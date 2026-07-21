@@ -68,6 +68,31 @@ _FOCUS_TITLE_MARKERS = (
 _STALENESS_S = 0.1
 _X11_BAD_WINDOW = 3
 
+# Sonic command keys passively grabbed away from the focused MuJoCo viewer, in
+# their canonical order. Standalone Shift/Control are deliberately excluded so
+# AnyModifier grabs preserve the walk and strafe modifier combinations.
+_X11_GRABBED_CONTROL_KEYS = (
+    "W",
+    "A",
+    "S",
+    "D",
+    "Q",
+    "E",
+    "X",
+    "SPACE",
+    "LEFT",
+    "UP",
+    "RIGHT",
+    "DOWN",
+)
+# ``AnyModifier`` matches every modifier combination for a passive key grab.
+_X11_ANY_MODIFIER = 1 << 15
+# ``GrabModeAsync`` keeps event delivery flowing to the keymap while grabbed.
+_X11_GRAB_MODE_ASYNC = 1
+# This connection polls levels and never consumes X events, so every sync must
+# discard its private queue to bound autorepeat/key-event memory.
+_X11_DISCARD_EVENTS = 1
+
 
 class _XErrorEvent(ctypes.Structure):
     """The stable leading layout of Xlib's ``XErrorEvent``."""
@@ -451,6 +476,7 @@ class X11KeyStateProvider:
             raise ContractError(f"X11 provider cannot open display {name!r}")
         self._display = ctypes.c_void_p(display)
         self._closed = False
+        self._grabbed_window = 0
         self._keycodes: dict[str, int] = {}
         for key, keysym in KEYSYMS.items():
             keycode = int(lib.XKeysymToKeycode(self._display, ctypes.c_ulong(keysym)))
@@ -494,6 +520,23 @@ class X11KeyStateProvider:
         lib.XSetErrorHandler.restype = ctypes.c_void_p
         lib.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
         lib.XSync.restype = ctypes.c_int
+        lib.XGrabKey.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_uint,
+            ctypes.c_ulong,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        lib.XGrabKey.restype = ctypes.c_int
+        lib.XUngrabKey.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_uint,
+            ctypes.c_ulong,
+        ]
+        lib.XUngrabKey.restype = ctypes.c_int
 
     def _fetch_name(self, window: int) -> str | None:
         name_ptr = ctypes.c_char_p()
@@ -538,27 +581,115 @@ class X11KeyStateProvider:
         )
         return int(window.value)
 
-    def _focused_on_target(self, window: int) -> bool:
+    def _target_window(self, window: int) -> int:
+        """Return the titled operator ancestor for ``window``, or zero."""
+
         current = window
         for _ in range(64):
             if current == 0:
-                return False
+                return 0
             title = self._fetch_name(current)
             if title is not None and _is_target_window_title(title):
-                return True
+                return current
             parent = self._parent(current)
             if parent == 0 or parent == current:
-                return False
+                return 0
             current = parent
-        return False
+        return 0
+
+    def _focused_on_target(self, window: int) -> bool:
+        return self._target_window(window) != 0
+
+    def _ungrab_window(self, window: int) -> None:
+        """Release every command-key grab held on ``window``."""
+
+        if window == 0:
+            return
+        for key in _X11_GRABBED_CONTROL_KEYS:
+            keycode = self._keycodes.get(key)
+            if keycode is None:
+                continue
+            self._lib.XUngrabKey(
+                self._display,
+                keycode,
+                _X11_ANY_MODIFIER,
+                window,
+            )
+
+    def _release_grabbed_window(self) -> bool:
+        """Release the tracked window and report a destroyed-window race."""
+
+        window = self._grabbed_window
+        self._grabbed_window = 0
+        if window == 0:
+            return False
+        _take_x11_errors(self._display)
+        self._ungrab_window(window)
+        self._lib.XSync(self._display, _X11_DISCARD_EVENTS)
+        return _classify_x11_errors(_take_x11_errors(self._display))
+
+    def _discard_partial_grabs(self, window: int) -> None:
+        """Best-effort cleanup after a failed multi-key grab transaction."""
+
+        _take_x11_errors(self._display)
+        self._ungrab_window(window)
+        self._lib.XSync(self._display, _X11_DISCARD_EVENTS)
+        _take_x11_errors(self._display)
+
+    def _bind_target_window(self, window: int) -> bool:
+        """Passively grab all Sonic command keys on the focused target window.
+
+        Idempotent for the currently bound window. When replacing a different
+        window it releases the prior grabs first. A destroyed-window
+        ``BadWindow`` race clears the binding so a later focus can reacquire it;
+        any other X11 error fails closed with a ``ContractError``.
+        """
+
+        if window == 0:
+            return False
+        if window == self._grabbed_window:
+            return True
+        if self._grabbed_window != 0:
+            self._release_grabbed_window()
+        _take_x11_errors(self._display)
+        for key in _X11_GRABBED_CONTROL_KEYS:
+            keycode = self._keycodes.get(key)
+            if keycode is None:
+                continue
+            self._lib.XGrabKey(
+                self._display,
+                keycode,
+                _X11_ANY_MODIFIER,
+                window,
+                0,
+                _X11_GRAB_MODE_ASYNC,
+                _X11_GRAB_MODE_ASYNC,
+            )
+        self._lib.XSync(self._display, _X11_DISCARD_EVENTS)
+        errors = _take_x11_errors(self._display)
+        try:
+            destroyed = _classify_x11_errors(errors)
+        except ContractError:
+            self._discard_partial_grabs(window)
+            raise
+        if destroyed:
+            # Destroyed-window race: drop the binding and allow reacquisition.
+            self._grabbed_window = 0
+            return False
+        self._grabbed_window = window
+        return True
 
     def sample(self) -> KeyLevels:
         if self._closed:
             raise ContractError("X11 provider is closed")
         _take_x11_errors(self._display)
-        focused = self._focused_on_target(self._focus_window())
+        focus_window = self._focus_window()
+        target_window = self._target_window(focus_window)
+        focused = target_window != 0
         pressed: frozenset = frozenset()
         if focused:
+            if not self._bind_target_window(target_window):
+                return KeyLevels(focused=False, pressed=frozenset())
             keymap = (ctypes.c_char * 32)()
             self._lib.XQueryKeymap(self._display, keymap)
             raw = bytes(keymap)
@@ -567,8 +698,9 @@ class X11KeyStateProvider:
                 for key, keycode in self._keycodes.items()
                 if raw[keycode >> 3] & (1 << (keycode & 7))
             )
-        self._lib.XSync(self._display, 0)
+        self._lib.XSync(self._display, _X11_DISCARD_EVENTS)
         if _classify_x11_errors(_take_x11_errors(self._display)):
+            self._release_grabbed_window()
             return KeyLevels(focused=False, pressed=frozenset())
         return KeyLevels(focused=focused, pressed=pressed)
 
@@ -576,6 +708,12 @@ class X11KeyStateProvider:
         if self._closed:
             return
         self._closed = True
-        self._lib.XSync(self._display, 0)
-        _take_x11_errors(self._display)
-        self._lib.XCloseDisplay(self._display)
+        release_error: ContractError | None = None
+        try:
+            self._release_grabbed_window()
+        except ContractError as error:
+            release_error = error
+        finally:
+            self._lib.XCloseDisplay(self._display)
+        if release_error is not None:
+            raise release_error

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import ctypes
 import os
 import threading
 import time
 import unittest
 
+from mm_sonic import operator_x11
 from mm_sonic.commands import CommandSample
 from mm_sonic.holden_control import (
     CameraState,
@@ -20,6 +22,8 @@ from mm_sonic.operator_x11 import (
     IntentSnapshot,
     KeyLevels,
     X11KeyStateProvider,
+    _X11_ANY_MODIFIER,
+    _X11_GRABBED_CONTROL_KEYS,
     _classify_x11_errors,
     _is_target_window_title,
     normalized_state_from_pressed,
@@ -353,6 +357,178 @@ class IntentSnapshotTests(unittest.TestCase):
     def test_allows_none_command_for_terminate(self) -> None:
         snapshot = IntentSnapshot(revision=1, observed_ns=100, command=None)
         self.assertIsNone(snapshot.command)
+
+
+EXPECTED_GRABBED_KEYS = (
+    "W", "A", "S", "D", "Q", "E", "X", "SPACE",
+    "LEFT", "UP", "RIGHT", "DOWN",
+)
+
+
+class _RecordingX11Lib:
+    """Record the grab lifecycle without touching a real display."""
+
+    def __init__(self, *, grab_errors: tuple[int, ...] = ()) -> None:
+        self.grabs: list[tuple[int, int, int]] = []
+        self.ungrabbed_windows: list[int] = []
+        self.events: list[tuple] = []
+        self.query_keymap_calls = 0
+        self.sync_discards: list[int] = []
+        self._grab_errors = list(grab_errors)
+
+    def XGrabKey(self, display, keycode, modifiers, window, owner, pmode, kmode):
+        self.grabs.append((int(keycode), int(modifiers), int(window)))
+        return 0
+
+    def XUngrabKey(self, display, keycode, modifiers, window):
+        win = int(window)
+        if not self.ungrabbed_windows or self.ungrabbed_windows[-1] != win:
+            self.ungrabbed_windows.append(win)
+        self.events.append(("ungrab", win))
+        return 0
+
+    def XSync(self, display, discard):
+        self.events.append(("sync",))
+        self.sync_discards.append(int(discard))
+        # Deliver any queued asynchronous grab errors on the next sync.
+        display_key = int(getattr(display, "value", display) or 0)
+        if self._grab_errors:
+            with operator_x11._X11_ERROR_LOCK:
+                operator_x11._X11_ERRORS.setdefault(display_key, []).extend(
+                    self._grab_errors
+                )
+            self._grab_errors = []
+        return 0
+
+    def XQueryKeymap(self, display, keymap):
+        self.query_keymap_calls += 1
+        return 1
+
+    def XCloseDisplay(self, display):
+        self.events.append(("close",))
+        return 0
+
+
+class X11GrabLifecycleTests(unittest.TestCase):
+    def _recording_provider(
+        self, *, grab_errors: tuple[int, ...] = ()
+    ) -> X11KeyStateProvider:
+        provider = X11KeyStateProvider.__new__(X11KeyStateProvider)
+        provider._lib = _RecordingX11Lib(grab_errors=grab_errors)
+        provider._display = ctypes.c_void_p(0x5150)
+        provider._closed = False
+        provider._grabbed_window = 0
+        provider._keycodes = {
+            key: index + 10 for index, key in enumerate(KEYSYMS)
+        }
+        return provider
+
+    def test_controller_grabs_exclude_standalone_modifiers(self) -> None:
+        self.assertEqual(_X11_GRABBED_CONTROL_KEYS, EXPECTED_GRABBED_KEYS)
+        self.assertNotIn("LEFT_SHIFT", _X11_GRABBED_CONTROL_KEYS)
+        self.assertNotIn("LEFT_CTRL", _X11_GRABBED_CONTROL_KEYS)
+
+    def test_binding_target_grabs_each_control_key_once_for_all_modifiers(
+        self,
+    ) -> None:
+        provider = self._recording_provider()
+        provider._bind_target_window(91)
+        provider._bind_target_window(91)
+        self.assertEqual(
+            provider._lib.grabs,
+            [
+                (provider._keycodes[key], _X11_ANY_MODIFIER, 91)
+                for key in _X11_GRABBED_CONTROL_KEYS
+            ],
+        )
+        self.assertEqual(provider._grabbed_window, 91)
+
+    def test_rebinding_releases_old_window_before_grabbing_new_window(
+        self,
+    ) -> None:
+        provider = self._recording_provider()
+        provider._bind_target_window(91)
+        provider._bind_target_window(92)
+        self.assertEqual(provider._lib.ungrabbed_windows, [91])
+        self.assertEqual(provider._grabbed_window, 92)
+
+    def test_close_releases_grabs_before_display(self) -> None:
+        provider = self._recording_provider()
+        provider._bind_target_window(91)
+        provider.close()
+        last_ungrab = max(
+            index
+            for index, event in enumerate(provider._lib.events)
+            if event == ("ungrab", 91)
+        )
+        self.assertEqual(
+            provider._lib.events[last_ungrab + 1 :],
+            [("sync",), ("close",)],
+        )
+
+    def test_bind_unexpected_error_fails_closed(self) -> None:
+        provider = self._recording_provider(grab_errors=(2,))
+        with self.assertRaises(ContractError):
+            provider._bind_target_window(91)
+        self.assertEqual(provider._grabbed_window, 0)
+        self.assertEqual(provider._lib.ungrabbed_windows, [91])
+
+    def test_bind_bad_window_race_clears_binding_for_reacquisition(
+        self,
+    ) -> None:
+        provider = self._recording_provider(
+            grab_errors=(operator_x11._X11_BAD_WINDOW,)
+        )
+        provider._bind_target_window(91)
+        self.assertEqual(provider._grabbed_window, 0)
+
+    def test_target_window_returns_the_titled_ancestor(self) -> None:
+        provider = self._recording_provider()
+        names = {17: None, 41: "MuJoCo", 1: "desktop"}
+        parents = {17: 41, 41: 1, 1: 1}
+        provider._fetch_name = lambda window: names[window]
+        provider._parent = lambda window: parents[window]
+
+        self.assertEqual(provider._target_window(17), 41)
+        self.assertTrue(provider._focused_on_target(17))
+
+    def test_sample_grabs_titled_ancestor_not_raw_focus_child(self) -> None:
+        provider = self._recording_provider()
+        provider._focus_window = lambda: 17
+        provider._target_window = lambda window: 41
+
+        levels = provider.sample()
+
+        self.assertEqual(levels, KeyLevels(focused=True, pressed=frozenset()))
+        self.assertEqual(provider._grabbed_window, 41)
+        self.assertEqual({window for _, _, window in provider._lib.grabs}, {41})
+        self.assertTrue(provider._lib.sync_discards)
+        self.assertEqual(set(provider._lib.sync_discards), {1})
+
+    def test_sample_bad_window_during_bind_returns_neutral_without_key_query(
+        self,
+    ) -> None:
+        provider = self._recording_provider(
+            grab_errors=(operator_x11._X11_BAD_WINDOW,)
+        )
+        provider._focus_window = lambda: 17
+        provider._target_window = lambda window: 41
+
+        levels = provider.sample()
+
+        self.assertEqual(levels, KeyLevels(focused=False, pressed=frozenset()))
+        self.assertEqual(provider._grabbed_window, 0)
+        self.assertEqual(provider._lib.query_keymap_calls, 0)
+
+    def test_close_is_idempotent(self) -> None:
+        provider = self._recording_provider()
+        provider._bind_target_window(91)
+        provider.close()
+        provider.close()
+        self.assertEqual(
+            [event for event in provider._lib.events if event == ("close",)],
+            [("close",)],
+        )
 
 
 class X11KeyStateProviderTests(unittest.TestCase):

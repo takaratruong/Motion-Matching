@@ -1082,6 +1082,48 @@ def load_external_bindings(gear_checkout: str | Path) -> _ExternalBindings:
     )
 
 
+def _normalize_onscreen_viewer(sim_env: object, mujoco_module: object) -> None:
+    """Normalize terrain visibility exactly once for a running onscreen viewer.
+
+    Requires an already-running viewer with valid option arrays, then enables
+    the ``mjVIS_STATIC`` visualization flag and geom group ``2`` so static
+    terrain stays visible. It never steps physics or calls the viewer sync, so
+    the physics gate and 50 Hz sync cadence are untouched.
+    """
+
+    viewer = getattr(sim_env, "viewer", None)
+    is_running = getattr(viewer, "is_running", None)
+    if viewer is None or not callable(is_running) or not is_running():
+        raise ProtocolError(
+            "onscreen viewer must be running to normalize presentation"
+        )
+    opt = getattr(viewer, "opt", None)
+    flags = getattr(opt, "flags", None)
+    geomgroup = getattr(opt, "geomgroup", None)
+    try:
+        static_index = int(mujoco_module.mjtVisFlag.mjVIS_STATIC)
+        if static_index < 0 or len(flags) <= static_index or len(geomgroup) <= 2:
+            raise IndexError
+        previous_static = flags[static_index]
+        previous_terrain_group = geomgroup[2]
+    except (AttributeError, TypeError, ValueError, OverflowError, IndexError) as error:
+        raise ProtocolError(
+            "onscreen viewer presentation arrays are malformed"
+        ) from error
+    try:
+        flags[static_index] = 1
+        geomgroup[2] = 1
+    except (TypeError, ValueError, OverflowError, IndexError, KeyError) as error:
+        try:
+            flags[static_index] = previous_static
+            geomgroup[2] = previous_terrain_group
+        except (TypeError, ValueError, OverflowError, IndexError, KeyError):
+            pass
+        raise ProtocolError(
+            "onscreen viewer presentation arrays are malformed"
+        ) from error
+
+
 class ExternalGearBackend:
     """Lazy adapter over the pinned official ``BaseSimulator``."""
 
@@ -1126,6 +1168,21 @@ class ExternalGearBackend:
         self._wall_clock_pacing = wall_clock_pacing
         self._freeze_on_fall = freeze_on_fall
         self._frozen = False
+        if onscreen:
+            # One-time terrain visibility normalization for the visible viewer.
+            # Never enforced per frame so operator camera/viewer state is free.
+            try:
+                _normalize_onscreen_viewer(simulator.sim_env, bindings.mujoco)
+            except BaseException:
+                try:
+                    with redirect_stdout(sys.stderr):
+                        simulator.close()
+                except BaseException as close_error:
+                    print(
+                        f"onscreen viewer cleanup failed: {close_error}",
+                        file=sys.stderr,
+                    )
+                raise
         if freeze_on_fall:
             # Diagnostic-only: replace only this live instance's fall callback so
             # the first fall latches the fallen pose instead of rewinding the

@@ -20,6 +20,7 @@ from mm_sonic.gated_sim import (
     ExternalGearBackend,
     GatedSimulatorRunner,
     ProtocolError,
+    _normalize_onscreen_viewer,
     physical_qpos_with_perturbation,
     serve_jsonl,
 )
@@ -1142,13 +1143,21 @@ class ExternalGearBackendBoundaryTests(unittest.TestCase):
                     def load_wbc_yaml():
                         return {}
 
+                viewer = SimpleNamespace(
+                    opt=SimpleNamespace(flags=[0] * 31, geomgroup=[0] * 6),
+                    is_running=lambda: True,
+                )
+
                 def base_simulator(**kwargs):
                     captured.update(kwargs)
-                    return SimpleNamespace()
+                    return SimpleNamespace(sim_env=SimpleNamespace(viewer=viewer))
 
                 bindings = SimpleNamespace(
                     sim_loop_config=ConfigLoader,
                     base_simulator=base_simulator,
+                    mujoco=SimpleNamespace(
+                        mjtVisFlag=SimpleNamespace(mjVIS_STATIC=22),
+                    ),
                 )
                 with tempfile.TemporaryDirectory() as root_text:
                     scene = Path(root_text) / "scene.xml"
@@ -1307,8 +1316,21 @@ class ExternalGearBackendBoundaryTests(unittest.TestCase):
         return SimpleNamespace(
             sim_loop_config=ConfigLoader,
             base_simulator=base_simulator,
-            mujoco=SimpleNamespace(mj_forward=mj_forward),
+            mujoco=SimpleNamespace(
+                mj_forward=mj_forward,
+                mjtVisFlag=SimpleNamespace(mjVIS_STATIC=22),
+            ),
         )
+
+    @staticmethod
+    def _attach_running_viewer(sim_env):
+        """Give an onscreen fixture the running viewer startup normalization needs."""
+
+        sim_env.viewer = SimpleNamespace(
+            opt=SimpleNamespace(flags=[0] * 31, geomgroup=[0] * 6),
+            is_running=lambda: True,
+        )
+        return sim_env
 
     def _construct_freeze_backend(self, sim_env, *, freeze_on_fall):
         bindings = self._freeze_bindings(sim_env)
@@ -1330,7 +1352,9 @@ class ExternalGearBackendBoundaryTests(unittest.TestCase):
 
     def test_default_backend_does_not_replace_official_fall_callback(self):
         original = lambda: None
-        sim_env = SimpleNamespace(check_fall=original)
+        sim_env = self._attach_running_viewer(
+            SimpleNamespace(check_fall=original)
+        )
 
         backend = self._construct_freeze_backend(sim_env, freeze_on_fall=False)
 
@@ -1361,6 +1385,7 @@ class ExternalGearBackendBoundaryTests(unittest.TestCase):
         sim_env.mj_data = mj_data
         sim_env.mj_model = object()
         sim_env.forward_events = []
+        self._attach_running_viewer(sim_env)
         fallen_qpos = mj_data.qpos.copy()
         stderr = io.StringIO()
 
@@ -1400,6 +1425,7 @@ class ExternalGearBackendBoundaryTests(unittest.TestCase):
         sim_env = SimEnv()
         sim_env.mj_data = mj_data
         sim_env.mj_model = object()
+        self._attach_running_viewer(sim_env)
 
         backend = self._construct_freeze_backend(sim_env, freeze_on_fall=True)
         stderr = io.StringIO()
@@ -1797,6 +1823,163 @@ def _external_module_names():
         or name.startswith("gear_sonic.")
         or name.startswith("unitree_sdk2py.")
     )
+
+
+class OnscreenViewerNormalizationTests(unittest.TestCase):
+    @staticmethod
+    def _bindings():
+        return SimpleNamespace(
+            mujoco=SimpleNamespace(
+                mjtVisFlag=SimpleNamespace(mjVIS_STATIC=22),
+            )
+        )
+
+    @staticmethod
+    def _running_sim_env():
+        viewer = SimpleNamespace(
+            opt=SimpleNamespace(flags=[0] * 31, geomgroup=[0] * 6),
+            is_running=lambda: True,
+        )
+        return SimpleNamespace(viewer=viewer)
+
+    def test_onscreen_backend_enables_static_terrain_presentation(self) -> None:
+        sim_env = self._running_sim_env()
+        _normalize_onscreen_viewer(sim_env, self._bindings().mujoco)
+        self.assertEqual(sim_env.viewer.opt.flags[22], 1)
+        self.assertEqual(sim_env.viewer.opt.geomgroup[2], 1)
+
+    def test_normalization_does_not_step_or_sync(self) -> None:
+        events: list[str] = []
+        viewer = SimpleNamespace(
+            opt=SimpleNamespace(flags=[0] * 31, geomgroup=[0] * 6),
+            is_running=lambda: True,
+        )
+        sim_env = SimpleNamespace(
+            viewer=viewer,
+            sim_step=lambda: events.append("step"),
+            update_viewer=lambda: events.append("sync"),
+        )
+        _normalize_onscreen_viewer(sim_env, self._bindings().mujoco)
+        self.assertEqual(events, [])
+
+    def test_rejects_missing_viewer(self) -> None:
+        sim_env = SimpleNamespace(viewer=None)
+        with self.assertRaisesRegex(ProtocolError, "viewer"):
+            _normalize_onscreen_viewer(sim_env, self._bindings().mujoco)
+
+    def test_rejects_closed_viewer(self) -> None:
+        viewer = SimpleNamespace(
+            opt=SimpleNamespace(flags=[0] * 31, geomgroup=[0] * 6),
+            is_running=lambda: False,
+        )
+        sim_env = SimpleNamespace(viewer=viewer)
+        with self.assertRaisesRegex(ProtocolError, "viewer"):
+            _normalize_onscreen_viewer(sim_env, self._bindings().mujoco)
+
+    def test_rejects_malformed_option_arrays(self) -> None:
+        flags = [0] * 31
+        viewer = SimpleNamespace(
+            opt=SimpleNamespace(flags=flags, geomgroup=[0]),
+            is_running=lambda: True,
+        )
+        sim_env = SimpleNamespace(viewer=viewer)
+        with self.assertRaisesRegex(ProtocolError, "viewer presentation"):
+            _normalize_onscreen_viewer(sim_env, self._bindings().mujoco)
+        self.assertEqual(flags[22], 0)
+
+    def test_rejects_missing_static_flag_identity_without_partial_mutation(
+        self,
+    ) -> None:
+        sim_env = self._running_sim_env()
+        malformed_mujoco = SimpleNamespace(mjtVisFlag=SimpleNamespace())
+
+        with self.assertRaisesRegex(ProtocolError, "viewer presentation"):
+            _normalize_onscreen_viewer(sim_env, malformed_mujoco)
+
+        self.assertEqual(sim_env.viewer.opt.flags, [0] * 31)
+        self.assertEqual(sim_env.viewer.opt.geomgroup, [0] * 6)
+
+    def test_constructor_normalizes_once_only_when_onscreen(self) -> None:
+        for onscreen in (False, True):
+            with self.subTest(onscreen=onscreen):
+                calls: list[object] = []
+
+                class ConfigLoader:
+                    env_name = "default"
+
+                    @staticmethod
+                    def load_wbc_yaml():
+                        return {}
+
+                sim_env = self._running_sim_env()
+                simulator = SimpleNamespace(sim_env=sim_env)
+
+                def base_simulator(**kwargs):
+                    return simulator
+
+                bindings = SimpleNamespace(
+                    sim_loop_config=ConfigLoader,
+                    base_simulator=base_simulator,
+                    mujoco=self._bindings().mujoco,
+                )
+                with tempfile.TemporaryDirectory() as root_text:
+                    scene = Path(root_text) / "scene.xml"
+                    scene.write_text("<mujoco/>\n", encoding="utf-8")
+                    with patch.object(
+                        gated_sim,
+                        "load_external_bindings",
+                        return_value=bindings,
+                    ), patch.object(
+                        gated_sim,
+                        "_normalize_onscreen_viewer",
+                        side_effect=lambda *a: calls.append(a),
+                    ):
+                        ExternalGearBackend(
+                            "/authenticated/gear", scene, onscreen=onscreen
+                        )
+                if onscreen:
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual(calls[0], (sim_env, bindings.mujoco))
+                else:
+                    self.assertEqual(calls, [])
+
+    def test_constructor_closes_simulator_when_normalization_fails(self) -> None:
+        close_calls: list[bool] = []
+
+        class ConfigLoader:
+            env_name = "default"
+
+            @staticmethod
+            def load_wbc_yaml():
+                return {}
+
+        simulator = SimpleNamespace(
+            sim_env=self._running_sim_env(),
+            close=lambda: close_calls.append(True),
+        )
+        bindings = SimpleNamespace(
+            sim_loop_config=ConfigLoader,
+            base_simulator=lambda **kwargs: simulator,
+            mujoco=self._bindings().mujoco,
+        )
+        with tempfile.TemporaryDirectory() as root_text:
+            scene = Path(root_text) / "scene.xml"
+            scene.write_text("<mujoco/>\n", encoding="utf-8")
+            with patch.object(
+                gated_sim,
+                "load_external_bindings",
+                return_value=bindings,
+            ), patch.object(
+                gated_sim,
+                "_normalize_onscreen_viewer",
+                side_effect=ProtocolError("viewer presentation failed"),
+            ):
+                with self.assertRaisesRegex(ProtocolError, "viewer presentation"):
+                    ExternalGearBackend(
+                        "/authenticated/gear", scene, onscreen=True
+                    )
+
+        self.assertEqual(close_calls, [True])
 
 
 class ExternalCheckoutProvenanceTests(unittest.TestCase):
