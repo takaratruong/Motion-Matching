@@ -36,6 +36,7 @@ from .joints import ContractError
 
 
 _SUPPORTED_SOURCE_INTERVALS = (5, 10)
+_SOURCE_RATE_HZ = 25.0
 _TARGET_ROWS_PER_INTERVAL = 2
 
 
@@ -264,6 +265,7 @@ class ManualChunkCommitter:
         steps_per_chunk: int,
         recorder: object,
         source_intervals: int = 10,
+        sim_dt_s: float = 0.02,
         state_log_reader: object | None = None,
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
         next_chunk: int = 0,
@@ -280,16 +282,28 @@ class ManualChunkCommitter:
                 "committer source_intervals must be one of "
                 + " or ".join(str(count) for count in _SUPPORTED_SOURCE_INTERVALS)
             )
-        # The generated MM horizon, published target-row horizon, and released
-        # physics horizon must be one and the same 0.2s or 0.4s prefix.  Reject
-        # the shortcut of committing a longer target while releasing fewer
-        # physics steps, which would grow a future queue.
-        expected_rows = source_intervals * _TARGET_ROWS_PER_INTERVAL
-        if steps_per_chunk != expected_rows:
+        if (
+            isinstance(sim_dt_s, bool)
+            or not isinstance(sim_dt_s, (int, float))
+            or not math.isfinite(float(sim_dt_s))
+            or float(sim_dt_s) <= 0.0
+        ):
+            raise ContractError("committer sim_dt_s must be finite and positive")
+        # MM, target, and physics operate at different rates. Compare their
+        # durations instead of equating row/step counts: five 25-Hz source
+        # intervals are ten 50-Hz target rows but forty 200-Hz physics steps.
+        expected_duration_s = source_intervals / _SOURCE_RATE_HZ
+        physics_duration_s = steps_per_chunk * float(sim_dt_s)
+        if not math.isclose(
+            physics_duration_s,
+            expected_duration_s,
+            rel_tol=0.0,
+            abs_tol=1.0e-12,
+        ):
             raise ContractError(
-                "committer steps_per_chunk "
-                f"{steps_per_chunk} must equal source_intervals * "
-                f"{_TARGET_ROWS_PER_INTERVAL} = {expected_rows}"
+                "committer physics duration "
+                f"{physics_duration_s:.12g}s must equal MM horizon "
+                f"{expected_duration_s:.12g}s"
             )
         if type(next_chunk) is not int or next_chunk < 0:
             raise ContractError("committer next_chunk must be a nonnegative integer")
@@ -311,6 +325,9 @@ class ManualChunkCommitter:
         self._session_id = session_id
         self._steps_per_chunk = steps_per_chunk
         self._source_intervals = source_intervals
+        self._expected_target_rows = (
+            source_intervals * _TARGET_ROWS_PER_INTERVAL
+        )
         self._recorder = recorder
         self._state_log_reader = state_log_reader
         self._monotonic_ns = monotonic_ns
@@ -345,20 +362,18 @@ class ManualChunkCommitter:
         # Extract evidence while the transaction is still reversible.  Evidence
         # assembly must never be the first failure after physics is released.
         generated_root_displacement = _generated_root_displacement(prepared)
-        # The published target and released physics must be the same horizon.
-        # Guard here (still reversible) against any prepared target whose row
-        # count would not be fully presented by exactly ``steps_per_chunk``
-        # physics steps -- the shortcut that grows a future queue.
+        # Guard the target's 50-Hz horizon here while the transaction remains
+        # reversible. Physics duration was independently checked from sim_dt.
         published_rows = int(
             np.asarray(prepared.target.virtual_root_position).shape[0]
         )
-        if published_rows != self._steps_per_chunk:
+        if published_rows != self._expected_target_rows:
             self._timeline.abort(candidate)
             self._mm.abort(candidate)
             raise ContractError(
                 "prepared target rows "
-                f"{published_rows} must equal released physics steps "
-                f"{self._steps_per_chunk}"
+                f"{published_rows} must equal source horizon target rows "
+                f"{self._expected_target_rows}"
             )
 
         # LAST supersession check, exactly where the coordinator places it.

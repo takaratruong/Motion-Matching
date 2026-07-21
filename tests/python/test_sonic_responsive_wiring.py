@@ -94,6 +94,7 @@ class _Fakes:
 
     def release_steps(self, steps):
         self.log.append("release")
+        self.released_steps = steps
         self.state_rows_before = 0
         return _FakeAdvance(0, self.state_rows_after)
 
@@ -173,7 +174,14 @@ class _RecorderShim:
         self._f.record(command)
 
 
-def _make_committer(fakes, *, mm=None, source_intervals=10, steps_per_chunk=20):
+def _make_committer(
+    fakes,
+    *,
+    mm=None,
+    source_intervals=10,
+    steps_per_chunk=20,
+    sim_dt_s=0.02,
+):
     from mm_sonic.responsive_wiring import ManualChunkCommitter
 
     return ManualChunkCommitter(
@@ -185,6 +193,7 @@ def _make_committer(fakes, *, mm=None, source_intervals=10, steps_per_chunk=20):
         session_id="session",
         steps_per_chunk=steps_per_chunk,
         source_intervals=source_intervals,
+        sim_dt_s=sim_dt_s,
         recorder=_RecorderShim(fakes),
     )
 
@@ -221,6 +230,33 @@ class ManualChunkCommitterOrderingTests(unittest.TestCase):
 
         self.assertEqual(fakes.generate_kwargs["source_intervals"], 5)
 
+    def test_five_intervals_release_forty_steps_at_200_hz(self):
+        fakes = _Fakes(root_rows=np.zeros((10, 3), dtype=np.float32))
+        committer = _make_committer(
+            fakes,
+            source_intervals=5,
+            steps_per_chunk=40,
+            sim_dt_s=0.005,
+        )
+
+        committer.run_one_chunk(_command(0))
+
+        self.assertEqual(fakes.released_steps, 40)
+
+    def test_physics_duration_mismatch_is_rejected_before_generation(self):
+        fakes = _Fakes(root_rows=np.zeros((10, 3), dtype=np.float32))
+
+        from mm_sonic.joints import ContractError
+
+        with self.assertRaisesRegex(ContractError, "physics duration"):
+            _make_committer(
+                fakes,
+                source_intervals=5,
+                steps_per_chunk=10,
+                sim_dt_s=0.005,
+            )
+        self.assertEqual(fakes.log, [])
+
     def test_default_committer_still_forwards_ten_intervals(self):
         fakes = _Fakes()
         committer = _make_committer(fakes)
@@ -229,7 +265,7 @@ class ManualChunkCommitterOrderingTests(unittest.TestCase):
 
         self.assertEqual(fakes.generate_kwargs["source_intervals"], 10)
 
-    def test_released_physics_horizon_must_match_published_target_rows(self):
+    def test_published_target_rows_must_match_source_horizon(self):
         # The rejected shortcut: publish/commit a 20-row target but release
         # only 10 physics steps grows a future queue and makes the one-prefix
         # trace false.  The committer must reject a generated/published/released

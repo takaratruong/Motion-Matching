@@ -874,6 +874,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                             session_id=session_id,
                             steps_per_chunk=steps_per_chunk,
                             source_intervals=source_intervals,
+                            sim_dt_s=simulator.sim_dt,
                             recorder=recorder,
                             state_log_reader=StateLogRootReader(
                                 bundle.path / "scored-sim-logs" / "state.jsonl"
