@@ -35,10 +35,9 @@ remain the entry condition; the character must never return to a training
 start or a stale entry waypoint.
 
 An explicit 3.0-metre object-radius gate belongs to `FunnelCaptureConfig`.
-Its internal route budget is also 3.0 metres so an obstacle-free angular
-capture candidate can be reached without redefining activation range. Authored
-Smart Pickup and the final interaction matcher's 1.0-metre approach limit do
-not change.
+The existing frozen-route revalidation continues to check table and obstacle
+clearance without reapplying an activation-distance test. Authored Smart Pickup
+and the final interaction matcher's 1.0-metre approach limit do not change.
 
 ## Generalization Sweep
 
