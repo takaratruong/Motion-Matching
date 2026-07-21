@@ -399,8 +399,10 @@ void test_provider_backed_lifecycle_submits_after_native_funnel() {
         vec3(0.18F, entry.position.y, 0.94F),
         entry.rotation,
     };
-    assert(backend.observe(lifecycle_observation(16U, target, tracked))
-               .override_steering);
+    const interaction::PickAssistOutput route_follow =
+        backend.observe(lifecycle_observation(16U, target, tracked));
+    assert(route_follow.override_steering);
+    assert(route_follow.force_strafe);
     assert(backend.observe(lifecycle_observation(17U, target, tracked))
                .override_steering);
     const interaction::PickAssistOutput final_request = backend.observe(
@@ -468,11 +470,20 @@ void test_capture_handoff_freezes_actual_pose_after_entering_annulus() {
     const float facing = std::atan2(-0.2F, -0.8F);
     const interaction::Transform crossed{
         vec3(0.2F, 0.0F, 0.8F),
-        quat_from_angle_axis(facing, vec3(0.0F, 1.0F, 0.0F)),
+        quat(1.0F, 0.0F, 0.0F, 0.0F),
     };
-    backend.observe(lifecycle_observation(10U, target, crossed));
-    backend.observe(lifecycle_observation(11U, target, crossed));
-    backend.observe(lifecycle_observation(12U, target, crossed));
+    const interaction::PickAssistOutput handoff_turn =
+        backend.observe(lifecycle_observation(10U, target, crossed));
+    assert(handoff_turn.override_steering);
+    assert(handoff_turn.force_strafe);
+    assert(std::abs(handoff_turn.left_stick.x) < 1.0e-6F);
+    assert(std::abs(handoff_turn.left_stick.z) < 1.0e-6F);
+    interaction::Transform turned = crossed;
+    turned.rotation = quat_from_angle_axis(
+        facing, vec3(0.0F, 1.0F, 0.0F));
+    backend.observe(lifecycle_observation(11U, target, turned));
+    backend.observe(lifecycle_observation(12U, target, turned));
+    backend.observe(lifecycle_observation(13U, target, turned));
 
     assert(provider.begin_calls == 1);
     assert(std::abs(provider.request.condition[18] - 0.2F) < 1.0e-6F);

@@ -272,6 +272,7 @@ PickAssistOutput LearnedSmartPickupBackend::observe_learned(
             diagnostics_.state = PickAssistState::SlotApproach;
             PickAssistOutput output{};
             output.override_steering = true;
+            output.force_strafe = true;
             output.left_stick = arrival_navigation_stick(
                 capture_.target_world.position,
                 observation.displayed_root.position,
@@ -504,6 +505,7 @@ PickAssistOutput LearnedSmartPickupBackend::observe_learned(
             frozen_object_world_, followed.sample);
         PickAssistOutput output{};
         output.override_steering = true;
+        output.force_strafe = true;
         output.left_stick = arrival_navigation_stick(
             target.position,
             observation.displayed_root.position,
