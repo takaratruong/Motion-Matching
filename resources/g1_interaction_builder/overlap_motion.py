@@ -260,6 +260,36 @@ def _yaw(quaternion: np.ndarray) -> float:
     return float(np.arctan2(2.0 * (w * y + x * z), 1.0 - 2.0 * (y * y + z * z)))
 
 
+def _yaw_quaternion(quaternion: np.ndarray) -> np.ndarray:
+    """Return the planar frame rotation represented by a WXYZ quaternion."""
+    half_yaw = 0.5 * _yaw(quaternion)
+    return np.asarray([np.cos(half_yaw), 0.0, np.sin(half_yaw), 0.0], np.float64)
+
+
+def _canonicalize_motion(
+    positions: np.ndarray,
+    rotations: np.ndarray,
+    frame_position: np.ndarray,
+    frame_rotation: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Express the Simulation root in a planar object/goal frame.
+
+    The remaining rotations are child-local Holden rotations and must not be
+    rotated with the world frame.
+    """
+    local_positions = np.asarray(positions, np.float64).copy()
+    local_rotations = np.asarray(rotations, np.float64).copy()
+    frame_position = _anchor(frame_position)
+    frame_rotation = _yaw_quaternion(frame_rotation)
+    local_positions[:, 0] = holden_quat.inv_mul_vec(
+        frame_rotation, local_positions[:, 0] - frame_position
+    )
+    local_rotations[:, 0] = holden_quat.mul(
+        holden_quat.inv(frame_rotation), local_rotations[:, 0]
+    )
+    return local_positions, local_rotations
+
+
 def _route_temporal(
     artifact: InteractionArtifact,
     source: slice,
@@ -267,13 +297,13 @@ def _route_temporal(
 ) -> np.ndarray:
     """Object-local root route and the five explicit source phase channels."""
     object_position = np.asarray(artifact.object_positions[object_frame], np.float64)
-    object_yaw = _yaw(artifact.object_rotations[object_frame])
+    object_rotation = _yaw_quaternion(artifact.object_rotations[object_frame])
+    object_yaw = _yaw(object_rotation)
     root = np.asarray(artifact.positions[source, 0], np.float64)
-    delta = root - object_position
-    c, s = np.cos(object_yaw), np.sin(object_yaw)
+    delta = holden_quat.inv_mul_vec(object_rotation, root - object_position)
     route = np.empty((len(root), 4), np.float32)
-    route[:, 0] = c * delta[:, 0] + s * delta[:, 2]
-    route[:, 1] = -s * delta[:, 0] + c * delta[:, 2]
+    route[:, 0] = delta[:, 0]
+    route[:, 1] = delta[:, 2]
     root_yaw = np.asarray([_yaw(q) for q in artifact.rotations[source, 0]])
     route[:, 2] = np.sin(root_yaw - object_yaw)
     route[:, 3] = np.cos(root_yaw - object_yaw)
@@ -360,11 +390,16 @@ def extract_interaction_pairs(
             artifact.foot_contacts[global_start:global_stop],
             artifact.hand_contacts[global_start:global_stop, int(InteractionHand.RIGHT)],
         ))
-        encoded = encode_motion(
+        frame_position = artifact.object_positions[contact - 1]
+        frame_rotation = artifact.object_rotations[contact - 1]
+        local_positions, local_rotations = _canonicalize_motion(
             artifact.positions[global_start:global_stop],
-            artifact.rotations[global_start:global_stop],
+            artifact.rotations[global_start:global_stop], frame_position, frame_rotation,
+        )
+        encoded = encode_motion(
+            local_positions, local_rotations,
             whole_contacts,
-            artifact.positions[global_start, 0],
+            np.zeros(3, np.float64),
         )
         walk = np.ascontiguousarray(encoded[:WALK_FRAMES])
         pickup = np.ascontiguousarray(encoded[WALK_FRAMES - OVERLAP_FRAMES:])
@@ -372,9 +407,10 @@ def extract_interaction_pairs(
             raise AssertionError("interaction overlap is not byte-identical")
 
         route = _route_temporal(artifact, slice(global_start, global_stop), contact - 1)
+        object_rotation = _yaw_quaternion(frame_rotation)
         initial_velocity = np.concatenate((
-            artifact.velocities[global_start, 0],
-            artifact.angular_velocities[global_start, 0],
+            holden_quat.inv_mul_vec(object_rotation, artifact.velocities[global_start, 0]),
+            holden_quat.inv_mul_vec(object_rotation, artifact.angular_velocities[global_start, 0]),
         )).astype(np.float32)
         static = np.concatenate((grasp, initial_velocity, np.array([1.0], np.float32)))
         if static.shape != (STATIC_CONDITION_DIM,) or not np.isfinite(static).all():
@@ -468,12 +504,23 @@ def extract_walking_windows(clip: HoldenClip, stride: int = 10) -> np.ndarray:
         raise ValueError("walking clip must use the canonical 31-bone skeleton")
     rows = []
     for start in range(0, len(clip.positions) - WALK_FRAMES + 1, stride):
-        stop = start + WALK_FRAMES
-        rows.append(encode_motion(
-            clip.positions[start:stop], clip.rotations[start:stop],
-            np.column_stack((clip.contacts[start:stop], np.zeros(WALK_FRAMES, np.float32))),
-            clip.positions[start, 0],
-        ))
+        rows.append(_encode_walking_window(clip, start))
     if not rows:
         return np.empty((0, WALK_FRAMES, FRAME_DIM), np.float32)
     return np.asarray(rows, np.float32)
+
+
+def _encode_walking_window(clip: HoldenClip, start: int) -> np.ndarray:
+    """Encode one walking window in its terminal-root goal frame."""
+    stop = start + WALK_FRAMES
+    if start < 0 or stop > len(clip.positions):
+        raise ValueError("walking window must remain inside the source clip")
+    local_positions, local_rotations = _canonicalize_motion(
+        clip.positions[start:stop], clip.rotations[start:stop],
+        clip.positions[stop - 1, 0], clip.rotations[stop - 1, 0],
+    )
+    return encode_motion(
+        local_positions, local_rotations,
+        np.column_stack((clip.contacts[start:stop], np.zeros(WALK_FRAMES, np.float32))),
+        np.zeros(3, np.float64),
+    )

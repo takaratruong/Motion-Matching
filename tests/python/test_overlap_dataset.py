@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import numpy as np
 
+from resources import quat as holden_quat
 from resources.g1_interaction_builder.overlap_motion import (
     extract_interaction_pairs,
     extract_walking_windows,
@@ -80,6 +81,46 @@ def interaction_artifact_fixture(
     )
 
 
+def _yaw_quaternion(angle: float) -> np.ndarray:
+    return holden_quat.from_angle_axis(
+        np.asarray(angle, np.float32), np.asarray([0.0, 1.0, 0.0], np.float32)
+    ).astype(np.float32)
+
+
+def _globally_transform_interaction(
+    artifact: InteractionArtifact, *, translation: np.ndarray, yaw: float,
+) -> InteractionArtifact:
+    transformed = copy.deepcopy(artifact)
+    rotation = _yaw_quaternion(yaw)
+    transformed.positions[:, 0] = (
+        holden_quat.mul_vec(rotation, transformed.positions[:, 0]) + translation
+    )
+    transformed.velocities[:, 0] = holden_quat.mul_vec(
+        rotation, transformed.velocities[:, 0]
+    )
+    transformed.angular_velocities[:, 0] = holden_quat.mul_vec(
+        rotation, transformed.angular_velocities[:, 0]
+    )
+    transformed.rotations[:, 0] = holden_quat.mul(rotation, transformed.rotations[:, 0])
+    transformed.object_positions = (
+        holden_quat.mul_vec(rotation, transformed.object_positions) + translation
+    )
+    transformed.object_rotations = holden_quat.mul(rotation, transformed.object_rotations)
+    return transformed
+
+
+def _globally_transform_walking(
+    clip: HoldenClip, *, translation: np.ndarray, yaw: float,
+) -> HoldenClip:
+    transformed = copy.deepcopy(clip)
+    rotation = _yaw_quaternion(yaw)
+    transformed.positions[:, 0] = (
+        holden_quat.mul_vec(rotation, transformed.positions[:, 0]) + translation
+    )
+    transformed.rotations[:, 0] = holden_quat.mul(rotation, transformed.rotations[:, 0])
+    return transformed
+
+
 class OverlapInteractionExtractionTests(unittest.TestCase):
     def test_interaction_pair_uses_real_contiguous_overlap(self):
         artifact = interaction_artifact_fixture()
@@ -102,6 +143,30 @@ class OverlapInteractionExtractionTests(unittest.TestCase):
         self.assertEqual(rows.walk_temporal.shape, (1, 50, 9))
         self.assertEqual(rows.pickup_temporal.shape, (1, 50, 9))
         self.assertEqual(rows.rejection_counts, {})
+
+    def test_interaction_motion_and_route_ignore_global_object_transform(self):
+        artifact = interaction_artifact_fixture()
+        artifact.object_rotations[:] = _yaw_quaternion(0.35)
+        artifact.rotations[:, 0] = _yaw_quaternion(-0.20)
+        transformed = _globally_transform_interaction(
+            artifact, translation=np.asarray([7.0, 0.5, -3.0], np.float32), yaw=1.10
+        )
+
+        baseline = extract_interaction_pairs(artifact)
+        equivalent = extract_interaction_pairs(transformed)
+
+        np.testing.assert_allclose(baseline.walk_windows, equivalent.walk_windows, atol=2e-6)
+        np.testing.assert_allclose(baseline.pickup_windows, equivalent.pickup_windows, atol=2e-6)
+        np.testing.assert_allclose(baseline.walk_temporal, equivalent.walk_temporal, atol=2e-6)
+        np.testing.assert_allclose(baseline.pickup_temporal, equivalent.pickup_temporal, atol=2e-6)
+        self.assertEqual(
+            baseline.walk_windows[:, 30:50].tobytes(),
+            baseline.pickup_windows[:, :20].tobytes(),
+        )
+        self.assertEqual(
+            equivalent.walk_windows[:, 30:50].tobytes(),
+            equivalent.pickup_windows[:, :20].tobytes(),
+        )
 
     def test_source_ranges_are_local_to_their_continuation_identity(self):
         first = interaction_artifact_fixture()
@@ -178,7 +243,7 @@ class OverlapWalkingExtractionTests(unittest.TestCase):
 
         self.assertEqual(rows.shape, (3, 50, 192))
         np.testing.assert_array_equal(
-            rows[:, :, 0], np.broadcast_to(np.arange(50, dtype=np.float32), (3, 50))
+            rows[:, :, 0], np.broadcast_to(np.arange(-49, 1, dtype=np.float32), (3, 50))
         )
 
     def test_balancing_keeps_every_native_source_window(self):
@@ -193,6 +258,51 @@ class OverlapWalkingExtractionTests(unittest.TestCase):
 
         np.testing.assert_array_equal(starts[np.unique(selected)], starts)
         self.assertGreaterEqual(len(selected), len(starts))
+
+    def test_walking_goal_frame_rotates_route_and_motion(self):
+        clip = HoldenClip.empty(frames=500, bones=31)
+        clip.positions[:, 0, 0] = np.arange(500, dtype=np.float32) * 0.05
+        clip.rotations[:, 0] = _yaw_quaternion(np.pi / 2.0)
+        transformed = _globally_transform_walking(
+            clip, translation=np.asarray([-5.0, 0.0, 8.0], np.float32), yaw=-0.70
+        )
+
+        window, _, route = build_g1_overlap_dataset._walking_row(clip, 0)
+        equivalent_window, _, equivalent_route = build_g1_overlap_dataset._walking_row(
+            transformed, 0
+        )
+        terminal = clip.rotations[49, 0]
+        expected_route = holden_quat.inv_mul_vec(
+            terminal, clip.positions[0, 0] - clip.positions[49, 0]
+        )[[0, 2]]
+
+        np.testing.assert_allclose(route[0, :2], expected_route, atol=2e-6)
+        np.testing.assert_allclose(window, equivalent_window, atol=2e-6)
+        np.testing.assert_allclose(route, equivalent_route, atol=2e-6)
+
+    def test_walking_partitions_have_no_shared_source_frame_or_range(self):
+        clip = HoldenClip.empty(frames=500, bones=31)
+        clip.positions[:, 0, 0] = np.arange(500, dtype=np.float32) * 0.03
+        partitions = build_g1_overlap_dataset._partitioned_walking_rows(
+            clip, stride=10, seed=14
+        )
+
+        source_frames = {
+            name: {
+                frame
+                for start, stop in rows[3]
+                for frame in range(int(start), int(stop))
+            }
+            for name, rows in partitions.items()
+        }
+        source_ranges = {
+            name: {tuple(int(value) for value in item) for item in rows[3]}
+            for name, rows in partitions.items()
+        }
+        self.assertGreater(len(partitions["train"][0]), 8)
+        for left, right in (("train", "validation"), ("train", "test"), ("validation", "test")):
+            self.assertTrue(source_frames[left].isdisjoint(source_frames[right]))
+            self.assertTrue(source_ranges[left].isdisjoint(source_ranges[right]))
 
 
 class OverlapDatasetCliTests(unittest.TestCase):
@@ -238,8 +348,8 @@ class OverlapDatasetCliTests(unittest.TestCase):
 
     def test_export_uses_manifest_object_identity_and_train_only_normalization(self):
         artifact = interaction_artifact_fixture()
-        walking = HoldenClip.empty(frames=71, bones=31)
-        walking.positions[:, 0, 0] = np.arange(71, dtype=np.float32)
+        walking = HoldenClip.empty(frames=500, bones=31)
+        walking.positions[:, 0, 0] = np.arange(500, dtype=np.float32)
         manifest = {
             "clips": [{
                 "sequence_id": "pickup_table__cup_2__001",
@@ -272,6 +382,48 @@ class OverlapDatasetCliTests(unittest.TestCase):
             with np.load(output, allow_pickle=False) as dataset:
                 np.testing.assert_array_equal(dataset["train_object_ids"], ["cup_2"])
                 self.assertIn("normalization_mean", dataset)
+
+    def test_failed_manifest_publication_restores_the_previous_output_pair(self):
+        artifact = interaction_artifact_fixture()
+        walking = HoldenClip.empty(frames=500, bones=31)
+        walking.positions[:, 0, 0] = np.arange(500, dtype=np.float32)
+        manifest = {"clips": [{
+            "sequence_id": "pickup_table__cup_2__001",
+            "object_id": "cup_2",
+            "range_start": 0,
+            "range_stop": 120,
+        }]}
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, xml = root / "native.npz", root / "g1.xml"
+            pack, output = root / "pack", root / "dataset.npz"
+            source.write_bytes(b"native")
+            xml.write_text("<mujoco/>", encoding="utf-8")
+            pack.mkdir()
+            for name in ("interaction_database.bin", "interaction_features.bin", "manifest.json"):
+                (pack / name).write_bytes(name.encode("ascii"))
+            output.write_bytes(b"old dataset")
+            output.with_suffix(".manifest.json").write_bytes(b'{"old": true}\n')
+            previous_dataset = output.read_bytes()
+            previous_manifest = output.with_suffix(".manifest.json").read_bytes()
+            real_replace = build_g1_overlap_dataset.os.replace
+            failed = False
+
+            def fail_manifest_replace(source_path, destination_path):
+                nonlocal failed
+                if not failed and Path(destination_path) == output.with_suffix(".manifest.json"):
+                    failed = True
+                    raise OSError("injected manifest publish failure")
+                return real_replace(source_path, destination_path)
+
+            with patch.object(build_g1_overlap_dataset, "load_native_g1_walk", return_value=walking), patch.object(
+                build_g1_overlap_dataset, "read_artifact_set", return_value=(artifact, None, manifest, None, None)
+            ), patch.object(build_g1_overlap_dataset.os, "replace", side_effect=fail_manifest_replace):
+                with self.assertRaisesRegex(OSError, "injected manifest"):
+                    build_g1_overlap_dataset.build_dataset(source, xml, pack, output, seed=2026072101)
+
+            self.assertEqual(output.read_bytes(), previous_dataset)
+            self.assertEqual(output.with_suffix(".manifest.json").read_bytes(), previous_manifest)
 
 
 if __name__ == "__main__":

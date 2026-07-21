@@ -20,13 +20,12 @@ from resources.g1_interaction_builder.overlap_motion import (
     FPS,
     FRAME_DIM,
     PICKUP_FRAMES,
-    STATIC_CONDITION_DIM,
-    TEMPORAL_CONDITION_DIM,
     WALK_FRAMES,
     OverlapDataset,
+    _encode_walking_window,
     _yaw,
+    _yaw_quaternion,
     extract_interaction_pairs,
-    extract_walking_windows,
     load_native_g1_walk,
 )
 from resources.g1_terrain_builder.schema import HoldenClip
@@ -43,27 +42,70 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _atomic_npz(path: Path, values: dict[str, np.ndarray]) -> None:
+def _stage_npz(path: Path, values: dict[str, np.ndarray]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile("wb", dir=path.parent, delete=False) as stream:
         temporary = Path(stream.name)
         np.savez_compressed(stream, **values)
-    try:
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    return temporary
 
 
-def _atomic_json(path: Path, value: dict) -> None:
+def _stage_json(path: Path, value: dict) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as stream:
         temporary = Path(stream.name)
         json.dump(value, stream, indent=2, sort_keys=True)
         stream.write("\n")
+    return temporary
+
+
+def _temporary_path(parent: Path) -> Path:
+    with tempfile.NamedTemporaryFile(dir=parent, delete=False) as stream:
+        temporary = Path(stream.name)
+    temporary.unlink()
+    return temporary
+
+
+def _atomic_dataset_pair(path: Path, values: dict[str, np.ndarray], manifest: dict) -> None:
+    """Publish the dataset and manifest together, restoring a prior pair on error."""
+    manifest_path = path.with_suffix(".manifest.json")
+    data_stage = _stage_npz(path, values)
+    manifest_stage = _stage_json(manifest_path, manifest)
+    data_backup = manifest_backup = None
+    had_data, had_manifest = path.exists(), manifest_path.exists()
+    if had_data != had_manifest:
+        data_stage.unlink(missing_ok=True)
+        manifest_stage.unlink(missing_ok=True)
+        raise RuntimeError("dataset publication requires a complete prior output pair")
     try:
-        os.replace(temporary, path)
+        if had_data:
+            data_backup, manifest_backup = _temporary_path(path.parent), _temporary_path(path.parent)
+            try:
+                os.replace(path, data_backup)
+                os.replace(manifest_path, manifest_backup)
+            except Exception:
+                if data_backup.exists():
+                    os.replace(data_backup, path)
+                if manifest_backup.exists():
+                    os.replace(manifest_backup, manifest_path)
+                raise
+        try:
+            os.replace(data_stage, path)
+            os.replace(manifest_stage, manifest_path)
+        except Exception:
+            path.unlink(missing_ok=True)
+            manifest_path.unlink(missing_ok=True)
+            if had_data:
+                os.replace(data_backup, path)
+                os.replace(manifest_backup, manifest_path)
+            raise
     finally:
-        temporary.unlink(missing_ok=True)
+        data_stage.unlink(missing_ok=True)
+        manifest_stage.unlink(missing_ok=True)
+        if data_backup is not None:
+            data_backup.unlink(missing_ok=True)
+        if manifest_backup is not None:
+            manifest_backup.unlink(missing_ok=True)
 
 
 def _split_indices(count: int, seed: int) -> dict[str, np.ndarray]:
@@ -88,9 +130,11 @@ def _split_indices(count: int, seed: int) -> dict[str, np.ndarray]:
 
 
 def _coverage_balanced_walking_indices(
-    clip: HoldenClip, stride: int, seed: int,
+    clip: HoldenClip, stride: int, seed: int, starts: np.ndarray | None = None,
 ) -> np.ndarray:
-    starts = np.arange(0, len(clip.positions) - WALK_FRAMES + 1, stride, dtype=np.int32)
+    if starts is None:
+        starts = np.arange(0, len(clip.positions) - WALK_FRAMES + 1, stride, dtype=np.int32)
+    starts = np.asarray(starts, np.int32)
     if len(starts) == 0:
         return starts
     root = clip.positions[:, 0].astype(np.float64)
@@ -131,44 +175,90 @@ def _split_interaction_by_object(
     }
 
 
-def _walking_rows(clip: HoldenClip, *, stride: int, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    windows = extract_walking_windows(clip, stride=stride)
-    starts = np.arange(0, len(clip.positions) - WALK_FRAMES + 1, stride, dtype=np.int32)
-    selected = _coverage_balanced_walking_indices(clip, stride, seed)
-    windows = windows[selected]
-    starts = starts[selected]
-    statics, temporal = [], []
-    for start in starts:
-        stop = int(start + WALK_FRAMES)
-        root = clip.positions[start:stop, 0].astype(np.float64)
-        terminal = root[-1]
-        terminal_yaw = _yaw(clip.rotations[stop - 1, 0])
-        delta = root - terminal
-        root_yaw = np.asarray([_yaw(q) for q in clip.rotations[start:stop, 0]])
-        route = np.column_stack((
-            delta[:, 0], delta[:, 2],
-            np.sin(root_yaw - terminal_yaw), np.cos(root_yaw - terminal_yaw),
-        )).astype(np.float32)
-        phases = np.zeros((WALK_FRAMES, 5), np.float32)
-        phases[:, 0] = 1.0
-        temporal.append(np.concatenate((route, phases), axis=1))
-        linear = (clip.positions[min(start + 1, stop - 1), 0] - clip.positions[start, 0]) * FPS
-        angular = np.zeros(3, np.float32)
-        if stop - start > 1:
-            q0, q1 = clip.rotations[start, 0], clip.rotations[start + 1, 0]
-            delta = holden_quat.mul(q1, holden_quat.inv(q0))
-            if np.linalg.norm(delta[1:]) >= 1e-8:
-                angular[:] = holden_quat.to_scaled_angle_axis(delta) * FPS
-        statics.append(np.concatenate((
-            np.zeros(18, np.float32), linear.astype(np.float32), angular,
-            np.array([0.0], np.float32),
-        )))
-    return (
-        windows,
-        np.asarray(statics, np.float32).reshape(-1, STATIC_CONDITION_DIM),
-        np.asarray(temporal, np.float32).reshape(-1, WALK_FRAMES, TEMPORAL_CONDITION_DIM),
-        np.column_stack((starts, starts + WALK_FRAMES)).astype(np.int32),
-    )
+def _walking_row(clip: HoldenClip, start: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Encode one source-contained row in its terminal-root goal frame."""
+    stop = int(start + WALK_FRAMES)
+    window = _encode_walking_window(clip, int(start))
+    root = clip.positions[start:stop, 0].astype(np.float64)
+    terminal_rotation = _yaw_quaternion(clip.rotations[stop - 1, 0])
+    goal_root = holden_quat.inv_mul_vec(terminal_rotation, root - root[-1])
+    terminal_yaw = _yaw(terminal_rotation)
+    root_yaw = np.asarray([_yaw(q) for q in clip.rotations[start:stop, 0]])
+    route = np.column_stack((
+        goal_root[:, 0], goal_root[:, 2],
+        np.sin(root_yaw - terminal_yaw), np.cos(root_yaw - terminal_yaw),
+    )).astype(np.float32)
+    phases = np.zeros((WALK_FRAMES, 5), np.float32)
+    phases[:, 0] = 1.0
+    temporal = np.concatenate((route, phases), axis=1)
+    linear = (goal_root[min(1, WALK_FRAMES - 1)] - goal_root[0]) * FPS
+    q0 = holden_quat.mul(holden_quat.inv(terminal_rotation), clip.rotations[start, 0])
+    q1 = holden_quat.mul(holden_quat.inv(terminal_rotation), clip.rotations[start + 1, 0])
+    rotation_delta = holden_quat.mul(q1, holden_quat.inv(q0))
+    angular = np.zeros(3, np.float32)
+    if np.linalg.norm(rotation_delta[1:]) >= 1e-8:
+        angular[:] = holden_quat.to_scaled_angle_axis(rotation_delta) * FPS
+    static = np.concatenate((
+        np.zeros(18, np.float32), linear.astype(np.float32), angular.astype(np.float32),
+        np.array([0.0], np.float32),
+    ))
+    return window, static, temporal
+
+
+def _walking_source_regions(frame_count: int) -> dict[str, tuple[int, int]]:
+    """Reserve disjoint source-frame regions with a full-window guard between them."""
+    guard = WALK_FRAMES - 1
+    usable = frame_count - 2 * guard
+    if usable < 3 * WALK_FRAMES:
+        raise ValueError("native G1 source is too short for three guarded walking partitions")
+    held_out = WALK_FRAMES
+    if usable >= 4 * WALK_FRAMES:
+        held_out = 2 * WALK_FRAMES
+    train = usable - 2 * held_out
+    regions = {
+        "train": (0, train),
+        "validation": (train + guard, train + guard + held_out),
+        "test": (train + held_out + 2 * guard, frame_count),
+    }
+    if any(stop - start < WALK_FRAMES for start, stop in regions.values()):
+        raise AssertionError("walking source partition cannot contain one full window")
+    return regions
+
+
+def _partitioned_walking_rows(
+    clip: HoldenClip, *, stride: int, seed: int,
+) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    """Partition source time first, then balance windows only inside each partition."""
+    partitions = {}
+    for offset, (name, (region_start, region_stop)) in enumerate(_walking_source_regions(len(clip.positions)).items()):
+        first = ((region_start + stride - 1) // stride) * stride
+        starts = np.arange(first, region_stop - WALK_FRAMES + 1, stride, dtype=np.int32)
+        selected = _coverage_balanced_walking_indices(clip, stride, seed + offset, starts)
+        selected_starts = starts[selected]
+        rows = [_walking_row(clip, int(start)) for start in selected_starts]
+        windows = np.asarray([row[0] for row in rows], np.float32)
+        statics = np.asarray([row[1] for row in rows], np.float32)
+        temporal = np.asarray([row[2] for row in rows], np.float32)
+        ranges = np.column_stack((selected_starts, selected_starts + WALK_FRAMES)).astype(np.int32)
+        partitions[name] = (windows, statics, temporal, ranges)
+    return partitions
+
+
+def _assert_disjoint_walking_source_ranges(
+    partitions: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+) -> None:
+    seen_frames: set[int] = set()
+    seen_ranges: set[tuple[int, int]] = set()
+    for name in SPLITS:
+        ranges = partitions[name][3]
+        ranges_in_partition = {tuple(int(value) for value in item) for item in ranges}
+        frames_in_partition = {
+            frame for start, stop in ranges_in_partition for frame in range(start, stop)
+        }
+        if seen_ranges.intersection(ranges_in_partition) or seen_frames.intersection(frames_in_partition):
+            raise AssertionError(f"walking source leakage into {name} partition")
+        seen_ranges.update(ranges_in_partition)
+        seen_frames.update(frames_in_partition)
 
 
 def _manifest_metadata(manifest: dict, artifact) -> list[dict]:
@@ -224,21 +314,19 @@ def build_dataset(
     if rows.walk_windows[:, 30:50].tobytes() != rows.pickup_windows[:, :20].tobytes():
         raise AssertionError("interaction dataset overlap audit failed")
     walking = load_native_g1_walk(walking_source, g1_xml)
-    walking_windows, walking_static, walking_temporal, walking_ranges = _walking_rows(
-        walking, stride=10, seed=seed
-    )
-    if len(walking_windows) == 0:
-        raise ValueError("native G1 source produced no complete walking windows")
+    walking_partitions = _partitioned_walking_rows(walking, stride=10, seed=seed)
+    _assert_disjoint_walking_source_ranges(walking_partitions)
+    if any(len(walking_partitions[name][0]) == 0 for name in SPLITS):
+        raise ValueError("native G1 source produced an empty walking partition")
 
     interaction_split = _split_interaction_by_object(rows.object_ids, seed)
-    walking_split = _split_indices(len(walking_windows), seed + 1)
     values: dict[str, np.ndarray] = {}
     _partition_overlap(values, rows, interaction_split)
-    for name, indices in walking_split.items():
-        values[f"{name}_walking_windows"] = walking_windows[indices]
-        values[f"{name}_walking_static_conditions"] = walking_static[indices]
-        values[f"{name}_walking_temporal"] = walking_temporal[indices]
-        values[f"{name}_walking_source_ranges"] = walking_ranges[indices]
+    for name, (windows, statics, temporal, ranges) in walking_partitions.items():
+        values[f"{name}_walking_windows"] = windows
+        values[f"{name}_walking_static_conditions"] = statics
+        values[f"{name}_walking_temporal"] = temporal
+        values[f"{name}_walking_source_ranges"] = ranges
 
     train_frames = np.concatenate((
         values["train_walk_windows"], values["train_pickup_windows"], values["train_walking_windows"],
@@ -247,8 +335,6 @@ def build_dataset(
     values["normalization_scale"] = np.maximum(
         train_frames.std(axis=(0, 1), dtype=np.float64), 1e-5
     ).astype(np.float32)
-    _atomic_npz(output, values)
-
     continuation_records = []
     for row, clip in enumerate(rows.continuation_sequence_indices):
         record = manifest["clips"][int(clip)]
@@ -270,20 +356,23 @@ def build_dataset(
         "frame_schema": FRAME_DIM,
         "fps": FPS,
         "interaction_rows": int(len(rows.walk_windows)),
-        "walking_rows": int(len(walking_windows)),
+        "walking_rows": int(sum(len(walking_partitions[name][0]) for name in SPLITS)),
         "split_interaction_rows": {name: int(len(indices)) for name, indices in interaction_split.items()},
         "split_interaction_object_counts": {
             name: int(len(np.unique(rows.object_ids[indices])))
             for name, indices in interaction_split.items()
         },
-        "split_walking_rows": {name: int(len(indices)) for name, indices in walking_split.items()},
+        "split_walking_rows": {
+            name: int(len(walking_partitions[name][0])) for name in SPLITS
+        },
+        "walking_source_partitions_disjoint": True,
         "overlap_byte_identical": True,
         "rejection_counts": rows.rejection_counts,
         "normalization_partition": "train",
         "source_hashes": source_hashes,
         "continuations": continuation_records,
     }
-    _atomic_json(output.with_suffix(".manifest.json"), audit)
+    _atomic_dataset_pair(output, values, audit)
     return audit
 
 
