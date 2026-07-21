@@ -44,6 +44,11 @@ _VECTOR_FIELDS = (
     ("requested_velocity_mujoco", 3),
     ("requested_heading_mujoco_wxyz", 4),
     ("generated_virtual_root_displacement_mujoco", 3),
+    # First and last source-step applied velocities in the MuJoCo target
+    # basis, transformed by the existing Holden-to-MuJoCo helper. These are
+    # honest producer-side references, never inferred from displacement.
+    ("applied_velocity_mujoco_first", 3),
+    ("applied_velocity_mujoco_last", 3),
 )
 
 
@@ -90,6 +95,9 @@ class BoundaryTrace:
     requested_velocity_mujoco: tuple[float, float, float]
     requested_heading_mujoco_wxyz: tuple[float, float, float, float]
     generated_virtual_root_displacement_mujoco: tuple[float, float, float]
+    # First/last source-step applied velocities in MuJoCo coordinates.
+    applied_velocity_mujoco_first: tuple[float, float, float]
+    applied_velocity_mujoco_last: tuple[float, float, float]
     # Real state-log measurement, or None when the log does not bound the
     # released chunk.  Never a made-up zero.
     observed_mujoco_root_displacement: tuple[float, float, float] | None

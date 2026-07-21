@@ -626,6 +626,34 @@ def _exact_object(
     return value
 
 
+def _validate_movement_model_object(value: object) -> str:
+    source = _exact_object(
+        value,
+        {
+            "profile",
+            "acceleration_mps2",
+            "deceleration_mps2",
+            "directional_acceleration",
+            "turn_strength",
+        },
+        "MM reset movement_model",
+    )
+    if source["profile"] not in ("raw", "holden-v1"):
+        raise ProcessProtocolError("MM reset movement_model profile is invalid")
+    if source["acceleration_mps2"] != 1.5 or source["deceleration_mps2"] != 2.0:
+        raise ProcessProtocolError(
+            "MM reset movement_model parameters are not the fixed values"
+        )
+    if (
+        source["directional_acceleration"] is not False
+        or source["turn_strength"] is not False
+    ):
+        raise ProcessProtocolError(
+            "MM reset movement_model must disable directional/turn features"
+        )
+    return source["profile"]
+
+
 def _finite_number(value: object, label: str) -> float:
     if type(value) not in (int, float):
         raise ProcessProtocolError(f"{label} must be a finite JSON number")
@@ -1070,22 +1098,37 @@ class MMChunkClient:
             float(terrain_weight)
         ):
             raise ValueError("terrain_weight must be finite")
+        movement_model = getattr(config, "movement_model", "raw")
+        if movement_model not in ("raw", "holden-v1"):
+            raise ValueError("movement_model must be raw or holden-v1")
         data = self._request(
             "reset",
             session_id=session,
             scene_id=scene_id,
             route_id=route_id,
             terrain_weight=float(terrain_weight),
+            movement_model=movement_model,
         )
         source = _exact_object(
             data,
-            {"session_id", "active_candidate_id", "scene", "initial_boundary"},
+            {
+                "session_id",
+                "active_candidate_id",
+                "scene",
+                "movement_model",
+                "initial_boundary",
+            },
             "MM reset data",
         )
         if source["session_id"] != session or source["active_candidate_id"] is not None:
             raise ProcessProtocolError("MM reset state identity mismatch")
         if type(source["scene"]) is not dict or type(source["initial_boundary"]) is not dict:
             raise ProcessProtocolError("MM reset data contains invalid objects")
+        selected = _validate_movement_model_object(source["movement_model"])
+        if selected != movement_model:
+            raise ProcessProtocolError(
+                "MM reset selected profile does not match the request"
+            )
         self._session_id = session
         self.active_candidate_id = None
         self.outstanding_candidate_id = None

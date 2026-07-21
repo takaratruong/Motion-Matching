@@ -569,6 +569,31 @@ public:
         std::string& message)
     {
         char error[1024] = {};
+        // Translate and validate the session profile before touching any
+        // scene, feature, or controller state so an invalid selection fails
+        // without mutating prepared or active state.
+        g1_movement_model_profile movement_profile = G1MovementRaw;
+        if (request.movement_model == "holden-v1") {
+            movement_profile = G1MovementHoldenV1;
+        } else if (request.movement_model != "raw") {
+            message = "movement_model must be raw or holden-v1";
+            return false;
+        }
+        const g1_movement_model_config movement_config =
+            g1_movement_model_fixed_config();
+        vec3 movement_probe;
+        if (!g1_movement_model_step(
+                movement_probe,
+                vec3(),
+                vec3(),
+                0.04f,
+                movement_profile,
+                movement_config,
+                error,
+                static_cast<int>(sizeof(error)))) {
+            message = error;
+            return false;
+        }
         if (request.scene_id == SonicFlatSceneId) {
             if (!sonic_flat_scene_build(
                     context.scene,
@@ -636,6 +661,7 @@ public:
             message = error;
             return false;
         }
+        next_state.movement_model_profile = movement_profile;
         next_state.route_index = static_cast<int>(
             route - context.scene.metadata.routes.data());
         next_state.route_waypoint = 1;
@@ -759,6 +785,7 @@ public:
             const bool wants_motion = planar_speed_squared > 1.0e-4f;
             if (!wants_motion && state.frame_index == flat_hold_frame_) {
                 state.desired_velocity = vec3();
+                state.movement_velocity = vec3();
                 state.desired_rotation = quat(
                     request.desired_heading_holden_wxyz[0],
                     request.desired_heading_holden_wxyz[1],
@@ -1456,6 +1483,7 @@ static std::string mm_json_hello_data(const mm_server_identity& identity)
     writer.raw(",\"skeleton_signature\":");
     writer.string(identity.skeleton_signature);
     writer.raw(",\"source_rate_hz\":25,\"supported_source_intervals\":[5,10],"
+               "\"supported_movement_models\":[\"raw\",\"holden-v1\"],"
                "\"build_commit\":");
     writer.string(identity.build_commit);
     writer.raw(",\"joint_contract_sha256\":");
@@ -1478,17 +1506,38 @@ static std::string mm_json_hello_data(const mm_server_identity& identity)
     return writer.valid() ? writer.text() : std::string();
 }
 
+static void mm_json_write_movement_model(
+    mm_chunk_json_writer& writer,
+    const std::string& profile)
+{
+    const g1_movement_model_config config = g1_movement_model_fixed_config();
+    writer.raw("{\"profile\":");
+    writer.string(profile);
+    writer.raw(",\"acceleration_mps2\":");
+    writer.number(config.acceleration);
+    writer.raw(",\"deceleration_mps2\":");
+    writer.number(config.deceleration);
+    writer.raw(",\"directional_acceleration\":");
+    writer.raw(config.directional_acceleration ? "true" : "false");
+    writer.raw(",\"turn_strength\":");
+    writer.raw(config.turn_strength ? "true" : "false");
+    writer.character('}');
+}
+
 static std::string mm_json_reset_data(
     const std::string& session_id,
     const mm_chunk_boundary& boundary,
     const mm_server_identity& identity,
-    const mm_server_scene_identity& scene)
+    const mm_server_scene_identity& scene,
+    const mm_chunk_reset_request& request)
 {
     mm_chunk_json_writer writer;
     writer.raw("{\"session_id\":");
     writer.string(session_id);
     writer.raw(",\"active_candidate_id\":null,\"scene\":");
     mm_json_write_scene(writer, scene);
+    writer.raw(",\"movement_model\":");
+    mm_json_write_movement_model(writer, request.movement_model);
     writer.raw(",\"initial_boundary\":");
     mm_json_write_boundary(
         writer, boundary, identity.source_joint_names, session_id);
@@ -1841,7 +1890,8 @@ static int mm_server_run(Adapter& adapter)
                     preparation.boundary,
                     adapter.identity(),
                     adapter.prepared_scene_identity(
-                        preparation.adapter_context));
+                        preparation.adapter_context),
+                    request.reset);
                 if (data.empty()) {
                     success = false;
                     mm_chunk_fail(

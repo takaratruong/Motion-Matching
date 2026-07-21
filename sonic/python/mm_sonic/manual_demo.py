@@ -32,7 +32,7 @@ from .joints import ContractError, load_joint_contract
 from .manual_evidence import (
     environment_control_record,
     manual_command_artifact_bytes,
-    manual_summary_v4_bytes,
+    manual_summary_v5_bytes,
 )
 from .operator import OperatorLimits, OperatorSampler
 from .operator_x11 import ContinuousControlLoop, X11KeyStateProvider
@@ -295,6 +295,27 @@ class StartupTransaction:
     initial_state: object
 
 
+def _require_supported_movement_model(hello: object, movement_model: str) -> None:
+    """Fail closed before reset if the server cannot honor the profile."""
+
+    supported = None
+    if type(hello) is dict:
+        supported = hello.get("supported_movement_models")
+    if (
+        type(supported) is not list
+        or not supported
+        or any(type(name) is not str for name in supported)
+        or len(set(supported)) != len(supported)
+    ):
+        raise ValueError(
+            "MM hello must advertise a unique list of movement models"
+        )
+    if movement_model not in supported:
+        raise ValueError(
+            f"MM server does not support movement model {movement_model!r}"
+        )
+
+
 def _run_startup_transaction(
     dependencies: DemoDependencies,
     *,
@@ -306,12 +327,14 @@ def _run_startup_transaction(
     terrain_weight: float,
     session_id: str,
     log_dir: Path,
+    movement_model: str = "raw",
 ) -> StartupTransaction:
     """Run the fail-closed MM -> scene -> initial-state -> simulator order."""
 
     hello = mm.hello()
+    _require_supported_movement_model(hello, movement_model)
     reset = mm.reset(
-        SessionConfig(scene_id, route_id, terrain_weight),
+        SessionConfig(scene_id, route_id, terrain_weight, movement_model),
         session_id=session_id,
     )
     scene_identity = reset["scene"]
@@ -474,6 +497,7 @@ def _write_responsive_evidence(
     *,
     committed_prefixes: int | None = None,
     source_intervals: int = 10,
+    movement_model: object = None,
 ) -> dict | None:
     """Write append-only responsive trace JSONL and an honest evidence summary.
 
@@ -519,6 +543,9 @@ def _write_responsive_evidence(
         # GEAR stream-processing acknowledgement (WAIT-phase only). The lookahead
         # is the true dynamic horizon = source_intervals / 25 s.
         "lookahead_seconds": _horizon_seconds(source_intervals),
+        # The server-authored selected profile and fixed parameters, recorded
+        # verbatim as honest evidence of the reference model that was applied.
+        "movement_model": movement_model,
     }
     bundle.write_text(
         "responsive-evidence.json",
@@ -722,11 +749,13 @@ def run_demo(namespace: argparse.Namespace) -> Path:
     cancellation = threading.Event()
     try:
         hello = mm.hello()
+        _require_supported_movement_model(hello, namespace.movement_model)
         reset = mm.reset(
             SessionConfig(
                 namespace.scene_id,
                 namespace.route_id,
                 namespace.terrain_weight,
+                namespace.movement_model,
             ),
             session_id=session_id,
         )
@@ -960,6 +989,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                 next_chunk - preload_chunks if responsive else None
             ),
             source_intervals=source_intervals,
+            movement_model=reset["movement_model"],
         )
         snapshot = simulator.snapshot()
         if namespace.scene_id == "sonic-flat-baseline":
@@ -1019,7 +1049,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                 ),
                 initial_qpos_sha256=initial_state.qpos_sha256,
             )
-            summary_bytes = manual_summary_v4_bytes(
+            summary_bytes = manual_summary_v5_bytes(
                 mode=namespace.mode,
                 run_root=str(bundle.path),
                 preload_chunks=preload_chunks,
@@ -1029,9 +1059,10 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                 hand_targets=NEUTRAL_HAND_TARGETS,
                 environment_control=environment_control,
                 snapshot=snapshot,
+                movement_model=reset["movement_model"],
             )
             summary = json.loads(summary_bytes)
-            if summary.get("schema") != "mm-sonic-manual-demo/v4":
+            if summary.get("schema") != "mm-sonic-manual-demo/v5":
                 raise ContractError("terrain manual summary schema changed")
         bundle.write_bytes("manual-commands.json", command_artifact)
         bundle.write_bytes("manual-summary.json", summary_bytes)
@@ -1110,6 +1141,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--scene-id", default=None)
     parser.add_argument("--route-id", default=None)
     parser.add_argument("--terrain-weight", type=float, default=None)
+    parser.add_argument(
+        "--movement-model",
+        choices=("raw", "holden-v1"),
+        default="raw",
+    )
     parser.add_argument(
         "--input-source", choices=("x11", "terminal"), default=None
     )

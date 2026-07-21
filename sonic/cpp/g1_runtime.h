@@ -880,7 +880,8 @@ static inline bool g1_runtime_step_internal(
     const g1_runtime_config& config,
     PredictionBuilder prediction_builder,
     char* error,
-    int capacity)
+    int capacity,
+    vec3* movement_prediction_target = nullptr)
 {
     if (request.mode < G1RuntimeVisual || request.mode > G1RuntimeDirect) {
         return scene_error(
@@ -938,7 +939,7 @@ static inline bool g1_runtime_step_internal(
     next.clamp_y = 0.0f;
 
     traversability_diagnostics traversal = {};
-    vec3 desired_velocity_curr = traversability_limit_command(
+    const vec3 limited_velocity = traversability_limit_command(
         next.traversal_speed_scale,
         next.traversal_speed_scale_velocity,
         traversal,
@@ -948,19 +949,50 @@ static inline bool g1_runtime_step_internal(
         commanded_velocity,
         dt);
     if (!g1_runtime_traversal_is_finite(traversal) ||
-        !terrain_float_is_finite(desired_velocity_curr.x) ||
-        !terrain_float_is_finite(desired_velocity_curr.y) ||
-        !terrain_float_is_finite(desired_velocity_curr.z))
+        !terrain_float_is_finite(limited_velocity.x) ||
+        !terrain_float_is_finite(limited_velocity.y) ||
+        !terrain_float_is_finite(limited_velocity.z))
     {
         return scene_error(
             error,
             capacity,
             "command traversal produced non-finite diagnostics");
     }
+
+    // Shape the traversability-limited command through the session movement
+    // model exactly once per MM step. `raw` returns the limited command
+    // unchanged; `holden-v1` advances the persistent intermediate velocity.
+    vec3 desired_velocity_curr;
+    if (!g1_movement_model_step(
+            desired_velocity_curr,
+            next.movement_velocity,
+            limited_velocity,
+            dt,
+            next.movement_model_profile,
+            g1_movement_model_fixed_config(),
+            error,
+            capacity)) {
+        return false;
+    }
+    next.movement_velocity = desired_velocity_curr;
+    if (movement_prediction_target != nullptr) {
+        *movement_prediction_target = limited_velocity;
+    }
+
     traversability_stop_blocked_planar_dynamics(
         traversal,
         next.simulation_velocity,
         next.simulation_acceleration);
+    if (traversal.blocked) {
+        next.movement_velocity.x = 0.0f;
+        next.movement_velocity.z = 0.0f;
+        // Raw keeps its historical limited command exactly; only the shaped
+        // profiles clear their planar applied velocity on a blocked stop.
+        if (next.movement_model_profile != G1MovementRaw) {
+            desired_velocity_curr.x = 0.0f;
+            desired_velocity_curr.z = 0.0f;
+        }
+    }
     next.blocked = traversal.blocked;
     next.walkability_class = traversal.walkability_class;
     next.blocked_distance = traversal.distance;
@@ -1664,6 +1696,10 @@ static inline bool g1_runtime_step_direct_internal(
             capacity,
             "renderer-free default predictor requires direct mode");
     }
+    // The internal step publishes the traversability-limited target here so
+    // the holden-v1 velocity predictor can ramp toward the same feasible
+    // command that shaped the current frame.
+    vec3 movement_prediction_target;
     const auto direct_prediction_builder =
         [&](G1CommandFramePrediction& frame_prediction,
             const G1CommandFramePrediction& frame_seed,
@@ -1684,16 +1720,27 @@ static inline bool g1_runtime_step_direct_internal(
                 direct_request,
                 [&](slice1d<vec3> desired_velocities,
                     bool& route_force_search,
-                    char*,
-                    int) {
-                    for (int index = 0;
-                         index < G1CommandTrajectorySampleCount;
-                         ++index) {
-                        desired_velocities(index) =
-                            direct_request.intent.requested_velocity;
-                    }
+                    char* fill_error,
+                    int fill_capacity) {
                     route_force_search = false;
-                    return true;
+                    if (next.movement_model_profile == G1MovementRaw) {
+                        for (int index = 0;
+                             index < G1CommandTrajectorySampleCount;
+                             ++index) {
+                            desired_velocities(index) =
+                                direct_request.intent.requested_velocity;
+                        }
+                        return true;
+                    }
+                    return g1_movement_model_predict(
+                        desired_velocities,
+                        next.movement_velocity,
+                        movement_prediction_target,
+                        runtime_config.trajectory_sample_time,
+                        next.movement_model_profile,
+                        g1_movement_model_fixed_config(),
+                        fill_error,
+                        fill_capacity);
                 },
                 [](slice1d<quat>,
                    const slice1d<vec3>,
@@ -1756,7 +1803,8 @@ static inline bool g1_runtime_step_direct_internal(
         config,
         direct_prediction_builder,
         error,
-        capacity);
+        capacity,
+        &movement_prediction_target);
 }
 
 static inline bool g1_runtime_step(

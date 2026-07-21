@@ -89,7 +89,17 @@ static std::string source_call_text(
     const std::size_t start,
     const char* description)
 {
-    const std::size_t name = source.find(function_name, start);
+    const std::size_t function_length = std::strlen(function_name);
+    std::size_t name = start;
+    while ((name = source.find(function_name, name)) != std::string::npos) {
+        const bool left_boundary =
+            name == 0 || !identifier_character(source[name - 1]);
+        const std::size_t after = name + function_length;
+        const bool right_boundary =
+            after == source.size() || !identifier_character(source[after]);
+        if (left_boundary && right_boundary) break;
+        name += function_length;
+    }
     check(name != std::string::npos, description);
     const std::size_t open = source.find('(', name);
     check(open != std::string::npos, description);
@@ -223,8 +233,12 @@ static void test_controller_wires_idle_match_transition_cost()
         "database_search",
         policy,
         "ordinary database search follows idle policy");
-    check(source_call_argument_count(search_call) == 5 &&
-              search_call.find("transition_cost") != std::string::npos,
+    const std::size_t transition_argument =
+        search_call.find("transition_cost");
+    check(source_call_argument_count(search_call) == 9 &&
+              transition_argument != std::string::npos &&
+              source_call_argument_count(
+                  search_call.substr(0, transition_argument) + ")") == 5,
           "idle transition cost is the fifth database_search argument");
 }
 
@@ -391,10 +405,12 @@ static void test_controller_publishes_independent_travel_and_heading()
         "const quat desired_rotation_curr = request.desired_heading_holden;",
         runtime_command);
     const std::size_t traversal = runtime_source.find(
-        "vec3 desired_velocity_curr = traversability_limit_command(",
+        "const vec3 limited_velocity = traversability_limit_command(",
         runtime_heading);
+    const std::size_t movement_model = runtime_source.find(
+        "if (!g1_movement_model_step(", traversal);
     const std::size_t intent = runtime_source.find(
-        "G1CommandIntent command_intent;", traversal);
+        "G1CommandIntent command_intent;", movement_model);
     const std::size_t prediction = runtime_source.find(
         "if (!prediction_builder(", intent);
     const std::size_t publication = runtime_source.find(
@@ -404,15 +420,18 @@ static void test_controller_publishes_independent_travel_and_heading()
     check(runtime_command != std::string::npos &&
               runtime_heading != std::string::npos &&
               traversal != std::string::npos &&
+              movement_model != std::string::npos &&
               intent != std::string::npos &&
               prediction != std::string::npos &&
               publication != std::string::npos &&
               query != std::string::npos &&
               runtime_command < runtime_heading &&
-              runtime_heading < traversal && traversal < intent &&
+              runtime_heading < traversal && traversal < movement_model &&
+              movement_model < intent &&
               intent < prediction && prediction < publication &&
               publication < query,
-          "runtime limits travel before publishing one transactional frame");
+          "runtime limits and shapes travel before publishing one "
+          "transactional frame");
     const std::string traversal_call = source_call_text(
         runtime_source,
         "traversability_limit_command",
@@ -795,6 +814,8 @@ static void poison_state(g1_controller_state& state)
     state.transition_src_rotation = quat(37.0f, 38.0f, 39.0f, 40.0f);
     state.transition_dst_rotation = quat(41.0f, 42.0f, 43.0f, 44.0f);
 
+    state.movement_model_profile = G1MovementHoldenV1;
+    state.movement_velocity = vec3(0.25f, 0.0f, -0.5f);
     state.desired_velocity = vec3(1.0f, 2.0f, 3.0f);
     state.desired_velocity_change_curr = vec3(4.0f, 5.0f, 6.0f);
     state.desired_velocity_change_prev = vec3(7.0f, 8.0f, 9.0f);
@@ -1091,6 +1112,8 @@ static bool same_state_bits(
            same_quat_bits(
                first.transition_dst_rotation,
                second.transition_dst_rotation) &&
+           first.movement_model_profile == second.movement_model_profile &&
+           same_vec3_bits(first.movement_velocity, second.movement_velocity) &&
            same_vec3_bits(first.desired_velocity, second.desired_velocity) &&
            same_vec3_bits(
                first.desired_velocity_change_curr,
@@ -1408,6 +1431,9 @@ static void test_reset_clears_every_dynamic_subsystem()
     check_quat_array(state.bone_offset_rotations, G1_BoneCount, quat(),
                      "rotation offsets reset");
 
+    check(state.movement_model_profile == G1MovementRaw &&
+              same_vec3(state.movement_velocity, vec3()),
+          "reset restores raw movement profile and zero intermediate velocity");
     check(same_vec3(state.desired_velocity, vec3()) &&
               same_vec3(state.desired_velocity_change_curr, vec3()) &&
               same_vec3(state.desired_velocity_change_prev, vec3()) &&
@@ -1643,6 +1669,24 @@ static void test_swap_owns_complete_command_snapshot()
           "state swap exchanges every command snapshot member");
 }
 
+static void test_swap_exchanges_movement_model_state()
+{
+    g1_controller_state first;
+    g1_controller_state second;
+    first.movement_model_profile = G1MovementHoldenV1;
+    first.movement_velocity = vec3(0.1f, 0.0f, 0.2f);
+    second.movement_model_profile = G1MovementRaw;
+    second.movement_velocity = vec3(-0.3f, 0.0f, -0.4f);
+    g1_controller_state_swap(first, second);
+    check(first.movement_model_profile == G1MovementRaw &&
+              same_vec3_bits(first.movement_velocity,
+                             vec3(-0.3f, 0.0f, -0.4f)) &&
+              second.movement_model_profile == G1MovementHoldenV1 &&
+              same_vec3_bits(second.movement_velocity,
+                             vec3(0.1f, 0.0f, 0.2f)),
+          "state swap exchanges the movement profile and velocity");
+}
+
 int main()
 {
     test_active_scene_sources_use_checked_v2_queries();
@@ -1657,6 +1701,7 @@ int main()
     test_reset_clears_every_dynamic_subsystem();
     test_failed_reset_preserves_prior_state();
     test_swap_owns_complete_command_snapshot();
+    test_swap_exchanges_movement_model_state();
     test_clone_is_deep_and_transactional();
     return 0;
 }

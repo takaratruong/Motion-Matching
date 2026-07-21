@@ -1046,9 +1046,213 @@ static void test_feasible_runtime_failures_are_transactional()
         false);
 }
 
+static bool nearly(float value, float expected)
+{
+    return std::fabs(value - expected) <= 1.0e-4f;
+}
+
+static void test_holden_movement_model_shapes_current_and_future()
+{
+    database db;
+    make_database(db);
+    scene_pack scene = make_scene();
+    terrain_support_set support;
+    make_support(support, db.nframes());
+    g1_runtime_config config;
+    char error[512] = {};
+
+    // Accelerating from rest: the first applied velocity respects the
+    // 1.5 m/s^2 acceleration bound (0.06 m/s per 0.04 s step) and the
+    // predicted samples ramp further toward the limited target.
+    g1_controller_state accel_state;
+    check(g1_controller_state_reset(
+              accel_state, db, support, scene, error,
+              static_cast<int>(sizeof(error))),
+          error);
+    accel_state.movement_model_profile = G1MovementHoldenV1;
+    g1_runtime_step_request accel_request;
+    accel_request.mode = G1RuntimeDirect;
+    accel_request.requested_velocity_holden = vec3(0.9f, 0.0f, 0.0f);
+    accel_request.desired_heading_holden = quat();
+    accel_request.matching_enabled = false;
+    g1_runtime_step_result accel_result;
+    check(g1_runtime_step(
+              accel_result, accel_state, db, support, scene,
+              accel_request, config, error,
+              static_cast<int>(sizeof(error))),
+          error);
+    check(nearly(accel_state.command.applied_velocity.x, 0.06f),
+          "holden-v1 shapes the current applied velocity by acceleration");
+    check(nearly(accel_state.movement_velocity.x, 0.06f),
+          "holden-v1 advances persistent movement velocity once per step");
+    check(accel_state.trajectory_desired_velocities(0).x > 0.06f &&
+              accel_state.trajectory_desired_velocities(0).x <= 0.560001f,
+          "holden-v1 predicts a forward-ramping future sample from a copy");
+
+    // Reversal: request the opposite direction from an established
+    // positive velocity; the first shaped applied value must remain
+    // positive and brake by at most the 0.08 m/s deceleration step.
+    g1_controller_state brake_state;
+    check(g1_controller_state_reset(
+              brake_state, db, support, scene, error,
+              static_cast<int>(sizeof(error))),
+          error);
+    brake_state.movement_model_profile = G1MovementHoldenV1;
+    brake_state.movement_velocity = vec3(0.9f, 0.0f, 0.0f);
+    g1_runtime_step_request brake_request = accel_request;
+    brake_request.requested_velocity_holden = vec3(-0.9f, 0.0f, 0.0f);
+    g1_runtime_step_result brake_result;
+    check(g1_runtime_step(
+              brake_result, brake_state, db, support, scene,
+              brake_request, config, error,
+              static_cast<int>(sizeof(error))),
+          error);
+    check(brake_state.command.applied_velocity.x > 0.0f &&
+              brake_state.command.applied_velocity.x >= 0.9f - 0.080001f,
+          "holden-v1 brakes an abrupt reversal through a bounded decel step");
+}
+
+static void test_holden_prediction_failure_is_transactional()
+{
+    database db;
+    make_database(db);
+    scene_pack scene = make_scene();
+    terrain_support_set support;
+    make_support(support, db.nframes());
+    g1_runtime_config config;
+    char error[512] = {};
+
+    g1_controller_state state;
+    check(g1_controller_state_reset(
+              state, db, support, scene, error,
+              static_cast<int>(sizeof(error))),
+          error);
+    state.movement_model_profile = G1MovementHoldenV1;
+    state.movement_velocity = vec3(0.3f, 0.0f, -0.2f);
+    // A non-finite trajectory sample time makes the movement-model
+    // prediction fail; the active state's profile and movement velocity
+    // must be preserved bit-for-bit.
+    g1_runtime_config invalid_config = config;
+    invalid_config.trajectory_sample_time =
+        std::numeric_limits<float>::quiet_NaN();
+    g1_runtime_step_request request;
+    request.mode = G1RuntimeDirect;
+    request.requested_velocity_holden = vec3(0.5f, 0.0f, 0.0f);
+    request.desired_heading_holden = quat();
+    request.matching_enabled = false;
+    const g1_movement_model_profile profile_before =
+        state.movement_model_profile;
+    const vec3 velocity_before = state.movement_velocity;
+    g1_runtime_step_result result;
+    check(!g1_runtime_step(
+              result, state, db, support, scene, request, invalid_config,
+              error, static_cast<int>(sizeof(error))),
+          "non-finite prediction sample time fails the holden-v1 step");
+    check(state.movement_model_profile == profile_before &&
+              same_vec3_bits(state.movement_velocity, velocity_before),
+          "failed holden-v1 prediction preserves active movement state");
+}
+
+static void test_holden_blocked_clears_planar_movement_velocity()
+{
+    database db;
+    make_database(db);
+    scene_pack scene = make_scene();
+    // Block every cell so the traversability limiter forces a full stop.
+    scene.walkability.cells.set(0);
+    terrain_support_set support;
+    make_support(support, db.nframes());
+    g1_runtime_config config;
+    char error[512] = {};
+
+    g1_controller_state state;
+    check(g1_controller_state_reset(
+              state, db, support, scene, error,
+              static_cast<int>(sizeof(error))),
+          error);
+    state.movement_model_profile = G1MovementHoldenV1;
+    state.movement_velocity = vec3(0.6f, 0.0f, 0.4f);
+    g1_runtime_step_request request;
+    request.mode = G1RuntimeDirect;
+    request.requested_velocity_holden = vec3(0.9f, 0.0f, 0.0f);
+    request.desired_heading_holden = quat();
+    request.matching_enabled = false;
+    g1_runtime_step_result result;
+    check(g1_runtime_step(
+              result, state, db, support, scene, request, config, error,
+              static_cast<int>(sizeof(error))),
+          error);
+    check(result.traversal.blocked,
+          "fixture blocks the commanded traversal");
+    check(state.movement_velocity.x == 0.0f &&
+              state.movement_velocity.z == 0.0f,
+          "a blocked holden-v1 step clears planar movement velocity");
+}
+
+static void test_raw_profile_preserves_generated_arrays()
+{
+    database db;
+    make_database(db);
+    scene_pack scene = make_scene();
+    terrain_support_set support;
+    make_support(support, db.nframes());
+    g1_runtime_config config;
+    char error[512] = {};
+
+    g1_runtime_step_request request;
+    request.mode = G1RuntimeDirect;
+    request.requested_velocity_holden = vec3(0.35f, 0.0f, -0.2f);
+    request.desired_heading_holden = quat();
+    request.matching_enabled = false;
+
+    // The default raw profile must reproduce the exact command and
+    // trajectory arrays regardless of any stale movement-model velocity.
+    g1_controller_state baseline;
+    check(g1_controller_state_reset(
+              baseline, db, support, scene, error,
+              static_cast<int>(sizeof(error))),
+          error);
+    g1_runtime_step_result baseline_result;
+    check(g1_runtime_step(
+              baseline_result, baseline, db, support, scene, request, config,
+              error, static_cast<int>(sizeof(error))),
+          error);
+
+    g1_controller_state with_stale;
+    check(g1_controller_state_reset(
+              with_stale, db, support, scene, error,
+              static_cast<int>(sizeof(error))),
+          error);
+    with_stale.movement_model_profile = G1MovementRaw;
+    with_stale.movement_velocity = vec3(5.0f, 0.0f, -7.0f);
+    g1_runtime_step_result stale_result;
+    check(g1_runtime_step(
+              stale_result, with_stale, db, support, scene, request, config,
+              error, static_cast<int>(sizeof(error))),
+          error);
+
+    check(same_vec3_bits(baseline.command.applied_velocity,
+                         with_stale.command.applied_velocity),
+          "raw applied velocity ignores movement-model state");
+    for (int index = 0; index < G1CommandTrajectorySampleCount; ++index) {
+        check(same_vec3_bits(
+                  baseline.trajectory_desired_velocities(index),
+                  with_stale.trajectory_desired_velocities(index)),
+              "raw trajectory desired velocities are byte-identical");
+        check(same_vec3_bits(
+                  baseline.command.predicted_desired_velocities[index],
+                  with_stale.command.predicted_desired_velocities[index]),
+              "raw predicted desired velocities are byte-identical");
+    }
+}
+
 int main()
 {
     test_direct_runtime_boundary_and_advance();
+    test_holden_movement_model_shapes_current_and_future();
+    test_holden_prediction_failure_is_transactional();
+    test_holden_blocked_clears_planar_movement_velocity();
+    test_raw_profile_preserves_generated_arrays();
     test_feasible_runtime_progression_and_masked_search();
     test_feasible_runtime_failures_are_transactional();
     test_joint_preview_selection_and_live_parity();

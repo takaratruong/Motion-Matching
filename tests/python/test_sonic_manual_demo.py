@@ -88,6 +88,19 @@ class CommandRecorderTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             _parser().parse_args(["--responsive-source-intervals", "7"])
 
+    def test_movement_model_defaults_to_raw(self) -> None:
+        self.assertEqual(_parser().parse_args([]).movement_model, "raw")
+
+    def test_movement_model_accepts_holden_v1(self) -> None:
+        self.assertEqual(
+            _parser().parse_args(["--movement-model", "holden-v1"]).movement_model,
+            "holden-v1",
+        )
+
+    def test_movement_model_rejects_other_values(self) -> None:
+        with self.assertRaises(SystemExit):
+            _parser().parse_args(["--movement-model", "other"])
+
     def test_mm_server_defaults_to_committed_build_path(self) -> None:
         default = _parser().parse_args([]).mm_server
         self.assertTrue(default.endswith("sonic/build/mm_chunk_server"))
@@ -175,7 +188,11 @@ class _FakeMM:
 
     def hello(self) -> dict:
         self._log.append("mm.hello")
-        return {"coordinate_signature": "holden", "id": "hello"}
+        return {
+            "coordinate_signature": "holden",
+            "id": "hello",
+            "supported_movement_models": ["raw", "holden-v1"],
+        }
 
     def reset(self, config: object, *, session_id: str) -> dict:
         self._log.append("mm.reset")
@@ -184,6 +201,13 @@ class _FakeMM:
             "scene": {
                 "scene_id": self._scene_id,
                 "route_id": self._route_id,
+            },
+            "movement_model": {
+                "profile": getattr(config, "movement_model", "raw"),
+                "acceleration_mps2": 1.5,
+                "deceleration_mps2": 2.0,
+                "directional_acceleration": False,
+                "turn_strength": False,
             },
             "initial_boundary": {"session_id": session_id},
         }
@@ -222,7 +246,8 @@ class _FakeInitialState:
 
 
 class StartupTransactionTests(unittest.TestCase):
-    def _run(self, scene_id: str, route_id: str, weight: float):
+    def _run(self, scene_id: str, route_id: str, weight: float,
+             movement_model: str = "raw"):
         log: list[str] = []
         mm = _FakeMM(log, scene_id, route_id)
         simulator = _FakeSimulator(log)
@@ -262,6 +287,7 @@ class StartupTransactionTests(unittest.TestCase):
             terrain_weight=weight,
             session_id="manual-1",
             log_dir=Path("/runs/manual/bootstrap-sim-logs"),
+            movement_model=movement_model,
         )
         return log, register_calls, initial_calls, scene, state, mm, simulator, result
 
@@ -285,7 +311,11 @@ class StartupTransactionTests(unittest.TestCase):
         )
         self.assertEqual(register_calls[0]["scene_id"], "grail-curb-default")
         self.assertEqual(register_calls[0]["route_id"], "curb-forward")
-        self.assertEqual(register_calls[0]["hello"], {"coordinate_signature": "holden", "id": "hello"})
+        self.assertEqual(register_calls[0]["hello"], {
+            "coordinate_signature": "holden",
+            "id": "hello",
+            "supported_movement_models": ["raw", "holden-v1"],
+        })
         self.assertEqual(
             register_calls[0]["scene"],
             {"scene_id": "grail-curb-default", "route_id": "curb-forward"},
@@ -313,6 +343,42 @@ class StartupTransactionTests(unittest.TestCase):
         self.assertEqual(mm.reset_config.scene_id, "sonic-flat-baseline")
         self.assertEqual(mm.reset_config.route_id, "flat-12s")
         self.assertEqual(mm.reset_config.terrain_weight, 0.0)
+        self.assertEqual(mm.reset_config.movement_model, "raw")
+
+    def test_reset_session_config_carries_selected_movement_model(self) -> None:
+        *_, mm, _simulator, _result = self._run(
+            "sonic-flat-baseline", "flat-12s", 0.0, movement_model="holden-v1"
+        )
+        self.assertEqual(mm.reset_config.movement_model, "holden-v1")
+
+    def test_hello_without_selected_profile_fails_before_reset(self) -> None:
+        log: list[str] = []
+
+        class _NoCapabilityMM(_FakeMM):
+            def hello(self) -> dict:
+                self._log.append("mm.hello")
+                return {"coordinate_signature": "holden", "id": "hello"}
+
+        mm = _NoCapabilityMM(log, "sonic-flat-baseline", "flat-12s")
+        simulator = _FakeSimulator(log)
+        deps = DemoDependencies(
+            register_scene=lambda *a, **k: self.fail("scene registered"),
+            build_initial_state=lambda *a, **k: self.fail("state built"),
+        )
+        with self.assertRaisesRegex(ValueError, "movement model"):
+            _run_startup_transaction(
+                deps,
+                mm=mm,
+                simulator=simulator,
+                validator=_FakeValidator(),
+                scene_id="sonic-flat-baseline",
+                route_id="flat-12s",
+                terrain_weight=0.0,
+                session_id="manual-1",
+                log_dir=Path("/runs/manual/bootstrap-sim-logs"),
+                movement_model="holden-v1",
+            )
+        self.assertEqual(log, ["mm.hello"])
 
 
 class _BoundaryMailbox:
@@ -632,7 +698,16 @@ class ResponsiveX11LoopTests(unittest.TestCase):
 
         class _Validator:
             def validate_source(self, raw):
-                return object()
+                import numpy as np
+
+                class _Checked:
+                    command = {
+                        "applied_velocity_holden": np.zeros(
+                            (10, 3), dtype=np.float32
+                        )
+                    }
+
+                return _Checked()
 
         class _Gate:
             def release_steps(self, steps):
@@ -756,6 +831,8 @@ class WriteResponsiveEvidenceTests(unittest.TestCase):
             physics_release_requested_ns=70,
             simulation_advance_completed_ns=80,
             generated_virtual_root_displacement_mujoco=(0.25, 0.0, 0.0),
+            applied_velocity_mujoco_first=(0.1, -0.2, 0.0),
+            applied_velocity_mujoco_last=(-0.3, -0.4, 0.0),
             observed_mujoco_root_displacement=observed,
             advance=object(),
         )

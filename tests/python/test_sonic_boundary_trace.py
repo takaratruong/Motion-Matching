@@ -52,6 +52,8 @@ def make_trace(**overrides) -> BoundaryTrace:
         requested_velocity_mujoco=(0.5, 0.0, 0.0),
         requested_heading_mujoco_wxyz=(1.0, 0.0, 0.0, 0.0),
         generated_virtual_root_displacement_mujoco=(0.2, 0.0, 0.0),
+        applied_velocity_mujoco_first=(0.1, -0.2, 0.0),
+        applied_velocity_mujoco_last=(-0.3, -0.4, 0.0),
         observed_mujoco_root_displacement=(0.17, 0.0, 0.0),
     )
     base.update(overrides)
@@ -97,9 +99,20 @@ class BoundaryTraceBindingTests(unittest.TestCase):
                 "requested_velocity_mujoco",
                 "requested_heading_mujoco_wxyz",
                 "generated_virtual_root_displacement_mujoco",
+                "applied_velocity_mujoco_first",
+                "applied_velocity_mujoco_last",
                 "observed_mujoco_root_displacement",
             ),
         )
+
+    def test_applied_velocity_endpoints_are_finite_width_three(self):
+        trace = make_trace()
+        self.assertEqual(trace.applied_velocity_mujoco_first, (0.1, -0.2, 0.0))
+        self.assertEqual(trace.applied_velocity_mujoco_last, (-0.3, -0.4, 0.0))
+
+    def test_applied_velocity_endpoints_reject_nonfinite(self):
+        with self.assertRaisesRegex(ContractError, "applied_velocity_mujoco_first"):
+            make_trace(applied_velocity_mujoco_first=(float("nan"), 0.0, 0.0))
 
     def test_observed_root_may_be_unavailable_none(self):
         # When the state log does not bound the released chunk, the observed

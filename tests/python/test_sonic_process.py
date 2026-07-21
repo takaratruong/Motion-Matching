@@ -84,6 +84,13 @@ class MMChunkClientRemoteErrorTests(TemporaryScriptCase):
                             "session_id": request["session_id"],
                             "active_candidate_id": None,
                             "scene": {},
+                            "movement_model": {
+                                "profile": request.get("movement_model", "raw"),
+                                "acceleration_mps2": 1.5,
+                                "deceleration_mps2": 2.0,
+                                "directional_acceleration": False,
+                                "turn_strength": False,
+                            },
                             "initial_boundary": {},
                         },
                     }
@@ -153,6 +160,98 @@ class MMChunkClientRemoteErrorTests(TemporaryScriptCase):
             client.close()
 
 
+class MMChunkClientMovementModelTests(TemporaryScriptCase):
+    def _capture_client(self, *, echo_profile=None, mismatch=False):
+        record = self.root / "reset_request.json"
+        forced = repr(echo_profile)
+        child = self.script(
+            "mm_movement_model.py",
+            f'''
+            import json
+            import sys
+
+            RECORD = {json.dumps(str(record))}
+            FORCED = {forced}
+            MISMATCH = {mismatch!r}
+
+            for line in sys.stdin:
+                request = json.loads(line)
+                op = request["op"]
+                if op == "hello":
+                    data = {{"protocol_version": 1}}
+                elif op == "reset":
+                    with open(RECORD, "w", encoding="utf-8") as handle:
+                        json.dump(request, handle)
+                    profile = FORCED if FORCED is not None else request.get(
+                        "movement_model", "raw")
+                    if MISMATCH:
+                        profile = "holden-v1" if profile == "raw" else "raw"
+                    data = {{
+                        "session_id": request["session_id"],
+                        "active_candidate_id": None,
+                        "scene": {{}},
+                        "movement_model": {{
+                            "profile": profile,
+                            "acceleration_mps2": 1.5,
+                            "deceleration_mps2": 2.0,
+                            "directional_acceleration": False,
+                            "turn_strength": False,
+                        }},
+                        "initial_boundary": {{}},
+                    }}
+                elif op == "close":
+                    data = {{}}
+                response = {{
+                    "v": 1,
+                    "ok": True,
+                    "op": op,
+                    "request_id": request["request_id"],
+                    "data": data,
+                }}
+                print(json.dumps(response, separators=(",", ":")), flush=True)
+                if op == "close":
+                    break
+            ''',
+        )
+        client = MMChunkClient(
+            run_root=self.root,
+            command=(sys.executable, "-u", str(child)),
+            stdout_archive=self.root / "mm.stdout.jsonl",
+            stderr_archive=self.root / "mm.stderr.log",
+            poll_interval_s=0.01,
+            stop_grace_s=0.05,
+            term_grace_s=0.05,
+            kill_grace_s=0.05,
+        )
+        return client, record
+
+    def test_reset_sends_selected_movement_model(self):
+        client, record = self._capture_client()
+        try:
+            client.hello()
+            source = client.reset(
+                SessionConfig("scene", "route", 4.0, "holden-v1"),
+                session_id="session-mm",
+            )
+            self.assertEqual(source["movement_model"]["profile"], "holden-v1")
+        finally:
+            client.close()
+        request = json.loads(record.read_text(encoding="utf-8"))
+        self.assertEqual(request["movement_model"], "holden-v1")
+
+    def test_reset_rejects_profile_mismatch(self):
+        client, _ = self._capture_client(mismatch=True)
+        try:
+            client.hello()
+            with self.assertRaises(ProcessProtocolError):
+                client.reset(
+                    SessionConfig("scene", "route", 4.0, "holden-v1"),
+                    session_id="session-mm",
+                )
+        finally:
+            client.close()
+
+
 class MMChunkClientSourceIntervalTests(TemporaryScriptCase):
     def _echo_client(self):
         child = self.script(
@@ -171,6 +270,13 @@ class MMChunkClientSourceIntervalTests(TemporaryScriptCase):
                         "session_id": request["session_id"],
                         "active_candidate_id": None,
                         "scene": {},
+                        "movement_model": {
+                            "profile": request.get("movement_model", "raw"),
+                            "acceleration_mps2": 1.5,
+                            "deceleration_mps2": 2.0,
+                            "directional_acceleration": False,
+                            "turn_strength": False,
+                        },
                         "initial_boundary": {},
                     }
                 elif op == "generate":

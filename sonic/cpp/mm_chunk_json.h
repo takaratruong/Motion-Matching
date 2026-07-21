@@ -291,12 +291,23 @@ static inline bool mm_chunk_json_parse_request(
     case mm_chunk_op_close:
         return mm_chunk_json_exact_keys(
             document, {"v", "op", "request_id"}, error);
-    case mm_chunk_op_reset:
-        if (!mm_chunk_json_exact_keys(
-                document,
-                {"v", "op", "request_id", "session_id", "scene_id",
-                 "route_id", "terrain_weight"},
-                error) ||
+    case mm_chunk_op_reset: {
+        // Accept the historical seven-key request (movement_model defaults to
+        // raw) or that set plus an explicit movement_model string.
+        const bool has_movement_model =
+            json_member(document, "movement_model") != nullptr;
+        const bool keys_ok = has_movement_model
+            ? mm_chunk_json_exact_keys(
+                  document,
+                  {"v", "op", "request_id", "session_id", "scene_id",
+                   "route_id", "terrain_weight", "movement_model"},
+                  error)
+            : mm_chunk_json_exact_keys(
+                  document,
+                  {"v", "op", "request_id", "session_id", "scene_id",
+                   "route_id", "terrain_weight"},
+                  error);
+        if (!keys_ok ||
             !mm_chunk_json_string_member(
                 output.reset.session_id, document, "session_id", error) ||
             !mm_chunk_json_string_member(
@@ -310,7 +321,16 @@ static inline bool mm_chunk_json_parse_request(
                 error)) {
             return false;
         }
+        if (has_movement_model &&
+            !mm_chunk_json_string_member(
+                output.reset.movement_model,
+                document,
+                "movement_model",
+                error)) {
+            return false;
+        }
         return true;
+    }
     case mm_chunk_op_generate: {
         if (!mm_chunk_json_exact_keys(
                 document,

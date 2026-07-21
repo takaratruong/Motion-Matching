@@ -90,6 +90,7 @@ class SessionConfig:
     scene_id: str
     route_id: str
     terrain_weight: float
+    movement_model: str = "raw"
 
     def __post_init__(self) -> None:
         if type(self.scene_id) is not str or not self.scene_id:
@@ -106,6 +107,8 @@ class SessionConfig:
         ):
             raise ContractError("session terrain_weight must be exact binary32")
         object.__setattr__(self, "terrain_weight", float(converted))
+        if self.movement_model not in ("raw", "holden-v1"):
+            raise ContractError("session movement_model must be raw or holden-v1")
 
 
 @dataclass(frozen=True)

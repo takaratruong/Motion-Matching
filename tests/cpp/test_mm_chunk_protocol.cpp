@@ -1,4 +1,5 @@
 #include "sonic/cpp/mm_chunk_protocol.h"
+#include "sonic/cpp/mm_chunk_json.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -705,6 +706,97 @@ static void test_candidate_preview_fields_participate_in_step_equality()
     CHECK(!(changed == baseline));
 }
 
+static void test_reset_defaults_movement_model_to_raw()
+{
+    fake_adapter adapter;
+    fake_engine protocol(adapter);
+    mm_chunk_error error;
+    mm_chunk_boundary initial;
+    CHECK(protocol.hello(error));
+    // The historical request leaves movement_model at its raw default.
+    mm_chunk_reset_request request = reset_request();
+    CHECK(request.movement_model == "raw");
+    CHECK(protocol.reset(request, initial, error));
+}
+
+static void test_reset_accepts_holden_v1_profile()
+{
+    fake_adapter adapter;
+    fake_engine protocol(adapter);
+    mm_chunk_error error;
+    mm_chunk_boundary initial;
+    CHECK(protocol.hello(error));
+    mm_chunk_reset_request request = reset_request();
+    request.movement_model = "holden-v1";
+    CHECK(protocol.reset(request, initial, error));
+}
+
+static void test_reset_rejects_unknown_movement_model_before_mutation()
+{
+    fake_adapter adapter;
+    fake_engine protocol(adapter);
+    mm_chunk_error error;
+    mm_chunk_boundary initial;
+    CHECK(protocol.hello(error));
+    CHECK(protocol.reset(reset_request(), initial, error));
+
+    const std::uint64_t active_before = fake_hash(protocol.session().active);
+    const int reset_publish_before = adapter.reset_publish_count;
+    const int observe_before = adapter.observe_count;
+
+    mm_chunk_reset_request request = reset_request("bad-profile");
+    request.movement_model = "other";
+    require_error(
+        protocol.reset(request, initial, error),
+        error,
+        "invalid_movement_model");
+    CHECK(fake_hash(protocol.session().active) == active_before);
+    CHECK(adapter.reset_publish_count == reset_publish_before);
+    CHECK(adapter.observe_count == observe_before);
+}
+
+static void test_reset_request_json_movement_model_shapes()
+{
+    // The seven-key request parses as raw.
+    mm_chunk_request seven;
+    mm_chunk_error error;
+    CHECK(mm_chunk_json_parse_request(
+        seven,
+        "{\"v\":1,\"op\":\"reset\",\"request_id\":\"r0\","
+        "\"session_id\":\"s1\",\"scene_id\":\"sc\",\"route_id\":\"rt\","
+        "\"terrain_weight\":4.0}",
+        error));
+    CHECK(seven.operation == mm_chunk_op_reset);
+    CHECK(seven.reset.movement_model == "raw");
+
+    // The eight-key request selects holden-v1.
+    mm_chunk_request eight;
+    CHECK(mm_chunk_json_parse_request(
+        eight,
+        "{\"v\":1,\"op\":\"reset\",\"request_id\":\"r0\","
+        "\"session_id\":\"s1\",\"scene_id\":\"sc\",\"route_id\":\"rt\","
+        "\"terrain_weight\":4.0,\"movement_model\":\"holden-v1\"}",
+        error));
+    CHECK(eight.reset.movement_model == "holden-v1");
+
+    // An unsupported profile string is rejected at prepare time; the parser
+    // accepts any nonempty string and the protocol validates the value.
+    fake_adapter adapter;
+    fake_engine protocol(adapter);
+    mm_chunk_boundary initial;
+    CHECK(protocol.hello(error));
+    mm_chunk_reset_request other;
+    other.session_id = "s1";
+    other.scene_id = "sc";
+    other.route_id = "rt";
+    other.terrain_weight = 4.0f;
+    other.movement_model = "other";
+    require_error(
+        protocol.reset(other, initial, error),
+        error,
+        "invalid_movement_model");
+}
+
 int main()
 {
     test_complete_protocol_state_matrix();
@@ -715,6 +807,10 @@ int main()
     test_supported_horizons_generate_matched_step_counts();
     test_unsupported_horizon_rejected_before_state_mutation();
     test_candidate_preview_fields_participate_in_step_equality();
+    test_reset_defaults_movement_model_to_raw();
+    test_reset_accepts_holden_v1_profile();
+    test_reset_rejects_unknown_movement_model_before_mutation();
+    test_reset_request_json_movement_model_shapes();
     std::puts("MM chunk protocol tests passed");
     return 0;
 }

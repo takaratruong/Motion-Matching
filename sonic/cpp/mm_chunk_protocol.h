@@ -46,6 +46,7 @@ struct mm_chunk_reset_request
     std::string scene_id;
     std::string route_id;
     float terrain_weight = 0.0f;
+    std::string movement_model = "raw";
 };
 
 struct mm_chunk_generate_request
@@ -269,6 +270,13 @@ public:
                 error,
                 "invalid_reset",
                 "reset identifiers must be nonempty");
+        }
+        if (request.movement_model != "raw" &&
+            request.movement_model != "holden-v1") {
+            return mm_chunk_fail(
+                error,
+                "invalid_movement_model",
+                "movement_model must be raw or holden-v1");
         }
 
         std::string adapter_error;

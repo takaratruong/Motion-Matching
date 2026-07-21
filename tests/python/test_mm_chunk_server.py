@@ -331,6 +331,56 @@ class ChunkServerProtocolTest(unittest.TestCase):
         self.assertTrue(
             self.server.request(generate(source_intervals=10))["ok"])
 
+    def test_hello_advertises_supported_movement_models(self):
+        identity = self.server.request(hello())["data"]
+        self.assertEqual(
+            identity["supported_movement_models"], ["raw", "holden-v1"])
+
+    def test_reset_movement_model_evidence_defaults_to_raw(self):
+        self.assertTrue(self.server.request(hello())["ok"])
+        reset_response = self.server.request(reset())
+        self.assertTrue(reset_response["ok"], reset_response)
+        self.assertEqual(reset_response["data"]["movement_model"], {
+            "profile": "raw",
+            "acceleration_mps2": 1.5,
+            "deceleration_mps2": 2.0,
+            "directional_acceleration": False,
+            "turn_strength": False,
+        })
+
+    def test_reset_selects_and_records_holden_v1(self):
+        self.assertTrue(self.server.request(hello())["ok"])
+        request = reset()
+        request["movement_model"] = "holden-v1"
+        reset_response = self.server.request(request)
+        self.assertTrue(reset_response["ok"], reset_response)
+        self.assertEqual(reset_response["data"]["movement_model"], {
+            "profile": "holden-v1",
+            "acceleration_mps2": 1.5,
+            "deceleration_mps2": 2.0,
+            "directional_acceleration": False,
+            "turn_strength": False,
+        })
+
+    def test_reset_rejects_unknown_movement_model(self):
+        self.assertTrue(self.server.request(hello())["ok"])
+        request = reset("bad-profile")
+        request["movement_model"] = "other"
+        response = self.server.request(request)
+        self.assertFalse(response["ok"], response)
+        self.assertEqual(response["error"]["code"], "invalid_movement_model")
+
+    def test_holden_v1_abort_regenerate_is_identical(self):
+        self.assertTrue(self.server.request(hello())["ok"])
+        request = reset()
+        request["movement_model"] = "holden-v1"
+        self.assertTrue(self.server.request(request)["ok"])
+        first = self.server.request(generate())
+        self.assertTrue(first["ok"], first)
+        self.assertTrue(self.server.request(finish("abort", "r3", "c000000"))["ok"])
+        regenerated = self.server.request(generate("r4"))
+        self.assertEqual(regenerated["data"], first["data"])
+
     def test_fake_joint_feasibility_identity_is_stable_across_fresh_launches(self):
         first = self.server.request(hello("first"))["data"]["joint_feasibility"]
         second_server = ChunkServer()

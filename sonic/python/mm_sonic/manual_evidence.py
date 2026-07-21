@@ -1204,6 +1204,102 @@ def parse_manual_summary_v4(
     }
 
 
+_MANUAL_SUMMARY_V5_SCHEMA = "mm-sonic-manual-demo/v5"
+_MANUAL_SUMMARY_V5_KEYS = _MANUAL_SUMMARY_V4_KEYS | {"movement_model"}
+_MOVEMENT_MODEL_KEYS = {
+    "profile",
+    "acceleration_mps2",
+    "deceleration_mps2",
+    "directional_acceleration",
+    "turn_strength",
+}
+
+
+def validate_movement_model_record(value: object) -> dict[str, object]:
+    """Validate one server-authored movement_model object exactly."""
+
+    record = _require_keys(value, _MOVEMENT_MODEL_KEYS, "movement_model")
+    if record["profile"] not in ("raw", "holden-v1"):
+        raise ContractError("movement_model profile must be raw or holden-v1")
+    if record["acceleration_mps2"] != 1.5 or record["deceleration_mps2"] != 2.0:
+        raise ContractError("movement_model parameters are not the fixed values")
+    if (
+        record["directional_acceleration"] is not False
+        or record["turn_strength"] is not False
+    ):
+        raise ContractError(
+            "movement_model must disable directional acceleration and turn strength"
+        )
+    return {
+        "profile": record["profile"],
+        "acceleration_mps2": 1.5,
+        "deceleration_mps2": 2.0,
+        "directional_acceleration": False,
+        "turn_strength": False,
+    }
+
+
+def manual_summary_v5_bytes(
+    *,
+    mode: str,
+    run_root: str,
+    preload_chunks: int,
+    generated_chunks: int,
+    lookahead_seconds: float,
+    command_bytes: bytes,
+    hand_targets: Dex3HandTargets,
+    environment_control: dict,
+    snapshot: dict,
+    movement_model: object,
+) -> bytes:
+    """Serialize a ``mm-sonic-manual-demo/v5`` summary (v4 plus movement model)."""
+
+    base = manual_summary_v4_bytes(
+        mode=mode,
+        run_root=run_root,
+        preload_chunks=preload_chunks,
+        generated_chunks=generated_chunks,
+        lookahead_seconds=lookahead_seconds,
+        command_bytes=command_bytes,
+        hand_targets=hand_targets,
+        environment_control=environment_control,
+        snapshot=snapshot,
+    )
+    document = json.loads(base)
+    document["schema"] = _MANUAL_SUMMARY_V5_SCHEMA
+    document["movement_model"] = validate_movement_model_record(movement_model)
+    try:
+        return (
+            json.dumps(document, sort_keys=True, indent=2) + "\n"
+        ).encode("ascii")
+    except (TypeError, ValueError) as error:
+        raise ContractError("manual summary v5 cannot be serialized") from error
+
+
+def parse_manual_summary_v5(
+    data: bytes | bytearray | memoryview,
+) -> dict[str, object]:
+    """Strictly parse one ``mm-sonic-manual-demo/v5`` summary."""
+
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        raise ContractError("manual summary must be bytes")
+    document = _json_object(bytes(data), label="manual summary")
+    root = _require_keys(document, _MANUAL_SUMMARY_V5_KEYS, "manual summary")
+    if root["schema"] != _MANUAL_SUMMARY_V5_SCHEMA:
+        raise ContractError("manual summary has an unsupported schema")
+    # Reuse the v4 body validation by parsing a v4 view of the same fields.
+    v4_view = {key: root[key] for key in _MANUAL_SUMMARY_V4_KEYS}
+    v4_view["schema"] = _MANUAL_SUMMARY_V4_SCHEMA
+    parsed = parse_manual_summary_v4(
+        (json.dumps(v4_view, sort_keys=True) + "\n").encode("ascii")
+    )
+    parsed["schema"] = _MANUAL_SUMMARY_V5_SCHEMA
+    parsed["movement_model"] = validate_movement_model_record(
+        root["movement_model"]
+    )
+    return parsed
+
+
 def _validate_summary(
     summary: dict[str, object],
     *,

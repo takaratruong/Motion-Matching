@@ -3,6 +3,7 @@
 #include "scene_runtime.h"
 #include "g1_command_runtime.h"
 #include "support_runtime.h"
+#include "sonic/cpp/g1_movement_model.h"
 
 #include <cfloat>
 #include <utility>
@@ -47,6 +48,9 @@ struct g1_controller_state
     vec3 transition_dst_position;
     quat transition_src_rotation;
     quat transition_dst_rotation;
+
+    g1_movement_model_profile movement_model_profile = G1MovementRaw;
+    vec3 movement_velocity;
 
     vec3 desired_velocity;
     vec3 desired_velocity_change_curr;
@@ -198,6 +202,8 @@ static inline void g1_controller_state_swap(
     swap(first.transition_dst_position, second.transition_dst_position);
     swap(first.transition_src_rotation, second.transition_src_rotation);
     swap(first.transition_dst_rotation, second.transition_dst_rotation);
+    swap(first.movement_model_profile, second.movement_model_profile);
+    swap(first.movement_velocity, second.movement_velocity);
     swap(first.desired_velocity, second.desired_velocity);
     swap(first.desired_velocity_change_curr, second.desired_velocity_change_curr);
     swap(first.desired_velocity_change_prev, second.desired_velocity_change_prev);

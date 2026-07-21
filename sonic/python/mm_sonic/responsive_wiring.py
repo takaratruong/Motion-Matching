@@ -33,6 +33,7 @@ import numpy as np
 from .boundary_trace import BoundaryTrace
 from .coordinator import CandidateSuperseded
 from .joints import ContractError
+from .transform import holden_to_mujoco_vectors
 
 
 _SUPPORTED_SOURCE_INTERVALS = (5, 10)
@@ -65,6 +66,8 @@ class AcceptedChunk:
     physics_release_requested_ns: int
     simulation_advance_completed_ns: int
     generated_virtual_root_displacement_mujoco: tuple[float, float, float]
+    applied_velocity_mujoco_first: tuple[float, float, float]
+    applied_velocity_mujoco_last: tuple[float, float, float]
     observed_mujoco_root_displacement: tuple[float, float, float] | None
     advance: object
 
@@ -175,6 +178,34 @@ def _generated_root_displacement(
     return (float(delta[0]), float(delta[1]), float(delta[2]))
 
 
+def _applied_velocity_endpoints_mujoco(
+    checked: object,
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """Transform the first/last source-step applied velocities to MuJoCo.
+
+    Reads the honest per-step ``applied_velocity_holden`` produced by the
+    server and maps both endpoints through the existing Holden-to-MuJoCo
+    helper. The values are never inferred from root displacement.
+    """
+
+    command = getattr(checked, "command", None)
+    if command is None or "applied_velocity_holden" not in command:
+        raise ContractError(
+            "validated source chunk must expose applied_velocity_holden"
+        )
+    rows = np.asarray(command["applied_velocity_holden"], dtype=np.float64)
+    if rows.ndim != 2 or rows.shape[0] < 1 or rows.shape[1] != 3:
+        raise ContractError(
+            "applied_velocity_holden must be a nonempty Nx3 array"
+        )
+    first = holden_to_mujoco_vectors(rows[0])
+    last = holden_to_mujoco_vectors(rows[-1])
+    return (
+        (float(first[0]), float(first[1]), float(first[2])),
+        (float(last[0]), float(last[1]), float(last[2])),
+    )
+
+
 def build_boundary_trace(
     prefix: object,
     accepted: AcceptedChunk,
@@ -211,6 +242,8 @@ def build_boundary_trace(
         generated_virtual_root_displacement_mujoco=(
             accepted.generated_virtual_root_displacement_mujoco
         ),
+        applied_velocity_mujoco_first=accepted.applied_velocity_mujoco_first,
+        applied_velocity_mujoco_last=accepted.applied_velocity_mujoco_last,
         observed_mujoco_root_displacement=(
             physical.observed_mujoco_root_displacement
         ),
@@ -227,7 +260,9 @@ def trace_record(trace: BoundaryTrace) -> dict:
 
     observed = trace.observed_mujoco_root_displacement
     return {
-        "schema": "mm-sonic-responsive-boundary-trace/v1",
+        # Schema v2: the public field set now carries the first/last shaped
+        # applied velocities in MuJoCo coordinates.
+        "schema": "mm-sonic-responsive-boundary-trace/v2",
         "input_transition_id": trace.input_transition_id,
         "presented_prefix_id": trace.presented_prefix_id,
         "input_observed_ns": trace.input_observed_ns,
@@ -242,6 +277,12 @@ def trace_record(trace: BoundaryTrace) -> dict:
         "requested_heading_mujoco_wxyz": list(trace.requested_heading_mujoco_wxyz),
         "generated_virtual_root_displacement_mujoco": list(
             trace.generated_virtual_root_displacement_mujoco
+        ),
+        "applied_velocity_mujoco_first": list(
+            trace.applied_velocity_mujoco_first
+        ),
+        "applied_velocity_mujoco_last": list(
+            trace.applied_velocity_mujoco_last
         ),
         "observed_mujoco_root_displacement": (
             None if observed is None else list(observed)
@@ -362,6 +403,7 @@ class ManualChunkCommitter:
         # Extract evidence while the transaction is still reversible.  Evidence
         # assembly must never be the first failure after physics is released.
         generated_root_displacement = _generated_root_displacement(prepared)
+        applied_first, applied_last = _applied_velocity_endpoints_mujoco(checked)
         # Guard the target's 50-Hz horizon here while the transaction remains
         # reversible. Physics duration was independently checked from sim_dt.
         published_rows = int(
@@ -414,6 +456,8 @@ class ManualChunkCommitter:
             physics_release_requested_ns=physics_release_requested_ns,
             simulation_advance_completed_ns=simulation_advance_completed_ns,
             generated_virtual_root_displacement_mujoco=generated_root_displacement,
+            applied_velocity_mujoco_first=applied_first,
+            applied_velocity_mujoco_last=applied_last,
             observed_mujoco_root_displacement=observed,
             advance=advance,
         )

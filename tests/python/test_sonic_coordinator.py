@@ -616,6 +616,20 @@ class CoordinatorContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, "route_id"):
             SessionConfig("sonic-flat-baseline", None, 0.0)
 
+    def test_session_config_movement_model_defaults_to_raw(self) -> None:
+        self.assertEqual(
+            SessionConfig("scene", "route", 4.0).movement_model, "raw")
+
+    def test_session_config_accepts_holden_v1(self) -> None:
+        self.assertEqual(
+            SessionConfig("scene", "route", 4.0, "holden-v1").movement_model,
+            "holden-v1",
+        )
+
+    def test_session_config_rejects_unknown_movement_model(self) -> None:
+        with self.assertRaisesRegex(ContractError, "movement_model"):
+            SessionConfig("scene", "route", 4.0, "other")
+
 
 class OfficialTargetLogTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -1678,6 +1692,13 @@ for line in sys.stdin:
             "session_id": request["session_id"],
             "active_candidate_id": None,
             "scene": {},
+            "movement_model": {
+                "profile": request.get("movement_model", "raw"),
+                "acceleration_mps2": 1.5,
+                "deceleration_mps2": 2.0,
+                "directional_acceleration": False,
+                "turn_strength": False,
+            },
             "initial_boundary": {},
         }
     elif op == "generate":

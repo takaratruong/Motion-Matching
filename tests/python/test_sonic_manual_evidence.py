@@ -31,9 +31,11 @@ from mm_sonic.manual_evidence import (
     load_canonical_target_npz,
     manual_command_artifact_bytes,
     manual_summary_v4_bytes,
+    manual_summary_v5_bytes,
     parse_environment_control,
     parse_manual_command_artifact,
     parse_manual_summary_v4,
+    parse_manual_summary_v5,
     scan_for_fall_marker,
     state_metrics,
 )
@@ -483,6 +485,48 @@ class ManualSummaryV4Tests(unittest.TestCase):
             parse_manual_summary_v4(
                 (json.dumps(document, sort_keys=True) + "\n").encode("ascii")
             )
+
+
+def _movement_model_record(profile: str = "holden-v1") -> dict:
+    return {
+        "profile": profile,
+        "acceleration_mps2": 1.5,
+        "deceleration_mps2": 2.0,
+        "directional_acceleration": False,
+        "turn_strength": False,
+    }
+
+
+class ManualSummaryV5Tests(unittest.TestCase):
+    def _v5_fields(self, run_root: str, profile: str = "holden-v1") -> dict:
+        fields = _v4_summary_fields(run_root)
+        fields["movement_model"] = _movement_model_record(profile)
+        return fields
+
+    def test_round_trips_selected_movement_model(self) -> None:
+        fields = self._v5_fields("/runs/manual-x")
+        data = manual_summary_v5_bytes(**fields)
+        parsed = parse_manual_summary_v5(data)
+        self.assertEqual(parsed["schema"], "mm-sonic-manual-demo/v5")
+        self.assertEqual(
+            parsed["movement_model"], _movement_model_record("holden-v1")
+        )
+
+    def test_records_raw_default_profile(self) -> None:
+        fields = self._v5_fields("/runs/manual-x", profile="raw")
+        parsed = parse_manual_summary_v5(manual_summary_v5_bytes(**fields))
+        self.assertEqual(parsed["movement_model"]["profile"], "raw")
+
+    def test_v4_parser_still_reads_old_summaries(self) -> None:
+        fields = _v4_summary_fields("/runs/manual-x")
+        parsed = parse_manual_summary_v4(manual_summary_v4_bytes(**fields))
+        self.assertEqual(parsed["schema"], "mm-sonic-manual-demo/v4")
+
+    def test_rejects_invalid_movement_model(self) -> None:
+        fields = self._v5_fields("/runs/manual-x")
+        fields["movement_model"] = {"profile": "other"}
+        with self.assertRaisesRegex(ContractError, "movement_model"):
+            manual_summary_v5_bytes(**fields)
 
 
 def _npz_bytes(buffer: CanonicalTargetBuffer) -> bytes:
