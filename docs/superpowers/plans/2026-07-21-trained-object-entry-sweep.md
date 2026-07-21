@@ -4,7 +4,7 @@
 
 **Goal:** Extend learned Smart Pickup's coarse route to 3.0 metres and evaluate the pinned checkpoint across 72 entry poses around its trained object.
 
-**Architecture:** `FunnelCaptureConfig` owns a learned-only 3.0-metre collision-checked route envelope while preserving its 0.45-to-1.00-metre handoff annulus. A Python evaluation tool reuses the production sampler, projection, and certification functions, varying only the six entry-condition values and writing deterministic JSON evidence.
+**Architecture:** `FunnelCaptureConfig` owns a learned-only 3.0-metre object-radius gate and collision-checked route budget while preserving its 0.45-to-1.00-metre handoff annulus. A Python evaluation tool reuses the production sampler, projection, and certification functions, varying only the six entry-condition values and writing deterministic JSON evidence.
 
 **Tech Stack:** C++17, Python 3.10, NumPy 2.2.6, PyTorch 2.5.1, GNU Make, existing learned-funnel checkpoint and training pack.
 
@@ -31,7 +31,7 @@
 **Interfaces:**
 
 - Consumes: `select_funnel_capture(Transform, InteractionTarget, obstacles, FunnelCaptureConfig)`.
-- Produces: a default `FunnelCaptureConfig` whose route envelope is 3.0 metres while `minimum_object_radius_m` and `maximum_object_radius_m` remain 0.45 and 1.00.
+- Produces: a default `FunnelCaptureConfig` whose activation object radius and route budget are 3.0 metres while `minimum_object_radius_m` and `maximum_object_radius_m` remain 0.45 and 1.00.
 
 - [ ] **Step 1: Write the failing range-boundary test**
 
@@ -71,6 +71,7 @@ Give `FunnelCaptureConfig` an explicit constructor without modifying `PickSlotCo
 struct FunnelCaptureConfig {
     float minimum_object_radius_m = 0.45F;
     float maximum_object_radius_m = 1.00F;
+    float maximum_activation_object_radius_m = 3.00F;
     PickSlotConfig route{};
 
     FunnelCaptureConfig() {
@@ -78,6 +79,10 @@ struct FunnelCaptureConfig {
     }
 };
 ```
+
+In `select_funnel_capture`, validate that the activation radius is finite and
+at least `maximum_object_radius_m`, then return `OutsideTravelEnvelope` when
+the live root's planar object radius exceeds it before enumerating candidates.
 
 - [ ] **Step 4: Run GREEN and related learned-backend tests**
 

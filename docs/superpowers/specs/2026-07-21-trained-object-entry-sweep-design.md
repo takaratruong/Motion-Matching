@@ -34,7 +34,9 @@ settled below the existing speed threshold. The exact live root and velocity
 remain the entry condition; the character must never return to a training
 start or a stale entry waypoint.
 
-The 3.0-metre route envelope belongs to `FunnelCaptureConfig`, so authored
+An explicit 3.0-metre object-radius gate belongs to `FunnelCaptureConfig`.
+Its internal route budget is also 3.0 metres so an obstacle-free angular
+capture candidate can be reached without redefining activation range. Authored
 Smart Pickup and the final interaction matcher's 1.0-metre approach limit do
 not change.
 
@@ -75,8 +77,9 @@ several bearings and distances up to 3.0 metres.
 
 Automated tests must prove:
 
-- the default learned capture route accepts a collision-free 3.0-metre route;
-- a route beyond 3.0 metres is rejected;
+- the default learned capture accepts a root exactly 3.0 metres from the object;
+- a root beyond 3.0 metres from the object is rejected even if its connector
+  to the annulus would fit inside the route budget;
 - the annulus still clamps the capture target to at most 1.0 metre;
 - authored pickup and matcher distance defaults remain 1.0 metre;
 - the sweep enumerates exactly 72 unique conditions;
