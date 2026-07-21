@@ -20,6 +20,7 @@ from mm_sonic.operator_x11 import (
     IntentSnapshot,
     KeyLevels,
     X11KeyStateProvider,
+    _classify_x11_errors,
     _is_target_window_title,
     normalized_state_from_pressed,
 )
@@ -355,6 +356,14 @@ class IntentSnapshotTests(unittest.TestCase):
 
 
 class X11KeyStateProviderTests(unittest.TestCase):
+    def test_destroyed_focus_window_degrades_to_neutral_sample(self) -> None:
+        self.assertTrue(_classify_x11_errors((3,)))
+        self.assertTrue(_classify_x11_errors((3, 3)))
+
+    def test_non_bad_window_x11_error_remains_fatal(self) -> None:
+        with self.assertRaises(ContractError):
+            _classify_x11_errors((2,))
+
     def test_live_holden_viewer_title_is_an_operator_target(self) -> None:
         self.assertTrue(
             _is_target_window_title("G1 terrain motion matching - Holden runtime")

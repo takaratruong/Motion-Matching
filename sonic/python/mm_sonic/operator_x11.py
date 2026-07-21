@@ -66,6 +66,71 @@ _FOCUS_TITLE_MARKERS = (
     "G1 terrain motion matching",
 )
 _STALENESS_S = 0.1
+_X11_BAD_WINDOW = 3
+
+
+class _XErrorEvent(ctypes.Structure):
+    """The stable leading layout of Xlib's ``XErrorEvent``."""
+
+    _fields_ = (
+        ("type", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("resourceid", ctypes.c_ulong),
+        ("serial", ctypes.c_ulong),
+        ("error_code", ctypes.c_ubyte),
+        ("request_code", ctypes.c_ubyte),
+        ("minor_code", ctypes.c_ubyte),
+    )
+
+
+_X_ERROR_HANDLER_TYPE = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(_XErrorEvent)
+)
+_X11_ERROR_LOCK = threading.Lock()
+_X11_ERRORS: dict[int, list[int]] = {}
+_X11_ERROR_HANDLER_INSTALLED = False
+
+
+@_X_ERROR_HANDLER_TYPE
+def _record_x11_error(
+    display: ctypes.c_void_p, event: ctypes.POINTER(_XErrorEvent)
+) -> int:
+    """Capture asynchronous X errors so Xlib cannot terminate the process."""
+
+    display_key = int(display or 0)
+    error_code = int(event.contents.error_code) if event else 0
+    with _X11_ERROR_LOCK:
+        _X11_ERRORS.setdefault(display_key, []).append(error_code)
+    return 0
+
+
+def _take_x11_errors(display: ctypes.c_void_p) -> tuple[int, ...]:
+    display_key = int(display.value or 0)
+    with _X11_ERROR_LOCK:
+        return tuple(_X11_ERRORS.pop(display_key, ()))
+
+
+def _classify_x11_errors(error_codes: tuple[int, ...]) -> bool:
+    """Return true for a transient destroyed-window race, else fail closed."""
+
+    if not error_codes:
+        return False
+    unexpected = tuple(code for code in error_codes if code != _X11_BAD_WINDOW)
+    if unexpected:
+        joined = ", ".join(str(code) for code in unexpected)
+        raise ContractError(f"X11 provider received protocol error code(s): {joined}")
+    return True
+
+
+def _install_x11_error_handler(lib: ctypes.CDLL) -> None:
+    """Install one process-wide nonterminating Xlib protocol-error handler."""
+
+    global _X11_ERROR_HANDLER_INSTALLED
+    with _X11_ERROR_LOCK:
+        if _X11_ERROR_HANDLER_INSTALLED:
+            return
+        lib.XSetErrorHandler(_record_x11_error)
+        _X11_ERROR_HANDLER_INSTALLED = True
 
 
 def _is_target_window_title(title: str) -> bool:
@@ -379,6 +444,7 @@ class X11KeyStateProvider:
         except OSError as error:
             raise ContractError("X11 provider requires libX11") from error
         self._configure(lib)
+        _install_x11_error_handler(lib)
         self._lib = lib
         display = lib.XOpenDisplay(name.encode("utf-8"))
         if not display:
@@ -424,6 +490,10 @@ class X11KeyStateProvider:
         lib.XQueryTree.restype = ctypes.c_int
         lib.XFree.argtypes = [ctypes.c_void_p]
         lib.XFree.restype = ctypes.c_int
+        lib.XSetErrorHandler.argtypes = [_X_ERROR_HANDLER_TYPE]
+        lib.XSetErrorHandler.restype = ctypes.c_void_p
+        lib.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.XSync.restype = ctypes.c_int
 
     def _fetch_name(self, window: int) -> str | None:
         name_ptr = ctypes.c_char_p()
@@ -485,20 +555,27 @@ class X11KeyStateProvider:
     def sample(self) -> KeyLevels:
         if self._closed:
             raise ContractError("X11 provider is closed")
-        if not self._focused_on_target(self._focus_window()):
+        _take_x11_errors(self._display)
+        focused = self._focused_on_target(self._focus_window())
+        pressed: frozenset = frozenset()
+        if focused:
+            keymap = (ctypes.c_char * 32)()
+            self._lib.XQueryKeymap(self._display, keymap)
+            raw = bytes(keymap)
+            pressed = frozenset(
+                key
+                for key, keycode in self._keycodes.items()
+                if raw[keycode >> 3] & (1 << (keycode & 7))
+            )
+        self._lib.XSync(self._display, 0)
+        if _classify_x11_errors(_take_x11_errors(self._display)):
             return KeyLevels(focused=False, pressed=frozenset())
-        keymap = (ctypes.c_char * 32)()
-        self._lib.XQueryKeymap(self._display, keymap)
-        raw = bytes(keymap)
-        pressed = {
-            key
-            for key, keycode in self._keycodes.items()
-            if raw[keycode >> 3] & (1 << (keycode & 7))
-        }
-        return KeyLevels(focused=True, pressed=frozenset(pressed))
+        return KeyLevels(focused=focused, pressed=pressed)
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
+        self._lib.XSync(self._display, 0)
+        _take_x11_errors(self._display)
         self._lib.XCloseDisplay(self._display)
