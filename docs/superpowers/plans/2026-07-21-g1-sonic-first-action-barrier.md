@@ -4,7 +4,7 @@
 
 **Goal:** Prevent live SONIC physics from starting until GEAR has produced and published the first policy action for the primed scored state.
 
-**Architecture:** Add one fail-closed readiness method to `GearProcess` that reads the owned GEAR `action.csv` through the retained directory descriptor and validates the first policy-produced row. Add a small manual-demo startup transaction that resumes and activates GEAR, crosses that barrier while MuJoCo is paused, then creates and pauses the existing `SimulationPolicyGate` before any scored release.
+**Architecture:** Retain the authenticated GEAR action-log reader, replace the scored one-step prime with a no-step LowState publication, and add a receiver-side LowCmd snapshot to the gated simulator protocol. The manual startup transaction resumes and activates GEAR, matches a received 29-joint target against an authenticated policy-action row under the pinned GEAR transform, then pauses the existing `SimulationPolicyGate` before any scored release.
 
 **Tech Stack:** Python 3.10, `unittest`, POSIX process groups and directory file descriptors, official GEAR CSV logging, and the existing gated MuJoCo protocol.
 
@@ -13,11 +13,13 @@
 - Do not edit or fork the official GEAR checkout.
 - Do not enable or retain the elastic band in the scored epoch.
 - Do not change MM chunks, target rows, the 0.2 s horizon, or command scheduling.
-- The barrier must observe actual policy output; it must not use a fixed startup sleep.
+- The barrier must observe actual policy output at the simulator DDS receiver; it must not use a fixed startup sleep or anonymous callback count.
 - Missing, partial, malformed, non-finite, timed-out, or child-aborted action evidence must fail before physics release.
 - Read only `action.csv` in the wrapper-owned GEAR logs directory without following a replacement symlink.
 - Preserve the existing full-process-group SIGSTOP/SIGCONT lifecycle.
 - Use test-first implementation and warning-strict verification.
+- Scored priming must not call `mj_step`, change MuJoCo time, or increment runner evidence counters.
+- Do not edit the pinned GEAR checkout; reconstruct its action-to-target mapping only from package constants qualified against the pinned source identity.
 
 ---
 
@@ -295,7 +297,67 @@ git add sonic/python/mm_sonic/manual_demo.py \
 git commit -m "fix: synchronize SONIC scored startup"
 ```
 
-### Task 3: Verify determinism and retain live evidence
+### Task 3: Publish scored LowState without stepping physics
+
+**Files:**
+- Modify: `tests/python/test_sonic_gated_sim.py`
+- Modify: `tests/python/test_sonic_process.py`
+- Modify: `sonic/python/mm_sonic/gated_sim.py`
+- Modify: `sonic/python/mm_sonic/process.py`
+- Modify: `sonic/python/mm_sonic/cli.py`
+
+**Interfaces:**
+- Produces: `prime_low_state` protocol operation and
+  `GatedSimulatorClient.prime_low_state()`.
+
+- [ ] Add RED runner tests proving prime publishes exactly one current LowState,
+  clears prior command receipt state, and leaves qpos, qvel, MuJoCo time, runner
+  steps, state rows, and contact rows unchanged.
+- [ ] Add RED JSONL/client tests for the exact request and response contract;
+  reject priming before reset and malformed responses.
+- [ ] Implement `ExternalGearBackend.prime_low_state()` with
+  `prepare_obs()`, bridge receipt reset, and `PublishLowState()` only. Thread it
+  through the backend protocol, runner, server, and client.
+- [ ] Replace `_reset_and_prime_scored_epoch`'s `advance(1)` with the no-step
+  operation and update its evidence contract.
+- [ ] Run warning-strict gated-simulator, process, timing, manual-demo, and CLI
+  suites.
+
+### Task 4: Authenticate LowCmd at the simulator receiver
+
+**Files:**
+- Modify: `tests/python/test_sonic_gated_sim.py`
+- Modify: `tests/python/test_sonic_process.py`
+- Modify: `tests/python/test_sonic_manual_demo.py`
+- Modify: `sonic/python/mm_sonic/gated_sim.py`
+- Modify: `sonic/python/mm_sonic/process.py`
+- Modify: `sonic/python/mm_sonic/manual_demo.py`
+
+**Interfaces:**
+- Produces: exact `low_command` snapshot protocol, complete authenticated action
+  snapshots, pinned action-to-target reconstruction, and a receiver-matched
+  startup receipt.
+
+- [ ] Add RED backend/runner tests for absent receipt, exact 29-value finite
+  target snapshots under the bridge lock, immutability, and malformed external
+  bridge state.
+- [ ] Add RED server/client tests for closed request/response shapes, wrong
+  widths/types/non-finite values, and child death/cancellation.
+- [ ] Extend the owned `action.csv` parser to return all complete contiguous
+  policy rows while retaining exact header/index/finite checks and bounded
+  reads. Add the cancellation regression omitted from Task 1.
+- [ ] Add pinned float32 action-to-LowCmd reconstruction and qualification tests
+  against the official GEAR permutation/default-angle/action-scale declarations.
+- [ ] Add a bounded startup loop that holds a received LowCmd snapshot until a
+  matching authenticated action row exists. It must check both child processes,
+  honor cancellation, and fail on timeout without advancing physics.
+- [ ] Wire `_activate_scored_control` as resume, activate, inference row,
+  receiver match, gate pause. Assert exact ordering and zero advance/time before
+  the first `release_steps` call.
+- [ ] Run the complete focused warning-strict suites and commit the corrected
+  transport fence.
+
+### Task 5: Verify determinism and retain live evidence
 
 **Files:**
 - Verify only: repository and new run artifacts beneath `/home/ubuntu/mm-sonic-holden-turn-live/`
