@@ -1997,6 +1997,9 @@ class GatedSimulatorClient:
     def close(self) -> None:
         if self._closed:
             return
+        # Cooperative cancellation interrupts operational waits, but shutdown
+        # has its own strict deadlines and must still reap the child group.
+        self._cancelled = None
         process = self._process
         assert process is not None
         assert self._pgid is not None
@@ -3288,6 +3291,7 @@ class SimulationPolicyGate:
         simulator: GatedSimulatorClient,
         *,
         tolerance: float = 1.0e-12,
+        suspend_gear_when_paused: bool = True,
     ) -> None:
         sim_dt = simulator.sim_dt
         if (
@@ -3298,10 +3302,13 @@ class SimulationPolicyGate:
             raise ValueError("sim_dt must be a positive finite number")
         if tolerance < 0.0 or not math.isfinite(tolerance):
             raise ValueError("tolerance must be finite and nonnegative")
+        if type(suspend_gear_when_paused) is not bool:
+            raise ValueError("suspend_gear_when_paused must be a boolean")
         self.gear = gear
         self.simulator = simulator
         self.sim_dt = float(sim_dt)
         self.tolerance = float(tolerance)
+        self.suspend_gear_when_paused = suspend_gear_when_paused
         self._paused = False
         self._closed = False
 
@@ -3318,7 +3325,9 @@ class SimulationPolicyGate:
 
     @property
     def is_paused(self) -> bool:
-        return self._paused and self.gear.group_is_stopped()
+        return self._paused and (
+            not self.suspend_gear_when_paused or self.gear.group_is_stopped()
+        )
 
     def require_paused(self) -> None:
         if not self.is_paused:
@@ -3327,6 +3336,11 @@ class SimulationPolicyGate:
     def pause(self) -> None:
         if self._closed:
             raise RuntimeError("simulation policy gate is closed")
+        if not self.suspend_gear_when_paused:
+            self.gear.require_alive()
+            self.simulator.require_alive()
+            self._paused = True
+            return
         try:
             if not self._paused or not self.gear.group_is_stopped():
                 self.gear.stop_group()
@@ -3359,10 +3373,11 @@ class SimulationPolicyGate:
         result: AdvanceResult | None = None
         operation_error: BaseException | None = None
         try:
-            try:
-                self.gear.continue_group()
-            except BaseException as error:
-                operation_error = _at_failure_site(error, "process_resume")
+            if self.suspend_gear_when_paused:
+                try:
+                    self.gear.continue_group()
+                except BaseException as error:
+                    operation_error = _at_failure_site(error, "process_resume")
             if operation_error is None:
                 try:
                     result = self.simulator.advance(steps)
@@ -3373,11 +3388,14 @@ class SimulationPolicyGate:
         except BaseException as error:
             operation_error = error
         stop_error: BaseException | None = None
-        try:
-            self.gear.stop_group()
-        except BaseException as error:
-            stop_error = error
-        self._paused = self.gear.group_is_stopped()
+        if self.suspend_gear_when_paused:
+            try:
+                self.gear.stop_group()
+            except BaseException as error:
+                stop_error = error
+            self._paused = self.gear.group_is_stopped()
+        else:
+            self._paused = True
         if operation_error is not None:
             if stop_error is not None and not self._paused:
                 raise stop_error from operation_error

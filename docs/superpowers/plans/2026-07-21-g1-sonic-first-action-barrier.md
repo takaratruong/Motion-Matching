@@ -336,7 +336,8 @@ git commit -m "fix: synchronize SONIC scored startup"
 **Interfaces:**
 - Produces: exact `low_command` snapshot protocol, complete authenticated action
   snapshots, fixed-nine action-to-target bounds, a receiver-matched startup
-  receipt, and a no-step LowState refresh before each GEAR resume.
+  receipt, a no-step LowState refresh before each physics release, and a live
+  physics-only pause mode that leaves GEAR's watchdog threads running.
 
 - [ ] Add RED backend/runner tests for absent receipt, exact 29-value finite
   target snapshots under the bridge lock, immutability, and malformed external
@@ -355,8 +356,9 @@ git commit -m "fix: synchronize SONIC scored startup"
 - [ ] Wire `_activate_scored_control` as resume, activate, inference row,
   receiver match, gate pause. Assert exact ordering and zero advance/time before
   the first `release_steps` call.
-- [ ] Wire one live cancellation callback into both production children and
-  refresh LowState without stepping immediately before each paused group resume.
+- [ ] Wire one live cancellation callback into both production children,
+  refresh LowState without stepping before each release, and keep GEAR running
+  while the manual live gate pauses only MuJoCo.
 - [ ] Run the complete focused warning-strict suites and commit the corrected
   transport fence.
 

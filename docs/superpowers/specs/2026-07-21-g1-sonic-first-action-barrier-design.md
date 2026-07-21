@@ -56,9 +56,11 @@ have rounded to that row, then apply the pinned permutation, action scales,
 default angles, and final float32 conversion.
 The snapshot is held fixed while later CSV rows arrive, so a fast 500 Hz writer
 cannot make the match unobservable. Once a received command is authenticated,
-the existing `SimulationPolicyGate.pause()` stops the full GEAR process group.
-The first `release_steps()` therefore begins from reset state with a proven
-policy-derived LowCmd already present at the physics consumer.
+the live `SimulationPolicyGate` enters physics-only pause mode: MuJoCo remains
+gated, but GEAR's DDS and watchdog threads stay running. The first
+`release_steps()` therefore begins from reset state with a proven policy-derived
+LowCmd already present at the physics consumer, without a stale-watchdog race
+at `SIGCONT`. Evidence/scoring gates retain full process suspension by default.
 
 The barrier will not enable or retain the elastic band, modify the target
 motion, retry a failed start, or advance scored physics. Terrain contacts and
@@ -94,9 +96,11 @@ both the inference index and the received-command index as startup evidence.
 
 `manual_demo.run_demo()` will call the barrier immediately after
 `gear.activate_control()` and before constructing and pausing the
-`SimulationPolicyGate`. Each later policy-gate release refreshes LowState while
-GEAR is still stopped, preventing the resumed watchdog from seeing the
-intentional inference pause as a lost robot connection.
+`SimulationPolicyGate`. Each later policy-gate release refreshes LowState before
+physics advances. In the live driver GEAR remains running while only physics is
+paused; the measured MM/publication interval must therefore remain below GEAR's
+pinned 500 ms LowState watchdog threshold. Longer external inference requires
+action chunking or an explicit no-step LowState maintenance service.
 
 ## Failure behavior
 
@@ -121,7 +125,8 @@ Tests will be written before production code and will prove:
 - a stale, absent, malformed, or policy-unmatched LowCmd cannot satisfy startup;
 - a receiver snapshot matching an authenticated policy row satisfies startup;
 - fixed-nine CSV rounding cannot reject a genuine received float32 target;
-- every paused-to-running release refreshes LowState before `SIGCONT`;
+- every release refreshes LowState before physics, and the live gate emits no
+  process stop/continue signals;
 - the production driver wires one cooperative-cancellation callback into both
   child-process lifecycles;
 - the manual demo orders reset, no-step prime, resume, activate, inference

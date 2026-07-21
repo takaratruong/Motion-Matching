@@ -1288,7 +1288,7 @@ class GatedSimulatorClientTests(TemporaryScriptCase):
             timer.cancel()
             pid = client.pid
             pgid = client.pgid
-            with self.assertRaises(OperatorCancelled):
+            with self.assertRaisesRegex(ProcessError, "close response"):
                 client.close()
         self.assertFalse(process_exists(pid))
         with self.assertRaises(ProcessLookupError):
@@ -3574,6 +3574,26 @@ class SimulationPolicyGateTests(TemporaryScriptCase):
             self.gear.signal_history[-3:],
             [signal.SIGSTOP, signal.SIGCONT, signal.SIGSTOP],
         )
+
+    def test_live_gate_pauses_only_physics_and_never_suspends_gear(self):
+        simulator = FakeSimulatorClient()
+        simulator.gear = self.gear
+        gate = SimulationPolicyGate(
+            self.gear,
+            simulator,
+            suspend_gear_when_paused=False,
+        )
+        before = list(self.gear.signal_history)
+
+        gate.pause()
+        result = gate.advance(0.2)
+
+        self.assertEqual(result.steps, 40)
+        self.assertTrue(gate.is_paused)
+        self.assertTrue(self.gear.group_is_resumed())
+        self.assertEqual(self.gear.signal_history, before)
+        self.assertEqual(simulator.refresh_stopped_checks, [False])
+        self.assertEqual(simulator.running_checks, [True])
 
     def test_duration_must_derive_exact_positive_integer_before_resume(self):
         simulator = FakeSimulatorClient()

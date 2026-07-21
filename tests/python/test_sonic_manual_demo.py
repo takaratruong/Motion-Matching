@@ -519,9 +519,8 @@ class ScoredControlStartupTests(unittest.TestCase):
         def group_is_resumed(self):
             return not self.stopped
 
-        @staticmethod
-        def require_alive():
-            return None
+        def require_alive(self):
+            self.calls.append("gear.require_alive")
 
     class _Simulator:
         sim_dt = 0.005
@@ -547,6 +546,7 @@ class ScoredControlStartupTests(unittest.TestCase):
             gate = _activate_scored_control(gear, simulator)
 
         self.assertIsInstance(gate, SimulationPolicyGate)
+        self.assertIs(gate.suspend_gear_when_paused, False)
         self.assertEqual(
             calls,
             [
@@ -554,11 +554,12 @@ class ScoredControlStartupTests(unittest.TestCase):
                 "gear.activate_control",
                 "gear.wait_for_first_policy_action",
                 "gear.wait_for_received_policy_command",
-                "gear.stop_group",
+                "gear.require_alive",
                 "simulator.require_alive",
             ],
         )
         self.assertTrue(gate.is_paused)
+        self.assertTrue(gear.group_is_resumed())
         self.assertEqual(simulator.advance_calls, 0)
         self.assertEqual(
             output.getvalue(),

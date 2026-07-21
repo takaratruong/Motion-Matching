@@ -381,7 +381,13 @@ def _activate_scored_control(
         f"policy_time={received['time_ms']:.3f}ms",
         flush=True,
     )
-    gate = SimulationPolicyGate(gear, simulator)
+    # Live inference pauses MuJoCo, not GEAR's DDS/control threads. Suspending
+    # the whole process makes its 500 ms LowState watchdog stale at SIGCONT.
+    gate = SimulationPolicyGate(
+        gear,
+        simulator,
+        suspend_gear_when_paused=False,
+    )
     gate.pause()
     return gate
 
