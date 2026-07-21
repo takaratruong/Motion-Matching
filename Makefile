@@ -82,6 +82,7 @@ NATIVE_G1_HEADERS := g1_terrain_skeleton.h g1_command_runtime.h \
   ik.h json_runtime.h motion_match_log.h route_runtime.h scene_runtime.h \
   sha256.h support_runtime.h terrain_runtime.h
 INTERACTION_NATIVE_G1_SOURCES := interaction_native_g1_bridge.cpp \
+  interaction_offline_overlap.cpp \
   interaction_pose.cpp interaction_target.cpp interaction_features.cpp \
   interaction_matcher.cpp interaction_playback.cpp interaction_ik.cpp \
   interaction_attachment.cpp interaction_carry.cpp interaction_runtime.cpp \
@@ -181,6 +182,7 @@ CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_funnel_timing
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_funnel_follower
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_learned_pickup_backend
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_learned_pickup_end_to_end
+CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_offline_overlap
 RELEASE_FAST_MATH_TARGET_TEST := \
   $(CPP_TEST_DIR)/test_interaction_target_release_fast_math
 RELEASE_FAST_MATH_CARRY_TEST := \
@@ -347,6 +349,14 @@ $(CPP_TEST_DIR)/test_interaction_native_g1_bridge: \
 	$(CXX) $(CPP_TEST_FLAGS) \
 	  tests/cpp/test_interaction_native_g1_bridge.cpp \
 	  interaction_native_g1_bridge.cpp interaction_pose.cpp -o $@
+
+$(CPP_TEST_DIR)/test_interaction_offline_overlap: \
+  tests/cpp/test_interaction_offline_overlap.cpp \
+  interaction_offline_overlap.cpp interaction_offline_overlap.h \
+  interaction_pose.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) \
+	  tests/cpp/test_interaction_offline_overlap.cpp \
+	  interaction_offline_overlap.cpp -o $@
 
 $(CPP_TEST_DIR)/test_interaction_target: tests/cpp/test_interaction_target.cpp interaction_target.cpp interaction_target.h interaction_pose.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_target.cpp interaction_target.cpp -o $@

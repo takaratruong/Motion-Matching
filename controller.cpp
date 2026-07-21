@@ -52,6 +52,7 @@
 #include "cleanup_runtime.h"
 #include "g1_mesh_renderer.h"
 #include "interaction_native_g1_bridge.h"
+#include "interaction_offline_overlap.h"
 #include "interaction_arrival.h"
 #include "interaction_smart_pickup_controller.h"
 #include "interaction_smart_pickup_scene.h"
@@ -2222,6 +2223,30 @@ int main(void)
     interaction::SmartPickupController smart_pickup_controller(
         smart_pickup_config);
     interaction::NativeG1PoseHandoff native_g1_pose_handoff;
+    std::optional<interaction::offline_overlap::Player> offline_overlap_player;
+    if (const char* offline_overlap_path = getenv("MM_G1_OFFLINE_OVERLAP");
+        offline_overlap_path != NULL && offline_overlap_path[0] != '\0')
+    {
+        try
+        {
+            offline_overlap_player.emplace(
+                interaction::offline_overlap::Clip::load(offline_overlap_path),
+                true);
+            fprintf(
+                stdout,
+                "G1 offline overlap visualizer loaded: %s\n",
+                offline_overlap_path);
+        }
+        catch (const std::exception& error)
+        {
+            fprintf(
+                stderr,
+                "G1 offline overlap visualizer rejected %s: %s\n",
+                offline_overlap_path,
+                error.what());
+            return 2;
+        }
+    }
     interaction::RuntimeOutput interaction_output{};
     interaction::SmartPickupPostStepResult smart_pickup_post_step{};
     std::optional<interaction::PlaceStagingPreview> native_place_preview;
@@ -4079,15 +4104,8 @@ int main(void)
                 native_g1_locomotion.pose,
                 interaction_output,
                 dt);
-        const interaction::Pose final_g1_pose = native_g1_frame.pose;
-        interaction::write_native_g1_pose(
-            final_g1_pose,
-            final_g1_local_positions,
-            final_g1_local_velocities,
-            final_g1_local_rotations,
-            final_g1_local_angular_velocities,
-            final_g1_contacts);
-        interaction::WorldPose final_g1_world_pose =
+        interaction::Pose final_g1_pose = native_g1_frame.pose;
+        const interaction::WorldPose runtime_g1_world_pose =
             interaction::world_pose(final_g1_pose);
         if (native_g1_frame.synchronize_simulation_root)
         {
@@ -4105,13 +4123,27 @@ int main(void)
                 interaction_output,
                 interaction_registry,
                 interaction_config,
-                final_g1_world_pose,
+                runtime_g1_world_pose,
                 artifact_error,
                 static_cast<int>(sizeof(artifact_error))))
         {
             controlled_runtime_error(artifact_error);
             return;
         }
+        if (offline_overlap_player.has_value())
+        {
+            final_g1_pose = offline_overlap_player->pose();
+            offline_overlap_player->advance_25hz();
+        }
+        interaction::write_native_g1_pose(
+            final_g1_pose,
+            final_g1_local_positions,
+            final_g1_local_velocities,
+            final_g1_local_rotations,
+            final_g1_local_angular_velocities,
+            final_g1_contacts);
+        interaction::WorldPose final_g1_world_pose =
+            interaction::world_pose(final_g1_pose);
 
         // Update camera
 
