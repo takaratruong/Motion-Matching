@@ -6,6 +6,8 @@ import struct
 
 import numpy as np
 
+from resources.g1_interaction_builder.schema import G1_SKELETON
+
 
 BONE_COUNT = 31
 CONTACT_COUNT = 2
@@ -117,6 +119,8 @@ def read_holden_database(path: Path) -> HoldenDatabase:
 
     if offset != len(data):
         raise ValueError("trailing bytes in Holden database")
+    if not np.array_equal(parents, G1_SKELETON.parents):
+        raise ValueError("parents must match the exact canonical G1 hierarchy")
     _require_finite(positions, velocities, rotations, angular_velocities)
     _validate_ranges(starts, stops, frames)
     return HoldenDatabase(

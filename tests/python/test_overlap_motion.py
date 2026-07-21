@@ -7,6 +7,7 @@ import numpy as np
 
 from resources.g1_interaction_builder import overlap_motion
 from resources.g1_interaction_builder.holden_database import read_holden_database
+from resources.g1_interaction_builder.schema import G1_SKELETON
 
 
 BONE_COUNT = 31
@@ -39,7 +40,8 @@ def _motion_fixture(frames: int = 4):
 def _write_database(path: Path, *, frames: int = 4, bones: int = BONE_COUNT,
                     ranges: tuple[np.ndarray, np.ndarray] | None = None,
                     contacts: int = 2, trailing: bytes = b"",
-                    finite: bool = True) -> None:
+                    finite: bool = True,
+                    parents: np.ndarray | None = None) -> None:
     positions = np.arange(frames * bones * 3, dtype=np.float32).reshape(
         frames, bones, 3
     ) * 0.01
@@ -49,7 +51,12 @@ def _write_database(path: Path, *, frames: int = 4, bones: int = BONE_COUNT,
     rotations = np.zeros((frames, bones, 4), np.float32)
     rotations[..., 0] = 1.0
     angular_velocities = positions + 2.0
-    parents = np.arange(-1, bones - 1, dtype=np.int32)
+    if parents is None:
+        parents = (
+            G1_SKELETON.parents
+            if bones == BONE_COUNT
+            else np.arange(-1, bones - 1, dtype=np.int32)
+        )
     if ranges is None:
         starts = np.array([0, 2], np.int32)
         stops = np.array([2, frames], np.int32)
@@ -123,6 +130,16 @@ class OverlapMotionTests(unittest.TestCase):
         np.testing.assert_array_equal(database.range_starts, [0, 2])
         np.testing.assert_array_equal(database.range_stops, [2, 4])
         self.assertEqual(database.positions.dtype, np.dtype("<f4"))
+
+    def test_reader_rejects_incorrect_31_bone_parent_hierarchy(self):
+        parents = G1_SKELETON.parents.copy()
+        parents[8] = 0
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "database.bin"
+            _write_database(path, parents=parents)
+            with self.assertRaisesRegex(ValueError, "exact canonical G1"):
+                read_holden_database(path)
 
     def test_reader_rejects_malformed_database_contracts(self):
         cases = (
