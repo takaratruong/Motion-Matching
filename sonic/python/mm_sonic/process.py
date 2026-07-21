@@ -78,6 +78,14 @@ _POST_ENABLE_RIGHT_LINE = "Delta heading right: 0 rad"
 _POST_ENABLE_FENCE_SEMANTICS = (
     "post-enable-reset-tail-complete-with-net-zero-heading"
 )
+_GEAR_ACTION_HEADER = (
+    "index",
+    "time_ms",
+    "time_realtime_ms",
+    "time_monotonic_ms",
+    "ros_timestamp",
+    *(f"act_{index}" for index in range(29)),
+)
 _GEAR_LAUNCH_PROFILES = frozenset({"zmq_stream", "loaded_motion"})
 _SHELL_SAFE_ABSOLUTE_PATH = re.compile(r"/[A-Za-z0-9._/-]*\Z")
 _OWNED_DIRECTORY_STAGING_PREFIX = ".mm-sonic-owned-"
@@ -2573,6 +2581,93 @@ class GearProcess:
         self._wait_exact_line(f"{marker}\n", after_offset=boundary)
         self._control_active = True
         self._ready = True
+
+    def _read_first_policy_action(self) -> Mapping[str, object] | None:
+        owned = self._owned_logs_directory
+        if owned is None:
+            raise ProcessError("GEAR logs directory is unavailable")
+        try:
+            descriptor = os.open(
+                "action.csv",
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=owned.leaf_fd,
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise ProcessError("cannot open GEAR action log") from error
+        try:
+            try:
+                mode = os.fstat(descriptor).st_mode
+                raw = os.read(descriptor, 65536)
+            except OSError as error:
+                raise ProcessError("cannot read GEAR action log") from error
+            if not stat.S_ISREG(mode):
+                raise ProcessError("GEAR action log must be a regular file")
+        finally:
+            os.close(descriptor)
+
+        if raw.count(b"\n") < 3:
+            return None
+        first_three = raw.splitlines()[:3]
+        try:
+            rows = [line.decode("ascii").split(",") for line in first_three]
+        except UnicodeDecodeError as error:
+            raise ProcessError("GEAR action log must be ASCII CSV") from error
+        if tuple(rows[0]) != _GEAR_ACTION_HEADER:
+            raise ProcessError("GEAR action log exact header changed")
+        width = len(_GEAR_ACTION_HEADER)
+        numeric_rows: list[list[float]] = []
+        for expected_index, row in enumerate(rows[1:]):
+            if len(row) != width or row[0] != str(expected_index):
+                raise ProcessError(
+                    "GEAR action log first indices must be exact 0 then 1"
+                )
+            try:
+                numeric_rows.append([float(value) for value in row])
+            except ValueError as error:
+                raise ProcessError(
+                    "GEAR action log contains a nonnumeric value"
+                ) from error
+            if not all(math.isfinite(value) for value in numeric_rows[-1]):
+                raise ProcessError(
+                    "GEAR action log contains a non-finite value"
+                )
+        policy = numeric_rows[1]
+        return MappingProxyType(
+            {
+                "index": 1,
+                "time_ms": policy[1],
+                "time_monotonic_ms": policy[3],
+                "action": tuple(policy[5:]),
+            }
+        )
+
+    def wait_for_first_policy_action(self) -> Mapping[str, object]:
+        """Wait until active GEAR control publishes its first policy action."""
+
+        if not self._control_active or not self.group_is_resumed():
+            raise ProcessError(
+                "first policy action requires resumed active GEAR control"
+            )
+        deadline = (
+            None
+            if self._readiness_timeout_s is None
+            else time.monotonic() + self._readiness_timeout_s
+        )
+        while True:
+            self.require_alive()
+            evidence = self._read_first_policy_action()
+            if evidence is not None:
+                return evidence
+            if deadline is not None and time.monotonic() >= deadline:
+                raise ProcessError(
+                    "timed out waiting for first GEAR policy action"
+                )
+            wait = self._readiness_poll_s
+            if deadline is not None:
+                wait = min(wait, max(0.0, deadline - time.monotonic()))
+            time.sleep(wait)
 
     def write_keys(self, keys: bytes) -> None:
         if type(keys) is not bytes or not keys:

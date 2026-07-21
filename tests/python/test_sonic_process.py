@@ -2177,6 +2177,294 @@ class GearProcessTests(TemporaryScriptCase):
         finally:
             gear.close()
 
+    def test_wait_for_first_policy_action_returns_authenticated_row(self):
+        child = self.script(
+            "first_policy_action.py",
+            r'''
+            import os
+            from pathlib import Path
+            import sys
+            import termios
+            import time
+
+            logs_dir = Path(sys.argv[sys.argv.index("--logs-dir") + 1])
+            attrs = termios.tcgetattr(0)
+            attrs[3] &= ~(termios.ICANON | termios.ECHO)
+            termios.tcsetattr(0, termios.TCSANOW, attrs)
+            print("BOOT READY", flush=True)
+            assert os.read(0, 1) == b"\n"
+            print("STREAM READY", flush=True)
+            assert os.read(0, 2) == b"qe"
+            print("Delta heading left: 0.1 rad", flush=True)
+            print("Delta heading right: 0 rad", flush=True)
+            assert os.read(0, 1) == b"]"
+            print("CONTROL READY", flush=True)
+
+            header = [
+                "index",
+                "time_ms",
+                "time_realtime_ms",
+                "time_monotonic_ms",
+                "ros_timestamp",
+                *[f"act_{index}" for index in range(29)],
+            ]
+            initial = [
+                "0",
+                "0.000",
+                "1.000",
+                "2.000",
+                "0.000000000",
+                *(["0.0"] * 29),
+            ]
+            policy = [
+                "1",
+                "20.000",
+                "21.000",
+                "22.000",
+                "0.000000000",
+                *(["0.25"] * 29),
+            ]
+            with (logs_dir / "action.csv").open(
+                "w", encoding="ascii", newline=""
+            ) as sink:
+                sink.write(",".join(header) + "\n")
+                sink.write(",".join(initial) + "\n")
+                sink.flush()
+                time.sleep(0.02)
+                sink.write(",".join(policy) + "\n")
+                sink.flush()
+            while os.read(0, 1).lower() != b"o":
+                pass
+            ''',
+        )
+        gear = self.gear(child, readiness_timeout_s=0.5)
+        try:
+            gear.start_to_wait_for_control()
+            gear.enable_stream_for_preload()
+            gear.stop_group()
+            gear.continue_group()
+            gear.activate_control()
+
+            ready = gear.wait_for_first_policy_action()
+
+            self.assertEqual(ready["index"], 1)
+            self.assertEqual(ready["time_ms"], 20.0)
+            self.assertEqual(ready["time_monotonic_ms"], 22.0)
+            self.assertEqual(ready["action"], (0.25,) * 29)
+            with self.assertRaises(TypeError):
+                ready["index"] = 2
+        finally:
+            gear.close()
+
+    def test_first_policy_action_rejects_wrong_header(self):
+        child = self.script("unused_action_header.py", "raise SystemExit(0)\n")
+        gear = self.gear(child)
+        header = [
+            "wrong_index",
+            "time_ms",
+            "time_realtime_ms",
+            "time_monotonic_ms",
+            "ros_timestamp",
+            *[f"act_{index}" for index in range(29)],
+        ]
+        initial = ["0", "0", "1", "2", "0", *(["0"] * 29)]
+        policy = ["1", "20", "21", "22", "0", *(["0.25"] * 29)]
+        try:
+            (gear.logs_dir / "action.csv").write_text(
+                "\n".join(
+                    (
+                        ",".join(header),
+                        ",".join(initial),
+                        ",".join(policy),
+                        "",
+                    )
+                ),
+                encoding="ascii",
+            )
+
+            with self.assertRaisesRegex(ProcessError, "exact header"):
+                gear._read_first_policy_action()
+        finally:
+            gear.close()
+
+    def test_first_policy_action_rejects_wrong_policy_index(self):
+        child = self.script("unused_action_index.py", "raise SystemExit(0)\n")
+        gear = self.gear(child)
+        header = [
+            "index",
+            "time_ms",
+            "time_realtime_ms",
+            "time_monotonic_ms",
+            "ros_timestamp",
+            *[f"act_{index}" for index in range(29)],
+        ]
+        initial = ["0", "0", "1", "2", "0", *(["0"] * 29)]
+        policy = ["2", "20", "21", "22", "0", *(["0.25"] * 29)]
+        try:
+            (gear.logs_dir / "action.csv").write_text(
+                "\n".join(
+                    (
+                        ",".join(header),
+                        ",".join(initial),
+                        ",".join(policy),
+                        "",
+                    )
+                ),
+                encoding="ascii",
+            )
+
+            with self.assertRaisesRegex(ProcessError, "exact 0 then 1"):
+                gear._read_first_policy_action()
+        finally:
+            gear.close()
+
+    def test_first_policy_action_rejects_nonfinite_action(self):
+        child = self.script("unused_action_nonfinite.py", "raise SystemExit(0)\n")
+        gear = self.gear(child)
+        header = [
+            "index",
+            "time_ms",
+            "time_realtime_ms",
+            "time_monotonic_ms",
+            "ros_timestamp",
+            *[f"act_{index}" for index in range(29)],
+        ]
+        initial = ["0", "0", "1", "2", "0", *(["0"] * 29)]
+        policy = ["1", "20", "21", "22", "0", "nan", *(["0.25"] * 28)]
+        try:
+            (gear.logs_dir / "action.csv").write_text(
+                "\n".join(
+                    (
+                        ",".join(header),
+                        ",".join(initial),
+                        ",".join(policy),
+                        "",
+                    )
+                ),
+                encoding="ascii",
+            )
+
+            with self.assertRaisesRegex(ProcessError, "non-finite"):
+                gear._read_first_policy_action()
+        finally:
+            gear.close()
+
+    def test_first_policy_action_requires_resumed_active_control(self):
+        child = self.script("unused_action_state.py", "raise SystemExit(0)\n")
+        gear = self.gear(child, readiness_timeout_s=0.01)
+        try:
+            with self.assertRaisesRegex(ProcessError, "resumed active"):
+                gear.wait_for_first_policy_action()
+        finally:
+            gear.close()
+
+    def test_first_policy_action_rejects_replaced_log_symlink(self):
+        child = self.script("unused_action_symlink.py", "raise SystemExit(0)\n")
+        gear = self.gear(child)
+        outside = self.root / "outside-action.csv"
+        header = [
+            "index",
+            "time_ms",
+            "time_realtime_ms",
+            "time_monotonic_ms",
+            "ros_timestamp",
+            *[f"act_{index}" for index in range(29)],
+        ]
+        initial = ["0", "0", "1", "2", "0", *(["0"] * 29)]
+        policy = ["1", "20", "21", "22", "0", *(["0.25"] * 29)]
+        outside.write_text(
+            "\n".join(
+                (
+                    ",".join(header),
+                    ",".join(initial),
+                    ",".join(policy),
+                    "",
+                )
+            ),
+            encoding="ascii",
+        )
+        (gear.logs_dir / "action.csv").symlink_to(outside)
+        try:
+            with self.assertRaisesRegex(ProcessError, "action log"):
+                gear._read_first_policy_action()
+        finally:
+            gear.close()
+
+    def test_first_policy_action_initial_row_alone_times_out(self):
+        child = self.script(
+            "first_action_initial_only.py",
+            r'''
+            import os
+            from pathlib import Path
+            import sys
+            import termios
+
+            logs_dir = Path(sys.argv[sys.argv.index("--logs-dir") + 1])
+            attrs = termios.tcgetattr(0)
+            attrs[3] &= ~(termios.ICANON | termios.ECHO)
+            termios.tcsetattr(0, termios.TCSANOW, attrs)
+            print("BOOT READY", flush=True)
+            assert os.read(0, 1) == b"]"
+            print("CONTROL READY", flush=True)
+            assert os.read(0, 1) == b"\n"
+            print("STREAM READY", flush=True)
+            header = [
+                "index", "time_ms", "time_realtime_ms", "time_monotonic_ms",
+                "ros_timestamp", *[f"act_{index}" for index in range(29)],
+            ]
+            initial = ["0", "0", "1", "2", "0", *(["0"] * 29)]
+            (logs_dir / "action.csv").write_text(
+                ",".join(header) + "\n" + ",".join(initial) + "\n",
+                encoding="ascii",
+            )
+            while os.read(0, 1).lower() != b"o":
+                pass
+            ''',
+        )
+        gear = self.gear(
+            child,
+            readiness_timeout_s=0.05,
+            readiness_poll_s=0.005,
+        )
+        try:
+            gear.start()
+            with self.assertRaisesRegex(ProcessError, "timed out"):
+                gear.wait_for_first_policy_action()
+        finally:
+            gear.close()
+
+    def test_first_policy_action_child_death_wins_over_timeout(self):
+        child = self.script(
+            "first_action_child_death.py",
+            r'''
+            import os
+            import termios
+            import time
+
+            attrs = termios.tcgetattr(0)
+            attrs[3] &= ~(termios.ICANON | termios.ECHO)
+            termios.tcsetattr(0, termios.TCSANOW, attrs)
+            print("BOOT READY", flush=True)
+            assert os.read(0, 1) == b"]"
+            print("CONTROL READY", flush=True)
+            assert os.read(0, 1) == b"\n"
+            print("STREAM READY", flush=True)
+            time.sleep(0.5)
+            raise SystemExit(7)
+            ''',
+        )
+        gear = self.gear(
+            child,
+            readiness_timeout_s=1.0,
+            readiness_poll_s=0.005,
+        )
+        try:
+            gear.start()
+            with self.assertRaises(ChildProcessDied):
+                gear.wait_for_first_policy_action()
+        finally:
+            gear.close()
+
     def test_stream_preparation_rejects_missing_or_reordered_fence_lines(self):
         for label, lines in (
             ("missing", ("Delta heading left: 0.1 rad",)),
