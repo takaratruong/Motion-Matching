@@ -150,6 +150,38 @@ class ResponsiveSchedulerTests(unittest.TestCase):
 
 
 class ScheduledPrefixResultTests(unittest.TestCase):
+    def test_sampled_timestamp_is_not_before_mailbox_observation(self) -> None:
+        # The mailbox records observed_ns while sampling.  The scheduler's
+        # sampled_ns must be captured after that call so BoundaryTrace remains
+        # monotone with the real shared clock.
+        ticks = iter([100, 200])
+
+        def clock() -> int:
+            return next(ticks)
+
+        class ClockedMailbox:
+            current_revision = 1
+
+            def sample_intent(self, chunk_index: int):
+                return (
+                    IntentSnapshot(
+                        revision=1,
+                        observed_ns=clock(),
+                        command=_command(chunk_index),
+                    ),
+                    None,
+                )
+
+        scheduler = ResponsiveScheduler(
+            RecordingCoordinator(["accept"]),
+            ClockedMailbox(),
+            monotonic_ns=clock,
+        )
+
+        result = scheduler.run_one_prefix(0)
+
+        self.assertGreaterEqual(result.sampled_ns, result.snapshot.observed_ns)
+
     def test_accepted_prefix_preserves_snapshot_and_sampled_ns(self) -> None:
         from mm_sonic.responsive_scheduler import ScheduledPrefix
 

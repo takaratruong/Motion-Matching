@@ -426,7 +426,11 @@ def _consume_x11_boundary(
 
 
 def _write_responsive_evidence(
-    bundle: object, responsive: bool, traces: list[object]
+    bundle: object,
+    responsive: bool,
+    traces: list[object],
+    *,
+    committed_prefixes: int | None = None,
 ) -> dict | None:
     """Write append-only responsive trace JSONL and an honest evidence summary.
 
@@ -438,6 +442,15 @@ def _write_responsive_evidence(
 
     if not responsive:
         return None
+    if committed_prefixes is None:
+        committed_prefixes = len(traces)
+    if (
+        type(committed_prefixes) is not int
+        or committed_prefixes < len(traces)
+    ):
+        raise ContractError(
+            "responsive committed_prefixes must cover all presented traces"
+        )
     records = [trace_record(trace) for trace in traces]
     lines = "".join(
         json.dumps(record, sort_keys=True) + "\n" for record in records
@@ -447,7 +460,9 @@ def _write_responsive_evidence(
     evidence = {
         "schema": "mm-sonic-responsive-evidence/v1",
         "trace_path": "responsive-boundary-trace.jsonl",
-        "committed_prefixes": len(records),
+        "committed_prefixes": committed_prefixes,
+        "presented_prefixes": len(records),
+        "queued_prefixes_unobserved": committed_prefixes - len(records),
         "observed_root_available": available,
         "observed_root_unavailable": len(records) - available,
         # Stage R1 honest floor: one irrevocable 0.4s prefix plus MM generation
@@ -500,13 +515,24 @@ def _run_responsive_x11_loop(
     scheduler = ResponsiveScheduler(
         committer, control_loop.mailbox, on_sample=on_sample
     )
+    pending_prefix: object | None = None
     for _consumed_chunk in range(chunks):
         prefix = scheduler.run_one_prefix(committer.next_chunk)
         if prefix is None:
             # Terminate (X): no generation, publication, or physics release.
             break
-        trace = build_boundary_trace(prefix, prefix.accepted, session_id=session_id)
-        trace_sink(trace)
+        if pending_prefix is not None:
+            # Exactly one prefix is irrevocably queued. The release performed
+            # by this transaction physically presents the prior transaction's
+            # prefix, so bind its observation to that prior input/prefix.
+            trace = build_boundary_trace(
+                pending_prefix,
+                pending_prefix.accepted,
+                release=prefix.accepted,
+                session_id=session_id,
+            )
+            trace_sink(trace)
+        pending_prefix = prefix
     return camera_box[0]
 
 
@@ -865,7 +891,12 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                     )
         command_artifact = recorder.artifact_bytes()
         responsive_evidence = _write_responsive_evidence(
-            bundle, responsive, responsive_traces
+            bundle,
+            responsive,
+            responsive_traces,
+            committed_prefixes=(
+                next_chunk - preload_chunks if responsive else None
+            ),
         )
         snapshot = simulator.snapshot()
         if namespace.scene_id == "sonic-flat-baseline":

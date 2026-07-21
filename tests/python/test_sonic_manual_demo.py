@@ -528,15 +528,19 @@ class ResponsiveX11LoopTests(unittest.TestCase):
         _command, mapped = _mapped_boundary()
         return mapped
 
-    def test_responsive_loop_commits_one_prefix_and_delivers_camera(self) -> None:
+    def test_responsive_loop_delays_trace_until_prefix_is_presented(self) -> None:
         from mm_sonic.manual_demo import _run_responsive_x11_loop
         from mm_sonic.operator_x11 import IntentSnapshot
         from mm_sonic.responsive_wiring import ManualChunkCommitter
 
-        command = CommandSample(0, (0.25, -0.4, 0.0), (1.0, 0.0, 0.0, 0.0))
-        snapshot = IntentSnapshot(revision=1, observed_ns=5, command=command)
+        command0 = CommandSample(0, (0.25, -0.4, 0.0), (1.0, 0.0, 0.0, 0.0))
+        command1 = CommandSample(1, (-0.25, 0.4, 0.0), (1.0, 0.0, 0.0, 0.0))
+        snapshots = [
+            IntentSnapshot(revision=1, observed_ns=5, command=command0),
+            IntentSnapshot(revision=2, observed_ns=6, command=command1),
+        ]
         mapped = self._mapped()
-        mailbox = _ResponsiveMailbox([snapshot], mapped)
+        mailbox = _ResponsiveMailbox(snapshots, mapped)
         control_loop = _ResponsiveControlLoop(mailbox)
         simulator = _BoundarySimulator()
 
@@ -607,7 +611,7 @@ class ResponsiveX11LoopTests(unittest.TestCase):
             control_loop=control_loop,
             committer=committer,
             simulator=simulator,
-            chunks=1,
+            chunks=2,
             camera_state=camera_state,
             event_sink=events.append,
             trace_sink=traces.append,
@@ -615,14 +619,21 @@ class ResponsiveX11LoopTests(unittest.TestCase):
             camera_disabled_prefix="CAMERA DISABLED",
         )
 
-        # One prefix committed and physics released once.
-        self.assertEqual(log.count("release"), 1)
-        self.assertEqual(published, [("timeline", False)])
+        # Two prefixes committed/released; only the first has reached physics.
+        self.assertEqual(log.count("release"), 2)
+        self.assertEqual(
+            published,
+            [("timeline", False), ("timeline", False)],
+        )
         # Camera delivered synchronously via on_sample.
+        # The second sample carries the same camera sequence, so delivery is
+        # correctly de-duplicated by the existing camera semantics.
         self.assertEqual(len(simulator.camera_calls), 1)
-        # One honest boundary trace emitted (observed root unavailable -> None).
+        # Candidate 0 is traced using the second release. Candidate 1 remains
+        # queued at loop exit and must not receive candidate 0's observation.
         self.assertEqual(len(traces), 1)
         self.assertEqual(traces[0].input_transition_id, "session:rev:000001")
+        self.assertEqual(traces[0].presented_prefix_id, "session:candidate:000000")
         self.assertIsNone(traces[0].observed_mujoco_root_displacement)
         self.assertIsInstance(final_state, CameraDeliveryState)
 
@@ -716,9 +727,16 @@ class WriteResponsiveEvidenceTests(unittest.TestCase):
                 self._trace_record((0.24, 0.0, 0.0)),
                 self._trace_record(None),
             ]
-            evidence = _write_responsive_evidence(bundle, True, traces)
+            evidence = _write_responsive_evidence(
+                bundle,
+                True,
+                traces,
+                committed_prefixes=3,
+            )
 
-            self.assertEqual(evidence["committed_prefixes"], 2)
+            self.assertEqual(evidence["committed_prefixes"], 3)
+            self.assertEqual(evidence["presented_prefixes"], 2)
+            self.assertEqual(evidence["queued_prefixes_unobserved"], 1)
             # Honest availability tally: one real observed root, one unavailable.
             self.assertEqual(evidence["observed_root_available"], 1)
             self.assertEqual(evidence["observed_root_unavailable"], 1)

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 from pathlib import Path
 import time
 from typing import Callable
@@ -64,16 +65,31 @@ class AcceptedChunk:
 
 
 class StateLogRootReader:
-    """Read real pelvis displacement from a scored-sim-logs ``state.jsonl``.
+    """Read incremental pelvis displacement from scored simulator state.
 
     Each row is ``{"step", "sim_time_s", "state": {"pelvis_position_m": [..]}}``
-    exactly as ``GatedSimulatorClient.advance`` writes it.  ``displacement``
-    returns the end-minus-start pelvis vector in the MuJoCo world basis, or
-    ``None`` when either bounding row is missing.  It never fabricates a value.
+    exactly as ``GatedSimulatorClient.advance`` writes it. Construction records
+    the existing row count and last pose, which excludes already-committed
+    preload rows. ``measure_advance`` then consumes only the number of new rows
+    reported by one ``AdvanceResult`` (that field is a delta, not cumulative).
+    It returns ``None`` when the new rows are unavailable and never fabricates
+    a value.
     """
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        initial_position: tuple[float, float, float] | None = None,
+    ) -> None:
         self._path = Path(path)
+        self._next_row = 0
+        self._last_position = initial_position
+        existing = self._pelvis_rows()
+        if existing is not None:
+            self._next_row = len(existing)
+            if existing:
+                self._last_position = existing[-1]
 
     def _pelvis_rows(self) -> list[tuple[float, float, float]] | None:
         try:
@@ -91,7 +107,17 @@ class StateLogRootReader:
                 return None
             if not isinstance(pelvis, (list, tuple)) or len(pelvis) != 3:
                 return None
-            rows.append((float(pelvis[0]), float(pelvis[1]), float(pelvis[2])))
+            try:
+                position = (
+                    float(pelvis[0]),
+                    float(pelvis[1]),
+                    float(pelvis[2]),
+                )
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if not all(math.isfinite(value) for value in position):
+                return None
+            rows.append(position)
         return rows
 
     def displacement(
@@ -108,28 +134,62 @@ class StateLogRootReader:
         end = rows[end_row]
         return (end[0] - start[0], end[1] - start[1], end[2] - start[2])
 
+    def measure_advance(
+        self, row_count: int
+    ) -> tuple[float, float, float] | None:
+        """Consume exactly one advance's appended rows and measure its motion."""
+
+        if type(row_count) is not int or row_count < 0:
+            raise ContractError("state row count must be a nonnegative integer")
+        if row_count == 0:
+            return None
+        rows = self._pelvis_rows()
+        end_exclusive = self._next_row + row_count
+        if rows is None or len(rows) < end_exclusive:
+            return None
+        end = rows[end_exclusive - 1]
+        start = self._last_position
+        self._next_row = end_exclusive
+        self._last_position = end
+        if start is None:
+            return None
+        return (end[0] - start[0], end[1] - start[1], end[2] - start[2])
+
 
 def _generated_root_displacement(
     prepared: object,
 ) -> tuple[float, float, float]:
     rows = np.asarray(prepared.target.virtual_root_position, dtype=np.float64)
+    if rows.ndim != 2 or rows.shape[0] < 1 or rows.shape[1] != 3:
+        raise ContractError(
+            "prepared virtual_root_position must be a nonempty Nx3 array"
+        )
     delta = rows[-1] - rows[0]
+    if not np.all(np.isfinite(delta)):
+        raise ContractError("generated virtual root displacement must be finite")
     return (float(delta[0]), float(delta[1]), float(delta[2]))
 
 
 def build_boundary_trace(
-    prefix: object, accepted: AcceptedChunk, *, session_id: str
+    prefix: object,
+    accepted: AcceptedChunk,
+    *,
+    session_id: str,
+    release: AcceptedChunk | None = None,
 ) -> BoundaryTrace:
     """Bind one input transition to the prefix it produced (honest evidence).
 
     Combines the scheduler's ``ScheduledPrefix`` (the exact successful snapshot
     and its monotonic sampled timestamp) with the committer's ``AcceptedChunk``
-    timings and root vectors.  ``observed_mujoco_root_displacement`` is passed
-    through as-is: a real measurement or ``None``, never a fabricated zero.
+    generation timings and root vectors. With one-prefix lookahead, the prefix
+    committed at one boundary is physically presented by the next boundary's
+    release; ``release`` supplies that later physical timing and observation.
+    The observed displacement remains real-or-``None``, never fabricated.
     """
 
     snapshot = prefix.snapshot
     command = snapshot.command
+    physical = accepted if release is None else release
     return BoundaryTrace(
         input_transition_id=f"{session_id}:rev:{snapshot.revision:06d}",
         presented_prefix_id=accepted.presented_prefix_id,
@@ -139,15 +199,15 @@ def build_boundary_trace(
         mm_completed_ns=accepted.mm_completed_ns,
         publication_sent_ns=accepted.publication_sent_ns,
         committed_ns=accepted.committed_ns,
-        physics_release_requested_ns=accepted.physics_release_requested_ns,
-        simulation_advance_completed_ns=accepted.simulation_advance_completed_ns,
+        physics_release_requested_ns=physical.physics_release_requested_ns,
+        simulation_advance_completed_ns=physical.simulation_advance_completed_ns,
         requested_velocity_mujoco=command.requested_velocity_mujoco,
         requested_heading_mujoco_wxyz=command.desired_heading_mujoco_wxyz,
         generated_virtual_root_displacement_mujoco=(
             accepted.generated_virtual_root_displacement_mujoco
         ),
         observed_mujoco_root_displacement=(
-            accepted.observed_mujoco_root_displacement
+            physical.observed_mujoco_root_displacement
         ),
     )
 
@@ -212,9 +272,11 @@ class ManualChunkCommitter:
         if not callable(publish):
             raise ContractError("committer publish must be callable")
         if state_log_reader is not None and not hasattr(
-            state_log_reader, "displacement"
+            state_log_reader, "measure_advance"
         ):
-            raise ContractError("committer state_log_reader must expose displacement")
+            raise ContractError(
+                "committer state_log_reader must expose measure_advance"
+            )
         if not callable(monotonic_ns):
             raise ContractError("committer monotonic_ns must be callable")
         self._mm = mm
@@ -255,6 +317,9 @@ class ManualChunkCommitter:
         mm_completed_ns = self._monotonic_ns()
         checked = self._validator.validate_source(raw)
         prepared = self._timeline.prepare(checked)
+        # Extract evidence while the transaction is still reversible.  Evidence
+        # assembly must never be the first failure after physics is released.
+        generated_root_displacement = _generated_root_displacement(prepared)
 
         # LAST supersession check, exactly where the coordinator places it.
         if command_is_current is not None and not command_is_current(command):
@@ -278,16 +343,13 @@ class ManualChunkCommitter:
         self._timeline.commit(prepared)
         committed_ns = self._monotonic_ns()
 
-        state_rows_before = self._state_rows_of(
-            getattr(self._gate, "state_rows", None)
-        )
         physics_release_requested_ns = self._monotonic_ns()
         advance = self._gate.release_steps(self._steps_per_chunk)
         simulation_advance_completed_ns = self._monotonic_ns()
         self._recorder.record(command)
         self._next_chunk += 1
 
-        observed = self._read_observed_root(state_rows_before, advance)
+        observed = self._read_observed_root(advance)
         return AcceptedChunk(
             presented_prefix_id=candidate,
             mm_started_ns=mm_started_ns,
@@ -296,38 +358,39 @@ class ManualChunkCommitter:
             committed_ns=committed_ns,
             physics_release_requested_ns=physics_release_requested_ns,
             simulation_advance_completed_ns=simulation_advance_completed_ns,
-            generated_virtual_root_displacement_mujoco=(
-                _generated_root_displacement(prepared)
-            ),
+            generated_virtual_root_displacement_mujoco=generated_root_displacement,
             observed_mujoco_root_displacement=observed,
             advance=advance,
         )
 
-    @staticmethod
-    def _state_rows_of(value: object) -> int | None:
-        return value if isinstance(value, int) and not isinstance(value, bool) else None
-
     def _read_observed_root(
-        self, state_rows_before: int | None, advance: object
+        self, advance: object
     ) -> tuple[float, float, float] | None:
         """Read a real observed pelvis displacement, or None if unavailable.
 
-        The observed root is only recoverable when a state-log reader is wired
-        and the ``AdvanceResult`` exposes the bounding ``state_rows``.  When any
-        of that is missing the displacement is explicitly ``None`` -- never a
-        fabricated zero, since ``AdvanceResult`` itself carries no root pose.
+        ``AdvanceResult.state_rows`` is the number of rows appended by this
+        advance. The stateful reader already captured the prior physical pose
+        and file cursor, so it consumes that delta exactly once.
         """
 
         if self._state_log_reader is None:
             return None
-        state_rows_after = getattr(advance, "state_rows", None)
-        if not isinstance(state_rows_after, int) or isinstance(
-            state_rows_after, bool
-        ):
+        state_rows = getattr(advance, "state_rows", None)
+        if not isinstance(state_rows, int) or isinstance(state_rows, bool):
             return None
-        start_index = 0 if state_rows_before is None else state_rows_before
-        # state.jsonl rows are 0-indexed; the last logged row is state_rows-1.
-        end_index = state_rows_after - 1
-        if end_index < start_index:
+        try:
+            observed = self._state_log_reader.measure_advance(state_rows)
+        except Exception:
+            # Motion is already committed and simulated. Evidence availability
+            # must not retroactively turn that successful boundary into a
+            # command failure.
             return None
-        return self._state_log_reader.displacement(start_index, end_index)
+        if not isinstance(observed, (tuple, list)) or len(observed) != 3:
+            return None
+        try:
+            vector = tuple(float(value) for value in observed)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not all(math.isfinite(value) for value in vector):
+            return None
+        return vector

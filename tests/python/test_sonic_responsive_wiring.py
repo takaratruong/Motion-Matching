@@ -234,6 +234,20 @@ class ManualChunkCommitterOrderingTests(unittest.TestCase):
         self.assertEqual(fakes.log, ["mm.generate"])
         self.assertNotIn("release", fakes.log)
 
+    def test_generated_root_evidence_is_validated_before_publication(self):
+        # Evidence extraction must not be able to fail after the irreversible
+        # publication/commit/release boundary.
+        fakes = _Fakes(root_rows=np.empty((0, 3), dtype=np.float32))
+        committer = _make_committer(fakes)
+
+        from mm_sonic.joints import ContractError
+
+        with self.assertRaises(ContractError):
+            committer.run_one_chunk(_command(0))
+
+        self.assertFalse(any(entry.startswith("publish") for entry in fakes.log))
+        self.assertNotIn("release", fakes.log)
+
     def test_publication_failure(self):
         # Publication is the last reversible step before the commit boundary.
         # When the socket publish raises, the committer must abort both the
@@ -361,9 +375,9 @@ class ManualChunkCommitterTraceTests(unittest.TestCase):
         fakes = _Fakes()
 
         class _FakeStateReader:
-            def displacement(self, start_row, end_row):
-                # Real end-minus-start pelvis displacement.
-                self.calls = (start_row, end_row)
+            def measure_advance(self, row_count):
+                # Real displacement for exactly this advance's appended rows.
+                self.calls = row_count
                 return (0.25, -0.05, 0.0)
 
         reader = _FakeStateReader()
@@ -397,7 +411,7 @@ class ManualChunkCommitterTraceTests(unittest.TestCase):
         fakes = _Fakes()
 
         class _EmptyReader:
-            def displacement(self, start_row, end_row):
+            def measure_advance(self, row_count):
                 return None
 
         from mm_sonic.responsive_wiring import ManualChunkCommitter
@@ -417,6 +431,33 @@ class ManualChunkCommitterTraceTests(unittest.TestCase):
         accepted = committer.run_one_chunk(_command(0))
 
         self.assertIsNone(accepted.observed_mujoco_root_displacement)
+
+    def test_observed_evidence_failure_does_not_fail_committed_motion(self):
+        fakes = _Fakes()
+
+        class _ExplodingReader:
+            def measure_advance(self, row_count):
+                raise OSError("state log unavailable")
+
+        from mm_sonic.responsive_wiring import ManualChunkCommitter
+
+        committer = ManualChunkCommitter(
+            mm=_MMShim(fakes),
+            validator=_ValidatorShim(fakes),
+            timeline=_TimelineShim(fakes),
+            publish=_PublisherShim(fakes).publish,
+            gate=_GateShim(fakes),
+            session_id="session",
+            steps_per_chunk=20,
+            recorder=_RecorderShim(fakes),
+            state_log_reader=_ExplodingReader(),
+        )
+
+        accepted = committer.run_one_chunk(_command(0))
+
+        self.assertIsNone(accepted.observed_mujoco_root_displacement)
+        self.assertIn("release", fakes.log)
+        self.assertEqual(committer.next_chunk, 1)
 
 
 class BuildBoundaryTraceTests(unittest.TestCase):
@@ -471,6 +512,37 @@ class BuildBoundaryTraceTests(unittest.TestCase):
         self.assertIsInstance(trace, BoundaryTrace)
         # No fabricated zero: the field is explicitly None.
         self.assertIsNone(trace.observed_mujoco_root_displacement)
+
+    def test_build_trace_uses_the_later_release_that_presented_the_prefix(self):
+        from dataclasses import replace
+        from mm_sonic.responsive_wiring import build_boundary_trace
+
+        committed = self._accepted(None)
+        release = replace(
+            committed,
+            presented_prefix_id="session:candidate:000001",
+            physics_release_requested_ns=170,
+            simulation_advance_completed_ns=180,
+            observed_mujoco_root_displacement=(0.2, -0.1, 0.0),
+        )
+
+        trace = build_boundary_trace(
+            self._prefix(),
+            committed,
+            release=release,
+            session_id="session",
+        )
+
+        # Identity/generation belong to candidate 0, while the physical release
+        # that actually presented candidate 0 occurred one boundary later.
+        self.assertEqual(trace.presented_prefix_id, "session:candidate:000000")
+        self.assertEqual(trace.mm_started_ns, 30)
+        self.assertEqual(trace.physics_release_requested_ns, 170)
+        self.assertEqual(trace.simulation_advance_completed_ns, 180)
+        self.assertEqual(
+            trace.observed_mujoco_root_displacement,
+            (0.2, -0.1, 0.0),
+        )
 
     def test_trace_record_is_json_serializable_append_only_evidence(self):
         from mm_sonic.responsive_wiring import build_boundary_trace, trace_record
@@ -548,6 +620,79 @@ class StateLogRootReaderTests(unittest.TestCase):
 
         reader = StateLogRootReader(Path("/nonexistent/state.jsonl"))
         self.assertIsNone(reader.displacement(0, 1))
+
+    def test_reader_measures_only_rows_appended_by_each_advance(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from mm_sonic.responsive_wiring import StateLogRootReader
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "state.jsonl"
+            # These rows belong to the already-committed preload.  Constructing
+            # the reader after preload must establish the baseline at its last
+            # pelvis pose, not re-measure these rows as the first live chunk.
+            self._write_log(
+                log,
+                [(10, (0.1, 0.0, 0.9)), (20, (0.2, 0.0, 0.9))],
+            )
+            reader = StateLogRootReader(log)
+
+            def append(rows):
+                with log.open("a", encoding="utf-8", newline="\n") as handle:
+                    for step, pelvis in rows:
+                        handle.write(
+                            json.dumps(
+                                {
+                                    "step": step,
+                                    "sim_time_s": step * 0.001,
+                                    "state": {"pelvis_position_m": list(pelvis)},
+                                }
+                            )
+                            + "\n"
+                        )
+
+            append([(30, (0.35, 0.0, 0.9)), (40, (0.5, 0.0, 0.9))])
+            first = reader.measure_advance(2)
+            append([(50, (0.65, 0.1, 0.9)), (60, (0.9, 0.2, 0.9))])
+            second = reader.measure_advance(2)
+
+            self.assertEqual(first, (0.3, 0.0, 0.0))
+            self.assertEqual(second, (0.4, 0.2, 0.0))
+
+    def test_committer_treats_advance_state_rows_as_delta(self):
+        fakes = _Fakes()
+
+        class _IncrementalReader:
+            def __init__(self):
+                self.counts = []
+
+            def measure_advance(self, row_count):
+                self.counts.append(row_count)
+                return (float(row_count), 0.0, 0.0)
+
+        reader = _IncrementalReader()
+        from mm_sonic.responsive_wiring import ManualChunkCommitter
+
+        committer = ManualChunkCommitter(
+            mm=_MMShim(fakes),
+            validator=_ValidatorShim(fakes),
+            timeline=_TimelineShim(fakes),
+            publish=_PublisherShim(fakes).publish,
+            gate=_GateShim(fakes),
+            session_id="session",
+            steps_per_chunk=20,
+            recorder=_RecorderShim(fakes),
+            state_log_reader=reader,
+        )
+
+        accepted = committer.run_one_chunk(_command(0))
+
+        self.assertEqual(reader.counts, [20])
+        self.assertEqual(
+            accepted.observed_mujoco_root_displacement,
+            (20.0, 0.0, 0.0),
+        )
 
 
 class _FakeMailbox:

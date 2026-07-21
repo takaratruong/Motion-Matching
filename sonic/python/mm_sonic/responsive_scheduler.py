@@ -77,8 +77,11 @@ class ResponsiveScheduler:
         if type(chunk_index) is not int or chunk_index < 0:
             raise ContractError("scheduler chunk_index must be a nonnegative integer")
         while True:
-            sampled_ns = self._monotonic_ns()
             snapshot, mapped = self._mailbox.sample_intent(chunk_index)
+            # The mailbox records the input observation while sampling.  Read
+            # this boundary timestamp afterwards so the trace cannot claim the
+            # sample preceded the observation that produced it.
+            sampled_ns = self._monotonic_ns()
             if self._on_sample is not None:
                 self._on_sample(snapshot, mapped)
             if snapshot.command is None:
