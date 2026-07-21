@@ -45,8 +45,11 @@ FunnelCaptureSelection select_funnel_capture(
         !finite_transform(target.object_world) ||
         !std::isfinite(config.minimum_object_radius_m) ||
         !std::isfinite(config.maximum_object_radius_m) ||
+        !std::isfinite(config.maximum_activation_object_radius_m) ||
         !(config.minimum_object_radius_m > 0.0F) ||
-        config.maximum_object_radius_m < config.minimum_object_radius_m) {
+        config.maximum_object_radius_m < config.minimum_object_radius_m ||
+        config.maximum_activation_object_radius_m <
+            config.maximum_object_radius_m) {
         return selection;
     }
 
@@ -59,6 +62,11 @@ FunnelCaptureSelection select_funnel_capture(
     const double bearing_length = std::sqrt(
         bearing_x * bearing_x + bearing_z * bearing_z);
     if (!(bearing_length > std::numeric_limits<double>::epsilon())) {
+        return selection;
+    }
+    if (bearing_length > static_cast<double>(
+                             config.maximum_activation_object_radius_m)) {
+        selection.reason = PickSlotReason::OutsideTravelEnvelope;
         return selection;
     }
     const double unit_x = bearing_x / bearing_length;

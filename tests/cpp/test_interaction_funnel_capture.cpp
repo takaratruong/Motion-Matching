@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cmath>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -48,6 +49,33 @@ void test_direct_bearing_is_clamped_to_annulus_and_faces_object() {
         root_at(0.0F, 0.2F), target_at_origin(), {});
     assert(near.reason == interaction::PickSlotReason::None);
     assert(std::abs(near.target_world.position.z - 0.45F) < 1.0e-6F);
+}
+
+void test_default_activation_reaches_three_metres_but_not_farther() {
+    const auto at_limit = interaction::select_funnel_capture(
+        root_at(0.0F, 3.0F), target_at_origin(), {});
+    assert(at_limit.reason == interaction::PickSlotReason::None);
+    assert(std::abs(at_limit.target_world.position.z - 1.0F) < 1.0e-6F);
+
+    const auto beyond = interaction::select_funnel_capture(
+        root_at(0.0F, 3.01F), target_at_origin(), {});
+    assert(
+        beyond.reason == interaction::PickSlotReason::OutsideTravelEnvelope);
+
+    interaction::FunnelCaptureConfig inverted{};
+    inverted.maximum_activation_object_radius_m = 0.99F;
+    assert(
+        interaction::select_funnel_capture(
+            root_at(0.0F, 0.75F), target_at_origin(), {}, inverted).reason ==
+        interaction::PickSlotReason::InvalidGeometry);
+
+    interaction::FunnelCaptureConfig nonfinite{};
+    nonfinite.maximum_activation_object_radius_m =
+        std::numeric_limits<float>::quiet_NaN();
+    assert(
+        interaction::select_funnel_capture(
+            root_at(0.0F, 0.75F), target_at_origin(), {}, nonfinite).reason ==
+        interaction::PickSlotReason::InvalidGeometry);
 }
 
 void test_blocked_direct_connector_uses_positive_angular_offset_first() {
@@ -125,6 +153,7 @@ void test_builds_exact_24_value_object_local_condition() {
 
 int main() {
     test_direct_bearing_is_clamped_to_annulus_and_faces_object();
+    test_default_activation_reaches_three_metres_but_not_farther();
     test_blocked_direct_connector_uses_positive_angular_offset_first();
     test_selection_does_not_read_authored_interaction_slots();
     test_rejects_when_every_connector_is_unsafe();

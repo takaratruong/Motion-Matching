@@ -11,6 +11,7 @@ namespace interaction {
 struct FunnelCaptureConfig {
     float minimum_object_radius_m = 0.45F;
     float maximum_object_radius_m = 1.00F;
+    float maximum_activation_object_radius_m = 3.00F;
     PickSlotConfig route{};
 };
 
