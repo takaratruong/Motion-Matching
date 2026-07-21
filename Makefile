@@ -81,7 +81,21 @@ NATIVE_G1_HEADERS := g1_terrain_skeleton.h g1_command_runtime.h \
   g1_ik_runtime.h g1_runtime_diagnostics.h g1_surface_query.h \
   ik.h json_runtime.h motion_match_log.h route_runtime.h scene_runtime.h \
   sha256.h support_runtime.h terrain_runtime.h
-SOURCE := controller.cpp
+INTERACTION_NATIVE_G1_SOURCES := interaction_native_g1_bridge.cpp \
+  interaction_pose.cpp interaction_target.cpp interaction_features.cpp \
+  interaction_matcher.cpp interaction_playback.cpp interaction_ik.cpp \
+  interaction_attachment.cpp interaction_carry.cpp interaction_runtime.cpp \
+  interaction_place_target.cpp interaction_place_collision.cpp \
+  interaction_place.cpp interaction_place_controller.cpp \
+  interaction_pickup_provenance.cpp interaction_arrival.cpp \
+  interaction_pick_assist.cpp interaction_pick_slots.cpp \
+  interaction_pick_approach.cpp interaction_smart_pickup_controller.cpp \
+  interaction_smart_pickup_scene.cpp interaction_learned_pickup_backend.cpp \
+  interaction_funnel_artifact.cpp interaction_funnel_capture.cpp \
+  interaction_funnel_plan.cpp interaction_funnel_follower.cpp \
+  interaction_funnel_timing.cpp interaction_funnel_worker.cpp \
+  interaction_sha256.cpp
+SOURCE := controller.cpp $(INTERACTION_NATIVE_G1_SOURCES)
 HEADER = $(wildcard *.h)
 
 .PHONY: all bootstrap-raylib controller

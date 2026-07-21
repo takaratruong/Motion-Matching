@@ -51,6 +51,9 @@
 #include "motion_match_log.h"
 #include "cleanup_runtime.h"
 #include "g1_mesh_renderer.h"
+#include "interaction_native_g1_bridge.h"
+#include "interaction_smart_pickup_controller.h"
+#include "interaction_smart_pickup_scene.h"
 
 #if defined(__GNUC__)
 #pragma GCC diagnostic push
@@ -68,8 +71,11 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <cstdlib>
+#include <filesystem>
 #include <initializer_list>
 #include <functional>
+#include <optional>
+#include <string>
 
 static_assert(G1_BoneCount == 31, "native G1 controller requires 31 bones");
 
@@ -1945,6 +1951,95 @@ int main(void)
     };
     configure_route_cursor(state);
 
+    // Interaction data stays separate from the locomotion database, but both
+    // publish the same native 31-bone G1 pose contract.
+    std::optional<interaction::Database> interaction_database;
+    std::optional<interaction::Features> interaction_features;
+    interaction::TargetRegistry interaction_registry;
+    interaction::PlacementSurfaceRegistry interaction_surface_registry;
+    interaction::PlaceMotionLibrary interaction_place_library{};
+    interaction::RuntimeConfig interaction_config{};
+    interaction::TargetHandle interaction_scene_target_handle{};
+    interaction::SurfaceHandle interaction_destination_surface_handle{};
+    uint32_t interaction_destination_affordance_id = 0U;
+    bool interaction_pack_loaded = false;
+    std::string interaction_pack_diagnostic;
+
+    const char* interaction_pack_environment = getenv("MM_INTERACTION_PACK");
+    const std::filesystem::path interaction_pack_path =
+        interaction_pack_environment != NULL &&
+            interaction_pack_environment[0] != '\0'
+        ? std::filesystem::path(interaction_pack_environment)
+        : std::filesystem::path("build/smart-pickup/full-pack");
+
+    interaction::InteractionRuntime interaction_runtime = [&]()
+        -> interaction::InteractionRuntime
+    {
+        try
+        {
+            interaction_database.emplace(interaction::load_database(
+                interaction_pack_path / "interaction_database.bin"));
+            interaction_features.emplace(interaction::load_features(
+                interaction_pack_path / "interaction_features.bin"));
+            if (interaction_database->frame_count !=
+                    interaction_features->frame_count)
+            {
+                throw interaction::FormatError(
+                    "interaction database/features frame count mismatch");
+            }
+
+            interaction::InteractionTarget target =
+                interaction::make_smart_pickup_demo_target();
+            interaction_scene_target_handle =
+                interaction_registry.upsert(std::move(target));
+            const interaction::InteractionTarget* registered_target =
+                interaction_registry.find(interaction_scene_target_handle);
+            if (registered_target == nullptr)
+            {
+                throw std::runtime_error(
+                    "interaction target registration failed");
+            }
+            interaction::PlacementSurface destination =
+                interaction::make_smart_pickup_demo_destination_surface(
+                    *registered_target);
+            if (destination.affordances.size() != 1U)
+            {
+                throw std::runtime_error(
+                    "interaction destination must expose one affordance");
+            }
+            interaction_destination_affordance_id =
+                destination.affordances.front().id;
+            interaction_destination_surface_handle =
+                interaction_surface_registry.upsert(std::move(destination));
+            interaction_pack_loaded = true;
+            return interaction::InteractionRuntime(
+                *interaction_database,
+                *interaction_features,
+                interaction_registry,
+                interaction_surface_registry,
+                interaction_place_library,
+                interaction_config);
+        }
+        catch (const std::exception& error)
+        {
+            interaction_pack_diagnostic = error.what();
+            interaction_pack_loaded = false;
+            fprintf(
+                stderr,
+                "G1 interaction disabled: %s\n",
+                interaction_pack_diagnostic.c_str());
+            return interaction::InteractionRuntime::disabled(
+                interaction::Reason::PackUnavailable);
+        }
+    }();
+
+    const interaction::SmartPickupProductionConfig smart_pickup_config =
+        interaction::load_smart_pickup_production_config();
+    interaction::SmartPickupController smart_pickup_controller(
+        smart_pickup_config);
+    interaction::NativeG1PoseHandoff native_g1_pose_handoff;
+    interaction::RuntimeOutput interaction_output{};
+
     if (test_config.mode == G1_TestSequential) {
         const int sequential_frames =
             db.range_stops(0) - db.range_starts(0) - 1;
@@ -3513,6 +3608,40 @@ int main(void)
                     toe_end_targ);
             }
         }
+
+        const interaction::LocomotionSnapshot native_g1_locomotion =
+            interaction::capture_native_g1_snapshot(
+                state.adjusted_bone_positions,
+                state.bone_velocities,
+                state.adjusted_bone_rotations,
+                state.bone_angular_velocities,
+                state.curr_bone_contacts,
+                slice1d<vec3>(
+                    3, state.trajectory_positions.data + 1),
+                slice1d<quat>(
+                    3, state.trajectory_rotations.data + 1));
+        interaction::RuntimeInput interaction_input{};
+        interaction_input.dt = dt;
+        interaction_input.locomotion = native_g1_locomotion;
+        interaction_output = interaction_runtime.update(interaction_input);
+        const interaction::NativeG1FrameState native_g1_frame =
+            native_g1_pose_handoff.apply(
+                native_g1_locomotion.pose,
+                interaction_output,
+                dt);
+        interaction::write_native_g1_pose(
+            native_g1_frame.pose,
+            state.adjusted_bone_positions,
+            state.bone_velocities,
+            state.adjusted_bone_rotations,
+            state.bone_angular_velocities,
+            state.curr_bone_contacts);
+        forward_kinematics_full(
+            state.global_bone_positions,
+            state.global_bone_rotations,
+            state.adjusted_bone_positions,
+            state.adjusted_bone_rotations,
+            db.bone_parents);
 
         // Update camera
 

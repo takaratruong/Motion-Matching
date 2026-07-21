@@ -30,6 +30,19 @@ class NativeG1ControllerTests(unittest.TestCase):
         self.assertNotIn(
             "NATIVE_G1_SOURCES := g1_clearance.cpp", MAKEFILE)
 
+    def test_native_controller_links_diffusion_without_flat_adapter(self):
+        self.assertIn('#include "interaction_native_g1_bridge.h"', SOURCE)
+        self.assertIn("interaction::SmartPickupController", SOURCE)
+        self.assertIn("interaction::RuntimeInput", SOURCE)
+        self.assertIn("capture_native_g1_snapshot(", SOURCE)
+        self.assertIn("INTERACTION_NATIVE_G1_SOURCES :=", MAKEFILE)
+        controller_sources = MAKEFILE.split(
+            "INTERACTION_NATIVE_G1_SOURCES :=", 1)[1].split(
+                "HEADER =", 1)[0]
+        self.assertNotIn("interaction_controller_adapter.cpp", controller_sources)
+        self.assertNotIn("interaction_target_rig_ik.cpp", controller_sources)
+        self.assertNotIn("locomotion_controller_update.cpp", controller_sources)
+
 
 if __name__ == "__main__":
     unittest.main()
