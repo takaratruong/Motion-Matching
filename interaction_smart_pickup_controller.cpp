@@ -306,6 +306,34 @@ SmartPickupPostStepResult SmartPickupController::post_step(
     }
 
     result.assist_output = backend_->observe(observation);
+    if (result.assist_output.planning_barrier &&
+        !result.assist_output.preview_requests.empty() &&
+        static_cast<bool>(preview_pick)) {
+        PickAssistObservation frozen_observation = observation;
+        frozen_observation.preview_results.clear();
+        const PickAssistDiagnostics& frozen = backend_->diagnostics();
+        frozen_observation.preview_results.reserve(
+            result.assist_output.preview_requests.size());
+        for (const PickAssistPreviewRequest& request :
+             result.assist_output.preview_requests) {
+            frozen_observation.preview_results.push_back({
+                request,
+                preview_frozen_smart_pickup(
+                    preview_pick,
+                    input.live_flat_snapshot,
+                    request.root,
+                    frozen.target,
+                    frozen.affordance_id),
+            });
+        }
+        frozen_observation.preview_snapshot_fingerprint =
+            result.snapshot_fingerprint;
+        result.assist_output = backend_->observe(frozen_observation);
+        if (result.assist_output.planning_barrier) {
+            backend_->cancel();
+            result.assist_output = {};
+        }
+    }
     if (result.assist_output.submit_interact) {
         result.pick_request = backend_->take_submission(
             input.next_request_id);

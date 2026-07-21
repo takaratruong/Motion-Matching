@@ -328,8 +328,10 @@ void test_learned_debug_snapshot_is_forwarded_without_mutation() {
     expected.frozen_entry_world = {0.1F, 0.2F, 0.0F, 1.0F};
     expected.tracked_root_world = {0.2F, 0.3F, 0.0F, 1.0F};
     expected.terminal_root_world = {0.4F, 0.5F, 0.0F, 1.0F};
-    expected.world_route[0] = expected.frozen_entry_world;
-    expected.world_route.back() = expected.terminal_root_world;
+    expected.world_route = {
+        expected.frozen_entry_world,
+        expected.terminal_root_world,
+    };
     expected.progress_index = 17;
     expected.lookahead_index = 29;
     backend.debug_snapshot = expected;
@@ -472,7 +474,7 @@ public:
         ++observe_calls;
         observations.push_back(observation);
         if (observe_calls == 1U) return first_output;
-        return {};
+        return subsequent_output;
     }
 
     std::optional<interaction::PickRequest> take_submission(
@@ -491,11 +493,75 @@ public:
     uint32_t begin_calls = 0U;
     uint32_t observe_calls = 0U;
     interaction::PickAssistOutput first_output{};
+    interaction::PickAssistOutput subsequent_output{};
     std::vector<interaction::PickAssistObservation> observations{};
 
 private:
     interaction::PickAssistDiagnostics diagnostics_{};
 };
+
+void test_planning_barrier_consumes_preview_in_same_step() {
+    interaction::InteractionTarget target = make_controller_target();
+    BatchProtocolAssistBackend backend;
+    interaction::SmartPickupController controller(backend);
+    const interaction::PickAssistPreviewRequest request{
+        17U, {0.2F, 0.7F, -0.1F}};
+    backend.first_output.planning_barrier = true;
+    backend.first_output.preview_requests = {request};
+    backend.subsequent_output.override_steering = true;
+    backend.subsequent_output.force_strafe = true;
+    backend.subsequent_output.left_stick = vec3(0.3F, 0.0F, -0.8F);
+
+    const interaction::LocomotionSnapshot snapshot =
+        make_snapshot(vec3(0.0F, 0.0F, 3.0F), PIf);
+    interaction::SmartPickupPreStepInput activation{};
+    activation.runtime_state = interaction::RuntimeState::Locomotion;
+    activation.interact_pressed = true;
+    activation.selected_target = &target;
+    activation.selected_affordance_id = target.affordances.front().id;
+    require(controller.pre_step(activation).interact_consumed,
+        "planning barrier fixture did not activate");
+    uint32_t preview_calls = 0U;
+    const interaction::SmartPickupPreviewCallback preview =
+        [&](const interaction::LocomotionSnapshot& callback_snapshot,
+            interaction::PickEntryRoot root,
+            interaction::TargetHandle handle,
+            uint32_t affordance_id)
+            -> std::optional<interaction::PickEntryPreview> {
+            ++preview_calls;
+            require(same_snapshot_bits(callback_snapshot, snapshot),
+                "planning barrier preview changed the frozen snapshot");
+            require(handle == target.handle &&
+                    affordance_id == target.affordances.front().id &&
+                    same_pick_entry_root_bits(root, request.root),
+                "planning barrier preview changed request authority");
+            interaction::PickEntryPreview result{};
+            result.path_feasible = true;
+            result.match_ready = true;
+            result.prospective_root = root;
+            return result;
+        };
+
+    interaction::SmartPickupPostStepInput post_input{};
+    post_input.runtime_state = interaction::RuntimeState::Locomotion;
+    post_input.live_flat_snapshot = snapshot;
+    post_input.current_target = &target;
+    const interaction::SmartPickupPostStepResult post =
+        controller.post_step(post_input, preview);
+
+    require(backend.observe_calls == 2U && preview_calls == 1U,
+        "planning barrier did not consume exactly one same-step preview");
+    require(backend.observations.size() == 2U &&
+            backend.observations.back().preview_results.size() == 1U &&
+            backend.observations.back().preview_snapshot_fingerprint ==
+                post.snapshot_fingerprint,
+        "planning barrier did not echo the frozen preview result");
+    require(post.assist_output.override_steering &&
+            post.assist_output.force_strafe &&
+            same_vec3_bits(post.assist_output.left_stick,
+                           backend.subsequent_output.left_stick),
+        "planning barrier did not return the armed-route steering output");
+}
 
 // This raylib-free harness establishes only the caller-side pre/ordinary/post
 // order around the coordinator. Production locomotion-provider, live-flat
@@ -2435,6 +2501,7 @@ int main() {
     test_learned_debug_snapshot_is_forwarded_without_mutation();
     test_production_provider_configuration_is_explicit_and_strict();
     test_activation_brackets_one_caller_step_and_defers_assist_motion();
+    test_planning_barrier_consumes_preview_in_same_step();
     test_prior_preview_batch_uses_one_snapshot_and_echoes_every_request();
     test_selection_and_final_preview_call_counts_are_exact();
     test_begin_exception_clears_pending_activation_before_backend_call();
