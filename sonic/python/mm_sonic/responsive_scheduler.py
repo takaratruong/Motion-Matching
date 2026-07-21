@@ -15,34 +15,72 @@ coordinator behavior.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+import time
+from typing import Callable
+
 from .coordinator import CandidateSuperseded
 from .joints import ContractError
+
+
+@dataclass(frozen=True)
+class ScheduledPrefix:
+    """One accepted responsive prefix bound to the intent that produced it.
+
+    Preserves the exact successful ``IntentSnapshot`` and the monotonic
+    ``sampled_ns`` timestamp read at its sample time, alongside the accepted
+    result the coordinator/committer returned.
+    """
+
+    snapshot: object
+    sampled_ns: int
+    accepted: object
 
 
 class ResponsiveScheduler:
     """Drive one committed prefix per operator boundary, retrying supersession."""
 
-    def __init__(self, coordinator: object, mailbox: object) -> None:
+    def __init__(
+        self,
+        coordinator: object,
+        mailbox: object,
+        *,
+        on_sample: Callable[[object, object], None] | None = None,
+        monotonic_ns: Callable[[], int] = time.monotonic_ns,
+    ) -> None:
         if not hasattr(coordinator, "run_one_chunk"):
             raise ContractError("scheduler requires a coordinator with run_one_chunk")
         if not hasattr(mailbox, "sample_intent"):
             raise ContractError("scheduler requires a mailbox with sample_intent")
+        if on_sample is not None and not callable(on_sample):
+            raise ContractError("scheduler on_sample must be callable or None")
+        if not callable(monotonic_ns):
+            raise ContractError("scheduler monotonic_ns must be callable")
         self._coordinator = coordinator
         self._mailbox = mailbox
+        self._on_sample = on_sample
+        self._monotonic_ns = monotonic_ns
 
-    def run_one_prefix(self, chunk_index: int) -> object | None:
+    def run_one_prefix(self, chunk_index: int) -> ScheduledPrefix | None:
         """Sample the latest intent and commit one prefix, retrying supersession.
 
-        Returns the accepted chunk, or ``None`` when the sampled intent is a
-        terminate snapshot (no command).  Retries the same ``chunk_index`` only
-        after a typed ``CandidateSuperseded`` outcome, always re-sampling the
-        newest revision.  Any other exception propagates unchanged.
+        Returns a :class:`ScheduledPrefix` binding the accepted result to the
+        exact successful snapshot and its monotonic sampled timestamp, or
+        ``None`` when the sampled intent is a terminate snapshot (no command).
+        Retries the same ``chunk_index`` only after a typed
+        ``CandidateSuperseded`` outcome, always re-sampling the newest revision.
+        Any other exception propagates unchanged.  When provided, ``on_sample``
+        fires for every sample (including terminate and superseded retries) so
+        camera delivery stays synchronized with the boundary.
         """
 
         if type(chunk_index) is not int or chunk_index < 0:
             raise ContractError("scheduler chunk_index must be a nonnegative integer")
         while True:
-            snapshot, _mapped = self._mailbox.sample_intent(chunk_index)
+            sampled_ns = self._monotonic_ns()
+            snapshot, mapped = self._mailbox.sample_intent(chunk_index)
+            if self._on_sample is not None:
+                self._on_sample(snapshot, mapped)
             if snapshot.command is None:
                 return None
             bound_revision = snapshot.revision
@@ -54,10 +92,13 @@ class ResponsiveScheduler:
                 return self._mailbox.current_revision <= bound_revision
 
             try:
-                return self._coordinator.run_one_chunk(
+                accepted = self._coordinator.run_one_chunk(
                     snapshot.command,
                     command_is_current=command_is_current,
                 )
             except CandidateSuperseded:
                 # Retry the same chunk index using the newest revision.
                 continue
+            return ScheduledPrefix(
+                snapshot=snapshot, sampled_ns=sampled_ns, accepted=accepted
+            )

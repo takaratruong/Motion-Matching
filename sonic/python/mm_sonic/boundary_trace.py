@@ -15,27 +15,35 @@ import math
 from .joints import ContractError
 
 
-# The eight design timestamps in their mandated non-decreasing order:
-# X11 transition -> sampled -> MM start -> MM complete -> committed ->
-# published+ack -> physics released -> first simulated frame.
+# The eight design timestamps in their corrected non-decreasing order:
+# X11 transition -> sampled -> MM start -> MM complete ->
+# publication sent (wait=False socket return) -> committed ->
+# physics release requested -> simulation advance completed.
+#
+# Publication is *sent* strictly before mm.commit/timeline.commit in the
+# adapter, so publication_sent_ns precedes committed_ns.  Two prior
+# acknowledgement/first-frame timestamp fields are deliberately absent: the
+# responsive publish is wait=False (no GEAR acknowledgement after CONTROL
+# activation) and no first-simulated-frame timestamp is exposed anywhere.
 _TIMESTAMP_FIELDS = (
     "input_observed_ns",
     "sampled_ns",
     "mm_started_ns",
     "mm_completed_ns",
+    "publication_sent_ns",
     "committed_ns",
-    "published_ack_ns",
-    "physics_released_ns",
-    "first_simulated_frame_ns",
+    "physics_release_requested_ns",
+    "simulation_advance_completed_ns",
 )
 
-# Registered numeric-vector widths in the MuJoCo target basis.
+# Registered numeric-vector widths in the MuJoCo target basis.  The false
+# published-physical-root-displacement field is removed: the SONIC wire
+# carries only joint_position/body_quat_w and no root translation, so there is
+# no independent published physical-root channel to report.
 _VECTOR_FIELDS = (
     ("requested_velocity_mujoco", 3),
     ("requested_heading_mujoco_wxyz", 4),
     ("generated_virtual_root_displacement_mujoco", 3),
-    ("published_physical_root_displacement_mujoco", 3),
-    ("observed_mujoco_root_displacement", 3),
 )
 
 
@@ -75,15 +83,16 @@ class BoundaryTrace:
     sampled_ns: int
     mm_started_ns: int
     mm_completed_ns: int
+    publication_sent_ns: int
     committed_ns: int
-    published_ack_ns: int
-    physics_released_ns: int
-    first_simulated_frame_ns: int
+    physics_release_requested_ns: int
+    simulation_advance_completed_ns: int
     requested_velocity_mujoco: tuple[float, float, float]
     requested_heading_mujoco_wxyz: tuple[float, float, float, float]
     generated_virtual_root_displacement_mujoco: tuple[float, float, float]
-    published_physical_root_displacement_mujoco: tuple[float, float, float]
-    observed_mujoco_root_displacement: tuple[float, float, float]
+    # Real state-log measurement, or None when the log does not bound the
+    # released chunk.  Never a made-up zero.
+    observed_mujoco_root_displacement: tuple[float, float, float] | None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -106,4 +115,15 @@ class BoundaryTrace:
         for name, width in _VECTOR_FIELDS:
             object.__setattr__(
                 self, name, _finite_vector(getattr(self, name), width, name)
+            )
+
+        # observed_mujoco_root_displacement is real-or-unavailable: a genuine
+        # width-3 finite measurement, or None when the state log does not bound
+        # the released chunk.  It is never fabricated as a zero vector.
+        observed = self.observed_mujoco_root_displacement
+        if observed is not None:
+            object.__setattr__(
+                self,
+                "observed_mujoco_root_displacement",
+                _finite_vector(observed, 3, "observed_mujoco_root_displacement"),
             )

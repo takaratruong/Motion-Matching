@@ -36,6 +36,13 @@ from .manual_evidence import (
 )
 from .operator import OperatorLimits, OperatorSampler
 from .operator_x11 import ContinuousControlLoop, X11KeyStateProvider
+from .responsive_scheduler import ResponsiveScheduler
+from .responsive_wiring import (
+    ManualChunkCommitter,
+    StateLogRootReader,
+    build_boundary_trace,
+    trace_record,
+)
 from .scene import (
     HOLDEN_COORDINATE_SIGNATURE,
     MUJOCO_COORDINATE_SIGNATURE,
@@ -101,6 +108,18 @@ def _validated_preload_chunks(value: object) -> int:
             f"preload chunks must be an int in 1..4, got {value!r}"
         )
     return value
+
+
+def _responsive_preload_chunks(default_preload_chunks: int) -> int:
+    """Stage-R1 responsive mode commits exactly one preloaded 0.4s prefix.
+
+    The opt-in responsive path drops lookahead to a single irrevocable chunk
+    regardless of the resolved interactive default; the default two-chunk path
+    never calls this.
+    """
+
+    _validated_preload_chunks(default_preload_chunks)
+    return 1
 
 
 class CommandRecorder:
@@ -319,6 +338,51 @@ def _heading_frame_offset_yaw_rad(
     )
 
 
+def _deliver_camera(
+    *,
+    simulator: object,
+    mapped: MappedControlState,
+    camera_state: CameraDeliveryState,
+    event_sink: Callable[[str], None],
+    camera_disabled_prefix: str,
+) -> CameraDeliveryState:
+    """Deliver one synchronized camera update with fail-closed ack semantics.
+
+    Only an exact-object/echo error (message prefixed ``camera data``) proves
+    the JSONL response was fully consumed; it disables the camera once. Any
+    other ``ProcessProtocolError`` is fatal because the request/response stream
+    may no longer be synchronized.
+    """
+
+    next_camera_state = camera_state
+    camera = mapped.camera
+    if camera_state.enabled and camera.sequence != camera_state.last_sequence:
+        try:
+            simulator.set_camera(
+                camera.sequence,
+                math.degrees(camera.azimuth_rad),
+                -math.degrees(camera.altitude_rad),
+                camera.distance_m,
+            )
+        except ProcessProtocolError as error:
+            if not str(error).startswith("camera data"):
+                raise
+            if not camera_state.disabled_reported:
+                event_sink(f"{camera_disabled_prefix}: {error}")
+            next_camera_state = CameraDeliveryState(
+                enabled=False,
+                last_sequence=camera_state.last_sequence,
+                disabled_reported=True,
+            )
+        else:
+            next_camera_state = CameraDeliveryState(
+                enabled=True,
+                last_sequence=camera.sequence,
+                disabled_reported=camera_state.disabled_reported,
+            )
+    return next_camera_state
+
+
 def _consume_x11_boundary(
     *,
     control_loop: object,
@@ -339,35 +403,13 @@ def _consume_x11_boundary(
     if command is None:
         return X11BoundaryResult(None, mapped, camera_state, None)
 
-    next_camera_state = camera_state
-    camera = mapped.camera
-    if camera_state.enabled and camera.sequence != camera_state.last_sequence:
-        try:
-            simulator.set_camera(
-                camera.sequence,
-                math.degrees(camera.azimuth_rad),
-                -math.degrees(camera.altitude_rad),
-                camera.distance_m,
-            )
-        except ProcessProtocolError as error:
-            # Only an exact-object/echo error proves the JSONL response was
-            # fully consumed. Parse/truncation errors remain fatal because the
-            # request/response stream may no longer be synchronized.
-            if not str(error).startswith("camera data"):
-                raise
-            if not camera_state.disabled_reported:
-                event_sink(f"{camera_disabled_prefix}: {error}")
-            next_camera_state = CameraDeliveryState(
-                enabled=False,
-                last_sequence=camera_state.last_sequence,
-                disabled_reported=True,
-            )
-        else:
-            next_camera_state = CameraDeliveryState(
-                enabled=True,
-                last_sequence=camera.sequence,
-                disabled_reported=camera_state.disabled_reported,
-            )
+    next_camera_state = _deliver_camera(
+        simulator=simulator,
+        mapped=mapped,
+        camera_state=camera_state,
+        event_sink=event_sink,
+        camera_disabled_prefix=camera_disabled_prefix,
+    )
 
     generate_and_publish(command, wait=False)
     advance = gate.release_steps(steps_per_chunk)
@@ -383,8 +425,106 @@ def _consume_x11_boundary(
     return X11BoundaryResult(command, mapped, next_camera_state, advance)
 
 
+def _write_responsive_evidence(
+    bundle: object, responsive: bool, traces: list[object]
+) -> dict | None:
+    """Write append-only responsive trace JSONL and an honest evidence summary.
+
+    Returns ``None`` on the default (non-responsive) path so nothing is written.
+    Each committed prefix contributes one JSONL line; the summary tallies how
+    many boundaries carried a real observed root measurement versus how many had
+    it unavailable, never fabricating a zero for the unavailable ones.
+    """
+
+    if not responsive:
+        return None
+    records = [trace_record(trace) for trace in traces]
+    lines = "".join(
+        json.dumps(record, sort_keys=True) + "\n" for record in records
+    )
+    bundle.write_text("responsive-boundary-trace.jsonl", lines)
+    available = sum(1 for record in records if record["observed_root_available"])
+    evidence = {
+        "schema": "mm-sonic-responsive-evidence/v1",
+        "trace_path": "responsive-boundary-trace.jsonl",
+        "committed_prefixes": len(records),
+        "observed_root_available": available,
+        "observed_root_unavailable": len(records) - available,
+        # Stage R1 honest floor: one irrevocable 0.4s prefix plus MM generation
+        # time. wait=False publication returns the socket send, not a GEAR
+        # stream-processing acknowledgement (WAIT-phase only).
+        "lookahead_seconds": _CHUNK_DURATION_S,
+    }
+    bundle.write_text(
+        "responsive-evidence.json",
+        json.dumps(evidence, sort_keys=True, indent=2) + "\n",
+    )
+    return evidence
+
+
+def _run_responsive_x11_loop(
+    *,
+    control_loop: object,
+    committer: object,
+    simulator: object,
+    chunks: int,
+    camera_state: CameraDeliveryState,
+    event_sink: Callable[[str], None],
+    trace_sink: Callable[[object], None],
+    session_id: str,
+    camera_disabled_prefix: str,
+) -> CameraDeliveryState:
+    """Drive the opt-in Stage-R1 one-prefix responsive loop.
+
+    Each iteration delivers the synchronized camera at sample time (via the
+    scheduler's ``on_sample`` callback, preserving the consumed-response and
+    camera-disable semantics) and commits exactly one prefix through the
+    ``ManualChunkCommitter``.  A terminate snapshot (X) returns ``None`` from the
+    scheduler and breaks the loop without generation, publication, or release.
+    An honest ``BoundaryTrace`` is emitted per committed prefix; assembling it
+    never alters command execution.
+    """
+
+    camera_box: list[CameraDeliveryState] = [camera_state]
+
+    def on_sample(_snapshot: object, mapped: object) -> None:
+        # Camera delivery is synchronous and identical to the default path.
+        camera_box[0] = _deliver_camera(
+            simulator=simulator,
+            mapped=mapped,
+            camera_state=camera_box[0],
+            event_sink=event_sink,
+            camera_disabled_prefix=camera_disabled_prefix,
+        )
+
+    scheduler = ResponsiveScheduler(
+        committer, control_loop.mailbox, on_sample=on_sample
+    )
+    for _consumed_chunk in range(chunks):
+        prefix = scheduler.run_one_prefix(committer.next_chunk)
+        if prefix is None:
+            # Terminate (X): no generation, publication, or physics release.
+            break
+        trace = build_boundary_trace(prefix, prefix.accepted, session_id=session_id)
+        trace_sink(trace)
+    return camera_box[0]
+
+
 def run_demo(namespace: argparse.Namespace) -> Path:
-    preload_chunks = _validated_preload_chunks(namespace.preload_chunks)
+    responsive = bool(getattr(namespace, "responsive", False))
+    if responsive and (
+        namespace.mode != "interactive" or namespace.input_source != "x11"
+    ):
+        raise ContractError(
+            "--responsive is valid only for interactive X11 mode"
+        )
+    # The opt-in responsive path commits exactly one preloaded 0.4s prefix; the
+    # default two-chunk interactive path and all other modes are untouched.
+    preload_chunks = (
+        _responsive_preload_chunks(namespace.preload_chunks)
+        if responsive
+        else _validated_preload_chunks(namespace.preload_chunks)
+    )
     output_root = Path(namespace.output_root).expanduser().resolve()
     source_run = Path(namespace.source_run).expanduser().resolve(strict=True)
     gear_checkout = Path(namespace.gear_checkout).expanduser().resolve(strict=True)
@@ -453,6 +593,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
     timeline: TargetTimeline | None = None
     session_id = f"manual-{os.getpid()}"
     next_chunk = 0
+    responsive_traces: list[object] = []
     recorder = CommandRecorder(
         mode=namespace.mode,
         preload_chunks=preload_chunks,
@@ -633,24 +774,57 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                         raise ContractError(
                             "continuous X11 control did not publish an initial state"
                         )
-                    for _consumed_chunk in range(namespace.chunks):
-                        result = _consume_x11_boundary(
-                            control_loop=control_loop,
-                            simulator=simulator,
+                    if responsive:
+                        # Opt-in Stage-R1 one-prefix responsive path. The single
+                        # preloaded chunk already committed index 0, so control
+                        # resumes at next_chunk. The committer presents
+                        # manual_demo's transaction as run_one_chunk; physics is
+                        # released only after publication and both commits.
+                        committer = ManualChunkCommitter(
+                            mm=mm,
+                            validator=validator,
+                            timeline=timeline,
+                            publish=publish,
                             gate=gate,
-                            generate_and_publish=generate_and_publish,
-                            chunk_index=next_chunk,
+                            session_id=session_id,
                             steps_per_chunk=steps_per_chunk,
-                            preload_chunks=preload_chunks,
+                            recorder=recorder,
+                            state_log_reader=StateLogRootReader(
+                                bundle.path / "scored-sim-logs" / "state.jsonl"
+                            ),
+                            next_chunk=next_chunk,
+                        )
+                        camera_state = _run_responsive_x11_loop(
+                            control_loop=control_loop,
+                            committer=committer,
+                            simulator=simulator,
+                            chunks=namespace.chunks,
                             camera_state=camera_state,
                             event_sink=_print_terminal_event,
-                            control_prefix="CONTROL chunk=",
+                            trace_sink=responsive_traces.append,
+                            session_id=session_id,
                             camera_disabled_prefix="CAMERA DISABLED",
                         )
-                        camera_state = result.camera_state
-                        if result.command is None:
-                            break
-                        last_command = result.command
+                        next_chunk = committer.next_chunk
+                    else:
+                        for _consumed_chunk in range(namespace.chunks):
+                            result = _consume_x11_boundary(
+                                control_loop=control_loop,
+                                simulator=simulator,
+                                gate=gate,
+                                generate_and_publish=generate_and_publish,
+                                chunk_index=next_chunk,
+                                steps_per_chunk=steps_per_chunk,
+                                preload_chunks=preload_chunks,
+                                camera_state=camera_state,
+                                event_sink=_print_terminal_event,
+                                control_prefix="CONTROL chunk=",
+                                camera_disabled_prefix="CAMERA DISABLED",
+                            )
+                            camera_state = result.camera_state
+                            if result.command is None:
+                                break
+                            last_command = result.command
             finally:
                 provider.close()
         else:
@@ -690,6 +864,9 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                         flush=True,
                     )
         command_artifact = recorder.artifact_bytes()
+        responsive_evidence = _write_responsive_evidence(
+            bundle, responsive, responsive_traces
+        )
         snapshot = simulator.snapshot()
         if namespace.scene_id == "sonic-flat-baseline":
             registration = json.loads(
@@ -765,6 +942,8 @@ def run_demo(namespace: argparse.Namespace) -> Path:
         bundle.write_bytes("manual-commands.json", command_artifact)
         bundle.write_bytes("manual-summary.json", summary_bytes)
         print(json.dumps(summary, sort_keys=True), flush=True)
+        if responsive_evidence is not None:
+            print(json.dumps(responsive_evidence, sort_keys=True), flush=True)
         return bundle.path
     finally:
         cancellation.set()
@@ -827,6 +1006,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--chunks", type=int, default=30)
     parser.add_argument("--preload-chunks", type=int, default=None)
     parser.add_argument("--onscreen", action="store_true")
+    parser.add_argument("--responsive", action="store_true")
     parser.add_argument("--scene-id", default=None)
     parser.add_argument("--route-id", default=None)
     parser.add_argument("--terrain-weight", type=float, default=None)

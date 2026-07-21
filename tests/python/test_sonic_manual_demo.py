@@ -50,6 +50,23 @@ class CommandRecorderTests(unittest.TestCase):
     def test_preload_chunks_defaults_to_four(self) -> None:
         self.assertEqual(_parser().parse_args([]).preload_chunks, 4)
 
+    def test_responsive_flag_defaults_false_and_is_opt_in(self) -> None:
+        self.assertFalse(_parser().parse_args([]).responsive)
+        self.assertTrue(_parser().parse_args(["--responsive"]).responsive)
+
+    def test_responsive_does_not_change_interactive_two_chunk_default(self) -> None:
+        args = _parser().parse_args(["--mode", "interactive"])
+        # Defaults untouched: two-chunk interactive path, flag off.
+        self.assertEqual(args.preload_chunks, 2)
+        self.assertFalse(args.responsive)
+
+    def test_responsive_preload_chunks_forces_exactly_one(self) -> None:
+        from mm_sonic.manual_demo import _responsive_preload_chunks
+
+        # Regardless of the resolved default, responsive uses one 0.4s prefix.
+        self.assertEqual(_responsive_preload_chunks(2), 1)
+        self.assertEqual(_responsive_preload_chunks(4), 1)
+
     def test_terrain_and_x11_are_interactive_defaults(self) -> None:
         args = _parser().parse_args(["--mode", "interactive", "--onscreen"])
         self.assertEqual(args.scene_id, "grail-curb-default")
@@ -485,6 +502,238 @@ class X11BoundaryIntegrationTests(unittest.TestCase):
             )
 
 
+class _ResponsiveMailbox:
+    """A sample_intent mailbox serving scripted IntentSnapshots."""
+
+    def __init__(self, snapshots, mapped) -> None:
+        self._snapshots = list(snapshots)
+        self._mapped = mapped
+        self.sampled: list[int] = []
+        self.current_revision = 1
+
+    def sample_intent(self, chunk_index: int):
+        self.sampled.append(chunk_index)
+        snapshot = self._snapshots.pop(0)
+        self.current_revision = snapshot.revision
+        return snapshot, self._mapped
+
+
+class _ResponsiveControlLoop:
+    def __init__(self, mailbox) -> None:
+        self.mailbox = mailbox
+
+
+class ResponsiveX11LoopTests(unittest.TestCase):
+    def _mapped(self):
+        _command, mapped = _mapped_boundary()
+        return mapped
+
+    def test_responsive_loop_commits_one_prefix_and_delivers_camera(self) -> None:
+        from mm_sonic.manual_demo import _run_responsive_x11_loop
+        from mm_sonic.operator_x11 import IntentSnapshot
+        from mm_sonic.responsive_wiring import ManualChunkCommitter
+
+        command = CommandSample(0, (0.25, -0.4, 0.0), (1.0, 0.0, 0.0, 0.0))
+        snapshot = IntentSnapshot(revision=1, observed_ns=5, command=command)
+        mapped = self._mapped()
+        mailbox = _ResponsiveMailbox([snapshot], mapped)
+        control_loop = _ResponsiveControlLoop(mailbox)
+        simulator = _BoundarySimulator()
+
+        log: list[str] = []
+
+        class _Timeline:
+            last_accepted_candidate_id = None
+
+            def prepare(self, checked):
+                import numpy as np
+
+                class _T:
+                    virtual_root_position = np.zeros((20, 3), dtype=np.float32)
+                    buffer = object()
+
+                class _P:
+                    target = _T()
+
+                return _P()
+
+            def commit(self, prepared):
+                log.append("timeline.commit")
+
+            def abort(self, candidate_id):
+                log.append("timeline.abort")
+
+        class _MM:
+            def generate(self, command, **kwargs):
+                log.append("mm.generate")
+                return object()
+
+            def commit(self, candidate_id):
+                log.append("mm.commit")
+
+            def abort(self, candidate_id):
+                log.append("mm.abort")
+
+        class _Validator:
+            def validate_source(self, raw):
+                return object()
+
+        class _Gate:
+            def release_steps(self, steps):
+                log.append("release")
+                return object()
+
+        class _Recorder:
+            def record(self, command):
+                log.append("record")
+
+        published: list = []
+        committer = ManualChunkCommitter(
+            mm=_MM(),
+            validator=_Validator(),
+            timeline=_Timeline(),
+            publish=lambda buffer, *, phase, wait: published.append((phase, wait)),
+            gate=_Gate(),
+            session_id="session",
+            steps_per_chunk=20,
+            recorder=_Recorder(),
+        )
+
+        traces: list = []
+        events: list[str] = []
+        camera_state = CameraDeliveryState()
+
+        final_state = _run_responsive_x11_loop(
+            control_loop=control_loop,
+            committer=committer,
+            simulator=simulator,
+            chunks=1,
+            camera_state=camera_state,
+            event_sink=events.append,
+            trace_sink=traces.append,
+            session_id="session",
+            camera_disabled_prefix="CAMERA DISABLED",
+        )
+
+        # One prefix committed and physics released once.
+        self.assertEqual(log.count("release"), 1)
+        self.assertEqual(published, [("timeline", False)])
+        # Camera delivered synchronously via on_sample.
+        self.assertEqual(len(simulator.camera_calls), 1)
+        # One honest boundary trace emitted (observed root unavailable -> None).
+        self.assertEqual(len(traces), 1)
+        self.assertEqual(traces[0].input_transition_id, "session:rev:000001")
+        self.assertIsNone(traces[0].observed_mujoco_root_displacement)
+        self.assertIsInstance(final_state, CameraDeliveryState)
+
+    def test_responsive_loop_terminate_breaks_without_committing(self) -> None:
+        from mm_sonic.manual_demo import _run_responsive_x11_loop
+        from mm_sonic.operator_x11 import IntentSnapshot
+
+        snapshot = IntentSnapshot(revision=1, observed_ns=5, command=None)
+        mapped = self._mapped()
+        mailbox = _ResponsiveMailbox([snapshot], mapped)
+        control_loop = _ResponsiveControlLoop(mailbox)
+        simulator = _BoundarySimulator()
+
+        class _NeverCommitter:
+            next_chunk = 0
+
+            def run_one_chunk(self, command, *, command_is_current=None):
+                raise AssertionError("terminate must not commit")
+
+        traces: list = []
+        final_state = _run_responsive_x11_loop(
+            control_loop=control_loop,
+            committer=_NeverCommitter(),
+            simulator=simulator,
+            chunks=3,
+            camera_state=CameraDeliveryState(),
+            event_sink=lambda _e: None,
+            trace_sink=traces.append,
+            session_id="session",
+            camera_disabled_prefix="CAMERA DISABLED",
+        )
+
+        # X terminates: no trace, no camera required, loop broke.
+        self.assertEqual(traces, [])
+        self.assertIsInstance(final_state, CameraDeliveryState)
+
+
+class _FakeBundle:
+    def __init__(self, path) -> None:
+        self.path = path
+        self.written: dict = {}
+
+    def write_text(self, relative, text):
+        from pathlib import Path
+
+        target = self.path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+        self.written[str(relative)] = text
+        return target
+
+
+class WriteResponsiveEvidenceTests(unittest.TestCase):
+    def _trace_record(self, observed):
+        from mm_sonic.responsive_wiring import build_boundary_trace, trace_record
+        from mm_sonic.operator_x11 import IntentSnapshot
+        from mm_sonic.responsive_scheduler import ScheduledPrefix
+        from mm_sonic.responsive_wiring import AcceptedChunk
+
+        snapshot = IntentSnapshot(revision=3, observed_ns=10, command=_forward(0))
+        prefix = ScheduledPrefix(snapshot=snapshot, sampled_ns=20, accepted=None)
+        accepted = AcceptedChunk(
+            presented_prefix_id="session:candidate:000000",
+            mm_started_ns=30,
+            mm_completed_ns=40,
+            publication_sent_ns=50,
+            committed_ns=60,
+            physics_release_requested_ns=70,
+            simulation_advance_completed_ns=80,
+            generated_virtual_root_displacement_mujoco=(0.25, 0.0, 0.0),
+            observed_mujoco_root_displacement=observed,
+            advance=object(),
+        )
+        return build_boundary_trace(prefix, accepted, session_id="session")
+
+    def test_non_responsive_writes_no_evidence(self):
+        from mm_sonic.manual_demo import _write_responsive_evidence
+
+        with TemporaryDirectory() as tmp:
+            bundle = _FakeBundle(Path(tmp))
+            evidence = _write_responsive_evidence(bundle, False, [])
+            self.assertIsNone(evidence)
+            self.assertEqual(bundle.written, {})
+
+    def test_responsive_writes_jsonl_and_honest_summary(self):
+        from mm_sonic.manual_demo import _write_responsive_evidence
+
+        with TemporaryDirectory() as tmp:
+            bundle = _FakeBundle(Path(tmp))
+            traces = [
+                self._trace_record((0.24, 0.0, 0.0)),
+                self._trace_record(None),
+            ]
+            evidence = _write_responsive_evidence(bundle, True, traces)
+
+            self.assertEqual(evidence["committed_prefixes"], 2)
+            # Honest availability tally: one real observed root, one unavailable.
+            self.assertEqual(evidence["observed_root_available"], 1)
+            self.assertEqual(evidence["observed_root_unavailable"], 1)
+            lines = (
+                bundle.path / "responsive-boundary-trace.jsonl"
+            ).read_text().splitlines()
+            self.assertEqual(len(lines), 2)
+            first = json.loads(lines[0])
+            self.assertEqual(first["input_transition_id"], "session:rev:000003")
+            self.assertTrue(first["observed_root_available"])
+            second = json.loads(lines[1])
+            self.assertFalse(second["observed_root_available"])
+            self.assertIsNone(second["observed_mujoco_root_displacement"])
+
+
 class TerminalEventPrintingTests(unittest.TestCase):
     def test_prints_one_complete_event_line(self) -> None:
         output = StringIO()
@@ -527,6 +776,44 @@ class MainPreloadValidationTests(unittest.TestCase):
                     [
                         "--preload-chunks",
                         "5",
+                        "--output-root",
+                        output_root,
+                    ]
+                )
+            self.assertEqual(list(Path(output_root).iterdir()), [])
+
+    def test_responsive_rejected_in_script_mode_before_any_run_bundle(self) -> None:
+        # The --responsive validation boundary lives in the real run_demo
+        # entrypoint: it is valid only for interactive X11 and must reject
+        # every other mode before any run bundle is materialized. Script mode
+        # is the default, so main(["--responsive"]) drives that branch.
+        with TemporaryDirectory() as output_root:
+            with self.assertRaisesRegex(ContractError, "interactive X11"):
+                main(
+                    [
+                        "--responsive",
+                        "--mode",
+                        "script",
+                        "--output-root",
+                        output_root,
+                    ]
+                )
+            self.assertEqual(list(Path(output_root).iterdir()), [])
+
+    def test_responsive_rejected_in_interactive_terminal_before_any_run_bundle(
+        self,
+    ) -> None:
+        # Interactive mode alone is not enough: the terminal input source must
+        # also be rejected by the same entrypoint guard before any run bundle.
+        with TemporaryDirectory() as output_root:
+            with self.assertRaisesRegex(ContractError, "interactive X11"):
+                main(
+                    [
+                        "--responsive",
+                        "--mode",
+                        "interactive",
+                        "--input-source",
+                        "terminal",
                         "--output-root",
                         output_root,
                     ]

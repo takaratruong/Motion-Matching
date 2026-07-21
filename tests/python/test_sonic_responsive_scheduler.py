@@ -149,5 +149,71 @@ class ResponsiveSchedulerTests(unittest.TestCase):
             ResponsiveScheduler(RecordingCoordinator([]), object())
 
 
+class ScheduledPrefixResultTests(unittest.TestCase):
+    def test_accepted_prefix_preserves_snapshot_and_sampled_ns(self) -> None:
+        from mm_sonic.responsive_scheduler import ScheduledPrefix
+
+        snapshot = IntentSnapshot(revision=4, observed_ns=123, command=_command())
+        mailbox = FakeMailbox([snapshot])
+        coordinator = RecordingCoordinator(["accept"])
+        clock = iter([777])
+        scheduler = ResponsiveScheduler(
+            coordinator, mailbox, monotonic_ns=lambda: next(clock)
+        )
+
+        result = scheduler.run_one_prefix(0)
+
+        self.assertIsInstance(result, ScheduledPrefix)
+        # The exact successful snapshot object is preserved.
+        self.assertIs(result.snapshot, snapshot)
+        self.assertEqual(result.sampled_ns, 777)
+        self.assertIsNotNone(result.accepted)
+
+    def test_on_sample_callback_fires_for_each_sample_with_snapshot(self) -> None:
+        stale = IntentSnapshot(revision=1, observed_ns=100, command=_command())
+        fresh = IntentSnapshot(revision=2, observed_ns=200, command=_command())
+        mailbox = FakeMailbox([stale, fresh])
+        coordinator = RecordingCoordinator(["supersede", "accept"])
+        seen: list[tuple[int, object]] = []
+        scheduler = ResponsiveScheduler(
+            coordinator,
+            mailbox,
+            on_sample=lambda snapshot, mapped: seen.append(
+                (snapshot.revision, mapped)
+            ),
+        )
+
+        result = scheduler.run_one_prefix(0)
+
+        self.assertIsNotNone(result)
+        # on_sample fired once per sample, including the superseded retry.
+        self.assertEqual([revision for revision, _ in seen], [1, 2])
+
+    def test_on_sample_fires_before_terminate_returns_none(self) -> None:
+        snapshot = IntentSnapshot(revision=1, observed_ns=100, command=None)
+        mailbox = FakeMailbox([snapshot])
+        coordinator = RecordingCoordinator([])
+        seen: list[object] = []
+        scheduler = ResponsiveScheduler(
+            coordinator, mailbox, on_sample=lambda s, m: seen.append(s)
+        )
+
+        result = scheduler.run_one_prefix(0)
+
+        self.assertIsNone(result)
+        # Camera delivery still happens on the terminate boundary.
+        self.assertEqual(len(seen), 1)
+
+    def test_ordinary_coordinator_compat_without_new_kwargs(self) -> None:
+        # A plain Coordinator (no monotonic_ns/on_sample) still drives.
+        snapshot = IntentSnapshot(revision=1, observed_ns=100, command=_command())
+        mailbox = FakeMailbox([snapshot])
+        coordinator = RecordingCoordinator(["accept"])
+        scheduler = ResponsiveScheduler(coordinator, mailbox)
+
+        result = scheduler.run_one_prefix(0)
+        self.assertIsNotNone(result)
+
+
 if __name__ == "__main__":
     unittest.main()
