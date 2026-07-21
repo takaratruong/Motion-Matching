@@ -2637,6 +2637,32 @@ class GearProcess:
                     )
                 self._simulation_control_tick = armed_tick
                 continue
+            if (
+                fields[0] in ("SYNCING", "SYNCED")
+                and expected == "PAUSED"
+                and self._simulation_control_state == "recovering"
+            ):
+                if len(fields) != 3:
+                    raise ProcessProtocolError(
+                        f"GEAR {fields[0]} packet shape is invalid"
+                    )
+                try:
+                    sync_epoch = int(fields[1])
+                    sync_tick = int(fields[2])
+                except ValueError as error:
+                    raise ProcessProtocolError(
+                        f"GEAR {fields[0]} packet integers are invalid"
+                    ) from error
+                if (
+                    sync_epoch != self._simulation_control_epoch
+                    or sync_tick < 0
+                    or sync_tick > 0xFFFFFFFF
+                ):
+                    raise ProcessProtocolError(
+                        f"GEAR {fields[0]} packet violates recovery epoch"
+                    )
+                self._simulation_control_tick = sync_tick
+                continue
             if expected == "READY":
                 if fields != _SIMULATION_CONTROL_READY:
                     raise ProcessProtocolError(

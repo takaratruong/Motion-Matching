@@ -2692,6 +2692,48 @@ class GearProcessTests(TemporaryScriptCase):
         finally:
             gear.close()
 
+    def test_simulation_control_recovery_discards_queued_synced_ack(self):
+        child = self.script(
+            "simulation_control_sync_recovery_child.py",
+            r'''
+            import socket
+            import sys
+
+            flag = sys.argv.index("--sonic-simulation-control-fd")
+            channel = socket.socket(fileno=int(sys.argv[flag + 1]))
+            channel.send(b"READY 4\n")
+            print("BOOT READY", flush=True)
+            while True:
+                packet = channel.recv(256)
+                if packet == b"PAUSE 1\n":
+                    channel.send(b"PAUSED 1 100\n")
+                elif packet == b"SYNC 1\n":
+                    channel.send(b"SYNCING 1 100\n")
+                    channel.send(b"SYNCED 1 100\n")
+                elif packet == b"PAUSE 2\n":
+                    channel.send(b"PAUSED 2 100\n")
+                else:
+                    channel.send(b"ERROR 0 unexpected-request\n")
+            ''',
+        )
+        gear = self.gear(
+            child,
+            simulation_control_gate=True,
+            readiness_timeout_s=0.5,
+        )
+        try:
+            gear.start_to_wait_for_control()
+            gear._control_active = True
+            gear.pause_simulation_control()
+            gear.begin_simulation_control_sync()
+
+            gear.pause_simulation_control()
+
+            self.assertTrue(gear.simulation_control_is_paused)
+            self.assertEqual(gear._simulation_control_epoch, 2)
+        finally:
+            gear.close()
+
     def test_simulation_control_channel_rejects_unpatched_binary_at_startup(self):
         child = self.script(
             "unpatched_simulation_control_child.py",
