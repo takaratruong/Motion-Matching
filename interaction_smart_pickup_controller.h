@@ -63,6 +63,9 @@ public:
         const PickAssistObservation& observation) = 0;
     virtual std::optional<PickRequest> take_submission(
         uint64_t request_id) = 0;
+    virtual std::optional<PickEntryPreview> take_certified_preview() {
+        return std::nullopt;
+    }
     virtual bool active() const = 0;
     virtual bool owns_manual_interact() const = 0;
     virtual const PickAssistDiagnostics& diagnostics() const = 0;
@@ -110,6 +113,7 @@ struct SmartPickupPostStepInput {
 struct SmartPickupPostStepResult {
     PickAssistOutput assist_output{};
     std::optional<PickRequest> pick_request{};
+    std::optional<PickEntryPreview> certified_preview{};
     uint64_t snapshot_fingerprint = 0U;
 };
 

@@ -394,30 +394,26 @@ void test_provider_backed_lifecycle_submits_after_native_funnel() {
         vec3(0.18F, entry.position.y, 0.94F),
         entry.rotation,
     };
-    const interaction::PickAssistOutput final_request =
+    const interaction::PickAssistOutput ready =
         backend.observe(lifecycle_observation(12U, target, tracked));
-    assert(final_request.preview_requests.size() == 1U);
+    assert(ready.submit_interact);
+    assert(ready.preview_requests.empty());
+    assert(!ready.stationary_constraint);
     assert(backend.learned_diagnostics().state ==
-           interaction::LearnedPickupState::FinalPreview);
+           interaction::LearnedPickupState::ReadyToSubmit);
     assert(backend.learned_diagnostics().follower_progress_index ==
            static_cast<int>(debug->world_route.size() - 1U));
     assert(backend.learned_diagnostics().follower_lookahead_index ==
            static_cast<int>(debug->world_route.size() - 1U));
 
-    interaction::PickAssistObservation final =
-        lifecycle_observation(13U, target, tracked);
-    final.preview_snapshot_fingerprint = final.snapshot_fingerprint;
-    interaction::PickEntryPreview preview{};
-    preview.path_feasible = true;
-    preview.match_ready = true;
-    preview.prospective_root = final_request.preview_requests.front().root;
-    final.preview_results.push_back({
-        final_request.preview_requests.front(), preview});
-    const interaction::PickAssistOutput ready = backend.observe(final);
-    assert(ready.submit_interact);
     const std::optional<interaction::PickRequest> request =
         backend.take_submission(9001U);
     assert(request.has_value());
+    const std::optional<interaction::PickEntryPreview> certified =
+        backend.take_certified_preview();
+    assert(certified.has_value());
+    assert(certified->path_feasible && certified->match_ready);
+    assert(!backend.take_certified_preview().has_value());
     assert(request->target == target.handle);
     assert(request->affordance_id == 7U);
     assert(request->request_id == 9001U);

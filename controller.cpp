@@ -5694,8 +5694,19 @@ int main(void)
             }
             if (manual_smart_pickup_post_step.pick_request.has_value())
             {
-                interaction_edges.interact_pressed = true;
-                manual_smart_pickup_request = manual_smart_pickup_post_step.pick_request;
+                bool certified = true;
+                if (manual_smart_pickup_post_step.certified_preview.has_value())
+                {
+                    certified = interaction_runtime.cache_certified_pick(
+                        *manual_smart_pickup_post_step.pick_request,
+                        *manual_smart_pickup_post_step.certified_preview);
+                }
+                if (certified)
+                {
+                    interaction_edges.interact_pressed = true;
+                    manual_smart_pickup_request =
+                        manual_smart_pickup_post_step.pick_request;
+                }
             }
         }
         // Manual pick-assist observation ends.

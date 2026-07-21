@@ -240,37 +240,37 @@ TrialEvidence run_learned_funnel_to_actual_carry(float bearing_radians) {
             std::atan2(terminal_world.yaw_sin, terminal_world.yaw_cos),
             vec3(0.0F, 1.0F, 0.0F)),
     };
-    backend.observe(observation(2U, *target, tracked));
-    backend.observe(observation(3U, *target, tracked));
-    const interaction::PickAssistOutput final_request = backend.observe(
-        observation(4U, *target, tracked));
+    const interaction::PickAssistOutput ready = backend.observe(
+        observation(2U, *target, tracked));
+    const auto debug = backend.learned_debug_snapshot();
+    assert(debug.has_value());
     assert(backend.learned_diagnostics().follower_progress_index ==
-           interaction::kFunnelExecutionTickCount - 1);
+           static_cast<int>(debug->world_route.size() - 1U));
     assert(backend.learned_diagnostics().follower_lookahead_index ==
-           interaction::kFunnelExecutionTickCount - 1);
-    assert(final_request.preview_requests.size() == 1U);
-
-    interaction::PickAssistObservation final =
-        observation(5U, *target, tracked);
-    final.preview_snapshot_fingerprint = final.snapshot_fingerprint;
-    const auto& request = final_request.preview_requests.front();
-    final.preview_results.push_back({
-        request,
-        runtime.preview_pick(
-            fixture.locomotion, request.root,
-            target->handle, fixture.request.affordance_id),
-    });
-    assert(backend.observe(final).submit_interact);
+           static_cast<int>(debug->world_route.size() - 1U));
+    assert(ready.submit_interact);
+    assert(ready.preview_requests.empty());
+    assert(!ready.stationary_constraint);
     const std::optional<interaction::PickRequest> learned_request =
         backend.take_submission(fixture.request.request_id);
+    const std::optional<interaction::PickEntryPreview> certified_preview =
+        backend.take_certified_preview();
     assert(learned_request.has_value());
+    assert(certified_preview.has_value());
     assert(learned_request->target == fixture.request.target);
     assert(learned_request->affordance_id == fixture.request.affordance_id);
 
+    interaction::LocomotionSnapshot terminal_locomotion = fixture.locomotion;
+    terminal_locomotion.pose.positions[g1_skeleton::Simulation] =
+        tracked.position;
+    terminal_locomotion.pose.rotations[g1_skeleton::Simulation] =
+        tracked.rotation;
     interaction::RuntimeInput activation =
-        idle_runtime_input(fixture.locomotion);
+        idle_runtime_input(terminal_locomotion);
     activation.interact_pressed = true;
     activation.pick_request = learned_request;
+    assert(runtime.cache_certified_pick(
+        *learned_request, *certified_preview));
     interaction::RuntimeOutput output = runtime.update(activation);
     bool was_attached = false;
     int attachment_edges = 0;
@@ -280,7 +280,7 @@ TrialEvidence run_learned_funnel_to_actual_carry(float bearing_radians) {
          ++update) {
         if (output.diagnostics.attached && !was_attached) ++attachment_edges;
         was_attached = output.diagnostics.attached;
-        output = runtime.update(idle_runtime_input(fixture.locomotion));
+        output = runtime.update(idle_runtime_input(terminal_locomotion));
     }
     if (output.diagnostics.attached && !was_attached) ++attachment_edges;
     assert(output.diagnostics.state == interaction::RuntimeState::Carry);
@@ -292,7 +292,7 @@ TrialEvidence run_learned_funnel_to_actual_carry(float bearing_radians) {
     assert(held->state == interaction::ObjectState::Held);
     assert(held->owner_request == fixture.request.request_id);
     const interaction::RuntimeOutput carry = runtime.update(
-        idle_runtime_input(fixture.locomotion));
+        idle_runtime_input(terminal_locomotion));
     assert(carry.diagnostics.state == interaction::RuntimeState::Carry);
     assert(carry.diagnostics.attached);
     assert(backend.learned_diagnostics().selected_proposal_index >= 0);

@@ -337,6 +337,9 @@ SmartPickupPostStepResult SmartPickupController::post_step(
     if (result.assist_output.submit_interact) {
         result.pick_request = backend_->take_submission(
             input.next_request_id);
+        if (result.pick_request.has_value()) {
+            result.certified_preview = backend_->take_certified_preview();
+        }
     }
     previous_assist_output_ = result.assist_output;
     return result;

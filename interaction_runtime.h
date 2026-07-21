@@ -215,6 +215,9 @@ public:
         PickEntryRoot prospective_root,
         TargetHandle target,
         uint32_t affordance_id) const;
+    bool cache_certified_pick(
+        const PickRequest& request,
+        const PickEntryPreview& preview);
     PlaceStagingPreview preview_place(
         SurfaceHandle surface,
         uint32_t affordance_id) const;
@@ -233,6 +236,11 @@ private:
         bool accepted = false;
         Reason reason = Reason::None;
         PlaceMatchInput input{};
+    };
+
+    struct CachedCertifiedPick {
+        PickRequest request{};
+        PickEntryPreview preview{};
     };
 
     InteractionRuntime() = default;
@@ -265,6 +273,7 @@ private:
     const CertifiedPickupSourceRegistry* pickup_source_registry_ = nullptr;
     RuntimeConfig config_{};
     std::optional<PickRequest> request_{};
+    std::optional<CachedCertifiedPick> cached_certified_pick_{};
     std::optional<InteractionTarget> target_{};
     std::optional<GraspAffordance> affordance_{};
     std::optional<MatchCandidate> candidate_{};

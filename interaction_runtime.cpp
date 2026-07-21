@@ -488,6 +488,72 @@ bool exact(const MatchCandidate& left, const MatchCandidate& right) {
            left.group_costs == right.group_costs;
 }
 
+bool exact(
+    const PickupSourceProvenance& left,
+    const PickupSourceProvenance& right) {
+    return left.clip_ordinal == right.clip_ordinal &&
+        left.range_start == right.range_start &&
+        left.range_stop == right.range_stop &&
+        left.entry_global_frame == right.entry_global_frame &&
+        left.contact_global_frame == right.contact_global_frame &&
+        left.lift_global_frame == right.lift_global_frame &&
+        left.hold_global_frame == right.hold_global_frame &&
+        left.active_hand == right.active_hand &&
+        left.object_profile_id == right.object_profile_id &&
+        exact(left.object_bounds, right.object_bounds) &&
+        exact(left.hand_in_object, right.hand_in_object) &&
+        left.source_support_height_m == right.source_support_height_m;
+}
+
+bool exact(
+    const CertifiedPickupSourceIdentity& left,
+    const CertifiedPickupSourceIdentity& right) {
+    return exact(left.provenance, right.provenance) &&
+        left.sequence_id == right.sequence_id &&
+        left.object_id == right.object_id &&
+        left.reverse_start_global_frame == right.reverse_start_global_frame &&
+        left.join_key_sha256 == right.join_key_sha256 &&
+        left.source_id == right.source_id;
+}
+
+bool same_request(const PickRequest& left, const PickRequest& right) {
+    return left.target == right.target &&
+        left.affordance_id == right.affordance_id &&
+        left.request_id == right.request_id;
+}
+
+bool finite_certified_preview(const PickEntryPreview& preview) {
+    const MatchCandidate& candidate = preview.match_candidate;
+    const float values[]{
+        preview.prospective_root.world_x,
+        preview.prospective_root.world_z,
+        preview.prospective_root.world_yaw_radians,
+        preview.total_cost,
+        candidate.scene_from_source.position.x,
+        candidate.scene_from_source.position.y,
+        candidate.scene_from_source.position.z,
+        candidate.scene_from_source.rotation.w,
+        candidate.scene_from_source.rotation.x,
+        candidate.scene_from_source.rotation.y,
+        candidate.scene_from_source.rotation.z,
+        candidate.entry_root_offset.x,
+        candidate.entry_root_offset.y,
+        candidate.entry_root_offset.z,
+        candidate.entry_yaw_offset,
+        candidate.total_cost,
+    };
+    for (float value : values) {
+        if (!std::isfinite(value)) return false;
+    }
+    for (float value : candidate.group_costs) {
+        if (!std::isfinite(value)) return false;
+    }
+    return candidate.clip >= 0 && candidate.entry_frame >= 0 &&
+        candidate.contact_frame >= candidate.entry_frame &&
+        candidate.lift_frame >= candidate.contact_frame &&
+        candidate.hold_frame >= candidate.lift_frame;
+}
+
 CertifiedPickupSourceIdentity pickup_source_identity(
     const Database& database,
     const MatchCandidate& candidate,
@@ -1468,6 +1534,20 @@ PickEntryPreview InteractionRuntime::preview_pick(
     return preview;
 }
 
+bool InteractionRuntime::cache_certified_pick(
+    const PickRequest& request,
+    const PickEntryPreview& preview) {
+    if (state_ != RuntimeState::Locomotion ||
+        request.target.id == 0U || request.target.generation == 0U ||
+        request.affordance_id == 0U || request.request_id == 0U ||
+        !preview.path_feasible || !preview.match_ready ||
+        !finite_certified_preview(preview)) {
+        return false;
+    }
+    cached_certified_pick_ = CachedCertifiedPick{request, preview};
+    return true;
+}
+
 InteractionRuntime::PlaceMatchBuildResult
 InteractionRuntime::make_place_match_input(
     SurfaceHandle surface,
@@ -2015,6 +2095,12 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
 
     if (state_ == RuntimeState::Locomotion && input.interact_pressed) {
         request_ = input.pick_request;
+        if (!request_.has_value() ||
+            !cached_certified_pick_.has_value() ||
+            !same_request(
+                cached_certified_pick_->request, *request_)) {
+            cached_certified_pick_.reset();
+        }
         owns_reservation_ = false;
         diagnostics_ = RuntimeDiagnostics{};
         diagnostics_.state = RuntimeState::Preflight;
@@ -2092,9 +2178,83 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
                                 } else {
                                     target_ = built.input.target;
                                     affordance_ = built.input.affordance;
-                                    const MatchResult match =
-                                        evaluate_pick_entries_realized(
+                                    MatchResult match{};
+                                    if (cached_certified_pick_.has_value() &&
+                                        same_request(
+                                            cached_certified_pick_->request,
+                                            request)) {
+                                        const PickEntryPreview certified =
+                                            cached_certified_pick_->preview;
+                                        cached_certified_pick_.reset();
+                                        const vec3 root = input.locomotion
+                                            .pose.positions[
+                                                g1_skeleton::Simulation];
+                                        const vec3 forward = quat_mul_vec3(
+                                            input.locomotion.pose.rotations[
+                                                g1_skeleton::Simulation],
+                                            vec3(0.0F, 0.0F, 1.0F));
+                                        const float root_yaw = std::atan2(
+                                            forward.x, forward.z);
+                                        const float root_error = std::hypot(
+                                            root.x - certified
+                                                .prospective_root.world_x,
+                                            root.z - certified
+                                                .prospective_root.world_z);
+                                        const float yaw_delta = root_yaw -
+                                            certified.prospective_root
+                                                .world_yaw_radians;
+                                        const float yaw_error = std::abs(
+                                            std::atan2(
+                                                std::sin(yaw_delta),
+                                                std::cos(yaw_delta)));
+                                        const MatchCandidate& candidate =
+                                            certified.match_candidate;
+                                        const bool correction_valid =
+                                            std::hypot(
+                                                candidate.entry_root_offset.x,
+                                                candidate.entry_root_offset.z) <=
+                                                config_.matcher
+                                                    .maximum_root_correction_m &&
+                                            std::abs(candidate.entry_yaw_offset) <=
+                                                config_.matcher
+                                                    .maximum_yaw_correction_radians;
+                                        const CertifiedPickupSourceIdentity
+                                            actual_source =
+                                                pickup_source_identity(
+                                                    *database_,
+                                                    candidate,
+                                                    built.input.target
+                                                        .object_profile_id,
+                                                    pickup_source_registry_);
+                                        const auto realized = runtime_detail::
+                                            evaluate_realized_pick_transition(
+                                                *database_,
+                                                input.locomotion.pose,
+                                                candidate,
+                                                built.input.target,
+                                                built.input.affordance,
+                                                config_.playback,
+                                                config_.ik,
+                                                config_.attachment);
+                                        if (root_error <= 0.04F &&
+                                            yaw_error <= 0.34906585F &&
+                                            correction_valid &&
+                                            exact(
+                                                actual_source,
+                                                certified.pickup_source) &&
+                                            realized.feasible) {
+                                            match.accepted = true;
+                                            match.candidate = candidate;
+                                            match.reason = Reason::None;
+                                        } else {
+                                            match.reason = realized.feasible
+                                                ? Reason::TargetChanged
+                                                : realized.reason;
+                                        }
+                                    } else {
+                                        match = evaluate_pick_entries_realized(
                                             built.input).selection;
+                                    }
                                     if (!match.accepted) {
                                         reject(match.reason);
                                     } else {

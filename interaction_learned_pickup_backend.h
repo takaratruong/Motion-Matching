@@ -59,6 +59,7 @@ public:
     void cancel() override;
     PickAssistOutput observe(const PickAssistObservation& observation) override;
     std::optional<PickRequest> take_submission(uint64_t request_id) override;
+    std::optional<PickEntryPreview> take_certified_preview() override;
     bool active() const override;
     bool owns_manual_interact() const override;
     const PickAssistDiagnostics& diagnostics() const override;
@@ -105,6 +106,7 @@ private:
     FunnelRoute selected_route_object_{};
     std::vector<FunnelSample> selected_world_targets_{};
     PickEntryRoot final_root_{};
+    std::optional<PickEntryPreview> selected_preview_{};
     std::optional<InteractionFunnelFollower> follower_{};
     PickAssistDiagnostics diagnostics_{};
     LearnedPickupDiagnostics learned_diagnostics_{};

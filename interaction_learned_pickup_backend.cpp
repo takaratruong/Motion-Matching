@@ -231,6 +231,7 @@ bool LearnedSmartPickupBackend::begin(
         return false;
     }
     start_ = start;
+    selected_preview_.reset();
     frozen_object_world_ = start_.target_snapshot.object_world;
     if (start_.live_obstacles.empty()) start_.live_obstacles = start_.obstacles;
     diagnostics_ = {};
@@ -429,6 +430,7 @@ PickAssistOutput LearnedSmartPickupBackend::observe_learned(
         final_root_ = entry_root(selected_world_targets_.back());
         learned_diagnostics_.selected_proposal_index =
             static_cast<int>(proposal_index);
+        selected_preview_ = observation.preview_results[*winner].preview;
         follower_.emplace(
             proposal.seed,
             selected_route_object_,
@@ -471,14 +473,10 @@ PickAssistOutput LearnedSmartPickupBackend::observe_learned(
             return fail(LearnedPickupFailureReason::FollowerFailed);
         }
         if (followed.state == FunnelFollowerState::Completed) {
-            learned_diagnostics_.state = LearnedPickupState::FinalPreview;
-            diagnostics_.state = PickAssistState::FinalPreview;
-            PickAssistOutput output = braking_output();
-            output.preview_requests.push_back({
-                static_cast<uint32_t>(
-                    learned_diagnostics_.selected_proposal_index + 1),
-                final_root_,
-            });
+            learned_diagnostics_.state = LearnedPickupState::ReadyToSubmit;
+            diagnostics_.state = PickAssistState::ReadyToSubmit;
+            PickAssistOutput output{};
+            output.submit_interact = true;
             return output;
         }
         if (!followed.published) return braking_output();
@@ -649,6 +647,15 @@ std::optional<PickRequest> LearnedSmartPickupBackend::take_submission(
         start_.affordance_id,
         request_id,
     };
+}
+
+std::optional<PickEntryPreview>
+LearnedSmartPickupBackend::take_certified_preview() {
+    if (provider_ == nullptr ||
+        learned_diagnostics_.state != LearnedPickupState::Submitted) {
+        return std::nullopt;
+    }
+    return std::exchange(selected_preview_, std::nullopt);
 }
 
 bool LearnedSmartPickupBackend::active() const {
