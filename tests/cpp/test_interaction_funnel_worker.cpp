@@ -70,11 +70,27 @@ void test_nonzero_worker_exit_fails_without_artifact() {
     std::filesystem::remove_all(directory);
 }
 
+void test_wait_blocks_until_nonzero_worker_exit_fails() {
+    const std::filesystem::path directory =
+        std::filesystem::temp_directory_path() /
+        "g1-funnel-worker-blocking-nonzero-test";
+    std::filesystem::remove_all(directory);
+    interaction::AsyncPythonFunnelProvider provider(
+        "/bin/false", "ignored-worker.py", "ignored-checkpoint.pt", directory);
+    assert(provider.begin(request()));
+    const interaction::FunnelProposalPoll result = provider.wait();
+    assert(result.state == interaction::FunnelProposalPollState::Failed);
+    assert(!result.artifact.has_value());
+    assert(!result.error.empty());
+    std::filesystem::remove_all(directory);
+}
+
 }  // namespace
 
 int main() {
     test_request_bytes_match_python_layout();
     test_invalid_request_is_rejected();
     test_nonzero_worker_exit_fails_without_artifact();
+    test_wait_blocks_until_nonzero_worker_exit_fails();
     return 0;
 }

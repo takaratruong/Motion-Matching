@@ -38,6 +38,7 @@ public:
     virtual ~FunnelProposalProvider() = default;
     virtual bool begin(const FunnelProposalRequest& request) = 0;
     virtual FunnelProposalPoll poll() = 0;
+    virtual FunnelProposalPoll wait() { return poll(); }
     virtual void cancel() = 0;
 };
 
@@ -52,9 +53,12 @@ public:
 
     bool begin(const FunnelProposalRequest& request) override;
     FunnelProposalPoll poll() override;
+    FunnelProposalPoll wait() override;
     void cancel() override;
 
 private:
+    FunnelProposalPoll no_active_request() const;
+    FunnelProposalPoll finish(int status);
     FunnelProposalPoll fail(std::string error);
     void remove_attempt_files();
 

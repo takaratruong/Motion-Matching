@@ -1,5 +1,6 @@
 #include "interaction_funnel_worker.h"
 
+#include <cerrno>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -155,14 +156,38 @@ bool AsyncPythonFunnelProvider::begin(
 
 FunnelProposalPoll AsyncPythonFunnelProvider::poll() {
     if (child_pid_ < 0 || !request_.has_value()) {
-        return {FunnelProposalPollState::Failed, std::nullopt,
-                "no active funnel proposal request"};
+        return no_active_request();
     }
     int status = 0;
     const pid_t result = waitpid(
         static_cast<pid_t>(child_pid_), &status, WNOHANG);
     if (result == 0) return {};
     if (result < 0) return fail("failed to poll funnel proposal worker");
+    return finish(status);
+}
+
+FunnelProposalPoll AsyncPythonFunnelProvider::wait() {
+    if (child_pid_ < 0 || !request_.has_value()) {
+        return no_active_request();
+    }
+    int status = 0;
+    pid_t result = -1;
+    do {
+        result = waitpid(
+            static_cast<pid_t>(child_pid_), &status, 0);
+    } while (result < 0 && errno == EINTR);
+    if (result < 0) {
+        return fail("failed to wait for funnel proposal worker");
+    }
+    return finish(status);
+}
+
+FunnelProposalPoll AsyncPythonFunnelProvider::no_active_request() const {
+    return {FunnelProposalPollState::Failed, std::nullopt,
+            "no active funnel proposal request"};
+}
+
+FunnelProposalPoll AsyncPythonFunnelProvider::finish(int status) {
     child_pid_ = -1;
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         return fail("funnel proposal worker exited unsuccessfully");
