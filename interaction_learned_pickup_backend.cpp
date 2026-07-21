@@ -249,11 +249,9 @@ PickAssistOutput LearnedSmartPickupBackend::observe_learned(
     const float capture_yaw_error = yaw_error(
         observation.displayed_root.rotation,
         capture_.target_world.rotation);
-    const bool capture_settled =
+    const bool capture_ready =
         capture_error <= config_.capture_position_tolerance_m &&
-        capture_yaw_error <= config_.capture_yaw_tolerance_radians &&
-        observation.displayed_planar_speed_mps <=
-            config_.capture_speed_tolerance_mps;
+        capture_yaw_error <= config_.capture_yaw_tolerance_radians;
 
     switch (learned_diagnostics_.state) {
     case LearnedPickupState::CoarseCapture:
@@ -266,9 +264,8 @@ PickAssistOutput LearnedSmartPickupBackend::observe_learned(
                 config_.capture.route) != PickSlotReason::None) {
             return fail(LearnedPickupFailureReason::RouteBlocked);
         }
-        if (!capture_settled) {
+        if (!capture_ready) {
             learned_diagnostics_.state = LearnedPickupState::CoarseCapture;
-            learned_diagnostics_.settled_capture_ticks = 0U;
             diagnostics_.state = PickAssistState::SlotApproach;
             PickAssistOutput output{};
             output.override_steering = true;
@@ -284,13 +281,6 @@ PickAssistOutput LearnedSmartPickupBackend::observe_learned(
                     vec3(0.0F, 0.0F, 1.0F)),
                 observation.camera_azimuth);
             return output;
-        }
-        learned_diagnostics_.state = LearnedPickupState::CaptureSettling;
-        diagnostics_.state = PickAssistState::Settling;
-        ++learned_diagnostics_.settled_capture_ticks;
-        if (learned_diagnostics_.settled_capture_ticks <
-            config_.required_capture_settle_ticks) {
-            return braking_output();
         }
         const GraspAffordance* affordance = find_affordance(
             start_.target_snapshot, start_.affordance_id);
@@ -319,7 +309,7 @@ PickAssistOutput LearnedSmartPickupBackend::observe_learned(
         }
         learned_diagnostics_.state = LearnedPickupState::ProposalPending;
         diagnostics_.state = PickAssistState::SlotSelectionPreview;
-        return braking_output();
+        return consume_proposal_poll(observation, provider_->wait());
     }
     case LearnedPickupState::ProposalPending: {
         ++learned_diagnostics_.proposal_pending_ticks;
@@ -327,66 +317,7 @@ PickAssistOutput LearnedSmartPickupBackend::observe_learned(
             config_.maximum_proposal_pending_ticks) {
             return fail(LearnedPickupFailureReason::ProposalTimeout);
         }
-        FunnelProposalPoll poll = provider_->poll();
-        if (poll.state == FunnelProposalPollState::Pending) {
-            return braking_output();
-        }
-        if (poll.state != FunnelProposalPollState::Ready ||
-            !poll.artifact.has_value()) {
-            return fail(LearnedPickupFailureReason::ProposalWorkerFailed);
-        }
-        if (poll.artifact->request_id() != proposal_request_.request_id ||
-            poll.artifact->batch_seed() != proposal_request_.batch_seed ||
-            poll.artifact->checkpoint_sha256() !=
-                proposal_request_.checkpoint_sha256 ||
-            std::memcmp(
-                poll.artifact->condition().data(),
-                proposal_request_.condition.data(),
-                sizeof(float) * kFunnelConditionDim) != 0) {
-            return fail(LearnedPickupFailureReason::ProposalIdentityMismatch);
-        }
-        artifact_ = std::move(*poll.artifact);
-        selection_requests_.clear();
-        selection_proposal_indices_.clear();
-        int accepted = 0;
-        for (size_t proposal_index = 0U;
-             proposal_index < artifact_->proposals().size();
-             ++proposal_index) {
-            const FunnelProposal& proposal =
-                artifact_->proposals()[proposal_index];
-            if (!proposal.accepted) continue;
-            ++accepted;
-            const FunnelExecutionTargets targets =
-                world_targets(frozen_object_world_, proposal);
-            bool route_valid = true;
-            Transform previous = frozen_entry_world_;
-            for (const FunnelSample& target : targets) {
-                const Transform next = target_transform(
-                    frozen_entry_world_.position.y, target);
-                if (revalidate_frozen_pick_slot(
-                        previous, next, start_.target_snapshot,
-                        observation.live_obstacles,
-                        config_.capture.route) != PickSlotReason::None) {
-                    route_valid = false;
-                    break;
-                }
-                previous = next;
-            }
-            if (!route_valid) continue;
-            selection_proposal_indices_.push_back(proposal_index);
-            selection_requests_.push_back({
-                static_cast<uint32_t>(proposal_index + 1U),
-                entry_root(targets.back()),
-            });
-        }
-        learned_diagnostics_.accepted_proposal_count = accepted;
-        if (selection_requests_.empty()) {
-            return fail(LearnedPickupFailureReason::NoAcceptedProposal);
-        }
-        learned_diagnostics_.state = LearnedPickupState::SelectionPreview;
-        PickAssistOutput output = braking_output();
-        output.preview_requests = selection_requests_;
-        return output;
+        return consume_proposal_poll(observation, provider_->wait());
     }
     case LearnedPickupState::SelectionPreview: {
         if (observation.preview_results.size() != selection_requests_.size() ||
@@ -545,6 +476,70 @@ PickAssistOutput LearnedSmartPickupBackend::observe_learned(
         return {};
     }
     return {};
+}
+
+PickAssistOutput LearnedSmartPickupBackend::consume_proposal_poll(
+    const PickAssistObservation& observation,
+    FunnelProposalPoll poll) {
+    if (poll.state == FunnelProposalPollState::Pending) {
+        return braking_output();
+    }
+    if (poll.state != FunnelProposalPollState::Ready ||
+        !poll.artifact.has_value()) {
+        return fail(LearnedPickupFailureReason::ProposalWorkerFailed);
+    }
+    if (poll.artifact->request_id() != proposal_request_.request_id ||
+        poll.artifact->batch_seed() != proposal_request_.batch_seed ||
+        poll.artifact->checkpoint_sha256() !=
+            proposal_request_.checkpoint_sha256 ||
+        std::memcmp(
+            poll.artifact->condition().data(),
+            proposal_request_.condition.data(),
+            sizeof(float) * kFunnelConditionDim) != 0) {
+        return fail(LearnedPickupFailureReason::ProposalIdentityMismatch);
+    }
+    artifact_ = std::move(*poll.artifact);
+    selection_requests_.clear();
+    selection_proposal_indices_.clear();
+    int accepted = 0;
+    for (size_t proposal_index = 0U;
+         proposal_index < artifact_->proposals().size();
+         ++proposal_index) {
+        const FunnelProposal& proposal =
+            artifact_->proposals()[proposal_index];
+        if (!proposal.accepted) continue;
+        ++accepted;
+        const FunnelExecutionTargets targets =
+            world_targets(frozen_object_world_, proposal);
+        bool route_valid = true;
+        Transform previous = frozen_entry_world_;
+        for (const FunnelSample& target : targets) {
+            const Transform next = target_transform(
+                frozen_entry_world_.position.y, target);
+            if (revalidate_frozen_pick_slot(
+                    previous, next, start_.target_snapshot,
+                    observation.live_obstacles,
+                    config_.capture.route) != PickSlotReason::None) {
+                route_valid = false;
+                break;
+            }
+            previous = next;
+        }
+        if (!route_valid) continue;
+        selection_proposal_indices_.push_back(proposal_index);
+        selection_requests_.push_back({
+            static_cast<uint32_t>(proposal_index + 1U),
+            entry_root(targets.back()),
+        });
+    }
+    learned_diagnostics_.accepted_proposal_count = accepted;
+    if (selection_requests_.empty()) {
+        return fail(LearnedPickupFailureReason::NoAcceptedProposal);
+    }
+    learned_diagnostics_.state = LearnedPickupState::SelectionPreview;
+    PickAssistOutput output = braking_output();
+    output.preview_requests = selection_requests_;
+    return output;
 }
 
 std::optional<PickRequest> LearnedSmartPickupBackend::take_submission(

@@ -31,11 +31,9 @@ namespace interaction {
 struct LearnedPickupConfig {
     FunnelCaptureConfig capture{};
     ArrivalConfig arrival{};
-    uint32_t required_capture_settle_ticks = 3U;
     uint32_t maximum_proposal_pending_ticks = 250U;
     float capture_position_tolerance_m = 0.03F;
     float capture_yaw_tolerance_radians = 20.0F * PIf / 180.0F;
-    float capture_speed_tolerance_mps = 0.10F;
     uint64_t batch_seed = 2026071901U;
     std::array<uint8_t, 32> checkpoint_sha256{};
 };
@@ -74,6 +72,9 @@ public:
 private:
     void refresh_follower_diagnostics();
     PickAssistOutput observe_learned(const PickAssistObservation& observation);
+    PickAssistOutput consume_proposal_poll(
+        const PickAssistObservation& observation,
+        FunnelProposalPoll poll);
     PickAssistOutput fail(LearnedPickupFailureReason reason);
     PickAssistOutput braking_output() const;
     bool authority_matches(const PickAssistObservation& observation) const;

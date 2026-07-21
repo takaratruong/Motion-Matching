@@ -177,16 +177,13 @@ TrialEvidence run_learned_funnel_to_actual_carry(float bearing_radians) {
     start.affordance_id = fixture.request.affordance_id;
     start.root_world = entry;
     assert(backend.begin(start, target));
-    backend.observe(observation(0U, *target, entry));
-    backend.observe(observation(1U, *target, entry));
-    backend.observe(observation(2U, *target, entry));
     const interaction::PickAssistOutput selection =
-        backend.observe(observation(3U, *target, entry));
+        backend.observe(observation(0U, *target, entry));
     assert(provider.begin_count == 1);
     assert(selection.preview_requests.size() == 32U);
 
     interaction::PickAssistObservation selected =
-        observation(4U, *target, entry);
+        observation(1U, *target, entry);
     selected.preview_snapshot_fingerprint = selected.snapshot_fingerprint;
     for (const auto& request : selection.preview_requests) {
         const std::optional<interaction::PickEntryPreview> preview =
@@ -243,10 +240,10 @@ TrialEvidence run_learned_funnel_to_actual_carry(float bearing_radians) {
             std::atan2(terminal_world.yaw_sin, terminal_world.yaw_cos),
             vec3(0.0F, 1.0F, 0.0F)),
     };
-    backend.observe(observation(5U, *target, tracked));
-    backend.observe(observation(6U, *target, tracked));
+    backend.observe(observation(2U, *target, tracked));
+    backend.observe(observation(3U, *target, tracked));
     const interaction::PickAssistOutput final_request = backend.observe(
-        observation(7U, *target, tracked));
+        observation(4U, *target, tracked));
     assert(backend.learned_diagnostics().follower_progress_index ==
            interaction::kFunnelExecutionTickCount - 1);
     assert(backend.learned_diagnostics().follower_lookahead_index ==
@@ -254,7 +251,7 @@ TrialEvidence run_learned_funnel_to_actual_carry(float bearing_radians) {
     assert(final_request.preview_requests.size() == 1U);
 
     interaction::PickAssistObservation final =
-        observation(8U, *target, tracked);
+        observation(5U, *target, tracked);
     final.preview_snapshot_fingerprint = final.snapshot_fingerprint;
     const auto& request = final_request.preview_requests.front();
     final.preview_results.push_back({
