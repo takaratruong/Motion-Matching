@@ -53,6 +53,26 @@ def _require_motion(value: torch.Tensor, label: str) -> None:
         )
 
 
+def _require_expert_epsilon(
+    value: torch.Tensor,
+    label: str,
+    *,
+    candidates: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    """Reject any expert result that cannot be one global-DDIM prediction."""
+    expected_shape = (candidates, WINDOW_FRAMES, FRAME_DIM)
+    if not isinstance(value, torch.Tensor) or tuple(value.shape) != expected_shape:
+        raise ValueError(f"{label} must have shape {expected_shape}")
+    if value.dtype != dtype:
+        raise ValueError(f"{label} must have dtype {dtype}")
+    if value.device != device:
+        raise ValueError(f"{label} must stay on device {device}")
+    if not value.is_floating_point() or not torch.isfinite(value).all():
+        raise ValueError(f"{label} must be finite")
+
+
 @dataclass(frozen=True)
 class CoupledCondition:
     """The one-request static and global temporal conditioning contract.
@@ -354,63 +374,76 @@ def sample_coupled(
     alpha_bars = _alpha_bars(device)
     traces: list[CoupledStepTrace] = []
 
-    for index, timestep in enumerate(timesteps):
-        walk_input = latent[:, :WINDOW_FRAMES].clone()
-        pickup_input = latent[:, WINDOW_FRAMES - OVERLAP_FRAMES:].clone()
-        timestep_tensor = torch.full(
-            (candidates,), timestep, device=device, dtype=torch.long
-        )
-        with torch.no_grad():
-            walk_epsilon = walk_model(
-                walk_input, timestep_tensor, static, temporal[:WINDOW_FRAMES].expand(candidates, -1, -1)
+    walk_training = walk_model.training
+    pickup_training = pickup_model.training
+    try:
+        walk_model.eval()
+        pickup_model.eval()
+        for index, timestep in enumerate(timesteps):
+            walk_input = latent[:, :WINDOW_FRAMES].clone()
+            pickup_input = latent[:, WINDOW_FRAMES - OVERLAP_FRAMES:].clone()
+            timestep_tensor = torch.full(
+                (candidates,), timestep, device=device, dtype=torch.long
             )
-            pickup_epsilon = pickup_model(
-                pickup_input, timestep_tensor, static,
-                temporal[WINDOW_FRAMES - OVERLAP_FRAMES:].expand(candidates, -1, -1),
-            )
-        _require_motion(walk_epsilon, "walk epsilon")
-        _require_motion(pickup_epsilon, "pickup epsilon")
-        if walk_epsilon.device != device or pickup_epsilon.device != device:
-            raise ValueError("expert epsilon predictions must stay on the model device")
-        epsilon = torch.empty_like(latent)
-        epsilon[:, :WINDOW_FRAMES - OVERLAP_FRAMES] = walk_epsilon[:, :WINDOW_FRAMES - OVERLAP_FRAMES]
-        epsilon[:, WINDOW_FRAMES:] = pickup_epsilon[:, OVERLAP_FRAMES:]
-        for overlap_index in range(OVERLAP_FRAMES):
-            pickup_weight = overlap_weight(overlap_index)
-            epsilon[:, WINDOW_FRAMES - OVERLAP_FRAMES + overlap_index] = (
-                (1.0 - pickup_weight) * walk_epsilon[:, WINDOW_FRAMES - OVERLAP_FRAMES + overlap_index]
-                + pickup_weight * pickup_epsilon[:, overlap_index]
-            )
-        if not torch.isfinite(epsilon).all():
-            raise ValueError("global epsilon must be finite")
-        alpha_bar = alpha_bars[timestep]
-        unguided_clean = (
-            latent - torch.sqrt(1.0 - alpha_bar) * epsilon
-        ) / torch.sqrt(alpha_bar)
-        guided_clean = _apply_fixed(unguided_clean, fixed_values, fixed_mask)
-        guided_clean = _apply_task_guidance(
-            guided_clean, task_guidance, guidance_condition, timestep
-        )
-        guided_clean = _apply_fixed(guided_clean, fixed_values, fixed_mask)
-        previous = timesteps[index + 1] if index + 1 < len(timesteps) else -1
-        previous_bar = (
-            torch.ones((), device=device, dtype=latent.dtype)
-            if previous < 0
-            else alpha_bars[previous]
-        )
-        latent = (
-            torch.sqrt(previous_bar) * guided_clean
-            + torch.sqrt(1.0 - previous_bar) * epsilon
-        )
-        latent = _apply_fixed(latent, fixed_values, fixed_mask)
-        if return_trace:
-            traces.append(
-                CoupledStepTrace(
-                    walk_input.detach().clone(), pickup_input.detach().clone(),
-                    epsilon.detach().clone(), unguided_clean.detach().clone(),
-                    guided_clean.detach().clone(), latent.detach().clone(),
+            with torch.inference_mode():
+                walk_epsilon = walk_model(
+                    walk_input, timestep_tensor, static,
+                    temporal[:WINDOW_FRAMES].expand(candidates, -1, -1),
                 )
+                pickup_epsilon = pickup_model(
+                    pickup_input, timestep_tensor, static,
+                    temporal[WINDOW_FRAMES - OVERLAP_FRAMES:].expand(candidates, -1, -1),
+                )
+            _require_expert_epsilon(
+                walk_epsilon, "walk epsilon", candidates=candidates,
+                device=device, dtype=latent.dtype,
             )
+            _require_expert_epsilon(
+                pickup_epsilon, "pickup epsilon", candidates=candidates,
+                device=device, dtype=latent.dtype,
+            )
+            epsilon = torch.empty_like(latent)
+            epsilon[:, :WINDOW_FRAMES - OVERLAP_FRAMES] = walk_epsilon[:, :WINDOW_FRAMES - OVERLAP_FRAMES]
+            epsilon[:, WINDOW_FRAMES:] = pickup_epsilon[:, OVERLAP_FRAMES:]
+            for overlap_index in range(OVERLAP_FRAMES):
+                pickup_weight = overlap_weight(overlap_index)
+                epsilon[:, WINDOW_FRAMES - OVERLAP_FRAMES + overlap_index] = (
+                    (1.0 - pickup_weight) * walk_epsilon[:, WINDOW_FRAMES - OVERLAP_FRAMES + overlap_index]
+                    + pickup_weight * pickup_epsilon[:, overlap_index]
+                )
+            if not torch.isfinite(epsilon).all():
+                raise ValueError("global epsilon must be finite")
+            alpha_bar = alpha_bars[timestep]
+            unguided_clean = (
+                latent - torch.sqrt(1.0 - alpha_bar) * epsilon
+            ) / torch.sqrt(alpha_bar)
+            guided_clean = _apply_fixed(unguided_clean, fixed_values, fixed_mask)
+            guided_clean = _apply_task_guidance(
+                guided_clean, task_guidance, guidance_condition, timestep
+            )
+            guided_clean = _apply_fixed(guided_clean, fixed_values, fixed_mask)
+            previous = timesteps[index + 1] if index + 1 < len(timesteps) else -1
+            previous_bar = (
+                torch.ones((), device=device, dtype=latent.dtype)
+                if previous < 0
+                else alpha_bars[previous]
+            )
+            latent = (
+                torch.sqrt(previous_bar) * guided_clean
+                + torch.sqrt(1.0 - previous_bar) * epsilon
+            )
+            latent = _apply_fixed(latent, fixed_values, fixed_mask)
+            if return_trace:
+                traces.append(
+                    CoupledStepTrace(
+                        walk_input.detach().clone(), pickup_input.detach().clone(),
+                        epsilon.detach().clone(), unguided_clean.detach().clone(),
+                        guided_clean.detach().clone(), latent.detach().clone(),
+                    )
+                )
+    finally:
+        walk_model.train(walk_training)
+        pickup_model.train(pickup_training)
     result = latent.detach()
     return (result, tuple(traces)) if return_trace else result
 
@@ -424,11 +457,12 @@ def _mean_square(value: torch.Tensor) -> torch.Tensor:
 
 
 def _validate_fk_result(result: Mapping[str, torch.Tensor], batch: int, label: str) -> Mapping[str, torch.Tensor]:
-    required = ("hand", "left_foot", "right_foot")
+    required = ("hand", "hand_orientation", "left_foot", "right_foot")
     if not isinstance(result, Mapping) or any(name not in result for name in required):
-        raise ValueError(f"{label} must map hand, left_foot, and right_foot")
-    for name in required:
+        raise ValueError(f"{label} must map hand, hand_orientation, left_foot, and right_foot")
+    for name in ("hand", "left_foot", "right_foot"):
         _require_tensor(result[name], (batch, WINDOW_FRAMES, 3), f"{label}[{name}]")
+    _require_tensor(result["hand_orientation"], (batch, WINDOW_FRAMES, 6), f"{label}[hand_orientation]")
     return result
 
 
@@ -442,10 +476,18 @@ def named_training_losses(
     grasp_position: torch.Tensor,
     grasp_orientation: torch.Tensor,
     object_position: torch.Tensor,
+    object_clearance: torch.Tensor,
     overlap_walk: torch.Tensor,
     overlap_pickup: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
-    """Return every non-stubbed Task 3 loss as separately inspectable scalars."""
+    """Return Task 3 losses under the contact-transition contract.
+
+    ``object_clearance`` is the finite, nonnegative per-object radius used only
+    before first hand contact.  ``grasp_position`` and ``grasp_orientation``
+    are the already conditioned object-relative grasp transform expressed as
+    the target hand pose; first-contact grasp and sustained attachment losses
+    must never substitute the object center for that target.
+    """
     for value, label in (
         (predicted_clean, "predicted_clean"), (target_clean, "target_clean"),
         (predicted_epsilon, "predicted_epsilon"), (target_epsilon, "target_epsilon"),
@@ -461,6 +503,9 @@ def named_training_losses(
     _require_tensor(grasp_position, (batch, 3), "grasp_position")
     _require_tensor(grasp_orientation, (batch, 6), "grasp_orientation")
     _require_tensor(object_position, (batch, 3), "object_position")
+    _require_tensor(object_clearance, (batch,), "object_clearance")
+    if torch.any(object_clearance < 0.0):
+        raise ValueError("object_clearance must be finite and nonnegative")
     expected_overlap = (batch, OVERLAP_FRAMES, FRAME_DIM)
     _require_tensor(overlap_walk, expected_overlap, "overlap_walk")
     _require_tensor(overlap_pickup, expected_overlap, "overlap_pickup")
@@ -470,8 +515,17 @@ def named_training_losses(
     target_fk = _validate_fk_result(fk(target_clean), batch, "target fk")
     pose_channels = slice(3, 3 + 31 * 6)
     foot_contacts = target_clean[..., -3:-1]
-    active_hand_contact = target_clean[..., -1:].clamp(0.0, 1.0)
-    contact_weight = active_hand_contact.sum().clamp_min(1.0)
+    active_hand_contact = target_clean[..., -1] >= 0.5
+    contact_count = active_hand_contact.cumsum(dim=1)
+    first_contact = active_hand_contact & (contact_count == 1)
+    post_contact = active_hand_contact & (contact_count > 1)
+    pre_contact = contact_count == 0
+    first_contact_weight = first_contact.to(predicted_clean.dtype).unsqueeze(-1)
+    post_contact_weight = post_contact.to(predicted_clean.dtype).unsqueeze(-1)
+    pre_contact_weight = pre_contact.to(predicted_clean.dtype).unsqueeze(-1)
+    first_contact_count = first_contact_weight.sum().clamp_min(1.0)
+    post_contact_count = post_contact_weight.sum().clamp_min(1.0)
+    pre_contact_count = pre_contact_weight.sum().clamp_min(1.0)
     foot_weight = foot_contacts.sum().clamp_min(1.0)
     predicted_foot_velocity = (
         _finite_difference(predicted_fk["left_foot"]).square() * foot_contacts[:, 1:, :1]
@@ -495,16 +549,35 @@ def named_training_losses(
         "foot_contact": _mean_square(predicted_clean[..., -3:-1] - target_clean[..., -3:-1]),
         "foot_sliding": predicted_foot_velocity.sum() / (foot_weight * 3.0),
         "grasp_position": (
-            ((predicted_fk["hand"] - grasp_position[:, None]).square() * active_hand_contact).sum()
-            / (contact_weight * 3.0)
+            ((predicted_fk["hand"] - grasp_position[:, None]).square() * first_contact_weight).sum()
+            / (first_contact_count * 3.0)
         ),
         "grasp_orientation": (
-            ((predicted_clean[..., 3:9] - grasp_orientation[:, None]).square() * active_hand_contact).sum()
-            / (contact_weight * 6.0)
+            ((predicted_fk["hand_orientation"] - grasp_orientation[:, None]).square() * first_contact_weight).sum()
+            / (first_contact_count * 6.0)
+        ),
+        "pre_contact_separation": (
+            (
+                torch.relu(
+                    object_clearance[:, None, None]
+                    - torch.linalg.vector_norm(predicted_fk["hand"] - object_position[:, None], dim=-1, keepdim=True)
+                ).square()
+                * pre_contact_weight
+            ).sum()
+            / pre_contact_count
         ),
         "attachment": (
-            ((predicted_fk["hand"] - object_position[:, None]).square() * active_hand_contact).sum()
-            / (contact_weight * 3.0)
+            0.5 * (
+                ((predicted_fk["hand"] - grasp_position[:, None]).square() * post_contact_weight).sum()
+                / (post_contact_count * 3.0)
+            )
+            + 0.5 * (
+                (
+                    (predicted_fk["hand_orientation"] - grasp_orientation[:, None]).square()
+                    * post_contact_weight
+                ).sum()
+                / (post_contact_count * 6.0)
+            )
         ),
         "overlap_agreement": _mean_square(overlap_walk - overlap_pickup),
     }
