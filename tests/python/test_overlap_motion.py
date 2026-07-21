@@ -23,6 +23,7 @@ def _motion_fixture(frames: int = 4):
     positions[:, 1:] = np.arange(
         (BONE_COUNT - 1) * 3, dtype=np.float32
     ).reshape(BONE_COUNT - 1, 3) * 0.01
+    positions[:, 1, 0] += np.linspace(0.0, 0.08, frames, dtype=np.float32)
 
     angle = np.linspace(0.0, 0.3, frames, dtype=np.float32)[:, None]
     rotations = np.zeros((frames, BONE_COUNT, 4), np.float32)
@@ -82,7 +83,7 @@ def _write_database(path: Path, *, frames: int = 4, bones: int = BONE_COUNT,
 class OverlapMotionTests(unittest.TestCase):
     def test_frame_schema_is_frozen(self):
         self.assertEqual(overlap_motion.BONE_COUNT, 31)
-        self.assertEqual(overlap_motion.FRAME_DIM, 3 + 31 * 6 + 3)
+        self.assertEqual(overlap_motion.FRAME_DIM, 3 + 3 + 31 * 6 + 3)
         self.assertEqual(overlap_motion.walk_slice(), slice(0, 50))
         self.assertEqual(overlap_motion.pickup_slice(), slice(30, 80))
 
@@ -95,13 +96,19 @@ class OverlapMotionTests(unittest.TestCase):
         )
         decoded = overlap_motion.decode_motion(encoded, positions[0], anchor)
 
-        self.assertEqual(encoded.shape, (4, 192))
+        self.assertEqual(encoded.shape, (4, 195))
         np.testing.assert_allclose(
             decoded.positions[:, 0], positions[:, 0], atol=2e-5
         )
         np.testing.assert_allclose(
-            decoded.positions[:, 1:],
-            np.broadcast_to(positions[:1, 1:], decoded.positions[:, 1:].shape),
+            decoded.positions[:, 1], positions[:, 1], atol=2e-5,
+        )
+        self.assertGreaterEqual(
+            np.ptp(decoded.positions[:, 1, 0]), 0.08 - 2e-5,
+        )
+        np.testing.assert_allclose(
+            decoded.positions[:, 2:],
+            np.broadcast_to(positions[:1, 2:], decoded.positions[:, 2:].shape),
             atol=2e-5,
         )
         np.testing.assert_allclose(

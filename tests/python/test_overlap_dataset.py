@@ -33,6 +33,7 @@ def interaction_artifact_fixture(
     reach = 60
     positions = np.zeros((frames, 31, 3), np.float32)
     positions[:, 0, 0] = np.arange(frames, dtype=np.float32) * 0.01
+    positions[:, 1, 0] = np.linspace(0.0, 0.08, frames, dtype=np.float32)
     rotations = np.zeros((frames, 31, 4), np.float32)
     rotations[..., 0] = 1.0
     phases = np.full(frames, int(InteractionPhase.APPROACH), np.uint8)
@@ -128,8 +129,8 @@ class OverlapInteractionExtractionTests(unittest.TestCase):
 
         rows = extract_interaction_pairs(artifact)
 
-        self.assertEqual(rows.walk_windows.shape, (1, 50, 192))
-        self.assertEqual(rows.pickup_windows.shape, (1, 50, 192))
+        self.assertEqual(rows.walk_windows.shape, (1, 50, 195))
+        self.assertEqual(rows.pickup_windows.shape, (1, 50, 195))
         np.testing.assert_array_equal(
             rows.walk_windows[:, 30:50], rows.pickup_windows[:, 0:20]
         )
@@ -241,7 +242,7 @@ class OverlapWalkingExtractionTests(unittest.TestCase):
         clip.positions[:, 0, 0] = np.arange(71, dtype=np.float32)
         rows = extract_walking_windows(clip, stride=10)
 
-        self.assertEqual(rows.shape, (3, 50, 192))
+        self.assertEqual(rows.shape, (3, 50, 195))
         np.testing.assert_array_equal(
             rows[:, :, 0], np.broadcast_to(np.arange(-49, 1, dtype=np.float32), (3, 50))
         )
@@ -382,6 +383,9 @@ class OverlapDatasetCliTests(unittest.TestCase):
             with np.load(output, allow_pickle=False) as dataset:
                 np.testing.assert_array_equal(dataset["train_object_ids"], ["cup_2"])
                 self.assertIn("normalization_mean", dataset)
+                self.assertEqual(dataset["normalization_mean"].shape, (195,))
+                self.assertGreater(float(dataset["normalization_scale"][3]), 0.0)
+            self.assertEqual(audit["frame_schema"], 195)
 
     def test_failed_manifest_publication_restores_the_previous_output_pair(self):
         artifact = interaction_artifact_fixture()

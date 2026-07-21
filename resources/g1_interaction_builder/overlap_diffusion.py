@@ -2,7 +2,7 @@
 
 The two experts intentionally have independent parameters.  Sampling never has
 two independently evolving window latents: each reverse step reads two slices
-from, and writes one DDIM update to, a single ``[candidates, 80, 192]`` tensor.
+from, and writes one DDIM update to, a single ``[candidates, 80, 195]`` tensor.
 """
 
 from __future__ import annotations
@@ -15,7 +15,11 @@ import torch
 from torch import nn
 
 
-FRAME_DIM = 192
+FRAME_DIM = 195
+ROOT_TRANSLATION_SLICE = slice(0, 3)
+HIPS_TRANSLATION_SLICE = slice(3, 6)
+ROTATION6D_SLICE = slice(6, 6 + 31 * 6)
+CONTACT_SLICE = slice(6 + 31 * 6, FRAME_DIM)
 STATIC_CONDITION_DIM = 25
 TEMPORAL_CONDITION_DIM = 9
 WINDOW_FRAMES = 50
@@ -115,7 +119,7 @@ GuidanceObjective = Callable[[torch.Tensor, CoupledCondition, torch.Tensor], tor
 class TaskGuidance:
     """A differentiable global clean-motion objective used during sampling.
 
-    The objective receives a clean estimate ``[B,80,192]``, the validated
+    The objective receives a clean estimate ``[B,80,195]``, the validated
     condition, and a same-device scalar timestep.  It must return a finite
     scalar or a finite per-candidate tensor.  Its gradient is applied to the
     clean estimate, so route/floor/contact/grasp/attachment objectives can be
@@ -185,7 +189,7 @@ class MotionWindowDenoiser(nn.Module):
         if (frame_dim, static_dim, temporal_dim) != (
             FRAME_DIM, STATIC_CONDITION_DIM, TEMPORAL_CONDITION_DIM,
         ):
-            raise ValueError("MotionWindowDenoiser uses the frozen 192/25/9 schema")
+            raise ValueError("MotionWindowDenoiser uses the frozen 195/25/9 schema")
         self.schema = DenoiserSchema(
             frame_dim, static_dim, temporal_dim, MODEL_WIDTH, MODEL_BLOCKS, MODEL_HEADS
         )
@@ -513,9 +517,9 @@ def named_training_losses(
         raise ValueError("fk must be callable")
     predicted_fk = _validate_fk_result(fk(predicted_clean), batch, "predicted fk")
     target_fk = _validate_fk_result(fk(target_clean), batch, "target fk")
-    pose_channels = slice(3, 3 + 31 * 6)
-    foot_contacts = target_clean[..., -3:-1]
-    active_hand_contact = target_clean[..., -1] >= 0.5
+    pose_channels = ROTATION6D_SLICE
+    foot_contacts = target_clean[..., CONTACT_SLICE.start:CONTACT_SLICE.stop - 1]
+    active_hand_contact = target_clean[..., CONTACT_SLICE.stop - 1] >= 0.5
     contact_count = active_hand_contact.cumsum(dim=1)
     first_contact = active_hand_contact & (contact_count == 1)
     post_contact = active_hand_contact & (contact_count > 1)
@@ -540,13 +544,17 @@ def named_training_losses(
             + _mean_square(predicted_fk["right_foot"] - target_fk["right_foot"])
         ),
         "velocity": _mean_square(
-            _finite_difference(predicted_clean[..., :-3]) - _finite_difference(target_clean[..., :-3])
+            _finite_difference(predicted_clean[..., :CONTACT_SLICE.start])
+            - _finite_difference(target_clean[..., :CONTACT_SLICE.start])
         ),
         "acceleration": _mean_square(
-            _finite_difference(_finite_difference(predicted_clean[..., :-3]))
-            - _finite_difference(_finite_difference(target_clean[..., :-3]))
+            _finite_difference(_finite_difference(predicted_clean[..., :CONTACT_SLICE.start]))
+            - _finite_difference(_finite_difference(target_clean[..., :CONTACT_SLICE.start]))
         ),
-        "foot_contact": _mean_square(predicted_clean[..., -3:-1] - target_clean[..., -3:-1]),
+        "foot_contact": _mean_square(
+            predicted_clean[..., CONTACT_SLICE.start:CONTACT_SLICE.stop - 1]
+            - target_clean[..., CONTACT_SLICE.start:CONTACT_SLICE.stop - 1]
+        ),
         "foot_sliding": predicted_foot_velocity.sum() / (foot_weight * 3.0),
         "grasp_position": (
             ((predicted_fk["hand"] - grasp_position[:, None]).square() * first_contact_weight).sum()

@@ -13,7 +13,11 @@ from resources.g1_terrain_builder.schema import HoldenClip, SourceClip
 
 
 BONE_COUNT = 31
-FRAME_DIM = 3 + BONE_COUNT * 6 + 3
+ROOT_TRANSLATION_SLICE = slice(0, 3)
+HIPS_TRANSLATION_SLICE = slice(3, 6)
+ROTATION6D_SLICE = slice(6, 6 + BONE_COUNT * 6)
+CONTACT_SLICE = slice(6 + BONE_COUNT * 6, 6 + BONE_COUNT * 6 + 3)
+FRAME_DIM = CONTACT_SLICE.stop
 WALK_FRAMES = 50
 PICKUP_FRAMES = 50
 OVERLAP_FRAMES = 20
@@ -138,7 +142,7 @@ def encode_motion(
     positions: np.ndarray, rotations: np.ndarray, contacts: np.ndarray,
     anchor: np.ndarray,
 ) -> np.ndarray:
-    """Encode a local Holden pose sequence into the strict 192-channel schema."""
+    """Encode Simulation-root and dynamic local-Hips motion into 195 channels."""
     positions = np.asarray(positions, dtype=np.float64)
     if (
         positions.ndim != 3
@@ -153,7 +157,12 @@ def encode_motion(
 
     rotation6d = _quaternion_to_rotation6d(_normalised_quaternions(rotations))
     return np.concatenate(
-        (positions[:, 0] - anchor, rotation6d.reshape(frames, -1), contacts),
+        (
+            positions[:, 0] - anchor,
+            positions[:, 1],
+            rotation6d.reshape(frames, -1),
+            contacts,
+        ),
         axis=-1,
     ).astype(np.float32)
 
@@ -161,7 +170,7 @@ def encode_motion(
 def decode_motion(
     encoded: np.ndarray, local_positions: np.ndarray, anchor: np.ndarray,
 ) -> DecodedMotion:
-    """Decode root motion and rotations while restoring frozen local offsets."""
+    """Decode root/Hips motion and restore frozen offsets only for bones 2..30."""
     encoded = np.asarray(encoded, dtype=np.float64)
     if encoded.ndim != 2 or encoded.shape[1] != FRAME_DIM or not np.isfinite(encoded).all():
         raise ValueError(f"encoded motion must be finite with shape (N, {FRAME_DIM})")
@@ -172,12 +181,13 @@ def decode_motion(
     anchor = _anchor(anchor)
 
     rotations = _rotation6d_to_quaternion(
-        encoded[:, 3:3 + BONE_COUNT * 6].reshape(frames, BONE_COUNT, 6)
+        encoded[:, ROTATION6D_SLICE].reshape(frames, BONE_COUNT, 6)
     )
     positions = np.broadcast_to(
         local_positions, (frames, BONE_COUNT, 3)
     ).copy()
-    positions[:, 0] = encoded[:, :3] + anchor
+    positions[:, 0] = encoded[:, ROOT_TRANSLATION_SLICE] + anchor
+    positions[:, 1] = encoded[:, HIPS_TRANSLATION_SLICE]
     return DecodedMotion(
         positions=positions.astype(np.float32),
         rotations=rotations.astype(np.float32),
@@ -185,7 +195,7 @@ def decode_motion(
         angular_velocities=_finite_difference_quaternions(rotations).astype(
             np.float32
         ),
-        contacts=encoded[:, -3:].astype(np.float32),
+        contacts=encoded[:, CONTACT_SLICE].astype(np.float32),
     )
 
 

@@ -354,6 +354,7 @@ def build_dataset(
     }
     audit = {
         "frame_schema": FRAME_DIM,
+        "hips_channel_variance": train_frames[..., 3:6].var(axis=(0, 1), dtype=np.float64).tolist(),
         "fps": FPS,
         "interaction_rows": int(len(rows.walk_windows)),
         "walking_rows": int(sum(len(walking_partitions[name][0]) for name in SPLITS)),
