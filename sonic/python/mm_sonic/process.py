@@ -3341,6 +3341,13 @@ class SimulationPolicyGate:
             self.simulator.require_alive()
             self._paused = True
             return
+        self.quiesce()
+
+    def quiesce(self) -> None:
+        """Stop GEAR explicitly for terminal evidence work and shutdown."""
+
+        if self._closed:
+            raise RuntimeError("simulation policy gate is closed")
         try:
             if not self._paused or not self.gear.group_is_stopped():
                 self.gear.stop_group()

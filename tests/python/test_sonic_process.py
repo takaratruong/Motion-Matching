@@ -3595,6 +3595,11 @@ class SimulationPolicyGateTests(TemporaryScriptCase):
         self.assertEqual(simulator.refresh_stopped_checks, [False])
         self.assertEqual(simulator.running_checks, [True])
 
+        gate.quiesce()
+
+        self.assertTrue(self.gear.group_is_stopped())
+        self.assertTrue(gate.is_paused)
+
     def test_duration_must_derive_exact_positive_integer_before_resume(self):
         simulator = FakeSimulatorClient()
         gate = SimulationPolicyGate(self.gear, simulator)

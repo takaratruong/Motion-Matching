@@ -101,6 +101,8 @@ physics advances. In the live driver GEAR remains running while only physics is
 paused; the measured MM/publication interval must therefore remain below GEAR's
 pinned 500 ms LowState watchdog threshold. Longer external inference requires
 action chunking or an explicit no-step LowState maintenance service.
+After the final physics release, the driver explicitly quiesces GEAR before
+building evidence so post-run serialization cannot trip that watchdog.
 
 ## Failure behavior
 
