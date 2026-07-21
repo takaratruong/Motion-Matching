@@ -10,8 +10,10 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import math
+import hashlib
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -32,6 +34,7 @@ DIFFUSION_STEPS = 1000
 MODEL_WIDTH = 256
 MODEL_BLOCKS = 8
 MODEL_HEADS = 8
+CANONICAL_LOCAL_OFFSETS_SHA256 = "7bb27502cea37d13bb255b9cf9933ace962b1d1dcf56eec90e5005774db97bcc"
 
 
 def _require_tensor(
@@ -313,18 +316,19 @@ def _apply_task_guidance(
 ) -> torch.Tensor:
     if guidance is None or guidance.strength == 0.0:
         return clean
-    candidate = clean.detach().requires_grad_(True)
-    value = guidance.objective(
-        candidate, condition, torch.tensor(timestep, device=clean.device, dtype=torch.long)
-    )
-    if not isinstance(value, torch.Tensor) or not value.is_floating_point() or not torch.isfinite(value).all():
-        raise ValueError("task guidance objective must return a finite floating tensor")
-    if value.ndim > 1 or (value.ndim == 1 and value.shape[0] != clean.shape[0]):
-        raise ValueError("task guidance objective must return a scalar or one value per candidate")
-    if not value.requires_grad:
-        raise ValueError("task guidance objective must be differentiable with respect to clean motion")
-    gradient = torch.autograd.grad(value.sum(), candidate, allow_unused=False)[0]
-    guided = clean - guidance.strength * gradient
+    with torch.inference_mode(False), torch.enable_grad():
+        candidate = clean.detach().clone().requires_grad_(True)
+        value = guidance.objective(
+            candidate, condition, torch.tensor(timestep, device=clean.device, dtype=torch.long)
+        )
+        if not isinstance(value, torch.Tensor) or not value.is_floating_point() or not torch.isfinite(value).all():
+            raise ValueError("task guidance objective must return a finite floating tensor")
+        if value.ndim > 1 or (value.ndim == 1 and value.shape[0] != clean.shape[0]):
+            raise ValueError("task guidance objective must return a scalar or one value per candidate")
+        if not value.requires_grad:
+            raise ValueError("task guidance objective must be differentiable with respect to clean motion")
+        gradient = torch.autograd.grad(value.sum(), candidate, allow_unused=False)[0]
+        guided = clean.detach().clone() - guidance.strength * gradient
     if not torch.isfinite(guided).all():
         raise ValueError("task guidance produced non-finite clean motion")
     return guided.detach()
@@ -642,6 +646,9 @@ def canonical_g1_fk(
         raise ValueError("FK local_offsets must be finite with shape (31, 3)")
     if not torch.equal(offsets[:2], torch.zeros_like(offsets[:2])):
         raise ValueError("FK local offsets for Simulation and Hips must be dynamic zeros")
+    offset_bytes = np.ascontiguousarray(offsets.detach().cpu().numpy().astype("<f4", copy=False)).tobytes()
+    if hashlib.sha256(offset_bytes).hexdigest() != CANONICAL_LOCAL_OFFSETS_SHA256:
+        raise ValueError("FK local offsets SHA256 does not match the frozen canonical G1 contract")
     batch, steps, _ = frames.shape
     local = offsets.view(1, 1, 31, 3).expand(batch, steps, -1, -1).clone()
     local[:, :, 0] = frames[..., ROOT_TRANSLATION_SLICE]
@@ -724,6 +731,9 @@ def load_overlap_checkpoint(path: Path, device: str | torch.device = "cpu") -> L
     offsets = _checkpoint_tensor(payload.get("canonical_local_offsets"), (31, 3), "canonical_local_offsets")
     if not torch.equal(offsets[:2], torch.zeros_like(offsets[:2])):
         raise ValueError("checkpoint canonical local offsets must leave root/Hips dynamic")
+    offset_bytes = np.ascontiguousarray(offsets.detach().cpu().numpy().astype("<f4", copy=False)).tobytes()
+    if hashlib.sha256(offset_bytes).hexdigest() != CANONICAL_LOCAL_OFFSETS_SHA256:
+        raise ValueError("checkpoint canonical local offsets SHA256 does not match the frozen contract")
     digest = payload.get("dataset_sha256")
     if not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
         raise ValueError("checkpoint dataset SHA256 is invalid")
@@ -744,14 +754,22 @@ def load_overlap_checkpoint(path: Path, device: str | torch.device = "cpu") -> L
     if not isinstance(history, list) or not history or any(not isinstance(row, Mapping) for row in history):
         raise ValueError("checkpoint stage history is invalid")
     for row in history:
+        permitted_keys = {"stage", "epoch", "train_loss"}
+        has_validation = "validation_rank" in row
+        if has_validation:
+            permitted_keys.add("validation_rank")
         if (
-            set(row) != {"stage", "epoch", "train_loss", "validation_rank"}
+            set(row) != permitted_keys
             or row["stage"] not in {"A", "B", "C"}
             or not isinstance(row["epoch"], int) or row["epoch"] <= 0
             or not _finite_number(row["train_loss"])
-            or not isinstance(row["validation_rank"], (list, tuple))
-            or len(row["validation_rank"]) != 3
-            or not all(_finite_number(item) for item in row["validation_rank"])
+            or (has_validation and (
+                row["stage"] != "C"
+                or
+                not isinstance(row["validation_rank"], (list, tuple))
+                or len(row["validation_rank"]) != 3
+                or not all(_finite_number(item) for item in row["validation_rank"])
+            ))
         ):
             raise ValueError("checkpoint stage history has invalid values")
     quality = payload.get("validation_quality")
@@ -767,6 +785,32 @@ def load_overlap_checkpoint(path: Path, device: str | torch.device = "cpu") -> L
         for summary in quality.values()
     ):
         raise ValueError("checkpoint validation quality contains invalid values")
+    for summary in quality.values():
+        if (
+            not 0.0 <= float(summary["attach_proxy_at_8"]) <= 1.0
+            or not 0.0 <= float(summary["no_stop_proxy"]) <= 1.0
+            or float(summary["median_grasp_position_m"]) < 0.0
+            or float(summary["median_grasp_orientation_degrees"]) < 0.0
+            or float(summary["rows"]) < 1.0
+        ):
+            raise ValueError("checkpoint validation quality rate or error is outside its valid range")
+    from tools.train_g1_overlap_diffusion import _select_sampler_steps
+    if int(steps) != _select_sampler_steps(quality):
+        raise ValueError("checkpoint selected sampler selection does not match validation quality")
+    provenance = payload.get("selected_stage")
+    if (
+        not isinstance(provenance, Mapping)
+        or set(provenance) != {"stage", "epoch"}
+        or provenance.get("stage") != "C"
+        or not isinstance(provenance.get("epoch"), int)
+        or not any(
+            row["stage"] == "C"
+            and row["epoch"] == provenance["epoch"]
+            and "validation_rank" in row
+            for row in history
+        )
+    ):
+        raise ValueError("checkpoint selected-stage provenance does not match C-stage weights")
     if _contains_test_partition(payload):
         raise ValueError("checkpoint must not serialize test-partition statistics")
     schema = payload.get("model_schema")

@@ -54,6 +54,7 @@
 #include "interaction_native_g1_bridge.h"
 #include "interaction_offline_overlap.h"
 #include "interaction_arrival.h"
+#include "interaction_pick_slots.h"
 #include "interaction_smart_pickup_controller.h"
 #include "interaction_smart_pickup_scene.h"
 
@@ -2224,6 +2225,9 @@ int main(void)
         smart_pickup_config);
     interaction::NativeG1PoseHandoff native_g1_pose_handoff;
     std::optional<interaction::offline_overlap::Player> offline_overlap_player;
+    interaction::offline_overlap::AttachedObjectFollower
+        offline_overlap_object_follower;
+    bool offline_overlap_active = false;
     if (const char* offline_overlap_path = getenv("MM_G1_OFFLINE_OVERLAP");
         offline_overlap_path != NULL && offline_overlap_path[0] != '\0')
     {
@@ -2231,7 +2235,7 @@ int main(void)
         {
             offline_overlap_player.emplace(
                 interaction::offline_overlap::Clip::load(offline_overlap_path),
-                true);
+                false);
             fprintf(
                 stdout,
                 "G1 offline overlap visualizer loaded: %s\n",
@@ -2298,7 +2302,7 @@ int main(void)
     bool controller_exit_requested = false;
     int controller_exit_code = 0;
 
-    Model terrain_model = LoadModel(active_scene.mesh_path.c_str());
+    Model terrain_model{};
     auto model_has_allocation = [](const Model& model)
     {
         return model.meshes != NULL || model.materials != NULL ||
@@ -2307,22 +2311,27 @@ int main(void)
                model.skeleton.bindPose != NULL ||
                model.currentPose != NULL || model.boneMatrices != NULL;
     };
-    const bool terrain_model_allocated = model_has_allocation(terrain_model);
-    if (terrain_model_allocated) ++model_load_count;
-    if (!IsModelValid(terrain_model) || terrain_model.meshCount <= 0)
+    if (!flat_interaction_terrain)
     {
-        fprintf(
-            stderr,
-            "G1 terrain mesh failed to load: %s\n",
-            active_scene.mesh_path.c_str());
-        controller_exit_code = 2;
-        controller_exit_requested = true;
+        terrain_model = LoadModel(active_scene.mesh_path.c_str());
+        if (model_has_allocation(terrain_model)) ++model_load_count;
+        if (!IsModelValid(terrain_model) || terrain_model.meshCount <= 0)
+        {
+            fprintf(
+                stderr,
+                "G1 terrain mesh failed to load: %s\n",
+                active_scene.mesh_path.c_str());
+            controller_exit_code = 2;
+            controller_exit_requested = true;
+        }
     }
 
     G1MeshRenderer g1_mesh_renderer = {};
-    bool show_g1_mesh = true;
+    bool show_g1_mesh = !offline_overlap_player.has_value();
     bool show_g1_bones = true;
-    if (!controller_exit_requested && !::g1_mesh_renderer_load(
+    if (!controller_exit_requested &&
+        !offline_overlap_player.has_value() &&
+        !::g1_mesh_renderer_load(
             g1_mesh_renderer,
             "resources/g1_mesh/g1_raylib.glb",
             artifact_error,
@@ -2332,7 +2341,7 @@ int main(void)
         controller_exit_code = 2;
         controller_exit_requested = true;
     }
-    if (!controller_exit_requested)
+    if (!controller_exit_requested && !offline_overlap_player.has_value())
     {
         fprintf(
             stdout,
@@ -2360,6 +2369,8 @@ int main(void)
     auto model_loader = [&](Model& model, const char* path,
                             char* error, int capacity)
     {
+        if (flat_interaction_terrain)
+            return scene_model_load_result{false, true};
         model = LoadModel(path);
         const bool allocated = model_has_allocation(model);
         if (allocated) ++model_load_count;
@@ -2531,7 +2542,8 @@ int main(void)
 
     auto update_func = [&]()
     {
-        if (::IsKeyPressed(KEY_M)) show_g1_mesh = !show_g1_mesh;
+        if (::IsKeyPressed(KEY_M) && !offline_overlap_player.has_value())
+            show_g1_mesh = !show_g1_mesh;
         if (::IsKeyPressed(KEY_B)) show_g1_bones = !show_g1_bones;
 
         const bool scene_reset_requested = pending_reset;
@@ -2652,10 +2664,27 @@ int main(void)
             gamepadstick_left = vec3(0.0f, 0.0f, 0.9f);
             gamepadstick_right = vec3();
         }
+        if (offline_overlap_active)
+        {
+            gamepadstick_left = vec3();
+        }
 
-        const bool smart_pickup_interact_pressed = IsKeyPressed(KEY_F);
+        const bool interact_pressed = IsKeyPressed(KEY_F);
         const bool smart_pickup_cancel_pressed = IsKeyPressed(KEY_X);
-        if (IsKeyPressed(KEY_R) ||
+        const bool reset_pressed = IsKeyPressed(KEY_R);
+        const bool offline_overlap_start_requested =
+            interact_pressed && offline_overlap_player.has_value();
+        if (offline_overlap_player.has_value())
+        {
+            if (smart_pickup_cancel_pressed || reset_pressed)
+            {
+                offline_overlap_active = false;
+                offline_overlap_object_follower.reset();
+            }
+        }
+        const bool smart_pickup_interact_pressed =
+            interact_pressed && !offline_overlap_player.has_value();
+        if (reset_pressed ||
             (scene_reset_requested && interaction_busy_before_scene))
         {
             interaction_reset_pending = true;
@@ -3642,6 +3671,7 @@ int main(void)
                 motion_pack_load_count,
                 model_load_count,
                 model_unload_count,
+                flat_interaction_terrain ? 0 : 1,
                 artifact_error,
                 static_cast<int>(sizeof(artifact_error))))
         {
@@ -4104,11 +4134,62 @@ int main(void)
                 native_g1_locomotion.pose,
                 interaction_output,
                 dt);
-        interaction::Pose final_g1_pose = native_g1_frame.pose;
-        const interaction::WorldPose runtime_g1_world_pose =
-            interaction::world_pose(final_g1_pose);
+        if (offline_overlap_start_requested)
+        {
+            offline_overlap_object_follower.reset();
+            bool bridged_to_object = false;
+            if (refreshed_interaction_target != nullptr)
+            {
+                const interaction::Transform& object_world =
+                    refreshed_interaction_target->object_world;
+                vec3 object_forward = quat_mul_vec3(
+                    object_world.rotation, vec3(0.0F, 0.0F, 1.0F));
+                object_forward.y = 0.0F;
+                const float forward_length = length(object_forward);
+                if (forward_length > 1.0e-5F)
+                {
+                    object_forward = object_forward / forward_length;
+                    const float object_yaw = std::atan2(
+                        object_forward.x, object_forward.z);
+                    const interaction::Transform object_yaw_world{
+                        object_world.position,
+                        quat_from_angle_axis(
+                            object_yaw, vec3(0.0F, 1.0F, 0.0F))};
+                    offline_overlap_player->restart_bridged_to_frame(
+                        native_g1_frame.pose,
+                        object_yaw_world);
+                    bridged_to_object = true;
+                }
+            }
+            if (!bridged_to_object)
+            {
+                offline_overlap_player->restart_aligned_to(
+                    native_g1_frame.pose);
+            }
+            offline_overlap_active = true;
+        }
         if (native_g1_frame.synchronize_simulation_root)
         {
+            state.simulation_position =
+                native_g1_frame.pose.positions[g1_skeleton::Simulation];
+            state.simulation_velocity =
+                native_g1_frame.pose.velocities[g1_skeleton::Simulation];
+            state.simulation_acceleration = vec3();
+            state.simulation_rotation =
+                native_g1_frame.pose.rotations[g1_skeleton::Simulation];
+            state.simulation_angular_velocity =
+                native_g1_frame.pose.angular_velocities[g1_skeleton::Simulation];
+        }
+        const interaction::Pose final_g1_pose =
+            offline_overlap_active
+                ? offline_overlap_player->aligned_pose()
+                : native_g1_frame.pose;
+        const size_t offline_overlap_frame = offline_overlap_active
+            ? offline_overlap_player->frame_index()
+            : 0U;
+        if (offline_overlap_active)
+        {
+            offline_overlap_player->advance_25hz();
             state.simulation_position =
                 final_g1_pose.positions[g1_skeleton::Simulation];
             state.simulation_velocity =
@@ -4118,22 +4199,51 @@ int main(void)
                 final_g1_pose.rotations[g1_skeleton::Simulation];
             state.simulation_angular_velocity =
                 final_g1_pose.angular_velocities[g1_skeleton::Simulation];
+            if (offline_overlap_player->finished())
+            {
+                offline_overlap_active = false;
+            }
+        }
+        interaction::WorldPose final_g1_world_pose =
+            interaction::world_pose(final_g1_pose);
+        interaction::InteractionTarget* offline_overlap_target =
+            interaction_registry.find(interaction_scene_target_handle);
+        if (offline_overlap_target != nullptr &&
+            !offline_overlap_target->affordances.empty())
+        {
+            const interaction::GraspAffordance& affordance =
+                offline_overlap_target->affordances.front();
+            const size_t hand = affordance.hand == interaction::Hand::Left
+                ? static_cast<size_t>(g1_skeleton::LeftWrist)
+                : static_cast<size_t>(g1_skeleton::RightWrist);
+            const interaction::Transform hand_world{
+                final_g1_world_pose.positions[hand],
+                final_g1_world_pose.rotations[hand]};
+            if (offline_overlap_active &&
+                offline_overlap_frame >=
+                    interaction::offline_overlap::kPickupContactFrame &&
+                !offline_overlap_object_follower.attached())
+            {
+                offline_overlap_object_follower.attach(
+                    hand_world,
+                    offline_overlap_target->object_world);
+            }
+            if (offline_overlap_object_follower.attached())
+            {
+                offline_overlap_target->object_world =
+                    offline_overlap_object_follower.follow(hand_world);
+            }
         }
         if (!validate_final_g1_grasp(
                 interaction_output,
                 interaction_registry,
                 interaction_config,
-                runtime_g1_world_pose,
+                final_g1_world_pose,
                 artifact_error,
                 static_cast<int>(sizeof(artifact_error))))
         {
             controlled_runtime_error(artifact_error);
             return;
-        }
-        if (offline_overlap_player.has_value())
-        {
-            final_g1_pose = offline_overlap_player->pose();
-            offline_overlap_player->advance_25hz();
         }
         interaction::write_native_g1_pose(
             final_g1_pose,
@@ -4142,9 +4252,6 @@ int main(void)
             final_g1_local_rotations,
             final_g1_local_angular_velocities,
             final_g1_contacts);
-        interaction::WorldPose final_g1_world_pose =
-            interaction::world_pose(final_g1_pose);
-
         // Update camera
 
         orbit_camera_update(
@@ -4159,7 +4266,8 @@ int main(void)
             desired_strafe,
             dt);
 
-        if (!::g1_mesh_renderer_update(
+        if (!offline_overlap_player.has_value() &&
+            !::g1_mesh_renderer_update(
                 g1_mesh_renderer,
                 slice1d<vec3>(
                     static_cast<int>(g1_skeleton::BoneCount),
@@ -4817,7 +4925,8 @@ int main(void)
             fprintf(stderr, "G1 runtime log error: %s\n", artifact_error);
             if (controller_exit_code == 0) controller_exit_code = 2;
         }
-        ::g1_mesh_renderer_unload(g1_mesh_renderer);
+        if (!offline_overlap_player.has_value())
+            ::g1_mesh_renderer_unload(g1_mesh_renderer);
         model_unloader(terrain_model);
 
         CloseWindow();

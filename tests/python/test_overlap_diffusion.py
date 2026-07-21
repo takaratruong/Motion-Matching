@@ -214,6 +214,15 @@ class OverlapDiffusionTests(unittest.TestCase):
             candidates=1, steps=1, task_guidance=guidance, return_trace=True,
         )
         self.assertTrue(torch.all(trace[0].guided_clean[..., 0] < trace[0].unguided_clean[..., 0]))
+        with torch.inference_mode():
+            _, inference_trace = sample_coupled(
+                self._zero_expert(), self._zero_expert(), self._condition(), seed=5,
+                candidates=1, steps=1, task_guidance=guidance, return_trace=True,
+            )
+        self.assertTrue(torch.all(
+            inference_trace[0].guided_clean[..., 0]
+            < inference_trace[0].unguided_clean[..., 0]
+        ))
 
     def test_denoiser_schema_is_exact_and_weights_are_independent(self):
         from resources.g1_interaction_builder.overlap_diffusion import MotionWindowDenoiser

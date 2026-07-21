@@ -207,6 +207,179 @@ void test_player_advances_exactly_one_25hz_frame_and_can_loop_or_restart() {
     require(loop.frame_index() == 0U, "looping player did not wrap at frame 80");
 }
 
+void test_player_aligns_clip_root_to_live_pose_without_losing_travel() {
+    const std::filesystem::path path = fixture_path("offline-overlap-aligned.bin");
+    write_fixture(path);
+    const interaction::offline_overlap::Clip clip =
+        interaction::offline_overlap::Clip::load(path);
+    interaction::offline_overlap::Player player(clip, false);
+    interaction::Pose live{};
+    live.positions[g1_skeleton::Simulation] = vec3(7.0F, 0.5F, -3.0F);
+    live.rotations[g1_skeleton::Simulation] = quat(
+        0.70710677F, 0.0F, 0.70710677F, 0.0F);
+
+    player.restart_aligned_to(live);
+    const interaction::Pose first = player.aligned_pose();
+    require(
+        length(first.positions[g1_skeleton::Simulation] -
+               live.positions[g1_skeleton::Simulation]) < 1.0e-4F,
+        "aligned player frame zero did not preserve the live root position");
+    const quat aligned_rotation =
+        first.rotations[g1_skeleton::Simulation];
+    const quat live_rotation = live.rotations[g1_skeleton::Simulation];
+    const float rotation_dot = std::abs(
+        aligned_rotation.w * live_rotation.w +
+        aligned_rotation.x * live_rotation.x +
+        aligned_rotation.y * live_rotation.y +
+        aligned_rotation.z * live_rotation.z);
+    require(
+        std::abs(rotation_dot - 1.0F) < 1.0e-4F,
+        "aligned player frame zero did not preserve the live root rotation");
+
+    const float source_travel = length(
+        clip.frames[1].positions[g1_skeleton::Simulation] -
+        clip.frames[0].positions[g1_skeleton::Simulation]);
+    player.advance_25hz();
+    const interaction::Pose second = player.aligned_pose();
+    require(
+        std::abs(length(
+            second.positions[g1_skeleton::Simulation] -
+            first.positions[g1_skeleton::Simulation]) - source_travel) < 1.0e-3F,
+        "aligned player changed the clip's relative root travel");
+}
+
+void test_player_bridges_live_root_to_world_interaction_slot() {
+    const std::filesystem::path path = fixture_path("offline-overlap-bridge.bin");
+    write_fixture(path);
+    const interaction::offline_overlap::Clip clip =
+        interaction::offline_overlap::Clip::load(path);
+    interaction::offline_overlap::Player player(clip, false);
+    interaction::Pose live{};
+    live.positions[g1_skeleton::Simulation] = vec3(2.0F, 0.25F, -1.0F);
+    live.rotations[g1_skeleton::Simulation] = quat();
+    const interaction::Transform destination{
+        vec3(-4.0F, 0.25F, 8.0F),
+        quat(0.70710677F, 0.0F, 0.70710677F, 0.0F)};
+
+    player.restart_bridged_to(live, destination);
+    const interaction::Pose first = player.aligned_pose();
+    require(
+        length(first.positions[g1_skeleton::Simulation] -
+               live.positions[g1_skeleton::Simulation]) < 1.0e-4F,
+        "bridged player changed the live entry root");
+    for (size_t tick = 0U; tick < 79U; ++tick) player.advance_25hz();
+    const interaction::Pose last = player.aligned_pose();
+    require(
+        length(last.positions[g1_skeleton::Simulation] -
+               destination.position) < 1.0e-3F,
+        "bridged player did not end at the world interaction slot");
+    const quat end_rotation = last.rotations[g1_skeleton::Simulation];
+    const float rotation_dot = std::abs(
+        end_rotation.w * destination.rotation.w +
+        end_rotation.x * destination.rotation.x +
+        end_rotation.y * destination.rotation.y +
+        end_rotation.z * destination.rotation.z);
+    require(
+        std::abs(rotation_dot - 1.0F) < 1.0e-4F,
+        "bridged player did not end at the interaction-slot heading");
+}
+
+void test_player_maps_object_relative_clip_endpoint_through_world_frame() {
+    const std::filesystem::path path = fixture_path("offline-overlap-object-frame.bin");
+    write_fixture(path);
+    const interaction::offline_overlap::Clip clip =
+        interaction::offline_overlap::Clip::load(path);
+    interaction::offline_overlap::Player player(clip, false);
+    interaction::Pose live{};
+    live.positions[g1_skeleton::Simulation] = vec3(1.0F, 0.0F, -2.0F);
+    live.rotations[g1_skeleton::Simulation] = quat();
+    const interaction::Transform object_yaw_world{
+        vec3(0.25F, 0.5F, 3.0F),
+        quat(0.9238795F, 0.0F, 0.3826834F, 0.0F)};
+    const size_t root = static_cast<size_t>(g1_skeleton::Simulation);
+    const interaction::Transform expected = interaction::compose(
+        object_yaw_world,
+        interaction::Transform{
+            clip.frames.back().positions[root],
+            clip.frames.back().rotations[root]});
+
+    player.restart_bridged_to_frame(live, object_yaw_world);
+    for (size_t tick = 0U; tick < 79U; ++tick) player.advance_25hz();
+    const interaction::Pose last = player.aligned_pose();
+    require(
+        length(last.positions[root] - expected.position) < 1.0e-3F,
+        "object-relative endpoint was not mapped through the world frame");
+    const quat actual_rotation = last.rotations[root];
+    const float rotation_dot = std::abs(
+        actual_rotation.w * expected.rotation.w +
+        actual_rotation.x * expected.rotation.x +
+        actual_rotation.y * expected.rotation.y +
+        actual_rotation.z * expected.rotation.z);
+    require(
+        std::abs(rotation_dot - 1.0F) < 1.0e-4F,
+        "object-relative endpoint heading was not mapped through the world frame");
+}
+
+void test_bridge_finishes_before_pickup_motion_begins() {
+    const std::filesystem::path path = fixture_path("offline-overlap-settled-bridge.bin");
+    write_fixture(path);
+    const interaction::offline_overlap::Clip clip =
+        interaction::offline_overlap::Clip::load(path);
+    interaction::offline_overlap::Player player(clip, false);
+    interaction::Pose live{};
+    live.positions[g1_skeleton::Simulation] =
+        clip.frames[0].positions[g1_skeleton::Simulation];
+    live.rotations[g1_skeleton::Simulation] =
+        clip.frames[0].rotations[g1_skeleton::Simulation];
+    player.restart_bridged_to(
+        live,
+        interaction::Transform{vec3(-20.0F, 0.0F, 30.0F), quat()});
+    for (size_t tick = 0U; tick < interaction::offline_overlap::kBridgeSettleFrame;
+         ++tick) {
+        player.advance_25hz();
+    }
+    const interaction::Pose settled = player.aligned_pose();
+    player.advance_25hz();
+    const interaction::Pose after = player.aligned_pose();
+    const size_t root = static_cast<size_t>(g1_skeleton::Simulation);
+    const vec3 source_delta =
+        clip.frames[interaction::offline_overlap::kBridgeSettleFrame + 1U]
+                .positions[root] -
+        clip.frames[interaction::offline_overlap::kBridgeSettleFrame]
+                .positions[root];
+    require(
+        length((after.positions[root] - settled.positions[root]) - source_delta) <
+            1.0e-3F,
+        "bridge correction continued sliding during pickup motion");
+}
+
+void test_attached_object_follower_is_continuous_and_tracks_hand() {
+    interaction::offline_overlap::AttachedObjectFollower follower;
+    const interaction::Transform contact_hand{
+        vec3(1.0F, 1.2F, -0.5F),
+        quat(0.9238795F, 0.0F, 0.3826834F, 0.0F)};
+    const interaction::Transform contact_object{
+        vec3(1.1F, 1.0F, -0.45F),
+        quat(0.9659258F, 0.0F, 0.2588190F, 0.0F)};
+    follower.attach(contact_hand, contact_object);
+    const interaction::Transform unchanged = follower.follow(contact_hand);
+    require(
+        length(unchanged.position - contact_object.position) < 1.0e-4F,
+        "offline attachment moved the object at contact");
+    const interaction::Transform moved_hand{
+        vec3(2.0F, 1.5F, 0.25F),
+        quat(0.70710677F, 0.0F, 0.70710677F, 0.0F)};
+    const interaction::Transform expected = interaction::compose(
+        moved_hand,
+        interaction::compose(interaction::inverse(contact_hand), contact_object));
+    const interaction::Transform followed = follower.follow(moved_hand);
+    require(
+        length(followed.position - expected.position) < 1.0e-4F,
+        "offline attachment did not follow the hand");
+    follower.reset();
+    require(!follower.attached(), "offline attachment reset did not detach");
+}
+
 }  // namespace
 
 int main() {
@@ -214,5 +387,10 @@ int main() {
     test_rejects_trailing_malformed_nonfinite_and_nonunit_input();
     test_rejects_wrong_skeleton_signature_and_order();
     test_player_advances_exactly_one_25hz_frame_and_can_loop_or_restart();
+    test_player_aligns_clip_root_to_live_pose_without_losing_travel();
+    test_player_bridges_live_root_to_world_interaction_slot();
+    test_player_maps_object_relative_clip_endpoint_through_world_frame();
+    test_bridge_finishes_before_pickup_motion_begins();
+    test_attached_object_follower_is_continuous_and_tracks_hand();
     return 0;
 }

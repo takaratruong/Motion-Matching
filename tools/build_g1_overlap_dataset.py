@@ -34,6 +34,7 @@ from resources.g1_terrain_builder.schema import HoldenClip
 
 SPLITS = ("train", "validation", "test")
 _NATIVE_OFFSET_TOLERANCE_M = 0.002
+CANONICAL_LOCAL_OFFSETS_SHA256 = "7bb27502cea37d13bb255b9cf9933ace962b1d1dcf56eec90e5005774db97bcc"
 
 
 def _sha256(path: Path) -> str:
@@ -320,11 +321,14 @@ def _canonical_skeleton_metadata(walking: HoldenClip) -> dict[str, np.ndarray]:
         raise ValueError("native G1 local offsets for bones 2..30 must be constant")
     if not np.isfinite(offsets).all():
         raise ValueError("canonical native G1 local offsets must be finite")
+    canonical_offsets = np.ascontiguousarray(offsets.astype("<f4", copy=False))
+    if hashlib.sha256(canonical_offsets.tobytes()).hexdigest() != CANONICAL_LOCAL_OFFSETS_SHA256:
+        raise ValueError("canonical native G1 local offsets SHA256 does not match the frozen contract")
     return {
         "skeleton_parents": G1_SKELETON.parents.astype(np.int32, copy=True),
         "skeleton_names": np.asarray(G1_SKELETON.names),
         "skeleton_signature": np.asarray(G1_SKELETON.signature()),
-        "canonical_local_offsets": offsets.astype(np.float32),
+        "canonical_local_offsets": canonical_offsets,
     }
 
 

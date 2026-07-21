@@ -353,10 +353,10 @@ $(CPP_TEST_DIR)/test_interaction_native_g1_bridge: \
 $(CPP_TEST_DIR)/test_interaction_offline_overlap: \
   tests/cpp/test_interaction_offline_overlap.cpp \
   interaction_offline_overlap.cpp interaction_offline_overlap.h \
-  interaction_pose.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
+  interaction_pose.cpp interaction_pose.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) \
 	  tests/cpp/test_interaction_offline_overlap.cpp \
-	  interaction_offline_overlap.cpp -o $@
+	  interaction_offline_overlap.cpp interaction_pose.cpp -o $@
 
 $(CPP_TEST_DIR)/test_interaction_target: tests/cpp/test_interaction_target.cpp interaction_target.cpp interaction_target.h interaction_pose.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_target.cpp interaction_target.cpp -o $@

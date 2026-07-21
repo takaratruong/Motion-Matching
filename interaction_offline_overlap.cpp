@@ -2,6 +2,7 @@
 
 #include "g1_skeleton.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -208,6 +209,95 @@ void Player::advance_25hz() {
 void Player::restart() {
     frame_index_ = 0U;
     finished_ = false;
+}
+
+void Player::restart_aligned_to(const Pose& target_pose) {
+    restart();
+    bridge_enabled_ = false;
+    endpoint_translation_ = vec3();
+    endpoint_rotation_ = quat();
+    const size_t root = static_cast<size_t>(g1_skeleton::Simulation);
+    const Transform source_root{
+        clip_.frames[0].positions[root], clip_.frames[0].rotations[root]};
+    const Transform target_root{
+        target_pose.positions[root], target_pose.rotations[root]};
+    alignment_ = compose(target_root, inverse(source_root));
+}
+
+void Player::restart_bridged_to(
+    const Pose& live_pose,
+    const Transform& destination_root) {
+    restart_aligned_to(live_pose);
+    const size_t root = static_cast<size_t>(g1_skeleton::Simulation);
+    const Pose& source_end = clip_.frames.back();
+    const Transform mapped_end = compose(
+        alignment_,
+        Transform{source_end.positions[root], source_end.rotations[root]});
+    endpoint_translation_ = destination_root.position - mapped_end.position;
+    endpoint_rotation_ = quat_normalize(quat_mul(
+        destination_root.rotation, quat_inv(mapped_end.rotation)));
+    bridge_enabled_ = true;
+}
+
+void Player::restart_bridged_to_frame(
+    const Pose& live_pose,
+    const Transform& destination_frame) {
+    const size_t root = static_cast<size_t>(g1_skeleton::Simulation);
+    const Pose& source_end = clip_.frames.back();
+    const Transform destination_root = compose(
+        destination_frame,
+        Transform{source_end.positions[root], source_end.rotations[root]});
+    restart_bridged_to(live_pose, destination_root);
+}
+
+Pose Player::aligned_pose() const {
+    Pose result = pose();
+    const size_t root = static_cast<size_t>(g1_skeleton::Simulation);
+    const Transform mapped_root = compose(
+        alignment_, Transform{result.positions[root], result.rotations[root]});
+    result.positions[root] = mapped_root.position;
+    result.rotations[root] = mapped_root.rotation;
+    result.velocities[root] = quat_mul_vec3(
+        alignment_.rotation, result.velocities[root]);
+    result.angular_velocities[root] = quat_mul_vec3(
+        alignment_.rotation, result.angular_velocities[root]);
+    if (bridge_enabled_) {
+        const float linear = static_cast<float>(
+            std::min(frame_index_, kBridgeSettleFrame)) /
+            static_cast<float>(kBridgeSettleFrame);
+        const float alpha = linear * linear * (3.0F - 2.0F * linear);
+        result.positions[root] =
+            result.positions[root] + alpha * endpoint_translation_;
+        const quat corrected_rotation = quat_normalize(quat_mul(
+            endpoint_rotation_, result.rotations[root]));
+        result.rotations[root] = quat_nlerp_shortest(
+            result.rotations[root], corrected_rotation, alpha);
+    }
+    return result;
+}
+
+void AttachedObjectFollower::attach(
+    const Transform& hand_world,
+    const Transform& object_world) {
+    object_in_hand_ = compose(inverse(hand_world), object_world);
+    attached_ = true;
+}
+
+void AttachedObjectFollower::reset() {
+    attached_ = false;
+    object_in_hand_ = Transform{};
+}
+
+bool AttachedObjectFollower::attached() const {
+    return attached_;
+}
+
+Transform AttachedObjectFollower::follow(
+    const Transform& hand_world) const {
+    if (!attached_) {
+        throw std::logic_error("offline object follower is not attached");
+    }
+    return compose(hand_world, object_in_hand_);
 }
 
 }  // namespace interaction::offline_overlap

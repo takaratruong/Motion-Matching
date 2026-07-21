@@ -219,12 +219,25 @@ def _empty_overlap_dataset(rejections: dict[str, int]) -> OverlapDataset:
 def _grasp_condition(
     artifact: InteractionArtifact, clip: int, object_frame: int,
 ) -> np.ndarray:
-    """The existing 18-value object/grasp condition used by funnel training."""
+    """Express object-local grasp metadata in the motion's yaw-canonical frame."""
     hand = int(artifact.active_hands[clip])
-    grasp_rotation = np.asarray(artifact.grasp_rotations_object[clip], np.float64)
-    if not np.isfinite(grasp_rotation).all() or np.linalg.norm(grasp_rotation) < _ROTATION_EPSILON:
+    object_rotation = np.asarray(artifact.object_rotations[object_frame], np.float64)
+    grasp_rotation_object = np.asarray(artifact.grasp_rotations_object[clip], np.float64)
+    if (
+        not np.isfinite(object_rotation).all()
+        or np.linalg.norm(object_rotation) < _ROTATION_EPSILON
+        or not np.isfinite(grasp_rotation_object).all()
+        or np.linalg.norm(grasp_rotation_object) < _ROTATION_EPSILON
+    ):
         raise ValueError("invalid_grasp")
-    grasp_rotation /= np.linalg.norm(grasp_rotation)
+    object_rotation /= np.linalg.norm(object_rotation)
+    grasp_rotation_object /= np.linalg.norm(grasp_rotation_object)
+    residual_rotation = holden_quat.mul(
+        holden_quat.inv(_yaw_quaternion(object_rotation)), object_rotation
+    )
+    grasp_rotation = holden_quat.normalize(
+        holden_quat.mul(residual_rotation, grasp_rotation_object)
+    )
     w, x, y, z = grasp_rotation
     rotation6 = np.asarray(
         [
@@ -233,8 +246,14 @@ def _grasp_condition(
             1 - 2 * (x * x + z * z), 2 * (y * z + x * w),
         ], np.float32,
     )
-    approach = np.asarray(artifact.approach_directions_object[clip], np.float64)
-    grasp_position = np.asarray(artifact.grasp_positions_object[clip], np.float32)
+    approach = holden_quat.mul_vec(
+        residual_rotation,
+        np.asarray(artifact.approach_directions_object[clip], np.float64),
+    )
+    grasp_position = holden_quat.mul_vec(
+        residual_rotation,
+        np.asarray(artifact.grasp_positions_object[clip], np.float64),
+    ).astype(np.float32)
     dimensions = np.asarray(artifact.object_dimensions[clip], np.float32)
     planar_norm = np.linalg.norm(approach[[0, 2]])
     if (

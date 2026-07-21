@@ -1,3 +1,4 @@
+import base64
 import copy
 import io
 import json
@@ -24,6 +25,18 @@ from resources.g1_interaction_builder.schema import (
 )
 from resources.g1_terrain_builder.schema import HoldenClip
 from tools import build_g1_overlap_dataset
+
+
+_CANONICAL_OFFSETS = np.frombuffer(base64.b64decode(
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACwJFBU0r08/4O9AGACpKmR+bzJ/VS9vc3MPDgx/r0AAMSkdE2gvd6XNb6P1Ay7AID9ozqamb7GEMY4AAAjJKrVj7wAwA4kAHi4JFFU0r1E/4M9ELQfLoCR+byr/VQ9eM3MPJgx/r0AgMEkSk2gvQCYNb6P1Aw7AABApNiZmb7GEMa4AIDwI4bVj7wAQJ2iAAAAAAAAAAAAAAAAP+CBux1cDz0AiAGkbQC3rNmlmzwAbImk2qOBO5F8cz4IQM29ALgMpd+aYrzGpRu9AACno+ZZ072Cd8y7WkuBPCvmpL2qSIwzXsvMPQrXI7y/c/e6tKQbPQAAQKTynn4zCGk8PQAAkKNm4gQz2aOBO418cz7EOs09AKDfpDCbYrzEpRs9AMAfJQxa0711eMw7WkuBPGDmpL0AEF+lTMzMPQrXI7y/c/c6fqUbPQAAJqVzE5myvmk8PQAAAKSIcomy"
+), dtype="<f4").reshape(31, 3)
+
+
+def _canonical_walking(frames: int = 500) -> HoldenClip:
+    walking = HoldenClip.empty(frames=frames, bones=31)
+    walking.positions[:] = _CANONICAL_OFFSETS
+    walking.positions[:, 0, 0] = np.arange(frames, dtype=np.float32)
+    return walking
 
 
 def interaction_artifact_fixture(
@@ -169,6 +182,46 @@ class OverlapInteractionExtractionTests(unittest.TestCase):
             equivalent.pickup_windows[:, :20].tobytes(),
         )
 
+    def test_grasp_pose_uses_the_same_yaw_canonical_frame_as_motion(self):
+        artifact = interaction_artifact_fixture()
+        tilt = holden_quat.from_angle_axis(
+            np.asarray(0.7, np.float32), np.asarray([1.0, 0.0, 0.0], np.float32)
+        ).astype(np.float32)
+        yaw = _yaw_quaternion(0.4)
+        object_rotation = holden_quat.mul(yaw, tilt)
+        artifact.object_rotations[:] = object_rotation
+        artifact.grasp_positions_object[0] = np.asarray([0.01, 0.02, 0.03], np.float32)
+        artifact.grasp_rotations_object[0] = holden_quat.from_angle_axis(
+            np.asarray(-0.2, np.float32), np.asarray([0.0, 0.0, 1.0], np.float32)
+        ).astype(np.float32)
+
+        rows = extract_interaction_pairs(artifact)
+
+        w, x, y, z = object_rotation
+        canonical_yaw = _yaw_quaternion(
+            float(np.arctan2(2.0 * (w * y + x * z), 1.0 - 2.0 * (y * y + z * z)))
+        )
+        residual = holden_quat.mul(holden_quat.inv(canonical_yaw), object_rotation)
+        expected_position = holden_quat.mul_vec(
+            residual, artifact.grasp_positions_object[0]
+        )
+        expected_rotation = holden_quat.mul(
+            residual, artifact.grasp_rotations_object[0]
+        )
+        expected_matrix = holden_quat.to_xform(expected_rotation)
+        expected_rotation6d = np.concatenate(
+            (expected_matrix[:, 0], expected_matrix[:, 1]), axis=0
+        )
+        expected_approach = holden_quat.mul_vec(
+            residual, artifact.approach_directions_object[0]
+        )
+        expected_approach_xz = expected_approach[[0, 2]] / np.linalg.norm(
+            expected_approach[[0, 2]]
+        )
+        np.testing.assert_allclose(rows.static_conditions[0, 2:5], expected_position, atol=1e-6)
+        np.testing.assert_allclose(rows.static_conditions[0, 5:11], expected_rotation6d, atol=1e-6)
+        np.testing.assert_allclose(rows.static_conditions[0, 11:13], expected_approach_xz, atol=1e-6)
+
     def test_source_ranges_are_local_to_their_continuation_identity(self):
         first = interaction_artifact_fixture()
         second = copy.deepcopy(first)
@@ -307,15 +360,11 @@ class OverlapWalkingExtractionTests(unittest.TestCase):
 
 
 class OverlapDatasetCliTests(unittest.TestCase):
-    def test_canonical_offsets_use_native_median_and_reject_real_motion(self):
+    def test_canonical_offsets_require_the_frozen_native_digest(self):
         walking = HoldenClip.empty(frames=3, bones=31)
         walking.positions[:, 2, 1] = np.asarray([-0.1000, -0.0990, -0.1000], np.float32)
 
-        metadata = build_g1_overlap_dataset._canonical_skeleton_metadata(walking)
-
-        self.assertAlmostEqual(float(metadata["canonical_local_offsets"][2, 1]), -0.1000)
-        walking.positions[2, 2, 1] = -0.0969
-        with self.assertRaisesRegex(ValueError, "must be constant"):
+        with self.assertRaisesRegex(ValueError, "SHA256"):
             build_g1_overlap_dataset._canonical_skeleton_metadata(walking)
 
     def test_interaction_split_is_object_disjoint_and_complete(self):
@@ -360,8 +409,7 @@ class OverlapDatasetCliTests(unittest.TestCase):
 
     def test_export_uses_manifest_object_identity_and_train_only_normalization(self):
         artifact = interaction_artifact_fixture()
-        walking = HoldenClip.empty(frames=500, bones=31)
-        walking.positions[:, 0, 0] = np.arange(500, dtype=np.float32)
+        walking = _canonical_walking()
         manifest = {
             "clips": [{
                 "sequence_id": "pickup_table__cup_2__001",
@@ -410,8 +458,7 @@ class OverlapDatasetCliTests(unittest.TestCase):
 
     def test_failed_manifest_publication_restores_the_previous_output_pair(self):
         artifact = interaction_artifact_fixture()
-        walking = HoldenClip.empty(frames=500, bones=31)
-        walking.positions[:, 0, 0] = np.arange(500, dtype=np.float32)
+        walking = _canonical_walking()
         manifest = {"clips": [{
             "sequence_id": "pickup_table__cup_2__001",
             "object_id": "cup_2",

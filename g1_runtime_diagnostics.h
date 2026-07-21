@@ -122,7 +122,8 @@ static inline bool g1_runtime_snapshot_is_valid(
            snapshot.motion_pack_load_count >= 0 &&
            snapshot.model_load_count >= 0 &&
            snapshot.model_unload_count >= 0 &&
-           snapshot.live_model_count == 1;
+           snapshot.live_model_count >= 0 &&
+           snapshot.live_model_count <= 1;
 }
 
 static inline bool g1_runtime_diagnostics_build(
@@ -138,6 +139,7 @@ static inline bool g1_runtime_diagnostics_build(
     int motion_pack_load_count,
     int model_load_count,
     int model_unload_count,
+    int expected_live_model_count,
     char* error,
     int capacity)
 {
@@ -183,17 +185,19 @@ static inline bool g1_runtime_diagnostics_build(
     }
     if (scene_generation < 0 || scene_reset_count < 0 ||
         motion_pack_load_count < 0 || model_load_count < 0 ||
-        model_unload_count < 0 || model_unload_count > model_load_count)
+        model_unload_count < 0 || model_unload_count > model_load_count ||
+        expected_live_model_count < 0)
     {
         return scene_error(
             error, capacity,
             "runtime diagnostics: counters must be nonnegative and ordered");
     }
     const int live_model_count = model_load_count - model_unload_count;
-    if (live_model_count != 1) {
+    if (live_model_count != expected_live_model_count) {
         return scene_error(
             error, capacity,
-            "runtime diagnostics: expected exactly one live model, got %d",
+            "runtime diagnostics: expected %d live models, got %d",
+            expected_live_model_count,
             live_model_count);
     }
 

@@ -22,6 +22,44 @@ class NativeG1ControllerTests(unittest.TestCase):
         self.assertIn("model.skeleton.bindPose", SOURCE)
         self.assertNotIn("IsModelReady(", SOURCE)
 
+    def test_offline_diffusion_preview_defaults_to_skeleton_only(self):
+        self.assertIn(
+            "bool show_g1_mesh = !offline_overlap_player.has_value();",
+            SOURCE,
+        )
+        self.assertIn(
+            "if (!controller_exit_requested &&\n"
+            "        !offline_overlap_player.has_value() &&\n"
+            "        !::g1_mesh_renderer_load(",
+            SOURCE,
+        )
+        self.assertIn(
+            "if (!offline_overlap_player.has_value() &&\n"
+            "            !::g1_mesh_renderer_update(",
+            SOURCE,
+        )
+        self.assertIn("bool show_g1_bones = true;", SOURCE)
+
+    def test_offline_diffusion_preview_waits_for_f_and_preserves_live_controls(self):
+        self.assertIn("bool offline_overlap_active = false;", SOURCE)
+        self.assertIn(
+            "offline_overlap_player->restart_bridged_to_frame(",
+            SOURCE,
+        )
+        self.assertIn("const interaction::Transform object_yaw_world", SOURCE)
+        self.assertIn("offline_overlap_active = true;", SOURCE)
+        self.assertIn(
+            "offline_overlap_active\n"
+            "                ? offline_overlap_player->aligned_pose()",
+            SOURCE,
+        )
+        self.assertIn("if (offline_overlap_player->finished())", SOURCE)
+        self.assertIn("offline_overlap_active = false;", SOURCE)
+        self.assertIn(
+            "interaction::offline_overlap::kPickupContactFrame", SOURCE)
+        self.assertIn("offline_overlap_object_follower.attach(", SOURCE)
+        self.assertIn("offline_overlap_object_follower.follow(hand_world)", SOURCE)
+
     def test_clearance_kernel_is_compiled_without_fast_math(self):
         self.assertIn(
             "G1_CLEARANCE_OBJECT := build/g1_clearance.o", MAKEFILE)
@@ -72,7 +110,7 @@ class NativeG1ControllerTests(unittest.TestCase):
         self.assertIn("write_native_g1_pose(\n            final_g1_pose", final_block)
 
         mesh_block = SOURCE.split(
-            "if (!::g1_mesh_renderer_update", 1)[1].split("// Render", 1)[0]
+            "!::g1_mesh_renderer_update(", 1)[1].split("// Render", 1)[0]
         self.assertIn("final_g1_world_pose.positions", mesh_block)
         self.assertIn("final_g1_world_pose.rotations", mesh_block)
         self.assertNotIn("state.global_bone_positions", mesh_block)
@@ -151,6 +189,18 @@ class NativeG1ControllerTests(unittest.TestCase):
         self.assertIn("scene.walkability.cells", flatten_block)
         self.assertIn("if (flat_interaction_terrain)", SOURCE)
         self.assertIn("DrawPlane(", SOURCE)
+        self.assertIn("Model terrain_model{};", SOURCE)
+        self.assertIn(
+            "if (!flat_interaction_terrain)\n    {\n"
+            "        terrain_model = LoadModel(",
+            SOURCE,
+        )
+        self.assertIn(
+            "if (flat_interaction_terrain)\n"
+            "            return scene_model_load_result{false, true};",
+            SOURCE,
+        )
+        self.assertIn("flat_interaction_terrain ? 0 : 1,", SOURCE)
 
         render_block = SOURCE.split("// Render", 1)[1].split(
             "// Draw Simulation Object", 1)[0]
