@@ -133,6 +133,7 @@ PLACEMENT_LOG_PATH ?= $(PLACEMENT_EVIDENCE_DIR)/placement.jsonl
 PLACEMENT_SCREENSHOT_PATH ?= $(PLACEMENT_EVIDENCE_DIR)/placement.png
 PLACEMENT_FEATURES_OUTPUT ?= $(PLACEMENT_EVIDENCE_DIR)/locomotion-features.bin
 CPP_TEST_BINS := $(CPP_TEST_DIR)/test_g1_skeleton
+CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_native_g1_bridge
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_database
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_pose
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_target
@@ -324,6 +325,14 @@ $(CPP_TEST_DIR)/test_interaction_database: tests/cpp/test_interaction_database.c
 
 $(CPP_TEST_DIR)/test_interaction_pose: tests/cpp/test_interaction_pose.cpp interaction_pose.cpp interaction_pose.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_pose.cpp interaction_pose.cpp -o $@
+
+$(CPP_TEST_DIR)/test_interaction_native_g1_bridge: \
+  tests/cpp/test_interaction_native_g1_bridge.cpp \
+  interaction_native_g1_bridge.cpp interaction_native_g1_bridge.h \
+  interaction_pose.cpp interaction_pose.h interaction_runtime.h | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) \
+	  tests/cpp/test_interaction_native_g1_bridge.cpp \
+	  interaction_native_g1_bridge.cpp interaction_pose.cpp -o $@
 
 $(CPP_TEST_DIR)/test_interaction_target: tests/cpp/test_interaction_target.cpp interaction_target.cpp interaction_target.h interaction_pose.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_target.cpp interaction_target.cpp -o $@
