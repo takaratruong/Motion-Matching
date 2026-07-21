@@ -535,10 +535,10 @@ class StageBDefaultDynamicTests(unittest.TestCase):
                 target_rows=601,
                 control_drive_steps=3000,
                 control_drive_duration_s=12.0,
-                simulator_steps=3001,
-                simulator_duration_s=12.004,
+                simulator_steps=3000,
+                simulator_duration_s=12.0,
                 state_rows=600,
-                contact_rows=3001,
+                contact_rows=3000,
                 wall_duration_s=12.5,
                 target_device=1,
                 target_inode=2,
@@ -558,7 +558,7 @@ class StageBDefaultDynamicTests(unittest.TestCase):
                     target_inode=4,
                     target_sha256=_sha("wait"),
                 ),
-                prime=MappingProxyType({"prime": {"steps": 1}}),
+                prime=MappingProxyType({"prime": {"steps": 0}}),
                 coverage=coverage,
                 target_audit=MappingProxyType({"exact": True}),
                 metrics=MappingProxyType(
@@ -662,6 +662,10 @@ class StageBDefaultDynamicTests(unittest.TestCase):
                 )
 
             self.assertEqual(result.status, "pass", result.reason)
+            evidence = json.loads(
+                (bundle.path / "gates/stage_b_dynamic.json").read_text("ascii")
+            )
+            self.assertEqual(evidence["fresh_low_state_prime"]["prime"]["steps"], 0)
             self.assertEqual(len(calls), 1)
             self.assertEqual(calls[0]["canonical"].count, 601)
             self.assertEqual(calls[0]["control_lead_rows"], 16)
@@ -676,9 +680,9 @@ class StageBDefaultDynamicTests(unittest.TestCase):
                 forbidden_geom_groups=scene.forbidden_geom_groups,
                 sim_dt_s=0.004,
                 expected_final_pelvis_xy=(1.0, 0.0),
-                expected_simulator_steps=3001,
+                expected_simulator_steps=3000,
                 expected_state_rows=600,
-                expected_contact_rows=3001,
+                expected_contact_rows=3000,
             )
             self.assertEqual(result.metrics["coverage"]["command_count"], 30)
             self.assertEqual(result.metrics["coverage"]["frame_count"], 601)

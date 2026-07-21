@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 from types import SimpleNamespace
 import types
 import unittest
@@ -35,6 +36,9 @@ class FakeBackend:
         self.reset_calls = []
         self.step_calls = 0
         self.sample_calls = 0
+        self.prime_calls = 0
+        self.low_command_received = False
+        self.low_command_q_target = np.zeros(29, dtype=np.float32)
         self.camera_calls = []
         self.closed = False
 
@@ -78,6 +82,19 @@ class FakeBackend:
                     "distance_m": -0.001,
                 }
             ],
+        }
+
+    def prime_low_state(self):
+        self.prime_calls += 1
+
+    def low_command_snapshot(self):
+        return {
+            "received": self.low_command_received,
+            "q_target": (
+                self.low_command_q_target.copy()
+                if self.low_command_received
+                else None
+            ),
         }
 
     def set_camera(self, azimuth_deg, elevation_deg, distance_m):
@@ -329,6 +346,58 @@ class GatedSimulatorRunnerTests(unittest.TestCase):
         )
         self.assertEqual(contact_rows[-1]["contacts"][0]["geom2"], "floor")
         self.assertAlmostEqual(state_rows[-1]["sim_time_s"], 0.4, places=15)
+
+    def test_prime_low_state_publishes_without_stepping_or_changing_evidence(self):
+        with self.assertRaisesRegex(ProtocolError, "reset is required"):
+            self.runner.prime_low_state()
+
+        self.reset()
+        backend = self.backends[-1]
+        before_snapshot = self.runner.snapshot()
+        before_qpos = backend.data.qpos.copy()
+        before_time = backend.data.time
+
+        result = self.runner.prime_low_state()
+
+        self.assertEqual(
+            result,
+            {
+                "published": True,
+                "steps": 0,
+                "sim_time_s": 0.0,
+                "state_rows": 0,
+                "contact_rows": 0,
+            },
+        )
+        self.assertEqual(backend.prime_calls, 1)
+        self.assertEqual(backend.step_calls, 0)
+        self.assertEqual(backend.sample_calls, 0)
+        np.testing.assert_array_equal(backend.data.qpos, before_qpos)
+        self.assertEqual(backend.data.time, before_time)
+        self.assertEqual(self.runner.snapshot(), before_snapshot)
+
+    def test_low_command_snapshot_is_receiver_owned_and_does_not_step(self):
+        with self.assertRaisesRegex(ProtocolError, "reset is required"):
+            self.runner.low_command_snapshot()
+
+        self.reset()
+        backend = self.backends[-1]
+        self.assertEqual(
+            self.runner.low_command_snapshot(),
+            {"received": False, "q_target": None},
+        )
+
+        target = np.linspace(-0.7, 0.7, 29, dtype=np.float32)
+        backend.low_command_received = True
+        backend.low_command_q_target[:] = target
+        received = self.runner.low_command_snapshot()
+        backend.low_command_q_target[:] = 99.0
+
+        self.assertIs(received["received"], True)
+        self.assertEqual(tuple(received["q_target"]), tuple(float(x) for x in target))
+        self.assertEqual(backend.step_calls, 0)
+        self.assertEqual(backend.sample_calls, 0)
+        self.assertEqual(self.runner.snapshot()["steps"], 0)
 
     def test_camera_request_applies_without_advancing_physics(self):
         self.reset()
@@ -616,6 +685,67 @@ class GatedSimulatorProtocolTests(unittest.TestCase):
         self.assertIn("exactly 36", responses[1]["error"]["message"])
         self.assertEqual(backend.step_calls, 0)
 
+    def test_prime_low_state_protocol_is_exact_and_does_not_advance(self):
+        qpos = [0.0] * 36
+        qpos[2] = 0.8
+        qpos[3] = 1.0
+        reset = json.dumps(
+            {
+                "v": 1,
+                "op": "reset",
+                "request_id": "g0",
+                "scene_xml": str(self.scene),
+                "initial_qpos": qpos,
+                "lateral_offset_m": 0.0,
+                "yaw_offset_rad": 0.0,
+                "log_dir": str(self.root / "prime-sim"),
+                "elastic_band_enabled": False,
+            },
+            separators=(",", ":"),
+        )
+        responses, backend = self.run_server(
+            [
+                reset,
+                '{"v":1,"op":"prime_low_state","request_id":"g1"}',
+                '{"v":1,"op":"snapshot","request_id":"g2"}',
+                '{"v":1,"op":"low_command","request_id":"g3"}',
+                '{"v":1,"op":"low_command","request_id":"g4","extra":0}',
+                '{"v":1,"op":"prime_low_state","request_id":"g5","extra":0}',
+                '{"v":1,"op":"close","request_id":"g6"}',
+            ]
+        )
+
+        self.assertTrue(responses[1]["ok"])
+        self.assertEqual(
+            responses[1]["data"],
+            {
+                "published": True,
+                "steps": 0,
+                "sim_time_s": 0.0,
+                "state_rows": 0,
+                "contact_rows": 0,
+            },
+        )
+        self.assertEqual(
+            responses[2]["data"],
+            {
+                "steps": 0,
+                "sim_time_s": 0.0,
+                "state_rows": 0,
+                "contact_rows": 0,
+            },
+        )
+        self.assertEqual(
+            responses[3]["data"],
+            {"received": False, "q_target": None},
+        )
+        self.assertFalse(responses[4]["ok"])
+        self.assertIn("keys differ", responses[4]["error"]["message"])
+        self.assertFalse(responses[5]["ok"])
+        self.assertIn("keys differ", responses[5]["error"]["message"])
+        self.assertEqual(backend.prime_calls, 1)
+        self.assertEqual(backend.step_calls, 0)
+
     def test_reset_request_echoes_band_boolean_and_rejects_nonboolean(self):
         def reset_request(band):
             return json.dumps(
@@ -745,6 +875,59 @@ class ExternalGearBackendBoundaryTests(unittest.TestCase):
             backend.step()
 
         sleep.assert_not_called()
+
+    def test_prime_low_state_clears_receipt_and_publishes_without_step(self):
+        events = []
+        obs = {"time": 0.0}
+        qpos = np.array([0.0, 0.0, 0.8, 1.0, 0.0, 0.0, 0.0])
+        bridge = SimpleNamespace(
+            reset=lambda: events.append("receipt-reset"),
+            PublishLowState=lambda value: events.append(("publish", value)),
+        )
+        sim_env = SimpleNamespace(
+            mj_data=SimpleNamespace(time=0.0, qpos=qpos.copy()),
+            unitree_bridge=bridge,
+            prepare_obs=lambda: events.append("prepare") or obs,
+            sim_step=lambda: events.append("step"),
+        )
+        backend = ExternalGearBackend.__new__(ExternalGearBackend)
+        backend._simulator = SimpleNamespace(sim_dt=0.005, sim_env=sim_env)
+
+        backend.prime_low_state()
+
+        self.assertEqual(
+            events,
+            ["receipt-reset", "prepare", ("publish", obs)],
+        )
+        self.assertIs(sim_env.obs, obs)
+        self.assertEqual(sim_env.mj_data.time, 0.0)
+        np.testing.assert_array_equal(sim_env.mj_data.qpos, qpos)
+
+    def test_low_command_snapshot_copies_exact_receiver_target(self):
+        target = np.linspace(-0.5, 0.5, 29, dtype=np.float32)
+        bridge = SimpleNamespace(
+            low_cmd_lock=threading.Lock(),
+            low_cmd_received=False,
+            num_body_motor=29,
+            low_cmd=SimpleNamespace(
+                motor_cmd=[SimpleNamespace(q=float(value)) for value in target]
+            ),
+        )
+        backend = ExternalGearBackend.__new__(ExternalGearBackend)
+        backend._simulator = SimpleNamespace(
+            sim_env=SimpleNamespace(unitree_bridge=bridge)
+        )
+
+        self.assertEqual(
+            backend.low_command_snapshot(),
+            {"received": False, "q_target": None},
+        )
+        bridge.low_cmd_received = True
+        received = backend.low_command_snapshot()
+        bridge.low_cmd.motor_cmd[0].q = 99.0
+
+        self.assertIs(received["received"], True)
+        np.testing.assert_array_equal(received["q_target"], target)
 
     def test_contact_samples_retain_authoritative_geom_ids(self):
         class FakeMujoco:

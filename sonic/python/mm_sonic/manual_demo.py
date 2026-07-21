@@ -374,6 +374,13 @@ def _activate_scored_control(
         f"index={ready['index']} policy_time={ready['time_ms']:.3f}ms",
         flush=True,
     )
+    received = gear.wait_for_received_policy_command(simulator)
+    print(
+        "SONIC policy command received: "
+        f"index={received['index']} "
+        f"policy_time={received['time_ms']:.3f}ms",
+        flush=True,
+    )
     gate = SimulationPolicyGate(gear, simulator)
     gate.pause()
     return gate

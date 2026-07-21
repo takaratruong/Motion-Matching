@@ -14,6 +14,7 @@ import numpy as np
 
 from mm_sonic.commands import CommandSample
 from mm_sonic.coordinator import SessionConfig
+from mm_sonic.gear_action import policy_action_to_lowcmd_target
 from mm_sonic.process import (
     AdvanceResult,
     ChildProcessDied,
@@ -504,6 +505,19 @@ class GatedSimulatorClientTests(TemporaryScriptCase):
                         "state_rows": steps // 4,
                         "contact_rows": steps,
                     }
+                elif op == "prime_low_state":
+                    data = {
+                        "published": True,
+                        "steps": 0,
+                        "sim_time_s": 0.0,
+                        "state_rows": 0,
+                        "contact_rows": 0,
+                    }
+                elif op == "low_command":
+                    data = {
+                        "received": True,
+                        "q_target": [index / 10.0 for index in range(29)],
+                    }
                 elif op == "snapshot":
                     data = {
                         "steps": 80,
@@ -541,6 +555,24 @@ class GatedSimulatorClientTests(TemporaryScriptCase):
             self.assertEqual(reset["nq"], 36)
             self.assertIs(reset["elastic_band_enabled"], False)
             self.assertEqual(client.sim_dt, reset["sim_dt_s"])
+            self.assertEqual(
+                client.prime_low_state(),
+                {
+                    "published": True,
+                    "steps": 0,
+                    "sim_time_s": 0.0,
+                    "state_rows": 0,
+                    "contact_rows": 0,
+                },
+            )
+            low_command = client.low_command_snapshot()
+            self.assertIs(low_command["received"], True)
+            self.assertEqual(
+                low_command["q_target"],
+                tuple(index / 10.0 for index in range(29)),
+            )
+            with self.assertRaises(TypeError):
+                low_command["received"] = False
             result = client.advance(80)
             self.assertEqual(
                 result,
@@ -2287,6 +2319,158 @@ class GearProcessTests(TemporaryScriptCase):
         finally:
             gear.close()
 
+    def test_policy_action_snapshot_returns_all_complete_contiguous_rows(self):
+        child = self.script("unused_action_snapshot.py", "raise SystemExit(0)\n")
+        gear = self.gear(child)
+        header = [
+            "index",
+            "time_ms",
+            "time_realtime_ms",
+            "time_monotonic_ms",
+            "ros_timestamp",
+            *[f"act_{index}" for index in range(29)],
+        ]
+        rows = [
+            ["0", "0", "1", "2", "0", *(["0"] * 29)],
+            ["1", "20", "21", "22", "0", *(["0.25"] * 29)],
+            ["2", "40", "41", "42", "0", *(["-0.5"] * 29)],
+        ]
+        try:
+            (gear.logs_dir / "action.csv").write_text(
+                ",".join(header)
+                + "\n"
+                + "\n".join(",".join(row) for row in rows)
+                + "\npartial",
+                encoding="ascii",
+            )
+
+            actions = gear._read_policy_actions()
+
+            self.assertEqual(tuple(row["index"] for row in actions), (1, 2))
+            self.assertEqual(actions[0]["action"], (0.25,) * 29)
+            self.assertEqual(actions[1]["action"], (-0.5,) * 29)
+            with self.assertRaises(TypeError):
+                actions[0]["index"] = 9
+        finally:
+            gear.close()
+
+    def test_received_policy_command_wait_matches_held_lowcmd_to_later_row(self):
+        child = self.script("unused_received_command.py", "raise SystemExit(0)\n")
+        gear = self.gear(
+            child,
+            readiness_timeout_s=0.1,
+            readiness_poll_s=0.001,
+        )
+        first = {
+            "index": 1,
+            "time_ms": 20.0,
+            "time_monotonic_ms": 22.0,
+            "action": (0.25,) * 29,
+        }
+        second = {
+            "index": 2,
+            "time_ms": 40.0,
+            "time_monotonic_ms": 42.0,
+            "action": (-0.5,) * 29,
+        }
+        received_target = policy_action_to_lowcmd_target(second["action"])
+
+        class Simulator:
+            def require_alive(self):
+                return None
+
+            def low_command_snapshot(self):
+                return {"received": True, "q_target": received_target}
+
+        gear._control_active = True
+        try:
+            with (
+                patch.object(gear, "group_is_resumed", return_value=True),
+                patch.object(gear, "require_alive", return_value=None),
+                patch.object(
+                    gear,
+                    "_read_policy_actions",
+                    side_effect=((first,), (first, second)),
+                ),
+            ):
+                receipt = gear.wait_for_received_policy_command(Simulator())
+
+            self.assertEqual(receipt["index"], 2)
+            self.assertEqual(receipt["time_ms"], 40.0)
+            self.assertEqual(receipt["q_target"], received_target)
+            with self.assertRaises(TypeError):
+                receipt["index"] = 3
+        finally:
+            gear.close()
+
+    def test_received_policy_command_mismatch_times_out_without_readiness(self):
+        child = self.script("unused_mismatched_command.py", "raise SystemExit(0)\n")
+        gear = self.gear(
+            child,
+            readiness_timeout_s=0.01,
+            readiness_poll_s=0.001,
+        )
+        action = {
+            "index": 1,
+            "time_ms": 20.0,
+            "time_monotonic_ms": 22.0,
+            "action": (0.25,) * 29,
+        }
+        wrong_target = policy_action_to_lowcmd_target((-0.5,) * 29)
+
+        class Simulator:
+            @staticmethod
+            def require_alive():
+                return None
+
+            @staticmethod
+            def low_command_snapshot():
+                return {"received": True, "q_target": wrong_target}
+
+        gear._control_active = True
+        try:
+            with (
+                patch.object(gear, "group_is_resumed", return_value=True),
+                patch.object(gear, "require_alive", return_value=None),
+                patch.object(gear, "_read_policy_actions", return_value=(action,)),
+            ):
+                with self.assertRaisesRegex(ProcessError, "timed out.*received"):
+                    gear.wait_for_received_policy_command(Simulator())
+        finally:
+            gear.close()
+
+    def test_received_policy_command_wait_honors_operator_cancellation(self):
+        child = self.script("unused_cancelled_command.py", "raise SystemExit(0)\n")
+        cancelled = threading.Event()
+        gear = self.gear(
+            child,
+            cancelled=cancelled.is_set,
+            readiness_timeout_s=0.5,
+            readiness_poll_s=0.001,
+        )
+
+        class Simulator:
+            @staticmethod
+            def require_alive():
+                return None
+
+            @staticmethod
+            def low_command_snapshot():
+                return {"received": False, "q_target": None}
+
+        gear._control_active = True
+        cancelled.set()
+        try:
+            with (
+                patch.object(gear, "group_is_resumed", return_value=True),
+                patch.object(gear, "require_alive", return_value=None),
+                patch.object(gear, "_read_policy_actions", return_value=()),
+            ):
+                with self.assertRaisesRegex(OperatorCancelled, "received policy"):
+                    gear.wait_for_received_policy_command(Simulator())
+        finally:
+            gear.close()
+
     def test_first_policy_action_rejects_wrong_policy_index(self):
         child = self.script("unused_action_index.py", "raise SystemExit(0)\n")
         gear = self.gear(child)
@@ -2429,6 +2613,40 @@ class GearProcessTests(TemporaryScriptCase):
         try:
             gear.start()
             with self.assertRaisesRegex(ProcessError, "timed out"):
+                gear.wait_for_first_policy_action()
+        finally:
+            gear.close()
+
+    def test_first_policy_action_wait_honors_operator_cancellation(self):
+        child = self.script(
+            "first_action_cancelled.py",
+            r'''
+            import os
+            import termios
+
+            attrs = termios.tcgetattr(0)
+            attrs[3] &= ~(termios.ICANON | termios.ECHO)
+            termios.tcsetattr(0, termios.TCSANOW, attrs)
+            print("BOOT READY", flush=True)
+            assert os.read(0, 1) == b"]"
+            print("CONTROL READY", flush=True)
+            assert os.read(0, 1) == b"\n"
+            print("STREAM READY", flush=True)
+            while os.read(0, 1).lower() != b"o":
+                pass
+            ''',
+        )
+        cancelled = threading.Event()
+        gear = self.gear(
+            child,
+            cancelled=cancelled.is_set,
+            readiness_timeout_s=0.5,
+            readiness_poll_s=0.005,
+        )
+        try:
+            gear.start()
+            cancelled.set()
+            with self.assertRaisesRegex(OperatorCancelled, "first policy action"):
                 gear.wait_for_first_policy_action()
         finally:
             gear.close()

@@ -29,6 +29,7 @@ from typing import Callable, Mapping, Sequence
 
 import numpy as np
 
+from .gear_action import policy_action_to_lowcmd_target
 from .joints import ContractError
 from .transform import mujoco_to_holden_quaternions, mujoco_to_holden_vectors
 
@@ -1813,6 +1814,73 @@ class GatedSimulatorClient:
             )
         return result
 
+    def prime_low_state(self) -> dict[str, object]:
+        """Publish reset LowState without advancing simulator physics or time."""
+
+        if self._sim_dt_s is None:
+            raise ProcessError(
+                "gated simulator reset is required before LowState prime"
+            )
+        data = _exact_object(
+            self._request("prime_low_state"),
+            {"published", "steps", "sim_time_s", "state_rows", "contact_rows"},
+            "prime_low_state data",
+        )
+        if data["published"] is not True:
+            raise ProcessProtocolError(
+                "prime_low_state data.published must be true"
+            )
+        result = {
+            "published": True,
+            "steps": _nonnegative_integer(
+                data["steps"], "prime_low_state data.steps"
+            ),
+            "sim_time_s": _finite_number(
+                data["sim_time_s"], "prime_low_state data.sim_time_s"
+            ),
+            "state_rows": _nonnegative_integer(
+                data["state_rows"], "prime_low_state data.state_rows"
+            ),
+            "contact_rows": _nonnegative_integer(
+                data["contact_rows"], "prime_low_state data.contact_rows"
+            ),
+        }
+        if result["steps"] != 0 or result["state_rows"] != 0 or result["contact_rows"] != 0:
+            raise ProcessProtocolError(
+                "LowState prime must precede all scored evidence rows"
+            )
+        return result
+
+    def low_command_snapshot(self) -> Mapping[str, object]:
+        """Return an immutable copy of the simulator receiver's latest LowCmd."""
+
+        data = _exact_object(
+            self._request("low_command"),
+            {"received", "q_target"},
+            "low_command data",
+        )
+        received = data["received"]
+        if type(received) is not bool:
+            raise ProcessProtocolError(
+                "low_command data.received must be a boolean"
+            )
+        if not received:
+            if data["q_target"] is not None:
+                raise ProcessProtocolError(
+                    "absent low_command data.q_target must be null"
+                )
+            return MappingProxyType({"received": False, "q_target": None})
+        target_source = data["q_target"]
+        if type(target_source) is not list or len(target_source) != 29:
+            raise ProcessProtocolError(
+                "low_command data.q_target must contain 29 values"
+            )
+        target = tuple(
+            _finite_number(value, f"low_command data.q_target[{index}]")
+            for index, value in enumerate(target_source)
+        )
+        return MappingProxyType({"received": True, "q_target": target})
+
     def snapshot(self) -> dict[str, object]:
         data = _exact_object(
             self._request("snapshot"),
@@ -2582,7 +2650,7 @@ class GearProcess:
         self._control_active = True
         self._ready = True
 
-    def _read_first_policy_action(self) -> Mapping[str, object] | None:
+    def _read_policy_actions(self) -> tuple[Mapping[str, object], ...]:
         owned = self._owned_logs_directory
         if owned is None:
             raise ProcessError("GEAR logs directory is unavailable")
@@ -2593,13 +2661,21 @@ class GearProcess:
                 dir_fd=owned.leaf_fd,
             )
         except FileNotFoundError:
-            return None
+            return ()
         except OSError as error:
             raise ProcessError("cannot open GEAR action log") from error
         try:
             try:
                 mode = os.fstat(descriptor).st_mode
-                raw = os.read(descriptor, 65536)
+                chunks: list[bytes] = []
+                remaining = 4 * 1024 * 1024 + 1
+                while remaining > 0:
+                    chunk = os.read(descriptor, min(65536, remaining))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                raw = b"".join(chunks)
             except OSError as error:
                 raise ProcessError("cannot read GEAR action log") from error
             if not stat.S_ISREG(mode):
@@ -2607,21 +2683,31 @@ class GearProcess:
         finally:
             os.close(descriptor)
 
-        if raw.count(b"\n") < 3:
-            return None
-        first_three = raw.splitlines()[:3]
+        if len(raw) > 4 * 1024 * 1024:
+            raise ProcessError("GEAR action log exceeds the startup read bound")
+        complete_lines = raw.split(b"\n")[:-1]
+        if not complete_lines:
+            return ()
         try:
-            rows = [line.decode("ascii").split(",") for line in first_three]
+            rows = [
+                line.decode("ascii").split(",") for line in complete_lines
+            ]
         except UnicodeDecodeError as error:
             raise ProcessError("GEAR action log must be ASCII CSV") from error
         if tuple(rows[0]) != _GEAR_ACTION_HEADER:
             raise ProcessError("GEAR action log exact header changed")
+        if len(rows) < 2:
+            return ()
         width = len(_GEAR_ACTION_HEADER)
         numeric_rows: list[list[float]] = []
         for expected_index, row in enumerate(rows[1:]):
             if len(row) != width or row[0] != str(expected_index):
+                if expected_index <= 1:
+                    raise ProcessError(
+                        "GEAR action log first indices must be exact 0 then 1"
+                    )
                 raise ProcessError(
-                    "GEAR action log first indices must be exact 0 then 1"
+                    "GEAR action log indices must be contiguous from 0"
                 )
             try:
                 numeric_rows.append([float(value) for value in row])
@@ -2633,15 +2719,21 @@ class GearProcess:
                 raise ProcessError(
                     "GEAR action log contains a non-finite value"
                 )
-        policy = numeric_rows[1]
-        return MappingProxyType(
-            {
-                "index": 1,
-                "time_ms": policy[1],
-                "time_monotonic_ms": policy[3],
-                "action": tuple(policy[5:]),
-            }
+        return tuple(
+            MappingProxyType(
+                {
+                    "index": index,
+                    "time_ms": policy[1],
+                    "time_monotonic_ms": policy[3],
+                    "action": tuple(policy[5:]),
+                }
+            )
+            for index, policy in enumerate(numeric_rows[1:], start=1)
         )
+
+    def _read_first_policy_action(self) -> Mapping[str, object] | None:
+        actions = self._read_policy_actions()
+        return None if not actions else actions[0]
 
     def wait_for_first_policy_action(self) -> Mapping[str, object]:
         """Wait until active GEAR control publishes its first policy action."""
@@ -2660,9 +2752,85 @@ class GearProcess:
             evidence = self._read_first_policy_action()
             if evidence is not None:
                 return evidence
+            if _cancelled(self._cancelled):
+                raise OperatorCancelled(
+                    "operator cancelled first policy action wait"
+                )
             if deadline is not None and time.monotonic() >= deadline:
                 raise ProcessError(
                     "timed out waiting for first GEAR policy action"
+                )
+            wait = self._readiness_poll_s
+            if deadline is not None:
+                wait = min(wait, max(0.0, deadline - time.monotonic()))
+            time.sleep(wait)
+
+    def wait_for_received_policy_command(
+        self, simulator: object
+    ) -> Mapping[str, object]:
+        """Fence startup on policy output received at the simulator LowCmd DDS."""
+
+        if not self._control_active or not self.group_is_resumed():
+            raise ProcessError(
+                "received policy command requires resumed active GEAR control"
+            )
+        deadline = (
+            None
+            if self._readiness_timeout_s is None
+            else time.monotonic() + self._readiness_timeout_s
+        )
+        held_targets: list[tuple[float, ...]] = []
+        held_set: set[tuple[float, ...]] = set()
+        while True:
+            self.require_alive()
+            simulator.require_alive()
+            snapshot = simulator.low_command_snapshot()
+            if not isinstance(snapshot, Mapping):
+                raise ProcessError("simulator LowCmd snapshot must be a mapping")
+            if snapshot.get("received") is True:
+                source = snapshot.get("q_target")
+                if not isinstance(source, (tuple, list)) or len(source) != 29:
+                    raise ProcessError(
+                        "received simulator LowCmd must contain 29 targets"
+                    )
+                target = tuple(float(value) for value in source)
+                if not all(math.isfinite(value) for value in target):
+                    raise ProcessError(
+                        "received simulator LowCmd contains a non-finite target"
+                    )
+                if target not in held_set:
+                    if len(held_targets) >= 16384:
+                        raise ProcessError(
+                            "too many unmatched simulator LowCmd targets"
+                        )
+                    held_targets.append(target)
+                    held_set.add(target)
+            elif snapshot.get("received") is not False:
+                raise ProcessError(
+                    "simulator LowCmd receipt flag must be boolean"
+                )
+
+            for action in self._read_policy_actions():
+                expected = policy_action_to_lowcmd_target(action["action"])
+                if expected in held_set:
+                    return MappingProxyType(
+                        {
+                            "index": action["index"],
+                            "time_ms": action["time_ms"],
+                            "time_monotonic_ms": action[
+                                "time_monotonic_ms"
+                            ],
+                            "action": action["action"],
+                            "q_target": expected,
+                        }
+                    )
+            if _cancelled(self._cancelled):
+                raise OperatorCancelled(
+                    "operator cancelled received policy command wait"
+                )
+            if deadline is not None and time.monotonic() >= deadline:
+                raise ProcessError(
+                    "timed out waiting for received GEAR policy command"
                 )
             wait = self._readiness_poll_s
             if deadline is not None:

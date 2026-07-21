@@ -3086,7 +3086,7 @@ def _reset_and_prime_scored_epoch(
     initial_qpos: np.ndarray,
     log_dir: Path,
 ) -> Mapping[str, object]:
-    """Reset registered physics and publish one fresh LowState while GEAR stops."""
+    """Reset scored physics and publish fresh LowState without `mj_step`."""
 
     if (
         not bool(getattr(gear, "wait_for_control_ready", False))
@@ -3105,19 +3105,29 @@ def _reset_and_prime_scored_epoch(
         log_dir=log_dir,
         elastic_band_enabled=False,
     )
-    prime = simulator.advance(1)
-    if getattr(prime, "steps", None) != 1:
-        raise ContractError("fresh LowState prime did not advance one exact step")
+    prime = simulator.prime_low_state()
+    if not isinstance(prime, Mapping):
+        raise ContractError("fresh LowState prime evidence is unavailable")
+    required = {"published", "steps", "sim_time_s", "state_rows", "contact_rows"}
+    if set(prime) != required:
+        raise ContractError("fresh LowState prime evidence shape changed")
+    reset_time = reset.get("sim_time_s")
+    if (
+        prime.get("published") is not True
+        or prime.get("steps") != 0
+        or prime.get("state_rows") != 0
+        or prime.get("contact_rows") != 0
+        or type(prime.get("sim_time_s")) not in (int, float)
+        or not math.isfinite(float(prime["sim_time_s"]))
+        or type(reset_time) not in (int, float)
+        or not math.isfinite(float(reset_time))
+        or abs(float(prime["sim_time_s"]) - float(reset_time)) > 1.0e-12
+    ):
+        raise ContractError("fresh LowState prime advanced scored physics")
     return MappingProxyType(
         {
             "reset": dict(reset),
-            "prime": {
-                "steps": prime.steps,
-                "sim_time_start_s": prime.sim_time_start_s,
-                "sim_time_end_s": prime.sim_time_end_s,
-                "state_rows": prime.state_rows,
-                "contact_rows": prime.contact_rows,
-            },
+            "prime": dict(prime),
         }
     )
 
@@ -3441,24 +3451,26 @@ def _execute_known_good_scoring_epoch(
         prime_record = prime.get("prime")
         if not isinstance(prime_record, Mapping):
             raise ContractError("fresh LowState prime evidence is unavailable")
+        prime_published = prime_record.get("published")
         prime_steps = prime_record.get("steps")
-        prime_end = prime_record.get("sim_time_end_s")
+        prime_time = prime_record.get("sim_time_s")
         prime_state_rows = prime_record.get("state_rows")
         prime_contact_rows = prime_record.get("contact_rows")
         if (
-            type(prime_steps) is not int
-            or prime_steps != 1
-            or type(prime_end) not in (int, float)
-            or not math.isfinite(float(prime_end))
+            prime_published is not True
+            or type(prime_steps) is not int
+            or prime_steps != 0
+            or type(prime_time) not in (int, float)
+            or not math.isfinite(float(prime_time))
             or type(prime_state_rows) is not int
             or prime_state_rows < 0
             or type(prime_contact_rows) is not int
             or prime_contact_rows < 0
             or coverage.simulator_steps
-            != prime_steps + coverage.control_drive_steps
+            != coverage.control_drive_steps
             or abs(
                 coverage.simulator_duration_s
-                - (float(prime_end) + coverage.control_drive_duration_s)
+                - (float(prime_time) + coverage.control_drive_duration_s)
             )
             > 1.0e-9
             or coverage.state_rows < prime_state_rows
@@ -5628,7 +5640,7 @@ class DefaultStageAOperations:
                 },
                 "fresh_low_state_prime": dict(execution.prime),
                 "scored_physics": {
-                    "prime_steps": 1,
+                    "prime_steps": execution.prime["prime"]["steps"],
                     "control_drive_steps": (
                         execution.coverage.control_drive_steps
                     ),
@@ -5646,7 +5658,7 @@ class DefaultStageAOperations:
                     "wall_duration_s": execution.coverage.wall_duration_s,
                     "prime_scope": "pre-CONTROL-fresh-LowState",
                     "control_drive_scope": "CONTROL-active-cadence-only",
-                    "log_row_scope": "total-scored-epoch-including-prime",
+                    "log_row_scope": "total-scored-control-epoch",
                 },
                 "target_log_audit": dict(execution.target_audit),
                 "state_target_pairing": {
@@ -5983,7 +5995,7 @@ class DefaultStageAOperations:
                 },
                 "fresh_low_state_prime": dict(execution.prime),
                 "scored_physics": {
-                    "prime_steps": 1,
+                    "prime_steps": execution.prime["prime"]["steps"],
                     "control_drive_steps": (
                         execution.coverage.control_drive_steps
                     ),
@@ -6001,7 +6013,7 @@ class DefaultStageAOperations:
                     "wall_duration_s": execution.coverage.wall_duration_s,
                     "prime_scope": "pre-CONTROL-fresh-LowState",
                     "control_drive_scope": "CONTROL-active-cadence-only",
-                    "log_row_scope": "total-scored-epoch-including-prime",
+                    "log_row_scope": "total-scored-control-epoch",
                 },
                 "delivery_audit": {
                     **dict(stored_audit),

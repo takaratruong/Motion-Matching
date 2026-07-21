@@ -1117,6 +1117,16 @@ class ScoredEpochTests(TemporaryCase):
             self.events.append(f"advance-{steps}")
             return AdvanceResult(steps, 0.0, steps * self.sim_dt, steps, steps)
 
+        def prime_low_state(self):
+            self.events.append("prime-low-state")
+            return {
+                "published": True,
+                "steps": 0,
+                "sim_time_s": 0.0,
+                "state_rows": 0,
+                "contact_rows": 0,
+            }
+
         def close(self) -> None:
             self.events.append("close")
             self.closed = True
@@ -1210,10 +1220,10 @@ class ScoredEpochTests(TemporaryCase):
                 target_rows=441,
                 control_drive_steps=2200,
                 control_drive_duration_s=4.4,
-                simulator_steps=2201,
-                simulator_duration_s=4.402,
+                simulator_steps=2200,
+                simulator_duration_s=4.4,
                 state_rows=220,
-                contact_rows=2201,
+                contact_rows=2200,
                 wall_duration_s=8.9,
                 target_device=1,
                 target_inode=2,
@@ -1375,9 +1385,15 @@ class ScoredEpochTests(TemporaryCase):
                 self.calls.append(("reset", kwargs))
                 return {"nq": 36, "sim_dt_s": 0.002, "sim_time_s": 0.0}
 
-            def advance(self, steps):
-                self.calls.append(("advance", steps))
-                return AdvanceResult(steps, 0.0, steps * 0.002, 0, steps)
+            def prime_low_state(self):
+                self.calls.append(("prime_low_state", None))
+                return {
+                    "published": True,
+                    "steps": 0,
+                    "sim_time_s": 0.0,
+                    "state_rows": 0,
+                    "contact_rows": 0,
+                }
 
         simulator = Simulator()
         with self.assertRaisesRegex(ContractError, "stopped.*WAIT"):
@@ -1412,9 +1428,15 @@ class ScoredEpochTests(TemporaryCase):
                     "elastic_band_enabled": elastic_band_enabled,
                 }
 
-            def advance(self, steps):
-                self.calls.append(("advance", steps))
-                return AdvanceResult(steps, 0.0, steps * 0.002, 0, steps)
+            def prime_low_state(self):
+                self.calls.append(("prime_low_state", None))
+                return {
+                    "published": True,
+                    "steps": 0,
+                    "sim_time_s": 0.0,
+                    "state_rows": 0,
+                    "contact_rows": 0,
+                }
 
         simulator = Simulator()
         prime = cli_module._reset_and_prime_scored_epoch(
@@ -1425,9 +1447,19 @@ class ScoredEpochTests(TemporaryCase):
             log_dir=self.root / "scored",
         )
         self.assertEqual(
-            simulator.calls, [("reset", False), ("advance", 1)]
+            simulator.calls, [("reset", False), ("prime_low_state", None)]
         )
         self.assertIs(prime["reset"]["elastic_band_enabled"], False)
+        self.assertEqual(
+            prime["prime"],
+            {
+                "published": True,
+                "steps": 0,
+                "sim_time_s": 0.0,
+                "state_rows": 0,
+                "contact_rows": 0,
+            },
+        )
 
 
 def write_gear_logs(

@@ -70,6 +70,12 @@ class SimulatorBackend(Protocol):
     def step(self) -> None:
         raise NotImplementedError
 
+    def prime_low_state(self) -> None:
+        raise NotImplementedError
+
+    def low_command_snapshot(self) -> Mapping[str, object]:
+        raise NotImplementedError
+
     def sample(self) -> Mapping[str, object]:
         raise NotImplementedError
 
@@ -524,6 +530,48 @@ class GatedSimulatorRunner:
             contact_rows=self._contact_rows - contact_start,
         )
 
+    def prime_low_state(self) -> dict[str, object]:
+        """Publish the reset observation without integrating scored physics."""
+
+        backend = self.backend
+        before = self.snapshot()
+        backend.prime_low_state()
+        after = self.snapshot()
+        if after != before:
+            raise ProtocolError(
+                "LowState prime changed simulator time or evidence counters"
+            )
+        return {"published": True, **after}
+
+    def low_command_snapshot(self) -> dict[str, object]:
+        """Copy the latest body LowCmd received by the simulator bridge."""
+
+        source = self.backend.low_command_snapshot()
+        if not isinstance(source, Mapping) or set(source) != {
+            "received",
+            "q_target",
+        }:
+            raise ProtocolError("backend LowCmd snapshot shape changed")
+        received = source["received"]
+        if type(received) is not bool:
+            raise ProtocolError("backend LowCmd received flag must be boolean")
+        if not received:
+            if source["q_target"] is not None:
+                raise ProtocolError("absent backend LowCmd must have null target")
+            return {"received": False, "q_target": None}
+        try:
+            target = np.asarray(source["q_target"], dtype=np.float64)
+        except (TypeError, ValueError) as error:
+            raise ProtocolError("backend LowCmd target must be numeric") from error
+        if target.shape != (29,) or not np.all(np.isfinite(target)):
+            raise ProtocolError(
+                "backend LowCmd target must contain 29 finite values"
+            )
+        return {
+            "received": True,
+            "q_target": tuple(float(value) for value in target),
+        }
+
     def snapshot(self) -> dict[str, object]:
         backend = self.backend
         return {
@@ -699,6 +747,20 @@ def _handle_request(
             "state_rows": result.state_rows,
             "contact_rows": result.contact_rows,
         }
+    if op == "prime_low_state":
+        _exact_request(
+            source,
+            {"v", "op", "request_id"},
+            "prime_low_state request",
+        )
+        return op, request_id, runner.prime_low_state()
+    if op == "low_command":
+        _exact_request(
+            source,
+            {"v", "op", "request_id"},
+            "low_command request",
+        )
+        return op, request_id, runner.low_command_snapshot()
     if op == "camera":
         _exact_request(
             source,
@@ -1139,6 +1201,53 @@ class ExternalGearBackend:
             file=sys.stderr,
             flush=True,
         )
+
+    def prime_low_state(self) -> None:
+        """Clear bootstrap receipts and publish reset state without `mj_step`."""
+
+        with redirect_stdout(sys.stderr):
+            sim_env = self._simulator.sim_env
+            try:
+                sim_env.unitree_bridge.reset()
+                sim_env.obs = sim_env.prepare_obs()
+                sim_env.unitree_bridge.PublishLowState(sim_env.obs)
+            except (AttributeError, TypeError, ValueError) as error:
+                raise ProtocolError(
+                    "simulator cannot publish a no-step LowState prime"
+                ) from error
+
+    def low_command_snapshot(self) -> Mapping[str, object]:
+        bridge = self._simulator.sim_env.unitree_bridge
+        try:
+            lock = bridge.low_cmd_lock
+            with lock:
+                received = bridge.low_cmd_received
+                count = bridge.num_body_motor
+                if type(received) is not bool:
+                    raise ProtocolError(
+                        "simulator LowCmd receipt flag must be boolean"
+                    )
+                if not received:
+                    return {"received": False, "q_target": None}
+                if type(count) is not int or count != 29:
+                    raise ProtocolError(
+                        "simulator LowCmd motor count must equal 29"
+                    )
+                target = np.asarray(
+                    [bridge.low_cmd.motor_cmd[index].q for index in range(count)],
+                    dtype=np.float64,
+                )
+        except ProtocolError:
+            raise
+        except (AttributeError, IndexError, TypeError, ValueError) as error:
+            raise ProtocolError(
+                "simulator cannot snapshot received LowCmd"
+            ) from error
+        if target.shape != (29,) or not np.all(np.isfinite(target)):
+            raise ProtocolError(
+                "simulator received LowCmd must contain 29 finite targets"
+            )
+        return {"received": True, "q_target": target.copy()}
 
     def _frozen_step(self) -> None:
         # Diagnostic-only frozen service: keep GEAR connected and advance the

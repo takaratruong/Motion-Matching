@@ -463,9 +463,10 @@ class StartupTransactionTests(unittest.TestCase):
 
 class ScoredControlStartupTests(unittest.TestCase):
     class _Gear:
-        def __init__(self, calls, *, barrier_error=None):
+        def __init__(self, calls, *, barrier_error=None, receipt_error=None):
             self.calls = calls
             self.barrier_error = barrier_error
+            self.receipt_error = receipt_error
             self.stopped = True
 
         def continue_group(self):
@@ -484,6 +485,18 @@ class ScoredControlStartupTests(unittest.TestCase):
                 "time_ms": 20.0,
                 "time_monotonic_ms": 22.0,
                 "action": (0.25,) * 29,
+            }
+
+        def wait_for_received_policy_command(self, simulator):
+            self.calls.append("gear.wait_for_received_policy_command")
+            if self.receipt_error is not None:
+                raise self.receipt_error
+            return {
+                "index": 2,
+                "time_ms": 40.0,
+                "time_monotonic_ms": 42.0,
+                "action": (-0.5,) * 29,
+                "q_target": tuple(index / 10.0 for index in range(29)),
             }
 
         def stop_group(self):
@@ -530,6 +543,7 @@ class ScoredControlStartupTests(unittest.TestCase):
                 "gear.continue_group",
                 "gear.activate_control",
                 "gear.wait_for_first_policy_action",
+                "gear.wait_for_received_policy_command",
                 "gear.stop_group",
                 "simulator.require_alive",
             ],
@@ -538,7 +552,8 @@ class ScoredControlStartupTests(unittest.TestCase):
         self.assertEqual(simulator.advance_calls, 0)
         self.assertEqual(
             output.getvalue(),
-            "SONIC first action ready: index=1 policy_time=20.000ms\n",
+            "SONIC first action ready: index=1 policy_time=20.000ms\n"
+            "SONIC policy command received: index=2 policy_time=40.000ms\n",
         )
 
     def test_barrier_failure_does_not_pause_gate_or_advance_physics(self):
@@ -555,6 +570,28 @@ class ScoredControlStartupTests(unittest.TestCase):
                 "gear.continue_group",
                 "gear.activate_control",
                 "gear.wait_for_first_policy_action",
+            ],
+        )
+        self.assertEqual(simulator.advance_calls, 0)
+
+    def test_receiver_failure_does_not_pause_gate_or_advance_physics(self):
+        calls = []
+        gear = self._Gear(
+            calls,
+            receipt_error=ProcessError("no received policy command"),
+        )
+        simulator = self._Simulator(calls)
+
+        with self.assertRaisesRegex(ProcessError, "no received"):
+            _activate_scored_control(gear, simulator)
+
+        self.assertEqual(
+            calls,
+            [
+                "gear.continue_group",
+                "gear.activate_control",
+                "gear.wait_for_first_policy_action",
+                "gear.wait_for_received_policy_command",
             ],
         )
         self.assertEqual(simulator.advance_calls, 0)
