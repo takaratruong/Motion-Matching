@@ -57,6 +57,10 @@ class SimulatorBackend(Protocol):
     def sim_dt(self) -> float:
         raise NotImplementedError
 
+    @property
+    def wall_clock_pacing(self) -> bool:
+        raise NotImplementedError
+
     def reset_from_qpos(
         self,
         qpos: np.ndarray,
@@ -430,6 +434,8 @@ class GatedSimulatorRunner:
             sim_dt = _finite_number(backend.sim_dt, "backend.sim_dt")
             if sim_dt <= 0.0:
                 raise ProtocolError("backend.sim_dt must be positive")
+            if type(backend.wall_clock_pacing) is not bool:
+                raise ProtocolError("backend.wall_clock_pacing must be boolean")
             ratio = _STATE_PERIOD_S / sim_dt
             stride = round(ratio)
             if stride <= 0 or abs(ratio - stride) > _EXACT_TOLERANCE:
@@ -478,6 +484,7 @@ class GatedSimulatorRunner:
         assert self._state_file is not None
         assert self._contact_file is not None
         start = _finite_number(backend.data.time, "backend.data.time")
+        wall_deadline = time.monotonic()
         state_start = self._state_rows
         contact_start = self._contact_rows
         for _ in range(steps):
@@ -513,6 +520,11 @@ class GatedSimulatorRunner:
                     + "\n"
                 )
                 self._state_rows += 1
+            if backend.wall_clock_pacing:
+                wall_deadline += float(backend.sim_dt)
+                remaining = wall_deadline - time.monotonic()
+                if remaining > 0.0:
+                    time.sleep(remaining)
         self._state_file.flush()
         self._contact_file.flush()
         end = _finite_number(backend.data.time, "backend.data.time")
@@ -1109,6 +1121,10 @@ class ExternalGearBackend:
     def sim_dt(self) -> float:
         return float(self._simulator.sim_dt)
 
+    @property
+    def wall_clock_pacing(self) -> bool:
+        return self._wall_clock_pacing
+
     def reset_from_qpos(
         self,
         qpos: np.ndarray,
@@ -1173,6 +1189,7 @@ class ExternalGearBackend:
         if self.data.ctrl.size:
             self.data.ctrl[:] = 0.0
         self._bindings.mujoco.mj_forward(self.model, self.data)
+        self._viewer_step_count = 0
 
     def _freeze_on_fall_callback(self) -> None:
         # Instance-local replacement for the official ``check_fall``. A pelvis
@@ -1267,31 +1284,28 @@ class ExternalGearBackend:
             ) from error
         # Advance the simulated clock by exactly one sim_dt without physics.
         sim_env.mj_data.time += float(self.sim_dt)
-        sim_env.update_viewer()
 
     def step(self) -> None:
-        started = time.monotonic()
         # The official simulator can print fall diagnostics.  Stdout is the
         # JSONL protocol channel in this child, so preserve those diagnostics
         # on stderr instead of allowing a non-JSON line to corrupt the peer.
         with redirect_stdout(sys.stderr):
+            sim_env = self._simulator.sim_env
+            viewer = getattr(sim_env, "viewer", None)
+            if viewer is not None and not viewer.is_running():
+                raise ProtocolError("MuJoCo viewer is closed")
             if getattr(self, "_freeze_on_fall", False) and self._frozen:
                 self._frozen_step()
             else:
-                sim_env = self._simulator.sim_env
-                viewer = getattr(sim_env, "viewer", None)
-                if viewer is not None and not viewer.is_running():
-                    raise ProtocolError("MuJoCo viewer is closed")
                 sim_env.sim_step()
-                # Presentation only: synchronize an existing passive viewer
-                # exactly once after the single authoritative physics step.
-                # This never advances physics and stays on stderr like the fall
-                # diagnostics.
-                if viewer is not None:
+            # Presentation only: synchronize the passive viewer at its pinned
+            # 50 Hz cadence, independent of the 200 Hz physics integration.
+            if viewer is not None:
+                viewer_step_count = getattr(self, "_viewer_step_count", 0) + 1
+                self._viewer_step_count = viewer_step_count
+                viewer_stride = max(1, round(_STATE_PERIOD_S / self.sim_dt))
+                if viewer_step_count % viewer_stride == 0:
                     sim_env.update_viewer()
-        remaining = self.sim_dt - (time.monotonic() - started)
-        if getattr(self, "_wall_clock_pacing", True) and remaining > 0.0:
-            time.sleep(remaining)
 
     def set_camera(
         self,

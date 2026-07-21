@@ -26,13 +26,14 @@ from mm_sonic.gated_sim import (
 
 
 class FakeBackend:
-    def __init__(self, *, nq=36, sim_dt=0.005):
+    def __init__(self, *, nq=36, sim_dt=0.005, wall_clock_pacing=False):
         self._model = SimpleNamespace(nq=nq)
         self._data = SimpleNamespace(
             time=0.0,
             qpos=np.zeros(nq, dtype=np.float64),
         )
         self._sim_dt = sim_dt
+        self._wall_clock_pacing = wall_clock_pacing
         self.reset_calls = []
         self.step_calls = 0
         self.sample_calls = 0
@@ -53,6 +54,10 @@ class FakeBackend:
     @property
     def sim_dt(self):
         return self._sim_dt
+
+    @property
+    def wall_clock_pacing(self):
+        return self._wall_clock_pacing
 
     def reset_from_qpos(
         self, qpos, lateral_offset_m, yaw_offset_rad, *, elastic_band_enabled
@@ -346,6 +351,24 @@ class GatedSimulatorRunnerTests(unittest.TestCase):
         )
         self.assertEqual(contact_rows[-1]["contacts"][0]["geom2"], "floor")
         self.assertAlmostEqual(state_rows[-1]["sim_time_s"], 0.4, places=15)
+
+    def test_pacing_deadline_includes_sampling_and_logging_without_drift(self):
+        self.reset()
+        self.backends[-1]._wall_clock_pacing = True
+
+        with (
+            patch.object(
+                gated_sim.time,
+                "monotonic",
+                side_effect=[100.0, 100.004, 100.009],
+            ),
+            patch.object(gated_sim.time, "sleep") as sleep,
+        ):
+            self.runner.advance(2)
+
+        self.assertEqual(sleep.call_count, 2)
+        self.assertAlmostEqual(sleep.call_args_list[0].args[0], 0.001, places=12)
+        self.assertAlmostEqual(sleep.call_args_list[1].args[0], 0.001, places=12)
 
     def test_prime_low_state_publishes_without_stepping_or_changing_evidence(self):
         with self.assertRaisesRegex(ProtocolError, "reset is required"):
@@ -863,6 +886,19 @@ class GatedSimulatorProtocolTests(unittest.TestCase):
 
 
 class ExternalGearBackendBoundaryTests(unittest.TestCase):
+    def test_paced_backend_leaves_wall_clock_sleep_to_whole_step_runner(self):
+        backend = ExternalGearBackend.__new__(ExternalGearBackend)
+        backend._wall_clock_pacing = True
+        backend._simulator = SimpleNamespace(
+            sim_dt=0.005,
+            sim_env=SimpleNamespace(viewer=None, sim_step=lambda: None),
+        )
+
+        with patch.object(gated_sim.time, "sleep") as sleep:
+            backend.step()
+
+        sleep.assert_not_called()
+
     def test_unpaced_backend_advances_without_wall_clock_sleep(self):
         backend = ExternalGearBackend.__new__(ExternalGearBackend)
         backend._wall_clock_pacing = False
@@ -1063,7 +1099,7 @@ class ExternalGearBackendBoundaryTests(unittest.TestCase):
                             "/authenticated/gear", scene, onscreen=value
                         )
 
-    def test_visible_backend_syncs_viewer_once_after_single_step(self):
+    def test_visible_backend_syncs_viewer_at_50hz_not_every_physics_step(self):
         events = []
         sim_env = SimpleNamespace(
             viewer=SimpleNamespace(is_running=lambda: True),
@@ -1074,9 +1110,10 @@ class ExternalGearBackendBoundaryTests(unittest.TestCase):
         backend._wall_clock_pacing = False
         backend._simulator = SimpleNamespace(sim_dt=0.005, sim_env=sim_env)
 
-        backend.step()
+        for _ in range(4):
+            backend.step()
 
-        self.assertEqual(events, ["step", "sync"])
+        self.assertEqual(events, ["step", "step", "step", "step", "sync"])
 
     def test_closed_visible_viewer_stops_before_physics_or_sync(self):
         events = []
@@ -1313,7 +1350,7 @@ class ExternalGearBackendBoundaryTests(unittest.TestCase):
         )
         return sim_env, events, obs_token
 
-    def test_frozen_step_republishes_lowstate_advances_clock_and_syncs_once(self):
+    def test_frozen_step_republishes_lowstate_and_syncs_at_50hz(self):
         sim_env, events, obs_token = self._frozen_sim_env()
         backend = ExternalGearBackend.__new__(ExternalGearBackend)
         backend._wall_clock_pacing = False
@@ -1321,7 +1358,8 @@ class ExternalGearBackendBoundaryTests(unittest.TestCase):
         backend._frozen = True
         backend._simulator = SimpleNamespace(sim_dt=0.005, sim_env=sim_env)
 
-        backend.step()
+        for _ in range(4):
+            backend.step()
 
         self.assertNotIn(("step",), events)
         self.assertEqual(
@@ -1330,11 +1368,20 @@ class ExternalGearBackendBoundaryTests(unittest.TestCase):
                 ("prepare",),
                 ("low", obs_token),
                 ("wireless",),
+                ("prepare",),
+                ("low", obs_token),
+                ("wireless",),
+                ("prepare",),
+                ("low", obs_token),
+                ("wireless",),
+                ("prepare",),
+                ("low", obs_token),
+                ("wireless",),
                 ("sync",),
             ],
         )
         self.assertIs(sim_env.obs, obs_token)
-        self.assertAlmostEqual(sim_env.mj_data.time, 1.005)
+        self.assertAlmostEqual(sim_env.mj_data.time, 1.02)
 
     def test_frozen_step_skips_wireless_when_joystick_is_falsey(self):
         sim_env, events, obs = self._frozen_sim_env(joystick=None)
