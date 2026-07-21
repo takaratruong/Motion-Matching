@@ -2,7 +2,10 @@
 
 Date: 2026-07-21
 
-Status: approved correction
+Status: superseded; continuing locomotion during generation still creates a
+separate approach-to-funnel handoff
+
+Superseded by `2026-07-21-data-supported-freeze-plan-pickup-design.md`.
 
 ## Goal
 
