@@ -8,7 +8,14 @@
 static constexpr int MM_CHUNK_PROTOCOL_VERSION = 1;
 static constexpr int MM_CHUNK_SOURCE_RATE_HZ = 25;
 static constexpr int MM_CHUNK_SOURCE_INTERVALS = 10;
+static constexpr int MM_CHUNK_RESPONSIVE_SOURCE_INTERVALS = 5;
 static constexpr int MM_CHUNK_JOINT_COUNT = 29;
+
+static inline bool mm_chunk_source_intervals_supported(int source_intervals)
+{
+    return source_intervals == MM_CHUNK_SOURCE_INTERVALS ||
+           source_intervals == MM_CHUNK_RESPONSIVE_SOURCE_INTERVALS;
+}
 static constexpr int MM_CHUNK_TERRAIN_SAMPLE_COUNT = 4;
 
 struct mm_chunk_error
@@ -344,11 +351,11 @@ public:
             return mm_chunk_fail(
                 error, "invalid_candidate", "candidate ID must be nonempty");
         }
-        if (request.source_intervals != MM_CHUNK_SOURCE_INTERVALS) {
+        if (!mm_chunk_source_intervals_supported(request.source_intervals)) {
             return mm_chunk_fail(
                 error,
                 "invalid_intervals",
-                "source_intervals must be exactly 10");
+                "source_intervals must be exactly 5 or 10");
         }
         const bool expected_null = session_.active_candidate_id.empty();
         if (request.predecessor_is_null != expected_null ||
@@ -376,11 +383,12 @@ public:
                 adapter_error.empty() ? "state clone failed" : adapter_error);
         }
 
+        const int source_intervals = request.source_intervals;
         mm_chunk_candidate generated;
         generated.boundaries.reserve(
-            static_cast<std::size_t>(MM_CHUNK_SOURCE_INTERVALS + 1));
+            static_cast<std::size_t>(source_intervals + 1));
         generated.steps.reserve(
-            static_cast<std::size_t>(MM_CHUNK_SOURCE_INTERVALS));
+            static_cast<std::size_t>(source_intervals));
         mm_chunk_boundary boundary;
         if (!adapter_.observe(
                 boundary, preparation.state, adapter_error)) {
@@ -392,7 +400,7 @@ public:
                     : adapter_error);
         }
         generated.boundaries.push_back(boundary);
-        for (int step = 0; step < MM_CHUNK_SOURCE_INTERVALS; ++step) {
+        for (int step = 0; step < source_intervals; ++step) {
             mm_chunk_step_diagnostic diagnostic;
             if (!adapter_.advance(
                     diagnostic,

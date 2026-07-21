@@ -20,8 +20,10 @@ from .transform import (
 
 _SOURCE_RATE_HZ = 25
 _SOURCE_INTERVALS = 10
+_SUPPORTED_SOURCE_INTERVALS = (5, 10)
 _SOURCE_BOUNDARIES = 11
 _TARGET_ROWS = 20
+_TARGET_ROWS_PER_INTERVAL = 2
 _JOINT_COUNT = 29
 _SOURCE_DT_S = float(np.float32(0.04))
 _MINIMUM_QUATERNION_NORM = 1.0e-12
@@ -293,15 +295,21 @@ def resample_source_chunk(
         raise ContractError("source predecessor_id must be a string or None")
     if source.source_rate_hz != _SOURCE_RATE_HZ:
         raise ContractError("source rate must equal 25 Hz")
-    if source.source_intervals != _SOURCE_INTERVALS:
-        raise ContractError("source interval count must equal 10")
+    if source.source_intervals not in _SUPPORTED_SOURCE_INTERVALS:
+        raise ContractError(
+            "source interval count must be one of "
+            + " or ".join(str(count) for count in _SUPPORTED_SOURCE_INTERVALS)
+        )
+    source_intervals = source.source_intervals
+    source_boundaries = source_intervals + 1
+    target_rows = source_intervals * _TARGET_ROWS_PER_INTERVAL
     timestamps = _float64_array(
-        source.timestamps_s, (_SOURCE_BOUNDARIES,), "source timestamps"
+        source.timestamps_s, (source_boundaries,), "source timestamps"
     )
     expected_timestamps = np.array(
         [
             np.float32(index) / np.float32(_SOURCE_RATE_HZ)
-            for index in range(_SOURCE_BOUNDARIES)
+            for index in range(source_boundaries)
         ],
         dtype=np.float32,
     )
@@ -313,32 +321,32 @@ def resample_source_chunk(
 
     _float64_array(
         source.joint_position_source,
-        (_SOURCE_BOUNDARIES, _JOINT_COUNT),
+        (source_boundaries, _JOINT_COUNT),
         "source joint position",
     )
     _float64_array(
         source.joint_velocity_source,
-        (_SOURCE_BOUNDARIES, _JOINT_COUNT),
+        (source_boundaries, _JOINT_COUNT),
         "source joint velocity",
     )
     _float64_array(
         source.physical_pelvis_position_holden,
-        (_SOURCE_BOUNDARIES, 3),
+        (source_boundaries, 3),
         "source physical pelvis position",
     )
     _float64_array(
         source.physical_pelvis_orientation_holden,
-        (_SOURCE_BOUNDARIES, 4),
+        (source_boundaries, 4),
         "source physical pelvis orientation",
     )
     _float64_array(
         source.virtual_root_position_holden,
-        (_SOURCE_BOUNDARIES, 3),
+        (source_boundaries, 3),
         "source virtual root position",
     )
     _float64_array(
         source.virtual_root_orientation_holden,
-        (_SOURCE_BOUNDARIES, 4),
+        (source_boundaries, 4),
         "source virtual root orientation",
     )
 
@@ -362,13 +370,13 @@ def resample_source_chunk(
     mapped_position_f64 = mapped_position.astype(np.float64)
     mapped_velocity_f64 = mapped_velocity.astype(np.float64)
     _validate_joint_limits(mapped_position_f64, contract, "source endpoint")
-    target_position = np.empty((_TARGET_ROWS, _JOINT_COUNT), np.float64)
-    target_velocity = np.empty((_TARGET_ROWS, _JOINT_COUNT), np.float64)
-    target_physical_position = np.empty((_TARGET_ROWS, 3), np.float64)
-    target_virtual_position = np.empty((_TARGET_ROWS, 3), np.float64)
-    target_physical_quaternion = np.empty((_TARGET_ROWS, 4), np.float64)
-    target_virtual_quaternion = np.empty((_TARGET_ROWS, 4), np.float64)
-    for interval in range(_SOURCE_INTERVALS):
+    target_position = np.empty((target_rows, _JOINT_COUNT), np.float64)
+    target_velocity = np.empty((target_rows, _JOINT_COUNT), np.float64)
+    target_physical_position = np.empty((target_rows, 3), np.float64)
+    target_virtual_position = np.empty((target_rows, 3), np.float64)
+    target_physical_quaternion = np.empty((target_rows, 4), np.float64)
+    target_virtual_quaternion = np.empty((target_rows, 4), np.float64)
+    for interval in range(source_intervals):
         midpoint = 2 * interval
         right = midpoint + 1
         midpoint_q, midpoint_v = hermite_pair(
@@ -404,29 +412,29 @@ def resample_source_chunk(
 
     _validate_joint_limits(target_position, contract, "interpolated")
     result_position = _readonly_float32(
-        target_position, (_TARGET_ROWS, _JOINT_COUNT), "target joint position"
+        target_position, (target_rows, _JOINT_COUNT), "target joint position"
     )
     result_velocity = _readonly_float32(
-        target_velocity, (_TARGET_ROWS, _JOINT_COUNT), "target joint velocity"
+        target_velocity, (target_rows, _JOINT_COUNT), "target joint velocity"
     )
     result_physical_position = _readonly_float32(
         target_physical_position,
-        (_TARGET_ROWS, 3),
+        (target_rows, 3),
         "target physical pelvis position",
     )
     result_virtual_position = _readonly_float32(
         target_virtual_position,
-        (_TARGET_ROWS, 3),
+        (target_rows, 3),
         "target virtual root position",
     )
     result_physical_quaternion = _readonly_float32(
         target_physical_quaternion,
-        (_TARGET_ROWS, 4),
+        (target_rows, 4),
         "target physical pelvis orientation",
     )
     result_virtual_quaternion = _readonly_float32(
         target_virtual_quaternion,
-        (_TARGET_ROWS, 4),
+        (target_rows, 4),
         "target virtual root orientation",
     )
     return ResampledSourceChunk(

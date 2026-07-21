@@ -153,6 +153,106 @@ class MMChunkClientRemoteErrorTests(TemporaryScriptCase):
             client.close()
 
 
+class MMChunkClientSourceIntervalTests(TemporaryScriptCase):
+    def _echo_client(self):
+        child = self.script(
+            "mm_echo_intervals.py",
+            r'''
+            import json
+            import sys
+
+            for line in sys.stdin:
+                request = json.loads(line)
+                op = request["op"]
+                if op == "hello":
+                    data = {"protocol_version": 1}
+                elif op == "reset":
+                    data = {
+                        "session_id": request["session_id"],
+                        "active_candidate_id": None,
+                        "scene": {},
+                        "initial_boundary": {},
+                    }
+                elif op == "generate":
+                    data = {
+                        "session_id": request["session_id"],
+                        "candidate_id": request["candidate_id"],
+                        "predecessor_id": request["predecessor_id"],
+                        "source_intervals": request["source_intervals"],
+                    }
+                elif op == "close":
+                    data = {}
+                response = {
+                    "v": 1,
+                    "ok": True,
+                    "op": op,
+                    "request_id": request["request_id"],
+                    "data": data,
+                }
+                print(json.dumps(response, separators=(",", ":")), flush=True)
+                if op == "close":
+                    break
+            ''',
+        )
+        return MMChunkClient(
+            run_root=self.root,
+            command=(sys.executable, "-u", str(child)),
+            stdout_archive=self.root / "mm.stdout.jsonl",
+            stderr_archive=self.root / "mm.stderr.log",
+            poll_interval_s=0.01,
+            stop_grace_s=0.05,
+            term_grace_s=0.05,
+            kill_grace_s=0.05,
+        )
+
+    def _command(self):
+        return CommandSample(
+            chunk_index=0,
+            requested_velocity_mujoco=(0.5, 0.0, 0.0),
+            desired_heading_mujoco_wxyz=(1.0, 0.0, 0.0, 0.0),
+        )
+
+    def test_generate_forwards_five_interval_horizon_to_the_server(self):
+        client = self._echo_client()
+        try:
+            client.hello()
+            client.reset(
+                SessionConfig("sonic-flat-baseline", "flat-12s", 0.0),
+                session_id="session-five",
+            )
+            data = client.generate(
+                self._command(),
+                session_id="session-five",
+                candidate_id="candidate-five",
+                predecessor_id=None,
+                source_intervals=5,
+            )
+            self.assertEqual(data["source_intervals"], 5)
+        finally:
+            client.close()
+
+    def test_generate_rejects_unsupported_horizon_before_contacting_server(self):
+        client = self._echo_client()
+        try:
+            client.hello()
+            client.reset(
+                SessionConfig("sonic-flat-baseline", "flat-12s", 0.0),
+                session_id="session-bad",
+            )
+            for bad in (0, 4, 6, 9, 20):
+                with self.subTest(bad=bad), self.assertRaises(ValueError):
+                    client.generate(
+                        self._command(),
+                        session_id="session-bad",
+                        candidate_id="candidate-bad",
+                        predecessor_id=None,
+                        source_intervals=bad,
+                    )
+                self.assertIsNone(client.outstanding_candidate_id)
+        finally:
+            client.close()
+
+
 class GatedSimulatorClientTests(TemporaryScriptCase):
     def client(self, script, *, cancelled=None, stem="sim"):
         return GatedSimulatorClient(

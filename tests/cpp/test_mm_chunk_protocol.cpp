@@ -631,6 +631,60 @@ static void test_every_illegal_identity_and_interval_is_rejected()
     CHECK(protocol.abort("s1", "c0", error));
 }
 
+static void test_supported_horizons_generate_matched_step_counts()
+{
+    fake_adapter adapter;
+    fake_engine protocol(adapter);
+    mm_chunk_error error;
+    mm_chunk_boundary initial;
+    CHECK(protocol.hello(error));
+    CHECK(protocol.reset(reset_request(), initial, error));
+
+    mm_chunk_generate_request short_request = generate_request("c000000", true);
+    short_request.source_intervals = 5;
+    mm_chunk_candidate short_chunk;
+    CHECK(protocol.generate(short_request, short_chunk, error));
+    CHECK(short_chunk.boundaries.size() == 6u);
+    CHECK(short_chunk.steps.size() == 5u);
+    CHECK(short_chunk.boundaries.back().physical_pelvis_position_holden[0] ==
+          initial.physical_pelvis_position_holden[0] + 5.0f);
+    CHECK(protocol.commit("s1", "c000000", error));
+
+    mm_chunk_generate_request long_request =
+        generate_request("c000001", false, "c000000");
+    long_request.source_intervals = MM_CHUNK_SOURCE_INTERVALS;
+    mm_chunk_candidate long_chunk;
+    CHECK(protocol.generate(long_request, long_chunk, error));
+    CHECK(long_chunk.boundaries.size() == 11u);
+    CHECK(long_chunk.steps.size() == 10u);
+    CHECK(protocol.commit("s1", "c000001", error));
+}
+
+static void test_unsupported_horizon_rejected_before_state_mutation()
+{
+    fake_adapter adapter;
+    fake_engine protocol(adapter);
+    mm_chunk_error error;
+    mm_chunk_boundary initial;
+    mm_chunk_candidate output;
+    CHECK(protocol.hello(error));
+    CHECK(protocol.reset(reset_request(), initial, error));
+
+    const std::uint64_t active_before = fake_hash(protocol.session().active);
+    const int clones_before = adapter.clone_count;
+    for (const int bad : {0, 4, 6, 9, 11, 20}) {
+        mm_chunk_generate_request request = generate_request("c000000", true);
+        request.source_intervals = bad;
+        require_error(
+            protocol.generate(request, output, error),
+            error,
+            "invalid_intervals");
+    }
+    CHECK(fake_hash(protocol.session().active) == active_before);
+    CHECK(adapter.clone_count == clones_before);
+    CHECK(!protocol.session().candidate_ready);
+}
+
 static void test_candidate_preview_fields_participate_in_step_equality()
 {
     mm_chunk_step_diagnostic baseline;
@@ -658,6 +712,8 @@ int main()
     test_legal_sequence_is_transactional_and_continuous();
     test_failures_never_publish_or_mutate_active_state();
     test_every_illegal_identity_and_interval_is_rejected();
+    test_supported_horizons_generate_matched_step_counts();
+    test_unsupported_horizon_rejected_before_state_mutation();
     test_candidate_preview_fields_participate_in_step_equality();
     std::puts("MM chunk protocol tests passed");
     return 0;

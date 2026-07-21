@@ -67,6 +67,35 @@ class CommandRecorderTests(unittest.TestCase):
         self.assertEqual(_responsive_preload_chunks(2), 1)
         self.assertEqual(_responsive_preload_chunks(4), 1)
 
+    def test_responsive_source_intervals_defaults_to_ten(self) -> None:
+        self.assertEqual(
+            _parser().parse_args([]).responsive_source_intervals, 10
+        )
+
+    def test_responsive_source_intervals_accepts_only_five_and_ten(self) -> None:
+        self.assertEqual(
+            _parser().parse_args(
+                ["--responsive-source-intervals", "5"]
+            ).responsive_source_intervals,
+            5,
+        )
+        self.assertEqual(
+            _parser().parse_args(
+                ["--responsive-source-intervals", "10"]
+            ).responsive_source_intervals,
+            10,
+        )
+        with self.assertRaises(SystemExit):
+            _parser().parse_args(["--responsive-source-intervals", "7"])
+
+    def test_mm_server_defaults_to_committed_build_path(self) -> None:
+        default = _parser().parse_args([]).mm_server
+        self.assertTrue(default.endswith("sonic/build/mm_chunk_server"))
+
+    def test_mm_server_override_is_honored(self) -> None:
+        args = _parser().parse_args(["--mm-server", "/tmp/x/mm_chunk_server"])
+        self.assertEqual(args.mm_server, "/tmp/x/mm_chunk_server")
+
     def test_terrain_and_x11_are_interactive_defaults(self) -> None:
         args = _parser().parse_args(["--mode", "interactive", "--onscreen"])
         self.assertEqual(args.scene_id, "grail-curb-default")
@@ -430,6 +459,29 @@ class X11BoundaryIntegrationTests(unittest.TestCase):
             ],
         )
 
+    def test_short_prefix_reports_matched_point_four_second_two_prefix_lookahead(
+        self,
+    ) -> None:
+        command, mapped = _mapped_boundary()
+        events: list[str] = []
+
+        _consume_x11_boundary(
+            control_loop=_BoundaryControlLoop(command, mapped),
+            simulator=_BoundarySimulator(),
+            gate=_BoundaryGate(),
+            generate_and_publish=lambda value, *, wait: None,
+            chunk_index=12,
+            steps_per_chunk=10,
+            preload_chunks=2,
+            camera_state=CameraDeliveryState(),
+            event_sink=events.append,
+            control_prefix="CONTROL chunk=",
+            camera_disabled_prefix="CAMERA DISABLED",
+            prefix_duration_s=0.2,
+        )
+
+        self.assertIn("presents_in=0.400s", events[-1])
+
     def test_invalid_consumed_camera_ack_disables_only_camera_once(self) -> None:
         command, mapped = _mapped_boundary()
         simulator = _BoundarySimulator(
@@ -718,6 +770,35 @@ class WriteResponsiveEvidenceTests(unittest.TestCase):
             self.assertIsNone(evidence)
             self.assertEqual(bundle.written, {})
 
+    def test_evidence_reports_dynamic_five_interval_horizon(self):
+        from mm_sonic.manual_demo import _write_responsive_evidence
+
+        with TemporaryDirectory() as tmp:
+            bundle = _FakeBundle(Path(tmp))
+            evidence = _write_responsive_evidence(
+                bundle,
+                True,
+                [self._trace_record((0.12, 0.0, 0.0))],
+                committed_prefixes=1,
+                source_intervals=5,
+            )
+            self.assertEqual(evidence["source_intervals"], 5)
+            self.assertEqual(evidence["lookahead_seconds"], 0.2)
+
+    def test_evidence_reports_default_ten_interval_horizon(self):
+        from mm_sonic.manual_demo import _write_responsive_evidence
+
+        with TemporaryDirectory() as tmp:
+            bundle = _FakeBundle(Path(tmp))
+            evidence = _write_responsive_evidence(
+                bundle,
+                True,
+                [self._trace_record((0.12, 0.0, 0.0))],
+                committed_prefixes=1,
+            )
+            self.assertEqual(evidence["source_intervals"], 10)
+            self.assertEqual(evidence["lookahead_seconds"], 0.4)
+
     def test_responsive_writes_jsonl_and_honest_summary(self):
         from mm_sonic.manual_demo import _write_responsive_evidence
 
@@ -837,6 +918,70 @@ class MainPreloadValidationTests(unittest.TestCase):
                     ]
                 )
             self.assertEqual(list(Path(output_root).iterdir()), [])
+
+
+class ResponsiveSourceIntervalValidationTests(unittest.TestCase):
+    def test_five_intervals_rejected_in_script_mode_before_any_run_bundle(
+        self,
+    ) -> None:
+        # A responsive 0.2s horizon is valid only for interactive X11.  Asking
+        # for five source intervals without --responsive must fail before any
+        # run bundle is materialized.
+        with TemporaryDirectory() as output_root:
+            with self.assertRaisesRegex(ContractError, "responsive"):
+                main(
+                    [
+                        "--responsive-source-intervals",
+                        "5",
+                        "--mode",
+                        "script",
+                        "--output-root",
+                        output_root,
+                    ]
+                )
+            self.assertEqual(list(Path(output_root).iterdir()), [])
+
+    def test_five_intervals_rejected_in_interactive_terminal_before_run_bundle(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as output_root:
+            with self.assertRaisesRegex(ContractError, "responsive"):
+                main(
+                    [
+                        "--responsive-source-intervals",
+                        "5",
+                        "--mode",
+                        "interactive",
+                        "--input-source",
+                        "terminal",
+                        "--output-root",
+                        output_root,
+                    ]
+                )
+            self.assertEqual(list(Path(output_root).iterdir()), [])
+
+    def test_default_ten_intervals_never_trip_the_responsive_guard(self) -> None:
+        from mm_sonic.manual_demo import _resolve_responsive_source_intervals
+
+        # Default 10 is always allowed, even on the non-responsive path.
+        args = _parser().parse_args(["--mode", "script"])
+        self.assertEqual(_resolve_responsive_source_intervals(args), 10)
+
+    def test_five_intervals_resolve_only_under_responsive_x11(self) -> None:
+        from mm_sonic.manual_demo import _resolve_responsive_source_intervals
+
+        args = _parser().parse_args(
+            [
+                "--responsive",
+                "--responsive-source-intervals",
+                "5",
+                "--mode",
+                "interactive",
+                "--input-source",
+                "x11",
+            ]
+        )
+        self.assertEqual(_resolve_responsive_source_intervals(args), 5)
 
 
 if __name__ == "__main__":

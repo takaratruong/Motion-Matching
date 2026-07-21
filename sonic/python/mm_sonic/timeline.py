@@ -29,6 +29,11 @@ from .transform import (
 
 _JOINT_COUNT = 29
 _TARGET_ROWS = 20
+_TARGET_ROWS_PER_INTERVAL = 2
+_SUPPORTED_SOURCE_INTERVALS = (5, 10)
+_SUPPORTED_TARGET_ROWS = tuple(
+    interval * _TARGET_ROWS_PER_INTERVAL for interval in _SUPPORTED_SOURCE_INTERVALS
+)
 _TARGET_RATE_HZ = 50.0
 _SEAM_TOLERANCE = 1.0e-6
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -92,13 +97,20 @@ class TargetChunk:
         ):
             if type(value) is not str or not value:
                 raise ContractError(f"target {label} must be a nonempty string")
+        raw_frame = np.asarray(self.frame_index)
+        if raw_frame.ndim != 1 or int(raw_frame.shape[0]) not in _SUPPORTED_TARGET_ROWS:
+            raise ContractError(
+                "target frame_index row count must be one of "
+                + " or ".join(str(count) for count in _SUPPORTED_TARGET_ROWS)
+            )
+        rows = int(raw_frame.shape[0])
         frame_index = _owned_array(
-            self.frame_index, np.int64, (_TARGET_ROWS,), "target frame_index"
+            self.frame_index, np.int64, (rows,), "target frame_index"
         )
         if np.any(frame_index < 0) or not np.all(np.diff(frame_index) == 1):
             raise ContractError("target frame_index must be nonnegative and contiguous")
         timestamps = _owned_array(
-            self.timestamps_s, np.float64, (_TARGET_ROWS,), "target timestamps_s"
+            self.timestamps_s, np.float64, (rows,), "target timestamps_s"
         )
         if not np.array_equal(
             timestamps, frame_index.astype(np.float64) / _TARGET_RATE_HZ
@@ -107,37 +119,37 @@ class TargetChunk:
         joint_position = _owned_array(
             self.joint_position,
             np.float32,
-            (_TARGET_ROWS, _JOINT_COUNT),
+            (rows, _JOINT_COUNT),
             "target joint_position",
         )
         joint_velocity = _owned_array(
             self.joint_velocity,
             np.float32,
-            (_TARGET_ROWS, _JOINT_COUNT),
+            (rows, _JOINT_COUNT),
             "target joint_velocity",
         )
         body_quat_w = _owned_array(
             self.body_quat_w,
             np.float32,
-            (_TARGET_ROWS, 4),
+            (rows, 4),
             "target body_quat_w",
         )
         physical_position = _owned_array(
             self.physical_pelvis_position,
             np.float32,
-            (_TARGET_ROWS, 3),
+            (rows, 3),
             "target physical_pelvis_position",
         )
         virtual_position = _owned_array(
             self.virtual_root_position,
             np.float32,
-            (_TARGET_ROWS, 3),
+            (rows, 3),
             "target virtual_root_position",
         )
         virtual_quat = _owned_array(
             self.virtual_root_quat_w,
             np.float32,
-            (_TARGET_ROWS, 4),
+            (rows, 4),
             "target virtual_root_quat_w",
         )
         _check_quaternions(body_quat_w, "target body_quat_w")
@@ -483,9 +495,10 @@ class TargetTimeline:
                 self._last_boundary.virtual_root_quat_w,
             ),
         )
+        target_rows = int(resampled.joint_position.shape[0])
         first_index = self._last_frame_index + 1
         frame_index = np.arange(
-            first_index, first_index + _TARGET_ROWS, dtype=np.int64
+            first_index, first_index + target_rows, dtype=np.int64
         )
         timestamps = frame_index.astype(np.float64) / _TARGET_RATE_HZ
         canonical_hash = _hash_arrays(
@@ -501,7 +514,7 @@ class TargetTimeline:
         )
         accepted_chunk_id = (
             f"{self._session_id}:target:{first_index:020d}-"
-            f"{first_index + _TARGET_ROWS - 1:020d}"
+            f"{first_index + target_rows - 1:020d}"
         )
         target = TargetChunk(
             schema="target-chunk/v1",

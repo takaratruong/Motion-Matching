@@ -181,16 +181,16 @@ class SourceFixture:
             "virtual_root_orientation_holden": [f32(1.0), 0.0, 0.0, 0.0],
         }
 
-    def chunk(self):
-        boundaries = range(11)
-        steps = range(10)
+    def chunk(self, source_intervals=10):
+        boundaries = range(source_intervals + 1)
+        steps = range(source_intervals)
         return {
             "schema": "mm-chunk/v1",
             "session_id": "session-0",
             "candidate_id": "candidate-0",
             "predecessor_id": None,
             "source_rate_hz": 25,
-            "source_intervals": 10,
+            "source_intervals": source_intervals,
             "timestamps_s": [f32(index / 25.0) for index in boundaries],
             "source_joint_names": list(self.source_names),
             "target_joint_names": list(self.target_names),
@@ -467,6 +467,51 @@ class SourceChunkTests(unittest.TestCase):
         np.testing.assert_array_equal(
             chunk.command["applied_velocity_holden"], original_command
         )
+
+    def test_responsive_five_interval_chunk_derives_all_shapes(self):
+        payload = self.fixture.chunk(source_intervals=5)
+        chunk = parse_source_chunk(payload, self.fixture.contract)
+        self.assertEqual(chunk.source_intervals, 5)
+        self.assertEqual(chunk.timestamps_s.shape, (6,))
+        self.assertEqual(chunk.joint_position_source.shape[0], 6)
+        self.assertEqual(chunk.joint_velocity_source.shape[0], 6)
+        self.assertEqual(chunk.physical_pelvis_position_holden.shape[0], 6)
+        self.assertEqual(chunk.virtual_root_orientation_holden.shape[0], 6)
+        for field in (
+            "selected_database_frame",
+            "candidate_preview_count",
+            "candidate_limit_rejection_count",
+            "first_rejected_database_frame",
+            "first_rejected_joint_index",
+            "first_rejected_joint_position",
+            "searched",
+            "transitioned",
+            "terrain_cost",
+            "support_height",
+            "support_target",
+        ):
+            self.assertEqual(getattr(chunk, field).shape[0], 5, field)
+        self.assertEqual(chunk.terrain_values.shape, (5, 4))
+        self.assertEqual(chunk.terrain_points_holden.shape, (5, 4, 3))
+        self.assertEqual(chunk.command["applied_velocity_holden"].shape, (5, 3))
+        expected_timestamps = np.array(
+            [np.float32(index) / np.float32(25) for index in range(6)],
+            dtype=np.float32,
+        )
+        np.testing.assert_array_equal(chunk.timestamps_s, expected_timestamps)
+
+    def test_ten_interval_chunk_keeps_twenty_step_shapes(self):
+        chunk = parse_source_chunk(self.fixture.chunk(), self.fixture.contract)
+        self.assertEqual(chunk.source_intervals, 10)
+        self.assertEqual(chunk.timestamps_s.shape, (11,))
+        self.assertEqual(chunk.selected_database_frame.shape[0], 10)
+
+    def test_chunk_rejects_unsupported_source_interval_counts(self):
+        for bad in (0, 4, 6, 7, 9, 11, 20):
+            payload = self.fixture.chunk()
+            payload["source_intervals"] = bad
+            with self.subTest(bad=bad), self.assertRaises(ContractError):
+                parse_source_chunk(payload, self.fixture.contract)
 
     def test_chunk_rejects_extra_or_missing_keys_at_every_object_level(self):
         cases = []

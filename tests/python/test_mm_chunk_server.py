@@ -89,6 +89,7 @@ def generate(
     request_id="r2",
     candidate_id="c000000",
     predecessor_id=None,
+    source_intervals=10,
 ):
     return {
         "v": 1,
@@ -97,7 +98,7 @@ def generate(
         "session_id": "s1",
         "candidate_id": candidate_id,
         "predecessor_id": predecessor_id,
-        "source_intervals": 10,
+        "source_intervals": source_intervals,
         "requested_velocity_holden": [0.0, 0.0, 0.5],
         "desired_heading_holden_wxyz": [1.0, 0.0, 0.0, 0.0],
     }
@@ -185,7 +186,7 @@ class ChunkServerProtocolTest(unittest.TestCase):
         identity = hello_response["data"]
         self.assertEqual(identity["protocol_version"], 1)
         self.assertEqual(identity["source_rate_hz"], 25)
-        self.assertEqual(identity["supported_source_intervals"], [10])
+        self.assertEqual(identity["supported_source_intervals"], [5, 10])
         self.assertEqual(len(identity["source_joint_names"]), 29)
         self.assertEqual(len(identity["target_joint_names"]), 29)
         for field in (
@@ -288,6 +289,47 @@ class ChunkServerProtocolTest(unittest.TestCase):
         self.assertEqual(stdout_tail, b"")
         self.assertIn(b"test adapter", stderr)
         self.assertNotIn(b"test adapter", json.dumps(closed).encode())
+
+    def test_responsive_five_interval_generate_reports_matched_horizon(self):
+        self.assertTrue(self.server.request(hello())["ok"])
+        self.assertTrue(self.server.request(reset())["ok"])
+
+        generated = self.server.request(generate(source_intervals=5))
+        self.assertTrue(generated["ok"], generated)
+        candidate = generated["data"]
+        self.assertEqual(candidate["source_intervals"], 5)
+        self.assertEqual(candidate["source_rate_hz"], 25)
+        self.assertEqual(len(candidate["timestamps_s"]), 6)
+        self.assertEqual(
+            [struct.pack("<f", value) for value in candidate["timestamps_s"]],
+            [struct.pack("<f", index / 25) for index in range(6)],
+        )
+        self.assertEqual(len(candidate["joint_position_source"]), 6)
+        self.assertTrue(
+            all(len(row) == 29 for row in candidate["joint_position_source"]))
+        self.assertEqual(len(candidate["selected_database_frame"]), 5)
+        for field in (
+            "candidate_preview_count",
+            "candidate_limit_rejection_count",
+            "first_rejected_database_frame",
+            "first_rejected_joint_index",
+            "first_rejected_joint_position",
+        ):
+            self.assertEqual(len(candidate[field]), 5, field)
+        self.assertEqual(len(candidate["terrain_values"]), 5)
+        self.assertEqual(len(candidate["command"]["applied_velocity_holden"]), 5)
+        self.assertTrue(self.server.request(finish("abort", "r3", "c000000"))["ok"])
+
+    def test_unsupported_source_intervals_reject_before_candidate(self):
+        self.assertTrue(self.server.request(hello())["ok"])
+        self.assertTrue(self.server.request(reset())["ok"])
+        for bad in (0, 4, 6, 9, 20):
+            response = self.server.request(generate(source_intervals=bad))
+            self.assertFalse(response["ok"], (bad, response))
+            self.assertEqual(response["error"]["code"], "invalid_intervals", bad)
+        # A supported horizon still succeeds after rejections.
+        self.assertTrue(
+            self.server.request(generate(source_intervals=10))["ok"])
 
     def test_fake_joint_feasibility_identity_is_stable_across_fresh_launches(self):
         first = self.server.request(hello("first"))["data"]["joint_feasibility"]

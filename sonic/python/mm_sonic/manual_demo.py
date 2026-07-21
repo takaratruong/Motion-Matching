@@ -90,6 +90,14 @@ _DEFAULT_TERRAIN = Path(
 )
 _PRELOAD_CHUNKS = 4
 _CHUNK_DURATION_S = 0.4
+_SOURCE_RATE_HZ = 25
+_SUPPORTED_SOURCE_INTERVALS = (5, 10)
+
+
+def _horizon_seconds(source_intervals: int) -> float:
+    """Return the exact matched horizon duration for a source-interval count."""
+
+    return source_intervals / _SOURCE_RATE_HZ
 
 
 def _print_terminal_event(event: str) -> None:
@@ -111,7 +119,7 @@ def _validated_preload_chunks(value: object) -> int:
 
 
 def _responsive_preload_chunks(default_preload_chunks: int) -> int:
-    """Stage-R1 responsive mode commits exactly one preloaded 0.4s prefix.
+    """Responsive mode commits exactly one matched-horizon prefix.
 
     The opt-in responsive path drops lookahead to a single irrevocable chunk
     regardless of the resolved interactive default; the default two-chunk path
@@ -120,6 +128,39 @@ def _responsive_preload_chunks(default_preload_chunks: int) -> int:
 
     _validated_preload_chunks(default_preload_chunks)
     return 1
+
+
+def _resolve_responsive_source_intervals(namespace: object) -> int:
+    """Return the validated matched source-interval horizon for this run.
+
+    The default 10-interval 0.4s horizon is always allowed.  The opt-in
+    5-interval 0.2s horizon is valid only for the interactive X11 responsive
+    path; requesting it anywhere else is rejected before any run bundle is
+    materialized.
+    """
+
+    source_intervals = getattr(namespace, "responsive_source_intervals", 10)
+    if (
+        type(source_intervals) is not int
+        or source_intervals not in _SUPPORTED_SOURCE_INTERVALS
+    ):
+        raise ContractError(
+            "--responsive-source-intervals must be one of "
+            + " or ".join(str(count) for count in _SUPPORTED_SOURCE_INTERVALS)
+        )
+    if source_intervals == 10:
+        return 10
+    responsive = bool(getattr(namespace, "responsive", False))
+    if (
+        not responsive
+        or getattr(namespace, "mode", None) != "interactive"
+        or getattr(namespace, "input_source", None) != "x11"
+    ):
+        raise ContractError(
+            "a responsive 5 source-interval 0.2s horizon is valid only for "
+            "--responsive interactive X11 mode"
+        )
+    return source_intervals
 
 
 class CommandRecorder:
@@ -396,6 +437,7 @@ def _consume_x11_boundary(
     event_sink: Callable[[str], None],
     control_prefix: str,
     camera_disabled_prefix: str,
+    prefix_duration_s: float = _CHUNK_DURATION_S,
 ) -> X11BoundaryResult:
     """Atomically forward one mapped control boundary and synchronized camera."""
 
@@ -420,7 +462,7 @@ def _consume_x11_boundary(
         f"vx={velocity[0]:+.3f} vy={velocity[1]:+.3f} "
         f"heading={heading:+.3f} strafe={int(mapped.strafe)} "
         f"walk={int(mapped.walk_blend >= 0.5)} "
-        f"presents_in={preload_chunks * _CHUNK_DURATION_S:.3f}s"
+        f"presents_in={preload_chunks * prefix_duration_s:.3f}s"
     )
     return X11BoundaryResult(command, mapped, next_camera_state, advance)
 
@@ -431,6 +473,7 @@ def _write_responsive_evidence(
     traces: list[object],
     *,
     committed_prefixes: int | None = None,
+    source_intervals: int = 10,
 ) -> dict | None:
     """Write append-only responsive trace JSONL and an honest evidence summary.
 
@@ -442,6 +485,11 @@ def _write_responsive_evidence(
 
     if not responsive:
         return None
+    if source_intervals not in _SUPPORTED_SOURCE_INTERVALS:
+        raise ContractError(
+            "responsive evidence source_intervals must be one of "
+            + " or ".join(str(count) for count in _SUPPORTED_SOURCE_INTERVALS)
+        )
     if committed_prefixes is None:
         committed_prefixes = len(traces)
     if (
@@ -465,10 +513,12 @@ def _write_responsive_evidence(
         "queued_prefixes_unobserved": committed_prefixes - len(records),
         "observed_root_available": available,
         "observed_root_unavailable": len(records) - available,
-        # Stage R1 honest floor: one irrevocable 0.4s prefix plus MM generation
-        # time. wait=False publication returns the socket send, not a GEAR
-        # stream-processing acknowledgement (WAIT-phase only).
-        "lookahead_seconds": _CHUNK_DURATION_S,
+        "source_intervals": source_intervals,
+        # Stage R1 honest floor: one irrevocable matched-horizon prefix plus MM
+        # generation time. wait=False publication returns the socket send, not a
+        # GEAR stream-processing acknowledgement (WAIT-phase only). The lookahead
+        # is the true dynamic horizon = source_intervals / 25 s.
+        "lookahead_seconds": _horizon_seconds(source_intervals),
     }
     bundle.write_text(
         "responsive-evidence.json",
@@ -544,7 +594,11 @@ def run_demo(namespace: argparse.Namespace) -> Path:
         raise ContractError(
             "--responsive is valid only for interactive X11 mode"
         )
-    # The opt-in responsive path commits exactly one preloaded 0.4s prefix; the
+    # Validate the matched source-interval horizon before any run bundle: the
+    # opt-in 5-interval 0.2s prefix is valid only under --responsive X11.
+    source_intervals = _resolve_responsive_source_intervals(namespace)
+    prefix_duration_s = _horizon_seconds(source_intervals)
+    # The opt-in responsive path commits exactly one matched-horizon prefix; the
     # default two-chunk interactive path and all other modes are untouched.
     preload_chunks = (
         _responsive_preload_chunks(namespace.preload_chunks)
@@ -566,9 +620,10 @@ def run_demo(namespace: argparse.Namespace) -> Path:
         bundle=bundle,
         default_hand_targets=NEUTRAL_HAND_TARGETS,
     )
+    mm_server = Path(namespace.mm_server).expanduser().resolve(strict=True)
     mm = MMChunkClient(
         run_root=bundle.path,
-        command=(str(_SONIC_ROOT / "build/mm_chunk_server"),),
+        command=(str(mm_server),),
         stdout_archive=bundle.path / "mm.stdout",
         stderr_archive=bundle.path / "mm.stderr",
         env=environment,
@@ -650,7 +705,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
             session_id=session_id,
             candidate_id=candidate,
             predecessor_id=timeline.last_accepted_candidate_id,
-            source_intervals=10,
+            source_intervals=source_intervals,
         )
         prepared = timeline.prepare(validator.validate_source(raw))
         try:
@@ -745,7 +800,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
         gear.activate_control()
         gate = SimulationPolicyGate(gear, simulator)
         gate.pause()
-        steps_per_chunk = round(_CHUNK_DURATION_S / simulator.sim_dt)
+        steps_per_chunk = round(prefix_duration_s / simulator.sim_dt)
 
         camera_state = _initial_camera_delivery_state(namespace.onscreen)
         last_command: CommandSample | None = None
@@ -785,7 +840,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
             print(
                 "LIVE X11: W/A/S/D move, Shift walk, Ctrl+arrows strafe/face, "
                 "arrows orbit camera, Q/E zoom, Space stand, X exit. "
-                f"Commands have {preload_chunks * _CHUNK_DURATION_S:.1f}s "
+                f"Commands have {preload_chunks * prefix_duration_s:.1f}s "
                 "lookahead latency.",
                 flush=True,
             )
@@ -805,7 +860,11 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                         # preloaded chunk already committed index 0, so control
                         # resumes at next_chunk. The committer presents
                         # manual_demo's transaction as run_one_chunk; physics is
-                        # released only after publication and both commits.
+                        # released only after publication and both commits.  The
+                        # released physics horizon matches the configured MM
+                        # source-interval prefix exactly (source_intervals / 25s
+                        # of simulation), keeping generation, publication, and
+                        # release on one horizon.
                         committer = ManualChunkCommitter(
                             mm=mm,
                             validator=validator,
@@ -814,6 +873,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                             gate=gate,
                             session_id=session_id,
                             steps_per_chunk=steps_per_chunk,
+                            source_intervals=source_intervals,
                             recorder=recorder,
                             state_log_reader=StateLogRootReader(
                                 bundle.path / "scored-sim-logs" / "state.jsonl"
@@ -846,6 +906,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                                 event_sink=_print_terminal_event,
                                 control_prefix="CONTROL chunk=",
                                 camera_disabled_prefix="CAMERA DISABLED",
+                                prefix_duration_s=prefix_duration_s,
                             )
                             camera_state = result.camera_state
                             if result.command is None:
@@ -897,6 +958,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
             committed_prefixes=(
                 next_chunk - preload_chunks if responsive else None
             ),
+            source_intervals=source_intervals,
         )
         snapshot = simulator.snapshot()
         if namespace.scene_id == "sonic-flat-baseline":
@@ -916,7 +978,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                 "run_root": str(bundle.path),
                 "preload_chunks": preload_chunks,
                 "generated_chunks": next_chunk,
-                "lookahead_seconds": preload_chunks * _CHUNK_DURATION_S,
+                "lookahead_seconds": preload_chunks * prefix_duration_s,
                 "command_artifact": {
                     "path": "manual-commands.json",
                     "sha256": hashlib.sha256(command_artifact).hexdigest(),
@@ -961,7 +1023,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                 run_root=str(bundle.path),
                 preload_chunks=preload_chunks,
                 generated_chunks=next_chunk,
-                lookahead_seconds=preload_chunks * _CHUNK_DURATION_S,
+                lookahead_seconds=preload_chunks * prefix_duration_s,
                 command_bytes=command_artifact,
                 hand_targets=NEUTRAL_HAND_TARGETS,
                 environment_control=environment_control,
@@ -1038,6 +1100,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--preload-chunks", type=int, default=None)
     parser.add_argument("--onscreen", action="store_true")
     parser.add_argument("--responsive", action="store_true")
+    parser.add_argument(
+        "--responsive-source-intervals",
+        type=int,
+        choices=(5, 10),
+        default=10,
+    )
     parser.add_argument("--scene-id", default=None)
     parser.add_argument("--route-id", default=None)
     parser.add_argument("--terrain-weight", type=float, default=None)
@@ -1049,6 +1117,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--gear-checkout", default=str(_DEFAULT_GEAR))
     parser.add_argument("--runtime", default=str(_DEFAULT_RUNTIME))
     parser.add_argument("--terrain-dir", default=str(_DEFAULT_TERRAIN))
+    parser.add_argument(
+        "--mm-server", default=str(_SONIC_ROOT / "build/mm_chunk_server")
+    )
     return parser
 
 

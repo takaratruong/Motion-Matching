@@ -16,6 +16,7 @@ from .joints import ContractError, JointContract, reorder_source_to_target
 
 _BOUNDARY_COUNT = 11
 _STEP_COUNT = 10
+_SUPPORTED_SOURCE_INTERVALS = (5, 10)
 _JOINT_COUNT = 29
 _TERRAIN_SAMPLE_COUNT = 4
 _SOURCE_RATE_HZ = 25
@@ -128,6 +129,15 @@ def _string(value: object, label: str, *, nonempty: bool = True) -> str:
 def _fixed_integer(value: object, expected: int, label: str) -> int:
     if type(value) is not int or value != expected:
         raise ContractError(f"{label} must equal {expected}")
+    return value
+
+
+def _supported_source_intervals(value: object, label: str) -> int:
+    if type(value) is not int or value not in _SUPPORTED_SOURCE_INTERVALS:
+        raise ContractError(
+            f"{label} must be one of "
+            + " or ".join(str(count) for count in _SUPPORTED_SOURCE_INTERVALS)
+        )
     return value
 
 
@@ -435,7 +445,7 @@ def _parse_scene(value: object) -> Mapping[str, object]:
     return MappingProxyType(output)
 
 
-def _parse_command(value: object) -> Mapping[str, object]:
+def _parse_command(value: object, step_count: int) -> Mapping[str, object]:
     fields = {
         "requested_velocity_holden",
         "desired_heading_holden_wxyz",
@@ -458,7 +468,7 @@ def _parse_command(value: object) -> Mapping[str, object]:
         ),
         "applied_velocity_holden": _float_array(
             source["applied_velocity_holden"],
-            (_STEP_COUNT, 3),
+            (step_count, 3),
             "command.applied_velocity_holden",
         ),
     }
@@ -617,6 +627,10 @@ def parse_source_chunk(
     source = _exact_object(value, fields, "source chunk")
     if source["schema"] != "mm-chunk/v1" or type(source["schema"]) is not str:
         raise ContractError("source chunk.schema must equal mm-chunk/v1")
+    step_count = _supported_source_intervals(
+        source["source_intervals"], "source chunk.source_intervals"
+    )
+    boundary_count = step_count + 1
     expected_source, expected_target = _joint_orders(contract)
     source_names = _joint_names(
         source["source_joint_names"],
@@ -637,13 +651,16 @@ def parse_source_chunk(
         )
     timestamps = _float_array(
         source["timestamps_s"],
-        (_BOUNDARY_COUNT,),
+        (boundary_count,),
         "source chunk.timestamps_s",
     )
     if np.any(np.diff(timestamps.astype(np.float64)) <= 0.0):
         raise ContractError("source chunk.timestamps_s must increase strictly")
     expected_timestamps = np.array(
-        [np.float32(index) / np.float32(_SOURCE_RATE_HZ) for index in range(11)],
+        [
+            np.float32(index) / np.float32(_SOURCE_RATE_HZ)
+            for index in range(boundary_count)
+        ],
         dtype=np.float32,
     )
     if not np.array_equal(
@@ -653,7 +670,7 @@ def parse_source_chunk(
     physical_orientation = _unit_quaternions(
         _float_array(
             source["physical_pelvis_orientation_holden"],
-            (_BOUNDARY_COUNT, 4),
+            (boundary_count, 4),
             "source chunk.physical_pelvis_orientation_holden",
         ),
         "source chunk.physical_pelvis_orientation_holden",
@@ -661,42 +678,42 @@ def parse_source_chunk(
     virtual_orientation = _unit_quaternions(
         _float_array(
             source["virtual_root_orientation_holden"],
-            (_BOUNDARY_COUNT, 4),
+            (boundary_count, 4),
             "source chunk.virtual_root_orientation_holden",
         ),
         "source chunk.virtual_root_orientation_holden",
     )
     selected_database_frame = _integer_array(
         source["selected_database_frame"],
-        _STEP_COUNT,
+        step_count,
         "source chunk.selected_database_frame",
     )
     candidate_preview_count = _integer_array(
         source["candidate_preview_count"],
-        _STEP_COUNT,
+        step_count,
         "source chunk.candidate_preview_count",
     )
     candidate_limit_rejection_count = _integer_array(
         source["candidate_limit_rejection_count"],
-        _STEP_COUNT,
+        step_count,
         "source chunk.candidate_limit_rejection_count",
     )
     first_rejected_database_frame = _sentinel_integer_array(
         source["first_rejected_database_frame"],
-        _STEP_COUNT,
+        step_count,
         "source chunk.first_rejected_database_frame",
     )
     first_rejected_joint_index = _sentinel_integer_array(
         source["first_rejected_joint_index"],
-        _STEP_COUNT,
+        step_count,
         "source chunk.first_rejected_joint_index",
     )
     first_rejected_joint_position = _float64_array(
         source["first_rejected_joint_position"],
-        (_STEP_COUNT,),
+        (step_count,),
         "source chunk.first_rejected_joint_position",
     )
-    for step in range(_STEP_COUNT):
+    for step in range(step_count):
         previews = int(candidate_preview_count[step])
         rejections = int(candidate_limit_rejection_count[step])
         rejected_frame = int(first_rejected_database_frame[step])
@@ -743,31 +760,29 @@ def parse_source_chunk(
         source_rate_hz=_fixed_integer(
             source["source_rate_hz"], _SOURCE_RATE_HZ, "source chunk.source_rate_hz"
         ),
-        source_intervals=_fixed_integer(
-            source["source_intervals"], _STEP_COUNT, "source chunk.source_intervals"
-        ),
+        source_intervals=step_count,
         timestamps_s=timestamps,
         source_joint_names=source_names,
         target_joint_names=target_names,
         joint_position_source=_float_array(
             source["joint_position_source"],
-            (_BOUNDARY_COUNT, _JOINT_COUNT),
+            (boundary_count, _JOINT_COUNT),
             "source chunk.joint_position_source",
         ),
         joint_velocity_source=_float_array(
             source["joint_velocity_source"],
-            (_BOUNDARY_COUNT, _JOINT_COUNT),
+            (boundary_count, _JOINT_COUNT),
             "source chunk.joint_velocity_source",
         ),
         physical_pelvis_position_holden=_float_array(
             source["physical_pelvis_position_holden"],
-            (_BOUNDARY_COUNT, 3),
+            (boundary_count, 3),
             "source chunk.physical_pelvis_position_holden",
         ),
         physical_pelvis_orientation_holden=physical_orientation,
         virtual_root_position_holden=_float_array(
             source["virtual_root_position_holden"],
-            (_BOUNDARY_COUNT, 3),
+            (boundary_count, 3),
             "source chunk.virtual_root_position_holden",
         ),
         virtual_root_orientation_holden=virtual_orientation,
@@ -778,35 +793,35 @@ def parse_source_chunk(
         first_rejected_joint_index=first_rejected_joint_index,
         first_rejected_joint_position=first_rejected_joint_position,
         searched=_boolean_array(
-            source["searched"], _STEP_COUNT, "source chunk.searched"
+            source["searched"], step_count, "source chunk.searched"
         ),
         transitioned=_boolean_array(
-            source["transitioned"], _STEP_COUNT, "source chunk.transitioned"
+            source["transitioned"], step_count, "source chunk.transitioned"
         ),
         terrain_cost=_float_array(
-            source["terrain_cost"], (_STEP_COUNT,), "source chunk.terrain_cost"
+            source["terrain_cost"], (step_count,), "source chunk.terrain_cost"
         ),
         terrain_values=_float_array(
             source["terrain_values"],
-            (_STEP_COUNT, _TERRAIN_SAMPLE_COUNT),
+            (step_count, _TERRAIN_SAMPLE_COUNT),
             "source chunk.terrain_values",
         ),
         terrain_points_holden=_float_array(
             source["terrain_points_holden"],
-            (_STEP_COUNT, _TERRAIN_SAMPLE_COUNT, 3),
+            (step_count, _TERRAIN_SAMPLE_COUNT, 3),
             "source chunk.terrain_points_holden",
         ),
         support_height=_float_array(
             source["support_height"],
-            (_STEP_COUNT,),
+            (step_count,),
             "source chunk.support_height",
         ),
         support_target=_float_array(
             source["support_target"],
-            (_STEP_COUNT,),
+            (step_count,),
             "source chunk.support_target",
         ),
         scene=scene,
-        command=_parse_command(source["command"]),
+        command=_parse_command(source["command"], step_count),
         artifacts=artifacts,
     )

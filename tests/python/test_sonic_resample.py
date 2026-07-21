@@ -71,14 +71,17 @@ def make_source_chunk(
     candidate_id="candidate-1",
     predecessor_id=None,
     start_s=0.0,
+    source_intervals=10,
 ):
-    local_time = np.arange(11, dtype=np.float64) / 25.0
+    boundaries = source_intervals + 1
+    steps = source_intervals
+    local_time = np.arange(boundaries, dtype=np.float64) / 25.0
     global_time = start_s + local_time
     target_velocity = np.linspace(-0.028, 0.028, 29, dtype=np.float64)
     target_position = global_time[:, np.newaxis] * target_velocity[np.newaxis, :]
-    target_velocity_rows = np.broadcast_to(target_velocity, (11, 29)).copy()
-    source_position = np.empty((11, 29), np.float64)
-    source_velocity = np.empty((11, 29), np.float64)
+    target_velocity_rows = np.broadcast_to(target_velocity, (boundaries, 29)).copy()
+    source_position = np.empty((boundaries, 29), np.float64)
+    source_velocity = np.empty((boundaries, 29), np.float64)
     for row in contract.rows:
         source_position[:, row.source_index] = target_position[:, row.target_index]
         source_velocity[:, row.source_index] = target_velocity_rows[:, row.target_index]
@@ -111,7 +114,7 @@ def make_source_chunk(
         {
             "requested_velocity_holden": readonly([0.0, 0.0, 0.5]),
             "desired_heading_holden_wxyz": readonly([1.0, 0.0, 0.0, 0.0]),
-            "applied_velocity_holden": readonly(np.zeros((10, 3))),
+            "applied_velocity_holden": readonly(np.zeros((steps, 3))),
         }
     )
     artifacts = MappingProxyType(
@@ -132,7 +135,7 @@ def make_source_chunk(
         candidate_id=candidate_id,
         predecessor_id=predecessor_id,
         source_rate_hz=25,
-        source_intervals=10,
+        source_intervals=source_intervals,
         timestamps_s=readonly(local_time),
         source_joint_names=tuple(row.source_joint for row in contract.rows),
         target_joint_names=target_names(contract),
@@ -142,19 +145,19 @@ def make_source_chunk(
         physical_pelvis_orientation_holden=readonly(physical_orientation),
         virtual_root_position_holden=readonly(virtual_position),
         virtual_root_orientation_holden=readonly(virtual_orientation),
-        selected_database_frame=readonly(np.arange(10), np.int64),
-        candidate_preview_count=readonly(np.zeros(10), np.int64),
-        candidate_limit_rejection_count=readonly(np.zeros(10), np.int64),
-        first_rejected_database_frame=readonly(-np.ones(10), np.int64),
-        first_rejected_joint_index=readonly(-np.ones(10), np.int64),
-        first_rejected_joint_position=readonly(np.zeros(10)),
-        searched=readonly(np.zeros(10), np.bool_),
-        transitioned=readonly(np.zeros(10), np.bool_),
-        terrain_cost=readonly(np.zeros(10)),
-        terrain_values=readonly(np.zeros((10, 4))),
-        terrain_points_holden=readonly(np.zeros((10, 4, 3))),
-        support_height=readonly(np.zeros(10)),
-        support_target=readonly(np.zeros(10)),
+        selected_database_frame=readonly(np.arange(steps), np.int64),
+        candidate_preview_count=readonly(np.zeros(steps), np.int64),
+        candidate_limit_rejection_count=readonly(np.zeros(steps), np.int64),
+        first_rejected_database_frame=readonly(-np.ones(steps), np.int64),
+        first_rejected_joint_index=readonly(-np.ones(steps), np.int64),
+        first_rejected_joint_position=readonly(np.zeros(steps)),
+        searched=readonly(np.zeros(steps), np.bool_),
+        transitioned=readonly(np.zeros(steps), np.bool_),
+        terrain_cost=readonly(np.zeros(steps)),
+        terrain_values=readonly(np.zeros((steps, 4))),
+        terrain_points_holden=readonly(np.zeros((steps, 4, 3))),
+        support_height=readonly(np.zeros(steps)),
+        support_target=readonly(np.zeros(steps)),
         scene=scene,
         command=command,
         artifacts=artifacts,
@@ -338,6 +341,28 @@ class SourceChunkResamplingTests(unittest.TestCase):
             self.contract,
         )[0]
         self.assertFalse(np.array_equal(actual.joint_position[0], expected_left))
+
+    def test_five_source_intervals_produce_exactly_ten_target_rows(self):
+        short = make_source_chunk(self.contract, source_intervals=5)
+        actual = resample_source_chunk(short, self.contract)
+        self.assertIsInstance(actual, ResampledSourceChunk)
+        self.assertEqual(actual.joint_position.shape, (10, 29))
+        self.assertEqual(actual.joint_velocity.shape, (10, 29))
+        self.assertEqual(actual.body_quat_w.shape, (10, 4))
+        self.assertEqual(actual.physical_pelvis_position.shape, (10, 3))
+        self.assertEqual(actual.virtual_root_position.shape, (10, 3))
+        self.assertEqual(actual.virtual_root_quat_w.shape, (10, 4))
+        # Right endpoints must recover the exact mapped source boundaries.
+        expected_position = map_source_joints(
+            short.joint_position_source,
+            short.source_joint_names,
+            self.contract,
+        )[1:]
+        for interval in range(5):
+            np.testing.assert_array_equal(
+                actual.joint_position[2 * interval + 1],
+                expected_position[interval],
+            )
 
     def test_all_source_right_endpoints_recover_exact_binary32_bits(self):
         actual = resample_source_chunk(self.chunk, self.contract)

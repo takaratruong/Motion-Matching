@@ -35,6 +35,10 @@ from .coordinator import CandidateSuperseded
 from .joints import ContractError
 
 
+_SUPPORTED_SOURCE_INTERVALS = (5, 10)
+_TARGET_ROWS_PER_INTERVAL = 2
+
+
 @dataclass(frozen=True)
 class AcceptedChunk:
     """One committed responsive prefix with honest producer-side evidence.
@@ -259,6 +263,7 @@ class ManualChunkCommitter:
         session_id: str,
         steps_per_chunk: int,
         recorder: object,
+        source_intervals: int = 10,
         state_log_reader: object | None = None,
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
         next_chunk: int = 0,
@@ -267,6 +272,25 @@ class ManualChunkCommitter:
             raise ContractError("committer session_id must be a nonempty string")
         if type(steps_per_chunk) is not int or steps_per_chunk <= 0:
             raise ContractError("committer steps_per_chunk must be a positive integer")
+        if (
+            type(source_intervals) is not int
+            or source_intervals not in _SUPPORTED_SOURCE_INTERVALS
+        ):
+            raise ContractError(
+                "committer source_intervals must be one of "
+                + " or ".join(str(count) for count in _SUPPORTED_SOURCE_INTERVALS)
+            )
+        # The generated MM horizon, published target-row horizon, and released
+        # physics horizon must be one and the same 0.2s or 0.4s prefix.  Reject
+        # the shortcut of committing a longer target while releasing fewer
+        # physics steps, which would grow a future queue.
+        expected_rows = source_intervals * _TARGET_ROWS_PER_INTERVAL
+        if steps_per_chunk != expected_rows:
+            raise ContractError(
+                "committer steps_per_chunk "
+                f"{steps_per_chunk} must equal source_intervals * "
+                f"{_TARGET_ROWS_PER_INTERVAL} = {expected_rows}"
+            )
         if type(next_chunk) is not int or next_chunk < 0:
             raise ContractError("committer next_chunk must be a nonnegative integer")
         if not callable(publish):
@@ -286,6 +310,7 @@ class ManualChunkCommitter:
         self._gate = gate
         self._session_id = session_id
         self._steps_per_chunk = steps_per_chunk
+        self._source_intervals = source_intervals
         self._recorder = recorder
         self._state_log_reader = state_log_reader
         self._monotonic_ns = monotonic_ns
@@ -312,7 +337,7 @@ class ManualChunkCommitter:
             session_id=self._session_id,
             candidate_id=candidate,
             predecessor_id=self._timeline.last_accepted_candidate_id,
-            source_intervals=10,
+            source_intervals=self._source_intervals,
         )
         mm_completed_ns = self._monotonic_ns()
         checked = self._validator.validate_source(raw)
@@ -320,6 +345,21 @@ class ManualChunkCommitter:
         # Extract evidence while the transaction is still reversible.  Evidence
         # assembly must never be the first failure after physics is released.
         generated_root_displacement = _generated_root_displacement(prepared)
+        # The published target and released physics must be the same horizon.
+        # Guard here (still reversible) against any prepared target whose row
+        # count would not be fully presented by exactly ``steps_per_chunk``
+        # physics steps -- the shortcut that grows a future queue.
+        published_rows = int(
+            np.asarray(prepared.target.virtual_root_position).shape[0]
+        )
+        if published_rows != self._steps_per_chunk:
+            self._timeline.abort(candidate)
+            self._mm.abort(candidate)
+            raise ContractError(
+                "prepared target rows "
+                f"{published_rows} must equal released physics steps "
+                f"{self._steps_per_chunk}"
+            )
 
         # LAST supersession check, exactly where the coordinator places it.
         if command_is_current is not None and not command_is_current(command):

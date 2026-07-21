@@ -1110,8 +1110,8 @@ class MMChunkClient:
             predecessor_id = self._identifier(predecessor_id, "predecessor_id")
         if predecessor_id != self.active_candidate_id:
             raise ProcessError("MM generate predecessor does not match active state")
-        if type(source_intervals) is not int or source_intervals != 10:
-            raise ValueError("MM source_intervals must equal 10")
+        if type(source_intervals) is not int or source_intervals not in (5, 10):
+            raise ValueError("MM source_intervals must be 5 or 10")
         try:
             velocity = mujoco_to_holden_vectors(
                 getattr(command, "requested_velocity_mujoco")

@@ -133,6 +133,26 @@ class TransactionalTimelineTests(unittest.TestCase):
             self.assertTrue(value.flags.c_contiguous, field)
             self.assertFalse(value.flags.writeable, field)
 
+    def test_responsive_five_interval_candidate_owns_exactly_ten_target_rows(self):
+        short = make_source_chunk(self.contract, source_intervals=5)
+        prepared = self.timeline.prepare(short)
+        self.assertIsInstance(prepared.target, TargetChunk)
+        np.testing.assert_array_equal(
+            prepared.target.frame_index, np.arange(1, 11, dtype=np.int64)
+        )
+        np.testing.assert_array_equal(
+            prepared.target.timestamps_s,
+            prepared.target.frame_index.astype(np.float64) / 50.0,
+        )
+        self.assertEqual(prepared.target.joint_position.shape, (10, 29))
+        committed = self.timeline.commit(prepared)
+        self.assertEqual(self.timeline.last_frame_index, 10)
+        canonical = self.timeline.canonical_buffer
+        self.assertEqual(canonical.count, 11)
+        np.testing.assert_array_equal(
+            canonical.joint_position[1:11], committed.joint_position
+        )
+
     def test_commit_advances_once_and_the_second_chunk_owns_twenty_one_to_forty(self):
         prepared_first = self.timeline.prepare(self.first)
         first_target = self.timeline.commit(prepared_first)

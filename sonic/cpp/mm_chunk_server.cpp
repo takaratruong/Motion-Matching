@@ -1455,7 +1455,7 @@ static std::string mm_json_hello_data(const mm_server_identity& identity)
     mm_json_write_string_array(writer, identity.target_joint_names);
     writer.raw(",\"skeleton_signature\":");
     writer.string(identity.skeleton_signature);
-    writer.raw(",\"source_rate_hz\":25,\"supported_source_intervals\":[10],"
+    writer.raw(",\"source_rate_hz\":25,\"supported_source_intervals\":[5,10],"
                "\"build_commit\":");
     writer.string(identity.build_commit);
     writer.raw(",\"joint_contract_sha256\":");
@@ -1678,10 +1678,11 @@ static std::string mm_json_generate_data(
     writer.raw(",\"predecessor_id\":");
     if (request.predecessor_is_null) writer.raw("null");
     else writer.string(request.predecessor_id);
-    writer.raw(",\"source_rate_hz\":25,\"source_intervals\":10,"
-               "\"timestamps_s\":[");
-    for (int boundary = 0; boundary <= MM_CHUNK_SOURCE_INTERVALS;
-         ++boundary) {
+    const int source_intervals = request.source_intervals;
+    writer.raw(",\"source_rate_hz\":25,\"source_intervals\":");
+    writer.integer(source_intervals);
+    writer.raw(",\"timestamps_s\":[");
+    for (int boundary = 0; boundary <= source_intervals; ++boundary) {
         if (boundary != 0) writer.character(',');
         writer.number(
             static_cast<float>(boundary) /

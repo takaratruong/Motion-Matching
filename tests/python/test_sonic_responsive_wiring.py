@@ -58,6 +58,7 @@ class _Fakes:
     # mm ----------------------------------------------------------------
     def generate(self, command, **kwargs):
         self.log.append("mm.generate")
+        self.generate_kwargs = kwargs
         return object()
 
     def commit(self, candidate_id):
@@ -172,7 +173,7 @@ class _RecorderShim:
         self._f.record(command)
 
 
-def _make_committer(fakes, *, mm=None):
+def _make_committer(fakes, *, mm=None, source_intervals=10, steps_per_chunk=20):
     from mm_sonic.responsive_wiring import ManualChunkCommitter
 
     return ManualChunkCommitter(
@@ -182,7 +183,8 @@ def _make_committer(fakes, *, mm=None):
         publish=_PublisherShim(fakes).publish,
         gate=_GateShim(fakes),
         session_id="session",
-        steps_per_chunk=20,
+        steps_per_chunk=steps_per_chunk,
+        source_intervals=source_intervals,
         recorder=_RecorderShim(fakes),
     )
 
@@ -208,6 +210,40 @@ class ManualChunkCommitterOrderingTests(unittest.TestCase):
                 "record",
             ],
         )
+
+    def test_committer_forwards_configured_source_intervals_to_mm(self):
+        fakes = _Fakes(root_rows=np.zeros((10, 3), dtype=np.float32))
+        committer = _make_committer(
+            fakes, source_intervals=5, steps_per_chunk=10
+        )
+
+        committer.run_one_chunk(_command(0))
+
+        self.assertEqual(fakes.generate_kwargs["source_intervals"], 5)
+
+    def test_default_committer_still_forwards_ten_intervals(self):
+        fakes = _Fakes()
+        committer = _make_committer(fakes)
+
+        committer.run_one_chunk(_command(0))
+
+        self.assertEqual(fakes.generate_kwargs["source_intervals"], 10)
+
+    def test_released_physics_horizon_must_match_published_target_rows(self):
+        # The rejected shortcut: publish/commit a 20-row target but release
+        # only 10 physics steps grows a future queue and makes the one-prefix
+        # trace false.  The committer must reject a generated/published/released
+        # horizon mismatch before releasing any physics.
+        fakes = _Fakes(root_rows=np.zeros((20, 3), dtype=np.float32))
+        committer = _make_committer(
+            fakes, source_intervals=5, steps_per_chunk=10
+        )
+
+        from mm_sonic.joints import ContractError
+
+        with self.assertRaises(ContractError):
+            committer.run_one_chunk(_command(0))
+        self.assertNotIn("release", fakes.log)
 
     def test_stale_candidate_is_aborted_before_publish_and_releases_no_physics(self):
         fakes = _Fakes()
