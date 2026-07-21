@@ -23,6 +23,7 @@
 
 **Files:**
 - Create: `g1_mesh_renderer.h`
+- Create: `g1_kinematic_contract.h`
 - Create: `resources/g1_mesh/__init__.py`
 - Create: `resources/g1_mesh/export_g1_raylib_glb.py`
 - Create: `resources/g1_mesh/g1_raylib.glb`
@@ -60,7 +61,8 @@
 - [ ] **Step 3: Restore the minimal certified renderer and complete asset package**
 
   ```bash
-  git restore --source 6de5f87 -- g1_mesh_renderer.h resources/g1_mesh
+  git restore --source 6de5f87 -- \
+    g1_mesh_renderer.h g1_kinematic_contract.h resources/g1_mesh
   ```
 
 - [ ] **Step 4: Verify GREEN with component and asset tests**
@@ -81,7 +83,7 @@
 - [ ] **Step 5: Commit the renderer package**
 
   ```bash
-  git add g1_mesh_renderer.h resources/g1_mesh \
+  git add g1_mesh_renderer.h g1_kinematic_contract.h resources/g1_mesh \
     tests/cpp/test_g1_mesh_renderer.cpp tests/python/test_g1_mesh_asset.py
   git commit -m "feat: stage certified G1 render mesh"
   ```

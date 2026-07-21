@@ -22,7 +22,7 @@ This is preferred over the legacy `character.bin` skin because that asset uses a
 
 ## Assets and source ownership
 
-Copy the renderer header, GLB, manifest, and exporter/validator support files from the terrain-aware branch. The diffusion branch owns a local copy so the visualizer remains runnable from its own worktree and does not depend on paths in another checkout.
+Copy the renderer header, its certified `g1_kinematic_contract.h` bone-enum dependency, the GLB, manifest, and exporter/validator support files from the terrain-aware branch. This branch's existing `g1_skeleton.h` has the same 31 indices, parents, and skeleton signature; the compatibility contract lets the renderer remain byte-for-byte certified. The diffusion branch owns a local copy so the visualizer remains runnable from its own worktree and does not depend on paths in another checkout.
 
 ## Verification
 
