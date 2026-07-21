@@ -42,6 +42,85 @@ def _forward(index: int) -> CommandSample:
     return CommandSample(index, (0.5, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0))
 
 
+class _StopAfterSimulator(Exception):
+    pass
+
+
+class SimulatorFreezeWiringTests(unittest.TestCase):
+    def _drive_run_demo(self, extra_argv):
+        from unittest.mock import patch
+
+        from mm_sonic import manual_demo
+
+        captured = {}
+
+        class _FakePublisher:
+            endpoint = "tcp://127.0.0.1:5555"
+
+            def __init__(self, *a, **k):
+                pass
+
+        def _fake_simulator(**kwargs):
+            captured.update(kwargs)
+            raise _StopAfterSimulator
+
+        with TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            source_run = root / "source"
+            gear_checkout = root / "gear"
+            runtime = root / "runtime"
+            terrain_dir = root / "terrain"
+            for directory in (source_run, gear_checkout, runtime, terrain_dir):
+                directory.mkdir()
+            mm_server = root / "mm_chunk_server"
+            mm_server.write_text("#!/bin/sh\n", encoding="utf-8")
+            argv = [
+                "--output-root",
+                str(root / "runs"),
+                "--source-run",
+                str(source_run),
+                "--gear-checkout",
+                str(gear_checkout),
+                "--runtime",
+                str(runtime),
+                "--terrain-dir",
+                str(terrain_dir),
+                "--mm-server",
+                str(mm_server),
+                *extra_argv,
+            ]
+            namespace = manual_demo._parser().parse_args(argv)
+            with (
+                patch.object(manual_demo, "GatedSimulatorClient", _fake_simulator),
+                patch.object(
+                    manual_demo, "MMChunkClient", lambda *a, **k: object()
+                ),
+                patch.object(
+                    manual_demo, "GearProcess", lambda *a, **k: object()
+                ),
+                patch.object(manual_demo, "PosePublisher", _FakePublisher),
+                patch.object(
+                    manual_demo, "load_joint_contract", lambda *a, **k: object()
+                ),
+                patch.object(
+                    manual_demo, "SourceValidator", lambda *a, **k: object()
+                ),
+            ):
+                with self.assertRaises(_StopAfterSimulator):
+                    manual_demo.run_demo(namespace)
+        return captured
+
+    def test_freeze_on_fall_matches_onscreen_when_visible(self) -> None:
+        captured = self._drive_run_demo(["--onscreen"])
+        self.assertIs(captured["onscreen"], True)
+        self.assertIs(captured["freeze_on_fall"], True)
+
+    def test_freeze_on_fall_disabled_when_headless(self) -> None:
+        captured = self._drive_run_demo([])
+        self.assertIs(captured["onscreen"], False)
+        self.assertIs(captured["freeze_on_fall"], False)
+
+
 class CommandRecorderTests(unittest.TestCase):
     def test_onscreen_is_explicit_and_opt_in(self) -> None:
         self.assertFalse(_parser().parse_args([]).onscreen)

@@ -995,11 +995,16 @@ class ExternalGearBackend:
         *,
         wall_clock_pacing: bool = True,
         onscreen: bool = False,
+        freeze_on_fall: bool = False,
     ) -> None:
         if type(wall_clock_pacing) is not bool:
             raise ProtocolError("wall_clock_pacing must be a boolean")
         if type(onscreen) is not bool:
             raise ProtocolError("onscreen must be a boolean")
+        if type(freeze_on_fall) is not bool:
+            raise ProtocolError("freeze_on_fall must be a boolean")
+        if freeze_on_fall and not onscreen:
+            raise ProtocolError("freeze_on_fall requires onscreen")
         scene = Path(scene_xml).resolve(strict=True)
         if not scene.is_file():
             raise ProtocolError(f"scene_xml is not a file: {scene}")
@@ -1022,6 +1027,13 @@ class ExternalGearBackend:
         self._bindings = bindings
         self._simulator = simulator
         self._wall_clock_pacing = wall_clock_pacing
+        self._freeze_on_fall = freeze_on_fall
+        self._frozen = False
+        if freeze_on_fall:
+            # Diagnostic-only: replace only this live instance's fall callback so
+            # the first fall latches the fallen pose instead of rewinding the
+            # official simulator and tearing down the visible viewer.
+            self._simulator.sim_env.check_fall = self._freeze_on_fall_callback
 
     @property
     def model(self) -> object:
@@ -1100,22 +1112,74 @@ class ExternalGearBackend:
             self.data.ctrl[:] = 0.0
         self._bindings.mujoco.mj_forward(self.model, self.data)
 
+    def _freeze_on_fall_callback(self) -> None:
+        # Instance-local replacement for the official ``check_fall``. A pelvis
+        # height below the official 0.2 m threshold latches the first fallen
+        # pose once, logs one diagnostic, and never calls the upstream reset.
+        if self._frozen:
+            return
+        sim_env = self._simulator.sim_env
+        if float(sim_env.mj_data.qpos[2]) >= 0.2:
+            return
+        self._frozen = True
+        # Preserve the fallen qpos; only stop the dynamics.
+        sim_env.mj_data.qvel[:] = 0.0
+        sim_env.mj_data.qacc[:] = 0.0
+        if sim_env.mj_data.ctrl.size:
+            sim_env.mj_data.ctrl[:] = 0.0
+        # Refresh MuJoCo's derived position/velocity caches without integrating.
+        # In particular, ``prepare_obs`` calls ``mj_objectVelocity`` for the
+        # torso; without this forward pass it would retain the final falling
+        # velocity from the preceding physics step. ``mj_forward`` recomputes
+        # acceleration, so zero it again to keep the frozen LowState consistent.
+        self._bindings.mujoco.mj_forward(self.model, self.data)
+        sim_env.mj_data.qacc[:] = 0.0
+        print(
+            "onscreen fall freeze: preserving first fallen pose",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def _frozen_step(self) -> None:
+        # Diagnostic-only frozen service: keep GEAR connected and advance the
+        # protocol clock without touching physics.
+        sim_env = self._simulator.sim_env
+        viewer = getattr(sim_env, "viewer", None)
+        if viewer is None or not viewer.is_running():
+            raise ProtocolError("MuJoCo viewer is closed")
+        try:
+            sim_env.obs = sim_env.prepare_obs()
+            sim_env.unitree_bridge.PublishLowState(sim_env.obs)
+            if sim_env.unitree_bridge.joystick:
+                sim_env.unitree_bridge.PublishWirelessController()
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ProtocolError(
+                "frozen simulator cannot republish LowState"
+            ) from error
+        # Advance the simulated clock by exactly one sim_dt without physics.
+        sim_env.mj_data.time += float(self.sim_dt)
+        sim_env.update_viewer()
+
     def step(self) -> None:
         started = time.monotonic()
         # The official simulator can print fall diagnostics.  Stdout is the
         # JSONL protocol channel in this child, so preserve those diagnostics
         # on stderr instead of allowing a non-JSON line to corrupt the peer.
         with redirect_stdout(sys.stderr):
-            sim_env = self._simulator.sim_env
-            viewer = getattr(sim_env, "viewer", None)
-            if viewer is not None and not viewer.is_running():
-                raise ProtocolError("MuJoCo viewer is closed")
-            sim_env.sim_step()
-            # Presentation only: synchronize an existing passive viewer exactly
-            # once after the single authoritative physics step.  This never
-            # advances physics and stays on stderr like the fall diagnostics.
-            if viewer is not None:
-                sim_env.update_viewer()
+            if getattr(self, "_freeze_on_fall", False) and self._frozen:
+                self._frozen_step()
+            else:
+                sim_env = self._simulator.sim_env
+                viewer = getattr(sim_env, "viewer", None)
+                if viewer is not None and not viewer.is_running():
+                    raise ProtocolError("MuJoCo viewer is closed")
+                sim_env.sim_step()
+                # Presentation only: synchronize an existing passive viewer
+                # exactly once after the single authoritative physics step.
+                # This never advances physics and stays on stderr like the fall
+                # diagnostics.
+                if viewer is not None:
+                    sim_env.update_viewer()
         remaining = self.sim_dt - (time.monotonic() - started)
         if getattr(self, "_wall_clock_pacing", True) and remaining > 0.0:
             time.sleep(remaining)
@@ -1241,6 +1305,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--import-preflight", action="store_true")
     parser.add_argument("--unpaced-physics", action="store_true")
     parser.add_argument("--onscreen", action="store_true")
+    parser.add_argument("--freeze-on-fall", action="store_true")
     return parser
 
 
@@ -1269,6 +1334,7 @@ def main(argv: list[str] | None = None) -> int:
                 scene,
                 wall_clock_pacing=not args.unpaced_physics,
                 onscreen=args.onscreen,
+                freeze_on_fall=args.freeze_on_fall,
             ),
             output_stream=protocol_stdout,
         )

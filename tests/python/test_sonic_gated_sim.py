@@ -955,6 +955,284 @@ class ExternalGearBackendBoundaryTests(unittest.TestCase):
                 with self.assertRaisesRegex(ProtocolError, "viewer"):
                     backend.set_camera(45.0, -20.0, 4.0)
 
+    def test_freeze_on_fall_must_be_a_boolean(self):
+        with tempfile.TemporaryDirectory() as root_text:
+            scene = Path(root_text) / "scene.xml"
+            scene.write_text("<mujoco/>\n", encoding="utf-8")
+            for value in (0, 1, None, "true"):
+                with self.subTest(value=value):
+                    with self.assertRaisesRegex(
+                        ProtocolError, "freeze_on_fall must be a boolean"
+                    ):
+                        ExternalGearBackend(
+                            "/authenticated/gear",
+                            scene,
+                            onscreen=True,
+                            freeze_on_fall=value,
+                        )
+
+    def test_freeze_on_fall_requires_onscreen(self):
+        with tempfile.TemporaryDirectory() as root_text:
+            scene = Path(root_text) / "scene.xml"
+            scene.write_text("<mujoco/>\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                ProtocolError, "freeze_on_fall requires onscreen"
+            ):
+                ExternalGearBackend(
+                    "/authenticated/gear",
+                    scene,
+                    onscreen=False,
+                    freeze_on_fall=True,
+                )
+
+    def _freeze_bindings(self, sim_env):
+        class ConfigLoader:
+            env_name = "default"
+
+            @staticmethod
+            def load_wbc_yaml():
+                return {}
+
+        def base_simulator(**_kwargs):
+            return SimpleNamespace(sim_dt=0.005, sim_env=sim_env)
+
+        def mj_forward(model, data):
+            events = getattr(sim_env, "forward_events", None)
+            if events is not None:
+                events.append((model, data))
+            # Model the real API recomputing acceleration so the adapter must
+            # explicitly restore the frozen acceleration contract afterward.
+            data.qacc[:] = 7.0
+
+        return SimpleNamespace(
+            sim_loop_config=ConfigLoader,
+            base_simulator=base_simulator,
+            mujoco=SimpleNamespace(mj_forward=mj_forward),
+        )
+
+    def _construct_freeze_backend(self, sim_env, *, freeze_on_fall):
+        bindings = self._freeze_bindings(sim_env)
+        with tempfile.TemporaryDirectory() as root_text:
+            scene = Path(root_text) / "scene.xml"
+            scene.write_text("<mujoco/>\n", encoding="utf-8")
+            with (
+                patch.object(
+                    gated_sim, "load_external_bindings", return_value=bindings
+                ),
+                redirect_stdout(io.StringIO()),
+            ):
+                return ExternalGearBackend(
+                    "/authenticated/gear",
+                    scene,
+                    onscreen=True,
+                    freeze_on_fall=freeze_on_fall,
+                )
+
+    def test_default_backend_does_not_replace_official_fall_callback(self):
+        original = lambda: None
+        sim_env = SimpleNamespace(check_fall=original)
+
+        backend = self._construct_freeze_backend(sim_env, freeze_on_fall=False)
+
+        self.assertIs(backend._simulator.sim_env.check_fall, original)
+
+    def test_freeze_latches_first_fall_and_suppresses_official_reset(self):
+        reset_calls = []
+        mj_data = SimpleNamespace(
+            qpos=np.array([0.0, 0.0, 0.1, 1.0, 0.0, 0.0, 0.0]),
+            qvel=np.ones(6),
+            qacc=np.ones(6),
+            ctrl=np.ones(3),
+            time=0.0,
+        )
+
+        class SimEnv:
+            def reset(self_inner):
+                reset_calls.append(True)
+
+            def check_fall(self_inner):
+                if self_inner.mj_data.qpos[2] < 0.2:
+                    self_inner.reset()
+
+            def sim_step(self_inner):
+                self_inner.check_fall()
+
+        sim_env = SimEnv()
+        sim_env.mj_data = mj_data
+        sim_env.mj_model = object()
+        sim_env.forward_events = []
+        fallen_qpos = mj_data.qpos.copy()
+        stderr = io.StringIO()
+
+        backend = self._construct_freeze_backend(sim_env, freeze_on_fall=True)
+        with redirect_stderr(stderr):
+            sim_env.sim_step()
+
+        self.assertEqual(reset_calls, [])
+        self.assertTrue(backend._frozen)
+        self.assertTrue(np.array_equal(mj_data.qpos, fallen_qpos))
+        self.assertTrue(np.array_equal(mj_data.qvel, np.zeros(6)))
+        self.assertTrue(np.array_equal(mj_data.qacc, np.zeros(6)))
+        self.assertTrue(np.array_equal(mj_data.ctrl, np.zeros(3)))
+        self.assertEqual(
+            sim_env.forward_events,
+            [(sim_env.mj_model, sim_env.mj_data)],
+        )
+        self.assertNotEqual(stderr.getvalue(), "")
+
+    def test_freeze_logs_once_and_does_not_relatch(self):
+        mj_data = SimpleNamespace(
+            qpos=np.array([0.0, 0.0, 0.1, 1.0, 0.0, 0.0, 0.0]),
+            qvel=np.ones(6),
+            qacc=np.ones(6),
+            ctrl=np.ones(3),
+            time=0.0,
+        )
+
+        class SimEnv:
+            def reset(self_inner):
+                raise AssertionError("official reset must not run")
+
+            def check_fall(self_inner):
+                if self_inner.mj_data.qpos[2] < 0.2:
+                    self_inner.reset()
+
+        sim_env = SimEnv()
+        sim_env.mj_data = mj_data
+        sim_env.mj_model = object()
+
+        backend = self._construct_freeze_backend(sim_env, freeze_on_fall=True)
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            sim_env.check_fall()
+            first = stderr.getvalue()
+            sim_env.check_fall()
+            second = stderr.getvalue()
+
+        self.assertEqual(first, second)
+        self.assertTrue(backend._frozen)
+
+    def _frozen_sim_env(self, *, viewer_running=True, joystick=True):
+        events = []
+        obs_token = object()
+        bridge = SimpleNamespace(
+            joystick=joystick,
+            PublishLowState=lambda obs: events.append(("low", obs)),
+            PublishWirelessController=lambda: events.append(("wireless",)),
+        )
+        sim_env = SimpleNamespace(
+            viewer=SimpleNamespace(is_running=lambda: viewer_running),
+            mj_data=SimpleNamespace(time=1.0),
+            unitree_bridge=bridge,
+            prepare_obs=lambda: events.append(("prepare",)) or obs_token,
+            sim_step=lambda: events.append(("step",)),
+            update_viewer=lambda: events.append(("sync",)),
+        )
+        return sim_env, events, obs_token
+
+    def test_frozen_step_republishes_lowstate_advances_clock_and_syncs_once(self):
+        sim_env, events, obs_token = self._frozen_sim_env()
+        backend = ExternalGearBackend.__new__(ExternalGearBackend)
+        backend._wall_clock_pacing = False
+        backend._freeze_on_fall = True
+        backend._frozen = True
+        backend._simulator = SimpleNamespace(sim_dt=0.005, sim_env=sim_env)
+
+        backend.step()
+
+        self.assertNotIn(("step",), events)
+        self.assertEqual(
+            events,
+            [
+                ("prepare",),
+                ("low", obs_token),
+                ("wireless",),
+                ("sync",),
+            ],
+        )
+        self.assertIs(sim_env.obs, obs_token)
+        self.assertAlmostEqual(sim_env.mj_data.time, 1.005)
+
+    def test_frozen_step_skips_wireless_when_joystick_is_falsey(self):
+        sim_env, events, obs = self._frozen_sim_env(joystick=None)
+        backend = ExternalGearBackend.__new__(ExternalGearBackend)
+        backend._wall_clock_pacing = False
+        backend._freeze_on_fall = True
+        backend._frozen = True
+        backend._simulator = SimpleNamespace(sim_dt=0.005, sim_env=sim_env)
+
+        backend.step()
+
+        self.assertIn(("low", obs), events)
+        self.assertNotIn(("wireless",), events)
+        self.assertNotIn(("step",), events)
+
+    def test_frozen_step_rejects_a_closed_viewer_before_publishing(self):
+        sim_env, events, _obs = self._frozen_sim_env(viewer_running=False)
+        backend = ExternalGearBackend.__new__(ExternalGearBackend)
+        backend._wall_clock_pacing = False
+        backend._freeze_on_fall = True
+        backend._frozen = True
+        backend._simulator = SimpleNamespace(sim_dt=0.005, sim_env=sim_env)
+
+        with self.assertRaisesRegex(ProtocolError, "viewer is closed"):
+            backend.step()
+
+        self.assertEqual(events, [])
+        self.assertEqual(sim_env.mj_data.time, 1.0)
+
+    def test_freeze_on_fall_flag_defaults_off_and_parses_opt_in(self):
+        parser = gated_sim._parser()
+        self.assertFalse(
+            parser.parse_args(["--gear-checkout", "/gear"]).freeze_on_fall
+        )
+        self.assertTrue(
+            parser.parse_args(
+                ["--gear-checkout", "/gear", "--onscreen", "--freeze-on-fall"]
+            ).freeze_on_fall
+        )
+
+    def test_production_main_forwards_freeze_on_fall_through_backend_factory(self):
+        for argv_extra, expected in (
+            (["--onscreen"], False),
+            (["--onscreen", "--freeze-on-fall"], True),
+        ):
+            with self.subTest(expected=expected):
+                captured = {}
+
+                def fake_backend(
+                    checkout, scene, *, wall_clock_pacing, onscreen, freeze_on_fall
+                ):
+                    captured["freeze_on_fall"] = freeze_on_fall
+                    return SimpleNamespace()
+
+                def fake_server(**kwargs):
+                    kwargs["backend_factory"](Path("/gear/scene.xml"))
+
+                with (
+                    patch.object(
+                        gated_sim, "_verified_checkout", return_value=Path("/gear")
+                    ),
+                    patch.object(
+                        gated_sim, "serve_jsonl", side_effect=fake_server
+                    ),
+                    patch.object(gated_sim, "ExternalGearBackend", fake_backend),
+                    redirect_stdout(io.StringIO()),
+                    redirect_stderr(io.StringIO()),
+                ):
+                    result = gated_sim.main(
+                        [
+                            "--gear-checkout",
+                            "/gear",
+                            "--run-root",
+                            str(Path.cwd()),
+                            *argv_extra,
+                        ]
+                    )
+
+                self.assertEqual(result, 0)
+                self.assertIs(captured["freeze_on_fall"], expected)
+
     def test_onscreen_flag_defaults_headless_and_parses_opt_in(self):
         parser = gated_sim._parser()
         self.assertFalse(parser.parse_args(["--gear-checkout", "/gear"]).onscreen)
@@ -969,7 +1247,10 @@ class ExternalGearBackendBoundaryTests(unittest.TestCase):
             with self.subTest(expected=expected):
                 captured = {}
 
-                def fake_backend(checkout, scene, *, wall_clock_pacing, onscreen):
+                def fake_backend(
+                    checkout, scene, *, wall_clock_pacing, onscreen,
+                    freeze_on_fall,
+                ):
                     captured["onscreen"] = onscreen
                     captured["wall_clock_pacing"] = wall_clock_pacing
                     return SimpleNamespace()

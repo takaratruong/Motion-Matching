@@ -1348,9 +1348,14 @@ def _gated_simulator_command(
     *,
     unpaced_physics: bool,
     onscreen: bool,
+    freeze_on_fall: bool = False,
 ) -> tuple[str, ...]:
     if type(onscreen) is not bool:
         raise ValueError("onscreen must be a boolean")
+    if type(freeze_on_fall) is not bool:
+        raise ValueError("freeze_on_fall must be a boolean")
+    if freeze_on_fall and not onscreen:
+        raise ValueError("freeze_on_fall requires onscreen")
     return (
         sys.executable,
         "-u",
@@ -1363,6 +1368,7 @@ def _gated_simulator_command(
         str(run_root),
         *(("--unpaced-physics",) if unpaced_physics else ()),
         *(("--onscreen",) if onscreen else ()),
+        *(("--freeze-on-fall",) if freeze_on_fall else ()),
     )
 
 
@@ -1377,6 +1383,7 @@ class GatedSimulatorClient:
         gear_checkout: str | Path | None = None,
         unpaced_physics: bool = False,
         onscreen: bool = False,
+        freeze_on_fall: bool = False,
         stdout_archive: str | Path,
         stderr_archive: str | Path,
         cancelled: Callable[[], bool] | None = None,
@@ -1392,6 +1399,10 @@ class GatedSimulatorClient:
             raise ValueError("unpaced_physics must be a boolean")
         if type(onscreen) is not bool:
             raise ValueError("onscreen must be a boolean")
+        if type(freeze_on_fall) is not bool:
+            raise ValueError("freeze_on_fall must be a boolean")
+        if freeze_on_fall and not onscreen:
+            raise ValueError("freeze_on_fall requires onscreen")
         if command is None:
             if gear_checkout is None:
                 raise ValueError(
@@ -1403,6 +1414,7 @@ class GatedSimulatorClient:
                 checkout,
                 unpaced_physics=unpaced_physics,
                 onscreen=onscreen,
+                freeze_on_fall=freeze_on_fall,
             )
         if not command or any(type(item) is not str or not item for item in command):
             raise ValueError("command must contain nonempty strings")

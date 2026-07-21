@@ -694,6 +694,9 @@ def run_demo(namespace: argparse.Namespace) -> Path:
         # use unpaced physics; this live producer cannot.
         unpaced_physics=False,
         onscreen=namespace.onscreen,
+        # Diagnostic-only: preserve the first fallen pose and visible terrain in
+        # manual visible runs. This is valid only when onscreen is enabled.
+        freeze_on_fall=namespace.onscreen,
         stdout_archive=bundle.path / "simulator.stdout",
         stderr_archive=bundle.path / "simulator.stderr",
         env=environment,

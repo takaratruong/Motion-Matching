@@ -432,6 +432,48 @@ class GatedSimulatorClientTests(TemporaryScriptCase):
                 onscreen=1,
             )
 
+    def test_generated_command_propagates_explicit_freeze_on_fall_flag(self):
+        without = _gated_simulator_command(
+            self.root,
+            self.root / "gear",
+            unpaced_physics=False,
+            onscreen=True,
+            freeze_on_fall=False,
+        )
+        frozen = _gated_simulator_command(
+            self.root,
+            self.root / "gear",
+            unpaced_physics=False,
+            onscreen=True,
+            freeze_on_fall=True,
+        )
+        self.assertNotIn("--freeze-on-fall", without)
+        self.assertEqual(frozen.count("--freeze-on-fall"), 1)
+
+    def test_generated_command_rejects_nonboolean_freeze_on_fall(self):
+        with self.assertRaisesRegex(
+            ValueError, "freeze_on_fall must be a boolean"
+        ):
+            _gated_simulator_command(
+                self.root,
+                self.root / "gear",
+                unpaced_physics=False,
+                onscreen=True,
+                freeze_on_fall=1,
+            )
+
+    def test_generated_command_rejects_freeze_on_fall_without_onscreen(self):
+        with self.assertRaisesRegex(
+            ValueError, "freeze_on_fall requires onscreen"
+        ):
+            _gated_simulator_command(
+                self.root,
+                self.root / "gear",
+                unpaced_physics=False,
+                onscreen=False,
+                freeze_on_fall=True,
+            )
+
     def test_strict_jsonl_round_trip_and_exact_step_result(self):
         child = self.script(
             "sim_child.py",
