@@ -161,7 +161,7 @@
   In `controller.cpp`:
 
   - Include `g1_mesh_renderer.h` beside the G1 runtime headers.
-  - After all ordinary/interactions assets have loaded successfully, create `G1MeshRenderer g1_mesh_renderer = {};`, `bool show_g1_mesh = true;`, and `bool show_g1_bones = false;`; load `resources/g1_mesh/g1_raylib.glb` and fail with `G1 mesh load error:` if validation fails.
+  - After all ordinary/interactions assets have loaded successfully, create `G1MeshRenderer g1_mesh_renderer = {};`, `bool show_g1_mesh = true;`, `bool show_g1_bones = false;`, and `char g1_mesh_error_message[256] = {};`; load `resources/g1_mesh/g1_raylib.glb` and fail with `G1 mesh load error:` if validation fails.
   - In `update_func`, toggle `show_g1_mesh` with `KEY_M` and `show_g1_bones` with `KEY_B`.
   - After the final global transforms are computed and before `BeginDrawing`, call:
 
@@ -170,11 +170,11 @@
             g1_mesh_renderer,
             global_bone_positions,
             global_bone_rotations,
-            artifact_error,
-            static_cast<int>(sizeof(artifact_error))))
+            g1_mesh_error_message,
+            static_cast<int>(sizeof(g1_mesh_error_message))))
     {
         throw std::runtime_error(
-            std::string("G1 mesh update error: ") + artifact_error);
+            std::string("G1 mesh update error: ") + g1_mesh_error_message);
     }
     ```
 
