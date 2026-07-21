@@ -90,7 +90,7 @@ _GEAR_ACTION_HEADER = (
     *(f"act_{index}" for index in range(29)),
 )
 _GEAR_LAUNCH_PROFILES = frozenset({"zmq_stream", "loaded_motion"})
-_SIMULATION_CONTROL_READY = ("READY", "2")
+_SIMULATION_CONTROL_READY = ("READY", "3")
 _SIMULATION_CONTROL_MAX_PACKET = 256
 _SHELL_SAFE_ABSOLUTE_PATH = re.compile(r"/[A-Za-z0-9._/-]*\Z")
 _OWNED_DIRECTORY_STAGING_PREFIX = ".mm-sonic-owned-"
@@ -2312,6 +2312,7 @@ class GearProcess:
         self._simulation_control_state = "disabled"
         self._simulation_control_epoch = 0
         self._simulation_control_tick: int | None = None
+        self._simulation_control_synchronized = False
         self._simulation_control_socket: socket.socket | None = None
         self._simulation_control_child_socket: socket.socket | None = None
         self._stopped_member_pids: tuple[int, ...] = ()
@@ -2639,7 +2640,7 @@ class GearProcess:
             if expected == "READY":
                 if fields != _SIMULATION_CONTROL_READY:
                     raise ProcessProtocolError(
-                        "GEAR simulation control capability is not READY/v2"
+                        "GEAR simulation control capability is not READY/v3"
                     )
                 return None
             if len(fields) != 3 or fields[0] != expected:
@@ -3151,6 +3152,7 @@ class GearProcess:
             "running",
             "armed",
             "arming",
+            "syncing",
             "unknown",
         ):
             raise ProcessError(
@@ -3168,6 +3170,42 @@ class GearProcess:
         assert tick is not None
         self._simulation_control_epoch = epoch
         self._simulation_control_tick = tick
+        self._simulation_control_synchronized = False
+        self._simulation_control_state = "paused"
+
+    def begin_simulation_control_sync(self) -> None:
+        """Fence a no-step LowState refresh after GEAR installs its barrier."""
+
+        if not self.simulation_control_gate:
+            raise ProcessError("GEAR simulation control gate is not enabled")
+        if self._simulation_control_state != "paused":
+            raise ProcessError("GEAR simulation control must be paused before sync")
+        epoch = self._simulation_control_epoch
+        self._simulation_control_state = "syncing"
+        self._simulation_control_synchronized = False
+        try:
+            self._send_simulation_control_packet("SYNC", epoch)
+            tick = self._wait_simulation_control_packet("SYNCING", epoch)
+        except BaseException:
+            self._simulation_control_state = "unknown"
+            raise
+        assert tick is not None
+        self._simulation_control_tick = tick
+
+    def finish_simulation_control_sync(self) -> None:
+        """Wait until DDS observes the post-barrier no-step refresh."""
+
+        if self._simulation_control_state != "syncing":
+            raise ProcessError("GEAR simulation control sync was not started")
+        epoch = self._simulation_control_epoch
+        try:
+            tick = self._wait_simulation_control_packet("SYNCED", epoch)
+        except BaseException:
+            self._simulation_control_state = "unknown"
+            raise
+        assert tick is not None
+        self._simulation_control_tick = tick
+        self._simulation_control_synchronized = True
         self._simulation_control_state = "paused"
 
     def arm_simulation_control(self) -> None:
@@ -3177,8 +3215,11 @@ class GearProcess:
             raise ProcessError("GEAR simulation control gate is not enabled")
         if self._simulation_control_state != "paused":
             raise ProcessError("GEAR simulation control must be paused before arm")
+        if not self._simulation_control_synchronized:
+            raise ProcessError("GEAR simulation control must be synchronized before arm")
         epoch = self._simulation_control_epoch
         self._simulation_control_state = "arming"
+        self._simulation_control_synchronized = False
         try:
             self._send_simulation_control_packet("ARM", epoch)
             tick = self._wait_simulation_control_packet("ARMED", epoch)
@@ -3716,9 +3757,24 @@ class SimulationPolicyGate:
                     operation_error = _at_failure_site(error, "process_resume")
             else:
                 try:
-                    self.gear.arm_simulation_control()
+                    self.gear.begin_simulation_control_sync()
                 except BaseException as error:
                     operation_error = _at_failure_site(error, "process_resume")
+                if operation_error is None:
+                    try:
+                        self.simulator.refresh_low_state()
+                    except BaseException as error:
+                        operation_error = _at_failure_site(
+                            error, "simulator_advance"
+                        )
+                if operation_error is None:
+                    try:
+                        self.gear.finish_simulation_control_sync()
+                        self.gear.arm_simulation_control()
+                    except BaseException as error:
+                        operation_error = _at_failure_site(
+                            error, "process_resume"
+                        )
             if operation_error is None:
                 try:
                     result = self.simulator.advance(steps)

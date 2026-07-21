@@ -2600,12 +2600,15 @@ class GearProcessTests(TemporaryScriptCase):
 
             flag = sys.argv.index("--sonic-simulation-control-fd")
             channel = socket.socket(fileno=int(sys.argv[flag + 1]))
-            channel.send(b"READY 2\n")
+            channel.send(b"READY 3\n")
             print("BOOT READY", flush=True)
             while True:
                 packet = channel.recv(256)
                 if packet == b"PAUSE 1\n":
                     channel.send(b"PAUSED 1 100\n")
+                elif packet == b"SYNC 1\n":
+                    channel.send(b"SYNCING 1 100\n")
+                    channel.send(b"SYNCED 1 100\n")
                 elif packet == b"ARM 1\n":
                     channel.send(b"ARMED 1 100\n")
                     channel.send(b"RUNNING 1 101\n")
@@ -2628,6 +2631,8 @@ class GearProcessTests(TemporaryScriptCase):
             self.assertTrue(gear.simulation_control_is_paused)
             self.assertTrue(gear.group_is_resumed())
 
+            gear.begin_simulation_control_sync()
+            gear.finish_simulation_control_sync()
             gear.arm_simulation_control()
             self.assertFalse(gear.simulation_control_is_paused)
             gear.pause_simulation_control()
@@ -2648,12 +2653,15 @@ class GearProcessTests(TemporaryScriptCase):
 
             flag = sys.argv.index("--sonic-simulation-control-fd")
             channel = socket.socket(fileno=int(sys.argv[flag + 1]))
-            channel.send(b"READY 2\n")
+            channel.send(b"READY 3\n")
             print("BOOT READY", flush=True)
             while True:
                 packet = channel.recv(256)
                 if packet == b"PAUSE 1\n":
                     channel.send(b"PAUSED 1 100\n")
+                elif packet == b"SYNC 1\n":
+                    channel.send(b"SYNCING 1 100\n")
+                    channel.send(b"SYNCED 1 100\n")
                 elif packet == b"ARM 1\n":
                     channel.send(b"not-an-ack\n")
                 elif packet == b"PAUSE 2\n":
@@ -2671,6 +2679,8 @@ class GearProcessTests(TemporaryScriptCase):
             gear.start_to_wait_for_control()
             gear._control_active = True
             gear.pause_simulation_control()
+            gear.begin_simulation_control_sync()
+            gear.finish_simulation_control_sync()
 
             with self.assertRaisesRegex(ProcessProtocolError, "expected GEAR ARMED"):
                 gear.arm_simulation_control()
@@ -3669,6 +3679,8 @@ class FakeSimulatorClient:
         self.refresh_stopped_checks.append(
             self.gear is None or self.gear.group_is_stopped()
         )
+        if hasattr(self.gear, "events"):
+            self.gear.events.append("simulator.refresh")
         return {"published": True}
 
     def require_alive(self):
@@ -3697,6 +3709,14 @@ class FakeChannelGatedGear:
     def arm_simulation_control(self):
         self.events.append("gear.arm_control")
         self.paused = False
+
+    def begin_simulation_control_sync(self):
+        self.events.append("gear.begin_control_sync")
+        self.paused = False
+
+    def finish_simulation_control_sync(self):
+        self.events.append("gear.finish_control_sync")
+        self.paused = True
 
     def require_alive(self):
         self.events.append("gear.require_alive")
@@ -3801,11 +3821,14 @@ class SimulationPolicyGateTests(TemporaryScriptCase):
             [
                 "gear.pause_control",
                 "gear.require_alive",
+                "gear.begin_control_sync",
+                "simulator.refresh",
+                "gear.finish_control_sync",
                 "gear.arm_control",
                 "gear.pause_control",
             ],
         )
-        self.assertEqual(simulator.refresh_stopped_checks, [])
+        self.assertEqual(simulator.refresh_stopped_checks, [False])
         self.assertEqual(simulator.running_checks, [True])
 
         gate.finish_policy()
