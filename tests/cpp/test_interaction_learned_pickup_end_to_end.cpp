@@ -262,7 +262,7 @@ TrialEvidence run_learned_funnel_to_actual_carry(float bearing_radians) {
 
     interaction::LocomotionSnapshot terminal_locomotion = fixture.locomotion;
     terminal_locomotion.pose.positions[g1_skeleton::Simulation] =
-        tracked.position;
+        tracked.position + vec3(0.01F, 0.0F, 0.0F);
     terminal_locomotion.pose.rotations[g1_skeleton::Simulation] =
         tracked.rotation;
     interaction::RuntimeInput activation =

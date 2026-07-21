@@ -2207,9 +2207,33 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
                                             std::atan2(
                                                 std::sin(yaw_delta),
                                                 std::cos(yaw_delta)));
-                                        const MatchCandidate& candidate =
+                                        MatchCandidate candidate =
                                             certified.match_candidate;
+                                        const Pose mapped_entry =
+                                            mapped_pose_at_frame(
+                                                *database_,
+                                                candidate,
+                                                candidate.entry_frame);
+                                        float mapped_yaw = 0.0F;
+                                        const bool mapped_yaw_valid =
+                                            pick_orientation_yaw(
+                                                mapped_entry.rotations[
+                                                    g1_skeleton::Simulation],
+                                                mapped_yaw);
+                                        candidate.entry_root_offset = vec3(
+                                            root.x - mapped_entry.positions[
+                                                g1_skeleton::Simulation].x,
+                                            0.0F,
+                                            root.z - mapped_entry.positions[
+                                                g1_skeleton::Simulation].z);
+                                        candidate.entry_yaw_offset =
+                                            std::atan2(
+                                                std::sin(
+                                                    root_yaw - mapped_yaw),
+                                                std::cos(
+                                                    root_yaw - mapped_yaw));
                                         const bool correction_valid =
+                                            mapped_yaw_valid &&
                                             std::hypot(
                                                 candidate.entry_root_offset.x,
                                                 candidate.entry_root_offset.z) <=

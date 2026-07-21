@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <tuple>
@@ -735,6 +736,15 @@ PickAssistOutput LearnedSmartPickupBackend::fail(
     }
     learned_diagnostics_.state = LearnedPickupState::Failed;
     learned_diagnostics_.failure_reason = reason;
+    std::fprintf(
+        stderr,
+        "learned pickup failed: reason=%u follower_state=%u "
+        "follower_cancel=%u progress=%d lookahead=%d\n",
+        static_cast<unsigned>(reason),
+        static_cast<unsigned>(learned_diagnostics_.follower_state),
+        static_cast<unsigned>(learned_diagnostics_.follower_cancel_reason),
+        learned_diagnostics_.follower_progress_index,
+        learned_diagnostics_.follower_lookahead_index);
     learned_diagnostics_.armed = false;
     diagnostics_.state = PickAssistState::Failed;
     diagnostics_.reason = reason == LearnedPickupFailureReason::Cancelled
