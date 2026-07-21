@@ -975,23 +975,30 @@ static inline bool g1_runtime_step_internal(
         return false;
     }
     next.movement_velocity = desired_velocity_curr;
-    if (movement_prediction_target != nullptr) {
-        *movement_prediction_target = limited_velocity;
-    }
 
     traversability_stop_blocked_planar_dynamics(
         traversal,
         next.simulation_velocity,
         next.simulation_acceleration);
-    if (traversal.blocked) {
+    const bool blocked_stop =
+        traversal.blocked &&
+        terrain_float_is_finite(traversal.applied_speed) &&
+        traversal.applied_speed <= 1.0e-4f;
+    vec3 prediction_target = limited_velocity;
+    if (blocked_stop) {
         next.movement_velocity.x = 0.0f;
         next.movement_velocity.z = 0.0f;
+        prediction_target.x = 0.0f;
+        prediction_target.z = 0.0f;
         // Raw keeps its historical limited command exactly; only the shaped
         // profiles clear their planar applied velocity on a blocked stop.
         if (next.movement_model_profile != G1MovementRaw) {
             desired_velocity_curr.x = 0.0f;
             desired_velocity_curr.z = 0.0f;
         }
+    }
+    if (movement_prediction_target != nullptr) {
+        *movement_prediction_target = prediction_target;
     }
     next.blocked = traversal.blocked;
     next.walkability_class = traversal.walkability_class;

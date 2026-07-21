@@ -30,10 +30,12 @@ from mm_sonic.manual_evidence import (
     environment_control_record,
     load_canonical_target_npz,
     manual_command_artifact_bytes,
+    manual_flat_summary_v6_bytes,
     manual_summary_v4_bytes,
     manual_summary_v5_bytes,
     parse_environment_control,
     parse_manual_command_artifact,
+    parse_manual_flat_summary_v6,
     parse_manual_summary_v4,
     parse_manual_summary_v5,
     scan_for_fall_marker,
@@ -527,6 +529,43 @@ class ManualSummaryV5Tests(unittest.TestCase):
         fields["movement_model"] = {"profile": "other"}
         with self.assertRaisesRegex(ContractError, "movement_model"):
             manual_summary_v5_bytes(**fields)
+
+
+class ManualFlatSummaryV6Tests(unittest.TestCase):
+    def test_round_trips_selected_movement_model(self) -> None:
+        command_bytes = b'{"commands":[]}\n'
+        data = manual_flat_summary_v6_bytes(
+            mode="interactive",
+            run_root="/runs/flat-x",
+            preload_chunks=1,
+            generated_chunks=7,
+            lookahead_seconds=0.2,
+            command_bytes=command_bytes,
+            hand_targets=NEUTRAL_HAND_TARGETS,
+            scene_control={
+                "gear_scene_sha256": "1" * 64,
+                "gear_robot_sha256": "2" * 64,
+                "actuator_joint_order_sha256": "3" * 64,
+            },
+            snapshot={
+                "contact_rows": 80,
+                "sim_time_s": 1.4,
+                "state_rows": 70,
+                "steps": 280,
+            },
+            movement_model=_movement_model_record("holden-v1"),
+        )
+
+        parsed = parse_manual_flat_summary_v6(data)
+
+        self.assertEqual(parsed["schema"], "mm-sonic-manual-demo/v6")
+        self.assertEqual(
+            parsed["movement_model"], _movement_model_record("holden-v1")
+        )
+        self.assertEqual(
+            parsed["command_artifact"]["sha256"],
+            hashlib.sha256(command_bytes).hexdigest(),
+        )
 
 
 def _npz_bytes(buffer: CanonicalTargetBuffer) -> bytes:

@@ -1300,6 +1300,135 @@ def parse_manual_summary_v5(
     return parsed
 
 
+_MANUAL_FLAT_SUMMARY_V6_SCHEMA = "mm-sonic-manual-demo/v6"
+_MANUAL_FLAT_SUMMARY_V6_KEYS = {
+    "schema",
+    "mode",
+    "run_root",
+    "preload_chunks",
+    "generated_chunks",
+    "lookahead_seconds",
+    "command_artifact",
+    "hand_control",
+    "scene_control",
+    "snapshot",
+    "movement_model",
+}
+
+
+def manual_flat_summary_v6_bytes(
+    *,
+    mode: str,
+    run_root: str,
+    preload_chunks: int,
+    generated_chunks: int,
+    lookahead_seconds: float,
+    command_bytes: bytes,
+    hand_targets: Dex3HandTargets,
+    scene_control: dict,
+    snapshot: dict,
+    movement_model: object,
+) -> bytes:
+    """Serialize a flat-scene summary with server-authored model identity."""
+
+    validated_mode = _validated_mode(mode)
+    if type(run_root) is not str or not run_root:
+        raise ContractError("manual summary run_root must be a nonempty string")
+    if type(preload_chunks) is not int or preload_chunks < 0:
+        raise ContractError("manual summary preload_chunks must be nonnegative")
+    if type(generated_chunks) is not int or generated_chunks < preload_chunks:
+        raise ContractError(
+            "manual summary generated_chunks must be at least preload_chunks"
+        )
+    if (
+        type(lookahead_seconds) not in (int, float)
+        or isinstance(lookahead_seconds, bool)
+        or not math.isfinite(float(lookahead_seconds))
+    ):
+        raise ContractError("manual summary lookahead_seconds must be finite")
+    if not isinstance(command_bytes, (bytes, bytearray, memoryview)):
+        raise ContractError("manual summary command_bytes must be bytes")
+    document = {
+        "schema": _MANUAL_FLAT_SUMMARY_V6_SCHEMA,
+        "mode": validated_mode,
+        "run_root": run_root,
+        "preload_chunks": preload_chunks,
+        "generated_chunks": generated_chunks,
+        "lookahead_seconds": float(lookahead_seconds),
+        "command_artifact": {
+            "path": "manual-commands.json",
+            "sha256": hashlib.sha256(bytes(command_bytes)).hexdigest(),
+        },
+        "hand_control": hand_targets_record(hand_targets),
+        "scene_control": _validate_scene_control(scene_control),
+        "snapshot": _validate_snapshot(snapshot),
+        "movement_model": validate_movement_model_record(movement_model),
+    }
+    try:
+        return (
+            json.dumps(document, sort_keys=True, indent=2) + "\n"
+        ).encode("ascii")
+    except (TypeError, ValueError) as error:
+        raise ContractError("manual flat summary v6 cannot be serialized") from error
+
+
+def parse_manual_flat_summary_v6(
+    data: bytes | bytearray | memoryview,
+) -> dict[str, object]:
+    """Strictly parse one flat-scene ``mm-sonic-manual-demo/v6`` summary."""
+
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        raise ContractError("manual summary must be bytes")
+    document = _json_object(bytes(data), label="manual summary")
+    root = _require_keys(
+        document, _MANUAL_FLAT_SUMMARY_V6_KEYS, "manual summary"
+    )
+    if root["schema"] != _MANUAL_FLAT_SUMMARY_V6_SCHEMA:
+        raise ContractError("manual summary has an unsupported schema")
+    mode = _validated_mode(root["mode"])
+    if type(root["run_root"]) is not str or not root["run_root"]:
+        raise ContractError("manual summary run_root must be a nonempty string")
+    if type(root["preload_chunks"]) is not int or root["preload_chunks"] < 0:
+        raise ContractError("manual summary preload_chunks must be nonnegative")
+    if (
+        type(root["generated_chunks"]) is not int
+        or root["generated_chunks"] < root["preload_chunks"]
+    ):
+        raise ContractError("manual summary generated_chunks is invalid")
+    lookahead = root["lookahead_seconds"]
+    if (
+        type(lookahead) not in (int, float)
+        or isinstance(lookahead, bool)
+        or not math.isfinite(float(lookahead))
+    ):
+        raise ContractError("manual summary lookahead_seconds must be finite")
+    command = _require_keys(
+        root["command_artifact"],
+        {"path", "sha256"},
+        "manual summary command artifact",
+    )
+    if command["path"] != "manual-commands.json" or not _is_sha256(
+        command["sha256"]
+    ):
+        raise ContractError("manual summary command artifact identity is invalid")
+    hand_targets = parse_hand_targets_record(root["hand_control"])
+    return {
+        "schema": _MANUAL_FLAT_SUMMARY_V6_SCHEMA,
+        "mode": mode,
+        "run_root": root["run_root"],
+        "preload_chunks": root["preload_chunks"],
+        "generated_chunks": root["generated_chunks"],
+        "lookahead_seconds": float(lookahead),
+        "command_artifact": dict(command),
+        "hand_control": hand_targets_record(hand_targets),
+        "scene_control": _validate_scene_control(root["scene_control"]),
+        "snapshot": _validate_snapshot(root["snapshot"]),
+        "movement_model": validate_movement_model_record(
+            root["movement_model"]
+        ),
+    }
+
+
 def _validate_summary(
     summary: dict[str, object],
     *,

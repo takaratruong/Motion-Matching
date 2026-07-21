@@ -32,6 +32,7 @@ from .joints import ContractError, load_joint_contract
 from .manual_evidence import (
     environment_control_record,
     manual_command_artifact_bytes,
+    manual_flat_summary_v6_bytes,
     manual_summary_v5_bytes,
 )
 from .operator import OperatorLimits, OperatorSampler
@@ -1003,24 +1004,21 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                     "actuator_joint_order_sha256"
                 ],
             }
-            summary = {
-                "schema": "mm-sonic-manual-demo/v3",
-                "mode": namespace.mode,
-                "run_root": str(bundle.path),
-                "preload_chunks": preload_chunks,
-                "generated_chunks": next_chunk,
-                "lookahead_seconds": preload_chunks * prefix_duration_s,
-                "command_artifact": {
-                    "path": "manual-commands.json",
-                    "sha256": hashlib.sha256(command_artifact).hexdigest(),
-                },
-                "hand_control": hand_targets_record(NEUTRAL_HAND_TARGETS),
-                "scene_control": scene_control,
-                "snapshot": snapshot,
-            }
-            summary_bytes = (
-                json.dumps(summary, sort_keys=True, indent=2) + "\n"
-            ).encode("ascii")
+            summary_bytes = manual_flat_summary_v6_bytes(
+                mode=namespace.mode,
+                run_root=str(bundle.path),
+                preload_chunks=preload_chunks,
+                generated_chunks=next_chunk,
+                lookahead_seconds=preload_chunks * prefix_duration_s,
+                command_bytes=command_artifact,
+                hand_targets=NEUTRAL_HAND_TARGETS,
+                scene_control=scene_control,
+                snapshot=snapshot,
+                movement_model=reset["movement_model"],
+            )
+            summary = json.loads(summary_bytes)
+            if summary.get("schema") != "mm-sonic-manual-demo/v6":
+                raise ContractError("flat manual summary schema changed")
         else:
             environment_control = environment_control_record(
                 scene_id=scene.scene_id,

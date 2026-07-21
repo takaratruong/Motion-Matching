@@ -1189,6 +1189,61 @@ static void test_holden_blocked_clears_planar_movement_velocity()
           "a blocked holden-v1 step clears planar movement velocity");
 }
 
+static void test_holden_partial_block_preserves_limited_motion()
+{
+    database db;
+    make_database(db);
+    scene_pack scene = make_scene();
+    scene.metadata.spawn_position = vec3(0.3f, 0.0f, 0.2f);
+    scene.metadata.playable_bounds = {0.0f, 0.0f, 1.0f, 0.4f};
+    scene.metadata.lookahead_bounds = scene.metadata.playable_bounds;
+    scene.terrain.nx = 11;
+    scene.terrain.nz = 5;
+    scene.terrain.origin_x = 0.0f;
+    scene.terrain.origin_z = 0.0f;
+    scene.terrain.cell_size = 0.10f;
+    scene.terrain.heights.resize(55);
+    scene.terrain.heights.zero();
+    scene.walkability.nx = 11;
+    scene.walkability.nz = 5;
+    scene.walkability.cells.resize(55);
+    scene.walkability.cells.set(1);
+    for (int z = 0; z < scene.walkability.nz; ++z) {
+        scene.walkability.cells(z * scene.walkability.nx + 7) = 0;
+    }
+    scene.walkability.cells(2 * scene.walkability.nx + 4) = 2;
+    terrain_support_set support;
+    make_support(support, db.nframes());
+    g1_runtime_config config;
+    char error[512] = {};
+
+    g1_controller_state state;
+    check(g1_controller_state_reset(
+              state, db, support, scene, error,
+              static_cast<int>(sizeof(error))),
+          error);
+    state.movement_model_profile = G1MovementHoldenV1;
+    state.movement_velocity = vec3(0.2f, 0.0f, 0.0f);
+    g1_runtime_step_request request;
+    request.mode = G1RuntimeDirect;
+    request.requested_velocity_holden = vec3(0.5f, 0.0f, 0.0f);
+    request.desired_heading_holden = quat();
+    request.matching_enabled = false;
+    g1_runtime_step_result result;
+    check(g1_runtime_step(
+              result, state, db, support, scene, request, config, error,
+              static_cast<int>(sizeof(error))),
+          error);
+    check(result.traversal.blocked &&
+              result.traversal.applied_speed > 1.0e-4f,
+          "fixture finds a block while retaining positive limited speed");
+    check(state.movement_velocity.x > 0.0f &&
+              state.command.applied_velocity.x > 0.0f,
+          "partial lookahead blocking preserves shaped limited motion");
+    check(state.trajectory_desired_velocities(0).x > 0.0f,
+          "partial lookahead blocking predicts toward the limited target");
+}
+
 static void test_raw_profile_preserves_generated_arrays()
 {
     database db;
@@ -1252,6 +1307,7 @@ int main()
     test_holden_movement_model_shapes_current_and_future();
     test_holden_prediction_failure_is_transactional();
     test_holden_blocked_clears_planar_movement_velocity();
+    test_holden_partial_block_preserves_limited_motion();
     test_raw_profile_preserves_generated_arrays();
     test_feasible_runtime_progression_and_masked_search();
     test_feasible_runtime_failures_are_transactional();
