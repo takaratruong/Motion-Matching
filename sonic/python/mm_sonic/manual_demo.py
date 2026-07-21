@@ -113,6 +113,9 @@ def _wait_for_x11_target(
     sequence = 1
     while not cancellation.is_set():
         if control_loop.wait_for_sequence(sequence, timeout_s=poll_s):
+            control_loop.raise_if_failed()
+            if cancellation.is_set():
+                break
             if provider.target_bound:
                 return
             sequence += 1

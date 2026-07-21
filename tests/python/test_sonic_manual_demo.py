@@ -55,6 +55,7 @@ class X11TargetReadinessTests(unittest.TestCase):
 
         class Loop:
             calls: list[int] = []
+            health_checks = 0
 
             def wait_for_sequence(self, sequence, timeout_s):
                 self.calls.append(sequence)
@@ -63,7 +64,7 @@ class X11TargetReadinessTests(unittest.TestCase):
                 return True
 
             def raise_if_failed(self):
-                raise AssertionError("healthy loop must not be treated as failed")
+                self.health_checks += 1
 
         loop = Loop()
         output = StringIO()
@@ -75,7 +76,50 @@ class X11TargetReadinessTests(unittest.TestCase):
                 poll_s=0.01,
             )
         self.assertEqual(loop.calls, [1, 2])
+        self.assertEqual(loop.health_checks, 2)
         self.assertIn("FOCUS THE MUJOCO VIEWER", output.getvalue())
+
+    def test_bound_target_does_not_mask_same_wake_control_failure(self) -> None:
+        provider = type("Provider", (), {"target_bound": False})()
+
+        class Loop:
+            def wait_for_sequence(self, sequence, timeout_s):
+                provider.target_bound = True
+                return True
+
+            def raise_if_failed(self):
+                raise ContractError("provider failed after binding")
+
+        with self.assertRaisesRegex(ContractError, "failed after binding"):
+            with redirect_stdout(StringIO()):
+                _wait_for_x11_target(
+                    provider,
+                    Loop(),
+                    cancellation=threading.Event(),
+                    poll_s=0.01,
+                )
+
+    def test_bound_target_does_not_mask_same_wake_cancellation(self) -> None:
+        provider = type("Provider", (), {"target_bound": False})()
+        cancellation = threading.Event()
+
+        class Loop:
+            def wait_for_sequence(self, sequence, timeout_s):
+                provider.target_bound = True
+                cancellation.set()
+                return True
+
+            def raise_if_failed(self):
+                return None
+
+        with self.assertRaisesRegex(ContractError, "cancelled"):
+            with redirect_stdout(StringIO()):
+                _wait_for_x11_target(
+                    provider,
+                    Loop(),
+                    cancellation=cancellation,
+                    poll_s=0.01,
+                )
 
     def test_wait_is_operator_driven_until_cancelled(self) -> None:
         provider = type("Provider", (), {"target_bound": False})()
