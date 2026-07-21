@@ -300,6 +300,11 @@ public:
         return implementation_.diagnostics();
     }
 
+    std::optional<interaction::LearnedPickupDebugSnapshot>
+    learned_debug_snapshot() const override {
+        return debug_snapshot;
+    }
+
     uint32_t begin_calls = 0U;
     uint32_t cancel_calls = 0U;
     uint32_t observe_calls = 0U;
@@ -310,10 +315,38 @@ public:
     std::vector<interaction::InteractionTarget> begin_post_step_targets{};
     std::vector<interaction::PickAssistObservation> observations{};
     std::vector<uint64_t> submission_request_ids{};
+    std::optional<interaction::LearnedPickupDebugSnapshot> debug_snapshot{};
 
 private:
     interaction::ControllerPickAssist implementation_;
 };
+
+void test_learned_debug_snapshot_is_forwarded_without_mutation() {
+    CountingAssistBackend backend;
+    interaction::LearnedPickupDebugSnapshot expected{};
+    expected.active = true;
+    expected.frozen_entry_world = {0.1F, 0.2F, 0.0F, 1.0F};
+    expected.tracked_root_world = {0.2F, 0.3F, 0.0F, 1.0F};
+    expected.terminal_root_world = {0.4F, 0.5F, 0.0F, 1.0F};
+    expected.world_route[0] = expected.frozen_entry_world;
+    expected.world_route.back() = expected.terminal_root_world;
+    expected.progress_index = 17;
+    expected.lookahead_index = 29;
+    backend.debug_snapshot = expected;
+    interaction::SmartPickupController controller(backend);
+
+    const auto actual = controller.learned_debug_snapshot();
+
+    require(actual.has_value(), "learned debug snapshot was not forwarded");
+    require(actual->active == expected.active &&
+            actual->progress_index == expected.progress_index &&
+            actual->lookahead_index == expected.lookahead_index &&
+            same_float_bits(actual->world_route[0].x,
+                            expected.world_route[0].x) &&
+            same_float_bits(actual->world_route.back().z,
+                            expected.world_route.back().z),
+        "learned debug snapshot changed while forwarding");
+}
 
 class ThrowingBeginAssistBackend final
     : public interaction::SmartPickupAssistBackend {
@@ -2399,6 +2432,7 @@ void test_final_preview_and_request_are_each_one_shot() {
 }  // namespace
 
 int main() {
+    test_learned_debug_snapshot_is_forwarded_without_mutation();
     test_production_provider_configuration_is_explicit_and_strict();
     test_activation_brackets_one_caller_step_and_defers_assist_motion();
     test_prior_preview_batch_uses_one_snapshot_and_echoes_every_request();

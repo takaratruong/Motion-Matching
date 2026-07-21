@@ -318,4 +318,9 @@ const PickAssistDiagnostics& SmartPickupController::diagnostics() const {
     return backend_->diagnostics();
 }
 
+std::optional<LearnedPickupDebugSnapshot>
+SmartPickupController::learned_debug_snapshot() const {
+    return backend_->learned_debug_snapshot();
+}
+
 }  // namespace interaction

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "interaction_funnel_timing.h"
 #include "interaction_pick_assist.h"
 
 #include <array>
@@ -40,6 +41,16 @@ using SmartPickupPreviewCallback = std::function<std::optional<PickEntryPreview>
     TargetHandle,
     uint32_t)>;
 
+struct LearnedPickupDebugSnapshot {
+    bool active = false;
+    FunnelSample frozen_entry_world{};
+    FunnelSample tracked_root_world{};
+    FunnelSample terminal_root_world{};
+    FunnelExecutionTargets world_route{};
+    int progress_index = 0;
+    int lookahead_index = 0;
+};
+
 class SmartPickupAssistBackend {
 public:
     virtual ~SmartPickupAssistBackend() = default;
@@ -55,6 +66,10 @@ public:
     virtual bool active() const = 0;
     virtual bool owns_manual_interact() const = 0;
     virtual const PickAssistDiagnostics& diagnostics() const = 0;
+    virtual std::optional<LearnedPickupDebugSnapshot>
+    learned_debug_snapshot() const {
+        return std::nullopt;
+    }
 };
 
 struct SmartPickupPreStepInput {
@@ -117,6 +132,8 @@ public:
         const SmartPickupPreviewCallback& preview_pick);
 
     const PickAssistDiagnostics& diagnostics() const;
+    std::optional<LearnedPickupDebugSnapshot>
+    learned_debug_snapshot() const;
 
 private:
     struct PendingManualPickActivation {

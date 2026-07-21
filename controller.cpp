@@ -6454,6 +6454,65 @@ int main(void)
             }
         }
         // Manual pick-assist route rendering ends.
+
+        // Learned pickup object-anchored route rendering begins.
+        const std::optional<interaction::LearnedPickupDebugSnapshot>
+            learned_pickup_debug =
+                manual_smart_pickup_controller.learned_debug_snapshot();
+        if (learned_pickup_debug.has_value() &&
+            learned_pickup_debug->active)
+        {
+            const float route_y = bone_positions(0).y + 0.04F;
+            const auto route_point = [route_y](
+                const interaction::FunnelSample& sample)
+            {
+                return vec3(sample.x, route_y, sample.z);
+            };
+            const Color route_color{70, 150, 255, 255};
+            const Color entry_color{0, 255, 255, 255};
+            for (size_t index = 1U;
+                 index < learned_pickup_debug->world_route.size();
+                 ++index)
+            {
+                DrawLine3D(
+                    to_Vector3(route_point(
+                        learned_pickup_debug->world_route[index - 1U])),
+                    to_Vector3(route_point(
+                        learned_pickup_debug->world_route[index])),
+                    route_color);
+            }
+            const int progress_index = std::clamp(
+                learned_pickup_debug->progress_index,
+                0,
+                interaction::kFunnelExecutionTickCount - 1);
+            const int lookahead_index = std::clamp(
+                learned_pickup_debug->lookahead_index,
+                0,
+                interaction::kFunnelExecutionTickCount - 1);
+            DrawSphereWires(
+                to_Vector3(route_point(
+                    learned_pickup_debug->frozen_entry_world)),
+                0.055F, 8, 12, entry_color);
+            DrawSphereWires(
+                to_Vector3(route_point(
+                    learned_pickup_debug->world_route[
+                        static_cast<size_t>(progress_index)])),
+                0.06F, 8, 12, GREEN);
+            DrawSphereWires(
+                to_Vector3(route_point(
+                    learned_pickup_debug->world_route[
+                        static_cast<size_t>(lookahead_index)])),
+                0.065F, 8, 12, ORANGE);
+            DrawSphereWires(
+                to_Vector3(route_point(
+                    learned_pickup_debug->terminal_root_world)),
+                0.07F, 8, 12, MAGENTA);
+            DrawSphereWires(
+                to_Vector3(route_point(
+                    learned_pickup_debug->tracked_root_world)),
+                0.05F, 8, 12, WHITE);
+        }
+        // Learned pickup object-anchored route rendering ends.
         
         // G1: no skinned mesh — draw the skeleton directly from bone transforms.
         // Sphere at each joint, capsule (cylinder) from each bone to its parent.

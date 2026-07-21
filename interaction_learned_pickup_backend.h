@@ -57,6 +57,8 @@ public:
     bool active() const override;
     bool owns_manual_interact() const override;
     const PickAssistDiagnostics& diagnostics() const override;
+    std::optional<LearnedPickupDebugSnapshot>
+    learned_debug_snapshot() const override;
 
     // Learned-funnel seam. arm() selects the first accepted proposal in the
     // artifact and binds a fresh follower to the given first tick index; it
@@ -84,6 +86,7 @@ private:
     FunnelCaptureSelection capture_{};
     Transform frozen_entry_world_{};
     Transform frozen_object_world_{};
+    Transform tracked_root_world_{};
     FunnelProposalRequest proposal_request_{};
     std::vector<PickAssistPreviewRequest> selection_requests_{};
     std::vector<size_t> selection_proposal_indices_{};

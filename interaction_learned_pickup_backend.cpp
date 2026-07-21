@@ -126,6 +126,16 @@ PickEntryRoot entry_root(const FunnelSample& sample) {
     };
 }
 
+FunnelSample world_sample(Transform transform) {
+    const float yaw = yaw_of(transform.rotation);
+    return {
+        transform.position.x,
+        transform.position.z,
+        std::sin(yaw),
+        std::cos(yaw),
+    };
+}
+
 const GraspAffordance* find_affordance(
     const InteractionTarget& target,
     uint32_t affordance_id) {
@@ -214,6 +224,7 @@ PickAssistOutput LearnedSmartPickupBackend::observe_learned(
             ? LearnedPickupFailureReason::TargetChanged
             : LearnedPickupFailureReason::RuntimeChanged);
     }
+    tracked_root_world_ = observation.displayed_root;
 
     const float object_radius = planar_distance(
         observation.displayed_root.position,
@@ -566,6 +577,23 @@ bool LearnedSmartPickupBackend::owns_manual_interact() const {
 
 const PickAssistDiagnostics& LearnedSmartPickupBackend::diagnostics() const {
     return provider_ == nullptr ? authored_.diagnostics() : diagnostics_;
+}
+
+std::optional<LearnedPickupDebugSnapshot>
+LearnedSmartPickupBackend::learned_debug_snapshot() const {
+    if (provider_ == nullptr || !follower_.has_value() ||
+        learned_diagnostics_.selected_proposal_index < 0) {
+        return std::nullopt;
+    }
+    LearnedPickupDebugSnapshot snapshot{};
+    snapshot.active = active();
+    snapshot.frozen_entry_world = world_sample(frozen_entry_world_);
+    snapshot.tracked_root_world = world_sample(tracked_root_world_);
+    snapshot.terminal_root_world = selected_world_targets_.back();
+    snapshot.world_route = selected_world_targets_;
+    snapshot.progress_index = learned_diagnostics_.follower_progress_index;
+    snapshot.lookahead_index = learned_diagnostics_.follower_lookahead_index;
+    return snapshot;
 }
 
 bool LearnedSmartPickupBackend::arm(uint64_t first_tick_index) {

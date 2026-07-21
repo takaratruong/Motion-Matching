@@ -387,6 +387,13 @@ void test_provider_backed_lifecycle_submits_after_native_funnel() {
     assert(backend.learned_diagnostics().state ==
            interaction::LearnedPickupState::FunnelFollow);
     assert(backend.learned_diagnostics().selected_proposal_index == 1);
+    const auto debug = backend.learned_debug_snapshot();
+    assert(debug.has_value());
+    assert(debug->active);
+    assert(std::abs(debug->world_route.front().x - entry.position.x) < 1.0e-5F);
+    assert(std::abs(debug->world_route.front().z - entry.position.z) < 1.0e-5F);
+    assert(std::abs(debug->terminal_root_world.x - 0.18F) < 1.0e-5F);
+    assert(std::abs(debug->terminal_root_world.z - 0.94F) < 1.0e-5F);
 
     interaction::Transform tracked{
         vec3(0.18F, entry.position.y, 0.94F),
