@@ -14,7 +14,7 @@ This is preferred over the legacy `character.bin` skin because that asset uses a
 
 - Load the GLB once after the window and rendering context exist.
 - Treat a missing or invalid mesh as a startup error with a useful diagnostic.
-- Update the mesh from the final accepted pose each frame, after diffusion/follower pose changes and before drawing.
+- Expand the controller's final accepted 23-bone flat pose to the canonical 31-bone G1 pose, including final foot-IK adjustments, then update the mesh from that world pose before drawing.
 - Show the robot mesh by default.
 - Keep `M` as the mesh visibility toggle.
 - Hide the debug G1 bone overlay by default while preserving its existing toggle/control for diagnostics.

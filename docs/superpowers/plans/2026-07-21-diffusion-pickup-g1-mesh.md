@@ -13,7 +13,7 @@
 - Use `resources/g1_mesh/g1_raylib.glb` and `g1_mesh_renderer.h` from certified commit `6de5f87`.
 - Show the robot mesh by default and hide the diagnostic bone overlay by default.
 - `M` toggles robot mesh visibility and `B` toggles diagnostic bones.
-- Update only from the final global pose; do not use adjusted, predicted, or candidate poses.
+- Expand only the final accepted 23-bone flat pose, with its final foot-IK adjustments, into the canonical 31-bone G1 world pose; do not use predicted or candidate poses.
 - Do not modify `resources/features.bin` or generated diffusion artifacts.
 - Do not alter diffusion generation, route following, interaction state, attachment, or placement behavior.
 - Preserve compatibility with both Raylib 5's `Model::bones`/`framePoses` API and Raylib 6's `Model::skeleton`/`keyframePoses` API.
@@ -128,9 +128,10 @@
           update = SOURCE.index("::g1_mesh_renderer_update(")
           update_end = SOURCE.index(");", update)
           call = SOURCE[update:update_end]
-          self.assertIn("global_bone_positions", call)
-          self.assertIn("global_bone_rotations", call)
-          self.assertNotIn("adjusted_bone", call)
+          self.assertIn("mesh_world_pose.positions", call)
+          self.assertIn("mesh_world_pose.rotations", call)
+          self.assertNotIn("global_bone_positions", call)
+          self.assertNotIn("global_bone_rotations", call)
           begin = SOURCE.index("BeginMode3D(camera);", update)
           draw = SOURCE.index(
               "::g1_mesh_renderer_draw(g1_mesh_renderer);", begin
@@ -176,13 +177,17 @@
   - Include `g1_mesh_renderer.h` beside the G1 runtime headers.
   - After all ordinary/interactions assets have loaded successfully, create `G1MeshRenderer g1_mesh_renderer = {};`, `bool show_g1_mesh = true;`, `bool show_g1_bones = false;`, and `char g1_mesh_error_message[256] = {};`; load `resources/g1_mesh/g1_raylib.glb` and fail with `G1 mesh load error:` if validation fails.
   - In `update_func`, toggle `show_g1_mesh` with `KEY_M` and `show_g1_bones` with `KEY_B`.
-  - After the final global transforms are computed and before `BeginDrawing`, call:
+  - After final flat foot IK, copy `adjusted_bone_positions` and `adjusted_bone_rotations` into `interaction_frame_state.pose`, expand it with `expand_flat_controller_pose`, convert it with `interaction::world_pose`, and before `BeginDrawing` call:
 
     ```cpp
     if (!::g1_mesh_renderer_update(
             g1_mesh_renderer,
-            global_bone_positions,
-            global_bone_rotations,
+            slice1d<vec3>(
+                static_cast<int>(mesh_world_pose.positions.size()),
+                mesh_world_pose.positions.data()),
+            slice1d<quat>(
+                static_cast<int>(mesh_world_pose.rotations.size()),
+                mesh_world_pose.rotations.data()),
             g1_mesh_error_message,
             static_cast<int>(sizeof(g1_mesh_error_message))))
     {

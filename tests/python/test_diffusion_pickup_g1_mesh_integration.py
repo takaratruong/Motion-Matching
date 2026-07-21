@@ -17,9 +17,32 @@ class DiffusionPickupG1MeshIntegrationTests(unittest.TestCase):
         update = SOURCE.index("::g1_mesh_renderer_update(")
         update_end = SOURCE.index(");", update)
         call = SOURCE[update:update_end]
-        self.assertIn("global_bone_positions", call)
-        self.assertIn("global_bone_rotations", call)
+        self.assertIn("mesh_world_pose.positions", call)
+        self.assertIn("mesh_world_pose.rotations", call)
+        self.assertNotIn("global_bone_positions", call)
+        self.assertNotIn("global_bone_rotations", call)
         self.assertNotIn("adjusted_bone", call)
+
+        expansion = SOURCE.index(
+            "interaction::FlatControllerPose mesh_flat_pose", 0, update
+        )
+        self.assertIn(
+            "mesh_flat_pose.positions[bone] =\n"
+            "                adjusted_bone_positions(index);",
+            SOURCE[expansion:update],
+        )
+        self.assertIn(
+            "mesh_flat_pose.rotations[bone] =\n"
+            "                adjusted_bone_rotations(index);",
+            SOURCE[expansion:update],
+        )
+        self.assertIn(
+            "interaction::expand_flat_controller_pose(",
+            SOURCE[expansion:update],
+        )
+        self.assertIn(
+            "interaction::world_pose(mesh_pose)", SOURCE[expansion:update]
+        )
 
         begin = SOURCE.index("BeginMode3D(camera);", update)
         draw = SOURCE.index(

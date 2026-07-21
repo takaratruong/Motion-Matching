@@ -6353,10 +6353,34 @@ int main(void)
             adjusted_bone_rotations,
             db.bone_parents);
 
+        interaction::FlatControllerPose mesh_flat_pose =
+            interaction_frame_state.pose;
+        for (size_t bone = 0;
+             bone < interaction::kFlatControllerBoneCount;
+             ++bone)
+        {
+            const int index = static_cast<int>(bone);
+            mesh_flat_pose.positions[bone] =
+                adjusted_bone_positions(index);
+            mesh_flat_pose.rotations[bone] =
+                adjusted_bone_rotations(index);
+        }
+        const interaction::Pose mesh_pose =
+            interaction::expand_flat_controller_pose(
+                mesh_flat_pose,
+                interaction_reference_pose,
+                interaction_flat_reference_pose);
+        interaction::WorldPose mesh_world_pose =
+            interaction::world_pose(mesh_pose);
+
         if (!::g1_mesh_renderer_update(
                 g1_mesh_renderer,
-                global_bone_positions,
-                global_bone_rotations,
+                slice1d<vec3>(
+                    static_cast<int>(mesh_world_pose.positions.size()),
+                    mesh_world_pose.positions.data()),
+                slice1d<quat>(
+                    static_cast<int>(mesh_world_pose.rotations.size()),
+                    mesh_world_pose.rotations.data()),
                 g1_mesh_error_message,
                 static_cast<int>(sizeof(g1_mesh_error_message))))
         {

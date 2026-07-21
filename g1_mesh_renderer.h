@@ -319,8 +319,13 @@ inline bool g1_mesh_pose_build(
         return g1_mesh_error(
             error,
             error_capacity,
-            "G1 mesh pose requires exactly %d accepted transforms",
-            G1_BoneCount);
+            "G1 mesh pose requires exactly %d accepted transforms; got "
+            "positions=%d/%s rotations=%d/%s",
+            G1_BoneCount,
+            accepted_positions.size,
+            accepted_positions.data == nullptr ? "null" : "set",
+            accepted_rotations.size,
+            accepted_rotations.data == nullptr ? "null" : "set");
     }
     if (g1_mesh_ranges_overlap(
             output,
