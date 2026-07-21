@@ -90,7 +90,7 @@ _GEAR_ACTION_HEADER = (
     *(f"act_{index}" for index in range(29)),
 )
 _GEAR_LAUNCH_PROFILES = frozenset({"zmq_stream", "loaded_motion"})
-_SIMULATION_CONTROL_READY = ("READY", "1")
+_SIMULATION_CONTROL_READY = ("READY", "2")
 _SIMULATION_CONTROL_MAX_PACKET = 256
 _SHELL_SAFE_ABSOLUTE_PATH = re.compile(r"/[A-Za-z0-9._/-]*\Z")
 _OWNED_DIRECTORY_STAGING_PREFIX = ".mm-sonic-owned-"
@@ -2598,21 +2598,48 @@ class GearProcess:
                     raise ProcessProtocolError(
                         "GEAR RUNNING packet integers are invalid"
                     ) from error
+                recovering = self._simulation_control_state == "recovering"
                 if (
                     self._simulation_control_state != "armed"
-                    or running_epoch != self._simulation_control_epoch
-                    or running_tick == self._simulation_control_tick
+                    and not recovering
+                ) or running_epoch != self._simulation_control_epoch or (
+                    not recovering and running_tick == self._simulation_control_tick
                 ):
                     raise ProcessProtocolError(
                         "GEAR RUNNING packet violates the armed epoch"
                     )
-                self._simulation_control_state = "running"
                 self._simulation_control_tick = running_tick
+                if not recovering:
+                    self._simulation_control_state = "running"
+                continue
+            if (
+                fields[0] == "ARMED"
+                and expected == "PAUSED"
+                and self._simulation_control_state == "recovering"
+            ):
+                if len(fields) != 3:
+                    raise ProcessProtocolError("GEAR ARMED packet shape is invalid")
+                try:
+                    armed_epoch = int(fields[1])
+                    armed_tick = int(fields[2])
+                except ValueError as error:
+                    raise ProcessProtocolError(
+                        "GEAR ARMED packet integers are invalid"
+                    ) from error
+                if (
+                    armed_epoch != self._simulation_control_epoch
+                    or armed_tick < 0
+                    or armed_tick > 0xFFFFFFFF
+                ):
+                    raise ProcessProtocolError(
+                        "GEAR ARMED packet violates recovery epoch"
+                    )
+                self._simulation_control_tick = armed_tick
                 continue
             if expected == "READY":
                 if fields != _SIMULATION_CONTROL_READY:
                     raise ProcessProtocolError(
-                        "GEAR simulation control capability is not READY/v1"
+                        "GEAR simulation control capability is not READY/v2"
                     )
                 return None
             if len(fields) != 3 or fields[0] != expected:
@@ -3120,14 +3147,24 @@ class GearProcess:
             )
         if self._simulation_control_state == "paused":
             return
-        if self._simulation_control_state not in ("running", "armed"):
+        if self._simulation_control_state not in (
+            "running",
+            "armed",
+            "arming",
+            "unknown",
+        ):
             raise ProcessError(
                 "GEAR simulation control cannot pause from state "
                 f"{self._simulation_control_state!r}"
             )
         epoch = self._simulation_control_epoch + 1
-        self._send_simulation_control_packet("PAUSE", epoch)
-        tick = self._wait_simulation_control_packet("PAUSED", epoch)
+        self._simulation_control_state = "recovering"
+        try:
+            self._send_simulation_control_packet("PAUSE", epoch)
+            tick = self._wait_simulation_control_packet("PAUSED", epoch)
+        except BaseException:
+            self._simulation_control_state = "unknown"
+            raise
         assert tick is not None
         self._simulation_control_epoch = epoch
         self._simulation_control_tick = tick
@@ -3141,8 +3178,13 @@ class GearProcess:
         if self._simulation_control_state != "paused":
             raise ProcessError("GEAR simulation control must be paused before arm")
         epoch = self._simulation_control_epoch
-        self._send_simulation_control_packet("ARM", epoch)
-        tick = self._wait_simulation_control_packet("ARMED", epoch)
+        self._simulation_control_state = "arming"
+        try:
+            self._send_simulation_control_packet("ARM", epoch)
+            tick = self._wait_simulation_control_packet("ARMED", epoch)
+        except BaseException:
+            self._simulation_control_state = "unknown"
+            raise
         assert tick is not None
         self._simulation_control_tick = tick
         self._simulation_control_state = "armed"
@@ -3658,10 +3700,11 @@ class SimulationPolicyGate:
             self.simulator.require_alive()
         except BaseException as error:
             raise _at_failure_site(error, "simulator_advance")
-        try:
-            self.simulator.refresh_low_state()
-        except BaseException as error:
-            raise _at_failure_site(error, "simulator_advance")
+        if self.pause_strategy == "process":
+            try:
+                self.simulator.refresh_low_state()
+            except BaseException as error:
+                raise _at_failure_site(error, "simulator_advance")
         self._paused = False
         result: AdvanceResult | None = None
         operation_error: BaseException | None = None
