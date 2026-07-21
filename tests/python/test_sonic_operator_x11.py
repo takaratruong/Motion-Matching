@@ -20,6 +20,7 @@ from mm_sonic.operator_x11 import (
     IntentSnapshot,
     KeyLevels,
     X11KeyStateProvider,
+    _is_target_window_title,
     normalized_state_from_pressed,
 )
 
@@ -354,6 +355,14 @@ class IntentSnapshotTests(unittest.TestCase):
 
 
 class X11KeyStateProviderTests(unittest.TestCase):
+    def test_live_holden_viewer_title_is_an_operator_target(self) -> None:
+        self.assertTrue(
+            _is_target_window_title("G1 terrain motion matching - Holden runtime")
+        )
+        self.assertTrue(_is_target_window_title("MuJoCo"))
+        self.assertTrue(_is_target_window_title("G1 CONTROLS"))
+        self.assertFalse(_is_target_window_title("ubuntu"))
+
     def test_missing_display_hard_fails(self) -> None:
         previous = os.environ.pop("DISPLAY", None)
         try:

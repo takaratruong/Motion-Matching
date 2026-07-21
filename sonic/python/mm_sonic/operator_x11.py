@@ -60,8 +60,18 @@ _ACTIONS = {
     "LEFT_CTRL": "strafe",
 }
 
-_FOCUS_TITLE_MARKERS = ("MuJoCo", "G1 CONTROLS")
+_FOCUS_TITLE_MARKERS = (
+    "MuJoCo",
+    "G1 CONTROLS",
+    "G1 terrain motion matching",
+)
 _STALENESS_S = 0.1
+
+
+def _is_target_window_title(title: str) -> bool:
+    """Return whether an X11 title belongs to an operator-control window."""
+
+    return any(marker in title for marker in _FOCUS_TITLE_MARKERS)
 
 
 @dataclass(frozen=True)
@@ -464,9 +474,7 @@ class X11KeyStateProvider:
             if current == 0:
                 return False
             title = self._fetch_name(current)
-            if title is not None and any(
-                marker in title for marker in _FOCUS_TITLE_MARKERS
-            ):
+            if title is not None and _is_target_window_title(title):
                 return True
             parent = self._parent(current)
             if parent == 0 or parent == current:
