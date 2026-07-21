@@ -65,6 +65,10 @@ class SimulatorFreezeWiringTests(unittest.TestCase):
             captured.update(kwargs)
             raise _StopAfterSimulator
 
+        def _fake_gear(*_args, **kwargs):
+            captured["gear_cancelled"] = kwargs.get("cancelled")
+            return object()
+
         with TemporaryDirectory() as scratch:
             root = Path(scratch)
             source_run = root / "source"
@@ -97,7 +101,7 @@ class SimulatorFreezeWiringTests(unittest.TestCase):
                     manual_demo, "MMChunkClient", lambda *a, **k: object()
                 ),
                 patch.object(
-                    manual_demo, "GearProcess", lambda *a, **k: object()
+                    manual_demo, "GearProcess", _fake_gear
                 ),
                 patch.object(manual_demo, "PosePublisher", _FakePublisher),
                 patch.object(
@@ -120,6 +124,12 @@ class SimulatorFreezeWiringTests(unittest.TestCase):
         captured = self._drive_run_demo([])
         self.assertIs(captured["onscreen"], False)
         self.assertIs(captured["freeze_on_fall"], False)
+
+    def test_startup_processes_share_live_operator_cancellation(self) -> None:
+        captured = self._drive_run_demo([])
+        self.assertTrue(callable(captured["gear_cancelled"]))
+        self.assertIs(captured["gear_cancelled"], captured["cancelled"])
+        self.assertIs(captured["cancelled"](), False)
 
 
 class CommandRecorderTests(unittest.TestCase):

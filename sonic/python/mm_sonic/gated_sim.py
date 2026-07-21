@@ -77,6 +77,9 @@ class SimulatorBackend(Protocol):
     def prime_low_state(self) -> None:
         raise NotImplementedError
 
+    def refresh_low_state(self) -> None:
+        raise NotImplementedError
+
     def low_command_snapshot(self) -> Mapping[str, object]:
         raise NotImplementedError
 
@@ -555,6 +558,19 @@ class GatedSimulatorRunner:
             )
         return {"published": True, **after}
 
+    def refresh_low_state(self) -> dict[str, object]:
+        """Republish current LowState without clearing LowCmd or integrating."""
+
+        backend = self.backend
+        before = self.snapshot()
+        backend.refresh_low_state()
+        after = self.snapshot()
+        if after != before:
+            raise ProtocolError(
+                "LowState refresh changed simulator time or evidence counters"
+            )
+        return {"published": True, **after}
+
     def low_command_snapshot(self) -> dict[str, object]:
         """Copy the latest body LowCmd received by the simulator bridge."""
 
@@ -766,6 +782,13 @@ def _handle_request(
             "prime_low_state request",
         )
         return op, request_id, runner.prime_low_state()
+    if op == "refresh_low_state":
+        _exact_request(
+            source,
+            {"v", "op", "request_id"},
+            "refresh_low_state request",
+        )
+        return op, request_id, runner.refresh_low_state()
     if op == "low_command":
         _exact_request(
             source,
@@ -1231,6 +1254,19 @@ class ExternalGearBackend:
             except (AttributeError, TypeError, ValueError) as error:
                 raise ProtocolError(
                     "simulator cannot publish a no-step LowState prime"
+                ) from error
+
+    def refresh_low_state(self) -> None:
+        """Publish the latest observation without resetting the LowCmd receiver."""
+
+        with redirect_stdout(sys.stderr):
+            sim_env = self._simulator.sim_env
+            try:
+                sim_env.obs = sim_env.prepare_obs()
+                sim_env.unitree_bridge.PublishLowState(sim_env.obs)
+            except (AttributeError, TypeError, ValueError) as error:
+                raise ProtocolError(
+                    "simulator cannot refresh LowState without stepping"
                 ) from error
 
     def low_command_snapshot(self) -> Mapping[str, object]:

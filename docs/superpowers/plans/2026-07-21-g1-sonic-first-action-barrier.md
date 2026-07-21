@@ -335,8 +335,8 @@ git commit -m "fix: synchronize SONIC scored startup"
 
 **Interfaces:**
 - Produces: exact `low_command` snapshot protocol, complete authenticated action
-  snapshots, pinned action-to-target reconstruction, and a receiver-matched
-  startup receipt.
+  snapshots, fixed-nine action-to-target bounds, a receiver-matched startup
+  receipt, and a no-step LowState refresh before each GEAR resume.
 
 - [ ] Add RED backend/runner tests for absent receipt, exact 29-value finite
   target snapshots under the bridge lock, immutability, and malformed external
@@ -346,14 +346,17 @@ git commit -m "fix: synchronize SONIC scored startup"
 - [ ] Extend the owned `action.csv` parser to return all complete contiguous
   policy rows while retaining exact header/index/finite checks and bounded
   reads. Add the cancellation regression omitted from Task 1.
-- [ ] Add pinned float32 action-to-LowCmd reconstruction and qualification tests
-  against the official GEAR permutation/default-angle/action-scale declarations.
+- [ ] Add pinned float32 action-to-LowCmd reconstruction and fixed-nine rounding
+  bounds against the official GEAR permutation/default-angle/action-scale
+  declarations.
 - [ ] Add a bounded startup loop that holds a received LowCmd snapshot until a
   matching authenticated action row exists. It must check both child processes,
   honor cancellation, and fail on timeout without advancing physics.
 - [ ] Wire `_activate_scored_control` as resume, activate, inference row,
   receiver match, gate pause. Assert exact ordering and zero advance/time before
   the first `release_steps` call.
+- [ ] Wire one live cancellation callback into both production children and
+  refresh LowState without stepping immediately before each paused group resume.
 - [ ] Run the complete focused warning-strict suites and commit the corrected
   transport fence.
 

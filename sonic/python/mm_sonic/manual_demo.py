@@ -697,6 +697,8 @@ def run_demo(namespace: argparse.Namespace) -> Path:
         "--encoder-file",
         str(runtime / "model_encoder.onnx"),
     )
+    cancellation = threading.Event()
+    cancelled = cancellation.is_set
     gear = GearProcess(
         run_root=bundle.path,
         command=_stream_gear_command(base_command, publisher.endpoint),
@@ -706,6 +708,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
         stderr_archive=bundle.path / "gear.stderr",
         launch_profile="zmq_stream",
         readiness_timeout_s=120.0,
+        cancelled=cancelled,
         env=environment,
         cwd=gear_checkout / "gear_sonic_deploy",
     )
@@ -724,6 +727,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
         freeze_on_fall=namespace.onscreen,
         stdout_archive=bundle.path / "simulator.stdout",
         stderr_archive=bundle.path / "simulator.stderr",
+        cancelled=cancelled,
         env=environment,
         cwd=_REPOSITORY_ROOT,
     )
@@ -777,7 +781,6 @@ def run_demo(namespace: argparse.Namespace) -> Path:
         recorder.record(command)
         next_chunk += 1
 
-    cancellation = threading.Event()
     try:
         hello = mm.hello()
         _require_supported_movement_model(hello, namespace.movement_model)

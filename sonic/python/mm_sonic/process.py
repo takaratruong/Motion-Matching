@@ -29,7 +29,7 @@ from typing import Callable, Mapping, Sequence
 
 import numpy as np
 
-from .gear_action import policy_action_to_lowcmd_target
+from .gear_action import policy_action_lowcmd_target_bounds
 from .joints import ContractError
 from .transform import mujoco_to_holden_quaternions, mujoco_to_holden_vectors
 
@@ -1851,6 +1851,38 @@ class GatedSimulatorClient:
             )
         return result
 
+    def refresh_low_state(self) -> dict[str, object]:
+        """Republish current LowState without physics or receiver reset."""
+
+        if self._sim_dt_s is None:
+            raise ProcessError(
+                "gated simulator reset is required before LowState refresh"
+            )
+        data = _exact_object(
+            self._request("refresh_low_state"),
+            {"published", "steps", "sim_time_s", "state_rows", "contact_rows"},
+            "refresh_low_state data",
+        )
+        if data["published"] is not True:
+            raise ProcessProtocolError(
+                "refresh_low_state data.published must be true"
+            )
+        return {
+            "published": True,
+            "steps": _nonnegative_integer(
+                data["steps"], "refresh_low_state data.steps"
+            ),
+            "sim_time_s": _finite_number(
+                data["sim_time_s"], "refresh_low_state data.sim_time_s"
+            ),
+            "state_rows": _nonnegative_integer(
+                data["state_rows"], "refresh_low_state data.state_rows"
+            ),
+            "contact_rows": _nonnegative_integer(
+                data["contact_rows"], "refresh_low_state data.contact_rows"
+            ),
+        }
+
     def low_command_snapshot(self) -> Mapping[str, object]:
         """Return an immutable copy of the simulator receiver's latest LowCmd."""
 
@@ -2726,9 +2758,12 @@ class GearProcess:
                     "time_ms": policy[1],
                     "time_monotonic_ms": policy[3],
                     "action": tuple(policy[5:]),
+                    "action_decimal": tuple(raw_policy[5:]),
                 }
             )
-            for index, policy in enumerate(numeric_rows[1:], start=1)
+            for index, (policy, raw_policy) in enumerate(
+                zip(numeric_rows[1:], rows[2:], strict=True), start=1
+            )
         )
 
     def _read_first_policy_action(self) -> Mapping[str, object] | None:
@@ -2811,8 +2846,28 @@ class GearProcess:
                 )
 
             for action in self._read_policy_actions():
-                expected = policy_action_to_lowcmd_target(action["action"])
-                if expected in held_set:
+                try:
+                    lower, upper = policy_action_lowcmd_target_bounds(
+                        action["action_decimal"]
+                    )
+                except (KeyError, TypeError, ValueError) as error:
+                    raise ProcessError(
+                        "GEAR action log policy values must use fixed-nine decimals"
+                    ) from error
+                matching_target = next(
+                    (
+                        target
+                        for target in held_targets
+                        if all(
+                            low <= value <= high
+                            for low, value, high in zip(
+                                lower, target, upper, strict=True
+                            )
+                        )
+                    ),
+                    None,
+                )
+                if matching_target is not None:
                     return MappingProxyType(
                         {
                             "index": action["index"],
@@ -2821,7 +2876,7 @@ class GearProcess:
                                 "time_monotonic_ms"
                             ],
                             "action": action["action"],
-                            "q_target": expected,
+                            "q_target": matching_target,
                         }
                     )
             if _cancelled(self._cancelled):
@@ -3294,6 +3349,10 @@ class SimulationPolicyGate:
             raise _at_failure_site(error, "process_resume")
         try:
             self.simulator.require_alive()
+        except BaseException as error:
+            raise _at_failure_site(error, "simulator_advance")
+        try:
+            self.simulator.refresh_low_state()
         except BaseException as error:
             raise _at_failure_site(error, "simulator_advance")
         self._paused = False

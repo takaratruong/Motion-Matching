@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from typing import Sequence
 
 import numpy as np
@@ -43,6 +44,8 @@ _MOTOR_KINDS = (
 _ACTION_SCALES = tuple(
     0.25 * _EFFORT[kind] / _STIFFNESS[kind] for kind in _MOTOR_KINDS
 )
+_FIXED_NINE = re.compile(r"-?(?:0|[1-9][0-9]*)\.[0-9]{9}\Z")
+_CSV_HALF_QUANTUM = 0.5e-9
 
 
 def policy_action_to_lowcmd_target(
@@ -71,4 +74,44 @@ def policy_action_to_lowcmd_target(
     )
 
 
-__all__ = ["policy_action_to_lowcmd_target"]
+def policy_action_lowcmd_target_bounds(
+    action_decimal: Sequence[str],
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    """Bound every LowCmd target consistent with GEAR's fixed-nine CSV row."""
+
+    if len(action_decimal) != 29:
+        raise ValueError("policy action must contain exactly 29 decimal fields")
+    intervals: list[tuple[float, float]] = []
+    for index, value in enumerate(action_decimal):
+        if type(value) is not str or _FIXED_NINE.fullmatch(value) is None:
+            raise ValueError(
+                f"policy action decimal[{index}] must use exact fixed-nine format"
+            )
+        center = float(value)
+        if not math.isfinite(center):
+            raise ValueError(f"policy action decimal[{index}] must be finite")
+        # C++ fixed/setprecision(9) discards the source float32 within this
+        # half-quantum interval. Expand each binary64 endpoint outward once so
+        # decimal-to-binary conversion cannot under-approximate the real bin.
+        intervals.append(
+            (
+                math.nextafter(center - _CSV_HALF_QUANTUM, -math.inf),
+                math.nextafter(center + _CSV_HALF_QUANTUM, math.inf),
+            )
+        )
+
+    lower = []
+    upper = []
+    for target_index, source_index in enumerate(_ISAACLAB_TO_MUJOCO):
+        source_lower, source_upper = intervals[source_index]
+        scale = _ACTION_SCALES[target_index]
+        default = _DEFAULT_ANGLES[target_index]
+        lower.append(float(np.float32(default + source_lower * scale)))
+        upper.append(float(np.float32(default + source_upper * scale)))
+    return tuple(lower), tuple(upper)
+
+
+__all__ = [
+    "policy_action_lowcmd_target_bounds",
+    "policy_action_to_lowcmd_target",
+]

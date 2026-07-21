@@ -49,9 +49,11 @@ After `activate_control()` reports the authenticated CONTROL transition, GEAR
 will remain running while MuJoCo remains paused. The barrier will wait for the
 first policy-produced action after the logger's initial row, then obtain a
 receiver-side snapshot from the simulator's `rt/lowcmd` subscriber. A snapshot
-satisfies the barrier only when its 29 target joint positions exactly match a
-target reconstructed from an authenticated policy-action CSV row using the
-pinned GEAR permutation, action scales, default angles, and float32 conversion.
+satisfies the barrier only when its 29 target joint positions fall within the
+closed float32 target bounds implied by an authenticated fixed-nine-decimal
+policy-action CSV row. The bounds include every source float32 that GEAR could
+have rounded to that row, then apply the pinned permutation, action scales,
+default angles, and final float32 conversion.
 The snapshot is held fixed while later CSV rows arrive, so a fast 500 Hz writer
 cannot make the match unobservable. Once a received command is authenticated,
 the existing `SimulationPolicyGate.pause()` stops the full GEAR process group.
@@ -77,12 +79,14 @@ The method will:
 4. Validate the row shape and finite action values before returning evidence.
 5. Time out with `ProcessError` and leave physics unreleased.
 
-The gated simulator will add two exact protocol operations:
+The gated simulator will add three exact protocol operations:
 
 - `prime_low_state`: reset bridge receipt flags and publish the current reset
   observation without changing physics or time;
 - `low_command`: return whether a body command was received and, if so, an
-  immutable copy of its 29 finite target joint positions.
+  immutable copy of its 29 finite target joint positions;
+- `refresh_low_state`: republish the current observation without stepping or
+  clearing the receiver, immediately before a paused GEAR group resumes.
 
 The manual driver will reconstruct pinned LowCmd targets from authenticated
 action rows and wait until a held receiver snapshot matches one. It will report
@@ -90,7 +94,9 @@ both the inference index and the received-command index as startup evidence.
 
 `manual_demo.run_demo()` will call the barrier immediately after
 `gear.activate_control()` and before constructing and pausing the
-`SimulationPolicyGate`. Other runners will not change in this patch.
+`SimulationPolicyGate`. Each later policy-gate release refreshes LowState while
+GEAR is still stopped, preventing the resumed watchdog from seeing the
+intentional inference pause as a lost robot connection.
 
 ## Failure behavior
 
@@ -114,6 +120,10 @@ Tests will be written before production code and will prove:
 - scored LowState priming changes neither qpos, MuJoCo time, nor step count;
 - a stale, absent, malformed, or policy-unmatched LowCmd cannot satisfy startup;
 - a receiver snapshot matching an authenticated policy row satisfies startup;
+- fixed-nine CSV rounding cannot reject a genuine received float32 target;
+- every paused-to-running release refreshes LowState before `SIGCONT`;
+- the production driver wires one cooperative-cancellation callback into both
+  child-process lifecycles;
 - the manual demo orders reset, no-step prime, resume, activate, inference
   evidence, receiver match, gate pause, and only then physics release;
 - no elastic-band or target-motion behavior changes.

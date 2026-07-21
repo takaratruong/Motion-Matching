@@ -513,6 +513,14 @@ class GatedSimulatorClientTests(TemporaryScriptCase):
                         "state_rows": 0,
                         "contact_rows": 0,
                     }
+                elif op == "refresh_low_state":
+                    data = {
+                        "published": True,
+                        "steps": 0,
+                        "sim_time_s": 0.0,
+                        "state_rows": 0,
+                        "contact_rows": 0,
+                    }
                 elif op == "low_command":
                     data = {
                         "received": True,
@@ -557,6 +565,16 @@ class GatedSimulatorClientTests(TemporaryScriptCase):
             self.assertEqual(client.sim_dt, reset["sim_dt_s"])
             self.assertEqual(
                 client.prime_low_state(),
+                {
+                    "published": True,
+                    "steps": 0,
+                    "sim_time_s": 0.0,
+                    "state_rows": 0,
+                    "contact_rows": 0,
+                },
+            )
+            self.assertEqual(
+                client.refresh_low_state(),
                 {
                     "published": True,
                     "steps": 0,
@@ -2366,12 +2384,14 @@ class GearProcessTests(TemporaryScriptCase):
             "time_ms": 20.0,
             "time_monotonic_ms": 22.0,
             "action": (0.25,) * 29,
+            "action_decimal": ("0.250000000",) * 29,
         }
         second = {
             "index": 2,
             "time_ms": 40.0,
             "time_monotonic_ms": 42.0,
             "action": (-0.5,) * 29,
+            "action_decimal": ("-0.500000000",) * 29,
         }
         received_target = policy_action_to_lowcmd_target(second["action"])
 
@@ -2415,6 +2435,7 @@ class GearProcessTests(TemporaryScriptCase):
             "time_ms": 20.0,
             "time_monotonic_ms": 22.0,
             "action": (0.25,) * 29,
+            "action_decimal": ("0.250000000",) * 29,
         }
         wrong_target = policy_action_to_lowcmd_target((-0.5,) * 29)
 
@@ -2436,6 +2457,48 @@ class GearProcessTests(TemporaryScriptCase):
             ):
                 with self.assertRaisesRegex(ProcessError, "timed out.*received"):
                     gear.wait_for_received_policy_command(Simulator())
+        finally:
+            gear.close()
+
+    def test_received_policy_command_accepts_target_hidden_by_csv_rounding(self):
+        child = self.script("unused_quantized_command.py", "raise SystemExit(0)\n")
+        gear = self.gear(
+            child,
+            readiness_timeout_s=0.1,
+            readiness_poll_s=0.001,
+        )
+        actual = [np.float32(0.0)] * 29
+        actual[0] = np.float32(0.006111744325608015)
+        decimal = tuple(f"{float(value):.9f}" for value in actual)
+        action = {
+            "index": 1,
+            "time_ms": 20.0,
+            "time_monotonic_ms": 22.0,
+            "action": tuple(float(value) for value in decimal),
+            "action_decimal": decimal,
+        }
+        received_target = policy_action_to_lowcmd_target(actual)
+
+        class Simulator:
+            @staticmethod
+            def require_alive():
+                return None
+
+            @staticmethod
+            def low_command_snapshot():
+                return {"received": True, "q_target": received_target}
+
+        gear._control_active = True
+        try:
+            with (
+                patch.object(gear, "group_is_resumed", return_value=True),
+                patch.object(gear, "require_alive", return_value=None),
+                patch.object(gear, "_read_policy_actions", return_value=(action,)),
+            ):
+                receipt = gear.wait_for_received_policy_command(Simulator())
+
+            self.assertEqual(receipt["index"], 1)
+            self.assertEqual(receipt["q_target"], received_target)
         finally:
             gear.close()
 
@@ -3416,6 +3479,7 @@ class FakeSimulatorClient:
         self.delta_error = delta_error
         self.steps = []
         self.running_checks = []
+        self.refresh_stopped_checks = []
         self.gear = None
         self.closed = False
 
@@ -3430,6 +3494,12 @@ class FakeSimulatorClient:
             state_rows=steps // 4,
             contact_rows=steps,
         )
+
+    def refresh_low_state(self):
+        self.refresh_stopped_checks.append(
+            self.gear is None or self.gear.group_is_stopped()
+        )
+        return {"published": True}
 
     def require_alive(self):
         return None
@@ -3495,6 +3565,7 @@ class SimulationPolicyGateTests(TemporaryScriptCase):
         result = gate.advance(0.4)
 
         self.assertEqual(result.steps, 80)
+        self.assertEqual(simulator.refresh_stopped_checks, [True])
         self.assertEqual(simulator.steps, [80])
         self.assertEqual(simulator.running_checks, [True])
         self.assertTrue(gate.is_paused)

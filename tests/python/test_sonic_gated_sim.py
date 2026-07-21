@@ -38,6 +38,7 @@ class FakeBackend:
         self.step_calls = 0
         self.sample_calls = 0
         self.prime_calls = 0
+        self.refresh_calls = 0
         self.low_command_received = False
         self.low_command_q_target = np.zeros(29, dtype=np.float32)
         self.camera_calls = []
@@ -91,6 +92,9 @@ class FakeBackend:
 
     def prime_low_state(self):
         self.prime_calls += 1
+
+    def refresh_low_state(self):
+        self.refresh_calls += 1
 
     def low_command_snapshot(self):
         return {
@@ -398,6 +402,18 @@ class GatedSimulatorRunnerTests(unittest.TestCase):
         np.testing.assert_array_equal(backend.data.qpos, before_qpos)
         self.assertEqual(backend.data.time, before_time)
         self.assertEqual(self.runner.snapshot(), before_snapshot)
+
+    def test_refresh_low_state_preserves_existing_epoch_evidence(self):
+        self.reset()
+        self.runner.advance(4)
+        backend = self.backends[-1]
+        before = self.runner.snapshot()
+
+        result = self.runner.refresh_low_state()
+
+        self.assertEqual(result, {"published": True, **before})
+        self.assertEqual(backend.refresh_calls, 1)
+        self.assertEqual(self.runner.snapshot(), before)
 
     def test_low_command_snapshot_is_receiver_owned_and_does_not_step(self):
         with self.assertRaisesRegex(ProtocolError, "reset is required"):
@@ -769,6 +785,48 @@ class GatedSimulatorProtocolTests(unittest.TestCase):
         self.assertEqual(backend.prime_calls, 1)
         self.assertEqual(backend.step_calls, 0)
 
+    def test_refresh_low_state_protocol_preserves_current_epoch(self):
+        qpos = [0.0] * 36
+        qpos[2] = 0.8
+        qpos[3] = 1.0
+        reset = json.dumps(
+            {
+                "v": 1,
+                "op": "reset",
+                "request_id": "r0",
+                "scene_xml": str(self.scene),
+                "initial_qpos": qpos,
+                "lateral_offset_m": 0.0,
+                "yaw_offset_rad": 0.0,
+                "log_dir": str(self.root / "refresh-sim"),
+                "elastic_band_enabled": False,
+            },
+            separators=(",", ":"),
+        )
+        responses, backend = self.run_server(
+            [
+                reset,
+                '{"v":1,"op":"advance","request_id":"r1","steps":4}',
+                '{"v":1,"op":"refresh_low_state","request_id":"r2"}',
+                '{"v":1,"op":"snapshot","request_id":"r3"}',
+                '{"v":1,"op":"refresh_low_state","request_id":"r4","extra":0}',
+                '{"v":1,"op":"close","request_id":"r5"}',
+            ]
+        )
+
+        expected = {
+            "steps": 4,
+            "sim_time_s": 0.02,
+            "state_rows": 1,
+            "contact_rows": 4,
+        }
+        self.assertEqual(responses[2]["data"], {"published": True, **expected})
+        self.assertEqual(responses[3]["data"], expected)
+        self.assertEqual(backend.refresh_calls, 1)
+        self.assertEqual(backend.step_calls, 4)
+        self.assertFalse(responses[4]["ok"])
+        self.assertIn("keys differ", responses[4]["error"]["message"])
+
     def test_reset_request_echoes_band_boolean_and_rejects_nonboolean(self):
         def reset_request(band):
             return json.dumps(
@@ -938,6 +996,28 @@ class ExternalGearBackendBoundaryTests(unittest.TestCase):
         self.assertIs(sim_env.obs, obs)
         self.assertEqual(sim_env.mj_data.time, 0.0)
         np.testing.assert_array_equal(sim_env.mj_data.qpos, qpos)
+
+    def test_refresh_low_state_publishes_without_reset_or_step(self):
+        events = []
+        obs = {"time": 0.4}
+        bridge = SimpleNamespace(
+            reset=lambda: events.append("receipt-reset"),
+            PublishLowState=lambda value: events.append(("publish", value)),
+        )
+        sim_env = SimpleNamespace(
+            mj_data=SimpleNamespace(time=0.4),
+            unitree_bridge=bridge,
+            prepare_obs=lambda: events.append("prepare") or obs,
+            sim_step=lambda: events.append("step"),
+        )
+        backend = ExternalGearBackend.__new__(ExternalGearBackend)
+        backend._simulator = SimpleNamespace(sim_dt=0.005, sim_env=sim_env)
+
+        backend.refresh_low_state()
+
+        self.assertEqual(events, ["prepare", ("publish", obs)])
+        self.assertIs(sim_env.obs, obs)
+        self.assertEqual(sim_env.mj_data.time, 0.4)
 
     def test_low_command_snapshot_copies_exact_receiver_target(self):
         target = np.linspace(-0.5, 0.5, 29, dtype=np.float32)

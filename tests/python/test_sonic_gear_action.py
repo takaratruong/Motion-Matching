@@ -2,7 +2,10 @@ import unittest
 
 import numpy as np
 
-from mm_sonic.gear_action import policy_action_to_lowcmd_target
+from mm_sonic.gear_action import (
+    policy_action_lowcmd_target_bounds,
+    policy_action_to_lowcmd_target,
+)
 
 
 class PolicyActionToLowCmdTargetTests(unittest.TestCase):
@@ -70,6 +73,27 @@ class PolicyActionToLowCmdTargetTests(unittest.TestCase):
         for action in ((0.0,) * 28, (0.0,) * 28 + (True,), (0.0,) * 28 + (float("nan"),)):
             with self.subTest(action=action[-1]), self.assertRaises(ValueError):
                 policy_action_to_lowcmd_target(action)
+
+    def test_nine_decimal_bounds_include_target_from_discarded_float32_bits(self):
+        actual = [np.float32(0.0)] * 29
+        actual[0] = np.float32(0.006111744325608015)
+        logged = tuple(f"{float(value):.9f}" for value in actual)
+        target = policy_action_to_lowcmd_target(actual)
+
+        lower, upper = policy_action_lowcmd_target_bounds(logged)
+
+        self.assertEqual(logged[0], "0.006111744")
+        self.assertNotEqual(
+            target[0],
+            policy_action_to_lowcmd_target(tuple(float(value) for value in logged))[0],
+        )
+        self.assertLessEqual(lower[0], target[0])
+        self.assertGreaterEqual(upper[0], target[0])
+
+    def test_decimal_bounds_require_exact_fixed_nine_action_fields(self):
+        for value in ("0", "0.0", "+0.000000000", "nan", " 0.000000000"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                policy_action_lowcmd_target_bounds((value,) + ("0.000000000",) * 28)
 
 
 if __name__ == "__main__":
