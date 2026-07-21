@@ -360,7 +360,8 @@ void test_provider_backed_lifecycle_submits_after_native_funnel() {
     const interaction::PickAssistOutput selection =
         backend.observe(lifecycle_observation(10U, target, entry));
     assert(provider.begin_calls == 1);
-    assert(provider.wait_calls == 1);
+    assert(provider.poll_calls == 1);
+    assert(provider.wait_calls == 0);
     assert(selection.preview_requests.size() == 31U);
     assert(backend.learned_diagnostics().state ==
            interaction::LearnedPickupState::SelectionPreview);
@@ -377,7 +378,7 @@ void test_provider_backed_lifecycle_submits_after_native_funnel() {
         preview.total_cost = static_cast<float>(request.slot_id);
         selected.preview_results.push_back({request, preview});
     }
-    assert(backend.observe(selected).stationary_constraint);
+    assert(!backend.observe(selected).stationary_constraint);
     assert(backend.learned_diagnostics().state ==
            interaction::LearnedPickupState::FunnelFollow);
     assert(backend.learned_diagnostics().selected_proposal_index == 1);
@@ -448,6 +449,97 @@ void test_provider_timeout_fails_closed_and_cancels_worker() {
     assert(!backend.take_submission(1U).has_value());
 }
 
+void test_moving_entry_prefetch_keeps_walking_until_handoff() {
+    FakeProposalProvider provider;
+    LearnedSmartPickupBackend backend(provider, {});
+    const auto target = lifecycle_target();
+    const interaction::Transform far_root{
+        vec3(0.0F, 0.0F, 3.0F),
+        quat_from_angle_axis(PIf, vec3(0.0F, 1.0F, 0.0F)),
+    };
+    interaction::PickAssistStart start{};
+    start.target_snapshot = target;
+    start.affordance_id = 7U;
+    start.root_world = far_root;
+    start.controller_tick = 10U;
+    assert(backend.begin(start, &target));
+
+    interaction::PickAssistObservation moving =
+        lifecycle_observation(10U, target, far_root);
+    moving.simulation_velocity = vec3(0.0F, 0.0F, -0.4F);
+    moving.displayed_planar_speed_mps = 0.4F;
+    const interaction::PickAssistOutput launched = backend.observe(moving);
+    assert(provider.begin_calls == 1);
+    assert(provider.wait_calls == 0);
+    assert(std::abs(provider.request.condition[18]) < 1.0e-6F);
+    assert(std::abs(provider.request.condition[19] - 1.0F) < 1.0e-6F);
+    assert(launched.override_steering);
+    assert(!launched.stationary_constraint);
+    assert(length(vec2(launched.left_stick.x, launched.left_stick.z)) > 0.0F);
+
+    interaction::Transform approaching = far_root;
+    approaching.position.z = 2.5F;
+    interaction::PickAssistObservation pending =
+        lifecycle_observation(11U, target, approaching);
+    pending.simulation_velocity = moving.simulation_velocity;
+    pending.displayed_planar_speed_mps = moving.displayed_planar_speed_mps;
+    const interaction::PickAssistOutput still_walking = backend.observe(pending);
+    assert(provider.poll_calls == 2);
+    assert(provider.wait_calls == 0);
+    assert(still_walking.override_steering);
+    assert(!still_walking.stationary_constraint);
+    assert(still_walking.preview_requests.empty());
+
+    provider.ready = true;
+    approaching.position.z = 2.0F;
+    const interaction::PickAssistOutput selection = backend.observe(
+        lifecycle_observation(12U, target, approaching));
+    assert(selection.preview_requests.size() == 31U);
+    assert(selection.override_steering);
+    assert(!selection.stationary_constraint);
+    assert(backend.learned_diagnostics().state ==
+           interaction::LearnedPickupState::SelectionPreview);
+
+    approaching.position.z = 1.8F;
+    interaction::PickAssistObservation selected =
+        lifecycle_observation(13U, target, approaching);
+    selected.preview_snapshot_fingerprint = selected.snapshot_fingerprint;
+    for (const interaction::PickAssistPreviewRequest& request :
+         selection.preview_requests) {
+        interaction::PickEntryPreview preview{};
+        preview.path_feasible = true;
+        preview.match_ready = true;
+        preview.prospective_root = request.root;
+        preview.total_cost = static_cast<float>(request.slot_id);
+        selected.preview_results.push_back({request, preview});
+    }
+    const interaction::PickAssistOutput waiting = backend.observe(selected);
+    assert(backend.learned_diagnostics().state ==
+           interaction::LearnedPickupState::AwaitEntry);
+    assert(waiting.override_steering);
+    assert(!waiting.stationary_constraint);
+    const auto prefetched_debug = backend.learned_debug_snapshot();
+    assert(prefetched_debug.has_value());
+    assert(prefetched_debug->active);
+    assert(!prefetched_debug->world_route.empty());
+
+    approaching.position.z = 1.3F;
+    const interaction::PickAssistOutput outside_entry = backend.observe(
+        lifecycle_observation(14U, target, approaching));
+    assert(backend.learned_diagnostics().state ==
+           interaction::LearnedPickupState::AwaitEntry);
+    assert(outside_entry.override_steering);
+    assert(!outside_entry.stationary_constraint);
+
+    approaching.position.z = 1.11F;
+    const interaction::PickAssistOutput handed_off = backend.observe(
+        lifecycle_observation(15U, target, approaching));
+    assert(backend.learned_diagnostics().state ==
+           interaction::LearnedPickupState::FunnelFollow);
+    assert(handed_off.override_steering);
+    assert(!handed_off.stationary_constraint);
+}
+
 void test_capture_handoff_freezes_actual_pose_after_entering_annulus() {
     FakeProposalProvider provider;
     provider.ready = true;
@@ -483,7 +575,8 @@ void test_capture_handoff_freezes_actual_pose_after_entering_annulus() {
     const interaction::PickAssistOutput selection = backend.observe(moving);
 
     assert(provider.begin_calls == 1);
-    assert(provider.wait_calls == 1);
+    assert(provider.poll_calls == 1);
+    assert(provider.wait_calls == 0);
     assert(selection.preview_requests.size() == 31U);
     assert(std::abs(provider.request.condition[18] - 0.4F) < 1.0e-6F);
     assert(std::abs(provider.request.condition[19] - 0.8F) < 1.0e-6F);
@@ -580,6 +673,7 @@ int main() {
     test_arm_is_rejected_when_no_proposal_accepted();
     test_provider_backed_lifecycle_submits_after_native_funnel();
     test_provider_timeout_fails_closed_and_cancels_worker();
+    test_moving_entry_prefetch_keeps_walking_until_handoff();
     test_capture_handoff_freezes_actual_pose_after_entering_annulus();
     test_provider_proposal_terminal_is_anchored_to_object_not_entry();
     test_no_accepted_proposal_and_malformed_preview_fail_closed();

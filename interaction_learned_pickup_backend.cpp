@@ -264,37 +264,27 @@ PickAssistOutput LearnedSmartPickupBackend::observe_learned(
                 config_.capture.route) != PickSlotReason::None) {
             return fail(LearnedPickupFailureReason::RouteBlocked);
         }
-        if (!capture_ready) {
+        const bool should_prefetch = capture_ready ||
+            observation.displayed_planar_speed_mps >=
+                config_.prefetch_minimum_planar_speed_mps;
+        if (!should_prefetch) {
             learned_diagnostics_.state = LearnedPickupState::CoarseCapture;
             diagnostics_.state = PickAssistState::SlotApproach;
-            PickAssistOutput output{};
-            output.override_steering = true;
-            output.force_strafe = true;
-            output.left_stick = arrival_navigation_stick(
-                capture_.target_world.position,
-                observation.displayed_root.position,
-                observation.camera_azimuth,
-                config_.arrival);
-            output.right_stick = arrival_facing_stick(
-                quat_mul_vec3(
-                    capture_.target_world.rotation,
-                    vec3(0.0F, 0.0F, 1.0F)),
-                observation.camera_azimuth);
-            return output;
+            return coarse_capture_output(observation);
         }
         const GraspAffordance* affordance = find_affordance(
             start_.target_snapshot, start_.affordance_id);
         const auto condition = affordance == nullptr
             ? std::nullopt
             : build_funnel_condition(
-                  observation.displayed_root,
+                  capture_.target_world,
                   observation.simulation_velocity,
                   start_.target_snapshot,
                   *affordance);
         if (!condition.has_value()) {
             return fail(LearnedPickupFailureReason::InvalidCondition);
         }
-        frozen_entry_world_ = observation.displayed_root;
+        frozen_entry_world_ = capture_.target_world;
         proposal_request_ = {};
         proposal_request_.request_id = observation.controller_tick ==
                 std::numeric_limits<uint64_t>::max()
@@ -308,8 +298,8 @@ PickAssistOutput LearnedSmartPickupBackend::observe_learned(
             return fail(LearnedPickupFailureReason::ProposalLaunchFailed);
         }
         learned_diagnostics_.state = LearnedPickupState::ProposalPending;
-        diagnostics_.state = PickAssistState::SlotSelectionPreview;
-        return consume_proposal_poll(observation, provider_->wait());
+        diagnostics_.state = PickAssistState::SlotApproach;
+        return consume_proposal_poll(observation, provider_->poll());
     }
     case LearnedPickupState::ProposalPending: {
         ++learned_diagnostics_.proposal_pending_ticks;
@@ -317,7 +307,7 @@ PickAssistOutput LearnedSmartPickupBackend::observe_learned(
             config_.maximum_proposal_pending_ticks) {
             return fail(LearnedPickupFailureReason::ProposalTimeout);
         }
-        return consume_proposal_poll(observation, provider_->wait());
+        return consume_proposal_poll(observation, provider_->poll());
     }
     case LearnedPickupState::SelectionPreview: {
         if (observation.preview_results.size() != selection_requests_.size() ||
@@ -386,15 +376,24 @@ PickAssistOutput LearnedSmartPickupBackend::observe_learned(
         const FunnelProposal& proposal = artifact_->proposals()[proposal_index];
         selected_world_targets_ = world_targets(frozen_object_world_, proposal);
         final_root_ = entry_root(selected_world_targets_.back());
-        follower_.emplace(
-            proposal.seed, proposal.samples, observation.controller_tick + 1U);
-        learned_diagnostics_.armed = true;
-        learned_diagnostics_.armed_seed = proposal.seed;
         learned_diagnostics_.selected_proposal_index =
             static_cast<int>(proposal_index);
-        learned_diagnostics_.state = LearnedPickupState::FunnelFollow;
-        refresh_follower_diagnostics();
-        return braking_output();
+        learned_diagnostics_.state = LearnedPickupState::AwaitEntry;
+        diagnostics_.state = PickAssistState::SlotApproach;
+        (void)arm_selected_if_at_entry(observation);
+        return coarse_capture_output(observation);
+    }
+    case LearnedPickupState::AwaitEntry: {
+        if (revalidate_frozen_pick_slot(
+                observation.displayed_root,
+                frozen_entry_world_,
+                start_.target_snapshot,
+                observation.live_obstacles,
+                config_.capture.route) != PickSlotReason::None) {
+            return fail(LearnedPickupFailureReason::RouteBlocked);
+        }
+        (void)arm_selected_if_at_entry(observation);
+        return coarse_capture_output(observation);
     }
     case LearnedPickupState::FunnelFollow: {
         const int next = follower_->diagnostics().progress_index;
@@ -482,7 +481,7 @@ PickAssistOutput LearnedSmartPickupBackend::consume_proposal_poll(
     const PickAssistObservation& observation,
     FunnelProposalPoll poll) {
     if (poll.state == FunnelProposalPollState::Pending) {
-        return braking_output();
+        return coarse_capture_output(observation);
     }
     if (poll.state != FunnelProposalPollState::Ready ||
         !poll.artifact.has_value()) {
@@ -537,9 +536,59 @@ PickAssistOutput LearnedSmartPickupBackend::consume_proposal_poll(
         return fail(LearnedPickupFailureReason::NoAcceptedProposal);
     }
     learned_diagnostics_.state = LearnedPickupState::SelectionPreview;
-    PickAssistOutput output = braking_output();
+    diagnostics_.state = PickAssistState::SlotSelectionPreview;
+    PickAssistOutput output = coarse_capture_output(observation);
     output.preview_requests = selection_requests_;
     return output;
+}
+
+PickAssistOutput LearnedSmartPickupBackend::coarse_capture_output(
+    const PickAssistObservation& observation) const {
+    const Transform& target =
+        learned_diagnostics_.state == LearnedPickupState::CoarseCapture ||
+        learned_diagnostics_.state == LearnedPickupState::CaptureSettling
+        ? capture_.target_world
+        : frozen_entry_world_;
+    PickAssistOutput output{};
+    output.override_steering = true;
+    output.force_strafe = true;
+    output.left_stick = arrival_navigation_stick(
+        target.position,
+        observation.displayed_root.position,
+        observation.camera_azimuth,
+        config_.arrival);
+    output.right_stick = arrival_facing_stick(
+        quat_mul_vec3(target.rotation, vec3(0.0F, 0.0F, 1.0F)),
+        observation.camera_azimuth);
+    return output;
+}
+
+bool LearnedSmartPickupBackend::arm_selected_if_at_entry(
+    const PickAssistObservation& observation) {
+    if (learned_diagnostics_.state != LearnedPickupState::AwaitEntry ||
+        planar_distance(
+            observation.displayed_root.position,
+            frozen_entry_world_.position) >
+            config_.handoff_position_tolerance_m ||
+        yaw_error(
+            observation.displayed_root.rotation,
+            frozen_entry_world_.rotation) >
+            config_.capture_yaw_tolerance_radians ||
+        !artifact_.has_value() ||
+        learned_diagnostics_.selected_proposal_index < 0) {
+        return false;
+    }
+    const size_t proposal_index = static_cast<size_t>(
+        learned_diagnostics_.selected_proposal_index);
+    if (proposal_index >= artifact_->proposals().size()) return false;
+    const FunnelProposal& proposal = artifact_->proposals()[proposal_index];
+    follower_.emplace(
+        proposal.seed, proposal.samples, observation.controller_tick + 1U);
+    learned_diagnostics_.armed = true;
+    learned_diagnostics_.armed_seed = proposal.seed;
+    learned_diagnostics_.state = LearnedPickupState::FunnelFollow;
+    refresh_follower_diagnostics();
+    return true;
 }
 
 std::optional<PickRequest> LearnedSmartPickupBackend::take_submission(
@@ -578,7 +627,7 @@ const PickAssistDiagnostics& LearnedSmartPickupBackend::diagnostics() const {
 
 std::optional<LearnedPickupDebugSnapshot>
 LearnedSmartPickupBackend::learned_debug_snapshot() const {
-    if (provider_ == nullptr || !follower_.has_value() ||
+    if (provider_ == nullptr ||
         learned_diagnostics_.selected_proposal_index < 0) {
         return std::nullopt;
     }

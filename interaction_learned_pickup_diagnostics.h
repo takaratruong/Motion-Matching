@@ -20,6 +20,7 @@ enum class LearnedPickupState : uint8_t {
     CaptureSettling,
     ProposalPending,
     SelectionPreview,
+    AwaitEntry,
     FunnelFollow,
     FinalPreview,
     ReadyToSubmit,

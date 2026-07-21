@@ -33,7 +33,9 @@ struct LearnedPickupConfig {
     ArrivalConfig arrival{};
     uint32_t maximum_proposal_pending_ticks = 250U;
     float capture_position_tolerance_m = 0.03F;
+    float handoff_position_tolerance_m = 0.12F;
     float capture_yaw_tolerance_radians = 20.0F * PIf / 180.0F;
+    float prefetch_minimum_planar_speed_mps = 0.05F;
     uint64_t batch_seed = 2026071901U;
     std::array<uint8_t, 32> checkpoint_sha256{};
 };
@@ -75,6 +77,10 @@ private:
     PickAssistOutput consume_proposal_poll(
         const PickAssistObservation& observation,
         FunnelProposalPoll poll);
+    PickAssistOutput coarse_capture_output(
+        const PickAssistObservation& observation) const;
+    bool arm_selected_if_at_entry(
+        const PickAssistObservation& observation);
     PickAssistOutput fail(LearnedPickupFailureReason reason);
     PickAssistOutput braking_output() const;
     bool authority_matches(const PickAssistObservation& observation) const;
