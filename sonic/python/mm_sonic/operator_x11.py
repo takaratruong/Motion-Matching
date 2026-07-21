@@ -538,6 +538,12 @@ class X11KeyStateProvider:
         ]
         lib.XUngrabKey.restype = ctypes.c_int
 
+    @property
+    def target_bound(self) -> bool:
+        """Whether command-key grabs are installed on a live target window."""
+
+        return not self._closed and self._grabbed_window != 0
+
     def _fetch_name(self, window: int) -> str | None:
         name_ptr = ctypes.c_char_p()
         status = int(

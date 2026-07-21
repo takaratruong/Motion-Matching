@@ -26,6 +26,14 @@ from mm_sonic.gated_sim import (
 )
 
 
+class _NoopViewerLock:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+
 class FakeBackend:
     def __init__(self, *, nq=36, sim_dt=0.005, wall_clock_pacing=False):
         self._model = SimpleNamespace(nq=nq)
@@ -1146,6 +1154,7 @@ class ExternalGearBackendBoundaryTests(unittest.TestCase):
                 viewer = SimpleNamespace(
                     opt=SimpleNamespace(flags=[0] * 31, geomgroup=[0] * 6),
                     is_running=lambda: True,
+                    lock=_NoopViewerLock,
                 )
 
                 def base_simulator(**kwargs):
@@ -1329,6 +1338,7 @@ class ExternalGearBackendBoundaryTests(unittest.TestCase):
         sim_env.viewer = SimpleNamespace(
             opt=SimpleNamespace(flags=[0] * 31, geomgroup=[0] * 6),
             is_running=lambda: True,
+            lock=_NoopViewerLock,
         )
         return sim_env
 
@@ -1826,6 +1836,18 @@ def _external_module_names():
 
 
 class OnscreenViewerNormalizationTests(unittest.TestCase):
+    class _ViewerLock:
+        def __init__(self, events: list[str]) -> None:
+            self._events = events
+
+        def __enter__(self):
+            self._events.append("lock_enter")
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            self._events.append("lock_exit")
+            return False
+
     @staticmethod
     def _bindings():
         return SimpleNamespace(
@@ -1835,24 +1857,29 @@ class OnscreenViewerNormalizationTests(unittest.TestCase):
         )
 
     @staticmethod
-    def _running_sim_env():
+    def _running_sim_env(lock_events: list[str] | None = None):
+        events = lock_events if lock_events is not None else []
         viewer = SimpleNamespace(
             opt=SimpleNamespace(flags=[0] * 31, geomgroup=[0] * 6),
             is_running=lambda: True,
+            lock=lambda: OnscreenViewerNormalizationTests._ViewerLock(events),
         )
         return SimpleNamespace(viewer=viewer)
 
     def test_onscreen_backend_enables_static_terrain_presentation(self) -> None:
-        sim_env = self._running_sim_env()
+        lock_events: list[str] = []
+        sim_env = self._running_sim_env(lock_events)
         _normalize_onscreen_viewer(sim_env, self._bindings().mujoco)
         self.assertEqual(sim_env.viewer.opt.flags[22], 1)
         self.assertEqual(sim_env.viewer.opt.geomgroup[2], 1)
+        self.assertEqual(lock_events, ["lock_enter", "lock_exit"])
 
     def test_normalization_does_not_step_or_sync(self) -> None:
         events: list[str] = []
         viewer = SimpleNamespace(
             opt=SimpleNamespace(flags=[0] * 31, geomgroup=[0] * 6),
             is_running=lambda: True,
+            lock=lambda: self._ViewerLock(events),
         )
         sim_env = SimpleNamespace(
             viewer=viewer,
@@ -1860,7 +1887,7 @@ class OnscreenViewerNormalizationTests(unittest.TestCase):
             update_viewer=lambda: events.append("sync"),
         )
         _normalize_onscreen_viewer(sim_env, self._bindings().mujoco)
-        self.assertEqual(events, [])
+        self.assertEqual(events, ["lock_enter", "lock_exit"])
 
     def test_rejects_missing_viewer(self) -> None:
         sim_env = SimpleNamespace(viewer=None)
@@ -1871,6 +1898,7 @@ class OnscreenViewerNormalizationTests(unittest.TestCase):
         viewer = SimpleNamespace(
             opt=SimpleNamespace(flags=[0] * 31, geomgroup=[0] * 6),
             is_running=lambda: False,
+            lock=lambda: self._ViewerLock([]),
         )
         sim_env = SimpleNamespace(viewer=viewer)
         with self.assertRaisesRegex(ProtocolError, "viewer"):
@@ -1881,6 +1909,7 @@ class OnscreenViewerNormalizationTests(unittest.TestCase):
         viewer = SimpleNamespace(
             opt=SimpleNamespace(flags=flags, geomgroup=[0]),
             is_running=lambda: True,
+            lock=lambda: self._ViewerLock([]),
         )
         sim_env = SimpleNamespace(viewer=viewer)
         with self.assertRaisesRegex(ProtocolError, "viewer presentation"):

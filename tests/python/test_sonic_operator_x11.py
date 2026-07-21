@@ -520,6 +520,19 @@ class X11GrabLifecycleTests(unittest.TestCase):
         self.assertEqual(provider._grabbed_window, 0)
         self.assertEqual(provider._lib.query_keymap_calls, 0)
 
+    def test_sample_rebinds_before_reading_a_new_target_window(self) -> None:
+        provider = self._recording_provider()
+        provider._focus_window = lambda: 17
+        targets = iter((41, 42))
+        provider._target_window = lambda window: next(targets)
+
+        provider.sample()
+        provider.sample()
+
+        self.assertEqual(provider._lib.ungrabbed_windows, [41])
+        self.assertEqual(provider._grabbed_window, 42)
+        self.assertEqual(provider._lib.query_keymap_calls, 2)
+
     def test_close_is_idempotent(self) -> None:
         provider = self._recording_provider()
         provider._bind_target_window(91)

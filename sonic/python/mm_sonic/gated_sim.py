@@ -1097,31 +1097,51 @@ def _normalize_onscreen_viewer(sim_env: object, mujoco_module: object) -> None:
         raise ProtocolError(
             "onscreen viewer must be running to normalize presentation"
         )
-    opt = getattr(viewer, "opt", None)
-    flags = getattr(opt, "flags", None)
-    geomgroup = getattr(opt, "geomgroup", None)
-    try:
-        static_index = int(mujoco_module.mjtVisFlag.mjVIS_STATIC)
-        if static_index < 0 or len(flags) <= static_index or len(geomgroup) <= 2:
-            raise IndexError
-        previous_static = flags[static_index]
-        previous_terrain_group = geomgroup[2]
-    except (AttributeError, TypeError, ValueError, OverflowError, IndexError) as error:
-        raise ProtocolError(
-            "onscreen viewer presentation arrays are malformed"
-        ) from error
-    try:
-        flags[static_index] = 1
-        geomgroup[2] = 1
-    except (TypeError, ValueError, OverflowError, IndexError, KeyError) as error:
+    lock = getattr(viewer, "lock", None)
+    if not callable(lock):
+        raise ProtocolError("onscreen viewer presentation lock is unavailable")
+    with lock():
+        opt = getattr(viewer, "opt", None)
+        flags = getattr(opt, "flags", None)
+        geomgroup = getattr(opt, "geomgroup", None)
         try:
-            flags[static_index] = previous_static
-            geomgroup[2] = previous_terrain_group
-        except (TypeError, ValueError, OverflowError, IndexError, KeyError):
-            pass
-        raise ProtocolError(
-            "onscreen viewer presentation arrays are malformed"
-        ) from error
+            static_index = int(mujoco_module.mjtVisFlag.mjVIS_STATIC)
+            if (
+                static_index < 0
+                or len(flags) <= static_index
+                or len(geomgroup) <= 2
+            ):
+                raise IndexError
+            previous_static = flags[static_index]
+            previous_terrain_group = geomgroup[2]
+        except (
+            AttributeError,
+            TypeError,
+            ValueError,
+            OverflowError,
+            IndexError,
+        ) as error:
+            raise ProtocolError(
+                "onscreen viewer presentation arrays are malformed"
+            ) from error
+        try:
+            flags[static_index] = 1
+            geomgroup[2] = 1
+        except (
+            TypeError,
+            ValueError,
+            OverflowError,
+            IndexError,
+            KeyError,
+        ) as error:
+            try:
+                flags[static_index] = previous_static
+                geomgroup[2] = previous_terrain_group
+            except (TypeError, ValueError, OverflowError, IndexError, KeyError):
+                pass
+            raise ProtocolError(
+                "onscreen viewer presentation arrays are malformed"
+            ) from error
 
 
 class ExternalGearBackend:

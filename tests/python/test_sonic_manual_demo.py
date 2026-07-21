@@ -29,6 +29,7 @@ from mm_sonic.manual_demo import (
     _print_terminal_event,
     _run_startup_transaction,
     _validated_preload_chunks,
+    _wait_for_x11_target,
     main,
 )
 from mm_sonic.manual_evidence import parse_manual_command_artifact
@@ -45,6 +46,34 @@ def _forward(index: int) -> CommandSample:
 
 class _StopAfterSimulator(Exception):
     pass
+
+
+class X11TargetReadinessTests(unittest.TestCase):
+    def test_waits_for_a_published_sample_with_a_bound_target(self) -> None:
+        provider = type("Provider", (), {"target_bound": False})()
+
+        class Loop:
+            calls: list[int] = []
+
+            def wait_for_sequence(self, sequence, timeout_s):
+                self.calls.append(sequence)
+                if sequence == 2:
+                    provider.target_bound = True
+                return True
+
+        loop = Loop()
+        _wait_for_x11_target(provider, loop, timeout_s=1.0)
+        self.assertEqual(loop.calls, [1, 2])
+
+    def test_rejects_initial_samples_without_a_focused_bound_target(self) -> None:
+        provider = type("Provider", (), {"target_bound": False})()
+
+        class Loop:
+            def wait_for_sequence(self, sequence, timeout_s):
+                return False
+
+        with self.assertRaisesRegex(ContractError, "focused MuJoCo"):
+            _wait_for_x11_target(provider, Loop(), timeout_s=0.01)
 
 
 class SimulatorFreezeWiringTests(unittest.TestCase):

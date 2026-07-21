@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import sys
 import threading
+import time
 from typing import Callable
 
 import numpy as np
@@ -95,6 +96,30 @@ _PRELOAD_CHUNKS = 4
 _CHUNK_DURATION_S = 0.4
 _SOURCE_RATE_HZ = 25
 _SUPPORTED_SOURCE_INTERVALS = (5, 10)
+
+
+def _wait_for_x11_target(
+    provider: X11KeyStateProvider,
+    control_loop: ContinuousControlLoop,
+    *,
+    timeout_s: float = 2.0,
+) -> None:
+    """Wait until a sampled focused viewer already has passive key grabs."""
+
+    deadline = time.monotonic() + float(timeout_s)
+    sequence = 1
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0 or not control_loop.wait_for_sequence(
+            sequence, timeout_s=remaining
+        ):
+            break
+        if provider.target_bound:
+            return
+        sequence += 1
+    raise ContractError(
+        "continuous X11 control did not acquire the focused MuJoCo viewer"
+    )
 
 
 def _horizon_seconds(source_intervals: int) -> float:
@@ -914,13 +939,6 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                 initial_heading_yaw_rad=initial_heading,
                 heading_frame_offset_yaw_rad=heading_frame_offset,
             )
-            print(
-                "LIVE X11: W/A/S/D move, Shift walk, Ctrl+arrows strafe/face, "
-                "arrows orbit camera, Q/E zoom, Space stand, X exit. "
-                f"Commands have {preload_chunks * prefix_duration_s:.1f}s "
-                "lookahead latency.",
-                flush=True,
-            )
             try:
                 with ContinuousControlLoop(
                     provider,
@@ -929,10 +947,16 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                     cancel_event=cancellation,
                 ) as control_loop:
                     def wait_for_initial_input() -> None:
-                        if not control_loop.wait_for_sequence(1, timeout_s=2.0):
-                            raise ContractError(
-                                "continuous X11 control did not publish an initial state"
-                            )
+                        _wait_for_x11_target(provider, control_loop)
+                        print(
+                            "LIVE X11: W/A/S/D move, Shift walk, "
+                            "Ctrl+arrows strafe/face, arrows orbit camera, "
+                            "Q/E zoom, Space stand, X exit. "
+                            f"Commands have "
+                            f"{preload_chunks * prefix_duration_s:.1f}s "
+                            "lookahead latency.",
+                            flush=True,
+                        )
 
                     gate = _activate_scored_control(
                         gear,
