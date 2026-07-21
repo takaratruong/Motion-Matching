@@ -473,10 +473,16 @@ static void test_unload_is_idempotent_for_canonical_renderer()
     check(!renderer.loaded, "second canonical unload remains unloaded");
     check(renderer.model.meshCount == 0 && renderer.model.meshes == nullptr,
           "second canonical unload preserves empty model");
+#if RAYLIB_VERSION_MAJOR >= 6
+    check(renderer.animation.keyframeCount == 0 &&
+              renderer.animation.keyframePoses == nullptr,
+          "second canonical unload preserves empty animation");
+#else
     check(renderer.animation.frameCount == 0 &&
               renderer.animation.framePoses == nullptr &&
               renderer.animation.bones == nullptr,
           "second canonical unload preserves empty animation");
+#endif
 }
 
 int main()

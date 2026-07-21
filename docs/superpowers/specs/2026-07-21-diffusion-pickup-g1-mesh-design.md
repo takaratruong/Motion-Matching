@@ -6,7 +6,7 @@ Render the existing articulated G1 robot mesh in the diffusion pickup visualizer
 
 ## Chosen approach
 
-Port the proven terrain-aware renderer without changing its pose mathematics. Reuse `g1_mesh_renderer.h` and `resources/g1_mesh/g1_raylib.glb`, bind GLB joint names to the existing 31-bone G1 hierarchy, update the mesh from the controller's accepted global bone positions and rotations each frame, and draw it in the existing 3D pass.
+Port the proven terrain-aware renderer without changing its pose mathematics. Reuse `g1_mesh_renderer.h` and `resources/g1_mesh/g1_raylib.glb`, bind GLB joint names to the existing 31-bone G1 hierarchy, update the mesh from the controller's accepted global bone positions and rotations each frame, and draw it in the existing 3D pass. Keep the renderer source-compatible with both the terrain visualizer's Raylib 5 model layout and this branch's pinned Raylib 6 skeleton/keyframe layout.
 
 This is preferred over the legacy `character.bin` skin because that asset uses a different 23-bone hierarchy, and over loading individual STL links because the terrain-aware GLB already has validated joint bindings and runtime tests.
 

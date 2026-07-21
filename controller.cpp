@@ -26,6 +26,7 @@
 #include "locomotion_controller_update.h"
 #include "locomotion_timing.h"
 #include "stationary_motion_matching.h"
+#include "g1_mesh_renderer.h"
 
 #include <algorithm>
 #include <array>
@@ -3772,6 +3773,15 @@ int main(void)
         return 1;
     }
 
+    G1MeshRenderer g1_mesh_renderer = {};
+    bool show_g1_mesh = true;
+    bool show_g1_bones = false;
+    char g1_mesh_error_message[256] = {};
+    auto unload_g1_mesh = [&]()
+    {
+        ::g1_mesh_renderer_unload(g1_mesh_renderer);
+    };
+
 #if !defined(PLATFORM_WEB)
     try
     {
@@ -4528,6 +4538,20 @@ int main(void)
         }
     }
 
+    if (!::g1_mesh_renderer_load(
+            g1_mesh_renderer,
+            "resources/g1_mesh/g1_raylib.glb",
+            g1_mesh_error_message,
+            static_cast<int>(sizeof(g1_mesh_error_message))))
+    {
+        throw std::runtime_error(
+            std::string("G1 mesh load error: ") + g1_mesh_error_message);
+    }
+    std::fprintf(
+        stdout,
+        "G1 mesh loaded: %d parts\n",
+        g1_mesh_renderer.model.meshCount);
+
     auto update_func = [&]()
     {
         AutodemoAction autodemo_action = AutodemoAction::None;
@@ -4535,6 +4559,9 @@ int main(void)
         bool placement_arrival_facing_override = false;
         bool placement_brake_latched_this_tick = false;
         bool placement_pick_interact_submitted_this_tick = false;
+
+        if (IsKeyPressed(KEY_M)) show_g1_mesh = !show_g1_mesh;
+        if (IsKeyPressed(KEY_B)) show_g1_bones = !show_g1_bones;
 
 #ifdef MM_DISCRETE
         // Camera-azimuth scripting. MM_MODE selects the pattern:
@@ -6326,6 +6353,18 @@ int main(void)
             adjusted_bone_rotations,
             db.bone_parents);
 
+        if (!::g1_mesh_renderer_update(
+                g1_mesh_renderer,
+                global_bone_positions,
+                global_bone_rotations,
+                g1_mesh_error_message,
+                static_cast<int>(sizeof(g1_mesh_error_message))))
+        {
+            throw std::runtime_error(
+                std::string("G1 mesh update error: ") +
+                g1_mesh_error_message);
+        }
+
         std::optional<AutodemoEvidenceCapture> autodemo_evidence_capture;
         if (autodemo_configuration.has_value())
         {
@@ -6357,6 +6396,11 @@ int main(void)
         ClearBackground(RAYWHITE);
         
         BeginMode3D(camera);
+
+        if (show_g1_mesh)
+        {
+            ::g1_mesh_renderer_draw(g1_mesh_renderer);
+        }
         
         // Draw Simulation Object
         
@@ -6525,17 +6569,24 @@ int main(void)
         }
         // Learned pickup object-anchored route rendering ends.
         
-        // G1: no skinned mesh — draw the skeleton directly from bone transforms.
-        // Sphere at each joint, capsule (cylinder) from each bone to its parent.
-        for (int bi = 1; bi < db.nbones(); bi++)
+        // Optional diagnostic skeleton over the articulated G1 mesh.
+        if (show_g1_bones)
         {
-            vec3 bp = global_bone_positions(bi);
-            DrawSphereWires(to_Vector3(bp), 0.028f, 4, 8, DARKBLUE);
-            int par = db.bone_parents(bi);
-            if (par > 0)
+            for (int bi = 1; bi < db.nbones(); bi++)
             {
-                DrawCylinderEx(to_Vector3(global_bone_positions(par)), to_Vector3(bp),
-                    0.018f, 0.018f, 6, SKYBLUE);
+                vec3 bp = global_bone_positions(bi);
+                DrawSphereWires(to_Vector3(bp), 0.028f, 4, 8, DARKBLUE);
+                int par = db.bone_parents(bi);
+                if (par > 0)
+                {
+                    DrawCylinderEx(
+                        to_Vector3(global_bone_positions(par)),
+                        to_Vector3(bp),
+                        0.018f,
+                        0.018f,
+                        6,
+                        SKYBLUE);
+                }
             }
         }
         
@@ -8080,7 +8131,8 @@ int main(void)
         exit_code = 1;
     }
 
-    // Unload stuff and finish (G1: no character mesh/shader to unload)
+    // Unload stuff and finish.
+    unload_g1_mesh();
     UnloadModel(ground_plane_model);
     UnloadShader(ground_plane_shader);
 
@@ -8096,6 +8148,7 @@ int main(void)
             cleanup_autodemo_temporaries(*autodemo_configuration);
         }
         std::fprintf(stderr, "controller: %s\n", error.what());
+        unload_g1_mesh();
         UnloadModel(ground_plane_model);
         UnloadShader(ground_plane_shader);
         CloseWindow();
@@ -8109,6 +8162,7 @@ int main(void)
         }
         std::fprintf(
             stderr, "controller: unknown interaction startup failure\n");
+        unload_g1_mesh();
         UnloadModel(ground_plane_model);
         UnloadShader(ground_plane_shader);
         CloseWindow();

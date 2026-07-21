@@ -397,11 +397,87 @@ inline bool g1_mesh_pose_build(
     return true;
 }
 
+static inline int g1_mesh_model_bone_count(const Model& model)
+{
+#if RAYLIB_VERSION_MAJOR >= 6
+    return model.skeleton.boneCount;
+#else
+    return model.boneCount;
+#endif
+}
+
+static inline BoneInfo* g1_mesh_model_bones(Model& model)
+{
+#if RAYLIB_VERSION_MAJOR >= 6
+    return model.skeleton.bones;
+#else
+    return model.bones;
+#endif
+}
+
+static inline Transform* g1_mesh_model_bind_pose(Model& model)
+{
+#if RAYLIB_VERSION_MAJOR >= 6
+    return model.skeleton.bindPose;
+#else
+    return model.bindPose;
+#endif
+}
+
+static inline int g1_mesh_animation_pose_count(
+    const ModelAnimation& animation)
+{
+#if RAYLIB_VERSION_MAJOR >= 6
+    return animation.keyframeCount;
+#else
+    return animation.frameCount;
+#endif
+}
+
+static inline Transform** g1_mesh_animation_poses(
+    ModelAnimation& animation)
+{
+#if RAYLIB_VERSION_MAJOR >= 6
+    return animation.keyframePoses;
+#else
+    return animation.framePoses;
+#endif
+}
+
+static inline void g1_mesh_animation_unload(ModelAnimation& animation)
+{
+#if RAYLIB_VERSION_MAJOR >= 6
+    if (animation.keyframePoses != nullptr) {
+        for (int frame = 0; frame < animation.keyframeCount; ++frame) {
+            ::MemFree(animation.keyframePoses[frame]);
+        }
+        ::MemFree(animation.keyframePoses);
+    }
+#else
+    if (animation.bones != nullptr || animation.framePoses != nullptr) {
+        ::UnloadModelAnimation(animation);
+    }
+#endif
+    animation = ModelAnimation{};
+}
+
+static inline void g1_mesh_model_unload(Model& model)
+{
+#if RAYLIB_VERSION_MAJOR >= 6
+    ::MemFree(model.currentPose);
+    ::MemFree(model.boneMatrices);
+    model.currentPose = nullptr;
+    model.boneMatrices = nullptr;
+#endif
+    ::UnloadModel(model);
+    model = Model{};
+}
+
 inline void g1_mesh_renderer_unload(G1MeshRenderer& renderer)
 {
     if (renderer.loaded) {
-        ::UnloadModelAnimation(renderer.animation);
-        ::UnloadModel(renderer.model);
+        g1_mesh_animation_unload(renderer.animation);
+        g1_mesh_model_unload(renderer.model);
     }
     renderer = G1MeshRenderer{};
 }
@@ -409,11 +485,8 @@ inline void g1_mesh_renderer_unload(G1MeshRenderer& renderer)
 static inline void g1_mesh_renderer_discard_partial(
     G1MeshRenderer& renderer)
 {
-    if (renderer.animation.bones != nullptr ||
-        renderer.animation.framePoses != nullptr) {
-        ::UnloadModelAnimation(renderer.animation);
-    }
-    ::UnloadModel(renderer.model);
+    g1_mesh_animation_unload(renderer.animation);
+    g1_mesh_model_unload(renderer.model);
     renderer = G1MeshRenderer{};
 }
 
@@ -434,9 +507,9 @@ inline bool g1_mesh_renderer_load(
     G1MeshRenderer candidate = {};
     candidate.model = ::LoadModel(path);
     if (candidate.model.meshCount <= 0 || candidate.model.meshes == nullptr ||
-        candidate.model.boneCount != G1MeshBoneCount ||
-        candidate.model.bones == nullptr ||
-        candidate.model.bindPose == nullptr) {
+        g1_mesh_model_bone_count(candidate.model) != G1MeshBoneCount ||
+        g1_mesh_model_bones(candidate.model) == nullptr ||
+        g1_mesh_model_bind_pose(candidate.model) == nullptr) {
         g1_mesh_renderer_discard_partial(candidate);
         return g1_mesh_error(
             error,
@@ -445,9 +518,9 @@ inline bool g1_mesh_renderer_load(
     }
     if (!g1_mesh_binding_build(
             candidate.binding,
-            candidate.model.bones,
-            candidate.model.bindPose,
-            candidate.model.boneCount,
+            g1_mesh_model_bones(candidate.model),
+            g1_mesh_model_bind_pose(candidate.model),
+            g1_mesh_model_bone_count(candidate.model),
             error,
             error_capacity)) {
         g1_mesh_renderer_discard_partial(candidate);
@@ -455,6 +528,33 @@ inline bool g1_mesh_renderer_load(
     }
 
     candidate.animation.boneCount = G1MeshBoneCount;
+#if RAYLIB_VERSION_MAJOR >= 6
+    candidate.animation.keyframePoses = static_cast<Transform**>(::MemAlloc(
+        static_cast<unsigned int>(sizeof(Transform*))));
+    if (candidate.animation.keyframePoses == nullptr) {
+        g1_mesh_renderer_discard_partial(candidate);
+        return g1_mesh_error(
+            error,
+            error_capacity,
+            "G1 mesh animation frame allocation failed");
+    }
+    candidate.animation.keyframePoses[0] = nullptr;
+    candidate.animation.keyframeCount = 1;
+    candidate.animation.keyframePoses[0] =
+        static_cast<Transform*>(::MemAlloc(static_cast<unsigned int>(
+            sizeof(Transform) * G1MeshBoneCount)));
+    if (candidate.animation.keyframePoses[0] == nullptr) {
+        g1_mesh_renderer_discard_partial(candidate);
+        return g1_mesh_error(
+            error,
+            error_capacity,
+            "G1 mesh animation pose allocation failed");
+    }
+    std::memcpy(
+        candidate.animation.keyframePoses[0],
+        g1_mesh_model_bind_pose(candidate.model),
+        sizeof(Transform) * G1MeshBoneCount);
+#else
     candidate.animation.bones = static_cast<BoneInfo*>(::MemAlloc(
         static_cast<unsigned int>(
             sizeof(BoneInfo) * G1MeshBoneCount)));
@@ -492,8 +592,9 @@ inline bool g1_mesh_renderer_load(
         sizeof(BoneInfo) * G1MeshBoneCount);
     std::memcpy(
         candidate.animation.framePoses[0],
-        candidate.model.bindPose,
+        g1_mesh_model_bind_pose(candidate.model),
         sizeof(Transform) * G1MeshBoneCount);
+#endif
     if (!::IsModelAnimationValid(candidate.model, candidate.animation)) {
         g1_mesh_renderer_discard_partial(candidate);
         return g1_mesh_error(
@@ -515,16 +616,18 @@ inline bool g1_mesh_renderer_update(
     char* error,
     int error_capacity)
 {
-    if (!renderer.loaded || renderer.animation.frameCount != 1 ||
-        renderer.animation.framePoses == nullptr ||
-        renderer.animation.framePoses[0] == nullptr) {
+    Transform** const animation_poses =
+        g1_mesh_animation_poses(renderer.animation);
+    if (!renderer.loaded ||
+        g1_mesh_animation_pose_count(renderer.animation) != 1 ||
+        animation_poses == nullptr || animation_poses[0] == nullptr) {
         return g1_mesh_error(
             error,
             error_capacity,
             "G1 mesh renderer is not loaded");
     }
     if (!g1_mesh_pose_build(
-            renderer.animation.framePoses[0],
+            animation_poses[0],
             renderer.animation.boneCount,
             renderer.binding,
             accepted_positions,

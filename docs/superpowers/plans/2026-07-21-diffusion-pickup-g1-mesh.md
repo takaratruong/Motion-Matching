@@ -16,6 +16,7 @@
 - Update only from the final global pose; do not use adjusted, predicted, or candidate poses.
 - Do not modify `resources/features.bin` or generated diffusion artifacts.
 - Do not alter diffusion generation, route following, interaction state, attachment, or placement behavior.
+- Preserve compatibility with both Raylib 5's `Model::bones`/`framePoses` API and Raylib 6's `Model::skeleton`/`keyframePoses` API.
 
 ---
 
@@ -75,6 +76,13 @@
     -L/home/ubuntu/apps/raylib/src \
     -lraylib -lGL -lm -lpthread -ldl -lrt -lX11
   /tmp/diffusion-pickup-g1-mesh-build/test-g1-mesh-renderer
+  g++ -std=c++17 -O2 -D_DEFAULT_SOURCE -DPLATFORM_DESKTOP \
+    -I. -I.deps/raylib/src -I.deps/raygui/src \
+    tests/cpp/test_g1_mesh_renderer.cpp \
+    -o /tmp/diffusion-pickup-g1-mesh-build/test-g1-mesh-renderer-raylib6 \
+    .deps/raylib/src/libraylib.a \
+    -lGL -lm -lpthread -ldl -lrt -lX11
+  /tmp/diffusion-pickup-g1-mesh-build/test-g1-mesh-renderer-raylib6
   python3 -m unittest tests.python.test_g1_mesh_asset -v
   ```
 
@@ -136,13 +144,16 @@
           load = SOURCE.index("::g1_mesh_renderer_load(")
           loop = SOURCE.index("auto update_func = [&]()")
           unload = SOURCE.index("::g1_mesh_renderer_unload(g1_mesh_renderer);")
-          close = SOURCE.index("CloseWindow();", unload)
+          normal_unload = SOURCE.index("unload_g1_mesh();", loop)
+          close = SOURCE.index("CloseWindow();", normal_unload)
           self.assertLess(load, loop)
-          self.assertLess(loop, unload)
-          self.assertLess(unload, close)
+          self.assertLess(unload, load)
+          self.assertLess(loop, normal_unload)
+          self.assertLess(normal_unload, close)
           self.assertEqual(
               SOURCE.count("::g1_mesh_renderer_unload(g1_mesh_renderer);"), 1
           )
+          self.assertEqual(SOURCE.count("unload_g1_mesh();"), 3)
 
 
   if __name__ == "__main__":
@@ -190,7 +201,7 @@
     ```
 
   - Wrap the existing joint/cylinder skeleton loop in `if (show_g1_bones)`.
-  - Before the normal `CloseWindow()`, call `::g1_mesh_renderer_unload(g1_mesh_renderer);` exactly once.
+  - Put the one direct `g1_mesh_renderer_unload` call in an `unload_g1_mesh` helper and invoke it before `CloseWindow()` on normal shutdown and both outer exception paths.
 
 - [ ] **Step 4: Verify GREEN and regression safety**
 
