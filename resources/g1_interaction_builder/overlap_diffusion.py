@@ -10,9 +10,12 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import math
+from pathlib import Path
 
 import torch
 from torch import nn
+
+from resources.g1_interaction_builder.schema import G1_SKELETON
 
 
 FRAME_DIM = 195
@@ -184,26 +187,36 @@ class MotionWindowDenoiser(nn.Module):
         frame_dim: int = FRAME_DIM,
         static_dim: int = STATIC_CONDITION_DIM,
         temporal_dim: int = TEMPORAL_CONDITION_DIM,
+        *,
+        width: int = MODEL_WIDTH,
+        blocks: int = MODEL_BLOCKS,
+        heads: int = MODEL_HEADS,
     ) -> None:
         super().__init__()
         if (frame_dim, static_dim, temporal_dim) != (
             FRAME_DIM, STATIC_CONDITION_DIM, TEMPORAL_CONDITION_DIM,
         ):
             raise ValueError("MotionWindowDenoiser uses the frozen 195/25/9 schema")
+        if (
+            not isinstance(width, int) or width < 2
+            or not isinstance(blocks, int) or blocks <= 0
+            or not isinstance(heads, int) or heads <= 0 or width % heads
+        ):
+            raise ValueError("denoiser width/blocks/heads must form a positive attention schema")
         self.schema = DenoiserSchema(
-            frame_dim, static_dim, temporal_dim, MODEL_WIDTH, MODEL_BLOCKS, MODEL_HEADS
+            frame_dim, static_dim, temporal_dim, width, blocks, heads
         )
-        self.frame_projection = nn.Linear(frame_dim, MODEL_WIDTH)
-        self.static_projection = nn.Linear(static_dim, MODEL_WIDTH)
-        self.temporal_projection = nn.Linear(temporal_dim, MODEL_WIDTH)
+        self.frame_projection = nn.Linear(frame_dim, width)
+        self.static_projection = nn.Linear(static_dim, width)
+        self.temporal_projection = nn.Linear(temporal_dim, width)
         self.timestep_projection = nn.Sequential(
-            nn.Linear(MODEL_WIDTH, MODEL_WIDTH), nn.SiLU(), nn.Linear(MODEL_WIDTH, MODEL_WIDTH)
+            nn.Linear(width, width), nn.SiLU(), nn.Linear(width, width)
         )
         self.blocks = nn.ModuleList(
-            [_TemporalTransformerBlock(MODEL_WIDTH, MODEL_HEADS) for _ in range(MODEL_BLOCKS)]
+            [_TemporalTransformerBlock(width, heads) for _ in range(blocks)]
         )
-        self.output_norm = nn.LayerNorm(MODEL_WIDTH)
-        self.output_projection = nn.Linear(MODEL_WIDTH, frame_dim)
+        self.output_norm = nn.LayerNorm(width)
+        self.output_projection = nn.Linear(width, frame_dim)
 
     def forward(
         self,
@@ -233,7 +246,7 @@ class MotionWindowDenoiser(nn.Module):
             self.frame_projection(noisy_frames)
             + self.static_projection(static_condition).unsqueeze(1)
             + self.temporal_projection(temporal_condition)
-            + self.timestep_projection(_timestep_embedding(timestep)).unsqueeze(1)
+            + self.timestep_projection(_timestep_embedding(timestep, self.schema.width)).unsqueeze(1)
         )
         for block in self.blocks:
             hidden = block(hidden)
@@ -589,3 +602,183 @@ def named_training_losses(
         ),
         "overlap_agreement": _mean_square(overlap_walk - overlap_pickup),
     }
+
+
+LOSS_NAMES = (
+    "epsilon", "pose_6d", "fk_hand", "fk_feet", "velocity", "acceleration",
+    "foot_contact", "foot_sliding", "grasp_position", "grasp_orientation",
+    "pre_contact_separation", "attachment", "overlap_agreement",
+)
+
+
+def _rotation6d_matrices(rotation6d: torch.Tensor) -> torch.Tensor:
+    """Gram--Schmidt 6-D rotations without any identity-FK fallback."""
+    first = torch.nn.functional.normalize(rotation6d[..., :3], dim=-1, eps=1e-8)
+    second = rotation6d[..., 3:] - (first * rotation6d[..., 3:]).sum(-1, keepdim=True) * first
+    second = torch.nn.functional.normalize(second, dim=-1, eps=1e-8)
+    third = torch.linalg.cross(first, second, dim=-1)
+    return torch.stack((first, second, third), dim=-1)
+
+
+def canonical_g1_fk(
+    frames: torch.Tensor,
+    *,
+    parents: torch.Tensor | tuple[int, ...] | list[int],
+    local_offsets: torch.Tensor,
+) -> Mapping[str, torch.Tensor]:
+    """Differentiably FK the real canonical G1 hierarchy from 195 channels.
+
+    Simulation-root and Hips translations are read from their dynamic channels;
+    only bones 2..30 use the frozen dataset offsets.  The returned active hand
+    is the canonical right wrist (bone 30), with LeftToe/RightToe at 7/13.
+    """
+    _require_motion(frames, "frames")
+    expected_parents = tuple(int(value) for value in G1_SKELETON.parents)
+    actual_parents = tuple(int(value) for value in torch.as_tensor(parents).cpu().tolist())
+    if actual_parents != expected_parents:
+        raise ValueError("FK parents must match the canonical G1 hierarchy")
+    offsets = torch.as_tensor(local_offsets, device=frames.device, dtype=frames.dtype)
+    if tuple(offsets.shape) != (31, 3) or not torch.isfinite(offsets).all():
+        raise ValueError("FK local_offsets must be finite with shape (31, 3)")
+    if not torch.equal(offsets[:2], torch.zeros_like(offsets[:2])):
+        raise ValueError("FK local offsets for Simulation and Hips must be dynamic zeros")
+    batch, steps, _ = frames.shape
+    local = offsets.view(1, 1, 31, 3).expand(batch, steps, -1, -1).clone()
+    local[:, :, 0] = frames[..., ROOT_TRANSLATION_SLICE]
+    local[:, :, 1] = frames[..., HIPS_TRANSLATION_SLICE]
+    rotations = _rotation6d_matrices(frames[..., ROTATION6D_SLICE].reshape(batch, steps, 31, 6))
+    world_positions: list[torch.Tensor] = []
+    world_rotations: list[torch.Tensor] = []
+    for bone, parent in enumerate(expected_parents):
+        if parent < 0:
+            world_positions.append(local[:, :, bone])
+            world_rotations.append(rotations[:, :, bone])
+            continue
+        parent_rotation = world_rotations[parent]
+        world_positions.append(
+            world_positions[parent] + torch.matmul(parent_rotation, local[:, :, bone].unsqueeze(-1)).squeeze(-1)
+        )
+        world_rotations.append(torch.matmul(parent_rotation, rotations[:, :, bone]))
+    hand_rotation = world_rotations[30]
+    return {
+        "hand": world_positions[30],
+        "hand_orientation": torch.cat((hand_rotation[..., :, 0], hand_rotation[..., :, 1]), dim=-1),
+        "left_foot": world_positions[7],
+        "right_foot": world_positions[13],
+    }
+
+
+@dataclass(frozen=True)
+class LoadedOverlapModels:
+    walk_model: MotionWindowDenoiser
+    pickup_model: MotionWindowDenoiser
+    payload: Mapping[str, object]
+
+
+def _checkpoint_tensor(value: object, shape: tuple[int, ...], label: str, *, positive: bool = False) -> torch.Tensor:
+    if not isinstance(value, torch.Tensor) or tuple(value.shape) != shape or not value.is_floating_point():
+        raise ValueError(f"checkpoint {label} must be a floating tensor with shape {shape}")
+    if not torch.isfinite(value).all() or (positive and torch.any(value <= 0.0)):
+        raise ValueError(f"checkpoint {label} must be finite" + (" and positive" if positive else ""))
+    return value
+
+
+def _validate_state_dict(value: object, label: str) -> Mapping[str, torch.Tensor]:
+    if not isinstance(value, Mapping) or not value:
+        raise ValueError(f"checkpoint {label} must be a nonempty state dictionary")
+    for name, tensor in value.items():
+        if not isinstance(name, str) or not isinstance(tensor, torch.Tensor):
+            raise ValueError(f"checkpoint {label} has an invalid state entry")
+        if tensor.is_floating_point() and not torch.isfinite(tensor).all():
+            raise ValueError(f"checkpoint {label} has non-finite state")
+    return value
+
+
+def _finite_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and math.isfinite(float(value))
+
+
+def _contains_test_partition(value: object) -> bool:
+    if isinstance(value, Mapping):
+        return any("test" in str(key).lower() or _contains_test_partition(item) for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_test_partition(item) for item in value)
+    return False
+
+
+def load_overlap_checkpoint(path: Path, device: str | torch.device = "cpu") -> LoadedOverlapModels:
+    """Strictly load the self-contained schema-v1 coupled-expert checkpoint."""
+    payload = torch.load(Path(path), map_location=device, weights_only=False)
+    if not isinstance(payload, Mapping) or payload.get("schema_version") != "overlap-diffusion-schema-v1":
+        raise ValueError("unsupported overlap checkpoint schema")
+    if payload.get("frame_dim") != FRAME_DIM or tuple(payload.get("windows", ())) != (50, 50, 20, 80):
+        raise ValueError("checkpoint has an unsupported overlap frame/window schema")
+    if payload.get("fps") != 25.0 or payload.get("prediction_type") != "epsilon":
+        raise ValueError("checkpoint has an unsupported prediction contract")
+    if payload.get("skeleton_signature") != G1_SKELETON.signature():
+        raise ValueError("checkpoint skeleton signature does not match canonical G1")
+    if tuple(payload.get("skeleton_names", ())) != G1_SKELETON.names:
+        raise ValueError("checkpoint skeleton names do not match canonical G1")
+    if tuple(payload.get("skeleton_parents", ())) != tuple(int(value) for value in G1_SKELETON.parents):
+        raise ValueError("checkpoint skeleton parents do not match canonical G1")
+    offsets = _checkpoint_tensor(payload.get("canonical_local_offsets"), (31, 3), "canonical_local_offsets")
+    if not torch.equal(offsets[:2], torch.zeros_like(offsets[:2])):
+        raise ValueError("checkpoint canonical local offsets must leave root/Hips dynamic")
+    digest = payload.get("dataset_sha256")
+    if not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        raise ValueError("checkpoint dataset SHA256 is invalid")
+    normalization = payload.get("normalization")
+    if not isinstance(normalization, Mapping):
+        raise ValueError("checkpoint normalization is missing")
+    _checkpoint_tensor(normalization.get("mean"), (FRAME_DIM,), "normalization mean")
+    _checkpoint_tensor(normalization.get("scale"), (FRAME_DIM,), "normalization scale", positive=True)
+    weights = payload.get("loss_weights")
+    if not isinstance(weights, Mapping) or set(weights) != set(LOSS_NAMES):
+        raise ValueError("checkpoint loss weights do not match named loss contract")
+    if any(not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0 for value in weights.values()):
+        raise ValueError("checkpoint loss weights must be finite and nonnegative")
+    steps = payload.get("selected_sampler_steps")
+    if steps not in (20, 50):
+        raise ValueError("checkpoint selected sampler steps must be 20 or 50")
+    history = payload.get("stage_history")
+    if not isinstance(history, list) or not history or any(not isinstance(row, Mapping) for row in history):
+        raise ValueError("checkpoint stage history is invalid")
+    for row in history:
+        if (
+            set(row) != {"stage", "epoch", "train_loss", "validation_rank"}
+            or row["stage"] not in {"A", "B", "C"}
+            or not isinstance(row["epoch"], int) or row["epoch"] <= 0
+            or not _finite_number(row["train_loss"])
+            or not isinstance(row["validation_rank"], (list, tuple))
+            or len(row["validation_rank"]) != 3
+            or not all(_finite_number(item) for item in row["validation_rank"])
+        ):
+            raise ValueError("checkpoint stage history has invalid values")
+    quality = payload.get("validation_quality")
+    if not isinstance(quality, Mapping) or set(quality) != {"20", "50"}:
+        raise ValueError("checkpoint validation-only quality summary is invalid")
+    quality_fields = {
+        "attach_proxy_at_8", "median_grasp_position_m", "median_grasp_orientation_degrees",
+        "no_stop_proxy", "rows",
+    }
+    if any(
+        not isinstance(summary, Mapping) or set(summary) != quality_fields
+        or not all(_finite_number(value) for value in summary.values())
+        for summary in quality.values()
+    ):
+        raise ValueError("checkpoint validation quality contains invalid values")
+    if _contains_test_partition(payload):
+        raise ValueError("checkpoint must not serialize test-partition statistics")
+    schema = payload.get("model_schema")
+    if not isinstance(schema, Mapping):
+        raise ValueError("checkpoint model schema is missing")
+    values = tuple(schema.get(key) for key in ("width", "blocks", "heads"))
+    if not all(isinstance(value, int) for value in values):
+        raise ValueError("checkpoint model schema is invalid")
+    walk = MotionWindowDenoiser(width=values[0], blocks=values[1], heads=values[2]).to(device)
+    pickup = MotionWindowDenoiser(width=values[0], blocks=values[1], heads=values[2]).to(device)
+    walk.load_state_dict(_validate_state_dict(payload.get("walk_model"), "walk_model"), strict=True)
+    pickup.load_state_dict(_validate_state_dict(payload.get("pickup_model"), "pickup_model"), strict=True)
+    walk.eval()
+    pickup.eval()
+    return LoadedOverlapModels(walk, pickup, payload)

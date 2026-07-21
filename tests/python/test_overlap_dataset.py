@@ -307,6 +307,17 @@ class OverlapWalkingExtractionTests(unittest.TestCase):
 
 
 class OverlapDatasetCliTests(unittest.TestCase):
+    def test_canonical_offsets_use_native_median_and_reject_real_motion(self):
+        walking = HoldenClip.empty(frames=3, bones=31)
+        walking.positions[:, 2, 1] = np.asarray([-0.1000, -0.0990, -0.1000], np.float32)
+
+        metadata = build_g1_overlap_dataset._canonical_skeleton_metadata(walking)
+
+        self.assertAlmostEqual(float(metadata["canonical_local_offsets"][2, 1]), -0.1000)
+        walking.positions[2, 2, 1] = -0.0969
+        with self.assertRaisesRegex(ValueError, "must be constant"):
+            build_g1_overlap_dataset._canonical_skeleton_metadata(walking)
+
     def test_interaction_split_is_object_disjoint_and_complete(self):
         object_ids = np.asarray(["cup", "cup", "bottle", "bottle", "plate", "vase"])
 
@@ -385,7 +396,17 @@ class OverlapDatasetCliTests(unittest.TestCase):
                 self.assertIn("normalization_mean", dataset)
                 self.assertEqual(dataset["normalization_mean"].shape, (195,))
                 self.assertGreater(float(dataset["normalization_scale"][3]), 0.0)
+                np.testing.assert_array_equal(
+                    dataset["skeleton_parents"], G1_SKELETON.parents,
+                )
+                np.testing.assert_array_equal(
+                    dataset["skeleton_names"], G1_SKELETON.names,
+                )
+                self.assertEqual(dataset["skeleton_signature"].item(), G1_SKELETON.signature())
+                self.assertEqual(dataset["canonical_local_offsets"].shape, (31, 3))
+                np.testing.assert_array_equal(dataset["canonical_local_offsets"][:2], 0.0)
             self.assertEqual(audit["frame_schema"], 195)
+            self.assertEqual(audit["skeleton_signature"], G1_SKELETON.signature())
 
     def test_failed_manifest_publication_restores_the_previous_output_pair(self):
         artifact = interaction_artifact_fixture()

@@ -28,10 +28,12 @@ from resources.g1_interaction_builder.overlap_motion import (
     extract_interaction_pairs,
     load_native_g1_walk,
 )
+from resources.g1_interaction_builder.schema import G1_SKELETON
 from resources.g1_terrain_builder.schema import HoldenClip
 
 
 SPLITS = ("train", "validation", "test")
+_NATIVE_OFFSET_TOLERANCE_M = 0.002
 
 
 def _sha256(path: Path) -> str:
@@ -296,6 +298,36 @@ def _partition_overlap(values: dict[str, np.ndarray], rows: OverlapDataset, spli
             values[f"{name}_{field}"] = source[indices]
 
 
+def _canonical_skeleton_metadata(walking: HoldenClip) -> dict[str, np.ndarray]:
+    """Return the fixed hierarchy and native local offsets used by torch FK.
+
+    The Simulation root and Hips translation are deliberately not offsets: both
+    are dynamic channels in the 195-D motion representation.  Every remaining
+    local translation must be a single canonical native-G1 value.
+    """
+    positions = np.asarray(walking.positions, dtype=np.float64)
+    if positions.ndim != 3 or positions.shape[1:] != (len(G1_SKELETON.names), 3):
+        raise ValueError("native G1 walk must contain canonical 31-bone local positions")
+    # Resampling the native source and reconstructing local transforms is
+    # numerically accurate to the existing 1 mm FK contract, not bit-exact.
+    # Median offsets retain the native skeleton while a 2 mm bound rejects a
+    # genuinely animated child translation.
+    offsets = np.median(positions, axis=0)
+    offsets[:2] = 0.0
+    if not np.allclose(
+        positions[:, 2:], offsets[None, 2:], rtol=0.0, atol=_NATIVE_OFFSET_TOLERANCE_M,
+    ):
+        raise ValueError("native G1 local offsets for bones 2..30 must be constant")
+    if not np.isfinite(offsets).all():
+        raise ValueError("canonical native G1 local offsets must be finite")
+    return {
+        "skeleton_parents": G1_SKELETON.parents.astype(np.int32, copy=True),
+        "skeleton_names": np.asarray(G1_SKELETON.names),
+        "skeleton_signature": np.asarray(G1_SKELETON.signature()),
+        "canonical_local_offsets": offsets.astype(np.float32),
+    }
+
+
 def build_dataset(
     walking_source: Path,
     g1_xml: Path,
@@ -314,6 +346,7 @@ def build_dataset(
     if rows.walk_windows[:, 30:50].tobytes() != rows.pickup_windows[:, :20].tobytes():
         raise AssertionError("interaction dataset overlap audit failed")
     walking = load_native_g1_walk(walking_source, g1_xml)
+    skeleton_metadata = _canonical_skeleton_metadata(walking)
     walking_partitions = _partitioned_walking_rows(walking, stride=10, seed=seed)
     _assert_disjoint_walking_source_ranges(walking_partitions)
     if any(len(walking_partitions[name][0]) == 0 for name in SPLITS):
@@ -321,6 +354,7 @@ def build_dataset(
 
     interaction_split = _split_interaction_by_object(rows.object_ids, seed)
     values: dict[str, np.ndarray] = {}
+    values.update(skeleton_metadata)
     _partition_overlap(values, rows, interaction_split)
     for name, (windows, statics, temporal, ranges) in walking_partitions.items():
         values[f"{name}_walking_windows"] = windows
@@ -354,6 +388,10 @@ def build_dataset(
     }
     audit = {
         "frame_schema": FRAME_DIM,
+        "skeleton_parents": skeleton_metadata["skeleton_parents"].astype(int).tolist(),
+        "skeleton_names": skeleton_metadata["skeleton_names"].tolist(),
+        "skeleton_signature": str(skeleton_metadata["skeleton_signature"].item()),
+        "canonical_local_offsets": skeleton_metadata["canonical_local_offsets"].tolist(),
         "hips_channel_variance": train_frames[..., 3:6].var(axis=(0, 1), dtype=np.float64).tolist(),
         "fps": FPS,
         "interaction_rows": int(len(rows.walk_windows)),
