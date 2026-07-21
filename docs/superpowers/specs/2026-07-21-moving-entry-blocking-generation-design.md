@@ -2,7 +2,9 @@
 
 Date: 2026-07-21
 
-Status: approved for implementation
+Status: superseded; a physics hold is still a visible stop
+
+Superseded by `2026-07-21-walking-entry-prefetch-design.md`.
 
 ## Goal
 
