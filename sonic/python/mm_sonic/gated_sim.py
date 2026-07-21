@@ -35,7 +35,7 @@ from .process import (
 
 PROTOCOL_NAME = "gated-sim/v1"
 PROTOCOL_VERSION = 1
-PINNED_GEAR_COMMIT = "60de0df7ffedeef415fe58d435e92cc5b01ba3d9"
+PINNED_GEAR_COMMIT = "ddd41cbe5c5de32b6ff8f2822c73cb92bfc1c190"
 _STATE_PERIOD_S = 1.0 / 50.0
 _EXACT_TOLERANCE = 1.0e-12
 

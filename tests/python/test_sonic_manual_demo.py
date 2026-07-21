@@ -473,11 +473,14 @@ class StartupTransactionTests(unittest.TestCase):
 
 class ScoredControlStartupTests(unittest.TestCase):
     class _Gear:
+        simulation_control_gate = True
+
         def __init__(self, calls, *, barrier_error=None, receipt_error=None):
             self.calls = calls
             self.barrier_error = barrier_error
             self.receipt_error = receipt_error
             self.stopped = True
+            self.control_paused = False
 
         def continue_group(self):
             self.calls.append("gear.continue_group")
@@ -513,6 +516,14 @@ class ScoredControlStartupTests(unittest.TestCase):
             self.calls.append("gear.stop_group")
             self.stopped = True
 
+        @property
+        def simulation_control_is_paused(self):
+            return self.control_paused
+
+        def pause_simulation_control(self):
+            self.calls.append("gear.pause_simulation_control")
+            self.control_paused = True
+
         def group_is_stopped(self):
             return self.stopped
 
@@ -536,7 +547,7 @@ class ScoredControlStartupTests(unittest.TestCase):
             self.advance_calls += 1
             raise AssertionError("startup must not advance physics")
 
-    def test_action_readiness_precedes_gate_pause(self):
+    def test_action_readiness_precedes_control_channel_gate_pause(self):
         calls = []
         gear = self._Gear(calls)
         simulator = self._Simulator(calls)
@@ -546,7 +557,7 @@ class ScoredControlStartupTests(unittest.TestCase):
             gate = _activate_scored_control(gear, simulator)
 
         self.assertIsInstance(gate, SimulationPolicyGate)
-        self.assertIs(gate.suspend_gear_when_paused, False)
+        self.assertEqual(gate.pause_strategy, "control-channel")
         self.assertEqual(
             calls,
             [
@@ -554,7 +565,7 @@ class ScoredControlStartupTests(unittest.TestCase):
                 "gear.activate_control",
                 "gear.wait_for_first_policy_action",
                 "gear.wait_for_received_policy_command",
-                "gear.require_alive",
+                "gear.pause_simulation_control",
                 "simulator.require_alive",
             ],
         )
@@ -566,6 +577,24 @@ class ScoredControlStartupTests(unittest.TestCase):
             "SONIC first action ready: index=1 policy_time=20.000ms\n"
             "SONIC policy command received: index=2 policy_time=40.000ms\n",
         )
+
+    def test_input_readiness_precedes_controller_activation(self):
+        calls = []
+        gear = self._Gear(calls)
+        simulator = self._Simulator(calls)
+
+        def input_ready():
+            calls.append("input.ready")
+
+        with redirect_stdout(StringIO()):
+            _activate_scored_control(
+                gear,
+                simulator,
+                before_control=input_ready,
+            )
+
+        self.assertEqual(calls[0], "input.ready")
+        self.assertEqual(calls[1], "gear.continue_group")
 
     def test_barrier_failure_does_not_pause_gate_or_advance_physics(self):
         calls = []

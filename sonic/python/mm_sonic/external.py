@@ -18,7 +18,7 @@ from typing import Mapping
 LOCK_SCHEMA = "gear-sonic-lock/v1"
 LOCK_REPOSITORY = "https://github.com/NVlabs/GR00T-WholeBodyControl.git"
 CURRENT_FRAME_ADVANCEMENT_SHA256 = (
-    "adcd05aa6abdde2f849ac3cfef6971f629a6972b680d78fb959b7eb5d8649f33"
+    "07f183c4abab53157beba3bbc12bc021789ae00ec8c1b8f69dce5596e33e7f6b"
 )
 
 LOCK_PATH_KEYS = (

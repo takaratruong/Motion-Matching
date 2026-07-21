@@ -1,7 +1,7 @@
 {
   "schema": "gear-sonic-lock/v1",
   "repository": "https://github.com/NVlabs/GR00T-WholeBodyControl.git",
-  "commit": "60de0df7ffedeef415fe58d435e92cc5b01ba3d9",
+  "commit": "ddd41cbe5c5de32b6ff8f2822c73cb92bfc1c190",
   "known_good_reference": "gear_sonic_deploy/reference/example/walking_quip_360_R_002__A428",
   "joint_names_source": "gear_sonic/envs/manager_env/robots/g1.py",
   "policy_parameters_source": "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/policy_parameters.hpp",
@@ -9,5 +9,5 @@
   "zmq_decoder_source": "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/input_interface/zmq_packed_message_subscriber.hpp",
   "stream_merger_source": "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/input_interface/streamed_motion_merger.hpp",
   "current_frame_advancement_source": "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/src/g1_deploy_onnx_ref.cpp",
-  "current_frame_advancement_sha256": "adcd05aa6abdde2f849ac3cfef6971f629a6972b680d78fb959b7eb5d8649f33"
+  "current_frame_advancement_sha256": "07f183c4abab53157beba3bbc12bc021789ae00ec8c1b8f69dce5596e33e7f6b"
 }

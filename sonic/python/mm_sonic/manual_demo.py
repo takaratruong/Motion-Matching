@@ -362,10 +362,15 @@ def _run_startup_transaction(
 
 
 def _activate_scored_control(
-    gear: object, simulator: object
+    gear: object,
+    simulator: object,
+    *,
+    before_control: Callable[[], None] | None = None,
 ) -> SimulationPolicyGate:
     """Prepare one policy action before any scored physics release."""
 
+    if before_control is not None:
+        before_control()
     gear.continue_group()
     gear.activate_control()
     ready = gear.wait_for_first_policy_action()
@@ -381,12 +386,12 @@ def _activate_scored_control(
         f"policy_time={received['time_ms']:.3f}ms",
         flush=True,
     )
-    # Live inference pauses MuJoCo, not GEAR's DDS/control threads. Suspending
-    # the whole process makes its 500 ms LowState watchdog stale at SIGCONT.
+    # Fence only GEAR's policy/reference workers. DDS LowState handling and the
+    # command writer stay live throughout arbitrarily long MM requests.
     gate = SimulationPolicyGate(
         gear,
         simulator,
-        suspend_gear_when_paused=False,
+        pause_strategy="control-channel",
     )
     gate.pause()
     return gate
@@ -713,6 +718,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
         stdout_archive=bundle.path / "gear.stdout",
         stderr_archive=bundle.path / "gear.stderr",
         launch_profile="zmq_stream",
+        simulation_control_gate=True,
         readiness_timeout_s=120.0,
         cancelled=cancelled,
         env=environment,
@@ -865,12 +871,12 @@ def run_demo(namespace: argparse.Namespace) -> Path:
             initial_qpos=initial_qpos,
             log_dir=bundle.path / "scored-sim-logs",
         )
-        gate = _activate_scored_control(gear, simulator)
         steps_per_chunk = round(prefix_duration_s / simulator.sim_dt)
 
         camera_state = _initial_camera_delivery_state(namespace.onscreen)
         last_command: CommandSample | None = None
         if namespace.mode == "script":
+            gate = _activate_scored_control(gear, simulator)
             script = flat_command_script()
             for consumed_chunk in range(namespace.chunks):
                 command = (
@@ -917,10 +923,17 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                     event_sink=_print_terminal_event,
                     cancel_event=cancellation,
                 ) as control_loop:
-                    if not control_loop.wait_for_sequence(1, timeout_s=2.0):
-                        raise ContractError(
-                            "continuous X11 control did not publish an initial state"
-                        )
+                    def wait_for_initial_input() -> None:
+                        if not control_loop.wait_for_sequence(1, timeout_s=2.0):
+                            raise ContractError(
+                                "continuous X11 control did not publish an initial state"
+                            )
+
+                    gate = _activate_scored_control(
+                        gear,
+                        simulator,
+                        before_control=wait_for_initial_input,
+                    )
                     if responsive:
                         # Opt-in Stage-R1 one-prefix responsive path. The single
                         # preloaded chunk already committed index 0, so control
@@ -1001,6 +1014,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                 event_sink=_print_terminal_event,
             )
             with reader:
+                gate = _activate_scored_control(gear, simulator)
                 for consumed_chunk in range(namespace.chunks):
                     sampler.update(key_buffer.sample())
                     command = sampler.sample_boundary(next_chunk)

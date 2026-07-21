@@ -199,7 +199,7 @@ class DeliveryAuditTests(unittest.TestCase):
             hashes["gear:current_frame_advancement_source"] = digest
         return VerifiedGearCheckout(
             gear_checkout=self.root,
-            gear_commit="60de0df7ffedeef415fe58d435e92cc5b01ba3d9",
+            gear_commit="ddd41cbe5c5de32b6ff8f2822c73cb92bfc1c190",
             gear_dirty=False,
             hashes=MappingProxyType(hashes),
             known_good_reference=self.root,

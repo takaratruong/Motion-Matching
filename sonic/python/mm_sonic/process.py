@@ -19,6 +19,7 @@ import re
 import secrets
 import select
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -44,6 +45,7 @@ _MANAGED_GEAR_FLAGS = frozenset(
         "--disable-crc-check",
         "--zmq-conflate",
         "--zmq-verbose",
+        "--sonic-simulation-control-fd",
     }
 )
 _DEFAULT_STARTUP_MARKERS = ("Initialized ZMQ endpoint interface",)
@@ -88,6 +90,8 @@ _GEAR_ACTION_HEADER = (
     *(f"act_{index}" for index in range(29)),
 )
 _GEAR_LAUNCH_PROFILES = frozenset({"zmq_stream", "loaded_motion"})
+_SIMULATION_CONTROL_READY = ("READY", "1")
+_SIMULATION_CONTROL_MAX_PACKET = 256
 _SHELL_SAFE_ABSOLUTE_PATH = re.compile(r"/[A-Za-z0-9._/-]*\Z")
 _OWNED_DIRECTORY_STAGING_PREFIX = ".mm-sonic-owned-"
 _RENAME_NOREPLACE = 1
@@ -2150,6 +2154,7 @@ class GearProcess:
         stdout_archive: str | Path,
         stderr_archive: str | Path,
         launch_profile: str = "zmq_stream",
+        simulation_control_gate: bool = False,
         startup_markers: Sequence[str] | None = None,
         active_markers: Sequence[str] | None = None,
         wait_for_control_marker: str = _WAIT_FOR_CONTROL_MARKER,
@@ -2175,6 +2180,8 @@ class GearProcess:
             raise ValueError(
                 "launch_profile must be 'zmq_stream' or 'loaded_motion'"
             )
+        if type(simulation_control_gate) is not bool:
+            raise ValueError("simulation_control_gate must be a boolean")
         managed = [
             item
             for item in selected_command
@@ -2270,6 +2277,7 @@ class GearProcess:
         self.run_root = run_root_path
         self.argv = argv
         self.launch_profile = launch_profile
+        self.simulation_control_gate = simulation_control_gate
         self.target_motion_logfile = target
         self.logs_dir = logs
         self.stdout_archive = stdout_path
@@ -2301,6 +2309,11 @@ class GearProcess:
         self._wait_for_control_ready = False
         self._input_prepared = False
         self._control_active = False
+        self._simulation_control_state = "disabled"
+        self._simulation_control_epoch = 0
+        self._simulation_control_tick: int | None = None
+        self._simulation_control_socket: socket.socket | None = None
+        self._simulation_control_child_socket: socket.socket | None = None
         self._stopped_member_pids: tuple[int, ...] = ()
         self._resume_verified_after_stop = False
         self.signal_history: list[signal.Signals] = []
@@ -2500,6 +2513,140 @@ class GearProcess:
     def _wait_exact_line(self, line: str, *, after_offset: int) -> int:
         return self._wait_exact_line_range(line, after_offset=after_offset)[1]
 
+    def _receive_simulation_control_packet(self) -> tuple[str, ...]:
+        channel = self._simulation_control_socket
+        if channel is None:
+            raise ProcessError("GEAR simulation control channel is unavailable")
+        deadline = (
+            None
+            if self._readiness_timeout_s is None
+            else time.monotonic() + self._readiness_timeout_s
+        )
+        while True:
+            self.require_alive()
+            if _cancelled(self._cancelled):
+                raise OperatorCancelled(
+                    "operator cancelled GEAR simulation control wait"
+                )
+            remaining = self._readiness_poll_s
+            if deadline is not None:
+                remaining = min(
+                    remaining, max(0.0, deadline - time.monotonic())
+                )
+                if remaining <= 0.0:
+                    raise ProcessError(
+                        "timed out waiting for GEAR simulation control packet"
+                    )
+            readable, _, exceptional = select.select(
+                (channel,), (), (channel,), remaining
+            )
+            if exceptional:
+                raise ProcessProtocolError(
+                    "GEAR simulation control channel reported an exception"
+                )
+            if not readable:
+                continue
+            try:
+                packet = channel.recv(_SIMULATION_CONTROL_MAX_PACKET + 1)
+            except OSError as error:
+                raise ProcessError(
+                    f"failed to receive GEAR simulation control packet: {error}"
+                ) from error
+            if not packet:
+                raise ChildProcessDied(
+                    "GEAR simulation control channel closed before acknowledgement"
+                )
+            if len(packet) > _SIMULATION_CONTROL_MAX_PACKET:
+                raise ProcessProtocolError(
+                    "GEAR simulation control packet exceeds maximum size"
+                )
+            try:
+                text = packet.decode("ascii")
+            except UnicodeDecodeError as error:
+                raise ProcessProtocolError(
+                    "GEAR simulation control packet must be ASCII"
+                ) from error
+            if not text.endswith("\n") or "\n" in text[:-1]:
+                raise ProcessProtocolError(
+                    "GEAR simulation control packet must contain one line"
+                )
+            fields = tuple(text[:-1].split(" "))
+            if any(not field for field in fields):
+                raise ProcessProtocolError(
+                    "GEAR simulation control packet fields are malformed"
+                )
+            return fields
+
+    def _wait_simulation_control_packet(
+        self, expected: str, epoch: int | None = None
+    ) -> int | None:
+        while True:
+            fields = self._receive_simulation_control_packet()
+            if fields[0] == "ERROR":
+                raise ProcessProtocolError(
+                    "GEAR simulation control rejected request: " + " ".join(fields)
+                )
+            if fields[0] == "RUNNING":
+                if len(fields) != 3:
+                    raise ProcessProtocolError(
+                        "GEAR RUNNING packet shape is invalid"
+                    )
+                try:
+                    running_epoch = int(fields[1])
+                    running_tick = int(fields[2])
+                except ValueError as error:
+                    raise ProcessProtocolError(
+                        "GEAR RUNNING packet integers are invalid"
+                    ) from error
+                if (
+                    self._simulation_control_state != "armed"
+                    or running_epoch != self._simulation_control_epoch
+                    or running_tick == self._simulation_control_tick
+                ):
+                    raise ProcessProtocolError(
+                        "GEAR RUNNING packet violates the armed epoch"
+                    )
+                self._simulation_control_state = "running"
+                self._simulation_control_tick = running_tick
+                continue
+            if expected == "READY":
+                if fields != _SIMULATION_CONTROL_READY:
+                    raise ProcessProtocolError(
+                        "GEAR simulation control capability is not READY/v1"
+                    )
+                return None
+            if len(fields) != 3 or fields[0] != expected:
+                raise ProcessProtocolError(
+                    f"expected GEAR {expected} packet, received {' '.join(fields)}"
+                )
+            try:
+                received_epoch = int(fields[1])
+                tick = int(fields[2])
+            except ValueError as error:
+                raise ProcessProtocolError(
+                    f"GEAR {expected} packet integers are invalid"
+                ) from error
+            if received_epoch != epoch or tick < 0 or tick > 0xFFFFFFFF:
+                raise ProcessProtocolError(
+                    f"GEAR {expected} packet epoch or tick is invalid"
+                )
+            return tick
+
+    def _send_simulation_control_packet(self, verb: str, epoch: int) -> None:
+        channel = self._simulation_control_socket
+        if channel is None:
+            raise ProcessError("GEAR simulation control channel is unavailable")
+        self.require_alive()
+        packet = f"{verb} {epoch}\n".encode("ascii")
+        try:
+            sent = channel.send(packet)
+        except OSError as error:
+            raise ProcessError(
+                f"failed to send GEAR simulation control packet: {error}"
+            ) from error
+        if sent != len(packet):
+            raise ProcessError("GEAR simulation control packet was truncated")
+
     def start_to_wait_for_control(self) -> None:
         """Cold-start GEAR through exact authenticated WAIT_FOR_CONTROL only."""
 
@@ -2509,6 +2656,22 @@ class GearProcess:
             raise ProcessError("GEAR process has already started")
         master, slave = pty.openpty()
         self._master_fd = master
+        launch_argv = self.argv
+        pass_fds: tuple[int, ...] = ()
+        if self.simulation_control_gate:
+            parent, child = socket.socketpair(
+                socket.AF_UNIX, socket.SOCK_SEQPACKET
+            )
+            child.set_inheritable(True)
+            self._simulation_control_socket = parent
+            self._simulation_control_child_socket = child
+            launch_argv = (
+                *launch_argv,
+                "--sonic-simulation-control-fd",
+                str(child.fileno()),
+            )
+            self.argv = launch_argv
+            pass_fds = (child.fileno(),)
         try:
             logs = _confined_existing_path(
                 self.run_root,
@@ -2540,7 +2703,7 @@ class GearProcess:
             )
             try:
                 self._process = subprocess.Popen(
-                    self.argv,
+                    launch_argv,
                     stdin=slave,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -2548,9 +2711,13 @@ class GearProcess:
                     cwd=self._cwd,
                     start_new_session=True,
                     bufsize=0,
+                    pass_fds=pass_fds,
                 )
             finally:
                 os.close(slave)
+                if self._simulation_control_child_socket is not None:
+                    self._simulation_control_child_socket.close()
+                    self._simulation_control_child_socket = None
             self._pgid = _verify_new_process_group(self._process)
             assert self._process.stdout is not None
             assert self._process.stderr is not None
@@ -2568,6 +2735,9 @@ class GearProcess:
                 self._reader_threads.append(thread)
             self._wait_markers(self._startup_markers)
             self._startup_markers_ready = True
+            if self.simulation_control_gate:
+                self._wait_simulation_control_packet("READY")
+                self._simulation_control_state = "running"
             self._wait_exact_line(f"{self._wait_for_control_marker}\n", after_offset=0)
             self._wait_for_control_ready = True
             if len(self._active_markers) != 2:
@@ -2819,9 +2989,53 @@ class GearProcess:
         )
         held_targets: list[tuple[float, ...]] = []
         held_set: set[tuple[float, ...]] = set()
+        observed_actions: list[Mapping[str, object]] = []
+        action_bounds: list[tuple[tuple[float, ...], tuple[float, ...]]] = []
+
+        def check_abort() -> None:
+            if _cancelled(self._cancelled):
+                raise OperatorCancelled(
+                    "operator cancelled received policy command wait"
+                )
+            if deadline is not None and time.monotonic() >= deadline:
+                raise ProcessError(
+                    "timed out waiting for received GEAR policy command"
+                )
+
+        def receipt(
+            action: Mapping[str, object], target: tuple[float, ...]
+        ) -> Mapping[str, object]:
+            return MappingProxyType(
+                {
+                    "index": action["index"],
+                    "time_ms": action["time_ms"],
+                    "time_monotonic_ms": action["time_monotonic_ms"],
+                    "action": action["action"],
+                    "q_target": target,
+                }
+            )
+
+        pair_checks = 0
+
+        def matches(
+            bounds: tuple[tuple[float, ...], tuple[float, ...]],
+            target: tuple[float, ...],
+        ) -> bool:
+            nonlocal pair_checks
+            if pair_checks % 256 == 0:
+                check_abort()
+            pair_checks += 1
+            lower, upper = bounds
+            return all(
+                low <= value <= high
+                for low, value, high in zip(lower, target, upper, strict=True)
+            )
+
         while True:
             self.require_alive()
             simulator.require_alive()
+            check_abort()
+            old_target_count = len(held_targets)
             snapshot = simulator.low_command_snapshot()
             if not isinstance(snapshot, Mapping):
                 raise ProcessError("simulator LowCmd snapshot must be a mapping")
@@ -2848,52 +3062,90 @@ class GearProcess:
                     "simulator LowCmd receipt flag must be boolean"
                 )
 
-            for action in self._read_policy_actions():
+            actions = self._read_policy_actions()
+            old_action_count = len(observed_actions)
+            if len(actions) < old_action_count or tuple(
+                observed_actions
+            ) != actions[:old_action_count]:
+                raise ProcessError(
+                    "GEAR action log changed after authenticated observation"
+                )
+            for action in actions[old_action_count:]:
+                check_abort()
                 try:
-                    lower, upper = policy_action_lowcmd_target_bounds(
-                        action["action_decimal"]
+                    bounds = policy_action_lowcmd_target_bounds(
+                        action["action_decimal"]  # type: ignore[arg-type]
                     )
                 except (KeyError, TypeError, ValueError) as error:
                     raise ProcessError(
                         "GEAR action log policy values must use fixed-nine decimals"
                     ) from error
-                matching_target = next(
-                    (
-                        target
-                        for target in held_targets
-                        if all(
-                            low <= value <= high
-                            for low, value, high in zip(
-                                lower, target, upper, strict=True
-                            )
-                        )
-                    ),
-                    None,
-                )
-                if matching_target is not None:
-                    return MappingProxyType(
-                        {
-                            "index": action["index"],
-                            "time_ms": action["time_ms"],
-                            "time_monotonic_ms": action[
-                                "time_monotonic_ms"
-                            ],
-                            "action": action["action"],
-                            "q_target": matching_target,
-                        }
-                    )
-            if _cancelled(self._cancelled):
-                raise OperatorCancelled(
-                    "operator cancelled received policy command wait"
-                )
-            if deadline is not None and time.monotonic() >= deadline:
-                raise ProcessError(
-                    "timed out waiting for received GEAR policy command"
-                )
+                observed_actions.append(action)
+                action_bounds.append(bounds)
+
+            # Compare each authenticated action/received-target pair once:
+            # new actions against old targets, then every action against the
+            # newly received targets. This keeps polling work append-only.
+            for action_index in range(old_action_count, len(observed_actions)):
+                for target in held_targets[:old_target_count]:
+                    if matches(action_bounds[action_index], target):
+                        return receipt(observed_actions[action_index], target)
+            for action_index, action in enumerate(observed_actions):
+                for target in held_targets[old_target_count:]:
+                    if matches(action_bounds[action_index], target):
+                        return receipt(action, target)
+
+            check_abort()
             wait = self._readiness_poll_s
             if deadline is not None:
                 wait = min(wait, max(0.0, deadline - time.monotonic()))
             time.sleep(wait)
+
+    @property
+    def simulation_control_is_paused(self) -> bool:
+        return self._simulation_control_state == "paused"
+
+    def pause_simulation_control(self) -> None:
+        """Fence policy workers after draining any in-flight callbacks."""
+
+        if not self.simulation_control_gate:
+            raise ProcessError("GEAR simulation control gate is not enabled")
+        if not self._control_active:
+            raise ProcessError(
+                "GEAR simulation control gate requires active policy control"
+            )
+        if self.group_is_stopped():
+            raise ProcessError(
+                "GEAR simulation control gate requires a resumed process group"
+            )
+        if self._simulation_control_state == "paused":
+            return
+        if self._simulation_control_state not in ("running", "armed"):
+            raise ProcessError(
+                "GEAR simulation control cannot pause from state "
+                f"{self._simulation_control_state!r}"
+            )
+        epoch = self._simulation_control_epoch + 1
+        self._send_simulation_control_packet("PAUSE", epoch)
+        tick = self._wait_simulation_control_packet("PAUSED", epoch)
+        assert tick is not None
+        self._simulation_control_epoch = epoch
+        self._simulation_control_tick = tick
+        self._simulation_control_state = "paused"
+
+    def arm_simulation_control(self) -> None:
+        """Arm resumption; a changed LowState tick opens policy execution."""
+
+        if not self.simulation_control_gate:
+            raise ProcessError("GEAR simulation control gate is not enabled")
+        if self._simulation_control_state != "paused":
+            raise ProcessError("GEAR simulation control must be paused before arm")
+        epoch = self._simulation_control_epoch
+        self._send_simulation_control_packet("ARM", epoch)
+        tick = self._wait_simulation_control_packet("ARMED", epoch)
+        assert tick is not None
+        self._simulation_control_tick = tick
+        self._simulation_control_state = "armed"
 
     def write_keys(self, keys: bytes) -> None:
         if type(keys) is not bytes or not keys:
@@ -3229,6 +3481,17 @@ class GearProcess:
                 except OSError:
                     pass
                 self._master_fd = None
+            for attribute in (
+                "_simulation_control_child_socket",
+                "_simulation_control_socket",
+            ):
+                channel = getattr(self, attribute)
+                if channel is not None:
+                    try:
+                        channel.close()
+                    except OSError:
+                        pass
+                    setattr(self, attribute, None)
             incomplete = self._finish_reader_threads(process)
             if incomplete is not None:
                 evidence_error = incomplete
@@ -3256,6 +3519,7 @@ class GearProcess:
             self._wait_for_control_ready = False
             self._input_prepared = False
             self._control_active = False
+            self._simulation_control_state = "disabled"
             # The wrapper creates this directory exclusively.  GEAR fills it
             # during a normal run; an earlier peer failure can leave it empty,
             # and empty unregistered directories cannot enter sealed evidence.
@@ -3291,7 +3555,7 @@ class SimulationPolicyGate:
         simulator: GatedSimulatorClient,
         *,
         tolerance: float = 1.0e-12,
-        suspend_gear_when_paused: bool = True,
+        pause_strategy: str = "process",
     ) -> None:
         sim_dt = simulator.sim_dt
         if (
@@ -3302,14 +3566,23 @@ class SimulationPolicyGate:
             raise ValueError("sim_dt must be a positive finite number")
         if tolerance < 0.0 or not math.isfinite(tolerance):
             raise ValueError("tolerance must be finite and nonnegative")
-        if type(suspend_gear_when_paused) is not bool:
-            raise ValueError("suspend_gear_when_paused must be a boolean")
+        if pause_strategy not in ("process", "control-channel"):
+            raise ValueError(
+                "pause_strategy must be 'process' or 'control-channel'"
+            )
+        if pause_strategy == "control-channel" and not getattr(
+            gear, "simulation_control_gate", False
+        ):
+            raise ValueError(
+                "control-channel pause strategy requires an enabled GEAR gate"
+            )
         self.gear = gear
         self.simulator = simulator
         self.sim_dt = float(sim_dt)
         self.tolerance = float(tolerance)
-        self.suspend_gear_when_paused = suspend_gear_when_paused
+        self.pause_strategy = pause_strategy
         self._paused = False
+        self._policy_finished = False
         self._closed = False
 
     def _require_bound_sim_dt(self) -> None:
@@ -3325,9 +3598,13 @@ class SimulationPolicyGate:
 
     @property
     def is_paused(self) -> bool:
-        return self._paused and (
-            not self.suspend_gear_when_paused or self.gear.group_is_stopped()
-        )
+        if self._policy_finished:
+            return True
+        if not self._paused:
+            return False
+        if self.pause_strategy == "control-channel":
+            return bool(self.gear.simulation_control_is_paused)
+        return self.gear.group_is_stopped()
 
     def require_paused(self) -> None:
         if not self.is_paused:
@@ -3336,8 +3613,8 @@ class SimulationPolicyGate:
     def pause(self) -> None:
         if self._closed:
             raise RuntimeError("simulation policy gate is closed")
-        if not self.suspend_gear_when_paused:
-            self.gear.require_alive()
+        if self.pause_strategy == "control-channel":
+            self.gear.pause_simulation_control()
             self.simulator.require_alive()
             self._paused = True
             return
@@ -3364,6 +3641,7 @@ class SimulationPolicyGate:
             raise RuntimeError("simulation policy gate is closed")
         self.gear.close()
         self._paused = True
+        self._policy_finished = True
 
     def release_steps(self, steps: int) -> AdvanceResult:
         _positive_integer(steps, "steps")
@@ -3388,9 +3666,14 @@ class SimulationPolicyGate:
         result: AdvanceResult | None = None
         operation_error: BaseException | None = None
         try:
-            if self.suspend_gear_when_paused:
+            if self.pause_strategy == "process":
                 try:
                     self.gear.continue_group()
+                except BaseException as error:
+                    operation_error = _at_failure_site(error, "process_resume")
+            else:
+                try:
+                    self.gear.arm_simulation_control()
                 except BaseException as error:
                     operation_error = _at_failure_site(error, "process_resume")
             if operation_error is None:
@@ -3403,14 +3686,18 @@ class SimulationPolicyGate:
         except BaseException as error:
             operation_error = error
         stop_error: BaseException | None = None
-        if self.suspend_gear_when_paused:
+        if self.pause_strategy == "process":
             try:
                 self.gear.stop_group()
             except BaseException as error:
                 stop_error = error
             self._paused = self.gear.group_is_stopped()
         else:
-            self._paused = True
+            try:
+                self.gear.pause_simulation_control()
+            except BaseException as error:
+                stop_error = error
+            self._paused = self.gear.simulation_control_is_paused
         if operation_error is not None:
             if stop_error is not None and not self._paused:
                 raise stop_error from operation_error

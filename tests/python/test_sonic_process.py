@@ -14,7 +14,10 @@ import numpy as np
 
 from mm_sonic.commands import CommandSample
 from mm_sonic.coordinator import SessionConfig
-from mm_sonic.gear_action import policy_action_to_lowcmd_target
+from mm_sonic.gear_action import (
+    policy_action_lowcmd_target_bounds,
+    policy_action_to_lowcmd_target,
+)
 from mm_sonic.process import (
     AdvanceResult,
     ChildProcessDied,
@@ -2534,6 +2537,130 @@ class GearProcessTests(TemporaryScriptCase):
         finally:
             gear.close()
 
+    def test_received_policy_command_cancellation_bounds_pair_scan_work(self):
+        child = self.script("unused_bounded_scan.py", "raise SystemExit(0)\n")
+        checks = 0
+
+        def cancelled():
+            nonlocal checks
+            checks += 1
+            return checks >= 4
+
+        gear = self.gear(
+            child,
+            cancelled=cancelled,
+            readiness_timeout_s=1.0,
+            readiness_poll_s=0.001,
+        )
+        actions = tuple(
+            {
+                "index": index,
+                "time_ms": index * 20.0,
+                "time_monotonic_ms": index * 20.0,
+                "action": (0.25,) * 29,
+                "action_decimal": ("0.250000000",) * 29,
+            }
+            for index in range(1, 1001)
+        )
+        received_target = policy_action_to_lowcmd_target((-0.5,) * 29)
+
+        class Simulator:
+            @staticmethod
+            def require_alive():
+                return None
+
+            @staticmethod
+            def low_command_snapshot():
+                return {"received": True, "q_target": received_target}
+
+        gear._control_active = True
+        try:
+            with (
+                patch.object(gear, "group_is_resumed", return_value=True),
+                patch.object(gear, "require_alive", return_value=None),
+                patch.object(gear, "_read_policy_actions", return_value=actions),
+                patch(
+                    "mm_sonic.process.policy_action_lowcmd_target_bounds",
+                    wraps=policy_action_lowcmd_target_bounds,
+                ) as bounds,
+            ):
+                with self.assertRaisesRegex(OperatorCancelled, "received policy"):
+                    gear.wait_for_received_policy_command(Simulator())
+
+            self.assertLessEqual(bounds.call_count, 2)
+        finally:
+            gear.close()
+
+    def test_simulation_control_channel_requires_ready_pause_arm_and_fresh_tick(self):
+        child = self.script(
+            "simulation_control_channel_child.py",
+            r'''
+            import socket
+            import sys
+
+            flag = sys.argv.index("--sonic-simulation-control-fd")
+            channel = socket.socket(fileno=int(sys.argv[flag + 1]))
+            channel.send(b"READY 1\n")
+            print("BOOT READY", flush=True)
+            while True:
+                packet = channel.recv(256)
+                if packet == b"PAUSE 1\n":
+                    channel.send(b"PAUSED 1 100\n")
+                elif packet == b"ARM 1\n":
+                    channel.send(b"ARMED 1 100\n")
+                    channel.send(b"RUNNING 1 101\n")
+                elif packet == b"PAUSE 2\n":
+                    channel.send(b"PAUSED 2 101\n")
+                else:
+                    channel.send(b"ERROR 0 unexpected-request\n")
+            ''',
+        )
+        gear = self.gear(
+            child,
+            simulation_control_gate=True,
+            readiness_timeout_s=0.5,
+        )
+        try:
+            gear.start_to_wait_for_control()
+            gear._control_active = True
+
+            gear.pause_simulation_control()
+            self.assertTrue(gear.simulation_control_is_paused)
+            self.assertTrue(gear.group_is_resumed())
+
+            gear.arm_simulation_control()
+            self.assertFalse(gear.simulation_control_is_paused)
+            gear.pause_simulation_control()
+            self.assertTrue(gear.simulation_control_is_paused)
+            self.assertTrue(gear.group_is_resumed())
+            self.assertIn("--sonic-simulation-control-fd", gear.argv)
+            self.assertEqual(gear._simulation_control_epoch, 2)
+            self.assertEqual(gear._simulation_control_tick, 101)
+        finally:
+            gear.close()
+
+    def test_simulation_control_channel_rejects_unpatched_binary_at_startup(self):
+        child = self.script(
+            "unpatched_simulation_control_child.py",
+            r'''
+            import os
+            print("BOOT READY", flush=True)
+            while os.read(0, 1).lower() != b"o":
+                pass
+            ''',
+        )
+        gear = self.gear(
+            child,
+            simulation_control_gate=True,
+            readiness_timeout_s=0.05,
+            readiness_poll_s=0.005,
+        )
+        try:
+            with self.assertRaisesRegex(ProcessError, "simulation control packet"):
+                gear.start_to_wait_for_control()
+        finally:
+            gear.close()
+
     def test_first_policy_action_rejects_wrong_policy_index(self):
         child = self.script("unused_action_index.py", "raise SystemExit(0)\n")
         gear = self.gear(child)
@@ -3508,6 +3635,41 @@ class FakeSimulatorClient:
         self.closed = True
 
 
+class FakeChannelGatedGear:
+    simulation_control_gate = True
+
+    def __init__(self):
+        self.paused = False
+        self.events = []
+        self.closed = False
+
+    @property
+    def simulation_control_is_paused(self):
+        return self.paused
+
+    def pause_simulation_control(self):
+        self.events.append("gear.pause_control")
+        self.paused = True
+
+    def arm_simulation_control(self):
+        self.events.append("gear.arm_control")
+        self.paused = False
+
+    def require_alive(self):
+        self.events.append("gear.require_alive")
+
+    @staticmethod
+    def group_is_stopped():
+        return False
+
+    @staticmethod
+    def group_is_resumed():
+        return True
+
+    def close(self):
+        self.closed = True
+
+
 class SimulationPolicyGateTests(TemporaryScriptCase):
     def setUp(self):
         super().setUp()
@@ -3575,30 +3737,60 @@ class SimulationPolicyGateTests(TemporaryScriptCase):
             [signal.SIGSTOP, signal.SIGCONT, signal.SIGSTOP],
         )
 
-    def test_live_gate_pauses_only_physics_and_never_suspends_gear(self):
+    def test_channel_gate_fences_control_while_gear_dds_stays_live(self):
         simulator = FakeSimulatorClient()
-        simulator.gear = self.gear
+        gear = FakeChannelGatedGear()
+        simulator.gear = gear
         gate = SimulationPolicyGate(
-            self.gear,
+            gear,
             simulator,
-            suspend_gear_when_paused=False,
+            pause_strategy="control-channel",
         )
-        before = list(self.gear.signal_history)
 
         gate.pause()
         result = gate.advance(0.2)
 
         self.assertEqual(result.steps, 40)
         self.assertTrue(gate.is_paused)
-        self.assertTrue(self.gear.group_is_resumed())
-        self.assertEqual(self.gear.signal_history, before)
+        self.assertTrue(gear.group_is_resumed())
+        self.assertEqual(
+            gear.events,
+            [
+                "gear.pause_control",
+                "gear.require_alive",
+                "gear.arm_control",
+                "gear.pause_control",
+            ],
+        )
         self.assertEqual(simulator.refresh_stopped_checks, [False])
         self.assertEqual(simulator.running_checks, [True])
 
         gate.finish_policy()
 
-        self.assertIsNotNone(self.gear.returncode)
+        self.assertTrue(gear.closed)
         self.assertTrue(gate.is_paused)
+
+    def test_channel_gate_positively_repauses_when_advance_fails_while_armed(self):
+        class FailingSimulator(FakeSimulatorClient):
+            def advance(self, steps):
+                self.steps.append(steps)
+                raise ProcessProtocolError("synthetic channel advance failure")
+
+        simulator = FailingSimulator()
+        gear = FakeChannelGatedGear()
+        simulator.gear = gear
+        gate = SimulationPolicyGate(
+            gear,
+            simulator,
+            pause_strategy="control-channel",
+        )
+        gate.pause()
+
+        with self.assertRaisesRegex(ProcessProtocolError, "channel advance"):
+            gate.release_steps(40)
+
+        self.assertTrue(gate.is_paused)
+        self.assertEqual(gear.events[-2:], ["gear.arm_control", "gear.pause_control"])
 
     def test_duration_must_derive_exact_positive_integer_before_resume(self):
         simulator = FakeSimulatorClient()
