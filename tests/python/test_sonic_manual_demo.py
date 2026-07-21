@@ -21,12 +21,14 @@ from mm_sonic.manual_demo import (
     CameraDeliveryState,
     CommandRecorder,
     DemoDependencies,
+    OperatorRestartRequested,
     _activate_scored_control,
     _consume_x11_boundary,
     _heading_frame_offset_yaw_rad,
     _initial_camera_delivery_state,
     _parser,
     _print_terminal_event,
+    _raise_if_restart_requested,
     _run_startup_transaction,
     _validated_preload_chunks,
     _wait_for_x11_target,
@@ -49,6 +51,13 @@ class _StopAfterSimulator(Exception):
 
 
 class X11TargetReadinessTests(unittest.TestCase):
+    def test_restart_check_raises_only_when_requested(self) -> None:
+        event = threading.Event()
+        _raise_if_restart_requested(event)
+        event.set()
+        with self.assertRaises(OperatorRestartRequested):
+            _raise_if_restart_requested(event)
+
     def test_waits_for_a_published_sample_with_a_bound_target(self) -> None:
         provider = type("Provider", (), {"target_bound": False})()
         cancellation = threading.Event()
@@ -830,6 +839,33 @@ def _mapped_boundary() -> tuple[CommandSample, MappedControlState]:
 
 
 class X11BoundaryIntegrationTests(unittest.TestCase):
+    def test_default_boundary_restart_stops_before_mailbox_sample(self) -> None:
+        restart = threading.Event()
+        restart.set()
+
+        class _NeverControlLoop:
+            @property
+            def mailbox(self):
+                raise AssertionError("restart must stop before mailbox access")
+
+        with self.assertRaises(OperatorRestartRequested):
+            _consume_x11_boundary(
+                control_loop=_NeverControlLoop(),
+                simulator=object(),
+                gate=object(),
+                generate_and_publish=lambda *_args, **_kwargs: self.fail(
+                    "restart must not generate"
+                ),
+                chunk_index=3,
+                steps_per_chunk=40,
+                preload_chunks=1,
+                camera_state=CameraDeliveryState(),
+                event_sink=lambda _event: None,
+                control_prefix="CONTROL chunk=",
+                camera_disabled_prefix="CAMERA DISABLED",
+                restart_event=restart,
+            )
+
     def test_heading_frame_offset_uses_physical_minus_virtual_yaw(self) -> None:
         physical = (
             math.cos(-math.pi / 4.0),
@@ -876,6 +912,7 @@ class X11BoundaryIntegrationTests(unittest.TestCase):
             event_sink=events.append,
             control_prefix="CONTROL chunk=",
             camera_disabled_prefix="CAMERA DISABLED",
+            restart_event=threading.Event(),
         )
 
         self.assertIs(result.command, command)
@@ -920,6 +957,7 @@ class X11BoundaryIntegrationTests(unittest.TestCase):
             event_sink=events.append,
             control_prefix="CONTROL chunk=",
             camera_disabled_prefix="CAMERA DISABLED",
+            restart_event=threading.Event(),
             prefix_duration_s=0.2,
         )
 
@@ -946,6 +984,7 @@ class X11BoundaryIntegrationTests(unittest.TestCase):
             event_sink=events.append,
             control_prefix="CONTROL chunk=",
             camera_disabled_prefix="CAMERA DISABLED",
+            restart_event=threading.Event(),
         )
         second_command = CommandSample(
             13,
@@ -964,6 +1003,7 @@ class X11BoundaryIntegrationTests(unittest.TestCase):
             event_sink=events.append,
             control_prefix="CONTROL chunk=",
             camera_disabled_prefix="CAMERA DISABLED",
+            restart_event=threading.Event(),
         )
 
         self.assertFalse(first.camera_state.enabled)
@@ -994,6 +1034,7 @@ class X11BoundaryIntegrationTests(unittest.TestCase):
                 event_sink=lambda _event: None,
                 control_prefix="CONTROL chunk=",
                 camera_disabled_prefix="CAMERA DISABLED",
+                restart_event=threading.Event(),
             )
 
 
@@ -1022,6 +1063,32 @@ class ResponsiveX11LoopTests(unittest.TestCase):
     def _mapped(self):
         _command, mapped = _mapped_boundary()
         return mapped
+
+    def test_responsive_restart_stops_before_sampling_or_commit(self) -> None:
+        from mm_sonic.manual_demo import _run_responsive_x11_loop
+
+        restart = threading.Event()
+        restart.set()
+
+        class _NeverCommitter:
+            next_chunk = 7
+
+            def run_one_chunk(self, command, *, command_is_current=None):
+                raise AssertionError("restart must stop before commit")
+
+        with self.assertRaises(OperatorRestartRequested):
+            _run_responsive_x11_loop(
+                control_loop=object(),
+                committer=_NeverCommitter(),
+                simulator=_BoundarySimulator(),
+                chunks=3,
+                camera_state=CameraDeliveryState(),
+                event_sink=lambda _event: None,
+                trace_sink=lambda _trace: None,
+                session_id="session",
+                camera_disabled_prefix="CAMERA DISABLED",
+                restart_event=restart,
+            )
 
     def test_responsive_loop_delays_trace_until_prefix_is_presented(self) -> None:
         from mm_sonic.manual_demo import _run_responsive_x11_loop
@@ -1129,6 +1196,7 @@ class ResponsiveX11LoopTests(unittest.TestCase):
             trace_sink=traces.append,
             session_id="session",
             camera_disabled_prefix="CAMERA DISABLED",
+            restart_event=threading.Event(),
         )
 
         # Two prefixes committed/released; only the first has reached physics.
@@ -1176,6 +1244,7 @@ class ResponsiveX11LoopTests(unittest.TestCase):
             trace_sink=traces.append,
             session_id="session",
             camera_disabled_prefix="CAMERA DISABLED",
+            restart_event=threading.Event(),
         )
 
         # X terminates: no trace, no camera required, loop broke.

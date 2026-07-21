@@ -134,6 +134,15 @@ def _print_terminal_event(event: str) -> None:
     print(event, flush=True)
 
 
+class OperatorRestartRequested(Exception):
+    """Normal operator request to replace the complete live episode."""
+
+
+def _raise_if_restart_requested(restart_event: threading.Event) -> None:
+    if restart_event.is_set():
+        raise OperatorRestartRequested
+
+
 def _validated_preload_chunks(value: object) -> int:
     """Return an exact preload depth in 1..4, rejecting everything else."""
 
@@ -526,10 +535,12 @@ def _consume_x11_boundary(
     event_sink: Callable[[str], None],
     control_prefix: str,
     camera_disabled_prefix: str,
+    restart_event: threading.Event,
     prefix_duration_s: float = _CHUNK_DURATION_S,
 ) -> X11BoundaryResult:
     """Atomically forward one mapped control boundary and synchronized camera."""
 
+    _raise_if_restart_requested(restart_event)
     command, mapped = control_loop.mailbox.sample(chunk_index)
     if command is None:
         return X11BoundaryResult(None, mapped, camera_state, None)
@@ -633,6 +644,7 @@ def _run_responsive_x11_loop(
     trace_sink: Callable[[object], None],
     session_id: str,
     camera_disabled_prefix: str,
+    restart_event: threading.Event,
 ) -> CameraDeliveryState:
     """Drive the opt-in Stage-R1 one-prefix responsive loop.
 
@@ -645,6 +657,7 @@ def _run_responsive_x11_loop(
     never alters command execution.
     """
 
+    _raise_if_restart_requested(restart_event)
     camera_box: list[CameraDeliveryState] = [camera_state]
 
     def on_sample(_snapshot: object, mapped: object) -> None:
@@ -662,6 +675,7 @@ def _run_responsive_x11_loop(
     )
     pending_prefix: object | None = None
     for _consumed_chunk in range(chunks):
+        _raise_if_restart_requested(restart_event)
         prefix = scheduler.run_one_prefix(committer.next_chunk)
         if prefix is None:
             # Terminate (X): no generation, publication, or physics release.
@@ -738,6 +752,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
         str(runtime / "model_encoder.onnx"),
     )
     cancellation = threading.Event()
+    restart = threading.Event()
     cancelled = cancellation.is_set
     gear = GearProcess(
         run_root=bundle.path,
@@ -947,6 +962,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                     mapper,
                     event_sink=_print_terminal_event,
                     cancel_event=cancellation,
+                    restart_event=restart,
                 ) as control_loop:
                     def wait_for_initial_input() -> None:
                         _wait_for_x11_target(
@@ -957,7 +973,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                         print(
                             "LIVE X11: W/A/S/D move, Shift walk, "
                             "Ctrl+arrows strafe/face, arrows orbit camera, "
-                            "Q/E zoom, Space stand, X exit. "
+                            "Q/E zoom, Space stand, Backspace restart, X exit. "
                             f"Commands have "
                             f"{preload_chunks * prefix_duration_s:.1f}s "
                             "lookahead latency.",
@@ -1005,6 +1021,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                             trace_sink=responsive_traces.append,
                             session_id=session_id,
                             camera_disabled_prefix="CAMERA DISABLED",
+                            restart_event=restart,
                         )
                         next_chunk = committer.next_chunk
                     else:
@@ -1021,6 +1038,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                                 event_sink=_print_terminal_event,
                                 control_prefix="CONTROL chunk=",
                                 camera_disabled_prefix="CAMERA DISABLED",
+                                restart_event=restart,
                                 prefix_duration_s=prefix_duration_s,
                             )
                             camera_state = result.camera_state
