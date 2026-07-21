@@ -43,6 +43,24 @@ class NativeG1ControllerTests(unittest.TestCase):
         self.assertNotIn("interaction_target_rig_ik.cpp", controller_sources)
         self.assertNotIn("locomotion_controller_update.cpp", controller_sources)
 
+    def test_f_stops_before_native_approach_and_runtime_update(self):
+        update_loop = SOURCE.split("auto update_func", 1)[1]
+        ordered_tokens = (
+            "IsKeyPressed(KEY_F)",
+            "smart_pickup_controller.pre_step(",
+            "G1CommandIntent command_intent",
+            "simulation_positions_update(",
+            "capture_native_g1_snapshot(",
+            "smart_pickup_controller.post_step(",
+            "interaction_runtime.update(interaction_input)",
+        )
+        for token in ordered_tokens:
+            self.assertIn(token, update_loop)
+        positions = [update_loop.index(token) for token in ordered_tokens]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("MM_INTERACTION_FUNNEL_CHECKPOINT", SOURCE)
+        self.assertIn("MM_INTERACTION_FUNNEL_WORKER", SOURCE)
+
 
 if __name__ == "__main__":
     unittest.main()

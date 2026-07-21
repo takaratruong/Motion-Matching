@@ -74,8 +74,10 @@
 #include <filesystem>
 #include <initializer_list>
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
+#include <utility>
 
 static_assert(G1_BoneCount == 31, "native G1 controller requires 31 bones");
 
@@ -84,6 +86,40 @@ static_assert(G1_BoneCount == 31, "native G1 controller requires 31 bones");
 static inline Vector3 to_Vector3(vec3 v)
 {
     return Vector3{ v.x, v.y, v.z };
+}
+
+static interaction::SmartPickupProductionConfig
+load_native_g1_smart_pickup_config()
+{
+    if (getenv("G1_SMART_PICKUP_PROVIDER") != NULL)
+    {
+        return interaction::load_smart_pickup_production_config();
+    }
+
+    const char* checkpoint =
+        getenv("MM_INTERACTION_FUNNEL_CHECKPOINT");
+    const char* worker = getenv("MM_INTERACTION_FUNNEL_WORKER");
+    if (checkpoint == NULL || checkpoint[0] == '\0' ||
+        worker == NULL || worker[0] == '\0')
+    {
+        return interaction::load_smart_pickup_production_config();
+    }
+
+    const char* python = getenv("MM_INTERACTION_FUNNEL_PYTHON");
+    const char* work_directory =
+        getenv("MM_INTERACTION_FUNNEL_WORK_DIR");
+    std::map<std::string, std::string> environment{
+        {"G1_SMART_PICKUP_PROVIDER", "learned"},
+        {"G1_FUNNEL_PYTHON",
+         python != NULL && python[0] != '\0' ? python : "/usr/bin/python3"},
+        {"G1_FUNNEL_CHECKPOINT", checkpoint},
+        {"G1_FUNNEL_WORKER", worker},
+        {"G1_FUNNEL_WORK_DIR",
+         work_directory != NULL && work_directory[0] != '\0'
+            ? work_directory
+            : "build/g1-funnels/runtime"},
+    };
+    return interaction::parse_smart_pickup_production_config(environment);
 }
 
 static bool g1_parse_terrain_weight(
@@ -2034,11 +2070,16 @@ int main(void)
     }();
 
     const interaction::SmartPickupProductionConfig smart_pickup_config =
-        interaction::load_smart_pickup_production_config();
+        load_native_g1_smart_pickup_config();
     interaction::SmartPickupController smart_pickup_controller(
         smart_pickup_config);
     interaction::NativeG1PoseHandoff native_g1_pose_handoff;
     interaction::RuntimeOutput interaction_output{};
+    interaction::SmartPickupPostStepResult smart_pickup_post_step{};
+    uint64_t interaction_next_request_id = 1U;
+    uint64_t smart_pickup_controller_tick = 0U;
+    vec3 smart_pickup_previous_root =
+        state.adjusted_bone_positions(G1_Simulation);
 
     if (test_config.mode == G1_TestSequential) {
         const int sequential_frames =
@@ -2411,8 +2452,61 @@ int main(void)
             gamepadstick_right = vec3();
         }
 
+        const bool smart_pickup_interact_pressed = IsKeyPressed(KEY_F);
+        const bool smart_pickup_cancel_pressed = IsKeyPressed(KEY_X);
+        const bool smart_pickup_manual_override_pressed =
+            IsKeyPressed(KEY_W) || IsKeyPressed(KEY_A) ||
+            IsKeyPressed(KEY_S) || IsKeyPressed(KEY_D);
+        if (interaction_output.suppress_steering)
+        {
+            gamepadstick_left = vec3();
+            gamepadstick_right = vec3();
+        }
+        const interaction::InteractionTarget* smart_pickup_target =
+            interaction_registry.find_by_id(
+                interaction_scene_target_handle.id);
+        interaction::SmartPickupPreStepInput smart_pickup_pre_input{};
+        smart_pickup_pre_input.runtime_state = interaction_runtime.state();
+        smart_pickup_pre_input.interact_pressed =
+            smart_pickup_interact_pressed;
+        smart_pickup_pre_input.cancel_pressed =
+            smart_pickup_cancel_pressed;
+        smart_pickup_pre_input.manual_override_pressed =
+            smart_pickup_manual_override_pressed;
+        smart_pickup_pre_input.selected_target = smart_pickup_target;
+        if (smart_pickup_target != nullptr &&
+            smart_pickup_target->affordances.size() == 1U)
+        {
+            smart_pickup_pre_input.selected_affordance_id =
+                smart_pickup_target->affordances.front().id;
+        }
+        smart_pickup_pre_input.left_stick = gamepadstick_left;
+        smart_pickup_pre_input.right_stick = gamepadstick_right;
+        smart_pickup_pre_input.force_strafe = desired_strafe_update();
+        const interaction::SmartPickupPreStepResult smart_pickup_pre_step =
+            smart_pickup_controller.pre_step(smart_pickup_pre_input);
+        gamepadstick_left = smart_pickup_pre_step.left_stick;
+        gamepadstick_right = smart_pickup_pre_step.right_stick;
+
+        const bool smart_pickup_immediate_stop =
+            smart_pickup_pre_step.interact_consumed ||
+            smart_pickup_post_step.assist_output.planning_barrier ||
+            smart_pickup_post_step.assist_output.stationary_constraint;
+        if (smart_pickup_immediate_stop)
+        {
+            state.simulation_velocity = vec3();
+            state.simulation_acceleration = vec3();
+            state.desired_velocity = vec3();
+            state.trajectory_velocities.zero();
+            state.trajectory_accelerations.zero();
+        }
+
         // Get if strafe is desired
         bool desired_strafe = desired_strafe_update();
+        if (smart_pickup_pre_step.force_strafe)
+        {
+            desired_strafe = true;
+        }
 #ifdef MM_DISCRETE
         desired_strafe = g_force_strafe;
 #endif
@@ -3620,10 +3714,76 @@ int main(void)
                     3, state.trajectory_positions.data + 1),
                 slice1d<quat>(
                     3, state.trajectory_rotations.data + 1));
+
+        vec3 smart_pickup_root_delta =
+            native_g1_locomotion.pose.positions[g1_skeleton::Simulation] -
+            smart_pickup_previous_root;
+        smart_pickup_root_delta.y = 0.0F;
+        const float smart_pickup_planar_speed =
+            length(smart_pickup_root_delta) / dt;
+        smart_pickup_previous_root =
+            native_g1_locomotion.pose.positions[g1_skeleton::Simulation];
+
+        interaction::SmartPickupPostStepInput smart_pickup_post_input{};
+        smart_pickup_post_input.controller_tick =
+            smart_pickup_controller_tick;
+        smart_pickup_post_input.runtime_state = interaction_runtime.state();
+        smart_pickup_post_input.live_flat_snapshot = native_g1_locomotion;
+        smart_pickup_post_input.current_target =
+            interaction_registry.find_by_id(
+                interaction_scene_target_handle.id);
+        smart_pickup_post_input.simulation_velocity =
+            state.simulation_velocity;
+        smart_pickup_post_input.displayed_planar_speed_mps =
+            smart_pickup_planar_speed;
+        smart_pickup_post_input.camera_azimuth = state.camera_azimuth;
+        smart_pickup_post_input.next_request_id =
+            interaction_next_request_id;
+        const interaction::SmartPickupPreviewCallback preview_smart_pickup =
+            [&](const interaction::LocomotionSnapshot& snapshot,
+                interaction::PickEntryRoot prospective_root,
+                interaction::TargetHandle target,
+                uint32_t affordance_id)
+                -> std::optional<interaction::PickEntryPreview>
+        {
+            return interaction_runtime.preview_pick(
+                snapshot,
+                prospective_root,
+                target,
+                affordance_id);
+        };
+        smart_pickup_post_step = smart_pickup_controller.post_step(
+            smart_pickup_post_input,
+            preview_smart_pickup);
+
+        std::optional<interaction::PickRequest> smart_pickup_request;
+        if (smart_pickup_post_step.pick_request.has_value())
+        {
+            bool certified = true;
+            if (smart_pickup_post_step.certified_preview.has_value())
+            {
+                certified = interaction_runtime.cache_certified_pick(
+                    *smart_pickup_post_step.pick_request,
+                    *smart_pickup_post_step.certified_preview);
+            }
+            if (certified)
+            {
+                smart_pickup_request = smart_pickup_post_step.pick_request;
+                ++interaction_next_request_id;
+            }
+        }
+
         interaction::RuntimeInput interaction_input{};
         interaction_input.dt = dt;
         interaction_input.locomotion = native_g1_locomotion;
+        interaction_input.interact_pressed =
+            smart_pickup_request.has_value();
+        interaction_input.pick_request = smart_pickup_request;
+        interaction_input.cancel_pressed =
+            smart_pickup_cancel_pressed &&
+            !smart_pickup_pre_step.cancel_consumed;
         interaction_output = interaction_runtime.update(interaction_input);
+        ++smart_pickup_controller_tick;
         const interaction::NativeG1FrameState native_g1_frame =
             native_g1_pose_handoff.apply(
                 native_g1_locomotion.pose,
