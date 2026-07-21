@@ -33,6 +33,7 @@ struct LearnedPickupConfig {
     FunnelCaptureConfig capture{};
     ArrivalConfig arrival{};
     uint32_t maximum_proposal_pending_ticks = 250U;
+    size_t maximum_preview_proposals = 3U;
     float capture_position_tolerance_m = 0.03F;
     float handoff_position_tolerance_m = 0.12F;
     float capture_yaw_tolerance_radians = 20.0F * PIf / 180.0F;

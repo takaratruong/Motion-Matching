@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 
@@ -1537,11 +1538,22 @@ PickEntryPreview InteractionRuntime::preview_pick(
 bool InteractionRuntime::cache_certified_pick(
     const PickRequest& request,
     const PickEntryPreview& preview) {
-    if (state_ != RuntimeState::Locomotion ||
-        request.target.id == 0U || request.target.generation == 0U ||
-        request.affordance_id == 0U || request.request_id == 0U ||
-        !preview.path_feasible || !preview.match_ready ||
-        !finite_certified_preview(preview)) {
+    const bool accepted = state_ == RuntimeState::Locomotion &&
+        request.target.id != 0U && request.target.generation != 0U &&
+        request.affordance_id != 0U && request.request_id != 0U &&
+        preview.path_feasible && preview.match_ready &&
+        finite_certified_preview(preview);
+    std::fprintf(
+        stderr,
+        "certified pick cache: accepted=%d state=%u request=%llu "
+        "path=%d match=%d candidate_clip=%d\n",
+        accepted ? 1 : 0,
+        static_cast<unsigned>(state_),
+        static_cast<unsigned long long>(request.request_id),
+        preview.path_feasible ? 1 : 0,
+        preview.match_ready ? 1 : 0,
+        preview.match_candidate.clip);
+    if (!accepted) {
         return false;
     }
     cached_certified_pick_ = CachedCertifiedPick{request, preview};
@@ -2275,6 +2287,23 @@ RuntimeOutput InteractionRuntime::update(const RuntimeInput& input) {
                                                 ? Reason::TargetChanged
                                                 : realized.reason;
                                         }
+                                        std::fprintf(
+                                            stderr,
+                                            "certified pick preflight: "
+                                            "accepted=%d root_error=%.6f "
+                                            "yaw_error=%.6f correction=%d "
+                                            "source=%d realized=%d reason=%u\n",
+                                            match.accepted ? 1 : 0,
+                                            root_error,
+                                            yaw_error,
+                                            correction_valid ? 1 : 0,
+                                            exact(
+                                                actual_source,
+                                                certified.pickup_source)
+                                                ? 1
+                                                : 0,
+                                            realized.feasible ? 1 : 0,
+                                            static_cast<unsigned>(match.reason));
                                     } else {
                                         match = evaluate_pick_entries_realized(
                                             built.input).selection;

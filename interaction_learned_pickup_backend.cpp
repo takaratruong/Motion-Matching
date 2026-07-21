@@ -582,6 +582,10 @@ PickAssistOutput LearnedSmartPickupBackend::consume_proposal_poll(
             static_cast<uint32_t>(proposal_index + 1U),
             entry_root(targets.back()),
         });
+        if (selection_requests_.size() >=
+            config_.maximum_preview_proposals) {
+            break;
+        }
     }
     learned_diagnostics_.accepted_proposal_count = accepted;
     if (selection_requests_.empty()) {

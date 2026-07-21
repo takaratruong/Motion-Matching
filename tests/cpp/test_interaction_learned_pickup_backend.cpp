@@ -362,7 +362,7 @@ void test_provider_backed_lifecycle_submits_after_native_funnel() {
     assert(provider.begin_calls == 1);
     assert(provider.poll_calls == 1);
     assert(provider.wait_calls == 1);
-    assert(selection.preview_requests.size() == 31U);
+    assert(selection.preview_requests.size() == 3U);
     assert(backend.learned_diagnostics().state ==
            interaction::LearnedPickupState::SelectionPreview);
 
@@ -470,7 +470,7 @@ void test_moving_activation_freezes_and_builds_complete_route() {
     assert(entry_speed >= 0.05F && entry_speed <= 0.30F);
     assert(launched.planning_barrier);
     assert(!launched.stationary_constraint);
-    assert(launched.preview_requests.size() == 31U);
+    assert(launched.preview_requests.size() == 3U);
     assert(backend.learned_diagnostics().state ==
            interaction::LearnedPickupState::SelectionPreview);
 
@@ -531,7 +531,7 @@ void test_activation_conditions_supported_entry_from_exact_live_pose() {
     assert(provider.begin_calls == 1);
     assert(provider.poll_calls == 1);
     assert(provider.wait_calls == 1);
-    assert(selection.preview_requests.size() == 31U);
+    assert(selection.preview_requests.size() == 3U);
     assert(std::abs(std::hypot(
         provider.request.condition[18], provider.request.condition[19]) -
         0.75F) < 1.0e-5F);
@@ -558,7 +558,7 @@ void test_provider_proposal_terminal_is_anchored_to_object_not_entry() {
     const auto selection = backend.observe(
         lifecycle_observation(10U, target, entry));
 
-    assert(selection.preview_requests.size() == 31U);
+    assert(selection.preview_requests.size() == 3U);
     for (const auto& request : selection.preview_requests) {
         assert(std::abs(request.root.world_x - 2.18F) < 1.0e-5F);
         assert(std::abs(request.root.world_z - (-0.06F)) < 1.0e-5F);

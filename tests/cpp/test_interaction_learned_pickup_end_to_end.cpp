@@ -180,7 +180,7 @@ TrialEvidence run_learned_funnel_to_actual_carry(float bearing_radians) {
     const interaction::PickAssistOutput selection =
         backend.observe(observation(0U, *target, entry));
     assert(provider.begin_count == 1);
-    assert(selection.preview_requests.size() == 32U);
+    assert(selection.preview_requests.size() == 3U);
 
     interaction::PickAssistObservation selected =
         observation(1U, *target, entry);
