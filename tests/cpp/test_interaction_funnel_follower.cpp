@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <vector>
 
 namespace {
 
@@ -143,6 +144,23 @@ void test_explicit_cancel_is_terminal() {
            FunnelCancelReason::ExplicitCancel);
 }
 
+void test_variable_route_follows_full_approach_and_completes_without_settle() {
+    std::vector<FunnelSample> route;
+    for (int index = 0; index <= 150; ++index) {
+        route.push_back(sample_at(0.02F * static_cast<float>(index)));
+    }
+    InteractionFunnelFollower follower(11U, route, 40U, 1U);
+    const FunnelFollowerOutput first = follower.tick({40U, route.front()});
+    assert(first.published);
+    assert(first.sample.x >= kFunnelLookaheadDistance - 0.01F);
+
+    const FunnelFollowerOutput completed = follower.tick({41U, route.back()});
+    assert(!completed.published);
+    assert(completed.state == FunnelFollowerState::Completed);
+    assert(follower.diagnostics().progress_index ==
+           static_cast<int>(route.size()) - 1);
+}
+
 }  // namespace
 
 int main() {
@@ -156,5 +174,6 @@ int main() {
     test_route_yaw_error_cancels_without_publication();
     test_follow_timeout_cancels();
     test_explicit_cancel_is_terminal();
+    test_variable_route_follows_full_approach_and_completes_without_settle();
     return 0;
 }

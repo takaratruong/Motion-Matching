@@ -14,6 +14,7 @@
 
 #include <array>
 #include <cstdint>
+#include <vector>
 
 namespace interaction {
 
@@ -66,6 +67,8 @@ struct FunnelFollowerDiagnostics {
     uint64_t proposal_seed = 0U;
 };
 
+using FunnelRoute = std::vector<FunnelSample>;
+
 class InteractionFunnelFollower {
 public:
     // Construct a follower bound to one proposal's immutable identity (seed and
@@ -74,6 +77,11 @@ public:
         uint64_t proposal_seed,
         const std::array<FunnelSample, kFunnelSampleCount>& samples,
         uint64_t first_tick_index);
+    InteractionFunnelFollower(
+        uint64_t proposal_seed,
+        FunnelRoute route,
+        uint64_t first_tick_index,
+        uint32_t required_terminal_ticks = kFunnelRequiredTerminalTicks);
 
     // Advance one 25 Hz tick. Publishes the next sample, or cancels.
     FunnelFollowerOutput tick(const FunnelFollowerInput& input);
@@ -86,8 +94,9 @@ public:
 
 private:
     const uint64_t proposal_seed_;
-    const FunnelExecutionTargets targets_;
+    const FunnelRoute targets_;
     uint64_t expected_tick_index_;
+    const uint32_t required_terminal_ticks_;
     uint32_t follow_ticks_ = 0U;
     int progress_index_ = 0;
     FunnelFollowerDiagnostics diagnostics_{};

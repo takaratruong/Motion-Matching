@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <stdexcept>
+#include <utility>
 
 namespace interaction {
 
@@ -40,11 +42,11 @@ struct RouteProjection {
 };
 
 RouteProjection project_to_remaining_route(
-    const FunnelExecutionTargets& targets,
+    const FunnelRoute& targets,
     int progress_index,
     const FunnelSample& tracked) {
     RouteProjection best{};
-    const int terminal = kFunnelExecutionTickCount - 1;
+    const int terminal = static_cast<int>(targets.size()) - 1;
     if (progress_index >= terminal) {
         best.segment = terminal;
         best.alpha = 0.0F;
@@ -78,10 +80,10 @@ RouteProjection project_to_remaining_route(
 }
 
 FunnelSample lookahead_target(
-    const FunnelExecutionTargets& targets,
+    const FunnelRoute& targets,
     const RouteProjection& projection,
     int& lookahead_index) {
-    const int terminal = kFunnelExecutionTickCount - 1;
+    const int terminal = static_cast<int>(targets.size()) - 1;
     if (projection.segment >= terminal) {
         lookahead_index = terminal;
         return targets.back();
@@ -109,15 +111,48 @@ float yaw_error(const FunnelSample& tracked, const FunnelSample& target) {
     return std::abs(std::atan2(cross, dot));
 }
 
+FunnelRoute expanded_route(
+    const std::array<FunnelSample, kFunnelSampleCount>& samples) {
+    const FunnelExecutionTargets expanded = expand_funnel_execution(samples);
+    return FunnelRoute(expanded.begin(), expanded.end());
+}
+
+bool finite_sample(const FunnelSample& sample) {
+    return std::isfinite(sample.x) && std::isfinite(sample.z) &&
+        std::isfinite(sample.yaw_sin) && std::isfinite(sample.yaw_cos);
+}
+
 }  // namespace
 
 InteractionFunnelFollower::InteractionFunnelFollower(
     uint64_t proposal_seed,
     const std::array<FunnelSample, kFunnelSampleCount>& samples,
     uint64_t first_tick_index)
+    : InteractionFunnelFollower(
+          proposal_seed,
+          expanded_route(samples),
+          first_tick_index,
+          kFunnelRequiredTerminalTicks) {}
+
+InteractionFunnelFollower::InteractionFunnelFollower(
+    uint64_t proposal_seed,
+    FunnelRoute route,
+    uint64_t first_tick_index,
+    uint32_t required_terminal_ticks)
     : proposal_seed_(proposal_seed),
-      targets_(expand_funnel_execution(samples)),
-      expected_tick_index_(first_tick_index) {
+      targets_(std::move(route)),
+      expected_tick_index_(first_tick_index),
+      required_terminal_ticks_(required_terminal_ticks) {
+    if (targets_.size() < 2U || required_terminal_ticks_ == 0U) {
+        throw std::invalid_argument(
+            "funnel follower route or terminal settle count is invalid");
+    }
+    for (const FunnelSample& sample : targets_) {
+        if (!finite_sample(sample)) {
+            throw std::invalid_argument(
+                "funnel follower route contains a non-finite sample");
+        }
+    }
     diagnostics_.proposal_seed = proposal_seed;
     diagnostics_.state = FunnelFollowerState::Following;
 }
@@ -160,7 +195,7 @@ FunnelFollowerOutput InteractionFunnelFollower::tick(const FunnelFollowerInput& 
 
     const int projected_index = std::min(
         projection.segment + (projection.alpha >= 0.5F ? 1 : 0),
-        kFunnelExecutionTickCount - 1);
+        static_cast<int>(targets_.size()) - 1);
     progress_index_ = std::max(progress_index_, projected_index);
     diagnostics_.progress_index = progress_index_;
 
@@ -177,10 +212,10 @@ FunnelFollowerOutput InteractionFunnelFollower::tick(const FunnelFollowerInput& 
         : 0U;
     ++expected_tick_index_;
     if (diagnostics_.terminal_settle_ticks >=
-        kFunnelRequiredTerminalTicks) {
+        required_terminal_ticks_) {
         diagnostics_.state = FunnelFollowerState::Completed;
-        diagnostics_.progress_index = kFunnelExecutionTickCount - 1;
-        diagnostics_.lookahead_index = kFunnelExecutionTickCount - 1;
+        diagnostics_.progress_index = static_cast<int>(targets_.size()) - 1;
+        diagnostics_.lookahead_index = static_cast<int>(targets_.size()) - 1;
         return {false, FunnelSample{}, diagnostics_.state};
     }
 
