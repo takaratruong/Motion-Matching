@@ -49,7 +49,19 @@ _VECTOR_FIELDS = (
     # honest producer-side references, never inferred from displacement.
     ("applied_velocity_mujoco_first", 3),
     ("applied_velocity_mujoco_last", 3),
+    # First and last source-step applied headings in the MuJoCo target basis.
+    # Honest producer-side references for the capped desired heading.
+    ("applied_heading_mujoco_wxyz_first", 4),
+    ("applied_heading_mujoco_wxyz_last", 4),
 )
+
+# Applied-heading fields must additionally be unit quaternions within the
+# repository's shared tolerance.
+_UNIT_QUATERNION_FIELDS = (
+    "applied_heading_mujoco_wxyz_first",
+    "applied_heading_mujoco_wxyz_last",
+)
+_QUATERNION_NORM_TOLERANCE = 1.0e-5
 
 
 def _nonempty_identity(value: object, label: str) -> str:
@@ -98,6 +110,9 @@ class BoundaryTrace:
     # First/last source-step applied velocities in MuJoCo coordinates.
     applied_velocity_mujoco_first: tuple[float, float, float]
     applied_velocity_mujoco_last: tuple[float, float, float]
+    # First/last source-step applied headings in MuJoCo coordinates.
+    applied_heading_mujoco_wxyz_first: tuple[float, float, float, float]
+    applied_heading_mujoco_wxyz_last: tuple[float, float, float, float]
     # Real state-log measurement, or None when the log does not bound the
     # released chunk.  Never a made-up zero.
     observed_mujoco_root_displacement: tuple[float, float, float] | None
@@ -124,6 +139,11 @@ class BoundaryTrace:
             object.__setattr__(
                 self, name, _finite_vector(getattr(self, name), width, name)
             )
+        for name in _UNIT_QUATERNION_FIELDS:
+            norm = math.sqrt(sum(component * component
+                                 for component in getattr(self, name)))
+            if abs(norm - 1.0) > _QUATERNION_NORM_TOLERANCE:
+                raise ContractError(f"trace {name} must be a unit quaternion")
 
         # observed_mujoco_root_displacement is real-or-unavailable: a genuine
         # width-3 finite measurement, or None when the state log does not bound

@@ -704,7 +704,11 @@ class ResponsiveX11LoopTests(unittest.TestCase):
                     command = {
                         "applied_velocity_holden": np.zeros(
                             (10, 3), dtype=np.float32
-                        )
+                        ),
+                        "applied_heading_holden_wxyz": np.tile(
+                            np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                            (10, 1),
+                        ),
                     }
 
                 return _Checked()
@@ -833,6 +837,8 @@ class WriteResponsiveEvidenceTests(unittest.TestCase):
             generated_virtual_root_displacement_mujoco=(0.25, 0.0, 0.0),
             applied_velocity_mujoco_first=(0.1, -0.2, 0.0),
             applied_velocity_mujoco_last=(-0.3, -0.4, 0.0),
+            applied_heading_mujoco_wxyz_first=(1.0, 0.0, 0.0, 0.0),
+            applied_heading_mujoco_wxyz_last=(0.99912283, 0.0, 0.0, -0.04187565),
             observed_mujoco_root_displacement=observed,
             advance=object(),
         )

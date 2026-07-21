@@ -120,6 +120,7 @@ struct mm_chunk_step_diagnostic
     bool transitioned = false;
     float terrain_cost = 0.0f;
     float applied_velocity_holden[3] = {};
+    float applied_heading_holden_wxyz[4] = {1.0f, 0.0f, 0.0f, 0.0f};
     float terrain_values[MM_CHUNK_TERRAIN_SAMPLE_COUNT] = {};
     float terrain_points_holden[MM_CHUNK_TERRAIN_SAMPLE_COUNT][3] = {};
     float support_height = 0.0f;
@@ -150,6 +151,12 @@ static inline bool operator==(
     for (int axis = 0; axis < 3; ++axis) {
         if (first.applied_velocity_holden[axis] !=
             second.applied_velocity_holden[axis]) {
+            return false;
+        }
+    }
+    for (int component = 0; component < 4; ++component) {
+        if (first.applied_heading_holden_wxyz[component] !=
+            second.applied_heading_holden_wxyz[component]) {
             return false;
         }
     }
@@ -272,11 +279,12 @@ public:
                 "reset identifiers must be nonempty");
         }
         if (request.movement_model != "raw" &&
-            request.movement_model != "holden-v1") {
+            request.movement_model != "holden-v1" &&
+            request.movement_model != "holden-turn-v1") {
             return mm_chunk_fail(
                 error,
                 "invalid_movement_model",
-                "movement_model must be raw or holden-v1");
+                "movement_model must be raw, holden-v1, or holden-turn-v1");
         }
 
         std::string adapter_error;

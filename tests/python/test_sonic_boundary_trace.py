@@ -54,6 +54,8 @@ def make_trace(**overrides) -> BoundaryTrace:
         generated_virtual_root_displacement_mujoco=(0.2, 0.0, 0.0),
         applied_velocity_mujoco_first=(0.1, -0.2, 0.0),
         applied_velocity_mujoco_last=(-0.3, -0.4, 0.0),
+        applied_heading_mujoco_wxyz_first=(1.0, 0.0, 0.0, 0.0),
+        applied_heading_mujoco_wxyz_last=(0.99912283, 0.0, 0.0, -0.04187565),
         observed_mujoco_root_displacement=(0.17, 0.0, 0.0),
     )
     base.update(overrides)
@@ -101,9 +103,23 @@ class BoundaryTraceBindingTests(unittest.TestCase):
                 "generated_virtual_root_displacement_mujoco",
                 "applied_velocity_mujoco_first",
                 "applied_velocity_mujoco_last",
+                "applied_heading_mujoco_wxyz_first",
+                "applied_heading_mujoco_wxyz_last",
                 "observed_mujoco_root_displacement",
             ),
         )
+
+    def test_applied_heading_endpoints_are_unit_quaternions(self):
+        trace = make_trace()
+        self.assertEqual(
+            trace.applied_heading_mujoco_wxyz_first, (1.0, 0.0, 0.0, 0.0))
+        self.assertEqual(len(trace.applied_heading_mujoco_wxyz_last), 4)
+
+    def test_applied_heading_endpoints_reject_non_unit(self):
+        with self.assertRaisesRegex(
+            ContractError, "applied_heading_mujoco_wxyz_first"
+        ):
+            make_trace(applied_heading_mujoco_wxyz_first=(2.0, 0.0, 0.0, 0.0))
 
     def test_applied_velocity_endpoints_are_finite_width_three(self):
         trace = make_trace()

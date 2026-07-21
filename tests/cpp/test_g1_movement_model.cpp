@@ -185,11 +185,61 @@ static void test_predict_fails_closed_without_mutation()
     }
 }
 
+static void require_step_parity(
+    vec3 current,
+    vec3 target,
+    float dt,
+    const g1_movement_model_config& config)
+{
+    char error[256] = {};
+    vec3 velocity_only;
+    vec3 turn_profile;
+    CHECK(g1_movement_model_step(
+        velocity_only, current, target, dt,
+        G1MovementHoldenV1, config, error, sizeof(error)));
+    CHECK(g1_movement_model_step(
+        turn_profile, current, target, dt,
+        G1MovementHoldenTurnV1, config, error, sizeof(error)));
+    CHECK(same_bits(velocity_only, turn_profile));
+}
+
+// The turn profile must shape translational velocity bit-identically to
+// holden-v1; only the heading is capped elsewhere.
+static void test_turn_profile_velocity_matches_holden_v1()
+{
+    const g1_movement_model_config config = g1_movement_model_fixed_config();
+
+    require_step_parity(vec3(), vec3(0.9f, 0.0f, 0.0f), 0.04f, config);
+    require_step_parity(
+        vec3(0.9f, 0.0f, 0.0f), vec3(-0.9f, 0.0f, 0.0f), 0.04f, config);
+    require_step_parity(
+        vec3(0.6f, 0.0f, 0.0f), vec3(0.0f, 0.0f, 0.6f), 0.04f, config);
+    require_step_parity(
+        vec3(0.4f, 0.0f, 0.0f), vec3(-0.9f, 0.0f, 0.0f), 0.04f, config);
+
+    array1d<vec3> velocity_only;
+    array1d<vec3> turn_profile;
+    velocity_only.resize(4);
+    turn_profile.resize(4);
+    char error[256] = {};
+    const vec3 persistent(0.3f, 0.0f, 0.0f);
+    CHECK(g1_movement_model_predict(
+        velocity_only, persistent, vec3(-0.9f, 0.0f, 0.0f), 1.0f / 3.0f,
+        G1MovementHoldenV1, config, error, sizeof(error)));
+    CHECK(g1_movement_model_predict(
+        turn_profile, persistent, vec3(-0.9f, 0.0f, 0.0f), 1.0f / 3.0f,
+        G1MovementHoldenTurnV1, config, error, sizeof(error)));
+    for (int i = 0; i < 4; ++i) {
+        CHECK(same_bits(velocity_only(i), turn_profile(i)));
+    }
+}
+
 int main()
 {
     test_public_behavior();
     test_invalid_inputs_fail_closed();
     test_predict_fails_closed_without_mutation();
+    test_turn_profile_velocity_matches_holden_v1();
     std::printf("G1 movement model tests passed\n");
     return 0;
 }

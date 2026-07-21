@@ -18,7 +18,8 @@
 enum g1_movement_model_profile
 {
     G1MovementRaw = 0,
-    G1MovementHoldenV1 = 1
+    G1MovementHoldenV1 = 1,
+    G1MovementHoldenTurnV1 = 2
 };
 
 struct g1_movement_model_config
@@ -68,7 +69,8 @@ static inline bool g1_movement_model_validate(
     char* error,
     int capacity)
 {
-    if (profile != G1MovementRaw && profile != G1MovementHoldenV1) {
+    if (profile != G1MovementRaw && profile != G1MovementHoldenV1
+            && profile != G1MovementHoldenTurnV1) {
         return g1_movement_model_fail(
             error, capacity, "movement model profile is unknown");
     }

@@ -31,13 +31,17 @@ from mm_sonic.manual_evidence import (
     load_canonical_target_npz,
     manual_command_artifact_bytes,
     manual_flat_summary_v6_bytes,
+    manual_flat_summary_v8_bytes,
     manual_summary_v4_bytes,
     manual_summary_v5_bytes,
+    manual_summary_v7_bytes,
     parse_environment_control,
     parse_manual_command_artifact,
     parse_manual_flat_summary_v6,
+    parse_manual_flat_summary_v8,
     parse_manual_summary_v4,
     parse_manual_summary_v5,
+    parse_manual_summary_v7,
     scan_for_fall_marker,
     state_metrics,
 )
@@ -566,6 +570,88 @@ class ManualFlatSummaryV6Tests(unittest.TestCase):
             parsed["command_artifact"]["sha256"],
             hashlib.sha256(command_bytes).hexdigest(),
         )
+
+
+def _turn_movement_model_record() -> dict:
+    return {
+        "profile": "holden-turn-v1",
+        "acceleration_mps2": 1.5,
+        "deceleration_mps2": 2.0,
+        "directional_acceleration": False,
+        "turn_strength": False,
+        "max_yaw_rate_deg_s": 120.0,
+    }
+
+
+class ManualSummaryV7Tests(unittest.TestCase):
+    def _v7_fields(self, run_root: str) -> dict:
+        fields = _v4_summary_fields(run_root)
+        fields["movement_model"] = _turn_movement_model_record()
+        return fields
+
+    def test_round_trips_turn_profile_summary(self) -> None:
+        fields = self._v7_fields("/runs/turn-x")
+        parsed = parse_manual_summary_v7(manual_summary_v7_bytes(**fields))
+        self.assertEqual(parsed["schema"], "mm-sonic-manual-demo/v7")
+        self.assertEqual(parsed["movement_model"], _turn_movement_model_record())
+        self.assertEqual(parsed["movement_model"]["max_yaw_rate_deg_s"], 120.0)
+
+    def test_v5_parser_rejects_v7_summary(self) -> None:
+        fields = self._v7_fields("/runs/turn-x")
+        with self.assertRaisesRegex(ContractError, "schema"):
+            parse_manual_summary_v5(manual_summary_v7_bytes(**fields))
+
+    def test_v7_parser_rejects_v5_summary(self) -> None:
+        fields = _v4_summary_fields("/runs/turn-x")
+        fields["movement_model"] = _movement_model_record("holden-v1")
+        with self.assertRaisesRegex(ContractError, "schema"):
+            parse_manual_summary_v7(manual_summary_v5_bytes(**fields))
+
+    def test_rejects_wrong_max_yaw_rate(self) -> None:
+        fields = self._v7_fields("/runs/turn-x")
+        model = dict(_turn_movement_model_record())
+        model["max_yaw_rate_deg_s"] = 90.0
+        fields["movement_model"] = model
+        with self.assertRaisesRegex(ContractError, "max_yaw_rate_deg_s"):
+            manual_summary_v7_bytes(**fields)
+
+
+class ManualFlatSummaryV8Tests(unittest.TestCase):
+    def _v8_call(self, movement_model: dict) -> bytes:
+        return manual_flat_summary_v8_bytes(
+            mode="interactive",
+            run_root="/runs/flat-turn",
+            preload_chunks=1,
+            generated_chunks=7,
+            lookahead_seconds=0.2,
+            command_bytes=b'{"commands":[]}\n',
+            hand_targets=NEUTRAL_HAND_TARGETS,
+            scene_control={
+                "gear_scene_sha256": "1" * 64,
+                "gear_robot_sha256": "2" * 64,
+                "actuator_joint_order_sha256": "3" * 64,
+            },
+            snapshot={
+                "contact_rows": 80,
+                "sim_time_s": 1.4,
+                "state_rows": 70,
+                "steps": 280,
+            },
+            movement_model=movement_model,
+        )
+
+    def test_round_trips_turn_profile_flat_summary(self) -> None:
+        parsed = parse_manual_flat_summary_v8(
+            self._v8_call(_turn_movement_model_record())
+        )
+        self.assertEqual(parsed["schema"], "mm-sonic-manual-demo/v8")
+        self.assertEqual(parsed["movement_model"], _turn_movement_model_record())
+
+    def test_v6_parser_rejects_v8_summary(self) -> None:
+        with self.assertRaisesRegex(ContractError, "schema"):
+            parse_manual_flat_summary_v6(
+                self._v8_call(_turn_movement_model_record())
+            )
 
 
 def _npz_bytes(buffer: CanonicalTargetBuffer) -> bytes:

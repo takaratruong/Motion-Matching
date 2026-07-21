@@ -445,14 +445,11 @@ def _parse_scene(value: object) -> Mapping[str, object]:
     return MappingProxyType(output)
 
 
-def _parse_command(value: object, step_count: int) -> Mapping[str, object]:
-    fields = {
-        "requested_velocity_holden",
-        "desired_heading_holden_wxyz",
-        "applied_velocity_holden",
-    }
-    source = _exact_object(value, fields, "command")
-    output = {
+def _parse_shared_command_fields(
+    source: dict[str, object],
+    step_count: int,
+) -> dict[str, object]:
+    return {
         "requested_velocity_holden": _float_array(
             source["requested_velocity_holden"],
             (3,),
@@ -472,6 +469,35 @@ def _parse_command(value: object, step_count: int) -> Mapping[str, object]:
             "command.applied_velocity_holden",
         ),
     }
+
+
+def _parse_command_v1(value: object, step_count: int) -> Mapping[str, object]:
+    fields = {
+        "requested_velocity_holden",
+        "desired_heading_holden_wxyz",
+        "applied_velocity_holden",
+    }
+    source = _exact_object(value, fields, "command")
+    return MappingProxyType(_parse_shared_command_fields(source, step_count))
+
+
+def _parse_command_v2(value: object, step_count: int) -> Mapping[str, object]:
+    fields = {
+        "requested_velocity_holden",
+        "desired_heading_holden_wxyz",
+        "applied_velocity_holden",
+        "applied_heading_holden_wxyz",
+    }
+    source = _exact_object(value, fields, "command")
+    output = dict(_parse_shared_command_fields(source, step_count))
+    output["applied_heading_holden_wxyz"] = _unit_quaternions(
+        _float_array(
+            source["applied_heading_holden_wxyz"],
+            (step_count, 4),
+            "command.applied_heading_holden_wxyz",
+        ),
+        "command.applied_heading_holden_wxyz",
+    )
     return MappingProxyType(output)
 
 
@@ -625,8 +651,17 @@ def parse_source_chunk(
         "artifacts",
     }
     source = _exact_object(value, fields, "source chunk")
-    if source["schema"] != "mm-chunk/v1" or type(source["schema"]) is not str:
-        raise ContractError("source chunk.schema must equal mm-chunk/v1")
+    schema_value = source["schema"]
+    if type(schema_value) is not str or schema_value not in (
+        "mm-chunk/v1",
+        "mm-chunk/v2",
+    ):
+        raise ContractError(
+            "source chunk.schema must equal mm-chunk/v1 or mm-chunk/v2"
+        )
+    command_parser = (
+        _parse_command_v1 if schema_value == "mm-chunk/v1" else _parse_command_v2
+    )
     step_count = _supported_source_intervals(
         source["source_intervals"], "source chunk.source_intervals"
     )
@@ -822,6 +857,6 @@ def parse_source_chunk(
             "source chunk.support_target",
         ),
         scene=scene,
-        command=_parse_command(source["command"], step_count),
+        command=command_parser(source["command"], step_count),
         artifacts=artifacts,
     )

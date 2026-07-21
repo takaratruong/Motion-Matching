@@ -704,6 +704,9 @@ static void test_candidate_preview_fields_participate_in_step_equality()
     changed = baseline;
     changed.first_rejected_joint_position = -0.3;
     CHECK(!(changed == baseline));
+    changed = baseline;
+    changed.applied_heading_holden_wxyz[3] = 0.5f;
+    CHECK(!(changed == baseline));
 }
 
 static void test_reset_defaults_movement_model_to_raw()
@@ -728,6 +731,18 @@ static void test_reset_accepts_holden_v1_profile()
     CHECK(protocol.hello(error));
     mm_chunk_reset_request request = reset_request();
     request.movement_model = "holden-v1";
+    CHECK(protocol.reset(request, initial, error));
+}
+
+static void test_reset_accepts_holden_turn_v1_profile()
+{
+    fake_adapter adapter;
+    fake_engine protocol(adapter);
+    mm_chunk_error error;
+    mm_chunk_boundary initial;
+    CHECK(protocol.hello(error));
+    mm_chunk_reset_request request = reset_request();
+    request.movement_model = "holden-turn-v1";
     CHECK(protocol.reset(request, initial, error));
 }
 
@@ -809,6 +824,7 @@ int main()
     test_candidate_preview_fields_participate_in_step_equality();
     test_reset_defaults_movement_model_to_raw();
     test_reset_accepts_holden_v1_profile();
+    test_reset_accepts_holden_turn_v1_profile();
     test_reset_rejects_unknown_movement_model_before_mutation();
     test_reset_request_json_movement_model_shapes();
     std::puts("MM chunk protocol tests passed");

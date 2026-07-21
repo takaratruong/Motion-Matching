@@ -18,6 +18,7 @@ g1_project_pose_cli: $(BUILD_DIR)/g1_project_pose_cli
 
 $(BUILD_DIR)/mm_chunk_server: mm_chunk_server.cpp mm_chunk_protocol.h \
 		mm_chunk_json.h g1_runtime.h g1_movement_model.h \
+		g1_turn_model.h \
 		g1_joint_projection.h \
 		g1_joint_feasibility.h ../../sha256.h \
 		g1_database_validation.h g1_joint_contract_io.h \

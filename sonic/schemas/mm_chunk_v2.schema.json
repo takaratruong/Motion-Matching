@@ -1,0 +1,312 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "mm-chunk/v2",
+  "title": "Transactional motion-matching source chunk v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "session_id",
+    "candidate_id",
+    "predecessor_id",
+    "source_rate_hz",
+    "source_intervals",
+    "timestamps_s",
+    "source_joint_names",
+    "target_joint_names",
+    "joint_position_source",
+    "joint_velocity_source",
+    "physical_pelvis_position_holden",
+    "physical_pelvis_orientation_holden",
+    "virtual_root_position_holden",
+    "virtual_root_orientation_holden",
+    "selected_database_frame",
+    "candidate_preview_count",
+    "candidate_limit_rejection_count",
+    "first_rejected_database_frame",
+    "first_rejected_joint_index",
+    "first_rejected_joint_position",
+    "searched",
+    "transitioned",
+    "terrain_cost",
+    "terrain_values",
+    "terrain_points_holden",
+    "support_height",
+    "support_target",
+    "scene",
+    "command",
+    "artifacts"
+  ],
+  "$defs": {
+    "float": {"type": "number"},
+    "vec3": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/float"},
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "quat": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/float"},
+      "minItems": 4,
+      "maxItems": 4
+    },
+    "joints": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/float"},
+      "minItems": 29,
+      "maxItems": 29
+    },
+    "jointNames": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "minItems": 29,
+      "maxItems": 29,
+      "uniqueItems": true
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  },
+  "properties": {
+    "schema": {"const": "mm-chunk/v2"},
+    "session_id": {"type": "string", "minLength": 1},
+    "candidate_id": {"type": "string", "minLength": 1},
+    "predecessor_id": {
+      "type": ["string", "null"]
+    },
+    "source_rate_hz": {"const": 25},
+    "source_intervals": {"enum": [5, 10]},
+    "timestamps_s": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/float"}
+    },
+    "source_joint_names": {"$ref": "#/$defs/jointNames"},
+    "target_joint_names": {"$ref": "#/$defs/jointNames"},
+    "joint_position_source": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/joints"}
+    },
+    "joint_velocity_source": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/joints"}
+    },
+    "physical_pelvis_position_holden": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/vec3"}
+    },
+    "physical_pelvis_orientation_holden": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/quat"}
+    },
+    "virtual_root_position_holden": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/vec3"}
+    },
+    "virtual_root_orientation_holden": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/quat"}
+    },
+    "selected_database_frame": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": 0}
+    },
+    "candidate_preview_count": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": 0}
+    },
+    "candidate_limit_rejection_count": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": 0}
+    },
+    "first_rejected_database_frame": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": -1}
+    },
+    "first_rejected_joint_index": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": -1, "maximum": 28}
+    },
+    "first_rejected_joint_position": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/float"}
+    },
+    "searched": {
+      "type": "array",
+      "items": {"type": "boolean"}
+    },
+    "transitioned": {
+      "type": "array",
+      "items": {"type": "boolean"}
+    },
+    "terrain_cost": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/float"}
+    },
+    "terrain_values": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": {"$ref": "#/$defs/float"},
+        "minItems": 4,
+        "maxItems": 4
+      }
+    },
+    "terrain_points_holden": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": {"$ref": "#/$defs/vec3"},
+        "minItems": 4,
+        "maxItems": 4
+      }
+    },
+    "support_height": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/float"}
+    },
+    "support_target": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/float"}
+    },
+    "scene": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scene_id",
+        "route_id",
+        "terrain_weight",
+        "coordinate_signature",
+        "heightfield_sha256",
+        "mesh_sha256",
+        "walkability_sha256"
+      ],
+      "properties": {
+        "scene_id": {"type": "string", "minLength": 1},
+        "route_id": {"type": "string", "minLength": 1},
+        "terrain_weight": {"$ref": "#/$defs/float"},
+        "coordinate_signature": {"type": "string", "minLength": 1},
+        "heightfield_sha256": {"$ref": "#/$defs/sha256"},
+        "mesh_sha256": {"$ref": "#/$defs/sha256"},
+        "walkability_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requested_velocity_holden",
+        "desired_heading_holden_wxyz",
+        "applied_velocity_holden",
+        "applied_heading_holden_wxyz"
+      ],
+      "properties": {
+        "requested_velocity_holden": {"$ref": "#/$defs/vec3"},
+        "desired_heading_holden_wxyz": {"$ref": "#/$defs/quat"},
+        "applied_velocity_holden": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/vec3"}
+        },
+        "applied_heading_holden_wxyz": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/quat"}
+        }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "build_commit",
+        "joint_contract_sha256",
+        "motion_manifest_sha256",
+        "database_sha256",
+        "terrain_features_sha256",
+        "terrain_support_sha256",
+        "scene_index_sha256",
+        "skeleton_signature",
+        "coordinate_signature"
+      ],
+      "properties": {
+        "build_commit": {"type": "string", "minLength": 1},
+        "joint_contract_sha256": {"$ref": "#/$defs/sha256"},
+        "motion_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "database_sha256": {"$ref": "#/$defs/sha256"},
+        "terrain_features_sha256": {"$ref": "#/$defs/sha256"},
+        "terrain_support_sha256": {"$ref": "#/$defs/sha256"},
+        "scene_index_sha256": {"$ref": "#/$defs/sha256"},
+        "skeleton_signature": {"$ref": "#/$defs/sha256"},
+        "coordinate_signature": {"type": "string", "minLength": 1}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"source_intervals": {"const": 5}}},
+      "then": {
+        "properties": {
+          "timestamps_s": {"minItems": 6, "maxItems": 6},
+          "joint_position_source": {"minItems": 6, "maxItems": 6},
+          "joint_velocity_source": {"minItems": 6, "maxItems": 6},
+          "physical_pelvis_position_holden": {"minItems": 6, "maxItems": 6},
+          "physical_pelvis_orientation_holden": {"minItems": 6, "maxItems": 6},
+          "virtual_root_position_holden": {"minItems": 6, "maxItems": 6},
+          "virtual_root_orientation_holden": {"minItems": 6, "maxItems": 6},
+          "selected_database_frame": {"minItems": 5, "maxItems": 5},
+          "candidate_preview_count": {"minItems": 5, "maxItems": 5},
+          "candidate_limit_rejection_count": {"minItems": 5, "maxItems": 5},
+          "first_rejected_database_frame": {"minItems": 5, "maxItems": 5},
+          "first_rejected_joint_index": {"minItems": 5, "maxItems": 5},
+          "first_rejected_joint_position": {"minItems": 5, "maxItems": 5},
+          "searched": {"minItems": 5, "maxItems": 5},
+          "transitioned": {"minItems": 5, "maxItems": 5},
+          "terrain_cost": {"minItems": 5, "maxItems": 5},
+          "terrain_values": {"minItems": 5, "maxItems": 5},
+          "terrain_points_holden": {"minItems": 5, "maxItems": 5},
+          "support_height": {"minItems": 5, "maxItems": 5},
+          "support_target": {"minItems": 5, "maxItems": 5},
+          "command": {
+            "properties": {
+              "applied_velocity_holden": {"minItems": 5, "maxItems": 5},
+              "applied_heading_holden_wxyz": {"minItems": 5, "maxItems": 5}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"source_intervals": {"const": 10}}},
+      "then": {
+        "properties": {
+          "timestamps_s": {"minItems": 11, "maxItems": 11},
+          "joint_position_source": {"minItems": 11, "maxItems": 11},
+          "joint_velocity_source": {"minItems": 11, "maxItems": 11},
+          "physical_pelvis_position_holden": {"minItems": 11, "maxItems": 11},
+          "physical_pelvis_orientation_holden": {"minItems": 11, "maxItems": 11},
+          "virtual_root_position_holden": {"minItems": 11, "maxItems": 11},
+          "virtual_root_orientation_holden": {"minItems": 11, "maxItems": 11},
+          "selected_database_frame": {"minItems": 10, "maxItems": 10},
+          "candidate_preview_count": {"minItems": 10, "maxItems": 10},
+          "candidate_limit_rejection_count": {"minItems": 10, "maxItems": 10},
+          "first_rejected_database_frame": {"minItems": 10, "maxItems": 10},
+          "first_rejected_joint_index": {"minItems": 10, "maxItems": 10},
+          "first_rejected_joint_position": {"minItems": 10, "maxItems": 10},
+          "searched": {"minItems": 10, "maxItems": 10},
+          "transitioned": {"minItems": 10, "maxItems": 10},
+          "terrain_cost": {"minItems": 10, "maxItems": 10},
+          "terrain_values": {"minItems": 10, "maxItems": 10},
+          "terrain_points_holden": {"minItems": 10, "maxItems": 10},
+          "support_height": {"minItems": 10, "maxItems": 10},
+          "support_target": {"minItems": 10, "maxItems": 10},
+          "command": {
+            "properties": {
+              "applied_velocity_holden": {"minItems": 10, "maxItems": 10},
+              "applied_heading_holden_wxyz": {"minItems": 10, "maxItems": 10}
+            }
+          }
+        }
+      }
+    }
+  ]
+}

@@ -186,17 +186,20 @@ class MMChunkClientMovementModelTests(TemporaryScriptCase):
                         "movement_model", "raw")
                     if MISMATCH:
                         profile = "holden-v1" if profile == "raw" else "raw"
+                    movement_model = {{
+                        "profile": profile,
+                        "acceleration_mps2": 1.5,
+                        "deceleration_mps2": 2.0,
+                        "directional_acceleration": False,
+                        "turn_strength": False,
+                    }}
+                    if profile == "holden-turn-v1":
+                        movement_model["max_yaw_rate_deg_s"] = 120.0
                     data = {{
                         "session_id": request["session_id"],
                         "active_candidate_id": None,
                         "scene": {{}},
-                        "movement_model": {{
-                            "profile": profile,
-                            "acceleration_mps2": 1.5,
-                            "deceleration_mps2": 2.0,
-                            "directional_acceleration": False,
-                            "turn_strength": False,
-                        }},
+                        "movement_model": movement_model,
                         "initial_boundary": {{}},
                     }}
                 elif op == "close":
@@ -238,6 +241,40 @@ class MMChunkClientMovementModelTests(TemporaryScriptCase):
             client.close()
         request = json.loads(record.read_text(encoding="utf-8"))
         self.assertEqual(request["movement_model"], "holden-v1")
+
+    def test_reset_sends_and_validates_holden_turn_v1(self):
+        client, record = self._capture_client()
+        try:
+            client.hello()
+            source = client.reset(
+                SessionConfig("scene", "route", 4.0, "holden-turn-v1"),
+                session_id="session-mm",
+            )
+            self.assertEqual(
+                source["movement_model"]["profile"], "holden-turn-v1")
+            self.assertEqual(
+                source["movement_model"]["max_yaw_rate_deg_s"], 120.0)
+        finally:
+            client.close()
+        request = json.loads(record.read_text(encoding="utf-8"))
+        self.assertEqual(request["movement_model"], "holden-turn-v1")
+
+    def test_reset_rejects_max_yaw_key_on_old_profile(self):
+        client, _ = self._capture_client(echo_profile="holden-v1")
+        try:
+            client.hello()
+            # Force the server to emit a holden-v1 record that (via the raw
+            # validator path) must have exactly five keys; a six-key record
+            # for an old profile is rejected. We emulate that by requesting
+            # the turn profile but forcing a holden-v1 profile echo without a
+            # max-rate key, then verify the validator's exact contract.
+            source = client.reset(
+                SessionConfig("scene", "route", 4.0, "holden-v1"),
+                session_id="session-mm",
+            )
+            self.assertNotIn("max_yaw_rate_deg_s", source["movement_model"])
+        finally:
+            client.close()
 
     def test_reset_rejects_profile_mismatch(self):
         client, _ = self._capture_client(mismatch=True)

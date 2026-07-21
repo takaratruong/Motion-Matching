@@ -1429,6 +1429,212 @@ def parse_manual_flat_summary_v6(
     }
 
 
+_TURN_MOVEMENT_MODEL_KEYS = _MOVEMENT_MODEL_KEYS | {"max_yaw_rate_deg_s"}
+
+
+def validate_turn_movement_model_record(value: object) -> dict[str, object]:
+    """Validate one server-authored ``holden-turn-v1`` movement_model object."""
+
+    record = _require_keys(value, _TURN_MOVEMENT_MODEL_KEYS, "movement_model")
+    if record["profile"] != "holden-turn-v1":
+        raise ContractError("movement_model profile must be holden-turn-v1")
+    if record["acceleration_mps2"] != 1.5 or record["deceleration_mps2"] != 2.0:
+        raise ContractError("movement_model parameters are not the fixed values")
+    if (
+        record["directional_acceleration"] is not False
+        or record["turn_strength"] is not False
+    ):
+        raise ContractError(
+            "movement_model must disable directional acceleration and turn strength"
+        )
+    max_yaw = record["max_yaw_rate_deg_s"]
+    if type(max_yaw) is bool or type(max_yaw) not in (int, float):
+        raise ContractError("movement_model max_yaw_rate_deg_s must be a number")
+    if not math.isfinite(float(max_yaw)) or float(max_yaw) != 120.0:
+        raise ContractError("movement_model max_yaw_rate_deg_s must equal 120.0")
+    return {
+        "profile": "holden-turn-v1",
+        "acceleration_mps2": 1.5,
+        "deceleration_mps2": 2.0,
+        "directional_acceleration": False,
+        "turn_strength": False,
+        "max_yaw_rate_deg_s": 120.0,
+    }
+
+
+_MANUAL_SUMMARY_V7_SCHEMA = "mm-sonic-manual-demo/v7"
+_MANUAL_SUMMARY_V7_KEYS = _MANUAL_SUMMARY_V5_KEYS
+
+
+def manual_summary_v7_bytes(
+    *,
+    mode: str,
+    run_root: str,
+    preload_chunks: int,
+    generated_chunks: int,
+    lookahead_seconds: float,
+    command_bytes: bytes,
+    hand_targets: Dex3HandTargets,
+    environment_control: dict,
+    snapshot: dict,
+    movement_model: object,
+) -> bytes:
+    """Serialize a terrain ``mm-sonic-manual-demo/v7`` turn-profile summary."""
+
+    base = manual_summary_v4_bytes(
+        mode=mode,
+        run_root=run_root,
+        preload_chunks=preload_chunks,
+        generated_chunks=generated_chunks,
+        lookahead_seconds=lookahead_seconds,
+        command_bytes=command_bytes,
+        hand_targets=hand_targets,
+        environment_control=environment_control,
+        snapshot=snapshot,
+    )
+    document = json.loads(base)
+    document["schema"] = _MANUAL_SUMMARY_V7_SCHEMA
+    document["movement_model"] = validate_turn_movement_model_record(
+        movement_model
+    )
+    try:
+        return (
+            json.dumps(document, sort_keys=True, indent=2) + "\n"
+        ).encode("ascii")
+    except (TypeError, ValueError) as error:
+        raise ContractError("manual summary v7 cannot be serialized") from error
+
+
+def parse_manual_summary_v7(
+    data: bytes | bytearray | memoryview,
+) -> dict[str, object]:
+    """Strictly parse one terrain ``mm-sonic-manual-demo/v7`` summary."""
+
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        raise ContractError("manual summary must be bytes")
+    document = _json_object(bytes(data), label="manual summary")
+    root = _require_keys(document, _MANUAL_SUMMARY_V7_KEYS, "manual summary")
+    if root["schema"] != _MANUAL_SUMMARY_V7_SCHEMA:
+        raise ContractError("manual summary has an unsupported schema")
+    v4_view = {key: root[key] for key in _MANUAL_SUMMARY_V4_KEYS}
+    v4_view["schema"] = _MANUAL_SUMMARY_V4_SCHEMA
+    parsed = parse_manual_summary_v4(
+        (json.dumps(v4_view, sort_keys=True) + "\n").encode("ascii")
+    )
+    parsed["schema"] = _MANUAL_SUMMARY_V7_SCHEMA
+    parsed["movement_model"] = validate_turn_movement_model_record(
+        root["movement_model"]
+    )
+    return parsed
+
+
+_MANUAL_FLAT_SUMMARY_V8_SCHEMA = "mm-sonic-manual-demo/v8"
+_MANUAL_FLAT_SUMMARY_V8_KEYS = _MANUAL_FLAT_SUMMARY_V6_KEYS
+
+
+def manual_flat_summary_v8_bytes(
+    *,
+    mode: str,
+    run_root: str,
+    preload_chunks: int,
+    generated_chunks: int,
+    lookahead_seconds: float,
+    command_bytes: bytes,
+    hand_targets: Dex3HandTargets,
+    scene_control: dict,
+    snapshot: dict,
+    movement_model: object,
+) -> bytes:
+    """Serialize a flat-scene ``mm-sonic-manual-demo/v8`` turn-profile summary."""
+
+    base = manual_flat_summary_v6_bytes(
+        mode=mode,
+        run_root=run_root,
+        preload_chunks=preload_chunks,
+        generated_chunks=generated_chunks,
+        lookahead_seconds=lookahead_seconds,
+        command_bytes=command_bytes,
+        hand_targets=hand_targets,
+        scene_control=scene_control,
+        snapshot=snapshot,
+        movement_model={
+            "profile": "raw",
+            "acceleration_mps2": 1.5,
+            "deceleration_mps2": 2.0,
+            "directional_acceleration": False,
+            "turn_strength": False,
+        },
+    )
+    document = json.loads(base)
+    document["schema"] = _MANUAL_FLAT_SUMMARY_V8_SCHEMA
+    document["movement_model"] = validate_turn_movement_model_record(
+        movement_model
+    )
+    try:
+        return (
+            json.dumps(document, sort_keys=True, indent=2) + "\n"
+        ).encode("ascii")
+    except (TypeError, ValueError) as error:
+        raise ContractError("manual flat summary v8 cannot be serialized") from error
+
+
+def parse_manual_flat_summary_v8(
+    data: bytes | bytearray | memoryview,
+) -> dict[str, object]:
+    """Strictly parse one flat-scene ``mm-sonic-manual-demo/v8`` summary."""
+
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        raise ContractError("manual summary must be bytes")
+    document = _json_object(bytes(data), label="manual summary")
+    root = _require_keys(
+        document, _MANUAL_FLAT_SUMMARY_V8_KEYS, "manual summary"
+    )
+    if root["schema"] != _MANUAL_FLAT_SUMMARY_V8_SCHEMA:
+        raise ContractError("manual summary has an unsupported schema")
+    mode = _validated_mode(root["mode"])
+    if type(root["run_root"]) is not str or not root["run_root"]:
+        raise ContractError("manual summary run_root must be a nonempty string")
+    if type(root["preload_chunks"]) is not int or root["preload_chunks"] < 0:
+        raise ContractError("manual summary preload_chunks must be nonnegative")
+    if (
+        type(root["generated_chunks"]) is not int
+        or root["generated_chunks"] < root["preload_chunks"]
+    ):
+        raise ContractError("manual summary generated_chunks is invalid")
+    lookahead = root["lookahead_seconds"]
+    if (
+        type(lookahead) not in (int, float)
+        or isinstance(lookahead, bool)
+        or not math.isfinite(float(lookahead))
+    ):
+        raise ContractError("manual summary lookahead_seconds must be finite")
+    command = _require_keys(
+        root["command_artifact"],
+        {"path", "sha256"},
+        "manual summary command artifact",
+    )
+    if command["path"] != "manual-commands.json" or not _is_sha256(
+        command["sha256"]
+    ):
+        raise ContractError("manual summary command artifact identity is invalid")
+    hand_targets = parse_hand_targets_record(root["hand_control"])
+    return {
+        "schema": _MANUAL_FLAT_SUMMARY_V8_SCHEMA,
+        "mode": mode,
+        "run_root": root["run_root"],
+        "preload_chunks": root["preload_chunks"],
+        "generated_chunks": root["generated_chunks"],
+        "lookahead_seconds": float(lookahead),
+        "command_artifact": dict(command),
+        "hand_control": hand_targets_record(hand_targets),
+        "scene_control": _validate_scene_control(root["scene_control"]),
+        "snapshot": _validate_snapshot(root["snapshot"]),
+        "movement_model": validate_turn_movement_model_record(
+            root["movement_model"]
+        ),
+    }
+
+
 def _validate_summary(
     summary: dict[str, object],
     *,

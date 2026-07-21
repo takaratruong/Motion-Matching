@@ -107,8 +107,11 @@ class SessionConfig:
         ):
             raise ContractError("session terrain_weight must be exact binary32")
         object.__setattr__(self, "terrain_weight", float(converted))
-        if self.movement_model not in ("raw", "holden-v1"):
-            raise ContractError("session movement_model must be raw or holden-v1")
+        if self.movement_model not in ("raw", "holden-v1", "holden-turn-v1"):
+            raise ContractError(
+                "session movement_model must be raw, holden-v1, "
+                "or holden-turn-v1"
+            )
 
 
 @dataclass(frozen=True)

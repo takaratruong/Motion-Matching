@@ -401,12 +401,18 @@ static void test_controller_publishes_independent_travel_and_heading()
 
     const std::size_t runtime_command = runtime_source.find(
         "const vec3 commanded_velocity = request.requested_velocity_holden;");
-    const std::size_t runtime_heading = runtime_source.find(
-        "const quat desired_rotation_curr = request.desired_heading_holden;",
+    const std::size_t runtime_requested = runtime_source.find(
+        "const quat requested_rotation = request.desired_heading_holden;",
         runtime_command);
+    const std::size_t runtime_heading = runtime_source.find(
+        "if (!g1_turn_model_step(",
+        runtime_requested);
     const std::size_t traversal = runtime_source.find(
         "const vec3 limited_velocity = traversability_limit_command(",
         runtime_heading);
+    check(runtime_requested != std::string::npos &&
+              runtime_requested < runtime_heading,
+          "runtime retains the requested heading before capping it once");
     const std::size_t movement_model = runtime_source.find(
         "if (!g1_movement_model_step(", traversal);
     const std::size_t intent = runtime_source.find(

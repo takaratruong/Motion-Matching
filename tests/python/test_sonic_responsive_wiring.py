@@ -45,10 +45,17 @@ class _FakeAdvance:
 
 
 class _FakeCheckedChunk:
-    """A validated source chunk exposing the per-step applied velocities."""
+    """A validated source chunk exposing per-step applied evidence."""
 
-    def __init__(self, applied_velocity_holden: np.ndarray) -> None:
-        self.command = {"applied_velocity_holden": applied_velocity_holden}
+    def __init__(
+        self,
+        applied_velocity_holden: np.ndarray,
+        applied_heading_holden_wxyz: np.ndarray,
+    ) -> None:
+        self.command = {
+            "applied_velocity_holden": applied_velocity_holden,
+            "applied_heading_holden_wxyz": applied_heading_holden_wxyz,
+        }
 
 
 class _Fakes:
@@ -59,6 +66,7 @@ class _Fakes:
         *,
         root_rows: np.ndarray | None = None,
         applied_velocity_holden: np.ndarray | None = None,
+        applied_heading_holden_wxyz: np.ndarray | None = None,
     ) -> None:
         self.log: list[str] = []
         if root_rows is None:
@@ -69,6 +77,12 @@ class _Fakes:
         if applied_velocity_holden is None:
             applied_velocity_holden = np.zeros((10, 3), dtype=np.float32)
         self._applied_velocity_holden = applied_velocity_holden
+        if applied_heading_holden_wxyz is None:
+            applied_heading_holden_wxyz = np.tile(
+                np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                (applied_velocity_holden.shape[0], 1),
+            )
+        self._applied_heading_holden_wxyz = applied_heading_holden_wxyz
 
     # mm ----------------------------------------------------------------
     def generate(self, command, **kwargs):
@@ -89,7 +103,10 @@ class _Fakes:
     # validator ---------------------------------------------------------
     def validate_source(self, raw):
         self.log.append("validate")
-        return _FakeCheckedChunk(self._applied_velocity_holden)
+        return _FakeCheckedChunk(
+            self._applied_velocity_holden,
+            self._applied_heading_holden_wxyz,
+        )
 
     # timeline ----------------------------------------------------------
     def prepare(self, checked):
@@ -490,6 +507,39 @@ class ManualChunkCommitterTraceTests(unittest.TestCase):
         )
         self.assertEqual(accepted.applied_velocity_mujoco_last, expected_last)
 
+    def test_accepted_chunk_carries_transformed_applied_heading_endpoints(self):
+        from mm_sonic.responsive_wiring import ManualChunkCommitter
+        from mm_sonic.transform import holden_to_mujoco_quaternions
+
+        headings = np.tile(
+            np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32), (10, 1)
+        )
+        # A small planar yaw about +Y on the last row (~4.8 degrees).
+        headings[-1] = (0.99912283, 0.0, 0.04187565, 0.0)
+        fakes = _Fakes(applied_heading_holden_wxyz=headings)
+        committer = ManualChunkCommitter(
+            mm=_MMShim(fakes),
+            validator=_ValidatorShim(fakes),
+            timeline=_TimelineShim(fakes),
+            publish=_PublisherShim(fakes).publish,
+            gate=_GateShim(fakes),
+            session_id="session",
+            steps_per_chunk=20,
+            recorder=_RecorderShim(fakes),
+        )
+
+        accepted = committer.run_one_chunk(_command(0))
+
+        expected = holden_to_mujoco_quaternions(headings[[0, -1]])
+        self.assertEqual(
+            accepted.applied_heading_mujoco_wxyz_first,
+            tuple(float(v) for v in expected[0]),
+        )
+        self.assertEqual(
+            accepted.applied_heading_mujoco_wxyz_last,
+            tuple(float(v) for v in expected[1]),
+        )
+
     def test_accepted_chunk_reads_real_observed_root_from_state_reader(self):
         fakes = _Fakes()
 
@@ -594,6 +644,8 @@ class BuildBoundaryTraceTests(unittest.TestCase):
             generated_virtual_root_displacement_mujoco=(0.3, 0.1, 0.0),
             applied_velocity_mujoco_first=(0.1, -0.2, 0.0),
             applied_velocity_mujoco_last=(-0.3, -0.4, 0.0),
+            applied_heading_mujoco_wxyz_first=(1.0, 0.0, 0.0, 0.0),
+            applied_heading_mujoco_wxyz_last=(0.99912283, 0.0, 0.0, -0.04187565),
             observed_mujoco_root_displacement=observed,
             advance=object(),
         )
@@ -686,7 +738,14 @@ class BuildBoundaryTraceTests(unittest.TestCase):
         self.assertEqual(restored["applied_velocity_mujoco_first"], [0.1, -0.2, 0.0])
         self.assertEqual(restored["applied_velocity_mujoco_last"], [-0.3, -0.4, 0.0])
         self.assertEqual(
-            restored["schema"], "mm-sonic-responsive-boundary-trace/v2"
+            restored["applied_heading_mujoco_wxyz_first"], [1.0, 0.0, 0.0, 0.0]
+        )
+        self.assertEqual(
+            restored["applied_heading_mujoco_wxyz_last"],
+            [0.99912283, 0.0, 0.0, -0.04187565],
+        )
+        self.assertEqual(
+            restored["schema"], "mm-sonic-responsive-boundary-trace/v3"
         )
 
 

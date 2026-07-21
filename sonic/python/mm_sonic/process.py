@@ -627,18 +627,31 @@ def _exact_object(
 
 
 def _validate_movement_model_object(value: object) -> str:
-    source = _exact_object(
-        value,
-        {
+    if type(value) is not dict:
+        raise ProcessProtocolError("MM reset movement_model must be an object")
+    # The historical raw/holden-v1 record has exactly five keys; the turn
+    # profile adds exactly max_yaw_rate_deg_s. Selecting the key set by the
+    # declared profile keeps both contracts fail-closed.
+    profile = value.get("profile")
+    if profile == "holden-turn-v1":
+        fields = {
             "profile",
             "acceleration_mps2",
             "deceleration_mps2",
             "directional_acceleration",
             "turn_strength",
-        },
-        "MM reset movement_model",
-    )
-    if source["profile"] not in ("raw", "holden-v1"):
+            "max_yaw_rate_deg_s",
+        }
+    else:
+        fields = {
+            "profile",
+            "acceleration_mps2",
+            "deceleration_mps2",
+            "directional_acceleration",
+            "turn_strength",
+        }
+    source = _exact_object(value, fields, "MM reset movement_model")
+    if source["profile"] not in ("raw", "holden-v1", "holden-turn-v1"):
         raise ProcessProtocolError("MM reset movement_model profile is invalid")
     if source["acceleration_mps2"] != 1.5 or source["deceleration_mps2"] != 2.0:
         raise ProcessProtocolError(
@@ -651,6 +664,17 @@ def _validate_movement_model_object(value: object) -> str:
         raise ProcessProtocolError(
             "MM reset movement_model must disable directional/turn features"
         )
+    if source["profile"] == "holden-turn-v1":
+        max_yaw = source["max_yaw_rate_deg_s"]
+        if type(max_yaw) is bool or type(max_yaw) not in (int, float):
+            raise ProcessProtocolError(
+                "MM reset movement_model max_yaw_rate_deg_s must be a number"
+            )
+        max_yaw = float(max_yaw)
+        if not math.isfinite(max_yaw) or max_yaw != 120.0:
+            raise ProcessProtocolError(
+                "MM reset movement_model max_yaw_rate_deg_s must equal 120.0"
+            )
     return source["profile"]
 
 
@@ -1099,8 +1123,10 @@ class MMChunkClient:
         ):
             raise ValueError("terrain_weight must be finite")
         movement_model = getattr(config, "movement_model", "raw")
-        if movement_model not in ("raw", "holden-v1"):
-            raise ValueError("movement_model must be raw or holden-v1")
+        if movement_model not in ("raw", "holden-v1", "holden-turn-v1"):
+            raise ValueError(
+                "movement_model must be raw, holden-v1, or holden-turn-v1"
+            )
         data = self._request(
             "reset",
             session_id=session,

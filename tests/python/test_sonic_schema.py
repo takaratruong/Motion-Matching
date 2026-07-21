@@ -274,6 +274,14 @@ class SourceFixture:
             },
         }
 
+    def chunk_v2(self, source_intervals=5):
+        payload = self.chunk(source_intervals=source_intervals)
+        payload["schema"] = "mm-chunk/v2"
+        payload["command"]["applied_heading_holden_wxyz"] = [
+            [1.0, 0.0, 0.0, 0.0] for _ in range(source_intervals)
+        ]
+        return payload
+
 
 class ExactJsonTests(unittest.TestCase):
     def test_duplicate_keys_are_rejected_at_every_object_depth(self):
@@ -783,6 +791,84 @@ class SourceChunkTests(unittest.TestCase):
         np.testing.assert_array_equal(
             chunk.joint_position_source.view(np.uint32), expected.view(np.uint32)
         )
+
+
+class SourceChunkV2Tests(unittest.TestCase):
+    def setUp(self):
+        self.fixture = SourceFixture()
+
+    def test_v2_document_is_closed_versioned_and_dual_interval(self):
+        document = loads_exact(
+            (ROOT / "sonic" / "schemas" / "mm_chunk_v2.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(document["$id"], "mm-chunk/v2")
+        self.assertFalse(document["additionalProperties"])
+        self.assertIn("applied_heading_holden_wxyz", document["properties"][
+            "command"]["required"])
+
+    def test_v1_fixture_still_parses_unchanged(self):
+        chunk = parse_source_chunk(self.fixture.chunk(), self.fixture.contract)
+        self.assertNotIn("applied_heading_holden_wxyz", chunk.command)
+
+    def test_v2_chunk_parses_owned_immutable_applied_headings(self):
+        requested_heading = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        chunk = parse_source_chunk(
+            self.fixture.chunk_v2(source_intervals=5), self.fixture.contract
+        )
+        self.assertEqual(
+            chunk.command["applied_heading_holden_wxyz"].shape, (5, 4)
+        )
+        self.assertFalse(
+            chunk.command["applied_heading_holden_wxyz"].flags.writeable
+        )
+        np.testing.assert_array_equal(
+            chunk.command["desired_heading_holden_wxyz"], requested_heading
+        )
+
+    def test_v2_rejects_missing_applied_heading_field(self):
+        payload = self.fixture.chunk_v2(source_intervals=5)
+        del payload["command"]["applied_heading_holden_wxyz"]
+        with self.assertRaises(ContractError):
+            parse_source_chunk(payload, self.fixture.contract)
+
+    def test_v1_with_applied_heading_field_is_rejected(self):
+        payload = self.fixture.chunk()
+        payload["command"]["applied_heading_holden_wxyz"] = [
+            [1.0, 0.0, 0.0, 0.0] for _ in range(10)
+        ]
+        with self.assertRaises(ContractError):
+            parse_source_chunk(payload, self.fixture.contract)
+
+    def test_v2_rejects_wrong_row_count(self):
+        payload = self.fixture.chunk_v2(source_intervals=5)
+        payload["command"]["applied_heading_holden_wxyz"] = payload[
+            "command"]["applied_heading_holden_wxyz"][:-1]
+        with self.assertRaises(ContractError):
+            parse_source_chunk(payload, self.fixture.contract)
+
+    def test_v2_rejects_non_unit_and_nan_applied_headings(self):
+        non_unit = self.fixture.chunk_v2(source_intervals=5)
+        non_unit["command"]["applied_heading_holden_wxyz"][0] = [
+            2.0, 0.0, 0.0, 0.0
+        ]
+        with self.assertRaises(ContractError):
+            parse_source_chunk(non_unit, self.fixture.contract)
+        nan_rows = self.fixture.chunk_v2(source_intervals=5)
+        nan_rows["command"]["applied_heading_holden_wxyz"][0] = [
+            float("nan"), 0.0, 0.0, 0.0
+        ]
+        with self.assertRaises(ContractError):
+            parse_source_chunk(nan_rows, self.fixture.contract)
+
+    def test_v2_rejects_duplicate_command_keys(self):
+        text = (
+            '{"command":{"applied_heading_holden_wxyz":[],'
+            '"applied_heading_holden_wxyz":[]}}'
+        )
+        with self.assertRaisesRegex(ContractError, "duplicate JSON key"):
+            loads_exact(text)
 
 
 if __name__ == "__main__":

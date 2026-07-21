@@ -2,6 +2,7 @@
 
 #include "g1_runtime_diagnostics.h"
 #include "motion_match_log.h"
+#include "sonic/cpp/g1_turn_model.h"
 
 #include <cassert>
 #include <cfloat>
@@ -930,7 +931,23 @@ static inline bool g1_runtime_step_internal(
     g1_runtime_step_result result;
     const float dt = config.dt;
     const vec3 commanded_velocity = request.requested_velocity_holden;
-    const quat desired_rotation_curr = request.desired_heading_holden;
+    // The requested heading remains the operator intent for prediction; the
+    // applied current heading is capped once against the committed anchor
+    // (`next.desired_rotation`) before diagnostics, prediction, query
+    // construction, and application. `raw`/`holden-v1` return it exactly.
+    const quat requested_rotation = request.desired_heading_holden;
+    quat desired_rotation_curr;
+    if (!g1_turn_model_step(
+            desired_rotation_curr,
+            next.desired_rotation,
+            requested_rotation,
+            dt,
+            next.movement_model_profile,
+            g1_turn_model_fixed_config(),
+            error,
+            capacity)) {
+        return false;
+    }
 
     next.transitioned = false;
     next.adjustment_xz = 0.0f;
@@ -1718,9 +1735,17 @@ static inline bool g1_runtime_step_direct_internal(
         {
             G1CommandFramePredictionRequest direct_request = frame_request;
             direct_request.route_mode = true;
-            direct_request.heading_override.active = true;
-            direct_request.heading_override.heading =
-                direct_request.intent.desired_heading;
+            // Raw and velocity-only profiles hold the (exact) current heading
+            // across the prediction horizon via the historical override. The
+            // turn profile instead rolls future headings forward along the
+            // same capped path toward the original operator request.
+            if (next.movement_model_profile == G1MovementHoldenTurnV1) {
+                direct_request.heading_override.active = false;
+            } else {
+                direct_request.heading_override.active = true;
+                direct_request.heading_override.heading =
+                    direct_request.intent.desired_heading;
+            }
             return g1_command_frame_prediction_build(
                 frame_prediction,
                 frame_seed,
@@ -1749,11 +1774,19 @@ static inline bool g1_runtime_step_direct_internal(
                         fill_error,
                         fill_capacity);
                 },
-                [](slice1d<quat>,
-                   const slice1d<vec3>,
-                   char*,
-                   int) {
-                    return true;
+                [&](slice1d<quat> desired_rotations,
+                    const slice1d<vec3>,
+                    char* fill_error,
+                    int fill_capacity) {
+                    return g1_turn_model_predict(
+                        desired_rotations,
+                        next.desired_rotation,
+                        request.desired_heading_holden,
+                        runtime_config.trajectory_sample_time,
+                        next.movement_model_profile,
+                        g1_turn_model_fixed_config(),
+                        fill_error,
+                        fill_capacity);
                 },
                 [&](slice1d<quat> rotations,
                     slice1d<vec3> angular_velocities,

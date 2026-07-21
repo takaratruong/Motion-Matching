@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SERVER = Path(os.environ.get(
     "SONIC_MM_SERVER", ROOT / "sonic" / "build" / "mm_chunk_server"))
 SCHEMA = ROOT / "sonic" / "schemas" / "mm_chunk_v1.schema.json"
+SCHEMA_V2 = ROOT / "sonic" / "schemas" / "mm_chunk_v2.schema.json"
 JOINT_CONTRACT = ROOT / "sonic" / "configs" / "g1_joint_contract.json"
 MIN_BINARY32_SUBNORMAL = struct.unpack("<f", bytes.fromhex("01000000"))[0]
 MAX_BINARY32_SUBNORMAL = struct.unpack("<f", bytes.fromhex("ffff7f00"))[0]
@@ -217,7 +218,7 @@ class ChunkServerProtocolTest(unittest.TestCase):
         generated = self.server.request(generate())
         self.assertTrue(generated["ok"])
         candidate = generated["data"]
-        self.assertEqual(candidate["schema"], "mm-chunk/v1")
+        self.assertEqual(candidate["schema"], "mm-chunk/v2")
         self.assertEqual(len(candidate["timestamps_s"]), 11)
         self.assertEqual(
             [struct.pack("<f", value) for value in candidate["timestamps_s"]],
@@ -245,11 +246,18 @@ class ChunkServerProtocolTest(unittest.TestCase):
             "requested_velocity_holden",
             "desired_heading_holden_wxyz",
             "applied_velocity_holden",
+            "applied_heading_holden_wxyz",
         })
         self.assertEqual(len(candidate["command"]["applied_velocity_holden"]), 10)
         self.assertTrue(all(
             len(row) == 3
             for row in candidate["command"]["applied_velocity_holden"]
+        ))
+        self.assertEqual(
+            len(candidate["command"]["applied_heading_holden_wxyz"]), 10)
+        self.assertTrue(all(
+            len(row) == 4
+            for row in candidate["command"]["applied_heading_holden_wxyz"]
         ))
 
         outstanding = self.server.request(generate("r-out", "c000001"))
@@ -334,7 +342,8 @@ class ChunkServerProtocolTest(unittest.TestCase):
     def test_hello_advertises_supported_movement_models(self):
         identity = self.server.request(hello())["data"]
         self.assertEqual(
-            identity["supported_movement_models"], ["raw", "holden-v1"])
+            identity["supported_movement_models"],
+            ["raw", "holden-v1", "holden-turn-v1"])
 
     def test_reset_movement_model_evidence_defaults_to_raw(self):
         self.assertTrue(self.server.request(hello())["ok"])
@@ -360,6 +369,21 @@ class ChunkServerProtocolTest(unittest.TestCase):
             "deceleration_mps2": 2.0,
             "directional_acceleration": False,
             "turn_strength": False,
+        })
+
+    def test_reset_selects_and_records_holden_turn_v1(self):
+        self.assertTrue(self.server.request(hello())["ok"])
+        request = reset()
+        request["movement_model"] = "holden-turn-v1"
+        reset_response = self.server.request(request)
+        self.assertTrue(reset_response["ok"], reset_response)
+        self.assertEqual(reset_response["data"]["movement_model"], {
+            "profile": "holden-turn-v1",
+            "acceleration_mps2": 1.5,
+            "deceleration_mps2": 2.0,
+            "directional_acceleration": False,
+            "turn_strength": False,
+            "max_yaw_rate_deg_s": 120.0,
         })
 
     def test_reset_rejects_unknown_movement_model(self):
@@ -503,14 +527,16 @@ class ChunkServerProtocolTest(unittest.TestCase):
         self.assertEqual(response["request_id"], request_id)
 
     def test_schema_identity_matches_generated_candidate(self):
-        schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
-        self.assertEqual(schema["$id"], "mm-chunk/v1")
+        schema = json.loads(SCHEMA_V2.read_text(encoding="utf-8"))
+        self.assertEqual(schema["$id"], "mm-chunk/v2")
         self.assertFalse(schema["additionalProperties"])
         self.assertTrue(self.server.request(hello())["ok"])
         self.assertTrue(self.server.request(reset())["ok"])
         candidate = self.server.request(generate())["data"]
         self.assertEqual(candidate["schema"], schema["$id"])
         self.assertEqual(set(candidate), set(schema["required"]))
+        self.assertIn(
+            "applied_heading_holden_wxyz", candidate["command"])
 
     def test_clean_eof_and_explicit_close(self):
         self.assertTrue(self.server.request(hello())["ok"])

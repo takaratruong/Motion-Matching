@@ -1051,6 +1051,184 @@ static bool nearly(float value, float expected)
     return std::fabs(value - expected) <= 1.0e-4f;
 }
 
+static quat yaw_quat(float radians)
+{
+    return quat_from_angle_axis(radians, vec3(0.0f, 1.0f, 0.0f));
+}
+
+static float yaw_degrees(quat q)
+{
+    return 2.0f * std::atan2(q.y, q.w) * 180.0f / PIf;
+}
+
+// The turn profile caps the desired heading presented to prediction and
+// application at 120 deg/s. At the 0.04 s step this is exactly 4.8 degrees;
+// at the 1/3 s trajectory sample it is exactly 40 degrees per sample.
+static void test_turn_profile_caps_current_and_future_heading()
+{
+    database db;
+    make_database(db);
+    scene_pack scene = make_scene();
+    terrain_support_set support;
+    make_support(support, db.nframes());
+    g1_runtime_config config;
+    char error[512] = {};
+
+    g1_controller_state state;
+    check(g1_controller_state_reset(
+              state, db, support, scene, error,
+              static_cast<int>(sizeof(error))),
+          error);
+    state.movement_model_profile = G1MovementHoldenTurnV1;
+    state.desired_rotation = yaw_quat(0.0f);
+    g1_runtime_step_request request;
+    request.mode = G1RuntimeDirect;
+    request.requested_velocity_holden = vec3();
+    request.desired_heading_holden = yaw_quat(PIf);
+    request.matching_enabled = false;
+    g1_runtime_step_result result;
+    check(g1_runtime_step(
+              result, state, db, support, scene, request, config, error,
+              static_cast<int>(sizeof(error))),
+          error);
+    check(nearly(yaw_degrees(state.desired_rotation), 4.8f),
+          "current desired heading is capped to 4.8 degrees");
+    check(same_quat_bits(
+              state.command.intent.desired_heading, state.desired_rotation),
+          "command evidence uses capped current heading");
+    check(nearly(yaw_degrees(state.command.predicted_desired_headings[0]),
+                 44.8f),
+          "first future heading advances another 40 degrees");
+    check(nearly(yaw_degrees(state.command.predicted_desired_headings[3]),
+                 164.8f),
+          "future rollout advances one shared capped path");
+}
+
+static void test_turn_profile_reversal_takes_at_least_1p5_seconds()
+{
+    database db;
+    make_database(db);
+    scene_pack scene = make_scene();
+    terrain_support_set support;
+    make_support(support, db.nframes());
+    g1_runtime_config config;
+    char error[512] = {};
+
+    g1_controller_state state;
+    check(g1_controller_state_reset(
+              state, db, support, scene, error,
+              static_cast<int>(sizeof(error))),
+          error);
+    state.movement_model_profile = G1MovementHoldenTurnV1;
+    state.desired_rotation = yaw_quat(0.0f);
+    g1_runtime_step_request request;
+    request.mode = G1RuntimeDirect;
+    request.requested_velocity_holden = vec3();
+    request.desired_heading_holden = yaw_quat(PIf);
+    request.matching_enabled = false;
+
+    int steps = 0;
+    float previous = 0.0f;
+    while (yaw_degrees(state.desired_rotation) < 179.999f && steps < 100) {
+        g1_runtime_step_result result;
+        check(g1_runtime_step(
+                  result, state, db, support, scene, request, config, error,
+                  static_cast<int>(sizeof(error))),
+              error);
+        const float current = yaw_degrees(state.desired_rotation);
+        check(current - previous <= 4.8001f,
+              "each committed heading delta is at most the 4.8-degree cap");
+        check(current + 1.0e-4f >= previous,
+              "committed heading advances monotonically toward the target");
+        previous = current;
+        ++steps;
+    }
+    check(steps >= 38, "a 180-degree reversal needs at least 38 25-Hz steps");
+}
+
+static void test_raw_and_holden_v1_headings_are_exact()
+{
+    database db;
+    make_database(db);
+    scene_pack scene = make_scene();
+    terrain_support_set support;
+    make_support(support, db.nframes());
+    g1_runtime_config config;
+    char error[512] = {};
+
+    const quat requested = yaw_quat(PIf);
+    const g1_movement_model_profile profiles[] = {
+        G1MovementRaw, G1MovementHoldenV1
+    };
+    for (g1_movement_model_profile profile : profiles) {
+        g1_controller_state state;
+        check(g1_controller_state_reset(
+                  state, db, support, scene, error,
+                  static_cast<int>(sizeof(error))),
+              error);
+        state.movement_model_profile = profile;
+        state.desired_rotation = yaw_quat(0.0f);
+        g1_runtime_step_request request;
+        request.mode = G1RuntimeDirect;
+        request.requested_velocity_holden = vec3();
+        request.desired_heading_holden = requested;
+        request.matching_enabled = false;
+        g1_runtime_step_result result;
+        check(g1_runtime_step(
+                  result, state, db, support, scene, request, config, error,
+                  static_cast<int>(sizeof(error))),
+              error);
+        check(same_quat_bits(state.desired_rotation, requested),
+              "raw/holden-v1 commit the exact requested heading");
+        check(same_quat_bits(
+                  state.command.intent.desired_heading, requested),
+              "raw/holden-v1 command evidence is the exact requested heading");
+        for (int index = 0; index < G1CommandTrajectorySampleCount; ++index) {
+            check(same_quat_bits(
+                      state.command.predicted_desired_headings[index],
+                      requested),
+                  "raw/holden-v1 predicted headings equal the request exactly");
+        }
+    }
+}
+
+static void test_turn_profile_prediction_failure_is_transactional()
+{
+    database db;
+    make_database(db);
+    scene_pack scene = make_scene();
+    terrain_support_set support;
+    make_support(support, db.nframes());
+    g1_runtime_config config;
+    char error[512] = {};
+
+    g1_controller_state state;
+    check(g1_controller_state_reset(
+              state, db, support, scene, error,
+              static_cast<int>(sizeof(error))),
+          error);
+    state.movement_model_profile = G1MovementHoldenTurnV1;
+    state.desired_rotation = yaw_quat(0.3f);
+    // A non-finite trajectory sample time makes the heading prediction fail;
+    // the committed desired rotation must be preserved bit-for-bit.
+    g1_runtime_config invalid_config = config;
+    invalid_config.trajectory_sample_time =
+        std::numeric_limits<float>::quiet_NaN();
+    g1_runtime_step_request request;
+    request.mode = G1RuntimeDirect;
+    request.requested_velocity_holden = vec3();
+    request.desired_heading_holden = yaw_quat(PIf);
+    request.matching_enabled = false;
+    const quat rotation_before = state.desired_rotation;
+    g1_runtime_step_result result;
+    check(!g1_runtime_step(
+              result, state, db, support, scene, request, invalid_config,
+              error, static_cast<int>(sizeof(error))),
+          "non-finite prediction sample time fails the turn-profile step");
+    check(same_quat_bits(state.desired_rotation, rotation_before),
+          "failed turn-profile prediction preserves committed heading");
+}
+
 static void test_holden_movement_model_shapes_current_and_future()
 {
     database db;
@@ -1308,6 +1486,10 @@ int main()
     test_holden_prediction_failure_is_transactional();
     test_holden_blocked_clears_planar_movement_velocity();
     test_holden_partial_block_preserves_limited_motion();
+    test_turn_profile_caps_current_and_future_heading();
+    test_turn_profile_reversal_takes_at_least_1p5_seconds();
+    test_raw_and_holden_v1_headings_are_exact();
+    test_turn_profile_prediction_failure_is_transactional();
     test_raw_profile_preserves_generated_arrays();
     test_feasible_runtime_progression_and_masked_search();
     test_feasible_runtime_failures_are_transactional();

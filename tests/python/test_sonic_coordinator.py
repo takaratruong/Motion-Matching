@@ -626,6 +626,14 @@ class CoordinatorContractTests(unittest.TestCase):
             "holden-v1",
         )
 
+    def test_session_config_accepts_holden_turn_v1(self) -> None:
+        self.assertEqual(
+            SessionConfig(
+                "scene", "route", 4.0, "holden-turn-v1"
+            ).movement_model,
+            "holden-turn-v1",
+        )
+
     def test_session_config_rejects_unknown_movement_model(self) -> None:
         with self.assertRaisesRegex(ContractError, "movement_model"):
             SessionConfig("scene", "route", 4.0, "other")

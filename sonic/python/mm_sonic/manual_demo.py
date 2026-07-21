@@ -33,7 +33,9 @@ from .manual_evidence import (
     environment_control_record,
     manual_command_artifact_bytes,
     manual_flat_summary_v6_bytes,
+    manual_flat_summary_v8_bytes,
     manual_summary_v5_bytes,
+    manual_summary_v7_bytes,
 )
 from .operator import OperatorLimits, OperatorSampler
 from .operator_x11 import ContinuousControlLoop, X11KeyStateProvider
@@ -1004,7 +1006,18 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                     "actuator_joint_order_sha256"
                 ],
             }
-            summary_bytes = manual_flat_summary_v6_bytes(
+            is_turn_profile = namespace.movement_model == "holden-turn-v1"
+            flat_summary_builder = (
+                manual_flat_summary_v8_bytes
+                if is_turn_profile
+                else manual_flat_summary_v6_bytes
+            )
+            expected_flat_schema = (
+                "mm-sonic-manual-demo/v8"
+                if is_turn_profile
+                else "mm-sonic-manual-demo/v6"
+            )
+            summary_bytes = flat_summary_builder(
                 mode=namespace.mode,
                 run_root=str(bundle.path),
                 preload_chunks=preload_chunks,
@@ -1017,7 +1030,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                 movement_model=reset["movement_model"],
             )
             summary = json.loads(summary_bytes)
-            if summary.get("schema") != "mm-sonic-manual-demo/v6":
+            if summary.get("schema") != expected_flat_schema:
                 raise ContractError("flat manual summary schema changed")
         else:
             environment_control = environment_control_record(
@@ -1047,7 +1060,18 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                 ),
                 initial_qpos_sha256=initial_state.qpos_sha256,
             )
-            summary_bytes = manual_summary_v5_bytes(
+            is_turn_profile = namespace.movement_model == "holden-turn-v1"
+            terrain_summary_builder = (
+                manual_summary_v7_bytes
+                if is_turn_profile
+                else manual_summary_v5_bytes
+            )
+            expected_terrain_schema = (
+                "mm-sonic-manual-demo/v7"
+                if is_turn_profile
+                else "mm-sonic-manual-demo/v5"
+            )
+            summary_bytes = terrain_summary_builder(
                 mode=namespace.mode,
                 run_root=str(bundle.path),
                 preload_chunks=preload_chunks,
@@ -1060,7 +1084,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                 movement_model=reset["movement_model"],
             )
             summary = json.loads(summary_bytes)
-            if summary.get("schema") != "mm-sonic-manual-demo/v5":
+            if summary.get("schema") != expected_terrain_schema:
                 raise ContractError("terrain manual summary schema changed")
         bundle.write_bytes("manual-commands.json", command_artifact)
         bundle.write_bytes("manual-summary.json", summary_bytes)
@@ -1141,7 +1165,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--terrain-weight", type=float, default=None)
     parser.add_argument(
         "--movement-model",
-        choices=("raw", "holden-v1"),
+        choices=("raw", "holden-v1", "holden-turn-v1"),
         default="raw",
     )
     parser.add_argument(

@@ -36,6 +36,10 @@
 #endif
 
 static constexpr const char* MM_CHUNK_SCHEMA = "mm-chunk/v1";
+// Newly generated chunks always carry the v2 schema and the additional
+// applied-heading evidence. The v1 constant is retained solely for the hello
+// and reset envelopes and for historical artifact compatibility.
+static constexpr const char* MM_CHUNK_SCHEMA_V2 = "mm-chunk/v2";
 static constexpr const char* MM_CHUNK_JOINT_FEASIBILITY_SCHEMA =
     "g1-joint-feasibility-certificate/v1";
 
@@ -575,8 +579,11 @@ public:
         g1_movement_model_profile movement_profile = G1MovementRaw;
         if (request.movement_model == "holden-v1") {
             movement_profile = G1MovementHoldenV1;
+        } else if (request.movement_model == "holden-turn-v1") {
+            movement_profile = G1MovementHoldenTurnV1;
         } else if (request.movement_model != "raw") {
-            message = "movement_model must be raw or holden-v1";
+            message =
+                "movement_model must be raw, holden-v1, or holden-turn-v1";
             return false;
         }
         const g1_movement_model_config movement_config =
@@ -589,6 +596,21 @@ public:
                 0.04f,
                 movement_profile,
                 movement_config,
+                error,
+                static_cast<int>(sizeof(error)))) {
+            message = error;
+            return false;
+        }
+        // Probe the turn configuration too so an invalid fixed contract fails
+        // before any scene or state mutation.
+        quat heading_probe;
+        if (!g1_turn_model_step(
+                heading_probe,
+                quat(1.0f, 0.0f, 0.0f, 0.0f),
+                quat(1.0f, 0.0f, 0.0f, 0.0f),
+                0.04f,
+                movement_profile,
+                g1_turn_model_fixed_config(),
                 error,
                 static_cast<int>(sizeof(error)))) {
             message = error;
@@ -786,11 +808,37 @@ public:
             if (!wants_motion && state.frame_index == flat_hold_frame_) {
                 state.desired_velocity = vec3();
                 state.movement_velocity = vec3();
-                state.desired_rotation = quat(
+                const quat requested_hold_heading = quat(
                     request.desired_heading_holden_wxyz[0],
                     request.desired_heading_holden_wxyz[1],
                     request.desired_heading_holden_wxyz[2],
                     request.desired_heading_holden_wxyz[3]);
+                // Cap the hold heading against the committed anchor exactly as
+                // a moving step would, so the next moving request advances from
+                // one coherent committed anchor rather than a stale heading.
+                quat applied_hold_heading;
+                g1_runtime_config hold_config;
+                char hold_error[256] = {};
+                if (!g1_turn_model_step(
+                        applied_hold_heading,
+                        state.desired_rotation,
+                        requested_hold_heading,
+                        hold_config.dt,
+                        state.movement_model_profile,
+                        g1_turn_model_fixed_config(),
+                        hold_error,
+                        static_cast<int>(sizeof(hold_error)))) {
+                    message = hold_error;
+                    return false;
+                }
+                state.desired_rotation = applied_hold_heading;
+                state.command.intent.desired_heading = applied_hold_heading;
+                for (int index = 0;
+                     index < G1CommandTrajectorySampleCount;
+                     ++index) {
+                    state.command.predicted_desired_headings[index] =
+                        applied_hold_heading;
+                }
                 state.curr_bone_velocities.set(vec3());
                 state.curr_bone_angular_velocities.set(vec3());
                 state.trns_bone_velocities.set(vec3());
@@ -801,6 +849,14 @@ public:
                 state.bone_offset_angular_velocities.set(vec3());
                 diagnostic = mm_chunk_step_diagnostic();
                 diagnostic.selected_database_frame = flat_hold_frame_;
+                diagnostic.applied_heading_holden_wxyz[0] =
+                    applied_hold_heading.w;
+                diagnostic.applied_heading_holden_wxyz[1] =
+                    applied_hold_heading.x;
+                diagnostic.applied_heading_holden_wxyz[2] =
+                    applied_hold_heading.y;
+                diagnostic.applied_heading_holden_wxyz[3] =
+                    applied_hold_heading.z;
                 diagnostic.support_height = state.support.height;
                 diagnostic.support_target = state.support.nominal_height;
                 return true;
@@ -891,6 +947,14 @@ public:
             state.command.applied_velocity.y;
         diagnostic.applied_velocity_holden[2] =
             state.command.applied_velocity.z;
+        diagnostic.applied_heading_holden_wxyz[0] =
+            state.command.intent.desired_heading.w;
+        diagnostic.applied_heading_holden_wxyz[1] =
+            state.command.intent.desired_heading.x;
+        diagnostic.applied_heading_holden_wxyz[2] =
+            state.command.intent.desired_heading.y;
+        diagnostic.applied_heading_holden_wxyz[3] =
+            state.command.intent.desired_heading.z;
         diagnostic.support_height = state.support.height;
         diagnostic.support_target = state.support.nominal_height;
         for (int sample = 0; sample < MM_CHUNK_TERRAIN_SAMPLE_COUNT;
@@ -1322,6 +1386,14 @@ public:
             request.requested_velocity_holden[1];
         diagnostic.applied_velocity_holden[2] =
             request.requested_velocity_holden[2];
+        diagnostic.applied_heading_holden_wxyz[0] =
+            request.desired_heading_holden_wxyz[0];
+        diagnostic.applied_heading_holden_wxyz[1] =
+            request.desired_heading_holden_wxyz[1];
+        diagnostic.applied_heading_holden_wxyz[2] =
+            request.desired_heading_holden_wxyz[2];
+        diagnostic.applied_heading_holden_wxyz[3] =
+            request.desired_heading_holden_wxyz[3];
         diagnostic.support_height = static_cast<float>(state.frame) * 0.01f;
         diagnostic.support_target = diagnostic.support_height;
         for (int sample = 0; sample < MM_CHUNK_TERRAIN_SAMPLE_COUNT;
@@ -1483,7 +1555,8 @@ static std::string mm_json_hello_data(const mm_server_identity& identity)
     writer.raw(",\"skeleton_signature\":");
     writer.string(identity.skeleton_signature);
     writer.raw(",\"source_rate_hz\":25,\"supported_source_intervals\":[5,10],"
-               "\"supported_movement_models\":[\"raw\",\"holden-v1\"],"
+               "\"supported_movement_models\":"
+               "[\"raw\",\"holden-v1\",\"holden-turn-v1\"],"
                "\"build_commit\":");
     writer.string(identity.build_commit);
     writer.raw(",\"joint_contract_sha256\":");
@@ -1521,6 +1594,9 @@ static void mm_json_write_movement_model(
     writer.raw(config.directional_acceleration ? "true" : "false");
     writer.raw(",\"turn_strength\":");
     writer.raw(config.turn_strength ? "true" : "false");
+    if (profile == "holden-turn-v1") {
+        writer.raw(",\"max_yaw_rate_deg_s\":120.0");
+    }
     writer.character('}');
 }
 
@@ -1674,6 +1750,19 @@ static void mm_json_write_applied_velocities(
     writer.character(']');
 }
 
+static void mm_json_write_applied_headings(
+    mm_chunk_json_writer& writer,
+    const std::vector<mm_chunk_step_diagnostic>& steps)
+{
+    writer.character('[');
+    for (std::size_t step = 0; step < steps.size(); ++step) {
+        if (step != 0) writer.character(',');
+        mm_json_write_float_array(
+            writer, steps[step].applied_heading_holden_wxyz, 4);
+    }
+    writer.character(']');
+}
+
 static std::string mm_json_generate_data(
     const mm_chunk_generate_request& request,
     const mm_chunk_candidate& candidate,
@@ -1719,7 +1808,7 @@ static std::string mm_json_generate_data(
     }
     mm_chunk_json_writer writer;
     writer.raw("{\"schema\":");
-    writer.string(MM_CHUNK_SCHEMA);
+    writer.string(MM_CHUNK_SCHEMA_V2);
     writer.raw(",\"session_id\":");
     writer.string(request.session_id);
     writer.raw(",\"candidate_id\":");
@@ -1791,6 +1880,8 @@ static std::string mm_json_generate_data(
     mm_json_write_float_array(writer, request.desired_heading_holden_wxyz, 4);
     writer.raw(",\"applied_velocity_holden\":");
     mm_json_write_applied_velocities(writer, candidate.steps);
+    writer.raw(",\"applied_heading_holden_wxyz\":");
+    mm_json_write_applied_headings(writer, candidate.steps);
     writer.raw("},\"artifacts\":");
     mm_json_write_artifacts(writer, identity);
     writer.character('}');

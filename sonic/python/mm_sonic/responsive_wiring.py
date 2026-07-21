@@ -33,7 +33,7 @@ import numpy as np
 from .boundary_trace import BoundaryTrace
 from .coordinator import CandidateSuperseded
 from .joints import ContractError
-from .transform import holden_to_mujoco_vectors
+from .transform import holden_to_mujoco_quaternions, holden_to_mujoco_vectors
 
 
 _SUPPORTED_SOURCE_INTERVALS = (5, 10)
@@ -68,6 +68,8 @@ class AcceptedChunk:
     generated_virtual_root_displacement_mujoco: tuple[float, float, float]
     applied_velocity_mujoco_first: tuple[float, float, float]
     applied_velocity_mujoco_last: tuple[float, float, float]
+    applied_heading_mujoco_wxyz_first: tuple[float, float, float, float]
+    applied_heading_mujoco_wxyz_last: tuple[float, float, float, float]
     observed_mujoco_root_displacement: tuple[float, float, float] | None
     advance: object
 
@@ -206,6 +208,31 @@ def _applied_velocity_endpoints_mujoco(
     )
 
 
+def _applied_heading_endpoints_mujoco(
+    checked: object,
+) -> tuple[
+    tuple[float, float, float, float],
+    tuple[float, float, float, float],
+]:
+    """Transform the first/last source-step applied headings to MuJoCo.
+
+    Reads the honest per-step ``applied_heading_holden_wxyz`` produced by the
+    turn-profile server and maps both endpoints through the existing
+    Holden-to-MuJoCo quaternion helper.
+    """
+
+    command = getattr(checked, "command", None)
+    if command is None or "applied_heading_holden_wxyz" not in command:
+        raise ContractError(
+            "validated turn-profile chunk must expose applied headings"
+        )
+    rows = np.asarray(command["applied_heading_holden_wxyz"], dtype=np.float64)
+    if rows.ndim != 2 or rows.shape[0] < 1 or rows.shape[1] != 4:
+        raise ContractError("applied headings must be a nonempty Nx4 array")
+    converted = holden_to_mujoco_quaternions(rows[[0, -1]])
+    return tuple(map(float, converted[0])), tuple(map(float, converted[1]))
+
+
 def build_boundary_trace(
     prefix: object,
     accepted: AcceptedChunk,
@@ -244,6 +271,12 @@ def build_boundary_trace(
         ),
         applied_velocity_mujoco_first=accepted.applied_velocity_mujoco_first,
         applied_velocity_mujoco_last=accepted.applied_velocity_mujoco_last,
+        applied_heading_mujoco_wxyz_first=(
+            accepted.applied_heading_mujoco_wxyz_first
+        ),
+        applied_heading_mujoco_wxyz_last=(
+            accepted.applied_heading_mujoco_wxyz_last
+        ),
         observed_mujoco_root_displacement=(
             physical.observed_mujoco_root_displacement
         ),
@@ -260,9 +293,9 @@ def trace_record(trace: BoundaryTrace) -> dict:
 
     observed = trace.observed_mujoco_root_displacement
     return {
-        # Schema v2: the public field set now carries the first/last shaped
-        # applied velocities in MuJoCo coordinates.
-        "schema": "mm-sonic-responsive-boundary-trace/v2",
+        # Schema v3: the public field set now also carries the first/last
+        # capped applied headings in MuJoCo coordinates.
+        "schema": "mm-sonic-responsive-boundary-trace/v3",
         "input_transition_id": trace.input_transition_id,
         "presented_prefix_id": trace.presented_prefix_id,
         "input_observed_ns": trace.input_observed_ns,
@@ -283,6 +316,12 @@ def trace_record(trace: BoundaryTrace) -> dict:
         ),
         "applied_velocity_mujoco_last": list(
             trace.applied_velocity_mujoco_last
+        ),
+        "applied_heading_mujoco_wxyz_first": list(
+            trace.applied_heading_mujoco_wxyz_first
+        ),
+        "applied_heading_mujoco_wxyz_last": list(
+            trace.applied_heading_mujoco_wxyz_last
         ),
         "observed_mujoco_root_displacement": (
             None if observed is None else list(observed)
@@ -404,6 +443,10 @@ class ManualChunkCommitter:
         # assembly must never be the first failure after physics is released.
         generated_root_displacement = _generated_root_displacement(prepared)
         applied_first, applied_last = _applied_velocity_endpoints_mujoco(checked)
+        (
+            applied_heading_first,
+            applied_heading_last,
+        ) = _applied_heading_endpoints_mujoco(checked)
         # Guard the target's 50-Hz horizon here while the transaction remains
         # reversible. Physics duration was independently checked from sim_dt.
         published_rows = int(
@@ -458,6 +501,8 @@ class ManualChunkCommitter:
             generated_virtual_root_displacement_mujoco=generated_root_displacement,
             applied_velocity_mujoco_first=applied_first,
             applied_velocity_mujoco_last=applied_last,
+            applied_heading_mujoco_wxyz_first=applied_heading_first,
+            applied_heading_mujoco_wxyz_last=applied_heading_last,
             observed_mujoco_root_displacement=observed,
             advance=advance,
         )
