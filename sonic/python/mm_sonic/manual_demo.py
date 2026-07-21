@@ -361,6 +361,24 @@ def _run_startup_transaction(
     return StartupTransaction(hello, reset, initial, scene, initial_state)
 
 
+def _activate_scored_control(
+    gear: object, simulator: object
+) -> SimulationPolicyGate:
+    """Prepare one policy action before any scored physics release."""
+
+    gear.continue_group()
+    gear.activate_control()
+    ready = gear.wait_for_first_policy_action()
+    print(
+        "SONIC first action ready: "
+        f"index={ready['index']} policy_time={ready['time_ms']:.3f}ms",
+        flush=True,
+    )
+    gate = SimulationPolicyGate(gear, simulator)
+    gate.pause()
+    return gate
+
+
 @dataclass(frozen=True)
 class CameraDeliveryState:
     """Fail-closed state for the optional, synchronized camera channel."""
@@ -831,10 +849,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
             initial_qpos=initial_qpos,
             log_dir=bundle.path / "scored-sim-logs",
         )
-        gear.continue_group()
-        gear.activate_control()
-        gate = SimulationPolicyGate(gear, simulator)
-        gate.pause()
+        gate = _activate_scored_control(gear, simulator)
         steps_per_chunk = round(prefix_duration_s / simulator.sim_dt)
 
         camera_state = _initial_camera_delivery_state(namespace.onscreen)

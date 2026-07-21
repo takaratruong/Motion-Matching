@@ -21,6 +21,7 @@ from mm_sonic.manual_demo import (
     CameraDeliveryState,
     CommandRecorder,
     DemoDependencies,
+    _activate_scored_control,
     _consume_x11_boundary,
     _heading_frame_offset_yaw_rad,
     _initial_camera_delivery_state,
@@ -31,7 +32,7 @@ from mm_sonic.manual_demo import (
     main,
 )
 from mm_sonic.manual_evidence import parse_manual_command_artifact
-from mm_sonic.process import ProcessProtocolError
+from mm_sonic.process import ProcessError, ProcessProtocolError, SimulationPolicyGate
 
 
 def _stand(index: int) -> CommandSample:
@@ -458,6 +459,105 @@ class StartupTransactionTests(unittest.TestCase):
                 movement_model="holden-v1",
             )
         self.assertEqual(log, ["mm.hello"])
+
+
+class ScoredControlStartupTests(unittest.TestCase):
+    class _Gear:
+        def __init__(self, calls, *, barrier_error=None):
+            self.calls = calls
+            self.barrier_error = barrier_error
+            self.stopped = True
+
+        def continue_group(self):
+            self.calls.append("gear.continue_group")
+            self.stopped = False
+
+        def activate_control(self):
+            self.calls.append("gear.activate_control")
+
+        def wait_for_first_policy_action(self):
+            self.calls.append("gear.wait_for_first_policy_action")
+            if self.barrier_error is not None:
+                raise self.barrier_error
+            return {
+                "index": 1,
+                "time_ms": 20.0,
+                "time_monotonic_ms": 22.0,
+                "action": (0.25,) * 29,
+            }
+
+        def stop_group(self):
+            self.calls.append("gear.stop_group")
+            self.stopped = True
+
+        def group_is_stopped(self):
+            return self.stopped
+
+        def group_is_resumed(self):
+            return not self.stopped
+
+        @staticmethod
+        def require_alive():
+            return None
+
+    class _Simulator:
+        sim_dt = 0.005
+
+        def __init__(self, calls):
+            self.calls = calls
+            self.advance_calls = 0
+
+        def require_alive(self):
+            self.calls.append("simulator.require_alive")
+
+        def advance(self, _steps):
+            self.advance_calls += 1
+            raise AssertionError("startup must not advance physics")
+
+    def test_action_readiness_precedes_gate_pause(self):
+        calls = []
+        gear = self._Gear(calls)
+        simulator = self._Simulator(calls)
+
+        output = StringIO()
+        with redirect_stdout(output):
+            gate = _activate_scored_control(gear, simulator)
+
+        self.assertIsInstance(gate, SimulationPolicyGate)
+        self.assertEqual(
+            calls,
+            [
+                "gear.continue_group",
+                "gear.activate_control",
+                "gear.wait_for_first_policy_action",
+                "gear.stop_group",
+                "simulator.require_alive",
+            ],
+        )
+        self.assertTrue(gate.is_paused)
+        self.assertEqual(simulator.advance_calls, 0)
+        self.assertEqual(
+            output.getvalue(),
+            "SONIC first action ready: index=1 policy_time=20.000ms\n",
+        )
+
+    def test_barrier_failure_does_not_pause_gate_or_advance_physics(self):
+        calls = []
+        gear = self._Gear(calls, barrier_error=ProcessError("no action"))
+        simulator = self._Simulator(calls)
+
+        with self.assertRaisesRegex(ProcessError, "no action"):
+            _activate_scored_control(gear, simulator)
+
+        self.assertEqual(
+            calls,
+            [
+                "gear.continue_group",
+                "gear.activate_control",
+                "gear.wait_for_first_policy_action",
+            ],
+        )
+        self.assertEqual(simulator.advance_calls, 0)
 
 
 class _BoundaryMailbox:
