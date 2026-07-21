@@ -24,6 +24,7 @@ class _FakeTarget:
     def __init__(self, root_rows: np.ndarray) -> None:
         self.virtual_root_position = root_rows
         self._buffer = _FakeBuffer()
+        self._buffer.frame_index = np.arange(root_rows.shape[0], dtype=np.int64)
 
     @property
     def buffer(self) -> _FakeBuffer:
@@ -124,9 +125,10 @@ class _Fakes:
         self.log.append(f"publish:{phase}:wait={wait}")
         self._published_buffer = buffer
 
-    def release_steps(self, steps):
+    def release_steps(self, steps, *, expected_stream_frame_end=None):
         self.log.append("release")
         self.released_steps = steps
+        self.expected_stream_frame_end = expected_stream_frame_end
         self.state_rows_before = 0
         return _FakeAdvance(0, self.state_rows_after)
 
@@ -194,8 +196,10 @@ class _GateShim:
     def __init__(self, fakes):
         self._f = fakes
 
-    def release_steps(self, steps):
-        return self._f.release_steps(steps)
+    def release_steps(self, steps, *, expected_stream_frame_end=None):
+        return self._f.release_steps(
+            steps, expected_stream_frame_end=expected_stream_frame_end
+        )
 
 
 class _RecorderShim:

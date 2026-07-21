@@ -484,7 +484,12 @@ class ManualChunkCommitter:
         committed_ns = self._monotonic_ns()
 
         physics_release_requested_ns = self._monotonic_ns()
-        advance = self._gate.release_steps(self._steps_per_chunk)
+        advance = self._gate.release_steps(
+            self._steps_per_chunk,
+            expected_stream_frame_end=int(
+                prepared.target.buffer.frame_index[-1]
+            ),
+        )
         simulation_advance_completed_ns = self._monotonic_ns()
         self._recorder.record(command)
         self._next_chunk += 1

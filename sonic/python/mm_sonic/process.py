@@ -90,7 +90,7 @@ _GEAR_ACTION_HEADER = (
     *(f"act_{index}" for index in range(29)),
 )
 _GEAR_LAUNCH_PROFILES = frozenset({"zmq_stream", "loaded_motion"})
-_SIMULATION_CONTROL_READY = ("READY", "3")
+_SIMULATION_CONTROL_READY = ("READY", "4")
 _SIMULATION_CONTROL_MAX_PACKET = 256
 _SHELL_SAFE_ABSOLUTE_PATH = re.compile(r"/[A-Za-z0-9._/-]*\Z")
 _OWNED_DIRECTORY_STAGING_PREFIX = ".mm-sonic-owned-"
@@ -2640,7 +2640,7 @@ class GearProcess:
             if expected == "READY":
                 if fields != _SIMULATION_CONTROL_READY:
                     raise ProcessProtocolError(
-                        "GEAR simulation control capability is not READY/v3"
+                        "GEAR simulation control capability is not READY/v4"
                     )
                 return None
             if len(fields) != 3 or fields[0] != expected:
@@ -2660,12 +2660,15 @@ class GearProcess:
                 )
             return tick
 
-    def _send_simulation_control_packet(self, verb: str, epoch: int) -> None:
+    def _send_simulation_control_packet(
+        self, verb: str, epoch: int, stream_frame_end: int | None = None
+    ) -> None:
         channel = self._simulation_control_socket
         if channel is None:
             raise ProcessError("GEAR simulation control channel is unavailable")
         self.require_alive()
-        packet = f"{verb} {epoch}\n".encode("ascii")
+        suffix = "" if stream_frame_end is None else f" {stream_frame_end}"
+        packet = f"{verb} {epoch}{suffix}\n".encode("ascii")
         try:
             sent = channel.send(packet)
         except OSError as error:
@@ -3208,11 +3211,18 @@ class GearProcess:
         self._simulation_control_synchronized = True
         self._simulation_control_state = "paused"
 
-    def arm_simulation_control(self) -> None:
+    def arm_simulation_control(self, expected_stream_frame_end: int) -> None:
         """Arm resumption; a changed LowState tick opens policy execution."""
 
         if not self.simulation_control_gate:
             raise ProcessError("GEAR simulation control gate is not enabled")
+        if (
+            type(expected_stream_frame_end) is not int
+            or expected_stream_frame_end < 0
+        ):
+            raise ValueError(
+                "expected_stream_frame_end must be a nonnegative integer"
+            )
         if self._simulation_control_state != "paused":
             raise ProcessError("GEAR simulation control must be paused before arm")
         if not self._simulation_control_synchronized:
@@ -3221,7 +3231,9 @@ class GearProcess:
         self._simulation_control_state = "arming"
         self._simulation_control_synchronized = False
         try:
-            self._send_simulation_control_packet("ARM", epoch)
+            self._send_simulation_control_packet(
+                "ARM", epoch, expected_stream_frame_end
+            )
             tick = self._wait_simulation_control_packet("ARMED", epoch)
         except BaseException:
             self._simulation_control_state = "unknown"
@@ -3726,8 +3738,18 @@ class SimulationPolicyGate:
         self._paused = True
         self._policy_finished = True
 
-    def release_steps(self, steps: int) -> AdvanceResult:
+    def release_steps(
+        self, steps: int, *, expected_stream_frame_end: int | None = None
+    ) -> AdvanceResult:
         _positive_integer(steps, "steps")
+        if self.pause_strategy == "control-channel" and (
+            type(expected_stream_frame_end) is not int
+            or expected_stream_frame_end < 0
+        ):
+            raise ValueError(
+                "control-channel release requires a nonnegative "
+                "expected_stream_frame_end"
+            )
         self.require_paused()
         try:
             self._require_bound_sim_dt()
@@ -3770,7 +3792,10 @@ class SimulationPolicyGate:
                 if operation_error is None:
                     try:
                         self.gear.finish_simulation_control_sync()
-                        self.gear.arm_simulation_control()
+                        assert expected_stream_frame_end is not None
+                        self.gear.arm_simulation_control(
+                            expected_stream_frame_end
+                        )
                     except BaseException as error:
                         operation_error = _at_failure_site(
                             error, "process_resume"
@@ -3820,7 +3845,12 @@ class SimulationPolicyGate:
             raise _at_failure_site(error, "simulator_advance")
         return result
 
-    def advance(self, duration_s: float) -> AdvanceResult:
+    def advance(
+        self,
+        duration_s: float,
+        *,
+        expected_stream_frame_end: int | None = None,
+    ) -> AdvanceResult:
         if type(duration_s) not in (int, float) or not math.isfinite(
             float(duration_s)
         ):
@@ -3829,7 +3859,9 @@ class SimulationPolicyGate:
         nearest = round(ratio)
         if nearest <= 0 or abs(ratio - nearest) > self.tolerance:
             raise ValueError("duration / SIMULATE_DT must be an exact positive integer")
-        return self.release_steps(int(nearest))
+        return self.release_steps(
+            int(nearest), expected_stream_frame_end=expected_stream_frame_end
+        )
 
     def close(self) -> None:
         if self._closed:

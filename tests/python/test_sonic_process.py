@@ -2600,7 +2600,7 @@ class GearProcessTests(TemporaryScriptCase):
 
             flag = sys.argv.index("--sonic-simulation-control-fd")
             channel = socket.socket(fileno=int(sys.argv[flag + 1]))
-            channel.send(b"READY 3\n")
+            channel.send(b"READY 4\n")
             print("BOOT READY", flush=True)
             while True:
                 packet = channel.recv(256)
@@ -2609,7 +2609,7 @@ class GearProcessTests(TemporaryScriptCase):
                 elif packet == b"SYNC 1\n":
                     channel.send(b"SYNCING 1 100\n")
                     channel.send(b"SYNCED 1 100\n")
-                elif packet == b"ARM 1\n":
+                elif packet == b"ARM 1 20\n":
                     channel.send(b"ARMED 1 100\n")
                     channel.send(b"RUNNING 1 101\n")
                 elif packet == b"PAUSE 2\n":
@@ -2633,7 +2633,7 @@ class GearProcessTests(TemporaryScriptCase):
 
             gear.begin_simulation_control_sync()
             gear.finish_simulation_control_sync()
-            gear.arm_simulation_control()
+            gear.arm_simulation_control(20)
             self.assertFalse(gear.simulation_control_is_paused)
             gear.pause_simulation_control()
             self.assertTrue(gear.simulation_control_is_paused)
@@ -2653,7 +2653,7 @@ class GearProcessTests(TemporaryScriptCase):
 
             flag = sys.argv.index("--sonic-simulation-control-fd")
             channel = socket.socket(fileno=int(sys.argv[flag + 1]))
-            channel.send(b"READY 3\n")
+            channel.send(b"READY 4\n")
             print("BOOT READY", flush=True)
             while True:
                 packet = channel.recv(256)
@@ -2662,7 +2662,7 @@ class GearProcessTests(TemporaryScriptCase):
                 elif packet == b"SYNC 1\n":
                     channel.send(b"SYNCING 1 100\n")
                     channel.send(b"SYNCED 1 100\n")
-                elif packet == b"ARM 1\n":
+                elif packet == b"ARM 1 20\n":
                     channel.send(b"not-an-ack\n")
                 elif packet == b"PAUSE 2\n":
                     channel.send(b"PAUSED 2 100\n")
@@ -2683,7 +2683,7 @@ class GearProcessTests(TemporaryScriptCase):
             gear.finish_simulation_control_sync()
 
             with self.assertRaisesRegex(ProcessProtocolError, "expected GEAR ARMED"):
-                gear.arm_simulation_control()
+                gear.arm_simulation_control(20)
             self.assertFalse(gear.simulation_control_is_paused)
 
             gear.pause_simulation_control()
@@ -3706,8 +3706,8 @@ class FakeChannelGatedGear:
         self.events.append("gear.pause_control")
         self.paused = True
 
-    def arm_simulation_control(self):
-        self.events.append("gear.arm_control")
+    def arm_simulation_control(self, expected_stream_frame_end):
+        self.events.append(f"gear.arm_control:{expected_stream_frame_end}")
         self.paused = False
 
     def begin_simulation_control_sync(self):
@@ -3811,7 +3811,7 @@ class SimulationPolicyGateTests(TemporaryScriptCase):
         )
 
         gate.pause()
-        result = gate.advance(0.2)
+        result = gate.advance(0.2, expected_stream_frame_end=20)
 
         self.assertEqual(result.steps, 40)
         self.assertTrue(gate.is_paused)
@@ -3824,7 +3824,7 @@ class SimulationPolicyGateTests(TemporaryScriptCase):
                 "gear.begin_control_sync",
                 "simulator.refresh",
                 "gear.finish_control_sync",
-                "gear.arm_control",
+                "gear.arm_control:20",
                 "gear.pause_control",
             ],
         )
@@ -3853,10 +3853,12 @@ class SimulationPolicyGateTests(TemporaryScriptCase):
         gate.pause()
 
         with self.assertRaisesRegex(ProcessProtocolError, "channel advance"):
-            gate.release_steps(40)
+            gate.release_steps(40, expected_stream_frame_end=20)
 
         self.assertTrue(gate.is_paused)
-        self.assertEqual(gear.events[-2:], ["gear.arm_control", "gear.pause_control"])
+        self.assertEqual(
+            gear.events[-2:], ["gear.arm_control:20", "gear.pause_control"]
+        )
 
     def test_duration_must_derive_exact_positive_integer_before_resume(self):
         simulator = FakeSimulatorClient()

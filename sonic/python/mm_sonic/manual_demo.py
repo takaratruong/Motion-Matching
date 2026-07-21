@@ -515,8 +515,10 @@ def _consume_x11_boundary(
         camera_disabled_prefix=camera_disabled_prefix,
     )
 
-    generate_and_publish(command, wait=False)
-    advance = gate.release_steps(steps_per_chunk)
+    frame_end = generate_and_publish(command, wait=False)
+    advance = gate.release_steps(
+        steps_per_chunk, expected_stream_frame_end=frame_end
+    )
     velocity = command.requested_velocity_mujoco
     heading = _heading_yaw_rad(command.desired_heading_mujoco_wxyz)
     event_sink(
@@ -766,7 +768,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                 merged_count=int(buffer.frame_index[-1]) + 1,
             )
 
-    def generate_and_publish(command: CommandSample, *, wait: bool) -> None:
+    def generate_and_publish(command: CommandSample, *, wait: bool) -> int:
         nonlocal next_chunk
         assert timeline is not None
         if command.chunk_index != next_chunk:
@@ -792,6 +794,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
         timeline.commit(prepared)
         recorder.record(command)
         next_chunk += 1
+        return int(prepared.target.buffer.frame_index[-1])
 
     try:
         hello = mm.hello()
@@ -884,9 +887,11 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                     if next_chunk < len(script)
                     else _stand_command(next_chunk, last_command)
                 )
-                generate_and_publish(command, wait=False)
+                frame_end = generate_and_publish(command, wait=False)
                 last_command = command
-                advance = gate.release_steps(steps_per_chunk)
+                advance = gate.release_steps(
+                    steps_per_chunk, expected_stream_frame_end=frame_end
+                )
                 print(
                     f"boundary {consumed_chunk + 1:03d}: "
                     f"sim={advance.sim_time_end_s:.2f}s queued={next_chunk - 1:03d} "
@@ -1020,9 +1025,11 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                     command = sampler.sample_boundary(next_chunk)
                     if command is None:
                         break
-                    generate_and_publish(command, wait=False)
+                    frame_end = generate_and_publish(command, wait=False)
                     last_command = command
-                    advance = gate.release_steps(steps_per_chunk)
+                    advance = gate.release_steps(
+                        steps_per_chunk, expected_stream_frame_end=frame_end
+                    )
                     print(
                         f"boundary {consumed_chunk + 1:03d}: "
                         f"sim={advance.sim_time_end_s:.2f}s "

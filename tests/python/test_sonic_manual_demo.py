@@ -682,7 +682,9 @@ class _BoundaryGate:
     def __init__(self) -> None:
         self.releases: list[int] = []
 
-    def release_steps(self, steps: int) -> object:
+    def release_steps(
+        self, steps: int, *, expected_stream_frame_end=None
+    ) -> object:
         self.releases.append(steps)
         return object()
 
@@ -745,8 +747,8 @@ class X11BoundaryIntegrationTests(unittest.TestCase):
             control_loop=control_loop,
             simulator=simulator,
             gate=gate,
-            generate_and_publish=lambda value, *, wait: published.append(
-                (value, wait)
+            generate_and_publish=lambda value, *, wait: (
+                published.append((value, wait)) or 20
             ),
             chunk_index=12,
             steps_per_chunk=80,
@@ -791,7 +793,7 @@ class X11BoundaryIntegrationTests(unittest.TestCase):
             control_loop=_BoundaryControlLoop(command, mapped),
             simulator=_BoundarySimulator(),
             gate=_BoundaryGate(),
-            generate_and_publish=lambda value, *, wait: None,
+            generate_and_publish=lambda value, *, wait: 20,
             chunk_index=12,
             steps_per_chunk=10,
             preload_chunks=2,
@@ -817,7 +819,7 @@ class X11BoundaryIntegrationTests(unittest.TestCase):
             control_loop=_BoundaryControlLoop(command, mapped),
             simulator=simulator,
             gate=_BoundaryGate(),
-            generate_and_publish=lambda _value, *, wait: None,
+            generate_and_publish=lambda _value, *, wait: 20,
             chunk_index=12,
             steps_per_chunk=80,
             preload_chunks=2,
@@ -835,7 +837,7 @@ class X11BoundaryIntegrationTests(unittest.TestCase):
             control_loop=_BoundaryControlLoop(second_command, mapped),
             simulator=simulator,
             gate=_BoundaryGate(),
-            generate_and_publish=lambda _value, *, wait: None,
+            generate_and_publish=lambda _value, *, wait: 30,
             chunk_index=13,
             steps_per_chunk=80,
             preload_chunks=2,
@@ -928,7 +930,11 @@ class ResponsiveX11LoopTests(unittest.TestCase):
 
                 class _T:
                     virtual_root_position = np.zeros((20, 3), dtype=np.float32)
-                    buffer = object()
+                    buffer = type(
+                        "Buffer",
+                        (),
+                        {"frame_index": list(range(20))},
+                    )()
 
                 class _P:
                     target = _T()
@@ -970,7 +976,7 @@ class ResponsiveX11LoopTests(unittest.TestCase):
                 return _Checked()
 
         class _Gate:
-            def release_steps(self, steps):
+            def release_steps(self, steps, *, expected_stream_frame_end=None):
                 log.append("release")
                 return object()
 
