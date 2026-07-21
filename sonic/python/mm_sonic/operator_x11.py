@@ -33,6 +33,7 @@ KEYSYMS = {
     "Q": 0x0071,
     "E": 0x0065,
     "X": 0x0078,
+    "BACKSPACE": 0xFF08,
     "SPACE": 0x0020,
     "LEFT": 0xFF51,
     "UP": 0xFF52,
@@ -54,8 +55,9 @@ _ACTIONS = {
     "RIGHT": "camera_right",
     "UP": "camera_up",
     "DOWN": "camera_down",
-    "SPACE": "stand",
     "X": "terminate",
+    "BACKSPACE": "restart",
+    "SPACE": "stand",
     "LEFT_SHIFT": "walk",
     "LEFT_CTRL": "strafe",
 }
@@ -79,6 +81,7 @@ _X11_GRABBED_CONTROL_KEYS = (
     "Q",
     "E",
     "X",
+    "BACKSPACE",
     "SPACE",
     "LEFT",
     "UP",
@@ -336,6 +339,7 @@ class ContinuousControlLoop:
         event_sink: Callable[[str], None] | None = None,
         period_s: float = 0.02,
         cancel_event: threading.Event | None = None,
+        restart_event: threading.Event | None = None,
         join_timeout_s: float = 2.0,
     ) -> None:
         if not hasattr(provider, "sample"):
@@ -350,11 +354,16 @@ class ContinuousControlLoop:
             raise ContractError("control loop period_s must be positive and finite")
         if cancel_event is not None and not isinstance(cancel_event, threading.Event):
             raise ContractError("control loop cancel_event must be a threading.Event")
+        if restart_event is not None and not isinstance(
+            restart_event, threading.Event
+        ):
+            raise ContractError("control loop restart_event must be a threading.Event")
         self._provider = provider
         self._mapper = mapper
         self._event_sink = event_sink
         self._period_s = float(period_s)
         self._cancel_event = cancel_event
+        self._restart_event = restart_event
         self._join_timeout_s = float(join_timeout_s)
         self.mailbox = BoundaryControlMailbox()
         self._stop = threading.Event()
@@ -417,6 +426,8 @@ class ContinuousControlLoop:
             self._emit(f"KEY {key} DOWN -> {_ACTIONS[key]}")
             if key == "X" and self._cancel_event is not None:
                 self._cancel_event.set()
+            if key == "BACKSPACE" and self._restart_event is not None:
+                self._restart_event.set()
         for key in sorted(self._prev_pressed - pressed):
             self._emit(f"KEY {key} UP -> {_ACTIONS[key]}")
         self._prev_focused = focused

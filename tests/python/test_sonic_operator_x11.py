@@ -74,6 +74,10 @@ def _mapper() -> HoldenControlMapper:
 
 
 class KeysymRegistryTests(unittest.TestCase):
+    def test_registry_has_exact_backspace_keysym(self) -> None:
+        self.assertEqual(KEYSYMS["BACKSPACE"], 0xFF08)
+        self.assertIn("BACKSPACE", _X11_GRABBED_CONTROL_KEYS)
+
     def test_registry_has_exact_frozen_keysyms(self) -> None:
         self.assertEqual(
             KEYSYMS,
@@ -85,6 +89,7 @@ class KeysymRegistryTests(unittest.TestCase):
                 "Q": 0x0071,
                 "E": 0x0065,
                 "X": 0x0078,
+                "BACKSPACE": 0xFF08,
                 "SPACE": 0x0020,
                 "LEFT": 0xFF51,
                 "UP": 0xFF52,
@@ -121,6 +126,11 @@ class NormalizedStateFromPressedTests(unittest.TestCase):
 
 
 class KeyLevelsTests(unittest.TestCase):
+    def test_backspace_is_a_valid_non_locomotion_key(self) -> None:
+        levels = KeyLevels(focused=True, pressed=frozenset({"BACKSPACE"}))
+        state = normalized_state_from_pressed(levels.pressed)
+        self.assertEqual(state, NormalizedControlState())
+
     def test_rejects_unknown_key(self) -> None:
         with self.assertRaises(ContractError):
             KeyLevels(focused=True, pressed=frozenset({"Z"}))
@@ -192,6 +202,60 @@ class ContinuousControlLoopTests(unittest.TestCase):
             self.assertTrue(loop.wait_for_sequence(2, timeout_s=1.0))
             self.assertTrue(event.wait(timeout=1.0))
         self.assertTrue(event.is_set())
+
+    def test_backspace_rising_edge_sets_only_restart_event(self) -> None:
+        cancel = threading.Event()
+        restart = threading.Event()
+        events: list[str] = []
+        provider = FakeProvider([
+            KeyLevels(focused=True, pressed=frozenset()),
+            KeyLevels(focused=True, pressed=frozenset({"BACKSPACE"})),
+            KeyLevels(focused=True, pressed=frozenset({"BACKSPACE"})),
+        ])
+        loop = ContinuousControlLoop(
+            provider,
+            _mapper(),
+            event_sink=events.append,
+            period_s=0.001,
+            cancel_event=cancel,
+            restart_event=restart,
+        )
+        with loop:
+            self.assertTrue(loop.wait_for_sequence(3, timeout_s=1.0))
+        self.assertTrue(restart.is_set())
+        self.assertFalse(cancel.is_set())
+        self.assertEqual(events.count("KEY BACKSPACE DOWN -> restart"), 1)
+
+    def test_backspace_release_rearms_rising_edge(self) -> None:
+        restart = threading.Event()
+        events: list[str] = []
+        provider = FakeProvider([
+            KeyLevels(focused=True, pressed=frozenset()),
+            KeyLevels(focused=True, pressed=frozenset({"BACKSPACE"})),
+            KeyLevels(focused=True, pressed=frozenset({"BACKSPACE"})),
+            KeyLevels(focused=True, pressed=frozenset()),
+            KeyLevels(focused=True, pressed=frozenset({"BACKSPACE"})),
+        ])
+        loop = ContinuousControlLoop(
+            provider,
+            _mapper(),
+            event_sink=events.append,
+            period_s=0.001,
+            restart_event=restart,
+        )
+        with loop:
+            self.assertTrue(loop.wait_for_sequence(5, timeout_s=1.0))
+        self.assertEqual(events.count("KEY BACKSPACE DOWN -> restart"), 2)
+
+    def test_rejects_invalid_restart_event(self) -> None:
+        with self.assertRaisesRegex(
+            ContractError, "restart_event must be a threading.Event"
+        ):
+            ContinuousControlLoop(
+                SteadyProvider(KeyLevels()),
+                _mapper(),
+                restart_event=object(),
+            )
 
 
 class BoundaryControlMailboxTests(unittest.TestCase):
@@ -361,7 +425,7 @@ class IntentSnapshotTests(unittest.TestCase):
 
 
 EXPECTED_GRABBED_KEYS = (
-    "W", "A", "S", "D", "Q", "E", "X", "SPACE",
+    "W", "A", "S", "D", "Q", "E", "X", "BACKSPACE", "SPACE",
     "LEFT", "UP", "RIGHT", "DOWN",
 )
 
