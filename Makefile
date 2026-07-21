@@ -75,9 +75,13 @@ CONTROLLER_SMART_PICKUP_SOURCES := interaction_smart_pickup_controller.cpp \
   interaction_funnel_follower.cpp \
   interaction_funnel_timing.cpp interaction_funnel_worker.cpp \
   interaction_sha256.cpp
-SOURCE := controller.cpp $(INTERACTION_SOURCES) \
-  $(CONTROLLER_LOCOMOTION_SOURCES) \
-  $(CONTROLLER_SMART_PICKUP_SOURCES)
+G1_CLEARANCE_OBJECT := build/g1_clearance.o
+NATIVE_G1_HEADERS := g1_terrain_skeleton.h g1_command_runtime.h \
+  g1_controller_state.h g1_footprint_runtime.h g1_ik.h \
+  g1_ik_runtime.h g1_runtime_diagnostics.h g1_surface_query.h \
+  ik.h json_runtime.h motion_match_log.h route_runtime.h scene_runtime.h \
+  sha256.h support_runtime.h terrain_runtime.h
+SOURCE := controller.cpp
 HEADER = $(wildcard *.h)
 
 .PHONY: all bootstrap-raylib controller
@@ -98,8 +102,13 @@ verify-raylib:
 $(LINUX_CONTROLLER_DEPS): verify-raylib
 endif
 
-controller: $(SOURCE) $(HEADER) $(LINUX_CONTROLLER_DEPS)
-	$(CC) $(CONTROLLER_CXXFLAGS) -o $@$(EXT) $(SOURCE) $(CFLAGS) $(LIBS)
+$(G1_CLEARANCE_OBJECT): g1_clearance.cpp g1_clearance.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CONTROLLER_CXXFLAGS) $(DEFINES) -O3 -I. -c $< -o $@
+
+controller: $(SOURCE) $(HEADER) $(G1_CLEARANCE_OBJECT) $(LINUX_CONTROLLER_DEPS)
+	$(CC) $(CONTROLLER_CXXFLAGS) -o $@$(EXT) $(SOURCE) \
+	  $(G1_CLEARANCE_OBJECT) $(CFLAGS) $(LIBS)
 
 clean:
 	rm controller$(EXT)

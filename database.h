@@ -4,12 +4,13 @@
 #include "vec.h"
 #include "quat.h"
 #include "array.h"
-#include "locomotion_timing.h"
 
 #include <assert.h>
 #include <float.h>
 #include <stdio.h>
 #include <math.h>
+#include <stdint.h>
+#include <string.h>
 
 //--------------------------------------
 
@@ -33,6 +34,7 @@ struct database
     array2d<float> features;
     array1d<float> features_offset;
     array1d<float> features_scale;
+    array2d<float> terrain_features;
     
     array2d<bool> contact_states;
     
@@ -98,6 +100,60 @@ int database_trajectory_index_clamp(database& db, int frame, int offset)
 
 //--------------------------------------
 
+static inline uint32_t feature_float_bits(const float value)
+{
+    uint32_t bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static inline bool feature_float_is_finite(const float value)
+{
+    return (feature_float_bits(value) & UINT32_C(0x7f800000)) !=
+           UINT32_C(0x7f800000);
+}
+
+static inline bool feature_float_is_positive_finite(const float value)
+{
+    const uint32_t bits = feature_float_bits(value);
+    return (bits & UINT32_C(0x80000000)) == 0 &&
+           (bits & UINT32_C(0x7fffffff)) != 0 &&
+           (bits & UINT32_C(0x7f800000)) != UINT32_C(0x7f800000);
+}
+
+static inline bool feature_weight_is_valid(const float weight)
+{
+    const uint32_t bits = feature_float_bits(weight);
+    return (bits & UINT32_C(0x7f800000)) != UINT32_C(0x7f800000) &&
+           ((bits & UINT32_C(0x80000000)) == 0 ||
+            (bits & UINT32_C(0x7fffffff)) == 0);
+}
+
+static inline void disable_feature_group(
+    slice2d<float> features,
+    slice1d<float> features_offset,
+    slice1d<float> features_scale,
+    const int offset,
+    const int size)
+{
+    for (int j = 0; j < size; ++j)
+    {
+        if (!feature_float_is_finite(features_offset(offset + j)))
+        {
+            features_offset(offset + j) = 0.0f;
+        }
+        features_scale(offset + j) = FLT_MAX;
+    }
+
+    for (int i = 0; i < features.rows; ++i)
+    {
+        for (int j = 0; j < size; ++j)
+        {
+            features(i, offset + j) = 0.0f;
+        }
+    }
+}
+
 void normalize_feature(
     slice2d<float> features,
     slice1d<float> features_offset,
@@ -106,6 +162,26 @@ void normalize_feature(
     const int size, 
     const float weight = 1.0f)
 {
+    assert(feature_weight_is_valid(weight));
+    if (!feature_weight_is_valid(weight))
+    {
+        return;
+    }
+
+    bool has_variation = false;
+    for (int j = 0; j < size && !has_variation; ++j)
+    {
+        const uint32_t first = feature_float_bits(features(0, offset + j));
+        for (int i = 1; i < features.rows; ++i)
+        {
+            if (feature_float_bits(features(i, offset + j)) != first)
+            {
+                has_variation = true;
+                break;
+            }
+        }
+    }
+
     // First compute what is essentially the mean 
     // value for each feature dimension
     for (int j = 0; j < size; j++)
@@ -121,6 +197,23 @@ void normalize_feature(
         }
     }
     
+    // A zero-weight group is explicitly disabled. Keep its raw mean for safe
+    // denormalization, but do not evaluate variance or any FLT_MAX arithmetic.
+    if (weight == 0.0f)
+    {
+        disable_feature_group(
+            features, features_offset, features_scale, offset, size);
+        return;
+    }
+
+    assert(has_variation);
+    if (!has_variation)
+    {
+        disable_feature_group(
+            features, features_offset, features_scale, offset, size);
+        return;
+    }
+
     // Now compute the variance of each feature dimension
     array1d<float> vars(size);
     vars.zero();
@@ -143,12 +236,30 @@ void normalize_feature(
     
     // Features with no variation can have zero std which is
     // almost always a bug.
-    assert(std > 0.0);
+    assert(feature_float_is_positive_finite(std));
+    if (!feature_float_is_positive_finite(std))
+    {
+        disable_feature_group(
+            features, features_offset, features_scale, offset, size);
+        return;
+    }
+
+    const float scale = std / weight;
+    const bool scale_valid =
+        feature_float_is_positive_finite(scale) &&
+        feature_float_bits(scale) != feature_float_bits(FLT_MAX);
+    assert(scale_valid);
+    if (!scale_valid)
+    {
+        disable_feature_group(
+            features, features_offset, features_scale, offset, size);
+        return;
+    }
     
     // The scale of a feature is just the std divided by the weight
     for (int j = 0; j < size; j++)
     {
-        features_scale(offset + j) = std / weight;
+        features_scale(offset + j) = scale;
     }
     
     // Using the offset and scale we can then normalize the features
@@ -161,6 +272,21 @@ void normalize_feature(
     }
 }
 
+static inline bool feature_scale_is_disabled(const float scale)
+{
+    return feature_float_bits(scale) == feature_float_bits(FLT_MAX);
+}
+
+static inline float normalize_query_feature(
+    const float value,
+    const float offset,
+    const float scale)
+{
+    return feature_scale_is_disabled(scale)
+        ? 0.0f
+        : (value - offset) / scale;
+}
+
 void denormalize_features(
     slice1d<float> features,
     const slice1d<float> features_offset,
@@ -168,7 +294,9 @@ void denormalize_features(
 {
     for (int i = 0; i < features.size; i++)
     {
-        features(i) = (features(i) * features_scale(i)) + features_offset(i);
+        features(i) = feature_scale_is_disabled(features_scale(i))
+            ? features_offset(i)
+            : (features(i) * features_scale(i)) + features_offset(i);
     }  
 }
 
@@ -441,17 +569,24 @@ void compute_bone_velocity_feature(database& db, int& offset, int bone, float we
     offset += 3;
 }
 
-// Compute the trajectory at the shared 25 Hz query horizons.
+static inline void database_trajectory_horizons(int out[3])
+{
+    out[0] = 8;
+    out[1] = 17;
+    out[2] = 25;
+}
+
+// Compute the trajectory at one-third, two-thirds, and one second in the future
 void compute_trajectory_position_feature(database& db, int& offset, float weight = 1.0f)
 {
+    int horizons[3];
+    database_trajectory_horizons(horizons);
+
     for (int i = 0; i < db.nframes(); i++)
     {
-        int t0 = database_trajectory_index_clamp(
-            db, i, locomotion_timing::kTrajectoryFrameOffsets[0]);
-        int t1 = database_trajectory_index_clamp(
-            db, i, locomotion_timing::kTrajectoryFrameOffsets[1]);
-        int t2 = database_trajectory_index_clamp(
-            db, i, locomotion_timing::kTrajectoryFrameOffsets[2]);
+        int t0 = database_trajectory_index_clamp(db, i, horizons[0]);
+        int t1 = database_trajectory_index_clamp(db, i, horizons[1]);
+        int t2 = database_trajectory_index_clamp(db, i, horizons[2]);
         
         vec3 trajectory_pos0 = quat_mul_vec3(quat_inv(db.bone_rotations(i, 0)), db.bone_positions(t0, 0) - db.bone_positions(i, 0));
         vec3 trajectory_pos1 = quat_mul_vec3(quat_inv(db.bone_rotations(i, 0)), db.bone_positions(t1, 0) - db.bone_positions(i, 0));
@@ -473,14 +608,14 @@ void compute_trajectory_position_feature(database& db, int& offset, float weight
 // Same for direction
 void compute_trajectory_direction_feature(database& db, int& offset, float weight = 1.0f)
 {
+    int horizons[3];
+    database_trajectory_horizons(horizons);
+
     for (int i = 0; i < db.nframes(); i++)
     {
-        int t0 = database_trajectory_index_clamp(
-            db, i, locomotion_timing::kTrajectoryFrameOffsets[0]);
-        int t1 = database_trajectory_index_clamp(
-            db, i, locomotion_timing::kTrajectoryFrameOffsets[1]);
-        int t2 = database_trajectory_index_clamp(
-            db, i, locomotion_timing::kTrajectoryFrameOffsets[2]);
+        int t0 = database_trajectory_index_clamp(db, i, horizons[0]);
+        int t1 = database_trajectory_index_clamp(db, i, horizons[1]);
+        int t2 = database_trajectory_index_clamp(db, i, horizons[2]);
         
         vec3 trajectory_dir0 = quat_mul_vec3(quat_inv(db.bone_rotations(i, 0)), quat_mul_vec3(db.bone_rotations(t0, 0), vec3(0, 0, 1)));
         vec3 trajectory_dir1 = quat_mul_vec3(quat_inv(db.bone_rotations(i, 0)), quat_mul_vec3(db.bone_rotations(t1, 0), vec3(0, 0, 1)));
@@ -497,6 +632,57 @@ void compute_trajectory_direction_feature(database& db, int& offset, float weigh
     normalize_feature(db.features, db.features_offset, db.features_scale, offset, 6, weight);
 
     offset += 6;
+}
+
+static inline void compute_terrain_feature(
+    database& db, int& offset, const float weight)
+{
+    assert(db.terrain_features.rows == db.nframes());
+    assert(db.terrain_features.cols == 4);
+
+    for (int i = 0; i < db.nframes(); ++i)
+    {
+        for (int j = 0; j < 4; ++j)
+        {
+            db.features(i, offset + j) = db.terrain_features(i, j);
+        }
+    }
+
+    normalize_feature(
+        db.features, db.features_offset, db.features_scale, offset, 4, weight);
+    offset += 4;
+}
+
+static inline float database_frame_cost(
+    const database& db, const int frame, const slice1d<float> query)
+{
+    assert(frame >= 0 && frame < db.nframes());
+    assert(query.size == db.nfeatures());
+
+    float cost = 0.0f;
+    for (int i = 0; i < db.nfeatures(); ++i)
+    {
+        const float normalized = normalize_query_feature(
+            query(i), db.features_offset(i), db.features_scale(i));
+        cost += squaref(normalized - db.features(frame, i));
+    }
+    return cost;
+}
+
+static inline float database_raw_terrain_error(
+    const database& db, const int frame, const slice1d<float> query)
+{
+    assert(frame >= 0 && frame < db.nframes());
+    assert(query.size >= 31);
+    assert(db.terrain_features.rows == db.nframes());
+    assert(db.terrain_features.cols == 4);
+
+    float error = 0.0f;
+    for (int j = 0; j < 4; ++j)
+    {
+        error += squaref(query(27 + j) - db.terrain_features(frame, j));
+    }
+    return error;
 }
 
 // Build the Motion Matching search acceleration structure. Here we
@@ -539,8 +725,41 @@ void database_build_matching_features(
     const float feature_weight_foot_velocity,
     const float feature_weight_hip_velocity,
     const float feature_weight_trajectory_positions,
-    const float feature_weight_trajectory_directions)
+    const float feature_weight_trajectory_directions,
+    const int left_foot_bone,
+    const int right_foot_bone,
+    const int hip_bone,
+    const float feature_weight_terrain = 0.0f)
 {
+    if (left_foot_bone < 0 || left_foot_bone >= db.nbones() ||
+        right_foot_bone < 0 || right_foot_bone >= db.nbones() ||
+        hip_bone < 0 || hip_bone >= db.nbones())
+    {
+        return;
+    }
+
+    const float feature_weights[6] = {
+        feature_weight_foot_position,
+        feature_weight_foot_velocity,
+        feature_weight_hip_velocity,
+        feature_weight_trajectory_positions,
+        feature_weight_trajectory_directions,
+        feature_weight_terrain
+    };
+    for (int i = 0; i < 6; ++i)
+    {
+        if (!feature_weight_is_valid(feature_weights[i]))
+        {
+            return;
+        }
+    }
+
+    if (db.terrain_features.rows != db.nframes() ||
+        db.terrain_features.cols != 4)
+    {
+        return;
+    }
+
     int nfeatures = 
         3 + // Left Foot Position
         3 + // Right Foot Position 
@@ -548,25 +767,22 @@ void database_build_matching_features(
         3 + // Right Foot Velocity
         3 + // Hip Velocity
         6 + // Trajectory Positions 2D
-        6 ; // Trajectory Directions 2D
+        6 + // Trajectory Directions 2D
+        4 ; // Terrain Centerline Heights
         
     db.features.resize(db.nframes(), nfeatures);
     db.features_offset.resize(nfeatures);
     db.features_scale.resize(nfeatures);
     
-    // G1 31-bone skeleton indices (index 0 = Simulation bone):
-    //   Hips=1, LeftAnkle=6, LeftToe=7, RightAnkle=12, RightToe=13.
-    // Holden's Bone_LeftFoot(4)/Bone_RightFoot(8) map to HIP joints on the G1,
-    // so match on the G1 foot (ankle) bones instead.
-    const int G1_LeftFoot = 6, G1_RightFoot = 12, G1_Hips = 1;
     int offset = 0;
-    compute_bone_position_feature(db, offset, G1_LeftFoot, feature_weight_foot_position);
-    compute_bone_position_feature(db, offset, G1_RightFoot, feature_weight_foot_position);
-    compute_bone_velocity_feature(db, offset, G1_LeftFoot, feature_weight_foot_velocity);
-    compute_bone_velocity_feature(db, offset, G1_RightFoot, feature_weight_foot_velocity);
-    compute_bone_velocity_feature(db, offset, G1_Hips, feature_weight_hip_velocity);
+    compute_bone_position_feature(db, offset, left_foot_bone, feature_weight_foot_position);
+    compute_bone_position_feature(db, offset, right_foot_bone, feature_weight_foot_position);
+    compute_bone_velocity_feature(db, offset, left_foot_bone, feature_weight_foot_velocity);
+    compute_bone_velocity_feature(db, offset, right_foot_bone, feature_weight_foot_velocity);
+    compute_bone_velocity_feature(db, offset, hip_bone, feature_weight_hip_velocity);
     compute_trajectory_position_feature(db, offset, feature_weight_trajectory_positions);
     compute_trajectory_direction_feature(db, offset, feature_weight_trajectory_directions);
+    compute_terrain_feature(db, offset, feature_weight_terrain);
     
     assert(offset == nfeatures);
     
@@ -595,6 +811,11 @@ void motion_matching_search(
     const int ignore_range_end,
     const int ignore_surrounding)
 {
+    // Keep strict header builds warning-clean while these legacy public API
+    // parameters remain unused by the normalized-distance implementation.
+    (void)features_offset;
+    (void)features_scale;
+
     int nfeatures = query_normalized.size;
     int nranges = range_starts.size;
     
@@ -721,7 +942,8 @@ void database_search(
     array1d<float> query_normalized(db.nfeatures());
     for (int i = 0; i < db.nfeatures(); i++)
     {
-        query_normalized(i) = (query(i) - db.features_offset(i)) / db.features_scale(i);
+        query_normalized(i) = normalize_query_feature(
+            query(i), db.features_offset(i), db.features_scale(i));
     }
     
     // Search
