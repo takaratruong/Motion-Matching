@@ -2183,6 +2183,7 @@ int main(void)
     interaction::SmartPickupPostStepResult smart_pickup_post_step{};
     std::optional<interaction::PlaceStagingPreview> native_place_preview;
     bool native_place_latched = false;
+    bool interaction_reset_pending = false;
     uint64_t native_place_request_id = 0U;
     uint64_t interaction_next_request_id = 1U;
     uint64_t smart_pickup_controller_tick = 0U;
@@ -2461,7 +2462,19 @@ int main(void)
         if (::IsKeyPressed(KEY_B)) show_g1_bones = !show_g1_bones;
 
         const bool scene_reset_requested = pending_reset;
-        if (pending_reset)
+        const interaction::RuntimeState interaction_state_before_scene =
+            interaction_runtime.state();
+        const bool interaction_busy_before_scene =
+            interaction_state_before_scene !=
+                interaction::RuntimeState::Locomotion &&
+            interaction_state_before_scene !=
+                interaction::RuntimeState::Disabled;
+        if ((pending_reset || pending_scene_index >= 0) &&
+            interaction_busy_before_scene)
+        {
+            interaction_reset_pending = true;
+        }
+        if (pending_reset && !interaction_busy_before_scene)
         {
             if (!scene_reset_current(
                     state,
@@ -2482,7 +2495,8 @@ int main(void)
             pending_reset = false;
             if (controller_exit_requested) return;
         }
-        if (pending_scene_index >= 0 && !controller_exit_requested)
+        if (pending_scene_index >= 0 && !controller_exit_requested &&
+            !interaction_busy_before_scene)
         {
             const int target = pending_scene_index;
             pending_scene_index = -1;
@@ -2568,8 +2582,12 @@ int main(void)
 
         const bool smart_pickup_interact_pressed = IsKeyPressed(KEY_F);
         const bool smart_pickup_cancel_pressed = IsKeyPressed(KEY_X);
-        const bool smart_pickup_reset_pressed =
-            IsKeyPressed(KEY_R) || scene_reset_requested;
+        if (IsKeyPressed(KEY_R) ||
+            (scene_reset_requested && interaction_busy_before_scene))
+        {
+            interaction_reset_pending = true;
+        }
+        const bool smart_pickup_reset_pressed = interaction_reset_pending;
         const bool smart_pickup_manual_override_pressed =
             IsKeyPressed(KEY_W) || IsKeyPressed(KEY_A) ||
             IsKeyPressed(KEY_S) || IsKeyPressed(KEY_D);
@@ -3983,6 +4001,14 @@ int main(void)
             !smart_pickup_pre_step.cancel_consumed;
         interaction_input.reset_pressed = smart_pickup_reset_pressed;
         interaction_output = interaction_runtime.update(interaction_input);
+        if (interaction_reset_pending &&
+            (interaction_output.diagnostics.state ==
+                interaction::RuntimeState::Locomotion ||
+             interaction_output.diagnostics.state ==
+                interaction::RuntimeState::Disabled))
+        {
+            interaction_reset_pending = false;
+        }
         if (pending_native_place_request.has_value() ||
             interaction_output.diagnostics.state !=
                 interaction::RuntimeState::Carry)

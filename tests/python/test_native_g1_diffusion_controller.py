@@ -116,6 +116,13 @@ class NativeG1ControllerTests(unittest.TestCase):
 
     def test_reset_releases_without_bypassing_handoff(self):
         self.assertIn("const bool scene_reset_requested = pending_reset", SOURCE)
+        self.assertIn("bool interaction_reset_pending = false", SOURCE)
+        self.assertIn("interaction_reset_pending = true", SOURCE)
+        self.assertIn(
+            "interaction_output.diagnostics.state ==\n"
+            "                interaction::RuntimeState::Locomotion",
+            SOURCE,
+        )
         self.assertIn(
             "smart_pickup_cancel_pressed || smart_pickup_reset_pressed",
             SOURCE,
