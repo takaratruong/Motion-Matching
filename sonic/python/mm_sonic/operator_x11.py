@@ -395,6 +395,17 @@ class ContinuousControlLoop:
                 self._cond.wait(remaining)
             return self._sequence >= count
 
+    def raise_if_failed(self) -> None:
+        """Surface a terminal sampler failure without waiting for context exit."""
+
+        with self._cond:
+            error = self._error
+            finished = self._finished.is_set()
+        if error is not None:
+            raise error
+        if finished:
+            raise ContractError("control loop stopped before viewer acquisition")
+
     def _emit(self, message: str) -> None:
         if self._event_sink is not None:
             self._event_sink(message)

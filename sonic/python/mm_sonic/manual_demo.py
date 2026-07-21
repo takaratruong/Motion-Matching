@@ -12,7 +12,6 @@ import os
 from pathlib import Path
 import sys
 import threading
-import time
 from typing import Callable
 
 import numpy as np
@@ -102,24 +101,24 @@ def _wait_for_x11_target(
     provider: X11KeyStateProvider,
     control_loop: ContinuousControlLoop,
     *,
-    timeout_s: float = 2.0,
+    cancellation: threading.Event,
+    poll_s: float = 0.25,
 ) -> None:
-    """Wait until a sampled focused viewer already has passive key grabs."""
+    """Wait for operator focus until grabs bind, cancellation, or loop failure."""
 
-    deadline = time.monotonic() + float(timeout_s)
-    sequence = 1
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0.0 or not control_loop.wait_for_sequence(
-            sequence, timeout_s=remaining
-        ):
-            break
-        if provider.target_bound:
-            return
-        sequence += 1
-    raise ContractError(
-        "continuous X11 control did not acquire the focused MuJoCo viewer"
+    print(
+        "FOCUS THE MUJOCO VIEWER: waiting to capture Sonic controls...",
+        flush=True,
     )
+    sequence = 1
+    while not cancellation.is_set():
+        if control_loop.wait_for_sequence(sequence, timeout_s=poll_s):
+            if provider.target_bound:
+                return
+            sequence += 1
+            continue
+        control_loop.raise_if_failed()
+    raise ContractError("X11 viewer acquisition was cancelled")
 
 
 def _horizon_seconds(source_intervals: int) -> float:
@@ -947,7 +946,11 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                     cancel_event=cancellation,
                 ) as control_loop:
                     def wait_for_initial_input() -> None:
-                        _wait_for_x11_target(provider, control_loop)
+                        _wait_for_x11_target(
+                            provider,
+                            control_loop,
+                            cancellation=cancellation,
+                        )
                         print(
                             "LIVE X11: W/A/S/D move, Shift walk, "
                             "Ctrl+arrows strafe/face, arrows orbit camera, "

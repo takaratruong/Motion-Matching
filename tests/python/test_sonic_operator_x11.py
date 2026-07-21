@@ -165,9 +165,10 @@ class ContinuousControlLoopTests(unittest.TestCase):
 
     def test_provider_exception_is_fatal(self) -> None:
         loop = ContinuousControlLoop(RaisingProvider(), _mapper(), period_s=0.001)
-        with self.assertRaises(ContractError):
+        with self.assertRaisesRegex(ContractError, "provider failed"):
             with loop:
-                loop.wait_for_sequence(1, timeout_s=1.0)
+                self.assertFalse(loop.wait_for_sequence(1, timeout_s=1.0))
+                loop.raise_if_failed()
 
     def test_absent_samples_beyond_staleness_are_fatal(self) -> None:
         loop = ContinuousControlLoop(AbsentProvider(), _mapper(), period_s=0.001)

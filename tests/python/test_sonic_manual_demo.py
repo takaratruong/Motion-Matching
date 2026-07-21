@@ -51,6 +51,7 @@ class _StopAfterSimulator(Exception):
 class X11TargetReadinessTests(unittest.TestCase):
     def test_waits_for_a_published_sample_with_a_bound_target(self) -> None:
         provider = type("Provider", (), {"target_bound": False})()
+        cancellation = threading.Event()
 
         class Loop:
             calls: list[int] = []
@@ -61,19 +62,64 @@ class X11TargetReadinessTests(unittest.TestCase):
                     provider.target_bound = True
                 return True
 
-        loop = Loop()
-        _wait_for_x11_target(provider, loop, timeout_s=1.0)
-        self.assertEqual(loop.calls, [1, 2])
+            def raise_if_failed(self):
+                raise AssertionError("healthy loop must not be treated as failed")
 
-    def test_rejects_initial_samples_without_a_focused_bound_target(self) -> None:
+        loop = Loop()
+        output = StringIO()
+        with redirect_stdout(output):
+            _wait_for_x11_target(
+                provider,
+                loop,
+                cancellation=cancellation,
+                poll_s=0.01,
+            )
+        self.assertEqual(loop.calls, [1, 2])
+        self.assertIn("FOCUS THE MUJOCO VIEWER", output.getvalue())
+
+    def test_wait_is_operator_driven_until_cancelled(self) -> None:
+        provider = type("Provider", (), {"target_bound": False})()
+        cancellation = threading.Event()
+
+        class Loop:
+            calls = 0
+
+            def wait_for_sequence(self, sequence, timeout_s):
+                self.calls += 1
+                if self.calls == 3:
+                    cancellation.set()
+                return False
+
+            def raise_if_failed(self):
+                return None
+
+        with self.assertRaisesRegex(ContractError, "cancelled"):
+            with redirect_stdout(StringIO()):
+                _wait_for_x11_target(
+                    provider,
+                    Loop(),
+                    cancellation=cancellation,
+                    poll_s=0.01,
+                )
+
+    def test_surfaces_control_loop_failure_while_waiting_for_focus(self) -> None:
         provider = type("Provider", (), {"target_bound": False})()
 
         class Loop:
             def wait_for_sequence(self, sequence, timeout_s):
                 return False
 
-        with self.assertRaisesRegex(ContractError, "focused MuJoCo"):
-            _wait_for_x11_target(provider, Loop(), timeout_s=0.01)
+            def raise_if_failed(self):
+                raise ContractError("provider disconnected")
+
+        with self.assertRaisesRegex(ContractError, "provider disconnected"):
+            with redirect_stdout(StringIO()):
+                _wait_for_x11_target(
+                    provider,
+                    Loop(),
+                    cancellation=threading.Event(),
+                    poll_s=0.01,
+                )
 
 
 class SimulatorFreezeWiringTests(unittest.TestCase):
