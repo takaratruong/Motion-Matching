@@ -7,6 +7,34 @@ SOURCE = (ROOT / "controller.cpp").read_text(encoding="utf-8")
 
 
 class DiffusionPickupG1MeshIntegrationTests(unittest.TestCase):
+    def test_mesh_uses_locomotion_calibrated_reference(self):
+        calibration = SOURCE.index(
+            "const interaction::Pose mesh_reference_pose ="
+        )
+        self.assertIn(
+            "interaction::calibrate_flat_mesh_reference(\n"
+            "            interaction_reference_pose,\n"
+            "            interaction_flat_reference_pose)",
+            SOURCE[calibration:],
+        )
+
+        expansion = SOURCE.index(
+            "interaction::FlatControllerPose mesh_flat_pose", calibration
+        )
+        update = SOURCE.index("::g1_mesh_renderer_update(", expansion)
+        mesh_render_path = SOURCE[expansion:update]
+        self.assertIn(
+            "mesh_flat_pose,\n"
+            "                mesh_reference_pose,\n"
+            "                interaction_flat_reference_pose",
+            mesh_render_path,
+        )
+        self.assertNotIn(
+            "mesh_flat_pose,\n"
+            "                interaction_reference_pose,",
+            mesh_render_path,
+        )
+
     def test_mesh_consumes_only_final_global_pose(self):
         self.assertIn('#include "g1_mesh_renderer.h"', SOURCE)
         self.assertIn("bool show_g1_mesh = true;", SOURCE)

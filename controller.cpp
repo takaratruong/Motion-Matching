@@ -4506,6 +4506,10 @@ int main(void)
         interaction_flat_reference_pose.rotations[0];
     interaction_reference_pose.angular_velocities[interaction_root] =
         interaction_flat_reference_pose.angular_velocities[0];
+    const interaction::Pose mesh_reference_pose =
+        interaction::calibrate_flat_mesh_reference(
+            interaction_reference_pose,
+            interaction_flat_reference_pose);
 
 #ifdef MM_DISCRETE
     // Optional env overrides so we can sweep halflife without recompiling.
@@ -6368,7 +6372,7 @@ int main(void)
         const interaction::Pose mesh_pose =
             interaction::expand_flat_controller_pose(
                 mesh_flat_pose,
-                interaction_reference_pose,
+                mesh_reference_pose,
                 interaction_flat_reference_pose);
         interaction::WorldPose mesh_world_pose =
             interaction::world_pose(mesh_pose);

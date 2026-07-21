@@ -639,6 +639,55 @@ void test_calibrated_flat_bridge_reference_is_exact_true_g1_pose() {
         "calibrated expansion changed its exact true-G1 reference pose");
 }
 
+void test_mesh_reference_calibration_uses_flat_locomotion_arm_posture() {
+    const FlatControllerPose flat_reference = make_flat_pose();
+    const Pose pickup_geometry_reference =
+        make_adversarial_true_g1_reference();
+    const Pose pickup_geometry_reference_before = pickup_geometry_reference;
+    const FlatControllerPose flat_reference_before = flat_reference;
+
+    const Pose mesh_reference =
+        interaction::calibrate_flat_mesh_reference(
+            pickup_geometry_reference, flat_reference);
+    const FlatWorldPose flat_world = flat_world_pose(flat_reference);
+    const interaction::WorldPose mesh_world =
+        interaction::world_pose(mesh_reference);
+
+    for (const interaction::FlatControllerAnchor anchor :
+         interaction::kFlatControllerAnchors) {
+        require_same_rotation(
+            mesh_world.rotations[anchor.g1_bone],
+            flat_world.rotations[anchor.flat_bone],
+            "mesh calibration retained the pickup posture at a mapped joint",
+            3.0e-4F);
+    }
+    for (size_t bone = 1; bone < g1_skeleton::BoneCount; ++bone) {
+        require(
+            vec_bits_equal(
+                mesh_reference.positions[bone],
+                pickup_geometry_reference.positions[bone]),
+            "mesh calibration warped true-G1 geometry");
+    }
+    for (size_t bone = 0; bone < g1_skeleton::BoneCount; ++bone) {
+        require(
+            vec_bits_equal(mesh_reference.velocities[bone], vec3()) &&
+                vec_bits_equal(
+                    mesh_reference.angular_velocities[bone], vec3()),
+            "mesh calibration retained dynamic pickup channels");
+    }
+    require(
+        mesh_reference.hand_dof == pickup_geometry_reference.hand_dof &&
+            mesh_reference.hand_dof_velocities ==
+                interaction::kFlatControllerRestHandDofVelocities &&
+            mesh_reference.foot_contacts == flat_reference.foot_contacts,
+        "mesh calibration changed hand geometry or retained dynamic channels");
+    require(
+        pose_bits_equal(
+            pickup_geometry_reference, pickup_geometry_reference_before) &&
+            flat_pose_bits_equal(flat_reference, flat_reference_before),
+        "mesh calibration mutated its source references");
+}
+
 void test_calibrated_flat_bridge_transfers_supported_world_deltas() {
     const FlatControllerPose flat_reference = make_flat_pose();
     FlatControllerPose flat_current = flat_reference;
@@ -6801,6 +6850,11 @@ void test_controller_and_make_clock_policy() {
 
 int main(int argc, char** argv) {
     if (argc == 2 &&
+        std::strcmp(argv[1], "--mesh-reference-calibration") == 0) {
+        test_mesh_reference_calibration_uses_flat_locomotion_arm_posture();
+        return 0;
+    }
+    if (argc == 2 &&
         std::strcmp(argv[1], "--post-release-arm-fast-math-canary") == 0) {
         test_place_release_active_arm_return_is_bounded_after_ownership();
         return 0;
@@ -6809,6 +6863,7 @@ int main(int argc, char** argv) {
     test_flat_bridge_exact_parent_tree_anchor_map_and_unmapped_head();
     test_flat_bridge_expansion_matches_every_world_anchor_and_retains_reference();
     test_calibrated_flat_bridge_reference_is_exact_true_g1_pose();
+    test_mesh_reference_calibration_uses_flat_locomotion_arm_posture();
     test_calibrated_flat_bridge_transfers_supported_world_deltas();
     test_calibrated_flat_bridge_round_trips_representable_flat_pose();
     test_calibrated_flat_bridge_projects_nonrepresentable_flat_morphology();

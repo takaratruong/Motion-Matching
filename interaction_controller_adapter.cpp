@@ -927,6 +927,26 @@ Pose expand_flat_controller_pose(
     return expanded;
 }
 
+Pose calibrate_flat_mesh_reference(
+    const Pose& geometry_reference,
+    const FlatControllerPose& flat_reference) {
+    Pose calibrated = expand_flat_controller_pose(
+        flat_reference, geometry_reference);
+
+    // The absolute bridge solves mapped G1 channels against the flat walking
+    // pose. Restore authored non-root offsets so rendering keeps G1 morphology
+    // instead of inheriting the LAFAN skeleton's segment lengths.
+    for (size_t bone = 1; bone < g1_skeleton::BoneCount; ++bone) {
+        calibrated.positions[bone] = geometry_reference.positions[bone];
+    }
+    calibrated.velocities.fill(vec3());
+    calibrated.angular_velocities.fill(vec3());
+    calibrated.hand_dof_velocities = kFlatControllerRestHandDofVelocities;
+    calibrated.foot_contacts = flat_reference.foot_contacts;
+    validate_interaction_pose(calibrated);
+    return calibrated;
+}
+
 Pose expand_flat_controller_pose(
     const FlatControllerPose& flat_pose,
     const Pose& interaction_reference,

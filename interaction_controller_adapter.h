@@ -72,6 +72,11 @@ struct FlatControllerPose {
 Pose expand_flat_controller_pose(
     const FlatControllerPose& flat_pose,
     const Pose& interaction_reference);
+// Builds a rendering-only G1 reference whose mapped world rotations follow the
+// flat locomotion reference while retaining the authored G1 bone geometry.
+Pose calibrate_flat_mesh_reference(
+    const Pose& geometry_reference,
+    const FlatControllerPose& flat_reference);
 // Expands the representable flat-controller subspace around a fixed reference
 // pair. Root translation/velocity and mapped world rotation/angular-velocity
 // deltas are transferred; true-G1 non-root translation/velocity morphology and
