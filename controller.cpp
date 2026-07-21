@@ -249,6 +249,40 @@ static bool g1_parse_terrain_weight(
     return true;
 }
 
+static bool g1_parse_flat_interaction_terrain(
+    bool& enabled, char* error, const int error_capacity)
+{
+    const char* value = getenv("MM_INTERACTION_FLAT_TERRAIN");
+    if (value == NULL || strcmp(value, "0") == 0)
+    {
+        enabled = false;
+        return true;
+    }
+    if (strcmp(value, "1") == 0)
+    {
+        enabled = true;
+        return true;
+    }
+    return g1_error(
+        error,
+        error_capacity,
+        "MM_INTERACTION_FLAT_TERRAIN must be 0 or 1, got '%s'",
+        value);
+}
+
+static void flatten_interaction_scene(scene_pack& scene)
+{
+    scene.terrain.exterior_height = 0.0F;
+    for (int index = 0; index < scene.terrain.heights.size; ++index)
+    {
+        scene.terrain.heights(index) = 0.0F;
+    }
+    for (int index = 0; index < scene.walkability.cells.size; ++index)
+    {
+        scene.walkability.cells(index) = 1U;
+    }
+}
+
 static bool g1_parse_test_frames(
     int& frame_limit, char* error, const int error_capacity)
 {
@@ -1811,6 +1845,7 @@ int main(void)
     float feature_weight_trajectory_positions = 1.0f;
     float feature_weight_trajectory_directions = 1.5f;
     float parsed_terrain_weight = 0.0f;
+    bool flat_interaction_terrain = false;
     g1_test_config test_config;
     G1TestHeadingOverride test_heading;
     if (!g1_parse_terrain_weight(
@@ -1819,6 +1854,10 @@ int main(void)
             static_cast<int>(sizeof(artifact_error))) ||
         !g1_parse_test_config(
             test_config,
+            artifact_error,
+            static_cast<int>(sizeof(artifact_error))) ||
+        !g1_parse_flat_interaction_terrain(
+            flat_interaction_terrain,
             artifact_error,
             static_cast<int>(sizeof(artifact_error))) ||
         !g1_test_heading_override_parse(
@@ -2028,6 +2067,10 @@ int main(void)
             requested_scene,
             artifact_error);
         return 2;
+    }
+    if (flat_interaction_terrain)
+    {
+        flatten_interaction_scene(active_scene);
     }
 
     int configured_route_index = -1;
@@ -2275,7 +2318,7 @@ int main(void)
     auto scene_loader = [&](scene_pack& candidate, int index,
                             char* error, int capacity)
     {
-        return scene_pack_load(
+        const bool loaded = scene_pack_load(
             candidate,
             terrain_directory,
             motion_manifest,
@@ -2283,6 +2326,11 @@ int main(void)
             index,
             error,
             capacity);
+        if (loaded && flat_interaction_terrain)
+        {
+            flatten_interaction_scene(candidate);
+        }
+        return loaded;
     };
     auto model_loader = [&](Model& model, const char* path,
                             char* error, int capacity)
@@ -4101,16 +4149,38 @@ int main(void)
 
         BeginMode3D(camera);
 
-        DrawModel(
-            terrain_model,
-            Vector3{ 0.0f, 0.0f, 0.0f },
-            1.0f,
-            Color{ 205, 199, 184, 255 });
-        DrawModelWires(
-            terrain_model,
-            Vector3{ 0.0f, 0.0f, 0.0f },
-            1.0f,
-            DARKGRAY);
+        if (flat_interaction_terrain)
+        {
+            const bounds3d& bounds =
+                active_scene.metadata.heightfield_bounds;
+            const float width = static_cast<float>(
+                bounds.maximum.x - bounds.minimum.x);
+            const float depth = static_cast<float>(
+                bounds.maximum.z - bounds.minimum.z);
+            const Vector3 center{
+                static_cast<float>(
+                    0.5 * (bounds.minimum.x + bounds.maximum.x)),
+                0.0F,
+                static_cast<float>(
+                    0.5 * (bounds.minimum.z + bounds.maximum.z))};
+            DrawPlane(
+                center,
+                Vector2{width, depth},
+                Color{ 205, 199, 184, 255 });
+        }
+        else
+        {
+            DrawModel(
+                terrain_model,
+                Vector3{ 0.0f, 0.0f, 0.0f },
+                1.0f,
+                Color{ 205, 199, 184, 255 });
+            DrawModelWires(
+                terrain_model,
+                Vector3{ 0.0f, 0.0f, 0.0f },
+                1.0f,
+                DARKGRAY);
+        }
 
         if (show_g1_mesh)
         {

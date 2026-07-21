@@ -140,6 +140,24 @@ class NativeG1ControllerTests(unittest.TestCase):
         self.assertNotIn("state.bone_velocities", write_block)
         self.assertNotIn("state.bone_angular_velocities", write_block)
 
+    def test_flat_interaction_terrain_changes_physics_and_rendering(self):
+        self.assertIn("MM_INTERACTION_FLAT_TERRAIN", SOURCE)
+        self.assertIn("g1_parse_flat_interaction_terrain(", SOURCE)
+        self.assertIn("flatten_interaction_scene(", SOURCE)
+        flatten_block = SOURCE.split(
+            "static void flatten_interaction_scene", 1)[1].split(
+                "static bool g1_parse_test_frames", 1)[0]
+        self.assertIn("scene.terrain.heights", flatten_block)
+        self.assertIn("scene.walkability.cells", flatten_block)
+        self.assertIn("if (flat_interaction_terrain)", SOURCE)
+        self.assertIn("DrawPlane(", SOURCE)
+
+        render_block = SOURCE.split("// Render", 1)[1].split(
+            "// Draw Simulation Object", 1)[0]
+        flat_branch = render_block.split(
+            "if (flat_interaction_terrain)", 1)[1].split("else", 1)[0]
+        self.assertNotIn("DrawModel(", flat_branch)
+
 
 if __name__ == "__main__":
     unittest.main()
