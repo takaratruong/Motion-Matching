@@ -122,6 +122,58 @@ load_native_g1_smart_pickup_config()
     return interaction::parse_smart_pickup_production_config(environment);
 }
 
+static bool validate_final_g1_grasp(
+    const interaction::RuntimeOutput& runtime_output,
+    const interaction::TargetRegistry& registry,
+    const interaction::RuntimeConfig& config,
+    const interaction::WorldPose& final_g1_world_pose,
+    char* error,
+    int error_capacity)
+{
+    if (runtime_output.diagnostics.hand_constraint_weight < 1.0F)
+    {
+        return true;
+    }
+    const interaction::InteractionTarget* target =
+        registry.find(runtime_output.diagnostics.target);
+    if (target == nullptr)
+    {
+        return g1_error(
+            error,
+            error_capacity,
+            "full G1 grasp constraint has no current target");
+    }
+    const interaction::GraspAffordance* affordance =
+        registry.find_affordance(
+            target->handle,
+            runtime_output.diagnostics.affordance_id);
+    if (affordance == nullptr)
+    {
+        return g1_error(
+            error,
+            error_capacity,
+            "full G1 grasp constraint has no current affordance");
+    }
+    const interaction::Transform grasp_world = interaction::compose(
+        runtime_output.object_world,
+        affordance->hand_in_object);
+    const size_t wrist = affordance->hand == interaction::Hand::Left
+        ? static_cast<size_t>(g1_skeleton::LeftWrist)
+        : static_cast<size_t>(g1_skeleton::RightWrist);
+    const float position_error = length(
+        final_g1_world_pose.positions[wrist] - grasp_world.position);
+    if (position_error > config.attachment.maximum_position_error_m)
+    {
+        return g1_error(
+            error,
+            error_capacity,
+            "final G1 wrist misses grasp by %.6f m (limit %.6f m)",
+            position_error,
+            config.attachment.maximum_position_error_m);
+    }
+    return true;
+}
+
 static bool g1_parse_terrain_weight(
     float& weight, char* error, const int error_capacity)
 {
@@ -3789,19 +3841,39 @@ int main(void)
                 native_g1_locomotion.pose,
                 interaction_output,
                 dt);
+        const interaction::Pose final_g1_pose = native_g1_frame.pose;
         interaction::write_native_g1_pose(
-            native_g1_frame.pose,
+            final_g1_pose,
             state.adjusted_bone_positions,
             state.bone_velocities,
             state.adjusted_bone_rotations,
             state.bone_angular_velocities,
             state.curr_bone_contacts);
-        forward_kinematics_full(
-            state.global_bone_positions,
-            state.global_bone_rotations,
-            state.adjusted_bone_positions,
-            state.adjusted_bone_rotations,
-            db.bone_parents);
+        interaction::WorldPose final_g1_world_pose =
+            interaction::world_pose(final_g1_pose);
+        if (native_g1_frame.synchronize_simulation_root)
+        {
+            state.simulation_position =
+                final_g1_pose.positions[g1_skeleton::Simulation];
+            state.simulation_velocity =
+                final_g1_pose.velocities[g1_skeleton::Simulation];
+            state.simulation_acceleration = vec3();
+            state.simulation_rotation =
+                final_g1_pose.rotations[g1_skeleton::Simulation];
+            state.simulation_angular_velocity =
+                final_g1_pose.angular_velocities[g1_skeleton::Simulation];
+        }
+        if (!validate_final_g1_grasp(
+                interaction_output,
+                interaction_registry,
+                interaction_config,
+                final_g1_world_pose,
+                artifact_error,
+                static_cast<int>(sizeof(artifact_error))))
+        {
+            controlled_runtime_error(artifact_error);
+            return;
+        }
 
         // Update camera
 
@@ -3818,8 +3890,12 @@ int main(void)
 
         if (!::g1_mesh_renderer_update(
                 g1_mesh_renderer,
-                state.global_bone_positions,
-                state.global_bone_rotations,
+                slice1d<vec3>(
+                    static_cast<int>(g1_skeleton::BoneCount),
+                    final_g1_world_pose.positions.data()),
+                slice1d<quat>(
+                    static_cast<int>(g1_skeleton::BoneCount),
+                    final_g1_world_pose.rotations.data()),
                 artifact_error,
                 static_cast<int>(sizeof(artifact_error))))
         {
@@ -3895,20 +3971,95 @@ int main(void)
             state.trajectory_rotations,
             ORANGE);
 
+        const interaction::InteractionTarget* rendered_interaction_target =
+            interaction_registry.find_by_id(
+                interaction_scene_target_handle.id);
+        if (rendered_interaction_target != nullptr)
+        {
+            interaction::Transform rendered_object =
+                rendered_interaction_target->object_world;
+            if (interaction_output.diagnostics.target.id ==
+                    rendered_interaction_target->handle.id &&
+                interaction_output.diagnostics.object_state ==
+                    interaction::ObjectState::Held)
+            {
+                rendered_object = interaction_output.object_world;
+            }
+            DrawCube(
+                to_Vector3(rendered_object.position),
+                rendered_interaction_target->object_dimensions.x,
+                rendered_interaction_target->object_dimensions.y,
+                rendered_interaction_target->object_dimensions.z,
+                GOLD);
+            DrawCubeWires(
+                to_Vector3(rendered_object.position),
+                rendered_interaction_target->object_dimensions.x,
+                rendered_interaction_target->object_dimensions.y,
+                rendered_interaction_target->object_dimensions.z,
+                BROWN);
+            DrawCubeWires(
+                to_Vector3(rendered_interaction_target->table_world.position),
+                rendered_interaction_target->table_size.x,
+                rendered_interaction_target->table_size.y,
+                rendered_interaction_target->table_size.z,
+                DARKGRAY);
+        }
+
+        const std::optional<interaction::LearnedPickupDebugSnapshot>
+            learned_pickup_debug =
+                smart_pickup_controller.learned_debug_snapshot();
+        if (learned_pickup_debug.has_value())
+        {
+            const std::vector<interaction::FunnelSample>& route =
+                learned_pickup_debug->world_route;
+            for (size_t sample = 0U; sample < route.size(); ++sample)
+            {
+                const vec3 point(
+                    route[sample].x,
+                    state.support.height + 0.08F,
+                    route[sample].z);
+                DrawSphereWires(
+                    to_Vector3(point),
+                    sample == static_cast<size_t>(
+                        learned_pickup_debug->lookahead_index)
+                        ? 0.055F
+                        : 0.025F,
+                    4,
+                    8,
+                    sample <= static_cast<size_t>(
+                        learned_pickup_debug->progress_index)
+                        ? GREEN
+                        : PURPLE);
+                if (sample > 0U)
+                {
+                    const vec3 previous(
+                        route[sample - 1U].x,
+                        state.support.height + 0.08F,
+                        route[sample - 1U].z);
+                    DrawLine3D(
+                        to_Vector3(previous), to_Vector3(point), PURPLE);
+                }
+            }
+        }
+
         // G1: no skinned mesh — draw the skeleton directly from bone transforms.
         // Sphere at each joint, capsule (cylinder) from each bone to its parent.
         if (show_g1_bones)
         {
-            for (int bi = 1; bi < db.nbones(); bi++)
+            for (size_t bone = 1U;
+                 bone < g1_skeleton::BoneCount;
+                 ++bone)
             {
-                vec3 bp = state.global_bone_positions(bi);
-                DrawSphereWires(to_Vector3(bp), 0.028f, 4, 8, DARKBLUE);
-                int par = db.bone_parents(bi);
-                if (par > 0)
+                const vec3 position = final_g1_world_pose.positions[bone];
+                DrawSphereWires(
+                    to_Vector3(position), 0.028f, 4, 8, DARKBLUE);
+                const int32_t parent = g1_skeleton::kParents[bone];
+                if (parent >= 0)
                 {
                     DrawCylinderEx(
-                        to_Vector3(state.global_bone_positions(par)),
-                        to_Vector3(bp),
+                        to_Vector3(final_g1_world_pose.positions[
+                            static_cast<size_t>(parent)]),
+                        to_Vector3(position),
                         0.018f,
                         0.018f,
                         6,

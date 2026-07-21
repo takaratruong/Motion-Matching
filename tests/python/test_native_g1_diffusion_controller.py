@@ -61,6 +61,29 @@ class NativeG1ControllerTests(unittest.TestCase):
         self.assertIn("MM_INTERACTION_FUNNEL_CHECKPOINT", SOURCE)
         self.assertIn("MM_INTERACTION_FUNNEL_WORKER", SOURCE)
 
+    def test_one_final_g1_pose_fans_out_to_every_consumer(self):
+        self.assertIn("const interaction::Pose final_g1_pose", SOURCE)
+        self.assertIn(
+            "interaction::WorldPose final_g1_world_pose", SOURCE)
+        self.assertIn("validate_final_g1_grasp(", SOURCE)
+
+        final_block = SOURCE.split(
+            "const interaction::Pose final_g1_pose", 1)[1]
+        self.assertIn("write_native_g1_pose(\n            final_g1_pose", final_block)
+
+        mesh_block = SOURCE.split(
+            "if (!::g1_mesh_renderer_update", 1)[1].split("// Render", 1)[0]
+        self.assertIn("final_g1_world_pose.positions", mesh_block)
+        self.assertIn("final_g1_world_pose.rotations", mesh_block)
+        self.assertNotIn("state.global_bone_positions", mesh_block)
+
+        skeleton_block = SOURCE.split(
+            "// G1: no skinned mesh", 1)[1].split(
+                "// Draw matched features", 1)[0]
+        self.assertIn("final_g1_world_pose.positions", skeleton_block)
+        self.assertIn("g1_skeleton::kParents", skeleton_block)
+        self.assertNotIn("state.global_bone_positions", skeleton_block)
+
 
 if __name__ == "__main__":
     unittest.main()
