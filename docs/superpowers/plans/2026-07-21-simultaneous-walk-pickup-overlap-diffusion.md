@@ -266,10 +266,13 @@ git commit -m "fix: preserve dynamic hips in overlap motion"
 - Create: `tools/train_g1_overlap_diffusion.py`
 - Modify: `resources/g1_interaction_builder/overlap_diffusion.py`
 - Create: `tests/python/test_overlap_checkpoint.py`
+- Modify: `tools/build_g1_overlap_dataset.py`
+- Modify: `tests/python/test_overlap_dataset.py`
 
 **Interfaces:**
 - Produces: schema-v1 checkpoint containing both model states, normalization, skeleton signature, dataset digest, losses, and sampler contract.
 - Produces: `load_overlap_checkpoint(path, device) -> LoadedOverlapModels`
+- Dataset stores canonical parents and local offsets for bones 2–30 so the real differentiable G1 FK losses never use an identity/proxy skeleton.
 
 - [ ] **Step 1: Write failing tiny-training and identity tests**
 
