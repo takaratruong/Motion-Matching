@@ -4,7 +4,7 @@
 
 **Goal:** Build and validate one full-body G1 walking window and one object-conditioned pickup window that denoise simultaneously through a shared 20-frame latent overlap and execute as one no-stop pickup timeline.
 
-**Architecture:** Add a new full-body overlap pipeline beside the existing root-funnel implementation. Python owns motion encoding, dataset extraction, two denoisers, shared-latent DDIM sampling, checkpointing, and a resident worker; C++ owns strict IPC identity, candidate decoding/certification, frozen planning, generated timeline playback, Contact/attachment/Lift authority, and visualization. The initial model uses two 50-frame windows at 25 Hz, global slices `[0, 50)` and `[30, 80)`, eight candidates, and 20 DDIM steps.
+**Architecture:** Add a new full-body overlap pipeline beside the existing root-funnel implementation. Python owns motion encoding, dataset extraction, two denoisers, shared-latent DDIM sampling, checkpointing, and a resident worker; C++ owns strict IPC identity, candidate decoding/certification, frozen planning, generated timeline playback through Contact, preselection of the recorded Lift continuation, Contact/attachment/Lift authority, and visualization. The initial model uses two 50-frame windows at 25 Hz, global slices `[0, 50)` and `[30, 80)`, eight candidates, and 20 DDIM steps.
 
 **Tech Stack:** Python 3, NumPy, PyTorch 2.5/CUDA 12.4, C++17, existing G1 interaction artifacts, existing raylib controller, Make-based C++ tests, `unittest` Python tests.
 
@@ -27,7 +27,7 @@
 
 ### New Python files
 
-- `resources/g1_interaction_builder/holden_database.py`: strict reader for `resources/database.bin` walking poses.
+- `resources/g1_interaction_builder/holden_database.py`: strict canonical 31-bone Holden reader/codec support.
 - `resources/g1_interaction_builder/overlap_motion.py`: 192-channel motion codec, conditions, dataset records, and extraction.
 - `resources/g1_interaction_builder/overlap_diffusion.py`: window denoiser, training losses, shared-overlap DDIM, and checkpoints.
 - `resources/g1_interaction_builder/overlap_protocol.py`: strict resident-worker request/response framing.
@@ -39,14 +39,14 @@
 
 - `interaction_overlap_protocol.h/.cpp`: request/response binary types and validation.
 - `interaction_overlap_worker.h/.cpp`: resident process lifecycle and length-delimited IPC.
-- `interaction_overlap_timeline.h/.cpp`: decoded 80-frame pose timeline, certification, scoring, and playback cursor.
-- `interaction_overlap_pickup_backend.h/.cpp`: freeze, request, selection, execution, Contact, and Lift state machine.
+- `interaction_overlap_timeline.h/.cpp`: decoded 80-frame pose timeline, certification, continuation identity, scoring, and playback cursor.
+- `interaction_overlap_pickup_backend.h/.cpp`: freeze, request, selection, generated execution, Contact, and preselected Lift-continuation state machine.
 
 ### Existing files to modify
 
 - `interaction_pick_assist.h`: publish an optional generated full-body pose/contact event from a learned backend.
 - `interaction_smart_pickup_controller.h/.cpp`: configure and construct the overlap provider/backend.
-- `interaction_runtime.h/.cpp`: accept a certified generated Contact/Lift stream without re-running pickup matching.
+- `interaction_runtime.h/.cpp`: accept a certified generated Contact stream and its preselected recorded Lift continuation without late matching.
 - `interaction_native_g1_bridge.h/.cpp`: give a generated overlap pose explicit authority before normal Hold/Carry release blending.
 - `interaction_debug_draw.h`: draw the generated root timeline and shared overlap.
 - `controller.cpp`: pass overlap environment variables and apply generated pose authority.
@@ -119,7 +119,8 @@ git commit -m "feat: add full-body overlap motion codec"
 **Interfaces:**
 - Produces: `OverlapDataset(walk_windows, pickup_windows, static_conditions, walk_temporal, pickup_temporal, sequence_indices, object_ids)`
 - Produces: `extract_interaction_pairs(artifact: InteractionArtifact) -> OverlapDataset`
-- Produces: `extract_walking_windows(database: HoldenDatabase, stride: int=10) -> np.ndarray[N,50,192]`
+- Produces: `load_native_g1_walk(source_npz, g1_xml) -> HoldenClip`
+- Produces: `extract_walking_windows(clip: HoldenClip, stride: int=10) -> np.ndarray[N,50,192]`
 
 - [ ] **Step 1: Write failing source-index and overlap-identity tests**
 
@@ -131,7 +132,7 @@ def test_interaction_pair_uses_real_contiguous_overlap():
     np.testing.assert_array_equal(rows.source_pickup_ranges[0], [reach - 20, reach + 30])
 ```
 
-Also assert rejection reasons for missing Reach, Contact after `R+29`, Lift after `R+29`, left hand, invalid grasp, and short clips.
+Also assert rejection reasons for missing Reach, Contact after `R+29`, left hand, invalid grasp, missing continuation identity, and short clips. Do not reject a row merely because Lift occurs after `R+29`.
 
 - [ ] **Step 2: Run tests and verify extraction symbols are missing**
 
@@ -141,15 +142,15 @@ Expected: FAIL with `ImportError` or missing `extract_interaction_pairs`.
 
 - [ ] **Step 3: Implement exact 80-frame interaction extraction**
 
-For each valid right-hand clip, use global source range `[R-50,R+30)`, walking target `[R-50,R)`, pickup target `[R-20,R+30)`, and object frame from Contact-minus-one. Build the 25-value static condition as the existing 18 grasp values plus initial root linear/angular velocity and `object_present=1`. Build nine temporal channels per global frame: object-local route `(x,z,sin(yaw),cos(yaw))` plus one-hot Walk/Approach/Reach/Contact/Lift.
+For each valid right-hand clip, use global source range `[R-50,R+30)`, walking target `[R-50,R)`, pickup target `[R-20,R+30)`, and object frame from Contact-minus-one. Build the 25-value static condition as the existing 18 grasp values plus initial root linear/angular velocity and `object_present=1`. Build nine temporal channels per global frame: object-local route `(x,z,sin(yaw),cos(yaw))` plus one-hot Walk/Approach/Reach/Contact/Lift. Record the source clip and post-window frame range that continues to the existing Lift witness.
 
 - [ ] **Step 4: Implement balanced 50-frame walking extraction**
 
-Resample `resources/database.bin` from 60 Hz to 25 Hz with existing vector/quaternion resamplers, keep each window inside one source range, construct its terminal-root goal frame, set object/grasp values to zero and `object_present=0`, and balance by planar-speed and yaw-rate bins before deterministic splitting.
+Load `/home/ubuntu/projects/mjx-diffphysics/env/g1/motions/lafan_walk_short.npz` and `/home/ubuntu/projects/mjx-diffphysics/env/g1/assets/g1_29dof.xml`, validate the 29 DoF/body names, convert through `G1Kinematics` and `convert_source_clip` into the canonical 31-bone Y-up `HoldenClip` at 25 Hz, and keep each 50-frame window inside that source clip. Construct each terminal-root goal frame, set object/grasp values to zero and `object_present=0`, and balance by planar-speed and yaw-rate bins before deterministic splitting. Do not use or retarget the tracked legacy 23-bone `resources/database.bin`.
 
 - [ ] **Step 5: Add deterministic NPZ export with manifest JSON**
 
-The CLI accepts `--walking-database`, `--interaction-pack`, `--output`, and `--seed`; write training/validation/test arrays, source hashes, rejection counts, normalization partition, object IDs, and exact source ranges atomically.
+The CLI accepts `--walking-source`, `--g1-xml`, `--interaction-pack`, `--output`, and `--seed`; write training/validation/test arrays, source hashes, rejection counts, continuation identities, normalization partition, object IDs, and exact source ranges atomically.
 
 - [ ] **Step 6: Run fixture tests and a real data audit**
 
@@ -158,13 +159,14 @@ Run:
 ```bash
 python3 -m unittest tests.python.test_overlap_dataset -v
 python3 tools/build_g1_overlap_dataset.py \
-  --walking-database resources/database.bin \
+  --walking-source /home/ubuntu/projects/mjx-diffphysics/env/g1/motions/lafan_walk_short.npz \
+  --g1-xml /home/ubuntu/projects/mjx-diffphysics/env/g1/assets/g1_29dof.xml \
   --interaction-pack /home/ubuntu/worktrees/motion-matching/g1-tabletop-placement/build/smart-pickup/full-pack \
   --output build/g1-overlap/dataset.npz \
   --seed 2026072101
 ```
 
-Expected: tests PASS; CLI reports nonzero train/validation/test interaction rows, byte-identical 20-frame overlaps, and rejection counts without modifying source artifacts.
+Expected: tests PASS; CLI reports nonzero train/validation/test interaction rows, byte-identical 20-frame overlaps, valid continuation identities, and rejection counts without modifying source artifacts.
 
 - [ ] **Step 7: Commit**
 
@@ -387,13 +389,13 @@ git commit -m "feat: host persistent overlap worker"
 - Modify: `Makefile`
 
 **Interfaces:**
-- Produces: `GeneratedPickupTimeline` containing 80 `Pose` frames and Contact/Lift events.
+- Produces: `GeneratedPickupTimeline` containing 80 `Pose` frames, a Contact event, and a certified recorded-continuation identity.
 - Produces: `certify_overlap_candidate(candidate, context) -> OverlapCertification`.
 - Produces: `GeneratedTimelinePlayer::update(dt) -> GeneratedTimelineFrame`.
 
 - [ ] **Step 1: Write failing certification tests**
 
-Build one valid synthetic 80-frame candidate and independently perturb frozen start, quaternion norm, joint speed, table collision, route corridor, foot penetration, three-frame overlap dwell, grasp transform, Contact geometry, and Lift height. Assert one stable rejection reason for each and stable scoring/candidate-index tie-breaks.
+Build one valid synthetic 80-frame candidate plus continuation and independently perturb frozen start, quaternion norm, joint speed, table collision, route corridor, foot penetration, three-frame overlap dwell, grasp transform, Contact geometry, continuation seam, and continuation Lift witness. Assert one stable rejection reason for each and stable scoring/candidate-index tie-breaks.
 
 - [ ] **Step 2: Build and verify missing symbols**
 
@@ -411,7 +413,7 @@ Reuse existing G1 FK, joint, table, obstacle, grasp, attachment, and lift helper
 
 - [ ] **Step 5: Implement deterministic 25 Hz playback**
 
-Advance monotonically by accumulated `dt`, interpolate only when render `dt` lies between generated frames, publish Contact and Lift crossings exactly once, and end in the final generated Lift pose for the normal Hold/Carry inertializer.
+Advance monotonically by accumulated `dt`, interpolate only when render `dt` lies between generated frames, publish Contact exactly once, and enter the already certified recorded continuation directly after frame 79. Publish its Lift crossing exactly once and end in its Lift pose for the normal Hold/Carry inertializer.
 
 - [ ] **Step 6: Run tests**
 
@@ -436,13 +438,13 @@ git commit -m "feat: certify generated pickup timelines"
 - Modify: `Makefile`
 
 **Interfaces:**
-- Produces: `CertifiedGeneratedPickup` with target, affordance, condition digest, contact frame, lift frame, and selected timeline identity.
+- Produces: `CertifiedGeneratedPickup` with target, affordance, condition digest, contact frame, selected timeline identity, and preselected recorded continuation identity.
 - Adds: `InteractionRuntime::begin_generated_pickup(const CertifiedGeneratedPickup&)`.
-- Adds: `RuntimeInput::generated_pose`, `generated_contact_crossing`, and `generated_lift_crossing`.
+- Adds: `RuntimeInput::generated_pose`, `generated_contact_crossing`, and continuation playback/Lift events.
 
 - [ ] **Step 1: Write failing runtime authority tests**
 
-Assert Locomotion accepts only a certified current target/generation; generated pre-Contact frames do not attach; Contact uses the existing geometric gate; attachment follows the generated hand; Lift reaches Held/Carry; stale target, bad grasp, missing Contact, early object motion, cancellation, and tracking failure reject without teleporting or authored fallback.
+Assert Locomotion accepts only a certified current target/generation; generated pre-Contact frames do not attach; Contact uses the existing geometric gate; attachment follows the generated hand; the preselected continuation reaches Lift/Held/Carry; stale target, bad grasp, missing Contact, bad continuation identity, early object motion, cancellation, and tracking failure reject without teleporting or authored fallback.
 
 - [ ] **Step 2: Build and verify missing API failure**
 
@@ -452,11 +454,11 @@ Expected: FAIL because `begin_generated_pickup` is absent.
 
 - [ ] **Step 3: Add the certified generated-pick seam**
 
-Store one immutable token only after C++ certification. Revalidate target handle/generation, affordance, object transform, condition digest, and frozen root before accepting frame zero. Do not call the pickup matcher or instantiate recorded playback for this path.
+Store one immutable token only after C++ certification. Revalidate target handle/generation, affordance, object transform, condition digest, frozen root, and preselected recorded continuation before accepting frame zero. Do not call the pickup matcher during execution; recorded continuation playback is instantiated and certified during frozen planning.
 
 - [ ] **Step 4: Route Contact and Lift through existing attachment authority**
 
-At the generated Contact crossing, call the existing geometric attachment checks with generated hand/object transforms. While attached, update object pose through `AttachmentController`; at generated Lift, require the existing lift-height witness before entering Hold/Carry. Preserve all existing authored/recorded paths unchanged.
+At the generated Contact crossing, call the existing geometric attachment checks with generated hand/object transforms. While attached, update object pose through `AttachmentController`; at frame 79 continue immediately into the preselected recorded post-Contact segment, and at its Lift crossing require the existing lift-height witness before entering Hold/Carry. Preserve all existing authored/recorded paths unchanged.
 
 - [ ] **Step 5: Run generated and existing runtime tests**
 
@@ -497,7 +499,7 @@ git commit -m "feat: add generated pickup runtime authority"
 
 - [ ] **Step 1: Write failing freeze/resume/state tests**
 
-Use a fake resident provider to prove `F` captures one immutable pose/velocity/target snapshot, planning polls without simulation ticks, eight responses are certified once, execution owns all 80 generated poses, no state change occurs at frames 30/50, resume occurs once, cancellation unfreezes, and all failure paths omit authored submission.
+Use a fake resident provider to prove `F` captures one immutable pose/velocity/target snapshot, planning polls without simulation ticks, eight responses and their continuations are certified once, execution owns all 80 generated poses and then the preselected continuation, no state change occurs at frames 30/50, resume occurs once, cancellation unfreezes, and all failure paths omit authored submission.
 
 - [ ] **Step 2: Build and verify missing backend failure**
 
@@ -507,11 +509,11 @@ Expected: FAIL because the overlap backend does not exist.
 
 - [ ] **Step 3: Implement frozen planning and selection**
 
-Build the collision-free 80-frame route corridor from frozen root to object, serialize the full request, keep `planning_barrier=true` while polling, certify all candidates in stable index order, choose the lowest complete-chain score, and arm one `GeneratedTimelinePlayer` plus one `CertifiedGeneratedPickup` token.
+Build the collision-free 80-frame route corridor from frozen root to object, serialize the full request, keep `planning_barrier=true` while polling, preselect and seam-certify each candidate's recorded Lift continuation, certify all complete chains in stable index order, choose the lowest score, and arm one `GeneratedTimelinePlayer` plus one `CertifiedGeneratedPickup` token.
 
 - [ ] **Step 4: Implement generated pose ownership and runtime events**
 
-Publish the generated `Pose` each tick through `PickAssistOutput`; let `NativeG1PoseHandoff` treat it as explicit learned authority. Forward Contact/Lift crossings to `InteractionRuntime`. Frames 30 and 50 remain ordinary player indices and cannot trigger any controller transition.
+Publish the generated `Pose` each tick through `PickAssistOutput`; let `NativeG1PoseHandoff` treat it as explicit learned authority. Forward generated Contact and continuation Lift crossings to `InteractionRuntime`. Frames 30 and 50 remain ordinary player indices and cannot trigger any controller transition; frame 79 enters only the continuation already chosen while frozen.
 
 - [ ] **Step 5: Add explicit production configuration**
 

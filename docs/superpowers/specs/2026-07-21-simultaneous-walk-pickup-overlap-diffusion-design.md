@@ -30,8 +30,9 @@ On the rising edge of `F`:
    walk/pickup timelines.
 4. Certify and select one complete timeline while the frozen state remains
    immutable.
-5. Resume once and execute the selected timeline continuously through walking,
-   Reach, Contact, attachment, and Lift.
+5. Resume once and execute the selected generated timeline continuously through
+   walking, Reach, Contact, and attachment, then continue directly into the
+   recorded Lift continuation selected during the same frozen planning pass.
 
 No state at the shared-window boundary may request settling, idle, zero desired
 velocity, a late matcher search, or a second planning pause. Natural slowing as
@@ -89,10 +90,12 @@ shared overlap                                [20 frames]
 - Complete unique timeline: 80 frames; 3.20 seconds.
 
 The pickup window's first 20 frames are still pre-Reach approach motion. Its
-remaining 30 frames cover Reach, Contact, and the beginning of Lift. The pickup
-expert may continue root movement throughout its window. Therefore the
+remaining 30 frames cover Reach, Contact, and early post-Contact motion. The
+pickup expert may continue root movement throughout its window. Therefore the
 character is not required to cover the entire object distance in the walking
-window alone.
+window alone. A compatible recorded continuation is selected before resume and
+starts immediately after generated frame 79; this is an execution seam, not a
+late matcher search or a second planning barrier.
 
 ## Shared Motion Representation
 
@@ -135,7 +138,8 @@ The common condition record contains:
 - object-local grasp translation and 6D rotation;
 - object-local horizontal approach direction;
 - an 80-frame planar route corridor with desired root position and facing;
-- an 80-frame phase schedule covering Walk, Approach, Reach, Contact, and Lift;
+- an 80-frame phase schedule covering Walk, Approach, Reach, Contact, and any
+  early Lift frames present in the source window;
 - a condition-presence mask distinguishing generic walking rows from object
   interaction rows; and
 - the deterministic candidate seed.
@@ -155,11 +159,13 @@ dynamics to the coupled models.
 
 ### Walking expert
 
-Train on contiguous 50-frame windows from the existing G1 walking database.
-Sample turning, acceleration, deceleration, and steady locomotion with balanced
-speed and heading bins. Also include the 50 pre-Reach frames from every valid
-interaction example, because those rows provide the real distribution on which
-the walking and pickup experts overlap.
+Train on contiguous 50-frame windows from the native 29-DoF G1 walking source
+`lafan_walk_short.npz`, converted through the existing G1 kinematics and
+canonical 31-bone interaction mapping at 25 Hz. Sample turning, acceleration,
+deceleration, and steady locomotion with balanced speed and heading bins. Also
+include the 50 pre-Reach frames from every valid interaction example, because
+those rows provide the real distribution on which the walking and pickup
+experts overlap. Do not retarget the legacy 23-bone Holden database into G1.
 
 ### Pickup expert
 
@@ -168,7 +174,6 @@ For each structurally valid interaction clip, locate canonical first Reach frame
 
 - frames `R - 50` through `R + 29` exist in the clip;
 - the first Contact occurs in `R` through `R + 29`;
-- Lift begins no later than `R + 29`;
 - the active hand is right;
 - object, grasp, support, contact, and phase records are finite and valid; and
 - the existing kinematic and interaction provenance checks pass.
@@ -181,6 +186,10 @@ resampling or fabricated cross-domain labels.
 Rejected-row counts and reasons are serialized in the dataset manifest. Object
 IDs remain disjoint across train, validation, and test partitions. Normalization
 statistics are computed only from the training partition.
+
+Each retained interaction row also records the source clip and frame needed to
+continue from generated frame 79 into that clip's post-Contact Lift. Frozen
+planning must certify this continuation and its seam before execution begins.
 
 ### Augmentation
 
@@ -298,7 +307,8 @@ candidate must pass:
 - active-hand approach and grasp-transform limits;
 - valid pre-contact separation;
 - valid Contact timing and attachment geometry; and
-- a valid Lift witness before the final frame.
+- a compatible preselected recorded continuation whose certified source segment
+  reaches the existing Lift witness.
 
 Score order after hard feasibility is:
 
@@ -313,7 +323,9 @@ Score order after hard feasibility is:
 After selection, the controller resumes once and executes the generated root and
 full-body pose timeline as one authority interval. There is no controller handoff
 at global frames 30 or 50 because those are internal model-window boundaries,
-not runtime states. At the generated Lift terminal, the existing inertialized
+not runtime states. At frame 79 it immediately enters the already selected and
+certified recorded post-Contact continuation, without stopping or matching. That
+continuation supplies the Lift witness, after which the existing inertialized
 Hold/Carry transition resumes normal interaction authority.
 
 Material target, support, obstacle, or ownership changes before resume invalidate
@@ -353,7 +365,8 @@ Every declared case is evaluated for:
 
 - `contact@8`: at least one candidate reaches valid Contact;
 - `attach@8`: at least one candidate attaches through runtime authority;
-- `lift@8`: the selected candidate reaches the Lift witness;
+- `lift@8`: the selected generated candidate plus its preselected continuation
+  reaches the Lift witness;
 - collision-free completion;
 - grasp position and orientation error;
 - root and joint velocity/acceleration across global frames 29 through 51;
