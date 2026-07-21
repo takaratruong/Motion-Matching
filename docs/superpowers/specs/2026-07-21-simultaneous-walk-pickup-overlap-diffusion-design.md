@@ -2,7 +2,7 @@
 
 Date: 2026-07-21
 
-Status: approved for implementation planning
+Status: implementation in progress; amended after native-pose audit
 
 ## Goal
 
@@ -106,17 +106,25 @@ interaction artifacts and native bridge.
 Each clean frame contains:
 
 - object-frame root translation `(x, y, z)`;
+- local Hips translation `(x, y, z)` beneath the virtual Simulation root;
 - continuous root rotation represented by the first two columns of its rotation
   matrix;
 - continuous local rotation for every canonical G1 joint in the same 6D form;
 - left-foot, right-foot, and active-hand contact values.
 
-The diffusion output does not independently predict velocities. Root linear and
-angular velocity, joint angular velocity, acceleration, and foot sliding are
-derived by finite differences at 25 Hz. This prevents pose and velocity channels
-from disagreeing. Contact channels are trained as probabilities and use `0.5`
-as the certification threshold; C++ attachment authority still requires the
-geometric Contact gate and never trusts a learned contact bit by itself.
+The resulting frame dimension is `3 + 3 + 31 * 6 + 3 = 195`. The extra Hips
+translation is required because the interaction skeleton has a virtual
+Simulation trajectory root: the physical pelvis offset beneath it changes by a
+median 2.2 cm and a 95th-percentile 8.5 cm within retained pickup windows. It
+must not be replaced by one frozen rest offset.
+
+The diffusion output does not independently predict velocities. Root and Hips
+linear velocity, root/joint angular velocity, acceleration, and foot sliding
+are derived by finite differences at 25 Hz. This prevents pose and velocity
+channels from disagreeing. Contact channels are trained as probabilities and
+use `0.5` as the certification threshold; C++ attachment authority still
+requires the geometric Contact gate and never trusts a learned contact bit by
+itself.
 
 For interaction clips, the frame origin and yaw are the observed target-object
 frame used by the existing interaction pack. For walking-only clips, training

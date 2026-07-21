@@ -13,7 +13,7 @@
 - Preserve the existing authored and root-funnel providers; add the overlap provider as an explicit production mode.
 - Use exactly 25 Hz, 50 walk frames, 50 pickup frames, 20 shared frames, 80 unique frames, eight candidates, and a 3.20-second complete timeline.
 - Use canonical 31-bone `g1_skeleton` / `FLAT_JOINT_NAMES` order.
-- Use full G1 pose channels: root translation, 31 continuous 6D rotations, and three contact channels; derive velocities rather than diffusing them.
+- Use full G1 pose channels: Simulation-root translation, dynamic local Hips translation, 31 continuous 6D rotations, and three contact channels; derive velocities rather than diffusing them.
 - Denoise both windows at the same timestep from one global latent and write overlap consensus back before the next step.
 - Freeze simulation and animation while planning; keep rendering, cancellation, diagnostics, and worker polling responsive.
 - Resume once and do not introduce a runtime state, stationary command, or late matcher search at global frames 30 or 50.
@@ -28,7 +28,7 @@
 ### New Python files
 
 - `resources/g1_interaction_builder/holden_database.py`: strict canonical 31-bone Holden reader/codec support.
-- `resources/g1_interaction_builder/overlap_motion.py`: 192-channel motion codec, conditions, dataset records, and extraction.
+- `resources/g1_interaction_builder/overlap_motion.py`: 195-channel motion codec, conditions, dataset records, and extraction.
 - `resources/g1_interaction_builder/overlap_diffusion.py`: window denoiser, training losses, shared-overlap DDIM, and checkpoints.
 - `resources/g1_interaction_builder/overlap_protocol.py`: strict resident-worker request/response framing.
 - `tools/train_g1_overlap_diffusion.py`: deterministic two-expert training entry point.
@@ -63,15 +63,15 @@
 
 **Interfaces:**
 - Produces: `read_holden_database(path: Path) -> HoldenDatabase`
-- Produces: `encode_motion(positions, rotations, contacts, anchor) -> np.ndarray[N, 192]`
+- Produces: `encode_motion(positions, rotations, contacts, anchor) -> np.ndarray[N, 195]`
 - Produces: `decode_motion(encoded, local_positions, anchor) -> DecodedMotion`
-- Constants: `BONE_COUNT=31`, `FRAME_DIM=192`, `WALK_FRAMES=50`, `PICKUP_FRAMES=50`, `OVERLAP_FRAMES=20`, `TIMELINE_FRAMES=80`
+- Constants: `BONE_COUNT=31`, `FRAME_DIM=195`, `WALK_FRAMES=50`, `PICKUP_FRAMES=50`, `OVERLAP_FRAMES=20`, `TIMELINE_FRAMES=80`
 
 - [ ] **Step 1: Write failing binary-reader and codec tests**
 
 ```python
 def test_frame_schema_is_frozen():
-    self.assertEqual(overlap_motion.FRAME_DIM, 3 + 31 * 6 + 3)
+    self.assertEqual(overlap_motion.FRAME_DIM, 3 + 3 + 31 * 6 + 3)
     self.assertEqual(overlap_motion.walk_slice(), slice(0, 50))
     self.assertEqual(overlap_motion.pickup_slice(), slice(30, 80))
 
@@ -92,9 +92,9 @@ Expected: FAIL with `ImportError: cannot import name 'overlap_motion'`.
 
 Read the eight arrays written by `resources/generate_database_g1.py:227-243`; reject trailing bytes, non-finite floats, non-contiguous ranges, bone counts other than 31, and contact counts other than two. Return positions, velocities, rotations, angular velocities, parents, ranges, and contacts without loading `features.bin`.
 
-- [ ] **Step 4: Implement the 192-channel codec**
+- [ ] **Step 4: Implement the 195-channel codec**
 
-Use channels `[root_xyz(3), rotation6d(31*6), left_foot, right_foot, active_hand]`. Convert 6D rotations with Gram-Schmidt and reject a column norm below `1e-8`. Reconstruct local non-root positions from the frozen canonical local offsets and derive linear/angular velocity with centered finite differences at 25 Hz.
+Use channels `[simulation_root_xyz(3), hips_local_xyz(3), rotation6d(31*6), left_foot, right_foot, active_hand]`. Convert 6D rotations with Gram-Schmidt and reject a column norm below `1e-8`. Preserve the dynamic local Hips translation at bone index 1, reconstruct only bones 2–30 from frozen canonical local offsets, and derive linear/angular velocity with centered finite differences at 25 Hz. Add a regression whose Hips offset changes by at least 8 cm and round-trips exactly.
 
 - [ ] **Step 5: Run focused and existing schema tests**
 
@@ -120,7 +120,7 @@ git commit -m "feat: add full-body overlap motion codec"
 - Produces: `OverlapDataset(walk_windows, pickup_windows, static_conditions, walk_temporal, pickup_temporal, sequence_indices, object_ids)`
 - Produces: `extract_interaction_pairs(artifact: InteractionArtifact) -> OverlapDataset`
 - Produces: `load_native_g1_walk(source_npz, g1_xml) -> HoldenClip`
-- Produces: `extract_walking_windows(clip: HoldenClip, stride: int=10) -> np.ndarray[N,50,192]`
+- Produces: `extract_walking_windows(clip: HoldenClip, stride: int=10) -> np.ndarray[N,50,195]`
 
 - [ ] **Step 1: Write failing source-index and overlap-identity tests**
 
@@ -182,8 +182,8 @@ git commit -m "feat: build genuine walk pickup overlap data"
 - Create: `tests/python/test_overlap_diffusion.py`
 
 **Interfaces:**
-- Produces: `MotionWindowDenoiser(frame_dim=192, static_dim=25, temporal_dim=9)`
-- Produces: `sample_coupled(walk_model, pickup_model, condition, *, seed, candidates=8, steps=20) -> Tensor[8,80,192]`
+- Produces: `MotionWindowDenoiser(frame_dim=195, static_dim=25, temporal_dim=9)`
+- Produces: `sample_coupled(walk_model, pickup_model, condition, *, seed, candidates=8, steps=20) -> Tensor[8,80,195]`
 - Produces: `overlap_weight(index: int) -> float`
 
 - [ ] **Step 1: Write failing simultaneous-sampling tests**
@@ -193,7 +193,7 @@ def test_overlap_endpoints_and_shared_latent_contract():
     self.assertEqual(overlap_weight(0), 0.0)
     self.assertEqual(overlap_weight(19), 1.0)
     out, trace = sample_coupled(walk, pickup, condition, seed=9, steps=2, return_trace=True)
-    self.assertEqual(tuple(out.shape), (8, 80, 192))
+    self.assertEqual(tuple(out.shape), (8, 80, 195))
     for step in trace:
         self.assertTrue(torch.equal(step.walk_input[:, 30:50], step.pickup_input[:, 0:20]))
 ```
@@ -208,11 +208,11 @@ Expected: FAIL with missing `overlap_diffusion`.
 
 - [ ] **Step 3: Implement the shared denoiser architecture**
 
-Use a 256-wide temporal transformer with eight residual blocks and eight heads. Project frame, static-condition, temporal-condition, and sinusoidal timestep embeddings to width 256; emit epsilon in `[B,50,192]`. Keep walking and pickup weights independent but schemas identical.
+Use a 256-wide temporal transformer with eight residual blocks and eight heads. Project frame, static-condition, temporal-condition, and sinusoidal timestep embeddings to width 256; emit epsilon in `[B,50,195]`. Keep walking and pickup weights independent but schemas identical.
 
 - [ ] **Step 4: Implement one-global-latent DDIM**
 
-Allocate CPU-seeded noise `[8,80,192]` once. At each timestep, slice `[0:50]` and `[30:80]`, call both models, assemble one epsilon tensor, blend overlap `j` with `w=j/19`, apply fixed-frame and differentiable task guidance, and perform one global DDIM update. Never independently update the two slices.
+Allocate CPU-seeded noise `[8,80,195]` once. At each timestep, slice `[0:50]` and `[30:80]`, call both models, assemble one epsilon tensor, blend overlap `j` with `w=j/19`, apply fixed-frame and differentiable task guidance, and perform one global DDIM update. Never independently update the two slices.
 
 - [ ] **Step 5: Implement training losses**
 
@@ -231,6 +231,35 @@ git add resources/g1_interaction_builder/overlap_diffusion.py tests/python/test_
 git commit -m "feat: add simultaneous overlap diffusion sampler"
 ```
 
+### Task 3A: Preserve Dynamic Hips Translation Before Training
+
+**Files:**
+- Modify: `resources/g1_interaction_builder/overlap_motion.py`
+- Modify: `resources/g1_interaction_builder/overlap_diffusion.py`
+- Modify: `tests/python/test_overlap_motion.py`
+- Modify: `tests/python/test_overlap_dataset.py`
+- Modify: `tests/python/test_overlap_diffusion.py`
+- Modify: `tools/build_g1_overlap_dataset.py`
+
+- [ ] **Step 1: Add failing dynamic-Hips codec and 195-channel schema tests**
+
+Prove an 8 cm local Hips displacement round-trips while all existing global translation/yaw invariance and byte-identical overlap tests remain true. Update sampler shape, loss-channel slices, normalization, manifest, and malformed-schema tests to 195.
+
+- [ ] **Step 2: Implement the amended frame layout**
+
+Encode Simulation-root XYZ, local Hips XYZ, 31 rotation-6D blocks, and three contacts. Decode dynamic Hips XYZ and restore frozen offsets only for bones 2–30. Keep all shared-latent, task-guidance, and loss semantics unchanged except for corrected channel offsets.
+
+- [ ] **Step 3: Rebuild and audit the real dataset**
+
+Run all overlap motion/dataset/diffusion tests, rebuild `build/g1-overlap/dataset.npz`, verify `frame_schema=195`, 2,020 interaction rows, byte-identical overlaps, object/source-disjoint splits, and nonzero Hips-channel variance.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add resources/g1_interaction_builder/overlap_motion.py resources/g1_interaction_builder/overlap_diffusion.py tests/python/test_overlap_motion.py tests/python/test_overlap_dataset.py tests/python/test_overlap_diffusion.py tools/build_g1_overlap_dataset.py
+git commit -m "fix: preserve dynamic hips in overlap motion"
+```
+
 ### Task 4: Training, Checkpoints, and 20-vs-50-Step Quality Gate
 
 **Files:**
@@ -244,7 +273,7 @@ git commit -m "feat: add simultaneous overlap diffusion sampler"
 
 - [ ] **Step 1: Write failing tiny-training and identity tests**
 
-Assert one training step writes both model states, `frame_dim=192`, windows `(50,50,20,80)`, prediction type `epsilon`, 25 Hz, normalization arrays, skeleton signature, dataset digest, and no test-partition statistics.
+Assert one training step writes both model states, `frame_dim=195`, windows `(50,50,20,80)`, prediction type `epsilon`, 25 Hz, normalization arrays, skeleton signature, dataset digest, and no test-partition statistics.
 
 - [ ] **Step 2: Run the focused test and confirm schema failure**
 
