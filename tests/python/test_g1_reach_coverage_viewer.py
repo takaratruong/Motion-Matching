@@ -60,6 +60,7 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
         self.assertIn("std::atomic<size_t> next_clip", source)
         self.assertIn("worker_count", source)
         self.assertIn("workers.emplace_back", source)
+        self.assertIn("reach::evaluate_candidate(", source)
 
     def test_makefile_has_standalone_targets(self):
         makefile = self.source(MAKEFILE)

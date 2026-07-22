@@ -1201,6 +1201,26 @@ void test_terminal_contact_window_exempts_only_the_active_wrist_chain() {
             interaction::TrajectoryFeasibilityReason::None,
             "terminal active wrist-chain contact was rejected");
 
+    const auto after_contact = shaped_pose_with_world_positions(
+        wrist_contact, interaction::Hand::Right, 6U);
+    const interaction::TrajectoryFeasibility after_result =
+        interaction::evaluate_shaped_trajectory_feasibility(
+            after_contact, 4U, interaction::Hand::Right,
+            object, environment, config);
+    require(after_result.reason ==
+                interaction::TrajectoryFeasibilityReason::ObjectCollision &&
+            after_result.sample == 5U,
+            "contact window was not bounded to end at Contact");
+
+    const interaction::TrajectoryFeasibility before_result =
+        interaction::evaluate_shaped_trajectory_feasibility(
+            after_contact, 5U, interaction::Hand::Right,
+            object, environment, config);
+    require(before_result.reason ==
+                interaction::TrajectoryFeasibilityReason::ObjectCollision &&
+            before_result.sample == 0U,
+            "contact window exempted more than its configured sample count");
+
     wrist_contact[g1_skeleton::RightElbow] = vec3(0.0F, 0.0F, 0.0F);
     const auto elbow_collision = shaped_pose_with_world_positions(
         wrist_contact, interaction::Hand::Right, 5U);

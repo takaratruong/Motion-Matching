@@ -125,6 +125,33 @@ reach::Query own_query(const reach::Pack& pack, size_t clip) {
     return query;
 }
 
+const interaction::EnvironmentGeometry& probe_environment() {
+    static const interaction::EnvironmentGeometry environment =
+        interaction::make_coverage_environment(
+            {vec3(0.0F, 0.74F, 0.0F), quat()},
+            vec3(1.20F, 0.06F, 0.75F));
+    return environment;
+}
+
+reach::Evaluation evaluate_query(
+    const reach::Pack& pack,
+    size_t clip,
+    const reach::Query& query) {
+    const vec3 dimensions(0.10F, 0.10F, 0.10F);
+    interaction::Transform object{};
+    object.rotation = quat_mul(
+        query.target.rotation,
+        quat_from_angle_axis(-kPi, vec3(0.0F, 1.0F, 0.0F)));
+    object.position = query.target.position - quat_mul_vec3(
+        object.rotation, vec3(0.5F * dimensions.x, 0.0F, 0.0F));
+    return reach::evaluate_candidate(
+        pack,
+        reach::Candidate{clip},
+        query,
+        {object, dimensions},
+        probe_environment());
+}
+
 Report run_clip(const reach::Pack& pack, size_t clip) {
     Report report{};
     const reach::Evaluation zero = reach::shape_candidate(
@@ -148,8 +175,8 @@ Report run_clip(const reach::Pack& pack, size_t clip) {
                 reach::Query query = own_query(pack, clip);
                 query.target.position = query.target.position +
                     sign * offset * axis;
-                const reach::Evaluation evaluation = reach::shape_candidate(
-                    pack, reach::Candidate{clip}, query);
+                const reach::Evaluation evaluation = evaluate_query(
+                    pack, clip, query);
                 record(report, pack, clip, evaluation, true);
             }
         }
@@ -164,8 +191,8 @@ Report run_clip(const reach::Pack& pack, size_t clip) {
                 query.target.rotation = quat_mul(
                     query.target.rotation,
                     quat_from_angle_axis(sign * angle, axis));
-                const reach::Evaluation evaluation = reach::shape_candidate(
-                    pack, reach::Candidate{clip}, query);
+                const reach::Evaluation evaluation = evaluate_query(
+                    pack, clip, query);
                 record(report, pack, clip, evaluation, false);
             }
         }
@@ -175,7 +202,7 @@ Report run_clip(const reach::Pack& pack, size_t clip) {
         twist.target.rotation,
         quat_from_angle_axis(kPi, vec3(1, 0, 0)));
     record(report, pack, clip,
-        reach::shape_candidate(pack, reach::Candidate{clip}, twist), false);
+        evaluate_query(pack, clip, twist), false);
     return report;
 }
 

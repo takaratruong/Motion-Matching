@@ -1041,9 +1041,11 @@ TrajectoryFeasibility evaluate_shaped_trajectory_feasibility(
         const WorldPose world = world_pose(trajectory.poses[sample]);
         const size_t contact_window = std::min(
             config.active_object_contact_window_samples,
-            trajectory.poses.size());
+            contact_point + 1U);
+        const size_t first_contact_sample =
+            contact_point + 1U - contact_window;
         const bool terminal_contact = contact_window > 0U &&
-            sample >= trajectory.poses.size() - contact_window;
+            sample >= first_contact_sample && sample <= contact_point;
         if (skeleton_intersects_box(
                 world, object, hand, terminal_contact, config)) {
             feasibility.object_collision_observed = true;
