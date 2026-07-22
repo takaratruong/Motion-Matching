@@ -186,7 +186,7 @@ class ContinuousControlLoopTests(unittest.TestCase):
             with loop:
                 time.sleep(0.2)
 
-    def test_x_rising_edge_sets_cancel_event(self) -> None:
+    def test_x_rising_edge_latches_terminate_without_process_cancellation(self) -> None:
         event = threading.Event()
         provider = FakeProvider([
             KeyLevels(focused=True, pressed=frozenset()),
@@ -200,10 +200,11 @@ class ContinuousControlLoopTests(unittest.TestCase):
         )
         with loop:
             self.assertTrue(loop.wait_for_sequence(2, timeout_s=1.0))
-            self.assertTrue(event.wait(timeout=1.0))
-        self.assertTrue(event.is_set())
+            snapshot, _mapped = loop.mailbox.sample_intent(0)
+        self.assertIsNone(snapshot.command)
+        self.assertFalse(event.is_set())
 
-    def test_simultaneous_x_and_backspace_edge_sets_only_cancel(self) -> None:
+    def test_simultaneous_x_and_backspace_latches_only_terminate(self) -> None:
         cancel = threading.Event()
         restart = threading.Event()
         events: list[str] = []
@@ -225,8 +226,10 @@ class ContinuousControlLoopTests(unittest.TestCase):
 
         with loop:
             self.assertTrue(loop.wait_for_sequence(2, timeout_s=1.0))
+            snapshot, _mapped = loop.mailbox.sample_intent(0)
 
-        self.assertTrue(cancel.is_set())
+        self.assertIsNone(snapshot.command)
+        self.assertFalse(cancel.is_set())
         self.assertFalse(restart.is_set())
         self.assertEqual(events.count("KEY X DOWN -> terminate"), 1)
         self.assertEqual(events.count("KEY BACKSPACE DOWN -> restart"), 1)

@@ -433,11 +433,9 @@ class ContinuousControlLoop:
         rising = pressed - self._prev_pressed
         for key in sorted(rising):
             self._emit(f"KEY {key} DOWN -> {_ACTIONS[key]}")
-        if "X" in rising:
-            if self._cancel_event is not None:
-                self._cancel_event.set()
-        elif (
-            "BACKSPACE" in rising
+        if (
+            "X" not in rising
+            and "BACKSPACE" in rising
             and self._restart_event is not None
             and (
                 self._restart_armed_event is None

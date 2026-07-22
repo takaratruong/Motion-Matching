@@ -1368,6 +1368,77 @@ class ResponsiveX11LoopTests(unittest.TestCase):
         self.assertEqual(traces, [])
         self.assertIsInstance(final_state, CameraDeliveryState)
 
+    def test_inflight_x_waits_for_boundary_before_clean_termination(self) -> None:
+        import time
+
+        from mm_sonic.manual_demo import _run_responsive_x11_loop
+        from mm_sonic.operator_x11 import ContinuousControlLoop, KeyLevels
+
+        rpc_started = threading.Event()
+        cancellation = threading.Event()
+        restart = threading.Event()
+        events: list[str] = []
+        case = self
+
+        class _Provider:
+            def sample(self):
+                pressed = frozenset({"X"}) if rpc_started.is_set() else frozenset()
+                return KeyLevels(focused=True, pressed=pressed)
+
+        with ContinuousControlLoop(
+            _Provider(),
+            HoldenControlMapper(initial_heading_yaw_rad=0.0),
+            event_sink=events.append,
+            cancel_event=cancellation,
+            restart_event=restart,
+            period_s=0.001,
+        ) as control_loop:
+            self.assertTrue(control_loop.wait_for_sequence(1, timeout_s=1.0))
+
+            class _InFlightCommitter:
+                next_chunk = 0
+
+                def run_one_chunk(self, command, *, command_is_current=None):
+                    rpc_started.set()
+                    deadline = time.monotonic() + 1.0
+                    while (
+                        control_loop.mailbox.current_revision == 1
+                        and time.monotonic() < deadline
+                    ):
+                        time.sleep(0.001)
+                    case.assertGreater(
+                        control_loop.mailbox.current_revision,
+                        1,
+                        "X was not published while the boundary was in flight",
+                    )
+                    case.assertFalse(
+                        cancellation.is_set(),
+                        "X asynchronously cancelled the in-flight boundary",
+                    )
+                    self.next_chunk += 1
+                    return object()
+
+            committer = _InFlightCommitter()
+            final_state = _run_responsive_x11_loop(
+                control_loop=control_loop,
+                committer=committer,
+                simulator=_BoundarySimulator(),
+                chunks=3,
+                camera_state=CameraDeliveryState(),
+                event_sink=events.append,
+                trace_sink=lambda _trace: None,
+                session_id="session",
+                camera_disabled_prefix="CAMERA DISABLED",
+                restart_event=restart,
+                cancellation_event=cancellation,
+            )
+
+        self.assertEqual(committer.next_chunk, 1)
+        self.assertFalse(cancellation.is_set())
+        self.assertFalse(restart.is_set())
+        self.assertEqual(events.count("KEY X DOWN -> terminate"), 1)
+        self.assertIsInstance(final_state, CameraDeliveryState)
+
 
 class _FakeBundle:
     def __init__(self, path) -> None:

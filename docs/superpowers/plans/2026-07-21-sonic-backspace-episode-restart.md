@@ -4,7 +4,7 @@
 
 **Goal:** Make a rising Backspace edge cleanly tear down the current visible Sonic episode and automatically launch a fresh, fully synchronized episode at the registered terrain start.
 
-**Architecture:** Add Backspace as an X11-only control edge backed by a dedicated `threading.Event`, separate from the locomotion mailbox and `X` cancellation. Boundary loops convert that edge into an internal `OperatorRestartRequested` outcome; `run_demo` records the interrupted episode before its existing fail-closed cleanup, and `main` supervises sequential `run_demo` calls with fresh child processes and run bundles.
+**Architecture:** Add Backspace as an X11-only control edge backed by a dedicated `threading.Event`, separate from the locomotion mailbox. `X` remains a boundary-latched terminate command and does not set shared infrastructure cancellation. Boundary loops convert Backspace into an internal `OperatorRestartRequested` outcome; `run_demo` records the interrupted episode before its existing fail-closed cleanup, and `main` supervises sequential `run_demo` calls with fresh child processes and run bundles.
 
 **Tech Stack:** Python 3.10, `ctypes`/libX11, `threading.Event`, JSON evidence through `RunBundle`, `unittest`, MuJoCo/GEAR/SONIC integration canary.
 
@@ -13,7 +13,9 @@
 - Backspace is active only after `LIVE X11` readiness and is rising-edge triggered.
 - Backspace restarts MM, streamed reference, GEAR, simulator, and input state together; pose-only reset is forbidden.
 - The current MuJoCo window closes and a fresh one opens after the normal 20–30 second startup.
-- `X` exits the complete demonstration and never aliases Backspace.
+- `X` exits the complete demonstration and never aliases Backspace. It waits
+  for any current matched-horizon boundary to finish (roughly 0.2 seconds at
+  5 intervals) so final evidence and close use an aligned protocol stream.
 - Every episode uses a unique existing run directory; replacement output never appends to interrupted output.
 - Startup, protocol, validation, teardown, and child-process failures are fatal and never become automatic retries.
 - Backspace during pre-live startup, hot GEAR reset, automatic fall recovery, and policy-quality changes are out of scope.
@@ -123,11 +125,13 @@ restart_event: threading.Event | None = None,
 Validate it alongside `cancel_event`, save `self._restart_event`, and extend the rising-edge branch in `_process_transitions`:
 
 ```python
-if key == "X" and self._cancel_event is not None:
-    self._cancel_event.set()
-if key == "BACKSPACE" and self._restart_event is not None:
+if "X" not in rising and "BACKSPACE" in rising and self._restart_event is not None:
     self._restart_event.set()
 ```
+
+`X` is represented only by `NormalizedControlState.terminate` and the existing
+mailbox latch. The shared cancellation event is reserved for teardown or
+external infrastructure cancellation.
 
 Do not add Backspace handling to `normalized_state_from_pressed` or `HoldenControlMapper`.
 

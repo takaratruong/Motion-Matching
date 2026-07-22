@@ -21,8 +21,10 @@ current policy recover from a fall.
   corresponding simulator `qpos`; it does not reuse the fallen pose.
 - The operator must focus the newly opened MuJoCo window before control becomes
   live, using the existing focus-readiness barrier.
-- `X` continues to exit the demonstration completely. Backspace never aliases
-  exit.
+- `X` continues to exit the demonstration completely. It is latched in the
+  control mailbox, so an in-flight matched-horizon boundary finishes before
+  normal evidence and teardown; at the 5-interval setting this adds at most
+  the current roughly 0.2-second prefix. Backspace never aliases exit.
 - Holding Backspace generates exactly one restart request. A new request
   requires release followed by another press.
 - Backspace is passively grabbed with the other Sonic command keys so MuJoCo
@@ -36,6 +38,12 @@ current policy recover from a fall.
 action registry, and passive-grab set. `ContinuousControlLoop` accepts a
 dedicated `restart_event`. On the rising Backspace edge it sets that event and
 emits `KEY BACKSPACE DOWN -> restart`; release emits the matching UP event.
+
+`X` sets only the normalized terminate level that the mailbox latches. It does
+not set the shared infrastructure-cancellation event. That event is reserved
+for teardown or external infrastructure cancellation, so X cannot abandon an
+MM, GEAR, or simulator RPC response and misalign the protocol stream. If X and
+Backspace rise together, X still suppresses the restart at the input source.
 
 Backspace is excluded from `NormalizedControlState`. It must not change
 velocity, heading, camera, stand, or terminate values. The restart event is
@@ -80,8 +88,8 @@ files. Existing successful summary schemas remain unchanged.
 ## Lifecycle and Failure Handling
 
 The restart event is accepted only from a healthy, focused X11 control loop.
-Provider failures and cancellation races retain the existing fail-closed
-behavior. If teardown fails, the supervisor does not start another episode;
+Provider failures and external infrastructure cancellation retain the existing
+fail-closed behavior. If teardown fails, the supervisor does not start another episode;
 the cleanup error is surfaced so two GEAR or simulator processes cannot overlap.
 
 The restart event is cleared by construction because every episode creates a
@@ -101,6 +109,9 @@ Unit tests will establish:
   edges, and release permits a later restart.
 - Backspace leaves the normalized locomotion/camera command neutral and does
   not set the exit cancellation event.
+- X latches a terminate command without setting process cancellation; an X
+  arriving during a fake RPC waits for that boundary and then finalizes on an
+  aligned protocol stream.
 - The responsive loop returns restart at a boundary without generating another
   MM candidate.
 - `run_demo` records the interrupted outcome and executes all cleanup paths.
