@@ -540,6 +540,12 @@ std::vector<HandTrajectory> select_hand_trajectories(
         trajectory.cost =
             position_error / position_normalizer +
             orientation_error / orientation_normalizer;
+        if (query.orientation_mode == GraspOrientationMode::ApproachAxis) {
+            constexpr float pi = 3.141592654F;
+            trajectory.cost += 0.25F * quaternion_angle(
+                mapped_contact.rotation,
+                query.grasp_world_rotation) / pi;
+        }
         selected.push_back(std::move(trajectory));
         if (selected.size() > config.maximum_compatible_clips) {
             throw std::length_error("compatible hand trajectory limit exceeded");
@@ -639,6 +645,7 @@ ShapedHandTrajectory shape_hand_trajectory(
         query.orientation_mode == GraspOrientationMode::ExactPose;
     const bool axis_orientation =
         query.orientation_mode == GraspOrientationMode::ApproachAxis;
+    const bool refine_orientation = exact_orientation || axis_orientation;
     const vec3 mapped_candidate_axis = normalize(quat_mul_vec3(
         alignment.rotation,
         quat_mul_vec3(
@@ -646,7 +653,7 @@ ShapedHandTrajectory shape_hand_trajectory(
             trajectory.source_approach_direction_object)));
     const vec3 axis_in_hand = quat_mul_vec3(
         quat_inv(base_contact.rotation), mapped_candidate_axis);
-    const quat contact_rotation = exact_orientation
+    const quat contact_rotation = refine_orientation
         ? quat_normalize(quat_mul(
               query.grasp_world_rotation,
               quat_inv(base_contact.rotation)))
@@ -668,7 +675,7 @@ ShapedHandTrajectory shape_hand_trajectory(
             linear_weight * linear_weight * (3.0F - 2.0F * linear_weight);
         Transform target = base_hands[sample];
         target.position = target.position + weight * contact_translation;
-        if (exact_orientation) {
+        if (refine_orientation) {
             const quat corrected = quat_normalize(quat_mul(
                 contact_rotation, base_hands[sample].rotation));
             target.rotation = quat_nlerp_shortest(
@@ -677,7 +684,13 @@ ShapedHandTrajectory shape_hand_trajectory(
 
         Pose pose = std::move(aligned[sample]);
         IKConfig solve_config = config;
-        if (!exact_orientation) {
+        if (axis_orientation) {
+            constexpr float pi = 3.141592654F;
+            solve_config.maximum_request_orientation_radians = pi;
+            solve_config.orientation_scale_m_per_radian = 0.10F;
+            solve_config.maximum_iterations = std::max(
+                16, config.maximum_iterations);
+        } else if (!exact_orientation) {
             constexpr float pi = 3.141592654F;
             solve_config.maximum_request_orientation_radians = pi;
             solve_config.accepted_orientation_radians = pi;
@@ -693,18 +706,28 @@ ShapedHandTrajectory shape_hand_trajectory(
             world.positions[elbow_index(query.hand)]);
         shaped.poses.push_back(std::move(pose));
         if (sample == trajectory.contact_point) {
-            shaped.contact_accepted = result.accepted;
-            shaped.reason = result.reason;
-            if (axis_orientation && result.accepted) {
-                const Transform solved_hand = hand_transform(world, query.hand);
+            const Transform solved_hand = hand_transform(world, query.hand);
+            shaped.achieved_orientation_error_radians = quaternion_angle(
+                solved_hand.rotation, query.grasp_world_rotation);
+            if (axis_orientation) {
                 const vec3 solved_axis = quat_mul_vec3(
                     solved_hand.rotation, axis_in_hand);
-                if (direction_angle(
-                        solved_axis, query.approach_world_direction) >
-                    config.accepted_orientation_radians) {
-                    shaped.contact_accepted = false;
-                    shaped.reason = Reason::CorrectionLimit;
-                }
+                constexpr float maximum_fallback_orientation_error =
+                    1.047197551F;
+                shaped.contact_accepted =
+                    length(solved_hand.position - query.grasp_world_position) <=
+                        config.accepted_position_m &&
+                    direction_angle(
+                        solved_axis, query.approach_world_direction) <=
+                        config.accepted_orientation_radians &&
+                    shaped.achieved_orientation_error_radians <=
+                        maximum_fallback_orientation_error;
+                shaped.reason = shaped.contact_accepted
+                    ? Reason::None
+                    : Reason::CorrectionLimit;
+            } else {
+                shaped.contact_accepted = result.accepted;
+                shaped.reason = result.reason;
             }
         }
     }

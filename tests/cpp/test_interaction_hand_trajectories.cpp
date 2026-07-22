@@ -24,6 +24,15 @@ bool near_rotation(quat left, quat right, float tolerance = 1.0e-4F) {
     return std::abs(dot - 1.0F) <= tolerance;
 }
 
+float rotation_error_radians(quat left, quat right) {
+    left = quat_normalize(left);
+    right = quat_normalize(right);
+    const float absolute_dot = std::min(1.0F, std::abs(
+        left.w * right.w + left.x * right.x +
+        left.y * right.y + left.z * right.z));
+    return 2.0F * std::acos(absolute_dot);
+}
+
 bool active_arm_bone(size_t bone, interaction::Hand hand) {
     const std::array<g1_skeleton::Bone, 7> left{{
         g1_skeleton::LeftShoulderPitch,
@@ -362,6 +371,27 @@ void test_approach_axis_search_ignores_twist_and_rejects_wrong_axis() {
             "axis search did not label fallback matches");
 }
 
+void test_approach_axis_search_softly_ranks_full_wrist_orientation() {
+    ClipSpec sixty{};
+    sixty.grasp_position = vec3(0.10F, 0.20F, 0.30F);
+    sixty.grasp_rotation = quat_from_angle_axis(
+        1.047197551F, vec3(1.0F, 0.0F, 0.0F));
+    ClipSpec thirty = sixty;
+    thirty.grasp_rotation = quat_from_angle_axis(
+        0.523598776F, vec3(1.0F, 0.0F, 0.0F));
+    const interaction::Database database = make_database({sixty, thirty});
+    interaction::HandTrajectoryQuery query = identity_query();
+    query.orientation_mode = interaction::GraspOrientationMode::ApproachAxis;
+    query.approach_world_direction = vec3(1.0F, 0.0F, 0.0F);
+
+    const auto selected = interaction::select_hand_trajectories(database, query);
+
+    require(selected.size() == 2U,
+            "soft orientation ranking removed an axis-compatible candidate");
+    require(selected[0].clip == 1 && selected[1].clip == 0,
+            "axis fallback did not prefer the closer full wrist orientation");
+}
+
 void test_exact_search_still_rejects_large_wrist_twist() {
     ClipSpec exact{};
     exact.grasp_position = vec3(0.10F, 0.20F, 0.30F);
@@ -401,7 +431,7 @@ void test_axis_shaping_accepts_wrist_twist() {
     ClipSpec twist{};
     twist.grasp_position = vec3(0.10F, 0.20F, 0.30F);
     twist.grasp_rotation = quat_from_angle_axis(
-        1.570796327F, vec3(1.0F, 0.0F, 0.0F));
+        0.785398163F, vec3(1.0F, 0.0F, 0.0F));
     const interaction::Database database = make_database({twist});
     interaction::HandTrajectoryQuery query = identity_query();
     query.orientation_mode =
@@ -415,6 +445,62 @@ void test_axis_shaping_accepts_wrist_twist() {
 
     require(shaped.contact_accepted,
             "axis shaping still required exact wrist twist");
+}
+
+void test_axis_shaping_refines_full_wrist_orientation() {
+    constexpr float thirty_degrees = 0.523598776F;
+    ClipSpec twist{};
+    twist.grasp_position = vec3(0.10F, 0.20F, 0.30F);
+    twist.grasp_rotation = quat_from_angle_axis(
+        thirty_degrees, vec3(1.0F, 0.0F, 0.0F));
+    const interaction::Database database = make_database({twist});
+    interaction::HandTrajectoryQuery query = identity_query();
+    query.orientation_mode = interaction::GraspOrientationMode::ApproachAxis;
+    query.approach_world_direction = vec3(1.0F, 0.0F, 0.0F);
+    const auto selected = interaction::select_hand_trajectories(database, query);
+    require(selected.size() == 1U,
+            "twisted fallback fixture was not selected");
+    const auto mapped = interaction::map_hand_trajectory(selected.front(), query);
+    const float unshaped_error = rotation_error_radians(
+        mapped.hands[selected.front().contact_point].rotation,
+        query.grasp_world_rotation);
+
+    const auto shaped = interaction::shape_hand_trajectory(
+        database, selected.front(), query);
+
+    require(shaped.contact_accepted,
+            "refined fallback was rejected");
+    require(shaped.achieved_orientation_error_radians < unshaped_error,
+            "fallback did not improve source wrist twist");
+    require(length(
+                shaped.path.hands[selected.front().contact_point].position -
+                query.grasp_world_position) <= 0.04F,
+            "orientation refinement lost contact position");
+}
+
+void test_axis_shaping_rejects_excessive_achieved_orientation_error() {
+    constexpr float seventy_five_degrees = 1.308996939F;
+    ClipSpec twist{};
+    twist.grasp_position = vec3(0.10F, 0.20F, 0.30F);
+    twist.grasp_rotation = quat_from_angle_axis(
+        seventy_five_degrees, vec3(1.0F, 0.0F, 0.0F));
+    const interaction::Database database = make_database({twist});
+    interaction::HandTrajectoryQuery query = identity_query();
+    query.orientation_mode = interaction::GraspOrientationMode::ApproachAxis;
+    query.approach_world_direction = vec3(1.0F, 0.0F, 0.0F);
+    const auto selected = interaction::select_hand_trajectories(database, query);
+    require(selected.size() == 1U,
+            "excessive-twist fallback fixture was not selected");
+    interaction::IKConfig no_motion{};
+    no_motion.maximum_step_radians = 1.0e-6F;
+
+    const auto shaped = interaction::shape_hand_trajectory(
+        database, selected.front(), query, no_motion);
+
+    require(!shaped.contact_accepted,
+            "fallback accepted more than 60 degrees of achieved error");
+    require(shaped.reason == interaction::Reason::CorrectionLimit,
+            "fallback used the wrong orientation-ceiling rejection reason");
 }
 
 void test_axis_shaping_enforces_stricter_final_axis_limit() {
@@ -1088,9 +1174,12 @@ int main() {
     test_object_roll_researches_recorded_world_grasp_orientation();
     test_world_grasp_limits_and_position_only_orientation();
     test_approach_axis_search_ignores_twist_and_rejects_wrong_axis();
+    test_approach_axis_search_softly_ranks_full_wrist_orientation();
     test_exact_search_still_rejects_large_wrist_twist();
     test_axis_query_accepts_object_tilted_world_direction();
     test_axis_shaping_accepts_wrist_twist();
+    test_axis_shaping_refines_full_wrist_orientation();
+    test_axis_shaping_rejects_excessive_achieved_orientation_error();
     test_axis_shaping_enforces_stricter_final_axis_limit();
     test_front_side_filter_rejects_only_rear_half_plane();
     test_selects_every_close_complete_same_hand_clip_in_stable_order();

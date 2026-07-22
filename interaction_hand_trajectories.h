@@ -69,6 +69,7 @@ struct MappedHandTrajectory {
 struct ShapedHandTrajectory {
     std::vector<Pose> poses;
     MappedHandTrajectory path;
+    float achieved_orientation_error_radians = 0.0F;
     bool contact_accepted = false;
     Reason reason = Reason::None;
 };

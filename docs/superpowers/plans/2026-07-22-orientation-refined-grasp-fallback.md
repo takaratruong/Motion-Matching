@@ -34,7 +34,7 @@
 
 - [ ] **Step 1: Write failing shaping tests**
 
-Extend the existing reachable fallback fixture by rotating its source wrist 30 degrees around its local approach axis while leaving the requested grasp rotation unchanged. Measure the mapped Contact quaternion error before shaping, then require that shaping reduces that error while retaining accepted position and axis. Reuse that fixture with a 75-degree source twist and set `IKConfig::maximum_step_radians = 0.0F`; require rejection with `Reason::CorrectionLimit` because all 16 iterations leave the achieved result above the 60-degree ceiling:
+Extend the existing reachable fallback fixture by rotating its source wrist 30 degrees around its local approach axis while leaving the requested grasp rotation unchanged. Measure the mapped Contact quaternion error before shaping, then require that shaping reduces that error while retaining accepted position and axis. Reuse that fixture with a 75-degree source twist and set `IKConfig::maximum_step_radians = 1.0e-6F`; require rejection with `Reason::CorrectionLimit` because all 16 iterations leave the achieved result above the 60-degree ceiling:
 
 ```cpp
 const auto shaped = interaction::shape_hand_trajectory(
@@ -47,7 +47,7 @@ require(length(shaped.path.hands[selected.front().contact_point].position -
         "orientation refinement lost contact position");
 
 interaction::IKConfig no_refinement{};
-no_refinement.maximum_step_radians = 0.0F;
+no_refinement.maximum_step_radians = 1.0e-6F;
 const auto excessive = interaction::shape_hand_trajectory(
     database, excessive_selected.front(), excessive_query, no_refinement);
 require(!excessive.contact_accepted,
