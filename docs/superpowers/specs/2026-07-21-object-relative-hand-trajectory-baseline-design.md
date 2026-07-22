@@ -73,7 +73,7 @@ paths use a blue-to-purple rank gradient. Contact points are marked separately.
 ## Trajectory-Lab Viewer
 
 Use a separate lightweight raylib executable rather than the playable
-controller. It loads only the interaction pack, selector, shelf scene, and
+controller. It loads only the interaction pack, selector, table scene, and
 trajectory renderer. Locomotion and diffusion therefore cannot influence this
 diagnostic.
 
@@ -83,50 +83,82 @@ The viewer exposes live object controls:
 - `R`/`F`: object pitch;
 - `Z`/`C`: object roll;
 - arrow keys: object planar translation;
-- Page Up/Page Down: object height;
+- `W`/`S`: object height;
+- Page Up/Page Down: optional aliases for object height;
+- `[`/`]`: cycle backward/forward through every compatible kinematic option;
 - `V`: toggle rejected trajectories;
 - Backspace: reset the query.
 
 The grasp is stored in object coordinates and follows every object transform.
 The internal query interface also supports an independently supplied grasp world
-pose or position for later tests.
+pose or position for later tests. Mapping and collision classification are
+recomputed on every rendered frame while any movement or rotation key is held;
+there is no key-release update or deferred recomputation. The selected option is
+highlighted while the complete trajectory field remains visible.
 
-## Shelf and Collision Feasibility
+## Recorded Table Fixture and Collision Feasibility
 
-Construct a shelf from five oriented boxes: floor, back, left wall, right wall,
-and top. The shelf remains fixed while the object moves and rotates inside it.
+Replace the oversized cabinet with the selected source clip's recorded support
+table. Preserve its authored tabletop position, rotation, and dimensions, then
+recenter the complete source scene only in the horizontal plane so the recorded
+feet remain on the ground. Render the tabletop plus four slender legs as five
+oriented collision boxes. The table remains fixed while the object moves and
+rotates. This keeps fixture scale and pickup height tied to the data rather than
+to an arbitrary cabinet.
 
 Each selected source clip stores wrist and elbow samples from Reach through
 Lift. Map both through the object frame and the exact Contact residual. Before
 Contact, reject a path if its wrist sphere or elbow-to-wrist capsule intersects
 the target object's oriented box. At all frames, reject a path if those proxies
-intersect any shelf box. Contact and post-Contact object overlap are exempt only
-from the object test, never from shelf tests.
+intersect any table box. Contact and post-Contact object overlap are exempt only
+from the object test, never from table tests.
 
 Accepted paths are the choices available to later playback. Rejected paths are
 not selectable, but can be drawn in faint red for diagnosis. The UI reports
-close, collision-safe, object-rejected, and shelf-rejected counts.
+close, collision-safe, object-rejected, and table-rejected counts.
+
+## Cycled Kinematic Skeleton
+
+The viewer cycles the deterministic sorted candidate list, including candidates
+currently rejected by collision checks. The selected candidate's status and clip
+index are always visible; rejected selections render red rather than silently
+skipping to a safe candidate.
+
+Animate the selected clip's complete G1 pose from Reach through Lift at the
+database rate and loop it. Reconstruct each frame with the database hierarchy,
+then apply the same single rigid mapping used by its displayed wrist trajectory:
+
+`contact_residual * target_object * inverse(source_object)`.
+
+Apply that transform to every world-space joint. The selected skeleton wrist
+must therefore coincide with the highlighted hand path at the same sample. Draw
+joints and parent-child cylinders only; do not load a robot mesh. Object motion,
+rotation, candidate cycling, and full-pose/position-only changes immediately
+rebuild the selected skeleton mapping. The animation clock continues independently
+so holding a movement key does not pause playback.
 
 ## Failure Behavior
 
 Malformed configuration, missing interaction artifacts, zero eligible clips, or
 more than 4096 compatible clips must produce a clear startup diagnostic. Invalid
-shelf dimensions are rejected. A single malformed source clip is excluded
+table dimensions are rejected. A single malformed source clip is excluded
 without changing the deterministic order of valid candidates.
 
 ## Verification
 
 - Unit tests cover ranking, deterministic tie-breaking, hand filtering, phase
   bounds, tolerance gates, exact pose convergence, exact position-only
-  convergence, moved/rotated target invariance, object collision, shelf
+  convergence, moved/rotated target invariance, object collision, table
   collision, and Contact exemption boundaries.
-- Viewer source tests prove all controls, rejected-path toggle, and absence of
-  diffusion/controller authority.
+- Viewer source tests prove W/S live height controls, candidate cycling, recorded
+  table construction, selected skeleton animation, rejected-path toggle, and
+  absence of diffusion/controller authority.
 - The viewer is built and launched as exactly one process with no controller,
   robot mesh, terrain mesh, or diffusion artifact.
 - Visual success means all compatible paths converge exactly on the requested
-  grasp, collision-unsafe paths are excluded, and choices update immediately
-  when object position or orientation changes.
+  grasp, collision status updates while the object is moving, and the cycled G1
+  skeleton's wrist follows the highlighted option through Reach, Contact, and
+  Lift.
 
 ## Deterministic Playback Follow-On
 
