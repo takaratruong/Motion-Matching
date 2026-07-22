@@ -8,7 +8,6 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -113,9 +112,8 @@ HandTrajectoryQuery make_query(
     query.object_dimensions = canonical.dimensions;
     query.hand = canonical.hand;
     query.grasp_world_position = grasp_world.position;
-    query.grasp_world_rotation = position_only
-        ? std::nullopt
-        : std::optional<quat>(grasp_world.rotation);
+    query.grasp_world_rotation = grasp_world.rotation;
+    query.constrain_grasp_orientation = !position_only;
     return query;
 }
 
@@ -140,8 +138,9 @@ TrajectorySet rebuild_valid_trajectories(
                 TrajectoryFeasibilityReason::None});
             continue;
         }
-        const auto feasibility = interaction::evaluate_trajectory_feasibility(
-            shaped.path, candidate.contact_point, object, shelf);
+        const auto feasibility =
+            interaction::evaluate_shaped_trajectory_feasibility(
+                shaped, candidate.contact_point, query.hand, object, shelf);
         RenderedTrajectory rendered{
             candidate, std::move(shaped), feasibility.reason};
         if (feasibility.reason == TrajectoryFeasibilityReason::None) {
@@ -369,7 +368,8 @@ int main(int argc, char** argv) {
                     animation_seconds = 0.0F;
                 }
             }
-            if (IsKeyPressed(KEY_RIGHT_BRACKET)) {
+            if (IsKeyPressed(KEY_SLASH) ||
+                IsKeyPressed(KEY_RIGHT_BRACKET)) {
                 if (!trajectories.valid.empty()) {
                     selected_index =
                         (selected_index + 1U) % trajectories.valid.size();
@@ -381,30 +381,12 @@ int main(int argc, char** argv) {
                 position_only = !position_only;
                 object_changed = true;
             }
+            if (IsKeyPressed(KEY_ENTER)) object_changed = true;
             if (object_changed) {
-                const int32_t previous_clip = trajectories.valid.empty()
-                    ? -1
-                    : trajectories.valid[selected_index].source.clip;
                 query = make_query(object_world, canonical, position_only);
                 trajectories = rebuild_valid_trajectories(
                     database, query, table_geometry);
                 selected_index = 0U;
-                if (previous_clip >= 0) {
-                    const auto preserved = std::find_if(
-                        trajectories.valid.begin(),
-                        trajectories.valid.end(),
-                        [previous_clip](const RenderedTrajectory& candidate) {
-                            return candidate.source.clip == previous_clip;
-                        });
-                    if (preserved != trajectories.valid.end()) {
-                        selected_index = static_cast<size_t>(std::distance(
-                            trajectories.valid.begin(), preserved));
-                    } else {
-                        animation_seconds = 0.0F;
-                    }
-                } else if (!trajectories.valid.empty()) {
-                    animation_seconds = 0.0F;
-                }
             }
 
             BeginDrawing();
@@ -486,7 +468,7 @@ int main(int argc, char** argv) {
                 26, 108, 16, DARKGRAY);
             DrawText(
                 TextFormat(
-                    "[/]: cycle option  V: rejected paths  P: %s  Backspace: reset",
+                    "[: previous  / or ]: next  Enter: rerun  P: %s",
                     position_only ? "position-only grasp" : "full grasp pose"),
                 26, 134, 16, DARKGRAY);
             EndDrawing();

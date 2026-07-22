@@ -19,7 +19,8 @@ class HandTrajectoryViewerTests(unittest.TestCase):
             "KEY_Q", "KEY_E", "KEY_R", "KEY_F", "KEY_Z", "KEY_C",
             "KEY_LEFT", "KEY_RIGHT", "KEY_UP", "KEY_DOWN",
             "KEY_W", "KEY_S", "KEY_PAGE_UP", "KEY_PAGE_DOWN",
-            "KEY_LEFT_BRACKET", "KEY_RIGHT_BRACKET",
+            "KEY_LEFT_BRACKET", "KEY_RIGHT_BRACKET", "KEY_SLASH",
+            "KEY_ENTER",
             "KEY_V", "KEY_BACKSPACE",
         ):
             self.assertIn(key, source)
@@ -28,7 +29,7 @@ class HandTrajectoryViewerTests(unittest.TestCase):
         source = self.source()
         self.assertIn("select_hand_trajectories(", source)
         self.assertIn("shape_hand_trajectory(", source)
-        self.assertIn("evaluate_trajectory_feasibility(", source)
+        self.assertIn("evaluate_shaped_trajectory_feasibility(", source)
         self.assertIn("rebuild_valid_trajectories(", source)
         object_change = source.split("if (object_changed)", 1)[1]
         self.assertIn("rebuild_valid_trajectories(", object_change)
@@ -38,6 +39,11 @@ class HandTrajectoryViewerTests(unittest.TestCase):
         self.assertIn("object_rejected", source)
         self.assertIn("table_rejected", source)
         self.assertIn("valid.empty()", source)
+        self.assertIn("constrain_grasp_orientation", source)
+        self.assertNotIn("previous_clip", source)
+        self.assertNotIn("preserved", source)
+        self.assertIn("selected_index = 0U", object_change)
+        self.assertIn("[: previous  / or ]: next  Enter: rerun", source)
 
         trajectory_source = TRAJECTORY_SOURCE_PATH.read_text(encoding="utf-8")
         self.assertIn("hand_trajectory_scene_alignment(", trajectory_source)
