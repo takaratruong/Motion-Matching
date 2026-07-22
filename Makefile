@@ -172,7 +172,7 @@ g1_reach_coverage_probe: g1_reach_coverage_probe.cpp \
   g1_arm_joint_metadata.h interaction_pose.cpp interaction_pose.h \
   interaction_target.cpp interaction_target.h interaction_database.h \
   g1_skeleton.h vec.h quat.h
-	$(CXX) $(CONTROLLER_CXXFLAGS) -O3 -DNDEBUG -I. -o $@$(EXT) \
+	$(CXX) $(CONTROLLER_CXXFLAGS) -O3 -DNDEBUG -pthread -I. -o $@$(EXT) \
 	  g1_reach_coverage_probe.cpp reach_coverage.cpp reach_database.cpp \
 	  reach_motion.cpp interaction_hand_trajectories.cpp interaction_ik.cpp \
 	  interaction_pose.cpp interaction_target.cpp

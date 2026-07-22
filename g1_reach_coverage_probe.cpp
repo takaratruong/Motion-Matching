@@ -1,6 +1,8 @@
 #include "reach_coverage.h"
 
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -11,6 +13,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -113,65 +117,118 @@ reach::Query own_query(const reach::Pack& pack, size_t clip) {
     return query;
 }
 
-Report run_probe(const reach::Pack& pack) {
+Report run_clip(const reach::Pack& pack, size_t clip) {
     Report report{};
-    for (size_t clip = 0U; clip < pack.database.clip_count; ++clip) {
-        const reach::Evaluation evaluation = reach::shape_candidate(
-            pack, reach::Candidate{clip}, own_query(pack, clip));
-        ++report.zero_tested;
-        report.zero_max_position = std::max(
-            report.zero_max_position, evaluation.position_error_m);
-        report.zero_max_approach = std::max(
-            report.zero_max_approach, evaluation.approach_error_radians);
-        if (evaluation.rejection != reach::Rejection::None ||
-            evaluation.position_error_m > kZeroPositionTolerance ||
-            evaluation.approach_error_radians > kZeroApproachTolerance) {
-            ++report.zero_failed;
-        }
+    const reach::Evaluation zero = reach::shape_candidate(
+        pack, reach::Candidate{clip}, own_query(pack, clip));
+    ++report.zero_tested;
+    report.zero_max_position = zero.position_error_m;
+    report.zero_max_approach = zero.approach_error_radians;
+    if (zero.rejection != reach::Rejection::None ||
+        zero.position_error_m > kZeroPositionTolerance ||
+        zero.approach_error_radians > kZeroApproachTolerance) {
+        ++report.zero_failed;
     }
 
     constexpr std::array<float, 5U> position_offsets = {
         0.05F, 0.10F, 0.20F, 0.30F, 0.45F};
     constexpr std::array<vec3, 3U> axes = {
         vec3(1, 0, 0), vec3(0, 1, 0), vec3(0, 0, 1)};
-    for (size_t clip = 0U; clip < pack.database.clip_count; ++clip) {
-        for (const vec3 axis : axes) {
-            for (const float offset : position_offsets) {
-                for (const float sign : {-1.0F, 1.0F}) {
-                    reach::Query query = own_query(pack, clip);
-                    query.target.position = query.target.position +
-                        sign * offset * axis;
-                    const reach::Evaluation evaluation = reach::shape_candidate(
-                        pack, reach::Candidate{clip}, query);
-                    record(report, pack, clip, evaluation, true);
-                }
+    for (const vec3 axis : axes) {
+        for (const float offset : position_offsets) {
+            for (const float sign : {-1.0F, 1.0F}) {
+                reach::Query query = own_query(pack, clip);
+                query.target.position = query.target.position +
+                    sign * offset * axis;
+                const reach::Evaluation evaluation = reach::shape_candidate(
+                    pack, reach::Candidate{clip}, query);
+                record(report, pack, clip, evaluation, true);
             }
         }
     }
 
     constexpr std::array<float, 4U> orientation_angles = {
         0.261799388F, 0.523598776F, 1.047197551F, 1.570796327F};
-    for (size_t clip = 0U; clip < pack.database.clip_count; ++clip) {
-        for (const vec3 axis : axes) {
-            for (const float angle : orientation_angles) {
-                for (const float sign : {-1.0F, 1.0F}) {
-                    reach::Query query = own_query(pack, clip);
-                    query.target.rotation = quat_mul(
-                        query.target.rotation,
-                        quat_from_angle_axis(sign * angle, axis));
-                    const reach::Evaluation evaluation = reach::shape_candidate(
-                        pack, reach::Candidate{clip}, query);
-                    record(report, pack, clip, evaluation, false);
-                }
+    for (const vec3 axis : axes) {
+        for (const float angle : orientation_angles) {
+            for (const float sign : {-1.0F, 1.0F}) {
+                reach::Query query = own_query(pack, clip);
+                query.target.rotation = quat_mul(
+                    query.target.rotation,
+                    quat_from_angle_axis(sign * angle, axis));
+                const reach::Evaluation evaluation = reach::shape_candidate(
+                    pack, reach::Candidate{clip}, query);
+                record(report, pack, clip, evaluation, false);
             }
         }
-        reach::Query twist = own_query(pack, clip);
-        twist.target.rotation = quat_mul(
-            twist.target.rotation,
-            quat_from_angle_axis(kPi, vec3(1, 0, 0)));
-        record(report, pack, clip,
-            reach::shape_candidate(pack, reach::Candidate{clip}, twist), false);
     }
+    reach::Query twist = own_query(pack, clip);
+    twist.target.rotation = quat_mul(
+        twist.target.rotation,
+        quat_from_angle_axis(kPi, vec3(1, 0, 0)));
+    record(report, pack, clip,
+        reach::shape_candidate(pack, reach::Candidate{clip}, twist), false);
+    return report;
+}
+
+void merge_count(Count& destination, const Count& source) {
+    destination.evaluations += source.evaluations;
+    destination.accepted += source.accepted;
+}
+
+void merge_groups(
+    std::map<std::string, Count>& destination,
+    const std::map<std::string, Count>& source) {
+    for (const auto& [name, count] : source) {
+        merge_count(destination[name], count);
+    }
+}
+
+void merge_report(Report& destination, const Report& source) {
+    destination.zero_tested += source.zero_tested;
+    destination.zero_failed += source.zero_failed;
+    destination.zero_max_position = std::max(
+        destination.zero_max_position, source.zero_max_position);
+    destination.zero_max_approach = std::max(
+        destination.zero_max_approach, source.zero_max_approach);
+    merge_count(
+        destination.position_perturbations, source.position_perturbations);
+    merge_count(
+        destination.orientation_perturbations,
+        source.orientation_perturbations);
+    for (size_t reason = 0U; reason < reach::kRejectionCount; ++reason) {
+        destination.rejections[reason] += source.rejections[reason];
+    }
+    merge_groups(destination.hand, source.hand);
+    merge_groups(destination.source, source.source);
+    merge_groups(destination.height_band, source.height_band);
+    merge_groups(destination.direction_band, source.direction_band);
+    merge_groups(destination.augmentation, source.augmentation);
+    merge_count(destination.union_counts, source.union_counts);
+}
+
+Report run_probe(const reach::Pack& pack) {
+    const size_t worker_count = std::max<size_t>(1U, std::min<size_t>(
+        8U,
+        std::min<size_t>(
+            pack.database.clip_count,
+            std::max(1U, std::thread::hardware_concurrency()))));
+    std::atomic<size_t> next_clip{0U};
+    std::vector<Report> partial(worker_count);
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    for (size_t worker = 0U; worker < worker_count; ++worker) {
+        workers.emplace_back([&, worker]() {
+            while (true) {
+                const size_t clip = next_clip.fetch_add(1U);
+                if (clip >= pack.database.clip_count) break;
+                merge_report(partial[worker], run_clip(pack, clip));
+            }
+        });
+    }
+    for (std::thread& worker : workers) worker.join();
+    Report report{};
+    for (const Report& value : partial) merge_report(report, value);
     return report;
 }
 
