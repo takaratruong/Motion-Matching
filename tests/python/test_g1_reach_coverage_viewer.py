@@ -26,6 +26,10 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
             "POSITION ERROR", "APPROACH AXIS", "FULL ORIENTATION",
             "OBJECT COLLISION", "ENVIRONMENT COLLISION",
             "SEARCH STALE - press Enter", "--object-size",
+            "results.options", "selected_evaluation",
+            "REJECTED - motion shown for diagnosis",
+            "ClearBackground(Color{238, 241, 245, 255})",
+            "DrawSphereWires(", "DARKBLUE", "SKYBLUE", "LIME",
         ):
             self.assertIn(required, source)
         for forbidden in (

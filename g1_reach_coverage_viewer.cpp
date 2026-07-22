@@ -27,6 +27,7 @@ struct Options {
 struct SearchResults {
     std::vector<reach::Evaluation> evaluations;
     std::vector<size_t> accepted;
+    std::vector<size_t> options;
     reach::Diagnostics diagnostics{};
 };
 
@@ -152,9 +153,21 @@ SearchResults rerun_search(
         if (results.evaluations[index].rejection == reach::Rejection::None) {
             results.accepted.push_back(index);
         }
+        if (!results.evaluations[index].poses.empty()) {
+            results.options.push_back(index);
+        }
     }
     results.diagnostics = reach::summarize_evaluations(
         pack, results.evaluations);
+    std::cerr << "coverage search: complete=" << results.options.size()
+              << " accepted=" << results.accepted.size()
+              << " object_collision="
+              << results.diagnostics.rejection_counts[
+                     static_cast<size_t>(reach::Rejection::ObjectCollision)]
+              << " environment_collision="
+              << results.diagnostics.rejection_counts[
+                     static_cast<size_t>(reach::Rejection::EnvironmentCollision)]
+              << '\n';
     return results;
 }
 
@@ -205,32 +218,50 @@ void draw_axes(
     }
 }
 
-void draw_pose(const interaction::Pose& pose, Color color) {
+void draw_pose(
+    const interaction::Pose& pose,
+    Color joint_color,
+    Color bone_color) {
     const interaction::WorldPose world = interaction::world_pose(pose);
-    for (size_t bone = 1U; bone < g1_skeleton::BoneCount; ++bone) {
+    for (size_t bone = 0U; bone < g1_skeleton::BoneCount; ++bone) {
+        DrawSphereWires(
+            ray(world.positions[bone]), 0.024F, 4, 8, joint_color);
         const int32_t parent = g1_skeleton::kParents[bone];
         if (parent < 0) continue;
         const Vector3 start = ray(world.positions[static_cast<size_t>(parent)]);
         const Vector3 stop = ray(world.positions[bone]);
-        DrawCylinderEx(start, stop, 0.012F, 0.012F, 7, color);
-        DrawSphere(stop, 0.018F, color);
+        DrawCylinderEx(start, stop, 0.014F, 0.014F, 6, bone_color);
     }
 }
 
 void draw_path(
     const reach::Evaluation& evaluation,
     reach::Hand hand,
-    Color color) {
+    Color color,
+    size_t stride = 1U,
+    bool emphasized = false) {
     if (evaluation.poses.size() < 2U) return;
     const size_t wrist = wrist_bone(hand);
     vec3 previous = interaction::world_pose(
         evaluation.poses.front()).positions[wrist];
-    for (size_t sample = 1U; sample < evaluation.poses.size(); ++sample) {
+    for (size_t sample = stride;
+         sample < evaluation.poses.size();
+         sample += stride) {
         const vec3 current = interaction::world_pose(
             evaluation.poses[sample]).positions[wrist];
-        DrawLine3D(ray(previous), ray(current), color);
+        if (emphasized) {
+            DrawCylinderEx(
+                ray(previous), ray(current), 0.009F, 0.009F, 6, color);
+            DrawSphere(ray(current), 0.014F, color);
+        } else {
+            DrawLine3D(ray(previous), ray(current), color);
+        }
         previous = current;
     }
+    const vec3 final = interaction::world_pose(
+        evaluation.poses.back()).positions[wrist];
+    DrawLine3D(ray(previous), ray(final), color);
+    DrawSphere(ray(final), 0.018F, color);
 }
 
 const char* provenance(const reach::Pack& pack, size_t clip) {
@@ -248,55 +279,61 @@ void draw_hud(
     bool coverage_environment,
     bool show_rejected,
     reach::Hand hand) {
-    DrawRectangle(12, 12, 650, 252, Fade(BLACK, 0.76F));
+    DrawRectangle(14, 14, 790, 282, Color{255, 255, 255, 225});
     DrawText(
         "Arrow X/Z  W/S Y | Q/E yaw R/F pitch Z/C roll | Enter search",
-        22, 20, 17, RAYWHITE);
+        26, 24, 17, DARKGRAY);
     DrawText(
         "M hand | G open/coverage | [ previous, ] or / next | V rejected | Backspace reset",
-        22, 43, 16, LIGHTGRAY);
+        26, 48, 16, DARKGRAY);
     DrawText(
         TextFormat("HAND %s | %s ENVIRONMENT | rejected paths %s",
             hand == reach::Hand::Left ? "LEFT" : "RIGHT",
             coverage_environment ? "COVERAGE" : "OPEN",
             show_rejected ? "ON" : "OFF"),
-        22, 69, 18, YELLOW);
+        26, 74, 18, DARKGRAY);
     DrawText(
         TextFormat("accepted %zu / evaluated %zu | joint-limit diagnostic %zu",
             results.diagnostics.accepted, results.diagnostics.evaluations,
             results.diagnostics.joint_limit_saturated),
-        22, 94, 18, RAYWHITE);
+        26, 99, 18, DARKGRAY);
     static constexpr std::array<const char*, 8U> labels = {
         "ACCEPTED", "OUTSIDE ENVELOPE", "INVALID SOLVER", "POSITION ERROR",
         "APPROACH AXIS", "FULL ORIENTATION", "OBJECT COLLISION",
         "ENVIRONMENT COLLISION"};
     for (size_t reason = 0U; reason < labels.size(); ++reason) {
-        const int column = reason % 2U == 0U ? 22 : 330;
-        const int row = 121 + static_cast<int>(reason / 2U) * 21;
+        const int column = reason % 2U == 0U ? 26 : 390;
+        const int row = 126 + static_cast<int>(reason / 2U) * 21;
         DrawText(
             TextFormat("%s: %zu", labels[reason],
                 results.diagnostics.rejection_counts[reason]),
-            column, row, 16, reason == 0U ? LIME : LIGHTGRAY);
+            column, row, 16, reason == 0U ? DARKGREEN : DARKGRAY);
     }
-    if (!results.accepted.empty()) {
+    if (!results.options.empty()) {
         const reach::Evaluation& evaluation =
-            results.evaluations[results.accepted[selected]];
+            results.evaluations[results.options[selected]];
         const size_t clip = evaluation.candidate.clip;
+        const char* selected_status = evaluation.rejection == reach::Rejection::None
+            ? "SAFE"
+            : "REJECTED - motion shown for diagnosis";
         DrawText(
-            TextFormat("option %zu/%zu | %s | %s",
-                selected + 1U, results.accepted.size(), provenance(pack, clip),
+            TextFormat("option %zu/%zu | %s | %s | %s (%s)",
+                selected + 1U, results.options.size(), provenance(pack, clip),
                 pack.database.source_names.at(
-                    pack.database.source_indices.at(clip)).c_str()),
-            22, 210, 17, trajectory_color(pack, clip, true));
+                    pack.database.source_indices.at(clip)).c_str(),
+                selected_status, reach::rejection_name(evaluation.rejection)),
+            26, 216, 16,
+            evaluation.rejection == reach::Rejection::None
+                ? DARKGREEN : MAROON);
         DrawText(
             TextFormat("final: %.1f cm | approach %.1f deg | orientation %.1f deg",
                 evaluation.position_error_m * 100.0F,
                 evaluation.approach_error_radians * 180.0F / kPi,
                 evaluation.orientation_error_radians * 180.0F / kPi),
-            22, 233, 16, RAYWHITE);
+            26, 242, 16, DARKGRAY);
     }
     if (stale) {
-        DrawText("SEARCH STALE - press Enter", 680, 22, 24, ORANGE);
+        DrawText("SEARCH STALE - press Enter", 830, 22, 24, MAROON);
     }
 }
 
@@ -325,11 +362,12 @@ int main(int argc, char** argv) {
         SearchResults results = rerun_search(
             pack, query, {object, options.object_size}, coverage);
 
-        InitWindow(1500, 900, "G1 retargeted reach coverage");
+        SetConfigFlags(FLAG_VSYNC_HINT | FLAG_MSAA_4X_HINT);
+        InitWindow(1280, 800, "G1 retargeted reach coverage");
         SetTargetFPS(60);
         Camera3D camera{};
-        camera.position = Vector3{2.35F, 1.65F, 2.35F};
-        camera.target = Vector3{0.0F, 0.85F, 0.0F};
+        camera.position = Vector3{2.35F, 1.55F, -2.45F};
+        camera.target = Vector3{0.0F, 0.70F, 0.0F};
         camera.up = Vector3{0.0F, 1.0F, 0.0F};
         camera.fovy = 45.0F;
         camera.projection = CAMERA_PERSPECTIVE;
@@ -382,49 +420,61 @@ int main(int argc, char** argv) {
                 animation_seconds = 0.0F;
                 stale = false;
             }
-            if (!results.accepted.empty()) {
+            if (!results.options.empty()) {
                 if (IsKeyPressed(KEY_LEFT_BRACKET)) {
-                    selected = (selected + results.accepted.size() - 1U) %
-                        results.accepted.size();
+                    selected = (selected + results.options.size() - 1U) %
+                        results.options.size();
                     animation_seconds = 0.0F;
                 }
                 if (IsKeyPressed(KEY_RIGHT_BRACKET) ||
                     IsKeyPressed(KEY_SLASH)) {
-                    selected = (selected + 1U) % results.accepted.size();
+                    selected = (selected + 1U) % results.options.size();
                     animation_seconds = 0.0F;
                 }
                 animation_seconds += dt;
             }
 
             BeginDrawing();
-            ClearBackground(Color{24, 27, 35, 255});
+            ClearBackground(Color{238, 241, 245, 255});
             BeginMode3D(camera);
             DrawGrid(20, 0.20F);
             for (const interaction::OrientedBox& box :
                  (use_coverage_environment ? coverage.boxes : open.boxes)) {
-                draw_oriented_box(box, Fade(GRAY, 0.72F));
+                DrawCubeV(
+                    ray(box.world.position), ray(box.dimensions),
+                    Color{135, 102, 74, 155});
+                draw_oriented_box(box, Color{72, 52, 39, 255});
             }
             draw_oriented_box({object, options.object_size}, GOLD);
+            DrawSphere(ray(query.target.position), 0.028F, GOLD);
             draw_axes(query.target, 0.16F, 255);
-            for (const reach::Evaluation& evaluation : results.evaluations) {
+            const size_t selected_evaluation = results.options.empty()
+                ? results.evaluations.size()
+                : results.options[selected];
+            for (size_t index = 0U; index < results.evaluations.size(); ++index) {
+                if (index == selected_evaluation) continue;
+                const reach::Evaluation& evaluation = results.evaluations[index];
                 if (evaluation.rejection != reach::Rejection::None &&
                     !show_rejected) {
                     continue;
                 }
                 draw_path(
                     evaluation, hand,
-                    trajectory_color(
-                        pack, evaluation.candidate.clip,
-                        evaluation.rejection == reach::Rejection::None));
+                    evaluation.rejection == reach::Rejection::None
+                        ? trajectory_color(
+                              pack, evaluation.candidate.clip, true)
+                        : Color{210, 45, 55, 75},
+                    5U);
             }
-            if (!results.accepted.empty()) {
+            if (!results.options.empty()) {
                 const reach::Evaluation& evaluation =
-                    results.evaluations[results.accepted[selected]];
+                    results.evaluations[selected_evaluation];
+                draw_path(evaluation, hand, LIME, 1U, true);
                 const float fps = static_cast<float>(pack.database.fps_numerator) /
                     static_cast<float>(pack.database.fps_denominator);
                 const size_t sample = static_cast<size_t>(
                     animation_seconds * fps) % evaluation.poses.size();
-                draw_pose(evaluation.poses[sample], RAYWHITE);
+                draw_pose(evaluation.poses[sample], DARKBLUE, SKYBLUE);
                 const interaction::WorldPose final = interaction::world_pose(
                     evaluation.poses.back());
                 const size_t wrist = wrist_bone(hand);
