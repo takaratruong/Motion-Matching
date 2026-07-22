@@ -111,12 +111,14 @@ the builder emits:
 1. the original captured left-hand reach; and
 2. one synthetic right-hand mirror.
 
-Mirror the entire pose, not just the arm. Reflection uses the G1 sagittal plane
-(`y = 0` in the canonical G1 frame): root and joint positions negate `y`, left
-and right bones are exchanged, and each world rotation is transformed as
-`R_mirror = M R M`, where `M = diag(1, -1, 1)`. Reflect the root-relative wrist
-endpoint and approach direction with the same `M`. Quaternions are normalized
-after conversion from the reflected rotation matrix.
+Mirror the entire pose, not just the arm. Raw MuJoCo G1 data is Z-up, so its
+sagittal plane is `y = 0`. Stored canonical motion is Y-up after the existing
+basis conversion, so the same sagittal reflection is `z = 0`: canonical root
+and joint positions negate `z`, left and right bones are exchanged, and each
+world rotation is transformed as `R_mirror = M R M`, where
+`M = diag(1, 1, -1)`. Reflect the root-relative wrist endpoint and approach
+direction with the same canonical `M`. Quaternions are normalized after
+conversion from the reflected rotation matrix.
 
 Mirroring must use a single explicit G1 left/right bone map and fail if a
 required counterpart is absent. Center bones map to themselves. The generated
