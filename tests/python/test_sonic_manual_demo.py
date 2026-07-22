@@ -1503,7 +1503,14 @@ class EpisodeSupervisorTests(unittest.TestCase):
         run.assert_called_once()
         self.assertEqual(run.call_args.kwargs["episode_ordinal"], 1)
 
-    def _run_interrupted_episode(self, *, responsive: bool) -> tuple[list[str], dict]:
+    def _run_interrupted_episode(
+        self,
+        *,
+        responsive: bool,
+        episode_ordinal: int = 1,
+        run_id: str = "manual-20260722T000000000001Z-100",
+        identity_sink: list[dict[str, str]] | None = None,
+    ) -> tuple[list[str], dict]:
         import numpy as np
 
         close_log: list[str] = []
@@ -1536,13 +1543,27 @@ class EpisodeSupervisorTests(unittest.TestCase):
                     "supported_movement_models": ["raw"],
                 }
 
-            def reset(self, *_args, **_kwargs):
+            def reset(self, *_args, **kwargs):
+                if identity_sink is not None:
+                    identity_sink.append(
+                        {
+                            "kind": "session",
+                            "value": kwargs["session_id"],
+                        }
+                    )
                 return {
                     "scene": {"scene_id": "scene", "route_id": "route"},
                     "movement_model": {"profile": "raw"},
                 }
 
-            def generate(self, *_args, **_kwargs):
+            def generate(self, *_args, **kwargs):
+                if identity_sink is not None:
+                    identity_sink.append(
+                        {
+                            "kind": "candidate",
+                            "value": kwargs["candidate_id"],
+                        }
+                    )
                 return object()
 
             def commit(self, *_args, **_kwargs):
@@ -1700,9 +1721,20 @@ class EpisodeSupervisorTests(unittest.TestCase):
             gear = _Gear()
             simulator = _Simulator()
 
-            def create_bundle(*_args, **_kwargs):
-                created_episode_ordinals.append(1)
+            def create_bundle(*args, **_kwargs):
+                created_episode_ordinals.append(episode_ordinal)
+                if identity_sink is not None:
+                    identity_sink.append(
+                        {"kind": "run", "value": args[2]}
+                    )
                 return bundle
+
+            def issue_run_id():
+                if identity_sink is not None:
+                    identity_sink.append(
+                        {"kind": "issued_run", "value": run_id}
+                    )
+                return run_id
 
             def activate(_gear, _simulator, *, before_control=None):
                 if before_control is not None:
@@ -1717,6 +1749,11 @@ class EpisodeSupervisorTests(unittest.TestCase):
                     manual_demo.RunBundle,
                     "create",
                     side_effect=create_bundle,
+                ),
+                patch.object(
+                    manual_demo,
+                    "_utc_run_id",
+                    side_effect=issue_run_id,
                 ),
                 patch.object(manual_demo, "load_joint_contract", return_value=object()),
                 patch.object(manual_demo, "SourceValidator", _Validator),
@@ -1784,11 +1821,63 @@ class EpisodeSupervisorTests(unittest.TestCase):
                 for patcher in patchers:
                     stack.enter_context(patcher)
                 with self.assertRaises(OperatorRestartRequested):
-                    manual_demo.run_demo(namespace, episode_ordinal=1)
+                    manual_demo.run_demo(
+                        namespace,
+                        episode_ordinal=episode_ordinal,
+                    )
 
-            self.assertEqual(created_episode_ordinals, [1])
+            self.assertEqual(created_episode_ordinals, [episode_ordinal])
             record = json.loads(bundle.written["episode-outcome.json"])
         return close_log, record
+
+    def test_fresh_episodes_use_distinct_run_and_mm_namespaces(self) -> None:
+        identities: list[dict[str, str]] = []
+        run_ids = (
+            "manual-20260722T000000000001Z-100",
+            "manual-20260722T000000000002Z-100",
+        )
+        for episode_ordinal, run_id in enumerate(run_ids, start=1):
+            self._run_interrupted_episode(
+                responsive=False,
+                episode_ordinal=episode_ordinal,
+                run_id=run_id,
+                identity_sink=identities,
+            )
+
+        observed_run_ids = [
+            identity["value"]
+            for identity in identities
+            if identity["kind"] == "run"
+        ]
+        issued_run_ids = [
+            identity["value"]
+            for identity in identities
+            if identity["kind"] == "issued_run"
+        ]
+        session_ids = [
+            identity["value"]
+            for identity in identities
+            if identity["kind"] == "session"
+        ]
+        candidate_ids = [
+            identity["value"]
+            for identity in identities
+            if identity["kind"] == "candidate"
+        ]
+        self.assertEqual(issued_run_ids, list(run_ids))
+        self.assertEqual(observed_run_ids, issued_run_ids)
+        self.assertEqual(len(set(session_ids)), 2)
+        self.assertEqual(len(set(candidate_ids)), 2)
+        for run_id, session_id, candidate_id in zip(
+            run_ids,
+            session_ids,
+            candidate_ids,
+        ):
+            self.assertEqual(session_id, run_id)
+            self.assertEqual(
+                candidate_id,
+                f"{session_id}:candidate:000000",
+            )
 
     def test_interrupted_episode_records_then_closes_every_resource(self) -> None:
         close_log, record = self._run_interrupted_episode(responsive=False)

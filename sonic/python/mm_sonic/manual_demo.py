@@ -769,7 +769,8 @@ def run_demo(
     gear_checkout = Path(namespace.gear_checkout).expanduser().resolve(strict=True)
     runtime = Path(namespace.runtime).expanduser().resolve(strict=True)
     terrain_dir = Path(namespace.terrain_dir).expanduser().resolve(strict=True)
-    bundle = RunBundle.create(output_root, "manual-sonic", _utc_run_id())
+    run_id = _utc_run_id()
+    bundle = RunBundle.create(output_root, "manual-sonic", run_id)
     environment = _environment(terrain_dir)
 
     contract = load_joint_contract(_SONIC_ROOT / "configs/g1_joint_contract.json")
@@ -842,7 +843,7 @@ def run_demo(
     gate: SimulationPolicyGate | None = None
     timeline: TargetTimeline | None = None
     committer: ManualChunkCommitter | None = None
-    session_id = f"manual-{os.getpid()}"
+    session_id = run_id
     next_chunk = 0
     responsive_traces: list[object] = []
     recorder = CommandRecorder(
