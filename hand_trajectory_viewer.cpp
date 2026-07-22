@@ -9,9 +9,10 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
-#include <optional>
+#include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -19,11 +20,13 @@ namespace {
 using interaction::HandTrajectory;
 using interaction::HandTrajectoryQuery;
 using interaction::OrientedBox;
-using interaction::ShelfGeometry;
+using interaction::EnvironmentGeometry;
 using interaction::ShapedHandTrajectory;
 using interaction::TrajectoryFeasibilityReason;
 
 constexpr size_t kBackgroundPathStride = 5U;
+constexpr size_t kTargetValidTrajectories = 12U;
+constexpr vec3 kSceneFront(0.0F, 0.0F, -1.0F);
 
 struct RenderedTrajectory {
     HandTrajectory source;
@@ -34,10 +37,14 @@ struct RenderedTrajectory {
 struct TrajectorySet {
     std::vector<RenderedTrajectory> valid;
     std::vector<RenderedTrajectory> rejected;
-    size_t compatible = 0U;
+    size_t exact_compatible = 0U;
+    size_t fallback_compatible = 0U;
+    size_t exact_valid = 0U;
+    size_t fallback_valid = 0U;
+    size_t wrong_side = 0U;
     size_t ik_rejected = 0U;
     size_t object_rejected = 0U;
-    size_t table_rejected = 0U;
+    size_t environment_rejected = 0U;
 };
 
 Vector3 ray_vector(vec3 value) {
@@ -62,36 +69,21 @@ struct CanonicalGrasp {
     interaction::Hand hand = interaction::Hand::Right;
     vec3 dimensions{};
     interaction::Transform grasp_in_object{};
+    vec3 approach_in_object{1.0F, 0.0F, 0.0F};
     interaction::Transform source_object{};
     interaction::Transform table_world{};
     vec3 table_dimensions{};
 };
 
-std::optional<ShelfGeometry> support_geometry(
+EnvironmentGeometry support_geometry(
     interaction::SupportKind support,
     const interaction::Transform& table_world,
     vec3 table_dimensions) {
     if (support == interaction::SupportKind::Ground) {
-        return std::nullopt;
+        return {};
     }
-    return interaction::make_recorded_table_geometry(
+    return interaction::make_coverage_environment(
         table_world, table_dimensions);
-}
-
-ShelfGeometry no_support_collision_geometry(vec3 scene_anchor) {
-    constexpr float offset = 1000000.0F;
-    ShelfGeometry geometry{};
-    for (size_t index = 0U; index < geometry.boxes.size(); ++index) {
-        geometry.boxes[index] = {
-            {
-                scene_anchor + vec3(
-                    offset + static_cast<float>(index), offset, offset),
-                quat(),
-            },
-            vec3(1.0F, 1.0F, 1.0F),
-        };
-    }
-    return geometry;
 }
 
 CanonicalGrasp canonical_grasp(
@@ -109,6 +101,7 @@ CanonicalGrasp canonical_grasp(
             read_vec3(database.grasp_positions_object, clip),
             read_quat(database.grasp_rotations_object, clip),
         },
+        read_vec3(database.approach_directions_object, clip),
         {
             read_vec3(
                 database.object_positions,
@@ -152,7 +145,7 @@ CanonicalGrasp find_canonical_grasp(const interaction::Database& database) {
 HandTrajectoryQuery make_query(
     const interaction::Transform& object_world,
     const CanonicalGrasp& canonical,
-    bool position_only) {
+    interaction::GraspOrientationMode orientation_mode) {
     const interaction::Transform grasp_world = interaction::compose(
         object_world, canonical.grasp_in_object);
     HandTrajectoryQuery query{};
@@ -161,24 +154,29 @@ HandTrajectoryQuery make_query(
     query.hand = canonical.hand;
     query.grasp_world_position = grasp_world.position;
     query.grasp_world_rotation = grasp_world.rotation;
-    query.constrain_grasp_orientation = !position_only;
+    query.approach_world_direction = normalize(quat_mul_vec3(
+        object_world.rotation, canonical.approach_in_object));
+    query.orientation_mode = orientation_mode;
     return query;
 }
 
-TrajectorySet rebuild_valid_trajectories(
+void process_candidates(
     const interaction::Database& database,
+    const std::vector<HandTrajectory>& candidates,
     const HandTrajectoryQuery& query,
-    const std::optional<ShelfGeometry>& table_geometry) {
+    const EnvironmentGeometry& environment,
+    std::unordered_set<int32_t>& accepted_clips,
+    size_t stop_after_valid,
+    TrajectorySet& result) {
     const OrientedBox object{query.object_world, query.object_dimensions};
-    const ShelfGeometry collision_geometry = table_geometry.value_or(
-        no_support_collision_geometry(query.object_world.position));
-    const std::vector<HandTrajectory> candidates =
-        interaction::select_hand_trajectories(database, query);
-    TrajectorySet result{};
-    result.compatible = candidates.size();
-    result.valid.reserve(candidates.size());
-    result.rejected.reserve(candidates.size());
     for (const HandTrajectory& candidate : candidates) {
+        if (result.valid.size() >= stop_after_valid) break;
+        if (accepted_clips.count(candidate.clip) != 0U) continue;
+        if (!interaction::starts_on_allowed_side(
+                candidate, query, kSceneFront)) {
+            ++result.wrong_side;
+            continue;
+        }
         ShapedHandTrajectory shaped = interaction::shape_hand_trajectory(
             database, candidate, query);
         if (!shaped.contact_accepted) {
@@ -192,21 +190,72 @@ TrajectorySet rebuild_valid_trajectories(
         const auto feasibility =
             interaction::evaluate_shaped_trajectory_feasibility(
                 shaped, candidate.contact_point, query.hand, object,
-                collision_geometry);
+                environment);
         std::vector<interaction::Pose>{}.swap(shaped.poses);
         RenderedTrajectory rendered{
             candidate, std::move(shaped), feasibility.reason};
         if (feasibility.reason == TrajectoryFeasibilityReason::None) {
+            accepted_clips.insert(candidate.clip);
+            if (candidate.match_tier ==
+                interaction::TrajectoryMatchTier::AxisFallback) {
+                ++result.fallback_valid;
+            } else {
+                ++result.exact_valid;
+            }
             result.valid.push_back(std::move(rendered));
         } else {
             if (feasibility.reason ==
                 TrajectoryFeasibilityReason::ObjectCollision) {
                 ++result.object_rejected;
             } else {
-                ++result.table_rejected;
+                ++result.environment_rejected;
             }
             result.rejected.push_back(std::move(rendered));
         }
+    }
+}
+
+TrajectorySet rebuild_valid_trajectories(
+    const interaction::Database& database,
+    const HandTrajectoryQuery& base_query,
+    const EnvironmentGeometry& environment) {
+    TrajectorySet result{};
+    std::unordered_set<int32_t> accepted_clips;
+    HandTrajectoryQuery exact_query = base_query;
+    const bool position_only = base_query.orientation_mode ==
+        interaction::GraspOrientationMode::PositionOnly;
+    exact_query.orientation_mode = position_only
+        ? interaction::GraspOrientationMode::PositionOnly
+        : interaction::GraspOrientationMode::ExactPose;
+    const std::vector<HandTrajectory> exact =
+        interaction::select_hand_trajectories(database, exact_query);
+    result.exact_compatible = exact.size();
+    result.valid.reserve(exact.size());
+    result.rejected.reserve(exact.size());
+    process_candidates(
+        database,
+        exact,
+        exact_query,
+        environment,
+        accepted_clips,
+        std::numeric_limits<size_t>::max(),
+        result);
+
+    if (!position_only && result.valid.size() < kTargetValidTrajectories) {
+        HandTrajectoryQuery fallback_query = base_query;
+        fallback_query.orientation_mode =
+            interaction::GraspOrientationMode::ApproachAxis;
+        const std::vector<HandTrajectory> fallback =
+            interaction::select_hand_trajectories(database, fallback_query);
+        result.fallback_compatible = fallback.size();
+        process_candidates(
+            database,
+            fallback,
+            fallback_query,
+            environment,
+            accepted_clips,
+            kTargetValidTrajectories,
+            result);
     }
     return result;
 }
@@ -220,8 +269,16 @@ ShapedHandTrajectory shape_selected_animation(
     if (selected_index >= trajectories.valid.size()) {
         throw std::out_of_range("selected trajectory index is invalid");
     }
+    HandTrajectoryQuery selected_query = searched_query;
+    const auto tier = trajectories.valid[selected_index].source.match_tier;
+    selected_query.orientation_mode = tier ==
+            interaction::TrajectoryMatchTier::AxisFallback
+        ? interaction::GraspOrientationMode::ApproachAxis
+        : (tier == interaction::TrajectoryMatchTier::PositionOnly
+               ? interaction::GraspOrientationMode::PositionOnly
+               : interaction::GraspOrientationMode::ExactPose);
     ShapedHandTrajectory shaped = interaction::shape_hand_trajectory(
-        database, trajectories.valid[selected_index].source, searched_query);
+        database, trajectories.valid[selected_index].source, selected_query);
     if (!shaped.contact_accepted) {
         throw std::runtime_error("validated trajectory no longer passes IK");
     }
@@ -301,6 +358,17 @@ const char* support_name(interaction::SupportKind support) {
         ? "GROUND" : "TABLE";
 }
 
+const char* match_tier_name(interaction::TrajectoryMatchTier tier) {
+    switch (tier) {
+        case interaction::TrajectoryMatchTier::Exact: return "EXACT";
+        case interaction::TrajectoryMatchTier::AxisFallback:
+            return "AXIS-FALLBACK";
+        case interaction::TrajectoryMatchTier::PositionOnly:
+            return "POSITION-ONLY";
+    }
+    return "UNKNOWN";
+}
+
 size_t animated_sample(
     const ShapedHandTrajectory& animation,
     float animation_seconds) {
@@ -362,7 +430,7 @@ int main(int argc, char** argv) {
             -canonical.table_world.position.z);
         interaction::Transform table_world = canonical.table_world;
         table_world.position = table_world.position + scene_offset;
-        const std::optional<ShelfGeometry> table_geometry = support_geometry(
+        const EnvironmentGeometry environment = support_geometry(
             canonical_support, table_world, canonical.table_dimensions);
 
         interaction::Transform initial_object = canonical.source_object;
@@ -374,9 +442,11 @@ int main(int argc, char** argv) {
         size_t selected_index = 0U;
         float animation_seconds = 0.0F;
         HandTrajectoryQuery query = make_query(
-            object_world, canonical, position_only);
+            object_world,
+            canonical,
+            interaction::GraspOrientationMode::ExactPose);
         TrajectorySet trajectories = rebuild_valid_trajectories(
-            database, query, table_geometry);
+            database, query, environment);
         HandTrajectoryQuery searched_query = query;
         ShapedHandTrajectory selected_animation = shape_selected_animation(
             database, trajectories, selected_index, searched_query);
@@ -478,12 +548,17 @@ int main(int argc, char** argv) {
                 grasp_changed = true;
             }
             if (grasp_changed) {
-                query = make_query(object_world, canonical, position_only);
+                query = make_query(
+                    object_world,
+                    canonical,
+                    position_only
+                        ? interaction::GraspOrientationMode::PositionOnly
+                        : interaction::GraspOrientationMode::ExactPose);
                 search_stale = true;
             }
             if (IsKeyPressed(KEY_ENTER)) {
                 trajectories = rebuild_valid_trajectories(
-                    database, query, table_geometry);
+                    database, query, environment);
                 selected_index = 0U;
                 searched_query = query;
                 selected_animation = shape_selected_animation(
@@ -496,14 +571,12 @@ int main(int argc, char** argv) {
             ClearBackground(Color{238, 241, 245, 255});
             BeginMode3D(camera);
             DrawGrid(20, 0.25F);
-            if (table_geometry.has_value()) {
-                for (const OrientedBox& box : table_geometry->boxes) {
-                    DrawCubeV(
-                        ray_vector(box.world.position),
-                        ray_vector(box.dimensions),
-                        Color{135, 102, 74, 155});
-                    draw_oriented_box(box, Color{72, 52, 39, 255});
-                }
+            for (const OrientedBox& box : environment.boxes) {
+                DrawCubeV(
+                    ray_vector(box.world.position),
+                    ray_vector(box.dimensions),
+                    Color{135, 102, 74, 155});
+                draw_oriented_box(box, Color{72, 52, 39, 255});
             }
             draw_oriented_box(
                 {object_world, canonical.dimensions},
@@ -539,25 +612,32 @@ int main(int argc, char** argv) {
             }
             EndMode3D();
 
-            DrawRectangle(14, 14, 665, 168, Color{255, 255, 255, 225});
+            DrawRectangle(14, 14, 790, 210, Color{255, 255, 255, 225});
             DrawText("Generic grasp trajectory field", 26, 24, 24, DARKGRAY);
             DrawText(
                 TextFormat(
-                    "compatible %i | valid %i | IK-rejected %i | object %i | table %i",
-                    static_cast<int>(trajectories.compatible),
-                    static_cast<int>(trajectories.valid.size()),
+                    "exact compatible %i valid %i | fallback compatible %i valid %i",
+                    static_cast<int>(trajectories.exact_compatible),
+                    static_cast<int>(trajectories.exact_valid),
+                    static_cast<int>(trajectories.fallback_compatible),
+                    static_cast<int>(trajectories.fallback_valid)),
+                26, 56, 18, DARKGRAY);
+            DrawText(
+                TextFormat(
+                    "wrong-side %i | IK %i | object %i | environment %i",
+                    static_cast<int>(trajectories.wrong_side),
                     static_cast<int>(trajectories.ik_rejected),
                     static_cast<int>(trajectories.object_rejected),
-                    static_cast<int>(trajectories.table_rejected)),
-                26, 56, 18, DARKGRAY);
+                    static_cast<int>(trajectories.environment_rejected)),
+                26, 82, 18, DARKGRAY);
             if (search_stale) {
                 DrawText(
                     "SEARCH STALE - press Enter",
-                    26, 82, 16, MAROON);
+                    26, 108, 16, MAROON);
             } else if (trajectories.valid.empty()) {
                 DrawText(
                     "0 valid motions for this world grasp",
-                    26, 82, 16, MAROON);
+                    26, 108, 16, MAROON);
             } else {
                 const RenderedTrajectory& selected =
                     trajectories.valid[selected_index];
@@ -567,24 +647,25 @@ int main(int argc, char** argv) {
                     static_cast<int32_t>(sample);
                 DrawText(
                     TextFormat(
-                        "option %i/%i | clip %i | SAFE | %s | %s frame %i",
+                        "option %i/%i | clip %i | %s | SAFE | %s | %s frame %i",
                         static_cast<int>(selected_index + 1U),
                         static_cast<int>(trajectories.valid.size()),
                         selected.source.clip,
+                        match_tier_name(selected.source.match_tier),
                         support_name(selected.source.support),
                         phase_name(database.phases.at(
                             static_cast<size_t>(frame))),
                         frame),
-                    26, 82, 16, DARKGRAY);
+                    26, 108, 16, DARKGRAY);
             }
             DrawText(
                 "Arrows: X/Z  W/S: height  Q/E: yaw  R/F: pitch  Z/C: roll",
-                26, 108, 16, DARKGRAY);
+                26, 134, 16, DARKGRAY);
             DrawText(
                 TextFormat(
                     "[: previous  / or ]: next  Enter: rerun  P: %s",
                     position_only ? "position-only grasp" : "full grasp pose"),
-                26, 134, 16, DARKGRAY);
+                26, 160, 16, DARKGRAY);
             EndDrawing();
         }
         CloseWindow();

@@ -414,7 +414,6 @@ void validate_query_and_config(
         !valid_rotation(query.grasp_world_rotation) ||
         (uses_axis &&
          (!finite(query.approach_world_direction) ||
-          std::abs(query.approach_world_direction.y) > 2.0e-5F ||
           !(approach_length > 1.0e-6F))) ||
         !finite(config.maximum_grasp_position_error_m) ||
         config.maximum_grasp_position_error_m < 0.0F ||

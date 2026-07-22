@@ -44,9 +44,10 @@ class HandTrajectoryViewerTests(unittest.TestCase):
         self.assertIn("grasp_world_rotation", source)
         self.assertIn("ik_rejected", source)
         self.assertIn("object_rejected", source)
-        self.assertIn("table_rejected", source)
+        self.assertIn("environment_rejected", source)
         self.assertIn("valid.empty()", source)
-        self.assertIn("constrain_grasp_orientation", source)
+        self.assertIn("orientation_mode", source)
+        self.assertNotIn("constrain_grasp_orientation", source)
         self.assertNotIn("previous_clip", source)
         self.assertNotIn("preserved", source)
         self.assertIn("selected_index = 0U", enter_search)
@@ -64,8 +65,8 @@ class HandTrajectoryViewerTests(unittest.TestCase):
 
     def test_builds_recorded_table_and_renders_rejections(self):
         source = self.source()
-        self.assertIn("ShelfGeometry", source)
-        self.assertIn("make_recorded_table_geometry(", source)
+        self.assertIn("EnvironmentGeometry", source)
+        self.assertIn("make_coverage_environment(", source)
         self.assertNotIn("make_shelf(", source)
         self.assertIn("show_rejected", source)
         self.assertIn("DrawLine3D", source)
@@ -105,26 +106,37 @@ class HandTrajectoryViewerTests(unittest.TestCase):
     def test_ground_support_uses_no_table_geometry(self):
         source = self.source()
         self.assertIn(
-            "std::optional<ShelfGeometry> support_geometry(", source
+            "EnvironmentGeometry support_geometry(", source
         )
         self.assertIn(
             "if (support == interaction::SupportKind::Ground) {\n"
-            "        return std::nullopt;\n"
+            "        return {};\n"
             "    }",
             source,
         )
-        self.assertIn("no_support_collision_geometry(", source)
-        self.assertIn("table_geometry.value_or(", source)
-        self.assertIn("if (table_geometry.has_value())", source)
+        self.assertNotIn("no_support_collision_geometry(", source)
+        self.assertIn("environment.boxes", source)
 
         helper = source.split(
-            "std::optional<ShelfGeometry> support_geometry(", 1
+            "EnvironmentGeometry support_geometry(", 1
         )[1].split("CanonicalGrasp canonical_grasp(", 1)[0]
         ground_branch = helper.split(
             "if (support == interaction::SupportKind::Ground)", 1
-        )[1].split("interaction::make_recorded_table_geometry(", 1)[0]
-        self.assertIn("return std::nullopt", ground_branch)
-        self.assertNotIn("make_recorded_table_geometry", ground_branch)
+        )[1].split("interaction::make_coverage_environment(", 1)[0]
+        self.assertIn("return {}", ground_branch)
+        self.assertNotIn("make_coverage_environment", ground_branch)
+
+    def test_uses_exact_first_axis_fallback_and_front_side_filter(self):
+        source = self.source()
+        self.assertIn("kTargetValidTrajectories = 12U", source)
+        self.assertIn("GraspOrientationMode::ExactPose", source)
+        self.assertIn("GraspOrientationMode::ApproachAxis", source)
+        self.assertIn("starts_on_allowed_side(", source)
+        self.assertIn("wrong_side", source)
+        self.assertIn("exact_compatible", source)
+        self.assertIn("fallback_compatible", source)
+        self.assertIn('"EXACT"', source)
+        self.assertIn('"AXIS-FALLBACK"', source)
 
     def test_is_independent_of_controller_diffusion_mesh_and_terrain(self):
         source = self.source()

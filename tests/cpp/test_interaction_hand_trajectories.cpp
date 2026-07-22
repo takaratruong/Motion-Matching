@@ -381,6 +381,22 @@ void test_exact_search_still_rejects_large_wrist_twist() {
             "exact search did not label exact matches");
 }
 
+void test_axis_query_accepts_object_tilted_world_direction() {
+    ClipSpec source{};
+    source.grasp_position = vec3(0.10F, 0.20F, 0.30F);
+    const interaction::Database database = make_database({source});
+    interaction::HandTrajectoryQuery query = identity_query();
+    query.orientation_mode =
+        interaction::GraspOrientationMode::ApproachAxis;
+    query.approach_world_direction = normalize(vec3(1.0F, 0.10F, 0.0F));
+
+    const auto selected = interaction::select_hand_trajectories(
+        database, query);
+
+    require(selected.size() == 1U,
+            "tilted object approach axis was not searchable");
+}
+
 void test_axis_shaping_accepts_wrist_twist() {
     ClipSpec twist{};
     twist.grasp_position = vec3(0.10F, 0.20F, 0.30F);
@@ -1073,6 +1089,7 @@ int main() {
     test_world_grasp_limits_and_position_only_orientation();
     test_approach_axis_search_ignores_twist_and_rejects_wrong_axis();
     test_exact_search_still_rejects_large_wrist_twist();
+    test_axis_query_accepts_object_tilted_world_direction();
     test_axis_shaping_accepts_wrist_twist();
     test_axis_shaping_enforces_stricter_final_axis_limit();
     test_front_side_filter_rejects_only_rear_half_plane();
