@@ -102,6 +102,30 @@ class HandTrajectoryViewerTests(unittest.TestCase):
         self.assertIn('"TABLE"', source)
         self.assertIn("support_name(selected.source.support)", source)
 
+    def test_ground_support_uses_no_table_geometry(self):
+        source = self.source()
+        self.assertIn(
+            "std::optional<ShelfGeometry> support_geometry(", source
+        )
+        self.assertIn(
+            "if (support == interaction::SupportKind::Ground) {\n"
+            "        return std::nullopt;\n"
+            "    }",
+            source,
+        )
+        self.assertIn("no_support_collision_geometry(", source)
+        self.assertIn("table_geometry.value_or(", source)
+        self.assertIn("if (table_geometry.has_value())", source)
+
+        helper = source.split(
+            "std::optional<ShelfGeometry> support_geometry(", 1
+        )[1].split("CanonicalGrasp canonical_grasp(", 1)[0]
+        ground_branch = helper.split(
+            "if (support == interaction::SupportKind::Ground)", 1
+        )[1].split("interaction::make_recorded_table_geometry(", 1)[0]
+        self.assertIn("return std::nullopt", ground_branch)
+        self.assertNotIn("make_recorded_table_geometry", ground_branch)
+
     def test_is_independent_of_controller_diffusion_mesh_and_terrain(self):
         source = self.source()
         for forbidden in (

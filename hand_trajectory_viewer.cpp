@@ -67,6 +67,33 @@ struct CanonicalGrasp {
     vec3 table_dimensions{};
 };
 
+std::optional<ShelfGeometry> support_geometry(
+    interaction::SupportKind support,
+    const interaction::Transform& table_world,
+    vec3 table_dimensions) {
+    if (support == interaction::SupportKind::Ground) {
+        return std::nullopt;
+    }
+    return interaction::make_recorded_table_geometry(
+        table_world, table_dimensions);
+}
+
+ShelfGeometry no_support_collision_geometry(vec3 scene_anchor) {
+    constexpr float offset = 1000000.0F;
+    ShelfGeometry geometry{};
+    for (size_t index = 0U; index < geometry.boxes.size(); ++index) {
+        geometry.boxes[index] = {
+            {
+                scene_anchor + vec3(
+                    offset + static_cast<float>(index), offset, offset),
+                quat(),
+            },
+            vec3(1.0F, 1.0F, 1.0F),
+        };
+    }
+    return geometry;
+}
+
 CanonicalGrasp canonical_grasp(
     const interaction::Database& database,
     size_t clip,
@@ -141,8 +168,10 @@ HandTrajectoryQuery make_query(
 TrajectorySet rebuild_valid_trajectories(
     const interaction::Database& database,
     const HandTrajectoryQuery& query,
-    const ShelfGeometry& shelf) {
+    const std::optional<ShelfGeometry>& table_geometry) {
     const OrientedBox object{query.object_world, query.object_dimensions};
+    const ShelfGeometry collision_geometry = table_geometry.value_or(
+        no_support_collision_geometry(query.object_world.position));
     const std::vector<HandTrajectory> candidates =
         interaction::select_hand_trajectories(database, query);
     TrajectorySet result{};
@@ -162,7 +191,8 @@ TrajectorySet rebuild_valid_trajectories(
         }
         const auto feasibility =
             interaction::evaluate_shaped_trajectory_feasibility(
-                shaped, candidate.contact_point, query.hand, object, shelf);
+                shaped, candidate.contact_point, query.hand, object,
+                collision_geometry);
         std::vector<interaction::Pose>{}.swap(shaped.poses);
         RenderedTrajectory rendered{
             candidate, std::move(shaped), feasibility.reason};
@@ -324,15 +354,16 @@ int main(int argc, char** argv) {
         const interaction::Database database = interaction::load_trajectory_database(
             pack / "interaction_database.bin");
         const CanonicalGrasp canonical = find_canonical_grasp(database);
+        const interaction::SupportKind canonical_support =
+            interaction::support_kind(database, canonical.clip);
         const vec3 scene_offset(
             -canonical.table_world.position.x,
             0.0F,
             -canonical.table_world.position.z);
         interaction::Transform table_world = canonical.table_world;
         table_world.position = table_world.position + scene_offset;
-        const ShelfGeometry table_geometry =
-            interaction::make_recorded_table_geometry(
-                table_world, canonical.table_dimensions);
+        const std::optional<ShelfGeometry> table_geometry = support_geometry(
+            canonical_support, table_world, canonical.table_dimensions);
 
         interaction::Transform initial_object = canonical.source_object;
         initial_object.position = initial_object.position + scene_offset;
@@ -465,11 +496,14 @@ int main(int argc, char** argv) {
             ClearBackground(Color{238, 241, 245, 255});
             BeginMode3D(camera);
             DrawGrid(20, 0.25F);
-            for (const OrientedBox& box : table_geometry.boxes) {
-                DrawCubeV(
-                    ray_vector(box.world.position), ray_vector(box.dimensions),
-                    Color{135, 102, 74, 155});
-                draw_oriented_box(box, Color{72, 52, 39, 255});
+            if (table_geometry.has_value()) {
+                for (const OrientedBox& box : table_geometry->boxes) {
+                    DrawCubeV(
+                        ray_vector(box.world.position),
+                        ray_vector(box.dimensions),
+                        Color{135, 102, 74, 155});
+                    draw_oriented_box(box, Color{72, 52, 39, 255});
+                }
             }
             draw_oriented_box(
                 {object_world, canonical.dimensions},
