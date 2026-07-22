@@ -203,6 +203,34 @@ class ContinuousControlLoopTests(unittest.TestCase):
             self.assertTrue(event.wait(timeout=1.0))
         self.assertTrue(event.is_set())
 
+    def test_simultaneous_x_and_backspace_edge_sets_only_cancel(self) -> None:
+        cancel = threading.Event()
+        restart = threading.Event()
+        events: list[str] = []
+        provider = FakeProvider([
+            KeyLevels(focused=True, pressed=frozenset()),
+            KeyLevels(
+                focused=True,
+                pressed=frozenset({"X", "BACKSPACE"}),
+            ),
+        ])
+        loop = ContinuousControlLoop(
+            provider,
+            _mapper(),
+            event_sink=events.append,
+            cancel_event=cancel,
+            restart_event=restart,
+            period_s=0.001,
+        )
+
+        with loop:
+            self.assertTrue(loop.wait_for_sequence(2, timeout_s=1.0))
+
+        self.assertTrue(cancel.is_set())
+        self.assertFalse(restart.is_set())
+        self.assertEqual(events.count("KEY X DOWN -> terminate"), 1)
+        self.assertEqual(events.count("KEY BACKSPACE DOWN -> restart"), 1)
+
     def test_backspace_rising_edge_sets_only_restart_event(self) -> None:
         cancel = threading.Event()
         restart = threading.Event()

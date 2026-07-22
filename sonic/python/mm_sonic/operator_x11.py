@@ -430,19 +430,21 @@ class ContinuousControlLoop:
     def _process_transitions(self, focused: bool, pressed: frozenset) -> None:
         if self._prev_focused and not focused:
             self._emit("FOCUS LOST -> neutral")
-        for key in sorted(pressed - self._prev_pressed):
+        rising = pressed - self._prev_pressed
+        for key in sorted(rising):
             self._emit(f"KEY {key} DOWN -> {_ACTIONS[key]}")
-            if key == "X" and self._cancel_event is not None:
+        if "X" in rising:
+            if self._cancel_event is not None:
                 self._cancel_event.set()
-            if (
-                key == "BACKSPACE"
-                and self._restart_event is not None
-                and (
-                    self._restart_armed_event is None
-                    or self._restart_armed_event.is_set()
-                )
-            ):
-                self._restart_event.set()
+        elif (
+            "BACKSPACE" in rising
+            and self._restart_event is not None
+            and (
+                self._restart_armed_event is None
+                or self._restart_armed_event.is_set()
+            )
+        ):
+            self._restart_event.set()
         for key in sorted(self._prev_pressed - pressed):
             self._emit(f"KEY {key} UP -> {_ACTIONS[key]}")
         self._prev_focused = focused
