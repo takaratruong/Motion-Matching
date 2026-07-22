@@ -58,6 +58,7 @@ struct ClipSpec {
     quat support_rotation{};
     vec3 support_size{1.20F, 0.08F, 0.80F};
     int32_t approach_samples = 3;
+    vec3 approach_direction{1.0F, 0.0F, 0.0F};
 };
 
 void write_vec3(std::vector<float>& values, size_t index, vec3 value) {
@@ -140,7 +141,9 @@ interaction::Database make_database(const std::vector<ClipSpec>& specs) {
         write_vec3(database.grasp_positions_object, clip, spec.grasp_position);
         write_quat(database.grasp_rotations_object, clip, spec.grasp_rotation);
         write_vec3(
-            database.approach_directions_object, clip, vec3(1.0F, 0.0F, 0.0F));
+            database.approach_directions_object,
+            clip,
+            spec.approach_direction);
         const size_t wrist = spec.hand == interaction::Hand::Right
             ? static_cast<size_t>(g1_skeleton::RightWrist)
             : static_cast<size_t>(g1_skeleton::LeftWrist);
@@ -226,7 +229,7 @@ void test_position_only_shaping_ignores_orientation_acceptance() {
     query.grasp_world_position = vec3(0.10F, 0.25F, 0.30F);
     query.grasp_world_rotation =
         quat_from_angle_axis(1.2F, vec3(1.0F, 0.0F, 0.0F));
-    query.constrain_grasp_orientation = false;
+    query.orientation_mode = interaction::GraspOrientationMode::PositionOnly;
     const auto selected = interaction::select_hand_trajectories(database, query);
     require(selected.size() == 1U,
             "position-only shaping candidate was not selected");
@@ -311,7 +314,8 @@ void test_world_grasp_limits_and_position_only_orientation() {
                 orientation_selected[0].clip == 1,
             "25 degree world-grasp orientation gate changed");
 
-    orientation_query.constrain_grasp_orientation = false;
+    orientation_query.orientation_mode =
+        interaction::GraspOrientationMode::PositionOnly;
     const auto position_only = interaction::select_hand_trajectories(
         orientation_database, orientation_query);
     require(position_only.size() == 2U && position_only[0].clip == 0,
@@ -326,6 +330,55 @@ interaction::HandTrajectoryQuery identity_query() {
     query.grasp_world_position = vec3(0.10F, 0.20F, 0.30F);
     query.grasp_world_rotation = quat();
     return query;
+}
+
+void test_approach_axis_search_ignores_twist_and_rejects_wrong_axis() {
+    ClipSpec exact{};
+    exact.grasp_position = vec3(0.10F, 0.20F, 0.30F);
+    ClipSpec twist = exact;
+    twist.grasp_rotation = quat_from_angle_axis(
+        1.570796327F, vec3(1.0F, 0.0F, 0.0F));
+    ClipSpec wrong_axis = exact;
+    wrong_axis.approach_direction = vec3(0.0F, 0.0F, 1.0F);
+    const interaction::Database database = make_database({
+        exact, twist, wrong_axis,
+    });
+    interaction::HandTrajectoryQuery query = identity_query();
+    query.orientation_mode =
+        interaction::GraspOrientationMode::ApproachAxis;
+    query.approach_world_direction = vec3(1.0F, 0.0F, 0.0F);
+
+    const auto selected = interaction::select_hand_trajectories(
+        database, query);
+
+    require(selected.size() == 2U,
+            "axis search did not isolate wrist twist from approach axis");
+    require(selected[0].clip == 0 && selected[1].clip == 1,
+            "axis search ordering changed");
+    require(selected[0].match_tier ==
+                interaction::TrajectoryMatchTier::AxisFallback &&
+            selected[1].match_tier ==
+                interaction::TrajectoryMatchTier::AxisFallback,
+            "axis search did not label fallback matches");
+}
+
+void test_exact_search_still_rejects_large_wrist_twist() {
+    ClipSpec exact{};
+    exact.grasp_position = vec3(0.10F, 0.20F, 0.30F);
+    ClipSpec twist = exact;
+    twist.grasp_rotation = quat_from_angle_axis(
+        1.570796327F, vec3(1.0F, 0.0F, 0.0F));
+    const interaction::Database database = make_database({exact, twist});
+    interaction::HandTrajectoryQuery query = identity_query();
+    query.orientation_mode = interaction::GraspOrientationMode::ExactPose;
+
+    const auto selected = interaction::select_hand_trajectories(
+        database, query);
+
+    require(selected.size() == 1U && selected[0].clip == 0,
+            "exact search ignored wrist twist");
+    require(selected[0].match_tier == interaction::TrajectoryMatchTier::Exact,
+            "exact search did not label exact matches");
 }
 
 void clear_compact_skipped_vectors(interaction::Database& database) {
@@ -641,7 +694,8 @@ void test_position_only_mapping_preserves_object_mapped_contact_rotation() {
         vec3(-1.0F, 0.2F, 3.0F),
         quat_from_angle_axis(0.5F, vec3(0.0F, 1.0F, 0.0F))};
     position_only.grasp_world_position = vec3(-0.5F, 0.9F, 2.8F);
-    position_only.constrain_grasp_orientation = false;
+    position_only.orientation_mode =
+        interaction::GraspOrientationMode::PositionOnly;
     const auto mapped = interaction::map_hand_trajectory(selected[0], position_only);
     const interaction::Transform& contact =
         mapped.hands[selected[0].contact_point];
@@ -896,6 +950,8 @@ int main() {
     test_search_is_anchored_to_grasp_not_object_metadata();
     test_object_roll_researches_recorded_world_grasp_orientation();
     test_world_grasp_limits_and_position_only_orientation();
+    test_approach_axis_search_ignores_twist_and_rejects_wrong_axis();
+    test_exact_search_still_rejects_large_wrist_twist();
     test_selects_every_close_complete_same_hand_clip_in_stable_order();
     test_support_kind_is_diagnostic_for_mixed_height_selection();
     test_ground_trajectory_spans_full_approach_through_contiguous_lift();

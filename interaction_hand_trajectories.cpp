@@ -292,10 +292,30 @@ float quaternion_angle(quat left, quat right) {
     return 2.0F * std::acos(absolute_dot);
 }
 
+float direction_angle(vec3 left, vec3 right) {
+    left = normalize(left);
+    right = normalize(right);
+    return std::acos(std::clamp(dot(left, right), -1.0F, 1.0F));
+}
+
+TrajectoryMatchTier match_tier(GraspOrientationMode mode) {
+    switch (mode) {
+        case GraspOrientationMode::ExactPose:
+            return TrajectoryMatchTier::Exact;
+        case GraspOrientationMode::ApproachAxis:
+            return TrajectoryMatchTier::AxisFallback;
+        case GraspOrientationMode::PositionOnly:
+            return TrajectoryMatchTier::PositionOnly;
+    }
+    throw std::invalid_argument("invalid grasp orientation mode");
+}
+
 float yaw_radians(quat rotation) {
-    const vec3 facing = quat_mul_vec3(
-        quat_normalize(rotation), vec3(0.0F, 0.0F, 1.0F));
-    return std::atan2(facing.x, facing.z);
+    rotation = quat_normalize(rotation);
+    return std::atan2(
+        2.0F * (rotation.w * rotation.y + rotation.x * rotation.z),
+        1.0F - 2.0F *
+            (rotation.y * rotation.y + rotation.z * rotation.z));
 }
 
 float shortest_angle(float angle) {
@@ -387,8 +407,15 @@ Transform hand_transform(const WorldPose& world, Hand hand) {
 void validate_query_and_config(
     const HandTrajectoryQuery& query,
     const HandTrajectoryConfig& config) {
+    const bool uses_axis =
+        query.orientation_mode == GraspOrientationMode::ApproachAxis;
+    const float approach_length = length(query.approach_world_direction);
     if (!finite(query.grasp_world_position) ||
         !valid_rotation(query.grasp_world_rotation) ||
+        (uses_axis &&
+         (!finite(query.approach_world_direction) ||
+          std::abs(query.approach_world_direction.y) > 2.0e-5F ||
+          !(approach_length > 1.0e-6F))) ||
         !finite(config.maximum_grasp_position_error_m) ||
         config.maximum_grasp_position_error_m < 0.0F ||
         !finite(config.maximum_grasp_orientation_error_radians) ||
@@ -397,6 +424,7 @@ void validate_query_and_config(
         config.maximum_compatible_clips > 4096U) {
         throw std::invalid_argument("invalid hand trajectory query or config");
     }
+    (void)match_tier(query.orientation_mode);
 }
 
 void validate_trajectory(const HandTrajectory& trajectory) {
@@ -449,10 +477,20 @@ std::vector<HandTrajectory> select_hand_trajectories(
         const Transform mapped_contact = compose(alignment, source_contact);
         const float position_error = length(
             mapped_contact.position - query.grasp_world_position);
-        const float orientation_error = query.constrain_grasp_orientation
-            ? quaternion_angle(
-                mapped_contact.rotation, query.grasp_world_rotation)
-            : 0.0F;
+        const vec3 source_approach = normalize(read_vec3(
+            database.approach_directions_object, clip));
+        const vec3 mapped_approach = quat_mul_vec3(
+            alignment.rotation,
+            quat_mul_vec3(source_object.rotation, source_approach));
+        float orientation_error = 0.0F;
+        if (query.orientation_mode == GraspOrientationMode::ExactPose) {
+            orientation_error = quaternion_angle(
+                mapped_contact.rotation, query.grasp_world_rotation);
+        } else if (
+            query.orientation_mode == GraspOrientationMode::ApproachAxis) {
+            orientation_error = direction_angle(
+                mapped_approach, query.approach_world_direction);
+        }
         if (position_error > config.maximum_grasp_position_error_m ||
             orientation_error >
                 config.maximum_grasp_orientation_error_radians) {
@@ -468,8 +506,10 @@ std::vector<HandTrajectory> select_hand_trajectories(
             phases.reach - trajectory.start_frame);
         trajectory.contact_point = static_cast<size_t>(
             phases.contact - trajectory.start_frame);
+        trajectory.match_tier = match_tier(query.orientation_mode);
         trajectory.support = support_kind(database, clip);
         trajectory.source_object = source_object;
+        trajectory.source_approach_direction_object = source_approach;
         const Transform source_from_world = inverse(trajectory.source_object);
         for (int32_t frame = trajectory.start_frame;
              frame <= phases.last_lift;
@@ -558,7 +598,9 @@ ShapedHandTrajectory shape_hand_trajectory(
     const Transform& base_contact = base_hands[trajectory.contact_point];
     const vec3 contact_translation =
         query.grasp_world_position - base_contact.position;
-    const quat contact_rotation = query.constrain_grasp_orientation
+    const bool exact_orientation =
+        query.orientation_mode == GraspOrientationMode::ExactPose;
+    const quat contact_rotation = exact_orientation
         ? quat_normalize(quat_mul(
               query.grasp_world_rotation,
               quat_inv(base_contact.rotation)))
@@ -580,7 +622,7 @@ ShapedHandTrajectory shape_hand_trajectory(
             linear_weight * linear_weight * (3.0F - 2.0F * linear_weight);
         Transform target = base_hands[sample];
         target.position = target.position + weight * contact_translation;
-        if (query.constrain_grasp_orientation) {
+        if (exact_orientation) {
             const quat corrected = quat_normalize(quat_mul(
                 contact_rotation, base_hands[sample].rotation));
             target.rotation = quat_nlerp_shortest(
@@ -589,7 +631,7 @@ ShapedHandTrajectory shape_hand_trajectory(
 
         Pose pose = std::move(aligned[sample]);
         IKConfig solve_config = config;
-        if (!query.constrain_grasp_orientation) {
+        if (!exact_orientation) {
             constexpr float pi = 3.141592654F;
             solve_config.maximum_request_orientation_radians = pi;
             solve_config.accepted_orientation_radians = pi;

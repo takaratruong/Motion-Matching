@@ -10,13 +10,26 @@
 
 namespace interaction {
 
+enum class GraspOrientationMode : uint8_t {
+    ExactPose = 0U,
+    ApproachAxis = 1U,
+    PositionOnly = 2U,
+};
+
+enum class TrajectoryMatchTier : uint8_t {
+    Exact = 0U,
+    AxisFallback = 1U,
+    PositionOnly = 2U,
+};
+
 struct HandTrajectoryQuery {
     Transform object_world{};
     vec3 object_dimensions{};
     Hand hand = Hand::Right;
     vec3 grasp_world_position{};
     quat grasp_world_rotation{};
-    bool constrain_grasp_orientation = true;
+    vec3 approach_world_direction{1.0F, 0.0F, 0.0F};
+    GraspOrientationMode orientation_mode = GraspOrientationMode::ExactPose;
 };
 
 struct HandTrajectoryConfig {
@@ -39,8 +52,10 @@ struct HandTrajectory {
     size_t reach_point = 0U;
     size_t contact_point = 0U;
     float cost = 0.0F;
+    TrajectoryMatchTier match_tier = TrajectoryMatchTier::Exact;
     SupportKind support = SupportKind::Table;
     Transform source_object{};
+    vec3 source_approach_direction_object{1.0F, 0.0F, 0.0F};
     std::vector<Transform> hands_in_source_object;
     std::vector<vec3> elbows_in_source_object;
 };
