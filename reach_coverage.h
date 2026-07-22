@@ -49,6 +49,8 @@ struct Evaluation {
     std::vector<interaction::Pose> poses;
     Rejection rejection = Rejection::None;
     bool joint_limit_saturated = false;
+    bool object_collision_observed = false;
+    bool environment_collision_observed = false;
     float position_error_m = 0.0F;
     float approach_error_radians = 0.0F;
     float orientation_error_radians = 0.0F;

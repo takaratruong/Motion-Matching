@@ -44,7 +44,7 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
             "reach::load_pack(", "reach::shape_candidate(", "--json",
             "zero_retarget", "position_perturbations",
             "orientation_perturbations", "augmentation", "height_band",
-            "direction_band", "source", "union",
+            "direction_band", "source", "union", "observed_collisions",
         ):
             self.assertIn(required, source)
         self.assertIn("0.001F", source)

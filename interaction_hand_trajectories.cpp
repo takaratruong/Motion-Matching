@@ -131,9 +131,13 @@ bool wrist_bone(size_t bone) {
 
 bool active_contact_wrist_bone(size_t bone, Hand hand) {
     if (hand == Hand::Left) {
-        return bone == static_cast<size_t>(g1_skeleton::LeftWrist);
+        return bone == static_cast<size_t>(g1_skeleton::LeftWristRoll) ||
+            bone == static_cast<size_t>(g1_skeleton::LeftWristPitch) ||
+            bone == static_cast<size_t>(g1_skeleton::LeftWrist);
     }
-    return bone == static_cast<size_t>(g1_skeleton::RightWrist);
+    return bone == static_cast<size_t>(g1_skeleton::RightWristRoll) ||
+        bone == static_cast<size_t>(g1_skeleton::RightWristPitch) ||
+        bone == static_cast<size_t>(g1_skeleton::RightWrist);
 }
 
 float joint_radius(
@@ -159,16 +163,18 @@ bool skeleton_intersects_box(
     bool exempt_active_contact_wrist,
     const TrajectoryCollisionConfig& config) {
     for (size_t bone = 1U; bone < g1_skeleton::BoneCount; ++bone) {
-        if (exempt_active_contact_wrist &&
-            active_contact_wrist_bone(bone, hand)) {
-            continue;
-        }
-        if (sphere_intersects_box(
+        const bool exempt_joint = exempt_active_contact_wrist &&
+            active_contact_wrist_bone(bone, hand);
+        if (!exempt_joint && sphere_intersects_box(
                 world.positions[bone], joint_radius(bone, config), box)) {
             return true;
         }
         const int32_t parent = g1_skeleton::kParents[bone];
-        if (parent >= 0 && capsule_intersects_box(
+        const bool exempt_segment = parent >= 0 &&
+            exempt_active_contact_wrist &&
+            active_contact_wrist_bone(bone, hand) &&
+            active_contact_wrist_bone(static_cast<size_t>(parent), hand);
+        if (parent >= 0 && !exempt_segment && capsule_intersects_box(
                 world.positions[static_cast<size_t>(parent)],
                 world.positions[bone], segment_radius(bone, config), box)) {
             return true;
@@ -988,7 +994,11 @@ TrajectoryFeasibility evaluate_trajectory_feasibility(
         if (arm_intersects_box(
                 trajectory.hands[sample].position,
                 trajectory.elbows[sample], object, config)) {
-            return {TrajectoryFeasibilityReason::ObjectCollision, sample};
+            return {
+                TrajectoryFeasibilityReason::ObjectCollision,
+                sample,
+                true,
+                false};
         }
     }
     for (size_t sample = 0U; sample < trajectory.hands.size(); ++sample) {
@@ -998,7 +1008,9 @@ TrajectoryFeasibility evaluate_trajectory_feasibility(
                     trajectory.elbows[sample], box, config)) {
                 return {
                     TrajectoryFeasibilityReason::EnvironmentCollision,
-                    sample};
+                    sample,
+                    false,
+                    true};
             }
         }
     }
@@ -1024,23 +1036,38 @@ TrajectoryFeasibility evaluate_shaped_trajectory_feasibility(
             throw std::invalid_argument("invalid environment geometry");
         }
     }
+    TrajectoryFeasibility feasibility{};
     for (size_t sample = 0U; sample < trajectory.poses.size(); ++sample) {
         const WorldPose world = world_pose(trajectory.poses[sample]);
-        const bool after_contact = sample >= contact_point;
+        const size_t contact_window = std::min(
+            config.active_object_contact_window_samples,
+            trajectory.poses.size());
+        const bool terminal_contact = contact_window > 0U &&
+            sample >= trajectory.poses.size() - contact_window;
         if (skeleton_intersects_box(
-                world, object, hand, after_contact, config)) {
-            return {TrajectoryFeasibilityReason::ObjectCollision, sample};
+                world, object, hand, terminal_contact, config)) {
+            feasibility.object_collision_observed = true;
+            if (feasibility.reason == TrajectoryFeasibilityReason::None) {
+                feasibility.reason =
+                    TrajectoryFeasibilityReason::ObjectCollision;
+                feasibility.sample = sample;
+            }
         }
         for (const OrientedBox& box : environment.boxes) {
             if (skeleton_intersects_box(
                     world, box, hand, false, config)) {
-                return {
-                    TrajectoryFeasibilityReason::EnvironmentCollision,
-                    sample};
+                feasibility.environment_collision_observed = true;
+                if (feasibility.reason ==
+                    TrajectoryFeasibilityReason::None) {
+                    feasibility.reason =
+                        TrajectoryFeasibilityReason::EnvironmentCollision;
+                    feasibility.sample = sample;
+                }
+                break;
             }
         }
     }
-    return {};
+    return feasibility;
 }
 
 }  // namespace interaction

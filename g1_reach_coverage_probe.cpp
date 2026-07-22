@@ -32,6 +32,8 @@ struct Report {
     size_t zero_failed = 0U;
     float zero_max_position = 0.0F;
     float zero_max_approach = 0.0F;
+    size_t object_collision_observed = 0U;
+    size_t environment_collision_observed = 0U;
     Count position_perturbations{};
     Count orientation_perturbations{};
     std::array<size_t, reach::kRejectionCount> rejections{};
@@ -88,6 +90,12 @@ void record(
         increment(report.orientation_perturbations, evaluation.rejection);
     }
     ++report.rejections.at(static_cast<size_t>(evaluation.rejection));
+    if (evaluation.object_collision_observed) {
+        ++report.object_collision_observed;
+    }
+    if (evaluation.environment_collision_observed) {
+        ++report.environment_collision_observed;
+    }
     increment(report.union_counts, evaluation.rejection);
     const reach::Hand hand = static_cast<reach::Hand>(
         pack.database.active_hands.at(clip));
@@ -191,6 +199,10 @@ void merge_report(Report& destination, const Report& source) {
         destination.zero_max_position, source.zero_max_position);
     destination.zero_max_approach = std::max(
         destination.zero_max_approach, source.zero_max_approach);
+    destination.object_collision_observed +=
+        source.object_collision_observed;
+    destination.environment_collision_observed +=
+        source.environment_collision_observed;
     merge_count(
         destination.position_perturbations, source.position_perturbations);
     merge_count(
@@ -264,6 +276,9 @@ std::string to_json(const Report& report) {
     write_groups(output, report.height_band);
     output << ",\"orientation_perturbations\":";
     write_count(output, report.orientation_perturbations);
+    output << ",\"observed_collisions\":{\"environment\":"
+           << report.environment_collision_observed
+           << ",\"object\":" << report.object_collision_observed << '}';
     output << ",\"position_perturbations\":";
     write_count(output, report.position_perturbations);
     output << ",\"rejections\":{";

@@ -101,6 +101,8 @@ enum class TrajectoryFeasibilityReason : uint8_t {
 struct TrajectoryFeasibility {
     TrajectoryFeasibilityReason reason = TrajectoryFeasibilityReason::None;
     size_t sample = 0U;
+    bool object_collision_observed = false;
+    bool environment_collision_observed = false;
 };
 
 struct TrajectoryCollisionConfig {
@@ -109,6 +111,7 @@ struct TrajectoryCollisionConfig {
     float joint_radius_m = 0.035F;
     float limb_radius_m = 0.045F;
     float torso_radius_m = 0.10F;
+    size_t active_object_contact_window_samples = 1U;
 };
 
 EnvironmentGeometry make_recorded_table_geometry(

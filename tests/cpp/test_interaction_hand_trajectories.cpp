@@ -692,9 +692,11 @@ interaction::Pose pose_from_world_positions(
 
 interaction::ShapedHandTrajectory shaped_pose_with_world_positions(
     const std::array<vec3, g1_skeleton::BoneCount>& world_positions,
-    interaction::Hand hand) {
+    interaction::Hand hand,
+    size_t sample_count = 1U) {
     interaction::ShapedHandTrajectory shaped{};
-    shaped.poses.push_back(pose_from_world_positions(world_positions));
+    shaped.poses.assign(
+        sample_count, pose_from_world_positions(world_positions));
     const interaction::WorldPose world = interaction::world_pose(
         shaped.poses.front());
     const size_t wrist = hand == interaction::Hand::Left
@@ -703,9 +705,10 @@ interaction::ShapedHandTrajectory shaped_pose_with_world_positions(
     const size_t elbow = hand == interaction::Hand::Left
         ? static_cast<size_t>(g1_skeleton::LeftElbow)
         : static_cast<size_t>(g1_skeleton::RightElbow);
-    shaped.path.hands.push_back(
+    shaped.path.hands.assign(
+        sample_count,
         {world.positions[wrist], world.rotations[wrist]});
-    shaped.path.elbows.push_back(world.positions[elbow]);
+    shaped.path.elbows.assign(sample_count, world.positions[elbow]);
     shaped.contact_accepted = true;
     return shaped;
 }
@@ -1177,6 +1180,47 @@ void test_only_final_active_wrist_is_exempt_after_contact() {
             "final active wrist contact was not exempted after Contact");
 }
 
+void test_terminal_contact_window_exempts_only_the_active_wrist_chain() {
+    const interaction::OrientedBox object{
+        {vec3(), quat()}, vec3(0.20F, 0.20F, 0.20F)};
+    const interaction::EnvironmentGeometry environment{};
+    interaction::TrajectoryCollisionConfig config{};
+    config.active_object_contact_window_samples = 5U;
+
+    std::array<vec3, g1_skeleton::BoneCount> wrist_contact{};
+    wrist_contact.fill(vec3(10.0F, 0.0F, 0.0F));
+    wrist_contact[g1_skeleton::RightElbow] = vec3(0.60F, 0.0F, 0.0F);
+    wrist_contact[g1_skeleton::RightWristRoll] = vec3(0.30F, 0.0F, 0.0F);
+    wrist_contact[g1_skeleton::RightWristPitch] = vec3(0.0F, 0.0F, 0.0F);
+    wrist_contact[g1_skeleton::RightWrist] = vec3(0.0F, 0.0F, 0.0F);
+    const auto allowed = shaped_pose_with_world_positions(
+        wrist_contact, interaction::Hand::Right, 5U);
+    require(interaction::evaluate_shaped_trajectory_feasibility(
+                allowed, 4U, interaction::Hand::Right,
+                object, environment, config).reason ==
+            interaction::TrajectoryFeasibilityReason::None,
+            "terminal active wrist-chain contact was rejected");
+
+    wrist_contact[g1_skeleton::RightElbow] = vec3(0.0F, 0.0F, 0.0F);
+    const auto elbow_collision = shaped_pose_with_world_positions(
+        wrist_contact, interaction::Hand::Right, 5U);
+    require(interaction::evaluate_shaped_trajectory_feasibility(
+                elbow_collision, 4U, interaction::Hand::Right,
+                object, environment, config).reason ==
+            interaction::TrajectoryFeasibilityReason::ObjectCollision,
+            "terminal active elbow collision was exempted");
+
+    wrist_contact[g1_skeleton::RightElbow] = vec3(0.40F, 0.0F, 0.0F);
+    wrist_contact[g1_skeleton::RightWristRoll] = vec3(0.0F, 0.0F, 0.0F);
+    const auto forearm_collision = shaped_pose_with_world_positions(
+        wrist_contact, interaction::Hand::Right, 5U);
+    require(interaction::evaluate_shaped_trajectory_feasibility(
+                forearm_collision, 4U, interaction::Hand::Right,
+                object, environment, config).reason ==
+            interaction::TrajectoryFeasibilityReason::ObjectCollision,
+            "terminal elbow-to-wrist-roll collision was exempted");
+}
+
 void test_recorded_table_geometry_preserves_top_and_builds_four_legs() {
     const interaction::Transform table{
         vec3(1.0F, 0.40F, -2.0F), quat()};
@@ -1284,6 +1328,7 @@ int main() {
     test_forearm_capsule_and_contact_still_collide_with_shelf();
     test_shaped_upper_arm_and_torso_collisions_are_rejected();
     test_only_final_active_wrist_is_exempt_after_contact();
+    test_terminal_contact_window_exempts_only_the_active_wrist_chain();
     test_recorded_table_geometry_preserves_top_and_builds_four_legs();
     test_coverage_environment_builds_right_shelf_and_lower_left_table();
     test_collision_checks_every_environment_box();

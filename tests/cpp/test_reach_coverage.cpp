@@ -343,6 +343,46 @@ void test_collision_stages_and_active_contact_exemption() {
         reach::Rejection::None);
 }
 
+void test_collision_observations_survive_an_earlier_kinematic_rejection() {
+    const reach::Pack pack = fixture();
+    reach::Query query = zero_query(pack);
+    query.approach_world = normalize(quat_mul_vec3(
+        quat_from_angle_axis(0.523598776F, vec3(0, 1, 0)),
+        query.approach_world));
+    const reach::Candidate candidate = reach::select_candidates(
+        pack, query)[0];
+    reach::CoverageConfig strict{};
+    strict.accepted_approach_radians = 0.01F;
+    const interaction::OrientedBox far_object{
+        {vec3(10, 10, 10), quat()}, vec3(0.01F, 0.01F, 0.01F)};
+    interaction::EnvironmentGeometry blocked{};
+    blocked.boxes.push_back({
+        {vec3(0.0F, 0.82F, 0.0F), quat()},
+        vec3(0.05F, 0.05F, 0.05F)});
+
+    const reach::Evaluation collision = reach::evaluate_candidate(
+        pack, candidate, query, far_object, blocked, strict);
+
+    assert(collision.rejection == reach::Rejection::ApproachAxisError);
+    assert(!collision.object_collision_observed);
+    assert(collision.environment_collision_observed);
+
+    const interaction::OrientedBox body_object{
+        {vec3(0.0F, 0.82F, 0.0F), quat()},
+        vec3(0.05F, 0.05F, 0.05F)};
+    const reach::Evaluation both = reach::evaluate_candidate(
+        pack, candidate, query, body_object, blocked, strict);
+    assert(both.rejection == reach::Rejection::ApproachAxisError);
+    assert(both.object_collision_observed);
+    assert(both.environment_collision_observed);
+
+    const reach::Evaluation open = reach::evaluate_candidate(
+        pack, candidate, query, far_object,
+        interaction::EnvironmentGeometry{}, strict);
+    assert(open.rejection == reach::Rejection::ApproachAxisError);
+    assert(!open.environment_collision_observed);
+}
+
 void test_diagnostics_separate_hand_and_augmentation_counts() {
     reach::Pack pack = fixture();
     pack.database.clip_count = 2U;
@@ -377,5 +417,6 @@ int main() {
     test_unreachable_target_reports_a_specific_final_gate();
     test_position_and_rotation_perturbations_have_exclusive_outcomes();
     test_collision_stages_and_active_contact_exemption();
+    test_collision_observations_survive_an_earlier_kinematic_rejection();
     test_diagnostics_separate_hand_and_augmentation_counts();
 }

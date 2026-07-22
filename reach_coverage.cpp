@@ -325,7 +325,7 @@ Evaluation evaluate_candidate(
     const CoverageConfig& config,
     const interaction::TrajectoryCollisionConfig& collision_config) {
     Evaluation evaluation = shape_candidate(pack, candidate, query, config);
-    if (evaluation.rejection != Rejection::None) {
+    if (evaluation.poses.empty()) {
         return evaluation;
     }
     interaction::ShapedHandTrajectory shaped{};
@@ -340,6 +340,9 @@ Evaluation evaluate_candidate(
             world.positions[wrist], world.rotations[wrist]});
         shaped.path.elbows.push_back(world.positions[elbow_bone(query.hand)]);
     }
+    interaction::TrajectoryCollisionConfig reach_collision_config =
+        collision_config;
+    reach_collision_config.active_object_contact_window_samples = 5U;
     const interaction::TrajectoryFeasibility feasibility =
         interaction::evaluate_shaped_trajectory_feasibility(
             shaped,
@@ -347,14 +350,22 @@ Evaluation evaluate_candidate(
             interaction_hand(query.hand),
             object,
             environment,
-            collision_config);
+            reach_collision_config);
     evaluation.collision_sample = feasibility.sample;
+    evaluation.object_collision_observed =
+        feasibility.object_collision_observed;
+    evaluation.environment_collision_observed =
+        feasibility.environment_collision_observed;
     if (feasibility.reason ==
         interaction::TrajectoryFeasibilityReason::ObjectCollision) {
-        evaluation.rejection = Rejection::ObjectCollision;
+        if (evaluation.rejection == Rejection::None) {
+            evaluation.rejection = Rejection::ObjectCollision;
+        }
     } else if (feasibility.reason ==
                interaction::TrajectoryFeasibilityReason::EnvironmentCollision) {
-        evaluation.rejection = Rejection::EnvironmentCollision;
+        if (evaluation.rejection == Rejection::None) {
+            evaluation.rejection = Rejection::EnvironmentCollision;
+        }
     }
     return evaluation;
 }
