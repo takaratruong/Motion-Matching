@@ -221,6 +221,19 @@ void test_full_pose_mapping_converges_exactly_at_contact() {
             "full-pose mapping missed requested Contact rotation");
     require(mapped.elbows.size() == mapped.hands.size(),
             "full-pose mapping omitted elbows");
+    const interaction::Transform mapping =
+        interaction::hand_trajectory_world_mapping(selected[0], moved);
+    for (size_t sample = 0U; sample < mapped.hands.size(); ++sample) {
+        const interaction::Transform source_hand = interaction::compose(
+            selected[0].source_object,
+            selected[0].hands_in_source_object[sample]);
+        const interaction::Transform via_mapping = interaction::compose(
+            mapping, source_hand);
+        require(near(via_mapping.position, mapped.hands[sample].position),
+                "world mapping disagrees with mapped wrist");
+        require(near_rotation(via_mapping.rotation, mapped.hands[sample].rotation),
+                "world mapping rotation disagrees with mapped wrist");
+    }
 }
 
 void test_position_only_mapping_preserves_object_mapped_contact_rotation() {

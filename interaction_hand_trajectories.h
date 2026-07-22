@@ -76,6 +76,10 @@ MappedHandTrajectory map_hand_trajectory(
     const HandTrajectory& trajectory,
     const HandTrajectoryQuery& query);
 
+Transform hand_trajectory_world_mapping(
+    const HandTrajectory& trajectory,
+    const HandTrajectoryQuery& query);
+
 TrajectoryFeasibility evaluate_trajectory_feasibility(
     const MappedHandTrajectory& trajectory,
     size_t contact_point,

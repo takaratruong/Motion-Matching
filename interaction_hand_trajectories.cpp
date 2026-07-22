@@ -213,6 +213,17 @@ void validate_query_and_config(
     }
 }
 
+void validate_trajectory(const HandTrajectory& trajectory) {
+    if (trajectory.hands_in_source_object.empty() ||
+        trajectory.hands_in_source_object.size() !=
+            trajectory.elbows_in_source_object.size() ||
+        trajectory.contact_point >= trajectory.hands_in_source_object.size() ||
+        !finite(trajectory.source_object.position) ||
+        !valid_rotation(trajectory.source_object.rotation)) {
+        throw std::invalid_argument("invalid hand trajectory");
+    }
+}
+
 }  // namespace
 
 std::vector<HandTrajectory> select_hand_trajectories(
@@ -301,46 +312,54 @@ std::vector<HandTrajectory> select_hand_trajectories(
     return selected;
 }
 
-MappedHandTrajectory map_hand_trajectory(
+Transform hand_trajectory_world_mapping(
     const HandTrajectory& trajectory,
     const HandTrajectoryQuery& query) {
     validate_query_and_config(query, HandTrajectoryConfig{});
-    if (trajectory.hands_in_source_object.empty() ||
-        trajectory.hands_in_source_object.size() !=
-            trajectory.elbows_in_source_object.size() ||
-        trajectory.contact_point >= trajectory.hands_in_source_object.size()) {
-        throw std::invalid_argument("invalid hand trajectory");
-    }
+    validate_trajectory(trajectory);
     const Transform target_object{
         query.object_world.position,
         quat_normalize(query.object_world.rotation)};
-    MappedHandTrajectory mapped{};
-    mapped.hands.reserve(trajectory.hands_in_source_object.size());
-    mapped.elbows.reserve(trajectory.elbows_in_source_object.size());
-    for (const Transform& hand : trajectory.hands_in_source_object) {
-        mapped.hands.push_back(compose(target_object, hand));
-    }
-    for (const vec3 elbow : trajectory.elbows_in_source_object) {
-        mapped.elbows.push_back(compose(
-            target_object, Transform{elbow, quat()}).position);
-    }
-    const Transform mapped_contact = mapped.hands[trajectory.contact_point];
+    const Transform source_world_to_target_object = compose(
+        target_object,
+        inverse(Transform{
+            trajectory.source_object.position,
+            quat_normalize(trajectory.source_object.rotation)}));
+    const Transform source_contact = compose(
+        trajectory.source_object,
+        trajectory.hands_in_source_object[trajectory.contact_point]);
+    const Transform mapped_contact = compose(
+        source_world_to_target_object, source_contact);
+    Transform residual{};
     if (query.grasp_world_rotation.has_value()) {
         const Transform requested{
             query.grasp_world_position,
             quat_normalize(*query.grasp_world_rotation)};
-        const Transform residual = compose(requested, inverse(mapped_contact));
-        for (Transform& hand : mapped.hands) hand = compose(residual, hand);
-        for (vec3& elbow : mapped.elbows) {
-            elbow = compose(residual, Transform{elbow, quat()}).position;
-        }
+        residual = compose(requested, inverse(mapped_contact));
     } else {
-        const vec3 translation =
-            query.grasp_world_position - mapped_contact.position;
-        for (Transform& hand : mapped.hands) {
-            hand.position = hand.position + translation;
-        }
-        for (vec3& elbow : mapped.elbows) elbow = elbow + translation;
+        residual.position = query.grasp_world_position - mapped_contact.position;
+        residual.rotation = quat();
+    }
+    return compose(residual, source_world_to_target_object);
+}
+
+MappedHandTrajectory map_hand_trajectory(
+    const HandTrajectory& trajectory,
+    const HandTrajectoryQuery& query) {
+    const Transform mapping = hand_trajectory_world_mapping(trajectory, query);
+    MappedHandTrajectory mapped{};
+    mapped.hands.reserve(trajectory.hands_in_source_object.size());
+    mapped.elbows.reserve(trajectory.elbows_in_source_object.size());
+    for (const Transform& hand : trajectory.hands_in_source_object) {
+        mapped.hands.push_back(compose(
+            mapping, compose(trajectory.source_object, hand)));
+    }
+    for (const vec3 elbow : trajectory.elbows_in_source_object) {
+        mapped.elbows.push_back(compose(
+            mapping,
+            compose(
+                trajectory.source_object,
+                Transform{elbow, quat()})).position);
     }
     return mapped;
 }
