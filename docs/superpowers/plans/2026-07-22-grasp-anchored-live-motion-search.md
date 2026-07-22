@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Search and display complete, collision-safe pickup motions from a changing world-space grasp without using object identity or rotation to transform the body.
+**Goal:** Search and display complete, collision-safe pickup motions from a staged world-space grasp without using object identity or rotation to transform the body.
 
 **Architecture:** Replace object-anchored scene alignment with Contact-wrist grasp anchoring that applies only yaw and X/Z translation. Extract through the final Lift frame, shape the active arm with the existing IK solver, collision-test every shaped skeleton, and rebuild/rank-zero the valid set after every grasp transform.
 
@@ -15,7 +15,8 @@
 - Whole-body alignment uses yaw and X/Z translation only and preserves world Y/up.
 - Position-only mode retains grasp heading for alignment but omits orientation ranking and IK correction.
 - Motions span first Reach through the final contiguous Lift frame.
-- Every grasp transform runs search, IK, collision filtering, and rank-zero selection.
+- Grasp transforms only update the marker and mark results stale; `Enter` runs
+  search, IK, collision filtering, and rank-zero selection once.
 - `/` and `]` cycle forward, `[` cycles backward, and `Enter` forces refresh.
 - Complete shaped skeletons are collision-tested against table and object geometry.
 - Keep the viewer free of mesh, terrain, diffusion, controller, and capture code.
@@ -167,11 +168,11 @@ git commit -m "fix: reject full-body pickup collisions"
 
 **Interfaces:**
 - `rebuild_valid_trajectories` calls grasp search, IK shaping, and shaped-skeleton collision filtering.
-- Object/grasp changes and `KEY_ENTER` replace the result set and select rank zero.
+- Object/grasp changes mark results stale; `KEY_ENTER` replaces the result set and selects rank zero.
 
 - [ ] **Step 1: Write failing viewer contract tests**
 
-Require `KEY_SLASH`, `KEY_ENTER`, and `evaluate_shaped_trajectory_feasibility(`. Inspect the `if (object_changed` branch and assert it calls `rebuild_valid_trajectories(` and assigns `selected_index = 0U`. Assert no previous-clip preservation code remains:
+Require `KEY_SLASH`, `KEY_ENTER`, and `evaluate_shaped_trajectory_feasibility(`. Assert the grasp-change branch updates the query and sets `search_stale = true` without calling `rebuild_valid_trajectories(`. Assert the `KEY_ENTER` branch calls the rebuild, assigns `selected_index = 0U`, and clears stale state. Assert no previous-clip preservation code remains:
 
 ```python
 self.assertNotIn("previous_clip", source)
@@ -206,7 +207,7 @@ if (IsKeyPressed(KEY_SLASH) || IsKeyPressed(KEY_RIGHT_BRACKET)) {
 if (IsKeyPressed(KEY_ENTER)) object_changed = true;
 ```
 
-After any `object_changed`, rebuild the complete result set and assign `selected_index = 0U`; do not search for or preserve the prior clip. Update help text to show `/ or ]` and `Enter: rerun search`. Continue to avoid indexing when `valid.empty()`.
+After any grasp transform, update `query` and set `search_stale = true` without rebuilding. When `KEY_ENTER` is pressed, rebuild the complete result set, assign `selected_index = 0U`, and set `search_stale = false`; do not preserve the prior clip. Display `SEARCH STALE - press Enter` while stale. Update help text to show `/ or ]` and `Enter: run search`. Continue to avoid indexing when `valid.empty()`.
 
 - [ ] **Step 4: Verify GREEN, build, and commit**
 

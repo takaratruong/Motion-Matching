@@ -282,6 +282,7 @@ int main(int argc, char** argv) {
         interaction::Transform object_world = initial_object;
         bool position_only = false;
         bool show_rejected = true;
+        bool search_stale = false;
         size_t selected_index = 0U;
         float animation_seconds = 0.0F;
         HandTrajectoryQuery query = make_query(
@@ -307,58 +308,58 @@ int main(int argc, char** argv) {
             animation_seconds += dt;
             const float translation_step = 0.45F * dt;
             const float rotation_step = 0.9F * dt;
-            bool object_changed = false;
+            bool grasp_changed = false;
             if (IsKeyDown(KEY_LEFT)) {
                 object_world.position.x -= translation_step;
-                object_changed = true;
+                grasp_changed = true;
             }
             if (IsKeyDown(KEY_RIGHT)) {
                 object_world.position.x += translation_step;
-                object_changed = true;
+                grasp_changed = true;
             }
             if (IsKeyDown(KEY_UP)) {
                 object_world.position.z += translation_step;
-                object_changed = true;
+                grasp_changed = true;
             }
             if (IsKeyDown(KEY_DOWN)) {
                 object_world.position.z -= translation_step;
-                object_changed = true;
+                grasp_changed = true;
             }
             if (IsKeyDown(KEY_W) || IsKeyDown(KEY_PAGE_UP)) {
                 object_world.position.y += translation_step;
-                object_changed = true;
+                grasp_changed = true;
             }
             if (IsKeyDown(KEY_S) || IsKeyDown(KEY_PAGE_DOWN)) {
                 object_world.position.y -= translation_step;
-                object_changed = true;
+                grasp_changed = true;
             }
             if (IsKeyDown(KEY_Q)) {
                 apply_rotation(object_world, rotation_step, vec3(0.0F, 1.0F, 0.0F));
-                object_changed = true;
+                grasp_changed = true;
             }
             if (IsKeyDown(KEY_E)) {
                 apply_rotation(object_world, -rotation_step, vec3(0.0F, 1.0F, 0.0F));
-                object_changed = true;
+                grasp_changed = true;
             }
             if (IsKeyDown(KEY_R)) {
                 apply_rotation(object_world, rotation_step, vec3(1.0F, 0.0F, 0.0F));
-                object_changed = true;
+                grasp_changed = true;
             }
             if (IsKeyDown(KEY_F)) {
                 apply_rotation(object_world, -rotation_step, vec3(1.0F, 0.0F, 0.0F));
-                object_changed = true;
+                grasp_changed = true;
             }
             if (IsKeyDown(KEY_Z)) {
                 apply_rotation(object_world, rotation_step, vec3(0.0F, 0.0F, 1.0F));
-                object_changed = true;
+                grasp_changed = true;
             }
             if (IsKeyDown(KEY_C)) {
                 apply_rotation(object_world, -rotation_step, vec3(0.0F, 0.0F, 1.0F));
-                object_changed = true;
+                grasp_changed = true;
             }
             if (IsKeyPressed(KEY_BACKSPACE)) {
                 object_world = initial_object;
-                object_changed = true;
+                grasp_changed = true;
             }
             if (IsKeyPressed(KEY_LEFT_BRACKET)) {
                 if (!trajectories.valid.empty()) {
@@ -379,14 +380,18 @@ int main(int argc, char** argv) {
             if (IsKeyPressed(KEY_V)) show_rejected = !show_rejected;
             if (IsKeyPressed(KEY_P)) {
                 position_only = !position_only;
-                object_changed = true;
+                grasp_changed = true;
             }
-            if (IsKeyPressed(KEY_ENTER)) object_changed = true;
-            if (object_changed) {
+            if (grasp_changed) {
                 query = make_query(object_world, canonical, position_only);
+                search_stale = true;
+            }
+            if (IsKeyPressed(KEY_ENTER)) {
                 trajectories = rebuild_valid_trajectories(
                     database, query, table_geometry);
                 selected_index = 0U;
+                animation_seconds = 0.0F;
+                search_stale = false;
             }
 
             BeginDrawing();
@@ -441,7 +446,11 @@ int main(int argc, char** argv) {
                     static_cast<int>(trajectories.object_rejected),
                     static_cast<int>(trajectories.table_rejected)),
                 26, 56, 18, DARKGRAY);
-            if (trajectories.valid.empty()) {
+            if (search_stale) {
+                DrawText(
+                    "SEARCH STALE - press Enter",
+                    26, 82, 16, MAROON);
+            } else if (trajectories.valid.empty()) {
                 DrawText(
                     "0 valid motions for this world grasp",
                     26, 82, 16, MAROON);

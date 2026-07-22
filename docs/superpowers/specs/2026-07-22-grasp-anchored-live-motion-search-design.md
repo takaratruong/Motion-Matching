@@ -25,10 +25,11 @@ and orientation residual. In position-only mode, requested grasp orientation
 is still retained for scene heading, but orientation is omitted from ranking
 and arm correction. Object dimensions are not a search gate or cost term.
 
-## Live Search and Controls
+## Staged Search and Controls
 
-Every object translation or rotation changes the requested grasp and performs
-the complete pipeline in the same update:
+Object translation or rotation updates only the requested grasp marker and
+marks the displayed result set stale. It does not run retrieval, IK, or
+collision filtering. Pressing `Enter` performs the complete pipeline once:
 
 1. Search every compatible recorded hand clip.
 2. Rank clips from the current world-space grasp.
@@ -36,11 +37,11 @@ the complete pipeline in the same update:
 4. Reject object or table collisions.
 5. Select rank zero from the new valid set.
 
-The viewer must not preserve a manually selected clip after the grasp changes,
-because doing so hides reranking. `Enter` forces the same complete refresh for
-diagnostics. `/` and `]` cycle forward through the current valid result set;
-`[` cycles backward. Cycling never selects rejected clips. Empty result sets
-remain interactive and display `0 valid motions`.
+The completed search selects rank zero and clears the stale state. `/` and `]`
+cycle forward through the frozen valid result set; `[` cycles backward.
+Cycling never selects rejected clips. Empty result sets remain interactive and
+display `0 valid motions`. The UI clearly reports `SEARCH STALE - press Enter`
+after the grasp changes so old paths are not mistaken for current results.
 
 ## Motion Extent and IK
 
@@ -79,7 +80,9 @@ Automated regressions must prove:
 - full-skeleton upper-arm or torso table penetration is rejected;
 - intended hand/object overlap is allowed only at and after Contact;
 - `/`, `]`, `[`, and `Enter` are bound;
-- every transform change calls the complete search pipeline and rank resets;
+- transform changes do not call the search pipeline and mark results stale;
+- `Enter` calls the complete search pipeline, clears stale state, and selects
+  rank zero;
 - zero valid results do not index the result vectors;
 - the standalone viewer remains independent of mesh, terrain, diffusion, and
   controller code.

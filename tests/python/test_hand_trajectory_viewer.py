@@ -31,8 +31,15 @@ class HandTrajectoryViewerTests(unittest.TestCase):
         self.assertIn("shape_hand_trajectory(", source)
         self.assertIn("evaluate_shaped_trajectory_feasibility(", source)
         self.assertIn("rebuild_valid_trajectories(", source)
-        object_change = source.split("if (object_changed)", 1)[1]
-        self.assertIn("rebuild_valid_trajectories(", object_change)
+        self.assertIn("if (grasp_changed)", source)
+        grasp_change = source.split("if (grasp_changed)", 1)[1].split(
+            "if (IsKeyPressed(KEY_ENTER))", 1
+        )[0]
+        self.assertNotIn("rebuild_valid_trajectories(", grasp_change)
+        self.assertIn("search_stale = true", grasp_change)
+        enter_search = source.split("if (IsKeyPressed(KEY_ENTER))", 1)[1]
+        self.assertIn("rebuild_valid_trajectories(", enter_search)
+        self.assertIn("search_stale = false", enter_search)
         self.assertIn("grasp_world_position", source)
         self.assertIn("grasp_world_rotation", source)
         self.assertIn("ik_rejected", source)
@@ -42,8 +49,9 @@ class HandTrajectoryViewerTests(unittest.TestCase):
         self.assertIn("constrain_grasp_orientation", source)
         self.assertNotIn("previous_clip", source)
         self.assertNotIn("preserved", source)
-        self.assertIn("selected_index = 0U", object_change)
+        self.assertIn("selected_index = 0U", enter_search)
         self.assertIn("[: previous  / or ]: next  Enter: rerun", source)
+        self.assertIn("SEARCH STALE - press Enter", source)
 
         trajectory_source = TRAJECTORY_SOURCE_PATH.read_text(encoding="utf-8")
         self.assertIn("hand_trajectory_scene_alignment(", trajectory_source)
