@@ -82,6 +82,27 @@ float rotation_angle(quat target, quat achieved) {
     return length(quat_to_scaled_angle_axis(delta));
 }
 
+float smoothstep(float value) {
+    const float x = std::clamp(value, 0.0F, 1.0F);
+    return x * x * (3.0F - 2.0F * x);
+}
+
+quat direction_alignment(vec3 source, vec3 target) {
+    source = normalize(source);
+    target = normalize(target);
+    const float cosine = std::clamp(dot(source, target), -1.0F, 1.0F);
+    if (cosine > 1.0F - 1.0e-6F) {
+        return quat();
+    }
+    if (cosine < -1.0F + 1.0e-6F) {
+        const vec3 basis = std::abs(source.x) < 0.8F
+            ? vec3(1, 0, 0)
+            : vec3(0, 1, 0);
+        return quat_from_angle_axis(kPi, normalize(cross(source, basis)));
+    }
+    return quat_between(source, target);
+}
+
 interaction::Transform hand_transform(
     const interaction::Pose& pose,
     Hand hand) {
@@ -216,12 +237,21 @@ Evaluation shape_candidate(
     evaluation.poses.reserve(frame_count);
     const vec3 endpoint_offset =
         query.target.position - source_endpoint.position;
+    const quat approach_alignment = direction_alignment(
+        approach_direction(pack.database, candidate.clip),
+        query.approach_world);
     const quat correction = quat_mul(
         query.target.rotation, quat_inv(source_endpoint.rotation));
+    const size_t aligned_sample = frame_count > 6U
+        ? frame_count - 6U
+        : 0U;
+    const size_t ramp_start = aligned_sample > 10U
+        ? aligned_sample - 10U
+        : 0U;
     const interaction::IKConfig ik_config{
         0.45F,
         kPi,
-        config.accepted_position_m,
+        std::min(config.accepted_position_m, 0.001F),
         config.accepted_orientation_radians,
         0.05F,
         0.001F,
@@ -238,11 +268,22 @@ Evaluation shape_candidate(
             ? 1.0F
             : static_cast<float>(sample) /
                   static_cast<float>(frame_count - 1U);
-        const float alpha = u * u * (3.0F - 2.0F * u);
+        const float translation_weight = smoothstep(u);
+        const float approach_u = sample >= aligned_sample
+            ? 1.0F
+            : (sample <= ramp_start
+                ? 0.0F
+                : static_cast<float>(sample - ramp_start) /
+                      static_cast<float>(aligned_sample - ramp_start));
+        const float approach_weight = smoothstep(approach_u);
+        const vec3 relative =
+            source_hand.position - source_endpoint.position;
+        const vec3 rotated = quat_mul_vec3(approach_alignment, relative);
         const interaction::Transform desired{
-            source_hand.position + alpha * endpoint_offset,
+            source_hand.position + translation_weight * endpoint_offset +
+                approach_weight * (rotated - relative),
             quat_mul(
-                quat_nlerp_shortest(quat(), correction, alpha),
+                quat_nlerp_shortest(quat(), correction, translation_weight),
                 source_hand.rotation),
         };
         const interaction::IKResult ik = interaction::solve_hand_ik(
