@@ -77,22 +77,22 @@ void append_pose(reach::Database& database, const interaction::Pose& pose) {
     database.foot_contacts.insert(database.foot_contacts.end(), {1, 1});
 }
 
-reach::Pack fixture() {
+reach::Pack fixture(size_t frame_count = 6U) {
     reach::Pack pack{};
     reach::Database& database = pack.database;
     database.version = 1U;
     database.endian_marker = 0x01020304U;
     database.fps_numerator = 25U;
     database.fps_denominator = 1U;
-    database.frame_count = 6U;
+    database.frame_count = static_cast<uint32_t>(frame_count);
     database.bone_count = 31U;
     database.clip_count = 1U;
     database.source_count = 1U;
     database.parents.assign(
         g1_skeleton::kParents.begin(), g1_skeleton::kParents.end());
     database.range_starts = {0};
-    database.range_stops = {6};
-    for (size_t frame = 0U; frame < 6U; ++frame) {
+    database.range_stops = {static_cast<int32_t>(frame_count)};
+    for (size_t frame = 0U; frame < frame_count; ++frame) {
         append_pose(database, base_pose(0.02F * static_cast<float>(frame)));
         database.source_frames.push_back(static_cast<int32_t>(100 + frame));
     }
@@ -104,7 +104,7 @@ reach::Pack fixture() {
     const interaction::WorldPose first = interaction::world_pose(
         reach::pose_at_frame(database, 0));
     const interaction::WorldPose last = interaction::world_pose(
-        reach::pose_at_frame(database, 5));
+        reach::pose_at_frame(database, static_cast<int32_t>(frame_count - 1U)));
     const size_t wrist = g1_skeleton::LeftWrist;
     const vec3 delta = last.positions[wrist] - first.positions[wrist];
     const vec3 approach = normalize(delta);
@@ -173,7 +173,7 @@ void test_retrieval_is_same_hand_spatial_and_wrist_orientation_independent() {
 }
 
 void test_one_reach_warps_to_a_different_approach_direction() {
-    const reach::Pack pack = fixture();
+    const reach::Pack pack = fixture(20U);
     reach::Query query = zero_query(pack);
     query.approach_world = normalize(quat_mul_vec3(
         quat_from_angle_axis(0.523598776F, vec3(0, 1, 0)),
@@ -189,10 +189,29 @@ void test_one_reach_warps_to_a_different_approach_direction() {
     for (size_t frame = 0U; frame < result.poses.size(); ++frame) {
         const interaction::Pose source = reach::pose_at_frame(
             pack.database, static_cast<int32_t>(frame));
-        assert(result.poses[frame].positions[g1_skeleton::Simulation].x ==
-               source.positions[g1_skeleton::Simulation].x);
+        const size_t root = static_cast<size_t>(g1_skeleton::Simulation);
+        assert(result.poses[frame].positions[root].x ==
+               source.positions[root].x);
+        assert(result.poses[frame].positions[root].y ==
+               source.positions[root].y);
+        assert(result.poses[frame].positions[root].z ==
+               source.positions[root].z);
+        assert(result.poses[frame].rotations[root].w ==
+               source.rotations[root].w);
+        assert(result.poses[frame].rotations[root].x ==
+               source.rotations[root].x);
+        assert(result.poses[frame].rotations[root].y ==
+               source.rotations[root].y);
+        assert(result.poses[frame].rotations[root].z ==
+               source.rotations[root].z);
         for (const interaction::HingeJoint& joint : interaction::kRightArm) {
             const size_t bone = static_cast<size_t>(joint.bone);
+            assert(result.poses[frame].positions[bone].x ==
+                   source.positions[bone].x);
+            assert(result.poses[frame].positions[bone].y ==
+                   source.positions[bone].y);
+            assert(result.poses[frame].positions[bone].z ==
+                   source.positions[bone].z);
             assert(result.poses[frame].rotations[bone].w ==
                    source.rotations[bone].w);
             assert(result.poses[frame].rotations[bone].x ==
@@ -202,6 +221,45 @@ void test_one_reach_warps_to_a_different_approach_direction() {
             assert(result.poses[frame].rotations[bone].z ==
                    source.rotations[bone].z);
         }
+    }
+}
+
+void test_short_reach_keeps_its_initial_pose_unwarped() {
+    const reach::Pack pack = fixture();
+    reach::Query query = zero_query(pack);
+    query.approach_world = normalize(quat_mul_vec3(
+        quat_from_angle_axis(0.523598776F, vec3(0, 1, 0)),
+        query.approach_world));
+
+    const reach::Evaluation result = reach::shape_candidate(
+        pack, reach::select_candidates(pack, query)[0], query);
+    const interaction::Pose source = reach::pose_at_frame(pack.database, 0);
+
+    for (const interaction::HingeJoint& joint : interaction::kLeftArm) {
+        const size_t bone = static_cast<size_t>(joint.bone);
+        assert(result.poses[0].rotations[bone].w == source.rotations[bone].w);
+        assert(result.poses[0].rotations[bone].x == source.rotations[bone].x);
+        assert(result.poses[0].rotations[bone].y == source.rotations[bone].y);
+        assert(result.poses[0].rotations[bone].z == source.rotations[bone].z);
+    }
+}
+
+void test_small_translation_without_approach_warp_uses_public_tolerance() {
+    const reach::Pack pack = fixture();
+    reach::Query query = zero_query(pack);
+    query.target.position.y += 0.01F;
+
+    const reach::Evaluation result = reach::shape_candidate(
+        pack, reach::select_candidates(pack, query)[0], query);
+    const interaction::Pose source = reach::pose_at_frame(pack.database, 5);
+
+    assert(result.rejection == reach::Rejection::None);
+    for (const interaction::HingeJoint& joint : interaction::kLeftArm) {
+        const size_t bone = static_cast<size_t>(joint.bone);
+        assert(result.poses[5].rotations[bone].w == source.rotations[bone].w);
+        assert(result.poses[5].rotations[bone].x == source.rotations[bone].x);
+        assert(result.poses[5].rotations[bone].y == source.rotations[bone].y);
+        assert(result.poses[5].rotations[bone].z == source.rotations[bone].z);
     }
 }
 
@@ -412,6 +470,8 @@ void test_diagnostics_separate_hand_and_augmentation_counts() {
 int main() {
     test_retrieval_is_same_hand_spatial_and_wrist_orientation_independent();
     test_one_reach_warps_to_a_different_approach_direction();
+    test_short_reach_keeps_its_initial_pose_unwarped();
+    test_small_translation_without_approach_warp_uses_public_tolerance();
     test_retrieval_ranks_position_then_approach_then_clip();
     test_zero_retarget_reproduces_endpoint_and_keeps_root_fixed();
     test_unreachable_target_reports_a_specific_final_gate();

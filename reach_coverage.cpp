@@ -237,9 +237,12 @@ Evaluation shape_candidate(
     evaluation.poses.reserve(frame_count);
     const vec3 endpoint_offset =
         query.target.position - source_endpoint.position;
+    const vec3 source_approach = approach_direction(
+        pack.database, candidate.clip);
     const quat approach_alignment = direction_alignment(
-        approach_direction(pack.database, candidate.clip),
-        query.approach_world);
+        source_approach, query.approach_world);
+    const bool warps_approach =
+        direction_angle(source_approach, query.approach_world) > 1.0e-6F;
     const quat correction = quat_mul(
         query.target.rotation, quat_inv(source_endpoint.rotation));
     const size_t aligned_sample = frame_count > 6U
@@ -251,7 +254,7 @@ Evaluation shape_candidate(
     const interaction::IKConfig ik_config{
         0.45F,
         kPi,
-        std::min(config.accepted_position_m, 0.001F),
+        config.accepted_position_m,
         config.accepted_orientation_radians,
         0.05F,
         0.001F,
@@ -269,10 +272,10 @@ Evaluation shape_candidate(
             : static_cast<float>(sample) /
                   static_cast<float>(frame_count - 1U);
         const float translation_weight = smoothstep(u);
-        const float approach_u = sample >= aligned_sample
-            ? 1.0F
-            : (sample <= ramp_start
-                ? 0.0F
+        const float approach_u = sample <= ramp_start
+            ? 0.0F
+            : (sample >= aligned_sample
+                ? 1.0F
                 : static_cast<float>(sample - ramp_start) /
                       static_cast<float>(aligned_sample - ramp_start));
         const float approach_weight = smoothstep(approach_u);
@@ -286,8 +289,13 @@ Evaluation shape_candidate(
                 quat_nlerp_shortest(quat(), correction, translation_weight),
                 source_hand.rotation),
         };
+        interaction::IKConfig sample_ik_config = ik_config;
+        if (warps_approach && approach_weight > 0.0F) {
+            sample_ik_config.accepted_position_m = std::min(
+                sample_ik_config.accepted_position_m, 0.001F);
+        }
         const interaction::IKResult ik = interaction::solve_hand_ik(
-            pose, interaction_hand(query.hand), desired, ik_config);
+            pose, interaction_hand(query.hand), desired, sample_ik_config);
         evaluation.joint_limit_saturated =
             evaluation.joint_limit_saturated ||
             ik.reason == interaction::Reason::JointLimit;
