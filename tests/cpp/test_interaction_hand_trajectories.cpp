@@ -552,11 +552,13 @@ void test_partial_compact_database_is_rejected_before_clip_filtering() {
             "partial compact database was accepted before clip filtering");
 }
 
-interaction::ShelfGeometry distant_shelf() {
-    interaction::ShelfGeometry shelf{};
-    for (interaction::OrientedBox& box : shelf.boxes) {
-        box.world = {vec3(100.0F, 100.0F, 100.0F), quat()};
-        box.dimensions = vec3(1.0F, 1.0F, 1.0F);
+interaction::EnvironmentGeometry distant_shelf() {
+    interaction::EnvironmentGeometry shelf{};
+    for (size_t index = 0U; index < 5U; ++index) {
+        shelf.boxes.push_back({
+            {vec3(100.0F, 100.0F, 100.0F), quat()},
+            vec3(1.0F, 1.0F, 1.0F),
+        });
     }
     return shelf;
 }
@@ -871,7 +873,7 @@ void test_shape_rejects_contact_correction_above_solver_envelope() {
 void test_collision_feasibility_is_phase_aware() {
     const interaction::OrientedBox object{
         {vec3(), quat()}, vec3(1.0F, 1.0F, 1.0F)};
-    const interaction::ShelfGeometry far_shelf = distant_shelf();
+    const interaction::EnvironmentGeometry far_shelf = distant_shelf();
 
     const auto clear = mapped_line(
         {vec3(2.0F, 2.0F, 2.0F), vec3(1.5F, 2.0F, 2.0F)},
@@ -903,7 +905,7 @@ void test_collision_feasibility_is_phase_aware() {
 void test_forearm_capsule_and_contact_still_collide_with_shelf() {
     const interaction::OrientedBox object{
         {vec3(), quat()}, vec3(0.2F, 0.2F, 0.2F)};
-    interaction::ShelfGeometry shelf = distant_shelf();
+    interaction::EnvironmentGeometry shelf = distant_shelf();
     shelf.boxes[0] = {
         {vec3(3.0F, 0.0F, 0.0F), quat()}, vec3(0.2F, 1.0F, 1.0F)};
     const auto forearm_crossing = mapped_line(
@@ -911,7 +913,7 @@ void test_forearm_capsule_and_contact_still_collide_with_shelf() {
         {vec3(4.0F, 0.0F, 0.0F)});
     require(interaction::evaluate_trajectory_feasibility(
                 forearm_crossing, 0U, object, shelf).reason ==
-            interaction::TrajectoryFeasibilityReason::ShelfCollision,
+            interaction::TrajectoryFeasibilityReason::EnvironmentCollision,
             "forearm capsule crossing shelf was not rejected");
 
     shelf.boxes[0] = object;
@@ -919,7 +921,7 @@ void test_forearm_capsule_and_contact_still_collide_with_shelf() {
         {vec3()}, {vec3(1.0F, 0.0F, 0.0F)});
     require(interaction::evaluate_trajectory_feasibility(
                 contact_shelf, 0U, object, shelf).reason ==
-            interaction::TrajectoryFeasibilityReason::ShelfCollision,
+            interaction::TrajectoryFeasibilityReason::EnvironmentCollision,
             "shelf collision was incorrectly exempted at Contact");
 }
 
@@ -928,7 +930,7 @@ void test_shaped_upper_arm_and_torso_collisions_are_rejected() {
     upper_arm.fill(vec3(10.0F, 10.0F, 10.0F));
     upper_arm[g1_skeleton::RightShoulderPitch] = vec3(-1.0F, 0.0F, 0.0F);
     upper_arm[g1_skeleton::RightShoulderRoll] = vec3(1.0F, 0.0F, 0.0F);
-    interaction::ShelfGeometry shelf = distant_shelf();
+    interaction::EnvironmentGeometry shelf = distant_shelf();
     shelf.boxes[0] = {
         {vec3(), quat()}, vec3(0.20F, 0.20F, 0.20F)};
     const interaction::OrientedBox distant_object{
@@ -940,7 +942,7 @@ void test_shaped_upper_arm_and_torso_collisions_are_rejected() {
     require(interaction::evaluate_shaped_trajectory_feasibility(
                 upper_arm_shaped, 0U, interaction::Hand::Right,
                 distant_object, shelf).reason ==
-            interaction::TrajectoryFeasibilityReason::ShelfCollision,
+            interaction::TrajectoryFeasibilityReason::EnvironmentCollision,
             "upper-arm table penetration was accepted");
 
     std::array<vec3, g1_skeleton::BoneCount> torso{};
@@ -951,14 +953,14 @@ void test_shaped_upper_arm_and_torso_collisions_are_rejected() {
     require(interaction::evaluate_shaped_trajectory_feasibility(
                 torso_shaped, 0U, interaction::Hand::Right,
                 distant_object, shelf).reason ==
-            interaction::TrajectoryFeasibilityReason::ShelfCollision,
+            interaction::TrajectoryFeasibilityReason::EnvironmentCollision,
             "torso table penetration was accepted");
 }
 
 void test_only_active_grasp_chain_is_exempt_after_contact() {
     const interaction::OrientedBox object{
         {vec3(), quat()}, vec3(0.20F, 0.20F, 0.20F)};
-    const interaction::ShelfGeometry shelf = distant_shelf();
+    const interaction::EnvironmentGeometry shelf = distant_shelf();
     std::array<vec3, g1_skeleton::BoneCount> nonactive{};
     nonactive.fill(vec3(10.0F, 10.0F, 10.0F));
     nonactive[g1_skeleton::LeftWristRoll] = vec3(0.0F, 0.0F, 0.0F);
@@ -991,7 +993,7 @@ void test_recorded_table_geometry_preserves_top_and_builds_four_legs() {
     const interaction::Transform table{
         vec3(1.0F, 0.40F, -2.0F), quat()};
     const vec3 dimensions(1.20F, 0.08F, 0.70F);
-    const interaction::ShelfGeometry geometry =
+    const interaction::EnvironmentGeometry geometry =
         interaction::make_recorded_table_geometry(table, dimensions);
     require(near(geometry.boxes[0].world.position, table.position),
             "tabletop position changed");
@@ -1013,6 +1015,54 @@ void test_recorded_table_geometry_preserves_top_and_builds_four_legs() {
         rejected = true;
     }
     require(rejected, "below-ground recorded table was accepted");
+}
+
+void test_coverage_environment_builds_right_shelf_and_lower_left_table() {
+    const interaction::EnvironmentGeometry environment =
+        interaction::make_coverage_environment(
+            {vec3(0.0F, 0.76F, 0.0F), quat()},
+            vec3(1.20F, 0.06F, 0.70F));
+
+    require(environment.boxes.size() == 13U,
+            "coverage environment did not contain 13 furniture boxes");
+    require(near(
+                environment.boxes[5].dimensions,
+                vec3(0.45F, 0.04F, 0.32F)),
+            "right shelf board dimensions changed");
+    require(environment.boxes[5].world.position.x > 0.0F &&
+                environment.boxes[5].world.position.y > 0.76F,
+            "right shelf board is not above the table's right side");
+    require(near(
+                environment.boxes[8].dimensions,
+                vec3(0.65F, 0.06F, 0.50F)),
+            "lower table top dimensions changed");
+    require(environment.boxes[8].world.position.x < -0.60F &&
+                environment.boxes[8].world.position.y < 0.76F,
+            "lower table is not below and left of the center table");
+}
+
+void test_collision_checks_every_environment_box() {
+    interaction::EnvironmentGeometry environment{};
+    environment.boxes.push_back({
+        {vec3(100.0F, 100.0F, 100.0F), quat()},
+        vec3(1.0F, 1.0F, 1.0F),
+    });
+    environment.boxes.push_back({
+        {vec3(), quat()}, vec3(0.20F, 0.20F, 0.20F),
+    });
+    const interaction::OrientedBox distant_object{
+        {vec3(50.0F, 50.0F, 50.0F), quat()},
+        vec3(0.10F, 0.10F, 0.10F),
+    };
+    const auto result = interaction::evaluate_trajectory_feasibility(
+        mapped_line({vec3()}, {vec3(0.0F, 0.10F, 0.0F)}),
+        0U,
+        distant_object,
+        environment);
+
+    require(result.reason ==
+                interaction::TrajectoryFeasibilityReason::EnvironmentCollision,
+            "collision evaluator ignored a later environment box");
 }
 
 }  // namespace
@@ -1041,5 +1091,7 @@ int main() {
     test_shaped_upper_arm_and_torso_collisions_are_rejected();
     test_only_active_grasp_chain_is_exempt_after_contact();
     test_recorded_table_geometry_preserves_top_and_builds_four_legs();
+    test_coverage_environment_builds_right_shelf_and_lower_left_table();
+    test_collision_checks_every_environment_box();
     return 0;
 }

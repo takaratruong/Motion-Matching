@@ -78,14 +78,14 @@ struct OrientedBox {
     vec3 dimensions{};
 };
 
-struct ShelfGeometry {
-    std::array<OrientedBox, 5> boxes{};
+struct EnvironmentGeometry {
+    std::vector<OrientedBox> boxes;
 };
 
 enum class TrajectoryFeasibilityReason : uint8_t {
     None = 0U,
     ObjectCollision = 1U,
-    ShelfCollision = 2U,
+    EnvironmentCollision = 2U,
 };
 
 struct TrajectoryFeasibility {
@@ -101,7 +101,12 @@ struct TrajectoryCollisionConfig {
     float torso_radius_m = 0.10F;
 };
 
-ShelfGeometry make_recorded_table_geometry(
+EnvironmentGeometry make_recorded_table_geometry(
+    const Transform& table_world,
+    vec3 table_dimensions,
+    float leg_thickness_m = 0.04F);
+
+EnvironmentGeometry make_coverage_environment(
     const Transform& table_world,
     vec3 table_dimensions,
     float leg_thickness_m = 0.04F);
@@ -137,7 +142,7 @@ TrajectoryFeasibility evaluate_trajectory_feasibility(
     const MappedHandTrajectory& trajectory,
     size_t contact_point,
     const OrientedBox& object,
-    const ShelfGeometry& shelf,
+    const EnvironmentGeometry& environment,
     const TrajectoryCollisionConfig& config = TrajectoryCollisionConfig{});
 
 TrajectoryFeasibility evaluate_shaped_trajectory_feasibility(
@@ -145,7 +150,7 @@ TrajectoryFeasibility evaluate_shaped_trajectory_feasibility(
     size_t contact_point,
     Hand hand,
     const OrientedBox& object,
-    const ShelfGeometry& shelf,
+    const EnvironmentGeometry& environment,
     const TrajectoryCollisionConfig& config = TrajectoryCollisionConfig{});
 
 }  // namespace interaction

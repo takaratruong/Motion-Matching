@@ -733,7 +733,7 @@ MappedHandTrajectory map_hand_trajectory(
     return mapped;
 }
 
-ShelfGeometry make_recorded_table_geometry(
+EnvironmentGeometry make_recorded_table_geometry(
     const Transform& table_world,
     vec3 table_dimensions,
     float leg_thickness_m) {
@@ -750,8 +750,8 @@ ShelfGeometry make_recorded_table_geometry(
         throw std::invalid_argument("invalid recorded table geometry");
     }
 
-    ShelfGeometry geometry{};
-    geometry.boxes[0] = tabletop;
+    EnvironmentGeometry geometry{};
+    geometry.boxes.push_back(tabletop);
     const float x_offset = 0.5F * table_dimensions.x - leg_thickness_m;
     const float z_offset = 0.5F * table_dimensions.z - leg_thickness_m;
     const float local_y =
@@ -763,19 +763,100 @@ ShelfGeometry make_recorded_table_geometry(
         vec3(x_offset, local_y, z_offset),
     }};
     for (size_t leg = 0U; leg < leg_positions.size(); ++leg) {
-        geometry.boxes[leg + 1U] = {
+        geometry.boxes.push_back({
             compose(tabletop.world, Transform{leg_positions[leg], quat()}),
             vec3(leg_thickness_m, underside_height, leg_thickness_m),
-        };
+        });
     }
     return geometry;
+}
+
+EnvironmentGeometry make_coverage_environment(
+    const Transform& table_world,
+    vec3 table_dimensions,
+    float leg_thickness_m) {
+    EnvironmentGeometry environment = make_recorded_table_geometry(
+        table_world, table_dimensions, leg_thickness_m);
+    constexpr float shelf_board_thickness = 0.04F;
+    constexpr float shelf_height = 0.32F;
+    constexpr float shelf_support_thickness = 0.035F;
+    const float shelf_width = std::min(
+        0.45F, table_dimensions.x - 0.08F);
+    const float shelf_depth = std::min(
+        0.32F, table_dimensions.z - 0.08F);
+    const float table_top =
+        table_world.position.y + 0.5F * table_dimensions.y;
+    const float shelf_x = table_world.position.x +
+        0.5F * table_dimensions.x - 0.04F - 0.5F * shelf_width;
+    const float shelf_y = table_top + shelf_height;
+    environment.boxes.push_back({
+        {vec3(shelf_x, shelf_y, table_world.position.z), quat()},
+        vec3(shelf_width, shelf_board_thickness, shelf_depth),
+    });
+    const float support_height =
+        shelf_height - 0.5F * shelf_board_thickness;
+    const float support_y = table_top + 0.5F * support_height;
+    const float support_x =
+        0.5F * shelf_width - 0.5F * shelf_support_thickness;
+    for (const float sign : {-1.0F, 1.0F}) {
+        environment.boxes.push_back({
+            {vec3(
+                 shelf_x + sign * support_x,
+                 support_y,
+                 table_world.position.z),
+             quat()},
+            vec3(
+                shelf_support_thickness, support_height, shelf_depth),
+        });
+    }
+
+    constexpr vec3 lower_dimensions(0.65F, 0.06F, 0.50F);
+    constexpr float table_gap = 0.12F;
+    const vec3 lower_position(
+        table_world.position.x - 0.5F * table_dimensions.x - table_gap -
+            0.5F * lower_dimensions.x,
+        table_world.position.y - 0.24F,
+        table_world.position.z);
+    environment.boxes.push_back({
+        {lower_position, quat()}, lower_dimensions,
+    });
+    const float lower_underside =
+        lower_position.y - 0.5F * lower_dimensions.y;
+    if (!(lower_underside > 0.0F)) {
+        throw std::invalid_argument("lower coverage table reaches below ground");
+    }
+    const float lower_x_offset =
+        0.5F * lower_dimensions.x - leg_thickness_m;
+    const float lower_z_offset =
+        0.5F * lower_dimensions.z - leg_thickness_m;
+    for (const float x_sign : {-1.0F, 1.0F}) {
+        for (const float z_sign : {-1.0F, 1.0F}) {
+            environment.boxes.push_back({
+                {vec3(
+                     lower_position.x + x_sign * lower_x_offset,
+                     0.5F * lower_underside,
+                     lower_position.z + z_sign * lower_z_offset),
+                 quat()},
+                vec3(
+                    leg_thickness_m,
+                    lower_underside,
+                    leg_thickness_m),
+            });
+        }
+    }
+    for (const OrientedBox& box : environment.boxes) {
+        if (!valid_box(box)) {
+            throw std::invalid_argument("invalid coverage environment geometry");
+        }
+    }
+    return environment;
 }
 
 TrajectoryFeasibility evaluate_trajectory_feasibility(
     const MappedHandTrajectory& trajectory,
     size_t contact_point,
     const OrientedBox& object,
-    const ShelfGeometry& shelf,
+    const EnvironmentGeometry& environment,
     const TrajectoryCollisionConfig& config) {
     if (trajectory.hands.empty() ||
         trajectory.hands.size() != trajectory.elbows.size() ||
@@ -783,9 +864,9 @@ TrajectoryFeasibility evaluate_trajectory_feasibility(
         !valid_box(object) || !valid_collision_config(config)) {
         throw std::invalid_argument("invalid trajectory collision query");
     }
-    for (const OrientedBox& box : shelf.boxes) {
+    for (const OrientedBox& box : environment.boxes) {
         if (!valid_box(box)) {
-            throw std::invalid_argument("invalid shelf geometry");
+            throw std::invalid_argument("invalid environment geometry");
         }
     }
     for (size_t sample = 0U; sample < contact_point; ++sample) {
@@ -796,11 +877,13 @@ TrajectoryFeasibility evaluate_trajectory_feasibility(
         }
     }
     for (size_t sample = 0U; sample < trajectory.hands.size(); ++sample) {
-        for (const OrientedBox& box : shelf.boxes) {
+        for (const OrientedBox& box : environment.boxes) {
             if (arm_intersects_box(
                     trajectory.hands[sample].position,
                     trajectory.elbows[sample], box, config)) {
-                return {TrajectoryFeasibilityReason::ShelfCollision, sample};
+                return {
+                    TrajectoryFeasibilityReason::EnvironmentCollision,
+                    sample};
             }
         }
     }
@@ -812,7 +895,7 @@ TrajectoryFeasibility evaluate_shaped_trajectory_feasibility(
     size_t contact_point,
     Hand hand,
     const OrientedBox& object,
-    const ShelfGeometry& shelf,
+    const EnvironmentGeometry& environment,
     const TrajectoryCollisionConfig& config) {
     if (trajectory.poses.empty() ||
         trajectory.path.hands.size() != trajectory.poses.size() ||
@@ -821,9 +904,9 @@ TrajectoryFeasibility evaluate_shaped_trajectory_feasibility(
         !valid_box(object) || !valid_collision_config(config)) {
         throw std::invalid_argument("invalid shaped trajectory collision query");
     }
-    for (const OrientedBox& box : shelf.boxes) {
+    for (const OrientedBox& box : environment.boxes) {
         if (!valid_box(box)) {
-            throw std::invalid_argument("invalid shelf geometry");
+            throw std::invalid_argument("invalid environment geometry");
         }
     }
     for (size_t sample = 0U; sample < trajectory.poses.size(); ++sample) {
@@ -833,10 +916,12 @@ TrajectoryFeasibility evaluate_shaped_trajectory_feasibility(
                 world, object, hand, after_contact, config)) {
             return {TrajectoryFeasibilityReason::ObjectCollision, sample};
         }
-        for (const OrientedBox& box : shelf.boxes) {
+        for (const OrientedBox& box : environment.boxes) {
             if (skeleton_intersects_box(
                     world, box, hand, false, config)) {
-                return {TrajectoryFeasibilityReason::ShelfCollision, sample};
+                return {
+                    TrajectoryFeasibilityReason::EnvironmentCollision,
+                    sample};
             }
         }
     }
