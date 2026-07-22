@@ -16,6 +16,7 @@
 namespace {
 
 constexpr float kPi = 3.14159265358979323846F;
+constexpr float kWristContactOffset = 0.04F;
 constexpr const char* kCapturedLabel = "CAPTURED LEFT";
 constexpr const char* kMirroredLabel = "MIRRORED RIGHT";
 
@@ -67,11 +68,21 @@ size_t wrist_bone(reach::Hand hand) {
         : static_cast<size_t>(g1_skeleton::RightWrist);
 }
 
+reach::Hand evaluation_hand(
+    const reach::Pack& pack,
+    const reach::Evaluation& evaluation) {
+    return static_cast<reach::Hand>(
+        pack.database.active_hands.at(evaluation.candidate.clip));
+}
+
 interaction::Transform desired_grasp(
     const interaction::Transform& object,
     vec3 dimensions) {
     const interaction::Transform local{
-        vec3(0.5F * dimensions.x, 0.0F, 0.0F),
+        vec3(
+            0.5F * dimensions.x + kWristContactOffset,
+            0.0F,
+            0.0F),
         quat_from_angle_axis(kPi, vec3(0.0F, 1.0F, 0.0F)),
     };
     return interaction::compose(object, local);
@@ -80,13 +91,29 @@ interaction::Transform desired_grasp(
 reach::Query make_query(
     const interaction::Transform& object,
     vec3 dimensions,
-    reach::Hand hand) {
+    reach::Hand hand,
+    vec3 grasp_approach_local) {
     reach::Query query{};
     query.hand = hand;
     query.target = desired_grasp(object, dimensions);
     query.approach_world = normalize(quat_mul_vec3(
-        object.rotation, vec3(-1.0F, 0.0F, 0.0F)));
+        object.rotation, grasp_approach_local));
     return query;
+}
+
+vec3 reset_grasp_approach_local(
+    const reach::Pack& pack,
+    reach::Hand hand,
+    const interaction::Transform& object) {
+    for (size_t clip = 0U; clip < pack.database.clip_count; ++clip) {
+        if (pack.database.active_hands.at(clip) ==
+            static_cast<uint8_t>(hand)) {
+            return normalize(quat_mul_vec3(
+                quat_inv(object.rotation),
+                reach::approach_direction(pack.database, clip)));
+        }
+    }
+    return vec3(-1.0F, 0.0F, 0.0F);
 }
 
 interaction::Transform reset_object(
@@ -105,7 +132,11 @@ interaction::Transform reset_object(
             endpoint.rotation,
             quat_from_angle_axis(-kPi, vec3(0.0F, 1.0F, 0.0F)));
         object.position = endpoint.position - quat_mul_vec3(
-            object.rotation, vec3(0.5F * dimensions.x, 0.0F, 0.0F));
+            object.rotation,
+            vec3(
+                0.5F * dimensions.x + kWristContactOffset,
+                0.0F,
+                0.0F));
         return object;
     }
     return {{0.65F, 0.85F, 0.0F}, quat()};
@@ -117,20 +148,23 @@ SearchResults rerun_search(
     const interaction::OrientedBox& object,
     const interaction::EnvironmentGeometry& environment) {
     SearchResults results{};
-    const std::vector<reach::Candidate> candidates =
-        reach::select_candidates(pack, query);
     std::unordered_set<size_t> selected;
-    selected.reserve(candidates.size());
+    selected.reserve(pack.database.clip_count);
     results.evaluations.reserve(pack.database.clip_count);
-    for (const reach::Candidate& candidate : candidates) {
-        selected.insert(candidate.clip);
-        results.evaluations.push_back(reach::evaluate_candidate(
-            pack, candidate, query, object, environment));
+    for (const reach::Hand candidate_hand :
+         {reach::Hand::Left, reach::Hand::Right}) {
+        reach::Query hand_query = query;
+        hand_query.hand = candidate_hand;
+        const std::vector<reach::Candidate> candidates =
+            reach::select_candidates(pack, hand_query);
+        for (const reach::Candidate& candidate : candidates) {
+            selected.insert(candidate.clip);
+            results.evaluations.push_back(reach::evaluate_candidate(
+                pack, candidate, hand_query, object, environment));
+        }
     }
     for (size_t clip = 0U; clip < pack.database.clip_count; ++clip) {
-        if (pack.database.active_hands.at(clip) !=
-                static_cast<uint8_t>(query.hand) ||
-            selected.count(clip) != 0U) {
+        if (selected.count(clip) != 0U) {
             continue;
         }
         reach::Evaluation outside{};
@@ -287,7 +321,7 @@ void draw_hud(
         "M hand | G open/coverage | [ previous, ] or / next | V rejected | Backspace reset",
         26, 48, 16, DARKGRAY);
     DrawText(
-        TextFormat("HAND %s | %s ENVIRONMENT | rejected paths %s",
+        TextFormat("RESET HAND %s | %s ENVIRONMENT | rejected paths %s",
             hand == reach::Hand::Left ? "LEFT" : "RIGHT",
             coverage_environment ? "COVERAGE" : "OPEN",
             show_rejected ? "ON" : "OFF"),
@@ -363,14 +397,17 @@ int main(int argc, char** argv) {
         reach::Hand hand = reach::Hand::Left;
         interaction::Transform object = reset_object(
             pack, hand, options.object_size);
-        bool use_coverage_environment = true;
+        vec3 grasp_approach_local = reset_grasp_approach_local(
+            pack, hand, object);
+        bool use_coverage_environment = false;
         bool show_rejected = true;
         bool stale = false;
         size_t selected = 0U;
         float animation_seconds = 0.0F;
-        reach::Query query = make_query(object, options.object_size, hand);
+        reach::Query query = make_query(
+            object, options.object_size, hand, grasp_approach_local);
         SearchResults results = rerun_search(
-            pack, query, {object, options.object_size}, coverage);
+            pack, query, {object, options.object_size}, open);
 
         SetConfigFlags(FLAG_VSYNC_HINT | FLAG_MSAA_4X_HINT);
         InitWindow(1280, 800, "G1 retargeted reach coverage");
@@ -409,6 +446,8 @@ int main(int argc, char** argv) {
                 hand = hand == reach::Hand::Left
                     ? reach::Hand::Right : reach::Hand::Left;
                 object = reset_object(pack, hand, options.object_size);
+                grasp_approach_local = reset_grasp_approach_local(
+                    pack, hand, object);
                 target_changed = true;
             }
             if (IsKeyPressed(KEY_G)) {
@@ -418,10 +457,13 @@ int main(int argc, char** argv) {
             if (IsKeyPressed(KEY_V)) show_rejected = !show_rejected;
             if (IsKeyPressed(KEY_BACKSPACE)) {
                 object = reset_object(pack, hand, options.object_size);
+                grasp_approach_local = reset_grasp_approach_local(
+                    pack, hand, object);
                 target_changed = true;
             }
             if (target_changed) stale = true;
-            query = make_query(object, options.object_size, hand);
+            query = make_query(
+                object, options.object_size, hand, grasp_approach_local);
             if (IsKeyPressed(KEY_ENTER)) {
                 results = rerun_search(
                     pack, query, {object, options.object_size},
@@ -468,8 +510,9 @@ int main(int argc, char** argv) {
                     !show_rejected) {
                     continue;
                 }
+                const reach::Hand path_hand = evaluation_hand(pack, evaluation);
                 draw_path(
-                    evaluation, hand,
+                    evaluation, path_hand,
                     evaluation.rejection == reach::Rejection::None
                         ? trajectory_color(
                               pack, evaluation.candidate.clip, true)
@@ -479,9 +522,11 @@ int main(int argc, char** argv) {
             if (!results.options.empty()) {
                 const reach::Evaluation& evaluation =
                     results.evaluations[selected_evaluation];
+                const reach::Hand selected_hand =
+                    evaluation_hand(pack, evaluation);
                 const Color selected_color =
                     evaluation.rejection == reach::Rejection::None ? LIME : ORANGE;
-                draw_path(evaluation, hand, selected_color, 1U, true);
+                draw_path(evaluation, selected_hand, selected_color, 1U, true);
                 const float fps = static_cast<float>(pack.database.fps_numerator) /
                     static_cast<float>(pack.database.fps_denominator);
                 const size_t sample = static_cast<size_t>(
@@ -489,7 +534,7 @@ int main(int argc, char** argv) {
                 draw_pose(evaluation.poses[sample], DARKBLUE, SKYBLUE);
                 const interaction::WorldPose final = interaction::world_pose(
                     evaluation.poses.back());
-                const size_t wrist = wrist_bone(hand);
+                const size_t wrist = wrist_bone(selected_hand);
                 draw_axes({final.positions[wrist], final.rotations[wrist]},
                     0.13F, 150);
             }

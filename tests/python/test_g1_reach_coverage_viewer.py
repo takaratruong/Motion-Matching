@@ -30,6 +30,10 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
             "REJECTED - motion shown for diagnosis",
             "ClearBackground(Color{238, 241, 245, 255})",
             "DrawSphereWires(", "DARKBLUE", "SKYBLUE", "LIME",
+            "grasp_approach_local", "use_coverage_environment = false",
+            "for (const reach::Hand candidate_hand",
+            "evaluation_hand(pack, evaluation)",
+            "kWristContactOffset",
         ):
             self.assertIn(required, source)
         for forbidden in (

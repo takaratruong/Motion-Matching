@@ -19,6 +19,7 @@
 namespace {
 
 constexpr float kPi = 3.14159265358979323846F;
+constexpr float kWristContactOffset = 0.04F;
 constexpr float kZeroPositionTolerance = 0.001F;
 constexpr float kZeroApproachTolerance = 0.008726646F;
 
@@ -135,7 +136,11 @@ reach::Evaluation evaluate_query(
         query.target.rotation,
         quat_from_angle_axis(-kPi, vec3(0.0F, 1.0F, 0.0F)));
     object.position = query.target.position - quat_mul_vec3(
-        object.rotation, vec3(0.5F * dimensions.x, 0.0F, 0.0F));
+        object.rotation,
+        vec3(
+            0.5F * dimensions.x + kWristContactOffset,
+            0.0F,
+            0.0F));
     const interaction::EnvironmentGeometry open{};
     return reach::evaluate_candidate(
         pack,
