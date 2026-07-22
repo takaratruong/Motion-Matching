@@ -19,6 +19,7 @@ from .schema import GMRSource, ReviewCorpus
 
 _MOTIONS_NAME = "review_motions.npz"
 _MANIFEST_NAME = "manifest.json"
+_PROPOSALS_NAME = "proposals.json"
 
 
 def _sha256(path: Path) -> str:
@@ -92,7 +93,12 @@ def convert_review_sources(
     return corpus
 
 
-def _manifest(corpus: ReviewCorpus, motions_sha256: str) -> dict:
+def _manifest(
+    corpus: ReviewCorpus,
+    motions_sha256: str,
+    proposals_sha256: str,
+    proposal_count: int,
+) -> dict:
     return {
         "schema": "g1-reach-review",
         "version": 1,
@@ -111,6 +117,8 @@ def _manifest(corpus: ReviewCorpus, motions_sha256: str) -> dict:
         "conversion_reports": list(corpus.conversion_reports),
         "excluded_sequence_ids": list(corpus.excluded_sequence_ids),
         "review_motions_sha256": motions_sha256,
+        "proposals_sha256": proposals_sha256,
+        "proposal_count": proposal_count,
     }
 
 
@@ -139,8 +147,24 @@ def write_review_corpus(output: Path, corpus: ReviewCorpus) -> None:
             range_stops=corpus.range_stops.astype(np.int32, copy=False),
             source_frames=corpus.source_frames.astype(np.int32, copy=False),
         )
+        from .segmentation import propose_reaches
+
+        proposals = propose_reaches(corpus)
+        proposal_document = {
+            "schema": "g1-reach-proposals",
+            "version": 1,
+            "review_motions_sha256": _sha256(temporary / _MOTIONS_NAME),
+            "proposals": [dataclasses.asdict(value) for value in proposals],
+        }
+        (temporary / _PROPOSALS_NAME).write_text(
+            json.dumps(proposal_document, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
         manifest = _manifest(
-            corpus, _sha256(temporary / _MOTIONS_NAME)
+            corpus,
+            proposal_document["review_motions_sha256"],
+            _sha256(temporary / _PROPOSALS_NAME),
+            len(proposals),
         )
         (temporary / _MANIFEST_NAME).write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n",
@@ -205,5 +229,35 @@ def read_review_corpus(output: Path) -> ReviewCorpus:
         raise ValueError("review manifest source count mismatch")
     if manifest.get("frame_count") != len(corpus.positions):
         raise ValueError("review manifest frame count mismatch")
+    proposals = read_reach_proposals(output)
+    if manifest.get("proposal_count") != len(proposals):
+        raise ValueError("review manifest proposal count mismatch")
     return corpus
 
+
+def read_reach_proposals(output: Path):
+    from .segmentation import ReachProposal
+
+    output = Path(output)
+    manifest = json.loads(
+        (output / _MANIFEST_NAME).read_text(encoding="utf-8")
+    )
+    proposals_path = output / _PROPOSALS_NAME
+    if _sha256(proposals_path) != manifest.get("proposals_sha256"):
+        raise ValueError("reach proposals checksum mismatch")
+    document = json.loads(proposals_path.read_text(encoding="utf-8"))
+    if (
+        document.get("schema") != "g1-reach-proposals"
+        or document.get("version") != 1
+    ):
+        raise ValueError("unsupported reach proposal document")
+    if document.get("review_motions_sha256") != manifest.get(
+        "review_motions_sha256"
+    ):
+        raise ValueError("reach proposals are bound to different review motions")
+    proposals = [ReachProposal(**value) for value in document.get("proposals", [])]
+    if len({proposal.proposal_id for proposal in proposals}) != len(proposals):
+        raise ValueError("duplicate reach proposal id")
+    if any(proposal.status != "pending" for proposal in proposals):
+        raise ValueError("generated reach proposals must remain pending")
+    return proposals

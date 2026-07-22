@@ -66,7 +66,7 @@ class ReviewCorpusTests(unittest.TestCase):
 
             self.assertEqual(
                 {path.name for path in output.iterdir()},
-                {"manifest.json", "review_motions.npz"},
+                {"manifest.json", "review_motions.npz", "proposals.json"},
             )
             np.testing.assert_array_equal(loaded.positions, corpus.positions)
             np.testing.assert_array_equal(loaded.rotations, corpus.rotations)
