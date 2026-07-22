@@ -37,6 +37,14 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
             "LoadModel(", "controller.cpp",
         ):
             self.assertNotIn(forbidden, source)
+        self.assertIn(
+            "evaluation.rejection == reach::Rejection::None ? LIME : ORANGE",
+            source,
+        )
+        self.assertIn("object_collision_observed", source)
+        self.assertIn("environment_collision_observed", source)
+        self.assertIn("OBSERVED OBJECT COLLISION", source)
+        self.assertIn("OBSERVED ENVIRONMENT COLLISION", source)
 
     def test_probe_contract(self):
         source = self.source(PROBE)

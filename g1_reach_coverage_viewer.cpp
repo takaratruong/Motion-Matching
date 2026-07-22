@@ -279,7 +279,7 @@ void draw_hud(
     bool coverage_environment,
     bool show_rejected,
     reach::Hand hand) {
-    DrawRectangle(14, 14, 790, 282, Color{255, 255, 255, 225});
+    DrawRectangle(14, 14, 790, 306, Color{255, 255, 255, 225});
     DrawText(
         "Arrow X/Z  W/S Y | Q/E yaw R/F pitch Z/C roll | Enter search",
         26, 24, 17, DARKGRAY);
@@ -331,6 +331,16 @@ void draw_hud(
                 evaluation.approach_error_radians * 180.0F / kPi,
                 evaluation.orientation_error_radians * 180.0F / kPi),
             26, 242, 16, DARKGRAY);
+        DrawText(
+            TextFormat(
+                "OBSERVED OBJECT COLLISION: %s | OBSERVED ENVIRONMENT COLLISION: %s",
+                evaluation.object_collision_observed ? "YES" : "NO",
+                evaluation.environment_collision_observed ? "YES" : "NO"),
+            26, 267, 16,
+            evaluation.object_collision_observed ||
+                    evaluation.environment_collision_observed
+                ? MAROON
+                : DARKGREEN);
     }
     if (stale) {
         DrawText("SEARCH STALE - press Enter", 830, 22, 24, MAROON);
@@ -469,7 +479,9 @@ int main(int argc, char** argv) {
             if (!results.options.empty()) {
                 const reach::Evaluation& evaluation =
                     results.evaluations[selected_evaluation];
-                draw_path(evaluation, hand, LIME, 1U, true);
+                const Color selected_color =
+                    evaluation.rejection == reach::Rejection::None ? LIME : ORANGE;
+                draw_path(evaluation, hand, selected_color, 1U, true);
                 const float fps = static_cast<float>(pack.database.fps_numerator) /
                     static_cast<float>(pack.database.fps_denominator);
                 const size_t sample = static_cast<size_t>(
