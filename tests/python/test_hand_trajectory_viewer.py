@@ -4,6 +4,7 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SOURCE_PATH = ROOT / "hand_trajectory_viewer.cpp"
+TRAJECTORY_SOURCE_PATH = ROOT / "interaction_hand_trajectories.cpp"
 MAKEFILE = (ROOT / "Makefile").read_text(encoding="utf-8")
 
 
@@ -23,16 +24,23 @@ class HandTrajectoryViewerTests(unittest.TestCase):
         ):
             self.assertIn(key, source)
 
-    def test_rebuilds_exact_paths_and_collision_classes(self):
+    def test_rebuilds_world_grasp_shaped_valid_set_live(self):
         source = self.source()
         self.assertIn("select_hand_trajectories(", source)
-        self.assertIn("map_hand_trajectory(", source)
+        self.assertIn("shape_hand_trajectory(", source)
         self.assertIn("evaluate_trajectory_feasibility(", source)
+        self.assertIn("rebuild_valid_trajectories(", source)
+        object_change = source.split("if (object_changed)", 1)[1]
+        self.assertIn("rebuild_valid_trajectories(", object_change)
         self.assertIn("grasp_world_position", source)
         self.assertIn("grasp_world_rotation", source)
+        self.assertIn("ik_rejected", source)
         self.assertIn("object_rejected", source)
         self.assertIn("table_rejected", source)
-        self.assertIn("accepted", source)
+        self.assertIn("valid.empty()", source)
+
+        trajectory_source = TRAJECTORY_SOURCE_PATH.read_text(encoding="utf-8")
+        self.assertIn("hand_trajectory_scene_alignment(", trajectory_source)
 
     def test_builds_recorded_table_and_renders_rejections(self):
         source = self.source()
@@ -46,8 +54,8 @@ class HandTrajectoryViewerTests(unittest.TestCase):
         source = self.source()
         self.assertIn("selected_index", source)
         self.assertIn("animation_seconds", source)
-        self.assertIn("hand_trajectory_world_mapping(", source)
-        self.assertIn("pose_at_frame(", source)
+        self.assertNotIn("hand_trajectory_world_mapping(", source)
+        self.assertIn("shaped.poses", source)
         self.assertIn("world_pose(", source)
         self.assertIn("g1_skeleton::kParents", source)
         self.assertIn("DrawCylinderEx(", source)

@@ -17,16 +17,24 @@ namespace {
 
 using interaction::HandTrajectory;
 using interaction::HandTrajectoryQuery;
-using interaction::MappedHandTrajectory;
 using interaction::OrientedBox;
 using interaction::ShelfGeometry;
+using interaction::ShapedHandTrajectory;
 using interaction::TrajectoryFeasibilityReason;
 
 struct RenderedTrajectory {
-    MappedHandTrajectory mapped;
+    HandTrajectory source;
+    ShapedHandTrajectory shaped;
     TrajectoryFeasibilityReason reason = TrajectoryFeasibilityReason::None;
-    size_t contact_point = 0U;
-    float cost = 0.0F;
+};
+
+struct TrajectorySet {
+    std::vector<RenderedTrajectory> valid;
+    std::vector<RenderedTrajectory> rejected;
+    size_t compatible = 0U;
+    size_t ik_rejected = 0U;
+    size_t object_rejected = 0U;
+    size_t table_rejected = 0U;
 };
 
 Vector3 ray_vector(vec3 value) {
@@ -111,23 +119,44 @@ HandTrajectoryQuery make_query(
     return query;
 }
 
-std::vector<RenderedTrajectory> classify_trajectories(
-    const std::vector<HandTrajectory>& candidates,
+TrajectorySet rebuild_valid_trajectories(
+    const interaction::Database& database,
     const HandTrajectoryQuery& query,
     const ShelfGeometry& shelf) {
     const OrientedBox object{query.object_world, query.object_dimensions};
-    std::vector<RenderedTrajectory> rendered;
-    rendered.reserve(candidates.size());
+    const std::vector<HandTrajectory> candidates =
+        interaction::select_hand_trajectories(database, query);
+    TrajectorySet result{};
+    result.compatible = candidates.size();
+    result.valid.reserve(candidates.size());
+    result.rejected.reserve(candidates.size());
     for (const HandTrajectory& candidate : candidates) {
-        MappedHandTrajectory mapped = interaction::map_hand_trajectory(
-            candidate, query);
+        ShapedHandTrajectory shaped = interaction::shape_hand_trajectory(
+            database, candidate, query);
+        if (!shaped.contact_accepted) {
+            ++result.ik_rejected;
+            result.rejected.push_back({
+                candidate, std::move(shaped),
+                TrajectoryFeasibilityReason::None});
+            continue;
+        }
         const auto feasibility = interaction::evaluate_trajectory_feasibility(
-            mapped, candidate.contact_point, object, shelf);
-        rendered.push_back({
-            std::move(mapped), feasibility.reason,
-            candidate.contact_point, candidate.cost});
+            shaped.path, candidate.contact_point, object, shelf);
+        RenderedTrajectory rendered{
+            candidate, std::move(shaped), feasibility.reason};
+        if (feasibility.reason == TrajectoryFeasibilityReason::None) {
+            result.valid.push_back(std::move(rendered));
+        } else {
+            if (feasibility.reason ==
+                TrajectoryFeasibilityReason::ObjectCollision) {
+                ++result.object_rejected;
+            } else {
+                ++result.table_rejected;
+            }
+            result.rejected.push_back(std::move(rendered));
+        }
     }
-    return rendered;
+    return result;
 }
 
 void draw_oriented_box(const OrientedBox& box, Color color) {
@@ -157,11 +186,12 @@ void draw_path(
     const RenderedTrajectory& trajectory,
     Color color,
     bool emphasized = false) {
-    for (size_t sample = 1U; sample < trajectory.mapped.hands.size(); ++sample) {
+    const auto& hands = trajectory.shaped.path.hands;
+    for (size_t sample = 1U; sample < hands.size(); ++sample) {
         const Vector3 start = ray_vector(
-            trajectory.mapped.hands[sample - 1U].position);
+            hands[sample - 1U].position);
         const Vector3 stop = ray_vector(
-            trajectory.mapped.hands[sample].position);
+            hands[sample].position);
         if (emphasized) {
             DrawCylinderEx(start, stop, 0.009F, 0.009F, 6, color);
             DrawSphere(stop, 0.014F, color);
@@ -169,20 +199,11 @@ void draw_path(
             DrawLine3D(start, stop, color);
         }
     }
-    DrawSphere(
-        ray_vector(trajectory.mapped.hands[trajectory.contact_point].position),
-        0.018F, color);
-}
-
-const char* feasibility_name(TrajectoryFeasibilityReason reason) {
-    switch (reason) {
-        case TrajectoryFeasibilityReason::None: return "SAFE";
-        case TrajectoryFeasibilityReason::ObjectCollision:
-            return "OBJECT COLLISION";
-        case TrajectoryFeasibilityReason::ShelfCollision:
-            return "TABLE COLLISION";
+    if (!hands.empty()) {
+        DrawSphere(
+            ray_vector(hands[trajectory.source.contact_point].position),
+            0.018F, color);
     }
-    return "UNKNOWN";
 }
 
 const char* phase_name(uint8_t phase) {
@@ -194,43 +215,29 @@ const char* phase_name(uint8_t phase) {
     }
 }
 
-int32_t animated_frame(
-    const HandTrajectory& trajectory,
+size_t animated_sample(
+    const RenderedTrajectory& trajectory,
     float animation_seconds) {
-    const int32_t frame_count =
-        trajectory.lift_frame - trajectory.reach_frame + 1;
-    if (frame_count <= 0) {
-        throw std::invalid_argument("selected trajectory has invalid frame range");
+    if (trajectory.shaped.poses.empty()) {
+        throw std::invalid_argument("selected trajectory has no shaped poses");
     }
-    const int32_t offset = static_cast<int32_t>(
-        std::floor(animation_seconds * 25.0F)) % frame_count;
-    return trajectory.reach_frame + offset;
+    return static_cast<size_t>(std::floor(animation_seconds * 25.0F)) %
+        trajectory.shaped.poses.size();
 }
 
 void draw_selected_skeleton(
-    const interaction::Database& database,
-    const HandTrajectory& trajectory,
-    const HandTrajectoryQuery& query,
-    int32_t frame,
+    const interaction::Pose& shaped_pose,
     Color joint_color,
     Color bone_color) {
-    const interaction::WorldPose source = interaction::world_pose(
-        interaction::pose_at_frame(database, frame));
-    const interaction::Transform mapping =
-        interaction::hand_trajectory_world_mapping(trajectory, query);
-    std::array<vec3, g1_skeleton::BoneCount> positions{};
-    for (size_t bone = 0U; bone < positions.size(); ++bone) {
-        positions[bone] = interaction::compose(
-            mapping,
-            interaction::Transform{source.positions[bone], quat()}).position;
-    }
-    for (size_t bone = 0U; bone < positions.size(); ++bone) {
-        DrawSphereWires(ray_vector(positions[bone]), 0.024F, 4, 8, joint_color);
+    const interaction::WorldPose shaped = interaction::world_pose(shaped_pose);
+    for (size_t bone = 0U; bone < shaped.positions.size(); ++bone) {
+        DrawSphereWires(
+            ray_vector(shaped.positions[bone]), 0.024F, 4, 8, joint_color);
         const int32_t parent = g1_skeleton::kParents[bone];
         if (parent >= 0) {
             DrawCylinderEx(
-                ray_vector(positions[static_cast<size_t>(parent)]),
-                ray_vector(positions[bone]),
+                ray_vector(shaped.positions[static_cast<size_t>(parent)]),
+                ray_vector(shaped.positions[bone]),
                 0.014F, 0.014F, 6, bone_color);
         }
     }
@@ -280,13 +287,8 @@ int main(int argc, char** argv) {
         float animation_seconds = 0.0F;
         HandTrajectoryQuery query = make_query(
             object_world, canonical, position_only);
-        std::vector<HandTrajectory> candidates =
-            interaction::select_hand_trajectories(database, query);
-        if (candidates.empty()) {
-            throw std::runtime_error("no compatible kinematic options");
-        }
-        std::vector<RenderedTrajectory> rendered = classify_trajectories(
-            candidates, query, table_geometry);
+        TrajectorySet trajectories = rebuild_valid_trajectories(
+            database, query, table_geometry);
 
         SetConfigFlags(FLAG_VSYNC_HINT | FLAG_MSAA_4X_HINT);
         InitWindow(1280, 800, "Generic grasp kinematic trajectory lab");
@@ -307,7 +309,6 @@ int main(int argc, char** argv) {
             const float translation_step = 0.45F * dt;
             const float rotation_step = 0.9F * dt;
             bool object_changed = false;
-            bool selection_changed = false;
             if (IsKeyDown(KEY_LEFT)) {
                 object_world.position.x -= translation_step;
                 object_changed = true;
@@ -361,52 +362,48 @@ int main(int argc, char** argv) {
                 object_changed = true;
             }
             if (IsKeyPressed(KEY_LEFT_BRACKET)) {
-                selected_index = selected_index == 0U
-                    ? candidates.size() - 1U
-                    : selected_index - 1U;
-                animation_seconds = 0.0F;
+                if (!trajectories.valid.empty()) {
+                    selected_index = selected_index == 0U
+                        ? trajectories.valid.size() - 1U
+                        : selected_index - 1U;
+                    animation_seconds = 0.0F;
+                }
             }
             if (IsKeyPressed(KEY_RIGHT_BRACKET)) {
-                selected_index = (selected_index + 1U) % candidates.size();
-                animation_seconds = 0.0F;
+                if (!trajectories.valid.empty()) {
+                    selected_index =
+                        (selected_index + 1U) % trajectories.valid.size();
+                    animation_seconds = 0.0F;
+                }
             }
             if (IsKeyPressed(KEY_V)) show_rejected = !show_rejected;
             if (IsKeyPressed(KEY_P)) {
                 position_only = !position_only;
-                selection_changed = true;
                 object_changed = true;
             }
             if (object_changed) {
+                const int32_t previous_clip = trajectories.valid.empty()
+                    ? -1
+                    : trajectories.valid[selected_index].source.clip;
                 query = make_query(object_world, canonical, position_only);
-                if (selection_changed) {
-                    candidates = interaction::select_hand_trajectories(
-                        database, query);
-                    if (candidates.empty()) {
-                        throw std::runtime_error(
-                            "no compatible kinematic options");
+                trajectories = rebuild_valid_trajectories(
+                    database, query, table_geometry);
+                selected_index = 0U;
+                if (previous_clip >= 0) {
+                    const auto preserved = std::find_if(
+                        trajectories.valid.begin(),
+                        trajectories.valid.end(),
+                        [previous_clip](const RenderedTrajectory& candidate) {
+                            return candidate.source.clip == previous_clip;
+                        });
+                    if (preserved != trajectories.valid.end()) {
+                        selected_index = static_cast<size_t>(std::distance(
+                            trajectories.valid.begin(), preserved));
+                    } else {
+                        animation_seconds = 0.0F;
                     }
-                    selected_index %= candidates.size();
+                } else if (!trajectories.valid.empty()) {
                     animation_seconds = 0.0F;
-                }
-                rendered = classify_trajectories(
-                    candidates, query, table_geometry);
-            }
-
-            const HandTrajectory& selected = candidates[selected_index];
-            const int32_t selected_frame = animated_frame(
-                selected, animation_seconds);
-
-            size_t accepted = 0U;
-            size_t object_rejected = 0U;
-            size_t table_rejected = 0U;
-            for (const RenderedTrajectory& trajectory : rendered) {
-                if (trajectory.reason == TrajectoryFeasibilityReason::None) {
-                    ++accepted;
-                } else if (trajectory.reason ==
-                           TrajectoryFeasibilityReason::ObjectCollision) {
-                    ++object_rejected;
-                } else {
-                    ++table_rejected;
                 }
             }
 
@@ -424,59 +421,66 @@ int main(int argc, char** argv) {
                 {object_world, canonical.dimensions},
                 Color{255, 177, 35, 255});
             DrawSphere(ray_vector(query.grasp_world_position), 0.028F, GOLD);
-            for (size_t index = 0U; index < rendered.size(); ++index) {
-                if (index == selected_index) continue;
-                const RenderedTrajectory& trajectory = rendered[index];
-                if (trajectory.reason != TrajectoryFeasibilityReason::None) {
-                    if (show_rejected) {
-                        draw_path(trajectory, Color{210, 45, 55, 75});
-                    }
-                    continue;
+            if (show_rejected) {
+                for (const RenderedTrajectory& rejected :
+                     trajectories.rejected) {
+                    draw_path(rejected, Color{210, 45, 55, 75});
                 }
-                const float fraction = accepted <= 1U
+            }
+            for (size_t index = 0U; index < trajectories.valid.size(); ++index) {
+                if (index == selected_index) continue;
+                const float fraction = trajectories.valid.size() <= 1U
                     ? 0.0F
                     : static_cast<float>(index) /
-                      static_cast<float>(rendered.size() - 1U);
+                      static_cast<float>(trajectories.valid.size() - 1U);
                 draw_path(
-                    trajectory,
+                    trajectories.valid[index],
                     ColorFromHSV(125.0F + 95.0F * fraction, 0.78F, 0.86F));
             }
-            const TrajectoryFeasibilityReason selected_reason =
-                rendered[selected_index].reason;
-            const bool selected_safe =
-                selected_reason == TrajectoryFeasibilityReason::None;
-            const Color selected_color = selected_safe ? LIME : RED;
-            draw_path(rendered[selected_index], selected_color, true);
-            draw_selected_skeleton(
-                database,
-                selected,
-                query,
-                selected_frame,
-                selected_safe ? DARKBLUE : MAROON,
-                selected_safe ? SKYBLUE : RED);
+            if (!trajectories.valid.empty()) {
+                const RenderedTrajectory& selected =
+                    trajectories.valid[selected_index];
+                const size_t sample = animated_sample(
+                    selected, animation_seconds);
+                draw_path(selected, LIME, true);
+                draw_selected_skeleton(
+                    selected.shaped.poses[sample], DARKBLUE, SKYBLUE);
+            }
             EndMode3D();
 
             DrawRectangle(14, 14, 665, 168, Color{255, 255, 255, 225});
             DrawText("Generic grasp trajectory field", 26, 24, 24, DARKGRAY);
             DrawText(
                 TextFormat(
-                    "compatible %i | accepted %i | object-rejected %i | table-rejected %i",
-                    static_cast<int>(candidates.size()),
-                    static_cast<int>(accepted),
-                    static_cast<int>(object_rejected),
-                    static_cast<int>(table_rejected)),
+                    "compatible %i | valid %i | IK-rejected %i | object %i | table %i",
+                    static_cast<int>(trajectories.compatible),
+                    static_cast<int>(trajectories.valid.size()),
+                    static_cast<int>(trajectories.ik_rejected),
+                    static_cast<int>(trajectories.object_rejected),
+                    static_cast<int>(trajectories.table_rejected)),
                 26, 56, 18, DARKGRAY);
-            DrawText(
-                TextFormat(
-                    "option %i/%i | clip %i | %s | %s frame %i",
-                    static_cast<int>(selected_index + 1U),
-                    static_cast<int>(candidates.size()),
-                    selected.clip,
-                    feasibility_name(selected_reason),
-                    phase_name(database.phases.at(
-                        static_cast<size_t>(selected_frame))),
-                    selected_frame),
-                26, 82, 16, DARKGRAY);
+            if (trajectories.valid.empty()) {
+                DrawText(
+                    "0 valid motions for this world grasp",
+                    26, 82, 16, MAROON);
+            } else {
+                const RenderedTrajectory& selected =
+                    trajectories.valid[selected_index];
+                const size_t sample = animated_sample(
+                    selected, animation_seconds);
+                const int32_t frame = selected.source.reach_frame +
+                    static_cast<int32_t>(sample);
+                DrawText(
+                    TextFormat(
+                        "option %i/%i | clip %i | SAFE | %s frame %i",
+                        static_cast<int>(selected_index + 1U),
+                        static_cast<int>(trajectories.valid.size()),
+                        selected.source.clip,
+                        phase_name(database.phases.at(
+                            static_cast<size_t>(frame))),
+                        frame),
+                    26, 82, 16, DARKGRAY);
+            }
             DrawText(
                 "Arrows: X/Z  W/S: height  Q/E: yaw  R/F: pitch  Z/C: roll",
                 26, 108, 16, DARKGRAY);
