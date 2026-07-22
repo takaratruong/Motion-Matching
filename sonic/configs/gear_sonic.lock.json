@@ -1,7 +1,7 @@
 {
   "schema": "gear-sonic-lock/v1",
   "repository": "https://github.com/NVlabs/GR00T-WholeBodyControl.git",
-  "commit": "4336cb0206362370b55240003afd4ffd2e08d94c",
+  "commit": "30826700c2d35d30722333f31a49b874c048f6d2",
   "known_good_reference": "gear_sonic_deploy/reference/example/walking_quip_360_R_002__A428",
   "joint_names_source": "gear_sonic/envs/manager_env/robots/g1.py",
   "policy_parameters_source": "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/policy_parameters.hpp",
