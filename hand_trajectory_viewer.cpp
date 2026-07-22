@@ -483,6 +483,7 @@ int main(int argc, char** argv) {
         bool show_rejected = true;
         bool search_stale = false;
         bool audit_stale = false;
+        bool audit_paths_displayed = false;
         std::optional<interaction::ReuseAuditResult> audit;
         size_t selected_index = 0U;
         float animation_seconds = 0.0F;
@@ -611,6 +612,7 @@ int main(int argc, char** argv) {
                     database, trajectories, selected_index, searched_query);
                 animation_seconds = 0.0F;
                 search_stale = false;
+                audit_paths_displayed = false;
             }
             if (IsKeyPressed(KEY_A)) {
                 HandTrajectoryQuery audit_query = query;
@@ -641,6 +643,7 @@ int main(int argc, char** argv) {
                         searched_query);
                     animation_seconds = 0.0F;
                     search_stale = false;
+                    audit_paths_displayed = true;
                 }
                 audit = std::move(next_audit);
                 audit_stale = false;
@@ -693,21 +696,32 @@ int main(int argc, char** argv) {
 
             DrawRectangle(14, 14, 790, 282, Color{255, 255, 255, 225});
             DrawText("Generic grasp trajectory field", 26, 24, 24, DARKGRAY);
-            DrawText(
-                TextFormat(
-                    "exact compatible %i valid %i | fallback compatible %i valid %i",
-                    static_cast<int>(trajectories.exact_compatible),
-                    static_cast<int>(trajectories.exact_valid),
-                    static_cast<int>(trajectories.fallback_compatible),
-                    static_cast<int>(trajectories.fallback_valid)),
-                26, 56, 18, DARKGRAY);
-            DrawText(
-                TextFormat(
-                    "IK %i | object %i | environment %i",
-                    static_cast<int>(trajectories.ik_rejected),
-                    static_cast<int>(trajectories.object_rejected),
-                    static_cast<int>(trajectories.environment_rejected)),
-                26, 82, 18, DARKGRAY);
+            if (audit_paths_displayed) {
+                DrawText(
+                    TextFormat(
+                        "exhaustive reuse display %i paths | full corpus counts below",
+                        static_cast<int>(trajectories.valid.size())),
+                    26, 56, 18, DARKGRAY);
+                DrawText(
+                    "A reruns exhaustive audit | Enter restores fast search",
+                    26, 82, 18, DARKGRAY);
+            } else {
+                DrawText(
+                    TextFormat(
+                        "exact compatible %i valid %i | fallback compatible %i valid %i",
+                        static_cast<int>(trajectories.exact_compatible),
+                        static_cast<int>(trajectories.exact_valid),
+                        static_cast<int>(trajectories.fallback_compatible),
+                        static_cast<int>(trajectories.fallback_valid)),
+                    26, 56, 18, DARKGRAY);
+                DrawText(
+                    TextFormat(
+                        "IK %i | object %i | environment %i",
+                        static_cast<int>(trajectories.ik_rejected),
+                        static_cast<int>(trajectories.object_rejected),
+                        static_cast<int>(trajectories.environment_rejected)),
+                    26, 82, 18, DARKGRAY);
+            }
             if (search_stale) {
                 DrawText(
                     "SEARCH STALE - press Enter",
@@ -752,9 +766,13 @@ int main(int argc, char** argv) {
                 26, 160, 16, DARKGRAY);
             if (audit.has_value()) {
                 const char* audit_status =
-                    audit->status == interaction::ReuseAuditStatus::Incomplete
+                    audit->status == interaction::ReuseAuditStatus::Incomplete &&
+                            audit_stale
+                    ? "AUDIT INCOMPLETE / STALE"
+                    : (audit->status ==
+                               interaction::ReuseAuditStatus::Incomplete
                     ? "AUDIT INCOMPLETE"
-                    : (audit_stale ? "AUDIT STALE" : "AUDIT COMPLETE");
+                    : (audit_stale ? "AUDIT STALE" : "AUDIT COMPLETE"));
                 DrawText(
                     TextFormat(
                         "%s | processed %i/%i | %llu ms",

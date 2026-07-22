@@ -5,6 +5,8 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SOURCE_PATH = ROOT / "hand_trajectory_viewer.cpp"
 TRAJECTORY_SOURCE_PATH = ROOT / "interaction_hand_trajectories.cpp"
+AUDIT_SOURCE_PATH = ROOT / "interaction_reuse_audit.cpp"
+AUDIT_PROBE_SOURCE_PATH = ROOT / "interaction_reuse_audit_probe.cpp"
 MAKEFILE = (ROOT / "Makefile").read_text(encoding="utf-8")
 
 
@@ -209,6 +211,26 @@ class HandTrajectoryViewerTests(unittest.TestCase):
         self.assertIn("interaction_reuse_audit.cpp", MAKEFILE)
         self.assertIn("interaction_reuse_audit.h", MAKEFILE)
         self.assertIn("interaction_reuse_audit_probe:", MAKEFILE)
+
+    def test_audit_deadline_and_hud_contract_are_truthful(self):
+        viewer = self.source()
+        audit_source = AUDIT_SOURCE_PATH.read_text(encoding="utf-8")
+        probe_source = AUDIT_PROBE_SOURCE_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("AUDIT INCOMPLETE / STALE", viewer)
+        self.assertIn("claim_mutex", audit_source)
+        self.assertNotIn("std::atomic<size_t> next", audit_source)
+        self.assertIn(
+            "result.elapsed_milliseconds = elapsed_milliseconds(start)",
+            audit_source,
+        )
+        self.assertGreater(
+            audit_source.rindex(
+                "result.elapsed_milliseconds = elapsed_milliseconds(start)"
+            ),
+            audit_source.index("std::stable_sort("),
+        )
+        self.assertIn("result.elapsed_milliseconds <= 30000U", probe_source)
 
 
 if __name__ == "__main__":

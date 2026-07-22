@@ -8,6 +8,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include <tuple>
@@ -168,20 +169,30 @@ ReuseAuditResult audit_reusable_hand_trajectories(
         result.counts.total - candidates.size();
 
     std::vector<Outcome> outcomes(candidates.size());
-    std::atomic<size_t> next{0U};
+    size_t next = 0U;
     std::atomic<bool> stop{false};
-    std::exception_ptr worker_error;
-    std::mutex error_mutex;
+    std::mutex claim_mutex;
+    std::vector<std::exception_ptr> worker_errors(candidates.size());
     IKConfig ik{};
     ik.maximum_request_position_m = config.maximum_contact_correction_m;
 
+    const auto claim = [&]() -> std::optional<size_t> {
+        std::lock_guard<std::mutex> lock(claim_mutex);
+        if (stop.load(std::memory_order_relaxed) ||
+            Clock::now() >= deadline || next >= candidates.size()) {
+            return std::nullopt;
+        }
+        return next++;
+    };
+
     const auto work = [&]() {
+        size_t active_index = std::numeric_limits<size_t>::max();
         try {
-            while (!stop.load(std::memory_order_relaxed)) {
-                if (Clock::now() >= deadline) return;
-                const size_t index = next.fetch_add(
-                    1U, std::memory_order_relaxed);
-                if (index >= candidates.size()) return;
+            while (true) {
+                const std::optional<size_t> claimed = claim();
+                if (!claimed.has_value()) return;
+                const size_t index = *claimed;
+                active_index = index;
                 const HandTrajectory& candidate = candidates[index];
                 const ShapedHandContact contact =
                     shape_hand_trajectory_contact(
@@ -219,11 +230,11 @@ ReuseAuditResult audit_reusable_hand_trajectories(
                 outcomes[index].kind = OutcomeKind::Reusable;
                 outcomes[index].motion = std::make_unique<ReuseAuditMotion>(
                     ReuseAuditMotion{candidate, std::move(shaped)});
+                active_index = std::numeric_limits<size_t>::max();
             }
         } catch (...) {
-            {
-                std::lock_guard<std::mutex> lock(error_mutex);
-                if (!worker_error) worker_error = std::current_exception();
+            if (active_index < worker_errors.size()) {
+                worker_errors[active_index] = std::current_exception();
             }
             stop.store(true, std::memory_order_relaxed);
         }
@@ -231,11 +242,20 @@ ReuseAuditResult audit_reusable_hand_trajectories(
 
     std::vector<std::thread> workers;
     workers.reserve(config.worker_count);
-    for (size_t worker = 0U; worker < config.worker_count; ++worker) {
-        workers.emplace_back(work);
+    std::exception_ptr thread_creation_error;
+    try {
+        for (size_t worker = 0U; worker < config.worker_count; ++worker) {
+            workers.emplace_back(work);
+        }
+    } catch (...) {
+        thread_creation_error = std::current_exception();
+        stop.store(true, std::memory_order_relaxed);
     }
     for (std::thread& worker : workers) worker.join();
-    if (worker_error) std::rethrow_exception(worker_error);
+    if (thread_creation_error) std::rethrow_exception(thread_creation_error);
+    for (const std::exception_ptr& error : worker_errors) {
+        if (error) std::rethrow_exception(error);
+    }
 
     result.counts.processed = outside_envelope;
     for (const Outcome& outcome : outcomes) {
@@ -252,9 +272,9 @@ ReuseAuditResult audit_reusable_hand_trajectories(
             ++result.counts.reusable;
         }
     }
-    result.elapsed_milliseconds = elapsed_milliseconds(start);
     if (result.counts.processed != result.counts.total) {
         result.status = ReuseAuditStatus::Incomplete;
+        result.elapsed_milliseconds = elapsed_milliseconds(start);
         return result;
     }
 
@@ -280,6 +300,7 @@ ReuseAuditResult audit_reusable_hand_trajectories(
     if (result.displayed.size() > config.display_limit) {
         result.displayed.resize(config.display_limit);
     }
+    result.elapsed_milliseconds = elapsed_milliseconds(start);
     return result;
 }
 

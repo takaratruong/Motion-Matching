@@ -187,7 +187,8 @@ int main(int argc, char** argv) {
                 viewer_collision_config(),
                 config);
         print_result(scenario, result);
-        return result.status == interaction::ReuseAuditStatus::Complete
+        return result.status == interaction::ReuseAuditStatus::Complete &&
+                result.elapsed_milliseconds <= 30000U
             ? 0
             : 3;
     } catch (const std::exception& error) {
