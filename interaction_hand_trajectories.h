@@ -25,6 +25,11 @@ struct HandTrajectoryConfig {
     size_t maximum_compatible_clips = 4096U;
 };
 
+enum class SupportKind : uint8_t {
+    Table = 0U,
+    Ground = 1U,
+};
+
 struct HandTrajectory {
     int32_t clip = -1;
     int32_t start_frame = -1;
@@ -34,6 +39,7 @@ struct HandTrajectory {
     size_t reach_point = 0U;
     size_t contact_point = 0U;
     float cost = 0.0F;
+    SupportKind support = SupportKind::Table;
     Transform source_object{};
     std::vector<Transform> hands_in_source_object;
     std::vector<vec3> elbows_in_source_object;
@@ -83,6 +89,8 @@ ShelfGeometry make_recorded_table_geometry(
     const Transform& table_world,
     vec3 table_dimensions,
     float leg_thickness_m = 0.04F);
+
+SupportKind support_kind(const Database& database, size_t clip);
 
 std::vector<HandTrajectory> select_hand_trajectories(
     const Database& database,

@@ -54,6 +54,10 @@ struct ClipSpec {
     vec3 dimensions{1.0F, 1.0F, 1.0F};
     bool complete_phases = true;
     quat object_rotation{};
+    vec3 support_position{0.0F, 0.40F, 0.0F};
+    quat support_rotation{};
+    vec3 support_size{1.20F, 0.08F, 0.80F};
+    int32_t approach_samples = 3;
 };
 
 void write_vec3(std::vector<float>& values, size_t index, vec3 value) {
@@ -72,8 +76,13 @@ void write_quat(std::vector<float>& values, size_t index, quat value) {
 }
 
 interaction::Database make_database(const std::vector<ClipSpec>& specs) {
-    constexpr int32_t frames_per_clip = 8;
-    const size_t frames = specs.size() * frames_per_clip;
+    size_t frames = 0U;
+    for (const ClipSpec& spec : specs) {
+        if (spec.approach_samples < 3) {
+            throw std::invalid_argument("approach sample count is too small");
+        }
+        frames += static_cast<size_t>(spec.approach_samples + 5);
+    }
     interaction::Database database{};
     database.frame_count = static_cast<uint32_t>(frames);
     database.bone_count = g1_skeleton::BoneCount;
@@ -117,23 +126,21 @@ interaction::Database make_database(const std::vector<ClipSpec>& specs) {
         write_quat(database.object_rotations, frame, quat());
         database.source_frames[frame] = static_cast<int32_t>(frame);
     }
+    int32_t start = 0;
     for (size_t clip = 0; clip < specs.size(); ++clip) {
         const ClipSpec& spec = specs[clip];
-        const int32_t start = static_cast<int32_t>(clip) * frames_per_clip;
+        const int32_t frames_per_clip = spec.approach_samples + 5;
         database.range_starts[clip] = start;
         database.range_stops[clip] = start + frames_per_clip;
         database.active_hands[clip] = static_cast<uint8_t>(spec.hand);
+        write_vec3(database.table_positions, clip, spec.support_position);
+        write_quat(database.table_rotations, clip, spec.support_rotation);
+        write_vec3(database.table_sizes, clip, spec.support_size);
         write_vec3(database.object_dimensions, clip, spec.dimensions);
         write_vec3(database.grasp_positions_object, clip, spec.grasp_position);
         write_quat(database.grasp_rotations_object, clip, spec.grasp_rotation);
         write_vec3(
             database.approach_directions_object, clip, vec3(1.0F, 0.0F, 0.0F));
-        const std::array<uint8_t, frames_per_clip> phases =
-            spec.complete_phases
-                ? std::array<uint8_t, frames_per_clip>{
-                      0U, 1U, 1U, 2U, 3U, 3U, 3U, 4U}
-                : std::array<uint8_t, frames_per_clip>{
-                      0U, 1U, 1U, 1U, 1U, 1U, 1U, 4U};
         const size_t wrist = spec.hand == interaction::Hand::Right
             ? static_cast<size_t>(g1_skeleton::RightWrist)
             : static_cast<size_t>(g1_skeleton::LeftWrist);
@@ -142,11 +149,29 @@ interaction::Database make_database(const std::vector<ClipSpec>& specs) {
             : static_cast<size_t>(g1_skeleton::LeftElbow);
         for (int32_t local = 0; local < frames_per_clip; ++local) {
             const size_t frame = static_cast<size_t>(start + local);
-            database.phases[frame] = phases[static_cast<size_t>(local)];
+            if (local == 0) {
+                database.phases[frame] = 0U;
+            } else if (local < spec.approach_samples ||
+                       (!spec.complete_phases &&
+                        local < frames_per_clip - 1)) {
+                database.phases[frame] = 1U;
+            } else if (local == spec.approach_samples) {
+                database.phases[frame] = 2U;
+            } else if (local <= spec.approach_samples + 3) {
+                database.phases[frame] = 3U;
+            } else {
+                database.phases[frame] = 4U;
+            }
             write_quat(database.object_rotations, frame, spec.object_rotation);
             vec3 hand = spec.grasp_position;
-            if (local < 3) hand.x -= 0.10F * static_cast<float>(3 - local);
-            if (local > 3) hand.y += 0.08F * static_cast<float>(local - 3);
+            if (local < spec.approach_samples) {
+                hand.x -= 0.10F * static_cast<float>(
+                    spec.approach_samples - local);
+            }
+            if (local > spec.approach_samples) {
+                hand.y += 0.08F * static_cast<float>(
+                    local - spec.approach_samples);
+            }
             write_vec3(
                 database.positions,
                 frame * g1_skeleton::BoneCount + wrist,
@@ -160,6 +185,7 @@ interaction::Database make_database(const std::vector<ClipSpec>& specs) {
                 frame * g1_skeleton::BoneCount + wrist,
                 spec.grasp_rotation);
         }
+        start += frames_per_clip;
     }
     return database;
 }
@@ -400,6 +426,66 @@ void test_selects_every_close_complete_same_hand_clip_in_stable_order() {
         rejected = true;
     }
     require(rejected, "selector silently truncated compatible clips");
+}
+
+void test_support_kind_is_diagnostic_for_mixed_height_selection() {
+    ClipSpec table{};
+    table.grasp_position = vec3(0.10F, 0.20F, 0.30F);
+
+    ClipSpec ground = table;
+    ground.support_position = vec3(0.0F, -0.02F, 0.0F);
+    ground.support_rotation = quat();
+    ground.support_size = vec3(20.0F, 0.04F, 20.0F);
+
+    ClipSpec distant = table;
+    distant.grasp_position.y += 0.121F;
+
+    const interaction::Database database = make_database({
+        table, ground, distant,
+    });
+    require(interaction::support_kind(database, 0U) ==
+                interaction::SupportKind::Table,
+            "table clip mislabeled");
+    require(interaction::support_kind(database, 1U) ==
+                interaction::SupportKind::Ground,
+            "exact virtual floor was not labeled ground");
+
+    const auto selected = interaction::select_hand_trajectories(
+        database, identity_query(), interaction::HandTrajectoryConfig{});
+    require(selected.size() == 2U,
+            "mixed support clips did not coexist at overlapping height");
+    require(selected[0].clip == 0 && selected[1].clip == 1 &&
+                selected[0].cost == selected[1].cost,
+            "mixed support clips were not sorted solely by cost and clip");
+    require(selected[0].support == interaction::SupportKind::Table &&
+                selected[1].support == interaction::SupportKind::Ground,
+            "trajectory support diagnostic was not retained");
+    require(std::none_of(selected.begin(), selected.end(),
+                         [](const interaction::HandTrajectory& trajectory) {
+                             return trajectory.clip == 2;
+                         }),
+            "grasp-position envelope admitted a clip beyond 0.12 m");
+}
+
+void test_ground_trajectory_spans_full_approach_through_contiguous_lift() {
+    ClipSpec ground{};
+    ground.grasp_position = vec3(0.10F, 0.20F, 0.30F);
+    ground.support_position = vec3(0.0F, -0.02F, 0.0F);
+    ground.support_rotation = quat();
+    ground.support_size = vec3(20.0F, 0.04F, 20.0F);
+    ground.approach_samples = 12;
+
+    const interaction::Database database = make_database({ground});
+    const auto selected = interaction::select_hand_trajectories(
+        database, identity_query(), interaction::HandTrajectoryConfig{});
+    require(selected.size() == 1U,
+            "ground approach trajectory was not selected");
+    const interaction::HandTrajectory& trajectory = selected.front();
+    require(trajectory.start_frame == 0 && trajectory.reach_frame == 1 &&
+                trajectory.reach_point == 1U && trajectory.contact_frame == 12 &&
+                trajectory.contact_point == 12U && trajectory.lift_frame == 15 &&
+                trajectory.hands_in_source_object.size() == 16U,
+            "ground trajectory did not span clip start through final Lift");
 }
 
 void test_raw_mapping_uses_upright_scene_alignment_without_grasp_residual() {
@@ -711,6 +797,8 @@ int main() {
     test_object_roll_researches_recorded_world_grasp_orientation();
     test_world_grasp_limits_and_position_only_orientation();
     test_selects_every_close_complete_same_hand_clip_in_stable_order();
+    test_support_kind_is_diagnostic_for_mixed_height_selection();
+    test_ground_trajectory_spans_full_approach_through_contiguous_lift();
     test_raw_mapping_uses_upright_scene_alignment_without_grasp_residual();
     test_position_only_mapping_preserves_object_mapped_contact_rotation();
     test_shape_converges_contact_without_moving_root_or_legs();

@@ -55,6 +55,12 @@ class HandTrajectoryViewerTests(unittest.TestCase):
 
         trajectory_source = TRAJECTORY_SOURCE_PATH.read_text(encoding="utf-8")
         self.assertIn("hand_trajectory_scene_alignment(", trajectory_source)
+        self.assertLess(
+            trajectory_source.index("if (position_error >"),
+            trajectory_source.index(
+                "for (int32_t frame = trajectory.start_frame;"
+            ),
+        )
 
     def test_builds_recorded_table_and_renders_rejections(self):
         source = self.source()
