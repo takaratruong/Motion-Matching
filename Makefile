@@ -163,6 +163,7 @@ PLACEMENT_FEATURES_OUTPUT ?= $(PLACEMENT_EVIDENCE_DIR)/locomotion-features.bin
 CPP_TEST_BINS := $(CPP_TEST_DIR)/test_g1_skeleton
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_native_g1_bridge
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_database
+CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_trajectory_database
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_pose
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_target
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_pick_slots
@@ -351,6 +352,9 @@ $(CPP_TEST_DIR)/test_g1_skeleton: tests/cpp/test_g1_skeleton.cpp g1_skeleton.h |
 	$(CXX) $(CPP_TEST_FLAGS) $< -o $@
 
 $(CPP_TEST_DIR)/test_interaction_database: tests/cpp/test_interaction_database.cpp interaction_database.h g1_skeleton.h | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) $< -o $@
+
+$(CPP_TEST_DIR)/test_interaction_trajectory_database: tests/cpp/test_interaction_trajectory_database.cpp interaction_trajectory_database.h interaction_database.h g1_skeleton.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) $< -o $@
 
 $(CPP_TEST_DIR)/test_interaction_pose: tests/cpp/test_interaction_pose.cpp interaction_pose.cpp interaction_pose.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
