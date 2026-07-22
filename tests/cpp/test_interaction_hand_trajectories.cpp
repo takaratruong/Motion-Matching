@@ -318,6 +318,34 @@ void test_forearm_capsule_and_contact_still_collide_with_shelf() {
             "shelf collision was incorrectly exempted at Contact");
 }
 
+void test_recorded_table_geometry_preserves_top_and_builds_four_legs() {
+    const interaction::Transform table{
+        vec3(1.0F, 0.40F, -2.0F), quat()};
+    const vec3 dimensions(1.20F, 0.08F, 0.70F);
+    const interaction::ShelfGeometry geometry =
+        interaction::make_recorded_table_geometry(table, dimensions);
+    require(near(geometry.boxes[0].world.position, table.position),
+            "tabletop position changed");
+    require(near(geometry.boxes[0].dimensions, dimensions),
+            "tabletop dimensions changed");
+    for (size_t leg = 1U; leg < geometry.boxes.size(); ++leg) {
+        require(geometry.boxes[leg].dimensions.x == 0.04F &&
+                geometry.boxes[leg].dimensions.z == 0.04F &&
+                geometry.boxes[leg].dimensions.y > 0.0F &&
+                geometry.boxes[leg].world.position.y < table.position.y,
+                "table leg is not slender and below tabletop");
+    }
+
+    bool rejected = false;
+    try {
+        (void)interaction::make_recorded_table_geometry(
+            {vec3(0.0F, 0.03F, 0.0F), quat()}, dimensions);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    require(rejected, "below-ground recorded table was accepted");
+}
+
 }  // namespace
 
 int main() {
@@ -326,5 +354,6 @@ int main() {
     test_position_only_mapping_preserves_object_mapped_contact_rotation();
     test_collision_feasibility_is_phase_aware();
     test_forearm_capsule_and_contact_still_collide_with_shelf();
+    test_recorded_table_geometry_preserves_top_and_builds_four_legs();
     return 0;
 }

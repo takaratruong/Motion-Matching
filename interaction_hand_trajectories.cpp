@@ -364,6 +364,44 @@ MappedHandTrajectory map_hand_trajectory(
     return mapped;
 }
 
+ShelfGeometry make_recorded_table_geometry(
+    const Transform& table_world,
+    vec3 table_dimensions,
+    float leg_thickness_m) {
+    const OrientedBox tabletop{
+        {table_world.position, quat_normalize(table_world.rotation)},
+        table_dimensions};
+    const float underside_height =
+        table_world.position.y - 0.5F * table_dimensions.y;
+    if (!valid_box(tabletop) ||
+        !finite(leg_thickness_m) || leg_thickness_m <= 0.0F ||
+        table_dimensions.x <= 2.0F * leg_thickness_m ||
+        table_dimensions.z <= 2.0F * leg_thickness_m ||
+        !finite(underside_height) || underside_height <= 0.0F) {
+        throw std::invalid_argument("invalid recorded table geometry");
+    }
+
+    ShelfGeometry geometry{};
+    geometry.boxes[0] = tabletop;
+    const float x_offset = 0.5F * table_dimensions.x - leg_thickness_m;
+    const float z_offset = 0.5F * table_dimensions.z - leg_thickness_m;
+    const float local_y =
+        -0.5F * table_dimensions.y - 0.5F * underside_height;
+    const std::array<vec3, 4> leg_positions{{
+        vec3(-x_offset, local_y, -z_offset),
+        vec3(x_offset, local_y, -z_offset),
+        vec3(-x_offset, local_y, z_offset),
+        vec3(x_offset, local_y, z_offset),
+    }};
+    for (size_t leg = 0U; leg < leg_positions.size(); ++leg) {
+        geometry.boxes[leg + 1U] = {
+            compose(tabletop.world, Transform{leg_positions[leg], quat()}),
+            vec3(leg_thickness_m, underside_height, leg_thickness_m),
+        };
+    }
+    return geometry;
+}
+
 TrajectoryFeasibility evaluate_trajectory_feasibility(
     const MappedHandTrajectory& trajectory,
     size_t contact_point,

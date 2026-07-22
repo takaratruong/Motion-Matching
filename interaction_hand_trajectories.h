@@ -67,6 +67,11 @@ struct TrajectoryCollisionConfig {
     float forearm_radius_m = 0.035F;
 };
 
+ShelfGeometry make_recorded_table_geometry(
+    const Transform& table_world,
+    vec3 table_dimensions,
+    float leg_thickness_m = 0.04F);
+
 std::vector<HandTrajectory> select_hand_trajectories(
     const Database& database,
     const HandTrajectoryQuery& query,
