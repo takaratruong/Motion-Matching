@@ -4,7 +4,7 @@
 
 **Goal:** Run a paired, identity-pinned experiment that distinguishes root plumbing from learned root conditioning and determines whether the root-conditioned SONIC encoder can traverse the low curb three consecutive times without regressing flat locomotion.
 
-**Architecture:** The evaluator runs three isolated variants: A0 is released SONIC over protocol v1, A1 is the identical released model over root-capable protocol v5, and B is the Stage-A root-conditioned encoder over v5. One deterministic straight-forward command artifact, initial state, terrain scene, runtime binary, and physics schedule are shared across variants and trials; only the registered protocol/model/config identity changes. A1 is the causal negative control, while B must pass flat probes before its 3-of-3 low-curb gate; the default curb remains a separate stress result.
+**Architecture:** The evaluator runs three isolated variants: A0 is released SONIC over protocol v1, A1 is the identical released model over root-capable protocol v5, and B is the Stage-A root-conditioned encoder over v5. One deterministic straight-forward command artifact, resampled reference buffer, initial state, terrain scene, runtime binary, and physics schedule are shared across variants and trials; only the registered protocol/model/config identity changes. A1 is the causal negative control, while B must pass flat probes before its 3-of-3 low-curb gate; the default curb remains a separate stress result.
 
 **Tech Stack:** Motion Matching Python orchestration, GEAR C++ deployment, MuJoCo simulation, ZMQ v1/v5, NumPy metrics, canonical JSON evidence, unittest.
 
@@ -21,9 +21,9 @@
 - A terrain pass requires exact command/frame/log coverage, target distance at most `0.25 m`, reached time at most `1.25 * nominal`, minimum local pelvis height at least `0.45 m`, minimum pelvis up-dot at least `0.5`, and no pelvis/knee/torso/hand terrain contact.
 - Flat regression runs before terrain and must satisfy the existing `evaluate_flat_trial` gates against the released known-good thresholds.
 - `grail-curb-default` is diagnostic stress evidence and cannot invalidate or rescue the low-curb primary result.
-- Latency is reported as generation, publication-to-consumption, inference, and physics-release distributions; it is diagnostic only because this experiment pauses physics during generation.
+- Timing is diagnostic because physics pauses during generation, but it is complete: report Motion Matching generation, publication-to-consumption, input arrival age, controller inference, and paused-physics duration with count/p50/p95/p99/max, plus missed-frame and held-frame counts.
 - If B fails any flat gate, or fewer than 3 low-curb trials pass, emit `stage_b_required: true`; do not start Stage B automatically.
-- Every result includes exact repository, binary, model, config, scene, command, and evidence hashes. A run with a changed identity is invalid rather than comparable.
+- Every result includes exact repository, binary, model, config, scene, command, resampled-reference-buffer, and evidence hashes. A run with a changed identity is invalid rather than comparable.
 
 ---
 
@@ -255,6 +255,7 @@ def test_runner_reuses_command_initial_state_and_physics_schedule_across_variant
     evidence = run_fake_matrix(root)
     identities = [trial["paired_identity"] for trial in evidence["trials"]]
     assert len({item["command_sha256"] for item in identities}) == 1
+    assert len({item["reference_buffer_sha256"] for item in identities}) == 1
     assert len({item["initial_qpos_sha256"] for item in identities}) == 1
     assert len({item["physics_schedule_sha256"] for item in identities}) == 1
 
@@ -267,11 +268,11 @@ def test_runner_rejects_a1_if_released_model_or_config_differs_from_a0(self):
 
 - [ ] **Step 2: Implement one isolated trial**
 
-The runner resolves every path without following a changed file after hashing, creates a run-local scene, launches a fresh GEAR and MuJoCo process, streams the exact straight-curb script through the selected protocol, and closes all resources after the trial. It archives target rows, control rows, root reference rows, actual pelvis rows, contacts, timing events, stdout/stderr, command bytes, initial qpos, physics schedule, model/config files or immutable hashes, and packed publications.
+The runner resolves every path without following a changed file after hashing, creates a run-local scene, launches a fresh GEAR and MuJoCo process, streams the exact straight-curb script through the selected protocol, and closes all resources after the trial. It archives target rows, control rows, root reference rows, actual pelvis rows, contacts, timing events, stdout/stderr, command bytes, the exact resampled reference buffer and its SHA-256, initial qpos, physics schedule, model/config files or immutable hashes, and packed publications.
 
 - [ ] **Step 3: Implement scoring and canonical evidence**
 
-Use existing `evaluate_flat_trial` and `evaluate_terrain_trial`. Pair GEAR target-root rows and MuJoCo pelvis rows by scored control tick before calling `root_response_metrics`. Evidence rejects duplicate JSON keys, non-finite values, symlinks, changed files, partial row coverage, mixed process identities, or a protocol/header mismatch. Timing summaries use count/min/median/p95/max and are explicitly under `diagnostic_timing`.
+Use existing `evaluate_flat_trial` and `evaluate_terrain_trial`. Pair GEAR target-root rows and MuJoCo pelvis rows by scored control tick before calling `root_response_metrics`. Evidence rejects duplicate JSON keys, non-finite values, symlinks, changed files, partial row coverage, mixed process identities, a protocol/header mismatch, or any paired trial whose `reference_buffer_sha256` differs. Timing events include generation start/end, publication, consumption, source timestamp/arrival age, inference start/end, physics pause/release, requested frame, and consumed frame. Summaries use count/p50/p95/p99/max for Motion Matching generation, publication-to-consumption, arrival age, inference, and paused-physics duration, with explicit missed-frame and held-frame counts under `diagnostic_timing`.
 
 - [ ] **Step 4: Register the CLI**
 

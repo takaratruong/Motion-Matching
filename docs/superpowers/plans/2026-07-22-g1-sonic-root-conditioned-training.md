@@ -17,7 +17,7 @@
 - G1 encoder input per frame changes from 64 to 67 values; flattened learned-layer input changes from 640 to 670.
 - G1 kinematic decoder output per frame changes from 64 to 67 values; flattened learned-layer output changes from 640 to 670.
 - Released 64-value per-frame order remains `joint_pos[29], joint_vel[29], orientation_6d[6]`; root XYZ is appended as values 64 through 66 of each frame inside the G1 network.
-- Exported multimode ONNX input preserves all existing 1,762 superset values and appends root values at `[1762,1792)`.
+- Export derives the baseline width from the selected encoder ONNX and independently sums the selected observation config. For the qualified baseline hashes in the runtime plan both equal 1,762, so root is appended at the derived range `[1762,1792)`; a stale YAML comment is never a width authority.
 - New encoder columns and new kinematic-decoder rows/biases initialize to exact zero; all copied values must be bit-equal to the released checkpoint.
 - The G1 dynamic/control decoder, teleop encoder, SMPL encoder, quantizer, and running statistics remain frozen in Stage A; the critic follows the existing trainer because it is not part of the deployed control path.
 - Stage A actor observations contain no privileged measured root pose, terrain height map, or global robot XY.
@@ -74,7 +74,20 @@ def test_root_position_observation_flattens_only_when_requested():
     transforms = torch.randn(2, 10, 9)
     env = fake_env(root_transforms=transforms)
     assert observations.motion_root_position_refheading_mf(env, "motion").shape == (2, 30)
+
+def test_training_root_transform_matches_shared_runtime_oracle():
+    position, quaternion = shared_root_fixture_inputs()
+    command = make_tracking_command(position, quaternion)
+    training = command.root_transforms_relative_to_first_frame[..., :3]
+    runtime = canonical_root_trajectory(position, quaternion)
+    torch.testing.assert_close(training.cpu(), torch.from_numpy(runtime), rtol=0.0, atol=1.0e-6)
 ```
+
+Use the same numeric fixture as
+`sonic/fixtures/root_trajectory_v1.json`; this is a cross-repository contract
+test, not a second independently generated expected value. Add yaw and XY
+translation variants and require the training tensor and shared Python oracle to
+remain equal for the same inputs.
 
 - [ ] **Step 2: Run the tests and confirm the missing function**
 
@@ -318,7 +331,7 @@ def test_fk_converter_ignores_root_channel_but_accepts_three_key_decoder():
 
 - [ ] **Step 2: Extend the legacy G1 decoder-key branch**
 
-In every exact-key branch that currently accepts the two released G1 outputs, accept the three-key set and continue using joint positions plus orientation for FK. Root is supervised separately by `G1ReconLossAligned`.
+In every exact-key branch that currently accepts the two released G1 outputs, accept the three-key set and continue using joint positions plus orientation for FK. Root is supervised by the existing `G1ReconLoss` reading the expanded decoder output list.
 
 ```python
 g1_qpos_keys = {"command_multi_future_nonflat", "motion_anchor_ori_b_mf_nonflat"}
@@ -331,9 +344,9 @@ if set(output_keys) in (
 
 - [ ] **Step 3: Add encoder, decoder, and loss configs**
 
-The encoder config copies `g1_mf_mlp.yaml` and uses the three inputs. The kinematic decoder copies `g1_kin_mf_mlp.yaml` and uses the three outputs. `g1_root_recon.yaml` instantiates the existing `G1ReconLoss` with MSE; that loss reads the expanded `g1_kin.outputs` list from `decoders_cfg`, so no extra loss-input contract is introduced. The Stage-A auxiliary config includes only `g1_root_recon` with coefficient `1.0`.
+The encoder config copies `g1_mf_mlp.yaml` and uses the three inputs. The kinematic decoder copies `g1_kin_mf_mlp.yaml` and uses the three outputs. `g1_root_recon.yaml` instantiates the existing `G1ReconLoss` with MSE; that loss reads the expanded `g1_kin.outputs` list from `decoders_cfg`, so no extra loss-input contract is introduced. The Stage-A auxiliary config starts from `g1_recon_and_all_latent.yaml`, replaces the released G1 reconstruction term with the expanded `g1_root_recon`, and retains the released alignment/cycle terms `g1_smpl_latent`, `g1_teleop_latent`, `teleop_smpl_latent`, and `reencoded_smpl_g1_latent` with their released coefficients. If a retained term requires a non-G1 sample stream, preserve the released sampling/availability contract while keeping that encoder frozen; do not silently set the needed sample probability to zero.
 
-The universal-token config instantiates every released encoder/decoder for export compatibility, sets `freeze: true` on teleop, SMPL, and `g1_dyn`, sets `freeze_quantizer: true`, and leaves G1 plus `g1_kin` trainable. Its G1 sample probability is `1.0`; teleop and SMPL are `0.0`; `optimize_encoders_ratio_for_CHIP: true` prevents automatic secondary activation.
+The universal-token config instantiates every released encoder/decoder for export compatibility, sets `freeze: true` on teleop, SMPL, and `g1_dyn`, sets `freeze_quantizer: true`, and leaves G1 plus `g1_kin` trainable. Preserve whatever frozen teleop/SMPL sampling is required by the retained alignment/cycle losses; `optimize_encoders_ratio_for_CHIP: true` must not activate another trainable module.
 
 - [ ] **Step 4: Add the Stage-A experiment config**
 
@@ -348,7 +361,7 @@ manager_env:
       dt_future_ref_frames: 0.1
 ```
 
-At initialization, assert the trainable audit has positive counts only for `encoders.g1` and `decoders.g1_kin`; raise `RuntimeError` before rollout otherwise.
+Guard the real setup function invoked by `train_agent_trl.py` immediately after checkpoint/model construction and before optimizer construction, environment rollout, logging side effects, or any `.step()`. Assert the trainable audit has positive counts only for `encoders.g1` and `decoders.g1_kin`; raise `RuntimeError` otherwise. Add a negative entrypoint test with intentionally unfrozen `g1_dyn` and spies proving no optimizer step and no rollout occurs.
 
 - [ ] **Step 5: Run tests and a one-environment construction smoke test**
 
@@ -375,7 +388,7 @@ git commit -m "feat: configure frozen SONIC root Stage A"
 
 **Interfaces:**
 - Consumes: `--sonic-root` containing official robot-motion PKLs and repeated `--mm-bundle` Motion Matching run bundles containing canonical CSVs plus `mm_root_diagnostic.csv`.
-- Produces: an output directory of read-only official-motion symlinks and normalized physical-pelvis MM reference directories plus `root_conditioning_manifest.json`; duplicate names receive a deterministic 12-character source-hash suffix.
+- Produces: an output directory containing read-only official-motion `.pkl` symlinks and deterministic MM-derived motion-library `.pkl` files plus `root_conditioning_manifest.json`; duplicate names receive a deterministic 12-character source-hash suffix. This is required because `motion_lib_base.py:364-379` recursively loads only `*.pkl`.
 
 - [ ] **Step 1: Write failing identity and rejection tests**
 
@@ -391,11 +404,22 @@ def test_rejects_mm_reference_with_zero_or_missing_body_position(tmp_path):
     mm = make_mm_bundle(tmp_path, physical_pelvis=np.zeros((21, 3), np.float32))
     with pytest.raises(ValueError, match="physical pelvis"):
         build_dataset(make_sonic_source(tmp_path), [mm], tmp_path / "mixed")
+
+def test_rejects_curb_clip_with_constant_pelvis_height(tmp_path):
+    pelvis = np.tile([0.0, 0.0, 0.80], (21, 1)).astype(np.float32)
+    mm = make_mm_bundle(tmp_path, physical_pelvis=pelvis, route_id="curb-forward")
+    with pytest.raises(ValueError, match="pelvis-height variance"):
+        build_dataset(make_sonic_source(tmp_path), [mm], tmp_path / "mixed")
+
+def test_manifest_root_is_canonical_and_yaw_translation_invariant(tmp_path):
+    base = materialize_mm_motion(make_mm_bundle(tmp_path / "base"))
+    augmented = materialize_mm_motion(make_yaw_xy_augmented_copy(tmp_path / "aug"))
+    np.testing.assert_allclose(recompute_canonical_root(base), recompute_canonical_root(augmented), rtol=0.0, atol=1.0e-6)
 ```
 
 - [ ] **Step 2: Implement deterministic materialization**
 
-For official data, accept only regular `.pkl` files, hash each file, and create relative read-only symlinks. For each MM bundle, validate the canonical joint/quaternion CSVs and `mm_root_diagnostic.csv`, extract columns `physical_pelvis_x/y/z`, reject non-finite or all-zero physical pelvis data, and materialize a new reference directory whose `body_pos.csv` contains those exact parsed float32 values. Hash `joint_pos.csv`, `joint_vel.csv`, `body_quat.csv`, generated `body_pos.csv`, and `metadata.txt` in sorted order. Write canonical sorted JSON with schema `sonic-root-conditioning-dataset/v1`, source paths, hashes, row counts, origin, and aggregate fractions.
+For official data, accept only regular `.pkl` files, hash each file, and create relative read-only symlinks. For each MM bundle, validate the canonical joint/quaternion CSVs and `mm_root_diagnostic.csv`, extract columns `physical_pelvis_x/y/z`, reject non-finite/all-zero pelvis data, and reject a curb-tagged clip whose Z variance is below the named tolerance. Convert each validated MM bundle into the same motion-library `.pkl` schema loaded by `MotionLibBase`, reusing `load_csv_motion`/`convert_sequence` semantics from `gear_sonic/data_process/convert_soma_csv_to_motion_lib.py` rather than inventing a directory format that the loader ignores. Hash every source CSV, converter identity/version, generated PKL, and decoded tensor shape in sorted order. Re-open every generated PKL through the real motion library, recompute the canonical root values, and validate the shared fixture plus yaw/XY-translation augmentation invariance at `1e-6`. Write canonical sorted JSON with schema `sonic-root-conditioning-dataset/v1`, source paths, hashes, row counts, origin, coordinate convention, converter identity, and aggregate fractions.
 
 - [ ] **Step 3: Run tests**
 
@@ -409,7 +433,7 @@ Run: `python download_from_hf.py --sample`
 
 Run: `python gear_sonic/tools/build_root_conditioning_dataset.py --sonic-root sample_data/robot_filtered --mm-bundle /home/ubuntu/mm-sonic-curb-low-diagnostic-20260722/manual-sonic/manual-20260722T162024737809Z-3083126 --output sonic_root_stage_a/motions --manifest sonic_root_stage_a/root_conditioning_manifest.json`
 
-Expected: command exits zero, records both origins, and reports at least one Motion Matching clip with nonzero pelvis-height variance.
+Expected: command exits zero, records both origins, produces loader-visible `.pkl` entries, and enforces at least one curb Motion Matching clip with pelvis-height variance above the configured threshold.
 
 - [ ] **Step 5: Commit the tool and tests**
 
@@ -428,6 +452,17 @@ git commit -m "feat: build hashed root conditioning dataset"
 **Interfaces:**
 - Consumes: released ONNX, expanded initial checkpoint, trained checkpoint, exported root encoder ONNX, and root-conditioned observation config.
 - Produces: `root_stage_a_verification.json` with tensor-copy, initial token/action parity, learned sensitivity, flat probes, model hashes, and config hash.
+
+- [ ] **Step 0: Prove expanded-initial parity before any optimizer step**
+
+Export the expanded zero-initialized checkpoint before training. Derive the
+released base width from its exact encoder ONNX input, independently sum the
+selected config, and derive `ROOT_RANGE = (base_width, base_width + 30)`. Require
+the currently qualified base width to be 1,762. Run the initial token/action
+parity gates against 20 seeded valid samples and abort before trainer/optimizer
+construction unless every tensor-copy, dimension, hash, token, and action gate
+passes. Add an entrypoint test proving a parity failure invokes neither rollout
+nor optimizer `.step()`.
 
 - [ ] **Step 1: Write verifier tests with tiny ONNX fixtures**
 
@@ -452,10 +487,10 @@ INITIAL_TOKEN_ATOL = 0.0
 INITIAL_ACTION_ATOL = 1.0e-6
 LEARNED_ROOT_TOKEN_MIN = 1.0e-5
 FLAT_ACTION_ATOL = 5.0e-3
-ROOT_RANGE = (1762, 1792)
+ROOT_RANGE = (base_width, base_width + 30)
 ```
 
-Initial expanded models must match released tokens exactly and released decoder actions within `1e-6` when root columns are zero. The trained model must exceed `1e-5` token change under root-only perturbations while joint/orientation inputs remain bit-identical. Ten flat-root probes at constant Z and zero delta XY must keep action deltas below `5e-3` relative to the released model.
+Initial expanded models must match released tokens exactly and released decoder actions within `1e-6` when root columns are zero. This check is a hard precondition before any optimizer step, not a post-training diagnostic. The trained model must exceed `1e-5` token change under root-only perturbations while joint/orientation inputs remain bit-identical. Ten flat-root probes at constant Z and zero delta XY must keep action deltas below `5e-3` relative to the released model.
 
 - [ ] **Step 3: Run unit tests**
 
@@ -473,7 +508,7 @@ Expected: training logs show only G1 encoder and G1 kinematic decoder gradients,
 
 Run: `python gear_sonic/eval_agent_trl.py +exp=manager/universal_token/all_modes/sonic_root_stage_a +checkpoint=sonic_root_stage_a/selected.pt +headless=True ++num_envs=1 +export_onnx_only=true`
 
-Expected: encoder ONNX input shape is `[1,1792]`, token output shape is `[1,64]`, and decoder input/output shapes match the released control decoder.
+Expected: for the qualified 1,762-wide baseline, encoder ONNX input shape is `[1,1792]`, token output shape is `[1,64]`, and decoder input/output shapes match the released control decoder. Record exact checkpoint, ONNX, and config hashes and reject any model/config width mismatch before export succeeds.
 
 - [ ] **Step 6: Run all parity and sensitivity gates**
 

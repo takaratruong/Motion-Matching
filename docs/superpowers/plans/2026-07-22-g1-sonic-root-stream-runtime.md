@@ -17,7 +17,8 @@
 - Protocol v5 field order is `joint_pos`, `joint_vel`, `body_quat_w`, `body_pos`, `frame_index`, optional hand fields, `catch_up`.
 - `body_pos` is little-endian `f32[N,3]`, finite, C-contiguous, and has the same row count as every other motion field.
 - Canonical root position for frame `i` is `inverse(heading(q0)) * (p_i - [p0.x,p0.y,0])`; therefore frame zero is `[0,0,p0.z]`.
-- The deployed encoder observation superset appends the new 30 values after the existing 1,762 values; old offsets and ordering do not move.
+- Treat the selected deployment model/config as one artifact pair. Derive `base_width` from the encoder ONNX input and independently sum the selected config's registered observation dimensions; require equality before startup. For the qualified pair `base_width == 1762`, so root is `[1762,1792)`; never infer the live width from a YAML header comment.
+- Qualified baseline identities are encoder `013ab0287236aa2721e13f1e936d699db982302d0de0bfcdae76d5c3245362d3`, decoder `c7241a123eaa36b5d64bad19540efde93cac1ad443bd4572fd12ca99898118ed`, and config `466d05947c78af6c76388adfb86e3a2a77b2a1d921a64883ed3d085ebf58de1`. Any other artifact must re-derive and record its widths and ranges.
 - The observation name is `motion_root_position_refheading_10frame_step5` and its logical training name is `motion_root_position_refheading_mf_nonflat`.
 - Cross-language canonicalization tolerance is `1e-6`; packed stream and reference-file root values must be float32 bit-equal.
 
@@ -63,8 +64,11 @@
 
 - [ ] **Step 1: Write failing ownership and validation tests**
 
+Add the following as methods on the existing `unittest.TestCase`; keep one
+assertion style within the file.
+
 ```python
-def test_from_target_chunk_owns_physical_pelvis_not_virtual_root():
+def test_from_target_chunk_owns_physical_pelvis_not_virtual_root(self):
     chunk = make_target_chunk()
     root = RootTargetBuffer.from_target_chunk(chunk)
     np.testing.assert_array_equal(root.body_position.view(np.uint32), chunk.physical_pelvis_position.view(np.uint32))
@@ -81,7 +85,19 @@ def test_rejects_mismatched_or_nonfinite_body_position(self):
     bad[1, 2] = np.nan
     with self.assertRaisesRegex(ContractError, "finite"):
         RootTargetBuffer(canonical, bad)
+
+def test_target_chunk_physical_pelvis_is_already_mujoco_frame(self):
+    chunk = make_known_axis_target_chunk(
+        physical_pelvis_holden=[1.0, 0.80, 2.0],
+        physical_pelvis_mujoco=[2.0, 1.0, 0.80],
+    )
+    root = RootTargetBuffer.from_target_chunk(chunk)
+    np.testing.assert_array_equal(root.body_position[0], [2.0, 1.0, 0.80])
 ```
+
+The known-axis fixture exercises the real conversion in
+`resample.py:359-366` and the initial-boundary conversion in
+`timeline.py:274-281`; also assert nominal standing pelvis Z is positive.
 
 - [ ] **Step 2: Run the tests and confirm the missing module failure**
 
@@ -123,9 +139,9 @@ class RootTargetBuffer:
 
 - [ ] **Step 4: Run the focused tests**
 
-Run: `PYTHONPATH=sonic/python python -m unittest discover -s tests/python -p 'test_sonic_*.py' -v`
+Run: `PYTHONPATH=sonic/python python -m unittest tests.python.test_sonic_root_target tests.python.test_sonic_timeline -v`
 
-Expected: all tests pass and the existing timeline tests remain unchanged.
+Expected: both focused suites pass and the existing timeline tests remain unchanged.
 
 - [ ] **Step 5: Commit**
 
@@ -146,6 +162,8 @@ git commit -m "feat: own physical pelvis target trajectory"
 - Produces: `pose_header_v5(count, include_hands=False)`, `encode_pose_v5(root, hand_targets=None)`, `decode_pose_v5(message)`, `DecodedPoseV5.root`, and `RootPosePublisher` with the same `prepare/send/close` surface as `PosePublisher`.
 
 - [ ] **Step 1: Write exact wire-contract tests**
+
+Add these as methods on the existing `unittest.TestCase`.
 
 ```python
 def test_v5_appends_body_position_without_changing_v1():
@@ -334,9 +352,11 @@ Use the returned array for `body_pos.csv`, include the returned label in `info.t
 
 - [ ] **Step 4: Run reference and codec tests**
 
-Run: `PYTHONPATH=sonic/python python -m unittest discover -s tests/python -p 'test_sonic_*.py' -v`
+Run: `PYTHONPATH=sonic/python python -m unittest tests.python.test_sonic_reference tests.python.test_sonic_root_target tests.python.test_sonic_zmq_v1 tests.python.test_sonic_zmq_v5 -v`
 
-Expected: all tests pass.
+Expected: the affected reference and codec suites pass. The repository-wide
+`test_sonic_*.py` gate remains a final qualification step after its documented
+environment prerequisites (`jsonschema` and `SONIC_PROJECT_CLI`) are present.
 
 - [ ] **Step 5: Commit**
 
@@ -399,7 +419,7 @@ For v5, require nonempty joint data, one body quaternion, one body position, and
 ```cpp
 int body_pos_idx = -1;
 // field scan
-else if (f.name == "body_pos" || f.name == "body_pos_w") body_pos_idx = static_cast<int>(i);
+else if (f.name == "body_pos") body_pos_idx = static_cast<int>(i);
 
 if (protocol_version == 5 && body_pos_idx < 0) {
   std::cerr << "[ZMQEndpointInterface] Version 5 missing required field 'body_pos'" << std::endl;
@@ -407,7 +427,13 @@ if (protocol_version == 5 && body_pos_idx < 0) {
 }
 ```
 
-Accept v5 in the same joint-motion branch as v1, require shape `[N,3]`, decode `f32` and `f64` through the existing endian-safe helpers, set `incoming.protocol_version = 5`, and assign `incoming.body_pos`. Keep v1/v2/v3/v4 branches unchanged and reject a mid-session version switch as before.
+Accept v5 in the same joint-motion branch as v1. Require the exact field name
+`body_pos`, exact dtype `f32`, little-endian encoding, and shape `[N,3]`; reject
+the alias `body_pos_w` and dtype `f64`. Decode through the existing endian-safe
+f32 helper, set `incoming.protocol_version = 5`, and assign
+`incoming.body_pos`. Add endpoint tests for the accepted exact header and both
+rejections. Keep v1/v2/v3/v4 branches unchanged and reject a mid-session
+version switch as before.
 
 - [ ] **Step 5: Build and run the C++ unit tests**
 
@@ -464,6 +490,8 @@ def canonical_root_trajectory(position: object, quaternion_wxyz: object) -> np.n
         raise ContractError("root trajectory requires position [N,3] and quaternion [N,4]")
     if not np.all(np.isfinite(p)) or not np.all(np.isfinite(q)):
         raise ContractError("root trajectory inputs must be finite")
+    if not np.allclose(np.linalg.norm(q, axis=1), 1.0, rtol=0.0, atol=1.0e-5):
+        raise ContractError("root trajectory quaternions must be unit length")
     yaw = math.atan2(2.0 * (q[0, 0] * q[0, 3] + q[0, 1] * q[0, 2]), 1.0 - 2.0 * (q[0, 2] ** 2 + q[0, 3] ** 2))
     c, s = math.cos(yaw), math.sin(yaw)
     delta = p - np.array([p[0, 0], p[0, 1], 0.0])
@@ -564,11 +592,11 @@ TEST(RootTrajectory, GathererClampsFramesAndWritesFrameMajorXYZ) {
  }},
 ```
 
-The gatherer chooses frames with the same `operator_state.play`, step, and final-frame clamp behavior as `GatherMotionAnchorOrientationMutiFrame`, reads body index zero, canonicalizes all selected frames using the first selected quaternion heading, and copies XYZ frame-major into the requested offset. It fails closed if either body positions or body quaternions are absent.
+The gatherer chooses frames with the same `operator_state.play`, step, and final-frame clamp behavior as `GatherMotionAnchorOrientationMutiFrame`, reads body index zero, canonicalizes all selected frames using the first selected quaternion heading, and copies XYZ frame-major into the requested offset. It fails closed if either body positions or body quaternions are absent. Add a parity test that instruments both gatherers and proves identical selected frame indices at start, middle, and final-frame-clamped play states.
 
 - [ ] **Step 3: Add the root-conditioned observation config**
 
-Copy the deployed 1,762-value configuration verbatim, append this enabled encoder observation after every existing entry, and require it only for G1:
+Copy the exact hash-qualified deployed configuration verbatim, append this enabled encoder observation after every existing entry, and require it only for G1. First sum the copied registry entries, compare that sum with the selected baseline ONNX input width, and derive the append offset; for the qualified pair both must equal 1,762:
 
 ```yaml
     - name: "motion_root_position_refheading_10frame_step5"
@@ -584,7 +612,7 @@ Copy the deployed 1,762-value configuration verbatim, append this enabled encode
         - motion_root_position_refheading_10frame_step5
 ```
 
-Keep teleop and SMPL required lists byte-for-byte equivalent to the deployed config. Document `Encoder input dimension: 1792` and `new range: [1762,1792)` in the header.
+Keep teleop and SMPL required lists byte-for-byte equivalent to the deployed config. Document baseline and root-aware model/config SHA-256 values, derived base width, final width, and derived root range in the header; for the qualified pair these are `1762`, `1792`, and `[1762,1792)`.
 
 - [ ] **Step 4: Build and validate dimensions**
 
@@ -595,6 +623,18 @@ Expected: both targets build.
 Run: `gear_sonic_deploy/target/release/run_tests --gtest_filter='RootTrajectory.*:StreamedRootMotion.*'`
 
 Expected: all root tests pass.
+
+Run two startup-negative tests through the real deployment initialization path:
+
+1. root-aware config plus the released 1,762-wide encoder fails before the
+   control loop because the summed config width is 1,792;
+2. root-aware 1,792-wide encoder plus the released config fails for the inverse
+   mismatch.
+
+Then start the matching root-aware pair and feed a v1 first motion message. The
+endpoint must reject it before one control action because root-aware G1 mode
+requires protocol v5. Log exact model/config hashes, summed dimensions,
+observation names and offsets, selected mode, and required protocol on startup.
 
 - [ ] **Step 5: Commit**
 
@@ -657,6 +697,10 @@ Record exact SHAs and command outputs, plus:
   "body_position_source": "physical-pelvis",
   "root_observation": "motion_root_position_refheading_10frame_step5",
   "root_observation_range": [1762, 1792],
+  "base_encoder_width_derived": 1762,
+  "baseline_encoder_sha256": "013ab0287236aa2721e13f1e936d699db982302d0de0bfcdae76d5c3245362d3",
+  "baseline_decoder_sha256": "c7241a123eaa36b5d64bad19540efde93cac1ad443bd4572fd12ca99898118ed",
+  "baseline_config_sha256": "466d05947c78af6c76388adfb86e3a2a77b2a1d921a64883ed3d085ebf58de1",
   "canonicalization_atol": 1e-6,
   "file_stream_bit_equal": true
 }
