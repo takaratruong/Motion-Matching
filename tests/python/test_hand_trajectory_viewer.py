@@ -138,6 +138,26 @@ class HandTrajectoryViewerTests(unittest.TestCase):
         self.assertIn('"EXACT"', source)
         self.assertIn('"AXIS-FALLBACK"', source)
 
+    def test_ranks_refined_fallbacks_and_adds_viewer_clearance(self):
+        source = self.source()
+        self.assertIn("achieved_orientation_error_radians", source)
+        self.assertIn("orientation_error_degrees", source)
+        self.assertIn("orient %.1f deg", source)
+        self.assertIn("std::stable_sort", source)
+        self.assertIn("viewer_collision_config()", source)
+        for radius in ("joint_radius_m", "limb_radius_m", "torso_radius_m"):
+            self.assertIn(f"config.{radius} += 0.02F", source)
+        self.assertIn("const TrajectoryCollisionConfig& collision_config", source)
+        self.assertIn("environment, collision_config", source)
+
+        comparator = source.split("std::stable_sort", 1)[1].split(
+            "return result;", 1
+        )[0]
+        self.assertIn("TrajectoryMatchTier::AxisFallback", comparator)
+        self.assertIn("achieved_orientation_error_radians", comparator)
+        self.assertIn("source.cost", comparator)
+        self.assertIn("source.clip", comparator)
+
     def test_is_independent_of_controller_diffusion_mesh_and_terrain(self):
         source = self.source()
         for forbidden in (

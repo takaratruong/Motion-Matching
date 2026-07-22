@@ -22,6 +22,7 @@ using interaction::HandTrajectoryQuery;
 using interaction::OrientedBox;
 using interaction::EnvironmentGeometry;
 using interaction::ShapedHandTrajectory;
+using interaction::TrajectoryCollisionConfig;
 using interaction::TrajectoryFeasibilityReason;
 
 constexpr size_t kBackgroundPathStride = 5U;
@@ -84,6 +85,14 @@ EnvironmentGeometry support_geometry(
     }
     return interaction::make_coverage_environment(
         table_world, table_dimensions);
+}
+
+TrajectoryCollisionConfig viewer_collision_config() {
+    TrajectoryCollisionConfig config{};
+    config.joint_radius_m += 0.02F;
+    config.limb_radius_m += 0.02F;
+    config.torso_radius_m += 0.02F;
+    return config;
 }
 
 CanonicalGrasp canonical_grasp(
@@ -165,6 +174,7 @@ void process_candidates(
     const std::vector<HandTrajectory>& candidates,
     const HandTrajectoryQuery& query,
     const EnvironmentGeometry& environment,
+    const TrajectoryCollisionConfig& collision_config,
     std::unordered_set<int32_t>& accepted_clips,
     size_t stop_after_valid,
     TrajectorySet& result) {
@@ -190,7 +200,7 @@ void process_candidates(
         const auto feasibility =
             interaction::evaluate_shaped_trajectory_feasibility(
                 shaped, candidate.contact_point, query.hand, object,
-                environment);
+                environment, collision_config);
         std::vector<interaction::Pose>{}.swap(shaped.poses);
         RenderedTrajectory rendered{
             candidate, std::move(shaped), feasibility.reason};
@@ -220,6 +230,8 @@ TrajectorySet rebuild_valid_trajectories(
     const HandTrajectoryQuery& base_query,
     const EnvironmentGeometry& environment) {
     TrajectorySet result{};
+    const TrajectoryCollisionConfig collision_config =
+        viewer_collision_config();
     std::unordered_set<int32_t> accepted_clips;
     HandTrajectoryQuery exact_query = base_query;
     const bool position_only = base_query.orientation_mode ==
@@ -237,6 +249,7 @@ TrajectorySet rebuild_valid_trajectories(
         exact,
         exact_query,
         environment,
+        collision_config,
         accepted_clips,
         std::numeric_limits<size_t>::max(),
         result);
@@ -253,10 +266,31 @@ TrajectorySet rebuild_valid_trajectories(
             fallback,
             fallback_query,
             environment,
+            collision_config,
             accepted_clips,
             kTargetValidTrajectories,
             result);
     }
+    std::stable_sort(
+        result.valid.begin(),
+        result.valid.end(),
+        [](const RenderedTrajectory& left, const RenderedTrajectory& right) {
+            const bool left_fallback = left.source.match_tier ==
+                interaction::TrajectoryMatchTier::AxisFallback;
+            const bool right_fallback = right.source.match_tier ==
+                interaction::TrajectoryMatchTier::AxisFallback;
+            if (left_fallback != right_fallback) return !left_fallback;
+            if (!left_fallback) return false;
+            if (left.shaped.achieved_orientation_error_radians !=
+                right.shaped.achieved_orientation_error_radians) {
+                return left.shaped.achieved_orientation_error_radians <
+                    right.shaped.achieved_orientation_error_radians;
+            }
+            if (left.source.cost != right.source.cost) {
+                return left.source.cost < right.source.cost;
+            }
+            return left.source.clip < right.source.clip;
+        });
     return result;
 }
 
@@ -645,13 +679,19 @@ int main(int argc, char** argv) {
                     selected_animation, animation_seconds);
                 const int32_t frame = selected.source.start_frame +
                     static_cast<int32_t>(sample);
+                constexpr float radians_to_degrees =
+                    57.295779513F;
+                const float orientation_error_degrees =
+                    selected.shaped.achieved_orientation_error_radians *
+                    radians_to_degrees;
                 DrawText(
                     TextFormat(
-                        "option %i/%i | clip %i | %s | SAFE | %s | %s frame %i",
+                        "option %i/%i | clip %i | %s | orient %.1f deg | SAFE | %s | %s frame %i",
                         static_cast<int>(selected_index + 1U),
                         static_cast<int>(trajectories.valid.size()),
                         selected.source.clip,
                         match_tier_name(selected.source.match_tier),
+                        orientation_error_degrees,
                         support_name(selected.source.support),
                         phase_name(database.phases.at(
                             static_cast<size_t>(frame))),
