@@ -615,19 +615,42 @@ class ScoredControlStartupTests(unittest.TestCase):
     class _Gear:
         simulation_control_gate = True
 
-        def __init__(self, calls, *, barrier_error=None, receipt_error=None):
+        def __init__(
+            self, calls, *, barrier_error=None, receipt_error=None, fail_method=None
+        ):
             self.calls = calls
             self.barrier_error = barrier_error
             self.receipt_error = receipt_error
+            self.fail_method = fail_method
             self.stopped = True
             self.control_paused = False
+
+        def _maybe_fail(self, method):
+            if self.fail_method == method:
+                raise ProcessError("synthetic startup boundary")
 
         def continue_group(self):
             self.calls.append("gear.continue_group")
             self.stopped = False
 
+        def begin_simulation_control_sync(self):
+            self.calls.append("gear.begin_simulation_control_sync")
+            self._maybe_fail("begin_simulation_control_sync")
+            self.control_paused = False
+
+        def finish_simulation_control_sync(self):
+            self.calls.append("gear.finish_simulation_control_sync")
+            self._maybe_fail("finish_simulation_control_sync")
+            self.control_paused = True
+
+        def resume_simulation_control(self):
+            self.calls.append("gear.resume_simulation_control")
+            self._maybe_fail("resume_simulation_control")
+            self.control_paused = False
+
         def activate_control(self):
             self.calls.append("gear.activate_control")
+            self._maybe_fail("activate_control")
 
         def wait_for_first_policy_action(self):
             self.calls.append("gear.wait_for_first_policy_action")
@@ -662,6 +685,7 @@ class ScoredControlStartupTests(unittest.TestCase):
 
         def pause_simulation_control(self):
             self.calls.append("gear.pause_simulation_control")
+            self._maybe_fail("pause_simulation_control")
             self.control_paused = True
 
         def group_is_stopped(self):
@@ -683,9 +707,18 @@ class ScoredControlStartupTests(unittest.TestCase):
         def require_alive(self):
             self.calls.append("simulator.require_alive")
 
+        def refresh_low_state(self):
+            self.calls.append("simulator.refresh_low_state")
+            return {"published": True, "steps": 0}
+
         def advance(self, _steps):
             self.advance_calls += 1
             raise AssertionError("startup must not advance physics")
+
+    class _FailingSimulator(_Simulator):
+        def refresh_low_state(self):
+            self.calls.append("simulator.refresh_low_state")
+            raise ProcessError("synthetic startup boundary")
 
     def test_action_readiness_precedes_control_channel_gate_pause(self):
         calls = []
@@ -733,8 +766,60 @@ class ScoredControlStartupTests(unittest.TestCase):
                 before_control=input_ready,
             )
 
-        self.assertEqual(calls[0], "input.ready")
-        self.assertEqual(calls[1], "gear.continue_group")
+        self.assertEqual(
+            calls,
+            [
+                "input.ready",
+                "gear.continue_group",
+                "gear.pause_simulation_control",
+                "gear.begin_simulation_control_sync",
+                "simulator.refresh_low_state",
+                "gear.finish_simulation_control_sync",
+                "gear.resume_simulation_control",
+                "gear.activate_control",
+                "gear.wait_for_first_policy_action",
+                "gear.wait_for_received_policy_command",
+                "gear.pause_simulation_control",
+                "simulator.require_alive",
+            ],
+        )
+        self.assertEqual(simulator.advance_calls, 0)
+
+    def test_x11_startup_boundary_failures_fail_closed(self):
+        boundary_methods = (
+            "pause_simulation_control",
+            "begin_simulation_control_sync",
+            "refresh_low_state",
+            "finish_simulation_control_sync",
+            "resume_simulation_control",
+            "activate_control",
+        )
+        for method_name in boundary_methods:
+            with self.subTest(method=method_name):
+                calls = []
+                if method_name == "refresh_low_state":
+                    gear = self._Gear(calls)
+                    simulator = self._FailingSimulator(calls)
+                else:
+                    gear = self._Gear(calls, fail_method=method_name)
+                    simulator = self._Simulator(calls)
+
+                output = StringIO()
+                with self.assertRaisesRegex(
+                    ProcessError, "synthetic startup boundary"
+                ):
+                    with redirect_stdout(output):
+                        _activate_scored_control(
+                            gear,
+                            simulator,
+                            before_control=lambda: calls.append("input.ready"),
+                        )
+
+                self.assertNotIn("SONIC first action ready", output.getvalue())
+                self.assertNotIn("SONIC policy command received", output.getvalue())
+                self.assertEqual(simulator.advance_calls, 0)
+                self.assertNotIn("gear.wait_for_first_policy_action", calls)
+                self.assertNotIn("gear.wait_for_received_policy_command", calls)
 
     def test_barrier_failure_does_not_pause_gate_or_advance_physics(self):
         calls = []

@@ -458,6 +458,12 @@ def _activate_scored_control(
     if before_control is not None:
         before_control()
     gear.continue_group()
+    if before_control is not None:
+        gear.pause_simulation_control()
+        gear.begin_simulation_control_sync()
+        simulator.refresh_low_state()
+        gear.finish_simulation_control_sync()
+        gear.resume_simulation_control()
     gear.activate_control()
     ready = gear.wait_for_first_policy_action()
     print(
