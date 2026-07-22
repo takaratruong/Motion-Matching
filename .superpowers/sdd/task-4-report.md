@@ -1,46 +1,162 @@
-# Task 4 report — coupled walk/pickup training
+# Task 4 report — focused low-memory trajectory database loader
 
-Status: DONE
+## Commit
 
-## Execution
+- Commit: `c133e9eaa66b7d7a978fefc67d6093d7612c9f5f`
+- Message: `perf: load compact trajectory viewer data`
+- Commit contents: only `interaction_trajectory_database.h`,
+  `tests/cpp/test_interaction_trajectory_database.cpp`, and `Makefile`.
 
-- Base: `a34ca758e22ee4fcb5c6c84ad3660b91a7ca3fe8`
-- GPU: one `NVIDIA L40S`, launched with `CUDA_VISIBLE_DEVICES=1` (PyTorch device `cuda:0`).
-- Real dataset rebuild: 13 seconds.
-- Real training: 17 seconds per deterministic run; the final 17-second run published the explicit `last.pt` and `best.pt` aliases after their contract was added. The earlier real run also took 17 seconds.
-- Defaults used: A/B/C = 1/1/1 epochs, batch size 64, frozen validation subset 4.
+## RED evidence
 
-## Artifacts
+The equivalence/malformed fixture test and its direct Makefile rule were added
+before the loader header existed. The prescribed RED command was run:
 
-All artifacts are intentionally untracked under `build/g1-overlap/`.
+```text
+$ make -B build/tests/test_interaction_trajectory_database
+make: *** No rule to make target 'interaction_trajectory_database.h', needed by 'build/tests/test_interaction_trajectory_database'.  Stop.
+```
 
-| Path | Bytes | SHA-256 |
-| --- | ---: | --- |
-| `dataset.npz` | 129100866 | `8f88f85b17c904bbf538682e54fe037c8a76ec5e7ee45c1dbcd26455c7142754` |
-| `checkpoint.pt` | 52549300 | `ca1d113b15fe3688039cc42e94b59eaefba656d5ef55e51d0e74c9875198c60a` |
-| `last.pt` | 52549300 | `ca1d113b15fe3688039cc42e94b59eaefba656d5ef55e51d0e74c9875198c60a` |
-| `best.pt` | 52549300 | `ca1d113b15fe3688039cc42e94b59eaefba656d5ef55e51d0e74c9875198c60a` |
-| `checkpoint.training.jsonl` | 2870 | `6f7c1457a4dc0392cd1384d9358c2558ca943fa6a231b203b48889b05ee6c116` |
-| `checkpoint.validation.json` | 1029 | `c13fd48bc7e7ad863a326f8b81f1fd1e1a90e4e0d13837fea69966b3e2fdb39f` |
+This is the expected missing-loader failure: the test target was recognized,
+but its required compact-loader header had not yet been created.
 
-Dataset audit: 2,020 interaction rows, byte-identical 20-frame overlaps, train-only normalization, dynamic-Hips variance nonzero, canonical signature `6138d9364b6f4178c25e2c1ac7039f3ce5fedf6b11a0b8375dea712633abd2e7`.
+## GREEN implementation and verification evidence
 
-## Validation quality and sampler gate
+`interaction_trajectory_database.h` is header-only and reuses safe helpers
+from `interaction_database.h`. It reads the unchanged `G1INTDB1` header,
+computes the exact schema-v1 byte count with checked multiplication and checked
+addition before any array access, rejects a size mismatch, and requires both
+the expected final stream position and EOF.
 
-Frozen validation rows: 4.
+It retains exactly these vectors:
 
-| DDIM steps | attach proxy @8 | median grasp position | median grasp orientation | no-stop proxy |
-| ---: | ---: | ---: | ---: | ---: |
-| 20 | 0.0 | 13.846933841705322 m | 138.6712875366211° | 1.0 |
-| 50 | 0.0 | 26.12924289703369 m | 138.37097930908203° | 1.0 |
+```text
+parents, range_starts, range_stops, positions, rotations, phases,
+active_hands, object_positions, object_rotations, table_positions,
+table_rotations, table_sizes, object_dimensions,
+grasp_positions_object, grasp_rotations_object,
+approach_directions_object
+```
 
-Selected production sampler: 20 steps. This is the honest deterministic gate result: both percentage proxies match, 20-step median position is lower, and its orientation is within 2°. No validation rows or metrics were altered.
+It skips with guarded bounds checks and leaves empty:
 
-## Verification
+```text
+velocities, angular_velocities, foot_contacts, hand_contacts,
+hand_dof, hand_dof_velocities, time_to_contact,
+object_velocities, object_angular_velocities, source_frames
+```
 
-`tests.python.test_overlap_checkpoint`, `tests.python.test_overlap_diffusion`, and `tests.python.test_overlap_dataset`: 37 tests passed in 3.143 seconds. The final checkpoint strictly loaded on CPU and CUDA with the 195/25/9, 256-wide/8-block/8-head model schema.
+The compact test creates a valid schema-v1 fixture, compares every retained
+field with `load_database`, confirms every skipped vector is empty, and rejects
+truncation inside skipped `velocities`, trailing data, invalid ranges,
+nonmonotonic phases, missing CONTACT/LIFT phases, invalid retained rotations,
+and invalid active hands.
 
-## Deviations and environment notes
+The required verification command completed with exit code 0:
 
-- The prescribed funnel interpreter has CUDA PyTorch but no MuJoCo. I ran its exact Python binary with `PYTHONPATH=/home/ubuntu/miniconda3/lib/python3.10/site-packages`, which supplies the already-installed MuJoCo package; no dependencies were modified.
-- Native local offsets vary by at most 1.18 mm after existing resampling/FK conversion. Canonical offsets therefore use the native median and reject variation over 2 mm; this is consistent with the repository's existing 1 mm conversion FK contract while still rejecting animated child translations.
+```text
+$ make -B build/tests/test_interaction_trajectory_database \
+    build/tests/test_interaction_database
+g++ -std=c++17 -Wall -Wextra -Werror -pedantic -I. \
+  tests/cpp/test_interaction_trajectory_database.cpp \
+  -o build/tests/test_interaction_trajectory_database
+g++ -std=c++17 -Wall -Wextra -Werror -pedantic -I. \
+  tests/cpp/test_interaction_database.cpp \
+  -o build/tests/test_interaction_database
+
+$ ./build/tests/test_interaction_trajectory_database
+$ ./build/tests/test_interaction_database
+$ git diff --check
+```
+
+The same build/test/diff checks were run again immediately before staging and
+committing, and `git diff --cached --check` was also clean.
+
+## Changed files
+
+- `interaction_trajectory_database.h`: compact schema-v1 loader, checked
+  skips, exact-size/EOF checks, and retained-data validation.
+- `tests/cpp/test_interaction_trajectory_database.cpp`: valid equivalence
+  fixture plus required malformed-input coverage.
+- `Makefile`: one compact-loader test binary entry and direct rule using
+  `CPP_TEST_FLAGS`.
+
+## Caveats
+
+- The compact loader intentionally does not call `validate_database`, because
+  that validator requires skipped vectors to be populated.
+- As a result, semantics that depend solely on skipped payloads (hand/foot
+  contact contents, source-frame ordering, and time-to-contact values) are not
+  validated by this focused viewer loader. Their schema byte ranges are still
+  overflow- and bounds-checked before they are skipped.
+- An input truncated inside a skipped array or with extra trailing bytes is
+  rejected by the pre-read exact schema-v1 byte-count check; the guarded skip
+  logic remains as a second defense for each skipped field.
+
+## Follow-up fix — retained approach-direction semantics
+
+### Commit
+
+- Commit: `4626814d65c8f25a8232f42141dfa12dd25f808c`
+- Message: `fix: validate compact approach directions`
+- Commit contents: only `interaction_trajectory_database.h` and
+  `tests/cpp/test_interaction_trajectory_database.cpp`; `Makefile` was not
+  changed.
+
+### Fix details
+
+The compact loader now matches the full loader's retained-field contract for
+every `approach_directions_object` entry. For each clip it:
+
+- rejects a non-horizontal direction when
+  `abs(y) > detail::kFloatTolerance`; and
+- computes the three-dimensional norm and rejects a non-unit direction when
+  `abs(norm - 1.0) > detail::kFloatTolerance`.
+
+The checks use the same indexing, tolerance constant, order, and error
+contracts as `interaction_database.h`.
+
+### RED evidence
+
+The two malformed behaviors were introduced in separate TDD cycles.
+
+First, a retained direction with `y = 0.5` was added while the compact loader
+still performed only finiteness validation:
+
+```text
+$ make -B build/tests/test_interaction_trajectory_database && \
+    ./build/tests/test_interaction_trajectory_database
+g++ -std=c++17 -Wall -Wextra -Werror -pedantic -I. \
+  tests/cpp/test_interaction_trajectory_database.cpp \
+  -o build/tests/test_interaction_trajectory_database
+test_interaction_trajectory_database: ... expect_format_error(...):
+Assertion `threw' failed.
+```
+
+After the horizontal check was implemented and passed, a horizontal retained
+direction with length `0.5` was added. It produced the same expected RED at
+`expect_format_error`: the loader did not throw because unit length was not yet
+validated.
+
+### GREEN evidence
+
+After adding the full-loader-equivalent norm check, the focused test compiled
+and exited 0. Final required verification was then run:
+
+```text
+$ make -B build/tests/test_interaction_trajectory_database \
+    build/tests/test_interaction_database
+g++ -std=c++17 -Wall -Wextra -Werror -pedantic -I. \
+  tests/cpp/test_interaction_trajectory_database.cpp \
+  -o build/tests/test_interaction_trajectory_database
+g++ -std=c++17 -Wall -Wextra -Werror -pedantic -I. \
+  tests/cpp/test_interaction_database.cpp \
+  -o build/tests/test_interaction_database
+
+$ ./build/tests/test_interaction_trajectory_database
+$ ./build/tests/test_interaction_database
+$ git diff --check
+```
+
+Both binaries exited 0 and `git diff --check` produced no output. The staged
+fix also passed `git diff --cached --check` before commit.

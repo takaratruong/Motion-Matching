@@ -2,239 +2,185 @@
 
 Status: complete and verified.
 
-Branch: `g1-tabletop-placement`
+Commit: `1cecd7a665e4087e5161d75c31d154ec285092a8`
 
-Base: `00241f645038410406fca7389a5c946c88e3a91b`
-
-Commit message: `feat: coordinate carry to place lifecycle`
-
-The final commit hash is reported in the parent handoff. It cannot be embedded
-in the report contained by that same commit without changing the commit hash.
+Commit message: `feat: visualize table and ground pickup searches`
 
 ## RED evidence
 
-The first runtime test build failed as intended:
+Added the viewer source-contract assertions before changing production code:
+
+- `interaction_trajectory_database.h` is included;
+- `load_trajectory_database(` is used and `interaction::load_database(` is absent;
+- the viewer references both `SupportKind::Table` and `SupportKind::Ground`;
+- the exact `GROUND` and `TABLE` labels are present and selected support is
+  rendered;
+- the viewer target depends on the compact-loader header; and
+- `MIXED_INTERACTION_PACK` and `mixed-interaction-pack` remain exposed by the
+  Makefile.
+
+The required RED command was run before production changes:
 
 ```text
-make build/tests/test_interaction_runtime
+python3 -m unittest tests.python.test_hand_trajectory_viewer -v
 ```
 
-Exit 2. The compiler reported the missing `RuntimeInput::place_request`,
-`RuntimeConfig::place`, `RuntimeState::{PlacePreflight,PlaceAlign,PlaceReplay,
-PlaceRelease}`, placement-enabled constructor, `preview_place`, and nested place
-diagnostics.
+It failed with the expected two source-contract failures:
 
-The focused controller diagnostic build also failed as intended:
+1. `#include "interaction_trajectory_database.h"` was absent from
+   `hand_trajectory_viewer.cpp` (the viewer was still using the legacy full
+   loader).
+2. `interaction_trajectory_database.h` was absent from the
+   `hand_trajectory_viewer` Makefile dependency list.
 
-```text
-make build/tests/test_interaction_place_controller
-```
-
-Exit 2. `PlaceStep` lacked exact source progress and requested/applied root,
-yaw, hand-position, and hand-orientation correction fields.
-
-After the first implementation compile succeeded, the runtime test failed at
-`first.ready`. Diagnostic evidence was:
-
-```text
-mode=RecordedPlace root_error=0.258824 current_root=(0.258824,2)
-staging_root=(0,2)
-```
-
-The production selector was correct; the new synthetic recorded-place fixture
-kept a 0.10 m authored x offset through release instead of reaching the
-destination. The fixture trajectory was corrected to decay to zero at release.
-
-Adversarial test development exposed further fixture/build issues:
-
-- A replacement surface moved its plane without moving its support volume and
-  was correctly rejected by surface validation. The test now moves both.
-- The original pickup fixture rests on the support plane for several
-  post-contact frames, so reversed placement was correctly rejected as blocked.
-  A reverse-only fixture now lifts immediately after contact.
-- The first full safe run linked `test_interaction_matcher` against the shared
-  fixture after placement initialization had been added to the base factory,
-  producing an undefined `PlacementSurfaceRegistry::upsert` reference. The
-  placement setup is now isolated in `make_place_runtime_fixture`, so legacy
-  matcher/playback/carry tests retain their original dependency closure.
-
-No adversarial RED required weakening production gates.
+The pre-existing assertions for Enter-only reruns, selected-only full-pose
+caching, background path stride, object/table collision, visible table/grid,
+and forbidden controller/mesh/terrain/diffusion/screenshot dependencies all
+remained green during RED.
 
 ## Implementation
 
-- Preserved `RuntimeState::Carry == 6` and appended the four Place states at
-  values 7 through 10.
-- Added the placement-enabled runtime constructor while retaining the legacy
-  pickup constructor. Both validate the complete Place controller and IK
-  configuration before registry mutation.
-- Added a const, mutation-free placement preview backed by one private pure
-  match-input builder. It re-fetches the exact Held owner/target generation,
-  grasp, destination surface generation, and affordance, and supplies the exact
-  runtime timing/match/IK configuration.
-- Carry Interact freezes one exact pose/object/input/preview and publishes one
-  PlacePreflight tick. The next tick rebuilds and compares the complete private
-  input, canonical candidate, selection ID, and IK fingerprint before beginning
-  playback. Pre-begin rejection republishes the frozen pair and retains the
-  original Carry controller.
-- PlaceAlign and PlaceReplay update the controller before evaluating cancel, so
-  the last pre-commit sample cancels while exact/after-commit cancels are
-  ignored. Post-begin failures seed a fresh Carry controller from the last-safe
-  place pair.
-- Release re-fetches the exact surface/affordance, repeats actual fit and sweep
-  gates, and performs one atomic `commit_place` with the original pickup owner
-  plus destination support context. Failed transactions remain Held and recover
-  to Carry; success publishes the incremented Free generation and retracts to
-  the final stop sample once before Locomotion.
-- Extended nested runtime and PlaceStep diagnostics with exact source progress,
-  preview/config/IK identity, goal/fit/sweep/support errors, and requested/applied
-  root, yaw, hand-position, and hand-orientation corrections. Corrections are
-  zero after release acknowledgement.
-- Updated debug text, exhaustive runtime probe state naming, and the complete
-  four-file placement source/header Make closure, including collision support.
-
-## Adversarial coverage
-
-The runtime test now covers:
-
-- deterministic pure preview before/during/after Carry, legacy missing
-  placement dependencies, and exact collapsed success lifecycle;
-- immediate ordinary re-pick of the returned Free handle using destination
-  support context rather than the source table;
-- both-constructor validation for every Place/IK field family, hard caps,
-  next-float-above caps, exact caps, and valid tighter request limits;
-- non-default timing, match, IK, and behavioral release threshold forwarding;
-- every IK scalar/iteration fingerprint and selection-ID perturbation plus
-  cross-runtime stale selection rejection;
-- missing/zero-ID/wrong-held requests, far/unready staging, stale far selection,
-  stale target/library/surface snapshots, candidate rejection, and unchanged
-  preflight Carry continuity;
-- cancellation after four Align ticks, default and non-default release-position
-  failures, surface replacement, and generation-overflow atomic rejection with
-  exact last-safe publication and fresh-Carry seam;
-- before/exact/after commit cancellation for recorded and reverse candidates;
-- Reset and duplicate Place edges in every Place state;
-- recorded/reverse deterministic replay, monotonic exact source diagnostics,
-  zeroed post-release corrections, and one final stop sample.
+- The viewer now includes `interaction_trajectory_database.h` and loads
+  `interaction_database.bin` with `interaction::load_trajectory_database`.
+- Canonical startup records the first Contact clip as a fallback, but returns
+  the first Contact clip classified as `SupportKind::Table`. Support kind is
+  not used in `select_hand_trajectories` membership or its cost/clip ordering.
+- `support_name` returns exactly `GROUND` for ground support and `TABLE`
+  otherwise. The selected option HUD now shows support beside `SAFE` and phase.
+- `pack_path` retains its argv and `MM_INTERACTION_PACK` selection; no combined
+  pack path was hardcoded in C++. The existing full-pack default was left
+  unchanged.
+- The viewer Make target now depends on `interaction_trajectory_database.h`.
+- The Task 2 `MIXED_INTERACTION_PACK` variable and `mixed-interaction-pack`
+  target were retained without changing the full-pack configuration.
 
 ## Changed files
 
-- `interaction_runtime.h`
-- `interaction_runtime.cpp`
-- `interaction_place_controller.h`
-- `interaction_place_controller.cpp`
-- `interaction_debug_draw.h`
-- `interaction_runtime_probe.cpp`
-- `tests/cpp/interaction_runtime_fixture.h`
-- `tests/cpp/test_interaction_runtime.cpp`
-- `tests/cpp/test_interaction_place_controller.cpp`
+- `hand_trajectory_viewer.cpp`
+- `tests/python/test_hand_trajectory_viewer.py`
 - `Makefile`
-- `.superpowers/sdd/task-5-report.md`
 
-## Verification
+## GREEN and final verification
 
-All final commands exited 0:
+After the focused implementation, the viewer contract suite passed all seven
+tests:
 
 ```text
-make build/tests/test_interaction_runtime \
-  build/tests/test_interaction_controller_adapter \
-  interaction_runtime_probe controller
-
-build/tests/test_interaction_runtime
-build/tests/test_interaction_controller_adapter
-
-make test-interaction-safe
+python3 -m unittest tests.python.test_hand_trajectory_viewer -v
 ```
 
-The safe suite reported 263 Python tests passing with 3 environment-dependent
-skips, then passed all C++ interaction tests and selection/release/carry
-fast-math gates. The desktop controller build emitted only pre-existing warnings
-from raygui/array file-reading code.
+The complete required verification sequence then exited 0:
 
-## Self-review
+```text
+python3 -m unittest tests.python.test_hand_trajectory_viewer -v
+make -B build/tests/test_interaction_trajectory_database \
+  build/tests/test_interaction_hand_trajectories
+./build/tests/test_interaction_trajectory_database
+./build/tests/test_interaction_hand_trajectories
+make hand_trajectory_viewer
+git diff --check
+```
 
-The final audit covered every Place transition, output authority flag,
-attachment/registry mutation, target generation and support update, frozen versus
-reconstructed Carry continuity, candidate/config/IK identity, cancellation
-boundary, release transaction terminal, final retraction sample, and Make link
-closure. Dead release-attempt bookkeeping and an unused include were removed.
-Placement fixture setup was isolated from non-runtime tests after the full-suite
-link RED. No blocking finding remains.
+The C++ test binaries built and ran successfully. The release-mode viewer built
+successfully; its Make prerequisite rebuilt the ignored local raylib dependency.
+`git diff --check` exited 0.
 
-The protected repository-root `interaction_query_probe` artifact was never
-accessed; verification used only the safe build output selected by the Make
-target.
+Before committing, the staged-file audit showed exactly the three owned files,
+and `git diff --cached --check` exited 0.
 
-## Formal-review follow-up: release-edge cancellation
+## Caveats
 
-Formal review found that the runtime updated the Place controller and then
-unconditionally replaced the returned step with `cancel()` when Cancel was
-pulsed. On the release update, that discarded the controller's one-shot
-`release_due` event. Because the controller had already entered its committed,
-release-pending state, later updates correctly did not re-emit the event, which
-left the runtime wedged in Held PlaceReplay.
+- The viewer was compiled but not interactively launched; the task’s requested
+  checks do not provide a display-backed runtime test.
+- This report is intentionally uncommitted. The worktree also retains the
+  pre-existing, intentionally uncommitted `.superpowers/sdd/task-4-report.md`
+  change; it was neither staged, reverted, nor altered.
+
+## Important-finding follow-up: ground-only support startup
+
+Commit: `6ff59c8d346faa26f8892a8e034f8eae8238849b`
+
+Commit message: `fix: support ground-only trajectory packs`
+
+### Root cause
+
+The first-Contact fallback correctly selected a Ground clip when no Table clip
+was available, but startup unconditionally passed that clip's virtual-floor
+metadata to `make_recorded_table_geometry`. The builder requires a tabletop
+with a positive underside height, so the virtual floor was rejected and startup
+terminated.
+
+A direct `ShelfGeometry{}` substitute would not be valid either: the shared
+type contains a fixed array of five boxes, and the feasibility evaluator rejects
+default zero-dimension boxes. Within Task 5's owned-file boundary, the viewer
+therefore represents absent support geometry as `std::nullopt` and supplies
+valid far-away no-op boxes only at the fixed-size feasibility API boundary.
+Those boxes are not rendered and do not create a floor/table obstacle in the
+scene; the evaluator's unchanged object-collision pass remains active.
 
 ### Follow-up RED
 
-The regression creates independent trial and control runtimes for both recorded
-and reversed candidates, advances each pair to the update immediately before
-release, and pulses Cancel only on the trial's release update. It compares the
-complete runtime output at release and on every retraction update, and verifies
-the exact Free generation, placed transform, destination support context, and
-final Locomotion result.
+Added `test_ground_support_uses_no_table_geometry` before changing production
+code. The contract requires:
+
+- a focused `support_geometry` helper returning optional geometry;
+- an exact Ground branch returning `std::nullopt` before the recorded-table
+  builder;
+- a no-support collision bridge for the fixed-size evaluator API;
+- use of the optional geometry in collision setup; and
+- rendering guarded by `table_geometry.has_value()`.
+
+The focused RED command was:
 
 ```text
-make build/tests/test_interaction_runtime && \
-  build/tests/test_interaction_runtime
+python3 -m unittest tests.python.test_hand_trajectory_viewer -v
 ```
 
-Before the fix, the command exited 134 on the recorded-candidate case:
+It ran eight tests and failed exactly once because
+`std::optional<ShelfGeometry> support_geometry(` was absent. The seven existing
+viewer contracts remained green.
+
+### Follow-up fix
+
+- `support_geometry` preserves the exact recorded-table builder path for Table
+  support and returns `std::nullopt` for Ground support.
+- Ground startup no longer constructs recorded geometry from virtual-floor
+  metadata and therefore cannot hit the table underside validation.
+- Table collision and rendering continue to consume the same five recorded
+  boxes. Ground rendering leaves `DrawGrid` visible and draws no support boxes.
+- Ground feasibility uses valid no-op boxes one million metres from the current
+  query anchor, preserving the unchanged object collision pass while applying
+  no table/floor collision obstacle.
+- Support kind is still absent from trajectory membership and cost/clip ranking.
+  Compact loading, staged controls, and selected-pose caching are unchanged.
+
+Follow-up changed files:
+
+- `hand_trajectory_viewer.cpp`
+- `tests/python/test_hand_trajectory_viewer.py`
+
+`Makefile` required no follow-up change.
+
+### Follow-up GREEN and verification
+
+The focused suite passed all eight tests after the fix. The complete Task 5
+verification sequence then exited 0:
 
 ```text
-test_interaction_runtime: tests/cpp/test_interaction_runtime.cpp:2010:
-void {anonymous}::test_cancel_on_release_update_preserves_release_for_both_modes():
-Assertion `exact(trial_output, control_output)' failed.
+python3 -m unittest tests.python.test_hand_trajectory_viewer -v
+make -B build/tests/test_interaction_trajectory_database \
+  build/tests/test_interaction_hand_trajectories
+./build/tests/test_interaction_trajectory_database
+./build/tests/test_interaction_hand_trajectories
+make hand_trajectory_viewer
+git diff --check
 ```
 
-The success-lifecycle test was also tightened to assert directly that the
-request update publishes PlacePreflight, the immediately following update does
-not, and the complete lifecycle contains exactly one PlacePreflight
-publication.
+Both C++ tests rebuilt and ran successfully, the release viewer rebuilt
+successfully, and `git diff --check` reported no whitespace errors. Before the
+follow-up commit, the staged-file audit contained exactly the two changed owned
+files and `git diff --cached --check` exited 0.
 
-### Follow-up fix and GREEN
-
-The runtime now evaluates Cancel only when the step returned by
-`PlaceController::update()` is uncommitted. This preserves the release event
-while retaining the controller's one-shot semantics and every pre-commit
-cancellation boundary. No controller code or API changed.
-
-After the fix, the focused RED command exited 0. The following build-closure
-and focused execution command also exited 0:
-
-```text
-make build/tests/test_interaction_runtime \
-  build/tests/test_interaction_controller_adapter \
-  interaction_runtime_probe && \
-  build/tests/test_interaction_runtime && \
-  build/tests/test_interaction_controller_adapter
-```
-
-The final safe-suite command exited 0:
-
-```text
-make test-interaction-safe
-```
-
-It reported 263 Python tests passing with 3 expected environment-dependent
-skips, followed by successful target-release, carry-release, place-selection,
-and place-release fast-math validation binaries.
-
-### Follow-up self-review
-
-The change is limited to the runtime cancellation gate and its runtime
-regressions. Both recorded and reversed trials are required to match their
-controls exactly through the first successful PlaceRelease and every retraction
-update to Locomotion. The assertions prove one Free generation increment, exact
-placed transform and support metadata, stable placed handles after release, and
-exactly one PlacePreflight publication on the success lifecycle. Existing
-before-commit cancellation coverage remains green, and the controller's
-one-shot release behavior is unchanged.
+The follow-up was compile- and contract-verified but not interactively launched
+under a display. This report remains intentionally uncommitted, alongside the
+untouched intentional Task 4 report modification.
