@@ -90,7 +90,7 @@ _GEAR_ACTION_HEADER = (
     *(f"act_{index}" for index in range(29)),
 )
 _GEAR_LAUNCH_PROFILES = frozenset({"zmq_stream", "loaded_motion"})
-_SIMULATION_CONTROL_READY = ("READY", "4")
+_SIMULATION_CONTROL_READY = ("READY", "5")
 _SIMULATION_CONTROL_MAX_PACKET = 256
 _SHELL_SAFE_ABSOLUTE_PATH = re.compile(r"/[A-Za-z0-9._/-]*\Z")
 _OWNED_DIRECTORY_STAGING_PREFIX = ".mm-sonic-owned-"
@@ -2666,7 +2666,7 @@ class GearProcess:
             if expected == "READY":
                 if fields != _SIMULATION_CONTROL_READY:
                     raise ProcessProtocolError(
-                        "GEAR simulation control capability is not READY/v4"
+                        "GEAR simulation control capability is not READY/v5"
                     )
                 return None
             if len(fields) != 3 or fields[0] != expected:
@@ -3167,9 +3167,12 @@ class GearProcess:
 
         if not self.simulation_control_gate:
             raise ProcessError("GEAR simulation control gate is not enabled")
-        if not self._control_active:
+        if not self._control_active and not (
+            self._wait_for_control_ready and self._input_prepared
+        ):
             raise ProcessError(
-                "GEAR simulation control gate requires active policy control"
+                "GEAR simulation control gate requires active policy control "
+                "or prepared WAIT_FOR_CONTROL"
             )
         if self.group_is_stopped():
             raise ProcessError(
@@ -3236,6 +3239,30 @@ class GearProcess:
         self._simulation_control_tick = tick
         self._simulation_control_synchronized = True
         self._simulation_control_state = "paused"
+
+    def resume_simulation_control(self) -> None:
+        """Resume fenced policy workers without requiring a changed physics tick."""
+
+        if not self.simulation_control_gate:
+            raise ProcessError("GEAR simulation control gate is not enabled")
+        if self._simulation_control_state != "paused":
+            raise ProcessError("GEAR simulation control must be paused before resume")
+        if not self._simulation_control_synchronized:
+            raise ProcessError(
+                "GEAR simulation control must be synchronized before resume"
+            )
+        epoch = self._simulation_control_epoch
+        self._simulation_control_state = "resuming"
+        self._simulation_control_synchronized = False
+        try:
+            self._send_simulation_control_packet("RESUME", epoch)
+            tick = self._wait_simulation_control_packet("RESUMED", epoch)
+        except BaseException:
+            self._simulation_control_state = "unknown"
+            raise
+        assert tick is not None
+        self._simulation_control_tick = tick
+        self._simulation_control_state = "running"
 
     def arm_simulation_control(self, expected_stream_frame_end: int) -> None:
         """Arm resumption; a changed LowState tick opens policy execution."""

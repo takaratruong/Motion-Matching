@@ -2600,7 +2600,7 @@ class GearProcessTests(TemporaryScriptCase):
 
             flag = sys.argv.index("--sonic-simulation-control-fd")
             channel = socket.socket(fileno=int(sys.argv[flag + 1]))
-            channel.send(b"READY 4\n")
+            channel.send(b"READY 5\n")
             print("BOOT READY", flush=True)
             while True:
                 packet = channel.recv(256)
@@ -2644,6 +2644,187 @@ class GearProcessTests(TemporaryScriptCase):
         finally:
             gear.close()
 
+    def test_resume_simulation_control_opens_group_on_same_tick(self):
+        child = self.script(
+            "simulation_control_resume_child.py",
+            r'''
+            import socket
+            import sys
+
+            flag = sys.argv.index("--sonic-simulation-control-fd")
+            channel = socket.socket(fileno=int(sys.argv[flag + 1]))
+            channel.send(b"READY 5\n")
+            print("BOOT READY", flush=True)
+            while True:
+                packet = channel.recv(256)
+                if packet == b"PAUSE 1\n":
+                    channel.send(b"PAUSED 1 100\n")
+                elif packet == b"SYNC 1\n":
+                    channel.send(b"SYNCING 1 100\n")
+                    channel.send(b"SYNCED 1 100\n")
+                elif packet == b"RESUME 1\n":
+                    channel.send(b"RESUMED 1 100\n")
+                else:
+                    channel.send(b"ERROR 0 unexpected-request\n")
+            ''',
+        )
+        gear = self.gear(
+            child,
+            simulation_control_gate=True,
+            readiness_timeout_s=0.5,
+        )
+        try:
+            gear.start_to_wait_for_control()
+            gear._control_active = True
+            gear.pause_simulation_control()
+            gear.begin_simulation_control_sync()
+            gear.finish_simulation_control_sync()
+
+            gear.resume_simulation_control()
+            self.assertFalse(gear.simulation_control_is_paused)
+            self.assertEqual(gear._simulation_control_state, "running")
+            self.assertFalse(gear._simulation_control_synchronized)
+            self.assertEqual(gear._simulation_control_tick, 100)
+        finally:
+            gear.close()
+
+    def test_resume_simulation_control_rejects_wrong_epoch_ack(self):
+        child = self.script(
+            "simulation_control_resume_bad_epoch_child.py",
+            r'''
+            import socket
+            import sys
+
+            flag = sys.argv.index("--sonic-simulation-control-fd")
+            channel = socket.socket(fileno=int(sys.argv[flag + 1]))
+            channel.send(b"READY 5\n")
+            print("BOOT READY", flush=True)
+            while True:
+                packet = channel.recv(256)
+                if packet == b"PAUSE 1\n":
+                    channel.send(b"PAUSED 1 100\n")
+                elif packet == b"SYNC 1\n":
+                    channel.send(b"SYNCING 1 100\n")
+                    channel.send(b"SYNCED 1 100\n")
+                elif packet == b"RESUME 1\n":
+                    channel.send(b"RESUMED 2 100\n")
+                else:
+                    channel.send(b"ERROR 0 unexpected-request\n")
+            ''',
+        )
+        gear = self.gear(
+            child,
+            simulation_control_gate=True,
+            readiness_timeout_s=0.5,
+        )
+        try:
+            gear.start_to_wait_for_control()
+            gear._control_active = True
+            gear.pause_simulation_control()
+            gear.begin_simulation_control_sync()
+            gear.finish_simulation_control_sync()
+
+            with self.assertRaises(ProcessProtocolError):
+                gear.resume_simulation_control()
+            self.assertEqual(gear._simulation_control_state, "unknown")
+            self.assertFalse(gear._simulation_control_synchronized)
+        finally:
+            gear.close()
+
+    def test_resume_simulation_control_requires_synchronized_pause(self):
+        child = self.script(
+            "simulation_control_resume_precondition_child.py",
+            r'''
+            import socket
+            import sys
+
+            flag = sys.argv.index("--sonic-simulation-control-fd")
+            channel = socket.socket(fileno=int(sys.argv[flag + 1]))
+            channel.send(b"READY 5\n")
+            print("BOOT READY", flush=True)
+            while True:
+                packet = channel.recv(256)
+                if packet == b"PAUSE 1\n":
+                    channel.send(b"PAUSED 1 100\n")
+                elif packet == b"SYNC 1\n":
+                    channel.send(b"SYNCING 1 100\n")
+                    channel.send(b"SYNCED 1 100\n")
+                elif packet == b"ARM 1 20\n":
+                    channel.send(b"ARMED 1 100\n")
+                    channel.send(b"RUNNING 1 101\n")
+                elif packet == b"PAUSE 2\n":
+                    channel.send(b"PAUSED 2 101\n")
+                else:
+                    channel.send(b"ERROR 0 unexpected-request\n")
+            ''',
+        )
+        gear = self.gear(
+            child,
+            simulation_control_gate=True,
+            readiness_timeout_s=0.5,
+        )
+        try:
+            gear.start_to_wait_for_control()
+            gear._control_active = True
+            gear.pause_simulation_control()
+            gear.begin_simulation_control_sync()
+            gear.finish_simulation_control_sync()
+            gear.arm_simulation_control(20)
+
+            # State is now "running": resume must refuse without a wire packet.
+            with self.assertRaises(ProcessError):
+                gear.resume_simulation_control()
+
+            # Re-pause without a sync: resume must still refuse.
+            gear.pause_simulation_control()
+            self.assertFalse(gear._simulation_control_synchronized)
+            with self.assertRaises(ProcessError):
+                gear.resume_simulation_control()
+        finally:
+            gear.close()
+
+    def test_pause_before_control_requires_prepared_wait_for_control(self):
+        child = self.script(
+            "simulation_control_prepared_wait_child.py",
+            r'''
+            import socket
+            import sys
+
+            flag = sys.argv.index("--sonic-simulation-control-fd")
+            channel = socket.socket(fileno=int(sys.argv[flag + 1]))
+            channel.send(b"READY 5\n")
+            print("BOOT READY", flush=True)
+            while True:
+                packet = channel.recv(256)
+                if packet == b"PAUSE 1\n":
+                    channel.send(b"PAUSED 1 100\n")
+                else:
+                    channel.send(b"ERROR 0 unexpected-request\n")
+            ''',
+        )
+        gear = self.gear(
+            child,
+            simulation_control_gate=True,
+            readiness_timeout_s=0.5,
+        )
+        try:
+            gear.start_to_wait_for_control()
+            gear._control_active = False
+
+            # Unprepared WAIT_FOR_CONTROL must refuse before sending a packet.
+            gear._wait_for_control_ready = True
+            gear._input_prepared = False
+            with self.assertRaises(ProcessError):
+                gear.pause_simulation_control()
+            self.assertFalse(gear.simulation_control_is_paused)
+
+            # Authenticated prepared WAIT_FOR_CONTROL may pause before CONTROL.
+            gear._input_prepared = True
+            gear.pause_simulation_control()
+            self.assertTrue(gear.simulation_control_is_paused)
+        finally:
+            gear.close()
+
     def test_simulation_control_recovers_pause_after_malformed_arm_ack(self):
         child = self.script(
             "simulation_control_arm_ack_failure_child.py",
@@ -2653,7 +2834,7 @@ class GearProcessTests(TemporaryScriptCase):
 
             flag = sys.argv.index("--sonic-simulation-control-fd")
             channel = socket.socket(fileno=int(sys.argv[flag + 1]))
-            channel.send(b"READY 4\n")
+            channel.send(b"READY 5\n")
             print("BOOT READY", flush=True)
             while True:
                 packet = channel.recv(256)
@@ -2701,7 +2882,7 @@ class GearProcessTests(TemporaryScriptCase):
 
             flag = sys.argv.index("--sonic-simulation-control-fd")
             channel = socket.socket(fileno=int(sys.argv[flag + 1]))
-            channel.send(b"READY 4\n")
+            channel.send(b"READY 5\n")
             print("BOOT READY", flush=True)
             while True:
                 packet = channel.recv(256)
