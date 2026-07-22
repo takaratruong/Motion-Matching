@@ -383,6 +383,68 @@ def publish_fast_valid_pack(
 
 
 class InteractionBuildUnitTests(unittest.TestCase):
+    def test_object_dimensions_use_one_representative_per_category(self):
+        sources = [
+            SimpleNamespace(
+                sequence_id="pickup_table__cup_2__002",
+                object_id="cup_2",
+                object_usd=Path("table-002.usd"),
+            ),
+            SimpleNamespace(
+                sequence_id="pickup_ground__cup_2__001",
+                object_id="cup_2",
+                object_usd=Path("ground-001.usd"),
+            ),
+            SimpleNamespace(
+                sequence_id="pickup_table__cup_2__001",
+                object_id="cup_2",
+                object_usd=Path("table-001.usd"),
+            ),
+            SimpleNamespace(
+                sequence_id="pickup_ground__cup_2__002",
+                object_id="cup_2",
+                object_usd=Path("ground-002.usd"),
+            ),
+        ]
+        dimensions = np.array([0.08, 0.20, 0.12], np.float32)
+        with patch.object(
+            build_module,
+            "read_usd_dimensions",
+            return_value=dimensions,
+        ) as reader:
+            result = build_module.build_object_dimensions(sources)
+
+        np.testing.assert_array_equal(result["cup_2"], dimensions)
+        self.assertEqual(
+            [path.name for (path,), _ in reader.call_args_list],
+            ["ground-001.usd", "table-001.usd"],
+        )
+
+    def test_object_dimensions_reject_inconsistent_cross_category_bounds(self):
+        sources = [
+            SimpleNamespace(
+                sequence_id="pickup_table__cup_2__001",
+                object_id="cup_2",
+                object_usd=Path("table.usd"),
+            ),
+            SimpleNamespace(
+                sequence_id="pickup_ground__cup_2__001",
+                object_id="cup_2",
+                object_usd=Path("ground.usd"),
+            ),
+        ]
+        with patch.object(
+            build_module,
+            "read_usd_dimensions",
+            side_effect=[
+                np.array([0.08, 0.20, 0.12], np.float32),
+                np.array([0.082, 0.20, 0.12], np.float32),
+            ],
+        ), self.assertRaisesRegex(
+            ValueError, "inconsistent cross-category USD bounds"
+        ):
+            build_module.build_object_dimensions(sources)
+
     def test_rejection_code_schema_is_closed(self):
         self.assertEqual(
             set(build_module.all_schema_v1_rejection_codes()),
@@ -692,9 +754,19 @@ class InteractionBuildUnitTests(unittest.TestCase):
 class InteractionBuildCliTests(unittest.TestCase):
     def test_parse_args_has_exact_schema_v1_defaults(self):
         args = build_cli.parse_args(
-            ["--source-root", "source", "--g1-xml", "g1.xml"]
+            [
+                "--source-root",
+                "source",
+                "--source-root",
+                "other-source",
+                "--g1-xml",
+                "g1.xml",
+            ]
         )
-        self.assertEqual(args.source_root, Path("source"))
+        self.assertEqual(
+            args.source_root,
+            [Path("source"), Path("other-source")],
+        )
         self.assertEqual(args.g1_xml, Path("g1.xml"))
         self.assertEqual(args.target_fps, 25.0)
         self.assertEqual(args.heldout_count, 20)
@@ -702,6 +774,78 @@ class InteractionBuildCliTests(unittest.TestCase):
         self.assertIsNone(args.limit)
         self.assertFalse(args.allow_rejections)
         self.assertEqual(args.output, Path("resources/g1_interaction"))
+
+    def test_multiple_roots_publish_sorted_provenance_and_split_shared_objects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "data"
+            table_root = base / "pickup_table"
+            ground_root = base / "pickup_ground"
+            output = Path(tmp) / "pack"
+            write_source_fixture(
+                table_root,
+                sequence_id="pickup_table__cup_2__001",
+                object_id="cup_2",
+            )
+            write_source_fixture(
+                table_root,
+                sequence_id="pickup_table__table_only__001",
+                object_id="table_only",
+            )
+            write_source_fixture(
+                ground_root,
+                sequence_id="pickup_ground__cup_2__001",
+                object_id="cup_2",
+                ground=True,
+            )
+            write_source_fixture(
+                ground_root,
+                sequence_id="pickup_ground__ground_only__001",
+                object_id="ground_only",
+                ground=True,
+            )
+            argv = [
+                "--source-root",
+                str(ground_root),
+                "--source-root",
+                str(table_root),
+                "--source-root",
+                str(table_root),
+                "--g1-xml",
+                str(base / "g1.xml"),
+                "--output",
+                str(output),
+                "--heldout-count",
+                "1",
+            ]
+            with fast_build_patches(), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(build_cli.main(argv), 0)
+
+            _, _, manifest, split, _ = read_artifact_set(output)
+            self.assertEqual(
+                manifest["source_roots"],
+                sorted([str(table_root.resolve()), str(ground_root.resolve())]),
+            )
+            self.assertEqual(manifest["source_root"], str(base.resolve()))
+            self.assertEqual(
+                {clip["source_category"] for clip in manifest["clips"]},
+                {"pickup_ground", "pickup_table"},
+            )
+            cup_sequences = {
+                "pickup_table__cup_2__001",
+                "pickup_ground__cup_2__001",
+            }
+            database_sequences = {
+                clip["sequence_id"] for clip in manifest["clips"]
+            }
+            self.assertIn(
+                database_sequences & cup_sequences,
+                (set(), cup_sequences),
+            )
+            self.assertTrue(
+                set(split["database_objects"]).isdisjoint(
+                    split["heldout_objects"]
+                )
+            )
 
     def test_parse_args_rejects_non_schema_fps_and_nonpositive_counts(self):
         cases = (
@@ -1023,6 +1167,7 @@ class InteractionBuildCliTests(unittest.TestCase):
             self.assertEqual(manifest["feature_magic"], "G1INTFT1")
             self.assertEqual(manifest["target_fps"], 25.0)
             self.assertEqual(manifest["source_root"], str(root.resolve()))
+            self.assertNotIn("source_roots", manifest)
             self.assertEqual(manifest["dataset_id"], fetch_cli.DATASET_ID)
             self.assertEqual(manifest["skeleton_names"], list(G1_SKELETON.names))
             self.assertEqual(
@@ -1083,6 +1228,7 @@ class InteractionBuildCliTests(unittest.TestCase):
                         "range_stop",
                     },
                 )
+                self.assertNotIn("source_category", clip)
 
     def test_source_date_epoch_is_null_when_absent_and_integer_when_set(self):
         with tempfile.TemporaryDirectory() as tmp:

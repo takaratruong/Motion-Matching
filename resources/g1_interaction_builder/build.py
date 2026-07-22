@@ -34,7 +34,7 @@ from .schema import (
     SourcePaths,
     SourceValidationError,
 )
-from .sources import load_raw_interaction
+from .sources import load_raw_interaction, sequence_parts
 from .splits import split_objects
 
 
@@ -143,15 +143,17 @@ def is_schema_v1_rejection(stage: str, code: str) -> bool:
 def build_object_dimensions(
     sources: Sequence[SourcePaths],
 ) -> dict[str, np.ndarray]:
-    """Read one deterministic USD bound per selected object identity."""
-    representatives: dict[str, SourcePaths] = {}
+    """Read consistent deterministic USD bounds for selected objects."""
+    representatives: dict[tuple[str, str], SourcePaths] = {}
     for source in sorted(sources, key=lambda item: item.sequence_id):
-        representatives.setdefault(source.object_id, source)
+        category = sequence_parts(source.sequence_id)[0]
+        representatives.setdefault((source.object_id, category), source)
 
-    dimensions = {}
-    for object_id in sorted(representatives):
+    category_dimensions: dict[tuple[str, str], np.ndarray] = {}
+    for key in sorted(representatives):
+        object_id, category = key
         value = np.asarray(
-            read_usd_dimensions(representatives[object_id].object_usd),
+            read_usd_dimensions(representatives[key].object_usd),
             np.float32,
         )
         if (
@@ -162,7 +164,28 @@ def build_object_dimensions(
             raise ValueError(
                 f"invalid object bounds for {object_id}: {value}"
             )
-        dimensions[object_id] = value.copy()
+        category_dimensions[(object_id, category)] = value.copy()
+
+    dimensions = {}
+    for object_id in sorted({key[0] for key in category_dimensions}):
+        values = [
+            category_dimensions[(object_id, category)]
+            for category in sorted(
+                category
+                for candidate_object, category in category_dimensions
+                if candidate_object == object_id
+            )
+        ]
+        reference = values[0]
+        if not all(
+            np.allclose(reference, value, rtol=0.0, atol=1e-3)
+            for value in values[1:]
+        ):
+            raise ValueError(
+                "inconsistent cross-category USD bounds "
+                f"for {object_id}: {values}"
+            )
+        dimensions[object_id] = reference.copy()
     return dimensions
 
 
@@ -297,7 +320,7 @@ def _source_date_epoch() -> int | None:
 
 def build_manifest(
     *,
-    source_root: Path,
+    source_roots: Sequence[Path],
     source_count: int,
     included: Sequence[LabeledInteractionClip],
     rejections: Sequence[Rejection],
@@ -307,6 +330,12 @@ def build_manifest(
     target_fps: float,
     diagnostic_limit: int | None,
 ) -> dict:
+    roots = tuple(
+        sorted({Path(root).resolve() for root in source_roots}, key=str)
+    )
+    if not roots:
+        raise ValueError("at least one source root is required")
+    multi_root = len(roots) > 1
     clips = []
     for labeled, start, stop in zip(
         database,
@@ -314,23 +343,28 @@ def build_manifest(
         artifact.range_stops,
         strict=True,
     ):
-        clips.append(
-            {
-                "sequence_id": labeled.motion.sequence_id,
-                "object_id": labeled.motion.object_id,
-                "active_hand": int(labeled.active_hand),
-                "range_start": int(start),
-                "range_stop": int(stop),
-            }
-        )
-    return {
+        clip = {
+            "sequence_id": labeled.motion.sequence_id,
+            "object_id": labeled.motion.object_id,
+            "active_hand": int(labeled.active_hand),
+            "range_start": int(start),
+            "range_stop": int(stop),
+        }
+        if multi_root:
+            clip["source_category"] = sequence_parts(
+                labeled.motion.sequence_id
+            )[0]
+        clips.append(clip)
+    manifest = {
         "schema_version": 1,
         "database_magic": DB_MAGIC.decode("ascii"),
         "feature_magic": FEATURE_MAGIC.decode("ascii"),
         "skeleton_names": list(G1_SKELETON.names),
         "skeleton_parents": G1_SKELETON.parents.astype(int).tolist(),
         "skeleton_signature": G1_SKELETON.signature(),
-        "source_root": str(Path(source_root).resolve()),
+        "source_root": str(
+            Path(os.path.commonpath([str(root) for root in roots]))
+        ),
         "dataset_id": GRAIL_DATASET_ID,
         "source_clips": int(source_count),
         "included_clips": len(included),
@@ -350,3 +384,6 @@ def build_manifest(
         "diagnostic_limit": diagnostic_limit,
         "source_date_epoch": _source_date_epoch(),
     }
+    if multi_root:
+        manifest["source_roots"] = [str(root) for root in roots]
+    return manifest

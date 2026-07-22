@@ -145,9 +145,11 @@ CPP_TEST_DIR := build/tests
 TASK12_BUILD_DIR := build/task12
 override SAFE_INTERACTION_QUERY_PROBE := build/task12/interaction_query_probe_safe
 GRAIL_PICKUP_ROOT ?= /home/ubuntu/datasets/GRAIL/data/pickup_table
+GRAIL_PICKUP_GROUND_ROOT ?= /home/ubuntu/datasets/GRAIL/data/pickup_ground
 GRAIL_ROOT ?= $(GRAIL_PICKUP_ROOT)
 G1_XML ?= /home/ubuntu/projects/mjx-diffphysics/env/g1/assets/g1_29dof.xml
 G1_INTERACTION_DIR ?= resources/g1_interaction
+MIXED_INTERACTION_PACK ?= build/smart-pickup/table-ground-pack
 DEMO_INTERACTION_LIMIT ?= 5
 INTERACTION_DEMO_PACK ?= resources/g1_interaction
 PLAYABLE_EVIDENCE_DIR ?= playable-evidence
@@ -326,7 +328,7 @@ INTERACTION_SMART_PICKUP_PREVIEW_HEADERS += \
 .PHONY: test-controller-scene-release-fast-math
 .PHONY: test-interaction-arrival-release-fast-math
 .PHONY: test-interaction-arrival-controller-release-fast-math
-.PHONY: demo-interaction-pack gate-live-flat-pick-entry-oracle
+.PHONY: demo-interaction-pack mixed-interaction-pack gate-live-flat-pick-entry-oracle
 .PHONY: gate-live-flat-pick-position-matrix
 .PHONY: test-live-flat-pick-entry-oracle-exhaustive
 .PHONY: gate-playable-interaction gate-place-headless
@@ -624,6 +626,16 @@ demo-interaction-pack:
 	  --allow-rejections
 	python -m resources.validate_g1_interaction_database \
 	  --input "$(INTERACTION_DEMO_PACK)"
+
+mixed-interaction-pack:
+	python -m resources.build_g1_interaction_database \
+	  --source-root "$(GRAIL_PICKUP_ROOT)" \
+	  --source-root "$(GRAIL_PICKUP_GROUND_ROOT)" \
+	  --g1-xml "$(G1_XML)" \
+	  --output "$(MIXED_INTERACTION_PACK)" \
+	  --target-fps 25 --allow-rejections
+	python -m resources.validate_g1_interaction_database \
+	  --input "$(MIXED_INTERACTION_PACK)"
 
 gate-live-flat-pick-entry-oracle: $(LIVE_FLAT_PICK_ENTRY_ORACLE_TEST) $(LIVE_FLAT_PICK_ENTRY_ORACLE_RELEASE_TEST)
 	@set -eu; \

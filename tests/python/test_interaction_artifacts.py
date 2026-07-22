@@ -1345,6 +1345,52 @@ class InteractionArtifactSerializationTests(unittest.TestCase):
             ):
                 read_artifact_set(output)
 
+    def test_manifest_accepts_optional_multi_root_provenance(self):
+        artifact, features, split, manifest, report = artifact_fixture()
+        manifest = copy.deepcopy(manifest)
+        manifest["source_root"] = "/synthetic/grail/data"
+        manifest["source_roots"] = [
+            "/synthetic/grail/data/pickup_ground",
+            "/synthetic/grail/data/pickup_table",
+        ]
+        manifest["clips"][0]["source_category"] = "pickup_table"
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "pack"
+            write_artifact_set(
+                output, artifact, features, split, manifest, report
+            )
+            read_artifact_set(output)
+
+        invalid_cases = (
+            (
+                "source_roots",
+                lambda value: value.__setitem__(
+                    "source_roots", ["relative/source"]
+                ),
+            ),
+            (
+                "source_category",
+                lambda value: value["clips"][0].__setitem__(
+                    "source_category", "putdown_ground"
+                ),
+            ),
+        )
+        for label, update in invalid_cases:
+            with self.subTest(label=label):
+                invalid_manifest = copy.deepcopy(manifest)
+                update(invalid_manifest)
+                with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(
+                    ValueError, label
+                ):
+                    write_artifact_set(
+                        Path(tmp) / "pack",
+                        artifact,
+                        features,
+                        split,
+                        invalid_manifest,
+                        report,
+                    )
+
     def test_manifest_and_report_counts_are_cross_file_consistent(self):
         artifact, features, split, manifest, report = artifact_fixture()
 

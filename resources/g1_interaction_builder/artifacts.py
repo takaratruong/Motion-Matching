@@ -30,6 +30,7 @@ from .schema import (
     PhaseConfig,
 )
 from .splits import partition_clips
+from .sources import sequence_parts
 
 
 DB_MAGIC = b"G1INTDB1"
@@ -783,6 +784,30 @@ def _validate_frozen_manifest_metadata(manifest: dict) -> None:
         raise ValueError(
             "manifest source_root must be a nonempty absolute path string"
         )
+    source_roots = manifest.get("source_roots")
+    if source_roots is not None:
+        if (
+            not isinstance(source_roots, list)
+            or len(source_roots) < 2
+            or not all(
+                isinstance(root, str)
+                and root
+                and Path(root).is_absolute()
+                for root in source_roots
+            )
+            or source_roots != sorted(source_roots)
+            or len(source_roots) != len(set(source_roots))
+        ):
+            raise ValueError(
+                "manifest source_roots must be sorted unique absolute "
+                "path strings"
+            )
+        common_root = str(Path(os.path.commonpath(source_roots)))
+        if source_root != common_root:
+            raise ValueError(
+                "manifest source_root must be the common parent of "
+                "source_roots"
+            )
     if manifest.get("dataset_id") != GRAIL_DATASET_ID:
         raise ValueError(
             "manifest dataset_id must be exactly "
@@ -899,6 +924,7 @@ def _validate_manifest(
     ranges = []
     sequence_ids = set()
     ordered_sequence_ids = []
+    has_source_roots = "source_roots" in manifest
     for index, clip in enumerate(clips):
         if not isinstance(clip, dict):
             raise ValueError(f"manifest clip {index} must be an object")
@@ -914,6 +940,18 @@ def _validate_manifest(
             )
         sequence_ids.add(clip["sequence_id"])
         ordered_sequence_ids.append(clip["sequence_id"])
+        if has_source_roots:
+            source_category = clip.get("source_category")
+            expected_category = sequence_parts(clip["sequence_id"])[0]
+            if source_category != expected_category:
+                raise ValueError(
+                    f"manifest clip {index} source_category must match "
+                    f"sequence category {expected_category!r}"
+                )
+        elif "source_category" in clip:
+            raise ValueError(
+                f"manifest clip {index} source_category requires source_roots"
+            )
         active_hand = clip.get("active_hand")
         if not _is_integer(active_hand) or active_hand not in (0, 1):
             raise ValueError(

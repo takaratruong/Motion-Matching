@@ -14,14 +14,16 @@ from .g1_interaction_builder.build import (
     prepare_database,
 )
 from .g1_interaction_builder.schema import G1_SKELETON
-from .g1_interaction_builder.sources import discover_source_paths
+from .g1_interaction_builder.sources import discover_source_paths_many
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build schema-v1 G1 tabletop interaction artifacts"
     )
-    parser.add_argument("--source-root", type=Path, required=True)
+    parser.add_argument(
+        "--source-root", type=Path, action="append", required=True
+    )
     parser.add_argument("--g1-xml", type=Path, required=True)
     parser.add_argument(
         "--output",
@@ -44,10 +46,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def run(args: argparse.Namespace) -> int:
-    sources = sorted(
-        discover_source_paths(args.source_root),
-        key=lambda source: source.sequence_id,
+    source_roots = tuple(
+        sorted(
+            {Path(root).resolve() for root in args.source_root},
+            key=str,
+        )
     )
+    sources = discover_source_paths_many(source_roots)
     if args.limit is not None:
         sources = sources[: args.limit]
 
@@ -97,7 +102,7 @@ def run(args: argparse.Namespace) -> int:
         len(artifact.positions),
     )
     manifest = build_manifest(
-        source_root=args.source_root,
+        source_roots=source_roots,
         source_count=len(sources),
         included=included,
         rejections=rejections,
