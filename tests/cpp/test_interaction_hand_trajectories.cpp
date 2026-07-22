@@ -53,6 +53,7 @@ struct ClipSpec {
     quat grasp_rotation{};
     vec3 dimensions{1.0F, 1.0F, 1.0F};
     bool complete_phases = true;
+    quat object_rotation{};
 };
 
 void write_vec3(std::vector<float>& values, size_t index, vec3 value) {
@@ -71,7 +72,7 @@ void write_quat(std::vector<float>& values, size_t index, quat value) {
 }
 
 interaction::Database make_database(const std::vector<ClipSpec>& specs) {
-    constexpr int32_t frames_per_clip = 6;
+    constexpr int32_t frames_per_clip = 8;
     const size_t frames = specs.size() * frames_per_clip;
     interaction::Database database{};
     database.frame_count = static_cast<uint32_t>(frames);
@@ -129,8 +130,10 @@ interaction::Database make_database(const std::vector<ClipSpec>& specs) {
             database.approach_directions_object, clip, vec3(1.0F, 0.0F, 0.0F));
         const std::array<uint8_t, frames_per_clip> phases =
             spec.complete_phases
-                ? std::array<uint8_t, frames_per_clip>{0U, 1U, 1U, 2U, 3U, 4U}
-                : std::array<uint8_t, frames_per_clip>{0U, 1U, 1U, 1U, 1U, 4U};
+                ? std::array<uint8_t, frames_per_clip>{
+                      0U, 1U, 1U, 2U, 3U, 3U, 3U, 4U}
+                : std::array<uint8_t, frames_per_clip>{
+                      0U, 1U, 1U, 1U, 1U, 1U, 1U, 4U};
         const size_t wrist = spec.hand == interaction::Hand::Right
             ? static_cast<size_t>(g1_skeleton::RightWrist)
             : static_cast<size_t>(g1_skeleton::LeftWrist);
@@ -140,6 +143,7 @@ interaction::Database make_database(const std::vector<ClipSpec>& specs) {
         for (int32_t local = 0; local < frames_per_clip; ++local) {
             const size_t frame = static_cast<size_t>(start + local);
             database.phases[frame] = phases[static_cast<size_t>(local)];
+            write_quat(database.object_rotations, frame, spec.object_rotation);
             vec3 hand = spec.grasp_position;
             if (local < 3) hand.x -= 0.10F * static_cast<float>(3 - local);
             if (local > 3) hand.y += 0.08F * static_cast<float>(local - 3);
@@ -158,6 +162,32 @@ interaction::Database make_database(const std::vector<ClipSpec>& specs) {
         }
     }
     return database;
+}
+
+void test_search_is_anchored_to_grasp_not_object_metadata() {
+    const quat unrelated_object_rotation =
+        quat_from_angle_axis(0.8F, vec3(0.0F, 1.0F, 0.0F));
+    const interaction::Database database = make_database({
+        {interaction::Hand::Right, vec3(0.10F, 0.20F, 0.30F), quat(),
+         vec3(0.10F, 0.10F, 0.10F), true, quat()},
+        {interaction::Hand::Right, vec3(0.10F, 0.20F, 0.30F), quat(),
+         vec3(4.0F, 3.0F, 2.0F), true, unrelated_object_rotation},
+    });
+    interaction::HandTrajectoryQuery query{};
+    query.object_world = {
+        vec3(9.0F, 4.0F, -7.0F),
+        quat_from_angle_axis(-0.6F, vec3(1.0F, 0.0F, 0.0F))};
+    query.object_dimensions = vec3(0.02F, 8.0F, 0.50F);
+    query.hand = interaction::Hand::Right;
+    query.grasp_world_position = vec3(0.10F, 0.20F, 0.30F);
+    query.grasp_world_rotation = quat();
+
+    const auto selected = interaction::select_hand_trajectories(database, query);
+
+    require(selected.size() == 2U,
+            "object metadata changed grasp-based search membership");
+    require(selected[0].cost == selected[1].cost,
+            "object metadata changed grasp-based search ranking");
 }
 
 void test_object_roll_researches_recorded_world_grasp_orientation() {
@@ -192,13 +222,13 @@ void test_object_roll_researches_recorded_world_grasp_orientation() {
 void test_world_grasp_limits_and_position_only_orientation() {
     const interaction::Database position_database = make_database({
         {interaction::Hand::Right, vec3(0.0F, 0.0F, 0.0F), quat()},
-        {interaction::Hand::Right, vec3(0.002F, 0.0F, 0.0F), quat()},
+        {interaction::Hand::Right, vec3(0.0F, 0.002F, 0.0F), quat()},
     });
     interaction::HandTrajectoryQuery position_query{};
     position_query.object_world = {vec3(), quat()};
     position_query.object_dimensions = vec3(1.0F, 1.0F, 1.0F);
     position_query.hand = interaction::Hand::Right;
-    position_query.grasp_world_position = vec3(0.121F, 0.0F, 0.0F);
+    position_query.grasp_world_position = vec3(0.0F, 0.121F, 0.0F);
     position_query.grasp_world_rotation = quat();
     const auto position_selected = interaction::select_hand_trajectories(
         position_database, position_query);
@@ -226,7 +256,7 @@ void test_world_grasp_limits_and_position_only_orientation() {
                 orientation_selected[0].clip == 1,
             "25 degree world-grasp orientation gate changed");
 
-    orientation_query.grasp_world_rotation.reset();
+    orientation_query.constrain_grasp_orientation = false;
     const auto position_only = interaction::select_hand_trajectories(
         orientation_database, orientation_query);
     require(position_only.size() == 2U && position_only[0].clip == 0,
@@ -266,8 +296,8 @@ interaction::MappedHandTrajectory mapped_line(
 void test_selects_every_close_complete_same_hand_clip_in_stable_order() {
     const interaction::Database database = make_database({
         {interaction::Hand::Right, vec3(0.10F, 0.20F, 0.30F), quat()},
-        {interaction::Hand::Right, vec3(0.11F, 0.20F, 0.30F), quat()},
-        {interaction::Hand::Right, vec3(1.00F, 0.20F, 0.30F), quat()},
+        {interaction::Hand::Right, vec3(0.10F, 0.21F, 0.30F), quat()},
+        {interaction::Hand::Right, vec3(0.10F, 1.00F, 0.30F), quat()},
         {interaction::Hand::Left, vec3(0.10F, 0.20F, 0.30F), quat()},
         {interaction::Hand::Right, vec3(0.10F, 0.20F, 0.30F), quat(),
             vec3(1.0F, 1.0F, 1.0F), false},
@@ -279,10 +309,12 @@ void test_selects_every_close_complete_same_hand_clip_in_stable_order() {
             "selector ordering changed");
     require(selected[0].cost <= selected[1].cost, "selector cost order changed");
     require(selected[0].contact_point == 2U, "contact point index changed");
-    require(selected[0].hands_in_source_object.size() == 4U,
-            "trajectory does not span Reach through Lift");
-    require(selected[0].elbows_in_source_object.size() == 4U,
-            "elbow trajectory does not span Reach through Lift");
+    require(selected[0].lift_frame == 6,
+            "trajectory stopped at the first Lift frame");
+    require(selected[0].hands_in_source_object.size() == 6U,
+            "trajectory does not span Reach through complete Lift");
+    require(selected[0].elbows_in_source_object.size() == 6U,
+            "elbow trajectory does not span Reach through complete Lift");
 
     interaction::HandTrajectoryConfig one_only{};
     one_only.maximum_compatible_clips = 1U;
@@ -307,8 +339,9 @@ void test_raw_mapping_uses_upright_scene_alignment_without_grasp_residual() {
         vec3(2.0F, 0.5F, -1.0F),
         quat_from_angle_axis(0.7F, vec3(0.0F, 1.0F, 0.0F))};
     moved.grasp_world_position = vec3(2.2F, 1.1F, -0.7F);
-    moved.grasp_world_rotation =
-        quat_from_angle_axis(-0.4F, vec3(0.0F, 1.0F, 0.0F));
+    moved.grasp_world_rotation = quat_normalize(quat_mul(
+        quat_from_angle_axis(-0.4F, vec3(0.0F, 1.0F, 0.0F)),
+        quat_from_angle_axis(0.2F, vec3(1.0F, 0.0F, 0.0F))));
     const auto mapped = interaction::map_hand_trajectory(selected[0], moved);
     require(mapped.elbows.size() == mapped.hands.size(),
             "full-pose mapping omitted elbows");
@@ -329,7 +362,7 @@ void test_raw_mapping_uses_upright_scene_alignment_without_grasp_residual() {
         mapped.hands[selected[0].contact_point];
     require(!near(contact.position, moved.grasp_world_position),
             "raw scene mapping incorrectly forced Contact position");
-    require(!near_rotation(contact.rotation, *moved.grasp_world_rotation),
+    require(!near_rotation(contact.rotation, moved.grasp_world_rotation),
             "raw scene mapping incorrectly forced Contact orientation");
 }
 
@@ -348,12 +381,11 @@ void test_position_only_mapping_preserves_object_mapped_contact_rotation() {
         vec3(-1.0F, 0.2F, 3.0F),
         quat_from_angle_axis(0.5F, vec3(0.0F, 1.0F, 0.0F))};
     position_only.grasp_world_position = vec3(-0.5F, 0.9F, 2.8F);
-    position_only.grasp_world_rotation.reset();
+    position_only.constrain_grasp_orientation = false;
     const auto mapped = interaction::map_hand_trajectory(selected[0], position_only);
     const interaction::Transform& contact =
         mapped.hands[selected[0].contact_point];
-    const quat expected_rotation = quat_normalize(quat_mul(
-        position_only.object_world.rotation, source_rotation));
+    const quat expected_rotation = source_rotation;
     require(!near(contact.position, position_only.grasp_world_position),
             "raw position-only mapping incorrectly forced Contact position");
     require(near_rotation(contact.rotation, expected_rotation),
@@ -434,7 +466,7 @@ void test_shape_rejects_contact_correction_above_solver_envelope() {
     const auto selected = interaction::select_hand_trajectories(
         database, identity_query());
     interaction::HandTrajectoryQuery over_limit = identity_query();
-    over_limit.grasp_world_position.x +=
+    over_limit.grasp_world_position.y +=
         interaction::IKConfig{}.maximum_request_position_m + 0.001F;
 
     const interaction::ShapedHandTrajectory shaped =
@@ -533,6 +565,7 @@ void test_recorded_table_geometry_preserves_top_and_builds_four_legs() {
 }  // namespace
 
 int main() {
+    test_search_is_anchored_to_grasp_not_object_metadata();
     test_object_roll_researches_recorded_world_grasp_orientation();
     test_world_grasp_limits_and_position_only_orientation();
     test_selects_every_close_complete_same_hand_clip_in_stable_order();

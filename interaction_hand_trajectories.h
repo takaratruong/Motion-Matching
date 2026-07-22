@@ -6,7 +6,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <optional>
 #include <vector>
 
 namespace interaction {
@@ -16,13 +15,13 @@ struct HandTrajectoryQuery {
     vec3 object_dimensions{};
     Hand hand = Hand::Right;
     vec3 grasp_world_position{};
-    std::optional<quat> grasp_world_rotation;
+    quat grasp_world_rotation{};
+    bool constrain_grasp_orientation = true;
 };
 
 struct HandTrajectoryConfig {
     float maximum_grasp_position_error_m = 0.12F;
     float maximum_grasp_orientation_error_radians = 0.436332313F;
-    float maximum_log_dimension_error = 0.75F;
     size_t maximum_compatible_clips = 4096U;
 };
 
