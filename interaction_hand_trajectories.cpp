@@ -133,6 +133,35 @@ float quaternion_angle(quat left, quat right) {
     return 2.0F * std::acos(absolute_dot);
 }
 
+float yaw_radians(quat rotation) {
+    const vec3 facing = quat_mul_vec3(
+        quat_normalize(rotation), vec3(0.0F, 0.0F, 1.0F));
+    return std::atan2(facing.x, facing.z);
+}
+
+float shortest_angle(float angle) {
+    return std::atan2(std::sin(angle), std::cos(angle));
+}
+
+Transform upright_scene_alignment(
+    const Transform& source_object,
+    const Transform& target_object) {
+    const float yaw = shortest_angle(
+        yaw_radians(target_object.rotation) -
+        yaw_radians(source_object.rotation));
+    const quat rotation = quat_from_angle_axis(
+        yaw, vec3(0.0F, 1.0F, 0.0F));
+    const vec3 rotated_source = quat_mul_vec3(
+        rotation, source_object.position);
+    return {
+        vec3(
+            target_object.position.x - rotated_source.x,
+            0.0F,
+            target_object.position.z - rotated_source.z),
+        rotation,
+    };
+}
+
 float log_dimension_error(vec3 source, vec3 target) {
     return std::max({
         std::abs(std::log(source.x / target.x)),
@@ -234,15 +263,6 @@ std::vector<HandTrajectory> select_hand_trajectories(
     const Transform target_object{
         query.object_world.position,
         quat_normalize(query.object_world.rotation)};
-    const vec3 target_grasp_object = compose(
-        inverse(target_object),
-        Transform{query.grasp_world_position, quat()}).position;
-    const std::optional<quat> target_grasp_rotation_object =
-        query.grasp_world_rotation.has_value()
-        ? std::optional<quat>(quat_normalize(quat_mul(
-            quat_inv(target_object.rotation),
-            *query.grasp_world_rotation)))
-        : std::nullopt;
 
     std::vector<HandTrajectory> selected;
     for (size_t clip = 0; clip < database.clip_count; ++clip) {
@@ -251,23 +271,13 @@ std::vector<HandTrajectory> select_hand_trajectories(
         }
         const ClipPhases phases = clip_phases(database, clip);
         if (phases.reach < 0) continue;
-        const vec3 source_grasp = read_vec3(database.grasp_positions_object, clip);
-        const quat source_grasp_rotation = read_quat(
-            database.grasp_rotations_object, clip);
         const vec3 source_dimensions = read_vec3(database.object_dimensions, clip);
-        if (!finite(source_grasp) || !valid_rotation(source_grasp_rotation) ||
-            !positive(source_dimensions)) {
+        if (!positive(source_dimensions)) {
             continue;
         }
-        const float position_error = length(source_grasp - target_grasp_object);
         const float dimension_error = log_dimension_error(
             source_dimensions, query.object_dimensions);
-        const float orientation_error = target_grasp_rotation_object.has_value()
-            ? quaternion_angle(source_grasp_rotation, *target_grasp_rotation_object)
-            : 0.0F;
-        if (position_error > config.maximum_grasp_position_error_m ||
-            dimension_error > config.maximum_log_dimension_error ||
-            orientation_error > config.maximum_grasp_orientation_error_radians) {
+        if (dimension_error > config.maximum_log_dimension_error) {
             continue;
         }
         HandTrajectory trajectory{};
@@ -276,16 +286,6 @@ std::vector<HandTrajectory> select_hand_trajectories(
         trajectory.contact_frame = phases.contact;
         trajectory.lift_frame = phases.lift;
         trajectory.contact_point = static_cast<size_t>(phases.contact - phases.reach);
-        const float position_normalizer = std::max(
-            config.maximum_grasp_position_error_m, 1.0e-6F);
-        const float orientation_normalizer = std::max(
-            config.maximum_grasp_orientation_error_radians, 1.0e-6F);
-        const float dimension_normalizer = std::max(
-            config.maximum_log_dimension_error, 1.0e-6F);
-        trajectory.cost =
-            position_error / position_normalizer +
-            orientation_error / orientation_normalizer +
-            dimension_error / dimension_normalizer;
         trajectory.source_object = object_transform(
             database, phases.contact - 1);
         const Transform source_from_world = inverse(trajectory.source_object);
@@ -299,6 +299,33 @@ std::vector<HandTrajectory> select_hand_trajectories(
                 Transform{world.positions[elbow_index(query.hand)], quat()}
             ).position);
         }
+        const Transform alignment = upright_scene_alignment(
+            trajectory.source_object, target_object);
+        const Transform source_contact = compose(
+            trajectory.source_object,
+            trajectory.hands_in_source_object[trajectory.contact_point]);
+        const Transform mapped_contact = compose(alignment, source_contact);
+        const float position_error = length(
+            mapped_contact.position - query.grasp_world_position);
+        const float orientation_error = query.grasp_world_rotation.has_value()
+            ? quaternion_angle(
+                mapped_contact.rotation, *query.grasp_world_rotation)
+            : 0.0F;
+        if (position_error > config.maximum_grasp_position_error_m ||
+            orientation_error >
+                config.maximum_grasp_orientation_error_radians) {
+            continue;
+        }
+        const float position_normalizer = std::max(
+            config.maximum_grasp_position_error_m, 1.0e-6F);
+        const float orientation_normalizer = std::max(
+            config.maximum_grasp_orientation_error_radians, 1.0e-6F);
+        const float dimension_normalizer = std::max(
+            config.maximum_log_dimension_error, 1.0e-6F);
+        trajectory.cost =
+            position_error / position_normalizer +
+            orientation_error / orientation_normalizer +
+            dimension_error / dimension_normalizer;
         selected.push_back(std::move(trajectory));
         if (selected.size() > config.maximum_compatible_clips) {
             throw std::length_error("compatible hand trajectory limit exceeded");
@@ -312,7 +339,7 @@ std::vector<HandTrajectory> select_hand_trajectories(
     return selected;
 }
 
-Transform hand_trajectory_world_mapping(
+Transform hand_trajectory_scene_alignment(
     const HandTrajectory& trajectory,
     const HandTrajectoryQuery& query) {
     validate_query_and_config(query, HandTrajectoryConfig{});
@@ -320,33 +347,13 @@ Transform hand_trajectory_world_mapping(
     const Transform target_object{
         query.object_world.position,
         quat_normalize(query.object_world.rotation)};
-    const Transform source_world_to_target_object = compose(
-        target_object,
-        inverse(Transform{
-            trajectory.source_object.position,
-            quat_normalize(trajectory.source_object.rotation)}));
-    const Transform source_contact = compose(
-        trajectory.source_object,
-        trajectory.hands_in_source_object[trajectory.contact_point]);
-    const Transform mapped_contact = compose(
-        source_world_to_target_object, source_contact);
-    Transform residual{};
-    if (query.grasp_world_rotation.has_value()) {
-        const Transform requested{
-            query.grasp_world_position,
-            quat_normalize(*query.grasp_world_rotation)};
-        residual = compose(requested, inverse(mapped_contact));
-    } else {
-        residual.position = query.grasp_world_position - mapped_contact.position;
-        residual.rotation = quat();
-    }
-    return compose(residual, source_world_to_target_object);
+    return upright_scene_alignment(trajectory.source_object, target_object);
 }
 
 MappedHandTrajectory map_hand_trajectory(
     const HandTrajectory& trajectory,
     const HandTrajectoryQuery& query) {
-    const Transform mapping = hand_trajectory_world_mapping(trajectory, query);
+    const Transform mapping = hand_trajectory_scene_alignment(trajectory, query);
     MappedHandTrajectory mapped{};
     mapped.hands.reserve(trajectory.hands_in_source_object.size());
     mapped.elbows.reserve(trajectory.elbows_in_source_object.size());

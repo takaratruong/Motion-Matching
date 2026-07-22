@@ -19,8 +19,8 @@ struct HandTrajectoryQuery {
 };
 
 struct HandTrajectoryConfig {
-    float maximum_grasp_position_error_m = 0.20F;
-    float maximum_grasp_orientation_error_radians = 0.785398163F;
+    float maximum_grasp_position_error_m = 0.12F;
+    float maximum_grasp_orientation_error_radians = 0.436332313F;
     float maximum_log_dimension_error = 0.75F;
     size_t maximum_compatible_clips = 4096U;
 };
@@ -81,7 +81,7 @@ MappedHandTrajectory map_hand_trajectory(
     const HandTrajectory& trajectory,
     const HandTrajectoryQuery& query);
 
-Transform hand_trajectory_world_mapping(
+Transform hand_trajectory_scene_alignment(
     const HandTrajectory& trajectory,
     const HandTrajectoryQuery& query);
 
