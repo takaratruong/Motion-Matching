@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
@@ -639,6 +640,44 @@ def _write_responsive_evidence(
     return evidence
 
 
+def _write_episode_restart_outcome(
+    bundle: object,
+    *,
+    episode_ordinal: int,
+    generated_chunks: int,
+    snapshot: Mapping[str, object],
+) -> dict[str, object]:
+    if type(episode_ordinal) is not int or episode_ordinal <= 0:
+        raise ContractError("episode ordinal must be a positive integer")
+    if type(generated_chunks) is not int or generated_chunks < 0:
+        raise ContractError("generated chunks must be a nonnegative integer")
+    if type(snapshot) is not dict or "sim_time_s" not in snapshot:
+        raise ContractError("restart snapshot must contain sim_time_s")
+    sim_time_s = snapshot["sim_time_s"]
+    if (
+        type(sim_time_s) not in (int, float)
+        or not math.isfinite(float(sim_time_s))
+        or float(sim_time_s) < 0.0
+    ):
+        raise ContractError(
+            "restart snapshot sim_time_s must be finite and nonnegative"
+        )
+    record = {
+        "schema": "mm-sonic-episode-outcome/v1",
+        "episode_ordinal": episode_ordinal,
+        "outcome": "operator_restart",
+        "trigger_key": "BACKSPACE",
+        "generated_chunks": generated_chunks,
+        "committed_chunks": generated_chunks,
+        "sim_time_s": float(sim_time_s),
+    }
+    bundle.write_text(
+        "episode-outcome.json",
+        json.dumps(record, sort_keys=True, indent=2) + "\n",
+    )
+    return record
+
+
 def _run_responsive_x11_loop(
     *,
     control_loop: object,
@@ -702,7 +741,11 @@ def _run_responsive_x11_loop(
     return camera_box[0]
 
 
-def run_demo(namespace: argparse.Namespace) -> Path:
+def run_demo(
+    namespace: argparse.Namespace, *, episode_ordinal: int = 1
+) -> Path:
+    if type(episode_ordinal) is not int or episode_ordinal <= 0:
+        raise ContractError("episode ordinal must be a positive integer")
     responsive = bool(getattr(namespace, "responsive", False))
     if responsive and (
         namespace.mode != "interactive" or namespace.input_source != "x11"
@@ -798,6 +841,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
 
     gate: SimulationPolicyGate | None = None
     timeline: TargetTimeline | None = None
+    committer: ManualChunkCommitter | None = None
     session_id = f"manual-{os.getpid()}"
     next_chunk = 0
     responsive_traces: list[object] = []
@@ -1211,6 +1255,17 @@ def run_demo(namespace: argparse.Namespace) -> Path:
         if responsive_evidence is not None:
             print(json.dumps(responsive_evidence, sort_keys=True), flush=True)
         return bundle.path
+    except OperatorRestartRequested:
+        generated_chunks = (
+            committer.next_chunk if committer is not None else next_chunk
+        )
+        _write_episode_restart_outcome(
+            bundle,
+            episode_ordinal=episode_ordinal,
+            generated_chunks=generated_chunks,
+            snapshot=simulator.snapshot(),
+        )
+        raise
     finally:
         cancellation.set()
         if gate is not None:
@@ -1305,8 +1360,19 @@ def main(argv: list[str] | None = None) -> int:
     namespace = _parser().parse_args(argv)
     if namespace.chunks <= 0:
         raise SystemExit("--chunks must be positive")
-    run_demo(namespace)
-    return 0
+    episode_ordinal = 1
+    while True:
+        try:
+            run_demo(namespace, episode_ordinal=episode_ordinal)
+        except OperatorRestartRequested:
+            print(
+                f"RESTART BACKSPACE: episode {episode_ordinal} -> "
+                f"{episode_ordinal + 1}",
+                flush=True,
+            )
+            episode_ordinal += 1
+            continue
+        return 0
 
 
 if __name__ == "__main__":

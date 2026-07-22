@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from io import StringIO
 import json
 import math
@@ -8,7 +8,9 @@ import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
+from mm_sonic import manual_demo
 from mm_sonic.commands import CommandSample
 from mm_sonic.hands import NEUTRAL_HAND_TARGETS, hand_targets_record
 from mm_sonic.holden_control import (
@@ -1380,6 +1382,428 @@ class _FakeBundle:
         target.write_text(text, encoding="utf-8")
         self.written[str(relative)] = text
         return target
+
+
+class WriteEpisodeRestartOutcomeTests(unittest.TestCase):
+    def test_restart_outcome_is_exact_and_episode_local(self) -> None:
+        with TemporaryDirectory() as tmp:
+            bundle = _FakeBundle(Path(tmp))
+            record = manual_demo._write_episode_restart_outcome(
+                bundle,
+                episode_ordinal=2,
+                generated_chunks=13,
+                snapshot={
+                    "steps": 80,
+                    "sim_time_s": 0.4,
+                    "state_rows": 20,
+                    "contact_rows": 80,
+                },
+            )
+            self.assertEqual(
+                record,
+                {
+                    "schema": "mm-sonic-episode-outcome/v1",
+                    "episode_ordinal": 2,
+                    "outcome": "operator_restart",
+                    "trigger_key": "BACKSPACE",
+                    "generated_chunks": 13,
+                    "committed_chunks": 13,
+                    "sim_time_s": 0.4,
+                },
+            )
+            self.assertIn("episode-outcome.json", bundle.written)
+
+    def test_rejects_boolean_or_nonpositive_episode_ordinal(self) -> None:
+        for ordinal in (True, 0, -1):
+            with self.subTest(ordinal=ordinal):
+                with self.assertRaisesRegex(ContractError, "episode ordinal"):
+                    manual_demo._write_episode_restart_outcome(
+                        _FakeBundle(Path("/unused")),
+                        episode_ordinal=ordinal,
+                        generated_chunks=0,
+                        snapshot={"sim_time_s": 0.0},
+                    )
+
+    def test_rejects_boolean_or_negative_generated_chunks(self) -> None:
+        for generated_chunks in (True, -1):
+            with self.subTest(generated_chunks=generated_chunks):
+                with self.assertRaisesRegex(ContractError, "generated chunks"):
+                    manual_demo._write_episode_restart_outcome(
+                        _FakeBundle(Path("/unused")),
+                        episode_ordinal=1,
+                        generated_chunks=generated_chunks,
+                        snapshot={"sim_time_s": 0.0},
+                    )
+
+    def test_rejects_snapshot_without_sim_time(self) -> None:
+        for snapshot in ({}, {"steps": 80}):
+            with self.subTest(snapshot=snapshot):
+                with self.assertRaisesRegex(ContractError, "sim_time_s"):
+                    manual_demo._write_episode_restart_outcome(
+                        _FakeBundle(Path("/unused")),
+                        episode_ordinal=1,
+                        generated_chunks=0,
+                        snapshot=snapshot,
+                    )
+
+    def test_rejects_boolean_nonfinite_or_negative_sim_time(self) -> None:
+        for sim_time_s in (True, math.nan, math.inf, -math.inf, -0.1):
+            with self.subTest(sim_time_s=sim_time_s):
+                with self.assertRaisesRegex(ContractError, "sim_time_s"):
+                    manual_demo._write_episode_restart_outcome(
+                        _FakeBundle(Path("/unused")),
+                        episode_ordinal=1,
+                        generated_chunks=0,
+                        snapshot={"sim_time_s": sim_time_s},
+                    )
+
+
+class EpisodeSupervisorTests(unittest.TestCase):
+    def test_main_relaunches_exactly_after_operator_restart(self) -> None:
+        calls = []
+
+        def fake_run(namespace, *, episode_ordinal):
+            calls.append((namespace, episode_ordinal))
+            if episode_ordinal == 1:
+                raise OperatorRestartRequested
+            return Path("/fresh")
+
+        with patch.object(manual_demo, "run_demo", side_effect=fake_run):
+            self.assertEqual(main(["--chunks", "1"]), 0)
+        self.assertEqual([ordinal for _, ordinal in calls], [1, 2])
+        self.assertIs(calls[0][0], calls[1][0])
+
+    def test_main_does_not_retry_contract_failure(self) -> None:
+        with patch.object(
+            manual_demo,
+            "run_demo",
+            side_effect=ContractError("contract failed"),
+        ) as run:
+            with self.assertRaisesRegex(ContractError, "contract failed"):
+                main(["--chunks", "1"])
+        run.assert_called_once()
+
+    def test_main_does_not_retry_process_failure(self) -> None:
+        with patch.object(
+            manual_demo,
+            "run_demo",
+            side_effect=ProcessError("gear failed"),
+        ) as run:
+            with self.assertRaisesRegex(ProcessError, "gear failed"):
+                main(["--chunks", "1"])
+        run.assert_called_once()
+
+    def test_main_runs_one_episode_without_restart(self) -> None:
+        with patch.object(
+            manual_demo,
+            "run_demo",
+            return_value=Path("/complete"),
+        ) as run:
+            self.assertEqual(main(["--chunks", "1"]), 0)
+        run.assert_called_once()
+        self.assertEqual(run.call_args.kwargs["episode_ordinal"], 1)
+
+    def _run_interrupted_episode(self, *, responsive: bool) -> tuple[list[str], dict]:
+        import numpy as np
+
+        close_log: list[str] = []
+
+        class _ClosingBundle(_FakeBundle):
+            def write_text(self, relative, text):
+                if relative == "episode-outcome.json":
+                    close_log.append("evidence")
+                return super().write_text(relative, text)
+
+        class _Publisher:
+            endpoint = "tcp://127.0.0.1:5555"
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def send(self, *_args, **_kwargs):
+                pass
+
+            def close(self):
+                close_log.append("publisher")
+
+        class _MM:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def hello(self):
+                return {
+                    "coordinate_signature": "holden",
+                    "supported_movement_models": ["raw"],
+                }
+
+            def reset(self, *_args, **_kwargs):
+                return {
+                    "scene": {"scene_id": "scene", "route_id": "route"},
+                    "movement_model": {"profile": "raw"},
+                }
+
+            def generate(self, *_args, **_kwargs):
+                return object()
+
+            def commit(self, *_args, **_kwargs):
+                pass
+
+            def abort(self, *_args, **_kwargs):
+                pass
+
+            def close(self):
+                close_log.append("mm")
+
+        class _Gear:
+            startup_markers_ready = True
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def publication_boundary(self):
+                return None
+
+            def start_to_wait_for_control(self):
+                pass
+
+            def enable_stream_for_preload(self):
+                pass
+
+            def stop_group(self):
+                pass
+
+            def close(self):
+                close_log.append("gear")
+
+        class _Simulator:
+            sim_dt = 0.005
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def hello(self):
+                return {"protocol": "gated-sim/v1"}
+
+            def reset(self, **_kwargs):
+                return {"sim_time_s": 0.0}
+
+            def snapshot(self):
+                return {"sim_time_s": 0.4, "steps": 80}
+
+            def close(self):
+                close_log.append("simulator")
+
+        class _Gate:
+            def __init__(self, gear, simulator):
+                self._gear = gear
+                self._simulator = simulator
+
+            def close(self):
+                close_log.append("gate")
+                self._simulator.close()
+                self._gear.close()
+
+        class _Validator:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def validate_initial(self, _reset):
+                return type(
+                    "Initial",
+                    (),
+                    {
+                        "virtual_root_orientation_holden": np.array(
+                            [1.0, 0.0, 0.0, 0.0]
+                        )
+                    },
+                )()
+
+            def validate_source(self, raw):
+                return raw
+
+        class _Timeline:
+            last_accepted_candidate_id = None
+            initial_buffer = type("Buffer", (), {"count": 1, "frame_index": [0]})()
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def prepare(self, _raw):
+                buffer = type("Buffer", (), {"count": 1, "frame_index": [1]})()
+                target = type("Target", (), {"buffer": buffer})()
+                return type("Prepared", (), {"target": target})()
+
+            def commit(self, _prepared):
+                pass
+
+            def abort(self, _candidate):
+                pass
+
+        class _Provider:
+            target_bound = True
+
+            def close(self):
+                close_log.append("provider")
+
+        class _ControlLoop:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+        class _Committer:
+            def __init__(self, *_args, **_kwargs):
+                self.next_chunk = 7
+
+        with TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            paths = {
+                name: root / name
+                for name in ("source", "gear", "runtime", "terrain")
+            }
+            for path in paths.values():
+                path.mkdir()
+            mm_server = root / "mm_chunk_server"
+            mm_server.write_text("#!/bin/sh\n", encoding="utf-8")
+            bundle = _ClosingBundle(root / "run")
+            bundle.path.mkdir()
+            created_episode_ordinals: list[int] = []
+            namespace = manual_demo._parser().parse_args(
+                [
+                    "--mode",
+                    "interactive",
+                    "--input-source",
+                    "x11",
+                    "--chunks",
+                    "1",
+                    "--preload-chunks",
+                    "1",
+                    "--output-root",
+                    str(root / "runs"),
+                    "--source-run",
+                    str(paths["source"]),
+                    "--gear-checkout",
+                    str(paths["gear"]),
+                    "--runtime",
+                    str(paths["runtime"]),
+                    "--terrain-dir",
+                    str(paths["terrain"]),
+                    "--mm-server",
+                    str(mm_server),
+                    *(["--responsive"] if responsive else []),
+                ]
+            )
+            gear = _Gear()
+            simulator = _Simulator()
+
+            def create_bundle(*_args, **_kwargs):
+                created_episode_ordinals.append(1)
+                return bundle
+
+            def activate(_gear, _simulator, *, before_control=None):
+                if before_control is not None:
+                    before_control()
+                return _Gate(gear, simulator)
+
+            def interrupt(*_args, **_kwargs):
+                raise OperatorRestartRequested
+
+            patchers = (
+                patch.object(
+                    manual_demo.RunBundle,
+                    "create",
+                    side_effect=create_bundle,
+                ),
+                patch.object(manual_demo, "load_joint_contract", return_value=object()),
+                patch.object(manual_demo, "SourceValidator", _Validator),
+                patch.object(manual_demo, "PosePublisher", _Publisher),
+                patch.object(manual_demo, "MMChunkClient", lambda *_a, **_k: _MM()),
+                patch.object(manual_demo, "GearProcess", lambda *_a, **_k: gear),
+                patch.object(
+                    manual_demo,
+                    "GatedSimulatorClient",
+                    lambda *_a, **_k: simulator,
+                ),
+                patch.object(
+                    manual_demo,
+                    "register_scene",
+                    return_value=type(
+                        "Scene", (), {"gear_scene_xml": root / "scene.xml"}
+                    )(),
+                ),
+                patch.object(
+                    manual_demo,
+                    "initial_physics_state",
+                    return_value=type(
+                        "State",
+                        (),
+                        {
+                            "qpos": np.array(
+                                [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+                            )
+                        },
+                    )(),
+                ),
+                patch.object(manual_demo, "TargetTimeline", _Timeline),
+                patch.object(
+                    manual_demo,
+                    "_drive_simulator_until",
+                    side_effect=lambda action, *_a, **_k: action(),
+                ),
+                patch.object(manual_demo, "_reset_and_prime_scored_epoch"),
+                patch.object(manual_demo, "X11KeyStateProvider", _Provider),
+                patch.object(
+                    manual_demo,
+                    "HoldenControlMapper",
+                    lambda *_a, **_k: object(),
+                ),
+                patch.object(manual_demo, "ContinuousControlLoop", _ControlLoop),
+                patch.object(manual_demo, "_wait_for_x11_target"),
+                patch.object(
+                    manual_demo,
+                    "_activate_scored_control",
+                    side_effect=activate,
+                ),
+                patch.object(
+                    manual_demo,
+                    "_consume_x11_boundary",
+                    side_effect=interrupt,
+                ),
+                patch.object(manual_demo, "ManualChunkCommitter", _Committer),
+                patch.object(
+                    manual_demo,
+                    "_run_responsive_x11_loop",
+                    side_effect=interrupt,
+                ),
+            )
+            with ExitStack() as stack:
+                for patcher in patchers:
+                    stack.enter_context(patcher)
+                with self.assertRaises(OperatorRestartRequested):
+                    manual_demo.run_demo(namespace, episode_ordinal=1)
+
+            self.assertEqual(created_episode_ordinals, [1])
+            record = json.loads(bundle.written["episode-outcome.json"])
+        return close_log, record
+
+    def test_interrupted_episode_records_then_closes_every_resource(self) -> None:
+        close_log, record = self._run_interrupted_episode(responsive=False)
+        self.assertIn("provider", close_log)
+        self.assertIn("publisher", close_log)
+        self.assertIn("mm", close_log)
+        self.assertIn("gear", close_log)
+        self.assertTrue("gate" in close_log or "simulator" in close_log)
+        self.assertLess(close_log.index("evidence"), close_log.index("gate"))
+        self.assertEqual(record["generated_chunks"], 1)
+
+    def test_responsive_interruption_uses_committer_next_chunk(self) -> None:
+        _close_log, record = self._run_interrupted_episode(responsive=True)
+        self.assertEqual(record["generated_chunks"], 7)
+        self.assertEqual(record["committed_chunks"], 7)
 
 
 class WriteResponsiveEvidenceTests(unittest.TestCase):
