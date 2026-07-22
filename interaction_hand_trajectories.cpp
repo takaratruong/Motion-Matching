@@ -304,10 +304,7 @@ Transform hand_transform(const WorldPose& world, Hand hand) {
 void validate_query_and_config(
     const HandTrajectoryQuery& query,
     const HandTrajectoryConfig& config) {
-    if (!finite(query.object_world.position) ||
-        !valid_rotation(query.object_world.rotation) ||
-        !positive(query.object_dimensions) ||
-        !finite(query.grasp_world_position) ||
+    if (!finite(query.grasp_world_position) ||
         !valid_rotation(query.grasp_world_rotation) ||
         !finite(config.maximum_grasp_position_error_m) ||
         config.maximum_grasp_position_error_m < 0.0F ||
@@ -478,8 +475,15 @@ ShapedHandTrajectory shape_hand_trajectory(
         }
 
         Pose pose = std::move(aligned[sample]);
+        IKConfig solve_config = config;
+        if (!query.constrain_grasp_orientation) {
+            constexpr float pi = 3.141592654F;
+            solve_config.maximum_request_orientation_radians = pi;
+            solve_config.accepted_orientation_radians = pi;
+            solve_config.orientation_scale_m_per_radian = 0.0F;
+        }
         const IKResult result = solve_hand_ik(
-            pose, query.hand, target, config);
+            pose, query.hand, target, solve_config);
         const WorldPose world = world_pose(pose);
         shaped.path.hands.push_back(hand_transform(world, query.hand));
         shaped.path.elbows.push_back(

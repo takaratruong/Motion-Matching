@@ -174,7 +174,7 @@ bool valid_config(const IKConfig& config) {
            config.accepted_orientation_radians >= 0.0F &&
            config.damping > 0.0F &&
            config.finite_difference_radians > 0.0F &&
-           config.orientation_scale_m_per_radian > 0.0F &&
+           config.orientation_scale_m_per_radian >= 0.0F &&
            config.maximum_step_radians > 0.0F &&
            config.maximum_iterations >= 0;
 }

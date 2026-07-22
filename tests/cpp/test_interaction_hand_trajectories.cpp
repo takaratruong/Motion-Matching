@@ -175,9 +175,8 @@ void test_search_is_anchored_to_grasp_not_object_metadata() {
     });
     interaction::HandTrajectoryQuery query{};
     query.object_world = {
-        vec3(9.0F, 4.0F, -7.0F),
-        quat_from_angle_axis(-0.6F, vec3(1.0F, 0.0F, 0.0F))};
-    query.object_dimensions = vec3(0.02F, 8.0F, 0.50F);
+        vec3(9.0F, 4.0F, -7.0F), quat(0.0F, 0.0F, 0.0F, 0.0F)};
+    query.object_dimensions = vec3();
     query.hand = interaction::Hand::Right;
     query.grasp_world_position = vec3(0.10F, 0.20F, 0.30F);
     query.grasp_world_rotation = quat();
@@ -188,6 +187,36 @@ void test_search_is_anchored_to_grasp_not_object_metadata() {
             "object metadata changed grasp-based search membership");
     require(selected[0].cost == selected[1].cost,
             "object metadata changed grasp-based search ranking");
+}
+
+void test_position_only_shaping_ignores_orientation_acceptance() {
+    const interaction::Database database = make_database({
+        {interaction::Hand::Right, vec3(0.10F, 0.20F, 0.30F), quat()},
+    });
+    interaction::HandTrajectoryQuery query{};
+    query.object_world = {vec3(), quat()};
+    query.object_dimensions = vec3(1.0F, 1.0F, 1.0F);
+    query.hand = interaction::Hand::Right;
+    query.grasp_world_position = vec3(0.10F, 0.25F, 0.30F);
+    query.grasp_world_rotation =
+        quat_from_angle_axis(1.2F, vec3(1.0F, 0.0F, 0.0F));
+    query.constrain_grasp_orientation = false;
+    const auto selected = interaction::select_hand_trajectories(database, query);
+    require(selected.size() == 1U,
+            "position-only shaping candidate was not selected");
+    interaction::IKConfig config{};
+    config.accepted_orientation_radians = 0.0F;
+
+    const interaction::ShapedHandTrajectory shaped =
+        interaction::shape_hand_trajectory(
+            database, selected[0], query, config);
+
+    require(shaped.contact_accepted,
+            "position-only IK was rejected by orientation acceptance");
+    require(length(
+                shaped.path.hands[selected[0].contact_point].position -
+                query.grasp_world_position) <= config.accepted_position_m,
+            "position-only IK did not converge in position");
 }
 
 void test_object_roll_researches_recorded_world_grasp_orientation() {
@@ -670,6 +699,7 @@ int main() {
     test_raw_mapping_uses_upright_scene_alignment_without_grasp_residual();
     test_position_only_mapping_preserves_object_mapped_contact_rotation();
     test_shape_converges_contact_without_moving_root_or_legs();
+    test_position_only_shaping_ignores_orientation_acceptance();
     test_shape_rejects_contact_correction_above_solver_envelope();
     test_collision_feasibility_is_phase_aware();
     test_forearm_capsule_and_contact_still_collide_with_shelf();
