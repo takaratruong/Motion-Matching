@@ -381,6 +381,77 @@ void test_exact_search_still_rejects_large_wrist_twist() {
             "exact search did not label exact matches");
 }
 
+void test_axis_shaping_accepts_wrist_twist() {
+    ClipSpec twist{};
+    twist.grasp_position = vec3(0.10F, 0.20F, 0.30F);
+    twist.grasp_rotation = quat_from_angle_axis(
+        1.570796327F, vec3(1.0F, 0.0F, 0.0F));
+    const interaction::Database database = make_database({twist});
+    interaction::HandTrajectoryQuery query = identity_query();
+    query.orientation_mode =
+        interaction::GraspOrientationMode::ApproachAxis;
+    query.approach_world_direction = vec3(1.0F, 0.0F, 0.0F);
+    const auto selected = interaction::select_hand_trajectories(
+        database, query);
+
+    const auto shaped = interaction::shape_hand_trajectory(
+        database, selected.front(), query);
+
+    require(shaped.contact_accepted,
+            "axis shaping still required exact wrist twist");
+}
+
+void test_axis_shaping_enforces_stricter_final_axis_limit() {
+    constexpr float twenty_degrees = 0.349065850F;
+    ClipSpec angled{};
+    angled.grasp_position = vec3(0.10F, 0.20F, 0.30F);
+    angled.approach_direction = vec3(
+        std::cos(twenty_degrees), 0.0F, std::sin(twenty_degrees));
+    const interaction::Database database = make_database({angled});
+    interaction::HandTrajectoryQuery query = identity_query();
+    query.orientation_mode =
+        interaction::GraspOrientationMode::ApproachAxis;
+    query.approach_world_direction = vec3(1.0F, 0.0F, 0.0F);
+    const auto selected = interaction::select_hand_trajectories(
+        database, query);
+    require(selected.size() == 1U,
+            "20 degree axis error did not pass the 25 degree search gate");
+
+    const auto shaped = interaction::shape_hand_trajectory(
+        database, selected.front(), query);
+
+    require(!shaped.contact_accepted,
+            "20 degree axis error passed the 15 degree final gate");
+    require(shaped.reason == interaction::Reason::CorrectionLimit,
+            "final axis rejection reported the wrong reason");
+}
+
+void test_front_side_filter_rejects_only_rear_half_plane() {
+    const interaction::Database database = make_database({
+        {interaction::Hand::Right, vec3(0.10F, 0.20F, 0.30F), quat()},
+    });
+    const interaction::HandTrajectoryQuery query = identity_query();
+    const auto selected = interaction::select_hand_trajectories(
+        database, query);
+    interaction::HandTrajectory front = selected.front();
+    front.start_root_in_source_object = vec3(0.10F, 0.0F, -0.70F);
+    interaction::HandTrajectory side = front;
+    side.start_root_in_source_object = vec3(1.10F, 0.0F, 0.30F);
+    interaction::HandTrajectory rear = front;
+    rear.start_root_in_source_object = vec3(0.10F, 0.0F, 1.30F);
+    const vec3 scene_front(0.0F, 0.0F, -1.0F);
+
+    require(interaction::starts_on_allowed_side(
+                front, query, scene_front),
+            "front start rejected");
+    require(interaction::starts_on_allowed_side(
+                side, query, scene_front),
+            "side start rejected");
+    require(!interaction::starts_on_allowed_side(
+                rear, query, scene_front),
+            "rear start accepted");
+}
+
 void clear_compact_skipped_vectors(interaction::Database& database) {
     database.velocities.clear();
     database.angular_velocities.clear();
@@ -952,6 +1023,9 @@ int main() {
     test_world_grasp_limits_and_position_only_orientation();
     test_approach_axis_search_ignores_twist_and_rejects_wrong_axis();
     test_exact_search_still_rejects_large_wrist_twist();
+    test_axis_shaping_accepts_wrist_twist();
+    test_axis_shaping_enforces_stricter_final_axis_limit();
+    test_front_side_filter_rejects_only_rear_half_plane();
     test_selects_every_close_complete_same_hand_clip_in_stable_order();
     test_support_kind_is_diagnostic_for_mixed_height_selection();
     test_ground_trajectory_spans_full_approach_through_contiguous_lift();

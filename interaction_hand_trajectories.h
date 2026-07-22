@@ -55,6 +55,7 @@ struct HandTrajectory {
     TrajectoryMatchTier match_tier = TrajectoryMatchTier::Exact;
     SupportKind support = SupportKind::Table;
     Transform source_object{};
+    vec3 start_root_in_source_object{};
     vec3 source_approach_direction_object{1.0F, 0.0F, 0.0F};
     std::vector<Transform> hands_in_source_object;
     std::vector<vec3> elbows_in_source_object;
@@ -119,6 +120,12 @@ MappedHandTrajectory map_hand_trajectory(
 Transform hand_trajectory_scene_alignment(
     const HandTrajectory& trajectory,
     const HandTrajectoryQuery& query);
+
+bool starts_on_allowed_side(
+    const HandTrajectory& trajectory,
+    const HandTrajectoryQuery& query,
+    vec3 scene_front,
+    float minimum_dot = 0.0F);
 
 ShapedHandTrajectory shape_hand_trajectory(
     const Database& database,

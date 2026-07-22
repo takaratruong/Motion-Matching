@@ -435,6 +435,7 @@ void validate_trajectory(const HandTrajectory& trajectory) {
         trajectory.contact_point >= trajectory.hands_in_source_object.size() ||
         trajectory.reach_point >= trajectory.contact_point ||
         !finite(trajectory.source_object.position) ||
+        !finite(trajectory.start_root_in_source_object) ||
         !valid_rotation(trajectory.source_object.rotation)) {
         throw std::invalid_argument("invalid hand trajectory");
     }
@@ -511,6 +512,15 @@ std::vector<HandTrajectory> select_hand_trajectories(
         trajectory.source_object = source_object;
         trajectory.source_approach_direction_object = source_approach;
         const Transform source_from_world = inverse(trajectory.source_object);
+        const WorldPose start_world = world_pose(
+            trajectory_pose_at_frame(database, trajectory.start_frame));
+        trajectory.start_root_in_source_object = compose(
+            source_from_world,
+            Transform{
+                start_world.positions[static_cast<size_t>(
+                    g1_skeleton::Simulation)],
+                quat(),
+            }).position;
         for (int32_t frame = trajectory.start_frame;
              frame <= phases.last_lift;
              ++frame) {
@@ -553,6 +563,34 @@ Transform hand_trajectory_scene_alignment(
         trajectory.source_object,
         trajectory.hands_in_source_object[trajectory.contact_point]);
     return upright_grasp_alignment(source_contact, query);
+}
+
+bool starts_on_allowed_side(
+    const HandTrajectory& trajectory,
+    const HandTrajectoryQuery& query,
+    vec3 scene_front,
+    float minimum_dot) {
+    validate_query_and_config(query, HandTrajectoryConfig{});
+    validate_trajectory(trajectory);
+    const float front_length = length(scene_front);
+    if (!finite(scene_front) || std::abs(scene_front.y) > 2.0e-5F ||
+        !(front_length > 1.0e-6F) || !finite(minimum_dot) ||
+        minimum_dot < -1.0F || minimum_dot > 1.0F) {
+        throw std::invalid_argument("invalid trajectory approach side query");
+    }
+    const Transform alignment = hand_trajectory_scene_alignment(
+        trajectory, query);
+    const vec3 mapped_root = compose(
+        alignment,
+        compose(
+            trajectory.source_object,
+            Transform{trajectory.start_root_in_source_object, quat()}))
+                                 .position;
+    vec3 target_to_root = mapped_root - query.grasp_world_position;
+    target_to_root.y = 0.0F;
+    if (length(target_to_root) <= 1.0e-6F) return true;
+    return dot(normalize(target_to_root), normalize(scene_front)) >=
+        minimum_dot;
 }
 
 ShapedHandTrajectory shape_hand_trajectory(
@@ -600,6 +638,15 @@ ShapedHandTrajectory shape_hand_trajectory(
         query.grasp_world_position - base_contact.position;
     const bool exact_orientation =
         query.orientation_mode == GraspOrientationMode::ExactPose;
+    const bool axis_orientation =
+        query.orientation_mode == GraspOrientationMode::ApproachAxis;
+    const vec3 mapped_candidate_axis = normalize(quat_mul_vec3(
+        alignment.rotation,
+        quat_mul_vec3(
+            trajectory.source_object.rotation,
+            trajectory.source_approach_direction_object)));
+    const vec3 axis_in_hand = quat_mul_vec3(
+        quat_inv(base_contact.rotation), mapped_candidate_axis);
     const quat contact_rotation = exact_orientation
         ? quat_normalize(quat_mul(
               query.grasp_world_rotation,
@@ -649,6 +696,17 @@ ShapedHandTrajectory shape_hand_trajectory(
         if (sample == trajectory.contact_point) {
             shaped.contact_accepted = result.accepted;
             shaped.reason = result.reason;
+            if (axis_orientation && result.accepted) {
+                const Transform solved_hand = hand_transform(world, query.hand);
+                const vec3 solved_axis = quat_mul_vec3(
+                    solved_hand.rotation, axis_in_hand);
+                if (direction_angle(
+                        solved_axis, query.approach_world_direction) >
+                    config.accepted_orientation_radians) {
+                    shaped.contact_accepted = false;
+                    shaped.reason = Reason::CorrectionLimit;
+                }
+            }
         }
     }
     return shaped;
