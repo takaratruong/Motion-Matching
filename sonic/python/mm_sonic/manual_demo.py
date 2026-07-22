@@ -39,7 +39,11 @@ from .manual_evidence import (
     manual_summary_v7_bytes,
 )
 from .operator import OperatorLimits, OperatorSampler
-from .operator_x11 import ContinuousControlLoop, X11KeyStateProvider
+from .operator_x11 import (
+    ContinuousControlLoop,
+    OperatorRestartRequested,
+    X11KeyStateProvider,
+)
 from .responsive_scheduler import ResponsiveScheduler
 from .responsive_wiring import (
     ManualChunkCommitter,
@@ -135,10 +139,6 @@ def _print_terminal_event(event: str) -> None:
     print(event, flush=True)
 
 
-class OperatorRestartRequested(Exception):
-    """Normal operator request to replace the complete live episode."""
-
-
 def _raise_if_restart_requested(
     restart_event: threading.Event,
     cancellation_event: threading.Event | None = None,
@@ -147,6 +147,50 @@ def _raise_if_restart_requested(
         cancellation_event is None or not cancellation_event.is_set()
     ):
         raise OperatorRestartRequested
+
+
+def _close_resiliently(
+    closers: object, *, primary: BaseException | None = None
+) -> None:
+    """Close every resource exactly once, continuing past any close failure.
+
+    Attempts all closes even when earlier ones raise so no owned resource is
+    leaked. When unwinding an existing ``primary`` failure (e.g. a partial
+    construction), close failures are swallowed so the primary is surfaced
+    unmasked. Otherwise a single close failure re-raises unchanged and multiple
+    failures raise one clearly aggregated ``ContractError`` (fail closed).
+    """
+
+    errors: list[BaseException] = []
+    for close in closers:
+        try:
+            close()
+        except BaseException as error:  # continue closing every remaining resource
+            errors.append(error)
+    if primary is not None or not errors:
+        return
+    if len(errors) == 1:
+        raise errors[0]
+    raise ContractError(
+        "episode teardown failed to close resources: "
+        + "; ".join(repr(error) for error in errors)
+    )
+
+
+def _poll_live_boundary(
+    control_loop: object,
+    restart_event: threading.Event,
+    cancellation_event: threading.Event | None = None,
+) -> None:
+    """Enforce provider-failure > restart precedence at one live boundary.
+
+    A terminal sampler failure must beat a pending Backspace restart: poll
+    ``raise_if_failed`` first so a provider ``ContractError`` propagates and no
+    relaunch is attempted, then honor an armed restart request.
+    """
+
+    control_loop.raise_if_failed()
+    _raise_if_restart_requested(restart_event, cancellation_event)
 
 
 def _validated_preload_chunks(value: object) -> int:
@@ -547,7 +591,7 @@ def _consume_x11_boundary(
 ) -> X11BoundaryResult:
     """Atomically forward one mapped control boundary and synchronized camera."""
 
-    _raise_if_restart_requested(restart_event, cancellation_event)
+    _poll_live_boundary(control_loop, restart_event, cancellation_event)
     command, mapped = control_loop.mailbox.sample(chunk_index)
     if command is None:
         return X11BoundaryResult(None, mapped, camera_state, None)
@@ -703,7 +747,7 @@ def _run_responsive_x11_loop(
     never alters command execution.
     """
 
-    _raise_if_restart_requested(restart_event, cancellation_event)
+    _poll_live_boundary(control_loop, restart_event, cancellation_event)
     camera_box: list[CameraDeliveryState] = [camera_state]
 
     def on_sample(_snapshot: object, mapped: object) -> None:
@@ -721,7 +765,7 @@ def _run_responsive_x11_loop(
     )
     pending_prefix: object | None = None
     for _consumed_chunk in range(chunks):
-        _raise_if_restart_requested(restart_event, cancellation_event)
+        _poll_live_boundary(control_loop, restart_event, cancellation_event)
         prefix = scheduler.run_one_prefix(committer.next_chunk)
         if prefix is None:
             # Terminate (X): no generation, publication, or physics release.
@@ -775,70 +819,87 @@ def run_demo(
 
     contract = load_joint_contract(_SONIC_ROOT / "configs/g1_joint_contract.json")
     validator = SourceValidator(contract)
-    publisher = PosePublisher(
-        "tcp://127.0.0.1:*",
-        bundle=bundle,
-        default_hand_targets=NEUTRAL_HAND_TARGETS,
-    )
-    mm_server = Path(namespace.mm_server).expanduser().resolve(strict=True)
-    mm = MMChunkClient(
-        run_root=bundle.path,
-        command=(str(mm_server),),
-        stdout_archive=bundle.path / "mm.stdout",
-        stderr_archive=bundle.path / "mm.stderr",
-        env=environment,
-        cwd=_REPOSITORY_ROOT,
-    )
-    base_command = (
-        str(
-            gear_checkout
-            / "gear_sonic_deploy/target/release/g1_deploy_onnx_ref"
-        ),
-        "lo",
-        str(runtime / "model_decoder.onnx"),
-        str(source_run / "known-good/reference-base"),
-        "--obs-config",
-        str(runtime / "observation_config.yaml"),
-        "--encoder-file",
-        str(runtime / "model_encoder.onnx"),
-    )
     cancellation = threading.Event()
     restart = threading.Event()
     restart_armed = threading.Event()
     cancelled = cancellation.is_set
-    gear = GearProcess(
-        run_root=bundle.path,
-        command=_stream_gear_command(base_command, publisher.endpoint),
-        target_motion_logfile=bundle.path / "target.csv",
-        logs_dir=bundle.path / "gear-logs",
-        stdout_archive=bundle.path / "gear.stdout",
-        stderr_archive=bundle.path / "gear.stderr",
-        launch_profile="zmq_stream",
-        simulation_control_gate=True,
-        readiness_timeout_s=120.0,
-        cancelled=cancelled,
-        env=environment,
-        cwd=gear_checkout / "gear_sonic_deploy",
-    )
-    simulator = GatedSimulatorClient(
-        run_root=bundle.path,
-        gear_checkout=gear_checkout,
-        # A rolling operator loop resumes GEAR immediately before each chunk.
-        # Keep MuJoCo at wall-clock pace so the policy/control threads can
-        # consume LowState and the newly appended reference before physics
-        # advances past them.  The fully preloaded evidence runner can safely
-        # use unpaced physics; this live producer cannot.
-        unpaced_physics=False,
-        onscreen=namespace.onscreen,
-        # Diagnostic-only: preserve the first fallen pose and visible terrain in
-        # manual visible runs. This is valid only when onscreen is enabled.
-        freeze_on_fall=namespace.onscreen,
-        stdout_archive=bundle.path / "simulator.stdout",
-        stderr_archive=bundle.path / "simulator.stderr",
-        cancelled=cancelled,
-        env=environment,
-        cwd=_REPOSITORY_ROOT,
-    )
+    mm_server = Path(namespace.mm_server).expanduser().resolve(strict=True)
+
+    # Construct the owned external resources incrementally so any later
+    # constructor failure closes every already-owned resource (in reverse
+    # ownership order) before propagating. Each resource is closed exactly once.
+    owned_closers: list[Callable[[], None]] = []
+    try:
+        publisher = PosePublisher(
+            "tcp://127.0.0.1:*",
+            bundle=bundle,
+            default_hand_targets=NEUTRAL_HAND_TARGETS,
+        )
+        owned_closers.insert(0, publisher.close)
+        mm = MMChunkClient(
+            run_root=bundle.path,
+            command=(str(mm_server),),
+            stdout_archive=bundle.path / "mm.stdout",
+            stderr_archive=bundle.path / "mm.stderr",
+            env=environment,
+            cwd=_REPOSITORY_ROOT,
+        )
+        owned_closers.insert(0, mm.close)
+        base_command = (
+            str(
+                gear_checkout
+                / "gear_sonic_deploy/target/release/g1_deploy_onnx_ref"
+            ),
+            "lo",
+            str(runtime / "model_decoder.onnx"),
+            str(source_run / "known-good/reference-base"),
+            "--obs-config",
+            str(runtime / "observation_config.yaml"),
+            "--encoder-file",
+            str(runtime / "model_encoder.onnx"),
+        )
+        gear = GearProcess(
+            run_root=bundle.path,
+            command=_stream_gear_command(base_command, publisher.endpoint),
+            target_motion_logfile=bundle.path / "target.csv",
+            logs_dir=bundle.path / "gear-logs",
+            stdout_archive=bundle.path / "gear.stdout",
+            stderr_archive=bundle.path / "gear.stderr",
+            launch_profile="zmq_stream",
+            simulation_control_gate=True,
+            readiness_timeout_s=120.0,
+            cancelled=cancelled,
+            env=environment,
+            cwd=gear_checkout / "gear_sonic_deploy",
+        )
+        owned_closers.insert(0, gear.close)
+        simulator = GatedSimulatorClient(
+            run_root=bundle.path,
+            gear_checkout=gear_checkout,
+            # A rolling operator loop resumes GEAR immediately before each chunk.
+            # Keep MuJoCo at wall-clock pace so the policy/control threads can
+            # consume LowState and the newly appended reference before physics
+            # advances past them.  The fully preloaded evidence runner can safely
+            # use unpaced physics; this live producer cannot.
+            unpaced_physics=False,
+            onscreen=namespace.onscreen,
+            # Diagnostic-only: preserve the first fallen pose and visible terrain
+            # in manual visible runs. This is valid only when onscreen is enabled.
+            freeze_on_fall=namespace.onscreen,
+            stdout_archive=bundle.path / "simulator.stdout",
+            stderr_archive=bundle.path / "simulator.stderr",
+            cancelled=cancelled,
+            env=environment,
+            cwd=_REPOSITORY_ROOT,
+        )
+        owned_closers.insert(0, simulator.close)
+    except BaseException as construction_error:
+        # A constructor failed: close every already-owned resource exactly once,
+        # continuing past any individual close failure, then fail closed so main
+        # never relaunches after a genuine construction failure.
+        cancellation.set()
+        _close_resiliently(owned_closers, primary=construction_error)
+        raise
 
     gate: SimulationPolicyGate | None = None
     timeline: TargetTimeline | None = None
@@ -1268,16 +1329,29 @@ def run_demo(
         )
         raise
     finally:
+        primary_error = sys.exc_info()[1]
+        # A restart is a control signal, not a failure: a teardown failure must
+        # supersede it so main cannot launch a replacement episode with leaked
+        # or incompletely reaped resources. Genuine body failures stay primary.
+        teardown_primary = (
+            None
+            if isinstance(primary_error, OperatorRestartRequested)
+            else primary_error
+        )
         cancellation.set()
+        # Close every owned resource exactly once, continuing past any close
+        # failure so no resource leaks, then surface the primary or aggregated
+        # failure (fail closed). When the gate exists it owns the simulator and
+        # gear closes; otherwise those are closed directly.
+        teardown_closers: list[Callable[[], None]] = []
         if gate is not None:
-            gate.close()
+            teardown_closers.append(gate.close)
         else:
-            try:
-                simulator.close()
-            finally:
-                gear.close()
-        publisher.close()
-        mm.close()
+            teardown_closers.append(simulator.close)
+            teardown_closers.append(gear.close)
+        teardown_closers.append(publisher.close)
+        teardown_closers.append(mm.close)
+        _close_resiliently(teardown_closers, primary=teardown_primary)
 
 
 class _NullContext:

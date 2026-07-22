@@ -15,6 +15,7 @@ from mm_sonic.holden_control import (
     NormalizedControlState,
 )
 from mm_sonic.joints import ContractError
+from mm_sonic.manual_demo import OperatorRestartRequested
 from mm_sonic.operator_x11 import (
     KEYSYMS,
     BoundaryControlMailbox,
@@ -180,6 +181,58 @@ class ContinuousControlLoopTests(unittest.TestCase):
                 self.assertFalse(loop.wait_for_sequence(1, timeout_s=1.0))
                 loop.raise_if_failed()
 
+    def test_provider_failure_during_restart_unwind_beats_restart(self) -> None:
+        release_failure = threading.Event()
+        waiting_to_fail = threading.Event()
+
+        class FailDuringUnwindProvider:
+            def __init__(self) -> None:
+                self._published = False
+
+            def sample(self) -> KeyLevels:
+                if not self._published:
+                    self._published = True
+                    return KeyLevels(focused=True, pressed=frozenset())
+                waiting_to_fail.set()
+                release_failure.wait(timeout=1.0)
+                raise RuntimeError("provider failed during restart unwind")
+
+        loop = ContinuousControlLoop(
+            FailDuringUnwindProvider(), _mapper(), period_s=0.001
+        )
+        with self.assertRaisesRegex(ContractError, "provider failed during restart"):
+            with loop:
+                self.assertTrue(loop.wait_for_sequence(1, timeout_s=1.0))
+                self.assertTrue(waiting_to_fail.wait(timeout=1.0))
+                release_failure.set()
+                raise OperatorRestartRequested
+
+    def test_provider_failure_does_not_mask_nonrestart_body_failure(self) -> None:
+        release_failure = threading.Event()
+        waiting_to_fail = threading.Event()
+
+        class FailDuringUnwindProvider:
+            def __init__(self) -> None:
+                self._published = False
+
+            def sample(self) -> KeyLevels:
+                if not self._published:
+                    self._published = True
+                    return KeyLevels(focused=True, pressed=frozenset())
+                waiting_to_fail.set()
+                release_failure.wait(timeout=1.0)
+                raise RuntimeError("concurrent provider failure")
+
+        loop = ContinuousControlLoop(
+            FailDuringUnwindProvider(), _mapper(), period_s=0.001
+        )
+        with self.assertRaisesRegex(RuntimeError, "primary body failure"):
+            with loop:
+                self.assertTrue(loop.wait_for_sequence(1, timeout_s=1.0))
+                self.assertTrue(waiting_to_fail.wait(timeout=1.0))
+                release_failure.set()
+                raise RuntimeError("primary body failure")
+
     def test_absent_samples_beyond_staleness_are_fatal(self) -> None:
         loop = ContinuousControlLoop(AbsentProvider(), _mapper(), period_s=0.001)
         with self.assertRaises(ContractError):
@@ -298,6 +351,35 @@ class ContinuousControlLoopTests(unittest.TestCase):
         loop._process_transitions(True, frozenset())
         loop._process_transitions(True, frozenset({"BACKSPACE"}))
         self.assertTrue(restart.is_set())
+
+    def test_x_rising_after_backspace_supersedes_pending_restart(self) -> None:
+        # Staggered precedence: BACKSPACE rises first and arms restart, then X
+        # rises before the next boundary. X must beat the pending Backspace
+        # restart, so the armed restart must be cleared once X is held.
+        restart = threading.Event()
+        loop = ContinuousControlLoop(
+            SteadyProvider(KeyLevels()),
+            _mapper(),
+            restart_event=restart,
+        )
+        loop._process_transitions(True, frozenset())
+        loop._process_transitions(True, frozenset({"BACKSPACE"}))
+        self.assertTrue(restart.is_set())
+        loop._process_transitions(True, frozenset({"BACKSPACE", "X"}))
+        self.assertFalse(restart.is_set())
+
+    def test_backspace_ignored_while_x_already_held(self) -> None:
+        # Staggered precedence: X held before BACKSPACE rises. X exit must beat
+        # a restart, so the rising BACKSPACE edge must not arm restart at all.
+        restart = threading.Event()
+        loop = ContinuousControlLoop(
+            SteadyProvider(KeyLevels()),
+            _mapper(),
+            restart_event=restart,
+        )
+        loop._process_transitions(True, frozenset({"X"}))
+        loop._process_transitions(True, frozenset({"X", "BACKSPACE"}))
+        self.assertFalse(restart.is_set())
 
     def test_rejects_invalid_restart_event(self) -> None:
         with self.assertRaisesRegex(

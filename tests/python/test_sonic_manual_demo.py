@@ -191,13 +191,23 @@ class SimulatorFreezeWiringTests(unittest.TestCase):
             def __init__(self, *a, **k):
                 pass
 
+            def close(self):
+                pass
+
+        class _FakeClosable:
+            def close(self):
+                pass
+
         def _fake_simulator(**kwargs):
             captured.update(kwargs)
+            # Record the shared cancellation state at construction time, before
+            # the fail-closed teardown signals it while unwinding this raise.
+            captured["cancelled_at_construction"] = kwargs["cancelled"]()
             raise _StopAfterSimulator
 
         def _fake_gear(*_args, **kwargs):
             captured["gear_cancelled"] = kwargs.get("cancelled")
-            return object()
+            return _FakeClosable()
 
         with TemporaryDirectory() as scratch:
             root = Path(scratch)
@@ -228,7 +238,7 @@ class SimulatorFreezeWiringTests(unittest.TestCase):
             with (
                 patch.object(manual_demo, "GatedSimulatorClient", _fake_simulator),
                 patch.object(
-                    manual_demo, "MMChunkClient", lambda *a, **k: object()
+                    manual_demo, "MMChunkClient", lambda *a, **k: _FakeClosable()
                 ),
                 patch.object(
                     manual_demo, "GearProcess", _fake_gear
@@ -259,7 +269,7 @@ class SimulatorFreezeWiringTests(unittest.TestCase):
         captured = self._drive_run_demo([])
         self.assertTrue(callable(captured["gear_cancelled"]))
         self.assertIs(captured["gear_cancelled"], captured["cancelled"])
-        self.assertIs(captured["cancelled"](), False)
+        self.assertIs(captured["cancelled_at_construction"], False)
 
 
 class CommandRecorderTests(unittest.TestCase):
@@ -786,6 +796,9 @@ class _BoundaryControlLoop:
     ) -> None:
         self.mailbox = _BoundaryMailbox(command, mapped)
 
+    def raise_if_failed(self) -> None:
+        return None
+
 
 class _BoundarySimulator:
     def __init__(self, error: ProcessProtocolError | None = None) -> None:
@@ -850,6 +863,9 @@ class X11BoundaryIntegrationTests(unittest.TestCase):
         restart.set()
 
         class _NeverControlLoop:
+            def raise_if_failed(self):
+                return None
+
             @property
             def mailbox(self):
                 raise AssertionError("restart must stop before mailbox access")
@@ -861,6 +877,36 @@ class X11BoundaryIntegrationTests(unittest.TestCase):
                 gate=object(),
                 generate_and_publish=lambda *_args, **_kwargs: self.fail(
                     "restart must not generate"
+                ),
+                chunk_index=3,
+                steps_per_chunk=40,
+                preload_chunks=1,
+                camera_state=CameraDeliveryState(),
+                event_sink=lambda _event: None,
+                control_prefix="CONTROL chunk=",
+                camera_disabled_prefix="CAMERA DISABLED",
+                restart_event=restart,
+            )
+
+    def test_default_boundary_provider_failure_beats_pending_restart(self) -> None:
+        restart = threading.Event()
+        restart.set()
+
+        class _FailingControlLoop:
+            def raise_if_failed(self):
+                raise ContractError("control loop provider failed: device gone")
+
+            @property
+            def mailbox(self):
+                raise AssertionError("failure must stop before mailbox access")
+
+        with self.assertRaisesRegex(ContractError, "provider failed"):
+            _consume_x11_boundary(
+                control_loop=_FailingControlLoop(),
+                simulator=object(),
+                gate=object(),
+                generate_and_publish=lambda *_args, **_kwargs: self.fail(
+                    "provider failure must not generate"
                 ),
                 chunk_index=3,
                 steps_per_chunk=40,
@@ -1093,6 +1139,9 @@ class _ResponsiveControlLoop:
     def __init__(self, mailbox) -> None:
         self.mailbox = mailbox
 
+    def raise_if_failed(self) -> None:
+        return None
+
 
 class ResponsiveX11LoopTests(unittest.TestCase):
     def _mapped(self):
@@ -1111,9 +1160,49 @@ class ResponsiveX11LoopTests(unittest.TestCase):
             def run_one_chunk(self, command, *, command_is_current=None):
                 raise AssertionError("restart must stop before commit")
 
+        class _HealthyControlLoop:
+            def raise_if_failed(self):
+                return None
+
         with self.assertRaises(OperatorRestartRequested):
             _run_responsive_x11_loop(
-                control_loop=object(),
+                control_loop=_HealthyControlLoop(),
+                committer=_NeverCommitter(),
+                simulator=_BoundarySimulator(),
+                chunks=3,
+                camera_state=CameraDeliveryState(),
+                event_sink=lambda _event: None,
+                trace_sink=lambda _trace: None,
+                session_id="session",
+                camera_disabled_prefix="CAMERA DISABLED",
+                restart_event=restart,
+            )
+
+    def test_responsive_provider_failure_beats_pending_restart(self) -> None:
+        from mm_sonic.manual_demo import _run_responsive_x11_loop
+
+        restart = threading.Event()
+        restart.set()
+
+        class _FailingControlLoop:
+            def raise_if_failed(self):
+                raise ContractError(
+                    "control loop provider failed: device gone"
+                )
+
+            @property
+            def mailbox(self):
+                raise AssertionError("failure must stop before sampling")
+
+        class _NeverCommitter:
+            next_chunk = 5
+
+            def run_one_chunk(self, command, *, command_is_current=None):
+                raise AssertionError("provider failure must not commit")
+
+        with self.assertRaisesRegex(ContractError, "provider failed"):
+            _run_responsive_x11_loop(
+                control_loop=_FailingControlLoop(),
                 committer=_NeverCommitter(),
                 simulator=_BoundarySimulator(),
                 chunks=3,
@@ -1964,6 +2053,209 @@ class EpisodeSupervisorTests(unittest.TestCase):
         _close_log, record = self._run_interrupted_episode(responsive=True)
         self.assertEqual(record["generated_chunks"], 7)
         self.assertEqual(record["committed_chunks"], 7)
+
+
+class _RecordingClose:
+    """A closeable resource that records its close and can fail on close."""
+
+    def __init__(self, name: str, log: list[str], *, error: Exception | None = None):
+        self._name = name
+        self._log = log
+        self._error = error
+
+    def close(self) -> None:
+        self._log.append(self._name)
+        if self._error is not None:
+            raise self._error
+
+
+class EpisodeResourceTeardownTests(unittest.TestCase):
+    """Fault-injected construction/teardown for the real run_demo entrypoint."""
+
+    def _drive(
+        self,
+        *,
+        fail_constructor: str | None = None,
+        constructor_error: Exception | None = None,
+        close_errors: dict[str, Exception] | None = None,
+        body_error: BaseException | None = None,
+    ) -> tuple[list[str], BaseException]:
+        close_log: list[str] = []
+        close_errors = close_errors or {}
+
+        def _make(name: str):
+            return _RecordingClose(
+                name, close_log, error=close_errors.get(name)
+            )
+
+        publisher = _make("publisher")
+        publisher.endpoint = "tcp://127.0.0.1:5555"
+        publisher.send = lambda *a, **k: None
+        mm = _make("mm")
+        if body_error is not None:
+            def fail_body():
+                raise body_error
+
+            mm.hello = fail_body
+        gear = _make("gear")
+        simulator = _make("simulator")
+        simulator.snapshot = lambda: {"sim_time_s": 0.0}
+
+        def _ctor(name, obj):
+            def build(*_args, **_kwargs):
+                if fail_constructor == name:
+                    raise (
+                        constructor_error
+                        if constructor_error is not None
+                        else ContractError(f"{name} constructor failed")
+                    )
+                return obj
+            return build
+
+        with TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            for name in ("source", "gear", "runtime", "terrain"):
+                (root / name).mkdir()
+            mm_server = root / "mm_chunk_server"
+            mm_server.write_text("#!/bin/sh\n", encoding="utf-8")
+            argv = [
+                "--output-root", str(root / "runs"),
+                "--source-run", str(root / "source"),
+                "--gear-checkout", str(root / "gear"),
+                "--runtime", str(root / "runtime"),
+                "--terrain-dir", str(root / "terrain"),
+                "--mm-server", str(mm_server),
+            ]
+            namespace = manual_demo._parser().parse_args(argv)
+            captured: list[BaseException] = []
+            with (
+                patch.object(manual_demo, "load_joint_contract", lambda *a, **k: object()),
+                patch.object(manual_demo, "SourceValidator", lambda *a, **k: object()),
+                patch.object(manual_demo, "PosePublisher", _ctor("publisher", publisher)),
+                patch.object(manual_demo, "MMChunkClient", _ctor("mm", mm)),
+                patch.object(manual_demo, "GearProcess", _ctor("gear", gear)),
+                patch.object(
+                    manual_demo, "GatedSimulatorClient", _ctor("simulator", simulator)
+                ),
+            ):
+                try:
+                    manual_demo.run_demo(namespace)
+                except BaseException as exc:  # noqa: BLE001 - test captures primary
+                    captured.append(exc)
+        self.assertTrue(captured, "run_demo must fail closed")
+        return close_log, captured[0]
+
+    def test_late_constructor_failure_closes_all_prior_resources(self) -> None:
+        # Simulator is the last owned constructor: its failure must close the
+        # already-owned publisher, mm, and gear, then propagate (no relaunch).
+        close_log, error = self._drive(fail_constructor="simulator")
+        self.assertIsInstance(error, ContractError)
+        self.assertIn("simulator constructor failed", str(error))
+        self.assertIn("publisher", close_log)
+        self.assertIn("mm", close_log)
+        self.assertIn("gear", close_log)
+        # The failed resource itself was never owned, so it is never closed.
+        self.assertNotIn("simulator", close_log)
+
+    def test_close_failure_still_closes_remaining_and_fails_closed(self) -> None:
+        # A gear close failure during teardown must not prevent publisher/mm
+        # from closing, and the failure must surface (fail closed, no relaunch).
+        close_log, error = self._drive(
+            fail_constructor="simulator",
+            close_errors={"gear": ContractError("gear close exploded")},
+        )
+        self.assertIn("gear", close_log)
+        self.assertIn("publisher", close_log)
+        self.assertIn("mm", close_log)
+        # The primary constructor failure is surfaced, not masked by the close.
+        self.assertIsInstance(error, ContractError)
+        self.assertIn("simulator constructor failed", str(error))
+
+    def test_teardown_finally_close_failure_still_closes_remaining(self) -> None:
+        # No constructor fails: run_demo proceeds into the body, the body fails
+        # (mm has no hello()), and the real finally teardown branch runs. A gear
+        # close failure there must not prevent the remaining publisher/mm closes,
+        # and the failure must surface (fail closed, no relaunch).
+        close_log, error = self._drive(
+            close_errors={"gear": ContractError("gear close exploded")},
+        )
+        self.assertIn("simulator", close_log)
+        self.assertIn("gear", close_log)
+        self.assertIn("publisher", close_log)
+        self.assertIn("mm", close_log)
+        # The body failure remains primary; teardown failures must not mask it.
+        self.assertIsInstance(error, AttributeError)
+        self.assertIn("hello", str(error))
+
+    def test_restart_signal_does_not_mask_teardown_failure(self) -> None:
+        close_log, error = self._drive(
+            body_error=OperatorRestartRequested(),
+            close_errors={"gear": ContractError("gear close exploded")},
+        )
+        self.assertEqual(close_log, ["simulator", "gear", "publisher", "mm"])
+        self.assertIsInstance(error, ContractError)
+        self.assertIn("gear close exploded", str(error))
+
+    def test_close_failure_alone_surfaces_and_does_not_relaunch(self) -> None:
+        with patch.object(
+            manual_demo, "run_demo", side_effect=ContractError("gear close exploded")
+        ) as run:
+            with self.assertRaisesRegex(ContractError, "gear close exploded"):
+                main(["--chunks", "1"])
+        run.assert_called_once()
+
+
+class CloseResilientlyTests(unittest.TestCase):
+    def _closer(self, name, log, error=None):
+        def close():
+            log.append(name)
+            if error is not None:
+                raise error
+        return close
+
+    def test_closes_every_resource_exactly_once_in_order(self) -> None:
+        log: list[str] = []
+        manual_demo._close_resiliently(
+            [self._closer("a", log), self._closer("b", log)]
+        )
+        self.assertEqual(log, ["a", "b"])
+
+    def test_continues_past_failure_and_reraises_single_error(self) -> None:
+        log: list[str] = []
+        with self.assertRaisesRegex(ContractError, "boom-a"):
+            manual_demo._close_resiliently(
+                [
+                    self._closer("a", log, ContractError("boom-a")),
+                    self._closer("b", log),
+                ]
+            )
+        # b was still closed despite a's failure.
+        self.assertEqual(log, ["a", "b"])
+
+    def test_aggregates_multiple_close_failures(self) -> None:
+        log: list[str] = []
+        with self.assertRaises(ContractError) as caught:
+            manual_demo._close_resiliently(
+                [
+                    self._closer("a", log, ContractError("boom-a")),
+                    self._closer("b", log, ContractError("boom-b")),
+                ]
+            )
+        message = str(caught.exception)
+        self.assertIn("boom-a", message)
+        self.assertIn("boom-b", message)
+        self.assertEqual(log, ["a", "b"])
+
+    def test_primary_failure_swallows_close_errors_unmasked(self) -> None:
+        log: list[str] = []
+        primary = ContractError("primary")
+        # With a primary failure the close errors are swallowed so the primary
+        # surfaces unmasked; every resource is still closed.
+        manual_demo._close_resiliently(
+            [self._closer("a", log, ContractError("boom")), self._closer("b", log)],
+            primary=primary,
+        )
+        self.assertEqual(log, ["a", "b"])
 
 
 class WriteResponsiveEvidenceTests(unittest.TestCase):

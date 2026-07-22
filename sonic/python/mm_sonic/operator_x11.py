@@ -62,6 +62,11 @@ _ACTIONS = {
     "LEFT_CTRL": "strafe",
 }
 
+
+class OperatorRestartRequested(Exception):
+    """Normal operator request to replace the complete live episode."""
+
+
 _FOCUS_TITLE_MARKERS = (
     "MuJoCo",
     "G1 CONTROLS",
@@ -394,10 +399,12 @@ class ContinuousControlLoop:
             self._thread.join(timeout=self._join_timeout_s)
             if self._thread.is_alive():
                 raise ContractError("control loop thread did not stop")
+        if self._error is not None and (
+            exc_type is None or isinstance(exc, OperatorRestartRequested)
+        ):
+            raise self._error
         if exc_type is not None:
             return False
-        if self._error is not None:
-            raise self._error
         return False
 
     def wait_for_sequence(self, count: int, timeout_s: float) -> bool:
@@ -433,9 +440,14 @@ class ContinuousControlLoop:
         rising = pressed - self._prev_pressed
         for key in sorted(rising):
             self._emit(f"KEY {key} DOWN -> {_ACTIONS[key]}")
-        if (
-            "X" not in rising
-            and "BACKSPACE" in rising
+        if "X" in pressed:
+            # X terminate outranks a Backspace restart. Suppress arming a new
+            # restart and supersede any restart already armed this episode so a
+            # staggered Backspace-then-X order still exits cleanly.
+            if self._restart_event is not None:
+                self._restart_event.clear()
+        elif (
+            "BACKSPACE" in rising
             and self._restart_event is not None
             and (
                 self._restart_armed_event is None
