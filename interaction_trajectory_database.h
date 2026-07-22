@@ -163,6 +163,20 @@ inline void validate_trajectory_phases(const Database& database) {
             throw FormatError(
                 "phases in each range must include CONTACT, LIFT, and at least 5 HOLD samples");
         }
+
+        const size_t approach = clip * 3U;
+        const double x = database.approach_directions_object[approach];
+        const double y = database.approach_directions_object[approach + 1U];
+        const double z = database.approach_directions_object[approach + 2U];
+        if (std::abs(y) > detail::kFloatTolerance) {
+            throw FormatError(
+                "approach_directions_object must be horizontal");
+        }
+        const double norm = std::sqrt(x * x + y * y + z * z);
+        if (std::abs(norm - 1.0) > detail::kFloatTolerance) {
+            throw FormatError(
+                "approach_directions_object must contain unit directions");
+        }
     }
 }
 

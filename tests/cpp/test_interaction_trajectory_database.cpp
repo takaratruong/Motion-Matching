@@ -282,6 +282,18 @@ void test_compact_loader_rejects_malformed_input(const TemporaryDirectory& tempo
     bytes = fixture.bytes;
     bytes[fixture.offsets.at("active_hands")] = 2;
     expect_format_error(path, bytes, "active_hands", load);
+
+    bytes = fixture.bytes;
+    overwrite_f32(
+        bytes,
+        fixture.offsets.at("approach_directions_object") + sizeof(float),
+        0.5F);
+    expect_format_error(path, bytes, "must be horizontal", load);
+
+    bytes = fixture.bytes;
+    overwrite_f32(
+        bytes, fixture.offsets.at("approach_directions_object"), 0.5F);
+    expect_format_error(path, bytes, "must contain unit directions", load);
 }
 
 }  // namespace
