@@ -129,15 +129,11 @@ bool wrist_bone(size_t bone) {
         bone == static_cast<size_t>(g1_skeleton::RightWrist);
 }
 
-bool active_grasp_chain_bone(size_t bone, Hand hand) {
+bool active_contact_wrist_bone(size_t bone, Hand hand) {
     if (hand == Hand::Left) {
-        return bone == static_cast<size_t>(g1_skeleton::LeftWristRoll) ||
-            bone == static_cast<size_t>(g1_skeleton::LeftWristPitch) ||
-            bone == static_cast<size_t>(g1_skeleton::LeftWrist);
+        return bone == static_cast<size_t>(g1_skeleton::LeftWrist);
     }
-    return bone == static_cast<size_t>(g1_skeleton::RightWristRoll) ||
-        bone == static_cast<size_t>(g1_skeleton::RightWristPitch) ||
-        bone == static_cast<size_t>(g1_skeleton::RightWrist);
+    return bone == static_cast<size_t>(g1_skeleton::RightWrist);
 }
 
 float joint_radius(
@@ -160,11 +156,11 @@ bool skeleton_intersects_box(
     const WorldPose& world,
     const OrientedBox& box,
     Hand hand,
-    bool exempt_active_grasp_chain,
+    bool exempt_active_contact_wrist,
     const TrajectoryCollisionConfig& config) {
     for (size_t bone = 1U; bone < g1_skeleton::BoneCount; ++bone) {
-        if (exempt_active_grasp_chain &&
-            active_grasp_chain_bone(bone, hand)) {
+        if (exempt_active_contact_wrist &&
+            active_contact_wrist_bone(bone, hand)) {
             continue;
         }
         if (sphere_intersects_box(

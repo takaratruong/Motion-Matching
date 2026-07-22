@@ -1059,7 +1059,7 @@ void test_shaped_upper_arm_and_torso_collisions_are_rejected() {
             "torso table penetration was accepted");
 }
 
-void test_only_active_grasp_chain_is_exempt_after_contact() {
+void test_only_final_active_wrist_is_exempt_after_contact() {
     const interaction::OrientedBox object{
         {vec3(), quat()}, vec3(0.20F, 0.20F, 0.20F)};
     const interaction::EnvironmentGeometry shelf = distant_shelf();
@@ -1082,13 +1082,24 @@ void test_only_active_grasp_chain_is_exempt_after_contact() {
     active[g1_skeleton::RightWristRoll] = vec3(0.0F, 0.0F, 0.0F);
     active[g1_skeleton::RightWristPitch] = vec3(0.0F, 0.0F, 0.0F);
     active[g1_skeleton::RightWrist] = vec3(0.0F, 0.0F, 0.0F);
-    const auto active_shaped = shaped_pose_with_world_positions(
+    const auto forearm_shaped = shaped_pose_with_world_positions(
         active, interaction::Hand::Right);
     require(interaction::evaluate_shaped_trajectory_feasibility(
-                active_shaped, 0U, interaction::Hand::Right,
+                forearm_shaped, 0U, interaction::Hand::Right,
+                object, shelf).reason ==
+            interaction::TrajectoryFeasibilityReason::ObjectCollision,
+            "active forearm was exempted after Contact");
+
+    std::array<vec3, g1_skeleton::BoneCount> final_wrist{};
+    final_wrist.fill(vec3(10.0F, 10.0F, 10.0F));
+    final_wrist[g1_skeleton::RightWrist] = vec3(0.0F, 0.0F, 0.0F);
+    const auto final_wrist_shaped = shaped_pose_with_world_positions(
+        final_wrist, interaction::Hand::Right);
+    require(interaction::evaluate_shaped_trajectory_feasibility(
+                final_wrist_shaped, 0U, interaction::Hand::Right,
                 object, shelf).reason ==
             interaction::TrajectoryFeasibilityReason::None,
-            "active grasp chain was not exempted after Contact");
+            "final active wrist contact was not exempted after Contact");
 }
 
 void test_recorded_table_geometry_preserves_top_and_builds_four_legs() {
@@ -1195,7 +1206,7 @@ int main() {
     test_collision_feasibility_is_phase_aware();
     test_forearm_capsule_and_contact_still_collide_with_shelf();
     test_shaped_upper_arm_and_torso_collisions_are_rejected();
-    test_only_active_grasp_chain_is_exempt_after_contact();
+    test_only_final_active_wrist_is_exempt_after_contact();
     test_recorded_table_geometry_preserves_top_and_builds_four_legs();
     test_coverage_environment_builds_right_shelf_and_lower_left_table();
     test_collision_checks_every_environment_box();
