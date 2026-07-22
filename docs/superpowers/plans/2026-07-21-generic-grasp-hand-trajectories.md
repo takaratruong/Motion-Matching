@@ -4,7 +4,7 @@
 
 **Goal:** Draw every recorded pickup path compatible with a generic object and requested grasp pose or position, with exact Contact convergence and motion matching as the only playback authority.
 
-**Architecture:** A pure C++ module selects clips with explicit tolerance gates and stores wrist poses in source-object coordinates. It maps each path into a live query by object alignment plus a Contact residual. The controller renders all selected paths; a launcher removes every diffusion authority variable.
+**Architecture:** A pure C++ module selects clips with explicit tolerance gates and stores wrist/elbow samples in source-object coordinates. It maps each path into a live query by object alignment plus a Contact residual, then filters object and shelf collisions. A separate lightweight raylib viewer renders accepted and rejected paths without the controller, diffusion runtime, robot mesh, or terrain renderer.
 
 **Tech Stack:** C++17, existing G1 interaction database and FK, raylib, Make, Python `unittest`, Bash.
 
@@ -82,12 +82,13 @@ struct HandTrajectory {
     float cost = 0.0F;
     Transform source_object{};
     std::vector<Transform> hands_in_source_object;
+    std::vector<vec3> elbows_in_source_object;
 };
 ```
 
 Find first Reach, Contact, and Lift. Compare source grasp metadata to the query
-in target-object coordinates. Gate before scoring. Store wrist transforms from
-Reach through Lift using `compose(inverse(source_object), source_hand_world)`.
+in target-object coordinates. Gate before scoring. Store wrist transforms and
+elbow points from Reach through Lift in source-object coordinates.
 
 - [ ] **Step 4: Implement exact mapping**
 
@@ -118,22 +119,71 @@ git add Makefile interaction_hand_trajectories.* \
 git commit -m "feat: select generic grasp hand trajectories"
 ```
 
-### Task 2: Live all-path controller overlay
+### Task 2: Shelf collision feasibility
 
 **Files:**
-- Modify: `controller.cpp`
-- Create: `tests/python/test_generic_hand_trajectory_controller.py`
+- Modify: `interaction_hand_trajectories.h`
+- Modify: `interaction_hand_trajectories.cpp`
+- Modify: `tests/cpp/test_interaction_hand_trajectories.cpp`
 
 **Interfaces:**
-- Consumes Task 1 selection/mapping.
-- Produces `MM_INTERACTION_HAND_TRAJECTORIES=1` and `MM_G1_SKELETON_ONLY=1` gates.
+- Consumes Task 1 mapped wrist/elbow samples.
+- Produces `ShelfGeometry`, `TrajectoryFeasibility`, and `evaluate_trajectory_feasibility(...)`.
 
-- [ ] **Step 1: Write failing source-contract tests**
+- [ ] **Step 1: Write failing geometry tests**
 
-Assert the controller includes the new header, parses both variables, builds a
-query from the current target and affordance, selects without top-K, maps using
-the current target each frame, draws every polyline and Contact marker, and
-skips mesh load/update/draw/unload in skeleton-only mode.
+Create an oriented target object and five shelf boxes. Assert a clear approach
+passes, a pre-Contact wrist sphere through the object is object-rejected, a
+forearm capsule through a side wall is shelf-rejected, and object overlap at
+Contact is exempt while shelf overlap at Contact is rejected.
+
+- [ ] **Step 2: Verify red**
+
+Run `make -B build/tests/test_interaction_hand_trajectories`.
+
+Expected: compile failure for missing feasibility interfaces.
+
+- [ ] **Step 3: Implement collision primitives**
+
+Implement point/segment distance against oriented boxes by transforming samples
+to each box's local frame. Expand boxes by wrist radius for sphere tests and by
+forearm radius for elbow-to-wrist capsule tests.
+
+- [ ] **Step 4: Implement phase-aware feasibility**
+
+Test object collision only for samples before `contact_point`. Test all shelf
+boxes for every sample. Return separate `ObjectCollision` and `ShelfCollision`
+reasons and never silently mutate or truncate trajectories.
+
+- [ ] **Step 5: Verify and commit**
+
+Run the focused C++ test and expect exit 0, then commit the selector and
+collision module:
+
+```bash
+./build/tests/test_interaction_hand_trajectories
+git add Makefile interaction_hand_trajectories.* \
+  tests/cpp/test_interaction_hand_trajectories.cpp
+git commit -m "feat: select collision-safe grasp trajectories"
+```
+
+### Task 3: Separate interactive shelf trajectory viewer
+
+**Files:**
+- Create: `hand_trajectory_viewer.cpp`
+- Create: `tests/python/test_hand_trajectory_viewer.py`
+- Modify: `Makefile`
+
+**Interfaces:**
+- Consumes Tasks 1-2 and an interaction pack path.
+- Produces standalone `hand_trajectory_viewer` with shelf/object controls and accepted/rejected path rendering.
+
+- [ ] **Step 1: Write failing viewer source-contract tests**
+
+Assert the standalone source handles `Q/E`, `R/F`, `Z/C`, arrow keys,
+Page Up/Page Down, `V`, and Backspace. Assert five shelf boxes, accepted and
+rejected counters, exact-query rebuilding, collision evaluation, and no
+controller/diffusion/mesh/terrain includes or screenshot calls.
 
 - [ ] **Step 2: Verify red**
 
@@ -141,109 +191,47 @@ Run:
 
 ```bash
 PYTHONPATH=. python -m unittest \
-  tests.python.test_generic_hand_trajectory_controller -v
+  tests.python.test_hand_trajectory_viewer -v
 ```
 
-Expected: failures for missing gates and calls.
+Expected: failure because the viewer source is absent.
 
-- [ ] **Step 3: Implement setup and selection**
+- [ ] **Step 3: Implement viewer setup and controls**
 
-Accept only `MM_INTERACTION_HAND_TRAJECTORIES=1`. After target registration,
-form the full-pose query from
-`compose(target.object_world, affordance.hand_in_object)` and select once. Treat
-zero candidates and over-limit selection as controlled startup errors.
+Load `interaction_database.bin`, construct the demo object's dimensions and
+object-local grasp, select all close trajectories, and construct floor/back/
+left/right/top shelf boxes. Apply object translation and yaw/pitch/roll at a
+fixed per-frame rate; Backspace restores the initial transform.
 
-- [ ] **Step 4: Render live paths**
+- [ ] **Step 4: Implement rendering**
 
-At render time, rebuild the query object/grasp transforms from the current
-target, map every selected path, draw all segments in a rank gradient, mark
-Contact spheres, emphasize rank zero in green, and display candidate count.
+Draw shelf and object oriented boxes, accepted paths in cost colors, Contact
+markers, and optionally rejected paths in translucent red. Show controls and
+close/safe/object-rejected/shelf-rejected counts. Recompute mapping and
+feasibility whenever the object changes.
 
-- [ ] **Step 5: Gate skeleton-only rendering**
-
-With `MM_G1_SKELETON_ONLY=1`, set `show_g1_mesh=false` and skip mesh renderer
-load/update/draw/unload while preserving `show_g1_bones=true`.
-
-- [ ] **Step 6: Verify and commit**
+- [ ] **Step 5: Add Make target and verify**
 
 ```bash
 ./build/tests/test_interaction_hand_trajectories
 PYTHONPATH=. python -m unittest \
-  tests.python.test_generic_hand_trajectory_controller \
-  tests.python.test_native_g1_diffusion_controller -v
-make -j2 controller
-git add controller.cpp tests/python/test_generic_hand_trajectory_controller.py
-git commit -m "feat: render generic grasp trajectory field"
-```
-
-Expected: tests and build exit 0 before commit.
-
-### Task 3: Motion-matching-only launcher and live audit
-
-**Files:**
-- Create: `tools/run_g1_motion_matching_pickup_baseline.sh`
-- Create: `tests/python/test_motion_matching_pickup_baseline_launcher.py`
-
-**Interfaces:**
-- Produces one flat skeleton controller with trajectory visualization enabled and diffusion disabled.
-
-- [ ] **Step 1: Write failing launcher test**
-
-Require trajectory, flat-terrain, skeleton-only, pack, and feature variables.
-Require `env -u` for `MM_G1_OFFLINE_OVERLAP`,
-`MM_INTERACTION_FUNNEL_WORKER`, and `MM_INTERACTION_FUNNEL_CHECKPOINT`. Reject
-screenshot/capture commands.
-
-- [ ] **Step 2: Verify red**
-
-Run:
-
-```bash
-PYTHONPATH=. python -m unittest \
-  tests.python.test_motion_matching_pickup_baseline_launcher -v
-```
-
-Expected: failure because the launcher is absent.
-
-- [ ] **Step 3: Implement launcher**
-
-Resolve repository root and `exec env`:
-
-```bash
-env -u MM_G1_OFFLINE_OVERLAP \
-  -u MM_INTERACTION_FUNNEL_WORKER \
-  -u MM_INTERACTION_FUNNEL_CHECKPOINT \
-  MM_INTERACTION_HAND_TRAJECTORIES=1 \
-  MM_INTERACTION_FLAT_TERRAIN=1 \
-  MM_G1_SKELETON_ONLY=1 \
-  MM_INTERACTION_PACK="$pack" \
-  MM_FEATURES_OUTPUT="$features" \
-  "$root/controller"
-```
-
-- [ ] **Step 4: Final verification**
-
-```bash
-./build/tests/test_interaction_hand_trajectories
-PYTHONPATH=. python -m unittest \
-  tests.python.test_generic_hand_trajectory_controller \
-  tests.python.test_motion_matching_pickup_baseline_launcher \
-  tests.python.test_native_g1_diffusion_controller -v
+  tests.python.test_hand_trajectory_viewer -v
+make -j2 hand_trajectory_viewer
 git diff --check
 ```
 
-Expected: all tests pass and whitespace check exits 0.
+Expected: tests and build exit 0.
 
-- [ ] **Step 5: Launch and audit**
+- [ ] **Step 6: Launch and audit**
 
-Stop only the exact old diffusion-preview process. Launch baseline on
-`DISPLAY=:1`; after eight seconds verify one controller, all baseline variables,
-no diffusion variables, no mesh-load lines, and no runtime error.
+Stop only the exact old diffusion-preview process. Launch exactly one
+`hand_trajectory_viewer` on `DISPLAY=:1`; after eight seconds verify it remains
+alive, has no diffusion environment variables, and reports no startup error.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add tools/run_g1_motion_matching_pickup_baseline.sh \
-  tests/python/test_motion_matching_pickup_baseline_launcher.py
-git commit -m "feat: launch motion matching pickup baseline"
+git add Makefile hand_trajectory_viewer.cpp \
+  tests/python/test_hand_trajectory_viewer.py
+git commit -m "feat: add interactive shelf trajectory lab"
 ```
