@@ -51,7 +51,9 @@ struct CanonicalGrasp {
     interaction::Hand hand = interaction::Hand::Right;
     vec3 dimensions{};
     interaction::Transform grasp_in_object{};
-    quat source_object_rotation{};
+    interaction::Transform source_object{};
+    interaction::Transform table_world{};
+    vec3 table_dimensions{};
 };
 
 CanonicalGrasp find_canonical_grasp(const interaction::Database& database) {
@@ -73,36 +75,23 @@ CanonicalGrasp find_canonical_grasp(const interaction::Database& database) {
                     read_vec3(database.grasp_positions_object, clip),
                     read_quat(database.grasp_rotations_object, clip),
                 },
-                read_quat(database.object_rotations, static_cast<size_t>(object_frame)),
+                {
+                    read_vec3(
+                        database.object_positions,
+                        static_cast<size_t>(object_frame)),
+                    read_quat(
+                        database.object_rotations,
+                        static_cast<size_t>(object_frame)),
+                },
+                {
+                    read_vec3(database.table_positions, clip),
+                    read_quat(database.table_rotations, clip),
+                },
+                read_vec3(database.table_sizes, clip),
             };
         }
     }
     throw std::runtime_error("interaction database has no Contact clip");
-}
-
-float vertical_half_extent(vec3 dimensions, quat rotation) {
-    const vec3 x_axis = quat_mul_vec3(rotation, vec3(1.0F, 0.0F, 0.0F));
-    const vec3 y_axis = quat_mul_vec3(rotation, vec3(0.0F, 1.0F, 0.0F));
-    const vec3 z_axis = quat_mul_vec3(rotation, vec3(0.0F, 0.0F, 1.0F));
-    return 0.5F * (
-        std::abs(x_axis.y) * dimensions.x +
-        std::abs(y_axis.y) * dimensions.y +
-        std::abs(z_axis.y) * dimensions.z);
-}
-
-ShelfGeometry make_shelf() {
-    ShelfGeometry shelf{};
-    shelf.boxes[0] = {{vec3(0.0F, 0.025F, 0.0F), quat()},
-                      vec3(1.40F, 0.05F, 0.80F)};
-    shelf.boxes[1] = {{vec3(0.0F, 0.70F, 0.375F), quat()},
-                      vec3(1.40F, 1.40F, 0.05F)};
-    shelf.boxes[2] = {{vec3(-0.675F, 0.70F, 0.0F), quat()},
-                      vec3(0.05F, 1.40F, 0.80F)};
-    shelf.boxes[3] = {{vec3(0.675F, 0.70F, 0.0F), quat()},
-                      vec3(0.05F, 1.40F, 0.80F)};
-    shelf.boxes[4] = {{vec3(0.0F, 1.375F, 0.0F), quat()},
-                      vec3(1.40F, 0.05F, 0.80F)};
-    return shelf;
 }
 
 HandTrajectoryQuery make_query(
@@ -164,15 +153,87 @@ void draw_oriented_box(const OrientedBox& box, Color color) {
     }
 }
 
-void draw_path(const RenderedTrajectory& trajectory, Color color) {
+void draw_path(
+    const RenderedTrajectory& trajectory,
+    Color color,
+    bool emphasized = false) {
     for (size_t sample = 1U; sample < trajectory.mapped.hands.size(); ++sample) {
-        DrawLine3D(
-            ray_vector(trajectory.mapped.hands[sample - 1U].position),
-            ray_vector(trajectory.mapped.hands[sample].position), color);
+        const Vector3 start = ray_vector(
+            trajectory.mapped.hands[sample - 1U].position);
+        const Vector3 stop = ray_vector(
+            trajectory.mapped.hands[sample].position);
+        if (emphasized) {
+            DrawCylinderEx(start, stop, 0.009F, 0.009F, 6, color);
+            DrawSphere(stop, 0.014F, color);
+        } else {
+            DrawLine3D(start, stop, color);
+        }
     }
     DrawSphere(
         ray_vector(trajectory.mapped.hands[trajectory.contact_point].position),
         0.018F, color);
+}
+
+const char* feasibility_name(TrajectoryFeasibilityReason reason) {
+    switch (reason) {
+        case TrajectoryFeasibilityReason::None: return "SAFE";
+        case TrajectoryFeasibilityReason::ObjectCollision:
+            return "OBJECT COLLISION";
+        case TrajectoryFeasibilityReason::ShelfCollision:
+            return "TABLE COLLISION";
+    }
+    return "UNKNOWN";
+}
+
+const char* phase_name(uint8_t phase) {
+    switch (phase) {
+        case 1U: return "REACH";
+        case 2U: return "CONTACT";
+        case 3U: return "LIFT";
+        default: return "TRANSITION";
+    }
+}
+
+int32_t animated_frame(
+    const HandTrajectory& trajectory,
+    float animation_seconds) {
+    const int32_t frame_count =
+        trajectory.lift_frame - trajectory.reach_frame + 1;
+    if (frame_count <= 0) {
+        throw std::invalid_argument("selected trajectory has invalid frame range");
+    }
+    const int32_t offset = static_cast<int32_t>(
+        std::floor(animation_seconds * 25.0F)) % frame_count;
+    return trajectory.reach_frame + offset;
+}
+
+void draw_selected_skeleton(
+    const interaction::Database& database,
+    const HandTrajectory& trajectory,
+    const HandTrajectoryQuery& query,
+    int32_t frame,
+    Color joint_color,
+    Color bone_color) {
+    const interaction::WorldPose source = interaction::world_pose(
+        interaction::pose_at_frame(database, frame));
+    const interaction::Transform mapping =
+        interaction::hand_trajectory_world_mapping(trajectory, query);
+    std::array<vec3, g1_skeleton::BoneCount> positions{};
+    for (size_t bone = 0U; bone < positions.size(); ++bone) {
+        positions[bone] = interaction::compose(
+            mapping,
+            interaction::Transform{source.positions[bone], quat()}).position;
+    }
+    for (size_t bone = 0U; bone < positions.size(); ++bone) {
+        DrawSphereWires(ray_vector(positions[bone]), 0.024F, 4, 8, joint_color);
+        const int32_t parent = g1_skeleton::kParents[bone];
+        if (parent >= 0) {
+            DrawCylinderEx(
+                ray_vector(positions[static_cast<size_t>(parent)]),
+                ray_vector(positions[bone]),
+                0.014F, 0.014F, 6, bone_color);
+        }
+    }
 }
 
 void apply_rotation(
@@ -200,40 +261,49 @@ int main(int argc, char** argv) {
         const interaction::Database database = interaction::load_database(
             pack / "interaction_database.bin");
         const CanonicalGrasp canonical = find_canonical_grasp(database);
-        const ShelfGeometry shelf = make_shelf();
-
-        interaction::Transform initial_object{};
-        initial_object.rotation = canonical.source_object_rotation;
-        initial_object.position = vec3(
+        const vec3 scene_offset(
+            -canonical.table_world.position.x,
             0.0F,
-            0.05F + vertical_half_extent(
-                canonical.dimensions, initial_object.rotation),
-            0.0F);
+            -canonical.table_world.position.z);
+        interaction::Transform table_world = canonical.table_world;
+        table_world.position = table_world.position + scene_offset;
+        const ShelfGeometry table_geometry =
+            interaction::make_recorded_table_geometry(
+                table_world, canonical.table_dimensions);
+
+        interaction::Transform initial_object = canonical.source_object;
+        initial_object.position = initial_object.position + scene_offset;
         interaction::Transform object_world = initial_object;
         bool position_only = false;
         bool show_rejected = true;
+        size_t selected_index = 0U;
+        float animation_seconds = 0.0F;
         HandTrajectoryQuery query = make_query(
             object_world, canonical, position_only);
         std::vector<HandTrajectory> candidates =
             interaction::select_hand_trajectories(database, query);
+        if (candidates.empty()) {
+            throw std::runtime_error("no compatible kinematic options");
+        }
         std::vector<RenderedTrajectory> rendered = classify_trajectories(
-            candidates, query, shelf);
+            candidates, query, table_geometry);
 
         SetConfigFlags(FLAG_VSYNC_HINT | FLAG_MSAA_4X_HINT);
-        InitWindow(1280, 800, "Generic grasp trajectory shelf lab");
+        InitWindow(1280, 800, "Generic grasp kinematic trajectory lab");
         if (!IsWindowReady()) {
             throw std::runtime_error("trajectory viewer could not open a window");
         }
         SetTargetFPS(60);
         Camera3D camera{};
-        camera.position = Vector3{2.2F, 1.65F, -2.4F};
-        camera.target = Vector3{0.0F, 0.65F, 0.0F};
+        camera.position = Vector3{2.35F, 1.55F, -2.45F};
+        camera.target = Vector3{0.0F, 0.70F, 0.0F};
         camera.up = Vector3{0.0F, 1.0F, 0.0F};
         camera.fovy = 45.0F;
         camera.projection = CAMERA_PERSPECTIVE;
 
         while (!WindowShouldClose()) {
             const float dt = std::min(GetFrameTime(), 0.05F);
+            animation_seconds += dt;
             const float translation_step = 0.45F * dt;
             const float rotation_step = 0.9F * dt;
             bool object_changed = false;
@@ -254,11 +324,11 @@ int main(int argc, char** argv) {
                 object_world.position.z -= translation_step;
                 object_changed = true;
             }
-            if (IsKeyDown(KEY_PAGE_UP)) {
+            if (IsKeyDown(KEY_W) || IsKeyDown(KEY_PAGE_UP)) {
                 object_world.position.y += translation_step;
                 object_changed = true;
             }
-            if (IsKeyDown(KEY_PAGE_DOWN)) {
+            if (IsKeyDown(KEY_S) || IsKeyDown(KEY_PAGE_DOWN)) {
                 object_world.position.y -= translation_step;
                 object_changed = true;
             }
@@ -290,6 +360,16 @@ int main(int argc, char** argv) {
                 object_world = initial_object;
                 object_changed = true;
             }
+            if (IsKeyPressed(KEY_LEFT_BRACKET)) {
+                selected_index = selected_index == 0U
+                    ? candidates.size() - 1U
+                    : selected_index - 1U;
+                animation_seconds = 0.0F;
+            }
+            if (IsKeyPressed(KEY_RIGHT_BRACKET)) {
+                selected_index = (selected_index + 1U) % candidates.size();
+                animation_seconds = 0.0F;
+            }
             if (IsKeyPressed(KEY_V)) show_rejected = !show_rejected;
             if (IsKeyPressed(KEY_P)) {
                 position_only = !position_only;
@@ -301,13 +381,24 @@ int main(int argc, char** argv) {
                 if (selection_changed) {
                     candidates = interaction::select_hand_trajectories(
                         database, query);
+                    if (candidates.empty()) {
+                        throw std::runtime_error(
+                            "no compatible kinematic options");
+                    }
+                    selected_index %= candidates.size();
+                    animation_seconds = 0.0F;
                 }
-                rendered = classify_trajectories(candidates, query, shelf);
+                rendered = classify_trajectories(
+                    candidates, query, table_geometry);
             }
+
+            const HandTrajectory& selected = candidates[selected_index];
+            const int32_t selected_frame = animated_frame(
+                selected, animation_seconds);
 
             size_t accepted = 0U;
             size_t object_rejected = 0U;
-            size_t shelf_rejected = 0U;
+            size_t table_rejected = 0U;
             for (const RenderedTrajectory& trajectory : rendered) {
                 if (trajectory.reason == TrajectoryFeasibilityReason::None) {
                     ++accepted;
@@ -315,7 +406,7 @@ int main(int argc, char** argv) {
                            TrajectoryFeasibilityReason::ObjectCollision) {
                     ++object_rejected;
                 } else {
-                    ++shelf_rejected;
+                    ++table_rejected;
                 }
             }
 
@@ -323,19 +414,18 @@ int main(int argc, char** argv) {
             ClearBackground(Color{238, 241, 245, 255});
             BeginMode3D(camera);
             DrawGrid(20, 0.25F);
-            for (const OrientedBox& box : shelf.boxes) {
+            for (const OrientedBox& box : table_geometry.boxes) {
                 DrawCubeV(
                     ray_vector(box.world.position), ray_vector(box.dimensions),
-                    Color{150, 155, 164, 105});
-                DrawCubeWiresV(
-                    ray_vector(box.world.position), ray_vector(box.dimensions),
-                    Color{75, 80, 90, 255});
+                    Color{135, 102, 74, 155});
+                draw_oriented_box(box, Color{72, 52, 39, 255});
             }
             draw_oriented_box(
                 {object_world, canonical.dimensions},
                 Color{255, 177, 35, 255});
             DrawSphere(ray_vector(query.grasp_world_position), 0.028F, GOLD);
             for (size_t index = 0U; index < rendered.size(); ++index) {
+                if (index == selected_index) continue;
                 const RenderedTrajectory& trajectory = rendered[index];
                 if (trajectory.reason != TrajectoryFeasibilityReason::None) {
                     if (show_rejected) {
@@ -351,26 +441,50 @@ int main(int argc, char** argv) {
                     trajectory,
                     ColorFromHSV(125.0F + 95.0F * fraction, 0.78F, 0.86F));
             }
+            const TrajectoryFeasibilityReason selected_reason =
+                rendered[selected_index].reason;
+            const bool selected_safe =
+                selected_reason == TrajectoryFeasibilityReason::None;
+            const Color selected_color = selected_safe ? LIME : RED;
+            draw_path(rendered[selected_index], selected_color, true);
+            draw_selected_skeleton(
+                database,
+                selected,
+                query,
+                selected_frame,
+                selected_safe ? DARKBLUE : MAROON,
+                selected_safe ? SKYBLUE : RED);
             EndMode3D();
 
-            DrawRectangle(14, 14, 570, 132, Color{255, 255, 255, 225});
+            DrawRectangle(14, 14, 665, 168, Color{255, 255, 255, 225});
             DrawText("Generic grasp trajectory field", 26, 24, 24, DARKGRAY);
             DrawText(
                 TextFormat(
-                    "compatible %i | accepted %i | object-rejected %i | shelf-rejected %i",
+                    "compatible %i | accepted %i | object-rejected %i | table-rejected %i",
                     static_cast<int>(candidates.size()),
                     static_cast<int>(accepted),
                     static_cast<int>(object_rejected),
-                    static_cast<int>(shelf_rejected)),
+                    static_cast<int>(table_rejected)),
                 26, 56, 18, DARKGRAY);
             DrawText(
-                "Arrows: X/Z  PgUp/PgDn: height  Q/E: yaw  R/F: pitch  Z/C: roll",
+                TextFormat(
+                    "option %i/%i | clip %i | %s | %s frame %i",
+                    static_cast<int>(selected_index + 1U),
+                    static_cast<int>(candidates.size()),
+                    selected.clip,
+                    feasibility_name(selected_reason),
+                    phase_name(database.phases.at(
+                        static_cast<size_t>(selected_frame))),
+                    selected_frame),
                 26, 82, 16, DARKGRAY);
             DrawText(
-                TextFormat(
-                    "V: rejected paths  P: %s  Backspace: reset",
-                    position_only ? "position-only grasp" : "full grasp pose"),
+                "Arrows: X/Z  W/S: height  Q/E: yaw  R/F: pitch  Z/C: roll",
                 26, 108, 16, DARKGRAY);
+            DrawText(
+                TextFormat(
+                    "[/]: cycle option  V: rejected paths  P: %s  Backspace: reset",
+                    position_only ? "position-only grasp" : "full grasp pose"),
+                26, 134, 16, DARKGRAY);
             EndDrawing();
         }
         CloseWindow();

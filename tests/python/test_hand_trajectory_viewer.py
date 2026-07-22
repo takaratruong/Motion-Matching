@@ -17,7 +17,9 @@ class HandTrajectoryViewerTests(unittest.TestCase):
         for key in (
             "KEY_Q", "KEY_E", "KEY_R", "KEY_F", "KEY_Z", "KEY_C",
             "KEY_LEFT", "KEY_RIGHT", "KEY_UP", "KEY_DOWN",
-            "KEY_PAGE_UP", "KEY_PAGE_DOWN", "KEY_V", "KEY_BACKSPACE",
+            "KEY_W", "KEY_S", "KEY_PAGE_UP", "KEY_PAGE_DOWN",
+            "KEY_LEFT_BRACKET", "KEY_RIGHT_BRACKET",
+            "KEY_V", "KEY_BACKSPACE",
         ):
             self.assertIn(key, source)
 
@@ -29,16 +31,26 @@ class HandTrajectoryViewerTests(unittest.TestCase):
         self.assertIn("grasp_world_position", source)
         self.assertIn("grasp_world_rotation", source)
         self.assertIn("object_rejected", source)
-        self.assertIn("shelf_rejected", source)
+        self.assertIn("table_rejected", source)
         self.assertIn("accepted", source)
 
-    def test_builds_five_box_shelf_and_renders_rejections(self):
+    def test_builds_recorded_table_and_renders_rejections(self):
         source = self.source()
         self.assertIn("ShelfGeometry", source)
-        self.assertIn("shelf.boxes[0]", source)
-        self.assertIn("shelf.boxes[4]", source)
+        self.assertIn("make_recorded_table_geometry(", source)
+        self.assertNotIn("make_shelf(", source)
         self.assertIn("show_rejected", source)
         self.assertIn("DrawLine3D", source)
+
+    def test_cycles_and_animates_selected_g1_kinematics(self):
+        source = self.source()
+        self.assertIn("selected_index", source)
+        self.assertIn("animation_seconds", source)
+        self.assertIn("hand_trajectory_world_mapping(", source)
+        self.assertIn("pose_at_frame(", source)
+        self.assertIn("world_pose(", source)
+        self.assertIn("g1_skeleton::kParents", source)
+        self.assertIn("DrawCylinderEx(", source)
 
     def test_is_independent_of_controller_diffusion_mesh_and_terrain(self):
         source = self.source()
