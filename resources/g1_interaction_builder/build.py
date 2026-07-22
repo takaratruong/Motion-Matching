@@ -178,14 +178,18 @@ def build_object_dimensions(
         ]
         reference = values[0]
         if not all(
-            np.allclose(reference, value, rtol=0.0, atol=1e-3)
+            np.allclose(
+                np.sort(reference), np.sort(value), rtol=0.0, atol=1e-3
+            )
             for value in values[1:]
         ):
             raise ValueError(
                 "inconsistent cross-category USD bounds "
                 f"for {object_id}: {values}"
             )
-        dimensions[object_id] = reference.copy()
+        dimensions[object_id] = category_dimensions.get(
+            (object_id, "pickup_table"), reference
+        ).copy()
     return dimensions
 
 

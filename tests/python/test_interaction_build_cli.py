@@ -420,6 +420,57 @@ class InteractionBuildUnitTests(unittest.TestCase):
             ["ground-001.usd", "table-001.usd"],
         )
 
+    def test_object_dimensions_accept_permuted_cross_category_bounds_and_uses_table_axes(
+        self,
+    ):
+        sources = [
+            SimpleNamespace(
+                sequence_id="pickup_table__cup_2__001",
+                object_id="cup_2",
+                object_usd=Path("table.usd"),
+            ),
+            SimpleNamespace(
+                sequence_id="pickup_ground__cup_2__001",
+                object_id="cup_2",
+                object_usd=Path("ground.usd"),
+            ),
+        ]
+        ground_dimensions = np.array([0.08, 0.12, 0.20], np.float32)
+        table_dimensions = np.array([0.08, 0.20, 0.12], np.float32)
+        with patch.object(
+            build_module,
+            "read_usd_dimensions",
+            side_effect=[ground_dimensions, table_dimensions],
+        ) as reader:
+            result = build_module.build_object_dimensions(sources)
+
+        np.testing.assert_array_equal(result["cup_2"], table_dimensions)
+        self.assertEqual(
+            [path.name for (path,), _ in reader.call_args_list],
+            ["ground.usd", "table.usd"],
+        )
+
+    def test_object_dimensions_preserves_single_category_axes(self):
+        cases = (
+            ("pickup_table", np.array([0.08, 0.20, 0.12], np.float32)),
+            ("pickup_ground", np.array([0.08, 0.12, 0.20], np.float32)),
+        )
+        for category, expected in cases:
+            with self.subTest(category=category):
+                source = SimpleNamespace(
+                    sequence_id=f"{category}__cup_2__001",
+                    object_id="cup_2",
+                    object_usd=Path(f"{category}.usd"),
+                )
+                with patch.object(
+                    build_module,
+                    "read_usd_dimensions",
+                    return_value=expected,
+                ):
+                    result = build_module.build_object_dimensions([source])
+
+                np.testing.assert_array_equal(result["cup_2"], expected)
+
     def test_object_dimensions_reject_inconsistent_cross_category_bounds(self):
         sources = [
             SimpleNamespace(
