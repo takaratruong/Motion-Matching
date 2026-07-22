@@ -199,6 +199,7 @@ CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_learned_pickup_backend
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_learned_pickup_end_to_end
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_offline_overlap
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_hand_trajectories
+CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_reuse_audit
 RELEASE_FAST_MATH_TARGET_TEST := \
   $(CPP_TEST_DIR)/test_interaction_target_release_fast_math
 RELEASE_FAST_MATH_CARRY_TEST := \
@@ -498,6 +499,9 @@ $(CPP_TEST_DIR)/test_interaction_matcher: tests/cpp/test_interaction_matcher.cpp
 
 $(CPP_TEST_DIR)/test_interaction_hand_trajectories: tests/cpp/test_interaction_hand_trajectories.cpp interaction_hand_trajectories.cpp interaction_hand_trajectories.h interaction_ik.cpp interaction_ik.h g1_arm_joint_metadata.h interaction_pose.cpp interaction_pose.h interaction_target.cpp interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_hand_trajectories.cpp interaction_hand_trajectories.cpp interaction_ik.cpp interaction_pose.cpp interaction_target.cpp -o $@
+
+$(CPP_TEST_DIR)/test_interaction_reuse_audit: tests/cpp/test_interaction_reuse_audit.cpp interaction_reuse_audit.cpp interaction_reuse_audit.h interaction_hand_trajectories.cpp interaction_hand_trajectories.h interaction_ik.cpp interaction_ik.h g1_arm_joint_metadata.h interaction_pose.cpp interaction_pose.h interaction_target.cpp interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) -pthread tests/cpp/test_interaction_reuse_audit.cpp interaction_reuse_audit.cpp interaction_hand_trajectories.cpp interaction_ik.cpp interaction_pose.cpp interaction_target.cpp -o $@
 
 $(CPP_TEST_DIR)/test_interaction_playback: tests/cpp/test_interaction_playback.cpp tests/cpp/interaction_runtime_fixture.h interaction_playback.cpp interaction_playback.h interaction_matcher.cpp interaction_matcher.h interaction_features.cpp interaction_features.h interaction_pose.cpp interaction_pose.h interaction_target.cpp interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_playback.cpp interaction_playback.cpp interaction_matcher.cpp interaction_features.cpp interaction_pose.cpp interaction_target.cpp -o $@
