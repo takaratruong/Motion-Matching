@@ -1,5 +1,7 @@
+from collections import Counter
 from pathlib import Path
 import re
+from typing import Sequence
 
 import joblib
 import numpy as np
@@ -7,7 +9,7 @@ import numpy as np
 from .schema import RawInteractionClip, SourcePaths, SourceValidationError
 
 
-SEQUENCE_RE = re.compile(r"^pickup_table__(.+)__([0-9]{3})$")
+SEQUENCE_RE = re.compile(r"^(pickup_table|pickup_ground)__(.+)__([0-9]{3})$")
 _MODALITIES = (
     ("robot", "robot", ".pkl"),
     ("objects", "objects", ".pkl"),
@@ -17,13 +19,21 @@ _MODALITIES = (
 _META_KEYS = frozenset(
     ("object_name", "table_pos", "table_quat", "table_size")
 )
+_GROUND_META_KEYS = frozenset(("object_name",))
+GROUND_SUPPORT_POSITION = np.array([0.0, 0.0, -0.02], np.float32)
+GROUND_SUPPORT_ROTATION_XYZW = np.array([0.0, 0.0, 0.0, 1.0], np.float32)
+GROUND_SUPPORT_SIZE = np.array([20.0, 20.0, 0.04], np.float32)
+
+
+def sequence_parts(sequence_id: str) -> tuple[str, str]:
+    match = SEQUENCE_RE.fullmatch(sequence_id)
+    if match is None:
+        raise ValueError(f"invalid pickup sequence id: {sequence_id}")
+    return match.group(1), match.group(2)
 
 
 def object_id_from_sequence(sequence_id: str) -> str:
-    match = SEQUENCE_RE.fullmatch(sequence_id)
-    if match is None:
-        raise ValueError(f"invalid pickup-table sequence id: {sequence_id}")
-    return match.group(1)
+    return sequence_parts(sequence_id)[1]
 
 
 def _single_record(path: Path) -> dict:
@@ -82,6 +92,21 @@ def discover_source_paths(root: Path) -> list[SourcePaths]:
     ]
 
 
+def discover_source_paths_many(roots: Sequence[Path]) -> list[SourcePaths]:
+    discovered = [
+        item for root in roots for item in discover_source_paths(root)
+    ]
+    sequence_ids = [item.sequence_id for item in discovered]
+    duplicates = sorted(
+        sequence
+        for sequence, count in Counter(sequence_ids).items()
+        if count > 1
+    )
+    if duplicates:
+        raise ValueError(f"duplicate sequence ids across roots: {duplicates}")
+    return sorted(discovered, key=lambda item: item.sequence_id)
+
+
 def _source_error(
     code: str, sequence_id: str, path: Path, message: str
 ) -> SourceValidationError:
@@ -109,6 +134,32 @@ def _wrapped_record(
 
 def _meta_record(path: Path, sequence_id: str) -> dict:
     records = joblib.load(path)
+    category, _ = sequence_parts(sequence_id)
+    if category == "pickup_ground":
+        if isinstance(records, dict) and set(records) == _GROUND_META_KEYS:
+            record = records
+        else:
+            if isinstance(records, dict) and set(records) & _META_KEYS:
+                raise _source_error(
+                    "invalid_source_record",
+                    sequence_id,
+                    path,
+                    "ground meta record must contain only object_name",
+                )
+            record = _wrapped_record(path, sequence_id, "meta")
+        if set(record) != _GROUND_META_KEYS:
+            raise _source_error(
+                "invalid_source_record",
+                sequence_id,
+                path,
+                "ground meta record must contain only object_name",
+            )
+        return {
+            "object_name": record["object_name"],
+            "table_pos": GROUND_SUPPORT_POSITION.copy(),
+            "table_quat": GROUND_SUPPORT_ROTATION_XYZW.copy(),
+            "table_size": GROUND_SUPPORT_SIZE.copy(),
+        }
     if isinstance(records, dict) and set(records) == _META_KEYS:
         return records
     if isinstance(records, dict) and set(records) & _META_KEYS:

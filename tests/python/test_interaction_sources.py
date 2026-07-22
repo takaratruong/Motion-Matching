@@ -1,4 +1,5 @@
 from dataclasses import fields
+from itertools import combinations
 from pathlib import Path
 import tempfile
 import unittest
@@ -30,8 +31,10 @@ from resources.g1_interaction_builder.schema import (
 )
 from resources.g1_interaction_builder.sources import (
     discover_source_paths,
+    discover_source_paths_many,
     load_raw_interaction,
     object_id_from_sequence,
+    sequence_parts,
 )
 from tests.python.interaction_fixture import write_source_fixture
 
@@ -191,19 +194,27 @@ class InteractionSourceTests(unittest.TestCase):
                 self.assertEqual(error.code, "code")
                 self.assertEqual(str(error), "code: detail")
 
-    def test_sequence_parser_accepts_only_pickup_table_ids(self):
+    def test_sequence_parser_accepts_exact_table_and_ground_ids(self):
         self.assertEqual(
-            object_id_from_sequence("pickup_table__cup_2__001"), "cup_2"
+            sequence_parts("pickup_table__cup_2__001"),
+            ("pickup_table", "cup_2"),
+        )
+        self.assertEqual(
+            sequence_parts("pickup_ground__cup_2__001"),
+            ("pickup_ground", "cup_2"),
         )
         for invalid in (
-            "pickup_table__cup_2__1",
-            "pickup_table__cup_2__0001",
-            "putdown_table__cup_2__001",
+            "pickup_ground__cup_2__01",
+            "pickup_ground__cup_2__0001",
+            "putdown_ground__cup_2__001",
         ):
             with self.subTest(sequence_id=invalid), self.assertRaisesRegex(
-                ValueError, "invalid pickup-table sequence id"
+                ValueError, "invalid pickup sequence id"
             ):
-                object_id_from_sequence(invalid)
+                sequence_parts(invalid)
+        self.assertEqual(
+            object_id_from_sequence("pickup_ground__cup_2__001"), "cup_2"
+        )
 
     def test_discovery_requires_complete_sorted_triplets(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -236,6 +247,34 @@ class InteractionSourceTests(unittest.TestCase):
             self.assertIn(f"{earlier.sequence_id}: missing meta", message)
             self.assertIn(f"{later.sequence_id}: missing object_usd", message)
 
+    def test_discovers_multiple_roots_in_sequence_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            table = write_source_fixture(
+                base / "table", sequence_id="pickup_table__cup_2__001"
+            )
+            ground = write_source_fixture(
+                base / "ground",
+                sequence_id="pickup_ground__cup_2__001",
+                ground=True,
+            )
+            found = discover_source_paths_many([base / "table", base / "ground"])
+            self.assertEqual(
+                [item.sequence_id for item in found],
+                [ground.sequence_id, table.sequence_id],
+            )
+
+    def test_discovery_rejects_duplicate_sequences_across_roots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            sequence_id = "pickup_ground__cup_2__001"
+            write_source_fixture(base / "first", sequence_id, ground=True)
+            write_source_fixture(base / "second", sequence_id, ground=True)
+            with self.assertRaisesRegex(
+                ValueError, "duplicate sequence ids across roots"
+            ):
+                discover_source_paths_many([base / "first", base / "second"])
+
     def test_loads_native_g1_hands_contacts_and_scene(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = write_source_fixture(Path(tmp))
@@ -265,6 +304,50 @@ class InteractionSourceTests(unittest.TestCase):
             joblib.dump(wrapped[paths.sequence_id], paths.meta)
             clip = load_raw_interaction(paths, np.ones(3, np.float32))
             np.testing.assert_allclose(clip.table_position, [0.0, 0.0, 0.75])
+
+    def test_ground_meta_synthesizes_exact_virtual_floor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = write_source_fixture(Path(tmp), ground=True)
+            clip = load_raw_interaction(paths, np.ones(3, np.float32))
+            np.testing.assert_array_equal(
+                clip.table_position, np.array([0.0, 0.0, -0.02], np.float32)
+            )
+            np.testing.assert_array_equal(
+                clip.table_size, np.array([20.0, 20.0, 0.04], np.float32)
+            )
+            np.testing.assert_array_equal(
+                clip.table_rotation, np.array([1.0, 0.0, 0.0, 0.0], np.float32)
+            )
+
+    def test_loads_the_native_direct_ground_meta_record_shape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = write_source_fixture(Path(tmp), ground=True)
+            wrapped = joblib.load(paths.meta)
+            joblib.dump(wrapped[paths.sequence_id], paths.meta)
+            clip = load_raw_interaction(paths, np.ones(3, np.float32))
+            np.testing.assert_array_equal(
+                clip.table_position, np.array([0.0, 0.0, -0.02], np.float32)
+            )
+
+    def test_ground_meta_rejects_any_tabletop_keys(self):
+        tabletop_fields = {
+            "table_pos": np.array([0.0, 0.0, 0.75], np.float32),
+            "table_quat": np.array([0, 0, 0, 1], np.float32),
+            "table_size": np.array([1.2, 0.8, 0.05], np.float32),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = write_source_fixture(Path(tmp), ground=True)
+            for count in range(1, len(tabletop_fields) + 1):
+                for fields in combinations(tabletop_fields, count):
+                    with self.subTest(fields=fields):
+                        record = {"object_name": paths.object_id}
+                        record.update(
+                            {field: tabletop_fields[field] for field in fields}
+                        )
+                        joblib.dump(record, paths.meta)
+                        with self.assertRaises(SourceValidationError) as caught:
+                            load_raw_interaction(paths, np.ones(3, np.float32))
+                        self.assertEqual(caught.exception.code, "invalid_source_record")
 
     def test_rejects_partial_native_meta_with_a_path_specific_source_error(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -25,7 +25,10 @@ def write_source_fixture(
     sequence_id: str = "pickup_table__cup_2__001",
     object_id: str = "cup_2",
     frames: int = 25,
+    ground: bool = False,
 ) -> SourcePaths:
+    if ground and sequence_id == "pickup_table__cup_2__001":
+        sequence_id = "pickup_ground__cup_2__001"
     robot_dir = root / "robot"
     objects_dir = root / "objects"
     meta_dir = root / "meta"
@@ -60,12 +63,15 @@ def write_source_fixture(
             i: np.empty((0, 3), np.float32) for i in range(frames)
         },
     }
-    meta_record = {
-        "object_name": object_id,
-        "table_pos": np.array([0.0, 0.0, 0.75], np.float32),
-        "table_quat": np.array([0, 0, 0, 1], np.float32),
-        "table_size": np.array([1.2, 0.8, 0.05], np.float32),
-    }
+    meta_record = {"object_name": object_id}
+    if not ground:
+        meta_record.update(
+            {
+                "table_pos": np.array([0.0, 0.0, 0.75], np.float32),
+                "table_quat": np.array([0, 0, 0, 1], np.float32),
+                "table_size": np.array([1.2, 0.8, 0.05], np.float32),
+            }
+        )
 
     robot = robot_dir / f"{sequence_id}.pkl"
     objects = objects_dir / f"{sequence_id}.pkl"
