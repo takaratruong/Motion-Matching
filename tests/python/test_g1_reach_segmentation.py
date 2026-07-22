@@ -29,6 +29,28 @@ def synthetic_trace() -> np.ndarray:
     return trace
 
 
+def drifting_neutral_trace() -> np.ndarray:
+    keyframes = np.array(
+        [
+            [0.00, 0.00, 0.00],
+            [0.40, 0.00, 0.00],
+            [0.00, 0.20, 0.00],
+            [0.00, 0.60, 0.00],
+            [-0.20, 0.20, 0.00],
+            [-0.60, 0.20, 0.00],
+            [-0.20, 0.00, 0.00],
+        ],
+        dtype=np.float64,
+    )
+    frames = [0, 30, 60, 90, 120, 150, 180]
+    trace = np.empty((181, 3), np.float64)
+    for left in range(6):
+        trace[frames[left] : frames[left + 1] + 1] = np.linspace(
+            keyframes[left], keyframes[left + 1], 31
+        )
+    return trace
+
+
 def review_corpus_for_trace(trace: np.ndarray) -> ReviewCorpus:
     frames = len(trace)
     positions = np.zeros((frames, 31, 3), np.float32)
@@ -54,6 +76,34 @@ def review_corpus_for_trace(trace: np.ndarray) -> ReviewCorpus:
 
 
 class ReachSegmentationTests(unittest.TestCase):
+    def test_keeps_terminal_nonreturning_outside_run(self):
+        trace = np.zeros((80, 3), np.float64)
+        trace[20:61, 0] = np.linspace(0.0, 0.40, 41)
+        trace[61:, 0] = 0.40
+
+        proposals = propose_wrist_trace(
+            trace, np.arange(len(trace)), "pickup_east_1"
+        )
+
+        self.assertEqual(len(proposals), 1)
+        self.assertGreaterEqual(proposals[0].grab_frame, 55)
+
+    def test_splits_prominent_endpoints_inside_one_global_outside_run(self):
+        trace = drifting_neutral_trace()
+
+        proposals = propose_wrist_trace(
+            trace,
+            np.arange(len(trace), dtype=np.int32),
+            "pickup_north_2",
+        )
+
+        self.assertEqual(len(proposals), 3)
+        np.testing.assert_allclose(
+            [trace[proposal.grab_frame] for proposal in proposals],
+            [trace[30], trace[90], trace[180]],
+            atol=0.02,
+        )
+
     def test_proposes_maximum_excursion_and_preceding_neutral_departure(self):
         trace = synthetic_trace()
 

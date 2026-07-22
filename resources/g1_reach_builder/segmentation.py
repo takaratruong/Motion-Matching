@@ -20,6 +20,7 @@ class SegmentationConfig:
     maximum_outbound_s: float = 3.60
     approach_window_s: float = 0.20
     minimum_approach_displacement_m: float = 0.01
+    minimum_peak_prominence_m: float = 0.08
 
     def validate(self) -> None:
         values = (
@@ -31,6 +32,7 @@ class SegmentationConfig:
             self.maximum_outbound_s,
             self.approach_window_s,
             self.minimum_approach_displacement_m,
+            self.minimum_peak_prominence_m,
         )
         if not all(np.isfinite(value) and value > 0 for value in values):
             raise ValueError("segmentation values must be finite and positive")
@@ -76,6 +78,49 @@ def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
     return list(zip(starts.tolist(), stops.tolist()))
 
 
+def prominent_endpoint_frames(
+    distance: np.ndarray,
+    config: SegmentationConfig,
+) -> list[int]:
+    distance = np.asarray(distance, np.float64)
+    if distance.ndim != 1 or len(distance) < 3:
+        return []
+    window = int(round(config.maximum_outbound_s * config.fps))
+    candidates = np.flatnonzero(
+        (distance[1:-1] >= distance[:-2])
+        & (distance[1:-1] > distance[2:])
+        & (distance[1:-1] >= config.minimum_excursion_m)
+    ) + 1
+    prominent = []
+    for peak in candidates.tolist():
+        left = float(np.min(distance[max(0, peak - window) : peak + 1]))
+        right = float(
+            np.min(distance[peak : min(len(distance), peak + window + 1)])
+        )
+        if (
+            float(distance[peak]) - max(left, right)
+            >= config.minimum_peak_prominence_m
+        ):
+            prominent.append(peak)
+
+    for start, stop in _runs(distance > config.return_radius_m):
+        peak = start + int(np.argmax(distance[start:stop]))
+        if distance[peak] >= config.minimum_excursion_m:
+            prominent.append(peak)
+
+    minimum_separation = int(round(
+        config.minimum_separation_s * config.fps
+    ))
+    selected: list[int] = []
+    for peak in sorted(set(prominent)):
+        if selected and peak - selected[-1] <= minimum_separation:
+            if distance[peak] > distance[selected[-1]]:
+                selected[-1] = peak
+        else:
+            selected.append(peak)
+    return selected
+
+
 def propose_wrist_trace(
     trace: np.ndarray,
     source_frames: np.ndarray,
@@ -99,25 +144,39 @@ def propose_wrist_trace(
     )))
     maximum_frames = int(round(config.maximum_outbound_s * config.fps))
     proposals: list[ReachProposal] = []
-    for start, stop in _runs(distance > config.return_radius_m):
-        grab = start + int(np.argmax(distance[start:stop]))
+    for peak in prominent_endpoint_frames(distance, config):
+        grab = peak
         excursion = float(distance[grab])
-        if excursion < config.minimum_excursion_m:
-            continue
         prior_neutral = np.flatnonzero(
-            distance[: start + 1] <= config.neutral_radius_m
+            distance[: grab + 1] <= config.neutral_radius_m
         )
-        departure = int(prior_neutral[-1]) if len(prior_neutral) else start
+        if len(prior_neutral):
+            departure = int(prior_neutral[-1])
+        else:
+            local_start = max(0, grab - maximum_frames)
+            departure = local_start + int(np.argmin(
+                distance[local_start : grab + 1]
+            ))
         departure = max(departure, grab - maximum_frames)
+        for candidate in range(
+            grab,
+            max(departure, grab - int(round(config.fps))) - 1,
+            -1,
+        ):
+            approach_start = max(departure, candidate - approach_frames)
+            if np.linalg.norm(trace[candidate] - trace[approach_start]) >= (
+                config.minimum_approach_displacement_m
+            ):
+                grab = candidate
+                break
         approach_start = max(departure, grab - approach_frames)
         approach_displacement = float(np.linalg.norm(
             trace[grab] - trace[approach_start]
         ))
-        returned = stop < len(trace)
         confidence = min(1.0, excursion / 0.45) * min(
             1.0, approach_displacement / 0.10
         )
-        if returned:
+        if peak + approach_frames < len(trace):
             confidence = min(1.0, confidence + 0.10)
         source_grab = int(source_frames[grab])
         identity = hashlib.sha256(
@@ -135,17 +194,7 @@ def propose_wrist_trace(
             confidence=float(confidence),
         ))
 
-    minimum_separation = int(round(
-        config.minimum_separation_s * config.fps
-    ))
-    merged: list[ReachProposal] = []
-    for proposal in proposals:
-        if merged and proposal.grab_frame - merged[-1].grab_frame < minimum_separation:
-            if proposal.excursion_m > merged[-1].excursion_m:
-                merged[-1] = proposal
-            continue
-        merged.append(proposal)
-    return merged
+    return proposals
 
 
 def _root_relative_left_wrist(
@@ -189,4 +238,3 @@ def propose_reaches(
             config,
         ))
     return result
-
