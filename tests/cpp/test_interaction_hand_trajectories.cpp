@@ -952,6 +952,81 @@ void test_shape_converges_contact_without_moving_root_or_legs() {
     }
 }
 
+void require_contact_matches_full_shape(
+    const interaction::ShapedHandContact& contact,
+    const interaction::ShapedHandTrajectory& shaped,
+    size_t contact_point) {
+    require(contact.accepted == shaped.contact_accepted,
+            "Contact-only and full shaping acceptance diverged");
+    require(contact.reason == shaped.reason,
+            "Contact-only and full shaping reasons diverged");
+    require(near(contact.hand.position,
+                 shaped.path.hands[contact_point].position),
+            "Contact-only and full shaping positions diverged");
+    require(near_rotation(contact.hand.rotation,
+                          shaped.path.hands[contact_point].rotation),
+            "Contact-only and full shaping rotations diverged");
+    require(near(contact.elbow, shaped.path.elbows[contact_point]),
+            "Contact-only and full shaping elbows diverged");
+    require(std::abs(contact.achieved_orientation_error_radians -
+                     shaped.achieved_orientation_error_radians) <= 1.0e-5F,
+            "Contact-only and full shaping orientation errors diverged");
+}
+
+void test_contact_only_matches_full_axis_and_position_only_shaping() {
+    ClipSpec source{};
+    source.grasp_position = vec3(0.10F, 0.20F, 0.30F);
+    source.grasp_rotation = quat_from_angle_axis(
+        0.523598776F, vec3(1.0F, 0.0F, 0.0F));
+    const interaction::Database database = make_database({source});
+    interaction::HandTrajectoryQuery query = identity_query();
+    query.grasp_world_position.y += 0.05F;
+    query.orientation_mode = interaction::GraspOrientationMode::ApproachAxis;
+    const auto selected = interaction::select_hand_trajectories(database, query);
+    require(selected.size() == 1U,
+            "Contact parity fixture was not selected");
+
+    const interaction::ShapedHandContact axis_contact =
+        interaction::shape_hand_trajectory_contact(
+            database, selected[0], query, interaction::IKConfig{});
+    const interaction::ShapedHandTrajectory axis_full =
+        interaction::shape_hand_trajectory(
+            database, selected[0], query, interaction::IKConfig{});
+    require_contact_matches_full_shape(
+        axis_contact, axis_full, selected[0].contact_point);
+
+    query.orientation_mode = interaction::GraspOrientationMode::PositionOnly;
+    const interaction::ShapedHandContact position_contact =
+        interaction::shape_hand_trajectory_contact(
+            database, selected[0], query, interaction::IKConfig{});
+    const interaction::ShapedHandTrajectory position_full =
+        interaction::shape_hand_trajectory(
+            database, selected[0], query, interaction::IKConfig{});
+    require_contact_matches_full_shape(
+        position_contact, position_full, selected[0].contact_point);
+}
+
+void test_contact_only_honors_widened_correction_envelope() {
+    const interaction::Database database = make_database({
+        {interaction::Hand::Right, vec3(0.10F, 0.20F, 0.30F), quat()},
+    });
+    const auto selected = interaction::select_hand_trajectories(
+        database, identity_query());
+    interaction::HandTrajectoryQuery query = identity_query();
+    query.grasp_world_position.y += 0.46F;
+    interaction::IKConfig config{};
+    config.maximum_request_position_m = 0.45F;
+
+    const interaction::ShapedHandContact contact =
+        interaction::shape_hand_trajectory_contact(
+            database, selected[0], query, config);
+
+    require(!contact.accepted,
+            "Contact-only shaping accepted a 46 cm correction");
+    require(contact.reason == interaction::Reason::CorrectionLimit,
+            "Contact-only shaping reported the wrong correction-limit reason");
+}
+
 void test_shape_rejects_contact_correction_above_solver_envelope() {
     const interaction::Database database = make_database({
         {interaction::Hand::Right, vec3(0.10F, 0.20F, 0.30F), quat()},
@@ -1199,6 +1274,8 @@ int main() {
     test_raw_mapping_uses_upright_scene_alignment_without_grasp_residual();
     test_position_only_mapping_preserves_object_mapped_contact_rotation();
     test_shape_converges_contact_without_moving_root_or_legs();
+    test_contact_only_matches_full_axis_and_position_only_shaping();
+    test_contact_only_honors_widened_correction_envelope();
     test_position_only_shaping_ignores_orientation_acceptance();
     test_compact_database_shapes_trajectories_with_default_pose_channels();
     test_partial_compact_database_is_rejected_before_clip_filtering();

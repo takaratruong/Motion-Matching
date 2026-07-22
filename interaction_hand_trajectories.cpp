@@ -436,6 +436,150 @@ void validate_trajectory(const HandTrajectory& trajectory) {
     }
 }
 
+void validate_shaping_range(const HandTrajectory& trajectory) {
+    const size_t sample_count = trajectory.hands_in_source_object.size();
+    if (trajectory.start_frame < 0 ||
+        trajectory.reach_frame < trajectory.start_frame ||
+        trajectory.contact_frame <= trajectory.reach_frame ||
+        trajectory.lift_frame < trajectory.contact_frame ||
+        trajectory.reach_point != static_cast<size_t>(
+            trajectory.reach_frame - trajectory.start_frame) ||
+        trajectory.contact_point != static_cast<size_t>(
+            trajectory.contact_frame - trajectory.start_frame) ||
+        static_cast<size_t>(trajectory.lift_frame - trajectory.start_frame + 1) !=
+            sample_count) {
+        throw std::invalid_argument(
+            "trajectory frame range does not match samples");
+    }
+}
+
+Pose aligned_trajectory_pose(
+    const Database& database,
+    int32_t frame,
+    const Transform& alignment) {
+    Pose pose = trajectory_pose_at_frame(database, frame);
+    const size_t root = static_cast<size_t>(g1_skeleton::Simulation);
+    const Transform mapped_root = compose(
+        alignment, {pose.positions[root], pose.rotations[root]});
+    pose.positions[root] = mapped_root.position;
+    pose.rotations[root] = mapped_root.rotation;
+    return pose;
+}
+
+struct ShapeContext {
+    vec3 contact_translation{};
+    vec3 axis_in_hand{1.0F, 0.0F, 0.0F};
+    quat contact_rotation{};
+    bool refine_orientation = false;
+    bool axis_orientation = false;
+};
+
+ShapeContext make_shape_context(
+    const HandTrajectory& trajectory,
+    const HandTrajectoryQuery& query,
+    const Transform& alignment,
+    const Transform& base_contact) {
+    ShapeContext context{};
+    context.contact_translation =
+        query.grasp_world_position - base_contact.position;
+    context.axis_orientation =
+        query.orientation_mode == GraspOrientationMode::ApproachAxis;
+    context.refine_orientation =
+        query.orientation_mode == GraspOrientationMode::ExactPose ||
+        context.axis_orientation;
+    const vec3 mapped_candidate_axis = normalize(quat_mul_vec3(
+        alignment.rotation,
+        quat_mul_vec3(
+            trajectory.source_object.rotation,
+            trajectory.source_approach_direction_object)));
+    context.axis_in_hand = quat_mul_vec3(
+        quat_inv(base_contact.rotation), mapped_candidate_axis);
+    context.contact_rotation = context.refine_orientation
+        ? quat_normalize(quat_mul(
+              query.grasp_world_rotation,
+              quat_inv(base_contact.rotation)))
+        : quat();
+    return context;
+}
+
+IKConfig shape_solve_config(
+    const HandTrajectoryQuery& query,
+    const IKConfig& config) {
+    IKConfig result = config;
+    constexpr float pi = 3.141592654F;
+    if (query.orientation_mode == GraspOrientationMode::ApproachAxis) {
+        result.maximum_request_orientation_radians = pi;
+        result.orientation_scale_m_per_radian = 0.10F;
+        result.maximum_iterations = std::max(16, config.maximum_iterations);
+    } else if (query.orientation_mode == GraspOrientationMode::PositionOnly) {
+        result.maximum_request_orientation_radians = pi;
+        result.accepted_orientation_radians = pi;
+        result.orientation_scale_m_per_radian = 0.0F;
+    }
+    return result;
+}
+
+Transform shaped_target(
+    const Transform& base_hand,
+    float weight,
+    const ShapeContext& context) {
+    Transform target = base_hand;
+    target.position = target.position + weight * context.contact_translation;
+    if (context.refine_orientation) {
+        const quat corrected = quat_normalize(quat_mul(
+            context.contact_rotation, base_hand.rotation));
+        target.rotation = quat_nlerp_shortest(
+            base_hand.rotation, corrected, weight);
+    }
+    return target;
+}
+
+ShapedHandContact solve_shaped_sample(
+    Pose pose,
+    const Transform& base_hand,
+    float weight,
+    bool contact_sample,
+    const ShapeContext& context,
+    const HandTrajectoryQuery& query,
+    const IKConfig& config) {
+    IKResult result{};
+    if (weight > 0.0F) {
+        result = solve_hand_ik(
+            pose,
+            query.hand,
+            shaped_target(base_hand, weight, context),
+            shape_solve_config(query, config));
+    }
+    const WorldPose world = world_pose(pose);
+    ShapedHandContact shaped{};
+    shaped.pose = std::move(pose);
+    shaped.hand = hand_transform(world, query.hand);
+    shaped.elbow = world.positions[elbow_index(query.hand)];
+    if (!contact_sample) return shaped;
+
+    shaped.achieved_orientation_error_radians = quaternion_angle(
+        shaped.hand.rotation, query.grasp_world_rotation);
+    if (context.axis_orientation) {
+        const vec3 solved_axis = quat_mul_vec3(
+            shaped.hand.rotation, context.axis_in_hand);
+        constexpr float maximum_fallback_orientation_error = 1.047197551F;
+        shaped.accepted =
+            length(shaped.hand.position - query.grasp_world_position) <=
+                config.accepted_position_m &&
+            direction_angle(solved_axis, query.approach_world_direction) <=
+                config.accepted_orientation_radians &&
+            shaped.achieved_orientation_error_radians <=
+                maximum_fallback_orientation_error;
+        shaped.reason = shaped.accepted
+            ? Reason::None
+            : Reason::CorrectionLimit;
+    } else {
+        shaped.accepted = result.accepted;
+        shaped.reason = result.reason;
+    }
+    return shaped;
+}
+
 }  // namespace
 
 SupportKind support_kind(const Database& database, size_t clip) {
@@ -594,66 +738,59 @@ bool starts_on_allowed_side(
         minimum_dot;
 }
 
+ShapedHandContact shape_hand_trajectory_contact(
+    const Database& database,
+    const HandTrajectory& trajectory,
+    const HandTrajectoryQuery& query,
+    const IKConfig& config) {
+    validate_trajectory(trajectory);
+    validate_shaping_range(trajectory);
+    const Transform alignment = hand_trajectory_scene_alignment(
+        trajectory, query);
+    Pose pose = aligned_trajectory_pose(
+        database, trajectory.contact_frame, alignment);
+    const Transform base_contact = hand_transform(
+        world_pose(pose), query.hand);
+    const ShapeContext context = make_shape_context(
+        trajectory, query, alignment, base_contact);
+    return solve_shaped_sample(
+        std::move(pose),
+        base_contact,
+        1.0F,
+        true,
+        context,
+        query,
+        config);
+}
+
 ShapedHandTrajectory shape_hand_trajectory(
     const Database& database,
     const HandTrajectory& trajectory,
     const HandTrajectoryQuery& query,
     const IKConfig& config) {
     validate_trajectory(trajectory);
+    validate_shaping_range(trajectory);
     const Transform alignment = hand_trajectory_scene_alignment(
         trajectory, query);
     const size_t sample_count = trajectory.hands_in_source_object.size();
-    if (trajectory.start_frame < 0 ||
-        trajectory.reach_frame < trajectory.start_frame ||
-        trajectory.contact_frame <= trajectory.reach_frame ||
-        trajectory.lift_frame < trajectory.contact_frame ||
-        trajectory.reach_point != static_cast<size_t>(
-            trajectory.reach_frame - trajectory.start_frame) ||
-        trajectory.contact_point != static_cast<size_t>(
-            trajectory.contact_frame - trajectory.start_frame) ||
-        static_cast<size_t>(trajectory.lift_frame - trajectory.start_frame + 1) !=
-            sample_count) {
-        throw std::invalid_argument("trajectory frame range does not match samples");
-    }
 
     std::vector<Pose> aligned;
     aligned.reserve(sample_count);
     std::vector<Transform> base_hands;
     base_hands.reserve(sample_count);
     for (size_t sample = 0U; sample < sample_count; ++sample) {
-        Pose pose = trajectory_pose_at_frame(
+        Pose pose = aligned_trajectory_pose(
             database,
-            trajectory.start_frame + static_cast<int32_t>(sample));
-        const size_t root = static_cast<size_t>(g1_skeleton::Simulation);
-        const Transform mapped_root = compose(
-            alignment, {pose.positions[root], pose.rotations[root]});
-        pose.positions[root] = mapped_root.position;
-        pose.rotations[root] = mapped_root.rotation;
+            trajectory.start_frame + static_cast<int32_t>(sample),
+            alignment);
         const WorldPose world = world_pose(pose);
         base_hands.push_back(hand_transform(world, query.hand));
         aligned.push_back(std::move(pose));
     }
 
     const Transform& base_contact = base_hands[trajectory.contact_point];
-    const vec3 contact_translation =
-        query.grasp_world_position - base_contact.position;
-    const bool exact_orientation =
-        query.orientation_mode == GraspOrientationMode::ExactPose;
-    const bool axis_orientation =
-        query.orientation_mode == GraspOrientationMode::ApproachAxis;
-    const bool refine_orientation = exact_orientation || axis_orientation;
-    const vec3 mapped_candidate_axis = normalize(quat_mul_vec3(
-        alignment.rotation,
-        quat_mul_vec3(
-            trajectory.source_object.rotation,
-            trajectory.source_approach_direction_object)));
-    const vec3 axis_in_hand = quat_mul_vec3(
-        quat_inv(base_contact.rotation), mapped_candidate_axis);
-    const quat contact_rotation = refine_orientation
-        ? quat_normalize(quat_mul(
-              query.grasp_world_rotation,
-              quat_inv(base_contact.rotation)))
-        : quat();
+    const ShapeContext context = make_shape_context(
+        trajectory, query, alignment, base_contact);
 
     ShapedHandTrajectory shaped{};
     shaped.poses.reserve(sample_count);
@@ -669,62 +806,22 @@ ShapedHandTrajectory shape_hand_trajectory(
                           trajectory.contact_point - trajectory.reach_point));
         const float weight =
             linear_weight * linear_weight * (3.0F - 2.0F * linear_weight);
-        Transform target = base_hands[sample];
-        target.position = target.position + weight * contact_translation;
-        if (refine_orientation) {
-            const quat corrected = quat_normalize(quat_mul(
-                contact_rotation, base_hands[sample].rotation));
-            target.rotation = quat_nlerp_shortest(
-                base_hands[sample].rotation, corrected, weight);
-        }
-
-        Pose pose = std::move(aligned[sample]);
-        IKConfig solve_config = config;
-        if (axis_orientation) {
-            constexpr float pi = 3.141592654F;
-            solve_config.maximum_request_orientation_radians = pi;
-            solve_config.orientation_scale_m_per_radian = 0.10F;
-            solve_config.maximum_iterations = std::max(
-                16, config.maximum_iterations);
-        } else if (!exact_orientation) {
-            constexpr float pi = 3.141592654F;
-            solve_config.maximum_request_orientation_radians = pi;
-            solve_config.accepted_orientation_radians = pi;
-            solve_config.orientation_scale_m_per_radian = 0.0F;
-        }
-        IKResult result{};
-        if (weight > 0.0F) {
-            result = solve_hand_ik(pose, query.hand, target, solve_config);
-        }
-        const WorldPose world = world_pose(pose);
-        shaped.path.hands.push_back(hand_transform(world, query.hand));
-        shaped.path.elbows.push_back(
-            world.positions[elbow_index(query.hand)]);
-        shaped.poses.push_back(std::move(pose));
+        ShapedHandContact sample_result = solve_shaped_sample(
+            std::move(aligned[sample]),
+            base_hands[sample],
+            weight,
+            sample == trajectory.contact_point,
+            context,
+            query,
+            config);
+        shaped.path.hands.push_back(sample_result.hand);
+        shaped.path.elbows.push_back(sample_result.elbow);
+        shaped.poses.push_back(std::move(sample_result.pose));
         if (sample == trajectory.contact_point) {
-            const Transform solved_hand = hand_transform(world, query.hand);
-            shaped.achieved_orientation_error_radians = quaternion_angle(
-                solved_hand.rotation, query.grasp_world_rotation);
-            if (axis_orientation) {
-                const vec3 solved_axis = quat_mul_vec3(
-                    solved_hand.rotation, axis_in_hand);
-                constexpr float maximum_fallback_orientation_error =
-                    1.047197551F;
-                shaped.contact_accepted =
-                    length(solved_hand.position - query.grasp_world_position) <=
-                        config.accepted_position_m &&
-                    direction_angle(
-                        solved_axis, query.approach_world_direction) <=
-                        config.accepted_orientation_radians &&
-                    shaped.achieved_orientation_error_radians <=
-                        maximum_fallback_orientation_error;
-                shaped.reason = shaped.contact_accepted
-                    ? Reason::None
-                    : Reason::CorrectionLimit;
-            } else {
-                shaped.contact_accepted = result.accepted;
-                shaped.reason = result.reason;
-            }
+            shaped.achieved_orientation_error_radians =
+                sample_result.achieved_orientation_error_radians;
+            shaped.contact_accepted = sample_result.accepted;
+            shaped.reason = sample_result.reason;
         }
     }
     return shaped;

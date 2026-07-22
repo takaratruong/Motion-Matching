@@ -66,6 +66,15 @@ struct MappedHandTrajectory {
     std::vector<vec3> elbows;
 };
 
+struct ShapedHandContact {
+    Pose pose{};
+    Transform hand{};
+    vec3 elbow{};
+    float achieved_orientation_error_radians = 0.0F;
+    bool accepted = false;
+    Reason reason = Reason::None;
+};
+
 struct ShapedHandTrajectory {
     std::vector<Pose> poses;
     MappedHandTrajectory path;
@@ -132,6 +141,12 @@ bool starts_on_allowed_side(
     const HandTrajectoryQuery& query,
     vec3 scene_front,
     float minimum_dot = 0.0F);
+
+ShapedHandContact shape_hand_trajectory_contact(
+    const Database& database,
+    const HandTrajectory& trajectory,
+    const HandTrajectoryQuery& query,
+    const IKConfig& config = IKConfig{});
 
 ShapedHandTrajectory shape_hand_trajectory(
     const Database& database,
