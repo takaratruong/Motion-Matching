@@ -40,6 +40,78 @@ bool valid_rotation(quat value) {
     return squared > kQuaternionEpsilon;
 }
 
+bool valid_box(const OrientedBox& box) {
+    return finite(box.world.position) && valid_rotation(box.world.rotation) &&
+           positive(box.dimensions);
+}
+
+vec3 point_in_box(const OrientedBox& box, vec3 point) {
+    return compose(
+        inverse(Transform{box.world.position, quat_normalize(box.world.rotation)}),
+        Transform{point, quat()}).position;
+}
+
+bool sphere_intersects_box(
+    vec3 center,
+    float radius,
+    const OrientedBox& box) {
+    const vec3 local = point_in_box(box, center);
+    const vec3 half = box.dimensions * 0.5F;
+    const vec3 closest = clamp(local, -half, half);
+    const vec3 offset = local - closest;
+    return dot(offset, offset) <= radius * radius;
+}
+
+bool update_slab(
+    float start,
+    float delta,
+    float half_extent,
+    float& minimum_time,
+    float& maximum_time) {
+    constexpr float epsilon = 1.0e-8F;
+    if (std::abs(delta) <= epsilon) {
+        return start >= -half_extent && start <= half_extent;
+    }
+    float first = (-half_extent - start) / delta;
+    float second = (half_extent - start) / delta;
+    if (first > second) std::swap(first, second);
+    minimum_time = std::max(minimum_time, first);
+    maximum_time = std::min(maximum_time, second);
+    return minimum_time <= maximum_time;
+}
+
+bool capsule_intersects_box(
+    vec3 start,
+    vec3 stop,
+    float radius,
+    const OrientedBox& box) {
+    const vec3 local_start = point_in_box(box, start);
+    const vec3 local_stop = point_in_box(box, stop);
+    const vec3 delta = local_stop - local_start;
+    const vec3 expanded = box.dimensions * 0.5F + radius;
+    float minimum_time = 0.0F;
+    float maximum_time = 1.0F;
+    return update_slab(
+               local_start.x, delta.x, expanded.x,
+               minimum_time, maximum_time) &&
+           update_slab(
+               local_start.y, delta.y, expanded.y,
+               minimum_time, maximum_time) &&
+           update_slab(
+               local_start.z, delta.z, expanded.z,
+               minimum_time, maximum_time);
+}
+
+bool arm_intersects_box(
+    vec3 wrist,
+    vec3 elbow,
+    const OrientedBox& box,
+    const TrajectoryCollisionConfig& config) {
+    return sphere_intersects_box(wrist, config.wrist_radius_m, box) ||
+           capsule_intersects_box(
+               elbow, wrist, config.forearm_radius_m, box);
+}
+
 vec3 read_vec3(const std::vector<float>& values, size_t index) {
     const size_t offset = 3U * index;
     return vec3(values.at(offset), values.at(offset + 1U), values.at(offset + 2U));
@@ -271,6 +343,44 @@ MappedHandTrajectory map_hand_trajectory(
         for (vec3& elbow : mapped.elbows) elbow = elbow + translation;
     }
     return mapped;
+}
+
+TrajectoryFeasibility evaluate_trajectory_feasibility(
+    const MappedHandTrajectory& trajectory,
+    size_t contact_point,
+    const OrientedBox& object,
+    const ShelfGeometry& shelf,
+    const TrajectoryCollisionConfig& config) {
+    if (trajectory.hands.empty() ||
+        trajectory.hands.size() != trajectory.elbows.size() ||
+        contact_point >= trajectory.hands.size() ||
+        !valid_box(object) ||
+        !finite(config.wrist_radius_m) || config.wrist_radius_m < 0.0F ||
+        !finite(config.forearm_radius_m) || config.forearm_radius_m < 0.0F) {
+        throw std::invalid_argument("invalid trajectory collision query");
+    }
+    for (const OrientedBox& box : shelf.boxes) {
+        if (!valid_box(box)) {
+            throw std::invalid_argument("invalid shelf geometry");
+        }
+    }
+    for (size_t sample = 0U; sample < contact_point; ++sample) {
+        if (arm_intersects_box(
+                trajectory.hands[sample].position,
+                trajectory.elbows[sample], object, config)) {
+            return {TrajectoryFeasibilityReason::ObjectCollision, sample};
+        }
+    }
+    for (size_t sample = 0U; sample < trajectory.hands.size(); ++sample) {
+        for (const OrientedBox& box : shelf.boxes) {
+            if (arm_intersects_box(
+                    trajectory.hands[sample].position,
+                    trajectory.elbows[sample], box, config)) {
+                return {TrajectoryFeasibilityReason::ShelfCollision, sample};
+            }
+        }
+    }
+    return {};
 }
 
 }  // namespace interaction

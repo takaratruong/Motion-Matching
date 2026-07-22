@@ -146,6 +146,26 @@ interaction::HandTrajectoryQuery identity_query() {
     return query;
 }
 
+interaction::ShelfGeometry distant_shelf() {
+    interaction::ShelfGeometry shelf{};
+    for (interaction::OrientedBox& box : shelf.boxes) {
+        box.world = {vec3(100.0F, 100.0F, 100.0F), quat()};
+        box.dimensions = vec3(1.0F, 1.0F, 1.0F);
+    }
+    return shelf;
+}
+
+interaction::MappedHandTrajectory mapped_line(
+    std::initializer_list<vec3> hands,
+    std::initializer_list<vec3> elbows) {
+    interaction::MappedHandTrajectory mapped{};
+    for (const vec3 hand : hands) {
+        mapped.hands.push_back({hand, quat()});
+    }
+    mapped.elbows.assign(elbows.begin(), elbows.end());
+    return mapped;
+}
+
 void test_selects_every_close_complete_same_hand_clip_in_stable_order() {
     const interaction::Database database = make_database({
         {interaction::Hand::Right, vec3(0.10F, 0.20F, 0.30F), quat()},
@@ -230,11 +250,68 @@ void test_position_only_mapping_preserves_object_mapped_contact_rotation() {
             "position-only mapping changed Contact rotation");
 }
 
+void test_collision_feasibility_is_phase_aware() {
+    const interaction::OrientedBox object{
+        {vec3(), quat()}, vec3(1.0F, 1.0F, 1.0F)};
+    const interaction::ShelfGeometry far_shelf = distant_shelf();
+
+    const auto clear = mapped_line(
+        {vec3(2.0F, 2.0F, 2.0F), vec3(1.5F, 2.0F, 2.0F)},
+        {vec3(2.5F, 2.0F, 2.0F), vec3(2.0F, 2.0F, 2.0F)});
+    require(interaction::evaluate_trajectory_feasibility(
+                clear, 1U, object, far_shelf).reason ==
+            interaction::TrajectoryFeasibilityReason::None,
+            "clear trajectory was rejected");
+
+    const auto precontact_object = mapped_line(
+        {vec3(), vec3(1.5F, 2.0F, 2.0F)},
+        {vec3(1.0F, 0.0F, 0.0F), vec3(2.0F, 2.0F, 2.0F)});
+    const auto object_rejected = interaction::evaluate_trajectory_feasibility(
+        precontact_object, 1U, object, far_shelf);
+    require(object_rejected.reason ==
+                interaction::TrajectoryFeasibilityReason::ObjectCollision &&
+            object_rejected.sample == 0U,
+            "pre-Contact object penetration was not identified");
+
+    const auto contact_object = mapped_line(
+        {vec3(2.0F, 2.0F, 2.0F), vec3()},
+        {vec3(2.5F, 2.0F, 2.0F), vec3(1.0F, 0.0F, 0.0F)});
+    require(interaction::evaluate_trajectory_feasibility(
+                contact_object, 1U, object, far_shelf).reason ==
+            interaction::TrajectoryFeasibilityReason::None,
+            "Contact object overlap was not exempted");
+}
+
+void test_forearm_capsule_and_contact_still_collide_with_shelf() {
+    const interaction::OrientedBox object{
+        {vec3(), quat()}, vec3(0.2F, 0.2F, 0.2F)};
+    interaction::ShelfGeometry shelf = distant_shelf();
+    shelf.boxes[0] = {
+        {vec3(3.0F, 0.0F, 0.0F), quat()}, vec3(0.2F, 1.0F, 1.0F)};
+    const auto forearm_crossing = mapped_line(
+        {vec3(2.0F, 0.0F, 0.0F)},
+        {vec3(4.0F, 0.0F, 0.0F)});
+    require(interaction::evaluate_trajectory_feasibility(
+                forearm_crossing, 0U, object, shelf).reason ==
+            interaction::TrajectoryFeasibilityReason::ShelfCollision,
+            "forearm capsule crossing shelf was not rejected");
+
+    shelf.boxes[0] = object;
+    const auto contact_shelf = mapped_line(
+        {vec3()}, {vec3(1.0F, 0.0F, 0.0F)});
+    require(interaction::evaluate_trajectory_feasibility(
+                contact_shelf, 0U, object, shelf).reason ==
+            interaction::TrajectoryFeasibilityReason::ShelfCollision,
+            "shelf collision was incorrectly exempted at Contact");
+}
+
 }  // namespace
 
 int main() {
     test_selects_every_close_complete_same_hand_clip_in_stable_order();
     test_full_pose_mapping_converges_exactly_at_contact();
     test_position_only_mapping_preserves_object_mapped_contact_rotation();
+    test_collision_feasibility_is_phase_aware();
+    test_forearm_capsule_and_contact_still_collide_with_shelf();
     return 0;
 }

@@ -2,6 +2,7 @@
 
 #include "interaction_target.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -41,6 +42,31 @@ struct MappedHandTrajectory {
     std::vector<vec3> elbows;
 };
 
+struct OrientedBox {
+    Transform world{};
+    vec3 dimensions{};
+};
+
+struct ShelfGeometry {
+    std::array<OrientedBox, 5> boxes{};
+};
+
+enum class TrajectoryFeasibilityReason : uint8_t {
+    None = 0U,
+    ObjectCollision = 1U,
+    ShelfCollision = 2U,
+};
+
+struct TrajectoryFeasibility {
+    TrajectoryFeasibilityReason reason = TrajectoryFeasibilityReason::None;
+    size_t sample = 0U;
+};
+
+struct TrajectoryCollisionConfig {
+    float wrist_radius_m = 0.04F;
+    float forearm_radius_m = 0.035F;
+};
+
 std::vector<HandTrajectory> select_hand_trajectories(
     const Database& database,
     const HandTrajectoryQuery& query,
@@ -49,5 +75,12 @@ std::vector<HandTrajectory> select_hand_trajectories(
 MappedHandTrajectory map_hand_trajectory(
     const HandTrajectory& trajectory,
     const HandTrajectoryQuery& query);
+
+TrajectoryFeasibility evaluate_trajectory_feasibility(
+    const MappedHandTrajectory& trajectory,
+    size_t contact_point,
+    const OrientedBox& object,
+    const ShelfGeometry& shelf,
+    const TrajectoryCollisionConfig& config = TrajectoryCollisionConfig{});
 
 }  // namespace interaction
