@@ -70,35 +70,63 @@ pre-contact path preserves the selected clip's shape.
 The best path is green and thicker through repeated line/sphere marks. Remaining
 paths use a blue-to-purple rank gradient. Contact points are marked separately.
 
-## Runtime Integration
+## Trajectory-Lab Viewer
 
-Add a focused, renderer-independent trajectory-ranking module. The controller
-loads and ranks paths when `MM_INTERACTION_HAND_TRAJECTORIES=1` and remaps
-world-space paths whenever the target generation, object pose, or grasp request
-changes. Rendering consumes only the resulting point arrays.
+Use a separate lightweight raylib executable rather than the playable
+controller. It loads only the interaction pack, selector, shelf scene, and
+trajectory renderer. Locomotion and diffusion therefore cannot influence this
+diagnostic.
 
-The baseline launch must omit `MM_G1_OFFLINE_OVERLAP` and any diffusion worker
-variables. Existing motion matching and interaction playback remain the sole
-motion authority. Flat terrain and the blue G1 skeleton remain enabled.
+The viewer exposes live object controls:
+
+- `Q`/`E`: object yaw;
+- `R`/`F`: object pitch;
+- `Z`/`C`: object roll;
+- arrow keys: object planar translation;
+- Page Up/Page Down: object height;
+- `V`: toggle rejected trajectories;
+- Backspace: reset the query.
+
+The grasp is stored in object coordinates and follows every object transform.
+The internal query interface also supports an independently supplied grasp world
+pose or position for later tests.
+
+## Shelf and Collision Feasibility
+
+Construct a shelf from five oriented boxes: floor, back, left wall, right wall,
+and top. The shelf remains fixed while the object moves and rotates inside it.
+
+Each selected source clip stores wrist and elbow samples from Reach through
+Lift. Map both through the object frame and the exact Contact residual. Before
+Contact, reject a path if its wrist sphere or elbow-to-wrist capsule intersects
+the target object's oriented box. At all frames, reject a path if those proxies
+intersect any shelf box. Contact and post-Contact object overlap are exempt only
+from the object test, never from shelf tests.
+
+Accepted paths are the choices available to later playback. Rejected paths are
+not selectable, but can be drawn in faint red for diagnosis. The UI reports
+close, collision-safe, object-rejected, and shelf-rejected counts.
 
 ## Failure Behavior
 
 Malformed configuration, missing interaction artifacts, zero eligible clips, or
-more than 4096 compatible clips must produce a clear startup diagnostic. A
-single malformed source clip is excluded without changing the deterministic
-order of valid candidates.
+more than 4096 compatible clips must produce a clear startup diagnostic. Invalid
+shelf dimensions are rejected. A single malformed source clip is excluded
+without changing the deterministic order of valid candidates.
 
 ## Verification
 
 - Unit tests cover ranking, deterministic tie-breaking, hand filtering, phase
   bounds, tolerance gates, exact pose convergence, exact position-only
-  convergence, and moved/rotated target invariance.
-- Controller source tests prove the environment gate, all-passing-candidates
-  behavior, and absence of diffusion authority in the baseline launch.
-- The controller is built and launched with exactly one process, flat terrain,
-  skeleton rendering, and no offline overlap artifact.
+  convergence, moved/rotated target invariance, object collision, shelf
+  collision, and Contact exemption boundaries.
+- Viewer source tests prove all controls, rejected-path toggle, and absence of
+  diffusion/controller authority.
+- The viewer is built and launched as exactly one process with no controller,
+  robot mesh, terrain mesh, or diffusion artifact.
 - Visual success means all compatible paths converge exactly on the requested
-  grasp and remain attached to it when the object or grasp transform changes.
+  grasp, collision-unsafe paths are excluded, and choices update immediately
+  when object position or orientation changes.
 
 ## Deterministic Playback Follow-On
 
