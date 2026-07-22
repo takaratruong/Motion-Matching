@@ -456,14 +456,18 @@ def _activate_scored_control(
     """Prepare one policy action before any scored physics release."""
 
     if before_control is not None:
-        before_control()
-    gear.continue_group()
-    if before_control is not None:
+        # Keep the GEAR process and DDS participant alive while X11 waits for
+        # focus. The simulation-control fence blocks policy/reference workers
+        # without expiring DDS liveliness during an arbitrarily long wait.
+        gear.continue_group()
         gear.pause_simulation_control()
+        before_control()
         gear.begin_simulation_control_sync()
         simulator.refresh_low_state()
         gear.finish_simulation_control_sync()
         gear.resume_simulation_control()
+    else:
+        gear.continue_group()
     gear.activate_control()
     ready = gear.wait_for_first_policy_action()
     print(

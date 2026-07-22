@@ -769,9 +769,9 @@ class ScoredControlStartupTests(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                "input.ready",
                 "gear.continue_group",
                 "gear.pause_simulation_control",
+                "input.ready",
                 "gear.begin_simulation_control_sync",
                 "simulator.refresh_low_state",
                 "gear.finish_simulation_control_sync",
