@@ -350,6 +350,86 @@ Transform hand_trajectory_scene_alignment(
     return upright_scene_alignment(trajectory.source_object, target_object);
 }
 
+ShapedHandTrajectory shape_hand_trajectory(
+    const Database& database,
+    const HandTrajectory& trajectory,
+    const HandTrajectoryQuery& query,
+    const IKConfig& config) {
+    validate_trajectory(trajectory);
+    const Transform alignment = hand_trajectory_scene_alignment(
+        trajectory, query);
+    const size_t sample_count = trajectory.hands_in_source_object.size();
+    if (trajectory.reach_frame < 0 || trajectory.lift_frame < trajectory.reach_frame ||
+        static_cast<size_t>(trajectory.lift_frame - trajectory.reach_frame + 1) !=
+            sample_count) {
+        throw std::invalid_argument("trajectory frame range does not match samples");
+    }
+
+    std::vector<Pose> aligned;
+    aligned.reserve(sample_count);
+    std::vector<Transform> base_hands;
+    base_hands.reserve(sample_count);
+    for (size_t sample = 0U; sample < sample_count; ++sample) {
+        Pose pose = pose_at_frame(
+            database,
+            trajectory.reach_frame + static_cast<int32_t>(sample));
+        const size_t root = static_cast<size_t>(g1_skeleton::Simulation);
+        const Transform mapped_root = compose(
+            alignment, {pose.positions[root], pose.rotations[root]});
+        pose.positions[root] = mapped_root.position;
+        pose.rotations[root] = mapped_root.rotation;
+        const WorldPose world = world_pose(pose);
+        base_hands.push_back(hand_transform(world, query.hand));
+        aligned.push_back(std::move(pose));
+    }
+
+    const Transform& base_contact = base_hands[trajectory.contact_point];
+    const vec3 contact_translation =
+        query.grasp_world_position - base_contact.position;
+    const quat contact_rotation = query.grasp_world_rotation.has_value()
+        ? quat_normalize(quat_mul(
+              *query.grasp_world_rotation,
+              quat_inv(base_contact.rotation)))
+        : quat();
+
+    ShapedHandTrajectory shaped{};
+    shaped.poses.reserve(sample_count);
+    shaped.path.hands.reserve(sample_count);
+    shaped.path.elbows.reserve(sample_count);
+    for (size_t sample = 0U; sample < sample_count; ++sample) {
+        const float linear_weight = trajectory.contact_point == 0U
+            ? 1.0F
+            : std::min(
+                  1.0F,
+                  static_cast<float>(sample) /
+                      static_cast<float>(trajectory.contact_point));
+        const float weight =
+            linear_weight * linear_weight * (3.0F - 2.0F * linear_weight);
+        Transform target = base_hands[sample];
+        target.position = target.position + weight * contact_translation;
+        if (query.grasp_world_rotation.has_value()) {
+            const quat corrected = quat_normalize(quat_mul(
+                contact_rotation, base_hands[sample].rotation));
+            target.rotation = quat_nlerp_shortest(
+                base_hands[sample].rotation, corrected, weight);
+        }
+
+        Pose pose = std::move(aligned[sample]);
+        const IKResult result = solve_hand_ik(
+            pose, query.hand, target, config);
+        const WorldPose world = world_pose(pose);
+        shaped.path.hands.push_back(hand_transform(world, query.hand));
+        shaped.path.elbows.push_back(
+            world.positions[elbow_index(query.hand)]);
+        shaped.poses.push_back(std::move(pose));
+        if (sample == trajectory.contact_point) {
+            shaped.contact_accepted = result.accepted;
+            shaped.reason = result.reason;
+        }
+    }
+    return shaped;
+}
+
 MappedHandTrajectory map_hand_trajectory(
     const HandTrajectory& trajectory,
     const HandTrajectoryQuery& query) {

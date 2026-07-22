@@ -1,5 +1,6 @@
 #include "interaction_hand_trajectories.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -21,6 +22,29 @@ bool near_rotation(quat left, quat right, float tolerance = 1.0e-4F) {
         left.w * right.w + left.x * right.x +
         left.y * right.y + left.z * right.z);
     return std::abs(dot - 1.0F) <= tolerance;
+}
+
+bool active_arm_bone(size_t bone, interaction::Hand hand) {
+    const std::array<g1_skeleton::Bone, 7> left{{
+        g1_skeleton::LeftShoulderPitch,
+        g1_skeleton::LeftShoulderRoll,
+        g1_skeleton::LeftShoulderYaw,
+        g1_skeleton::LeftElbow,
+        g1_skeleton::LeftWristRoll,
+        g1_skeleton::LeftWristPitch,
+        g1_skeleton::LeftWrist,
+    }};
+    const std::array<g1_skeleton::Bone, 7> right{{
+        g1_skeleton::RightShoulderPitch,
+        g1_skeleton::RightShoulderRoll,
+        g1_skeleton::RightShoulderYaw,
+        g1_skeleton::RightElbow,
+        g1_skeleton::RightWristRoll,
+        g1_skeleton::RightWristPitch,
+        g1_skeleton::RightWrist,
+    }};
+    const auto& bones = hand == interaction::Hand::Left ? left : right;
+    return std::find(bones.begin(), bones.end(), bone) != bones.end();
 }
 
 struct ClipSpec {
@@ -336,6 +360,93 @@ void test_position_only_mapping_preserves_object_mapped_contact_rotation() {
             "position-only mapping changed Contact rotation");
 }
 
+void test_shape_converges_contact_without_moving_root_or_legs() {
+    const interaction::Database database = make_database({
+        {interaction::Hand::Right, vec3(0.10F, 0.20F, 0.30F), quat()},
+    });
+    interaction::HandTrajectoryQuery query = identity_query();
+    query.object_world = {
+        vec3(0.35F, 0.60F, -0.20F),
+        quat_from_angle_axis(0.25F, vec3(0.0F, 1.0F, 0.0F))};
+    const interaction::Transform source_grasp{
+        vec3(0.10F, 0.20F, 0.30F), quat()};
+    const interaction::Transform alignment{
+        vec3(0.35F, 0.0F, -0.20F), query.object_world.rotation};
+    const interaction::Transform raw_contact = interaction::compose(
+        alignment, source_grasp);
+    query.grasp_world_position =
+        raw_contact.position + vec3(0.0F, 0.05F, 0.0F);
+    query.grasp_world_rotation = raw_contact.rotation;
+    const auto selected = interaction::select_hand_trajectories(database, query);
+    require(selected.size() == 1U, "bounded shaping candidate was not selected");
+
+    const interaction::ShapedHandTrajectory shaped =
+        interaction::shape_hand_trajectory(
+            database, selected[0], query, interaction::IKConfig{});
+
+    require(shaped.poses.size() == selected[0].hands_in_source_object.size(),
+            "shaping did not return one pose per trajectory sample");
+    require(shaped.path.hands.size() == shaped.poses.size() &&
+                shaped.path.elbows.size() == shaped.poses.size(),
+            "shaping path and pose counts disagree");
+    require(shaped.contact_accepted,
+            "bounded Contact correction was not accepted");
+    require(shaped.reason == interaction::Reason::None,
+            "accepted Contact correction reported a failure reason");
+    const vec3 shaped_contact =
+        shaped.path.hands[selected[0].contact_point].position;
+    require(length(shaped_contact - query.grasp_world_position) <=
+                interaction::IKConfig{}.accepted_position_m,
+            "shaped Contact wrist did not converge to the requested grasp");
+    require(length(shaped_contact - query.grasp_world_position) <
+                length(raw_contact.position - query.grasp_world_position),
+            "arm IK did not improve the Contact wrist error");
+
+    const interaction::Transform scene_alignment =
+        interaction::hand_trajectory_scene_alignment(selected[0], query);
+    for (size_t sample = 0U; sample < shaped.poses.size(); ++sample) {
+        interaction::Pose expected = interaction::pose_at_frame(
+            database,
+            selected[0].reach_frame + static_cast<int32_t>(sample));
+        const interaction::Transform root = interaction::compose(
+            scene_alignment,
+            {expected.positions[g1_skeleton::Simulation],
+             expected.rotations[g1_skeleton::Simulation]});
+        expected.positions[g1_skeleton::Simulation] = root.position;
+        expected.rotations[g1_skeleton::Simulation] = root.rotation;
+        for (size_t bone = 0U; bone < g1_skeleton::BoneCount; ++bone) {
+            require(near(shaped.poses[sample].positions[bone],
+                         expected.positions[bone]),
+                    "IK shaping changed a local bone position");
+            if (!active_arm_bone(bone, query.hand)) {
+                require(near_rotation(shaped.poses[sample].rotations[bone],
+                                      expected.rotations[bone]),
+                        "IK shaping rotated the root, torso, or legs");
+            }
+        }
+    }
+}
+
+void test_shape_rejects_contact_correction_above_solver_envelope() {
+    const interaction::Database database = make_database({
+        {interaction::Hand::Right, vec3(0.10F, 0.20F, 0.30F), quat()},
+    });
+    const auto selected = interaction::select_hand_trajectories(
+        database, identity_query());
+    interaction::HandTrajectoryQuery over_limit = identity_query();
+    over_limit.grasp_world_position.x +=
+        interaction::IKConfig{}.maximum_request_position_m + 0.001F;
+
+    const interaction::ShapedHandTrajectory shaped =
+        interaction::shape_hand_trajectory(
+            database, selected[0], over_limit, interaction::IKConfig{});
+
+    require(!shaped.contact_accepted,
+            "over-limit Contact correction was accepted");
+    require(shaped.reason == interaction::Reason::CorrectionLimit,
+            "over-limit Contact correction reported the wrong reason");
+}
+
 void test_collision_feasibility_is_phase_aware() {
     const interaction::OrientedBox object{
         {vec3(), quat()}, vec3(1.0F, 1.0F, 1.0F)};
@@ -427,6 +538,8 @@ int main() {
     test_selects_every_close_complete_same_hand_clip_in_stable_order();
     test_raw_mapping_uses_upright_scene_alignment_without_grasp_residual();
     test_position_only_mapping_preserves_object_mapped_contact_rotation();
+    test_shape_converges_contact_without_moving_root_or_legs();
+    test_shape_rejects_contact_correction_above_solver_envelope();
     test_collision_feasibility_is_phase_aware();
     test_forearm_capsule_and_contact_still_collide_with_shelf();
     test_recorded_table_geometry_preserves_top_and_builds_four_legs();

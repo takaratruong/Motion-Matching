@@ -1,5 +1,6 @@
 #pragma once
 
+#include "interaction_ik.h"
 #include "interaction_target.h"
 
 #include <array>
@@ -40,6 +41,13 @@ struct HandTrajectory {
 struct MappedHandTrajectory {
     std::vector<Transform> hands;
     std::vector<vec3> elbows;
+};
+
+struct ShapedHandTrajectory {
+    std::vector<Pose> poses;
+    MappedHandTrajectory path;
+    bool contact_accepted = false;
+    Reason reason = Reason::None;
 };
 
 struct OrientedBox {
@@ -84,6 +92,12 @@ MappedHandTrajectory map_hand_trajectory(
 Transform hand_trajectory_scene_alignment(
     const HandTrajectory& trajectory,
     const HandTrajectoryQuery& query);
+
+ShapedHandTrajectory shape_hand_trajectory(
+    const Database& database,
+    const HandTrajectory& trajectory,
+    const HandTrajectoryQuery& query,
+    const IKConfig& config = IKConfig{});
 
 TrajectoryFeasibility evaluate_trajectory_feasibility(
     const MappedHandTrajectory& trajectory,
