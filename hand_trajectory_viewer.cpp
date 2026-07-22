@@ -1,5 +1,6 @@
 #include "interaction_hand_trajectories.h"
 #include "interaction_pose.h"
+#include "interaction_reuse_audit.h"
 #include "interaction_trajectory_database.h"
 #include "raylib.h"
 
@@ -10,6 +11,7 @@
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -45,6 +47,20 @@ struct TrajectorySet {
     size_t object_rejected = 0U;
     size_t environment_rejected = 0U;
 };
+
+TrajectorySet trajectory_set_from_audit(
+    interaction::ReuseAuditResult& audit) {
+    TrajectorySet result{};
+    result.valid.reserve(audit.displayed.size());
+    for (interaction::ReuseAuditMotion& motion : audit.displayed) {
+        result.valid.push_back({
+            std::move(motion.source),
+            std::move(motion.shaped),
+            TrajectoryFeasibilityReason::None,
+        });
+    }
+    return result;
+}
 
 Vector3 ray_vector(vec3 value) {
     return Vector3{value.x, value.y, value.z};
@@ -466,6 +482,8 @@ int main(int argc, char** argv) {
         bool position_only = false;
         bool show_rejected = true;
         bool search_stale = false;
+        bool audit_stale = false;
+        std::optional<interaction::ReuseAuditResult> audit;
         size_t selected_index = 0U;
         float animation_seconds = 0.0F;
         HandTrajectoryQuery query = make_query(
@@ -582,6 +600,7 @@ int main(int argc, char** argv) {
                         ? interaction::GraspOrientationMode::PositionOnly
                         : interaction::GraspOrientationMode::ExactPose);
                 search_stale = true;
+                audit_stale = true;
             }
             if (IsKeyPressed(KEY_ENTER)) {
                 trajectories = rebuild_valid_trajectories(
@@ -592,6 +611,39 @@ int main(int argc, char** argv) {
                     database, trajectories, selected_index, searched_query);
                 animation_seconds = 0.0F;
                 search_stale = false;
+            }
+            if (IsKeyPressed(KEY_A)) {
+                HandTrajectoryQuery audit_query = query;
+                audit_query.orientation_mode = position_only
+                    ? interaction::GraspOrientationMode::PositionOnly
+                    : interaction::GraspOrientationMode::ApproachAxis;
+                interaction::ReuseAuditConfig audit_config{};
+                audit_config.deadline_milliseconds = 30000U;
+                audit_config.worker_count = 4U;
+                interaction::ReuseAuditResult next_audit =
+                    interaction::audit_reusable_hand_trajectories(
+                        database,
+                        audit_query,
+                        {audit_query.object_world,
+                         audit_query.object_dimensions},
+                        environment,
+                        viewer_collision_config(),
+                        audit_config);
+                if (next_audit.status !=
+                    interaction::ReuseAuditStatus::Incomplete) {
+                    trajectories = trajectory_set_from_audit(next_audit);
+                    selected_index = 0U;
+                    searched_query = audit_query;
+                    selected_animation = shape_selected_animation(
+                        database,
+                        trajectories,
+                        selected_index,
+                        searched_query);
+                    animation_seconds = 0.0F;
+                    search_stale = false;
+                }
+                audit = std::move(next_audit);
+                audit_stale = false;
             }
 
             BeginDrawing();
@@ -639,7 +691,7 @@ int main(int argc, char** argv) {
             }
             EndMode3D();
 
-            DrawRectangle(14, 14, 790, 210, Color{255, 255, 255, 225});
+            DrawRectangle(14, 14, 790, 282, Color{255, 255, 255, 225});
             DrawText("Generic grasp trajectory field", 26, 24, 24, DARKGRAY);
             DrawText(
                 TextFormat(
@@ -698,6 +750,42 @@ int main(int argc, char** argv) {
                     "[: previous  / or ]: next  Enter: rerun  P: %s",
                     position_only ? "position-only grasp" : "full grasp pose"),
                 26, 160, 16, DARKGRAY);
+            if (audit.has_value()) {
+                const char* audit_status =
+                    audit->status == interaction::ReuseAuditStatus::Incomplete
+                    ? "AUDIT INCOMPLETE"
+                    : (audit_stale ? "AUDIT STALE" : "AUDIT COMPLETE");
+                DrawText(
+                    TextFormat(
+                        "%s | processed %i/%i | %llu ms",
+                        audit_status,
+                        static_cast<int>(audit->counts.processed),
+                        static_cast<int>(audit->counts.total),
+                        static_cast<unsigned long long>(
+                            audit->elapsed_milliseconds)),
+                    26, 186, 16,
+                    audit->status == interaction::ReuseAuditStatus::Incomplete ||
+                            audit_stale
+                        ? MAROON
+                        : DARKGREEN);
+                DrawText(
+                    TextFormat(
+                        "Contact accepted %i | fully shaped %i",
+                        static_cast<int>(audit->counts.contact_accepted),
+                        static_cast<int>(audit->counts.fully_shaped)),
+                    26, 212, 16, DARKGRAY);
+                DrawText(
+                    TextFormat(
+                        "object rejected %i | furniture rejected %i | reusable %i",
+                        static_cast<int>(audit->counts.object_rejected),
+                        static_cast<int>(audit->counts.environment_rejected),
+                        static_cast<int>(audit->counts.reusable)),
+                    26, 238, 16, DARKGRAY);
+            } else {
+                DrawText(
+                    "A: exhaustive reuse audit (30s max)",
+                    26, 186, 16, DARKGRAY);
+            }
             EndDrawing();
         }
         CloseWindow();

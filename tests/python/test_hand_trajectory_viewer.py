@@ -179,6 +179,37 @@ class HandTrajectoryViewerTests(unittest.TestCase):
         self.assertIn("MIXED_INTERACTION_PACK", MAKEFILE)
         self.assertIn("mixed-interaction-pack", MAKEFILE)
 
+    def test_exposes_bounded_exhaustive_reuse_audit(self):
+        source = self.source()
+        for contract in (
+            "KEY_A",
+            "audit_reusable_hand_trajectories(",
+            "ReuseAuditStatus::Incomplete",
+            "deadline_milliseconds = 30000U",
+            "worker_count = 4U",
+            "Contact accepted",
+            "fully shaped",
+            "object rejected",
+            "furniture rejected",
+            "reusable",
+            "AUDIT INCOMPLETE",
+            "AUDIT STALE",
+        ):
+            self.assertIn(contract, source)
+
+        grasp_change = source.split("if (grasp_changed)", 1)[1].split(
+            "if (IsKeyPressed(KEY_ENTER))", 1
+        )[0]
+        self.assertIn("audit_stale = true", grasp_change)
+        enter_search = source.split("if (IsKeyPressed(KEY_ENTER))", 1)[1].split(
+            "if (IsKeyPressed(KEY_A))", 1
+        )[0]
+        self.assertNotIn("audit_reusable_hand_trajectories(", enter_search)
+
+        self.assertIn("interaction_reuse_audit.cpp", MAKEFILE)
+        self.assertIn("interaction_reuse_audit.h", MAKEFILE)
+        self.assertIn("interaction_reuse_audit_probe:", MAKEFILE)
+
 
 if __name__ == "__main__":
     unittest.main()

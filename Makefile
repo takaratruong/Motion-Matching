@@ -99,7 +99,7 @@ INTERACTION_NATIVE_G1_SOURCES := interaction_native_g1_bridge.cpp \
 SOURCE := controller.cpp $(INTERACTION_NATIVE_G1_SOURCES)
 HEADER = $(wildcard *.h)
 
-.PHONY: all bootstrap-raylib controller hand_trajectory_viewer
+.PHONY: all bootstrap-raylib controller hand_trajectory_viewer interaction_reuse_audit_probe
 
 all: controller
 
@@ -127,15 +127,29 @@ controller: $(SOURCE) $(HEADER) $(G1_CLEARANCE_OBJECT) $(LINUX_CONTROLLER_DEPS)
 
 hand_trajectory_viewer: hand_trajectory_viewer.cpp \
   interaction_hand_trajectories.cpp interaction_hand_trajectories.h \
+  interaction_reuse_audit.cpp interaction_reuse_audit.h \
   interaction_ik.cpp interaction_ik.h g1_arm_joint_metadata.h \
   interaction_pose.cpp interaction_pose.h interaction_target.cpp \
   interaction_target.h interaction_database.h interaction_trajectory_database.h \
   g1_skeleton.h vec.h quat.h \
   $(LINUX_CONTROLLER_DEPS)
-	$(CC) $(CONTROLLER_CXXFLAGS) -o $@$(EXT) \
+	$(CC) $(CONTROLLER_CXXFLAGS) -pthread -o $@$(EXT) \
 	  hand_trajectory_viewer.cpp interaction_hand_trajectories.cpp \
+	  interaction_reuse_audit.cpp \
 	  interaction_ik.cpp interaction_pose.cpp interaction_target.cpp \
 	  $(CFLAGS) $(LIBS)
+
+interaction_reuse_audit_probe: interaction_reuse_audit_probe.cpp \
+  interaction_reuse_audit.cpp interaction_reuse_audit.h \
+  interaction_hand_trajectories.cpp interaction_hand_trajectories.h \
+  interaction_ik.cpp interaction_ik.h g1_arm_joint_metadata.h \
+  interaction_pose.cpp interaction_pose.h interaction_target.cpp \
+  interaction_target.h interaction_database.h interaction_trajectory_database.h \
+  g1_skeleton.h vec.h quat.h
+	$(CXX) $(CONTROLLER_CXXFLAGS) -O3 -DNDEBUG -pthread -I. \
+	  interaction_reuse_audit_probe.cpp interaction_reuse_audit.cpp \
+	  interaction_hand_trajectories.cpp interaction_ik.cpp \
+	  interaction_pose.cpp interaction_target.cpp -o $@$(EXT)
 
 clean:
 	rm controller$(EXT)
