@@ -31,13 +31,13 @@ publish reaches from them. Preserve the original archive unchanged. Record its
 path and checksum in generated metadata.
 
 Each GMR source must contain finite `root_pos (N, 3)`, `root_rot (N, 4)` in
-xyzw order, and `dof_pos (N, 29)` arrays. Use an embedded source frame rate
-when available. If it is absent, require an explicit importer argument; use
-100 Hz for this archive and record that override in provenance. Never infer a
-frame rate silently. Convert through the existing G1 kinematics and resample
-to the existing 25 Hz canonical skeleton representation. Reject malformed
-inputs with a source-specific error rather than publishing a partial source
-silently.
+xyzw order, and `dof_pos (N, 29)` arrays. Use the embedded source frame rate;
+all inspected members of this archive declare 30 Hz. If it is absent, require
+an explicit importer argument and record that override in provenance. Never
+infer a frame rate silently. Convert through the existing G1 kinematics and
+resample from 30 Hz to the existing 25 Hz canonical skeleton representation.
+Reject malformed inputs with a source-specific error rather than publishing a
+partial source silently.
 
 This archive is trusted user-authored input; loading arbitrary third-party
 pickle files remains unsupported.
@@ -217,7 +217,7 @@ back to one source recording and one confirmed annotation.
 
 Add focused tests for:
 
-- GMR schema validation, 100-to-25 Hz resampling, and canonical FK conversion;
+- GMR schema validation, 30-to-25 Hz resampling, and canonical FK conversion;
 - synthetic neutral-reach-return candidate proposals;
 - annotation adjustment, rejection, atomic persistence, and deterministic IDs;
 - exclusion of `walking` and `carry_walking`;
