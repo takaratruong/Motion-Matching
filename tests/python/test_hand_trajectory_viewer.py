@@ -126,13 +126,14 @@ class HandTrajectoryViewerTests(unittest.TestCase):
         self.assertIn("return {}", ground_branch)
         self.assertNotIn("make_coverage_environment", ground_branch)
 
-    def test_uses_exact_first_axis_fallback_and_front_side_filter(self):
+    def test_uses_exact_first_axis_fallback_and_all_approach_sides(self):
         source = self.source()
         self.assertIn("kTargetValidTrajectories = 12U", source)
         self.assertIn("GraspOrientationMode::ExactPose", source)
         self.assertIn("GraspOrientationMode::ApproachAxis", source)
-        self.assertIn("starts_on_allowed_side(", source)
-        self.assertIn("wrong_side", source)
+        self.assertNotIn("kSceneFront", source)
+        self.assertNotIn("starts_on_allowed_side(", source)
+        self.assertNotIn("wrong_side", source)
         self.assertIn("exact_compatible", source)
         self.assertIn("fallback_compatible", source)
         self.assertIn('"EXACT"', source)

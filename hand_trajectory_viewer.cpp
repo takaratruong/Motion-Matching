@@ -27,7 +27,6 @@ using interaction::TrajectoryFeasibilityReason;
 
 constexpr size_t kBackgroundPathStride = 5U;
 constexpr size_t kTargetValidTrajectories = 12U;
-constexpr vec3 kSceneFront(0.0F, 0.0F, -1.0F);
 
 struct RenderedTrajectory {
     HandTrajectory source;
@@ -42,7 +41,6 @@ struct TrajectorySet {
     size_t fallback_compatible = 0U;
     size_t exact_valid = 0U;
     size_t fallback_valid = 0U;
-    size_t wrong_side = 0U;
     size_t ik_rejected = 0U;
     size_t object_rejected = 0U;
     size_t environment_rejected = 0U;
@@ -182,11 +180,6 @@ void process_candidates(
     for (const HandTrajectory& candidate : candidates) {
         if (result.valid.size() >= stop_after_valid) break;
         if (accepted_clips.count(candidate.clip) != 0U) continue;
-        if (!interaction::starts_on_allowed_side(
-                candidate, query, kSceneFront)) {
-            ++result.wrong_side;
-            continue;
-        }
         ShapedHandTrajectory shaped = interaction::shape_hand_trajectory(
             database, candidate, query);
         if (!shaped.contact_accepted) {
@@ -658,8 +651,7 @@ int main(int argc, char** argv) {
                 26, 56, 18, DARKGRAY);
             DrawText(
                 TextFormat(
-                    "wrong-side %i | IK %i | object %i | environment %i",
-                    static_cast<int>(trajectories.wrong_side),
+                    "IK %i | object %i | environment %i",
                     static_cast<int>(trajectories.ik_rejected),
                     static_cast<int>(trajectories.object_rejected),
                     static_cast<int>(trajectories.environment_rejected)),
