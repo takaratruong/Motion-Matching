@@ -129,7 +129,8 @@ hand_trajectory_viewer: hand_trajectory_viewer.cpp \
   interaction_hand_trajectories.cpp interaction_hand_trajectories.h \
   interaction_ik.cpp interaction_ik.h g1_arm_joint_metadata.h \
   interaction_pose.cpp interaction_pose.h interaction_target.cpp \
-  interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h \
+  interaction_target.h interaction_database.h interaction_trajectory_database.h \
+  g1_skeleton.h vec.h quat.h \
   $(LINUX_CONTROLLER_DEPS)
 	$(CC) $(CONTROLLER_CXXFLAGS) -o $@$(EXT) \
 	  hand_trajectory_viewer.cpp interaction_hand_trajectories.cpp \

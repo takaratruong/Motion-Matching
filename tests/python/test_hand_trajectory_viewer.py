@@ -91,6 +91,17 @@ class HandTrajectoryViewerTests(unittest.TestCase):
         self.assertIn("selected_animation.poses[sample]", source)
         self.assertNotIn("selected.shaped.poses[sample]", source)
 
+    def test_loads_compact_database_and_displays_support(self):
+        source = self.source()
+        self.assertIn('#include "interaction_trajectory_database.h"', source)
+        self.assertIn("load_trajectory_database(", source)
+        self.assertNotIn("interaction::load_database(", source)
+        self.assertIn("SupportKind::Table", source)
+        self.assertIn("SupportKind::Ground", source)
+        self.assertIn('"GROUND"', source)
+        self.assertIn('"TABLE"', source)
+        self.assertIn("support_name(selected.source.support)", source)
+
     def test_is_independent_of_controller_diffusion_mesh_and_terrain(self):
         source = self.source()
         for forbidden in (
@@ -107,6 +118,9 @@ class HandTrajectoryViewerTests(unittest.TestCase):
         target = MAKEFILE.split("hand_trajectory_viewer:", 1)[1].split("\n\n", 1)[0]
         self.assertIn("hand_trajectory_viewer.cpp", target)
         self.assertIn("interaction_hand_trajectories.cpp", target)
+        self.assertIn("interaction_trajectory_database.h", target)
+        self.assertIn("MIXED_INTERACTION_PACK", MAKEFILE)
+        self.assertIn("mixed-interaction-pack", MAKEFILE)
 
 
 if __name__ == "__main__":

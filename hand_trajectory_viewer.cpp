@@ -1,5 +1,6 @@
 #include "interaction_hand_trajectories.h"
 #include "interaction_pose.h"
+#include "interaction_trajectory_database.h"
 #include "raylib.h"
 
 #include <algorithm>
@@ -8,6 +9,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -65,8 +67,40 @@ struct CanonicalGrasp {
     vec3 table_dimensions{};
 };
 
+CanonicalGrasp canonical_grasp(
+    const interaction::Database& database,
+    size_t clip,
+    int32_t contact_frame) {
+    const int32_t start = database.range_starts.at(clip);
+    const int32_t object_frame = std::max(start, contact_frame - 1);
+    return {
+        clip,
+        contact_frame,
+        static_cast<interaction::Hand>(database.active_hands.at(clip)),
+        read_vec3(database.object_dimensions, clip),
+        {
+            read_vec3(database.grasp_positions_object, clip),
+            read_quat(database.grasp_rotations_object, clip),
+        },
+        {
+            read_vec3(
+                database.object_positions,
+                static_cast<size_t>(object_frame)),
+            read_quat(
+                database.object_rotations,
+                static_cast<size_t>(object_frame)),
+        },
+        {
+            read_vec3(database.table_positions, clip),
+            read_quat(database.table_rotations, clip),
+        },
+        read_vec3(database.table_sizes, clip),
+    };
+}
+
 CanonicalGrasp find_canonical_grasp(const interaction::Database& database) {
     constexpr uint8_t contact_phase = 2U;
+    std::optional<CanonicalGrasp> fallback;
     for (size_t clip = 0U; clip < database.clip_count; ++clip) {
         const int32_t start = database.range_starts.at(clip);
         const int32_t stop = database.range_stops.at(clip);
@@ -74,32 +108,17 @@ CanonicalGrasp find_canonical_grasp(const interaction::Database& database) {
             if (database.phases.at(static_cast<size_t>(frame)) != contact_phase) {
                 continue;
             }
-            const int32_t object_frame = std::max(start, frame - 1);
-            return {
-                clip,
-                frame,
-                static_cast<interaction::Hand>(database.active_hands.at(clip)),
-                read_vec3(database.object_dimensions, clip),
-                {
-                    read_vec3(database.grasp_positions_object, clip),
-                    read_quat(database.grasp_rotations_object, clip),
-                },
-                {
-                    read_vec3(
-                        database.object_positions,
-                        static_cast<size_t>(object_frame)),
-                    read_quat(
-                        database.object_rotations,
-                        static_cast<size_t>(object_frame)),
-                },
-                {
-                    read_vec3(database.table_positions, clip),
-                    read_quat(database.table_rotations, clip),
-                },
-                read_vec3(database.table_sizes, clip),
-            };
+            const CanonicalGrasp candidate =
+                canonical_grasp(database, clip, frame);
+            if (!fallback.has_value()) fallback = candidate;
+            if (interaction::support_kind(database, clip) ==
+                interaction::SupportKind::Table) {
+                return candidate;
+            }
+            break;
         }
     }
+    if (fallback.has_value()) return *fallback;
     throw std::runtime_error("interaction database has no Contact clip");
 }
 
@@ -247,6 +266,11 @@ const char* phase_name(uint8_t phase) {
     }
 }
 
+const char* support_name(interaction::SupportKind support) {
+    return support == interaction::SupportKind::Ground
+        ? "GROUND" : "TABLE";
+}
+
 size_t animated_sample(
     const ShapedHandTrajectory& animation,
     float animation_seconds) {
@@ -297,7 +321,7 @@ std::filesystem::path pack_path(int argc, char** argv) {
 int main(int argc, char** argv) {
     try {
         const std::filesystem::path pack = pack_path(argc, argv);
-        const interaction::Database database = interaction::load_database(
+        const interaction::Database database = interaction::load_trajectory_database(
             pack / "interaction_database.bin");
         const CanonicalGrasp canonical = find_canonical_grasp(database);
         const vec3 scene_offset(
@@ -509,10 +533,11 @@ int main(int argc, char** argv) {
                     static_cast<int32_t>(sample);
                 DrawText(
                     TextFormat(
-                        "option %i/%i | clip %i | SAFE | %s frame %i",
+                        "option %i/%i | clip %i | SAFE | %s | %s frame %i",
                         static_cast<int>(selected_index + 1U),
                         static_cast<int>(trajectories.valid.size()),
                         selected.source.clip,
+                        support_name(selected.source.support),
                         phase_name(database.phases.at(
                             static_cast<size_t>(frame))),
                         frame),
