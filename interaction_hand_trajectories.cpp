@@ -201,6 +201,53 @@ quat read_quat(const std::vector<float>& values, size_t index) {
         values.at(offset + 2U), values.at(offset + 3U));
 }
 
+bool compact_skipped_vectors_empty(const Database& database) {
+    return database.velocities.empty() &&
+        database.angular_velocities.empty() &&
+        database.foot_contacts.empty() &&
+        database.hand_contacts.empty() &&
+        database.hand_dof.empty() &&
+        database.hand_dof_velocities.empty() &&
+        database.time_to_contact.empty() &&
+        database.object_velocities.empty() &&
+        database.object_angular_velocities.empty() &&
+        database.source_frames.empty();
+}
+
+bool any_compact_skipped_vector_empty(const Database& database) {
+    return database.velocities.empty() ||
+        database.angular_velocities.empty() ||
+        database.foot_contacts.empty() ||
+        database.hand_contacts.empty() ||
+        database.hand_dof.empty() ||
+        database.hand_dof_velocities.empty() ||
+        database.time_to_contact.empty() ||
+        database.object_velocities.empty() ||
+        database.object_angular_velocities.empty() ||
+        database.source_frames.empty();
+}
+
+Pose trajectory_pose_at_frame(const Database& database, int32_t frame) {
+    if (!compact_skipped_vectors_empty(database)) {
+        if (any_compact_skipped_vector_empty(database)) {
+            throw std::invalid_argument("partial compact trajectory pose data");
+        }
+        return pose_at_frame(database, frame);
+    }
+    if (frame < 0 || static_cast<uint32_t>(frame) >= database.frame_count) {
+        throw std::out_of_range("interaction trajectory pose frame outside database");
+    }
+
+    const size_t source_frame = static_cast<size_t>(frame);
+    Pose pose{};
+    for (size_t bone = 0U; bone < g1_skeleton::BoneCount; ++bone) {
+        const size_t index = source_frame * g1_skeleton::BoneCount + bone;
+        pose.positions[bone] = read_vec3(database.positions, index);
+        pose.rotations[bone] = read_quat(database.rotations, index);
+    }
+    return pose;
+}
+
 bool near_support_metadata(float left, float right) {
     return std::abs(left - right) <= kSupportMetadataTolerance;
 }
@@ -376,7 +423,7 @@ std::vector<HandTrajectory> select_hand_trajectories(
         const Transform source_object = object_transform(
             database, phases.contact - 1);
         const WorldPose contact_world = world_pose(
-            pose_at_frame(database, phases.contact));
+            trajectory_pose_at_frame(database, phases.contact));
         const Transform source_contact = hand_transform(contact_world, query.hand);
         const Transform alignment = upright_grasp_alignment(
             source_contact, query);
@@ -408,7 +455,8 @@ std::vector<HandTrajectory> select_hand_trajectories(
         for (int32_t frame = trajectory.start_frame;
              frame <= phases.last_lift;
              ++frame) {
-            const WorldPose world = world_pose(pose_at_frame(database, frame));
+            const WorldPose world = world_pose(
+                trajectory_pose_at_frame(database, frame));
             trajectory.hands_in_source_object.push_back(compose(
                 source_from_world,
                 hand_transform(world, query.hand)));
@@ -475,7 +523,7 @@ ShapedHandTrajectory shape_hand_trajectory(
     std::vector<Transform> base_hands;
     base_hands.reserve(sample_count);
     for (size_t sample = 0U; sample < sample_count; ++sample) {
-        Pose pose = pose_at_frame(
+        Pose pose = trajectory_pose_at_frame(
             database,
             trajectory.start_frame + static_cast<int32_t>(sample));
         const size_t root = static_cast<size_t>(g1_skeleton::Simulation);

@@ -328,6 +328,86 @@ interaction::HandTrajectoryQuery identity_query() {
     return query;
 }
 
+void clear_compact_skipped_vectors(interaction::Database& database) {
+    database.velocities.clear();
+    database.angular_velocities.clear();
+    database.foot_contacts.clear();
+    database.hand_contacts.clear();
+    database.hand_dof.clear();
+    database.hand_dof_velocities.clear();
+    database.time_to_contact.clear();
+    database.object_velocities.clear();
+    database.object_angular_velocities.clear();
+    database.source_frames.clear();
+}
+
+void test_compact_database_shapes_trajectories_with_default_pose_channels() {
+    const interaction::Database full_database = make_database({
+        {interaction::Hand::Right, vec3(0.10F, 0.20F, 0.30F), quat()},
+    });
+    const interaction::HandTrajectoryQuery query = identity_query();
+    const auto full_selected = interaction::select_hand_trajectories(
+        full_database, query);
+    require(full_selected.size() == 1U,
+            "full database did not provide the compact regression trajectory");
+    const interaction::ShapedHandTrajectory full_shaped =
+        interaction::shape_hand_trajectory(
+            full_database, full_selected[0], query, interaction::IKConfig{});
+
+    interaction::Database compact_database = full_database;
+    clear_compact_skipped_vectors(compact_database);
+
+    const auto selected = interaction::select_hand_trajectories(
+        compact_database, query);
+    require(selected.size() == 1U,
+            "compact database did not select the recorded trajectory");
+    require(selected[0].reach_point == full_selected[0].reach_point &&
+                selected[0].contact_point == full_selected[0].contact_point,
+            "compact database changed trajectory Contact indexing");
+
+    const interaction::ShapedHandTrajectory shaped =
+        interaction::shape_hand_trajectory(
+            compact_database, selected[0], query, interaction::IKConfig{});
+    require(shaped.contact_accepted,
+            "compact database did not accept the Contact pose");
+    require(shaped.poses.size() == full_shaped.poses.size() &&
+                shaped.path.hands.size() == shaped.poses.size() &&
+                shaped.path.elbows.size() == shaped.poses.size(),
+            "compact database did not retain one shaped pose and path sample per frame");
+    require(near(
+                shaped.path.hands[selected[0].contact_point].position,
+                query.grasp_world_position),
+            "compact database Contact path missed the requested grasp");
+
+    for (size_t sample = 0U; sample < shaped.poses.size(); ++sample) {
+        require(near(shaped.path.hands[sample].position,
+                     full_shaped.path.hands[sample].position) &&
+                    near(shaped.path.elbows[sample],
+                         full_shaped.path.elbows[sample]),
+                "compact database changed the shaped hand path");
+        for (size_t bone = 0U; bone < g1_skeleton::BoneCount; ++bone) {
+            require(near(shaped.poses[sample].positions[bone],
+                         full_shaped.poses[sample].positions[bone]) &&
+                        near_rotation(shaped.poses[sample].rotations[bone],
+                                      full_shaped.poses[sample].rotations[bone]),
+                    "compact database changed retained pose transforms");
+            require(near(shaped.poses[sample].velocities[bone], vec3()) &&
+                        near(shaped.poses[sample].angular_velocities[bone],
+                             vec3()),
+                    "compact database did not zero default velocity channels");
+        }
+        for (size_t dof = 0U; dof < shaped.poses[sample].hand_dof.size(); ++dof) {
+            require(shaped.poses[sample].hand_dof[dof] == 0.0F &&
+                        shaped.poses[sample].hand_dof_velocities[dof] == 0.0F,
+                    "compact database did not zero default hand DOF channels");
+        }
+        for (uint8_t contact : shaped.poses[sample].foot_contacts) {
+            require(contact == 0U,
+                    "compact database did not zero default foot contacts");
+        }
+    }
+}
+
 interaction::ShelfGeometry distant_shelf() {
     interaction::ShelfGeometry shelf{};
     for (interaction::OrientedBox& box : shelf.boxes) {
@@ -803,6 +883,7 @@ int main() {
     test_position_only_mapping_preserves_object_mapped_contact_rotation();
     test_shape_converges_contact_without_moving_root_or_legs();
     test_position_only_shaping_ignores_orientation_acceptance();
+    test_compact_database_shapes_trajectories_with_default_pose_channels();
     test_shape_rejects_contact_correction_above_solver_envelope();
     test_collision_feasibility_is_phase_aware();
     test_forearm_capsule_and_contact_still_collide_with_shelf();
