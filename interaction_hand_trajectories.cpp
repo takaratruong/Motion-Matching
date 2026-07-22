@@ -112,6 +112,82 @@ bool arm_intersects_box(
                elbow, wrist, config.forearm_radius_m, box);
 }
 
+bool torso_bone(size_t bone) {
+    return bone == static_cast<size_t>(g1_skeleton::Hips) ||
+        bone == static_cast<size_t>(g1_skeleton::Spine) ||
+        bone == static_cast<size_t>(g1_skeleton::Spine1) ||
+        bone == static_cast<size_t>(g1_skeleton::Spine2);
+}
+
+bool wrist_bone(size_t bone) {
+    return bone == static_cast<size_t>(g1_skeleton::LeftWristRoll) ||
+        bone == static_cast<size_t>(g1_skeleton::LeftWristPitch) ||
+        bone == static_cast<size_t>(g1_skeleton::LeftWrist) ||
+        bone == static_cast<size_t>(g1_skeleton::RightWristRoll) ||
+        bone == static_cast<size_t>(g1_skeleton::RightWristPitch) ||
+        bone == static_cast<size_t>(g1_skeleton::RightWrist);
+}
+
+bool active_grasp_chain_bone(size_t bone, Hand hand) {
+    if (hand == Hand::Left) {
+        return bone == static_cast<size_t>(g1_skeleton::LeftWristRoll) ||
+            bone == static_cast<size_t>(g1_skeleton::LeftWristPitch) ||
+            bone == static_cast<size_t>(g1_skeleton::LeftWrist);
+    }
+    return bone == static_cast<size_t>(g1_skeleton::RightWristRoll) ||
+        bone == static_cast<size_t>(g1_skeleton::RightWristPitch) ||
+        bone == static_cast<size_t>(g1_skeleton::RightWrist);
+}
+
+float joint_radius(
+    size_t bone,
+    const TrajectoryCollisionConfig& config) {
+    if (torso_bone(bone)) return config.torso_radius_m;
+    if (wrist_bone(bone)) return config.wrist_radius_m;
+    return config.joint_radius_m;
+}
+
+float segment_radius(
+    size_t bone,
+    const TrajectoryCollisionConfig& config) {
+    if (torso_bone(bone)) return config.torso_radius_m;
+    if (wrist_bone(bone)) return config.forearm_radius_m;
+    return config.limb_radius_m;
+}
+
+bool skeleton_intersects_box(
+    const WorldPose& world,
+    const OrientedBox& box,
+    Hand hand,
+    bool exempt_active_grasp_chain,
+    const TrajectoryCollisionConfig& config) {
+    for (size_t bone = 1U; bone < g1_skeleton::BoneCount; ++bone) {
+        if (exempt_active_grasp_chain &&
+            active_grasp_chain_bone(bone, hand)) {
+            continue;
+        }
+        if (sphere_intersects_box(
+                world.positions[bone], joint_radius(bone, config), box)) {
+            return true;
+        }
+        const int32_t parent = g1_skeleton::kParents[bone];
+        if (parent >= 0 && capsule_intersects_box(
+                world.positions[static_cast<size_t>(parent)],
+                world.positions[bone], segment_radius(bone, config), box)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool valid_collision_config(const TrajectoryCollisionConfig& config) {
+    return finite(config.wrist_radius_m) && config.wrist_radius_m >= 0.0F &&
+        finite(config.forearm_radius_m) && config.forearm_radius_m >= 0.0F &&
+        finite(config.joint_radius_m) && config.joint_radius_m >= 0.0F &&
+        finite(config.limb_radius_m) && config.limb_radius_m >= 0.0F &&
+        finite(config.torso_radius_m) && config.torso_radius_m >= 0.0F;
+}
+
 vec3 read_vec3(const std::vector<float>& values, size_t index) {
     const size_t offset = 3U * index;
     return vec3(values.at(offset), values.at(offset + 1U), values.at(offset + 2U));
@@ -485,9 +561,7 @@ TrajectoryFeasibility evaluate_trajectory_feasibility(
     if (trajectory.hands.empty() ||
         trajectory.hands.size() != trajectory.elbows.size() ||
         contact_point >= trajectory.hands.size() ||
-        !valid_box(object) ||
-        !finite(config.wrist_radius_m) || config.wrist_radius_m < 0.0F ||
-        !finite(config.forearm_radius_m) || config.forearm_radius_m < 0.0F) {
+        !valid_box(object) || !valid_collision_config(config)) {
         throw std::invalid_argument("invalid trajectory collision query");
     }
     for (const OrientedBox& box : shelf.boxes) {
@@ -507,6 +581,42 @@ TrajectoryFeasibility evaluate_trajectory_feasibility(
             if (arm_intersects_box(
                     trajectory.hands[sample].position,
                     trajectory.elbows[sample], box, config)) {
+                return {TrajectoryFeasibilityReason::ShelfCollision, sample};
+            }
+        }
+    }
+    return {};
+}
+
+TrajectoryFeasibility evaluate_shaped_trajectory_feasibility(
+    const ShapedHandTrajectory& trajectory,
+    size_t contact_point,
+    Hand hand,
+    const OrientedBox& object,
+    const ShelfGeometry& shelf,
+    const TrajectoryCollisionConfig& config) {
+    if (trajectory.poses.empty() ||
+        trajectory.path.hands.size() != trajectory.poses.size() ||
+        trajectory.path.elbows.size() != trajectory.poses.size() ||
+        contact_point >= trajectory.poses.size() ||
+        !valid_box(object) || !valid_collision_config(config)) {
+        throw std::invalid_argument("invalid shaped trajectory collision query");
+    }
+    for (const OrientedBox& box : shelf.boxes) {
+        if (!valid_box(box)) {
+            throw std::invalid_argument("invalid shelf geometry");
+        }
+    }
+    for (size_t sample = 0U; sample < trajectory.poses.size(); ++sample) {
+        const WorldPose world = world_pose(trajectory.poses[sample]);
+        const bool after_contact = sample >= contact_point;
+        if (skeleton_intersects_box(
+                world, object, hand, after_contact, config)) {
+            return {TrajectoryFeasibilityReason::ObjectCollision, sample};
+        }
+        for (const OrientedBox& box : shelf.boxes) {
+            if (skeleton_intersects_box(
+                    world, box, hand, false, config)) {
                 return {TrajectoryFeasibilityReason::ShelfCollision, sample};
             }
         }

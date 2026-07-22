@@ -293,6 +293,40 @@ interaction::MappedHandTrajectory mapped_line(
     return mapped;
 }
 
+interaction::Pose pose_from_world_positions(
+    std::array<vec3, g1_skeleton::BoneCount> world_positions) {
+    interaction::Pose pose{};
+    for (quat& rotation : pose.rotations) rotation = quat();
+    for (size_t bone = 0U; bone < g1_skeleton::BoneCount; ++bone) {
+        const int32_t parent = g1_skeleton::kParents[bone];
+        pose.positions[bone] = parent < 0
+            ? world_positions[bone]
+            : world_positions[bone] -
+                  world_positions[static_cast<size_t>(parent)];
+    }
+    return pose;
+}
+
+interaction::ShapedHandTrajectory shaped_pose_with_world_positions(
+    const std::array<vec3, g1_skeleton::BoneCount>& world_positions,
+    interaction::Hand hand) {
+    interaction::ShapedHandTrajectory shaped{};
+    shaped.poses.push_back(pose_from_world_positions(world_positions));
+    const interaction::WorldPose world = interaction::world_pose(
+        shaped.poses.front());
+    const size_t wrist = hand == interaction::Hand::Left
+        ? static_cast<size_t>(g1_skeleton::LeftWrist)
+        : static_cast<size_t>(g1_skeleton::RightWrist);
+    const size_t elbow = hand == interaction::Hand::Left
+        ? static_cast<size_t>(g1_skeleton::LeftElbow)
+        : static_cast<size_t>(g1_skeleton::RightElbow);
+    shaped.path.hands.push_back(
+        {world.positions[wrist], world.rotations[wrist]});
+    shaped.path.elbows.push_back(world.positions[elbow]);
+    shaped.contact_accepted = true;
+    return shaped;
+}
+
 void test_selects_every_close_complete_same_hand_clip_in_stable_order() {
     const interaction::Database database = make_database({
         {interaction::Hand::Right, vec3(0.10F, 0.20F, 0.30F), quat()},
@@ -534,6 +568,70 @@ void test_forearm_capsule_and_contact_still_collide_with_shelf() {
             "shelf collision was incorrectly exempted at Contact");
 }
 
+void test_shaped_upper_arm_and_torso_collisions_are_rejected() {
+    std::array<vec3, g1_skeleton::BoneCount> upper_arm{};
+    upper_arm.fill(vec3(10.0F, 10.0F, 10.0F));
+    upper_arm[g1_skeleton::RightShoulderPitch] = vec3(-1.0F, 0.0F, 0.0F);
+    upper_arm[g1_skeleton::RightShoulderRoll] = vec3(1.0F, 0.0F, 0.0F);
+    interaction::ShelfGeometry shelf = distant_shelf();
+    shelf.boxes[0] = {
+        {vec3(), quat()}, vec3(0.20F, 0.20F, 0.20F)};
+    const interaction::OrientedBox distant_object{
+        {vec3(100.0F, 100.0F, 100.0F), quat()},
+        vec3(0.20F, 0.20F, 0.20F)};
+
+    const auto upper_arm_shaped = shaped_pose_with_world_positions(
+        upper_arm, interaction::Hand::Right);
+    require(interaction::evaluate_shaped_trajectory_feasibility(
+                upper_arm_shaped, 0U, interaction::Hand::Right,
+                distant_object, shelf).reason ==
+            interaction::TrajectoryFeasibilityReason::ShelfCollision,
+            "upper-arm table penetration was accepted");
+
+    std::array<vec3, g1_skeleton::BoneCount> torso{};
+    torso.fill(vec3(1.0F, 0.0F, 0.0F));
+    torso[g1_skeleton::Simulation] = vec3(-1.0F, 0.0F, 0.0F);
+    const auto torso_shaped = shaped_pose_with_world_positions(
+        torso, interaction::Hand::Right);
+    require(interaction::evaluate_shaped_trajectory_feasibility(
+                torso_shaped, 0U, interaction::Hand::Right,
+                distant_object, shelf).reason ==
+            interaction::TrajectoryFeasibilityReason::ShelfCollision,
+            "torso table penetration was accepted");
+}
+
+void test_only_active_grasp_chain_is_exempt_after_contact() {
+    const interaction::OrientedBox object{
+        {vec3(), quat()}, vec3(0.20F, 0.20F, 0.20F)};
+    const interaction::ShelfGeometry shelf = distant_shelf();
+    std::array<vec3, g1_skeleton::BoneCount> nonactive{};
+    nonactive.fill(vec3(10.0F, 10.0F, 10.0F));
+    nonactive[g1_skeleton::LeftWristRoll] = vec3(0.0F, 0.0F, 0.0F);
+    nonactive[g1_skeleton::LeftWristPitch] = vec3(0.0F, 0.0F, 0.0F);
+    nonactive[g1_skeleton::LeftWrist] = vec3(0.0F, 0.0F, 0.0F);
+    const auto nonactive_shaped = shaped_pose_with_world_positions(
+        nonactive, interaction::Hand::Right);
+    require(interaction::evaluate_shaped_trajectory_feasibility(
+                nonactive_shaped, 0U, interaction::Hand::Right,
+                object, shelf).reason ==
+            interaction::TrajectoryFeasibilityReason::ObjectCollision,
+            "non-active hand object penetration was exempted");
+
+    std::array<vec3, g1_skeleton::BoneCount> active{};
+    active.fill(vec3(10.0F, 10.0F, 10.0F));
+    active[g1_skeleton::RightElbow] = vec3(0.30F, 0.0F, 0.0F);
+    active[g1_skeleton::RightWristRoll] = vec3(0.0F, 0.0F, 0.0F);
+    active[g1_skeleton::RightWristPitch] = vec3(0.0F, 0.0F, 0.0F);
+    active[g1_skeleton::RightWrist] = vec3(0.0F, 0.0F, 0.0F);
+    const auto active_shaped = shaped_pose_with_world_positions(
+        active, interaction::Hand::Right);
+    require(interaction::evaluate_shaped_trajectory_feasibility(
+                active_shaped, 0U, interaction::Hand::Right,
+                object, shelf).reason ==
+            interaction::TrajectoryFeasibilityReason::None,
+            "active grasp chain was not exempted after Contact");
+}
+
 void test_recorded_table_geometry_preserves_top_and_builds_four_legs() {
     const interaction::Transform table{
         vec3(1.0F, 0.40F, -2.0F), quat()};
@@ -575,6 +673,8 @@ int main() {
     test_shape_rejects_contact_correction_above_solver_envelope();
     test_collision_feasibility_is_phase_aware();
     test_forearm_capsule_and_contact_still_collide_with_shelf();
+    test_shaped_upper_arm_and_torso_collisions_are_rejected();
+    test_only_active_grasp_chain_is_exempt_after_contact();
     test_recorded_table_geometry_preserves_top_and_builds_four_legs();
     return 0;
 }
