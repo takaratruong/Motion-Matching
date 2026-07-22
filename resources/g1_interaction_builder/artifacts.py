@@ -784,8 +784,8 @@ def _validate_frozen_manifest_metadata(manifest: dict) -> None:
         raise ValueError(
             "manifest source_root must be a nonempty absolute path string"
         )
-    source_roots = manifest.get("source_roots")
-    if source_roots is not None:
+    if "source_roots" in manifest:
+        source_roots = manifest["source_roots"]
         if (
             not isinstance(source_roots, list)
             or len(source_roots) < 2
