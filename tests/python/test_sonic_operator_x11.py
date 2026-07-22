@@ -247,6 +247,27 @@ class ContinuousControlLoopTests(unittest.TestCase):
             self.assertTrue(loop.wait_for_sequence(5, timeout_s=1.0))
         self.assertEqual(events.count("KEY BACKSPACE DOWN -> restart"), 2)
 
+    def test_backspace_before_restart_arming_does_not_persist(self) -> None:
+        restart = threading.Event()
+        armed = threading.Event()
+        loop = ContinuousControlLoop(
+            SteadyProvider(KeyLevels()),
+            _mapper(),
+            restart_event=restart,
+            restart_armed_event=armed,
+        )
+
+        loop._process_transitions(True, frozenset())
+        loop._process_transitions(True, frozenset({"BACKSPACE"}))
+        self.assertFalse(restart.is_set())
+
+        armed.set()
+        loop._process_transitions(True, frozenset({"BACKSPACE"}))
+        self.assertFalse(restart.is_set())
+        loop._process_transitions(True, frozenset())
+        loop._process_transitions(True, frozenset({"BACKSPACE"}))
+        self.assertTrue(restart.is_set())
+
     def test_rejects_invalid_restart_event(self) -> None:
         with self.assertRaisesRegex(
             ContractError, "restart_event must be a threading.Event"
@@ -255,6 +276,16 @@ class ContinuousControlLoopTests(unittest.TestCase):
                 SteadyProvider(KeyLevels()),
                 _mapper(),
                 restart_event=object(),
+            )
+
+    def test_rejects_invalid_restart_armed_event(self) -> None:
+        with self.assertRaisesRegex(
+            ContractError, "restart_armed_event must be a threading.Event"
+        ):
+            ContinuousControlLoop(
+                SteadyProvider(KeyLevels()),
+                _mapper(),
+                restart_armed_event=object(),
             )
 
 

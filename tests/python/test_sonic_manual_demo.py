@@ -766,7 +766,9 @@ class ScoredControlStartupTests(unittest.TestCase):
 
 
 class _BoundaryMailbox:
-    def __init__(self, command: CommandSample, mapped: MappedControlState) -> None:
+    def __init__(
+        self, command: CommandSample | None, mapped: MappedControlState
+    ) -> None:
         self.command = command
         self.mapped = mapped
         self.sampled: list[int] = []
@@ -777,7 +779,9 @@ class _BoundaryMailbox:
 
 
 class _BoundaryControlLoop:
-    def __init__(self, command: CommandSample, mapped: MappedControlState) -> None:
+    def __init__(
+        self, command: CommandSample | None, mapped: MappedControlState
+    ) -> None:
         self.mailbox = _BoundaryMailbox(command, mapped)
 
 
@@ -865,6 +869,35 @@ class X11BoundaryIntegrationTests(unittest.TestCase):
                 camera_disabled_prefix="CAMERA DISABLED",
                 restart_event=restart,
             )
+
+    def test_default_boundary_x_wins_over_simultaneous_restart(self) -> None:
+        restart = threading.Event()
+        restart.set()
+        cancellation = threading.Event()
+        cancellation.set()
+        _command, mapped = _mapped_boundary()
+        control_loop = _BoundaryControlLoop(None, mapped)
+
+        result = _consume_x11_boundary(
+            control_loop=control_loop,
+            simulator=object(),
+            gate=object(),
+            generate_and_publish=lambda *_args, **_kwargs: self.fail(
+                "X must stop before generation"
+            ),
+            chunk_index=3,
+            steps_per_chunk=40,
+            preload_chunks=1,
+            camera_state=CameraDeliveryState(),
+            event_sink=lambda _event: None,
+            control_prefix="CONTROL chunk=",
+            camera_disabled_prefix="CAMERA DISABLED",
+            restart_event=restart,
+            cancellation_event=cancellation,
+        )
+
+        self.assertIsNone(result.command)
+        self.assertEqual(control_loop.mailbox.sampled, [3])
 
     def test_heading_frame_offset_uses_physical_minus_virtual_yaw(self) -> None:
         physical = (
@@ -1089,6 +1122,88 @@ class ResponsiveX11LoopTests(unittest.TestCase):
                 camera_disabled_prefix="CAMERA DISABLED",
                 restart_event=restart,
             )
+
+    def test_responsive_x_wins_over_simultaneous_restart(self) -> None:
+        from mm_sonic.manual_demo import _run_responsive_x11_loop
+        from mm_sonic.operator_x11 import IntentSnapshot
+
+        restart = threading.Event()
+        restart.set()
+        cancellation = threading.Event()
+        cancellation.set()
+        snapshot = IntentSnapshot(revision=1, observed_ns=5, command=None)
+        mailbox = _ResponsiveMailbox([snapshot], self._mapped())
+
+        class _NeverCommitter:
+            next_chunk = 0
+
+            def run_one_chunk(self, command, *, command_is_current=None):
+                raise AssertionError("X must not commit")
+
+        final_state = _run_responsive_x11_loop(
+            control_loop=_ResponsiveControlLoop(mailbox),
+            committer=_NeverCommitter(),
+            simulator=_BoundarySimulator(),
+            chunks=3,
+            camera_state=CameraDeliveryState(),
+            event_sink=lambda _event: None,
+            trace_sink=lambda _trace: None,
+            session_id="session",
+            camera_disabled_prefix="CAMERA DISABLED",
+            restart_event=restart,
+            cancellation_event=cancellation,
+        )
+
+        self.assertEqual(mailbox.sampled, [0])
+        self.assertIsInstance(final_state, CameraDeliveryState)
+
+    def test_responsive_restart_between_prefixes_stops_next_prefix(self) -> None:
+        from mm_sonic.manual_demo import _run_responsive_x11_loop
+        from mm_sonic.operator_x11 import IntentSnapshot
+
+        restart = threading.Event()
+        commands = [_forward(0), _forward(1)]
+        snapshots = [
+            IntentSnapshot(
+                revision=index + 1,
+                observed_ns=index + 5,
+                command=command,
+            )
+            for index, command in enumerate(commands)
+        ]
+        mailbox = _ResponsiveMailbox(snapshots, self._mapped())
+
+        class _OneCommitter:
+            next_chunk = 0
+
+            def __init__(self) -> None:
+                self.calls: list[CommandSample] = []
+
+            def run_one_chunk(self, command, *, command_is_current=None):
+                if self.calls:
+                    raise AssertionError("prefix 2 must never start")
+                self.calls.append(command)
+                self.next_chunk += 1
+                restart.set()
+                return object()
+
+        committer = _OneCommitter()
+        with self.assertRaises(OperatorRestartRequested):
+            _run_responsive_x11_loop(
+                control_loop=_ResponsiveControlLoop(mailbox),
+                committer=committer,
+                simulator=_BoundarySimulator(),
+                chunks=2,
+                camera_state=CameraDeliveryState(),
+                event_sink=lambda _event: None,
+                trace_sink=lambda _trace: None,
+                session_id="session",
+                camera_disabled_prefix="CAMERA DISABLED",
+                restart_event=restart,
+            )
+
+        self.assertEqual(committer.calls, [commands[0]])
+        self.assertEqual(mailbox.sampled, [0])
 
     def test_responsive_loop_delays_trace_until_prefix_is_presented(self) -> None:
         from mm_sonic.manual_demo import _run_responsive_x11_loop

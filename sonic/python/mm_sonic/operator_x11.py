@@ -340,6 +340,7 @@ class ContinuousControlLoop:
         period_s: float = 0.02,
         cancel_event: threading.Event | None = None,
         restart_event: threading.Event | None = None,
+        restart_armed_event: threading.Event | None = None,
         join_timeout_s: float = 2.0,
     ) -> None:
         if not hasattr(provider, "sample"):
@@ -358,12 +359,19 @@ class ContinuousControlLoop:
             restart_event, threading.Event
         ):
             raise ContractError("control loop restart_event must be a threading.Event")
+        if restart_armed_event is not None and not isinstance(
+            restart_armed_event, threading.Event
+        ):
+            raise ContractError(
+                "control loop restart_armed_event must be a threading.Event"
+            )
         self._provider = provider
         self._mapper = mapper
         self._event_sink = event_sink
         self._period_s = float(period_s)
         self._cancel_event = cancel_event
         self._restart_event = restart_event
+        self._restart_armed_event = restart_armed_event
         self._join_timeout_s = float(join_timeout_s)
         self.mailbox = BoundaryControlMailbox()
         self._stop = threading.Event()
@@ -426,7 +434,14 @@ class ContinuousControlLoop:
             self._emit(f"KEY {key} DOWN -> {_ACTIONS[key]}")
             if key == "X" and self._cancel_event is not None:
                 self._cancel_event.set()
-            if key == "BACKSPACE" and self._restart_event is not None:
+            if (
+                key == "BACKSPACE"
+                and self._restart_event is not None
+                and (
+                    self._restart_armed_event is None
+                    or self._restart_armed_event.is_set()
+                )
+            ):
                 self._restart_event.set()
         for key in sorted(self._prev_pressed - pressed):
             self._emit(f"KEY {key} UP -> {_ACTIONS[key]}")

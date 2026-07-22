@@ -138,8 +138,13 @@ class OperatorRestartRequested(Exception):
     """Normal operator request to replace the complete live episode."""
 
 
-def _raise_if_restart_requested(restart_event: threading.Event) -> None:
-    if restart_event.is_set():
+def _raise_if_restart_requested(
+    restart_event: threading.Event,
+    cancellation_event: threading.Event | None = None,
+) -> None:
+    if restart_event.is_set() and (
+        cancellation_event is None or not cancellation_event.is_set()
+    ):
         raise OperatorRestartRequested
 
 
@@ -536,11 +541,12 @@ def _consume_x11_boundary(
     control_prefix: str,
     camera_disabled_prefix: str,
     restart_event: threading.Event,
+    cancellation_event: threading.Event | None = None,
     prefix_duration_s: float = _CHUNK_DURATION_S,
 ) -> X11BoundaryResult:
     """Atomically forward one mapped control boundary and synchronized camera."""
 
-    _raise_if_restart_requested(restart_event)
+    _raise_if_restart_requested(restart_event, cancellation_event)
     command, mapped = control_loop.mailbox.sample(chunk_index)
     if command is None:
         return X11BoundaryResult(None, mapped, camera_state, None)
@@ -645,6 +651,7 @@ def _run_responsive_x11_loop(
     session_id: str,
     camera_disabled_prefix: str,
     restart_event: threading.Event,
+    cancellation_event: threading.Event | None = None,
 ) -> CameraDeliveryState:
     """Drive the opt-in Stage-R1 one-prefix responsive loop.
 
@@ -657,7 +664,7 @@ def _run_responsive_x11_loop(
     never alters command execution.
     """
 
-    _raise_if_restart_requested(restart_event)
+    _raise_if_restart_requested(restart_event, cancellation_event)
     camera_box: list[CameraDeliveryState] = [camera_state]
 
     def on_sample(_snapshot: object, mapped: object) -> None:
@@ -675,7 +682,7 @@ def _run_responsive_x11_loop(
     )
     pending_prefix: object | None = None
     for _consumed_chunk in range(chunks):
-        _raise_if_restart_requested(restart_event)
+        _raise_if_restart_requested(restart_event, cancellation_event)
         prefix = scheduler.run_one_prefix(committer.next_chunk)
         if prefix is None:
             # Terminate (X): no generation, publication, or physics release.
@@ -753,6 +760,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
     )
     cancellation = threading.Event()
     restart = threading.Event()
+    restart_armed = threading.Event()
     cancelled = cancellation.is_set
     gear = GearProcess(
         run_root=bundle.path,
@@ -963,6 +971,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                     event_sink=_print_terminal_event,
                     cancel_event=cancellation,
                     restart_event=restart,
+                    restart_armed_event=restart_armed,
                 ) as control_loop:
                     def wait_for_initial_input() -> None:
                         _wait_for_x11_target(
@@ -979,6 +988,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                             "lookahead latency.",
                             flush=True,
                         )
+                        restart_armed.set()
 
                     gate = _activate_scored_control(
                         gear,
@@ -1022,6 +1032,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                             session_id=session_id,
                             camera_disabled_prefix="CAMERA DISABLED",
                             restart_event=restart,
+                            cancellation_event=cancellation,
                         )
                         next_chunk = committer.next_chunk
                     else:
@@ -1039,6 +1050,7 @@ def run_demo(namespace: argparse.Namespace) -> Path:
                                 control_prefix="CONTROL chunk=",
                                 camera_disabled_prefix="CAMERA DISABLED",
                                 restart_event=restart,
+                                cancellation_event=cancellation,
                                 prefix_duration_s=prefix_duration_s,
                             )
                             camera_state = result.camera_state
