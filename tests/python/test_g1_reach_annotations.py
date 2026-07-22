@@ -149,7 +149,8 @@ class ReachAnnotationTests(unittest.TestCase):
             "toggle_play", "scrub(-1)", "scrub(1)", "scrub(-10)",
             "scrub(10)", "previous_proposal", "next_proposal",
             "set_departure", "set_grab", "accept_current",
-            "reject_current", "save", "escape", "--smoke-test",
+            "reject_current", "undo_current", '"u": undo_current',
+            "history.append", "history.pop", "save", "escape", "--smoke-test",
             "G1_SKELETON.parents", "import tkinter", "Canvas(",
         ):
             self.assertIn(contract, source)

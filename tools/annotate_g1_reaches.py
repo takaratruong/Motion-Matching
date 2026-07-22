@@ -93,6 +93,7 @@ def run(args) -> int:
         "playing": False,
         "message": "",
     }
+    history = []
 
     def current():
         return document.annotations[state["index"]]
@@ -166,7 +167,8 @@ def run(args) -> int:
             font=("Sans", 12),
             text=(
                 "Space play | J/L ±1 | Shift+J/L ±10 | [/] proposal | "
-                "1 departure | 2 grab | A accept | R reject | S save | Esc close"
+                "1 departure | 2 grab | A accept | R reject | U undo | "
+                "S save | Esc close"
             ),
         )
 
@@ -212,6 +214,7 @@ def run(args) -> int:
             redraw()
             return False
         values = list(document.annotations)
+        history.append((state["index"], values[state["index"]]))
         values[state["index"]] = updated
         document = replace(document, annotations=tuple(values))
         write_annotations_atomic(args.annotations, document)
@@ -224,6 +227,22 @@ def run(args) -> int:
     def reject_current():
         if replace_current("rejected"):
             next_proposal()
+
+    def undo_current():
+        nonlocal document
+        if not history:
+            state["message"] = "nothing to undo"
+            redraw()
+            return
+        index, annotation = history.pop()
+        values = list(document.annotations)
+        values[index] = annotation
+        document = replace(document, annotations=tuple(values))
+        write_annotations_atomic(args.annotations, document)
+        state["index"] = index
+        load_current()
+        state["message"] = "last decision undone"
+        redraw()
 
     def save():
         write_annotations_atomic(args.annotations, document)
@@ -247,6 +266,7 @@ def run(args) -> int:
             "2": set_grab,
             "a": accept_current,
             "r": reject_current,
+            "u": undo_current,
             "s": save,
             "Escape": escape,
         }
