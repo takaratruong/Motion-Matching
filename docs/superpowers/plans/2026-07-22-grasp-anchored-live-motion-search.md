@@ -4,7 +4,7 @@
 
 **Goal:** Search and display complete, collision-safe pickup motions from a staged world-space grasp without using object identity or rotation to transform the body.
 
-**Architecture:** Replace object-anchored scene alignment with Contact-wrist grasp anchoring that applies only yaw and X/Z translation. Extract through the final Lift frame, shape the active arm with the existing IK solver, collision-test every shaped skeleton, and rebuild/rank-zero the valid set after every grasp transform.
+**Architecture:** Replace object-anchored scene alignment with Contact-wrist grasp anchoring that applies only yaw and X/Z translation. Extract through the final Lift frame, shape the active arm with the existing IK solver, collision-test every shaped skeleton, and rebuild/rank-zero the valid set when Enter commits a staged grasp transform.
 
 **Tech Stack:** C++17, existing interaction pose/IK math, raylib, C++ regression tests, Python source-contract tests, Make.
 
@@ -14,7 +14,8 @@
 - Object identity, dimensions, pitch, and roll do not affect retrieval ranking or whole-body alignment.
 - Whole-body alignment uses yaw and X/Z translation only and preserves world Y/up.
 - Position-only mode retains grasp heading for alignment but omits orientation ranking and IK correction.
-- Motions span first Reach through the final contiguous Lift frame.
+- Motions span source clip start through the final contiguous Lift frame; the
+  post-Lift Hold tail remains omitted.
 - Grasp transforms only update the marker and mark results stale; `Enter` runs
   search, IK, collision filtering, and rank-zero selection once.
 - `/` and `]` cycle forward, `[` cycles backward, and `Enter` forces refresh.
@@ -255,3 +256,46 @@ Do not use screenshot, display-capture, mesh, terrain, controller, or diffusion 
 - [ ] **Step 3: Verify runtime state**
 
 Confirm exactly one viewer process, matching disk/running binary hashes, the expected DISPLAY/pack environment, no viewer runtime error output, and a clean worktree. Leave the branch/worktree available for the user's visual iteration.
+
+### Task 5: Show the recorded walking approach
+
+**Files:**
+- Modify: `interaction_hand_trajectories.h`
+- Modify: `interaction_hand_trajectories.cpp`
+- Modify: `hand_trajectory_viewer.cpp`
+- Test: `tests/cpp/test_interaction_hand_trajectories.cpp`
+- Test: `tests/python/test_hand_trajectory_viewer.py`
+
+**Interfaces:**
+- `HandTrajectory::start_frame` is the source clip start.
+- `HandTrajectory::reach_point` and `contact_point` index into the complete
+  clip-start-through-Lift sample arrays.
+
+- [x] **Step 1: Write failing approach-window tests**
+
+Assert that extracted hand/elbow paths begin at the clip range start, preserve
+the Reach and Contact indices, and end at final contiguous Lift. Assert shaping
+loads poses from `start_frame`, leaves all pre-Reach arm samples uncorrected,
+and still converges at Contact.
+
+- [x] **Step 2: Verify RED**
+
+Run the focused C++ and Python tests. Expect compile/source-contract failures
+for the missing start/reach-point contract and viewer frame mapping.
+
+- [x] **Step 3: Implement approach extraction and display**
+
+Extract source samples from the clip range start through final Lift. Compute IK
+weight as zero through Reach entry, smoothstep from Reach to Contact, and one
+after Contact. Animate and label frames from `start_frame`, including the
+`APPROACH` phase label. Draw unselected background paths with a fixed stride,
+but keep the selected path and skeleton at full source resolution. Retain path
+data for all options, release full pose arrays after collision checking, and
+regenerate full poses only for the selected option to avoid a gigabyte-scale
+viewer cache.
+
+- [ ] **Step 4: Verify, build, and replace the viewer**
+
+Run focused C++ tests, Python viewer tests, a release viewer build, and
+`git diff --check`. Replace only the exact existing viewer process after all
+checks pass, then confirm one process and matching executable hashes.

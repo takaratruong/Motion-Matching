@@ -2,9 +2,9 @@
 
 ## Goal
 
-Make the trajectory viewer search recorded pickup motions from the requested
-world-space grasp, update that search while the grasp is manipulated, and show
-only complete, collision-safe pickup options whose bodies remain upright.
+Make the trajectory viewer search recorded pickup motions from a staged
+world-space grasp and show only complete, collision-safe pickup options whose
+bodies remain upright.
 
 ## Search Query and Alignment
 
@@ -45,16 +45,26 @@ after the grasp changes so old paths are not mistaken for current results.
 
 ## Motion Extent and IK
 
-Each option begins at the first Reach frame and continues through the final
-contiguous Lift frame. Contact remains the first Contact frame. This displays
-the complete Reach, Contact, and Lift sequence, whose median duration in the
-current 2,045-clip pack is approximately 3.6 seconds.
+Each option begins at the source clip's first frame and continues through the
+final contiguous Lift frame. Contact remains the first Contact frame and Reach
+remains the first Reach frame. This displays the recorded walking approach in
+addition to the complete Reach, Contact, and Lift sequence. In the current
+2,045-clip pack, the median clip-start-through-Lift duration is approximately
+8.1 seconds; the later Hold tail remains omitted.
 
-The grasp-aligned body pose is the IK base. A smooth correction weight grows
-from zero at Reach entry to one at Contact and stays at one through Lift. Only
-the active seven-joint arm may change. At Contact, the requested IK target is
-the exact world-space grasp. The root, torso, opposite arm, and legs retain
+The grasp-aligned body pose is the IK base. The recorded approach remains
+unmodified by arm IK through Reach entry. A smooth correction weight then
+grows from zero at Reach entry to one at Contact and stays at one through Lift.
+Only the active seven-joint arm may change. At Contact, the requested IK target
+is the exact world-space grasp. The root, torso, opposite arm, and legs retain
 their recorded local transforms after yaw/XZ alignment.
+
+Collision and search operate on every source sample. To keep the visualization
+responsive with thousands of longer paths, unselected background paths may be
+drawn at a fixed sample stride. The selected path and animated skeleton retain
+all source samples. Search retains every shaped hand path but releases the much
+larger full-skeleton pose arrays after collision validation. It regenerates the
+full pose sequence only for the currently selected option.
 
 ## Collision Filtering
 
@@ -76,7 +86,9 @@ Automated regressions must prove:
 - object identity and dimensions do not change grasp-based ranking;
 - rotating the requested grasp reranks recorded Contact wrist orientations;
 - grasp alignment preserves world up and Contact X/Z/heading;
-- extraction reaches the final Lift frame rather than its first frame;
+- extraction starts at the source clip boundary and reaches the final Lift
+  frame rather than its first frame;
+- pre-Reach approach samples receive zero IK correction;
 - full-skeleton upper-arm or torso table penetration is rejected;
 - intended hand/object overlap is allowed only at and after Contact;
 - `/`, `]`, `[`, and `Enter` are bound;

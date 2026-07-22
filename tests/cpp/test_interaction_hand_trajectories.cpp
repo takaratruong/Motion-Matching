@@ -371,13 +371,24 @@ void test_selects_every_close_complete_same_hand_clip_in_stable_order() {
     require(selected[0].clip == 0 && selected[1].clip == 1,
             "selector ordering changed");
     require(selected[0].cost <= selected[1].cost, "selector cost order changed");
-    require(selected[0].contact_point == 2U, "contact point index changed");
+    require(selected[0].start_frame == 0,
+            "trajectory did not begin at the source clip boundary");
+    require(selected[0].reach_frame == 1,
+            "first Reach source frame changed");
+    require(selected[0].reach_point == 1U,
+            "Reach point does not index the full approach path");
+    require(selected[0].contact_point == 3U,
+            "Contact point does not index the full approach path");
     require(selected[0].lift_frame == 6,
             "trajectory stopped at the first Lift frame");
-    require(selected[0].hands_in_source_object.size() == 6U,
-            "trajectory does not span Reach through complete Lift");
-    require(selected[0].elbows_in_source_object.size() == 6U,
-            "elbow trajectory does not span Reach through complete Lift");
+    require(selected[0].hands_in_source_object.size() == 7U,
+            "trajectory does not span clip start through complete Lift");
+    require(selected[0].elbows_in_source_object.size() == 7U,
+            "elbow trajectory does not span clip start through complete Lift");
+    require(selected[1].start_frame == 8 && selected[1].reach_frame == 9 &&
+                selected[1].reach_point == 1U &&
+                selected[1].contact_point == 3U,
+            "nonzero clip start produced incorrect path indices");
 
     interaction::HandTrajectoryConfig one_only{};
     one_only.maximum_compatible_clips = 1U;
@@ -502,7 +513,7 @@ void test_shape_converges_contact_without_moving_root_or_legs() {
     for (size_t sample = 0U; sample < shaped.poses.size(); ++sample) {
         interaction::Pose expected = interaction::pose_at_frame(
             database,
-            selected[0].reach_frame + static_cast<int32_t>(sample));
+            selected[0].start_frame + static_cast<int32_t>(sample));
         const interaction::Transform root = interaction::compose(
             scene_alignment,
             {expected.positions[g1_skeleton::Simulation],
@@ -517,6 +528,10 @@ void test_shape_converges_contact_without_moving_root_or_legs() {
                 require(near_rotation(shaped.poses[sample].rotations[bone],
                                       expected.rotations[bone]),
                         "IK shaping rotated the root, torso, or legs");
+            } else if (sample <= selected[0].reach_point) {
+                require(near_rotation(shaped.poses[sample].rotations[bone],
+                                      expected.rotations[bone]),
+                        "IK shaping changed the pre-Reach approach arm");
             }
         }
     }

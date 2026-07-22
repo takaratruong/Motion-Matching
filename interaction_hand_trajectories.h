@@ -27,9 +27,11 @@ struct HandTrajectoryConfig {
 
 struct HandTrajectory {
     int32_t clip = -1;
+    int32_t start_frame = -1;
     int32_t reach_frame = -1;
     int32_t contact_frame = -1;
     int32_t lift_frame = -1;
+    size_t reach_point = 0U;
     size_t contact_point = 0U;
     float cost = 0.0F;
     Transform source_object{};

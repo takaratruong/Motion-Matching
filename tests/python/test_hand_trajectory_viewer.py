@@ -73,6 +73,17 @@ class HandTrajectoryViewerTests(unittest.TestCase):
         self.assertIn("world_pose(", source)
         self.assertIn("g1_skeleton::kParents", source)
         self.assertIn("DrawCylinderEx(", source)
+        self.assertIn("selected.source.start_frame", source)
+        self.assertIn('case 0U: return "APPROACH"', source)
+        self.assertIn("kBackgroundPathStride", source)
+        self.assertIn("draw_path(selected, LIME, 1U, true)", source)
+        self.assertIn(
+            "std::vector<interaction::Pose>{}.swap(shaped.poses)", source
+        )
+        self.assertNotIn("shaped.poses.clear()", source)
+        self.assertIn("shape_selected_animation(", source)
+        self.assertIn("selected_animation.poses[sample]", source)
+        self.assertNotIn("selected.shaped.poses[sample]", source)
 
     def test_is_independent_of_controller_diffusion_mesh_and_terrain(self):
         source = self.source()

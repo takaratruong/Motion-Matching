@@ -21,6 +21,8 @@ using interaction::ShelfGeometry;
 using interaction::ShapedHandTrajectory;
 using interaction::TrajectoryFeasibilityReason;
 
+constexpr size_t kBackgroundPathStride = 5U;
+
 struct RenderedTrajectory {
     HandTrajectory source;
     ShapedHandTrajectory shaped;
@@ -133,6 +135,7 @@ TrajectorySet rebuild_valid_trajectories(
             database, candidate, query);
         if (!shaped.contact_accepted) {
             ++result.ik_rejected;
+            std::vector<interaction::Pose>{}.swap(shaped.poses);
             result.rejected.push_back({
                 candidate, std::move(shaped),
                 TrajectoryFeasibilityReason::None});
@@ -141,6 +144,7 @@ TrajectorySet rebuild_valid_trajectories(
         const auto feasibility =
             interaction::evaluate_shaped_trajectory_feasibility(
                 shaped, candidate.contact_point, query.hand, object, shelf);
+        std::vector<interaction::Pose>{}.swap(shaped.poses);
         RenderedTrajectory rendered{
             candidate, std::move(shaped), feasibility.reason};
         if (feasibility.reason == TrajectoryFeasibilityReason::None) {
@@ -156,6 +160,23 @@ TrajectorySet rebuild_valid_trajectories(
         }
     }
     return result;
+}
+
+ShapedHandTrajectory shape_selected_animation(
+    const interaction::Database& database,
+    const TrajectorySet& trajectories,
+    size_t selected_index,
+    const HandTrajectoryQuery& searched_query) {
+    if (trajectories.valid.empty()) return {};
+    if (selected_index >= trajectories.valid.size()) {
+        throw std::out_of_range("selected trajectory index is invalid");
+    }
+    ShapedHandTrajectory shaped = interaction::shape_hand_trajectory(
+        database, trajectories.valid[selected_index].source, searched_query);
+    if (!shaped.contact_accepted) {
+        throw std::runtime_error("validated trajectory no longer passes IK");
+    }
+    return shaped;
 }
 
 void draw_oriented_box(const OrientedBox& box, Color color) {
@@ -184,11 +205,15 @@ void draw_oriented_box(const OrientedBox& box, Color color) {
 void draw_path(
     const RenderedTrajectory& trajectory,
     Color color,
+    size_t sample_stride = 1U,
     bool emphasized = false) {
     const auto& hands = trajectory.shaped.path.hands;
-    for (size_t sample = 1U; sample < hands.size(); ++sample) {
+    size_t previous = 0U;
+    for (size_t sample = sample_stride;
+         sample < hands.size();
+         sample += sample_stride) {
         const Vector3 start = ray_vector(
-            hands[sample - 1U].position);
+            hands[previous].position);
         const Vector3 stop = ray_vector(
             hands[sample].position);
         if (emphasized) {
@@ -197,6 +222,13 @@ void draw_path(
         } else {
             DrawLine3D(start, stop, color);
         }
+        previous = sample;
+    }
+    if (!hands.empty() && previous != hands.size() - 1U) {
+        DrawLine3D(
+            ray_vector(hands[previous].position),
+            ray_vector(hands.back().position),
+            color);
     }
     if (!hands.empty()) {
         DrawSphere(
@@ -207,6 +239,7 @@ void draw_path(
 
 const char* phase_name(uint8_t phase) {
     switch (phase) {
+        case 0U: return "APPROACH";
         case 1U: return "REACH";
         case 2U: return "CONTACT";
         case 3U: return "LIFT";
@@ -215,13 +248,13 @@ const char* phase_name(uint8_t phase) {
 }
 
 size_t animated_sample(
-    const RenderedTrajectory& trajectory,
+    const ShapedHandTrajectory& animation,
     float animation_seconds) {
-    if (trajectory.shaped.poses.empty()) {
+    if (animation.poses.empty()) {
         throw std::invalid_argument("selected trajectory has no shaped poses");
     }
     return static_cast<size_t>(std::floor(animation_seconds * 25.0F)) %
-        trajectory.shaped.poses.size();
+        animation.poses.size();
 }
 
 void draw_selected_skeleton(
@@ -289,6 +322,9 @@ int main(int argc, char** argv) {
             object_world, canonical, position_only);
         TrajectorySet trajectories = rebuild_valid_trajectories(
             database, query, table_geometry);
+        HandTrajectoryQuery searched_query = query;
+        ShapedHandTrajectory selected_animation = shape_selected_animation(
+            database, trajectories, selected_index, searched_query);
 
         SetConfigFlags(FLAG_VSYNC_HINT | FLAG_MSAA_4X_HINT);
         InitWindow(1280, 800, "Generic grasp kinematic trajectory lab");
@@ -366,6 +402,8 @@ int main(int argc, char** argv) {
                     selected_index = selected_index == 0U
                         ? trajectories.valid.size() - 1U
                         : selected_index - 1U;
+                    selected_animation = shape_selected_animation(
+                        database, trajectories, selected_index, searched_query);
                     animation_seconds = 0.0F;
                 }
             }
@@ -374,6 +412,8 @@ int main(int argc, char** argv) {
                 if (!trajectories.valid.empty()) {
                     selected_index =
                         (selected_index + 1U) % trajectories.valid.size();
+                    selected_animation = shape_selected_animation(
+                        database, trajectories, selected_index, searched_query);
                     animation_seconds = 0.0F;
                 }
             }
@@ -390,6 +430,9 @@ int main(int argc, char** argv) {
                 trajectories = rebuild_valid_trajectories(
                     database, query, table_geometry);
                 selected_index = 0U;
+                searched_query = query;
+                selected_animation = shape_selected_animation(
+                    database, trajectories, selected_index, searched_query);
                 animation_seconds = 0.0F;
                 search_stale = false;
             }
@@ -411,7 +454,9 @@ int main(int argc, char** argv) {
             if (show_rejected) {
                 for (const RenderedTrajectory& rejected :
                      trajectories.rejected) {
-                    draw_path(rejected, Color{210, 45, 55, 75});
+                    draw_path(
+                        rejected, Color{210, 45, 55, 75},
+                        kBackgroundPathStride);
                 }
             }
             for (size_t index = 0U; index < trajectories.valid.size(); ++index) {
@@ -422,16 +467,17 @@ int main(int argc, char** argv) {
                       static_cast<float>(trajectories.valid.size() - 1U);
                 draw_path(
                     trajectories.valid[index],
-                    ColorFromHSV(125.0F + 95.0F * fraction, 0.78F, 0.86F));
+                    ColorFromHSV(125.0F + 95.0F * fraction, 0.78F, 0.86F),
+                    kBackgroundPathStride);
             }
             if (!trajectories.valid.empty()) {
                 const RenderedTrajectory& selected =
                     trajectories.valid[selected_index];
                 const size_t sample = animated_sample(
-                    selected, animation_seconds);
-                draw_path(selected, LIME, true);
+                    selected_animation, animation_seconds);
+                draw_path(selected, LIME, 1U, true);
                 draw_selected_skeleton(
-                    selected.shaped.poses[sample], DARKBLUE, SKYBLUE);
+                    selected_animation.poses[sample], DARKBLUE, SKYBLUE);
             }
             EndMode3D();
 
@@ -458,8 +504,8 @@ int main(int argc, char** argv) {
                 const RenderedTrajectory& selected =
                     trajectories.valid[selected_index];
                 const size_t sample = animated_sample(
-                    selected, animation_seconds);
-                const int32_t frame = selected.source.reach_frame +
+                    selected_animation, animation_seconds);
+                const int32_t frame = selected.source.start_frame +
                     static_cast<int32_t>(sample);
                 DrawText(
                     TextFormat(

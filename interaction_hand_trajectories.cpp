@@ -320,7 +320,9 @@ void validate_trajectory(const HandTrajectory& trajectory) {
     if (trajectory.hands_in_source_object.empty() ||
         trajectory.hands_in_source_object.size() !=
             trajectory.elbows_in_source_object.size() ||
+        trajectory.reach_point >= trajectory.hands_in_source_object.size() ||
         trajectory.contact_point >= trajectory.hands_in_source_object.size() ||
+        trajectory.reach_point >= trajectory.contact_point ||
         !finite(trajectory.source_object.position) ||
         !valid_rotation(trajectory.source_object.rotation)) {
         throw std::invalid_argument("invalid hand trajectory");
@@ -343,14 +345,18 @@ std::vector<HandTrajectory> select_hand_trajectories(
         if (phases.reach < 0) continue;
         HandTrajectory trajectory{};
         trajectory.clip = static_cast<int32_t>(clip);
+        trajectory.start_frame = database.range_starts.at(clip);
         trajectory.reach_frame = phases.reach;
         trajectory.contact_frame = phases.contact;
         trajectory.lift_frame = phases.last_lift;
-        trajectory.contact_point = static_cast<size_t>(phases.contact - phases.reach);
+        trajectory.reach_point = static_cast<size_t>(
+            phases.reach - trajectory.start_frame);
+        trajectory.contact_point = static_cast<size_t>(
+            phases.contact - trajectory.start_frame);
         trajectory.source_object = object_transform(
             database, phases.contact - 1);
         const Transform source_from_world = inverse(trajectory.source_object);
-        for (int32_t frame = phases.reach;
+        for (int32_t frame = trajectory.start_frame;
              frame <= phases.last_lift;
              ++frame) {
             const WorldPose world = world_pose(pose_at_frame(database, frame));
@@ -419,8 +425,15 @@ ShapedHandTrajectory shape_hand_trajectory(
     const Transform alignment = hand_trajectory_scene_alignment(
         trajectory, query);
     const size_t sample_count = trajectory.hands_in_source_object.size();
-    if (trajectory.reach_frame < 0 || trajectory.lift_frame < trajectory.reach_frame ||
-        static_cast<size_t>(trajectory.lift_frame - trajectory.reach_frame + 1) !=
+    if (trajectory.start_frame < 0 ||
+        trajectory.reach_frame < trajectory.start_frame ||
+        trajectory.contact_frame <= trajectory.reach_frame ||
+        trajectory.lift_frame < trajectory.contact_frame ||
+        trajectory.reach_point != static_cast<size_t>(
+            trajectory.reach_frame - trajectory.start_frame) ||
+        trajectory.contact_point != static_cast<size_t>(
+            trajectory.contact_frame - trajectory.start_frame) ||
+        static_cast<size_t>(trajectory.lift_frame - trajectory.start_frame + 1) !=
             sample_count) {
         throw std::invalid_argument("trajectory frame range does not match samples");
     }
@@ -432,7 +445,7 @@ ShapedHandTrajectory shape_hand_trajectory(
     for (size_t sample = 0U; sample < sample_count; ++sample) {
         Pose pose = pose_at_frame(
             database,
-            trajectory.reach_frame + static_cast<int32_t>(sample));
+            trajectory.start_frame + static_cast<int32_t>(sample));
         const size_t root = static_cast<size_t>(g1_skeleton::Simulation);
         const Transform mapped_root = compose(
             alignment, {pose.positions[root], pose.rotations[root]});
@@ -457,12 +470,13 @@ ShapedHandTrajectory shape_hand_trajectory(
     shaped.path.hands.reserve(sample_count);
     shaped.path.elbows.reserve(sample_count);
     for (size_t sample = 0U; sample < sample_count; ++sample) {
-        const float linear_weight = trajectory.contact_point == 0U
-            ? 1.0F
+        const float linear_weight = sample <= trajectory.reach_point
+            ? 0.0F
             : std::min(
                   1.0F,
-                  static_cast<float>(sample) /
-                      static_cast<float>(trajectory.contact_point));
+                  static_cast<float>(sample - trajectory.reach_point) /
+                      static_cast<float>(
+                          trajectory.contact_point - trajectory.reach_point));
         const float weight =
             linear_weight * linear_weight * (3.0F - 2.0F * linear_weight);
         Transform target = base_hands[sample];
@@ -482,8 +496,10 @@ ShapedHandTrajectory shape_hand_trajectory(
             solve_config.accepted_orientation_radians = pi;
             solve_config.orientation_scale_m_per_radian = 0.0F;
         }
-        const IKResult result = solve_hand_ik(
-            pose, query.hand, target, solve_config);
+        IKResult result{};
+        if (weight > 0.0F) {
+            result = solve_hand_ik(pose, query.hand, target, solve_config);
+        }
         const WorldPose world = world_pose(pose);
         shaped.path.hands.push_back(hand_transform(world, query.hand));
         shaped.path.elbows.push_back(
