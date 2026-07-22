@@ -31,7 +31,7 @@ from .timeline import CanonicalTargetBuffer
 from .zmq_v1 import DecodedPoseV1, decode_pose_v1
 
 
-PINNED_GEAR_COMMIT = "30826700c2d35d30722333f31a49b874c048f6d2"
+PINNED_GEAR_COMMIT = "294110cedba01ad764f1e268d57ddf7c1bbf9523"
 PINNED_CURRENT_FRAME_ADVANCEMENT_SHA256 = CURRENT_FRAME_ADVANCEMENT_SHA256
 FORBIDDEN_CONTACT_GROUPS = frozenset(("pelvis", "knees", "torso", "hands"))
 REGISTERED_TERRAIN_SCENE_IDS = (
