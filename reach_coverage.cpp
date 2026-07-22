@@ -120,6 +120,35 @@ bool finite_pose(const interaction::Pose& pose) {
     return true;
 }
 
+vec3 measured_approach_displacement(
+    const std::vector<interaction::Pose>& poses,
+    Hand hand) {
+    const size_t final_sample = poses.size() - 1U;
+    const interaction::Transform final_hand = hand_transform(
+        poses[final_sample], hand);
+    const size_t preferred_sample = final_sample > 5U
+        ? final_sample - 5U
+        : 0U;
+    vec3 displacement = final_hand.position - hand_transform(
+        poses[preferred_sample], hand).position;
+    if (length(displacement) >= 0.01F) {
+        return displacement;
+    }
+    const size_t earliest_sample = final_sample > 25U
+        ? final_sample - 25U
+        : 0U;
+    for (size_t sample = preferred_sample;
+         sample > earliest_sample;
+         --sample) {
+        const vec3 candidate = final_hand.position - hand_transform(
+            poses[sample - 1U], hand).position;
+        if (length(candidate) >= 0.01F) {
+            return candidate;
+        }
+    }
+    return displacement;
+}
+
 void assign_final_errors(
     Evaluation& evaluation,
     const Query& query) {
@@ -128,17 +157,12 @@ void assign_final_errors(
         return;
     }
     const size_t final_sample = evaluation.poses.size() - 1U;
-    const size_t approach_sample = final_sample > 5U
-        ? final_sample - 5U
-        : 0U;
     const interaction::Transform final_hand = hand_transform(
         evaluation.poses[final_sample], query.hand);
-    const interaction::Transform earlier_hand = hand_transform(
-        evaluation.poses[approach_sample], query.hand);
     evaluation.position_error_m = length(
         final_hand.position - query.target.position);
     evaluation.approach_error_radians = direction_angle(
-        final_hand.position - earlier_hand.position,
+        measured_approach_displacement(evaluation.poses, query.hand),
         query.approach_world);
     evaluation.orientation_error_radians = rotation_angle(
         query.target.rotation, final_hand.rotation);

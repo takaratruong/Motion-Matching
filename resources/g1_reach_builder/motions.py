@@ -16,6 +16,7 @@ from resources.g1_terrain_builder.kinematics import (
 
 from .annotations import ReachAnnotation
 from .schema import ReviewCorpus
+from .segmentation import outbound_approach_delta
 
 
 class ReachHand(IntEnum):
@@ -137,9 +138,10 @@ def _reach_from_local(
         rotations.astype(np.float64),
         G1_SKELETON.parents,
     )[1]
-    approach_start = max(0, len(world_positions) - 6)
-    approach_delta = (
-        world_positions[-1, wrist] - world_positions[approach_start, wrist]
+    approach_delta = outbound_approach_delta(
+        world_positions[:, wrist],
+        0,
+        len(world_positions) - 1,
     )
     approach_length = float(np.linalg.norm(approach_delta))
     if approach_length < 0.01:

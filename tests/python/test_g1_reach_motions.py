@@ -102,6 +102,20 @@ class CapturedReachTests(unittest.TestCase):
             float(np.linalg.norm(reach.approach_direction_root)), 1.0, places=5
         )
 
+    def test_grab_pause_uses_recent_outbound_approach_evidence(self):
+        corpus = motion_corpus(80)
+        corpus.positions[:, 23, 0] = 0.0
+        corpus.positions[10:31, 23, 0] = np.linspace(0.0, 0.40, 21)
+        corpus.positions[31:51, 23, 0] = 0.40
+
+        reach = build_captured_reach(
+            corpus, accepted_annotation(departure=10, grab=50)
+        )
+
+        np.testing.assert_allclose(
+            reach.approach_direction_root, [1.0, 0.0, 0.0], atol=1e-6
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

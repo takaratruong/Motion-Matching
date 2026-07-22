@@ -122,6 +122,30 @@ class ReachAnnotationTests(unittest.TestCase):
             )
             self.assertEqual(rejected.status, "rejected")
 
+    def test_accepts_a_grab_pause_with_recent_outbound_direction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            corpus = corpus_fixture()
+            corpus.positions[:, 23] = 0.0
+            corpus.positions[10:31, 23, 0] = np.linspace(0.0, 0.40, 21)
+            corpus.positions[31:51, 23, 0] = 0.40
+            review = Path(directory) / "review"
+            write_review_corpus(review, corpus)
+            current = create_annotation_document(review).annotations[0]
+
+            accepted = update_annotation(
+                review,
+                current,
+                departure_frame=10,
+                grab_frame=50,
+                status="accepted",
+                note="paused grab",
+            )
+
+            self.assertEqual(accepted.status, "accepted")
+            np.testing.assert_allclose(
+                accepted.approach_direction_root, [1.0, 0.0, 0.0], atol=1e-6
+            )
+
     def test_atomic_document_round_trip_preserves_existing_file_on_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             review, _ = self.make_review(directory)

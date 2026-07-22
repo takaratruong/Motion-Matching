@@ -11,7 +11,7 @@ from resources.g1_terrain_builder.kinematics import forward_local_hierarchy
 
 from .review import read_reach_proposals, read_review_corpus
 from .schema import ReviewCorpus
-from .segmentation import ReachProposal
+from .segmentation import ReachProposal, outbound_approach_delta
 
 
 @dataclass(frozen=True)
@@ -103,10 +103,12 @@ def _annotation(
         root_rotation_inv,
         rotations[grab_frame, wrist],
     ))
-    approach_start = max(departure_frame, grab_frame - 5)
+    approach_delta_world = outbound_approach_delta(
+        positions[:, wrist], departure_frame, grab_frame
+    )
     approach_delta = holden_quat.mul_vec(
         root_rotation_inv,
-        positions[grab_frame, wrist] - positions[approach_start, wrist],
+        approach_delta_world,
     )
     approach_length = float(np.linalg.norm(approach_delta))
     if status == "accepted" and approach_length < 0.01:

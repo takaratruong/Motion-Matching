@@ -54,6 +54,40 @@ class ReachProposal:
     status: str = "pending"
 
 
+def outbound_approach_delta(
+    trace: np.ndarray,
+    departure_frame: int,
+    grab_frame: int,
+    *,
+    minimum_displacement_m: float = 0.01,
+    preferred_window_frames: int = 5,
+    maximum_window_frames: int = 25,
+) -> np.ndarray:
+    trace = np.asarray(trace, np.float64)
+    if (
+        trace.ndim != 2
+        or trace.shape[1] != 3
+        or not 0 <= departure_frame <= grab_frame < len(trace)
+        or preferred_window_frames < 1
+        or maximum_window_frames < preferred_window_frames
+        or not np.isfinite(minimum_displacement_m)
+        or minimum_displacement_m <= 0.0
+    ):
+        raise ValueError("invalid outbound approach query")
+    preferred_start = max(
+        departure_frame, grab_frame - preferred_window_frames
+    )
+    delta = trace[grab_frame] - trace[preferred_start]
+    if float(np.linalg.norm(delta)) >= minimum_displacement_m:
+        return delta
+    earliest = max(departure_frame, grab_frame - maximum_window_frames)
+    for start in range(preferred_start - 1, earliest - 1, -1):
+        candidate = trace[grab_frame] - trace[start]
+        if float(np.linalg.norm(candidate)) >= minimum_displacement_m:
+            return candidate
+    return delta
+
+
 def _neutral_center(trace: np.ndarray, fps: float) -> np.ndarray:
     velocity = np.gradient(trace, 1.0 / fps, axis=0)
     speed = np.linalg.norm(velocity, axis=1)
@@ -169,10 +203,15 @@ def propose_wrist_trace(
             ):
                 grab = candidate
                 break
-        approach_start = max(departure, grab - approach_frames)
-        approach_displacement = float(np.linalg.norm(
-            trace[grab] - trace[approach_start]
-        ))
+        approach_delta = outbound_approach_delta(
+            trace,
+            departure,
+            grab,
+            minimum_displacement_m=config.minimum_approach_displacement_m,
+            preferred_window_frames=approach_frames,
+            maximum_window_frames=int(round(config.fps)),
+        )
+        approach_displacement = float(np.linalg.norm(approach_delta))
         confidence = min(1.0, excursion / 0.45) * min(
             1.0, approach_displacement / 0.10
         )

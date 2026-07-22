@@ -61,6 +61,7 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
         self.assertIn("worker_count", source)
         self.assertIn("workers.emplace_back", source)
         self.assertIn("reach::evaluate_candidate(", source)
+        self.assertIn("const interaction::EnvironmentGeometry open{}", source)
 
     def test_makefile_has_standalone_targets(self):
         makefile = self.source(MAKEFILE)

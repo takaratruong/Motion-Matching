@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -77,7 +78,9 @@ void append_pose(reach::Database& database, const interaction::Pose& pose) {
     database.foot_contacts.insert(database.foot_contacts.end(), {1, 1});
 }
 
-reach::Pack fixture(size_t frame_count = 6U) {
+reach::Pack fixture(
+    size_t frame_count = 6U,
+    size_t final_moving_frame = std::numeric_limits<size_t>::max()) {
     reach::Pack pack{};
     reach::Database& database = pack.database;
     database.version = 1U;
@@ -93,7 +96,8 @@ reach::Pack fixture(size_t frame_count = 6U) {
     database.range_starts = {0};
     database.range_stops = {static_cast<int32_t>(frame_count)};
     for (size_t frame = 0U; frame < frame_count; ++frame) {
-        append_pose(database, base_pose(0.02F * static_cast<float>(frame)));
+        append_pose(database, base_pose(
+            0.02F * static_cast<float>(std::min(frame, final_moving_frame))));
         database.source_frames.push_back(static_cast<int32_t>(100 + frame));
     }
     database.active_hands = {0U};
@@ -101,12 +105,24 @@ reach::Pack fixture(size_t frame_count = 6U) {
     database.source_indices = {0U};
     database.original_indices = {-1};
     database.source_names = {"pickup_north_0"};
-    const interaction::WorldPose first = interaction::world_pose(
-        reach::pose_at_frame(database, 0));
     const interaction::WorldPose last = interaction::world_pose(
         reach::pose_at_frame(database, static_cast<int32_t>(frame_count - 1U)));
     const size_t wrist = g1_skeleton::LeftWrist;
-    const vec3 delta = last.positions[wrist] - first.positions[wrist];
+    const size_t final_sample = frame_count - 1U;
+    size_t approach_sample = final_sample > 5U ? final_sample - 5U : 0U;
+    vec3 delta = last.positions[wrist] - interaction::world_pose(
+        reach::pose_at_frame(database, static_cast<int32_t>(approach_sample)))
+                                           .positions[wrist];
+    const size_t earliest_sample = final_sample > 25U
+        ? final_sample - 25U
+        : 0U;
+    while (length(delta) < 0.01F && approach_sample > earliest_sample) {
+        --approach_sample;
+        delta = last.positions[wrist] - interaction::world_pose(
+            reach::pose_at_frame(
+                database, static_cast<int32_t>(approach_sample)))
+                                                .positions[wrist];
+    }
     const vec3 approach = normalize(delta);
     const interaction::Transform endpoint{
         last.positions[wrist], last.rotations[wrist]};
@@ -315,6 +331,17 @@ void test_zero_retarget_reproduces_endpoint_and_keeps_root_fixed() {
     }
 }
 
+void test_zero_retarget_uses_pre_pause_approach_evidence() {
+    const reach::Pack pack = fixture(20U, 10U);
+    const reach::Query query = zero_query(pack);
+
+    const reach::Evaluation result = reach::shape_candidate(
+        pack, reach::Candidate{0U}, query);
+
+    assert(result.rejection == reach::Rejection::None);
+    assert(result.approach_error_radians <= 0.008726646F);
+}
+
 void test_unreachable_target_reports_a_specific_final_gate() {
     const reach::Pack pack = fixture();
     reach::Query query = zero_query(pack);
@@ -474,6 +501,7 @@ int main() {
     test_small_translation_without_approach_warp_uses_public_tolerance();
     test_retrieval_ranks_position_then_approach_then_clip();
     test_zero_retarget_reproduces_endpoint_and_keeps_root_fixed();
+    test_zero_retarget_uses_pre_pause_approach_evidence();
     test_unreachable_target_reports_a_specific_final_gate();
     test_position_and_rotation_perturbations_have_exclusive_outcomes();
     test_collision_stages_and_active_contact_exemption();
