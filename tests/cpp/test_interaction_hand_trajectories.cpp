@@ -408,6 +408,26 @@ void test_compact_database_shapes_trajectories_with_default_pose_channels() {
     }
 }
 
+void test_partial_compact_database_is_rejected_before_clip_filtering() {
+    interaction::Database database = make_database({
+        {interaction::Hand::Right, vec3(0.10F, 0.20F, 0.30F), quat()},
+    });
+    const std::vector<int32_t> source_frames = database.source_frames;
+    clear_compact_skipped_vectors(database);
+    database.source_frames = source_frames;
+
+    interaction::HandTrajectoryQuery query = identity_query();
+    query.hand = interaction::Hand::Left;
+    bool rejected = false;
+    try {
+        (void)interaction::select_hand_trajectories(database, query);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    require(rejected,
+            "partial compact database was accepted before clip filtering");
+}
+
 interaction::ShelfGeometry distant_shelf() {
     interaction::ShelfGeometry shelf{};
     for (interaction::OrientedBox& box : shelf.boxes) {
@@ -884,6 +904,7 @@ int main() {
     test_shape_converges_contact_without_moving_root_or_legs();
     test_position_only_shaping_ignores_orientation_acceptance();
     test_compact_database_shapes_trajectories_with_default_pose_channels();
+    test_partial_compact_database_is_rejected_before_clip_filtering();
     test_shape_rejects_contact_correction_above_solver_envelope();
     test_collision_feasibility_is_phase_aware();
     test_forearm_capsule_and_contact_still_collide_with_shelf();

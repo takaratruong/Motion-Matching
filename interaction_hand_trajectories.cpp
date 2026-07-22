@@ -201,8 +201,15 @@ quat read_quat(const std::vector<float>& values, size_t index) {
         values.at(offset + 2U), values.at(offset + 3U));
 }
 
-bool compact_skipped_vectors_empty(const Database& database) {
-    return database.velocities.empty() &&
+enum class TrajectoryDatabaseRepresentation {
+    Full,
+    Compact,
+    Partial,
+};
+
+TrajectoryDatabaseRepresentation trajectory_database_representation(
+    const Database& database) {
+    const bool all_skipped_empty = database.velocities.empty() &&
         database.angular_velocities.empty() &&
         database.foot_contacts.empty() &&
         database.hand_contacts.empty() &&
@@ -212,10 +219,10 @@ bool compact_skipped_vectors_empty(const Database& database) {
         database.object_velocities.empty() &&
         database.object_angular_velocities.empty() &&
         database.source_frames.empty();
-}
-
-bool any_compact_skipped_vector_empty(const Database& database) {
-    return database.velocities.empty() ||
+    if (all_skipped_empty) {
+        return TrajectoryDatabaseRepresentation::Compact;
+    }
+    const bool any_skipped_empty = database.velocities.empty() ||
         database.angular_velocities.empty() ||
         database.foot_contacts.empty() ||
         database.hand_contacts.empty() ||
@@ -225,13 +232,24 @@ bool any_compact_skipped_vector_empty(const Database& database) {
         database.object_velocities.empty() ||
         database.object_angular_velocities.empty() ||
         database.source_frames.empty();
+    return any_skipped_empty
+        ? TrajectoryDatabaseRepresentation::Partial
+        : TrajectoryDatabaseRepresentation::Full;
+}
+
+TrajectoryDatabaseRepresentation require_trajectory_database_representation(
+    const Database& database) {
+    const TrajectoryDatabaseRepresentation representation =
+        trajectory_database_representation(database);
+    if (representation == TrajectoryDatabaseRepresentation::Partial) {
+        throw std::invalid_argument("partial compact trajectory pose data");
+    }
+    return representation;
 }
 
 Pose trajectory_pose_at_frame(const Database& database, int32_t frame) {
-    if (!compact_skipped_vectors_empty(database)) {
-        if (any_compact_skipped_vector_empty(database)) {
-            throw std::invalid_argument("partial compact trajectory pose data");
-        }
+    if (require_trajectory_database_representation(database) ==
+        TrajectoryDatabaseRepresentation::Full) {
         return pose_at_frame(database, frame);
     }
     if (frame < 0 || static_cast<uint32_t>(frame) >= database.frame_count) {
@@ -413,6 +431,7 @@ std::vector<HandTrajectory> select_hand_trajectories(
     const HandTrajectoryQuery& query,
     const HandTrajectoryConfig& config) {
     validate_query_and_config(query, config);
+    (void)require_trajectory_database_representation(database);
     std::vector<HandTrajectory> selected;
     for (size_t clip = 0; clip < database.clip_count; ++clip) {
         if (database.active_hands.at(clip) != static_cast<uint8_t>(query.hand)) {

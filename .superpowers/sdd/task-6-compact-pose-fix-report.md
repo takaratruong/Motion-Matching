@@ -47,3 +47,46 @@ OK
 make hand_trajectory_viewer
   exit 0
 ```
+
+## Review follow-up: eager partial-state validation
+
+### RED
+
+The follow-up regression starts from a valid right-hand database, clears all
+ten compact-skipped vectors, restores only `source_frames`, and searches with
+a left-hand query. Before entry validation, every clip was skipped by the hand
+filter and selection returned normally:
+
+```text
+terminate called after throwing an instance of 'std::runtime_error'
+what():  partial compact database was accepted before clip filtering
+```
+
+### GREEN
+
+Compact-state classification is now shared and explicit: all ten skipped
+vectors empty is compact, none empty is full, and any mixed state is partial.
+`select_hand_trajectories` validates that classification before iterating over
+clips, while the compact pose reader uses the same classifier. The classifier
+uses only scalar booleans and introduces no allocations.
+
+Follow-up verification:
+
+```text
+make -B build/tests/test_interaction_hand_trajectories
+./build/tests/test_interaction_hand_trajectories
+  exit 0
+
+make -B build/tests/test_interaction_trajectory_database
+./build/tests/test_interaction_trajectory_database
+  exit 0
+
+python3 -m unittest tests.python.test_interaction_sources tests.python.test_interaction_build_cli tests.python.test_interaction_artifacts tests.python.test_hand_trajectory_viewer -v
+Ran 103 tests in 4.733s
+OK
+
+make hand_trajectory_viewer
+  exit 0
+```
+
+No process-control command was run; the live viewer process was left untouched.
