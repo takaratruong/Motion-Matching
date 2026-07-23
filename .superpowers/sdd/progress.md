@@ -33,3 +33,12 @@
 - Automated gate: viewer Python contracts, certified mesh renderer test, exhaustive search/coverage/database/trajectory/IK tests, probe/viewer release builds, and unchanged-IK diff all passed on 2026-07-23.
 - Lowered-table real report: `build/g1-reaches/contact-anchored-coverage-report-v3.json`; every fixture completed 4,608/4,608 within 30 seconds.
 - Lowered-table counts: open space 388 accepted (7 sectors, 5.05 s); main table 0 (6.17 s); shelf 2 (1 sector, 5.77 s); below table 0 (5.49 s); lower table 2 (1 sector, 6.59 s). Gates were not weakened.
+
+## Swept Grasp Collision and Bilateral Posture IK
+
+- Swept object filter: `a4f00d8` analytically sweeps all three active wrist-chain joints against the fully oriented object; `9917c08` removes the five-sample exemption so only terminal endpoint contact is permitted.
+- Posture solver: imported reviewed left solver at `24e0aaa`, generalized direct metadata/FK/limits to both hands at `a3a1911`, and integrated temporally seeded final-`0.6 s` shaping at `439ac9b`. Exhaustive reach shaping has no arm-only IK fallback.
+- Focused gate: 10 viewer/source contracts plus posture IK, hand trajectory, reach coverage, reach search, reach database, legacy IK, certified GLB lifecycle, probe, and viewer builds passed on 2026-07-23.
+- Real report: `build/g1-reaches/contact-anchored-coverage-report-v4.json`; every fixture processed all 4,608 identities, integrity passed, and each fixture completed below 10 seconds.
+- Strict-quality counts after posture IK and swept collision: open space 6 accepted (3 left, 3 right, 4 azimuth sectors, 7.58 s); table 0 (7.92 s); shelf 0 (8.14 s); below table 0 (8.24 s); lower table 0 (9.11 s). No IK, orientation, or collision threshold was weakened; total five-fixture wall time was 41.07 s at 55,332 KiB peak RSS.
+- Focused implementation review found no remaining Critical or Important issues in oriented sweep semantics, bilateral metadata/FK/limits, temporal seeding, unowned-pose preservation, finite handling, or thread safety.
