@@ -32,21 +32,25 @@ std::filesystem::path temporary_directory() {
     return path;
 }
 
-void write_database(const std::filesystem::path& path, bool trailing = false) {
+void write_database(
+    const std::filesystem::path& path,
+    const std::vector<int32_t>& contact_frames = {0, 1},
+    bool trailing = false) {
     constexpr uint32_t frames = 2U;
     constexpr uint32_t bones = 31U;
     constexpr uint32_t clips = 2U;
     std::ofstream output(path, std::ios::binary);
-    const std::array<char, 8> magic = {'G','1','R','C','H','D','1','\0'};
+    const std::array<char, 8> magic = {'G','1','R','C','H','D','2','\0'};
     output.write(magic.data(), static_cast<std::streamsize>(magic.size()));
     for (uint32_t value : {
-             1U, 0x01020304U, 25U, 1U, frames, bones, clips, 1U}) {
+             2U, 0x01020304U, 25U, 1U, frames, bones, clips, 1U}) {
         write_scalar(output, value);
     }
     write_vector(output, std::vector<int32_t>(
         g1_skeleton::kParents.begin(), g1_skeleton::kParents.end()));
     write_vector(output, std::vector<int32_t>{0, 1});
     write_vector(output, std::vector<int32_t>{1, 2});
+    write_vector(output, contact_frames);
     std::vector<float> positions(frames * bones * 3U, 0.0F);
     positions[0] = 1.0F;
     positions[1] = 2.0F;
@@ -79,9 +83,9 @@ void write_database(const std::filesystem::path& path, bool trailing = false) {
 
 void write_features(const std::filesystem::path& path) {
     std::ofstream output(path, std::ios::binary);
-    const std::array<char, 8> magic = {'G','1','R','C','H','F','1','\0'};
+    const std::array<char, 8> magic = {'G','1','R','C','H','F','2','\0'};
     output.write(magic.data(), static_cast<std::streamsize>(magic.size()));
-    for (uint32_t value : {1U, 0x01020304U, 2U, 10U}) {
+    for (uint32_t value : {2U, 0x01020304U, 2U, 10U}) {
         write_scalar(output, value);
     }
     write_vector(output, std::vector<float>{
@@ -103,6 +107,7 @@ void test_loads_pack_and_reconstructs_pose() {
     assert(pack.database.active_hands == std::vector<uint8_t>({0U, 1U}));
     assert(pack.database.augmentations == std::vector<uint8_t>({0U, 1U}));
     assert(pack.database.original_indices == std::vector<int32_t>({-1, 0}));
+    assert(pack.database.contact_frames == std::vector<int32_t>({0, 1}));
     assert(pack.features.values.size() == 20U);
     const interaction::Pose pose = reach::pose_at_frame(pack.database, 0);
     assert(pose.positions[g1_skeleton::Simulation].x == 1.0F);
@@ -114,12 +119,46 @@ void test_loads_pack_and_reconstructs_pose() {
     const interaction::Transform endpoint = reach::endpoint_transform(
         pack.database, 1U);
     assert(endpoint.position.z == -0.2F);
+    assert(reach::clip_contact_frame(pack.database, 0U) == 0);
+    assert(reach::clip_return_start(pack.database, 0U) == 1);
+    assert(reach::clip_return_stop(pack.database, 0U) == 1);
+    assert(reach::clip_contact_frame(pack.database, 1U) == 1);
+    assert(reach::clip_return_start(pack.database, 1U) == 2);
+    assert(reach::clip_return_stop(pack.database, 1U) == 2);
     std::filesystem::remove_all(directory);
 }
 
 void test_rejects_trailing_database_bytes() {
     const auto directory = temporary_directory();
-    write_database(directory / "reach_database.bin", true);
+    write_database(directory / "reach_database.bin", {0, 1}, true);
+    write_features(directory / "reach_features.bin");
+    bool threw = false;
+    try {
+        (void)reach::load_pack(directory);
+    } catch (const interaction::FormatError&) {
+        threw = true;
+    }
+    assert(threw);
+    std::filesystem::remove_all(directory);
+}
+
+void test_rejects_contact_before_clip_start() {
+    const auto directory = temporary_directory();
+    write_database(directory / "reach_database.bin", {-1, 1});
+    write_features(directory / "reach_features.bin");
+    bool threw = false;
+    try {
+        (void)reach::load_pack(directory);
+    } catch (const interaction::FormatError&) {
+        threw = true;
+    }
+    assert(threw);
+    std::filesystem::remove_all(directory);
+}
+
+void test_rejects_contact_at_clip_stop() {
+    const auto directory = temporary_directory();
+    write_database(directory / "reach_database.bin", {1, 2});
     write_features(directory / "reach_features.bin");
     bool threw = false;
     try {
@@ -136,6 +175,8 @@ void test_rejects_trailing_database_bytes() {
 int main(int argc, char** argv) {
     test_loads_pack_and_reconstructs_pose();
     test_rejects_trailing_database_bytes();
+    test_rejects_contact_before_clip_start();
+    test_rejects_contact_at_clip_stop();
     if (argc == 2) {
         const reach::Pack pack = reach::load_pack(argv[1]);
         assert(pack.database.clip_count == 2U);

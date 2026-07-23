@@ -309,7 +309,8 @@ Evaluation shape_candidate(
         return evaluation;
     }
     const int32_t start = pack.database.range_starts.at(candidate.clip);
-    const int32_t stop = pack.database.range_stops.at(candidate.clip);
+    const int32_t stop =
+        clip_contact_frame(pack.database, candidate.clip) + 1;
     if (start < 0 || stop <= start ||
         static_cast<uint32_t>(stop) > pack.database.frame_count) {
         evaluation.rejection = Rejection::InvalidSolver;

@@ -24,6 +24,7 @@ struct Database {
     std::vector<int32_t> parents;
     std::vector<int32_t> range_starts;
     std::vector<int32_t> range_stops;
+    std::vector<int32_t> contact_frames;
     std::vector<float> positions;
     std::vector<float> velocities;
     std::vector<float> rotations;
@@ -58,4 +59,3 @@ Features load_features(const std::filesystem::path& path);
 Pack load_pack(const std::filesystem::path& directory);
 
 }  // namespace reach
-

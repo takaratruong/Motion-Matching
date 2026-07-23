@@ -83,10 +83,11 @@ void append_pose(reach::Database& database, const interaction::Pose& pose) {
 
 reach::Pack fixture(
     size_t frame_count = 6U,
-    size_t final_moving_frame = std::numeric_limits<size_t>::max()) {
+    size_t final_moving_frame = std::numeric_limits<size_t>::max(),
+    size_t contact_frame = std::numeric_limits<size_t>::max()) {
     reach::Pack pack{};
     reach::Database& database = pack.database;
-    database.version = 1U;
+    database.version = 2U;
     database.endian_marker = 0x01020304U;
     database.fps_numerator = 25U;
     database.fps_denominator = 1U;
@@ -98,6 +99,11 @@ reach::Pack fixture(
         g1_skeleton::kParents.begin(), g1_skeleton::kParents.end());
     database.range_starts = {0};
     database.range_stops = {static_cast<int32_t>(frame_count)};
+    if (contact_frame == std::numeric_limits<size_t>::max()) {
+        contact_frame = frame_count - 1U;
+    }
+    assert(contact_frame < frame_count);
+    database.contact_frames = {static_cast<int32_t>(contact_frame)};
     for (size_t frame = 0U; frame < frame_count; ++frame) {
         append_pose(database, base_pose(
             0.02F * static_cast<float>(std::min(frame, final_moving_frame))));
@@ -109,9 +115,9 @@ reach::Pack fixture(
     database.original_indices = {-1};
     database.source_names = {"pickup_north_0"};
     const interaction::WorldPose last = interaction::world_pose(
-        reach::pose_at_frame(database, static_cast<int32_t>(frame_count - 1U)));
+        reach::pose_at_frame(database, static_cast<int32_t>(contact_frame)));
     const size_t wrist = g1_skeleton::LeftWrist;
-    const size_t final_sample = frame_count - 1U;
+    const size_t final_sample = contact_frame;
     size_t approach_sample = final_sample > 5U ? final_sample - 5U : 0U;
     vec3 delta = last.positions[wrist] - interaction::world_pose(
         reach::pose_at_frame(database, static_cast<int32_t>(approach_sample)))
@@ -135,7 +141,7 @@ reach::Pack fixture(
         endpoint.rotation.w, endpoint.rotation.x,
         endpoint.rotation.y, endpoint.rotation.z};
     database.approach_directions = {approach.x, approach.y, approach.z};
-    pack.features.version = 1U;
+    pack.features.version = 2U;
     pack.features.endian_marker = 0x01020304U;
     pack.features.clip_count = 1U;
     pack.features.dimension = 10U;
@@ -161,6 +167,8 @@ reach::Pack bilateral_fixture() {
     database.range_starts.push_back(right_start);
     database.range_stops.push_back(
         right_start + static_cast<int32_t>(frames_per_clip));
+    database.contact_frames.push_back(
+        right_start + static_cast<int32_t>(frames_per_clip - 1U));
     database.active_hands = {0U, 1U};
     database.augmentations = {0U, 1U};
     database.source_indices = {0U, 0U};
@@ -392,6 +400,29 @@ void test_final_contact_uses_posture_window_and_one_millimetre_gate() {
                                      .positions[wrist].y;
         assert(std::abs(achieved_y - desired_y) <= 0.001F);
     }
+}
+
+void test_outbound_shape_stops_at_contact_before_wild_return_motion() {
+    constexpr size_t contact_frame = 20U;
+    reach::Pack pack = fixture(30U, contact_frame, contact_frame);
+    reach::Database& database = pack.database;
+    for (size_t frame = contact_frame + 1U;
+         frame < database.frame_count;
+         ++frame) {
+        const size_t hips_offset =
+            (frame * g1_skeleton::BoneCount + g1_skeleton::Hips) * 3U;
+        database.positions.at(hips_offset) = 100.0F;
+        database.positions.at(hips_offset + 1U) = -100.0F;
+        database.positions.at(hips_offset + 2U) = 100.0F;
+    }
+
+    const reach::Query query = zero_query(pack);
+    const reach::Evaluation result = reach::shape_candidate(
+        pack, reach::select_candidates(pack, query)[0], query);
+
+    assert(result.rejection == reach::Rejection::None);
+    assert(result.poses.size() == static_cast<size_t>(
+        database.contact_frames.at(0) - database.range_starts.at(0) + 1));
 }
 
 void test_final_five_frames_lock_to_requested_approach() {
@@ -956,6 +987,7 @@ int main() {
     test_one_reach_warps_to_a_different_approach_direction();
     test_short_reach_rejects_approach_retarget_without_safe_ramp();
     test_final_contact_uses_posture_window_and_one_millimetre_gate();
+    test_outbound_shape_stops_at_contact_before_wild_return_motion();
     test_final_five_frames_lock_to_requested_approach();
     test_short_clip_rejects_height_retarget_without_a_safe_ramp();
     test_retrieval_keeps_every_clip_and_yaw_then_ranks_approach();

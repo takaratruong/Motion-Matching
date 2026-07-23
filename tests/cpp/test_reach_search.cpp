@@ -77,7 +77,7 @@ reach::Pack bilateral_fixture() {
     constexpr size_t frames_per_clip = 20U;
     reach::Pack pack{};
     reach::Database& database = pack.database;
-    database.version = 1U;
+    database.version = 2U;
     database.endian_marker = 0x01020304U;
     database.fps_numerator = 25U;
     database.fps_denominator = 1U;
@@ -91,6 +91,9 @@ reach::Pack bilateral_fixture() {
     database.range_stops = {
         static_cast<int32_t>(frames_per_clip),
         static_cast<int32_t>(2U * frames_per_clip)};
+    database.contact_frames = {
+        static_cast<int32_t>(frames_per_clip - 1U),
+        static_cast<int32_t>(2U * frames_per_clip - 1U)};
     for (size_t clip = 0U; clip < 2U; ++clip) {
         for (size_t frame = 0U; frame < frames_per_clip; ++frame) {
             append_pose(database, pose_at_step(0.035F * static_cast<float>(frame)));

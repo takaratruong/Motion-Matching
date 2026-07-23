@@ -16,10 +16,10 @@ namespace reach {
 namespace {
 
 constexpr std::array<char, 8> kDatabaseMagic = {
-    'G','1','R','C','H','D','1','\0'};
+    'G','1','R','C','H','D','2','\0'};
 constexpr std::array<char, 8> kFeatureMagic = {
-    'G','1','R','C','H','F','1','\0'};
-constexpr uint32_t kVersion = 1U;
+    'G','1','R','C','H','F','2','\0'};
+constexpr uint32_t kVersion = 2U;
 constexpr uint32_t kEndian = 0x01020304U;
 constexpr uint32_t kFpsNumerator = 25U;
 constexpr uint32_t kFpsDenominator = 1U;
@@ -92,6 +92,7 @@ void validate_database(const Database& value) {
     const size_t frames = value.frame_count;
     if (value.range_starts.size() != clips ||
         value.range_stops.size() != clips ||
+        value.contact_frames.size() != clips ||
         value.active_hands.size() != clips ||
         value.augmentations.size() != clips ||
         value.source_indices.size() != clips ||
@@ -113,6 +114,10 @@ void validate_database(const Database& value) {
             (clip > 0U &&
              value.range_starts[clip] != value.range_stops[clip - 1U])) {
             throw interaction::FormatError("invalid reach range");
+        }
+        if (value.contact_frames[clip] < value.range_starts[clip] ||
+            value.contact_frames[clip] >= value.range_stops[clip]) {
+            throw interaction::FormatError("invalid reach contact frame");
         }
         if (value.active_hands[clip] > 1U ||
             value.augmentations[clip] > 1U ||
@@ -208,6 +213,8 @@ Database load_database(const std::filesystem::path& path) {
     result.parents = read_values<int32_t>(input, input_size, kBones, "reach parents");
     result.range_starts = read_values<int32_t>(input, input_size, clips, "reach starts");
     result.range_stops = read_values<int32_t>(input, input_size, clips, "reach stops");
+    result.contact_frames = read_values<int32_t>(
+        input, input_size, clips, "reach contact frames");
     result.positions = read_values<float>(input, input_size,
         product({frames, kBones, 3U}, "reach positions"), "reach positions");
     result.velocities = read_values<float>(input, input_size,
@@ -298,4 +305,3 @@ Pack load_pack(const std::filesystem::path& directory) {
 }
 
 }  // namespace reach
-

@@ -58,5 +58,22 @@ vec3 approach_direction(const Database& database, size_t clip) {
     return read_vec3(database.approach_directions, clip * 3U);
 }
 
-}  // namespace reach
+int32_t clip_contact_frame(const Database& database, size_t clip) {
+    if (clip >= database.clip_count) {
+        throw std::out_of_range("reach contact clip outside database");
+    }
+    return database.contact_frames.at(clip);
+}
 
+int32_t clip_return_start(const Database& database, size_t clip) {
+    return clip_contact_frame(database, clip) + 1;
+}
+
+int32_t clip_return_stop(const Database& database, size_t clip) {
+    if (clip >= database.clip_count) {
+        throw std::out_of_range("reach return clip outside database");
+    }
+    return database.range_stops.at(clip);
+}
+
+}  // namespace reach
