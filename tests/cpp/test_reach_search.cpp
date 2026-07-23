@@ -73,7 +73,7 @@ void append_pose(reach::Database& database, const interaction::Pose& pose) {
 }
 
 reach::Pack bilateral_fixture() {
-    constexpr size_t frames_per_clip = 8U;
+    constexpr size_t frames_per_clip = 20U;
     reach::Pack pack{};
     reach::Database& database = pack.database;
     database.version = 1U;

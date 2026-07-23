@@ -2,6 +2,7 @@
 
 #include "g1_arm_joint_metadata.h"
 #include "g1_skeleton.h"
+#include "interaction_posture_ik.h"
 #include "reach_placement.h"
 
 #include <algorithm>
@@ -13,6 +14,7 @@ namespace reach {
 namespace {
 
 constexpr float kPi = 3.14159265358979323846F;
+constexpr float kPostureCorrectionSeconds = 0.6F;
 
 bool finite(float value) {
     return std::isfinite(value);
@@ -58,6 +60,15 @@ const std::array<interaction::HingeJoint, 7U>& arm_metadata(Hand hand) {
         : interaction::kRightArm;
 }
 
+const interaction::HingeJoint& upper_body_metadata(
+    Hand hand,
+    size_t joint) {
+    if (joint < interaction::kWaist.size()) {
+        return interaction::kWaist[joint];
+    }
+    return arm_metadata(hand)[joint - interaction::kWaist.size()];
+}
+
 size_t wrist_bone(Hand hand) {
     return hand == Hand::Left
         ? static_cast<size_t>(g1_skeleton::LeftWrist)
@@ -88,6 +99,12 @@ float rotation_angle(quat target, quat achieved) {
     const quat delta = quat_abs(quat_mul(
         quat_normalize(target), quat_inv(quat_normalize(achieved))));
     return length(quat_to_scaled_angle_axis(delta));
+}
+
+float wrap_angle(float value) {
+    value = std::fmod(value + kPi, 2.0F * kPi);
+    if (value < 0.0F) value += 2.0F * kPi;
+    return value - kPi;
 }
 
 float smoothstep(float value) {
@@ -288,27 +305,42 @@ Evaluation shape_candidate(
     const bool warps_translation = length(contact_offset) > 1.0e-6F;
     const quat correction = quat_mul(
         query.target.rotation, quat_inv(placed_endpoint.rotation));
-    const size_t aligned_sample = frame_count > 6U
-        ? frame_count - 6U
-        : 0U;
-    if (warps_translation && aligned_sample == 0U) {
+    const bool warps_rotation =
+        rotation_angle(correction, quat()) > 1.0e-6F;
+    const bool requires_correction =
+        warps_translation || warps_approach || warps_rotation;
+    if (pack.database.fps_denominator == 0U) {
+        evaluation.rejection = Rejection::InvalidSolver;
+        return evaluation;
+    }
+    const float fps =
+        static_cast<float>(pack.database.fps_numerator) /
+        static_cast<float>(pack.database.fps_denominator);
+    if (!finite(fps) || !(fps > 0.0F)) {
+        evaluation.rejection = Rejection::InvalidSolver;
+        return evaluation;
+    }
+    const size_t correction_intervals = static_cast<size_t>(
+        std::ceil(kPostureCorrectionSeconds * fps));
+    const size_t available_intervals = frame_count - 1U;
+    if (requires_correction &&
+        available_intervals < correction_intervals) {
         evaluation.rejection = Rejection::PositionError;
         return evaluation;
     }
-    const size_t ramp_start = aligned_sample > 10U
-        ? aligned_sample - 10U
+    const size_t correction_start = available_intervals >
+            correction_intervals
+        ? available_intervals - correction_intervals
         : 0U;
-    const interaction::IKConfig ik_config{
-        0.45F,
-        kPi,
-        0.04F,
-        config.accepted_orientation_radians,
-        0.05F,
-        0.001F,
-        0.10F,
-        0.10F,
-        20,
-    };
+    interaction::PostureIKConfig posture_config{};
+    posture_config.accepted_position_m = config.accepted_position_m;
+    posture_config.accepted_orientation_radians =
+        config.accepted_orientation_radians;
+    interaction::UpperBodyAngles previous_source{};
+    interaction::UpperBodyAngles previous_solution{};
+    bool have_previous = false;
+    constexpr size_t upper_body_joint_count =
+        interaction::kUpperBodyJointCount;
     for (size_t sample = 0U; sample < frame_count; ++sample) {
         interaction::Pose pose = place_pose(
             pack,
@@ -319,51 +351,67 @@ Evaluation shape_candidate(
         const interaction::Pose placed_pose = pose;
         const interaction::Transform placed_hand = hand_transform(
             pose, query.hand);
-        const float translation_u = aligned_sample == 0U
-            ? 1.0F
-            : std::min(
-                1.0F,
-                static_cast<float>(sample) /
-                    static_cast<float>(aligned_sample));
-        const float translation_weight = smoothstep(translation_u);
-        const float approach_u = sample <= ramp_start
+        const float correction_u = sample <= correction_start
             ? 0.0F
-            : (sample >= aligned_sample
-                ? 1.0F
-                : static_cast<float>(sample - ramp_start) /
-                      static_cast<float>(aligned_sample - ramp_start));
-        const float approach_weight = smoothstep(approach_u);
+            : static_cast<float>(sample - correction_start) /
+                  static_cast<float>(
+                      available_intervals - correction_start);
+        const float correction_weight = smoothstep(correction_u);
         const vec3 translated_position =
-            placed_hand.position + translation_weight * contact_offset;
+            placed_hand.position + correction_weight * contact_offset;
         const vec3 relative =
             translated_position - query.target.position;
         const vec3 rotated = quat_mul_vec3(approach_alignment, relative);
         const interaction::Transform desired{
-            translated_position + approach_weight * (rotated - relative),
+            translated_position +
+                correction_weight * (rotated - relative),
             quat_mul(
-                quat_nlerp_shortest(quat(), correction, translation_weight),
+                quat_nlerp_shortest(
+                    quat(), correction, correction_weight),
                 placed_hand.rotation),
         };
-        interaction::IKConfig sample_ik_config = ik_config;
-        if ((warps_translation && translation_weight > 0.0F) ||
-            (warps_approach && approach_weight > 0.0F) ||
-            sample + 1U == frame_count) {
-            sample_ik_config.accepted_position_m =
-                config.accepted_position_m;
+        const interaction::Hand hand = interaction_hand(query.hand);
+        const interaction::UpperBodyAngles source_angles =
+            interaction::decompose_upper_body(placed_pose, hand);
+        interaction::UpperBodyAngles temporal_seed = source_angles;
+        if (have_previous) {
+            for (size_t joint = 0U;
+                 joint < upper_body_joint_count;
+                 ++joint) {
+                temporal_seed[joint] += wrap_angle(
+                    previous_solution[joint] -
+                    previous_source[joint]);
+            }
         }
-        const interaction::IKResult ik = interaction::solve_hand_ik(
-            pose, interaction_hand(query.hand), desired, sample_ik_config);
-        evaluation.joint_limit_saturated =
-            evaluation.joint_limit_saturated ||
-            ik.reason == interaction::Reason::JointLimit;
+        interaction::PostureIKResult ik{};
+        ik.joint_angles = source_angles;
+        if (requires_correction && correction_weight > 0.0F) {
+            ik = interaction::solve_hand_posture_ik(
+                pose,
+                hand,
+                desired,
+                placed_pose,
+                temporal_seed,
+                posture_config);
+            evaluation.joint_limit_saturated =
+                evaluation.joint_limit_saturated ||
+                ik.joint_limit_saturated;
+        }
+        previous_source = source_angles;
+        previous_solution = ik.joint_angles;
+        have_previous = true;
         if (!finite_pose(pose) || !finite(ik.position_error_m) ||
-            !finite(ik.orientation_error_radians)) {
+            !finite(ik.orientation_error_radians) ||
+            !finite(static_cast<float>(ik.objective))) {
             evaluation.rejection = Rejection::InvalidSolver;
             evaluation.poses.clear();
             return evaluation;
         }
-        for (const interaction::HingeJoint& joint :
-             arm_metadata(query.hand)) {
+        for (size_t joint_index = 0U;
+             joint_index < upper_body_joint_count;
+             ++joint_index) {
+            const interaction::HingeJoint& joint =
+                upper_body_metadata(query.hand, joint_index);
             const size_t bone = static_cast<size_t>(joint.bone);
             const float angle = rotation_angle(
                 placed_pose.rotations[bone], pose.rotations[bone]);
@@ -372,7 +420,7 @@ Evaluation shape_candidate(
         evaluation.poses.push_back(std::move(pose));
     }
     evaluation.active_arm_deformation /= static_cast<float>(
-        frame_count * arm_metadata(query.hand).size());
+        frame_count * upper_body_joint_count);
     assign_final_errors(evaluation, query);
     if (!finite(evaluation.position_error_m) ||
         !finite(evaluation.approach_error_radians) ||

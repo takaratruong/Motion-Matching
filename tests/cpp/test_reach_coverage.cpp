@@ -305,7 +305,7 @@ void test_one_reach_warps_to_a_different_approach_direction() {
     }
 }
 
-void test_short_reach_keeps_its_initial_pose_unwarped() {
+void test_short_reach_rejects_approach_retarget_without_safe_ramp() {
     const reach::Pack pack = fixture();
     reach::Query query = zero_query(pack);
     query.approach_world = normalize(quat_mul_vec3(
@@ -315,23 +315,14 @@ void test_short_reach_keeps_its_initial_pose_unwarped() {
     const reach::Candidate candidate = reach::select_candidates(pack, query)[0];
     const reach::Evaluation result = reach::shape_candidate(
         pack, candidate, query);
-    const interaction::Pose source = reach::place_pose(
-        pack, candidate.clip, candidate.yaw_index,
-        query.target.position, 0);
-
-    for (const interaction::HingeJoint& joint : interaction::kLeftArm) {
-        const size_t bone = static_cast<size_t>(joint.bone);
-        assert(result.poses[0].rotations[bone].w == source.rotations[bone].w);
-        assert(result.poses[0].rotations[bone].x == source.rotations[bone].x);
-        assert(result.poses[0].rotations[bone].y == source.rotations[bone].y);
-        assert(result.poses[0].rotations[bone].z == source.rotations[bone].z);
-    }
+    assert(result.rejection == reach::Rejection::PositionError);
+    assert(result.poses.empty());
 }
 
-void test_final_contact_always_uses_one_millimetre_gate() {
+void test_final_contact_uses_posture_window_and_one_millimetre_gate() {
     const reach::Pack pack = fixture(20U);
     reach::Query query = zero_query(pack);
-    query.target.position.y += 0.05F;
+    query.target.position.y += 0.01F;
 
     const reach::Evaluation result = reach::shape_candidate(
         pack, reach::select_candidates(pack, query)[0], query);
@@ -339,7 +330,7 @@ void test_final_contact_always_uses_one_millimetre_gate() {
     assert(result.position_error_m <= 0.001F);
     const size_t root = static_cast<size_t>(g1_skeleton::Simulation);
     const size_t wrist = static_cast<size_t>(g1_skeleton::LeftWrist);
-    constexpr size_t aligned_sample = 14U;
+    constexpr size_t correction_start = 4U;
     for (size_t sample = 0U; sample < result.poses.size(); ++sample) {
         const interaction::Pose source = reach::pose_at_frame(
             pack.database, static_cast<int32_t>(sample));
@@ -349,14 +340,35 @@ void test_final_contact_always_uses_one_millimetre_gate() {
         const interaction::Pose placed = reach::place_pose(
             pack, 0U, 0U, query.target.position,
             static_cast<int32_t>(sample));
-        const float u = std::min(
-            1.0F,
-            static_cast<float>(sample) /
-                static_cast<float>(aligned_sample));
+        if (sample <= correction_start) {
+            for (size_t bone = 0U;
+                 bone < g1_skeleton::BoneCount;
+                 ++bone) {
+                assert(result.poses[sample].positions[bone].x ==
+                       placed.positions[bone].x);
+                assert(result.poses[sample].positions[bone].y ==
+                       placed.positions[bone].y);
+                assert(result.poses[sample].positions[bone].z ==
+                       placed.positions[bone].z);
+                assert(result.poses[sample].rotations[bone].w ==
+                       placed.rotations[bone].w);
+                assert(result.poses[sample].rotations[bone].x ==
+                       placed.rotations[bone].x);
+                assert(result.poses[sample].rotations[bone].y ==
+                       placed.rotations[bone].y);
+                assert(result.poses[sample].rotations[bone].z ==
+                       placed.rotations[bone].z);
+            }
+        }
+        const float u = sample <= correction_start
+            ? 0.0F
+            : static_cast<float>(sample - correction_start) /
+                  static_cast<float>(
+                      result.poses.size() - 1U - correction_start);
         const float weight = u * u * (3.0F - 2.0F * u);
         const float desired_y = interaction::world_pose(placed)
                                     .positions[wrist].y +
-                                weight * 0.05F;
+                                weight * 0.01F;
         const float achieved_y = interaction::world_pose(result.poses[sample])
                                      .positions[wrist].y;
         assert(std::abs(achieved_y - desired_y) <= 0.001F);
@@ -544,13 +556,14 @@ void test_collision_stages_and_active_contact_exemption() {
 }
 
 void test_collision_observations_survive_an_earlier_kinematic_rejection() {
-    const reach::Pack pack = fixture();
+    const reach::Pack pack = fixture(20U);
     reach::Query query = zero_query(pack);
     query.approach_world = normalize(quat_mul_vec3(
         quat_from_angle_axis(0.523598776F, vec3(0, 1, 0)),
         query.approach_world));
     const reach::Candidate candidate{0U, 0U};
     reach::CoverageConfig strict{};
+    strict.accepted_position_m = 0.10F;
     strict.accepted_approach_radians = 0.01F;
     const interaction::OrientedBox far_object{
         {vec3(10, 10, 10), quat()}, vec3(0.01F, 0.01F, 0.01F)};
@@ -686,8 +699,8 @@ void test_shared_grasp_shapes_both_hands_at_every_yaw() {
 int main() {
     test_retrieval_is_same_hand_and_query_pose_independent();
     test_one_reach_warps_to_a_different_approach_direction();
-    test_short_reach_keeps_its_initial_pose_unwarped();
-    test_final_contact_always_uses_one_millimetre_gate();
+    test_short_reach_rejects_approach_retarget_without_safe_ramp();
+    test_final_contact_uses_posture_window_and_one_millimetre_gate();
     test_short_clip_rejects_height_retarget_without_a_safe_ramp();
     test_retrieval_keeps_every_clip_and_yaw_then_ranks_approach();
     test_zero_retarget_reproduces_endpoint_and_keeps_root_fixed();

@@ -139,6 +139,20 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
             self.source(TRAJECTORY_HEADER),
         )
 
+    def test_reach_shaping_uses_bilateral_posture_ik(self):
+        source = self.source(REACH_COVERAGE)
+        shaped = source.split("Evaluation shape_candidate(", 1)[1].split(
+            "Evaluation evaluate_candidate(", 1
+        )[0]
+        for required in (
+            '#include "interaction_posture_ik.h"',
+            "solve_hand_posture_ik(",
+            "decompose_upper_body(",
+            "kPostureCorrectionSeconds = 0.6F",
+        ):
+            self.assertIn(required, source)
+        self.assertNotIn("solve_hand_ik(", shaped)
+
     def test_probe_contract(self):
         source = self.source(PROBE)
         for required in (
