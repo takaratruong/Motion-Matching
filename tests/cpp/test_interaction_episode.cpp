@@ -1,9 +1,6 @@
 #include "interaction_episode.h"
 
-#include "g1_arm_joint_metadata.h"
-
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <filesystem>
 #include <iostream>
@@ -92,190 +89,247 @@ void advance_until(
     throw std::runtime_error("episode did not reach requested state");
 }
 
-size_t wrist_bone(interaction::Hand hand) {
-    return hand == interaction::Hand::Left
-        ? g1_skeleton::LeftWrist
-        : g1_skeleton::RightWrist;
+interaction::Pose translate_pose(interaction::Pose pose, vec3 delta) {
+    for (size_t bone = 0U; bone < g1_skeleton::BoneCount; ++bone) {
+        pose.positions[bone] = pose.positions[bone] + delta;
+    }
+    return pose;
 }
 
-interaction::Transform hand_world(
-    const interaction::Pose& pose,
-    interaction::Hand hand) {
-    const interaction::WorldPose world = interaction::world_pose(pose);
-    const size_t wrist = wrist_bone(hand);
-    return {world.positions[wrist], world.rotations[wrist]};
+float quaternion_component_distance(quat left, quat right) {
+    const auto squared = [](quat value) {
+        return value.w * value.w + value.x * value.x +
+            value.y * value.y + value.z * value.z;
+    };
+    const quat direct(
+        left.w - right.w,
+        left.x - right.x,
+        left.y - right.y,
+        left.z - right.z);
+    const quat negated(
+        left.w + right.w,
+        left.x + right.x,
+        left.y + right.y,
+        left.z + right.z);
+    return std::sqrt(std::min(squared(direct), squared(negated)));
 }
 
-void require_pose_root(
+void require_pose_near(
     const interaction::Pose& actual,
     const interaction::Pose& expected,
+    float tolerance,
     const std::string& message) {
-    require(
-        length(
-            actual.positions[g1_skeleton::Simulation] -
-            expected.positions[g1_skeleton::Simulation]) < 1.0e-5F,
-        message);
-}
-
-void require_return_sample(
-    const episode::EpisodeOutput& output,
-    const interaction::Pose& expected,
-    interaction::Hand hand,
-    interaction::Transform hand_in_object,
-    const std::string& label) {
-    require(
-        output.state == episode::EpisodeState::Return,
-        label + " was not observable in Return");
-    require(output.attached, label + " detached the object");
-    require_pose_root(output.pose, expected, label + " root differs");
-    const interaction::Transform expected_object = interaction::compose(
-        hand_world(output.pose, hand),
-        interaction::inverse(hand_in_object));
-    require(
-        length(output.object_world.position - expected_object.position) <
-            1.0e-5F,
-        label + " object position did not follow the displayed wrist");
-    require(
-        quat_angle_between(
-            output.object_world.rotation,
-            expected_object.rotation) < 0.002F,
-        label + " object rotation did not follow the displayed wrist");
-}
-
-void require_selected_arm_layer(
-    const interaction::Pose& pose,
-    const interaction::Pose& nominal,
-    interaction::Hand hand,
-    const std::string& label) {
-    const std::array<interaction::HingeJoint, 7>& arm =
-        hand == interaction::Hand::Left
-            ? interaction::kLeftArm
-            : interaction::kRightArm;
-    for (const interaction::HingeJoint& joint : arm) {
-        const size_t bone = static_cast<size_t>(joint.bone);
-        require(
-            quat_angle_between(
-                pose.rotations[bone], nominal.rotations[bone]) < 0.002F,
-            label + " did not retain the final recorded arm layer");
+    for (size_t bone = 0U; bone < g1_skeleton::BoneCount; ++bone) {
+        const float position_error =
+            length(actual.positions[bone] - expected.positions[bone]);
+        const float rotation_error = quaternion_component_distance(
+            actual.rotations[bone], expected.rotations[bone]);
+        if (position_error > tolerance || rotation_error > tolerance) {
+            throw std::runtime_error(
+                message + " at bone " + std::to_string(bone) +
+                " position " + std::to_string(position_error) +
+                " rotation " + std::to_string(rotation_error));
+        }
     }
 }
 
-void test_commit_rejects_nonfinite_return_pose_before_state_mutation() {
+void test_commit_rejects_non_finite_return_trajectory() {
     const std::filesystem::path pack("build/g1-episode");
     episode::InteractionEpisode runtime(
         pack / "walking_database.bin",
         pack / "carry_left_database.bin",
         pack / "carry_right_database.bin",
         fast_config());
-    auto malformed = make_attempt(
-        runtime.output().pose, reach::Hand::Left, 60U, 69U, 14U);
-    malformed.plan.return_poses[1U]
-        .positions[g1_skeleton::Simulation].x =
-            std::numeric_limits<float>::quiet_NaN();
-    malformed.plan.return_poses[2U]
-        .rotations[g1_skeleton::LeftWrist].w =
-            std::numeric_limits<float>::infinity();
-    require(
-        !runtime.commit(malformed),
-        "commit accepted a non-finite recorded return pose");
-    require(
-        runtime.state() == episode::EpisodeState::FreeLocomotion &&
-            !runtime.attempt().has_value() && !runtime.output().attached,
-        "malformed return plan mutated episode state before rejection");
+    const auto require_rejected = [&](const auto& corrupt,
+                                      const std::string& channel) {
+        auto attempt = make_attempt(
+            runtime.output().pose, reach::Hand::Left, 63U, 72U, 16U);
+        corrupt(attempt.plan.return_poses[1U]);
+        require(
+            !runtime.commit(attempt),
+            "commit accepted non-finite return " + channel);
+        require(
+            runtime.state() == episode::EpisodeState::FreeLocomotion,
+            "rejected non-finite return mutated episode state for " +
+                channel);
+        require(
+            !runtime.attempt().has_value(),
+            "rejected non-finite return retained an attempt for " +
+                channel);
+    };
+    require_rejected(
+        [](interaction::Pose& pose) {
+            pose.positions[g1_skeleton::RightWrist].y =
+                std::numeric_limits<float>::quiet_NaN();
+        },
+        "position");
+    require_rejected(
+        [](interaction::Pose& pose) {
+            pose.velocities[g1_skeleton::RightWrist].x =
+                std::numeric_limits<float>::infinity();
+        },
+        "velocity");
+    require_rejected(
+        [](interaction::Pose& pose) {
+            pose.rotations[g1_skeleton::RightWrist].w =
+                std::numeric_limits<float>::quiet_NaN();
+        },
+        "rotation");
+    require_rejected(
+        [](interaction::Pose& pose) {
+            pose.angular_velocities[g1_skeleton::RightWrist].z =
+                -std::numeric_limits<float>::infinity();
+        },
+        "angular velocity");
+    require_rejected(
+        [](interaction::Pose& pose) {
+            pose.hand_dof[3U] =
+                std::numeric_limits<float>::quiet_NaN();
+        },
+        "hand dof");
+    require_rejected(
+        [](interaction::Pose& pose) {
+            pose.hand_dof_velocities[9U] =
+                std::numeric_limits<float>::infinity();
+        },
+        "hand dof velocity");
 }
 
-void test_return_replays_every_authored_sample_before_carry() {
+void test_return_replays_ordered_samples_then_holds_neutral() {
     const std::filesystem::path pack("build/g1-episode");
     episode::InteractionEpisode runtime(
         pack / "walking_database.bin",
         pack / "carry_left_database.bin",
         pack / "carry_right_database.bin",
         fast_config());
-    auto attempt = make_attempt(
-        runtime.output().pose, reach::Hand::Left, 61U, 70U, 14U);
-    interaction::Pose return0 = runtime.output().pose;
-    interaction::Pose return1 = return0;
-    interaction::Pose return2 = return0;
-    return0.positions[g1_skeleton::Simulation] =
-        return0.positions[g1_skeleton::Simulation] +
-        vec3(0.02F, 0.0F, 0.01F);
-    return1.positions[g1_skeleton::Simulation] =
-        return1.positions[g1_skeleton::Simulation] +
-        vec3(0.04F, 0.0F, 0.02F);
-    return2.positions[g1_skeleton::Simulation] =
-        return2.positions[g1_skeleton::Simulation] +
-        vec3(0.06F, 0.0F, 0.03F);
-    return0.rotations[g1_skeleton::LeftElbow] = quat_mul(
-        quat_from_angle_axis(0.10F, vec3(0.0F, 0.0F, 1.0F)),
-        return0.rotations[g1_skeleton::LeftElbow]);
-    return1.rotations[g1_skeleton::LeftElbow] = quat_mul(
-        quat_from_angle_axis(0.20F, vec3(0.0F, 0.0F, 1.0F)),
-        return1.rotations[g1_skeleton::LeftElbow]);
-    return2.rotations[g1_skeleton::LeftElbow] = quat_mul(
-        quat_from_angle_axis(0.30F, vec3(0.0F, 0.0F, 1.0F)),
-        return2.rotations[g1_skeleton::LeftElbow]);
-    attempt.plan.return_poses = {return0, return1, return2};
-    const interaction::Transform hand_in_object = interaction::compose(
-        interaction::inverse(attempt.object.world),
-        attempt.grasp.hand_world);
+    const interaction::Pose base = runtime.output().pose;
+    auto attempt = make_attempt(base, reach::Hand::Left, 61U, 70U, 14U);
+    // Distinct return samples: the whole body (and wrist) translates each
+    // sample, so an attached object must track the wrist to stay synchronized.
+    const vec3 step(0.0F, 0.03F, 0.0F);
+    attempt.plan.return_poses = {
+        base,
+        translate_pose(base, step),
+        translate_pose(base, step + step),
+    };
     require(runtime.commit(attempt), "return fixture did not commit");
     advance_until(runtime, episode::EpisodeState::Reach, 61U);
     advance_until(runtime, episode::EpisodeState::Return, 61U);
 
-    require_return_sample(
-        runtime.output(), return0, interaction::Hand::Left, hand_in_object,
-        "return sample 0");
-    const float large_dt = 3.0F * kTick;
-    const episode::LocomotionCommand ignored_command{
-        vec3(0.0F, 0.0F, 1.0F), quat()};
-    const episode::EpisodeOutput& sample1 = runtime.update({
-        large_dt, ignored_command, 61U, false, false});
-    require_return_sample(
-        sample1, return1, interaction::Hand::Left, hand_in_object,
-        "return sample 1");
-    const episode::EpisodeOutput& sample2 = runtime.update({
-        large_dt, ignored_command, 61U, false, false});
-    require_return_sample(
-        sample2, return2, interaction::Hand::Left, hand_in_object,
-        "return sample 2");
-    const episode::EpisodeOutput& carry_start = runtime.update({
-        0.0F, ignored_command, 61U, false, false});
     require(
-        runtime.state() == episode::EpisodeState::Carry &&
-            carry_start.state == episode::EpisodeState::Carry,
-        "recorded return did not lead into carry after its final sample");
-    require_pose_root(
-        carry_start.pose, return2,
-        "carry matcher rebased with a root discontinuity");
-    require_selected_arm_layer(
-        carry_start.pose, return2, interaction::Hand::Left,
-        "first carry pose");
-
-    const vec3 carry_root =
-        carry_start.pose.positions[g1_skeleton::Simulation];
-    interaction::Pose previous = carry_start.pose;
-    float maximum_knee_change = 0.0F;
-    for (int tick = 0; tick < 100; ++tick) {
-        const episode::EpisodeOutput& output = runtime.update({
-            kTick, ignored_command, 61U, false, false});
-        maximum_knee_change = std::max(
-            maximum_knee_change,
-            quat_angle_between(
-                output.pose.rotations[g1_skeleton::LeftKnee],
-                previous.rotations[g1_skeleton::LeftKnee]));
-        require_selected_arm_layer(
-            output.pose, return2, interaction::Hand::Left,
-            "walking carry pose");
-        previous = output.pose;
-    }
+        runtime.output().attached,
+        "object detached at the first recorded return frame");
     require(
         length(
-            previous.positions[g1_skeleton::Simulation] - carry_root) >
-            0.20F,
-        "walking carry did not move the rebased root");
+            runtime.output().pose.positions[g1_skeleton::Simulation] -
+            attempt.plan.return_poses.front()
+                .positions[g1_skeleton::Simulation]) < 1.0e-5F,
+        "return did not begin at the first frozen pose");
+
+    const size_t wrist = g1_skeleton::LeftWrist;
+    const interaction::Transform hand_in_object = interaction::compose(
+        interaction::inverse(attempt.object.world),
+        attempt.grasp.hand_world);
+    const auto expected_object = [&](const interaction::Pose& pose) {
+        const interaction::WorldPose world =
+            interaction::world_pose(pose);
+        const interaction::Transform hand_world{
+            world.positions[wrist],
+            world.rotations[wrist],
+        };
+        return interaction::compose(
+            hand_world, interaction::inverse(hand_in_object));
+    };
+    const interaction::Transform first_expected =
+        expected_object(runtime.output().pose);
     require(
-        maximum_knee_change > 0.005F,
-        "walking carry did not retain leg motion");
+        length(
+            runtime.output().object_world.position -
+            first_expected.position) < 1.0e-5F &&
+        quaternion_component_distance(
+            runtime.output().object_world.rotation,
+            first_expected.rotation) < 1.0e-5F,
+        "first return sample lost hand-in-object synchronization");
+
+    const episode::EpisodeOutput& sub_tick = runtime.update({
+        0.5F * kTick,
+        {vec3(0.0F, 0.0F, 1.0F), quat()},
+        61U,
+        false,
+        false,
+    });
+    require(
+        runtime.state() == episode::EpisodeState::Return,
+        "sub-tick update left Return before the next authored sample");
+    require_pose_near(
+        sub_tick.pose,
+        attempt.plan.return_poses.front(),
+        1.0e-6F,
+        "sub-tick update duplicated progression instead of holding sample 0");
+
+    // A large dt must advance exactly one authored sample, never skipping.
+    for (size_t frame = 1U;
+         frame < attempt.plan.return_poses.size();
+         ++frame) {
+        const episode::EpisodeOutput& output = runtime.update({
+            10.0F * kTick,
+            {vec3(0.0F, 0.0F, 1.0F), quat()},
+            61U,
+            false,
+            false,
+        });
+        require(output.attached, "object detached during recorded return");
+        require(
+            length(
+                output.pose.positions[g1_skeleton::Simulation] -
+                attempt.plan.return_poses[frame]
+                    .positions[g1_skeleton::Simulation]) < 1.0e-5F,
+            "large dt skipped authored return samples");
+        const interaction::Transform expected =
+            expected_object(output.pose);
+        require(
+            length(output.object_world.position - expected.position) <
+                1.0e-5F &&
+            quaternion_component_distance(
+                output.object_world.rotation, expected.rotation) <
+                1.0e-5F,
+            "object lost frozen hand-in-object synchronization during return");
+    }
+    require(
+        runtime.state() == episode::EpisodeState::Neutral,
+        "final recorded return sample did not enter the neutral hold");
+
+    const interaction::Pose neutral_pose = runtime.output().pose;
+    const interaction::Transform neutral_object =
+        runtime.output().object_world;
+    for (int tick = 0; tick < 60; ++tick) {
+        runtime.update({
+            kTick,
+            {vec3(0.0F, 0.0F, 1.5F), quat()},
+            61U,
+            false,
+            false,
+        });
+    }
+    require(
+        runtime.state() == episode::EpisodeState::Neutral,
+        "neutral hold advanced past the final recorded sample");
+    require(
+        runtime.output().attached,
+        "neutral hold lost attachment validation");
+    require_pose_near(
+        runtime.output().pose,
+        neutral_pose,
+        1.0e-6F,
+        "neutral hold full pose drifted under later locomotion input");
+    require(
+        length(
+            runtime.output().object_world.position -
+            neutral_object.position) < 1.0e-6F &&
+        quaternion_component_distance(
+            runtime.output().object_world.rotation,
+            neutral_object.rotation) < 1.0e-6F,
+        "neutral hold object drifted under later locomotion input");
 }
 
 void test_freeze_attach_and_selected_carry_hand(reach::Hand hand) {
@@ -302,14 +356,14 @@ void test_freeze_attach_and_selected_carry_hand(reach::Hand hand) {
         "active plan was not immutable");
 
     advance_until(runtime, episode::EpisodeState::Reach, 7U);
-    advance_until(runtime, episode::EpisodeState::Carry, 7U);
+    advance_until(runtime, episode::EpisodeState::Neutral, 7U);
     require(runtime.output().attached, "object did not attach at contact");
     const interaction::Hand expected = hand == reach::Hand::Left
         ? interaction::Hand::Left
         : interaction::Hand::Right;
     require(
         runtime.output().selected_hand == expected,
-        "selected reach hand was not propagated into carry");
+        "selected reach hand was not propagated into the neutral hold");
 }
 
 void test_layered_carry_does_not_require_full_pose_carry_databases(
@@ -325,13 +379,13 @@ void test_layered_carry_does_not_require_full_pose_carry_databases(
     require(
         runtime.commit(attempt),
         "layered carry fixture did not commit");
-    advance_until(runtime, episode::EpisodeState::Carry, 17U);
+    advance_until(runtime, episode::EpisodeState::Neutral, 17U);
     require(
         runtime.output().attached,
-        "layered carry fixture did not retain attachment");
+        "neutral hold fixture did not retain attachment");
     require(
         runtime.output().diagnostic.empty(),
-        "successful layered carry reported an IK fallback");
+        "successful neutral hold reported an IK fallback");
 }
 
 void test_generation_change_and_cancel_fail_before_contact() {
@@ -451,7 +505,7 @@ void test_native_walking_converges_to_a_distant_entry() {
         "native G1 bridge exposed a second skeleton or skipped blending");
 }
 
-void test_native_walking_reach_and_carry_preserve_contact_root() {
+void test_native_walking_reach_and_neutral_hold_preserve_contact_root() {
     const std::filesystem::path pack("build/g1-episode");
     episode::InteractionEpisode runtime(
         pack / "walking_database.bin",
@@ -480,135 +534,40 @@ void test_native_walking_reach_and_carry_preserve_contact_root() {
     };
 
     require(runtime.commit(attempt), "flat full-episode fixture did not commit");
-    advance_until(runtime, episode::EpisodeState::Carry, 31U);
+    advance_until(runtime, episode::EpisodeState::Neutral, 31U);
     require(runtime.output().attached, "flat full episode did not attach");
     require(
         length(
             runtime.output().pose.positions[g1_skeleton::Simulation] -
             contact.positions[g1_skeleton::Simulation]) < 0.15F,
-        "carry rebased away from the reach contact root");
+        "neutral hold rebased away from the reach contact root");
 
-    const vec3 carry_root =
-        runtime.output().pose.positions[g1_skeleton::Simulation];
-    const vec3 carry_object = runtime.output().object_world.position;
+    // Motion matching must not advance after neutral: locomotion input leaves
+    // the held root and object exactly where the final return sample left them.
+    const interaction::Pose hold_pose = runtime.output().pose;
+    const interaction::Transform hold_object =
+        runtime.output().object_world;
     const episode::LocomotionCommand command{
         vec3(0.0F, 0.0F, 0.60F), quat()};
     for (int tick = 0; tick < 100; ++tick) {
         runtime.update({kTick, command, 31U, false, false});
     }
     require(
-        length(
-            runtime.output().pose.positions[g1_skeleton::Simulation] -
-            carry_root) > 0.20F,
-        "flat carry did not respond to locomotion");
-    require(
-        length(runtime.output().object_world.position - carry_object) >
-            0.20F,
-        "attached object did not follow flat carry locomotion");
-}
-
-void test_same_hand_place_releases_and_returns_to_locomotion() {
-    const std::filesystem::path pack("build/g1-episode");
-    episode::InteractionEpisode runtime(
-        pack / "walking_database.bin",
-        pack / "carry_left_database.bin",
-        pack / "carry_right_database.bin",
-        fast_config());
-    const auto pickup = make_attempt(
-        runtime.output().pose, reach::Hand::Left, 41U, 50U, 10U);
-    require(runtime.commit(pickup), "place pickup fixture did not commit");
-    advance_until(runtime, episode::EpisodeState::Carry, 41U);
-    for (int tick = 0;
-         tick < 100 && !runtime.output().place_ready;
-         ++tick) {
-        runtime.update({
-            kTick,
-            episode::LocomotionCommand{},
-            41U,
-            false,
-            false,
-            0U,
-        });
-    }
-    require(
-        runtime.output().place_ready,
-        "held object was not place-ready: object y " +
-            std::to_string(runtime.output().object_world.position.y) +
-            " pre-lift y " +
-            std::to_string(pickup.object.world.position.y));
-
-    const interaction::Pose start = runtime.output().pose;
-    interaction::Pose contact = start;
-    const vec3 placement_delta(0.25F, 0.0F, 0.10F);
-    contact.positions[g1_skeleton::Simulation] =
-        contact.positions[g1_skeleton::Simulation] + placement_delta;
-    const interaction::WorldPose contact_world =
-        interaction::world_pose(contact);
-    const size_t wrist = g1_skeleton::LeftWrist;
-    episode::FrozenPlaceAttempt place{};
-    place.destination = {
-        51U,
-        {
-            runtime.output().object_world.position + placement_delta,
-            runtime.output().object_world.rotation,
-        },
-        pickup.object.dimensions,
-    };
-    place.grasp = {
-        {
-            contact_world.positions[wrist],
-            contact_world.rotations[wrist],
-        },
-        vec3(1.0F, 0.0F, 0.0F),
-        interaction::Hand::Left,
-        12U,
-    };
-    place.plan.grasp = place.grasp;
-    place.plan.hand = reach::Hand::Left;
-    place.plan.entry_root_world = {
-        start.positions[g1_skeleton::Simulation],
-        start.rotations[g1_skeleton::Simulation],
-    };
-    place.plan.reach.candidate.clip = 10U;
-    place.plan.reach.rejection = reach::Rejection::None;
-    place.plan.reach.poses = {start, start, contact, contact};
-    place.support = {
-        {vec3(0.0F, 0.65F, 0.0F), quat()},
-        vec3(1.20F, 0.06F, 0.75F),
-    };
-    place.request_id = 52U;
-
-    require(runtime.commit_place(place), "valid place attempt did not commit");
-    require(
-        runtime.state() == episode::EpisodeState::PlaceApproach,
-        "place attempt did not enter approach");
-    for (int tick = 0;
-         tick < 200 &&
-         runtime.state() != episode::EpisodeState::FreeLocomotion;
-         ++tick) {
-        runtime.update({
-            kTick,
-            episode::LocomotionCommand{},
-            41U,
-            false,
-            false,
-            51U,
-        });
-    }
-    require(
-        runtime.state() == episode::EpisodeState::FreeLocomotion,
-        "place playback did not return locomotion control");
-    require(
-        runtime.output().placed && !runtime.output().attached,
-        "place playback did not release the object");
+        runtime.state() == episode::EpisodeState::Neutral,
+        "neutral hold advanced the locomotion matcher after neutral");
+    require_pose_near(
+        runtime.output().pose,
+        hold_pose,
+        1.0e-6F,
+        "neutral hold pose drifted under locomotion input");
     require(
         length(
             runtime.output().object_world.position -
-            place.destination.world.position) < 1.0e-5F,
-        "placed object did not retain the frozen destination");
-    require(
-        !runtime.place_attempt().has_value(),
-        "completed place attempt remained active");
+            hold_object.position) < 1.0e-6F &&
+        quaternion_component_distance(
+            runtime.output().object_world.rotation,
+            hold_object.rotation) < 1.0e-6F,
+        "neutral hold object drifted under locomotion input");
 }
 
 }  // namespace
@@ -621,13 +580,12 @@ int main() {
             reach::Hand::Left);
         test_layered_carry_does_not_require_full_pose_carry_databases(
             reach::Hand::Right);
-        test_commit_rejects_nonfinite_return_pose_before_state_mutation();
-        test_return_replays_every_authored_sample_before_carry();
+        test_commit_rejects_non_finite_return_trajectory();
+        test_return_replays_ordered_samples_then_holds_neutral();
         test_generation_change_and_cancel_fail_before_contact();
         test_contact_rejection_timeout_and_reset();
         test_native_walking_converges_to_a_distant_entry();
-        test_native_walking_reach_and_carry_preserve_contact_root();
-        test_same_hand_place_releases_and_returns_to_locomotion();
+        test_native_walking_reach_and_neutral_hold_preserve_contact_root();
         std::cout << "interaction episode PASS\n";
         return 0;
     } catch (const std::exception& error) {

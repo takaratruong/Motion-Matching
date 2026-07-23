@@ -65,6 +65,14 @@ class InteractionEpisodeViewerContractTest(unittest.TestCase):
         self.assertIn('case episode::EpisodeState::Return: return "RETURN";', source)
         self.assertNotIn("CARRY IK", source)
 
+    def test_viewer_names_post_return_state_hold(self) -> None:
+        source = self.source()
+        self.assertIn(
+            'case episode::EpisodeState::Neutral: return "HOLD";', source
+        )
+        self.assertNotIn("CARRY MOTION MATCHING", source)
+        self.assertNotIn("WALKING CARRY", source)
+
 
 if __name__ == "__main__":
     unittest.main()

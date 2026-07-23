@@ -176,6 +176,7 @@ const char* state_name(episode::EpisodeState state, bool searching) {
         case episode::EpisodeState::Bridge: return "BRIDGE";
         case episode::EpisodeState::Reach: return "REACH";
         case episode::EpisodeState::Return: return "RETURN";
+        case episode::EpisodeState::Neutral: return "HOLD";
         case episode::EpisodeState::CarryBlend: return "CARRY BLEND";
         case episode::EpisodeState::Carry: return "CARRY";
         case episode::EpisodeState::PlaceApproach:

@@ -116,28 +116,45 @@ If a candidate's return fails, search continues to the next outbound candidate.
 Failure diagnostics distinguish return IK, object collision, environment
 collision, and seam rejection.
 
-## Episode State and Carry Handoff
+## Episode State and Neutral Hold (narrowed baseline)
+
+**User-approved narrowed scope (2026-07-23):** this milestone ends the playable
+baseline at the recorded return endpoint. There is no carry motion matching,
+walking-while-carrying, or placement locomotion after neutral. The pickup ->
+paired recorded return -> stable neutral hold path is the entire behavior.
 
 Add an attached `Return` state after pickup contact. It owns the complete shaped
 return playback and ignores locomotion commands until the recorded endpoint is
 reached. Reset and cancellation retain the existing attachment safety rules.
 
-At the final return frame:
+Return playback validity and ordering:
 
-1. rebase the native G1 walking matcher to the displayed pose;
-2. retain the final recorded active-arm rotations as the carry arm layer;
-3. let walking own root, hips, legs, spine sway, and the inactive arm;
-4. derive the held object from the active wrist and frozen
-   `hand_in_object`; and
-5. do not run continuous carry IK.
+1. `commit` rejects an empty or non-finite return trajectory before mutating any
+   episode state (`finite_return_trajectory` guards `InteractionEpisode::commit`,
+   so a NaN return leaves the runtime in `FreeLocomotion` with no active attempt);
+2. the first paired return pose is published at contact by `update_reach`;
+3. `update_return` advances at most one authored sample per update, so a large
+   `dt` can never skip past intermediate recorded return samples; and
+4. the object stays attached and wrist-synchronized through every return sample
+   via the frozen `hand_in_object` transform and `update_attached_object`.
 
-This makes the data's reachable return endpoint the nominal carry posture and
-removes the failure mode where changing walking torso motion invalidates a
-fixed world-space IK target.
+At the final recorded return sample, the episode enters the `Neutral` state:
 
-Placement approach uses the same recorded active-arm carry layer. The existing
-placement search, bridge, release, reversed placement reach, and return to free
-locomotion remain unchanged.
+1. capture the displayed pose and attached object transform as the frozen
+   neutral hold (`neutral_pose_`, `neutral_object_`);
+2. stop all motion matching — no walking matcher advance, no carry IK, no
+   layered carry start; and
+3. on every later update, `update_neutral_hold` re-publishes the exact recorded
+   neutral pose and holds the object transform unchanged, ignoring all
+   locomotion commands.
+
+This makes the data's reachable return endpoint a stable neutral hold and
+removes the failure mode where changing walking torso motion invalidates a fixed
+world-space IK target.
+
+Placement, carry, and layered-carry code remain in the tree only so the project
+keeps compiling; they are unreachable in the narrowed baseline because `Return`
+now terminates in `Neutral` rather than handing off to `Carry`.
 
 ## Compatibility
 
@@ -163,13 +180,18 @@ Automated tests must prove:
 6. warp weight reaches zero at the recorded nominal endpoint;
 7. every accepted frame preserves the frozen hand/object transform;
 8. return IK and collision failures reject the candidate before attachment;
-9. the episode transitions `Reach -> Return -> Carry`;
-10. carry walking moves the root and legs without continuous carry IK;
-11. left- and right-hand pickup, carry, placement, re-pick, and replacement
-    retain one finite 31-bone G1 pose.
+9. `commit` rejects an empty or non-finite return trajectory before mutating
+   episode state;
+10. the episode transitions `Reach -> Return -> Neutral`, publishing the first
+    return pose at contact and every later authored sample in order under a
+    large `dt`;
+11. the final recorded neutral pose and attached object remain unchanged under
+    later locomotion input, with no motion matching after neutral; and
+12. left- and right-hand pickup retain one finite attached 31-bone G1 pose
+    through the neutral hold.
 
-Manual acceptance tests pickup from multiple approach angles and object
-heights, watches the complete authored return, walks while carrying, places on
-the shelf and lower table, and re-picks the object. Pickup and placement quality
-must not regress, the object must not jump at contact, and no carry IK rejection
-may appear after the return.
+Manual acceptance picks up from multiple approach angles and object heights,
+watches the complete authored return, and confirms the character then holds the
+recorded neutral pose with the object attached while later locomotion commands
+are ignored. The viewer labels this state HOLD. Pickup quality must not regress,
+the object must not jump at contact, and no carry IK rejection may appear.

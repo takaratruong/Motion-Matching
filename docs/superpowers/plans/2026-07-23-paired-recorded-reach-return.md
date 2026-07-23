@@ -2,9 +2,23 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replay each selected reach recording's warped post-grab return, then carry with its reachable final arm posture instead of continuous carry IK.
+**Goal:** Replay each selected reach recording's warped post-grab return, then hold the recorded neutral pose with the object attached.
 
-**Architecture:** Reach-pack version 2 stores one full outbound-and-return clip plus an absolute contact frame per reach. Search still shapes and scores only the outbound interval. A new return shaper applies the inverse-time continuation of the contact warp, validates the attached trajectory, and supplies an explicit episode `Return` state; after it finishes, walking owns locomotion while the recorded final arm remains a joint-space carry layer.
+> **Narrowed baseline (user-approved 2026-07-23).** The playable baseline ends at
+> the recorded return endpoint in a stable neutral hold. There is no carry motion
+> matching, walking-while-carrying, or placement locomotion after neutral. Tasks 1–4
+> (return extraction, pack, loading, and shaping/preflight) are unchanged. Task 5 is
+> superseded: instead of handing `Return` off to `Carry`, the final recorded return
+> sample enters a new `Neutral` state that freezes the exact pose and attached object
+> and ignores all later locomotion input. The `pickup-return-neutral-hold` milestone
+> additionally hardens playback validation: `commit` rejects an empty or non-finite
+> return trajectory before mutating episode state, the first return pose is published
+> at contact, and `update_return` advances at most one authored sample per update so a
+> large `dt` never skips samples. Carry, layered-carry, and placement code stay in the
+> tree only to keep compiling; they are unreachable in this baseline. The viewer labels
+> the post-return state `HOLD`.
+
+**Architecture:** Reach-pack version 2 stores one full outbound-and-return clip plus an absolute contact frame per reach. Search still shapes and scores only the outbound interval. A new return shaper applies the inverse-time continuation of the contact warp, validates the attached trajectory, and supplies an explicit episode `Return` state; after it finishes, the episode enters a stable `Neutral` hold of the final recorded pose and attached object with no further motion matching.
 
 **Tech Stack:** Python 3, NumPy, C++17, existing G1 posture-aware IK and collision helpers, Make, Python `unittest`.
 
@@ -473,49 +487,45 @@ git commit -m "feat: shape and preflight recorded reach returns"
 
 ---
 
-### Task 5: Play Return and Carry Without Continuous IK
+### Task 5: Play Return and Hold the Recorded Neutral Pose
 
 **Files:**
-- Modify: `episode_layered_carry.h`
-- Modify: `episode_layered_carry.cpp`
 - Modify: `interaction_episode.h`
 - Modify: `interaction_episode.cpp`
 - Modify: `g1_interaction_episode_viewer.cpp`
-- Test: `tests/cpp/test_episode_layered_carry.cpp`
 - Test: `tests/cpp/test_interaction_episode.cpp`
 - Test: `tests/python/test_g1_interaction_episode_viewer.py`
 
 **Interfaces:**
-- Adds `EpisodeState::Return`.
-- Replaces `LayeredCarry::start(final_hold_pose, hand, hand_in_object,
-  object_world)` with `start(nominal_return_pose, hand, hand_in_object)`.
-- `LayeredCarry::update(locomotion)` copies only the selected arm rotations
-  from the nominal return pose over live walking and derives object world from
-  the displayed wrist; it performs no IK solve.
+- Adds `EpisodeState::Return` and `EpisodeState::Neutral`.
+- `Return` plays the selected reach's shaped paired return one authored sample
+  at a time, with the object attached to the active wrist.
+- `Neutral` republishes the exact final recorded pose and attached object.
+  Locomotion and carry motion matching are intentionally out of scope.
 
-- [ ] **Step 1: Write failing episode-state and carry tests**
+- [ ] **Step 1: Write failing return and neutral-hold tests**
 
-Add a frozen attempt with three return poses. Assert:
+Add a frozen attempt with three distinct return poses. Assert:
 
 ```cpp
-Reach -> Return -> Carry
+Reach -> Return -> Neutral
 ```
 
-and verify the object remains attached on every return frame. In the layered
-carry test, drive 100 walking ticks and require root/leg motion while selected
-arm rotations stay equal to the nominal return layer. Remove expectations for
-`last_solve_accepted()`.
+Verify each displayed return pose derives the object transform from the active
+wrist and the frozen hand-in-object relation. A `10 * kFixedTick` update may
+advance only one authored sample; a sub-tick update must hold the current
+sample. Corrupt each floating `Pose` channel in turn and require `commit()` to
+reject the trajectory before changing episode state.
 
 Run:
 
 ```bash
-make build/tests/test_episode_layered_carry \
-  build/tests/test_interaction_episode
-./build/tests/test_episode_layered_carry
+make build/tests/test_interaction_episode
 ./build/tests/test_interaction_episode
 ```
 
-Expected: compilation/state failures because `Return` is absent.
+Expected: compilation/state failures because ordered Return and Neutral are
+absent.
 
 - [ ] **Step 2: Add recorded return playback**
 
@@ -528,31 +538,28 @@ publish(attempt_->plan.return_poses.front());
 ```
 
 Advance at the fixed 25 Hz tick, publish every shaped return pose, update the
-attached object from the wrist, and ignore locomotion commands. At the final
-frame, rebase the walking matcher, start the carry layer from that final pose,
-and enter `Carry`.
+attached object from the wrist, and ignore locomotion commands. Advance at most
+one authored sample per update so a large render `dt` cannot skip poses.
 
-- [ ] **Step 3: Replace carry IK with a recorded arm layer**
+- [ ] **Step 3: Enter exact neutral hold**
 
-Start from `locomotion.pose`, copy the seven selected-arm local rotations from
-the final recorded return pose, optionally retain the existing 25% spine
-nlerp, and derive the object from the active wrist and frozen
-`hand_in_object`. Delete temporal IK state, object-in-root targeting, rejection
-fallback, and carry-IK diagnostics.
+At the final return sample, freeze the complete 31-bone pose and attached
+object transform, enter `Neutral`, and continue validating the wrist-derived
+attachment without changing the displayed values. Ignore all later locomotion
+commands. Do not rebase or advance a walking/carry matcher.
 
-Placement approach continues to use this same layer until `PlaceBridge`.
+Walking while carrying and placement locomotion are deferred.
 
 - [ ] **Step 4: Update viewer state text and contracts**
 
-Display `RETURN` for the new state. Ensure input remains locked during Return
-and the viewer no longer advertises carry IK rejection diagnostics.
+Display `RETURN` during playback and `HOLD` for `Neutral`. Ensure input remains
+locked in both states and the viewer no longer advertises carry IK or walking
+carry behavior.
 
 Run:
 
 ```bash
-make build/tests/test_episode_layered_carry \
-  build/tests/test_interaction_episode g1_interaction_episode_viewer
-./build/tests/test_episode_layered_carry
+make build/tests/test_interaction_episode g1_interaction_episode_viewer
 ./build/tests/test_interaction_episode
 python3 -m unittest tests.python.test_g1_interaction_episode_viewer -v
 ```
@@ -562,13 +569,11 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add episode_layered_carry.h episode_layered_carry.cpp \
-  interaction_episode.h interaction_episode.cpp \
+git add interaction_episode.h interaction_episode.cpp \
   g1_interaction_episode_viewer.cpp \
-  tests/cpp/test_episode_layered_carry.cpp \
   tests/cpp/test_interaction_episode.cpp \
   tests/python/test_g1_interaction_episode_viewer.py
-git commit -m "feat: replay recorded return before carry"
+git commit -m "feat: hold recorded neutral after pickup"
 ```
 
 ---
@@ -639,9 +644,9 @@ Manually exercise:
 1. WASD before pickup.
 2. Pickup from at least three angles and two heights.
 3. Watch the full attached recorded return with no contact jump.
-4. Walk while carrying and confirm animated legs with a stable arm layer.
-5. Place on the shelf and lower table.
-6. Re-pick and place again.
+4. Hold WASD after `HOLD` appears and confirm the full pose and object remain
+   fixed at the recorded neutral endpoint.
+5. Reset and repeat pickup from each tested object pose.
 
 Capture logs and reject any `return`, attachment, non-finite, skeleton, or
 collision diagnostic.

@@ -19,6 +19,7 @@ enum class EpisodeState : uint8_t {
     Bridge,
     Reach,
     Return,
+    Neutral,
     CarryBlend,
     Carry,
     PlaceApproach,
@@ -111,6 +112,7 @@ private:
     void update_bridge(float dt);
     void update_reach(float dt);
     void update_return(float dt);
+    void update_neutral_hold(float dt);
     void update_carry(const EpisodeInput& input);
     void update_place_approach(const EpisodeInput& input);
     void update_place_bridge(float dt);
@@ -143,6 +145,8 @@ private:
     interaction::Pose bridge_start_{};
     FlatSkeletonWorldPose bridge_flat_start_{};
     interaction::Pose contact_pose_{};
+    interaction::Pose neutral_pose_{};
+    interaction::Transform neutral_object_{};
     LayeredCarry layered_carry_{};
     interaction::Transform hand_in_object_{};
     float state_seconds_ = 0.0F;

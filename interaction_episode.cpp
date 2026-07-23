@@ -4,6 +4,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace episode {
 namespace {
@@ -60,6 +61,45 @@ size_t wrist_bone(interaction::Hand hand) {
         : g1_skeleton::RightWrist;
 }
 
+bool finite_vec3(const vec3& value) {
+    return std::isfinite(value.x) &&
+        std::isfinite(value.y) &&
+        std::isfinite(value.z);
+}
+
+bool finite_quat(const quat& value) {
+    return std::isfinite(value.x) &&
+        std::isfinite(value.y) &&
+        std::isfinite(value.z) &&
+        std::isfinite(value.w);
+}
+
+bool finite_pose(const interaction::Pose& pose) {
+    for (size_t bone = 0U; bone < g1_skeleton::BoneCount; ++bone) {
+        if (!finite_vec3(pose.positions[bone]) ||
+            !finite_vec3(pose.velocities[bone]) ||
+            !finite_quat(pose.rotations[bone]) ||
+            !finite_vec3(pose.angular_velocities[bone])) {
+            return false;
+        }
+    }
+    for (size_t dof = 0U; dof < pose.hand_dof.size(); ++dof) {
+        if (!std::isfinite(pose.hand_dof[dof]) ||
+            !std::isfinite(pose.hand_dof_velocities[dof])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool finite_return_trajectory(const std::vector<interaction::Pose>& poses) {
+    if (poses.empty()) return false;
+    for (const interaction::Pose& pose : poses) {
+        if (!finite_pose(pose)) return false;
+    }
+    return true;
+}
+
 void validate_config(const EpisodeConfig& config) {
     if (!(config.entry_position_m >= 0.0F) ||
         !(config.entry_yaw_radians >= 0.0F) ||
@@ -103,7 +143,7 @@ bool InteractionEpisode::commit(FrozenAttempt attempt) {
         attempt.request_id == 0U ||
         attempt.object.generation == 0U ||
         attempt.plan.reach.poses.empty() ||
-        attempt.plan.return_poses.empty() ||
+        !finite_return_trajectory(attempt.plan.return_poses) ||
         attempt.object.dimensions.x <= 0.0F ||
         attempt.object.dimensions.y <= 0.0F ||
         attempt.object.dimensions.z <= 0.0F) {
@@ -268,6 +308,9 @@ const EpisodeOutput& InteractionEpisode::update(const EpisodeInput& input) {
         case EpisodeState::Return:
             update_return(input.dt);
             break;
+        case EpisodeState::Neutral:
+            update_neutral_hold(input.dt);
+            break;
         case EpisodeState::CarryBlend:
         case EpisodeState::Carry:
             update_carry(input);
@@ -396,9 +439,12 @@ void InteractionEpisode::update_reach(float dt) {
 }
 
 void InteractionEpisode::update_return(float dt) {
+    // Advance at most one authored sample per update so a large dt can never
+    // skip past intermediate recorded return poses. The first sample was
+    // already published at contact by update_reach.
     frame_accumulator_ += dt;
-    while (frame_accumulator_ >= kFixedTick &&
-           reach_frame_ + 1U < attempt_->plan.return_poses.size()) {
+    if (frame_accumulator_ >= kFixedTick &&
+        reach_frame_ + 1U < attempt_->plan.return_poses.size()) {
         frame_accumulator_ -= kFixedTick;
         ++reach_frame_;
     }
@@ -409,33 +455,36 @@ void InteractionEpisode::update_return(float dt) {
         return;
     }
 
-    const interaction::Pose& nominal_return = output_.pose;
-    matcher_.switch_database(walking_database_, nominal_return);
-    layered_carry_.start(
-        nominal_return,
-        output_.selected_hand,
-        hand_in_object_);
-    state_ = EpisodeState::Carry;
+    // Final recorded return pose reached: freeze into a stable neutral hold.
+    // No further motion matching runs after this sample.
+    neutral_pose_ = output_.pose;
+    neutral_object_ = output_.object_world;
+    state_ = EpisodeState::Neutral;
     state_seconds_ = 0.0F;
+    output_.state = state_;
     output_.diagnostic.clear();
 }
 
-void InteractionEpisode::update_carry(const EpisodeInput& input) {
-    matcher_.update(input.command, input.dt);
-    interaction::Pose displayed =
-        layered_carry_.update(matcher_.snapshot());
-    if (state_ == EpisodeState::CarryBlend) {
-        state_seconds_ += input.dt;
-        const float alpha = smoothstep(
-            state_seconds_ / config_.carry_blend_seconds);
-        displayed = interaction::interpolate_pose(
-            contact_pose_, displayed, alpha);
-        if (state_seconds_ >= config_.carry_blend_seconds) {
-            state_ = EpisodeState::Carry;
-        }
+void InteractionEpisode::update_neutral_hold(float dt) {
+    // Ignore all locomotion commands: re-publish the exact recorded neutral
+    // pose and validate that its wrist-derived attachment remains intact.
+    publish(neutral_pose_);
+    update_attached_object(dt);
+    if (state_ != EpisodeState::Failed) {
+        output_.object_world = neutral_object_;
+        output_.attached = true;
     }
-    publish(displayed);
+}
+
+void InteractionEpisode::update_carry(const EpisodeInput& input) {
+    // Legacy carry states are a neutral hold in this narrowed baseline too.
+    // No path after pickup may advance motion matching.
+    publish(neutral_pose_);
     update_attached_object(input.dt);
+    if (state_ != EpisodeState::Failed) {
+        output_.object_world = neutral_object_;
+        output_.attached = true;
+    }
 }
 
 void InteractionEpisode::update_place_approach(
