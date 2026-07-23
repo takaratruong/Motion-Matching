@@ -195,6 +195,56 @@ void test_commit_rejects_non_finite_return_trajectory() {
         "hand dof velocity");
 }
 
+void test_commit_rejects_invalid_reach_and_discontinuous_return() {
+    const std::filesystem::path pack("build/g1-episode");
+    episode::InteractionEpisode runtime(
+        pack / "walking_database.bin",
+        pack / "carry_left_database.bin",
+        pack / "carry_right_database.bin",
+        fast_config());
+    const auto require_rejected = [&](const auto& corrupt,
+                                      const std::string& defect) {
+        auto attempt = make_attempt(
+            runtime.output().pose, reach::Hand::Left, 64U, 73U, 17U);
+        corrupt(attempt);
+        require(
+            !runtime.commit(attempt),
+            "commit accepted " + defect);
+        require(
+            runtime.state() == episode::EpisodeState::FreeLocomotion &&
+                !runtime.attempt().has_value(),
+            "rejected " + defect + " mutated episode state");
+    };
+
+    require_rejected(
+        [](episode::FrozenAttempt& attempt) {
+            attempt.plan.reach.poses[1U]
+                .positions[g1_skeleton::LeftWrist].x =
+                std::numeric_limits<float>::quiet_NaN();
+        },
+        "non-finite inbound reach pose");
+    require_rejected(
+        [](episode::FrozenAttempt& attempt) {
+            attempt.plan.reach.poses[1U]
+                .rotations[g1_skeleton::LeftWrist] =
+                quat(0.0F, 0.0F, 0.0F, 0.0F);
+        },
+        "zero-norm inbound reach rotation");
+    require_rejected(
+        [](episode::FrozenAttempt& attempt) {
+            attempt.plan.return_poses[1U]
+                .rotations[g1_skeleton::LeftWrist] =
+                quat(2.0F, 0.0F, 0.0F, 0.0F);
+        },
+        "non-unit outbound return rotation");
+    require_rejected(
+        [](episode::FrozenAttempt& attempt) {
+            attempt.plan.return_poses.front()
+                .positions[g1_skeleton::LeftWrist].x += 0.02F;
+        },
+        "pickup-contact to outbound-return pose discontinuity");
+}
+
 void test_return_replays_ordered_samples_then_holds_neutral() {
     const std::filesystem::path pack("build/g1-episode");
     episode::InteractionEpisode runtime(
@@ -581,6 +631,7 @@ int main() {
         test_layered_carry_does_not_require_full_pose_carry_databases(
             reach::Hand::Right);
         test_commit_rejects_non_finite_return_trajectory();
+        test_commit_rejects_invalid_reach_and_discontinuous_return();
         test_return_replays_ordered_samples_then_holds_neutral();
         test_generation_change_and_cancel_fail_before_contact();
         test_contact_rejection_timeout_and_reset();

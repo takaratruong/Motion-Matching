@@ -67,18 +67,29 @@ bool finite_vec3(const vec3& value) {
         std::isfinite(value.z);
 }
 
-bool finite_quat(const quat& value) {
-    return std::isfinite(value.x) &&
-        std::isfinite(value.y) &&
-        std::isfinite(value.z) &&
-        std::isfinite(value.w);
+float quat_squared_norm(const quat& value) {
+    return value.w * value.w + value.x * value.x +
+        value.y * value.y + value.z * value.z;
 }
 
-bool finite_pose(const interaction::Pose& pose) {
+bool valid_quat(const quat& value) {
+    if (!std::isfinite(value.x) ||
+        !std::isfinite(value.y) ||
+        !std::isfinite(value.z) ||
+        !std::isfinite(value.w)) {
+        return false;
+    }
+    const float squared_norm = quat_squared_norm(value);
+    return std::isfinite(squared_norm) &&
+        squared_norm > 1.0e-8F &&
+        std::fabs(squared_norm - 1.0F) <= 1.0e-3F;
+}
+
+bool valid_pose(const interaction::Pose& pose) {
     for (size_t bone = 0U; bone < g1_skeleton::BoneCount; ++bone) {
         if (!finite_vec3(pose.positions[bone]) ||
             !finite_vec3(pose.velocities[bone]) ||
-            !finite_quat(pose.rotations[bone]) ||
+            !valid_quat(pose.rotations[bone]) ||
             !finite_vec3(pose.angular_velocities[bone])) {
             return false;
         }
@@ -92,10 +103,48 @@ bool finite_pose(const interaction::Pose& pose) {
     return true;
 }
 
-bool finite_return_trajectory(const std::vector<interaction::Pose>& poses) {
+bool valid_trajectory(const std::vector<interaction::Pose>& poses) {
     if (poses.empty()) return false;
     for (const interaction::Pose& pose : poses) {
-        if (!finite_pose(pose)) return false;
+        if (!valid_pose(pose)) return false;
+    }
+    return true;
+}
+
+float rotation_distance(const quat& left, const quat& right) {
+    const float denominator = std::sqrt(
+        quat_squared_norm(left) * quat_squared_norm(right));
+    const float normalized_dot = std::fabs(
+        (left.w * right.w + left.x * right.x +
+         left.y * right.y + left.z * right.z) / denominator);
+    return 2.0F * std::acos(clampf(normalized_dot, -1.0F, 1.0F));
+}
+
+bool continuous_contact_return_seam(
+    const interaction::Pose& contact,
+    const interaction::Pose& first_return) {
+    constexpr float kMaximumPositionJumpM = 1.0e-4F;
+    constexpr float kMaximumRotationJumpRadians = 1.0e-3F;
+    constexpr float kMaximumHandDofJump = 1.0e-4F;
+    for (size_t bone = 0U; bone < g1_skeleton::BoneCount; ++bone) {
+        if (length(
+                contact.positions[bone] -
+                first_return.positions[bone]) >
+                kMaximumPositionJumpM ||
+            rotation_distance(
+                contact.rotations[bone],
+                first_return.rotations[bone]) >
+                kMaximumRotationJumpRadians) {
+            return false;
+        }
+    }
+    for (size_t dof = 0U; dof < contact.hand_dof.size(); ++dof) {
+        if (std::fabs(
+                contact.hand_dof[dof] -
+                first_return.hand_dof[dof]) >
+                kMaximumHandDofJump) {
+            return false;
+        }
     }
     return true;
 }
@@ -142,8 +191,11 @@ bool InteractionEpisode::commit(FrozenAttempt attempt) {
     if (state_ != EpisodeState::FreeLocomotion ||
         attempt.request_id == 0U ||
         attempt.object.generation == 0U ||
-        attempt.plan.reach.poses.empty() ||
-        !finite_return_trajectory(attempt.plan.return_poses) ||
+        !valid_trajectory(attempt.plan.reach.poses) ||
+        !valid_trajectory(attempt.plan.return_poses) ||
+        !continuous_contact_return_seam(
+            attempt.plan.reach.poses.back(),
+            attempt.plan.return_poses.front()) ||
         attempt.object.dimensions.x <= 0.0F ||
         attempt.object.dimensions.y <= 0.0F ||
         attempt.object.dimensions.z <= 0.0F) {
