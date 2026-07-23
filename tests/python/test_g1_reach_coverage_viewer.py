@@ -146,7 +146,7 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
         )[0]
         for required in (
             '#include "interaction_posture_ik.h"',
-            "solve_hand_posture_ik(",
+            "solve_hand_posture_ik_task_priority(",
             "decompose_upper_body(",
             "kPostureCorrectionSeconds = 0.6F",
         ):
@@ -168,6 +168,19 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
             self.assertIn(required, source)
         for forbidden in ("own_query(", "position_perturbations"):
             self.assertNotIn(forbidden, source)
+
+    def test_probe_enforces_the_measured_open_space_baseline(self):
+        source = self.source(PROBE)
+        for required in (
+            "constexpr size_t kMinimumOpenAccepted = 94U;",
+            "constexpr size_t kMinimumOpenAcceptedPerHand = 47U;",
+            "constexpr size_t kMinimumOpenAzimuthSectors = 5U;",
+            "report.accepted >= kMinimumOpenAccepted",
+            "report.hands[0] >= kMinimumOpenAcceptedPerHand",
+            "report.hands[1] >= kMinimumOpenAcceptedPerHand",
+            "report.root_azimuth_sectors >= kMinimumOpenAzimuthSectors",
+        ):
+            self.assertIn(required, source)
 
     def test_makefile_has_standalone_targets(self):
         makefile = self.source(MAKEFILE)

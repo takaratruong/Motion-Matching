@@ -27,6 +27,9 @@ constexpr vec3 kTableDimensions(1.20F, kTableThickness, 0.75F);
 constexpr float kAcceptedPositionM = 0.001F;
 constexpr size_t kExpectedInstances = 4608U;
 constexpr size_t kRootAzimuthSectors = 12U;
+constexpr size_t kMinimumOpenAccepted = 94U;
+constexpr size_t kMinimumOpenAcceptedPerHand = 47U;
+constexpr size_t kMinimumOpenAzimuthSectors = 5U;
 
 struct Fixture {
     std::string name;
@@ -264,8 +267,11 @@ bool valid_report(
                  report.maximum_accepted_position_m <= kAcceptedPositionM) &&
                 report.elapsed_seconds <= 30.0;
         if (fixtures[index].name == "open_space") {
-            valid = valid && report.hands[0] > 0U && report.hands[1] > 0U &&
-                    report.root_azimuth_sectors > 1U;
+            valid = valid &&
+                    report.accepted >= kMinimumOpenAccepted &&
+                    report.hands[0] >= kMinimumOpenAcceptedPerHand &&
+                    report.hands[1] >= kMinimumOpenAcceptedPerHand &&
+                    report.root_azimuth_sectors >= kMinimumOpenAzimuthSectors;
         }
     }
     return valid;
