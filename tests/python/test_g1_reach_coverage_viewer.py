@@ -16,9 +16,9 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
     def test_flat_viewer_contract(self):
         source = self.source(VIEWER)
         for required in (
-            "reach::load_pack(", "reach::select_candidates(",
-            "reach::evaluate_candidate(", "KEY_ENTER", "KEY_SLASH",
-            "KEY_LEFT_BRACKET", "KEY_RIGHT_BRACKET", "KEY_M", "KEY_G",
+            "reach::load_pack(", "reach::search_all(",
+            "reach::regenerate(", "KEY_ENTER", "KEY_SLASH",
+            "KEY_LEFT_BRACKET", "KEY_RIGHT_BRACKET", "KEY_G",
             "KEY_Q", "KEY_E", "KEY_R", "KEY_F", "KEY_Z", "KEY_C",
             "KEY_LEFT", "KEY_RIGHT", "KEY_UP", "KEY_DOWN", "KEY_W",
             "KEY_S", "KEY_V", "KEY_BACKSPACE", "DrawCylinderEx(",
@@ -26,19 +26,23 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
             "POSITION ERROR", "APPROACH AXIS", "FULL ORIENTATION",
             "OBJECT COLLISION", "ENVIRONMENT COLLISION",
             "SEARCH STALE - press Enter", "--object-size",
-            "results.options", "selected_evaluation",
+            "selected_evaluation",
             "REJECTED - motion shown for diagnosis",
             "ClearBackground(Color{238, 241, 245, 255})",
             "DrawSphereWires(", "DARKBLUE", "SKYBLUE", "LIME",
-            "grasp_approach_local", "use_coverage_environment = false",
-            "for (const reach::Hand candidate_hand",
+            "grasp_approach_local", "use_coverage_environment = true",
             "evaluation_hand(pack, evaluation)",
-            "kWristContactOffset",
+            "kWristContactOffset", "SEARCH INCOMPLETE",
+            "RAW INSTANCES", "PROCESSED", "YAW PLACEMENT",
+            "PRESS ENTER TO SEARCH", "displayed", "accepted",
+            "std::optional<reach::SearchResult>",
+            "results = std::move(completed)",
         ):
             self.assertIn(required, source)
         for forbidden in (
             "g1_mesh_renderer", "terrain_runtime", "TakeScreenshot(",
-            "LoadModel(", "controller.cpp",
+            "LoadModel(", "controller.cpp", "reach::select_candidates(",
+            "use_coverage_environment = false",
         ):
             self.assertNotIn(forbidden, source)
         self.assertIn(
@@ -49,6 +53,10 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
         self.assertIn("environment_collision_observed", source)
         self.assertIn("OBSERVED OBJECT COLLISION", source)
         self.assertIn("OBSERVED ENVIRONMENT COLLISION", source)
+        self.assertIn(
+            "results.has_value() && !results->accepted.empty() && !stale",
+            source,
+        )
 
     def test_probe_contract(self):
         source = self.source(PROBE)
@@ -72,6 +80,7 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
         self.assertIn("g1_reach_coverage_viewer:", makefile)
         self.assertIn("g1_reach_coverage_probe:", makefile)
         self.assertIn("reach_coverage.cpp", makefile)
+        self.assertIn("reach_search.cpp", makefile)
         self.assertIn("reach_database.cpp", makefile)
         probe_target = makefile.split("g1_reach_coverage_probe:", 1)[1].split(
             "\n\n", 1
