@@ -45,18 +45,12 @@ Hand candidate_hand(const Pack& pack, const Candidate& candidate) {
         pack.database.active_hands.at(candidate.clip));
 }
 
-size_t wrist_bone(Hand hand) {
-    return hand == Hand::Left
-        ? static_cast<size_t>(g1_skeleton::LeftWrist)
-        : static_cast<size_t>(g1_skeleton::RightWrist);
-}
-
 std::vector<vec3> extract_active_wrist_path(
     const std::vector<interaction::Pose>& poses,
     Hand hand) {
     std::vector<vec3> path;
     path.reserve(poses.size());
-    const size_t wrist = wrist_bone(hand);
+    const size_t wrist = detail::wrist_bone(hand);
     for (const interaction::Pose& pose : poses) {
         path.push_back(interaction::world_pose(pose).positions[wrist]);
     }

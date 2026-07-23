@@ -2,6 +2,7 @@
 
 #include "g1_skeleton.h"
 #include "reach_placement.h"
+#include "reach_return.h"
 
 #include <algorithm>
 #include <cmath>
@@ -305,19 +306,35 @@ std::optional<ReachPlan> choose_reach_plan(
     GraspCandidate grasp,
     std::optional<reach::Hand> required_hand) {
     if (!compact.complete) return std::nullopt;
+    if (grasp.grasp_id == 0U) {
+        grasp.hand_world = query.target;
+        grasp.approach_world = query.approach_world;
+        grasp.grasp_id = 1U;
+    }
     const size_t root =
         static_cast<size_t>(g1_skeleton::Simulation);
     const vec3 live_root = live_pose.positions[root];
     const float live_yaw = yaw(live_pose.rotations[root]);
-    size_t best_index = std::numeric_limits<size_t>::max();
-    ReachPlanCost best_cost{};
-    std::vector<vec3> best_path;
+
+    struct RankedCandidate {
+        size_t evaluation_index = 0U;
+        interaction::Transform entry{};
+        std::vector<vec3> path;
+        ReachPlanCost cost{};
+    };
+    std::vector<RankedCandidate> ranked;
+    ranked.reserve(compact.accepted.size());
     for (size_t evaluation_index : compact.accepted) {
         const reach::Evaluation& evaluation =
             compact.evaluations.at(evaluation_index).evaluation;
+        const size_t clip = evaluation.candidate.clip;
+        if (reach::clip_return_start(pack.database, clip) ==
+            reach::clip_return_stop(pack.database, clip)) {
+            continue;
+        }
         const reach::Hand candidate_hand = static_cast<reach::Hand>(
             pack.database.active_hands.at(
-                evaluation.candidate.clip));
+                clip));
         if (!reach_hand_allowed(candidate_hand, required_hand)) {
             continue;
         }
@@ -344,42 +361,69 @@ std::optional<ReachPlan> choose_reach_plan(
             evaluation.candidate.clip,
             evaluation.candidate.yaw_index,
         };
-        if (best_index == std::numeric_limits<size_t>::max() ||
-            reach_plan_cost_less(cost, best_cost)) {
-            best_index = evaluation_index;
-            best_cost = cost;
-            best_path = *path;
+        ranked.push_back({
+            evaluation_index,
+            entry,
+            *path,
+            cost,
+        });
+    }
+    std::stable_sort(
+        ranked.begin(),
+        ranked.end(),
+        [](const RankedCandidate& left, const RankedCandidate& right) {
+            return reach_plan_cost_less(left.cost, right.cost);
+        });
+
+    const interaction::Transform hand_in_object =
+        interaction::compose(
+            interaction::inverse(object.world),
+            grasp.hand_world);
+    for (RankedCandidate& selected : ranked) {
+        reach::Evaluation full = reach::regenerate(
+            pack,
+            compact.evaluations.at(selected.evaluation_index),
+            query,
+            object,
+            environment,
+            search_config);
+        if (full.rejection != reach::Rejection::None ||
+            full.poses.empty()) {
+            continue;
         }
+        const reach::Hand hand = static_cast<reach::Hand>(
+            pack.database.active_hands.at(full.candidate.clip));
+        const reach::Query return_query{
+            hand,
+            query.target,
+            query.approach_world,
+        };
+        reach::ShapedReturn shaped_return =
+            reach::shape_recorded_return(
+                pack,
+                full.candidate,
+                return_query,
+                full.poses.back(),
+                hand_in_object,
+                object.dimensions,
+                environment,
+                search_config);
+        if (shaped_return.rejection !=
+                reach::ReturnRejection::None ||
+            shaped_return.poses.empty()) {
+            continue;
+        }
+        return ReachPlan{
+            grasp,
+            std::move(full),
+            hand,
+            selected.entry,
+            std::move(selected.path),
+            selected.cost,
+            std::move(shaped_return.poses),
+        };
     }
-    if (best_index == std::numeric_limits<size_t>::max()) {
-        return std::nullopt;
-    }
-    reach::Evaluation full = reach::regenerate(
-        pack,
-        compact.evaluations.at(best_index),
-        query,
-        object,
-        environment,
-        search_config);
-    if (full.rejection != reach::Rejection::None || full.poses.empty()) {
-        return std::nullopt;
-    }
-    const reach::Hand hand = static_cast<reach::Hand>(
-        pack.database.active_hands.at(full.candidate.clip));
-    if (grasp.grasp_id == 0U) {
-        grasp.hand_world = query.target;
-        grasp.approach_world = query.approach_world;
-        grasp.grasp_id = 1U;
-    }
-    return ReachPlan{
-        grasp,
-        std::move(full),
-        hand,
-        entry_root(pack, compact.evaluations.at(best_index).evaluation.candidate,
-                   query.target.position),
-        std::move(best_path),
-        best_cost,
-    };
+    return std::nullopt;
 }
 
 }  // namespace episode

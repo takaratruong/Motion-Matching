@@ -1,162 +1,170 @@
-# Task 4 report — focused low-memory trajectory database loader
+# Task 4: Shape and Preflight the Warped Recorded Return
 
-## Commit
+## Implementation summary
 
-- Commit: `c133e9eaa66b7d7a978fefc67d6093d7612c9f5f`
-- Message: `perf: load compact trajectory viewer data`
-- Commit contents: only `interaction_trajectory_database.h`,
-  `tests/cpp/test_interaction_trajectory_database.cpp`, and `Makefile`.
+- Added `shape_recorded_return(...)` and the requested return rejection/result
+  types.
+- Published the selected outbound contact pose unchanged as return sample zero.
+  Aligned each later recorded frame with the existing placement transform,
+  applied the inverse-time smoothstep SE(3) contact correction, and solved the
+  existing posture-aware task-priority IK with transported temporal correction.
+- Derived the held object from every solved wrist and frozen
+  `hand_in_object`. Reused the existing single-pose body-vs-object and
+  body-vs-environment feasibility path with the active-hand object exemption,
+  and added 15-axis oriented-box SAT for held-object-vs-environment overlap.
+  A 1 micrometre axis-scaled overlap tolerance preserves zero-depth support
+  contact while rejecting positive overlap.
+- Changed playable plan selection to exclude empty returns before regeneration,
+  rank all remaining playable candidates, preflight returns in cost order, and
+  continue after failed regeneration/return preflight. The accepted
+  `ReachPlan` stores `return_poses`.
+- Did not change episode playback or outbound reach shaping, ranking, or
+  collision behavior.
 
-## RED evidence
+## Files changed
 
-The equivalence/malformed fixture test and its direct Makefile rule were added
-before the loader header existed. The prescribed RED command was run:
+- Created: `reach_return.h`
+- Created: `reach_return.cpp`
+- Modified: `reach_coverage.h`
+- Modified: `reach_search.cpp`
+- Modified: `episode_reach_planner.h`
+- Modified: `episode_reach_planner.cpp`
+- Modified: `Makefile`
+- Created: `tests/cpp/test_reach_return.cpp`
+- Modified: `tests/cpp/test_episode_reach_planner.cpp`
+- Created: `.superpowers/sdd/task-4-report.md`
 
-```text
-$ make -B build/tests/test_interaction_trajectory_database
-make: *** No rule to make target 'interaction_trajectory_database.h', needed by 'build/tests/test_interaction_trajectory_database'.  Stop.
+The pre-existing `.superpowers/sdd/progress.md` modification and generated
+packs/viewer binaries were not changed for Task 4 and are excluded from the
+commit.
+
+## TDD evidence
+
+1. Return shaper RED:
+
+   ```text
+   make build/tests/test_reach_return
+   tests/cpp/test_reach_return.cpp:3:10: fatal error:
+   reach_return.h: No such file or directory
+   make: *** [Makefile:621: build/tests/test_reach_return] Error 1
+   ```
+
+2. Return shaper GREEN after the minimal implementation:
+
+   ```text
+   reach return PASS
+   ```
+
+3. Planner integration RED, after correcting an unrelated missing test include:
+
+   ```text
+   tests/cpp/test_episode_reach_planner.cpp:501:15: error:
+   'const struct episode::ReachPlan' has no member named 'return_poses'
+   tests/cpp/test_episode_reach_planner.cpp:505:19: error:
+   'const struct episode::ReachPlan' has no member named 'return_poses'
+   ```
+
+4. Planner integration GREEN:
+
+   ```text
+   reach return PASS
+   episode reach planner PASS
+   ```
+
+5. Self-review found that inclusive SAT would classify the real viewer's exact
+   object/support tangency as overlap. The focused regression failed before the
+   fix:
+
+   ```text
+   reach return FAILED: zero-depth support contact was treated as object
+   overlap: rejection 4 at sample 0, contact gap 0.000000
+   ```
+
+   After applying strict positive-overlap semantics with the axis-scaled float
+   tolerance, the tangent test and the existing rotated deep-overlap test both
+   passed.
+
+## Tests and exact results
+
+Baseline before Task 4:
+
+```bash
+make build/tests/test_reach_coverage \
+  build/tests/test_reach_search \
+  build/tests/test_episode_reach_planner
+./build/tests/test_reach_coverage
+./build/tests/test_reach_search
+./build/tests/test_episode_reach_planner
 ```
 
-This is the expected missing-loader failure: the test target was recognized,
-but its required compact-loader header had not yet been created.
-
-## GREEN implementation and verification evidence
-
-`interaction_trajectory_database.h` is header-only and reuses safe helpers
-from `interaction_database.h`. It reads the unchanged `G1INTDB1` header,
-computes the exact schema-v1 byte count with checked multiplication and checked
-addition before any array access, rejects a size mismatch, and requires both
-the expected final stream position and EOF.
-
-It retains exactly these vectors:
+Result: exit 0; coverage/search were silent and the planner printed:
 
 ```text
-parents, range_starts, range_stops, positions, rotations, phases,
-active_hands, object_positions, object_rotations, table_positions,
-table_rotations, table_sizes, object_dimensions,
-grasp_positions_object, grasp_rotations_object,
-approach_directions_object
+episode reach planner PASS
 ```
 
-It skips with guarded bounds checks and leaves empty:
+Focused and required reach regressions:
+
+```bash
+make build/tests/test_reach_return \
+  build/tests/test_reach_coverage \
+  build/tests/test_reach_search \
+  build/tests/test_episode_reach_planner
+./build/tests/test_reach_return
+./build/tests/test_reach_coverage
+./build/tests/test_reach_search
+./build/tests/test_episode_reach_planner
+```
+
+Result: exit 0; coverage/search were silent and the focused binaries printed:
 
 ```text
-velocities, angular_velocities, foot_contacts, hand_contacts,
-hand_dof, hand_dof_velocities, time_to_contact,
-object_velocities, object_angular_velocities, source_frames
+reach return PASS
+episode reach planner PASS
 ```
 
-The compact test creates a valid schema-v1 fixture, compares every retained
-field with `load_database`, confirms every skipped vector is empty, and rejects
-truncation inside skipped `velocities`, trailing data, invalid ranges,
-nonmonotonic phases, missing CONTACT/LIFT phases, invalid retained rotations,
-and invalid active hands.
+Header-consumer regression:
 
-The required verification command completed with exit code 0:
+```bash
+make build/tests/test_interaction_episode
+./build/tests/test_interaction_episode
+```
+
+Result:
 
 ```text
-$ make -B build/tests/test_interaction_trajectory_database \
-    build/tests/test_interaction_database
-g++ -std=c++17 -Wall -Wextra -Werror -pedantic -I. \
-  tests/cpp/test_interaction_trajectory_database.cpp \
-  -o build/tests/test_interaction_trajectory_database
-g++ -std=c++17 -Wall -Wextra -Werror -pedantic -I. \
-  tests/cpp/test_interaction_database.cpp \
-  -o build/tests/test_interaction_database
-
-$ ./build/tests/test_interaction_trajectory_database
-$ ./build/tests/test_interaction_database
-$ git diff --check
+interaction episode PASS
 ```
 
-The same build/test/diff checks were run again immediately before staging and
-committing, and `git diff --cached --check` was also clean.
+Static/scope check:
 
-## Changed files
-
-- `interaction_trajectory_database.h`: compact schema-v1 loader, checked
-  skips, exact-size/EOF checks, and retained-data validation.
-- `tests/cpp/test_interaction_trajectory_database.cpp`: valid equivalence
-  fixture plus required malformed-input coverage.
-- `Makefile`: one compact-loader test binary entry and direct rule using
-  `CPP_TEST_FLAGS`.
-
-## Caveats
-
-- The compact loader intentionally does not call `validate_database`, because
-  that validator requires skipped vectors to be populated.
-- As a result, semantics that depend solely on skipped payloads (hand/foot
-  contact contents, source-frame ordering, and time-to-contact values) are not
-  validated by this focused viewer loader. Their schema byte ranges are still
-  overflow- and bounds-checked before they are skipped.
-- An input truncated inside a skipped array or with extra trailing bytes is
-  rejected by the pre-read exact schema-v1 byte-count check; the guarded skip
-  logic remains as a second defense for each skipped field.
-
-## Follow-up fix — retained approach-direction semantics
-
-### Commit
-
-- Commit: `4626814d65c8f25a8232f42141dfa12dd25f808c`
-- Message: `fix: validate compact approach directions`
-- Commit contents: only `interaction_trajectory_database.h` and
-  `tests/cpp/test_interaction_trajectory_database.cpp`; `Makefile` was not
-  changed.
-
-### Fix details
-
-The compact loader now matches the full loader's retained-field contract for
-every `approach_directions_object` entry. For each clip it:
-
-- rejects a non-horizontal direction when
-  `abs(y) > detail::kFloatTolerance`; and
-- computes the three-dimensional norm and rejects a non-unit direction when
-  `abs(norm - 1.0) > detail::kFloatTolerance`.
-
-The checks use the same indexing, tolerance constant, order, and error
-contracts as `interaction_database.h`.
-
-### RED evidence
-
-The two malformed behaviors were introduced in separate TDD cycles.
-
-First, a retained direction with `y = 0.5` was added while the compact loader
-still performed only finiteness validation:
-
-```text
-$ make -B build/tests/test_interaction_trajectory_database && \
-    ./build/tests/test_interaction_trajectory_database
-g++ -std=c++17 -Wall -Wextra -Werror -pedantic -I. \
-  tests/cpp/test_interaction_trajectory_database.cpp \
-  -o build/tests/test_interaction_trajectory_database
-test_interaction_trajectory_database: ... expect_format_error(...):
-Assertion `threw' failed.
+```bash
+git diff --check
 ```
 
-After the horizontal check was implemented and passed, a horizontal retained
-direction with length `0.5` was added. It produced the same expected RED at
-`expect_format_error`: the loader did not throw because unit length was not yet
-validated.
+Result: exit 0 with no output.
 
-### GREEN evidence
+## Self-review
 
-After adding the full-loader-equivalent norm check, the focused test compiled
-and exited 0. Final required verification was then run:
+- Confirmed sample zero is a bitwise copy of `solved_contact`; the first
+  correction is therefore exactly one and no playback seam is introduced.
+- Confirmed the final sample evaluates `sample / return_count == 1`, so its
+  correction weight is zero and its wrist target is the aligned recorded
+  endpoint.
+- Confirmed every later frame uses the aligned recorded pose as posture source
+  and transports the previous solved-minus-source joint correction in the
+  temporal seed.
+- Confirmed non-finite or unaccepted IK reports `InvalidSolver` at the first
+  rejected sample.
+- Confirmed body/object, body/environment, and held-object/environment checks
+  use the dynamic object reconstructed from each solved wrist.
+- Confirmed empty-return clips remain accepted outbound coverage identities but
+  are skipped only by playable plan selection.
+- Confirmed failed return preflight falls through to the next ranked accepted
+  candidate and the selected plan owns the shaped return poses.
+- Confirmed requested reach coverage/search/planner regressions pass and no
+  generated pack or binary is staged.
 
-```text
-$ make -B build/tests/test_interaction_trajectory_database \
-    build/tests/test_interaction_database
-g++ -std=c++17 -Wall -Wextra -Werror -pedantic -I. \
-  tests/cpp/test_interaction_trajectory_database.cpp \
-  -o build/tests/test_interaction_trajectory_database
-g++ -std=c++17 -Wall -Wextra -Werror -pedantic -I. \
-  tests/cpp/test_interaction_database.cpp \
-  -o build/tests/test_interaction_database
+## Concerns
 
-$ ./build/tests/test_interaction_trajectory_database
-$ ./build/tests/test_interaction_database
-$ git diff --check
-```
-
-Both binaries exited 0 and `git diff --check` produced no output. The staged
-fix also passed `git diff --cached --check` before commit.
+None.

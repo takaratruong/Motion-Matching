@@ -28,6 +28,7 @@ struct ReachPlan {
     interaction::Transform entry_root_world{};
     std::vector<vec3> entry_waypoints_world;
     ReachPlanCost cost{};
+    std::vector<interaction::Pose> return_poses;
 };
 
 bool reach_plan_cost_less(

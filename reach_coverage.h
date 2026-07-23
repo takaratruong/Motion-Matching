@@ -77,6 +77,36 @@ struct Diagnostics {
     std::array<size_t, 2U> augmentation_evaluations{};
 };
 
+namespace detail {
+
+inline interaction::Hand interaction_hand(Hand hand) {
+    return hand == Hand::Left
+        ? interaction::Hand::Left
+        : interaction::Hand::Right;
+}
+
+inline size_t wrist_bone(Hand hand) {
+    return hand == Hand::Left
+        ? static_cast<size_t>(g1_skeleton::LeftWrist)
+        : static_cast<size_t>(g1_skeleton::RightWrist);
+}
+
+inline size_t elbow_bone(Hand hand) {
+    return hand == Hand::Left
+        ? static_cast<size_t>(g1_skeleton::LeftElbow)
+        : static_cast<size_t>(g1_skeleton::RightElbow);
+}
+
+inline interaction::Transform hand_transform(
+    const interaction::Pose& pose,
+    Hand hand) {
+    const interaction::WorldPose world = interaction::world_pose(pose);
+    const size_t wrist = wrist_bone(hand);
+    return {world.positions[wrist], world.rotations[wrist]};
+}
+
+}  // namespace detail
+
 std::vector<Candidate> enumerate_candidates(const Pack& pack);
 
 WristPathQuality measure_wrist_path_quality(

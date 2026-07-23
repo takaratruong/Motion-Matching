@@ -1,10 +1,15 @@
 #include "episode_grasp_provider.h"
 #include "episode_reach_planner.h"
+#include "g1_posture_ik_fixture.h"
 #include "interaction_episode.h"
+#include "reach_placement.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -16,6 +21,211 @@ void require(bool condition, const std::string& message) {
 
 bool near(vec3 left, vec3 right, float tolerance = 1.0e-5F) {
     return length(left - right) <= tolerance;
+}
+
+void append_pose(
+    reach::Database& database,
+    const interaction::Pose& pose) {
+    for (size_t bone = 0U; bone < g1_skeleton::BoneCount; ++bone) {
+        database.positions.insert(database.positions.end(), {
+            pose.positions[bone].x,
+            pose.positions[bone].y,
+            pose.positions[bone].z,
+        });
+        database.velocities.insert(database.velocities.end(), {
+            pose.velocities[bone].x,
+            pose.velocities[bone].y,
+            pose.velocities[bone].z,
+        });
+        database.rotations.insert(database.rotations.end(), {
+            pose.rotations[bone].w,
+            pose.rotations[bone].x,
+            pose.rotations[bone].y,
+            pose.rotations[bone].z,
+        });
+        database.angular_velocities.insert(
+            database.angular_velocities.end(), {
+                pose.angular_velocities[bone].x,
+                pose.angular_velocities[bone].y,
+                pose.angular_velocities[bone].z,
+            });
+    }
+    database.foot_contacts.insert(
+        database.foot_contacts.end(),
+        pose.foot_contacts.begin(),
+        pose.foot_contacts.end());
+}
+
+interaction::Pose pose_with_shoulder_pitch(float delta) {
+    interaction::Pose pose = g1_posture_fixture::make_pose();
+    interaction::UpperBodyAngles angles =
+        interaction::decompose_upper_body(
+            pose, interaction::Hand::Left);
+    angles[interaction::kWaist.size()] += delta;
+    interaction::apply_upper_body(
+        pose, interaction::Hand::Left, angles);
+    return pose;
+}
+
+reach::Pack fallback_pack() {
+    constexpr size_t kOutboundFrames = 20U;
+    constexpr size_t kReturnFrames = 3U;
+    reach::Pack pack{};
+    reach::Database& database = pack.database;
+    database.version = 2U;
+    database.endian_marker = 0x01020304U;
+    database.fps_numerator = 25U;
+    database.fps_denominator = 1U;
+    database.bone_count = g1_skeleton::BoneCount;
+    database.clip_count = 3U;
+    database.source_count = 1U;
+    database.parents.assign(
+        g1_skeleton::kParents.begin(),
+        g1_skeleton::kParents.end());
+    database.range_starts = {
+        0,
+        static_cast<int32_t>(kOutboundFrames),
+        static_cast<int32_t>(
+            2U * kOutboundFrames + kReturnFrames),
+    };
+    database.range_stops = {
+        static_cast<int32_t>(kOutboundFrames),
+        static_cast<int32_t>(
+            2U * kOutboundFrames + kReturnFrames),
+        static_cast<int32_t>(
+            3U * kOutboundFrames + 2U * kReturnFrames),
+    };
+    database.contact_frames = {
+        static_cast<int32_t>(kOutboundFrames - 1U),
+        static_cast<int32_t>(2U * kOutboundFrames - 1U),
+        static_cast<int32_t>(
+            3U * kOutboundFrames + kReturnFrames - 1U),
+    };
+    for (size_t clip = 0U; clip < 3U; ++clip) {
+        for (size_t frame = 0U; frame < kOutboundFrames; ++frame) {
+            const float u = static_cast<float>(frame) /
+                static_cast<float>(kOutboundFrames - 1U);
+            append_pose(
+                database,
+                pose_with_shoulder_pitch(-0.25F + 0.50F * u));
+            database.source_frames.push_back(
+                static_cast<int32_t>(
+                    1000U * clip + frame));
+        }
+        if (clip == 0U) continue;
+        for (size_t frame = 0U; frame < kReturnFrames; ++frame) {
+            interaction::Pose pose = pose_with_shoulder_pitch(
+                0.10F - 0.20F * static_cast<float>(frame));
+            if (clip == 1U && frame == 0U) {
+                pose.positions[g1_skeleton::RightWrist].x =
+                    std::numeric_limits<float>::quiet_NaN();
+            }
+            append_pose(database, pose);
+            database.source_frames.push_back(
+                static_cast<int32_t>(
+                    1000U * clip + kOutboundFrames + frame));
+        }
+    }
+    database.frame_count = static_cast<uint32_t>(
+        3U * kOutboundFrames + 2U * kReturnFrames);
+    database.active_hands.assign(
+        3U, static_cast<uint8_t>(reach::Hand::Left));
+    database.augmentations.assign(
+        3U, static_cast<uint8_t>(reach::Augmentation::Captured));
+    database.source_indices.assign(3U, 0U);
+    database.original_indices.assign(3U, -1);
+    database.source_names = {"fallback_fixture"};
+    for (size_t clip = 0U; clip < 3U; ++clip) {
+        const interaction::WorldPose contact =
+            interaction::world_pose(reach::pose_at_frame(
+                database, database.contact_frames[clip]));
+        const interaction::WorldPose before =
+            interaction::world_pose(reach::pose_at_frame(
+                database, database.contact_frames[clip] - 5));
+        const vec3 approach = normalize(
+            contact.positions[g1_skeleton::LeftWrist] -
+            before.positions[g1_skeleton::LeftWrist]);
+        const interaction::Transform endpoint{
+            contact.positions[g1_skeleton::LeftWrist],
+            contact.rotations[g1_skeleton::LeftWrist],
+        };
+        database.endpoint_positions.insert(
+            database.endpoint_positions.end(), {
+                endpoint.position.x,
+                endpoint.position.y,
+                endpoint.position.z,
+            });
+        database.endpoint_rotations.insert(
+            database.endpoint_rotations.end(), {
+                endpoint.rotation.w,
+                endpoint.rotation.x,
+                endpoint.rotation.y,
+                endpoint.rotation.z,
+            });
+        database.approach_directions.insert(
+            database.approach_directions.end(), {
+                approach.x,
+                approach.y,
+                approach.z,
+            });
+    }
+    pack.features.version = 2U;
+    pack.features.endian_marker = 0x01020304U;
+    pack.features.clip_count = 3U;
+    pack.features.dimension = 10U;
+    for (size_t clip = 0U; clip < 3U; ++clip) {
+        const size_t position = 3U * clip;
+        const size_t rotation = 4U * clip;
+        pack.features.values.insert(pack.features.values.end(), {
+            database.endpoint_positions[position],
+            database.endpoint_positions[position + 1U],
+            database.endpoint_positions[position + 2U],
+            database.approach_directions[position],
+            database.approach_directions[position + 1U],
+            database.approach_directions[position + 2U],
+            database.endpoint_rotations[rotation],
+            database.endpoint_rotations[rotation + 1U],
+            database.endpoint_rotations[rotation + 2U],
+            database.endpoint_rotations[rotation + 3U],
+        });
+    }
+    return pack;
+}
+
+reach::SearchResult compact_outbound_candidates(
+    const reach::Pack& pack,
+    const reach::ExhaustiveQuery& query,
+    const interaction::OrientedBox& object,
+    const reach::SearchConfig& config) {
+    reach::SearchResult result{};
+    result.complete = true;
+    result.total = 3U;
+    result.processed = 3U;
+    for (size_t clip = 0U; clip < 3U; ++clip) {
+        const reach::Candidate candidate{
+            clip, 0U, reach::placement_yaw(0U), 0.0F, 0.0F};
+        reach::Query hand_query{};
+        hand_query.hand = reach::Hand::Left;
+        hand_query.target = query.target;
+        hand_query.approach_world = query.approach_world;
+        reach::Evaluation evaluation = reach::evaluate_candidate(
+            pack,
+            candidate,
+            hand_query,
+            object,
+            interaction::EnvironmentGeometry{},
+            config.coverage,
+            config.collision);
+        require(
+            evaluation.rejection == reach::Rejection::None,
+            "fallback fixture outbound was not accepted");
+        reach::CompactEvaluation compact{};
+        compact.evaluation = std::move(evaluation);
+        compact.evaluation.poses.clear();
+        result.evaluations.push_back(std::move(compact));
+        result.accepted.push_back(clip);
+    }
+    return result;
 }
 
 void test_known_grasp_is_object_relative_and_hand_agnostic() {
@@ -246,6 +456,56 @@ void test_nearest_support_tracks_a_moved_destination() {
         "vertically rotated slab was treated as horizontal support");
 }
 
+void test_plan_skips_empty_return_and_falls_back_after_failed_preflight() {
+    const reach::Pack pack = fallback_pack();
+    const interaction::Transform target =
+        reach::endpoint_transform(pack.database, 0U);
+    const reach::ExhaustiveQuery query{
+        target,
+        reach::approach_direction(pack.database, 0U),
+    };
+    const interaction::OrientedBox object{
+        {vec3(10.0F, 10.0F, 10.0F), quat()},
+        vec3(0.01F, 0.01F, 0.01F),
+    };
+    reach::SearchConfig config{};
+    config.coverage.accepted_approach_radians = 3.141592654F;
+    config.coverage.accepted_orientation_radians = 3.141592654F;
+    const reach::SearchResult compact =
+        compact_outbound_candidates(pack, query, object, config);
+    require(
+        compact.accepted.size() == 3U &&
+        compact.evaluations[0].evaluation.candidate.clip == 0U,
+        "empty-return identity did not remain in outbound coverage");
+    episode::GraspCandidate grasp{};
+    grasp.hand_world = target;
+    grasp.approach_world = query.approach_world;
+    grasp.grasp_id = 7U;
+
+    const std::optional<episode::ReachPlan> plan =
+        episode::choose_reach_plan(
+            pack,
+            compact,
+            query,
+            object,
+            interaction::EnvironmentGeometry{},
+            config,
+            reach::pose_at_frame(pack.database, 0),
+            grasp);
+
+    require(plan.has_value(), "planner did not reach valid fallback return");
+    require(
+        plan->reach.candidate.clip == 2U,
+        "planner selected empty or failed return instead of fallback");
+    require(
+        plan->return_poses.size() == 4U,
+        "planner did not retain contact plus recorded return poses");
+    require(
+        g1_posture_fixture::same_pose(
+            plan->return_poses.front(), plan->reach.poses.back()),
+        "stored return did not begin at selected solved contact");
+}
+
 }  // namespace
 
 int main() {
@@ -259,6 +519,7 @@ int main() {
         test_entry_path_rejects_an_unbounded_endpoint_exemption();
         test_waypoint_arrival_stays_inside_corner_clearance_margin();
         test_nearest_support_tracks_a_moved_destination();
+        test_plan_skips_empty_return_and_falls_back_after_failed_preflight();
         std::cout << "episode reach planner PASS\n";
         return 0;
     } catch (const std::exception& error) {
