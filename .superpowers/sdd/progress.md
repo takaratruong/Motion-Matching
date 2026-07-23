@@ -42,3 +42,12 @@
 - Real report: `build/g1-reaches/contact-anchored-coverage-report-v4.json`; every fixture processed all 4,608 identities, integrity passed, and each fixture completed below 10 seconds.
 - Strict-quality counts after posture IK and swept collision: open space 6 accepted (3 left, 3 right, 4 azimuth sectors, 7.58 s); table 0 (7.92 s); shelf 0 (8.14 s); below table 0 (8.24 s); lower table 0 (9.11 s). No IK, orientation, or collision threshold was weakened; total five-fixture wall time was 41.07 s at 55,332 KiB peak RSS.
 - Focused implementation review found no remaining Critical or Important issues in oriented sweep semantics, bilateral metadata/FK/limits, temporal seeding, unowned-pose preservation, finite handling, or thread safety.
+
+## Posture-IK Coverage Regression Fix
+
+- Design and plan: `afd859e`, `8968b31`.
+- Implementation: `feb79b0` adds bilateral quality-first/task-feasible posture IK; `c934569` restores a fully aligned final five-frame approach; `bf5d07b` makes the measured pre-IK open-space baseline a hard probe gate; `eb93c5a` measures root sectors across every accepted placed candidate instead of one clip per yaw.
+- Focused verification on 2026-07-23: 12 viewer/probe Python contracts plus posture IK, hand trajectory, reach coverage, reach search, reach database, and legacy IK tests passed; probe and viewer release binaries rebuilt successfully.
+- Root and collision regressions passed: IK modifies only the three waist and seven active-arm joints, root placement/height stays exact, and strict swept object/environment collision checks retain final-contact-only semantics.
+- Real report: `build/g1-reaches/contact-anchored-coverage-report-v5.json`; all five fixtures processed 4,608/4,608 instances in under 17 seconds each and `search_integrity_passed` is true.
+- Restored open-space coverage: 477 accepted (231 left, 246 right), 10 root-azimuth sectors, 0.0007471 m maximum accepted position error, 0.1177661 rad maximum approach error, 0.0048828 rad maximum orientation error, and 13.1638 seconds.
