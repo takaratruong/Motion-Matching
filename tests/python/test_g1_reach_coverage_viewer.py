@@ -70,6 +70,52 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
             source,
         )
 
+    def test_straight_approach_modes_and_diagnostics(self):
+        source = self.source(VIEWER)
+        for required in (
+            "enum class ApproachDisplayMode",
+            "KEY_A",
+            "results->preferred",
+            "reach::retarget_straight_approach(",
+            "RAW",
+            "PREFERRED",
+            "RETARGETED",
+            "MAX LATERAL",
+            "RMS LATERAL",
+            "BACKWARD",
+            "NO PREGRASP COVERAGE",
+            "CORRIDOR RETARGET FAILED",
+        ):
+            self.assertIn(required, source)
+        # Bracket cycling must remain and must never invoke exhaustive search.
+        self.assertIn("KEY_LEFT_BRACKET", source)
+        self.assertIn("KEY_RIGHT_BRACKET", source)
+        # search_all appears exactly once, inside the Enter handler only.
+        self.assertEqual(source.count("reach::search_all"), 1)
+        enter = source.index("IsKeyPressed(KEY_ENTER)")
+        # The bracket-cycling block lives after the Enter handler; from the
+        # first bracket keypress onward there is no exhaustive search call.
+        bracket = source.index("IsKeyPressed(KEY_LEFT_BRACKET)", enter)
+        self.assertGreater(bracket, source.index("reach::search_all"))
+        self.assertNotIn("reach::search_all", source[bracket:])
+        # Mode cycling on KEY_A must not clear cached results nor invoke search.
+        mode = source.index("IsKeyPressed(KEY_A)")
+        mode_end = source.index("mode_changed = true;", mode)
+        self.assertNotIn("reach::search_all", source[mode:mode_end])
+        self.assertNotIn("results.reset()", source[mode:mode_end])
+
+    def test_rejected_selection_cannot_reuse_stale_retarget(self):
+        source = self.source(VIEWER)
+        rejected = source.split("if (rejected_selection_changed)", 1)[1].split(
+            "if (selected_full.has_value())", 1
+        )[0]
+        self.assertIn("selected_retarget.reset()", rejected)
+        returning = source.split(
+            "if (!show_rejected && selected_rejected)", 1
+        )[1].split("if (IsKeyPressed(KEY_BACKSPACE))", 1)[0]
+        self.assertIn("selected_retarget.reset()", returning)
+        self.assertIn("retarget_selected(", returning)
+
     def test_rotated_object_has_no_axis_aligned_solid(self):
         source = self.source(VIEWER)
         self.assertEqual(source.count("DrawCubeV("), 1)

@@ -1,12 +1,16 @@
 #include "g1_arm_joint_metadata.h"
 #include "reach_placement.h"
 #include "reach_search.h"
+#include "reach_straight_approach.h"
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
+#include <vector>
 
 namespace {
 
@@ -235,6 +239,22 @@ void test_complete_search_never_exceeds_its_deadline() {
         23U, 24U, 23U, deadline, deadline));
 }
 
+void test_search_rejects_nonunit_approach() {
+    bool threw = false;
+    try {
+        reach::SearchConfig config{};
+        (void)reach::search_all(
+            bilateral_fixture(),
+            {{{1.0F, 0.85F, -0.25F}, quat()}, vec3(-2.0F, 0.0F, 0.0F)},
+            {{vec3(10, 10, 10), quat()}, vec3(0.01F, 0.01F, 0.01F)},
+            interaction::EnvironmentGeometry{},
+            config);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    assert(threw);
+}
+
 void test_selected_regeneration_matches_compact_metrics() {
     const reach::Pack pack = bilateral_fixture();
     const reach::ExhaustiveQuery query{
@@ -280,6 +300,68 @@ void test_direct_reach_ranks_before_hooked_fallback() {
     assert(hooked.rejection == reach::Rejection::None);
 }
 
+reach::CompactEvaluation accepted_with_path(
+    size_t clip, const std::vector<vec3>& path) {
+    reach::CompactEvaluation compact{};
+    compact.evaluation.rejection = reach::Rejection::None;
+    compact.evaluation.candidate.clip = clip;
+    compact.hand_path = path;
+    compact.straight_approach = reach::measure_straight_approach(
+        path, vec3(0.0F, 0.0F, 0.0F), vec3(1.0F, 0.0F, 0.0F));
+    return compact;
+}
+
+void test_preferred_preserves_identity_and_ranks_straight_first() {
+    // Three accepted candidates: hooked, sliding, straight (raw order).
+    const std::vector<vec3> hooked = {
+        {-0.20F, 0.0F, 0.0F}, {-0.05F, 0.10F, 0.0F}, {0.0F, 0.0F, 0.0F}};
+    const std::vector<vec3> slide = {
+        {-0.20F, 0.06F, 0.0F}, {-0.10F, 0.04F, 0.0F}, {0.0F, 0.0F, 0.0F}};
+    const std::vector<vec3> straight = {
+        {-0.20F, 0.0F, 0.0F}, {-0.10F, 0.0F, 0.0F}, {0.0F, 0.0F, 0.0F}};
+
+    std::vector<reach::CompactEvaluation> evaluations;
+    evaluations.push_back(accepted_with_path(0U, hooked));
+    evaluations.push_back(accepted_with_path(1U, slide));
+    const size_t straight_index = evaluations.size();
+    evaluations.push_back(accepted_with_path(2U, straight));
+
+    const std::vector<size_t> accepted = {0U, 1U, 2U};
+    const std::vector<size_t> preferred =
+        reach::detail::build_preferred(evaluations, accepted);
+
+    assert(accepted.size() == preferred.size());
+    std::vector<size_t> raw_identities = accepted;
+    std::vector<size_t> preferred_identities = preferred;
+    std::sort(raw_identities.begin(), raw_identities.end());
+    std::sort(preferred_identities.begin(), preferred_identities.end());
+    assert(raw_identities == preferred_identities);
+    assert(preferred.front() == straight_index);
+}
+
+void test_search_publishes_preferred_with_same_identities_as_accepted() {
+    const reach::SearchResult result = run_fixture_search(2U);
+    assert(result.complete);
+    assert(result.accepted.size() == result.preferred.size());
+    std::vector<size_t> raw = result.accepted;
+    std::vector<size_t> pref = result.preferred;
+    std::sort(raw.begin(), raw.end());
+    std::sort(pref.begin(), pref.end());
+    assert(raw == pref);
+    // Raw acceptance order remains controlled by accepted_quality_less.
+    for (size_t index = 1U; index < result.accepted.size(); ++index) {
+        const reach::Evaluation& previous =
+            result.evaluations[result.accepted[index - 1U]].evaluation;
+        const reach::Evaluation& current =
+            result.evaluations[result.accepted[index]].evaluation;
+        assert(!reach::detail::accepted_quality_less(current, previous));
+    }
+    // Every accepted evaluation carries a finite straight-approach measurement.
+    for (size_t index : result.accepted) {
+        assert(result.evaluations[index].straight_approach.finite);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -288,6 +370,9 @@ int main() {
     test_cancelled_search_returns_without_processing_the_pack();
     test_zero_deadline_never_publishes_partial_results_as_complete();
     test_complete_search_never_exceeds_its_deadline();
+    test_search_rejects_nonunit_approach();
     test_selected_regeneration_matches_compact_metrics();
     test_direct_reach_ranks_before_hooked_fallback();
+    test_preferred_preserves_identity_and_ranks_straight_first();
+    test_search_publishes_preferred_with_same_identities_as_accepted();
 }

@@ -157,6 +157,7 @@ g1_reach_coverage_viewer: g1_reach_coverage_viewer.cpp \
   reach_coverage.cpp reach_coverage.h reach_database.cpp reach_database.h \
   reach_motion.cpp reach_motion.h reach_placement.cpp reach_placement.h \
   reach_search.cpp reach_search.h \
+  reach_straight_approach.cpp reach_straight_approach.h \
   interaction_hand_trajectories.cpp \
   interaction_hand_trajectories.h interaction_ik.cpp interaction_ik.h \
   interaction_posture_ik.cpp interaction_posture_ik.h \
@@ -168,6 +169,7 @@ g1_reach_coverage_viewer: g1_reach_coverage_viewer.cpp \
 	$(CC) $(CONTROLLER_CXXFLAGS) -O3 -DNDEBUG -pthread -o $@$(EXT) \
 	  g1_reach_coverage_viewer.cpp reach_coverage.cpp reach_database.cpp \
 	  reach_motion.cpp reach_placement.cpp reach_search.cpp \
+	  reach_straight_approach.cpp \
 	  interaction_hand_trajectories.cpp interaction_posture_ik.cpp \
 	  interaction_ik.cpp \
 	  interaction_pose.cpp interaction_target.cpp $(CFLAGS) $(LIBS)
@@ -182,7 +184,9 @@ g1_interaction_episode_viewer: g1_interaction_episode_viewer.cpp \
   interaction_attachment.cpp interaction_attachment.h \
   reach_coverage.cpp reach_coverage.h reach_database.cpp reach_database.h \
   reach_motion.cpp reach_motion.h reach_placement.cpp reach_placement.h \
-  reach_search.cpp reach_search.h interaction_hand_trajectories.cpp \
+  reach_search.cpp reach_search.h \
+  reach_straight_approach.cpp reach_straight_approach.h \
+  interaction_hand_trajectories.cpp \
   interaction_hand_trajectories.h interaction_ik.cpp interaction_ik.h \
   interaction_posture_ik.cpp interaction_posture_ik.h \
   g1_arm_joint_metadata.h interaction_pose.cpp interaction_pose.h \
@@ -197,7 +201,7 @@ g1_interaction_episode_viewer: g1_interaction_episode_viewer.cpp \
 	  reach_return.cpp \
 	  g1_flat_motion_matcher.cpp interaction_attachment.cpp \
 	  reach_coverage.cpp reach_database.cpp reach_motion.cpp \
-	  reach_placement.cpp reach_search.cpp \
+	  reach_placement.cpp reach_search.cpp reach_straight_approach.cpp \
 	  interaction_hand_trajectories.cpp interaction_posture_ik.cpp \
 	  interaction_ik.cpp interaction_pose.cpp interaction_target.cpp \
 	  $(CFLAGS) $(LIBS)
@@ -207,6 +211,7 @@ g1_reach_coverage_probe: g1_reach_coverage_probe.cpp \
   reach_coverage_metrics.cpp reach_coverage_metrics.h \
   reach_motion.cpp reach_motion.h reach_placement.cpp reach_placement.h \
   reach_search.cpp reach_search.h \
+  reach_straight_approach.cpp reach_straight_approach.h \
   interaction_hand_trajectories.cpp \
   interaction_hand_trajectories.h interaction_ik.cpp interaction_ik.h \
   interaction_posture_ik.cpp interaction_posture_ik.h \
@@ -216,7 +221,7 @@ g1_reach_coverage_probe: g1_reach_coverage_probe.cpp \
 	$(CXX) $(CONTROLLER_CXXFLAGS) -O3 -DNDEBUG -pthread -I. -o $@$(EXT) \
 	  g1_reach_coverage_probe.cpp reach_coverage.cpp reach_database.cpp \
 	  reach_coverage_metrics.cpp reach_motion.cpp reach_placement.cpp \
-	  reach_search.cpp \
+	  reach_search.cpp reach_straight_approach.cpp \
 	  interaction_hand_trajectories.cpp interaction_posture_ik.cpp \
 	  interaction_ik.cpp \
 	  interaction_pose.cpp interaction_target.cpp
@@ -288,6 +293,7 @@ CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_reuse_audit
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_reach_database
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_reach_coverage
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_reach_search
+CPP_TEST_BINS += $(CPP_TEST_DIR)/test_reach_straight_approach
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_reach_return
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_episode_reach_planner
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_g1_flat_motion_matcher
@@ -606,6 +612,7 @@ $(CPP_TEST_DIR)/test_reach_coverage: tests/cpp/test_reach_coverage.cpp reach_cov
 
 $(CPP_TEST_DIR)/test_reach_search: tests/cpp/test_reach_search.cpp \
   reach_search.cpp reach_search.h reach_coverage.cpp reach_coverage.h \
+  reach_straight_approach.cpp reach_straight_approach.h \
   reach_placement.cpp reach_placement.h reach_database.cpp reach_database.h \
   reach_motion.cpp reach_motion.h interaction_hand_trajectories.cpp \
   interaction_hand_trajectories.h interaction_ik.cpp interaction_ik.h \
@@ -614,8 +621,24 @@ $(CPP_TEST_DIR)/test_reach_search: tests/cpp/test_reach_search.cpp \
   interaction_target.cpp interaction_target.h interaction_database.h \
   g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) -pthread tests/cpp/test_reach_search.cpp \
-	  reach_search.cpp reach_coverage.cpp reach_placement.cpp \
+	  reach_search.cpp reach_coverage.cpp reach_straight_approach.cpp \
+	  reach_placement.cpp \
 	  reach_database.cpp reach_motion.cpp interaction_hand_trajectories.cpp \
+	  interaction_posture_ik.cpp interaction_ik.cpp interaction_pose.cpp \
+	  interaction_target.cpp -o $@
+
+$(CPP_TEST_DIR)/test_reach_straight_approach: \
+  tests/cpp/test_reach_straight_approach.cpp \
+  reach_straight_approach.cpp reach_straight_approach.h \
+  reach_coverage.cpp reach_coverage.h \
+  interaction_hand_trajectories.cpp interaction_hand_trajectories.h \
+  interaction_posture_ik.cpp interaction_posture_ik.h \
+  interaction_ik.cpp interaction_ik.h g1_arm_joint_metadata.h \
+  interaction_pose.cpp interaction_pose.h interaction_target.cpp \
+  interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h \
+  | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_reach_straight_approach.cpp \
+	  reach_straight_approach.cpp interaction_hand_trajectories.cpp \
 	  interaction_posture_ik.cpp interaction_ik.cpp interaction_pose.cpp \
 	  interaction_target.cpp -o $@
 
@@ -639,6 +662,7 @@ $(CPP_TEST_DIR)/test_episode_reach_planner: \
   episode_reach_planner.cpp episode_reach_planner.h \
   reach_return.cpp reach_return.h \
   reach_search.cpp reach_search.h reach_coverage.cpp reach_coverage.h \
+  reach_straight_approach.cpp reach_straight_approach.h \
   reach_placement.cpp reach_placement.h reach_database.cpp reach_database.h \
   reach_motion.cpp reach_motion.h interaction_hand_trajectories.cpp \
   interaction_hand_trajectories.h interaction_ik.cpp interaction_ik.h \
@@ -650,7 +674,8 @@ $(CPP_TEST_DIR)/test_episode_reach_planner: \
 	  tests/cpp/test_episode_reach_planner.cpp \
 	  episode_grasp_provider.cpp episode_reach_planner.cpp \
 	  reach_return.cpp \
-	  reach_search.cpp reach_coverage.cpp reach_placement.cpp \
+	  reach_search.cpp reach_coverage.cpp reach_straight_approach.cpp \
+	  reach_placement.cpp \
 	  reach_database.cpp reach_motion.cpp interaction_hand_trajectories.cpp \
 	  interaction_posture_ik.cpp interaction_ik.cpp interaction_pose.cpp \
 	  interaction_target.cpp -o $@

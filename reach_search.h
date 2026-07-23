@@ -1,6 +1,7 @@
 #pragma once
 
 #include "reach_coverage.h"
+#include "reach_straight_approach.h"
 
 #include <chrono>
 #include <cstddef>
@@ -21,11 +22,13 @@ struct SearchConfig {
     std::shared_ptr<std::atomic_bool> cancellation{};
     CoverageConfig coverage{};
     interaction::TrajectoryCollisionConfig collision{};
+    StraightApproachConfig straight_approach{};
 };
 
 struct CompactEvaluation {
     Evaluation evaluation{};
     std::vector<vec3> hand_path;
+    StraightApproachQuality straight_approach{};
 };
 
 struct SearchResult {
@@ -34,7 +37,8 @@ struct SearchResult {
     size_t processed = 0U;
     std::chrono::steady_clock::duration elapsed{};
     std::vector<CompactEvaluation> evaluations;
-    std::vector<size_t> accepted;
+    std::vector<size_t> accepted;   // Existing raw accepted order.
+    std::vector<size_t> preferred;  // Same identities, straight-in order.
 };
 
 namespace detail {
@@ -49,6 +53,10 @@ bool complete_within_deadline(
 bool accepted_quality_less(
     const Evaluation& left,
     const Evaluation& right);
+
+std::vector<size_t> build_preferred(
+    const std::vector<CompactEvaluation>& evaluations,
+    const std::vector<size_t>& accepted);
 
 }  // namespace detail
 

@@ -31,11 +31,12 @@ void validate(
     const SearchConfig& config) {
     if (!finite(query.target.position) || !finite(query.target.rotation) ||
         !finite(query.approach_world) ||
-        length(query.approach_world) <= 1.0e-8F) {
+        std::fabs(length(query.approach_world) - 1.0F) > 1.0e-3F) {
         throw std::invalid_argument("invalid exhaustive reach query");
     }
     if (config.worker_count == 0U || config.worker_count > 64U ||
-        config.deadline < std::chrono::steady_clock::duration::zero()) {
+        config.deadline < std::chrono::steady_clock::duration::zero() ||
+        !valid_straight_approach_config(config.straight_approach)) {
         throw std::invalid_argument("invalid exhaustive reach search config");
     }
 }
@@ -93,6 +94,24 @@ bool accepted_quality_less(
                right.candidate.yaw_index);
 }
 
+std::vector<size_t> build_preferred(
+    const std::vector<CompactEvaluation>& evaluations,
+    const std::vector<size_t>& accepted) {
+    std::vector<size_t> preferred = accepted;
+    std::stable_sort(
+        preferred.begin(), preferred.end(),
+        [&](size_t left, size_t right) {
+            const CompactEvaluation& l = evaluations[left];
+            const CompactEvaluation& r = evaluations[right];
+            if (straight_approach_quality_less(
+                    l.straight_approach, r.straight_approach)) return true;
+            if (straight_approach_quality_less(
+                    r.straight_approach, l.straight_approach)) return false;
+            return accepted_quality_less(l.evaluation, r.evaluation);
+        });
+    return preferred;
+}
+
 }  // namespace detail
 
 SearchResult search_all(
@@ -131,6 +150,11 @@ SearchResult search_all(
             CompactEvaluation compact{};
             compact.hand_path = extract_active_wrist_path(
                 evaluation.poses, hand_query.hand);
+            compact.straight_approach = measure_straight_approach(
+                compact.hand_path,
+                query.target.position,
+                query.approach_world,
+                config.straight_approach);
             compact.evaluation = std::move(evaluation);
             std::vector<interaction::Pose>().swap(compact.evaluation.poses);
             slots[index] = std::move(compact);
@@ -181,6 +205,9 @@ SearchResult search_all(
                 result.evaluations[right_index].evaluation;
             return detail::accepted_quality_less(left, right);
         });
+    result.preferred = result.accepted;
+    result.preferred = detail::build_preferred(
+        result.evaluations, result.preferred);
     return result;
 }
 
@@ -232,6 +259,45 @@ Evaluation regenerate(
             compact.evaluation.directness_cost)) {
         throw std::runtime_error(
             "regenerated reach evaluation disagrees with compact search");
+    }
+    // Only revalidate straight-approach metrics when the compact search
+    // actually recorded a wrist path (search_all always does). Consumers that
+    // build a compact without a recorded path carry no metrics to compare.
+    if (compact.hand_path.empty()) {
+        return evaluation;
+    }
+    const std::vector<vec3> regenerated_path = extract_active_wrist_path(
+        evaluation.poses, hand_query.hand);
+    const StraightApproachQuality regenerated_quality =
+        measure_straight_approach(
+            regenerated_path,
+            query.target.position,
+            query.approach_world,
+            config.straight_approach);
+    if (regenerated_quality.finite != compact.straight_approach.finite ||
+        regenerated_quality.reaches_pregrasp_plane !=
+            compact.straight_approach.reaches_pregrasp_plane) {
+        throw std::runtime_error(
+            "regenerated straight-approach metrics disagree with compact search");
+    }
+    if (compact.straight_approach.finite && (
+        !same_metric(
+            regenerated_quality.maximum_lateral_m,
+            compact.straight_approach.maximum_lateral_m) ||
+        !same_metric(
+            regenerated_quality.rms_lateral_m,
+            compact.straight_approach.rms_lateral_m) ||
+        !same_metric(
+            regenerated_quality.backward_ratio,
+            compact.straight_approach.backward_ratio) ||
+        !same_metric(
+            regenerated_quality.maximum_angle_radians,
+            compact.straight_approach.maximum_angle_radians) ||
+        !same_metric(
+            regenerated_quality.rms_angle_radians,
+            compact.straight_approach.rms_angle_radians))) {
+        throw std::runtime_error(
+            "regenerated straight-approach metrics disagree with compact search");
     }
     return evaluation;
 }

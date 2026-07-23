@@ -1,6 +1,7 @@
 #include "g1_mesh_renderer.h"
 #include "g1_skeleton.h"
 #include "reach_search.h"
+#include "reach_straight_approach.h"
 #include "raylib.h"
 
 #include <algorithm>
@@ -25,6 +26,31 @@ constexpr float kTableCenterY = 0.62F;
 constexpr vec3 kTableDimensions(1.20F, kTableThickness, 0.75F);
 constexpr const char* kCapturedLabel = "CAPTURED LEFT";
 constexpr const char* kMirroredLabel = "MIRRORED RIGHT";
+
+enum class ApproachDisplayMode : uint8_t {
+    Raw = 0U,
+    Preferred = 1U,
+    Retargeted = 2U,
+};
+
+const char* approach_mode_label(ApproachDisplayMode mode) {
+    switch (mode) {
+        case ApproachDisplayMode::Raw: return "RAW";
+        case ApproachDisplayMode::Preferred: return "PREFERRED";
+        case ApproachDisplayMode::Retargeted: return "RETARGETED";
+    }
+    return "RAW";
+}
+
+// RAW indexes the raw accepted order; PREFERRED and RETARGETED index the
+// straight-in preferred order. Both vectors hold the same candidate identities.
+const std::vector<size_t>& active_order(
+    const std::optional<reach::SearchResult>& results,
+    ApproachDisplayMode mode) {
+    return mode == ApproachDisplayMode::Raw
+        ? results->accepted
+        : results->preferred;
+}
 
 struct Options {
     std::filesystem::path pack;
@@ -319,17 +345,20 @@ void draw_hud(
     bool show_rejected,
     bool show_g1_mesh,
     bool show_g1_bones,
+    ApproachDisplayMode approach_mode,
+    const std::optional<reach::CorridorRetargetResult>& selected_retarget,
     const char* g1_mesh_error) {
     DrawRectangle(14, 14, 800, 400, Color{255, 255, 255, 230});
     DrawText(
         "Arrow X/Z  W/S Y | Q/E yaw R/F pitch Z/C roll | Enter search",
         26, 24, 17, DARKGRAY);
     DrawText(
-        "G environment | [ ] / accepted | < > rejected | V paths | M mesh | B bones",
+        "G environment | A mode | [ ] / cycle | < > rejected | V paths | M mesh | B bones",
         26, 48, 16, DARKGRAY);
     DrawText(
-        TextFormat("%s ENVIRONMENT | rejected paths %s",
+        TextFormat("%s ENVIRONMENT | MODE %s | rejected paths %s",
             coverage_environment ? "COVERAGE" : "OPEN",
+            approach_mode_label(approach_mode),
             show_rejected ? "ON" : "OFF"),
         26, 74, 18, DARKGRAY);
 
@@ -366,13 +395,15 @@ void draw_hud(
                 15,
                 reason == 0U ? DARKGREEN : DARKGRAY);
         }
+        const std::vector<size_t>& order =
+            active_order(results, approach_mode);
         const bool has_selected = selected_rejected
             ? selected_rejected_option < rejected.size()
-            : selected < results->accepted.size();
+            : selected < order.size();
         if (has_selected) {
             const size_t selected_evaluation = selected_rejected
                 ? rejected[selected_rejected_option]
-                : results->accepted[selected];
+                : order[selected];
             const reach::Evaluation& evaluation =
                 results->evaluations[selected_evaluation].evaluation;
             const bool has_path_quality =
@@ -381,12 +412,35 @@ void draw_hud(
                 std::isfinite(evaluation.backtrack_ratio) &&
                 std::isfinite(evaluation.excess_path_ratio);
             const size_t clip = evaluation.candidate.clip;
+            const auto raw_rank_it = std::find(
+                results->accepted.begin(),
+                results->accepted.end(),
+                selected_evaluation);
+            const auto preferred_rank_it = std::find(
+                results->preferred.begin(),
+                results->preferred.end(),
+                selected_evaluation);
+            const size_t raw_rank = raw_rank_it == results->accepted.end()
+                ? 0U
+                : static_cast<size_t>(
+                    raw_rank_it - results->accepted.begin()) + 1U;
+            const size_t preferred_rank =
+                preferred_rank_it == results->preferred.end()
+                ? 0U
+                : static_cast<size_t>(
+                    preferred_rank_it - results->preferred.begin()) + 1U;
             DrawText(
                 TextFormat(
-                    "%s option %zu/%zu | YAW PLACEMENT %u/12 | %s | %s",
-                    selected_rejected ? "REJECTED" : "ACCEPTED",
+                    "%s option %zu/%zu | RAW %zu/%zu | PREF %zu/%zu | "
+                    "YAW PLACEMENT %u/12 | %s | %s",
+                    selected_rejected ? "REJECTED" : approach_mode_label(
+                        approach_mode),
                     (selected_rejected ? selected_rejected_option : selected) + 1U,
-                    selected_rejected ? rejected.size() : results->accepted.size(),
+                    selected_rejected ? rejected.size() : order.size(),
+                    raw_rank,
+                    results->accepted.size(),
+                    preferred_rank,
+                    results->accepted.size(),
                     static_cast<unsigned>(evaluation.candidate.yaw_index) + 1U,
                     provenance(pack, clip),
                     pack.database.source_names.at(
@@ -441,7 +495,64 @@ void draw_hud(
                         evaluation.environment_collision_observed
                     ? MAROON
                     : DARKGREEN);
-        } else if (results->accepted.empty()) {
+            const reach::StraightApproachQuality& quality =
+                results->evaluations[selected_evaluation].straight_approach;
+            DrawText(
+                TextFormat(
+                    "MAX LATERAL %.2f cm | RMS LATERAL %.2f cm | "
+                    "MAX ANGLE %.1f deg | RMS ANGLE %.1f deg | BACKWARD %.1f%%",
+                    quality.maximum_lateral_m * 100.0F,
+                    quality.rms_lateral_m * 100.0F,
+                    quality.maximum_angle_radians * 180.0F / kPi,
+                    quality.rms_angle_radians * 180.0F / kPi,
+                    100.0F * quality.backward_ratio),
+                26,
+                339,
+                15,
+                quality.reaches_pregrasp_plane ? DARKGRAY : MAROON);
+            if (!quality.reaches_pregrasp_plane) {
+                DrawText("NO PREGRASP COVERAGE", 26, 359, 16, MAROON);
+            } else if (approach_mode == ApproachDisplayMode::Retargeted) {
+                if (selected_retarget.has_value() &&
+                    selected_retarget->accepted) {
+                    DrawText(
+                        TextFormat(
+                            "RETARGET ACCEPTED | active arm deform %.4f",
+                            selected_retarget->active_arm_deformation),
+                        26,
+                        359,
+                        16,
+                        DARKGREEN);
+                } else {
+                    const char* reason = "INVALID";
+                    if (selected_retarget.has_value()) {
+                        switch (selected_retarget->failure) {
+                            case reach::CorridorRetargetFailure::
+                                NoPregraspCoverage:
+                                reason = "NO PREGRASP COVERAGE"; break;
+                            case reach::CorridorRetargetFailure::OutsideCorridor:
+                                reason = "OUTSIDE CORRIDOR"; break;
+                            case reach::CorridorRetargetFailure::BackwardMotion:
+                                reason = "BACKWARD MOTION"; break;
+                            case reach::CorridorRetargetFailure::ObjectCollision:
+                                reason = "OBJECT COLLISION"; break;
+                            case reach::CorridorRetargetFailure::
+                                EnvironmentCollision:
+                                reason = "ENVIRONMENT COLLISION"; break;
+                            case reach::CorridorRetargetFailure::InvalidSolver:
+                                reason = "INVALID SOLVER"; break;
+                            default: reason = "INVALID INPUT"; break;
+                        }
+                    }
+                    DrawText(
+                        TextFormat("CORRIDOR RETARGET FAILED: %s", reason),
+                        26,
+                        359,
+                        16,
+                        MAROON);
+                }
+            }
+        } else if (order.empty()) {
             DrawText("0 valid motions", 26, 239, 20, MAROON);
         }
     }
@@ -502,6 +613,34 @@ void regenerate_index(
         config);
 }
 
+// Lazily retargets only the selected regenerated candidate through the
+// straight-in corridor. Cached by the caller until selection/mode/object/
+// grasp/environment changes; never reruns exhaustive search.
+void retarget_selected(
+    const reach::Pack& pack,
+    const std::optional<reach::Evaluation>& selected_full,
+    const reach::ExhaustiveQuery& query,
+    const interaction::OrientedBox& object,
+    const interaction::EnvironmentGeometry& environment,
+    const reach::SearchConfig& config,
+    std::optional<reach::CorridorRetargetResult>& selected_retarget) {
+    selected_retarget.reset();
+    if (!selected_full.has_value() || selected_full->poses.empty()) return;
+    const reach::Hand hand = evaluation_hand(pack, *selected_full);
+    const float fps =
+        static_cast<float>(pack.database.fps_numerator) /
+        static_cast<float>(pack.database.fps_denominator);
+    selected_retarget = reach::retarget_straight_approach(
+        selected_full->poses,
+        hand,
+        query.target,
+        query.approach_world,
+        object,
+        environment,
+        fps,
+        config.straight_approach);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -525,8 +664,10 @@ int main(int argc, char** argv) {
         size_t selected_rejected_option = 0U;
         bool selected_rejected = false;
         float animation_seconds = 0.0F;
+        ApproachDisplayMode approach_mode = ApproachDisplayMode::Raw;
         std::optional<reach::SearchResult> results;
         std::optional<reach::Evaluation> selected_full;
+        std::optional<reach::CorridorRetargetResult> selected_retarget;
         reach::SearchConfig search_config{};
         reach::ExhaustiveQuery query = make_query(
             object, options.object_size, grasp_approach_local);
@@ -607,6 +748,19 @@ int main(int argc, char** argv) {
                 use_coverage_environment = !use_coverage_environment;
                 target_changed = true;
             }
+            bool mode_changed = false;
+            if (IsKeyPressed(KEY_A)) {
+                // Cycle RAW -> PREFERRED -> RETARGETED without touching the
+                // cached results or rerunning the exhaustive search.
+                approach_mode = static_cast<ApproachDisplayMode>(
+                    (static_cast<uint8_t>(approach_mode) + 1U) % 3U);
+                selected = 0U;
+                selected_rejected = false;
+                animation_seconds = 0.0F;
+                selected_full.reset();
+                selected_retarget.reset();
+                mode_changed = true;
+            }
             if (IsKeyPressed(KEY_M) && g1_mesh_renderer.loaded) {
                 show_g1_mesh = !show_g1_mesh;
             }
@@ -619,17 +773,25 @@ int main(int argc, char** argv) {
                     selected_rejected = false;
                     animation_seconds = 0.0F;
                     selected_full.reset();
-                    if (results.has_value() &&
-                        !results->accepted.empty() && !stale) {
+                    selected_retarget.reset();
+                    if (results.has_value() && !results->accepted.empty() && !stale) {
                         regenerate_index(
                             pack,
                             *results,
-                            results->accepted[selected],
+                            active_order(results, approach_mode)[selected],
                             query,
                             {object, options.object_size},
                             use_coverage_environment ? coverage : open,
                             search_config,
                             selected_full);
+                        if (approach_mode ==
+                            ApproachDisplayMode::Retargeted) {
+                            retarget_selected(
+                                pack, selected_full, query,
+                                {object, options.object_size},
+                                use_coverage_environment ? coverage : open,
+                                search_config, selected_retarget);
+                        }
                     }
                 }
             }
@@ -657,16 +819,26 @@ int main(int argc, char** argv) {
                     selected_rejected = false;
                     animation_seconds = 0.0F;
                     selected_full.reset();
-                    if (!results->accepted.empty()) {
+                    selected_retarget.reset();
+                    const std::vector<size_t>& order =
+                        active_order(results, approach_mode);
+                    if (!order.empty()) {
                         regenerate_index(
                             pack,
                             *results,
-                            results->accepted[selected],
+                            order[selected],
                             query,
                             object_box,
                             environment,
                             search_config,
                             selected_full);
+                        if (approach_mode ==
+                            ApproachDisplayMode::Retargeted) {
+                            retarget_selected(
+                                pack, selected_full, query, object_box,
+                                environment, search_config,
+                                selected_retarget);
+                        }
                     }
                     stale = false;
                     search_incomplete = false;
@@ -674,31 +846,44 @@ int main(int argc, char** argv) {
                     search_incomplete = true;
                 }
             }
-            if (results.has_value() && !results->accepted.empty() && !stale) {
-                bool selection_changed = false;
+            if (results.has_value() &&
+                !active_order(results, approach_mode).empty() && !stale) {
+                const std::vector<size_t>& order =
+                    active_order(results, approach_mode);
+                bool selection_changed = mode_changed;
+                if (mode_changed && selected >= order.size()) {
+                    selected = 0U;
+                }
+                // Bracket cycling wraps within the active cached order and
+                // never reruns the exhaustive search.
                 if (IsKeyPressed(KEY_LEFT_BRACKET)) {
                     selected =
-                        (selected + results->accepted.size() - 1U) %
-                        results->accepted.size();
+                        (selected + order.size() - 1U) % order.size();
                     selection_changed = true;
                 }
                 if (IsKeyPressed(KEY_RIGHT_BRACKET) ||
                     IsKeyPressed(KEY_SLASH)) {
-                    selected = (selected + 1U) % results->accepted.size();
+                    selected = (selected + 1U) % order.size();
                     selection_changed = true;
                 }
                 if (selection_changed) {
                     selected_rejected = false;
                     animation_seconds = 0.0F;
+                    selected_retarget.reset();
                     regenerate_index(
                         pack,
                         *results,
-                        results->accepted[selected],
+                        order[selected],
                         query,
                         object_box,
                         environment,
                         search_config,
                         selected_full);
+                    if (approach_mode == ApproachDisplayMode::Retargeted) {
+                        retarget_selected(
+                            pack, selected_full, query, object_box,
+                            environment, search_config, selected_retarget);
+                    }
                 }
             }
             if (results.has_value() && show_rejected &&
@@ -718,6 +903,7 @@ int main(int argc, char** argv) {
                 if (rejected_selection_changed) {
                     selected_rejected = true;
                     animation_seconds = 0.0F;
+                    selected_retarget.reset();
                     regenerate_index(
                         pack,
                         *results,
@@ -737,21 +923,35 @@ int main(int argc, char** argv) {
                 selected_rejected_option < rejected.size()) {
                 selected_evaluation = rejected[selected_rejected_option];
                 has_selected_evaluation = true;
-            } else if (results.has_value() && !results->accepted.empty()) {
-                selected_evaluation = results->accepted[selected];
+            } else if (results.has_value() &&
+                       !active_order(results, approach_mode).empty()) {
+                selected_evaluation =
+                    active_order(results, approach_mode)[selected];
                 has_selected_evaluation = true;
             }
 
+            // The animated mesh/bones use the retargeted poses only when the
+            // retarget is accepted; otherwise the regenerated recorded poses.
+            const bool use_retargeted_poses =
+                approach_mode == ApproachDisplayMode::Retargeted &&
+                selected_retarget.has_value() &&
+                selected_retarget->accepted &&
+                !selected_retarget->poses.empty();
+            const std::vector<interaction::Pose>* animation_poses =
+                use_retargeted_poses
+                    ? &selected_retarget->poses
+                    : (selected_full.has_value()
+                        ? &selected_full->poses
+                        : nullptr);
             std::optional<interaction::WorldPose> selected_world_pose;
-            if (selected_full.has_value() &&
-                !selected_full->poses.empty()) {
+            if (animation_poses != nullptr && !animation_poses->empty()) {
                 const float fps =
                     static_cast<float>(pack.database.fps_numerator) /
                     static_cast<float>(pack.database.fps_denominator);
                 const size_t sample = static_cast<size_t>(
-                    animation_seconds * fps) % selected_full->poses.size();
+                    animation_seconds * fps) % animation_poses->size();
                 selected_world_pose = interaction::world_pose(
-                    selected_full->poses[sample]);
+                    (*animation_poses)[sample]);
                 if (show_g1_mesh && g1_mesh_renderer.loaded) {
                     interaction::WorldPose& mesh_world_pose =
                         *selected_world_pose;
@@ -785,6 +985,22 @@ int main(int argc, char** argv) {
             draw_oriented_box(object_box, GOLD);
             DrawSphere(ray(query.target.position), 0.028F, GOLD);
             draw_axes(query.target, 0.16F, 255);
+            if (approach_mode == ApproachDisplayMode::Retargeted) {
+                // Requested pre-grasp point (gold sphere) and 20 cm corridor
+                // (gold cylinder) from pre-grasp toward contact.
+                const vec3 corridor_dir = normalize(query.approach_world);
+                const vec3 pregrasp = query.target.position -
+                    search_config.straight_approach.corridor_length_m *
+                        corridor_dir;
+                DrawSphere(ray(pregrasp), 0.022F, GOLD);
+                DrawCylinderEx(
+                    ray(pregrasp),
+                    ray(query.target.position),
+                    search_config.straight_approach.corridor_radius_m,
+                    search_config.straight_approach.corridor_radius_m,
+                    12,
+                    Color{212, 175, 55, 90});
+            }
             if (show_g1_mesh && selected_world_pose.has_value()) {
                 ::g1_mesh_renderer_draw(g1_mesh_renderer);
             }
@@ -815,13 +1031,35 @@ int main(int argc, char** argv) {
                 const reach::Evaluation& evaluation = *selected_full;
                 const reach::Hand selected_hand =
                     evaluation_hand(pack, evaluation);
+                const std::vector<vec3> raw_path =
+                    active_wrist_path(evaluation, selected_hand);
+                if (approach_mode == ApproachDisplayMode::Retargeted) {
+                    // Raw wrist path as a faint purple reference.
+                    draw_path(raw_path, Color{150, 90, 210, 90}, 1U, false);
+                    if (selected_retarget.has_value() &&
+                        !selected_retarget->poses.empty()) {
+                        std::vector<vec3> solved_path;
+                        solved_path.reserve(selected_retarget->poses.size());
+                        const size_t wrist = wrist_bone(selected_hand);
+                        for (const interaction::Pose& pose :
+                             selected_retarget->poses) {
+                            solved_path.push_back(
+                                interaction::world_pose(pose).positions[wrist]);
+                        }
+                        // Accepted retarget path emphasized green, failed
+                        // retarget path in orange.
+                        draw_path(
+                            solved_path,
+                            selected_retarget->accepted ? GREEN : ORANGE,
+                            1U,
+                            true);
+                    }
+                }
                 const Color selected_color =
                     evaluation.rejection == reach::Rejection::None ? LIME : ORANGE;
-                draw_path(
-                    active_wrist_path(evaluation, selected_hand),
-                    selected_color,
-                    1U,
-                    true);
+                if (approach_mode != ApproachDisplayMode::Retargeted) {
+                    draw_path(raw_path, selected_color, 1U, true);
+                }
                 if (show_g1_bones && selected_world_pose.has_value()) {
                     draw_pose(
                         *selected_world_pose,
@@ -852,6 +1090,8 @@ int main(int argc, char** argv) {
                 show_rejected,
                 show_g1_mesh,
                 show_g1_bones,
+                approach_mode,
+                selected_retarget,
                 g1_mesh_error.data());
             EndDrawing();
         }
