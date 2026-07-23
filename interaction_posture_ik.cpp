@@ -9,7 +9,7 @@
 namespace interaction {
 namespace {
 
-constexpr size_t kJointCount = kLeftUpperBodyJointCount;
+constexpr size_t kJointCount = kUpperBodyJointCount;
 constexpr size_t kTaskResidualStart = 0U;
 constexpr size_t kOrientationResidualStart = 3U;
 constexpr size_t kElbowResidualStart = 6U;
@@ -37,10 +37,12 @@ struct Evaluation {
     double objective = 0.0;
 };
 
-const HingeJoint& metadata(size_t joint) {
-    return joint < kWaist.size()
-        ? kWaist[joint]
-        : kLeftArm[joint - kWaist.size()];
+const HingeJoint& metadata(Hand hand, size_t joint) {
+    if (joint < kWaist.size()) return kWaist[joint];
+    const size_t arm_joint = joint - kWaist.size();
+    return hand == Hand::Left
+        ? kLeftArm[arm_joint]
+        : kRightArm[arm_joint];
 }
 
 bool finite(float value) {
@@ -101,11 +103,14 @@ quat joint_rotation(const HingeJoint& joint, float angle) {
         quat_from_angle_axis(angle, joint.axis)));
 }
 
-Transform left_hand_world(const Pose& pose) {
+Transform hand_world(const Pose& pose, Hand hand) {
     const WorldPose world = world_pose(pose);
+    const size_t wrist = hand == Hand::Left
+        ? static_cast<size_t>(g1_skeleton::LeftWrist)
+        : static_cast<size_t>(g1_skeleton::RightWrist);
     return {
-        world.positions[g1_skeleton::LeftWrist],
-        normalize_exact(world.rotations[g1_skeleton::LeftWrist]),
+        world.positions[wrist],
+        normalize_exact(world.rotations[wrist]),
     };
 }
 
@@ -193,9 +198,9 @@ bool valid_config(const PostureIKConfig& config) {
     return true;
 }
 
-bool bounded(const LeftUpperBodyAngles& angles) {
+bool bounded(Hand hand, const UpperBodyAngles& angles) {
     for (size_t joint = 0U; joint < kJointCount; ++joint) {
-        const HingeJoint& item = metadata(joint);
+        const HingeJoint& item = metadata(hand, joint);
         if (!finite(angles[joint]) || angles[joint] < item.lower ||
             angles[joint] > item.upper) {
             return false;
@@ -213,20 +218,24 @@ bool task_accepted(
 }
 
 Evaluation evaluate(
+    Hand hand,
     const Pose& source_pose,
-    const LeftUpperBodyAngles& angles,
-    const LeftUpperBodyAngles& source_angles,
-    const LeftUpperBodyAngles& temporal_seed,
+    const UpperBodyAngles& angles,
+    const UpperBodyAngles& source_angles,
+    const UpperBodyAngles& temporal_seed,
     const ElbowPole& source_pole,
     Transform target,
-    const PostureIKConfig& config) {
+    const PostureIKConfig& config,
+    bool preserve_source_pose = false) {
     Evaluation evaluation{};
     evaluation.pose = source_pose;
-    apply_left_upper_body(evaluation.pose, angles);
-    const Transform hand = left_hand_world(evaluation.pose);
-    const vec3 position = target.position - hand.position;
+    if (!preserve_source_pose) {
+        apply_upper_body(evaluation.pose, hand, angles);
+    }
+    const Transform achieved_hand = hand_world(evaluation.pose, hand);
+    const vec3 position = target.position - achieved_hand.position;
     const vec3 orientation = orientation_delta(
-        target.rotation, hand.rotation);
+        target.rotation, achieved_hand.rotation);
     evaluation.position_error_m = length(position);
     evaluation.orientation_error_radians = length(orientation);
     evaluation.residual[kTaskResidualStart + 0U] = position.x;
@@ -239,7 +248,8 @@ Evaluation evaluate(
     evaluation.residual[kOrientationResidualStart + 2U] =
         config.orientation_scale_m_per_radian * orientation.z;
 
-    const ElbowPole current_pole = left_elbow_pole(evaluation.pose);
+    const ElbowPole current_pole =
+        hand_elbow_pole(evaluation.pose, hand);
     evaluation.elbow_pole_degenerate =
         !source_pole.valid || !current_pole.valid;
     if (!evaluation.elbow_pole_degenerate) {
@@ -270,28 +280,29 @@ Evaluation evaluate(
 }
 
 Jacobian numerical_jacobian(
+    Hand hand,
     const Pose& source_pose,
-    const LeftUpperBodyAngles& angles,
-    const LeftUpperBodyAngles& source_angles,
-    const LeftUpperBodyAngles& temporal_seed,
+    const UpperBodyAngles& angles,
+    const UpperBodyAngles& source_angles,
+    const UpperBodyAngles& temporal_seed,
     const ElbowPole& source_pole,
     Transform target,
     const PostureIKConfig& config,
     const Residual& current) {
     Jacobian jacobian{};
     for (size_t joint = 0U; joint < kJointCount; ++joint) {
-        const HingeJoint& item = metadata(joint);
+        const HingeJoint& item = metadata(hand, joint);
         float step = config.finite_difference_radians;
         if (angles[joint] + step > item.upper) {
             step = -config.finite_difference_radians;
         }
-        LeftUpperBodyAngles perturbed = angles;
+        UpperBodyAngles perturbed = angles;
         perturbed[joint] = std::clamp(
             perturbed[joint] + step, item.lower, item.upper);
         const float actual_step = perturbed[joint] - angles[joint];
         if (std::abs(actual_step) < 1.0e-12F) continue;
         const Evaluation value = evaluate(
-            source_pose, perturbed, source_angles, temporal_seed,
+            hand, source_pose, perturbed, source_angles, temporal_seed,
             source_pole, target, config);
         for (size_t row = 0U; row < kResidualDimension; ++row) {
             jacobian[row][joint] =
@@ -366,13 +377,15 @@ bool damped_step(
 }
 
 PostureIKResult make_result(
+    Hand hand,
     const Evaluation& evaluation,
-    const LeftUpperBodyAngles& angles,
+    const UpperBodyAngles& angles,
     bool hit_joint_limit,
     int32_t iterations,
     const PostureIKConfig& config) {
     PostureIKResult result{};
-    result.accepted = task_accepted(evaluation, config) && bounded(angles);
+    result.accepted =
+        task_accepted(evaluation, config) && bounded(hand, angles);
     result.reason = result.accepted
         ? Reason::None
         : (hit_joint_limit ? Reason::JointLimit : Reason::CorrectionLimit);
@@ -386,7 +399,7 @@ PostureIKResult make_result(
     result.iterations = iterations;
     result.joint_angles = angles;
     for (size_t joint = 0U; joint < kJointCount; ++joint) {
-        const HingeJoint& item = metadata(joint);
+        const HingeJoint& item = metadata(hand, joint);
         result.at_limit[joint] =
             std::abs(angles[joint] - item.lower) <= kLimitTolerance ||
             std::abs(angles[joint] - item.upper) <= kLimitTolerance;
@@ -397,7 +410,7 @@ PostureIKResult make_result(
 PostureIKResult invalid_result(
     Pose& pose,
     const Pose& source_pose,
-    const LeftUpperBodyAngles& source_angles) {
+    const UpperBodyAngles& source_angles) {
     pose = source_pose;
     PostureIKResult result{};
     result.reason = Reason::CorrectionLimit;
@@ -411,31 +424,41 @@ PostureIKResult invalid_result(
 
 }  // namespace
 
-LeftUpperBodyAngles decompose_left_upper_body(const Pose& pose) {
-    LeftUpperBodyAngles angles{};
+UpperBodyAngles decompose_upper_body(const Pose& pose, Hand hand) {
+    UpperBodyAngles angles{};
     for (size_t joint = 0U; joint < kJointCount; ++joint) {
-        const HingeJoint& item = metadata(joint);
+        const HingeJoint& item = metadata(hand, joint);
         angles[joint] = decompose_angle(
             item, pose.rotations[static_cast<size_t>(item.bone)]);
     }
     return angles;
 }
 
-void apply_left_upper_body(
+void apply_upper_body(
     Pose& pose,
-    const LeftUpperBodyAngles& angles) {
+    Hand hand,
+    const UpperBodyAngles& angles) {
     for (size_t joint = 0U; joint < kJointCount; ++joint) {
-        const HingeJoint& item = metadata(joint);
+        const HingeJoint& item = metadata(hand, joint);
         pose.rotations[static_cast<size_t>(item.bone)] =
             joint_rotation(item, angles[joint]);
     }
 }
 
-ElbowPole left_elbow_pole(const Pose& pose) {
+ElbowPole hand_elbow_pole(const Pose& pose, Hand hand) {
     const WorldPose world = world_pose(pose);
-    const vec3 shoulder = world.positions[g1_skeleton::LeftShoulderPitch];
-    const vec3 elbow = world.positions[g1_skeleton::LeftElbow];
-    const vec3 wrist = world.positions[g1_skeleton::LeftWrist];
+    const size_t shoulder_bone = hand == Hand::Left
+        ? static_cast<size_t>(g1_skeleton::LeftShoulderPitch)
+        : static_cast<size_t>(g1_skeleton::RightShoulderPitch);
+    const size_t elbow_bone = hand == Hand::Left
+        ? static_cast<size_t>(g1_skeleton::LeftElbow)
+        : static_cast<size_t>(g1_skeleton::RightElbow);
+    const size_t wrist_bone = hand == Hand::Left
+        ? static_cast<size_t>(g1_skeleton::LeftWrist)
+        : static_cast<size_t>(g1_skeleton::RightWrist);
+    const vec3 shoulder = world.positions[shoulder_bone];
+    const vec3 elbow = world.positions[elbow_bone];
+    const vec3 wrist = world.positions[wrist_bone];
     const vec3 axis_vector = wrist - shoulder;
     const float axis_length = length(axis_vector);
     if (!(axis_length > 1.0e-6F) || !finite(axis_length)) return {};
@@ -457,14 +480,15 @@ float transported_elbow_pole_error(
         dot(transported, current.direction), -1.0F, 1.0F));
 }
 
-PostureIKResult solve_left_hand_posture_ik(
+PostureIKResult solve_hand_posture_ik(
     Pose& pose,
+    Hand hand,
     Transform target_hand_world,
     const Pose& source_pose,
-    const LeftUpperBodyAngles& temporal_seed,
+    const UpperBodyAngles& temporal_seed,
     const PostureIKConfig& config) {
-    const LeftUpperBodyAngles source_angles =
-        decompose_left_upper_body(source_pose);
+    const UpperBodyAngles source_angles =
+        decompose_upper_body(source_pose, hand);
     if (!finite_pose_kinematics(source_pose) ||
         !finite_transform(target_hand_world) || !valid_config(config)) {
         return invalid_result(pose, source_pose, source_angles);
@@ -475,7 +499,7 @@ PostureIKResult solve_left_hand_posture_ik(
         }
     }
 
-    const ElbowPole source_pole = left_elbow_pole(source_pose);
+    const ElbowPole source_pole = hand_elbow_pole(source_pose, hand);
     bool seed_is_source = true;
     for (size_t joint = 0U; joint < kJointCount; ++joint) {
         seed_is_source = seed_is_source &&
@@ -483,19 +507,19 @@ PostureIKResult solve_left_hand_posture_ik(
                 temporal_seed[joint] - source_angles[joint])) <= 1.0e-7F;
     }
     const Evaluation exact_source = evaluate(
-        source_pose, source_angles, source_angles, temporal_seed,
-        source_pole, target_hand_world, config);
-    if (seed_is_source && bounded(source_angles) &&
+        hand, source_pose, source_angles, source_angles, temporal_seed,
+        source_pole, target_hand_world, config, true);
+    if (seed_is_source && bounded(hand, source_angles) &&
         task_accepted(exact_source, config)) {
         pose = source_pose;
         return make_result(
-            exact_source, source_angles, false, 0, config);
+            hand, exact_source, source_angles, false, 0, config);
     }
 
     bool hit_joint_limit = false;
-    LeftUpperBodyAngles angles = temporal_seed;
+    UpperBodyAngles angles = temporal_seed;
     for (size_t joint = 0U; joint < kJointCount; ++joint) {
-        const HingeJoint& item = metadata(joint);
+        const HingeJoint& item = metadata(hand, joint);
         const float value = std::clamp(
             angles[joint], item.lower, item.upper);
         hit_joint_limit = hit_joint_limit || value != angles[joint];
@@ -503,10 +527,15 @@ PostureIKResult solve_left_hand_posture_ik(
     }
 
     Evaluation working = evaluate(
-        source_pose, angles, source_angles, temporal_seed, source_pole,
+        hand, source_pose, angles, source_angles, temporal_seed, source_pole,
         target_hand_world, config);
     Evaluation best = working;
-    LeftUpperBodyAngles best_angles = angles;
+    UpperBodyAngles best_angles = angles;
+    if (bounded(hand, source_angles) && finite(exact_source.objective) &&
+        exact_source.objective <= best.objective) {
+        best = exact_source;
+        best_angles = source_angles;
+    }
     float damping = std::clamp(
         config.initial_damping,
         config.minimum_damping,
@@ -515,7 +544,7 @@ PostureIKResult solve_left_hand_posture_ik(
 
     for (; iterations < config.maximum_iterations; ++iterations) {
         const Jacobian jacobian = numerical_jacobian(
-            source_pose, angles, source_angles, temporal_seed, source_pole,
+            hand, source_pose, angles, source_angles, temporal_seed, source_pole,
             target_hand_world, config, working.residual);
         NormalVector raw_step{};
         if (!damped_step(
@@ -526,9 +555,9 @@ PostureIKResult solve_left_hand_posture_ik(
             continue;
         }
 
-        LeftUpperBodyAngles trial_angles = angles;
+        UpperBodyAngles trial_angles = angles;
         for (size_t joint = 0U; joint < kJointCount; ++joint) {
-            const HingeJoint& item = metadata(joint);
+            const HingeJoint& item = metadata(hand, joint);
             const float step = std::clamp(
                 static_cast<float>(raw_step[joint]),
                 -config.maximum_step_radians,
@@ -540,7 +569,7 @@ PostureIKResult solve_left_hand_posture_ik(
                 hit_joint_limit || trial_angles[joint] != proposed;
         }
         const Evaluation trial = evaluate(
-            source_pose, trial_angles, source_angles, temporal_seed,
+            hand, source_pose, trial_angles, source_angles, temporal_seed,
             source_pole, target_hand_world, config);
         if (finite(trial.objective) &&
             trial.objective + 1.0e-15 < working.objective) {
@@ -564,7 +593,36 @@ PostureIKResult solve_left_hand_posture_ik(
 
     pose = best.pose;
     return make_result(
-        best, best_angles, hit_joint_limit, iterations, config);
+        hand, best, best_angles, hit_joint_limit, iterations, config);
+}
+
+LeftUpperBodyAngles decompose_left_upper_body(const Pose& pose) {
+    return decompose_upper_body(pose, Hand::Left);
+}
+
+void apply_left_upper_body(
+    Pose& pose,
+    const LeftUpperBodyAngles& angles) {
+    apply_upper_body(pose, Hand::Left, angles);
+}
+
+ElbowPole left_elbow_pole(const Pose& pose) {
+    return hand_elbow_pole(pose, Hand::Left);
+}
+
+PostureIKResult solve_left_hand_posture_ik(
+    Pose& pose,
+    Transform target_hand_world,
+    const Pose& source_pose,
+    const LeftUpperBodyAngles& temporal_seed,
+    const PostureIKConfig& config) {
+    return solve_hand_posture_ik(
+        pose,
+        Hand::Left,
+        target_hand_world,
+        source_pose,
+        temporal_seed,
+        config);
 }
 
 }  // namespace interaction

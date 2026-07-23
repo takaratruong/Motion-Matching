@@ -49,6 +49,31 @@ void test_zero_target_returns_source_byte_exact() {
     assert(same_pose(source, solved));
 }
 
+void test_right_zero_target_returns_source_byte_exact() {
+    const interaction::Pose source = make_pose();
+    const interaction::WorldPose world = interaction::world_pose(source);
+    const interaction::Transform target{
+        world.positions[g1_skeleton::RightWrist],
+        world.rotations[g1_skeleton::RightWrist],
+    };
+    interaction::Pose solved = source;
+    const interaction::UpperBodyAngles seed =
+        interaction::decompose_upper_body(
+            source, interaction::Hand::Right);
+    const auto result = interaction::solve_hand_posture_ik(
+        solved,
+        interaction::Hand::Right,
+        target,
+        source,
+        seed);
+
+    assert(result.accepted);
+    assert(result.reason == interaction::Reason::None);
+    assert(result.position_error_m <= kTolerance);
+    assert(result.orientation_error_radians <= kTolerance);
+    assert(same_pose(source, solved));
+}
+
 void test_reachable_ten_joint_target_converges() {
     const interaction::Pose source = make_pose();
     interaction::Pose goal = source;
@@ -81,6 +106,43 @@ void test_reachable_ten_joint_target_converges() {
     assert_non_owned_local_channels_equal(source, solved);
 }
 
+void test_right_reachable_ten_joint_target_converges() {
+    const interaction::Pose source = make_pose();
+    interaction::Pose goal = source;
+    auto goal_angles = interaction::decompose_upper_body(
+        goal, interaction::Hand::Right);
+    const interaction::UpperBodyAngles delta{
+        0.05F, -0.03F, 0.02F, -0.08F, -0.06F,
+        0.04F, 0.10F, 0.05F, -0.04F, 0.03F};
+    for (size_t joint = 0U; joint < goal_angles.size(); ++joint) {
+        goal_angles[joint] += delta[joint];
+    }
+    interaction::apply_upper_body(
+        goal, interaction::Hand::Right, goal_angles);
+
+    interaction::Pose solved = source;
+    interaction::PostureIKConfig config{};
+    config.source_scale_m_per_radian.fill(0.0F);
+    config.temporal_scale_m_per_radian.fill(0.0F);
+    config.elbow_pole_scale_m = 0.0F;
+    const auto result = interaction::solve_hand_posture_ik(
+        solved,
+        interaction::Hand::Right,
+        hand_transform(goal, interaction::Hand::Right),
+        source,
+        interaction::decompose_upper_body(
+            source, interaction::Hand::Right),
+        config);
+
+    assert(result.accepted);
+    assert(result.position_error_m <= config.accepted_position_m);
+    assert(result.orientation_error_radians <=
+           config.accepted_orientation_radians);
+    assert_finite_bounded(result.joint_angles, interaction::Hand::Right);
+    assert_non_owned_local_channels_equal(
+        source, solved, interaction::Hand::Right);
+}
+
 void test_unreachable_target_returns_finite_bounded_best_pose() {
     const interaction::Pose source = make_pose();
     interaction::Pose solved = source;
@@ -99,6 +161,34 @@ void test_unreachable_target_returns_finite_bounded_best_pose() {
     assert_finite_bounded(result.joint_angles);
     assert_finite_pose(solved);
     assert_non_owned_local_channels_equal(source, solved);
+}
+
+void test_best_seen_pose_includes_the_byte_exact_source_candidate() {
+    const interaction::Pose source = make_pose();
+    auto transported_seed =
+        interaction::decompose_left_upper_body(source);
+    transported_seed[3] += 1.0F;
+    transported_seed[4] += 0.8F;
+
+    interaction::PostureIKConfig config{};
+    config.temporal_scale_m_per_radian.fill(0.0F);
+    config.maximum_iterations = 0;
+    interaction::Pose solved = source;
+    const auto result = interaction::solve_left_hand_posture_ik(
+        solved,
+        left_hand_transform(source),
+        source,
+        transported_seed,
+        config);
+
+    assert(result.accepted);
+    assert(result.objective <= 1.0e-10);
+    assert(same_pose(source, solved));
+    const auto source_angles =
+        interaction::decompose_left_upper_body(source);
+    for (size_t joint = 0U; joint < source_angles.size(); ++joint) {
+        assert(near(result.joint_angles[joint], source_angles[joint]));
+    }
 }
 
 void test_elbow_pole_geometry_and_degeneracy() {
@@ -164,13 +254,50 @@ void test_solver_does_not_flip_elbow_across_small_target_sweep() {
     }
 }
 
+void test_right_solver_does_not_flip_elbow_across_small_target_sweep() {
+    const interaction::Pose source = make_pose();
+    const interaction::ElbowPole reference =
+        interaction::hand_elbow_pole(source, interaction::Hand::Right);
+    const std::array<vec3, 3U> offsets = {
+        vec3(-0.03F, 0.0F, 0.0F),
+        vec3(0.0F, 0.03F, 0.0F),
+        vec3(0.0F, 0.0F, 0.03F),
+    };
+    for (const vec3 offset : offsets) {
+        interaction::Pose solved = source;
+        interaction::Transform target =
+            hand_transform(source, interaction::Hand::Right);
+        target.position = target.position + offset;
+        const auto result = interaction::solve_hand_posture_ik(
+            solved,
+            interaction::Hand::Right,
+            target,
+            source,
+            interaction::decompose_upper_body(
+                source, interaction::Hand::Right));
+        assert_finite_pose(solved);
+        assert_finite_bounded(
+            result.joint_angles, interaction::Hand::Right);
+        const interaction::ElbowPole current =
+            interaction::hand_elbow_pole(
+                solved, interaction::Hand::Right);
+        assert(!current.valid ||
+               interaction::transported_elbow_pole_error(
+                   reference, current) < 1.570796327F);
+    }
+}
+
 }  // namespace
 
 int main() {
     test_public_contract_and_angle_round_trip();
     test_zero_target_returns_source_byte_exact();
+    test_right_zero_target_returns_source_byte_exact();
     test_reachable_ten_joint_target_converges();
+    test_right_reachable_ten_joint_target_converges();
     test_unreachable_target_returns_finite_bounded_best_pose();
+    test_best_seen_pose_includes_the_byte_exact_source_candidate();
     test_elbow_pole_geometry_and_degeneracy();
     test_solver_does_not_flip_elbow_across_small_target_sweep();
+    test_right_solver_does_not_flip_elbow_across_small_target_sweep();
 }

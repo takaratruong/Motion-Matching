@@ -17,10 +17,20 @@ inline bool near(
     return std::abs(left - right) <= tolerance;
 }
 
+inline const interaction::HingeJoint& upper_body_metadata(
+    interaction::Hand hand,
+    size_t joint) {
+    if (joint < interaction::kWaist.size()) {
+        return interaction::kWaist[joint];
+    }
+    const size_t arm_joint = joint - interaction::kWaist.size();
+    return hand == interaction::Hand::Left
+        ? interaction::kLeftArm[arm_joint]
+        : interaction::kRightArm[arm_joint];
+}
+
 inline const interaction::HingeJoint& upper_body_metadata(size_t joint) {
-    return joint < interaction::kWaist.size()
-        ? interaction::kWaist[joint]
-        : interaction::kLeftArm[joint - interaction::kWaist.size()];
+    return upper_body_metadata(interaction::Hand::Left, joint);
 }
 
 inline interaction::Pose make_pose() {
@@ -92,21 +102,36 @@ inline interaction::Transform left_hand_transform(
     };
 }
 
+inline interaction::Transform hand_transform(
+    const interaction::Pose& pose,
+    interaction::Hand hand) {
+    const interaction::WorldPose world = interaction::world_pose(pose);
+    const size_t wrist = hand == interaction::Hand::Left
+        ? static_cast<size_t>(g1_skeleton::LeftWrist)
+        : static_cast<size_t>(g1_skeleton::RightWrist);
+    return {world.positions[wrist], world.rotations[wrist]};
+}
+
 inline void assert_finite_bounded(
-    const interaction::LeftUpperBodyAngles& angles) {
+    const interaction::UpperBodyAngles& angles,
+    interaction::Hand hand = interaction::Hand::Left) {
     for (size_t joint = 0U; joint < angles.size(); ++joint) {
-        const interaction::HingeJoint& item = upper_body_metadata(joint);
+        const interaction::HingeJoint& item =
+            upper_body_metadata(hand, joint);
         assert(std::isfinite(angles[joint]));
         assert(angles[joint] >= item.lower - kTolerance);
         assert(angles[joint] <= item.upper + kTolerance);
     }
 }
 
-inline bool owned_rotation(size_t bone) {
+inline bool owned_rotation(
+    size_t bone,
+    interaction::Hand hand = interaction::Hand::Left) {
     for (size_t joint = 0U;
-         joint < interaction::kLeftUpperBodyJointCount;
+         joint < interaction::kUpperBodyJointCount;
          ++joint) {
-        if (static_cast<size_t>(upper_body_metadata(joint).bone) == bone) {
+        if (static_cast<size_t>(
+                upper_body_metadata(hand, joint).bone) == bone) {
             return true;
         }
     }
@@ -124,14 +149,15 @@ inline bool exact(quat left, quat right) {
 
 inline void assert_non_owned_local_channels_equal(
     const interaction::Pose& before,
-    const interaction::Pose& after) {
+    const interaction::Pose& after,
+    interaction::Hand hand = interaction::Hand::Left) {
     for (size_t bone = 0U; bone < g1_skeleton::BoneCount; ++bone) {
         assert(exact(before.positions[bone], after.positions[bone]));
         assert(exact(before.velocities[bone], after.velocities[bone]));
         assert(exact(
             before.angular_velocities[bone],
             after.angular_velocities[bone]));
-        if (!owned_rotation(bone)) {
+        if (!owned_rotation(bone, hand)) {
             assert(exact(before.rotations[bone], after.rotations[bone]));
         }
     }
