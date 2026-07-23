@@ -693,24 +693,54 @@ interaction::Pose pose_from_world_positions(
 interaction::ShapedHandTrajectory shaped_pose_with_world_positions(
     const std::array<vec3, g1_skeleton::BoneCount>& world_positions,
     interaction::Hand hand,
-    size_t sample_count = 1U) {
+    size_t sample_count = 1U);
+
+interaction::ShapedHandTrajectory shaped_trajectory_with_world_positions(
+    const std::vector<
+        std::array<vec3, g1_skeleton::BoneCount>>& world_samples,
+    interaction::Hand hand) {
     interaction::ShapedHandTrajectory shaped{};
-    shaped.poses.assign(
-        sample_count, pose_from_world_positions(world_positions));
-    const interaction::WorldPose world = interaction::world_pose(
-        shaped.poses.front());
     const size_t wrist = hand == interaction::Hand::Left
         ? static_cast<size_t>(g1_skeleton::LeftWrist)
         : static_cast<size_t>(g1_skeleton::RightWrist);
     const size_t elbow = hand == interaction::Hand::Left
         ? static_cast<size_t>(g1_skeleton::LeftElbow)
         : static_cast<size_t>(g1_skeleton::RightElbow);
-    shaped.path.hands.assign(
-        sample_count,
-        {world.positions[wrist], world.rotations[wrist]});
-    shaped.path.elbows.assign(sample_count, world.positions[elbow]);
+    for (const auto& world_positions : world_samples) {
+        shaped.poses.push_back(pose_from_world_positions(world_positions));
+        const interaction::WorldPose world = interaction::world_pose(
+            shaped.poses.back());
+        shaped.path.hands.push_back(
+            {world.positions[wrist], world.rotations[wrist]});
+        shaped.path.elbows.push_back(world.positions[elbow]);
+    }
     shaped.contact_accepted = true;
     return shaped;
+}
+
+interaction::ShapedHandTrajectory shaped_pose_with_world_positions(
+    const std::array<vec3, g1_skeleton::BoneCount>& world_positions,
+    interaction::Hand hand,
+    size_t sample_count) {
+    return shaped_trajectory_with_world_positions(
+        std::vector<std::array<vec3, g1_skeleton::BoneCount>>(
+            sample_count, world_positions),
+        hand);
+}
+
+std::array<vec3, g1_skeleton::BoneCount> right_wrist_pose_on_axis(
+    vec3 axis,
+    float body_distance,
+    float wrist_roll_distance,
+    float wrist_pitch_distance,
+    float wrist_distance) {
+    std::array<vec3, g1_skeleton::BoneCount> positions{};
+    positions.fill(body_distance * axis);
+    positions[g1_skeleton::RightElbow] = body_distance * axis;
+    positions[g1_skeleton::RightWristRoll] = wrist_roll_distance * axis;
+    positions[g1_skeleton::RightWristPitch] = wrist_pitch_distance * axis;
+    positions[g1_skeleton::RightWrist] = wrist_distance * axis;
+    return positions;
 }
 
 void test_selects_every_close_complete_same_hand_clip_in_stable_order() {
@@ -1180,12 +1210,10 @@ void test_only_final_active_wrist_is_exempt_after_contact() {
             "final active wrist contact was not exempted after Contact");
 }
 
-void test_terminal_contact_window_exempts_only_the_active_wrist_chain() {
+void test_only_final_sample_exempts_active_wrist_chain() {
     const interaction::OrientedBox object{
         {vec3(), quat()}, vec3(0.20F, 0.20F, 0.20F)};
     const interaction::EnvironmentGeometry environment{};
-    interaction::TrajectoryCollisionConfig config{};
-    config.active_object_contact_window_samples = 5U;
 
     std::array<vec3, g1_skeleton::BoneCount> wrist_contact{};
     wrist_contact.fill(vec3(10.0F, 0.0F, 0.0F));
@@ -1193,40 +1221,23 @@ void test_terminal_contact_window_exempts_only_the_active_wrist_chain() {
     wrist_contact[g1_skeleton::RightWristRoll] = vec3(0.30F, 0.0F, 0.0F);
     wrist_contact[g1_skeleton::RightWristPitch] = vec3(0.0F, 0.0F, 0.0F);
     wrist_contact[g1_skeleton::RightWrist] = vec3(0.0F, 0.0F, 0.0F);
-    const auto allowed = shaped_pose_with_world_positions(
+    const auto repeated_contact = shaped_pose_with_world_positions(
         wrist_contact, interaction::Hand::Right, 5U);
-    require(interaction::evaluate_shaped_trajectory_feasibility(
-                allowed, 4U, interaction::Hand::Right,
-                object, environment, config).reason ==
-            interaction::TrajectoryFeasibilityReason::None,
-            "terminal active wrist-chain contact was rejected");
-
-    const auto after_contact = shaped_pose_with_world_positions(
-        wrist_contact, interaction::Hand::Right, 6U);
-    const interaction::TrajectoryFeasibility after_result =
+    const interaction::TrajectoryFeasibility repeated_result =
         interaction::evaluate_shaped_trajectory_feasibility(
-            after_contact, 4U, interaction::Hand::Right,
-            object, environment, config);
-    require(after_result.reason ==
+            repeated_contact, 4U, interaction::Hand::Right,
+            object, environment);
+    require(repeated_result.reason ==
                 interaction::TrajectoryFeasibilityReason::ObjectCollision &&
-            after_result.sample == 5U,
-            "contact window was not bounded to end at Contact");
-
-    const interaction::TrajectoryFeasibility before_result =
-        interaction::evaluate_shaped_trajectory_feasibility(
-            after_contact, 5U, interaction::Hand::Right,
-            object, environment, config);
-    require(before_result.reason ==
-                interaction::TrajectoryFeasibilityReason::ObjectCollision &&
-            before_result.sample == 0U,
-            "contact window exempted more than its configured sample count");
+            repeated_result.sample == 0U,
+            "active wrist contact was exempted before the final sample");
 
     wrist_contact[g1_skeleton::RightElbow] = vec3(0.0F, 0.0F, 0.0F);
     const auto elbow_collision = shaped_pose_with_world_positions(
         wrist_contact, interaction::Hand::Right, 5U);
     require(interaction::evaluate_shaped_trajectory_feasibility(
                 elbow_collision, 4U, interaction::Hand::Right,
-                object, environment, config).reason ==
+                object, environment).reason ==
             interaction::TrajectoryFeasibilityReason::ObjectCollision,
             "terminal active elbow collision was exempted");
 
@@ -1236,9 +1247,89 @@ void test_terminal_contact_window_exempts_only_the_active_wrist_chain() {
         wrist_contact, interaction::Hand::Right, 5U);
     require(interaction::evaluate_shaped_trajectory_feasibility(
                 forearm_collision, 4U, interaction::Hand::Right,
-                object, environment, config).reason ==
+                object, environment).reason ==
             interaction::TrajectoryFeasibilityReason::ObjectCollision,
             "terminal elbow-to-wrist-roll collision was exempted");
+}
+
+void test_swept_active_wrist_rejects_clear_endpoints_crossing_object() {
+    const interaction::OrientedBox object{
+        {vec3(), quat()}, vec3(0.20F, 0.20F, 0.20F)};
+    const vec3 axis(1.0F, 0.0F, 0.0F);
+    const auto crossing = shaped_trajectory_with_world_positions(
+        {
+            right_wrist_pose_on_axis(axis, -0.60F, -0.40F, -0.30F, -0.30F),
+            right_wrist_pose_on_axis(axis, 0.60F, 0.40F, 0.30F, 0.30F),
+        },
+        interaction::Hand::Right);
+    const interaction::TrajectoryFeasibility result =
+        interaction::evaluate_shaped_trajectory_feasibility(
+            crossing, 1U, interaction::Hand::Right,
+            object, interaction::EnvironmentGeometry{});
+    require(result.reason ==
+                interaction::TrajectoryFeasibilityReason::ObjectCollision &&
+            result.sample == 1U,
+            "clear sampled wrist endpoints tunneled through the object");
+}
+
+void test_terminal_sweep_allows_only_endpoint_contact() {
+    const interaction::OrientedBox object{
+        {vec3(), quat()}, vec3(0.20F, 0.20F, 0.20F)};
+    const vec3 axis(1.0F, 0.0F, 0.0F);
+    const auto same_side = shaped_trajectory_with_world_positions(
+        {
+            right_wrist_pose_on_axis(axis, 0.60F, 0.40F, 0.30F, 0.30F),
+            right_wrist_pose_on_axis(axis, 0.60F, 0.40F, 0.30F, 0.14F),
+        },
+        interaction::Hand::Right);
+    require(interaction::evaluate_shaped_trajectory_feasibility(
+                same_side, 1U, interaction::Hand::Right,
+                object, interaction::EnvironmentGeometry{}).reason ==
+            interaction::TrajectoryFeasibilityReason::None,
+            "same-side terminal endpoint contact was rejected");
+
+    const auto opposite_side = shaped_trajectory_with_world_positions(
+        {
+            right_wrist_pose_on_axis(axis, -0.60F, -0.40F, -0.30F, -0.30F),
+            right_wrist_pose_on_axis(axis, 0.60F, 0.40F, 0.30F, 0.14F),
+        },
+        interaction::Hand::Right);
+    require(interaction::evaluate_shaped_trajectory_feasibility(
+                opposite_side, 1U, interaction::Hand::Right,
+                object, interaction::EnvironmentGeometry{}).reason ==
+            interaction::TrajectoryFeasibilityReason::ObjectCollision,
+            "opposite-side terminal sweep through the object was accepted");
+}
+
+void test_swept_active_wrist_respects_object_rotation() {
+    const quat rotation = quat_from_angle_axis(
+        1.570796327F, vec3(0.0F, 1.0F, 0.0F));
+    const interaction::OrientedBox object{
+        {vec3(), rotation}, vec3(0.20F, 0.20F, 0.20F)};
+    const vec3 axis = quat_mul_vec3(rotation, vec3(1.0F, 0.0F, 0.0F));
+    const auto crossing = shaped_trajectory_with_world_positions(
+        {
+            right_wrist_pose_on_axis(axis, -0.60F, -0.40F, -0.30F, -0.30F),
+            right_wrist_pose_on_axis(axis, 0.60F, 0.40F, 0.30F, 0.30F),
+        },
+        interaction::Hand::Right);
+    require(interaction::evaluate_shaped_trajectory_feasibility(
+                crossing, 1U, interaction::Hand::Right,
+                object, interaction::EnvironmentGeometry{}).reason ==
+            interaction::TrajectoryFeasibilityReason::ObjectCollision,
+            "rotated object did not rotate the active-wrist sweep");
+
+    const auto same_side = shaped_trajectory_with_world_positions(
+        {
+            right_wrist_pose_on_axis(axis, 0.60F, 0.40F, 0.30F, 0.30F),
+            right_wrist_pose_on_axis(axis, 0.60F, 0.40F, 0.30F, 0.14F),
+        },
+        interaction::Hand::Right);
+    require(interaction::evaluate_shaped_trajectory_feasibility(
+                same_side, 1U, interaction::Hand::Right,
+                object, interaction::EnvironmentGeometry{}).reason ==
+            interaction::TrajectoryFeasibilityReason::None,
+            "rotated same-side terminal contact was rejected");
 }
 
 void test_recorded_table_geometry_preserves_top_and_builds_four_legs() {
@@ -1348,7 +1439,10 @@ int main() {
     test_forearm_capsule_and_contact_still_collide_with_shelf();
     test_shaped_upper_arm_and_torso_collisions_are_rejected();
     test_only_final_active_wrist_is_exempt_after_contact();
-    test_terminal_contact_window_exempts_only_the_active_wrist_chain();
+    test_only_final_sample_exempts_active_wrist_chain();
+    test_swept_active_wrist_rejects_clear_endpoints_crossing_object();
+    test_terminal_sweep_allows_only_endpoint_contact();
+    test_swept_active_wrist_respects_object_rotation();
     test_recorded_table_geometry_preserves_top_and_builds_four_legs();
     test_coverage_environment_builds_right_shelf_and_lower_left_table();
     test_collision_checks_every_environment_box();

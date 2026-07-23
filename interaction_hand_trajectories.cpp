@@ -16,6 +16,7 @@ constexpr uint8_t kContactPhase = 2U;
 constexpr uint8_t kLiftPhase = 3U;
 constexpr float kQuaternionEpsilon = 1.0e-6F;
 constexpr float kSupportMetadataTolerance = 1.0e-4F;
+constexpr float kTerminalContactTimeEpsilon = 1.0e-5F;
 
 bool finite(float value) {
     return std::isfinite(value);
@@ -81,7 +82,13 @@ bool update_slab(
     return minimum_time <= maximum_time;
 }
 
-bool capsule_intersects_box(
+struct SegmentBoxInterval {
+    bool intersects = false;
+    float entry = 0.0F;
+    float exit = 0.0F;
+};
+
+SegmentBoxInterval segment_box_interval(
     vec3 start,
     vec3 stop,
     float radius,
@@ -92,15 +99,28 @@ bool capsule_intersects_box(
     const vec3 expanded = box.dimensions * 0.5F + radius;
     float minimum_time = 0.0F;
     float maximum_time = 1.0F;
-    return update_slab(
-               local_start.x, delta.x, expanded.x,
-               minimum_time, maximum_time) &&
-           update_slab(
-               local_start.y, delta.y, expanded.y,
-               minimum_time, maximum_time) &&
-           update_slab(
-               local_start.z, delta.z, expanded.z,
-               minimum_time, maximum_time);
+    const bool intersects =
+        update_slab(
+            local_start.x, delta.x, expanded.x,
+            minimum_time, maximum_time) &&
+        update_slab(
+            local_start.y, delta.y, expanded.y,
+            minimum_time, maximum_time) &&
+        update_slab(
+            local_start.z, delta.z, expanded.z,
+            minimum_time, maximum_time);
+    return {
+        intersects,
+        intersects ? minimum_time : 0.0F,
+        intersects ? maximum_time : 0.0F};
+}
+
+bool capsule_intersects_box(
+    vec3 start,
+    vec3 stop,
+    float radius,
+    const OrientedBox& box) {
+    return segment_box_interval(start, stop, radius, box).intersects;
 }
 
 bool arm_intersects_box(
@@ -138,6 +158,19 @@ bool active_contact_wrist_bone(size_t bone, Hand hand) {
     return bone == static_cast<size_t>(g1_skeleton::RightWristRoll) ||
         bone == static_cast<size_t>(g1_skeleton::RightWristPitch) ||
         bone == static_cast<size_t>(g1_skeleton::RightWrist);
+}
+
+std::array<size_t, 3U> active_contact_wrist_bones(Hand hand) {
+    if (hand == Hand::Left) {
+        return {
+            static_cast<size_t>(g1_skeleton::LeftWristRoll),
+            static_cast<size_t>(g1_skeleton::LeftWristPitch),
+            static_cast<size_t>(g1_skeleton::LeftWrist)};
+    }
+    return {
+        static_cast<size_t>(g1_skeleton::RightWristRoll),
+        static_cast<size_t>(g1_skeleton::RightWristPitch),
+        static_cast<size_t>(g1_skeleton::RightWrist)};
 }
 
 float joint_radius(
@@ -1037,15 +1070,36 @@ TrajectoryFeasibility evaluate_shaped_trajectory_feasibility(
         }
     }
     TrajectoryFeasibility feasibility{};
+    std::vector<WorldPose> world_poses;
+    world_poses.reserve(trajectory.poses.size());
+    for (const Pose& pose : trajectory.poses) {
+        world_poses.push_back(world_pose(pose));
+    }
     for (size_t sample = 0U; sample < trajectory.poses.size(); ++sample) {
-        const WorldPose world = world_pose(trajectory.poses[sample]);
-        const size_t contact_window = std::min(
-            config.active_object_contact_window_samples,
-            contact_point + 1U);
-        const size_t first_contact_sample =
-            contact_point + 1U - contact_window;
-        const bool terminal_contact = contact_window > 0U &&
-            sample >= first_contact_sample && sample <= contact_point;
+        const WorldPose& world = world_poses[sample];
+        const bool terminal_contact = sample == contact_point;
+        if (sample > 0U) {
+            for (const size_t bone : active_contact_wrist_bones(hand)) {
+                const SegmentBoxInterval interval = segment_box_interval(
+                    world_poses[sample - 1U].positions[bone],
+                    world.positions[bone],
+                    joint_radius(bone, config),
+                    object);
+                const bool endpoint_only_contact =
+                    interval.entry >=
+                    1.0F - kTerminalContactTimeEpsilon;
+                if (interval.intersects &&
+                    !(terminal_contact && endpoint_only_contact)) {
+                    feasibility.object_collision_observed = true;
+                    if (feasibility.reason ==
+                        TrajectoryFeasibilityReason::None) {
+                        feasibility.reason =
+                            TrajectoryFeasibilityReason::ObjectCollision;
+                        feasibility.sample = sample;
+                    }
+                }
+            }
+        }
         if (skeleton_intersects_box(
                 world, object, hand, terminal_contact, config)) {
             feasibility.object_collision_observed = true;
