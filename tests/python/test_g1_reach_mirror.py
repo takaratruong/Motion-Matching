@@ -59,10 +59,21 @@ class ReachMirrorTests(unittest.TestCase):
         np.testing.assert_allclose(
             reconstructed.positions, left.positions, atol=1e-5
         )
+        np.testing.assert_allclose(
+            reconstructed.positions[left.contact_index + 1:],
+            left.positions[left.contact_index + 1:],
+            atol=1e-5,
+        )
         dots = np.abs(np.sum(
             reconstructed.rotations * left.rotations, axis=-1
         ))
         np.testing.assert_allclose(dots, 1.0, atol=1e-4)
+        return_dots = np.abs(np.sum(
+            reconstructed.rotations[left.contact_index + 1:]
+            * left.rotations[left.contact_index + 1:],
+            axis=-1,
+        ))
+        np.testing.assert_allclose(return_dots, 1.0, atol=1e-4)
         np.testing.assert_allclose(
             reconstructed.endpoint_position_root,
             left.endpoint_position_root,

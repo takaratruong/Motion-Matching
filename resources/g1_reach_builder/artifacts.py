@@ -14,9 +14,9 @@ from resources.g1_interaction_builder.schema import G1_SKELETON
 from .motions import CanonicalReach, ReachAugmentation
 
 
-DATABASE_MAGIC = b"G1RCHD1\0"
-FEATURE_MAGIC = b"G1RCHF1\0"
-VERSION = 1
+DATABASE_MAGIC = b"G1RCHD2\0"
+FEATURE_MAGIC = b"G1RCHF2\0"
+VERSION = 2
 ENDIAN_MARKER = 0x01020304
 DATABASE_HEADER = struct.Struct("<8s8I")
 FEATURE_HEADER = struct.Struct("<8s4I")
@@ -32,6 +32,7 @@ class ReachArtifact:
     source_frames: np.ndarray
     range_starts: np.ndarray
     range_stops: np.ndarray
+    contact_frames: np.ndarray
     active_hands: np.ndarray
     augmentations: np.ndarray
     source_indices: np.ndarray
@@ -58,6 +59,7 @@ class ReachArtifact:
             (self.source_frames, (frames,), np.int32, "source frames"),
             (self.range_starts, (clips,), np.int32, "range starts"),
             (self.range_stops, (clips,), np.int32, "range stops"),
+            (self.contact_frames, (clips,), np.int32, "contact frames"),
             (self.active_hands, (clips,), np.uint8, "active hands"),
             (self.augmentations, (clips,), np.uint8, "augmentations"),
             (self.source_indices, (clips,), np.uint32, "source indices"),
@@ -97,6 +99,10 @@ class ReachArtifact:
             raise ValueError("reach ranges contain an empty clip")
         if np.any(self.range_starts[1:] != self.range_stops[:-1]):
             raise ValueError("reach ranges must be contiguous")
+        if np.any(self.contact_frames < self.range_starts) or np.any(
+            self.contact_frames >= self.range_stops
+        ):
+            raise ValueError("reach contact frames are outside clip ranges")
         if np.any(self.active_hands > 1) or np.any(self.augmentations > 1):
             raise ValueError("reach hand or augmentation enum is invalid")
         if not self.source_names or len(set(self.source_names)) != len(self.source_names):
@@ -151,6 +157,9 @@ def assemble_reach_pack(
     counts = np.asarray([reach.frame_count for reach in reaches], np.int32)
     stops = np.cumsum(counts, dtype=np.int32)
     starts = np.concatenate((np.array([0], np.int32), stops[:-1]))
+    contact_frames = starts + np.asarray(
+        [reach.contact_index for reach in reaches], np.int32
+    )
     artifact = ReachArtifact(
         positions=np.concatenate([reach.positions for reach in reaches]).astype(np.float32),
         velocities=np.concatenate([reach.velocities for reach in reaches]).astype(np.float32),
@@ -166,6 +175,7 @@ def assemble_reach_pack(
         ).astype(np.int32),
         range_starts=starts,
         range_stops=stops,
+        contact_frames=contact_frames,
         active_hands=np.asarray([int(reach.active_hand) for reach in reaches], np.uint8),
         augmentations=np.asarray(
             [int(reach.augmentation) for reach in reaches], np.uint8
@@ -216,6 +226,7 @@ def _write_database(path: Path, value: ReachArtifact) -> None:
             (G1_SKELETON.parents, "<i4"),
             (value.range_starts, "<i4"),
             (value.range_stops, "<i4"),
+            (value.contact_frames, "<i4"),
             (value.positions, "<f4"),
             (value.velocities, "<f4"),
             (value.rotations, "<f4"),
@@ -280,6 +291,7 @@ def _read_database(path: Path) -> ReachArtifact:
     kwargs = {
         "range_starts": _take(stream, clips, "<i4", (clips,), "range starts"),
         "range_stops": _take(stream, clips, "<i4", (clips,), "range stops"),
+        "contact_frames": _take(stream, clips, "<i4", (clips,), "contact frames"),
         "positions": _take(stream, frames * 31 * 3, "<f4", (frames, 31, 3), "positions"),
         "velocities": _take(stream, frames * 31 * 3, "<f4", (frames, 31, 3), "velocities"),
         "rotations": _take(stream, frames * 31 * 4, "<f4", (frames, 31, 4), "rotations"),
@@ -363,6 +375,8 @@ def write_reach_pack(
     try:
         _write_database(temporary / "reach_database.bin", artifact)
         _write_features(temporary / "reach_features.bin", features)
+        stops = artifact.range_stops
+        contact_frames = artifact.contact_frames
         value = dict(manifest)
         value.update({
             "schema": "g1-reach-pack",
@@ -377,6 +391,11 @@ def write_reach_pack(
             "total_reaches": len(artifact.range_starts),
             "source_names": list(artifact.source_names),
             "feature_dimension": 10,
+            "paired_returns": int(np.sum(stops - contact_frames - 1 > 0)),
+            "unavailable_returns": int(np.sum(stops - contact_frames - 1 == 0)),
+            "return_frame_count": int(np.sum(stops - contact_frames - 1)),
+            "minimum_return_frames": int(np.min(stops - contact_frames - 1)),
+            "maximum_return_frames": int(np.max(stops - contact_frames - 1)),
             "reach_database_sha256": _sha256(temporary / "reach_database.bin"),
             "reach_features_sha256": _sha256(temporary / "reach_features.bin"),
         })
@@ -417,7 +436,10 @@ def read_reach_pack(
     artifact = _read_database(database_path)
     features = _read_features(feature_path)
     features.validate(len(artifact.range_starts))
-    if manifest.get("schema") != "g1-reach-pack" or manifest.get("version") != 1:
+    if (
+        manifest.get("schema") != "g1-reach-pack"
+        or manifest.get("version") != VERSION
+    ):
         raise ValueError("unsupported reach pack manifest")
     if manifest.get("frame_count") != len(artifact.positions):
         raise ValueError("reach manifest frame count mismatch")
@@ -435,11 +457,22 @@ def read_reach_pack(
         raise ValueError("reach manifest captured reach count mismatch")
     if manifest.get("mirrored_reaches") != mirrored:
         raise ValueError("reach manifest mirrored reach count mismatch")
+    return_frames = artifact.range_stops - artifact.contact_frames - 1
+    return_metadata = {
+        "paired_returns": int(np.sum(return_frames > 0)),
+        "unavailable_returns": int(np.sum(return_frames == 0)),
+        "return_frame_count": int(np.sum(return_frames)),
+        "minimum_return_frames": int(np.min(return_frames)),
+        "maximum_return_frames": int(np.max(return_frames)),
+    }
+    for field, expected in return_metadata.items():
+        if manifest.get(field) != expected:
+            raise ValueError(f"reach manifest {field} mismatch")
     expected_features = np.concatenate((
         artifact.endpoint_positions,
         artifact.approach_directions,
         artifact.endpoint_rotations,
     ), axis=1)
-    if not np.array_equal(features.values, expected_features):
+    if features.values.tobytes() != expected_features.tobytes():
         raise ValueError("reach feature values do not match database endpoints")
     return artifact, features, manifest

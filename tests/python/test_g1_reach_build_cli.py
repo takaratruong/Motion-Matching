@@ -72,6 +72,28 @@ class ReachBuildCLITests(unittest.TestCase):
             self.assertEqual(manifest["rejected_annotations"], 0)
             self.assertEqual(manifest["captured_reaches"], 1)
             self.assertEqual(manifest["mirrored_reaches"], 1)
+            self.assertEqual(manifest["paired_returns"], 2)
+            self.assertEqual(manifest["unavailable_returns"], 0)
+            self.assertEqual(
+                manifest["return_frame_count"],
+                int((artifact.range_stops - artifact.contact_frames - 1).sum()),
+            )
+            self.assertEqual(
+                manifest["minimum_return_frames"],
+                int((artifact.range_stops - artifact.contact_frames - 1).min()),
+            )
+            self.assertEqual(
+                manifest["maximum_return_frames"],
+                int((artifact.range_stops - artifact.contact_frames - 1).max()),
+            )
+            self.assertEqual(
+                [record["contact_index"] for record in manifest["reach_records"]],
+                [30, 30],
+            )
+            self.assertEqual(
+                [record["return_available"] for record in manifest["reach_records"]],
+                [True, True],
+            )
 
 
 if __name__ == "__main__":

@@ -39,9 +39,12 @@ def run(args: argparse.Namespace) -> int:
         return 1
     write_reach_pack(args.output, artifact, features, manifest)
     print(
-        f"BUILT reach-pack schema=1 captured={manifest['captured_reaches']} "
+        f"BUILT reach-pack schema={manifest['version']} captured={manifest['captured_reaches']} "
         f"mirrored={manifest['mirrored_reaches']} total={len(reaches)} "
-        f"frames={len(artifact.positions)} pending={pending} output={args.output}"
+        f"frames={len(artifact.positions)} paired_returns={manifest['paired_returns']} "
+        f"unavailable_returns={manifest['unavailable_returns']} "
+        f"return_frames={manifest['return_frame_count']} pending={pending} "
+        f"output={args.output}"
     )
     return 0
 

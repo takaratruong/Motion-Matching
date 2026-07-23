@@ -1,5 +1,7 @@
+import numpy as np
+
 from .annotations import AnnotationDocument
-from .artifacts import ReachArtifact, ReachFeatures, assemble_reach_pack
+from .artifacts import VERSION, ReachArtifact, ReachFeatures, assemble_reach_pack
 from .mirror import build_bilateral_reaches
 from .motions import CanonicalReach, build_captured_reach
 from .schema import ReviewCorpus
@@ -24,9 +26,16 @@ def prepare_reach_pack(
     rejected = sum(
         annotation.status == "rejected" for annotation in annotations.annotations
     )
+    return_frames = artifact.range_stops - artifact.contact_frames - 1
     manifest = {
+        "version": VERSION,
         "captured_reaches": len(captured),
         "mirrored_reaches": len(captured),
+        "paired_returns": int(np.sum(return_frames > 0)),
+        "unavailable_returns": int(np.sum(return_frames == 0)),
+        "return_frame_count": int(np.sum(return_frames)),
+        "minimum_return_frames": int(np.min(return_frames)),
+        "maximum_return_frames": int(np.max(return_frames)),
         "pending_annotations": pending,
         "rejected_annotations": rejected,
         "excluded_sequence_ids": list(corpus.excluded_sequence_ids),
@@ -40,9 +49,10 @@ def prepare_reach_pack(
                 "sequence_id": reach.sequence_id,
                 "active_hand": int(reach.active_hand),
                 "augmentation": int(reach.augmentation),
+                "contact_index": reach.contact_index,
+                "return_available": bool(reach.return_available),
             }
             for reach in reaches
         ],
     }
     return reaches, artifact, features, manifest
-
