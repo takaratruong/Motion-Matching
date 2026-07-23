@@ -3,6 +3,10 @@ from dataclasses import dataclass
 import numpy as np
 
 
+class ReturnUnavailableError(ValueError):
+    """Raised when a bounded trace has no stable retracted return."""
+
+
 @dataclass(frozen=True)
 class ReturnSegmentationConfig:
     fps: float = 25.0
@@ -44,7 +48,7 @@ def find_return_stop(
         raise ValueError("return segmentation window is invalid")
     search_stop = min(len(trace), grab_frame + maximum_return_frames + 1)
     if search_stop - (grab_frame + 1) < stable_frames:
-        raise ValueError("no paired return stable window exists")
+        raise ReturnUnavailableError("no paired return stable window exists")
 
     speeds = np.empty(len(trace), np.float64)
     speeds[0] = np.inf
@@ -68,5 +72,5 @@ def find_return_stop(
             best_distance = distance
             best_stop = stop
     if best_stop is None:
-        raise ValueError("no paired return stable window exists")
+        raise ReturnUnavailableError("no paired return stable window exists")
     return best_stop

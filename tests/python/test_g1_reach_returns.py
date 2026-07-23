@@ -2,7 +2,10 @@ import unittest
 
 import numpy as np
 
-from resources.g1_reach_builder.returns import find_return_stop
+from resources.g1_reach_builder.returns import (
+    ReturnUnavailableError,
+    find_return_stop,
+)
 
 
 def synthetic_reach(
@@ -39,8 +42,12 @@ class PairedReturnSegmentationTest(unittest.TestCase):
         trace = np.zeros((80, 3), np.float64)
         trace[20:, 0] = 0.45
 
-        with self.assertRaisesRegex(ValueError, "paired return"):
+        with self.assertRaisesRegex(ReturnUnavailableError, "paired return"):
             find_return_stop(trace, 0, 20)
+
+    def test_rejects_invalid_trace_without_return_unavailable(self):
+        with self.assertRaisesRegex(ValueError, "shape"):
+            find_return_stop(np.zeros((80, 2), np.float64), 0, 20)
 
 
 if __name__ == "__main__":

@@ -130,6 +130,8 @@ def mirror_reach(
         ),
         foot_contacts=source.foot_contacts[:, ::-1].copy(),
         source_frames=source.source_frames.copy(),
+        contact_index=source.contact_index,
+        return_available=source.return_available,
         endpoint_position_root=endpoint_position.astype(np.float32),
         endpoint_rotation_root_wxyz=holden_quat.normalize(
             endpoint_rotation
@@ -152,4 +154,3 @@ def build_bilateral_reaches(
             raise ValueError("bilateral builder accepts captured reaches only")
         result.extend((reach, mirror_reach(reach)))
     return result
-

@@ -15,12 +15,9 @@ from resources.g1_terrain_builder.kinematics import (
 )
 
 from .annotations import ReachAnnotation
-from .returns import find_return_stop
+from .returns import ReturnUnavailableError, find_return_stop
 from .schema import ReviewCorpus
 from .segmentation import outbound_approach_delta
-
-
-_RETURN_UNAVAILABLE_PROPOSAL_ID = "pickup_north_1:cfdcdaa4db704be8"
 
 
 class ReachHand(IntEnum):
@@ -246,12 +243,7 @@ def build_captured_reach(
             annotation.grab_frame,
         )
         return_available = True
-    except ValueError as error:
-        if (
-            annotation.proposal_id != _RETURN_UNAVAILABLE_PROPOSAL_ID
-            or str(error) != "no paired return stable window exists"
-        ):
-            raise
+    except ReturnUnavailableError:
         retained_stop = annotation.grab_frame + 1
         return_available = False
     stop = source_start + retained_stop

@@ -28,6 +28,8 @@ class ReachMirrorTests(unittest.TestCase):
         self.assertEqual(right.augmentation, ReachAugmentation.MIRRORED)
         self.assertEqual(right.original_reach_id, left.reach_id)
         self.assertEqual(right.source_frames.tolist(), left.source_frames.tolist())
+        self.assertEqual(right.contact_index, left.contact_index)
+        self.assertEqual(right.return_available, left.return_available)
         np.testing.assert_allclose(
             right.endpoint_position_root,
             np.asarray(left.endpoint_position_root) * [1, 1, -1],

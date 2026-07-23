@@ -132,6 +132,20 @@ class CapturedReachTests(unittest.TestCase):
             reach.approach_direction_root, [1.0, 0.0, 0.0], atol=1e-6
         )
 
+    def test_marks_missing_return_unavailable(self):
+        corpus = motion_corpus()
+        corpus.positions[:, 23, 0] = 0.0
+        corpus.positions[10:31, 23, 0] = np.linspace(0.0, 0.45, 21)
+        corpus.positions[31:, 23, 0] = 0.45
+
+        reach = build_captured_reach(
+            corpus, accepted_annotation(departure=10, grab=30)
+        )
+
+        self.assertFalse(reach.return_available)
+        self.assertEqual(reach.contact_index, reach.frame_count - 1)
+        self.assertEqual(reach.source_frames[-1], 30)
+
 
 class CapturedReviewCorpusTests(unittest.TestCase):
     def test_all_accepted_reaches_have_paired_returns(self):
