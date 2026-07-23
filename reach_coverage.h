@@ -18,15 +18,16 @@ struct Query {
 
 struct CoverageConfig {
     float maximum_request_position_m = 0.45F;
-    float accepted_position_m = 0.04F;
+    float accepted_position_m = 0.001F;
     float accepted_approach_radians = 0.261799388F;
     float accepted_orientation_radians = 1.047197551F;
-    size_t maximum_candidates = 4096U;
+    size_t maximum_candidates = 8192U;
 };
 
 struct Candidate {
     size_t clip = 0U;
-    float source_position_error_m = 0.0F;
+    uint8_t yaw_index = 0U;
+    float yaw_radians = 0.0F;
     float source_approach_error_radians = 0.0F;
     float cost = 0.0F;
 };
@@ -54,6 +55,7 @@ struct Evaluation {
     float position_error_m = 0.0F;
     float approach_error_radians = 0.0F;
     float orientation_error_radians = 0.0F;
+    float active_arm_deformation = 0.0F;
     size_t collision_sample = 0U;
 };
 
@@ -65,6 +67,8 @@ struct Diagnostics {
     std::array<size_t, 2U> hand_evaluations{};
     std::array<size_t, 2U> augmentation_evaluations{};
 };
+
+std::vector<Candidate> enumerate_candidates(const Pack& pack);
 
 std::vector<Candidate> select_candidates(
     const Pack& pack,

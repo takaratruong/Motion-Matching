@@ -145,6 +145,64 @@ reach::Pack fixture(
     return pack;
 }
 
+reach::Pack bilateral_fixture() {
+    constexpr size_t frames_per_clip = 20U;
+    reach::Pack pack = fixture(frames_per_clip);
+    reach::Database& database = pack.database;
+    const int32_t right_start = static_cast<int32_t>(frames_per_clip);
+    for (size_t frame = 0U; frame < frames_per_clip; ++frame) {
+        append_pose(database, base_pose(0.02F * static_cast<float>(frame)));
+        database.source_frames.push_back(static_cast<int32_t>(200 + frame));
+    }
+    database.frame_count = static_cast<uint32_t>(2U * frames_per_clip);
+    database.clip_count = 2U;
+    database.range_starts.push_back(right_start);
+    database.range_stops.push_back(
+        right_start + static_cast<int32_t>(frames_per_clip));
+    database.active_hands = {0U, 1U};
+    database.augmentations = {0U, 1U};
+    database.source_indices = {0U, 0U};
+    database.original_indices = {-1, 0};
+
+    const interaction::WorldPose right_final = interaction::world_pose(
+        reach::pose_at_frame(
+            database, right_start + static_cast<int32_t>(frames_per_clip - 1U)));
+    const interaction::WorldPose right_approach = interaction::world_pose(
+        reach::pose_at_frame(
+            database, right_start + static_cast<int32_t>(frames_per_clip - 6U)));
+    const size_t wrist = static_cast<size_t>(g1_skeleton::RightWrist);
+    const vec3 approach = normalize(
+        right_final.positions[wrist] - right_approach.positions[wrist]);
+    database.endpoint_positions.insert(database.endpoint_positions.end(), {
+        right_final.positions[wrist].x,
+        right_final.positions[wrist].y,
+        right_final.positions[wrist].z,
+    });
+    database.endpoint_rotations.insert(database.endpoint_rotations.end(), {
+        right_final.rotations[wrist].w,
+        right_final.rotations[wrist].x,
+        right_final.rotations[wrist].y,
+        right_final.rotations[wrist].z,
+    });
+    database.approach_directions.insert(database.approach_directions.end(), {
+        approach.x, approach.y, approach.z,
+    });
+    pack.features.clip_count = 2U;
+    pack.features.values.insert(pack.features.values.end(), {
+        right_final.positions[wrist].x,
+        right_final.positions[wrist].y,
+        right_final.positions[wrist].z,
+        approach.x,
+        approach.y,
+        approach.z,
+        right_final.rotations[wrist].w,
+        right_final.rotations[wrist].x,
+        right_final.rotations[wrist].y,
+        right_final.rotations[wrist].z,
+    });
+    return pack;
+}
+
 reach::Query zero_query(const reach::Pack& pack) {
     reach::Query query{};
     query.hand = reach::Hand::Left;
@@ -162,16 +220,20 @@ std::vector<size_t> clip_set(const std::vector<reach::Candidate>& candidates) {
     return clips;
 }
 
-void test_retrieval_is_same_hand_spatial_and_wrist_orientation_independent() {
+void test_retrieval_is_same_hand_and_query_pose_independent() {
     const reach::Pack pack = fixture();
     reach::Query query = zero_query(pack);
     auto candidates = reach::select_candidates(pack, query);
-    assert(candidates.size() == 1U && candidates[0].clip == 0U);
+    assert(candidates.size() == reach::kYawPlacementCount);
+    for (const reach::Candidate& candidate : candidates) {
+        assert(candidate.clip == 0U);
+    }
 
     query.target.rotation = quat_mul(
         quat_from_angle_axis(3.14159265F, vec3(0, 1, 0)),
         query.target.rotation);
-    assert(reach::select_candidates(pack, query).size() == 1U);
+    assert(reach::select_candidates(pack, query).size() ==
+           reach::kYawPlacementCount);
 
     query = zero_query(pack);
     const std::vector<size_t> baseline = clip_set(
@@ -185,8 +247,9 @@ void test_retrieval_is_same_hand_spatial_and_wrist_orientation_independent() {
     query.hand = reach::Hand::Right;
     assert(reach::select_candidates(pack, query).empty());
     query = zero_query(pack);
-    query.target.position.x += 0.451F;
-    assert(reach::select_candidates(pack, query).empty());
+    query.target.position = query.target.position + vec3(3.0F, -1.0F, 2.0F);
+    assert(reach::select_candidates(pack, query).size() ==
+           reach::kYawPlacementCount);
 }
 
 void test_one_reach_warps_to_a_different_approach_direction() {
@@ -204,8 +267,9 @@ void test_one_reach_warps_to_a_different_approach_direction() {
     assert(result.rejection == reach::Rejection::None);
     assert(result.approach_error_radians <= 0.261799388F);
     for (size_t frame = 0U; frame < result.poses.size(); ++frame) {
-        const interaction::Pose source = reach::pose_at_frame(
-            pack.database, static_cast<int32_t>(frame));
+        const interaction::Pose source = reach::place_pose(
+            pack, candidate.clip, candidate.yaw_index,
+            query.target.position, static_cast<int32_t>(frame));
         const size_t root = static_cast<size_t>(g1_skeleton::Simulation);
         assert(result.poses[frame].positions[root].x ==
                source.positions[root].x);
@@ -248,9 +312,12 @@ void test_short_reach_keeps_its_initial_pose_unwarped() {
         quat_from_angle_axis(0.523598776F, vec3(0, 1, 0)),
         query.approach_world));
 
+    const reach::Candidate candidate = reach::select_candidates(pack, query)[0];
     const reach::Evaluation result = reach::shape_candidate(
-        pack, reach::select_candidates(pack, query)[0], query);
-    const interaction::Pose source = reach::pose_at_frame(pack.database, 0);
+        pack, candidate, query);
+    const interaction::Pose source = reach::place_pose(
+        pack, candidate.clip, candidate.yaw_index,
+        query.target.position, 0);
 
     for (const interaction::HingeJoint& joint : interaction::kLeftArm) {
         const size_t bone = static_cast<size_t>(joint.bone);
@@ -261,26 +328,18 @@ void test_short_reach_keeps_its_initial_pose_unwarped() {
     }
 }
 
-void test_small_translation_without_approach_warp_uses_public_tolerance() {
+void test_final_contact_always_uses_one_millimetre_gate() {
     const reach::Pack pack = fixture();
     reach::Query query = zero_query(pack);
     query.target.position.y += 0.01F;
 
     const reach::Evaluation result = reach::shape_candidate(
         pack, reach::select_candidates(pack, query)[0], query);
-    const interaction::Pose source = reach::pose_at_frame(pack.database, 5);
-
     assert(result.rejection == reach::Rejection::None);
-    for (const interaction::HingeJoint& joint : interaction::kLeftArm) {
-        const size_t bone = static_cast<size_t>(joint.bone);
-        assert(result.poses[5].rotations[bone].w == source.rotations[bone].w);
-        assert(result.poses[5].rotations[bone].x == source.rotations[bone].x);
-        assert(result.poses[5].rotations[bone].y == source.rotations[bone].y);
-        assert(result.poses[5].rotations[bone].z == source.rotations[bone].z);
-    }
+    assert(result.position_error_m <= 0.001F);
 }
 
-void test_retrieval_ranks_position_then_approach_then_clip() {
+void test_retrieval_keeps_every_clip_and_yaw_then_ranks_approach() {
     reach::Pack pack = fixture();
     const interaction::Transform endpoint =
         reach::endpoint_transform(pack.database, 0U);
@@ -304,10 +363,15 @@ void test_retrieval_ranks_position_then_approach_then_clip() {
     reach::Query query = zero_query(pack);
     query.target.position.x += 0.05F;
     const auto candidates = reach::select_candidates(pack, query);
-    assert(candidates.size() == 3U);
-    assert(candidates[0].clip == 0U);
-    assert(candidates[1].clip == 1U);
-    assert(candidates[2].clip == 2U);
+    assert(candidates.size() == 3U * reach::kYawPlacementCount);
+    std::array<size_t, 3U> per_clip{};
+    for (const reach::Candidate& candidate : candidates) {
+        ++per_clip.at(candidate.clip);
+    }
+    for (size_t count : per_clip) {
+        assert(count == reach::kYawPlacementCount);
+    }
+    assert(candidates.front().cost <= candidates.back().cost);
 }
 
 void test_zero_retarget_reproduces_endpoint_and_keeps_root_fixed() {
@@ -343,17 +407,16 @@ void test_zero_retarget_uses_pre_pause_approach_evidence() {
     assert(result.approach_error_radians <= 0.008726646F);
 }
 
-void test_unreachable_target_reports_a_specific_final_gate() {
+void test_arbitrary_target_is_placed_without_an_endpoint_envelope() {
     const reach::Pack pack = fixture();
     reach::Query query = zero_query(pack);
-    query.target.position.x += 0.40F;
+    query.target.position = query.target.position + vec3(3.0F, 1.0F, -2.0F);
     const auto candidates = reach::select_candidates(pack, query);
-    assert(candidates.size() == 1U);
+    assert(candidates.size() == reach::kYawPlacementCount);
     const reach::Evaluation result = reach::shape_candidate(
         pack, candidates[0], query);
-    assert(result.rejection == reach::Rejection::PositionError ||
-           result.rejection == reach::Rejection::ApproachAxisError ||
-           result.rejection == reach::Rejection::FullOrientationError);
+    assert(result.rejection == reach::Rejection::None);
+    assert(result.position_error_m <= 0.001F);
 }
 
 void test_position_and_rotation_perturbations_have_exclusive_outcomes() {
@@ -363,7 +426,7 @@ void test_position_and_rotation_perturbations_have_exclusive_outcomes() {
         reach::Query query = zero_query(pack);
         query.target.position.z += offset;
         const auto candidates = reach::select_candidates(pack, query);
-        assert(candidates.size() == 1U);
+        assert(candidates.size() == reach::kYawPlacementCount);
         const reach::Evaluation result = reach::shape_candidate(
             pack, candidates[0], query);
         assert(result.rejection != reach::Rejection::OutsideEnvelope);
@@ -435,8 +498,7 @@ void test_collision_observations_survive_an_earlier_kinematic_rejection() {
     query.approach_world = normalize(quat_mul_vec3(
         quat_from_angle_axis(0.523598776F, vec3(0, 1, 0)),
         query.approach_world));
-    const reach::Candidate candidate = reach::select_candidates(
-        pack, query)[0];
+    const reach::Candidate candidate{0U, 0U};
     reach::CoverageConfig strict{};
     strict.accepted_approach_radians = 0.01F;
     const interaction::OrientedBox far_object{
@@ -525,21 +587,60 @@ void test_contact_placement_translates_every_sample_rigidly() {
     }
 }
 
+void test_enumeration_is_bilateral_exhaustive_and_query_invariant() {
+    const reach::Pack pack = bilateral_fixture();
+    const auto candidates = reach::enumerate_candidates(pack);
+    assert(candidates.size() == 2U * reach::kYawPlacementCount);
+    for (size_t clip = 0U; clip < 2U; ++clip) {
+        for (uint8_t yaw = 0U; yaw < reach::kYawPlacementCount; ++yaw) {
+            const size_t index = clip * reach::kYawPlacementCount + yaw;
+            assert(candidates[index].clip == clip);
+            assert(candidates[index].yaw_index == yaw);
+        }
+    }
+}
+
+void test_shared_grasp_shapes_both_hands_at_every_yaw() {
+    const reach::Pack pack = bilateral_fixture();
+    reach::Query query{};
+    query.target.position = vec3(1.1F, 0.9F, -0.6F);
+    query.target.rotation = quat();
+    query.approach_world = normalize(vec3(-1, 0, 0));
+    bool saw_left = false;
+    bool saw_right = false;
+    for (const reach::Candidate& candidate : reach::enumerate_candidates(pack)) {
+        query.hand = static_cast<reach::Hand>(
+            pack.database.active_hands.at(candidate.clip));
+        saw_left = saw_left || query.hand == reach::Hand::Left;
+        saw_right = saw_right || query.hand == reach::Hand::Right;
+        const reach::Evaluation result = reach::shape_candidate(
+            pack, candidate, query);
+        assert(!result.poses.empty());
+        assert(result.rejection != reach::Rejection::OutsideEnvelope);
+        if (result.rejection == reach::Rejection::None) {
+            assert(result.position_error_m <= 0.001F);
+        }
+    }
+    assert(saw_left && saw_right);
+}
+
 }  // namespace
 
 int main() {
-    test_retrieval_is_same_hand_spatial_and_wrist_orientation_independent();
+    test_retrieval_is_same_hand_and_query_pose_independent();
     test_one_reach_warps_to_a_different_approach_direction();
     test_short_reach_keeps_its_initial_pose_unwarped();
-    test_small_translation_without_approach_warp_uses_public_tolerance();
-    test_retrieval_ranks_position_then_approach_then_clip();
+    test_final_contact_always_uses_one_millimetre_gate();
+    test_retrieval_keeps_every_clip_and_yaw_then_ranks_approach();
     test_zero_retarget_reproduces_endpoint_and_keeps_root_fixed();
     test_zero_retarget_uses_pre_pause_approach_evidence();
-    test_unreachable_target_reports_a_specific_final_gate();
+    test_arbitrary_target_is_placed_without_an_endpoint_envelope();
     test_position_and_rotation_perturbations_have_exclusive_outcomes();
     test_collision_stages_and_active_contact_exemption();
     test_collision_observations_survive_an_earlier_kinematic_rejection();
     test_diagnostics_separate_hand_and_augmentation_counts();
     test_contact_placement_is_exact_and_upright();
     test_contact_placement_translates_every_sample_rigidly();
+    test_enumeration_is_bilateral_exhaustive_and_query_invariant();
+    test_shared_grasp_shapes_both_hands_at_every_yaw();
 }

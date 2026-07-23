@@ -1,6 +1,8 @@
 #include "reach_coverage.h"
 
+#include "g1_arm_joint_metadata.h"
 #include "g1_skeleton.h"
+#include "reach_placement.h"
 
 #include <algorithm>
 #include <cmath>
@@ -48,6 +50,12 @@ interaction::Hand interaction_hand(Hand hand) {
     return hand == Hand::Left
         ? interaction::Hand::Left
         : interaction::Hand::Right;
+}
+
+const std::array<interaction::HingeJoint, 7U>& arm_metadata(Hand hand) {
+    return hand == Hand::Left
+        ? interaction::kLeftArm
+        : interaction::kRightArm;
 }
 
 size_t wrist_bone(Hand hand) {
@@ -170,6 +178,24 @@ void assign_final_errors(
 
 }  // namespace
 
+std::vector<Candidate> enumerate_candidates(const Pack& pack) {
+    std::vector<Candidate> candidates;
+    candidates.reserve(
+        static_cast<size_t>(pack.database.clip_count) * kYawPlacementCount);
+    for (size_t clip = 0U; clip < pack.database.clip_count; ++clip) {
+        for (uint8_t yaw = 0U; yaw < kYawPlacementCount; ++yaw) {
+            candidates.push_back({
+                clip,
+                yaw,
+                placement_yaw(yaw),
+                0.0F,
+                0.0F,
+            });
+        }
+    }
+    return candidates;
+}
+
 std::vector<Candidate> select_candidates(
     const Pack& pack,
     const Query& query,
@@ -181,47 +207,36 @@ std::vector<Candidate> select_candidates(
     }
     const vec3 requested_approach = normalize(query.approach_world);
     candidates.reserve(std::min(
-        static_cast<size_t>(pack.database.clip_count),
+        static_cast<size_t>(pack.database.clip_count) * kYawPlacementCount,
         config.maximum_candidates));
-    for (size_t clip = 0U; clip < pack.database.clip_count; ++clip) {
-        if (pack.database.active_hands.at(clip) !=
+    for (Candidate candidate : enumerate_candidates(pack)) {
+        if (pack.database.active_hands.at(candidate.clip) !=
             static_cast<uint8_t>(query.hand)) {
             continue;
         }
-        const interaction::Transform endpoint = endpoint_transform(
-            pack.database, clip);
-        const float position_error = length(
-            endpoint.position - query.target.position);
-        if (!finite(position_error) ||
-            position_error > config.maximum_request_position_m) {
-            continue;
-        }
         const float approach_error = direction_angle(
-            approach_direction(pack.database, clip), requested_approach);
+            place_direction(
+                approach_direction(pack.database, candidate.clip),
+                candidate.yaw_index),
+            requested_approach);
         if (!finite(approach_error)) {
             continue;
         }
-        candidates.push_back({
-            clip,
-            position_error,
-            approach_error,
-            position_error + 0.05F * approach_error,
-        });
+        candidate.source_approach_error_radians = approach_error;
+        candidate.cost = approach_error;
+        candidates.push_back(candidate);
     }
     std::stable_sort(
         candidates.begin(), candidates.end(),
         [](const Candidate& left, const Candidate& right) {
             if (left.cost != right.cost) return left.cost < right.cost;
-            if (left.source_position_error_m != right.source_position_error_m) {
-                return left.source_position_error_m <
-                       right.source_position_error_m;
-            }
             if (left.source_approach_error_radians !=
                 right.source_approach_error_radians) {
                 return left.source_approach_error_radians <
                        right.source_approach_error_radians;
             }
-            return left.clip < right.clip;
+            if (left.clip != right.clip) return left.clip < right.clip;
+            return left.yaw_index < right.yaw_index;
         });
     if (candidates.size() > config.maximum_candidates) {
         candidates.resize(config.maximum_candidates);
@@ -238,16 +253,10 @@ Evaluation shape_candidate(
     evaluation.candidate = candidate;
     if (!valid_query(query) || !valid_config(config) ||
         candidate.clip >= pack.database.clip_count ||
+        candidate.yaw_index >= kYawPlacementCount ||
         pack.database.active_hands.at(candidate.clip) !=
             static_cast<uint8_t>(query.hand)) {
         evaluation.rejection = Rejection::InvalidSolver;
-        return evaluation;
-    }
-    const interaction::Transform source_endpoint = endpoint_transform(
-        pack.database, candidate.clip);
-    if (length(query.target.position - source_endpoint.position) >
-        config.maximum_request_position_m) {
-        evaluation.rejection = Rejection::OutsideEnvelope;
         return evaluation;
     }
     const int32_t start = pack.database.range_starts.at(candidate.clip);
@@ -259,16 +268,23 @@ Evaluation shape_candidate(
     }
     const size_t frame_count = static_cast<size_t>(stop - start);
     evaluation.poses.reserve(frame_count);
-    const vec3 endpoint_offset =
-        query.target.position - source_endpoint.position;
-    const vec3 source_approach = approach_direction(
-        pack.database, candidate.clip);
+    const vec3 source_approach = place_direction(
+        approach_direction(pack.database, candidate.clip),
+        candidate.yaw_index);
     const quat approach_alignment = direction_alignment(
         source_approach, query.approach_world);
     const bool warps_approach =
         direction_angle(source_approach, query.approach_world) > 1.0e-6F;
+    const interaction::Pose placed_final_pose = place_pose(
+        pack,
+        candidate.clip,
+        candidate.yaw_index,
+        query.target.position,
+        stop - 1);
+    const interaction::Transform placed_endpoint = hand_transform(
+        placed_final_pose, query.hand);
     const quat correction = quat_mul(
-        query.target.rotation, quat_inv(source_endpoint.rotation));
+        query.target.rotation, quat_inv(placed_endpoint.rotation));
     const size_t aligned_sample = frame_count > 6U
         ? frame_count - 6U
         : 0U;
@@ -278,7 +294,7 @@ Evaluation shape_candidate(
     const interaction::IKConfig ik_config{
         0.45F,
         kPi,
-        config.accepted_position_m,
+        0.04F,
         config.accepted_orientation_radians,
         0.05F,
         0.001F,
@@ -287,9 +303,14 @@ Evaluation shape_candidate(
         20,
     };
     for (size_t sample = 0U; sample < frame_count; ++sample) {
-        interaction::Pose pose = pose_at_frame(
-            pack.database, start + static_cast<int32_t>(sample));
-        const interaction::Transform source_hand = hand_transform(
+        interaction::Pose pose = place_pose(
+            pack,
+            candidate.clip,
+            candidate.yaw_index,
+            query.target.position,
+            start + static_cast<int32_t>(sample));
+        const interaction::Pose placed_pose = pose;
+        const interaction::Transform placed_hand = hand_transform(
             pose, query.hand);
         const float u = frame_count == 1U
             ? 1.0F
@@ -304,19 +325,19 @@ Evaluation shape_candidate(
                       static_cast<float>(aligned_sample - ramp_start));
         const float approach_weight = smoothstep(approach_u);
         const vec3 relative =
-            source_hand.position - source_endpoint.position;
+            placed_hand.position - query.target.position;
         const vec3 rotated = quat_mul_vec3(approach_alignment, relative);
         const interaction::Transform desired{
-            source_hand.position + translation_weight * endpoint_offset +
-                approach_weight * (rotated - relative),
+            placed_hand.position + approach_weight * (rotated - relative),
             quat_mul(
                 quat_nlerp_shortest(quat(), correction, translation_weight),
-                source_hand.rotation),
+                placed_hand.rotation),
         };
         interaction::IKConfig sample_ik_config = ik_config;
-        if (warps_approach && approach_weight > 0.0F) {
-            sample_ik_config.accepted_position_m = std::min(
-                sample_ik_config.accepted_position_m, 0.001F);
+        if ((warps_approach && approach_weight > 0.0F) ||
+            sample + 1U == frame_count) {
+            sample_ik_config.accepted_position_m =
+                config.accepted_position_m;
         }
         const interaction::IKResult ik = interaction::solve_hand_ik(
             pose, interaction_hand(query.hand), desired, sample_ik_config);
@@ -329,12 +350,22 @@ Evaluation shape_candidate(
             evaluation.poses.clear();
             return evaluation;
         }
+        for (const interaction::HingeJoint& joint :
+             arm_metadata(query.hand)) {
+            const size_t bone = static_cast<size_t>(joint.bone);
+            const float angle = rotation_angle(
+                placed_pose.rotations[bone], pose.rotations[bone]);
+            evaluation.active_arm_deformation += angle * angle;
+        }
         evaluation.poses.push_back(std::move(pose));
     }
+    evaluation.active_arm_deformation /= static_cast<float>(
+        frame_count * arm_metadata(query.hand).size());
     assign_final_errors(evaluation, query);
     if (!finite(evaluation.position_error_m) ||
         !finite(evaluation.approach_error_radians) ||
-        !finite(evaluation.orientation_error_radians)) {
+        !finite(evaluation.orientation_error_radians) ||
+        !finite(evaluation.active_arm_deformation)) {
         evaluation.rejection = Rejection::InvalidSolver;
     } else if (evaluation.position_error_m > config.accepted_position_m) {
         evaluation.rejection = Rejection::PositionError;
