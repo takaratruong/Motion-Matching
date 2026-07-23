@@ -15,6 +15,7 @@ namespace {
 
 constexpr float kPi = 3.14159265358979323846F;
 constexpr float kPostureCorrectionSeconds = 0.6F;
+constexpr size_t kLockedApproachIntervals = 5U;
 
 bool finite(float value) {
     return std::isfinite(value);
@@ -332,6 +333,14 @@ Evaluation shape_candidate(
             correction_intervals
         ? available_intervals - correction_intervals
         : 0U;
+    const size_t aligned_sample = available_intervals >
+            kLockedApproachIntervals
+        ? available_intervals - kLockedApproachIntervals
+        : available_intervals;
+    if (requires_correction && aligned_sample <= correction_start) {
+        evaluation.rejection = Rejection::PositionError;
+        return evaluation;
+    }
     interaction::PostureIKConfig posture_config{};
     posture_config.accepted_position_m = config.accepted_position_m;
     posture_config.accepted_orientation_radians =
@@ -353,9 +362,11 @@ Evaluation shape_candidate(
             pose, query.hand);
         const float correction_u = sample <= correction_start
             ? 0.0F
-            : static_cast<float>(sample - correction_start) /
-                  static_cast<float>(
-                      available_intervals - correction_start);
+            : (sample >= aligned_sample
+                ? 1.0F
+                : static_cast<float>(sample - correction_start) /
+                      static_cast<float>(
+                          aligned_sample - correction_start));
         const float correction_weight = smoothstep(correction_u);
         const vec3 translated_position =
             placed_hand.position + correction_weight * contact_offset;
@@ -386,7 +397,7 @@ Evaluation shape_candidate(
         interaction::PostureIKResult ik{};
         ik.joint_angles = source_angles;
         if (requires_correction && correction_weight > 0.0F) {
-            ik = interaction::solve_hand_posture_ik(
+            ik = interaction::solve_hand_posture_ik_task_priority(
                 pose,
                 hand,
                 desired,

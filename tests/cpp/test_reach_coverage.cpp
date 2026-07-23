@@ -340,6 +340,20 @@ void test_final_contact_uses_posture_window_and_one_millimetre_gate() {
         const interaction::Pose placed = reach::place_pose(
             pack, 0U, 0U, query.target.position,
             static_cast<int32_t>(sample));
+        assert(result.poses[sample].positions[root].x ==
+               placed.positions[root].x);
+        assert(result.poses[sample].positions[root].y ==
+               placed.positions[root].y);
+        assert(result.poses[sample].positions[root].z ==
+               placed.positions[root].z);
+        assert(result.poses[sample].rotations[root].w ==
+               placed.rotations[root].w);
+        assert(result.poses[sample].rotations[root].x ==
+               placed.rotations[root].x);
+        assert(result.poses[sample].rotations[root].y ==
+               placed.rotations[root].y);
+        assert(result.poses[sample].rotations[root].z ==
+               placed.rotations[root].z);
         if (sample <= correction_start) {
             for (size_t bone = 0U;
                  bone < g1_skeleton::BoneCount;
@@ -360,11 +374,14 @@ void test_final_contact_uses_posture_window_and_one_millimetre_gate() {
                        placed.rotations[bone].z);
             }
         }
+        constexpr size_t aligned_sample = 14U;
         const float u = sample <= correction_start
             ? 0.0F
-            : static_cast<float>(sample - correction_start) /
-                  static_cast<float>(
-                      result.poses.size() - 1U - correction_start);
+            : (sample >= aligned_sample
+                ? 1.0F
+                : static_cast<float>(sample - correction_start) /
+                      static_cast<float>(
+                          aligned_sample - correction_start));
         const float weight = u * u * (3.0F - 2.0F * u);
         const float desired_y = interaction::world_pose(placed)
                                     .positions[wrist].y +
@@ -373,6 +390,35 @@ void test_final_contact_uses_posture_window_and_one_millimetre_gate() {
                                      .positions[wrist].y;
         assert(std::abs(achieved_y - desired_y) <= 0.001F);
     }
+}
+
+void test_final_five_frames_lock_to_requested_approach() {
+    const reach::Pack pack = fixture(25U);
+    reach::Query query = zero_query(pack);
+    query.approach_world = normalize(quat_mul_vec3(
+        quat_from_angle_axis(
+            1.570796327F, vec3(0.0F, 1.0F, 0.0F)),
+        query.approach_world));
+    const reach::Candidate candidate =
+        reach::select_candidates(pack, query).front();
+
+    const reach::Evaluation result =
+        reach::shape_candidate(pack, candidate, query);
+
+    assert(!result.poses.empty());
+    const size_t final_sample = result.poses.size() - 1U;
+    const interaction::WorldPose start =
+        interaction::world_pose(result.poses[final_sample - 5U]);
+    const interaction::WorldPose finish =
+        interaction::world_pose(result.poses[final_sample]);
+    const vec3 measured = normalize(
+        finish.positions[g1_skeleton::LeftWrist] -
+        start.positions[g1_skeleton::LeftWrist]);
+    const float error = std::acos(std::clamp(
+        dot(measured, normalize(query.approach_world)),
+        -1.0F,
+        1.0F));
+    assert(error <= 0.008726646F);
 }
 
 void test_short_clip_rejects_height_retarget_without_a_safe_ramp() {
@@ -701,6 +747,7 @@ int main() {
     test_one_reach_warps_to_a_different_approach_direction();
     test_short_reach_rejects_approach_retarget_without_safe_ramp();
     test_final_contact_uses_posture_window_and_one_millimetre_gate();
+    test_final_five_frames_lock_to_requested_approach();
     test_short_clip_rejects_height_retarget_without_a_safe_ramp();
     test_retrieval_keeps_every_clip_and_yaw_then_ranks_approach();
     test_zero_retarget_reproduces_endpoint_and_keeps_root_fixed();
