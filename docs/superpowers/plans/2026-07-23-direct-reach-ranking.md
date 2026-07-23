@@ -90,7 +90,7 @@ Call the test from `main()`.
 Run:
 
 ```bash
-make build/cpp-tests/test_reach_coverage
+make build/tests/test_reach_coverage
 ```
 
 Expected: compilation fails because `WristPathQuality` and
@@ -153,8 +153,8 @@ WristPathQuality measure_wrist_path_quality(
 Run:
 
 ```bash
-make build/cpp-tests/test_reach_coverage &&
-./build/cpp-tests/test_reach_coverage
+make build/tests/test_reach_coverage &&
+./build/tests/test_reach_coverage
 ```
 
 Expected: build succeeds and the binary exits 0.
@@ -226,7 +226,7 @@ Call the ranking test from `main()`.
 Run:
 
 ```bash
-make build/cpp-tests/test_reach_search
+make build/tests/test_reach_search
 ```
 
 Expected: compilation fails because the evaluation fields and comparator do
@@ -309,10 +309,10 @@ three new metrics.
 Run:
 
 ```bash
-make build/cpp-tests/test_reach_coverage \
-  build/cpp-tests/test_reach_search &&
-./build/cpp-tests/test_reach_coverage &&
-./build/cpp-tests/test_reach_search
+make build/tests/test_reach_coverage \
+  build/tests/test_reach_search &&
+./build/tests/test_reach_coverage &&
+./build/tests/test_reach_search
 ```
 
 Expected: both binaries exit 0.
@@ -362,15 +362,15 @@ Run:
 
 ```bash
 python3 -m unittest tests.python.test_g1_reach_coverage_viewer -v
-make build/cpp-tests/test_reach_coverage \
-  build/cpp-tests/test_reach_search \
-  build/cpp-tests/test_interaction_posture_ik \
-  build/cpp-tests/test_interaction_hand_trajectories \
+make build/tests/test_reach_coverage \
+  build/tests/test_reach_search \
+  build/tests/test_interaction_posture_ik \
+  build/tests/test_interaction_hand_trajectories \
   g1_reach_coverage_probe g1_reach_coverage_viewer
-./build/cpp-tests/test_reach_coverage
-./build/cpp-tests/test_reach_search
-./build/cpp-tests/test_interaction_posture_ik
-./build/cpp-tests/test_interaction_hand_trajectories
+./build/tests/test_reach_coverage
+./build/tests/test_reach_search
+./build/tests/test_interaction_posture_ik
+./build/tests/test_interaction_hand_trajectories
 ```
 
 Expected: 12 Python viewer tests pass, all C++ binaries exit 0, and both
