@@ -2,6 +2,7 @@
 #include "reach_search.h"
 #include "raylib.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdlib>
@@ -16,6 +17,10 @@ namespace {
 
 constexpr float kPi = 3.14159265358979323846F;
 constexpr float kWristContactOffset = 0.04F;
+constexpr float kTableTop = 0.65F;
+constexpr float kTableThickness = 0.06F;
+constexpr float kTableCenterY = 0.62F;
+constexpr vec3 kTableDimensions(1.20F, kTableThickness, 0.75F);
 constexpr const char* kCapturedLabel = "CAPTURED LEFT";
 constexpr const char* kMirroredLabel = "MIRRORED RIGHT";
 
@@ -30,8 +35,51 @@ struct ViewDiagnostics {
     size_t joint_limit_saturated = 0U;
 };
 
+struct OrbitCameraState {
+    vec3 target{0.0F, 0.70F, 0.0F};
+    float azimuth = -0.80F;
+    float altitude = 0.32F;
+    float distance = 3.50F;
+};
+
 Vector3 ray(vec3 value) {
     return {value.x, value.y, value.z};
+}
+
+void update_orbit_camera(
+    Camera3D& camera,
+    OrbitCameraState& state) {
+    const Vector2 mouse_delta = GetMouseDelta();
+    if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+        state.azimuth -= 0.006F * mouse_delta.x;
+        state.altitude = std::clamp(
+            state.altitude + 0.006F * mouse_delta.y,
+            -1.30F,
+            1.30F);
+    }
+    state.distance = std::clamp(
+        state.distance * std::exp(-0.16F * GetMouseWheelMove()),
+        0.60F,
+        8.0F);
+
+    const float cos_altitude = std::cos(state.altitude);
+    const vec3 offset_direction(
+        cos_altitude * std::cos(state.azimuth),
+        std::sin(state.altitude),
+        cos_altitude * std::sin(state.azimuth));
+    const vec3 forward = -offset_direction;
+    const vec3 world_up(0.0F, 1.0F, 0.0F);
+    const vec3 right = normalize(cross(forward, world_up));
+    const vec3 view_up = normalize(cross(right, forward));
+    if (IsMouseButtonDown(MOUSE_BUTTON_MIDDLE)) {
+        const float pan_scale = 0.0015F * state.distance;
+        state.target = state.target +
+            pan_scale * (mouse_delta.x * right + mouse_delta.y * view_up);
+    }
+    const vec3 position = state.target + state.distance * offset_direction;
+    camera.position = ray(position);
+    camera.target = ray(state.target);
+    camera.up = ray(world_up);
 }
 
 Options parse_options(int argc, char** argv) {
@@ -107,9 +155,8 @@ reach::ExhaustiveQuery make_query(
 }
 
 interaction::Transform reset_object(vec3 dimensions) {
-    constexpr float table_top = 0.77F;
     return {
-        vec3(0.0F, table_top + 0.5F * dimensions.y, 0.0F),
+        vec3(0.0F, kTableTop + 0.5F * dimensions.y, 0.0F),
         quat(),
     };
 }
@@ -407,11 +454,10 @@ int main(int argc, char** argv) {
         const Options options = parse_options(argc, argv);
         const reach::Pack pack = reach::load_pack(options.pack);
         const interaction::Transform table_world{
-            vec3(0.0F, 0.74F, 0.0F), quat()};
-        const vec3 table_dimensions(1.20F, 0.06F, 0.75F);
+            vec3(0.0F, kTableCenterY, 0.0F), quat()};
         const interaction::EnvironmentGeometry coverage =
             interaction::make_coverage_environment(
-                table_world, table_dimensions);
+                table_world, kTableDimensions);
         const interaction::EnvironmentGeometry open{};
         interaction::Transform object = reset_object(options.object_size);
         vec3 grasp_approach_local = reset_grasp_approach_local();
@@ -434,14 +480,14 @@ int main(int argc, char** argv) {
         InitWindow(1280, 800, "G1 contact-anchored reach coverage");
         SetTargetFPS(60);
         Camera3D camera{};
-        camera.position = Vector3{2.35F, 1.55F, -2.45F};
-        camera.target = Vector3{0.0F, 0.70F, 0.0F};
-        camera.up = Vector3{0.0F, 1.0F, 0.0F};
         camera.fovy = 45.0F;
         camera.projection = CAMERA_PERSPECTIVE;
+        OrbitCameraState camera_state{};
+        update_orbit_camera(camera, camera_state);
 
         while (!WindowShouldClose()) {
             const float dt = GetFrameTime();
+            update_orbit_camera(camera, camera_state);
             bool target_changed = false;
             const float move = 0.60F * dt;
             if (IsKeyDown(KEY_LEFT)) {

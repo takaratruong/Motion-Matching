@@ -70,6 +70,18 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
         ):
             self.assertIn(required, source)
 
+    def test_lowered_scene_and_mouse_camera_contract(self):
+        source = self.source(VIEWER)
+        for required in (
+            "kTableTop = 0.65F", "kTableCenterY = 0.62F",
+            "OrbitCameraState", "update_orbit_camera(",
+            "GetMouseDelta()", "GetMouseWheelMove()",
+            "MOUSE_BUTTON_LEFT", "MOUSE_BUTTON_MIDDLE",
+            "std::clamp", "camera.target",
+        ):
+            self.assertIn(required, source)
+        self.assertNotIn("constexpr float table_top = 0.77F", source)
+
     def test_probe_contract(self):
         source = self.source(PROBE)
         for required in (
@@ -80,6 +92,7 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
             "elapsed_seconds", "complete", "4608", "0.001F", "30",
             "observed_collisions",
             "coverage_demonstrated", "search_integrity_passed", "null",
+            "kTableTop = 0.65F", "supported_center", "coverage.boxes",
         ):
             self.assertIn(required, source)
         for forbidden in ("own_query(", "position_perturbations"):

@@ -20,6 +20,10 @@ namespace {
 
 constexpr float kPi = 3.14159265358979323846F;
 constexpr float kWristContactOffset = 0.04F;
+constexpr float kTableTop = 0.65F;
+constexpr float kTableThickness = 0.06F;
+constexpr float kTableCenterY = 0.62F;
+constexpr vec3 kTableDimensions(1.20F, kTableThickness, 0.75F);
 constexpr float kAcceptedPositionM = 0.001F;
 constexpr size_t kExpectedInstances = 4608U;
 constexpr size_t kRootAzimuthSectors = 12U;
@@ -86,18 +90,23 @@ Fixture make_fixture(
 
 std::vector<Fixture> shared_grasps() {
     const interaction::Transform table_world{
-        vec3(0.0F, 0.74F, 0.0F), quat()};
-    const vec3 table_dimensions(1.20F, 0.06F, 0.75F);
+        vec3(0.0F, kTableCenterY, 0.0F), quat()};
     const interaction::EnvironmentGeometry coverage =
         interaction::make_coverage_environment(
-            table_world, table_dimensions);
+            table_world, kTableDimensions);
     const interaction::EnvironmentGeometry open{};
+    const auto supported_center = [](const interaction::OrientedBox& support) {
+        return support.world.position +
+            vec3(0.0F, 0.5F * support.dimensions.y + 0.05F, 0.0F);
+    };
     return {
         make_fixture("open_space", vec3(0.0F, 0.90F, 0.0F), open),
-        make_fixture("table", vec3(0.0F, 0.82F, 0.0F), coverage),
-        make_fixture("shelf", vec3(0.335F, 1.16F, 0.0F), coverage),
-        make_fixture("below_table", vec3(0.0F, 0.45F, 0.0F), coverage),
-        make_fixture("lower_table", vec3(-1.045F, 0.58F, 0.0F), coverage),
+        make_fixture("table", supported_center(coverage.boxes.at(0U)), coverage),
+        make_fixture("shelf", supported_center(coverage.boxes.at(5U)), coverage),
+        make_fixture(
+            "below_table", vec3(0.0F, kTableTop - 0.32F, 0.0F), coverage),
+        make_fixture(
+            "lower_table", supported_center(coverage.boxes.at(8U)), coverage),
     };
 }
 
