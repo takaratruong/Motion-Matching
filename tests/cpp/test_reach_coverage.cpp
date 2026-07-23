@@ -338,13 +338,41 @@ void test_final_contact_always_uses_one_millimetre_gate() {
     assert(result.rejection == reach::Rejection::None);
     assert(result.position_error_m <= 0.001F);
     const size_t root = static_cast<size_t>(g1_skeleton::Simulation);
+    const size_t wrist = static_cast<size_t>(g1_skeleton::LeftWrist);
+    constexpr size_t aligned_sample = 14U;
     for (size_t sample = 0U; sample < result.poses.size(); ++sample) {
         const interaction::Pose source = reach::pose_at_frame(
             pack.database, static_cast<int32_t>(sample));
         assert(std::abs(
             result.poses[sample].positions[root].y -
             source.positions[root].y) <= 1.0e-6F);
+        const interaction::Pose placed = reach::place_pose(
+            pack, 0U, 0U, query.target.position,
+            static_cast<int32_t>(sample));
+        const float u = std::min(
+            1.0F,
+            static_cast<float>(sample) /
+                static_cast<float>(aligned_sample));
+        const float weight = u * u * (3.0F - 2.0F * u);
+        const float desired_y = interaction::world_pose(placed)
+                                    .positions[wrist].y +
+                                weight * 0.05F;
+        const float achieved_y = interaction::world_pose(result.poses[sample])
+                                     .positions[wrist].y;
+        assert(std::abs(achieved_y - desired_y) <= 0.001F);
     }
+}
+
+void test_short_clip_rejects_height_retarget_without_a_safe_ramp() {
+    const reach::Pack pack = fixture(6U);
+    reach::Query query = zero_query(pack);
+    query.target.position.y += 0.05F;
+
+    const reach::Evaluation result = reach::shape_candidate(
+        pack, reach::select_candidates(pack, query)[0], query);
+
+    assert(result.rejection == reach::Rejection::PositionError);
+    assert(result.poses.empty());
 }
 
 void test_retrieval_keeps_every_clip_and_yaw_then_ranks_approach() {
@@ -416,7 +444,7 @@ void test_zero_retarget_uses_pre_pause_approach_evidence() {
 }
 
 void test_arbitrary_target_is_placed_without_an_endpoint_envelope() {
-    const reach::Pack pack = fixture();
+    const reach::Pack pack = fixture(20U);
     reach::Query query = zero_query(pack);
     query.target.position = query.target.position + vec3(3.0F, 1.0F, -2.0F);
     const auto candidates = reach::select_candidates(pack, query);
@@ -654,6 +682,7 @@ int main() {
     test_one_reach_warps_to_a_different_approach_direction();
     test_short_reach_keeps_its_initial_pose_unwarped();
     test_final_contact_always_uses_one_millimetre_gate();
+    test_short_clip_rejects_height_retarget_without_a_safe_ramp();
     test_retrieval_keeps_every_clip_and_yaw_then_ranks_approach();
     test_zero_retarget_reproduces_endpoint_and_keeps_root_fixed();
     test_zero_retarget_uses_pre_pause_approach_evidence();

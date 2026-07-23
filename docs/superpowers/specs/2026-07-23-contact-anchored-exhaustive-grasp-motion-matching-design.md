@@ -136,6 +136,9 @@ unchanged. At the call site:
 - smoothly introduce vertical contact translation before the terminal
   approach window, then approach and wrist-orientation correction over the
   existing outbound shaping interval;
+- enforce the final position tolerance at every nonzero vertical-ramp sample,
+  and reject a nonzero height retarget when the clip has no safe pre-contact
+  ramp window;
 - keep root, torso, legs, and inactive arm unchanged after rigid placement;
 - require final position error at most `1 mm`;
 - retain the existing `15 degree` approach-axis gate;

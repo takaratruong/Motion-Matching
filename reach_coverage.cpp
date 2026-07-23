@@ -291,6 +291,10 @@ Evaluation shape_candidate(
     const size_t aligned_sample = frame_count > 6U
         ? frame_count - 6U
         : 0U;
+    if (warps_translation && aligned_sample == 0U) {
+        evaluation.rejection = Rejection::PositionError;
+        return evaluation;
+    }
     const size_t ramp_start = aligned_sample > 10U
         ? aligned_sample - 10U
         : 0U;
@@ -341,8 +345,8 @@ Evaluation shape_candidate(
                 placed_hand.rotation),
         };
         interaction::IKConfig sample_ik_config = ik_config;
-        if (((warps_approach || warps_translation) &&
-             approach_weight > 0.0F) ||
+        if ((warps_translation && translation_weight > 0.0F) ||
+            (warps_approach && approach_weight > 0.0F) ||
             sample + 1U == frame_count) {
             sample_ik_config.accepted_position_m =
                 config.accepted_position_m;
