@@ -224,6 +224,7 @@ CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_features
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_matcher
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_playback
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_ik
+CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_posture_ik
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_attachment
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_carry
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_runtime
@@ -585,6 +586,16 @@ $(CPP_TEST_DIR)/test_interaction_playback: tests/cpp/test_interaction_playback.c
 
 $(CPP_TEST_DIR)/test_interaction_ik: tests/cpp/test_interaction_ik.cpp interaction_ik.cpp interaction_ik.h interaction_rotation_gate.h g1_arm_joint_metadata.h interaction_pose.cpp interaction_pose.h interaction_matcher.h interaction_features.h interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_ik.cpp interaction_ik.cpp interaction_pose.cpp -o $@
+
+$(CPP_TEST_DIR)/test_interaction_posture_ik: \
+  tests/cpp/test_interaction_posture_ik.cpp \
+  tests/cpp/g1_posture_ik_fixture.h \
+  interaction_posture_ik.cpp interaction_posture_ik.h \
+  g1_arm_joint_metadata.h interaction_pose.cpp interaction_pose.h \
+  interaction_ik.h interaction_matcher.h interaction_database.h \
+  g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_posture_ik.cpp \
+	  interaction_posture_ik.cpp interaction_pose.cpp -o $@
 
 $(CPP_TEST_DIR)/test_interaction_attachment: tests/cpp/test_interaction_attachment.cpp interaction_attachment.cpp interaction_attachment.h interaction_pose.cpp interaction_pose.h interaction_target.cpp interaction_target.h interaction_matcher.h interaction_features.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_attachment.cpp interaction_attachment.cpp interaction_pose.cpp interaction_target.cpp -o $@
