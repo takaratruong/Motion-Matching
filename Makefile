@@ -155,26 +155,28 @@ interaction_reuse_audit_probe: interaction_reuse_audit_probe.cpp \
 
 g1_reach_coverage_viewer: g1_reach_coverage_viewer.cpp \
   reach_coverage.cpp reach_coverage.h reach_database.cpp reach_database.h \
-  reach_motion.cpp reach_motion.h interaction_hand_trajectories.cpp \
+  reach_motion.cpp reach_motion.h reach_placement.cpp reach_placement.h \
+  interaction_hand_trajectories.cpp \
   interaction_hand_trajectories.h interaction_ik.cpp interaction_ik.h \
   g1_arm_joint_metadata.h interaction_pose.cpp interaction_pose.h \
   interaction_target.cpp interaction_target.h interaction_database.h \
   g1_skeleton.h vec.h quat.h $(LINUX_CONTROLLER_DEPS)
 	$(CC) $(CONTROLLER_CXXFLAGS) -O3 -DNDEBUG -o $@$(EXT) \
 	  g1_reach_coverage_viewer.cpp reach_coverage.cpp reach_database.cpp \
-	  reach_motion.cpp interaction_hand_trajectories.cpp interaction_ik.cpp \
+	  reach_motion.cpp reach_placement.cpp interaction_hand_trajectories.cpp interaction_ik.cpp \
 	  interaction_pose.cpp interaction_target.cpp $(CFLAGS) $(LIBS)
 
 g1_reach_coverage_probe: g1_reach_coverage_probe.cpp \
   reach_coverage.cpp reach_coverage.h reach_database.cpp reach_database.h \
-  reach_motion.cpp reach_motion.h interaction_hand_trajectories.cpp \
+  reach_motion.cpp reach_motion.h reach_placement.cpp reach_placement.h \
+  interaction_hand_trajectories.cpp \
   interaction_hand_trajectories.h interaction_ik.cpp interaction_ik.h \
   g1_arm_joint_metadata.h interaction_pose.cpp interaction_pose.h \
   interaction_target.cpp interaction_target.h interaction_database.h \
   g1_skeleton.h vec.h quat.h
 	$(CXX) $(CONTROLLER_CXXFLAGS) -O3 -DNDEBUG -pthread -I. -o $@$(EXT) \
 	  g1_reach_coverage_probe.cpp reach_coverage.cpp reach_database.cpp \
-	  reach_motion.cpp interaction_hand_trajectories.cpp interaction_ik.cpp \
+	  reach_motion.cpp reach_placement.cpp interaction_hand_trajectories.cpp interaction_ik.cpp \
 	  interaction_pose.cpp interaction_target.cpp
 
 clean:
@@ -548,8 +550,8 @@ $(CPP_TEST_DIR)/test_interaction_reuse_audit: tests/cpp/test_interaction_reuse_a
 $(CPP_TEST_DIR)/test_reach_database: tests/cpp/test_reach_database.cpp reach_database.cpp reach_database.h reach_motion.cpp reach_motion.h interaction_pose.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_reach_database.cpp reach_database.cpp reach_motion.cpp -o $@
 
-$(CPP_TEST_DIR)/test_reach_coverage: tests/cpp/test_reach_coverage.cpp reach_coverage.cpp reach_coverage.h reach_database.cpp reach_database.h reach_motion.cpp reach_motion.h interaction_hand_trajectories.cpp interaction_hand_trajectories.h interaction_ik.cpp interaction_ik.h g1_arm_joint_metadata.h interaction_pose.cpp interaction_pose.h interaction_target.cpp interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
-	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_reach_coverage.cpp reach_coverage.cpp reach_database.cpp reach_motion.cpp interaction_hand_trajectories.cpp interaction_ik.cpp interaction_pose.cpp interaction_target.cpp -o $@
+$(CPP_TEST_DIR)/test_reach_coverage: tests/cpp/test_reach_coverage.cpp reach_coverage.cpp reach_coverage.h reach_database.cpp reach_database.h reach_motion.cpp reach_motion.h reach_placement.cpp reach_placement.h interaction_hand_trajectories.cpp interaction_hand_trajectories.h interaction_ik.cpp interaction_ik.h g1_arm_joint_metadata.h interaction_pose.cpp interaction_pose.h interaction_target.cpp interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_reach_coverage.cpp reach_coverage.cpp reach_database.cpp reach_motion.cpp reach_placement.cpp interaction_hand_trajectories.cpp interaction_ik.cpp interaction_pose.cpp interaction_target.cpp -o $@
 
 $(CPP_TEST_DIR)/test_interaction_playback: tests/cpp/test_interaction_playback.cpp tests/cpp/interaction_runtime_fixture.h interaction_playback.cpp interaction_playback.h interaction_matcher.cpp interaction_matcher.h interaction_features.cpp interaction_features.h interaction_pose.cpp interaction_pose.h interaction_target.cpp interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_playback.cpp interaction_playback.cpp interaction_matcher.cpp interaction_features.cpp interaction_pose.cpp interaction_target.cpp -o $@
