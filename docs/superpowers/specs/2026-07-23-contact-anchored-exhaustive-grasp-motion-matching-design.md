@@ -42,7 +42,8 @@ The input is:
 
 The output is a diverse, deterministic set of complete recorded motions that:
 
-1. place their terminal active wrist exactly at the requested grasp;
+1. place their terminal active wrist exactly at the requested grasp after
+   active-arm shaping without moving the recorded root height;
 2. keep the body upright;
 3. approach from multiple body placements around the grasp;
 4. satisfy the existing active-arm IK gates;
@@ -66,10 +67,11 @@ Each canonical clip begins upright with its source root normalized. Let:
 - `g` be the requested world-space grasp position; and
 - `R_y(theta)` be an upright rotation around world up.
 
-One placed instance is:
+Define the horizontal contact translation:
 
 ```text
-p'_i = g + R_y(theta) * (p_i - e)
+a = (g.x - (R_y(theta)e).x, 0, g.z - (R_y(theta)e).z)
+p'_i = a + R_y(theta) * p_i
 q'_i = R_y(theta) * q_i
 ```
 
@@ -77,15 +79,19 @@ The transform applies to the complete skeleton trajectory. It can be
 implemented by composing the equivalent yaw and translation into the
 Simulation root; local body motion remains recorded motion.
 
-This contract guarantees before IK that:
+This contract guarantees before IK that the terminal active wrist is aligned
+in the ground plane while recorded root height remains unchanged:
 
 ```text
-terminal_active_wrist_position = g
+terminal_active_wrist_position.xz = g.xz
+placed_root_position.y = source_root_position.y
 ```
 
-up to floating-point forward-kinematics precision. It also preserves the
-recorded body-to-hand relationship and keeps every root, torso, and limb
-upright. No object rotation is ever multiplied into the whole skeleton.
+up to floating-point forward-kinematics precision. The remaining vertical
+contact offset is introduced gradually through active-arm IK. This preserves
+grounding and the recorded body-to-hand relationship while keeping every root,
+torso, and limb upright. No object rotation is ever multiplied into the whole
+skeleton.
 
 Object translation changes `g`. Object rotation changes the requested grasp
 orientation and approach axis, and may change `g` when the grasp is stored on
@@ -118,16 +124,17 @@ instance's truthful rejection. They may not silently reduce the population.
 
 ## Active-Arm Shaping
 
-Rigid contact placement happens before active-arm shaping. Because placement
-already gives exact terminal position, IK is responsible only for adapting the
-recorded active arm toward the requested wrist orientation and terminal
+Grounded horizontal contact placement happens before active-arm shaping. IK is
+responsible for moving the active wrist through the remaining vertical contact
+offset and adapting it toward the requested wrist orientation and terminal
 approach while retaining the trajectory's character.
 
 Use the existing seven-joint `interaction::solve_hand_ik` implementation
 unchanged. At the call site:
 
 - preserve the placed pose as the initial state;
-- smoothly introduce approach and wrist-orientation correction over the
+- smoothly introduce vertical contact translation before the terminal
+  approach window, then approach and wrist-orientation correction over the
   existing outbound shaping interval;
 - keep root, torso, legs, and inactive arm unchanged after rigid placement;
 - require final position error at most `1 mm`;
@@ -237,14 +244,16 @@ partial result as exhaustive.
 Tests must fail under the old root-fixed implementation and establish all of
 the following under the corrected implementation:
 
-1. Translating a shared grasp by at least one metre leaves the raw population
-   at 4,608 and moves every placed terminal wrist by the same translation.
+1. Translating a shared grasp in X/Z leaves the raw population at 4,608 and
+   moves every placed terminal wrist by the same horizontal translation;
+   changing grasp height never changes any placed root Y sample.
 2. Rotating the object leaves the raw population at 4,608 and never tilts a
    skeleton root away from world up.
 3. Each source clip produces exactly 12 yaw instances with stable identities.
 4. Captured-left and mirrored-right options target the same grasp.
-5. Rigid placement alone reproduces the requested terminal position within
-   floating-point forward-kinematics tolerance.
+5. Grounded placement alone reproduces requested terminal X/Z within
+   floating-point tolerance, and active-arm IK produces accepted full 3D
+   contacts without changing root height.
 6. Final IK-shaped accepted contacts remain within `1 mm`, while the current
    IK implementation files remain unchanged.
 7. Open-space accepted options occupy multiple root-azimuth sectors around the

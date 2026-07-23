@@ -14,7 +14,10 @@
 - Every search enumerates all 384 clips at exactly 12 world-up yaw placements: 4,608 raw instances.
 - Query translation and rotation never change the raw candidate population.
 - Recorded endpoint distance, wrist orientation, and approach direction are not eligibility filters.
-- Whole-body placement is `p' = g + R_y(theta) * (p - e)` and never inherits object pitch or roll.
+- Whole-body placement aligns terminal contact only in X/Z, preserves every
+  recorded root Y sample, and never inherits object pitch or roll. Vertical
+  grasp displacement is handled by gradual active-arm IK. This live-review
+  correction supersedes the original full-3D placement snippets in Task 1.
 - Keep `interaction_ik.h`, `interaction_ik.cpp`, and `g1_arm_joint_metadata.h` unchanged.
 - Accepted final wrist position error is at most `0.001 m`; approach error remains at most 15 degrees and orientation error at most 60 degrees.
 - Complete shaped skeletons are tested against target-object and furniture geometry.

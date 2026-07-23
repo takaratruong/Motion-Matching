@@ -329,14 +329,22 @@ void test_short_reach_keeps_its_initial_pose_unwarped() {
 }
 
 void test_final_contact_always_uses_one_millimetre_gate() {
-    const reach::Pack pack = fixture();
+    const reach::Pack pack = fixture(20U);
     reach::Query query = zero_query(pack);
-    query.target.position.y += 0.01F;
+    query.target.position.y += 0.05F;
 
     const reach::Evaluation result = reach::shape_candidate(
         pack, reach::select_candidates(pack, query)[0], query);
     assert(result.rejection == reach::Rejection::None);
     assert(result.position_error_m <= 0.001F);
+    const size_t root = static_cast<size_t>(g1_skeleton::Simulation);
+    for (size_t sample = 0U; sample < result.poses.size(); ++sample) {
+        const interaction::Pose source = reach::pose_at_frame(
+            pack.database, static_cast<int32_t>(sample));
+        assert(std::abs(
+            result.poses[sample].positions[root].y -
+            source.positions[root].y) <= 1.0e-6F);
+    }
 }
 
 void test_retrieval_keeps_every_clip_and_yaw_then_ranks_approach() {
@@ -415,8 +423,17 @@ void test_arbitrary_target_is_placed_without_an_endpoint_envelope() {
     assert(candidates.size() == reach::kYawPlacementCount);
     const reach::Evaluation result = reach::shape_candidate(
         pack, candidates[0], query);
-    assert(result.rejection == reach::Rejection::None);
-    assert(result.position_error_m <= 0.001F);
+    assert(result.rejection != reach::Rejection::OutsideEnvelope);
+    assert(result.rejection != reach::Rejection::InvalidSolver);
+    assert(!result.poses.empty());
+    const size_t root = static_cast<size_t>(g1_skeleton::Simulation);
+    for (size_t sample = 0U; sample < result.poses.size(); ++sample) {
+        const interaction::Pose source = reach::pose_at_frame(
+            pack.database, static_cast<int32_t>(sample));
+        assert(std::abs(
+            result.poses[sample].positions[root].y -
+            source.positions[root].y) <= 1.0e-6F);
+    }
 }
 
 void test_position_and_rotation_perturbations_have_exclusive_outcomes() {
@@ -555,25 +572,31 @@ void test_diagnostics_separate_hand_and_augmentation_counts() {
     assert(diagnostics.joint_limit_saturated == 1U);
 }
 
-void test_contact_placement_is_exact_and_upright() {
+void test_contact_placement_is_grounded_and_horizontally_exact() {
     const reach::Pack pack = fixture(20U);
     const vec3 target(1.25F, 0.83F, -0.70F);
+    const interaction::Pose source = reach::pose_at_frame(pack.database, 19);
+    const size_t root = static_cast<size_t>(g1_skeleton::Simulation);
     for (uint8_t yaw = 0U; yaw < reach::kYawPlacementCount; ++yaw) {
         const interaction::Pose placed = reach::place_pose(
             pack, 0U, yaw, target, 19);
         const interaction::WorldPose world = interaction::world_pose(placed);
         const size_t wrist = static_cast<size_t>(g1_skeleton::LeftWrist);
-        assert(length(world.positions[wrist] - target) <= 1.0e-5F);
+        assert(std::abs(world.positions[wrist].x - target.x) <= 1.0e-5F);
+        assert(std::abs(world.positions[wrist].z - target.z) <= 1.0e-5F);
+        assert(std::abs(
+            placed.positions[root].y - source.positions[root].y) <= 1.0e-6F);
         const vec3 up = quat_mul_vec3(
             world.rotations[g1_skeleton::Simulation], vec3(0, 1, 0));
         assert(length(up - vec3(0, 1, 0)) <= 1.0e-5F);
     }
 }
 
-void test_contact_placement_translates_every_sample_rigidly() {
+void test_contact_placement_ignores_target_height_for_whole_body() {
     const reach::Pack pack = fixture(20U);
     const vec3 first_target(0.4F, 0.9F, -0.2F);
     const vec3 moved_target = first_target + vec3(1.0F, -0.3F, 0.5F);
+    const vec3 expected_delta(1.0F, 0.0F, 0.5F);
     for (int32_t frame = 0; frame < 20; ++frame) {
         const interaction::WorldPose first = interaction::world_pose(
             reach::place_pose(pack, 0U, 3U, first_target, frame));
@@ -582,7 +605,7 @@ void test_contact_placement_translates_every_sample_rigidly() {
         for (size_t bone = 0U; bone < g1_skeleton::BoneCount; ++bone) {
             assert(length(
                 (moved.positions[bone] - first.positions[bone]) -
-                (moved_target - first_target)) <= 1.0e-5F);
+                expected_delta) <= 1.0e-5F);
         }
     }
 }
@@ -639,8 +662,8 @@ int main() {
     test_collision_stages_and_active_contact_exemption();
     test_collision_observations_survive_an_earlier_kinematic_rejection();
     test_diagnostics_separate_hand_and_augmentation_counts();
-    test_contact_placement_is_exact_and_upright();
-    test_contact_placement_translates_every_sample_rigidly();
+    test_contact_placement_is_grounded_and_horizontally_exact();
+    test_contact_placement_ignores_target_height_for_whole_body();
     test_enumeration_is_bilateral_exhaustive_and_query_invariant();
     test_shared_grasp_shapes_both_hands_at_every_yaw();
 }

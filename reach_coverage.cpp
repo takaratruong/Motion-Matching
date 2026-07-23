@@ -283,6 +283,9 @@ Evaluation shape_candidate(
         stop - 1);
     const interaction::Transform placed_endpoint = hand_transform(
         placed_final_pose, query.hand);
+    const vec3 contact_offset =
+        query.target.position - placed_endpoint.position;
+    const bool warps_translation = length(contact_offset) > 1.0e-6F;
     const quat correction = quat_mul(
         query.target.rotation, quat_inv(placed_endpoint.rotation));
     const size_t aligned_sample = frame_count > 6U
@@ -312,11 +315,13 @@ Evaluation shape_candidate(
         const interaction::Pose placed_pose = pose;
         const interaction::Transform placed_hand = hand_transform(
             pose, query.hand);
-        const float u = frame_count == 1U
+        const float translation_u = aligned_sample == 0U
             ? 1.0F
-            : static_cast<float>(sample) /
-                  static_cast<float>(frame_count - 1U);
-        const float translation_weight = smoothstep(u);
+            : std::min(
+                1.0F,
+                static_cast<float>(sample) /
+                    static_cast<float>(aligned_sample));
+        const float translation_weight = smoothstep(translation_u);
         const float approach_u = sample <= ramp_start
             ? 0.0F
             : (sample >= aligned_sample
@@ -324,17 +329,20 @@ Evaluation shape_candidate(
                 : static_cast<float>(sample - ramp_start) /
                       static_cast<float>(aligned_sample - ramp_start));
         const float approach_weight = smoothstep(approach_u);
+        const vec3 translated_position =
+            placed_hand.position + translation_weight * contact_offset;
         const vec3 relative =
-            placed_hand.position - query.target.position;
+            translated_position - query.target.position;
         const vec3 rotated = quat_mul_vec3(approach_alignment, relative);
         const interaction::Transform desired{
-            placed_hand.position + approach_weight * (rotated - relative),
+            translated_position + approach_weight * (rotated - relative),
             quat_mul(
                 quat_nlerp_shortest(quat(), correction, translation_weight),
                 placed_hand.rotation),
         };
         interaction::IKConfig sample_ik_config = ik_config;
-        if ((warps_approach && approach_weight > 0.0F) ||
+        if (((warps_approach || warps_translation) &&
+             approach_weight > 0.0F) ||
             sample + 1U == frame_count) {
             sample_ik_config.accepted_position_m =
                 config.accepted_position_m;

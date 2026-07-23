@@ -16,9 +16,10 @@
 - Task 3: `de14dad` (bounded deterministic parallel evaluation of all 4,608 instances).
 - Task 4: `2176faa` (furniture-first exhaustive flat viewer with explicit Enter search).
 - Task 5: `27eb950` (shared-grasp real-pack coverage probe and report contract).
-- Task 6 review fixes: `fix: make exhaustive coverage diagnostics truthful` (deadline-complete semantics, oriented-object rendering, rejected-option inspection, and explicit zero-coverage evidence).
+- Task 6 review fixes: `46e5006`, `ad28d84` (deadline-complete semantics, oriented-object rendering, rejected-option inspection, explicit zero-coverage evidence, and deterministic deadline testing).
+- Live grounding correction: whole-body placement now preserves recorded root Y and applies grasp-height displacement only through active-arm IK; grounded 5 cm height-retarget regression added.
 - Automated gate: `python3 -m unittest tests.python.test_g1_reach_coverage_viewer -v`; `make build/tests/test_reach_search build/tests/test_reach_coverage build/tests/test_reach_database build/tests/test_interaction_hand_trajectories build/tests/test_interaction_ik g1_reach_coverage_probe g1_reach_coverage_viewer`; then each of the five test binaries. All passed on 2026-07-23.
 - Unchanged-IK gate: `git diff --exit-code 50f5542 -- interaction_ik.h interaction_ik.cpp g1_arm_joint_metadata.h` passed with no output.
 - Real evidence command: `/usr/bin/time -f 'elapsed=%e rss_kb=%M' ./g1_reach_coverage_probe build/g1-reaches/reach-pack-v2 --json build/g1-reaches/contact-anchored-coverage-report-v3.json`.
 - Real report: `build/g1-reaches/contact-anchored-coverage-report-v3.json`; every fixture completed all 4,608/4,608 instances below 30 seconds and every accepted endpoint was within 1 mm.
-- Fixture evidence: open space 355 accepted (178 left, 177 right, 3 azimuth sectors, 2.60 s); table 0 accepted / `coverage_demonstrated: false` with accepted-only errors `null` (3.09 s); shelf 42 (4 sectors, 3.65 s); below table 128 (4 sectors, 3.67 s); lower table 2 (2 sectors, 3.91 s). The unchanged IK position gate rejected roughly 3,940 instances per fixture; table survivors were then eliminated by scene collision.
+- Grounded fixture evidence: open space 362 accepted (181 left, 181 right, 7 azimuth sectors, 3.60 s); table 0 (4.13 s); shelf 0 (4.22 s); below table 0 (4.59 s); lower table 8 (2 sectors, 5.52 s). Zero-coverage fixtures are explicit failures, not vacuous zero-error successes. The reduced furniture coverage is the truthful result when grasp height may not float the full body.

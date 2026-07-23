@@ -38,8 +38,11 @@ interaction::Transform contact_alignment(
     }
     const quat rotation = placement_rotation(yaw_index);
     const vec3 endpoint = endpoint_transform(pack.database, clip).position;
+    vec3 translation =
+        target_position - quat_mul_vec3(rotation, endpoint);
+    translation.y = 0.0F;
     return {
-        target_position - quat_mul_vec3(rotation, endpoint),
+        translation,
         rotation,
     };
 }
