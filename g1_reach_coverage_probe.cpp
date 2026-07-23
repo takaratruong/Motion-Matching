@@ -6,6 +6,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -44,6 +45,7 @@ struct FixtureReport {
     size_t raw_instances = 0U;
     size_t processed_instances = 0U;
     size_t accepted = 0U;
+    uint64_t accepted_set_hash = 0U;
     std::array<size_t, 2U> hands{};
     size_t root_azimuth_sectors = 0U;
     float maximum_accepted_position_m = 0.0F;
@@ -67,6 +69,12 @@ std::string escape_json(const std::string& value) {
             default: output << character; break;
         }
     }
+    return output.str();
+}
+
+std::string hex_hash(uint64_t value) {
+    std::ostringstream output;
+    output << std::hex << std::setfill('0') << std::setw(16) << value;
     return output.str();
 }
 
@@ -167,6 +175,8 @@ FixtureReport evaluate_fixture(
             accepted_candidates,
             fixture.query.target.position,
             kRootAzimuthSectors);
+    report.accepted_set_hash =
+        reach::accepted_candidate_set_hash(accepted_candidates);
     return report;
 }
 
@@ -174,6 +184,8 @@ void write_fixture_report(
     std::ostream& output,
     const FixtureReport& report) {
     output << "{\"accepted\":" << report.accepted
+           << ",\"accepted_set_hash\":\""
+           << hex_hash(report.accepted_set_hash) << '"'
            << ",\"complete\":" << (report.complete ? "true" : "false")
            << ",\"coverage_demonstrated\":"
            << (report.accepted > 0U ? "true" : "false")

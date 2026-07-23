@@ -77,7 +77,9 @@ Tests must be written before implementation and demonstrate:
 6. all existing reach, IK, and collision tests continue to pass;
 7. the real pack still accepts the same 477 open-space motions, including 231
    left-hand and 246 right-hand motions across ten root-azimuth sectors;
-8. the exhaustive real-pack search remains complete within 30 seconds.
+8. a deterministic hash of sorted accepted `(clip, yaw)` identifiers matches
+   the pre-ranking implementation;
+9. the exhaustive real-pack search remains complete within 30 seconds.
 
 The final handoff requires a rebuilt and relaunched flat-terrain viewer so the
 new ordering can be checked by cycling the first several accepted options.
@@ -94,7 +96,10 @@ each environment. Open-space search completed in 13.1497150 seconds and
 retained exactly 477 accepted motions: 231 left-hand, 246 right-hand, across
 ten root-azimuth sectors. The complete acceptance and rejection report is
 identical to the pre-ranking report after excluding elapsed-time fields.
-Therefore the change affects accepted-motion order, not the accepted set.
+The sorted accepted-candidate hashes also match in every environment;
+open-space is `d29ce5d4a682a839`, shelf is `11830248945b2ebc`, and lower
+table is `d8a79f2853857922`. Therefore the change affects accepted-motion
+order, not the accepted set.
 
 The viewer now displays directness, backtracking, and excess-path values for
 the selected option so the new ordering can be assessed while cycling the

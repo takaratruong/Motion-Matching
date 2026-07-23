@@ -39,6 +39,9 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
             "kWristContactOffset", "SEARCH INCOMPLETE",
             "RAW INSTANCES", "PROCESSED", "YAW PLACEMENT",
             "PRESS ENTER TO SEARCH", "displayed", "accepted",
+            "DIRECT %.3f", "BACKTRACK %.1f%%", "EXCESS PATH %.1f%%",
+            "evaluation.backtrack_ratio", "evaluation.excess_path_ratio",
+            "evaluation.directness_cost",
             "std::optional<reach::SearchResult>",
             "results = std::move(completed)",
         ):
@@ -57,6 +60,11 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
         self.assertIn("environment_collision_observed", source)
         self.assertIn("OBSERVED OBJECT COLLISION", source)
         self.assertIn("OBSERVED ENVIRONMENT COLLISION", source)
+        self.assertRegex(
+            source,
+            r"evaluation\.rejection == reach::Rejection::None &&\s+"
+            r"evaluation\.directness_cost <= 0\.10F",
+        )
         self.assertIn(
             "results.has_value() && !results->accepted.empty() && !stale",
             source,
@@ -161,6 +169,7 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
             "shared_grasps", "open_space", "table", "shelf",
             "below_table", "lower_table", "raw_instances",
             "processed_instances", "root_azimuth_sectors",
+            "accepted_set_hash", "reach::accepted_candidate_set_hash(",
             "elapsed_seconds", "complete", "4608", "0.001F", "30",
             "observed_collisions",
             "coverage_demonstrated", "search_integrity_passed", "null",

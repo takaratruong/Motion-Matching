@@ -375,6 +375,11 @@ void draw_hud(
                 : results->accepted[selected];
             const reach::Evaluation& evaluation =
                 results->evaluations[selected_evaluation].evaluation;
+            const bool has_path_quality =
+                !results->evaluations[selected_evaluation].hand_path.empty() &&
+                std::isfinite(evaluation.directness_cost) &&
+                std::isfinite(evaluation.backtrack_ratio) &&
+                std::isfinite(evaluation.excess_path_ratio);
             const size_t clip = evaluation.candidate.clip;
             DrawText(
                 TextFormat(
@@ -402,18 +407,28 @@ void draw_hud(
                 264,
                 16,
                 DARKGRAY);
-            DrawText(
-                TextFormat(
-                    "DIRECT %.3f | BACKTRACK %.1f%% | EXCESS PATH %.1f%%",
-                    evaluation.directness_cost,
-                    100.0F * evaluation.backtrack_ratio,
-                    100.0F * evaluation.excess_path_ratio),
-                26,
-                289,
-                16,
-                evaluation.directness_cost <= 0.10F
-                    ? DARKGREEN
-                    : DARKGRAY);
+            if (has_path_quality) {
+                DrawText(
+                    TextFormat(
+                        "DIRECT %.3f | BACKTRACK %.1f%% | EXCESS PATH %.1f%%",
+                        evaluation.directness_cost,
+                        100.0F * evaluation.backtrack_ratio,
+                        100.0F * evaluation.excess_path_ratio),
+                    26,
+                    289,
+                    16,
+                    evaluation.rejection == reach::Rejection::None &&
+                            evaluation.directness_cost <= 0.10F
+                        ? DARKGREEN
+                        : DARKGRAY);
+            } else {
+                DrawText(
+                    "DIRECT N/A | BACKTRACK N/A | EXCESS PATH N/A",
+                    26,
+                    289,
+                    16,
+                    DARKGRAY);
+            }
             DrawText(
                 TextFormat(
                     "OBSERVED OBJECT COLLISION: %s | OBSERVED ENVIRONMENT COLLISION: %s",

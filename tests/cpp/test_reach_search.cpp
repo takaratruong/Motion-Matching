@@ -137,6 +137,9 @@ reach::SearchResult run_fixture_search(size_t workers) {
     reach::SearchConfig config{};
     config.worker_count = workers;
     config.deadline = std::chrono::seconds(30);
+    config.coverage.accepted_position_m = 10.0F;
+    config.coverage.accepted_approach_radians = 3.141592654F;
+    config.coverage.accepted_orientation_radians = 3.141592654F;
     return reach::search_all(
         bilateral_fixture(),
         {{{1.0F, 0.85F, -0.25F}, quat()}, normalize(vec3(-1, 0, 0))},
@@ -168,6 +171,24 @@ void test_search_order_is_independent_of_worker_count() {
                parallel.evaluations[index].evaluation.candidate.yaw_index);
         assert(serial.evaluations[index].evaluation.rejection ==
                parallel.evaluations[index].evaluation.rejection);
+    }
+    assert(serial.accepted.size() == parallel.accepted.size());
+    assert(serial.accepted.size() > 1U);
+    for (size_t index = 0U; index < serial.accepted.size(); ++index) {
+        const reach::Evaluation& serial_evaluation =
+            serial.evaluations[serial.accepted[index]].evaluation;
+        const reach::Evaluation& parallel_evaluation =
+            parallel.evaluations[parallel.accepted[index]].evaluation;
+        assert(serial_evaluation.candidate.clip ==
+               parallel_evaluation.candidate.clip);
+        assert(serial_evaluation.candidate.yaw_index ==
+               parallel_evaluation.candidate.yaw_index);
+        if (index > 0U) {
+            const reach::Evaluation& previous =
+                serial.evaluations[serial.accepted[index - 1U]].evaluation;
+            assert(!reach::detail::accepted_quality_less(
+                serial_evaluation, previous));
+        }
     }
 }
 

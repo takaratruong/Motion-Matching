@@ -387,8 +387,8 @@ Run:
 ```
 
 Expected: exit 0; open space reports 477 accepted, 231 left, 246 right, ten
-root-azimuth sectors, all 4,608 instances processed, and elapsed time no more
-than 30 seconds.
+root-azimuth sectors, accepted-set hash `d29ce5d4a682a839`, all 4,608
+instances processed, and elapsed time no more than 30 seconds.
 
 - [ ] **Step 4: Record final evidence**
 

@@ -5,7 +5,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace reach {
@@ -57,6 +59,32 @@ size_t count_placed_root_azimuth_sectors(
     }
     return static_cast<size_t>(
         std::count(occupied.begin(), occupied.end(), true));
+}
+
+uint64_t accepted_candidate_set_hash(
+    const std::vector<Candidate>& candidates) {
+    std::vector<std::pair<size_t, uint8_t>> identities;
+    identities.reserve(candidates.size());
+    for (const Candidate& candidate : candidates) {
+        identities.emplace_back(candidate.clip, candidate.yaw_index);
+    }
+    std::sort(identities.begin(), identities.end());
+
+    constexpr uint64_t offset = 14695981039346656037ULL;
+    constexpr uint64_t prime = 1099511628211ULL;
+    uint64_t hash = offset;
+    const auto mix = [&](uint8_t byte) {
+        hash ^= static_cast<uint64_t>(byte);
+        hash *= prime;
+    };
+    for (const auto& identity : identities) {
+        const uint64_t clip = static_cast<uint64_t>(identity.first);
+        for (unsigned shift = 0U; shift < 64U; shift += 8U) {
+            mix(static_cast<uint8_t>((clip >> shift) & 0xffU));
+        }
+        mix(identity.second);
+    }
+    return hash;
 }
 
 }  // namespace reach

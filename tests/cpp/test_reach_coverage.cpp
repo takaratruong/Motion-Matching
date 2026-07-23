@@ -820,6 +820,23 @@ void test_sector_metric_counts_distinct_roots_that_share_a_yaw() {
         reach::kYawPlacementCount) == 1U);
 }
 
+void test_accepted_candidate_hash_is_order_invariant_and_identity_sensitive() {
+    const std::vector<reach::Candidate> ordered = {
+        reach::Candidate{4U, 2U},
+        reach::Candidate{9U, 7U},
+        reach::Candidate{4U, 8U},
+    };
+    const std::vector<reach::Candidate> reordered = {
+        ordered[2], ordered[0], ordered[1],
+    };
+    std::vector<reach::Candidate> changed = reordered;
+    changed[0].yaw_index = 9U;
+    assert(reach::accepted_candidate_set_hash(ordered) ==
+           reach::accepted_candidate_set_hash(reordered));
+    assert(reach::accepted_candidate_set_hash(ordered) !=
+           reach::accepted_candidate_set_hash(changed));
+}
+
 void test_enumeration_is_bilateral_exhaustive_and_query_invariant() {
     const reach::Pack pack = bilateral_fixture();
     const auto candidates = reach::enumerate_candidates(pack);
@@ -904,6 +921,34 @@ void test_wrist_path_quality_penalizes_hooks_and_is_rigid_invariant() {
         hooked_quality.directness_cost));
 }
 
+void test_wrist_path_quality_handles_degenerate_and_invalid_paths() {
+    const reach::WristPathQuality empty =
+        reach::measure_wrist_path_quality({});
+    const reach::WristPathQuality singleton =
+        reach::measure_wrist_path_quality({vec3(3.0F, -2.0F, 1.0F)});
+    const reach::WristPathQuality short_direct =
+        reach::measure_wrist_path_quality({
+            vec3(0.0F, 0.0F, 0.0F),
+            vec3(0.01F, 0.0F, 0.0F),
+            vec3(0.02F, 0.0F, 0.0F),
+        });
+    assert(near(empty.directness_cost, 0.0F));
+    assert(near(singleton.directness_cost, 0.0F));
+    assert(near(short_direct.backtrack_ratio, 0.0F));
+    assert(near(short_direct.excess_path_ratio, 0.0F));
+    assert(near(short_direct.directness_cost, 0.0F));
+
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const reach::WristPathQuality invalid =
+        reach::measure_wrist_path_quality({
+            vec3(0.0F, 0.0F, 0.0F),
+            vec3(nan, 0.0F, 0.0F),
+        });
+    assert(std::isinf(invalid.backtrack_ratio));
+    assert(std::isinf(invalid.excess_path_ratio));
+    assert(std::isinf(invalid.directness_cost));
+}
+
 }  // namespace
 
 int main() {
@@ -926,7 +971,9 @@ int main() {
     test_shaping_is_invariant_under_horizontal_target_translation();
     test_task_priority_shaping_is_frame_to_frame_continuous();
     test_sector_metric_counts_distinct_roots_that_share_a_yaw();
+    test_accepted_candidate_hash_is_order_invariant_and_identity_sensitive();
     test_enumeration_is_bilateral_exhaustive_and_query_invariant();
     test_shared_grasp_shapes_both_hands_at_every_yaw();
     test_wrist_path_quality_penalizes_hooks_and_is_rigid_invariant();
+    test_wrist_path_quality_handles_degenerate_and_invalid_paths();
 }
