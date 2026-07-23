@@ -126,16 +126,38 @@ void test_real_motion_and_switch_preserve_root(
         "walking reset did not restore the scene spawn");
 }
 
+void test_native_g1_database_publishes_only_g1() {
+    episode::FlatMotionMatcher matcher(
+        "build/g1-episode/walking_database.bin");
+    require(
+        matcher.uses_native_g1(),
+        "episode walking database was not recognized as native G1");
+    require(
+        !matcher.flat_skeleton().valid,
+        "native G1 matcher exposed a second flat skeleton");
+    for (int tick = 0; tick < 50; ++tick) {
+        matcher.update(
+            {vec3(0.0F, 0.0F, 0.22F), quat()},
+            1.0F / 25.0F);
+        require(
+            !matcher.flat_skeleton().valid,
+            "native G1 update exposed a flat skeleton");
+        require(
+            finite_pose(matcher.snapshot().pose),
+            "native G1 update produced a non-finite pose");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     try {
         const std::filesystem::path walking = argc >= 2
             ? std::filesystem::path(argv[1])
-            : std::filesystem::path(
-                  "build/g1-episode/walking_database.bin");
+            : std::filesystem::path("resources/database.bin");
         test_real_motion_and_switch_preserve_root(walking);
         test_heading_command_converges(walking);
+        test_native_g1_database_publishes_only_g1();
         std::cout << "flat G1 motion matcher PASS\n";
         return 0;
     } catch (const std::exception& error) {

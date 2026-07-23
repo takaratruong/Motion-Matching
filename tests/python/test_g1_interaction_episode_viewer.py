@@ -15,6 +15,15 @@ class InteractionEpisodeViewerContractTest(unittest.TestCase):
         self.assertNotIn("G1_TERRAIN_DIR", source)
         self.assertNotIn("table-ground-pack", source)
 
+    def test_viewer_uses_episode_pack_g1_walking_and_one_pose(self) -> None:
+        source = self.source()
+        self.assertIn(
+            'options.episode_pack / "walking_database.bin"', source
+        )
+        self.assertNotIn('"resources/database.bin"', source)
+        self.assertNotIn("draw_flat_bones(", source)
+        self.assertNotIn("flat_visible", source)
+
     def test_controls_and_search_are_edge_triggered(self) -> None:
         source = self.source()
         self.assertIn("IsKeyPressed(KEY_F)", source)

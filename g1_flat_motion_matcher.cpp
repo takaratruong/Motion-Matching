@@ -397,6 +397,10 @@ const FlatSkeletonWorldPose& FlatMotionMatcher::flat_skeleton() const {
     return flat_skeleton_;
 }
 
+bool FlatMotionMatcher::uses_native_g1() const {
+    return !uses_flat_controller_skeleton_;
+}
+
 float FlatMotionMatcher::planar_speed() const {
     const vec3 velocity = snapshot_.pose.velocities[0];
     return std::sqrt(velocity.x * velocity.x + velocity.z * velocity.z);

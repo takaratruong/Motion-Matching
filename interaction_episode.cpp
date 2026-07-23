@@ -90,6 +90,10 @@ InteractionEpisode::InteractionEpisode(
       config_(config),
       matcher_(walking_database_, carry_left_database_) {
     validate_config(config_);
+    if (!matcher_.uses_native_g1()) {
+        throw std::invalid_argument(
+            "playable episode walking database must use native 31-bone G1");
+    }
     output_.pose = matcher_.snapshot().pose;
     output_.state = state_;
 }
@@ -578,11 +582,7 @@ void InteractionEpisode::update_attached_object(float dt) {
 void InteractionEpisode::publish(interaction::Pose pose) {
     output_.pose = std::move(pose);
     output_.state = state_;
-    output_.flat_locomotion =
-        state_ == EpisodeState::FreeLocomotion ||
-                state_ == EpisodeState::Approach
-            ? matcher_.flat_skeleton()
-            : FlatSkeletonWorldPose{};
+    output_.flat_locomotion = FlatSkeletonWorldPose{};
     if (state_ != EpisodeState::Bridge) output_.bridge_alpha = 0.0F;
 }
 

@@ -194,12 +194,12 @@ void test_contact_rejection_timeout_and_reset() {
         "approach timeout did not fail");
 }
 
-void test_flat_walking_converges_to_a_distant_entry() {
+void test_native_walking_converges_to_a_distant_entry() {
     const std::filesystem::path pack("build/g1-episode");
     episode::EpisodeConfig config{};
     config.bridge_seconds = 10.0F;
     episode::InteractionEpisode runtime(
-        "resources/database.bin",
+        pack / "walking_database.bin",
         pack / "carry_left_database.bin",
         pack / "carry_right_database.bin",
         config);
@@ -231,16 +231,16 @@ void test_flat_walking_converges_to_a_distant_entry() {
         kTick, episode::LocomotionCommand{}, 21U, false, false});
     require(
         runtime.state() == episode::EpisodeState::Bridge &&
-            runtime.output().flat_locomotion.valid &&
+            !runtime.output().flat_locomotion.valid &&
             runtime.output().bridge_alpha > 0.0F &&
             runtime.output().bridge_alpha < 1.0F,
-        "bridge did not cross-fade from the displayed flat skeleton");
+        "native G1 bridge exposed a second skeleton or skipped blending");
 }
 
-void test_flat_walking_reach_and_carry_preserve_contact_root() {
+void test_native_walking_reach_and_carry_preserve_contact_root() {
     const std::filesystem::path pack("build/g1-episode");
     episode::InteractionEpisode runtime(
-        "resources/database.bin",
+        pack / "walking_database.bin",
         pack / "carry_left_database.bin",
         pack / "carry_right_database.bin",
         fast_config());
@@ -295,7 +295,7 @@ void test_flat_walking_reach_and_carry_preserve_contact_root() {
 void test_same_hand_place_releases_and_returns_to_locomotion() {
     const std::filesystem::path pack("build/g1-episode");
     episode::InteractionEpisode runtime(
-        "resources/database.bin",
+        pack / "walking_database.bin",
         pack / "carry_left_database.bin",
         pack / "carry_right_database.bin",
         fast_config());
@@ -404,8 +404,8 @@ int main() {
         test_freeze_attach_and_selected_carry_hand(reach::Hand::Right);
         test_generation_change_and_cancel_fail_before_contact();
         test_contact_rejection_timeout_and_reset();
-        test_flat_walking_converges_to_a_distant_entry();
-        test_flat_walking_reach_and_carry_preserve_contact_root();
+        test_native_walking_converges_to_a_distant_entry();
+        test_native_walking_reach_and_carry_preserve_contact_root();
         test_same_hand_place_releases_and_returns_to_locomotion();
         std::cout << "interaction episode PASS\n";
         return 0;

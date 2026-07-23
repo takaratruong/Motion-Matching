@@ -41,6 +41,7 @@ public:
     void reset_database(const std::filesystem::path& database_path);
     const interaction::LocomotionSnapshot& snapshot() const;
     const FlatSkeletonWorldPose& flat_skeleton() const;
+    bool uses_native_g1() const;
     float planar_speed() const;
 
 private:

@@ -249,28 +249,6 @@ void draw_bones(
     }
 }
 
-void draw_flat_bones(
-    const episode::FlatSkeletonWorldPose& pose,
-    float alpha = 1.0F) {
-    for (size_t bone = 0U;
-         bone < episode::kFlatSkeletonBoneCount;
-         ++bone) {
-        const int32_t parent = episode::kFlatSkeletonParents[bone];
-        DrawSphere(
-            ray(pose.positions[bone]),
-            0.018F,
-            with_alpha(DARKBLUE, alpha));
-        if (parent < 0) continue;
-        DrawCylinderEx(
-            ray(pose.positions[static_cast<size_t>(parent)]),
-            ray(pose.positions[bone]),
-            0.012F,
-            0.012F,
-            6,
-            with_alpha(SKYBLUE, alpha));
-    }
-}
-
 void draw_plan(const episode::ReachPlan& plan, vec3 live_root) {
     vec3 previous_root = live_root;
     if (plan.entry_waypoints_world.empty()) {
@@ -394,7 +372,7 @@ int main(int argc, char** argv) {
         const Options options = parse_options(argc, argv);
         const reach::Pack reach_pack = reach::load_pack(options.reach_pack);
         const std::filesystem::path walking_database =
-            "resources/database.bin";
+            options.episode_pack / "walking_database.bin";
         episode::EpisodeConfig episode_config{};
         episode_config.attachment.required_hold_seconds = 0.50F;
         episode::InteractionEpisode runtime(
@@ -721,9 +699,7 @@ int main(int argc, char** argv) {
                 : object;
             interaction::WorldPose world =
                 interaction::world_pose(runtime.output().pose);
-            const bool flat_visible =
-                runtime.output().flat_locomotion.valid;
-            if (show_mesh && mesh.loaded && !flat_visible &&
+            if (show_mesh && mesh.loaded &&
                 !::g1_mesh_renderer_update(
                     mesh,
                     slice1d<vec3>(
@@ -778,22 +754,10 @@ int main(int argc, char** argv) {
                         g1_skeleton::Simulation]);
             }
             draw_search_paths(accepted_paths);
-            if (flat_visible) {
-                const float bridge_alpha =
-                    runtime.output().bridge_alpha;
-                draw_flat_bones(
-                    runtime.output().flat_locomotion,
-                    1.0F - bridge_alpha);
-                if (runtime.state() == episode::EpisodeState::Bridge &&
-                    show_bones) {
-                    draw_bones(world, bridge_alpha);
-                }
-            } else {
-                if (show_mesh && mesh.loaded) {
-                    ::g1_mesh_renderer_draw(mesh);
-                }
-                if (show_bones) draw_bones(world);
+            if (show_mesh && mesh.loaded) {
+                ::g1_mesh_renderer_draw(mesh);
             }
+            if (show_bones) draw_bones(world);
             EndMode3D();
             draw_hud(
                 runtime,
