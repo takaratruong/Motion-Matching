@@ -30,6 +30,12 @@ bool near(quat left, quat right, float tolerance = 2.0e-3F) {
     return length(quat_to_scaled_angle_axis(delta)) <= tolerance;
 }
 
+float rotation_error(quat left, quat right) {
+    const quat delta = quat_abs(quat_mul(
+        quat_normalize(left), quat_inv(quat_normalize(right))));
+    return length(quat_to_scaled_angle_axis(delta));
+}
+
 bool same_pose(
     const interaction::Pose& left,
     const interaction::Pose& right) {
@@ -226,16 +232,19 @@ struct ReturnInput {
 };
 
 void test_inverse_time_warp_is_continuous_and_object_rigid() {
-    const ReturnInput input{};
+    ReturnInput input{};
+    input.hand_in_object = interaction::Transform{vec3(), quat()};
+    reach::SearchConfig config{};
+    config.coverage.accepted_orientation_radians = 0.02F;
     const reach::ShapedReturn shaped = reach::shape_recorded_return(
         input.pack,
         input.candidate,
         input.query,
         input.solved_contact,
         input.hand_in_object,
-        vec3(0.01F, 0.01F, 0.01F),
+        vec3(0.006F, 0.006F, 0.006F),
         interaction::EnvironmentGeometry{},
-        reach::SearchConfig{});
+        config);
 
     require(
         shaped.rejection == reach::ReturnRejection::None,
@@ -265,22 +274,61 @@ void test_inverse_time_warp_is_continuous_and_object_rigid() {
         near(actual_final.rotation, expected_final.rotation),
         "zero-weight return endpoint changed recorded wrist rotation");
 
-    for (const interaction::Pose& pose : shaped.poses) {
-        const interaction::Transform solved_hand =
-            g1_posture_fixture::left_hand_transform(pose);
-        const interaction::Transform object_world =
+    const interaction::Transform aligned_contact_hand =
+        g1_posture_fixture::left_hand_transform(input.aligned_contact);
+    const interaction::Transform solved_contact_hand =
+        g1_posture_fixture::left_hand_transform(input.solved_contact);
+    const interaction::Transform contact_delta = interaction::compose(
+        solved_contact_hand,
+        interaction::inverse(aligned_contact_hand));
+    const size_t return_count = shaped.poses.size() - 1U;
+    for (size_t sample = 0U; sample < shaped.poses.size(); ++sample) {
+        interaction::Transform expected_hand = solved_contact_hand;
+        if (sample > 0U) {
+            const interaction::Pose aligned_source = reach::place_pose(
+                input.pack,
+                input.candidate.clip,
+                input.candidate.yaw_index,
+                input.query.target.position,
+                static_cast<int32_t>(kContactFrame + sample));
+            const interaction::Transform aligned_source_hand =
+                g1_posture_fixture::left_hand_transform(aligned_source);
+            const float u = static_cast<float>(sample) /
+                static_cast<float>(return_count);
+            const float smooth = u * u * (3.0F - 2.0F * u);
+            const float weight = 1.0F - smooth;
+            expected_hand = interaction::compose(
+                {
+                    weight * contact_delta.position,
+                    quat_nlerp_shortest(
+                        quat(), contact_delta.rotation, weight),
+                },
+                aligned_source_hand);
+        }
+        const interaction::Transform actual_hand =
+            g1_posture_fixture::left_hand_transform(shaped.poses[sample]);
+        const interaction::Transform expected_object =
             interaction::compose(
-                solved_hand,
+                expected_hand,
                 interaction::inverse(input.hand_in_object));
-        const interaction::Transform reconstructed_hand =
+        const interaction::Transform actual_object =
             interaction::compose(
-                object_world, input.hand_in_object);
+                actual_hand,
+                interaction::inverse(input.hand_in_object));
         require(
-            near(reconstructed_hand.position, solved_hand.position, 1.0e-5F),
-            "frozen hand-in-object did not reconstruct wrist position");
+            near(
+                actual_object.position,
+                expected_object.position,
+                config.coverage.accepted_position_m + 1.0e-5F),
+            "attached object left expected frozen-hand trajectory at sample " +
+                std::to_string(sample));
         require(
-            near(reconstructed_hand.rotation, solved_hand.rotation, 1.0e-5F),
-            "frozen hand-in-object did not reconstruct wrist rotation");
+            rotation_error(
+                actual_object.rotation,
+                expected_object.rotation) <=
+                config.coverage.accepted_orientation_radians + 1.0e-5F,
+            "attached object left expected frozen-hand orientation at sample " +
+                std::to_string(sample));
     }
 }
 
@@ -306,6 +354,79 @@ void test_unreachable_return_reports_invalid_solver() {
     require(
         shaped.rejected_sample == 1U,
         "unreachable return did not identify its first solved frame");
+}
+
+void test_short_return_drops_large_contact_correction_at_endpoint() {
+    ReturnInput input{};
+    input.pack.database.range_stops.at(0) = 3;
+    input.aligned_contact = reach::place_pose(
+        input.pack,
+        input.candidate.clip,
+        input.candidate.yaw_index,
+        input.query.target.position,
+        static_cast<int32_t>(kContactFrame));
+    const interaction::Transform aligned_contact_hand =
+        g1_posture_fixture::left_hand_transform(input.aligned_contact);
+    input.query.target = {
+        aligned_contact_hand.position + vec3(0.0F, 0.025F, 0.0F),
+        quat_mul(
+            quat_from_angle_axis(
+                0.18F, vec3(0.0F, 1.0F, 0.0F)),
+            aligned_contact_hand.rotation),
+    };
+    input.solved_contact = input.aligned_contact;
+    interaction::PostureIKConfig contact_config{};
+    contact_config.maximum_iterations = 60;
+    const interaction::PostureIKResult contact =
+        interaction::solve_hand_posture_ik_task_priority(
+            input.solved_contact,
+            interaction::Hand::Left,
+            input.query.target,
+            input.aligned_contact,
+            interaction::decompose_upper_body(
+                input.aligned_contact, interaction::Hand::Left),
+            contact_config);
+    require(
+        contact.accepted,
+        "short-return fixture contact correction was not valid");
+
+    const reach::ShapedReturn shaped = reach::shape_recorded_return(
+        input.pack,
+        input.candidate,
+        input.query,
+        input.solved_contact,
+        input.hand_in_object,
+        vec3(0.01F, 0.01F, 0.01F),
+        interaction::EnvironmentGeometry{},
+        reach::SearchConfig{});
+
+    require(
+        shaped.rejection == reach::ReturnRejection::None,
+        "short reachable return was rejected");
+    require(
+        shaped.poses.size() == 2U,
+        "one-frame return did not publish contact and endpoint");
+    const interaction::Pose aligned_endpoint = reach::place_pose(
+        input.pack,
+        input.candidate.clip,
+        input.candidate.yaw_index,
+        input.query.target.position,
+        2);
+    const interaction::Transform expected =
+        g1_posture_fixture::left_hand_transform(aligned_endpoint);
+    const interaction::Transform actual =
+        g1_posture_fixture::left_hand_transform(shaped.poses.back());
+    const float position_error = length(actual.position - expected.position);
+    const float orientation_error =
+        rotation_error(actual.rotation, expected.rotation);
+    require(
+        position_error <= 1.0e-6F,
+        "final wrist retained transported position correction: " +
+            std::to_string(position_error));
+    require(
+        orientation_error <= 1.0e-6F,
+        "final wrist retained transported orientation correction: " +
+            std::to_string(orientation_error));
 }
 
 void test_held_object_crossing_rotated_box_reports_environment_collision() {
@@ -349,15 +470,108 @@ void test_held_object_crossing_rotated_box_reports_environment_collision() {
         shaped.rejection == reach::ReturnRejection::EnvironmentCollision,
         "held object crossing rotated box was not rejected");
     require(
-        shaped.rejected_sample == shaped.poses.size() - 1U,
+        shaped.rejected_sample ==
+            kReturnStop - kContactFrame - 1U,
         "held-object collision was not reported at the first overlap");
 }
 
-void test_zero_depth_support_contact_is_not_object_overlap() {
+void test_body_inside_held_object_reports_object_collision() {
+    ReturnInput input{};
+    input.solved_contact = input.aligned_contact;
+    const interaction::WorldPose world =
+        interaction::world_pose(input.solved_contact);
+    const interaction::Transform hand{
+        world.positions[g1_skeleton::LeftWrist],
+        world.rotations[g1_skeleton::LeftWrist],
+    };
+    const interaction::Transform body_object{
+        world.positions[g1_skeleton::Spine1],
+        quat(),
+    };
+    input.hand_in_object = interaction::compose(
+        interaction::inverse(body_object), hand);
+
+    const reach::ShapedReturn shaped = reach::shape_recorded_return(
+        input.pack,
+        input.candidate,
+        input.query,
+        input.solved_contact,
+        input.hand_in_object,
+        vec3(0.04F, 0.04F, 0.04F),
+        interaction::EnvironmentGeometry{},
+        reach::SearchConfig{});
+
+    require(
+        shaped.rejection == reach::ReturnRejection::ObjectCollision,
+        "body inside held object did not report object collision");
+    require(
+        shaped.rejected_sample == 0U,
+        "body/object collision did not report contact sample");
+}
+
+void test_body_inside_environment_reports_environment_collision() {
+    ReturnInput input{};
+    input.solved_contact = input.aligned_contact;
+    const interaction::WorldPose world =
+        interaction::world_pose(input.solved_contact);
+    interaction::EnvironmentGeometry environment{};
+    environment.boxes.push_back({
+        {
+            world.positions[g1_skeleton::Hips],
+            quat_from_angle_axis(
+                0.31F, normalize(vec3(1.0F, 0.4F, 0.2F))),
+        },
+        vec3(0.02F, 0.02F, 0.02F),
+    });
+
+    const reach::ShapedReturn shaped = reach::shape_recorded_return(
+        input.pack,
+        input.candidate,
+        input.query,
+        input.solved_contact,
+        input.hand_in_object,
+        vec3(0.008F, 0.008F, 0.008F),
+        environment,
+        reach::SearchConfig{});
+
+    require(
+        shaped.rejection == reach::ReturnRejection::EnvironmentCollision,
+        "body inside environment did not report environment collision");
+    require(
+        shaped.rejected_sample == 0U,
+        "body/environment collision did not report contact sample");
+}
+
+void test_active_grasp_wrist_inside_held_object_is_exempt() {
+    ReturnInput input{};
+    input.solved_contact = input.aligned_contact;
+    input.hand_in_object = interaction::Transform{
+        vec3(), quat()};
+
+    const reach::ShapedReturn shaped = reach::shape_recorded_return(
+        input.pack,
+        input.candidate,
+        input.query,
+        input.solved_contact,
+        input.hand_in_object,
+        vec3(0.006F, 0.006F, 0.006F),
+        interaction::EnvironmentGeometry{},
+        reach::SearchConfig{});
+
+    require(
+        shaped.rejection == reach::ReturnRejection::None,
+        "active grasp wrist inside held object was not exempt");
+    require(
+        shaped.poses.size() == kReturnStop - kContactFrame,
+        "active-wrist exemption did not preserve the full return");
+}
+
+void test_sat_tolerance_ignores_submicrometre_contact_but_rejects_overlap() {
     ReturnInput input{};
     input.solved_contact = input.aligned_contact;
     constexpr vec3 object_dimensions(0.008F, 0.008F, 0.008F);
     float minimum_bottom = std::numeric_limits<float>::infinity();
+    size_t minimum_sample = 0U;
     for (int32_t frame = static_cast<int32_t>(kContactFrame);
          frame < static_cast<int32_t>(kReturnStop);
          ++frame) {
@@ -383,18 +597,13 @@ void test_zero_depth_support_contact_is_not_object_overlap() {
             object_dimensions.x * std::abs(axis_x.y) +
             object_dimensions.y * std::abs(axis_y.y) +
             object_dimensions.z * std::abs(axis_z.y));
-        minimum_bottom = std::min(
-            minimum_bottom,
-            object.position.y - vertical_radius);
+        const float bottom = object.position.y - vertical_radius;
+        if (bottom < minimum_bottom) {
+            minimum_bottom = bottom;
+            minimum_sample = static_cast<size_t>(
+                frame - static_cast<int32_t>(kContactFrame));
+        }
     }
-    interaction::EnvironmentGeometry environment{};
-    environment.boxes.push_back({
-        {
-            vec3(0.0F, minimum_bottom - 0.05F, 0.0F),
-            quat(),
-        },
-        vec3(20.0F, 0.10F, 20.0F),
-    });
     const interaction::WorldPose contact_world =
         interaction::world_pose(input.solved_contact);
     const interaction::Transform contact_hand{
@@ -407,18 +616,23 @@ void test_zero_depth_support_contact_is_not_object_overlap() {
             interaction::inverse(input.hand_in_object)),
         object_dimensions,
     };
-    const vec3 contact_axis_x = quat_mul_vec3(
-        contact_object.world.rotation, vec3(1.0F, 0.0F, 0.0F));
-    const vec3 contact_axis_y = quat_mul_vec3(
-        contact_object.world.rotation, vec3(0.0F, 1.0F, 0.0F));
-    const vec3 contact_axis_z = quat_mul_vec3(
-        contact_object.world.rotation, vec3(0.0F, 0.0F, 1.0F));
-    const float contact_vertical_radius = 0.5F * (
-        object_dimensions.x * std::abs(contact_axis_x.y) +
-        object_dimensions.y * std::abs(contact_axis_y.y) +
-        object_dimensions.z * std::abs(contact_axis_z.y));
-    const float contact_bottom =
-        contact_object.world.position.y - contact_vertical_radius;
+    const auto environment_with_penetration =
+        [&](float penetration_m) {
+        interaction::EnvironmentGeometry environment{};
+        environment.boxes.push_back({
+            {
+                vec3(
+                    0.0F,
+                    minimum_bottom - 0.05F + penetration_m,
+                    0.0F),
+                quat(),
+            },
+            vec3(20.0F, 0.10F, 20.0F),
+        });
+        return environment;
+    };
+    const interaction::EnvironmentGeometry submicrometre =
+        environment_with_penetration(0.5e-6F);
     interaction::ShapedHandTrajectory single{};
     single.poses.push_back(input.solved_contact);
     single.path.hands.push_back(contact_hand);
@@ -431,29 +645,42 @@ void test_zero_depth_support_contact_is_not_object_overlap() {
             0U,
             interaction::Hand::Left,
             contact_object,
-            environment);
+            submicrometre);
     require(
         body_feasibility.reason ==
             interaction::TrajectoryFeasibilityReason::None,
         "support-contact fixture intersects the body");
 
-    const reach::ShapedReturn shaped = reach::shape_recorded_return(
+    const reach::ShapedReturn tolerated = reach::shape_recorded_return(
         input.pack,
         input.candidate,
         input.query,
         input.solved_contact,
         input.hand_in_object,
         object_dimensions,
-        environment,
+        submicrometre,
         reach::SearchConfig{});
-
     require(
-        shaped.rejection == reach::ReturnRejection::None,
-        "zero-depth support contact was treated as object overlap: rejection " +
-            std::to_string(static_cast<int>(shaped.rejection)) +
-            " at sample " + std::to_string(shaped.rejected_sample) +
-            ", contact gap " +
-            std::to_string(contact_bottom - minimum_bottom));
+        tolerated.rejection == reach::ReturnRejection::None,
+        "0.5 micrometre SAT penetration exceeded nominal 1 micrometre "
+        "overlap tolerance");
+
+    const reach::ShapedReturn overlapping = reach::shape_recorded_return(
+        input.pack,
+        input.candidate,
+        input.query,
+        input.solved_contact,
+        input.hand_in_object,
+        object_dimensions,
+        environment_with_penetration(2.0e-6F),
+        reach::SearchConfig{});
+    require(
+        overlapping.rejection ==
+            reach::ReturnRejection::EnvironmentCollision,
+        "2 micrometre SAT penetration was not rejected");
+    require(
+        overlapping.rejected_sample == minimum_sample,
+        "SAT boundary collision reported the wrong explicit sample");
 }
 
 }  // namespace
@@ -462,8 +689,12 @@ int main() {
     try {
         test_inverse_time_warp_is_continuous_and_object_rigid();
         test_unreachable_return_reports_invalid_solver();
+        test_short_return_drops_large_contact_correction_at_endpoint();
         test_held_object_crossing_rotated_box_reports_environment_collision();
-        test_zero_depth_support_contact_is_not_object_overlap();
+        test_body_inside_held_object_reports_object_collision();
+        test_body_inside_environment_reports_environment_collision();
+        test_active_grasp_wrist_inside_held_object_is_exempt();
+        test_sat_tolerance_ignores_submicrometre_contact_but_rejects_overlap();
         std::cout << "reach return PASS\n";
         return 0;
     } catch (const std::exception& error) {

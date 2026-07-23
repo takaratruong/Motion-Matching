@@ -60,6 +60,12 @@ float wrap_angle(float value) {
     return value - kPi;
 }
 
+float rotation_error(quat left, quat right) {
+    const quat delta = quat_abs(quat_mul(
+        quat_normalize(left), quat_inv(quat_normalize(right))));
+    return length(quat_to_scaled_angle_axis(delta));
+}
+
 std::array<vec3, 3U> box_axes(quat rotation) {
     rotation = quat_normalize(rotation);
     return {
@@ -318,12 +324,15 @@ ShapedReturn shape_recorded_return(
                 source_pose,
                 detail::interaction_hand(query.hand));
         interaction::UpperBodyAngles temporal_seed = source_angles;
-        for (size_t joint = 0U;
-             joint < interaction::kUpperBodyJointCount;
-             ++joint) {
-            temporal_seed[joint] += wrap_angle(
-                previous_solution[joint] -
-                previous_source[joint]);
+        const bool final_sample = sample == return_count;
+        if (!final_sample) {
+            for (size_t joint = 0U;
+                 joint < interaction::kUpperBodyJointCount;
+                 ++joint) {
+                temporal_seed[joint] += wrap_angle(
+                    previous_solution[joint] -
+                    previous_source[joint]);
+            }
         }
         const interaction::PostureIKResult ik =
             interaction::solve_hand_posture_ik_task_priority(
@@ -340,6 +349,22 @@ ShapedReturn shape_recorded_return(
             shaped.rejection = ReturnRejection::InvalidSolver;
             shaped.rejected_sample = sample;
             return shaped;
+        }
+        if (final_sample) {
+            constexpr float kEndpointPositionToleranceM = 1.0e-6F;
+            constexpr float kEndpointOrientationToleranceRadians = 1.0e-6F;
+            const interaction::Transform achieved =
+                detail::hand_transform(pose, query.hand);
+            if (length(achieved.position - aligned_source_hand.position) >
+                    kEndpointPositionToleranceM ||
+                rotation_error(
+                    achieved.rotation,
+                    aligned_source_hand.rotation) >
+                    kEndpointOrientationToleranceRadians) {
+                shaped.rejection = ReturnRejection::InvalidSolver;
+                shaped.rejected_sample = sample;
+                return shaped;
+            }
         }
         previous_source = source_angles;
         previous_solution = ik.joint_angles;
