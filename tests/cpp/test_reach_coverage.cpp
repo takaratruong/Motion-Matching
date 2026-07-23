@@ -857,6 +857,53 @@ void test_shared_grasp_shapes_both_hands_at_every_yaw() {
     assert(saw_left && saw_right);
 }
 
+bool near(float left, float right, float tolerance = 1.0e-5F) {
+    return std::abs(left - right) <= tolerance;
+}
+
+void test_wrist_path_quality_penalizes_hooks_and_is_rigid_invariant() {
+    const std::vector<vec3> direct = {
+        vec3(0.0F, 0.0F, 0.0F),
+        vec3(0.5F, 0.0F, 0.0F),
+        vec3(1.0F, 0.0F, 0.0F),
+    };
+    const std::vector<vec3> hooked = {
+        vec3(0.0F, 0.0F, 0.0F),
+        vec3(-0.25F, 0.0F, 0.0F),
+        vec3(0.5F, 0.0F, 0.0F),
+        vec3(1.0F, 0.0F, 0.0F),
+    };
+    const reach::WristPathQuality direct_quality =
+        reach::measure_wrist_path_quality(direct);
+    const reach::WristPathQuality hooked_quality =
+        reach::measure_wrist_path_quality(hooked);
+    assert(near(direct_quality.backtrack_ratio, 0.0F));
+    assert(near(direct_quality.excess_path_ratio, 0.0F));
+    assert(near(direct_quality.directness_cost, 0.0F));
+    assert(near(hooked_quality.backtrack_ratio, 0.25F));
+    assert(near(hooked_quality.excess_path_ratio, 0.50F));
+    assert(near(hooked_quality.directness_cost, 0.375F));
+
+    const quat yaw = quat_from_angle_axis(
+        1.1F, vec3(0.0F, 1.0F, 0.0F));
+    std::vector<vec3> transformed;
+    for (const vec3 point : hooked) {
+        transformed.push_back(
+            quat_mul_vec3(yaw, point) + vec3(4.0F, -2.0F, 7.0F));
+    }
+    const reach::WristPathQuality transformed_quality =
+        reach::measure_wrist_path_quality(transformed);
+    assert(near(
+        transformed_quality.backtrack_ratio,
+        hooked_quality.backtrack_ratio));
+    assert(near(
+        transformed_quality.excess_path_ratio,
+        hooked_quality.excess_path_ratio));
+    assert(near(
+        transformed_quality.directness_cost,
+        hooked_quality.directness_cost));
+}
+
 }  // namespace
 
 int main() {
@@ -881,4 +928,5 @@ int main() {
     test_sector_metric_counts_distinct_roots_that_share_a_yaw();
     test_enumeration_is_bilateral_exhaustive_and_query_invariant();
     test_shared_grasp_shapes_both_hands_at_every_yaw();
+    test_wrist_path_quality_penalizes_hooks_and_is_rigid_invariant();
 }

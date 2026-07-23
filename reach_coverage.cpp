@@ -196,6 +196,37 @@ void assign_final_errors(
 
 }  // namespace
 
+WristPathQuality measure_wrist_path_quality(
+    const std::vector<vec3>& path) {
+    const float invalid = std::numeric_limits<float>::infinity();
+    for (const vec3 point : path) {
+        if (!finite(point)) return {invalid, invalid, invalid};
+    }
+    if (path.size() < 2U) return {};
+
+    const vec3 endpoint = path.back();
+    const float denominator = std::max(
+        length(endpoint - path.front()), 0.05F);
+    float previous_distance = length(endpoint - path.front());
+    float backtrack = 0.0F;
+    float path_length = 0.0F;
+    for (size_t sample = 1U; sample < path.size(); ++sample) {
+        const float current_distance = length(endpoint - path[sample]);
+        backtrack += std::max(
+            0.0F, current_distance - previous_distance);
+        path_length += length(path[sample] - path[sample - 1U]);
+        previous_distance = current_distance;
+    }
+
+    WristPathQuality result{};
+    result.backtrack_ratio = backtrack / denominator;
+    result.excess_path_ratio = std::max(
+        0.0F, path_length / denominator - 1.0F);
+    result.directness_cost =
+        result.backtrack_ratio + 0.25F * result.excess_path_ratio;
+    return result;
+}
+
 std::vector<Candidate> enumerate_candidates(const Pack& pack) {
     std::vector<Candidate> candidates;
     candidates.reserve(

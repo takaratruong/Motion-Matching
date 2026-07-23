@@ -45,6 +45,12 @@ enum class Rejection : uint8_t {
 
 inline constexpr size_t kRejectionCount = 8U;
 
+struct WristPathQuality {
+    float backtrack_ratio = 0.0F;
+    float excess_path_ratio = 0.0F;
+    float directness_cost = 0.0F;
+};
+
 struct Evaluation {
     Candidate candidate{};
     std::vector<interaction::Pose> poses;
@@ -69,6 +75,9 @@ struct Diagnostics {
 };
 
 std::vector<Candidate> enumerate_candidates(const Pack& pack);
+
+WristPathQuality measure_wrist_path_quality(
+    const std::vector<vec3>& path);
 
 std::vector<Candidate> select_candidates(
     const Pack& pack,
