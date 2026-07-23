@@ -29,6 +29,7 @@
 - Design: `7133a06`; plan: `f557b3c`.
 - Scene/camera: `986816c` lowers the main tabletop to `0.65 m` and adds bounded left-drag orbit, middle-drag pan, and wheel zoom.
 - Mesh: `f75f5af` feeds the certified articulated G1 renderer and optional blue skeleton from the same selected 31-bone `WorldPose`; `M` and `B` are visual-only toggles with skeleton fallback.
+- Review hardening: `8c6213c` checks window readiness before mesh loading, wraps/bounds camera state, and exercises certified-GLB load/update/draw/unload in a hidden runtime test. Focused re-review found no remaining Critical or Important issues.
 - Automated gate: viewer Python contracts, certified mesh renderer test, exhaustive search/coverage/database/trajectory/IK tests, probe/viewer release builds, and unchanged-IK diff all passed on 2026-07-23.
 - Lowered-table real report: `build/g1-reaches/contact-anchored-coverage-report-v3.json`; every fixture completed 4,608/4,608 within 30 seconds.
 - Lowered-table counts: open space 388 accepted (7 sectors, 5.05 s); main table 0 (6.17 s); shelf 2 (1 sector, 5.77 s); below table 0 (5.49 s); lower table 2 (1 sector, 6.59 s). Gates were not weakened.
