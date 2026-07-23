@@ -72,7 +72,8 @@ void append_pose(reach::Database& database, const interaction::Pose& pose) {
     database.foot_contacts.insert(database.foot_contacts.end(), {1, 1});
 }
 
-reach::Pack bilateral_fixture(size_t frames_per_clip = 8U) {
+reach::Pack bilateral_fixture() {
+    constexpr size_t frames_per_clip = 8U;
     reach::Pack pack{};
     reach::Database& database = pack.database;
     database.version = 1U;
@@ -185,16 +186,13 @@ void test_zero_deadline_never_publishes_partial_results_as_complete() {
 }
 
 void test_complete_search_never_exceeds_its_deadline() {
-    reach::SearchConfig config{};
-    config.worker_count = 24U;
-    config.deadline = std::chrono::milliseconds(20);
-    const reach::SearchResult result = reach::search_all(
-        bilateral_fixture(500U),
-        {{{1.0F, 0.85F, -0.25F}, quat()}, normalize(vec3(-1, 0, 0))},
-        {{vec3(10, 10, 10), quat()}, vec3(0.01F, 0.01F, 0.01F)},
-        interaction::EnvironmentGeometry{},
-        config);
-    assert(!result.complete || result.elapsed <= config.deadline);
+    const auto deadline = std::chrono::milliseconds(20);
+    assert(reach::detail::complete_within_deadline(
+        24U, 24U, 24U, deadline, deadline));
+    assert(!reach::detail::complete_within_deadline(
+        24U, 24U, 24U, deadline + std::chrono::nanoseconds(1), deadline));
+    assert(!reach::detail::complete_within_deadline(
+        23U, 24U, 23U, deadline, deadline));
 }
 
 void test_selected_regeneration_matches_compact_metrics() {

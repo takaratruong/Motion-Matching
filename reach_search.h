@@ -34,6 +34,17 @@ struct SearchResult {
     std::vector<size_t> accepted;
 };
 
+namespace detail {
+
+bool complete_within_deadline(
+    size_t processed,
+    size_t total,
+    size_t retained,
+    std::chrono::steady_clock::duration elapsed,
+    std::chrono::steady_clock::duration deadline);
+
+}  // namespace detail
+
 SearchResult search_all(
     const Pack& pack,
     const ExhaustiveQuery& query,

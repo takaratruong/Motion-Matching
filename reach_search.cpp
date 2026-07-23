@@ -69,6 +69,19 @@ bool same_metric(float left, float right) {
 
 }  // namespace
 
+namespace detail {
+
+bool complete_within_deadline(
+    size_t processed,
+    size_t total,
+    size_t retained,
+    std::chrono::steady_clock::duration elapsed,
+    std::chrono::steady_clock::duration deadline) {
+    return processed == total && retained == total && elapsed <= deadline;
+}
+
+}  // namespace detail
+
 SearchResult search_all(
     const Pack& pack,
     const ExhaustiveQuery& query,
@@ -131,9 +144,12 @@ SearchResult search_all(
             result.evaluations.push_back(std::move(*slot));
         }
     }
-    result.complete = result.processed == result.total &&
-                      result.evaluations.size() == result.total &&
-                      result.elapsed <= config.deadline;
+    result.complete = detail::complete_within_deadline(
+        result.processed,
+        result.total,
+        result.evaluations.size(),
+        result.elapsed,
+        config.deadline);
     if (!result.complete) return result;
 
     for (size_t index = 0U; index < result.evaluations.size(); ++index) {
