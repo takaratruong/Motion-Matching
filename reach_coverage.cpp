@@ -415,9 +415,6 @@ Evaluation evaluate_candidate(
             world.positions[wrist], world.rotations[wrist]});
         shaped.path.elbows.push_back(world.positions[elbow_bone(query.hand)]);
     }
-    interaction::TrajectoryCollisionConfig reach_collision_config =
-        collision_config;
-    reach_collision_config.active_object_contact_window_samples = 5U;
     const interaction::TrajectoryFeasibility feasibility =
         interaction::evaluate_shaped_trajectory_feasibility(
             shaped,
@@ -425,7 +422,7 @@ Evaluation evaluate_candidate(
             interaction_hand(query.hand),
             object,
             environment,
-            reach_collision_config);
+            collision_config);
     evaluation.collision_sample = feasibility.sample;
     evaluation.object_collision_observed =
         feasibility.object_collision_observed;

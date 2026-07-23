@@ -529,8 +529,14 @@ void test_collision_stages_and_active_contact_exemption() {
     points_only.joint_radius_m = 0.0F;
     points_only.limb_radius_m = 0.0F;
     points_only.torso_radius_m = 0.0F;
+    const vec3 grasp_dimensions(1.0e-4F, 1.0e-5F, 1.0e-5F);
     const interaction::OrientedBox grasp_object{
-        {query.target.position, quat()}, vec3(1.0e-5F, 1.0e-5F, 1.0e-5F)};
+        {
+            query.target.position +
+                0.5F * grasp_dimensions.x * query.approach_world,
+            quat_between(vec3(1.0F, 0.0F, 0.0F), query.approach_world),
+        },
+        grasp_dimensions};
     assert(reach::evaluate_candidate(
         pack, candidate, query, grasp_object, open,
         reach::CoverageConfig{}, points_only).rejection ==

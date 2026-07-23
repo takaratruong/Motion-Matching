@@ -5,6 +5,8 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 VIEWER = ROOT / "g1_reach_coverage_viewer.cpp"
 PROBE = ROOT / "g1_reach_coverage_probe.cpp"
+REACH_COVERAGE = ROOT / "reach_coverage.cpp"
+TRAJECTORY_HEADER = ROOT / "interaction_hand_trajectories.h"
 MAKEFILE = ROOT / "Makefile"
 MESH_TEST = ROOT / "tests" / "cpp" / "test_g1_mesh_renderer.cpp"
 
@@ -126,6 +128,16 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
             "g1_mesh_renderer_unload(", "BeginDrawing()", "CloseWindow()",
         ):
             self.assertIn(required, source)
+
+    def test_reach_collision_uses_final_contact_only(self):
+        self.assertNotIn(
+            "active_object_contact_window_samples",
+            self.source(REACH_COVERAGE),
+        )
+        self.assertNotIn(
+            "active_object_contact_window_samples",
+            self.source(TRAJECTORY_HEADER),
+        )
 
     def test_probe_contract(self):
         source = self.source(PROBE)
