@@ -12,8 +12,8 @@
   `hand_in_object`. Reused the existing single-pose body-vs-object and
   body-vs-environment feasibility path with the active-hand object exemption,
   and added 15-axis oriented-box SAT for held-object-vs-environment overlap.
-  A 1 micrometre axis-scaled overlap tolerance preserves zero-depth support
-  contact while rejecting positive overlap.
+  An approximately 1 micrometre axis-scaled numerical tolerance preserves
+  zero-depth support contact; overlaps beyond that tolerance are rejected.
 - Changed playable plan selection to exclude empty returns before regeneration,
   rank all remaining playable candidates, preflight returns in cost order, and
   continue after failed regeneration/return preflight. The accepted
@@ -80,9 +80,8 @@ commit.
    overlap: rejection 4 at sample 0, contact gap 0.000000
    ```
 
-   After applying strict positive-overlap semantics with the axis-scaled float
-   tolerance, the tangent test and the existing rotated deep-overlap test both
-   passed.
+   After applying the axis-scaled float tolerance, the tangent test and the
+   existing rotated deep-overlap test both passed.
 
 ## Tests and exact results
 
@@ -169,12 +168,12 @@ Result: exit 0 with no output.
 
 None.
 
-## Review-fix implementation
+## Initial review-fix implementation
 
-- Changed the final recorded-return sample to start from the aligned recorded
-  source angles without the transported previous-frame joint correction. This
-  guarantees that zero target weight also means zero transported seed
-  correction.
+- The initial endpoint correction reset the final temporal seed to the aligned
+  recorded source. The follow-up contract fix documented below supersedes that
+  behavior: every later frame now retains the transported previous accepted
+  correction, including the final frame.
 - Added an explicit final-frame wrist check against the aligned recorded source
   endpoint, with position and orientation tolerances of `1e-6`.
 - Added a one-frame return regression with a valid 25 mm / 0.18 rad contact
@@ -217,8 +216,10 @@ reach return FAILED: final wrist retained transported position correction: 0.000
 The failure reproduced the review finding: the target correction weight was
 zero, but the transported temporal seed still biased the final IK solution.
 
-GREEN — after dropping the transported seed on the final sample and adding the
-explicit endpoint check:
+GREEN for the initial endpoint regression — after adding the explicit endpoint
+check. The later contract review found that resetting the final transported
+seed was not permitted; the superseding RED/GREEN evidence is documented
+below.
 
 ```bash
 make build/tests/test_reach_return
@@ -269,8 +270,9 @@ interaction episode PASS
 
 ## Review-fix self-review
 
-- Confirmed the final source target has exactly zero warped correction and the
-  final temporal seed is exactly the aligned recorded source angles.
+- Confirmed the final source target has exactly zero warped target correction.
+  The follow-up contract fix below supersedes the initial final-seed reset and
+  preserves transported temporal correction on that frame.
 - Confirmed the final achieved wrist position and orientation are explicitly
   checked against that source endpoint before the frame is accepted.
 - Confirmed the short-return regression uses a solved, accepted large contact
@@ -289,5 +291,126 @@ interaction episode PASS
   `.superpowers/sdd/progress.md` modification, remain outside this change.
 
 ## Review-fix concerns
+
+None.
+
+## Final temporal-transport contract fix
+
+### Implementation
+
+- Restored transported previous accepted solved-minus-source joint correction
+  as the temporal seed on every recorded-return frame, including the final
+  frame.
+- Kept the final target at the aligned recorded nominal endpoint and introduced
+  a final-only `PostureIKConfig` whose accepted position and orientation errors
+  are both `1e-6`. This causes task-priority polish to satisfy the endpoint
+  while retaining the transported input seed.
+- Kept the independent achieved-wrist position/orientation endpoint check at
+  the same `1e-6` tolerances.
+- Strengthened the short-return / 25 mm / 0.18 rad contact-correction test. It
+  still checks the exact final wrist endpoint, proves that the fixture produces
+  a materially distinct transported final seed, and compares the returned
+  posture against an independently solved transported-seed endpoint reference.
+  In this fixture the polished nominal endpoint posture coincides with the
+  source posture, so seed use cannot be distinguished from final pose alone.
+- Corrected SAT wording throughout this report: the SAT permits approximately
+  1 micrometre of axis-scaled numerical tolerance and rejects overlap beyond
+  that tolerance; it does not claim rejection of every positive overlap.
+
+Files changed:
+
+- `reach_return.cpp`
+- `tests/cpp/test_reach_return.cpp`
+- `.superpowers/sdd/task-4-report.md`
+
+### RED/GREEN evidence
+
+RED — after restoring required temporal transport on the final frame but before
+tightening its IK acceptance config:
+
+```bash
+make build/tests/test_reach_return && ./build/tests/test_reach_return
+```
+
+Result: exit 1.
+
+```text
+g++ -std=c++17 -Wall -Wextra -Werror -pedantic -I. tests/cpp/test_reach_return.cpp \
+  reach_return.cpp reach_placement.cpp reach_database.cpp reach_motion.cpp \
+  interaction_hand_trajectories.cpp interaction_posture_ik.cpp \
+  interaction_ik.cpp interaction_pose.cpp interaction_target.cpp -o build/tests/test_reach_return
+reach return FAILED: reachable return was rejected
+```
+
+GREEN — after selecting the final-only `1e-6` position/orientation acceptance
+config:
+
+```bash
+make build/tests/test_reach_return && ./build/tests/test_reach_return
+```
+
+Result: exit 0.
+
+```text
+g++ -std=c++17 -Wall -Wextra -Werror -pedantic -I. tests/cpp/test_reach_return.cpp \
+  reach_return.cpp reach_placement.cpp reach_database.cpp reach_motion.cpp \
+  interaction_hand_trajectories.cpp interaction_posture_ik.cpp \
+  interaction_ik.cpp interaction_pose.cpp interaction_target.cpp -o build/tests/test_reach_return
+reach return PASS
+```
+
+### Exact required regression run
+
+Commands:
+
+```bash
+make build/tests/test_reach_return build/tests/test_reach_coverage build/tests/test_reach_search build/tests/test_episode_reach_planner build/tests/test_interaction_episode
+./build/tests/test_reach_return
+./build/tests/test_reach_coverage
+./build/tests/test_reach_search
+./build/tests/test_episode_reach_planner
+./build/tests/test_interaction_episode
+```
+
+Result: exit 0. Exact output:
+
+```text
+make: 'build/tests/test_reach_return' is up to date.
+make: 'build/tests/test_reach_coverage' is up to date.
+make: 'build/tests/test_reach_search' is up to date.
+g++ -std=c++17 -Wall -Wextra -Werror -pedantic -I. -pthread \
+  tests/cpp/test_episode_reach_planner.cpp \
+  episode_grasp_provider.cpp episode_reach_planner.cpp \
+  reach_return.cpp \
+  reach_search.cpp reach_coverage.cpp reach_placement.cpp \
+  reach_database.cpp reach_motion.cpp interaction_hand_trajectories.cpp \
+  interaction_posture_ik.cpp interaction_ik.cpp interaction_pose.cpp \
+  interaction_target.cpp -o build/tests/test_episode_reach_planner
+make: 'build/tests/test_interaction_episode' is up to date.
+reach return PASS
+episode reach planner PASS
+interaction episode PASS
+```
+
+`test_reach_coverage` and `test_reach_search` are silent on success.
+
+### Self-review
+
+- Confirmed there is no final-frame exception in transported temporal-seed
+  construction.
+- Confirmed only the final sample receives the tightened IK acceptance values;
+  earlier return frames retain the established coverage acceptance values.
+- Confirmed the endpoint tolerances are shared by the final IK acceptance
+  config and the explicit achieved-wrist endpoint check.
+- Confirmed target correction weight remains zero on the final sample while
+  temporal correction remains transported.
+- Confirmed the focused regression exercises a nontrivial transported seed and
+  checks both endpoint position and orientation.
+- Confirmed the exact required coverage, search, planner, and interaction
+  regressions pass.
+- Confirmed `git diff --check` exits 0 and no generated pack or binary is part
+  of this fix.
+
+### Concerns
 
 None.

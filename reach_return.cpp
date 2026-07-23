@@ -298,6 +298,8 @@ ShapedReturn shape_recorded_return(
         config.coverage.accepted_position_m;
     posture_config.accepted_orientation_radians =
         config.coverage.accepted_orientation_radians;
+    constexpr float kEndpointPositionToleranceM = 1.0e-6F;
+    constexpr float kEndpointOrientationToleranceRadians = 1.0e-6F;
 
     for (size_t sample = 1U; sample <= return_count; ++sample) {
         interaction::Pose pose = place_pose(
@@ -325,14 +327,19 @@ ShapedReturn shape_recorded_return(
                 detail::interaction_hand(query.hand));
         interaction::UpperBodyAngles temporal_seed = source_angles;
         const bool final_sample = sample == return_count;
-        if (!final_sample) {
-            for (size_t joint = 0U;
-                 joint < interaction::kUpperBodyJointCount;
-                 ++joint) {
-                temporal_seed[joint] += wrap_angle(
-                    previous_solution[joint] -
-                    previous_source[joint]);
-            }
+        for (size_t joint = 0U;
+             joint < interaction::kUpperBodyJointCount;
+             ++joint) {
+            temporal_seed[joint] += wrap_angle(
+                previous_solution[joint] -
+                previous_source[joint]);
+        }
+        interaction::PostureIKConfig sample_config = posture_config;
+        if (final_sample) {
+            sample_config.accepted_position_m =
+                kEndpointPositionToleranceM;
+            sample_config.accepted_orientation_radians =
+                kEndpointOrientationToleranceRadians;
         }
         const interaction::PostureIKResult ik =
             interaction::solve_hand_posture_ik_task_priority(
@@ -341,7 +348,7 @@ ShapedReturn shape_recorded_return(
                 target,
                 source_pose,
                 temporal_seed,
-                posture_config);
+                sample_config);
         if (!ik.accepted || !finite_pose(pose) ||
             !finite(ik.position_error_m) ||
             !finite(ik.orientation_error_radians) ||
@@ -351,8 +358,6 @@ ShapedReturn shape_recorded_return(
             return shaped;
         }
         if (final_sample) {
-            constexpr float kEndpointPositionToleranceM = 1.0e-6F;
-            constexpr float kEndpointOrientationToleranceRadians = 1.0e-6F;
             const interaction::Transform achieved =
                 detail::hand_transform(pose, query.hand);
             if (length(achieved.position - aligned_source_hand.position) >

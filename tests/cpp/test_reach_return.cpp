@@ -2,6 +2,7 @@
 #include "reach_placement.h"
 #include "reach_return.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
@@ -34,6 +35,13 @@ float rotation_error(quat left, quat right) {
     const quat delta = quat_abs(quat_mul(
         quat_normalize(left), quat_inv(quat_normalize(right))));
     return length(quat_to_scaled_angle_axis(delta));
+}
+
+float wrap_angle(float value) {
+    constexpr float kPi = 3.14159265358979323846F;
+    value = std::fmod(value + kPi, 2.0F * kPi);
+    if (value < 0.0F) value += 2.0F * kPi;
+    return value - kPi;
 }
 
 bool same_pose(
@@ -356,7 +364,7 @@ void test_unreachable_return_reports_invalid_solver() {
         "unreachable return did not identify its first solved frame");
 }
 
-void test_short_return_drops_large_contact_correction_at_endpoint() {
+void test_short_return_transports_correction_and_reaches_exact_endpoint() {
     ReturnInput input{};
     input.pack.database.range_stops.at(0) = 3;
     input.aligned_contact = reach::place_pose(
@@ -427,6 +435,63 @@ void test_short_return_drops_large_contact_correction_at_endpoint() {
         orientation_error <= 1.0e-6F,
         "final wrist retained transported orientation correction: " +
             std::to_string(orientation_error));
+
+    const interaction::UpperBodyAngles contact_source_angles =
+        interaction::decompose_upper_body(
+            input.aligned_contact, interaction::Hand::Left);
+    const interaction::UpperBodyAngles contact_solution_angles =
+        interaction::decompose_upper_body(
+            input.solved_contact, interaction::Hand::Left);
+    const interaction::UpperBodyAngles endpoint_source_angles =
+        interaction::decompose_upper_body(
+            aligned_endpoint, interaction::Hand::Left);
+    interaction::UpperBodyAngles transported_seed =
+        endpoint_source_angles;
+    float transported_seed_difference = 0.0F;
+    for (size_t joint = 0U; joint < transported_seed.size(); ++joint) {
+        transported_seed[joint] += wrap_angle(
+            contact_solution_angles[joint] -
+            contact_source_angles[joint]);
+        transported_seed_difference = std::max(
+            transported_seed_difference,
+            std::abs(wrap_angle(
+                transported_seed[joint] -
+                endpoint_source_angles[joint])));
+    }
+    require(
+        transported_seed_difference > 1.0e-3F,
+        "large contact correction did not produce a distinct transported "
+        "final seed");
+    interaction::PostureIKConfig endpoint_config{};
+    endpoint_config.accepted_position_m = 1.0e-6F;
+    endpoint_config.accepted_orientation_radians = 1.0e-6F;
+    interaction::Pose transported_endpoint = aligned_endpoint;
+    const interaction::PostureIKResult transported =
+        interaction::solve_hand_posture_ik_task_priority(
+            transported_endpoint,
+            interaction::Hand::Left,
+            expected,
+            aligned_endpoint,
+            transported_seed,
+            endpoint_config);
+    require(
+        transported.accepted,
+        "transported final-frame reference solve was not accepted");
+    const interaction::UpperBodyAngles actual_angles =
+        interaction::decompose_upper_body(
+            shaped.poses.back(), interaction::Hand::Left);
+    float transported_match_error = 0.0F;
+    for (size_t joint = 0U; joint < actual_angles.size(); ++joint) {
+        transported_match_error = std::max(
+            transported_match_error,
+            std::abs(wrap_angle(
+                actual_angles[joint] -
+                transported.joint_angles[joint])));
+    }
+    require(
+        transported_match_error <= 1.0e-5F,
+        "final-frame posture did not preserve transported correction: " +
+            std::to_string(transported_match_error));
 }
 
 void test_held_object_crossing_rotated_box_reports_environment_collision() {
@@ -689,7 +754,7 @@ int main() {
     try {
         test_inverse_time_warp_is_continuous_and_object_rigid();
         test_unreachable_return_reports_invalid_solver();
-        test_short_return_drops_large_contact_correction_at_endpoint();
+        test_short_return_transports_correction_and_reaches_exact_endpoint();
         test_held_object_crossing_rotated_box_reports_environment_collision();
         test_body_inside_held_object_reports_object_collision();
         test_body_inside_environment_reports_environment_collision();
