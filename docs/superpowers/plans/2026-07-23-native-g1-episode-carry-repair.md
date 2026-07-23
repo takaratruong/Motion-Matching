@@ -19,17 +19,6 @@
 - Do not load or render terrain in this repair.
 - Do not commit generated `build/g1-reaches/` data or root-level viewer/probe binaries.
 
-## Live Acceptance Correction
-
-Driven clip-168 testing showed that retaining the final reach pose as the
-permanent arm layer does not return to a nominal carry and that a rejected IK
-fallback can freeze the legs. The accepted implementation therefore loads the
-first native G1 pose from the selected left/right carry database as an
-upper-body posture reference only. Walking still owns the root and lower body;
-the carry blend moves the active arm from reach contact to the nominal carry
-posture, and an IK fallback preserves the current walking pose while retaining
-only the last-safe active-arm branch.
-
 ---
 
 ### Task 1: Correct Camera-Relative Controls

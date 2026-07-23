@@ -59,8 +59,7 @@ void test_hand(interaction::Hand hand) {
             interaction::inverse(object_world), hand_world);
 
     episode::LayeredCarry carry;
-    carry.start(
-        hold, hold, hand, hand_in_object, object_world);
+    carry.start(hold, hand, hand_in_object, object_world);
     const vec3 start_root =
         hold.positions[g1_skeleton::Simulation];
     float maximum_knee_change = 0.0F;
@@ -104,12 +103,6 @@ void test_hand(interaction::Hand hand) {
         require(
             finite_pose(pose),
             "layered carry published a non-finite pose");
-        require(
-            carry.last_position_error_m() < 0.01F,
-            "accepted carry exceeded position error bound");
-        require(
-            carry.last_orientation_error_radians() < 0.30F,
-            "accepted carry exceeded orientation error bound");
         previous = pose;
     }
     require(
@@ -125,56 +118,48 @@ void test_hand(interaction::Hand hand) {
         "layered carry froze the inactive arm");
 }
 
-void test_nominal_carry_posture_replaces_reach_arm() {
+void test_unreachable_target_uses_last_safe_pose() {
     episode::FlatMotionMatcher matcher(
         "build/g1-episode/walking_database.bin");
-    const interaction::Pose nominal =
-        episode::load_native_g1_reference_pose(
-            "build/g1-episode/carry_left_database.bin");
-    require(
-        finite_pose(nominal),
-        "carry database did not provide a finite posture reference");
-    interaction::Pose reach = nominal;
-    reach.rotations[g1_skeleton::LeftShoulderPitch] =
-        quat_normalize(quat_mul(
-            quat_from_angle_axis(
-                0.45F, vec3(0.0F, 0.0F, -1.0F)),
-            reach.rotations[g1_skeleton::LeftShoulderPitch]));
+    const interaction::Pose hold = matcher.snapshot().pose;
     const interaction::WorldPose world =
-        interaction::world_pose(reach);
+        interaction::world_pose(hold);
     const interaction::Transform hand_world{
         world.positions[g1_skeleton::LeftWrist],
         world.rotations[g1_skeleton::LeftWrist],
     };
-    const interaction::Transform object_world{
+    interaction::Transform object_world{
         hand_world.position + vec3(0.0F, -0.05F, 0.0F),
         hand_world.rotation,
     };
     const interaction::Transform hand_in_object =
         interaction::compose(
             interaction::inverse(object_world), hand_world);
+    object_world.position.x += 5.0F;
+
     episode::LayeredCarry carry;
     carry.start(
-        reach,
-        nominal,
+        hold,
         interaction::Hand::Left,
         hand_in_object,
         object_world);
-    const interaction::Pose& pose =
+    matcher.update(
+        {vec3(0.0F, 0.0F, 0.22F), quat()},
+        1.0F / 25.0F);
+    const interaction::Pose& fallback =
         carry.update(matcher.snapshot());
     require(
-        carry.last_solve_accepted(),
-        "nominal carry posture was not accepted");
+        !carry.last_solve_accepted(),
+        "unreachable target was incorrectly accepted");
     require(
-        quat_angle_between(
-            pose.rotations[g1_skeleton::LeftShoulderPitch],
-            nominal.rotations[
-                g1_skeleton::LeftShoulderPitch]) <
-            quat_angle_between(
-                reach.rotations[g1_skeleton::LeftShoulderPitch],
-                nominal.rotations[
-                    g1_skeleton::LeftShoulderPitch]),
-        "active arm did not return toward nominal carry posture");
+        finite_pose(fallback),
+        "unreachable target published a non-finite fallback");
+    require(
+        length(
+            fallback.positions[g1_skeleton::Simulation] -
+            matcher.snapshot().pose.positions[
+                g1_skeleton::Simulation]) < 1.0e-5F,
+        "fallback did not retain the live locomotion root");
 }
 
 }  // namespace
@@ -183,7 +168,7 @@ int main() {
     try {
         test_hand(interaction::Hand::Left);
         test_hand(interaction::Hand::Right);
-        test_nominal_carry_posture_replaces_reach_arm();
+        test_unreachable_target_uses_last_safe_pose();
         std::cout << "episode layered carry PASS\n";
         return 0;
     } catch (const std::exception& error) {

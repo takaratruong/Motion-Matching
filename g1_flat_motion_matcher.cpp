@@ -117,28 +117,6 @@ FlatWorldPose flat_world_pose(const FlatPose& pose) {
 
 }  // namespace
 
-interaction::Pose load_native_g1_reference_pose(
-    const std::filesystem::path& database_path) {
-    database source{};
-    database_load(source, database_path.string().c_str());
-    if (source.nbones() != g1_skeleton::BoneCount ||
-        source.nframes() < 1 ||
-        source.nranges() < 1) {
-        throw std::invalid_argument(
-            "carry posture database must use native 31-bone G1");
-    }
-    for (size_t bone = 0U;
-         bone < g1_skeleton::BoneCount;
-         ++bone) {
-        if (source.bone_parents(static_cast<int>(bone)) !=
-            g1_skeleton::kParents[bone]) {
-            throw std::invalid_argument(
-                "carry posture database G1 hierarchy mismatch");
-        }
-    }
-    return database_pose31(source, source.range_starts(0));
-}
-
 FlatMotionMatcher::FlatMotionMatcher(
     const std::filesystem::path& database_path,
     const std::filesystem::path& g1_reference_database) {

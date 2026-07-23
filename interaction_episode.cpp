@@ -94,10 +94,6 @@ InteractionEpisode::InteractionEpisode(
         throw std::invalid_argument(
             "playable episode walking database must use native 31-bone G1");
     }
-    carry_left_reference_ =
-        load_native_g1_reference_pose(carry_left_database_);
-    carry_right_reference_ =
-        load_native_g1_reference_pose(carry_right_database_);
     output_.pose = matcher_.snapshot().pose;
     output_.state = state_;
 }
@@ -391,9 +387,6 @@ void InteractionEpisode::update_reach(float dt) {
     matcher_.switch_database(walking_database_, contact_pose_);
     layered_carry_.start(
         contact_pose_,
-        output_.selected_hand == interaction::Hand::Left
-            ? carry_left_reference_
-            : carry_right_reference_,
         output_.selected_hand,
         hand_in_object_,
         output_.object_world);
@@ -408,14 +401,7 @@ void InteractionEpisode::update_carry(const EpisodeInput& input) {
     output_.diagnostic = layered_carry_.last_solve_accepted()
         ? std::string{}
         : std::string{
-              "carry IK rejected ("} +
-              std::to_string(
-                  layered_carry_.last_position_error_m() * 100.0F) +
-              " cm, " +
-              std::to_string(
-                  layered_carry_.last_orientation_error_radians() *
-                  57.2957795F) +
-              " deg); using last safe active-arm branch";
+              "carry IK rejected; using last safe active-arm branch"};
     if (state_ == EpisodeState::CarryBlend) {
         state_seconds_ += input.dt;
         const float alpha = smoothstep(
@@ -463,14 +449,7 @@ void InteractionEpisode::update_place_approach(
     output_.diagnostic = layered_carry_.last_solve_accepted()
         ? std::string{}
         : std::string{
-              "carry IK rejected ("} +
-              std::to_string(
-                  layered_carry_.last_position_error_m() * 100.0F) +
-              " cm, " +
-              std::to_string(
-                  layered_carry_.last_orientation_error_radians() *
-                  57.2957795F) +
-              " deg); using last safe active-arm branch";
+              "carry IK rejected; using last safe active-arm branch"};
     update_attached_object(input.dt);
     if (state_ == EpisodeState::Failed) return;
 
@@ -647,9 +626,6 @@ void InteractionEpisode::cancel_place_before_release() {
     matcher_.switch_database(walking_database_, output_.pose);
     layered_carry_.start(
         output_.pose,
-        output_.selected_hand == interaction::Hand::Left
-            ? carry_left_reference_
-            : carry_right_reference_,
         output_.selected_hand,
         hand_in_object_,
         output_.object_world);

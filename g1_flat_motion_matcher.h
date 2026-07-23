@@ -27,9 +27,6 @@ struct FlatSkeletonWorldPose {
     bool valid = false;
 };
 
-interaction::Pose load_native_g1_reference_pose(
-    const std::filesystem::path& database_path);
-
 class FlatMotionMatcher {
 public:
     explicit FlatMotionMatcher(

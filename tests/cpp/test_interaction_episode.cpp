@@ -120,13 +120,13 @@ void test_freeze_attach_and_selected_carry_hand(reach::Hand hand) {
         "selected reach hand was not propagated into carry");
 }
 
-void test_layered_carry_uses_posture_database_without_switching_locomotion(
+void test_layered_carry_does_not_require_full_pose_carry_databases(
     reach::Hand hand) {
     const std::filesystem::path pack("build/g1-episode");
     episode::InteractionEpisode runtime(
         pack / "walking_database.bin",
-        pack / "carry_left_database.bin",
-        pack / "carry_right_database.bin",
+        pack / "missing-carry-left.bin",
+        pack / "missing-carry-right.bin",
         fast_config());
     const auto attempt = make_attempt(
         runtime.output().pose, hand, 17U, 101U, 13U);
@@ -424,9 +424,9 @@ int main() {
     try {
         test_freeze_attach_and_selected_carry_hand(reach::Hand::Left);
         test_freeze_attach_and_selected_carry_hand(reach::Hand::Right);
-        test_layered_carry_uses_posture_database_without_switching_locomotion(
+        test_layered_carry_does_not_require_full_pose_carry_databases(
             reach::Hand::Left);
-        test_layered_carry_uses_posture_database_without_switching_locomotion(
+        test_layered_carry_does_not_require_full_pose_carry_databases(
             reach::Hand::Right);
         test_generation_change_and_cancel_fail_before_contact();
         test_contact_rejection_timeout_and_reset();
