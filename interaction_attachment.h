@@ -22,6 +22,7 @@ struct AttachmentConfig {
     float maximum_orientation_error_radians = 0.261799388F;
     float required_lift_m = 0.15F;
     float required_hold_seconds = 1.00F;
+    bool require_lift_for_hold = true;
 };
 
 struct ContactMeasurement {

@@ -359,6 +359,7 @@ void test_frozen_public_contract_and_defaults() {
     assert(config.maximum_orientation_error_radians == 0.261799388F);
     assert(config.required_lift_m == 0.15F);
     assert(config.required_hold_seconds == 1.00F);
+    assert(config.require_lift_for_hold);
 
     TargetRegistry registry;
     const AttachmentController unstarted(registry);
@@ -553,6 +554,32 @@ void test_object_follows_grasp_and_hold_requires_continuous_lift() {
     assert(attachment.result() == ResultCode::Succeeded);
     assert(attachment.held_seconds() >= 1.0F);
     assert(near(attachment.object_world(), carried));
+}
+
+void test_hold_can_be_contact_timed_without_world_height_gain() {
+    using namespace interaction;
+
+    AttachmentFixture fixture = make_fixture();
+    AttachmentConfig config{};
+    config.required_hold_seconds = 0.50F;
+    config.require_lift_for_hold = false;
+    AttachmentController attachment(fixture.registry, config);
+    assert(attachment.begin(
+        fixture.target,
+        fixture.request,
+        fixture.affordance,
+        fixture.target.object_world.position.y));
+    assert(attachment.try_contact(valid_measurement(fixture)));
+
+    Transform lowered = fixture.target.object_world;
+    lowered.position.y -= 0.30F;
+    const ContactMeasurement measurement =
+        measurement_for_object(fixture, lowered);
+    attachment.update(measurement, 0.25F);
+    assert(attachment.state() == ObjectState::Attached);
+    attachment.update(measurement, 0.25F);
+    assert(attachment.state() == ObjectState::Held);
+    assert(near(attachment.object_world(), lowered));
 }
 
 void test_post_attach_updates_require_contact_but_not_a_second_event() {
@@ -1391,6 +1418,7 @@ int main() {
     test_valid_contact_attaches_at_inclusive_boundaries();
     test_failed_contact_can_be_remeasured_without_teleporting();
     test_object_follows_grasp_and_hold_requires_continuous_lift();
+    test_hold_can_be_contact_timed_without_world_height_gain();
     test_post_attach_updates_require_contact_but_not_a_second_event();
     test_held_contact_loss_is_terminal_and_freezes_last_valid_state();
     test_generation_change_fails_without_attaching_replacement();

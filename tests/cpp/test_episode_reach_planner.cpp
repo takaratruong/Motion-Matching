@@ -1,5 +1,6 @@
 #include "episode_grasp_provider.h"
 #include "episode_reach_planner.h"
+#include "interaction_episode.h"
 
 #include <algorithm>
 #include <cmath>
@@ -105,6 +106,146 @@ void test_entry_segment_rejects_expanded_obstacle() {
         "clear entry segment was rejected");
 }
 
+void test_required_hand_filter_is_contextual() {
+    require(
+        episode::reach_hand_allowed(
+            reach::Hand::Left, std::nullopt) &&
+            episode::reach_hand_allowed(
+                reach::Hand::Right, std::nullopt),
+        "pickup hand-agnostic mode rejected a hand");
+    require(
+        episode::reach_hand_allowed(
+            reach::Hand::Left, reach::Hand::Left) &&
+            !episode::reach_hand_allowed(
+                reach::Hand::Right, reach::Hand::Left),
+        "placement did not retain the currently attached hand");
+}
+
+void test_entry_path_routes_around_blocking_geometry() {
+    interaction::EnvironmentGeometry environment{};
+    environment.boxes.push_back({
+        {vec3(0.0F, 0.5F, 0.0F), quat()},
+        vec3(0.40F, 1.0F, 0.40F),
+    });
+    const vec3 start(-1.0F, 0.0F, 0.0F);
+    const vec3 entry(1.0F, 0.0F, 0.0F);
+    require(
+        !episode::entry_segment_clear(
+            start, entry, environment, 0.28F),
+        "path fixture was not blocked");
+    const auto path = episode::find_entry_path(
+        start, entry, environment, 0.28F);
+    require(path.has_value(), "visibility graph did not find a detour");
+    require(
+        path->size() >= 2U && path->back().x == entry.x &&
+            path->back().z == entry.z,
+        "entry path did not retain detour and certified endpoint");
+    const auto certified_start_path = episode::find_entry_path(
+        vec3(-0.30F, 0.0F, 0.0F),
+        entry,
+        environment,
+        0.28F);
+    require(
+        certified_start_path.has_value(),
+        "path could not exit a certified start neighborhood");
+}
+
+void test_entry_path_rejects_an_unbounded_endpoint_exemption() {
+    interaction::EnvironmentGeometry environment{};
+    environment.boxes.push_back({
+        {vec3(0.0F, 0.5F, 0.0F), quat()},
+        vec3(2.0F, 1.0F, 2.0F),
+    });
+    const auto path = episode::find_entry_path(
+        vec3(0.0F, 0.0F, 0.0F),
+        vec3(2.0F, 0.0F, 0.0F),
+        environment,
+        0.28F);
+    require(
+        !path.has_value(),
+        "path accepted an arbitrarily long colliding endpoint prefix");
+}
+
+void test_waypoint_arrival_stays_inside_corner_clearance_margin() {
+    const episode::EpisodeConfig config{};
+    require(
+        config.waypoint_reached_m >= 0.08F,
+        "waypoint tolerance is below locomotion convergence resolution");
+    require(
+        config.waypoint_reached_m + 0.05F <=
+            episode::kEntryPathCornerMarginM,
+        "waypoint follower can turn outside the planner corner margin");
+    require(
+        config.approach_timeout_seconds >= 20.0F,
+        "routed approach timeout cannot cover a furniture detour");
+    require(
+        !config.attachment.require_lift_for_hold,
+        "episode defaults still prevent downward high-shelf pickup");
+}
+
+void test_nearest_support_tracks_a_moved_destination() {
+    interaction::EnvironmentGeometry environment{};
+    environment.boxes.push_back({
+        {vec3(0.0F, 0.47F, 0.0F), quat()},
+        vec3(1.0F, 0.06F, 1.0F),
+    });
+    environment.boxes.push_back({
+        {vec3(2.0F, 0.98F, 0.0F), quat()},
+        vec3(0.8F, 0.04F, 0.8F),
+    });
+    const vec3 object_size(0.10F, 0.10F, 0.10F);
+    const std::optional<size_t> lower =
+        episode::find_support_index(
+            environment,
+            {vec3(0.0F, 0.55F, 0.0F), quat()},
+            object_size);
+    require(
+        lower.has_value() && *lower == 0U,
+        "lower destination did not retain its support");
+    const std::optional<size_t> upper =
+        episode::find_support_index(
+            environment,
+            {vec3(2.0F, 1.05F, 0.0F), quat()},
+            object_size);
+    require(
+        upper.has_value() && *upper == 1U,
+        "moved destination retained stale support metadata");
+    require(
+        !episode::find_support_index(
+            environment,
+            {vec3(2.0F, 1.40F, 0.0F), quat()},
+            object_size).has_value(),
+        "floating destination inherited an unrelated support");
+
+    interaction::EnvironmentGeometry leg_only{};
+    leg_only.boxes.push_back({
+        {vec3(0.0F, 0.50F, 0.0F), quat()},
+        vec3(0.05F, 1.00F, 0.05F),
+    });
+    require(
+        !episode::find_support_index(
+            leg_only,
+            {vec3(0.0F, 1.05F, 0.0F), quat()},
+            object_size).has_value(),
+        "vertical furniture member was treated as a support surface");
+
+    interaction::EnvironmentGeometry rotated_slab{};
+    rotated_slab.boxes.push_back({
+        {
+            vec3(0.0F, 0.50F, 0.0F),
+            quat_from_angle_axis(
+                1.570796327F, vec3(0.0F, 0.0F, 1.0F)),
+        },
+        vec3(1.0F, 0.04F, 1.0F),
+    });
+    require(
+        !episode::find_support_index(
+            rotated_slab,
+            {vec3(0.0F, 0.55F, 0.0F), quat()},
+            object_size).has_value(),
+        "vertically rotated slab was treated as horizontal support");
+}
+
 }  // namespace
 
 int main() {
@@ -113,6 +254,11 @@ int main() {
         test_entry_compatibility_precedes_directness();
         test_ties_are_deterministic_by_clip_then_yaw();
         test_entry_segment_rejects_expanded_obstacle();
+        test_required_hand_filter_is_contextual();
+        test_entry_path_routes_around_blocking_geometry();
+        test_entry_path_rejects_an_unbounded_endpoint_exemption();
+        test_waypoint_arrival_stays_inside_corner_clearance_margin();
+        test_nearest_support_tracks_a_moved_destination();
         std::cout << "episode reach planner PASS\n";
         return 0;
     } catch (const std::exception& error) {

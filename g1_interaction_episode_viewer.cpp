@@ -42,12 +42,17 @@ struct OrbitCamera {
     float distance = 3.70F;
 };
 
+enum class SearchPurpose : uint8_t { Pickup, Place };
+
 struct SearchJob {
+    SearchPurpose purpose = SearchPurpose::Pickup;
     episode::ObjectSnapshot object{};
     episode::GraspCandidate grasp{};
     reach::ExhaustiveQuery query{};
     interaction::OrientedBox object_box{};
     interaction::EnvironmentGeometry environment{};
+    interaction::PlacedSupportContext support{};
+    std::optional<reach::Hand> required_hand{};
     std::shared_ptr<std::atomic_bool> cancellation;
     std::future<reach::SearchResult> result;
 };
@@ -133,6 +138,44 @@ episode::LocomotionCommand locomotion_input(
     };
 }
 
+bool edit_marker(interaction::Transform& marker, float dt) {
+    bool changed = false;
+    const float move = 0.55F * dt;
+    if (IsKeyDown(KEY_LEFT)) {
+        marker.position.x -= move;
+        changed = true;
+    }
+    if (IsKeyDown(KEY_RIGHT)) {
+        marker.position.x += move;
+        changed = true;
+    }
+    if (IsKeyDown(KEY_UP)) {
+        marker.position.z -= move;
+        changed = true;
+    }
+    if (IsKeyDown(KEY_DOWN)) {
+        marker.position.z += move;
+        changed = true;
+    }
+    if (IsKeyDown(KEY_U)) {
+        marker.position.y += move;
+        changed = true;
+    }
+    if (IsKeyDown(KEY_J)) {
+        marker.position.y -= move;
+        changed = true;
+    }
+    if (IsKeyDown(KEY_Q) || IsKeyDown(KEY_E)) {
+        const float sign = IsKeyDown(KEY_Q) ? 1.0F : -1.0F;
+        marker.rotation = quat_normalize(quat_mul(
+            quat_from_angle_axis(
+                sign * 1.3F * dt, vec3(0.0F, 1.0F, 0.0F)),
+            marker.rotation));
+        changed = true;
+    }
+    return changed;
+}
+
 const char* state_name(episode::EpisodeState state, bool searching) {
     if (searching) return "SEARCHING";
     switch (state) {
@@ -143,6 +186,11 @@ const char* state_name(episode::EpisodeState state, bool searching) {
         case episode::EpisodeState::Reach: return "REACH";
         case episode::EpisodeState::CarryBlend: return "CARRY BLEND";
         case episode::EpisodeState::Carry: return "CARRY";
+        case episode::EpisodeState::PlaceApproach:
+            return "PLACE APPROACH";
+        case episode::EpisodeState::PlaceBridge: return "PLACE BRIDGE";
+        case episode::EpisodeState::PlaceReach: return "PLACE REACH";
+        case episode::EpisodeState::PlaceReturn: return "PLACE RETURN";
         case episode::EpisodeState::Failed: return "FAILED";
     }
     return "UNKNOWN";
@@ -233,10 +281,21 @@ void draw_flat_bones(
 }
 
 void draw_plan(const episode::ReachPlan& plan, vec3 live_root) {
-    DrawLine3D(
-        ray(live_root),
-        ray(plan.entry_root_world.position),
-        Color{80, 80, 80, 180});
+    vec3 previous_root = live_root;
+    if (plan.entry_waypoints_world.empty()) {
+        DrawLine3D(
+            ray(previous_root),
+            ray(plan.entry_root_world.position),
+            Color{80, 80, 80, 180});
+    } else {
+        for (const vec3 waypoint : plan.entry_waypoints_world) {
+            DrawLine3D(
+                ray(previous_root),
+                ray(waypoint),
+                Color{80, 80, 80, 180});
+            previous_root = waypoint;
+        }
+    }
     DrawSphere(ray(plan.entry_root_world.position), 0.045F, ORANGE);
     draw_axes(plan.entry_root_world, 0.18F);
     if (plan.reach.poses.size() < 2U) return;
@@ -280,18 +339,22 @@ void draw_hud(
     bool show_bones) {
     DrawRectangle(14, 14, 760, 184, Color{255, 255, 255, 232});
     DrawText(
-        "WASD move | arrows object X/Z | U/J height | Q/E yaw | F pickup",
+        "WASD move | arrows active marker | U/J height | Q/E yaw | F pick/place",
         26, 24, 17, DARKGRAY);
     DrawText(
         "Esc cancel | R reset | M mesh | B bones | mouse orbit/pan/zoom",
         26, 47, 16, DARKGRAY);
     const auto& output = runtime.output();
     const auto& attempt = runtime.attempt();
+    const auto& place_attempt = runtime.place_attempt();
     const char* hand = output.selected_hand == interaction::Hand::Left
         ? "LEFT"
         : "RIGHT";
-    const size_t clip = attempt.has_value()
-        ? attempt->plan.reach.candidate.clip
+    const episode::ReachPlan* active_plan = place_attempt.has_value()
+        ? &place_attempt->plan
+        : attempt.has_value() ? &attempt->plan : nullptr;
+    const size_t clip = active_plan != nullptr
+        ? active_plan->reach.candidate.clip
         : 0U;
     DrawText(
         TextFormat(
@@ -301,10 +364,13 @@ void draw_hud(
         runtime.state() == episode::EpisodeState::Failed ? MAROON : DARKBLUE);
     DrawText(
         TextFormat(
-            "SEARCH %lld ms | ACCEPTED %zu | ATTACHED %s",
-            search_ms, accepted, output.attached ? "YES" : "NO"),
+            "SEARCH %lld ms | ACCEPTED %zu | ATTACHED %s | PLACE %s",
+            search_ms,
+            accepted,
+            output.attached ? "YES" : "NO",
+            output.place_ready ? "READY" : "WAIT"),
         26, 103, 18, DARKGRAY);
-    if (attempt.has_value()) {
+    if (active_plan != nullptr) {
         DrawText(
             TextFormat(
                 "ENTRY live %.2f m %.1f deg %.2f m/s | DIRECT %.3f | CONTACT %.2f cm %.1f deg",
@@ -312,9 +378,9 @@ void draw_hud(
                 output.approach_yaw_error_radians *
                     180.0F / kPi,
                 output.locomotion_speed_mps,
-                attempt->plan.cost.directness_cost,
-                attempt->plan.reach.position_error_m * 100.0F,
-                attempt->plan.reach.orientation_error_radians *
+                active_plan->cost.directness_cost,
+                active_plan->reach.position_error_m * 100.0F,
+                active_plan->reach.orientation_error_radians *
                     180.0F / kPi),
             26, 129, 17, DARKGRAY);
     }
@@ -338,10 +404,13 @@ int main(int argc, char** argv) {
         const reach::Pack reach_pack = reach::load_pack(options.reach_pack);
         const std::filesystem::path walking_database =
             "resources/database.bin";
+        episode::EpisodeConfig episode_config{};
+        episode_config.attachment.required_hold_seconds = 0.50F;
         episode::InteractionEpisode runtime(
             walking_database,
             options.episode_pack / "carry_left_database.bin",
-            options.episode_pack / "carry_right_database.bin");
+            options.episode_pack / "carry_right_database.bin",
+            episode_config);
         const interaction::Transform table_world{
             vec3(0.0F, kTableTop - 0.5F * kTableDimensions.y, 0.0F),
             quat(),
@@ -349,9 +418,10 @@ int main(int argc, char** argv) {
         const interaction::EnvironmentGeometry environment =
             interaction::make_coverage_environment(
                 table_world, kTableDimensions);
-        const auto reset_object = [&environment] {
+        const auto supported_object =
+            [&environment](size_t support_index) {
             const interaction::OrientedBox& support =
-                environment.boxes.at(8U);
+                environment.boxes.at(support_index);
             return interaction::Transform{
                 support.world.position + vec3(
                     0.0F,
@@ -361,9 +431,16 @@ int main(int argc, char** argv) {
                 quat(),
             };
         };
-        interaction::Transform object = reset_object();
+        std::optional<size_t> object_support_index{8U};
+        std::optional<size_t> destination_support_index{5U};
+        interaction::Transform object =
+            supported_object(*object_support_index);
+        interaction::Transform destination =
+            supported_object(*destination_support_index);
         uint64_t object_generation = 1U;
+        uint64_t destination_generation = 1U;
         uint64_t request_id = 1U;
+        bool placement_synchronized = false;
         const episode::KnownGraspProvider grasp_provider(
             {
                 vec3(0.5F * kObjectDimensions.x + 0.04F, 0.0F, 0.0F),
@@ -416,47 +493,27 @@ int main(int argc, char** argv) {
             if (IsKeyPressed(KEY_M) && mesh.loaded) show_mesh = !show_mesh;
             if (IsKeyPressed(KEY_B)) show_bones = !show_bones;
 
-            const bool editable =
+            const bool pickup_editable =
                 runtime.state() == episode::EpisodeState::FreeLocomotion &&
                 !search.has_value();
-            bool object_changed = false;
-            if (editable) {
-                const float move = 0.55F * dt;
-                if (IsKeyDown(KEY_LEFT)) {
-                    object.position.x -= move;
-                    object_changed = true;
-                }
-                if (IsKeyDown(KEY_RIGHT)) {
-                    object.position.x += move;
-                    object_changed = true;
-                }
-                if (IsKeyDown(KEY_UP)) {
-                    object.position.z -= move;
-                    object_changed = true;
-                }
-                if (IsKeyDown(KEY_DOWN)) {
-                    object.position.z += move;
-                    object_changed = true;
-                }
-                if (IsKeyDown(KEY_U)) {
-                    object.position.y += move;
-                    object_changed = true;
-                }
-                if (IsKeyDown(KEY_J)) {
-                    object.position.y -= move;
-                    object_changed = true;
-                }
-                if (IsKeyDown(KEY_Q) || IsKeyDown(KEY_E)) {
-                    const float sign = IsKeyDown(KEY_Q) ? 1.0F : -1.0F;
-                    object.rotation = quat_normalize(quat_mul(
-                        quat_from_angle_axis(
-                            sign * 1.3F * dt, vec3(0.0F, 1.0F, 0.0F)),
-                        object.rotation));
-                    object_changed = true;
-                }
-            }
+            const bool destination_editable =
+                runtime.state() == episode::EpisodeState::Carry &&
+                runtime.output().place_ready &&
+                !search.has_value();
+            const bool object_changed =
+                pickup_editable && edit_marker(object, dt);
+            const bool destination_changed =
+                destination_editable && edit_marker(destination, dt);
             if (object_changed) {
+                object_support_index = episode::find_support_index(
+                    environment, object, kObjectDimensions);
                 ++object_generation;
+                accepted_paths.clear();
+            }
+            if (destination_changed) {
+                destination_support_index = episode::find_support_index(
+                    environment, destination, kObjectDimensions);
+                ++destination_generation;
                 accepted_paths.clear();
             }
 
@@ -468,21 +525,45 @@ int main(int argc, char** argv) {
                     search.reset();
                 }
                 runtime.reset();
-                object = reset_object();
+                object_support_index = 8U;
+                destination_support_index = 5U;
+                object = supported_object(*object_support_index);
+                destination =
+                    supported_object(*destination_support_index);
                 ++object_generation;
+                ++destination_generation;
+                placement_synchronized = false;
                 accepted_count = 0U;
                 search_ms = 0;
                 search_failure.clear();
                 accepted_paths.clear();
             }
 
-            if (IsKeyPressed(KEY_F) && editable) {
+            if (IsKeyPressed(KEY_F) &&
+                (pickup_editable || destination_editable)) {
+                const SearchPurpose purpose = destination_editable
+                    ? SearchPurpose::Place
+                    : SearchPurpose::Pickup;
+                if (purpose == SearchPurpose::Place &&
+                    !destination_support_index.has_value()) {
+                    search_failure =
+                        "destination is not on a horizontal support";
+                    continue;
+                }
                 episode::ObjectSnapshot snapshot{
-                    object_generation, object, kObjectDimensions};
+                    purpose == SearchPurpose::Pickup
+                        ? object_generation
+                        : destination_generation,
+                    purpose == SearchPurpose::Pickup
+                        ? object
+                        : destination,
+                    kObjectDimensions,
+                };
                 const std::vector<episode::GraspCandidate> grasps =
                     grasp_provider.query(snapshot);
                 if (!grasps.empty()) {
                     SearchJob job{};
+                    job.purpose = purpose;
                     job.object = snapshot;
                     job.grasp = grasps.front();
                     job.query = {
@@ -491,6 +572,20 @@ int main(int argc, char** argv) {
                     };
                     job.object_box = {snapshot.world, snapshot.dimensions};
                     job.environment = environment;
+                    if (purpose == SearchPurpose::Place) {
+                        const interaction::OrientedBox& support =
+                            environment.boxes.at(
+                                *destination_support_index);
+                        job.support = {
+                            support.world,
+                            support.dimensions,
+                        };
+                        job.required_hand =
+                            runtime.output().selected_hand ==
+                                    interaction::Hand::Left
+                                ? reach::Hand::Left
+                                : reach::Hand::Right;
+                    }
                     const reach::ExhaustiveQuery query = job.query;
                     const interaction::OrientedBox box = job.object_box;
                     const interaction::EnvironmentGeometry geometry =
@@ -520,10 +615,20 @@ int main(int argc, char** argv) {
                 reach::SearchResult result = search->result.get();
                 search_ms = std::chrono::duration_cast<
                     std::chrono::milliseconds>(result.elapsed).count();
-                accepted_count = result.accepted.size();
+                accepted_count = 0U;
                 accepted_paths.clear();
                 accepted_paths.reserve(result.accepted.size());
                 for (const size_t index : result.accepted) {
+                    const reach::Evaluation& evaluation =
+                        result.evaluations.at(index).evaluation;
+                    const reach::Hand hand = static_cast<reach::Hand>(
+                        reach_pack.database.active_hands.at(
+                            evaluation.candidate.clip));
+                    if (search->required_hand.has_value() &&
+                        hand != *search->required_hand) {
+                        continue;
+                    }
+                    ++accepted_count;
                     accepted_paths.push_back(
                         result.evaluations.at(index).hand_path);
                 }
@@ -536,7 +641,7 @@ int main(int argc, char** argv) {
                 std::cerr
                     << "episode search processed " << result.processed
                     << "/" << result.total
-                    << " accepted " << result.accepted.size()
+                    << " accepted " << accepted_count
                     << " rejection histogram";
                 for (size_t count : rejected) std::cerr << " " << count;
                 std::cerr << '\n';
@@ -549,7 +654,8 @@ int main(int argc, char** argv) {
                         search->environment,
                         search_config,
                         runtime.output().pose,
-                        search->grasp);
+                        search->grasp,
+                        search->required_hand);
                 if (plan.has_value()) {
                     const vec3 live_root = runtime.output().pose.positions[
                         g1_skeleton::Simulation];
@@ -561,12 +667,28 @@ int main(int argc, char** argv) {
                         << live_root.y << " " << live_root.z
                         << " entry " << entry.x << " "
                         << entry.y << " " << entry.z << '\n';
-                    runtime.commit({
-                        search->object,
-                        search->grasp,
-                        *plan,
-                        request_id++,
-                    });
+                    const uint64_t request = request_id++;
+                    const bool committed =
+                        search->purpose == SearchPurpose::Pickup
+                        ? runtime.commit({
+                              search->object,
+                              search->grasp,
+                              *plan,
+                              request,
+                          })
+                        : runtime.commit_place({
+                              search->object,
+                              search->grasp,
+                              *plan,
+                              search->support,
+                              request,
+                          });
+                    if (!committed) {
+                        search_failure =
+                            search->purpose == SearchPurpose::Pickup
+                            ? "pickup plan commit rejected"
+                            : "place plan commit rejected";
+                    }
                 } else {
                     search_failure = result.complete
                         ? "no playable collision-free entry"
@@ -586,7 +708,22 @@ int main(int argc, char** argv) {
                 object_generation,
                 escape,
                 false,
+                destination_generation,
             });
+            if (runtime.output().placed && !placement_synchronized) {
+                const interaction::Transform previous_object = object;
+                object = runtime.output().object_world;
+                destination = previous_object;
+                std::swap(
+                    object_support_index,
+                    destination_support_index);
+                ++object_generation;
+                ++destination_generation;
+                placement_synchronized = true;
+                accepted_paths.clear();
+            } else if (!runtime.output().placed) {
+                placement_synchronized = false;
+            }
             const interaction::Transform displayed_object =
                 runtime.output().attached
                 ? runtime.output().object_world
@@ -628,10 +765,22 @@ int main(int argc, char** argv) {
                 ray(kObjectDimensions),
                 Color{245, 176, 35, 220});
             draw_oriented_box(displayed_box, ORANGE);
+            const interaction::OrientedBox destination_box{
+                destination, kObjectDimensions};
+            DrawCubeV(
+                ray(destination.position),
+                ray(kObjectDimensions),
+                Color{75, 205, 115, 65});
+            draw_oriented_box(destination_box, DARKGREEN);
             const auto grasp = grasp_provider.query({
                 object_generation, displayed_object, kObjectDimensions});
             if (!grasp.empty()) draw_axes(grasp.front().hand_world, 0.14F);
-            if (runtime.attempt().has_value()) {
+            if (runtime.place_attempt().has_value()) {
+                draw_plan(
+                    runtime.place_attempt()->plan,
+                    runtime.output().pose.positions[
+                        g1_skeleton::Simulation]);
+            } else if (runtime.attempt().has_value()) {
                 draw_plan(
                     runtime.attempt()->plan,
                     runtime.output().pose.positions[

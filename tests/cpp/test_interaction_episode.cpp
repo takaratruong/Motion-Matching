@@ -58,7 +58,11 @@ episode::EpisodeConfig fast_config() {
     config.entry_yaw_radians = 3.14159265F;
     config.stable_entry_ticks = 1;
     config.bridge_seconds = kTick;
+    config.place_bridge_seconds = kTick;
     config.carry_blend_seconds = kTick;
+    config.attachment.required_lift_m = 0.0F;
+    config.attachment.required_hold_seconds = 0.0F;
+    config.attachment.require_lift_for_hold = false;
     return config;
 }
 
@@ -66,7 +70,8 @@ void advance_until(
     episode::InteractionEpisode& runtime,
     episode::EpisodeState desired,
     uint64_t generation,
-    int maximum_ticks = 80) {
+    int maximum_ticks = 80,
+    uint64_t destination_generation = 0U) {
     for (int tick = 0; tick < maximum_ticks; ++tick) {
         runtime.update({
             kTick,
@@ -74,6 +79,7 @@ void advance_until(
             generation,
             false,
             false,
+            destination_generation,
         });
         if (runtime.state() == desired) return;
     }
@@ -286,6 +292,110 @@ void test_flat_walking_reach_and_carry_preserve_contact_root() {
         "attached object did not follow flat carry locomotion");
 }
 
+void test_same_hand_place_releases_and_returns_to_locomotion() {
+    const std::filesystem::path pack("build/g1-episode");
+    episode::InteractionEpisode runtime(
+        "resources/database.bin",
+        pack / "carry_left_database.bin",
+        pack / "carry_right_database.bin",
+        fast_config());
+    const auto pickup = make_attempt(
+        runtime.output().pose, reach::Hand::Left, 41U, 50U, 10U);
+    require(runtime.commit(pickup), "place pickup fixture did not commit");
+    advance_until(runtime, episode::EpisodeState::Carry, 41U);
+    for (int tick = 0;
+         tick < 100 && !runtime.output().place_ready;
+         ++tick) {
+        runtime.update({
+            kTick,
+            episode::LocomotionCommand{},
+            41U,
+            false,
+            false,
+            0U,
+        });
+    }
+    require(
+        runtime.output().place_ready,
+        "held object was not place-ready: object y " +
+            std::to_string(runtime.output().object_world.position.y) +
+            " pre-lift y " +
+            std::to_string(pickup.object.world.position.y));
+
+    const interaction::Pose start = runtime.output().pose;
+    interaction::Pose contact = start;
+    const vec3 placement_delta(0.25F, 0.0F, 0.10F);
+    contact.positions[g1_skeleton::Simulation] =
+        contact.positions[g1_skeleton::Simulation] + placement_delta;
+    const interaction::WorldPose contact_world =
+        interaction::world_pose(contact);
+    const size_t wrist = g1_skeleton::LeftWrist;
+    episode::FrozenPlaceAttempt place{};
+    place.destination = {
+        51U,
+        {
+            runtime.output().object_world.position + placement_delta,
+            runtime.output().object_world.rotation,
+        },
+        pickup.object.dimensions,
+    };
+    place.grasp = {
+        {
+            contact_world.positions[wrist],
+            contact_world.rotations[wrist],
+        },
+        vec3(1.0F, 0.0F, 0.0F),
+        interaction::Hand::Left,
+        12U,
+    };
+    place.plan.grasp = place.grasp;
+    place.plan.hand = reach::Hand::Left;
+    place.plan.entry_root_world = {
+        start.positions[g1_skeleton::Simulation],
+        start.rotations[g1_skeleton::Simulation],
+    };
+    place.plan.reach.candidate.clip = 10U;
+    place.plan.reach.rejection = reach::Rejection::None;
+    place.plan.reach.poses = {start, start, contact, contact};
+    place.support = {
+        {vec3(0.0F, 0.65F, 0.0F), quat()},
+        vec3(1.20F, 0.06F, 0.75F),
+    };
+    place.request_id = 52U;
+
+    require(runtime.commit_place(place), "valid place attempt did not commit");
+    require(
+        runtime.state() == episode::EpisodeState::PlaceApproach,
+        "place attempt did not enter approach");
+    for (int tick = 0;
+         tick < 200 &&
+         runtime.state() != episode::EpisodeState::FreeLocomotion;
+         ++tick) {
+        runtime.update({
+            kTick,
+            episode::LocomotionCommand{},
+            41U,
+            false,
+            false,
+            51U,
+        });
+    }
+    require(
+        runtime.state() == episode::EpisodeState::FreeLocomotion,
+        "place playback did not return locomotion control");
+    require(
+        runtime.output().placed && !runtime.output().attached,
+        "place playback did not release the object");
+    require(
+        length(
+            runtime.output().object_world.position -
+            place.destination.world.position) < 1.0e-5F,
+        "placed object did not retain the frozen destination");
+    require(
+        !runtime.place_attempt().has_value(),
+        "completed place attempt remained active");
+}
+
 }  // namespace
 
 int main() {
@@ -296,6 +406,7 @@ int main() {
         test_contact_rejection_timeout_and_reset();
         test_flat_walking_converges_to_a_distant_entry();
         test_flat_walking_reach_and_carry_preserve_contact_root();
+        test_same_hand_place_releases_and_returns_to_locomotion();
         std::cout << "interaction episode PASS\n";
         return 0;
     } catch (const std::exception& error) {

@@ -6,8 +6,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 namespace episode {
+
+inline constexpr float kEntryPathCornerMarginM = 0.18F;
 
 struct ReachPlanCost {
     float entry_distance_m = 0.0F;
@@ -23,6 +26,7 @@ struct ReachPlan {
     reach::Evaluation reach{};
     reach::Hand hand = reach::Hand::Left;
     interaction::Transform entry_root_world{};
+    std::vector<vec3> entry_waypoints_world;
     ReachPlanCost cost{};
 };
 
@@ -36,6 +40,21 @@ bool entry_segment_clear(
     const interaction::EnvironmentGeometry& environment,
     float expansion_m);
 
+std::optional<std::vector<vec3>> find_entry_path(
+    vec3 start_world,
+    vec3 certified_entry_world,
+    const interaction::EnvironmentGeometry& environment,
+    float expansion_m);
+
+std::optional<size_t> find_support_index(
+    const interaction::EnvironmentGeometry& environment,
+    const interaction::Transform& marker,
+    vec3 object_dimensions);
+
+bool reach_hand_allowed(
+    reach::Hand candidate,
+    std::optional<reach::Hand> required_hand);
+
 std::optional<ReachPlan> choose_reach_plan(
     const reach::Pack& pack,
     const reach::SearchResult& compact,
@@ -44,6 +63,7 @@ std::optional<ReachPlan> choose_reach_plan(
     const interaction::EnvironmentGeometry& environment,
     const reach::SearchConfig& search_config,
     const interaction::Pose& live_pose,
-    GraspCandidate grasp = GraspCandidate{});
+    GraspCandidate grasp = GraspCandidate{},
+    std::optional<reach::Hand> required_hand = std::nullopt);
 
 }  // namespace episode

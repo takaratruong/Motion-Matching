@@ -42,6 +42,15 @@ class InteractionEpisodeViewerContractTest(unittest.TestCase):
         self.assertIn("std::thread::hardware_concurrency()", source)
         self.assertIn("search.has_value() ? 0.0F : dt", source)
 
+    def test_viewer_has_contextual_same_hand_placement(self) -> None:
+        source = self.source()
+        self.assertIn("SearchPurpose::Place", source)
+        self.assertIn("runtime.commit_place(", source)
+        self.assertIn("job.required_hand", source)
+        self.assertIn("destination_generation", source)
+        self.assertIn("destination_support_index", source)
+        self.assertIn("std::swap(", source)
+
 
 if __name__ == "__main__":
     unittest.main()

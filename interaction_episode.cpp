@@ -48,6 +48,12 @@ interaction::Hand interaction_hand(reach::Hand hand) {
         : interaction::Hand::Right;
 }
 
+reach::Hand reach_hand(interaction::Hand hand) {
+    return hand == interaction::Hand::Left
+        ? reach::Hand::Left
+        : reach::Hand::Right;
+}
+
 size_t wrist_bone(interaction::Hand hand) {
     return hand == interaction::Hand::Left
         ? g1_skeleton::LeftWrist
@@ -57,9 +63,15 @@ size_t wrist_bone(interaction::Hand hand) {
 void validate_config(const EpisodeConfig& config) {
     if (!(config.entry_position_m >= 0.0F) ||
         !(config.entry_yaw_radians >= 0.0F) ||
+        !(config.place_entry_position_m >= 0.0F) ||
+        !(config.place_entry_yaw_radians >= 0.0F) ||
+        !(config.waypoint_reached_m >= 0.0F) ||
+        config.waypoint_reached_m + 0.05F >
+            kEntryPathCornerMarginM ||
         config.stable_entry_ticks <= 0 ||
         !(config.approach_timeout_seconds > 0.0F) ||
         !(config.bridge_seconds > 0.0F) ||
+        !(config.place_bridge_seconds > 0.0F) ||
         !(config.carry_blend_seconds > 0.0F)) {
         throw std::invalid_argument("invalid interaction episode config");
     }
@@ -98,6 +110,8 @@ bool InteractionEpisode::commit(FrozenAttempt attempt) {
     output_.selected_hand = interaction_hand(attempt_->plan.hand);
     output_.object_world = attempt_->object.world;
     output_.attached = false;
+    output_.place_ready = false;
+    output_.placed = false;
     output_.failure.clear();
 
     interaction::GraspAffordance affordance{};
@@ -139,7 +153,7 @@ bool InteractionEpisode::commit(FrozenAttempt attempt) {
         attempt_.reset();
         return false;
     }
-    attachment_.emplace(registry_);
+    attachment_.emplace(registry_, config_.attachment);
     const interaction::PickRequest request{
         target_handle_, affordance.id, attempt_->request_id};
     if (!attachment_->begin(
@@ -156,8 +170,39 @@ bool InteractionEpisode::commit(FrozenAttempt attempt) {
     state_seconds_ = 0.0F;
     frame_accumulator_ = 0.0F;
     reach_frame_ = 0U;
+    approach_waypoint_ = 0U;
     stable_entry_ticks_ = 0;
     output_.state = state_;
+    return true;
+}
+
+bool InteractionEpisode::commit_place(FrozenPlaceAttempt attempt) {
+    if (state_ != EpisodeState::Carry ||
+        !attempt_.has_value() ||
+        !attachment_.has_value() ||
+        attachment_->state() != interaction::ObjectState::Held ||
+        !output_.attached ||
+        attempt.request_id == 0U ||
+        attempt.destination.generation == 0U ||
+        attempt.destination.dimensions.x <= 0.0F ||
+        attempt.destination.dimensions.y <= 0.0F ||
+        attempt.destination.dimensions.z <= 0.0F ||
+        attempt.plan.reach.poses.empty() ||
+        attempt.plan.hand != reach_hand(output_.selected_hand)) {
+        return false;
+    }
+    attempt.plan.grasp = attempt.grasp;
+    place_attempt_ = std::move(attempt);
+    state_ = EpisodeState::PlaceApproach;
+    state_seconds_ = 0.0F;
+    frame_accumulator_ = 0.0F;
+    reach_frame_ = 0U;
+    approach_waypoint_ = 0U;
+    stable_entry_ticks_ = 0;
+    output_.state = state_;
+    output_.place_ready = false;
+    output_.placed = false;
+    output_.failure.clear();
     return true;
 }
 
@@ -182,6 +227,20 @@ const EpisodeOutput& InteractionEpisode::update(const EpisodeInput& input) {
         fail("object changed before contact");
         return output_;
     }
+    const bool before_place_release =
+        state_ == EpisodeState::PlaceApproach ||
+        state_ == EpisodeState::PlaceBridge ||
+        state_ == EpisodeState::PlaceReach;
+    if (before_place_release && input.cancel_pressed) {
+        cancel_place_before_release();
+        return output_;
+    }
+    if (before_place_release && place_attempt_.has_value() &&
+        input.current_destination_generation !=
+            place_attempt_->destination.generation) {
+        fail("destination changed before placement");
+        return output_;
+    }
 
     switch (state_) {
         case EpisodeState::FreeLocomotion:
@@ -203,6 +262,18 @@ const EpisodeOutput& InteractionEpisode::update(const EpisodeInput& input) {
         case EpisodeState::Carry:
             update_carry(input);
             break;
+        case EpisodeState::PlaceApproach:
+            update_place_approach(input);
+            break;
+        case EpisodeState::PlaceBridge:
+            update_place_bridge(input.dt);
+            break;
+        case EpisodeState::PlaceReach:
+            update_place_reach(input.dt);
+            break;
+        case EpisodeState::PlaceReturn:
+            update_place_return(input.dt);
+            break;
         case EpisodeState::Failed:
             break;
     }
@@ -213,7 +284,16 @@ const EpisodeOutput& InteractionEpisode::update(const EpisodeInput& input) {
 void InteractionEpisode::update_approach(const EpisodeInput& input) {
     const interaction::Pose& live = matcher_.snapshot().pose;
     const vec3 root = live.positions[g1_skeleton::Simulation];
-    const vec3 entry = attempt_->plan.entry_root_world.position;
+    const bool has_waypoints =
+        !attempt_->plan.entry_waypoints_world.empty();
+    const bool final_waypoint =
+        !has_waypoints ||
+        approach_waypoint_ + 1U >=
+            attempt_->plan.entry_waypoints_world.size();
+    const vec3 entry = has_waypoints
+        ? attempt_->plan.entry_waypoints_world.at(
+              approach_waypoint_)
+        : attempt_->plan.entry_root_world.position;
     vec3 delta(entry.x - root.x, 0.0F, entry.z - root.z);
     const float distance = length(delta);
     const float speed = std::min(
@@ -222,7 +302,8 @@ void InteractionEpisode::update_approach(const EpisodeInput& input) {
     const vec3 velocity = distance > 1.0e-5F
         ? delta * (speed / distance)
         : vec3();
-    const quat heading = distance <= kHeadingConvergenceDistance
+    const quat heading =
+        final_waypoint && distance <= kHeadingConvergenceDistance
         ? attempt_->plan.entry_root_world.rotation
         : heading_from_velocity(
               velocity,
@@ -238,7 +319,14 @@ void InteractionEpisode::update_approach(const EpisodeInput& input) {
         current.rotations[g1_skeleton::Simulation],
         attempt_->plan.entry_root_world.rotation);
     output_.locomotion_speed_mps = matcher_.planar_speed();
+    if (!final_waypoint &&
+        output_.approach_distance_m <= config_.waypoint_reached_m) {
+        ++approach_waypoint_;
+        stable_entry_ticks_ = 0;
+        return;
+    }
     const bool settled =
+        final_waypoint &&
         output_.approach_distance_m <= config_.entry_position_m &&
         output_.approach_yaw_error_radians <=
             config_.entry_yaw_radians;
@@ -313,10 +401,174 @@ void InteractionEpisode::update_carry(const EpisodeInput& input) {
         }
     }
     publish(displayed);
-    attachment_->update(hand_measurement(displayed, false), input.dt);
+    update_attached_object(input.dt);
+}
+
+void InteractionEpisode::update_place_approach(
+    const EpisodeInput& input) {
+    const interaction::Pose& live = matcher_.snapshot().pose;
+    const vec3 root = live.positions[g1_skeleton::Simulation];
+    const bool has_waypoints =
+        !place_attempt_->plan.entry_waypoints_world.empty();
+    const bool final_waypoint =
+        !has_waypoints ||
+        approach_waypoint_ + 1U >=
+            place_attempt_->plan.entry_waypoints_world.size();
+    const vec3 entry = has_waypoints
+        ? place_attempt_->plan.entry_waypoints_world.at(
+              approach_waypoint_)
+        : place_attempt_->plan.entry_root_world.position;
+    vec3 delta(entry.x - root.x, 0.0F, entry.z - root.z);
+    const float distance = length(delta);
+    const float speed = std::min(
+        kMaximumApproachSpeed,
+        distance / std::max(input.dt, kFixedTick));
+    const vec3 velocity = distance > 1.0e-5F
+        ? delta * (speed / distance)
+        : vec3();
+    const quat heading =
+        final_waypoint && distance <= kHeadingConvergenceDistance
+        ? place_attempt_->plan.entry_root_world.rotation
+        : heading_from_velocity(
+              velocity,
+              live.rotations[g1_skeleton::Simulation]);
+    matcher_.update({velocity, heading}, input.dt);
+    publish(matcher_.snapshot().pose);
+    update_attached_object(input.dt);
+    if (state_ == EpisodeState::Failed) return;
+
+    state_seconds_ += input.dt;
+    output_.approach_distance_m = planar_distance(
+        output_.pose.positions[g1_skeleton::Simulation], entry);
+    output_.approach_yaw_error_radians = planar_heading_error(
+        output_.pose.rotations[g1_skeleton::Simulation],
+        place_attempt_->plan.entry_root_world.rotation);
+    output_.locomotion_speed_mps = matcher_.planar_speed();
+    if (!final_waypoint &&
+        output_.approach_distance_m <= config_.waypoint_reached_m) {
+        ++approach_waypoint_;
+        stable_entry_ticks_ = 0;
+        return;
+    }
+    const bool settled =
+        final_waypoint &&
+        output_.approach_distance_m <=
+            config_.place_entry_position_m &&
+        output_.approach_yaw_error_radians <=
+            config_.place_entry_yaw_radians;
+    stable_entry_ticks_ = settled ? stable_entry_ticks_ + 1 : 0;
+    if (stable_entry_ticks_ >= config_.stable_entry_ticks) {
+        bridge_start_ = output_.pose;
+        state_ = EpisodeState::PlaceBridge;
+        state_seconds_ = 0.0F;
+        frame_accumulator_ = 0.0F;
+        return;
+    }
+    if (state_seconds_ >= config_.approach_timeout_seconds) {
+        fail("place approach timed out");
+    }
+}
+
+void InteractionEpisode::update_place_bridge(float dt) {
+    state_seconds_ += dt;
+    const float alpha = smoothstep(
+        state_seconds_ / config_.place_bridge_seconds);
+    publish(interaction::interpolate_pose(
+        bridge_start_,
+        place_attempt_->plan.reach.poses.front(),
+        alpha));
+    update_attached_object(dt);
+    if (state_ == EpisodeState::Failed) return;
+    if (state_seconds_ >= config_.place_bridge_seconds) {
+        state_ = EpisodeState::PlaceReach;
+        state_seconds_ = 0.0F;
+        frame_accumulator_ = 0.0F;
+        reach_frame_ = 0U;
+        publish(place_attempt_->plan.reach.poses.front());
+    }
+}
+
+void InteractionEpisode::update_place_reach(float dt) {
+    frame_accumulator_ += dt;
+    while (frame_accumulator_ >= kFixedTick &&
+           reach_frame_ + 1U <
+               place_attempt_->plan.reach.poses.size()) {
+        frame_accumulator_ -= kFixedTick;
+        ++reach_frame_;
+    }
+    publish(place_attempt_->plan.reach.poses[reach_frame_]);
+    update_attached_object(dt);
+    if (state_ == EpisodeState::Failed ||
+        reach_frame_ + 1U !=
+            place_attempt_->plan.reach.poses.size()) {
+        return;
+    }
+
+    const interaction::Transform held = attachment_->object_world();
+    if (length(
+            held.position -
+            place_attempt_->destination.world.position) > 0.04F ||
+        quat_angle_between(
+            held.rotation,
+            place_attempt_->destination.world.rotation) >
+            0.261799388F) {
+        fail("place contact mismatch");
+        return;
+    }
+    const std::optional<interaction::TargetHandle> placed =
+        attachment_->commit_place(
+            place_attempt_->destination.world,
+            place_attempt_->support);
+    if (!placed.has_value()) {
+        fail("place release rejected");
+        return;
+    }
+    target_handle_ = *placed;
+    output_.object_world = place_attempt_->destination.world;
+    output_.attached = false;
+    output_.place_ready = false;
+    output_.placed = true;
+    state_ = EpisodeState::PlaceReturn;
+    state_seconds_ = 0.0F;
+    frame_accumulator_ = 0.0F;
+    reach_frame_ =
+        place_attempt_->plan.reach.poses.size() - 1U;
+}
+
+void InteractionEpisode::update_place_return(float dt) {
+    frame_accumulator_ += dt;
+    while (frame_accumulator_ >= kFixedTick && reach_frame_ > 0U) {
+        frame_accumulator_ -= kFixedTick;
+        --reach_frame_;
+    }
+    publish(place_attempt_->plan.reach.poses[reach_frame_]);
+    if (reach_frame_ != 0U) return;
+
+    const interaction::Transform placed = output_.object_world;
+    matcher_.switch_database(walking_database_, output_.pose);
+    matcher_.update(LocomotionCommand{}, kFixedTick);
+    attachment_.reset();
+    attempt_.reset();
+    place_attempt_.reset();
+    target_handle_ = {};
+    state_ = EpisodeState::FreeLocomotion;
+    output_.attached = false;
+    output_.place_ready = false;
+    output_.placed = true;
+    output_.object_world = placed;
+    output_.failure.clear();
+    publish(matcher_.snapshot().pose);
+    output_.object_world = placed;
+    output_.placed = true;
+}
+
+void InteractionEpisode::update_attached_object(float dt) {
+    attachment_->update(hand_measurement(output_.pose, false), dt);
     output_.object_world = attachment_->object_world();
     output_.attached =
         attachment_->state() == interaction::ObjectState::Attached ||
+        attachment_->state() == interaction::ObjectState::Held;
+    output_.place_ready =
         attachment_->state() == interaction::ObjectState::Held;
     if (!output_.attached) {
         fail("attachment lost during carry");
@@ -346,10 +598,33 @@ void InteractionEpisode::cancel_before_contact() {
     }
     attachment_.reset();
     attempt_.reset();
+    place_attempt_.reset();
     target_handle_ = {};
     state_ = EpisodeState::FreeLocomotion;
     output_.state = state_;
     output_.attached = false;
+    output_.place_ready = false;
+    output_.failure.clear();
+    publish(matcher_.snapshot().pose);
+}
+
+void InteractionEpisode::cancel_place_before_release() {
+    matcher_.switch_database(
+        output_.selected_hand == interaction::Hand::Left
+            ? carry_left_database_
+            : carry_right_database_,
+        output_.pose);
+    place_attempt_.reset();
+    state_ = EpisodeState::Carry;
+    state_seconds_ = 0.0F;
+    frame_accumulator_ = 0.0F;
+    reach_frame_ = 0U;
+    approach_waypoint_ = 0U;
+    stable_entry_ticks_ = 0;
+    output_.state = state_;
+    output_.attached = true;
+    output_.place_ready = true;
+    output_.placed = false;
     output_.failure.clear();
     publish(matcher_.snapshot().pose);
 }
@@ -392,11 +667,13 @@ void InteractionEpisode::reset() {
     registry_ = interaction::TargetRegistry{};
     attachment_.reset();
     attempt_.reset();
+    place_attempt_.reset();
     target_handle_ = {};
     state_ = EpisodeState::FreeLocomotion;
     state_seconds_ = 0.0F;
     frame_accumulator_ = 0.0F;
     reach_frame_ = 0U;
+    approach_waypoint_ = 0U;
     stable_entry_ticks_ = 0;
     output_ = EpisodeOutput{};
     output_.pose = matcher_.snapshot().pose;
@@ -409,6 +686,11 @@ EpisodeState InteractionEpisode::state() const {
 
 const std::optional<FrozenAttempt>& InteractionEpisode::attempt() const {
     return attempt_;
+}
+
+const std::optional<FrozenPlaceAttempt>&
+InteractionEpisode::place_attempt() const {
+    return place_attempt_;
 }
 
 const EpisodeOutput& InteractionEpisode::output() const {

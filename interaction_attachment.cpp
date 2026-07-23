@@ -249,7 +249,10 @@ void AttachmentController::update(
     float next_held_seconds = 0.0F;
     const float lift_threshold =
         pre_lift_object_height_ + config_.required_lift_m;
-    if (next_object_world.position.y >= lift_threshold) {
+    const bool lift_satisfied =
+        !config_.require_lift_for_hold ||
+        next_object_world.position.y >= lift_threshold;
+    if (lift_satisfied) {
         const double accumulated =
             static_cast<double>(held_seconds_) + static_cast<double>(dt);
         next_held_seconds = static_cast<float>(std::min(
@@ -258,7 +261,7 @@ void AttachmentController::update(
     }
 
     if (next_held_seconds >= config_.required_hold_seconds &&
-        next_object_world.position.y >= lift_threshold) {
+        lift_satisfied) {
         if (!registry_->hold(request_.target, request_.request_id)) {
             fail(Reason::TargetChanged);
             return;
