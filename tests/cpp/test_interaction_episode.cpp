@@ -56,7 +56,6 @@ episode::EpisodeConfig fast_config() {
     episode::EpisodeConfig config{};
     config.entry_position_m = 0.20F;
     config.entry_yaw_radians = 3.14159265F;
-    config.entry_speed_mps = 10.0F;
     config.stable_entry_ticks = 1;
     config.bridge_seconds = kTick;
     config.carry_blend_seconds = kTick;
@@ -189,6 +188,104 @@ void test_contact_rejection_timeout_and_reset() {
         "approach timeout did not fail");
 }
 
+void test_flat_walking_converges_to_a_distant_entry() {
+    const std::filesystem::path pack("build/g1-episode");
+    episode::EpisodeConfig config{};
+    config.bridge_seconds = 10.0F;
+    episode::InteractionEpisode runtime(
+        "resources/database.bin",
+        pack / "carry_left_database.bin",
+        pack / "carry_right_database.bin",
+        config);
+    auto attempt = make_attempt(
+        runtime.output().pose, reach::Hand::Left, 21U, 30U, 8U);
+    attempt.plan.entry_root_world.position =
+        runtime.output().pose.positions[g1_skeleton::Simulation] +
+        vec3(-0.514F, 0.0F, 0.948F);
+    attempt.plan.entry_root_world.rotation = quat_mul(
+        quat_from_angle_axis(
+            0.529F, vec3(0.0F, 1.0F, 0.0F)),
+        runtime.output().pose.rotations[g1_skeleton::Simulation]);
+    require(runtime.commit(attempt), "distant-entry fixture did not commit");
+    for (int tick = 0;
+         tick < 400 && runtime.state() == episode::EpisodeState::Approach;
+         ++tick) {
+        runtime.update({
+            kTick, episode::LocomotionCommand{}, 21U, false, false});
+    }
+    require(
+        runtime.state() == episode::EpisodeState::Bridge,
+        "flat walking missed entry: distance " +
+            std::to_string(runtime.output().approach_distance_m) +
+            " yaw " +
+            std::to_string(runtime.output().approach_yaw_error_radians) +
+            " speed " +
+            std::to_string(runtime.output().locomotion_speed_mps));
+    runtime.update({
+        kTick, episode::LocomotionCommand{}, 21U, false, false});
+    require(
+        runtime.state() == episode::EpisodeState::Bridge &&
+            runtime.output().flat_locomotion.valid &&
+            runtime.output().bridge_alpha > 0.0F &&
+            runtime.output().bridge_alpha < 1.0F,
+        "bridge did not cross-fade from the displayed flat skeleton");
+}
+
+void test_flat_walking_reach_and_carry_preserve_contact_root() {
+    const std::filesystem::path pack("build/g1-episode");
+    episode::InteractionEpisode runtime(
+        "resources/database.bin",
+        pack / "carry_left_database.bin",
+        pack / "carry_right_database.bin",
+        fast_config());
+    const interaction::Pose start = runtime.output().pose;
+    interaction::Pose contact = start;
+    contact.positions[g1_skeleton::Simulation].x += 0.30F;
+    auto attempt = make_attempt(
+        start, reach::Hand::Left, 31U, 40U, 9U);
+    attempt.plan.reach.poses = {start, start, contact, contact};
+    const interaction::WorldPose contact_world =
+        interaction::world_pose(contact);
+    const size_t wrist = g1_skeleton::LeftWrist;
+    attempt.grasp.hand_world = {
+        contact_world.positions[wrist],
+        contact_world.rotations[wrist],
+    };
+    attempt.grasp.approach_world = vec3(1.0F, 0.0F, 0.0F);
+    attempt.plan.grasp = attempt.grasp;
+    attempt.object.world = {
+        contact_world.positions[wrist] + vec3(0.0F, -0.05F, 0.0F),
+        contact_world.rotations[wrist],
+    };
+
+    require(runtime.commit(attempt), "flat full-episode fixture did not commit");
+    advance_until(runtime, episode::EpisodeState::Carry, 31U);
+    require(runtime.output().attached, "flat full episode did not attach");
+    require(
+        length(
+            runtime.output().pose.positions[g1_skeleton::Simulation] -
+            contact.positions[g1_skeleton::Simulation]) < 0.15F,
+        "carry rebased away from the reach contact root");
+
+    const vec3 carry_root =
+        runtime.output().pose.positions[g1_skeleton::Simulation];
+    const vec3 carry_object = runtime.output().object_world.position;
+    const episode::LocomotionCommand command{
+        vec3(0.0F, 0.0F, 0.60F), quat()};
+    for (int tick = 0; tick < 100; ++tick) {
+        runtime.update({kTick, command, 31U, false, false});
+    }
+    require(
+        length(
+            runtime.output().pose.positions[g1_skeleton::Simulation] -
+            carry_root) > 0.20F,
+        "flat carry did not respond to locomotion");
+    require(
+        length(runtime.output().object_world.position - carry_object) >
+            0.20F,
+        "attached object did not follow flat carry locomotion");
+}
+
 }  // namespace
 
 int main() {
@@ -197,6 +294,8 @@ int main() {
         test_freeze_attach_and_selected_carry_hand(reach::Hand::Right);
         test_generation_change_and_cancel_fail_before_contact();
         test_contact_rejection_timeout_and_reset();
+        test_flat_walking_converges_to_a_distant_entry();
+        test_flat_walking_reach_and_carry_preserve_contact_root();
         std::cout << "interaction episode PASS\n";
         return 0;
     } catch (const std::exception& error) {

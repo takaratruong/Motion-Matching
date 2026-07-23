@@ -116,7 +116,9 @@ SearchResult search_all(
     std::atomic<size_t> processed{0U};
 
     const auto worker = [&] {
-        while (std::chrono::steady_clock::now() < expires) {
+        while (std::chrono::steady_clock::now() < expires &&
+               !(config.cancellation &&
+                 config.cancellation->load(std::memory_order_relaxed))) {
             const size_t index = next.fetch_add(1U);
             if (index >= candidates.size()) return;
             const Candidate candidate = candidates[index];

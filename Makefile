@@ -172,6 +172,32 @@ g1_reach_coverage_viewer: g1_reach_coverage_viewer.cpp \
 	  interaction_ik.cpp \
 	  interaction_pose.cpp interaction_target.cpp $(CFLAGS) $(LIBS)
 
+g1_interaction_episode_viewer: g1_interaction_episode_viewer.cpp \
+  interaction_episode.cpp interaction_episode.h \
+  episode_grasp_provider.cpp episode_grasp_provider.h \
+  episode_reach_planner.cpp episode_reach_planner.h \
+  g1_flat_motion_matcher.cpp g1_flat_motion_matcher.h \
+  interaction_attachment.cpp interaction_attachment.h \
+  reach_coverage.cpp reach_coverage.h reach_database.cpp reach_database.h \
+  reach_motion.cpp reach_motion.h reach_placement.cpp reach_placement.h \
+  reach_search.cpp reach_search.h interaction_hand_trajectories.cpp \
+  interaction_hand_trajectories.h interaction_ik.cpp interaction_ik.h \
+  interaction_posture_ik.cpp interaction_posture_ik.h \
+  g1_arm_joint_metadata.h interaction_pose.cpp interaction_pose.h \
+  interaction_target.cpp interaction_target.h interaction_database.h \
+  database.h g1_mesh_renderer.h g1_kinematic_contract.h array.h \
+  resources/g1_mesh/g1_raylib.glb g1_skeleton.h vec.h quat.h \
+  $(LINUX_CONTROLLER_DEPS)
+	$(CC) $(CONTROLLER_CXXFLAGS) -O3 -DNDEBUG -pthread -o $@$(EXT) \
+	  g1_interaction_episode_viewer.cpp interaction_episode.cpp \
+	  episode_grasp_provider.cpp episode_reach_planner.cpp \
+	  g1_flat_motion_matcher.cpp interaction_attachment.cpp \
+	  reach_coverage.cpp reach_database.cpp reach_motion.cpp \
+	  reach_placement.cpp reach_search.cpp \
+	  interaction_hand_trajectories.cpp interaction_posture_ik.cpp \
+	  interaction_ik.cpp interaction_pose.cpp interaction_target.cpp \
+	  $(CFLAGS) $(LIBS)
+
 g1_reach_coverage_probe: g1_reach_coverage_probe.cpp \
   reach_coverage.cpp reach_coverage.h reach_database.cpp reach_database.h \
   reach_coverage_metrics.cpp reach_coverage_metrics.h \

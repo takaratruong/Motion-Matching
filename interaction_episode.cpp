@@ -57,7 +57,6 @@ size_t wrist_bone(interaction::Hand hand) {
 void validate_config(const EpisodeConfig& config) {
     if (!(config.entry_position_m >= 0.0F) ||
         !(config.entry_yaw_radians >= 0.0F) ||
-        !(config.entry_speed_mps >= 0.0F) ||
         config.stable_entry_ticks <= 0 ||
         !(config.approach_timeout_seconds > 0.0F) ||
         !(config.bridge_seconds > 0.0F) ||
@@ -77,7 +76,7 @@ InteractionEpisode::InteractionEpisode(
       carry_left_database_(std::move(carry_left_database)),
       carry_right_database_(std::move(carry_right_database)),
       config_(config),
-      matcher_(walking_database_) {
+      matcher_(walking_database_, carry_left_database_) {
     validate_config(config_);
     output_.pose = matcher_.snapshot().pose;
     output_.state = state_;
@@ -233,18 +232,20 @@ void InteractionEpisode::update_approach(const EpisodeInput& input) {
 
     state_seconds_ += input.dt;
     const interaction::Pose& current = output_.pose;
+    output_.approach_distance_m = planar_distance(
+        current.positions[g1_skeleton::Simulation], entry);
+    output_.approach_yaw_error_radians = planar_heading_error(
+        current.rotations[g1_skeleton::Simulation],
+        attempt_->plan.entry_root_world.rotation);
+    output_.locomotion_speed_mps = matcher_.planar_speed();
     const bool settled =
-        planar_distance(
-            current.positions[g1_skeleton::Simulation], entry) <=
-            config_.entry_position_m &&
-        planar_heading_error(
-            current.rotations[g1_skeleton::Simulation],
-            attempt_->plan.entry_root_world.rotation) <=
-            config_.entry_yaw_radians &&
-        matcher_.planar_speed() <= config_.entry_speed_mps;
+        output_.approach_distance_m <= config_.entry_position_m &&
+        output_.approach_yaw_error_radians <=
+            config_.entry_yaw_radians;
     stable_entry_ticks_ = settled ? stable_entry_ticks_ + 1 : 0;
     if (stable_entry_ticks_ >= config_.stable_entry_ticks) {
         bridge_start_ = output_.pose;
+        bridge_flat_start_ = matcher_.flat_skeleton();
         state_ = EpisodeState::Bridge;
         state_seconds_ = 0.0F;
         frame_accumulator_ = 0.0F;
@@ -263,6 +264,8 @@ void InteractionEpisode::update_bridge(float dt) {
         bridge_start_,
         attempt_->plan.reach.poses.front(),
         alpha));
+    output_.flat_locomotion = bridge_flat_start_;
+    output_.bridge_alpha = alpha;
     if (state_seconds_ >= config_.bridge_seconds) {
         state_ = EpisodeState::Reach;
         state_seconds_ = 0.0F;
@@ -290,7 +293,8 @@ void InteractionEpisode::update_reach(float dt) {
     matcher_.switch_database(
         output_.selected_hand == interaction::Hand::Left
             ? carry_left_database_
-            : carry_right_database_);
+            : carry_right_database_,
+        contact_pose_);
     state_ = EpisodeState::CarryBlend;
     state_seconds_ = 0.0F;
 }
@@ -322,6 +326,12 @@ void InteractionEpisode::update_carry(const EpisodeInput& input) {
 void InteractionEpisode::publish(interaction::Pose pose) {
     output_.pose = std::move(pose);
     output_.state = state_;
+    output_.flat_locomotion =
+        state_ == EpisodeState::FreeLocomotion ||
+                state_ == EpisodeState::Approach
+            ? matcher_.flat_skeleton()
+            : FlatSkeletonWorldPose{};
+    if (state_ != EpisodeState::Bridge) output_.bridge_alpha = 0.0F;
 }
 
 void InteractionEpisode::fail(std::string reason) {
@@ -378,7 +388,7 @@ interaction::ContactMeasurement InteractionEpisode::hand_measurement(
 }
 
 void InteractionEpisode::reset() {
-    matcher_.switch_database(walking_database_);
+    matcher_.reset_database(walking_database_);
     registry_ = interaction::TargetRegistry{};
     attachment_.reset();
     attempt_.reset();

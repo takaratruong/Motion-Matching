@@ -192,6 +192,21 @@ void test_search_order_is_independent_of_worker_count() {
     }
 }
 
+void test_cancelled_search_returns_without_processing_the_pack() {
+    const reach::Pack pack = bilateral_fixture();
+    reach::SearchConfig config{};
+    config.cancellation = std::make_shared<std::atomic_bool>(true);
+    const reach::SearchResult result = reach::search_all(
+        pack,
+        {{{1.0F, 0.85F, -0.25F}, quat()}, normalize(vec3(-1, 0, 0))},
+        {{vec3(10, 10, 10), quat()}, vec3(0.01F, 0.01F, 0.01F)},
+        interaction::EnvironmentGeometry{},
+        config);
+    assert(!result.complete);
+    assert(result.processed == 0U);
+    assert(result.evaluations.empty());
+}
+
 void test_zero_deadline_never_publishes_partial_results_as_complete() {
     reach::SearchConfig config{};
     config.worker_count = 2U;
@@ -267,6 +282,7 @@ void test_direct_reach_ranks_before_hooked_fallback() {
 int main() {
     test_search_processes_every_bilateral_yaw_instance();
     test_search_order_is_independent_of_worker_count();
+    test_cancelled_search_returns_without_processing_the_pack();
     test_zero_deadline_never_publishes_partial_results_as_complete();
     test_complete_search_never_exceeds_its_deadline();
     test_selected_regeneration_matches_compact_metrics();

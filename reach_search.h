@@ -4,6 +4,8 @@
 
 #include <chrono>
 #include <cstddef>
+#include <atomic>
+#include <memory>
 #include <vector>
 
 namespace reach {
@@ -16,6 +18,7 @@ struct ExhaustiveQuery {
 struct SearchConfig {
     size_t worker_count = 4U;
     std::chrono::steady_clock::duration deadline = std::chrono::seconds(30);
+    std::shared_ptr<std::atomic_bool> cancellation{};
     CoverageConfig coverage{};
     interaction::TrajectoryCollisionConfig collision{};
 };

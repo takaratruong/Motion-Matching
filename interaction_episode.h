@@ -25,7 +25,6 @@ enum class EpisodeState : uint8_t {
 struct EpisodeConfig {
     float entry_position_m = 0.08F;
     float entry_yaw_radians = 0.174532925F;
-    float entry_speed_mps = 0.08F;
     int stable_entry_ticks = 3;
     float approach_timeout_seconds = 12.0F;
     float bridge_seconds = 0.24F;
@@ -52,6 +51,11 @@ struct EpisodeOutput {
     interaction::Transform object_world{};
     EpisodeState state = EpisodeState::FreeLocomotion;
     interaction::Hand selected_hand = interaction::Hand::Right;
+    FlatSkeletonWorldPose flat_locomotion{};
+    float approach_distance_m = 0.0F;
+    float approach_yaw_error_radians = 0.0F;
+    float locomotion_speed_mps = 0.0F;
+    float bridge_alpha = 0.0F;
     bool attached = false;
     bool owns_pose = true;
     std::string failure;
@@ -100,6 +104,7 @@ private:
     interaction::TargetHandle target_handle_{};
 
     interaction::Pose bridge_start_{};
+    FlatSkeletonWorldPose bridge_flat_start_{};
     interaction::Pose contact_pose_{};
     float state_seconds_ = 0.0F;
     float frame_accumulator_ = 0.0F;
