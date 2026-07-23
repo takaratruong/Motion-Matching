@@ -143,6 +143,84 @@ void test_right_reachable_ten_joint_target_converges() {
         source, solved, interaction::Hand::Right);
 }
 
+void assert_task_priority_reaches(
+    interaction::Hand hand,
+    const interaction::UpperBodyAngles& delta) {
+    const interaction::Pose source = make_pose();
+    interaction::Pose goal = source;
+    auto goal_angles = interaction::decompose_upper_body(goal, hand);
+    for (size_t joint = 0U; joint < goal_angles.size(); ++joint) {
+        goal_angles[joint] += delta[joint];
+    }
+    interaction::apply_upper_body(goal, hand, goal_angles);
+
+    interaction::PostureIKConfig config{};
+    config.source_scale_m_per_radian.fill(0.30F);
+    config.temporal_scale_m_per_radian.fill(0.30F);
+    interaction::Pose quality = source;
+    const interaction::UpperBodyAngles seed =
+        interaction::decompose_upper_body(source, hand);
+    const auto quality_result = interaction::solve_hand_posture_ik(
+        quality,
+        hand,
+        hand_transform(goal, hand),
+        source,
+        seed,
+        config);
+    assert(!quality_result.accepted);
+
+    interaction::Pose solved = source;
+    const auto result = interaction::solve_hand_posture_ik_task_priority(
+        solved,
+        hand,
+        hand_transform(goal, hand),
+        source,
+        seed,
+        config);
+    assert(result.accepted);
+    assert(result.position_error_m <= config.accepted_position_m);
+    assert(result.orientation_error_radians <=
+           config.accepted_orientation_radians);
+    assert_finite_bounded(result.joint_angles, hand);
+    assert_non_owned_local_channels_equal(source, solved, hand);
+    assert(exact(
+        source.positions[g1_skeleton::Simulation],
+        solved.positions[g1_skeleton::Simulation]));
+}
+
+void test_task_priority_reaches_bilaterally_despite_posture_penalties() {
+    assert_task_priority_reaches(
+        interaction::Hand::Left,
+        {0.06F, -0.04F, 0.03F, -0.10F, 0.08F,
+         0.05F, 0.12F, -0.06F, 0.05F, -0.04F});
+    assert_task_priority_reaches(
+        interaction::Hand::Right,
+        {0.05F, -0.03F, 0.02F, -0.08F, -0.06F,
+         0.04F, 0.10F, 0.05F, -0.04F, 0.03F});
+}
+
+void test_task_priority_unreachable_target_is_finite_and_keeps_root() {
+    const interaction::Pose source = make_pose();
+    interaction::Pose solved = source;
+    interaction::Transform target = left_hand_transform(source);
+    target.position = target.position + vec3(2.0F, 1.0F, -1.0F);
+
+    const auto result = interaction::solve_hand_posture_ik_task_priority(
+        solved,
+        interaction::Hand::Left,
+        target,
+        source,
+        interaction::decompose_left_upper_body(source));
+
+    assert(!result.accepted);
+    assert_finite_pose(solved);
+    assert_finite_bounded(result.joint_angles);
+    assert_non_owned_local_channels_equal(source, solved);
+    assert(exact(
+        source.positions[g1_skeleton::Simulation],
+        solved.positions[g1_skeleton::Simulation]));
+}
+
 void test_unreachable_target_returns_finite_bounded_best_pose() {
     const interaction::Pose source = make_pose();
     interaction::Pose solved = source;
@@ -295,6 +373,8 @@ int main() {
     test_right_zero_target_returns_source_byte_exact();
     test_reachable_ten_joint_target_converges();
     test_right_reachable_ten_joint_target_converges();
+    test_task_priority_reaches_bilaterally_despite_posture_penalties();
+    test_task_priority_unreachable_target_is_finite_and_keeps_root();
     test_unreachable_target_returns_finite_bounded_best_pose();
     test_best_seen_pose_includes_the_byte_exact_source_candidate();
     test_elbow_pole_geometry_and_degeneracy();

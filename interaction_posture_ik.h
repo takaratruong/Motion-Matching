@@ -69,6 +69,13 @@ PostureIKResult solve_hand_posture_ik(
     const Pose& source_pose,
     const UpperBodyAngles& temporal_seed,
     const PostureIKConfig& config = PostureIKConfig{});
+PostureIKResult solve_hand_posture_ik_task_priority(
+    Pose& pose,
+    Hand hand,
+    Transform target_hand_world,
+    const Pose& source_pose,
+    const UpperBodyAngles& temporal_seed,
+    const PostureIKConfig& config = PostureIKConfig{});
 
 LeftUpperBodyAngles decompose_left_upper_body(const Pose& pose);
 void apply_left_upper_body(Pose& pose, const LeftUpperBodyAngles& angles);
@@ -78,6 +85,12 @@ float transported_elbow_pole_error(
     const ElbowPole& current);
 
 PostureIKResult solve_left_hand_posture_ik(
+    Pose& pose,
+    Transform target_hand_world,
+    const Pose& source_pose,
+    const LeftUpperBodyAngles& temporal_seed,
+    const PostureIKConfig& config = PostureIKConfig{});
+PostureIKResult solve_left_hand_posture_ik_task_priority(
     Pose& pose,
     Transform target_hand_world,
     const Pose& source_pose,

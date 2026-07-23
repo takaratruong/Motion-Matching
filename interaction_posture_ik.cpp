@@ -596,6 +596,58 @@ PostureIKResult solve_hand_posture_ik(
         hand, best, best_angles, hit_joint_limit, iterations, config);
 }
 
+PostureIKResult solve_hand_posture_ik_task_priority(
+    Pose& pose,
+    Hand hand,
+    Transform target_hand_world,
+    const Pose& source_pose,
+    const UpperBodyAngles& temporal_seed,
+    const PostureIKConfig& config) {
+    Pose quality_pose = source_pose;
+    PostureIKResult quality = solve_hand_posture_ik(
+        quality_pose,
+        hand,
+        target_hand_world,
+        source_pose,
+        temporal_seed,
+        config);
+    if (quality.accepted) {
+        pose = quality_pose;
+        return quality;
+    }
+
+    PostureIKConfig polish_config = config;
+    polish_config.source_scale_m_per_radian.fill(0.0F);
+    polish_config.temporal_scale_m_per_radian.fill(0.0F);
+    polish_config.elbow_pole_scale_m = 0.0F;
+    polish_config.maximum_iterations = std::max(
+        polish_config.maximum_iterations, 45);
+
+    Pose polish_pose = quality_pose;
+    PostureIKResult polish = solve_hand_posture_ik(
+        polish_pose,
+        hand,
+        target_hand_world,
+        source_pose,
+        quality.joint_angles,
+        polish_config);
+    const bool polish_is_better =
+        polish.accepted ||
+        polish.position_error_m < quality.position_error_m ||
+        (polish.position_error_m == quality.position_error_m &&
+         (polish.orientation_error_radians <
+              quality.orientation_error_radians ||
+          (polish.orientation_error_radians ==
+               quality.orientation_error_radians &&
+           polish.objective < quality.objective)));
+    if (polish_is_better) {
+        pose = polish_pose;
+        return polish;
+    }
+    pose = quality_pose;
+    return quality;
+}
+
 LeftUpperBodyAngles decompose_left_upper_body(const Pose& pose) {
     return decompose_upper_body(pose, Hand::Left);
 }
@@ -617,6 +669,21 @@ PostureIKResult solve_left_hand_posture_ik(
     const LeftUpperBodyAngles& temporal_seed,
     const PostureIKConfig& config) {
     return solve_hand_posture_ik(
+        pose,
+        Hand::Left,
+        target_hand_world,
+        source_pose,
+        temporal_seed,
+        config);
+}
+
+PostureIKResult solve_left_hand_posture_ik_task_priority(
+    Pose& pose,
+    Transform target_hand_world,
+    const Pose& source_pose,
+    const LeftUpperBodyAngles& temporal_seed,
+    const PostureIKConfig& config) {
+    return solve_hand_posture_ik_task_priority(
         pose,
         Hand::Left,
         target_hand_world,
