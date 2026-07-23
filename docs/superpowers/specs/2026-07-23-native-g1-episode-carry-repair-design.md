@@ -44,7 +44,7 @@ camera-relative WASD
         +------> layered carry base
                     |
                     +-- walking root, hips, legs, spine motion
-                    +-- final hold active-arm posture
+                    +-- selected carry-pack active-arm posture
                     +-- posture-aware hand IK
                     +-- wrist-authoritative attached object
         |
@@ -93,28 +93,31 @@ the 31-bone G1 hierarchy. This prevents a silent return to mixed skeletons.
 
 ## Layered carry
 
-At pickup contact, preserve the final hold pose and selected hand. Rebase the
-native G1 walking matcher to that live root instead of switching the complete
-pose source to a carry database.
+At pickup contact, preserve the final hold pose and selected hand, then select
+the corresponding left- or right-hand nominal posture from the carry pack.
+Rebase the native G1 walking matcher to the live root instead of switching the
+complete pose source to a carry database.
 
 Each Carry or PlaceApproach update:
 
 1. Advance ordinary native G1 motion matching from the live movement command.
 2. Start from the resulting locomotion pose, retaining its root, hips, legs,
    foot contacts, and unselected-arm motion.
-3. Blend the three spine rotations partially toward the final hold pose so the
-   grasp has a stable torso base without freezing locomotion sway.
-4. Seed the selected seven-joint arm from the final hold pose.
-5. Solve the selected wrist to the attached object's desired hand transform
-   using the existing posture-aware bounded IK path.
+3. Blend the three spine rotations partially toward the selected nominal carry
+   posture so the grasp has a stable torso base without freezing locomotion
+   sway.
+4. Seed the selected seven-joint arm from that nominal carry posture. The
+   existing carry blend moves the arm and attached object from reach contact
+   into this posture.
+5. Solve the selected wrist through the existing posture-aware bounded IK path.
 6. Publish the solved G1 pose and derive the object transform from the solved
    wrist and frozen hand-in-object transform.
 
 The existing carry blend remains the handoff seam. A failed carry solve must
 not detach or teleport the object. It retries from the last accepted active-arm
-branch; if no bounded solution exists, the last accepted carry pose is remapped
-to the current walking root for that frame and an actionable diagnostic is
-reported.
+branch while retaining the current walking root, hips, legs, contacts, spine
+sway, and inactive arm. The fallback never reuses a frozen full-body pose, and
+an actionable diagnostic is reported.
 
 Placement approach uses the same layered carry composition. PlaceBridge then
 blends from the final layered G1 pose into the chosen complete G1 reach clip.

@@ -141,6 +141,8 @@ private:
     interaction::Pose bridge_start_{};
     FlatSkeletonWorldPose bridge_flat_start_{};
     interaction::Pose contact_pose_{};
+    interaction::Pose carry_left_reference_{};
+    interaction::Pose carry_right_reference_{};
     LayeredCarry layered_carry_{};
     interaction::Transform hand_in_object_{};
     float state_seconds_ = 0.0F;
