@@ -12,6 +12,7 @@ resources/runs*
 .venv/
 build/tests/
 build/task12/
+/build/g1-episode/
 interaction_probe
 resources/g1_interaction/
 .deps/
