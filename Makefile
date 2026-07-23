@@ -287,6 +287,7 @@ CPP_TEST_BINS += $(CPP_TEST_DIR)/test_reach_search
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_episode_reach_planner
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_g1_flat_motion_matcher
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_episode
+CPP_TEST_BINS += $(CPP_TEST_DIR)/test_episode_controls
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_g1_mesh_renderer
 RELEASE_FAST_MATH_TARGET_TEST := \
   $(CPP_TEST_DIR)/test_interaction_target_release_fast_math
@@ -639,6 +640,12 @@ $(CPP_TEST_DIR)/test_g1_flat_motion_matcher: \
   database.h g1_skeleton.h array.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_g1_flat_motion_matcher.cpp \
 	  g1_flat_motion_matcher.cpp interaction_pose.cpp -o $@
+
+$(CPP_TEST_DIR)/test_episode_controls: \
+  tests/cpp/test_episode_controls.cpp g1_flat_motion_matcher.h \
+  interaction_pose.h interaction_database.h g1_skeleton.h vec.h quat.h \
+  | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_episode_controls.cpp -o $@
 
 $(CPP_TEST_DIR)/test_interaction_episode: \
   tests/cpp/test_interaction_episode.cpp \

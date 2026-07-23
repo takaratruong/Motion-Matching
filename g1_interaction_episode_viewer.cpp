@@ -1,4 +1,5 @@
 #include "episode_grasp_provider.h"
+#include "episode_controls.h"
 #include "episode_reach_planner.h"
 #include "g1_mesh_renderer.h"
 #include "interaction_episode.h"
@@ -116,26 +117,16 @@ episode::LocomotionCommand locomotion_input(
         0.0F,
         camera.target.z - camera.position.z);
     if (length(forward) < 1.0e-5F) forward = vec3(0.0F, 0.0F, 1.0F);
-    forward = normalize(forward);
-    const vec3 right = normalize(cross(
-        vec3(0.0F, 1.0F, 0.0F), forward));
-    vec3 direction{};
-    if (IsKeyDown(KEY_W)) direction = direction + forward;
-    if (IsKeyDown(KEY_S)) direction = direction - forward;
-    if (IsKeyDown(KEY_D)) direction = direction + right;
-    if (IsKeyDown(KEY_A)) direction = direction - right;
-    if (length(direction) < 1.0e-5F) {
-        return {
-            vec3(),
-            pose.rotations[g1_skeleton::Simulation],
-        };
-    }
-    direction = normalize(direction);
-    const float yaw = std::atan2(direction.x, direction.z);
-    return {
-        direction * 0.80F,
-        quat_from_angle_axis(yaw, vec3(0.0F, 1.0F, 0.0F)),
-    };
+    return episode::camera_relative_command(
+        forward,
+        pose.rotations[g1_skeleton::Simulation],
+        {
+            IsKeyDown(KEY_W),
+            IsKeyDown(KEY_S),
+            IsKeyDown(KEY_A),
+            IsKeyDown(KEY_D),
+        },
+        0.22F);
 }
 
 bool edit_marker(interaction::Transform& marker, float dt) {
