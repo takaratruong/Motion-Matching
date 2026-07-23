@@ -62,6 +62,9 @@ struct Evaluation {
     float approach_error_radians = 0.0F;
     float orientation_error_radians = 0.0F;
     float active_arm_deformation = 0.0F;
+    float backtrack_ratio = 0.0F;
+    float excess_path_ratio = 0.0F;
+    float directness_cost = 0.0F;
     size_t collision_sample = 0U;
 };
 

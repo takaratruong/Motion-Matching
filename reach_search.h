@@ -43,6 +43,10 @@ bool complete_within_deadline(
     std::chrono::steady_clock::duration elapsed,
     std::chrono::steady_clock::duration deadline);
 
+bool accepted_quality_less(
+    const Evaluation& left,
+    const Evaluation& right);
+
 }  // namespace detail
 
 SearchResult search_all(

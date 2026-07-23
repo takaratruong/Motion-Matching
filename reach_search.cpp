@@ -80,6 +80,25 @@ bool complete_within_deadline(
     return processed == total && retained == total && elapsed <= deadline;
 }
 
+bool accepted_quality_less(
+    const Evaluation& left,
+    const Evaluation& right) {
+    return std::tie(
+               left.directness_cost,
+               left.active_arm_deformation,
+               left.orientation_error_radians,
+               left.approach_error_radians,
+               left.candidate.clip,
+               left.candidate.yaw_index) <
+           std::tie(
+               right.directness_cost,
+               right.active_arm_deformation,
+               right.orientation_error_radians,
+               right.approach_error_radians,
+               right.candidate.clip,
+               right.candidate.yaw_index);
+}
+
 }  // namespace detail
 
 SearchResult search_all(
@@ -164,18 +183,7 @@ SearchResult search_all(
                 result.evaluations[left_index].evaluation;
             const Evaluation& right =
                 result.evaluations[right_index].evaluation;
-            return std::tie(
-                       left.active_arm_deformation,
-                       left.orientation_error_radians,
-                       left.approach_error_radians,
-                       left.candidate.clip,
-                       left.candidate.yaw_index) <
-                   std::tie(
-                       right.active_arm_deformation,
-                       right.orientation_error_radians,
-                       right.approach_error_radians,
-                       right.candidate.clip,
-                       right.candidate.yaw_index);
+            return detail::accepted_quality_less(left, right);
         });
     return result;
 }
@@ -216,7 +224,16 @@ Evaluation regenerate(
             compact.evaluation.orientation_error_radians) ||
         !same_metric(
             evaluation.active_arm_deformation,
-            compact.evaluation.active_arm_deformation)) {
+            compact.evaluation.active_arm_deformation) ||
+        !same_metric(
+            evaluation.backtrack_ratio,
+            compact.evaluation.backtrack_ratio) ||
+        !same_metric(
+            evaluation.excess_path_ratio,
+            compact.evaluation.excess_path_ratio) ||
+        !same_metric(
+            evaluation.directness_cost,
+            compact.evaluation.directness_cost)) {
         throw std::runtime_error(
             "regenerated reach evaluation disagrees with compact search");
     }

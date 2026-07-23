@@ -463,11 +463,26 @@ Evaluation shape_candidate(
     }
     evaluation.active_arm_deformation /= static_cast<float>(
         frame_count * upper_body_joint_count);
+    std::vector<vec3> wrist_path;
+    wrist_path.reserve(evaluation.poses.size());
+    const size_t wrist = wrist_bone(query.hand);
+    for (const interaction::Pose& pose : evaluation.poses) {
+        wrist_path.push_back(
+            interaction::world_pose(pose).positions[wrist]);
+    }
+    const WristPathQuality path_quality =
+        measure_wrist_path_quality(wrist_path);
+    evaluation.backtrack_ratio = path_quality.backtrack_ratio;
+    evaluation.excess_path_ratio = path_quality.excess_path_ratio;
+    evaluation.directness_cost = path_quality.directness_cost;
     assign_final_errors(evaluation, query);
     if (!finite(evaluation.position_error_m) ||
         !finite(evaluation.approach_error_radians) ||
         !finite(evaluation.orientation_error_radians) ||
-        !finite(evaluation.active_arm_deformation)) {
+        !finite(evaluation.active_arm_deformation) ||
+        !finite(evaluation.backtrack_ratio) ||
+        !finite(evaluation.excess_path_ratio) ||
+        !finite(evaluation.directness_cost)) {
         evaluation.rejection = Rejection::InvalidSolver;
     } else if (evaluation.position_error_m > config.accepted_position_m) {
         evaluation.rejection = Rejection::PositionError;

@@ -4,6 +4,7 @@
 
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 
@@ -211,6 +212,33 @@ void test_selected_regeneration_matches_compact_metrics() {
     assert(regenerated.rejection ==
            result.evaluations.front().evaluation.rejection);
     assert(!regenerated.poses.empty());
+    const reach::Evaluation& compact =
+        result.evaluations.front().evaluation;
+    assert(std::abs(
+        regenerated.backtrack_ratio - compact.backtrack_ratio) <= 1.0e-5F);
+    assert(std::abs(
+        regenerated.excess_path_ratio - compact.excess_path_ratio) <= 1.0e-5F);
+    assert(std::abs(
+        regenerated.directness_cost - compact.directness_cost) <= 1.0e-5F);
+}
+
+void test_direct_reach_ranks_before_hooked_fallback() {
+    reach::Evaluation direct{};
+    direct.rejection = reach::Rejection::None;
+    direct.directness_cost = 0.05F;
+    direct.active_arm_deformation = 1.0F;
+    direct.candidate.clip = 1U;
+
+    reach::Evaluation hooked{};
+    hooked.rejection = reach::Rejection::None;
+    hooked.directness_cost = 0.50F;
+    hooked.active_arm_deformation = 0.0F;
+    hooked.candidate.clip = 0U;
+
+    assert(reach::detail::accepted_quality_less(direct, hooked));
+    assert(!reach::detail::accepted_quality_less(hooked, direct));
+    assert(direct.rejection == reach::Rejection::None);
+    assert(hooked.rejection == reach::Rejection::None);
 }
 
 }  // namespace
@@ -221,4 +249,5 @@ int main() {
     test_zero_deadline_never_publishes_partial_results_as_complete();
     test_complete_search_never_exceeds_its_deadline();
     test_selected_regeneration_matches_compact_metrics();
+    test_direct_reach_ranks_before_hooked_fallback();
 }
