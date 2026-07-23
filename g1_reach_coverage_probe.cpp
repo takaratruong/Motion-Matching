@@ -140,7 +140,6 @@ FixtureReport evaluate_fixture(
     report.elapsed_seconds =
         std::chrono::duration<double>(result.elapsed).count();
     std::array<bool, kRootAzimuthSectors> occupied{};
-    std::array<bool, reach::kYawPlacementCount> regenerated_yaw{};
 
     for (const reach::CompactEvaluation& compact : result.evaluations) {
         const reach::Evaluation& evaluation = compact.evaluation;
@@ -167,18 +166,18 @@ FixtureReport evaluate_fixture(
         report.maximum_accepted_orientation_radians = std::max(
             report.maximum_accepted_orientation_radians,
             evaluation.orientation_error_radians);
+        const size_t clip = evaluation.candidate.clip;
         const uint8_t yaw = evaluation.candidate.yaw_index;
-        if (regenerated_yaw[yaw]) continue;
-        regenerated_yaw[yaw] = true;
-        const reach::Evaluation full = reach::regenerate(
+        const int32_t terminal_frame =
+            pack.database.range_stops.at(clip) - 1;
+        const interaction::Pose terminal_pose = reach::place_pose(
             pack,
-            compact,
-            fixture.query,
-            fixture.object,
-            fixture.environment,
-            config);
+            clip,
+            yaw,
+            fixture.query.target.position,
+            terminal_frame);
         const interaction::WorldPose terminal = interaction::world_pose(
-            full.poses.back());
+            terminal_pose);
         vec3 grasp_to_root =
             terminal.positions[g1_skeleton::Simulation] -
             fixture.query.target.position;

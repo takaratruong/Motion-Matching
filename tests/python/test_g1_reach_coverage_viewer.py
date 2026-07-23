@@ -182,6 +182,11 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
         ):
             self.assertIn(required, source)
 
+    def test_probe_counts_diversity_across_every_accepted_candidate(self):
+        source = self.source(PROBE)
+        self.assertIn("reach::place_pose(", source)
+        self.assertNotIn("regenerated_yaw", source)
+
     def test_makefile_has_standalone_targets(self):
         makefile = self.source(MAKEFILE)
         self.assertIn("g1_reach_coverage_viewer:", makefile)
