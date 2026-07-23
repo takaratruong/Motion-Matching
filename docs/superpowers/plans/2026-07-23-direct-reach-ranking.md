@@ -383,7 +383,7 @@ Run:
 ```bash
 ./g1_reach_coverage_probe \
   build/g1-reaches/reach-pack-v2 \
-  build/g1-reaches/contact-anchored-coverage-report-v6.json
+  --json build/g1-reaches/contact-anchored-coverage-report-v6.json
 ```
 
 Expected: exit 0; open space reports 477 accepted, 231 left, 246 right, ten

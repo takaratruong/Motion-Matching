@@ -81,3 +81,21 @@ Tests must be written before implementation and demonstrate:
 
 The final handoff requires a rebuilt and relaunched flat-terrain viewer so the
 new ordering can be checked by cycling the first several accepted options.
+
+## Result
+
+The directness metric and direct-first comparator were implemented with
+test-first coverage. Twelve Python viewer contract tests pass, as do the
+focused reach-coverage, reach-search, posture-IK, and hand-trajectory C++
+test binaries.
+
+The rebuilt real-pack probe processed every one of the 4,608 instances in
+each environment. Open-space search completed in 13.1497150 seconds and
+retained exactly 477 accepted motions: 231 left-hand, 246 right-hand, across
+ten root-azimuth sectors. The complete acceptance and rejection report is
+identical to the pre-ranking report after excluding elapsed-time fields.
+Therefore the change affects accepted-motion order, not the accepted set.
+
+The viewer now displays directness, backtracking, and excess-path values for
+the selected option so the new ordering can be assessed while cycling the
+same complete set of valid motions.

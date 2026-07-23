@@ -320,7 +320,7 @@ void draw_hud(
     bool show_g1_mesh,
     bool show_g1_bones,
     const char* g1_mesh_error) {
-    DrawRectangle(14, 14, 800, 370, Color{255, 255, 255, 230});
+    DrawRectangle(14, 14, 800, 400, Color{255, 255, 255, 230});
     DrawText(
         "Arrow X/Z  W/S Y | Q/E yaw R/F pitch Z/C roll | Enter search",
         26, 24, 17, DARKGRAY);
@@ -404,11 +404,23 @@ void draw_hud(
                 DARKGRAY);
             DrawText(
                 TextFormat(
+                    "DIRECT %.3f | BACKTRACK %.1f%% | EXCESS PATH %.1f%%",
+                    evaluation.directness_cost,
+                    100.0F * evaluation.backtrack_ratio,
+                    100.0F * evaluation.excess_path_ratio),
+                26,
+                289,
+                16,
+                evaluation.directness_cost <= 0.10F
+                    ? DARKGREEN
+                    : DARKGRAY);
+            DrawText(
+                TextFormat(
                     "OBSERVED OBJECT COLLISION: %s | OBSERVED ENVIRONMENT COLLISION: %s",
                     evaluation.object_collision_observed ? "YES" : "NO",
                     evaluation.environment_collision_observed ? "YES" : "NO"),
                 26,
-                289,
+                314,
                 16,
                 evaluation.object_collision_observed ||
                         evaluation.environment_collision_observed
@@ -422,7 +434,7 @@ void draw_hud(
         DrawText(
             "REJECTED - motion shown for diagnosis",
             26,
-            318,
+            343,
             15,
             MAROON);
     }
@@ -432,7 +444,7 @@ void draw_hud(
             show_g1_mesh ? "ON" : "OFF",
             show_g1_bones ? "ON" : "OFF"),
         26,
-        342,
+        367,
         15,
         DARKGRAY);
     if (g1_mesh_error != nullptr && g1_mesh_error[0] != '\0') {
