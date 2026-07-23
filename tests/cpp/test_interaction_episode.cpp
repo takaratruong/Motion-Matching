@@ -1,8 +1,13 @@
 #include "interaction_episode.h"
 
+#include "g1_arm_joint_metadata.h"
+
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -87,49 +92,190 @@ void advance_until(
     throw std::runtime_error("episode did not reach requested state");
 }
 
-void test_return_replays_attached_frozen_poses_before_carry() {
+size_t wrist_bone(interaction::Hand hand) {
+    return hand == interaction::Hand::Left
+        ? g1_skeleton::LeftWrist
+        : g1_skeleton::RightWrist;
+}
+
+interaction::Transform hand_world(
+    const interaction::Pose& pose,
+    interaction::Hand hand) {
+    const interaction::WorldPose world = interaction::world_pose(pose);
+    const size_t wrist = wrist_bone(hand);
+    return {world.positions[wrist], world.rotations[wrist]};
+}
+
+void require_pose_root(
+    const interaction::Pose& actual,
+    const interaction::Pose& expected,
+    const std::string& message) {
+    require(
+        length(
+            actual.positions[g1_skeleton::Simulation] -
+            expected.positions[g1_skeleton::Simulation]) < 1.0e-5F,
+        message);
+}
+
+void require_return_sample(
+    const episode::EpisodeOutput& output,
+    const interaction::Pose& expected,
+    interaction::Hand hand,
+    interaction::Transform hand_in_object,
+    const std::string& label) {
+    require(
+        output.state == episode::EpisodeState::Return,
+        label + " was not observable in Return");
+    require(output.attached, label + " detached the object");
+    require_pose_root(output.pose, expected, label + " root differs");
+    const interaction::Transform expected_object = interaction::compose(
+        hand_world(output.pose, hand),
+        interaction::inverse(hand_in_object));
+    require(
+        length(output.object_world.position - expected_object.position) <
+            1.0e-5F,
+        label + " object position did not follow the displayed wrist");
+    require(
+        quat_angle_between(
+            output.object_world.rotation,
+            expected_object.rotation) < 0.002F,
+        label + " object rotation did not follow the displayed wrist");
+}
+
+void require_selected_arm_layer(
+    const interaction::Pose& pose,
+    const interaction::Pose& nominal,
+    interaction::Hand hand,
+    const std::string& label) {
+    const std::array<interaction::HingeJoint, 7>& arm =
+        hand == interaction::Hand::Left
+            ? interaction::kLeftArm
+            : interaction::kRightArm;
+    for (const interaction::HingeJoint& joint : arm) {
+        const size_t bone = static_cast<size_t>(joint.bone);
+        require(
+            quat_angle_between(
+                pose.rotations[bone], nominal.rotations[bone]) < 0.002F,
+            label + " did not retain the final recorded arm layer");
+    }
+}
+
+void test_commit_rejects_nonfinite_return_pose_before_state_mutation() {
     const std::filesystem::path pack("build/g1-episode");
     episode::InteractionEpisode runtime(
         pack / "walking_database.bin",
         pack / "carry_left_database.bin",
         pack / "carry_right_database.bin",
         fast_config());
-    const auto attempt = make_attempt(
+    auto malformed = make_attempt(
+        runtime.output().pose, reach::Hand::Left, 60U, 69U, 14U);
+    malformed.plan.return_poses[1U]
+        .positions[g1_skeleton::Simulation].x =
+            std::numeric_limits<float>::quiet_NaN();
+    malformed.plan.return_poses[2U]
+        .rotations[g1_skeleton::LeftWrist].w =
+            std::numeric_limits<float>::infinity();
+    require(
+        !runtime.commit(malformed),
+        "commit accepted a non-finite recorded return pose");
+    require(
+        runtime.state() == episode::EpisodeState::FreeLocomotion &&
+            !runtime.attempt().has_value() && !runtime.output().attached,
+        "malformed return plan mutated episode state before rejection");
+}
+
+void test_return_replays_every_authored_sample_before_carry() {
+    const std::filesystem::path pack("build/g1-episode");
+    episode::InteractionEpisode runtime(
+        pack / "walking_database.bin",
+        pack / "carry_left_database.bin",
+        pack / "carry_right_database.bin",
+        fast_config());
+    auto attempt = make_attempt(
         runtime.output().pose, reach::Hand::Left, 61U, 70U, 14U);
+    interaction::Pose return0 = runtime.output().pose;
+    interaction::Pose return1 = return0;
+    interaction::Pose return2 = return0;
+    return0.positions[g1_skeleton::Simulation] =
+        return0.positions[g1_skeleton::Simulation] +
+        vec3(0.02F, 0.0F, 0.01F);
+    return1.positions[g1_skeleton::Simulation] =
+        return1.positions[g1_skeleton::Simulation] +
+        vec3(0.04F, 0.0F, 0.02F);
+    return2.positions[g1_skeleton::Simulation] =
+        return2.positions[g1_skeleton::Simulation] +
+        vec3(0.06F, 0.0F, 0.03F);
+    return0.rotations[g1_skeleton::LeftElbow] = quat_mul(
+        quat_from_angle_axis(0.10F, vec3(0.0F, 0.0F, 1.0F)),
+        return0.rotations[g1_skeleton::LeftElbow]);
+    return1.rotations[g1_skeleton::LeftElbow] = quat_mul(
+        quat_from_angle_axis(0.20F, vec3(0.0F, 0.0F, 1.0F)),
+        return1.rotations[g1_skeleton::LeftElbow]);
+    return2.rotations[g1_skeleton::LeftElbow] = quat_mul(
+        quat_from_angle_axis(0.30F, vec3(0.0F, 0.0F, 1.0F)),
+        return2.rotations[g1_skeleton::LeftElbow]);
+    attempt.plan.return_poses = {return0, return1, return2};
+    const interaction::Transform hand_in_object = interaction::compose(
+        interaction::inverse(attempt.object.world),
+        attempt.grasp.hand_world);
     require(runtime.commit(attempt), "return fixture did not commit");
     advance_until(runtime, episode::EpisodeState::Reach, 61U);
     advance_until(runtime, episode::EpisodeState::Return, 61U);
-    require(
-        runtime.output().attached,
-        "object detached at the first recorded return frame");
-    require(
-        length(
-            runtime.output().pose.positions[g1_skeleton::Simulation] -
-            attempt.plan.return_poses.front()
-                .positions[g1_skeleton::Simulation]) < 1.0e-5F,
-        "return did not begin at the first frozen pose");
 
-    for (size_t frame = 1U;
-         frame < attempt.plan.return_poses.size();
-         ++frame) {
+    require_return_sample(
+        runtime.output(), return0, interaction::Hand::Left, hand_in_object,
+        "return sample 0");
+    const float large_dt = 3.0F * kTick;
+    const episode::LocomotionCommand ignored_command{
+        vec3(0.0F, 0.0F, 1.0F), quat()};
+    const episode::EpisodeOutput& sample1 = runtime.update({
+        large_dt, ignored_command, 61U, false, false});
+    require_return_sample(
+        sample1, return1, interaction::Hand::Left, hand_in_object,
+        "return sample 1");
+    const episode::EpisodeOutput& sample2 = runtime.update({
+        large_dt, ignored_command, 61U, false, false});
+    require_return_sample(
+        sample2, return2, interaction::Hand::Left, hand_in_object,
+        "return sample 2");
+    const episode::EpisodeOutput& carry_start = runtime.update({
+        0.0F, ignored_command, 61U, false, false});
+    require(
+        runtime.state() == episode::EpisodeState::Carry &&
+            carry_start.state == episode::EpisodeState::Carry,
+        "recorded return did not lead into carry after its final sample");
+    require_pose_root(
+        carry_start.pose, return2,
+        "carry matcher rebased with a root discontinuity");
+    require_selected_arm_layer(
+        carry_start.pose, return2, interaction::Hand::Left,
+        "first carry pose");
+
+    const vec3 carry_root =
+        carry_start.pose.positions[g1_skeleton::Simulation];
+    interaction::Pose previous = carry_start.pose;
+    float maximum_knee_change = 0.0F;
+    for (int tick = 0; tick < 100; ++tick) {
         const episode::EpisodeOutput& output = runtime.update({
-            kTick,
-            {vec3(0.0F, 0.0F, 1.0F), quat()},
-            61U,
-            false,
-            false,
-        });
-        require(output.attached, "object detached during recorded return");
-        require(
-            length(
-                output.pose.positions[g1_skeleton::Simulation] -
-                attempt.plan.return_poses[frame]
-                    .positions[g1_skeleton::Simulation]) < 1.0e-5F,
-            "return accepted locomotion input instead of playback");
+            kTick, ignored_command, 61U, false, false});
+        maximum_knee_change = std::max(
+            maximum_knee_change,
+            quat_angle_between(
+                output.pose.rotations[g1_skeleton::LeftKnee],
+                previous.rotations[g1_skeleton::LeftKnee]));
+        require_selected_arm_layer(
+            output.pose, return2, interaction::Hand::Left,
+            "walking carry pose");
+        previous = output.pose;
     }
     require(
-        runtime.state() == episode::EpisodeState::Carry,
-        "recorded return did not lead into carry");
+        length(
+            previous.positions[g1_skeleton::Simulation] - carry_root) >
+            0.20F,
+        "walking carry did not move the rebased root");
+    require(
+        maximum_knee_change > 0.005F,
+        "walking carry did not retain leg motion");
 }
 
 void test_freeze_attach_and_selected_carry_hand(reach::Hand hand) {
@@ -475,7 +621,8 @@ int main() {
             reach::Hand::Left);
         test_layered_carry_does_not_require_full_pose_carry_databases(
             reach::Hand::Right);
-        test_return_replays_attached_frozen_poses_before_carry();
+        test_commit_rejects_nonfinite_return_pose_before_state_mutation();
+        test_return_replays_every_authored_sample_before_carry();
         test_generation_change_and_cancel_fail_before_contact();
         test_contact_rejection_timeout_and_reset();
         test_native_walking_converges_to_a_distant_entry();
