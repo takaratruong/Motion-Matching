@@ -137,6 +137,19 @@ ViewDiagnostics summarize(
     return diagnostics;
 }
 
+std::vector<size_t> rejected_indices(
+    const reach::SearchResult& results) {
+    std::vector<size_t> rejected;
+    rejected.reserve(results.evaluations.size() - results.accepted.size());
+    for (size_t index = 0U; index < results.evaluations.size(); ++index) {
+        if (results.evaluations[index].evaluation.rejection !=
+            reach::Rejection::None) {
+            rejected.push_back(index);
+        }
+    }
+    return rejected;
+}
+
 Color trajectory_color(const reach::Pack& pack, size_t clip, bool accepted) {
     const bool mirrored = pack.database.augmentations.at(clip) ==
         static_cast<uint8_t>(reach::Augmentation::Mirrored);
@@ -242,6 +255,9 @@ void draw_hud(
     const reach::Pack& pack,
     const std::optional<reach::SearchResult>& results,
     size_t selected,
+    const std::vector<size_t>& rejected,
+    size_t selected_rejected_option,
+    bool selected_rejected,
     bool stale,
     bool search_incomplete,
     bool coverage_environment,
@@ -251,7 +267,7 @@ void draw_hud(
         "Arrow X/Z  W/S Y | Q/E yaw R/F pitch Z/C roll | Enter search",
         26, 24, 17, DARKGRAY);
     DrawText(
-        "G open/coverage | [ previous, ] or / next | V rejected | Backspace reset",
+        "G environment | [ ] or / accepted | < > rejected | V paths | Backspace reset",
         26, 48, 16, DARKGRAY);
     DrawText(
         TextFormat("%s ENVIRONMENT | rejected paths %s",
@@ -292,16 +308,22 @@ void draw_hud(
                 15,
                 reason == 0U ? DARKGREEN : DARKGRAY);
         }
-        if (!results->accepted.empty()) {
-            const size_t selected_evaluation = results->accepted[selected];
+        const bool has_selected = selected_rejected
+            ? selected_rejected_option < rejected.size()
+            : selected < results->accepted.size();
+        if (has_selected) {
+            const size_t selected_evaluation = selected_rejected
+                ? rejected[selected_rejected_option]
+                : results->accepted[selected];
             const reach::Evaluation& evaluation =
                 results->evaluations[selected_evaluation].evaluation;
             const size_t clip = evaluation.candidate.clip;
             DrawText(
                 TextFormat(
-                    "option %zu/%zu | YAW PLACEMENT %u/12 | %s | %s",
-                    selected + 1U,
-                    results->accepted.size(),
+                    "%s option %zu/%zu | YAW PLACEMENT %u/12 | %s | %s",
+                    selected_rejected ? "REJECTED" : "ACCEPTED",
+                    (selected_rejected ? selected_rejected_option : selected) + 1U,
+                    selected_rejected ? rejected.size() : results->accepted.size(),
                     static_cast<unsigned>(evaluation.candidate.yaw_index) + 1U,
                     provenance(pack, clip),
                     pack.database.source_names.at(
@@ -309,10 +331,11 @@ void draw_hud(
                 26,
                 239,
                 16,
-                DARKGREEN);
+                selected_rejected ? MAROON : DARKGREEN);
             DrawText(
                 TextFormat(
-                    "final %.2f cm | approach %.1f deg | orientation %.1f deg | deform %.4f",
+                    "%s | final %.2f cm | approach %.1f deg | orientation %.1f deg | deform %.4f",
+                    reach::rejection_name(evaluation.rejection),
                     evaluation.position_error_m * 100.0F,
                     evaluation.approach_error_radians * 180.0F / kPi,
                     evaluation.orientation_error_radians * 180.0F / kPi,
@@ -333,7 +356,7 @@ void draw_hud(
                         evaluation.environment_collision_observed
                     ? MAROON
                     : DARKGREEN);
-        } else {
+        } else if (results->accepted.empty()) {
             DrawText("0 valid motions", 26, 239, 20, MAROON);
         }
     }
@@ -358,20 +381,19 @@ void draw_hud(
     }
 }
 
-void regenerate_selected(
+void regenerate_index(
     const reach::Pack& pack,
     const reach::SearchResult& results,
-    size_t selected,
+    size_t evaluation_index,
     const reach::ExhaustiveQuery& query,
     const interaction::OrientedBox& object,
     const interaction::EnvironmentGeometry& environment,
     const reach::SearchConfig& config,
     std::optional<reach::Evaluation>& selected_full) {
     selected_full.reset();
-    if (results.accepted.empty()) return;
     selected_full = reach::regenerate(
         pack,
-        results.evaluations[results.accepted[selected]],
+        results.evaluations.at(evaluation_index),
         query,
         object,
         environment,
@@ -398,6 +420,9 @@ int main(int argc, char** argv) {
         bool stale = false;
         bool search_incomplete = false;
         size_t selected = 0U;
+        std::vector<size_t> rejected;
+        size_t selected_rejected_option = 0U;
+        bool selected_rejected = false;
         float animation_seconds = 0.0F;
         std::optional<reach::SearchResult> results;
         std::optional<reach::Evaluation> selected_full;
@@ -460,7 +485,26 @@ int main(int argc, char** argv) {
                 use_coverage_environment = !use_coverage_environment;
                 target_changed = true;
             }
-            if (IsKeyPressed(KEY_V)) show_rejected = !show_rejected;
+            if (IsKeyPressed(KEY_V)) {
+                show_rejected = !show_rejected;
+                if (!show_rejected && selected_rejected) {
+                    selected_rejected = false;
+                    animation_seconds = 0.0F;
+                    selected_full.reset();
+                    if (results.has_value() &&
+                        !results->accepted.empty() && !stale) {
+                        regenerate_index(
+                            pack,
+                            *results,
+                            results->accepted[selected],
+                            query,
+                            {object, options.object_size},
+                            use_coverage_environment ? coverage : open,
+                            search_config,
+                            selected_full);
+                    }
+                }
+            }
             if (IsKeyPressed(KEY_BACKSPACE)) {
                 object = reset_object(options.object_size);
                 grasp_approach_local = reset_grasp_approach_local();
@@ -480,16 +524,22 @@ int main(int argc, char** argv) {
                 if (completed.complete) {
                     results = std::move(completed);
                     selected = 0U;
+                    rejected = rejected_indices(*results);
+                    selected_rejected_option = 0U;
+                    selected_rejected = false;
                     animation_seconds = 0.0F;
-                    regenerate_selected(
-                        pack,
-                        *results,
-                        selected,
-                        query,
-                        object_box,
-                        environment,
-                        search_config,
-                        selected_full);
+                    selected_full.reset();
+                    if (!results->accepted.empty()) {
+                        regenerate_index(
+                            pack,
+                            *results,
+                            results->accepted[selected],
+                            query,
+                            object_box,
+                            environment,
+                            search_config,
+                            selected_full);
+                    }
                     stale = false;
                     search_incomplete = false;
                 } else {
@@ -510,11 +560,40 @@ int main(int argc, char** argv) {
                     selection_changed = true;
                 }
                 if (selection_changed) {
+                    selected_rejected = false;
                     animation_seconds = 0.0F;
-                    regenerate_selected(
+                    regenerate_index(
                         pack,
                         *results,
-                        selected,
+                        results->accepted[selected],
+                        query,
+                        object_box,
+                        environment,
+                        search_config,
+                        selected_full);
+                }
+            }
+            if (results.has_value() && show_rejected &&
+                !rejected.empty() && !stale) {
+                bool rejected_selection_changed = false;
+                if (IsKeyPressed(KEY_COMMA)) {
+                    selected_rejected_option =
+                        (selected_rejected_option + rejected.size() - 1U) %
+                        rejected.size();
+                    rejected_selection_changed = true;
+                }
+                if (IsKeyPressed(KEY_PERIOD)) {
+                    selected_rejected_option =
+                        (selected_rejected_option + 1U) % rejected.size();
+                    rejected_selection_changed = true;
+                }
+                if (rejected_selection_changed) {
+                    selected_rejected = true;
+                    animation_seconds = 0.0F;
+                    regenerate_index(
+                        pack,
+                        *results,
+                        rejected[selected_rejected_option],
                         query,
                         object_box,
                         environment,
@@ -535,17 +614,17 @@ int main(int argc, char** argv) {
                     Color{135, 102, 74, 155});
                 draw_oriented_box(box, Color{72, 52, 39, 255});
             }
-            DrawCubeV(
-                ray(object.position),
-                ray(options.object_size),
-                Color{245, 185, 45, 180});
             draw_oriented_box(object_box, GOLD);
             DrawSphere(ray(query.target.position), 0.028F, GOLD);
             draw_axes(query.target, 0.16F, 255);
 
             size_t selected_evaluation = 0U;
             bool has_selected_evaluation = false;
-            if (results.has_value() && !results->accepted.empty()) {
+            if (results.has_value() && selected_rejected &&
+                selected_rejected_option < rejected.size()) {
+                selected_evaluation = rejected[selected_rejected_option];
+                has_selected_evaluation = true;
+            } else if (results.has_value() && !results->accepted.empty()) {
                 selected_evaluation = results->accepted[selected];
                 has_selected_evaluation = true;
             }
@@ -589,7 +668,11 @@ int main(int argc, char** argv) {
                 const size_t sample = static_cast<size_t>(
                     animation_seconds * fps) % evaluation.poses.size();
                 draw_pose(
-                    evaluation.poses[sample], DARKBLUE, SKYBLUE);
+                    evaluation.poses[sample],
+                    evaluation.rejection == reach::Rejection::None
+                        ? DARKBLUE : MAROON,
+                    evaluation.rejection == reach::Rejection::None
+                        ? SKYBLUE : ORANGE);
                 const interaction::WorldPose final = interaction::world_pose(
                     evaluation.poses.back());
                 const size_t wrist = wrist_bone(selected_hand);
@@ -603,6 +686,9 @@ int main(int argc, char** argv) {
                 pack,
                 results,
                 selected,
+                rejected,
+                selected_rejected_option,
+                selected_rejected,
                 stale,
                 search_incomplete,
                 use_coverage_environment,

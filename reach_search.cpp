@@ -132,7 +132,8 @@ SearchResult search_all(
         }
     }
     result.complete = result.processed == result.total &&
-                      result.evaluations.size() == result.total;
+                      result.evaluations.size() == result.total &&
+                      result.elapsed <= config.deadline;
     if (!result.complete) return result;
 
     for (size_t index = 0U; index < result.evaluations.size(); ++index) {

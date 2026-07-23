@@ -58,6 +58,18 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
             source,
         )
 
+    def test_rotated_object_has_no_axis_aligned_solid(self):
+        source = self.source(VIEWER)
+        self.assertEqual(source.count("DrawCubeV("), 1)
+
+    def test_rejected_candidate_is_individually_inspectable(self):
+        source = self.source(VIEWER)
+        for required in (
+            "rejected_indices", "selected_rejected",
+            "KEY_COMMA", "KEY_PERIOD",
+        ):
+            self.assertIn(required, source)
+
     def test_probe_contract(self):
         source = self.source(PROBE)
         for required in (
@@ -67,6 +79,7 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
             "processed_instances", "root_azimuth_sectors",
             "elapsed_seconds", "complete", "4608", "0.001F", "30",
             "observed_collisions",
+            "coverage_demonstrated", "search_integrity_passed", "null",
         ):
             self.assertIn(required, source)
         for forbidden in ("own_query(", "position_perturbations"):

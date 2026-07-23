@@ -185,16 +185,29 @@ void write_fixture_report(
     const FixtureReport& report) {
     output << "{\"accepted\":" << report.accepted
            << ",\"complete\":" << (report.complete ? "true" : "false")
+           << ",\"coverage_demonstrated\":"
+           << (report.accepted > 0U ? "true" : "false")
            << ",\"elapsed_seconds\":" << report.elapsed_seconds
            << ",\"hands\":{\"left\":" << report.hands[0]
-           << ",\"right\":" << report.hands[1] << '}'
-           << ",\"maximum_accepted_approach_radians\":"
-           << report.maximum_accepted_approach_radians
-           << ",\"maximum_accepted_orientation_radians\":"
-           << report.maximum_accepted_orientation_radians
-           << ",\"maximum_accepted_position_m\":"
-           << report.maximum_accepted_position_m
-           << ",\"observed_collisions\":{\"environment\":"
+           << ",\"right\":" << report.hands[1] << '}';
+    const auto accepted_metric = [&](const char* name, float value) {
+        output << ",\"" << name << "\":";
+        if (report.accepted == 0U) {
+            output << "null";
+        } else {
+            output << value;
+        }
+    };
+    accepted_metric(
+        "maximum_accepted_approach_radians",
+        report.maximum_accepted_approach_radians);
+    accepted_metric(
+        "maximum_accepted_orientation_radians",
+        report.maximum_accepted_orientation_radians);
+    accepted_metric(
+        "maximum_accepted_position_m",
+        report.maximum_accepted_position_m);
+    output << ",\"observed_collisions\":{\"environment\":"
            << report.environment_collision_observed
            << ",\"object\":" << report.object_collision_observed << '}'
            << ",\"processed_instances\":" << report.processed_instances
@@ -212,10 +225,13 @@ void write_fixture_report(
 
 std::string to_json(
     const std::vector<Fixture>& fixtures,
-    const std::vector<FixtureReport>& reports) {
+    const std::vector<FixtureReport>& reports,
+    bool search_integrity_passed) {
     std::ostringstream output;
     output << std::fixed << std::setprecision(7);
-    output << "{\"expected_instances\":" << kExpectedInstances
+    output << "{\"search_integrity_passed\":"
+           << (search_integrity_passed ? "true" : "false")
+           << ",\"expected_instances\":" << kExpectedInstances
            << ",\"shared_grasps\":{";
     for (size_t index = 0U; index < fixtures.size(); ++index) {
         if (index != 0U) output << ',';
@@ -235,7 +251,8 @@ bool valid_report(
         valid = valid && report.complete &&
                 report.raw_instances == kExpectedInstances &&
                 report.processed_instances == kExpectedInstances &&
-                report.maximum_accepted_position_m <= kAcceptedPositionM &&
+                (report.accepted == 0U ||
+                 report.maximum_accepted_position_m <= kAcceptedPositionM) &&
                 report.elapsed_seconds <= 30.0;
         if (fixtures[index].name == "open_space") {
             valid = valid && report.hands[0] > 0U && report.hands[1] > 0U &&
@@ -271,7 +288,9 @@ int main(int argc, char** argv) {
         for (const Fixture& fixture : fixtures) {
             reports.push_back(evaluate_fixture(pack, fixture, config));
         }
-        const std::string json = to_json(fixtures, reports);
+        const bool search_integrity_passed = valid_report(fixtures, reports);
+        const std::string json = to_json(
+            fixtures, reports, search_integrity_passed);
         std::cout << json;
         if (!json_path.empty()) {
             if (!json_path.parent_path().empty()) {
@@ -282,7 +301,7 @@ int main(int argc, char** argv) {
             output << json;
             if (!output) throw std::runtime_error("cannot write JSON output");
         }
-        return valid_report(fixtures, reports) ? EXIT_SUCCESS : EXIT_FAILURE;
+        return search_integrity_passed ? EXIT_SUCCESS : EXIT_FAILURE;
     } catch (const std::exception& error) {
         std::cerr << "g1 reach coverage probe: " << error.what() << '\n';
         return EXIT_FAILURE;
