@@ -174,6 +174,7 @@ g1_reach_coverage_viewer: g1_reach_coverage_viewer.cpp \
 
 g1_interaction_episode_viewer: g1_interaction_episode_viewer.cpp \
   interaction_episode.cpp interaction_episode.h \
+  episode_layered_carry.cpp episode_layered_carry.h \
   episode_grasp_provider.cpp episode_grasp_provider.h \
   episode_reach_planner.cpp episode_reach_planner.h \
   g1_flat_motion_matcher.cpp g1_flat_motion_matcher.h \
@@ -190,6 +191,7 @@ g1_interaction_episode_viewer: g1_interaction_episode_viewer.cpp \
   $(LINUX_CONTROLLER_DEPS)
 	$(CC) $(CONTROLLER_CXXFLAGS) -O3 -DNDEBUG -pthread -o $@$(EXT) \
 	  g1_interaction_episode_viewer.cpp interaction_episode.cpp \
+	  episode_layered_carry.cpp \
 	  episode_grasp_provider.cpp episode_reach_planner.cpp \
 	  g1_flat_motion_matcher.cpp interaction_attachment.cpp \
 	  reach_coverage.cpp reach_database.cpp reach_motion.cpp \
@@ -288,6 +290,7 @@ CPP_TEST_BINS += $(CPP_TEST_DIR)/test_episode_reach_planner
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_g1_flat_motion_matcher
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_episode
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_episode_controls
+CPP_TEST_BINS += $(CPP_TEST_DIR)/test_episode_layered_carry
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_g1_mesh_renderer
 RELEASE_FAST_MATH_TARGET_TEST := \
   $(CPP_TEST_DIR)/test_interaction_target_release_fast_math
@@ -647,20 +650,38 @@ $(CPP_TEST_DIR)/test_episode_controls: \
   | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_episode_controls.cpp -o $@
 
+$(CPP_TEST_DIR)/test_episode_layered_carry: \
+  tests/cpp/test_episode_layered_carry.cpp \
+  episode_layered_carry.cpp episode_layered_carry.h \
+  g1_flat_motion_matcher.cpp g1_flat_motion_matcher.h \
+  interaction_posture_ik.cpp interaction_posture_ik.h \
+  interaction_ik.cpp interaction_ik.h g1_arm_joint_metadata.h \
+  interaction_pose.cpp interaction_pose.h interaction_database.h \
+  database.h g1_skeleton.h array.h vec.h quat.h | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_episode_layered_carry.cpp \
+	  episode_layered_carry.cpp g1_flat_motion_matcher.cpp \
+	  interaction_posture_ik.cpp interaction_ik.cpp \
+	  interaction_pose.cpp -o $@
+
 $(CPP_TEST_DIR)/test_interaction_episode: \
   tests/cpp/test_interaction_episode.cpp \
   interaction_episode.cpp interaction_episode.h \
+  episode_layered_carry.cpp episode_layered_carry.h \
   episode_grasp_provider.cpp episode_grasp_provider.h \
   episode_reach_planner.cpp episode_reach_planner.h \
   g1_flat_motion_matcher.cpp g1_flat_motion_matcher.h \
   interaction_attachment.cpp interaction_attachment.h \
+  interaction_posture_ik.cpp interaction_posture_ik.h \
+  interaction_ik.cpp interaction_ik.h g1_arm_joint_metadata.h \
   interaction_pose.cpp interaction_pose.h interaction_target.cpp \
   interaction_target.h interaction_database.h database.h g1_skeleton.h \
   array.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) -pthread \
 	  tests/cpp/test_interaction_episode.cpp interaction_episode.cpp \
+	  episode_layered_carry.cpp \
 	  episode_grasp_provider.cpp g1_flat_motion_matcher.cpp \
-	  interaction_attachment.cpp interaction_pose.cpp \
+	  interaction_attachment.cpp interaction_posture_ik.cpp \
+	  interaction_ik.cpp interaction_pose.cpp \
 	  interaction_target.cpp -o $@
 
 $(CPP_TEST_DIR)/test_g1_mesh_renderer: tests/cpp/test_g1_mesh_renderer.cpp \

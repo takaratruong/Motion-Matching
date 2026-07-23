@@ -60,6 +60,11 @@ class InteractionEpisodeViewerContractTest(unittest.TestCase):
         self.assertIn("destination_support_index", source)
         self.assertIn("std::swap(", source)
 
+    def test_viewer_surfaces_layered_carry_diagnostics(self) -> None:
+        source = self.source()
+        self.assertIn("runtime.output().diagnostic", source)
+        self.assertIn("CARRY IK", source)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -306,7 +306,7 @@ void draw_hud(
     const std::string& search_failure,
     bool show_mesh,
     bool show_bones) {
-    DrawRectangle(14, 14, 760, 184, Color{255, 255, 255, 232});
+    DrawRectangle(14, 14, 760, 208, Color{255, 255, 255, 232});
     DrawText(
         "WASD move | arrows active marker | U/J height | Q/E yaw | F pick/place",
         26, 24, 17, DARKGRAY);
@@ -363,6 +363,20 @@ void draw_hud(
             show_bones ? "ON" : "OFF",
             failure.empty() ? "none" : failure.c_str()),
         26, 157, 16, failure.empty() ? DARKGRAY : MAROON);
+    const std::string& carry_diagnostic =
+        runtime.output().diagnostic;
+    DrawText(
+        TextFormat(
+            "CARRY IK %s",
+            carry_diagnostic.empty()
+                ? "nominal"
+                : carry_diagnostic.c_str()),
+        26,
+        181,
+        16,
+        carry_diagnostic.empty()
+            ? DARKGRAY
+            : Color{190, 118, 15, 255});
 }
 
 }  // namespace

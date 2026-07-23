@@ -1,6 +1,7 @@
 #pragma once
 
 #include "episode_reach_planner.h"
+#include "episode_layered_carry.h"
 #include "g1_flat_motion_matcher.h"
 #include "interaction_attachment.h"
 
@@ -83,6 +84,7 @@ struct EpisodeOutput {
     bool placed = false;
     bool owns_pose = true;
     std::string failure;
+    std::string diagnostic;
 };
 
 class InteractionEpisode {
@@ -139,6 +141,8 @@ private:
     interaction::Pose bridge_start_{};
     FlatSkeletonWorldPose bridge_flat_start_{};
     interaction::Pose contact_pose_{};
+    LayeredCarry layered_carry_{};
+    interaction::Transform hand_in_object_{};
     float state_seconds_ = 0.0F;
     float frame_accumulator_ = 0.0F;
     size_t reach_frame_ = 0U;

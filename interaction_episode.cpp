@@ -88,7 +88,7 @@ InteractionEpisode::InteractionEpisode(
       carry_left_database_(std::move(carry_left_database)),
       carry_right_database_(std::move(carry_right_database)),
       config_(config),
-      matcher_(walking_database_, carry_left_database_) {
+      matcher_(walking_database_) {
     validate_config(config_);
     if (!matcher_.uses_native_g1()) {
         throw std::invalid_argument(
@@ -117,6 +117,7 @@ bool InteractionEpisode::commit(FrozenAttempt attempt) {
     output_.place_ready = false;
     output_.placed = false;
     output_.failure.clear();
+    output_.diagnostic.clear();
 
     interaction::GraspAffordance affordance{};
     affordance.id = 1U;
@@ -124,6 +125,7 @@ bool InteractionEpisode::commit(FrozenAttempt attempt) {
     affordance.hand_in_object = interaction::compose(
         interaction::inverse(attempt_->object.world),
         attempt_->grasp.hand_world);
+    hand_in_object_ = affordance.hand_in_object;
     affordance.approach_direction_object = quat_inv_mul_vec3(
         attempt_->object.world.rotation,
         attempt_->grasp.approach_world);
@@ -382,18 +384,24 @@ void InteractionEpisode::update_reach(float dt) {
         fail("contact rejected");
         return;
     }
-    matcher_.switch_database(
-        output_.selected_hand == interaction::Hand::Left
-            ? carry_left_database_
-            : carry_right_database_,
-        contact_pose_);
+    matcher_.switch_database(walking_database_, contact_pose_);
+    layered_carry_.start(
+        contact_pose_,
+        output_.selected_hand,
+        hand_in_object_,
+        output_.object_world);
     state_ = EpisodeState::CarryBlend;
     state_seconds_ = 0.0F;
 }
 
 void InteractionEpisode::update_carry(const EpisodeInput& input) {
     matcher_.update(input.command, input.dt);
-    interaction::Pose displayed = matcher_.snapshot().pose;
+    interaction::Pose displayed =
+        layered_carry_.update(matcher_.snapshot());
+    output_.diagnostic = layered_carry_.last_solve_accepted()
+        ? std::string{}
+        : std::string{
+              "carry IK rejected; using last safe active-arm branch"};
     if (state_ == EpisodeState::CarryBlend) {
         state_seconds_ += input.dt;
         const float alpha = smoothstep(
@@ -437,7 +445,11 @@ void InteractionEpisode::update_place_approach(
               velocity,
               live.rotations[g1_skeleton::Simulation]);
     matcher_.update({velocity, heading}, input.dt);
-    publish(matcher_.snapshot().pose);
+    publish(layered_carry_.update(matcher_.snapshot()));
+    output_.diagnostic = layered_carry_.last_solve_accepted()
+        ? std::string{}
+        : std::string{
+              "carry IK rejected; using last safe active-arm branch"};
     update_attached_object(input.dt);
     if (state_ == EpisodeState::Failed) return;
 
@@ -561,6 +573,7 @@ void InteractionEpisode::update_place_return(float dt) {
     output_.placed = true;
     output_.object_world = placed;
     output_.failure.clear();
+    output_.diagnostic.clear();
     publish(matcher_.snapshot().pose);
     output_.object_world = placed;
     output_.placed = true;
@@ -605,15 +618,17 @@ void InteractionEpisode::cancel_before_contact() {
     output_.attached = false;
     output_.place_ready = false;
     output_.failure.clear();
+    output_.diagnostic.clear();
     publish(matcher_.snapshot().pose);
 }
 
 void InteractionEpisode::cancel_place_before_release() {
-    matcher_.switch_database(
-        output_.selected_hand == interaction::Hand::Left
-            ? carry_left_database_
-            : carry_right_database_,
-        output_.pose);
+    matcher_.switch_database(walking_database_, output_.pose);
+    layered_carry_.start(
+        output_.pose,
+        output_.selected_hand,
+        hand_in_object_,
+        output_.object_world);
     place_attempt_.reset();
     state_ = EpisodeState::Carry;
     state_seconds_ = 0.0F;
