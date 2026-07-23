@@ -40,8 +40,8 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
         ):
             self.assertIn(required, source)
         for forbidden in (
-            "g1_mesh_renderer", "terrain_runtime", "TakeScreenshot(",
-            "LoadModel(", "controller.cpp", "reach::select_candidates(",
+            "terrain_runtime", "TakeScreenshot(",
+            "controller.cpp", "reach::select_candidates(",
             "use_coverage_environment = false",
         ):
             self.assertNotIn(forbidden, source)
@@ -82,6 +82,31 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
             self.assertIn(required, source)
         self.assertNotIn("constexpr float table_top = 0.77F", source)
 
+    def test_mesh_uses_the_exact_selected_world_pose_and_safe_lifecycle(self):
+        source = self.source(VIEWER)
+        for required in (
+            '#include "g1_mesh_renderer.h"',
+            '"resources/g1_mesh/g1_raylib.glb"',
+            "bool show_g1_mesh = true", "bool show_g1_bones = false",
+            "IsKeyPressed(KEY_M)", "IsKeyPressed(KEY_B)",
+            "::g1_mesh_renderer_load(", "::g1_mesh_renderer_update(",
+            "::g1_mesh_renderer_draw(", "::g1_mesh_renderer_unload(",
+            "mesh_world_pose.positions", "mesh_world_pose.rotations",
+            "G1 MESH DISABLED", "show_g1_bones = true",
+        ):
+            self.assertIn(required, source)
+        update = source.index("::g1_mesh_renderer_update(")
+        begin_drawing = source.index("BeginDrawing();", update)
+        begin_3d = source.index("BeginMode3D(camera);", begin_drawing)
+        draw = source.index("::g1_mesh_renderer_draw(", begin_3d)
+        end_3d = source.index("EndMode3D();", draw)
+        unload = source.index("::g1_mesh_renderer_unload(")
+        close = source.index("CloseWindow();", unload)
+        self.assertLess(update, begin_drawing)
+        self.assertLess(begin_3d, draw)
+        self.assertLess(draw, end_3d)
+        self.assertLess(unload, close)
+
     def test_probe_contract(self):
         source = self.source(PROBE)
         for required in (
@@ -105,6 +130,8 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
         self.assertIn("reach_coverage.cpp", makefile)
         self.assertIn("reach_search.cpp", makefile)
         self.assertIn("reach_database.cpp", makefile)
+        self.assertIn("g1_mesh_renderer.h", makefile)
+        self.assertIn("resources/g1_mesh/g1_raylib.glb", makefile)
         probe_target = makefile.split("g1_reach_coverage_probe:", 1)[1].split(
             "\n\n", 1
         )[0]

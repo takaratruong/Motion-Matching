@@ -161,6 +161,8 @@ g1_reach_coverage_viewer: g1_reach_coverage_viewer.cpp \
   interaction_hand_trajectories.h interaction_ik.cpp interaction_ik.h \
   g1_arm_joint_metadata.h interaction_pose.cpp interaction_pose.h \
   interaction_target.cpp interaction_target.h interaction_database.h \
+  g1_mesh_renderer.h g1_kinematic_contract.h array.h \
+  resources/g1_mesh/g1_raylib.glb \
   g1_skeleton.h vec.h quat.h $(LINUX_CONTROLLER_DEPS)
 	$(CC) $(CONTROLLER_CXXFLAGS) -O3 -DNDEBUG -pthread -o $@$(EXT) \
 	  g1_reach_coverage_viewer.cpp reach_coverage.cpp reach_database.cpp \
@@ -249,6 +251,7 @@ CPP_TEST_BINS += $(CPP_TEST_DIR)/test_interaction_reuse_audit
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_reach_database
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_reach_coverage
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_reach_search
+CPP_TEST_BINS += $(CPP_TEST_DIR)/test_g1_mesh_renderer
 RELEASE_FAST_MATH_TARGET_TEST := \
   $(CPP_TEST_DIR)/test_interaction_target_release_fast_math
 RELEASE_FAST_MATH_CARRY_TEST := \
@@ -570,6 +573,12 @@ $(CPP_TEST_DIR)/test_reach_search: tests/cpp/test_reach_search.cpp \
 	  reach_search.cpp reach_coverage.cpp reach_placement.cpp \
 	  reach_database.cpp reach_motion.cpp interaction_hand_trajectories.cpp \
 	  interaction_ik.cpp interaction_pose.cpp interaction_target.cpp -o $@
+
+$(CPP_TEST_DIR)/test_g1_mesh_renderer: tests/cpp/test_g1_mesh_renderer.cpp \
+  g1_mesh_renderer.h g1_kinematic_contract.h array.h vec.h quat.h \
+  $(LINUX_CONTROLLER_DEPS) | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_g1_mesh_renderer.cpp \
+	  $(CFLAGS) $(LIBS) -o $@
 
 $(CPP_TEST_DIR)/test_interaction_playback: tests/cpp/test_interaction_playback.cpp tests/cpp/interaction_runtime_fixture.h interaction_playback.cpp interaction_playback.h interaction_matcher.cpp interaction_matcher.h interaction_features.cpp interaction_features.h interaction_pose.cpp interaction_pose.h interaction_target.cpp interaction_target.h interaction_database.h g1_skeleton.h vec.h quat.h | $(CPP_TEST_DIR)
 	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_interaction_playback.cpp interaction_playback.cpp interaction_matcher.cpp interaction_features.cpp interaction_pose.cpp interaction_target.cpp -o $@

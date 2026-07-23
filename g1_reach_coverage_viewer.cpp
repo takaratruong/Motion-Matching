@@ -1,3 +1,4 @@
+#include "g1_mesh_renderer.h"
 #include "g1_skeleton.h"
 #include "reach_search.h"
 #include "raylib.h"
@@ -245,10 +246,9 @@ void draw_axes(
 }
 
 void draw_pose(
-    const interaction::Pose& pose,
+    const interaction::WorldPose& world,
     Color joint_color,
     Color bone_color) {
-    const interaction::WorldPose world = interaction::world_pose(pose);
     for (size_t bone = 0U; bone < g1_skeleton::BoneCount; ++bone) {
         DrawSphereWires(
             ray(world.positions[bone]), 0.024F, 4, 8, joint_color);
@@ -308,13 +308,16 @@ void draw_hud(
     bool stale,
     bool search_incomplete,
     bool coverage_environment,
-    bool show_rejected) {
-    DrawRectangle(14, 14, 800, 342, Color{255, 255, 255, 230});
+    bool show_rejected,
+    bool show_g1_mesh,
+    bool show_g1_bones,
+    const char* g1_mesh_error) {
+    DrawRectangle(14, 14, 800, 370, Color{255, 255, 255, 230});
     DrawText(
         "Arrow X/Z  W/S Y | Q/E yaw R/F pitch Z/C roll | Enter search",
         26, 24, 17, DARKGRAY);
     DrawText(
-        "G environment | [ ] or / accepted | < > rejected | V paths | Backspace reset",
+        "G environment | [ ] / accepted | < > rejected | V paths | M mesh | B bones",
         26, 48, 16, DARKGRAY);
     DrawText(
         TextFormat("%s ENVIRONMENT | rejected paths %s",
@@ -415,6 +418,23 @@ void draw_hud(
             15,
             MAROON);
     }
+    DrawText(
+        TextFormat(
+            "M mesh %s | B bones %s | left orbit | middle pan | wheel zoom",
+            show_g1_mesh ? "ON" : "OFF",
+            show_g1_bones ? "ON" : "OFF"),
+        26,
+        342,
+        15,
+        DARKGRAY);
+    if (g1_mesh_error != nullptr && g1_mesh_error[0] != '\0') {
+        DrawText(
+            TextFormat("G1 MESH DISABLED: %s", g1_mesh_error),
+            820,
+            82,
+            16,
+            MAROON);
+    }
     if (stale) {
         DrawText("SEARCH STALE - press Enter", 830, 22, 24, MAROON);
     }
@@ -484,7 +504,24 @@ int main(int argc, char** argv) {
         camera.projection = CAMERA_PERSPECTIVE;
         OrbitCameraState camera_state{};
         update_orbit_camera(camera, camera_state);
+        G1MeshRenderer g1_mesh_renderer{};
+        std::array<char, 256U> g1_mesh_error{};
+        bool show_g1_mesh = true;
+        bool show_g1_bones = false;
+        if (!::g1_mesh_renderer_load(
+                g1_mesh_renderer,
+                "resources/g1_mesh/g1_raylib.glb",
+                g1_mesh_error.data(),
+                static_cast<int>(g1_mesh_error.size()))) {
+            show_g1_mesh = false;
+            show_g1_bones = true;
+        }
+        const auto close_graphics = [&] {
+            ::g1_mesh_renderer_unload(g1_mesh_renderer);
+            CloseWindow();
+        };
 
+        try {
         while (!WindowShouldClose()) {
             const float dt = GetFrameTime();
             update_orbit_camera(camera, camera_state);
@@ -530,6 +567,12 @@ int main(int argc, char** argv) {
             if (IsKeyPressed(KEY_G)) {
                 use_coverage_environment = !use_coverage_environment;
                 target_changed = true;
+            }
+            if (IsKeyPressed(KEY_M) && g1_mesh_renderer.loaded) {
+                show_g1_mesh = !show_g1_mesh;
+            }
+            if (IsKeyPressed(KEY_B)) {
+                show_g1_bones = !show_g1_bones;
             }
             if (IsKeyPressed(KEY_V)) {
                 show_rejected = !show_rejected;
@@ -649,6 +692,46 @@ int main(int argc, char** argv) {
             }
             if (selected_full.has_value()) animation_seconds += dt;
 
+            size_t selected_evaluation = 0U;
+            bool has_selected_evaluation = false;
+            if (results.has_value() && selected_rejected &&
+                selected_rejected_option < rejected.size()) {
+                selected_evaluation = rejected[selected_rejected_option];
+                has_selected_evaluation = true;
+            } else if (results.has_value() && !results->accepted.empty()) {
+                selected_evaluation = results->accepted[selected];
+                has_selected_evaluation = true;
+            }
+
+            std::optional<interaction::WorldPose> selected_world_pose;
+            if (selected_full.has_value() &&
+                !selected_full->poses.empty()) {
+                const float fps =
+                    static_cast<float>(pack.database.fps_numerator) /
+                    static_cast<float>(pack.database.fps_denominator);
+                const size_t sample = static_cast<size_t>(
+                    animation_seconds * fps) % selected_full->poses.size();
+                selected_world_pose = interaction::world_pose(
+                    selected_full->poses[sample]);
+                if (show_g1_mesh && g1_mesh_renderer.loaded) {
+                    interaction::WorldPose& mesh_world_pose =
+                        *selected_world_pose;
+                    if (!::g1_mesh_renderer_update(
+                            g1_mesh_renderer,
+                            slice1d<vec3>(
+                                static_cast<int>(g1_skeleton::BoneCount),
+                                mesh_world_pose.positions.data()),
+                            slice1d<quat>(
+                                static_cast<int>(g1_skeleton::BoneCount),
+                                mesh_world_pose.rotations.data()),
+                            g1_mesh_error.data(),
+                            static_cast<int>(g1_mesh_error.size()))) {
+                        show_g1_mesh = false;
+                        show_g1_bones = true;
+                    }
+                }
+            }
+
             BeginDrawing();
             ClearBackground(Color{238, 241, 245, 255});
             BeginMode3D(camera);
@@ -663,16 +746,8 @@ int main(int argc, char** argv) {
             draw_oriented_box(object_box, GOLD);
             DrawSphere(ray(query.target.position), 0.028F, GOLD);
             draw_axes(query.target, 0.16F, 255);
-
-            size_t selected_evaluation = 0U;
-            bool has_selected_evaluation = false;
-            if (results.has_value() && selected_rejected &&
-                selected_rejected_option < rejected.size()) {
-                selected_evaluation = rejected[selected_rejected_option];
-                has_selected_evaluation = true;
-            } else if (results.has_value() && !results->accepted.empty()) {
-                selected_evaluation = results->accepted[selected];
-                has_selected_evaluation = true;
+            if (show_g1_mesh && selected_world_pose.has_value()) {
+                ::g1_mesh_renderer_draw(g1_mesh_renderer);
             }
             if (results.has_value()) {
                 for (size_t index = 0U;
@@ -708,17 +783,14 @@ int main(int argc, char** argv) {
                     selected_color,
                     1U,
                     true);
-                const float fps =
-                    static_cast<float>(pack.database.fps_numerator) /
-                    static_cast<float>(pack.database.fps_denominator);
-                const size_t sample = static_cast<size_t>(
-                    animation_seconds * fps) % evaluation.poses.size();
-                draw_pose(
-                    evaluation.poses[sample],
-                    evaluation.rejection == reach::Rejection::None
-                        ? DARKBLUE : MAROON,
-                    evaluation.rejection == reach::Rejection::None
-                        ? SKYBLUE : ORANGE);
+                if (show_g1_bones && selected_world_pose.has_value()) {
+                    draw_pose(
+                        *selected_world_pose,
+                        evaluation.rejection == reach::Rejection::None
+                            ? DARKBLUE : MAROON,
+                        evaluation.rejection == reach::Rejection::None
+                            ? SKYBLUE : ORANGE);
+                }
                 const interaction::WorldPose final = interaction::world_pose(
                     evaluation.poses.back());
                 const size_t wrist = wrist_bone(selected_hand);
@@ -738,10 +810,17 @@ int main(int argc, char** argv) {
                 stale,
                 search_incomplete,
                 use_coverage_environment,
-                show_rejected);
+                show_rejected,
+                show_g1_mesh,
+                show_g1_bones,
+                g1_mesh_error.data());
             EndDrawing();
         }
-        CloseWindow();
+        } catch (...) {
+            close_graphics();
+            throw;
+        }
+        close_graphics();
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {
         std::cerr << "g1 reach coverage viewer: " << error.what() << '\n';
