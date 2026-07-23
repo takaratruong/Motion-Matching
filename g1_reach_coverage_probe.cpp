@@ -1,3 +1,4 @@
+#include "reach_coverage_metrics.h"
 #include "reach_search.h"
 #include "reach_placement.h"
 
@@ -113,15 +114,6 @@ std::vector<Fixture> shared_grasps() {
     };
 }
 
-size_t azimuth_sector(vec3 direction) {
-    const float angle = std::atan2(direction.z, direction.x);
-    const float normalized = angle < 0.0F ? angle + 2.0F * kPi : angle;
-    const size_t sector = static_cast<size_t>(
-        normalized * static_cast<float>(kRootAzimuthSectors) /
-        (2.0F * kPi));
-    return std::min(sector, kRootAzimuthSectors - 1U);
-}
-
 FixtureReport evaluate_fixture(
     const reach::Pack& pack,
     const Fixture& fixture,
@@ -139,7 +131,8 @@ FixtureReport evaluate_fixture(
     report.accepted = result.accepted.size();
     report.elapsed_seconds =
         std::chrono::duration<double>(result.elapsed).count();
-    std::array<bool, kRootAzimuthSectors> occupied{};
+    std::vector<reach::Candidate> accepted_candidates;
+    accepted_candidates.reserve(result.accepted.size());
 
     for (const reach::CompactEvaluation& compact : result.evaluations) {
         const reach::Evaluation& evaluation = compact.evaluation;
@@ -155,6 +148,7 @@ FixtureReport evaluate_fixture(
     for (const size_t index : result.accepted) {
         const reach::CompactEvaluation& compact = result.evaluations[index];
         const reach::Evaluation& evaluation = compact.evaluation;
+        accepted_candidates.push_back(evaluation.candidate);
         ++report.hands.at(
             pack.database.active_hands.at(evaluation.candidate.clip));
         report.maximum_accepted_position_m = std::max(
@@ -166,28 +160,13 @@ FixtureReport evaluate_fixture(
         report.maximum_accepted_orientation_radians = std::max(
             report.maximum_accepted_orientation_radians,
             evaluation.orientation_error_radians);
-        const size_t clip = evaluation.candidate.clip;
-        const uint8_t yaw = evaluation.candidate.yaw_index;
-        const int32_t terminal_frame =
-            pack.database.range_stops.at(clip) - 1;
-        const interaction::Pose terminal_pose = reach::place_pose(
-            pack,
-            clip,
-            yaw,
-            fixture.query.target.position,
-            terminal_frame);
-        const interaction::WorldPose terminal = interaction::world_pose(
-            terminal_pose);
-        vec3 grasp_to_root =
-            terminal.positions[g1_skeleton::Simulation] -
-            fixture.query.target.position;
-        grasp_to_root.y = 0.0F;
-        if (length(grasp_to_root) > 1.0e-5F) {
-            occupied[azimuth_sector(grasp_to_root)] = true;
-        }
     }
-    report.root_azimuth_sectors = static_cast<size_t>(std::count(
-        occupied.begin(), occupied.end(), true));
+    report.root_azimuth_sectors =
+        reach::count_placed_root_azimuth_sectors(
+            pack,
+            accepted_candidates,
+            fixture.query.target.position,
+            kRootAzimuthSectors);
     return report;
 }
 

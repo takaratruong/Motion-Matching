@@ -1,6 +1,7 @@
 #include "g1_arm_joint_metadata.h"
 #include "interaction_posture_ik.h"
 #include "reach_coverage.h"
+#include "reach_coverage_metrics.h"
 #include "reach_placement.h"
 
 #include <array>
@@ -743,6 +744,23 @@ void test_shaping_is_invariant_under_horizontal_target_translation() {
             first_world.positions[g1_skeleton::LeftWrist] -
             horizontal_delta) <= 0.001F);
     }
+
+    size_t origin_accepted = 0U;
+    size_t moved_accepted = 0U;
+    const std::vector<reach::Candidate> candidates =
+        reach::enumerate_candidates(pack);
+    for (const reach::Candidate& exhaustive : candidates) {
+        const reach::Evaluation at_origin =
+            reach::shape_candidate(pack, exhaustive, origin);
+        const reach::Evaluation at_moved =
+            reach::shape_candidate(pack, exhaustive, moved);
+        assert(at_origin.rejection == at_moved.rejection);
+        origin_accepted +=
+            at_origin.rejection == reach::Rejection::None ? 1U : 0U;
+        moved_accepted +=
+            at_moved.rejection == reach::Rejection::None ? 1U : 0U;
+    }
+    assert(origin_accepted == moved_accepted);
 }
 
 void test_task_priority_shaping_is_frame_to_frame_continuous() {
@@ -777,37 +795,29 @@ void test_task_priority_shaping_is_frame_to_frame_continuous() {
     }
 }
 
-void test_all_yaw_placements_contribute_root_azimuth_diversity() {
-    const reach::Pack pack = fixture(20U);
+void test_sector_metric_counts_distinct_roots_that_share_a_yaw() {
+    reach::Pack pack = bilateral_fixture();
     const reach::Query query = zero_query(pack);
-    std::array<bool, reach::kYawPlacementCount> occupied{};
-    constexpr float two_pi = 6.28318530717958647692F;
-    const int32_t terminal_frame =
-        pack.database.range_stops.front() - 1;
-    for (const reach::Candidate& candidate :
-         reach::enumerate_candidates(pack)) {
-        const interaction::WorldPose terminal = interaction::world_pose(
-            reach::place_pose(
-                pack,
-                candidate.clip,
-                candidate.yaw_index,
-                query.target.position,
-                terminal_frame));
-        vec3 direction =
-            terminal.positions[g1_skeleton::Simulation] -
-            query.target.position;
-        direction.y = 0.0F;
-        float angle = std::atan2(direction.z, direction.x);
-        if (angle < 0.0F) angle += two_pi;
-        const size_t sector = std::min(
-            static_cast<size_t>(
-                angle *
-                static_cast<float>(reach::kYawPlacementCount) /
-                two_pi),
-            static_cast<size_t>(reach::kYawPlacementCount - 1U));
-        occupied[sector] = true;
-    }
-    assert(std::count(occupied.begin(), occupied.end(), true) >= 10);
+    pack.database.endpoint_positions[3U] += 1.0F;
+    pack.database.endpoint_positions[5U] += 1.0F;
+    const std::vector<reach::Candidate> same_yaw = {
+        reach::Candidate{0U, 0U},
+        reach::Candidate{1U, 0U},
+    };
+    assert(reach::count_placed_root_azimuth_sectors(
+        pack,
+        same_yaw,
+        query.target.position,
+        reach::kYawPlacementCount) == 2U);
+    const std::vector<reach::Candidate> duplicate = {
+        reach::Candidate{0U, 0U},
+        reach::Candidate{0U, 0U},
+    };
+    assert(reach::count_placed_root_azimuth_sectors(
+        pack,
+        duplicate,
+        query.target.position,
+        reach::kYawPlacementCount) == 1U);
 }
 
 void test_enumeration_is_bilateral_exhaustive_and_query_invariant() {
@@ -868,7 +878,7 @@ int main() {
     test_contact_placement_ignores_target_height_for_whole_body();
     test_shaping_is_invariant_under_horizontal_target_translation();
     test_task_priority_shaping_is_frame_to_frame_continuous();
-    test_all_yaw_placements_contribute_root_azimuth_diversity();
+    test_sector_metric_counts_distinct_roots_that_share_a_yaw();
     test_enumeration_is_bilateral_exhaustive_and_query_invariant();
     test_shared_grasp_shapes_both_hands_at_every_yaw();
 }

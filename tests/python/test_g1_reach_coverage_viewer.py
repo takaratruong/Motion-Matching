@@ -6,6 +6,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 VIEWER = ROOT / "g1_reach_coverage_viewer.cpp"
 PROBE = ROOT / "g1_reach_coverage_probe.cpp"
 REACH_COVERAGE = ROOT / "reach_coverage.cpp"
+REACH_COVERAGE_METRICS = ROOT / "reach_coverage_metrics.cpp"
 TRAJECTORY_HEADER = ROOT / "interaction_hand_trajectories.h"
 MAKEFILE = ROOT / "Makefile"
 MESH_TEST = ROOT / "tests" / "cpp" / "test_g1_mesh_renderer.cpp"
@@ -183,9 +184,13 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
             self.assertIn(required, source)
 
     def test_probe_counts_diversity_across_every_accepted_candidate(self):
-        source = self.source(PROBE)
-        self.assertIn("reach::place_pose(", source)
-        self.assertNotIn("regenerated_yaw", source)
+        probe = self.source(PROBE)
+        metrics = self.source(REACH_COVERAGE_METRICS)
+        self.assertIn(
+            "reach::count_placed_root_azimuth_sectors(", probe
+        )
+        self.assertIn("place_pose(", metrics)
+        self.assertNotIn("regenerated_yaw", probe)
 
     def test_makefile_has_standalone_targets(self):
         makefile = self.source(MAKEFILE)
@@ -194,6 +199,7 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
         self.assertIn("reach_coverage.cpp", makefile)
         self.assertIn("reach_search.cpp", makefile)
         self.assertIn("reach_database.cpp", makefile)
+        self.assertIn("reach_coverage_metrics.cpp", makefile)
         self.assertIn("g1_mesh_renderer.h", makefile)
         self.assertIn("resources/g1_mesh/g1_raylib.glb", makefile)
         probe_target = makefile.split("g1_reach_coverage_probe:", 1)[1].split(
