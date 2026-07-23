@@ -1,5 +1,6 @@
 #include "episode_layered_carry.h"
 
+#include "g1_arm_joint_metadata.h"
 #include "g1_flat_motion_matcher.h"
 
 #include <algorithm>
@@ -59,18 +60,29 @@ void test_hand(interaction::Hand hand) {
             interaction::inverse(object_world), hand_world);
 
     episode::LayeredCarry carry;
-    carry.start(hold, hand, hand_in_object, object_world);
+    carry.start(hold, hand, hand_in_object);
     const vec3 start_root =
         hold.positions[g1_skeleton::Simulation];
     float maximum_knee_change = 0.0F;
     float maximum_inactive_arm_change = 0.0F;
     interaction::Pose previous = hold;
-    for (int tick = 0; tick < 150; ++tick) {
+    for (int tick = 0; tick < 100; ++tick) {
         matcher.update(
             {vec3(0.0F, 0.0F, 0.22F), quat()},
             1.0F / 25.0F);
         const interaction::Pose& pose =
             carry.update(matcher.snapshot());
+        const std::array<interaction::HingeJoint, 7>& selected_arm =
+            hand == interaction::Hand::Left
+                ? interaction::kLeftArm
+                : interaction::kRightArm;
+        for (const interaction::HingeJoint& joint : selected_arm) {
+            const size_t bone = static_cast<size_t>(joint.bone);
+            require(
+                quat_angle_between(
+                    pose.rotations[bone], hold.rotations[bone]) < 0.002F,
+                "selected arm did not retain the nominal return layer");
+        }
         maximum_knee_change = std::max(
             maximum_knee_change,
             quat_angle_between(
@@ -118,57 +130,12 @@ void test_hand(interaction::Hand hand) {
         "layered carry froze the inactive arm");
 }
 
-void test_unreachable_target_uses_last_safe_pose() {
-    episode::FlatMotionMatcher matcher(
-        "build/g1-episode/walking_database.bin");
-    const interaction::Pose hold = matcher.snapshot().pose;
-    const interaction::WorldPose world =
-        interaction::world_pose(hold);
-    const interaction::Transform hand_world{
-        world.positions[g1_skeleton::LeftWrist],
-        world.rotations[g1_skeleton::LeftWrist],
-    };
-    interaction::Transform object_world{
-        hand_world.position + vec3(0.0F, -0.05F, 0.0F),
-        hand_world.rotation,
-    };
-    const interaction::Transform hand_in_object =
-        interaction::compose(
-            interaction::inverse(object_world), hand_world);
-    object_world.position.x += 5.0F;
-
-    episode::LayeredCarry carry;
-    carry.start(
-        hold,
-        interaction::Hand::Left,
-        hand_in_object,
-        object_world);
-    matcher.update(
-        {vec3(0.0F, 0.0F, 0.22F), quat()},
-        1.0F / 25.0F);
-    const interaction::Pose& fallback =
-        carry.update(matcher.snapshot());
-    require(
-        !carry.last_solve_accepted(),
-        "unreachable target was incorrectly accepted");
-    require(
-        finite_pose(fallback),
-        "unreachable target published a non-finite fallback");
-    require(
-        length(
-            fallback.positions[g1_skeleton::Simulation] -
-            matcher.snapshot().pose.positions[
-                g1_skeleton::Simulation]) < 1.0e-5F,
-        "fallback did not retain the live locomotion root");
-}
-
 }  // namespace
 
 int main() {
     try {
         test_hand(interaction::Hand::Left);
         test_hand(interaction::Hand::Right);
-        test_unreachable_target_uses_last_safe_pose();
         std::cout << "episode layered carry PASS\n";
         return 0;
     } catch (const std::exception& error) {

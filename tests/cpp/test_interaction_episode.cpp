@@ -48,6 +48,7 @@ episode::FrozenAttempt make_attempt(
     attempt.plan.reach.candidate.clip = clip;
     attempt.plan.reach.rejection = reach::Rejection::None;
     attempt.plan.reach.poses.assign(4U, pose);
+    attempt.plan.return_poses.assign(3U, pose);
     attempt.request_id = request_id;
     return attempt;
 }
@@ -84,6 +85,51 @@ void advance_until(
         if (runtime.state() == desired) return;
     }
     throw std::runtime_error("episode did not reach requested state");
+}
+
+void test_return_replays_attached_frozen_poses_before_carry() {
+    const std::filesystem::path pack("build/g1-episode");
+    episode::InteractionEpisode runtime(
+        pack / "walking_database.bin",
+        pack / "carry_left_database.bin",
+        pack / "carry_right_database.bin",
+        fast_config());
+    const auto attempt = make_attempt(
+        runtime.output().pose, reach::Hand::Left, 61U, 70U, 14U);
+    require(runtime.commit(attempt), "return fixture did not commit");
+    advance_until(runtime, episode::EpisodeState::Reach, 61U);
+    advance_until(runtime, episode::EpisodeState::Return, 61U);
+    require(
+        runtime.output().attached,
+        "object detached at the first recorded return frame");
+    require(
+        length(
+            runtime.output().pose.positions[g1_skeleton::Simulation] -
+            attempt.plan.return_poses.front()
+                .positions[g1_skeleton::Simulation]) < 1.0e-5F,
+        "return did not begin at the first frozen pose");
+
+    for (size_t frame = 1U;
+         frame < attempt.plan.return_poses.size();
+         ++frame) {
+        const episode::EpisodeOutput& output = runtime.update({
+            kTick,
+            {vec3(0.0F, 0.0F, 1.0F), quat()},
+            61U,
+            false,
+            false,
+        });
+        require(output.attached, "object detached during recorded return");
+        require(
+            length(
+                output.pose.positions[g1_skeleton::Simulation] -
+                attempt.plan.return_poses[frame]
+                    .positions[g1_skeleton::Simulation]) < 1.0e-5F,
+            "return accepted locomotion input instead of playback");
+    }
+    require(
+        runtime.state() == episode::EpisodeState::Carry,
+        "recorded return did not lead into carry");
 }
 
 void test_freeze_attach_and_selected_carry_hand(reach::Hand hand) {
@@ -272,6 +318,7 @@ void test_native_walking_reach_and_carry_preserve_contact_root() {
     auto attempt = make_attempt(
         start, reach::Hand::Left, 31U, 40U, 9U);
     attempt.plan.reach.poses = {start, start, contact, contact};
+    attempt.plan.return_poses = {contact, contact, contact};
     const interaction::WorldPose contact_world =
         interaction::world_pose(contact);
     const size_t wrist = g1_skeleton::LeftWrist;
@@ -428,6 +475,7 @@ int main() {
             reach::Hand::Left);
         test_layered_carry_does_not_require_full_pose_carry_databases(
             reach::Hand::Right);
+        test_return_replays_attached_frozen_poses_before_carry();
         test_generation_change_and_cancel_fail_before_contact();
         test_contact_rejection_timeout_and_reset();
         test_native_walking_converges_to_a_distant_entry();

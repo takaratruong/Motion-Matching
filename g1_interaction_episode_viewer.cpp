@@ -175,6 +175,7 @@ const char* state_name(episode::EpisodeState state, bool searching) {
         case episode::EpisodeState::Approach: return "APPROACH";
         case episode::EpisodeState::Bridge: return "BRIDGE";
         case episode::EpisodeState::Reach: return "REACH";
+        case episode::EpisodeState::Return: return "RETURN";
         case episode::EpisodeState::CarryBlend: return "CARRY BLEND";
         case episode::EpisodeState::Carry: return "CARRY";
         case episode::EpisodeState::PlaceApproach:
@@ -363,20 +364,6 @@ void draw_hud(
             show_bones ? "ON" : "OFF",
             failure.empty() ? "none" : failure.c_str()),
         26, 157, 16, failure.empty() ? DARKGRAY : MAROON);
-    const std::string& carry_diagnostic =
-        runtime.output().diagnostic;
-    DrawText(
-        TextFormat(
-            "CARRY IK %s",
-            carry_diagnostic.empty()
-                ? "nominal"
-                : carry_diagnostic.c_str()),
-        26,
-        181,
-        16,
-        carry_diagnostic.empty()
-            ? DARKGRAY
-            : Color{190, 118, 15, 255});
 }
 
 }  // namespace

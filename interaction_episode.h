@@ -18,6 +18,7 @@ enum class EpisodeState : uint8_t {
     Approach,
     Bridge,
     Reach,
+    Return,
     CarryBlend,
     Carry,
     PlaceApproach,
@@ -109,6 +110,7 @@ private:
     void update_approach(const EpisodeInput& input);
     void update_bridge(float dt);
     void update_reach(float dt);
+    void update_return(float dt);
     void update_carry(const EpisodeInput& input);
     void update_place_approach(const EpisodeInput& input);
     void update_place_bridge(float dt);

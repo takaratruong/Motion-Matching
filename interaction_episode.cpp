@@ -103,6 +103,7 @@ bool InteractionEpisode::commit(FrozenAttempt attempt) {
         attempt.request_id == 0U ||
         attempt.object.generation == 0U ||
         attempt.plan.reach.poses.empty() ||
+        attempt.plan.return_poses.empty() ||
         attempt.object.dimensions.x <= 0.0F ||
         attempt.object.dimensions.y <= 0.0F ||
         attempt.object.dimensions.z <= 0.0F) {
@@ -264,6 +265,9 @@ const EpisodeOutput& InteractionEpisode::update(const EpisodeInput& input) {
         case EpisodeState::Reach:
             update_reach(input.dt);
             break;
+        case EpisodeState::Return:
+            update_return(input.dt);
+            break;
         case EpisodeState::CarryBlend:
         case EpisodeState::Carry:
             update_carry(input);
@@ -384,24 +388,42 @@ void InteractionEpisode::update_reach(float dt) {
         fail("contact rejected");
         return;
     }
-    matcher_.switch_database(walking_database_, contact_pose_);
+    state_ = EpisodeState::Return;
+    reach_frame_ = 0U;
+    frame_accumulator_ = 0.0F;
+    publish(attempt_->plan.return_poses.front());
+    update_attached_object(0.0F);
+}
+
+void InteractionEpisode::update_return(float dt) {
+    frame_accumulator_ += dt;
+    while (frame_accumulator_ >= kFixedTick &&
+           reach_frame_ + 1U < attempt_->plan.return_poses.size()) {
+        frame_accumulator_ -= kFixedTick;
+        ++reach_frame_;
+    }
+    publish(attempt_->plan.return_poses[reach_frame_]);
+    update_attached_object(dt);
+    if (state_ == EpisodeState::Failed ||
+        reach_frame_ + 1U != attempt_->plan.return_poses.size()) {
+        return;
+    }
+
+    const interaction::Pose& nominal_return = output_.pose;
+    matcher_.switch_database(walking_database_, nominal_return);
     layered_carry_.start(
-        contact_pose_,
+        nominal_return,
         output_.selected_hand,
-        hand_in_object_,
-        output_.object_world);
-    state_ = EpisodeState::CarryBlend;
+        hand_in_object_);
+    state_ = EpisodeState::Carry;
     state_seconds_ = 0.0F;
+    output_.diagnostic.clear();
 }
 
 void InteractionEpisode::update_carry(const EpisodeInput& input) {
     matcher_.update(input.command, input.dt);
     interaction::Pose displayed =
         layered_carry_.update(matcher_.snapshot());
-    output_.diagnostic = layered_carry_.last_solve_accepted()
-        ? std::string{}
-        : std::string{
-              "carry IK rejected; using last safe active-arm branch"};
     if (state_ == EpisodeState::CarryBlend) {
         state_seconds_ += input.dt;
         const float alpha = smoothstep(
@@ -446,10 +468,6 @@ void InteractionEpisode::update_place_approach(
               live.rotations[g1_skeleton::Simulation]);
     matcher_.update({velocity, heading}, input.dt);
     publish(layered_carry_.update(matcher_.snapshot()));
-    output_.diagnostic = layered_carry_.last_solve_accepted()
-        ? std::string{}
-        : std::string{
-              "carry IK rejected; using last safe active-arm branch"};
     update_attached_object(input.dt);
     if (state_ == EpisodeState::Failed) return;
 
@@ -627,8 +645,7 @@ void InteractionEpisode::cancel_place_before_release() {
     layered_carry_.start(
         output_.pose,
         output_.selected_hand,
-        hand_in_object_,
-        output_.object_world);
+        hand_in_object_);
     place_attempt_.reset();
     state_ = EpisodeState::Carry;
     state_seconds_ = 0.0F;
