@@ -61,19 +61,16 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
     def test_probe_contract(self):
         source = self.source(PROBE)
         for required in (
-            "reach::load_pack(", "reach::shape_candidate(", "--json",
-            "zero_retarget", "position_perturbations",
-            "orientation_perturbations", "augmentation", "height_band",
-            "direction_band", "source", "union", "observed_collisions",
+            "reach::load_pack(", "reach::search_all(", "--json",
+            "shared_grasps", "open_space", "table", "shelf",
+            "below_table", "lower_table", "raw_instances",
+            "processed_instances", "root_azimuth_sectors",
+            "elapsed_seconds", "complete", "4608", "0.001F", "30",
+            "observed_collisions",
         ):
             self.assertIn(required, source)
-        self.assertIn("0.001F", source)
-        self.assertIn("0.008726646F", source)
-        self.assertIn("std::atomic<size_t> next_clip", source)
-        self.assertIn("worker_count", source)
-        self.assertIn("workers.emplace_back", source)
-        self.assertIn("reach::evaluate_candidate(", source)
-        self.assertIn("const interaction::EnvironmentGeometry open{}", source)
+        for forbidden in ("own_query(", "position_perturbations"):
+            self.assertNotIn(forbidden, source)
 
     def test_makefile_has_standalone_targets(self):
         makefile = self.source(MAKEFILE)

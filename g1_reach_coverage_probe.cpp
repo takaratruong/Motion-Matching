@@ -1,15 +1,15 @@
-#include "reach_coverage.h"
+#include "reach_search.h"
+#include "reach_placement.h"
 
 #include <algorithm>
 #include <array>
-#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -20,30 +20,31 @@ namespace {
 
 constexpr float kPi = 3.14159265358979323846F;
 constexpr float kWristContactOffset = 0.04F;
-constexpr float kZeroPositionTolerance = 0.001F;
-constexpr float kZeroApproachTolerance = 0.008726646F;
+constexpr float kAcceptedPositionM = 0.001F;
+constexpr size_t kExpectedInstances = 4608U;
+constexpr size_t kRootAzimuthSectors = 12U;
 
-struct Count {
-    size_t evaluations = 0U;
-    size_t accepted = 0U;
+struct Fixture {
+    std::string name;
+    reach::ExhaustiveQuery query{};
+    interaction::OrientedBox object{};
+    interaction::EnvironmentGeometry environment{};
 };
 
-struct Report {
-    size_t zero_tested = 0U;
-    size_t zero_failed = 0U;
-    float zero_max_position = 0.0F;
-    float zero_max_approach = 0.0F;
+struct FixtureReport {
+    bool complete = false;
+    size_t raw_instances = 0U;
+    size_t processed_instances = 0U;
+    size_t accepted = 0U;
+    std::array<size_t, 2U> hands{};
+    size_t root_azimuth_sectors = 0U;
+    float maximum_accepted_position_m = 0.0F;
+    float maximum_accepted_approach_radians = 0.0F;
+    float maximum_accepted_orientation_radians = 0.0F;
+    std::array<size_t, reach::kRejectionCount> rejections{};
     size_t object_collision_observed = 0U;
     size_t environment_collision_observed = 0U;
-    Count position_perturbations{};
-    Count orientation_perturbations{};
-    std::array<size_t, reach::kRejectionCount> rejections{};
-    std::map<std::string, Count> hand;
-    std::map<std::string, Count> source;
-    std::map<std::string, Count> height_band;
-    std::map<std::string, Count> direction_band;
-    std::map<std::string, Count> augmentation;
-    Count union_counts{};
+    double elapsed_seconds = 0.0;
 };
 
 std::string escape_json(const std::string& value) {
@@ -61,267 +62,187 @@ std::string escape_json(const std::string& value) {
     return output.str();
 }
 
-std::string height_band(vec3 endpoint) {
-    if (endpoint.y < 0.50F) return "ground";
-    if (endpoint.y < 1.20F) return "middle";
-    return "overhead";
-}
-
-std::string direction_band(vec3 endpoint) {
-    if (std::abs(endpoint.x) >= std::abs(endpoint.z)) {
-        return endpoint.x >= 0.0F ? "front" : "back";
-    }
-    return endpoint.z >= 0.0F ? "left" : "right";
-}
-
-void increment(Count& count, reach::Rejection rejection) {
-    ++count.evaluations;
-    if (rejection == reach::Rejection::None) ++count.accepted;
-}
-
-void record(
-    Report& report,
-    const reach::Pack& pack,
-    size_t clip,
-    const reach::Evaluation& evaluation,
-    bool position_perturbation) {
-    if (position_perturbation) {
-        increment(report.position_perturbations, evaluation.rejection);
-    } else {
-        increment(report.orientation_perturbations, evaluation.rejection);
-    }
-    ++report.rejections.at(static_cast<size_t>(evaluation.rejection));
-    if (evaluation.object_collision_observed) {
-        ++report.object_collision_observed;
-    }
-    if (evaluation.environment_collision_observed) {
-        ++report.environment_collision_observed;
-    }
-    increment(report.union_counts, evaluation.rejection);
-    const reach::Hand hand = static_cast<reach::Hand>(
-        pack.database.active_hands.at(clip));
-    increment(report.hand[hand == reach::Hand::Left ? "left" : "right"],
-        evaluation.rejection);
-    increment(report.source[pack.database.source_names.at(
-        pack.database.source_indices.at(clip))], evaluation.rejection);
-    const interaction::Transform endpoint = reach::endpoint_transform(
-        pack.database, clip);
-    increment(report.height_band[height_band(endpoint.position)],
-        evaluation.rejection);
-    increment(report.direction_band[direction_band(endpoint.position)],
-        evaluation.rejection);
-    const reach::Augmentation augmentation = static_cast<reach::Augmentation>(
-        pack.database.augmentations.at(clip));
-    increment(report.augmentation[
-        augmentation == reach::Augmentation::Captured
-            ? "captured" : "mirrored"], evaluation.rejection);
-}
-
-reach::Query own_query(const reach::Pack& pack, size_t clip) {
-    reach::Query query{};
-    query.hand = static_cast<reach::Hand>(
-        pack.database.active_hands.at(clip));
-    query.target = reach::endpoint_transform(pack.database, clip);
-    query.approach_world = reach::approach_direction(pack.database, clip);
-    return query;
-}
-
-reach::Evaluation evaluate_query(
-    const reach::Pack& pack,
-    size_t clip,
-    const reach::Query& query) {
-    const vec3 dimensions(0.10F, 0.10F, 0.10F);
-    interaction::Transform object{};
-    object.rotation = quat_mul(
-        query.target.rotation,
-        quat_from_angle_axis(-kPi, vec3(0.0F, 1.0F, 0.0F)));
-    object.position = query.target.position - quat_mul_vec3(
-        object.rotation,
-        vec3(
-            0.5F * dimensions.x + kWristContactOffset,
-            0.0F,
-            0.0F));
-    const interaction::EnvironmentGeometry open{};
-    return reach::evaluate_candidate(
-        pack,
-        reach::Candidate{clip},
-        query,
+Fixture make_fixture(
+    std::string name,
+    vec3 object_position,
+    const interaction::EnvironmentGeometry& environment) {
+    constexpr vec3 dimensions(0.10F, 0.10F, 0.10F);
+    const interaction::Transform object{object_position, quat()};
+    const vec3 target_position = object_position + vec3(
+        0.5F * dimensions.x + kWristContactOffset, 0.0F, 0.0F);
+    return {
+        std::move(name),
+        {
+            {
+                target_position,
+                quat_from_angle_axis(kPi, vec3(0.0F, 1.0F, 0.0F)),
+            },
+            vec3(-1.0F, 0.0F, 0.0F),
+        },
         {object, dimensions},
-        open);
+        environment,
+    };
 }
 
-Report run_clip(const reach::Pack& pack, size_t clip) {
-    Report report{};
-    const reach::Evaluation zero = reach::shape_candidate(
-        pack, reach::Candidate{clip}, own_query(pack, clip));
-    ++report.zero_tested;
-    report.zero_max_position = zero.position_error_m;
-    report.zero_max_approach = zero.approach_error_radians;
-    if (zero.rejection != reach::Rejection::None ||
-        zero.position_error_m > kZeroPositionTolerance ||
-        zero.approach_error_radians > kZeroApproachTolerance) {
-        ++report.zero_failed;
-    }
+std::vector<Fixture> shared_grasps() {
+    const interaction::Transform table_world{
+        vec3(0.0F, 0.74F, 0.0F), quat()};
+    const vec3 table_dimensions(1.20F, 0.06F, 0.75F);
+    const interaction::EnvironmentGeometry coverage =
+        interaction::make_coverage_environment(
+            table_world, table_dimensions);
+    const interaction::EnvironmentGeometry open{};
+    return {
+        make_fixture("open_space", vec3(0.0F, 0.90F, 0.0F), open),
+        make_fixture("table", vec3(0.0F, 0.82F, 0.0F), coverage),
+        make_fixture("shelf", vec3(0.335F, 1.16F, 0.0F), coverage),
+        make_fixture("below_table", vec3(0.0F, 0.45F, 0.0F), coverage),
+        make_fixture("lower_table", vec3(-1.045F, 0.58F, 0.0F), coverage),
+    };
+}
 
-    constexpr std::array<float, 5U> position_offsets = {
-        0.05F, 0.10F, 0.20F, 0.30F, 0.45F};
-    constexpr std::array<vec3, 3U> axes = {
-        vec3(1, 0, 0), vec3(0, 1, 0), vec3(0, 0, 1)};
-    for (const vec3 axis : axes) {
-        for (const float offset : position_offsets) {
-            for (const float sign : {-1.0F, 1.0F}) {
-                reach::Query query = own_query(pack, clip);
-                query.target.position = query.target.position +
-                    sign * offset * axis;
-                const reach::Evaluation evaluation = evaluate_query(
-                    pack, clip, query);
-                record(report, pack, clip, evaluation, true);
-            }
+size_t azimuth_sector(vec3 direction) {
+    const float angle = std::atan2(direction.z, direction.x);
+    const float normalized = angle < 0.0F ? angle + 2.0F * kPi : angle;
+    const size_t sector = static_cast<size_t>(
+        normalized * static_cast<float>(kRootAzimuthSectors) /
+        (2.0F * kPi));
+    return std::min(sector, kRootAzimuthSectors - 1U);
+}
+
+FixtureReport evaluate_fixture(
+    const reach::Pack& pack,
+    const Fixture& fixture,
+    const reach::SearchConfig& config) {
+    const reach::SearchResult result = reach::search_all(
+        pack,
+        fixture.query,
+        fixture.object,
+        fixture.environment,
+        config);
+    FixtureReport report{};
+    report.complete = result.complete;
+    report.raw_instances = result.total;
+    report.processed_instances = result.processed;
+    report.accepted = result.accepted.size();
+    report.elapsed_seconds =
+        std::chrono::duration<double>(result.elapsed).count();
+    std::array<bool, kRootAzimuthSectors> occupied{};
+    std::array<bool, reach::kYawPlacementCount> regenerated_yaw{};
+
+    for (const reach::CompactEvaluation& compact : result.evaluations) {
+        const reach::Evaluation& evaluation = compact.evaluation;
+        ++report.rejections.at(
+            static_cast<size_t>(evaluation.rejection));
+        if (evaluation.object_collision_observed) {
+            ++report.object_collision_observed;
+        }
+        if (evaluation.environment_collision_observed) {
+            ++report.environment_collision_observed;
         }
     }
-
-    constexpr std::array<float, 4U> orientation_angles = {
-        0.261799388F, 0.523598776F, 1.047197551F, 1.570796327F};
-    for (const vec3 axis : axes) {
-        for (const float angle : orientation_angles) {
-            for (const float sign : {-1.0F, 1.0F}) {
-                reach::Query query = own_query(pack, clip);
-                query.target.rotation = quat_mul(
-                    query.target.rotation,
-                    quat_from_angle_axis(sign * angle, axis));
-                const reach::Evaluation evaluation = evaluate_query(
-                    pack, clip, query);
-                record(report, pack, clip, evaluation, false);
-            }
+    for (const size_t index : result.accepted) {
+        const reach::CompactEvaluation& compact = result.evaluations[index];
+        const reach::Evaluation& evaluation = compact.evaluation;
+        ++report.hands.at(
+            pack.database.active_hands.at(evaluation.candidate.clip));
+        report.maximum_accepted_position_m = std::max(
+            report.maximum_accepted_position_m,
+            evaluation.position_error_m);
+        report.maximum_accepted_approach_radians = std::max(
+            report.maximum_accepted_approach_radians,
+            evaluation.approach_error_radians);
+        report.maximum_accepted_orientation_radians = std::max(
+            report.maximum_accepted_orientation_radians,
+            evaluation.orientation_error_radians);
+        const uint8_t yaw = evaluation.candidate.yaw_index;
+        if (regenerated_yaw[yaw]) continue;
+        regenerated_yaw[yaw] = true;
+        const reach::Evaluation full = reach::regenerate(
+            pack,
+            compact,
+            fixture.query,
+            fixture.object,
+            fixture.environment,
+            config);
+        const interaction::WorldPose terminal = interaction::world_pose(
+            full.poses.back());
+        vec3 grasp_to_root =
+            terminal.positions[g1_skeleton::Simulation] -
+            fixture.query.target.position;
+        grasp_to_root.y = 0.0F;
+        if (length(grasp_to_root) > 1.0e-5F) {
+            occupied[azimuth_sector(grasp_to_root)] = true;
         }
     }
-    reach::Query twist = own_query(pack, clip);
-    twist.target.rotation = quat_mul(
-        twist.target.rotation,
-        quat_from_angle_axis(kPi, vec3(1, 0, 0)));
-    record(report, pack, clip,
-        evaluate_query(pack, clip, twist), false);
+    report.root_azimuth_sectors = static_cast<size_t>(std::count(
+        occupied.begin(), occupied.end(), true));
     return report;
 }
 
-void merge_count(Count& destination, const Count& source) {
-    destination.evaluations += source.evaluations;
-    destination.accepted += source.accepted;
-}
-
-void merge_groups(
-    std::map<std::string, Count>& destination,
-    const std::map<std::string, Count>& source) {
-    for (const auto& [name, count] : source) {
-        merge_count(destination[name], count);
-    }
-}
-
-void merge_report(Report& destination, const Report& source) {
-    destination.zero_tested += source.zero_tested;
-    destination.zero_failed += source.zero_failed;
-    destination.zero_max_position = std::max(
-        destination.zero_max_position, source.zero_max_position);
-    destination.zero_max_approach = std::max(
-        destination.zero_max_approach, source.zero_max_approach);
-    destination.object_collision_observed +=
-        source.object_collision_observed;
-    destination.environment_collision_observed +=
-        source.environment_collision_observed;
-    merge_count(
-        destination.position_perturbations, source.position_perturbations);
-    merge_count(
-        destination.orientation_perturbations,
-        source.orientation_perturbations);
-    for (size_t reason = 0U; reason < reach::kRejectionCount; ++reason) {
-        destination.rejections[reason] += source.rejections[reason];
-    }
-    merge_groups(destination.hand, source.hand);
-    merge_groups(destination.source, source.source);
-    merge_groups(destination.height_band, source.height_band);
-    merge_groups(destination.direction_band, source.direction_band);
-    merge_groups(destination.augmentation, source.augmentation);
-    merge_count(destination.union_counts, source.union_counts);
-}
-
-Report run_probe(const reach::Pack& pack) {
-    const size_t worker_count = std::max<size_t>(1U, std::min<size_t>(
-        8U,
-        std::min<size_t>(
-            pack.database.clip_count,
-            std::max(1U, std::thread::hardware_concurrency()))));
-    std::atomic<size_t> next_clip{0U};
-    std::vector<Report> partial(worker_count);
-    std::vector<std::thread> workers;
-    workers.reserve(worker_count);
-    for (size_t worker = 0U; worker < worker_count; ++worker) {
-        workers.emplace_back([&, worker]() {
-            while (true) {
-                const size_t clip = next_clip.fetch_add(1U);
-                if (clip >= pack.database.clip_count) break;
-                merge_report(partial[worker], run_clip(pack, clip));
-            }
-        });
-    }
-    for (std::thread& worker : workers) worker.join();
-    Report report{};
-    for (const Report& value : partial) merge_report(report, value);
-    return report;
-}
-
-void write_count(std::ostream& output, const Count& count) {
-    output << "{\"accepted\":" << count.accepted
-           << ",\"evaluations\":" << count.evaluations << '}';
-}
-
-void write_groups(
+void write_fixture_report(
     std::ostream& output,
-    const std::map<std::string, Count>& groups) {
-    output << '{';
-    bool first = true;
-    for (const auto& [name, count] : groups) {
-        if (!first) output << ',';
-        first = false;
-        output << '"' << escape_json(name) << "\":";
-        write_count(output, count);
-    }
-    output << '}';
-}
-
-std::string to_json(const Report& report) {
-    std::ostringstream output;
-    output << std::fixed << std::setprecision(7);
-    output << "{\"augmentation\":";
-    write_groups(output, report.augmentation);
-    output << ",\"direction_band\":";
-    write_groups(output, report.direction_band);
-    output << ",\"hand\":";
-    write_groups(output, report.hand);
-    output << ",\"height_band\":";
-    write_groups(output, report.height_band);
-    output << ",\"orientation_perturbations\":";
-    write_count(output, report.orientation_perturbations);
-    output << ",\"observed_collisions\":{\"environment\":"
+    const FixtureReport& report) {
+    output << "{\"accepted\":" << report.accepted
+           << ",\"complete\":" << (report.complete ? "true" : "false")
+           << ",\"elapsed_seconds\":" << report.elapsed_seconds
+           << ",\"hands\":{\"left\":" << report.hands[0]
+           << ",\"right\":" << report.hands[1] << '}'
+           << ",\"maximum_accepted_approach_radians\":"
+           << report.maximum_accepted_approach_radians
+           << ",\"maximum_accepted_orientation_radians\":"
+           << report.maximum_accepted_orientation_radians
+           << ",\"maximum_accepted_position_m\":"
+           << report.maximum_accepted_position_m
+           << ",\"observed_collisions\":{\"environment\":"
            << report.environment_collision_observed
-           << ",\"object\":" << report.object_collision_observed << '}';
-    output << ",\"position_perturbations\":";
-    write_count(output, report.position_perturbations);
-    output << ",\"rejections\":{";
+           << ",\"object\":" << report.object_collision_observed << '}'
+           << ",\"processed_instances\":" << report.processed_instances
+           << ",\"raw_instances\":" << report.raw_instances
+           << ",\"rejections\":{";
     for (size_t reason = 0U; reason < report.rejections.size(); ++reason) {
         if (reason != 0U) output << ',';
         output << '"' << reach::rejection_name(
             static_cast<reach::Rejection>(reason)) << "\":"
                << report.rejections[reason];
     }
-    output << "},\"source\":";
-    write_groups(output, report.source);
-    output << ",\"union\":";
-    write_count(output, report.union_counts);
-    output << ",\"zero_retarget\":{\"failed\":" << report.zero_failed
-           << ",\"max_approach_radians\":" << report.zero_max_approach
-           << ",\"max_position_m\":" << report.zero_max_position
-           << ",\"tested\":" << report.zero_tested << "}}\n";
+    output << "},\"root_azimuth_sectors\":"
+           << report.root_azimuth_sectors << '}';
+}
+
+std::string to_json(
+    const std::vector<Fixture>& fixtures,
+    const std::vector<FixtureReport>& reports) {
+    std::ostringstream output;
+    output << std::fixed << std::setprecision(7);
+    output << "{\"expected_instances\":" << kExpectedInstances
+           << ",\"shared_grasps\":{";
+    for (size_t index = 0U; index < fixtures.size(); ++index) {
+        if (index != 0U) output << ',';
+        output << '"' << escape_json(fixtures[index].name) << "\":";
+        write_fixture_report(output, reports[index]);
+    }
+    output << "}}\n";
     return output.str();
+}
+
+bool valid_report(
+    const std::vector<Fixture>& fixtures,
+    const std::vector<FixtureReport>& reports) {
+    bool valid = true;
+    for (size_t index = 0U; index < reports.size(); ++index) {
+        const FixtureReport& report = reports[index];
+        valid = valid && report.complete &&
+                report.raw_instances == kExpectedInstances &&
+                report.processed_instances == kExpectedInstances &&
+                report.maximum_accepted_position_m <= kAcceptedPositionM &&
+                report.elapsed_seconds <= 30.0;
+        if (fixtures[index].name == "open_space") {
+            valid = valid && report.hands[0] > 0U && report.hands[1] > 0U &&
+                    report.root_azimuth_sectors > 1U;
+        }
+    }
+    return valid;
 }
 
 }  // namespace
@@ -340,8 +261,17 @@ int main(int argc, char** argv) {
             json_path = argv[3];
         }
         const reach::Pack pack = reach::load_pack(argv[1]);
-        const Report report = run_probe(pack);
-        const std::string json = to_json(report);
+        const std::vector<Fixture> fixtures = shared_grasps();
+        reach::SearchConfig config{};
+        config.worker_count = std::max<size_t>(1U, std::min<size_t>(
+            8U, std::max(1U, std::thread::hardware_concurrency())));
+        config.deadline = std::chrono::seconds(30);
+        std::vector<FixtureReport> reports;
+        reports.reserve(fixtures.size());
+        for (const Fixture& fixture : fixtures) {
+            reports.push_back(evaluate_fixture(pack, fixture, config));
+        }
+        const std::string json = to_json(fixtures, reports);
         std::cout << json;
         if (!json_path.empty()) {
             if (!json_path.parent_path().empty()) {
@@ -352,7 +282,7 @@ int main(int argc, char** argv) {
             output << json;
             if (!output) throw std::runtime_error("cannot write JSON output");
         }
-        return report.zero_failed == 0U ? EXIT_SUCCESS : EXIT_FAILURE;
+        return valid_report(fixtures, reports) ? EXIT_SUCCESS : EXIT_FAILURE;
     } catch (const std::exception& error) {
         std::cerr << "g1 reach coverage probe: " << error.what() << '\n';
         return EXIT_FAILURE;
