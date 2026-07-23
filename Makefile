@@ -259,6 +259,7 @@ CPP_TEST_BINS += $(CPP_TEST_DIR)/test_reach_database
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_reach_coverage
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_reach_search
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_episode_reach_planner
+CPP_TEST_BINS += $(CPP_TEST_DIR)/test_g1_flat_motion_matcher
 CPP_TEST_BINS += $(CPP_TEST_DIR)/test_g1_mesh_renderer
 RELEASE_FAST_MATH_TARGET_TEST := \
   $(CPP_TEST_DIR)/test_interaction_target_release_fast_math
@@ -603,6 +604,14 @@ $(CPP_TEST_DIR)/test_episode_reach_planner: \
 	  reach_database.cpp reach_motion.cpp interaction_hand_trajectories.cpp \
 	  interaction_posture_ik.cpp interaction_ik.cpp interaction_pose.cpp \
 	  interaction_target.cpp -o $@
+
+$(CPP_TEST_DIR)/test_g1_flat_motion_matcher: \
+  tests/cpp/test_g1_flat_motion_matcher.cpp \
+  g1_flat_motion_matcher.cpp g1_flat_motion_matcher.h \
+  interaction_pose.cpp interaction_pose.h interaction_database.h \
+  database.h g1_skeleton.h array.h vec.h quat.h | $(CPP_TEST_DIR)
+	$(CXX) $(CPP_TEST_FLAGS) tests/cpp/test_g1_flat_motion_matcher.cpp \
+	  g1_flat_motion_matcher.cpp interaction_pose.cpp -o $@
 
 $(CPP_TEST_DIR)/test_g1_mesh_renderer: tests/cpp/test_g1_mesh_renderer.cpp \
   g1_mesh_renderer.h g1_kinematic_contract.h array.h vec.h quat.h \
