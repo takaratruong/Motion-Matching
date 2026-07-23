@@ -624,7 +624,7 @@ return-unavailable identities, and unchanged ten-dimensional features.
 - [ ] **Step 3: Run the full safe regression suite**
 
 ```bash
-make test-safe
+make test-interaction-safe
 ```
 
 Expected: PASS with no new failures.
