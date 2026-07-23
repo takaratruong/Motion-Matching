@@ -66,10 +66,13 @@ The builder records:
 - the return endpoint;
 - captured or mirrored provenance.
 
-Extraction must fail the pack build for any accepted reach without a valid,
-nonempty return. It must not silently substitute a reversed outbound clip or a
-generic carry pose. Aggregate return durations and extraction failures are
-reported in the manifest.
+If an accepted outbound reach ends before a valid, nonempty return was
+recorded, keep its outbound motion and mark its return unavailable. Apply the
+same marker to its mirror. Such clips remain valid coverage/search data but
+are excluded from playable pickup planning, which requires a complete return.
+Do not silently substitute a reversed outbound clip, a donor return, or a
+generic carry pose. Aggregate return durations and unavailable-return counts
+are reported in the manifest.
 
 ## Continuous Return Warp
 
@@ -138,10 +141,11 @@ locomotion remain unchanged.
 
 ## Compatibility
 
-Reach-pack loading is versioned and rejects ambiguous layouts. The new pack is
-built beside existing generated artifacts and becomes the explicit viewer
-input only after validation. Source archives and review annotations are not
-modified.
+Reach-pack loading is versioned and rejects ambiguous layouts. A contact frame
+equal to the final stored clip frame explicitly means that no paired return is
+available; it is not inferred from missing metadata. The new pack is built
+beside existing generated artifacts and becomes the explicit viewer input only
+after validation. Source archives and review annotations are not modified.
 
 Generated reach packs and viewer binaries remain untracked.
 
@@ -149,16 +153,19 @@ Generated reach packs and viewer binaries remain untracked.
 
 Automated tests must prove:
 
-1. an accepted captured reach includes a nonempty source-contiguous return;
-2. its mirror contains the exact bilateral mirrored return;
-3. the outbound endpoint and search features are unchanged;
-4. the shaped return begins at the solved target grasp;
-5. warp weight reaches zero at the recorded nominal endpoint;
-6. every accepted frame preserves the frozen hand/object transform;
-7. return IK and collision failures reject the candidate before attachment;
-8. the episode transitions `Reach -> Return -> Carry`;
-9. carry walking moves the root and legs without continuous carry IK;
-10. left- and right-hand pickup, carry, placement, re-pick, and replacement
+1. all accepted outbound reaches remain present;
+2. every available captured return is source-contiguous and its mirror contains
+   the exact bilateral mirrored return;
+3. return-unavailable clips and their mirrors are excluded from playable
+   pickup planning without disappearing from coverage;
+4. the outbound endpoint and search features are unchanged;
+5. the shaped return begins at the solved target grasp;
+6. warp weight reaches zero at the recorded nominal endpoint;
+7. every accepted frame preserves the frozen hand/object transform;
+8. return IK and collision failures reject the candidate before attachment;
+9. the episode transitions `Reach -> Return -> Carry`;
+10. carry walking moves the root and legs without continuous carry IK;
+11. left- and right-hand pickup, carry, placement, re-pick, and replacement
     retain one finite 31-bone G1 pose.
 
 Manual acceptance tests pickup from multiple approach angles and object

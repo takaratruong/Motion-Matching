@@ -12,7 +12,8 @@
 
 - Preserve the existing outbound endpoint features, candidate ranking, pickup playback, placement search, release, and reversed placement playback.
 - Source archives, review motions, and accepted annotations remain unchanged.
-- Every paired return comes from the selected captured source interval; mirrored reaches use the exact bilateral mirror.
+- Every available paired return comes from the selected captured source interval; mirrored reaches use the exact bilateral mirror.
+- Return-unavailable outbound clips remain in coverage data but are excluded from playable pickup planning.
 - The contact warp has weight `1` at contact and `0` at the return endpoint.
 - The frozen `hand_in_object` transform owns the object throughout attached playback.
 - A return failure rejects the candidate before attachment.
@@ -32,7 +33,7 @@
 **Interfaces:**
 - Consumes: root-relative 25 Hz wrist trace, accepted `departure_frame`, and accepted `grab_frame`.
 - Produces: `ReturnSegmentationConfig` and `find_return_stop(trace, departure_frame, grab_frame, config) -> int`, where the result is an exclusive source-local stop.
-- Produces: `CanonicalReach.contact_index: int`; `CanonicalReach.positions` spans outbound start through the paired return endpoint.
+- Produces: `CanonicalReach.contact_index: int` and `CanonicalReach.return_available: bool`; available-return poses span outbound start through the paired return endpoint, while a return-unavailable clip ends at contact.
 
 - [ ] **Step 1: Write failing return-segmentation tests**
 
@@ -96,9 +97,11 @@ and break ties by the earliest frame.
 
 - [ ] **Step 3: Extend captured reach construction**
 
-Change `build_captured_reach` to load the source-local wrist trace, call
-`find_return_stop`, retain frames from the existing outbound start through the
-exclusive return stop, and pass:
+Change `build_captured_reach` to load the source-local wrist trace and call
+`find_return_stop`. Retain frames from the existing outbound start through the
+exclusive return stop when found. If the bounded source interval has no
+qualifying return, retain through contact and set
+`return_available=False`; do not substitute motion. Pass:
 
 ```python
 contact_index = annotation.grab_frame - retained_start
@@ -106,7 +109,9 @@ contact_index = annotation.grab_frame - retained_start
 
 Update `_reach_from_local` so endpoint position, endpoint rotation, and
 approach direction are measured at `contact_index`, not `positions[-1]`.
-Validate `0 < contact_index < frame_count - 1` and contiguous source frames.
+Validate `0 < contact_index < frame_count`, require
+`contact_index < frame_count - 1` exactly when `return_available` is true, and
+validate contiguous source frames.
 
 - [ ] **Step 4: Prove the complete accepted corpus pairs**
 
@@ -115,7 +120,16 @@ all 192 captured reaches, and checks:
 
 ```python
 self.assertEqual(len(captured), 192)
-self.assertTrue(all(r.contact_index + 1 < r.frame_count for r in captured))
+self.assertEqual(sum(r.return_available for r in captured), 191)
+self.assertEqual(sum(not r.return_available for r in captured), 1)
+self.assertEqual(
+    [r.proposal_id for r in captured if not r.return_available],
+    ["pickup_north_1:cfdcdaa4db704be8"],
+)
+self.assertTrue(all(
+    (r.contact_index + 1 < r.frame_count) == r.return_available
+    for r in captured
+))
 self.assertTrue(all(
     np.array_equal(np.diff(r.source_frames), np.ones(r.frame_count - 1))
     for r in captured
@@ -123,7 +137,8 @@ self.assertTrue(all(
 ```
 
 Tune only the explicit `ReturnSegmentationConfig` thresholds if this test
-identifies a genuine stable authored return. Do not drop annotations.
+identifies a genuine stable authored return. Do not drop annotations and do
+not fabricate the one missing return.
 
 Run:
 
@@ -161,13 +176,13 @@ git commit -m "feat: pair recorded returns with captured reaches"
 **Interfaces:**
 - Consumes: `CanonicalReach.contact_index`.
 - Produces: reach database magic `G1RCHD2`, feature magic `G1RCHF2`, version `2`, and `ReachArtifact.contact_frames: np.ndarray[int32]`.
-- Guarantees: `range_starts[clip] <= contact_frames[clip] < range_stops[clip] - 1`.
+- Guarantees: `range_starts[clip] <= contact_frames[clip] < range_stops[clip]`; equality with `range_stops[clip] - 1` means return unavailable.
 
 - [ ] **Step 1: Write failing mirror and wire-format tests**
 
-Assert the mirrored clip preserves `contact_index`, mirrors every return pose,
-and mirrors twice back to the captured full clip. Extend artifact round-trip
-tests to require:
+Assert the mirrored clip preserves `contact_index` and `return_available`,
+mirrors every available return pose, and mirrors twice back to the captured
+full clip. Extend artifact round-trip tests to require:
 
 ```python
 self.assertEqual(manifest["version"], 2)
@@ -208,16 +223,18 @@ contact_frames = starts + np.asarray(
 ```
 
 Write `contact_frames` immediately after `range_stops` and read it in the same
-position. Validate contact bounds and require at least one return frame.
-Features remain the same ten floats and must equal the contact endpoint
-metadata byte-for-byte.
+position. Validate contact bounds. Interpret `contact_frame + 1 < range_stop`
+as an available return and `contact_frame + 1 == range_stop` as explicitly
+unavailable. Features remain the same ten floats and must equal the contact
+endpoint metadata byte-for-byte.
 
 - [ ] **Step 4: Report return metadata**
 
 Add manifest fields:
 
 ```python
-"paired_returns": len(reaches),
+"paired_returns": int(np.sum(stops - contact_frames - 1 > 0)),
+"unavailable_returns": int(np.sum(stops - contact_frames - 1 == 0)),
 "return_frame_count": int(np.sum(stops - contact_frames - 1)),
 "minimum_return_frames": int(np.min(stops - contact_frames - 1)),
 "maximum_return_frames": int(np.max(stops - contact_frames - 1)),
@@ -271,9 +288,10 @@ git commit -m "feat: publish paired-return reach pack v2"
 - [ ] **Step 1: Write failing loader and outbound-boundary tests**
 
 Update the binary fixture to write version 2 contact frames. Assert malformed
-contact-before-start, contact-at-stop, and no-return records throw
-`interaction::FormatError`. Add a coverage fixture whose frames after contact
-move wildly and assert the shaped outbound pose count is still:
+contact-before-start and contact-at-stop records throw
+`interaction::FormatError`; contact at `stop - 1` is the valid
+return-unavailable representation. Add a coverage fixture whose frames after
+contact move wildly and assert the shaped outbound pose count is still:
 
 ```cpp
 contact_frame - range_start + 1
@@ -295,7 +313,7 @@ Change magic/version constants to `G1RCHD2`, `G1RCHF2`, and `2`. Read
 `contact_frames` after range stops, validate one per clip, and enforce:
 
 ```cpp
-start <= contact && contact + 1 < stop
+start <= contact && contact < stop
 ```
 
 Add the three checked accessors in `reach_motion.cpp`.
@@ -426,6 +444,8 @@ colliding sample.
 
 - [ ] **Step 4: Integrate return feasibility into plan selection**
 
+Before regeneration, skip candidates for which
+`clip_return_start(database, clip) == clip_return_stop(database, clip)`.
 After `regenerate` succeeds, derive `hand_in_object` from the frozen object and
 target grasp, shape the return, and accept the candidate only if its return is
 valid. If it fails, continue through the remaining accepted candidates instead
@@ -593,8 +613,8 @@ python3 -m resources.build_g1_reach_database \
 ```
 
 Read the generated pack back through both Python and C++ loaders. Require 192
-captured and 192 mirrored reaches, 384 paired returns, unchanged ten-dimensional
-features, and no extraction failures.
+captured and 192 mirrored reaches, 382 paired returns, two explicitly
+return-unavailable identities, and unchanged ten-dimensional features.
 
 - [ ] **Step 3: Run the full safe regression suite**
 
@@ -630,4 +650,3 @@ collision diagnostic.
 
 If verification required no source correction, do not create an empty commit.
 Never add generated packs or binaries.
-
