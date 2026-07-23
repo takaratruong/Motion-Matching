@@ -47,6 +47,7 @@
 
 - Design and plan: `afd859e`, `8968b31`.
 - Implementation: `feb79b0` adds bilateral quality-first/task-feasible posture IK; `c934569` restores a fully aligned final five-frame approach; `bf5d07b` makes the measured pre-IK open-space baseline a hard probe gate; `eb93c5a` measures root sectors across every accepted placed candidate instead of one clip per yaw.
+- Review fixes: `a45c132` rejects invalid configuration/seed inputs before either solver stage and adds executable translation/continuity regressions; `6098568` extracts and behaviorally tests the production aggregate sector metric. Focused re-review found no remaining Critical or Important issues.
 - Focused verification on 2026-07-23: 12 viewer/probe Python contracts plus posture IK, hand trajectory, reach coverage, reach search, reach database, and legacy IK tests passed; probe and viewer release binaries rebuilt successfully.
 - Root and collision regressions passed: IK modifies only the three waist and seven active-arm joints, root placement/height stays exact, and strict swept object/environment collision checks retain final-contact-only semantics.
 - Real report: `build/g1-reaches/contact-anchored-coverage-report-v5.json`; all five fixtures processed 4,608/4,608 instances in under 17 seconds each and `search_integrity_passed` is true.
