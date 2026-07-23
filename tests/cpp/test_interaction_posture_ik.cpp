@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 
 namespace {
 
@@ -221,6 +222,50 @@ void test_task_priority_unreachable_target_is_finite_and_keeps_root() {
         solved.positions[g1_skeleton::Simulation]));
 }
 
+void assert_task_priority_rejects_invalid_input(
+    interaction::PostureIKConfig config,
+    interaction::UpperBodyAngles seed) {
+    const interaction::Pose source = make_pose();
+    interaction::Pose solved = source;
+    const auto result = interaction::solve_hand_posture_ik_task_priority(
+        solved,
+        interaction::Hand::Left,
+        left_hand_transform(source),
+        source,
+        seed,
+        config);
+
+    assert(!result.accepted);
+    assert(result.reason == interaction::Reason::CorrectionLimit);
+    assert(result.position_error_m == std::numeric_limits<float>::max());
+    assert(result.orientation_error_radians ==
+           std::numeric_limits<float>::max());
+    assert(result.objective == std::numeric_limits<double>::max());
+    assert(same_pose(source, solved));
+}
+
+void test_task_priority_never_polishes_invalid_inputs_into_acceptance() {
+    const interaction::Pose source = make_pose();
+    const interaction::UpperBodyAngles valid_seed =
+        interaction::decompose_left_upper_body(source);
+
+    interaction::PostureIKConfig nonfinite_scale{};
+    nonfinite_scale.source_scale_m_per_radian[0] =
+        std::numeric_limits<float>::quiet_NaN();
+    assert_task_priority_rejects_invalid_input(
+        nonfinite_scale, valid_seed);
+
+    interaction::PostureIKConfig negative_iterations{};
+    negative_iterations.maximum_iterations = -1;
+    assert_task_priority_rejects_invalid_input(
+        negative_iterations, valid_seed);
+
+    interaction::UpperBodyAngles nonfinite_seed = valid_seed;
+    nonfinite_seed[3] = std::numeric_limits<float>::quiet_NaN();
+    assert_task_priority_rejects_invalid_input(
+        interaction::PostureIKConfig{}, nonfinite_seed);
+}
+
 void test_unreachable_target_returns_finite_bounded_best_pose() {
     const interaction::Pose source = make_pose();
     interaction::Pose solved = source;
@@ -375,6 +420,7 @@ int main() {
     test_right_reachable_ten_joint_target_converges();
     test_task_priority_reaches_bilaterally_despite_posture_penalties();
     test_task_priority_unreachable_target_is_finite_and_keeps_root();
+    test_task_priority_never_polishes_invalid_inputs_into_acceptance();
     test_unreachable_target_returns_finite_bounded_best_pose();
     test_best_seen_pose_includes_the_byte_exact_source_candidate();
     test_elbow_pole_geometry_and_degeneracy();

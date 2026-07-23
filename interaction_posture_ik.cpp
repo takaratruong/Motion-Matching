@@ -198,6 +198,22 @@ bool valid_config(const PostureIKConfig& config) {
     return true;
 }
 
+bool valid_solver_inputs(
+    const Pose& source_pose,
+    Transform target_hand_world,
+    const UpperBodyAngles& temporal_seed,
+    const PostureIKConfig& config) {
+    if (!finite_pose_kinematics(source_pose) ||
+        !finite_transform(target_hand_world) ||
+        !valid_config(config)) {
+        return false;
+    }
+    return std::all_of(
+        temporal_seed.begin(),
+        temporal_seed.end(),
+        [](float value) { return finite(value); });
+}
+
 bool bounded(Hand hand, const UpperBodyAngles& angles) {
     for (size_t joint = 0U; joint < kJointCount; ++joint) {
         const HingeJoint& item = metadata(hand, joint);
@@ -489,14 +505,9 @@ PostureIKResult solve_hand_posture_ik(
     const PostureIKConfig& config) {
     const UpperBodyAngles source_angles =
         decompose_upper_body(source_pose, hand);
-    if (!finite_pose_kinematics(source_pose) ||
-        !finite_transform(target_hand_world) || !valid_config(config)) {
+    if (!valid_solver_inputs(
+            source_pose, target_hand_world, temporal_seed, config)) {
         return invalid_result(pose, source_pose, source_angles);
-    }
-    for (const float value : temporal_seed) {
-        if (!finite(value)) {
-            return invalid_result(pose, source_pose, source_angles);
-        }
     }
 
     const ElbowPole source_pole = hand_elbow_pole(source_pose, hand);
@@ -603,6 +614,12 @@ PostureIKResult solve_hand_posture_ik_task_priority(
     const Pose& source_pose,
     const UpperBodyAngles& temporal_seed,
     const PostureIKConfig& config) {
+    const UpperBodyAngles source_angles =
+        decompose_upper_body(source_pose, hand);
+    if (!valid_solver_inputs(
+            source_pose, target_hand_world, temporal_seed, config)) {
+        return invalid_result(pose, source_pose, source_angles);
+    }
     Pose quality_pose = source_pose;
     PostureIKResult quality = solve_hand_posture_ik(
         quality_pose,
