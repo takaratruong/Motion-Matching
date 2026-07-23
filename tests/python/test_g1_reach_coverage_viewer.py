@@ -6,6 +6,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 VIEWER = ROOT / "g1_reach_coverage_viewer.cpp"
 PROBE = ROOT / "g1_reach_coverage_probe.cpp"
 MAKEFILE = ROOT / "Makefile"
+MESH_TEST = ROOT / "tests" / "cpp" / "test_g1_mesh_renderer.cpp"
 
 
 class G1ReachCoverageViewerTests(unittest.TestCase):
@@ -78,8 +79,12 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
             "GetMouseDelta()", "GetMouseWheelMove()",
             "MOUSE_BUTTON_LEFT", "MOUSE_BUTTON_MIDDLE",
             "std::clamp", "camera.target",
+            "std::remainder", "kCameraTargetLimit",
         ):
             self.assertIn(required, source)
+        self.assertIn("state.target.x = std::clamp", source)
+        self.assertIn("state.target.y = std::clamp", source)
+        self.assertIn("state.target.z = std::clamp", source)
         self.assertNotIn("constexpr float table_top = 0.77F", source)
 
     def test_mesh_uses_the_exact_selected_world_pose_and_safe_lifecycle(self):
@@ -102,10 +107,25 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
         end_3d = source.index("EndMode3D();", draw)
         unload = source.index("::g1_mesh_renderer_unload(")
         close = source.index("CloseWindow();", unload)
+        init = source.index("InitWindow(")
+        ready = source.index("IsWindowReady()", init)
+        load = source.index("::g1_mesh_renderer_load(", ready)
+        self.assertLess(init, ready)
+        self.assertLess(ready, load)
         self.assertLess(update, begin_drawing)
         self.assertLess(begin_3d, draw)
         self.assertLess(draw, end_3d)
         self.assertLess(unload, close)
+
+    def test_renderer_test_exercises_certified_glb_runtime_lifecycle(self):
+        source = self.source(MESH_TEST)
+        for required in (
+            "int main(int argc, char** argv)", "FLAG_WINDOW_HIDDEN",
+            "IsWindowReady()", "g1_mesh_renderer_load(",
+            "g1_mesh_renderer_update(", "g1_mesh_renderer_draw(",
+            "g1_mesh_renderer_unload(", "BeginDrawing()", "CloseWindow()",
+        ):
+            self.assertIn(required, source)
 
     def test_probe_contract(self):
         source = self.source(PROBE)

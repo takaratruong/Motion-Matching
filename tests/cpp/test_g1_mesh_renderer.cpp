@@ -485,7 +485,48 @@ static void test_unload_is_idempotent_for_canonical_renderer()
 #endif
 }
 
-int main()
+static bool test_runtime_renderer(const char* model_path)
+{
+    SetTraceLogLevel(LOG_WARNING);
+    SetConfigFlags(FLAG_WINDOW_HIDDEN);
+    InitWindow(64, 64, "G1 mesh renderer runtime test");
+    if (!IsWindowReady()) {
+        std::fprintf(stderr, "G1 mesh renderer test failed: hidden window\n");
+        return false;
+    }
+
+    G1MeshRenderer renderer = {};
+    char error[256] = {};
+    bool passed = g1_mesh_renderer_load(
+        renderer, model_path, error, static_cast<int>(sizeof(error)));
+    if (passed) {
+        Fixture value = valid_fixture();
+        passed = g1_mesh_renderer_update(
+            renderer,
+            value.accepted_positions,
+            value.accepted_rotations,
+            error,
+            static_cast<int>(sizeof(error)));
+    }
+    if (passed) {
+        BeginDrawing();
+        ClearBackground(BLACK);
+        g1_mesh_renderer_draw(renderer);
+        EndDrawing();
+    }
+
+    g1_mesh_renderer_unload(renderer);
+    CloseWindow();
+    if (!passed) {
+        std::fprintf(
+            stderr,
+            "G1 mesh renderer runtime test failed: %s\n",
+            error[0] != '\0' ? error : "runtime lifecycle");
+    }
+    return passed;
+}
+
+int main(int argc, char** argv)
 {
     test_exact_articulated_mapping();
     test_fixed_attachment_follows_parent_bind_local();
@@ -493,5 +534,10 @@ int main()
     test_binding_rejects_malformed_layouts();
     test_pose_rejects_invalid_inputs_transactionally();
     test_unload_is_idempotent_for_canonical_renderer();
+    if (argc == 2 && !test_runtime_renderer(argv[1])) return 1;
+    if (argc > 2) {
+        std::fprintf(stderr, "usage: test_g1_mesh_renderer [MODEL.glb]\n");
+        return 1;
+    }
     return 0;
 }

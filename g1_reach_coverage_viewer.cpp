@@ -17,6 +17,7 @@
 namespace {
 
 constexpr float kPi = 3.14159265358979323846F;
+constexpr float kCameraTargetLimit = 5.0F;
 constexpr float kWristContactOffset = 0.04F;
 constexpr float kTableTop = 0.65F;
 constexpr float kTableThickness = 0.06F;
@@ -53,6 +54,7 @@ void update_orbit_camera(
     const Vector2 mouse_delta = GetMouseDelta();
     if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
         state.azimuth -= 0.006F * mouse_delta.x;
+        state.azimuth = std::remainder(state.azimuth, 2.0F * kPi);
         state.altitude = std::clamp(
             state.altitude + 0.006F * mouse_delta.y,
             -1.30F,
@@ -77,6 +79,12 @@ void update_orbit_camera(
         state.target = state.target +
             pan_scale * (mouse_delta.x * right + mouse_delta.y * view_up);
     }
+    state.target.x = std::clamp(
+        state.target.x, -kCameraTargetLimit, kCameraTargetLimit);
+    state.target.y = std::clamp(
+        state.target.y, -kCameraTargetLimit, kCameraTargetLimit);
+    state.target.z = std::clamp(
+        state.target.z, -kCameraTargetLimit, kCameraTargetLimit);
     const vec3 position = state.target + state.distance * offset_direction;
     camera.position = ray(position);
     camera.target = ray(state.target);
@@ -498,6 +506,10 @@ int main(int argc, char** argv) {
 
         SetConfigFlags(FLAG_VSYNC_HINT | FLAG_MSAA_4X_HINT);
         InitWindow(1280, 800, "G1 contact-anchored reach coverage");
+        if (!IsWindowReady()) {
+            throw std::runtime_error(
+                "G1 reach coverage window failed to initialize");
+        }
         SetTargetFPS(60);
         Camera3D camera{};
         camera.fovy = 45.0F;
