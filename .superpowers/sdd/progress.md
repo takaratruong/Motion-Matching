@@ -23,3 +23,12 @@
 - Real evidence command: `/usr/bin/time -f 'elapsed=%e rss_kb=%M' ./g1_reach_coverage_probe build/g1-reaches/reach-pack-v2 --json build/g1-reaches/contact-anchored-coverage-report-v3.json`.
 - Real report: `build/g1-reaches/contact-anchored-coverage-report-v3.json`; every fixture completed all 4,608/4,608 instances below 30 seconds and every accepted endpoint was within 1 mm.
 - Grounded fixture evidence after strict per-sample height-ramp IK: open space 388 accepted (194 left, 194 right, 7 azimuth sectors, 5.04 s); table 0 (5.54 s); shelf 0 (5.53 s); below table 0 (5.73 s); lower table 8 (2 sectors, 6.87 s). Zero-coverage fixtures are explicit failures, not vacuous zero-error successes. The reduced furniture coverage is the truthful result when grasp height may not float the full body.
+
+## Grounded G1 Mesh Coverage Viewer
+
+- Design: `7133a06`; plan: `f557b3c`.
+- Scene/camera: `986816c` lowers the main tabletop to `0.65 m` and adds bounded left-drag orbit, middle-drag pan, and wheel zoom.
+- Mesh: `f75f5af` feeds the certified articulated G1 renderer and optional blue skeleton from the same selected 31-bone `WorldPose`; `M` and `B` are visual-only toggles with skeleton fallback.
+- Automated gate: viewer Python contracts, certified mesh renderer test, exhaustive search/coverage/database/trajectory/IK tests, probe/viewer release builds, and unchanged-IK diff all passed on 2026-07-23.
+- Lowered-table real report: `build/g1-reaches/contact-anchored-coverage-report-v3.json`; every fixture completed 4,608/4,608 within 30 seconds.
+- Lowered-table counts: open space 388 accepted (7 sectors, 5.05 s); main table 0 (6.17 s); shelf 2 (1 sector, 5.77 s); below table 0 (5.49 s); lower table 2 (1 sector, 6.59 s). Gates were not weakened.
