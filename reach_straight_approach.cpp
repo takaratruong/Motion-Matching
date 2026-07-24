@@ -47,7 +47,11 @@ bool config_finite(const StraightApproachConfig& c) {
         c.open_gripper_radius_m > 0.0F &&
         std::isfinite(c.closed_gripper_radius_m) &&
         c.closed_gripper_radius_m > 0.0F &&
-        c.closed_gripper_radius_m <= c.open_gripper_radius_m;
+        c.closed_gripper_radius_m <= c.open_gripper_radius_m &&
+        std::isfinite(c.finger_proxy_radius_m) &&
+        c.finger_proxy_radius_m > 0.0F &&
+        std::isfinite(c.finger_length_m) &&
+        c.finger_length_m >= 0.0F;
 }
 
 StraightApproachQuality invalid_quality() {
@@ -337,6 +341,23 @@ float rotation_error(quat current, quat target) {
 
 vec3 active_wrist_world(const interaction::Pose& pose, Hand hand) {
     return interaction::world_pose(pose).positions[wrist_bone(hand)];
+}
+
+vec3 gripper_lateral_world(
+    const interaction::Pose& pose,
+    Hand hand,
+    vec3 approach) {
+    const interaction::WorldPose world = interaction::world_pose(pose);
+    vec3 lateral = quat_mul_vec3(
+        world.rotations[wrist_bone(hand)], vec3(0.0F, 0.0F, 1.0F));
+    lateral = lateral - dot(lateral, approach) * approach;
+    if (length(lateral) <= 1.0e-5F) {
+        lateral = cross(approach, vec3(0.0F, 1.0F, 0.0F));
+    }
+    if (length(lateral) <= 1.0e-5F) {
+        lateral = cross(approach, vec3(0.0F, 0.0F, 1.0F));
+    }
+    return normalize(lateral);
 }
 
 CorridorRetargetResult failed(CorridorRetargetFailure failure, size_t sample) {
@@ -686,40 +707,65 @@ CorridorRetargetResult retarget_straight_approach(
         }
     }
 
-    // Dynamic open-gripper proxy: swept wrist sphere against object/environment.
+    // Dynamic open-gripper proxy: two oriented finger paths. The open/closed
+    // radii are jaw half-gaps in the grasp frame, not a spherical envelope
+    // around the wrist; that lets the fingers surround the intended object
+    // without treating the empty space between them as penetration.
     constexpr float terminal_contact_time_epsilon = 1.0e-5F;
     for (size_t sample = blend_start; sample < result.poses.size(); ++sample) {
         const size_t previous_sample =
             sample == blend_start ? sample : sample - 1U;
-        const vec3 previous =
+        const vec3 previous_wrist =
             active_wrist_world(result.poses[previous_sample], hand);
-        const vec3 current = active_wrist_world(result.poses[sample], hand);
-        const float conservative_close_weight = std::min(
-            gripper_close_weights[previous_sample],
-            gripper_close_weights[sample]);
-        const float radius = lerp_scalar(
+        const vec3 current_wrist =
+            active_wrist_world(result.poses[sample], hand);
+        const vec3 previous_lateral = gripper_lateral_world(
+            result.poses[previous_sample], hand, approach);
+        const vec3 current_lateral = gripper_lateral_world(
+            result.poses[sample], hand, approach);
+        const float previous_gap = lerp_scalar(
             config.open_gripper_radius_m,
             config.closed_gripper_radius_m,
-            conservative_close_weight);
+            gripper_close_weights[previous_sample]);
+        const float current_gap = lerp_scalar(
+            config.open_gripper_radius_m,
+            config.closed_gripper_radius_m,
+            gripper_close_weights[sample]);
         const bool terminal = sample == result.poses.size() - 1U;
-        const SweepInterval object_interval =
-            swept_sphere_box_interval(previous, current, radius, object);
-        const bool endpoint_only_contact =
-            object_interval.entry >=
-            1.0F - terminal_contact_time_epsilon;
-        if (object_interval.intersects &&
-            !(terminal && endpoint_only_contact)) {
-            return failed(
-                std::move(result),
-                CorridorRetargetFailure::ObjectCollision,
-                sample);
-        }
-        for (const interaction::OrientedBox& box : environment.boxes) {
-            if (swept_sphere_box_interval(
-                    previous, current, radius, box).intersects) {
+        for (const float side : {-1.0F, 1.0F}) {
+            const vec3 previous_finger =
+                previous_wrist + config.finger_length_m * approach +
+                side * previous_gap * previous_lateral;
+            const vec3 current_finger =
+                current_wrist + config.finger_length_m * approach +
+                side * current_gap * current_lateral;
+            const SweepInterval object_interval =
+                swept_sphere_box_interval(
+                    previous_finger,
+                    current_finger,
+                    config.finger_proxy_radius_m,
+                    object);
+            const bool endpoint_only_contact =
+                object_interval.entry >=
+                1.0F - terminal_contact_time_epsilon;
+            if (object_interval.intersects &&
+                !(terminal && endpoint_only_contact)) {
                 return failed(
                     std::move(result),
-                    CorridorRetargetFailure::EnvironmentCollision, sample);
+                    CorridorRetargetFailure::ObjectCollision,
+                    sample);
+            }
+            for (const interaction::OrientedBox& box : environment.boxes) {
+                if (swept_sphere_box_interval(
+                        previous_finger,
+                        current_finger,
+                        config.finger_proxy_radius_m,
+                        box).intersects) {
+                    return failed(
+                        std::move(result),
+                        CorridorRetargetFailure::EnvironmentCollision,
+                        sample);
+                }
             }
         }
     }

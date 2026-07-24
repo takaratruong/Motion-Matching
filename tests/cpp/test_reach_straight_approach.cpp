@@ -397,14 +397,16 @@ void test_open_gripper_proxy_rejects_early_terminal_sweep_contact() {
     require(clear.accepted, "clear proxy fixture did not retarget");
     const vec3 previous = active_wrist(clear.poses[clear.poses.size() - 2U]);
     const vec3 current = active_wrist(clear.poses.back());
-    vec3 perpendicular = cross(normalize(current - previous), vec3(0, 1, 0));
-    if (length(perpendicular) < 1.0e-4F) {
-        perpendicular = vec3(0, 0, 1);
-    } else {
-        perpendicular = normalize(perpendicular);
-    }
+    const vec3 approach = normalize(current - active_wrist(source.front()));
+    vec3 finger_axis = quat_mul_vec3(
+        active_wrist_rotation(clear.poses.back()), vec3(0, 0, 1));
+    finger_axis = finger_axis - dot(finger_axis, approach) * approach;
+    finger_axis = normalize(finger_axis);
     const interaction::OrientedBox near_open_fingers{
-        {lerp(previous, current, 0.5F) + 0.055F * perpendicular, quat()},
+        {
+            lerp(previous, current, 0.5F) +
+                0.03F * approach + 0.065F * finger_axis,
+            quat()},
         vec3(0.005F, 0.005F, 0.005F)};
     const reach::CorridorRetargetResult blocked =
         run_retarget(
@@ -413,6 +415,27 @@ void test_open_gripper_proxy_rejects_early_terminal_sweep_contact() {
         "early terminal sweep contact escaped the open-gripper proxy");
     require(blocked.failure == reach::CorridorRetargetFailure::ObjectCollision,
         "terminal sweep contact did not report object collision");
+}
+
+void test_open_fingers_can_surround_the_intended_grasp_object() {
+    const std::vector<interaction::Pose> source = synthetic_sequence(16U);
+    const vec3 contact = active_wrist(source.back());
+    const vec3 approach = normalize(contact - active_wrist(source.front()));
+    const interaction::OrientedBox grasped_object{
+        {contact + 0.06F * approach, quat()},
+        vec3(0.04F, 0.002F, 0.002F)};
+    const reach::CorridorRetargetResult result =
+        run_retarget(
+            source, grasped_object, interaction::EnvironmentGeometry{});
+    if (!result.accepted) {
+        std::fprintf(
+            stderr,
+            "grasp-object diagnostic: failure=%u sample=%zu\n",
+            static_cast<unsigned>(result.failure),
+            result.failure_sample);
+    }
+    require(result.accepted,
+        "open finger spacing was treated as penetration of the grasp object");
 }
 
 void test_short_path_reports_no_pregrasp_coverage_on_retarget() {
@@ -492,6 +515,7 @@ int main() {
     test_explicit_closed_hand_target_overrides_recorded_contact();
     test_nonfinite_hand_schedule_fails_closed();
     test_open_gripper_proxy_rejects_early_terminal_sweep_contact();
+    test_open_fingers_can_surround_the_intended_grasp_object();
     test_short_path_reports_no_pregrasp_coverage_on_retarget();
     test_environment_collision_fails_closed();
     test_unaccepted_ik_fails_closed();

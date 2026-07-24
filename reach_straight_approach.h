@@ -24,6 +24,8 @@ struct StraightApproachConfig {
     float maximum_pregrasp_orientation_radians = 0.174532925F;
     float open_gripper_radius_m = 0.065F;
     float closed_gripper_radius_m = 0.040F;
+    float finger_proxy_radius_m = 0.008F;
+    float finger_length_m = 0.030F;
     std::array<float, 7U> open_active_hand_dof{};
     bool use_explicit_closed_hand_dof = false;
     std::array<float, 7U> closed_active_hand_dof{};
