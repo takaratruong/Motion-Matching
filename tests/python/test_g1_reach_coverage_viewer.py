@@ -134,11 +134,29 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
             "kTableTop = 0.65F", "kTableCenterY = 0.62F",
             "OrbitCameraState", "update_orbit_camera(",
             "GetMouseDelta()", "GetMouseWheelMove()",
-            "MOUSE_BUTTON_LEFT", "MOUSE_BUTTON_MIDDLE",
+            "MOUSE_BUTTON_LEFT", "MOUSE_BUTTON_RIGHT",
+            "MOUSE_BUTTON_MIDDLE",
             "std::clamp", "camera.target",
             "std::remainder", "kCameraTargetLimit",
         ):
             self.assertIn(required, source)
+        self.assertIn(
+            "const bool pan_down =\n"
+            "        IsMouseButtonDown(MOUSE_BUTTON_RIGHT) ||\n"
+            "        IsMouseButtonDown(MOUSE_BUTTON_MIDDLE);",
+            source,
+        )
+        self.assertIn(
+            "IsMouseButtonDown(MOUSE_BUTTON_LEFT) && !pan_down",
+            source,
+        )
+        self.assertIn(
+            "if (pan_down) {\n"
+            "        const float pan_scale = 0.0015F * state.distance;\n"
+            "        state.target = state.target +",
+            source,
+        )
+        self.assertIn("right/middle pan", source)
         self.assertIn("state.target.x = std::clamp", source)
         self.assertIn("state.target.y = std::clamp", source)
         self.assertIn("state.target.z = std::clamp", source)

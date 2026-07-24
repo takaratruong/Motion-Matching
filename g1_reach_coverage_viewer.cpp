@@ -78,7 +78,10 @@ void update_orbit_camera(
     Camera3D& camera,
     OrbitCameraState& state) {
     const Vector2 mouse_delta = GetMouseDelta();
-    if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+    const bool pan_down =
+        IsMouseButtonDown(MOUSE_BUTTON_RIGHT) ||
+        IsMouseButtonDown(MOUSE_BUTTON_MIDDLE);
+    if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && !pan_down) {
         state.azimuth -= 0.006F * mouse_delta.x;
         state.azimuth = std::remainder(state.azimuth, 2.0F * kPi);
         state.altitude = std::clamp(
@@ -100,7 +103,7 @@ void update_orbit_camera(
     const vec3 world_up(0.0F, 1.0F, 0.0F);
     const vec3 right = normalize(cross(forward, world_up));
     const vec3 view_up = normalize(cross(right, forward));
-    if (IsMouseButtonDown(MOUSE_BUTTON_MIDDLE)) {
+    if (pan_down) {
         const float pan_scale = 0.0015F * state.distance;
         state.target = state.target +
             pan_scale * (mouse_delta.x * right + mouse_delta.y * view_up);
@@ -566,7 +569,7 @@ void draw_hud(
     }
     DrawText(
         TextFormat(
-            "M mesh %s | B bones %s | left orbit | middle pan | wheel zoom",
+            "M mesh %s | B bones %s | left orbit | right/middle pan | wheel zoom",
             show_g1_mesh ? "ON" : "OFF",
             show_g1_bones ? "ON" : "OFF"),
         26,
