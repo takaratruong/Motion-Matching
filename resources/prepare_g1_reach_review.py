@@ -8,14 +8,19 @@ from .g1_reach_builder.review import (
     convert_review_sources,
     write_review_corpus,
 )
-from .g1_reach_builder.sources import load_gmr_archive
+from .g1_reach_builder.sources import (
+    load_gmr_archive,
+    load_soma_csv_directory,
+)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Prepare trusted GMR recordings for reach annotation"
     )
-    parser.add_argument("--archive", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--archive", type=Path)
+    source.add_argument("--soma-csv-dir", type=Path)
     parser.add_argument("--g1-xml", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--source-fps", type=float)
@@ -23,11 +28,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def run(args: argparse.Namespace) -> int:
-    all_sources = load_gmr_archive(
-        args.archive,
-        fps_override=args.source_fps,
-        include_excluded=True,
-    )
+    if args.soma_csv_dir is not None:
+        all_sources = load_soma_csv_directory(
+            args.soma_csv_dir,
+            fps=100.0 if args.source_fps is None else args.source_fps,
+        )
+    else:
+        all_sources = load_gmr_archive(
+            args.archive,
+            fps_override=args.source_fps,
+            include_excluded=True,
+        )
     included = [source for source in all_sources if source.disposition == "included"]
     excluded = tuple(
         source.sequence_id

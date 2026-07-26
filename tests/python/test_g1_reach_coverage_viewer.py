@@ -234,7 +234,7 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
             "below_table", "lower_table", "raw_instances",
             "processed_instances", "root_azimuth_sectors",
             "accepted_set_hash", "reach::accepted_candidate_set_hash(",
-            "elapsed_seconds", "complete", "4608", "0.001F", "30",
+            "elapsed_seconds", "complete", "expected_instances", "0.001F", "30",
             "observed_collisions",
             "coverage_demonstrated", "search_integrity_passed", "null",
             "kTableTop = 0.65F", "supported_center", "coverage.boxes",
@@ -264,6 +264,12 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
         )
         self.assertIn("place_pose(", metrics)
         self.assertNotIn("regenerated_yaw", probe)
+        self.assertNotIn("kExpectedInstances = 4608U", probe)
+        self.assertIn(
+            "pack.database.clip_count * reach::kYawPlacementCount", probe
+        )
+        self.assertIn("size_t expected_instances", probe)
+        self.assertIn('"expected_instances"', probe)
 
     def test_makefile_has_standalone_targets(self):
         makefile = self.source(MAKEFILE)

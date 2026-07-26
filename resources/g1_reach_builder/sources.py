@@ -1,16 +1,101 @@
 from collections.abc import Mapping
+import csv
 import hashlib
 from pathlib import Path
 import pickle
 import zipfile
 
 import numpy as np
+from scipy.spatial.transform import Rotation as ScipyRotation
 
 from .schema import GMRSource
 
 
 _PREFIX = "g1_retargeted_motions/gmr_pkl/"
 _EXCLUDED = {"walking", "carry_walking"}
+
+SOMA_G1_JOINT_NAMES = (
+    "left_hip_pitch_joint", "left_hip_roll_joint",
+    "left_hip_yaw_joint", "left_knee_joint",
+    "left_ankle_pitch_joint", "left_ankle_roll_joint",
+    "right_hip_pitch_joint", "right_hip_roll_joint",
+    "right_hip_yaw_joint", "right_knee_joint",
+    "right_ankle_pitch_joint", "right_ankle_roll_joint",
+    "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
+    "left_shoulder_pitch_joint", "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint", "left_elbow_joint",
+    "left_wrist_roll_joint", "left_wrist_pitch_joint",
+    "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint", "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint", "right_elbow_joint",
+    "right_wrist_roll_joint", "right_wrist_pitch_joint",
+    "right_wrist_yaw_joint",
+)
+SOMA_COLUMNS = (
+    "Frame",
+    "root_translateX", "root_translateY", "root_translateZ",
+    "root_rotateX", "root_rotateY", "root_rotateZ",
+    *tuple(f"{name}_dof" for name in SOMA_G1_JOINT_NAMES),
+)
+
+
+def load_soma_csv_directory(
+    path: Path,
+    fps: float = 100.0,
+) -> list[GMRSource]:
+    """Load strict SOMA tabletop CSV recordings as validated G1 sources.
+
+    Root XYZ is parsed as centimeters, root Euler as intrinsic ZYX degrees
+    stored in XYZ columns, and all 29 G1 joint DOFs as degrees. Sequence IDs
+    use the ``tabletop_soma/<stem>`` namespace so they cannot collide with the
+    original reach recordings.
+    """
+    if not np.isfinite(fps) or fps <= 0.0:
+        raise ValueError(f"invalid fps {fps}")
+    result: list[GMRSource] = []
+    for csv_path in sorted(Path(path).glob("*.csv")):
+        with csv_path.open(newline="", encoding="utf-8") as stream:
+            reader = csv.reader(stream)
+            header = tuple(next(reader))
+            if header != SOMA_COLUMNS:
+                raise ValueError(f"{csv_path.name}: SOMA header mismatch")
+            values = np.asarray(
+                [[float(value) for value in row] for row in reader],
+                dtype=np.float64,
+            )
+        if values.ndim != 2 or values.shape[1] != len(SOMA_COLUMNS):
+            raise ValueError(f"{csv_path.name}: SOMA row width mismatch")
+        if not np.isfinite(values).all():
+            raise ValueError(f"{csv_path.name}: non-finite value")
+        frames = values[:, 0]
+        if not np.array_equal(frames, np.arange(len(values))):
+            raise ValueError(
+                f"{csv_path.name}: source frames must be contiguous from zero"
+            )
+        root_xyzw = ScipyRotation.from_euler(
+            "ZYX", values[:, 4:7][:, [2, 1, 0]], degrees=True
+        ).as_quat()
+        qpos = np.concatenate((
+            values[:, 1:4] / 100.0,
+            root_xyzw[:, [3, 0, 1, 2]],
+            np.radians(values[:, 7:]),
+        ), axis=1)
+        source = GMRSource(
+            sequence_id=f"tabletop_soma/{csv_path.stem}",
+            archive_member=csv_path.name,
+            archive_path=csv_path.resolve(),
+            archive_sha256=hashlib.sha256(csv_path.read_bytes()).hexdigest(),
+            fps=float(fps),
+            fps_overridden=True,
+            qpos=qpos,
+            source_frames=np.arange(len(qpos), dtype=np.int32),
+            disposition="included",
+        )
+        source.validate()
+        result.append(source)
+    if not result:
+        raise ValueError(f"no SOMA CSV files in {path}")
+    return result
 
 
 def _disposition(sequence_id: str) -> str | None:

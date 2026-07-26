@@ -1,3 +1,4 @@
+import csv
 import hashlib
 import pickle
 from pathlib import Path
@@ -6,8 +7,26 @@ import unittest
 import zipfile
 
 import numpy as np
+from scipy.spatial.transform import Rotation as ScipyRotation
 
-from resources.g1_reach_builder.sources import load_gmr_archive
+from resources.g1_reach_builder.sources import (
+    SOMA_COLUMNS,
+    load_gmr_archive,
+    load_soma_csv_directory,
+)
+
+
+def write_soma_csv(path: Path, frames: int = 4) -> np.ndarray:
+    values = np.zeros((frames, len(SOMA_COLUMNS)), np.float64)
+    values[:, 0] = np.arange(frames)
+    values[:, 1:4] = np.array([100.0, -200.0, 75.0])
+    values[:, 4:7] = np.array([10.0, 20.0, 30.0])
+    values[:, 7:] = np.arange(29) + np.arange(frames)[:, None]
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(SOMA_COLUMNS)
+        writer.writerows(values)
+    return values
 
 
 def gmr_record(frames: int = 4, *, fps=30) -> dict:
@@ -136,6 +155,92 @@ class GMRArchiveTests(unittest.TestCase):
                 write_archive(archive, {"pickup_north_0": record})
                 with self.assertRaisesRegex(ValueError, message):
                     load_gmr_archive(archive)
+
+
+    def test_loads_soma_csv_directory_with_exact_units_and_rotation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            csv_path = root / "height0_top.csv"
+            values = write_soma_csv(csv_path)
+
+            source = load_soma_csv_directory(root)[0]
+
+            self.assertEqual(source.sequence_id, "tabletop_soma/height0_top")
+            self.assertEqual(source.fps, 100.0)
+            self.assertTrue(source.fps_overridden)
+            self.assertEqual(source.disposition, "included")
+            self.assertEqual(source.qpos.shape, (4, 36))
+            np.testing.assert_allclose(
+                source.qpos[:, :3], values[:, 1:4] / 100.0
+            )
+            expected_xyzw = ScipyRotation.from_euler(
+                "ZYX", values[:, 4:7][:, [2, 1, 0]], degrees=True
+            ).as_quat()
+            np.testing.assert_allclose(
+                source.qpos[:, 3:7], expected_xyzw[:, [3, 0, 1, 2]]
+            )
+            np.testing.assert_allclose(
+                source.qpos[:, 7:], np.radians(values[:, 7:])
+            )
+            np.testing.assert_array_equal(source.source_frames, np.arange(4))
+            self.assertEqual(source.archive_member, "height0_top.csv")
+            self.assertEqual(source.archive_path, csv_path.resolve())
+            self.assertEqual(
+                source.archive_sha256,
+                hashlib.sha256(csv_path.read_bytes()).hexdigest(),
+            )
+
+    def test_orders_and_namespaces_multiple_soma_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_soma_csv(root / "b_second.csv")
+            write_soma_csv(root / "a_first.csv")
+
+            sources = load_soma_csv_directory(root)
+
+            self.assertEqual(
+                [source.sequence_id for source in sources],
+                ["tabletop_soma/a_first", "tabletop_soma/b_second"],
+            )
+
+    def test_rejects_malformed_soma_csv_sources(self):
+        def mutate_header(rows: list[list]) -> None:
+            rows[0][0] = "NotFrame"
+
+        def mutate_frame_to_two(rows: list[list]) -> None:
+            rows[1][0] = "2"
+
+        def mutate_joint_to_nan(rows: list[list]) -> None:
+            rows[1][7] = "nan"
+
+        for label, mutation, message in (
+            ("header", mutate_header, "SOMA header"),
+            ("frame gap", mutate_frame_to_two, "contiguous from zero"),
+            ("nonfinite", mutate_joint_to_nan, "non-finite"),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                csv_path = root / "height0_top.csv"
+                values = write_soma_csv(csv_path)
+                rows = [list(SOMA_COLUMNS)] + [
+                    [repr(float(cell)) for cell in row] for row in values
+                ]
+                mutation(rows)
+                with csv_path.open("w", newline="", encoding="utf-8") as stream:
+                    writer = csv.writer(stream)
+                    writer.writerows(rows)
+                with self.assertRaisesRegex(ValueError, message):
+                    load_soma_csv_directory(root)
+
+    def test_rejects_invalid_fps_and_empty_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_soma_csv(root / "height0_top.csv")
+            with self.assertRaisesRegex(ValueError, "invalid fps"):
+                load_soma_csv_directory(root, fps=0.0)
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "no SOMA CSV"):
+                load_soma_csv_directory(Path(directory))
 
 
 if __name__ == "__main__":

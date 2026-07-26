@@ -6,6 +6,7 @@ import unittest
 
 import numpy as np
 
+from resources import prepare_g1_reach_review as prepare_cli
 from resources.g1_reach_builder.review import (
     convert_review_sources,
     read_review_corpus,
@@ -90,6 +91,45 @@ class ReviewCorpusTests(unittest.TestCase):
         source.disposition = "excluded"
         with self.assertRaisesRegex(ValueError, "excluded source"):
             convert_review_sources([source], self.kinematics)
+
+
+class PrepareReviewCLITests(unittest.TestCase):
+    def test_archive_and_soma_modes_are_mutually_exclusive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            xml = root / "g1.xml"
+            output = root / "review"
+            archive = root / "motions.zip"
+
+            archive_args = prepare_cli.parse_args([
+                "--archive", str(archive),
+                "--g1-xml", str(xml),
+                "--output", str(output),
+            ])
+            self.assertEqual(archive_args.archive, archive)
+            self.assertIsNone(archive_args.soma_csv_dir)
+
+            soma = prepare_cli.parse_args([
+                "--soma-csv-dir", str(root),
+                "--source-fps", "100",
+                "--g1-xml", str(xml),
+                "--output", str(output),
+            ])
+            self.assertEqual(soma.soma_csv_dir, root)
+            self.assertIsNone(soma.archive)
+
+            with self.assertRaises(SystemExit):
+                prepare_cli.parse_args([
+                    "--archive", str(archive),
+                    "--soma-csv-dir", str(root),
+                    "--g1-xml", str(xml),
+                    "--output", str(output),
+                ])
+            with self.assertRaises(SystemExit):
+                prepare_cli.parse_args([
+                    "--g1-xml", str(xml),
+                    "--output", str(output),
+                ])
 
 
 if __name__ == "__main__":

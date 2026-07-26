@@ -24,6 +24,24 @@ def arguments(review: Path, annotations: Path, output: Path, allow_pending=False
     )
 
 
+def write_accepted_corpus(review: Path, annotations: Path, sequence_id: str):
+    corpus = replace(corpus_fixture(), sequence_ids=(sequence_id,))
+    write_review_corpus(review, corpus)
+    document = create_annotation_document(review)
+    accepted = update_annotation(
+        review,
+        document.annotations[0],
+        departure_frame=10,
+        grab_frame=40,
+        status="accepted",
+        note="",
+    )
+    write_annotations_atomic(
+        annotations,
+        replace(document, annotations=(accepted,)),
+    )
+
+
 class ReachBuildCLITests(unittest.TestCase):
     def test_pending_annotations_block_normal_publication(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -94,6 +112,71 @@ class ReachBuildCLITests(unittest.TestCase):
                 [record["return_available"] for record in manifest["reach_records"]],
                 [True, True],
             )
+
+
+    def test_combines_two_review_corpora_before_mirroring(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            review_a = root / "review_a"
+            review_b = root / "review_b"
+            annotations_a = root / "annotations_a.json"
+            annotations_b = root / "annotations_b.json"
+            output = root / "pack"
+            write_accepted_corpus(review_a, annotations_a, "pickup_north_0")
+            write_accepted_corpus(
+                review_b, annotations_b, "tabletop_soma/height0_top"
+            )
+
+            result = build_cli.run(Namespace(
+                review=[review_a, review_b],
+                annotations=[annotations_a, annotations_b],
+                output=output,
+                allow_pending=False,
+            ))
+            artifact, _, manifest = read_reach_pack(output)
+
+            self.assertEqual(result, 0)
+            self.assertEqual(manifest["captured_reaches"], 2)
+            self.assertEqual(manifest["mirrored_reaches"], 2)
+            self.assertEqual(len(manifest["corpora"]), 2)
+            self.assertEqual(
+                [record["captured_reaches"] for record in manifest["corpora"]],
+                [1, 1],
+            )
+            self.assertEqual(
+                [record["sequence_ids"] for record in manifest["corpora"]],
+                [["pickup_north_0"], ["tabletop_soma/height0_top"]],
+            )
+            self.assertEqual(artifact.active_hands.tolist(), [0, 1, 0, 1])
+
+    def test_rejects_mismatched_or_duplicate_corpus_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            review_a = root / "review_a"
+            review_b = root / "review_b"
+            annotations_a = root / "annotations_a.json"
+            annotations_b = root / "annotations_b.json"
+            output = root / "pack"
+            write_accepted_corpus(review_a, annotations_a, "pickup_north_0")
+            write_accepted_corpus(review_b, annotations_b, "pickup_north_0")
+
+            mismatched = build_cli.run(Namespace(
+                review=[review_a, review_b],
+                annotations=[annotations_a],
+                output=output,
+                allow_pending=False,
+            ))
+            self.assertEqual(mismatched, 1)
+            self.assertFalse(output.exists())
+
+            duplicate = build_cli.run(Namespace(
+                review=[review_a, review_b],
+                annotations=[annotations_a, annotations_b],
+                output=output,
+                allow_pending=False,
+            ))
+            self.assertEqual(duplicate, 1)
+            self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

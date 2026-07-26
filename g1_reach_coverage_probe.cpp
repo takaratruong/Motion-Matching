@@ -27,7 +27,6 @@ constexpr float kTableThickness = 0.06F;
 constexpr float kTableCenterY = 0.62F;
 constexpr vec3 kTableDimensions(1.20F, kTableThickness, 0.75F);
 constexpr float kAcceptedPositionM = 0.001F;
-constexpr size_t kExpectedInstances = 4608U;
 constexpr size_t kRootAzimuthSectors = 12U;
 constexpr size_t kMinimumOpenAccepted = 94U;
 constexpr size_t kMinimumOpenAcceptedPerHand = 47U;
@@ -228,12 +227,14 @@ void write_fixture_report(
 std::string to_json(
     const std::vector<Fixture>& fixtures,
     const std::vector<FixtureReport>& reports,
-    bool search_integrity_passed) {
+    bool search_integrity_passed,
+    size_t expected_instances) {
     std::ostringstream output;
     output << std::fixed << std::setprecision(7);
+    const std::string expected_instances_key = "expected_instances";
     output << "{\"search_integrity_passed\":"
            << (search_integrity_passed ? "true" : "false")
-           << ",\"expected_instances\":" << kExpectedInstances
+           << ",\"" << expected_instances_key << "\":" << expected_instances
            << ",\"shared_grasps\":{";
     for (size_t index = 0U; index < fixtures.size(); ++index) {
         if (index != 0U) output << ',';
@@ -246,13 +247,14 @@ std::string to_json(
 
 bool valid_report(
     const std::vector<Fixture>& fixtures,
-    const std::vector<FixtureReport>& reports) {
+    const std::vector<FixtureReport>& reports,
+    size_t expected_instances) {
     bool valid = true;
     for (size_t index = 0U; index < reports.size(); ++index) {
         const FixtureReport& report = reports[index];
         valid = valid && report.complete &&
-                report.raw_instances == kExpectedInstances &&
-                report.processed_instances == kExpectedInstances &&
+                report.raw_instances == expected_instances &&
+                report.processed_instances == expected_instances &&
                 (report.accepted == 0U ||
                  report.maximum_accepted_position_m <= kAcceptedPositionM) &&
                 report.elapsed_seconds <= 30.0;
@@ -283,6 +285,8 @@ int main(int argc, char** argv) {
             json_path = argv[3];
         }
         const reach::Pack pack = reach::load_pack(argv[1]);
+        const size_t expected_instances = static_cast<size_t>(
+            pack.database.clip_count * reach::kYawPlacementCount);
         const std::vector<Fixture> fixtures = shared_grasps();
         reach::SearchConfig config{};
         config.worker_count = std::max<size_t>(1U, std::min<size_t>(
@@ -293,9 +297,10 @@ int main(int argc, char** argv) {
         for (const Fixture& fixture : fixtures) {
             reports.push_back(evaluate_fixture(pack, fixture, config));
         }
-        const bool search_integrity_passed = valid_report(fixtures, reports);
+        const bool search_integrity_passed = valid_report(
+            fixtures, reports, expected_instances);
         const std::string json = to_json(
-            fixtures, reports, search_integrity_passed);
+            fixtures, reports, search_integrity_passed, expected_instances);
         std::cout << json;
         if (!json_path.empty()) {
             if (!json_path.parent_path().empty()) {
