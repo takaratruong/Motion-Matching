@@ -283,6 +283,28 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
             viewer,
         )
 
+    def test_viewer_plays_only_inbound_approach(self):
+        viewer = self.source(VIEWER)
+        for required in (
+            "constexpr float kInboundPlaybackSeconds = 3.6F;",
+            "size_t inbound_pose_count(",
+            "size_t inbound_playback_sample(",
+            "database.contact_frames.at(clip)",
+            "database.range_starts.at(clip)",
+            "const size_t playback_pose_count = std::min(",
+            "inbound_playback_sample(",
+            "const size_t inbound_count = inbound_pose_count(",
+        ):
+            self.assertIn(required, viewer)
+        self.assertNotIn(
+            "animation_seconds * fps) % animation_poses->size()",
+            viewer,
+        )
+        self.assertNotIn(
+            "animation_seconds * fps) % playback_pose_count",
+            viewer,
+        )
+
     def test_makefile_has_standalone_targets(self):
         makefile = self.source(MAKEFILE)
         self.assertIn("g1_reach_coverage_viewer:", makefile)

@@ -21,6 +21,7 @@ namespace {
 constexpr float kPi = 3.14159265358979323846F;
 constexpr float kCameraTargetLimit = 5.0F;
 constexpr float kWristContactOffset = 0.04F;
+constexpr float kInboundPlaybackSeconds = 3.6F;
 constexpr float kTableTop = 0.65F;
 constexpr float kTableThickness = 0.06F;
 constexpr float kTableCenterY = 0.62F;
@@ -169,6 +170,33 @@ const char* provenance(const reach::Pack& pack, size_t clip) {
         : kMirroredLabel;
 }
 
+size_t inbound_pose_count(
+    const reach::Database& database,
+    size_t clip) {
+    const int32_t start = database.range_starts.at(clip);
+    const int32_t contact = database.contact_frames.at(clip);
+    if (start < 0 || contact < start) {
+        throw std::runtime_error("invalid inbound reach frame boundary");
+    }
+    return static_cast<size_t>(contact - start) + 1U;
+}
+
+size_t inbound_playback_sample(
+    size_t pose_count,
+    float animation_seconds) {
+    if (pose_count == 0U) {
+        throw std::runtime_error("cannot play an empty inbound reach");
+    }
+    const float progress = std::clamp(
+        animation_seconds / kInboundPlaybackSeconds,
+        0.0F,
+        1.0F);
+    return std::min(
+        pose_count - 1U,
+        static_cast<size_t>(
+            progress * static_cast<float>(pose_count - 1U)));
+}
+
 interaction::Transform desired_grasp(
     const interaction::Transform& object,
     vec3 dimensions) {
@@ -306,10 +334,12 @@ void draw_path(
     const std::vector<vec3>& path,
     Color color,
     size_t stride,
+    size_t sample_count,
     bool emphasized = false) {
-    if (path.size() < 2U) return;
+    sample_count = std::min(sample_count, path.size());
+    if (sample_count < 2U) return;
     vec3 previous = path.front();
-    for (size_t sample = stride; sample < path.size(); sample += stride) {
+    for (size_t sample = stride; sample < sample_count; sample += stride) {
         const vec3 current = path[sample];
         if (emphasized) {
             DrawCylinderEx(
@@ -320,18 +350,22 @@ void draw_path(
         }
         previous = current;
     }
-    DrawLine3D(ray(previous), ray(path.back()), color);
-    DrawSphere(ray(path.back()), emphasized ? 0.018F : 0.010F, color);
+    const vec3 inbound_end = path[sample_count - 1U];
+    DrawLine3D(ray(previous), ray(inbound_end), color);
+    DrawSphere(ray(inbound_end), emphasized ? 0.018F : 0.010F, color);
 }
 
 std::vector<vec3> active_wrist_path(
     const reach::Evaluation& evaluation,
-    reach::Hand hand) {
+    reach::Hand hand,
+    size_t sample_count) {
+    sample_count = std::min(sample_count, evaluation.poses.size());
     std::vector<vec3> path;
-    path.reserve(evaluation.poses.size());
+    path.reserve(sample_count);
     const size_t wrist = wrist_bone(hand);
-    for (const interaction::Pose& pose : evaluation.poses) {
-        path.push_back(interaction::world_pose(pose).positions[wrist]);
+    for (size_t sample = 0U; sample < sample_count; ++sample) {
+        path.push_back(
+            interaction::world_pose(evaluation.poses[sample]).positions[wrist]);
     }
     return path;
 }
@@ -950,12 +984,14 @@ int main(int argc, char** argv) {
                         ? &selected_full->poses
                         : nullptr);
             std::optional<interaction::WorldPose> selected_world_pose;
-            if (animation_poses != nullptr && !animation_poses->empty()) {
-                const float fps =
-                    static_cast<float>(pack.database.fps_numerator) /
-                    static_cast<float>(pack.database.fps_denominator);
-                const size_t sample = static_cast<size_t>(
-                    animation_seconds * fps) % animation_poses->size();
+            if (animation_poses != nullptr && !animation_poses->empty() &&
+                selected_full.has_value()) {
+                const size_t playback_pose_count = std::min(
+                    animation_poses->size(),
+                    inbound_pose_count(
+                        pack.database, selected_full->candidate.clip));
+                const size_t sample = inbound_playback_sample(
+                    playback_pose_count, animation_seconds);
                 selected_world_pose = interaction::world_pose(
                     (*animation_poses)[sample]);
                 if (show_g1_mesh && g1_mesh_renderer.loaded) {
@@ -1023,13 +1059,16 @@ int main(int argc, char** argv) {
                     const bool accepted =
                         evaluation.rejection == reach::Rejection::None;
                     if (!accepted && !show_rejected) continue;
+                    const size_t inbound_count = inbound_pose_count(
+                        pack.database, evaluation.candidate.clip);
                     draw_path(
                         compact.hand_path,
                         accepted
                             ? trajectory_color(
                                   pack, evaluation.candidate.clip, true)
                             : Color{210, 45, 55, 60},
-                        accepted ? 5U : 10U);
+                        accepted ? 5U : 10U,
+                        inbound_count);
                 }
             }
             if (selected_full.has_value() &&
@@ -1037,20 +1076,33 @@ int main(int argc, char** argv) {
                 const reach::Evaluation& evaluation = *selected_full;
                 const reach::Hand selected_hand =
                     evaluation_hand(pack, evaluation);
+                const size_t inbound_count = inbound_pose_count(
+                    pack.database, evaluation.candidate.clip);
                 const std::vector<vec3> raw_path =
-                    active_wrist_path(evaluation, selected_hand);
+                    active_wrist_path(
+                        evaluation, selected_hand, inbound_count);
                 if (approach_mode == ApproachDisplayMode::Retargeted) {
                     // Raw wrist path as a faint purple reference.
-                    draw_path(raw_path, Color{150, 90, 210, 90}, 1U, false);
+                    draw_path(
+                        raw_path,
+                        Color{150, 90, 210, 90},
+                        1U,
+                        inbound_count,
+                        false);
                     if (selected_retarget.has_value() &&
                         !selected_retarget->poses.empty()) {
                         std::vector<vec3> solved_path;
-                        solved_path.reserve(selected_retarget->poses.size());
+                        const size_t solved_count = std::min(
+                            inbound_count, selected_retarget->poses.size());
+                        solved_path.reserve(solved_count);
                         const size_t wrist = wrist_bone(selected_hand);
-                        for (const interaction::Pose& pose :
-                             selected_retarget->poses) {
+                        for (size_t sample = 0U;
+                             sample < solved_count;
+                             ++sample) {
                             solved_path.push_back(
-                                interaction::world_pose(pose).positions[wrist]);
+                                interaction::world_pose(
+                                    selected_retarget->poses[sample])
+                                    .positions[wrist]);
                         }
                         // Accepted retarget path emphasized green, failed
                         // retarget path in orange.
@@ -1058,13 +1110,19 @@ int main(int argc, char** argv) {
                             solved_path,
                             selected_retarget->accepted ? GREEN : ORANGE,
                             1U,
+                            solved_count,
                             true);
                     }
                 }
                 const Color selected_color =
                     evaluation.rejection == reach::Rejection::None ? LIME : ORANGE;
                 if (approach_mode != ApproachDisplayMode::Retargeted) {
-                    draw_path(raw_path, selected_color, 1U, true);
+                    draw_path(
+                        raw_path,
+                        selected_color,
+                        1U,
+                        inbound_count,
+                        true);
                 }
                 if (show_g1_bones && selected_world_pose.has_value()) {
                     draw_pose(
@@ -1075,7 +1133,7 @@ int main(int argc, char** argv) {
                             ? SKYBLUE : ORANGE);
                 }
                 const interaction::WorldPose final = interaction::world_pose(
-                    evaluation.poses.back());
+                    evaluation.poses.at(inbound_count - 1U));
                 const size_t wrist = wrist_bone(selected_hand);
                 draw_axes(
                     {final.positions[wrist], final.rotations[wrist]},
