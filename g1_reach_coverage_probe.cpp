@@ -290,7 +290,7 @@ int main(int argc, char** argv) {
         const std::vector<Fixture> fixtures = shared_grasps();
         reach::SearchConfig config{};
         config.worker_count = std::max<size_t>(1U, std::min<size_t>(
-            8U, std::max(1U, std::thread::hardware_concurrency())));
+            32U, std::max(1U, std::thread::hardware_concurrency())));
         config.deadline = std::chrono::seconds(30);
         std::vector<FixtureReport> reports;
         reports.reserve(fixtures.size());

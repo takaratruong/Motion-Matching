@@ -271,6 +271,13 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
         self.assertIn("size_t expected_instances", probe)
         self.assertIn('"expected_instances"', probe)
 
+    def test_probe_scales_worker_pool_for_the_enlarged_corpus(self):
+        probe = self.source(PROBE)
+        self.assertIn(
+            "32U, std::max(1U, std::thread::hardware_concurrency())",
+            probe,
+        )
+
     def test_makefile_has_standalone_targets(self):
         makefile = self.source(MAKEFILE)
         self.assertIn("g1_reach_coverage_viewer:", makefile)
