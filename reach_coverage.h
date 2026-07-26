@@ -18,6 +18,7 @@ struct Query {
 
 struct CoverageConfig {
     float maximum_request_position_m = 0.45F;
+    float maximum_endpoint_vertical_delta_m = 0.10F;
     float accepted_position_m = 0.001F;
     float accepted_approach_radians = 0.261799388F;
     float accepted_orientation_radians = 1.047197551F;
@@ -106,6 +107,14 @@ inline interaction::Transform hand_transform(
 }
 
 }  // namespace detail
+
+bool valid_coverage_config(const CoverageConfig& config);
+
+bool endpoint_vertical_compatible(
+    const Pack& pack,
+    const Candidate& candidate,
+    const Query& query,
+    const CoverageConfig& config = CoverageConfig{});
 
 std::vector<Candidate> enumerate_candidates(const Pack& pack);
 

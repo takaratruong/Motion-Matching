@@ -36,19 +36,6 @@ bool valid_query(const Query& query) {
            length(query.approach_world) > 1.0e-8F;
 }
 
-bool valid_config(const CoverageConfig& config) {
-    return finite(config.maximum_request_position_m) &&
-           finite(config.accepted_position_m) &&
-           finite(config.accepted_approach_radians) &&
-           finite(config.accepted_orientation_radians) &&
-           config.maximum_request_position_m >= 0.0F &&
-           config.accepted_position_m >= 0.0F &&
-           config.accepted_approach_radians >= 0.0F &&
-           config.accepted_approach_radians <= kPi &&
-           config.accepted_orientation_radians >= 0.0F &&
-           config.accepted_orientation_radians <= kPi;
-}
-
 interaction::Hand interaction_hand(Hand hand) {
     return hand == Hand::Left
         ? interaction::Hand::Left
@@ -196,6 +183,37 @@ void assign_final_errors(
 
 }  // namespace
 
+bool valid_coverage_config(const CoverageConfig& config) {
+    return finite(config.maximum_request_position_m) &&
+           finite(config.maximum_endpoint_vertical_delta_m) &&
+           finite(config.accepted_position_m) &&
+           finite(config.accepted_approach_radians) &&
+           finite(config.accepted_orientation_radians) &&
+           config.maximum_request_position_m >= 0.0F &&
+           config.maximum_endpoint_vertical_delta_m >= 0.0F &&
+           config.accepted_position_m >= 0.0F &&
+           config.accepted_approach_radians >= 0.0F &&
+           config.accepted_approach_radians <= kPi &&
+           config.accepted_orientation_radians >= 0.0F &&
+           config.accepted_orientation_radians <= kPi;
+}
+
+bool endpoint_vertical_compatible(
+    const Pack& pack,
+    const Candidate& candidate,
+    const Query& query,
+    const CoverageConfig& config) {
+    if (!valid_query(query) || !valid_coverage_config(config) ||
+        candidate.clip >= pack.database.clip_count) {
+        return false;
+    }
+    const float endpoint_y =
+        endpoint_transform(pack.database, candidate.clip).position.y;
+    constexpr float numeric_tolerance_m = 1.0e-6F;
+    return std::abs(endpoint_y - query.target.position.y) <=
+        config.maximum_endpoint_vertical_delta_m + numeric_tolerance_m;
+}
+
 WristPathQuality measure_wrist_path_quality(
     const std::vector<vec3>& path) {
     const float invalid = std::numeric_limits<float>::infinity();
@@ -250,7 +268,7 @@ std::vector<Candidate> select_candidates(
     const Query& query,
     const CoverageConfig& config) {
     std::vector<Candidate> candidates;
-    if (!valid_query(query) || !valid_config(config) ||
+    if (!valid_query(query) || !valid_coverage_config(config) ||
         pack.database.clip_count == 0U) {
         return candidates;
     }
@@ -261,6 +279,10 @@ std::vector<Candidate> select_candidates(
     for (Candidate candidate : enumerate_candidates(pack)) {
         if (pack.database.active_hands.at(candidate.clip) !=
             static_cast<uint8_t>(query.hand)) {
+            continue;
+        }
+        if (!endpoint_vertical_compatible(
+                pack, candidate, query, config)) {
             continue;
         }
         const float approach_error = direction_angle(
@@ -300,12 +322,16 @@ Evaluation shape_candidate(
     const CoverageConfig& config) {
     Evaluation evaluation{};
     evaluation.candidate = candidate;
-    if (!valid_query(query) || !valid_config(config) ||
+    if (!valid_query(query) || !valid_coverage_config(config) ||
         candidate.clip >= pack.database.clip_count ||
         candidate.yaw_index >= kYawPlacementCount ||
         pack.database.active_hands.at(candidate.clip) !=
             static_cast<uint8_t>(query.hand)) {
         evaluation.rejection = Rejection::InvalidSolver;
+        return evaluation;
+    }
+    if (!endpoint_vertical_compatible(pack, candidate, query, config)) {
+        evaluation.rejection = Rejection::OutsideEnvelope;
         return evaluation;
     }
     const int32_t start = pack.database.range_starts.at(candidate.clip);

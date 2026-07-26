@@ -258,8 +258,36 @@ void test_retrieval_is_same_hand_and_query_pose_independent() {
     assert(reach::select_candidates(pack, query).empty());
     query = zero_query(pack);
     query.target.position = query.target.position + vec3(3.0F, -1.0F, 2.0F);
-    assert(reach::select_candidates(pack, query).size() ==
-           reach::kYawPlacementCount);
+    assert(reach::select_candidates(pack, query).empty());
+}
+
+void test_vertical_endpoint_gate_is_inclusive_and_blocks_direct_bypass() {
+    const reach::Pack pack = fixture(20U);
+    const reach::Candidate candidate{0U, 0U, 0.0F, 0.0F, 0.0F};
+    reach::CoverageConfig config{};
+    reach::Query query = zero_query(pack);
+
+    query.target.position.y += 0.10F;
+    assert(reach::endpoint_vertical_compatible(
+        pack, candidate, query, config));
+    assert(reach::shape_candidate(
+        pack, candidate, query, config).rejection !=
+        reach::Rejection::OutsideEnvelope);
+
+    query.target.position.y += 0.001F;
+    assert(!reach::endpoint_vertical_compatible(
+        pack, candidate, query, config));
+    const reach::Evaluation blocked =
+        reach::shape_candidate(pack, candidate, query, config);
+    assert(blocked.rejection == reach::Rejection::OutsideEnvelope);
+    assert(blocked.poses.empty());
+    assert(reach::select_candidates(pack, query, config).empty());
+
+    config.maximum_endpoint_vertical_delta_m = -0.01F;
+    assert(reach::select_candidates(pack, zero_query(pack), config).empty());
+    assert(reach::shape_candidate(
+        pack, candidate, zero_query(pack), config).rejection ==
+        reach::Rejection::InvalidSolver);
 }
 
 void test_one_reach_warps_to_a_different_approach_direction() {
@@ -534,10 +562,10 @@ void test_zero_retarget_uses_pre_pause_approach_evidence() {
     assert(result.approach_error_radians <= 0.008726646F);
 }
 
-void test_arbitrary_target_is_placed_without_an_endpoint_envelope() {
+void test_arbitrary_horizontal_target_is_placed_without_an_endpoint_envelope() {
     const reach::Pack pack = fixture(20U);
     reach::Query query = zero_query(pack);
-    query.target.position = query.target.position + vec3(3.0F, 1.0F, -2.0F);
+    query.target.position = query.target.position + vec3(3.0F, 0.0F, -2.0F);
     const auto candidates = reach::select_candidates(pack, query);
     assert(candidates.size() == reach::kYawPlacementCount);
     const reach::Evaluation result = reach::shape_candidate(
@@ -884,7 +912,8 @@ void test_enumeration_is_bilateral_exhaustive_and_query_invariant() {
 void test_shared_grasp_shapes_both_hands_at_every_yaw() {
     const reach::Pack pack = bilateral_fixture();
     reach::Query query{};
-    query.target.position = vec3(1.1F, 0.9F, -0.6F);
+    query.target.position = vec3(
+        1.1F, pack.database.endpoint_positions[1], -0.6F);
     query.target.rotation = quat();
     query.approach_world = normalize(vec3(-1, 0, 0));
     bool saw_left = false;
@@ -984,6 +1013,7 @@ void test_wrist_path_quality_handles_degenerate_and_invalid_paths() {
 
 int main() {
     test_retrieval_is_same_hand_and_query_pose_independent();
+    test_vertical_endpoint_gate_is_inclusive_and_blocks_direct_bypass();
     test_one_reach_warps_to_a_different_approach_direction();
     test_short_reach_rejects_approach_retarget_without_safe_ramp();
     test_final_contact_uses_posture_window_and_one_millimetre_gate();
@@ -993,7 +1023,7 @@ int main() {
     test_retrieval_keeps_every_clip_and_yaw_then_ranks_approach();
     test_zero_retarget_reproduces_endpoint_and_keeps_root_fixed();
     test_zero_retarget_uses_pre_pause_approach_evidence();
-    test_arbitrary_target_is_placed_without_an_endpoint_envelope();
+    test_arbitrary_horizontal_target_is_placed_without_an_endpoint_envelope();
     test_position_and_rotation_perturbations_have_exclusive_outcomes();
     test_collision_stages_and_active_contact_exemption();
     test_collision_observations_survive_an_earlier_kinematic_rejection();

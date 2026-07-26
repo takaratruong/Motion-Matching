@@ -36,6 +36,7 @@ void validate(
     }
     if (config.worker_count == 0U || config.worker_count > 64U ||
         config.deadline < std::chrono::steady_clock::duration::zero() ||
+        !valid_coverage_config(config.coverage) ||
         !valid_straight_approach_config(config.straight_approach)) {
         throw std::invalid_argument("invalid exhaustive reach search config");
     }
@@ -121,7 +122,19 @@ SearchResult search_all(
     const interaction::EnvironmentGeometry& environment,
     const SearchConfig& config) {
     validate(query, config);
-    const std::vector<Candidate> candidates = enumerate_candidates(pack);
+    const std::vector<Candidate> enumerated = enumerate_candidates(pack);
+    std::vector<Candidate> candidates;
+    candidates.reserve(enumerated.size());
+    for (const Candidate& candidate : enumerated) {
+        Query hand_query{};
+        hand_query.hand = candidate_hand(pack, candidate);
+        hand_query.target = query.target;
+        hand_query.approach_world = query.approach_world;
+        if (endpoint_vertical_compatible(
+                pack, candidate, hand_query, config.coverage)) {
+            candidates.push_back(candidate);
+        }
+    }
     const auto started = std::chrono::steady_clock::now();
     const auto expires = started + config.deadline;
     std::vector<std::optional<CompactEvaluation>> slots(candidates.size());

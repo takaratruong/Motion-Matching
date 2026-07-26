@@ -141,6 +141,7 @@ reach::Pack bilateral_fixture() {
 }
 
 reach::SearchResult run_fixture_search(size_t workers) {
+    reach::Pack pack = bilateral_fixture();
     reach::SearchConfig config{};
     config.worker_count = workers;
     config.deadline = std::chrono::seconds(30);
@@ -148,11 +149,33 @@ reach::SearchResult run_fixture_search(size_t workers) {
     config.coverage.accepted_approach_radians = 3.141592654F;
     config.coverage.accepted_orientation_radians = 3.141592654F;
     return reach::search_all(
-        bilateral_fixture(),
-        {{{1.0F, 0.85F, -0.25F}, quat()}, normalize(vec3(-1, 0, 0))},
+        pack,
+        {{{1.0F, pack.database.endpoint_positions[1], -0.25F}, quat()},
+         normalize(vec3(-1, 0, 0))},
         {{vec3(10, 10, 10), quat()}, vec3(0.01F, 0.01F, 0.01F)},
         interaction::EnvironmentGeometry{},
         config);
+}
+
+void test_search_prefilters_incompatible_endpoint_heights() {
+    reach::Pack pack = bilateral_fixture();
+    const float target_y = pack.database.endpoint_positions[1];
+    pack.database.endpoint_positions[4] = target_y + 0.101F;
+    reach::SearchConfig config{};
+    config.worker_count = 2U;
+    const reach::SearchResult result = reach::search_all(
+        pack,
+        {{{1.0F, target_y, -0.25F}, quat()}, normalize(vec3(-1, 0, 0))},
+        {{vec3(10, 10, 10), quat()}, vec3(0.01F, 0.01F, 0.01F)},
+        interaction::EnvironmentGeometry{},
+        config);
+
+    assert(result.complete);
+    assert(result.total == reach::kYawPlacementCount);
+    assert(result.processed == result.total);
+    for (const reach::CompactEvaluation& compact : result.evaluations) {
+        assert(compact.evaluation.candidate.clip == 0U);
+    }
 }
 
 void test_search_processes_every_bilateral_yaw_instance() {
@@ -205,7 +228,8 @@ void test_cancelled_search_returns_without_processing_the_pack() {
     config.cancellation = std::make_shared<std::atomic_bool>(true);
     const reach::SearchResult result = reach::search_all(
         pack,
-        {{{1.0F, 0.85F, -0.25F}, quat()}, normalize(vec3(-1, 0, 0))},
+        {{{1.0F, pack.database.endpoint_positions[1], -0.25F}, quat()},
+         normalize(vec3(-1, 0, 0))},
         {{vec3(10, 10, 10), quat()}, vec3(0.01F, 0.01F, 0.01F)},
         interaction::EnvironmentGeometry{},
         config);
@@ -215,12 +239,14 @@ void test_cancelled_search_returns_without_processing_the_pack() {
 }
 
 void test_zero_deadline_never_publishes_partial_results_as_complete() {
+    const reach::Pack pack = bilateral_fixture();
     reach::SearchConfig config{};
     config.worker_count = 2U;
     config.deadline = std::chrono::steady_clock::duration::zero();
     const reach::SearchResult result = reach::search_all(
-        bilateral_fixture(),
-        {{{1.0F, 0.85F, -0.25F}, quat()}, normalize(vec3(-1, 0, 0))},
+        pack,
+        {{{1.0F, pack.database.endpoint_positions[1], -0.25F}, quat()},
+         normalize(vec3(-1, 0, 0))},
         {{vec3(10, 10, 10), quat()}, vec3(0.01F, 0.01F, 0.01F)},
         interaction::EnvironmentGeometry{},
         config);
@@ -240,12 +266,14 @@ void test_complete_search_never_exceeds_its_deadline() {
 }
 
 void test_search_rejects_nonunit_approach() {
+    const reach::Pack pack = bilateral_fixture();
     bool threw = false;
     try {
         reach::SearchConfig config{};
         (void)reach::search_all(
-            bilateral_fixture(),
-            {{{1.0F, 0.85F, -0.25F}, quat()}, vec3(-2.0F, 0.0F, 0.0F)},
+            pack,
+            {{{1.0F, pack.database.endpoint_positions[1], -0.25F}, quat()},
+             vec3(-2.0F, 0.0F, 0.0F)},
             {{vec3(10, 10, 10), quat()}, vec3(0.01F, 0.01F, 0.01F)},
             interaction::EnvironmentGeometry{},
             config);
@@ -258,7 +286,8 @@ void test_search_rejects_nonunit_approach() {
 void test_selected_regeneration_matches_compact_metrics() {
     const reach::Pack pack = bilateral_fixture();
     const reach::ExhaustiveQuery query{
-        {{1.0F, 0.85F, -0.25F}, quat()}, normalize(vec3(-1, 0, 0))};
+        {{1.0F, pack.database.endpoint_positions[1], -0.25F}, quat()},
+        normalize(vec3(-1, 0, 0))};
     const interaction::OrientedBox object{
         {vec3(10, 10, 10), quat()}, vec3(0.01F, 0.01F, 0.01F)};
     reach::SearchConfig config{};
@@ -366,6 +395,7 @@ void test_search_publishes_preferred_with_same_identities_as_accepted() {
 
 int main() {
     test_search_processes_every_bilateral_yaw_instance();
+    test_search_prefilters_incompatible_endpoint_heights();
     test_search_order_is_independent_of_worker_count();
     test_cancelled_search_returns_without_processing_the_pack();
     test_zero_deadline_never_publishes_partial_results_as_complete();
