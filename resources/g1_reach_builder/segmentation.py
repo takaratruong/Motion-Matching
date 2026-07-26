@@ -41,6 +41,39 @@ class SegmentationConfig:
 
 
 @dataclass(frozen=True)
+class PauseSegmentationConfig:
+    fps: float = 25.0
+    neutral_radius_m: float = 0.10
+    minimum_excursion_m: float = 0.18
+    maximum_contact_speed_mps: float = 0.10
+    minimum_contact_separation_s: float = 1.20
+    contact_prominence_window_s: float = 0.40
+    minimum_speed_prominence_mps: float = 0.03
+    minimum_approach_frames: int = 10
+    minimum_approach_travel_m: float = 0.18
+
+    def validate(self) -> None:
+        positive = (
+            self.fps,
+            self.neutral_radius_m,
+            self.minimum_excursion_m,
+            self.maximum_contact_speed_mps,
+            self.minimum_contact_separation_s,
+            self.contact_prominence_window_s,
+            self.minimum_speed_prominence_mps,
+            self.minimum_approach_travel_m,
+        )
+        if not all(np.isfinite(value) and value > 0 for value in positive):
+            raise ValueError(
+                "pause segmentation values must be finite and positive"
+            )
+        if self.minimum_approach_frames < 2:
+            raise ValueError(
+                "pause segmentation requires at least two approach frames"
+            )
+
+
+@dataclass(frozen=True)
 class ReachProposal:
     proposal_id: str
     sequence_id: str
@@ -236,6 +269,113 @@ def propose_wrist_trace(
     return proposals
 
 
+def _smoothed_wrist_speed(trace: np.ndarray, fps: float) -> np.ndarray:
+    velocity = np.gradient(trace, 1.0 / fps, axis=0)
+    speed = np.linalg.norm(velocity, axis=1)
+    return np.convolve(
+        speed,
+        np.asarray([0.25, 0.50, 0.25], np.float64),
+        mode="same",
+    )
+
+
+def _contact_pause_frames(
+    distance: np.ndarray,
+    speed: np.ndarray,
+    config: PauseSegmentationConfig,
+) -> list[int]:
+    minima = np.flatnonzero(
+        (speed[1:-1] <= speed[:-2])
+        & (speed[1:-1] < speed[2:])
+    ) + 1
+    minima = minima[
+        (distance[minima] >= config.minimum_excursion_m)
+        & (speed[minima] <= config.maximum_contact_speed_mps)
+    ]
+    prominence_window = max(
+        1, int(round(config.contact_prominence_window_s * config.fps))
+    )
+    prominent: list[int] = []
+    for frame in minima.tolist():
+        left = speed[max(0, frame - prominence_window) : frame + 1]
+        right = speed[frame : min(len(speed), frame + prominence_window + 1)]
+        prominence = min(float(np.max(left)), float(np.max(right))) - float(
+            speed[frame]
+        )
+        if prominence >= config.minimum_speed_prominence_mps:
+            prominent.append(frame)
+
+    separation = max(
+        1, int(round(config.minimum_contact_separation_s * config.fps))
+    )
+    selected: list[int] = []
+    for frame in sorted(prominent, key=lambda value: (speed[value], value)):
+        if all(abs(frame - current) >= separation for current in selected):
+            selected.append(frame)
+    return sorted(selected)
+
+
+def propose_pause_bounded_wrist_trace(
+    trace: np.ndarray,
+    source_frames: np.ndarray,
+    sequence_id: str,
+    config: PauseSegmentationConfig = PauseSegmentationConfig(),
+) -> list[ReachProposal]:
+    config.validate()
+    trace = np.asarray(trace, np.float64)
+    source_frames = np.asarray(source_frames)
+    if trace.ndim != 2 or trace.shape[1] != 3 or len(trace) < 3:
+        raise ValueError("wrist trace shape must be (T, 3) with T >= 3")
+    if source_frames.shape != (len(trace),):
+        raise ValueError("source frame count does not match wrist trace")
+    if not np.isfinite(trace).all():
+        raise ValueError("wrist trace contains non-finite values")
+
+    center = _neutral_center(trace, config.fps)
+    distance = np.linalg.norm(trace - center, axis=1)
+    speed = _smoothed_wrist_speed(trace, config.fps)
+    proposals: list[ReachProposal] = []
+    previous_contact = -1
+    for contact in _contact_pause_frames(distance, speed, config):
+        interval_start = previous_contact + 1
+        interval = np.arange(interval_start, contact + 1)
+        neutral = interval[
+            distance[interval] <= config.neutral_radius_m
+        ]
+        if len(neutral):
+            departure = int(neutral[np.argmin(speed[neutral])])
+        else:
+            departure = interval_start + int(
+                np.argmin(distance[interval_start : contact + 1])
+            )
+        approach_frames = contact - departure + 1
+        approach_delta = trace[contact] - trace[departure]
+        approach_travel = float(np.linalg.norm(approach_delta))
+        if (
+            approach_frames < config.minimum_approach_frames
+            or approach_travel < config.minimum_approach_travel_m
+        ):
+            continue
+
+        source_grab = int(source_frames[contact])
+        identity = hashlib.sha256(
+            f"{sequence_id}\0pause\0{source_grab}".encode("utf-8")
+        ).hexdigest()[:16]
+        proposals.append(ReachProposal(
+            proposal_id=f"{sequence_id}:{identity}",
+            sequence_id=sequence_id,
+            departure_frame=departure,
+            grab_frame=contact,
+            source_departure_frame=int(source_frames[departure]),
+            source_grab_frame=source_grab,
+            excursion_m=float(distance[contact]),
+            approach_displacement_m=approach_travel,
+            confidence=min(1.0, approach_travel / 0.45),
+        ))
+        previous_contact = contact
+    return proposals
+
+
 def _root_relative_left_wrist(
     positions: np.ndarray,
     rotations: np.ndarray,
@@ -271,6 +411,31 @@ def propose_reaches(
             corpus.positions[start:stop], corpus.rotations[start:stop]
         )
         result.extend(propose_wrist_trace(
+            trace,
+            corpus.source_frames[start:stop],
+            sequence_id,
+            config,
+        ))
+    return result
+
+
+def propose_pause_bounded_reaches(
+    corpus: ReviewCorpus,
+    config: PauseSegmentationConfig = PauseSegmentationConfig(),
+) -> list[ReachProposal]:
+    corpus.validate()
+    if config.fps != corpus.fps:
+        raise ValueError(
+            f"segmentation fps {config.fps} does not match corpus {corpus.fps}"
+        )
+    result: list[ReachProposal] = []
+    for clip, sequence_id in enumerate(corpus.sequence_ids):
+        start = int(corpus.range_starts[clip])
+        stop = int(corpus.range_stops[clip])
+        trace = _root_relative_left_wrist(
+            corpus.positions[start:stop], corpus.rotations[start:stop]
+        )
+        result.extend(propose_pause_bounded_wrist_trace(
             trace,
             corpus.source_frames[start:stop],
             sequence_id,

@@ -98,6 +98,7 @@ def _manifest(
     motions_sha256: str,
     proposals_sha256: str,
     proposal_count: int,
+    proposal_strategy: str,
 ) -> dict:
     return {
         "schema": "g1-reach-review",
@@ -119,6 +120,7 @@ def _manifest(
         "review_motions_sha256": motions_sha256,
         "proposals_sha256": proposals_sha256,
         "proposal_count": proposal_count,
+        "proposal_strategy": proposal_strategy,
     }
 
 
@@ -129,7 +131,12 @@ def _remove_directory(path: Path) -> None:
         shutil.rmtree(path)
 
 
-def write_review_corpus(output: Path, corpus: ReviewCorpus) -> None:
+def write_review_corpus(
+    output: Path,
+    corpus: ReviewCorpus,
+    *,
+    pause_bounded: bool = False,
+) -> None:
     corpus.validate()
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -147,9 +154,16 @@ def write_review_corpus(output: Path, corpus: ReviewCorpus) -> None:
             range_stops=corpus.range_stops.astype(np.int32, copy=False),
             source_frames=corpus.source_frames.astype(np.int32, copy=False),
         )
-        from .segmentation import propose_reaches
+        from .segmentation import (
+            propose_pause_bounded_reaches,
+            propose_reaches,
+        )
 
-        proposals = propose_reaches(corpus)
+        proposals = (
+            propose_pause_bounded_reaches(corpus)
+            if pause_bounded
+            else propose_reaches(corpus)
+        )
         proposal_document = {
             "schema": "g1-reach-proposals",
             "version": 1,
@@ -165,6 +179,7 @@ def write_review_corpus(output: Path, corpus: ReviewCorpus) -> None:
             proposal_document["review_motions_sha256"],
             _sha256(temporary / _PROPOSALS_NAME),
             len(proposals),
+            "pause-bounded" if pause_bounded else "radial",
         )
         (temporary / _MANIFEST_NAME).write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n",

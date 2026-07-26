@@ -112,11 +112,13 @@ class PrepareReviewCLITests(unittest.TestCase):
             soma = prepare_cli.parse_args([
                 "--soma-csv-dir", str(root),
                 "--source-fps", "100",
+                "--pause-bounded",
                 "--g1-xml", str(xml),
                 "--output", str(output),
             ])
             self.assertEqual(soma.soma_csv_dir, root)
             self.assertIsNone(soma.archive)
+            self.assertTrue(soma.pause_bounded)
 
             with self.assertRaises(SystemExit):
                 prepare_cli.parse_args([

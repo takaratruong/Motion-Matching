@@ -5,6 +5,7 @@ import unittest
 
 import numpy as np
 
+from resources.g1_reach_builder import segmentation as reach_segmentation
 from resources.g1_reach_builder.review import (
     read_review_corpus,
     read_reach_proposals,
@@ -51,6 +52,19 @@ def drifting_neutral_trace() -> np.ndarray:
     return trace
 
 
+def pause_bounded_trace() -> np.ndarray:
+    trace = np.zeros((145, 3), np.float64)
+    trace[10:31, 0] = np.linspace(0.0, 0.40, 21)
+    trace[31:36, 0] = 0.40
+    trace[36:46, 0] = 0.40
+    trace[36:46, 1] = np.linspace(0.0, 0.22, 10)
+    trace[46:71] = np.linspace(trace[45], np.zeros(3), 25)
+    trace[80:106, 1] = np.linspace(0.0, 0.35, 26)
+    trace[106:111, 1] = 0.35
+    trace[111:136, 1] = np.linspace(0.35, 0.0, 25)
+    return trace
+
+
 def review_corpus_for_trace(trace: np.ndarray) -> ReviewCorpus:
     frames = len(trace)
     positions = np.zeros((frames, 31, 3), np.float32)
@@ -76,6 +90,28 @@ def review_corpus_for_trace(trace: np.ndarray) -> ReviewCorpus:
 
 
 class ReachSegmentationTests(unittest.TestCase):
+    def test_pause_bounded_reaches_end_before_withdrawal(self):
+        trace = pause_bounded_trace()
+
+        proposals = reach_segmentation.propose_pause_bounded_wrist_trace(
+            trace,
+            np.arange(len(trace), dtype=np.int32),
+            "tabletop_soma/height0_side",
+        )
+
+        self.assertEqual(len(proposals), 2)
+        first, second = proposals
+        self.assertLessEqual(first.departure_frame, 10)
+        self.assertGreaterEqual(first.grab_frame, 31)
+        self.assertLess(first.grab_frame, 36)
+        np.testing.assert_allclose(
+            trace[first.grab_frame], [0.40, 0.0, 0.0], atol=1e-6
+        )
+        self.assertGreaterEqual(second.departure_frame, 70)
+        self.assertLessEqual(second.departure_frame, 80)
+        self.assertGreaterEqual(second.grab_frame, 106)
+        self.assertLess(second.grab_frame, 111)
+
     def test_keeps_terminal_nonreturning_outside_run(self):
         trace = np.zeros((80, 3), np.float64)
         trace[20:61, 0] = np.linspace(0.0, 0.40, 41)
@@ -159,6 +195,21 @@ class ReachSegmentationTests(unittest.TestCase):
                 {path.name for path in output.iterdir()},
                 {"manifest.json", "review_motions.npz", "proposals.json"},
             )
+
+    def test_review_publication_can_use_pause_bounded_proposals(self):
+        corpus = review_corpus_for_trace(pause_bounded_trace())
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "review"
+
+            write_review_corpus(output, corpus, pause_bounded=True)
+            loaded = read_review_corpus(output)
+            proposals = read_reach_proposals(output)
+
+            self.assertEqual(
+                proposals,
+                reach_segmentation.propose_pause_bounded_reaches(loaded),
+            )
+            self.assertEqual(len(proposals), 2)
 
 
 if __name__ == "__main__":

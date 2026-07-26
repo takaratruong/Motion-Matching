@@ -24,6 +24,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--g1-xml", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--source-fps", type=float)
+    parser.add_argument("--pause-bounded", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -50,7 +51,11 @@ def run(args: argparse.Namespace) -> int:
         G1Kinematics(str(args.g1_xml)),
         excluded_sequence_ids=excluded,
     )
-    write_review_corpus(args.output, corpus)
+    write_review_corpus(
+        args.output,
+        corpus,
+        pause_bounded=args.pause_bounded,
+    )
     rates = sorted(set(float(value) for value in corpus.source_fps))
     print(
         f"BUILT reach-review schema=1 included={len(included)} "
