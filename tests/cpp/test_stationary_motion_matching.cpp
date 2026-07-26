@@ -584,14 +584,20 @@ void test_authoritative_candidates_and_constrained_search() {
 
     database db;
     database_load(db, "resources/database.bin");
+    db.terrain_features.resize(db.nframes(), 4);
+    db.terrain_features.zero();
     database_build_matching_features(
         db,
         0.75F,
         1.0F,
         1.0F,
         1.0F,
-        1.5F);
-    require(db.nfeatures() == 27, "ordinary matching feature width changed");
+        1.5F,
+        6,
+        12,
+        1,
+        0.0F);
+    require(db.nfeatures() == 31, "ordinary matching feature width changed");
 
     const std::vector<int> candidates = derive_candidates(db);
     require(candidates.size() == 186U, "authoritative stationary count changed");
