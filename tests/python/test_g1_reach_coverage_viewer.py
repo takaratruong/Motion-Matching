@@ -277,6 +277,11 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
             "32U, std::max(1U, std::thread::hardware_concurrency())",
             probe,
         )
+        viewer = self.source(VIEWER)
+        self.assertIn(
+            "32U, std::max(1U, std::thread::hardware_concurrency())",
+            viewer,
+        )
 
     def test_makefile_has_standalone_targets(self):
         makefile = self.source(MAKEFILE)

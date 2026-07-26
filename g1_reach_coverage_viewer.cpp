@@ -13,6 +13,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -672,6 +673,8 @@ int main(int argc, char** argv) {
         std::optional<reach::Evaluation> selected_full;
         std::optional<reach::CorridorRetargetResult> selected_retarget;
         reach::SearchConfig search_config{};
+        search_config.worker_count = std::max<size_t>(1U, std::min<size_t>(
+            32U, std::max(1U, std::thread::hardware_concurrency())));
         reach::ExhaustiveQuery query = make_query(
             object, options.object_size, grasp_approach_local);
 
