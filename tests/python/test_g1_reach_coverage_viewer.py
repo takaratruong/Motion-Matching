@@ -283,6 +283,20 @@ class G1ReachCoverageViewerTests(unittest.TestCase):
             viewer,
         )
 
+    def test_probe_integrity_uses_height_compatible_candidate_counts(self):
+        probe = self.source(PROBE)
+        for required in (
+            "expected_compatible_instances(",
+            "endpoint_vertical_compatible(",
+            "report.raw_instances == compatible_instances[index]",
+            "report.processed_instances == report.raw_instances",
+        ):
+            self.assertIn(required, probe)
+        self.assertNotIn(
+            "report.raw_instances == expected_instances",
+            probe,
+        )
+
     def test_viewer_plays_only_inbound_approach(self):
         viewer = self.source(VIEWER)
         for required in (

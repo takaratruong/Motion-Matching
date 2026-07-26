@@ -179,6 +179,26 @@ FixtureReport evaluate_fixture(
     return report;
 }
 
+size_t expected_compatible_instances(
+    const reach::Pack& pack,
+    const Fixture& fixture,
+    const reach::SearchConfig& config) {
+    size_t compatible = 0U;
+    for (const reach::Candidate& candidate :
+         reach::enumerate_candidates(pack)) {
+        reach::Query query{};
+        query.hand = static_cast<reach::Hand>(
+            pack.database.active_hands.at(candidate.clip));
+        query.target = fixture.query.target;
+        query.approach_world = fixture.query.approach_world;
+        if (reach::endpoint_vertical_compatible(
+                pack, candidate, query, config.coverage)) {
+            ++compatible;
+        }
+    }
+    return compatible;
+}
+
 void write_fixture_report(
     std::ostream& output,
     const FixtureReport& report) {
@@ -248,13 +268,19 @@ std::string to_json(
 bool valid_report(
     const std::vector<Fixture>& fixtures,
     const std::vector<FixtureReport>& reports,
+    const std::vector<size_t>& compatible_instances,
     size_t expected_instances) {
+    if (fixtures.size() != reports.size() ||
+        reports.size() != compatible_instances.size()) {
+        return false;
+    }
     bool valid = true;
     for (size_t index = 0U; index < reports.size(); ++index) {
         const FixtureReport& report = reports[index];
         valid = valid && report.complete &&
-                report.raw_instances == expected_instances &&
-                report.processed_instances == expected_instances &&
+                compatible_instances[index] <= expected_instances &&
+                report.raw_instances == compatible_instances[index] &&
+                report.processed_instances == report.raw_instances &&
                 (report.accepted == 0U ||
                  report.maximum_accepted_position_m <= kAcceptedPositionM) &&
                 report.elapsed_seconds <= 30.0;
@@ -292,13 +318,17 @@ int main(int argc, char** argv) {
         config.worker_count = std::max<size_t>(1U, std::min<size_t>(
             32U, std::max(1U, std::thread::hardware_concurrency())));
         config.deadline = std::chrono::seconds(30);
+        std::vector<size_t> compatible_instances;
+        compatible_instances.reserve(fixtures.size());
         std::vector<FixtureReport> reports;
         reports.reserve(fixtures.size());
         for (const Fixture& fixture : fixtures) {
+            compatible_instances.push_back(expected_compatible_instances(
+                pack, fixture, config));
             reports.push_back(evaluate_fixture(pack, fixture, config));
         }
         const bool search_integrity_passed = valid_report(
-            fixtures, reports, expected_instances);
+            fixtures, reports, compatible_instances, expected_instances);
         const std::string json = to_json(
             fixtures, reports, search_integrity_passed, expected_instances);
         std::cout << json;
