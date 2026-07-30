@@ -18,6 +18,7 @@ from mm_sonic.torch_terrain_features import (
     DENSE_LATERAL_M,
     TerrainDataset,
     TerrainFeatureExtension,
+    TerrainFootClearanceValidator,
     TerrainSceneAlignment,
 )
 from resources.g1_torch_stair_builder.publish import publish_stair_slice
@@ -199,6 +200,67 @@ class TerrainFeatureTests(unittest.TestCase):
             torch.equal(legacy_rows[0], torch.zeros_like(legacy_rows[0]))
         )
         self.assertGreater(float(dense_rows[1].std()), 0.0)
+
+    def test_foot_clearance_validator_uses_exact_emitted_preview(self):
+        extension = TerrainFeatureExtension.for_condition(
+            self.dataset,
+            condition="dense",
+            query_scene="stair/0000/motion.npz",
+            weight=4.0,
+        )
+        validator = TerrainFootClearanceValidator(
+            extension=extension,
+            preview_steps=10,
+            minimum_clearance_m=-0.03,
+        )
+        body = torch.zeros((46, 3, 3), dtype=torch.float32)
+        scene_xy = extension.alignment.matcher_to_scene_xy(
+            body[:, :, :2]
+        )
+        surface = extension.query_grid.sample_xy(scene_xy)
+        body[:, :, 2] = surface
+        body[:, 1:, 2] += 0.035
+        self.assertTrue(validator(body))
+
+        unsafe = body.clone()
+        unsafe[9, 1, 2] = surface[9, 1] - 0.031
+        self.assertFalse(validator(unsafe))
+
+        just_outside_preview = body.clone()
+        just_outside_preview[10, 1, 2] = surface[10, 1] - 0.031
+        self.assertTrue(validator(just_outside_preview))
+
+        for steps in (0, 47, True):
+            with self.subTest(preview_steps=steps):
+                with self.assertRaises(Exception):
+                    TerrainFootClearanceValidator(
+                        extension=extension,
+                        preview_steps=steps,
+                        minimum_clearance_m=-0.03,
+                    )
+        for clearance in (float("nan"), "unsafe"):
+            with self.subTest(clearance=clearance):
+                with self.assertRaises(Exception):
+                    TerrainFootClearanceValidator(
+                        extension=extension,
+                        preview_steps=10,
+                        minimum_clearance_m=clearance,
+                    )
+
+        invalid_windows = (
+            torch.zeros((45, 3, 3), dtype=torch.float32),
+            body.double(),
+            body.clone(),
+        )
+        invalid_windows[2][0, 0, 0] = float("nan")
+        for invalid in invalid_windows:
+            with self.subTest(shape=tuple(invalid.shape), dtype=invalid.dtype):
+                with self.assertRaises(Exception):
+                    validator(invalid)
+        outside = body.clone()
+        outside[:, :, :2] = 100.0
+        with self.assertRaisesRegex(Exception, "outside"):
+            validator(outside)
 
     def test_scene_alignment_maps_matcher_world_into_recorded_world(self):
         alignment = TerrainSceneAlignment(

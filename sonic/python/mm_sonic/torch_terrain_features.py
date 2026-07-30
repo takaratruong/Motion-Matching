@@ -675,3 +675,59 @@ class TerrainFeatureExtension:
             self.query_grid.sample_xy(scene_samples)
             - self.query_grid.sample_xy(root_scene)
         ).to(dtype=torch.float32)
+
+
+@dataclass(frozen=True)
+class TerrainFootClearanceValidator:
+    """Validate ankle clearance over a composed inertialized body window."""
+
+    extension: TerrainFeatureExtension
+    preview_steps: int
+    minimum_clearance_m: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.extension, TerrainFeatureExtension):
+            raise ContractError(
+                "terrain clearance validator requires a terrain extension"
+            )
+        if (
+            type(self.preview_steps) is not int
+            or not 1 <= self.preview_steps <= 46
+        ):
+            raise ContractError(
+                "terrain clearance preview steps must be an integer in [1, 46]"
+            )
+        clearance = self.minimum_clearance_m
+        if (
+            not isinstance(clearance, (int, float))
+            or isinstance(clearance, bool)
+            or not math.isfinite(float(clearance))
+        ):
+            raise ContractError(
+                "minimum terrain foot clearance must be finite"
+            )
+        object.__setattr__(
+            self, "minimum_clearance_m", float(clearance)
+        )
+
+    def __call__(self, body_window: torch.Tensor) -> bool:
+        if (
+            not isinstance(body_window, torch.Tensor)
+            or tuple(body_window.shape) != (46, 3, 3)
+            or body_window.dtype != torch.float32
+            or body_window.device != self.extension.dataset.device
+            or not torch.isfinite(body_window).all()
+        ):
+            raise ContractError(
+                "terrain clearance body window must be finite float32 "
+                "shape (46, 3, 3) on the terrain dataset device"
+            )
+        preview = body_window[: self.preview_steps]
+        scene_xy = self.extension.alignment.matcher_to_scene_xy(
+            preview[:, :, :2]
+        )
+        surface = self.extension.query_grid.sample_xy(scene_xy)
+        clearance = preview[:, 1:, 2] - surface[:, 1:]
+        return bool(
+            (clearance.min() >= self.minimum_clearance_m).item()
+        )
