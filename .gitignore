@@ -11,5 +11,6 @@ resources/runs*
 /resources/g1_terrain/
 /.worktrees/
 /sonic/.venv/
+/sonic/.torch-mm-venv/
 /sonic/build/
 /sonic/runs/

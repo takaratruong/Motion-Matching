@@ -23,6 +23,9 @@ integration = [
   "PyYAML==6.0.3",
   "cyclonedds==0.10.2",
 ]
+torch-mm = [
+  "torch>=2.13",
+]
 
 [tool.setuptools]
 package-dir = {"" = "python"}

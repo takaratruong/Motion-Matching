@@ -22,6 +22,50 @@ PYTHONPATH=sonic/python sonic/.venv/bin/python -m unittest \
   tests.python.test_sonic_external -v
 ```
 
+## In-process Torch motion matcher runtime
+
+The in-process Torch motion matcher runs in its own candidate-local virtual
+environment, `sonic/.torch-mm-venv`, so that the optional Torch dependency never
+enters the baseline import paths or the shared `sonic/.venv`.
+
+> **Warning:** `sonic/.venv` is a shared symlink used by the baseline runtime
+> and must never be created, deleted, or otherwise modified by the Torch matcher
+> workflow. Always target the separate `sonic/.torch-mm-venv` directory, which is
+> git-ignored.
+
+Create and verify the isolated environment:
+
+```bash
+/home/ubuntu/miniconda3/envs/env_isaaclab/bin/python -m venv \
+  --system-site-packages sonic/.torch-mm-venv
+sonic/.torch-mm-venv/bin/pip install -e 'sonic[integration,torch-mm]'
+sonic/.torch-mm-venv/bin/python - <<'PY'
+import sys
+import mujoco
+import numpy
+import torch
+import zmq
+print(sys.version.split()[0])
+print(torch.__version__)
+print(torch.cuda.is_available())
+print(numpy.__version__, mujoco.__version__, zmq.__version__)
+PY
+```
+
+Expected: Python `3.10.x`, Torch `2.13.0+cu130`, `True`, and successful imports.
+Confirm `readlink -f sonic/.venv` is unchanged before and after. Run the focused
+native Takara loader tests with this interpreter; they import only NumPy and
+never Torch:
+
+```bash
+PYTHONPATH=sonic/python sonic/.torch-mm-venv/bin/python -B -m unittest -v \
+  tests.python.test_sonic_torch_motion_data
+```
+
+The `torch-mm` extra declares only `torch>=2.13`; the native Takara loader in
+`mm_sonic.torch_motion_data` itself imports no Torch, so baseline test discovery
+never depends on the optional runtime.
+
 The `integration` extra installs the three pinned upstream runtime dependencies
 (`scipy==1.15.3`, `PyYAML==6.0.3`, `cyclonedds==0.10.2`) alongside `mujoco` and
 `pyzmq`. It intentionally does **not** declare a PyPI `unitree_sdk2py`: the
