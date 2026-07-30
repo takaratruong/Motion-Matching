@@ -16,6 +16,7 @@ from mm_sonic.torch_motion_matcher import (
     SearchDecision,
     TorchMotionMatcher,
     decay_spring_offsets,
+    predict_command_trajectory,
     rank_exact_transition_candidates,
 )
 from mm_sonic.torch_motion_data import MotionFolder
@@ -59,6 +60,156 @@ class _ScriptedWindowValidator:
 
 
 class TorchMotionMatcherTests(unittest.TestCase):
+    def _jerk_rerank_fixture(self, root, *, weight):
+        matcher = TorchMotionMatcher.from_folder(
+            root,
+            device="cpu",
+            config=MatcherConfig(
+                search_interval_steps=1,
+                exclusion_frames=0,
+                transition_window_jerk_weight=weight,
+                transition_window_candidate_count=2,
+            ),
+            emitted_window_validator=lambda _window: True,
+        )
+        matcher.reset()
+        state = matcher._state
+        successor = matcher.database.row_for_source(
+            state.clip_index, state.frame_index + 1
+        )
+        shaped = predict_command_trajectory(
+            state.root_position[:2],
+            state.shaped_velocity,
+            state.shaped_heading,
+            torch.tensor((0.5, 0.0), dtype=torch.float32),
+            torch.tensor(0.0, dtype=torch.float32),
+            has_valid_successor=successor is not None,
+            config=matcher.config,
+        )
+        candidates = []
+        stop = matcher.folder.clips[0].valid_frame_stop
+        for frame in range(20, stop, 8):
+            row = matcher.database.row_for_source(0, frame)
+            if row is None or row == successor:
+                continue
+            candidate = matcher._compose_candidate(
+                state, shaped, row, successor
+            )
+            jerk = torch.linalg.vector_norm(
+                torch.diff(
+                    candidate.dense_joint_position, n=3, dim=0
+                )
+                / (matcher.config.dt**3),
+                dim=1,
+            )
+            candidates.append(
+                (float(torch.quantile(jerk, 0.95).item()), row)
+            )
+        candidates.sort()
+        self.assertGreater(candidates[-1][0], candidates[0][0])
+        return matcher, successor, candidates[0], candidates[-1]
+
+    def test_transition_window_reranker_selects_lower_predicted_jerk(self):
+        arrays = build_varying_takara_arrays(frames=240)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher, successor, low, high = self._jerk_rerank_fixture(
+                root, weight=100.0
+            )
+            selected = SearchDecision(
+                high[1], successor, 1000.0, 1.0, 1.0, True, True
+            )
+            ranked = (
+                SearchDecision(
+                    high[1], None, math.inf, 1.0, 1.0, True, True
+                ),
+                SearchDecision(
+                    low[1], None, math.inf, 1.0, 1.0, True, True
+                ),
+            )
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher.select_exact_candidate",
+                return_value=selected,
+            ), mock.patch(
+                "mm_sonic.torch_motion_matcher."
+                "rank_exact_transition_candidates",
+                return_value=ranked,
+            ) as ranking:
+                result = matcher.step((0.5, 0.0), 0.0)
+
+        ranking.assert_called_once()
+        self.assertEqual(
+            result.diagnostics.selected_frame,
+            matcher._source_for_row(low[1])[1],
+        )
+        self.assertTrue(result.diagnostics.transitioned)
+        self.assertFalse(result.diagnostics.terrain_safety_override)
+
+    def test_zero_window_jerk_weight_preserves_vanilla_without_ranking(self):
+        arrays = build_varying_takara_arrays(frames=240)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher, successor, _low, high = self._jerk_rerank_fixture(
+                root, weight=0.0
+            )
+            selected = SearchDecision(
+                high[1], successor, 1000.0, 1.0, 1.0, True, True
+            )
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher.select_exact_candidate",
+                return_value=selected,
+            ), mock.patch(
+                "mm_sonic.torch_motion_matcher."
+                "rank_exact_transition_candidates"
+            ) as ranking:
+                result = matcher.step((0.5, 0.0), 0.0)
+
+        ranking.assert_not_called()
+        self.assertEqual(
+            result.diagnostics.selected_frame,
+            matcher._source_for_row(high[1])[1],
+        )
+
+    def test_direct_matcher_rejects_invalid_window_rerank_config(self):
+        arrays = build_varying_takara_arrays(frames=80)
+        invalid = (
+            (
+                MatcherConfig(transition_window_jerk_weight=-1.0),
+                "transition_window_jerk_weight",
+            ),
+            (
+                MatcherConfig(transition_window_jerk_weight=math.inf),
+                "transition_window_jerk_weight",
+            ),
+            (
+                MatcherConfig(transition_window_jerk_weight=math.nan),
+                "transition_window_jerk_weight",
+            ),
+            (
+                MatcherConfig(transition_window_candidate_count=0),
+                "transition_window_candidate_count",
+            ),
+            (
+                MatcherConfig(transition_window_candidate_count=True),
+                "transition_window_candidate_count",
+            ),
+            (
+                MatcherConfig(transition_window_candidate_count=2.0),
+                "transition_window_candidate_count",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            for config, label in invalid:
+                with self.subTest(config=config):
+                    with self.assertRaisesRegex(ContractError, label):
+                        TorchMotionMatcher.from_folder(
+                            root, device="cpu", config=config
+                        )
+
     def test_spring_matches_independent_equation(self):
         position = torch.tensor([0.4, -0.2], dtype=torch.float32)
         velocity = torch.tensor([-0.1, 0.3], dtype=torch.float32)

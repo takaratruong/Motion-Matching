@@ -39,7 +39,11 @@ EXPERIMENT_SCHEMA = "g1-torch-stair-small-experiment/v1"
 CONDITIONS = ("flat", "legacy", "dense")
 _TIMING_ARRAYS = frozenset(("search_time_ns", "step_time_ns"))
 _MATCHER_INTEGER_FIELDS = frozenset(
-    ("search_interval_steps", "exclusion_frames")
+    (
+        "search_interval_steps",
+        "exclusion_frames",
+        "transition_window_candidate_count",
+    )
 )
 _MATCHER_FLOAT_FIELDS = frozenset(
     (
@@ -52,6 +56,7 @@ _MATCHER_FLOAT_FIELDS = frozenset(
         "inertialization_halflife_s",
         "transition_joint_position_weight",
         "transition_joint_velocity_weight",
+        "transition_window_jerk_weight",
         "transition_settle_duration_s",
         "transition_settle_penalty",
     )
@@ -62,6 +67,7 @@ _MATCHER_NONNEGATIVE_FLOAT_FIELDS = frozenset(
         "transition_settle_penalty",
         "transition_joint_position_weight",
         "transition_joint_velocity_weight",
+        "transition_window_jerk_weight",
     )
 )
 
@@ -139,6 +145,12 @@ def _validate_base_config(config: object) -> None:
     if type(exclusion_frames) is not int or exclusion_frames < 0:
         raise ContractError(
             "matcher exclusion_frames must be a non-negative integer"
+        )
+    candidate_count = matcher["transition_window_candidate_count"]
+    if type(candidate_count) is not int or candidate_count < 1:
+        raise ContractError(
+            "matcher transition_window_candidate_count must be a "
+            "positive integer"
         )
     for name in _MATCHER_FLOAT_FIELDS:
         value = _finite_number(
@@ -245,6 +257,12 @@ def matcher_config_from_resolved(config: Mapping) -> MatcherConfig:
         ),
         transition_settle_penalty=float(
             values["transition_settle_penalty"]
+        ),
+        transition_window_jerk_weight=float(
+            values["transition_window_jerk_weight"]
+        ),
+        transition_window_candidate_count=int(
+            values["transition_window_candidate_count"]
         ),
     )
 

@@ -43,6 +43,8 @@ class MatcherConfig:
     transition_settle_penalty: float = 0.0
     transition_joint_position_weight: float = 0.0
     transition_joint_velocity_weight: float = 0.0
+    transition_window_jerk_weight: float = 0.0
+    transition_window_candidate_count: int = 32
 
 
 @dataclass(frozen=True)
@@ -776,6 +778,25 @@ class TorchMotionMatcher:
         config: MatcherConfig,
         emitted_window_validator: EmittedWindowValidator | None = None,
     ) -> None:
+        jerk_weight = config.transition_window_jerk_weight
+        if (
+            isinstance(jerk_weight, bool)
+            or not isinstance(jerk_weight, (int, float))
+            or not math.isfinite(jerk_weight)
+            or jerk_weight < 0
+        ):
+            raise ContractError(
+                "transition_window_jerk_weight must be a finite "
+                "non-negative number"
+            )
+        candidate_count = config.transition_window_candidate_count
+        if (
+            type(candidate_count) is not int
+            or candidate_count <= 0
+        ):
+            raise ContractError(
+                "transition_window_candidate_count must be a positive integer"
+            )
         if continuity.device != database.device:
             raise ContractError(
                 "continuity and motion databases must use the same device"
@@ -972,6 +993,137 @@ class TorchMotionMatcher:
             ),
         )
         return rank, decision, candidate, search_time
+
+    def _rerank_transition_window(
+        self,
+        state: _MatcherState,
+        shaped: ShapedCommand,
+        query: torch.Tensor,
+        continuity: TransitionContinuityCosts,
+        successor: int,
+        decision: SearchDecision,
+        candidate: _ComposedCandidate,
+        validator,
+        settle_penalty: float,
+        search_time: int | None,
+    ) -> tuple[SearchDecision, _ComposedCandidate, int | None]:
+        weight = float(self.config.transition_window_jerk_weight)
+        if weight <= 0.0:
+            return decision, candidate, search_time
+        rerank_start = time.perf_counter_ns()
+        ranked = rank_exact_transition_candidates(
+            self.database,
+            query,
+            current_clip_index=state.clip_index,
+            current_frame_index=state.frame_index,
+            config=self.config,
+            additional_transition_costs=continuity.total,
+        )
+        rerank_time = time.perf_counter_ns() - rerank_start
+        search_time = (
+            rerank_time
+            if search_time is None
+            else search_time + rerank_time
+        )
+
+        def predicted_p95(value: _ComposedCandidate) -> torch.Tensor:
+            jerk = torch.linalg.vector_norm(
+                torch.diff(
+                    value.dense_joint_position, n=3, dim=0
+                )
+                / (self.config.dt**3),
+                dim=1,
+            )
+            return torch.quantile(jerk, 0.95)
+
+        records = []
+        original_in_prefix = False
+        limit = self.config.transition_window_candidate_count
+        for ranked_decision in ranked[:limit]:
+            raw_total = (
+                ranked_decision.selected_total_cost + settle_penalty
+            )
+            if raw_total >= decision.incumbent_cost:
+                continue
+            if ranked_decision.selected_row == decision.selected_row:
+                reranked_candidate = candidate
+                original_in_prefix = True
+            else:
+                reranked_candidate = self._compose_candidate(
+                    state,
+                    shaped,
+                    ranked_decision.selected_row,
+                    successor,
+                )
+            records.append(
+                (
+                    ranked_decision,
+                    reranked_candidate,
+                    raw_total,
+                    torch.as_tensor(
+                        raw_total,
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                    + weight
+                    * predicted_p95(reranked_candidate)
+                    / 1000.0,
+                )
+            )
+        if not original_in_prefix:
+            records.append(
+                (
+                    decision,
+                    candidate,
+                    decision.selected_total_cost,
+                    torch.as_tensor(
+                        decision.selected_total_cost,
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                    + weight * predicted_p95(candidate) / 1000.0,
+                )
+            )
+        scores = torch.stack([record[3] for record in records])
+        order = torch.argsort(scores, stable=True).cpu().tolist()
+        for index in order:
+            ranked_decision, reranked_candidate, raw_total, _score = (
+                records[index]
+            )
+            if (
+                ranked_decision.selected_row != decision.selected_row
+                and validator is not None
+            ):
+                accepted = validator(
+                    reranked_candidate.dense_body_position.clone()
+                )
+                if type(accepted) is not bool:
+                    raise ContractError(
+                        "emitted-window validator must return exact bool"
+                    )
+                if not accepted:
+                    continue
+            if ranked_decision.selected_row == decision.selected_row:
+                return decision, candidate, search_time
+            return (
+                SearchDecision(
+                    selected_row=ranked_decision.selected_row,
+                    incumbent_row=successor,
+                    incumbent_cost=decision.incumbent_cost,
+                    selected_feature_cost=(
+                        ranked_decision.selected_feature_cost
+                    ),
+                    selected_total_cost=raw_total,
+                    searched=True,
+                    transitioned=True,
+                    selected_transition_cost=(
+                        ranked_decision.selected_transition_cost
+                    ),
+                ),
+                reranked_candidate,
+                search_time,
+            )
+        return decision, candidate, search_time
 
     def _compose_candidate(
         self,
@@ -1391,6 +1543,27 @@ class TorchMotionMatcher:
                             transitioned=False,
                         )
                         transition_rejected = True
+        if (
+            decision.transitioned
+            and not terrain_safety_override
+            and self.config.transition_window_jerk_weight > 0.0
+        ):
+            (
+                decision,
+                candidate,
+                search_time,
+            ) = self._rerank_transition_window(
+                state,
+                shaped,
+                query,
+                continuity,
+                successor,
+                decision,
+                candidate,
+                validator,
+                settle_penalty,
+                search_time,
+            )
         residual_sq = torch.square(
             self.database._search_features[decision.selected_row] - query
         )

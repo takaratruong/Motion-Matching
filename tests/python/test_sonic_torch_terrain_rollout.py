@@ -92,6 +92,8 @@ class TerrainRolloutTests(unittest.TestCase):
                 "stop_speed_mps",
                 "transition_joint_position_weight",
                 "transition_joint_velocity_weight",
+                "transition_window_candidate_count",
+                "transition_window_jerk_weight",
                 "transition_penalty",
                 "transition_settle_duration_s",
                 "transition_settle_penalty",
@@ -112,6 +114,8 @@ class TerrainRolloutTests(unittest.TestCase):
         self.assertGreater(matcher.transition_settle_penalty, 0.0)
         self.assertEqual(matcher.transition_joint_position_weight, 0.0)
         self.assertEqual(matcher.transition_joint_velocity_weight, 0.0)
+        self.assertEqual(matcher.transition_window_candidate_count, 32)
+        self.assertEqual(matcher.transition_window_jerk_weight, 0.0)
         validator = terrain_transition_validator_from_resolved(
             self.resolved
         )
@@ -158,6 +162,27 @@ class TerrainRolloutTests(unittest.TestCase):
             "transition_settle_penalty"
         ] = float("nan")
         cases["transition_settle_penalty"] = nonfinite_settle_penalty
+        for label, value in (
+            ("negative", -0.01),
+            ("NaN", float("nan")),
+            ("infinity", float("inf")),
+            ("boolean", True),
+        ):
+            invalid_jerk_weight = json.loads(json.dumps(raw))
+            invalid_jerk_weight["matcher"][
+                "transition_window_jerk_weight"
+            ] = value
+            cases[
+                f"transition_window_jerk_weight {label}"
+            ] = invalid_jerk_weight
+        for value in (0, -1, 1.5, True):
+            invalid_candidate_count = json.loads(json.dumps(raw))
+            invalid_candidate_count["matcher"][
+                "transition_window_candidate_count"
+            ] = value
+            cases[
+                f"transition_window_candidate_count {value!r}"
+            ] = invalid_candidate_count
         for name in (
             "transition_joint_position_weight",
             "transition_joint_velocity_weight",

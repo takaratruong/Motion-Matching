@@ -32,6 +32,8 @@
     "stop_speed_mps": 0.05,
     "transition_joint_position_weight": 0.1,
     "transition_joint_velocity_weight": 0.1,
+    "transition_window_candidate_count": 32,
+    "transition_window_jerk_weight": 0.0,
     "transition_penalty": 0.1,
     "transition_settle_duration_s": 0.2,
     "transition_settle_penalty": 18.75,
