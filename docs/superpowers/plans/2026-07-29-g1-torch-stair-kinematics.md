@@ -565,21 +565,21 @@ fixed-diagonal sampling in Torch; do not perform per-frame CPU height calls.
 `TerrainFeatureExtension` precomputes immutable database rows at construction and
 uses the same local-point and sampler functions for live query rows.
 
-- [ ] **Step 4: Validate against the old artifact only as an alignment oracle**
+- [ ] **Step 4: Validate real USD/object alignment against recorded contacts**
 
 Add an opt-in real-data test guarded by
-`MM_REAL_STAIR_ALIGNMENT_ORACLE=1`. At the original 25 Hz source frames, compare
-the new native surface/legacy sampler for `04d99a9e43__0000` against rows
-`489432:489682` in:
+`MM_REAL_STAIR_ALIGNMENT_ORACLE=1`. At the original 25 Hz source frames,
+forward-kinematics the recorded left/right ankle-roll bodies and sample the new
+native USD/object surface beneath them. Require at least 100 near-contact frames
+per foot and require each minimum clearance to match the G1 sole offset of
+0.035 m within `1e-4` m.
 
-```text
-/home/ubuntu/projects/motion-matching/resources/
-g1_terrain_takara_slopes_stairs/terrain_features.bin
-```
-
-The test does not require the legacy feature to select good motion. It only
-proves that USD/object/robot coordinates are aligned. Require maximum absolute
-height-delta error at or below `1e-4` metres.
+Do not use the old `g1_terrain_takara_slopes_stairs` sidecar as an oracle.
+Investigation during implementation showed that its rows for this source behave
+as a single roughly 0.70 m curb and came from a different reconstruction
+surface, not the four-step object pose stored with this recording. This check
+also freezes the discovered GRAIL convention: object `root_quat` is source
+wxyz, unlike robot `root_rot`, which is source xyzw.
 
 - [ ] **Step 5: Run GREEN and commit**
 

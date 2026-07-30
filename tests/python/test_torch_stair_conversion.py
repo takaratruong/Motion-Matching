@@ -45,13 +45,14 @@ def _object_record(frames: int, fps: float) -> dict:
     root = np.broadcast_to(
         np.array([0.2, -0.3, 0.15], np.float32), (frames, 1, 3)
     ).copy()
-    xyzw = np.broadcast_to(
-        np.array([0.0, 0.0, 2**-0.5, 2**-0.5], np.float32),
+    # GRAIL object records use wxyz (unlike robot root_rot, which uses xyzw).
+    wxyz = np.broadcast_to(
+        np.array([2**-0.5, 0.0, 0.0, 2**-0.5], np.float32),
         (frames, 1, 4),
     ).copy()
     return {
         "root_pos": root,
-        "root_quat": xyzw,
+        "root_quat": wxyz,
         "fps": float(fps),
         "scale": np.ones((3, 1), np.float32),
         "contact_points_left_hand": {},
@@ -157,6 +158,11 @@ class PinnedCorpusTests(unittest.TestCase):
             self.assertEqual(source.robot_qpos_mujoco.shape, (250, 36))
             self.assertEqual(source.object_position_world.shape, (3,))
             self.assertEqual(source.object_quaternion_world_xyzw.shape, (4,))
+            np.testing.assert_allclose(
+                source.object_quaternion_world_xyzw,
+                [0.0, 0.0, 2**-0.5, 2**-0.5],
+                atol=1e-7,
+            )
             self.assertEqual(source.object_scale.shape, (3,))
             self.assertEqual(
                 set(source.source_sha256), {"robot", "object", "usd"}

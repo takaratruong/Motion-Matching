@@ -57,6 +57,10 @@ The runtime stays in the existing Torch matcher's native convention:
 - wxyz quaternions; and
 - the existing `g1-29dof-isaaclab-v1` joint/body layout.
 
+GRAIL's robot `root_rot` field is source xyzw, while its object `root_quat`
+field is source wxyz. The converter validates and converts both once into the
+explicit conventions above; it never infers quaternion order from values.
+
 The four GRAIL clips are converted from their recorded 25 Hz samples to 50 Hz
 once, offline. Root and body translations use timestamp interpolation. Root and
 body rotations use normalized shortest-arc quaternion interpolation with
@@ -204,8 +208,15 @@ Automated tests cover:
 - structured metrics and latency output.
 
 A protected integration test converts the four real local GRAIL clips and checks
-that the resulting folder loads through the strict native motion loader. Large
-generated clips are never committed.
+that the resulting folder loads through the strict native motion loader. A
+second protected oracle checks the transformed USD surface against the recorded
+left/right ankle-roll contact height (3.5 cm above the sole) on at least 100
+frames per foot. Large generated clips are never committed.
+
+The earlier `g1_terrain_takara_slopes_stairs` four-height sidecar is not used as
+an alignment oracle. Inspection showed that its rows for this source behave as
+a single roughly 0.70 m curb and were built from a different reconstruction
+surface, rather than the four-step object pose stored with this recording.
 
 ## Failure Handling
 

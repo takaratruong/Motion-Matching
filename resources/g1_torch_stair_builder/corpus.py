@@ -166,7 +166,7 @@ def _load_source(root: Path, base: str) -> PinnedStairSource:
         "root_pos",
         base,
     )
-    object_quaternion = _constant_row(
+    object_quaternion_wxyz = _constant_row(
         _finite_array(
             object_record,
             "root_quat",
@@ -177,10 +177,13 @@ def _load_source(root: Path, base: str) -> PinnedStairSource:
         "root_quat",
         base,
     )
-    object_quaternion_norm = float(np.linalg.norm(object_quaternion))
+    object_quaternion_norm = float(np.linalg.norm(object_quaternion_wxyz))
     if abs(object_quaternion_norm - 1.0) > 1e-4:
         raise ValueError(f"{base}: object root_quat is not unit length")
-    object_quaternion /= object_quaternion_norm
+    object_quaternion_wxyz /= object_quaternion_norm
+    # GRAIL object root_quat is wxyz.  Keep the public source contract explicit
+    # and convert it once to the xyzw convention used by the surface transform.
+    object_quaternion_xyzw = object_quaternion_wxyz[[1, 2, 3, 0]]
 
     if "scale" not in object_record:
         raise ValueError(f"{base}: object field scale is missing")
@@ -198,7 +201,7 @@ def _load_source(root: Path, base: str) -> PinnedStairSource:
         usd_path=usd_path,
         robot_qpos_mujoco=_owned_readonly(qpos),
         object_position_world=_owned_readonly(object_position),
-        object_quaternion_world_xyzw=_owned_readonly(object_quaternion),
+        object_quaternion_world_xyzw=_owned_readonly(object_quaternion_xyzw),
         object_scale=_owned_readonly(scale),
         source_fps=robot_fps,
         source_sha256=MappingProxyType(
@@ -216,4 +219,3 @@ def load_pinned_sources(root: str | Path) -> tuple[PinnedStairSource, ...]:
     if not resolved.is_dir():
         raise ValueError(f"GRAIL stair root is not a directory: {resolved}")
     return tuple(_load_source(resolved, base) for base in STAIR_BASES)
-
