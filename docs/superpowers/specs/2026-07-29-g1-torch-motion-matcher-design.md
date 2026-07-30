@@ -199,6 +199,23 @@ result = matcher.step(
 )
 ```
 
+`step()` is the convenience API for offline use and performs
+`prepare_step(...)` followed by `commit(prepared)`. The live SONIC adapter uses
+the two-phase form:
+
+```python
+prepared = matcher.prepare_step(velocity_world_xy, heading_world_yaw, dt=0.02)
+publication = adapter.prepare(prepared.result, global_frame_start=n)
+adapter.send_and_wait(publication)
+matcher.commit(prepared)
+```
+
+`PreparedMotionMatch` owns an immutable private next-state snapshot and may be
+committed exactly once by the matcher that created it. Until commit, the
+matcher's selected frame, command filters, inertialization, sequence, and last
+result are unchanged. A publication or acknowledgement failure discards the
+prepared object, leaves matcher state unchanged, and advances no physics.
+
 The existing `CommandSample` adapter supplies its MuJoCo-world XY velocity and
 extracts a Z-up yaw from its unit wxyz heading quaternion. The matcher never
 receives the robot's measured state.
@@ -426,8 +443,10 @@ unchanged in this experiment.
 
 ## Failure and transaction semantics
 
-`step()` constructs a private next state, validates the complete result, and
-only then swaps it into the matcher. Any exception leaves clip/frame, command
+`prepare_step()` constructs a private next state and validates the complete
+result without changing the matcher. `commit()` performs the state swap only
+for the exact live prepared object. `step()` combines those operations for
+offline callers. Any exception before commit leaves clip/frame, command
 filters, inertialization, sequence, and last valid result unchanged.
 
 Invalid commands are rejected before state construction. Velocity must contain
@@ -437,12 +456,13 @@ two finite float values, yaw and `dt` must be finite, and v1 requires
 The integration treats one matcher result, one SONIC reference publication, and
 one physics step as a boundary:
 
-1. compute the match result;
-2. validate and publish the complete SONIC reference;
-3. request/receive the SONIC action; and
-4. advance MuJoCo once.
+1. prepare the match result without changing matcher state;
+2. validate, publish, and acknowledge the complete SONIC reference;
+3. commit the exact prepared matcher state;
+4. request/receive the SONIC action; and
+5. advance MuJoCo once.
 
-Failure before the fourth operation does not advance physics. The viewer holds
+Failure before the fifth operation does not advance physics. The viewer holds
 the last valid rendered state and reports the failed stage. No partial window,
 mixed old/new reference, or implicit retry is published.
 
