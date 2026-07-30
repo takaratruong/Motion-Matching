@@ -260,6 +260,46 @@ class TorchMotionMatcherTests(unittest.TestCase):
             with self.assertRaisesRegex(ContractError, "exact bool"):
                 matcher.prepare_step((0.5, 0.0), 0.0)
 
+    def test_unsafe_transition_without_incumbent_fails_transactionally(
+        self,
+    ):
+        arrays = build_varying_takara_arrays(frames=120)
+        validator = _ScriptedWindowValidator([False])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                emitted_window_validator=validator,
+            )
+            reset = matcher.reset()
+            target = matcher.database.row_for_source(0, 20)
+            self.assertIsNotNone(target)
+            decision = SearchDecision(
+                target,
+                None,
+                math.inf,
+                1.0,
+                1.1,
+                True,
+                True,
+            )
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher."
+                "TorchMotionDatabase.row_for_source",
+                return_value=None,
+            ), mock.patch(
+                "mm_sonic.torch_motion_matcher.select_exact_candidate",
+                return_value=decision,
+            ):
+                with self.assertRaisesRegex(
+                    ContractError, "no incumbent"
+                ):
+                    matcher.prepare_step((0.5, 0.0), 0.0)
+
+        self.assertEqual(reset.diagnostics.sequence, 0)
+
     def test_explicit_none_preserves_flat_matcher_for_100_commands(self):
         arrays = build_varying_takara_arrays(frames=160)
         with tempfile.TemporaryDirectory() as tmp:

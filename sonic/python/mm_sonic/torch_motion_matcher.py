@@ -609,7 +609,7 @@ class TorchMotionMatcher:
         database: TorchMotionDatabase,
         clips: tuple[_DeviceClip, ...],
         config: MatcherConfig,
-        emitted_window_validator: EmittedWindowValidator | None,
+        emitted_window_validator: EmittedWindowValidator | None = None,
     ) -> None:
         self.folder = folder
         self.database = database
