@@ -173,6 +173,42 @@ After deterministic qualification, the interactive viewer must survive an
 up/turn/down user sequence and the user must confirm that descent is visibly
 smoother. The viewer is not called stable before that check.
 
+## Post-Qualification Command Stress Matrix
+
+The up/turn/down sequence isolates the descent transition defect; it is not the
+final claim of general behavior. A retained weight pair is next evaluated
+against commands deliberately harder than the tuning route:
+
+1. rapid forward/backward reversals while holding heading fixed;
+2. alternating left/right lateral velocity while holding heading fixed;
+3. all eight planar travel directions with independently varied headings;
+4. repeated stop/restart segments on the approach, stair, and landing;
+5. ascent followed by a lateral upper-landing exit and the mirrored side; and
+6. deterministic random command episodes using seed `20260730`, short
+   `0.10--0.80 s` command segments, independent travel and heading choices,
+   and an explicit reset between bounded episodes.
+
+This matrix calls the matcher directly so velocity and heading remain
+independent. It does not inherit the current viewer keyboard convenience that
+turns heading toward travel.
+
+Every scenario is run first with zero continuity weights and then with the
+retained pair. It reports exceptions, clearance, completion, accepted/rejected
+transitions, rescue ranks, joint/root acceleration and jerk, and
+transition-neighborhood spikes separately per scenario. The retained pair may
+not worsen p95 joint jerk by more than 10% in any scenario and must reduce it by
+at least 15% in at least four of the six scenarios. Every scenario must retain
+`-0.03 m` clearance and complete without an exception.
+
+A stress failure is not averaged into a passing aggregate. It becomes a saved,
+deterministic reproduction. Further matcher changes follow the same
+root-cause, test-first, isolated-ablation loop and must re-pass ascent, descent,
+the complete stress matrix, terrain acceptance, and MuJoCo-FK. Iteration stops
+only when the retained candidate passes these gates or evidence shows that the
+remaining failure is motion-inventory coverage; in the latter case the exact
+scenario becomes the input to the planned curb and omnidirectional inventory
+expansion.
+
 ## Tests
 
 Focused tests prove:
@@ -193,8 +229,8 @@ Focused tests prove:
     continuity diagnostics.
 
 After focused tests, run the complete Torch suite, the 25-cell deterministic
-up/turn/down sweep, flat/legacy/dense CUDA qualification, authoritative MuJoCo
-FK, and the live viewer check.
+up/turn/down sweep, the command stress matrix, flat/legacy/dense CUDA
+qualification, authoritative MuJoCo FK, and the live viewer check.
 
 ## Alternatives Rejected
 

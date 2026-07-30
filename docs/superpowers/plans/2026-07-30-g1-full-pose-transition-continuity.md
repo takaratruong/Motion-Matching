@@ -709,7 +709,157 @@ git add sonic/python/mm_sonic/torch_terrain_directional_rollout.py \
 git commit -m "feat: benchmark directional stair transitions"
 ```
 
-### Task 6: Weight Sweep, Qualification, and Retained Evidence
+### Task 6: Challenging Independent-Command Stress Matrix
+
+**Files:**
+- Modify: `sonic/python/mm_sonic/torch_terrain_directional_rollout.py`
+- Modify: `tests/python/test_sonic_torch_terrain_directional_rollout.py`
+
+**Interfaces:**
+- Consumes: direct matcher velocity and heading commands, existing directional
+  metric primitives, zero-weight baseline, and one retained weight pair.
+- Produces: `challenge_scenarios() -> tuple[ChallengeScenario, ...]`.
+- Produces: `run_challenge_matrix(resolved, *, device, position_weight, velocity_weight) -> ChallengeMatrix`.
+- Produces: CLI mode `--challenge-matrix` and per-scenario saved evidence.
+
+- [ ] **Step 1: Write failing exact scenario-generation tests**
+
+Require six named deterministic scenarios:
+
+```text
+rapid-reversal
+lateral-switch
+independent-octants
+stair-stop-restart
+upper-landing-side-exit
+seeded-random
+```
+
+Assert rapid reversal alternates `+forward/-forward` every 10 frames while
+heading remains the fixed forward heading. Assert lateral switch alternates
+`+right/-right` every 15 frames with the same fixed heading. Assert the octant
+scenario contains all eight normalized planar directions and at least four
+headings that differ from travel direction.
+
+Assert the side-exit scenario contains the exact 280-frame ascent prefix,
+followed by both left and right lateral landing exits as separate reset
+episodes. Assert stop/restart includes zero-velocity matcher steps on the
+approach, stair, and landing rather than pausing the benchmark clock.
+
+- [ ] **Step 2: Write failing seeded-random determinism and bounding tests**
+
+Use NumPy `default_rng(20260730)`. Require command segments of 5 through 40
+frames (`0.10--0.80 s`), choices from zero plus eight unit travel directions,
+and independent choices from eight headings. Generate eight episodes, resetting
+the matcher between episodes, with no episode longer than 400 frames.
+
+Call the generator twice and compare every velocity/heading/reset bit pattern.
+Call it with a different seed and require a different command identity. Reject
+non-integer seeds, non-finite speeds, and non-positive episode bounds.
+
+- [ ] **Step 3: Write failing per-scenario acceptance tests**
+
+Build synthetic zero-weight and retained metrics. Assert one scenario failing
+clearance or raising an exception fails the complete matrix. Assert one
+scenario whose retained p95 joint jerk exceeds 110% of its baseline fails.
+Require at least four of six scenarios to reduce p95 joint jerk by 15% or more:
+
+```python
+ratio = retained_p95 / baseline_p95
+scenario_nonregression = ratio <= 1.10
+material_improvement = ratio <= 0.85
+matrix_pass = (
+    all(completed_without_exception)
+    and all(minimum_clearance_m >= -0.03)
+    and all(scenario_nonregression)
+    and sum(material_improvement) >= 4
+)
+```
+
+Handle an exact zero baseline jerk explicitly: retained must also be zero and
+the scenario counts as non-regressed but not materially improved.
+
+- [ ] **Step 4: Run challenge tests and verify RED**
+
+Run:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=sonic/python:. \
+  sonic/.torch-mm-venv/bin/python -B -m unittest \
+  tests.python.test_sonic_torch_terrain_directional_rollout -v
+```
+
+Expected: missing `ChallengeScenario`, `challenge_scenarios`, or
+`run_challenge_matrix`.
+
+- [ ] **Step 5: Implement immutable challenge commands**
+
+Add frozen dataclasses:
+
+```python
+@dataclass(frozen=True)
+class ChallengeCommand:
+    velocity_world_xy: tuple[float, float]
+    heading_world_yaw: float
+    reset_before: bool = False
+
+
+@dataclass(frozen=True)
+class ChallengeScenario:
+    name: str
+    commands: tuple[ChallengeCommand, ...]
+```
+
+Validate finite values and non-empty unique scenario names. Construct velocity
+and heading independently; never replace heading with `atan2(velocity)` in
+these scenarios. A reset creates a new matcher state and phase-local
+derivative history so acceleration/jerk never crosses reset boundaries.
+
+- [ ] **Step 6: Execute and save every scenario independently**
+
+For each scenario, build or reset the dense matcher, execute every command at
+`dt=0.02`, and collect the same emitted kinematics, clearance, selection,
+transition, rescue, and continuity evidence as the directional rollout.
+Catch an exception only at the scenario boundary: record its exact type,
+message, and failing command index, mark the scenario failed, and continue to
+the next scenario. Do not reinterpret a crash as completion or synthesize
+missing frames.
+
+Save each scenario under `<output>/<scenario-name>/` and write a top-level
+matrix verdict whose deterministic identity includes every command and
+non-timing result.
+
+- [ ] **Step 7: Add baseline-relative matrix evaluation**
+
+The CLI accepts:
+
+```text
+--challenge-matrix
+--baseline-root PATH
+```
+
+Without `--baseline-root`, save raw scenario metrics and identify the run as a
+baseline. With it, authenticate and load all six baseline scenarios, require
+identical command identities, compute per-scenario jerk ratios, and apply the
+frozen completion, clearance, 10% non-regression, and four-of-six 15%
+improvement rules.
+
+- [ ] **Step 8: Run challenge tests and verify GREEN**
+
+Run the Task 6 test command.
+
+Expected: all directional and challenge tests pass with deterministic commands
+and exact matrix verdicts.
+
+- [ ] **Step 9: Commit Task 6**
+
+```bash
+git add sonic/python/mm_sonic/torch_terrain_directional_rollout.py \
+  tests/python/test_sonic_torch_terrain_directional_rollout.py
+git commit -m "feat: stress terrain matcher commands"
+```
+
+### Task 7: Weight Sweep, Qualification, and Retained Evidence
 
 **Files:**
 - Modify: `sonic/configs/experiments/torch_stair_small.json`
@@ -718,8 +868,8 @@ git commit -m "feat: benchmark directional stair transitions"
 
 **Interfaces:**
 - Consumes: the 25 fixed `(position_weight, velocity_weight)` cells.
-- Produces: retained config weights, directional evidence, full terrain
-  qualification, MuJoCo-FK result, and live viewer verdict.
+- Produces: retained config weights, directional and stress evidence, full
+  terrain qualification, MuJoCo-FK result, and live viewer verdict.
 
 - [ ] **Step 1: Run and save the zero-weight baseline**
 
@@ -774,7 +924,43 @@ Write the selected values explicitly into
 `sonic/configs/experiments/torch_stair_small.json`. Re-run the selected cell
 using only config values and require a byte-identical deterministic hash.
 
-- [ ] **Step 4: Run the complete Torch suite**
+- [ ] **Step 4: Run the challenging command matrix**
+
+Save the zero-weight stress baseline:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=sonic/python:. \
+  sonic/.torch-mm-venv/bin/python -B \
+  -m mm_sonic.torch_terrain_directional_rollout \
+  --dataset build/torch-stair-small \
+  --config sonic/configs/experiments/torch_stair_small.json \
+  --device cuda:4 --position-weight 0 --velocity-weight 0 \
+  --challenge-matrix \
+  --output build/torch-stair-small-results/quality-loop-07/challenge/baseline
+```
+
+Then run the retained config against the authenticated baseline:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=sonic/python:. \
+  sonic/.torch-mm-venv/bin/python -B \
+  -m mm_sonic.torch_terrain_directional_rollout \
+  --dataset build/torch-stair-small \
+  --config sonic/configs/experiments/torch_stair_small.json \
+  --device cuda:4 --challenge-matrix \
+  --baseline-root \
+    build/torch-stair-small-results/quality-loop-07/challenge/baseline \
+  --output build/torch-stair-small-results/quality-loop-07/challenge/retained
+```
+
+Expected: all six scenarios complete with clearance at least `-0.03 m`; no
+scenario exceeds 110% of its zero-weight p95 joint jerk; at least four reduce
+p95 joint jerk by 15% or more. If any scenario fails, preserve it as a
+reproduction, identify its root cause, add a failing focused test, implement
+one isolated correction, and rerun the directional sweep plus complete stress
+matrix. Do not average away or manually waive a failed scenario.
+
+- [ ] **Step 5: Run the complete Torch suite**
 
 Run:
 
@@ -787,7 +973,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=sonic/python:. \
 Expected: zero failures; the existing protected real-data oracle may remain
 skipped by its explicit opt-in gate.
 
-- [ ] **Step 5: Run flat/legacy/dense CUDA qualification**
+- [ ] **Step 6: Run flat/legacy/dense CUDA qualification**
 
 Run:
 
@@ -804,7 +990,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=sonic/python:. \
 Expected: dense passes all five frozen acceptance criteria and reports no
 clearance below `-0.03 m`.
 
-- [ ] **Step 6: Run authoritative MuJoCo-FK clearance**
+- [ ] **Step 7: Run authoritative MuJoCo-FK clearance**
 
 Replay all 450 retained dense `joint_position`, `root_position_world`, and
 `root_orientation_world_wxyz` rows through:
@@ -819,21 +1005,23 @@ authenticated query grid, and report the minimum ankle-origin clearance.
 
 Expected: minimum at least `-0.03 m`, zero penetrating samples.
 
-- [ ] **Step 7: Request code review and address findings**
+- [ ] **Step 8: Request code review and address findings**
 
 Use the requesting-code-review workflow on all commits from Task 1 through
-Task 5. Review specifically:
+Task 6. Review specifically:
 
 - incumbent exemption;
 - zero-weight equivalence;
 - row-provenance alignment;
 - rescue ordering and transactional failure;
 - artifact backward compatibility; and
-- benchmark phase/derivative indexing.
+- benchmark phase/derivative indexing;
+- independent velocity/heading command generation; and
+- baseline-relative stress verdicts.
 
-Apply accepted corrections test-first and rerun Steps 4 through 6.
+Apply accepted corrections test-first and rerun Steps 4 through 7.
 
-- [ ] **Step 8: Launch prolonged interactive qualification**
+- [ ] **Step 9: Launch prolonged interactive qualification**
 
 Run:
 
@@ -852,7 +1040,7 @@ Do not call the candidate stable unless the process remains alive and the user
 confirms descent is visibly smoother. Lateral and side-exit traversal remain
 the next motion-inventory experiment and are not a hidden gate for this fix.
 
-- [ ] **Step 9: Record honest retained evidence**
+- [ ] **Step 10: Record honest retained evidence**
 
 Update the results document with:
 
@@ -862,6 +1050,7 @@ Update the results document with:
 - all 25 sweep cells and rejection reasons;
 - retained weights and deterministic identity;
 - separate ascent/reversal/descent metrics;
+- all six challenging-command baseline/retained comparisons;
 - full five-gate rollout and MuJoCo-FK results;
 - full test count;
 - live verdict; and
@@ -870,7 +1059,7 @@ Update the results document with:
 Mark every completed checkbox in this plan. Do not hide a weaker descent result
 inside an aggregate metric.
 
-- [ ] **Step 10: Commit configuration and evidence**
+- [ ] **Step 11: Commit configuration and evidence**
 
 ```bash
 git add sonic/configs/experiments/torch_stair_small.json \
