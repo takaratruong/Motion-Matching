@@ -112,8 +112,8 @@ class TerrainRolloutTests(unittest.TestCase):
             matcher.transition_settle_duration_s, 0.20
         )
         self.assertGreater(matcher.transition_settle_penalty, 0.0)
-        self.assertEqual(matcher.transition_joint_position_weight, 0.0)
-        self.assertEqual(matcher.transition_joint_velocity_weight, 0.0)
+        self.assertEqual(matcher.transition_joint_position_weight, 0.1)
+        self.assertEqual(matcher.transition_joint_velocity_weight, 0.1)
         self.assertEqual(matcher.transition_window_candidate_count, 32)
         self.assertEqual(matcher.transition_window_jerk_weight, 0.0)
         validator = terrain_transition_validator_from_resolved(
