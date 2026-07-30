@@ -32,7 +32,7 @@
     "stop_speed_mps": 0.05,
     "transition_penalty": 0.1,
     "transition_settle_duration_s": 0.2,
-    "transition_settle_penalty": 10.0,
+    "transition_settle_penalty": 18.75,
     "yaw_rate_rad_s": 2.0943951023931953
   },
   "query_scene": "stair/updown-0000/motion.npz",

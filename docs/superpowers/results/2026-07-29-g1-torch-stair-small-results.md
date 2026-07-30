@@ -371,3 +371,108 @@ participate in acceptance.
 The next step is user-controlled inspection in the native MuJoCo kinematic
 viewer. SONIC tracking, physics, and depth learning remain intentionally
 excluded until that inspection is satisfactory.
+
+---
+
+## 2026-07-30 Motion-Quality Loops 03–04
+
+**Retained after deterministic and user-controlled inspection.**
+
+The Loop 02 terrain preview was safe but visibly stuttered. The nine-second
+dense trace accepted 36 transitions, including nine pairs only one 20 ms frame
+apart. Each accepted transition restarted the Holden inertialization. Median
+joint acceleration at transition frames was `100.32 rad/s²`, compared with
+`14.14 rad/s²` across the rollout, directly matching the visible stutter.
+
+Loop 03 adds a blend-aware transition cost. Exact search still runs every
+20 ms. Non-incumbent candidates receive an additional cost that decays linearly
+to zero over `0.20 s`; the incumbent is never charged. The retained magnitude
+is `18.75`. This is hysteresis, not a hard cooldown: a sufficiently better
+candidate can still interrupt the active blend.
+
+Initial live testing found one priority defect that the straight scripted
+rollout did not exercise. Under arbitrary steering, hysteresis could retain an
+incumbent whose terrain preview had become unsafe. Loop 04 adds one bounded
+safety override: only in that case, exact selection is retried once with the
+additional settle cost set to zero. The retry must transition and its emitted
+window must pass the same terrain validator; otherwise preparation still fails
+closed without advancing matcher state. Every override is recorded explicitly.
+
+### Qualified results
+
+Artifacts:
+`build/torch-stair-small-results/quality-loop-04/full/`
+
+Device: `cuda:2`, NVIDIA L40S.
+
+| Value | Loop 02 | Retained 18.75 | Change |
+|---|---:|---:|---:|
+| Accepted transitions | 36 | 29 | -19% |
+| One-frame transition intervals | 9 | 1 | -89% |
+| Median transition interval (s) | 0.10 | 0.20 | +100% |
+| Transition joint acceleration median (rad/s²) | 100.32 | 72.73 | -28% |
+| Transition joint jerk median (rad/s³) | 5392.39 | 3620.72 | -33% |
+| Transition root jerk median (m/s³) | 298.80 | 178.74 | -40% |
+| Contact-foot speed proxy median (m/s) | 0.0837 | 0.0466 | -44% |
+| Contact-foot speed proxy p95 (m/s) | 0.6617 | 0.5719 | -14% |
+| Maximum progress (m) | 1.9905 | 1.9479 | -2% |
+| Maximum root-height gain (m) | 0.6083 | 0.6115 | +1% |
+| Matcher-body minimum clearance (m) | 0.03364 | 0.03388 | pass |
+| Full MuJoCo-FK minimum clearance (m) | 0.02934 | 0.02742 | pass |
+| Penetrating MuJoCo-FK samples | 0 | 0 | unchanged |
+| Rejected unsafe transitions | 15 | 28 | diagnostic |
+| Safety overrides in scripted rollout | unavailable | 0 | none needed |
+
+The remaining one-frame interval is isolated rather than part of the prior
+multi-frame switching burst. Transition-conditioned p95 joint jerk does not
+improve monotonically, so it remains a diagnostic rather than a claimed win.
+Median transition acceleration and jerk, overall p95 joint jerk, contact-foot
+motion, switching frequency, and the user's visual inspection all improve.
+
+The retained dense condition reaches 96.8% of reference horizontal progress
+and 96.9% of reference height gain, reaches the upper landing, and has zero
+penetration. It passes all five frozen acceptance criteria. The authoritative
+MuJoCo-FK minimum is the left ankle at output 237, `+0.027416 m` above the
+authenticated surface.
+
+### Controlled hysteresis ablation
+
+| Settle magnitude | Scripted result | Decision |
+|---:|---|---|
+| 5.0 | safe; 24 transitions; 3 one-frame intervals | superseded |
+| 10.0 | safe; 34 transitions; 1 one-frame interval | superseded |
+| 12.5 | safe; 29 transitions; lower median jerk | superseded |
+| 15.0 | safe; 29 transitions; lower sliding | superseded |
+| 17.5 | safe; 30 transitions; lower transition jerk | superseded |
+| 18.5 | safe; same selected kinematics as 18.75 | superseded |
+| **18.75** | safe; best retained boundary | **retain** |
+| 19.0 | unsafe incumbent, correctly failed closed | reject |
+| 20.0 | unsafe incumbent, correctly failed closed | reject |
+| 40.0 | unsafe incumbent, correctly failed closed | reject |
+
+Before the safety-override fix, 18.75 passed the straight scripted rollout but
+failed closed during user steering. After the fix, the same live test remained
+running and the user reported that motion was “much better.”
+
+### Identities and verification
+
+Deterministic rollout identities:
+
+- flat: `3d976c396e255d630c215540a729f2ad3403750da890c5a158de9987f05ead4f`;
+- legacy: `00a1f8e617aee84c71c7ec4fd4de8175d64439527ee07ea6591fae25623d40de`;
+- dense: `a46894f216ff9f3923bebfe76d40b7d97c9a322fd1873005ccd25cbb222785a7`.
+
+Verification:
+
+- deterministic flat/legacy/dense CUDA rollout: pass;
+- frozen dense acceptance: 5/5 pass;
+- 450-frame native MuJoCo forward-kinematics sweep: pass, zero penetration;
+- unsafe-incumbent safety override, unsafe retry, retained-incumbent retry, and
+  transactional state tests: pass;
+- flat 100-command no-extension equivalence: bitwise pass;
+- focused Torch regression: 74 tests pass, one protected real-data oracle
+  skipped by its explicit opt-in gate; and
+- user-controlled native MuJoCo viewer: stable and visually “much better.”
+
+The retained result remains kinematic and privileged-height. SONIC tracking,
+physics, depth estimation, and learned control remain outside this experiment.

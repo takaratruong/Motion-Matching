@@ -29,7 +29,7 @@
 - Consumes: `MatcherConfig`, `select_exact_candidate(...)`.
 - Produces: `active_transition_penalty(blend_age_s: float, config: MatcherConfig) -> float` and `select_exact_candidate(..., additional_transition_penalty: float = 0.0)`.
 
-- [ ] **Step 1: Write failing decay and selection tests**
+- [x] **Step 1: Write failing decay and selection tests**
 
 Add imports for `ContractError` and `active_transition_penalty`, then add tests that assert:
 
@@ -83,7 +83,7 @@ def test_additional_penalty_never_applies_to_incumbent(self):
 
 Also add subtests proving negative/non-finite ages, magnitudes, durations, and explicit additional penalties raise `ContractError`.
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 Run:
 
@@ -95,7 +95,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=sonic/python:. \
 
 Expected: import or constructor failures because the helper and configuration fields do not exist.
 
-- [ ] **Step 3: Add the minimal helper and selection input**
+- [x] **Step 3: Add the minimal helper and selection input**
 
 Extend `MatcherConfig`:
 
@@ -148,13 +148,13 @@ total_costs = (
 
 Continue overwriting the incumbent row with its raw feature cost.
 
-- [ ] **Step 4: Run focused and existing flat search tests**
+- [x] **Step 4: Run focused and existing flat search tests**
 
 Run the command from Step 2.
 
 Expected: all tests pass on CPU and CUDA when CUDA is available.
 
-- [ ] **Step 5: Commit the pure algorithm**
+- [x] **Step 5: Commit the pure algorithm**
 
 ```bash
 git add tests/python/test_sonic_torch_motion_search.py \
@@ -175,7 +175,7 @@ git commit -m "feat: add blend-aware transition cost"
 - Consumes: `active_transition_penalty(...)` and `select_exact_candidate(..., additional_transition_penalty=...)`.
 - Produces: exact matcher configuration reconstruction and runtime use of `_Offsets.elapsed_s`.
 
-- [ ] **Step 1: Write failing wiring tests**
+- [x] **Step 1: Write failing wiring tests**
 
 In the rollout configuration test, assert:
 
@@ -192,7 +192,7 @@ after reset and an accepted transition, and assert the
 `additional_transition_penalty` passed after reset is zero while the value
 passed immediately after the accepted transition is positive.
 
-- [ ] **Step 2: Run wiring tests and verify RED**
+- [x] **Step 2: Run wiring tests and verify RED**
 
 Run:
 
@@ -205,7 +205,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=sonic/python:. \
 
 Expected: failures because the new JSON keys and matcher runtime input are not wired.
 
-- [ ] **Step 3: Wire validated configuration and runtime state**
+- [x] **Step 3: Wire validated configuration and runtime state**
 
 Add `transition_settle_duration_s` and `transition_settle_penalty` to the
 rollout's exact matcher float-field set. Validate these two as finite and
@@ -233,13 +233,13 @@ Add the initial experiment values:
 "transition_settle_penalty": 10.0
 ```
 
-- [ ] **Step 4: Run focused wiring tests**
+- [x] **Step 4: Run focused wiring tests**
 
 Run the command from Step 2.
 
 Expected: all focused matcher and rollout tests pass.
 
-- [ ] **Step 5: Run the full Torch matcher suite**
+- [x] **Step 5: Run the full Torch matcher suite**
 
 Run:
 
@@ -251,7 +251,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=sonic/python:. \
 
 Expected: zero failures; the existing optional MuJoCo-dependent skip is allowed.
 
-- [ ] **Step 6: Commit runtime wiring**
+- [x] **Step 6: Commit runtime wiring**
 
 ```bash
 git add tests/python/test_sonic_torch_motion_matcher.py \
@@ -276,7 +276,7 @@ git commit -m "feat: settle terrain matcher transitions"
 - Produces: one bounded zero-hysteresis retry and
   `MotionMatchDiagnostics.hysteresis_overridden: bool`.
 
-- [ ] **Step 1: Write failing transactional safety-override tests**
+- [x] **Step 1: Write failing transactional safety-override tests**
 
 Build a matcher with active hysteresis and a scripted validator. Patch
 `select_exact_candidate` so its first decision retains the incumbent and its
@@ -301,7 +301,7 @@ Add separate tests proving an unsafe retry, a retry that retains the incumbent,
 and an unsafe incumbent with zero active penalty raise `ContractError` without
 advancing the committed sequence.
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 Run:
 
@@ -314,7 +314,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=sonic/python:. \
 Expected: the safe-override test raises `emitted-window incumbent is unsafe` and
 the diagnostic field does not exist.
 
-- [ ] **Step 3: Implement one bounded retry**
+- [x] **Step 3: Implement one bounded retry**
 
 Add `hysteresis_overridden: bool` to `MotionMatchDiagnostics` and thread it
 through `_make_result`, reset, normal steps, and rollout serialization.
@@ -327,13 +327,13 @@ emitted window. If it is safe, replace the original candidate and decision and
 set `hysteresis_overridden=True`. Otherwise raise `ContractError`. Do not loop
 or mutate `_state` before the existing commit boundary.
 
-- [ ] **Step 4: Save and validate the override diagnostic**
+- [x] **Step 4: Save and validate the override diagnostic**
 
 Add a boolean `hysteresis_overridden` row to deterministic rollout artifacts,
 event JSON, saved-array validation, and tests. Timing remains excluded from the
 deterministic digest; the new boolean is included.
 
-- [ ] **Step 5: Run focused and full suites**
+- [x] **Step 5: Run focused and full suites**
 
 Run:
 
@@ -349,7 +349,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=sonic/python:. \
 
 Expected: zero failures; the existing optional skip is allowed.
 
-- [ ] **Step 6: Commit the safety override**
+- [x] **Step 6: Commit the safety override**
 
 ```bash
 git add tests/python/test_sonic_torch_motion_matcher.py \
@@ -369,7 +369,7 @@ git commit -m "fix: let terrain safety override transition settling"
 - Consumes: frozen dataset `build/torch-stair-small` and the deterministic stair-rollout CLI.
 - Produces: one retained magnitude and a reproducible evidence directory.
 
-- [ ] **Step 1: Evaluate the initial magnitude**
+- [x] **Step 1: Evaluate the initial magnitude**
 
 Run the dense condition on `cuda:1` into a new iteration directory using the
 existing `mm_sonic.torch_terrain_rollout` CLI and the frozen config. Save the
@@ -377,7 +377,7 @@ rollout, events, resolved config, and metrics.
 
 Expected: all prior stair gates pass; otherwise the candidate is rejected.
 
-- [ ] **Step 2: Calculate the stutter report**
+- [x] **Step 2: Calculate the stutter report**
 
 From `rollout.npz`, report transition count, transition-interval quantiles,
 intervals at most `0.20 s`, source jumps, transition-conditioned joint/root
@@ -387,7 +387,7 @@ minimum clearance.
 Expected: no accepted transitions on consecutive `0.02 s` frames and lower
 transition-conditioned acceleration or jerk than quality-loop-02.
 
-- [ ] **Step 3: Sweep only hysteresis magnitude**
+- [x] **Step 3: Sweep only hysteresis magnitude**
 
 If the initial value fails either terrain gates or stutter diagnostics, evaluate
 the bounded set `5.0`, `20.0`, and `40.0`, holding duration at `0.20 s` and every
@@ -395,14 +395,14 @@ other parameter fixed. Reject candidates that fail terrain gates. Among passing
 candidates, retain the smallest magnitude that removes consecutive-frame
 transition bursts and minimizes transition-conditioned jerk.
 
-- [ ] **Step 4: Cross-check retained clearance with MuJoCo FK**
+- [x] **Step 4: Cross-check retained clearance with MuJoCo FK**
 
 Replay every saved `joint_position`, `root_position_world`, and
 `root_orientation_world_wxyz` through the pinned G1 XML with `mj_forward`.
 
 Expected: ankle-origin clearance is at least `-0.03 m`.
 
-- [ ] **Step 5: Update results and run final verification**
+- [x] **Step 5: Update results and run final verification**
 
 Record baseline and sweep values, the retained configuration, deterministic
 hash, exact commands, and any rejected candidates in the results document.
@@ -416,7 +416,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=sonic/python:. \
 
 Expected: zero failures; the existing optional skip is allowed.
 
-- [ ] **Step 6: Commit evidence**
+- [x] **Step 6: Commit evidence**
 
 ```bash
 git add sonic/configs/experiments/torch_stair_small.json \
@@ -424,7 +424,7 @@ git add sonic/configs/experiments/torch_stair_small.json \
 git commit -m "docs: qualify blend-aware terrain transitions"
 ```
 
-- [ ] **Step 7: Launch the retained interactive viewer**
+- [x] **Step 7: Launch the retained interactive viewer**
 
 Run:
 
