@@ -137,10 +137,18 @@ class TransitionContinuityDatabase:
                 torch.square(residual), dim=1
             )
 
+        total = position + velocity
+        for component in (position, velocity, total):
+            valid = torch.isfinite(component) & (component >= 0)
+            if not bool(torch.all(valid).item()):
+                raise ContractError(
+                    "continuity costs must be finite and non-negative"
+                )
+
         return TransitionContinuityCosts(
             position=position,
             velocity=velocity,
-            total=position + velocity,
+            total=total,
         )
 
 

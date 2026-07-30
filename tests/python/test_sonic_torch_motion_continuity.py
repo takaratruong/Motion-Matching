@@ -241,6 +241,43 @@ class TransitionContinuityDatabaseTests(unittest.TestCase):
             with self.subTest(call=invalid_call), self.assertRaises(ContractError):
                 invalid_call()
 
+    def test_costs_reject_finite_inputs_that_overflow_cost_vectors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = _continuity_folder(Path(tmp))
+
+        for device in _devices():
+            with self.subTest(device=device):
+                database = TransitionContinuityDatabase.from_folder(folder, device)
+                zero = torch.zeros(29, dtype=torch.float32, device=device)
+                extreme_state = torch.full(
+                    (29,),
+                    torch.finfo(torch.float32).max,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                invalid_calls = (
+                    lambda: database.costs(
+                        extreme_state,
+                        zero,
+                        position_weight=1,
+                        velocity_weight=0,
+                    ),
+                    lambda: database.costs(
+                        zero,
+                        zero,
+                        position_weight=1e300,
+                        velocity_weight=0,
+                    ),
+                )
+                for invalid_call in invalid_calls:
+                    with self.subTest(
+                        call=invalid_call
+                    ), self.assertRaisesRegex(
+                        ContractError,
+                        "continuity costs must be finite and non-negative",
+                    ):
+                        invalid_call()
+
     def test_zero_weights_return_exact_float32_zero_vectors(self):
         with tempfile.TemporaryDirectory() as tmp:
             database = TransitionContinuityDatabase.from_folder(
