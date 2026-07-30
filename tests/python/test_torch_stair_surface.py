@@ -75,8 +75,8 @@ class ZUpSurfaceTests(unittest.TestCase):
             return_value=_two_level_surface(),
         ):
             grid = build_source_height_grid(source, cell_size_m=1.0)
-        np.testing.assert_array_equal(grid.origin_xy, [-3.0, -3.0])
-        np.testing.assert_allclose(grid.maximum_xy, [3.0, 3.0])
+        np.testing.assert_array_equal(grid.origin_xy, [-3.5, -3.5])
+        np.testing.assert_allclose(grid.maximum_xy, [3.5, 3.5])
 
     def test_vertical_triangle_surface_returns_highest_z_and_flat_exterior(self):
         surface = _two_level_surface()

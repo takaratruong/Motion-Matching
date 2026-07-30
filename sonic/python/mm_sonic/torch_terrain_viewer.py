@@ -275,29 +275,40 @@ class PlaybackController:
             self.frame_index = 0
 
 
-def _mujoco_positions(
-    saved: SavedTerrainRollout,
-    g1_xml: Path,
-    frame_index: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    try:
-        import mujoco
-    except ImportError as error:
-        raise ContractError("mujoco is required to reconstruct the saved skeleton") from error
-    model = mujoco.MjModel.from_xml_path(str(g1_xml))
-    if model.nq != 36:
-        raise ContractError(f"G1 model nq must equal 36, got {model.nq}")
-    data = mujoco.MjData(model)
-    qpos = np.zeros(36, np.float64)
-    qpos[:3] = saved.arrays["root_position_world"][frame_index]
-    qpos[3:7] = saved.arrays["root_orientation_world_wxyz"][frame_index]
-    target = saved.arrays["joint_position"][frame_index]
-    source = np.empty(29, np.float64)
-    source[np.asarray(PINNED_TARGET_TO_SOURCE_PERMUTATION)] = target
-    qpos[7:] = source
-    data.qpos[:] = qpos
-    mujoco.mj_forward(model, data)
-    return data.xpos.copy(), np.asarray(model.body_parentid, np.int32)
+class _MujocoReconstructor:
+    def __init__(self, g1_xml: Path) -> None:
+        try:
+            import mujoco
+        except ImportError as error:
+            raise ContractError(
+                "mujoco is required to reconstruct the saved skeleton"
+            ) from error
+        self._mujoco = mujoco
+        self._model = mujoco.MjModel.from_xml_path(str(g1_xml))
+        if self._model.nq != 36:
+            raise ContractError(
+                f"G1 model nq must equal 36, got {self._model.nq}"
+            )
+        self._data = mujoco.MjData(self._model)
+        self._parents = np.asarray(
+            self._model.body_parentid, np.int32
+        ).copy()
+
+    def positions(
+        self, saved: SavedTerrainRollout, frame_index: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        qpos = np.zeros(36, np.float64)
+        qpos[:3] = saved.arrays["root_position_world"][frame_index]
+        qpos[3:7] = saved.arrays[
+            "root_orientation_world_wxyz"
+        ][frame_index]
+        target = saved.arrays["joint_position"][frame_index]
+        source = np.empty(29, np.float64)
+        source[np.asarray(PINNED_TARGET_TO_SOURCE_PERMUTATION)] = target
+        qpos[7:] = source
+        self._data.qpos[:] = qpos
+        self._mujoco.mj_forward(self._model, self._data)
+        return self._data.xpos.copy(), self._parents
 
 
 def _draw_saved_frame(
@@ -306,6 +317,7 @@ def _draw_saved_frame(
     *,
     g1_xml: Path,
     frame_index: int,
+    reconstructor: _MujocoReconstructor | None = None,
 ) -> None:
     axes.clear()
     height = saved.terrain_height_z
@@ -336,9 +348,9 @@ def _draw_saved_frame(
         antialiased=False,
     )
 
-    body_position, parents = _mujoco_positions(
-        saved, g1_xml, frame_index
-    )
+    if reconstructor is None:
+        reconstructor = _MujocoReconstructor(g1_xml)
+    body_position, parents = reconstructor.positions(saved, frame_index)
     for body in range(1, len(body_position)):
         parent = int(parents[body])
         if parent <= 0:
@@ -429,8 +441,13 @@ def render_saved_frame(
 
     figure = plt.figure(figsize=(10, 7), dpi=120)
     axes = figure.add_subplot(111, projection="3d")
+    reconstructor = _MujocoReconstructor(g1_xml)
     _draw_saved_frame(
-        axes, saved, g1_xml=g1_xml, frame_index=int(frame_index)
+        axes,
+        saved,
+        g1_xml=g1_xml,
+        frame_index=int(frame_index),
+        reconstructor=reconstructor,
     )
     figure.tight_layout()
     output_png = Path(output_png).resolve()
@@ -448,6 +465,7 @@ def show_saved_rollout(
     controller = PlaybackController(saved.frame_count)
     figure = plt.figure(figsize=(11, 8))
     axes = figure.add_subplot(111, projection="3d")
+    reconstructor = _MujocoReconstructor(g1_xml)
 
     def redraw() -> None:
         _draw_saved_frame(
@@ -455,6 +473,7 @@ def show_saved_rollout(
             saved,
             g1_xml=g1_xml,
             frame_index=controller.frame_index,
+            reconstructor=reconstructor,
         )
         figure.canvas.draw_idle()
 
@@ -498,6 +517,7 @@ def save_saved_video(
     output_mp4.parent.mkdir(parents=True, exist_ok=True)
     figure = plt.figure(figsize=(11, 8), dpi=120)
     axes = figure.add_subplot(111, projection="3d")
+    reconstructor = _MujocoReconstructor(g1_xml)
     writer = animation.FFMpegWriter(
         fps=fps,
         codec="libx264",
@@ -511,6 +531,7 @@ def save_saved_video(
                 saved,
                 g1_xml=g1_xml,
                 frame_index=frame_index,
+                reconstructor=reconstructor,
             )
             figure.tight_layout()
             writer.grab_frame()

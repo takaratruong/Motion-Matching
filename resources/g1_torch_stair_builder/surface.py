@@ -336,7 +336,7 @@ def build_source_height_grid(
     source: PinnedStairSource,
     *,
     cell_size_m: float = 0.02,
-    margin_m: float = 2.0,
+    margin_m: float = 2.5,
 ) -> ZUpHeightGrid:
     surface = load_source_surface(source)
     root_xy = np.asarray(source.robot_qpos_mujoco[:, :2], np.float64)
