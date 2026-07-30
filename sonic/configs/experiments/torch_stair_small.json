@@ -27,7 +27,7 @@
     "deceleration_mps2": 2.0,
     "exclusion_frames": 20,
     "inertialization_halflife_s": 0.1,
-    "joint_reference_smoothing_weight": 0.0,
+    "joint_reference_smoothing_weight": 0.2,
     "reversal_speed_mps": 0.15,
     "search_interval_steps": 1,
     "stop_speed_mps": 0.05,

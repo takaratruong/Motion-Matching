@@ -119,7 +119,7 @@ class TerrainRolloutTests(unittest.TestCase):
         self.assertEqual(matcher.transition_window_candidate_count, 32)
         self.assertEqual(matcher.transition_window_jerk_horizon_steps, 46)
         self.assertEqual(matcher.transition_window_jerk_weight, 0.0)
-        self.assertEqual(matcher.joint_reference_smoothing_weight, 0.0)
+        self.assertEqual(matcher.joint_reference_smoothing_weight, 0.2)
         validator = terrain_transition_validator_from_resolved(
             self.resolved
         )
