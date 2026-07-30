@@ -236,6 +236,7 @@ class TerrainRolloutTests(unittest.TestCase):
             ("searched", ()),
             ("transitioned", ()),
             ("transition_rejected", ()),
+            ("hysteresis_overridden", ()),
             ("motion_feature_cost", ()),
             ("terrain_feature_cost", ()),
             ("total_feature_cost", ()),
@@ -256,6 +257,10 @@ class TerrainRolloutTests(unittest.TestCase):
         self.assertEqual(
             rollout.metrics["rejected_transition_count"],
             int(arrays["transition_rejected"].sum()),
+        )
+        self.assertEqual(
+            rollout.metrics["hysteresis_override_count"],
+            int(arrays["hysteresis_overridden"].sum()),
         )
         np.testing.assert_allclose(
             arrays["motion_feature_cost"] + arrays["terrain_feature_cost"],

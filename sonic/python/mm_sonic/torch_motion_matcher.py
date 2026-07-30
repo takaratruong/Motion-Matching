@@ -520,6 +520,7 @@ class MotionMatchDiagnostics:
     searched: bool
     transitioned: bool
     transition_rejected: bool
+    hysteresis_overridden: bool
     force_search_reason: str | None
     search_time_ns: int | None
     step_time_ns: int
@@ -883,6 +884,7 @@ class TorchMotionMatcher:
         frame_index: int,
         decision: SearchDecision,
         transition_rejected: bool,
+        hysteresis_overridden: bool,
         force_reason: str | None,
         search_time_ns: int | None,
         step_start_ns: int,
@@ -908,6 +910,7 @@ class TorchMotionMatcher:
             searched=decision.searched,
             transitioned=decision.transitioned,
             transition_rejected=transition_rejected,
+            hysteresis_overridden=hysteresis_overridden,
             force_search_reason=force_reason,
             search_time_ns=search_time_ns,
             step_time_ns=time.perf_counter_ns() - step_start_ns,
@@ -976,6 +979,7 @@ class TorchMotionMatcher:
             frame_index=frame_index,
             decision=decision,
             transition_rejected=False,
+            hysteresis_overridden=False,
             force_reason=None,
             search_time_ns=None,
             step_start_ns=step_start,
@@ -1072,6 +1076,7 @@ class TorchMotionMatcher:
             state, shaped, decision.selected_row, successor
         )
         transition_rejected = False
+        hysteresis_overridden = False
         validator = self._emitted_window_validator
         if validator is not None:
             accepted = validator(candidate.dense_body_position.clone())
@@ -1081,38 +1086,79 @@ class TorchMotionMatcher:
                 )
             if not accepted:
                 if not candidate.transitioned:
-                    raise ContractError(
-                        "emitted-window incumbent is unsafe"
+                    if settle_penalty <= 0.0:
+                        raise ContractError(
+                            "emitted-window incumbent is unsafe"
+                        )
+                    retry_start = time.perf_counter_ns()
+                    retry_decision = select_exact_candidate(
+                        self.database,
+                        query,
+                        current_clip_index=state.clip_index,
+                        current_frame_index=state.frame_index,
+                        incumbent_row=successor,
+                        search=search,
+                        config=self.config,
+                        additional_transition_penalty=0.0,
                     )
-                if successor is None:
-                    raise ContractError(
-                        "unsafe transition has no incumbent"
+                    if search_time is not None:
+                        search_time += (
+                            time.perf_counter_ns() - retry_start
+                        )
+                    if not retry_decision.transitioned:
+                        raise ContractError(
+                            "hysteresis retry retained unsafe incumbent"
+                        )
+                    retry_candidate = self._compose_candidate(
+                        state,
+                        shaped,
+                        retry_decision.selected_row,
+                        successor,
                     )
-                incumbent = self._compose_candidate(
-                    state, shaped, successor, successor
-                )
-                incumbent_accepted = validator(
-                    incumbent.dense_body_position.clone()
-                )
-                if type(incumbent_accepted) is not bool:
-                    raise ContractError(
-                        "emitted-window validator must return exact bool"
+                    retry_accepted = validator(
+                        retry_candidate.dense_body_position.clone()
                     )
-                if not incumbent_accepted:
-                    raise ContractError(
-                        "emitted-window incumbent is unsafe"
+                    if type(retry_accepted) is not bool:
+                        raise ContractError(
+                            "emitted-window validator must return exact bool"
+                        )
+                    if not retry_accepted:
+                        raise ContractError(
+                            "hysteresis retry transition is unsafe"
+                        )
+                    decision = retry_decision
+                    candidate = retry_candidate
+                    hysteresis_overridden = True
+                else:
+                    if successor is None:
+                        raise ContractError(
+                            "unsafe transition has no incumbent"
+                        )
+                    incumbent = self._compose_candidate(
+                        state, shaped, successor, successor
                     )
-                candidate = incumbent
-                decision = SearchDecision(
-                    selected_row=successor,
-                    incumbent_row=successor,
-                    incumbent_cost=decision.incumbent_cost,
-                    selected_feature_cost=decision.incumbent_cost,
-                    selected_total_cost=decision.incumbent_cost,
-                    searched=decision.searched,
-                    transitioned=False,
-                )
-                transition_rejected = True
+                    incumbent_accepted = validator(
+                        incumbent.dense_body_position.clone()
+                    )
+                    if type(incumbent_accepted) is not bool:
+                        raise ContractError(
+                            "emitted-window validator must return exact bool"
+                        )
+                    if not incumbent_accepted:
+                        raise ContractError(
+                            "emitted-window incumbent is unsafe"
+                        )
+                    candidate = incumbent
+                    decision = SearchDecision(
+                        selected_row=successor,
+                        incumbent_row=successor,
+                        incumbent_cost=decision.incumbent_cost,
+                        selected_feature_cost=decision.incumbent_cost,
+                        selected_total_cost=decision.incumbent_cost,
+                        searched=decision.searched,
+                        transitioned=False,
+                    )
+                    transition_rejected = True
         residual_sq = torch.square(
             self.database._search_features[decision.selected_row] - query
         )
@@ -1139,6 +1185,7 @@ class TorchMotionMatcher:
             frame_index=candidate.frame_index,
             decision=decision,
             transition_rejected=transition_rejected,
+            hysteresis_overridden=hysteresis_overridden,
             force_reason=force_reason,
             search_time_ns=search_time,
             step_start_ns=step_start,

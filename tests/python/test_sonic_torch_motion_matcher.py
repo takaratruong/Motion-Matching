@@ -202,6 +202,189 @@ class TorchMotionMatcherTests(unittest.TestCase):
             config.transition_settle_penalty,
         )
 
+    def test_unsafe_settling_incumbent_retries_without_penalty(self):
+        arrays = build_varying_takara_arrays(frames=140)
+        validator = _ScriptedWindowValidator([True, False, True])
+        config = MatcherConfig(
+            search_interval_steps=1,
+            transition_settle_duration_s=0.20,
+            transition_settle_penalty=18.75,
+        )
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=config,
+                emitted_window_validator=validator,
+            )
+            reset = matcher.reset()
+            stop = matcher.folder.clips[0].valid_frame_stop
+            first_frame = (reset.diagnostics.selected_frame + 25) % stop
+            second_frame = (first_frame + 25) % stop
+            first = matcher.database.row_for_source(0, first_frame)
+            second = matcher.database.row_for_source(0, second_frame)
+            self.assertIsNotNone(first)
+            self.assertIsNotNone(second)
+
+            def scripted(database, normalized_query, **kwargs):
+                calls.append(dict(kwargs))
+                successor = kwargs["incumbent_row"]
+                if len(calls) == 1:
+                    return SearchDecision(
+                        first, successor, 10.0, 1.0, 1.1, True, True
+                    )
+                if len(calls) == 2:
+                    return SearchDecision(
+                        successor,
+                        successor,
+                        2.0,
+                        2.0,
+                        2.0,
+                        True,
+                        False,
+                    )
+                return SearchDecision(
+                    second, successor, 2.0, 1.0, 1.1, True, True
+                )
+
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher.select_exact_candidate",
+                side_effect=scripted,
+            ):
+                first_result = matcher.step((0.5, 0.0), 0.0)
+                result = matcher.step((0.5, 0.0), 0.0)
+
+        self.assertTrue(first_result.diagnostics.transitioned)
+        self.assertEqual(len(calls), 3)
+        self.assertGreater(
+            calls[1]["additional_transition_penalty"], 0.0
+        )
+        self.assertEqual(calls[2]["additional_transition_penalty"], 0.0)
+        self.assertTrue(result.diagnostics.transitioned)
+        self.assertTrue(result.diagnostics.hysteresis_overridden)
+        self.assertEqual(result.diagnostics.selected_frame, second_frame)
+        self.assertEqual(len(validator.windows), 3)
+
+    def test_unsafe_hysteresis_retry_fails_without_advancing_state(self):
+        arrays = build_varying_takara_arrays(frames=140)
+        validator = _ScriptedWindowValidator([True, False, False])
+        config = MatcherConfig(
+            search_interval_steps=1,
+            transition_settle_duration_s=0.20,
+            transition_settle_penalty=18.75,
+        )
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=config,
+                emitted_window_validator=validator,
+            )
+            reset = matcher.reset()
+            stop = matcher.folder.clips[0].valid_frame_stop
+            first_frame = (reset.diagnostics.selected_frame + 25) % stop
+            second_frame = (first_frame + 25) % stop
+            first = matcher.database.row_for_source(0, first_frame)
+            second = matcher.database.row_for_source(0, second_frame)
+            self.assertIsNotNone(first)
+            self.assertIsNotNone(second)
+
+            def scripted(database, normalized_query, **kwargs):
+                calls.append(dict(kwargs))
+                successor = kwargs["incumbent_row"]
+                if len(calls) == 1:
+                    return SearchDecision(
+                        first, successor, 10.0, 1.0, 1.1, True, True
+                    )
+                if len(calls) == 2:
+                    return SearchDecision(
+                        successor,
+                        successor,
+                        2.0,
+                        2.0,
+                        2.0,
+                        True,
+                        False,
+                    )
+                return SearchDecision(
+                    second, successor, 2.0, 1.0, 1.1, True, True
+                )
+
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher.select_exact_candidate",
+                side_effect=scripted,
+            ):
+                first_result = matcher.step((0.5, 0.0), 0.0)
+                with self.assertRaisesRegex(
+                    ContractError, "hysteresis retry.*unsafe"
+                ):
+                    matcher.prepare_step((0.5, 0.0), 0.0)
+
+        self.assertEqual(first_result.diagnostics.sequence, 1)
+        self.assertEqual(matcher._state.sequence, 1)
+        self.assertEqual(len(calls), 3)
+
+    def test_hysteresis_retry_must_leave_unsafe_incumbent(self):
+        arrays = build_varying_takara_arrays(frames=140)
+        validator = _ScriptedWindowValidator([True, False, True])
+        config = MatcherConfig(
+            search_interval_steps=1,
+            transition_settle_duration_s=0.20,
+            transition_settle_penalty=18.75,
+        )
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=config,
+                emitted_window_validator=validator,
+            )
+            reset = matcher.reset()
+            stop = matcher.folder.clips[0].valid_frame_stop
+            first_frame = (reset.diagnostics.selected_frame + 25) % stop
+            first = matcher.database.row_for_source(0, first_frame)
+            self.assertIsNotNone(first)
+
+            def scripted(database, normalized_query, **kwargs):
+                calls.append(dict(kwargs))
+                successor = kwargs["incumbent_row"]
+                if len(calls) == 1:
+                    return SearchDecision(
+                        first, successor, 10.0, 1.0, 1.1, True, True
+                    )
+                return SearchDecision(
+                    successor,
+                    successor,
+                    2.0,
+                    2.0,
+                    2.0,
+                    True,
+                    False,
+                )
+
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher.select_exact_candidate",
+                side_effect=scripted,
+            ):
+                first_result = matcher.step((0.5, 0.0), 0.0)
+                with self.assertRaisesRegex(
+                    ContractError, "retry retained unsafe incumbent"
+                ):
+                    matcher.prepare_step((0.5, 0.0), 0.0)
+
+        self.assertEqual(first_result.diagnostics.sequence, 1)
+        self.assertEqual(matcher._state.sequence, 1)
+        self.assertEqual(len(calls), 3)
+
     def test_unsafe_transition_falls_back_to_safe_incumbent_transactionally(
         self,
     ):

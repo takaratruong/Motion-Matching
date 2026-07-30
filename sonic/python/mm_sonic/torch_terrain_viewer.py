@@ -142,6 +142,7 @@ def load_saved_rollout(run_root: str | Path) -> SavedTerrainRollout:
         "terrain_feature_cost": (frames,),
         "total_feature_cost": (frames,),
         "selected_total_cost": (frames,),
+        "hysteresis_overridden": (frames,),
         "step_time_ns": (frames,),
         "joint_position": (frames, 29),
         "root_position_world": (frames, 3),
