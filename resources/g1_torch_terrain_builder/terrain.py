@@ -10,6 +10,7 @@ import math
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
+import xml.etree.ElementTree as ET
 
 import numpy as np
 
@@ -32,6 +33,8 @@ _DEFAULT_CHAIR_CONFIG = Path(
 _DEFAULT_CHAIR_CONFIG_SHA256 = (
     "c6187a72e9ab3126faa33b516d4f9f99e78539e764105236fed669007547da74"
 )
+_SCALED_STAIRCASE_SCALE = 0.8380952380952381
+_SCALED_STAIRCASE_SCENE_Y_M = -0.025
 
 
 @dataclass(frozen=True)
@@ -114,6 +117,82 @@ def _fixed_staircase(motion: NativeMotionArrays) -> ZUpHeightGrid:
         ),
         motion,
     )
+
+
+def _obj_bounds(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    vertices = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            fields = line.split()
+            if fields[:1] == ["v"] and len(fields) >= 4:
+                vertices.append(tuple(float(value) for value in fields[1:4]))
+    except Exception as error:
+        raise ValueError("scaled staircase OBJ cannot be parsed") from error
+    value = np.asarray(vertices, np.float64)
+    if (
+        value.ndim != 2
+        or value.shape[1:] != (3,)
+        or len(value) < 2
+        or not np.isfinite(value).all()
+    ):
+        raise ValueError("scaled staircase OBJ has invalid vertices")
+    return value.min(axis=0), value.max(axis=0)
+
+
+def _scaled_staircase_084(
+    source: ResolvedSource, motion: NativeMotionArrays
+) -> ZUpHeightGrid:
+    if len(source.geometry_paths) != 4:
+        raise ValueError("scaled staircase requires one URDF and three OBJs")
+    urdf, *objects = source.geometry_paths
+    try:
+        root = ET.parse(urdf).getroot()
+    except Exception as error:
+        raise ValueError("scaled staircase URDF cannot be parsed") from error
+    meshes = root.findall("./link/collision/geometry/mesh")
+    if root.tag != "robot" or root.get("name") != "multi_boxes":
+        raise ValueError("scaled staircase URDF identity is invalid")
+    if len(meshes) != 3:
+        raise ValueError("scaled staircase URDF must contain three meshes")
+    expected_names = tuple(path.name for path in objects)
+    actual_names = tuple(Path(mesh.get("filename", "")).name for mesh in meshes)
+    if actual_names != expected_names:
+        raise ValueError("scaled staircase URDF mesh identities changed")
+    scales = []
+    for mesh in meshes:
+        try:
+            scale = tuple(
+                float(value) for value in mesh.get("scale", "").split()
+            )
+        except Exception as error:
+            raise ValueError("scaled staircase URDF scale is invalid") from error
+        if (
+            len(scale) != 3
+            or not np.isfinite(scale).all()
+            or any(
+                abs(value - _SCALED_STAIRCASE_SCALE) > 1e-12
+                for value in scale
+            )
+        ):
+            raise ValueError("scaled staircase URDF scale changed")
+        scales.append(scale)
+    boxes = []
+    for path, scale in zip(objects, scales):
+        minimum, maximum = _obj_bounds(path)
+        minimum *= np.asarray(scale, np.float64)
+        maximum *= np.asarray(scale, np.float64)
+        minimum[1] += _SCALED_STAIRCASE_SCENE_Y_M
+        maximum[1] += _SCALED_STAIRCASE_SCENE_Y_M
+        boxes.append(
+            (
+                float(minimum[0]),
+                float(maximum[0]),
+                float(minimum[1]),
+                float(maximum[1]),
+                float(maximum[2]),
+            )
+        )
+    return _boxes_grid(tuple(boxes), motion)
 
 
 def _karen_boxes(path: Path) -> tuple[
@@ -240,6 +319,8 @@ def build_source_terrain(
     hashes = dict(_geometry_hashes(source))
     if adapter == "fixed-staircase":
         grid = _fixed_staircase(motion)
+    elif adapter == "scaled-staircase-084":
+        grid = _scaled_staircase_084(source, motion)
     elif adapter == "karen-metadata":
         if len(source.geometry_paths) != 1:
             raise ValueError("Karen terrain requires one metadata file")

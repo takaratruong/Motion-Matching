@@ -22,7 +22,7 @@ class ExpandedTerrainRegistryTests(unittest.TestCase):
             by_name["staircase-side-stepto"],
             (
                 "stair-local",
-                "aba4f13be96bb888acc99bdaec11ef2434195a28d5bb69c8803b6b03644be0be",
+                "e92ad315d8ed212a9fe9cd656199e5bf1389993530ddc2850a4dbe113e0ef18c",
             ),
         )
         self.assertEqual(
@@ -44,10 +44,11 @@ class ExpandedTerrainRegistryTests(unittest.TestCase):
             for spec in CANDIDATE_SPECS
             if spec.logical_name == "staircase-side-stepto"
         )
+        self.assertEqual(side.terrain_adapter, "scaled-staircase-084")
         self.assertEqual(
             side.geometry_sha256,
             (
-                "d521bf511bce8511652af961d624579a312ec4350fbb2e5b5fab717e9b7965ca",
+                "78b560b01880e7202f5d36cf55cb66ab8ab98189fdb3f152c4406bf17557ac2f",
                 "412cab2eb06f0501d20009823c7127c5293257d87b1e86ffdb3da2c7697ec5de",
                 "8d3e9e204fa2646dbac9726ffe0da163f0b5811259981a76ee49c420079ff22c",
                 "dc8679af4fa022512613f42e340567fe9ec27697e71613f9d1b9695a767b1ca4",

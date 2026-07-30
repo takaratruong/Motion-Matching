@@ -91,6 +91,61 @@ class ExpandedTerrainAdapterTests(unittest.TestCase):
         self.assertEqual(evidence.adapter, "fixed-staircase")
         self.assertEqual(evidence.motion_to_terrain_xy_yaw, (0.0, 0.0, 0.0))
 
+    def test_scaled_staircase_uses_pinned_urdf_scale_and_scene_offset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            urdf = root / "stairs.urdf"
+            objects = tuple(root / f"box{index}.obj" for index in range(1, 4))
+            y_bounds = ((-0.345, 0.0), (-0.01, 0.335), (0.334, 0.999))
+            for index, (path, (minimum_y, maximum_y)) in enumerate(
+                zip(objects, y_bounds), start=1
+            ):
+                top = 0.17 * index
+                path.write_text(
+                    "\n".join(
+                        (
+                            f"v -0.542 {minimum_y} 0",
+                            f"v 0.620 {maximum_y} {top}",
+                        )
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+            urdf.write_text(
+                """<?xml version="1.0"?>
+<robot name="multi_boxes">
+  <link name="world"/>
+  <link name="multi_boxes_box1_link"><collision><geometry>
+    <mesh filename="box1.obj" scale="0.8380952380952381 0.8380952380952381 0.8380952380952381"/>
+  </geometry></collision></link>
+  <link name="multi_boxes_box2_link"><collision><geometry>
+    <mesh filename="box2.obj" scale="0.8380952380952381 0.8380952380952381 0.8380952380952381"/>
+  </geometry></collision></link>
+  <link name="multi_boxes_box3_link"><collision><geometry>
+    <mesh filename="box3.obj" scale="0.8380952380952381 0.8380952380952381 0.8380952380952381"/>
+  </geometry></collision></link>
+</robot>
+""",
+                encoding="utf-8",
+            )
+            evidence = build_source_terrain(
+                _source(
+                    root,
+                    family="stair-local",
+                    terrain_adapter="scaled-staircase-084",
+                    geometry=(urdf, *objects),
+                ),
+                _motion(),
+            )
+        np.testing.assert_allclose(
+            evidence.grid.sample_xy(
+                np.array([[0.0, -0.10], [0.0, 0.50]], np.float32)
+            ),
+            [0.14247619, 0.42742857],
+            atol=0.011,
+        )
+        self.assertEqual(evidence.adapter, "scaled-staircase-084")
+
     def test_karen_metadata_builds_exact_declared_boxes(self):
         metadata = {
             "axis_conversion": "fbx_y_up_to_z_up_with_negated_y",

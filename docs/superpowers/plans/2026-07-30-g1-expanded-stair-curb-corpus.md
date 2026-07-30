@@ -45,7 +45,7 @@ exact motion identities already measured on this host:
 EXPECTED = {
     "staircase-side-stepto": (
         "stair-local",
-        "aba4f13be96bb888acc99bdaec11ef2434195a28d5bb69c8803b6b03644be0be",
+        "e92ad315d8ed212a9fe9cd656199e5bf1389993530ddc2850a4dbe113e0ef18c",
     ),
     "staircase-final-v3": (
         "stair-local",
@@ -97,7 +97,10 @@ class SourceSpec:
     family: Literal["grail", "stair-local", "stair-karen", "curb-chair"]
     motion_relative_path: str
     motion_sha256: str
-    terrain_adapter: Literal["grail-usd", "fixed-staircase", "karen-metadata", "chair-object"]
+    terrain_adapter: Literal[
+        "grail-usd", "fixed-staircase", "scaled-staircase-084",
+        "karen-metadata", "chair-object",
+    ]
     geometry_relative_paths: tuple[str, ...]
     expected_layout: str = "g1-29dof-isaaclab-v1"
 
@@ -121,8 +124,8 @@ PINNED_LOCAL_MOTIONS = (
      "72ed7871b8ef1feffc650bd36107707bfcc293b79741edda1455894d0d6ffb67"),
     ("staircase-final-v3", "staircase_final_v3:v0/motion.npz",
      "22e80e8787a13a9c946b745a58fba6a0a4ffba658bbd50d8ecd9ffc2159af1b6"),
-    ("staircase-side-stepto", "staircase_side_stepto_isaac.npz",
-     "aba4f13be96bb888acc99bdaec11ef2434195a28d5bb69c8803b6b03644be0be"),
+    ("staircase-side-stepto", "staircase_side_stepto:v1/motion.npz",
+     "e92ad315d8ed212a9fe9cd656199e5bf1389993530ddc2850a4dbe113e0ef18c"),
     ("up-continuous-33", "up_continuous_33.npz:v0/motion.npz",
      "03da1a99a161327fd6650e8b304934e182ab34b3ff9ec8cc0978c69700a6696c"),
     ("down-continuous-33", "down_continuous_33.npz:v0/motion.npz",
@@ -175,6 +178,15 @@ FIXED_STAIR_GEOMETRY_SHA256 = {
         "dc8679af4fa022512613f42e340567fe9ec27697e71613f9d1b9695a767b1ca4",
 }
 ```
+
+The finalized `staircase-side-stepto` artifact was produced against the
+0.8380952380952381-scale staircase at scene Y offset -0.025 m, not the
+unscaled geometry. Pin
+`staircase/multi_boxes_scaled_0.84_0.84_0.84.urdf` at
+`78b560b01880e7202f5d36cf55cb66ab8ab98189fdb3f152c4406bf17557ac2f`,
+pin the same three OBJ identities, and use `scaled-staircase-084` for this
+candidate. Parse the checked collision mesh scales and OBJ bounds rather than
+relaxing the contact oracle.
 
 The chair adapter also pins
 `rmr_tracking/.../chair_step/chair_step_env_cfg.py` to
@@ -388,7 +400,8 @@ self.assertLessEqual(report.contact_height_error_m["p95"], 0.035)
 
 Add one test per rejection code:
 `layout_unproven`, `fk_mismatch`, `insufficient_contact_samples`,
-`contact_alignment_failed`, `exact_duplicate`, and
+`insufficient_elevated_contact_samples`, `contact_alignment_failed`,
+`exact_duplicate`, and
 `missing_authoritative_terrain`.
 
 - [ ] **Step 2: Run admission tests and verify RED**
@@ -407,6 +420,7 @@ class AdmissionReport:
     reason: str | None
     output_frames: int
     contact_sample_count: int
+    elevated_contact_sample_count: int
     contact_height_error_m: Mapping[str, float]
     fk_position_error_m: Mapping[str, float]
     duplicate_of: str | None
@@ -425,7 +439,9 @@ def admit_candidate(
 Contact-like samples require ankle-origin clearance near 0.035 m and bounded
 vertical foot speed. FK compares root/joint reconstructed bodies with published
 body positions. Process candidates in registry order so exact-duplicate
-ownership is deterministic.
+ownership is deterministic. If the grid contains elevated terrain, require at
+least 25 aligned elevated contact samples so flat approach/exit frames alone
+cannot authenticate a stair or curb transform.
 
 - [ ] **Step 4: Run admission tests and verify GREEN**
 

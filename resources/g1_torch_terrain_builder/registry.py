@@ -14,13 +14,23 @@ from resources.g1_torch_stair_builder.corpus import STAIR_BASES
 SourceFamily = Literal["grail", "stair-local", "stair-karen", "curb-chair"]
 SourceAdapter = Literal["grail-record", "native-npz"]
 TerrainAdapter = Literal[
-    "grail-usd", "fixed-staircase", "karen-metadata", "chair-object"
+    "grail-usd",
+    "fixed-staircase",
+    "scaled-staircase-084",
+    "karen-metadata",
+    "chair-object",
 ]
 
 _FAMILIES = frozenset(("grail", "stair-local", "stair-karen", "curb-chair"))
 _SOURCE_ADAPTERS = frozenset(("grail-record", "native-npz"))
 _TERRAIN_ADAPTERS = frozenset(
-    ("grail-usd", "fixed-staircase", "karen-metadata", "chair-object")
+    (
+        "grail-usd",
+        "fixed-staircase",
+        "scaled-staircase-084",
+        "karen-metadata",
+        "chair-object",
+    )
 )
 _HEX = frozenset("0123456789abcdef")
 
@@ -109,6 +119,18 @@ _FIXED_GEOMETRY_HASHES = (
     "8d3e9e204fa2646dbac9726ffe0da163f0b5811259981a76ee49c420079ff22c",
     "dc8679af4fa022512613f42e340567fe9ec27697e71613f9d1b9695a767b1ca4",
 )
+_SCALED_084_GEOMETRY = (
+    "staircase/multi_boxes_scaled_0.84_0.84_0.84.urdf",
+    "staircase/box_models/box1.obj",
+    "staircase/box_models/box2.obj",
+    "staircase/box_models/box3.obj",
+)
+_SCALED_084_GEOMETRY_HASHES = (
+    "78b560b01880e7202f5d36cf55cb66ab8ab98189fdb3f152c4406bf17557ac2f",
+    "412cab2eb06f0501d20009823c7127c5293257d87b1e86ffdb3da2c7697ec5de",
+    "8d3e9e204fa2646dbac9726ffe0da163f0b5811259981a76ee49c420079ff22c",
+    "dc8679af4fa022512613f42e340567fe9ec27697e71613f9d1b9695a767b1ca4",
+)
 
 _GRAIL_ROBOT_HASHES = (
     "5d7b39d9d1386c4c152e05a9f4036d59b9bb14b2b2adfcb3c4bf1f2c4f012162",
@@ -171,7 +193,7 @@ _LOCAL_IDENTITIES = (
     ("staircase-final", "stair-local", "staircase_final:v0/motion.npz", "846fc49ef5a6a628353f4644fb989b5341ee0a8f73f26aa72f1c09346a69065b", "fixed-staircase", _FIXED_GEOMETRY, _FIXED_GEOMETRY_HASHES),
     ("staircase-final-2", "stair-local", "staircase_final_2:v0/motion.npz", "72ed7871b8ef1feffc650bd36107707bfcc293b79741edda1455894d0d6ffb67", "fixed-staircase", _FIXED_GEOMETRY, _FIXED_GEOMETRY_HASHES),
     ("staircase-final-v3", "stair-local", "staircase_final_v3:v0/motion.npz", "22e80e8787a13a9c946b745a58fba6a0a4ffba658bbd50d8ecd9ffc2159af1b6", "fixed-staircase", _FIXED_GEOMETRY, _FIXED_GEOMETRY_HASHES),
-    ("staircase-side-stepto", "stair-local", "staircase_side_stepto_isaac.npz", "aba4f13be96bb888acc99bdaec11ef2434195a28d5bb69c8803b6b03644be0be", "fixed-staircase", _FIXED_GEOMETRY, _FIXED_GEOMETRY_HASHES),
+    ("staircase-side-stepto", "stair-local", "staircase_side_stepto:v1/motion.npz", "e92ad315d8ed212a9fe9cd656199e5bf1389993530ddc2850a4dbe113e0ef18c", "scaled-staircase-084", _SCALED_084_GEOMETRY, _SCALED_084_GEOMETRY_HASHES),
     ("up-continuous-33", "stair-local", "up_continuous_33.npz:v0/motion.npz", "03da1a99a161327fd6650e8b304934e182ab34b3ff9ec8cc0978c69700a6696c", "fixed-staircase", _FIXED_GEOMETRY, _FIXED_GEOMETRY_HASHES),
     ("down-continuous-33", "stair-local", "down_continuous_33.npz:v0/motion.npz", "ca05856c8fe06f8d01e8a91bd300e118c28852b641a1c1154415c06a99c5eb3b", "fixed-staircase", _FIXED_GEOMETRY, _FIXED_GEOMETRY_HASHES),
     ("walk-up-33", "stair-local", "walk_up_33.npz:v0/motion.npz", "1158fb751c8d6ee1be19e878e12ab35042b7127559e44cb941279e0dbf0b378f", "fixed-staircase", _FIXED_GEOMETRY, _FIXED_GEOMETRY_HASHES),
