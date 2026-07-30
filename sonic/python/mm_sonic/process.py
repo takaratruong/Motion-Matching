@@ -3742,7 +3742,6 @@ class SimulationPolicyGate:
         self._release_token = object()
         self._release_sequence = 0
         self._prepared_release: PreparedSimulationRelease | None = None
-        self._used_releases: set[int] = set()
 
     def _require_bound_sim_dt(self) -> None:
         current = self.simulator.sim_dt
@@ -3851,12 +3850,10 @@ class SimulationPolicyGate:
             or prepared._owner_token is not self._release_token
             or prepared._base_release_sequence != self._release_sequence
             or self._prepared_release is not prepared
-            or id(prepared) in self._used_releases
         ):
             raise RuntimeError("simulation release is foreign, stale, or already used")
         # Mark terminal before touching physics: an ARMED release is never safe
         # to retry after an ambiguous simulator failure.
-        self._used_releases.add(id(prepared))
         self._prepared_release = None
         result: AdvanceResult | None = None
         operation_error: BaseException | None = None
