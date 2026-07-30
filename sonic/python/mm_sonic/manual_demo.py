@@ -795,11 +795,265 @@ def _run_responsive_x11_loop(
     return camera_box[0]
 
 
+def _run_torch_demo(
+    namespace: argparse.Namespace, *, episode_ordinal: int
+) -> Path:
+    """Run the low-latency flat demo without constructing a C++ MM client."""
+    # Keep Torch optional for every existing baseline import/test path.
+    import mujoco
+
+    from .torch_motion_matcher import TorchMotionMatcher
+    from .torch_motion_sonic import (
+        SonicReferenceAdapter,
+        TorchMotionCommitter,
+        canonical_target_buffer_from_match,
+        initial_qpos_from_match,
+    )
+
+    if namespace.mode != "interactive" or namespace.input_source != "x11":
+        raise ContractError("Torch backend currently requires interactive X11 mode")
+    if namespace.scene_id != "sonic-flat-baseline":
+        raise ContractError("Torch backend currently requires sonic-flat-baseline")
+    if float(namespace.terrain_weight) != 0.0:
+        raise ContractError("Torch backend requires --terrain-weight 0")
+    if not namespace.motions_dir:
+        raise ContractError("Torch backend requires --motions-dir")
+    motions_dir = Path(namespace.motions_dir).expanduser().resolve(strict=True)
+    if not motions_dir.is_dir():
+        raise ContractError("--motions-dir must resolve to a directory")
+    output_root = Path(namespace.output_root).expanduser().resolve()
+    source_run = Path(namespace.source_run).expanduser().resolve(strict=True)
+    gear_checkout = Path(namespace.gear_checkout).expanduser().resolve(strict=True)
+    runtime = Path(namespace.runtime).expanduser().resolve(strict=True)
+    terrain_dir = Path(namespace.terrain_dir).expanduser().resolve(strict=True)
+    run_id = _utc_run_id()
+    bundle = RunBundle.create(output_root, "manual-sonic-torch", run_id)
+    scene_xml, _scene_control = _copy_scene(bundle, source_run)
+    environment = _environment(terrain_dir)
+    cancellation = threading.Event()
+    restart = threading.Event()
+    restart_armed = threading.Event()
+
+    print(
+        f"Loading Torch matcher on {namespace.torch_device}: {motions_dir}",
+        flush=True,
+    )
+    matcher = TorchMotionMatcher.from_folder(
+        motions_dir, device=namespace.torch_device
+    )
+    reset_result = matcher.reset()
+    model = mujoco.MjModel.from_xml_path(str(scene_xml))
+    initial_qpos = initial_qpos_from_match(
+        reset_result, base_qpos=model.qpos0
+    )
+    owned_closers: list[Callable[[], None]] = []
+    try:
+        publisher = PosePublisher(
+            "tcp://127.0.0.1:*",
+            bundle=bundle,
+            default_hand_targets=NEUTRAL_HAND_TARGETS,
+        )
+        owned_closers.insert(0, publisher.close)
+        base_command = (
+            str(
+                gear_checkout
+                / "gear_sonic_deploy/target/release/g1_deploy_onnx_ref"
+            ),
+            "lo",
+            str(runtime / "model_decoder.onnx"),
+            str(source_run / "known-good/reference-base"),
+            "--obs-config",
+            str(runtime / "observation_config.yaml"),
+            "--encoder-file",
+            str(runtime / "model_encoder.onnx"),
+        )
+        gear = GearProcess(
+            run_root=bundle.path,
+            command=_stream_gear_command(base_command, publisher.endpoint),
+            target_motion_logfile=bundle.path / "target.csv",
+            logs_dir=bundle.path / "gear-logs",
+            stdout_archive=bundle.path / "gear.stdout",
+            stderr_archive=bundle.path / "gear.stderr",
+            launch_profile="zmq_stream",
+            simulation_control_gate=True,
+            readiness_timeout_s=120.0,
+            cancelled=cancellation.is_set,
+            env=environment,
+            cwd=gear_checkout / "gear_sonic_deploy",
+        )
+        owned_closers.insert(0, gear.close)
+        simulator = GatedSimulatorClient(
+            run_root=bundle.path,
+            gear_checkout=gear_checkout,
+            unpaced_physics=False,
+            onscreen=namespace.onscreen,
+            freeze_on_fall=namespace.onscreen,
+            stdout_archive=bundle.path / "simulator.stdout",
+            stderr_archive=bundle.path / "simulator.stderr",
+            cancelled=cancellation.is_set,
+            env=environment,
+            cwd=_REPOSITORY_ROOT,
+        )
+        owned_closers.insert(0, simulator.close)
+    except BaseException as construction_error:
+        cancellation.set()
+        _close_resiliently(owned_closers, primary=construction_error)
+        raise
+
+    recorder = CommandRecorder(
+        mode=namespace.mode,
+        preload_chunks=0,
+        hand_targets=NEUTRAL_HAND_TARGETS,
+    )
+    gate: SimulationPolicyGate | None = None
+    try:
+        simulator.hello()
+        simulator.reset(
+            scene_xml=scene_xml,
+            initial_qpos=initial_qpos,
+            lateral_offset_m=0.0,
+            yaw_offset_rad=0.0,
+            log_dir=bundle.path / "bootstrap-sim-logs",
+            elastic_band_enabled=True,
+        )
+        print("Starting GEAR and publishing Torch rows 0..45...", flush=True)
+        _drive_simulator_until(
+            gear.start_to_wait_for_control,
+            simulator,
+            label="torch-wait-for-control",
+            ready_for_bootstrap=lambda: gear.startup_markers_ready,
+            cancellation=cancellation,
+        )
+
+        def prepare_stream() -> None:
+            gear.enable_stream_for_preload()
+            initial_buffer = canonical_target_buffer_from_match(
+                reset_result, global_frame_start=0
+            )
+            boundary = gear.publication_boundary()
+            publisher.send(initial_buffer, phase="readiness")
+            gear.wait_for_stream_processing(
+                boundary,
+                frame_count=46,
+                global_start=0,
+                merged_count=46,
+            )
+
+        _drive_simulator_until(
+            prepare_stream,
+            simulator,
+            label="torch-stream-preload",
+            cancellation=cancellation,
+        )
+        gear.stop_group()
+        _reset_and_prime_scored_epoch(
+            gear,
+            simulator,
+            scene_xml=scene_xml,
+            initial_qpos=initial_qpos,
+            log_dir=bundle.path / "scored-sim-logs",
+        )
+        ratio = 0.02 / simulator.sim_dt
+        steps_per_policy = round(ratio)
+        if steps_per_policy <= 0 or not math.isclose(
+            steps_per_policy * simulator.sim_dt,
+            0.02,
+            rel_tol=0.0,
+            abs_tol=1.0e-12,
+        ):
+            raise ContractError("0.02 / SIMULATE_DT must be an exact integer")
+
+        provider = X11KeyStateProvider()
+        initial_heading = _heading_yaw_rad(
+            tuple(float(value) for value in initial_qpos[3:7])
+        )
+        mapper = HoldenControlMapper(
+            initial_heading_yaw_rad=initial_heading,
+            heading_frame_offset_yaw_rad=0.0,
+        )
+        with ContinuousControlLoop(
+            provider,
+            mapper,
+            event_sink=_print_terminal_event,
+            cancel_event=cancellation,
+            restart_event=restart,
+            restart_armed_event=restart_armed,
+        ) as control_loop:
+
+            def wait_for_initial_input() -> None:
+                _wait_for_x11_target(
+                    provider, control_loop, cancellation=cancellation
+                )
+                print(
+                    "LIVE TORCH MM: W/A/S/D move, Ctrl+arrows strafe/face, "
+                    "Space stand, Backspace restart, X exit.",
+                    flush=True,
+                )
+                restart_armed.set()
+
+            gate = _activate_scored_control(
+                gear,
+                simulator,
+                before_control=wait_for_initial_input,
+            )
+            adapter = SonicReferenceAdapter(
+                publisher,
+                gate,
+                initial_acked_sequence=0,
+                initial_global_frame_end=45,
+            )
+            committer = TorchMotionCommitter(
+                matcher=matcher,
+                adapter=adapter,
+                gate=gate,
+                recorder=recorder,
+                steps_per_policy=steps_per_policy,
+            )
+            camera_state = _initial_camera_delivery_state(namespace.onscreen)
+            for _ in range(namespace.chunks):
+                _poll_live_boundary(control_loop, restart, cancellation)
+                snapshot, mapped = control_loop.mailbox.sample_intent(
+                    committer.next_command_index
+                )
+                if snapshot.command is None:
+                    break
+                camera_state = _deliver_camera(
+                    simulator=simulator,
+                    mapped=mapped,
+                    camera_state=camera_state,
+                    event_sink=_print_terminal_event,
+                    camera_disabled_prefix="Torch camera disabled",
+                )
+                revision = snapshot.revision
+                record = committer.run_one_step(
+                    snapshot.command,
+                    command_is_current=lambda _command: (
+                        control_loop.mailbox.current_revision <= revision
+                    ),
+                )
+                if record.command_index % 25 == 0:
+                    velocity = snapshot.command.requested_velocity_mujoco
+                    print(
+                        f"torch boundary {record.command_index:05d} "
+                        f"source={record.selected_frame:05d} "
+                        f"vx={velocity[0]:+.2f} vy={velocity[1]:+.2f}",
+                        flush=True,
+                    )
+        if restart.is_set() and not cancellation.is_set():
+            raise OperatorRestartRequested
+        return bundle.path
+    finally:
+        cancellation.set()
+        _close_resiliently(owned_closers)
+
+
 def run_demo(
     namespace: argparse.Namespace, *, episode_ordinal: int = 1
 ) -> Path:
     if type(episode_ordinal) is not int or episode_ordinal <= 0:
         raise ContractError("episode ordinal must be a positive integer")
+    if getattr(namespace, "motion_backend", "cpp") == "torch":
+        return _run_torch_demo(namespace, episode_ordinal=episode_ordinal)
     responsive = bool(getattr(namespace, "responsive", False))
     if responsive and (
         namespace.mode != "interactive" or namespace.input_source != "x11"
@@ -1412,6 +1666,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--chunks", type=int, default=30)
     parser.add_argument("--preload-chunks", type=int, default=None)
     parser.add_argument("--onscreen", action="store_true")
+    parser.add_argument(
+        "--motion-backend", choices=("cpp", "torch"), default="cpp"
+    )
+    parser.add_argument("--motions-dir", default=None)
+    parser.add_argument(
+        "--torch-device", choices=("auto", "cpu", "cuda"), default="auto"
+    )
     parser.add_argument("--responsive", action="store_true")
     parser.add_argument(
         "--responsive-source-intervals",

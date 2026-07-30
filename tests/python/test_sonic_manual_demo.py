@@ -53,6 +53,20 @@ class _StopAfterSimulator(Exception):
 
 
 class X11TargetReadinessTests(unittest.TestCase):
+    def test_torch_backend_parser_is_explicit_and_opt_in(self) -> None:
+        default = _parser().parse_args([])
+        self.assertEqual(default.motion_backend, "cpp")
+        args = _parser().parse_args(
+            [
+                "--motion-backend", "torch",
+                "--motions-dir", "/tmp/motions",
+                "--torch-device", "cuda",
+            ]
+        )
+        self.assertEqual(args.motion_backend, "torch")
+        self.assertEqual(args.motions_dir, "/tmp/motions")
+        self.assertEqual(args.torch_device, "cuda")
+
     def test_restart_check_raises_only_when_requested(self) -> None:
         event = threading.Event()
         _raise_if_restart_requested(event)
