@@ -39,6 +39,20 @@ class ExpandedTerrainRegistryTests(unittest.TestCase):
                 "69c545d85349033d1dbdc41041ea2baec730e3700f16dd1075c53fd08c99dc76",
             ),
         )
+        side = next(
+            spec
+            for spec in CANDIDATE_SPECS
+            if spec.logical_name == "staircase-side-stepto"
+        )
+        self.assertEqual(
+            side.geometry_sha256,
+            (
+                "d521bf511bce8511652af961d624579a312ec4350fbb2e5b5fab717e9b7965ca",
+                "412cab2eb06f0501d20009823c7127c5293257d87b1e86ffdb3da2c7697ec5de",
+                "8d3e9e204fa2646dbac9726ffe0da163f0b5811259981a76ee49c420079ff22c",
+                "dc8679af4fa022512613f42e340567fe9ec27697e71613f9d1b9695a767b1ca4",
+            ),
+        )
         self.assertEqual(
             sum(spec.family == "grail" for spec in CANDIDATE_SPECS),
             4,
