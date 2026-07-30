@@ -14,3 +14,5 @@ resources/runs*
 /sonic/.torch-mm-venv/
 /sonic/build/
 /sonic/runs/
+/build/torch-stair-small/
+/build/torch-stair-small-results/
