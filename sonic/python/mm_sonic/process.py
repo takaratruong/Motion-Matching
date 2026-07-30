@@ -3694,6 +3694,13 @@ class GearProcess:
         self.close()
 
 
+@dataclass(frozen=True)
+class PreparedSimulationRelease:
+    expected_stream_frame_end: int
+    _owner_token: object
+    _base_release_sequence: int
+
+
 class SimulationPolicyGate:
     """Release GEAR only while the simulator advances an exact step count."""
 
@@ -3732,6 +3739,10 @@ class SimulationPolicyGate:
         self._paused = False
         self._policy_finished = False
         self._closed = False
+        self._release_token = object()
+        self._release_sequence = 0
+        self._prepared_release: PreparedSimulationRelease | None = None
+        self._used_releases: set[int] = set()
 
     def _require_bound_sim_dt(self) -> None:
         current = self.simulator.sim_dt
@@ -3791,6 +3802,96 @@ class SimulationPolicyGate:
         self._paused = True
         self._policy_finished = True
 
+    def prepare_release(
+        self, *, expected_stream_frame_end: int
+    ) -> PreparedSimulationRelease:
+        """Arm one acknowledged reference without advancing physics."""
+        if self.pause_strategy != "control-channel":
+            raise RuntimeError("prepare_release requires control-channel mode")
+        if (
+            type(expected_stream_frame_end) is not int
+            or expected_stream_frame_end < 0
+        ):
+            raise ValueError(
+                "expected_stream_frame_end must be a nonnegative integer"
+            )
+        if self._prepared_release is not None:
+            raise RuntimeError("a simulation release is already prepared")
+        self.require_paused()
+        try:
+            self._require_bound_sim_dt()
+            self.gear.require_alive()
+            self.simulator.require_alive()
+            self.gear.begin_simulation_control_sync()
+            self.simulator.refresh_low_state()
+            self.gear.finish_simulation_control_sync()
+            self.gear.arm_simulation_control(expected_stream_frame_end)
+        except BaseException as error:
+            try:
+                self.gear.pause_simulation_control()
+            finally:
+                self._paused = bool(self.gear.simulation_control_is_paused)
+            raise _at_failure_site(error, "process_resume")
+        self._paused = False
+        prepared = PreparedSimulationRelease(
+            expected_stream_frame_end=expected_stream_frame_end,
+            _owner_token=self._release_token,
+            _base_release_sequence=self._release_sequence,
+        )
+        self._prepared_release = prepared
+        return prepared
+
+    def commit_release(
+        self, prepared: PreparedSimulationRelease, steps: int
+    ) -> AdvanceResult:
+        """Advance exactly one already-armed release, then re-fence control."""
+        _positive_integer(steps, "steps")
+        if (
+            not isinstance(prepared, PreparedSimulationRelease)
+            or prepared._owner_token is not self._release_token
+            or prepared._base_release_sequence != self._release_sequence
+            or self._prepared_release is not prepared
+            or id(prepared) in self._used_releases
+        ):
+            raise RuntimeError("simulation release is foreign, stale, or already used")
+        # Mark terminal before touching physics: an ARMED release is never safe
+        # to retry after an ambiguous simulator failure.
+        self._used_releases.add(id(prepared))
+        self._prepared_release = None
+        result: AdvanceResult | None = None
+        operation_error: BaseException | None = None
+        try:
+            result = self.simulator.advance(steps)
+        except BaseException as error:
+            operation_error = _at_failure_site(error, "simulator_advance")
+        stop_error: BaseException | None = None
+        try:
+            self.gear.pause_simulation_control()
+        except BaseException as error:
+            stop_error = error
+        self._paused = bool(self.gear.simulation_control_is_paused)
+        if operation_error is not None:
+            raise operation_error
+        if stop_error is not None:
+            raise stop_error
+        assert result is not None
+        try:
+            if result.steps != steps:
+                raise ProcessProtocolError(
+                    f"simulator reply reports {result.steps} steps, expected {steps}"
+                )
+            expected = steps * self.sim_dt
+            actual = result.sim_time_end_s - result.sim_time_start_s
+            if not math.isfinite(actual) or abs(actual - expected) > self.tolerance:
+                raise ProcessProtocolError(
+                    "MuJoCo time delta mismatch: "
+                    f"expected {expected:.17g}, found {actual:.17g}"
+                )
+        except BaseException as error:
+            raise _at_failure_site(error, "simulator_advance")
+        self._release_sequence += 1
+        return result
+
     def release_steps(
         self, steps: int, *, expected_stream_frame_end: int | None = None
     ) -> AdvanceResult:
@@ -3803,6 +3904,12 @@ class SimulationPolicyGate:
                 "control-channel release requires a nonnegative "
                 "expected_stream_frame_end"
             )
+        if self.pause_strategy == "control-channel":
+            assert expected_stream_frame_end is not None
+            prepared = self.prepare_release(
+                expected_stream_frame_end=expected_stream_frame_end
+            )
+            return self.commit_release(prepared, steps)
         self.require_paused()
         try:
             self._require_bound_sim_dt()
