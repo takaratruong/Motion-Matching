@@ -912,6 +912,67 @@ class TorchMotionMatcher:
         root_w = _rotate_z(clip.body_angular_velocity[sl, root], yaw_offset)
         return joint_p, joint_v, root_p, root_q, root_v, root_w, body_p, body_v
 
+    def _ranked_terrain_rescue(
+        self,
+        state: _MatcherState,
+        shaped: ShapedCommand,
+        query: torch.Tensor,
+        continuity: TransitionContinuityCosts,
+        successor: int,
+        incumbent_cost: float,
+        validator,
+        search_time,
+    ):
+        rescue_start = time.perf_counter_ns()
+        ranked_rescue_decisions = rank_exact_transition_candidates(
+            self.database,
+            query,
+            current_clip_index=state.clip_index,
+            current_frame_index=state.frame_index,
+            config=self.config,
+            additional_transition_costs=continuity.total,
+        )
+        rescue_time = time.perf_counter_ns() - rescue_start
+        search_time = (
+            rescue_time if search_time is None else search_time + rescue_time
+        )
+        safe_rescue = None
+        for rank, rescue_decision in enumerate(
+            ranked_rescue_decisions, start=1
+        ):
+            rescue_candidate = self._compose_candidate(
+                state,
+                shaped,
+                rescue_decision.selected_row,
+                successor,
+            )
+            rescue_accepted = validator(
+                rescue_candidate.dense_body_position.clone()
+            )
+            if type(rescue_accepted) is not bool:
+                raise ContractError(
+                    "emitted-window validator must return exact bool"
+                )
+            if rescue_accepted:
+                safe_rescue = (rank, rescue_decision, rescue_candidate)
+                break
+        if safe_rescue is None:
+            raise ContractError("no safe terrain rescue candidate")
+        rank, rescue_decision, candidate = safe_rescue
+        decision = SearchDecision(
+            selected_row=rescue_decision.selected_row,
+            incumbent_row=successor,
+            incumbent_cost=incumbent_cost,
+            selected_feature_cost=rescue_decision.selected_feature_cost,
+            selected_total_cost=rescue_decision.selected_total_cost,
+            searched=True,
+            transitioned=True,
+            selected_transition_cost=(
+                rescue_decision.selected_transition_cost
+            ),
+        )
+        return rank, decision, candidate, search_time
+
     def _compose_candidate(
         self,
         state: _MatcherState,
@@ -1270,70 +1331,20 @@ class TorchMotionMatcher:
                         raise ContractError(
                             "unsafe incumbent has no source row"
                         )
-                    incumbent_cost = decision.incumbent_cost
-                    rescue_start = time.perf_counter_ns()
-                    ranked_rescue_decisions = rank_exact_transition_candidates(
-                        self.database,
-                        query,
-                        current_clip_index=state.clip_index,
-                        current_frame_index=state.frame_index,
-                        config=self.config,
-                        additional_transition_costs=continuity.total,
-                    )
-                    rescue_time = time.perf_counter_ns() - rescue_start
-                    search_time = (
-                        rescue_time
-                        if search_time is None
-                        else search_time + rescue_time
-                    )
-                    safe_rescue = None
-                    for rank, rescue_decision in enumerate(
-                        ranked_rescue_decisions, start=1
-                    ):
-                        rescue_candidate = self._compose_candidate(
-                            state,
-                            shaped,
-                            rescue_decision.selected_row,
-                            successor,
-                        )
-                        rescue_accepted = validator(
-                            rescue_candidate.dense_body_position.clone()
-                        )
-                        if type(rescue_accepted) is not bool:
-                            raise ContractError(
-                                "emitted-window validator must return exact bool"
-                            )
-                        if rescue_accepted:
-                            safe_rescue = (
-                                rank,
-                                rescue_decision,
-                                rescue_candidate,
-                            )
-                            break
-                    if safe_rescue is None:
-                        raise ContractError(
-                            "no safe terrain rescue candidate"
-                        )
                     (
                         terrain_safety_override_rank,
-                        rescue_decision,
+                        decision,
                         candidate,
-                    ) = safe_rescue
-                    decision = SearchDecision(
-                        selected_row=rescue_decision.selected_row,
-                        incumbent_row=successor,
-                        incumbent_cost=incumbent_cost,
-                        selected_feature_cost=(
-                            rescue_decision.selected_feature_cost
-                        ),
-                        selected_total_cost=(
-                            rescue_decision.selected_total_cost
-                        ),
-                        searched=True,
-                        transitioned=True,
-                        selected_transition_cost=(
-                            rescue_decision.selected_transition_cost
-                        ),
+                        search_time,
+                    ) = self._ranked_terrain_rescue(
+                        state,
+                        shaped,
+                        query,
+                        continuity,
+                        successor,
+                        decision.incumbent_cost,
+                        validator,
+                        search_time,
                     )
                     terrain_safety_override = True
                 else:
@@ -1352,20 +1363,34 @@ class TorchMotionMatcher:
                             "emitted-window validator must return exact bool"
                         )
                     if not incumbent_accepted:
-                        raise ContractError(
-                            "emitted-window incumbent is unsafe"
+                        (
+                            terrain_safety_override_rank,
+                            decision,
+                            candidate,
+                            search_time,
+                        ) = self._ranked_terrain_rescue(
+                            state,
+                            shaped,
+                            query,
+                            continuity,
+                            successor,
+                            decision.incumbent_cost,
+                            validator,
+                            search_time,
                         )
-                    candidate = incumbent
-                    decision = SearchDecision(
-                        selected_row=successor,
-                        incumbent_row=successor,
-                        incumbent_cost=decision.incumbent_cost,
-                        selected_feature_cost=decision.incumbent_cost,
-                        selected_total_cost=decision.incumbent_cost,
-                        searched=decision.searched,
-                        transitioned=False,
-                    )
-                    transition_rejected = True
+                        terrain_safety_override = True
+                    else:
+                        candidate = incumbent
+                        decision = SearchDecision(
+                            selected_row=successor,
+                            incumbent_row=successor,
+                            incumbent_cost=decision.incumbent_cost,
+                            selected_feature_cost=decision.incumbent_cost,
+                            selected_total_cost=decision.incumbent_cost,
+                            searched=decision.searched,
+                            transitioned=False,
+                        )
+                        transition_rejected = True
         residual_sq = torch.square(
             self.database._search_features[decision.selected_row] - query
         )
