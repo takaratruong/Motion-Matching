@@ -240,3 +240,28 @@ coverage checks, no forbidden contacts, pelvis height and uprightness limits,
 and joint/pelvis tracking ratios relative to the authenticated known-good
 baseline. Secondary drift, clearance, scuff, impulse, and timing measurements
 remain diagnostics and cannot override those registered primary gates.
+
+## Opt-in in-process Torch motion matcher
+
+The flat interactive demo can load a native 50 Hz Takara motion folder and run
+the matcher directly on CUDA, without starting `mm_chunk_server`:
+
+```bash
+PYTHONPATH=sonic/python sonic/.torch-mm-venv/bin/python -B \
+  -m mm_sonic.manual_demo \
+  --mode interactive --input-source x11 --onscreen \
+  --motion-backend torch \
+  --motions-dir /home/ubuntu/Downloads/takara_walk_50hz.npz_v0 \
+  --torch-device cuda \
+  --scene-id sonic-flat-baseline --route-id flat-12s --terrain-weight 0 \
+  --chunks 3000 \
+  --gear-checkout /home/ubuntu/projects/gear-sonic-worktrees/simulation-lowstate-wait-v6 \
+  --source-run /home/ubuntu/mm-flat-walk-stage-b-r16-hold-resume.tym9Fc/stage-b/stage-b-20260718T005901613783Z-8b63d477 \
+  --runtime /home/ubuntu/.local/share/motion-matching-deps/gear-sonic/5e22ddc69abcea2a9aafc40536b14c232d3f9d7f \
+  --terrain-dir /home/ubuntu/projects/motion-matching/resources/g1_terrain \
+  --output-root /home/ubuntu/mm-sonic-torch-live
+```
+
+The matcher publishes overlapping 46-row windows. Physics remains fenced until
+GEAR acknowledges the final row, after which exactly one 20 ms policy interval
+is released. W/A/S/D move, Space stops, Backspace restarts, and X exits.
