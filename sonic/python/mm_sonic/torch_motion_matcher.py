@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import math
 from pathlib import Path
 import time
-from typing import Protocol
+from typing import Protocol, Sequence
 
 import torch
 
@@ -26,6 +26,12 @@ from .torch_motion_features import (
     resolve_torch_device,
     validated_extension_query_row,
 )
+
+
+LOOP_HISTORY_FRAMES = 128
+LOOP_SOURCE_NEIGHBORHOOD_FRAMES = 8
+LOOP_ROOT_PROGRESS_M = 0.05
+LOOP_REVISIT_PENALTY = 1000.0
 
 
 @dataclass(frozen=True)
@@ -729,6 +735,72 @@ class _MatcherState:
 
 
 @dataclass(frozen=True)
+class _SelectionVisit:
+    sequence: int
+    clip_index: int
+    frame_index: int
+    root_position_xy: torch.Tensor
+
+
+def _loop_revisit_transition_costs(
+    database: TorchMotionDatabase,
+    history: Sequence[_SelectionVisit],
+    current_root_position_xy: torch.Tensor,
+    *,
+    current_sequence: int,
+    config: MatcherConfig,
+) -> torch.Tensor:
+    """Penalize source neighborhoods revisited without meaningful root progress."""
+
+    root = current_root_position_xy
+    if (
+        not isinstance(root, torch.Tensor)
+        or tuple(root.shape) != (2,)
+        or root.device != database.device
+        or not torch.isfinite(root).all()
+    ):
+        raise ContractError(
+            "loop revisit root position must be finite shape-(2,) "
+            "on the database device"
+        )
+    costs = torch.zeros(
+        database.feature_shape[0],
+        dtype=torch.float32,
+        device=database.device,
+    )
+    for visit in history:
+        if not isinstance(visit, _SelectionVisit):
+            raise ContractError("loop revisit history is invalid")
+        age = int(current_sequence) - visit.sequence
+        if age <= config.exclusion_frames or age > LOOP_HISTORY_FRAMES:
+            continue
+        if (
+            visit.root_position_xy.device != database.device
+            or tuple(visit.root_position_xy.shape) != (2,)
+            or float(
+                torch.linalg.vector_norm(
+                    root - visit.root_position_xy
+                ).item()
+            )
+            > LOOP_ROOT_PROGRESS_M
+        ):
+            continue
+        clip = database.folder.clips[visit.clip_index]
+        start = max(
+            0, visit.frame_index - LOOP_SOURCE_NEIGHBORHOOD_FRAMES
+        )
+        stop = min(
+            clip.valid_frame_stop,
+            visit.frame_index + LOOP_SOURCE_NEIGHBORHOOD_FRAMES + 1,
+        )
+        for frame_index in range(start, stop):
+            row = database.row_for_source(visit.clip_index, frame_index)
+            if row is not None:
+                costs[row] = LOOP_REVISIT_PENALTY
+    return costs
+
+
+@dataclass(frozen=True)
 class _ComposedCandidate:
     clip_index: int
     frame_index: int
@@ -850,6 +922,7 @@ class TorchMotionMatcher:
         )
         self._owner_token = object()
         self._state: _MatcherState | None = None
+        self._selection_history: list[_SelectionVisit] = []
 
     @classmethod
     def from_folder(
@@ -963,7 +1036,7 @@ class TorchMotionMatcher:
         state: _MatcherState,
         shaped: ShapedCommand,
         query: torch.Tensor,
-        continuity: TransitionContinuityCosts,
+        transition_costs: torch.Tensor,
         successor: int | None,
         incumbent_cost: float,
         validator,
@@ -976,7 +1049,7 @@ class TorchMotionMatcher:
             current_clip_index=state.clip_index,
             current_frame_index=state.frame_index,
             config=self.config,
-            additional_transition_costs=continuity.total,
+            additional_transition_costs=transition_costs,
         )
         rescue_time = time.perf_counter_ns() - rescue_start
         search_time = (
@@ -1024,7 +1097,7 @@ class TorchMotionMatcher:
         state: _MatcherState,
         shaped: ShapedCommand,
         query: torch.Tensor,
-        continuity: TransitionContinuityCosts,
+        transition_costs: torch.Tensor,
         successor: int,
         decision: SearchDecision,
         candidate: _ComposedCandidate,
@@ -1042,7 +1115,7 @@ class TorchMotionMatcher:
             current_clip_index=state.clip_index,
             current_frame_index=state.frame_index,
             config=self.config,
-            additional_transition_costs=continuity.total,
+            additional_transition_costs=transition_costs,
         )
         rerank_time = time.perf_counter_ns() - rerank_start
         search_time = (
@@ -1446,6 +1519,14 @@ class TorchMotionMatcher:
             jp[0].clone(), jv[0].clone(), rp[0].clone(), rq[0].clone(),
             rv[0].clone(), rw[0].clone(), bp[0].clone(), bv[0].clone(), zeros,
         )
+        self._selection_history = [
+            _SelectionVisit(
+                sequence=0,
+                clip_index=clip_index,
+                frame_index=frame_index,
+                root_position_xy=rp[0, :2].clone(),
+            )
+        ]
         return _copy_result(result)
 
     def prepare_step(
@@ -1513,6 +1594,18 @@ class TorchMotionMatcher:
             position_weight=self.config.transition_joint_position_weight,
             velocity_weight=self.config.transition_joint_velocity_weight,
         )
+        loop_costs = _loop_revisit_transition_costs(
+            self.database,
+            self._selection_history,
+            state.root_position[:2],
+            current_sequence=state.sequence,
+            config=self.config,
+        )
+        transition_costs = (
+            continuity.total + loop_costs
+            if bool((loop_costs > 0.0).any().item())
+            else continuity.total
+        )
         search_start = time.perf_counter_ns()
         decision = select_exact_candidate(
             self.database,
@@ -1523,7 +1616,7 @@ class TorchMotionMatcher:
             search=search,
             config=self.config,
             additional_transition_penalty=settle_penalty,
-            additional_transition_costs=continuity.total,
+            additional_transition_costs=transition_costs,
         )
         search_time = time.perf_counter_ns() - search_start if search else None
         candidate = self._compose_candidate(
@@ -1554,7 +1647,7 @@ class TorchMotionMatcher:
                         state,
                         shaped,
                         query,
-                        continuity,
+                        transition_costs,
                         successor,
                         decision.incumbent_cost,
                         validator,
@@ -1572,7 +1665,7 @@ class TorchMotionMatcher:
                             state,
                             shaped,
                             query,
-                            continuity,
+                            transition_costs,
                             successor,
                             decision.incumbent_cost,
                             validator,
@@ -1600,7 +1693,7 @@ class TorchMotionMatcher:
                                 state,
                                 shaped,
                                 query,
-                                continuity,
+                                transition_costs,
                                 successor,
                                 decision.incumbent_cost,
                                 validator,
@@ -1632,7 +1725,7 @@ class TorchMotionMatcher:
                 state,
                 shaped,
                 query,
-                continuity,
+                transition_costs,
                 successor,
                 decision,
                 candidate,
@@ -1716,6 +1809,18 @@ class TorchMotionMatcher:
         ):
             raise ContractError("prepared motion match is foreign, stale, or used")
         self._state = prepared._next_state
+        self._selection_history.append(
+            _SelectionVisit(
+                sequence=self._state.sequence,
+                clip_index=self._state.clip_index,
+                frame_index=self._state.frame_index,
+                root_position_xy=self._state.root_position[:2].clone(),
+            )
+        )
+        if len(self._selection_history) > LOOP_HISTORY_FRAMES:
+            del self._selection_history[
+                : len(self._selection_history) - LOOP_HISTORY_FRAMES
+            ]
         return _copy_result(prepared.result)
 
     def step(

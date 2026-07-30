@@ -15,6 +15,8 @@ from mm_sonic.torch_motion_matcher import (
     MatcherConfig,
     SearchDecision,
     TorchMotionMatcher,
+    _SelectionVisit,
+    _loop_revisit_transition_costs,
     decay_spring_offsets,
     predict_command_trajectory,
     rank_exact_transition_candidates,
@@ -1094,6 +1096,53 @@ class TorchMotionMatcherTests(unittest.TestCase):
         self.assertEqual(result.diagnostics.selected_frame, 40)
         self.assertTrue(result.diagnostics.terrain_safety_override)
         self.assertEqual(result.diagnostics.terrain_safety_override_rank, 2)
+
+    def test_low_progress_source_revisit_is_penalized_beyond_local_exclusion(
+        self,
+    ):
+        arrays = build_varying_takara_arrays(frames=120)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=MatcherConfig(exclusion_frames=20),
+            )
+            matcher.reset()
+            current_root = torch.tensor((1.0, -0.5))
+            old = _SelectionVisit(0, 0, 40, current_root.clone())
+            costs = _loop_revisit_transition_costs(
+                matcher.database,
+                (old,),
+                current_root + torch.tensor((0.03, 0.0)),
+                current_sequence=22,
+                config=matcher.config,
+            )
+            for frame in (32, 40, 48):
+                row = matcher.database.row_for_source(0, frame)
+                self.assertEqual(float(costs[row]), 1000.0)
+            outside = matcher.database.row_for_source(0, 49)
+            self.assertEqual(float(costs[outside]), 0.0)
+
+            recent = _SelectionVisit(10, 0, 40, current_root.clone())
+            recent_costs = _loop_revisit_transition_costs(
+                matcher.database,
+                (recent,),
+                current_root,
+                current_sequence=22,
+                config=matcher.config,
+            )
+            self.assertEqual(float(recent_costs.sum()), 0.0)
+
+            far_costs = _loop_revisit_transition_costs(
+                matcher.database,
+                (old,),
+                current_root + torch.tensor((0.08, 0.0)),
+                current_sequence=22,
+                config=matcher.config,
+            )
+            self.assertEqual(float(far_costs.sum()), 0.0)
 
     def test_zero_continuity_weights_preserve_matcher_for_100_commands(self):
         arrays = build_varying_takara_arrays(frames=160)
