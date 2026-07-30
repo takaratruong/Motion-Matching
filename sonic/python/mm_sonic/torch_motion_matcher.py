@@ -32,6 +32,7 @@ LOOP_HISTORY_FRAMES = 128
 LOOP_SOURCE_NEIGHBORHOOD_FRAMES = 8
 LOOP_ROOT_PROGRESS_M = 0.05
 LOOP_REVISIT_PENALTY = 1000.0
+RECENT_CROSS_CLIP_REVISIT_PENALTY = 25.0
 
 
 @dataclass(frozen=True)
@@ -747,6 +748,7 @@ def _loop_revisit_transition_costs(
     history: Sequence[_SelectionVisit],
     current_root_position_xy: torch.Tensor,
     *,
+    current_clip_index: int,
     current_sequence: int,
     config: MatcherConfig,
 ) -> torch.Tensor:
@@ -763,41 +765,74 @@ def _loop_revisit_transition_costs(
             "loop revisit root position must be finite shape-(2,) "
             "on the database device"
         )
+    if not 0 <= int(current_clip_index) < len(database.folder.clips):
+        raise ContractError("loop revisit current clip index is invalid")
     costs = torch.zeros(
         database.feature_shape[0],
         dtype=torch.float32,
         device=database.device,
     )
+    eligible_visits = []
+    penalties = []
     for visit in history:
         if not isinstance(visit, _SelectionVisit):
             raise ContractError("loop revisit history is invalid")
         age = int(current_sequence) - visit.sequence
-        if age <= config.exclusion_frames or age > LOOP_HISTORY_FRAMES:
+        if age <= 0 or age > LOOP_HISTORY_FRAMES:
+            continue
+        if (
+            age <= config.exclusion_frames
+            and visit.clip_index == int(current_clip_index)
+        ):
             continue
         if (
             visit.root_position_xy.device != database.device
             or tuple(visit.root_position_xy.shape) != (2,)
-            or float(
-                torch.linalg.vector_norm(
-                    root - visit.root_position_xy
-                ).item()
-            )
-            > LOOP_ROOT_PROGRESS_M
+            or not torch.isfinite(visit.root_position_xy).all()
         ):
-            continue
-        clip = database.folder.clips[visit.clip_index]
-        start = max(
-            0, visit.frame_index - LOOP_SOURCE_NEIGHBORHOOD_FRAMES
+            raise ContractError("loop revisit history position is invalid")
+        eligible_visits.append(visit)
+        penalties.append(
+            RECENT_CROSS_CLIP_REVISIT_PENALTY
+            if age <= config.exclusion_frames
+            else LOOP_REVISIT_PENALTY
         )
-        stop = min(
-            clip.valid_frame_stop,
-            visit.frame_index + LOOP_SOURCE_NEIGHBORHOOD_FRAMES + 1,
+    if not eligible_visits:
+        return costs
+
+    visit_roots = torch.stack(
+        [visit.root_position_xy for visit in eligible_visits]
+    )
+    low_progress = (
+        torch.linalg.vector_norm(visit_roots - root, dim=1)
+        <= LOOP_ROOT_PROGRESS_M
+    )
+    visit_clips = torch.tensor(
+        [visit.clip_index for visit in eligible_visits],
+        dtype=database._search_clip_index.dtype,
+        device=database.device,
+    )
+    visit_frames = torch.tensor(
+        [visit.frame_index for visit in eligible_visits],
+        dtype=database._search_frame_index.dtype,
+        device=database.device,
+    )
+    visit_penalties = torch.tensor(
+        penalties, dtype=torch.float32, device=database.device
+    )
+    neighborhoods = (
+        database._search_clip_index[:, None] == visit_clips[None, :]
+    ) & (
+        torch.abs(
+            database._search_frame_index[:, None] - visit_frames[None, :]
         )
-        for frame_index in range(start, stop):
-            row = database.row_for_source(visit.clip_index, frame_index)
-            if row is not None:
-                costs[row] = LOOP_REVISIT_PENALTY
-    return costs
+        <= LOOP_SOURCE_NEIGHBORHOOD_FRAMES
+    )
+    return torch.where(
+        neighborhoods & low_progress[None, :],
+        visit_penalties[None, :],
+        0.0,
+    ).amax(dim=1)
 
 
 @dataclass(frozen=True)
@@ -1041,6 +1076,10 @@ class TorchMotionMatcher:
         incumbent_cost: float,
         validator,
         search_time,
+        *,
+        additional_transition_penalty: float = 0.0,
+        maximum_total_cost: float | None = None,
+        require_safe_candidate: bool = True,
     ):
         rescue_start = time.perf_counter_ns()
         ranked_rescue_decisions = rank_exact_transition_candidates(
@@ -1059,6 +1098,15 @@ class TorchMotionMatcher:
         for rank, rescue_decision in enumerate(
             ranked_rescue_decisions, start=1
         ):
+            effective_total_cost = (
+                rescue_decision.selected_total_cost
+                + additional_transition_penalty
+            )
+            if (
+                maximum_total_cost is not None
+                and effective_total_cost >= maximum_total_cost
+            ):
+                break
             rescue_candidate = self._compose_candidate(
                 state,
                 shaped,
@@ -1073,17 +1121,24 @@ class TorchMotionMatcher:
                     "emitted-window validator must return exact bool"
                 )
             if rescue_accepted:
-                safe_rescue = (rank, rescue_decision, rescue_candidate)
+                safe_rescue = (
+                    rank,
+                    rescue_decision,
+                    rescue_candidate,
+                    effective_total_cost,
+                )
                 break
         if safe_rescue is None:
+            if not require_safe_candidate:
+                return None
             raise ContractError("no safe terrain rescue candidate")
-        rank, rescue_decision, candidate = safe_rescue
+        rank, rescue_decision, candidate, effective_total_cost = safe_rescue
         decision = SearchDecision(
             selected_row=rescue_decision.selected_row,
             incumbent_row=successor,
             incumbent_cost=incumbent_cost,
             selected_feature_cost=rescue_decision.selected_feature_cost,
-            selected_total_cost=rescue_decision.selected_total_cost,
+            selected_total_cost=effective_total_cost,
             searched=True,
             transitioned=True,
             selected_transition_cost=(
@@ -1598,6 +1653,7 @@ class TorchMotionMatcher:
             self.database,
             self._selection_history,
             state.root_position[:2],
+            current_clip_index=state.clip_index,
             current_sequence=state.sequence,
             config=self.config,
         )
@@ -1652,6 +1708,7 @@ class TorchMotionMatcher:
                         decision.incumbent_cost,
                         validator,
                         search_time,
+                        additional_transition_penalty=settle_penalty,
                     )
                     terrain_safety_override = True
                 else:
@@ -1670,6 +1727,7 @@ class TorchMotionMatcher:
                             decision.incumbent_cost,
                             validator,
                             search_time,
+                            additional_transition_penalty=settle_penalty,
                         )
                         terrain_safety_override = True
                     else:
@@ -1698,20 +1756,47 @@ class TorchMotionMatcher:
                                 decision.incumbent_cost,
                                 validator,
                                 search_time,
+                                additional_transition_penalty=settle_penalty,
                             )
                             terrain_safety_override = True
                         else:
-                            candidate = incumbent
-                            decision = SearchDecision(
-                                selected_row=successor,
-                                incumbent_row=successor,
-                                incumbent_cost=decision.incumbent_cost,
-                                selected_feature_cost=decision.incumbent_cost,
-                                selected_total_cost=decision.incumbent_cost,
-                                searched=decision.searched,
-                                transitioned=False,
+                            rescue = self._ranked_terrain_rescue(
+                                state,
+                                shaped,
+                                query,
+                                transition_costs,
+                                successor,
+                                decision.incumbent_cost,
+                                validator,
+                                search_time,
+                                additional_transition_penalty=settle_penalty,
+                                maximum_total_cost=decision.incumbent_cost,
+                                require_safe_candidate=False,
                             )
-                            transition_rejected = True
+                            if rescue is not None:
+                                (
+                                    terrain_safety_override_rank,
+                                    decision,
+                                    candidate,
+                                    search_time,
+                                ) = rescue
+                                terrain_safety_override = True
+                            else:
+                                candidate = incumbent
+                                decision = SearchDecision(
+                                    selected_row=successor,
+                                    incumbent_row=successor,
+                                    incumbent_cost=decision.incumbent_cost,
+                                    selected_feature_cost=(
+                                        decision.incumbent_cost
+                                    ),
+                                    selected_total_cost=(
+                                        decision.incumbent_cost
+                                    ),
+                                    searched=decision.searched,
+                                    transitioned=False,
+                                )
+                                transition_rejected = True
         if (
             decision.transitioned
             and not terrain_safety_override

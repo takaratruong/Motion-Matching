@@ -2,6 +2,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -200,6 +201,111 @@ class TerrainFeatureTests(unittest.TestCase):
             torch.equal(legacy_rows[0], torch.zeros_like(legacy_rows[0]))
         )
         self.assertGreater(float(dense_rows[1].std()), 0.0)
+
+    def test_expanded_dataset_applies_motion_to_terrain_registration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            expanded_root = Path(tmp) / "expanded"
+            shutil.copytree(self.dataset_root, expanded_root)
+            manifest_path = expanded_root / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["schema"] = "g1-torch-terrain-corpus/v1"
+            for descriptor in manifest["clips"][1:]:
+                descriptor["kind"] = "terrain"
+                descriptor["terrain"]["motion_to_terrain_xy_yaw"] = [
+                    0.0,
+                    0.0,
+                    0.0,
+                ]
+            transform = [1.0, -2.0, math.pi / 2.0]
+            manifest["clips"][1]["terrain"][
+                "motion_to_terrain_xy_yaw"
+            ] = transform
+            manifest["accepted_clips"] = manifest["clips"]
+            manifest_path.write_text(
+                json.dumps(
+                    manifest,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            dataset = TerrainDataset.load(expanded_root, device="cpu")
+            extension = TerrainFeatureExtension.for_condition(
+                dataset,
+                condition="dense",
+                query_scene="stair/0000/motion.npz",
+                weight=4.0,
+            )
+            rows = extension.database_rows(
+                dataset.folder, torch.device("cpu")
+            )
+
+            clip = dataset.folder.clips[1]
+            root_index = dataset.folder.layout.root_body_index
+            root_xy = clip.body_position_world[0, root_index, :2]
+            quaternion = clip.body_quaternion_world_wxyz[0, root_index]
+            w, x, y, z = quaternion
+            root_yaw = math.atan2(
+                2.0 * (w * z + x * y),
+                1.0 - 2.0 * (y * y + z * z),
+            )
+            scene_root = np.array(
+                [-root_xy[1] + transform[0], root_xy[0] + transform[1]]
+            )
+            forward, lateral = np.meshgrid(
+                np.asarray(DENSE_FORWARD_M),
+                np.asarray(DENSE_LATERAL_M),
+                indexing="ij",
+            )
+            local = np.stack((forward, lateral), axis=-1).reshape(-1, 2)
+            scene_yaw = root_yaw + transform[2]
+            cosine = math.cos(scene_yaw)
+            sine = math.sin(scene_yaw)
+            rotation = np.array([[cosine, -sine], [sine, cosine]])
+            points = scene_root + local @ rotation.T
+
+            def curved_height(xy):
+                return (
+                    0.1 * xy[..., 0]
+                    + 0.2 * xy[..., 1]
+                    + 0.05 * xy[..., 0] * xy[..., 0]
+                )
+
+            expected = curved_height(points) - curved_height(scene_root)
+            np.testing.assert_allclose(
+                rows[1][0].numpy(), expected, rtol=0.0, atol=2e-5
+            )
+            np.testing.assert_allclose(
+                extension.query_row(
+                    _state(), _straight_trajectory()
+                ).numpy(),
+                expected,
+                rtol=0.0,
+                atol=2e-5,
+            )
+
+    def test_expanded_dataset_requires_finite_motion_registration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            expanded_root = Path(tmp) / "expanded"
+            shutil.copytree(self.dataset_root, expanded_root)
+            manifest_path = expanded_root / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["schema"] = "g1-torch-terrain-corpus/v1"
+            for descriptor in manifest["clips"][1:]:
+                descriptor["kind"] = "terrain"
+            manifest["accepted_clips"] = manifest["clips"]
+            manifest_path.write_text(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                Exception, "motion-to-terrain registration"
+            ):
+                TerrainDataset.load(expanded_root, device="cpu")
 
     def test_foot_clearance_validator_uses_exact_emitted_preview(self):
         extension = TerrainFeatureExtension.for_condition(

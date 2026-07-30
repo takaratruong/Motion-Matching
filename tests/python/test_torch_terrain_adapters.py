@@ -41,6 +41,7 @@ def _source(
     family: str,
     terrain_adapter: str,
     geometry: tuple[Path, ...] = (),
+    motion_to_terrain_xy_yaw: tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> ResolvedSource:
     motion = root / "motion.npz"
     motion.write_bytes(b"fixture")
@@ -54,6 +55,7 @@ def _source(
             terrain_adapter=terrain_adapter,
             geometry_relative_paths=tuple(path.name for path in geometry),
             geometry_sha256=tuple("1" * 64 for _ in geometry),
+            motion_to_terrain_xy_yaw=motion_to_terrain_xy_yaw,
         ),
         motion_path=motion,
         geometry_paths=geometry,
@@ -90,6 +92,21 @@ class ExpandedTerrainAdapterTests(unittest.TestCase):
         )
         self.assertEqual(evidence.adapter, "fixed-staircase")
         self.assertEqual(evidence.motion_to_terrain_xy_yaw, (0.0, 0.0, 0.0))
+
+    def test_adapter_preserves_checked_motion_to_terrain_registration(self):
+        transform = (-0.29, 3.99, -np.pi / 2.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            evidence = build_source_terrain(
+                _source(
+                    root,
+                    family="stair-local",
+                    terrain_adapter="fixed-staircase",
+                    motion_to_terrain_xy_yaw=transform,
+                ),
+                _motion(),
+            )
+        self.assertEqual(evidence.motion_to_terrain_xy_yaw, transform)
 
     def test_scaled_staircase_uses_pinned_urdf_scale_and_scene_offset(self):
         with tempfile.TemporaryDirectory() as tmp:

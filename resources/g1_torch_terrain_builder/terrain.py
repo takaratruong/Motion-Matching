@@ -350,5 +350,5 @@ def build_source_terrain(
         adapter=adapter,
         grid=grid,
         geometry_sha256=MappingProxyType(hashes),
-        motion_to_terrain_xy_yaw=(0.0, 0.0, 0.0),
+        motion_to_terrain_xy_yaw=source.spec.motion_to_terrain_xy_yaw,
     )

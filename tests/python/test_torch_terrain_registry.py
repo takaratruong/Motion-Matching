@@ -1,4 +1,5 @@
 import hashlib
+import math
 from pathlib import Path
 import tempfile
 import unittest
@@ -57,6 +58,24 @@ class ExpandedTerrainRegistryTests(unittest.TestCase):
         self.assertEqual(
             sum(spec.family == "grail" for spec in CANDIDATE_SPECS),
             4,
+        )
+        downhill = next(
+            spec
+            for spec in CANDIDATE_SPECS
+            if spec.logical_name == "down-continuous-33"
+        )
+        self.assertEqual(
+            downhill.motion_to_terrain_xy_yaw,
+            (-0.29, 3.99, -math.pi / 2.0),
+        )
+        backward_stair = next(
+            spec
+            for spec in CANDIDATE_SPECS
+            if spec.logical_name == "staircase-final-v3"
+        )
+        self.assertEqual(
+            backward_stair.motion_to_terrain_xy_yaw,
+            (-0.24, -0.10, math.pi / 2.0),
         )
         self.assertNotIn("crane", by_name)
 
@@ -126,6 +145,26 @@ class ExpandedTerrainRegistryTests(unittest.TestCase):
                 terrain_adapter="fixed-staircase",
                 geometry_relative_paths=(),
             )
+        for transform in (
+            [0.0, 0.0, 0.0],
+            (0.0, 0.0),
+            (0.0, float("nan"), 0.0),
+            (0.0, 0.0, "yaw"),
+        ):
+            with self.subTest(transform=transform):
+                with self.assertRaisesRegex(
+                    ValueError, "motion-to-terrain transform"
+                ):
+                    SourceSpec(
+                        logical_name="bad-transform",
+                        family="stair-local",
+                        source_adapter="native-npz",
+                        motion_relative_path="motion.npz",
+                        motion_sha256="0" * 64,
+                        terrain_adapter="fixed-staircase",
+                        geometry_relative_paths=(),
+                        motion_to_terrain_xy_yaw=transform,
+                    )
 
 
 if __name__ == "__main__":

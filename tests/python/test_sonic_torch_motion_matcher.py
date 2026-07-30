@@ -995,12 +995,40 @@ class TorchMotionMatcherTests(unittest.TestCase):
                 True,
                 True,
             )
+            too_expensive = SearchDecision(
+                target,
+                None,
+                math.inf,
+                10.0,
+                10.1,
+                True,
+                True,
+            )
+            state = matcher._state
+            shaped = predict_command_trajectory(
+                state.root_position[:2],
+                state.shaped_velocity,
+                state.shaped_heading,
+                torch.tensor((0.5, 0.0)),
+                torch.tensor(0.0),
+                has_valid_successor=True,
+                config=matcher.config,
+            )
+            periodic_shaped = replace(shaped, force_search=False)
             with mock.patch(
                 "mm_sonic.torch_motion_matcher.select_exact_candidate",
                 return_value=decision,
-            ):
+            ), mock.patch(
+                "mm_sonic.torch_motion_matcher.predict_command_trajectory",
+                return_value=periodic_shaped,
+            ), mock.patch(
+                "mm_sonic.torch_motion_matcher."
+                "rank_exact_transition_candidates",
+                return_value=(too_expensive,),
+            ) as ranking:
                 result = matcher.step((0.5, 0.0), 0.0)
 
+        ranking.assert_called_once()
         self.assertEqual(
             result.diagnostics.selected_frame,
             reset.diagnostics.selected_frame + 1,
@@ -1017,6 +1045,137 @@ class TorchMotionMatcherTests(unittest.TestCase):
                 result.dense_feature_body_position_window,
             )
         )
+
+    def test_unsafe_transition_uses_next_ranked_safe_candidate_better_than_incumbent(
+        self,
+    ):
+        arrays = build_varying_takara_arrays(frames=120)
+        validator = _ScriptedWindowValidator([False, True, False, True])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=MatcherConfig(search_interval_steps=1),
+                emitted_window_validator=validator,
+            )
+            reset = matcher.reset()
+            successor = matcher.database.row_for_source(
+                0, reset.diagnostics.selected_frame + 1
+            )
+            unsafe_row = matcher.database.row_for_source(0, 25)
+            safe_row = matcher.database.row_for_source(0, 50)
+            self.assertIsNotNone(successor)
+            self.assertIsNotNone(unsafe_row)
+            self.assertIsNotNone(safe_row)
+            selected = SearchDecision(
+                unsafe_row,
+                successor,
+                10.0,
+                1.0,
+                1.1,
+                True,
+                True,
+            )
+            ranked = (
+                SearchDecision(
+                    unsafe_row,
+                    None,
+                    math.inf,
+                    1.0,
+                    1.1,
+                    True,
+                    True,
+                ),
+                SearchDecision(
+                    safe_row,
+                    None,
+                    math.inf,
+                    2.0,
+                    2.1,
+                    True,
+                    True,
+                ),
+            )
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher.select_exact_candidate",
+                return_value=selected,
+            ), mock.patch(
+                "mm_sonic.torch_motion_matcher."
+                "rank_exact_transition_candidates",
+                return_value=ranked,
+            ) as ranking:
+                result = matcher.step((0.5, 0.0), 0.0)
+
+        ranking.assert_called_once()
+        self.assertEqual(result.diagnostics.selected_frame, 50)
+        self.assertTrue(result.diagnostics.transitioned)
+        self.assertFalse(result.diagnostics.transition_rejected)
+        self.assertTrue(result.diagnostics.terrain_safety_override)
+        self.assertEqual(result.diagnostics.terrain_safety_override_rank, 2)
+        self.assertEqual(result.diagnostics.selected_total_cost, 2.1)
+        self.assertEqual(len(validator.windows), 4)
+
+    def test_ranked_safe_candidate_must_beat_incumbent_after_settle_penalty(
+        self,
+    ):
+        arrays = build_varying_takara_arrays(frames=120)
+        validator = _ScriptedWindowValidator([False, True])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=MatcherConfig(search_interval_steps=1),
+                emitted_window_validator=validator,
+            )
+            reset = matcher.reset()
+            successor = matcher.database.row_for_source(
+                0, reset.diagnostics.selected_frame + 1
+            )
+            target = matcher.database.row_for_source(0, 25)
+            self.assertIsNotNone(successor)
+            self.assertIsNotNone(target)
+            selected = SearchDecision(
+                target,
+                successor,
+                10.0,
+                1.0,
+                1.1,
+                True,
+                True,
+            )
+            ranked = SearchDecision(
+                target,
+                None,
+                math.inf,
+                9.0,
+                9.5,
+                True,
+                True,
+            )
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher.select_exact_candidate",
+                return_value=selected,
+            ), mock.patch(
+                "mm_sonic.torch_motion_matcher."
+                "rank_exact_transition_candidates",
+                return_value=(ranked,),
+            ), mock.patch(
+                "mm_sonic.torch_motion_matcher.active_transition_penalty",
+                return_value=0.5,
+            ):
+                result = matcher.step((0.5, 0.0), 0.0)
+
+        self.assertEqual(
+            result.diagnostics.selected_frame,
+            reset.diagnostics.selected_frame + 1,
+        )
+        self.assertFalse(result.diagnostics.transitioned)
+        self.assertTrue(result.diagnostics.transition_rejected)
+        self.assertEqual(len(validator.windows), 2)
 
     def test_emitted_window_validator_must_return_exact_bool(self):
         arrays = build_varying_takara_arrays(frames=120)
@@ -1116,6 +1275,7 @@ class TorchMotionMatcherTests(unittest.TestCase):
                 matcher.database,
                 (old,),
                 current_root + torch.tensor((0.03, 0.0)),
+                current_clip_index=0,
                 current_sequence=22,
                 config=matcher.config,
             )
@@ -1130,6 +1290,7 @@ class TorchMotionMatcherTests(unittest.TestCase):
                 matcher.database,
                 (recent,),
                 current_root,
+                current_clip_index=0,
                 current_sequence=22,
                 config=matcher.config,
             )
@@ -1139,10 +1300,39 @@ class TorchMotionMatcherTests(unittest.TestCase):
                 matcher.database,
                 (old,),
                 current_root + torch.tensor((0.08, 0.0)),
+                current_clip_index=0,
                 current_sequence=22,
                 config=matcher.config,
             )
             self.assertEqual(float(far_costs.sum()), 0.0)
+
+    def test_recent_low_progress_cross_clip_revisit_is_penalized(self):
+        arrays = build_varying_takara_arrays(frames=120)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk-a", arrays)
+            write_takara_arrays(root / "walk-b", arrays)
+            matcher = TorchMotionMatcher.from_folder(root, device="cpu")
+            matcher.reset()
+            current_root = torch.tensor((1.0, -0.5))
+            recent_other_clip = _SelectionVisit(
+                10, 1, 40, current_root.clone()
+            )
+
+            costs = _loop_revisit_transition_costs(
+                matcher.database,
+                (recent_other_clip,),
+                current_root + torch.tensor((0.03, 0.0)),
+                current_clip_index=0,
+                current_sequence=22,
+                config=matcher.config,
+            )
+
+            for frame in (32, 40, 48):
+                row = matcher.database.row_for_source(1, frame)
+                self.assertEqual(float(costs[row]), 25.0)
+            same_source_row = matcher.database.row_for_source(0, 40)
+            self.assertEqual(float(costs[same_source_row]), 0.0)
 
     def test_zero_continuity_weights_preserve_matcher_for_100_commands(self):
         arrays = build_varying_takara_arrays(frames=160)

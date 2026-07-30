@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import math
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, Mapping
@@ -45,6 +46,11 @@ class SourceSpec:
     terrain_adapter: TerrainAdapter
     geometry_relative_paths: tuple[str, ...]
     geometry_sha256: tuple[str, ...] = ()
+    motion_to_terrain_xy_yaw: tuple[float, float, float] = (
+        0.0,
+        0.0,
+        0.0,
+    )
     expected_layout: str = "g1-29dof-isaaclab-v1"
 
     def __post_init__(self) -> None:
@@ -97,6 +103,20 @@ class SourceSpec:
             )
         if self.expected_layout != "g1-29dof-isaaclab-v1":
             raise ValueError("expected layout must be g1-29dof-isaaclab-v1")
+        transform = self.motion_to_terrain_xy_yaw
+        if (
+            type(transform) is not tuple
+            or len(transform) != 3
+            or any(
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(float(value))
+                for value in transform
+            )
+        ):
+            raise ValueError(
+                "motion-to-terrain transform must be a finite numeric tuple"
+            )
 
 
 @dataclass(frozen=True)
@@ -211,6 +231,11 @@ _LOCAL_IDENTITIES = (
     ("chair-step-truncated", "curb-chair", "chair_step_truncated_converted.npz:v0/motion.npz", "f9a858ae4d9e0b097255bbb1dffcc6c214e3c8a49ae8701645a87a91c65b5256", "chair-object", (), ()),
 )
 
+_MOTION_TO_TERRAIN_XY_YAW = {
+    "down-continuous-33": (-0.29, 3.99, -math.pi / 2.0),
+    "staircase-final-v3": (-0.24, -0.10, math.pi / 2.0),
+}
+
 
 def _local_specs() -> tuple[SourceSpec, ...]:
     return tuple(
@@ -223,6 +248,9 @@ def _local_specs() -> tuple[SourceSpec, ...]:
             terrain_adapter=terrain_adapter,
             geometry_relative_paths=geometry,
             geometry_sha256=geometry_hashes,
+            motion_to_terrain_xy_yaw=_MOTION_TO_TERRAIN_XY_YAW.get(
+                name, (0.0, 0.0, 0.0)
+            ),
         )
         for (
             name,

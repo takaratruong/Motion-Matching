@@ -215,6 +215,7 @@ class TerrainDataset:
     root: Path
     folder: MotionFolder
     clip_grids: Sequence[_TorchHeightGrid | None]
+    clip_alignments: Sequence[TerrainSceneAlignment | None]
     manifest_sha256: str
     _manifest: dict
     device: torch.device
@@ -269,6 +270,7 @@ class TerrainDataset:
             raise ContractError("terrain manifest clip count does not match motion folder")
 
         grids: list[_TorchHeightGrid | None] = []
+        alignments: list[TerrainSceneAlignment | None] = []
         for index, (clip, descriptor) in enumerate(
             zip(folder.clips, descriptors)
         ):
@@ -301,6 +303,7 @@ class TerrainDataset:
                         "only the first flat control clip may omit a height grid"
                     )
                 grids.append(None)
+                alignments.append(None)
                 continue
             expected_kinds = (
                 ("stair",)
@@ -365,12 +368,46 @@ class TerrainDataset:
                 raise ContractError(
                     f"terrain grid metadata mismatch: {clip.relative_path}"
                 )
+            if schema == EXPANDED_TERRAIN_DATASET_SCHEMA:
+                registration = terrain.get("motion_to_terrain_xy_yaw")
+                if (
+                    not isinstance(registration, list)
+                    or len(registration) != 3
+                    or any(
+                        not isinstance(value, (int, float))
+                        or isinstance(value, bool)
+                        or not math.isfinite(float(value))
+                        for value in registration
+                    )
+                ):
+                    raise ContractError(
+                        "expanded terrain motion-to-terrain registration "
+                        f"is invalid: {clip.relative_path}"
+                    )
+                tx, ty, yaw = (float(value) for value in registration)
+            else:
+                tx, ty, yaw = 0.0, 0.0, 0.0
             grids.append(torch_grid)
+            alignments.append(
+                TerrainSceneAlignment(
+                    translation_scene_xy=torch.tensor(
+                        [tx, ty],
+                        dtype=torch.float32,
+                        device=resolved_device,
+                    ),
+                    yaw_scene_from_matcher=torch.tensor(
+                        yaw,
+                        dtype=torch.float32,
+                        device=resolved_device,
+                    ),
+                )
+            )
 
         return TerrainDataset(
             root=root_path,
             folder=folder,
             clip_grids=tuple(grids),
+            clip_alignments=tuple(alignments),
             manifest_sha256=hashlib.sha256(raw_manifest).hexdigest(),
             _manifest=deepcopy(manifest),
             device=resolved_device,
@@ -451,6 +488,7 @@ def _arc_distance_points(
 def _legacy_rows(
     clip: MotionClip,
     grid: _TorchHeightGrid,
+    alignment: TerrainSceneAlignment,
     *,
     root_body_index: int,
     device: torch.device,
@@ -460,12 +498,13 @@ def _legacy_rows(
         dtype=torch.float32,
         device=device,
     )
+    position = alignment.matcher_to_scene_xy(position)
     quaternion = torch.tensor(
         clip.body_quaternion_world_wxyz[:, root_body_index],
         dtype=torch.float32,
         device=device,
     )
-    yaw = _yaw_from_wxyz(quaternion)
+    yaw = _yaw_from_wxyz(quaternion) + alignment.yaw_scene_from_matcher
     facing = torch.stack((torch.cos(yaw), torch.sin(yaw)), dim=-1)
     frames = torch.arange(clip.valid_frame_stop, device=device)
     offsets = torch.arange(46, device=device)
@@ -554,13 +593,19 @@ class TerrainFeatureExtension:
         query_grid = dataset.clip_grids[clip_index]
         if query_grid is None:
             raise ContractError("terrain query scene must have a height grid")
+        motion_alignment = dataset.clip_alignments[clip_index]
+        if motion_alignment is None:
+            raise ContractError(
+                "terrain query scene must have a motion registration"
+            )
         clip = dataset.folder.clips[clip_index]
         root = dataset.folder.layout.root_body_index
-        translation = torch.tensor(
+        motion_root = torch.tensor(
             clip.body_position_world[0, root, :2],
             dtype=torch.float32,
             device=dataset.device,
         )
+        translation = motion_alignment.matcher_to_scene_xy(motion_root)
         quaternion = torch.tensor(
             clip.body_quaternion_world_wxyz[0, root],
             dtype=torch.float32,
@@ -568,7 +613,10 @@ class TerrainFeatureExtension:
         )
         alignment = TerrainSceneAlignment(
             translation_scene_xy=translation,
-            yaw_scene_from_matcher=_yaw_from_wxyz(quaternion),
+            yaw_scene_from_matcher=(
+                _yaw_from_wxyz(quaternion)
+                + motion_alignment.yaw_scene_from_matcher
+            ),
         )
         return TerrainFeatureExtension(
             dataset=dataset,
@@ -596,7 +644,11 @@ class TerrainFeatureExtension:
             )
         root = folder.layout.root_body_index
         rows: list[torch.Tensor] = []
-        for clip, grid in zip(folder.clips, self.dataset.clip_grids):
+        for clip, grid, alignment in zip(
+            folder.clips,
+            self.dataset.clip_grids,
+            self.dataset.clip_alignments,
+        ):
             if grid is None:
                 rows.append(
                     torch.zeros(
@@ -606,6 +658,10 @@ class TerrainFeatureExtension:
                     )
                 )
                 continue
+            if alignment is None:
+                raise ContractError(
+                    "terrain database clip must have a motion registration"
+                )
             if self.condition == "dense":
                 position = torch.tensor(
                     clip.body_position_world[: clip.valid_frame_stop, root, :2],
@@ -619,14 +675,21 @@ class TerrainFeatureExtension:
                     dtype=torch.float32,
                     device=device,
                 )
+                position = alignment.matcher_to_scene_xy(position)
                 rows.append(
-                    _dense_rows(position, _yaw_from_wxyz(quaternion), grid)
+                    _dense_rows(
+                        position,
+                        _yaw_from_wxyz(quaternion)
+                        + alignment.yaw_scene_from_matcher,
+                        grid,
+                    )
                 )
             else:
                 rows.append(
                     _legacy_rows(
                         clip,
                         grid,
+                        alignment,
                         root_body_index=root,
                         device=torch.device(device),
                     )
