@@ -23,6 +23,7 @@ from .torch_terrain_rollout import (
     load_experiment_config,
     matcher_config_from_resolved,
     resolve_stair_config,
+    terrain_transition_validator_from_resolved,
 )
 
 
@@ -484,6 +485,9 @@ def run_live_viewer(
         config=matcher_config_from_resolved(resolved.resolved_config),
         extension=resolved.measurement_extension,
         reset_clip_path=resolved.resolved_config["reset_clip"],
+        emitted_window_validator=(
+            terrain_transition_validator_from_resolved(resolved)
+        ),
     )
     model, data = build_kinematic_scene(g1_xml, resolved)
     result = matcher.reset()

@@ -31,6 +31,7 @@ from .torch_terrain_features import (
     DENSE_LATERAL_M,
     TerrainDataset,
     TerrainFeatureExtension,
+    TerrainFootClearanceValidator,
 )
 
 
@@ -131,6 +132,14 @@ def _validate_base_config(config: object) -> None:
         _finite_number(
             matcher[name], f"matcher {name}", positive=True
         )
+    preview_steps = config.get("terrain_transition_preview_steps")
+    if (
+        type(preview_steps) is not int
+        or not 1 <= preview_steps <= 46
+    ):
+        raise ContractError(
+            "terrain_transition_preview_steps must be an integer in [1, 46]"
+        )
     for name in ("query_scene", "reset_clip"):
         if not isinstance(config.get(name), str) or not config[name]:
             raise ContractError(f"{name} must be a non-empty relative path")
@@ -206,6 +215,26 @@ def matcher_config_from_resolved(config: Mapping) -> MatcherConfig:
         transition_penalty=float(values["transition_penalty"]),
         inertialization_halflife_s=float(
             values["inertialization_halflife_s"]
+        ),
+    )
+
+
+def terrain_transition_validator_from_resolved(
+    resolved: ResolvedStairConfig,
+) -> TerrainFootClearanceValidator:
+    """Build the dense condition's emitted-window clearance validator."""
+
+    return TerrainFootClearanceValidator(
+        extension=resolved.measurement_extension,
+        preview_steps=int(
+            resolved.resolved_config[
+                "terrain_transition_preview_steps"
+            ]
+        ),
+        minimum_clearance_m=float(
+            resolved.resolved_config["acceptance"][
+                "minimum_foot_clearance_m"
+            ]
         ),
     )
 
@@ -406,6 +435,11 @@ def run_stair_rollout(
         config=matcher_config_from_resolved(config.resolved_config),
         extension=extension,
         reset_clip_path=config.resolved_config["reset_clip"],
+        emitted_window_validator=(
+            terrain_transition_validator_from_resolved(config)
+            if condition == "dense"
+            else None
+        ),
     )
     reset = matcher.reset()
     initial_root = reset.root_position_world.detach().cpu().numpy()
@@ -426,6 +460,7 @@ def run_stair_rollout(
         "selected_clip_index": [],
         "searched": [],
         "transitioned": [],
+        "transition_rejected": [],
         "motion_feature_cost": [],
         "terrain_feature_cost": [],
         "total_feature_cost": [],
@@ -525,6 +560,9 @@ def run_stair_rollout(
         )
         rows["searched"].append(np.bool_(diagnostics.searched))
         rows["transitioned"].append(np.bool_(diagnostics.transitioned))
+        rows["transition_rejected"].append(
+            np.bool_(diagnostics.transition_rejected)
+        )
         rows["motion_feature_cost"].append(
             np.float32(diagnostics.motion_feature_cost)
         )
@@ -556,7 +594,11 @@ def run_stair_rollout(
         rows["terrain_patch_position_world"].append(patch_position)
         rows["foot_clearance_m"].append(clearance.astype(np.float32))
         rows["progress_m"].append(np.float32(progress))
-        if diagnostics.searched or diagnostics.transitioned:
+        if (
+            diagnostics.searched
+            or diagnostics.transitioned
+            or diagnostics.transition_rejected
+        ):
             events.append(
                 {
                     "sequence": diagnostics.sequence,
@@ -565,6 +607,9 @@ def run_stair_rollout(
                     "selected_frame": diagnostics.selected_frame,
                     "searched": diagnostics.searched,
                     "transitioned": diagnostics.transitioned,
+                    "transition_rejected": (
+                        diagnostics.transition_rejected
+                    ),
                     "motion_feature_cost": diagnostics.motion_feature_cost,
                     "terrain_feature_cost": diagnostics.extension_feature_cost,
                     "total_feature_cost": diagnostics.selected_feature_cost,
@@ -615,6 +660,9 @@ def run_stair_rollout(
             else None
         ),
         "step_count": steps,
+        "rejected_transition_count": int(
+            arrays["transition_rejected"].sum()
+        ),
         "first_stair_selection_progress_m": first_selection_progress,
         "maximum_progress_m": maximum_progress,
         "maximum_root_height_gain_m": maximum_height_gain,

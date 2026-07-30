@@ -35,5 +35,6 @@
   },
   "query_scene": "stair/updown-0000/motion.npz",
   "reset_clip": "flat/motion.npz",
-  "schema": "g1-torch-stair-small-experiment/v1"
+  "schema": "g1-torch-stair-small-experiment/v1",
+  "terrain_transition_preview_steps": 10
 }

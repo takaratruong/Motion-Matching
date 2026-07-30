@@ -203,6 +203,14 @@ class LiveMujocoSceneTests(unittest.TestCase):
             "matcher_config_from_resolved",
             inspect.getsource(live_module.run_live_viewer),
         )
+        self.assertIn(
+            "terrain_transition_validator_from_resolved",
+            inspect.getsource(live_module.run_live_viewer),
+        )
+        self.assertIn(
+            "emitted_window_validator",
+            inspect.getsource(live_module.run_live_viewer),
+        )
         help_text = build_live_viewer_argument_parser().format_help()
         for option in ("--dataset", "--config", "--g1-xml", "--device"):
             self.assertIn(option, help_text)

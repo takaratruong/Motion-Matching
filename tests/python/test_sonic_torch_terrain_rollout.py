@@ -7,6 +7,9 @@ from unittest import mock
 import numpy as np
 
 from mm_sonic.torch_motion_matcher import TorchMotionMatcher
+from mm_sonic.torch_terrain_features import (
+    TerrainFootClearanceValidator,
+)
 from mm_sonic.torch_terrain_rollout import (
     evaluate_dense_acceptance,
     load_experiment_config,
@@ -14,6 +17,7 @@ from mm_sonic.torch_terrain_rollout import (
     resolve_stair_config,
     run_stair_rollout,
     save_stair_rollout,
+    terrain_transition_validator_from_resolved,
 )
 from resources.g1_torch_stair_builder.publish import publish_stair_slice
 from resources.g1_torch_stair_builder.surface import ZUpHeightGrid
@@ -83,6 +87,19 @@ class TerrainRolloutTests(unittest.TestCase):
         self.assertAlmostEqual(
             matcher.inertialization_halflife_s, 0.1
         )
+        validator = terrain_transition_validator_from_resolved(
+            self.resolved
+        )
+        self.assertIsInstance(
+            validator, TerrainFootClearanceValidator
+        )
+        self.assertEqual(validator.preview_steps, 10)
+        self.assertEqual(
+            validator.minimum_clearance_m,
+            self.resolved.resolved_config["acceptance"][
+                "minimum_foot_clearance_m"
+            ],
+        )
 
         raw = load_experiment_config(CONFIG_PATH)
         cases = {}
@@ -107,6 +124,10 @@ class TerrainRolloutTests(unittest.TestCase):
         nonfinite = json.loads(json.dumps(raw))
         nonfinite["matcher"]["yaw_rate_rad_s"] = float("nan")
         cases["yaw_rate_rad_s"] = nonfinite
+        for value in (0, 47, True):
+            preview = json.loads(json.dumps(raw))
+            preview["terrain_transition_preview_steps"] = value
+            cases[f"terrain preview {value!r}"] = preview
         for label, invalid in cases.items():
             with self.subTest(label=label):
                 with self.assertRaises(Exception):
@@ -118,14 +139,29 @@ class TerrainRolloutTests(unittest.TestCase):
         expected = matcher_config_from_resolved(
             self.resolved.resolved_config
         )
+        real_build = TorchMotionMatcher.from_folder
+        calls = []
+
+        def recording_build(*args, **kwargs):
+            calls.append(dict(kwargs))
+            kwargs["emitted_window_validator"] = None
+            return real_build(*args, **kwargs)
+
         with mock.patch.object(
             TorchMotionMatcher,
             "from_folder",
-            wraps=TorchMotionMatcher.from_folder,
-        ) as build:
+            side_effect=recording_build,
+        ):
             run_stair_rollout(self.resolved, "flat", device="cpu")
-        self.assertEqual(build.call_count, 1)
-        self.assertEqual(build.call_args.kwargs["config"], expected)
+            run_stair_rollout(self.resolved, "dense", device="cpu")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["config"], expected)
+        self.assertEqual(calls[1]["config"], expected)
+        self.assertIsNone(calls[0]["emitted_window_validator"])
+        self.assertIsInstance(
+            calls[1]["emitted_window_validator"],
+            TerrainFootClearanceValidator,
+        )
 
     def test_deterministic_hash_and_commands_are_condition_independent(self):
         first = run_stair_rollout(self.resolved, "flat", device="cpu")
@@ -173,6 +209,7 @@ class TerrainRolloutTests(unittest.TestCase):
             ("selected_clip_index", ()),
             ("searched", ()),
             ("transitioned", ()),
+            ("transition_rejected", ()),
             ("motion_feature_cost", ()),
             ("terrain_feature_cost", ()),
             ("total_feature_cost", ()),
@@ -190,6 +227,10 @@ class TerrainRolloutTests(unittest.TestCase):
             self.assertEqual(arrays[name].shape, (10,) + trailing)
         self.assertTrue(np.isfinite(arrays["foot_clearance_m"]).all())
         self.assertTrue(np.isfinite(arrays["step_time_ns"]).all())
+        self.assertEqual(
+            rollout.metrics["rejected_transition_count"],
+            int(arrays["transition_rejected"].sum()),
+        )
         np.testing.assert_allclose(
             arrays["motion_feature_cost"] + arrays["terrain_feature_cost"],
             arrays["total_feature_cost"],
