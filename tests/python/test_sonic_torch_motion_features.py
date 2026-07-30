@@ -22,6 +22,7 @@ from mm_sonic.torch_motion_features import (
     FEATURE_HORIZON_FRAMES,
     CommandTrajectory,
     GeneratedFeatureState,
+    SearchFeatureExtension,
     TorchMotionDatabase,
     extract_query_features,
 )
@@ -39,6 +40,35 @@ from tests.python.torch_motion_test_utils import (
 )
 
 _CPU = torch.device("cpu")
+
+
+class _TwoValueExtension:
+    name = "test_extension"
+    dimension = 2
+    weight = 2.0
+
+    def __init__(self, *, dtype=torch.float32, wrong_rows=0, constant=False):
+        self.dtype = dtype
+        self.wrong_rows = wrong_rows
+        self.constant = constant
+        self.query_calls = 0
+        self.database_calls = 0
+
+    def database_rows(self, folder, device):
+        self.database_calls += 1
+        rows = []
+        for clip in folder.clips:
+            count = clip.valid_frame_stop + self.wrong_rows
+            frame = torch.arange(count, dtype=self.dtype, device=device)
+            if self.constant:
+                frame = torch.zeros_like(frame)
+            rows.append(torch.stack((frame, 0.25 * frame * frame + frame), dim=1))
+        return tuple(rows)
+
+    def query_row(self, state, trajectory):
+        self.query_calls += 1
+        x = state.root_position_world[0]
+        return torch.stack((x, x * x + x)).to(dtype=self.dtype)
 
 
 def _generated_state_from_arrays(arrays, frame, device=_CPU):
@@ -233,6 +263,57 @@ class FeatureVectorContractTests(unittest.TestCase):
 
 
 class NormalizationAndDatabaseTests(unittest.TestCase):
+    def test_optional_extension_appends_one_normalized_group(self):
+        self.assertTrue(issubclass(SearchFeatureExtension, object))
+        arrays = build_varying_takara_arrays(frames=80)
+        extension = _TwoValueExtension()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            folder = MotionFolder.load(root)
+            db = TorchMotionDatabase.from_folder(
+                folder, device="cpu", extension=extension
+            )
+
+        self.assertEqual(db.feature_shape, (35, 29))
+        self.assertEqual(extension.database_calls, 1)
+        mean, scale = db.normalization.parameters_copy()
+        self.assertEqual(tuple(mean.shape), (29,))
+        self.assertEqual(tuple(scale.shape), (29,))
+        self.assertTrue(torch.isfinite(db.normalized_features_copy()).all())
+        self.assertEqual(db.motion_feature_dim, 27)
+
+    def test_extension_rejects_wrong_rows_dtype_nonfinite_and_zero_variance(self):
+        arrays = build_varying_takara_arrays(frames=80)
+
+        def build(extension):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                write_takara_arrays(root / "walk", arrays)
+                folder = MotionFolder.load(root)
+                return TorchMotionDatabase.from_folder(
+                    folder, device="cpu", extension=extension
+                )
+
+        with self.assertRaisesRegex(Exception, "rows"):
+            build(_TwoValueExtension(wrong_rows=1))
+        with self.assertRaisesRegex(Exception, "float32"):
+            build(_TwoValueExtension(dtype=torch.float64))
+
+        nonfinite = _TwoValueExtension()
+        original = nonfinite.database_rows
+
+        def nan_rows(folder, device):
+            rows = list(original(folder, device))
+            rows[0][0, 0] = float("nan")
+            return tuple(rows)
+
+        nonfinite.database_rows = nan_rows
+        with self.assertRaisesRegex(Exception, "finite"):
+            build(nonfinite)
+        with self.assertRaisesRegex(Exception, "scale"):
+            build(_TwoValueExtension(constant=True))
+
     def test_group_means_scales_and_normalized_rows_match_numpy_oracle(self):
         arrays = build_varying_takara_arrays(frames=80)
         with tempfile.TemporaryDirectory() as tmp:
@@ -317,6 +398,34 @@ class NormalizationAndDatabaseTests(unittest.TestCase):
             db = TorchMotionDatabase.from_folder(folder, device="cpu")
         # Clip a frame 2 is the earliest global row with minimal joint velocity.
         self.assertEqual(db.reset_row, db.row_for_source(0, 2))
+
+    def test_reset_clip_path_limits_reset_selection_to_exact_clip(self):
+        arrays_flat = build_varying_takara_arrays(frames=70)
+        arrays_stair = build_varying_takara_arrays(frames=70)
+        arrays_flat["joint_vel"][:] = 2.0
+        arrays_flat["joint_vel"][7] = 0.2
+        arrays_stair["joint_vel"][:] = 1.0
+        arrays_stair["joint_vel"][3] = 0.0
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "flat", arrays_flat)
+            write_takara_arrays(root / "stair", arrays_stair)
+            folder = MotionFolder.load(root)
+            global_db = TorchMotionDatabase.from_folder(folder, device="cpu")
+            flat_db = TorchMotionDatabase.from_folder(
+                folder,
+                device="cpu",
+                reset_clip_path="flat/motion.npz",
+            )
+            with self.assertRaisesRegex(Exception, "reset clip"):
+                TorchMotionDatabase.from_folder(
+                    folder,
+                    device="cpu",
+                    reset_clip_path="missing/motion.npz",
+                )
+
+        self.assertEqual(global_db.reset_row, global_db.row_for_source(1, 3))
+        self.assertEqual(flat_db.reset_row, flat_db.row_for_source(0, 7))
 
     def test_cpu_and_cuda_database_tensors_are_immutable_by_api(self):
         arrays = build_varying_takara_arrays(frames=60)

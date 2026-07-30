@@ -15,6 +15,8 @@ to the current root in the same heading frame.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
+from typing import Protocol, Sequence
 
 import torch
 
@@ -36,6 +38,24 @@ FEATURE_GROUPS = (
 )
 
 FEATURE_DIM = 27
+
+
+class SearchFeatureExtension(Protocol):
+    """One optional feature group shared by database and live query paths."""
+
+    name: str
+    dimension: int
+    weight: float
+
+    def database_rows(
+        self, folder: MotionFolder, device: torch.device
+    ) -> Sequence[torch.Tensor]:
+        ...
+
+    def query_row(
+        self, state: "GeneratedFeatureState", trajectory: "CommandTrajectory"
+    ) -> torch.Tensor:
+        ...
 
 
 @dataclass(frozen=True)
@@ -78,6 +98,8 @@ class TorchMotionDatabase:
     _search_frame_index: torch.Tensor
     # Private ``(clip_index, frame_index) -> global row`` provenance mapping.
     _source_row_map: "dict[tuple[int, int], int]"
+    _extension: SearchFeatureExtension | None = None
+    motion_feature_dim: int = FEATURE_DIM
 
     @property
     def feature_shape(self) -> tuple[int, int]:
@@ -91,9 +113,18 @@ class TorchMotionDatabase:
 
     @staticmethod
     def from_folder(
-        folder: MotionFolder, *, device: "str | torch.device"
+        folder: MotionFolder,
+        *,
+        device: "str | torch.device",
+        extension: SearchFeatureExtension | None = None,
+        reset_clip_path: str | None = None,
     ) -> "TorchMotionDatabase":
-        return _build_database(folder, device)
+        return _build_database(
+            folder,
+            device,
+            extension=extension,
+            reset_clip_path=reset_clip_path,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +249,65 @@ def extract_query_features(
     return _feature_row(state, trajectory)
 
 
+def _extension_contract(
+    extension: SearchFeatureExtension | None,
+) -> tuple[str, int, float] | None:
+    if extension is None:
+        return None
+    name = getattr(extension, "name", None)
+    dimension = getattr(extension, "dimension", None)
+    weight = getattr(extension, "weight", None)
+    if not isinstance(name, str) or not name:
+        raise ContractError("feature extension name must be a non-empty string")
+    if (
+        not isinstance(dimension, int)
+        or isinstance(dimension, bool)
+        or dimension <= 0
+    ):
+        raise ContractError(
+            "feature extension dimension must be a positive integer"
+        )
+    if (
+        not isinstance(weight, (int, float))
+        or isinstance(weight, bool)
+        or not math.isfinite(float(weight))
+        or float(weight) <= 0.0
+    ):
+        raise ContractError(
+            "feature extension weight must be finite and positive"
+        )
+    if not callable(getattr(extension, "database_rows", None)):
+        raise ContractError("feature extension database_rows must be callable")
+    if not callable(getattr(extension, "query_row", None)):
+        raise ContractError("feature extension query_row must be callable")
+    return name, dimension, float(weight)
+
+
+def validated_extension_query_row(
+    extension: SearchFeatureExtension,
+    state: GeneratedFeatureState,
+    trajectory: CommandTrajectory,
+) -> torch.Tensor:
+    contract = _extension_contract(extension)
+    assert contract is not None
+    _name, dimension, _weight = contract
+    row = extension.query_row(state, trajectory)
+    reference = state.root_position_world
+    if not isinstance(row, torch.Tensor) or tuple(row.shape) != (dimension,):
+        raise ContractError(
+            f"feature extension query row must have shape ({dimension},)"
+        )
+    if row.dtype != torch.float32:
+        raise ContractError("feature extension query row must use float32")
+    if row.device != reference.device:
+        raise ContractError(
+            "feature extension query row must be on the matcher device"
+        )
+    if not torch.isfinite(row).all():
+        raise ContractError("feature extension query row must be finite")
+    return row
+
+
 # ---------------------------------------------------------------------------
 # Database construction.
 # ---------------------------------------------------------------------------
@@ -270,10 +360,27 @@ def _clip_feature_rows(
 
 
 def _build_database(
-    folder: MotionFolder, device: "str | torch.device"
+    folder: MotionFolder,
+    device: "str | torch.device",
+    *,
+    extension: SearchFeatureExtension | None = None,
+    reset_clip_path: str | None = None,
 ) -> TorchMotionDatabase:
     resolved = torch.device(device) if not isinstance(device, torch.device) else device
     layout = folder.layout
+    extension_contract = _extension_contract(extension)
+    extension_rows: tuple[torch.Tensor, ...] | None = None
+    if extension is not None:
+        try:
+            extension_rows = tuple(extension.database_rows(folder, resolved))
+        except ContractError:
+            raise
+        except Exception as error:
+            raise ContractError("feature extension database rows failed") from error
+        if len(extension_rows) != len(folder.clips):
+            raise ContractError(
+                "feature extension database rows must contain one tensor per clip"
+            )
 
     rows: list[torch.Tensor] = []
     clip_indices: list[int] = []
@@ -285,6 +392,29 @@ def _build_database(
         clip_rows, clip_joint_velocity_sq = _clip_feature_rows(
             clip, resolved, layout
         )
+        if extension_rows is not None:
+            assert extension_contract is not None
+            _name, dimension, _weight = extension_contract
+            extra = extension_rows[clip_index]
+            expected = (clip.valid_frame_stop, dimension)
+            if not isinstance(extra, torch.Tensor) or tuple(extra.shape) != expected:
+                raise ContractError(
+                    "feature extension rows for "
+                    f"{clip.relative_path} must have shape {expected}"
+                )
+            if extra.dtype != torch.float32:
+                raise ContractError(
+                    "feature extension database rows must use float32"
+                )
+            if extra.device != resolved:
+                raise ContractError(
+                    "feature extension database rows must be on the database device"
+                )
+            if not torch.isfinite(extra).all():
+                raise ContractError(
+                    "feature extension database rows must be finite"
+                )
+            clip_rows = torch.cat((clip_rows, extra.detach()), dim=1)
         rows.append(clip_rows)
         joint_velocity_sq.append(clip_joint_velocity_sq)
         first_row = sum(item.shape[0] for item in rows[:-1])
@@ -304,7 +434,13 @@ def _build_database(
     component_mean = features.mean(dim=0)
     component_std = features.std(dim=0, unbiased=False)
     scale = torch.empty_like(component_mean)
-    for name, group_slice, weight in FEATURE_GROUPS:
+    groups = list(FEATURE_GROUPS)
+    if extension_contract is not None:
+        name, dimension, weight = extension_contract
+        groups.append(
+            (name, slice(FEATURE_DIM, FEATURE_DIM + dimension), weight)
+        )
+    for name, group_slice, weight in groups:
         group_std = component_std[group_slice].mean()
         group_scale = group_std / weight
         if not torch.isfinite(group_scale) or group_scale <= 0.0:
@@ -319,7 +455,33 @@ def _build_database(
 
     # reset_row: minimum joint-velocity squared norm, smallest global row tie break.
     jv = torch.cat(joint_velocity_sq)
-    reset_row = int(torch.argmin(jv).item())
+    if reset_clip_path is None:
+        reset_row = int(torch.argmin(jv).item())
+    else:
+        if not isinstance(reset_clip_path, str) or not reset_clip_path:
+            raise ContractError("reset clip path must be a non-empty string")
+        matches = [
+            index
+            for index, clip in enumerate(folder.clips)
+            if clip.relative_path == reset_clip_path
+        ]
+        if len(matches) != 1:
+            raise ContractError(
+                f"reset clip path must resolve exactly once: {reset_clip_path}"
+            )
+        reset_clip_index = matches[0]
+        global_indices = (
+            (
+                torch.tensor(clip_indices, device=resolved)
+                == reset_clip_index
+            )
+            .nonzero(as_tuple=False)
+            .flatten()
+        )
+        if global_indices.numel() == 0:
+            raise ContractError("reset clip produced no searchable rows")
+        local_row = int(torch.argmin(jv[global_indices]).item())
+        reset_row = int(global_indices[local_row].item())
 
     normalization = FeatureNormalization(
         _component_mean=component_mean.detach(),
@@ -334,5 +496,7 @@ def _build_database(
         _search_clip_index=torch.tensor(clip_indices, device=resolved),
         _search_frame_index=torch.tensor(frame_indices, device=resolved),
         _source_row_map=source_row_map,
+        _extension=extension,
+        motion_feature_dim=FEATURE_DIM,
     )
     return database

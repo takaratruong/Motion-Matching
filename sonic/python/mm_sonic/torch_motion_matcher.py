@@ -14,8 +14,10 @@ from .torch_motion_data import MotionFolder
 from .torch_motion_features import (
     CommandTrajectory,
     GeneratedFeatureState,
+    SearchFeatureExtension,
     TorchMotionDatabase,
     extract_query_features,
+    validated_extension_query_row,
 )
 
 
@@ -465,6 +467,8 @@ class MotionMatchDiagnostics:
     selected_frame: int
     incumbent_cost: float
     selected_feature_cost: float
+    motion_feature_cost: float
+    extension_feature_cost: float
     selected_total_cost: float
     searched: bool
     transitioned: bool
@@ -483,6 +487,8 @@ class MotionMatchResult:
     dense_joint_velocity_window: torch.Tensor
     dense_root_position_window: torch.Tensor
     dense_root_orientation_window_wxyz: torch.Tensor
+    dense_feature_body_position_window: torch.Tensor
+    dense_feature_body_velocity_window: torch.Tensor
     joint_position_window: torch.Tensor
     joint_velocity_window: torch.Tensor
     root_position_window: torch.Tensor
@@ -553,6 +559,8 @@ def _copy_result(result: MotionMatchResult) -> MotionMatchResult:
             "dense_joint_velocity_window",
             "dense_root_position_window",
             "dense_root_orientation_window_wxyz",
+            "dense_feature_body_position_window",
+            "dense_feature_body_velocity_window",
             "joint_position_window",
             "joint_velocity_window",
             "root_position_window",
@@ -593,6 +601,8 @@ class TorchMotionMatcher:
         *,
         device: str = "auto",
         config: MatcherConfig = MatcherConfig(),
+        extension: SearchFeatureExtension | None = None,
+        reset_clip_path: str | None = None,
     ) -> "TorchMotionMatcher":
         resolved = (
             torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -602,7 +612,12 @@ class TorchMotionMatcher:
         if resolved.type == "cuda" and not torch.cuda.is_available():
             raise ContractError("CUDA motion matcher requested but unavailable")
         folder = MotionFolder.load(motions_dir)
-        database = TorchMotionDatabase.from_folder(folder, device=resolved)
+        database = TorchMotionDatabase.from_folder(
+            folder,
+            device=resolved,
+            extension=extension,
+            reset_clip_path=reset_clip_path,
+        )
         clips = tuple(
             _DeviceClip(
                 joint_position=torch.tensor(
@@ -685,10 +700,14 @@ class TorchMotionMatcher:
         force_reason: str | None,
         search_time_ns: int | None,
         step_start_ns: int,
+        motion_feature_cost: float,
+        extension_feature_cost: float,
         dense_joint_p: torch.Tensor,
         dense_joint_v: torch.Tensor,
         dense_root_p: torch.Tensor,
         dense_root_q: torch.Tensor,
+        dense_body_p: torch.Tensor,
+        dense_body_v: torch.Tensor,
     ) -> MotionMatchResult:
         sample = torch.arange(0, 46, 5, device=self.device)
         diagnostics = MotionMatchDiagnostics(
@@ -697,6 +716,8 @@ class TorchMotionMatcher:
             selected_frame=frame_index,
             incumbent_cost=decision.incumbent_cost,
             selected_feature_cost=decision.selected_feature_cost,
+            motion_feature_cost=motion_feature_cost,
+            extension_feature_cost=extension_feature_cost,
             selected_total_cost=decision.selected_total_cost,
             searched=decision.searched,
             transitioned=decision.transitioned,
@@ -713,6 +734,8 @@ class TorchMotionMatcher:
             dense_joint_velocity_window=dense_joint_v.clone(),
             dense_root_position_window=dense_root_p.clone(),
             dense_root_orientation_window_wxyz=dense_root_q.clone(),
+            dense_feature_body_position_window=dense_body_p.clone(),
+            dense_feature_body_velocity_window=dense_body_v.clone(),
             joint_position_window=dense_joint_p[sample].clone(),
             joint_velocity_window=dense_joint_v[sample].clone(),
             root_position_window=dense_root_p[sample].clone(),
@@ -723,6 +746,8 @@ class TorchMotionMatcher:
         finite &= torch.isfinite(dense_joint_v).all()
         finite &= torch.isfinite(dense_root_p).all()
         finite &= torch.isfinite(dense_root_q).all()
+        finite &= torch.isfinite(dense_body_p).all()
+        finite &= torch.isfinite(dense_body_v).all()
         unit = torch.all(
             torch.abs(torch.linalg.vector_norm(dense_root_q, dim=-1) - 1.0)
             <= 1e-5
@@ -766,10 +791,14 @@ class TorchMotionMatcher:
             force_reason=None,
             search_time_ns=None,
             step_start_ns=step_start,
+            motion_feature_cost=0.0,
+            extension_feature_cost=0.0,
             dense_joint_p=jp,
             dense_joint_v=jv,
             dense_root_p=rp,
             dense_root_q=rq,
+            dense_body_p=bp,
+            dense_body_v=bv,
         )
         self._state = _MatcherState(
             0, clip_index, frame_index, yaw_offset, translation,
@@ -820,9 +849,19 @@ class TorchMotionMatcher:
             left_foot_velocity_world=state.feature_body_velocity[1],
             right_foot_velocity_world=state.feature_body_velocity[2],
         )
-        query = self.database.normalization.normalize(
-            extract_query_features(feature_state, shaped.trajectory)
-        )
+        raw_query = extract_query_features(feature_state, shaped.trajectory)
+        if self.database._extension is not None:
+            raw_query = torch.cat(
+                (
+                    raw_query,
+                    validated_extension_query_row(
+                        self.database._extension,
+                        feature_state,
+                        shaped.trajectory,
+                    ),
+                )
+            )
+        query = self.database.normalization.normalize(raw_query)
         search = search_is_due(
             state.sequence, shaped.force_search, self.config
         )
@@ -837,6 +876,21 @@ class TorchMotionMatcher:
             config=self.config,
         )
         search_time = time.perf_counter_ns() - search_start if search else None
+        residual_sq = torch.square(
+            self.database._search_features[decision.selected_row] - query
+        )
+        motion_cost_tensor = residual_sq[
+            : self.database.motion_feature_dim
+        ].sum()
+        extension_cost_tensor = residual_sq[
+            self.database.motion_feature_dim :
+        ].sum()
+        motion_feature_cost, extension_feature_cost = (
+            torch.stack((motion_cost_tensor, extension_cost_tensor))
+            .to(torch.float64)
+            .cpu()
+            .tolist()
+        )
         clip_index, frame_index = self._source_for_row(decision.selected_row)
         transitioned = decision.transitioned or successor is None
         if transitioned:
@@ -928,10 +982,14 @@ class TorchMotionMatcher:
             force_reason=force_reason,
             search_time_ns=search_time,
             step_start_ns=step_start,
+            motion_feature_cost=float(motion_feature_cost),
+            extension_feature_cost=float(extension_feature_cost),
             dense_joint_p=dense_jp,
             dense_joint_v=dense_jv,
             dense_root_p=dense_rp,
             dense_root_q=dense_rq,
+            dense_body_p=dense_bp,
+            dense_body_v=dense_bv,
         )
         next_state = _MatcherState(
             state.sequence + 1, clip_index, frame_index, yaw_offset, translation,
