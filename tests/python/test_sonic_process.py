@@ -4079,6 +4079,22 @@ class SimulationPolicyGateTests(TemporaryScriptCase):
         with self.assertRaises((RuntimeError, ValueError)):
             gate.commit_release(prepared, 4)
 
+    def test_channel_gate_accepts_many_fresh_release_tokens(self):
+        simulator = FakeSimulatorClient()
+        gear = FakeChannelGatedGear()
+        simulator.gear = gear
+        gate = SimulationPolicyGate(
+            gear, simulator, pause_strategy="control-channel"
+        )
+        gate.pause()
+        for frame_end in range(46, 146):
+            prepared = gate.prepare_release(
+                expected_stream_frame_end=frame_end
+            )
+            gate.commit_release(prepared, 4)
+        self.assertEqual(len(simulator.steps), 100)
+        self.assertTrue(gate.is_paused)
+
     def test_channel_gate_positively_repauses_when_advance_fails_while_armed(self):
         class FailingSimulator(FakeSimulatorClient):
             def advance(self, steps):
