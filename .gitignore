@@ -16,3 +16,5 @@ resources/runs*
 /sonic/runs/
 /build/torch-stair-small/
 /build/torch-stair-small-results/
+/build/torch-terrain-expanded/
+/build/torch-terrain-expanded-admission.json

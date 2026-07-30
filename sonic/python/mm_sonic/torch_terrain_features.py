@@ -32,6 +32,7 @@ DENSE_FORWARD_M = tuple(-0.15 + 0.15 * index for index in range(13))
 DENSE_LATERAL_M = tuple(-0.45 + 0.15 * index for index in range(7))
 LEGACY_DISTANCE_M = (0.25, 0.50, 0.75, 1.00)
 TERRAIN_DATASET_SCHEMA = "g1-torch-stair-slice/v1"
+EXPANDED_TERRAIN_DATASET_SCHEMA = "g1-torch-terrain-corpus/v1"
 
 
 def _sha256(path: Path) -> str:
@@ -237,16 +238,29 @@ class TerrainDataset:
             raise ContractError("terrain manifest is not valid JSON") from error
         if not isinstance(manifest, dict):
             raise ContractError("terrain manifest must be an object")
-        if manifest.get("schema") != TERRAIN_DATASET_SCHEMA:
+        schema = manifest.get("schema")
+        if schema not in (
+            TERRAIN_DATASET_SCHEMA,
+            EXPANDED_TERRAIN_DATASET_SCHEMA,
+        ):
             raise ContractError("terrain manifest schema is invalid")
         if manifest.get("output_fps") != 50:
             raise ContractError("terrain manifest output_fps must equal 50")
         if manifest.get("layout") != G1_TAKARA_LAYOUT.identity:
             raise ContractError("terrain manifest layout is invalid")
         descriptors = manifest.get("clips")
-        if not isinstance(descriptors, list) or len(descriptors) != 5:
+        if not isinstance(descriptors, list) or not descriptors:
+            raise ContractError("terrain manifest must describe clips")
+        if schema == TERRAIN_DATASET_SCHEMA and len(descriptors) != 5:
             raise ContractError(
                 "terrain manifest must describe exactly five clips"
+            )
+        if (
+            schema == EXPANDED_TERRAIN_DATASET_SCHEMA
+            and manifest.get("accepted_clips") != descriptors
+        ):
+            raise ContractError(
+                "expanded terrain accepted clips must match clip inventory"
             )
 
         resolved_device = resolve_torch_device(device)
@@ -288,7 +302,15 @@ class TerrainDataset:
                     )
                 grids.append(None)
                 continue
-            if kind != "heightgrid" or descriptor.get("kind") != "stair":
+            expected_kinds = (
+                ("stair",)
+                if schema == TERRAIN_DATASET_SCHEMA
+                else ("terrain",)
+            )
+            if (
+                kind != "heightgrid"
+                or descriptor.get("kind") not in expected_kinds
+            ):
                 raise ContractError(
                     f"terrain kind is invalid: {clip.relative_path}"
                 )
