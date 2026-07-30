@@ -6,9 +6,11 @@ import unittest
 import numpy as np
 import torch
 
+from mm_sonic.joints import ContractError
 from mm_sonic.torch_motion_features import CommandTrajectory, TorchMotionDatabase
 from mm_sonic.torch_motion_matcher import (
     MatcherConfig,
+    active_transition_penalty,
     bounded_velocity_step,
     bounded_yaw_step,
     predict_command_trajectory,
@@ -237,6 +239,115 @@ class ExactSearchTests(unittest.TestCase):
         )
         self.assertEqual(decision.selected_row, 1)
         self.assertTrue(decision.transitioned)
+
+    def test_active_transition_penalty_decays_linearly_and_can_be_disabled(self):
+        cfg = MatcherConfig(
+            transition_settle_duration_s=0.20,
+            transition_settle_penalty=10.0,
+        )
+        self.assertAlmostEqual(active_transition_penalty(0.0, cfg), 10.0)
+        self.assertAlmostEqual(active_transition_penalty(0.05, cfg), 7.5)
+        self.assertAlmostEqual(active_transition_penalty(0.20, cfg), 0.0)
+        self.assertAlmostEqual(active_transition_penalty(1.0, cfg), 0.0)
+        self.assertEqual(
+            active_transition_penalty(
+                0.0,
+                MatcherConfig(
+                    transition_settle_duration_s=0.20,
+                    transition_settle_penalty=0.0,
+                ),
+            ),
+            0.0,
+        )
+        self.assertEqual(
+            active_transition_penalty(
+                0.0,
+                MatcherConfig(
+                    transition_settle_duration_s=0.0,
+                    transition_settle_penalty=10.0,
+                ),
+            ),
+            0.0,
+        )
+
+    def test_active_transition_penalty_rejects_invalid_inputs(self):
+        valid = MatcherConfig(
+            transition_settle_duration_s=0.20,
+            transition_settle_penalty=10.0,
+        )
+        for age in (-0.01, math.inf, -math.inf, math.nan):
+            with self.subTest(age=age):
+                with self.assertRaises(ContractError):
+                    active_transition_penalty(age, valid)
+        for duration in (-0.01, math.inf, math.nan):
+            with self.subTest(duration=duration):
+                with self.assertRaises(ContractError):
+                    active_transition_penalty(
+                        0.0,
+                        MatcherConfig(
+                            transition_settle_duration_s=duration,
+                            transition_settle_penalty=10.0,
+                        ),
+                    )
+        for magnitude in (-0.01, math.inf, math.nan):
+            with self.subTest(magnitude=magnitude):
+                with self.assertRaises(ContractError):
+                    active_transition_penalty(
+                        0.0,
+                        MatcherConfig(
+                            transition_settle_duration_s=0.20,
+                            transition_settle_penalty=magnitude,
+                        ),
+                    )
+
+    def test_additional_penalty_never_applies_to_incumbent(self):
+        db = _database(
+            [[math.sqrt(1.0)], [math.sqrt(0.5)]],
+            [0, 1],
+            [1, 1],
+            "cpu",
+        )
+        held = select_exact_candidate(
+            db,
+            torch.zeros(1),
+            current_clip_index=0,
+            current_frame_index=0,
+            incumbent_row=0,
+            search=True,
+            config=MatcherConfig(),
+            additional_transition_penalty=0.5,
+        )
+        self.assertEqual(held.selected_row, 0)
+        self.assertAlmostEqual(held.selected_total_cost, 1.0)
+
+        switched = select_exact_candidate(
+            db,
+            torch.zeros(1),
+            current_clip_index=0,
+            current_frame_index=0,
+            incumbent_row=0,
+            search=True,
+            config=MatcherConfig(),
+            additional_transition_penalty=0.3,
+        )
+        self.assertEqual(switched.selected_row, 1)
+        self.assertAlmostEqual(switched.selected_total_cost, 0.9, places=6)
+
+    def test_additional_transition_penalty_must_be_finite_and_non_negative(self):
+        db = _database([[1.0], [0.0]], [0, 1], [1, 1], "cpu")
+        for penalty in (-0.01, math.inf, -math.inf, math.nan):
+            with self.subTest(penalty=penalty):
+                with self.assertRaises(ContractError):
+                    select_exact_candidate(
+                        db,
+                        torch.zeros(1),
+                        current_clip_index=0,
+                        current_frame_index=0,
+                        incumbent_row=0,
+                        search=True,
+                        config=MatcherConfig(),
+                        additional_transition_penalty=penalty,
+                    )
 
     def test_missing_incumbent_requires_lowest_cost_valid_candidate(self):
         db = _database([[0.0], [2.0], [1.0]], [0, 1, 1], [5, 2, 3], "cpu")

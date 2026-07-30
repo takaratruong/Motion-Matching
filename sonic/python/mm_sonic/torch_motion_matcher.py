@@ -35,6 +35,8 @@ class MatcherConfig:
     exclusion_frames: int = 20
     transition_penalty: float = 0.1
     inertialization_halflife_s: float = 0.10
+    transition_settle_duration_s: float = 0.0
+    transition_settle_penalty: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -63,6 +65,30 @@ class EmittedWindowValidator(Protocol):
         self, feature_body_position_window: torch.Tensor
     ) -> bool:
         ...
+
+
+def active_transition_penalty(
+    blend_age_s: float,
+    config: MatcherConfig = MatcherConfig(),
+) -> float:
+    """Return the linearly decayed cost of interrupting an active blend."""
+
+    age = float(blend_age_s)
+    duration = float(config.transition_settle_duration_s)
+    magnitude = float(config.transition_settle_penalty)
+    if not math.isfinite(age) or age < 0.0:
+        raise ContractError("blend_age_s must be finite and non-negative")
+    if not math.isfinite(duration) or duration < 0.0:
+        raise ContractError(
+            "transition_settle_duration_s must be finite and non-negative"
+        )
+    if not math.isfinite(magnitude) or magnitude < 0.0:
+        raise ContractError(
+            "transition_settle_penalty must be finite and non-negative"
+        )
+    if duration == 0.0 or magnitude == 0.0 or age >= duration:
+        return 0.0
+    return magnitude * (1.0 - age / duration)
 
 
 def _require_planar_pair(
@@ -293,8 +319,14 @@ def select_exact_candidate(
     incumbent_row: int | None,
     search: bool,
     config: MatcherConfig = MatcherConfig(),
+    additional_transition_penalty: float = 0.0,
 ) -> SearchDecision:
     """Select the exact lowest-cost eligible row with continuation hysteresis."""
+    additional_penalty = float(additional_transition_penalty)
+    if not math.isfinite(additional_penalty) or additional_penalty < 0.0:
+        raise ContractError(
+            "additional_transition_penalty must be finite and non-negative"
+        )
     features, row_count = _validate_search_inputs(
         database, normalized_query, incumbent_row
     )
@@ -338,7 +370,11 @@ def select_exact_candidate(
     if incumbent_row is not None:
         eligible[incumbent_row] = True
 
-    total_costs = feature_costs + config.transition_penalty
+    total_costs = (
+        feature_costs
+        + config.transition_penalty
+        + additional_penalty
+    )
     if incumbent_row is not None:
         total_costs[incumbent_row] = feature_costs[incumbent_row]
     total_costs = total_costs.masked_fill(~eligible, math.inf)
