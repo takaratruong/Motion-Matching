@@ -31,6 +31,7 @@ from mm_sonic.manual_demo import (
     _parser,
     _print_terminal_event,
     _raise_if_restart_requested,
+    _sample_and_commit_torch_boundary,
     _run_startup_transaction,
     _validated_preload_chunks,
     _wait_for_x11_target,
@@ -53,6 +54,41 @@ class _StopAfterSimulator(Exception):
 
 
 class X11TargetReadinessTests(unittest.TestCase):
+    def test_torch_boundary_retries_a_superseded_ctrl_revision(self) -> None:
+        command = _forward(0)
+        snapshots = [
+            type("Snapshot", (), {"command": command, "revision": 1})(),
+            type("Snapshot", (), {"command": command, "revision": 2})(),
+        ]
+
+        class Mailbox:
+            current_revision = 2
+
+            def sample_intent(self, _index):
+                return snapshots.pop(0), object()
+
+        class Committer:
+            next_command_index = 0
+            calls = 0
+
+            def run_one_step(self, sampled, *, command_is_current):
+                self.calls += 1
+                if self.calls == 1:
+                    from mm_sonic.coordinator import CandidateSuperseded
+
+                    raise CandidateSuperseded("torch:000000", sampled)
+                self.asserted_current = command_is_current(sampled)
+                return "committed"
+
+        committer = Committer()
+        snapshot, _mapped, record = _sample_and_commit_torch_boundary(
+            type("Loop", (), {"mailbox": Mailbox()})(), committer
+        )
+        self.assertEqual(committer.calls, 2)
+        self.assertTrue(committer.asserted_current)
+        self.assertEqual(snapshot.revision, 2)
+        self.assertEqual(record, "committed")
+
     def test_torch_backend_parser_is_explicit_and_opt_in(self) -> None:
         default = _parser().parse_args([])
         self.assertEqual(default.motion_backend, "cpp")

@@ -26,7 +26,7 @@ from .cli import (
 import xml.etree.ElementTree as ET
 
 from .commands import CommandSample, flat_command_script
-from .coordinator import SessionConfig, SourceValidator
+from .coordinator import CandidateSuperseded, SessionConfig, SourceValidator
 from .hands import Dex3HandTargets, NEUTRAL_HAND_TARGETS, hand_targets_record
 from .holden_control import HoldenControlMapper, MappedControlState
 from .joints import ContractError, load_joint_contract
@@ -795,6 +795,29 @@ def _run_responsive_x11_loop(
     return camera_box[0]
 
 
+def _sample_and_commit_torch_boundary(
+    control_loop: object, committer: object
+) -> tuple[object, object, object] | tuple[None, object, None]:
+    """Retry the same Torch boundary when a newer key revision supersedes it."""
+    while True:
+        snapshot, mapped = control_loop.mailbox.sample_intent(
+            committer.next_command_index
+        )
+        if snapshot.command is None:
+            return None, mapped, None
+        revision = snapshot.revision
+        try:
+            record = committer.run_one_step(
+                snapshot.command,
+                command_is_current=lambda _command: (
+                    control_loop.mailbox.current_revision <= revision
+                ),
+            )
+        except CandidateSuperseded:
+            continue
+        return snapshot, mapped, record
+
+
 def _run_torch_demo(
     namespace: argparse.Namespace, *, episode_ordinal: int
 ) -> Path:
@@ -1012,10 +1035,10 @@ def _run_torch_demo(
             camera_state = _initial_camera_delivery_state(namespace.onscreen)
             for _ in range(namespace.chunks):
                 _poll_live_boundary(control_loop, restart, cancellation)
-                snapshot, mapped = control_loop.mailbox.sample_intent(
-                    committer.next_command_index
+                snapshot, mapped, record = _sample_and_commit_torch_boundary(
+                    control_loop, committer
                 )
-                if snapshot.command is None:
+                if snapshot is None:
                     break
                 camera_state = _deliver_camera(
                     simulator=simulator,
@@ -1024,13 +1047,7 @@ def _run_torch_demo(
                     event_sink=_print_terminal_event,
                     camera_disabled_prefix="Torch camera disabled",
                 )
-                revision = snapshot.revision
-                record = committer.run_one_step(
-                    snapshot.command,
-                    command_is_current=lambda _command: (
-                        control_loop.mailbox.current_revision <= revision
-                    ),
-                )
+                assert record is not None
                 if record.command_index % 25 == 0:
                     velocity = snapshot.command.requested_velocity_mujoco
                     print(
