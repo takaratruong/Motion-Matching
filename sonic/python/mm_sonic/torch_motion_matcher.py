@@ -425,6 +425,69 @@ def select_exact_candidate(
     )
 
 
+def rank_exact_transition_candidates(
+    database: TorchMotionDatabase,
+    normalized_query: torch.Tensor,
+    *,
+    current_clip_index: int,
+    current_frame_index: int,
+    config: MatcherConfig = MatcherConfig(),
+) -> tuple[SearchDecision, ...]:
+    """Rank every finite eligible transition by exact matching cost."""
+
+    features, row_count = _validate_search_inputs(
+        database, normalized_query, None
+    )
+    feature_costs = torch.sum(
+        torch.square(features - normalized_query.unsqueeze(0)), dim=1
+    )
+    eligible = torch.ones(
+        row_count, dtype=torch.bool, device=features.device
+    )
+    local = (
+        database._search_clip_index == int(current_clip_index)
+    ) & (
+        torch.abs(
+            database._search_frame_index - int(current_frame_index)
+        )
+        <= config.exclusion_frames
+    )
+    eligible &= ~local
+    eligible &= torch.isfinite(feature_costs)
+    eligible_rows = torch.nonzero(eligible, as_tuple=False).flatten()
+    if eligible_rows.numel() == 0:
+        return ()
+
+    eligible_feature_costs = feature_costs[eligible_rows]
+    eligible_total_costs = (
+        eligible_feature_costs + config.transition_penalty
+    )
+    order = torch.argsort(eligible_total_costs, stable=True)
+    ranked_rows = eligible_rows[order]
+    ranked_feature_costs = eligible_feature_costs[order]
+    ranked_total_costs = eligible_total_costs[order]
+    diagnostics = torch.stack(
+        (
+            ranked_rows.to(torch.float64),
+            ranked_feature_costs.to(torch.float64),
+            ranked_total_costs.to(torch.float64),
+        ),
+        dim=1,
+    ).cpu().tolist()
+    return tuple(
+        SearchDecision(
+            selected_row=int(row),
+            incumbent_row=None,
+            incumbent_cost=math.inf,
+            selected_feature_cost=float(feature_cost),
+            selected_total_cost=float(total_cost),
+            searched=True,
+            transitioned=True,
+        )
+        for row, feature_cost, total_cost in diagnostics
+    )
+
+
 # ---------------------------------------------------------------------------
 # Inertialized native-frame playback.
 # ---------------------------------------------------------------------------
@@ -526,6 +589,7 @@ class MotionMatchDiagnostics:
     transitioned: bool
     transition_rejected: bool
     terrain_safety_override: bool
+    terrain_safety_override_rank: int
     force_search_reason: str | None
     search_time_ns: int | None
     step_time_ns: int
@@ -890,6 +954,7 @@ class TorchMotionMatcher:
         decision: SearchDecision,
         transition_rejected: bool,
         terrain_safety_override: bool,
+        terrain_safety_override_rank: int,
         force_reason: str | None,
         search_time_ns: int | None,
         step_start_ns: int,
@@ -916,6 +981,7 @@ class TorchMotionMatcher:
             transitioned=decision.transitioned,
             transition_rejected=transition_rejected,
             terrain_safety_override=terrain_safety_override,
+            terrain_safety_override_rank=terrain_safety_override_rank,
             force_search_reason=force_reason,
             search_time_ns=search_time_ns,
             step_time_ns=time.perf_counter_ns() - step_start_ns,
@@ -985,6 +1051,7 @@ class TorchMotionMatcher:
             decision=decision,
             transition_rejected=False,
             terrain_safety_override=False,
+            terrain_safety_override_rank=0,
             force_reason=None,
             search_time_ns=None,
             step_start_ns=step_start,
@@ -1082,6 +1149,7 @@ class TorchMotionMatcher:
         )
         transition_rejected = False
         terrain_safety_override = False
+        terrain_safety_override_rank = 0
         validator = self._emitted_window_validator
         if validator is not None:
             accepted = validator(candidate.dense_body_position.clone())
@@ -1097,15 +1165,12 @@ class TorchMotionMatcher:
                         )
                     incumbent_cost = decision.incumbent_cost
                     rescue_start = time.perf_counter_ns()
-                    rescue_decision = select_exact_candidate(
+                    ranked_rescue_decisions = rank_exact_transition_candidates(
                         self.database,
                         query,
                         current_clip_index=state.clip_index,
                         current_frame_index=state.frame_index,
-                        incumbent_row=None,
-                        search=True,
                         config=self.config,
-                        additional_transition_penalty=0.0,
                     )
                     rescue_time = time.perf_counter_ns() - rescue_start
                     search_time = (
@@ -1113,27 +1178,39 @@ class TorchMotionMatcher:
                         if search_time is None
                         else search_time + rescue_time
                     )
-                    if not rescue_decision.transitioned:
-                        raise ContractError(
-                            "terrain rescue did not select transition"
+                    safe_rescue = None
+                    for rank, rescue_decision in enumerate(
+                        ranked_rescue_decisions, start=1
+                    ):
+                        rescue_candidate = self._compose_candidate(
+                            state,
+                            shaped,
+                            rescue_decision.selected_row,
+                            successor,
                         )
-                    rescue_candidate = self._compose_candidate(
-                        state,
-                        shaped,
-                        rescue_decision.selected_row,
-                        successor,
-                    )
-                    rescue_accepted = validator(
-                        rescue_candidate.dense_body_position.clone()
-                    )
-                    if type(rescue_accepted) is not bool:
-                        raise ContractError(
-                            "emitted-window validator must return exact bool"
+                        rescue_accepted = validator(
+                            rescue_candidate.dense_body_position.clone()
                         )
-                    if not rescue_accepted:
+                        if type(rescue_accepted) is not bool:
+                            raise ContractError(
+                                "emitted-window validator must return exact bool"
+                            )
+                        if rescue_accepted:
+                            safe_rescue = (
+                                rank,
+                                rescue_decision,
+                                rescue_candidate,
+                            )
+                            break
+                    if safe_rescue is None:
                         raise ContractError(
-                            "terrain rescue transition is unsafe"
+                            "no safe terrain rescue candidate"
                         )
+                    (
+                        terrain_safety_override_rank,
+                        rescue_decision,
+                        candidate,
+                    ) = safe_rescue
                     decision = SearchDecision(
                         selected_row=rescue_decision.selected_row,
                         incumbent_row=successor,
@@ -1147,7 +1224,6 @@ class TorchMotionMatcher:
                         searched=True,
                         transitioned=True,
                     )
-                    candidate = rescue_candidate
                     terrain_safety_override = True
                 else:
                     if successor is None:
@@ -1206,6 +1282,7 @@ class TorchMotionMatcher:
             decision=decision,
             transition_rejected=transition_rejected,
             terrain_safety_override=terrain_safety_override,
+            terrain_safety_override_rank=terrain_safety_override_rank,
             force_reason=force_reason,
             search_time_ns=search_time,
             step_start_ns=step_start,

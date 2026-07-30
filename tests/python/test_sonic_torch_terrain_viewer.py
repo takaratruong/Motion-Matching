@@ -146,6 +146,12 @@ class TerrainViewerTests(unittest.TestCase):
             np.dtype(np.bool_),
         )
         self.assertFalse(saved.arrays["terrain_safety_override"].any())
+        self.assertIn("terrain_safety_override_rank", saved.arrays)
+        self.assertEqual(
+            saved.arrays["terrain_safety_override_rank"].dtype,
+            np.dtype(np.int32),
+        )
+        self.assertFalse(saved.arrays["terrain_safety_override_rank"].any())
 
     def test_playback_controls_only_move_through_saved_frames(self):
         playback = PlaybackController(frame_count=3)

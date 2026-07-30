@@ -237,6 +237,7 @@ class TerrainRolloutTests(unittest.TestCase):
             ("transitioned", ()),
             ("transition_rejected", ()),
             ("terrain_safety_override", ()),
+            ("terrain_safety_override_rank", ()),
             ("motion_feature_cost", ()),
             ("terrain_feature_cost", ()),
             ("total_feature_cost", ()),
@@ -261,6 +262,16 @@ class TerrainRolloutTests(unittest.TestCase):
         self.assertEqual(
             rollout.metrics["terrain_safety_override_count"],
             int(arrays["terrain_safety_override"].sum()),
+        )
+        self.assertEqual(
+            rollout.metrics["maximum_terrain_safety_override_rank"],
+            int(arrays["terrain_safety_override_rank"].max()),
+        )
+        self.assertEqual(
+            rollout.metrics[
+                "p95_positive_terrain_safety_override_rank"
+            ],
+            0.0,
         )
         np.testing.assert_allclose(
             arrays["motion_feature_cost"] + arrays["terrain_feature_cost"],

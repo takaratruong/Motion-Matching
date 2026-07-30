@@ -15,6 +15,7 @@ from mm_sonic.torch_motion_matcher import (
     SearchDecision,
     TorchMotionMatcher,
     decay_spring_offsets,
+    rank_exact_transition_candidates,
 )
 from mm_sonic.torch_motion_data import MotionFolder
 from tests.python.torch_motion_test_utils import (
@@ -225,38 +226,41 @@ class TorchMotionMatcherTests(unittest.TestCase):
             def scripted(database, normalized_query, **kwargs):
                 calls.append(dict(kwargs))
                 successor = kwargs["incumbent_row"]
-                if len(calls) < 4:
-                    return SearchDecision(
-                        successor,
-                        successor,
-                        2.0,
-                        2.0,
-                        2.0,
-                        kwargs["search"],
-                        False,
-                    )
                 return SearchDecision(
-                    target, None, math.inf, 1.0, 1.1, True, True
+                    successor,
+                    successor,
+                    2.0,
+                    2.0,
+                    2.0,
+                    kwargs["search"],
+                    False,
                 )
 
             with mock.patch(
                 "mm_sonic.torch_motion_matcher.select_exact_candidate",
                 side_effect=scripted,
-            ):
+            ), mock.patch(
+                "mm_sonic.torch_motion_matcher."
+                "rank_exact_transition_candidates",
+                return_value=(
+                    SearchDecision(
+                        target, None, math.inf, 1.0, 1.1, True, True
+                    ),
+                ),
+            ) as ranking:
                 first_result = matcher.step((0.5, 0.0), 0.0)
                 second_result = matcher.step((0.5, 0.0), 0.0)
                 result = matcher.step((0.5, 0.0), 0.0)
 
         self.assertFalse(first_result.diagnostics.transitioned)
         self.assertFalse(second_result.diagnostics.transitioned)
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(calls), 3)
         self.assertFalse(calls[2]["search"])
         self.assertEqual(calls[2]["additional_transition_penalty"], 0.0)
-        self.assertIsNone(calls[3]["incumbent_row"])
-        self.assertTrue(calls[3]["search"])
-        self.assertEqual(calls[3]["additional_transition_penalty"], 0.0)
+        ranking.assert_called_once()
         self.assertTrue(result.diagnostics.transitioned)
         self.assertTrue(result.diagnostics.terrain_safety_override)
+        self.assertEqual(result.diagnostics.terrain_safety_override_rank, 1)
         self.assertEqual(result.diagnostics.selected_frame, target_frame)
         self.assertEqual(len(validator.windows), 4)
 
@@ -284,10 +288,11 @@ class TorchMotionMatcherTests(unittest.TestCase):
         self.assertTrue(rescued.diagnostics.terrain_safety_override)
         self.assertEqual(len(validator.windows), 4)
 
-    def test_unsafe_terrain_rescue_fails_without_advancing_state(self):
-        arrays = build_varying_takara_arrays(frames=140)
-        validator = _ScriptedWindowValidator([True, True, False, False])
-        calls = []
+    def test_ranked_rescue_skips_unsafe_candidate_and_records_rank(self):
+        arrays = build_varying_takara_arrays(frames=160)
+        validator = _ScriptedWindowValidator(
+            [True, True, False, False, True]
+        )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write_takara_arrays(root / "walk", arrays)
@@ -298,49 +303,51 @@ class TorchMotionMatcherTests(unittest.TestCase):
                 emitted_window_validator=validator,
             )
             reset = matcher.reset()
-            target_frame = (
-                reset.diagnostics.selected_frame + 30
-            ) % matcher.folder.clips[0].valid_frame_stop
-            target = matcher.database.row_for_source(0, target_frame)
-            self.assertIsNotNone(target)
-
-            def scripted(database, normalized_query, **kwargs):
-                calls.append(dict(kwargs))
-                successor = kwargs["incumbent_row"]
-                if len(calls) < 4:
-                    return SearchDecision(
-                        successor,
-                        successor,
-                        2.0,
-                        2.0,
-                        2.0,
-                        kwargs["search"],
-                        False,
-                    )
-                return SearchDecision(
-                    target, None, math.inf, 1.0, 1.1, True, True
+            stop = matcher.folder.clips[0].valid_frame_stop
+            rows = [
+                matcher.database.row_for_source(
+                    0,
+                    (reset.diagnostics.selected_frame + offset) % stop,
                 )
+                for offset in (30, 60)
+            ]
+            self.assertTrue(all(row is not None for row in rows))
+            ranked = tuple(
+                SearchDecision(
+                    row,
+                    None,
+                    math.inf,
+                    float(index),
+                    float(index) + 0.1,
+                    True,
+                    True,
+                )
+                for index, row in enumerate(rows, start=1)
+            )
 
             with mock.patch(
-                "mm_sonic.torch_motion_matcher.select_exact_candidate",
-                side_effect=scripted,
-            ):
-                first_result = matcher.step((0.5, 0.0), 0.0)
-                second_result = matcher.step((0.5, 0.0), 0.0)
-                with self.assertRaisesRegex(
-                    ContractError, "terrain rescue transition is unsafe"
-                ):
-                    matcher.prepare_step((0.5, 0.0), 0.0)
+                "mm_sonic.torch_motion_matcher."
+                "rank_exact_transition_candidates",
+                return_value=ranked,
+            ) as ranking:
+                matcher.step((0.5, 0.0), 0.0)
+                matcher.step((0.5, 0.0), 0.0)
+                result = matcher.step((0.5, 0.0), 0.0)
 
-        self.assertEqual(first_result.diagnostics.sequence, 1)
-        self.assertEqual(second_result.diagnostics.sequence, 2)
-        self.assertEqual(matcher._state.sequence, 2)
-        self.assertEqual(len(calls), 4)
+        ranking.assert_called_once()
+        self.assertTrue(result.diagnostics.transitioned)
+        self.assertTrue(result.diagnostics.terrain_safety_override)
+        self.assertEqual(result.diagnostics.terrain_safety_override_rank, 2)
+        self.assertEqual(result.diagnostics.selected_frame, (
+            reset.diagnostics.selected_frame + 60
+        ) % stop)
+        self.assertEqual(len(validator.windows), 5)
 
-    def test_terrain_rescue_must_select_transition(self):
-        arrays = build_varying_takara_arrays(frames=140)
-        validator = _ScriptedWindowValidator([True, True, False])
-        calls = []
+    def test_all_ranked_rescue_candidates_unsafe_fails_transactionally(self):
+        arrays = build_varying_takara_arrays(frames=160)
+        validator = _ScriptedWindowValidator(
+            [True, True, False, False, False]
+        )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write_takara_arrays(root / "walk", arrays)
@@ -350,38 +357,42 @@ class TorchMotionMatcherTests(unittest.TestCase):
                 config=MatcherConfig(search_interval_steps=5),
                 emitted_window_validator=validator,
             )
-            matcher.reset()
-
-            def scripted(database, normalized_query, **kwargs):
-                calls.append(dict(kwargs))
-                successor = kwargs["incumbent_row"]
-                if len(calls) < 4:
-                    return SearchDecision(
-                        successor,
-                        successor,
-                        2.0,
-                        2.0,
-                        2.0,
-                        kwargs["search"],
-                        False,
-                    )
-                return SearchDecision(
-                    0, None, math.inf, 1.0, 1.1, True, False
+            reset = matcher.reset()
+            stop = matcher.folder.clips[0].valid_frame_stop
+            rows = [
+                matcher.database.row_for_source(
+                    0,
+                    (reset.diagnostics.selected_frame + offset) % stop,
                 )
+                for offset in (30, 60)
+            ]
+            ranked = tuple(
+                SearchDecision(
+                    row,
+                    None,
+                    math.inf,
+                    float(index),
+                    float(index) + 0.1,
+                    True,
+                    True,
+                )
+                for index, row in enumerate(rows, start=1)
+            )
 
             with mock.patch(
-                "mm_sonic.torch_motion_matcher.select_exact_candidate",
-                side_effect=scripted,
+                "mm_sonic.torch_motion_matcher."
+                "rank_exact_transition_candidates",
+                return_value=ranked,
             ):
                 matcher.step((0.5, 0.0), 0.0)
                 matcher.step((0.5, 0.0), 0.0)
                 with self.assertRaisesRegex(
-                    ContractError, "terrain rescue did not select transition"
+                    ContractError, "no safe terrain rescue candidate"
                 ):
                     matcher.prepare_step((0.5, 0.0), 0.0)
 
         self.assertEqual(matcher._state.sequence, 2)
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(validator.windows), 5)
 
     def test_unsafe_transition_falls_back_to_safe_incumbent_transactionally(
         self,
@@ -443,46 +454,6 @@ class TorchMotionMatcherTests(unittest.TestCase):
                 result.dense_feature_body_position_window,
             )
         )
-
-    def test_invalid_terrain_rescue_fails_without_advancing_state(self):
-        arrays = build_varying_takara_arrays(frames=120)
-        validator = _ScriptedWindowValidator([False])
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            write_takara_arrays(root / "walk", arrays)
-            matcher = TorchMotionMatcher.from_folder(
-                root,
-                device="cpu",
-                config=MatcherConfig(search_interval_steps=1),
-                emitted_window_validator=validator,
-            )
-            reset = matcher.reset()
-            successor = matcher.database.row_for_source(
-                0, reset.diagnostics.selected_frame + 1
-            )
-            self.assertIsNotNone(successor)
-            decision = SearchDecision(
-                successor,
-                successor,
-                2.0,
-                2.0,
-                2.0,
-                True,
-                False,
-            )
-            with mock.patch(
-                "mm_sonic.torch_motion_matcher.select_exact_candidate",
-                return_value=decision,
-            ):
-                with self.assertRaisesRegex(
-                    ContractError, "rescue did not select transition"
-                ):
-                    matcher.prepare_step((0.5, 0.0), 0.0)
-                validator.decisions.append(True)
-                prepared = matcher.prepare_step((0.5, 0.0), 0.0)
-
-        self.assertEqual(prepared.result.diagnostics.sequence, 1)
-        self.assertEqual(reset.diagnostics.sequence, 0)
 
     def test_emitted_window_validator_must_return_exact_bool(self):
         arrays = build_varying_takara_arrays(frames=120)

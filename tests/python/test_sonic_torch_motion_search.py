@@ -14,6 +14,7 @@ from mm_sonic.torch_motion_matcher import (
     bounded_velocity_step,
     bounded_yaw_step,
     predict_command_trajectory,
+    rank_exact_transition_candidates,
     search_is_due,
     select_exact_candidate,
 )
@@ -212,6 +213,47 @@ class ExactSearchTests(unittest.TestCase):
             config=MatcherConfig(),
         )
         self.assertEqual(decision.selected_row, 2)
+
+    def test_ranked_transition_candidates_are_exact_stable_and_complete(self):
+        features = [[0.0], [1.0], [2.0], [0.5], [0.5]]
+        clips = [0, 0, 1, 1, 1]
+        frames = [10, 40, 10, 20, 30]
+        db = _database(features, clips, frames, "cpu")
+        config = MatcherConfig()
+
+        ranked = rank_exact_transition_candidates(
+            db,
+            torch.zeros(1),
+            current_clip_index=0,
+            current_frame_index=10,
+            config=config,
+        )
+        incumbent_free = select_exact_candidate(
+            db,
+            torch.zeros(1),
+            current_clip_index=0,
+            current_frame_index=10,
+            incumbent_row=None,
+            search=True,
+            config=config,
+        )
+
+        self.assertEqual(
+            [decision.selected_row for decision in ranked],
+            [3, 4, 1, 2],
+        )
+        self.assertEqual(ranked[0].selected_row, incumbent_free.selected_row)
+        self.assertEqual(
+            ranked[0].selected_feature_cost,
+            incumbent_free.selected_feature_cost,
+        )
+        self.assertEqual(
+            ranked[0].selected_total_cost,
+            incumbent_free.selected_total_cost,
+        )
+        self.assertTrue(all(item.transitioned for item in ranked))
+        self.assertTrue(all(item.searched for item in ranked))
+        self.assertTrue(all(item.incumbent_row is None for item in ranked))
 
     def test_candidate_must_beat_incumbent_after_point_one_penalty(self):
         db = _database([[math.sqrt(1.0)], [math.sqrt(0.91)]], [0, 1], [1, 1], "cpu")

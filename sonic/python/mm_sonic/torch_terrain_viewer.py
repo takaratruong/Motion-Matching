@@ -152,6 +152,10 @@ def load_saved_rollout(run_root: str | Path) -> SavedTerrainRollout:
             arrays["terrain_safety_override"] = np.array(
                 legacy_override, copy=True
             )
+    if "terrain_safety_override_rank" not in arrays:
+        arrays["terrain_safety_override_rank"] = np.zeros(
+            frames, dtype=np.int32
+        )
     required_shapes = {
         "selected_clip_index": (frames,),
         "selected_frame": (frames,),
@@ -160,6 +164,7 @@ def load_saved_rollout(run_root: str | Path) -> SavedTerrainRollout:
         "total_feature_cost": (frames,),
         "selected_total_cost": (frames,),
         "terrain_safety_override": (frames,),
+        "terrain_safety_override_rank": (frames,),
         "step_time_ns": (frames,),
         "joint_position": (frames, 29),
         "root_position_world": (frames, 3),
@@ -175,6 +180,11 @@ def load_saved_rollout(run_root: str | Path) -> SavedTerrainRollout:
     selected_frame = arrays["selected_frame"]
     if selected_clip.dtype.kind not in "iu" or selected_frame.dtype.kind not in "iu":
         raise ContractError("saved rollout selection arrays must use integers")
+    rescue_rank = arrays["terrain_safety_override_rank"]
+    if rescue_rank.dtype.kind not in "iu" or np.any(rescue_rank < 0):
+        raise ContractError(
+            "saved rollout terrain safety override ranks must be non-negative integers"
+        )
 
     dataset_root = Path(resolved.get("dataset_root", "")).resolve()
     manifest_path = dataset_root / "manifest.json"

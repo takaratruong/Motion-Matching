@@ -482,6 +482,7 @@ def run_stair_rollout(
         "transitioned": [],
         "transition_rejected": [],
         "terrain_safety_override": [],
+        "terrain_safety_override_rank": [],
         "motion_feature_cost": [],
         "terrain_feature_cost": [],
         "total_feature_cost": [],
@@ -587,6 +588,9 @@ def run_stair_rollout(
         rows["terrain_safety_override"].append(
             np.bool_(diagnostics.terrain_safety_override)
         )
+        rows["terrain_safety_override_rank"].append(
+            np.int32(diagnostics.terrain_safety_override_rank)
+        )
         rows["motion_feature_cost"].append(
             np.float32(diagnostics.motion_feature_cost)
         )
@@ -638,6 +642,9 @@ def run_stair_rollout(
                     "terrain_safety_override": (
                         diagnostics.terrain_safety_override
                     ),
+                    "terrain_safety_override_rank": (
+                        diagnostics.terrain_safety_override_rank
+                    ),
                     "motion_feature_cost": diagnostics.motion_feature_cost,
                     "terrain_feature_cost": diagnostics.extension_feature_cost,
                     "total_feature_cost": diagnostics.selected_feature_cost,
@@ -674,6 +681,9 @@ def run_stair_rollout(
     )
     maximum_progress = float(arrays["progress_m"].max())
     maximum_height_gain = float(root_gain.max())
+    positive_rescue_ranks = arrays["terrain_safety_override_rank"][
+        arrays["terrain_safety_override_rank"] > 0
+    ]
     metrics = {
         "condition": condition,
         "dataset_manifest_sha256": config.dataset.manifest_sha256,
@@ -693,6 +703,14 @@ def run_stair_rollout(
         ),
         "terrain_safety_override_count": int(
             arrays["terrain_safety_override"].sum()
+        ),
+        "maximum_terrain_safety_override_rank": int(
+            arrays["terrain_safety_override_rank"].max()
+        ),
+        "p95_positive_terrain_safety_override_rank": (
+            float(np.percentile(positive_rescue_ranks, 95))
+            if positive_rescue_ranks.size
+            else 0.0
         ),
         "first_stair_selection_progress_m": first_selection_progress,
         "maximum_progress_m": maximum_progress,
