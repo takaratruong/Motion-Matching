@@ -243,6 +243,9 @@ remain diagnostics and cannot override those registered primary gates.
 
 ## Opt-in in-process Torch motion matcher
 
+For a clone-to-launch guide, see
+[`TORCH_SONIC_QUICKSTART.md`](../TORCH_SONIC_QUICKSTART.md).
+
 The flat interactive demo can load a native 50 Hz Takara motion folder and run
 the matcher directly on CUDA, without starting `mm_chunk_server`:
 
