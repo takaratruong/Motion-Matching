@@ -54,6 +54,25 @@ class SameStairOmnidirectionalRouteTests(unittest.TestCase):
                 route.required_outcome,
                 {"mount", "traverse", "turn", "exit", "mixed"},
             )
+            command_segments = {
+                command.segment for command in route.commands
+            }
+            self.assertTrue(route.outcome.required_segments)
+            self.assertLessEqual(
+                set(route.outcome.required_segments), command_segments
+            )
+            self.assertGreater(route.outcome.min_segment_progress_ratio, 0.0)
+            self.assertGreater(route.outcome.min_elevated_foot_samples, 0)
+
+        for route in routes:
+            if route.required_outcome == "turn":
+                self.assertIsNotNone(
+                    route.outcome.final_heading_error_max_rad
+                )
+            if route.required_outcome == "exit":
+                self.assertEqual(route.outcome.final_surface, "flat")
+            if route.required_outcome == "mount":
+                self.assertEqual(route.outcome.final_surface, "elevated")
 
     def test_world_transform_rotates_commands_without_changing_metadata(self):
         frame = StairFrame(

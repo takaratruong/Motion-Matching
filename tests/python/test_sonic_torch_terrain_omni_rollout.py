@@ -1,4 +1,5 @@
 import unittest
+import json
 from pathlib import Path
 import tempfile
 
@@ -6,14 +7,17 @@ import numpy as np
 
 from mm_sonic.torch_terrain_omni_rollout import (
     KinematicSample,
+    evaluate_route_outcome,
     run_omni_matrix,
     save_omni_matrix,
 )
 from mm_sonic.torch_terrain_omni_routes import (
     OmniRoute,
+    RouteOutcomeContract,
     RouteCommand,
     StairFrame,
 )
+from mm_sonic.torch_terrain_rollout import load_experiment_config
 
 
 def _routes():
@@ -190,8 +194,97 @@ class OmnidirectionalRolloutContractTests(unittest.TestCase):
                 self.assertTrue((route_dir / "metrics.json").is_file())
                 with np.load(route_dir / "arrays.npz", allow_pickle=False) as arrays:
                     self.assertIn("foot_surface_height_m", arrays)
+                payload = json.loads((route_dir / "metrics.json").read_text())
+                self.assertTrue(payload["outcome"]["completed"])
+                self.assertEqual(payload["outcome"]["failure_reasons"], [])
             with self.assertRaises(FileExistsError):
                 save_omni_matrix(matrix, output)
+
+    def test_route_outcome_requires_progress_terrain_and_final_state(self):
+        route = OmniRoute(
+            "qualified-mount",
+            (RouteCommand((0.2, 0.0), 0.0, 51, "mount", True),),
+            "mount",
+            RouteOutcomeContract(
+                required_segments=("mount",),
+                min_segment_progress_ratio=0.5,
+                min_elevated_foot_samples=20,
+                final_surface="elevated",
+                final_heading_error_max_rad=0.2,
+            ),
+        )
+        frame_count = 51
+        root = np.zeros((frame_count, 3))
+        root[:, 0] = np.linspace(0.0, 0.15, frame_count)
+        arrays = {
+            "root_position_world": root,
+            "root_yaw_world": np.zeros(frame_count),
+            "command_velocity_world_xy": np.tile((0.2, 0.0), (frame_count, 1)),
+            "command_heading_world_yaw": np.zeros(frame_count),
+            "command_segment_index": np.zeros(frame_count, dtype=np.int32),
+            "foot_surface_height_m": np.full((frame_count, 2), 0.1778),
+        }
+
+        outcome = evaluate_route_outcome(route, arrays)
+
+        self.assertTrue(outcome.completed)
+        self.assertEqual(outcome.failure_reasons, ())
+        self.assertAlmostEqual(outcome.segment_progress_ratio[0][1], 0.75)
+
+        no_progress = dict(arrays)
+        no_progress["root_position_world"] = np.zeros_like(root)
+        failed = evaluate_route_outcome(route, no_progress)
+        self.assertFalse(failed.completed)
+        self.assertIn("segment:mount:progress", failed.failure_reasons)
+
+    def test_matrix_pass_requires_behavioral_outcome_completion(self):
+        route = OmniRoute(
+            "cannot-mount",
+            (RouteCommand((0.2, 0.0), 0.0, 4, "move", True),),
+            "mount",
+            RouteOutcomeContract(
+                required_segments=("move",),
+                min_segment_progress_ratio=0.1,
+                min_elevated_foot_samples=1,
+                final_surface="elevated",
+            ),
+        )
+        matrix = run_omni_matrix(
+            routes=(route,),
+            stair_frame=self.frame,
+            matcher_factory=lambda _route: _FakeMatcher(
+                fail_at=None, timing=100, ledger=[]
+            ),
+            kinematics=_kinematics,
+            terrain_sampler=lambda xy: np.zeros(2),
+            dataset_identity="dataset-a",
+            config_identity="config-a",
+        )
+
+        self.assertTrue(matrix.runs[0].completed_without_exception)
+        self.assertFalse(
+            matrix.runs[0].metrics.required_outcome_completed
+        )
+        self.assertFalse(matrix.matrix_pass)
+
+    def test_retained_omni_configs_pin_terrain_weight_three(self):
+        project = Path(__file__).resolve().parents[2]
+        expanded = load_experiment_config(
+            project
+            / "sonic/configs/experiments/torch_terrain_expanded.json"
+        )
+        normalization = load_experiment_config(
+            project
+            / "sonic/configs/experiments/"
+            "torch_stair_small_terrain_weight3.json"
+        )
+
+        self.assertEqual(expanded["conditions"]["dense"]["weight"], 3.0)
+        self.assertEqual(
+            normalization["conditions"]["dense"]["weight"], 3.0
+        )
+        self.assertEqual(expanded["conditions"]["legacy"]["weight"], 4.0)
+        self.assertEqual(normalization["conditions"]["legacy"]["weight"], 4.0)
 
 
 if __name__ == "__main__":

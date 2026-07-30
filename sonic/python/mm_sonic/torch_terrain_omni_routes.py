@@ -41,10 +41,20 @@ class WorldCommand:
 
 
 @dataclass(frozen=True)
+class RouteOutcomeContract:
+    required_segments: tuple[str, ...] = ()
+    min_segment_progress_ratio: float = 0.1
+    min_elevated_foot_samples: int = 0
+    final_surface: Literal["any", "flat", "elevated"] = "any"
+    final_heading_error_max_rad: float | None = None
+
+
+@dataclass(frozen=True)
 class OmniRoute:
     name: str
     commands: tuple[RouteCommand, ...]
     required_outcome: Literal["mount", "traverse", "turn", "exit", "mixed"]
+    outcome: RouteOutcomeContract = RouteOutcomeContract()
 
 
 # Compatibility names for the first frozen consumer test.
@@ -56,6 +66,10 @@ def _route(
     name: str,
     outcome: Literal["mount", "traverse", "turn", "exit", "mixed"],
     specs: tuple[tuple[str, int, float, float, float], ...],
+    *,
+    required_segments: tuple[str, ...],
+    final_surface: Literal["any", "flat", "elevated"] = "any",
+    final_heading_error_max_rad: float | None = None,
 ) -> OmniRoute:
     return OmniRoute(
         name=name,
@@ -69,6 +83,13 @@ def _route(
                 reset_before=index == 0,
             )
             for index, (segment, frames, vx, vy, heading) in enumerate(specs)
+        ),
+        outcome=RouteOutcomeContract(
+            required_segments=required_segments,
+            min_segment_progress_ratio=0.1,
+            min_elevated_foot_samples=20,
+            final_surface=final_surface,
+            final_heading_error_max_rad=final_heading_error_max_rad,
         ),
     )
 
@@ -88,6 +109,7 @@ def _mirror(name: str, source: OmniRoute) -> OmniRoute:
             )
             for command in source.commands
         ),
+        outcome=source.outcome,
     )
 
 
@@ -100,6 +122,8 @@ _SIDE_MOUNT_LEFT = _route(
         ("mount-from-left", 60, 0.00, -0.38, 0.0),
         ("continue-up", 70, 0.38, 0.00, 0.0),
     ),
+    required_segments=("mount-from-left", "continue-up"),
+    final_surface="elevated",
 )
 _CROSS_TREAD_LEFT = _route(
     "cross-tread-left-to-right",
@@ -110,6 +134,7 @@ _CROSS_TREAD_LEFT = _route(
         ("cross-left-to-right", 120, 0.00, -0.38, 0.0),
         ("settle", 30, 0.15, 0.00, 0.0),
     ),
+    required_segments=("cross-left-to-right",),
 )
 _TURN_45_LEFT = _route(
     "turn-45-lower-left",
@@ -118,6 +143,8 @@ _TURN_45_LEFT = _route(
         ("approach-lower", 190, 0.38, 0.00, 0.0),
         ("pivot-45", 50, 0.05, 0.05, math.pi / 4.0),
     ),
+    required_segments=("approach-lower",),
+    final_heading_error_max_rad=0.35,
 )
 _TURN_90_LEFT = _route(
     "turn-90-middle-left",
@@ -126,6 +153,8 @@ _TURN_90_LEFT = _route(
         ("ascend-middle", 225, 0.38, 0.00, 0.0),
         ("pivot-90", 70, 0.00, 0.08, math.pi / 2.0),
     ),
+    required_segments=("ascend-middle",),
+    final_heading_error_max_rad=0.35,
 )
 _TURN_180_LEFT = _route(
     "turn-180-upper-left",
@@ -134,6 +163,8 @@ _TURN_180_LEFT = _route(
         ("ascend-upper", 260, 0.38, 0.00, 0.0),
         ("pivot-180", 100, -0.05, 0.05, math.pi),
     ),
+    required_segments=("ascend-upper",),
+    final_heading_error_max_rad=0.35,
 )
 _DIAGONAL_UP_LEFT = _route(
     "diagonal-up-left",
@@ -143,6 +174,7 @@ _DIAGONAL_UP_LEFT = _route(
         ("diagonal-up", 120, 0.30, 0.18, math.atan2(0.18, 0.30)),
         ("settle", 30, 0.15, 0.00, 0.0),
     ),
+    required_segments=("diagonal-up",),
 )
 _DIAGONAL_DOWN_LEFT = _route(
     "diagonal-down-left",
@@ -152,6 +184,7 @@ _DIAGONAL_DOWN_LEFT = _route(
         ("diagonal-down", 160, -0.30, 0.15, 0.0),
         ("settle", 30, -0.15, 0.00, 0.0),
     ),
+    required_segments=("diagonal-down",),
 )
 _SIDE_EXIT_LOWER_LEFT = _route(
     "side-exit-lower-left",
@@ -161,6 +194,8 @@ _SIDE_EXIT_LOWER_LEFT = _route(
         ("exit-left", 70, 0.00, 0.38, 0.0),
         ("continue-off", 30, 0.15, 0.00, 0.0),
     ),
+    required_segments=("exit-left",),
+    final_surface="flat",
 )
 _SIDE_EXIT_UPPER_LEFT = _route(
     "side-exit-upper-left",
@@ -170,6 +205,8 @@ _SIDE_EXIT_UPPER_LEFT = _route(
         ("exit-left", 75, 0.00, 0.38, 0.0),
         ("continue-off", 30, 0.15, 0.00, 0.0),
     ),
+    required_segments=("exit-left",),
+    final_surface="flat",
 )
 _RISER_STOP_RESTART = _route(
     "riser-stop-restart",
@@ -179,6 +216,8 @@ _RISER_STOP_RESTART = _route(
         ("stop-at-riser", 30, 0.00, 0.00, 0.0),
         ("restart-up", 100, 0.38, 0.00, 0.0),
     ),
+    required_segments=("restart-up",),
+    final_surface="elevated",
 )
 _RISER_REVERSAL = _route(
     "riser-reversal",
@@ -187,6 +226,7 @@ _RISER_REVERSAL = _route(
         ("ascend-middle", 230, 0.38, 0.00, 0.0),
         ("reverse-down", 160, -0.38, 0.00, 0.0),
     ),
+    required_segments=("reverse-down",),
 )
 _MIXED_ADVERSARIAL = _route(
     "mixed-adversarial",
@@ -198,6 +238,14 @@ _MIXED_ADVERSARIAL = _route(
         ("reverse-down", 100, -0.30, 0.10, 0.0),
         ("side-exit", 70, 0.00, 0.38, 0.0),
     ),
+    required_segments=(
+        "diagonal-mount",
+        "turn-across",
+        "reverse-down",
+        "side-exit",
+    ),
+    final_surface="flat",
+    final_heading_error_max_rad=0.35,
 )
 
 _ROUTES = (

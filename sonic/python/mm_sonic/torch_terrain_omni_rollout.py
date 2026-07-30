@@ -47,14 +47,125 @@ class RouteFailure:
 
 
 @dataclass(frozen=True)
+class RouteOutcomeEvaluation:
+    completed: bool
+    segment_progress_ratio: tuple[tuple[str, float], ...]
+    elevated_foot_sample_count: int
+    final_heading_error_rad: float
+    failure_reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class OmniRouteRun:
     route: OmniRoute
     arrays: Mapping[str, np.ndarray]
+    outcome: RouteOutcomeEvaluation
     metrics: OmniRouteMetrics | None
     completed_frames: int
     completed_without_exception: bool
     failure: RouteFailure | None
     deterministic_sha256: str
+
+
+def evaluate_route_outcome(
+    route: OmniRoute,
+    arrays: Mapping[str, np.ndarray],
+) -> RouteOutcomeEvaluation:
+    """Evaluate the route's explicit progress, terrain, and terminal contract."""
+
+    root = np.asarray(arrays["root_position_world"], dtype=np.float64)
+    velocity = np.asarray(
+        arrays["command_velocity_world_xy"], dtype=np.float64
+    )
+    segment_index = np.asarray(
+        arrays["command_segment_index"], dtype=np.int64
+    )
+    surface = np.asarray(
+        arrays["foot_surface_height_m"], dtype=np.float64
+    )
+    yaw = np.asarray(arrays["root_yaw_world"], dtype=np.float64)
+    command_yaw = np.asarray(
+        arrays["command_heading_world_yaw"], dtype=np.float64
+    )
+    frame_count = root.shape[0]
+    if (
+        root.shape != (frame_count, 3)
+        or velocity.shape != (frame_count, 2)
+        or segment_index.shape != (frame_count,)
+        or surface.shape != (frame_count, 2)
+        or yaw.shape != (frame_count,)
+        or command_yaw.shape != (frame_count,)
+        or not all(
+            np.isfinite(value).all()
+            for value in (root, velocity, surface, yaw, command_yaw)
+        )
+    ):
+        raise ValueError("route outcome arrays are invalid")
+    if frame_count == 0:
+        return RouteOutcomeEvaluation(
+            False, (), 0, math.inf, ("no-frames",)
+        )
+
+    reasons: list[str] = []
+    ratios: list[tuple[str, float]] = []
+    by_segment = {
+        command.segment: index for index, command in enumerate(route.commands)
+    }
+    for segment in route.outcome.required_segments:
+        index = by_segment[segment]
+        frames = np.flatnonzero(segment_index == index)
+        if frames.size < 2:
+            ratio = 0.0
+        else:
+            command = np.mean(velocity[frames], axis=0)
+            speed = float(np.linalg.norm(command))
+            direction = command / speed if speed > 0.0 else np.zeros(2)
+            progress = float(
+                np.dot(
+                    root[frames[-1], :2] - root[frames[0], :2],
+                    direction,
+                )
+            )
+            expected = speed * (frames.size - 1) * DT_S
+            ratio = progress / expected if expected > 0.0 else 0.0
+        ratios.append((segment, ratio))
+        if ratio < route.outcome.min_segment_progress_ratio:
+            reasons.append(f"segment:{segment}:progress")
+
+    elevated_count = int(np.sum(surface > 0.05))
+    if elevated_count < route.outcome.min_elevated_foot_samples:
+        reasons.append("terrain:not-engaged")
+
+    tail = slice(max(0, frame_count - 10), frame_count)
+    if (
+        route.outcome.final_surface == "flat"
+        and bool(np.any(surface[tail] > 0.05))
+    ):
+        reasons.append("final-surface:not-flat")
+    if (
+        route.outcome.final_surface == "elevated"
+        and not bool(np.any(surface[tail] > 0.05))
+    ):
+        reasons.append("final-surface:not-elevated")
+
+    heading_error = np.abs(
+        np.arctan2(
+            np.sin(yaw[tail] - command_yaw[tail]),
+            np.cos(yaw[tail] - command_yaw[tail]),
+        )
+    )
+    final_heading_error = float(np.max(heading_error))
+    tolerance = route.outcome.final_heading_error_max_rad
+    if tolerance is not None and final_heading_error > tolerance:
+        reasons.append("final-heading:error")
+
+    return RouteOutcomeEvaluation(
+        completed=not reasons,
+        segment_progress_ratio=tuple(ratios),
+        elevated_foot_sample_count=elevated_count,
+        final_heading_error_rad=final_heading_error,
+        failure_reasons=tuple(reasons),
+    )
 
 
 @dataclass(frozen=True)
@@ -142,7 +253,7 @@ def _hash_run(
     config_identity: str,
 ) -> str:
     digest = hashlib.sha256()
-    digest.update(b"g1-same-stair-omni-route/v1\0")
+    digest.update(b"g1-same-stair-omni-route/v2\0")
     digest.update(dataset_identity.encode("utf-8"))
     digest.update(b"\0")
     digest.update(config_identity.encode("utf-8"))
@@ -152,6 +263,19 @@ def _hash_run(
             {
                 "name": route.name,
                 "required_outcome": route.required_outcome,
+                "outcome_contract": {
+                    "required_segments": route.outcome.required_segments,
+                    "min_segment_progress_ratio": (
+                        route.outcome.min_segment_progress_ratio
+                    ),
+                    "min_elevated_foot_samples": (
+                        route.outcome.min_elevated_foot_samples
+                    ),
+                    "final_surface": route.outcome.final_surface,
+                    "final_heading_error_max_rad": (
+                        route.outcome.final_heading_error_max_rad
+                    ),
+                },
                 "commands": [
                     {
                         "velocity_stair_xy": command.velocity_stair_xy,
@@ -296,6 +420,7 @@ def _run_route(
         failure = _failure(stage, frame_index, error)
 
     arrays = _finalize_rows(rows)
+    outcome = evaluate_route_outcome(route, arrays)
     metrics = None
     if arrays["qpos"].shape[0] > 0:
         rescue_events = tuple(
@@ -330,7 +455,7 @@ def _run_route(
             selected_clip_id=arrays["selected_clip_path"],
             selected_source_frame=arrays["selected_source_frame"],
             rescue_events=rescue_events,
-            required_outcome_completed=None,
+            required_outcome_completed=outcome.completed,
         )
     deterministic_hash = _hash_run(
         route, arrays, failure, dataset_identity, config_identity
@@ -338,6 +463,7 @@ def _run_route(
     return OmniRouteRun(
         route=route,
         arrays=arrays,
+        outcome=outcome,
         metrics=metrics,
         completed_frames=int(arrays["qpos"].shape[0]),
         completed_without_exception=failure is None,
@@ -373,7 +499,7 @@ def run_omni_matrix(
         for route in routes
     )
     digest = hashlib.sha256()
-    digest.update(b"g1-same-stair-omni-matrix/v1")
+    digest.update(b"g1-same-stair-omni-matrix/v2")
     digest.update(b"\0")
     digest.update(dataset_identity.encode("utf-8"))
     digest.update(b"\0")
@@ -388,7 +514,9 @@ def run_omni_matrix(
         dataset_identity=dataset_identity,
         config_identity=config_identity,
         matrix_pass=bool(runs) and all(
-            run.completed_without_exception for run in runs
+            run.completed_without_exception
+            and run.outcome.completed
+            for run in runs
         ),
         deterministic_sha256=digest.hexdigest(),
     )
@@ -592,6 +720,19 @@ def _failure_json(failure: RouteFailure | None) -> dict | None:
     }
 
 
+def _outcome_json(outcome: RouteOutcomeEvaluation) -> dict:
+    return {
+        "completed": outcome.completed,
+        "segment_progress_ratio": [
+            {"segment": segment, "ratio": ratio}
+            for segment, ratio in outcome.segment_progress_ratio
+        ],
+        "elevated_foot_sample_count": outcome.elevated_foot_sample_count,
+        "final_heading_error_rad": outcome.final_heading_error_rad,
+        "failure_reasons": list(outcome.failure_reasons),
+    }
+
+
 def save_omni_matrix(matrix: OmniMatrix, output: str | Path) -> None:
     """Publish one matrix atomically as pickle-free NPZ and canonical JSON."""
 
@@ -613,9 +754,10 @@ def save_omni_matrix(matrix: OmniMatrix, output: str | Path) -> None:
             route_dir.mkdir()
             np.savez_compressed(route_dir / "arrays.npz", **run.arrays)
             metrics_payload = {
-                "schema": "g1-same-stair-omni-route-metrics/v1",
+                "schema": "g1-same-stair-omni-route-metrics/v2",
                 "route": run.route.name,
                 "required_outcome": run.route.required_outcome,
+                "outcome": _outcome_json(run.outcome),
                 "completed_frames": run.completed_frames,
                 "completed_without_exception": (
                     run.completed_without_exception
@@ -640,7 +782,7 @@ def save_omni_matrix(matrix: OmniMatrix, output: str | Path) -> None:
                 }
             )
         matrix_payload = {
-            "schema": "g1-same-stair-omni-matrix/v1",
+            "schema": "g1-same-stair-omni-matrix/v2",
             "dataset_identity": matrix.dataset_identity,
             "config_identity": matrix.config_identity,
             "matrix_pass": matrix.matrix_pass,

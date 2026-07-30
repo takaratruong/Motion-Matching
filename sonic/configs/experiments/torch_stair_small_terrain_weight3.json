@@ -41,7 +41,7 @@
     "transition_settle_penalty": 18.75,
     "yaw_rate_rad_s": 2.0943951023931953
   },
-  "query_scene": "terrain/grail/grail-stair-updown-0000/motion.npz",
+  "query_scene": "stair/updown-0000/motion.npz",
   "reset_clip": "flat/motion.npz",
   "schema": "g1-torch-stair-small-experiment/v1",
   "terrain_transition_preview_steps": 10
