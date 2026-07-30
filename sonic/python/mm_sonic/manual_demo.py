@@ -931,7 +931,7 @@ def _run_torch_demo(
                 reset_result, global_frame_start=0
             )
             boundary = gear.publication_boundary()
-            publisher.send(initial_buffer, phase="readiness")
+            publisher.send(initial_buffer, phase="readiness", attempt=1)
             gear.wait_for_stream_processing(
                 boundary,
                 frame_count=46,
