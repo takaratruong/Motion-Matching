@@ -189,14 +189,24 @@ def load_saved_rollout(run_root: str | Path) -> SavedTerrainRollout:
         _require_array(arrays, name, shape)
     for name in transition_cost_names:
         transition_cost = arrays[name]
-        if transition_cost.dtype.kind != "f":
+        if transition_cost.dtype != np.dtype(np.float32):
             raise ContractError(
-                f"saved rollout {name} must use floating-point values"
+                f"saved rollout {name} must use float32 values"
             )
         if np.any(transition_cost < 0.0):
             raise ContractError(
                 f"saved rollout {name} must be non-negative"
             )
+    if not np.allclose(
+        arrays["selected_transition_position_cost"]
+        + arrays["selected_transition_velocity_cost"],
+        arrays["selected_transition_continuity_cost"],
+        rtol=0.0,
+        atol=2e-5,
+    ):
+        raise ContractError(
+            "saved rollout transition continuity costs are inconsistent"
+        )
     selected_clip = arrays["selected_clip_index"]
     selected_frame = arrays["selected_frame"]
     if selected_clip.dtype.kind not in "iu" or selected_frame.dtype.kind not in "iu":

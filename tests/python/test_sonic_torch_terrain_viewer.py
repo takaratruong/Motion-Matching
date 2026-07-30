@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 
 import mm_sonic.torch_terrain_viewer as viewer_module
+from mm_sonic.joints import ContractError
 from mm_sonic.torch_terrain_rollout import (
     build_rollout_argument_parser,
     load_experiment_config,
@@ -198,15 +199,42 @@ class TerrainViewerTests(unittest.TestCase):
 
     def test_loader_rejects_invalid_transition_cost_arrays(self):
         cases = {
-            "integer": np.zeros(5, dtype=np.int32),
-            "non-finite": np.array(
-                [0.0, 0.0, np.nan, 0.0, 0.0], dtype=np.float32
+            "integer": (
+                "selected_transition_position_cost",
+                np.zeros(5, dtype=np.int32),
+                "selected_transition_position_cost.*float32",
             ),
-            "negative": np.array(
-                [0.0, 0.0, -0.01, 0.0, 0.0], dtype=np.float32
+            "float64 component": (
+                "selected_transition_position_cost",
+                np.zeros(5, dtype=np.float64),
+                "selected_transition_position_cost.*float32",
+            ),
+            "float64 total": (
+                "selected_transition_continuity_cost",
+                np.zeros(5, dtype=np.float64),
+                "selected_transition_continuity_cost.*float32",
+            ),
+            "non-finite": (
+                "selected_transition_position_cost",
+                np.array(
+                    [0.0, 0.0, np.nan, 0.0, 0.0], dtype=np.float32
+                ),
+                "selected_transition_position_cost.*non-finite",
+            ),
+            "negative": (
+                "selected_transition_position_cost",
+                np.array(
+                    [0.0, 0.0, -0.01, 0.0, 0.0], dtype=np.float32
+                ),
+                "selected_transition_position_cost.*non-negative",
+            ),
+            "inconsistent total": (
+                "selected_transition_continuity_cost",
+                None,
+                "transition continuity costs are inconsistent",
             ),
         }
-        for label, invalid in cases.items():
+        for label, (name, invalid, message) in cases.items():
             with self.subTest(label=label):
                 corrupted = self.root / f"invalid-transition-cost-{label}"
                 shutil.copytree(self.run_root, corrupted)
@@ -216,7 +244,12 @@ class TerrainViewerTests(unittest.TestCase):
                         name: np.array(archive[name], copy=True)
                         for name in archive.files
                     }
-                arrays["selected_transition_position_cost"] = invalid
+                if label == "inconsistent total":
+                    invalid = (
+                        arrays["selected_transition_continuity_cost"]
+                        + np.float32(1.0)
+                    )
+                arrays[name] = invalid
                 np.savez(archive_path, **arrays)
                 metrics_path = corrupted / "metrics.json"
                 metrics = json.loads(metrics_path.read_text("utf-8"))
@@ -234,7 +267,7 @@ class TerrainViewerTests(unittest.TestCase):
                     encoding="utf-8",
                 )
 
-                with self.assertRaises(Exception):
+                with self.assertRaisesRegex(ContractError, message):
                     load_saved_rollout(corrupted)
 
     def test_playback_controls_only_move_through_saved_frames(self):
