@@ -450,15 +450,27 @@ def _build_database(
     component_mean = features.mean(dim=0)
     component_std = features.std(dim=0, unbiased=False)
     scale = torch.empty_like(component_mean)
-    groups = list(FEATURE_GROUPS)
+    groups = [
+        (name, group_slice, weight, False)
+        for name, group_slice, weight in FEATURE_GROUPS
+    ]
     if extension_contract is not None:
         name, dimension, weight = extension_contract
         groups.append(
-            (name, slice(FEATURE_DIM, FEATURE_DIM + dimension), weight)
+            (
+                name,
+                slice(FEATURE_DIM, FEATURE_DIM + dimension),
+                weight,
+                True,
+            )
         )
-    for name, group_slice, weight in groups:
+    for name, group_slice, weight, group_total_weight in groups:
         group_std = component_std[group_slice].mean()
         group_scale = group_std / weight
+        if group_total_weight:
+            group_scale = group_scale * math.sqrt(
+                group_slice.stop - group_slice.start
+            )
         if not torch.isfinite(group_scale) or group_scale <= 0.0:
             raise ContractError(
                 f"feature group {name!r} has non-positive or non-finite scale "

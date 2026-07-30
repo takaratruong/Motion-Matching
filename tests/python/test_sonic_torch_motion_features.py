@@ -7,6 +7,7 @@ the production Torch extractor against an independent NumPy oracle defined in
 their own expectations.
 """
 
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -69,6 +70,26 @@ class _TwoValueExtension:
         self.query_calls += 1
         x = state.root_position_world[0]
         return torch.stack((x, x * x + x)).to(dtype=self.dtype)
+
+
+class _RepeatedValueExtension:
+    name = "repeated_extension"
+    weight = 2.0
+
+    def __init__(self, dimension):
+        self.dimension = dimension
+
+    def database_rows(self, folder, device):
+        rows = []
+        for clip in folder.clips:
+            value = torch.arange(
+                clip.valid_frame_stop, dtype=torch.float32, device=device
+            )
+            rows.append(value[:, None].repeat(1, self.dimension))
+        return tuple(rows)
+
+    def query_row(self, state, trajectory):
+        return state.root_position_world[0].repeat(self.dimension)
 
 
 def _generated_state_from_arrays(arrays, frame, device=_CPU):
@@ -263,6 +284,63 @@ class FeatureVectorContractTests(unittest.TestCase):
 
 
 class NormalizationAndDatabaseTests(unittest.TestCase):
+    def test_extension_weight_is_dimension_invariant(self):
+        arrays = build_varying_takara_arrays(frames=80)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            folder = MotionFolder.load(root)
+            flat_before = TorchMotionDatabase.from_folder(
+                folder, device="cpu"
+            )
+            two = TorchMotionDatabase.from_folder(
+                folder,
+                device="cpu",
+                extension=_RepeatedValueExtension(2),
+            )
+            eight = TorchMotionDatabase.from_folder(
+                folder,
+                device="cpu",
+                extension=_RepeatedValueExtension(8),
+            )
+            flat_after = TorchMotionDatabase.from_folder(
+                folder, device="cpu"
+            )
+
+        two_cost = two.normalized_features_copy()[:, 27:].square().sum(dim=1)
+        eight_cost = (
+            eight.normalized_features_copy()[:, 27:].square().sum(dim=1)
+        )
+        torch.testing.assert_close(
+            eight_cost, two_cost, rtol=1e-6, atol=1e-6
+        )
+
+        raw = _RepeatedValueExtension(8).database_rows(folder, _CPU)[0]
+        expected = (
+            raw.std(dim=0, unbiased=False).mean() * math.sqrt(8) / 2.0
+        )
+        _, scale = eight.normalization.parameters_copy()
+        torch.testing.assert_close(
+            scale[27:], expected.expand(8), rtol=1e-6, atol=1e-6
+        )
+
+        before_mean, before_scale = (
+            flat_before.normalization.parameters_copy()
+        )
+        after_mean, after_scale = flat_after.normalization.parameters_copy()
+        torch.testing.assert_close(
+            after_mean, before_mean, rtol=0.0, atol=0.0
+        )
+        torch.testing.assert_close(
+            after_scale, before_scale, rtol=0.0, atol=0.0
+        )
+        torch.testing.assert_close(
+            flat_after.normalized_features_copy(),
+            flat_before.normalized_features_copy(),
+            rtol=0.0,
+            atol=0.0,
+        )
+
     def test_optional_extension_appends_one_normalized_group(self):
         self.assertTrue(issubclass(SearchFeatureExtension, object))
         arrays = build_varying_takara_arrays(frames=80)
