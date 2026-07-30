@@ -128,40 +128,68 @@ def _fail(relative: str, field: str, detail: str) -> "ContractError":
 def _load_clip(
     path: Path, relative: str, layout: MotionLayout
 ) -> MotionClip:
-    with np.load(path, allow_pickle=False) as data:
-        present = set(data.files)
-        required = (
-            "fps",
-            "joint_pos",
-            "joint_vel",
-            "body_pos_w",
-            "body_quat_w",
-            "body_lin_vel_w",
-            "body_ang_vel_w",
-        )
-        for field in required:
-            if field not in present:
-                raise _fail(relative, field, "is missing")
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            present = set(data.files)
+            required = (
+                "fps",
+                "joint_pos",
+                "joint_vel",
+                "body_pos_w",
+                "body_quat_w",
+                "body_lin_vel_w",
+                "body_ang_vel_w",
+            )
+            for field in required:
+                if field not in present:
+                    raise _fail(relative, field, "is missing")
 
-        fps_raw = np.asarray(data["fps"])
-        if fps_raw.size != 1:
-            raise _fail(relative, "fps", "must contain exactly one value")
-        fps_value = float(fps_raw.reshape(-1)[0])
-        if not np.isfinite(fps_value) or fps_value != 50.0:
-            raise _fail(relative, "fps", "must equal 50")
+            fps_raw = _read_npz_field(data, relative, "fps")
+            fps_values = _as_finite_float32(fps_raw, relative, "fps")
+            if fps_values.size != 1:
+                raise _fail(relative, "fps", "must contain exactly one value")
+            fps_value = float(fps_values.reshape(-1)[0])
+            if fps_value != 50.0:
+                raise _fail(relative, "fps", "must equal 50")
 
-        joint_pos = _as_finite_float32(data["joint_pos"], relative, "joint_pos")
-        joint_vel = _as_finite_float32(data["joint_vel"], relative, "joint_vel")
-        body_pos = _as_finite_float32(data["body_pos_w"], relative, "body_pos_w")
-        body_quat = _as_finite_float32(
-            data["body_quat_w"], relative, "body_quat_w"
-        )
-        body_lin = _as_finite_float32(
-            data["body_lin_vel_w"], relative, "body_lin_vel_w"
-        )
-        body_ang = _as_finite_float32(
-            data["body_ang_vel_w"], relative, "body_ang_vel_w"
-        )
+            joint_pos = _as_finite_float32(
+                _read_npz_field(data, relative, "joint_pos"),
+                relative,
+                "joint_pos",
+            )
+            joint_vel = _as_finite_float32(
+                _read_npz_field(data, relative, "joint_vel"),
+                relative,
+                "joint_vel",
+            )
+            body_pos = _as_finite_float32(
+                _read_npz_field(data, relative, "body_pos_w"),
+                relative,
+                "body_pos_w",
+            )
+            body_quat = _as_finite_float32(
+                _read_npz_field(data, relative, "body_quat_w"),
+                relative,
+                "body_quat_w",
+            )
+            body_lin = _as_finite_float32(
+                _read_npz_field(data, relative, "body_lin_vel_w"),
+                relative,
+                "body_lin_vel_w",
+            )
+            body_ang = _as_finite_float32(
+                _read_npz_field(data, relative, "body_ang_vel_w"),
+                relative,
+                "body_ang_vel_w",
+            )
+    except ContractError:
+        raise
+    except Exception as error:
+        raise _fail(
+            relative,
+            "archive",
+            f"cannot be loaded ({type(error).__name__})",
+        ) from error
 
     j = layout.joint_count
     b = layout.body_count
@@ -206,11 +234,25 @@ def _load_clip(
     )
 
 
+def _read_npz_field(data: object, relative: str, field: str) -> np.ndarray:
+    try:
+        return np.asarray(data[field])  # type: ignore[index]
+    except Exception as error:
+        raise _fail(
+            relative,
+            field,
+            f"cannot be loaded ({type(error).__name__})",
+        ) from error
+
+
 def _as_finite_float32(array: np.ndarray, relative: str, field: str) -> np.ndarray:
     source = np.asarray(array)
+    if source.dtype.kind not in "iuf":
+        raise _fail(relative, field, "must contain real numeric values")
     if not np.all(np.isfinite(source)):
         raise _fail(relative, field, "contains non-finite values")
-    converted = np.ascontiguousarray(source, dtype=np.float32)
+    with np.errstate(over="ignore", invalid="ignore"):
+        converted = np.ascontiguousarray(source, dtype=np.float32)
     if not np.all(np.isfinite(converted)):
         raise _fail(relative, field, "is not representable as finite float32")
     return converted
