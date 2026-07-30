@@ -21,6 +21,7 @@ from .torch_motion_features import (
     GeneratedFeatureState,
     SearchFeatureExtension,
     TorchMotionDatabase,
+    FeatureNormalization,
     extract_query_features,
     resolve_torch_device,
     validated_extension_query_row,
@@ -860,6 +861,7 @@ class TorchMotionMatcher:
         extension: SearchFeatureExtension | None = None,
         reset_clip_path: str | None = None,
         emitted_window_validator: EmittedWindowValidator | None = None,
+        normalization_override: FeatureNormalization | None = None,
     ) -> "TorchMotionMatcher":
         resolved = resolve_torch_device(
             "cuda" if device == "auto" and torch.cuda.is_available()
@@ -874,6 +876,7 @@ class TorchMotionMatcher:
             device=resolved,
             extension=extension,
             reset_clip_path=reset_clip_path,
+            normalization_override=normalization_override,
         )
         continuity = TransitionContinuityDatabase.from_folder(folder, resolved)
         clips = tuple(
@@ -961,7 +964,7 @@ class TorchMotionMatcher:
         shaped: ShapedCommand,
         query: torch.Tensor,
         continuity: TransitionContinuityCosts,
-        successor: int,
+        successor: int | None,
         incumbent_cost: float,
         validator,
         search_time,
@@ -1560,20 +1563,6 @@ class TorchMotionMatcher:
                     terrain_safety_override = True
                 else:
                     if successor is None:
-                        raise ContractError(
-                            "unsafe transition has no incumbent"
-                        )
-                    incumbent = self._compose_candidate(
-                        state, shaped, successor, successor
-                    )
-                    incumbent_accepted = validator(
-                        incumbent.dense_body_position.clone()
-                    )
-                    if type(incumbent_accepted) is not bool:
-                        raise ContractError(
-                            "emitted-window validator must return exact bool"
-                        )
-                    if not incumbent_accepted:
                         (
                             terrain_safety_override_rank,
                             decision,
@@ -1591,17 +1580,45 @@ class TorchMotionMatcher:
                         )
                         terrain_safety_override = True
                     else:
-                        candidate = incumbent
-                        decision = SearchDecision(
-                            selected_row=successor,
-                            incumbent_row=successor,
-                            incumbent_cost=decision.incumbent_cost,
-                            selected_feature_cost=decision.incumbent_cost,
-                            selected_total_cost=decision.incumbent_cost,
-                            searched=decision.searched,
-                            transitioned=False,
+                        incumbent = self._compose_candidate(
+                            state, shaped, successor, successor
                         )
-                        transition_rejected = True
+                        incumbent_accepted = validator(
+                            incumbent.dense_body_position.clone()
+                        )
+                        if type(incumbent_accepted) is not bool:
+                            raise ContractError(
+                                "emitted-window validator must return exact bool"
+                            )
+                        if not incumbent_accepted:
+                            (
+                                terrain_safety_override_rank,
+                                decision,
+                                candidate,
+                                search_time,
+                            ) = self._ranked_terrain_rescue(
+                                state,
+                                shaped,
+                                query,
+                                continuity,
+                                successor,
+                                decision.incumbent_cost,
+                                validator,
+                                search_time,
+                            )
+                            terrain_safety_override = True
+                        else:
+                            candidate = incumbent
+                            decision = SearchDecision(
+                                selected_row=successor,
+                                incumbent_row=successor,
+                                incumbent_cost=decision.incumbent_cost,
+                                selected_feature_cost=decision.incumbent_cost,
+                                selected_total_cost=decision.incumbent_cost,
+                                searched=decision.searched,
+                                transitioned=False,
+                            )
+                            transition_rejected = True
         if (
             decision.transitioned
             and not terrain_safety_override

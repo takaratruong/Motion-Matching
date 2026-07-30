@@ -76,6 +76,46 @@ class OmnidirectionalTerrainMetricTests(unittest.TestCase):
         ) + events[3:]
         self.assertEqual(detect_rescue_cycles(non_rescue), ())
 
+    def test_transition_count_excludes_sequential_playback_frames(self):
+        frame_count = 5
+        feet = np.zeros((frame_count, 2, 3), dtype=np.float64)
+        feet[:, :, 2] = ANKLE_ORIGIN_SOLE_M
+        metrics = evaluate_omni_route(
+            root_xy=np.zeros((frame_count, 2)),
+            root_yaw=np.zeros(frame_count),
+            foot_position_world=feet,
+            foot_surface_height_m=np.zeros((frame_count, 2)),
+            command_velocity_world_xy=np.zeros((frame_count, 2)),
+            command_heading_world_yaw=np.zeros(frame_count),
+            selected_clip_id=("a", "a", "a", "b", "b"),
+            selected_source_frame=(10, 11, 12, 5, 6),
+        )
+        self.assertEqual(metrics.transition_count, 1)
+
+    def test_freeze_metric_counts_only_moving_commands_with_low_root_speed(self):
+        frame_count = 10
+        feet = np.zeros((frame_count, 2, 3), dtype=np.float64)
+        feet[:, :, 2] = ANKLE_ORIGIN_SOLE_M
+        root = np.zeros((frame_count, 2), dtype=np.float64)
+        root[5:, 0] = np.arange(1, 6) * 0.01
+        command = np.zeros((frame_count, 2), dtype=np.float64)
+        command[:8, 0] = 0.4
+        metrics = evaluate_omni_route(
+            root_xy=root,
+            root_yaw=np.zeros(frame_count),
+            foot_position_world=feet,
+            foot_surface_height_m=np.zeros((frame_count, 2)),
+            command_velocity_world_xy=command,
+            command_heading_world_yaw=np.zeros(frame_count),
+        )
+
+        np.testing.assert_array_equal(
+            metrics.stalled_moving_mask,
+            [False, True, True, True, True, False, False, False, False, False],
+        )
+        self.assertEqual(metrics.longest_stall_frames, 4)
+        self.assertAlmostEqual(metrics.stalled_moving_fraction, 4.0 / 7.0)
+
 
 if __name__ == "__main__":
     unittest.main()

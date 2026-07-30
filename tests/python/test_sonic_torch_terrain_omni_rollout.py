@@ -1,10 +1,13 @@
 import unittest
+from pathlib import Path
+import tempfile
 
 import numpy as np
 
 from mm_sonic.torch_terrain_omni_rollout import (
     KinematicSample,
     run_omni_matrix,
+    save_omni_matrix,
 )
 from mm_sonic.torch_terrain_omni_routes import (
     OmniRoute,
@@ -164,6 +167,31 @@ class OmnidirectionalRolloutContractTests(unittest.TestCase):
         self.assertEqual(first.runs[0].failure.exception_type, "RuntimeError")
         self.assertTrue(first.runs[1].completed_without_exception)
         self.assertEqual(first.deterministic_sha256, second.deterministic_sha256)
+
+    def test_matrix_artifacts_are_saved_transactionally_and_pickle_free(self):
+        matrix = run_omni_matrix(
+            routes=_routes(),
+            stair_frame=self.frame,
+            matcher_factory=lambda _route: _FakeMatcher(
+                fail_at=None, timing=100, ledger=[]
+            ),
+            kinematics=_kinematics,
+            terrain_sampler=lambda xy: np.zeros(2),
+            dataset_identity="dataset-a",
+            config_identity="config-a",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "matrix"
+            save_omni_matrix(matrix, output)
+            self.assertTrue((output / "matrix.json").is_file())
+            for route in _routes():
+                route_dir = output / "routes" / route.name
+                self.assertTrue((route_dir / "arrays.npz").is_file())
+                self.assertTrue((route_dir / "metrics.json").is_file())
+                with np.load(route_dir / "arrays.npz", allow_pickle=False) as arrays:
+                    self.assertIn("foot_surface_height_m", arrays)
+            with self.assertRaises(FileExistsError):
+                save_omni_matrix(matrix, output)
 
 
 if __name__ == "__main__":

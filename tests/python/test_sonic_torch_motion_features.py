@@ -433,6 +433,30 @@ class NormalizationAndDatabaseTests(unittest.TestCase):
         )
         self.assertEqual(db.feature_shape, (rows.shape[0], 27))
 
+    def test_explicit_normalization_reweights_new_rows_without_refitting(self):
+        arrays = build_varying_takara_arrays(frames=80)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            folder = MotionFolder.load(root)
+            fitted = TorchMotionDatabase.from_folder(folder, device="cpu")
+            mean, scale = fitted.normalization.parameters_copy()
+            frozen = type(fitted.normalization)(mean + 0.25, scale * 1.5)
+            overridden = TorchMotionDatabase.from_folder(
+                folder,
+                device="cpu",
+                normalization_override=frozen,
+            )
+
+        got_mean, got_scale = overridden.normalization.parameters_copy()
+        torch.testing.assert_close(got_mean, mean + 0.25)
+        torch.testing.assert_close(got_scale, scale * 1.5)
+        raw = fitted.normalized_features_copy() * scale + mean
+        torch.testing.assert_close(
+            overridden.normalized_features_copy(),
+            (raw - (mean + 0.25)) / (scale * 1.5),
+        )
+
     def test_zero_variation_group_fails_database_build(self):
         # A perfectly static clip yields zero-variance groups, so the group
         # standard deviation is non-positive and construction must fail.

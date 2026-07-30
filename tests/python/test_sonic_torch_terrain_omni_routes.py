@@ -113,6 +113,88 @@ class SameStairOmnidirectionalRouteTests(unittest.TestCase):
                 self.assertEqual(left_command.frames, right_command.frames)
                 self.assertEqual(left_command.segment, right_command.segment)
 
+    def test_routes_reach_the_stair_before_exercising_the_named_outcome(self):
+        routes = {route.name: route for route in same_stair_routes()}
+
+        def positions(route):
+            velocity = np.asarray(
+                [command.velocity_stair_xy for command in route.commands]
+            )
+            duration = np.asarray(
+                [command.frames * 0.02 for command in route.commands]
+            )
+            return np.vstack(
+                (np.zeros(2), np.cumsum(velocity * duration[:, None], axis=0))
+            )
+
+        for route in routes.values():
+            self.assertGreaterEqual(
+                float(positions(route)[:, 0].max()),
+                1.30,
+                route.name,
+            )
+
+        side_mount = positions(routes["side-mount-left"])
+        self.assertGreaterEqual(float(side_mount[:, 1].max()), 0.42)
+        self.assertLessEqual(float(side_mount[-1, 1]), 0.10)
+
+        for name in ("diagonal-down-left", "diagonal-down-right"):
+            route = routes[name]
+            first_descent = next(
+                index
+                for index, command in enumerate(route.commands)
+                if command.velocity_stair_xy[0] < -0.05
+            )
+            self.assertGreaterEqual(
+                float(positions(route)[first_descent, 0]), 1.75, name
+            )
+
+        for name in ("side-exit-upper-left", "side-exit-upper-right"):
+            route = routes[name]
+            first_exit = next(
+                index
+                for index, command in enumerate(route.commands)
+                if abs(command.velocity_stair_xy[1]) > 0.20
+            )
+            self.assertGreaterEqual(
+                float(positions(route)[first_exit, 0]), 1.75, name
+            )
+
+        expected_turns = {
+            "turn-45-lower-left": math.pi / 4,
+            "turn-90-middle-left": math.pi / 2,
+            "turn-180-upper-left": math.pi,
+        }
+        for name, expected in expected_turns.items():
+            self.assertAlmostEqual(
+                routes[name].commands[-1].heading_stair_yaw, expected
+            )
+
+    def test_sideways_and_backward_routes_keep_facing_independent_of_velocity(self):
+        routes = {route.name: route for route in same_stair_routes()}
+        for name in (
+            "side-mount-left",
+            "side-mount-right",
+            "cross-tread-left-to-right",
+            "cross-tread-right-to-left",
+            "side-exit-upper-left",
+            "side-exit-upper-right",
+        ):
+            lateral = [
+                command
+                for command in routes[name].commands
+                if abs(command.velocity_stair_xy[1]) > 0.20
+                and abs(command.velocity_stair_xy[0]) < 0.05
+            ]
+            self.assertTrue(lateral, name)
+            self.assertTrue(
+                all(abs(command.heading_stair_yaw) < 1e-12 for command in lateral),
+                name,
+            )
+        reversal = routes["riser-reversal"].commands[-1]
+        self.assertLess(reversal.velocity_stair_xy[0], 0.0)
+        self.assertAlmostEqual(reversal.heading_stair_yaw, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

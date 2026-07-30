@@ -1034,11 +1034,11 @@ class TorchMotionMatcherTests(unittest.TestCase):
             with self.assertRaisesRegex(ContractError, "exact bool"):
                 matcher.prepare_step((0.5, 0.0), 0.0)
 
-    def test_unsafe_transition_without_incumbent_fails_transactionally(
+    def test_unsafe_transition_without_incumbent_uses_ranked_rescue(
         self,
     ):
         arrays = build_varying_takara_arrays(frames=120)
-        validator = _ScriptedWindowValidator([False])
+        validator = _ScriptedWindowValidator([False, False, True])
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write_takara_arrays(root / "walk", arrays)
@@ -1049,7 +1049,12 @@ class TorchMotionMatcherTests(unittest.TestCase):
             )
             reset = matcher.reset()
             target = matcher.database.row_for_source(0, 20)
+            rescue_rows = (
+                matcher.database.row_for_source(0, 30),
+                matcher.database.row_for_source(0, 40),
+            )
             self.assertIsNotNone(target)
+            self.assertTrue(all(row is not None for row in rescue_rows))
             decision = SearchDecision(
                 target,
                 None,
@@ -1059,6 +1064,18 @@ class TorchMotionMatcherTests(unittest.TestCase):
                 True,
                 True,
             )
+            ranked = tuple(
+                SearchDecision(
+                    row,
+                    None,
+                    math.inf,
+                    float(index),
+                    float(index) + 0.1,
+                    True,
+                    True,
+                )
+                for index, row in enumerate(rescue_rows, start=1)
+            )
             with mock.patch(
                 "mm_sonic.torch_motion_matcher."
                 "TorchMotionDatabase.row_for_source",
@@ -1066,13 +1083,17 @@ class TorchMotionMatcherTests(unittest.TestCase):
             ), mock.patch(
                 "mm_sonic.torch_motion_matcher.select_exact_candidate",
                 return_value=decision,
+            ), mock.patch(
+                "mm_sonic.torch_motion_matcher."
+                "rank_exact_transition_candidates",
+                return_value=ranked,
             ):
-                with self.assertRaisesRegex(
-                    ContractError, "no incumbent"
-                ):
-                    matcher.prepare_step((0.5, 0.0), 0.0)
+                result = matcher.step((0.5, 0.0), 0.0)
 
-        self.assertEqual(reset.diagnostics.sequence, 0)
+        self.assertEqual(result.diagnostics.sequence, 1)
+        self.assertEqual(result.diagnostics.selected_frame, 40)
+        self.assertTrue(result.diagnostics.terrain_safety_override)
+        self.assertEqual(result.diagnostics.terrain_safety_override_rank, 2)
 
     def test_zero_continuity_weights_preserve_matcher_for_100_commands(self):
         arrays = build_varying_takara_arrays(frames=160)

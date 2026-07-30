@@ -95,100 +95,108 @@ _SIDE_MOUNT_LEFT = _route(
     "side-mount-left",
     "mount",
     (
-        ("approach", 40, 0.00, 0.30, math.pi / 2.0),
-        ("mount", 45, 0.35, 0.15, math.pi / 6.0),
+        ("move-outside", 60, 0.00, 0.38, 0.0),
+        ("approach-alongside", 180, 0.38, 0.00, 0.0),
+        ("mount-from-left", 60, 0.00, -0.38, 0.0),
+        ("continue-up", 70, 0.38, 0.00, 0.0),
     ),
 )
 _CROSS_TREAD_LEFT = _route(
     "cross-tread-left-to-right",
     "traverse",
     (
-        ("enter", 30, 0.10, 0.30, math.pi / 2.0),
-        ("cross", 45, 0.15, 0.30, math.pi / 3.0),
-        ("settle", 25, 0.05, 0.20, math.pi / 4.0),
+        ("move-outside", 60, 0.00, 0.38, 0.0),
+        ("approach-lower-tread", 200, 0.38, 0.00, 0.0),
+        ("cross-left-to-right", 120, 0.00, -0.38, 0.0),
+        ("settle", 30, 0.15, 0.00, 0.0),
     ),
 )
 _TURN_45_LEFT = _route(
     "turn-45-lower-left",
     "turn",
     (
-        ("ascend", 30, 0.40, 0.00, 0.0),
-        ("pivot", 25, 0.20, 0.15, math.pi / 4.0),
+        ("approach-lower", 190, 0.38, 0.00, 0.0),
+        ("pivot-45", 50, 0.05, 0.05, math.pi / 4.0),
     ),
 )
 _TURN_90_LEFT = _route(
     "turn-90-middle-left",
     "turn",
     (
-        ("ascend", 35, 0.40, 0.00, 0.0),
-        ("pivot", 30, 0.10, 0.20, math.pi / 2.0),
+        ("ascend-middle", 225, 0.38, 0.00, 0.0),
+        ("pivot-90", 70, 0.00, 0.08, math.pi / 2.0),
     ),
 )
 _TURN_180_LEFT = _route(
     "turn-180-upper-left",
     "turn",
     (
-        ("ascend", 40, 0.40, 0.00, 0.0),
-        ("pivot", 35, -0.10, 0.15, math.pi),
+        ("ascend-upper", 260, 0.38, 0.00, 0.0),
+        ("pivot-180", 100, -0.05, 0.05, math.pi),
     ),
 )
 _DIAGONAL_UP_LEFT = _route(
     "diagonal-up-left",
     "traverse",
     (
-        ("diagonal", 40, 0.30, 0.25, math.pi / 5.0),
-        ("continue", 35, 0.30, 0.20, math.pi / 6.0),
+        ("approach-riser", 165, 0.38, 0.00, 0.0),
+        ("diagonal-up", 120, 0.30, 0.18, math.atan2(0.18, 0.30)),
+        ("settle", 30, 0.15, 0.00, 0.0),
     ),
 )
 _DIAGONAL_DOWN_LEFT = _route(
     "diagonal-down-left",
     "traverse",
     (
-        ("descend", 40, -0.30, 0.25, math.pi - math.pi / 5.0),
-        ("continue", 35, -0.30, 0.20, math.pi - math.pi / 6.0),
+        ("ascend-upper", 270, 0.38, 0.00, 0.0),
+        ("diagonal-down", 160, -0.30, 0.15, 0.0),
+        ("settle", 30, -0.15, 0.00, 0.0),
     ),
 )
 _SIDE_EXIT_LOWER_LEFT = _route(
     "side-exit-lower-left",
     "exit",
     (
-        ("descend", 30, -0.30, 0.00, math.pi),
-        ("exit", 35, -0.10, 0.30, math.pi / 2.0),
+        ("approach-lower", 195, 0.38, 0.00, 0.0),
+        ("exit-left", 70, 0.00, 0.38, 0.0),
+        ("continue-off", 30, 0.15, 0.00, 0.0),
     ),
 )
 _SIDE_EXIT_UPPER_LEFT = _route(
     "side-exit-upper-left",
     "exit",
     (
-        ("ascend", 30, 0.30, 0.00, 0.0),
-        ("exit", 35, 0.05, 0.30, math.pi / 2.0),
+        ("ascend-upper", 265, 0.38, 0.00, 0.0),
+        ("exit-left", 75, 0.00, 0.38, 0.0),
+        ("continue-off", 30, 0.15, 0.00, 0.0),
     ),
 )
 _RISER_STOP_RESTART = _route(
     "riser-stop-restart",
     "mixed",
     (
-        ("ascend", 30, 0.40, 0.00, 0.0),
-        ("stop", 20, 0.00, 0.00, 0.0),
-        ("restart", 30, 0.40, 0.00, 0.0),
+        ("approach-riser", 160, 0.38, 0.00, 0.0),
+        ("stop-at-riser", 30, 0.00, 0.00, 0.0),
+        ("restart-up", 100, 0.38, 0.00, 0.0),
     ),
 )
 _RISER_REVERSAL = _route(
     "riser-reversal",
     "mixed",
     (
-        ("ascend", 30, 0.40, 0.00, 0.0),
-        ("reverse", 30, -0.40, 0.00, math.pi),
+        ("ascend-middle", 230, 0.38, 0.00, 0.0),
+        ("reverse-down", 160, -0.38, 0.00, 0.0),
     ),
 )
 _MIXED_ADVERSARIAL = _route(
     "mixed-adversarial",
     "mixed",
     (
-        ("mount", 25, 0.20, 0.30, math.pi / 3.0),
-        ("turn", 25, 0.10, -0.20, -math.pi / 4.0),
-        ("descend", 25, -0.30, 0.10, math.pi),
-        ("exit", 25, 0.00, 0.35, math.pi / 2.0),
+        ("approach", 180, 0.38, 0.00, 0.0),
+        ("diagonal-mount", 80, 0.28, 0.18, math.atan2(0.18, 0.28)),
+        ("turn-across", 70, 0.05, -0.20, -math.pi / 2.0),
+        ("reverse-down", 100, -0.30, 0.10, 0.0),
+        ("side-exit", 70, 0.00, 0.38, 0.0),
     ),
 )
 

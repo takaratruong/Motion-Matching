@@ -134,12 +134,14 @@ class TorchMotionDatabase:
         device: "str | torch.device",
         extension: SearchFeatureExtension | None = None,
         reset_clip_path: str | None = None,
+        normalization_override: FeatureNormalization | None = None,
     ) -> "TorchMotionDatabase":
         return _build_database(
             folder,
             device,
             extension=extension,
             reset_clip_path=reset_clip_path,
+            normalization_override=normalization_override,
         )
 
 
@@ -381,6 +383,7 @@ def _build_database(
     *,
     extension: SearchFeatureExtension | None = None,
     reset_clip_path: str | None = None,
+    normalization_override: FeatureNormalization | None = None,
 ) -> TorchMotionDatabase:
     resolved = resolve_torch_device(device)
     layout = folder.layout
@@ -477,6 +480,35 @@ def _build_database(
                 f"{float(group_scale)}"
             )
         scale[group_slice] = group_scale
+
+    if normalization_override is not None:
+        if not isinstance(normalization_override, FeatureNormalization):
+            raise ContractError(
+                "normalization override must be FeatureNormalization"
+            )
+        override_mean, override_scale = (
+            normalization_override.parameters_copy()
+        )
+        expected = (features.shape[1],)
+        if (
+            tuple(override_mean.shape) != expected
+            or tuple(override_scale.shape) != expected
+        ):
+            raise ContractError(
+                f"normalization override must have shape {expected}"
+            )
+        component_mean = override_mean.to(
+            device=resolved, dtype=torch.float32
+        )
+        scale = override_scale.to(device=resolved, dtype=torch.float32)
+        if (
+            not torch.isfinite(component_mean).all()
+            or not torch.isfinite(scale).all()
+            or bool((scale <= 0.0).any().item())
+        ):
+            raise ContractError(
+                "normalization override must be finite with positive scale"
+            )
 
     normalized = (features - component_mean) / scale
     normalized.requires_grad_(False)

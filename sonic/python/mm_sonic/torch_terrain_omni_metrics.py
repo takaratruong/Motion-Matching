@@ -15,6 +15,8 @@ STANCE_CLEARANCE_TOLERANCE_M = 0.02
 STANCE_VERTICAL_SPEED_MAX_MPS = 0.12
 RESCUE_NEIGHBORHOOD_FRAMES = 8
 RESCUE_CYCLE_PROGRESS_MIN_M = 0.05
+MOVING_COMMAND_SPEED_MIN_MPS = 0.10
+STALL_ROOT_SPEED_MAX_MPS = 0.03
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,10 @@ class OmniRouteMetrics:
     heading_error_rad: Distribution
     root_progress_m: float
     root_jerk_m_s3: Distribution
+    root_velocity_error_mps: Distribution
+    stalled_moving_mask: np.ndarray
+    stalled_moving_fraction: float
+    longest_stall_frames: int
     transition_count: int
     rescue_cycles: tuple[RescueCycle, ...]
     required_outcome_completed: bool | None
@@ -211,16 +217,43 @@ def evaluate_omni_route(
     else:
         root_jerk = np.empty(0, dtype=np.float64)
 
+    root_velocity = np.zeros_like(root_xy_array)
+    if frame_count > 1:
+        root_velocity[1:] = np.diff(root_xy_array, axis=0) / DT_S
+    moving_command = (
+        np.linalg.norm(command_velocity, axis=1)
+        >= MOVING_COMMAND_SPEED_MIN_MPS
+    )
+    if frame_count:
+        moving_command[0] = False
+    stalled = moving_command & (
+        np.linalg.norm(root_velocity, axis=1) <= STALL_ROOT_SPEED_MAX_MPS
+    )
+    moving_count = int(np.sum(moving_command))
+    longest_stall = 0
+    current_stall = 0
+    for value in stalled:
+        current_stall = current_stall + 1 if value else 0
+        longest_stall = max(longest_stall, current_stall)
+    velocity_error = np.linalg.norm(
+        root_velocity - command_velocity, axis=1
+    )
+
     transition_count = 0
     if selected_clip_id is not None or selected_source_frame is not None:
         if selected_clip_id is None or selected_source_frame is None:
             raise ValueError("selection clip and frame must be supplied together")
         if len(selected_clip_id) != frame_count or len(selected_source_frame) != frame_count:
             raise ValueError("selection arrays must share the frame count")
-        identities = tuple(zip(selected_clip_id, selected_source_frame))
         transition_count = sum(
-            current != previous
-            for previous, current in zip(identities, identities[1:])
+            current_clip != previous_clip
+            or int(current_frame) != int(previous_frame) + 1
+            for previous_clip, current_clip, previous_frame, current_frame in zip(
+                selected_clip_id,
+                selected_clip_id[1:],
+                selected_source_frame,
+                selected_source_frame[1:],
+            )
         )
 
     return OmniRouteMetrics(
@@ -238,6 +271,14 @@ def evaluate_omni_route(
         heading_error_rad=_distribution(heading_error),
         root_progress_m=root_progress,
         root_jerk_m_s3=_distribution(root_jerk),
+        root_velocity_error_mps=_distribution(
+            velocity_error[moving_command]
+        ),
+        stalled_moving_mask=stalled,
+        stalled_moving_fraction=(
+            float(np.sum(stalled)) / moving_count if moving_count else 0.0
+        ),
+        longest_stall_frames=longest_stall,
         transition_count=transition_count,
         rescue_cycles=detect_rescue_cycles(rescue_events),
         required_outcome_completed=required_outcome_completed,

@@ -18,3 +18,4 @@ resources/runs*
 /build/torch-stair-small-results/
 /build/torch-terrain-expanded/
 /build/torch-terrain-expanded-admission.json
+/build/omni-*/
