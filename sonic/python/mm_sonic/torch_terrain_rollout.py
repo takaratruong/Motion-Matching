@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+import argparse
 import hashlib
 import json
 import math
@@ -26,6 +27,8 @@ from .joints import ContractError
 from .torch_motion_matcher import TorchMotionMatcher
 from .torch_motion_features import resolve_torch_device
 from .torch_terrain_features import (
+    DENSE_FORWARD_M,
+    DENSE_LATERAL_M,
     TerrainDataset,
     TerrainFeatureExtension,
 )
@@ -372,6 +375,7 @@ def run_stair_rollout(
         "root_position_world": [],
         "root_orientation_world_wxyz": [],
         "feature_body_position_world": [],
+        "terrain_patch_position_world": [],
         "foot_clearance_m": [],
         "progress_m": [],
     }
@@ -414,6 +418,39 @@ def run_stair_rollout(
         )
         clearance = body[1:, 2] - surface_height[1:]
         root_position = result.root_position_world.detach().cpu().numpy()
+        root_quaternion = result.root_orientation_world_wxyz
+        w, x, y, z = root_quaternion
+        root_yaw = torch.atan2(
+            2.0 * (w * z + x * y),
+            1.0 - 2.0 * (y * y + z * z),
+        )
+        patch_forward, patch_lateral = torch.meshgrid(
+            torch.tensor(
+                DENSE_FORWARD_M,
+                dtype=torch.float32,
+                device=resolved_device,
+            ),
+            torch.tensor(
+                DENSE_LATERAL_M,
+                dtype=torch.float32,
+                device=resolved_device,
+            ),
+            indexing="ij",
+        )
+        cosine = torch.cos(root_yaw)
+        sine = torch.sin(root_yaw)
+        patch_x = cosine * patch_forward - sine * patch_lateral
+        patch_y = sine * patch_forward + cosine * patch_lateral
+        patch_matcher_xy = torch.stack(
+            (patch_x, patch_y), dim=-1
+        ).reshape(-1, 2) + result.root_position_world[:2]
+        patch_scene_xy = measurement.alignment.matcher_to_scene_xy(
+            patch_matcher_xy
+        )
+        patch_height = measurement.query_grid.sample_xy(patch_scene_xy)
+        patch_position = torch.cat(
+            (patch_matcher_xy, patch_height[:, None]), dim=1
+        ).detach().cpu().numpy()
         progress = float((root_position[:2] - initial_root[:2]) @ direction)
 
         rows["time_s"].append(np.float32(step * dt))
@@ -452,9 +489,10 @@ def run_stair_rollout(
         )
         rows["root_position_world"].append(root_position)
         rows["root_orientation_world_wxyz"].append(
-            result.root_orientation_world_wxyz.detach().cpu().numpy()
+            root_quaternion.detach().cpu().numpy()
         )
         rows["feature_body_position_world"].append(body)
+        rows["terrain_patch_position_world"].append(patch_position)
         rows["foot_clearance_m"].append(clearance.astype(np.float32))
         rows["progress_m"].append(np.float32(progress))
         if diagnostics.searched or diagnostics.transitioned:
@@ -623,6 +661,9 @@ def save_stair_rollout(rollout: StairRollout, output: str | Path) -> None:
     try:
         np.savez(staging / "rollout.npz", **rollout.arrays)
         metrics = dict(rollout.metrics)
+        metrics["rollout_npz_sha256"] = _file_sha256(
+            staging / "rollout.npz"
+        )
         (staging / "metrics.json").write_bytes(_canonical_json_bytes(metrics))
         event_bytes = b"".join(
             _canonical_json_bytes(dict(event)) for event in rollout.events
@@ -666,3 +707,74 @@ def save_stair_rollout(rollout: StairRollout, output: str | Path) -> None:
                 elif path.is_dir():
                     path.rmdir()
             staging.rmdir()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def build_rollout_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run the native 50 Hz Torch stair kinematics experiment."
+    )
+    parser.add_argument("--dataset", required=True)
+    parser.add_argument("--config", required=True)
+    parser.add_argument(
+        "--conditions",
+        nargs="+",
+        choices=CONDITIONS,
+        default=list(CONDITIONS),
+    )
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--output", required=True)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_rollout_argument_parser().parse_args(argv)
+    device = (
+        "cuda" if args.device == "auto" and torch.cuda.is_available()
+        else "cpu" if args.device == "auto"
+        else args.device
+    )
+    raw = load_experiment_config(args.config)
+    resolved = resolve_stair_config(args.dataset, raw, device=device)
+    output = Path(args.output).resolve()
+    runs: dict[str, StairRollout] = {}
+    for condition in args.conditions:
+        run = run_stair_rollout(resolved, condition, device=device)
+        save_stair_rollout(run, output / condition)
+        runs[condition] = run
+        print(
+            json.dumps(
+                {
+                    "condition": condition,
+                    "output": str(output / condition),
+                    "deterministic_sha256": run.deterministic_sha256,
+                    "metrics": dict(run.metrics),
+                },
+                sort_keys=True,
+                allow_nan=False,
+            ),
+            flush=True,
+        )
+    if "flat" in runs and "dense" in runs:
+        acceptance = evaluate_dense_acceptance(
+            runs["dense"].metrics,
+            runs["flat"].metrics,
+            resolved.resolved_config,
+        )
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "acceptance.json").write_bytes(
+            _canonical_json_bytes(acceptance)
+        )
+        print(json.dumps({"acceptance": acceptance}, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

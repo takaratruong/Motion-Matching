@@ -4,6 +4,14 @@ This repo contains the source code for all the demos from [this article](https:/
 
 It also contains basic example implementations of Motion Matching and Learned Motion Matching in the style of [this paper](https://theorangeduck.com/page/learned-motion-matching).
 
+## G1 Native Torch Stair Experiment
+
+The focused G1 terrain experiment converts four pinned GRAIL stair recordings
+to native 50 Hz Torch motion matching, compares flat/legacy/dense privileged
+height conditions, and saves authenticated kinematic rollouts for interactive
+or MP4 playback. See [TORCH_TERRAIN_QUICKSTART.md](TORCH_TERRAIN_QUICKSTART.md)
+for the exact build, run, and viewer commands.
+
 # Installation
 
 This demo uses [raylib](https://www.raylib.com/) and [raygui](https://github.com/raysan5/raygui) so you will need to first install those. Once installed, the demo itself is a pretty straight forward to make - just compile `controller.cpp`.

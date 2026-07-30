@@ -128,6 +128,7 @@ class TerrainRolloutTests(unittest.TestCase):
             ("root_position_world", (3,)),
             ("root_orientation_world_wxyz", (4,)),
             ("feature_body_position_world", (3, 3)),
+            ("terrain_patch_position_world", (91, 3)),
             ("foot_clearance_m", (2,)),
             ("progress_m", ()),
         ):
