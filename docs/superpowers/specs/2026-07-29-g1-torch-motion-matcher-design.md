@@ -209,6 +209,10 @@ receives the robot's measured state.
 - current `joint_velocity [29]`;
 - current `root_position_world [3]`;
 - current `root_orientation_world_wxyz [4]`;
+- `dense_joint_position_window [46, 29]`;
+- `dense_joint_velocity_window [46, 29]`;
+- `dense_root_position_window [46, 3]`;
+- `dense_root_orientation_window_wxyz [46, 4]`;
 - `joint_position_window [10, 29]`;
 - `joint_velocity_window [10, 29]`;
 - `root_position_window [10, 3]`;
@@ -394,8 +398,18 @@ time. The generated root remains continuous even when the source clip changes.
 ## SONIC reference-window assembly
 
 After selection, the matcher gathers the chosen clip at offsets
-`0,5,...,45`, applies the committed planar alignment, applies transition
-offsets at the corresponding future times, and creates one immutable result.
+`0,1,...,45`, applies the committed planar alignment, applies transition
+offsets at the corresponding future times, and creates one immutable dense
+result. The ten-sample encoder arrays are exact indexed views/copies of dense
+rows `0,5,...,45`; they are not separately interpolated.
+
+GEAR stores a contiguous `MotionSequence` and performs the step-five gather
+inside its observation code. Therefore, the adapter publishes all 46 dense
+rows with global frame indices `n..n+45`. On the next committed 20 ms step it
+publishes `n+1..n+46`. GEAR's existing sliding merger retains consumed history
+and replaces the overlapping future rows. Physics remains paused until that
+complete replacement is accepted. Publishing only the ten sampled rows, or
+allowing GEAR to clamp missing intermediate rows, is forbidden.
 
 The adapter verifies:
 
@@ -472,8 +486,11 @@ inertialization in this design.
 
 Adapter tests must prove the exact IsaacLab joint order, wxyz convention,
 ten-sample offsets, 0.9-second span, sequence monotonicity, and atomic
-publication. A process-level integration test must prove that the Python path
-does not launch or contact the C++ Motion Matching server.
+publication. They must also prove that dense rows `0..45` produce the sampled
+ten-row arrays exactly and that consecutive publications use overlapping
+global ranges `n..n+45` then `n+1..n+46`. A process-level integration test must
+prove that the Python path does not launch or contact the C++ Motion Matching
+server.
 
 ### Performance
 
