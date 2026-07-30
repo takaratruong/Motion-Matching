@@ -133,6 +133,11 @@ class MotionFolderLoadTests(unittest.TestCase):
             lambda a: a.__setitem__("fps", np.array([49], dtype=np.float32)),
             r"clip/motion\.npz.*fps",
         )
+        # A float64 value that rounds to 50 in float32 is still not exact 50 Hz.
+        bad(
+            lambda a: a.__setitem__("fps", np.array([50.0000001], dtype=np.float64)),
+            r"clip/motion\.npz.*fps",
+        )
         # FPS not scalar.
         bad(
             lambda a: a.__setitem__("fps", np.array([50, 50], dtype=np.float32)),

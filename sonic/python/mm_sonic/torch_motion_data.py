@@ -145,7 +145,7 @@ def _load_clip(
                     raise _fail(relative, field, "is missing")
 
             fps_raw = _read_npz_field(data, relative, "fps")
-            fps_values = _as_finite_float32(fps_raw, relative, "fps")
+            fps_values = _as_finite_real(fps_raw, relative, "fps")
             if fps_values.size != 1:
                 raise _fail(relative, "fps", "must contain exactly one value")
             fps_value = float(fps_values.reshape(-1)[0])
@@ -246,16 +246,21 @@ def _read_npz_field(data: object, relative: str, field: str) -> np.ndarray:
 
 
 def _as_finite_float32(array: np.ndarray, relative: str, field: str) -> np.ndarray:
-    source = np.asarray(array)
-    if source.dtype.kind not in "iuf":
-        raise _fail(relative, field, "must contain real numeric values")
-    if not np.all(np.isfinite(source)):
-        raise _fail(relative, field, "contains non-finite values")
+    source = _as_finite_real(array, relative, field)
     with np.errstate(over="ignore", invalid="ignore"):
         converted = np.ascontiguousarray(source, dtype=np.float32)
     if not np.all(np.isfinite(converted)):
         raise _fail(relative, field, "is not representable as finite float32")
     return converted
+
+
+def _as_finite_real(array: np.ndarray, relative: str, field: str) -> np.ndarray:
+    source = np.asarray(array)
+    if source.dtype.kind not in "iuf":
+        raise _fail(relative, field, "must contain real numeric values")
+    if not np.all(np.isfinite(source)):
+        raise _fail(relative, field, "contains non-finite values")
+    return source
 
 
 def _require_shape(
