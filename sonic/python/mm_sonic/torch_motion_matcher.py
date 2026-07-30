@@ -56,6 +56,7 @@ class SearchDecision:
     selected_total_cost: float
     searched: bool
     transitioned: bool
+    selected_transition_cost: float = 0.0
 
 
 class EmittedWindowValidator(Protocol):
@@ -315,6 +316,30 @@ def _validate_search_inputs(
     return features, row_count
 
 
+def _validated_transition_costs(
+    features: torch.Tensor,
+    additional_transition_costs: torch.Tensor | None,
+) -> torch.Tensor:
+    if additional_transition_costs is None:
+        return torch.zeros(
+            features.shape[0], dtype=torch.float32, device=features.device
+        )
+    costs = additional_transition_costs
+    if (
+        not isinstance(costs, torch.Tensor)
+        or tuple(costs.shape) != (features.shape[0],)
+        or costs.dtype != torch.float32
+        or costs.device != features.device
+        or not bool(torch.isfinite(costs).all().item())
+        or bool((costs < 0).any().item())
+    ):
+        raise ContractError(
+            "additional_transition_costs must be finite non-negative float32 "
+            "with one row on the database device"
+        )
+    return costs
+
+
 def select_exact_candidate(
     database: TorchMotionDatabase,
     normalized_query: torch.Tensor,
@@ -325,6 +350,7 @@ def select_exact_candidate(
     search: bool,
     config: MatcherConfig = MatcherConfig(),
     additional_transition_penalty: float = 0.0,
+    additional_transition_costs: torch.Tensor | None = None,
 ) -> SearchDecision:
     """Select the exact lowest-cost eligible row with continuation hysteresis."""
     additional_penalty = float(additional_transition_penalty)
@@ -334,6 +360,9 @@ def select_exact_candidate(
         )
     features, row_count = _validate_search_inputs(
         database, normalized_query, incumbent_row
+    )
+    transition_costs = _validated_transition_costs(
+        features, additional_transition_costs
     )
     if incumbent_row is None and not search:
         raise ContractError("search=False requires a valid incumbent")
@@ -379,6 +408,7 @@ def select_exact_candidate(
         feature_costs
         + config.transition_penalty
         + additional_penalty
+        + transition_costs
     )
     if incumbent_row is not None:
         total_costs[incumbent_row] = feature_costs[incumbent_row]
@@ -395,6 +425,13 @@ def select_exact_candidate(
         )
     selected_feature_cost_tensor = feature_costs[selected_row_tensor]
     selected_total_cost_tensor = total_costs[selected_row_tensor]
+    selected_transition_cost_tensor = transition_costs[selected_row_tensor]
+    if incumbent_row is not None:
+        selected_transition_cost_tensor = torch.where(
+            selected_row_tensor == incumbent_row,
+            torch.zeros((), dtype=torch.float32, device=features.device),
+            selected_transition_cost_tensor,
+        )
 
     # Convert all diagnostics in one device synchronization.
     diagnostics = torch.stack(
@@ -404,6 +441,7 @@ def select_exact_candidate(
             selected_feature_cost_tensor.to(torch.float64),
             selected_total_cost_tensor.to(torch.float64),
             candidate_total_tensor.to(torch.float64),
+            selected_transition_cost_tensor.to(torch.float64),
         )
     ).cpu().tolist()
     selected_row = int(diagnostics[0])
@@ -411,6 +449,7 @@ def select_exact_candidate(
     selected_feature_cost = float(diagnostics[2])
     selected_total_cost = float(diagnostics[3])
     candidate_total = float(diagnostics[4])
+    selected_transition_cost = float(diagnostics[5])
     if not math.isfinite(candidate_total):
         raise ContractError("no valid motion-matching candidate exists")
 
@@ -422,6 +461,7 @@ def select_exact_candidate(
         selected_total_cost=selected_total_cost,
         searched=True,
         transitioned=incumbent_row is None or selected_row != incumbent_row,
+        selected_transition_cost=selected_transition_cost,
     )
 
 
@@ -432,11 +472,15 @@ def rank_exact_transition_candidates(
     current_clip_index: int,
     current_frame_index: int,
     config: MatcherConfig = MatcherConfig(),
+    additional_transition_costs: torch.Tensor | None = None,
 ) -> tuple[SearchDecision, ...]:
     """Rank every finite eligible transition by exact matching cost."""
 
     features, row_count = _validate_search_inputs(
         database, normalized_query, None
+    )
+    transition_costs = _validated_transition_costs(
+        features, additional_transition_costs
     )
     feature_costs = torch.sum(
         torch.square(features - normalized_query.unsqueeze(0)), dim=1
@@ -460,17 +504,21 @@ def rank_exact_transition_candidates(
 
     eligible_feature_costs = feature_costs[eligible_rows]
     eligible_total_costs = (
-        eligible_feature_costs + config.transition_penalty
+        eligible_feature_costs
+        + config.transition_penalty
+        + transition_costs[eligible_rows]
     )
     order = torch.argsort(eligible_total_costs, stable=True)
     ranked_rows = eligible_rows[order]
     ranked_feature_costs = eligible_feature_costs[order]
     ranked_total_costs = eligible_total_costs[order]
+    ranked_transition_costs = transition_costs[ranked_rows]
     diagnostics = torch.stack(
         (
             ranked_rows.to(torch.float64),
             ranked_feature_costs.to(torch.float64),
             ranked_total_costs.to(torch.float64),
+            ranked_transition_costs.to(torch.float64),
         ),
         dim=1,
     ).cpu().tolist()
@@ -483,8 +531,9 @@ def rank_exact_transition_candidates(
             selected_total_cost=float(total_cost),
             searched=True,
             transitioned=True,
+            selected_transition_cost=float(transition_cost),
         )
-        for row, feature_cost, total_cost in diagnostics
+        for row, feature_cost, total_cost, transition_cost in diagnostics
     )
 
 

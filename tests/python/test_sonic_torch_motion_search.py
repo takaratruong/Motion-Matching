@@ -255,6 +255,201 @@ class ExactSearchTests(unittest.TestCase):
         self.assertTrue(all(item.searched for item in ranked))
         self.assertTrue(all(item.incumbent_row is None for item in ranked))
 
+    def test_per_row_transition_cost_orders_candidates_and_exempts_incumbent(self):
+        config = MatcherConfig()
+        devices = ["cpu"]
+        if torch.cuda.is_available():
+            devices.append("cuda")
+        for device in devices:
+            with self.subTest(device=device):
+                query = torch.zeros(1, device=device)
+                row_cost = torch.tensor(
+                    [100.0, 0.0, 2.0], dtype=torch.float32, device=device
+                )
+
+                held = select_exact_candidate(
+                    _database(
+                        [[1.0], [math.sqrt(1.5)], [0.0]],
+                        [0, 1, 1],
+                        [0, 0, 1],
+                        device,
+                    ),
+                    query,
+                    current_clip_index=0,
+                    current_frame_index=0,
+                    incumbent_row=0,
+                    search=True,
+                    config=config,
+                    additional_transition_costs=row_cost,
+                )
+                self.assertEqual(held.selected_row, 0)
+                self.assertAlmostEqual(held.selected_feature_cost, 1.0)
+                self.assertAlmostEqual(held.selected_total_cost, 1.0)
+                self.assertEqual(held.selected_transition_cost, 0.0)
+
+                smoother_second_best = select_exact_candidate(
+                    _database(
+                        [[math.sqrt(5.0)], [1.0], [0.0]],
+                        [0, 1, 1],
+                        [0, 0, 1],
+                        device,
+                    ),
+                    query,
+                    current_clip_index=0,
+                    current_frame_index=0,
+                    incumbent_row=0,
+                    search=True,
+                    config=config,
+                    additional_transition_costs=row_cost,
+                )
+                self.assertEqual(smoother_second_best.selected_row, 1)
+                self.assertEqual(
+                    smoother_second_best.selected_transition_cost, 0.0
+                )
+                self.assertAlmostEqual(
+                    smoother_second_best.selected_total_cost,
+                    smoother_second_best.selected_feature_cost
+                    + config.transition_penalty
+                    + smoother_second_best.selected_transition_cost,
+                )
+
+    def test_ranked_candidates_include_row_cost_with_stable_global_ties(self):
+        config = MatcherConfig()
+        devices = ["cpu"]
+        if torch.cuda.is_available():
+            devices.append("cuda")
+        for device in devices:
+            with self.subTest(device=device):
+                database = _database(
+                    [[9.0], [1.0], [0.0], [1.0]],
+                    [0, 1, 1, 1],
+                    [0, 0, 1, 2],
+                    device,
+                )
+                row_cost = torch.tensor(
+                    [0.0, 0.0, 1.0, 0.0],
+                    dtype=torch.float32,
+                    device=device,
+                )
+
+                ranked = rank_exact_transition_candidates(
+                    database,
+                    torch.zeros(1, device=device),
+                    current_clip_index=0,
+                    current_frame_index=0,
+                    config=config,
+                    additional_transition_costs=row_cost,
+                )
+
+                self.assertEqual(
+                    [decision.selected_row for decision in ranked], [1, 2, 3]
+                )
+                self.assertEqual(
+                    [decision.selected_transition_cost for decision in ranked],
+                    [0.0, 1.0, 0.0],
+                )
+                for decision in ranked:
+                    self.assertAlmostEqual(
+                        decision.selected_total_cost,
+                        decision.selected_feature_cost
+                        + config.transition_penalty
+                        + decision.selected_transition_cost,
+                    )
+
+    def test_per_row_transition_cost_contract_is_strict_for_both_selectors(self):
+        database = _database([[1.0], [0.0], [2.0]], [0, 1, 1], [0, 0, 1], "cpu")
+        query = torch.zeros(1)
+        invalid_costs = {
+            "python-list": [0.0, 0.0, 0.0],
+            "column": torch.zeros((3, 1), dtype=torch.float32),
+            "wrong-row-count": torch.zeros(2, dtype=torch.float32),
+            "float64": torch.zeros(3, dtype=torch.float64),
+            "wrong-device": torch.zeros(
+                3,
+                dtype=torch.float32,
+                device="cuda" if torch.cuda.is_available() else "meta",
+            ),
+            "negative": torch.tensor([0.0, -1.0, 0.0], dtype=torch.float32),
+            "nan": torch.tensor([0.0, math.nan, 0.0], dtype=torch.float32),
+            "positive-infinity": torch.tensor(
+                [0.0, math.inf, 0.0], dtype=torch.float32
+            ),
+            "negative-infinity": torch.tensor(
+                [0.0, -math.inf, 0.0], dtype=torch.float32
+            ),
+        }
+
+        def select(costs):
+            return select_exact_candidate(
+                database,
+                query,
+                current_clip_index=0,
+                current_frame_index=0,
+                incumbent_row=0,
+                search=True,
+                additional_transition_costs=costs,
+            )
+
+        def rank(costs):
+            return rank_exact_transition_candidates(
+                database,
+                query,
+                current_clip_index=0,
+                current_frame_index=0,
+                additional_transition_costs=costs,
+            )
+
+        for selector in (select, rank):
+            for case, costs in invalid_costs.items():
+                with self.subTest(selector=selector.__name__, case=case):
+                    with self.assertRaisesRegex(
+                        ContractError,
+                        "additional_transition_costs must be finite non-negative "
+                        "float32 with one row on the database device",
+                    ):
+                        selector(costs)
+
+    def test_zero_per_row_transition_costs_are_exactly_backward_compatible(self):
+        database = _database(
+            [[1.0], [0.25], [2.0], [0.25]],
+            [0, 1, 1, 1],
+            [0, 0, 1, 2],
+            "cpu",
+        )
+        query = torch.zeros(1)
+        zeros = torch.zeros(4, dtype=torch.float32)
+        kwargs = dict(
+            current_clip_index=0,
+            current_frame_index=0,
+            incumbent_row=0,
+            search=True,
+            config=MatcherConfig(),
+        )
+
+        without_costs = select_exact_candidate(database, query, **kwargs)
+        with_zeros = select_exact_candidate(
+            database,
+            query,
+            **kwargs,
+            additional_transition_costs=zeros,
+        )
+        self.assertEqual(with_zeros, without_costs)
+
+        ranked_without_costs = rank_exact_transition_candidates(
+            database,
+            query,
+            current_clip_index=0,
+            current_frame_index=0,
+        )
+        ranked_with_zeros = rank_exact_transition_candidates(
+            database,
+            query,
+            current_clip_index=0,
+            current_frame_index=0,
+            additional_transition_costs=zeros,
+        )
+        self.assertEqual(ranked_with_zeros, ranked_without_costs)
+
     def test_candidate_must_beat_incumbent_after_point_one_penalty(self):
         db = _database([[math.sqrt(1.0)], [math.sqrt(0.91)]], [0, 1], [1, 1], "cpu")
         decision = select_exact_candidate(
