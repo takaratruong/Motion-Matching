@@ -39,6 +39,7 @@ class MatcherConfig:
     exclusion_frames: int = 20
     transition_penalty: float = 0.1
     inertialization_halflife_s: float = 0.10
+    joint_reference_smoothing_weight: float = 0.0
     transition_settle_duration_s: float = 0.0
     transition_settle_penalty: float = 0.0
     transition_joint_position_weight: float = 0.0
@@ -807,6 +808,17 @@ class TorchMotionMatcher:
                 "transition_window_jerk_horizon_steps must be an integer "
                 "in [4, 46]"
             )
+        smoothing_weight = config.joint_reference_smoothing_weight
+        if (
+            isinstance(smoothing_weight, bool)
+            or not isinstance(smoothing_weight, (int, float))
+            or not math.isfinite(smoothing_weight)
+            or not 0.0 <= smoothing_weight <= 0.5
+        ):
+            raise ContractError(
+                "joint_reference_smoothing_weight must be finite and in "
+                "[0, 0.5]"
+            )
         if continuity.device != database.device:
             raise ContractError(
                 "continuity and motion databases must use the same device"
@@ -1340,6 +1352,42 @@ class TorchMotionMatcher:
             raise ContractError("motion match produced invalid dense output")
         return result
 
+    def _smooth_joint_reference(
+        self,
+        state: _MatcherState,
+        candidate: _ComposedCandidate,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        weight = float(self.config.joint_reference_smoothing_weight)
+        if weight == 0.0:
+            return (
+                candidate.dense_joint_position,
+                candidate.dense_joint_velocity,
+            )
+        center = 1.0 - 2.0 * weight
+        position = candidate.dense_joint_position.clone()
+        velocity = candidate.dense_joint_velocity.clone()
+        position[0] = (
+            weight * state.joint_position
+            + center * candidate.dense_joint_position[0]
+            + weight * candidate.dense_joint_position[1]
+        )
+        velocity[0] = (
+            weight * state.joint_velocity
+            + center * candidate.dense_joint_velocity[0]
+            + weight * candidate.dense_joint_velocity[1]
+        )
+        position[1:-1] = (
+            weight * candidate.dense_joint_position[:-2]
+            + center * candidate.dense_joint_position[1:-1]
+            + weight * candidate.dense_joint_position[2:]
+        )
+        velocity[1:-1] = (
+            weight * candidate.dense_joint_velocity[:-2]
+            + center * candidate.dense_joint_velocity[1:-1]
+            + weight * candidate.dense_joint_velocity[2:]
+        )
+        return position, velocity
+
     def reset(self) -> MotionMatchResult:
         step_start = time.perf_counter_ns()
         row = self.database.reset_row
@@ -1595,6 +1643,9 @@ class TorchMotionMatcher:
             force_reason = "clip_end"
         elif shaped.force_search:
             force_reason = "command_transition"
+        dense_joint_p, dense_joint_v = self._smooth_joint_reference(
+            state, candidate
+        )
         result = self._make_result(
             sequence=state.sequence + 1,
             clip_index=candidate.clip_index,
@@ -1609,8 +1660,8 @@ class TorchMotionMatcher:
             step_start_ns=step_start,
             motion_feature_cost=float(motion_feature_cost),
             extension_feature_cost=float(extension_feature_cost),
-            dense_joint_p=candidate.dense_joint_position,
-            dense_joint_v=candidate.dense_joint_velocity,
+            dense_joint_p=dense_joint_p,
+            dense_joint_v=dense_joint_v,
             dense_root_p=candidate.dense_root_position,
             dense_root_q=candidate.dense_root_quaternion,
             dense_body_p=candidate.dense_body_position,
@@ -1623,8 +1674,8 @@ class TorchMotionMatcher:
             candidate.yaw_offset,
             candidate.translation_xy,
             shaped.velocity_world_xy.clone(), shaped.heading_world_yaw.clone(),
-            candidate.dense_joint_position[0].clone(),
-            candidate.dense_joint_velocity[0].clone(),
+            dense_joint_p[0].clone(),
+            dense_joint_v[0].clone(),
             candidate.dense_root_position[0].clone(),
             candidate.dense_root_quaternion[0].clone(),
             candidate.dense_root_linear_velocity[0].clone(),

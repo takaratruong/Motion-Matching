@@ -215,6 +215,22 @@ class TorchMotionMatcherTests(unittest.TestCase):
                 MatcherConfig(transition_window_jerk_horizon_steps=8.0),
                 "transition_window_jerk_horizon_steps",
             ),
+            (
+                MatcherConfig(joint_reference_smoothing_weight=-0.01),
+                "joint_reference_smoothing_weight",
+            ),
+            (
+                MatcherConfig(joint_reference_smoothing_weight=0.51),
+                "joint_reference_smoothing_weight",
+            ),
+            (
+                MatcherConfig(joint_reference_smoothing_weight=math.nan),
+                "joint_reference_smoothing_weight",
+            ),
+            (
+                MatcherConfig(joint_reference_smoothing_weight=True),
+                "joint_reference_smoothing_weight",
+            ),
         )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -225,6 +241,61 @@ class TorchMotionMatcherTests(unittest.TestCase):
                         TorchMotionMatcher.from_folder(
                             root, device="cpu", config=config
                         )
+
+    def test_joint_reference_smoothing_uses_previous_and_future_samples(self):
+        arrays = build_varying_takara_arrays(frames=120)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            vanilla = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=MatcherConfig(search_interval_steps=1),
+            )
+            smoothed = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=MatcherConfig(
+                    search_interval_steps=1,
+                    joint_reference_smoothing_weight=0.25,
+                ),
+            )
+            vanilla_reset = vanilla.reset()
+            smoothed_reset = smoothed.reset()
+            raw = vanilla.step((0.5, 0.0), 0.0)
+            actual = smoothed.step((0.5, 0.0), 0.0)
+
+        torch.testing.assert_close(
+            smoothed_reset.joint_position, vanilla_reset.joint_position
+        )
+        expected_position = raw.dense_joint_position_window.clone()
+        expected_position[0] = (
+            0.25 * vanilla_reset.joint_position
+            + 0.5 * raw.dense_joint_position_window[0]
+            + 0.25 * raw.dense_joint_position_window[1]
+        )
+        expected_position[1:-1] = (
+            0.25 * raw.dense_joint_position_window[:-2]
+            + 0.5 * raw.dense_joint_position_window[1:-1]
+            + 0.25 * raw.dense_joint_position_window[2:]
+        )
+        expected_velocity = raw.dense_joint_velocity_window.clone()
+        expected_velocity[0] = (
+            0.25 * vanilla_reset.joint_velocity
+            + 0.5 * raw.dense_joint_velocity_window[0]
+            + 0.25 * raw.dense_joint_velocity_window[1]
+        )
+        expected_velocity[1:-1] = (
+            0.25 * raw.dense_joint_velocity_window[:-2]
+            + 0.5 * raw.dense_joint_velocity_window[1:-1]
+            + 0.25 * raw.dense_joint_velocity_window[2:]
+        )
+        torch.testing.assert_close(
+            actual.dense_joint_position_window, expected_position
+        )
+        torch.testing.assert_close(
+            actual.dense_joint_velocity_window, expected_velocity
+        )
 
     def test_spring_matches_independent_equation(self):
         position = torch.tensor([0.4, -0.2], dtype=torch.float32)

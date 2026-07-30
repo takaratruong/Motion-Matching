@@ -87,6 +87,7 @@ class TerrainRolloutTests(unittest.TestCase):
                 "deceleration_mps2",
                 "exclusion_frames",
                 "inertialization_halflife_s",
+                "joint_reference_smoothing_weight",
                 "reversal_speed_mps",
                 "search_interval_steps",
                 "stop_speed_mps",
@@ -118,6 +119,7 @@ class TerrainRolloutTests(unittest.TestCase):
         self.assertEqual(matcher.transition_window_candidate_count, 32)
         self.assertEqual(matcher.transition_window_jerk_horizon_steps, 46)
         self.assertEqual(matcher.transition_window_jerk_weight, 0.0)
+        self.assertEqual(matcher.joint_reference_smoothing_weight, 0.0)
         validator = terrain_transition_validator_from_resolved(
             self.resolved
         )
@@ -193,6 +195,19 @@ class TerrainRolloutTests(unittest.TestCase):
             cases[
                 f"transition_window_jerk_horizon_steps {value!r}"
             ] = invalid_horizon
+        for label, value in (
+            ("negative", -0.01),
+            ("too large", 0.51),
+            ("NaN", float("nan")),
+            ("boolean", True),
+        ):
+            invalid_smoothing = json.loads(json.dumps(raw))
+            invalid_smoothing["matcher"][
+                "joint_reference_smoothing_weight"
+            ] = value
+            cases[
+                f"joint_reference_smoothing_weight {label}"
+            ] = invalid_smoothing
         for name in (
             "transition_joint_position_weight",
             "transition_joint_velocity_weight",

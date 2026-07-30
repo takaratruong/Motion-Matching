@@ -55,6 +55,7 @@ _MATCHER_FLOAT_FIELDS = frozenset(
         "reversal_speed_mps",
         "transition_penalty",
         "inertialization_halflife_s",
+        "joint_reference_smoothing_weight",
         "transition_joint_position_weight",
         "transition_joint_velocity_weight",
         "transition_window_jerk_weight",
@@ -69,6 +70,7 @@ _MATCHER_NONNEGATIVE_FLOAT_FIELDS = frozenset(
         "transition_joint_position_weight",
         "transition_joint_velocity_weight",
         "transition_window_jerk_weight",
+        "joint_reference_smoothing_weight",
     )
 )
 
@@ -169,6 +171,10 @@ def _validate_base_config(config: object) -> None:
             raise ContractError(
                 f"matcher {name} must be finite and non-negative"
             )
+    if matcher["joint_reference_smoothing_weight"] > 0.5:
+        raise ContractError(
+            "matcher joint_reference_smoothing_weight must be at most 0.5"
+        )
     preview_steps = config.get("terrain_transition_preview_steps")
     if (
         type(preview_steps) is not int
@@ -252,6 +258,9 @@ def matcher_config_from_resolved(config: Mapping) -> MatcherConfig:
         transition_penalty=float(values["transition_penalty"]),
         inertialization_halflife_s=float(
             values["inertialization_halflife_s"]
+        ),
+        joint_reference_smoothing_weight=float(
+            values["joint_reference_smoothing_weight"]
         ),
         transition_joint_position_weight=float(
             values["transition_joint_position_weight"]
