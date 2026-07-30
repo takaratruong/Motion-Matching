@@ -84,12 +84,21 @@ the matcher performs one terrain-safety rescue. The rescue:
 - must pass the same emitted-window validator; and
 - is committed transactionally as the frame's result.
 
-If no eligible transition exists or the selected transition is unsafe, the
-matcher still fails closed. This makes terrain safety outrank both raw feature
-cost and smoothing without weakening any validator or turning safety failure
-into an unbounded candidate-search loop.
+Live testing showed that the lowest-cost non-incumbent can also be unsafe.
+Therefore the rescue ranks the complete finite eligible set by exact total cost
+and validates emitted windows in that order. It commits the first safe
+candidate. If no eligible safe transition exists, the matcher still fails
+closed. The loop is bounded by the database row count and runs only after the
+ordinary selected incumbent has failed validation.
+
+This makes terrain safety outrank both raw feature cost and smoothing without
+weakening any validator. Runtime speed remains diagnostic rather than an
+acceptance gate.
 
 Diagnostics explicitly record `terrain_safety_override` on rescued frames.
+They also record the one-based accepted rescue rank; zero means no override.
+The rank is a motion-coverage diagnostic: consistently deep ranks indicate the
+database lacks good terrain-compatible motion near the query.
 Historical saved rollouts that predate the diagnostic remain loadable and are
 interpreted as containing no overrides.
 
@@ -129,9 +138,10 @@ Focused unit tests prove:
 6. parameter validation rejects negative or non-finite values.
 7. any unsafe incumbent triggers one forced search with that incumbent
    excluded;
-8. a safe retry transition commits and records the override;
-9. a missing candidate or unsafe retry still fails closed;
-10. failed retries leave matcher state unchanged.
+8. unsafe ranked candidates are skipped and the first safe candidate commits;
+9. the accepted one-based rank is recorded;
+10. an empty ranking or an all-unsafe ranking still fails closed;
+11. failed rescues leave matcher state unchanged.
 
 After focused tests, run the full Torch matcher suite and frozen stair rollout.
 Retain a parameter candidate only if all safety gates pass and its stutter

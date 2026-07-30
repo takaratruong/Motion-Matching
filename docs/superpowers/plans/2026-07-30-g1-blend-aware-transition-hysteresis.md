@@ -511,3 +511,64 @@ settled-blend crash.
 Commit production code/tests separately from the updated result evidence. Do
 not call the viewer stable until it survives user steering and the process
 remains alive.
+
+### Task 6: Ranked Safe-Candidate Rescue
+
+**Files:**
+- Modify: `tests/python/test_sonic_torch_motion_search.py`
+- Modify: `tests/python/test_sonic_torch_motion_matcher.py`
+- Modify: `tests/python/test_sonic_torch_terrain_rollout.py`
+- Modify: `sonic/python/mm_sonic/torch_motion_matcher.py`
+- Modify: `sonic/python/mm_sonic/torch_terrain_rollout.py`
+
+**Interfaces:**
+- Produces: `rank_exact_transition_candidates(...) -> tuple[SearchDecision, ...]`.
+- Produces: `MotionMatchDiagnostics.terrain_safety_override_rank: int`, where
+  zero means no rescue and positive values are one-based ranks.
+
+- [ ] **Step 1: Write exact-ranking tests**
+
+Use a synthetic Torch database to prove ranking:
+
+- excludes the current clip's local source window;
+- contains every remaining eligible row exactly once;
+- sorts by float32 feature cost plus base transition penalty;
+- uses smallest global row as the stable tie break; and
+- has the same first row/cost as incumbent-free exact selection.
+
+- [ ] **Step 2: Write matcher rescue tests**
+
+Script a ranked result whose first candidate is unsafe and second is safe.
+Assert both emitted windows are validated, the second commits, override is true,
+and `terrain_safety_override_rank == 2`. Add an all-unsafe ranking test that
+fails without state advancement.
+
+- [ ] **Step 3: Verify RED**
+
+Run the search and matcher test modules. Expected: ranking import failure and no
+override-rank diagnostic.
+
+- [ ] **Step 4: Implement one finite ranking and validation loop**
+
+Compute float32 feature costs once on the database device. Build the same local
+eligibility mask as exact selection, add the base transition penalty, and use a
+stable cost sort. Transfer ranked row/feature/total triples in one device
+synchronization.
+
+On unsafe-incumbent rescue, compose and validate candidates in rank order. Stop
+at the first safe candidate, reconstruct diagnostics against the real
+incumbent, and record its one-based rank. If the finite ranking is empty or all
+candidates are unsafe, raise `ContractError`.
+
+- [ ] **Step 5: Wire rank evidence**
+
+Save `terrain_safety_override_rank` in rollout arrays and events. Report maximum
+and p95 positive rescue rank in metrics when overrides occur. Historical
+rollouts synthesize a zero rank.
+
+- [ ] **Step 6: Requalify**
+
+Run the full Torch suite, flat/legacy/dense CUDA rollout, MuJoCo-FK clearance,
+and prolonged arbitrary user steering. Retain only if ascent quality remains
+improved, no crash occurs, and descent weakness is documented rather than
+hidden by aggregate results.
