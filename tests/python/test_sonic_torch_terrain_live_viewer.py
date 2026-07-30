@@ -19,19 +19,8 @@ from mm_sonic.torch_terrain_live_viewer import (
     matcher_result_qpos,
 )
 from mm_sonic.torch_terrain_rollout import (
-    load_experiment_config,
-    resolve_stair_config,
+    ResolvedStairConfig,
 )
-from resources.g1_torch_stair_builder.publish import publish_stair_slice
-from tests.python.test_sonic_torch_terrain_rollout import (
-    CONFIG_PATH,
-    _wide_curved_grid,
-)
-from tests.python.test_torch_stair_conversion import (
-    _FakeKinematics,
-    write_synthetic_pinned_corpus,
-)
-from tests.python.torch_motion_test_utils import write_takara_clip
 
 
 def _minimal_g1_xml(path: Path) -> None:
@@ -99,6 +88,10 @@ class LiveCommandTests(unittest.TestCase):
                 self.assertAlmostEqual(
                     command.heading_world_yaw, expected_heading
                 )
+                self.assertEqual(
+                    command.advance_matcher,
+                    bool(np.linalg.norm(expected)),
+                )
 
     def test_space_has_stop_precedence(self):
         command = command_from_keys(
@@ -111,6 +104,7 @@ class LiveCommandTests(unittest.TestCase):
             command.velocity_world_xy, np.zeros(2)
         )
         self.assertAlmostEqual(command.heading_world_yaw, -0.2)
+        self.assertFalse(command.advance_matcher)
 
     def test_reset_and_exit_are_rising_edges(self):
         latch = ControlEdgeLatch()
@@ -149,24 +143,31 @@ class LiveMujocoSceneTests(unittest.TestCase):
     def setUpClass(cls):
         cls.temporary = tempfile.TemporaryDirectory()
         cls.root = Path(cls.temporary.name)
-        grail = cls.root / "grail"
-        write_synthetic_pinned_corpus(grail)
-        flat_motion = write_takara_clip(cls.root / "flat", frames=80)
-        builder_xml = cls.root / "builder.xml"
-        builder_xml.write_text("<mujoco/>", encoding="utf-8")
-        cls.dataset_root = cls.root / "dataset"
-        publish_stair_slice(
-            output=cls.dataset_root,
-            grail_root=grail,
-            g1_xml=builder_xml,
-            flat_motion=flat_motion,
-            kinematics=_FakeKinematics(),
-            grid_builder=_wide_curved_grid,
+        grid = SimpleNamespace(
+            origin_xy=torch.tensor([-1.0, -1.0], dtype=torch.float32),
+            cell_size_m=0.1,
+            height_z=torch.tensor(
+                [
+                    [0.0, 0.0, 0.1],
+                    [0.0, 0.1, 0.2],
+                    [0.1, 0.2, 0.3],
+                ],
+                dtype=torch.float32,
+            ),
         )
-        raw = load_experiment_config(CONFIG_PATH)
-        raw["duration_s"] = 0.10
-        cls.resolved = resolve_stair_config(
-            cls.dataset_root, raw, device="cpu"
+        alignment = SimpleNamespace(
+            translation_scene_xy=torch.zeros(2, dtype=torch.float32),
+            yaw_scene_from_matcher=torch.zeros((), dtype=torch.float32),
+        )
+        cls.resolved = ResolvedStairConfig(
+            dataset=SimpleNamespace(),
+            measurement_extension=SimpleNamespace(
+                query_grid=grid,
+                alignment=alignment,
+            ),
+            resolved_config={},
+            base_config_sha256="0" * 64,
+            device=torch.device("cpu"),
         )
         cls.g1_xml = cls.root / "g1.xml"
         _minimal_g1_xml(cls.g1_xml)

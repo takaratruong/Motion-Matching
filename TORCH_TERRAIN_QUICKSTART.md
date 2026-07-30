@@ -64,7 +64,31 @@ The viewer authenticates the rollout, dataset manifest, motion, and height grid
 before creating a window. It is not a second matcher and only calls MuJoCo
 forward kinematics to draw saved root/joint states.
 
-## 4. Record an MP4
+## 4. Drive the matcher live in native MuJoCo
+
+```bash
+DISPLAY=:1 PYTHONPATH=sonic/python \
+  sonic/.torch-mm-venv/bin/python -B -m \
+  mm_sonic.torch_terrain_live_viewer \
+  --dataset build/torch-stair-small \
+  --config sonic/configs/experiments/torch_stair_small.json \
+  --g1-xml /home/ubuntu/projects/mjx-diffphysics/env/g1/assets/g1_29dof.xml \
+  --device cuda
+```
+
+Click the MuJoCo window, then use:
+
+- `W`, `A`, `S`, `D`: command matcher-world forward, left, backward, and right;
+- `Space`: stop;
+- `Backspace`: reset the matcher and rendered robot; and
+- `X`: exit.
+
+This is a live kinematic experiment. The Torch matcher supplies every root and
+joint state. MuJoCo renders the authenticated stair heightfield, copies each
+state into `qpos`, and runs forward kinematics only. It does not integrate
+physics and does not launch SONIC, GEAR, or a tracking policy.
+
+## 5. Record an MP4
 
 ```bash
 MPLBACKEND=Agg PYTHONPATH=sonic/python \
