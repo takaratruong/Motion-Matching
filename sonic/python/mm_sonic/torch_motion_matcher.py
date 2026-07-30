@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import math
 from pathlib import Path
 import time
+from typing import Protocol
 
 import torch
 
@@ -53,6 +54,15 @@ class SearchDecision:
     selected_total_cost: float
     searched: bool
     transitioned: bool
+
+
+class EmittedWindowValidator(Protocol):
+    """Optional state-dependent validation of one composed output window."""
+
+    def __call__(
+        self, feature_body_position_window: torch.Tensor
+    ) -> bool:
+        ...
 
 
 def _require_planar_pair(
@@ -473,6 +483,7 @@ class MotionMatchDiagnostics:
     selected_total_cost: float
     searched: bool
     transitioned: bool
+    transition_rejected: bool
     force_search_reason: str | None
     search_time_ns: int | None
     step_time_ns: int
@@ -548,6 +559,24 @@ class _MatcherState:
     offsets: _Offsets
 
 
+@dataclass(frozen=True)
+class _ComposedCandidate:
+    clip_index: int
+    frame_index: int
+    transitioned: bool
+    yaw_offset: torch.Tensor
+    translation_xy: torch.Tensor
+    offsets: _Offsets
+    dense_joint_position: torch.Tensor
+    dense_joint_velocity: torch.Tensor
+    dense_root_position: torch.Tensor
+    dense_root_quaternion: torch.Tensor
+    dense_root_linear_velocity: torch.Tensor
+    dense_root_angular_velocity: torch.Tensor
+    dense_body_position: torch.Tensor
+    dense_body_velocity: torch.Tensor
+
+
 def _copy_result(result: MotionMatchResult) -> MotionMatchResult:
     values = {
         name: getattr(result, name).clone()
@@ -580,11 +609,13 @@ class TorchMotionMatcher:
         database: TorchMotionDatabase,
         clips: tuple[_DeviceClip, ...],
         config: MatcherConfig,
+        emitted_window_validator: EmittedWindowValidator | None,
     ) -> None:
         self.folder = folder
         self.database = database
         self.device = database.device
         self.config = config
+        self._emitted_window_validator = emitted_window_validator
         self._clips = clips
         self._row_sources = tuple(
             zip(
@@ -604,6 +635,7 @@ class TorchMotionMatcher:
         config: MatcherConfig = MatcherConfig(),
         extension: SearchFeatureExtension | None = None,
         reset_clip_path: str | None = None,
+        emitted_window_validator: EmittedWindowValidator | None = None,
     ) -> "TorchMotionMatcher":
         resolved = resolve_torch_device(
             "cuda" if device == "auto" and torch.cuda.is_available()
@@ -648,7 +680,13 @@ class TorchMotionMatcher:
             )
             for clip in folder.clips
         )
-        return cls(folder, database, clips, config)
+        return cls(
+            folder,
+            database,
+            clips,
+            config,
+            emitted_window_validator,
+        )
 
     @property
     def motion_inventory_sha256(self) -> str:
@@ -691,6 +729,116 @@ class TorchMotionMatcher:
         root_w = _rotate_z(clip.body_angular_velocity[sl, root], yaw_offset)
         return joint_p, joint_v, root_p, root_q, root_v, root_w, body_p, body_v
 
+    def _compose_candidate(
+        self,
+        state: _MatcherState,
+        shaped: ShapedCommand,
+        selected_row: int,
+        incumbent_row: int | None,
+    ) -> _ComposedCandidate:
+        clip_index, frame_index = self._source_for_row(selected_row)
+        transitioned = (
+            incumbent_row is None or selected_row != incumbent_row
+        )
+        if transitioned:
+            clip = self._clips[clip_index]
+            root = self.folder.layout.root_body_index
+            source_pos = clip.body_position[frame_index, root]
+            source_yaw = _quat_yaw(
+                clip.body_quaternion[frame_index, root]
+            )
+            yaw_offset = _wrapped_angle(
+                shaped.heading_world_yaw - source_yaw
+            )
+            desired_xy = (
+                state.root_position[:2]
+                + shaped.velocity_world_xy * self.config.dt
+            )
+            rotated = _rotate_z(source_pos, yaw_offset)
+            translation = desired_xy - rotated[:2]
+        else:
+            yaw_offset = state.yaw_offset
+            translation = state.translation_xy
+        targets = self._aligned_targets(
+            clip_index, frame_index, yaw_offset, translation
+        )
+        jp, jv, rp, rq, rv, rw, bp, bv = targets
+        if transitioned:
+            offsets = _Offsets(
+                state.joint_position - jp[0],
+                state.joint_velocity - jv[0],
+                state.root_position - rp[0],
+                state.root_linear_velocity - rv[0],
+                _quat_to_scaled_axis(
+                    _quat_mul(
+                        state.root_quaternion, _quat_inverse(rq[0])
+                    )
+                ),
+                state.root_angular_velocity - rw[0],
+                state.feature_body_position - bp[0],
+                state.feature_body_velocity - bv[0],
+                self.config.dt,
+            )
+        else:
+            offsets = _Offsets(
+                state.offsets.joint_position,
+                state.offsets.joint_velocity,
+                state.offsets.root_position,
+                state.offsets.root_linear_velocity,
+                state.offsets.root_rotation_axis,
+                state.offsets.root_angular_velocity,
+                state.offsets.body_position,
+                state.offsets.body_velocity,
+                state.offsets.elapsed_s + self.config.dt,
+            )
+        times = (
+            torch.arange(46, device=self.device, dtype=torch.float32)
+            * self.config.dt
+            + offsets.elapsed_s
+        )
+        jpo, jvo = decay_spring_offsets(
+            offsets.joint_position,
+            offsets.joint_velocity,
+            halflife_s=self.config.inertialization_halflife_s,
+            time_s=times,
+        )
+        rpo, rvo = decay_spring_offsets(
+            offsets.root_position,
+            offsets.root_linear_velocity,
+            halflife_s=self.config.inertialization_halflife_s,
+            time_s=times,
+        )
+        bao, bvo = decay_spring_offsets(
+            offsets.body_position,
+            offsets.body_velocity,
+            halflife_s=self.config.inertialization_halflife_s,
+            time_s=times,
+        )
+        qao, qwo = decay_spring_offsets(
+            offsets.root_rotation_axis,
+            offsets.root_angular_velocity,
+            halflife_s=self.config.inertialization_halflife_s,
+            time_s=times,
+        )
+        return _ComposedCandidate(
+            clip_index=clip_index,
+            frame_index=frame_index,
+            transitioned=transitioned,
+            yaw_offset=yaw_offset,
+            translation_xy=translation,
+            offsets=offsets,
+            dense_joint_position=jp + jpo,
+            dense_joint_velocity=jv + jvo,
+            dense_root_position=rp + rpo,
+            dense_root_quaternion=_quat_normalize(
+                _quat_mul(_quat_from_scaled_axis(qao), rq)
+            ),
+            dense_root_linear_velocity=rv + rvo,
+            dense_root_angular_velocity=rw + qwo,
+            dense_body_position=bp + bao,
+            dense_body_velocity=bv + bvo,
+        )
+
     def _make_result(
         self,
         *,
@@ -698,6 +846,7 @@ class TorchMotionMatcher:
         clip_index: int,
         frame_index: int,
         decision: SearchDecision,
+        transition_rejected: bool,
         force_reason: str | None,
         search_time_ns: int | None,
         step_start_ns: int,
@@ -722,6 +871,7 @@ class TorchMotionMatcher:
             selected_total_cost=decision.selected_total_cost,
             searched=decision.searched,
             transitioned=decision.transitioned,
+            transition_rejected=transition_rejected,
             force_search_reason=force_reason,
             search_time_ns=search_time_ns,
             step_time_ns=time.perf_counter_ns() - step_start_ns,
@@ -789,6 +939,7 @@ class TorchMotionMatcher:
             clip_index=clip_index,
             frame_index=frame_index,
             decision=decision,
+            transition_rejected=False,
             force_reason=None,
             search_time_ns=None,
             step_start_ns=step_start,
@@ -877,6 +1028,51 @@ class TorchMotionMatcher:
             config=self.config,
         )
         search_time = time.perf_counter_ns() - search_start if search else None
+        candidate = self._compose_candidate(
+            state, shaped, decision.selected_row, successor
+        )
+        transition_rejected = False
+        validator = self._emitted_window_validator
+        if validator is not None:
+            accepted = validator(candidate.dense_body_position.clone())
+            if type(accepted) is not bool:
+                raise ContractError(
+                    "emitted-window validator must return exact bool"
+                )
+            if not accepted:
+                if not candidate.transitioned:
+                    raise ContractError(
+                        "emitted-window incumbent is unsafe"
+                    )
+                if successor is None:
+                    raise ContractError(
+                        "unsafe transition has no incumbent"
+                    )
+                incumbent = self._compose_candidate(
+                    state, shaped, successor, successor
+                )
+                incumbent_accepted = validator(
+                    incumbent.dense_body_position.clone()
+                )
+                if type(incumbent_accepted) is not bool:
+                    raise ContractError(
+                        "emitted-window validator must return exact bool"
+                    )
+                if not incumbent_accepted:
+                    raise ContractError(
+                        "emitted-window incumbent is unsafe"
+                    )
+                candidate = incumbent
+                decision = SearchDecision(
+                    selected_row=successor,
+                    incumbent_row=successor,
+                    incumbent_cost=decision.incumbent_cost,
+                    selected_feature_cost=decision.incumbent_cost,
+                    selected_total_cost=decision.incumbent_cost,
+                    searched=decision.searched,
+                    transitioned=False,
+                )
+                transition_rejected = True
         residual_sq = torch.square(
             self.database._search_features[decision.selected_row] - query
         )
@@ -892,84 +1088,6 @@ class TorchMotionMatcher:
             .cpu()
             .tolist()
         )
-        clip_index, frame_index = self._source_for_row(decision.selected_row)
-        transitioned = decision.transitioned or successor is None
-        if transitioned:
-            clip = self._clips[clip_index]
-            root = self.folder.layout.root_body_index
-            source_pos = clip.body_position[frame_index, root]
-            source_yaw = _quat_yaw(clip.body_quaternion[frame_index, root])
-            yaw_offset = _wrapped_angle(shaped.heading_world_yaw - source_yaw)
-            desired_xy = (
-                state.root_position[:2]
-                + shaped.velocity_world_xy * self.config.dt
-            )
-            rotated = _rotate_z(source_pos, yaw_offset)
-            translation = desired_xy - rotated[:2]
-        else:
-            yaw_offset = state.yaw_offset
-            translation = state.translation_xy
-        targets = self._aligned_targets(
-            clip_index, frame_index, yaw_offset, translation
-        )
-        jp, jv, rp, rq, rv, rw, bp, bv = targets
-        if transitioned:
-            offsets = _Offsets(
-                state.joint_position - jp[0],
-                state.joint_velocity - jv[0],
-                state.root_position - rp[0],
-                state.root_linear_velocity - rv[0],
-                _quat_to_scaled_axis(
-                    _quat_mul(state.root_quaternion, _quat_inverse(rq[0]))
-                ),
-                state.root_angular_velocity - rw[0],
-                state.feature_body_position - bp[0],
-                state.feature_body_velocity - bv[0],
-                self.config.dt,
-            )
-        else:
-            offsets = _Offsets(
-                state.offsets.joint_position,
-                state.offsets.joint_velocity,
-                state.offsets.root_position,
-                state.offsets.root_linear_velocity,
-                state.offsets.root_rotation_axis,
-                state.offsets.root_angular_velocity,
-                state.offsets.body_position,
-                state.offsets.body_velocity,
-                state.offsets.elapsed_s + self.config.dt,
-            )
-        times = (
-            torch.arange(46, device=self.device, dtype=torch.float32)
-            * self.config.dt
-            + offsets.elapsed_s
-        )
-        jpo, jvo = decay_spring_offsets(
-            offsets.joint_position, offsets.joint_velocity,
-            halflife_s=self.config.inertialization_halflife_s, time_s=times,
-        )
-        rpo, rvo = decay_spring_offsets(
-            offsets.root_position, offsets.root_linear_velocity,
-            halflife_s=self.config.inertialization_halflife_s, time_s=times,
-        )
-        bao, bvo = decay_spring_offsets(
-            offsets.body_position, offsets.body_velocity,
-            halflife_s=self.config.inertialization_halflife_s, time_s=times,
-        )
-        qao, qwo = decay_spring_offsets(
-            offsets.root_rotation_axis, offsets.root_angular_velocity,
-            halflife_s=self.config.inertialization_halflife_s, time_s=times,
-        )
-        dense_jp = jp + jpo
-        dense_jv = jv + jvo
-        dense_rp = rp + rpo
-        dense_rv = rv + rvo
-        dense_bp = bp + bao
-        dense_bv = bv + bvo
-        dense_rq = _quat_normalize(
-            _quat_mul(_quat_from_scaled_axis(qao), rq)
-        )
-        dense_rw = rw + qwo
         force_reason = None
         if successor is None:
             force_reason = "clip_end"
@@ -977,27 +1095,38 @@ class TorchMotionMatcher:
             force_reason = "command_transition"
         result = self._make_result(
             sequence=state.sequence + 1,
-            clip_index=clip_index,
-            frame_index=frame_index,
+            clip_index=candidate.clip_index,
+            frame_index=candidate.frame_index,
             decision=decision,
+            transition_rejected=transition_rejected,
             force_reason=force_reason,
             search_time_ns=search_time,
             step_start_ns=step_start,
             motion_feature_cost=float(motion_feature_cost),
             extension_feature_cost=float(extension_feature_cost),
-            dense_joint_p=dense_jp,
-            dense_joint_v=dense_jv,
-            dense_root_p=dense_rp,
-            dense_root_q=dense_rq,
-            dense_body_p=dense_bp,
-            dense_body_v=dense_bv,
+            dense_joint_p=candidate.dense_joint_position,
+            dense_joint_v=candidate.dense_joint_velocity,
+            dense_root_p=candidate.dense_root_position,
+            dense_root_q=candidate.dense_root_quaternion,
+            dense_body_p=candidate.dense_body_position,
+            dense_body_v=candidate.dense_body_velocity,
         )
         next_state = _MatcherState(
-            state.sequence + 1, clip_index, frame_index, yaw_offset, translation,
+            state.sequence + 1,
+            candidate.clip_index,
+            candidate.frame_index,
+            candidate.yaw_offset,
+            candidate.translation_xy,
             shaped.velocity_world_xy.clone(), shaped.heading_world_yaw.clone(),
-            dense_jp[0].clone(), dense_jv[0].clone(), dense_rp[0].clone(),
-            dense_rq[0].clone(), dense_rv[0].clone(), dense_rw[0].clone(),
-            dense_bp[0].clone(), dense_bv[0].clone(), offsets,
+            candidate.dense_joint_position[0].clone(),
+            candidate.dense_joint_velocity[0].clone(),
+            candidate.dense_root_position[0].clone(),
+            candidate.dense_root_quaternion[0].clone(),
+            candidate.dense_root_linear_velocity[0].clone(),
+            candidate.dense_root_angular_velocity[0].clone(),
+            candidate.dense_body_position[0].clone(),
+            candidate.dense_body_velocity[0].clone(),
+            candidate.offsets,
         )
         return PreparedMotionMatch(
             _copy_result(result), self._owner_token, state.sequence, next_state

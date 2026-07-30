@@ -3,11 +3,16 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
 
+from mm_sonic.joints import ContractError
 from mm_sonic.torch_motion_matcher import (
+    EmittedWindowValidator,
+    MatcherConfig,
+    SearchDecision,
     TorchMotionMatcher,
     decay_spring_offsets,
 )
@@ -39,6 +44,16 @@ class _MatcherExtension:
         self.query_calls += 1
         value = state.root_position_world[0]
         return torch.stack((value, value.square() + value))
+
+
+class _ScriptedWindowValidator:
+    def __init__(self, decisions):
+        self.decisions = list(decisions)
+        self.windows = []
+
+    def __call__(self, window):
+        self.windows.append(window.clone())
+        return self.decisions.pop(0)
 
 
 class TorchMotionMatcherTests(unittest.TestCase):
@@ -125,6 +140,125 @@ class TorchMotionMatcherTests(unittest.TestCase):
             result.diagnostics.selected_feature_cost,
             places=4,
         )
+
+    def test_unsafe_transition_falls_back_to_safe_incumbent_transactionally(
+        self,
+    ):
+        self.assertTrue(issubclass(EmittedWindowValidator, object))
+        arrays = build_varying_takara_arrays(frames=120)
+        validator = _ScriptedWindowValidator([False, True])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=MatcherConfig(search_interval_steps=1),
+                emitted_window_validator=validator,
+            )
+            reset = matcher.reset()
+            successor = matcher.database.row_for_source(
+                0, reset.diagnostics.selected_frame + 1
+            )
+            self.assertIsNotNone(successor)
+            target_frame = (
+                reset.diagnostics.selected_frame + 25
+            ) % matcher.folder.clips[0].valid_frame_stop
+            if target_frame == reset.diagnostics.selected_frame + 1:
+                target_frame = (
+                    target_frame + 25
+                ) % matcher.folder.clips[0].valid_frame_stop
+            target = matcher.database.row_for_source(0, target_frame)
+            self.assertIsNotNone(target)
+            decision = SearchDecision(
+                target,
+                successor,
+                10.0,
+                1.0,
+                1.1,
+                True,
+                True,
+            )
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher.select_exact_candidate",
+                return_value=decision,
+            ):
+                result = matcher.step((0.5, 0.0), 0.0)
+
+        self.assertEqual(
+            result.diagnostics.selected_frame,
+            reset.diagnostics.selected_frame + 1,
+        )
+        self.assertFalse(result.diagnostics.transitioned)
+        self.assertTrue(result.diagnostics.transition_rejected)
+        self.assertTrue(result.diagnostics.searched)
+        self.assertEqual(len(validator.windows), 2)
+        self.assertEqual(validator.windows[0].shape, (46, 3, 3))
+        validator.windows[0].add_(100.0)
+        self.assertFalse(
+            torch.allclose(
+                validator.windows[0],
+                result.dense_feature_body_position_window,
+            )
+        )
+
+    def test_unsafe_incumbent_fails_without_advancing_state(self):
+        arrays = build_varying_takara_arrays(frames=120)
+        validator = _ScriptedWindowValidator([False])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=MatcherConfig(search_interval_steps=1),
+                emitted_window_validator=validator,
+            )
+            reset = matcher.reset()
+            successor = matcher.database.row_for_source(
+                0, reset.diagnostics.selected_frame + 1
+            )
+            self.assertIsNotNone(successor)
+            decision = SearchDecision(
+                successor,
+                successor,
+                2.0,
+                2.0,
+                2.0,
+                True,
+                False,
+            )
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher.select_exact_candidate",
+                return_value=decision,
+            ):
+                with self.assertRaisesRegex(
+                    ContractError, "incumbent.*unsafe"
+                ):
+                    matcher.prepare_step((0.5, 0.0), 0.0)
+                validator.decisions.append(True)
+                prepared = matcher.prepare_step((0.5, 0.0), 0.0)
+
+        self.assertEqual(prepared.result.diagnostics.sequence, 1)
+        self.assertEqual(reset.diagnostics.sequence, 0)
+
+    def test_emitted_window_validator_must_return_exact_bool(self):
+        arrays = build_varying_takara_arrays(frames=120)
+
+        def invalid_validator(_window):
+            return torch.tensor(True)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                emitted_window_validator=invalid_validator,
+            )
+            matcher.reset()
+            with self.assertRaisesRegex(ContractError, "exact bool"):
+                matcher.prepare_step((0.5, 0.0), 0.0)
 
     def test_explicit_none_preserves_flat_matcher_for_100_commands(self):
         arrays = build_varying_takara_arrays(frames=160)
