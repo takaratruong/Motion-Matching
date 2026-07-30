@@ -11,6 +11,10 @@ from typing import Protocol
 import torch
 
 from .joints import ContractError
+from .torch_motion_continuity import (
+    TransitionContinuityCosts,
+    TransitionContinuityDatabase,
+)
 from .torch_motion_data import MotionFolder
 from .torch_motion_features import (
     CommandTrajectory,
@@ -37,6 +41,8 @@ class MatcherConfig:
     inertialization_halflife_s: float = 0.10
     transition_settle_duration_s: float = 0.0
     transition_settle_penalty: float = 0.0
+    transition_joint_position_weight: float = 0.0
+    transition_joint_velocity_weight: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -634,6 +640,9 @@ class MotionMatchDiagnostics:
     motion_feature_cost: float
     extension_feature_cost: float
     selected_total_cost: float
+    selected_transition_position_cost: float
+    selected_transition_velocity_cost: float
+    selected_transition_continuity_cost: float
     searched: bool
     transitioned: bool
     transition_rejected: bool
@@ -762,12 +771,29 @@ class TorchMotionMatcher:
         self,
         folder: MotionFolder,
         database: TorchMotionDatabase,
+        continuity: TransitionContinuityDatabase,
         clips: tuple[_DeviceClip, ...],
         config: MatcherConfig,
         emitted_window_validator: EmittedWindowValidator | None = None,
     ) -> None:
+        if continuity.device != database.device:
+            raise ContractError(
+                "continuity and motion databases must use the same device"
+            )
+        continuity_rows = (
+            continuity._joint_position.shape[0],
+            continuity._joint_velocity.shape[0],
+        )
+        if any(
+            row_count != database._search_features.shape[0]
+            for row_count in continuity_rows
+        ):
+            raise ContractError(
+                "continuity and motion database row counts must match"
+            )
         self.folder = folder
         self.database = database
+        self._continuity = continuity
         self.device = database.device
         self.config = config
         self._emitted_window_validator = emitted_window_validator
@@ -806,6 +832,7 @@ class TorchMotionMatcher:
             extension=extension,
             reset_clip_path=reset_clip_path,
         )
+        continuity = TransitionContinuityDatabase.from_folder(folder, resolved)
         clips = tuple(
             _DeviceClip(
                 joint_position=torch.tensor(
@@ -838,6 +865,7 @@ class TorchMotionMatcher:
         return cls(
             folder,
             database,
+            continuity,
             clips,
             config,
             emitted_window_validator,
@@ -1001,6 +1029,7 @@ class TorchMotionMatcher:
         clip_index: int,
         frame_index: int,
         decision: SearchDecision,
+        continuity: TransitionContinuityCosts | None,
         transition_rejected: bool,
         terrain_safety_override: bool,
         terrain_safety_override_rank: int,
@@ -1017,6 +1046,24 @@ class TorchMotionMatcher:
         dense_body_v: torch.Tensor,
     ) -> MotionMatchResult:
         sample = torch.arange(0, 46, 5, device=self.device)
+        if decision.transitioned:
+            if continuity is None:
+                raise ContractError(
+                    "transition diagnostics require continuity costs"
+                )
+            (
+                position_cost,
+                velocity_cost,
+                total_cost,
+            ) = torch.stack(
+                (
+                    continuity.position[decision.selected_row],
+                    continuity.velocity[decision.selected_row],
+                    continuity.total[decision.selected_row],
+                )
+            ).to(torch.float64).cpu().tolist()
+        else:
+            position_cost = velocity_cost = total_cost = 0.0
         diagnostics = MotionMatchDiagnostics(
             sequence=sequence,
             selected_clip_path=self.folder.clips[clip_index].relative_path,
@@ -1026,6 +1073,9 @@ class TorchMotionMatcher:
             motion_feature_cost=motion_feature_cost,
             extension_feature_cost=extension_feature_cost,
             selected_total_cost=decision.selected_total_cost,
+            selected_transition_position_cost=float(position_cost),
+            selected_transition_velocity_cost=float(velocity_cost),
+            selected_transition_continuity_cost=float(total_cost),
             searched=decision.searched,
             transitioned=decision.transitioned,
             transition_rejected=transition_rejected,
@@ -1098,6 +1148,7 @@ class TorchMotionMatcher:
             clip_index=clip_index,
             frame_index=frame_index,
             decision=decision,
+            continuity=None,
             transition_rejected=False,
             terrain_safety_override=False,
             terrain_safety_override_rank=0,
@@ -1181,6 +1232,12 @@ class TorchMotionMatcher:
         settle_penalty = active_transition_penalty(
             state.offsets.elapsed_s, self.config
         )
+        continuity = self._continuity.costs(
+            state.joint_position,
+            state.joint_velocity,
+            position_weight=self.config.transition_joint_position_weight,
+            velocity_weight=self.config.transition_joint_velocity_weight,
+        )
         search_start = time.perf_counter_ns()
         decision = select_exact_candidate(
             self.database,
@@ -1191,6 +1248,7 @@ class TorchMotionMatcher:
             search=search,
             config=self.config,
             additional_transition_penalty=settle_penalty,
+            additional_transition_costs=continuity.total,
         )
         search_time = time.perf_counter_ns() - search_start if search else None
         candidate = self._compose_candidate(
@@ -1220,6 +1278,7 @@ class TorchMotionMatcher:
                         current_clip_index=state.clip_index,
                         current_frame_index=state.frame_index,
                         config=self.config,
+                        additional_transition_costs=continuity.total,
                     )
                     rescue_time = time.perf_counter_ns() - rescue_start
                     search_time = (
@@ -1272,6 +1331,9 @@ class TorchMotionMatcher:
                         ),
                         searched=True,
                         transitioned=True,
+                        selected_transition_cost=(
+                            rescue_decision.selected_transition_cost
+                        ),
                     )
                     terrain_safety_override = True
                 else:
@@ -1329,6 +1391,7 @@ class TorchMotionMatcher:
             clip_index=candidate.clip_index,
             frame_index=candidate.frame_index,
             decision=decision,
+            continuity=continuity,
             transition_rejected=transition_rejected,
             terrain_safety_override=terrain_safety_override,
             terrain_safety_override_rank=terrain_safety_override_rank,

@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from mm_sonic.joints import ContractError
+from mm_sonic.torch_motion_continuity import TransitionContinuityCosts
 from mm_sonic.torch_motion_matcher import (
     EmittedWindowValidator,
     MatcherConfig,
@@ -119,6 +120,44 @@ class TorchMotionMatcherTests(unittest.TestCase):
                     isolated, next_result.dense_feature_body_position_window
                 )
             )
+
+    def test_constructor_rejects_mismatched_continuity_database(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(root, device="cpu")
+            mismatches = (
+                (
+                    replace(
+                        matcher._continuity,
+                        device=torch.device("meta"),
+                    ),
+                    "same device",
+                ),
+                (
+                    replace(
+                        matcher._continuity,
+                        _joint_position=(
+                            matcher._continuity._joint_position[:-1]
+                        ),
+                        _joint_velocity=(
+                            matcher._continuity._joint_velocity[:-1]
+                        ),
+                    ),
+                    "row counts",
+                ),
+            )
+            for continuity, message in mismatches:
+                with self.subTest(message=message):
+                    with self.assertRaisesRegex(ContractError, message):
+                        TorchMotionMatcher(
+                            matcher.folder,
+                            matcher.database,
+                            continuity,
+                            matcher._clips,
+                            matcher.config,
+                        )
 
     def test_extension_query_and_split_costs_are_used_by_matcher(self):
         arrays = build_varying_takara_arrays(frames=100)
@@ -394,6 +433,126 @@ class TorchMotionMatcherTests(unittest.TestCase):
         self.assertEqual(matcher._state.sequence, 2)
         self.assertEqual(len(validator.windows), 5)
 
+    def test_ranked_rescue_uses_continuity_order_transactionally(self):
+        arrays = build_varying_takara_arrays(frames=48)
+        continuity = TransitionContinuityCosts(
+            position=torch.tensor([0.0, 5.0, 0.1]),
+            velocity=torch.tensor([0.0, 5.0, 0.1]),
+            total=torch.tensor([0.0, 10.0, 0.2]),
+        )
+
+        def make_matcher(root, validator):
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=MatcherConfig(
+                    search_interval_steps=1,
+                    exclusion_frames=0,
+                    transition_penalty=0.0,
+                    transition_joint_position_weight=1.0,
+                    transition_joint_velocity_weight=1.0,
+                ),
+                emitted_window_validator=validator,
+            )
+            matcher.reset()
+            matcher.database._search_features.zero_()
+            matcher.database._search_features[1, 0] = 1.0
+            matcher.database._search_features[2, 0] = math.sqrt(2.0)
+            return matcher
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            validator = _ScriptedWindowValidator([False, False, True])
+            matcher = make_matcher(root, validator)
+            mean, _ = matcher.database.normalization.parameters_copy()
+            self.assertLess(
+                torch.sum(torch.square(matcher.database._search_features[1])),
+                torch.sum(torch.square(matcher.database._search_features[2])),
+            )
+            self.assertLess(
+                torch.sum(torch.square(matcher.database._search_features[2]))
+                + continuity.total[2],
+                torch.sum(torch.square(matcher.database._search_features[1]))
+                + continuity.total[1],
+            )
+
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher.extract_query_features",
+                return_value=mean,
+            ), mock.patch(
+                "mm_sonic.torch_motion_matcher."
+                "TorchMotionDatabase.row_for_source",
+                return_value=0,
+            ), mock.patch(
+                "mm_sonic.torch_motion_matcher."
+                "TransitionContinuityDatabase.costs",
+                return_value=continuity,
+            ), mock.patch(
+                "mm_sonic.torch_motion_matcher."
+                "rank_exact_transition_candidates",
+                wraps=rank_exact_transition_candidates,
+            ) as ranking, mock.patch.object(
+                matcher,
+                "_compose_candidate",
+                wraps=matcher._compose_candidate,
+            ) as compose:
+                result = matcher.step((0.5, 0.0), 0.0)
+
+            ranking.assert_called_once()
+            self.assertIs(
+                ranking.call_args.kwargs["additional_transition_costs"],
+                continuity.total,
+            )
+            self.assertEqual(
+                [call.args[2] for call in compose.call_args_list],
+                [0, 2, 1],
+            )
+            self.assertEqual(result.diagnostics.selected_frame, 1)
+            self.assertEqual(result.diagnostics.terrain_safety_override_rank, 2)
+            self.assertEqual(
+                result.diagnostics.selected_transition_position_cost, 5.0
+            )
+            self.assertEqual(
+                result.diagnostics.selected_transition_velocity_cost, 5.0
+            )
+            self.assertEqual(
+                result.diagnostics.selected_transition_continuity_cost, 10.0
+            )
+
+            all_unsafe = _ScriptedWindowValidator([False, False, False])
+            failed = make_matcher(root, all_unsafe)
+            failed_mean, _ = failed.database.normalization.parameters_copy()
+            sequence = failed._state.sequence
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher.extract_query_features",
+                return_value=failed_mean,
+            ), mock.patch(
+                "mm_sonic.torch_motion_matcher."
+                "TorchMotionDatabase.row_for_source",
+                return_value=0,
+            ), mock.patch(
+                "mm_sonic.torch_motion_matcher."
+                "TransitionContinuityDatabase.costs",
+                return_value=continuity,
+            ), mock.patch(
+                "mm_sonic.torch_motion_matcher."
+                "rank_exact_transition_candidates",
+                wraps=rank_exact_transition_candidates,
+            ) as failed_ranking:
+                with self.assertRaisesRegex(
+                    ContractError, "no safe terrain rescue candidate"
+                ):
+                    failed.prepare_step((0.5, 0.0), 0.0)
+
+            self.assertIs(
+                failed_ranking.call_args.kwargs[
+                    "additional_transition_costs"
+                ],
+                continuity.total,
+            )
+            self.assertEqual(failed._state.sequence, sequence)
+
     def test_unsafe_transition_falls_back_to_safe_incumbent_transactionally(
         self,
     ):
@@ -513,17 +672,32 @@ class TorchMotionMatcherTests(unittest.TestCase):
 
         self.assertEqual(reset.diagnostics.sequence, 0)
 
-    def test_explicit_none_preserves_flat_matcher_for_100_commands(self):
+    def test_zero_continuity_weights_preserve_matcher_for_100_commands(self):
         arrays = build_varying_takara_arrays(frames=160)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write_takara_arrays(root / "walk", arrays)
             omitted = TorchMotionMatcher.from_folder(root, device="cpu")
             explicit = TorchMotionMatcher.from_folder(
-                root, device="cpu", extension=None
+                root,
+                device="cpu",
+                config=MatcherConfig(
+                    transition_joint_position_weight=0.0,
+                    transition_joint_velocity_weight=0.0,
+                ),
             )
-            omitted.reset()
-            explicit.reset()
+            left_reset = omitted.reset()
+            right_reset = explicit.reset()
+            for reset in (left_reset, right_reset):
+                self.assertEqual(
+                    reset.diagnostics.selected_transition_position_cost, 0.0
+                )
+                self.assertEqual(
+                    reset.diagnostics.selected_transition_velocity_cost, 0.0
+                )
+                self.assertEqual(
+                    reset.diagnostics.selected_transition_continuity_cost, 0.0
+                )
             for step in range(100):
                 velocity = (
                     0.4 * math.cos(0.03 * step),
@@ -533,6 +707,14 @@ class TorchMotionMatcherTests(unittest.TestCase):
                 left = omitted.step(velocity, heading)
                 right = explicit.step(velocity, heading)
                 self.assertEqual(
+                    left.diagnostics.selected_clip_path,
+                    right.diagnostics.selected_clip_path,
+                )
+                self.assertEqual(
+                    left.diagnostics.selected_frame,
+                    right.diagnostics.selected_frame,
+                )
+                self.assertEqual(
                     replace(
                         left.diagnostics, search_time_ns=None, step_time_ns=0
                     ),
@@ -540,24 +722,176 @@ class TorchMotionMatcherTests(unittest.TestCase):
                         right.diagnostics, search_time_ns=None, step_time_ns=0
                     ),
                 )
-                torch.testing.assert_close(
-                    left.dense_joint_position_window,
-                    right.dense_joint_position_window,
-                    rtol=0.0,
-                    atol=0.0,
-                )
-                torch.testing.assert_close(
-                    left.dense_root_position_window,
-                    right.dense_root_position_window,
-                    rtol=0.0,
-                    atol=0.0,
-                )
-                torch.testing.assert_close(
-                    left.dense_feature_body_position_window,
-                    right.dense_feature_body_position_window,
-                    rtol=0.0,
-                    atol=0.0,
-                )
+                for diagnostics in (left.diagnostics, right.diagnostics):
+                    self.assertEqual(
+                        diagnostics.selected_transition_position_cost, 0.0
+                    )
+                    self.assertEqual(
+                        diagnostics.selected_transition_velocity_cost, 0.0
+                    )
+                    self.assertEqual(
+                        diagnostics.selected_transition_continuity_cost, 0.0
+                    )
+                for name in (
+                    "dense_joint_position_window",
+                    "dense_joint_velocity_window",
+                    "dense_root_position_window",
+                    "dense_root_orientation_window_wxyz",
+                    "dense_feature_body_position_window",
+                    "dense_feature_body_velocity_window",
+                ):
+                    torch.testing.assert_close(
+                        getattr(left, name),
+                        getattr(right, name),
+                        rtol=0.0,
+                        atol=0.0,
+                    )
+
+    def test_runtime_continuity_selects_smoother_candidate_and_reports_costs(
+        self,
+    ):
+        arrays = build_varying_takara_arrays(frames=48)
+        continuity = TransitionContinuityCosts(
+            position=torch.tensor([0.0, 5.0, 0.1]),
+            velocity=torch.tensor([0.0, 5.0, 0.1]),
+            total=torch.tensor([0.0, 10.0, 0.2]),
+        )
+        zeros = TransitionContinuityCosts(
+            position=torch.zeros(3),
+            velocity=torch.zeros(3),
+            total=torch.zeros(3),
+        )
+        config = MatcherConfig(
+            search_interval_steps=1,
+            exclusion_frames=0,
+            transition_penalty=0.0,
+            transition_joint_position_weight=1.0,
+            transition_joint_velocity_weight=1.0,
+        )
+
+        def set_feature_costs(matcher, incumbent_cost=100.0):
+            matcher.database._search_features.zero_()
+            matcher.database._search_features[0, 0] = math.sqrt(
+                incumbent_cost
+            )
+            matcher.database._search_features[1, 0] = 1.0
+            matcher.database._search_features[2, 0] = math.sqrt(1.1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            ordinary = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=replace(
+                    config,
+                    transition_joint_position_weight=0.0,
+                    transition_joint_velocity_weight=0.0,
+                ),
+            )
+            ordinary.reset()
+            set_feature_costs(ordinary)
+            ordinary_mean, _ = (
+                ordinary.database.normalization.parameters_copy()
+            )
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher.extract_query_features",
+                return_value=ordinary_mean,
+            ), mock.patch(
+                "mm_sonic.torch_motion_matcher."
+                "TorchMotionDatabase.row_for_source",
+                return_value=0,
+            ), mock.patch(
+                "mm_sonic.torch_motion_matcher."
+                "TransitionContinuityDatabase.costs",
+                return_value=zeros,
+            ):
+                ordinary_result = ordinary.step((0.5, 0.0), 0.0)
+
+            enabled = TorchMotionMatcher.from_folder(
+                root, device="cpu", config=config
+            )
+            enabled.reset()
+            set_feature_costs(enabled)
+            enabled_mean, _ = enabled.database.normalization.parameters_copy()
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher.extract_query_features",
+                return_value=enabled_mean,
+            ), mock.patch(
+                "mm_sonic.torch_motion_matcher."
+                "TorchMotionDatabase.row_for_source",
+                return_value=0,
+            ), mock.patch(
+                "mm_sonic.torch_motion_matcher."
+                "TransitionContinuityDatabase.costs",
+                return_value=continuity,
+            ) as costs:
+                enabled_result = enabled.step((0.5, 0.0), 0.0)
+
+            self.assertEqual(ordinary_result.diagnostics.selected_frame, 1)
+            self.assertEqual(enabled_result.diagnostics.selected_frame, 2)
+            costs.assert_called_once()
+            self.assertEqual(
+                costs.call_args.kwargs["position_weight"], 1.0
+            )
+            self.assertEqual(
+                costs.call_args.kwargs["velocity_weight"], 1.0
+            )
+            self.assertAlmostEqual(
+                enabled_result.diagnostics.selected_transition_position_cost,
+                0.1,
+                places=6,
+            )
+            self.assertAlmostEqual(
+                enabled_result.diagnostics.selected_transition_velocity_cost,
+                0.1,
+                places=6,
+            )
+            self.assertAlmostEqual(
+                enabled_result.diagnostics.selected_transition_continuity_cost,
+                0.2,
+                places=6,
+            )
+            self.assertAlmostEqual(
+                enabled_result.diagnostics.selected_total_cost,
+                enabled_result.diagnostics.selected_feature_cost
+                + enabled_result.diagnostics.selected_transition_continuity_cost,
+                places=6,
+            )
+
+            incumbent = TorchMotionMatcher.from_folder(
+                root, device="cpu", config=config
+            )
+            incumbent.reset()
+            incumbent.database._search_features.zero_()
+            incumbent.database._search_features[2, 0] = 1.0
+            incumbent_mean, _ = (
+                incumbent.database.normalization.parameters_copy()
+            )
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher.extract_query_features",
+                return_value=incumbent_mean,
+            ), mock.patch(
+                "mm_sonic.torch_motion_matcher."
+                "TransitionContinuityDatabase.costs",
+                return_value=continuity,
+            ):
+                incumbent_result = incumbent.step((0.5, 0.0), 0.0)
+
+            self.assertFalse(incumbent_result.diagnostics.transitioned)
+            self.assertEqual(incumbent_result.diagnostics.selected_frame, 1)
+            self.assertEqual(
+                incumbent_result.diagnostics.selected_transition_position_cost,
+                0.0,
+            )
+            self.assertEqual(
+                incumbent_result.diagnostics.selected_transition_velocity_cost,
+                0.0,
+            )
+            self.assertEqual(
+                incumbent_result.diagnostics.selected_transition_continuity_cost,
+                0.0,
+            )
 
 
 if __name__ == "__main__":
