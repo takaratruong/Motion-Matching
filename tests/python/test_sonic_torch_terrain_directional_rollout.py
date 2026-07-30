@@ -1,3 +1,4 @@
+from copy import deepcopy
 import json
 import math
 import tempfile
@@ -8,6 +9,7 @@ from unittest import mock
 
 import numpy as np
 
+from mm_sonic.joints import ContractError
 from mm_sonic.torch_terrain_directional_rollout import (
     ASCENT_STOP,
     REVERSAL_STOP,
@@ -79,6 +81,37 @@ def _fixture_rollout() -> DirectionalRollout:
     )
 
 
+def _metric_arrays(frame_count=STEP_COUNT):
+    return {
+        "joint_position": np.zeros((frame_count, 1), np.float64),
+        "joint_velocity": np.zeros((frame_count, 1), np.float64),
+        "root_position_world": np.column_stack(
+            (
+                np.zeros(frame_count),
+                np.zeros(frame_count),
+                np.full(frame_count, 0.75),
+            )
+        ),
+        "foot_position_world": np.zeros((frame_count, 2, 3), np.float64),
+        "foot_clearance_m": np.zeros((frame_count, 2), np.float64),
+        "selected_clip_index": np.zeros(frame_count, np.int32),
+        "previous_selected_clip_index": np.zeros(frame_count, np.int32),
+        "transitioned": np.zeros(frame_count, np.bool_),
+        "transition_rejected": np.zeros(frame_count, np.bool_),
+        "terrain_safety_override": np.zeros(frame_count, np.bool_),
+        "terrain_safety_override_rank": np.zeros(frame_count, np.int32),
+        "selected_transition_position_cost": np.zeros(
+            frame_count, np.float64
+        ),
+        "selected_transition_velocity_cost": np.zeros(
+            frame_count, np.float64
+        ),
+        "selected_transition_continuity_cost": np.zeros(
+            frame_count, np.float64
+        ),
+    }
+
+
 class DirectionalPhaseAndMetricTests(unittest.TestCase):
     def test_phase_boundaries_are_exact(self):
         self.assertEqual(ASCENT_STOP, 280)
@@ -141,6 +174,9 @@ class DirectionalPhaseAndMetricTests(unittest.TestCase):
                 [[0.10, 0.20], [0.05, 0.20], [-0.02, 0.10], [0.0, 0.1]]
             ),
             "selected_clip_index": np.array([0, 1, 1, 2], np.int32),
+            "previous_selected_clip_index": np.array(
+                [0, 0, 1, 1], np.int32
+            ),
             "transitioned": np.array([False, True, False, True]),
             "transition_rejected": np.array([False, False, True, False]),
             "terrain_safety_override": np.array([False, True, False, False]),
@@ -189,6 +225,203 @@ class DirectionalPhaseAndMetricTests(unittest.TestCase):
         )
         self.assertEqual(metrics["position_weight"], 0.1)
         self.assertEqual(metrics["velocity_weight"], 0.25)
+
+    def test_reversal_derivatives_start_inside_frame_280_boundary(self):
+        arrays = _metric_arrays()
+        arrays["joint_position"][279, 0] = 100.0
+        arrays["root_position_world"][279, 0] = 100.0
+        arrays["foot_position_world"][279, :, 0] = 100.0
+        arrays["transitioned"][280] = True
+        metrics = compute_directional_metrics(
+            arrays,
+            dt=1.0,
+            position_weight=0.1,
+            velocity_weight=0.25,
+        )
+
+        reversal = metrics["phases"]["reversal"]
+        self.assertEqual(
+            reversal["joint_acceleration_rad_s2"]["count"], 98
+        )
+        self.assertEqual(reversal["joint_jerk_rad_s3"]["count"], 97)
+        self.assertEqual(reversal["root_jerk_m_s3"]["count"], 97)
+        self.assertEqual(reversal["contact_foot_speed_m_s"]["count"], 99)
+        self.assertEqual(
+            reversal["joint_acceleration_rad_s2"]["maximum"], 0.0
+        )
+        self.assertEqual(reversal["joint_jerk_rad_s3"]["maximum"], 0.0)
+        self.assertEqual(reversal["root_jerk_m_s3"]["maximum"], 0.0)
+        self.assertEqual(reversal["contact_foot_speed_m_s"]["maximum"], 0.0)
+        self.assertEqual(
+            reversal["transition_neighborhood_joint_jerk_output_frames"],
+            [283, 284],
+        )
+
+    def test_descent_derivatives_start_inside_frame_380_boundary(self):
+        arrays = _metric_arrays()
+        arrays["joint_position"][379, 0] = 100.0
+        arrays["root_position_world"][379, 0] = 100.0
+        arrays["foot_position_world"][379, :, 0] = 100.0
+        arrays["transitioned"][380] = True
+        metrics = compute_directional_metrics(
+            arrays,
+            dt=1.0,
+            position_weight=0.1,
+            velocity_weight=0.25,
+        )
+
+        descent = metrics["phases"]["descent"]
+        self.assertEqual(
+            descent["joint_acceleration_rad_s2"]["count"], 258
+        )
+        self.assertEqual(descent["joint_jerk_rad_s3"]["count"], 257)
+        self.assertEqual(descent["root_jerk_m_s3"]["count"], 257)
+        self.assertEqual(descent["contact_foot_speed_m_s"]["count"], 259)
+        self.assertEqual(
+            descent["joint_acceleration_rad_s2"]["maximum"], 0.0
+        )
+        self.assertEqual(descent["joint_jerk_rad_s3"]["maximum"], 0.0)
+        self.assertEqual(descent["root_jerk_m_s3"]["maximum"], 0.0)
+        self.assertEqual(descent["contact_foot_speed_m_s"]["maximum"], 0.0)
+        self.assertEqual(
+            descent["transition_neighborhood_joint_jerk_output_frames"],
+            [383, 384],
+        )
+
+    def test_frame_zero_cross_clip_compares_reset_selection(self):
+        arrays = _metric_arrays(frame_count=4)
+        arrays["previous_selected_clip_index"][0] = 7
+        arrays["selected_clip_index"][0] = 3
+        arrays["transitioned"][0] = True
+        metrics = compute_directional_metrics(
+            arrays,
+            dt=1.0,
+            position_weight=0.1,
+            velocity_weight=0.25,
+        )
+        self.assertEqual(
+            metrics["aggregate"]["cross_clip_transition_count"], 1
+        )
+
+    def test_all_frozen_gates_and_qualification_are_explicit(self):
+        passing = _metric_arrays()
+        nonzero = compute_directional_metrics(
+            passing,
+            dt=1.0,
+            position_weight=0.1,
+            velocity_weight=0.25,
+        )
+        self.assertEqual(
+            nonzero["gates"],
+            {
+                "completed_640_frames": True,
+                "returned_to_lower_height": True,
+                "minimum_clearance": True,
+                "descent_transition_count": True,
+                "descent_joint_jerk_p95": True,
+                "descent_transition_max_jerk": True,
+                "ascent_joint_jerk_p95": True,
+            },
+        )
+        self.assertTrue(nonzero["qualified"])
+
+        baseline = compute_directional_metrics(
+            passing,
+            dt=1.0,
+            position_weight=0.0,
+            velocity_weight=0.0,
+        )
+        self.assertTrue(baseline["baseline"])
+        self.assertTrue(all(baseline["gates"].values()))
+        self.assertFalse(baseline["qualified"])
+
+        cases = {}
+        incomplete = _metric_arrays(frame_count=639)
+        cases["completed_640_frames"] = incomplete
+        high_root = _metric_arrays()
+        high_root["root_position_world"][-1, 2] = 0.8201
+        cases["returned_to_lower_height"] = high_root
+        low_clearance = _metric_arrays()
+        low_clearance["foot_clearance_m"][100, 0] = -0.0301
+        cases["minimum_clearance"] = low_clearance
+        many_transitions = _metric_arrays()
+        many_transitions["transitioned"][380:392] = True
+        cases["descent_transition_count"] = many_transitions
+        descent_jerk = _metric_arrays()
+        descent_index = np.arange(STEP_COUNT - REVERSAL_STOP)
+        descent_jerk["joint_position"][REVERSAL_STOP:, 0] = (
+            3000.0 * descent_index**3
+        )
+        cases["descent_joint_jerk_p95"] = descent_jerk
+        transition_jerk = _metric_arrays()
+        transition_jerk["joint_position"][400, 0] = 60000.0
+        transition_jerk["transitioned"][400] = True
+        cases["descent_transition_max_jerk"] = transition_jerk
+        ascent_jerk = _metric_arrays()
+        ascent_index = np.arange(ASCENT_STOP)
+        ascent_jerk["joint_position"][:ASCENT_STOP, 0] = (
+            2500.0 * ascent_index**3
+        )
+        cases["ascent_joint_jerk_p95"] = ascent_jerk
+
+        for gate, arrays in cases.items():
+            with self.subTest(gate=gate):
+                metrics = compute_directional_metrics(
+                    arrays,
+                    dt=1.0,
+                    position_weight=0.1,
+                    velocity_weight=0.25,
+                )
+                self.assertFalse(metrics["gates"][gate])
+                self.assertFalse(metrics["qualified"])
+
+    def test_zero_weight_baseline_with_failed_improvement_gates_still_saves(self):
+        arrays = _metric_arrays()
+        ascent_index = np.arange(ASCENT_STOP)
+        arrays["joint_position"][:ASCENT_STOP, 0] = (
+            2500.0 * ascent_index**3
+        )
+        descent_index = np.arange(STEP_COUNT - REVERSAL_STOP)
+        arrays["joint_position"][REVERSAL_STOP:, 0] = (
+            3000.0 * descent_index**3
+        )
+        arrays["joint_position"][400, 0] += 60000.0
+        arrays["transitioned"][400] = True
+        metrics = compute_directional_metrics(
+            arrays,
+            dt=1.0,
+            position_weight=0.0,
+            velocity_weight=0.0,
+        )
+        for gate in (
+            "descent_joint_jerk_p95",
+            "descent_transition_max_jerk",
+            "ascent_joint_jerk_p95",
+        ):
+            self.assertFalse(metrics["gates"][gate])
+        self.assertFalse(metrics["qualified"])
+
+        rollout = DirectionalRollout(
+            arrays=MappingProxyType(
+                {
+                    name: _readonly(value)
+                    for name, value in arrays.items()
+                }
+            ),
+            metrics=MappingProxyType(metrics),
+            events=(),
+            resolved_config=MappingProxyType({"baseline": True}),
+            resolved_config_sha256="b" * 64,
+            deterministic_sha256="a" * 64,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "baseline"
+            save_directional_rollout(rollout, output)
+            saved = json.loads(
+                (output / "metrics.json").read_text("utf-8")
+            )
+        self.assertTrue(saved["baseline"])
+        self.assertFalse(saved["qualified"])
 
 
 class DirectionalCliAndArtifactTests(unittest.TestCase):
@@ -336,9 +569,59 @@ class DirectionalCliAndArtifactTests(unittest.TestCase):
     def test_save_rejects_non_directory_output_without_replacing_it(self):
         output = self.root / "not-a-directory"
         output.write_text("keep", encoding="utf-8")
-        with self.assertRaises(Exception):
+        with self.assertRaises(ContractError):
             save_directional_rollout(_fixture_rollout(), output)
         self.assertEqual(output.read_text("utf-8"), "keep")
+
+    def test_save_rejects_directory_symlink_without_changing_target(self):
+        target = self.root / "target"
+        target.mkdir()
+        sentinel = target / "sentinel.txt"
+        sentinel.write_text("keep", encoding="utf-8")
+        output = self.root / "output-link"
+        output.symlink_to(target, target_is_directory=True)
+
+        with self.assertRaises(Exception):
+            save_directional_rollout(_fixture_rollout(), output)
+
+        self.assertTrue(output.is_symlink())
+        self.assertEqual(sentinel.read_text("utf-8"), "keep")
+
+    def test_main_does_not_resolve_away_output_symlink(self):
+        target = self.root / "main-target"
+        target.mkdir()
+        sentinel = target / "sentinel.txt"
+        sentinel.write_text("keep", encoding="utf-8")
+        output = self.root / "main-output-link"
+        output.symlink_to(target, target_is_directory=True)
+        with (
+            mock.patch(
+                "mm_sonic.torch_terrain_directional_rollout.load_experiment_config",
+                return_value={"schema": "fixture"},
+            ),
+            mock.patch(
+                "mm_sonic.torch_terrain_directional_rollout.resolve_stair_config",
+                return_value=object(),
+            ),
+            mock.patch(
+                "mm_sonic.torch_terrain_directional_rollout.run_directional_rollout",
+                return_value=_fixture_rollout(),
+            ),
+            mock.patch("builtins.print"),
+        ):
+            with self.assertRaises(ContractError):
+                main(
+                    [
+                        "--dataset",
+                        "DATASET",
+                        "--config",
+                        "CONFIG",
+                        "--output",
+                        str(output),
+                    ]
+                )
+        self.assertTrue(output.is_symlink())
+        self.assertEqual(sentinel.read_text("utf-8"), "keep")
 
 
 class DirectionalMatcherIntegrationTests(unittest.TestCase):
@@ -352,6 +635,7 @@ class DirectionalMatcherIntegrationTests(unittest.TestCase):
         terrain_rollout_test.TerrainRolloutTests.tearDownClass()
 
     def test_real_matcher_emits_exact_dense_640_frame_contract(self):
+        input_config = deepcopy(dict(self.resolved.resolved_config))
         first = run_directional_rollout(
             self.resolved,
             device="cpu",
@@ -382,7 +666,27 @@ class DirectionalMatcherIntegrationTests(unittest.TestCase):
         self.assertEqual(
             first.deterministic_sha256, second.deterministic_sha256
         )
+        self.assertEqual(
+            dict(self.resolved.resolved_config),
+            input_config,
+        )
         arrays = first.arrays
+        reset_clip_index = next(
+            index
+            for index, clip in enumerate(
+                self.resolved.dataset.folder.clips
+            )
+            if clip.relative_path
+            == self.resolved.resolved_config["reset_clip"]
+        )
+        self.assertEqual(
+            int(arrays["previous_selected_clip_index"][0]),
+            reset_clip_index,
+        )
+        np.testing.assert_array_equal(
+            arrays["previous_selected_clip_index"][1:],
+            arrays["selected_clip_index"][:-1],
+        )
         for name, trailing in (
             ("joint_position", (29,)),
             ("joint_velocity", (29,)),
@@ -391,6 +695,7 @@ class DirectionalMatcherIntegrationTests(unittest.TestCase):
             ("foot_velocity_world", (2, 3)),
             ("foot_clearance_m", (2,)),
             ("selected_clip_index", ()),
+            ("previous_selected_clip_index", ()),
             ("selected_frame", ()),
             ("transitioned", ()),
             ("transition_rejected", ()),

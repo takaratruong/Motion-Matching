@@ -168,14 +168,10 @@ def _phase_mask(frame_count: int, phase: str) -> np.ndarray:
 def _phase_metrics(
     *,
     phase_mask: np.ndarray,
-    joint_acceleration: np.ndarray,
-    joint_acceleration_frames: np.ndarray,
-    joint_jerk: np.ndarray,
-    joint_jerk_frames: np.ndarray,
-    root_jerk: np.ndarray,
-    root_jerk_frames: np.ndarray,
-    contact_speed: np.ndarray,
-    contact_speed_frames: np.ndarray,
+    dt: float,
+    joint_position: np.ndarray,
+    root_position: np.ndarray,
+    foot_position: np.ndarray,
     transition_neighborhood: np.ndarray,
     transitioned: np.ndarray,
     rejected: np.ndarray,
@@ -186,16 +182,35 @@ def _phase_metrics(
     position_cost: np.ndarray,
     velocity_cost: np.ndarray,
     continuity_cost: np.ndarray,
-    root_position: np.ndarray,
 ) -> dict:
     frame_indices = np.flatnonzero(phase_mask)
-    accepted_in_phase = transitioned & phase_mask
-    jerk_in_phase = phase_mask[joint_jerk_frames]
-    neighborhood_jerk = (
-        jerk_in_phase & transition_neighborhood[joint_jerk_frames]
-    )
+    phase_joint_position = joint_position[phase_mask].astype(np.float64)
+    phase_root_position = root_position[phase_mask].astype(np.float64)
+    phase_foot_position = foot_position[phase_mask].astype(np.float64)
     phase_clearance = clearance[phase_mask]
-    phase_root = root_position[phase_mask]
+    joint_acceleration = np.linalg.norm(
+        np.diff(phase_joint_position, n=2, axis=0) / (dt * dt),
+        axis=1,
+    )
+    joint_jerk = np.linalg.norm(
+        np.diff(phase_joint_position, n=3, axis=0) / (dt * dt * dt),
+        axis=1,
+    )
+    joint_jerk_frames = frame_indices[3:]
+    root_jerk = np.linalg.norm(
+        np.diff(phase_root_position, n=3, axis=0) / (dt * dt * dt),
+        axis=1,
+    )
+    foot_speed = np.linalg.norm(
+        np.diff(phase_foot_position[:, :, :2], axis=0) / dt,
+        axis=2,
+    )
+    contact_foot = np.argmin(phase_clearance[1:], axis=1)
+    contact_speed = foot_speed[
+        np.arange(len(foot_speed), dtype=np.int64), contact_foot
+    ]
+    accepted_in_phase = transitioned & phase_mask
+    neighborhood_jerk = transition_neighborhood[joint_jerk_frames]
     return {
         "frame_count": int(phase_mask.sum()),
         "first_frame": (
@@ -217,23 +232,21 @@ def _phase_metrics(
             float(phase_clearance.min()) if phase_clearance.size else None
         ),
         "final_root_height_m": (
-            float(phase_root[-1, 2]) if len(phase_root) else None
+            float(phase_root_position[-1, 2])
+            if len(phase_root_position)
+            else None
         ),
-        "joint_acceleration_rad_s2": _distribution(
-            joint_acceleration[phase_mask[joint_acceleration_frames]]
-        ),
-        "joint_jerk_rad_s3": _distribution(
-            joint_jerk[jerk_in_phase]
-        ),
+        "joint_acceleration_rad_s2": _distribution(joint_acceleration),
+        "joint_jerk_rad_s3": _distribution(joint_jerk),
         "transition_neighborhood_joint_jerk_rad_s3": _distribution(
             joint_jerk[neighborhood_jerk]
         ),
-        "root_jerk_m_s3": _distribution(
-            root_jerk[phase_mask[root_jerk_frames]]
-        ),
-        "contact_foot_speed_m_s": _distribution(
-            contact_speed[phase_mask[contact_speed_frames]]
-        ),
+        "transition_neighborhood_joint_jerk_output_frames": [
+            int(frame)
+            for frame in joint_jerk_frames[neighborhood_jerk]
+        ],
+        "root_jerk_m_s3": _distribution(root_jerk),
+        "contact_foot_speed_m_s": _distribution(contact_speed),
         "transition_position_cost": _distribution(
             position_cost[accepted_in_phase]
         ),
@@ -282,6 +295,9 @@ def compute_directional_metrics(
     selected_clip = _required_frame_array(
         arrays, "selected_clip_index", frame_count
     )
+    previous_selected_clip = _required_frame_array(
+        arrays, "previous_selected_clip_index", frame_count
+    )
     transitioned = _required_frame_array(
         arrays, "transitioned", frame_count
     )
@@ -319,6 +335,7 @@ def compute_directional_metrics(
         )
     for name, value in (
         ("selected_clip_index", selected_clip),
+        ("previous_selected_clip_index", previous_selected_clip),
         ("transitioned", transitioned),
         ("transition_rejected", rejected),
         ("terrain_safety_override", rescue),
@@ -334,53 +351,18 @@ def compute_directional_metrics(
     ):
         raise ContractError("transition and rescue diagnostics must be bool")
 
-    joint_acceleration = np.linalg.norm(
-        np.diff(joint_position.astype(np.float64), n=2, axis=0)
-        / (dt * dt),
-        axis=1,
-    )
-    joint_acceleration_frames = np.arange(
-        2, frame_count, dtype=np.int64
-    )
-    joint_jerk = np.linalg.norm(
-        np.diff(joint_position.astype(np.float64), n=3, axis=0)
-        / (dt * dt * dt),
-        axis=1,
-    )
-    joint_jerk_frames = np.arange(3, frame_count, dtype=np.int64)
-    root_jerk = np.linalg.norm(
-        np.diff(root_position.astype(np.float64), n=3, axis=0)
-        / (dt * dt * dt),
-        axis=1,
-    )
-    root_jerk_frames = np.arange(3, frame_count, dtype=np.int64)
-    foot_delta_xy = np.diff(
-        foot_position[:, :, :2].astype(np.float64), axis=0
-    )
-    foot_speed = np.linalg.norm(foot_delta_xy / dt, axis=2)
-    contact_foot = np.argmin(clearance[1:], axis=1)
-    contact_speed = foot_speed[
-        np.arange(len(foot_speed), dtype=np.int64), contact_foot
-    ]
-    contact_speed_frames = np.arange(1, frame_count, dtype=np.int64)
     transition_neighborhood = transition_neighborhood_mask(transitioned)
-    cross_clip = np.zeros(frame_count, dtype=np.bool_)
-    if frame_count > 1:
-        cross_clip[1:] = (
-            transitioned[1:] & (selected_clip[1:] != selected_clip[:-1])
-        )
+    cross_clip = transitioned & (
+        selected_clip != previous_selected_clip
+    )
 
     aggregate_mask = np.ones(frame_count, dtype=np.bool_)
     aggregate = _phase_metrics(
         phase_mask=aggregate_mask,
-        joint_acceleration=joint_acceleration,
-        joint_acceleration_frames=joint_acceleration_frames,
-        joint_jerk=joint_jerk,
-        joint_jerk_frames=joint_jerk_frames,
-        root_jerk=root_jerk,
-        root_jerk_frames=root_jerk_frames,
-        contact_speed=contact_speed,
-        contact_speed_frames=contact_speed_frames,
+        dt=dt,
+        joint_position=joint_position,
+        root_position=root_position,
+        foot_position=foot_position,
         transition_neighborhood=transition_neighborhood,
         transitioned=transitioned,
         rejected=rejected,
@@ -391,7 +373,6 @@ def compute_directional_metrics(
         position_cost=position_cost,
         velocity_cost=velocity_cost,
         continuity_cost=continuity_cost,
-        root_position=root_position,
     )
     transition_frames = np.flatnonzero(transitioned)
     intervals = np.diff(transition_frames)
@@ -404,14 +385,10 @@ def compute_directional_metrics(
     phase_metrics = {
         phase: _phase_metrics(
             phase_mask=_phase_mask(frame_count, phase),
-            joint_acceleration=joint_acceleration,
-            joint_acceleration_frames=joint_acceleration_frames,
-            joint_jerk=joint_jerk,
-            joint_jerk_frames=joint_jerk_frames,
-            root_jerk=root_jerk,
-            root_jerk_frames=root_jerk_frames,
-            contact_speed=contact_speed,
-            contact_speed_frames=contact_speed_frames,
+            dt=dt,
+            joint_position=joint_position,
+            root_position=root_position,
+            foot_position=foot_position,
             transition_neighborhood=transition_neighborhood,
             transitioned=transitioned,
             rejected=rejected,
@@ -422,7 +399,6 @@ def compute_directional_metrics(
             position_cost=position_cost,
             velocity_cost=velocity_cost,
             continuity_cost=continuity_cost,
-            root_position=root_position,
         )
         for phase in _PHASES
     }
@@ -458,8 +434,8 @@ def compute_directional_metrics(
             descent_p95 is not None and descent_p95 <= 16614.05
         ),
         "descent_transition_max_jerk": (
-            descent_transition_max is not None
-            and descent_transition_max <= 58035.6
+            descent_transition_max is None
+            or descent_transition_max <= 58035.6
         ),
         "ascent_joint_jerk_p95": (
             ascent_p95 is not None and ascent_p95 <= 14427.81
@@ -564,7 +540,7 @@ def run_directional_rollout(
             resolved
         ),
     )
-    matcher.reset()
+    reset = matcher.reset()
     direction = np.asarray(
         directional_config["reference_direction_matcher_xy"], np.float64
     )
@@ -579,6 +555,7 @@ def run_directional_rollout(
         "command_heading_world_yaw": [],
         "selected_frame": [],
         "selected_clip_index": [],
+        "previous_selected_clip_index": [],
         "searched": [],
         "transitioned": [],
         "transition_rejected": [],
@@ -603,6 +580,9 @@ def run_directional_rollout(
     }
     events: list[dict] = []
     measurement = resolved.measurement_extension
+    previous_clip_index = clip_index[
+        reset.diagnostics.selected_clip_path
+    ]
     for step in range(STEP_COUNT):
         requested_velocity = direction * speed
         if step >= ASCENT_STOP:
@@ -653,6 +633,9 @@ def run_directional_rollout(
         rows["selected_frame"].append(np.int64(diagnostics.selected_frame))
         rows["selected_clip_index"].append(
             np.int32(clip_index[diagnostics.selected_clip_path])
+        )
+        rows["previous_selected_clip_index"].append(
+            np.int32(previous_clip_index)
         )
         rows["searched"].append(np.bool_(diagnostics.searched))
         rows["transitioned"].append(np.bool_(diagnostics.transitioned))
@@ -757,6 +740,9 @@ def run_directional_rollout(
                     ),
                 }
             )
+        previous_clip_index = clip_index[
+            diagnostics.selected_clip_path
+        ]
 
     arrays = {
         name: _owned_readonly(np.asarray(values))
@@ -808,6 +794,15 @@ def _remove_real_directory(path: Path) -> None:
     path.rmdir()
 
 
+def _validated_lexical_output_path(output: str | Path) -> Path:
+    path = Path(os.path.abspath(os.fspath(output)))
+    if path.is_symlink():
+        raise ContractError(
+            "directional rollout output must not be a symlink"
+        )
+    return path
+
+
 def save_directional_rollout(
     rollout: DirectionalRollout,
     output: str | Path,
@@ -816,7 +811,7 @@ def save_directional_rollout(
 
     if not isinstance(rollout, DirectionalRollout):
         raise ContractError("only a DirectionalRollout can be saved")
-    output = Path(output).resolve()
+    output = _validated_lexical_output_path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(
         tempfile.mkdtemp(prefix=f".{output.name}.staging-", dir=output.parent)
@@ -913,6 +908,7 @@ def build_directional_argument_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_directional_argument_parser().parse_args(argv)
+    output = _validated_lexical_output_path(args.output)
     device = (
         "cuda"
         if args.device == "auto" and torch.cuda.is_available()
@@ -928,7 +924,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         position_weight=args.position_weight,
         velocity_weight=args.velocity_weight,
     )
-    output = Path(args.output).resolve()
     save_directional_rollout(rollout, output)
     print(
         json.dumps(
