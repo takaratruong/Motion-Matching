@@ -153,6 +153,90 @@ class TerrainViewerTests(unittest.TestCase):
         )
         self.assertFalse(saved.arrays["terrain_safety_override_rank"].any())
 
+    def test_loader_defaults_missing_transition_costs_for_authenticated_rollout(self):
+        legacy = self.root / "legacy-without-transition-costs"
+        shutil.copytree(self.run_root, legacy)
+        archive_path = legacy / "rollout.npz"
+        transition_costs = {
+            "selected_transition_position_cost",
+            "selected_transition_velocity_cost",
+            "selected_transition_continuity_cost",
+        }
+        with np.load(archive_path, allow_pickle=False) as archive:
+            arrays = {
+                name: np.array(archive[name], copy=True)
+                for name in archive.files
+                if name not in transition_costs
+            }
+        np.savez(archive_path, **arrays)
+        metrics_path = legacy / "metrics.json"
+        metrics = json.loads(metrics_path.read_text("utf-8"))
+        metrics["rollout_npz_sha256"] = hashlib.sha256(
+            archive_path.read_bytes()
+        ).hexdigest()
+        metrics_path.write_text(
+            json.dumps(
+                metrics,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        saved = load_saved_rollout(legacy)
+
+        for name in transition_costs:
+            self.assertIn(name, saved.arrays)
+            self.assertEqual(saved.arrays[name].shape, (5,))
+            self.assertEqual(saved.arrays[name].dtype, np.dtype(np.float32))
+            np.testing.assert_array_equal(
+                saved.arrays[name],
+                np.zeros(5, dtype=np.float32),
+            )
+
+    def test_loader_rejects_invalid_transition_cost_arrays(self):
+        cases = {
+            "integer": np.zeros(5, dtype=np.int32),
+            "non-finite": np.array(
+                [0.0, 0.0, np.nan, 0.0, 0.0], dtype=np.float32
+            ),
+            "negative": np.array(
+                [0.0, 0.0, -0.01, 0.0, 0.0], dtype=np.float32
+            ),
+        }
+        for label, invalid in cases.items():
+            with self.subTest(label=label):
+                corrupted = self.root / f"invalid-transition-cost-{label}"
+                shutil.copytree(self.run_root, corrupted)
+                archive_path = corrupted / "rollout.npz"
+                with np.load(archive_path, allow_pickle=False) as archive:
+                    arrays = {
+                        name: np.array(archive[name], copy=True)
+                        for name in archive.files
+                    }
+                arrays["selected_transition_position_cost"] = invalid
+                np.savez(archive_path, **arrays)
+                metrics_path = corrupted / "metrics.json"
+                metrics = json.loads(metrics_path.read_text("utf-8"))
+                metrics["rollout_npz_sha256"] = hashlib.sha256(
+                    archive_path.read_bytes()
+                ).hexdigest()
+                metrics_path.write_text(
+                    json.dumps(
+                        metrics,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+                with self.assertRaises(Exception):
+                    load_saved_rollout(corrupted)
+
     def test_playback_controls_only_move_through_saved_frames(self):
         playback = PlaybackController(frame_count=3)
         self.assertEqual(playback.frame_index, 0)

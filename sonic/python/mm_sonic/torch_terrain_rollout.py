@@ -50,6 +50,8 @@ _MATCHER_FLOAT_FIELDS = frozenset(
         "reversal_speed_mps",
         "transition_penalty",
         "inertialization_halflife_s",
+        "transition_joint_position_weight",
+        "transition_joint_velocity_weight",
         "transition_settle_duration_s",
         "transition_settle_penalty",
     )
@@ -58,6 +60,8 @@ _MATCHER_NONNEGATIVE_FLOAT_FIELDS = frozenset(
     (
         "transition_settle_duration_s",
         "transition_settle_penalty",
+        "transition_joint_position_weight",
+        "transition_joint_velocity_weight",
     )
 )
 
@@ -229,6 +233,12 @@ def matcher_config_from_resolved(config: Mapping) -> MatcherConfig:
         transition_penalty=float(values["transition_penalty"]),
         inertialization_halflife_s=float(
             values["inertialization_halflife_s"]
+        ),
+        transition_joint_position_weight=float(
+            values["transition_joint_position_weight"]
+        ),
+        transition_joint_velocity_weight=float(
+            values["transition_joint_velocity_weight"]
         ),
         transition_settle_duration_s=float(
             values["transition_settle_duration_s"]
@@ -487,6 +497,9 @@ def run_stair_rollout(
         "terrain_feature_cost": [],
         "total_feature_cost": [],
         "selected_total_cost": [],
+        "selected_transition_position_cost": [],
+        "selected_transition_velocity_cost": [],
+        "selected_transition_continuity_cost": [],
         "step_time_ns": [],
         "search_time_ns": [],
         "joint_position": [],
@@ -603,6 +616,15 @@ def run_stair_rollout(
         rows["selected_total_cost"].append(
             np.float32(diagnostics.selected_total_cost)
         )
+        rows["selected_transition_position_cost"].append(
+            np.float32(diagnostics.selected_transition_position_cost)
+        )
+        rows["selected_transition_velocity_cost"].append(
+            np.float32(diagnostics.selected_transition_velocity_cost)
+        )
+        rows["selected_transition_continuity_cost"].append(
+            np.float32(diagnostics.selected_transition_continuity_cost)
+        )
         rows["step_time_ns"].append(np.int64(diagnostics.step_time_ns))
         rows["search_time_ns"].append(
             np.int64(
@@ -649,6 +671,15 @@ def run_stair_rollout(
                     "terrain_feature_cost": diagnostics.extension_feature_cost,
                     "total_feature_cost": diagnostics.selected_feature_cost,
                     "selected_total_cost": diagnostics.selected_total_cost,
+                    "selected_transition_position_cost": (
+                        diagnostics.selected_transition_position_cost
+                    ),
+                    "selected_transition_velocity_cost": (
+                        diagnostics.selected_transition_velocity_cost
+                    ),
+                    "selected_transition_continuity_cost": (
+                        diagnostics.selected_transition_continuity_cost
+                    ),
                 }
             )
 

@@ -79,6 +79,25 @@ class TerrainRolloutTests(unittest.TestCase):
         cls.temporary.cleanup()
 
     def test_matcher_config_is_exact_validated_and_reconstructed(self):
+        raw = load_experiment_config(CONFIG_PATH)
+        self.assertEqual(
+            set(raw["matcher"]),
+            {
+                "acceleration_mps2",
+                "deceleration_mps2",
+                "exclusion_frames",
+                "inertialization_halflife_s",
+                "reversal_speed_mps",
+                "search_interval_steps",
+                "stop_speed_mps",
+                "transition_joint_position_weight",
+                "transition_joint_velocity_weight",
+                "transition_penalty",
+                "transition_settle_duration_s",
+                "transition_settle_penalty",
+                "yaw_rate_rad_s",
+            },
+        )
         matcher = matcher_config_from_resolved(
             self.resolved.resolved_config
         )
@@ -91,6 +110,8 @@ class TerrainRolloutTests(unittest.TestCase):
             matcher.transition_settle_duration_s, 0.20
         )
         self.assertGreater(matcher.transition_settle_penalty, 0.0)
+        self.assertEqual(matcher.transition_joint_position_weight, 0.0)
+        self.assertEqual(matcher.transition_joint_velocity_weight, 0.0)
         validator = terrain_transition_validator_from_resolved(
             self.resolved
         )
@@ -105,7 +126,6 @@ class TerrainRolloutTests(unittest.TestCase):
             ],
         )
 
-        raw = load_experiment_config(CONFIG_PATH)
         cases = {}
         missing = json.loads(json.dumps(raw))
         del missing["matcher"]
@@ -138,6 +158,22 @@ class TerrainRolloutTests(unittest.TestCase):
             "transition_settle_penalty"
         ] = float("nan")
         cases["transition_settle_penalty"] = nonfinite_settle_penalty
+        for name in (
+            "transition_joint_position_weight",
+            "transition_joint_velocity_weight",
+        ):
+            for label, value in (
+                ("negative", -0.01),
+                ("NaN", float("nan")),
+                ("infinity", float("inf")),
+                ("boolean", True),
+            ):
+                invalid_weight = json.loads(json.dumps(raw))
+                invalid_weight["matcher"][name] = value
+                cases[f"{name} {label}"] = invalid_weight
+            missing_weight = json.loads(json.dumps(raw))
+            del missing_weight["matcher"][name]
+            cases[f"{name} missing"] = missing_weight
         for value in (0, 47, True):
             preview = json.loads(json.dumps(raw))
             preview["terrain_transition_preview_steps"] = value
@@ -152,6 +188,8 @@ class TerrainRolloutTests(unittest.TestCase):
         disabled = json.loads(json.dumps(raw))
         disabled["matcher"]["transition_settle_duration_s"] = 0.0
         disabled["matcher"]["transition_settle_penalty"] = 0.0
+        disabled["matcher"]["transition_joint_position_weight"] = 1.25
+        disabled["matcher"]["transition_joint_velocity_weight"] = 2.5
         disabled_resolved = resolve_stair_config(
             self.dataset_root, disabled, device="cpu"
         )
@@ -160,6 +198,12 @@ class TerrainRolloutTests(unittest.TestCase):
         )
         self.assertEqual(disabled_matcher.transition_settle_duration_s, 0.0)
         self.assertEqual(disabled_matcher.transition_settle_penalty, 0.0)
+        self.assertEqual(
+            disabled_matcher.transition_joint_position_weight, 1.25
+        )
+        self.assertEqual(
+            disabled_matcher.transition_joint_velocity_weight, 2.5
+        )
 
     def test_rollout_passes_pinned_matcher_config_to_matcher(self):
         expected = matcher_config_from_resolved(
@@ -242,6 +286,9 @@ class TerrainRolloutTests(unittest.TestCase):
             ("terrain_feature_cost", ()),
             ("total_feature_cost", ()),
             ("selected_total_cost", ()),
+            ("selected_transition_position_cost", ()),
+            ("selected_transition_velocity_cost", ()),
+            ("selected_transition_continuity_cost", ()),
             ("step_time_ns", ()),
             ("search_time_ns", ()),
             ("joint_position", (29,)),
@@ -255,6 +302,14 @@ class TerrainRolloutTests(unittest.TestCase):
             self.assertEqual(arrays[name].shape, (10,) + trailing)
         self.assertTrue(np.isfinite(arrays["foot_clearance_m"]).all())
         self.assertTrue(np.isfinite(arrays["step_time_ns"]).all())
+        for name in (
+            "selected_transition_position_cost",
+            "selected_transition_velocity_cost",
+            "selected_transition_continuity_cost",
+        ):
+            self.assertEqual(arrays[name].dtype, np.dtype(np.float32))
+            self.assertTrue(np.isfinite(arrays[name]).all())
+            self.assertTrue(np.all(arrays[name] >= 0.0))
         self.assertEqual(
             rollout.metrics["rejected_transition_count"],
             int(arrays["transition_rejected"].sum()),
@@ -283,6 +338,13 @@ class TerrainRolloutTests(unittest.TestCase):
                 arrays["selected_total_cost"]
                 >= arrays["total_feature_cost"]
             )
+        )
+        np.testing.assert_allclose(
+            arrays["selected_transition_position_cost"]
+            + arrays["selected_transition_velocity_cost"],
+            arrays["selected_transition_continuity_cost"],
+            rtol=0,
+            atol=2e-5,
         )
 
         extension = self.resolved.measurement_extension
@@ -374,6 +436,16 @@ class TerrainRolloutTests(unittest.TestCase):
             for line in (output / "events.jsonl").read_text("utf-8").splitlines()
         ]
         self.assertEqual(events, list(rollout.events))
+        for event in events:
+            for name in (
+                "selected_transition_position_cost",
+                "selected_transition_velocity_cost",
+                "selected_transition_continuity_cost",
+            ):
+                self.assertIn(name, event)
+                self.assertIsInstance(event[name], float)
+                self.assertTrue(np.isfinite(event[name]))
+                self.assertGreaterEqual(event[name], 0.0)
 
 
 if __name__ == "__main__":

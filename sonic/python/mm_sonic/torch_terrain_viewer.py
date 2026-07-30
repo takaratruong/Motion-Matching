@@ -156,6 +156,14 @@ def load_saved_rollout(run_root: str | Path) -> SavedTerrainRollout:
         arrays["terrain_safety_override_rank"] = np.zeros(
             frames, dtype=np.int32
         )
+    transition_cost_names = (
+        "selected_transition_position_cost",
+        "selected_transition_velocity_cost",
+        "selected_transition_continuity_cost",
+    )
+    for name in transition_cost_names:
+        if name not in arrays:
+            arrays[name] = np.zeros(frames, dtype=np.float32)
     required_shapes = {
         "selected_clip_index": (frames,),
         "selected_frame": (frames,),
@@ -163,6 +171,9 @@ def load_saved_rollout(run_root: str | Path) -> SavedTerrainRollout:
         "terrain_feature_cost": (frames,),
         "total_feature_cost": (frames,),
         "selected_total_cost": (frames,),
+        "selected_transition_position_cost": (frames,),
+        "selected_transition_velocity_cost": (frames,),
+        "selected_transition_continuity_cost": (frames,),
         "terrain_safety_override": (frames,),
         "terrain_safety_override_rank": (frames,),
         "step_time_ns": (frames,),
@@ -176,6 +187,16 @@ def load_saved_rollout(run_root: str | Path) -> SavedTerrainRollout:
     }
     for name, shape in required_shapes.items():
         _require_array(arrays, name, shape)
+    for name in transition_cost_names:
+        transition_cost = arrays[name]
+        if transition_cost.dtype.kind != "f":
+            raise ContractError(
+                f"saved rollout {name} must use floating-point values"
+            )
+        if np.any(transition_cost < 0.0):
+            raise ContractError(
+                f"saved rollout {name} must be non-negative"
+            )
     selected_clip = arrays["selected_clip_index"]
     selected_frame = arrays["selected_frame"]
     if selected_clip.dtype.kind not in "iu" or selected_frame.dtype.kind not in "iu":
