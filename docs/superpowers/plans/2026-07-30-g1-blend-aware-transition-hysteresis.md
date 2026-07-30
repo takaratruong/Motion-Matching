@@ -440,3 +440,74 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=sonic/python:. \
 
 Expected: the user can control the kinematic robot over the visible stairs
 without the prior rapid transition stutter.
+
+### Task 5: General Unsafe-Incumbent Terrain Rescue
+
+**Files:**
+- Modify: `tests/python/test_sonic_torch_motion_matcher.py`
+- Modify: `tests/python/test_sonic_torch_terrain_rollout.py`
+- Modify: `tests/python/test_sonic_torch_terrain_viewer.py`
+- Modify: `sonic/python/mm_sonic/torch_motion_matcher.py`
+- Modify: `sonic/python/mm_sonic/torch_terrain_rollout.py`
+- Modify: `sonic/python/mm_sonic/torch_terrain_viewer.py`
+
+**Interfaces:**
+- Consumes: exact candidate selection, current successor row, emitted-window
+  validator, and transactional prepare/commit.
+- Produces: a single forced non-incumbent rescue search and
+  `MotionMatchDiagnostics.terrain_safety_override: bool`.
+
+- [ ] **Step 1: Reproduce the settled-blend live crash**
+
+Write a test in which ordinary selection retains an unsafe incumbent with
+`additional_transition_penalty == 0.0`. Assert a second selector call uses:
+
+```python
+self.assertIsNone(rescue["incumbent_row"])
+self.assertTrue(rescue["search"])
+self.assertEqual(rescue["additional_transition_penalty"], 0.0)
+```
+
+Return a safe non-local transition and assert it commits with
+`terrain_safety_override=True`.
+
+- [ ] **Step 2: Verify RED**
+
+Run:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=sonic/python:. \
+  sonic/.torch-mm-venv/bin/python -B -m unittest \
+  tests.python.test_sonic_torch_motion_matcher -v
+```
+
+Expected: `emitted-window incumbent is unsafe`.
+
+- [ ] **Step 3: Implement the bounded rescue**
+
+When any selected incumbent fails its emitted-window validator, call
+`select_exact_candidate` once with `incumbent_row=None`, `search=True`, and
+`additional_transition_penalty=0.0`. Compose the returned row as a transition
+against the real successor, validate it, and commit only if safe. Preserve the
+original incumbent cost in diagnostics and include rescue search time.
+
+Rename `hysteresis_overridden` to `terrain_safety_override` throughout runtime,
+rollout arrays, events, metrics, tests, and documentation.
+
+- [ ] **Step 4: Preserve historical rollout loading**
+
+When `terrain_safety_override` is absent from a saved rollout, synthesize an
+all-false boolean array after archive authentication. Add a loader regression
+test using an archive without the new field.
+
+- [ ] **Step 5: Verify scripted and live behavior**
+
+Run the full Torch suite, flat/legacy/dense CUDA qualification, authoritative
+MuJoCo-FK sweep, and the same user-controlled command sequence that produced the
+settled-blend crash.
+
+- [ ] **Step 6: Commit the retained rescue and evidence**
+
+Commit production code/tests separately from the updated result evidence. Do
+not call the viewer stable until it survives user steering and the process
+remains alive.

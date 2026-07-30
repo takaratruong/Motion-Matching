@@ -70,25 +70,28 @@ The existing emitted-window terrain validator remains authoritative and runs
 after selection. A selected transition that is unsafe still falls back
 transactionally to its safe incumbent.
 
-Live testing exposed one necessary priority rule: active hysteresis can select
-the incumbent even when the incumbent's emitted window has become unsafe. In
-that case only, the matcher retries exact selection once with the additional
-settle penalty set to zero. The retry:
+Live testing exposed one necessary priority rule: feature search can retain the
+incumbent even when the incumbent's emitted window has become unsafe. Active
+hysteresis is one cause, but the same failure can occur after the blend has
+settled because raw feature cost can also prefer the incumbent. In either case,
+the matcher performs one terrain-safety rescue. The rescue:
 
-- uses the same query, eligibility mask, base transition penalty, and candidate
-  costs as the original search;
-- must select a non-incumbent transition;
+- uses the same query, local source exclusion, base transition penalty, and
+  candidate costs as the original search;
+- excludes the known-unsafe incumbent;
+- forces exact search even if ordinary cadence was not due;
+- selects the lowest-cost eligible non-incumbent transition;
 - must pass the same emitted-window validator; and
 - is committed transactionally as the frame's result.
 
-If the retry retains the incumbent or selects an unsafe transition, the matcher
-still fails closed. A zero active settle penalty never triggers a retry. This
-makes terrain safety outrank smoothing without weakening any validator or
-turning safety failure into an unbounded candidate-search loop.
+If no eligible transition exists or the selected transition is unsafe, the
+matcher still fails closed. This makes terrain safety outrank both raw feature
+cost and smoothing without weakening any validator or turning safety failure
+into an unbounded candidate-search loop.
 
-Diagnostics explicitly record whether the settle penalty was bypassed on a
-frame so scripted and live runs can distinguish normal hysteresis from a safety
-override.
+Diagnostics explicitly record `terrain_safety_override` on rescued frames.
+Historical saved rollouts that predate the diagnostic remain loadable and are
+interpreted as containing no overrides.
 
 The hysteresis parameters must be tuned only among candidates that retain:
 
@@ -124,11 +127,10 @@ Focused unit tests prove:
 4. a substantially better candidate can still transition during settling;
 5. continuation remains unpenalized; and
 6. parameter validation rejects negative or non-finite values.
-7. an unsafe incumbent selected under active hysteresis retries once without
-   the additional settle penalty;
+7. any unsafe incumbent triggers one forced search with that incumbent
+   excluded;
 8. a safe retry transition commits and records the override;
-9. no active penalty, a retry that retains the incumbent, or an unsafe retry
-   still fails closed; and
+9. a missing candidate or unsafe retry still fails closed;
 10. failed retries leave matcher state unchanged.
 
 After focused tests, run the full Torch matcher suite and frozen stair rollout.
