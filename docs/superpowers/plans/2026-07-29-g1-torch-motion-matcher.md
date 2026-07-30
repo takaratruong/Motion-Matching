@@ -1197,9 +1197,14 @@ PYTHONPATH=sonic/python sonic/.venv/bin/python -B -m unittest discover \
   -s tests/python -p 'test_*.py' -v
 ```
 
-Expected: all baseline tests PASS. Torch-only modules may be skipped only when
-their test module explicitly detects the missing optional Torch dependency;
-no existing test may be skipped newly.
+Expected: no regression from the recorded pre-implementation fingerprint
+(`1085` tests, one pre-existing
+`test_contract_definitions_have_one_production_owner` failure, eight
+environment errors caused only by absent `pxr`, absent `joblib`, and absent
+`SONIC_PROJECT_CLI`, and nine skips). Torch-only modules may add explicit
+optional-dependency skips, but no new failure/error name and no new skip in an
+existing test is allowed. The focused SONIC tests from Step 1 must all pass in
+the combined environment.
 
 - [ ] **Step 3: Run the real offline behavior/performance canary twice**
 
