@@ -967,7 +967,7 @@ class TorchMotionMatcher:
             torch.zeros_like(rw[0]),
             torch.zeros_like(bp[0]),
             torch.zeros_like(bv[0]),
-            0.0,
+            self.config.transition_settle_duration_s,
         )
         decision = SearchDecision(row, None, math.inf, 0.0, 0.0, False, False)
         result = self._make_result(
@@ -1053,6 +1053,9 @@ class TorchMotionMatcher:
         search = search_is_due(
             state.sequence, shaped.force_search, self.config
         )
+        settle_penalty = active_transition_penalty(
+            state.offsets.elapsed_s, self.config
+        )
         search_start = time.perf_counter_ns()
         decision = select_exact_candidate(
             self.database,
@@ -1062,6 +1065,7 @@ class TorchMotionMatcher:
             incumbent_row=successor,
             search=search,
             config=self.config,
+            additional_transition_penalty=settle_penalty,
         )
         search_time = time.perf_counter_ns() - search_start if search else None
         candidate = self._compose_candidate(

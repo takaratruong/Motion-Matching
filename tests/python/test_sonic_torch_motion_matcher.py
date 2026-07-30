@@ -141,6 +141,67 @@ class TorchMotionMatcherTests(unittest.TestCase):
             places=4,
         )
 
+    def test_runtime_passes_blend_age_penalty_after_accepted_transition(self):
+        arrays = build_varying_takara_arrays(frames=120)
+        config = MatcherConfig(
+            search_interval_steps=1,
+            transition_settle_duration_s=0.20,
+            transition_settle_penalty=10.0,
+        )
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=config,
+            )
+            reset = matcher.reset()
+            target_frame = (
+                reset.diagnostics.selected_frame + 25
+            ) % matcher.folder.clips[0].valid_frame_stop
+            target = matcher.database.row_for_source(0, target_frame)
+            self.assertIsNotNone(target)
+
+            def scripted(database, normalized_query, **kwargs):
+                calls.append(dict(kwargs))
+                successor = kwargs["incumbent_row"]
+                if len(calls) == 1:
+                    return SearchDecision(
+                        target,
+                        successor,
+                        10.0,
+                        1.0,
+                        1.1,
+                        True,
+                        True,
+                    )
+                return SearchDecision(
+                    successor,
+                    successor,
+                    1.0,
+                    1.0,
+                    1.0,
+                    True,
+                    False,
+                )
+
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher.select_exact_candidate",
+                side_effect=scripted,
+            ):
+                transitioned = matcher.step((0.5, 0.0), 0.0)
+                matcher.step((0.5, 0.0), 0.0)
+
+        self.assertTrue(transitioned.diagnostics.transitioned)
+        self.assertEqual(calls[0]["additional_transition_penalty"], 0.0)
+        self.assertGreater(calls[1]["additional_transition_penalty"], 0.0)
+        self.assertLess(
+            calls[1]["additional_transition_penalty"],
+            config.transition_settle_penalty,
+        )
+
     def test_unsafe_transition_falls_back_to_safe_incumbent_transactionally(
         self,
     ):

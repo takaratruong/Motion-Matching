@@ -50,6 +50,14 @@ _MATCHER_FLOAT_FIELDS = frozenset(
         "reversal_speed_mps",
         "transition_penalty",
         "inertialization_halflife_s",
+        "transition_settle_duration_s",
+        "transition_settle_penalty",
+    )
+)
+_MATCHER_NONNEGATIVE_FLOAT_FIELDS = frozenset(
+    (
+        "transition_settle_duration_s",
+        "transition_settle_penalty",
     )
 )
 
@@ -129,9 +137,15 @@ def _validate_base_config(config: object) -> None:
             "matcher exclusion_frames must be a non-negative integer"
         )
     for name in _MATCHER_FLOAT_FIELDS:
-        _finite_number(
-            matcher[name], f"matcher {name}", positive=True
+        value = _finite_number(
+            matcher[name],
+            f"matcher {name}",
+            positive=name not in _MATCHER_NONNEGATIVE_FLOAT_FIELDS,
         )
+        if name in _MATCHER_NONNEGATIVE_FLOAT_FIELDS and value < 0.0:
+            raise ContractError(
+                f"matcher {name} must be finite and non-negative"
+            )
     preview_steps = config.get("terrain_transition_preview_steps")
     if (
         type(preview_steps) is not int
@@ -215,6 +229,12 @@ def matcher_config_from_resolved(config: Mapping) -> MatcherConfig:
         transition_penalty=float(values["transition_penalty"]),
         inertialization_halflife_s=float(
             values["inertialization_halflife_s"]
+        ),
+        transition_settle_duration_s=float(
+            values["transition_settle_duration_s"]
+        ),
+        transition_settle_penalty=float(
+            values["transition_settle_penalty"]
         ),
     )
 

@@ -87,6 +87,10 @@ class TerrainRolloutTests(unittest.TestCase):
         self.assertAlmostEqual(
             matcher.inertialization_halflife_s, 0.1
         )
+        self.assertAlmostEqual(
+            matcher.transition_settle_duration_s, 0.20
+        )
+        self.assertGreater(matcher.transition_settle_penalty, 0.0)
         validator = terrain_transition_validator_from_resolved(
             self.resolved
         )
@@ -124,6 +128,16 @@ class TerrainRolloutTests(unittest.TestCase):
         nonfinite = json.loads(json.dumps(raw))
         nonfinite["matcher"]["yaw_rate_rad_s"] = float("nan")
         cases["yaw_rate_rad_s"] = nonfinite
+        negative_settle_duration = json.loads(json.dumps(raw))
+        negative_settle_duration["matcher"][
+            "transition_settle_duration_s"
+        ] = -0.01
+        cases["transition_settle_duration_s"] = negative_settle_duration
+        nonfinite_settle_penalty = json.loads(json.dumps(raw))
+        nonfinite_settle_penalty["matcher"][
+            "transition_settle_penalty"
+        ] = float("nan")
+        cases["transition_settle_penalty"] = nonfinite_settle_penalty
         for value in (0, 47, True):
             preview = json.loads(json.dumps(raw))
             preview["terrain_transition_preview_steps"] = value
@@ -134,6 +148,18 @@ class TerrainRolloutTests(unittest.TestCase):
                     resolve_stair_config(
                         self.dataset_root, invalid, device="cpu"
                     )
+
+        disabled = json.loads(json.dumps(raw))
+        disabled["matcher"]["transition_settle_duration_s"] = 0.0
+        disabled["matcher"]["transition_settle_penalty"] = 0.0
+        disabled_resolved = resolve_stair_config(
+            self.dataset_root, disabled, device="cpu"
+        )
+        disabled_matcher = matcher_config_from_resolved(
+            disabled_resolved.resolved_config
+        )
+        self.assertEqual(disabled_matcher.transition_settle_duration_s, 0.0)
+        self.assertEqual(disabled_matcher.transition_settle_penalty, 0.0)
 
     def test_rollout_passes_pinned_matcher_config_to_matcher(self):
         expected = matcher_config_from_resolved(
