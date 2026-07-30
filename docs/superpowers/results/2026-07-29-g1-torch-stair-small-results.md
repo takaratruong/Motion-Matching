@@ -274,3 +274,100 @@ transactional retry only to test the hypothesis and is not a retained
 implementation. The next implementation must share production candidate-window
 construction, reject unsafe transitions before commit, preserve a safe
 incumbent exactly, and fail explicitly if the incumbent is also unsafe.
+
+---
+
+## 2026-07-30 Motion-Quality Loop 02
+
+**Promising under every frozen stair-quality gate.**
+
+The transactional terrain transition preview implements the passing Loop 01
+prototype without retrying or mutating live matcher state. The retained
+implementation commits are:
+
+- `0e1441d`: shared emitted-window composition and transactional validation;
+- `18b0198`: authenticated terrain foot-clearance validator;
+- `c89c7d4`: dense rollout/viewer integration and rejection evidence; and
+- `ad44782`: explicit no-incumbent failure coverage and constructor
+  compatibility.
+
+The matcher first performs the unchanged exact feature search. It composes the
+selected candidate through the same placement, inertialization, and 46-frame
+output path used for commit. The dense validator inspects frames 0 through 9
+(0.20 s) against the query grid. If a prospective transition crosses the
+existing `-0.03 m` ankle-clearance threshold, the matcher composes and validates
+the exact incumbent instead. A safe incumbent is retained; an unsafe or absent
+incumbent fails without advancing sequence state.
+
+### Qualified results
+
+Artifacts:
+`build/torch-stair-small-results/quality-loop-02/`
+
+Device: `cuda:1`, NVIDIA L40S.
+
+| Value | Flat | Legacy 4 | Dense 91 + preview |
+|---|---:|---:|---:|
+| First stair selection (m) | 0.5154 | 0.4716 | 0.0029 |
+| Maximum progress (m) | 0.9076 | 1.8137 | 1.9905 |
+| Reference progress ratio | 45.1% | 90.1% | **98.9%** |
+| Maximum root-height gain (m) | 0.4278 | 0.4745 | 0.6083 |
+| Reference height ratio | 67.8% | 75.2% | **96.4%** |
+| Matcher-body minimum clearance (m) | 0.0335 | 0.0298 | **0.03364** |
+| Full MuJoCo-FK minimum clearance (m) | not evaluated | not evaluated | **0.02934** |
+| Penetration integral (m·s) | 0.0000 | 0.0000 | **0.0000** |
+| Reached upper landing | No | No | **Yes** |
+| Accepted transitions | not reported | not reported | 36 |
+| Rejected unsafe transitions | 0 | 0 | 15 |
+
+### Dense acceptance
+
+| Criterion | Threshold | Observed | Pass |
+|---|---:|---:|:---:|
+| Stair selected by pre-riser deadline | ≤ 1.0722 m | 0.0029 m | Yes |
+| Horizontal reference progress | ≥ 90% | 98.9% | Yes |
+| Root-height gain | ≥ 80% | 96.4% | Yes |
+| Minimum foot clearance | ≥ -0.030 m | +0.0293 m MuJoCo FK | Yes |
+| Landing or ≤ 50% flat penetration | either | landing, zero penetration | Yes |
+
+Overall: **5/5 criteria pass.**
+
+The rollout's auxiliary matcher-body diagnostic reaches its minimum at output
+227 with clearances `[0.619562, 0.033645] m`. Because joint/root offsets and the
+three diagnostic body offsets are inertialized independently, a high swing foot
+is not guaranteed to reproduce the exact forward-kinematic body position.
+Therefore the displayed qpos was also evaluated through MuJoCo for every one of
+the 450 frames.
+
+The authoritative full-state minimum occurs at output 169 (3.38 s), selected
+source `stair/updown-0000/motion.npz:187`. MuJoCo left/right ankle-roll
+clearances are `[0.103968, 0.029344] m`; the limiting right-ankle difference
+from the auxiliary diagnostic is `-0.006956 m`. No MuJoCo-FK ankle position is
+below the terrain, and integrated FK penetration is zero.
+
+### Identities and timing
+
+Deterministic rollout identities:
+
+- flat: `163249ad1dc2afa057672785fdfbcbf2dc7202426add3ab349fd84056d2a95da`;
+- legacy: `a0656eab8c9a597d33685d5f53af032072ebdea7c75841da51902846f1200137`;
+- dense: `3844df3687d16b04c3c45d019ff134d9bd1634b92a67572392659c5676b3e908`.
+
+Dense search p50/p95/p99 was 0.539/0.705/0.737 ms. Full matcher-step
+p50/p95/p99 was 7.798/8.673/11.216 ms. Timing remains diagnostic and did not
+participate in acceptance.
+
+### Verification
+
+- Deterministic flat/legacy/dense CUDA rollout: pass.
+- Frozen dense acceptance: 5/5 pass.
+- 450-frame native MuJoCo forward-kinematics sweep: pass, zero penetration.
+- Transactional unsafe-transition, unsafe-incumbent, missing-incumbent, invalid
+  validator, and no-validator tests: pass.
+- Flat 100-command no-validator equivalence: bitwise pass.
+- Focused Torch regression: 66 tests pass, one protected real-data oracle
+  skipped by its explicit opt-in gate.
+
+The next step is user-controlled inspection in the native MuJoCo kinematic
+viewer. SONIC tracking, physics, and depth learning remain intentionally
+excluded until that inspection is satisfactory.
