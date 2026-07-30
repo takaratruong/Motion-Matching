@@ -24,7 +24,7 @@ import numpy as np
 import torch
 
 from .joints import ContractError
-from .torch_motion_matcher import TorchMotionMatcher
+from .torch_motion_matcher import MatcherConfig, TorchMotionMatcher
 from .torch_motion_features import resolve_torch_device
 from .torch_terrain_features import (
     DENSE_FORWARD_M,
@@ -37,6 +37,20 @@ from .torch_terrain_features import (
 EXPERIMENT_SCHEMA = "g1-torch-stair-small-experiment/v1"
 CONDITIONS = ("flat", "legacy", "dense")
 _TIMING_ARRAYS = frozenset(("search_time_ns", "step_time_ns"))
+_MATCHER_INTEGER_FIELDS = frozenset(
+    ("search_interval_steps", "exclusion_frames")
+)
+_MATCHER_FLOAT_FIELDS = frozenset(
+    (
+        "acceleration_mps2",
+        "deceleration_mps2",
+        "yaw_rate_rad_s",
+        "stop_speed_mps",
+        "reversal_speed_mps",
+        "transition_penalty",
+        "inertialization_halflife_s",
+    )
+)
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -91,6 +105,32 @@ def _validate_base_config(config: object) -> None:
     steps = duration / dt
     if abs(steps - round(steps)) > 1e-9:
         raise ContractError("duration_s must contain an integral number of steps")
+    matcher = config.get("matcher")
+    expected_matcher_fields = (
+        _MATCHER_INTEGER_FIELDS | _MATCHER_FLOAT_FIELDS
+    )
+    if (
+        not isinstance(matcher, dict)
+        or set(matcher) != expected_matcher_fields
+    ):
+        raise ContractError("experiment matcher fields are invalid")
+    search_interval = matcher["search_interval_steps"]
+    exclusion_frames = matcher["exclusion_frames"]
+    if (
+        type(search_interval) is not int
+        or search_interval < 1
+    ):
+        raise ContractError(
+            "matcher search_interval_steps must be a positive integer"
+        )
+    if type(exclusion_frames) is not int or exclusion_frames < 0:
+        raise ContractError(
+            "matcher exclusion_frames must be a non-negative integer"
+        )
+    for name in _MATCHER_FLOAT_FIELDS:
+        _finite_number(
+            matcher[name], f"matcher {name}", positive=True
+        )
     for name in ("query_scene", "reset_clip"):
         if not isinstance(config.get(name), str) or not config[name]:
             raise ContractError(f"{name} must be a non-empty relative path")
@@ -148,6 +188,26 @@ class ResolvedStairConfig:
     resolved_config: Mapping
     base_config_sha256: str
     device: torch.device
+
+
+def matcher_config_from_resolved(config: Mapping) -> MatcherConfig:
+    """Reconstruct the exact matcher parameters recorded by the experiment."""
+
+    values = config["matcher"]
+    return MatcherConfig(
+        dt=float(config["dt"]),
+        search_interval_steps=int(values["search_interval_steps"]),
+        acceleration_mps2=float(values["acceleration_mps2"]),
+        deceleration_mps2=float(values["deceleration_mps2"]),
+        yaw_rate_rad_s=float(values["yaw_rate_rad_s"]),
+        stop_speed_mps=float(values["stop_speed_mps"]),
+        reversal_speed_mps=float(values["reversal_speed_mps"]),
+        exclusion_frames=int(values["exclusion_frames"]),
+        transition_penalty=float(values["transition_penalty"]),
+        inertialization_halflife_s=float(
+            values["inertialization_halflife_s"]
+        ),
+    )
 
 
 def resolve_stair_config(
@@ -343,6 +403,7 @@ def run_stair_rollout(
     matcher = TorchMotionMatcher.from_folder(
         config.dataset.root,
         device=str(resolved_device),
+        config=matcher_config_from_resolved(config.resolved_config),
         extension=extension,
         reset_clip_path=config.resolved_config["reset_clip"],
     )

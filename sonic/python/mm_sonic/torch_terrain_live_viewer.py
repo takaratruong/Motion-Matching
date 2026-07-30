@@ -21,6 +21,7 @@ from .torch_terrain_features import DENSE_FORWARD_M, DENSE_LATERAL_M
 from .torch_terrain_rollout import (
     ResolvedStairConfig,
     load_experiment_config,
+    matcher_config_from_resolved,
     resolve_stair_config,
 )
 
@@ -480,6 +481,7 @@ def run_live_viewer(
     matcher = TorchMotionMatcher.from_folder(
         resolved.dataset.root,
         device=str(resolved.device),
+        config=matcher_config_from_resolved(resolved.resolved_config),
         extension=resolved.measurement_extension,
         reset_clip_path=resolved.resolved_config["reset_clip"],
     )

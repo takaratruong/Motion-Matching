@@ -6,9 +6,11 @@ from unittest import mock
 
 import numpy as np
 
+from mm_sonic.torch_motion_matcher import TorchMotionMatcher
 from mm_sonic.torch_terrain_rollout import (
     evaluate_dense_acceptance,
     load_experiment_config,
+    matcher_config_from_resolved,
     resolve_stair_config,
     run_stair_rollout,
     save_stair_rollout,
@@ -71,6 +73,59 @@ class TerrainRolloutTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.temporary.cleanup()
+
+    def test_matcher_config_is_exact_validated_and_reconstructed(self):
+        matcher = matcher_config_from_resolved(
+            self.resolved.resolved_config
+        )
+        self.assertEqual(matcher.search_interval_steps, 1)
+        self.assertEqual(matcher.dt, 0.02)
+        self.assertAlmostEqual(
+            matcher.inertialization_halflife_s, 0.1
+        )
+
+        raw = load_experiment_config(CONFIG_PATH)
+        cases = {}
+        missing = json.loads(json.dumps(raw))
+        del missing["matcher"]
+        cases["missing"] = missing
+        extra = json.loads(json.dumps(raw))
+        extra["matcher"]["unknown"] = 1
+        cases["keys"] = extra
+        interval = json.loads(json.dumps(raw))
+        interval["matcher"]["search_interval_steps"] = 0
+        cases["search_interval_steps"] = interval
+        boolean_interval = json.loads(json.dumps(raw))
+        boolean_interval["matcher"]["search_interval_steps"] = True
+        cases["search_interval_steps boolean"] = boolean_interval
+        exclusion = json.loads(json.dumps(raw))
+        exclusion["matcher"]["exclusion_frames"] = -1
+        cases["exclusion_frames"] = exclusion
+        halflife = json.loads(json.dumps(raw))
+        halflife["matcher"]["inertialization_halflife_s"] = 0.0
+        cases["inertialization_halflife_s"] = halflife
+        nonfinite = json.loads(json.dumps(raw))
+        nonfinite["matcher"]["yaw_rate_rad_s"] = float("nan")
+        cases["yaw_rate_rad_s"] = nonfinite
+        for label, invalid in cases.items():
+            with self.subTest(label=label):
+                with self.assertRaises(Exception):
+                    resolve_stair_config(
+                        self.dataset_root, invalid, device="cpu"
+                    )
+
+    def test_rollout_passes_pinned_matcher_config_to_matcher(self):
+        expected = matcher_config_from_resolved(
+            self.resolved.resolved_config
+        )
+        with mock.patch.object(
+            TorchMotionMatcher,
+            "from_folder",
+            wraps=TorchMotionMatcher.from_folder,
+        ) as build:
+            run_stair_rollout(self.resolved, "flat", device="cpu")
+        self.assertEqual(build.call_count, 1)
+        self.assertEqual(build.call_args.kwargs["config"], expected)
 
     def test_deterministic_hash_and_commands_are_condition_independent(self):
         first = run_stair_rollout(self.resolved, "flat", device="cpu")

@@ -199,6 +199,10 @@ class LiveMujocoSceneTests(unittest.TestCase):
         self.assertNotIn("mj_step(", source)
         self.assertNotIn("manual_demo", source)
         self.assertNotIn("SonicReferenceAdapter", source)
+        self.assertIn(
+            "matcher_config_from_resolved",
+            inspect.getsource(live_module.run_live_viewer),
+        )
         help_text = build_live_viewer_argument_parser().format_help()
         for option in ("--dataset", "--config", "--g1-xml", "--device"):
             self.assertIn(option, help_text)
