@@ -17,6 +17,7 @@ from .torch_motion_features import (
     SearchFeatureExtension,
     TorchMotionDatabase,
     extract_query_features,
+    resolve_torch_device,
     validated_extension_query_row,
 )
 
@@ -604,10 +605,10 @@ class TorchMotionMatcher:
         extension: SearchFeatureExtension | None = None,
         reset_clip_path: str | None = None,
     ) -> "TorchMotionMatcher":
-        resolved = (
-            torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            if device == "auto"
-            else torch.device(device)
+        resolved = resolve_torch_device(
+            "cuda" if device == "auto" and torch.cuda.is_available()
+            else "cpu" if device == "auto"
+            else device
         )
         if resolved.type == "cuda" and not torch.cuda.is_available():
             raise ContractError("CUDA motion matcher requested but unavailable")

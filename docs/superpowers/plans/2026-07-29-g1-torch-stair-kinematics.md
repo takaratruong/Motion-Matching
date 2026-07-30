@@ -649,7 +649,7 @@ Store:
   "schema": "g1-torch-stair-small-experiment/v1",
   "dt": 0.02,
     "duration_s": 9.0,
-    "query_scene": "stair/0000/motion.npz",
+    "query_scene": "stair/updown-0000/motion.npz",
     "reset_clip": "flat/motion.npz",
   "conditions": {
     "flat": {"encoder": null, "weight": 0.0},
@@ -667,9 +667,11 @@ Store:
 ```
 
 Derive the straight command speed, direction, first-riser location, reference
-horizontal progress, and reference root-height gain from converted `__0000`
-before constructing any matcher. Freeze them into the run-local resolved config
-and hash it.
+horizontal progress, and reference root-height gain from the ascent segment of
+converted `_updown__0000` before constructing any matcher. The ordinary
+`__0000`–`__0002` clips begin at the top and are descent recordings, so they
+cannot define the uphill query start. Freeze the derived values into the
+run-local resolved config and hash it.
 
 - [ ] **Step 4: Implement rollout and structured results**
 
@@ -833,7 +835,8 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=sonic/python:. \
   tests.python.test_sonic_torch_terrain_features
 ```
 
-Expected: PASS with maximum legacy height-delta error no greater than `1e-4 m`.
+Expected: PASS with recorded left/right minimum contact-clearance error no
+greater than `1e-4 m`.
 If it fails, stop the A/B run and debug alignment; do not tune matcher weights
 against a misregistered surface.
 

@@ -24,6 +24,7 @@ from .torch_motion_data import G1_TAKARA_LAYOUT, MotionClip, MotionFolder
 from .torch_motion_features import (
     CommandTrajectory,
     GeneratedFeatureState,
+    resolve_torch_device,
 )
 
 
@@ -248,7 +249,7 @@ class TerrainDataset:
                 "terrain manifest must describe exactly five clips"
             )
 
-        resolved_device = torch.device(device)
+        resolved_device = resolve_torch_device(device)
         folder = MotionFolder.load(root_path)
         if len(folder.clips) != len(descriptors):
             raise ContractError("terrain manifest clip count does not match motion folder")
@@ -444,19 +445,42 @@ def _legacy_rows(
     )
     yaw = _yaw_from_wxyz(quaternion)
     facing = torch.stack((torch.cos(yaw), torch.sin(yaw)), dim=-1)
-    output: list[torch.Tensor] = []
-    for frame in range(clip.valid_frame_stop):
-        stop = min(frame + 46, clip.frame_count)
-        samples = _arc_distance_points(
-            position[frame],
-            position[frame + 1 : stop],
-            facing[frame + 1 : stop],
-            facing[frame],
-        )
-        output.append(
-            grid.sample_xy(samples) - grid.sample_xy(position[frame])
-        )
-    return torch.stack(output)
+    frames = torch.arange(clip.valid_frame_stop, device=device)
+    offsets = torch.arange(46, device=device)
+    window_indices = frames[:, None] + offsets[None, :]
+    position_window = position[window_indices]
+    segments = position_window[:, 1:] - position_window[:, :-1]
+    length = torch.linalg.vector_norm(segments, dim=-1)
+    cumulative = torch.cumsum(length, dim=1)
+    targets = torch.tensor(
+        LEGACY_DISTANCE_M, dtype=torch.float32, device=device
+    )
+    crossed = cumulative[:, :, None] >= targets[None, None, :]
+    has_crossing = crossed.any(dim=1)
+    segment_index = torch.argmax(crossed.to(torch.int64), dim=1)
+    gather_xy = segment_index[:, :, None].expand(-1, -1, 2)
+    selected_start = torch.gather(
+        position_window[:, :-1], 1, gather_xy
+    )
+    selected_segment = torch.gather(segments, 1, gather_xy)
+    selected_length = torch.gather(length, 1, segment_index).clamp_min(1e-8)
+    previous_index = (segment_index - 1).clamp_min(0)
+    previous = torch.gather(cumulative, 1, previous_index)
+    previous = torch.where(
+        segment_index == 0, torch.zeros_like(previous), previous
+    )
+    fraction = (targets[None, :] - previous) / selected_length
+    interpolated = selected_start + fraction[:, :, None] * selected_segment
+
+    total = cumulative[:, -1]
+    final_facing = facing[frames + 45]
+    extended = position_window[:, -1, None, :] + (
+        targets[None, :] - total[:, None]
+    )[:, :, None] * final_facing[:, None, :]
+    samples = torch.where(
+        has_crossing[:, :, None], interpolated, extended
+    )
+    return grid.sample_xy(samples) - grid.sample_xy(position[frames])[:, None]
 
 
 @dataclass(frozen=True)

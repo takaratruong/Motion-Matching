@@ -40,6 +40,22 @@ FEATURE_GROUPS = (
 FEATURE_DIM = 27
 
 
+def resolve_torch_device(
+    device: "str | torch.device",
+) -> torch.device:
+    """Resolve aliases such as ``cuda`` to the exact device tensors report."""
+    resolved = (
+        torch.device(device)
+        if not isinstance(device, torch.device)
+        else device
+    )
+    if resolved.type == "cuda" and resolved.index is None:
+        if not torch.cuda.is_available():
+            raise ContractError("CUDA requested but unavailable")
+        resolved = torch.device("cuda", torch.cuda.current_device())
+    return resolved
+
+
 class SearchFeatureExtension(Protocol):
     """One optional feature group shared by database and live query paths."""
 
@@ -366,7 +382,7 @@ def _build_database(
     extension: SearchFeatureExtension | None = None,
     reset_clip_path: str | None = None,
 ) -> TorchMotionDatabase:
-    resolved = torch.device(device) if not isinstance(device, torch.device) else device
+    resolved = resolve_torch_device(device)
     layout = folder.layout
     extension_contract = _extension_contract(extension)
     extension_rows: tuple[torch.Tensor, ...] | None = None

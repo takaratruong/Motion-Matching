@@ -1,15 +1,19 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import MappingProxyType
+from unittest import mock
 
 import numpy as np
 
 from resources.g1_torch_stair_builder.surface import (
     ZUpHeightGrid,
     ZUpTriangleSurface,
+    build_source_height_grid,
     rasterize_zup_surface,
     transform_object_vertices,
 )
+from resources.g1_torch_stair_builder.corpus import PinnedStairSource
 
 
 def _two_level_surface() -> ZUpTriangleSurface:
@@ -51,6 +55,29 @@ class ObjectTransformTests(unittest.TestCase):
 
 
 class ZUpSurfaceTests(unittest.TestCase):
+    def test_source_grid_default_padding_covers_dense_landing_lookahead(self):
+        source = PinnedStairSource(
+            base="synthetic",
+            robot_path=Path("/robot"),
+            object_path=Path("/object"),
+            usd_path=Path("/mesh"),
+            robot_qpos_mujoco=np.zeros((250, 36), np.float32),
+            object_position_world=np.zeros(3, np.float32),
+            object_quaternion_world_xyzw=np.array(
+                [0.0, 0.0, 0.0, 1.0], np.float32
+            ),
+            object_scale=np.ones(3, np.float32),
+            source_fps=25.0,
+            source_sha256=MappingProxyType({}),
+        )
+        with mock.patch(
+            "resources.g1_torch_stair_builder.surface.load_source_surface",
+            return_value=_two_level_surface(),
+        ):
+            grid = build_source_height_grid(source, cell_size_m=1.0)
+        np.testing.assert_array_equal(grid.origin_xy, [-3.0, -3.0])
+        np.testing.assert_allclose(grid.maximum_xy, [3.0, 3.0])
+
     def test_vertical_triangle_surface_returns_highest_z_and_flat_exterior(self):
         surface = _two_level_surface()
         values = surface.height_xy(

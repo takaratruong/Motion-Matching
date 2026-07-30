@@ -283,6 +283,21 @@ class NormalizationAndDatabaseTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(db.normalized_features_copy()).all())
         self.assertEqual(db.motion_feature_dim, 27)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_cuda_alias_is_canonicalized_before_extension_validation(self):
+        arrays = build_varying_takara_arrays(frames=80)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            folder = MotionFolder.load(root)
+            db = TorchMotionDatabase.from_folder(
+                folder,
+                device="cuda",
+                extension=_TwoValueExtension(),
+            )
+        self.assertEqual(db.device, torch.device("cuda:0"))
+        self.assertEqual(db.normalized_features_copy().device, db.device)
+
     def test_extension_rejects_wrong_rows_dtype_nonfinite_and_zero_variance(self):
         arrays = build_varying_takara_arrays(frames=80)
 
