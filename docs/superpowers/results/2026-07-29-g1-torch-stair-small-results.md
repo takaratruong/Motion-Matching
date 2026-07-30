@@ -166,3 +166,111 @@ from entering descent-only clips, and evaluate transition clearance before any
 depth encoder or SONIC tracking run. The current small-corpus matcher latency
 does not justify action chunking by itself; depth plus controller latency remains
 unmeasured.
+
+---
+
+## 2026-07-30 Motion-Quality Loop 01
+
+The original conclusion above is retained as the frozen initial result. This
+iteration removed one normalization defect and increased search frequency. It
+improved the dense condition substantially, but the committed candidate still
+fails only the foot-clearance gate.
+
+### Retained changes
+
+An optional feature-extension weight now describes the total importance of the
+group. Its shared scale includes `sqrt(extension_dimension)`. The seven
+established flat-motion groups retain their exact prior normalization. This
+prevents the 91-value dense patch from receiving roughly 91 copies of its
+declared weight.
+
+The experiment now records every `MatcherConfig` field and searches on every
+50 Hz output frame. The 100 ms Holden inertialization halflife remains
+unchanged. Both the deterministic rollout and native MuJoCo viewer reconstruct
+the same pinned matcher configuration.
+
+### Committed candidate results
+
+Artifacts:
+`build/torch-stair-small-results/quality-loop-01/`
+
+Device: `cuda:1`, NVIDIA L40S.
+
+| Value | Flat | Legacy 4 | Dense 91 |
+|---|---:|---:|---:|
+| First stair selection (m) | 0.5154 | 0.4716 | 0.0029 |
+| Maximum progress (m) | 0.9076 | 1.8137 | 1.9844 |
+| Reference progress ratio | 45.1% | 90.1% | 98.6% |
+| Maximum root-height gain (m) | 0.4278 | 0.4745 | 0.6084 |
+| Reference height ratio | 67.8% | 75.2% | 96.4% |
+| Minimum foot clearance (m) | 0.0335 | 0.0298 | -0.1139 |
+| Penetration integral (m·s) | 0.0000 | 0.0000 | 0.05148 |
+| Reached upper landing | No | No | **Yes** |
+
+Dense acceptance is 4/5:
+
+| Criterion | Observed | Pass |
+|---|---:|:---:|
+| Stair selected by pre-riser deadline | 0.0029 m | Yes |
+| Horizontal reference progress | 98.6% | Yes |
+| Root-height gain | 96.4% | Yes |
+| Minimum foot clearance | -0.1139 m | **No** |
+| Landing or penetration improvement | landing | Yes |
+
+The worst dense frame is output 215 at 4.30 s, continuing
+`stair/0000/motion.npz:225`. Left/right matcher clearances are
+`[-0.113947, 0.035036] m`. Applying the saved root and joints to the native G1
+MuJoCo model gives `[-0.114031, 0.035161] m`, a maximum disagreement of
+`0.000124 m`. The failure is therefore present in displayed forward kinematics,
+not only the three-body diagnostic.
+
+Deterministic rollout identities:
+
+- flat: `f2cc2110058bfe69068b691a73b91b357469b4faf8c8cbf4def53ec0c5dd78c1`;
+- legacy: `7e825d673361640df35f0553fba0fd9e921402974ab2a7a3ed56fcde8a39e599`;
+- dense: `280e5e09b2e8070e970c00727ebfe5f932a123e9f05c616678cb893686a29987`.
+
+Dense exact search ran on all 450 frames with 42 transitions. Search
+p50/p95/p99 was 0.640/0.776/0.850 ms; full matcher-step p50/p95/p99 was
+7.319/8.095/8.551 ms. These are diagnostic only and were not used to retain or
+reject an intervention.
+
+### Controlled ablations
+
+| Intervention | Min clearance (m) | Penetration (m·s) | Progress (m) | Height gain (m) | Transitions | Decision |
+|---|---:|---:|---:|---:|---:|---|
+| Original dense baseline | -0.4820 | 0.31688 | 2.1796 | 0.6058 | 29 | reject |
+| Dimension correction, search every 5 | -0.1366 | 0.07061 | 1.9360 | 0.6083 | 27 | retain correction |
+| Transition penalty 10.0 | -0.2036 | 0.08536 | 1.9326 | 0.6083 | 13 | reject |
+| Search every 2 | -0.1312 | 0.06062 | 1.9501 | 0.6084 | 34 | superseded |
+| Search every 1, halflife 0.10 | -0.1139 | 0.05148 | 1.9844 | 0.6084 | 42 | retain cadence |
+| Search every 1, halflife 0.05 | -0.1334 | 0.04232 | 1.9418 | 0.6097 | 56 | reject |
+| Search every 1, halflife 0.02 | -0.2385 | 0.05632 | 1.9601 | 0.6156 | 209 | reject |
+
+The 20 ms halflife repeatedly selected flat walking during the ascent. Lower
+penetration integral alone is not sufficient when minimum clearance or
+transition stability regresses.
+
+### Next causal hypothesis
+
+The current result already emits a 46-frame inertialized candidate window.
+Before the bad transition at output 189, the selected candidate predicts a
+`-0.1103 m` clearance within ten frames while the valid incumbent predicts no
+clearance violation. A transactional diagnostic prototype rejected only
+transition candidates whose first ten emitted frames crossed `-0.03 m`, then
+kept the incumbent. On the unchanged 450-step rollout it produced:
+
+- minimum clearance `+0.03364 m`;
+- zero integrated penetration;
+- maximum progress `1.99048 m` (98.9% of reference);
+- root-height gain `0.60830 m` (96.4% of reference);
+- upper landing reached;
+- 36 transitions;
+- 15 rejected unsafe transitions; and
+- zero unsafe incumbents.
+
+This prototype passes every stair-quality gate. It used a monkeypatched
+transactional retry only to test the hypothesis and is not a retained
+implementation. The next implementation must share production candidate-window
+construction, reject unsafe transitions before commit, preserve a safe
+incumbent exactly, and fail explicitly if the incumbent is also unsafe.
