@@ -199,6 +199,22 @@ class TorchMotionMatcherTests(unittest.TestCase):
                 MatcherConfig(transition_window_candidate_count=2.0),
                 "transition_window_candidate_count",
             ),
+            (
+                MatcherConfig(transition_window_jerk_horizon_steps=3),
+                "transition_window_jerk_horizon_steps",
+            ),
+            (
+                MatcherConfig(transition_window_jerk_horizon_steps=47),
+                "transition_window_jerk_horizon_steps",
+            ),
+            (
+                MatcherConfig(transition_window_jerk_horizon_steps=True),
+                "transition_window_jerk_horizon_steps",
+            ),
+            (
+                MatcherConfig(transition_window_jerk_horizon_steps=8.0),
+                "transition_window_jerk_horizon_steps",
+            ),
         )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

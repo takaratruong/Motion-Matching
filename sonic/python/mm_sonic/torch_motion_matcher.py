@@ -45,6 +45,7 @@ class MatcherConfig:
     transition_joint_velocity_weight: float = 0.0
     transition_window_jerk_weight: float = 0.0
     transition_window_candidate_count: int = 32
+    transition_window_jerk_horizon_steps: int = 46
 
 
 @dataclass(frozen=True)
@@ -797,6 +798,15 @@ class TorchMotionMatcher:
             raise ContractError(
                 "transition_window_candidate_count must be a positive integer"
             )
+        jerk_horizon = config.transition_window_jerk_horizon_steps
+        if (
+            type(jerk_horizon) is not int
+            or not 4 <= jerk_horizon <= 46
+        ):
+            raise ContractError(
+                "transition_window_jerk_horizon_steps must be an integer "
+                "in [4, 46]"
+            )
         if continuity.device != database.device:
             raise ContractError(
                 "continuity and motion databases must use the same device"
@@ -1027,9 +1037,10 @@ class TorchMotionMatcher:
         )
 
         def predicted_p95(value: _ComposedCandidate) -> torch.Tensor:
+            horizon = self.config.transition_window_jerk_horizon_steps
             jerk = torch.linalg.vector_norm(
                 torch.diff(
-                    value.dense_joint_position, n=3, dim=0
+                    value.dense_joint_position[:horizon], n=3, dim=0
                 )
                 / (self.config.dt**3),
                 dim=1,

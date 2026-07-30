@@ -43,6 +43,7 @@ _MATCHER_INTEGER_FIELDS = frozenset(
         "search_interval_steps",
         "exclusion_frames",
         "transition_window_candidate_count",
+        "transition_window_jerk_horizon_steps",
     )
 )
 _MATCHER_FLOAT_FIELDS = frozenset(
@@ -151,6 +152,12 @@ def _validate_base_config(config: object) -> None:
         raise ContractError(
             "matcher transition_window_candidate_count must be a "
             "positive integer"
+        )
+    jerk_horizon = matcher["transition_window_jerk_horizon_steps"]
+    if type(jerk_horizon) is not int or not 4 <= jerk_horizon <= 46:
+        raise ContractError(
+            "matcher transition_window_jerk_horizon_steps must be an "
+            "integer in [4, 46]"
         )
     for name in _MATCHER_FLOAT_FIELDS:
         value = _finite_number(
@@ -263,6 +270,9 @@ def matcher_config_from_resolved(config: Mapping) -> MatcherConfig:
         ),
         transition_window_candidate_count=int(
             values["transition_window_candidate_count"]
+        ),
+        transition_window_jerk_horizon_steps=int(
+            values["transition_window_jerk_horizon_steps"]
         ),
     )
 

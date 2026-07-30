@@ -93,6 +93,7 @@ class TerrainRolloutTests(unittest.TestCase):
                 "transition_joint_position_weight",
                 "transition_joint_velocity_weight",
                 "transition_window_candidate_count",
+                "transition_window_jerk_horizon_steps",
                 "transition_window_jerk_weight",
                 "transition_penalty",
                 "transition_settle_duration_s",
@@ -115,6 +116,7 @@ class TerrainRolloutTests(unittest.TestCase):
         self.assertEqual(matcher.transition_joint_position_weight, 0.1)
         self.assertEqual(matcher.transition_joint_velocity_weight, 0.1)
         self.assertEqual(matcher.transition_window_candidate_count, 32)
+        self.assertEqual(matcher.transition_window_jerk_horizon_steps, 46)
         self.assertEqual(matcher.transition_window_jerk_weight, 0.0)
         validator = terrain_transition_validator_from_resolved(
             self.resolved
@@ -183,6 +185,14 @@ class TerrainRolloutTests(unittest.TestCase):
             cases[
                 f"transition_window_candidate_count {value!r}"
             ] = invalid_candidate_count
+        for value in (3, 47, 8.5, True):
+            invalid_horizon = json.loads(json.dumps(raw))
+            invalid_horizon["matcher"][
+                "transition_window_jerk_horizon_steps"
+            ] = value
+            cases[
+                f"transition_window_jerk_horizon_steps {value!r}"
+            ] = invalid_horizon
         for name in (
             "transition_joint_position_weight",
             "transition_joint_velocity_weight",
