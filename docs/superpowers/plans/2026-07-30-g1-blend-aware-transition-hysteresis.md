@@ -262,7 +262,104 @@ git add tests/python/test_sonic_torch_motion_matcher.py \
 git commit -m "feat: settle terrain matcher transitions"
 ```
 
-### Task 3: Deterministic Magnitude Sweep and Viewer Qualification
+### Task 3: Terrain-Safety Override
+
+**Files:**
+- Modify: `tests/python/test_sonic_torch_motion_matcher.py`
+- Modify: `tests/python/test_sonic_torch_terrain_rollout.py`
+- Modify: `sonic/python/mm_sonic/torch_motion_matcher.py`
+- Modify: `sonic/python/mm_sonic/torch_terrain_rollout.py`
+
+**Interfaces:**
+- Consumes: `active_transition_penalty(...)`, transactional
+  `prepare_step(...)`, and `EmittedWindowValidator`.
+- Produces: one bounded zero-hysteresis retry and
+  `MotionMatchDiagnostics.hysteresis_overridden: bool`.
+
+- [ ] **Step 1: Write failing transactional safety-override tests**
+
+Build a matcher with active hysteresis and a scripted validator. Patch
+`select_exact_candidate` so its first decision retains the incumbent and its
+second decision transitions. Assert:
+
+```python
+result = matcher.step((0.5, 0.0), 0.0)
+self.assertTrue(result.diagnostics.transitioned)
+self.assertTrue(result.diagnostics.hysteresis_overridden)
+self.assertEqual(selector.call_count, 2)
+self.assertGreater(
+    selector.call_args_list[0].kwargs["additional_transition_penalty"],
+    0.0,
+)
+self.assertEqual(
+    selector.call_args_list[1].kwargs["additional_transition_penalty"],
+    0.0,
+)
+```
+
+Add separate tests proving an unsafe retry, a retry that retains the incumbent,
+and an unsafe incumbent with zero active penalty raise `ContractError` without
+advancing the committed sequence.
+
+- [ ] **Step 2: Run focused tests and verify RED**
+
+Run:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=sonic/python:. \
+  sonic/.torch-mm-venv/bin/python -B -m unittest \
+  tests.python.test_sonic_torch_motion_matcher -v
+```
+
+Expected: the safe-override test raises `emitted-window incumbent is unsafe` and
+the diagnostic field does not exist.
+
+- [ ] **Step 3: Implement one bounded retry**
+
+Add `hysteresis_overridden: bool` to `MotionMatchDiagnostics` and thread it
+through `_make_result`, reset, normal steps, and rollout serialization.
+
+When the first composed candidate is an unsafe incumbent and
+`settle_penalty > 0.0`, call `select_exact_candidate` a second time with the
+same arguments except `additional_transition_penalty=0.0`. Require the retry
+decision to transition, compose it from the unchanged state, and validate its
+emitted window. If it is safe, replace the original candidate and decision and
+set `hysteresis_overridden=True`. Otherwise raise `ContractError`. Do not loop
+or mutate `_state` before the existing commit boundary.
+
+- [ ] **Step 4: Save and validate the override diagnostic**
+
+Add a boolean `hysteresis_overridden` row to deterministic rollout artifacts,
+event JSON, saved-array validation, and tests. Timing remains excluded from the
+deterministic digest; the new boolean is included.
+
+- [ ] **Step 5: Run focused and full suites**
+
+Run:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=sonic/python:. \
+  sonic/.torch-mm-venv/bin/python -B -m unittest \
+  tests.python.test_sonic_torch_motion_matcher \
+  tests.python.test_sonic_torch_terrain_rollout -v
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=sonic/python:. \
+  sonic/.torch-mm-venv/bin/python -B -m unittest discover \
+  -s tests/python -p 'test_sonic_torch_*.py' -v
+```
+
+Expected: zero failures; the existing optional skip is allowed.
+
+- [ ] **Step 6: Commit the safety override**
+
+```bash
+git add tests/python/test_sonic_torch_motion_matcher.py \
+  tests/python/test_sonic_torch_terrain_rollout.py \
+  sonic/python/mm_sonic/torch_motion_matcher.py \
+  sonic/python/mm_sonic/torch_terrain_rollout.py
+git commit -m "fix: let terrain safety override transition settling"
+```
+
+### Task 4: Deterministic Magnitude Sweep and Viewer Qualification
 
 **Files:**
 - Modify: `sonic/configs/experiments/torch_stair_small.json`
@@ -343,4 +440,3 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=sonic/python:. \
 
 Expected: the user can control the kinematic robot over the visible stairs
 without the prior rapid transition stutter.
-

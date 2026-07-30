@@ -68,7 +68,27 @@ now, not bypass all matching costs.
 
 The existing emitted-window terrain validator remains authoritative and runs
 after selection. A selected transition that is unsafe still falls back
-transactionally to its safe incumbent. An unsafe incumbent still fails closed.
+transactionally to its safe incumbent.
+
+Live testing exposed one necessary priority rule: active hysteresis can select
+the incumbent even when the incumbent's emitted window has become unsafe. In
+that case only, the matcher retries exact selection once with the additional
+settle penalty set to zero. The retry:
+
+- uses the same query, eligibility mask, base transition penalty, and candidate
+  costs as the original search;
+- must select a non-incumbent transition;
+- must pass the same emitted-window validator; and
+- is committed transactionally as the frame's result.
+
+If the retry retains the incumbent or selects an unsafe transition, the matcher
+still fails closed. A zero active settle penalty never triggers a retry. This
+makes terrain safety outrank smoothing without weakening any validator or
+turning safety failure into an unbounded candidate-search loop.
+
+Diagnostics explicitly record whether the settle penalty was bypassed on a
+frame so scripted and live runs can distinguish normal hysteresis from a safety
+override.
 
 The hysteresis parameters must be tuned only among candidates that retain:
 
@@ -104,6 +124,12 @@ Focused unit tests prove:
 4. a substantially better candidate can still transition during settling;
 5. continuation remains unpenalized; and
 6. parameter validation rejects negative or non-finite values.
+7. an unsafe incumbent selected under active hysteresis retries once without
+   the additional settle penalty;
+8. a safe retry transition commits and records the override;
+9. no active penalty, a retry that retains the incumbent, or an unsafe retry
+   still fails closed; and
+10. failed retries leave matcher state unchanged.
 
 After focused tests, run the full Torch matcher suite and frozen stair rollout.
 Retain a parameter candidate only if all safety gates pass and its stutter
@@ -116,4 +142,3 @@ inertialization half-life. Sweep only the hysteresis magnitude while holding all
 other settings fixed. If no magnitude removes transition bursts without losing
 terrain quality, reject this hypothesis and proceed to contact/gait-phase
 continuity rather than accumulating more transition heuristics.
-
