@@ -5,6 +5,7 @@ import math
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from types import MappingProxyType
 from unittest import mock
 
@@ -21,6 +22,9 @@ from mm_sonic.torch_terrain_directional_rollout import (
     ChallengeScenario,
     ChallengeScenarioRun,
     DirectionalRollout,
+    _challenge_run_hash,
+    _challenge_exception_evidence,
+    _compute_challenge_metrics,
     build_directional_argument_parser,
     challenge_scenarios,
     compute_directional_metrics,
@@ -40,6 +44,18 @@ def _readonly(value):
     result = np.ascontiguousarray(value)
     result.setflags(write=False)
     return result
+
+
+def _canonical_bytes(value):
+    return (
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
 
 
 def _fixture_rollout() -> DirectionalRollout:
@@ -128,6 +144,8 @@ def _challenge_metric(
     clearance=0.0,
     completed=True,
     error=None,
+    position_weight=0.0,
+    velocity_weight=0.0,
 ):
     return {
         "scenario_name": name,
@@ -136,11 +154,24 @@ def _challenge_metric(
         "minimum_clearance_m": clearance,
         "p95_joint_jerk_rad_s3": jerk,
         "exception": error,
+        "position_weight": position_weight,
+        "velocity_weight": velocity_weight,
     }
 
 
-def _fixture_challenge_matrix(*, jerk=100.0) -> ChallengeMatrix:
-    resolved_config = {"fixture": True}
+def _fixture_challenge_matrix(
+    *,
+    jerk=100.0,
+    position_weight=0.0,
+    velocity_weight=0.0,
+) -> ChallengeMatrix:
+    resolved_config = {
+        "fixture": True,
+        "matcher": {
+            "transition_joint_position_weight": position_weight,
+            "transition_joint_velocity_weight": velocity_weight,
+        },
+    }
     resolved_config_sha = hashlib.sha256(
         (
             json.dumps(
@@ -215,6 +246,8 @@ def _fixture_challenge_matrix(*, jerk=100.0) -> ChallengeMatrix:
             _challenge_metric(
                 scenario.name,
                 jerk=jerk,
+                position_weight=position_weight,
+                velocity_weight=velocity_weight,
             )
         )
         runs.append(
@@ -231,8 +264,8 @@ def _fixture_challenge_matrix(*, jerk=100.0) -> ChallengeMatrix:
         runs=tuple(runs),
         metrics=MappingProxyType(
             {
-                "position_weight": 0.0,
-                "velocity_weight": 0.0,
+                "position_weight": position_weight,
+                "velocity_weight": velocity_weight,
                 "scenario_count": 6,
             }
         ),
@@ -240,6 +273,187 @@ def _fixture_challenge_matrix(*, jerk=100.0) -> ChallengeMatrix:
         resolved_config_sha256=resolved_config_sha,
         deterministic_sha256="e" * 64,
     )
+
+
+def _challenge_oracle():
+    frame_count = 10
+    scenario = ChallengeScenario(
+        "oracle",
+        tuple(
+            ChallengeCommand(
+                (1.0, 0.0),
+                0.0,
+                reset_before=index in (0, 5),
+            )
+            for index in range(frame_count)
+        ),
+    )
+    joint_episode = np.array([0.0, 1.0, 4.0, 10.0, 20.0])
+    root_episode = np.array([0.0, 1.0, 4.0, 9.0, 16.0])
+    arrays = {
+        "joint_position": np.concatenate(
+            (joint_episode, joint_episode + 1000.0)
+        )[:, None],
+        "root_position_world": np.column_stack(
+            (
+                np.concatenate(
+                    (root_episode, root_episode + 1000.0)
+                ),
+                np.zeros(frame_count),
+                np.zeros(frame_count),
+            )
+        ),
+        "foot_position_world": np.zeros(
+            (frame_count, 2, 3), np.float64
+        ),
+        "foot_clearance_m": np.zeros((frame_count, 2), np.float64),
+        "reset_before": np.array(
+            [True, False, False, False, False] * 2, np.bool_
+        ),
+        "selected_clip_index": np.zeros(frame_count, np.int32),
+        "previous_selected_clip_index": np.zeros(
+            frame_count, np.int32
+        ),
+        "transitioned": np.array(
+            [False, False, False, False, True]
+            + [False] * 5,
+            np.bool_,
+        ),
+        "transition_rejected": np.zeros(frame_count, np.bool_),
+        "terrain_safety_override": np.zeros(frame_count, np.bool_),
+        "terrain_safety_override_rank": np.zeros(
+            frame_count, np.int32
+        ),
+        "selected_transition_position_cost": np.zeros(
+            frame_count, np.float64
+        ),
+        "selected_transition_velocity_cost": np.zeros(
+            frame_count, np.float64
+        ),
+        "selected_transition_continuity_cost": np.zeros(
+            frame_count, np.float64
+        ),
+    }
+    return scenario, arrays
+
+
+class ChallengeMetricAndIdentityTests(unittest.TestCase):
+    def test_identity_excludes_only_runtime_timing_and_includes_events(self):
+        arrays = {
+            "time_s": np.array([0.0], np.float32),
+            "joint_position": np.array([[1.0]], np.float32),
+            "step_time_ns": np.array([11], np.int64),
+            "search_time_ns": np.array([7], np.int64),
+        }
+        events = (
+            {
+                "command_index": 0,
+                "time_s": 0.0,
+                "selected_frame": 3,
+                "step_time_ns": 11,
+                "search_time_ns": 7,
+            },
+        )
+
+        def identity(
+            array_values=arrays,
+            event_values=events,
+            exception=None,
+        ):
+            return _challenge_run_hash(
+                "a" * 64,
+                "b" * 64,
+                array_values,
+                event_values,
+                exception,
+            )
+
+        expected = identity()
+        timing_arrays = deepcopy(arrays)
+        timing_arrays["step_time_ns"][0] = 999
+        timing_arrays["search_time_ns"][0] = 888
+        self.assertEqual(identity(timing_arrays), expected)
+        timing_events = deepcopy(events)
+        timing_events[0]["step_time_ns"] = 999
+        timing_events[0]["search_time_ns"] = 888
+        self.assertEqual(identity(event_values=timing_events), expected)
+
+        behavior_array = deepcopy(arrays)
+        behavior_array["joint_position"][0, 0] = 2.0
+        self.assertNotEqual(identity(behavior_array), expected)
+        behavior_event = deepcopy(events)
+        behavior_event[0]["selected_frame"] = 4
+        self.assertNotEqual(
+            identity(event_values=behavior_event), expected
+        )
+        command_time = deepcopy(events)
+        command_time[0]["time_s"] = 0.02
+        self.assertNotEqual(identity(event_values=command_time), expected)
+        self.assertNotEqual(
+            identity(
+                exception={
+                    "type": "RuntimeError",
+                    "message": "failed",
+                    "command_index": 0,
+                    "stage": "command",
+                }
+            ),
+            expected,
+        )
+
+    def test_boundary_exception_convention_never_claims_command_zero(self):
+        self.assertEqual(
+            _challenge_exception_evidence(
+                RuntimeError("finalize failed"),
+                stage="scenario_finalize",
+                command_index=None,
+            ),
+            {
+                "type": "RuntimeError",
+                "message": "finalize failed",
+                "command_index": None,
+                "stage": "scenario_finalize",
+            },
+        )
+        with self.assertRaises(ContractError):
+            _challenge_exception_evidence(
+                RuntimeError("invalid"),
+                stage="scenario_setup",
+                command_index=0,
+            )
+
+    def test_reset_local_derivative_and_transition_neighborhood_oracle(self):
+        scenario, arrays = _challenge_oracle()
+        metrics = _compute_challenge_metrics(
+            scenario,
+            arrays,
+            dt=1.0,
+            position_weight=0.0,
+            velocity_weight=0.0,
+            exception=None,
+        )
+        aggregate = metrics["aggregate"]
+        self.assertEqual(
+            aggregate["joint_jerk_rad_s3"]["samples"],
+            [1.0, 1.0, 1.0, 1.0],
+        )
+        self.assertEqual(
+            aggregate["root_acceleration_m_s2"]["samples"],
+            [2.0] * 6,
+        )
+        self.assertEqual(
+            aggregate[
+                "transition_neighborhood_joint_jerk_rad_s3"
+            ]["samples"],
+            [1.0, 1.0],
+        )
+        self.assertEqual(
+            aggregate[
+                "transition_neighborhood_joint_jerk_output_frames"
+            ],
+            [3, 4],
+        )
+        self.assertEqual(aggregate["root_jerk_m_s3"]["maximum"], 0.0)
 
 
 class ChallengeScenarioGenerationTests(unittest.TestCase):
@@ -641,10 +855,181 @@ class ChallengeMatrixExecutionAndArtifactTests(unittest.TestCase):
             {
                 "type": "RuntimeError",
                 "message": "boom",
-                "command_index": 0,
+                "command_index": None,
+                "stage": "scenario_boundary_unknown",
             },
         )
         self.assertEqual(matrix.runs[1], completed)
+
+    def test_real_scenario_loop_preserves_prefix_before_command_exception(self):
+        torch = __import__("torch")
+        scenario = ChallengeScenario(
+            "partial",
+            (
+                ChallengeCommand((1.0, 0.0), 0.0, True),
+                ChallengeCommand((1.0, 0.0), 0.0),
+            ),
+        )
+        diagnostics = SimpleNamespace(
+            selected_clip_path="reset",
+            selected_frame=3,
+            searched=True,
+            transitioned=True,
+            transition_rejected=False,
+            terrain_safety_override=False,
+            terrain_safety_override_rank=0,
+            motion_feature_cost=1.0,
+            extension_feature_cost=2.0,
+            selected_feature_cost=3.0,
+            selected_total_cost=4.0,
+            selected_transition_position_cost=5.0,
+            selected_transition_velocity_cost=6.0,
+            selected_transition_continuity_cost=7.0,
+            step_time_ns=11,
+            search_time_ns=7,
+            sequence=1,
+        )
+        result = SimpleNamespace(
+            diagnostics=diagnostics,
+            dense_feature_body_position_window=torch.zeros(
+                (1, 3, 3), dtype=torch.float32
+            ),
+            dense_feature_body_velocity_window=torch.zeros(
+                (1, 3, 3), dtype=torch.float32
+            ),
+            joint_position=torch.tensor([1.0]),
+            joint_velocity=torch.tensor([2.0]),
+            root_position_world=torch.tensor([0.0, 0.0, 0.75]),
+            root_orientation_world_wxyz=torch.tensor(
+                [1.0, 0.0, 0.0, 0.0]
+            ),
+        )
+        matcher = mock.Mock()
+        matcher.motion_inventory_sha256 = "m" * 64
+        matcher.reset.return_value = SimpleNamespace(
+            diagnostics=SimpleNamespace(selected_clip_path="reset")
+        )
+        matcher.prepare_step.side_effect = ["first", "second"]
+        matcher.commit.side_effect = [result, RuntimeError("second failed")]
+        resolved = mock.Mock()
+        resolved.device = torch.device("cpu")
+        resolved.resolved_config = {
+            "dt": 0.02,
+            "matcher": {},
+            "reset_clip": "reset",
+            "command_speed_mps": 1.0,
+            "reference_direction_matcher_xy": [1.0, 0.0],
+        }
+        resolved.dataset = SimpleNamespace(
+            root=Path("dataset"),
+            manifest_sha256="d" * 64,
+            folder=SimpleNamespace(
+                clips=(SimpleNamespace(relative_path="reset"),)
+            ),
+        )
+        resolved.measurement_extension = SimpleNamespace(
+            alignment=SimpleNamespace(
+                matcher_to_scene_xy=lambda value: value
+            ),
+            query_grid=SimpleNamespace(
+                sample_xy=lambda value: torch.zeros(
+                    2, dtype=torch.float32
+                )
+            ),
+        )
+        with (
+            mock.patch(
+                "mm_sonic.torch_terrain_directional_rollout.challenge_scenarios",
+                return_value=(scenario,),
+            ),
+            mock.patch(
+                "mm_sonic.torch_terrain_directional_rollout.TorchMotionMatcher.from_folder",
+                return_value=matcher,
+            ),
+            mock.patch(
+                "mm_sonic.torch_terrain_directional_rollout.matcher_config_from_resolved",
+                return_value=object(),
+            ),
+            mock.patch(
+                "mm_sonic.torch_terrain_directional_rollout.terrain_transition_validator_from_resolved",
+                return_value=object(),
+            ),
+        ):
+            matrix = run_challenge_matrix(
+                resolved,
+                device="cpu",
+                position_weight=0.0,
+                velocity_weight=0.0,
+            )
+        run = matrix.runs[0]
+        self.assertEqual(run.metrics["frame_count"], 1)
+        self.assertEqual(len(run.events), 1)
+        np.testing.assert_array_equal(
+            run.arrays["joint_position"], np.array([[1.0]])
+        )
+        self.assertEqual(
+            run.metrics["exception"],
+            {
+                "type": "RuntimeError",
+                "message": "second failed",
+                "command_index": 1,
+                "stage": "command",
+            },
+        )
+
+    def test_real_scenario_setup_exception_has_no_command_index(self):
+        torch = __import__("torch")
+        scenario = ChallengeScenario(
+            "setup",
+            (ChallengeCommand((1.0, 0.0), 0.0, True),),
+        )
+        resolved = mock.Mock()
+        resolved.device = torch.device("cpu")
+        resolved.resolved_config = {
+            "dt": 0.02,
+            "matcher": {},
+            "reset_clip": "reset",
+            "command_speed_mps": 1.0,
+            "reference_direction_matcher_xy": [1.0, 0.0],
+        }
+        resolved.dataset = SimpleNamespace(
+            root=Path("dataset"),
+            folder=SimpleNamespace(clips=None),
+        )
+        resolved.measurement_extension = object()
+        matcher = mock.Mock()
+        matcher.motion_inventory_sha256 = "m" * 64
+        with (
+            mock.patch(
+                "mm_sonic.torch_terrain_directional_rollout.challenge_scenarios",
+                return_value=(scenario,),
+            ),
+            mock.patch(
+                "mm_sonic.torch_terrain_directional_rollout.matcher_config_from_resolved",
+                return_value=object(),
+            ),
+            mock.patch(
+                "mm_sonic.torch_terrain_directional_rollout.terrain_transition_validator_from_resolved",
+                return_value=object(),
+            ),
+            mock.patch(
+                "mm_sonic.torch_terrain_directional_rollout.TorchMotionMatcher.from_folder",
+                return_value=matcher,
+            ),
+        ):
+            matrix = run_challenge_matrix(
+                resolved,
+                device="cpu",
+                position_weight=0.0,
+                velocity_weight=0.0,
+            )
+        exception = matrix.runs[0].metrics["exception"]
+        self.assertEqual(exception["type"], "TypeError")
+        self.assertIsNone(exception["command_index"])
+        self.assertEqual(
+            exception["stage"],
+            "scenario_setup",
+        )
 
     def test_run_generates_commands_from_resolved_stair_direction_and_speed(self):
         sentinel_resolved = mock.Mock()
@@ -684,6 +1069,8 @@ class ChallengeMatrixExecutionAndArtifactTests(unittest.TestCase):
             (baseline_root / "matrix.json").read_text("utf-8")
         )
         self.assertTrue(top["baseline"])
+        self.assertEqual(top["position_weight"], 0.0)
+        self.assertEqual(top["velocity_weight"], 0.0)
         self.assertIsNone(top["matrix_pass"])
         self.assertEqual(
             tuple(top["scenario_names"]),
@@ -697,7 +1084,24 @@ class ChallengeMatrixExecutionAndArtifactTests(unittest.TestCase):
             metrics = json.loads(
                 (scenario_root / "metrics.json").read_text("utf-8")
             )
+            self.assertEqual(metrics["position_weight"], 0.0)
+            self.assertEqual(metrics["velocity_weight"], 0.0)
             self.assertIn("rollout_npz_sha256", metrics)
+        resolved_config = json.loads(
+            (baseline_root / "resolved_config.json").read_text("utf-8")
+        )
+        self.assertEqual(
+            resolved_config["matcher"][
+                "transition_joint_position_weight"
+            ],
+            0.0,
+        )
+        self.assertEqual(
+            resolved_config["matcher"][
+                "transition_joint_velocity_weight"
+            ],
+            0.0,
+        )
 
         retained = _fixture_challenge_matrix(jerk=80.0)
         retained_root = self.root / "retained"
@@ -724,6 +1128,79 @@ class ChallengeMatrixExecutionAndArtifactTests(unittest.TestCase):
                 baseline_root=baseline_root,
             )
         self.assertFalse((self.root / "rejected").exists())
+
+    def test_baseline_save_rejects_nonzero_weights_without_partial_output(self):
+        for position_weight, velocity_weight in (
+            (0.1, 0.0),
+            (0.0, 0.25),
+        ):
+            with self.subTest(
+                position_weight=position_weight,
+                velocity_weight=velocity_weight,
+            ):
+                output = self.root / (
+                    f"invalid-{position_weight}-{velocity_weight}"
+                )
+                with self.assertRaises(ContractError):
+                    save_challenge_matrix(
+                        _fixture_challenge_matrix(
+                            position_weight=position_weight,
+                            velocity_weight=velocity_weight,
+                        ),
+                        output,
+                    )
+                self.assertFalse(output.exists())
+
+    def test_baseline_load_rejects_self_consistent_nonzero_weight_tampering(self):
+        retained = _fixture_challenge_matrix(jerk=80.0)
+
+        for tamper in ("top", "config", "scenario"):
+            with self.subTest(tamper=tamper):
+                baseline_root = self.root / f"baseline-{tamper}"
+                save_challenge_matrix(
+                    _fixture_challenge_matrix(), baseline_root
+                )
+                top_path = baseline_root / "matrix.json"
+                top = json.loads(top_path.read_text("utf-8"))
+                if tamper == "top":
+                    top["position_weight"] = 0.1
+                elif tamper == "config":
+                    config_path = baseline_root / "resolved_config.json"
+                    config = json.loads(config_path.read_text("utf-8"))
+                    config["matcher"][
+                        "transition_joint_position_weight"
+                    ] = 0.1
+                    config_path.write_bytes(_canonical_bytes(config))
+                    top["resolved_config_json_sha256"] = hashlib.sha256(
+                        config_path.read_bytes()
+                    ).hexdigest()
+                    top["resolved_config_sha256"] = hashlib.sha256(
+                        _canonical_bytes(config)
+                    ).hexdigest()
+                else:
+                    name = "rapid-reversal"
+                    metrics_path = (
+                        baseline_root / name / "metrics.json"
+                    )
+                    metrics = json.loads(
+                        metrics_path.read_text("utf-8")
+                    )
+                    metrics["position_weight"] = 0.1
+                    metrics_path.write_bytes(_canonical_bytes(metrics))
+                    top["scenario_artifacts"][name][
+                        "metrics_json_sha256"
+                    ] = hashlib.sha256(
+                        metrics_path.read_bytes()
+                    ).hexdigest()
+                top_path.write_bytes(_canonical_bytes(top))
+                output = self.root / f"rejected-{tamper}"
+                with self.assertRaises(ContractError):
+                    save_challenge_matrix(
+                        retained,
+                        output,
+                        baseline_root=baseline_root,
+                    )
+                self.assertFalse(output.exists())
 
     def test_save_rejects_output_symlink_without_changing_target(self):
         target = self.root / "target"

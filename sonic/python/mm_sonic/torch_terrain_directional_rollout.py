@@ -877,6 +877,13 @@ def _compute_challenge_metrics(
         dt=dt,
         axis=1,
     )
+    root_acceleration = _episode_differences(
+        root_position,
+        episodes,
+        order=2,
+        dt=dt,
+        axis=1,
+    )
     foot_speed = _episode_differences(
         foot_position[:, :, :2],
         episodes,
@@ -949,6 +956,35 @@ def _compute_challenge_metrics(
         if transition_intervals
         else np.empty(0, np.int64)
     )
+    transition_neighborhood_jerk = []
+    transition_neighborhood_jerk_frames = []
+    for episode in episodes:
+        episode_joint = joint_position[episode]
+        if len(episode_joint) <= 3:
+            continue
+        episode_jerk = np.linalg.norm(
+            np.diff(episode_joint, n=3, axis=0) / (dt**3),
+            axis=1,
+        )
+        local_neighborhood = transition_neighborhood_mask(
+            transitioned[episode]
+        )
+        selected = local_neighborhood[3:]
+        if selected.any():
+            transition_neighborhood_jerk.append(
+                episode_jerk[selected]
+            )
+            transition_neighborhood_jerk_frames.extend(
+                int(frame)
+                for frame in np.arange(
+                    episode.start + 3, episode.stop, dtype=np.int64
+                )[selected]
+            )
+    neighborhood_jerk = (
+        np.concatenate(transition_neighborhood_jerk)
+        if transition_neighborhood_jerk
+        else np.empty(0, np.float64)
+    )
     jerk_distribution = _distribution(joint_jerk)
     minimum_clearance = (
         float(clearance.min()) if clearance.size else None
@@ -974,6 +1010,15 @@ def _compute_challenge_metrics(
                 joint_acceleration
             ),
             "joint_jerk_rad_s3": jerk_distribution,
+            "transition_neighborhood_joint_jerk_rad_s3": (
+                _distribution(neighborhood_jerk)
+            ),
+            "transition_neighborhood_joint_jerk_output_frames": (
+                transition_neighborhood_jerk_frames
+            ),
+            "root_acceleration_m_s2": _distribution(
+                root_acceleration
+            ),
             "root_jerk_m_s3": _distribution(root_jerk),
             "foot_speed_m_s": _distribution(foot_speed),
             "minimum_foot_clearance_m": minimum_clearance,
@@ -1186,6 +1231,7 @@ def _challenge_run_hash(
     resolved_config_sha256: str,
     command_sha256: str,
     arrays: Mapping[str, np.ndarray],
+    events: Sequence[Mapping],
     exception: Mapping | None,
 ) -> str:
     digest = hashlib.sha256()
@@ -1206,6 +1252,14 @@ def _challenge_run_hash(
         digest.update(json.dumps(list(value.shape)).encode("ascii"))
         digest.update(b"\x00")
         digest.update(value.tobytes(order="C"))
+    for event in events:
+        deterministic_event = {
+            key: value
+            for key, value in dict(event).items()
+            if key not in _TIMING_ARRAYS
+        }
+        digest.update(b"\x00event\x00")
+        digest.update(_canonical_json_bytes(deterministic_event))
     if exception is not None:
         digest.update(b"\x00exception\x00")
         digest.update(_canonical_json_bytes(dict(exception)))
@@ -1297,6 +1351,7 @@ def _finalize_challenge_run(
         resolved_config_sha256,
         command_sha,
         arrays,
+        events,
         exception,
     )
     metrics["resolved_config_sha256"] = resolved_config_sha256
@@ -1324,6 +1379,29 @@ class _ChallengeScenarioFailure(Exception):
         self.partial_run = partial_run
 
 
+def _challenge_exception_evidence(
+    error: Exception,
+    *,
+    stage: str,
+    command_index: int | None,
+) -> dict:
+    if stage == "command":
+        if type(command_index) is not int or command_index < 0:
+            raise ContractError(
+                "command failure evidence requires a non-negative index"
+            )
+    elif command_index is not None:
+        raise ContractError(
+            "scenario-boundary failure evidence must not claim a command index"
+        )
+    return {
+        "type": type(error).__name__,
+        "message": str(error),
+        "command_index": command_index,
+        "stage": stage,
+    }
+
+
 def _run_challenge_scenario(
     resolved: ResolvedStairConfig,
     *,
@@ -1335,35 +1413,40 @@ def _run_challenge_scenario(
     velocity_weight: float,
 ) -> ChallengeScenarioRun:
     dt = float(challenge_config["dt"])
-    matcher = TorchMotionMatcher.from_folder(
-        resolved.dataset.root,
-        device=str(resolved_device),
-        config=matcher_config_from_resolved(challenge_config),
-        extension=resolved.measurement_extension,
-        reset_clip_path=challenge_config["reset_clip"],
-        emitted_window_validator=terrain_transition_validator_from_resolved(
-            resolved
-        ),
-    )
-    clip_index = {
-        clip.relative_path: index
-        for index, clip in enumerate(resolved.dataset.folder.clips)
-    }
-    rows = _challenge_rows()
-    events: list[dict] = []
-    measurement = resolved.measurement_extension
-    previous_clip_index = None
-    metadata = {
-        "dataset_manifest_sha256": resolved.dataset.manifest_sha256,
-        "motion_inventory_sha256": matcher.motion_inventory_sha256,
-        "device": str(resolved_device),
-        "torch_version": torch.__version__,
-        "cuda_device_name": (
-            torch.cuda.get_device_name(resolved_device)
-            if resolved_device.type == "cuda"
-            else None
-        ),
-    }
+    try:
+        matcher = TorchMotionMatcher.from_folder(
+            resolved.dataset.root,
+            device=str(resolved_device),
+            config=matcher_config_from_resolved(challenge_config),
+            extension=resolved.measurement_extension,
+            reset_clip_path=challenge_config["reset_clip"],
+            emitted_window_validator=(
+                terrain_transition_validator_from_resolved(resolved)
+            ),
+        )
+        clip_index = {
+            clip.relative_path: index
+            for index, clip in enumerate(resolved.dataset.folder.clips)
+        }
+        rows = _challenge_rows()
+        events: list[dict] = []
+        measurement = resolved.measurement_extension
+        previous_clip_index = None
+        metadata = {
+            "dataset_manifest_sha256": resolved.dataset.manifest_sha256,
+            "motion_inventory_sha256": matcher.motion_inventory_sha256,
+            "device": str(resolved_device),
+            "torch_version": torch.__version__,
+            "cuda_device_name": (
+                torch.cuda.get_device_name(resolved_device)
+                if resolved_device.type == "cuda"
+                else None
+            ),
+        }
+    except Exception as error:
+        error._challenge_stage = "scenario_setup"
+        error._challenge_command_index = None
+        raise
     for command_index, command in enumerate(scenario.commands):
         try:
             if command.reset_before or previous_clip_index is None:
@@ -1545,11 +1628,11 @@ def _run_challenge_scenario(
                 diagnostics.selected_clip_path
             ]
         except Exception as error:
-            exception = {
-                "type": type(error).__name__,
-                "message": str(error),
-                "command_index": command_index,
-            }
+            exception = _challenge_exception_evidence(
+                error,
+                stage="command",
+                command_index=command_index,
+            )
             partial = _finalize_challenge_run(
                 scenario=scenario,
                 rows=rows,
@@ -1564,17 +1647,22 @@ def _run_challenge_scenario(
             raise _ChallengeScenarioFailure(
                 error, command_index, partial
             ) from error
-    return _finalize_challenge_run(
-        scenario=scenario,
-        rows=rows,
-        events=events,
-        resolved_config_sha256=resolved_config_sha256,
-        dt=dt,
-        position_weight=position_weight,
-        velocity_weight=velocity_weight,
-        exception=None,
-        metadata=metadata,
-    )
+    try:
+        return _finalize_challenge_run(
+            scenario=scenario,
+            rows=rows,
+            events=events,
+            resolved_config_sha256=resolved_config_sha256,
+            dt=dt,
+            position_weight=position_weight,
+            velocity_weight=velocity_weight,
+            exception=None,
+            metadata=metadata,
+        )
+    except Exception as error:
+        error._challenge_stage = "scenario_finalize"
+        error._challenge_command_index = None
+        raise
 
 
 def run_challenge_matrix(
@@ -1646,13 +1734,17 @@ def run_challenge_matrix(
         except _ChallengeScenarioFailure as error:
             run = error.partial_run
         except Exception as error:
-            exception = {
-                "type": type(error).__name__,
-                "message": str(error),
-                "command_index": int(
-                    getattr(error, "_challenge_command_index", 0)
+            exception = _challenge_exception_evidence(
+                error,
+                stage=getattr(
+                    error,
+                    "_challenge_stage",
+                    "scenario_boundary_unknown",
                 ),
-            }
+                command_index=getattr(
+                    error, "_challenge_command_index", None
+                ),
+            )
             run = _finalize_challenge_run(
                 scenario=scenario,
                 rows=_challenge_rows(),
@@ -2144,6 +2236,21 @@ def _read_canonical_json(path: Path, label: str) -> dict:
     return value
 
 
+def _require_zero_baseline_weights(
+    position_weight: object,
+    velocity_weight: object,
+    *,
+    label: str,
+) -> None:
+    try:
+        position = _validate_weight(position_weight, "position weight")
+        velocity = _validate_weight(velocity_weight, "velocity weight")
+    except ContractError as error:
+        raise ContractError(f"{label} baseline weights are invalid") from error
+    if position != 0.0 or velocity != 0.0:
+        raise ContractError(f"{label} baseline weights must be exactly zero")
+
+
 def _load_authenticated_challenge_baseline(
     baseline_root: str | Path,
 ) -> dict[str, dict]:
@@ -2155,11 +2262,26 @@ def _load_authenticated_challenge_baseline(
     )
     if matrix.get("baseline") is not True:
         raise ContractError("challenge baseline artifact is not a baseline")
+    _require_zero_baseline_weights(
+        matrix.get("position_weight"),
+        matrix.get("velocity_weight"),
+        label="top-level challenge",
+    )
     if tuple(matrix.get("scenario_names", ())) != _CHALLENGE_NAMES:
         raise ContractError("challenge baseline scenario names differ")
     resolved_config_path = root / "resolved_config.json"
     resolved_config = _read_canonical_json(
         resolved_config_path, "challenge baseline resolved config"
+    )
+    resolved_matcher = resolved_config.get("matcher")
+    if not isinstance(resolved_matcher, dict):
+        raise ContractError(
+            "challenge baseline resolved matcher config is invalid"
+        )
+    _require_zero_baseline_weights(
+        resolved_matcher.get("transition_joint_position_weight"),
+        resolved_matcher.get("transition_joint_velocity_weight"),
+        label="resolved challenge",
     )
     if (
         _file_sha256(resolved_config_path)
@@ -2275,6 +2397,11 @@ def _load_authenticated_challenge_baseline(
             raise ContractError(
                 f"challenge baseline result identity failed: {name}"
             )
+        _require_zero_baseline_weights(
+            metrics.get("position_weight"),
+            metrics.get("velocity_weight"),
+            label=f"challenge scenario {name}",
+        )
         metrics_by_name[name] = metrics
     return _validated_challenge_metric_map(
         metrics_by_name, label="baseline"
@@ -2314,6 +2441,27 @@ def save_challenge_matrix(
         else _load_authenticated_challenge_baseline(baseline_root)
     )
     if baseline_metrics is None:
+        _require_zero_baseline_weights(
+            matrix.metrics.get("position_weight"),
+            matrix.metrics.get("velocity_weight"),
+            label="top-level challenge",
+        )
+        resolved_matcher = matrix.resolved_config.get("matcher")
+        if not isinstance(resolved_matcher, Mapping):
+            raise ContractError(
+                "challenge baseline resolved matcher config is invalid"
+            )
+        _require_zero_baseline_weights(
+            resolved_matcher.get("transition_joint_position_weight"),
+            resolved_matcher.get("transition_joint_velocity_weight"),
+            label="resolved challenge",
+        )
+        for name in _CHALLENGE_NAMES:
+            _require_zero_baseline_weights(
+                current_metrics[name].get("position_weight"),
+                current_metrics[name].get("velocity_weight"),
+                label=f"challenge scenario {name}",
+            )
         verdict = {
             "baseline": True,
             "matrix_pass": None,
