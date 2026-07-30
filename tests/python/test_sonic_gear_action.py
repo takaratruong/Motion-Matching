@@ -3,12 +3,25 @@ import unittest
 import numpy as np
 
 from mm_sonic.gear_action import (
+    isaaclab_to_mujoco_joint_vector,
     policy_action_lowcmd_target_bounds,
     policy_action_to_lowcmd_target,
 )
 
 
 class PolicyActionToLowCmdTargetTests(unittest.TestCase):
+    def test_isaaclab_joint_vector_uses_frozen_mujoco_permutation(self):
+        source = np.arange(29, dtype=np.float32)
+        permutation = np.asarray(
+            [
+                0, 3, 6, 9, 13, 17, 1, 4, 7, 10, 14, 18, 2, 5, 8,
+                11, 15, 19, 21, 23, 25, 27, 12, 16, 20, 22, 24, 26, 28,
+            ]
+        )
+        actual = isaaclab_to_mujoco_joint_vector(source)
+        self.assertEqual(actual.dtype, np.float64)
+        np.testing.assert_array_equal(actual, source[permutation])
+
     def test_zero_action_recovers_exact_float32_default_pose(self):
         expected = np.asarray(
             [
