@@ -1,4 +1,6 @@
+import hashlib
 import inspect
+import json
 import shutil
 import tempfile
 import unittest
@@ -108,6 +110,42 @@ class TerrainViewerTests(unittest.TestCase):
         archive.write_bytes(payload)
         with self.assertRaisesRegex(Exception, "hash"):
             load_saved_rollout(corrupt)
+
+    def test_loader_defaults_missing_safety_override_for_v1_rollout(self):
+        legacy = self.root / "legacy-without-safety-override"
+        shutil.copytree(self.run_root, legacy)
+        archive_path = legacy / "rollout.npz"
+        with np.load(archive_path, allow_pickle=False) as archive:
+            arrays = {
+                name: np.array(archive[name], copy=True)
+                for name in archive.files
+                if name != "terrain_safety_override"
+            }
+        np.savez(archive_path, **arrays)
+        metrics_path = legacy / "metrics.json"
+        metrics = json.loads(metrics_path.read_text("utf-8"))
+        metrics["rollout_npz_sha256"] = hashlib.sha256(
+            archive_path.read_bytes()
+        ).hexdigest()
+        metrics_path.write_text(
+            json.dumps(
+                metrics,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        saved = load_saved_rollout(legacy)
+
+        self.assertIn("terrain_safety_override", saved.arrays)
+        self.assertEqual(
+            saved.arrays["terrain_safety_override"].dtype,
+            np.dtype(np.bool_),
+        )
+        self.assertFalse(saved.arrays["terrain_safety_override"].any())
 
     def test_playback_controls_only_move_through_saved_frames(self):
         playback = PlaybackController(frame_count=3)

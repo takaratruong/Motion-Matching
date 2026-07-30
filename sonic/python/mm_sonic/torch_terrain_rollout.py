@@ -481,7 +481,7 @@ def run_stair_rollout(
         "searched": [],
         "transitioned": [],
         "transition_rejected": [],
-        "hysteresis_overridden": [],
+        "terrain_safety_override": [],
         "motion_feature_cost": [],
         "terrain_feature_cost": [],
         "total_feature_cost": [],
@@ -584,8 +584,8 @@ def run_stair_rollout(
         rows["transition_rejected"].append(
             np.bool_(diagnostics.transition_rejected)
         )
-        rows["hysteresis_overridden"].append(
-            np.bool_(diagnostics.hysteresis_overridden)
+        rows["terrain_safety_override"].append(
+            np.bool_(diagnostics.terrain_safety_override)
         )
         rows["motion_feature_cost"].append(
             np.float32(diagnostics.motion_feature_cost)
@@ -622,7 +622,7 @@ def run_stair_rollout(
             diagnostics.searched
             or diagnostics.transitioned
             or diagnostics.transition_rejected
-            or diagnostics.hysteresis_overridden
+            or diagnostics.terrain_safety_override
         ):
             events.append(
                 {
@@ -635,8 +635,8 @@ def run_stair_rollout(
                     "transition_rejected": (
                         diagnostics.transition_rejected
                     ),
-                    "hysteresis_overridden": (
-                        diagnostics.hysteresis_overridden
+                    "terrain_safety_override": (
+                        diagnostics.terrain_safety_override
                     ),
                     "motion_feature_cost": diagnostics.motion_feature_cost,
                     "terrain_feature_cost": diagnostics.extension_feature_cost,
@@ -691,8 +691,8 @@ def run_stair_rollout(
         "rejected_transition_count": int(
             arrays["transition_rejected"].sum()
         ),
-        "hysteresis_override_count": int(
-            arrays["hysteresis_overridden"].sum()
+        "terrain_safety_override_count": int(
+            arrays["terrain_safety_override"].sum()
         ),
         "first_stair_selection_progress_m": first_selection_progress,
         "maximum_progress_m": maximum_progress,

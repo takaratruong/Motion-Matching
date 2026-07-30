@@ -86,7 +86,12 @@ def active_transition_penalty(
         raise ContractError(
             "transition_settle_penalty must be finite and non-negative"
         )
-    if duration == 0.0 or magnitude == 0.0 or age >= duration:
+    if (
+        duration == 0.0
+        or magnitude == 0.0
+        or age >= duration
+        or math.isclose(age, duration, rel_tol=0.0, abs_tol=1e-12)
+    ):
         return 0.0
     return magnitude * (1.0 - age / duration)
 
@@ -520,7 +525,7 @@ class MotionMatchDiagnostics:
     searched: bool
     transitioned: bool
     transition_rejected: bool
-    hysteresis_overridden: bool
+    terrain_safety_override: bool
     force_search_reason: str | None
     search_time_ns: int | None
     step_time_ns: int
@@ -884,7 +889,7 @@ class TorchMotionMatcher:
         frame_index: int,
         decision: SearchDecision,
         transition_rejected: bool,
-        hysteresis_overridden: bool,
+        terrain_safety_override: bool,
         force_reason: str | None,
         search_time_ns: int | None,
         step_start_ns: int,
@@ -910,7 +915,7 @@ class TorchMotionMatcher:
             searched=decision.searched,
             transitioned=decision.transitioned,
             transition_rejected=transition_rejected,
-            hysteresis_overridden=hysteresis_overridden,
+            terrain_safety_override=terrain_safety_override,
             force_search_reason=force_reason,
             search_time_ns=search_time_ns,
             step_time_ns=time.perf_counter_ns() - step_start_ns,
@@ -979,7 +984,7 @@ class TorchMotionMatcher:
             frame_index=frame_index,
             decision=decision,
             transition_rejected=False,
-            hysteresis_overridden=False,
+            terrain_safety_override=False,
             force_reason=None,
             search_time_ns=None,
             step_start_ns=step_start,
@@ -1076,7 +1081,7 @@ class TorchMotionMatcher:
             state, shaped, decision.selected_row, successor
         )
         transition_rejected = False
-        hysteresis_overridden = False
+        terrain_safety_override = False
         validator = self._emitted_window_validator
         if validator is not None:
             accepted = validator(candidate.dense_body_position.clone())
@@ -1086,49 +1091,64 @@ class TorchMotionMatcher:
                 )
             if not accepted:
                 if not candidate.transitioned:
-                    if settle_penalty <= 0.0:
+                    if successor is None:
                         raise ContractError(
-                            "emitted-window incumbent is unsafe"
+                            "unsafe incumbent has no source row"
                         )
-                    retry_start = time.perf_counter_ns()
-                    retry_decision = select_exact_candidate(
+                    incumbent_cost = decision.incumbent_cost
+                    rescue_start = time.perf_counter_ns()
+                    rescue_decision = select_exact_candidate(
                         self.database,
                         query,
                         current_clip_index=state.clip_index,
                         current_frame_index=state.frame_index,
-                        incumbent_row=successor,
-                        search=search,
+                        incumbent_row=None,
+                        search=True,
                         config=self.config,
                         additional_transition_penalty=0.0,
                     )
-                    if search_time is not None:
-                        search_time += (
-                            time.perf_counter_ns() - retry_start
-                        )
-                    if not retry_decision.transitioned:
+                    rescue_time = time.perf_counter_ns() - rescue_start
+                    search_time = (
+                        rescue_time
+                        if search_time is None
+                        else search_time + rescue_time
+                    )
+                    if not rescue_decision.transitioned:
                         raise ContractError(
-                            "hysteresis retry retained unsafe incumbent"
+                            "terrain rescue did not select transition"
                         )
-                    retry_candidate = self._compose_candidate(
+                    rescue_candidate = self._compose_candidate(
                         state,
                         shaped,
-                        retry_decision.selected_row,
+                        rescue_decision.selected_row,
                         successor,
                     )
-                    retry_accepted = validator(
-                        retry_candidate.dense_body_position.clone()
+                    rescue_accepted = validator(
+                        rescue_candidate.dense_body_position.clone()
                     )
-                    if type(retry_accepted) is not bool:
+                    if type(rescue_accepted) is not bool:
                         raise ContractError(
                             "emitted-window validator must return exact bool"
                         )
-                    if not retry_accepted:
+                    if not rescue_accepted:
                         raise ContractError(
-                            "hysteresis retry transition is unsafe"
+                            "terrain rescue transition is unsafe"
                         )
-                    decision = retry_decision
-                    candidate = retry_candidate
-                    hysteresis_overridden = True
+                    decision = SearchDecision(
+                        selected_row=rescue_decision.selected_row,
+                        incumbent_row=successor,
+                        incumbent_cost=incumbent_cost,
+                        selected_feature_cost=(
+                            rescue_decision.selected_feature_cost
+                        ),
+                        selected_total_cost=(
+                            rescue_decision.selected_total_cost
+                        ),
+                        searched=True,
+                        transitioned=True,
+                    )
+                    candidate = rescue_candidate
+                    terrain_safety_override = True
                 else:
                     if successor is None:
                         raise ContractError(
@@ -1185,7 +1205,7 @@ class TorchMotionMatcher:
             frame_index=candidate.frame_index,
             decision=decision,
             transition_rejected=transition_rejected,
-            hysteresis_overridden=hysteresis_overridden,
+            terrain_safety_override=terrain_safety_override,
             force_reason=force_reason,
             search_time_ns=search_time,
             step_start_ns=step_start,

@@ -259,6 +259,12 @@ class ExactSearchTests(unittest.TestCase):
             ),
             0.0,
         )
+        accumulated_age = sum(0.02 for _ in range(10))
+        self.assertLess(accumulated_age, 0.20)
+        self.assertEqual(
+            active_transition_penalty(accumulated_age, cfg),
+            0.0,
+        )
         self.assertEqual(
             active_transition_penalty(
                 0.0,

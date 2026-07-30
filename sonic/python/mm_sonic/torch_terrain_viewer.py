@@ -135,6 +135,23 @@ def load_saved_rollout(run_root: str | Path) -> SavedTerrainRollout:
     frames = len(arrays["time_s"])
     if frames <= 0:
         raise ContractError("saved rollout must contain at least one frame")
+    if "terrain_safety_override" not in arrays:
+        legacy_override = arrays.get("hysteresis_overridden")
+        if legacy_override is None:
+            arrays["terrain_safety_override"] = np.zeros(
+                frames, dtype=np.bool_
+            )
+        else:
+            if (
+                legacy_override.shape != (frames,)
+                or legacy_override.dtype != np.dtype(np.bool_)
+            ):
+                raise ContractError(
+                    "saved rollout legacy hysteresis override is invalid"
+                )
+            arrays["terrain_safety_override"] = np.array(
+                legacy_override, copy=True
+            )
     required_shapes = {
         "selected_clip_index": (frames,),
         "selected_frame": (frames,),
@@ -142,7 +159,7 @@ def load_saved_rollout(run_root: str | Path) -> SavedTerrainRollout:
         "terrain_feature_cost": (frames,),
         "total_feature_cost": (frames,),
         "selected_total_cost": (frames,),
-        "hysteresis_overridden": (frames,),
+        "terrain_safety_override": (frames,),
         "step_time_ns": (frames,),
         "joint_position": (frames, 29),
         "root_position_world": (frames, 3),
