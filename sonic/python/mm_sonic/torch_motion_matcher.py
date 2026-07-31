@@ -1574,7 +1574,14 @@ class TorchMotionMatcher:
         if (
             policy is not None
             and contact_entry_valid
-            and (placement is not None or state.commitment is not None)
+            and (
+                placement is not None
+                or state.commitment is not None
+                or (
+                    not transitioned
+                    and clip_index in policy.index.terrain_clip_indices
+                )
+            )
         ):
             feet = torch.tensor(
                 policy.emitted_foot_positions(

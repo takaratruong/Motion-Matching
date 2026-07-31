@@ -201,6 +201,19 @@ class TorchMotionMatcherTests(unittest.TestCase):
                 released = matcher.step((-0.4, 0.0), math.pi)
             self.assertFalse(released.diagnostics.segment_committed)
             resumed_search.assert_called_once()
+            released_feet = (
+                matcher._contact_segment_policy.emitted_foot_positions(
+                    released.dense_joint_position_window,
+                    released.dense_root_position_window,
+                    released.dense_root_orientation_window_wxyz,
+                )
+            )
+            np.testing.assert_allclose(
+                released.dense_feature_body_position_window[:, 1:].numpy(),
+                released_feet,
+                rtol=0.0,
+                atol=1e-7,
+            )
 
     def test_failed_full_segment_fk_validation_rejects_every_entry(self):
         arrays = build_varying_takara_arrays(frames=100)
