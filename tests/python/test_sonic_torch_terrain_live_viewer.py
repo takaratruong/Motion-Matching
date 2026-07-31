@@ -212,8 +212,15 @@ class LiveMujocoSceneTests(unittest.TestCase):
             inspect.getsource(live_module.run_live_viewer),
         )
         help_text = build_live_viewer_argument_parser().format_help()
-        for option in ("--dataset", "--config", "--g1-xml", "--device"):
+        for option in (
+            "--dataset", "--config", "--g1-xml", "--device",
+            "--contact-segments",
+        ):
             self.assertIn(option, help_text)
+        self.assertIn(
+            "contact_segment_policy",
+            inspect.getsource(live_module.run_live_viewer),
+        )
 
 
 if __name__ == "__main__":

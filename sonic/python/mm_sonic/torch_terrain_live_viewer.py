@@ -457,6 +457,7 @@ def run_live_viewer(
     config: str | Path,
     g1_xml: str | Path,
     device: str,
+    contact_segments: bool = False,
 ) -> None:
     """Run the dense 50 Hz matcher and display each committed state."""
 
@@ -465,14 +466,43 @@ def run_live_viewer(
         import mujoco.viewer
     except ImportError as error:
         raise ContractError("live terrain viewer requires mujoco viewer") from error
-    raw = load_experiment_config(config)
-    resolved = resolve_stair_config(dataset, raw, device=device)
+    if contact_segments:
+        from .torch_contact_segment_rollout import (
+            load_contact_segment_config,
+            resolve_contact_segment_config,
+        )
+
+        raw = load_contact_segment_config(config)
+        resolved = resolve_contact_segment_config(
+            dataset, raw, device=device
+        )
+    else:
+        raw = load_experiment_config(config)
+        resolved = resolve_stair_config(dataset, raw, device=device)
     descriptor = resolved.resolved_config["conditions"]["dense"]
     if (
         descriptor["encoder"] != "dense"
         or float(descriptor["weight"]) <= 0.0
     ):
         raise ContractError("live terrain viewer requires the dense condition")
+    contact_segment_policy = None
+    if contact_segments:
+        from .torch_contact_segments import (
+            ContactSegmentIndex,
+            TerrainContactSegmentPolicy,
+        )
+        from .torch_g1_fk import MujocoG1FootKinematics
+
+        bounds = resolved.resolved_config["contact_segments"]
+        contact_segment_policy = TerrainContactSegmentPolicy(
+            index=ContactSegmentIndex.from_dataset(
+                resolved.dataset,
+                minimum_frames=int(bounds["minimum_frames"]),
+                maximum_frames=int(bounds["maximum_frames"]),
+            ),
+            extension=resolved.measurement_extension,
+            foot_kinematics=MujocoG1FootKinematics(g1_xml),
+        )
     matcher = TorchMotionMatcher.from_folder(
         resolved.dataset.root,
         device=str(resolved.device),
@@ -482,6 +512,7 @@ def run_live_viewer(
         emitted_window_validator=(
             terrain_transition_validator_from_resolved(resolved)
         ),
+        contact_segment_policy=contact_segment_policy,
     )
     model, data = build_kinematic_scene(g1_xml, resolved)
     result = matcher.reset()
@@ -587,6 +618,11 @@ def build_live_viewer_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", required=True)
     parser.add_argument("--g1-xml", required=True)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--contact-segments",
+        action="store_true",
+        help="Use committed authoritative-FK terrain contact segments.",
+    )
     return parser
 
 
@@ -597,6 +633,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         config=args.config,
         g1_xml=args.g1_xml,
         device=args.device,
+        contact_segments=args.contact_segments,
     )
     return 0
 
