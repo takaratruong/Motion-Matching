@@ -17,8 +17,13 @@ import torch
 from .joints import ContractError
 from .torch_g1_fk import target_state_qpos
 from .operator_x11 import KEYSYMS, X11KeyStateProvider
-from .torch_motion_matcher import MotionMatchResult, TorchMotionMatcher
-from .torch_terrain_features import DENSE_FORWARD_M, DENSE_LATERAL_M
+from .torch_motion_features import CommandTrajectory
+from .torch_motion_matcher import (
+    MotionMatchResult,
+    TorchMotionMatcher,
+    predict_command_trajectory,
+)
+from .torch_terrain_features import DENSE_FORWARD_M, dense_path_points
 from .torch_terrain_rollout import (
     ResolvedStairConfig,
     load_experiment_config,
@@ -364,9 +369,11 @@ def apply_kinematic_state(
 
 
 def dense_patch_positions(
-    result: MotionMatchResult, measurement
+    result: MotionMatchResult,
+    measurement,
+    trajectory: CommandTrajectory,
 ) -> np.ndarray:
-    """Return the 91 current dense height samples in matcher coordinates."""
+    """Return the exact 91 path-conditioned samples used by terrain search."""
 
     root = result.root_position_world
     quaternion = result.root_orientation_world_wxyz
@@ -377,27 +384,18 @@ def dense_patch_positions(
         or tuple(quaternion.shape) != (4,)
     ):
         raise ContractError("dense patch requires a valid matcher result")
-    device = root.device
-    dtype = root.dtype
     w, x, y, z = quaternion
     yaw = torch.atan2(
         2.0 * (w * z + x * y),
         1.0 - 2.0 * (y * y + z * z),
     )
-    forward, lateral = torch.meshgrid(
-        torch.tensor(DENSE_FORWARD_M, device=device, dtype=dtype),
-        torch.tensor(DENSE_LATERAL_M, device=device, dtype=dtype),
-        indexing="ij",
+    root_facing = torch.stack((torch.cos(yaw), torch.sin(yaw)))
+    matcher_xy = dense_path_points(
+        root[:2],
+        root_facing,
+        trajectory.position_world_xy,
+        trajectory.facing_world_xy,
     )
-    cosine = torch.cos(yaw)
-    sine = torch.sin(yaw)
-    matcher_xy = torch.stack(
-        (
-            cosine * forward - sine * lateral,
-            sine * forward + cosine * lateral,
-        ),
-        dim=-1,
-    ).reshape(-1, 2) + root[:2]
     scene_xy = measurement.alignment.matcher_to_scene_xy(matcher_xy)
     height = measurement.query_grid.sample_xy(scene_xy)
     points = torch.cat((matcher_xy, height[:, None]), dim=1)
@@ -512,10 +510,11 @@ def run_live_viewer(
                 bounds["flat_support_transition_cost_weight"]
             ),
         )
+    matcher_config = matcher_config_from_resolved(resolved.resolved_config)
     matcher = TorchMotionMatcher.from_folder(
         resolved.dataset.root,
         device=str(resolved.device),
-        config=matcher_config_from_resolved(resolved.resolved_config),
+        config=matcher_config,
         extension=resolved.measurement_extension,
         reset_clip_path=resolved.resolved_config["reset_clip"],
         emitted_window_validator=(
@@ -542,6 +541,21 @@ def run_live_viewer(
         speed_mps=speed,
         previous_heading_rad=heading,
     )
+    shaped_velocity = torch.zeros(
+        2, dtype=result.root_position_world.dtype, device=resolved.device
+    )
+    shaped_heading = torch.zeros(
+        (), dtype=result.root_position_world.dtype, device=resolved.device
+    )
+    marker_result = result
+    marker_trajectory = predict_command_trajectory(
+        result.root_position_world[:2],
+        shaped_velocity,
+        shaped_heading,
+        shaped_velocity,
+        shaped_heading,
+        config=matcher_config,
+    ).trajectory
     provider: X11KeyStateProvider | None = None
     latch = ControlEdgeLatch()
     try:
@@ -575,12 +589,44 @@ def run_live_viewer(
                 )
                 if edges.reset_requested:
                     result = matcher.reset()
+                    shaped_velocity.zero_()
+                    shaped_heading.zero_()
                     heading = float(
                         resolved.resolved_config[
                             "command_heading_matcher_yaw"
                         ]
                     )
-                elif command.advance_matcher:
+                    marker_result = result
+                    marker_trajectory = predict_command_trajectory(
+                        result.root_position_world[:2],
+                        shaped_velocity,
+                        shaped_heading,
+                        shaped_velocity,
+                        shaped_heading,
+                        config=matcher_config,
+                    ).trajectory
+                else:
+                    marker_result = result
+                    requested_velocity = torch.tensor(
+                        command.velocity_world_xy,
+                        dtype=result.root_position_world.dtype,
+                        device=resolved.device,
+                    )
+                    requested_heading = torch.tensor(
+                        command.heading_world_yaw,
+                        dtype=result.root_position_world.dtype,
+                        device=resolved.device,
+                    )
+                    shaped = predict_command_trajectory(
+                        result.root_position_world[:2],
+                        shaped_velocity,
+                        shaped_heading,
+                        requested_velocity,
+                        requested_heading,
+                        config=matcher_config,
+                    )
+                    marker_trajectory = shaped.trajectory
+                if not edges.reset_requested and command.advance_matcher:
                     heading = command.heading_world_yaw
                     prepared = matcher.prepare_step(
                         (
@@ -591,9 +637,13 @@ def run_live_viewer(
                         dt=_DT_S,
                     )
                     result = matcher.commit(prepared)
+                    shaped_velocity = shaped.velocity_world_xy.clone()
+                    shaped_heading = shaped.heading_world_yaw.clone()
                 qpos = matcher_result_qpos(result)
                 patch = dense_patch_positions(
-                    result, resolved.measurement_extension
+                    marker_result,
+                    resolved.measurement_extension,
+                    marker_trajectory,
                 )
                 with viewer.lock():
                     apply_kinematic_state(mujoco, model, data, qpos)

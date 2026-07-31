@@ -10,14 +10,17 @@ import torch
 
 import mm_sonic.torch_terrain_live_viewer as live_module
 from mm_sonic.joints import PINNED_TARGET_TO_SOURCE_PERMUTATION
+from mm_sonic.torch_motion_features import CommandTrajectory
 from mm_sonic.torch_terrain_live_viewer import (
     ControlEdgeLatch,
     apply_kinematic_state,
     build_kinematic_scene,
     build_live_viewer_argument_parser,
     command_from_keys,
+    dense_patch_positions,
     matcher_result_qpos,
 )
+from mm_sonic.torch_terrain_features import TerrainSceneAlignment
 from mm_sonic.torch_terrain_rollout import (
     ResolvedStairConfig,
 )
@@ -221,6 +224,71 @@ class LiveMujocoSceneTests(unittest.TestCase):
             "contact_segment_policy",
             inspect.getsource(live_module.run_live_viewer),
         )
+        self.assertIn(
+            "predict_command_trajectory(",
+            inspect.getsource(live_module.run_live_viewer),
+        )
+        self.assertIn(
+            "marker_trajectory",
+            inspect.getsource(live_module.run_live_viewer),
+        )
+
+    def test_dense_patch_requires_the_trajectory_used_by_search(self):
+        self.assertEqual(
+            tuple(inspect.signature(dense_patch_positions).parameters),
+            ("result", "measurement", "trajectory"),
+        )
+
+    def test_dense_patch_markers_follow_commanded_path(self):
+        class Grid:
+            @staticmethod
+            def sample_xy(points):
+                return 0.1 * points[..., 0] + 0.2 * points[..., 1]
+
+        measurement = SimpleNamespace(
+            alignment=TerrainSceneAlignment(
+                translation_scene_xy=torch.zeros(2),
+                yaw_scene_from_matcher=torch.zeros(()),
+            ),
+            query_grid=Grid(),
+        )
+        result = SimpleNamespace(
+            root_position_world=torch.tensor([0.0, 0.0, 0.8]),
+            root_orientation_world_wxyz=torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        )
+        straight = CommandTrajectory(
+            position_world_xy=torch.tensor(
+                [[0.3, 0.0], [0.6, 0.0], [0.9, 0.0]]
+            ),
+            facing_world_xy=torch.tensor(
+                [[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]
+            ),
+        )
+        lateral = CommandTrajectory(
+            position_world_xy=torch.tensor(
+                [[0.0, 0.3], [0.0, 0.6], [0.0, 0.9]]
+            ),
+            facing_world_xy=torch.tensor(
+                [[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]]
+            ),
+        )
+
+        straight_points = dense_patch_positions(
+            result, measurement, straight
+        )
+        lateral_points = dense_patch_positions(result, measurement, lateral)
+
+        np.testing.assert_allclose(
+            straight_points.reshape(13, 7, 3)[:, 3, :2],
+            np.stack((np.asarray(live_module.DENSE_FORWARD_M), np.zeros(13)), axis=1),
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            lateral_points.reshape(13, 7, 3)[:, 3, :2],
+            np.stack((np.zeros(13), np.asarray(live_module.DENSE_FORWARD_M)), axis=1),
+            atol=1e-6,
+        )
+        self.assertFalse(np.array_equal(straight_points, lateral_points))
 
 
 if __name__ == "__main__":
