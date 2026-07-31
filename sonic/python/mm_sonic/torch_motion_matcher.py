@@ -45,6 +45,7 @@ LOOP_ROOT_PROGRESS_M = 0.05
 LOOP_REVISIT_PENALTY = 1000.0
 RECENT_CROSS_CLIP_REVISIT_PENALTY = 25.0
 CONTIGUOUS_SEGMENT_COMMAND_ALIGNMENT_MIN = 0.5
+CONTACT_COMMITMENT_HEADING_ALIGNMENT_MIN = math.cos(math.radians(15.0))
 
 
 @dataclass(frozen=True)
@@ -1253,10 +1254,24 @@ class TorchMotionMatcher:
         command = self._command_travel_direction(shaped)
         velocity = state.root_linear_velocity[:2]
         speed = torch.linalg.vector_norm(velocity)
-        if float(speed.item()) <= 1e-6:
-            return True
-        return float(torch.dot(velocity / speed, command).item()) < (
-            CONTIGUOUS_SEGMENT_COMMAND_ALIGNMENT_MIN
+        travel_deviated = (
+            float(speed.item()) <= 1e-6
+            or float(torch.dot(velocity / speed, command).item())
+            < CONTIGUOUS_SEGMENT_COMMAND_ALIGNMENT_MIN
+        )
+        root_yaw = _quat_yaw(state.root_quaternion)
+        root_facing = torch.stack((torch.cos(root_yaw), torch.sin(root_yaw)))
+        heading_deviated = float(
+            torch.dot(root_facing, shaped.trajectory.facing_world_xy[-1]).item()
+        ) < CONTACT_COMMITMENT_HEADING_ALIGNMENT_MIN
+        return travel_deviated or heading_deviated
+
+    def _contact_commitment_should_interrupt(
+        self, state: _MatcherState, shaped: ShapedCommand
+    ) -> bool:
+        return (
+            state.commitment is not None
+            and self._terrain_command_deviated(state, shaped)
         )
 
     @staticmethod
@@ -2551,8 +2566,7 @@ class TorchMotionMatcher:
         )
         interrupting_commitment = (
             active_commitment
-            and shaped.force_search
-            and self._terrain_command_deviated(state, shaped)
+            and self._contact_commitment_should_interrupt(state, shaped)
         )
         committed_playback = active_commitment and not interrupting_commitment
         settle_penalty = active_transition_penalty(

@@ -457,6 +457,66 @@ class TorchMotionMatcherTests(unittest.TestCase):
         self.assertEqual(reversed_result.diagnostics.selected_frame, 30)
         self.assertEqual(reversed_result.diagnostics.segment_start_frame, 30)
 
+    def test_active_commitment_rechecks_divergence_after_force_pulse(self):
+        arrays = build_varying_takara_arrays(frames=120)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(root, device="cpu")
+            matcher.reset()
+            _install_contact_policy(matcher, start=20, end=30)
+            state = replace(
+                matcher._state,
+                commitment=SegmentCommitment(0, 20, 30, 0, 0.0),
+                root_linear_velocity=torch.tensor((0.4, 0.0, 0.0)),
+            )
+            shaped = predict_command_trajectory(
+                state.root_position[:2],
+                torch.tensor((0.0, 0.4)),
+                state.shaped_heading,
+                torch.tensor((0.0, 0.4)),
+                torch.tensor(0.0),
+                has_valid_successor=True,
+                config=matcher.config,
+            )
+            shaped = replace(shaped, force_search=False)
+
+            interrupt = matcher._contact_commitment_should_interrupt(
+                state, shaped
+            )
+
+        self.assertTrue(interrupt)
+
+    def test_active_commitment_interrupts_for_heading_error_over_15_degrees(self):
+        arrays = build_varying_takara_arrays(frames=120)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(root, device="cpu")
+            matcher.reset()
+            _install_contact_policy(matcher, start=20, end=30)
+            state = replace(
+                matcher._state,
+                commitment=SegmentCommitment(0, 20, 30, 0, 0.0),
+                root_linear_velocity=torch.tensor((0.4, 0.0, 0.0)),
+            )
+            shaped = predict_command_trajectory(
+                state.root_position[:2],
+                torch.tensor((0.4, 0.0)),
+                torch.tensor(0.0),
+                torch.tensor((0.4, 0.0)),
+                torch.tensor(math.radians(45.0)),
+                has_valid_successor=True,
+                config=matcher.config,
+            )
+            shaped = replace(shaped, force_search=False)
+
+            interrupt = matcher._contact_commitment_should_interrupt(
+                state, shaped
+            )
+
+        self.assertTrue(interrupt)
+
     def test_validated_contact_commitment_does_not_revalidate_past_its_end(self):
         arrays = build_varying_takara_arrays(frames=120)
         validator = _ScriptedWindowValidator([True])
