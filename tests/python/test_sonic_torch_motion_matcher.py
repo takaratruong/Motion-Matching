@@ -165,6 +165,120 @@ def _install_contact_policy(
 
 
 class TorchMotionMatcherTests(unittest.TestCase):
+    def test_terrain_candidate_yaw_follows_commanded_facing(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(root, device="cpu")
+            matcher.reset()
+            policy = _install_contact_policy(matcher, start=20, end=30)
+            policy.dataset.clip_alignments[0].yaw_scene_from_matcher.fill_(0.8)
+            policy.extension.alignment.yaw_scene_from_matcher.fill_(-0.4)
+            state = matcher._state
+            shaped = predict_command_trajectory(
+                state.root_position[:2],
+                state.shaped_velocity,
+                state.shaped_heading,
+                torch.tensor((0.0, 0.4)),
+                torch.tensor(1.1),
+                has_valid_successor=True,
+                config=matcher.config,
+            )
+            source_yaw = math.atan2(
+                2.0
+                * float(
+                    matcher._clips[0].body_quaternion[20, 0, 0]
+                    * matcher._clips[0].body_quaternion[20, 0, 3]
+                    + matcher._clips[0].body_quaternion[20, 0, 1]
+                    * matcher._clips[0].body_quaternion[20, 0, 2]
+                ),
+                1.0
+                - 2.0
+                * float(
+                    matcher._clips[0].body_quaternion[20, 0, 2].square()
+                    + matcher._clips[0].body_quaternion[20, 0, 3].square()
+                ),
+            )
+
+            yaw = matcher._candidate_yaw_offset(0, 20, shaped)
+
+        expected = math.atan2(
+            math.sin(float(shaped.heading_world_yaw) - source_yaw),
+            math.cos(float(shaped.heading_world_yaw) - source_yaw),
+        )
+        self.assertAlmostEqual(float(yaw), expected, places=6)
+        self.assertNotAlmostEqual(
+            float(yaw), float(policy.registered_yaw_offset(0)), places=3
+        )
+
+    def test_segment_command_compatibility_uses_whole_segment_travel(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(root, device="cpu")
+            matcher.reset()
+            _install_contact_policy(matcher, start=20, end=30)
+            root_body = matcher.folder.layout.root_body_index
+            matcher._clips[0].body_linear_velocity[
+                20, root_body, :2
+            ] = torch.tensor((1.0, 0.0))
+            matcher._clips[0].body_position[
+                20:30, root_body, :2
+            ] = torch.stack(
+                (
+                    torch.zeros(10),
+                    torch.linspace(0.0, 1.0, 10),
+                ),
+                dim=1,
+            )
+            state = matcher._state
+            shaped = predict_command_trajectory(
+                state.root_position[:2],
+                state.shaped_velocity,
+                state.shaped_heading,
+                torch.tensor((0.0, 0.4)),
+                torch.tensor(0.0),
+                has_valid_successor=True,
+                config=matcher.config,
+            )
+
+            compatible = matcher._segment_command_compatible(
+                0, 20, torch.tensor(0.0), shaped
+            )
+
+        self.assertTrue(compatible)
+
+    def test_transition_eligibility_rotates_planar_source_travel(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(root, device="cpu")
+            matcher.reset()
+            _install_contact_policy(matcher, start=20, end=30)
+            directions = torch.zeros(
+                (matcher.database.feature_shape[0], 2), dtype=torch.float32
+            )
+            entry = matcher.database.row_for_source(0, 20)
+            directions[entry] = torch.tensor((0.0, 1.0))
+            matcher._terrain_entry_direction_xy = directions
+            state = matcher._state
+            shaped = predict_command_trajectory(
+                state.root_position[:2],
+                state.shaped_velocity,
+                state.shaped_heading,
+                torch.tensor((0.0, 0.4)),
+                torch.tensor(0.0),
+                has_valid_successor=True,
+                config=matcher.config,
+            )
+
+            eligible = matcher._command_transition_eligibility(state, shaped)
+
+        self.assertTrue(bool(eligible[entry]))
+
     def test_flat_support_transition_cost_is_row_aligned(self):
         arrays = build_varying_takara_arrays(frames=100)
         with tempfile.TemporaryDirectory() as tmp:
@@ -250,7 +364,7 @@ class TorchMotionMatcherTests(unittest.TestCase):
             frames = [first.diagnostics.selected_frame]
             searched = [first.diagnostics.searched]
             while frames[-1] + 1 < 30:
-                value = matcher.step((-0.4, 0.0), math.pi)
+                value = matcher.step((0.4, 0.0), 0.0)
                 frames.append(value.diagnostics.selected_frame)
                 searched.append(value.diagnostics.searched)
                 self.assertTrue(value.diagnostics.segment_committed)
@@ -284,6 +398,95 @@ class TorchMotionMatcherTests(unittest.TestCase):
                 rtol=0.0,
                 atol=1e-7,
             )
+
+    def test_forced_reversal_can_replace_active_contact_commitment(self):
+        arrays = build_varying_takara_arrays(frames=120)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=MatcherConfig(search_interval_steps=1, exclusion_frames=0),
+            )
+            matcher.reset()
+            _install_contact_policy(matcher, start=20, end=30)
+            root_body = matcher.folder.layout.root_body_index
+            matcher._clips[0].body_position[
+                30:40, root_body, 0
+            ] = torch.linspace(0.0, -1.0, 10)
+            second_entry = matcher.database.row_for_source(0, 30)
+            matcher._terrain_entry_direction_xy = torch.zeros(
+                (matcher.database.feature_shape[0], 2), dtype=torch.float32
+            )
+            matcher._terrain_entry_direction_xy[second_entry] = torch.tensor(
+                (-1.0, 0.0)
+            )
+            first_entry = matcher.database.row_for_source(0, 20)
+            first_successor = matcher.database.row_for_source(0, 1)
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher.select_exact_candidate",
+                return_value=SearchDecision(
+                    first_entry,
+                    first_successor,
+                    10.0,
+                    1.0,
+                    1.0,
+                    True,
+                    True,
+                ),
+            ):
+                first = matcher.step((0.4, 0.0), 0.0)
+            self.assertEqual(first.diagnostics.segment_start_frame, 20)
+            active_successor = matcher.database.row_for_source(0, 21)
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher.select_exact_candidate",
+                return_value=SearchDecision(
+                    second_entry,
+                    active_successor,
+                    10.0,
+                    1.0,
+                    1.0,
+                    True,
+                    True,
+                ),
+            ):
+                reversed_result = matcher.step((-0.4, 0.0), 0.0)
+
+        self.assertTrue(reversed_result.diagnostics.transitioned)
+        self.assertEqual(reversed_result.diagnostics.selected_frame, 30)
+        self.assertEqual(reversed_result.diagnostics.segment_start_frame, 30)
+
+    def test_validated_contact_commitment_does_not_revalidate_past_its_end(self):
+        arrays = build_varying_takara_arrays(frames=120)
+        validator = _ScriptedWindowValidator([True])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=MatcherConfig(search_interval_steps=1, exclusion_frames=0),
+                emitted_window_validator=validator,
+            )
+            matcher.reset()
+            _install_contact_policy(matcher, start=20, end=30)
+            entry = matcher.database.row_for_source(0, 20)
+            successor = matcher.database.row_for_source(0, 1)
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher.select_exact_candidate",
+                return_value=SearchDecision(
+                    entry, successor, 10.0, 1.0, 1.0, True, True
+                ),
+            ):
+                first = matcher.step((0.4, 0.0), 0.0)
+
+            second = matcher.step((0.4, 0.0), 0.0)
+
+        self.assertTrue(first.diagnostics.segment_committed)
+        self.assertTrue(second.diagnostics.segment_committed)
+        self.assertEqual(second.diagnostics.selected_frame, 21)
+        self.assertEqual(len(validator.windows), 1)
 
     def test_failed_full_segment_fk_validation_rejects_every_entry(self):
         arrays = build_varying_takara_arrays(frames=100)
@@ -352,6 +555,56 @@ class TorchMotionMatcherTests(unittest.TestCase):
                 result = matcher.step((0.4, 0.0), 0.0)
 
         self.assertEqual(result.diagnostics.selected_frame, 20)
+        self.assertTrue(result.diagnostics.segment_committed)
+        self.assertTrue(result.diagnostics.terrain_safety_override)
+
+    def test_valid_terrain_entry_overrides_invalid_terrain_first_choice(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=MatcherConfig(search_interval_steps=1, exclusion_frames=0),
+            )
+            matcher.reset()
+            policy = _install_contact_policy(matcher, start=20, end=30)
+            successor = matcher.database.row_for_source(0, 1)
+            invalid_entry = matcher.database.row_for_source(0, 20)
+            valid_entry = matcher.database.row_for_source(0, 30)
+            selected = SearchDecision(
+                invalid_entry, successor, 0.5, 1.0, 1.0, True, True
+            )
+            ranked = (
+                SearchDecision(
+                    invalid_entry, None, math.inf, 1.0, 1.0, True, True
+                ),
+                SearchDecision(
+                    valid_entry, None, math.inf, 2.0, 2.0, True, True
+                ),
+            )
+            original_resolve = policy.resolve_entry
+
+            def resolve_entry(_policy, **kwargs):
+                if kwargs["frame_index"] == 20:
+                    return None
+                return original_resolve(**kwargs)
+
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher.select_exact_candidate",
+                return_value=selected,
+            ), mock.patch(
+                "mm_sonic.torch_motion_matcher.rank_exact_transition_candidates",
+                return_value=ranked,
+            ), mock.patch.object(
+                TerrainContactSegmentPolicy,
+                "resolve_entry",
+                new=resolve_entry,
+            ):
+                result = matcher.step((0.4, 0.0), 0.0)
+
+        self.assertEqual(result.diagnostics.selected_frame, 30)
         self.assertTrue(result.diagnostics.segment_committed)
         self.assertTrue(result.diagnostics.terrain_safety_override)
 
@@ -1580,6 +1833,57 @@ class TorchMotionMatcherTests(unittest.TestCase):
 
         self.assertEqual(matcher._state.sequence, 2)
         self.assertEqual(len(validator.windows), 5)
+
+    def test_ranked_rescue_composes_only_configured_candidate_count(self):
+        arrays = build_varying_takara_arrays(frames=160)
+        validator = _ScriptedWindowValidator([True, True, False, False])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=MatcherConfig(
+                    search_interval_steps=5,
+                    transition_window_candidate_count=1,
+                ),
+                emitted_window_validator=validator,
+            )
+            reset = matcher.reset()
+            stop = matcher.folder.clips[0].valid_frame_stop
+            rows = [
+                matcher.database.row_for_source(
+                    0, (reset.diagnostics.selected_frame + offset) % stop
+                )
+                for offset in (30, 60, 90)
+            ]
+            ranked = tuple(
+                SearchDecision(
+                    row,
+                    None,
+                    math.inf,
+                    float(index),
+                    float(index) + 0.1,
+                    True,
+                    True,
+                )
+                for index, row in enumerate(rows, start=1)
+            )
+
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher."
+                "rank_exact_transition_candidates",
+                return_value=ranked,
+            ):
+                matcher.step((0.5, 0.0), 0.0)
+                matcher.step((0.5, 0.0), 0.0)
+                with self.assertRaisesRegex(
+                    ContractError, "no safe terrain rescue candidate"
+                ):
+                    matcher.prepare_step((0.5, 0.0), 0.0)
+
+        self.assertEqual(matcher._state.sequence, 2)
+        self.assertEqual(len(validator.windows), 4)
 
     def test_unsafe_transition_and_unsafe_incumbent_recover_through_ranked_rescue(
         self,

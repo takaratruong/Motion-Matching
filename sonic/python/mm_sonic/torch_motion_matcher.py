@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import itertools
 import math
 from pathlib import Path
 import time
@@ -698,6 +699,15 @@ def _rotate_z(values: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:
     return torch.stack((c * x - s * y, s * x + c * y, values[..., 2]), -1)
 
 
+def _rotate_xy(values: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:
+    c, s = torch.cos(yaw), torch.sin(yaw)
+    x, y = values[..., 0], values[..., 1]
+    while c.ndim < x.ndim:
+        c = c.unsqueeze(-1)
+        s = s.unsqueeze(-1)
+    return torch.stack((c * x - s * y, s * x + c * y), -1)
+
+
 @dataclass(frozen=True)
 class MotionMatchDiagnostics:
     sequence: int
@@ -1081,7 +1091,6 @@ class TorchMotionMatcher:
         if contact_segment_policy is None:
             self._terrain_entry_rows = None
             self._terrain_entry_direction_xy = None
-            self._terrain_clip_reference_direction_xy = {}
         else:
             terrain_clips = torch.tensor(
                 sorted(contact_segment_policy.index.terrain_clip_indices),
@@ -1096,7 +1105,6 @@ class TorchMotionMatcher:
                 dtype=torch.float32,
                 device=database.device,
             )
-            clip_reference_directions = {}
             root = folder.layout.root_body_index
             for clip_index in contact_segment_policy.index.terrain_clip_indices:
                 rows = self._terrain_entry_rows & (
@@ -1105,22 +1113,26 @@ class TorchMotionMatcher:
                 frames = database._search_frame_index[rows]
                 if frames.numel() == 0:
                     continue
-                velocity = _rotate_z(
-                    clips[clip_index].body_linear_velocity[frames, root],
-                    contact_segment_policy.registered_yaw_offset(clip_index),
-                )[:, :2]
-                norm = torch.linalg.vector_norm(
-                    velocity, dim=1, keepdim=True
-                ).clamp_min(1e-6)
-                directions[rows] = velocity / norm
-                earliest = torch.argmin(frames)
-                clip_reference_directions[clip_index] = (
-                    directions[rows][earliest].clone()
+                end_frames = torch.tensor(
+                    [
+                        contact_segment_policy.index.entry(
+                            clip_index, int(frame)
+                        ).end_frame
+                        - 1
+                        for frame in frames.detach().cpu().tolist()
+                    ],
+                    dtype=frames.dtype,
+                    device=frames.device,
                 )
+                displacement = (
+                    clips[clip_index].body_position[end_frames, root, :2]
+                    - clips[clip_index].body_position[frames, root, :2]
+                )
+                norm = torch.linalg.vector_norm(
+                    displacement, dim=1, keepdim=True
+                ).clamp_min(1e-6)
+                directions[rows] = displacement / norm
             self._terrain_entry_direction_xy = directions
-            self._terrain_clip_reference_direction_xy = (
-                clip_reference_directions
-            )
         self._clips = clips
         root = folder.layout.root_body_index
         feet = torch.tensor(
@@ -1216,11 +1228,13 @@ class TorchMotionMatcher:
         eligible = self._transition_eligible_rows
         if eligible is None or self._terrain_entry_direction_xy is None:
             return eligible
-        command = shaped.trajectory.facing_world_xy[-1]
+        command = self._command_travel_direction(shaped)
         if not self._terrain_command_deviated(state, shaped):
             return eligible
+        yaw = shaped.heading_world_yaw - self._transition_source_root_yaw
+        directions = _rotate_xy(self._terrain_entry_direction_xy, yaw)
         compatible = (
-            self._terrain_entry_direction_xy @ command
+            directions @ command
             >= CONTIGUOUS_SEGMENT_COMMAND_ALIGNMENT_MIN
         )
         return eligible & (~self._terrain_entry_rows | compatible)
@@ -1236,15 +1250,40 @@ class TorchMotionMatcher:
     def _terrain_command_deviated(
         self, state: _MatcherState, shaped: ShapedCommand
     ) -> bool:
-        reference = self._terrain_clip_reference_direction_xy.get(
-            state.clip_index
-        )
-        if reference is None:
+        command = self._command_travel_direction(shaped)
+        velocity = state.root_linear_velocity[:2]
+        speed = torch.linalg.vector_norm(velocity)
+        if float(speed.item()) <= 1e-6:
             return True
-        command = shaped.trajectory.facing_world_xy[-1]
-        return float(torch.dot(reference, command).item()) < (
+        return float(torch.dot(velocity / speed, command).item()) < (
             CONTIGUOUS_SEGMENT_COMMAND_ALIGNMENT_MIN
         )
+
+    @staticmethod
+    def _command_travel_direction(shaped: ShapedCommand) -> torch.Tensor:
+        displacement = (
+            shaped.trajectory.position_world_xy[-1]
+            - shaped.trajectory.position_world_xy[0]
+        )
+        distance = torch.linalg.vector_norm(displacement)
+        if float(distance.item()) > 1e-6:
+            return displacement / distance
+        speed = torch.linalg.vector_norm(shaped.velocity_world_xy)
+        if float(speed.item()) > 1e-6:
+            return shaped.velocity_world_xy / speed
+        return shaped.trajectory.facing_world_xy[-1]
+
+    def _candidate_yaw_offset(
+        self,
+        clip_index: int,
+        frame_index: int,
+        shaped: ShapedCommand,
+    ) -> torch.Tensor:
+        root = self.folder.layout.root_body_index
+        source_yaw = _quat_yaw(
+            self._clips[clip_index].body_quaternion[frame_index, root]
+        )
+        return _wrapped_angle(shaped.heading_world_yaw - source_yaw)
 
     @classmethod
     def from_folder(
@@ -1401,7 +1440,11 @@ class TorchMotionMatcher:
         )
         safe_rescue = None
         for rank, rescue_decision in enumerate(
-            ranked_rescue_decisions, start=1
+            itertools.islice(
+                ranked_rescue_decisions,
+                self.config.transition_window_candidate_count,
+            ),
+            start=1,
         ):
             effective_total_cost = (
                 rescue_decision.selected_total_cost
@@ -1611,18 +1654,9 @@ class TorchMotionMatcher:
             clip = self._clips[clip_index]
             root = self.folder.layout.root_body_index
             source_pos = clip.body_position[frame_index, root]
-            source_yaw = _quat_yaw(
-                clip.body_quaternion[frame_index, root]
+            yaw_offset = self._candidate_yaw_offset(
+                clip_index, frame_index, shaped
             )
-            if (
-                policy is not None
-                and clip_index in policy.index.terrain_clip_indices
-            ):
-                yaw_offset = policy.registered_yaw_offset(clip_index)
-            else:
-                yaw_offset = _wrapped_angle(
-                    shaped.heading_world_yaw - source_yaw
-                )
             desired_xy = (
                 state.root_position[:2]
                 + shaped.velocity_world_xy * self.config.dt
@@ -1861,18 +1895,29 @@ class TorchMotionMatcher:
         yaw_offset: torch.Tensor,
         shaped: ShapedCommand,
     ) -> bool:
-        command = shaped.trajectory.facing_world_xy[-1]
+        command = self._command_travel_direction(shaped)
         root = self.folder.layout.root_body_index
-        source_velocity = _rotate_z(
-            self._clips[clip_index].body_linear_velocity[frame_index, root],
+        policy = self._contact_segment_policy
+        segment = (
+            None
+            if policy is None
+            else policy.index.entry(clip_index, frame_index)
+        )
+        if segment is None:
+            return False
+        source_travel = _rotate_z(
+            self._clips[clip_index].body_position[
+                segment.end_frame - 1, root
+            ]
+            - self._clips[clip_index].body_position[frame_index, root],
             yaw_offset,
         )[:2]
-        source_speed = torch.linalg.vector_norm(source_velocity)
+        source_speed = torch.linalg.vector_norm(source_travel)
         if float(source_speed.item()) <= 1e-6:
             return False
         alignment = torch.dot(
             command,
-            source_velocity / source_speed,
+            source_travel / source_speed,
         )
         return float(alignment.item()) >= (
             CONTIGUOUS_SEGMENT_COMMAND_ALIGNMENT_MIN
@@ -2500,10 +2545,16 @@ class TorchMotionMatcher:
         search = search_is_due(
             state.sequence, shaped.force_search, self.config
         )
-        committed_playback = (
+        active_commitment = (
             state.commitment is not None
             and state.frame_index + 1 < state.commitment.end_frame
         )
+        interrupting_commitment = (
+            active_commitment
+            and shaped.force_search
+            and self._terrain_command_deviated(state, shaped)
+        )
+        committed_playback = active_commitment and not interrupting_commitment
         settle_penalty = active_transition_penalty(
             state.offsets.elapsed_s, self.config
         )
@@ -2592,8 +2643,11 @@ class TorchMotionMatcher:
             policy is not None
             and search
             and not committed_playback
-            and not bool(
-                self._terrain_entry_rows[decision.selected_row].item()
+            and (
+                not bool(
+                    self._terrain_entry_rows[decision.selected_row].item()
+                )
+                or not candidate.contact_entry_valid
             )
         ):
             terrain_rank_start = time.perf_counter_ns()
@@ -2615,7 +2669,11 @@ class TorchMotionMatcher:
                 else search_time + terrain_rank_time
             )
             for rank, terrain_decision in enumerate(
-                terrain_entries, start=1
+                itertools.islice(
+                    terrain_entries,
+                    self.config.transition_window_candidate_count,
+                ),
+                start=1,
             ):
                 terrain_candidate = self._compose_candidate(
                     state,
@@ -2703,7 +2761,7 @@ class TorchMotionMatcher:
                     transitioned=False,
                 )
                 transition_rejected = True
-        if validator is not None:
+        if validator is not None and not committed_playback:
             accepted = validator(candidate.dense_body_position[:46].clone())
             if type(accepted) is not bool:
                 raise ContractError(
@@ -2877,7 +2935,11 @@ class TorchMotionMatcher:
             force_reason = "command_transition"
         dense_joint_p = candidate.dense_joint_position
         dense_joint_v = candidate.dense_joint_velocity
-        output_commitment = state.commitment
+        output_commitment = (
+            None
+            if interrupting_commitment and candidate.transitioned
+            else state.commitment
+        )
         if (
             output_commitment is None
             and candidate.segment_placement is not None

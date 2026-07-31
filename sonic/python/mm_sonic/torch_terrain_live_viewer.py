@@ -460,6 +460,7 @@ def run_live_viewer(
         raise ContractError("live terrain viewer requires mujoco viewer") from error
     if contact_segments:
         from .torch_contact_segment_rollout import (
+            build_contact_segment_policy,
             load_contact_segment_config,
             resolve_contact_segment_config,
         )
@@ -479,30 +480,8 @@ def run_live_viewer(
         raise ContractError("live terrain viewer requires the dense condition")
     contact_segment_policy = None
     if contact_segments:
-        from .torch_contact_segments import (
-            ContactSegmentIndex,
-            TerrainContactSegmentPolicy,
-        )
-        from .torch_g1_fk import MujocoG1FootKinematics
-
-        bounds = resolved.resolved_config["contact_segments"]
-        contact_segment_policy = TerrainContactSegmentPolicy(
-            index=ContactSegmentIndex.from_dataset(
-                resolved.dataset,
-                minimum_frames=int(bounds["minimum_frames"]),
-                maximum_frames=int(bounds["maximum_frames"]),
-            ),
-            extension=resolved.measurement_extension,
-            foot_kinematics=MujocoG1FootKinematics(g1_xml),
-            maximum_scene_xy_mismatch_m=float(
-                bounds["maximum_scene_xy_mismatch_m"]
-            ),
-            entry_inertialization_halflife_s=float(
-                bounds["entry_inertialization_halflife_s"]
-            ),
-            flat_support_transition_cost_weight=float(
-                bounds["flat_support_transition_cost_weight"]
-            ),
+        contact_segment_policy = build_contact_segment_policy(
+            resolved, g1_xml
         )
     matcher_config = matcher_config_from_resolved(resolved.resolved_config)
     matcher = TorchMotionMatcher.from_folder(

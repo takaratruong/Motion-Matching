@@ -153,6 +153,7 @@ def load_contact_segment_config(path: str | Path) -> dict:
         != {
             "minimum_frames",
             "maximum_frames",
+            "placement_mode",
             "maximum_scene_xy_mismatch_m",
             "entry_inertialization_halflife_s",
             "flat_support_transition_cost_weight",
@@ -167,6 +168,8 @@ def load_contact_segment_config(path: str | Path) -> dict:
     maximum = contact["maximum_frames"]
     if type(minimum) is not int or type(maximum) is not int or not 1 <= minimum <= maximum:
         raise ContractError("contact-segment frame bounds are invalid")
+    if contact["placement_mode"] not in ("local", "registered"):
+        raise ContractError("contact-segment placement mode is invalid")
     mismatch = contact["maximum_scene_xy_mismatch_m"]
     if (
         isinstance(mismatch, bool)
@@ -192,6 +195,45 @@ def load_contact_segment_config(path: str | Path) -> dict:
     ):
         raise ContractError("flat support transition cost weight is invalid")
     return deepcopy(config)
+
+
+def contact_scene_mismatch_limit(contact: Mapping[str, object]) -> float | None:
+    """Return the absolute-scene gate only for registered placement."""
+
+    try:
+        mode = contact["placement_mode"]
+        mismatch = contact["maximum_scene_xy_mismatch_m"]
+    except (KeyError, TypeError) as error:
+        raise ContractError("contact-segment placement config is invalid") from error
+    if mode == "local":
+        return None
+    if mode != "registered":
+        raise ContractError("contact-segment placement mode is invalid")
+    return float(mismatch)
+
+
+def build_contact_segment_policy(
+    resolved: ResolvedStairConfig, g1_xml: str | Path
+) -> TerrainContactSegmentPolicy:
+    """Build the exact contact policy shared by rollouts and the viewer."""
+
+    contact = resolved.resolved_config["contact_segments"]
+    return TerrainContactSegmentPolicy(
+        index=ContactSegmentIndex.from_dataset(
+            resolved.dataset,
+            minimum_frames=int(contact["minimum_frames"]),
+            maximum_frames=int(contact["maximum_frames"]),
+        ),
+        extension=resolved.measurement_extension,
+        foot_kinematics=MujocoG1FootKinematics(g1_xml),
+        maximum_scene_xy_mismatch_m=contact_scene_mismatch_limit(contact),
+        entry_inertialization_halflife_s=float(
+            contact["entry_inertialization_halflife_s"]
+        ),
+        flat_support_transition_cost_weight=float(
+            contact["flat_support_transition_cost_weight"]
+        ),
+    )
 
 
 def resolve_contact_segment_config(
@@ -310,27 +352,9 @@ def run_contact_segment_rollout(
     resolved: ResolvedStairConfig,
     g1_xml: str | Path,
 ) -> ContactSegmentRollout:
-    contact = resolved.resolved_config["contact_segments"]
-    index = ContactSegmentIndex.from_dataset(
-        resolved.dataset,
-        minimum_frames=int(contact["minimum_frames"]),
-        maximum_frames=int(contact["maximum_frames"]),
-    )
     fk = MujocoG1FootKinematics(g1_xml)
-    policy = TerrainContactSegmentPolicy(
-        index=index,
-        extension=resolved.measurement_extension,
-        foot_kinematics=fk,
-        maximum_scene_xy_mismatch_m=float(
-            contact["maximum_scene_xy_mismatch_m"]
-        ),
-        entry_inertialization_halflife_s=float(
-            contact["entry_inertialization_halflife_s"]
-        ),
-        flat_support_transition_cost_weight=float(
-            contact["flat_support_transition_cost_weight"]
-        ),
-    )
+    policy = build_contact_segment_policy(resolved, g1_xml)
+    index = policy.index
     matcher = TorchMotionMatcher.from_folder(
         resolved.dataset.root,
         device=str(resolved.device),

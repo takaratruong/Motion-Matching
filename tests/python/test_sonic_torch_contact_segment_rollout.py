@@ -1,11 +1,24 @@
 import unittest
+from pathlib import Path
 
 from mm_sonic.torch_contact_segment_rollout import (
     evaluate_contact_segment_acceptance,
+    load_contact_segment_config,
 )
 
 
 class ContactSegmentAcceptanceTests(unittest.TestCase):
+    def test_runtime_experiment_uses_local_segment_retargeting(self):
+        root = Path(__file__).resolve().parents[2]
+        config = load_contact_segment_config(
+            root
+            / "sonic/configs/experiments/torch_grail_contact_segment.json"
+        )
+
+        self.assertEqual(
+            config["contact_segments"]["placement_mode"], "local"
+        )
+
     def test_every_acceptance_boundary_is_inclusive(self):
         metrics = {
             "unsupported_fraction": 0.15,

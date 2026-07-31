@@ -29,7 +29,8 @@
     "maximum_lost_source_support_fraction": 0.05,
     "maximum_scene_xy_mismatch_m": 0.05,
     "maximum_unsupported_frames": 10,
-    "minimum_frames": 5
+    "minimum_frames": 5,
+    "placement_mode": "local"
   },
   "dt": 0.02,
   "duration_s": 9.0,
