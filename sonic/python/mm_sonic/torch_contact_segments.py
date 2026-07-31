@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from types import MappingProxyType
 from typing import Mapping, Sequence
 
+import numpy as np
 import torch
 
 from .joints import ContractError
@@ -284,12 +286,57 @@ class SegmentPlacement:
         object.__setattr__(self, "source_support_mask", owned)
 
 
+def _owned_readonly(array: object, dtype=None) -> np.ndarray:
+    output = np.array(array, dtype=dtype, copy=True)
+    output.setflags(write=False)
+    return output
+
+
+@dataclass(frozen=True)
+class SegmentValidation:
+    accepted: bool
+    reason: str | None
+    foot_position_world: np.ndarray
+    foot_clearance_m: np.ndarray
+    emitted_support_mask: np.ndarray
+    lost_source_support_fraction: float
+    longest_unsupported_frames: int
+
+    def __post_init__(self) -> None:
+        feet = _owned_readonly(self.foot_position_world, np.float64)
+        clearance = _owned_readonly(self.foot_clearance_m, np.float64)
+        support = _owned_readonly(self.emitted_support_mask, np.bool_)
+        frames = feet.shape[0] if feet.ndim == 3 else -1
+        if (
+            type(self.accepted) is not bool
+            or (self.reason is not None and not isinstance(self.reason, str))
+            or feet.shape != (frames, 2, 3)
+            or clearance.shape != (frames, 2)
+            or support.shape != (frames, 2)
+            or not np.isfinite(feet).all()
+            or not math.isfinite(float(self.lost_source_support_fraction))
+            or not 0.0 <= float(self.lost_source_support_fraction) <= 1.0
+            or type(self.longest_unsupported_frames) is not int
+            or self.longest_unsupported_frames < 0
+        ):
+            raise ContractError("segment validation fields are invalid")
+        object.__setattr__(self, "foot_position_world", feet)
+        object.__setattr__(self, "foot_clearance_m", clearance)
+        object.__setattr__(self, "emitted_support_mask", support)
+        object.__setattr__(
+            self,
+            "lost_source_support_fraction",
+            float(self.lost_source_support_fraction),
+        )
+
+
 @dataclass(frozen=True)
 class TerrainContactSegmentPolicy:
     """Resolve contact-compatible terrain entries and rigid vertical placement."""
 
     index: ContactSegmentIndex
     extension: object
+    foot_kinematics: object | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -316,6 +363,137 @@ class TerrainContactSegmentPolicy:
 
     def entry_eligibility(self, database: object) -> torch.Tensor:
         return self.index.terrain_entry_eligibility(database)
+
+    @staticmethod
+    def _longest_false_run(supported: torch.Tensor) -> int:
+        longest = current = 0
+        for value in supported.detach().cpu().tolist():
+            if bool(value):
+                current = 0
+            else:
+                current += 1
+                longest = max(longest, current)
+        return longest
+
+    def emitted_foot_positions(
+        self,
+        joint_position: torch.Tensor,
+        root_position: torch.Tensor,
+        root_orientation_wxyz: torch.Tensor,
+    ) -> np.ndarray:
+        adapter = self.foot_kinematics
+        if adapter is None or not callable(
+            getattr(adapter, "foot_positions", None)
+        ):
+            raise ContractError(
+                "contact segment validation requires foot kinematics"
+            )
+        try:
+            feet = np.asarray(
+                adapter.foot_positions(
+                    joint_position, root_position, root_orientation_wxyz
+                ),
+                np.float64,
+            )
+        except ContractError:
+            raise
+        except Exception as error:
+            raise ContractError("contact segment foot kinematics failed") from error
+        expected = (joint_position.shape[0], 2, 3)
+        if feet.shape != expected or not np.isfinite(feet).all():
+            raise ContractError(
+                "contact segment foot kinematics returned invalid positions"
+            )
+        return np.ascontiguousarray(feet)
+
+    def validate_emitted(
+        self,
+        placement: SegmentPlacement,
+        *,
+        joint_position: torch.Tensor,
+        root_position: torch.Tensor,
+        root_orientation_wxyz: torch.Tensor,
+    ) -> SegmentValidation:
+        if not isinstance(placement, SegmentPlacement):
+            raise ContractError("emitted validation requires segment placement")
+        frames = placement.segment.frame_count
+        if (
+            not isinstance(joint_position, torch.Tensor)
+            or tuple(joint_position.shape) != (frames, 29)
+            or not isinstance(root_position, torch.Tensor)
+            or tuple(root_position.shape) != (frames, 3)
+            or not isinstance(root_orientation_wxyz, torch.Tensor)
+            or tuple(root_orientation_wxyz.shape) != (frames, 4)
+            or joint_position.device != self.dataset.device
+            or root_position.device != joint_position.device
+            or root_orientation_wxyz.device != joint_position.device
+            or not torch.isfinite(joint_position).all()
+            or not torch.isfinite(root_position).all()
+            or not torch.isfinite(root_orientation_wxyz).all()
+        ):
+            raise ContractError(
+                "emitted segment state shapes must exactly match its frame count"
+            )
+        feet_np = self.emitted_foot_positions(
+            joint_position, root_position, root_orientation_wxyz
+        )
+        feet = torch.tensor(
+            feet_np, dtype=torch.float32, device=self.dataset.device
+        )
+        try:
+            scene_xy = self.extension.alignment.matcher_to_scene_xy(
+                feet[..., :2]
+            )
+            surface = self.extension.query_grid.sample_xy(scene_xy)
+        except ContractError:
+            return SegmentValidation(
+                accepted=False,
+                reason="out_of_domain",
+                foot_position_world=feet_np,
+                foot_clearance_m=np.full((frames, 2), np.nan),
+                emitted_support_mask=np.zeros((frames, 2), np.bool_),
+                lost_source_support_fraction=1.0,
+                longest_unsupported_frames=frames,
+            )
+        clearance = feet[..., 2] - surface
+        vertical_speed = torch.zeros_like(clearance)
+        if frames > 1:
+            vertical_speed[1:] = (feet[1:, :, 2] - feet[:-1, :, 2]) / 0.02
+        emitted_support = (
+            (
+                torch.abs(clearance - ANKLE_ORIGIN_SOLE_M)
+                <= STANCE_CLEARANCE_TOLERANCE_M
+            )
+            & (torch.abs(vertical_speed) <= STANCE_VERTICAL_SPEED_MAX_MPS)
+        )
+        supported = emitted_support.any(dim=1)
+        longest = self._longest_false_run(supported)
+        source_supported = placement.source_support_mask.any(dim=1)
+        source_count = int(source_supported.sum().item())
+        lost = int((source_supported & ~supported).sum().item())
+        lost_fraction = 0.0 if source_count == 0 else lost / source_count
+
+        if float(clearance.min().item()) < -0.03:
+            reason = "penetration"
+        elif not bool(
+            emitted_support[0, placement.segment.entering_foot].item()
+        ):
+            reason = "entering_support"
+        elif longest > 10:
+            reason = "unsupported_run"
+        elif lost_fraction > 0.05:
+            reason = "source_support_lost"
+        else:
+            reason = None
+        return SegmentValidation(
+            accepted=reason is None,
+            reason=reason,
+            foot_position_world=feet_np,
+            foot_clearance_m=clearance.detach().cpu().numpy(),
+            emitted_support_mask=emitted_support.detach().cpu().numpy(),
+            lost_source_support_fraction=lost_fraction,
+            longest_unsupported_frames=longest,
+        )
 
     @staticmethod
     def _validated_pose(

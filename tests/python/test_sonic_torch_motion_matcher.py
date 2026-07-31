@@ -86,7 +86,19 @@ class _IdentityAlignment:
         return points
 
 
-def _install_contact_policy(matcher, *, start=20, end=30):
+class _FlatContactFootKinematics:
+    def __init__(self, height=0.035):
+        self.height = float(height)
+
+    def foot_positions(self, joints, roots, quaternions):
+        output = np.zeros((len(joints), 2, 3), np.float64)
+        output[..., 2] = self.height
+        return output
+
+
+def _install_contact_policy(
+    matcher, *, start=20, end=30, foot_kinematics=None
+):
     support = torch.zeros(
         (len(matcher.folder.clips[0].joint_position), 2), dtype=torch.bool
     )
@@ -109,7 +121,15 @@ def _install_contact_policy(matcher, *, start=20, end=30):
         query_grid=_ConstantGrid(0.0),
         alignment=identity,
     )
-    policy = TerrainContactSegmentPolicy(index=index, extension=extension)
+    policy = TerrainContactSegmentPolicy(
+        index=index,
+        extension=extension,
+        foot_kinematics=(
+            _FlatContactFootKinematics()
+            if foot_kinematics is None
+            else foot_kinematics
+        ),
+    )
     matcher._contact_segment_policy = policy
     matcher._transition_eligible_rows = policy.entry_eligibility(
         matcher.database
@@ -145,6 +165,17 @@ class TorchMotionMatcherTests(unittest.TestCase):
             self.assertIsInstance(matcher._state.commitment, SegmentCommitment)
             self.assertEqual(first.diagnostics.segment_start_frame, 20)
             self.assertEqual(first.diagnostics.segment_end_frame, 30)
+            fresh_feet = matcher._contact_segment_policy.emitted_foot_positions(
+                first.dense_joint_position_window,
+                first.dense_root_position_window,
+                first.dense_root_orientation_window_wxyz,
+            )
+            np.testing.assert_allclose(
+                first.dense_feature_body_position_window[:, 1:].numpy(),
+                fresh_feet,
+                rtol=0.0,
+                atol=1e-7,
+            )
             search.assert_called_once()
 
             frames = [first.diagnostics.selected_frame]
@@ -170,6 +201,43 @@ class TorchMotionMatcherTests(unittest.TestCase):
                 released = matcher.step((-0.4, 0.0), math.pi)
             self.assertFalse(released.diagnostics.segment_committed)
             resumed_search.assert_called_once()
+
+    def test_failed_full_segment_fk_validation_rejects_every_entry(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=MatcherConfig(search_interval_steps=1, exclusion_frames=0),
+            )
+            matcher.reset()
+            _install_contact_policy(
+                matcher,
+                start=20,
+                end=30,
+                foot_kinematics=_FlatContactFootKinematics(height=0.20),
+            )
+            entry_row = matcher.database.row_for_source(0, 20)
+            successor = matcher.database.row_for_source(0, 1)
+            selected = SearchDecision(
+                entry_row, successor, 0.0, 1.0, 1.0, True, True
+            )
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher.select_exact_candidate",
+                return_value=selected,
+            ):
+                prepared = matcher.prepare_step((0.4, 0.0), 0.0)
+
+        self.assertFalse(prepared.result.diagnostics.segment_committed)
+        self.assertTrue(prepared.result.diagnostics.transition_rejected)
+        self.assertEqual(
+            prepared.result.diagnostics.segment_rejection_reason,
+            "entering_support",
+        )
+        self.assertEqual(matcher._state.sequence, 0)
+        self.assertIsNone(matcher._state.commitment)
 
     def test_rejected_contact_entry_is_transactional(self):
         arrays = build_varying_takara_arrays(frames=100)

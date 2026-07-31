@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import unittest
 
+import numpy as np
 import torch
 
 from mm_sonic.joints import ContractError
@@ -13,6 +14,7 @@ try:
         ContactSegment,
         ContactSegmentIndex,
         SegmentPlacement,
+        SegmentValidation,
         TerrainContactSegmentPolicy,
         segments_from_support_mask,
     )
@@ -36,7 +38,7 @@ except ImportError:
     def segments_from_support_mask(*_args, **_kwargs):
         raise AssertionError("contact segmentation is missing")
 
-    SegmentPlacement = TerrainContactSegmentPolicy = None
+    SegmentPlacement = SegmentValidation = TerrainContactSegmentPolicy = None
 
 
 class _ConstantGrid:
@@ -55,7 +57,28 @@ class _IdentityAlignment:
         return points
 
 
-def _placement_policy():
+class _FakeFootKinematics:
+    def __init__(self, feet):
+        self.feet = np.asarray(feet, np.float64)
+
+    def foot_positions(self, joints, roots, quaternions):
+        count = len(joints)
+        return self.feet[:count].copy()
+
+
+class _OutOfDomainGrid(_ConstantGrid):
+    def __init__(self, height):
+        super().__init__(height)
+        self.calls = 0
+
+    def sample_xy(self, points):
+        self.calls += 1
+        if self.calls == 1:
+            return super().sample_xy(points)
+        raise ContractError("outside the authoritative terrain domain")
+
+
+def _placement_policy(*, foot_kinematics=None, query_grid=None):
     flat = torch.zeros((80, 2), dtype=torch.bool)
     terrain = torch.zeros((80, 2), dtype=torch.bool)
     terrain[10:29, 0] = True
@@ -81,10 +104,16 @@ def _placement_policy():
     )
     extension = SimpleNamespace(
         dataset=dataset,
-        query_grid=_ConstantGrid(0.50),
+        query_grid=(
+            _ConstantGrid(0.50) if query_grid is None else query_grid
+        ),
         alignment=_IdentityAlignment(),
     )
-    return TerrainContactSegmentPolicy(index=index, extension=extension)
+    return TerrainContactSegmentPolicy(
+        index=index,
+        extension=extension,
+        foot_kinematics=foot_kinematics,
+    )
 
 
 class ContactSegmentTests(unittest.TestCase):
@@ -241,6 +270,81 @@ class ContactSegmentTests(unittest.TestCase):
         support = policy.query_support_mask(bodies, velocities)
 
         self.assertEqual(support.tolist(), [True, False])
+
+    def test_full_segment_validation_accepts_authoritative_fk_contact(self):
+        feet = np.zeros((20, 2, 3), np.float64)
+        feet[..., 2] = 0.60
+        feet[:, 0, 2] = 0.535
+        policy = _placement_policy(
+            foot_kinematics=_FakeFootKinematics(feet)
+        )
+        placement = policy.resolve_entry(
+            clip_index=1, frame_index=10,
+            yaw_offset=torch.tensor(0.0), translation_xy=torch.zeros(2),
+            current_support_mask=torch.tensor([False, False]),
+        )
+
+        validation = policy.validate_emitted(
+            placement,
+            joint_position=torch.zeros((20, 29)),
+            root_position=torch.zeros((20, 3)),
+            root_orientation_wxyz=torch.tensor(
+                [[1.0, 0.0, 0.0, 0.0]] * 20
+            ),
+        )
+
+        self.assertIsInstance(validation, SegmentValidation)
+        self.assertTrue(validation.accepted)
+        self.assertIsNone(validation.reason)
+        self.assertEqual(validation.foot_position_world.shape, (20, 2, 3))
+        self.assertFalse(validation.foot_position_world.flags.writeable)
+        self.assertEqual(validation.longest_unsupported_frames, 0)
+
+    def test_full_segment_validation_reports_first_exact_failure(self):
+        base = np.zeros((20, 2, 3), np.float64)
+        base[..., 2] = 0.60
+        base[:, 0, 2] = 0.535
+        cases = []
+        penetration = base.copy()
+        penetration[5, 1, 2] = 0.46
+        cases.append((penetration, None, "penetration", None))
+        entering = base.copy()
+        entering[0, 0, 2] = 0.60
+        cases.append((entering, None, "entering_support", None))
+        unsupported = base.copy()
+        unsupported[3:13, :, 2] = 0.60
+        cases.append((unsupported, None, "unsupported_run", 11))
+        lost = base.copy()
+        lost[5:7, :, 2] = 0.60
+        cases.append((lost, None, "source_support_lost", None))
+        cases.append((base, _OutOfDomainGrid(0.5), "out_of_domain", None))
+
+        for feet, grid, reason, longest in cases:
+            with self.subTest(reason=reason):
+                policy = _placement_policy(
+                    foot_kinematics=_FakeFootKinematics(feet),
+                    query_grid=grid,
+                )
+                placement = policy.resolve_entry(
+                    clip_index=1, frame_index=10,
+                    yaw_offset=torch.tensor(0.0),
+                    translation_xy=torch.zeros(2),
+                    current_support_mask=torch.tensor([False, False]),
+                )
+                validation = policy.validate_emitted(
+                    placement,
+                    joint_position=torch.zeros((20, 29)),
+                    root_position=torch.zeros((20, 3)),
+                    root_orientation_wxyz=torch.tensor(
+                        [[1.0, 0.0, 0.0, 0.0]] * 20
+                    ),
+                )
+                self.assertFalse(validation.accepted)
+                self.assertEqual(validation.reason, reason)
+                if longest is not None:
+                    self.assertEqual(
+                        validation.longest_unsupported_frames, longest
+                    )
 
 
 @unittest.skipUnless(

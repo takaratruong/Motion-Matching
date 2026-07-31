@@ -13,6 +13,7 @@ import torch
 from .joints import ContractError
 from .torch_contact_segments import (
     SegmentPlacement,
+    SegmentValidation,
     TerrainContactSegmentPolicy,
 )
 from .torch_motion_continuity import (
@@ -931,6 +932,7 @@ class _ComposedCandidate:
     translation_xy: torch.Tensor
     translation_z: float
     segment_placement: SegmentPlacement | None
+    segment_validation: SegmentValidation | None
     contact_entry_valid: bool
     offsets: _Offsets
     dense_joint_position: torch.Tensor
@@ -1550,6 +1552,50 @@ class TorchMotionMatcher:
             halflife_s=self.config.inertialization_halflife_s,
             time_s=times,
         )
+        dense_joint_position = jp + jpo
+        dense_joint_velocity = jv + jvo
+        dense_root_position = rp + rpo
+        dense_root_quaternion = _quat_normalize(
+            _quat_mul(_quat_from_scaled_axis(qao), rq)
+        )
+        dense_body_position = bp + bao
+        dense_body_velocity = bv + bvo
+        segment_validation = None
+        policy = self._contact_segment_policy
+        if placement is not None:
+            frame_count = placement.segment.frame_count
+            segment_validation = policy.validate_emitted(
+                placement,
+                joint_position=dense_joint_position[:frame_count],
+                root_position=dense_root_position[:frame_count],
+                root_orientation_wxyz=dense_root_quaternion[:frame_count],
+            )
+            contact_entry_valid = segment_validation.accepted
+        if (
+            policy is not None
+            and contact_entry_valid
+            and (placement is not None or state.commitment is not None)
+        ):
+            feet = torch.tensor(
+                policy.emitted_foot_positions(
+                    dense_joint_position,
+                    dense_root_position,
+                    dense_root_quaternion,
+                ),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            authoritative_body = torch.cat(
+                (dense_root_position[:, None, :], feet), dim=1
+            )
+            authoritative_velocity = torch.empty_like(authoritative_body)
+            authoritative_velocity[0] = dense_body_velocity[0]
+            authoritative_velocity[1:] = (
+                authoritative_body[1:] - authoritative_body[:-1]
+            ) / self.config.dt
+            dense_body_position = authoritative_body
+            dense_body_velocity = authoritative_velocity
+
         return _ComposedCandidate(
             clip_index=clip_index,
             frame_index=frame_index,
@@ -1558,18 +1604,17 @@ class TorchMotionMatcher:
             translation_xy=translation,
             translation_z=translation_z,
             segment_placement=placement,
+            segment_validation=segment_validation,
             contact_entry_valid=contact_entry_valid,
             offsets=offsets,
-            dense_joint_position=jp + jpo,
-            dense_joint_velocity=jv + jvo,
-            dense_root_position=rp + rpo,
-            dense_root_quaternion=_quat_normalize(
-                _quat_mul(_quat_from_scaled_axis(qao), rq)
-            ),
+            dense_joint_position=dense_joint_position,
+            dense_joint_velocity=dense_joint_velocity,
+            dense_root_position=dense_root_position,
+            dense_root_quaternion=dense_root_quaternion,
             dense_root_linear_velocity=rv + rvo,
             dense_root_angular_velocity=rw + qwo,
-            dense_body_position=bp + bao,
-            dense_body_velocity=bv + bvo,
+            dense_body_position=dense_body_position,
+            dense_body_velocity=dense_body_velocity,
         )
 
     def _reachability_query(
@@ -2261,7 +2306,11 @@ class TorchMotionMatcher:
         validator = self._emitted_window_validator
         segment_rejection_reason = None
         if not candidate.contact_entry_valid:
-            segment_rejection_reason = "incompatible_support_side"
+            segment_rejection_reason = (
+                candidate.segment_validation.reason
+                if candidate.segment_validation is not None
+                else "incompatible_support_side"
+            )
             rescue = self._ranked_terrain_rescue(
                 state,
                 shaped,
