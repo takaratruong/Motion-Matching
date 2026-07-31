@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace the rigid 91-height dense feature with a shared path-aligned 91-height plus pelvis-clearance terrain feature.
+**Goal:** Augment the body-relative 91-height feature with four command-path heights without regressing terrain safety.
 
-**Architecture:** A vectorized path-frame sampler consumes root pose plus three future trajectory positions/facings. Database and live query paths both call it, and the viewer calls the same point constructor so rendered samples cannot diverge from search samples.
+**Architecture:** Preserve the 13 by 7 body-yaw grid so terrain slope remains related to the robot's feet, then append four arc-distance samples from the shaped/recorded trajectory. Database, live query, and viewer share the same point definitions.
 
 **Tech Stack:** Python 3, PyTorch, NumPy, unittest, MuJoCo viewer.
 
@@ -12,13 +12,14 @@
 
 - Remain privileged-height-map kinematics only; do not add SONIC or tracking.
 - Preserve the 13 by 7 footprint, 0.15 m spacing, and legacy encoder.
-- Dense features are exactly 92 float32 values: 91 relative heights followed by pelvis clearance.
+- Dense features are exactly 95 float32 values: 91 body-relative heights followed by four command-path heights.
+- Pelvis clearance remains a safety diagnostic and is not a search feature.
 - Query and database terrain features must use the same sampling primitive.
 - Preserve untracked build artifacts and unrelated project changes.
 
 ---
 
-### Task 1: Path-aligned feature contract
+### Task 1: Hybrid feature contract
 
 **Files:**
 - Modify: `tests/python/test_sonic_torch_terrain_features.py`
@@ -26,21 +27,24 @@
 
 **Interfaces:**
 - Consumes: `GeneratedFeatureState`, `CommandTrajectory`, and recorded root trajectories.
-- Produces: `TerrainFeatureExtension.dimension == 92` and a shared path-aligned sampling primitive.
+- Produces: `TerrainFeatureExtension.dimension == 95` and shared body/path sampling primitives.
 
 - [ ] **Step 1: Write failing query tests**
 
-Add assertions that two trajectories with different commanded directions produce different dense rows on a non-axis-symmetric grid, that turning trajectories bend sample coordinates, and that the final value equals root Z minus root-surface Z.
+Add assertions that command changes preserve the first 91 body-relative values,
+change the final four path values, and bend the four-point profile on turns.
 
 - [ ] **Step 2: Run the focused test and verify RED**
 
 Run: `PYTHONPATH=sonic/python:. python -m unittest tests.python.test_sonic_torch_terrain_features -v`
 
-Expected: failures showing the old dense row has shape 91 and does not respond to changed trajectories.
+Expected: failures showing the old dense row has shape 91 and does not include
+the command trajectory.
 
 - [ ] **Step 3: Implement the minimal shared sampler**
 
-Implement batched arc-distance centerline interpolation, local tangent/facing resolution, lateral offsets, relative-height sampling, and the appended clearance scalar. Use it from both `query_row()` and `database_rows()`.
+Retain the body-yaw sampler, append the existing four-point arc-distance profile,
+and use the combined 95-value definition in both query and database paths.
 
 - [ ] **Step 4: Run the focused test and verify GREEN**
 
@@ -62,7 +66,7 @@ git commit -m "feat: condition dense terrain features on command paths"
 
 **Interfaces:**
 - Consumes: the shared path-aligned point constructor from Task 1.
-- Produces: viewer markers at the exact 91 query sample locations.
+- Produces: viewer markers at the exact 95 query sample locations.
 
 - [ ] **Step 1: Write a failing viewer identity test**
 
@@ -98,7 +102,7 @@ git commit -m "fix: render command-conditioned terrain samples"
 - Modify only if a test exposes a representation regression.
 
 **Interfaces:**
-- Consumes: the 92-value database/query feature and path-aligned viewer.
+- Consumes: the 95-value database/query feature and hybrid viewer.
 - Produces: regression evidence and an interactive visual verdict.
 
 - [ ] **Step 1: Run focused motion, terrain, contact, rollout, and viewer suites**

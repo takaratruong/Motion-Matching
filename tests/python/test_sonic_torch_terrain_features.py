@@ -22,7 +22,6 @@ from mm_sonic.torch_terrain_features import (
     TerrainFootClearanceValidator,
     TerrainSceneAlignment,
     TerrainTransitionTerminalEvaluator,
-    dense_path_points,
 )
 from resources.g1_torch_stair_builder.publish import publish_stair_slice
 from resources.g1_torch_stair_builder.surface import ZUpHeightGrid
@@ -153,7 +152,7 @@ class TerrainFeatureTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-    def test_dense_patch_has_exact_path_major_values_and_root_clearance(self):
+    def test_dense_feature_combines_body_patch_and_command_path_profile(self):
         extension = TerrainFeatureExtension.for_condition(
             self.dataset,
             condition="dense",
@@ -166,17 +165,18 @@ class TerrainFeatureTests(unittest.TestCase):
             np.asarray(DENSE_LATERAL_M),
             indexing="ij",
         )
-        expected = (
+        body_expected = (
             0.1 * forward + 0.2 * lateral + 0.05 * forward * forward
         ).reshape(-1)
+        distance = np.array([0.25, 0.5, 0.75, 1.0])
+        path_expected = 0.1 * distance + 0.05 * distance * distance
+        expected = np.concatenate((body_expected, path_expected))
 
-        expected = np.concatenate((expected, np.array([0.8])))
-
-        self.assertEqual(extension.dimension, 92)
-        self.assertEqual(tuple(row.shape), (92,))
+        self.assertEqual(extension.dimension, 95)
+        self.assertEqual(tuple(row.shape), (95,))
         np.testing.assert_allclose(row.numpy(), expected, rtol=0.0, atol=2e-5)
 
-    def test_dense_patch_follows_commanded_lateral_path_not_root_yaw(self):
+    def test_dense_body_patch_stays_body_relative_while_profile_follows_command(self):
         extension = TerrainFeatureExtension.for_condition(
             self.dataset,
             condition="dense",
@@ -188,23 +188,25 @@ class TerrainFeatureTests(unittest.TestCase):
             np.asarray(DENSE_LATERAL_M),
             indexing="ij",
         )
-        # A +Y command makes path-forward +Y and path-left -X.
-        x = -lateral
-        y = forward
-        expected = (
-            0.1 * x + 0.2 * y + 0.05 * x * x
+        body_expected = (
+            0.1 * forward + 0.2 * lateral + 0.05 * forward * forward
         ).reshape(-1)
-        expected = np.concatenate((expected, np.array([0.8])))
+        distance = np.array([0.25, 0.5, 0.75, 1.0])
+        lateral_profile = 0.2 * distance
 
         lateral_row = extension.query_row(_state(), _lateral_trajectory())
         straight_row = extension.query_row(_state(), _straight_trajectory())
 
         np.testing.assert_allclose(
-            lateral_row.numpy(), expected, rtol=0.0, atol=2e-5
+            lateral_row[:91].numpy(), body_expected, rtol=0.0, atol=2e-5
         )
-        self.assertFalse(torch.allclose(lateral_row, straight_row))
+        np.testing.assert_allclose(
+            lateral_row[91:].numpy(), lateral_profile, rtol=0.0, atol=2e-5
+        )
+        self.assertTrue(torch.equal(lateral_row[:91], straight_row[:91]))
+        self.assertFalse(torch.allclose(lateral_row[91:], straight_row[91:]))
 
-    def test_dense_patch_centerline_bends_along_command_polyline(self):
+    def test_dense_command_profile_bends_along_command_polyline(self):
         extension = TerrainFeatureExtension.for_condition(
             self.dataset,
             condition="dense",
@@ -212,30 +214,17 @@ class TerrainFeatureTests(unittest.TestCase):
             weight=4.0,
         )
         row = extension.query_row(_state(), _right_angle_trajectory())
-        centerline = row[:-1].reshape(13, 7)[:, 3].numpy()
         center_xy = np.array(
-            [
-                [-0.15, 0.0],
-                [0.0, 0.0],
-                [0.15, 0.0],
-                [0.30, 0.0],
-                [0.30, 0.15],
-                [0.30, 0.30],
-                [0.30, 0.45],
-                [0.30, 0.60],
-                [0.30, 0.75],
-                [0.30, 0.90],
-                [0.30, 1.05],
-                [0.30, 1.20],
-                [0.30, 1.35],
-            ]
+            [[0.25, 0.0], [0.30, 0.20], [0.30, 0.45], [0.30, 0.70]]
         )
         expected = (
             0.1 * center_xy[:, 0]
             + 0.2 * center_xy[:, 1]
             + 0.05 * center_xy[:, 0] * center_xy[:, 0]
         )
-        np.testing.assert_allclose(centerline, expected, rtol=0.0, atol=2e-5)
+        np.testing.assert_allclose(
+            row[91:].numpy(), expected, rtol=0.0, atol=2e-5
+        )
 
     def test_legacy_uses_arc_distances_and_stopped_heading_extension(self):
         extension = TerrainFeatureExtension.for_condition(
@@ -278,22 +267,13 @@ class TerrainFeatureTests(unittest.TestCase):
             self.dataset.folder.clips, dense_rows, legacy_rows
         ):
             self.assertEqual(
-                tuple(dense_clip.shape), (clip.valid_frame_stop, 92)
+                tuple(dense_clip.shape), (clip.valid_frame_stop, 95)
             )
             self.assertEqual(
                 tuple(legacy_clip.shape), (clip.valid_frame_stop, 4)
             )
-        self.assertTrue(torch.equal(
-            dense_rows[0][:, :91], torch.zeros_like(dense_rows[0][:, :91])
-        ))
-        root = self.dataset.folder.layout.root_body_index
-        np.testing.assert_allclose(
-            dense_rows[0][:, 91].numpy(),
-            self.dataset.folder.clips[0].body_position_world[
-                : self.dataset.folder.clips[0].valid_frame_stop, root, 2
-            ],
-            rtol=0.0,
-            atol=1e-6,
+        self.assertTrue(
+            torch.equal(dense_rows[0], torch.zeros_like(dense_rows[0]))
         )
         self.assertTrue(
             torch.equal(legacy_rows[0], torch.zeros_like(legacy_rows[0]))
@@ -344,6 +324,12 @@ class TerrainFeatureTests(unittest.TestCase):
             clip = dataset.folder.clips[1]
             root_index = dataset.folder.layout.root_body_index
             root_xy = clip.body_position_world[0, root_index, :2]
+            quaternion = clip.body_quaternion_world_wxyz[0, root_index]
+            w, x, y, z = quaternion
+            root_yaw = math.atan2(
+                2.0 * (w * z + x * y),
+                1.0 - 2.0 * (y * y + z * z),
+            )
             scene_root = np.array(
                 [-root_xy[1] + transform[0], root_xy[0] + transform[1]]
             )
@@ -355,46 +341,30 @@ class TerrainFeatureTests(unittest.TestCase):
                     + 0.05 * xy[..., 0] * xy[..., 0]
                 )
 
-            body_position = torch.tensor(
-                clip.body_position_world[:, root_index, :2], dtype=torch.float32
+            forward, lateral = np.meshgrid(
+                np.asarray(DENSE_FORWARD_M),
+                np.asarray(DENSE_LATERAL_M),
+                indexing="ij",
             )
-            body_quaternion = clip.body_quaternion_world_wxyz[:, root_index]
-            yaw = np.arctan2(
-                2.0
-                * (
-                    body_quaternion[:, 0] * body_quaternion[:, 3]
-                    + body_quaternion[:, 1] * body_quaternion[:, 2]
-                ),
-                1.0
-                - 2.0
-                * (
-                    body_quaternion[:, 2] * body_quaternion[:, 2]
-                    + body_quaternion[:, 3] * body_quaternion[:, 3]
-                ),
+            local = np.stack((forward, lateral), axis=-1).reshape(-1, 2)
+            scene_yaw = root_yaw + transform[2]
+            cosine = math.cos(scene_yaw)
+            sine = math.sin(scene_yaw)
+            rotation = np.array([[cosine, -sine], [sine, cosine]])
+            body_points = scene_root + local @ rotation.T
+            legacy = TerrainFeatureExtension.for_condition(
+                dataset,
+                condition="legacy",
+                query_scene="stair/0000/motion.npz",
+                weight=4.0,
             )
-            facing = torch.tensor(
-                np.stack((np.cos(yaw), np.sin(yaw)), axis=-1),
-                dtype=torch.float32,
+            legacy_rows = legacy.database_rows(
+                dataset.folder, torch.device("cpu")
             )
-            recorded_points = dense_path_points(
-                body_position[0],
-                facing[0],
-                body_position[torch.tensor([15, 30, 45])],
-                facing[torch.tensor([15, 30, 45])],
-            )
-            recorded_scene_points = dataset.clip_alignments[
-                1
-            ].matcher_to_scene_xy(recorded_points).numpy()
             database_expected = np.concatenate(
                 (
-                    curved_height(recorded_scene_points)
-                    - curved_height(scene_root),
-                    np.array(
-                        [
-                            clip.body_position_world[0, root_index, 2]
-                            - curved_height(scene_root)
-                        ]
-                    ),
+                    curved_height(body_points) - curved_height(scene_root),
+                    legacy_rows[1][0].numpy(),
                 )
             )
             np.testing.assert_allclose(
@@ -403,28 +373,15 @@ class TerrainFeatureTests(unittest.TestCase):
 
             state = _state()
             trajectory = _straight_trajectory()
-            query_points = dense_path_points(
-                state.root_position_world[:2],
-                torch.tensor([1.0, 0.0]),
-                trajectory.position_world_xy,
-                trajectory.facing_world_xy,
-            )
-            query_scene_points = extension.alignment.matcher_to_scene_xy(
-                query_points
-            ).numpy()
             query_scene_root = extension.alignment.matcher_to_scene_xy(
                 state.root_position_world[:2]
             ).numpy()
+            query_body_points = query_scene_root + local @ rotation.T
             query_expected = np.concatenate(
                 (
-                    curved_height(query_scene_points)
+                    curved_height(query_body_points)
                     - curved_height(query_scene_root),
-                    np.array(
-                        [
-                            state.root_position_world[2].item()
-                            - curved_height(query_scene_root)
-                        ]
-                    ),
+                    legacy.query_row(state, trajectory).numpy(),
                 )
             )
             np.testing.assert_allclose(

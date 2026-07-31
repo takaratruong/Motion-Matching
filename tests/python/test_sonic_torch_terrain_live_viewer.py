@@ -279,16 +279,31 @@ class LiveMujocoSceneTests(unittest.TestCase):
         lateral_points = dense_patch_positions(result, measurement, lateral)
 
         np.testing.assert_allclose(
-            straight_points.reshape(13, 7, 3)[:, 3, :2],
+            straight_points[:91].reshape(13, 7, 3)[:, 3, :2],
             np.stack((np.asarray(live_module.DENSE_FORWARD_M), np.zeros(13)), axis=1),
             atol=1e-6,
         )
         np.testing.assert_allclose(
-            lateral_points.reshape(13, 7, 3)[:, 3, :2],
-            np.stack((np.zeros(13), np.asarray(live_module.DENSE_FORWARD_M)), axis=1),
+            lateral_points[:91].reshape(13, 7, 3)[:, 3, :2],
+            np.stack((np.asarray(live_module.DENSE_FORWARD_M), np.zeros(13)), axis=1),
             atol=1e-6,
         )
-        self.assertFalse(np.array_equal(straight_points, lateral_points))
+        np.testing.assert_allclose(
+            straight_points[91:, :2],
+            [[0.25, 0.0], [0.5, 0.0], [0.75, 0.0], [1.0, 0.0]],
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            lateral_points[91:, :2],
+            [[0.0, 0.25], [0.0, 0.5], [0.0, 0.75], [0.0, 1.0]],
+            atol=1e-6,
+        )
+        np.testing.assert_array_equal(
+            straight_points[:91, :2], lateral_points[:91, :2]
+        )
+        self.assertFalse(
+            np.array_equal(straight_points[91:], lateral_points[91:])
+        )
 
 
 if __name__ == "__main__":

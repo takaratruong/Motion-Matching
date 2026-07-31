@@ -23,7 +23,7 @@ from .torch_motion_matcher import (
     TorchMotionMatcher,
     predict_command_trajectory,
 )
-from .torch_terrain_features import DENSE_FORWARD_M, dense_path_points
+from .torch_terrain_features import DENSE_FORWARD_M, dense_query_points
 from .torch_terrain_rollout import (
     ResolvedStairConfig,
     load_experiment_config,
@@ -373,7 +373,7 @@ def dense_patch_positions(
     measurement,
     trajectory: CommandTrajectory,
 ) -> np.ndarray:
-    """Return the exact 91 path-conditioned samples used by terrain search."""
+    """Return the exact 95 body-and-path samples used by terrain search."""
 
     root = result.root_position_world
     quaternion = result.root_orientation_world_wxyz
@@ -389,18 +389,12 @@ def dense_patch_positions(
         2.0 * (w * z + x * y),
         1.0 - 2.0 * (y * y + z * z),
     )
-    root_facing = torch.stack((torch.cos(yaw), torch.sin(yaw)))
-    matcher_xy = dense_path_points(
-        root[:2],
-        root_facing,
-        trajectory.position_world_xy,
-        trajectory.facing_world_xy,
-    )
+    matcher_xy = dense_query_points(root[:2], yaw, trajectory)
     scene_xy = measurement.alignment.matcher_to_scene_xy(matcher_xy)
     height = measurement.query_grid.sample_xy(scene_xy)
     points = torch.cat((matcher_xy, height[:, None]), dim=1)
     output = points.detach().to("cpu").numpy().astype(np.float64)
-    if output.shape != (91, 3) or not np.isfinite(output).all():
+    if output.shape != (95, 3) or not np.isfinite(output).all():
         raise ContractError("dense terrain marker positions are invalid")
     return output
 
