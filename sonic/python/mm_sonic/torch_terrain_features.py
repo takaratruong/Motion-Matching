@@ -23,6 +23,7 @@ from .joints import ContractError
 from .torch_motion_data import G1_TAKARA_LAYOUT, MotionClip, MotionFolder
 from .torch_motion_features import (
     CommandTrajectory,
+    FEATURE_HORIZON_FRAMES,
     GeneratedFeatureState,
     resolve_torch_device,
 )
@@ -414,29 +415,151 @@ class TerrainDataset:
         )
 
 
-def _dense_local_points(
-    *, device: torch.device, dtype: torch.dtype
+def _last_finite_facing(
+    future_facings_xy: torch.Tensor,
+    root_facing_xy: torch.Tensor,
 ) -> torch.Tensor:
-    forward = torch.tensor(DENSE_FORWARD_M, device=device, dtype=dtype)
-    lateral = torch.tensor(DENSE_LATERAL_M, device=device, dtype=dtype)
-    grid_forward, grid_lateral = torch.meshgrid(
-        forward, lateral, indexing="ij"
+    """Return the last non-zero future facing, falling back to root facing."""
+
+    result = root_facing_xy
+    for index in range(future_facings_xy.shape[-2]):
+        candidate = future_facings_xy[..., index, :]
+        valid = torch.linalg.vector_norm(candidate, dim=-1) > 1e-6
+        result = torch.where(valid[..., None], candidate, result)
+    return result / torch.linalg.vector_norm(
+        result, dim=-1, keepdim=True
+    ).clamp_min(1e-6)
+
+
+def dense_path_points(
+    root_xy: torch.Tensor,
+    root_facing_xy: torch.Tensor,
+    future_positions_xy: torch.Tensor,
+    future_facings_xy: torch.Tensor,
+) -> torch.Tensor:
+    """Return the 13-by-7 dense footprint bent along a future path.
+
+    Leading dimensions may be empty for one live query or contain the database
+    frame batch. The final layout is forward-major with shape ``[..., 91, 2]``.
+    """
+
+    if root_xy.shape[-1:] != (2,):
+        raise ContractError("dense path root must have trailing shape (2,)")
+    leading = root_xy.shape[:-1]
+    if root_facing_xy.shape != (*leading, 2):
+        raise ContractError("dense path root facing shape does not match root")
+    if future_positions_xy.shape != (*leading, 3, 2):
+        raise ContractError(
+            "dense path future positions must have trailing shape (3, 2)"
+        )
+    if future_facings_xy.shape != (*leading, 3, 2):
+        raise ContractError(
+            "dense path future facings must have trailing shape (3, 2)"
+        )
+    tensors = (
+        root_xy,
+        root_facing_xy,
+        future_positions_xy,
+        future_facings_xy,
     )
-    return torch.stack((grid_forward, grid_lateral), dim=-1).reshape(-1, 2)
+    if any(
+        tensor.dtype != root_xy.dtype
+        or tensor.device != root_xy.device
+        or not torch.isfinite(tensor).all()
+        for tensor in tensors
+    ):
+        raise ContractError(
+            "dense path inputs must be finite tensors with one dtype and device"
+        )
+
+    nodes = torch.cat((root_xy[..., None, :], future_positions_xy), dim=-2)
+    segments = nodes[..., 1:, :] - nodes[..., :-1, :]
+    lengths = torch.linalg.vector_norm(segments, dim=-1)
+    cumulative = torch.cumsum(lengths, dim=-1)
+    previous = torch.cat(
+        (torch.zeros_like(cumulative[..., :1]), cumulative[..., :-1]), dim=-1
+    )
+
+    extension_facing = _last_finite_facing(
+        future_facings_xy, root_facing_xy
+    )
+    segment_valid = lengths > 1e-6
+    first_index = torch.argmax(segment_valid.to(torch.int64), dim=-1)
+    first_segment = torch.gather(
+        segments,
+        -2,
+        first_index[..., None, None].expand(*leading, 1, 2),
+    ).squeeze(-2)
+    has_segment = segment_valid.any(dim=-1)
+    initial_facing = torch.where(
+        has_segment[..., None], first_segment, extension_facing
+    )
+    initial_facing = initial_facing / torch.linalg.vector_norm(
+        initial_facing, dim=-1, keepdim=True
+    ).clamp_min(1e-6)
+
+    stations = torch.tensor(
+        DENSE_FORWARD_M, dtype=root_xy.dtype, device=root_xy.device
+    )
+    positive = stations.clamp_min(0.0)
+    crossed = cumulative[..., :, None] >= positive
+    has_crossing = crossed.any(dim=-2)
+    segment_index = torch.argmax(crossed.to(torch.int64), dim=-2)
+    gather_xy = segment_index[..., None, :].expand(*leading, 2, len(stations))
+    selected_start = torch.gather(
+        nodes[..., :-1, :].transpose(-2, -1), -1, gather_xy
+    ).transpose(-2, -1)
+    selected_segment = torch.gather(
+        segments.transpose(-2, -1), -1, gather_xy
+    ).transpose(-2, -1)
+    selected_length = torch.gather(lengths, -1, segment_index).clamp_min(1e-6)
+    selected_previous = torch.gather(previous, -1, segment_index)
+    fraction = (positive - selected_previous) / selected_length
+    interpolated = selected_start + fraction[..., None] * selected_segment
+
+    total = cumulative[..., -1]
+    extended = nodes[..., -1, None, :] + (
+        positive - total[..., None]
+    ).clamp_min(0.0)[..., None] * extension_facing[..., None, :]
+    centers = torch.where(has_crossing[..., None], interpolated, extended)
+    centers = torch.where(
+        (stations < 0.0)[..., None],
+        root_xy[..., None, :] + stations[..., None] * initial_facing[..., None, :],
+        centers,
+    )
+
+    selected_tangent = selected_segment / selected_length[..., None]
+    tangents = torch.where(
+        has_crossing[..., None], selected_tangent, extension_facing[..., None, :]
+    )
+    tangents = torch.where(
+        (stations <= 0.0)[..., None], initial_facing[..., None, :], tangents
+    )
+    left = torch.stack((-tangents[..., 1], tangents[..., 0]), dim=-1)
+    lateral = torch.tensor(
+        DENSE_LATERAL_M, dtype=root_xy.dtype, device=root_xy.device
+    )
+    points = centers[..., :, None, :] + lateral[None, :, None] * left[..., :, None, :]
+    return points.reshape(*leading, len(DENSE_FORWARD_M) * len(DENSE_LATERAL_M), 2)
 
 
 def _dense_rows(
-    root_xy: torch.Tensor,
-    root_yaw: torch.Tensor,
+    root_position: torch.Tensor,
+    root_facing_xy: torch.Tensor,
+    future_positions_xy: torch.Tensor,
+    future_facings_xy: torch.Tensor,
     grid: _TorchHeightGrid,
 ) -> torch.Tensor:
-    local = _dense_local_points(device=root_xy.device, dtype=root_xy.dtype)
-    scene_points = root_xy[:, None, :] + _rotate_xy(
-        local[None, :, :], root_yaw[:, None]
+    points = dense_path_points(
+        root_position[:, :2],
+        root_facing_xy,
+        future_positions_xy,
+        future_facings_xy,
     )
-    heights = grid.sample_xy(scene_points)
-    base = grid.sample_xy(root_xy)
-    return heights - base[:, None]
+    heights = grid.sample_xy(points)
+    base = grid.sample_xy(root_position[:, :2])
+    clearance = root_position[:, 2] - base
+    return torch.cat((heights - base[:, None], clearance[:, None]), dim=1)
 
 
 def _facing_unit(
@@ -558,7 +681,7 @@ class TerrainFeatureExtension:
 
     @property
     def dimension(self) -> int:
-        return 4 if self.condition == "legacy" else 91
+        return 4 if self.condition == "legacy" else 92
 
     @staticmethod
     def for_condition(
@@ -650,37 +773,62 @@ class TerrainFeatureExtension:
             self.dataset.clip_alignments,
         ):
             if grid is None:
-                rows.append(
-                    torch.zeros(
-                        (clip.valid_frame_stop, self.dimension),
+                flat = torch.zeros(
+                    (clip.valid_frame_stop, self.dimension),
+                    dtype=torch.float32,
+                    device=device,
+                )
+                if self.condition == "dense":
+                    flat[:, -1] = torch.tensor(
+                        clip.body_position_world[
+                            : clip.valid_frame_stop, root, 2
+                        ],
                         dtype=torch.float32,
                         device=device,
                     )
-                )
+                rows.append(flat)
                 continue
             if alignment is None:
                 raise ContractError(
                     "terrain database clip must have a motion registration"
                 )
             if self.condition == "dense":
-                position = torch.tensor(
-                    clip.body_position_world[: clip.valid_frame_stop, root, :2],
+                body_position = torch.tensor(
+                    clip.body_position_world[:, root],
                     dtype=torch.float32,
                     device=device,
                 )
                 quaternion = torch.tensor(
-                    clip.body_quaternion_world_wxyz[
-                        : clip.valid_frame_stop, root
-                    ],
+                    clip.body_quaternion_world_wxyz[:, root],
                     dtype=torch.float32,
                     device=device,
                 )
-                position = alignment.matcher_to_scene_xy(position)
+                frames = torch.arange(clip.valid_frame_stop, device=device)
+                offsets = torch.tensor(FEATURE_HORIZON_FRAMES, device=device)
+                future_frames = frames[:, None] + offsets[None, :]
+                yaw = _yaw_from_wxyz(quaternion)
+                facing = torch.stack((torch.cos(yaw), torch.sin(yaw)), dim=-1)
+                root_position = body_position[frames]
+                root_position = torch.cat(
+                    (
+                        alignment.matcher_to_scene_xy(root_position[:, :2]),
+                        root_position[:, 2:3],
+                    ),
+                    dim=1,
+                )
                 rows.append(
                     _dense_rows(
-                        position,
-                        _yaw_from_wxyz(quaternion)
-                        + alignment.yaw_scene_from_matcher,
+                        root_position,
+                        _rotate_xy(
+                            facing[frames], alignment.yaw_scene_from_matcher
+                        ),
+                        alignment.matcher_to_scene_xy(
+                            body_position[future_frames, :2]
+                        ),
+                        _rotate_xy(
+                            facing[future_frames],
+                            alignment.yaw_scene_from_matcher,
+                        ),
                         grid,
                     )
                 )
@@ -725,13 +873,19 @@ class TerrainFeatureExtension:
         yaw = _yaw_from_wxyz(quaternion)
         root_scene = self.alignment.matcher_to_scene_xy(root[:2])
         if self.condition == "dense":
-            local = _dense_local_points(device=root.device, dtype=root.dtype)
-            matcher_points = root[:2] + _rotate_xy(local, yaw)
+            root_facing = torch.stack((torch.cos(yaw), torch.sin(yaw)))
+            matcher_points = dense_path_points(
+                root[:2],
+                root_facing,
+                trajectory.position_world_xy,
+                trajectory.facing_world_xy,
+            )
             scene_points = self.alignment.matcher_to_scene_xy(matcher_points)
-            return (
-                self.query_grid.sample_xy(scene_points)
-                - self.query_grid.sample_xy(root_scene)
-            ).to(dtype=torch.float32)
+            base = self.query_grid.sample_xy(root_scene)
+            relative = self.query_grid.sample_xy(scene_points) - base
+            return torch.cat((relative, (root[2] - base)[None])).to(
+                dtype=torch.float32
+            )
 
         positions = trajectory.position_world_xy
         facings = trajectory.facing_world_xy
