@@ -14,7 +14,8 @@ import xml.etree.ElementTree as ET
 import numpy as np
 import torch
 
-from .joints import ContractError, PINNED_TARGET_TO_SOURCE_PERMUTATION
+from .joints import ContractError
+from .torch_g1_fk import target_state_qpos
 from .operator_x11 import KEYSYMS, X11KeyStateProvider
 from .torch_motion_matcher import MotionMatchResult, TorchMotionMatcher
 from .torch_terrain_features import DENSE_FORWARD_M, DENSE_LATERAL_M
@@ -161,16 +162,9 @@ def matcher_result_qpos(result: object) -> np.ndarray:
         )
     except AttributeError as error:
         raise ContractError("matcher result is missing kinematic state") from error
-    quaternion_norm = float(np.linalg.norm(root_orientation))
-    if abs(quaternion_norm - 1.0) > 1e-4:
-        raise ContractError("matcher root orientation must be unit length")
-    source_joints = np.empty(29, np.float64)
-    source_joints[
-        np.asarray(PINNED_TARGET_TO_SOURCE_PERMUTATION, np.int64)
-    ] = target_joints
-    qpos = np.concatenate(
-        (root_position, root_orientation, source_joints)
-    ).astype(np.float64, copy=False)
+    qpos = target_state_qpos(
+        target_joints, root_position, root_orientation
+    )
     if qpos.shape != (36,) or not np.isfinite(qpos).all():
         raise ContractError("converted matcher qpos is invalid")
     return qpos
