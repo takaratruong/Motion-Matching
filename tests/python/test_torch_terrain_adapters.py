@@ -44,7 +44,7 @@ def _source(
     motion_to_terrain_xy_yaw: tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> ResolvedSource:
     motion = root / "motion.npz"
-    motion.write_bytes(b"fixture")
+    np.savez(motion, fixture=np.zeros(1, np.float32))
     return ResolvedSource(
         spec=SourceSpec(
             logical_name=f"{family}-fixture",
@@ -221,6 +221,23 @@ class ExpandedTerrainAdapterTests(unittest.TestCase):
                 "BOX_SIZE = [0.4572, 0.4064, 0.3]\n",
                 encoding="utf-8",
             )
+            self.assertIsNone(
+                build_source_terrain(
+                    source,
+                    _motion(),
+                    chair_config_path=config,
+                    chair_config_sha256=None,
+                )
+            )
+            object_position = np.zeros((60, 3), np.float64)
+            object_position[:, :2] = (-0.1, 0.5)
+            object_quaternion = np.zeros((60, 4), np.float32)
+            object_quaternion[:, 0] = 1.0
+            np.savez(
+                source.motion_path,
+                object_pos_w=object_position,
+                object_quat_w=object_quaternion,
+            )
             evidence = build_source_terrain(
                 source,
                 _motion(),
@@ -234,6 +251,112 @@ class ExpandedTerrainAdapterTests(unittest.TestCase):
             [0.3, 0.0],
             atol=0.011,
         )
+
+    def test_chair_registration_matches_embedded_constant_object_pose(self):
+        recorded_xy = np.array(
+            [-0.07415730506181717, 0.3856179714202881],
+            np.float32,
+        )
+        expected = (
+            float(-0.1 - recorded_xy[0]),
+            float(0.5 - recorded_xy[1]),
+            0.0,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "chair.py"
+            config.write_text(
+                "BOX_POSITION = [-0.1, 0.50, 0.15]\n"
+                "BOX_SIZE = [0.4572, 0.4064, 0.3]\n",
+                encoding="utf-8",
+            )
+            source = _source(
+                root,
+                family="curb-chair",
+                terrain_adapter="chair-object",
+                motion_to_terrain_xy_yaw=expected,
+            )
+            object_position = np.zeros((60, 3), np.float32)
+            object_position[:, :2] = recorded_xy
+            object_quaternion = np.zeros((60, 4), np.float32)
+            object_quaternion[:, 0] = 1.0
+            np.savez(
+                source.motion_path,
+                object_pos_w=object_position,
+                object_quat_w=object_quaternion,
+            )
+            evidence = build_source_terrain(
+                source,
+                _motion(),
+                chair_config_path=config,
+                chair_config_sha256=None,
+            )
+            self.assertEqual(
+                evidence.motion_to_terrain_xy_yaw, expected
+            )
+
+            mismatched = _source(
+                root,
+                family="curb-chair",
+                terrain_adapter="chair-object",
+            )
+            np.savez(
+                mismatched.motion_path,
+                object_pos_w=object_position,
+                object_quat_w=object_quaternion,
+            )
+            with self.assertRaisesRegex(
+                ValueError, "recorded object pose"
+            ):
+                build_source_terrain(
+                    mismatched,
+                    _motion(),
+                    chair_config_path=config,
+                    chair_config_sha256=None,
+                )
+
+            invalid_position = object_position.copy()
+            invalid_position[-1, 0] += 0.01
+            invalid_quaternion = object_quaternion.copy()
+            invalid_quaternion[-1] = np.array(
+                [0.999, 0.0, 0.0, 0.0447], np.float32
+            )
+            rotated_quaternion = np.zeros_like(object_quaternion)
+            rotated_quaternion[:, 0] = np.sqrt(0.5)
+            rotated_quaternion[:, 3] = np.sqrt(0.5)
+            for name, positions, quaternions in (
+                (
+                    "nonconstant-position",
+                    invalid_position,
+                    object_quaternion,
+                ),
+                (
+                    "nonconstant-quaternion",
+                    object_position,
+                    invalid_quaternion,
+                ),
+                (
+                    "rotated-object",
+                    object_position,
+                    rotated_quaternion,
+                ),
+            ):
+                with self.subTest(recorded_pose=name):
+                    np.savez(
+                        source.motion_path,
+                        object_pos_w=positions,
+                        object_quat_w=quaternions,
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "constant with identity rotation",
+                    ):
+                        build_source_terrain(
+                            source,
+                            _motion(),
+                            chair_config_path=config,
+                            chair_config_sha256=None,
+                        )
 
     def test_invalid_karen_metadata_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:

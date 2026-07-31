@@ -77,6 +77,19 @@ class ExpandedTerrainRegistryTests(unittest.TestCase):
             backward_stair.motion_to_terrain_xy_yaw,
             (-0.24, -0.10, math.pi / 2.0),
         )
+        chair_climb = next(
+            spec
+            for spec in CANDIDATE_SPECS
+            if spec.logical_name == "chair-step-climbing-final"
+        )
+        self.assertEqual(
+            chair_climb.motion_to_terrain_xy_yaw,
+            (
+                -0.025842694938182836,
+                0.11438202857971191,
+                0.0,
+            ),
+        )
         self.assertNotIn("crane", by_name)
 
     def test_resolver_rejects_changed_hash_symlink_and_escape(self):

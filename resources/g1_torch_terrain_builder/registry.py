@@ -232,6 +232,13 @@ _LOCAL_IDENTITIES = (
 )
 
 _MOTION_TO_TERRAIN_XY_YAW = {
+    # Pinned chair config XY (-0.1, 0.5) minus the source archive's constant
+    # object_pos_w XY (-0.07415730506181717, 0.3856179714202881).
+    "chair-step-climbing-final": (
+        -0.025842694938182836,
+        0.11438202857971191,
+        0.0,
+    ),
     "down-continuous-33": (-0.29, 3.99, -math.pi / 2.0),
     "staircase-final-v3": (-0.24, -0.10, math.pi / 2.0),
 }

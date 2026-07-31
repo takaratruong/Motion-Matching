@@ -296,6 +296,68 @@ def _chair_box(
     )
 
 
+def _validate_recorded_chair_registration(
+    source: ResolvedSource,
+    config_path: Path,
+) -> bool:
+    try:
+        with np.load(source.motion_path, allow_pickle=False) as archive:
+            present = {
+                name for name in ("object_pos_w", "object_quat_w")
+                if name in archive.files
+            }
+            if not present:
+                return False
+            if present != {"object_pos_w", "object_quat_w"}:
+                raise ValueError(
+                    "recorded chair object pose fields are incomplete"
+                )
+            position = np.asarray(archive["object_pos_w"], np.float64)
+            quaternion = np.asarray(archive["object_quat_w"], np.float64)
+    except ValueError:
+        raise
+    except Exception as error:
+        raise ValueError(
+            "recorded chair object pose cannot be loaded"
+        ) from error
+    if (
+        position.ndim != 2
+        or position.shape[1:] != (3,)
+        or quaternion.shape != (len(position), 4)
+        or not len(position)
+        or not np.isfinite(position).all()
+        or not np.isfinite(quaternion).all()
+        or not np.array_equal(
+            position, np.broadcast_to(position[0], position.shape)
+        )
+        or not np.array_equal(
+            quaternion, np.broadcast_to(quaternion[0], quaternion.shape)
+        )
+        or not np.allclose(
+            quaternion[0], (1.0, 0.0, 0.0, 0.0), rtol=0.0, atol=1e-7
+        )
+    ):
+        raise ValueError(
+            "recorded chair object pose must be constant with identity rotation"
+        )
+    configured_position = _literal_assignment(config_path, "BOX_POSITION")
+    expected = (
+        float(configured_position[0] - position[0, 0]),
+        float(configured_position[1] - position[0, 1]),
+        0.0,
+    )
+    if not np.allclose(
+        source.spec.motion_to_terrain_xy_yaw,
+        expected,
+        rtol=0.0,
+        atol=1e-12,
+    ):
+        raise ValueError(
+            "motion-to-terrain registration does not match recorded object pose"
+        )
+    return True
+
+
 def _geometry_hashes(source: ResolvedSource) -> Mapping[str, str]:
     return MappingProxyType(
         {
@@ -312,7 +374,7 @@ def build_source_terrain(
     *,
     chair_config_path: str | Path = _DEFAULT_CHAIR_CONFIG,
     chair_config_sha256: str | None = _DEFAULT_CHAIR_CONFIG_SHA256,
-) -> TerrainEvidence:
+) -> TerrainEvidence | None:
     if not isinstance(source, ResolvedSource):
         raise TypeError("source must be a ResolvedSource")
     adapter = source.spec.terrain_adapter
@@ -328,6 +390,8 @@ def build_source_terrain(
     elif adapter == "chair-object":
         config = Path(chair_config_path).resolve()
         boxes = _chair_box(config, expected_sha256=chair_config_sha256)
+        if not _validate_recorded_chair_registration(source, config):
+            return None
         grid = _boxes_grid(boxes, motion)
         hashes[f"chair-config:{config}"] = _sha256(config)
     elif adapter == "grail-usd":
