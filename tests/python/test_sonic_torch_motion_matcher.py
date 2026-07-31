@@ -21,6 +21,7 @@ from mm_sonic.torch_motion_matcher import (
     decay_spring_offsets,
     predict_command_trajectory,
     rank_exact_transition_candidates,
+    select_exact_candidate,
 )
 from mm_sonic.torch_transition_reachability import ReachabilityLimits
 from mm_sonic.torch_motion_data import MotionFolder
@@ -64,6 +65,112 @@ class _ScriptedWindowValidator:
 
 
 class TorchMotionMatcherTests(unittest.TestCase):
+    def test_transition_eligibility_masks_only_search_transitions(self):
+        arrays = build_varying_takara_arrays(frames=80)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(root, device="cpu")
+            query = matcher.database._search_features[0].clone()
+            rows = matcher.database.feature_shape[0]
+            eligible = torch.zeros(rows, dtype=torch.bool)
+            eligible[2] = True
+
+            initial = select_exact_candidate(
+                matcher.database,
+                query,
+                current_clip_index=0,
+                current_frame_index=0,
+                incumbent_row=None,
+                search=True,
+                config=MatcherConfig(exclusion_frames=0),
+                transition_eligible_rows=eligible,
+            )
+            incumbent = select_exact_candidate(
+                matcher.database,
+                query,
+                current_clip_index=0,
+                current_frame_index=0,
+                incumbent_row=1,
+                search=True,
+                config=MatcherConfig(exclusion_frames=0),
+                transition_eligible_rows=torch.zeros_like(eligible),
+            )
+            ranked = rank_exact_transition_candidates(
+                matcher.database,
+                query,
+                current_clip_index=0,
+                current_frame_index=0,
+                config=MatcherConfig(exclusion_frames=0),
+                transition_eligible_rows=eligible,
+            )
+
+        self.assertEqual(initial.selected_row, 2)
+        self.assertEqual(incumbent.selected_row, 1)
+        self.assertEqual([value.selected_row for value in ranked], [2])
+
+    def test_explicit_no_contact_policy_is_vanilla_bitwise(self):
+        arrays = build_varying_takara_arrays(frames=180)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            default = TorchMotionMatcher.from_folder(root, device="cpu")
+            explicit = TorchMotionMatcher.from_folder(
+                root, device="cpu", contact_segment_policy=None
+            )
+            default.reset()
+            explicit.reset()
+            for step in range(100):
+                command = (0.5, 0.0) if step < 50 else (-0.4, 0.2)
+                heading = 0.0 if step < 50 else 2.7
+                left = default.step(command, heading)
+                right = explicit.step(command, heading)
+                for field in (
+                    "joint_position", "joint_velocity",
+                    "root_position_world", "root_orientation_world_wxyz",
+                    "dense_joint_position_window",
+                    "dense_root_position_window",
+                    "dense_feature_body_position_window",
+                ):
+                    self.assertTrue(
+                        torch.equal(getattr(left, field), getattr(right, field)),
+                        field,
+                    )
+                self.assertEqual(
+                    replace(
+                        left.diagnostics,
+                        search_time_ns=None,
+                        step_time_ns=0,
+                    ),
+                    replace(
+                        right.diagnostics,
+                        search_time_ns=None,
+                        step_time_ns=0,
+                    ),
+                )
+
+    def test_aligned_targets_apply_one_rigid_vertical_translation(self):
+        arrays = build_varying_takara_arrays(frames=80)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(root, device="cpu")
+            zero = matcher._aligned_targets(
+                0, 0, torch.tensor(0.0), torch.zeros(2),
+                translation_z=0.0, horizon=46,
+            )
+            raised = matcher._aligned_targets(
+                0, 0, torch.tensor(0.0), torch.zeros(2),
+                translation_z=0.4, horizon=46,
+            )
+
+        expected_root = torch.tensor([0, 0, 0.4]).expand(46, 3)
+        expected_body = torch.tensor([0, 0, 0.4]).expand(46, 3, 3)
+        torch.testing.assert_close(raised[2] - zero[2], expected_root)
+        torch.testing.assert_close(
+            raised[6] - zero[6], expected_body
+        )
+
     def test_transition_reachability_budget_caps_actual_compositions(self):
         arrays = build_varying_takara_arrays(frames=140)
         with tempfile.TemporaryDirectory() as tmp:

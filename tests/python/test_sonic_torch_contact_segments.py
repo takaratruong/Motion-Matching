@@ -12,6 +12,8 @@ try:
     from mm_sonic.torch_contact_segments import (
         ContactSegment,
         ContactSegmentIndex,
+        SegmentPlacement,
+        TerrainContactSegmentPolicy,
         segments_from_support_mask,
     )
 except ImportError:
@@ -33,6 +35,56 @@ except ImportError:
 
     def segments_from_support_mask(*_args, **_kwargs):
         raise AssertionError("contact segmentation is missing")
+
+    SegmentPlacement = TerrainContactSegmentPolicy = None
+
+
+class _ConstantGrid:
+    def __init__(self, height):
+        self.height = float(height)
+
+    def sample_xy(self, points):
+        return torch.full(
+            points.shape[:-1], self.height, dtype=points.dtype,
+            device=points.device,
+        )
+
+
+class _IdentityAlignment:
+    def matcher_to_scene_xy(self, points):
+        return points
+
+
+def _placement_policy():
+    flat = torch.zeros((80, 2), dtype=torch.bool)
+    terrain = torch.zeros((80, 2), dtype=torch.bool)
+    terrain[10:29, 0] = True
+    terrain[30:49, 1] = True
+    terrain[50:70, 0] = True
+    index = ContactSegmentIndex.from_support_masks(
+        (flat, terrain), terrain_clip_indices=(1,),
+        minimum_frames=5, maximum_frames=60,
+    )
+    body = torch.zeros((80, 3, 3), dtype=torch.float32)
+    body[:, 1, :2] = torch.tensor([0.25, 0.10])
+    body[:, 2, :2] = torch.tensor([0.25, -0.10])
+    body[:, 1:, 2] = 0.135
+    clip = SimpleNamespace(body_position_world=body.numpy())
+    layout = SimpleNamespace(
+        left_foot_body_index=1, right_foot_body_index=2,
+    )
+    dataset = SimpleNamespace(
+        folder=SimpleNamespace(clips=(SimpleNamespace(), clip), layout=layout),
+        clip_grids=(None, _ConstantGrid(0.10)),
+        clip_alignments=(None, _IdentityAlignment()),
+        device=torch.device("cpu"),
+    )
+    extension = SimpleNamespace(
+        dataset=dataset,
+        query_grid=_ConstantGrid(0.50),
+        alignment=_IdentityAlignment(),
+    )
+    return TerrainContactSegmentPolicy(index=index, extension=extension)
 
 
 class ContactSegmentTests(unittest.TestCase):
@@ -132,6 +184,63 @@ class ContactSegmentTests(unittest.TestCase):
 
         self.assertEqual(eligible.dtype, torch.bool)
         self.assertEqual(eligible.tolist(), [True, True, False, True, True])
+
+    def test_policy_places_whole_segment_by_entering_support_surface(self):
+        policy = _placement_policy()
+
+        placement = policy.resolve_entry(
+            clip_index=1,
+            frame_index=10,
+            yaw_offset=torch.tensor(0.0),
+            translation_xy=torch.tensor([2.0, 0.0]),
+            current_support_mask=torch.tensor([False, False]),
+        )
+
+        self.assertIsInstance(placement, SegmentPlacement)
+        self.assertEqual(placement.segment, ContactSegment(1, 10, 30, 0))
+        self.assertAlmostEqual(placement.vertical_offset_m, 0.40, places=6)
+        self.assertEqual(tuple(placement.source_support_mask.shape), (20, 2))
+        self.assertTrue(bool(placement.source_support_mask[0, 0]))
+
+    def test_policy_rejects_instant_opposite_support_switch(self):
+        policy = _placement_policy()
+        arguments = dict(
+            clip_index=1,
+            frame_index=10,
+            yaw_offset=torch.tensor(0.0),
+            translation_xy=torch.zeros(2),
+        )
+
+        self.assertIsNone(
+            policy.resolve_entry(
+                **arguments,
+                current_support_mask=torch.tensor([False, True]),
+            )
+        )
+        self.assertIsNotNone(
+            policy.resolve_entry(
+                **arguments,
+                current_support_mask=torch.tensor([True, False]),
+            )
+        )
+        self.assertIsNotNone(
+            policy.resolve_entry(
+                **arguments,
+                current_support_mask=torch.tensor([False, False]),
+            )
+        )
+
+    def test_policy_samples_current_query_support_with_frozen_thresholds(self):
+        policy = _placement_policy()
+        bodies = torch.tensor(
+            [[0.0, 0.0, 0.8], [0.0, 0.1, 0.535], [0.0, -0.1, 0.60]]
+        )
+        velocities = torch.zeros((3, 3))
+        velocities[2, 2] = 0.2
+
+        support = policy.query_support_mask(bodies, velocities)
+
+        self.assertEqual(support.tolist(), [True, False])
 
 
 @unittest.skipUnless(

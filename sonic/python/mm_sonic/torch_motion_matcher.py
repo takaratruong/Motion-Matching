@@ -11,6 +11,10 @@ from typing import Protocol, Sequence
 import torch
 
 from .joints import ContractError
+from .torch_contact_segments import (
+    SegmentPlacement,
+    TerrainContactSegmentPolicy,
+)
 from .torch_motion_continuity import (
     TransitionContinuityCosts,
     TransitionContinuityDatabase,
@@ -376,6 +380,28 @@ def _validated_transition_costs(
     return costs
 
 
+def _validated_transition_eligible_rows(
+    features: torch.Tensor,
+    transition_eligible_rows: torch.Tensor | None,
+) -> torch.Tensor:
+    if transition_eligible_rows is None:
+        return torch.ones(
+            features.shape[0], dtype=torch.bool, device=features.device
+        )
+    eligible = transition_eligible_rows
+    if (
+        not isinstance(eligible, torch.Tensor)
+        or eligible.dtype != torch.bool
+        or tuple(eligible.shape) != (features.shape[0],)
+        or eligible.device != features.device
+    ):
+        raise ContractError(
+            "transition_eligible_rows must be boolean with one row on the "
+            "database device"
+        )
+    return eligible
+
+
 def select_exact_candidate(
     database: TorchMotionDatabase,
     normalized_query: torch.Tensor,
@@ -387,6 +413,7 @@ def select_exact_candidate(
     config: MatcherConfig = MatcherConfig(),
     additional_transition_penalty: float = 0.0,
     additional_transition_costs: torch.Tensor | None = None,
+    transition_eligible_rows: torch.Tensor | None = None,
 ) -> SearchDecision:
     """Select the exact lowest-cost eligible row with continuation hysteresis."""
     additional_penalty = float(additional_transition_penalty)
@@ -399,6 +426,9 @@ def select_exact_candidate(
     )
     transition_costs = _validated_transition_costs(
         features, additional_transition_costs
+    )
+    transition_eligible = _validated_transition_eligible_rows(
+        features, transition_eligible_rows
     )
     if incumbent_row is None and not search:
         raise ContractError("search=False requires a valid incumbent")
@@ -437,6 +467,7 @@ def select_exact_candidate(
         <= config.exclusion_frames
     )
     eligible &= ~local
+    eligible &= transition_eligible
     if incumbent_row is not None:
         eligible[incumbent_row] = True
 
@@ -509,6 +540,7 @@ def rank_exact_transition_candidates(
     current_frame_index: int,
     config: MatcherConfig = MatcherConfig(),
     additional_transition_costs: torch.Tensor | None = None,
+    transition_eligible_rows: torch.Tensor | None = None,
 ) -> tuple[SearchDecision, ...]:
     """Rank every finite eligible transition by exact matching cost."""
 
@@ -517,6 +549,9 @@ def rank_exact_transition_candidates(
     )
     transition_costs = _validated_transition_costs(
         features, additional_transition_costs
+    )
+    transition_eligible = _validated_transition_eligible_rows(
+        features, transition_eligible_rows
     )
     feature_costs = torch.sum(
         torch.square(features - normalized_query.unsqueeze(0)), dim=1
@@ -533,6 +568,7 @@ def rank_exact_transition_candidates(
         <= config.exclusion_frames
     )
     eligible &= ~local
+    eligible &= transition_eligible
     eligible &= torch.isfinite(feature_costs)
     eligible_rows = torch.nonzero(eligible, as_tuple=False).flatten()
     if eligible_rows.numel() == 0:
@@ -740,6 +776,7 @@ class _MatcherState:
     frame_index: int
     yaw_offset: torch.Tensor
     translation_xy: torch.Tensor
+    translation_z: float
     shaped_velocity: torch.Tensor
     shaped_heading: torch.Tensor
     joint_position: torch.Tensor
@@ -860,6 +897,9 @@ class _ComposedCandidate:
     transitioned: bool
     yaw_offset: torch.Tensor
     translation_xy: torch.Tensor
+    translation_z: float
+    segment_placement: SegmentPlacement | None
+    contact_entry_valid: bool
     offsets: _Offsets
     dense_joint_position: torch.Tensor
     dense_joint_velocity: torch.Tensor
@@ -918,6 +958,7 @@ class TorchMotionMatcher:
         clips: tuple[_DeviceClip, ...],
         config: MatcherConfig,
         emitted_window_validator: EmittedWindowValidator | None = None,
+        contact_segment_policy: TerrainContactSegmentPolicy | None = None,
     ) -> None:
         jerk_weight = config.transition_window_jerk_weight
         if (
@@ -979,6 +1020,29 @@ class TorchMotionMatcher:
         self.device = database.device
         self.config = config
         self._emitted_window_validator = emitted_window_validator
+        if (
+            contact_segment_policy is not None
+            and not isinstance(
+                contact_segment_policy, TerrainContactSegmentPolicy
+            )
+        ):
+            raise ContractError("contact_segment_policy is invalid")
+        if contact_segment_policy is not None:
+            policy_folder = contact_segment_policy.dataset.folder
+            if (
+                torch.device(contact_segment_policy.dataset.device)
+                != database.device
+                or policy_folder.inventory_sha256 != folder.inventory_sha256
+            ):
+                raise ContractError(
+                    "contact segment policy does not match the motion database"
+                )
+        self._contact_segment_policy = contact_segment_policy
+        self._transition_eligible_rows = (
+            None
+            if contact_segment_policy is None
+            else contact_segment_policy.entry_eligibility(database)
+        )
         self._clips = clips
         self._row_sources = tuple(
             zip(
@@ -1001,6 +1065,7 @@ class TorchMotionMatcher:
         reset_clip_path: str | None = None,
         emitted_window_validator: EmittedWindowValidator | None = None,
         normalization_override: FeatureNormalization | None = None,
+        contact_segment_policy: TerrainContactSegmentPolicy | None = None,
     ) -> "TorchMotionMatcher":
         resolved = resolve_torch_device(
             "cuda" if device == "auto" and torch.cuda.is_available()
@@ -1054,6 +1119,7 @@ class TorchMotionMatcher:
             clips,
             config,
             emitted_window_validator,
+            contact_segment_policy,
         )
 
     @property
@@ -1070,9 +1136,17 @@ class TorchMotionMatcher:
         frame_index: int,
         yaw_offset: torch.Tensor,
         translation_xy: torch.Tensor,
+        *,
+        translation_z: float,
+        horizon: int,
     ) -> tuple[torch.Tensor, ...]:
+        if type(horizon) is not int or horizon < 1:
+            raise ContractError("aligned target horizon must be positive")
+        vertical = float(translation_z)
+        if not math.isfinite(vertical):
+            raise ContractError("aligned target vertical translation must be finite")
         clip = self._clips[clip_index]
-        sl = slice(frame_index, frame_index + 46)
+        sl = slice(frame_index, frame_index + horizon)
         root = self.folder.layout.root_body_index
         bodies = torch.tensor(
             (
@@ -1087,12 +1161,17 @@ class TorchMotionMatcher:
         body_p = _rotate_z(clip.body_position[sl][:, bodies], yaw_offset)
         body_p = body_p.clone()
         body_p[..., :2] += translation_xy
+        if vertical != 0.0:
+            body_p[..., 2] += vertical
         body_v = _rotate_z(clip.body_linear_velocity[sl][:, bodies], yaw_offset)
         root_p = body_p[:, 0]
         root_v = body_v[:, 0]
         yaw_q = _quat_from_yaw(yaw_offset)
         root_q = _quat_normalize(
-            _quat_mul(yaw_q.expand(46, 4), clip.body_quaternion[sl, root])
+            _quat_mul(
+                yaw_q.expand(horizon, 4),
+                clip.body_quaternion[sl, root],
+            )
         )
         root_w = _rotate_z(clip.body_angular_velocity[sl, root], yaw_offset)
         return joint_p, joint_v, root_p, root_q, root_v, root_w, body_p, body_v
@@ -1120,6 +1199,7 @@ class TorchMotionMatcher:
             current_frame_index=state.frame_index,
             config=self.config,
             additional_transition_costs=transition_costs,
+            transition_eligible_rows=self._transition_eligible_rows,
         )
         rescue_time = time.perf_counter_ns() - rescue_start
         search_time = (
@@ -1144,13 +1224,15 @@ class TorchMotionMatcher:
                 rescue_decision.selected_row,
                 successor,
             )
-            rescue_accepted = validator(
-                rescue_candidate.dense_body_position.clone()
-            )
-            if type(rescue_accepted) is not bool:
-                raise ContractError(
-                    "emitted-window validator must return exact bool"
+            rescue_accepted = rescue_candidate.contact_entry_valid
+            if rescue_accepted and validator is not None:
+                rescue_accepted = validator(
+                    rescue_candidate.dense_body_position[:46].clone()
                 )
+                if type(rescue_accepted) is not bool:
+                    raise ContractError(
+                        "emitted-window validator must return exact bool"
+                    )
             if rescue_accepted:
                 safe_rescue = (
                     rank,
@@ -1202,6 +1284,7 @@ class TorchMotionMatcher:
             current_frame_index=state.frame_index,
             config=self.config,
             additional_transition_costs=transition_costs,
+            transition_eligible_rows=self._transition_eligible_rows,
         )
         rerank_time = time.perf_counter_ns() - rerank_start
         search_time = (
@@ -1240,6 +1323,8 @@ class TorchMotionMatcher:
                     ranked_decision.selected_row,
                     successor,
                 )
+            if not reranked_candidate.contact_entry_valid:
+                continue
             records.append(
                 (
                     ranked_decision,
@@ -1280,7 +1365,7 @@ class TorchMotionMatcher:
                 and validator is not None
             ):
                 accepted = validator(
-                    reranked_candidate.dense_body_position.clone()
+                    reranked_candidate.dense_body_position[:46].clone()
                 )
                 if type(accepted) is not bool:
                     raise ContractError(
@@ -1321,6 +1406,8 @@ class TorchMotionMatcher:
         transitioned = (
             incumbent_row is None or selected_row != incumbent_row
         )
+        placement = None
+        contact_entry_valid = True
         if transitioned:
             clip = self._clips[clip_index]
             root = self.folder.layout.root_body_index
@@ -1337,11 +1424,41 @@ class TorchMotionMatcher:
             )
             rotated = _rotate_z(source_pos, yaw_offset)
             translation = desired_xy - rotated[:2]
+            translation_z = 0.0
+            policy = self._contact_segment_policy
+            if (
+                policy is not None
+                and clip_index in policy.index.terrain_clip_indices
+            ):
+                current_support = policy.query_support_mask(
+                    state.feature_body_position,
+                    state.feature_body_velocity,
+                )
+                placement = policy.resolve_entry(
+                    clip_index=clip_index,
+                    frame_index=frame_index,
+                    yaw_offset=yaw_offset,
+                    translation_xy=translation,
+                    current_support_mask=current_support,
+                )
+                contact_entry_valid = placement is not None
+                if placement is not None:
+                    translation_z = placement.vertical_offset_m
         else:
             yaw_offset = state.yaw_offset
             translation = state.translation_xy
+            translation_z = state.translation_z
+        horizon = max(
+            46,
+            placement.segment.frame_count if placement is not None else 46,
+        )
         targets = self._aligned_targets(
-            clip_index, frame_index, yaw_offset, translation
+            clip_index,
+            frame_index,
+            yaw_offset,
+            translation,
+            translation_z=translation_z,
+            horizon=horizon,
         )
         jp, jv, rp, rq, rv, rw, bp, bv = targets
         if transitioned:
@@ -1373,7 +1490,7 @@ class TorchMotionMatcher:
                 state.offsets.elapsed_s + self.config.dt,
             )
         times = (
-            torch.arange(46, device=self.device, dtype=torch.float32)
+            torch.arange(horizon, device=self.device, dtype=torch.float32)
             * self.config.dt
             + offsets.elapsed_s
         )
@@ -1407,6 +1524,9 @@ class TorchMotionMatcher:
             transitioned=transitioned,
             yaw_offset=yaw_offset,
             translation_xy=translation,
+            translation_z=translation_z,
+            segment_placement=placement,
+            contact_entry_valid=contact_entry_valid,
             offsets=offsets,
             dense_joint_position=jp + jpo,
             dense_joint_velocity=jv + jvo,
@@ -1529,6 +1649,7 @@ class TorchMotionMatcher:
             frame_index=candidate.frame_index + advance_frames,
             yaw_offset=candidate.yaw_offset,
             translation_xy=candidate.translation_xy,
+            translation_z=candidate.translation_z,
             shaped_velocity=velocity.clone(),
             shaped_heading=heading.clone(),
             joint_position=candidate.dense_joint_position[index].clone(),
@@ -1662,6 +1783,9 @@ class TorchMotionMatcher:
                     current_frame_index=context.state.frame_index,
                     config=self.config,
                     additional_transition_costs=transition_costs,
+                    transition_eligible_rows=(
+                        self._transition_eligible_rows
+                    ),
                 )
                 ranked_contexts.append(
                     (context, shaped, successor, ranked)
@@ -1698,7 +1822,7 @@ class TorchMotionMatcher:
 
         def is_safe(node: _ReachabilityNode, _command) -> bool:
             accepted = diagnostic_validator(
-                node.candidate.dense_body_position.clone()
+                node.candidate.dense_body_position[:46].clone()
             )
             if type(accepted) is not bool:
                 raise ContractError(
@@ -1708,7 +1832,7 @@ class TorchMotionMatcher:
 
         def is_terminal(node: _ReachabilityNode, _command) -> bool:
             terminal = terminal_evaluator(
-                node.candidate.dense_body_position.clone(),
+                node.candidate.dense_body_position[:46].clone(),
                 node.candidate.clip_index,
                 node.candidate.frame_index,
                 requested_velocity.clone(),
@@ -1759,6 +1883,12 @@ class TorchMotionMatcher:
         dense_body_p: torch.Tensor,
         dense_body_v: torch.Tensor,
     ) -> MotionMatchResult:
+        dense_joint_p = dense_joint_p[:46]
+        dense_joint_v = dense_joint_v[:46]
+        dense_root_p = dense_root_p[:46]
+        dense_root_q = dense_root_q[:46]
+        dense_body_p = dense_body_p[:46]
+        dense_body_v = dense_body_v[:46]
         sample = torch.arange(0, 46, 5, device=self.device)
         if decision.transitioned:
             if continuity is None:
@@ -1878,7 +2008,12 @@ class TorchMotionMatcher:
         rotated_root = _rotate_z(source_root, yaw_offset)
         translation = -rotated_root[:2]
         targets = self._aligned_targets(
-            clip_index, frame_index, yaw_offset, translation
+            clip_index,
+            frame_index,
+            yaw_offset,
+            translation,
+            translation_z=0.0,
+            horizon=46,
         )
         jp, jv, rp, rq, rv, rw, bp, bv = targets
         zeros = _Offsets(
@@ -1915,7 +2050,7 @@ class TorchMotionMatcher:
             dense_body_v=bv,
         )
         self._state = _MatcherState(
-            0, clip_index, frame_index, yaw_offset, translation,
+            0, clip_index, frame_index, yaw_offset, translation, 0.0,
             torch.zeros(2, device=self.device),
             torch.zeros((), device=self.device),
             jp[0].clone(), jv[0].clone(), rp[0].clone(), rq[0].clone(),
@@ -2020,6 +2155,7 @@ class TorchMotionMatcher:
             config=self.config,
             additional_transition_penalty=settle_penalty,
             additional_transition_costs=transition_costs,
+            transition_eligible_rows=self._transition_eligible_rows,
         )
         search_time = time.perf_counter_ns() - search_start if search else None
         candidate = self._compose_candidate(
@@ -2029,8 +2165,49 @@ class TorchMotionMatcher:
         terrain_safety_override = False
         terrain_safety_override_rank = 0
         validator = self._emitted_window_validator
+        if not candidate.contact_entry_valid:
+            rescue = self._ranked_terrain_rescue(
+                state,
+                shaped,
+                query,
+                transition_costs,
+                successor,
+                decision.incumbent_cost,
+                validator,
+                search_time,
+                additional_transition_penalty=settle_penalty,
+                maximum_total_cost=(
+                    decision.incumbent_cost
+                    if successor is not None
+                    else None
+                ),
+                require_safe_candidate=successor is None,
+            )
+            if rescue is not None:
+                (
+                    terrain_safety_override_rank,
+                    decision,
+                    candidate,
+                    search_time,
+                ) = rescue
+                terrain_safety_override = True
+            else:
+                assert successor is not None
+                candidate = self._compose_candidate(
+                    state, shaped, successor, successor
+                )
+                decision = SearchDecision(
+                    selected_row=successor,
+                    incumbent_row=successor,
+                    incumbent_cost=decision.incumbent_cost,
+                    selected_feature_cost=decision.incumbent_cost,
+                    selected_total_cost=decision.incumbent_cost,
+                    searched=decision.searched,
+                    transitioned=False,
+                )
+                transition_rejected = True
         if validator is not None:
-            accepted = validator(candidate.dense_body_position.clone())
+            accepted = validator(candidate.dense_body_position[:46].clone())
             if type(accepted) is not bool:
                 raise ContractError(
                     "emitted-window validator must return exact bool"
@@ -2082,7 +2259,7 @@ class TorchMotionMatcher:
                             state, shaped, successor, successor
                         )
                         incumbent_accepted = validator(
-                            incumbent.dense_body_position.clone()
+                            incumbent.dense_body_position[:46].clone()
                         )
                         if type(incumbent_accepted) is not bool:
                             raise ContractError(
@@ -2215,6 +2392,7 @@ class TorchMotionMatcher:
             candidate.frame_index,
             candidate.yaw_offset,
             candidate.translation_xy,
+            candidate.translation_z,
             shaped.velocity_world_xy.clone(), shaped.heading_world_yaw.clone(),
             dense_joint_p[0].clone(),
             dense_joint_v[0].clone(),

@@ -256,3 +256,194 @@ class ContactSegmentIndex:
                     int(clip_index), int(frame_index)
                 ) in self._entries
         return eligible
+
+
+@dataclass(frozen=True)
+class SegmentPlacement:
+    segment: ContactSegment
+    vertical_offset_m: float
+    source_support_mask: torch.Tensor
+
+    def __post_init__(self) -> None:
+        offset = float(self.vertical_offset_m)
+        support = self.source_support_mask
+        if not isinstance(self.segment, ContactSegment):
+            raise ContractError("segment placement requires a contact segment")
+        if not torch.isfinite(torch.tensor(offset)):
+            raise ContractError("segment placement vertical offset must be finite")
+        if (
+            not isinstance(support, torch.Tensor)
+            or support.dtype != torch.bool
+            or tuple(support.shape) != (self.segment.frame_count, 2)
+        ):
+            raise ContractError(
+                "segment placement source support must match the segment"
+            )
+        owned = support.detach().clone()
+        object.__setattr__(self, "vertical_offset_m", offset)
+        object.__setattr__(self, "source_support_mask", owned)
+
+
+@dataclass(frozen=True)
+class TerrainContactSegmentPolicy:
+    """Resolve contact-compatible terrain entries and rigid vertical placement."""
+
+    index: ContactSegmentIndex
+    extension: object
+
+    def __post_init__(self) -> None:
+        try:
+            dataset = self.extension.dataset
+            query_grid = self.extension.query_grid
+            query_alignment = self.extension.alignment
+            clip_count = len(dataset.folder.clips)
+        except AttributeError as error:
+            raise ContractError("contact segment terrain extension is invalid") from error
+        if not isinstance(self.index, ContactSegmentIndex):
+            raise ContractError("contact segment policy index is invalid")
+        if clip_count != len(self.index._support_masks):
+            raise ContractError(
+                "contact segment policy motion inventory does not match"
+            )
+        if not callable(getattr(query_grid, "sample_xy", None)) or not callable(
+            getattr(query_alignment, "matcher_to_scene_xy", None)
+        ):
+            raise ContractError("contact segment query terrain is invalid")
+
+    @property
+    def dataset(self):
+        return self.extension.dataset
+
+    def entry_eligibility(self, database: object) -> torch.Tensor:
+        return self.index.terrain_entry_eligibility(database)
+
+    @staticmethod
+    def _validated_pose(
+        yaw_offset: torch.Tensor,
+        translation_xy: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            not isinstance(yaw_offset, torch.Tensor)
+            or yaw_offset.numel() != 1
+            or not yaw_offset.dtype.is_floating_point
+            or not torch.isfinite(yaw_offset).all()
+        ):
+            raise ContractError("contact entry yaw must be a finite scalar tensor")
+        if (
+            not isinstance(translation_xy, torch.Tensor)
+            or tuple(translation_xy.shape) != (2,)
+            or translation_xy.device != yaw_offset.device
+            or translation_xy.dtype != yaw_offset.dtype
+            or not torch.isfinite(translation_xy).all()
+        ):
+            raise ContractError(
+                "contact entry translation must be a matching finite shape-(2,) tensor"
+            )
+        return yaw_offset.reshape(()), translation_xy
+
+    def query_support_mask(
+        self,
+        feature_body_position: torch.Tensor,
+        feature_body_velocity: torch.Tensor,
+    ) -> torch.Tensor:
+        position = feature_body_position
+        velocity = feature_body_velocity
+        if (
+            not isinstance(position, torch.Tensor)
+            or tuple(position.shape) != (3, 3)
+            or position.dtype != torch.float32
+            or position.device != self.dataset.device
+            or not torch.isfinite(position).all()
+            or not isinstance(velocity, torch.Tensor)
+            or tuple(velocity.shape) != (3, 3)
+            or velocity.dtype != position.dtype
+            or velocity.device != position.device
+            or not torch.isfinite(velocity).all()
+        ):
+            raise ContractError(
+                "contact query bodies must be finite float32 shape-(3,3) tensors"
+            )
+        feet = position[1:]
+        scene_xy = self.extension.alignment.matcher_to_scene_xy(feet[:, :2])
+        surface = self.extension.query_grid.sample_xy(scene_xy)
+        clearance = feet[:, 2] - surface
+        return (
+            (
+                torch.abs(clearance - ANKLE_ORIGIN_SOLE_M)
+                <= STANCE_CLEARANCE_TOLERANCE_M
+            )
+            & (
+                torch.abs(velocity[1:, 2])
+                <= STANCE_VERTICAL_SPEED_MAX_MPS
+            )
+        ).detach()
+
+    def resolve_entry(
+        self,
+        *,
+        clip_index: int,
+        frame_index: int,
+        yaw_offset: torch.Tensor,
+        translation_xy: torch.Tensor,
+        current_support_mask: torch.Tensor,
+    ) -> SegmentPlacement | None:
+        segment = self.index.entry(clip_index, frame_index)
+        if segment is None:
+            return None
+        yaw, translation = self._validated_pose(yaw_offset, translation_xy)
+        support = current_support_mask
+        if (
+            not isinstance(support, torch.Tensor)
+            or support.dtype != torch.bool
+            or tuple(support.shape) != (2,)
+            or support.device != yaw.device
+        ):
+            raise ContractError(
+                "current support mask must be boolean shape-(2,) on the policy device"
+            )
+        if bool(support.any().item()) and not bool(
+            support[segment.entering_foot].item()
+        ):
+            return None
+
+        dataset = self.dataset
+        layout = dataset.folder.layout
+        foot_body = (
+            layout.left_foot_body_index
+            if segment.entering_foot == 0
+            else layout.right_foot_body_index
+        )
+        source_ankle = torch.as_tensor(
+            dataset.folder.clips[clip_index].body_position_world[
+                frame_index, foot_body
+            ],
+            dtype=torch.float32,
+            device=dataset.device,
+        )
+        cosine = torch.cos(yaw)
+        sine = torch.sin(yaw)
+        transformed_xy = torch.stack(
+            (
+                cosine * source_ankle[0] - sine * source_ankle[1],
+                sine * source_ankle[0] + cosine * source_ankle[1],
+            )
+        ) + translation
+        query_scene_xy = self.extension.alignment.matcher_to_scene_xy(
+            transformed_xy
+        )
+        target_surface = self.extension.query_grid.sample_xy(query_scene_xy)
+        source_grid = dataset.clip_grids[clip_index]
+        source_alignment = dataset.clip_alignments[clip_index]
+        if source_grid is None or source_alignment is None:
+            raise ContractError("terrain contact entry has no source terrain")
+        source_scene_xy = source_alignment.matcher_to_scene_xy(
+            source_ankle[:2]
+        )
+        source_surface = source_grid.sample_xy(source_scene_xy)
+        return SegmentPlacement(
+            segment=segment,
+            vertical_offset_m=float((target_surface - source_surface).item()),
+            source_support_mask=self.index.support_mask(clip_index)[
+                segment.start_frame : segment.end_frame
+            ],
+        )
