@@ -428,7 +428,7 @@ class ContactSegmentRealDataTests(unittest.TestCase):
                 for segment in index.segments
                 if segment.clip_index == clip_index
             ),
-            (33, 40, 41, 54, 35, 36, 36, 47, 19, 22),
+            (33, 40, 41, 54, 35, 36, 36, 47),
         )
 
 

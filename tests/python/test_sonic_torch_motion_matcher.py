@@ -268,9 +268,8 @@ class TorchMotionMatcherTests(unittest.TestCase):
                 wraps=select_exact_candidate,
             ) as resumed_search:
                 released = matcher.step((-0.4, 0.0), math.pi)
-            self.assertTrue(released.diagnostics.segment_committed)
-            self.assertEqual(released.diagnostics.segment_start_frame, 30)
-            self.assertEqual(released.diagnostics.segment_end_frame, 40)
+            self.assertFalse(released.diagnostics.segment_committed)
+            self.assertIsNone(matcher._state.commitment)
             resumed_search.assert_called_once()
             released_feet = (
                 matcher._contact_segment_policy.emitted_foot_positions(

@@ -43,6 +43,7 @@ LOOP_SOURCE_NEIGHBORHOOD_FRAMES = 8
 LOOP_ROOT_PROGRESS_M = 0.05
 LOOP_REVISIT_PENALTY = 1000.0
 RECENT_CROSS_CLIP_REVISIT_PENALTY = 25.0
+CONTIGUOUS_SEGMENT_COMMAND_ALIGNMENT_MIN = 0.5
 
 
 @dataclass(frozen=True)
@@ -1079,6 +1080,8 @@ class TorchMotionMatcher:
         )
         if contact_segment_policy is None:
             self._terrain_entry_rows = None
+            self._terrain_entry_direction_xy = None
+            self._terrain_clip_reference_direction_xy = {}
         else:
             terrain_clips = torch.tensor(
                 sorted(contact_segment_policy.index.terrain_clip_indices),
@@ -1087,6 +1090,36 @@ class TorchMotionMatcher:
             )
             self._terrain_entry_rows = self._transition_eligible_rows & torch.isin(
                 database._search_clip_index, terrain_clips
+            )
+            directions = torch.zeros(
+                (database._search_clip_index.shape[0], 2),
+                dtype=torch.float32,
+                device=database.device,
+            )
+            clip_reference_directions = {}
+            root = folder.layout.root_body_index
+            for clip_index in contact_segment_policy.index.terrain_clip_indices:
+                rows = self._terrain_entry_rows & (
+                    database._search_clip_index == clip_index
+                )
+                frames = database._search_frame_index[rows]
+                if frames.numel() == 0:
+                    continue
+                velocity = _rotate_z(
+                    clips[clip_index].body_linear_velocity[frames, root],
+                    contact_segment_policy.registered_yaw_offset(clip_index),
+                )[:, :2]
+                norm = torch.linalg.vector_norm(
+                    velocity, dim=1, keepdim=True
+                ).clamp_min(1e-6)
+                directions[rows] = velocity / norm
+                earliest = torch.argmin(frames)
+                clip_reference_directions[clip_index] = (
+                    directions[rows][earliest].clone()
+                )
+            self._terrain_entry_direction_xy = directions
+            self._terrain_clip_reference_direction_xy = (
+                clip_reference_directions
             )
         self._clips = clips
         root = folder.layout.root_body_index
@@ -1176,6 +1209,42 @@ class TorchMotionMatcher:
                 costs,
             )
         return costs
+
+    def _command_transition_eligibility(
+        self, state: _MatcherState, shaped: ShapedCommand
+    ) -> torch.Tensor | None:
+        eligible = self._transition_eligible_rows
+        if eligible is None or self._terrain_entry_direction_xy is None:
+            return eligible
+        command = shaped.trajectory.facing_world_xy[-1]
+        if not self._terrain_command_deviated(state, shaped):
+            return eligible
+        compatible = (
+            self._terrain_entry_direction_xy @ command
+            >= CONTIGUOUS_SEGMENT_COMMAND_ALIGNMENT_MIN
+        )
+        return eligible & (~self._terrain_entry_rows | compatible)
+
+    def _command_terrain_entry_rows(
+        self, state: _MatcherState, shaped: ShapedCommand
+    ) -> torch.Tensor | None:
+        if self._terrain_entry_rows is None:
+            return None
+        eligible = self._command_transition_eligibility(state, shaped)
+        return self._terrain_entry_rows & eligible
+
+    def _terrain_command_deviated(
+        self, state: _MatcherState, shaped: ShapedCommand
+    ) -> bool:
+        reference = self._terrain_clip_reference_direction_xy.get(
+            state.clip_index
+        )
+        if reference is None:
+            return True
+        command = shaped.trajectory.facing_world_xy[-1]
+        return float(torch.dot(reference, command).item()) < (
+            CONTIGUOUS_SEGMENT_COMMAND_ALIGNMENT_MIN
+        )
 
     @classmethod
     def from_folder(
@@ -1322,7 +1391,9 @@ class TorchMotionMatcher:
             current_frame_index=state.frame_index,
             config=self.config,
             additional_transition_costs=transition_costs,
-            transition_eligible_rows=self._transition_eligible_rows,
+            transition_eligible_rows=self._command_transition_eligibility(
+                state, shaped
+            ),
         )
         rescue_time = time.perf_counter_ns() - rescue_start
         search_time = (
@@ -1407,7 +1478,9 @@ class TorchMotionMatcher:
             current_frame_index=state.frame_index,
             config=self.config,
             additional_transition_costs=transition_costs,
-            transition_eligible_rows=self._transition_eligible_rows,
+            transition_eligible_rows=self._command_transition_eligibility(
+                state, shaped
+            ),
         )
         rerank_time = time.perf_counter_ns() - rerank_start
         search_time = (
@@ -1582,6 +1655,18 @@ class TorchMotionMatcher:
                     current_support_mask=current_support,
                 )
                 contact_entry_valid = placement is not None
+                if (
+                    placement is not None
+                    and self._terrain_command_deviated(state, shaped)
+                    and not self._segment_command_compatible(
+                        clip_index,
+                        frame_index,
+                        yaw_offset,
+                        shaped,
+                    )
+                ):
+                    placement = None
+                    contact_entry_valid = False
                 if placement is not None:
                     translation_z = placement.vertical_offset_m
         else:
@@ -1590,7 +1675,18 @@ class TorchMotionMatcher:
             translation_z = state.translation_z
             if policy is not None:
                 contiguous = policy.index.entry(clip_index, frame_index)
-                if contiguous is not None:
+                if (
+                    contiguous is not None
+                    and (
+                        not self._terrain_command_deviated(state, shaped)
+                        or self._segment_command_compatible(
+                            clip_index,
+                            frame_index,
+                            yaw_offset,
+                            shaped,
+                        )
+                    )
+                ):
                     placement = SegmentPlacement(
                         segment=contiguous,
                         vertical_offset_m=translation_z,
@@ -1756,6 +1852,30 @@ class TorchMotionMatcher:
             dense_root_angular_velocity=rw + qwo,
             dense_body_position=dense_body_position,
             dense_body_velocity=dense_body_velocity,
+        )
+
+    def _segment_command_compatible(
+        self,
+        clip_index: int,
+        frame_index: int,
+        yaw_offset: torch.Tensor,
+        shaped: ShapedCommand,
+    ) -> bool:
+        command = shaped.trajectory.facing_world_xy[-1]
+        root = self.folder.layout.root_body_index
+        source_velocity = _rotate_z(
+            self._clips[clip_index].body_linear_velocity[frame_index, root],
+            yaw_offset,
+        )[:2]
+        source_speed = torch.linalg.vector_norm(source_velocity)
+        if float(source_speed.item()) <= 1e-6:
+            return False
+        alignment = torch.dot(
+            command,
+            source_velocity / source_speed,
+        )
+        return float(alignment.item()) >= (
+            CONTIGUOUS_SEGMENT_COMMAND_ALIGNMENT_MIN
         )
 
     def _reachability_query(
@@ -2453,7 +2573,9 @@ class TorchMotionMatcher:
                 config=self.config,
                 additional_transition_penalty=settle_penalty,
                 additional_transition_costs=transition_costs,
-                transition_eligible_rows=self._transition_eligible_rows,
+                transition_eligible_rows=self._command_transition_eligibility(
+                    state, shaped
+                ),
             )
             search_time = (
                 time.perf_counter_ns() - search_start if search else None
@@ -2482,7 +2604,9 @@ class TorchMotionMatcher:
                 current_frame_index=state.frame_index,
                 config=self.config,
                 additional_transition_costs=transition_costs,
-                transition_eligible_rows=self._terrain_entry_rows,
+                transition_eligible_rows=self._command_terrain_entry_rows(
+                    state, shaped
+                ),
             )
             terrain_rank_time = time.perf_counter_ns() - terrain_rank_start
             search_time = (

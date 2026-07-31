@@ -212,7 +212,9 @@ class ContactSegmentIndex:
             if grid is not None
         )
         masks = tuple(
-            source_support_mask(dataset, index)
+            source_support_mask(dataset, index)[
+                : dataset.folder.clips[index].valid_frame_stop
+            ]
             for index in range(len(dataset.folder.clips))
         )
         return cls.from_support_masks(
