@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import math
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
@@ -25,6 +26,8 @@ STAIR_BASES: tuple[str, str, str, str] = (
 )
 SOURCE_FPS = 25.0
 SOURCE_FRAMES = 250
+_MAX_OBJECT_TRANSLATION_EXCURSION_M = 0.02
+_MAX_OBJECT_ROTATION_EXCURSION_RAD = math.radians(2.0)
 
 
 @dataclass(frozen=True)
@@ -39,6 +42,8 @@ class PinnedStairSource:
     object_scale: np.ndarray
     source_fps: float
     source_sha256: Mapping[str, str]
+    object_translation_excursion_m: float = 0.0
+    object_rotation_excursion_rad: float = 0.0
 
 
 def _sha256(path: Path) -> str:
@@ -107,20 +112,62 @@ def _normalized_unrolled_wxyz(xyzw: np.ndarray, base: str) -> np.ndarray:
     return wxyz
 
 
-def _constant_row(array: np.ndarray, field: str, base: str) -> np.ndarray:
-    flat = array.reshape(SOURCE_FRAMES, -1)
-    if not np.allclose(flat, flat[:1], rtol=0.0, atol=1e-7):
-        raise ValueError(f"{base}: object field {field} must be constant")
-    return flat[0].copy()
-
-
 def _owned_readonly(value: np.ndarray) -> np.ndarray:
     output = np.ascontiguousarray(value, dtype=np.float32)
     output.setflags(write=False)
     return output
 
 
-def _load_source(root: Path, base: str) -> PinnedStairSource:
+def _static_object_pose(
+    position_world: np.ndarray,
+    quaternion_world_wxyz: np.ndarray,
+    base: str,
+) -> tuple[np.ndarray, np.ndarray, float, float]:
+    position = np.asarray(position_world, np.float64).reshape(
+        SOURCE_FRAMES, 3
+    )
+    quaternion = np.asarray(quaternion_world_wxyz, np.float64).reshape(
+        SOURCE_FRAMES, 4
+    ).copy()
+    norms = np.linalg.norm(quaternion, axis=1, keepdims=True)
+    if not np.isfinite(norms).all() or np.any(norms < 1e-12):
+        raise ValueError(f"{base}: object root_quat is invalid")
+    quaternion /= norms
+    for frame in range(1, len(quaternion)):
+        if float(np.dot(quaternion[frame - 1], quaternion[frame])) < 0.0:
+            quaternion[frame] *= -1.0
+
+    translation_excursion = float(
+        np.linalg.norm(position - position[:1], axis=1).max()
+    )
+    dot = np.clip(
+        np.abs(np.sum(quaternion * quaternion[:1], axis=1)),
+        0.0,
+        1.0,
+    )
+    rotation_excursion = float((2.0 * np.arccos(dot)).max())
+    if translation_excursion > _MAX_OBJECT_TRANSLATION_EXCURSION_M:
+        raise ValueError(
+            f"{base}: object translation excursion exceeds 0.02 m"
+        )
+    if rotation_excursion > _MAX_OBJECT_ROTATION_EXCURSION_RAD:
+        raise ValueError(
+            f"{base}: object rotation excursion exceeds 2 degrees"
+        )
+    return (
+        position[0].copy(),
+        quaternion[0, (1, 2, 3, 0)].copy(),
+        translation_excursion,
+        rotation_excursion,
+    )
+
+
+def load_source(root: str | Path, base: str) -> PinnedStairSource:
+    root = Path(root).resolve()
+    if not root.is_dir():
+        raise ValueError(f"GRAIL source root is not a directory: {root}")
+    if not isinstance(base, str) or not base or Path(base).name != base:
+        raise ValueError("GRAIL source base must be a non-empty filename stem")
     robot_path = (root / "robot" / f"{base}.pkl").resolve()
     object_path = (root / "objects" / f"{base}.pkl").resolve()
     usd_path = (root / "object_usd" / f"{base}.usd").resolve()
@@ -155,35 +202,28 @@ def _load_source(root: Path, base: str) -> PinnedStairSource:
     root_wxyz = _normalized_unrolled_wxyz(root_xyzw, base)
     qpos = np.concatenate((root_position, root_wxyz, joints), axis=1)
 
-    object_position = _constant_row(
-        _finite_array(
-            object_record,
-            "root_pos",
-            (SOURCE_FRAMES, 1, 3),
-            base,
-            "object",
-        ),
+    object_positions = _finite_array(
+        object_record,
         "root_pos",
+        (SOURCE_FRAMES, 1, 3),
         base,
+        "object",
     )
-    object_quaternion_wxyz = _constant_row(
-        _finite_array(
-            object_record,
-            "root_quat",
-            (SOURCE_FRAMES, 1, 4),
-            base,
-            "object",
-        ),
+    object_quaternions_wxyz = _finite_array(
+        object_record,
         "root_quat",
+        (SOURCE_FRAMES, 1, 4),
         base,
+        "object",
     )
-    object_quaternion_norm = float(np.linalg.norm(object_quaternion_wxyz))
-    if abs(object_quaternion_norm - 1.0) > 1e-4:
-        raise ValueError(f"{base}: object root_quat is not unit length")
-    object_quaternion_wxyz /= object_quaternion_norm
-    # GRAIL object root_quat is wxyz.  Keep the public source contract explicit
-    # and convert it once to the xyzw convention used by the surface transform.
-    object_quaternion_xyzw = object_quaternion_wxyz[[1, 2, 3, 0]]
+    (
+        object_position,
+        object_quaternion_xyzw,
+        object_translation_excursion,
+        object_rotation_excursion,
+    ) = _static_object_pose(
+        object_positions, object_quaternions_wxyz, base
+    )
 
     if "scale" not in object_record:
         raise ValueError(f"{base}: object field scale is missing")
@@ -211,6 +251,8 @@ def _load_source(root: Path, base: str) -> PinnedStairSource:
                 "usd": _sha256(usd_path),
             }
         ),
+        object_translation_excursion_m=object_translation_excursion,
+        object_rotation_excursion_rad=object_rotation_excursion,
     )
 
 
@@ -218,4 +260,4 @@ def load_pinned_sources(root: str | Path) -> tuple[PinnedStairSource, ...]:
     resolved = Path(root).resolve()
     if not resolved.is_dir():
         raise ValueError(f"GRAIL stair root is not a directory: {resolved}")
-    return tuple(_load_source(resolved, base) for base in STAIR_BASES)
+    return tuple(load_source(resolved, base) for base in STAIR_BASES)
