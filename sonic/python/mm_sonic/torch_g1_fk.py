@@ -6,7 +6,10 @@ from pathlib import Path
 
 import numpy as np
 
-from .joints import ContractError, PINNED_TARGET_TO_SOURCE_PERMUTATION
+from .joints import (
+    ContractError,
+    PINNED_TARGET_TO_SOURCE_PERMUTATION,
+)
 
 
 _G1_NQ = 36
@@ -15,6 +18,28 @@ _FOOT_BODY_NAMES = (
     "left_ankle_roll_link",
     "right_ankle_roll_link",
 )
+_LEG_JOINT_NAMES = (
+    (
+        "left_hip_pitch_joint",
+        "left_hip_roll_joint",
+        "left_hip_yaw_joint",
+        "left_knee_joint",
+        "left_ankle_pitch_joint",
+        "left_ankle_roll_joint",
+    ),
+    (
+        "right_hip_pitch_joint",
+        "right_hip_roll_joint",
+        "right_hip_yaw_joint",
+        "right_knee_joint",
+        "right_ankle_pitch_joint",
+        "right_ankle_roll_joint",
+    ),
+)
+_IK_MAX_ITERATIONS = 32
+_IK_DAMPING = 1.0e-4
+_IK_MAX_STEP_RAD = 0.10
+_IK_TOLERANCE_M = 0.005
 
 
 def _numpy_float64(value: object) -> np.ndarray:
@@ -109,6 +134,31 @@ class MujocoG1FootKinematics:
         self._model = model
         self._data = mujoco_module.MjData(model)
         self._foot_body_ids = foot_body_ids
+        try:
+            leg_joint_ids = tuple(
+                tuple(int(model.joint(name).id) for name in names)
+                for names in _LEG_JOINT_NAMES
+            )
+        except Exception as error:
+            raise ContractError("G1 model is missing leg joints") from error
+        self._leg_qpos_addresses = tuple(
+            np.asarray(
+                [int(model.jnt_qposadr[index]) for index in joint_ids],
+                dtype=np.int64,
+            )
+            for joint_ids in leg_joint_ids
+        )
+        self._leg_dof_addresses = tuple(
+            np.asarray(
+                [int(model.jnt_dofadr[index]) for index in joint_ids],
+                dtype=np.int64,
+            )
+            for joint_ids in leg_joint_ids
+        )
+        self._leg_ranges = tuple(
+            np.asarray(model.jnt_range[list(joint_ids)], dtype=np.float64)
+            for joint_ids in leg_joint_ids
+        )
 
     def foot_positions(
         self,
@@ -152,3 +202,101 @@ class MujocoG1FootKinematics:
             self._mujoco.mj_forward(self._model, self._data)
             output[frame] = self._data.xpos[self._foot_body_ids]
         return output
+
+    def solve_leg_positions(
+        self,
+        joint_position: object,
+        root_position_world: object,
+        root_orientation_world_wxyz: object,
+        solve_feet: object,
+        target_foot_position_world: object,
+    ) -> np.ndarray:
+        """Solve selected G1 legs to world ankle targets without moving root."""
+
+        joints = _finite_array(
+            joint_position, (_G1_JOINT_COUNT,), "joint position"
+        )
+        root = _finite_array(root_position_world, (3,), "root position")
+        quaternion = _finite_array(
+            root_orientation_world_wxyz, (4,), "root orientation"
+        )
+        if abs(float(np.linalg.norm(quaternion)) - 1.0) > 1e-4:
+            raise ContractError("root orientation must be unit length")
+        mask = np.asarray(solve_feet)
+        if mask.dtype != np.bool_ or mask.shape != (2,) or not bool(mask.any()):
+            raise ContractError(
+                "G1 foot IK solve mask must be boolean shape (2,) and nonempty"
+            )
+        targets = _finite_array(
+            target_foot_position_world, (2, 3), "G1 foot IK target"
+        )
+
+        self._data.qpos[:] = target_state_qpos(joints, root, quaternion)
+        selected_feet = np.flatnonzero(mask)
+        selected_dofs = np.concatenate(
+            [self._leg_dof_addresses[index] for index in selected_feet]
+        )
+        selected_qpos = np.concatenate(
+            [self._leg_qpos_addresses[index] for index in selected_feet]
+        )
+        selected_ranges = np.concatenate(
+            [self._leg_ranges[index] for index in selected_feet], axis=0
+        )
+
+        for _ in range(_IK_MAX_ITERATIONS):
+            self._mujoco.mj_forward(self._model, self._data)
+            error = np.concatenate(
+                [
+                    targets[index]
+                    - self._data.xpos[self._foot_body_ids[index]]
+                    for index in selected_feet
+                ]
+            )
+            if all(
+                np.linalg.norm(error[offset : offset + 3])
+                <= _IK_TOLERANCE_M
+                for offset in range(0, error.size, 3)
+            ):
+                source = np.asarray(self._data.qpos[7:], dtype=np.float64)
+                return np.ascontiguousarray(
+                    source[
+                        np.asarray(
+                            PINNED_TARGET_TO_SOURCE_PERMUTATION,
+                            dtype=np.int64,
+                        )
+                    ]
+                )
+
+            rows = []
+            for index in selected_feet:
+                jacobian = np.zeros((3, self._model.nv), np.float64)
+                self._mujoco.mj_jacBody(
+                    self._model,
+                    self._data,
+                    jacobian,
+                    None,
+                    int(self._foot_body_ids[index]),
+                )
+                rows.append(jacobian[:, selected_dofs])
+            jacobian = np.concatenate(rows, axis=0)
+            system = (
+                jacobian @ jacobian.T
+                + _IK_DAMPING * np.eye(error.size, dtype=np.float64)
+            )
+            try:
+                delta = jacobian.T @ np.linalg.solve(system, error)
+            except np.linalg.LinAlgError as error_value:
+                raise ContractError(
+                    "G1 foot IK target is unreachable"
+                ) from error_value
+            delta = np.clip(
+                delta, -_IK_MAX_STEP_RAD, _IK_MAX_STEP_RAD
+            )
+            updated = np.clip(
+                self._data.qpos[selected_qpos] + delta,
+                selected_ranges[:, 0],
+                selected_ranges[:, 1],
+            )
+            self._data.qpos[selected_qpos] = updated
+
+        raise ContractError("G1 foot IK target is unreachable")
