@@ -267,7 +267,7 @@ class ZUpHeightGrid:
             raise ValueError(f"cannot load height grid: {path}") from error
 
 
-def rasterize_zup_surface(
+def _rasterize_zup_surface_reference(
     surface: ZUpTriangleSurface,
     *,
     bounds_xy: tuple[float, float, float, float],
@@ -298,6 +298,87 @@ def rasterize_zup_surface(
         points = np.column_stack((xs, np.full(nx, y)))
         heights[row] = surface.height_xy(points).astype(np.float32)
     return ZUpHeightGrid(origin, cell, heights)
+
+
+def rasterize_zup_surface(
+    surface: ZUpTriangleSurface,
+    *,
+    bounds_xy: tuple[float, float, float, float],
+    cell_size_m: float = 0.02,
+) -> ZUpHeightGrid:
+    if not isinstance(surface, ZUpTriangleSurface):
+        raise TypeError("surface must be a ZUpTriangleSurface")
+    try:
+        minimum_x, maximum_x, minimum_y, maximum_y = (
+            float(value) for value in bounds_xy
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("height grid bounds must contain four numbers") from error
+    if not np.isfinite(bounds_xy).all() or maximum_x <= minimum_x or maximum_y <= minimum_y:
+        raise ValueError("height grid bounds must be finite and increasing")
+    cell = float(np.float32(cell_size_m))
+    if not math.isfinite(cell) or cell <= 0.0:
+        raise ValueError("height grid cell size must be finite and positive")
+    origin = np.array([minimum_x, minimum_y], np.float32)
+    nx = int(math.ceil((maximum_x - float(origin[0])) / cell)) + 1
+    ny = int(math.ceil((maximum_y - float(origin[1])) / cell)) + 1
+    if nx < 2 or ny < 2 or nx * ny > 50_000_000:
+        raise ValueError("height grid dimensions are invalid")
+    xs = float(origin[0]) + np.arange(nx, dtype=np.float64) * cell
+    ys = float(origin[1]) + np.arange(ny, dtype=np.float64) * cell
+    heights = np.full(
+        (ny, nx), surface.exterior_height_z, dtype=np.float64
+    )
+
+    for triangle in surface._triangle_vertices:
+        a, b, c = triangle
+        v0 = b[:2] - a[:2]
+        v1 = c[:2] - a[:2]
+        determinant = v0[0] * v1[1] - v0[1] * v1[0]
+        if abs(float(determinant)) <= _PROJECTED_EPSILON:
+            continue
+        projected = triangle[:, :2]
+        lower = projected.min(axis=0) - _BARYCENTRIC_TOLERANCE
+        upper = projected.max(axis=0) + _BARYCENTRIC_TOLERANCE
+        ix0 = max(
+            0,
+            int(math.ceil((lower[0] - float(origin[0])) / cell)),
+        )
+        ix1 = min(
+            nx - 1,
+            int(math.floor((upper[0] - float(origin[0])) / cell)),
+        )
+        iy0 = max(
+            0,
+            int(math.ceil((lower[1] - float(origin[1])) / cell)),
+        )
+        iy1 = min(
+            ny - 1,
+            int(math.floor((upper[1] - float(origin[1])) / cell)),
+        )
+        if ix0 > ix1 or iy0 > iy1:
+            continue
+        x, y = np.meshgrid(
+            xs[ix0 : ix1 + 1],
+            ys[iy0 : iy1 + 1],
+            indexing="xy",
+        )
+        px = x - a[0]
+        py = y - a[1]
+        u = (px * v1[1] - py * v1[0]) / determinant
+        v = (v0[0] * py - v0[1] * px) / determinant
+        w = 1.0 - u - v
+        inside = (
+            (u >= -_BARYCENTRIC_TOLERANCE)
+            & (v >= -_BARYCENTRIC_TOLERANCE)
+            & (w >= -_BARYCENTRIC_TOLERANCE)
+        )
+        if not np.any(inside):
+            continue
+        z = w * a[2] + u * b[2] + v * c[2]
+        window = heights[iy0 : iy1 + 1, ix0 : ix1 + 1]
+        window[inside] = np.maximum(window[inside], z[inside])
+    return ZUpHeightGrid(origin, cell, heights.astype(np.float32))
 
 
 def load_source_surface(source: PinnedStairSource) -> ZUpTriangleSurface:

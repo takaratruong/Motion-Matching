@@ -6,6 +6,7 @@ from unittest import mock
 
 import numpy as np
 
+from resources.g1_torch_stair_builder import surface as surface_module
 from resources.g1_torch_stair_builder.surface import (
     ZUpHeightGrid,
     ZUpTriangleSurface,
@@ -55,6 +56,50 @@ class ObjectTransformTests(unittest.TestCase):
 
 
 class ZUpSurfaceTests(unittest.TestCase):
+    def test_rasterizer_does_not_query_every_grid_row_through_surface(self):
+        surface = _two_level_surface()
+        with mock.patch.object(
+            surface,
+            "height_xy",
+            side_effect=AssertionError("row-wise surface query used"),
+        ):
+            try:
+                grid = rasterize_zup_surface(
+                    surface,
+                    bounds_xy=(-1.0, 1.0, -1.0, 1.0),
+                    cell_size_m=0.25,
+                )
+            except AssertionError as error:
+                self.fail(str(error))
+        self.assertEqual(grid.height_z.shape, (9, 9))
+
+    def test_triangle_bounded_rasterizer_is_bitwise_reference_equivalent(self):
+        self.assertTrue(
+            hasattr(surface_module, "_rasterize_zup_surface_reference")
+        )
+        random = np.random.default_rng(4812)
+        vertices = random.uniform(
+            [-0.9, -0.8, -0.2], [0.9, 0.8, 0.8], size=(36, 3)
+        )
+        triangles = np.arange(36, dtype=np.int32).reshape(-1, 3)
+        # Include one reversed winding and one projected-degenerate triangle.
+        triangles[1] = triangles[1, ::-1]
+        vertices[6:9, :2] = [[-0.5, 0.0], [0.0, 0.0], [0.5, 0.0]]
+        surface = ZUpTriangleSurface(vertices, triangles)
+        expected = surface_module._rasterize_zup_surface_reference(
+            surface,
+            bounds_xy=(-1.0, 1.0, -1.0, 1.0),
+            cell_size_m=0.05,
+        )
+        actual = rasterize_zup_surface(
+            surface,
+            bounds_xy=(-1.0, 1.0, -1.0, 1.0),
+            cell_size_m=0.05,
+        )
+        np.testing.assert_array_equal(actual.origin_xy, expected.origin_xy)
+        self.assertEqual(actual.cell_size_m, expected.cell_size_m)
+        np.testing.assert_array_equal(actual.height_z, expected.height_z)
+
     def test_source_grid_default_padding_covers_dense_landing_lookahead(self):
         source = PinnedStairSource(
             base="synthetic",
