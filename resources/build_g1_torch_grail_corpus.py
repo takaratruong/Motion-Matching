@@ -22,6 +22,7 @@ from resources.g1_torch_terrain_builder.bulk_grail import (
     discover_bulk_grail_candidates,
     resolve_bulk_grail_candidates,
     select_bulk_grail_candidates,
+    select_named_bulk_grail_candidates,
 )
 from resources.g1_torch_terrain_builder.publish import publish_expanded_corpus
 
@@ -74,6 +75,7 @@ def _selection_metadata(
     selected,
     limit_per_partition: int | None,
     selection_seed: int,
+    selection_mode: str,
 ) -> dict:
     available = Counter(candidate.partition for candidate in candidates)
     selected_count = Counter(candidate.partition for candidate in selected)
@@ -92,6 +94,7 @@ def _selection_metadata(
         },
         "limit_per_partition": limit_per_partition,
         "selection_seed": selection_seed,
+        "selection_mode": selection_mode,
         "selected_logical_names": [
             candidate.logical_name for candidate in selected
         ],
@@ -110,6 +113,11 @@ def main(argv: list[str] | None = None) -> int:
         choices=_PARTITIONS,
     )
     parser.add_argument("--limit-per-partition", type=int)
+    parser.add_argument(
+        "--logical-name",
+        dest="logical_names",
+        action="append",
+    )
     parser.add_argument("--selection-seed", type=int, default=0)
     parser.add_argument(
         "--source-root", default="/home/ubuntu/Downloads/artifacts"
@@ -145,14 +153,25 @@ def main(argv: list[str] | None = None) -> int:
         and args.limit_per_partition <= 0
     ):
         parser.error("--limit-per-partition must be positive")
+    if args.logical_names is not None and args.limit_per_partition is not None:
+        parser.error(
+            "--logical-name cannot be combined with --limit-per-partition"
+        )
 
     dataset_root = Path(args.dataset_root).resolve()
     candidates = discover_bulk_grail_candidates(dataset_root, partitions)
-    selected = select_bulk_grail_candidates(
-        candidates,
-        limit_per_partition=args.limit_per_partition,
-        seed=args.selection_seed,
-    )
+    if args.logical_names is None:
+        selected = select_bulk_grail_candidates(
+            candidates,
+            limit_per_partition=args.limit_per_partition,
+            seed=args.selection_seed,
+        )
+        selection_mode = "balanced"
+    else:
+        selected = select_named_bulk_grail_candidates(
+            candidates, tuple(args.logical_names)
+        )
+        selection_mode = "named"
     resolved = resolve_bulk_grail_candidates(dataset_root, selected)
     metadata = _selection_metadata(
         dataset_root=dataset_root,
@@ -161,6 +180,7 @@ def main(argv: list[str] | None = None) -> int:
         selected=selected,
         limit_per_partition=args.limit_per_partition,
         selection_seed=args.selection_seed,
+        selection_mode=selection_mode,
     )
     manifest = publish_expanded_corpus(
         output=args.output,

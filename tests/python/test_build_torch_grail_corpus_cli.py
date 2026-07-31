@@ -125,6 +125,94 @@ class BulkGrailCorpusCliTests(unittest.TestCase):
                 ]
             )
 
+    def test_builds_exact_named_selection_without_balanced_sampler(self):
+        self.assertIsNotNone(cli)
+        candidates = tuple(
+            SimpleNamespace(
+                partition="stair_p1",
+                logical_name=f"stair-{index}",
+                stem=f"stair-{index}",
+            )
+            for index in range(3)
+        )
+        selected = (candidates[1],)
+        resolved = (SimpleNamespace(),)
+        manifest = {
+            "schema": "g1-torch-terrain-corpus/v1",
+            "clips": [{}, {}],
+            "accepted_clips": [{}, {}],
+            "rejected_candidates": [],
+            "bulk_grail": {},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            grail = root / "grail"
+            grail.mkdir()
+            (grail / "g1_mm_inventory.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            with (
+                mock.patch.object(
+                    cli,
+                    "discover_bulk_grail_candidates",
+                    return_value=candidates,
+                ),
+                mock.patch.object(
+                    cli,
+                    "select_named_bulk_grail_candidates",
+                    return_value=selected,
+                    create=True,
+                ) as select_named,
+                mock.patch.object(
+                    cli, "select_bulk_grail_candidates"
+                ) as select_balanced,
+                mock.patch.object(
+                    cli,
+                    "resolve_bulk_grail_candidates",
+                    return_value=resolved,
+                ),
+                mock.patch.object(
+                    cli,
+                    "publish_expanded_corpus",
+                    return_value=manifest,
+                ) as publish,
+            ):
+                result = cli.main(
+                    [
+                        "--dataset-root",
+                        str(grail),
+                        "--partition",
+                        "stair_p1",
+                        "--logical-name",
+                        "stair-1",
+                        "--output",
+                        str(root / "output"),
+                        "--report",
+                        str(root / "report.json"),
+                    ]
+                )
+
+        self.assertEqual(result, 0)
+        select_named.assert_called_once_with(candidates, ("stair-1",))
+        select_balanced.assert_not_called()
+        metadata = publish.call_args.kwargs["corpus_metadata"]
+        self.assertEqual(metadata["selection_mode"], "named")
+        self.assertEqual(metadata["selected_logical_names"], ["stair-1"])
+
+    def test_rejects_named_selection_with_balanced_limit(self):
+        self.assertIsNotNone(cli)
+        with self.assertRaises(SystemExit):
+            cli.main(
+                [
+                    "--partition",
+                    "stair_p1",
+                    "--logical-name",
+                    "stair-1",
+                    "--limit-per-partition",
+                    "2",
+                ]
+            )
+
     def test_partition_counter_fixture_is_balanced(self):
         values = Counter(
             namespace.partition

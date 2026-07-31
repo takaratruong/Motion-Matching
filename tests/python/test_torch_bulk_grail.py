@@ -35,6 +35,14 @@ except ModuleNotFoundError:
     resolve_bulk_grail_candidates = _missing
     select_bulk_grail_candidates = _missing
 
+try:
+    from resources.g1_torch_terrain_builder.bulk_grail import (
+        select_named_bulk_grail_candidates,
+    )
+except ImportError:
+    def select_named_bulk_grail_candidates(*_args, **_kwargs):
+        raise AssertionError("named bulk GRAIL selection is missing")
+
 
 _REVISION = "943946a972d5de2eb0d2ff214b236d0e43575fd7"
 
@@ -243,6 +251,33 @@ class BulkGrailSelectionTests(unittest.TestCase):
                 self.candidates + (self.candidates[0],),
                 limit_per_partition=2,
                 seed=0,
+            )
+
+    def test_named_selection_is_exact_and_requested_ordered(self):
+        selected = select_named_bulk_grail_candidates(
+            self.candidates,
+            (
+                self.candidates[2].logical_name,
+                self.candidates[0].logical_name,
+            ),
+        )
+        self.assertEqual(
+            tuple(item.logical_name for item in selected),
+            (
+                self.candidates[2].logical_name,
+                self.candidates[0].logical_name,
+            ),
+        )
+
+    def test_named_selection_rejects_duplicate_and_missing_names(self):
+        name = self.candidates[0].logical_name
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            select_named_bulk_grail_candidates(
+                self.candidates, (name, name)
+            )
+        with self.assertRaisesRegex(ValueError, "not found"):
+            select_named_bulk_grail_candidates(
+                self.candidates, ("missing",)
             )
 
 

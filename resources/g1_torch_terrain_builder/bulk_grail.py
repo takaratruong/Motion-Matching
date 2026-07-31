@@ -7,7 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 from types import MappingProxyType
-from typing import Iterable
+from typing import Iterable, Sequence
 
 from .registry import ResolvedSource, SourceSpec
 
@@ -227,6 +227,31 @@ def select_bulk_grail_candidates(
                 )
             )
     return tuple(sorted(selected, key=lambda value: (value.partition, value.stem)))
+
+
+def select_named_bulk_grail_candidates(
+    candidates: Sequence[BulkGrailCandidate],
+    logical_names: Sequence[str],
+) -> tuple[BulkGrailCandidate, ...]:
+    values = tuple(candidates)
+    if any(not isinstance(value, BulkGrailCandidate) for value in values):
+        raise TypeError("bulk GRAIL candidates have an invalid type")
+    requested = tuple(logical_names)
+    if not requested:
+        raise ValueError("named GRAIL selection must not be empty")
+    if any(not isinstance(name, str) or not name for name in requested):
+        raise ValueError("named GRAIL selection contains an invalid name")
+    if len(requested) != len(set(requested)):
+        raise ValueError("named GRAIL selection contains a duplicate")
+    by_name = {candidate.logical_name: candidate for candidate in values}
+    if len(by_name) != len(values):
+        raise ValueError(
+            "bulk GRAIL candidates contain duplicate logical identity"
+        )
+    missing = [name for name in requested if name not in by_name]
+    if missing:
+        raise ValueError(f"named GRAIL candidate not found: {missing[0]}")
+    return tuple(by_name[name] for name in requested)
 
 
 def _checked_file(
