@@ -502,6 +502,15 @@ def run_live_viewer(
             ),
             extension=resolved.measurement_extension,
             foot_kinematics=MujocoG1FootKinematics(g1_xml),
+            maximum_scene_xy_mismatch_m=float(
+                bounds["maximum_scene_xy_mismatch_m"]
+            ),
+            entry_inertialization_halflife_s=float(
+                bounds["entry_inertialization_halflife_s"]
+            ),
+            flat_support_transition_cost_weight=float(
+                bounds["flat_support_transition_cost_weight"]
+            ),
         )
     matcher = TorchMotionMatcher.from_folder(
         resolved.dataset.root,

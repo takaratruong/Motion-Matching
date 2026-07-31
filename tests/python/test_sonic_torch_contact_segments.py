@@ -53,6 +53,10 @@ class _ConstantGrid:
 
 
 class _IdentityAlignment:
+    def __init__(self):
+        self.translation_scene_xy = torch.zeros(2)
+        self.yaw_scene_from_matcher = torch.zeros(())
+
     def matcher_to_scene_xy(self, points):
         return points
 
@@ -231,7 +235,7 @@ class ContactSegmentTests(unittest.TestCase):
         self.assertEqual(tuple(placement.source_support_mask.shape), (20, 2))
         self.assertTrue(bool(placement.source_support_mask[0, 0]))
 
-    def test_policy_rejects_instant_opposite_support_switch(self):
+    def test_policy_defers_support_switch_to_emitted_fk_validation(self):
         policy = _placement_policy()
         arguments = dict(
             clip_index=1,
@@ -240,7 +244,7 @@ class ContactSegmentTests(unittest.TestCase):
             translation_xy=torch.zeros(2),
         )
 
-        self.assertIsNone(
+        self.assertIsNotNone(
             policy.resolve_entry(
                 **arguments,
                 current_support_mask=torch.tensor([False, True]),
@@ -258,6 +262,49 @@ class ContactSegmentTests(unittest.TestCase):
                 current_support_mask=torch.tensor([False, False]),
             )
         )
+
+    def test_policy_rejects_entry_far_from_authenticated_scene_phase(self):
+        base = _placement_policy()
+        policy = TerrainContactSegmentPolicy(
+            index=base.index,
+            extension=base.extension,
+            maximum_scene_xy_mismatch_m=0.10,
+        )
+        common = dict(
+            clip_index=1,
+            frame_index=10,
+            yaw_offset=torch.tensor(0.0),
+            current_support_mask=torch.tensor([False, False]),
+        )
+
+        self.assertIsNone(
+            policy.resolve_entry(
+                **common, translation_xy=torch.tensor([0.11, 0.0])
+            )
+        )
+        self.assertIsNotNone(
+            policy.resolve_entry(
+                **common, translation_xy=torch.tensor([0.10, 0.0])
+            )
+        )
+
+    def test_policy_uses_authenticated_source_to_query_scene_yaw(self):
+        policy = _placement_policy()
+        policy.dataset.clip_alignments[1].yaw_scene_from_matcher.fill_(0.4)
+        policy.extension.alignment.yaw_scene_from_matcher.fill_(-0.2)
+
+        yaw = policy.registered_yaw_offset(1)
+
+        self.assertAlmostEqual(float(yaw), 0.6, places=6)
+
+    def test_policy_requires_positive_terrain_entry_inertialization(self):
+        base = _placement_policy()
+        with self.assertRaisesRegex(ContractError, "inertialization"):
+            TerrainContactSegmentPolicy(
+                index=base.index,
+                extension=base.extension,
+                entry_inertialization_halflife_s=0.0,
+            )
 
     def test_policy_samples_current_query_support_with_frozen_thresholds(self):
         policy = _placement_policy()

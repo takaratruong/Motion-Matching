@@ -265,6 +265,7 @@ class SegmentPlacement:
     segment: ContactSegment
     vertical_offset_m: float
     source_support_mask: torch.Tensor
+    required_entry_support_mask: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         offset = float(self.vertical_offset_m)
@@ -281,9 +282,26 @@ class SegmentPlacement:
             raise ContractError(
                 "segment placement source support must match the segment"
             )
+        required = self.required_entry_support_mask
+        if required is not None and (
+            not isinstance(required, torch.Tensor)
+            or required.dtype != torch.bool
+            or tuple(required.shape) != (2,)
+            or required.device != support.device
+        ):
+            raise ContractError(
+                "segment placement required entry support must be boolean "
+                "shape-(2,) on the source support device"
+            )
         owned = support.detach().clone()
         object.__setattr__(self, "vertical_offset_m", offset)
         object.__setattr__(self, "source_support_mask", owned)
+        if required is not None:
+            object.__setattr__(
+                self,
+                "required_entry_support_mask",
+                required.detach().clone(),
+            )
 
 
 def _owned_readonly(array: object, dtype=None) -> np.ndarray:
@@ -337,6 +355,9 @@ class TerrainContactSegmentPolicy:
     index: ContactSegmentIndex
     extension: object
     foot_kinematics: object | None = None
+    maximum_scene_xy_mismatch_m: float | None = None
+    entry_inertialization_halflife_s: float | None = None
+    flat_support_transition_cost_weight: float = 0.0
 
     def __post_init__(self) -> None:
         try:
@@ -356,13 +377,83 @@ class TerrainContactSegmentPolicy:
             getattr(query_alignment, "matcher_to_scene_xy", None)
         ):
             raise ContractError("contact segment query terrain is invalid")
-
+        mismatch = self.maximum_scene_xy_mismatch_m
+        if mismatch is not None and (
+            isinstance(mismatch, bool)
+            or not isinstance(mismatch, (int, float))
+            or not math.isfinite(float(mismatch))
+            or float(mismatch) <= 0.0
+        ):
+            raise ContractError(
+                "contact segment scene mismatch limit must be finite and positive"
+            )
+        if mismatch is not None:
+            object.__setattr__(
+                self, "maximum_scene_xy_mismatch_m", float(mismatch)
+            )
+        halflife = self.entry_inertialization_halflife_s
+        if halflife is not None and (
+            isinstance(halflife, bool)
+            or not isinstance(halflife, (int, float))
+            or not math.isfinite(float(halflife))
+            or float(halflife) <= 0.0
+        ):
+            raise ContractError(
+                "contact entry inertialization halflife must be finite and positive"
+            )
+        if halflife is not None:
+            object.__setattr__(
+                self,
+                "entry_inertialization_halflife_s",
+                float(halflife),
+            )
+        weight = self.flat_support_transition_cost_weight
+        if (
+            isinstance(weight, bool)
+            or not isinstance(weight, (int, float))
+            or not math.isfinite(float(weight))
+            or float(weight) < 0.0
+        ):
+            raise ContractError(
+                "flat support transition cost weight must be finite and non-negative"
+            )
+        object.__setattr__(
+            self, "flat_support_transition_cost_weight", float(weight)
+        )
     @property
     def dataset(self):
         return self.extension.dataset
 
     def entry_eligibility(self, database: object) -> torch.Tensor:
         return self.index.terrain_entry_eligibility(database)
+
+    def registered_yaw_offset(self, clip_index: int) -> torch.Tensor:
+        if (
+            type(clip_index) is not int
+            or clip_index not in self.index.terrain_clip_indices
+        ):
+            raise ContractError("registered terrain yaw clip is invalid")
+        source_alignment = self.dataset.clip_alignments[clip_index]
+        if source_alignment is None:
+            raise ContractError("registered terrain yaw has no source alignment")
+        try:
+            source_yaw = source_alignment.yaw_scene_from_matcher
+            query_yaw = self.extension.alignment.yaw_scene_from_matcher
+        except AttributeError as error:
+            raise ContractError("registered terrain yaw alignment is invalid") from error
+        if (
+            not isinstance(source_yaw, torch.Tensor)
+            or source_yaw.numel() != 1
+            or not isinstance(query_yaw, torch.Tensor)
+            or query_yaw.numel() != 1
+            or source_yaw.device != query_yaw.device
+            or source_yaw.dtype != query_yaw.dtype
+            or not torch.isfinite(source_yaw).all()
+            or not torch.isfinite(query_yaw).all()
+        ):
+            raise ContractError("registered terrain yaw tensors are invalid")
+        delta = source_yaw.reshape(()) - query_yaw.reshape(())
+        return torch.atan2(torch.sin(delta), torch.cos(delta))
 
     @staticmethod
     def _longest_false_run(supported: torch.Tensor) -> int:
@@ -479,6 +570,17 @@ class TerrainContactSegmentPolicy:
             emitted_support[0, placement.segment.entering_foot].item()
         ):
             reason = "entering_support"
+        elif (
+            placement.required_entry_support_mask is not None
+            and bool(placement.required_entry_support_mask.any().item())
+            and not bool(
+                (
+                    emitted_support[0]
+                    & placement.required_entry_support_mask
+                ).any().item()
+            )
+        ):
+            reason = "support_side_switch"
         elif longest > 10:
             reason = "unsupported_run"
         elif lost_fraction > 0.05:
@@ -579,11 +681,6 @@ class TerrainContactSegmentPolicy:
             raise ContractError(
                 "current support mask must be boolean shape-(2,) on the policy device"
             )
-        if bool(support.any().item()) and not bool(
-            support[segment.entering_foot].item()
-        ):
-            return None
-
         dataset = self.dataset
         layout = dataset.folder.layout
         foot_body = (
@@ -606,10 +703,6 @@ class TerrainContactSegmentPolicy:
                 sine * source_ankle[0] + cosine * source_ankle[1],
             )
         ) + translation
-        query_scene_xy = self.extension.alignment.matcher_to_scene_xy(
-            transformed_xy
-        )
-        target_surface = self.extension.query_grid.sample_xy(query_scene_xy)
         source_grid = dataset.clip_grids[clip_index]
         source_alignment = dataset.clip_alignments[clip_index]
         if source_grid is None or source_alignment is None:
@@ -617,6 +710,62 @@ class TerrainContactSegmentPolicy:
         source_scene_xy = source_alignment.matcher_to_scene_xy(
             source_ankle[:2]
         )
+        mismatch_limit = self.maximum_scene_xy_mismatch_m
+        if mismatch_limit is not None:
+            try:
+                query_translation = self.extension.alignment.translation_scene_xy
+                query_yaw = self.extension.alignment.yaw_scene_from_matcher
+            except AttributeError as error:
+                raise ContractError(
+                    "contact scene mismatch gate requires rigid query alignment"
+                ) from error
+            relative = source_scene_xy - query_translation
+            query_cosine = torch.cos(query_yaw)
+            query_sine = torch.sin(query_yaw)
+            registered_xy = torch.stack(
+                (
+                    query_cosine * relative[0]
+                    + query_sine * relative[1],
+                    -query_sine * relative[0]
+                    + query_cosine * relative[1],
+                )
+            )
+            mismatch = transformed_xy - registered_xy
+            if float(torch.linalg.vector_norm(mismatch).item()) > mismatch_limit:
+                return None
+            source_start_ankle = torch.tensor(
+                dataset.folder.clips[clip_index].body_position_world[
+                    0, foot_body, :2
+                ],
+                dtype=torch.float32,
+                device=dataset.device,
+            )
+            start_scene_xy = source_alignment.matcher_to_scene_xy(
+                source_start_ankle
+            )
+            start_relative = start_scene_xy - query_translation
+            registered_start_xy = torch.stack(
+                (
+                    query_cosine * start_relative[0]
+                    + query_sine * start_relative[1],
+                    -query_sine * start_relative[0]
+                    + query_cosine * start_relative[1],
+                )
+            )
+            phase_direction = registered_xy - registered_start_xy
+            phase_length = torch.linalg.vector_norm(phase_direction)
+            if (
+                float(phase_length.item()) > 1e-6
+                and float(
+                    torch.dot(mismatch, phase_direction / phase_length).item()
+                )
+                < 0.0
+            ):
+                return None
+        query_scene_xy = self.extension.alignment.matcher_to_scene_xy(
+            transformed_xy
+        )
+        target_surface = self.extension.query_grid.sample_xy(query_scene_xy)
         source_surface = source_grid.sample_xy(source_scene_xy)
         return SegmentPlacement(
             segment=segment,
@@ -624,4 +773,5 @@ class TerrainContactSegmentPolicy:
             source_support_mask=self.index.support_mask(clip_index)[
                 segment.start_frame : segment.end_frame
             ],
+            required_entry_support_mask=support,
         )

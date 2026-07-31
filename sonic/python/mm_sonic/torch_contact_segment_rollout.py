@@ -153,6 +153,9 @@ def load_contact_segment_config(path: str | Path) -> dict:
         != {
             "minimum_frames",
             "maximum_frames",
+            "maximum_scene_xy_mismatch_m",
+            "entry_inertialization_halflife_s",
+            "flat_support_transition_cost_weight",
             "maximum_unsupported_frames",
             "maximum_lost_source_support_fraction",
         }
@@ -164,6 +167,30 @@ def load_contact_segment_config(path: str | Path) -> dict:
     maximum = contact["maximum_frames"]
     if type(minimum) is not int or type(maximum) is not int or not 1 <= minimum <= maximum:
         raise ContractError("contact-segment frame bounds are invalid")
+    mismatch = contact["maximum_scene_xy_mismatch_m"]
+    if (
+        isinstance(mismatch, bool)
+        or not isinstance(mismatch, (int, float))
+        or not math.isfinite(float(mismatch))
+        or float(mismatch) <= 0.0
+    ):
+        raise ContractError("contact-segment scene mismatch limit is invalid")
+    entry_halflife = contact["entry_inertialization_halflife_s"]
+    if (
+        isinstance(entry_halflife, bool)
+        or not isinstance(entry_halflife, (int, float))
+        or not math.isfinite(float(entry_halflife))
+        or float(entry_halflife) <= 0.0
+    ):
+        raise ContractError("contact-segment entry inertialization is invalid")
+    flat_support_weight = contact["flat_support_transition_cost_weight"]
+    if (
+        isinstance(flat_support_weight, bool)
+        or not isinstance(flat_support_weight, (int, float))
+        or not math.isfinite(float(flat_support_weight))
+        or float(flat_support_weight) < 0.0
+    ):
+        raise ContractError("flat support transition cost weight is invalid")
     return deepcopy(config)
 
 
@@ -294,6 +321,15 @@ def run_contact_segment_rollout(
         index=index,
         extension=resolved.measurement_extension,
         foot_kinematics=fk,
+        maximum_scene_xy_mismatch_m=float(
+            contact["maximum_scene_xy_mismatch_m"]
+        ),
+        entry_inertialization_halflife_s=float(
+            contact["entry_inertialization_halflife_s"]
+        ),
+        flat_support_transition_cost_weight=float(
+            contact["flat_support_transition_cost_weight"]
+        ),
     )
     matcher = TorchMotionMatcher.from_folder(
         resolved.dataset.root,

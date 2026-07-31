@@ -1077,7 +1077,43 @@ class TorchMotionMatcher:
             if contact_segment_policy is None
             else contact_segment_policy.entry_eligibility(database)
         )
+        if contact_segment_policy is None:
+            self._terrain_entry_rows = None
+        else:
+            terrain_clips = torch.tensor(
+                sorted(contact_segment_policy.index.terrain_clip_indices),
+                dtype=database._search_clip_index.dtype,
+                device=database.device,
+            )
+            self._terrain_entry_rows = self._transition_eligible_rows & torch.isin(
+                database._search_clip_index, terrain_clips
+            )
         self._clips = clips
+        root = folder.layout.root_body_index
+        feet = torch.tensor(
+            (
+                folder.layout.left_foot_body_index,
+                folder.layout.right_foot_body_index,
+            ),
+            device=database.device,
+        )
+        self._transition_source_root_yaw = torch.cat(
+            tuple(
+                _quat_yaw(
+                    clip.body_quaternion[: source.valid_frame_stop, root]
+                )
+                for clip, source in zip(clips, folder.clips)
+            )
+        )
+        self._transition_source_foot_offset_xy = torch.cat(
+            tuple(
+                clip.body_position[: source.valid_frame_stop, feet, :2]
+                - clip.body_position[
+                    : source.valid_frame_stop, root, :2
+                ][:, None, :]
+                for clip, source in zip(clips, folder.clips)
+            )
+        )
         self._row_sources = tuple(
             zip(
                 database._search_clip_index.cpu().tolist(),
@@ -1087,6 +1123,59 @@ class TorchMotionMatcher:
         self._owner_token = object()
         self._state: _MatcherState | None = None
         self._selection_history: list[_SelectionVisit] = []
+
+    def _flat_support_transition_costs(
+        self,
+        state: _MatcherState,
+        shaped: ShapedCommand,
+    ) -> torch.Tensor:
+        rows = self.database._search_clip_index.shape
+        costs = torch.zeros(rows, dtype=torch.float32, device=self.device)
+        policy = self._contact_segment_policy
+        if policy is None or policy.flat_support_transition_cost_weight == 0.0:
+            return costs
+        if state.clip_index in policy.index.terrain_clip_indices:
+            return costs
+        support = policy.query_support_mask(
+            state.feature_body_position,
+            state.feature_body_velocity,
+        )
+        if not bool(support.any().item()):
+            return costs
+        yaw = shaped.heading_world_yaw - self._transition_source_root_yaw
+        offsets = self._transition_source_foot_offset_xy
+        cosine = torch.cos(yaw)[:, None]
+        sine = torch.sin(yaw)[:, None]
+        rotated = torch.stack(
+            (
+                cosine * offsets[..., 0] - sine * offsets[..., 1],
+                sine * offsets[..., 0] + cosine * offsets[..., 1],
+            ),
+            dim=-1,
+        )
+        desired_root = (
+            state.root_position[:2]
+            + shaped.velocity_world_xy * self.config.dt
+        )
+        predicted = desired_root[None, None, :] + rotated
+        residual = predicted[:, support] - state.feature_body_position[
+            1:, :2
+        ][support]
+        costs = policy.flat_support_transition_cost_weight * torch.mean(
+            torch.square(residual), dim=(1, 2)
+        )
+        terrain = torch.tensor(
+            sorted(policy.index.terrain_clip_indices),
+            dtype=self.database._search_clip_index.dtype,
+            device=self.device,
+        )
+        if terrain.numel() > 0:
+            costs = torch.where(
+                torch.isin(self.database._search_clip_index, terrain),
+                0.0,
+                costs,
+            )
+        return costs
 
     @classmethod
     def from_folder(
@@ -1435,6 +1524,8 @@ class TorchMotionMatcher:
         shaped: ShapedCommand,
         selected_row: int,
         incumbent_row: int | None,
+        *,
+        inherit_terrain_exit_elevation: bool = False,
     ) -> _ComposedCandidate:
         clip_index, frame_index = self._source_for_row(selected_row)
         transitioned = (
@@ -1442,6 +1533,7 @@ class TorchMotionMatcher:
         )
         placement = None
         contact_entry_valid = True
+        policy = self._contact_segment_policy
         if transitioned:
             clip = self._clips[clip_index]
             root = self.folder.layout.root_body_index
@@ -1449,9 +1541,15 @@ class TorchMotionMatcher:
             source_yaw = _quat_yaw(
                 clip.body_quaternion[frame_index, root]
             )
-            yaw_offset = _wrapped_angle(
-                shaped.heading_world_yaw - source_yaw
-            )
+            if (
+                policy is not None
+                and clip_index in policy.index.terrain_clip_indices
+            ):
+                yaw_offset = policy.registered_yaw_offset(clip_index)
+            else:
+                yaw_offset = _wrapped_angle(
+                    shaped.heading_world_yaw - source_yaw
+                )
             desired_xy = (
                 state.root_position[:2]
                 + shaped.velocity_world_xy * self.config.dt
@@ -1459,7 +1557,15 @@ class TorchMotionMatcher:
             rotated = _rotate_z(source_pos, yaw_offset)
             translation = desired_xy - rotated[:2]
             translation_z = 0.0
-            policy = self._contact_segment_policy
+            if (
+                policy is not None
+                and state.clip_index in policy.index.terrain_clip_indices
+                and clip_index not in policy.index.terrain_clip_indices
+                and inherit_terrain_exit_elevation
+            ):
+                translation_z = float(
+                    (state.root_position[2] - source_pos[2]).item()
+                )
             if (
                 policy is not None
                 and clip_index in policy.index.terrain_clip_indices
@@ -1482,6 +1588,16 @@ class TorchMotionMatcher:
             yaw_offset = state.yaw_offset
             translation = state.translation_xy
             translation_z = state.translation_z
+            if policy is not None:
+                contiguous = policy.index.entry(clip_index, frame_index)
+                if contiguous is not None:
+                    placement = SegmentPlacement(
+                        segment=contiguous,
+                        vertical_offset_m=translation_z,
+                        source_support_mask=policy.index.support_mask(
+                            clip_index
+                        )[contiguous.start_frame : contiguous.end_frame],
+                    )
         horizon = max(
             46,
             placement.segment.frame_count if placement is not None else 46,
@@ -1528,32 +1644,51 @@ class TorchMotionMatcher:
             * self.config.dt
             + offsets.elapsed_s
         )
+        inertialization_halflife = self.config.inertialization_halflife_s
+        if (
+            transitioned
+            and placement is not None
+            and self._contact_segment_policy is not None
+            and self._contact_segment_policy.entry_inertialization_halflife_s
+            is not None
+        ):
+            inertialization_halflife = (
+                self._contact_segment_policy.entry_inertialization_halflife_s
+            )
         jpo, jvo = decay_spring_offsets(
             offsets.joint_position,
             offsets.joint_velocity,
-            halflife_s=self.config.inertialization_halflife_s,
+            halflife_s=inertialization_halflife,
             time_s=times,
         )
         rpo, rvo = decay_spring_offsets(
             offsets.root_position,
             offsets.root_linear_velocity,
-            halflife_s=self.config.inertialization_halflife_s,
+            halflife_s=inertialization_halflife,
             time_s=times,
         )
         bao, bvo = decay_spring_offsets(
             offsets.body_position,
             offsets.body_velocity,
-            halflife_s=self.config.inertialization_halflife_s,
+            halflife_s=inertialization_halflife,
             time_s=times,
         )
         qao, qwo = decay_spring_offsets(
             offsets.root_rotation_axis,
             offsets.root_angular_velocity,
-            halflife_s=self.config.inertialization_halflife_s,
+            halflife_s=inertialization_halflife,
             time_s=times,
         )
         dense_joint_position = jp + jpo
         dense_joint_velocity = jv + jvo
+        dense_joint_position, dense_joint_velocity = (
+            self._smooth_joint_reference(
+                state,
+                dense_joint_position,
+                dense_joint_velocity,
+                disable=(placement is not None or state.commitment is not None),
+            )
+        )
         dense_root_position = rp + rpo
         dense_root_quaternion = _quat_normalize(
             _quat_mul(_quat_from_scaled_axis(qao), rq)
@@ -1561,7 +1696,6 @@ class TorchMotionMatcher:
         dense_body_position = bp + bao
         dense_body_velocity = bv + bvo
         segment_validation = None
-        policy = self._contact_segment_policy
         if placement is not None:
             frame_count = placement.segment.frame_count
             segment_validation = policy.validate_emitted(
@@ -1684,6 +1818,14 @@ class TorchMotionMatcher:
             if bool((loop_costs > 0.0).any().item())
             else continuity.total
         )
+        if (
+            self._contact_segment_policy is not None
+            and self._contact_segment_policy.flat_support_transition_cost_weight
+            > 0.0
+        ):
+            transition_costs = transition_costs + (
+                self._flat_support_transition_costs(state, shaped)
+            )
         return shaped, query, transition_costs, successor
 
     def _reachability_state_after(
@@ -2072,36 +2214,40 @@ class TorchMotionMatcher:
     def _smooth_joint_reference(
         self,
         state: _MatcherState,
-        candidate: _ComposedCandidate,
+        dense_joint_position: torch.Tensor,
+        dense_joint_velocity: torch.Tensor,
+        *,
+        disable: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        weight = float(self.config.joint_reference_smoothing_weight)
+        weight = (
+            0.0
+            if disable
+            else float(self.config.joint_reference_smoothing_weight)
+        )
         if weight == 0.0:
-            return (
-                candidate.dense_joint_position,
-                candidate.dense_joint_velocity,
-            )
+            return dense_joint_position, dense_joint_velocity
         center = 1.0 - 2.0 * weight
-        position = candidate.dense_joint_position.clone()
-        velocity = candidate.dense_joint_velocity.clone()
+        position = dense_joint_position.clone()
+        velocity = dense_joint_velocity.clone()
         position[0] = (
             weight * state.joint_position
-            + center * candidate.dense_joint_position[0]
-            + weight * candidate.dense_joint_position[1]
+            + center * dense_joint_position[0]
+            + weight * dense_joint_position[1]
         )
         velocity[0] = (
             weight * state.joint_velocity
-            + center * candidate.dense_joint_velocity[0]
-            + weight * candidate.dense_joint_velocity[1]
+            + center * dense_joint_velocity[0]
+            + weight * dense_joint_velocity[1]
         )
         position[1:-1] = (
-            weight * candidate.dense_joint_position[:-2]
-            + center * candidate.dense_joint_position[1:-1]
-            + weight * candidate.dense_joint_position[2:]
+            weight * dense_joint_position[:-2]
+            + center * dense_joint_position[1:-1]
+            + weight * dense_joint_position[2:]
         )
         velocity[1:-1] = (
-            weight * candidate.dense_joint_velocity[:-2]
-            + center * candidate.dense_joint_velocity[1:-1]
-            + weight * candidate.dense_joint_velocity[2:]
+            weight * dense_joint_velocity[:-2]
+            + center * dense_joint_velocity[1:-1]
+            + weight * dense_joint_velocity[2:]
         )
         return position, velocity
 
@@ -2260,6 +2406,14 @@ class TorchMotionMatcher:
             if bool((loop_costs > 0.0).any().item())
             else continuity.total
         )
+        if (
+            self._contact_segment_policy is not None
+            and self._contact_segment_policy.flat_support_transition_cost_weight
+            > 0.0
+        ):
+            transition_costs = transition_costs + (
+                self._flat_support_transition_costs(state, shaped)
+            )
         if committed_playback:
             commitment = state.commitment
             assert commitment is not None
@@ -2311,6 +2465,73 @@ class TorchMotionMatcher:
         terrain_safety_override = False
         terrain_safety_override_rank = 0
         validator = self._emitted_window_validator
+        policy = self._contact_segment_policy
+        if (
+            policy is not None
+            and search
+            and not committed_playback
+            and not bool(
+                self._terrain_entry_rows[decision.selected_row].item()
+            )
+        ):
+            terrain_rank_start = time.perf_counter_ns()
+            terrain_entries = rank_exact_transition_candidates(
+                self.database,
+                query,
+                current_clip_index=state.clip_index,
+                current_frame_index=state.frame_index,
+                config=self.config,
+                additional_transition_costs=transition_costs,
+                transition_eligible_rows=self._terrain_entry_rows,
+            )
+            terrain_rank_time = time.perf_counter_ns() - terrain_rank_start
+            search_time = (
+                terrain_rank_time
+                if search_time is None
+                else search_time + terrain_rank_time
+            )
+            for rank, terrain_decision in enumerate(
+                terrain_entries, start=1
+            ):
+                terrain_candidate = self._compose_candidate(
+                    state,
+                    shaped,
+                    terrain_decision.selected_row,
+                    successor,
+                )
+                if not terrain_candidate.contact_entry_valid:
+                    continue
+                if validator is not None:
+                    terrain_accepted = validator(
+                        terrain_candidate.dense_body_position[:46].clone()
+                    )
+                    if type(terrain_accepted) is not bool:
+                        raise ContractError(
+                            "emitted-window validator must return exact bool"
+                        )
+                    if not terrain_accepted:
+                        continue
+                candidate = terrain_candidate
+                decision = SearchDecision(
+                    selected_row=terrain_decision.selected_row,
+                    incumbent_row=successor,
+                    incumbent_cost=decision.incumbent_cost,
+                    selected_feature_cost=(
+                        terrain_decision.selected_feature_cost
+                    ),
+                    selected_total_cost=(
+                        terrain_decision.selected_total_cost
+                        + settle_penalty
+                    ),
+                    searched=True,
+                    transitioned=True,
+                    selected_transition_cost=(
+                        terrain_decision.selected_transition_cost
+                    ),
+                )
+                terrain_safety_override = True
+                terrain_safety_override_rank = rank
+                break
         segment_rejection_reason = None
         if not candidate.contact_entry_valid:
             segment_rejection_reason = (
@@ -2494,6 +2715,20 @@ class TorchMotionMatcher:
                 settle_penalty,
                 search_time,
             )
+        if (
+            candidate.transitioned
+            and policy is not None
+            and state.clip_index in policy.index.terrain_clip_indices
+            and candidate.clip_index
+            not in policy.index.terrain_clip_indices
+        ):
+            candidate = self._compose_candidate(
+                state,
+                shaped,
+                decision.selected_row,
+                successor,
+                inherit_terrain_exit_elevation=True,
+            )
         residual_sq = torch.square(
             self.database._search_features[decision.selected_row] - query
         )
@@ -2516,14 +2751,15 @@ class TorchMotionMatcher:
             force_reason = "clip_end"
         elif shaped.force_search:
             force_reason = "command_transition"
-        dense_joint_p, dense_joint_v = self._smooth_joint_reference(
-            state, candidate
-        )
+        dense_joint_p = candidate.dense_joint_position
+        dense_joint_v = candidate.dense_joint_velocity
         output_commitment = state.commitment
         if (
             output_commitment is None
-            and candidate.transitioned
             and candidate.segment_placement is not None
+            and candidate.contact_entry_valid
+            and candidate.segment_validation is not None
+            and candidate.segment_validation.accepted
         ):
             placement = candidate.segment_placement
             output_commitment = SegmentCommitment(

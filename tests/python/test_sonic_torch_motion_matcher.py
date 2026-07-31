@@ -82,22 +82,45 @@ class _ConstantGrid:
 
 
 class _IdentityAlignment:
+    def __init__(self):
+        self.translation_scene_xy = torch.zeros(2)
+        self.yaw_scene_from_matcher = torch.zeros(())
+
     def matcher_to_scene_xy(self, points):
         return points
 
 
 class _FlatContactFootKinematics:
-    def __init__(self, height=0.035):
+    def __init__(self, height=0.035, right_height=None):
         self.height = float(height)
+        self.right_height = (
+            self.height if right_height is None else float(right_height)
+        )
 
     def foot_positions(self, joints, roots, quaternions):
         output = np.zeros((len(joints), 2, 3), np.float64)
-        output[..., 2] = self.height
+        output[:, 0, 2] = self.height
+        output[:, 1, 2] = self.right_height
+        return output
+
+
+class _JointDependentContactFootKinematics:
+    def foot_positions(self, joints, roots, quaternions):
+        output = np.zeros((len(joints), 2, 3), np.float64)
+        output[:, 0, :2] = joints[:, :2]
+        output[:, 1, :2] = joints[:, 2:4]
+        output[:, :, 2] = 0.035
         return output
 
 
 def _install_contact_policy(
-    matcher, *, start=20, end=30, foot_kinematics=None
+    matcher,
+    *,
+    start=20,
+    end=30,
+    foot_kinematics=None,
+    terrain_clip_indices=(0,),
+    flat_support_transition_cost_weight=0.0,
 ):
     support = torch.zeros(
         (len(matcher.folder.clips[0].joint_position), 2), dtype=torch.bool
@@ -106,7 +129,7 @@ def _install_contact_policy(
     support[end : end + 10, 1] = True
     support[end + 10 : end + 20, 0] = True
     index = ContactSegmentIndex.from_support_masks(
-        (support,), terrain_clip_indices=(0,),
+        (support,), terrain_clip_indices=terrain_clip_indices,
         minimum_frames=5, maximum_frames=60,
     )
     identity = _IdentityAlignment()
@@ -129,15 +152,52 @@ def _install_contact_policy(
             if foot_kinematics is None
             else foot_kinematics
         ),
+        flat_support_transition_cost_weight=(
+            flat_support_transition_cost_weight
+        ),
     )
     matcher._contact_segment_policy = policy
     matcher._transition_eligible_rows = policy.entry_eligibility(
         matcher.database
     )
+    matcher._terrain_entry_rows = matcher._transition_eligible_rows.clone()
     return policy
 
 
 class TorchMotionMatcherTests(unittest.TestCase):
+    def test_flat_support_transition_cost_is_row_aligned(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(root, device="cpu")
+            matcher.reset()
+            _install_contact_policy(
+                matcher,
+                terrain_clip_indices=(),
+                flat_support_transition_cost_weight=400.0,
+            )
+            state = matcher._state
+            shaped = predict_command_trajectory(
+                state.root_position[:2],
+                state.shaped_velocity,
+                state.shaped_heading,
+                torch.tensor((0.4, 0.0)),
+                torch.tensor(0.0),
+                has_valid_successor=True,
+                config=matcher.config,
+            )
+            with mock.patch.object(
+                TerrainContactSegmentPolicy,
+                "query_support_mask",
+                return_value=torch.tensor([False, True]),
+            ):
+                costs = matcher._flat_support_transition_costs(state, shaped)
+
+        self.assertEqual(costs.shape, matcher.database._search_clip_index.shape)
+        self.assertTrue(bool((costs >= 0.0).all().item()))
+        self.assertTrue(bool((costs > 0.0).any().item()))
+
     def test_contact_segment_commitment_is_sequential_until_release(self):
         arrays = build_varying_takara_arrays(frames=100)
         with tempfile.TemporaryDirectory() as tmp:
@@ -146,10 +206,19 @@ class TorchMotionMatcherTests(unittest.TestCase):
             matcher = TorchMotionMatcher.from_folder(
                 root,
                 device="cpu",
-                config=MatcherConfig(search_interval_steps=1, exclusion_frames=0),
+                config=MatcherConfig(
+                    search_interval_steps=1,
+                    exclusion_frames=0,
+                    joint_reference_smoothing_weight=0.2,
+                ),
             )
             matcher.reset()
-            _install_contact_policy(matcher, start=20, end=30)
+            _install_contact_policy(
+                matcher,
+                start=20,
+                end=30,
+                foot_kinematics=_JointDependentContactFootKinematics(),
+            )
             entry_row = matcher.database.row_for_source(0, 20)
             successor = matcher.database.row_for_source(0, 1)
             selected = SearchDecision(
@@ -199,7 +268,9 @@ class TorchMotionMatcherTests(unittest.TestCase):
                 wraps=select_exact_candidate,
             ) as resumed_search:
                 released = matcher.step((-0.4, 0.0), math.pi)
-            self.assertFalse(released.diagnostics.segment_committed)
+            self.assertTrue(released.diagnostics.segment_committed)
+            self.assertEqual(released.diagnostics.segment_start_frame, 30)
+            self.assertEqual(released.diagnostics.segment_end_frame, 40)
             resumed_search.assert_called_once()
             released_feet = (
                 matcher._contact_segment_policy.emitted_foot_positions(
@@ -252,7 +323,7 @@ class TorchMotionMatcherTests(unittest.TestCase):
         self.assertEqual(matcher._state.sequence, 0)
         self.assertIsNone(matcher._state.commitment)
 
-    def test_rejected_contact_entry_is_transactional(self):
+    def test_valid_terrain_entry_overrides_flat_incumbent_during_search(self):
         arrays = build_varying_takara_arrays(frames=100)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -264,6 +335,46 @@ class TorchMotionMatcherTests(unittest.TestCase):
             )
             matcher.reset()
             _install_contact_policy(matcher, start=20, end=30)
+            successor = matcher.database.row_for_source(0, 1)
+            entry = matcher.database.row_for_source(0, 20)
+            flat = SearchDecision(
+                successor, successor, 0.0, 0.0, 0.0, True, False
+            )
+            terrain = SearchDecision(
+                entry, None, math.inf, 2.0, 2.1, True, True
+            )
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher.select_exact_candidate",
+                return_value=flat,
+            ), mock.patch(
+                "mm_sonic.torch_motion_matcher.rank_exact_transition_candidates",
+                return_value=(terrain,),
+            ):
+                result = matcher.step((0.4, 0.0), 0.0)
+
+        self.assertEqual(result.diagnostics.selected_frame, 20)
+        self.assertTrue(result.diagnostics.segment_committed)
+        self.assertTrue(result.diagnostics.terrain_safety_override)
+
+    def test_rejected_contact_entry_is_transactional(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=MatcherConfig(search_interval_steps=1, exclusion_frames=0),
+            )
+            matcher.reset()
+            _install_contact_policy(
+                matcher,
+                start=20,
+                end=30,
+                foot_kinematics=_FlatContactFootKinematics(
+                    height=0.035, right_height=0.20
+                ),
+            )
             entry_row = matcher.database.row_for_source(0, 20)
             successor = matcher.database.row_for_source(0, 1)
             selected = SearchDecision(
@@ -287,7 +398,7 @@ class TorchMotionMatcherTests(unittest.TestCase):
         self.assertTrue(prepared.result.diagnostics.transition_rejected)
         self.assertEqual(
             prepared.result.diagnostics.segment_rejection_reason,
-            "incompatible_support_side",
+            "support_side_switch",
         )
 
     def test_transition_eligibility_masks_only_search_transitions(self):
@@ -394,6 +505,59 @@ class TorchMotionMatcherTests(unittest.TestCase):
         torch.testing.assert_close(raised[2] - zero[2], expected_root)
         torch.testing.assert_close(
             raised[6] - zero[6], expected_body
+        )
+
+    def test_flat_transition_from_terrain_inherits_current_root_elevation(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "flat", arrays)
+            write_takara_arrays(root / "terrain", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                reset_clip_path="terrain/motion.npz",
+            )
+            matcher.reset()
+            state = matcher._state
+            self.assertIsNotNone(state)
+            raised_root = state.root_position.clone()
+            raised_root[2] += 0.4
+            state = replace(
+                state,
+                root_position=raised_root,
+                translation_z=0.4,
+            )
+            matcher._contact_segment_policy = SimpleNamespace(
+                index=SimpleNamespace(terrain_clip_indices=frozenset({1}))
+            )
+            shaped = predict_command_trajectory(
+                state.root_position[:2],
+                state.shaped_velocity,
+                state.shaped_heading,
+                torch.tensor((0.4, 0.0)),
+                torch.tensor(0.0),
+                has_valid_successor=True,
+                config=matcher.config,
+            )
+            flat_row = matcher.database.row_for_source(0, 20)
+            candidate = matcher._compose_candidate(
+                state,
+                shaped,
+                flat_row,
+                None,
+                inherit_terrain_exit_elevation=True,
+            )
+
+        source_root_z = float(
+            matcher._clips[0].body_position[
+                20, matcher.folder.layout.root_body_index, 2
+            ].item()
+        )
+        self.assertAlmostEqual(
+            candidate.translation_z,
+            float(state.root_position[2].item()) - source_root_z,
+            places=6,
         )
 
     def test_transition_reachability_budget_caps_actual_compositions(self):
