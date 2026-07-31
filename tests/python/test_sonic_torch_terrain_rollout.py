@@ -382,6 +382,9 @@ class TerrainRolloutTests(unittest.TestCase):
             arrays["motion_feature_cost"] + arrays["terrain_feature_cost"],
             arrays["total_feature_cost"],
             atol=2e-4,
+            # Separate float32 reductions need a dimension-independent
+            # relative allowance when compared with the fused reduction.
+            rtol=3e-7,
         )
         self.assertTrue(
             np.all(
