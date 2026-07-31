@@ -3,8 +3,8 @@
 **Date:** 2026-07-30
 **Branch:** `research/g1-torch-terrain-kinematics`
 **Scope:** Kinematic motion matching on one authenticated GRAIL stair scene.
-SONIC tracking, physics, depth estimation, omnidirectional coverage, curb
-coverage, and bulk-corpus publication are excluded until this experiment passes.
+Tracking, physics, depth estimation, omnidirectional coverage, curb coverage,
+and bulk-corpus publication are outside this project.
 
 ## Problem
 
@@ -57,7 +57,7 @@ The experiment uses:
 It does not use:
 
 - the 176-clip representative corpus or the full GRAIL corpus;
-- inverse kinematics, foot locking, physics, or SONIC;
+- inverse kinematics, foot locking, or physics;
 - a learned model;
 - future operator commands;
 - a multi-step beam planner; or
@@ -212,5 +212,4 @@ After the single forward stair run passes visually:
 2. test diagonal approach and turning on the same stair;
 3. add lateral and backward segments only where source data supports them;
 4. add curb clips;
-5. evaluate whether shorter safe commitments are needed for responsiveness;
-6. then connect the kinematic matcher to SONIC and measure inference latency.
+5. evaluate whether shorter safe commitments are needed for responsiveness.
