@@ -2,6 +2,7 @@ import unittest
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -10,6 +11,7 @@ from mm_sonic.torch_terrain_omni_rollout import (
     evaluate_route_outcome,
     run_omni_matrix,
     save_omni_matrix,
+    _scalar_diagnostic,
 )
 from mm_sonic.torch_terrain_omni_routes import (
     OmniRoute,
@@ -99,6 +101,13 @@ class OmnidirectionalRolloutContractTests(unittest.TestCase):
     def setUp(self):
         self.frame = StairFrame((0.0, 0.0), 0.0, 0.6223, 0.3302, 0.1778, 3)
 
+    def test_none_optional_diagnostic_uses_numeric_default(self):
+        diagnostic = SimpleNamespace(search_time_ns=None)
+
+        self.assertEqual(
+            _scalar_diagnostic(diagnostic, "search_time_ns", -1), -1
+        )
+
     def test_every_command_frame_commits_once_and_arrays_are_complete(self):
         ledgers = []
 
@@ -171,6 +180,27 @@ class OmnidirectionalRolloutContractTests(unittest.TestCase):
         self.assertEqual(first.runs[0].failure.exception_type, "RuntimeError")
         self.assertTrue(first.runs[1].completed_without_exception)
         self.assertEqual(first.deterministic_sha256, second.deterministic_sha256)
+
+    def test_route_fails_fast_after_step_exceeds_latency_limit(self):
+        matrix = run_omni_matrix(
+            routes=_routes(),
+            stair_frame=self.frame,
+            matcher_factory=lambda _route: _FakeMatcher(
+                fail_at=None, timing=101, ledger=[]
+            ),
+            kinematics=_kinematics,
+            terrain_sampler=lambda xy: np.zeros(2),
+            dataset_identity="dataset-a",
+            config_identity="config-a",
+            maximum_step_time_ns=100,
+        )
+
+        self.assertFalse(matrix.matrix_pass)
+        for run in matrix.runs:
+            self.assertEqual(run.completed_frames, 1)
+            self.assertEqual(run.failure.stage, "latency")
+            self.assertEqual(run.failure.frame_index, 1)
+            self.assertIn("101 ns", run.failure.message)
 
     def test_matrix_artifacts_are_saved_transactionally_and_pickle_free(self):
         matrix = run_omni_matrix(

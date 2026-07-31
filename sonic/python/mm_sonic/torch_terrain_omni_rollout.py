@@ -315,7 +315,8 @@ def _failure(stage: str, frame_index: int | None, error: Exception) -> RouteFail
 
 
 def _scalar_diagnostic(diagnostics, name: str, default):
-    return getattr(diagnostics, name, default)
+    value = getattr(diagnostics, name, default)
+    return default if value is None else value
 
 
 def _run_route(
@@ -327,6 +328,7 @@ def _run_route(
     terrain_sampler: Callable[[np.ndarray], np.ndarray],
     dataset_identity: str,
     config_identity: str,
+    maximum_step_time_ns: int | None,
 ) -> OmniRouteRun:
     rows = {name: [] for name in _ARRAY_SHAPES}
     failure = None
@@ -416,6 +418,16 @@ def _run_route(
                     int(_scalar_diagnostic(diagnostics, "search_time_ns", -1))
                 )
                 frame_index += 1
+                step_time_ns = rows["step_time_ns"][-1]
+                if (
+                    maximum_step_time_ns is not None
+                    and step_time_ns > maximum_step_time_ns
+                ):
+                    stage = "latency"
+                    raise RuntimeError(
+                        f"matcher step took {step_time_ns} ns, exceeding "
+                        f"{maximum_step_time_ns} ns"
+                    )
     except Exception as error:
         failure = _failure(stage, frame_index, error)
 
@@ -481,11 +493,16 @@ def run_omni_matrix(
     terrain_sampler: Callable[[np.ndarray], np.ndarray],
     dataset_identity: str,
     config_identity: str,
+    maximum_step_time_ns: int | None = None,
 ) -> OmniMatrix:
     """Run every route independently so one exception cannot abort the matrix."""
 
     if not dataset_identity or not config_identity:
         raise ValueError("dataset and config identities must be non-empty")
+    if maximum_step_time_ns is not None and (
+        type(maximum_step_time_ns) is not int or maximum_step_time_ns <= 0
+    ):
+        raise ValueError("maximum step time must be a positive integer")
     runs = tuple(
         _run_route(
             route,
@@ -495,6 +512,7 @@ def run_omni_matrix(
             terrain_sampler=terrain_sampler,
             dataset_identity=dataset_identity,
             config_identity=config_identity,
+            maximum_step_time_ns=maximum_step_time_ns,
         )
         for route in routes
     )
@@ -528,6 +546,8 @@ def run_resolved_omni_matrix(
     g1_xml: str | Path,
     routes: Sequence[OmniRoute] | None = None,
     normalization_override=None,
+    contact_segment_policy=None,
+    maximum_step_time_ns: int | None = None,
 ) -> OmniMatrix:
     """Run the real Torch matcher and measure native MuJoCo FK ankle origins."""
 
@@ -561,6 +581,7 @@ def run_resolved_omni_matrix(
             resolved
         ),
         normalization_override=normalization_override,
+        contact_segment_policy=contact_segment_policy,
     )
     model, data = build_kinematic_scene(g1_xml, resolved)
     left_ankle = int(model.body("left_ankle_roll_link").id)
@@ -637,6 +658,7 @@ def run_resolved_omni_matrix(
             f"{resolved.base_config_sha256}:normalization:"
             f"{normalization_digest}"
         ),
+        maximum_step_time_ns=maximum_step_time_ns,
     )
 
 

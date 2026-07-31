@@ -26,6 +26,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
+        "--contact-segments",
+        action="store_true",
+        help="Load the contact-segment experiment schema and policy.",
+    )
+    parser.add_argument(
+        "--maximum-step-time-ms",
+        type=float,
+        default=1000.0,
+        help="Fail a route after a matcher step exceeds this latency.",
+    )
+    parser.add_argument(
         "--normalization-dataset",
         help="Optional reference corpus whose feature normalization is frozen.",
     )
@@ -53,11 +64,28 @@ def main() -> int:
         routes = tuple(by_name[name] for name in args.route)
     else:
         routes = inventory
-    resolved = resolve_stair_config(
-        args.dataset,
-        load_experiment_config(args.config),
-        device=args.device,
-    )
+    contact_policy = None
+    if args.contact_segments:
+        from mm_sonic.torch_contact_segment_rollout import (
+            build_contact_segment_policy,
+            load_contact_segment_config,
+            resolve_contact_segment_config,
+        )
+
+        resolved = resolve_contact_segment_config(
+            args.dataset,
+            load_contact_segment_config(args.config),
+            device=args.device,
+        )
+        contact_policy = build_contact_segment_policy(resolved, args.g1_xml)
+    else:
+        resolved = resolve_stair_config(
+            args.dataset,
+            load_experiment_config(args.config),
+            device=args.device,
+        )
+    if args.maximum_step_time_ms <= 0.0:
+        raise ValueError("maximum step time must be positive")
     if bool(args.normalization_dataset) != bool(args.normalization_config):
         raise ValueError(
             "normalization dataset and config must be supplied together"
@@ -75,6 +103,8 @@ def main() -> int:
         g1_xml=args.g1_xml,
         routes=routes,
         normalization_override=normalization,
+        contact_segment_policy=contact_policy,
+        maximum_step_time_ns=int(args.maximum_step_time_ms * 1_000_000),
     )
     save_omni_matrix(matrix, args.output)
     print(
