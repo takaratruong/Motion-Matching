@@ -74,9 +74,12 @@ conditions used by the existing metrics:
 A contact onset is a false-to-true support transition for either foot. A
 searchable terrain segment begins at an onset and ends immediately before the
 next onset of the opposite foot. Double-support frames belong to the segment
-that is already active. Segments shorter than 5 frames or longer than 30 frames
-are invalid for this first experiment. Flat matching retains the existing
-frame-level behavior until a terrain segment is entered.
+that is already active. Segments shorter than 5 frames or longer than 60 frames
+are invalid for this first experiment. The bound is authenticated against the
+selected GRAIL clip: its ordinary stair-step intervals are 33–54 frames, while
+the two-frame startup artifact and 83/110-frame anomalous gaps remain excluded.
+Flat matching retains the existing frame-level behavior until a terrain segment
+is entered.
 
 Contact metadata is immutable, derived during database construction, and
 indexed by clip and source frame. No contact inference is performed from the
@@ -99,7 +102,7 @@ When the matcher proposes a terrain candidate:
 6. Release the commitment at the next contact onset. The next frame may retain
    the incumbent or choose another valid segment.
 
-The commitment is bounded by the source segment and therefore lasts 0.10–0.60
+The commitment is bounded by the source segment and therefore lasts 0.10–1.20
 seconds. It is not an arbitrary fixed action chunk.
 
 ## Support-foot placement
