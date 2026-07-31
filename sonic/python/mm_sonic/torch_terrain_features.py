@@ -816,3 +816,142 @@ class TerrainFootClearanceValidator:
         return bool(
             (clearance.min() >= self.minimum_clearance_m).item()
         )
+
+
+@dataclass(frozen=True)
+class TerrainTransitionTerminalEvaluator:
+    """Require safe commanded progress from higher to lower support terrain."""
+
+    extension: TerrainFeatureExtension
+    horizon_steps: int
+    minimum_command_progress_m: float
+    minimum_surface_drop_m: float
+    minimum_clearance_m: float
+    maximum_terminal_sole_error_m: float = 0.05
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.extension, TerrainFeatureExtension):
+            raise ContractError(
+                "terrain transition terminal requires a terrain extension"
+            )
+        if (
+            type(self.horizon_steps) is not int
+            or self.horizon_steps != 46
+        ):
+            raise ContractError(
+                "terrain transition terminal horizon must equal 46"
+            )
+        for name in (
+            "minimum_command_progress_m",
+            "minimum_surface_drop_m",
+        ):
+            value = getattr(self, name)
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(float(value))
+                or float(value) <= 0.0
+            ):
+                raise ContractError(f"{name} must be finite and positive")
+            object.__setattr__(self, name, float(value))
+        clearance = self.minimum_clearance_m
+        if (
+            not isinstance(clearance, (int, float))
+            or isinstance(clearance, bool)
+            or not math.isfinite(float(clearance))
+        ):
+            raise ContractError("minimum_clearance_m must be finite")
+        object.__setattr__(self, "minimum_clearance_m", float(clearance))
+        sole_error = self.maximum_terminal_sole_error_m
+        if (
+            not isinstance(sole_error, (int, float))
+            or isinstance(sole_error, bool)
+            or not math.isfinite(float(sole_error))
+            or float(sole_error) <= 0.0
+        ):
+            raise ContractError(
+                "maximum_terminal_sole_error_m must be finite and positive"
+            )
+        object.__setattr__(
+            self, "maximum_terminal_sole_error_m", float(sole_error)
+        )
+
+    def __call__(
+        self,
+        body_window: torch.Tensor,
+        clip_index: int,
+        frame_index: int,
+        command_velocity_world_xy: torch.Tensor,
+    ) -> bool:
+        if (
+            not isinstance(body_window, torch.Tensor)
+            or tuple(body_window.shape) != (46, 3, 3)
+            or body_window.dtype != torch.float32
+            or body_window.device != self.extension.dataset.device
+            or not torch.isfinite(body_window).all()
+        ):
+            raise ContractError(
+                "terrain transition body window must be finite float32 "
+                "shape (46, 3, 3) on the terrain dataset device"
+            )
+        if (
+            type(clip_index) is not int
+            or clip_index < 0
+            or type(frame_index) is not int
+            or frame_index < 0
+        ):
+            raise ContractError(
+                "terrain transition source identity must be non-negative"
+            )
+        command = command_velocity_world_xy
+        if (
+            not isinstance(command, torch.Tensor)
+            or tuple(command.shape) != (2,)
+            or command.dtype != torch.float32
+            or command.device != body_window.device
+            or not torch.isfinite(command).all()
+        ):
+            raise ContractError(
+                "terrain transition command must be finite float32 shape (2,)"
+            )
+        speed = torch.linalg.vector_norm(command)
+        if bool((speed <= 1e-6).item()):
+            return False
+
+        preview = body_window[: self.horizon_steps]
+        scene_xy = self.extension.alignment.matcher_to_scene_xy(
+            preview[:, :, :2]
+        )
+        surface = self.extension.query_grid.sample_xy(scene_xy)
+        clearance = preview[:, 1:, 2] - surface[:, 1:]
+        safe = clearance.min() >= self.minimum_clearance_m
+        direction = command / speed
+        tail_double_support = torch.all(
+            torch.abs(clearance[-10:] - 0.035)
+            <= self.maximum_terminal_sole_error_m,
+            dim=1,
+        )
+        tail_progress = torch.sum(
+            (preview[-10:, 0, :2] - preview[0, 0, :2]) * direction,
+            dim=1,
+        )
+        tail_surface_drop = surface[0, 1:] - surface[-10:, 1:]
+        tail_terminal = (
+            tail_double_support
+            & (tail_progress >= self.minimum_command_progress_m)
+            & torch.all(
+                tail_surface_drop >= self.minimum_surface_drop_m,
+                dim=1,
+            )
+        ).any()
+        final_single_support = torch.any(
+            torch.abs(clearance[-1] - 0.035)
+            <= self.maximum_terminal_sole_error_m
+        )
+        return bool(
+            (
+                safe
+                & tail_terminal
+                & final_single_support
+            ).item()
+        )

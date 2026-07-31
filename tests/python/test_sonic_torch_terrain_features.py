@@ -21,6 +21,7 @@ from mm_sonic.torch_terrain_features import (
     TerrainFeatureExtension,
     TerrainFootClearanceValidator,
     TerrainSceneAlignment,
+    TerrainTransitionTerminalEvaluator,
 )
 from resources.g1_torch_stair_builder.publish import publish_stair_slice
 from resources.g1_torch_stair_builder.surface import ZUpHeightGrid
@@ -367,6 +368,101 @@ class TerrainFeatureTests(unittest.TestCase):
         outside[:, :, :2] = 100.0
         with self.assertRaisesRegex(Exception, "outside"):
             validator(outside)
+
+    def test_transition_terminal_requires_safe_commanded_surface_drop(self):
+        extension = TerrainFeatureExtension.for_condition(
+            self.dataset,
+            condition="dense",
+            query_scene="stair/0000/motion.npz",
+            weight=4.0,
+        )
+        evaluator = TerrainTransitionTerminalEvaluator(
+            extension=extension,
+            horizon_steps=46,
+            minimum_command_progress_m=0.05,
+            minimum_surface_drop_m=0.05,
+            minimum_clearance_m=-0.03,
+        )
+        body = torch.zeros((46, 3, 3), dtype=torch.float32)
+        body[:, :, 1] = torch.linspace(0.0, -1.0, 46)[:, None]
+        scene_xy = extension.alignment.matcher_to_scene_xy(
+            body[:, :, :2]
+        )
+        surface = extension.query_grid.sample_xy(scene_xy)
+        body[:, :, 2] = surface
+        body[:, 0, 2] += 0.8
+        body[:, 1:, 2] += 0.035
+        command = torch.tensor((0.0, -0.5), dtype=torch.float32)
+        self.assertTrue(evaluator(body, 2, 30, command))
+
+        no_foot_surface_drop = body.clone()
+        no_foot_surface_drop[:, 1:, :2] = 0.0
+        flat_foot_scene = extension.alignment.matcher_to_scene_xy(
+            no_foot_surface_drop[:, 1:, :2]
+        )
+        flat_foot_surface = extension.query_grid.sample_xy(flat_foot_scene)
+        no_foot_surface_drop[:, 1:, 2] = flat_foot_surface + 0.035
+        self.assertFalse(
+            evaluator(no_foot_surface_drop, 2, 30, command)
+        )
+
+        one_foot_surface_drop = body.clone()
+        one_foot_surface_drop[:, 1, :2] = 0.0
+        one_foot_scene = extension.alignment.matcher_to_scene_xy(
+            one_foot_surface_drop[:, 1, :2]
+        )
+        one_foot_surface = extension.query_grid.sample_xy(one_foot_scene)
+        one_foot_surface_drop[:, 1, 2] = one_foot_surface + 0.035
+        self.assertFalse(
+            evaluator(one_foot_surface_drop, 2, 30, command)
+        )
+
+        hovering = body.clone()
+        hovering[:, 1:, 2] += 1.0
+        self.assertFalse(evaluator(hovering, 2, 30, command))
+
+        staggered_transient_support = body.clone()
+        staggered_transient_support[-10:, 1:, 2] += 1.0
+        staggered_transient_support[-10, 1, 2] = body[-10, 1, 2]
+        staggered_transient_support[-9, 2, 2] = body[-9, 2, 2]
+        self.assertFalse(
+            evaluator(staggered_transient_support, 2, 30, command)
+        )
+
+        early_double_support_then_hover = body.clone()
+        early_double_support_then_hover[-10:, 1:, 2] += 1.0
+        early_double_support_then_hover[-10, 1:, :2] = body[0, 1:, :2]
+        early_double_support_then_hover[-10, 1:, 2] = body[0, 1:, 2]
+        self.assertFalse(
+            evaluator(early_double_support_then_hover, 2, 30, command)
+        )
+
+        lower_double_support_then_hover = body.clone()
+        lower_double_support_then_hover[-10:, 1:, 2] += 1.0
+        lower_double_support_then_hover[-5, 1:, 2] = body[-5, 1:, 2]
+        self.assertFalse(
+            evaluator(lower_double_support_then_hover, 2, 30, command)
+        )
+
+        unsafe_terminal = body.clone()
+        unsafe_terminal[45, 1, 2] = surface[45, 1] - 0.031
+        self.assertFalse(evaluator(unsafe_terminal, 2, 30, command))
+        self.assertFalse(
+            evaluator(
+                body,
+                2,
+                30,
+                torch.tensor((0.0, 0.0), dtype=torch.float32),
+            )
+        )
+        with self.assertRaises(Exception):
+            TerrainTransitionTerminalEvaluator(
+                extension=extension,
+                horizon_steps=45,
+                minimum_command_progress_m=0.05,
+                minimum_surface_drop_m=0.05,
+                minimum_clearance_m=-0.03,
+            )
 
     def test_scene_alignment_maps_matcher_world_into_recorded_world(self):
         alignment = TerrainSceneAlignment(

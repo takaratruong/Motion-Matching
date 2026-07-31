@@ -14,6 +14,7 @@ from mm_sonic.torch_motion_matcher import (
     EmittedWindowValidator,
     MatcherConfig,
     SearchDecision,
+    TransitionTerminalEvaluator,
     TorchMotionMatcher,
     _SelectionVisit,
     _loop_revisit_transition_costs,
@@ -21,6 +22,7 @@ from mm_sonic.torch_motion_matcher import (
     predict_command_trajectory,
     rank_exact_transition_candidates,
 )
+from mm_sonic.torch_transition_reachability import ReachabilityLimits
 from mm_sonic.torch_motion_data import MotionFolder
 from tests.python.torch_motion_test_utils import (
     build_varying_takara_arrays,
@@ -62,6 +64,417 @@ class _ScriptedWindowValidator:
 
 
 class TorchMotionMatcherTests(unittest.TestCase):
+    def test_transition_reachability_budget_caps_actual_compositions(self):
+        arrays = build_varying_takara_arrays(frames=140)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=MatcherConfig(exclusion_frames=0),
+                emitted_window_validator=lambda _window: True,
+            )
+            matcher.reset()
+            ranked = tuple(
+                SearchDecision(
+                    matcher.database.row_for_source(0, frame),
+                    None,
+                    math.inf,
+                    float(frame),
+                    float(frame),
+                    True,
+                    True,
+                )
+                for frame in range(20, 28)
+            )
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher."
+                "rank_exact_transition_candidates",
+                return_value=ranked,
+            ), mock.patch.object(
+                matcher,
+                "_compose_candidate",
+                wraps=matcher._compose_candidate,
+            ) as compose:
+                diagnostic = matcher.diagnose_transition_reachability(
+                    (0.0, -0.5),
+                    -math.pi / 2.0,
+                    command_change_frame=120,
+                    terminal_evaluator=lambda *_args: False,
+                    safe_evaluator=lambda _window: True,
+                    limits=ReachabilityLimits(
+                        max_depth=2,
+                        beam_width=8,
+                        max_expanded_states=3,
+                        max_source_advance_frames=15,
+                    ),
+                )
+
+        self.assertFalse(diagnostic.reachable)
+        self.assertTrue(diagnostic.budget_exhausted)
+        self.assertEqual(diagnostic.expanded_state_count, 3)
+        self.assertEqual(compose.call_count, 3)
+
+    def test_transition_reachability_rejects_late_window_unsafety(self):
+        arrays = build_varying_takara_arrays(frames=140)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=MatcherConfig(exclusion_frames=0),
+                emitted_window_validator=lambda _window: True,
+            )
+            matcher.reset()
+            row = matcher.database.row_for_source(0, 20)
+            ranked = (
+                SearchDecision(
+                    row,
+                    None,
+                    math.inf,
+                    1.0,
+                    1.0,
+                    True,
+                    True,
+                ),
+            )
+            compose = matcher._compose_candidate
+
+            def late_unsafe_candidate(*args):
+                candidate = compose(*args)
+                body = candidate.dense_body_position.clone()
+                body[15, 1:, 2] = -100.0
+                return replace(candidate, dense_body_position=body)
+
+            safety_windows = []
+
+            def full_window_safe(window):
+                safety_windows.append(window.clone())
+                return bool((window[10:, 1:, 2] > -10.0).all().item())
+
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher."
+                "rank_exact_transition_candidates",
+                return_value=ranked,
+            ), mock.patch.object(
+                matcher,
+                "_compose_candidate",
+                side_effect=late_unsafe_candidate,
+            ):
+                diagnostic = matcher.diagnose_transition_reachability(
+                    (0.0, -0.5),
+                    -math.pi / 2.0,
+                    command_change_frame=120,
+                    terminal_evaluator=lambda *_args: True,
+                    safe_evaluator=full_window_safe,
+                    limits=ReachabilityLimits(
+                        max_depth=1,
+                        beam_width=1,
+                        max_expanded_states=1,
+                        max_source_advance_frames=15,
+                    ),
+                )
+
+        self.assertFalse(diagnostic.reachable)
+        self.assertEqual(diagnostic.expanded_state_count, 1)
+        self.assertEqual(len(safety_windows), 1)
+        self.assertEqual(tuple(safety_windows[0].shape), (46, 3, 3))
+
+    def test_transition_reachability_diagnostic_is_two_hop_and_read_only(self):
+        arrays = build_varying_takara_arrays(frames=140)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=MatcherConfig(
+                    search_interval_steps=1,
+                    exclusion_frames=0,
+                ),
+                emitted_window_validator=lambda _window: True,
+            )
+            control = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=MatcherConfig(
+                    search_interval_steps=1,
+                    exclusion_frames=0,
+                ),
+                emitted_window_validator=lambda _window: True,
+            )
+            matcher.reset()
+            control.reset()
+            bridge_row = matcher.database.row_for_source(0, 20)
+            terminal_row = matcher.database.row_for_source(0, 40)
+            ranked = (
+                (
+                    SearchDecision(
+                        bridge_row,
+                        None,
+                        math.inf,
+                        1.0,
+                        1.1,
+                        True,
+                        True,
+                    ),
+                ),
+                (
+                    SearchDecision(
+                        terminal_row,
+                        None,
+                        math.inf,
+                        1.0,
+                        1.1,
+                        True,
+                        True,
+                    ),
+                ),
+            )
+            terminal_calls = []
+            safe_calls = []
+
+            def terminal(
+                _window,
+                clip_index,
+                frame_index,
+                command_velocity_world_xy,
+            ):
+                terminal_calls.append(command_velocity_world_xy.clone())
+                return clip_index == 0 and frame_index == 40
+
+            def full_horizon_safe(window):
+                safe_calls.append(window.clone())
+                return True
+
+            evaluator: TransitionTerminalEvaluator = terminal
+            state_before = matcher._state
+            with self.assertRaisesRegex(
+                ContractError, "explicit full-window safe evaluator"
+            ):
+                matcher.diagnose_transition_reachability(
+                    (0.0, -0.5),
+                    -math.pi / 2.0,
+                    command_change_frame=120,
+                    terminal_evaluator=evaluator,
+                    safe_evaluator=None,
+                )
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher."
+                "rank_exact_transition_candidates",
+                side_effect=ranked,
+            ) as ranking:
+                diagnostic = matcher.diagnose_transition_reachability(
+                    (0.0, -0.5),
+                    -math.pi / 2.0,
+                    command_change_frame=120,
+                    terminal_evaluator=evaluator,
+                    safe_evaluator=full_horizon_safe,
+                    limits=ReachabilityLimits(
+                        max_depth=2,
+                        beam_width=1,
+                        max_expanded_states=8,
+                        max_source_advance_frames=1,
+                    ),
+                )
+
+            self.assertTrue(diagnostic.reachable)
+            self.assertEqual(diagnostic.depth_used, 2)
+            self.assertEqual(
+                (diagnostic.first_clip_index, diagnostic.first_frame_index),
+                (0, 20),
+            )
+            self.assertEqual(
+                (
+                    diagnostic.terminal_clip_index,
+                    diagnostic.terminal_frame_index,
+                ),
+                (0, 40),
+            )
+            self.assertIs(matcher._state, state_before)
+            self.assertEqual(len(terminal_calls), 2)
+            self.assertEqual(len(safe_calls), 2)
+            self.assertEqual(
+                ranking.call_args_list[1].kwargs["current_frame_index"],
+                20,
+            )
+            for command in terminal_calls:
+                torch.testing.assert_close(
+                    command,
+                    torch.tensor((0.0, -0.5), dtype=torch.float32),
+                    rtol=0.0,
+                    atol=0.0,
+                )
+
+            observed = matcher.step((0.0, -0.5), -math.pi / 2.0)
+            expected = control.step((0.0, -0.5), -math.pi / 2.0)
+            self.assertEqual(
+                observed.diagnostics.selected_clip_path,
+                expected.diagnostics.selected_clip_path,
+            )
+            self.assertEqual(
+                observed.diagnostics.selected_frame,
+                expected.diagnostics.selected_frame,
+            )
+            for name in (
+                "dense_joint_position_window",
+                "dense_joint_velocity_window",
+                "dense_root_position_window",
+                "dense_root_orientation_window_wxyz",
+                "dense_feature_body_position_window",
+                "dense_feature_body_velocity_window",
+            ):
+                torch.testing.assert_close(
+                    getattr(observed, name),
+                    getattr(expected, name),
+                    rtol=0.0,
+                    atol=0.0,
+                )
+
+    def test_transition_reachability_checks_intermediate_advance_times(self):
+        arrays = build_varying_takara_arrays(frames=140)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=MatcherConfig(exclusion_frames=0),
+                emitted_window_validator=lambda _window: True,
+            )
+            matcher.reset()
+            bridge_row = matcher.database.row_for_source(0, 20)
+            terminal_row = matcher.database.row_for_source(0, 40)
+            dead_row = matcher.database.row_for_source(0, 60)
+            ranked_frames = []
+
+            def decision(row):
+                return SearchDecision(
+                    row,
+                    None,
+                    math.inf,
+                    1.0,
+                    1.0,
+                    True,
+                    True,
+                )
+
+            def rank_for_state(*_args, **kwargs):
+                current = kwargs["current_frame_index"]
+                ranked_frames.append(current)
+                if current == 0:
+                    return (decision(bridge_row),)
+                return (
+                    decision(
+                        terminal_row if current == 24 else dead_row
+                    ),
+                )
+
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher."
+                "rank_exact_transition_candidates",
+                side_effect=rank_for_state,
+            ):
+                diagnostic = matcher.diagnose_transition_reachability(
+                    (0.0, -0.5),
+                    -math.pi / 2.0,
+                    command_change_frame=120,
+                    terminal_evaluator=lambda _window, _clip, frame, _cmd: (
+                        frame == 40
+                    ),
+                    safe_evaluator=lambda _window: True,
+                    limits=ReachabilityLimits(
+                        max_depth=2,
+                        beam_width=1,
+                        max_expanded_states=64,
+                        max_source_advance_frames=15,
+                    ),
+                )
+
+        self.assertTrue(diagnostic.reachable)
+        self.assertEqual(diagnostic.depth_used, 2)
+        self.assertEqual(diagnostic.first_frame_index, 20)
+        self.assertEqual(diagnostic.terminal_frame_index, 40)
+        self.assertIn(24, ranked_frames)
+
+    def test_transition_reachability_uses_and_propagates_loop_history(self):
+        arrays = build_varying_takara_arrays(frames=140)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=MatcherConfig(exclusion_frames=0),
+                emitted_window_validator=lambda _window: True,
+            )
+            matcher.reset()
+            dead_row = matcher.database.row_for_source(0, 10)
+            bridge_row = matcher.database.row_for_source(0, 20)
+            terminal_row = matcher.database.row_for_source(0, 40)
+            history_lengths = []
+
+            def loop_costs(database, history, *_args, **_kwargs):
+                history_lengths.append(len(history))
+                costs = torch.zeros(
+                    database.feature_shape[0], dtype=torch.float32
+                )
+                costs[dead_row] = 100.0
+                return costs
+
+            def decision(row):
+                return SearchDecision(
+                    row,
+                    None,
+                    math.inf,
+                    1.0,
+                    1.0,
+                    True,
+                    True,
+                )
+
+            def rank_with_loop_cost(*_args, **kwargs):
+                costs = kwargs["additional_transition_costs"]
+                if kwargs["current_frame_index"] == 0:
+                    selected = (
+                        bridge_row
+                        if float(costs[dead_row]) == 100.0
+                        else dead_row
+                    )
+                    return (decision(selected),)
+                return (decision(terminal_row),)
+
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher."
+                "_loop_revisit_transition_costs",
+                side_effect=loop_costs,
+            ), mock.patch(
+                "mm_sonic.torch_motion_matcher."
+                "rank_exact_transition_candidates",
+                side_effect=rank_with_loop_cost,
+            ):
+                diagnostic = matcher.diagnose_transition_reachability(
+                    (0.0, -0.5),
+                    -math.pi / 2.0,
+                    command_change_frame=120,
+                    terminal_evaluator=lambda _window, _clip, frame, _cmd: (
+                        frame == 40
+                    ),
+                    safe_evaluator=lambda _window: True,
+                    limits=ReachabilityLimits(
+                        max_depth=2,
+                        beam_width=1,
+                        max_expanded_states=8,
+                        max_source_advance_frames=1,
+                    ),
+                )
+
+        self.assertTrue(diagnostic.reachable)
+        self.assertEqual(diagnostic.first_frame_index, 20)
+        self.assertEqual(history_lengths, [1, 2])
+
     def _jerk_rerank_fixture(self, root, *, weight):
         matcher = TorchMotionMatcher.from_folder(
             root,

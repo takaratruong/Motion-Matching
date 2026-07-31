@@ -26,6 +26,11 @@ from .torch_motion_features import (
     resolve_torch_device,
     validated_extension_query_row,
 )
+from .torch_transition_reachability import (
+    ReachabilityLimits,
+    TransitionReachabilityDiagnostic,
+    bounded_transition_reachability,
+)
 
 
 LOOP_HISTORY_FRAMES = 128
@@ -82,6 +87,19 @@ class EmittedWindowValidator(Protocol):
 
     def __call__(
         self, feature_body_position_window: torch.Tensor
+    ) -> bool:
+        ...
+
+
+class TransitionTerminalEvaluator(Protocol):
+    """Classify a composed safe transition under the current issued command."""
+
+    def __call__(
+        self,
+        feature_body_position_window: torch.Tensor,
+        clip_index: int,
+        frame_index: int,
+        command_velocity_world_xy: torch.Tensor,
     ) -> bool:
         ...
 
@@ -853,6 +871,19 @@ class _ComposedCandidate:
     dense_body_velocity: torch.Tensor
 
 
+@dataclass(frozen=True)
+class _ReachabilityContinuation:
+    state: _MatcherState
+    history: tuple[_SelectionVisit, ...]
+
+
+@dataclass(frozen=True)
+class _ReachabilityNode:
+    state: _MatcherState
+    candidate: _ComposedCandidate
+    continuations: tuple[_ReachabilityContinuation, ...]
+
+
 def _copy_result(result: MotionMatchResult) -> MotionMatchResult:
     values = {
         name: getattr(result, name).clone()
@@ -1387,6 +1418,322 @@ class TorchMotionMatcher:
             dense_root_angular_velocity=rw + qwo,
             dense_body_position=bp + bao,
             dense_body_velocity=bv + bvo,
+        )
+
+    def _reachability_query(
+        self,
+        state: _MatcherState,
+        history: Sequence[_SelectionVisit],
+        requested_velocity: torch.Tensor,
+        requested_heading: torch.Tensor,
+    ) -> tuple[ShapedCommand, torch.Tensor, torch.Tensor, int | None]:
+        successor = self.database.row_for_source(
+            state.clip_index, state.frame_index + 1
+        )
+        shaped = predict_command_trajectory(
+            state.root_position[:2],
+            state.shaped_velocity,
+            state.shaped_heading,
+            requested_velocity,
+            requested_heading,
+            has_valid_successor=successor is not None,
+            config=self.config,
+        )
+        feature_state = GeneratedFeatureState(
+            root_position_world=state.root_position,
+            root_orientation_world_wxyz=state.root_quaternion,
+            root_linear_velocity_world=state.root_linear_velocity,
+            left_foot_position_world=state.feature_body_position[1],
+            right_foot_position_world=state.feature_body_position[2],
+            left_foot_velocity_world=state.feature_body_velocity[1],
+            right_foot_velocity_world=state.feature_body_velocity[2],
+        )
+        raw_query = extract_query_features(feature_state, shaped.trajectory)
+        if self.database._extension is not None:
+            raw_query = torch.cat(
+                (
+                    raw_query,
+                    validated_extension_query_row(
+                        self.database._extension,
+                        feature_state,
+                        shaped.trajectory,
+                    ),
+                )
+            )
+        query = self.database.normalization.normalize(raw_query)
+        continuity = self._continuity.costs(
+            state.joint_position,
+            state.joint_velocity,
+            position_weight=self.config.transition_joint_position_weight,
+            velocity_weight=self.config.transition_joint_velocity_weight,
+        )
+        loop_costs = _loop_revisit_transition_costs(
+            self.database,
+            history,
+            state.root_position[:2],
+            current_clip_index=state.clip_index,
+            current_sequence=state.sequence,
+            config=self.config,
+        )
+        transition_costs = (
+            continuity.total + loop_costs
+            if bool((loop_costs > 0.0).any().item())
+            else continuity.total
+        )
+        return shaped, query, transition_costs, successor
+
+    def _reachability_state_after(
+        self,
+        state: _MatcherState,
+        candidate: _ComposedCandidate,
+        shaped: ShapedCommand,
+        requested_velocity: torch.Tensor,
+        requested_heading: torch.Tensor,
+        advance_frames: int,
+    ) -> _MatcherState:
+        velocity = shaped.velocity_world_xy
+        heading = shaped.heading_world_yaw
+        for index in range(advance_frames):
+            next_frame = candidate.frame_index + index + 1
+            next_shaped = predict_command_trajectory(
+                candidate.dense_root_position[index + 1, :2],
+                velocity,
+                heading,
+                requested_velocity,
+                requested_heading,
+                has_valid_successor=(
+                    self.database.row_for_source(
+                        candidate.clip_index, next_frame + 1
+                    )
+                    is not None
+                ),
+                config=self.config,
+            )
+            velocity = next_shaped.velocity_world_xy
+            heading = next_shaped.heading_world_yaw
+        index = advance_frames
+        offsets = _Offsets(
+            candidate.offsets.joint_position,
+            candidate.offsets.joint_velocity,
+            candidate.offsets.root_position,
+            candidate.offsets.root_linear_velocity,
+            candidate.offsets.root_rotation_axis,
+            candidate.offsets.root_angular_velocity,
+            candidate.offsets.body_position,
+            candidate.offsets.body_velocity,
+            candidate.offsets.elapsed_s + advance_frames * self.config.dt,
+        )
+        return _MatcherState(
+            sequence=state.sequence + advance_frames + 1,
+            clip_index=candidate.clip_index,
+            frame_index=candidate.frame_index + advance_frames,
+            yaw_offset=candidate.yaw_offset,
+            translation_xy=candidate.translation_xy,
+            shaped_velocity=velocity.clone(),
+            shaped_heading=heading.clone(),
+            joint_position=candidate.dense_joint_position[index].clone(),
+            joint_velocity=candidate.dense_joint_velocity[index].clone(),
+            root_position=candidate.dense_root_position[index].clone(),
+            root_quaternion=candidate.dense_root_quaternion[index].clone(),
+            root_linear_velocity=(
+                candidate.dense_root_linear_velocity[index].clone()
+            ),
+            root_angular_velocity=(
+                candidate.dense_root_angular_velocity[index].clone()
+            ),
+            feature_body_position=(
+                candidate.dense_body_position[index].clone()
+            ),
+            feature_body_velocity=(
+                candidate.dense_body_velocity[index].clone()
+            ),
+            offsets=offsets,
+        )
+
+    def _reachability_continuations(
+        self,
+        state: _MatcherState,
+        history: Sequence[_SelectionVisit],
+        candidate: _ComposedCandidate,
+        shaped: ShapedCommand,
+        requested_velocity: torch.Tensor,
+        requested_heading: torch.Tensor,
+        maximum_advance_frames: int,
+    ) -> tuple[_ReachabilityContinuation, ...]:
+        output = []
+        for advance in range(1, maximum_advance_frames + 1):
+            child_state = self._reachability_state_after(
+                state,
+                candidate,
+                shaped,
+                requested_velocity,
+                requested_heading,
+                advance - 1,
+            )
+            additions = tuple(
+                _SelectionVisit(
+                    sequence=state.sequence + offset + 1,
+                    clip_index=candidate.clip_index,
+                    frame_index=candidate.frame_index + offset,
+                    root_position_xy=(
+                        candidate.dense_root_position[offset, :2].clone()
+                    ),
+                )
+                for offset in range(advance)
+            )
+            combined = tuple(history) + additions
+            output.append(
+                _ReachabilityContinuation(
+                    child_state,
+                    combined[-LOOP_HISTORY_FRAMES:],
+                )
+            )
+        return tuple(output)
+
+    def diagnose_transition_reachability(
+        self,
+        velocity_world_xy: tuple[float, float],
+        heading_world_yaw: float,
+        *,
+        command_change_frame: int,
+        terminal_evaluator: TransitionTerminalEvaluator,
+        safe_evaluator: EmittedWindowValidator,
+        limits: ReachabilityLimits = ReachabilityLimits(),
+    ) -> TransitionReachabilityDiagnostic:
+        """Search two hypothetical transitions without committing matcher state."""
+
+        state = self._state
+        if state is None:
+            raise ContractError(
+                "reset must be called before transition reachability"
+            )
+        runtime_validator = self._emitted_window_validator
+        if runtime_validator is None:
+            raise ContractError(
+                "transition reachability requires an emitted-window validator"
+            )
+        if safe_evaluator is None:
+            raise ContractError(
+                "transition reachability requires an explicit full-window "
+                "safe evaluator"
+            )
+        diagnostic_validator = safe_evaluator
+        if not callable(diagnostic_validator):
+            raise TypeError("safe_evaluator must be callable")
+        if not callable(terminal_evaluator):
+            raise TypeError("terminal_evaluator must be callable")
+        requested_velocity = torch.tensor(
+            velocity_world_xy, dtype=torch.float32, device=self.device
+        )
+        requested_heading = torch.tensor(
+            heading_world_yaw, dtype=torch.float32, device=self.device
+        )
+
+        def expand(
+            parent: _MatcherState | _ReachabilityNode,
+            _command,
+            max_source_advance_frames: int,
+        ):
+            hypothetical = isinstance(parent, _ReachabilityNode)
+            contexts = (
+                parent.continuations
+                if hypothetical
+                else (
+                    _ReachabilityContinuation(
+                        parent,
+                        tuple(self._selection_history),
+                    ),
+                )
+            )
+            ranked_contexts = []
+            for context in contexts:
+                shaped, query, transition_costs, successor = (
+                    self._reachability_query(
+                        context.state,
+                        context.history,
+                        requested_velocity,
+                        requested_heading,
+                    )
+                )
+                ranked = rank_exact_transition_candidates(
+                    self.database,
+                    query,
+                    current_clip_index=context.state.clip_index,
+                    current_frame_index=context.state.frame_index,
+                    config=self.config,
+                    additional_transition_costs=transition_costs,
+                )
+                ranked_contexts.append(
+                    (context, shaped, successor, ranked)
+                )
+            for rank in range(limits.beam_width):
+                for context, shaped, successor, ranked in ranked_contexts:
+                    if rank >= len(ranked):
+                        continue
+                    decision = ranked[rank]
+                    candidate = self._compose_candidate(
+                        context.state,
+                        shaped,
+                        decision.selected_row,
+                        successor,
+                    )
+                    continuations = (
+                        ()
+                        if hypothetical
+                        else self._reachability_continuations(
+                            context.state,
+                            context.history,
+                            candidate,
+                            shaped,
+                            requested_velocity,
+                            requested_heading,
+                            max_source_advance_frames,
+                        )
+                    )
+                    yield _ReachabilityNode(
+                        context.state,
+                        candidate,
+                        continuations,
+                    )
+
+        def is_safe(node: _ReachabilityNode, _command) -> bool:
+            accepted = diagnostic_validator(
+                node.candidate.dense_body_position.clone()
+            )
+            if type(accepted) is not bool:
+                raise ContractError(
+                    "emitted-window validator must return exact bool"
+                )
+            return accepted
+
+        def is_terminal(node: _ReachabilityNode, _command) -> bool:
+            terminal = terminal_evaluator(
+                node.candidate.dense_body_position.clone(),
+                node.candidate.clip_index,
+                node.candidate.frame_index,
+                requested_velocity.clone(),
+            )
+            if type(terminal) is not bool:
+                raise ContractError(
+                    "transition terminal evaluator must return exact bool"
+                )
+            return terminal
+
+        return bounded_transition_reachability(
+            state,
+            command=(
+                requested_velocity.clone(),
+                requested_heading.clone(),
+            ),
+            command_change_frame=command_change_frame,
+            expand=expand,
+            is_safe=is_safe,
+            is_terminal=is_terminal,
+            identity=lambda node: (
+                node.candidate.clip_index,
+                node.candidate.frame_index,
+            ),
+            limits=limits,
         )
 
     def _make_result(
