@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
 from mm_sonic.torch_motion_data import MotionFolder
 from mm_sonic.torch_terrain_features import TerrainDataset
@@ -18,7 +18,7 @@ from resources.g1_torch_stair_builder.conversion import (
     _body_permutation,
     convert_source_to_native_50hz,
 )
-from resources.g1_torch_stair_builder.corpus import load_pinned_sources
+from resources.g1_torch_stair_builder.corpus import load_source
 from resources.g1_torch_stair_builder.publish import (
     _deterministic_npz_bytes,
     _fsync_tree,
@@ -119,16 +119,10 @@ def _default_motion_loader(
         raise ValueError(
             f"unsupported source adapter: {source.spec.source_adapter}"
         )
-    pinned = next(
-        (
-            candidate
-            for candidate in load_pinned_sources(grail_root)
-            if candidate.robot_path == source.motion_path
-        ),
-        None,
+    pinned = load_source(
+        source.motion_path.parents[1],
+        source.motion_path.stem,
     )
-    if pinned is None:
-        raise ValueError("registered GRAIL motion is not pinned")
     return convert_source_to_native_50hz(pinned, kinematics)
 
 
@@ -163,6 +157,7 @@ def publish_expanded_corpus(
     fk: Callable | None = None,
     kinematics=None,
     validate_candidate: Callable[[Path], None] | None = None,
+    corpus_metadata: Mapping[str, object] | None = None,
 ) -> dict:
     output = Path(output).resolve()
     source_root = Path(source_root).resolve()
@@ -175,6 +170,10 @@ def publish_expanded_corpus(
         raise ValueError(f"flat motion is missing or unsafe: {flat_motion}")
     if output.exists() and (output.is_symlink() or not output.is_dir()):
         raise ValueError("existing output must be a real directory")
+    if corpus_metadata is not None and not isinstance(
+        corpus_metadata, Mapping
+    ):
+        raise TypeError("corpus metadata must be a mapping or None")
     output.parent.mkdir(parents=True, exist_ok=True)
 
     sources = (
@@ -330,6 +329,8 @@ def publish_expanded_corpus(
             "accepted_clips": clips,
             "rejected_candidates": rejected,
         }
+        if corpus_metadata is not None:
+            manifest["bulk_grail"] = dict(corpus_metadata)
         _write_bytes(
             staging / "manifest.json",
             (

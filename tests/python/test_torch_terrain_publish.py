@@ -14,10 +14,12 @@ from mm_sonic.torch_terrain_features import TerrainDataset
 from resources.g1_torch_stair_builder.conversion import NativeMotionArrays
 from resources.g1_torch_stair_builder.surface import ZUpHeightGrid
 from resources.g1_torch_terrain_builder.publish import publish_expanded_corpus
+from resources.g1_torch_terrain_builder import publish as publish_module
 from resources.g1_torch_terrain_builder.registry import (
     ResolvedSource,
     SourceSpec,
 )
+from resources.g1_torch_terrain_builder import terrain as terrain_module
 from resources.g1_torch_terrain_builder.terrain import TerrainEvidence
 from tests.python.torch_motion_test_utils import write_takara_clip
 
@@ -75,6 +77,115 @@ def _terrain() -> TerrainEvidence:
 
 
 class ExpandedTerrainPublicationTests(unittest.TestCase):
+    def test_default_grail_adapters_use_public_single_source_loader(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            partition = root / "data" / "curb"
+            motion_path = partition / "robot" / "new-source.pkl"
+            motion_path.parent.mkdir(parents=True)
+            motion_path.write_bytes(b"robot")
+            object_path = partition / "objects" / "new-source.pkl"
+            object_path.parent.mkdir()
+            object_path.write_bytes(b"object")
+            usd_path = partition / "object_usd" / "new-source.usd"
+            usd_path.parent.mkdir()
+            usd_path.write_bytes(b"usd")
+            spec = SourceSpec(
+                logical_name="bulk-source",
+                family="grail",
+                source_adapter="grail-record",
+                motion_relative_path="data/curb/robot/new-source.pkl",
+                motion_sha256="1" * 64,
+                terrain_adapter="grail-usd",
+                geometry_relative_paths=(
+                    "data/curb/objects/new-source.pkl",
+                    "data/curb/object_usd/new-source.usd",
+                ),
+                geometry_sha256=("2" * 64, "3" * 64),
+            )
+            source = ResolvedSource(
+                spec=spec,
+                motion_path=motion_path,
+                geometry_paths=(object_path, usd_path),
+                source_sha256=MappingProxyType({"motion": "1" * 64}),
+            )
+            record = object()
+            converted = _motion()
+            with (
+                mock.patch.object(
+                    publish_module,
+                    "load_source",
+                    create=True,
+                    return_value=record,
+                ) as load_motion,
+                mock.patch.object(
+                    publish_module,
+                    "convert_source_to_native_50hz",
+                    return_value=converted,
+                ),
+            ):
+                try:
+                    actual = publish_module._default_motion_loader(
+                        source, grail_root=root, kinematics=object()
+                    )
+                except ValueError as error:
+                    self.fail(f"bulk GRAIL motion was rejected: {error}")
+            with (
+                mock.patch.object(
+                    terrain_module,
+                    "load_source",
+                    create=True,
+                    return_value=record,
+                ) as load_terrain,
+                mock.patch.object(
+                    terrain_module,
+                    "build_source_height_grid",
+                    return_value=_terrain().grid,
+                ),
+            ):
+                try:
+                    evidence = terrain_module.build_source_terrain(
+                        source, converted
+                    )
+                except ValueError as error:
+                    self.fail(f"bulk GRAIL terrain was rejected: {error}")
+
+        self.assertIs(actual, converted)
+        self.assertIsNotNone(evidence)
+        load_motion.assert_called_once_with(partition, "new-source")
+        load_terrain.assert_called_once_with(partition, "new-source")
+
+    def test_publishes_supplied_bulk_selection_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            flat = write_takara_clip(root / "flat", frames=60)
+            xml = root / "g1.xml"
+            xml.write_text("<mujoco/>", encoding="utf-8")
+            metadata = {
+                "inventory_revision": "9" * 40,
+                "selected_by_partition": {"curb": 2},
+            }
+            try:
+                manifest = publish_expanded_corpus(
+                    output=root / "corpus",
+                    source_root=root,
+                    grail_root=root,
+                    g1_xml=xml,
+                    flat_motion=flat,
+                    resolved_sources=(),
+                    corpus_metadata=metadata,
+                    motion_loader=lambda _source: _motion(),
+                    terrain_builder=lambda _source, _motion: _terrain(),
+                    fk=lambda _qpos: (
+                        _motion().body_position_world,
+                        _motion().body_quaternion_world_wxyz,
+                    ),
+                )
+            except TypeError as error:
+                self.fail(f"publisher rejected bulk metadata: {error}")
+
+        self.assertEqual(manifest["bulk_grail"], metadata)
+
     def test_publishes_accepted_and_records_rejected_candidates(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

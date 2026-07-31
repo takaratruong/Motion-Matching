@@ -15,7 +15,7 @@ import xml.etree.ElementTree as ET
 import numpy as np
 
 from resources.g1_torch_stair_builder.conversion import NativeMotionArrays
-from resources.g1_torch_stair_builder.corpus import load_pinned_sources
+from resources.g1_torch_stair_builder.corpus import load_source
 from resources.g1_torch_stair_builder.surface import (
     ZUpHeightGrid,
     build_source_height_grid,
@@ -395,18 +395,10 @@ def build_source_terrain(
         grid = _boxes_grid(boxes, motion)
         hashes[f"chair-config:{config}"] = _sha256(config)
     elif adapter == "grail-usd":
-        root = source.motion_path.parents[1]
-        candidates = load_pinned_sources(root)
-        pinned = next(
-            (
-                candidate
-                for candidate in candidates
-                if candidate.robot_path == source.motion_path
-            ),
-            None,
+        pinned = load_source(
+            source.motion_path.parents[1],
+            source.motion_path.stem,
         )
-        if pinned is None:
-            raise ValueError("registered GRAIL source is not pinned")
         grid = build_source_height_grid(pinned)
     else:
         raise ValueError(f"unsupported terrain adapter: {adapter}")
