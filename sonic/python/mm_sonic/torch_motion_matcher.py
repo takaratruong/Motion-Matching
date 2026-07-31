@@ -717,6 +717,12 @@ class MotionMatchDiagnostics:
     force_search_reason: str | None
     search_time_ns: int | None
     step_time_ns: int
+    segment_committed: bool
+    segment_start_frame: int | None
+    segment_end_frame: int | None
+    segment_entering_foot: int | None
+    segment_vertical_offset_m: float | None
+    segment_rejection_reason: str | None
 
 
 @dataclass(frozen=True)
@@ -770,6 +776,31 @@ class _Offsets:
 
 
 @dataclass(frozen=True)
+class SegmentCommitment:
+    clip_index: int
+    start_frame: int
+    end_frame: int
+    entering_foot: int
+    vertical_offset_m: float
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.clip_index) is not int
+            or self.clip_index < 0
+            or type(self.start_frame) is not int
+            or self.start_frame < 0
+            or type(self.end_frame) is not int
+            or self.end_frame <= self.start_frame
+            or self.entering_foot not in (0, 1)
+            or not math.isfinite(float(self.vertical_offset_m))
+        ):
+            raise ContractError("segment commitment fields are invalid")
+        object.__setattr__(
+            self, "vertical_offset_m", float(self.vertical_offset_m)
+        )
+
+
+@dataclass(frozen=True)
 class _MatcherState:
     sequence: int
     clip_index: int
@@ -788,6 +819,7 @@ class _MatcherState:
     feature_body_position: torch.Tensor
     feature_body_velocity: torch.Tensor
     offsets: _Offsets
+    commitment: SegmentCommitment | None
 
 
 @dataclass(frozen=True)
@@ -1669,6 +1701,7 @@ class TorchMotionMatcher:
                 candidate.dense_body_velocity[index].clone()
             ),
             offsets=offsets,
+            commitment=state.commitment,
         )
 
     def _reachability_continuations(
@@ -1882,6 +1915,8 @@ class TorchMotionMatcher:
         dense_root_q: torch.Tensor,
         dense_body_p: torch.Tensor,
         dense_body_v: torch.Tensor,
+        segment_commitment: SegmentCommitment | None,
+        segment_rejection_reason: str | None,
     ) -> MotionMatchResult:
         dense_joint_p = dense_joint_p[:46]
         dense_joint_v = dense_joint_v[:46]
@@ -1928,6 +1963,28 @@ class TorchMotionMatcher:
             force_search_reason=force_reason,
             search_time_ns=search_time_ns,
             step_time_ns=time.perf_counter_ns() - step_start_ns,
+            segment_committed=segment_commitment is not None,
+            segment_start_frame=(
+                None
+                if segment_commitment is None
+                else segment_commitment.start_frame
+            ),
+            segment_end_frame=(
+                None
+                if segment_commitment is None
+                else segment_commitment.end_frame
+            ),
+            segment_entering_foot=(
+                None
+                if segment_commitment is None
+                else segment_commitment.entering_foot
+            ),
+            segment_vertical_offset_m=(
+                None
+                if segment_commitment is None
+                else segment_commitment.vertical_offset_m
+            ),
+            segment_rejection_reason=segment_rejection_reason,
         )
         result = MotionMatchResult(
             joint_position=dense_joint_p[0].clone(),
@@ -2048,6 +2105,8 @@ class TorchMotionMatcher:
             dense_root_q=rq,
             dense_body_p=bp,
             dense_body_v=bv,
+            segment_commitment=None,
+            segment_rejection_reason=None,
         )
         self._state = _MatcherState(
             0, clip_index, frame_index, yaw_offset, translation, 0.0,
@@ -2055,6 +2114,7 @@ class TorchMotionMatcher:
             torch.zeros((), device=self.device),
             jp[0].clone(), jv[0].clone(), rp[0].clone(), rq[0].clone(),
             rv[0].clone(), rw[0].clone(), bp[0].clone(), bv[0].clone(), zeros,
+            None,
         )
         self._selection_history = [
             _SelectionVisit(
@@ -2122,6 +2182,10 @@ class TorchMotionMatcher:
         search = search_is_due(
             state.sequence, shaped.force_search, self.config
         )
+        committed_playback = (
+            state.commitment is not None
+            and state.frame_index + 1 < state.commitment.end_frame
+        )
         settle_penalty = active_transition_penalty(
             state.offsets.elapsed_s, self.config
         )
@@ -2144,20 +2208,50 @@ class TorchMotionMatcher:
             if bool((loop_costs > 0.0).any().item())
             else continuity.total
         )
-        search_start = time.perf_counter_ns()
-        decision = select_exact_candidate(
-            self.database,
-            query,
-            current_clip_index=state.clip_index,
-            current_frame_index=state.frame_index,
-            incumbent_row=successor,
-            search=search,
-            config=self.config,
-            additional_transition_penalty=settle_penalty,
-            additional_transition_costs=transition_costs,
-            transition_eligible_rows=self._transition_eligible_rows,
-        )
-        search_time = time.perf_counter_ns() - search_start if search else None
+        if committed_playback:
+            commitment = state.commitment
+            assert commitment is not None
+            if successor is None or self._source_for_row(successor) != (
+                commitment.clip_index,
+                state.frame_index + 1,
+            ):
+                raise ContractError(
+                    "active contact segment has no exact source successor"
+                )
+            feature_cost = float(
+                torch.sum(
+                    torch.square(
+                        self.database._search_features[successor] - query
+                    )
+                ).item()
+            )
+            decision = SearchDecision(
+                selected_row=successor,
+                incumbent_row=successor,
+                incumbent_cost=feature_cost,
+                selected_feature_cost=feature_cost,
+                selected_total_cost=feature_cost,
+                searched=False,
+                transitioned=False,
+            )
+            search_time = None
+        else:
+            search_start = time.perf_counter_ns()
+            decision = select_exact_candidate(
+                self.database,
+                query,
+                current_clip_index=state.clip_index,
+                current_frame_index=state.frame_index,
+                incumbent_row=successor,
+                search=search,
+                config=self.config,
+                additional_transition_penalty=settle_penalty,
+                additional_transition_costs=transition_costs,
+                transition_eligible_rows=self._transition_eligible_rows,
+            )
+            search_time = (
+                time.perf_counter_ns() - search_start if search else None
+            )
         candidate = self._compose_candidate(
             state, shaped, decision.selected_row, successor
         )
@@ -2165,7 +2259,9 @@ class TorchMotionMatcher:
         terrain_safety_override = False
         terrain_safety_override_rank = 0
         validator = self._emitted_window_validator
+        segment_rejection_reason = None
         if not candidate.contact_entry_valid:
+            segment_rejection_reason = "incompatible_support_side"
             rescue = self._ranked_terrain_rescue(
                 state,
                 shaped,
@@ -2358,13 +2454,44 @@ class TorchMotionMatcher:
             .tolist()
         )
         force_reason = None
-        if successor is None:
+        if committed_playback:
+            force_reason = "segment_commitment"
+        elif successor is None:
             force_reason = "clip_end"
         elif shaped.force_search:
             force_reason = "command_transition"
         dense_joint_p, dense_joint_v = self._smooth_joint_reference(
             state, candidate
         )
+        output_commitment = state.commitment
+        if (
+            output_commitment is None
+            and candidate.transitioned
+            and candidate.segment_placement is not None
+        ):
+            placement = candidate.segment_placement
+            output_commitment = SegmentCommitment(
+                clip_index=candidate.clip_index,
+                start_frame=placement.segment.start_frame,
+                end_frame=placement.segment.end_frame,
+                entering_foot=placement.segment.entering_foot,
+                vertical_offset_m=placement.vertical_offset_m,
+            )
+        if output_commitment is not None and not (
+            output_commitment.clip_index == candidate.clip_index
+            and output_commitment.start_frame
+            <= candidate.frame_index
+            < output_commitment.end_frame
+        ):
+            raise ContractError(
+                "emitted frame is outside the active contact segment"
+            )
+        next_commitment = output_commitment
+        if (
+            output_commitment is not None
+            and candidate.frame_index == output_commitment.end_frame - 1
+        ):
+            next_commitment = None
         result = self._make_result(
             sequence=state.sequence + 1,
             clip_index=candidate.clip_index,
@@ -2385,6 +2512,8 @@ class TorchMotionMatcher:
             dense_root_q=candidate.dense_root_quaternion,
             dense_body_p=candidate.dense_body_position,
             dense_body_v=candidate.dense_body_velocity,
+            segment_commitment=output_commitment,
+            segment_rejection_reason=segment_rejection_reason,
         )
         next_state = _MatcherState(
             state.sequence + 1,
@@ -2403,6 +2532,7 @@ class TorchMotionMatcher:
             candidate.dense_body_position[0].clone(),
             candidate.dense_body_velocity[0].clone(),
             candidate.offsets,
+            next_commitment,
         )
         return PreparedMotionMatch(
             _copy_result(result), self._owner_token, state.sequence, next_state

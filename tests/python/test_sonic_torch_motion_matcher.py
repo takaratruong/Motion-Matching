@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -14,6 +15,7 @@ from mm_sonic.torch_motion_matcher import (
     EmittedWindowValidator,
     MatcherConfig,
     SearchDecision,
+    SegmentCommitment,
     TransitionTerminalEvaluator,
     TorchMotionMatcher,
     _SelectionVisit,
@@ -22,6 +24,10 @@ from mm_sonic.torch_motion_matcher import (
     predict_command_trajectory,
     rank_exact_transition_candidates,
     select_exact_candidate,
+)
+from mm_sonic.torch_contact_segments import (
+    ContactSegmentIndex,
+    TerrainContactSegmentPolicy,
 )
 from mm_sonic.torch_transition_reachability import ReachabilityLimits
 from mm_sonic.torch_motion_data import MotionFolder
@@ -64,7 +70,145 @@ class _ScriptedWindowValidator:
         return self.decisions.pop(0)
 
 
+class _ConstantGrid:
+    def __init__(self, height):
+        self.height = float(height)
+
+    def sample_xy(self, points):
+        return torch.full(
+            points.shape[:-1], self.height, dtype=points.dtype,
+            device=points.device,
+        )
+
+
+class _IdentityAlignment:
+    def matcher_to_scene_xy(self, points):
+        return points
+
+
+def _install_contact_policy(matcher, *, start=20, end=30):
+    support = torch.zeros(
+        (len(matcher.folder.clips[0].joint_position), 2), dtype=torch.bool
+    )
+    support[start:end, 0] = True
+    support[end : end + 10, 1] = True
+    support[end + 10 : end + 20, 0] = True
+    index = ContactSegmentIndex.from_support_masks(
+        (support,), terrain_clip_indices=(0,),
+        minimum_frames=5, maximum_frames=60,
+    )
+    identity = _IdentityAlignment()
+    dataset = SimpleNamespace(
+        folder=matcher.folder,
+        clip_grids=(_ConstantGrid(0.0),),
+        clip_alignments=(identity,),
+        device=matcher.device,
+    )
+    extension = SimpleNamespace(
+        dataset=dataset,
+        query_grid=_ConstantGrid(0.0),
+        alignment=identity,
+    )
+    policy = TerrainContactSegmentPolicy(index=index, extension=extension)
+    matcher._contact_segment_policy = policy
+    matcher._transition_eligible_rows = policy.entry_eligibility(
+        matcher.database
+    )
+    return policy
+
+
 class TorchMotionMatcherTests(unittest.TestCase):
+    def test_contact_segment_commitment_is_sequential_until_release(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=MatcherConfig(search_interval_steps=1, exclusion_frames=0),
+            )
+            matcher.reset()
+            _install_contact_policy(matcher, start=20, end=30)
+            entry_row = matcher.database.row_for_source(0, 20)
+            successor = matcher.database.row_for_source(0, 1)
+            selected = SearchDecision(
+                entry_row, successor, 100.0, 1.0, 1.0, True, True
+            )
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher.select_exact_candidate",
+                return_value=selected,
+            ) as search:
+                first = matcher.step((0.4, 0.0), 0.0)
+
+            self.assertTrue(first.diagnostics.segment_committed)
+            self.assertIsInstance(matcher._state.commitment, SegmentCommitment)
+            self.assertEqual(first.diagnostics.segment_start_frame, 20)
+            self.assertEqual(first.diagnostics.segment_end_frame, 30)
+            search.assert_called_once()
+
+            frames = [first.diagnostics.selected_frame]
+            searched = [first.diagnostics.searched]
+            while frames[-1] + 1 < 30:
+                value = matcher.step((-0.4, 0.0), math.pi)
+                frames.append(value.diagnostics.selected_frame)
+                searched.append(value.diagnostics.searched)
+                self.assertTrue(value.diagnostics.segment_committed)
+                self.assertEqual(
+                    value.diagnostics.force_search_reason,
+                    "segment_commitment",
+                )
+
+            self.assertEqual(frames, list(range(20, 30)))
+            self.assertEqual(searched, [True] + [False] * 9)
+            self.assertIsNone(matcher._state.commitment)
+
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher.select_exact_candidate",
+                wraps=select_exact_candidate,
+            ) as resumed_search:
+                released = matcher.step((-0.4, 0.0), math.pi)
+            self.assertFalse(released.diagnostics.segment_committed)
+            resumed_search.assert_called_once()
+
+    def test_rejected_contact_entry_is_transactional(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=MatcherConfig(search_interval_steps=1, exclusion_frames=0),
+            )
+            matcher.reset()
+            _install_contact_policy(matcher, start=20, end=30)
+            entry_row = matcher.database.row_for_source(0, 20)
+            successor = matcher.database.row_for_source(0, 1)
+            selected = SearchDecision(
+                entry_row, successor, 0.0, 1.0, 1.0, True, True
+            )
+            state_before = matcher._state
+            history_before = tuple(matcher._selection_history)
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher.select_exact_candidate",
+                return_value=selected,
+            ), mock.patch.object(
+                TerrainContactSegmentPolicy,
+                "query_support_mask",
+                return_value=torch.tensor([False, True]),
+            ):
+                prepared = matcher.prepare_step((0.4, 0.0), 0.0)
+
+        self.assertIs(matcher._state, state_before)
+        self.assertEqual(tuple(matcher._selection_history), history_before)
+        self.assertFalse(prepared.result.diagnostics.segment_committed)
+        self.assertTrue(prepared.result.diagnostics.transition_rejected)
+        self.assertEqual(
+            prepared.result.diagnostics.segment_rejection_reason,
+            "incompatible_support_side",
+        )
+
     def test_transition_eligibility_masks_only_search_transitions(self):
         arrays = build_varying_takara_arrays(frames=80)
         with tempfile.TemporaryDirectory() as tmp:

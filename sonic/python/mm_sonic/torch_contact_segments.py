@@ -413,7 +413,7 @@ class TerrainContactSegmentPolicy:
             if segment.entering_foot == 0
             else layout.right_foot_body_index
         )
-        source_ankle = torch.as_tensor(
+        source_ankle = torch.tensor(
             dataset.folder.clips[clip_index].body_position_world[
                 frame_index, foot_body
             ],
