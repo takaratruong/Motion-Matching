@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 
 from mm_sonic.torch_terrain_omni_rollout import (
     fit_resolved_normalization,
@@ -37,6 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
             "two-contact",
             "hybrid",
             "layered",
+            "layered-hybrid",
             "continuous-control",
         ),
         help="Condition contact-segment entries on this foothold ablation arm.",
@@ -54,6 +56,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fail a route after a matcher step exceeds this latency.",
     )
     parser.add_argument(
+        "--transition-joint-position-weight",
+        type=float,
+        help="Override the non-negative full-pose transition position weight.",
+    )
+    parser.add_argument(
+        "--transition-joint-velocity-weight",
+        type=float,
+        help="Override the non-negative full-pose transition velocity weight.",
+    )
+    parser.add_argument(
         "--normalization-dataset",
         help="Optional reference corpus whose feature normalization is frozen.",
     )
@@ -68,6 +80,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run only this route name; repeat to select multiple routes.",
     )
     return parser
+
+
+def _apply_transition_overrides(config: dict, args) -> None:
+    for field, override in (
+        (
+            "transition_joint_position_weight",
+            args.transition_joint_position_weight,
+        ),
+        (
+            "transition_joint_velocity_weight",
+            args.transition_joint_velocity_weight,
+        ),
+    ):
+        if override is None:
+            continue
+        if not math.isfinite(override) or override < 0.0:
+            raise ValueError(f"{field} override must be finite and non-negative")
+        config["matcher"][field] = override
 
 
 def main() -> int:
@@ -90,17 +120,17 @@ def main() -> int:
             resolve_contact_segment_config,
         )
 
+        experiment_config = load_contact_segment_config(args.config)
+        _apply_transition_overrides(experiment_config, args)
         resolved = resolve_contact_segment_config(
-            args.dataset,
-            load_contact_segment_config(args.config),
-            device=args.device,
+            args.dataset, experiment_config, device=args.device
         )
         contact_policy = build_contact_segment_policy(resolved, args.g1_xml)
     else:
+        experiment_config = load_experiment_config(args.config)
+        _apply_transition_overrides(experiment_config, args)
         resolved = resolve_stair_config(
-            args.dataset,
-            load_experiment_config(args.config),
-            device=args.device,
+            args.dataset, experiment_config, device=args.device
         )
     if args.foothold_arm and contact_policy is None:
         raise ValueError("--foothold-arm requires --contact-segments")

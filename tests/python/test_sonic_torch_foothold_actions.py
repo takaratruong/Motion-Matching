@@ -462,6 +462,50 @@ class FootholdActionTests(unittest.TestCase):
         self.assertEqual(ranking.eligible.tolist(), [True, True])
         self.assertEqual(ranking.selected_action, 1)
 
+    def test_hybrid_uses_motion_cost_after_two_contact_gate(self):
+        exact_footholds_rough_pose = _action()
+        nearby_footholds_smooth_pose = _action(
+            xy=((0.45, 0.10), (0.75, -0.10)),
+        )
+
+        ranking = rank_foothold_actions(
+            arm=FootholdSelectionArm.HYBRID,
+            plan=_plan(),
+            actions=(exact_footholds_rough_pose, nearby_footholds_smooth_pose),
+            motion_cost=torch.tensor((0.8, 0.0)),
+            height_tolerance_m=0.04,
+            xy_tolerance_m=0.20,
+            timing_tolerance_frames=8,
+        )
+
+        self.assertEqual(ranking.eligible.tolist(), [True, True])
+        torch.testing.assert_close(
+            ranking.additional_cost, torch.zeros(2)
+        )
+        self.assertEqual(ranking.selected_action, 1)
+
+    def test_first_contact_uses_motion_cost_inside_hard_gate(self):
+        exact_footholds_rough_pose = _action()
+        nearby_footholds_smooth_pose = _action(
+            xy=((0.45, 0.10), (0.75, -0.10)),
+        )
+
+        ranking = rank_foothold_actions(
+            arm=FootholdSelectionArm.FIRST_CONTACT,
+            plan=_plan(),
+            actions=(exact_footholds_rough_pose, nearby_footholds_smooth_pose),
+            motion_cost=torch.tensor((0.8, 0.0)),
+            height_tolerance_m=0.04,
+            xy_tolerance_m=0.20,
+            timing_tolerance_frames=8,
+        )
+
+        self.assertEqual(ranking.eligible.tolist(), [True, True])
+        torch.testing.assert_close(
+            ranking.additional_cost, torch.zeros(2)
+        )
+        self.assertEqual(ranking.selected_action, 1)
+
     def test_layered_arm_keeps_contact_heights_hard_and_xy_soft(self):
         far_but_correct_contacts = _action(
             height=(0.18, 0.18),
@@ -483,6 +527,34 @@ class FootholdActionTests(unittest.TestCase):
 
         self.assertEqual(ranking.eligible.tolist(), [True, False])
         self.assertEqual(ranking.selected_action, 0)
+
+    def test_layered_hybrid_keeps_contact_gate_but_uses_motion_cost(self):
+        exact_footholds_rough_pose = _action(height=(0.18, 0.18))
+        nearby_footholds_smooth_pose = _action(
+            height=(0.18, 0.18),
+            xy=((0.45, 0.10), (0.75, -0.10)),
+        )
+        wrong_second_height = _action(height=(0.18, 0.00))
+
+        ranking = rank_foothold_actions(
+            arm=FootholdSelectionArm.LAYERED_HYBRID,
+            plan=_plan(height=(0.18, 0.18)),
+            actions=(
+                exact_footholds_rough_pose,
+                nearby_footholds_smooth_pose,
+                wrong_second_height,
+            ),
+            motion_cost=torch.tensor((0.8, 0.0, 0.0)),
+            height_tolerance_m=0.04,
+            xy_tolerance_m=0.20,
+            timing_tolerance_frames=8,
+        )
+
+        self.assertEqual(ranking.eligible.tolist(), [True, True, False])
+        torch.testing.assert_close(
+            ranking.additional_cost, torch.zeros(3)
+        )
+        self.assertEqual(ranking.selected_action, 1)
 
     def test_continuous_control_can_prefer_wrong_contact_sequence(self):
         ranking = rank_foothold_actions(

@@ -40,6 +40,21 @@ class TerrainOmniCliTests(unittest.TestCase):
         self.assertTrue(arguments.contact_segments)
         self.assertEqual(arguments.maximum_step_time_ms, 1000.0)
 
+    def test_transition_continuity_overrides_are_explicit(self):
+        arguments = build_parser().parse_args(
+            [
+                "--dataset", "motions",
+                "--config", "contact.json",
+                "--g1-xml", "g1.xml",
+                "--output", "matrix",
+                "--transition-joint-position-weight", "1.0",
+                "--transition-joint-velocity-weight", "2.0",
+            ]
+        )
+
+        self.assertEqual(arguments.transition_joint_position_weight, 1.0)
+        self.assertEqual(arguments.transition_joint_velocity_weight, 2.0)
+
 
 if __name__ == "__main__":
     unittest.main()

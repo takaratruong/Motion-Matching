@@ -731,6 +731,7 @@ class FootholdSelectionArm(Enum):
     TWO_CONTACT = "two-contact"
     HYBRID = "hybrid"
     LAYERED = "layered"
+    LAYERED_HYBRID = "layered-hybrid"
     CONTINUOUS = "continuous-control"
 
 
@@ -871,11 +872,20 @@ def rank_foothold_actions(
             FootholdSelectionArm.HYBRID,
         ):
             eligible[action_index] = bool(both_valid.any().item())
-        elif arm is FootholdSelectionArm.LAYERED:
+        elif arm in (
+            FootholdSelectionArm.LAYERED,
+            FootholdSelectionArm.LAYERED_HYBRID,
+        ):
             eligible[action_index] = bool(contact_valid.any().item())
         else:
             eligible[action_index] = True
 
+    if arm in (
+        FootholdSelectionArm.FIRST_CONTACT,
+        FootholdSelectionArm.HYBRID,
+        FootholdSelectionArm.LAYERED_HYBRID,
+    ):
+        descriptor_cost.zero_()
     total = motion_cost + descriptor_cost
     selected = None
     if bool(eligible.any().item()):
@@ -1132,10 +1142,19 @@ class FootholdActionPolicy:
             FootholdSelectionArm.HYBRID,
         ):
             eligible = both_valid.any(dim=0)
-        elif self.arm is FootholdSelectionArm.LAYERED:
+        elif self.arm in (
+            FootholdSelectionArm.LAYERED,
+            FootholdSelectionArm.LAYERED_HYBRID,
+        ):
             eligible = contact_valid.any(dim=0)
         else:
             eligible.fill_(True)
+        if self.arm in (
+            FootholdSelectionArm.FIRST_CONTACT,
+            FootholdSelectionArm.HYBRID,
+            FootholdSelectionArm.LAYERED_HYBRID,
+        ):
+            cost.zero_()
         selected = None
         if bool(eligible.any().item()):
             selected = int(
@@ -1222,7 +1241,10 @@ class FootholdActionPolicy:
                 action_indices[action_rows]
             ]
         fallback = None
-        if self.arm is FootholdSelectionArm.LAYERED:
+        if self.arm in (
+            FootholdSelectionArm.LAYERED,
+            FootholdSelectionArm.LAYERED_HYBRID,
+        ):
             if terrain_required:
                 fallback = action_rows.clone()
             else:

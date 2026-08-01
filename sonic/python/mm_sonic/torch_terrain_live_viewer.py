@@ -694,6 +694,7 @@ def build_live_viewer_argument_parser() -> argparse.ArgumentParser:
             "two-contact",
             "hybrid",
             "layered",
+            "layered-hybrid",
             "continuous-control",
         ),
         help="Condition terrain entries with the selected foothold policy.",
