@@ -30,6 +30,9 @@ class FootholdAblationComparisonTests(unittest.TestCase):
         self.assertEqual(metrics["source_discontinuity_count"], 2)
         self.assertEqual(metrics["cross_clip_transition_count"], 1)
         self.assertEqual(metrics["shortest_sequential_run_frames"], 1)
+        self.assertAlmostEqual(
+            metrics["transition_joint_velocity_jump_p95_rad_s"], 1.715
+        )
         self.assertGreater(metrics["joint_jerk_p95_rad_s3"], 0.0)
 
     def test_arm_rank_prioritizes_safety_then_route_classes_then_coherence(self):

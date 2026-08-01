@@ -1,0 +1,60 @@
+{
+  "acceptance": {
+    "maximum_longest_unsupported_frames": 10,
+    "maximum_lost_source_support_fraction": 0.05,
+    "maximum_stance_slide_m": 0.35,
+    "maximum_unsupported_fraction": 0.15,
+    "minimum_foot_clearance_m": -0.03,
+    "require_sequential_commitment": true,
+    "require_upper_landing": true
+  },
+  "conditions": {
+    "dense": {
+      "encoder": "dense",
+      "weight": 3.0
+    },
+    "flat": {
+      "encoder": null,
+      "weight": 0.0
+    },
+    "legacy": {
+      "encoder": "legacy",
+      "weight": 4.0
+    }
+  },
+  "contact_segments": {
+    "entry_inertialization_halflife_s": 0.01,
+    "flat_support_transition_cost_weight": 400.0,
+    "maximum_frames": 60,
+    "maximum_lost_source_support_fraction": 0.05,
+    "maximum_scene_xy_mismatch_m": 0.05,
+    "maximum_unsupported_frames": 10,
+    "minimum_frames": 5,
+    "placement_mode": "local"
+  },
+  "dt": 0.02,
+  "duration_s": 9.0,
+  "matcher": {
+    "acceleration_mps2": 1.5,
+    "deceleration_mps2": 2.0,
+    "exclusion_frames": 20,
+    "inertialization_halflife_s": 0.02,
+    "joint_reference_smoothing_weight": 0.0,
+    "reversal_speed_mps": 0.15,
+    "search_interval_steps": 1,
+    "stop_speed_mps": 0.05,
+    "transition_joint_position_weight": 0.5,
+    "transition_joint_velocity_weight": 0.5,
+    "transition_penalty": 0.1,
+    "transition_settle_duration_s": 0.2,
+    "transition_settle_penalty": 18.75,
+    "transition_window_candidate_count": 32,
+    "transition_window_jerk_horizon_steps": 46,
+    "transition_window_jerk_weight": 0.0,
+    "yaw_rate_rad_s": 2.0943951023931953
+  },
+  "query_scene": "terrain/grail/grail-stair_p1-d01be55953dba78b90e9/motion.npz",
+  "reset_clip": "flat/motion.npz",
+  "schema": "g1-torch-contact-segment-experiment/v1",
+  "terrain_transition_preview_steps": 10
+}

@@ -64,11 +64,27 @@ def selection_coherence(
         )
     else:
         joint_jerk = np.zeros(0, dtype=np.float64)
+    if count >= 2:
+        transition_velocity_jump = np.linalg.norm(
+            np.diff(velocity, axis=0), axis=1
+        )[discontinuity]
+    else:
+        transition_velocity_jump = np.zeros(0, dtype=np.float64)
     return {
         "source_discontinuity_count": int(np.sum(discontinuity)),
         "cross_clip_transition_count": int(np.sum(cross_clip)),
         "shortest_sequential_run_frames": (
             int(np.min(run_lengths)) if run_lengths.size else 0
+        ),
+        "transition_joint_velocity_jump_p95_rad_s": (
+            float(np.percentile(transition_velocity_jump, 95))
+            if transition_velocity_jump.size
+            else 0.0
+        ),
+        "transition_joint_velocity_jump_max_rad_s": (
+            float(np.max(transition_velocity_jump))
+            if transition_velocity_jump.size
+            else 0.0
         ),
         "joint_jerk_p95_rad_s3": (
             float(np.percentile(joint_jerk, 95)) if joint_jerk.size else 0.0
@@ -139,6 +155,8 @@ def summarize_arm(name: str, root: str | Path) -> dict[str, object]:
     source_discontinuities = 0
     cross_clip_transitions = 0
     shortest_run: int | None = None
+    transition_velocity_jump_p95 = 0.0
+    transition_velocity_jump_max = 0.0
     joint_jerk: list[np.ndarray] = []
     for metrics_path in route_files:
         value = json.loads(metrics_path.read_text(encoding="utf-8"))
@@ -188,6 +206,14 @@ def summarize_arm(name: str, root: str | Path) -> dict[str, object]:
         )
         run = int(coherence["shortest_sequential_run_frames"])
         shortest_run = run if shortest_run is None else min(shortest_run, run)
+        transition_velocity_jump_p95 = max(
+            transition_velocity_jump_p95,
+            float(coherence["transition_joint_velocity_jump_p95_rad_s"]),
+        )
+        transition_velocity_jump_max = max(
+            transition_velocity_jump_max,
+            float(coherence["transition_joint_velocity_jump_max_rad_s"]),
+        )
         routes[route_name] = {
             "passed": passed,
             "failure_reasons": value["outcome"]["failure_reasons"],
@@ -227,6 +253,12 @@ def summarize_arm(name: str, root: str | Path) -> dict[str, object]:
         "source_discontinuity_count": source_discontinuities,
         "cross_clip_transition_count": cross_clip_transitions,
         "shortest_sequential_run_frames": shortest_run or 0,
+        "transition_joint_velocity_jump_p95_rad_s": (
+            transition_velocity_jump_p95
+        ),
+        "transition_joint_velocity_jump_max_rad_s": (
+            transition_velocity_jump_max
+        ),
         "joint_jerk_p95_rad_s3": (
             float(np.percentile(jerk, 95)) if jerk.size else 0.0
         ),
