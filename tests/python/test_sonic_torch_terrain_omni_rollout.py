@@ -11,6 +11,7 @@ from mm_sonic.torch_terrain_omni_rollout import (
     evaluate_route_outcome,
     run_omni_matrix,
     save_omni_matrix,
+    _elevated_lateral_midpoint,
     _scalar_diagnostic,
 )
 from mm_sonic.torch_terrain_omni_routes import (
@@ -65,8 +66,8 @@ class _FakeMatcher:
         self._timing = timing
         self._ledger = ledger
 
-    def reset(self):
-        self._ledger.append(("reset", None))
+    def reset(self, *, root_position_world_xy=None):
+        self._ledger.append(("reset", root_position_world_xy))
         return _Result(-1, self._timing)
 
     def prepare_step(self, velocity, heading, *, dt):
@@ -106,6 +107,38 @@ class OmnidirectionalRolloutContractTests(unittest.TestCase):
 
         self.assertEqual(
             _scalar_diagnostic(diagnostic, "search_time_ns", -1), -1
+        )
+
+    def test_elevated_lateral_midpoint_handles_asymmetric_stair(self):
+        lateral = np.linspace(-1.0, 1.0, 9)
+        height = np.array([0.0, 0.0, 0.0, 0.2, 0.2, 0.2, 0.2, 0.2, 0.0])
+
+        center = _elevated_lateral_midpoint(lateral, height, 0.0)
+
+        self.assertAlmostEqual(center, 0.25)
+
+    def test_matrix_threads_optional_reset_root_position(self):
+        ledgers = []
+
+        def factory(_route):
+            ledger = []
+            ledgers.append(ledger)
+            return _FakeMatcher(fail_at=None, timing=100, ledger=ledger)
+
+        run_omni_matrix(
+            routes=_routes(),
+            stair_frame=self.frame,
+            matcher_factory=factory,
+            kinematics=_kinematics,
+            terrain_sampler=lambda xy: np.zeros(2),
+            dataset_identity="dataset-a",
+            config_identity="config-a",
+            reset_root_position_world_xy=(0.25, -0.5),
+        )
+
+        self.assertTrue(ledgers)
+        self.assertTrue(
+            all(ledger[0] == ("reset", (0.25, -0.5)) for ledger in ledgers)
         )
 
     def test_every_command_frame_commits_once_and_arrays_are_complete(self):

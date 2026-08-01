@@ -210,6 +210,22 @@ def _install_contact_policy(
 
 
 class TorchMotionMatcherTests(unittest.TestCase):
+    def test_reset_can_place_root_at_requested_world_xy(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(root, device="cpu")
+
+            result = matcher.reset(root_position_world_xy=(1.25, -0.75))
+
+        torch.testing.assert_close(
+            result.root_position_world[:2], torch.tensor((1.25, -0.75))
+        )
+        torch.testing.assert_close(
+            matcher._state.root_position[:2], torch.tensor((1.25, -0.75))
+        )
+
     def test_two_contact_action_extends_validated_segment_window(self):
         arrays = build_varying_takara_arrays(frames=100)
         with tempfile.TemporaryDirectory() as tmp:

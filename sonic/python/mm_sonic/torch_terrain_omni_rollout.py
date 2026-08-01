@@ -319,6 +319,39 @@ def _scalar_diagnostic(diagnostics, name: str, default):
     return default if value is None else value
 
 
+def _elevated_lateral_midpoint(
+    lateral_m: np.ndarray,
+    height_m: np.ndarray,
+    base_height_m: float,
+) -> float:
+    """Return the midpoint of the widest elevated lateral interval."""
+
+    lateral = np.asarray(lateral_m, np.float64)
+    height = np.asarray(height_m, np.float64)
+    base = float(base_height_m)
+    if (
+        lateral.ndim != 1
+        or height.shape != lateral.shape
+        or lateral.size < 3
+        or not np.isfinite(lateral).all()
+        or not np.isfinite(height).all()
+        or not math.isfinite(base)
+        or not bool(np.all(np.diff(lateral) > 0.0))
+    ):
+        raise ValueError("lateral stair profile is invalid")
+    elevated = height > base + 0.05
+    indices = np.flatnonzero(elevated)
+    if indices.size == 0:
+        raise ValueError("lateral stair profile has no elevated interval")
+    splits = np.flatnonzero(np.diff(indices) > 1) + 1
+    groups = np.split(indices, splits)
+    group = max(
+        groups,
+        key=lambda item: float(lateral[item[-1]] - lateral[item[0]]),
+    )
+    return 0.5 * float(lateral[group[0]] + lateral[group[-1]])
+
+
 def _run_route(
     route: OmniRoute,
     *,
@@ -329,6 +362,7 @@ def _run_route(
     dataset_identity: str,
     config_identity: str,
     maximum_step_time_ns: int | None,
+    reset_root_position_world_xy: tuple[float, float] | None,
 ) -> OmniRouteRun:
     rows = {name: [] for name in _ARRAY_SHAPES}
     failure = None
@@ -343,7 +377,12 @@ def _run_route(
             raise ValueError("route reset must be declared on its first command only")
         matcher = matcher_factory(route)
         stage = "reset"
-        matcher.reset()
+        if reset_root_position_world_xy is None:
+            matcher.reset()
+        else:
+            matcher.reset(
+                root_position_world_xy=reset_root_position_world_xy
+            )
         expanded = world_commands(stair_frame, route)
         frame_index = 0
         for segment_index, command in enumerate(expanded):
@@ -494,6 +533,7 @@ def run_omni_matrix(
     dataset_identity: str,
     config_identity: str,
     maximum_step_time_ns: int | None = None,
+    reset_root_position_world_xy: tuple[float, float] | None = None,
 ) -> OmniMatrix:
     """Run every route independently so one exception cannot abort the matrix."""
 
@@ -503,6 +543,17 @@ def run_omni_matrix(
         type(maximum_step_time_ns) is not int or maximum_step_time_ns <= 0
     ):
         raise ValueError("maximum step time must be a positive integer")
+    if reset_root_position_world_xy is not None and (
+        not isinstance(reset_root_position_world_xy, tuple)
+        or len(reset_root_position_world_xy) != 2
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            for value in reset_root_position_world_xy
+        )
+    ):
+        raise ValueError("reset root position must be a finite XY tuple")
     runs = tuple(
         _run_route(
             route,
@@ -513,6 +564,7 @@ def run_omni_matrix(
             dataset_identity=dataset_identity,
             config_identity=config_identity,
             maximum_step_time_ns=maximum_step_time_ns,
+            reset_root_position_world_xy=reset_root_position_world_xy,
         )
         for route in routes
     )
@@ -538,6 +590,40 @@ def run_omni_matrix(
         ),
         deterministic_sha256=digest.hexdigest(),
     )
+
+
+def resolved_stair_reset_position(resolved) -> tuple[float, float]:
+    """Measure the query stair midline and return its matcher-world XY."""
+
+    config = resolved.resolved_config
+    direction = torch.tensor(
+        config["reference_direction_matcher_xy"],
+        dtype=torch.float32,
+        device=resolved.device,
+    )
+    direction = direction / torch.linalg.vector_norm(direction)
+    left = torch.stack((-direction[1], direction[0]))
+    lateral = torch.linspace(
+        -2.0, 2.0, 401, dtype=torch.float32, device=resolved.device
+    )
+    progress = 0.70 * float(config["reference_horizontal_progress_m"])
+    matcher_points = (
+        progress * direction[None, :] + lateral[:, None] * left[None, :]
+    )
+    measurement = resolved.measurement_extension
+    scene_points = measurement.alignment.matcher_to_scene_xy(matcher_points)
+    heights = measurement.query_grid.sample_xy(scene_points)
+    origin_scene = measurement.alignment.matcher_to_scene_xy(
+        torch.zeros((1, 2), dtype=torch.float32, device=resolved.device)
+    )
+    base = float(measurement.query_grid.sample_xy(origin_scene)[0].item())
+    center = _elevated_lateral_midpoint(
+        lateral.detach().cpu().numpy(),
+        heights.detach().cpu().numpy(),
+        base,
+    )
+    position = center * left
+    return tuple(float(value) for value in position.detach().cpu().tolist())
 
 
 def run_resolved_omni_matrix(
@@ -649,6 +735,7 @@ def run_resolved_omni_matrix(
     digest.update(mean.detach().to("cpu").numpy().tobytes())
     digest.update(scale.detach().to("cpu").numpy().tobytes())
     normalization_digest = digest.hexdigest()
+    reset_position = resolved_stair_reset_position(resolved)
     return run_omni_matrix(
         routes=tuple(same_stair_routes() if routes is None else routes),
         stair_frame=stair_frame,
@@ -658,9 +745,11 @@ def run_resolved_omni_matrix(
         dataset_identity=resolved.dataset.manifest_sha256,
         config_identity=(
             f"{resolved.base_config_sha256}:normalization:"
-            f"{normalization_digest}"
+            f"{normalization_digest}:reset:"
+            f"{reset_position[0]:.9f},{reset_position[1]:.9f}"
         ),
         maximum_step_time_ns=maximum_step_time_ns,
+        reset_root_position_world_xy=reset_position,
     )
 
 

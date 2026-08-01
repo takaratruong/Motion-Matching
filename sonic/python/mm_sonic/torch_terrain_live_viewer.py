@@ -522,8 +522,11 @@ def run_live_viewer(
         contact_segment_policy=contact_segment_policy,
         foothold_action_policy=foothold_action_policy,
     )
+    from .torch_terrain_omni_rollout import resolved_stair_reset_position
+
+    reset_position = resolved_stair_reset_position(resolved)
     model, data = build_kinematic_scene(g1_xml, resolved)
-    result = matcher.reset()
+    result = matcher.reset(root_position_world_xy=reset_position)
     apply_kinematic_state(
         mujoco, model, data, matcher_result_qpos(result)
     )
@@ -588,7 +591,9 @@ def run_live_viewer(
                     previous_heading_rad=heading,
                 )
                 if edges.reset_requested:
-                    result = matcher.reset()
+                    result = matcher.reset(
+                        root_position_world_xy=reset_position
+                    )
                     shaped_velocity.zero_()
                     shaped_heading.zero_()
                     heading = float(

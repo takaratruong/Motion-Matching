@@ -2817,8 +2817,28 @@ class TorchMotionMatcher:
         )
         return position, velocity
 
-    def reset(self) -> MotionMatchResult:
+    def reset(
+        self,
+        *,
+        root_position_world_xy: tuple[float, float] = (0.0, 0.0),
+    ) -> MotionMatchResult:
         step_start = time.perf_counter_ns()
+        if (
+            not isinstance(root_position_world_xy, tuple)
+            or len(root_position_world_xy) != 2
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                for value in root_position_world_xy
+            )
+        ):
+            raise ContractError("reset root position must be a finite XY tuple")
+        reset_xy = torch.tensor(
+            root_position_world_xy,
+            dtype=torch.float32,
+            device=self.device,
+        )
         row = self.database.reset_row
         clip_index, frame_index = self._source_for_row(row)
         clip = self._clips[clip_index]
@@ -2827,7 +2847,7 @@ class TorchMotionMatcher:
         source_yaw = _quat_yaw(clip.body_quaternion[frame_index, root])
         yaw_offset = -source_yaw
         rotated_root = _rotate_z(source_root, yaw_offset)
-        translation = -rotated_root[:2]
+        translation = reset_xy - rotated_root[:2]
         targets = self._aligned_targets(
             clip_index,
             frame_index,
