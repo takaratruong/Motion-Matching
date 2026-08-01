@@ -1243,6 +1243,8 @@ def _feasible_actions(
     config: OracleSearchConfig,
     entry_cache: _ActionEntryCache,
     rejected: Counter[str] | None = None,
+    *,
+    exhaustive_on_empty: bool = False,
 ) -> list[tuple[int, PlacedContactPhase, FeasibilityResult]]:
     output = []
     candidates = entry_cache.candidate_indices(
@@ -1267,7 +1269,7 @@ def _feasible_actions(
 
     evaluate(candidate_indices)
     pruned_count = int(candidates.numel() - candidate_indices.numel())
-    if output or pruned_count == 0:
+    if output or pruned_count == 0 or not exhaustive_on_empty:
         if rejected is not None and pruned_count:
             rejected["shortlist-pruned"] += pruned_count
         return output
@@ -1410,6 +1412,7 @@ def _search_horizon(
     config: OracleSearchConfig,
     rejected: Counter[str],
     entry_cache: _ActionEntryCache,
+    exhaustive_failure_audit: bool = False,
 ) -> tuple[_SearchNode | None, tuple[int, ...], int]:
     beam = (
         _SearchNode(initial_state, (), (), (), OracleCost()),
@@ -1435,6 +1438,7 @@ def _search_horizon(
                     config,
                     entry_cache,
                     rejected,
+                    exhaustive_on_empty=exhaustive_failure_audit,
                 )
             else:
                 feasible = list(node.cached_feasible)
@@ -1539,6 +1543,7 @@ def search_contact_plan(
             config=config,
             rejected=rejected,
             entry_cache=entry_cache,
+            exhaustive_failure_audit=horizon == 1,
         )
         total_expanded += expanded
         all_beam_sizes.extend(beam_sizes)
