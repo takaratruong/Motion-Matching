@@ -913,6 +913,7 @@ class _ActionEntryCache:
         candidates: torch.Tensor,
         state: OracleState,
         schedule: CommandSchedule,
+        foothold_plan: FootholdPlan,
         config: OracleSearchConfig,
         rejected: Counter[str] | None,
     ) -> torch.Tensor:
@@ -950,7 +951,56 @@ class _ActionEntryCache:
             ),
             dim=1,
         )
-        score = path + facing + joint_position + joint_velocity
+        terminal = self.frame_steps[candidates]
+        swing = self.swing_foot[candidates]
+        rows = torch.arange(
+            candidates.numel(), dtype=torch.int64, device=candidates.device
+        )
+        landing_local = self.foot_trajectory_local[candidates][
+            rows, terminal, swing, :2
+        ]
+        landing_world = (
+            _rotate_xy(landing_local, state.root_yaw_world)
+            + state.root_position_world[None, :2]
+        )
+        target_xy = foothold_plan.landing_xy_world_m[:, 0]
+        target_feet = foothold_plan.landing_feet[:, 0]
+        target_frames = foothold_plan.landing_frame_offsets[:, 0]
+        if target_xy.shape[0]:
+            matching = swing[:, None] == target_feet[None, :]
+            landing_error = torch.sum(
+                torch.square(
+                    landing_world[:, None, :] - target_xy[None, :, :]
+                ),
+                dim=2,
+            )
+            timing_error = torch.square(
+                terminal[:, None].to(torch.float32)
+                - target_frames[None, :].to(torch.float32)
+            )
+            target_cost = (
+                float(config.foothold_weight) * landing_error
+                + float(config.timing_weight) * timing_error
+            )
+            target_cost = torch.where(
+                matching,
+                target_cost,
+                torch.full_like(target_cost, torch.inf),
+            ).amin(dim=1)
+            target_cost = torch.where(
+                torch.isfinite(target_cost),
+                target_cost,
+                torch.full_like(target_cost, 100.0),
+            )
+        else:
+            target_cost = torch.zeros_like(path)
+        score = (
+            path
+            + facing
+            + joint_position
+            + joint_velocity
+            + target_cost
+        )
         order = torch.argsort(score, stable=True)
         if rejected is not None:
             rejected["shortlist-pruned"] += int(candidates.numel()) - limit
@@ -1089,6 +1139,7 @@ def _feasible_actions(
     state: OracleState,
     actions: Sequence[ContactPhaseAction],
     schedule: CommandSchedule,
+    foothold_plan: FootholdPlan,
     sample_surface: Callable[[torch.Tensor], torch.Tensor],
     config: OracleSearchConfig,
     entry_cache: _ActionEntryCache,
@@ -1099,7 +1150,7 @@ def _feasible_actions(
         state, config.constraints, rejected
     )
     candidate_indices = entry_cache.shortlisted_indices(
-        candidates, state, schedule, config, rejected
+        candidates, state, schedule, foothold_plan, config, rejected
     )
     results = entry_cache.terrain_feasibility(
         candidate_indices, state, sample_surface, config.constraints
@@ -1251,6 +1302,7 @@ def _search_horizon(
                     node.state,
                     actions,
                     command_schedule,
+                    foothold_plan,
                     sample_surface,
                     config,
                     entry_cache,
@@ -1268,11 +1320,18 @@ def _search_horizon(
                 successor_rejected = None
                 if depth + 1 < horizon:
                     successor_rejected = Counter()
+                    child_foothold_plan = _foothold_plan_for_state(
+                        child_state,
+                        command_schedule,
+                        sample_surface,
+                        config,
+                    )
                     successors = tuple(
                         _feasible_actions(
                             child_state,
                             actions,
                             command_schedule,
+                            child_foothold_plan,
                             sample_surface,
                             config,
                             entry_cache,

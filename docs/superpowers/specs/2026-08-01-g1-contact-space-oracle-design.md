@@ -107,9 +107,9 @@ joint motion.
 
 The oracle performs deterministic beam search with a default width of 32 and
 a default horizon of four landings. There is no wall-clock cutoff. Exact hard
-entry gates are followed by a deterministic 32-action command/continuity
-shortlist before batched terrain validation. Candidate ordering uses a stable
-source-row tie break. This measured revision replaced the original width-256
+entry gates are followed by a deterministic 32-action command, continuity,
+and planned-foothold XY/timing shortlist before batched terrain validation.
+Candidate ordering uses a stable source-row tie break. This measured revision replaced the original width-256
 all-compatible expansion after real-corpus traces showed multi-minute first
 plans dominated by repeated candidate placement rather than useful lookahead.
 

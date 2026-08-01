@@ -546,6 +546,8 @@ class ContactOracleSearchTests(unittest.TestCase):
             sample_surface=flat_surface,
             config=OracleSearchConfig(
                 horizon_landings=1,
+                beam_width=1,
+                transition_candidate_count=1,
                 constraints=OracleConstraints(maximum_entry_foot_error_m=10.0),
             ),
         )
@@ -576,6 +578,8 @@ class ContactOracleSearchTests(unittest.TestCase):
             sample_surface=flat_surface,
             config=OracleSearchConfig(
                 horizon_landings=1,
+                beam_width=1,
+                transition_candidate_count=1,
                 constraints=OracleConstraints(maximum_entry_foot_error_m=10.0),
             ),
         )

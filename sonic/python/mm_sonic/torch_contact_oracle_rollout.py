@@ -65,6 +65,7 @@ ORACLE_ARRAY_SHAPES = {
     "landing_error_m": (),
     "minimum_swing_clearance_m": (),
 }
+ORACLE_IMPLEMENTATION_ID = "g1-contact-oracle/foothold-shortlist-v2"
 
 
 @dataclass(frozen=True)
@@ -709,6 +710,7 @@ def run_resolved_oracle_matrix(
         )
 
     config_payload = {
+        "implementation": ORACLE_IMPLEMENTATION_ID,
         "terrain": resolved.base_config_sha256,
         "search": repr(experiment.search),
     }
