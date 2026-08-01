@@ -5,7 +5,7 @@
     "maximum_edge_height_range_m": 0.025,
     "maximum_entry_foot_error_m": 0.08,
     "maximum_height_deformation_m": 0.06,
-    "maximum_joint_position_error_rad": 1.5,
+    "maximum_joint_position_error_rad": 2.5,
     "maximum_joint_velocity_error_rad_s": 8.0,
     "minimum_swing_clearance_m": -0.03,
     "stance_height_tolerance_m": 0.05

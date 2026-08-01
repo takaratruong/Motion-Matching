@@ -97,6 +97,9 @@ class ContactOracleSearchTests(unittest.TestCase):
         loaded = load_contact_oracle_config(path)
         self.assertEqual(loaded.search.horizon_landings, 4)
         self.assertEqual(loaded.search.beam_width, 256)
+        self.assertEqual(
+            loaded.search.constraints.maximum_joint_position_error_rad, 2.5
+        )
         self.assertEqual(loaded.terrain_config.name, "torch_grail_layered_graph_hybrid.json")
 
         malformed = json.loads(path.read_text())
