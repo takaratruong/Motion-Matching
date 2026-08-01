@@ -63,15 +63,19 @@ def select_terrain_skill(
         raise ContractError("terrain validator must be callable")
     eligible = skill_entry_eligibility(database, inventory)
     rejected = 0
-    for row in torch.nonzero(eligible, as_tuple=False).flatten().cpu().tolist():
-        row = int(row)
-        skill_index = inventory.row_to_skill[row]
-        if not 0 <= skill_index < len(inventory.skills):
-            raise ContractError("terrain skill index is invalid")
-        skill = inventory.skills[skill_index]
-        if not bool(terrain_validator(skill, row)):
-            eligible[row] = False
-            rejected += 1
+    for skill in inventory.skills:
+        if not skill.entry_rows:
+            continue
+        # Terrain compatibility belongs to the coherent skill, not each of its
+        # many equivalent pre-entry feature rows.  Evaluate at the entry row
+        # closest to playback and gate every row atomically.
+        canonical_row = skill.entry_rows[-1]
+        if not bool(terrain_validator(skill, canonical_row)):
+            rows = torch.as_tensor(
+                skill.entry_rows, dtype=torch.long, device=database.device
+            )
+            eligible[rows] = False
+            rejected += len(skill.entry_rows)
     if not bool(eligible.any().item()):
         raise ContractError("no terrain-compatible skill entry exists")
 

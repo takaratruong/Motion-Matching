@@ -72,7 +72,7 @@ class TerrainSkillSearchTest(unittest.TestCase):
             and skill.skill_index == 1,
         )
 
-        self.assertEqual(visited, [(0, 2), (0, 3), (1, 7)])
+        self.assertEqual(visited, [(0, 3), (1, 7)])
         self.assertEqual(result.skill.skill_index, 1)
         self.assertEqual(result.selected_row, 7)
         self.assertEqual(result.rejected_by_reason, {"terrain": 2})
