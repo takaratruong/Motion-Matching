@@ -106,10 +106,44 @@ matcher.
 
 The recorded query stair is also not centered on matcher y=0: its sampled
 cross-section is approximately -0.24 to +0.62 m. The route generator mirrors
-commands around y=0, so the current left/right routes are not geometric mirrors
-of the actual obstacle. This does not invalidate the reported failures, but it
-does mean the next evaluator revision should center routes on the measured stair
-midline before using left/right deltas as an algorithm metric.
+commands around y=0, so these original left/right routes are not geometric
+mirrors of the actual obstacle. The follow-up below corrects that evaluator
+bias before interpreting left/right deltas.
+
+## Centered-evaluator follow-up
+
+The evaluator now measures the widest elevated lateral interval at 70% of the
+reference ascent and resets the character on that interval's midline. For this
+scene, the measured matcher-world reset is approximately
+`(-0.0533, +0.1667)` m. The reset is part of the deterministic configuration
+identity, and the same placement is used by Backspace in the interactive
+viewer.
+
+The centered 21-route matrix completed 14 routes, one more than the original
+matrix. Its SHA is
+`875e90850d4af7d890a111591621af91ba18dec3dd5096e35ec23489ff4741e6`.
+Most importantly, both former safe-candidate-exhaustion routes now complete:
+
+| Route | Original | Centered | Centered progress | Centered slide (m) |
+|---|---:|---:|---:|---:|
+| Cross-tread right-to-left | fail: candidate exhaustion | pass | 0.56 | 0.786 |
+| Side-mount right | fail: candidate exhaustion | pass | 0.29 / 0.46 | 0.632 |
+| Cross-tread left-to-right | pass | pass | 0.18 | 0.761 |
+| Side-mount left | pass | fail: continue-up progress | 0.41 / 0.08 | 0.524 |
+
+The centered pass set contains both cross-tread routes, all four diagonals,
+both 90-degree turns, both 180-degree turns, the lower-left 45-degree turn,
+the right side mount, reversal, and stop/restart. The seven remaining failures
+are all four fixed-duration side exits, the left side mount, the lower-right
+45-degree turn, and the mixed route's final-surface requirement. No centered
+route raised an exception or exhausted the safe candidate set.
+
+Centering therefore removes a real evaluator defect and exposes a more useful
+algorithm result: bidirectional cross-tread traversal is available, but true
+lateral travel remains too slow and inconsistent to clear either stair edge
+reliably. It also increases slide on several routes (for example, centered
+cross-tread slide is 0.761/0.786 m), so 14/21 is still a research checkpoint,
+not a production-quality omnidirectional matcher.
 
 ## Corpus coverage finding
 
