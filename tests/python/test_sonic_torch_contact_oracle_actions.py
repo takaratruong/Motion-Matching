@@ -133,6 +133,7 @@ class ContactOracleActionTests(unittest.TestCase):
             action.root_position_local[-1],
             torch.tensor((0.3, 0.0, 0.0), dtype=torch.float32),
         )
+        self.assertAlmostEqual(action.minimum_swing_clearance_m, -0.035)
 
     def test_dataset_index_reports_inventory_and_exact_source_successor(self):
         dataset, support, feet = _index_fixture()

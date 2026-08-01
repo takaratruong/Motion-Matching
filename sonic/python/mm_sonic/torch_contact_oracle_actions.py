@@ -12,6 +12,7 @@ import numpy as np
 import torch
 
 from .joints import ContractError
+from .torch_contact_segments import ANKLE_ORIGIN_SOLE_M
 
 
 def _owned_tensor(
@@ -188,7 +189,11 @@ def action_from_profiles(
         foot_surface_height_m[selection]
         - foot_surface_height_m[start_frame][None, :]
     )
-    source_clearance = foot_position_world[..., 2] - foot_surface_height_m
+    source_clearance = (
+        foot_position_world[..., 2]
+        - foot_surface_height_m
+        - float(ANKLE_ORIGIN_SOLE_M)
+    )
     swing_clearance = source_clearance[selection, swing_foot]
     return ContactPhaseAction(
         clip_index=clip_index,
