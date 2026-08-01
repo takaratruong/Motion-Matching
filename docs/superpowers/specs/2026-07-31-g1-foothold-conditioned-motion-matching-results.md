@@ -69,6 +69,39 @@ final forward segment because it left the finite authoritative height-grid
 domain. This distinguishes slow/limited lateral coverage from a matcher freeze,
 but its 2.25 m accumulated slide and 35 transitions are not production quality.
 
+## Complete 21-route matrix
+
+The exact committed matcher completed 13 of 21 routes. The matrix SHA is
+`0f8993cd3980d88fdb3d637919e177755ccf09a342b77c98dc61b49e5870fad3`.
+All routes were reset independently; no route result was reused from a targeted
+ablation.
+
+Passes:
+
+- cross-tread left-to-right;
+- diagonal up and down in both directions;
+- riser reversal and stop/restart;
+- upper-right side exit;
+- left side mount;
+- 45-degree lower-right, both 180-degree upper turns, and 90-degree
+  middle-left.
+
+Failures:
+
+| Route | Failure |
+|---|---|
+| Cross-tread right-to-left | Safe-candidate exhaustion at frame 308; terrain was not engaged |
+| Side-mount right | Safe-candidate exhaustion at frame 353; final surface was not elevated |
+| Side-exit lower left/right | Fixed command duration ended before both feet reached flat ground |
+| Side-exit upper left | Fixed command duration ended before both feet reached flat ground |
+| Mixed adversarial | All required segment progress thresholds passed, but the final surface remained elevated |
+| Turn 45 degrees lower left | Final heading exceeded the 0.35 rad tolerance |
+| Turn 90 degrees middle right | Final heading exceeded the 0.35 rad tolerance |
+
+The directional asymmetry and two candidate-exhaustion failures mean this is a
+feedback-ready research checkpoint, not a completed omnidirectional terrain
+matcher.
+
 ## Corpus coverage finding
 
 Contact-segment travel relative to source facing is strongly imbalanced:
