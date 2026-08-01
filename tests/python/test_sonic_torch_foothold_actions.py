@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from enum import Enum
 from types import SimpleNamespace
 import unittest
 
@@ -38,6 +39,35 @@ except ImportError:
         @classmethod
         def from_dataset(cls, *_args, **_kwargs):
             raise AssertionError("foothold action index is missing")
+
+try:
+    from mm_sonic.torch_foothold_actions import (
+        FootholdPlan,
+        first_contact_eligibility,
+        plan_footholds,
+    )
+except ImportError:
+    FootholdPlan = None
+
+    def first_contact_eligibility(*_args, **_kwargs):
+        raise AssertionError("first-contact filter is missing")
+
+    def plan_footholds(*_args, **_kwargs):
+        raise AssertionError("foothold planner is missing")
+
+try:
+    from mm_sonic.torch_foothold_actions import (
+        FootholdSelectionArm,
+        rank_foothold_actions,
+    )
+except ImportError:
+    class FootholdSelectionArm(Enum):
+        TWO_CONTACT = "two-contact"
+        HYBRID = "hybrid"
+        CONTINUOUS = "continuous-control"
+
+    def rank_foothold_actions(*_args, **_kwargs):
+        raise AssertionError("foothold ranking is missing")
 
 
 def _two_contact_profiles():
@@ -87,6 +117,46 @@ def _two_contact_profiles():
     )
     root_yaw = torch.full((6,), torch.pi / 2, dtype=torch.float32)
     return support, foot_xy, surface, root_xy, root_yaw
+
+
+def _action(*, height=(0.0, 0.0), feet=(1, 0), xy=None):
+    landing_xy = (
+        torch.tensor(((0.30, 0.10), (0.60, -0.10)))
+        if xy is None
+        else torch.tensor(xy, dtype=torch.float32)
+    )
+    return FootholdAction(
+        clip_index=0,
+        start_frame=0,
+        end_frame=21,
+        start_support=(True, True),
+        landing_feet=feet,
+        landing_frame_offsets=(10, 20),
+        landing_xy_start_frame_m=landing_xy,
+        landing_height_delta_m=torch.tensor(height),
+        root_displacement_m=torch.tensor(
+            ((0.25, 0.0), (0.50, 0.0))
+        ),
+        root_yaw_delta_rad=torch.zeros(2),
+        minimum_swing_clearance_m=0.04,
+        maximum_unsupported_frames=0,
+    )
+
+
+def _plan(*, height=(0.0, 0.0), feet=(1, 0), xy=None):
+    landing_xy = (
+        torch.tensor((((0.30, 0.10), (0.60, -0.10)),))
+        if xy is None
+        else torch.tensor((xy,), dtype=torch.float32)
+    )
+    return FootholdPlan(
+        landing_feet=torch.tensor((feet,), dtype=torch.int64),
+        landing_xy_world_m=landing_xy.clone(),
+        landing_xy_command_frame_m=landing_xy,
+        landing_height_delta_m=torch.tensor((height,)),
+        landing_frame_offsets=torch.tensor(((10, 20),), dtype=torch.int64),
+        score=torch.zeros(1),
+    )
 
 
 class FootholdActionTests(unittest.TestCase):
@@ -260,6 +330,124 @@ class FootholdActionTests(unittest.TestCase):
             index.actions[0].landing_height_delta_m,
             torch.tensor((0.18, 0.18)),
         )
+
+    def test_flat_approach_cannot_plan_raised_first_landing(self):
+        def step_surface(points):
+            return torch.where(
+                points[..., 0] >= 0.50,
+                torch.full_like(points[..., 0], 0.18),
+                torch.zeros_like(points[..., 0]),
+            )
+
+        plan = plan_footholds(
+            foot_xy_m=torch.tensor(((0.00, -0.10), (0.00, 0.10))),
+            support_mask=torch.tensor((True, True)),
+            command_xy=torch.tensor((1.00, 0.00)),
+            sample_surface=step_surface,
+            reachable_forward_m=(0.20, 0.40),
+            lateral_samples_m=(-0.10, 0.00, 0.10),
+            edge_margin_m=0.04,
+            beam_width=8,
+        )
+
+        self.assertGreater(plan.landing_height_delta_m.shape[0], 0)
+        self.assertTrue(
+            bool((plan.landing_height_delta_m[:, 0] == 0.0).all().item())
+        )
+
+    def test_first_contact_filter_is_hard_not_weighted(self):
+        def flat_surface(points):
+            return torch.zeros(points.shape[:-1], dtype=points.dtype)
+
+        plan = plan_footholds(
+            foot_xy_m=torch.tensor(((0.00, -0.10), (0.00, 0.10))),
+            support_mask=torch.tensor((True, True)),
+            command_xy=torch.tensor((1.00, 0.00)),
+            sample_surface=flat_surface,
+            reachable_forward_m=(0.30,),
+            lateral_samples_m=(0.00,),
+            edge_margin_m=0.04,
+            beam_width=8,
+        )
+
+        eligible = first_contact_eligibility(
+            plan=plan,
+            actions=(_action(height=(0.18, 0.18)), _action()),
+            height_tolerance_m=0.04,
+            xy_tolerance_m=0.20,
+            timing_tolerance_frames=8,
+        )
+
+        self.assertEqual(eligible.tolist(), [False, True])
+
+    def test_foothold_plan_rejects_an_edge_under_the_sole(self):
+        def narrow_surface(points):
+            return torch.where(
+                points[..., 0] < 0.30,
+                torch.zeros_like(points[..., 0]),
+                torch.full_like(points[..., 0], -0.20),
+            )
+
+        plan = plan_footholds(
+            foot_xy_m=torch.tensor(((0.00, -0.10), (0.00, 0.10))),
+            support_mask=torch.tensor((True, True)),
+            command_xy=torch.tensor((1.00, 0.00)),
+            sample_surface=narrow_surface,
+            reachable_forward_m=(0.30,),
+            lateral_samples_m=(0.10,),
+            edge_margin_m=0.04,
+            beam_width=8,
+        )
+
+        self.assertEqual(plan.landing_xy_world_m.shape, (0, 2, 2))
+
+    def test_two_contact_arm_rejects_wrong_second_tread(self):
+        ranking = rank_foothold_actions(
+            arm=FootholdSelectionArm.TWO_CONTACT,
+            plan=_plan(height=(0.18, 0.18)),
+            actions=(
+                _action(height=(0.18, 0.00)),
+                _action(height=(0.18, 0.18)),
+            ),
+            motion_cost=torch.tensor((0.0, 100.0)),
+            height_tolerance_m=0.04,
+            xy_tolerance_m=0.20,
+            timing_tolerance_frames=8,
+        )
+
+        self.assertEqual(ranking.eligible.tolist(), [False, True])
+        self.assertEqual(ranking.selected_action, 1)
+
+    def test_hybrid_breaks_feasible_tie_with_motion_cost(self):
+        ranking = rank_foothold_actions(
+            arm=FootholdSelectionArm.HYBRID,
+            plan=_plan(),
+            actions=(_action(), _action()),
+            motion_cost=torch.tensor((8.0, 1.0)),
+            height_tolerance_m=0.04,
+            xy_tolerance_m=0.20,
+            timing_tolerance_frames=8,
+        )
+
+        self.assertEqual(ranking.eligible.tolist(), [True, True])
+        self.assertEqual(ranking.selected_action, 1)
+
+    def test_continuous_control_can_prefer_wrong_contact_sequence(self):
+        ranking = rank_foothold_actions(
+            arm=FootholdSelectionArm.CONTINUOUS,
+            plan=_plan(height=(0.18, 0.18)),
+            actions=(
+                _action(height=(0.18, 0.00)),
+                _action(height=(0.18, 0.18)),
+            ),
+            motion_cost=torch.tensor((0.0, 100.0)),
+            height_tolerance_m=0.04,
+            xy_tolerance_m=0.20,
+            timing_tolerance_frames=8,
+        )
+
+        self.assertEqual(ranking.eligible.tolist(), [True, True])
+        self.assertEqual(ranking.selected_action, 0)
 
 
 if __name__ == "__main__":

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 import math
 from types import MappingProxyType
-from typing import Mapping
+from typing import Callable, Mapping, Sequence
 
 import torch
 
@@ -390,3 +391,456 @@ class FootholdActionIndex:
                 frames.detach().cpu().tolist(),
             )
         )
+
+
+@dataclass(frozen=True)
+class FootholdPlan:
+    """Deterministic beam of two alternating query-terrain landings."""
+
+    landing_feet: torch.Tensor
+    landing_xy_world_m: torch.Tensor
+    landing_xy_command_frame_m: torch.Tensor
+    landing_height_delta_m: torch.Tensor
+    landing_frame_offsets: torch.Tensor
+    score: torch.Tensor
+
+    def __post_init__(self) -> None:
+        tensors = (
+            (self.landing_feet, (None, 2), False),
+            (self.landing_xy_world_m, (None, 2, 2), True),
+            (self.landing_xy_command_frame_m, (None, 2, 2), True),
+            (self.landing_height_delta_m, (None, 2), True),
+            (self.landing_frame_offsets, (None, 2), False),
+            (self.score, (None,), True),
+        )
+        count = None
+        owned: list[torch.Tensor] = []
+        device = None
+        for value, shape, floating in tensors:
+            if not isinstance(value, torch.Tensor):
+                raise ContractError("foothold plan tensors are invalid")
+            if count is None:
+                count = value.shape[0] if value.ndim else -1
+                device = value.device
+            expected = (count, *shape[1:])
+            if (
+                tuple(value.shape) != expected
+                or value.device != device
+                or floating != value.dtype.is_floating_point
+                or (floating and not torch.isfinite(value).all())
+            ):
+                raise ContractError("foothold plan tensors are invalid")
+            owned.append(value.detach().clone())
+        assert count is not None
+        if (
+            self.landing_feet.dtype != torch.int64
+            or self.landing_frame_offsets.dtype != torch.int64
+            or (count and not bool(
+                ((self.landing_feet == 0) | (self.landing_feet == 1))
+                .all()
+                .item()
+            ))
+            or (count and not bool(
+                (self.landing_feet[:, 0] != self.landing_feet[:, 1])
+                .all()
+                .item()
+            ))
+        ):
+            raise ContractError("foothold plan contact identities are invalid")
+        for (name, _value), replacement in zip(
+            self.__dict__.items(), owned
+        ):
+            object.__setattr__(self, name, replacement)
+
+
+def _empty_plan(*, device: torch.device) -> FootholdPlan:
+    return FootholdPlan(
+        landing_feet=torch.empty((0, 2), dtype=torch.int64, device=device),
+        landing_xy_world_m=torch.empty(
+            (0, 2, 2), dtype=torch.float32, device=device
+        ),
+        landing_xy_command_frame_m=torch.empty(
+            (0, 2, 2), dtype=torch.float32, device=device
+        ),
+        landing_height_delta_m=torch.empty(
+            (0, 2), dtype=torch.float32, device=device
+        ),
+        landing_frame_offsets=torch.empty(
+            (0, 2), dtype=torch.int64, device=device
+        ),
+        score=torch.empty((0,), dtype=torch.float32, device=device),
+    )
+
+
+def _stable_surface_height(
+    point_xy: torch.Tensor,
+    sample_surface: Callable[[torch.Tensor], torch.Tensor],
+    edge_margin_m: float,
+) -> torch.Tensor | None:
+    offsets = torch.tensor(
+        (
+            (0.0, 0.0),
+            (edge_margin_m, 0.0),
+            (-edge_margin_m, 0.0),
+            (0.0, edge_margin_m),
+            (0.0, -edge_margin_m),
+        ),
+        dtype=point_xy.dtype,
+        device=point_xy.device,
+    )
+    values = sample_surface(point_xy[None, :] + offsets)
+    if (
+        not isinstance(values, torch.Tensor)
+        or tuple(values.shape) != (5,)
+        or values.device != point_xy.device
+        or values.dtype != point_xy.dtype
+        or not torch.isfinite(values).all()
+    ):
+        raise ContractError("foothold surface sampler returned invalid heights")
+    if float((values.max() - values.min()).item()) > 0.025:
+        return None
+    return values[0]
+
+
+def plan_footholds(
+    *,
+    foot_xy_m: torch.Tensor,
+    support_mask: torch.Tensor,
+    command_xy: torch.Tensor,
+    sample_surface: Callable[[torch.Tensor], torch.Tensor],
+    reachable_forward_m: Sequence[float],
+    lateral_samples_m: Sequence[float],
+    edge_margin_m: float,
+    beam_width: int = 8,
+) -> FootholdPlan:
+    """Enumerate stable two-step placements along the current command."""
+
+    if (
+        not isinstance(foot_xy_m, torch.Tensor)
+        or tuple(foot_xy_m.shape) != (2, 2)
+        or not foot_xy_m.dtype.is_floating_point
+        or not torch.isfinite(foot_xy_m).all()
+        or not isinstance(support_mask, torch.Tensor)
+        or tuple(support_mask.shape) != (2,)
+        or support_mask.dtype != torch.bool
+        or support_mask.device != foot_xy_m.device
+        or not isinstance(command_xy, torch.Tensor)
+        or tuple(command_xy.shape) != (2,)
+        or command_xy.dtype != foot_xy_m.dtype
+        or command_xy.device != foot_xy_m.device
+        or not torch.isfinite(command_xy).all()
+        or not callable(sample_surface)
+        or type(beam_width) is not int
+        or beam_width < 1
+        or isinstance(edge_margin_m, bool)
+        or not isinstance(edge_margin_m, (int, float))
+        or not math.isfinite(float(edge_margin_m))
+        or float(edge_margin_m) <= 0.0
+    ):
+        raise ContractError("foothold planning inputs are invalid")
+    forward_samples = tuple(float(value) for value in reachable_forward_m)
+    lateral_samples = tuple(float(value) for value in lateral_samples_m)
+    if (
+        not forward_samples
+        or not lateral_samples
+        or any(not math.isfinite(value) or value <= 0.0 for value in forward_samples)
+        or any(not math.isfinite(value) for value in lateral_samples)
+    ):
+        raise ContractError("foothold reach samples are invalid")
+    speed = torch.linalg.vector_norm(command_xy)
+    if float(speed.item()) <= 1e-6 or not bool(support_mask.any().item()):
+        return _empty_plan(device=foot_xy_m.device)
+    forward = command_xy / speed
+    right = torch.stack((forward[1], -forward[0]))
+    anchor = foot_xy_m.mean(dim=0)
+    base_surface = sample_surface(foot_xy_m)
+    if (
+        not isinstance(base_surface, torch.Tensor)
+        or tuple(base_surface.shape) != (2,)
+        or base_surface.device != foot_xy_m.device
+        or base_surface.dtype != foot_xy_m.dtype
+        or not torch.isfinite(base_surface).all()
+    ):
+        raise ContractError("foothold current surface heights are invalid")
+    moving_feet = (
+        tuple(range(2))
+        if bool(support_mask.all().item())
+        else (int(torch.nonzero(~support_mask, as_tuple=False)[0].item()),)
+    )
+    candidates: list[tuple] = []
+    command_yaw = torch.atan2(forward[1], forward[0])
+    for moving in moving_feet:
+        other = 1 - moving
+        for distance in sorted(set(forward_samples)):
+            for lateral in sorted(set(lateral_samples)):
+                first_xy = (
+                    foot_xy_m[moving]
+                    + forward * distance
+                    + right * lateral
+                )
+                first_height = _stable_surface_height(
+                    first_xy, sample_surface, float(edge_margin_m)
+                )
+                if first_height is None:
+                    continue
+                second_xy = (
+                    foot_xy_m[other]
+                    + forward * (2.0 * distance)
+                    + right * lateral
+                )
+                second_height = _stable_surface_height(
+                    second_xy, sample_surface, float(edge_margin_m)
+                )
+                if second_height is None:
+                    continue
+                world = torch.stack((first_xy, second_xy))
+                local = _world_to_local(world - anchor, command_yaw)
+                heights = torch.stack(
+                    (
+                        first_height - base_surface[moving],
+                        second_height - base_surface[other],
+                    )
+                )
+                times = torch.tensor(
+                    (
+                        max(1, round(distance / float(speed.item()) * 50.0)),
+                        max(2, round(2.0 * distance / float(speed.item()) * 50.0)),
+                    ),
+                    dtype=torch.int64,
+                    device=foot_xy_m.device,
+                )
+                score = -3.0 * distance + abs(lateral)
+                candidates.append(
+                    (
+                        score,
+                        moving,
+                        distance,
+                        lateral,
+                        torch.tensor((moving, other), device=foot_xy_m.device),
+                        world,
+                        local,
+                        heights,
+                        times,
+                    )
+                )
+    candidates.sort(key=lambda item: item[:4])
+    retained = candidates[:beam_width]
+    if not retained:
+        return _empty_plan(device=foot_xy_m.device)
+    return FootholdPlan(
+        landing_feet=torch.stack([item[4] for item in retained]).to(torch.int64),
+        landing_xy_world_m=torch.stack([item[5] for item in retained]),
+        landing_xy_command_frame_m=torch.stack([item[6] for item in retained]),
+        landing_height_delta_m=torch.stack([item[7] for item in retained]),
+        landing_frame_offsets=torch.stack([item[8] for item in retained]),
+        score=torch.tensor(
+            [item[0] for item in retained],
+            dtype=foot_xy_m.dtype,
+            device=foot_xy_m.device,
+        ),
+    )
+
+
+def first_contact_eligibility(
+    *,
+    plan: FootholdPlan,
+    actions: Sequence[FootholdAction],
+    height_tolerance_m: float,
+    xy_tolerance_m: float,
+    timing_tolerance_frames: int,
+) -> torch.Tensor:
+    """Hard-gate actions against at least one planned first landing."""
+
+    if not isinstance(plan, FootholdPlan):
+        raise ContractError("first-contact filter requires a foothold plan")
+    tolerances = (height_tolerance_m, xy_tolerance_m)
+    if (
+        any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+            for value in tolerances
+        )
+        or type(timing_tolerance_frames) is not int
+        or timing_tolerance_frames < 0
+        or any(not isinstance(action, FootholdAction) for action in actions)
+    ):
+        raise ContractError("first-contact filter inputs are invalid")
+    output = torch.zeros(
+        len(actions), dtype=torch.bool, device=plan.score.device
+    )
+    for action_index, action in enumerate(actions):
+        if action.landing_height_delta_m.device != plan.score.device:
+            raise ContractError("first-contact action device is invalid")
+        feet = plan.landing_feet[:, 0] == action.landing_feet[0]
+        height = (
+            plan.landing_height_delta_m[:, 0]
+            - action.landing_height_delta_m[0]
+        ).abs() <= float(height_tolerance_m)
+        xy = torch.linalg.vector_norm(
+            plan.landing_xy_command_frame_m[:, 0]
+            - action.landing_xy_start_frame_m[0],
+            dim=-1,
+        ) <= float(xy_tolerance_m)
+        timing = (
+            plan.landing_frame_offsets[:, 0]
+            - action.landing_frame_offsets[0]
+        ).abs() <= timing_tolerance_frames
+        output[action_index] = bool((feet & height & xy & timing).any().item())
+    return output
+
+
+class FootholdSelectionArm(Enum):
+    FIRST_CONTACT = "first-contact"
+    TWO_CONTACT = "two-contact"
+    HYBRID = "hybrid"
+    CONTINUOUS = "continuous-control"
+
+
+@dataclass(frozen=True)
+class FootholdRanking:
+    eligible: torch.Tensor
+    additional_cost: torch.Tensor
+    selected_action: int | None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.eligible, torch.Tensor)
+            or self.eligible.ndim != 1
+            or self.eligible.dtype != torch.bool
+            or not isinstance(self.additional_cost, torch.Tensor)
+            or self.additional_cost.shape != self.eligible.shape
+            or not self.additional_cost.dtype.is_floating_point
+            or self.additional_cost.device != self.eligible.device
+            or not torch.isfinite(self.additional_cost).all()
+        ):
+            raise ContractError("foothold ranking tensors are invalid")
+        selected = self.selected_action
+        if selected is not None and (
+            type(selected) is not int
+            or not 0 <= selected < self.eligible.shape[0]
+            or not bool(self.eligible[selected].item())
+        ):
+            raise ContractError("foothold ranking selection is invalid")
+        object.__setattr__(self, "eligible", self.eligible.detach().clone())
+        object.__setattr__(
+            self, "additional_cost", self.additional_cost.detach().clone()
+        )
+
+
+def rank_foothold_actions(
+    *,
+    arm: FootholdSelectionArm,
+    plan: FootholdPlan,
+    actions: Sequence[FootholdAction],
+    motion_cost: torch.Tensor,
+    height_tolerance_m: float,
+    xy_tolerance_m: float,
+    timing_tolerance_frames: int,
+) -> FootholdRanking:
+    """Compare hard first/two-contact gates with a continuous control arm."""
+
+    if (
+        not isinstance(arm, FootholdSelectionArm)
+        or not isinstance(plan, FootholdPlan)
+        or not isinstance(motion_cost, torch.Tensor)
+        or tuple(motion_cost.shape) != (len(actions),)
+        or not motion_cost.dtype.is_floating_point
+        or motion_cost.device != plan.score.device
+        or not torch.isfinite(motion_cost).all()
+        or any(not isinstance(action, FootholdAction) for action in actions)
+    ):
+        raise ContractError("foothold ranking inputs are invalid")
+    tolerances = (height_tolerance_m, xy_tolerance_m)
+    if (
+        any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) <= 0.0
+            for value in tolerances
+        )
+        or type(timing_tolerance_frames) is not int
+        or timing_tolerance_frames < 0
+    ):
+        raise ContractError("foothold ranking tolerances are invalid")
+    count = len(actions)
+    eligible = torch.zeros(count, dtype=torch.bool, device=motion_cost.device)
+    descriptor_cost = torch.zeros_like(motion_cost)
+    if plan.score.shape[0] == 0:
+        return FootholdRanking(eligible, descriptor_cost, None)
+
+    for action_index, action in enumerate(actions):
+        tensors = (
+            action.landing_xy_start_frame_m,
+            action.landing_height_delta_m,
+        )
+        if any(value.device != motion_cost.device for value in tensors):
+            raise ContractError("foothold ranking action device is invalid")
+        action_feet = torch.tensor(
+            action.landing_feet,
+            dtype=torch.int64,
+            device=motion_cost.device,
+        )
+        feet = plan.landing_feet == action_feet[None, :]
+        height_error = torch.abs(
+            plan.landing_height_delta_m
+            - action.landing_height_delta_m[None, :]
+        )
+        xy_error = torch.linalg.vector_norm(
+            plan.landing_xy_command_frame_m
+            - action.landing_xy_start_frame_m[None, :, :],
+            dim=-1,
+        )
+        action_timing = torch.tensor(
+            action.landing_frame_offsets,
+            dtype=torch.int64,
+            device=motion_cost.device,
+        )
+        timing_error = torch.abs(
+            plan.landing_frame_offsets - action_timing[None, :]
+        )
+        first_valid = (
+            feet[:, 0]
+            & (height_error[:, 0] <= float(height_tolerance_m))
+            & (xy_error[:, 0] <= float(xy_tolerance_m))
+            & (timing_error[:, 0] <= timing_tolerance_frames)
+        )
+        both_valid = (
+            feet.all(dim=1)
+            & (height_error <= float(height_tolerance_m)).all(dim=1)
+            & (xy_error <= float(xy_tolerance_m)).all(dim=1)
+            & (timing_error <= timing_tolerance_frames).all(dim=1)
+        )
+        normalized = (
+            torch.square(height_error / float(height_tolerance_m)).sum(dim=1)
+            + torch.square(xy_error / float(xy_tolerance_m)).sum(dim=1)
+            + torch.square(
+                timing_error.to(motion_cost.dtype)
+                / float(max(1, timing_tolerance_frames))
+            ).sum(dim=1)
+            + (~feet).to(motion_cost.dtype).sum(dim=1) * 100.0
+            + plan.score
+        )
+        descriptor_cost[action_index] = normalized.min()
+        if arm is FootholdSelectionArm.FIRST_CONTACT:
+            eligible[action_index] = bool(first_valid.any().item())
+        elif arm in (
+            FootholdSelectionArm.TWO_CONTACT,
+            FootholdSelectionArm.HYBRID,
+        ):
+            eligible[action_index] = bool(both_valid.any().item())
+        else:
+            eligible[action_index] = True
+
+    total = motion_cost + descriptor_cost
+    selected = None
+    if bool(eligible.any().item()):
+        masked = torch.where(
+            eligible,
+            total,
+            torch.full_like(total, torch.inf),
+        )
+        selected = int(torch.argmin(masked).item())
+    return FootholdRanking(eligible, descriptor_cost, selected)
