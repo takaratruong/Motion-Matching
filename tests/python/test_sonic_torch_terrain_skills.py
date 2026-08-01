@@ -1,0 +1,71 @@
+import unittest
+
+import torch
+
+from mm_sonic.joints import ContractError
+from mm_sonic.torch_terrain_skills import SkillInterval, extract_skill_intervals
+
+
+class TerrainSkillIntervalTest(unittest.TestCase):
+    def test_extracts_complete_episode_with_pre_skill_entry(self):
+        support = torch.ones((30, 2), dtype=torch.bool)
+        heights = torch.zeros((30, 2), dtype=torch.float32)
+        heights[10:22] = 0.18
+
+        self.assertEqual(
+            extract_skill_intervals(
+                support,
+                heights,
+                valid_frame_stop=25,
+                entry_window_frames=5,
+                minimum_surface_change_m=0.08,
+            ),
+            (SkillInterval(entry_start=4, playback_start=9, playback_stop=23),),
+        )
+
+    def test_never_uses_flight_as_a_skill_boundary(self):
+        support = torch.ones((30, 2), dtype=torch.bool)
+        support[8:12, 1] = False
+        heights = torch.zeros((30, 2), dtype=torch.float32)
+        heights[12:22] = 0.18
+
+        interval = extract_skill_intervals(
+            support,
+            heights,
+            valid_frame_stop=25,
+            entry_window_frames=5,
+            minimum_surface_change_m=0.08,
+        )[0]
+
+        self.assertTrue(bool(support[interval.playback_start].all()))
+        self.assertTrue(bool(support[interval.playback_stop - 1].all()))
+        self.assertEqual(interval.playback_start, 7)
+
+    def test_merges_height_events_without_a_stable_gap(self):
+        support = torch.ones((40, 2), dtype=torch.bool)
+        heights = torch.zeros((40, 2), dtype=torch.float32)
+        heights[10:14] = 0.12
+        heights[18:22] = 0.16
+
+        intervals = extract_skill_intervals(
+            support,
+            heights,
+            valid_frame_stop=35,
+            entry_window_frames=4,
+            minimum_surface_change_m=0.08,
+            stable_gap_frames=6,
+        )
+
+        self.assertEqual(intervals, (SkillInterval(5, 9, 23),))
+
+    def test_rejects_mismatched_profiles(self):
+        with self.assertRaisesRegex(ContractError, "matching shape"):
+            extract_skill_intervals(
+                torch.ones((10, 2), dtype=torch.bool),
+                torch.zeros((9, 2), dtype=torch.float32),
+                valid_frame_stop=8,
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
