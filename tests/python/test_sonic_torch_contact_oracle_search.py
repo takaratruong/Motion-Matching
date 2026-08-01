@@ -1,14 +1,22 @@
 import math
 import unittest
 from dataclasses import replace
+import json
+from pathlib import Path
+import tempfile
 
 import torch
 
 from mm_sonic.torch_contact_oracle_actions import ContactPhaseAction
 from mm_sonic.torch_contact_oracle_search import (
     OracleConstraints,
+    OracleSearchConfig,
+    OracleSearchFailure,
     OracleState,
+    constant_command_schedule,
+    load_contact_oracle_config,
     place_action,
+    search_contact_plan,
     validate_placement,
 )
 
@@ -61,7 +69,44 @@ def _state(*, yaw: float = 0.0) -> OracleState:
     )
 
 
+def _graph_action(index: int, entry: float, terminal: float, dx: float):
+    action = _one_meter_forward_action()
+    joints = action.joint_position.clone()
+    joints[0] = entry
+    joints[-1] = terminal
+    root = action.root_position_local.clone()
+    root[-1, 0] = dx
+    feet = action.foot_position_local.clone()
+    feet[-1, 1, 0] = dx
+    return replace(
+        action,
+        clip_index=index,
+        start_frame=10 * index,
+        end_frame=10 * index + 2,
+        entry_support=torch.tensor((True, True)),
+        support_mask=torch.tensor(((True, True), (True, True))),
+        root_position_local=root,
+        foot_position_local=feet,
+        joint_position=joints,
+    )
+
+
 class ContactOracleSearchTests(unittest.TestCase):
+    def test_loads_frozen_oracle_config_and_rejects_extra_keys(self):
+        path = Path("sonic/configs/experiments/torch_grail_contact_oracle.json")
+        loaded = load_contact_oracle_config(path)
+        self.assertEqual(loaded.search.horizon_landings, 4)
+        self.assertEqual(loaded.search.beam_width, 256)
+        self.assertEqual(loaded.terrain_config.name, "torch_grail_layered_graph_hybrid.json")
+
+        malformed = json.loads(path.read_text())
+        malformed["unexpected"] = True
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "bad.json"
+            target.write_text(json.dumps(malformed))
+            with self.assertRaisesRegex(Exception, "keys"):
+                load_contact_oracle_config(target)
+
     def test_rigid_placement_rotates_source_trajectory_about_entry_root(self):
         placed = place_action(_one_meter_forward_action(), _state(yaw=math.pi / 2.0))
 
@@ -233,6 +278,154 @@ class ContactOracleSearchTests(unittest.TestCase):
             ).reason,
             "joint-velocity",
         )
+
+    def test_four_contact_search_rejects_cheapest_greedy_dead_end(self):
+        actions = (
+            _graph_action(0, entry=0.0, terminal=10.0, dx=0.006),
+            _graph_action(1, entry=0.0, terminal=1.0, dx=0.010),
+            _graph_action(2, entry=1.0, terminal=2.0, dx=0.010),
+            _graph_action(3, entry=2.0, terminal=3.0, dx=0.010),
+        )
+
+        def flat_surface(points):
+            return torch.zeros(points.shape[:-1], dtype=points.dtype, device=points.device)
+
+        constraints = OracleConstraints(
+            maximum_entry_foot_error_m=10.0,
+            maximum_joint_position_error_rad=0.2,
+            maximum_joint_velocity_error_rad_s=0.2,
+        )
+        plan = search_contact_plan(
+            initial_state=_state(),
+            actions=actions,
+            command_schedule=constant_command_schedule(
+                velocity_world_xy=(0.3, 0.0),
+                heading_world_yaw=0.0,
+                frames=100,
+                device=torch.device("cpu"),
+            ),
+            sample_surface=flat_surface,
+            config=OracleSearchConfig(
+                horizon_landings=3,
+                beam_width=8,
+                constraints=constraints,
+            ),
+        )
+
+        self.assertEqual(plan.action_indices, (1, 2, 3))
+        self.assertGreater(plan.expansion.rejected_by_reason["no-successor"], 0)
+
+    def test_search_shortens_horizon_but_never_invents_a_fallback(self):
+        action = _graph_action(0, entry=0.0, terminal=10.0, dx=0.006)
+
+        def flat_surface(points):
+            return torch.zeros(points.shape[:-1], dtype=points.dtype, device=points.device)
+
+        config = OracleSearchConfig(
+            horizon_landings=3,
+            beam_width=4,
+            constraints=OracleConstraints(
+                maximum_entry_foot_error_m=10.0,
+                maximum_joint_position_error_rad=0.2,
+                maximum_joint_velocity_error_rad_s=0.2,
+            ),
+        )
+        schedule = constant_command_schedule(
+            velocity_world_xy=(0.3, 0.0),
+            heading_world_yaw=0.0,
+            frames=20,
+            device="cpu",
+        )
+
+        plan = search_contact_plan(
+            initial_state=_state(),
+            actions=(action,),
+            command_schedule=schedule,
+            sample_surface=flat_surface,
+            config=config,
+        )
+        self.assertEqual(plan.horizon_landings, 1)
+        self.assertEqual(plan.action_indices, (0,))
+
+        incompatible = replace(
+            action,
+            entry_support=torch.tensor((False, True)),
+            support_mask=torch.tensor(((False, True), (True, True))),
+        )
+        with self.assertRaises(OracleSearchFailure) as caught:
+            search_contact_plan(
+                initial_state=_state(),
+                actions=(incompatible,),
+                command_schedule=schedule,
+                sample_surface=flat_surface,
+                config=config,
+            )
+        self.assertGreater(caught.exception.rejected_by_reason["support-order"], 0)
+
+    def test_facing_command_is_independent_of_travel_velocity(self):
+        straight = _graph_action(0, entry=0.0, terminal=0.0, dx=0.006)
+        turning_yaw = straight.root_yaw_local.clone()
+        turning_yaw[-1] = math.pi / 2.0
+        turning = replace(
+            straight,
+            clip_index=1,
+            start_frame=20,
+            end_frame=22,
+            root_yaw_local=turning_yaw,
+        )
+
+        def flat_surface(points):
+            return torch.zeros(points.shape[:-1], dtype=points.dtype, device=points.device)
+
+        plan = search_contact_plan(
+            initial_state=_state(),
+            actions=(straight, turning),
+            command_schedule=constant_command_schedule(
+                velocity_world_xy=(0.3, 0.0),
+                heading_world_yaw=math.pi / 2.0,
+                frames=20,
+                device="cpu",
+            ),
+            sample_surface=flat_surface,
+            config=OracleSearchConfig(
+                horizon_landings=1,
+                constraints=OracleConstraints(maximum_entry_foot_error_m=10.0),
+            ),
+        )
+        self.assertEqual(plan.action_indices, (1,))
+
+    def test_planned_foothold_xy_breaks_equal_root_motion_tie(self):
+        bad = _graph_action(0, entry=0.0, terminal=0.0, dx=0.006)
+        bad_feet = bad.foot_position_local.clone()
+        bad_feet[-1, bad.swing_foot, 0] = 0.60
+        bad = replace(bad, foot_position_local=bad_feet)
+        good = _graph_action(1, entry=0.0, terminal=0.0, dx=0.006)
+        good_feet = good.foot_position_local.clone()
+        good_feet[-1, good.swing_foot, 0] = 0.20
+        good = replace(good, foot_position_local=good_feet)
+
+        def flat_surface(points):
+            return torch.zeros(points.shape[:-1], dtype=points.dtype, device=points.device)
+
+        plan = search_contact_plan(
+            initial_state=_state(),
+            actions=(bad, good),
+            command_schedule=constant_command_schedule(
+                velocity_world_xy=(0.3, 0.0),
+                heading_world_yaw=0.0,
+                frames=20,
+                device="cpu",
+            ),
+            sample_surface=flat_surface,
+            config=OracleSearchConfig(
+                horizon_landings=1,
+                constraints=OracleConstraints(maximum_entry_foot_error_m=10.0),
+            ),
+        )
+
+        self.assertEqual(plan.action_indices, (1,))
+        self.assertAlmostEqual(plan.step_costs[0].foothold, 0.0)
+        self.assertGreater(plan.step_costs[0].timing, 0.0)
 
 
 if __name__ == "__main__":

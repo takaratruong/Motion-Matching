@@ -1,0 +1,32 @@
+{
+  "constraints": {
+    "edge_margin_m": 0.04,
+    "landing_height_tolerance_m": 0.03,
+    "maximum_edge_height_range_m": 0.025,
+    "maximum_entry_foot_error_m": 0.08,
+    "maximum_height_deformation_m": 0.06,
+    "maximum_joint_position_error_rad": 1.5,
+    "maximum_joint_velocity_error_rad_s": 8.0,
+    "minimum_swing_clearance_m": -0.03,
+    "stance_height_tolerance_m": 0.05
+  },
+  "schema": "g1-contact-space-oracle/v1",
+  "search": {
+    "beam_width": 256,
+    "foothold_beam_width": 50,
+    "horizon_landings": 4
+  },
+  "terrain_config": "sonic/configs/experiments/torch_grail_layered_graph_hybrid.json",
+  "weights": {
+    "clearance_margin_weight": 1.0,
+    "facing_weight": 10.0,
+    "foothold_weight": 50.0,
+    "joint_position_weight": 0.5,
+    "joint_velocity_weight": 0.05,
+    "path_weight": 25.0,
+    "reachability_weight": 10.0,
+    "repetition_weight": 2.0,
+    "stance_motion_weight": 100.0,
+    "timing_weight": 0.1
+  }
+}

@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
+import json
 import math
+from pathlib import Path
+from types import MappingProxyType
 from typing import Callable
+from typing import Mapping, Sequence
 
 import torch
 
 from .joints import ContractError
 from .torch_contact_oracle_actions import ContactPhaseAction
 from .torch_contact_segments import ANKLE_ORIGIN_SOLE_M
+from .torch_foothold_actions import FootholdPlan, plan_footholds
 
 
 def _owned(
@@ -358,3 +364,692 @@ def validate_placement(
         landing=landing_error,
         swing=minimum_swing,
     )
+
+
+@dataclass(frozen=True)
+class CommandSchedule:
+    velocity_world_xy: torch.Tensor
+    heading_world_yaw: torch.Tensor
+    dt: float = 0.02
+
+    def __post_init__(self) -> None:
+        velocity = self.velocity_world_xy
+        heading = self.heading_world_yaw
+        if (
+            not isinstance(velocity, torch.Tensor)
+            or velocity.ndim != 2
+            or velocity.shape[1] != 2
+            or not velocity.dtype.is_floating_point
+            or not torch.isfinite(velocity).all()
+            or not isinstance(heading, torch.Tensor)
+            or heading.shape != velocity.shape[:1]
+            or heading.dtype != velocity.dtype
+            or heading.device != velocity.device
+            or not torch.isfinite(heading).all()
+            or velocity.shape[0] < 1
+            or isinstance(self.dt, bool)
+            or not isinstance(self.dt, (int, float))
+            or not math.isfinite(float(self.dt))
+            or float(self.dt) <= 0.0
+        ):
+            raise ContractError("contact oracle command schedule is invalid")
+        object.__setattr__(self, "velocity_world_xy", velocity.detach().clone())
+        object.__setattr__(self, "heading_world_yaw", heading.detach().clone())
+        object.__setattr__(self, "dt", float(self.dt))
+
+    @property
+    def frame_count(self) -> int:
+        return int(self.heading_world_yaw.shape[0])
+
+    def displacement(self, start_frame: int, steps: int) -> torch.Tensor:
+        if type(start_frame) is not int or start_frame < 0 or type(steps) is not int or steps < 0:
+            raise ContractError("contact oracle command interval is invalid")
+        if steps == 0:
+            return torch.zeros(
+                2,
+                dtype=self.velocity_world_xy.dtype,
+                device=self.velocity_world_xy.device,
+            )
+        indices = torch.arange(
+            start_frame,
+            start_frame + steps,
+            dtype=torch.int64,
+            device=self.velocity_world_xy.device,
+        ).clamp(max=self.frame_count - 1)
+        return self.velocity_world_xy[indices].sum(dim=0) * self.dt
+
+    def heading(self, frame: int) -> torch.Tensor:
+        if type(frame) is not int or frame < 0:
+            raise ContractError("contact oracle command frame is invalid")
+        return self.heading_world_yaw[min(frame, self.frame_count - 1)]
+
+    def velocity(self, frame: int) -> torch.Tensor:
+        if type(frame) is not int or frame < 0:
+            raise ContractError("contact oracle command frame is invalid")
+        return self.velocity_world_xy[min(frame, self.frame_count - 1)]
+
+
+def constant_command_schedule(
+    *,
+    velocity_world_xy: tuple[float, float],
+    heading_world_yaw: float,
+    frames: int,
+    device: torch.device | str,
+) -> CommandSchedule:
+    try:
+        resolved = torch.device(device)
+        velocity = torch.tensor(
+            velocity_world_xy, dtype=torch.float32, device=resolved
+        )
+        heading = float(heading_world_yaw)
+    except (TypeError, ValueError, RuntimeError) as error:
+        raise ContractError("contact oracle constant command is invalid") from error
+    if (
+        tuple(velocity.shape) != (2,)
+        or not torch.isfinite(velocity).all()
+        or not math.isfinite(heading)
+        or type(frames) is not int
+        or frames < 1
+    ):
+        raise ContractError("contact oracle constant command is invalid")
+    return CommandSchedule(
+        velocity_world_xy=velocity[None, :].repeat(frames, 1),
+        heading_world_yaw=torch.full(
+            (frames,), heading, dtype=torch.float32, device=resolved
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class OracleCost:
+    path: float = 0.0
+    facing: float = 0.0
+    foothold: float = 0.0
+    timing: float = 0.0
+    joint_position: float = 0.0
+    joint_velocity: float = 0.0
+    stance_motion: float = 0.0
+    clearance_margin: float = 0.0
+    reachability: float = 0.0
+    repetition: float = 0.0
+
+    def __post_init__(self) -> None:
+        if any(
+            not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+            for value in self.components()
+        ):
+            raise ContractError("contact oracle cost is invalid")
+
+    def components(self) -> tuple[float, ...]:
+        return (
+            float(self.path),
+            float(self.facing),
+            float(self.foothold),
+            float(self.timing),
+            float(self.joint_position),
+            float(self.joint_velocity),
+            float(self.stance_motion),
+            float(self.clearance_margin),
+            float(self.reachability),
+            float(self.repetition),
+        )
+
+    @property
+    def total(self) -> float:
+        return sum(self.components())
+
+    def __add__(self, other: object) -> "OracleCost":
+        if not isinstance(other, OracleCost):
+            return NotImplemented
+        return OracleCost(
+            *(left + right for left, right in zip(self.components(), other.components()))
+        )
+
+
+@dataclass(frozen=True)
+class OracleSearchConfig:
+    horizon_landings: int = 4
+    beam_width: int = 256
+    foothold_beam_width: int = 50
+    constraints: OracleConstraints = OracleConstraints()
+    path_weight: float = 25.0
+    facing_weight: float = 10.0
+    foothold_weight: float = 50.0
+    timing_weight: float = 0.10
+    joint_position_weight: float = 0.50
+    joint_velocity_weight: float = 0.05
+    stance_motion_weight: float = 100.0
+    clearance_margin_weight: float = 1.0
+    reachability_weight: float = 10.0
+    repetition_weight: float = 2.0
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.horizon_landings) is not int
+            or self.horizon_landings < 1
+            or type(self.beam_width) is not int
+            or self.beam_width < 1
+            or type(self.foothold_beam_width) is not int
+            or self.foothold_beam_width < 1
+            or not isinstance(self.constraints, OracleConstraints)
+        ):
+            raise ContractError("contact oracle search dimensions are invalid")
+        weights = (
+            self.path_weight,
+            self.facing_weight,
+            self.foothold_weight,
+            self.timing_weight,
+            self.joint_position_weight,
+            self.joint_velocity_weight,
+            self.stance_motion_weight,
+            self.clearance_margin_weight,
+            self.reachability_weight,
+            self.repetition_weight,
+        )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+            for value in weights
+        ):
+            raise ContractError("contact oracle search weights are invalid")
+
+
+@dataclass(frozen=True)
+class ContactOracleExperimentConfig:
+    terrain_config: Path
+    search: OracleSearchConfig
+
+    def __post_init__(self) -> None:
+        path = Path(self.terrain_config).resolve()
+        if not path.is_file() or not isinstance(self.search, OracleSearchConfig):
+            raise ContractError("contact oracle experiment config is invalid")
+        object.__setattr__(self, "terrain_config", path)
+
+
+def load_contact_oracle_config(
+    path: str | Path,
+) -> ContactOracleExperimentConfig:
+    """Load the strict frozen contact-oracle experiment schema."""
+
+    target = Path(path).resolve()
+    try:
+        raw = json.loads(target.read_text())
+    except Exception as error:
+        raise ContractError(f"cannot load contact oracle config: {target}") from error
+    if not isinstance(raw, dict) or set(raw) != {
+        "schema",
+        "terrain_config",
+        "search",
+        "constraints",
+        "weights",
+    }:
+        raise ContractError("contact oracle config keys are invalid")
+    if raw["schema"] != "g1-contact-space-oracle/v1":
+        raise ContractError("contact oracle config schema is invalid")
+    search = raw["search"]
+    constraints = raw["constraints"]
+    weights = raw["weights"]
+    search_keys = {"horizon_landings", "beam_width", "foothold_beam_width"}
+    constraint_keys = set(OracleConstraints.__dataclass_fields__)
+    weight_keys = {
+        "path_weight",
+        "facing_weight",
+        "foothold_weight",
+        "timing_weight",
+        "joint_position_weight",
+        "joint_velocity_weight",
+        "stance_motion_weight",
+        "clearance_margin_weight",
+        "reachability_weight",
+        "repetition_weight",
+    }
+    if (
+        not isinstance(search, dict)
+        or set(search) != search_keys
+        or not isinstance(constraints, dict)
+        or set(constraints) != constraint_keys
+        or not isinstance(weights, dict)
+        or set(weights) != weight_keys
+    ):
+        raise ContractError("contact oracle nested config keys are invalid")
+    terrain_value = raw["terrain_config"]
+    if not isinstance(terrain_value, str) or not terrain_value:
+        raise ContractError("contact oracle terrain config path is invalid")
+    terrain_path = Path(terrain_value)
+    if not terrain_path.is_absolute():
+        try:
+            repository_root = target.parents[3]
+        except IndexError as error:
+            raise ContractError("contact oracle config location is invalid") from error
+        terrain_path = repository_root / terrain_path
+    try:
+        resolved_constraints = OracleConstraints(**constraints)
+        resolved_search = OracleSearchConfig(
+            constraints=resolved_constraints,
+            **search,
+            **weights,
+        )
+    except TypeError as error:
+        raise ContractError("contact oracle config values are invalid") from error
+    return ContactOracleExperimentConfig(
+        terrain_config=terrain_path,
+        search=resolved_search,
+    )
+
+
+@dataclass(frozen=True)
+class OracleExpansionDiagnostics:
+    expanded_candidate_count: int
+    rejected_by_reason: Mapping[str, int]
+    beam_sizes: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        rejected = dict(self.rejected_by_reason)
+        if (
+            type(self.expanded_candidate_count) is not int
+            or self.expanded_candidate_count < 0
+            or not isinstance(self.beam_sizes, tuple)
+            or any(type(value) is not int or value < 0 for value in self.beam_sizes)
+            or any(
+                not isinstance(reason, str)
+                or not reason
+                or type(count) is not int
+                or count < 1
+                for reason, count in rejected.items()
+            )
+        ):
+            raise ContractError("contact oracle expansion diagnostics are invalid")
+        object.__setattr__(self, "rejected_by_reason", MappingProxyType(rejected))
+
+
+@dataclass(frozen=True)
+class OraclePlan:
+    action_indices: tuple[int, ...]
+    placements: tuple[PlacedContactPhase, ...]
+    step_costs: tuple[OracleCost, ...]
+    total_cost: OracleCost
+    horizon_landings: int
+    expansion: OracleExpansionDiagnostics
+
+    def __post_init__(self) -> None:
+        count = len(self.action_indices)
+        if (
+            not isinstance(self.action_indices, tuple)
+            or any(type(value) is not int or value < 0 for value in self.action_indices)
+            or len(self.placements) != count
+            or len(self.step_costs) != count
+            or any(not isinstance(value, PlacedContactPhase) for value in self.placements)
+            or any(not isinstance(value, OracleCost) for value in self.step_costs)
+            or not isinstance(self.total_cost, OracleCost)
+            or type(self.horizon_landings) is not int
+            or self.horizon_landings != count
+            or not isinstance(self.expansion, OracleExpansionDiagnostics)
+        ):
+            raise ContractError("contact oracle plan is invalid")
+
+
+class OracleSearchFailure(ContractError):
+    def __init__(self, rejected_by_reason: Mapping[str, int]):
+        self.rejected_by_reason = MappingProxyType(dict(rejected_by_reason))
+        super().__init__("no feasible one-contact oracle action")
+
+
+@dataclass(frozen=True)
+class _SearchNode:
+    state: OracleState
+    action_indices: tuple[int, ...]
+    placements: tuple[PlacedContactPhase, ...]
+    step_costs: tuple[OracleCost, ...]
+    total_cost: OracleCost
+
+    @property
+    def source_key_path(self) -> tuple[tuple[int, int, int], ...]:
+        return tuple(placement.action.source_key for placement in self.placements)
+
+
+@dataclass(frozen=True)
+class _ActionEntryCache:
+    support: torch.Tensor
+    joint_position: torch.Tensor
+    joint_velocity: torch.Tensor
+
+    @classmethod
+    def from_actions(
+        cls, actions: Sequence[ContactPhaseAction]
+    ) -> "_ActionEntryCache":
+        return cls(
+            support=torch.stack([action.entry_support for action in actions]),
+            joint_position=torch.stack(
+                [action.joint_position[0] for action in actions]
+            ),
+            joint_velocity=torch.stack(
+                [action.joint_velocity[0] for action in actions]
+            ),
+        )
+
+    def candidate_indices(
+        self,
+        state: OracleState,
+        constraints: OracleConstraints,
+        rejected: Counter[str] | None,
+    ) -> torch.Tensor:
+        eligible = torch.ones(
+            self.support.shape[0],
+            dtype=torch.bool,
+            device=self.support.device,
+        )
+        support = ~(
+            state.support_mask[None, :] & ~self.support
+        ).any(dim=1)
+        if rejected is not None:
+            count = int((eligible & ~support).sum().item())
+            if count:
+                rejected["support-order"] += count
+        eligible &= support
+        position = torch.linalg.vector_norm(
+            self.joint_position - state.joint_position[None, :], dim=1
+        ) <= float(constraints.maximum_joint_position_error_rad)
+        if rejected is not None:
+            count = int((eligible & ~position).sum().item())
+            if count:
+                rejected["joint-position"] += count
+        eligible &= position
+        velocity = torch.linalg.vector_norm(
+            self.joint_velocity - state.joint_velocity[None, :], dim=1
+        ) <= float(constraints.maximum_joint_velocity_error_rad_s)
+        if rejected is not None:
+            count = int((eligible & ~velocity).sum().item())
+            if count:
+                rejected["joint-velocity"] += count
+        eligible &= velocity
+        return torch.nonzero(eligible, as_tuple=False).flatten()
+
+
+def advance_state(
+    state: OracleState, placed: PlacedContactPhase
+) -> OracleState:
+    action = placed.action
+    steps = action.frame_count - 1
+    return OracleState(
+        root_position_world=placed.root_position_world[-1],
+        root_yaw_world=placed.root_yaw_world[-1],
+        foot_position_world=placed.foot_position_world[-1],
+        support_mask=action.exit_support,
+        joint_position=action.joint_position[-1],
+        joint_velocity=action.joint_velocity[-1],
+        route_frame=state.route_frame + steps,
+        source_history=(*state.source_history, action.source_key),
+    )
+
+
+def _feasible_actions(
+    state: OracleState,
+    actions: Sequence[ContactPhaseAction],
+    sample_surface: Callable[[torch.Tensor], torch.Tensor],
+    constraints: OracleConstraints,
+    entry_cache: _ActionEntryCache,
+    rejected: Counter[str] | None = None,
+) -> list[tuple[int, PlacedContactPhase, FeasibilityResult]]:
+    output = []
+    candidate_indices = entry_cache.candidate_indices(
+        state, constraints, rejected
+    ).detach().cpu().tolist()
+    for index in candidate_indices:
+        action = actions[index]
+        placed = place_action(action, state)
+        result = validate_placement(
+            placed=placed,
+            state=state,
+            sample_surface=sample_surface,
+            constraints=constraints,
+        )
+        if result.accepted:
+            output.append((index, placed, result))
+        elif rejected is not None:
+            assert result.reason is not None
+            rejected[result.reason] += 1
+    return output
+
+
+def _edge_cost(
+    state: OracleState,
+    placed: PlacedContactPhase,
+    feasibility: FeasibilityResult,
+    schedule: CommandSchedule,
+    config: OracleSearchConfig,
+    successor_count: int,
+    foothold_plan: FootholdPlan,
+) -> OracleCost:
+    action = placed.action
+    steps = action.frame_count - 1
+    desired_displacement = schedule.displacement(state.route_frame, steps)
+    actual_displacement = placed.root_position_world[-1, :2] - state.root_position_world[:2]
+    path = float(
+        config.path_weight
+        * torch.sum(torch.square(actual_displacement - desired_displacement)).item()
+    )
+    desired_heading = schedule.heading(state.route_frame + steps)
+    heading_error = torch.atan2(
+        torch.sin(placed.root_yaw_world[-1] - desired_heading),
+        torch.cos(placed.root_yaw_world[-1] - desired_heading),
+    )
+    facing = float(config.facing_weight * torch.square(heading_error).item())
+    matching_foot = foothold_plan.landing_feet[:, 0] == action.swing_foot
+    if bool(matching_foot.any().item()):
+        target_xy = foothold_plan.landing_xy_world_m[matching_foot, 0]
+        xy_error_sq = torch.sum(
+            torch.square(
+                target_xy
+                - placed.foot_position_world[-1, action.swing_foot, :2]
+            ),
+            dim=1,
+        )
+        target_timing = foothold_plan.landing_frame_offsets[
+            matching_foot, 0
+        ].to(torch.float32)
+        timing_error_sq = torch.square(target_timing - float(steps))
+        combined = (
+            config.foothold_weight * xy_error_sq
+            + config.timing_weight * timing_error_sq
+        )
+        target = int(torch.argmin(combined).item())
+        foothold = float(config.foothold_weight * xy_error_sq[target].item())
+        timing = float(config.timing_weight * timing_error_sq[target].item())
+    elif foothold_plan.score.numel():
+        foothold = float(config.foothold_weight * 100.0)
+        timing = float(config.timing_weight * 100.0)
+    else:
+        foothold = 0.0
+        timing = 0.0
+    joint_position = float(
+        config.joint_position_weight
+        * torch.sum(torch.square(action.joint_position[0] - state.joint_position)).item()
+    )
+    joint_velocity = float(
+        config.joint_velocity_weight
+        * torch.sum(torch.square(action.joint_velocity[0] - state.joint_velocity)).item()
+    )
+    stance = action.entry_support.clone()
+    stance[action.swing_foot] = False
+    if bool(stance.any().item()):
+        displacement = (
+            placed.foot_position_world[:, stance]
+            - placed.foot_position_world[0:1, stance]
+        )
+        stance_motion = float(
+            config.stance_motion_weight * torch.mean(torch.square(displacement)).item()
+        )
+    else:
+        stance_motion = 0.0
+    clearance_deficit = max(0.0, 0.05 - feasibility.minimum_swing_clearance_m)
+    repetition_count = state.source_history.count(action.source_key)
+    return OracleCost(
+        path=path,
+        facing=facing,
+        foothold=foothold,
+        timing=timing,
+        joint_position=joint_position,
+        joint_velocity=joint_velocity,
+        stance_motion=stance_motion,
+        clearance_margin=config.clearance_margin_weight * clearance_deficit**2,
+        reachability=config.reachability_weight / (1.0 + successor_count),
+        repetition=config.repetition_weight * repetition_count,
+    )
+
+
+def _foothold_plan_for_state(
+    state: OracleState,
+    schedule: CommandSchedule,
+    sample_surface: Callable[[torch.Tensor], torch.Tensor],
+    config: OracleSearchConfig,
+) -> FootholdPlan:
+    return plan_footholds(
+        foot_xy_m=state.foot_position_world[:, :2],
+        support_mask=state.support_mask,
+        command_xy=schedule.velocity(state.route_frame),
+        sample_surface=sample_surface,
+        reachable_forward_m=(0.20, 0.25, 0.30, 0.35, 0.40),
+        lateral_samples_m=(-0.15, -0.075, 0.0, 0.075, 0.15),
+        edge_margin_m=config.constraints.edge_margin_m,
+        beam_width=config.foothold_beam_width,
+    )
+
+
+def _search_horizon(
+    *,
+    horizon: int,
+    initial_state: OracleState,
+    actions: Sequence[ContactPhaseAction],
+    command_schedule: CommandSchedule,
+    sample_surface: Callable[[torch.Tensor], torch.Tensor],
+    config: OracleSearchConfig,
+    rejected: Counter[str],
+    entry_cache: _ActionEntryCache,
+) -> tuple[_SearchNode | None, tuple[int, ...], int]:
+    beam = (
+        _SearchNode(initial_state, (), (), (), OracleCost()),
+    )
+    beam_sizes = []
+    expanded = 0
+    for depth in range(horizon):
+        candidates: list[_SearchNode] = []
+        for node in beam:
+            foothold_plan = _foothold_plan_for_state(
+                node.state,
+                command_schedule,
+                sample_surface,
+                config,
+            )
+            feasible = _feasible_actions(
+                node.state,
+                actions,
+                sample_surface,
+                config.constraints,
+                entry_cache,
+                rejected,
+            )
+            expanded += len(actions)
+            for action_index, placed, result in feasible:
+                child_state = advance_state(node.state, placed)
+                successor_count = 0
+                if depth + 1 < horizon:
+                    successor_count = len(
+                        _feasible_actions(
+                            child_state,
+                            actions,
+                            sample_surface,
+                            config.constraints,
+                            entry_cache,
+                        )
+                    )
+                    if successor_count == 0:
+                        rejected["no-successor"] += 1
+                        continue
+                edge_cost = _edge_cost(
+                    node.state,
+                    placed,
+                    result,
+                    command_schedule,
+                    config,
+                    successor_count,
+                    foothold_plan,
+                )
+                candidates.append(
+                    _SearchNode(
+                        state=child_state,
+                        action_indices=(*node.action_indices, action_index),
+                        placements=(*node.placements, placed),
+                        step_costs=(*node.step_costs, edge_cost),
+                        total_cost=node.total_cost + edge_cost,
+                    )
+                )
+        candidates.sort(
+            key=lambda node: (node.total_cost.total, node.source_key_path)
+        )
+        beam = tuple(candidates[: config.beam_width])
+        beam_sizes.append(len(beam))
+        if not beam:
+            return None, tuple(beam_sizes), expanded
+    return beam[0], tuple(beam_sizes), expanded
+
+
+def search_contact_plan(
+    *,
+    initial_state: OracleState,
+    actions: Sequence[ContactPhaseAction],
+    command_schedule: CommandSchedule,
+    sample_surface: Callable[[torch.Tensor], torch.Tensor],
+    config: OracleSearchConfig = OracleSearchConfig(),
+) -> OraclePlan:
+    """Return the best complete horizon, shortening only after exhaustion."""
+
+    inventory = tuple(actions)
+    if (
+        not isinstance(initial_state, OracleState)
+        or not inventory
+        or any(not isinstance(action, ContactPhaseAction) for action in inventory)
+        or not isinstance(command_schedule, CommandSchedule)
+        or not callable(sample_surface)
+        or not isinstance(config, OracleSearchConfig)
+    ):
+        raise ContractError("contact oracle search inputs are invalid")
+    if any(
+        action.root_position_local.device != initial_state.root_position_world.device
+        for action in inventory
+    ) or command_schedule.velocity_world_xy.device != initial_state.root_position_world.device:
+        raise ContractError("contact oracle search devices do not match")
+    rejected: Counter[str] = Counter()
+    entry_cache = _ActionEntryCache.from_actions(inventory)
+    total_expanded = 0
+    all_beam_sizes: list[int] = []
+    for horizon in range(config.horizon_landings, 0, -1):
+        node, beam_sizes, expanded = _search_horizon(
+            horizon=horizon,
+            initial_state=initial_state,
+            actions=inventory,
+            command_schedule=command_schedule,
+            sample_surface=sample_surface,
+            config=config,
+            rejected=rejected,
+            entry_cache=entry_cache,
+        )
+        total_expanded += expanded
+        all_beam_sizes.extend(beam_sizes)
+        if node is not None:
+            return OraclePlan(
+                action_indices=node.action_indices,
+                placements=node.placements,
+                step_costs=node.step_costs,
+                total_cost=node.total_cost,
+                horizon_landings=horizon,
+                expansion=OracleExpansionDiagnostics(
+                    expanded_candidate_count=total_expanded,
+                    rejected_by_reason=rejected,
+                    beam_sizes=tuple(all_beam_sizes),
+                ),
+            )
+    raise OracleSearchFailure(rejected)
