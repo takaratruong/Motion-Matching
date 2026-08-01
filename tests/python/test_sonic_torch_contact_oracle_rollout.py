@@ -1,0 +1,267 @@
+import math
+import unittest
+
+import torch
+
+from mm_sonic.torch_contact_oracle_actions import (
+    ContactPhaseAction,
+    ContactPhaseActionIndex,
+    ContactPhaseInventory,
+)
+from mm_sonic.torch_contact_oracle_rollout import (
+    run_oracle_matrix,
+    run_oracle_route,
+)
+from mm_sonic.torch_contact_oracle_search import (
+    OracleCost,
+    OracleExpansionDiagnostics,
+    OraclePlan,
+    OracleSearchFailure,
+    OracleState,
+    advance_state,
+    place_action,
+)
+from mm_sonic.torch_terrain_omni_routes import (
+    OmniRoute,
+    RouteCommand,
+    RouteOutcomeContract,
+    StairFrame,
+)
+
+
+def _action() -> ContactPhaseAction:
+    frames = 7
+    root = torch.zeros((frames, 3))
+    root[:, 0] = torch.linspace(0.0, 0.06, frames)
+    feet = torch.zeros((frames, 2, 3))
+    feet[:, :, 0] = root[:, 0, None]
+    feet[:, 0, 1] = 0.1
+    feet[:, 1, 1] = -0.1
+    feet[:, :, 2] = 0.035
+    return ContactPhaseAction(
+        clip_index=0,
+        start_frame=10,
+        end_frame=17,
+        swing_foot=1,
+        entry_support=torch.tensor((True, True)),
+        exit_support=torch.tensor((True, True)),
+        support_mask=torch.ones((frames, 2), dtype=torch.bool),
+        joint_position=torch.zeros((frames, 29)),
+        joint_velocity=torch.zeros((frames, 29)),
+        root_position_local=root,
+        root_yaw_local=torch.zeros(frames),
+        foot_position_local=feet,
+        foot_surface_delta_m=torch.zeros((frames, 2)),
+        minimum_swing_clearance_m=0.0,
+    )
+
+
+def _state() -> OracleState:
+    return OracleState(
+        root_position_world=torch.zeros(3),
+        root_yaw_world=torch.zeros(()),
+        foot_position_world=torch.tensor(
+            ((0.0, 0.1, 0.035), (0.0, -0.1, 0.035))
+        ),
+        support_mask=torch.tensor((True, True)),
+        joint_position=torch.zeros(29),
+        joint_velocity=torch.zeros(29),
+        route_frame=0,
+    )
+
+
+class _RecordingPlanner:
+    def __init__(self, action):
+        self.action = action
+        self.requested_route_frames = []
+
+    def __call__(self, state, _schedule):
+        self.requested_route_frames.append(state.route_frame)
+        first = place_action(self.action, state)
+        horizon = 1 if state.route_frame >= 12 else 2
+        placements = [first]
+        if horizon == 2:
+            placements.append(
+                place_action(self.action, advance_state(state, first))
+            )
+        costs = tuple(OracleCost() for _ in placements)
+        return OraclePlan(
+            action_indices=tuple(0 for _ in placements),
+            placements=tuple(placements),
+            step_costs=costs,
+            total_cost=OracleCost(),
+            horizon_landings=horizon,
+            expansion=OracleExpansionDiagnostics(1, {}, (1,) * horizon),
+        )
+
+
+class ContactOracleRolloutTests(unittest.TestCase):
+    def test_executes_one_edge_then_replans_at_terminal_contact(self):
+        route = OmniRoute(
+            name="fourteen-frame",
+            commands=(
+                RouteCommand((0.3, 0.0), 0.0, 14, "move", reset_before=True),
+            ),
+            required_outcome="traverse",
+            outcome=RouteOutcomeContract(),
+        )
+        stair = StairFrame((0.0, 0.0), 0.0, 0.6, 0.3, 0.18, 3)
+        planner = _RecordingPlanner(_action())
+
+        def flat_surface(points):
+            return torch.zeros(points.shape[:-1], dtype=points.dtype, device=points.device)
+
+        run = run_oracle_route(
+            route=route,
+            stair_frame=stair,
+            initial_state=_state(),
+            planner=planner,
+            terrain_sampler=flat_surface,
+            clip_paths=("clip0",),
+            dataset_identity="dataset",
+            config_identity="config",
+        )
+
+        self.assertEqual(planner.requested_route_frames, [0, 6, 12])
+        self.assertEqual(run.completed_frames, 14)
+        self.assertEqual(
+            run.arrays["planned_horizon"].tolist(),
+            [2] * 7 + [2] * 6 + [1],
+        )
+        self.assertTrue(run.completed_without_exception)
+        self.assertTrue(math.isfinite(run.metrics.stance_slide_m.total))
+
+    def test_zero_speed_frames_hold_without_invoking_planner(self):
+        route = OmniRoute(
+            name="hold",
+            commands=(
+                RouteCommand((0.0, 0.0), 0.0, 3, "stop", reset_before=True),
+            ),
+            required_outcome="mixed",
+            outcome=RouteOutcomeContract(),
+        )
+
+        def forbidden_planner(_state, _schedule):
+            raise AssertionError("planner must not run while stopped")
+
+        def flat_surface(points):
+            return torch.zeros(points.shape[:-1], dtype=points.dtype, device=points.device)
+
+        run = run_oracle_route(
+            route=route,
+            stair_frame=StairFrame((0.0, 0.0), 0.0, 0.6, 0.3, 0.18, 3),
+            initial_state=_state(),
+            planner=forbidden_planner,
+            terrain_sampler=flat_surface,
+            clip_paths=("clip0",),
+            dataset_identity="dataset",
+            config_identity="config",
+        )
+
+        self.assertEqual(run.completed_frames, 3)
+        self.assertTrue(run.completed_without_exception)
+        self.assertEqual(run.arrays["selected_action_index"].tolist(), [-1, -1, -1])
+        self.assertTrue((run.arrays["root_position_world"] == 0.0).all())
+
+    def test_search_failure_is_structured_and_never_replaced(self):
+        route = OmniRoute(
+            name="failure",
+            commands=(
+                RouteCommand((0.3, 0.0), 0.0, 3, "move", reset_before=True),
+            ),
+            required_outcome="mixed",
+            outcome=RouteOutcomeContract(),
+        )
+
+        def failed_planner(_state, _schedule):
+            raise OracleSearchFailure({"joint-position": 17})
+
+        def flat_surface(points):
+            return torch.zeros(points.shape[:-1], dtype=points.dtype, device=points.device)
+
+        run = run_oracle_route(
+            route=route,
+            stair_frame=StairFrame((0.0, 0.0), 0.0, 0.6, 0.3, 0.18, 3),
+            initial_state=_state(),
+            planner=failed_planner,
+            terrain_sampler=flat_surface,
+            clip_paths=("clip0",),
+            dataset_identity="dataset",
+            config_identity="config",
+        )
+
+        self.assertEqual(run.completed_frames, 0)
+        self.assertFalse(run.completed_without_exception)
+        self.assertEqual(run.failure.stage, "oracle-search")
+        self.assertEqual(
+            run.failure.message, "no feasible one-contact oracle action"
+        )
+        self.assertEqual(
+            dict(run.failure.rejected_by_reason), {"joint-position": 17}
+        )
+
+    def test_matrix_isolates_route_failures_and_hashes_deterministically(self):
+        routes = (
+            OmniRoute(
+                name="hold-success",
+                commands=(
+                    RouteCommand(
+                        (0.0, 0.0), 0.0, 2, "stop", reset_before=True
+                    ),
+                ),
+                required_outcome="mixed",
+                outcome=RouteOutcomeContract(),
+            ),
+            OmniRoute(
+                name="move-failure",
+                commands=(
+                    RouteCommand(
+                        (0.3, 0.0), 0.0, 2, "move", reset_before=True
+                    ),
+                ),
+                required_outcome="mixed",
+                outcome=RouteOutcomeContract(),
+            ),
+        )
+        index = ContactPhaseActionIndex(
+            actions=(_action(),),
+            inventory=ContactPhaseInventory(1, {}),
+            exact_successor_indices=(None,),
+        )
+
+        def failed_planner(_state, _schedule):
+            raise RuntimeError("no safe action")
+
+        def flat_surface(points):
+            return torch.zeros(
+                points.shape[:-1], dtype=points.dtype, device=points.device
+            )
+
+        kwargs = dict(
+            routes=routes,
+            stair_frame=StairFrame(
+                (0.0, 0.0), 0.0, 0.6, 0.3, 0.18, 3
+            ),
+            initial_state=_state(),
+            planner=failed_planner,
+            terrain_sampler=flat_surface,
+            clip_paths=("clip0",),
+            dataset_identity="dataset",
+            config_identity="config",
+            action_index=index,
+            constraints=None,
+        )
+        from mm_sonic.torch_contact_oracle_search import OracleConstraints
+
+        kwargs["constraints"] = OracleConstraints()
+        first = run_oracle_matrix(**kwargs)
+        second = run_oracle_matrix(**kwargs)
+
+        self.assertEqual(first.runs[0].completed_frames, 2)
+        self.assertEqual(first.runs[1].failure.stage, "oracle-search")
+        self.assertFalse(first.matrix_pass)
+        self.assertEqual(first.deterministic_sha256, second.deterministic_sha256)
+
+
+if __name__ == "__main__":
+    unittest.main()
