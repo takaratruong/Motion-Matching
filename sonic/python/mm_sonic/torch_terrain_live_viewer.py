@@ -450,6 +450,8 @@ def run_live_viewer(
     g1_xml: str | Path,
     device: str,
     contact_segments: bool = False,
+    foothold_arm: str | None = None,
+    foothold_height_tolerance_m: float = 0.07,
 ) -> None:
     """Run the dense 50 Hz matcher and display each committed state."""
 
@@ -479,9 +481,33 @@ def run_live_viewer(
     ):
         raise ContractError("live terrain viewer requires the dense condition")
     contact_segment_policy = None
+    foothold_action_policy = None
     if contact_segments:
         contact_segment_policy = build_contact_segment_policy(
             resolved, g1_xml
+        )
+    if foothold_arm is not None:
+        if contact_segment_policy is None:
+            raise ContractError(
+                "foothold arm requires contact-segment terrain actions"
+            )
+        if not 0.0 < float(foothold_height_tolerance_m) < 0.0889:
+            raise ContractError(
+                "foothold height tolerance must be positive and below half a riser"
+            )
+        from .torch_foothold_actions import (
+            FootholdActionIndex,
+            FootholdActionPolicy,
+            FootholdSelectionArm,
+        )
+
+        foothold_action_policy = FootholdActionPolicy(
+            index=FootholdActionIndex.from_dataset(
+                resolved.dataset, contact_segment_policy.index
+            ),
+            extension=resolved.measurement_extension,
+            arm=FootholdSelectionArm(foothold_arm),
+            height_tolerance_m=float(foothold_height_tolerance_m),
         )
     matcher_config = matcher_config_from_resolved(resolved.resolved_config)
     matcher = TorchMotionMatcher.from_folder(
@@ -494,6 +520,7 @@ def run_live_viewer(
             terrain_transition_validator_from_resolved(resolved)
         ),
         contact_segment_policy=contact_segment_policy,
+        foothold_action_policy=foothold_action_policy,
     )
     model, data = build_kinematic_scene(g1_xml, resolved)
     result = matcher.reset()
@@ -655,6 +682,22 @@ def build_live_viewer_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use committed authoritative-FK terrain contact segments.",
     )
+    parser.add_argument(
+        "--foothold-arm",
+        choices=(
+            "first-contact",
+            "two-contact",
+            "hybrid",
+            "layered",
+            "continuous-control",
+        ),
+        help="Condition terrain entries with the selected foothold policy.",
+    )
+    parser.add_argument(
+        "--foothold-height-tolerance-m",
+        type=float,
+        default=0.07,
+    )
     return parser
 
 
@@ -666,6 +709,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         g1_xml=args.g1_xml,
         device=args.device,
         contact_segments=args.contact_segments,
+        foothold_arm=args.foothold_arm,
+        foothold_height_tolerance_m=args.foothold_height_tolerance_m,
     )
     return 0
 

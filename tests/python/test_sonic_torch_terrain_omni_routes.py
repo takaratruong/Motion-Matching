@@ -178,6 +178,9 @@ class SameStairOmnidirectionalRouteTests(unittest.TestCase):
             self.assertGreaterEqual(
                 float(positions(route)[first_exit, 0]), 1.75, name
             )
+            self.assertGreaterEqual(
+                route.commands[first_exit].frames, 150, name
+            )
 
         expected_turns = {
             "turn-45-lower-left": math.pi / 4,
@@ -213,6 +216,19 @@ class SameStairOmnidirectionalRouteTests(unittest.TestCase):
         reversal = routes["riser-reversal"].commands[-1]
         self.assertLess(reversal.velocity_stair_xy[0], 0.0)
         self.assertAlmostEqual(reversal.heading_stair_yaw, 0.0)
+
+    def test_diagonal_descent_faces_its_sparse_supported_travel_direction(self):
+        routes = {route.name: route for route in same_stair_routes()}
+        for name in ("diagonal-down-left", "diagonal-down-right"):
+            descent = next(
+                command
+                for command in routes[name].commands
+                if command.segment == "diagonal-down"
+            )
+            self.assertAlmostEqual(
+                descent.heading_stair_yaw,
+                math.atan2(*reversed(descent.velocity_stair_xy)),
+            )
 
 
 if __name__ == "__main__":

@@ -36,9 +36,16 @@ def build_parser() -> argparse.ArgumentParser:
             "first-contact",
             "two-contact",
             "hybrid",
+            "layered",
             "continuous-control",
         ),
         help="Condition contact-segment entries on this foothold ablation arm.",
+    )
+    parser.add_argument(
+        "--foothold-height-tolerance-m",
+        type=float,
+        default=0.06,
+        help="Hard per-contact height tolerance; must remain below half a riser.",
     )
     parser.add_argument(
         "--maximum-step-time-ms",
@@ -97,6 +104,10 @@ def main() -> int:
         )
     if args.foothold_arm and contact_policy is None:
         raise ValueError("--foothold-arm requires --contact-segments")
+    if not 0.0 < args.foothold_height_tolerance_m < 0.0889:
+        raise ValueError(
+            "foothold height tolerance must be positive and below half a riser"
+        )
     if args.foothold_arm:
         from mm_sonic.torch_foothold_actions import (
             FootholdActionIndex,
@@ -110,6 +121,7 @@ def main() -> int:
             ),
             extension=resolved.measurement_extension,
             arm=FootholdSelectionArm(args.foothold_arm),
+            height_tolerance_m=args.foothold_height_tolerance_m,
         )
     if args.maximum_step_time_ms <= 0.0:
         raise ValueError("maximum step time must be positive")

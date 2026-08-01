@@ -13,10 +13,12 @@ class TerrainOmniCliTests(unittest.TestCase):
                 "--output", "matrix",
                 "--contact-segments",
                 "--foothold-arm", "hybrid",
+                "--foothold-height-tolerance-m", "0.08",
             ]
         )
 
         self.assertEqual(arguments.foothold_arm, "hybrid")
+        self.assertEqual(arguments.foothold_height_tolerance_m, 0.08)
 
     def test_contact_policy_and_latency_flags_are_explicit(self):
         arguments = build_parser().parse_args(

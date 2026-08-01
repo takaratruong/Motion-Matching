@@ -67,6 +67,7 @@ except ImportError:
     class FootholdSelectionArm(Enum):
         TWO_CONTACT = "two-contact"
         HYBRID = "hybrid"
+        LAYERED = "layered"
         CONTINUOUS = "continuous-control"
 
     def rank_foothold_actions(*_args, **_kwargs):
@@ -331,6 +332,8 @@ class FootholdActionTests(unittest.TestCase):
         self.assertIsNone(rows[0])
         self.assertIs(rows[1], index.actions[0])
         self.assertIsNone(rows[2])
+        self.assertIs(index.entry(0, 1), index.actions[0])
+        self.assertIsNone(index.entry(0, 0))
         torch.testing.assert_close(
             index.actions[0].landing_height_delta_m,
             torch.tensor((0.18, 0.18)),
@@ -406,6 +409,28 @@ class FootholdActionTests(unittest.TestCase):
 
         self.assertEqual(plan.landing_xy_world_m.shape, (0, 2, 2))
 
+    def test_foothold_plan_batches_all_candidate_surface_queries(self):
+        calls = 0
+
+        def flat_surface(points):
+            nonlocal calls
+            calls += 1
+            return torch.zeros(points.shape[:-1], dtype=points.dtype)
+
+        plan = plan_footholds(
+            foot_xy_m=torch.tensor(((0.00, -0.10), (0.00, 0.10))),
+            support_mask=torch.tensor((True, True)),
+            command_xy=torch.tensor((1.00, 0.00)),
+            sample_surface=flat_surface,
+            reachable_forward_m=(0.20, 0.30, 0.40),
+            lateral_samples_m=(-0.10, 0.00, 0.10),
+            edge_margin_m=0.04,
+            beam_width=18,
+        )
+
+        self.assertEqual(plan.score.shape[0], 18)
+        self.assertEqual(calls, 2)
+
     def test_two_contact_arm_rejects_wrong_second_tread(self):
         ranking = rank_foothold_actions(
             arm=FootholdSelectionArm.TWO_CONTACT,
@@ -436,6 +461,28 @@ class FootholdActionTests(unittest.TestCase):
 
         self.assertEqual(ranking.eligible.tolist(), [True, True])
         self.assertEqual(ranking.selected_action, 1)
+
+    def test_layered_arm_keeps_contact_heights_hard_and_xy_soft(self):
+        far_but_correct_contacts = _action(
+            height=(0.18, 0.18),
+            xy=((0.80, 0.50), (1.20, -0.50)),
+        )
+        wrong_second_height = _action(
+            height=(0.18, 0.00),
+        )
+
+        ranking = rank_foothold_actions(
+            arm=FootholdSelectionArm.LAYERED,
+            plan=_plan(height=(0.18, 0.18)),
+            actions=(far_but_correct_contacts, wrong_second_height),
+            motion_cost=torch.tensor((10.0, 0.0)),
+            height_tolerance_m=0.04,
+            xy_tolerance_m=0.20,
+            timing_tolerance_frames=8,
+        )
+
+        self.assertEqual(ranking.eligible.tolist(), [True, False])
+        self.assertEqual(ranking.selected_action, 0)
 
     def test_continuous_control_can_prefer_wrong_contact_sequence(self):
         ranking = rank_foothold_actions(
@@ -480,11 +527,11 @@ class FootholdActionTests(unittest.TestCase):
         policy = FootholdActionPolicy(
             index=index,
             extension=extension,
-            arm=FootholdSelectionArm.TWO_CONTACT,
+            arm=FootholdSelectionArm.LAYERED,
         )
         database = SimpleNamespace(
-            _search_clip_index=torch.tensor((0, 0)),
-            _search_frame_index=torch.tensor((0, 1)),
+            _search_clip_index=torch.tensor((0, 0, 1)),
+            _search_frame_index=torch.tensor((0, 1, 0)),
             device=torch.device("cpu"),
         )
         state = SimpleNamespace(
@@ -502,8 +549,78 @@ class FootholdActionTests(unittest.TestCase):
 
         result = policy.prepare(state, shaped, database)
 
-        self.assertEqual(result.row_eligibility.tolist(), [False, True])
-        self.assertGreaterEqual(result.candidate_count, 1)
+        self.assertEqual(
+            result.row_eligibility.tolist(), [False, False, True]
+        )
+        self.assertEqual(
+            result.fallback_row_eligibility.tolist(), [False, False, True]
+        )
+        self.assertFalse(result.terrain_action_required)
+        self.assertEqual(policy.fallback_candidate_count, 1024)
+        self.assertEqual(policy.beam_width, 50)
+        self.assertEqual(result.candidate_count, 0)
+
+    def test_policy_activates_terrain_actions_only_when_plan_changes_height(self):
+        raised = _action(height=(0.18, 0.18), start_frame=0)
+        index = FootholdActionIndex(
+            actions=(raised,),
+            _entries={(0, 0): raised},
+        )
+
+        class StepGrid:
+            @staticmethod
+            def sample_xy(points):
+                return torch.where(
+                    points[..., 0] >= 0.24,
+                    torch.full(
+                        points.shape[:-1],
+                        0.18,
+                        dtype=points.dtype,
+                        device=points.device,
+                    ),
+                    torch.zeros(
+                        points.shape[:-1],
+                        dtype=points.dtype,
+                        device=points.device,
+                    ),
+                )
+
+        policy = FootholdActionPolicy(
+            index=index,
+            extension=SimpleNamespace(
+                query_grid=StepGrid(),
+                alignment=SimpleNamespace(
+                    matcher_to_scene_xy=lambda points: points
+                ),
+            ),
+            arm=FootholdSelectionArm.LAYERED,
+        )
+        database = SimpleNamespace(
+            _search_clip_index=torch.tensor((0, 1)),
+            _search_frame_index=torch.tensor((0, 0)),
+            device=torch.device("cpu"),
+        )
+        state = SimpleNamespace(
+            feature_body_position=torch.tensor(
+                (
+                    (0.0, 0.0, 0.8),
+                    (0.0, -0.1, 0.035),
+                    (0.0, 0.1, 0.035),
+                )
+            )
+        )
+        shaped = SimpleNamespace(
+            velocity_world_xy=torch.tensor((1.0, 0.0))
+        )
+
+        result = policy.prepare(state, shaped, database)
+
+        self.assertTrue(result.terrain_action_required)
+        self.assertTrue(result.row_eligibility[0].item())
+        self.assertFalse(result.row_eligibility[1].item())
+        self.assertEqual(
+            result.fallback_row_eligibility.tolist(), [True, False]
+        )
 
 
 if __name__ == "__main__":

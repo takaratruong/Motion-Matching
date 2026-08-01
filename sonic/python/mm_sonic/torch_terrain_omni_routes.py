@@ -181,8 +181,14 @@ _DIAGONAL_DOWN_LEFT = _route(
     "traverse",
     (
         ("ascend-upper", 270, 0.38, 0.00, 0.0),
-        ("diagonal-down", 160, -0.30, 0.15, 0.0),
-        ("settle", 30, -0.15, 0.00, 0.0),
+        (
+            "diagonal-down",
+            160,
+            -0.30,
+            0.15,
+            math.atan2(0.15, -0.30),
+        ),
+        ("settle", 30, -0.15, 0.00, math.pi),
     ),
     required_segments=("diagonal-down",),
 )
@@ -202,7 +208,7 @@ _SIDE_EXIT_UPPER_LEFT = _route(
     "exit",
     (
         ("ascend-upper", 265, 0.38, 0.00, 0.0),
-        ("exit-left", 75, 0.00, 0.38, 0.0),
+        ("exit-left", 150, 0.00, 0.38, 0.0),
         ("continue-off", 30, 0.15, 0.00, 0.0),
     ),
     required_segments=("exit-left",),

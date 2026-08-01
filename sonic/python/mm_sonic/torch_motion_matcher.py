@@ -13,6 +13,7 @@ import torch
 
 from .joints import ContractError
 from .torch_contact_segments import (
+    ContactSegment,
     SegmentPlacement,
     SegmentValidation,
     TerrainContactSegmentPolicy,
@@ -46,6 +47,7 @@ LOOP_REVISIT_PENALTY = 1000.0
 RECENT_CROSS_CLIP_REVISIT_PENALTY = 25.0
 CONTIGUOUS_SEGMENT_COMMAND_ALIGNMENT_MIN = 0.5
 CONTACT_COMMITMENT_HEADING_ALIGNMENT_MIN = math.cos(math.radians(15.0))
+FOOTHOLD_CHUNK_MAX_FRAMES = 120
 
 
 @dataclass(frozen=True)
@@ -795,6 +797,8 @@ class SegmentCommitment:
     end_frame: int
     entering_foot: int
     vertical_offset_m: float
+    command_direction_world_xy: tuple[float, float] | None = None
+    command_heading_world_yaw: float | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -808,9 +812,42 @@ class SegmentCommitment:
             or not math.isfinite(float(self.vertical_offset_m))
         ):
             raise ContractError("segment commitment fields are invalid")
+        direction = self.command_direction_world_xy
+        if direction is not None:
+            if (
+                not isinstance(direction, tuple)
+                or len(direction) != 2
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    for value in direction
+                )
+                or math.hypot(*direction) <= 1e-6
+            ):
+                raise ContractError("segment commitment command is invalid")
+            norm = math.hypot(*direction)
+            object.__setattr__(
+                self,
+                "command_direction_world_xy",
+                (float(direction[0]) / norm, float(direction[1]) / norm),
+            )
+        heading = self.command_heading_world_yaw
+        if heading is not None and (
+            isinstance(heading, bool)
+            or not isinstance(heading, (int, float))
+            or not math.isfinite(float(heading))
+        ):
+            raise ContractError("segment commitment command is invalid")
+        if direction is not None and heading is None:
+            raise ContractError("segment commitment command is incomplete")
         object.__setattr__(
             self, "vertical_offset_m", float(self.vertical_offset_m)
         )
+        if heading is not None:
+            object.__setattr__(
+                self, "command_heading_world_yaw", float(heading)
+            )
 
 
 @dataclass(frozen=True)
@@ -1216,6 +1253,9 @@ class TorchMotionMatcher:
         costs = policy.flat_support_transition_cost_weight * torch.mean(
             torch.square(residual), dim=(1, 2)
         )
+        # Terrain candidates are emitted from authoritative MuJoCo FK, while
+        # this cheap row cache comes from source body arrays. Do not apply the
+        # source-body proxy where its foot offsets are not authoritative.
         terrain = torch.tensor(
             sorted(policy.index.terrain_clip_indices),
             dtype=self.database._search_clip_index.dtype,
@@ -1236,7 +1276,12 @@ class TorchMotionMatcher:
         if eligible is None or self._terrain_entry_direction_xy is None:
             return eligible
         command = self._command_travel_direction(shaped)
-        if not self._terrain_command_deviated(state, shaped):
+        lateral = self._terrain_command_is_lateral(shaped, command)
+        command_speed = self._command_plan_speed(shaped)
+        if command_speed < self.config.reversal_speed_mps or (
+            not self._terrain_command_deviated(state, shaped)
+            and not lateral
+        ):
             return eligible
         yaw = shaped.heading_world_yaw - self._transition_source_root_yaw
         directions = _rotate_xy(self._terrain_entry_direction_xy, yaw)
@@ -1246,21 +1291,36 @@ class TorchMotionMatcher:
         )
         return eligible & (~self._terrain_entry_rows | compatible)
 
+    @staticmethod
+    def _terrain_command_is_lateral(
+        shaped: ShapedCommand, command: torch.Tensor
+    ) -> bool:
+        facing = shaped.trajectory.facing_world_xy[-1]
+        return abs(float(torch.dot(command, facing).item())) < 0.5
+
     def _foothold_conditioning(
         self,
         state: _MatcherState,
         shaped: ShapedCommand,
         transition_costs: torch.Tensor,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor,
+        torch.Tensor | None,
+    ]:
         eligible = self._command_transition_eligibility(state, shaped)
         terrain_eligible = self._command_terrain_entry_rows(state, shaped)
         policy = self._foothold_action_policy
         if policy is None:
-            return eligible, terrain_eligible, transition_costs
+            return eligible, terrain_eligible, transition_costs, None
         try:
             result = policy.prepare(state, shaped, self.database)
             row_eligibility = result.row_eligibility
             additional_row_cost = result.additional_row_cost
+            fallback_row_eligibility = getattr(
+                result, "fallback_row_eligibility", None
+            )
         except ContractError:
             raise
         except Exception as error:
@@ -1289,10 +1349,38 @@ class TorchMotionMatcher:
             if terrain_eligible is None
             else terrain_eligible & row_eligibility
         )
+        conditioned_fallback = None
+        if fallback_row_eligibility is not None:
+            if (
+                not isinstance(fallback_row_eligibility, torch.Tensor)
+                or fallback_row_eligibility.shape != row_shape
+                or fallback_row_eligibility.dtype != torch.bool
+                or fallback_row_eligibility.device != self.device
+                or bool(
+                    (row_eligibility & ~fallback_row_eligibility).any().item()
+                )
+            ):
+                raise ContractError("foothold action fallback is invalid")
+            conditioned_fallback = (
+                fallback_row_eligibility
+                if eligible is None
+                else eligible & fallback_row_eligibility
+            )
+            if (
+                not bool(conditioned.any().item())
+                and bool(conditioned_fallback.any().item())
+            ):
+                conditioned = conditioned_fallback
+                conditioned_terrain = (
+                    None
+                    if terrain_eligible is None
+                    else terrain_eligible & conditioned_fallback
+                )
         return (
             conditioned,
             conditioned_terrain,
             transition_costs + additional_row_cost,
+            conditioned_fallback,
         )
 
     def _command_terrain_entry_rows(
@@ -1314,20 +1402,75 @@ class TorchMotionMatcher:
             or float(torch.dot(velocity / speed, command).item())
             < CONTIGUOUS_SEGMENT_COMMAND_ALIGNMENT_MIN
         )
+        return travel_deviated or self._terrain_heading_deviated(
+            state, shaped
+        )
+
+    @staticmethod
+    def _terrain_heading_deviated(
+        state: _MatcherState, shaped: ShapedCommand
+    ) -> bool:
         root_yaw = _quat_yaw(state.root_quaternion)
         root_facing = torch.stack((torch.cos(root_yaw), torch.sin(root_yaw)))
-        heading_deviated = float(
-            torch.dot(root_facing, shaped.trajectory.facing_world_xy[-1]).item()
+        return float(
+            torch.dot(
+                root_facing, shaped.trajectory.facing_world_xy[-1]
+            ).item()
         ) < CONTACT_COMMITMENT_HEADING_ALIGNMENT_MIN
-        return travel_deviated or heading_deviated
 
     def _contact_commitment_should_interrupt(
-        self, state: _MatcherState, shaped: ShapedCommand
+        self,
+        state: _MatcherState,
+        shaped: ShapedCommand,
+        requested_velocity: torch.Tensor | None = None,
+        requested_heading: torch.Tensor | None = None,
     ) -> bool:
-        return (
-            state.commitment is not None
-            and self._terrain_command_deviated(state, shaped)
-        )
+        commitment = state.commitment
+        if commitment is None:
+            return False
+        if (
+            commitment.command_heading_world_yaw is not None
+            and requested_velocity is not None
+            and requested_heading is not None
+        ):
+            speed = torch.linalg.vector_norm(requested_velocity)
+            new_direction = (
+                None
+                if float(speed.item()) <= 1e-6
+                else requested_velocity / speed
+            )
+            old_direction = commitment.command_direction_world_xy
+            direction_changed = (old_direction is None) != (
+                new_direction is None
+            )
+            if old_direction is not None and new_direction is not None:
+                old = torch.tensor(
+                    old_direction,
+                    dtype=new_direction.dtype,
+                    device=new_direction.device,
+                )
+                direction_changed = bool(
+                    (
+                        torch.dot(old, new_direction)
+                        < CONTIGUOUS_SEGMENT_COMMAND_ALIGNMENT_MIN
+                    ).item()
+                )
+            heading_delta = _wrapped_angle(
+                requested_heading
+                - torch.as_tensor(
+                    commitment.command_heading_world_yaw,
+                    dtype=requested_heading.dtype,
+                    device=requested_heading.device,
+                )
+            )
+            heading_changed = bool(
+                (
+                    torch.abs(heading_delta)
+                    > math.radians(15.0)
+                ).item()
+            )
+            return direction_changed or heading_changed
+        return self._terrain_command_deviated(state, shaped)
 
     @staticmethod
     def _command_travel_direction(shaped: ShapedCommand) -> torch.Tensor:
@@ -1342,6 +1485,18 @@ class TorchMotionMatcher:
         if float(speed.item()) > 1e-6:
             return shaped.velocity_world_xy / speed
         return shaped.trajectory.facing_world_xy[-1]
+
+    def _command_plan_speed(self, shaped: ShapedCommand) -> float:
+        """Average planned speed between the 15- and 45-frame horizons."""
+
+        displacement = (
+            shaped.trajectory.position_world_xy[-1]
+            - shaped.trajectory.position_world_xy[0]
+        )
+        return float(
+            torch.linalg.vector_norm(displacement).item()
+            / (30.0 * self.config.dt)
+        )
 
     def _candidate_yaw_offset(
         self,
@@ -1497,6 +1652,7 @@ class TorchMotionMatcher:
         query: torch.Tensor,
         transition_costs: torch.Tensor,
         transition_eligibility: torch.Tensor | None,
+        fallback_transition_eligibility: torch.Tensor | None,
         successor: int | None,
         incumbent_cost: float,
         validator,
@@ -1506,60 +1662,76 @@ class TorchMotionMatcher:
         maximum_total_cost: float | None = None,
         require_safe_candidate: bool = True,
     ):
-        rescue_start = time.perf_counter_ns()
-        ranked_rescue_decisions = rank_exact_transition_candidates(
-            self.database,
-            query,
-            current_clip_index=state.clip_index,
-            current_frame_index=state.frame_index,
-            config=self.config,
-            additional_transition_costs=transition_costs,
-            transition_eligible_rows=transition_eligibility,
-        )
-        rescue_time = time.perf_counter_ns() - rescue_start
-        search_time = (
-            rescue_time if search_time is None else search_time + rescue_time
-        )
-        safe_rescue = None
-        for rank, rescue_decision in enumerate(
-            itertools.islice(
-                ranked_rescue_decisions,
-                self.config.transition_window_candidate_count,
-            ),
-            start=1,
-        ):
-            effective_total_cost = (
-                rescue_decision.selected_total_cost
-                + additional_transition_penalty
+        def ranked(eligibility):
+            nonlocal search_time
+            rescue_start = time.perf_counter_ns()
+            decisions = rank_exact_transition_candidates(
+                self.database,
+                query,
+                current_clip_index=state.clip_index,
+                current_frame_index=state.frame_index,
+                config=self.config,
+                additional_transition_costs=transition_costs,
+                transition_eligible_rows=eligibility,
             )
-            if (
-                maximum_total_cost is not None
-                and effective_total_cost >= maximum_total_cost
+            rescue_time = time.perf_counter_ns() - rescue_start
+            search_time = (
+                rescue_time
+                if search_time is None
+                else search_time + rescue_time
+            )
+            return decisions
+
+        def first_safe(decisions, *, fallback: bool):
+            for rank, rescue_decision in enumerate(
+                itertools.islice(
+                    decisions,
+                    self._terrain_rescue_candidate_limit(
+                        fallback=fallback
+                    ),
+                ),
+                start=1,
             ):
-                break
-            rescue_candidate = self._compose_candidate(
-                state,
-                shaped,
-                rescue_decision.selected_row,
-                successor,
-            )
-            rescue_accepted = rescue_candidate.contact_entry_valid
-            if rescue_accepted and validator is not None:
-                rescue_accepted = validator(
-                    rescue_candidate.dense_body_position[:46].clone()
+                effective_total_cost = (
+                    rescue_decision.selected_total_cost
+                    + additional_transition_penalty
                 )
-                if type(rescue_accepted) is not bool:
-                    raise ContractError(
-                        "emitted-window validator must return exact bool"
+                if (
+                    maximum_total_cost is not None
+                    and effective_total_cost >= maximum_total_cost
+                ):
+                    break
+                rescue_candidate = self._compose_candidate(
+                    state,
+                    shaped,
+                    rescue_decision.selected_row,
+                    successor,
+                )
+                rescue_accepted = rescue_candidate.contact_entry_valid
+                if rescue_accepted and validator is not None:
+                    rescue_accepted = validator(
+                        rescue_candidate.dense_body_position[:46].clone()
                     )
-            if rescue_accepted:
-                safe_rescue = (
-                    rank,
-                    rescue_decision,
-                    rescue_candidate,
-                    effective_total_cost,
-                )
-                break
+                    if type(rescue_accepted) is not bool:
+                        raise ContractError(
+                            "emitted-window validator must return exact bool"
+                        )
+                if rescue_accepted:
+                    return (
+                        rank,
+                        rescue_decision,
+                        rescue_candidate,
+                        effective_total_cost,
+                    )
+            return None
+
+        safe_rescue = first_safe(
+            ranked(transition_eligibility), fallback=False
+        )
+        if safe_rescue is None and fallback_transition_eligibility is not None:
+            safe_rescue = first_safe(
+                ranked(fallback_transition_eligibility), fallback=True
+            )
         if safe_rescue is None:
             if not require_safe_candidate:
                 return None
@@ -1578,6 +1750,95 @@ class TorchMotionMatcher:
             ),
         )
         return rank, decision, candidate, search_time
+
+    def _terrain_rescue_candidate_limit(self, *, fallback: bool) -> int:
+        """Keep the normal rescue bounded, but search layered fallback deeply."""
+
+        realtime_limit = self.config.transition_window_candidate_count
+        if not fallback:
+            return realtime_limit
+        requested = getattr(
+            self._foothold_action_policy,
+            "fallback_candidate_count",
+            realtime_limit,
+        )
+        if type(requested) is not int or requested < 1:
+            raise ContractError(
+                "foothold fallback candidate count must be a positive integer"
+            )
+        return max(realtime_limit, requested)
+
+    def _extend_foothold_placement(
+        self,
+        placement: SegmentPlacement,
+        *,
+        maximum_chunk_frames: int,
+        shaped: ShapedCommand | None = None,
+        yaw_offset: torch.Tensor | None = None,
+    ) -> SegmentPlacement:
+        """Extend only while the full action chunk still follows the command."""
+
+        if type(maximum_chunk_frames) is not int or maximum_chunk_frames < 1:
+            raise ContractError(
+                "foothold chunk maximum must be a positive integer"
+            )
+        index = getattr(self._foothold_action_policy, "index", None)
+        entry = getattr(index, "entry", None)
+        policy = self._contact_segment_policy
+        if not callable(entry) or policy is None:
+            return placement
+        segment = placement.segment
+        action = entry(segment.clip_index, segment.start_frame)
+        if action is None:
+            return placement
+        action_end = getattr(action, "end_frame", None)
+        clip_stop = self._clips[segment.clip_index].joint_position.shape[0]
+        if (
+            type(action_end) is not int
+            or not segment.start_frame < action_end <= clip_stop
+        ):
+            raise ContractError("foothold action commitment end is invalid")
+        chunk_end = min(
+            action_end,
+            segment.start_frame + maximum_chunk_frames,
+        )
+        if chunk_end <= segment.end_frame:
+            return placement
+        extended = ContactSegment(
+            clip_index=segment.clip_index,
+            start_frame=segment.start_frame,
+            end_frame=chunk_end,
+            entering_foot=segment.entering_foot,
+        )
+        support = policy.index.support_mask(segment.clip_index)[
+            segment.start_frame:chunk_end
+        ]
+        extended_placement = SegmentPlacement(
+            segment=extended,
+            vertical_offset_m=placement.vertical_offset_m,
+            source_support_mask=support,
+            required_entry_support_mask=(
+                placement.required_entry_support_mask
+            ),
+        )
+        if (shaped is None) != (yaw_offset is None):
+            raise ContractError(
+                "foothold extension command and yaw must be supplied together"
+            )
+        if shaped is not None:
+            command_speed = self._command_plan_speed(shaped)
+            if (
+                command_speed >= self.config.reversal_speed_mps
+                and not self._segment_command_compatible(
+                    segment.clip_index,
+                    segment.start_frame,
+                    yaw_offset,
+                    shaped,
+                    end_frame=chunk_end,
+                )
+            ):
+                return placement
+        return extended_placement
 
     def _rerank_transition_window(
         self,
@@ -1788,12 +2049,22 @@ class TorchMotionMatcher:
                     placement = None
                     contact_entry_valid = False
                 if placement is not None:
+                    placement = self._extend_foothold_placement(
+                        placement,
+                        maximum_chunk_frames=(
+                            15
+                            if self._terrain_heading_deviated(state, shaped)
+                            else FOOTHOLD_CHUNK_MAX_FRAMES
+                        ),
+                        shaped=shaped,
+                        yaw_offset=yaw_offset,
+                    )
                     translation_z = placement.vertical_offset_m
         else:
             yaw_offset = state.yaw_offset
             translation = state.translation_xy
             translation_z = state.translation_z
-            if policy is not None:
+            if policy is not None and source_override is None:
                 contiguous = policy.index.entry(clip_index, frame_index)
                 if (
                     contiguous is not None
@@ -1980,6 +2251,8 @@ class TorchMotionMatcher:
         frame_index: int,
         yaw_offset: torch.Tensor,
         shaped: ShapedCommand,
+        *,
+        end_frame: int | None = None,
     ) -> bool:
         command = self._command_travel_direction(shaped)
         root = self.folder.layout.root_body_index
@@ -1989,11 +2262,18 @@ class TorchMotionMatcher:
             if policy is None
             else policy.index.entry(clip_index, frame_index)
         )
-        if segment is None:
+        if segment is None and end_frame is None:
             return False
+        stop = segment.end_frame if end_frame is None else end_frame
+        if (
+            type(stop) is not int
+            or not frame_index < stop
+            or stop > self._clips[clip_index].body_position.shape[0]
+        ):
+            raise ContractError("segment command compatibility end is invalid")
         source_travel = _rotate_z(
             self._clips[clip_index].body_position[
-                segment.end_frame - 1, root
+                stop - 1, root
             ]
             - self._clips[clip_index].body_position[frame_index, root],
             yaw_offset,
@@ -2035,7 +2315,9 @@ class TorchMotionMatcher:
         feature_state = GeneratedFeatureState(
             root_position_world=state.root_position,
             root_orientation_world_wxyz=state.root_quaternion,
-            root_linear_velocity_world=state.root_linear_velocity,
+            root_linear_velocity_world=self._query_root_velocity(
+                state.root_linear_velocity, shaped.velocity_world_xy
+            ),
             left_foot_position_world=state.feature_body_position[1],
             right_foot_position_world=state.feature_body_position[2],
             left_foot_velocity_world=state.feature_body_velocity[1],
@@ -2082,6 +2364,35 @@ class TorchMotionMatcher:
                 self._flat_support_transition_costs(state, shaped)
             )
         return shaped, query, transition_costs, successor
+
+    def _query_root_velocity(
+        self,
+        actual_world_xyz: torch.Tensor,
+        shaped_command_world_xy: torch.Tensor,
+    ) -> torch.Tensor:
+        """Blend command velocity into the MM query to avoid slow-gait lock."""
+
+        blend = getattr(
+            self._foothold_action_policy,
+            "command_velocity_query_blend",
+            0.0,
+        )
+        if (
+            isinstance(blend, bool)
+            or not isinstance(blend, (int, float))
+            or not math.isfinite(float(blend))
+            or not 0.0 <= float(blend) <= 1.0
+        ):
+            raise ContractError(
+                "command velocity query blend must be finite and in [0, 1]"
+            )
+        output = actual_world_xyz.clone()
+        output[:2] = torch.lerp(
+            actual_world_xyz[:2],
+            shaped_command_world_xy,
+            float(blend),
+        )
+        return output
 
     def _reachability_state_after(
         self,
@@ -2617,7 +2928,9 @@ class TorchMotionMatcher:
         feature_state = GeneratedFeatureState(
             root_position_world=state.root_position,
             root_orientation_world_wxyz=state.root_quaternion,
-            root_linear_velocity_world=state.root_linear_velocity,
+            root_linear_velocity_world=self._query_root_velocity(
+                state.root_linear_velocity, shaped.velocity_world_xy
+            ),
             left_foot_position_world=state.feature_body_position[1],
             right_foot_position_world=state.feature_body_position[2],
             left_foot_velocity_world=state.feature_body_velocity[1],
@@ -2641,7 +2954,9 @@ class TorchMotionMatcher:
         )
         interrupting_commitment = (
             active_commitment
-            and self._contact_commitment_should_interrupt(state, shaped)
+            and self._contact_commitment_should_interrupt(
+                state, shaped, requested_v, requested_h
+            )
         )
         committed_playback = active_commitment and not interrupting_commitment
         settle_penalty = active_transition_penalty(
@@ -2680,11 +2995,13 @@ class TorchMotionMatcher:
         terrain_transition_eligibility = self._command_terrain_entry_rows(
             state, shaped
         )
+        foothold_fallback_eligibility = None
         if not committed_playback and search:
             (
                 transition_eligibility,
                 terrain_transition_eligibility,
                 transition_costs,
+                foothold_fallback_eligibility,
             ) = self._foothold_conditioning(
                 state, shaped, transition_costs
             )
@@ -2851,6 +3168,7 @@ class TorchMotionMatcher:
                 query,
                 transition_costs,
                 transition_eligibility,
+                foothold_fallback_eligibility,
                 successor,
                 decision.incumbent_cost,
                 validator,
@@ -2909,6 +3227,7 @@ class TorchMotionMatcher:
                         query,
                         transition_costs,
                         transition_eligibility,
+                        foothold_fallback_eligibility,
                         successor,
                         decision.incumbent_cost,
                         validator,
@@ -2929,6 +3248,7 @@ class TorchMotionMatcher:
                             query,
                             transition_costs,
                             transition_eligibility,
+                            foothold_fallback_eligibility,
                             successor,
                             decision.incumbent_cost,
                             validator,
@@ -2959,6 +3279,7 @@ class TorchMotionMatcher:
                                 query,
                                 transition_costs,
                                 transition_eligibility,
+                                foothold_fallback_eligibility,
                                 successor,
                                 decision.incumbent_cost,
                                 validator,
@@ -2973,6 +3294,7 @@ class TorchMotionMatcher:
                                 query,
                                 transition_costs,
                                 transition_eligibility,
+                                foothold_fallback_eligibility,
                                 successor,
                                 decision.incumbent_cost,
                                 validator,
@@ -3066,9 +3388,10 @@ class TorchMotionMatcher:
         dense_joint_p = candidate.dense_joint_position
         dense_joint_v = candidate.dense_joint_velocity
         output_commitment = (
-            None
-            if interrupting_commitment and candidate.transitioned
-            else state.commitment
+            state.commitment
+            if active_commitment
+            and not (interrupting_commitment and candidate.transitioned)
+            else None
         )
         if (
             output_commitment is None
@@ -3084,6 +3407,22 @@ class TorchMotionMatcher:
                 end_frame=placement.segment.end_frame,
                 entering_foot=placement.segment.entering_foot,
                 vertical_offset_m=placement.vertical_offset_m,
+                command_direction_world_xy=(
+                    None
+                    if float(torch.linalg.vector_norm(requested_v).item())
+                    <= 1e-6
+                    else tuple(
+                        float(value)
+                        for value in (
+                            requested_v
+                            / torch.linalg.vector_norm(requested_v)
+                        )
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    )
+                ),
+                command_heading_world_yaw=float(requested_h.item()),
             )
         if output_commitment is not None and not (
             output_commitment.clip_index == candidate.clip_index
@@ -3092,7 +3431,13 @@ class TorchMotionMatcher:
             < output_commitment.end_frame
         ):
             raise ContractError(
-                "emitted frame is outside the active contact segment"
+                "emitted frame is outside the active contact segment: "
+                f"candidate={candidate.clip_index}:{candidate.frame_index}, "
+                f"commitment={output_commitment.clip_index}:"
+                f"{output_commitment.start_frame}-"
+                f"{output_commitment.end_frame}, active={active_commitment}, "
+                f"interrupting={interrupting_commitment}, "
+                f"transitioned={candidate.transitioned}"
             )
         next_commitment = output_commitment
         if (

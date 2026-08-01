@@ -26,7 +26,9 @@ from mm_sonic.torch_motion_matcher import (
     select_exact_candidate,
 )
 from mm_sonic.torch_contact_segments import (
+    ContactSegment,
     ContactSegmentIndex,
+    SegmentPlacement,
     TerrainContactSegmentPolicy,
 )
 from mm_sonic.torch_transition_reachability import ReachabilityLimits
@@ -71,9 +73,21 @@ class _ScriptedWindowValidator:
 
 
 class _FakeFootholdPolicy:
-    def __init__(self, allowed_source, added_cost):
+    def __init__(
+        self,
+        allowed_source,
+        added_cost,
+        fallback_source=None,
+        fallback_candidate_count=256,
+        command_velocity_query_blend=1.0,
+    ):
         self.allowed_source = tuple(allowed_source)
         self.added_cost = float(added_cost)
+        self.fallback_source = (
+            None if fallback_source is None else tuple(fallback_source)
+        )
+        self.fallback_candidate_count = fallback_candidate_count
+        self.command_velocity_query_blend = command_velocity_query_blend
         self.calls = 0
 
     def prepare(self, state, shaped, database):
@@ -85,6 +99,10 @@ class _FakeFootholdPolicy:
         )
         row = database.row_for_source(*self.allowed_source)
         eligible[row] = True
+        fallback = None
+        if self.fallback_source is not None:
+            fallback = eligible.clone()
+            fallback[database.row_for_source(*self.fallback_source)] = True
         return SimpleNamespace(
             row_eligibility=eligible,
             additional_row_cost=torch.full(
@@ -93,6 +111,7 @@ class _FakeFootholdPolicy:
                 dtype=torch.float32,
                 device=database.device,
             ),
+            fallback_row_eligibility=fallback,
         )
 
 
@@ -191,6 +210,329 @@ def _install_contact_policy(
 
 
 class TorchMotionMatcherTests(unittest.TestCase):
+    def test_two_contact_action_extends_validated_segment_window(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+            )
+            contact = _install_contact_policy(
+                matcher, start=20, end=30
+            )
+            matcher._foothold_action_policy = SimpleNamespace(
+                index=SimpleNamespace(
+                    entry=lambda clip, frame: (
+                        SimpleNamespace(end_frame=47)
+                        if (clip, frame) == (0, 20)
+                        else None
+                    )
+                )
+            )
+            placement = SegmentPlacement(
+                segment=ContactSegment(0, 20, 30, 0),
+                vertical_offset_m=0.0,
+                source_support_mask=contact.index.support_mask(0)[20:30],
+            )
+
+            extended = matcher._extend_foothold_placement(
+                placement, maximum_chunk_frames=120
+            )
+            short = matcher._extend_foothold_placement(
+                placement, maximum_chunk_frames=15
+            )
+
+        self.assertEqual(extended.segment.end_frame, 47)
+        self.assertEqual(extended.source_support_mask.shape, (27, 2))
+        self.assertEqual(short.segment.end_frame, 35)
+
+    def test_two_contact_action_does_not_latch_across_command_divergence(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(root, device="cpu")
+            contact = _install_contact_policy(matcher, start=20, end=30)
+            matcher._foothold_action_policy = SimpleNamespace(
+                index=SimpleNamespace(
+                    entry=lambda clip, frame: (
+                        SimpleNamespace(end_frame=47)
+                        if (clip, frame) == (0, 20)
+                        else None
+                    )
+                )
+            )
+            placement = SegmentPlacement(
+                segment=ContactSegment(0, 20, 30, 0),
+                vertical_offset_m=0.0,
+                source_support_mask=contact.index.support_mask(0)[20:30],
+            )
+            state = matcher._state
+            self.assertIsNone(state)
+            matcher.reset()
+            state = matcher._state
+            sideways = predict_command_trajectory(
+                state.root_position[:2],
+                torch.tensor((0.0, 0.4)),
+                state.shaped_heading,
+                torch.tensor((0.0, 0.4)),
+                torch.tensor(0.0),
+                config=matcher.config,
+            )
+
+            extended = matcher._extend_foothold_placement(
+                placement,
+                maximum_chunk_frames=120,
+                shaped=sideways,
+                yaw_offset=torch.tensor(0.0),
+            )
+
+        self.assertEqual(extended.segment.end_frame, 30)
+
+    def test_slow_pivot_keeps_validated_two_contact_action_chunk(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(root, device="cpu")
+            contact = _install_contact_policy(matcher, start=20, end=30)
+            matcher._foothold_action_policy = SimpleNamespace(
+                index=SimpleNamespace(
+                    entry=lambda clip, frame: (
+                        SimpleNamespace(end_frame=47)
+                        if (clip, frame) == (0, 20)
+                        else None
+                    )
+                )
+            )
+            placement = SegmentPlacement(
+                segment=ContactSegment(0, 20, 30, 0),
+                vertical_offset_m=0.0,
+                source_support_mask=contact.index.support_mask(0)[20:30],
+            )
+            matcher.reset()
+            state = matcher._state
+            pivot = predict_command_trajectory(
+                state.root_position[:2],
+                torch.tensor((0.4, 0.0)),
+                state.shaped_heading,
+                torch.tensor((0.0, 0.05)),
+                torch.tensor(math.pi),
+                config=matcher.config,
+            )
+
+            extended = matcher._extend_foothold_placement(
+                placement,
+                maximum_chunk_frames=120,
+                shaped=pivot,
+                yaw_offset=torch.tensor(0.0),
+            )
+
+        self.assertEqual(extended.segment.end_frame, 47)
+
+    def test_foothold_query_can_use_shaped_command_velocity(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                foothold_action_policy=_FakeFootholdPolicy(
+                    (0, 20), 0.0, command_velocity_query_blend=0.75
+                ),
+            )
+        actual = torch.tensor((0.1, -0.2, 0.3))
+        command = torch.tensor((0.5, 0.6))
+
+        conditioned = matcher._query_root_velocity(actual, command)
+
+        torch.testing.assert_close(
+            conditioned, torch.tensor((0.4, 0.4, 0.3))
+        )
+
+    def test_layered_fallback_can_validate_deeper_than_realtime_window(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=MatcherConfig(transition_window_candidate_count=2),
+                foothold_action_policy=_FakeFootholdPolicy(
+                    (0, 20),
+                    0.0,
+                    fallback_source=(0, 30),
+                    fallback_candidate_count=7,
+                ),
+            )
+
+        self.assertEqual(
+            matcher._terrain_rescue_candidate_limit(fallback=False), 2
+        )
+        self.assertEqual(
+            matcher._terrain_rescue_candidate_limit(fallback=True), 7
+        )
+
+    def test_foothold_conditioning_preserves_relaxed_fallback_rows(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            policy = _FakeFootholdPolicy(
+                (0, 20), 7.0, fallback_source=(0, 30)
+            )
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                foothold_action_policy=policy,
+            )
+            matcher.reset()
+            state = matcher._state
+            shaped = predict_command_trajectory(
+                state.root_position[:2],
+                state.shaped_velocity,
+                state.shaped_heading,
+                torch.tensor((0.4, 0.0)),
+                torch.tensor(0.0),
+                config=matcher.config,
+            )
+
+            _, _, _, fallback = matcher._foothold_conditioning(
+                state,
+                shaped,
+                torch.zeros(
+                    matcher.database._search_clip_index.shape,
+                    dtype=torch.float32,
+                ),
+            )
+
+        self.assertEqual(
+            torch.nonzero(fallback, as_tuple=False).flatten().tolist(),
+            [
+                matcher.database.row_for_source(0, 20),
+                matcher.database.row_for_source(0, 30),
+            ],
+        )
+
+    def test_foothold_conditioning_activates_fallback_when_hard_set_is_empty(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                foothold_action_policy=_FakeFootholdPolicy(
+                    (0, 20), 7.0, fallback_source=(0, 30)
+                ),
+            )
+            matcher.reset()
+            matcher._transition_eligible_rows = torch.zeros(
+                matcher.database.feature_shape[0], dtype=torch.bool
+            )
+            fallback_row = matcher.database.row_for_source(0, 30)
+            matcher._transition_eligible_rows[fallback_row] = True
+            state = matcher._state
+            shaped = predict_command_trajectory(
+                state.root_position[:2],
+                state.shaped_velocity,
+                state.shaped_heading,
+                torch.tensor((0.4, 0.0)),
+                torch.tensor(0.0),
+                config=matcher.config,
+            )
+
+            conditioned, _, _, fallback = matcher._foothold_conditioning(
+                state,
+                shaped,
+                torch.zeros(
+                    matcher.database._search_clip_index.shape,
+                    dtype=torch.float32,
+                ),
+            )
+
+        self.assertEqual(
+            torch.nonzero(conditioned, as_tuple=False).flatten().tolist(),
+            [fallback_row],
+        )
+        torch.testing.assert_close(conditioned, fallback)
+
+    def test_committed_multi_contact_action_ignores_nested_segment_entry(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=MatcherConfig(
+                    search_interval_steps=1,
+                    exclusion_frames=0,
+                ),
+            )
+            matcher.reset()
+            policy = _install_contact_policy(matcher, start=20, end=30)
+            entry_row = matcher.database.row_for_source(0, 20)
+            successor = matcher.database.row_for_source(0, 1)
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher.select_exact_candidate",
+                return_value=SearchDecision(
+                    entry_row, successor, 10.0, 1.0, 1.0, True, True
+                ),
+            ):
+                first = matcher.step((0.4, 0.0), 0.0)
+
+            with mock.patch.object(
+                ContactSegmentIndex,
+                "entry",
+                return_value=ContactSegment(0, 21, 26, 1),
+            ) as nested, mock.patch.object(
+                TerrainContactSegmentPolicy,
+                "validate_emitted",
+                side_effect=AssertionError("nested segment was revalidated"),
+            ) as validate:
+                second = matcher.step((0.4, 0.0), 0.0)
+
+        self.assertTrue(first.diagnostics.segment_committed)
+        self.assertTrue(second.diagnostics.segment_committed)
+        self.assertEqual(second.diagnostics.selected_frame, 21)
+        nested.assert_not_called()
+        validate.assert_not_called()
+
+    def test_expired_contact_commitment_is_not_carried_to_successor(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=MatcherConfig(
+                    search_interval_steps=1,
+                    exclusion_frames=0,
+                ),
+            )
+            matcher.reset()
+            matcher._state = replace(
+                matcher._state,
+                commitment=SegmentCommitment(
+                    clip_index=0,
+                    start_frame=0,
+                    end_frame=1,
+                    entering_foot=0,
+                    vertical_offset_m=0.0,
+                ),
+            )
+
+            result = matcher.step((0.4, 0.0), 0.0)
+
+        self.assertFalse(result.diagnostics.segment_committed)
+        self.assertIsNone(matcher._state.commitment)
+
     def test_foothold_policy_conditions_exact_search_rows_and_costs(self):
         arrays = build_varying_takara_arrays(frames=100)
         with tempfile.TemporaryDirectory() as tmp:
@@ -333,6 +675,102 @@ class TorchMotionMatcherTests(unittest.TestCase):
                 state.shaped_heading,
                 torch.tensor((0.0, 0.4)),
                 torch.tensor(0.0),
+                has_valid_successor=True,
+                config=matcher.config,
+            )
+
+            eligible = matcher._command_transition_eligibility(state, shaped)
+
+        self.assertTrue(bool(eligible[entry]))
+
+    def test_terrain_entry_direction_is_enforced_after_command_alignment(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(root, device="cpu")
+            matcher.reset()
+            _install_contact_policy(matcher, start=20, end=30)
+            directions = torch.zeros(
+                (matcher.database.feature_shape[0], 2), dtype=torch.float32
+            )
+            entry = matcher.database.row_for_source(0, 20)
+            directions[entry] = torch.tensor((0.0, -1.0))
+            matcher._terrain_entry_direction_xy = directions
+            state = replace(
+                matcher._state,
+                root_linear_velocity=torch.tensor((0.0, 0.4, 0.0)),
+            )
+            shaped = predict_command_trajectory(
+                state.root_position[:2],
+                torch.tensor((0.0, 0.4)),
+                state.shaped_heading,
+                torch.tensor((0.0, 0.4)),
+                torch.tensor(0.0),
+                has_valid_successor=True,
+                config=matcher.config,
+            )
+
+            eligible = matcher._command_transition_eligibility(state, shaped)
+
+        self.assertFalse(bool(eligible[entry]))
+
+    def test_backward_entry_filter_relaxes_after_command_alignment(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(root, device="cpu")
+            matcher.reset()
+            _install_contact_policy(matcher, start=20, end=30)
+            directions = torch.zeros(
+                (matcher.database.feature_shape[0], 2), dtype=torch.float32
+            )
+            entry = matcher.database.row_for_source(0, 20)
+            directions[entry] = torch.tensor((1.0, 0.0))
+            matcher._terrain_entry_direction_xy = directions
+            state = replace(
+                matcher._state,
+                root_linear_velocity=torch.tensor((-0.4, 0.0, 0.0)),
+            )
+            shaped = predict_command_trajectory(
+                state.root_position[:2],
+                torch.tensor((-0.4, 0.0)),
+                state.shaped_heading,
+                torch.tensor((-0.4, 0.0)),
+                torch.tensor(0.0),
+                has_valid_successor=True,
+                config=matcher.config,
+            )
+
+            eligible = matcher._command_transition_eligibility(state, shaped)
+
+        self.assertTrue(bool(eligible[entry]))
+
+    def test_slow_pivot_does_not_gate_on_travel_direction(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(root, device="cpu")
+            matcher.reset()
+            _install_contact_policy(matcher, start=20, end=30)
+            directions = torch.zeros(
+                (matcher.database.feature_shape[0], 2), dtype=torch.float32
+            )
+            entry = matcher.database.row_for_source(0, 20)
+            directions[entry] = torch.tensor((1.0, 0.0))
+            matcher._terrain_entry_direction_xy = directions
+            state = replace(
+                matcher._state,
+                root_linear_velocity=torch.tensor((0.0, 0.07, 0.0)),
+            )
+            shaped = predict_command_trajectory(
+                state.root_position[:2],
+                torch.tensor((0.0, 0.07)),
+                state.shaped_heading,
+                torch.tensor((0.0, 0.07)),
+                torch.tensor(math.pi),
                 has_valid_successor=True,
                 config=matcher.config,
             )
@@ -619,6 +1057,51 @@ class TorchMotionMatcherTests(unittest.TestCase):
             )
 
         self.assertTrue(interrupt)
+
+    def test_latched_action_chunk_interrupts_only_for_new_operator_command(self):
+        arrays = build_varying_takara_arrays(frames=120)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(root, device="cpu")
+            matcher.reset()
+            _install_contact_policy(matcher, start=20, end=40)
+            state = replace(
+                matcher._state,
+                commitment=SegmentCommitment(
+                    0,
+                    20,
+                    40,
+                    0,
+                    0.0,
+                    command_direction_world_xy=(-1.0, 0.0),
+                    command_heading_world_yaw=math.pi,
+                ),
+            )
+            shaped = predict_command_trajectory(
+                state.root_position[:2],
+                state.shaped_velocity,
+                state.shaped_heading,
+                torch.tensor((-0.4, 0.0)),
+                torch.tensor(math.pi),
+                config=matcher.config,
+            )
+
+            same = matcher._contact_commitment_should_interrupt(
+                state,
+                shaped,
+                torch.tensor((-0.4, 0.0)),
+                torch.tensor(math.pi),
+            )
+            changed = matcher._contact_commitment_should_interrupt(
+                state,
+                shaped,
+                torch.tensor((0.0, 0.4)),
+                torch.tensor(math.pi / 2.0),
+            )
+
+        self.assertFalse(same)
+        self.assertTrue(changed)
 
     def test_validated_contact_commitment_does_not_revalidate_past_its_end(self):
         arrays = build_varying_takara_arrays(frames=120)

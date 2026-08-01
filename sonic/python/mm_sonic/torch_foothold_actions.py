@@ -255,12 +255,8 @@ class FootholdActionIndex:
         if (
             len(entries) != len(self.actions)
             or any(
-                not any(value is action for action in self.actions)
-                for value in entries.values()
-            )
-            or any(
-                key != (action.clip_index, action.start_frame)
-                for key, action in entries.items()
+                entries.get((action.clip_index, action.start_frame)) is not action
+                for action in self.actions
             )
         ):
             raise ContractError("foothold action entries are invalid")
@@ -391,6 +387,13 @@ class FootholdActionIndex:
                 frames.detach().cpu().tolist(),
             )
         )
+
+    def entry(
+        self, clip_index: int, frame_index: int
+    ) -> FootholdAction | None:
+        if type(clip_index) is not int or type(frame_index) is not int:
+            raise ContractError("foothold action entry indices must be integers")
+        return self._entries.get((clip_index, frame_index))
 
 
 @dataclass(frozen=True)
@@ -567,7 +570,7 @@ def plan_footholds(
         if bool(support_mask.all().item())
         else (int(torch.nonzero(~support_mask, as_tuple=False)[0].item()),)
     )
-    candidates: list[tuple] = []
+    proposals: list[tuple] = []
     command_yaw = torch.atan2(forward[1], forward[0])
     for moving in moving_feet:
         other = 1 - moving
@@ -578,51 +581,83 @@ def plan_footholds(
                     + forward * distance
                     + right * lateral
                 )
-                first_height = _stable_surface_height(
-                    first_xy, sample_surface, float(edge_margin_m)
-                )
-                if first_height is None:
-                    continue
                 second_xy = (
                     foot_xy_m[other]
                     + forward * (2.0 * distance)
                     + right * lateral
                 )
-                second_height = _stable_surface_height(
-                    second_xy, sample_surface, float(edge_margin_m)
-                )
-                if second_height is None:
-                    continue
-                world = torch.stack((first_xy, second_xy))
-                local = _world_to_local(world - anchor, command_yaw)
-                heights = torch.stack(
+                proposals.append(
                     (
-                        first_height - base_surface[moving],
-                        second_height - base_surface[other],
-                    )
-                )
-                times = torch.tensor(
-                    (
-                        max(1, round(distance / float(speed.item()) * 50.0)),
-                        max(2, round(2.0 * distance / float(speed.item()) * 50.0)),
-                    ),
-                    dtype=torch.int64,
-                    device=foot_xy_m.device,
-                )
-                score = -3.0 * distance + abs(lateral)
-                candidates.append(
-                    (
-                        score,
                         moving,
+                        other,
                         distance,
                         lateral,
-                        torch.tensor((moving, other), device=foot_xy_m.device),
-                        world,
-                        local,
-                        heights,
-                        times,
+                        torch.stack((first_xy, second_xy)),
                     )
                 )
+    worlds = torch.stack([item[4] for item in proposals])
+    sole_offsets = torch.tensor(
+        (
+            (0.0, 0.0),
+            (edge_margin_m, 0.0),
+            (-edge_margin_m, 0.0),
+            (0.0, edge_margin_m),
+            (0.0, -edge_margin_m),
+        ),
+        dtype=foot_xy_m.dtype,
+        device=foot_xy_m.device,
+    )
+    sampled = sample_surface(
+        worlds[:, :, None, :] + sole_offsets[None, None, :, :]
+    )
+    expected_surface_shape = (len(proposals), 2, 5)
+    if (
+        not isinstance(sampled, torch.Tensor)
+        or tuple(sampled.shape) != expected_surface_shape
+        or sampled.device != foot_xy_m.device
+        or sampled.dtype != foot_xy_m.dtype
+        or not torch.isfinite(sampled).all()
+    ):
+        raise ContractError("foothold surface sampler returned invalid heights")
+    stable = (sampled.amax(dim=-1) - sampled.amin(dim=-1)) <= 0.025
+    stable_pairs = stable.all(dim=-1).detach().cpu().tolist()
+    center_heights = sampled[:, :, 0]
+    speed_value = float(speed.item())
+    candidates: list[tuple] = []
+    for proposal_index, proposal in enumerate(proposals):
+        if stable_pairs[proposal_index]:
+            moving, other, distance, lateral, world = proposal
+            local = _world_to_local(world - anchor, command_yaw)
+            heights = torch.stack(
+                (
+                    center_heights[proposal_index, 0]
+                    - base_surface[moving],
+                    center_heights[proposal_index, 1]
+                    - base_surface[other],
+                )
+            )
+            times = torch.tensor(
+                (
+                    max(1, round(distance / speed_value * 50.0)),
+                    max(2, round(2.0 * distance / speed_value * 50.0)),
+                ),
+                dtype=torch.int64,
+                device=foot_xy_m.device,
+            )
+            score = -3.0 * distance + abs(lateral)
+            candidates.append(
+                (
+                    score,
+                    moving,
+                    distance,
+                    lateral,
+                    torch.tensor((moving, other), device=foot_xy_m.device),
+                    world,
+                    local,
+                    heights,
+                    times,
+                )
+            )
     candidates.sort(key=lambda item: item[:4])
     retained = candidates[:beam_width]
     if not retained:
@@ -695,6 +730,7 @@ class FootholdSelectionArm(Enum):
     FIRST_CONTACT = "first-contact"
     TWO_CONTACT = "two-contact"
     HYBRID = "hybrid"
+    LAYERED = "layered"
     CONTINUOUS = "continuous-control"
 
 
@@ -813,6 +849,10 @@ def rank_foothold_actions(
             & (xy_error <= float(xy_tolerance_m)).all(dim=1)
             & (timing_error <= timing_tolerance_frames).all(dim=1)
         )
+        contact_valid = (
+            feet.all(dim=1)
+            & (height_error <= float(height_tolerance_m)).all(dim=1)
+        )
         normalized = (
             torch.square(height_error / float(height_tolerance_m)).sum(dim=1)
             + torch.square(xy_error / float(xy_tolerance_m)).sum(dim=1)
@@ -831,6 +871,8 @@ def rank_foothold_actions(
             FootholdSelectionArm.HYBRID,
         ):
             eligible[action_index] = bool(both_valid.any().item())
+        elif arm is FootholdSelectionArm.LAYERED:
+            eligible[action_index] = bool(contact_valid.any().item())
         else:
             eligible[action_index] = True
 
@@ -852,6 +894,8 @@ class FootholdPolicyResult:
     additional_row_cost: torch.Tensor
     plan: FootholdPlan
     candidate_count: int
+    terrain_action_required: bool
+    fallback_row_eligibility: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -868,8 +912,18 @@ class FootholdPolicyResult:
             or self.plan.score.device != self.row_eligibility.device
             or type(self.candidate_count) is not int
             or self.candidate_count < 0
+            or type(self.terrain_action_required) is not bool
         ):
             raise ContractError("foothold policy result is invalid")
+        fallback = self.fallback_row_eligibility
+        if fallback is not None and (
+            not isinstance(fallback, torch.Tensor)
+            or fallback.shape != self.row_eligibility.shape
+            or fallback.dtype != torch.bool
+            or fallback.device != self.row_eligibility.device
+            or bool((self.row_eligibility & ~fallback).any().item())
+        ):
+            raise ContractError("foothold policy fallback is invalid")
         object.__setattr__(
             self, "row_eligibility", self.row_eligibility.detach().clone()
         )
@@ -878,6 +932,12 @@ class FootholdPolicyResult:
             "additional_row_cost",
             self.additional_row_cost.detach().clone(),
         )
+        if fallback is not None:
+            object.__setattr__(
+                self,
+                "fallback_row_eligibility",
+                fallback.detach().clone(),
+            )
 
 
 @dataclass
@@ -891,7 +951,10 @@ class FootholdActionPolicy:
     xy_tolerance_m: float = 0.25
     timing_tolerance_frames: int = 20
     edge_margin_m: float = 0.04
-    beam_width: int = 16
+    beam_width: int = 50
+    fallback_candidate_count: int = 1024
+    terrain_activation_height_m: float = 0.05
+    command_velocity_query_blend: float = 1.0
 
     def __post_init__(self) -> None:
         if (
@@ -917,12 +980,19 @@ class FootholdActionPolicy:
                     self.height_tolerance_m,
                     self.xy_tolerance_m,
                     self.edge_margin_m,
+                    self.terrain_activation_height_m,
                 )
             )
             or type(self.timing_tolerance_frames) is not int
             or self.timing_tolerance_frames < 0
             or type(self.beam_width) is not int
             or self.beam_width < 1
+            or type(self.fallback_candidate_count) is not int
+            or self.fallback_candidate_count < 1
+            or isinstance(self.command_velocity_query_blend, bool)
+            or not isinstance(self.command_velocity_query_blend, (int, float))
+            or not math.isfinite(float(self.command_velocity_query_blend))
+            or not 0.0 <= float(self.command_velocity_query_blend) <= 1.0
         ):
             raise ContractError("foothold action policy tolerances are invalid")
         self._terrain_clip_indices = frozenset(
@@ -1040,6 +1110,10 @@ class FootholdActionPolicy:
             & (xy_error <= self.xy_tolerance_m).all(dim=-1)
             & (timing_error <= self.timing_tolerance_frames).all(dim=-1)
         )
+        contact_valid = (
+            feet.all(dim=-1)
+            & (height_error <= self.height_tolerance_m).all(dim=-1)
+        )
         normalized = (
             torch.square(height_error / self.height_tolerance_m).sum(dim=-1)
             + torch.square(xy_error / self.xy_tolerance_m).sum(dim=-1)
@@ -1058,6 +1132,8 @@ class FootholdActionPolicy:
             FootholdSelectionArm.HYBRID,
         ):
             eligible = both_valid.any(dim=0)
+        elif self.arm is FootholdSelectionArm.LAYERED:
+            eligible = contact_valid.any(dim=0)
         else:
             eligible.fill_(True)
         selected = None
@@ -1123,16 +1199,43 @@ class FootholdActionPolicy:
         assert self._cached_terrain_rows is not None
         action_indices = self._cached_row_action_indices
         action_rows = action_indices >= 0
-        eligible = ~self._cached_terrain_rows
-        eligible = eligible.clone()
-        eligible[action_rows] = ranking.eligible[action_indices[action_rows]]
+        terrain_required = bool(
+            (torch.abs(surface[0] - surface[1])
+             >= self.terrain_activation_height_m).item()
+            or (
+                plan.landing_height_delta_m.numel() > 0
+                and bool(
+                    (torch.abs(plan.landing_height_delta_m)
+                     >= self.terrain_activation_height_m).any().item()
+                )
+            )
+        )
+        eligible = (~self._cached_terrain_rows).clone()
+        if terrain_required:
+            eligible.zero_()
+            eligible[action_rows] = ranking.eligible[
+                action_indices[action_rows]
+            ]
         additional = torch.zeros(row_count, dtype=torch.float32, device=device)
-        additional[action_rows] = ranking.additional_cost[
-            action_indices[action_rows]
-        ]
+        if terrain_required:
+            additional[action_rows] = ranking.additional_cost[
+                action_indices[action_rows]
+            ]
+        fallback = None
+        if self.arm is FootholdSelectionArm.LAYERED:
+            if terrain_required:
+                fallback = action_rows.clone()
+            else:
+                fallback = (~self._cached_terrain_rows).clone()
         return FootholdPolicyResult(
             row_eligibility=eligible,
             additional_row_cost=additional,
             plan=plan,
-            candidate_count=int(ranking.eligible.sum().item()),
+            candidate_count=(
+                int(ranking.eligible.sum().item())
+                if terrain_required
+                else 0
+            ),
+            terrain_action_required=terrain_required,
+            fallback_row_eligibility=fallback,
         )
