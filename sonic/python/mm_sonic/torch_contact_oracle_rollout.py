@@ -68,7 +68,7 @@ ORACLE_ARRAY_SHAPES = {
     "landing_error_m": (),
     "minimum_swing_clearance_m": (),
 }
-ORACLE_IMPLEMENTATION_ID = "g1-contact-oracle/mirrored-foothold-shortlist-v3"
+ORACLE_IMPLEMENTATION_ID = "g1-contact-oracle/route-anchored-continuity-v4"
 
 
 @dataclass(frozen=True)
@@ -156,7 +156,10 @@ class OracleMatrix:
 
 
 def _command_arrays(
-    route: OmniRoute, stair_frame: StairFrame, device: torch.device
+    route: OmniRoute,
+    stair_frame: StairFrame,
+    device: torch.device,
+    origin_world_xy: torch.Tensor,
 ) -> tuple[CommandSchedule, torch.Tensor]:
     expanded = world_commands(stair_frame, route)
     velocities = []
@@ -176,6 +179,7 @@ def _command_arrays(
             heading_world_yaw=torch.tensor(
                 headings, dtype=torch.float32, device=device
             ),
+            origin_world_xy=origin_world_xy,
         ),
         torch.tensor(segments, dtype=torch.int64, device=device),
     )
@@ -404,7 +408,10 @@ def run_oracle_route(
     if not paths or any(not isinstance(path, str) or not path for path in paths):
         raise ContractError("contact oracle clip paths are invalid")
     schedule, segment_indices = _command_arrays(
-        route, stair_frame, initial_state.root_position_world.device
+        route,
+        stair_frame,
+        initial_state.root_position_world.device,
+        initial_state.root_position_world[:2],
     )
     rows = {name: [] for name in ORACLE_ARRAY_SHAPES}
     events: list[OraclePlanEvent] = []

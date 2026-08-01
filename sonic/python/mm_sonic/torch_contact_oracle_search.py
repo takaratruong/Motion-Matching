@@ -375,10 +375,12 @@ class CommandSchedule:
     velocity_world_xy: torch.Tensor
     heading_world_yaw: torch.Tensor
     dt: float = 0.02
+    origin_world_xy: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         velocity = self.velocity_world_xy
         heading = self.heading_world_yaw
+        origin = self.origin_world_xy
         if (
             not isinstance(velocity, torch.Tensor)
             or velocity.ndim != 2
@@ -395,11 +397,26 @@ class CommandSchedule:
             or not isinstance(self.dt, (int, float))
             or not math.isfinite(float(self.dt))
             or float(self.dt) <= 0.0
+            or (
+                origin is not None
+                and (
+                    not isinstance(origin, torch.Tensor)
+                    or tuple(origin.shape) != (2,)
+                    or origin.dtype != velocity.dtype
+                    or origin.device != velocity.device
+                    or not torch.isfinite(origin).all()
+                )
+            )
         ):
             raise ContractError("contact oracle command schedule is invalid")
         object.__setattr__(self, "velocity_world_xy", velocity.detach().clone())
         object.__setattr__(self, "heading_world_yaw", heading.detach().clone())
         object.__setattr__(self, "dt", float(self.dt))
+        object.__setattr__(
+            self,
+            "origin_world_xy",
+            None if origin is None else origin.detach().clone(),
+        )
 
     @property
     def frame_count(self) -> int:
@@ -461,6 +478,23 @@ class CommandSchedule:
         if type(frame) is not int or frame < 0:
             raise ContractError("contact oracle command frame is invalid")
         return self.heading_world_yaw[min(frame, self.frame_count - 1)]
+
+    def target_positions(self, frames: torch.Tensor) -> torch.Tensor:
+        if self.origin_world_xy is None:
+            raise ContractError("contact oracle command path has no origin")
+        return self.origin_world_xy[None, :] + self.displacements(0, frames)
+
+    def target_position(self, frame: int) -> torch.Tensor:
+        if type(frame) is not int or frame < 0:
+            raise ContractError("contact oracle command target frame is invalid")
+        target = self.target_positions(
+            torch.tensor(
+                (frame,),
+                dtype=torch.int64,
+                device=self.velocity_world_xy.device,
+            )
+        )
+        return target[0]
 
     def headings(
         self, start_frame: int, steps: torch.Tensor
@@ -925,10 +959,14 @@ class _ActionEntryCache:
         if candidates.numel() <= limit:
             return candidates
         steps = self.frame_steps[candidates]
-        desired = schedule.displacements(state.route_frame, steps)
         actual = _rotate_xy(
             self.root_displacement_local[candidates], state.root_yaw_world
         )
+        if schedule.origin_world_xy is None:
+            desired = schedule.displacements(state.route_frame, steps)
+        else:
+            desired = schedule.target_positions(steps + state.route_frame)
+            actual = actual + state.root_position_world[None, :2]
         path = float(config.path_weight) * torch.sum(
             torch.square(actual - desired), dim=1
         )
@@ -954,6 +992,27 @@ class _ActionEntryCache:
                 - state.joint_velocity[None, :]
             ),
             dim=1,
+        )
+        entry_foot_xy = (
+            _rotate_xy(
+                self.foot_position_local[candidates, :, :2],
+                state.root_yaw_world,
+            )
+            + state.root_position_world[None, None, :2]
+        )
+        entry_foot_z = (
+            self.foot_position_local[candidates, :, 2]
+            + state.root_position_world[2]
+        )
+        entry_feet = torch.cat(
+            (entry_foot_xy, entry_foot_z[..., None]), dim=2
+        )
+        entry_contact = float(config.stance_motion_weight) * torch.mean(
+            torch.square(
+                entry_feet[:, state.support_mask]
+                - state.foot_position_world[None, state.support_mask]
+            ),
+            dim=(1, 2),
         )
         terminal = self.frame_steps[candidates]
         swing = self.swing_foot[candidates]
@@ -1003,6 +1062,7 @@ class _ActionEntryCache:
             + facing
             + joint_position
             + joint_velocity
+            + entry_contact
             + target_cost
         )
         order = torch.argsort(score, stable=True)
@@ -1183,8 +1243,17 @@ def _edge_cost(
 ) -> OracleCost:
     action = placed.action
     steps = action.frame_count - 1
-    desired_displacement = schedule.displacement(state.route_frame, steps)
-    actual_displacement = placed.root_position_world[-1, :2] - state.root_position_world[:2]
+    if schedule.origin_world_xy is None:
+        desired_displacement = schedule.displacement(state.route_frame, steps)
+        actual_displacement = (
+            placed.root_position_world[-1, :2]
+            - state.root_position_world[:2]
+        )
+    else:
+        desired_displacement = schedule.target_position(
+            state.route_frame + steps
+        )
+        actual_displacement = placed.root_position_world[-1, :2]
     path = float(
         config.path_weight
         * torch.sum(torch.square(actual_displacement - desired_displacement)).item()
@@ -1230,6 +1299,12 @@ def _edge_cost(
         config.joint_velocity_weight
         * torch.sum(torch.square(action.joint_velocity[0] - state.joint_velocity)).item()
     )
+    entry_contact_error = torch.mean(
+        torch.square(
+            placed.foot_position_world[0, state.support_mask]
+            - state.foot_position_world[state.support_mask]
+        )
+    )
     stance = action.entry_support.clone()
     stance[action.swing_foot] = False
     if bool(stance.any().item()):
@@ -1237,11 +1312,13 @@ def _edge_cost(
             placed.foot_position_world[:, stance]
             - placed.foot_position_world[0:1, stance]
         )
-        stance_motion = float(
-            config.stance_motion_weight * torch.mean(torch.square(displacement)).item()
-        )
+        stance_error = torch.mean(torch.square(displacement))
     else:
-        stance_motion = 0.0
+        stance_error = torch.zeros_like(entry_contact_error)
+    stance_motion = float(
+        config.stance_motion_weight
+        * (entry_contact_error + stance_error).item()
+    )
     clearance_deficit = max(0.0, 0.05 - feasibility.minimum_swing_clearance_m)
     repetition_count = state.source_history.count(action.source_key)
     return OracleCost(

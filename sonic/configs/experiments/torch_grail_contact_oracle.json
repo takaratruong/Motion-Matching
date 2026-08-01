@@ -24,10 +24,10 @@
     "foothold_weight": 50.0,
     "joint_position_weight": 0.5,
     "joint_velocity_weight": 0.05,
-    "path_weight": 25.0,
+    "path_weight": 100.0,
     "reachability_weight": 10.0,
     "repetition_weight": 2.0,
-    "stance_motion_weight": 100.0,
+    "stance_motion_weight": 1000.0,
     "timing_weight": 0.1
   }
 }

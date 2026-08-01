@@ -118,6 +118,8 @@ class ContactOracleSearchTests(unittest.TestCase):
         self.assertEqual(loaded.search.horizon_landings, 4)
         self.assertEqual(loaded.search.beam_width, 32)
         self.assertEqual(loaded.search.transition_candidate_count, 32)
+        self.assertEqual(loaded.search.path_weight, 100.0)
+        self.assertEqual(loaded.search.stance_motion_weight, 1000.0)
         self.assertEqual(
             loaded.search.constraints.maximum_joint_position_error_rad, 2.5
         )
@@ -410,6 +412,72 @@ class ContactOracleSearchTests(unittest.TestCase):
         self.assertEqual(
             dict(plan.expansion.rejected_by_reason)["shortlist-pruned"], 1
         )
+
+    def test_route_anchored_path_cost_recovers_accumulated_lag(self):
+        slow = _graph_action(0, entry=0.0, terminal=0.0, dx=0.006)
+        catch_up = _graph_action(1, entry=0.0, terminal=0.0, dx=0.066)
+        state = replace(_state(), route_frame=10)
+        schedule = oracle_search.CommandSchedule(
+            velocity_world_xy=torch.tensor(((0.3, 0.0),) * 100),
+            heading_world_yaw=torch.zeros(100),
+            origin_world_xy=state.root_position_world[:2],
+        )
+
+        def flat_surface(points):
+            return torch.zeros(
+                points.shape[:-1], dtype=points.dtype, device=points.device
+            )
+
+        plan = search_contact_plan(
+            initial_state=state,
+            actions=(slow, catch_up),
+            command_schedule=schedule,
+            sample_surface=flat_surface,
+            config=OracleSearchConfig(
+                horizon_landings=1,
+                beam_width=1,
+                transition_candidate_count=1,
+                path_weight=1000.0,
+                foothold_weight=0.0,
+            ),
+        )
+
+        self.assertEqual(plan.action_indices, (1,))
+
+    def test_layered_shortlist_prefers_continuous_entry_contact(self):
+        bad = _graph_action(0, entry=0.0, terminal=0.0, dx=0.006)
+        bad_feet = bad.foot_position_local.clone()
+        bad_feet[:, 0, 0] += 0.07
+        bad = replace(bad, foot_position_local=bad_feet)
+        good = _graph_action(1, entry=0.0, terminal=0.0, dx=0.006)
+        good_feet = good.foot_position_local.clone()
+        good_feet[:, 0, 0] += 0.01
+        good = replace(good, foot_position_local=good_feet)
+
+        def flat_surface(points):
+            return torch.zeros(
+                points.shape[:-1], dtype=points.dtype, device=points.device
+            )
+
+        plan = search_contact_plan(
+            initial_state=_state(),
+            actions=(bad, good),
+            command_schedule=constant_command_schedule(
+                velocity_world_xy=(0.3, 0.0),
+                heading_world_yaw=0.0,
+                frames=4,
+                device="cpu",
+            ),
+            sample_surface=flat_surface,
+            config=OracleSearchConfig(
+                horizon_landings=1,
+                beam_width=1,
+                transition_candidate_count=1,
+            ),
+        )
+
+        self.assertEqual(plan.action_indices, (1,))
+        self.assertLess(plan.step_costs[0].stance_motion, 0.02)
 
     def test_shortlisted_terrain_validation_is_batched(self):
         action = _one_meter_forward_action()
