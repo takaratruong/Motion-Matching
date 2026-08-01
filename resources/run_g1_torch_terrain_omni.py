@@ -39,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
             "hybrid",
             "layered",
             "layered-hybrid",
+            "layered-graph-hybrid",
             "continuous-control",
         ),
         help="Condition contact-segment entries on this foothold ablation arm.",
@@ -48,6 +49,53 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.06,
         help="Hard per-contact height tolerance; must remain below half a riser.",
+    )
+    parser.add_argument(
+        "--turn-root-lateral-cost-weight",
+        type=float,
+        default=100.0,
+        help="Penalty for predicted turn displacement across the command axis.",
+    )
+    parser.add_argument(
+        "--turn-root-progress-cost-weight",
+        type=float,
+        default=10.0,
+        help="Penalty for insufficient predicted turn progress along the command axis.",
+    )
+    parser.add_argument(
+        "--turn-sequence-candidate-count",
+        type=int,
+        default=64,
+        help="Number of path-ranked turn entries passed to exact placement validation.",
+    )
+    parser.add_argument(
+        "--heading-maintenance-yaw-cost-weight",
+        type=float,
+        default=10.0,
+        help="Soft terminal-yaw cost used before an explicit turn begins.",
+    )
+    parser.add_argument(
+        "--turn-lateral-root-warp-gain",
+        type=float,
+        default=0.606,
+        help="Fraction of per-frame turn drift removed by trajectory warping.",
+    )
+    parser.add_argument(
+        "--small-turn-lateral-root-warp-gain",
+        type=float,
+        default=0.25,
+        help="Maximum drift-warp gain for turns of 60 degrees or less.",
+    )
+    parser.add_argument(
+        "--reversal-lateral-root-warp-gain",
+        type=float,
+        default=0.25,
+        help="Maximum drift-warp gain for turns greater than 135 degrees.",
+    )
+    parser.add_argument(
+        "--strafe-action-gate",
+        action="store_true",
+        help="Enable the experimental velocity/facing lateral action bin.",
     )
     parser.add_argument(
         "--maximum-step-time-ms",
@@ -143,15 +191,42 @@ def main() -> int:
             FootholdActionIndex,
             FootholdActionPolicy,
             FootholdSelectionArm,
+            FootholdTransitionGraph,
         )
 
+        action_index = FootholdActionIndex.from_dataset(
+            resolved.dataset, contact_policy.index
+        )
+        arm = FootholdSelectionArm(args.foothold_arm)
         foothold_policy = FootholdActionPolicy(
-            index=FootholdActionIndex.from_dataset(
-                resolved.dataset, contact_policy.index
-            ),
+            index=action_index,
             extension=resolved.measurement_extension,
-            arm=FootholdSelectionArm(args.foothold_arm),
+            arm=arm,
+            transition_graph=(
+                FootholdTransitionGraph.from_dataset(
+                    action_index, resolved.dataset
+                )
+                if arm is FootholdSelectionArm.LAYERED_GRAPH_HYBRID
+                else None
+            ),
+            turn_sequence_lookahead=(
+                arm is FootholdSelectionArm.LAYERED_GRAPH_HYBRID
+            ),
             height_tolerance_m=args.foothold_height_tolerance_m,
+            turn_root_lateral_cost_weight=args.turn_root_lateral_cost_weight,
+            turn_root_progress_cost_weight=args.turn_root_progress_cost_weight,
+            turn_sequence_candidate_count=args.turn_sequence_candidate_count,
+            heading_maintenance_yaw_cost_weight=(
+                args.heading_maintenance_yaw_cost_weight
+            ),
+            turn_lateral_root_warp_gain=args.turn_lateral_root_warp_gain,
+            small_turn_lateral_root_warp_gain=(
+                args.small_turn_lateral_root_warp_gain
+            ),
+            reversal_lateral_root_warp_gain=(
+                args.reversal_lateral_root_warp_gain
+            ),
+            strafe_action_gate_enabled=args.strafe_action_gate,
         )
     if args.maximum_step_time_ms <= 0.0:
         raise ValueError("maximum step time must be positive")

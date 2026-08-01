@@ -451,7 +451,15 @@ def run_live_viewer(
     device: str,
     contact_segments: bool = False,
     foothold_arm: str | None = None,
-    foothold_height_tolerance_m: float = 0.07,
+    foothold_height_tolerance_m: float = 0.04,
+    turn_root_lateral_cost_weight: float = 100.0,
+    turn_root_progress_cost_weight: float = 10.0,
+    turn_sequence_candidate_count: int = 64,
+    heading_maintenance_yaw_cost_weight: float = 0.3,
+    turn_lateral_root_warp_gain: float = 0.606,
+    small_turn_lateral_root_warp_gain: float = 0.25,
+    reversal_lateral_root_warp_gain: float = 0.25,
+    strafe_action_gate: bool = False,
 ) -> None:
     """Run the dense 50 Hz matcher and display each committed state."""
 
@@ -499,15 +507,48 @@ def run_live_viewer(
             FootholdActionIndex,
             FootholdActionPolicy,
             FootholdSelectionArm,
+            FootholdTransitionGraph,
         )
 
+        action_index = FootholdActionIndex.from_dataset(
+            resolved.dataset, contact_segment_policy.index
+        )
+        arm = FootholdSelectionArm(foothold_arm)
         foothold_action_policy = FootholdActionPolicy(
-            index=FootholdActionIndex.from_dataset(
-                resolved.dataset, contact_segment_policy.index
-            ),
+            index=action_index,
             extension=resolved.measurement_extension,
-            arm=FootholdSelectionArm(foothold_arm),
+            arm=arm,
+            transition_graph=(
+                FootholdTransitionGraph.from_dataset(
+                    action_index, resolved.dataset
+                )
+                if arm is FootholdSelectionArm.LAYERED_GRAPH_HYBRID
+                else None
+            ),
+            turn_sequence_lookahead=(
+                arm is FootholdSelectionArm.LAYERED_GRAPH_HYBRID
+            ),
             height_tolerance_m=float(foothold_height_tolerance_m),
+            turn_root_lateral_cost_weight=float(
+                turn_root_lateral_cost_weight
+            ),
+            turn_root_progress_cost_weight=float(
+                turn_root_progress_cost_weight
+            ),
+            turn_sequence_candidate_count=int(
+                turn_sequence_candidate_count
+            ),
+            heading_maintenance_yaw_cost_weight=float(
+                heading_maintenance_yaw_cost_weight
+            ),
+            turn_lateral_root_warp_gain=float(turn_lateral_root_warp_gain),
+            small_turn_lateral_root_warp_gain=float(
+                small_turn_lateral_root_warp_gain
+            ),
+            reversal_lateral_root_warp_gain=float(
+                reversal_lateral_root_warp_gain
+            ),
+            strafe_action_gate_enabled=bool(strafe_action_gate),
         )
     matcher_config = matcher_config_from_resolved(resolved.resolved_config)
     matcher = TorchMotionMatcher.from_folder(
@@ -695,6 +736,7 @@ def build_live_viewer_argument_parser() -> argparse.ArgumentParser:
             "hybrid",
             "layered",
             "layered-hybrid",
+            "layered-graph-hybrid",
             "continuous-control",
         ),
         help="Condition terrain entries with the selected foothold policy.",
@@ -702,7 +744,46 @@ def build_live_viewer_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--foothold-height-tolerance-m",
         type=float,
-        default=0.07,
+        default=0.04,
+    )
+    parser.add_argument(
+        "--turn-root-lateral-cost-weight",
+        type=float,
+        default=100.0,
+    )
+    parser.add_argument(
+        "--turn-root-progress-cost-weight",
+        type=float,
+        default=10.0,
+    )
+    parser.add_argument(
+        "--turn-lateral-root-warp-gain",
+        type=float,
+        default=0.606,
+    )
+    parser.add_argument(
+        "--small-turn-lateral-root-warp-gain",
+        type=float,
+        default=0.25,
+    )
+    parser.add_argument(
+        "--reversal-lateral-root-warp-gain",
+        type=float,
+        default=0.25,
+    )
+    parser.add_argument(
+        "--strafe-action-gate",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--turn-sequence-candidate-count",
+        type=int,
+        default=64,
+    )
+    parser.add_argument(
+        "--heading-maintenance-yaw-cost-weight",
+        type=float,
+        default=0.3,
     )
     return parser
 
@@ -717,6 +798,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         contact_segments=args.contact_segments,
         foothold_arm=args.foothold_arm,
         foothold_height_tolerance_m=args.foothold_height_tolerance_m,
+        turn_root_lateral_cost_weight=args.turn_root_lateral_cost_weight,
+        turn_root_progress_cost_weight=args.turn_root_progress_cost_weight,
+        turn_sequence_candidate_count=args.turn_sequence_candidate_count,
+        heading_maintenance_yaw_cost_weight=(
+            args.heading_maintenance_yaw_cost_weight
+        ),
+        turn_lateral_root_warp_gain=args.turn_lateral_root_warp_gain,
+        small_turn_lateral_root_warp_gain=(
+            args.small_turn_lateral_root_warp_gain
+        ),
+        reversal_lateral_root_warp_gain=(
+            args.reversal_lateral_root_warp_gain
+        ),
+        strafe_action_gate=args.strafe_action_gate,
     )
     return 0
 

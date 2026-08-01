@@ -192,6 +192,34 @@ class SameStairOmnidirectionalRouteTests(unittest.TestCase):
                 routes[name].commands[-1].heading_stair_yaw, expected
             )
 
+    def test_all_turns_replay_full_speed_live_wasd(self):
+        routes = {route.name: route for route in same_stair_routes()}
+        for name in (
+            "turn-45-lower-left",
+            "turn-45-lower-right",
+            "turn-90-middle-left",
+            "turn-90-middle-right",
+            "turn-180-upper-left",
+            "turn-180-upper-right",
+        ):
+            turn = routes[name].commands[-1]
+            self.assertAlmostEqual(
+                math.hypot(*turn.velocity_stair_xy), 0.38
+            )
+            self.assertGreaterEqual(turn.frames, 100)
+            self.assertAlmostEqual(
+                turn.heading_stair_yaw,
+                math.atan2(
+                    turn.velocity_stair_xy[1],
+                    turn.velocity_stair_xy[0],
+                ),
+            )
+            self.assertIn(turn.segment, routes[name].outcome.required_segments)
+            self.assertLessEqual(
+                routes[name].outcome.final_command_lateral_drift_max_m,
+                0.10,
+            )
+
     def test_sideways_and_backward_routes_keep_facing_independent_of_velocity(self):
         routes = {route.name: route for route in same_stair_routes()}
         for name in (

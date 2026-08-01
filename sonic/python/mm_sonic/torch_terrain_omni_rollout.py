@@ -17,8 +17,10 @@ import numpy as np
 import torch
 
 from .torch_terrain_omni_metrics import (
+    MOVING_COMMAND_SPEED_MIN_MPS,
     OmniRouteMetrics,
     RescueEvent,
+    STALL_ROOT_SPEED_MAX_MPS,
     evaluate_omni_route,
 )
 from .torch_terrain_omni_routes import OmniRoute, StairFrame, world_commands
@@ -107,6 +109,9 @@ def evaluate_route_outcome(
         )
 
     reasons: list[str] = []
+    expected_frame_count = sum(command.frames for command in route.commands)
+    if frame_count != expected_frame_count:
+        reasons.append("route:incomplete")
     ratios: list[tuple[str, float]] = []
     by_segment = {
         command.segment: index for index, command in enumerate(route.commands)
@@ -158,6 +163,49 @@ def evaluate_route_outcome(
     tolerance = route.outcome.final_heading_error_max_rad
     if tolerance is not None and final_heading_error > tolerance:
         reasons.append("final-heading:error")
+
+    drift_limit = route.outcome.final_command_lateral_drift_max_m
+    if drift_limit is not None:
+        final_segment = len(route.commands) - 1
+        frames = np.flatnonzero(segment_index == final_segment)
+        if frames.size < 2:
+            lateral_drift = math.inf
+        else:
+            command = np.mean(velocity[frames], axis=0)
+            speed = float(np.linalg.norm(command))
+            if speed <= 0.0:
+                lateral_drift = math.inf
+            else:
+                direction = command / speed
+                lateral = np.array((-direction[1], direction[0]))
+                lateral_drift = abs(float(
+                    np.dot(
+                        root[frames[-1], :2] - root[frames[0], :2],
+                        lateral,
+                    )
+                ))
+        if lateral_drift > float(drift_limit):
+            reasons.append("final-command:lateral-drift")
+
+    stall_limit = route.outcome.maximum_moving_stall_frames
+    if stall_limit is not None:
+        root_speed = np.zeros(frame_count, dtype=np.float64)
+        if frame_count > 1:
+            root_speed[1:] = np.linalg.norm(
+                np.diff(root[:, :2], axis=0), axis=1
+            ) / DT_S
+        moving = np.linalg.norm(velocity, axis=1) >= (
+            MOVING_COMMAND_SPEED_MIN_MPS
+        )
+        if frame_count:
+            moving[0] = False
+        stalled = moving & (root_speed <= STALL_ROOT_SPEED_MAX_MPS)
+        longest = current = 0
+        for value in stalled:
+            current = current + 1 if bool(value) else 0
+            longest = max(longest, current)
+        if longest > int(stall_limit):
+            reasons.append("moving-command:stall")
 
     return RouteOutcomeEvaluation(
         completed=not reasons,

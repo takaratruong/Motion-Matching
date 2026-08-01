@@ -47,6 +47,8 @@ class RouteOutcomeContract:
     min_elevated_foot_samples: int = 0
     final_surface: Literal["any", "flat", "elevated"] = "any"
     final_heading_error_max_rad: float | None = None
+    final_command_lateral_drift_max_m: float | None = None
+    maximum_moving_stall_frames: int | None = None
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,7 @@ def _route(
     required_segments: tuple[str, ...],
     final_surface: Literal["any", "flat", "elevated"] = "any",
     final_heading_error_max_rad: float | None = None,
+    final_command_lateral_drift_max_m: float | None = None,
 ) -> OmniRoute:
     return OmniRoute(
         name=name,
@@ -90,6 +93,10 @@ def _route(
             min_elevated_foot_samples=20,
             final_surface=final_surface,
             final_heading_error_max_rad=final_heading_error_max_rad,
+            final_command_lateral_drift_max_m=(
+                final_command_lateral_drift_max_m
+            ),
+            maximum_moving_stall_frames=10,
         ),
     )
 
@@ -141,30 +148,39 @@ _TURN_45_LEFT = _route(
     "turn",
     (
         ("approach-lower", 190, 0.38, 0.00, 0.0),
-        ("pivot-45", 50, 0.05, 0.05, math.pi / 4.0),
+        (
+            "pivot-45",
+            100,
+            0.38 / math.sqrt(2.0),
+            0.38 / math.sqrt(2.0),
+            math.pi / 4.0,
+        ),
     ),
-    required_segments=("approach-lower",),
+    required_segments=("approach-lower", "pivot-45"),
     final_heading_error_max_rad=0.35,
+    final_command_lateral_drift_max_m=0.10,
 )
 _TURN_90_LEFT = _route(
     "turn-90-middle-left",
     "turn",
     (
         ("ascend-middle", 225, 0.38, 0.00, 0.0),
-        ("pivot-90", 70, 0.00, 0.08, math.pi / 2.0),
+        ("pivot-90", 120, 0.00, 0.38, math.pi / 2.0),
     ),
-    required_segments=("ascend-middle",),
+    required_segments=("ascend-middle", "pivot-90"),
     final_heading_error_max_rad=0.35,
+    final_command_lateral_drift_max_m=0.10,
 )
 _TURN_180_LEFT = _route(
     "turn-180-upper-left",
     "turn",
     (
         ("ascend-upper", 260, 0.38, 0.00, 0.0),
-        ("pivot-180", 100, -0.05, 0.05, math.pi),
+        ("pivot-180", 160, -0.38, 0.00, math.pi),
     ),
-    required_segments=("ascend-upper",),
+    required_segments=("ascend-upper", "pivot-180"),
     final_heading_error_max_rad=0.35,
+    final_command_lateral_drift_max_m=0.10,
 )
 _DIAGONAL_UP_LEFT = _route(
     "diagonal-up-left",

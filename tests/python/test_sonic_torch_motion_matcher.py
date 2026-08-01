@@ -210,6 +210,138 @@ def _install_contact_policy(
 
 
 class TorchMotionMatcherTests(unittest.TestCase):
+    def test_requested_turn_warp_corrects_only_lateral_root_error(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(root, device="cpu")
+            matcher._foothold_action_policy = SimpleNamespace(
+                turn_lateral_root_warp_gain=0.25,
+                _requested_turn_active=True,
+                _requested_heading_world_yaw=torch.tensor(0.0),
+                _requested_turn_delta_rad=math.pi / 4.0,
+            )
+            matcher.reset()
+            state = matcher._state
+            shaped = SimpleNamespace(
+                velocity_world_xy=torch.tensor((0.4, 0.0))
+            )
+
+            shift = matcher._requested_turn_lateral_warp_shift(
+                state,
+                shaped,
+                torch.tensor((0.1, 0.1, 0.8)),
+            )
+
+        torch.testing.assert_close(shift, torch.tensor((0.0, -0.025)))
+
+    def test_requested_turn_warp_uses_target_not_shaped_heading(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(root, device="cpu")
+            matcher._foothold_action_policy = SimpleNamespace(
+                turn_lateral_root_warp_gain=0.25,
+                _requested_turn_active=True,
+                _requested_heading_world_yaw=torch.tensor(0.0),
+                _requested_turn_delta_rad=math.pi / 4.0,
+            )
+            matcher.reset()
+            state = matcher._state
+            shaped = SimpleNamespace(
+                velocity_world_xy=torch.tensor((0.0, 0.4))
+            )
+
+            shift = matcher._requested_turn_lateral_warp_shift(
+                state,
+                shaped,
+                torch.tensor((0.1, 0.1, 0.8)),
+            )
+
+        torch.testing.assert_close(shift, torch.tensor((0.0, -0.025)))
+
+    def test_large_requested_turn_warp_uses_shaped_direction(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(root, device="cpu")
+            matcher._foothold_action_policy = SimpleNamespace(
+                turn_lateral_root_warp_gain=0.25,
+                _requested_turn_active=True,
+                _requested_heading_world_yaw=torch.tensor(0.0),
+                _requested_turn_delta_rad=math.pi / 2.0,
+            )
+            matcher.reset()
+            state = matcher._state
+            shaped = SimpleNamespace(
+                velocity_world_xy=torch.tensor((0.0, 0.4))
+            )
+
+            shift = matcher._requested_turn_lateral_warp_shift(
+                state,
+                shaped,
+                torch.tensor((0.1, 0.1, 0.8)),
+            )
+
+        torch.testing.assert_close(shift, torch.tensor((-0.025, 0.0)))
+
+    def test_reversal_turn_warp_caps_gain(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(root, device="cpu")
+            matcher._foothold_action_policy = SimpleNamespace(
+                turn_lateral_root_warp_gain=0.606,
+                reversal_lateral_root_warp_gain=0.25,
+                _requested_turn_active=True,
+                _requested_heading_world_yaw=torch.tensor(math.pi),
+                _requested_turn_delta_rad=math.pi,
+            )
+            matcher.reset()
+            state = matcher._state
+            shaped = SimpleNamespace(
+                velocity_world_xy=torch.tensor((0.0, 0.4))
+            )
+
+            shift = matcher._requested_turn_lateral_warp_shift(
+                state,
+                shaped,
+                torch.tensor((0.1, 0.1, 0.8)),
+            )
+
+        torch.testing.assert_close(shift, torch.tensor((-0.025, 0.0)))
+
+    def test_small_turn_warp_caps_gain(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(root, device="cpu")
+            matcher._foothold_action_policy = SimpleNamespace(
+                turn_lateral_root_warp_gain=0.606,
+                small_turn_lateral_root_warp_gain=0.25,
+                _requested_turn_active=True,
+                _requested_heading_world_yaw=torch.tensor(0.0),
+                _requested_turn_delta_rad=math.pi / 4.0,
+            )
+            matcher.reset()
+            state = matcher._state
+            shaped = SimpleNamespace(
+                velocity_world_xy=torch.tensor((0.0, 0.4))
+            )
+
+            shift = matcher._requested_turn_lateral_warp_shift(
+                state,
+                shaped,
+                torch.tensor((0.1, 0.1, 0.8)),
+            )
+
+        torch.testing.assert_close(shift, torch.tensor((0.0, -0.025)))
+
     def test_reset_can_place_root_at_requested_world_xy(self):
         arrays = build_varying_takara_arrays(frames=100)
         with tempfile.TemporaryDirectory() as tmp:
@@ -263,6 +395,72 @@ class TorchMotionMatcherTests(unittest.TestCase):
         self.assertEqual(extended.segment.end_frame, 47)
         self.assertEqual(extended.source_support_mask.shape, (27, 2))
         self.assertEqual(short.segment.end_frame, 35)
+
+    def test_heading_chunk_cap_can_shorten_a_long_base_segment(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(root, device="cpu")
+            contact = _install_contact_policy(matcher, start=20, end=45)
+            matcher._foothold_action_policy = SimpleNamespace(
+                index=SimpleNamespace(
+                    entry=lambda clip, frame: (
+                        SimpleNamespace(end_frame=60)
+                        if (clip, frame) == (0, 20)
+                        else None
+                    )
+                )
+            )
+            placement = SegmentPlacement(
+                segment=ContactSegment(0, 20, 45, 0),
+                vertical_offset_m=0.0,
+                source_support_mask=contact.index.support_mask(0)[20:45],
+            )
+
+            shortened = matcher._extend_foothold_placement(
+                placement, maximum_chunk_frames=15
+            )
+
+        self.assertEqual(shortened.segment.end_frame, 35)
+        self.assertEqual(shortened.source_support_mask.shape, (15, 2))
+
+    def test_rejected_command_interrupt_stops_at_next_replanning_entry(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(root, device="cpu")
+            contact = _install_contact_policy(matcher, start=20, end=30)
+            matcher._foothold_action_policy = SimpleNamespace(
+                index=SimpleNamespace(
+                    entry=lambda clip, frame: (
+                        SimpleNamespace(end_frame=60)
+                        if (clip, frame) == (0, 20)
+                        else None
+                    ),
+                    next_entry_frame=lambda clip, frame: (
+                        40 if clip == 0 and frame < 40 else None
+                    ),
+                )
+            )
+            commitment = SegmentCommitment(
+                0,
+                20,
+                60,
+                0,
+                0.0,
+                command_direction_world_xy=(1.0, 0.0),
+                command_heading_world_yaw=0.0,
+            )
+
+            shortened = matcher._shorten_interrupted_commitment(
+                commitment,
+                emitted_frame_index=30,
+            )
+
+        self.assertEqual(shortened.end_frame, 40)
+        self.assertEqual(shortened.command_direction_world_xy, (1.0, 0.0))
 
     def test_two_contact_action_does_not_latch_across_command_divergence(self):
         arrays = build_varying_takara_arrays(frames=100)

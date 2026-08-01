@@ -1,5 +1,6 @@
 import unittest
 import json
+import math
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -299,6 +300,78 @@ class OmnidirectionalRolloutContractTests(unittest.TestCase):
         failed = evaluate_route_outcome(route, no_progress)
         self.assertFalse(failed.completed)
         self.assertIn("segment:mount:progress", failed.failure_reasons)
+
+    def test_route_outcome_rejects_a_run_that_never_reaches_later_commands(self):
+        route = OmniRoute(
+            "turn-after-ascent",
+            (
+                RouteCommand((0.2, 0.0), 0.0, 4, "ascend", True),
+                RouteCommand((0.0, 0.2), 1.57, 4, "turn"),
+            ),
+            "turn",
+            RouteOutcomeContract(required_segments=("ascend",)),
+        )
+        arrays = {
+            "root_position_world": np.array(
+                [[0.00, 0.0, 0.8], [0.01, 0.0, 0.8],
+                 [0.02, 0.0, 0.8], [0.03, 0.0, 0.8]]
+            ),
+            "root_yaw_world": np.zeros(4),
+            "command_velocity_world_xy": np.tile((0.2, 0.0), (4, 1)),
+            "command_heading_world_yaw": np.zeros(4),
+            "command_segment_index": np.zeros(4, dtype=np.int32),
+            "foot_surface_height_m": np.zeros((4, 2)),
+        }
+
+        outcome = evaluate_route_outcome(route, arrays)
+
+        self.assertFalse(outcome.completed)
+        self.assertIn("route:incomplete", outcome.failure_reasons)
+
+    def test_route_outcome_rejects_terminal_command_lateral_drift(self):
+        route = OmniRoute(
+            "drifting-turn",
+            (RouteCommand((0.0, 0.2), math.pi / 2.0, 4, "turn", True),),
+            "turn",
+            RouteOutcomeContract(final_command_lateral_drift_max_m=0.05),
+        )
+        arrays = {
+            "root_position_world": np.array(
+                [[0.00, 0.00, 0.8], [0.03, 0.01, 0.8],
+                 [0.06, 0.02, 0.8], [0.09, 0.03, 0.8]]
+            ),
+            "root_yaw_world": np.full(4, math.pi / 2.0),
+            "command_velocity_world_xy": np.tile((0.0, 0.2), (4, 1)),
+            "command_heading_world_yaw": np.full(4, math.pi / 2.0),
+            "command_segment_index": np.zeros(4, dtype=np.int32),
+            "foot_surface_height_m": np.zeros((4, 2)),
+        }
+
+        outcome = evaluate_route_outcome(route, arrays)
+
+        self.assertFalse(outcome.completed)
+        self.assertIn("final-command:lateral-drift", outcome.failure_reasons)
+
+    def test_route_outcome_rejects_a_long_stall_under_moving_command(self):
+        route = OmniRoute(
+            "stalled-traverse",
+            (RouteCommand((0.2, 0.0), 0.0, 5, "move", True),),
+            "traverse",
+            RouteOutcomeContract(maximum_moving_stall_frames=2),
+        )
+        arrays = {
+            "root_position_world": np.tile((0.0, 0.0, 0.8), (5, 1)),
+            "root_yaw_world": np.zeros(5),
+            "command_velocity_world_xy": np.tile((0.2, 0.0), (5, 1)),
+            "command_heading_world_yaw": np.zeros(5),
+            "command_segment_index": np.zeros(5, dtype=np.int32),
+            "foot_surface_height_m": np.zeros((5, 2)),
+        }
+
+        outcome = evaluate_route_outcome(route, arrays)
+
+        self.assertFalse(outcome.completed)
+        self.assertIn("moving-command:stall", outcome.failure_reasons)
 
     def test_matrix_pass_requires_behavioral_outcome_completion(self):
         route = OmniRoute(

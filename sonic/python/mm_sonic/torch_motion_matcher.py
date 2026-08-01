@@ -1303,6 +1303,7 @@ class TorchMotionMatcher:
         state: _MatcherState,
         shaped: ShapedCommand,
         transition_costs: torch.Tensor,
+        requested_heading_world_yaw: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor | None,
         torch.Tensor | None,
@@ -1315,7 +1316,17 @@ class TorchMotionMatcher:
         if policy is None:
             return eligible, terrain_eligible, transition_costs, None
         try:
-            result = policy.prepare(state, shaped, self.database)
+            if getattr(policy, "accepts_requested_heading", False):
+                result = policy.prepare(
+                    state,
+                    shaped,
+                    self.database,
+                    requested_heading_world_yaw=(
+                        requested_heading_world_yaw
+                    ),
+                )
+            else:
+                result = policy.prepare(state, shaped, self.database)
             row_eligibility = result.row_eligibility
             additional_row_cost = result.additional_row_cost
             fallback_row_eligibility = getattr(
@@ -1802,7 +1813,7 @@ class TorchMotionMatcher:
             action_end,
             segment.start_frame + maximum_chunk_frames,
         )
-        if chunk_end <= segment.end_frame:
+        if chunk_end == segment.end_frame:
             return placement
         extended = ContactSegment(
             clip_index=segment.clip_index,
@@ -1839,6 +1850,37 @@ class TorchMotionMatcher:
             ):
                 return placement
         return extended_placement
+
+    def _shorten_interrupted_commitment(
+        self,
+        commitment: SegmentCommitment,
+        *,
+        emitted_frame_index: int,
+    ) -> SegmentCommitment:
+        if (
+            not isinstance(commitment, SegmentCommitment)
+            or type(emitted_frame_index) is not int
+            or emitted_frame_index < commitment.start_frame
+        ):
+            raise ContractError("interrupted commitment state is invalid")
+        index = getattr(self._foothold_action_policy, "index", None)
+        next_entry = getattr(index, "next_entry_frame", None)
+        if not callable(next_entry):
+            return commitment
+        boundary = next_entry(commitment.clip_index, emitted_frame_index)
+        if boundary is None or boundary >= commitment.end_frame:
+            return commitment
+        if type(boundary) is not int or boundary <= emitted_frame_index:
+            raise ContractError("interrupted commitment boundary is invalid")
+        return SegmentCommitment(
+            clip_index=commitment.clip_index,
+            start_frame=commitment.start_frame,
+            end_frame=boundary,
+            entering_foot=commitment.entering_foot,
+            vertical_offset_m=commitment.vertical_offset_m,
+            command_direction_world_xy=commitment.command_direction_world_xy,
+            command_heading_world_yaw=commitment.command_heading_world_yaw,
+        )
 
     def _rerank_transition_window(
         self,
@@ -2180,7 +2222,19 @@ class TorchMotionMatcher:
         dense_root_quaternion = _quat_normalize(
             _quat_mul(_quat_from_scaled_axis(qao), rq)
         )
+        root_warp_shift = self._requested_turn_lateral_warp_shift(
+            state,
+            shaped,
+            dense_root_position[0],
+        )
+        if bool((root_warp_shift != 0.0).any().item()):
+            translation = translation + root_warp_shift
+            dense_root_position = dense_root_position.clone()
+            dense_root_position[:, :2] += root_warp_shift
         dense_body_position = bp + bao
+        if bool((root_warp_shift != 0.0).any().item()):
+            dense_body_position = dense_body_position.clone()
+            dense_body_position[..., :2] += root_warp_shift
         dense_body_velocity = bv + bvo
         segment_validation = None
         if placement is not None:
@@ -2393,6 +2447,92 @@ class TorchMotionMatcher:
             float(blend),
         )
         return output
+
+    def _requested_turn_lateral_warp_shift(
+        self,
+        state: _MatcherState,
+        shaped: object,
+        next_root_position: torch.Tensor,
+    ) -> torch.Tensor:
+        policy = self._foothold_action_policy
+        gain = getattr(policy, "turn_lateral_root_warp_gain", 0.0)
+        small_turn_gain = getattr(
+            policy, "small_turn_lateral_root_warp_gain", 0.25
+        )
+        reversal_gain = getattr(
+            policy, "reversal_lateral_root_warp_gain", 0.25
+        )
+        active = getattr(policy, "_requested_turn_active", False)
+        target_yaw = getattr(policy, "_requested_heading_world_yaw", None)
+        turn_delta = getattr(policy, "_requested_turn_delta_rad", 0.0)
+        try:
+            command = shaped.velocity_world_xy
+        except AttributeError as error:
+            raise ContractError("turn root warp command is invalid") from error
+        if (
+            isinstance(gain, bool)
+            or not isinstance(gain, (int, float))
+            or not math.isfinite(float(gain))
+            or not 0.0 <= float(gain) <= 1.0
+            or isinstance(small_turn_gain, bool)
+            or not isinstance(small_turn_gain, (int, float))
+            or not math.isfinite(float(small_turn_gain))
+            or not 0.0 <= float(small_turn_gain) <= 1.0
+            or isinstance(reversal_gain, bool)
+            or not isinstance(reversal_gain, (int, float))
+            or not math.isfinite(float(reversal_gain))
+            or not 0.0 <= float(reversal_gain) <= 1.0
+            or type(active) is not bool
+            or isinstance(turn_delta, bool)
+            or not isinstance(turn_delta, (int, float))
+            or not math.isfinite(float(turn_delta))
+            or float(turn_delta) < 0.0
+            or (
+                active
+                and (
+                    not isinstance(target_yaw, torch.Tensor)
+                    or target_yaw.numel() != 1
+                    or target_yaw.dtype != next_root_position.dtype
+                    or target_yaw.device != next_root_position.device
+                    or not torch.isfinite(target_yaw).all()
+                )
+            )
+            or not isinstance(next_root_position, torch.Tensor)
+            or tuple(next_root_position.shape) != (3,)
+            or next_root_position.dtype != state.root_position.dtype
+            or next_root_position.device != state.root_position.device
+            or not torch.isfinite(next_root_position).all()
+            or not isinstance(command, torch.Tensor)
+            or tuple(command.shape) != (2,)
+            or command.dtype != next_root_position.dtype
+            or command.device != next_root_position.device
+            or not torch.isfinite(command).all()
+        ):
+            raise ContractError("turn root warp state is invalid")
+        output = torch.zeros_like(command)
+        speed = torch.linalg.vector_norm(command)
+        if not active or float(gain) == 0.0 or float(speed.item()) <= 1e-6:
+            return output
+        if float(turn_delta) <= math.pi / 3.0:
+            effective_gain = min(float(gain), float(small_turn_gain))
+        elif float(turn_delta) > 3.0 * math.pi / 4.0:
+            effective_gain = min(float(gain), float(reversal_gain))
+        else:
+            effective_gain = float(gain)
+        if float(turn_delta) <= math.radians(60.0):
+            direction = torch.stack(
+                (
+                    torch.cos(target_yaw.reshape(())),
+                    torch.sin(target_yaw.reshape(())),
+                )
+            )
+        else:
+            direction = command / speed
+        lateral = torch.stack((-direction[1], direction[0]))
+        error = torch.dot(
+            next_root_position[:2] - state.root_position[:2], lateral
+        )
+        return -effective_gain * error * lateral
 
     def _reachability_state_after(
         self,
@@ -3023,7 +3163,10 @@ class TorchMotionMatcher:
                 transition_costs,
                 foothold_fallback_eligibility,
             ) = self._foothold_conditioning(
-                state, shaped, transition_costs
+                state,
+                shaped,
+                transition_costs,
+                requested_heading_world_yaw=requested_h,
             )
         committed_source = None
         if committed_playback:
@@ -3413,6 +3556,15 @@ class TorchMotionMatcher:
             and not (interrupting_commitment and candidate.transitioned)
             else None
         )
+        if (
+            output_commitment is not None
+            and interrupting_commitment
+            and not candidate.transitioned
+        ):
+            output_commitment = self._shorten_interrupted_commitment(
+                output_commitment,
+                emitted_frame_index=candidate.frame_index,
+            )
         if (
             output_commitment is None
             and candidate.segment_placement is not None
