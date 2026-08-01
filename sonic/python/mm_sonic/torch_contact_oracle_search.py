@@ -418,10 +418,61 @@ class CommandSchedule:
         ).clamp(max=self.frame_count - 1)
         return self.velocity_world_xy[indices].sum(dim=0) * self.dt
 
+    def displacements(
+        self, start_frame: int, steps: torch.Tensor
+    ) -> torch.Tensor:
+        if (
+            type(start_frame) is not int
+            or start_frame < 0
+            or not isinstance(steps, torch.Tensor)
+            or steps.ndim != 1
+            or steps.dtype not in (torch.int32, torch.int64)
+            or steps.device != self.velocity_world_xy.device
+            or bool((steps < 0).any().item())
+        ):
+            raise ContractError("contact oracle command intervals are invalid")
+        prefix = torch.cat(
+            (
+                torch.zeros(
+                    (1, 2),
+                    dtype=self.velocity_world_xy.dtype,
+                    device=self.velocity_world_xy.device,
+                ),
+                torch.cumsum(self.velocity_world_xy, dim=0),
+            ),
+            dim=0,
+        )
+        frame_count = self.frame_count
+        start = min(start_frame, frame_count)
+        end = steps + start_frame
+        clamped_end = end.clamp(max=frame_count)
+        base = prefix[clamped_end] - prefix[start]
+        prior_tail = max(0, start_frame - frame_count)
+        tail = (end - frame_count).clamp(min=0) - prior_tail
+        return (
+            base + tail[:, None] * self.velocity_world_xy[-1]
+        ) * self.dt
+
     def heading(self, frame: int) -> torch.Tensor:
         if type(frame) is not int or frame < 0:
             raise ContractError("contact oracle command frame is invalid")
         return self.heading_world_yaw[min(frame, self.frame_count - 1)]
+
+    def headings(
+        self, start_frame: int, steps: torch.Tensor
+    ) -> torch.Tensor:
+        if (
+            type(start_frame) is not int
+            or start_frame < 0
+            or not isinstance(steps, torch.Tensor)
+            or steps.ndim != 1
+            or steps.dtype not in (torch.int32, torch.int64)
+            or steps.device != self.heading_world_yaw.device
+            or bool((steps < 0).any().item())
+        ):
+            raise ContractError("contact oracle command headings are invalid")
+        indices = (steps + start_frame).clamp(max=self.frame_count - 1)
+        return self.heading_world_yaw[indices]
 
     def velocity(self, frame: int) -> torch.Tensor:
         if type(frame) is not int or frame < 0:
@@ -513,6 +564,7 @@ class OracleSearchConfig:
     horizon_landings: int = 4
     beam_width: int = 256
     foothold_beam_width: int = 50
+    transition_candidate_count: int = 64
     constraints: OracleConstraints = OracleConstraints()
     path_weight: float = 25.0
     facing_weight: float = 10.0
@@ -533,6 +585,8 @@ class OracleSearchConfig:
             or self.beam_width < 1
             or type(self.foothold_beam_width) is not int
             or self.foothold_beam_width < 1
+            or type(self.transition_candidate_count) is not int
+            or self.transition_candidate_count < 1
             or not isinstance(self.constraints, OracleConstraints)
         ):
             raise ContractError("contact oracle search dimensions are invalid")
@@ -593,7 +647,12 @@ def load_contact_oracle_config(
     search = raw["search"]
     constraints = raw["constraints"]
     weights = raw["weights"]
-    search_keys = {"horizon_landings", "beam_width", "foothold_beam_width"}
+    search_keys = {
+        "horizon_landings",
+        "beam_width",
+        "foothold_beam_width",
+        "transition_candidate_count",
+    }
     constraint_keys = set(OracleConstraints.__dataclass_fields__)
     weight_keys = {
         "path_weight",
@@ -705,6 +764,10 @@ class _SearchNode:
     placements: tuple[PlacedContactPhase, ...]
     step_costs: tuple[OracleCost, ...]
     total_cost: OracleCost
+    cached_feasible: tuple[
+        tuple[int, PlacedContactPhase, FeasibilityResult], ...
+    ] | None = None
+    cached_rejected: Mapping[str, int] | None = None
 
     @property
     def source_key_path(self) -> tuple[tuple[int, int, int], ...]:
@@ -716,11 +779,42 @@ class _ActionEntryCache:
     support: torch.Tensor
     joint_position: torch.Tensor
     joint_velocity: torch.Tensor
+    foot_position_local: torch.Tensor
+    root_displacement_local: torch.Tensor
+    terminal_yaw_local: torch.Tensor
+    frame_steps: torch.Tensor
+    foot_trajectory_local: torch.Tensor
+    support_trajectory: torch.Tensor
+    valid_frames: torch.Tensor
+    surface_delta_m: torch.Tensor
+    swing_foot: torch.Tensor
 
     @classmethod
     def from_actions(
         cls, actions: Sequence[ContactPhaseAction]
     ) -> "_ActionEntryCache":
+        device = actions[0].root_position_local.device
+        dtype = actions[0].root_position_local.dtype
+        count = len(actions)
+        frames = max(action.frame_count for action in actions)
+        foot_trajectory = torch.zeros(
+            (count, frames, 2, 3), dtype=dtype, device=device
+        )
+        support_trajectory = torch.zeros(
+            (count, frames, 2), dtype=torch.bool, device=device
+        )
+        valid_frames = torch.zeros(
+            (count, frames), dtype=torch.bool, device=device
+        )
+        surface_delta = torch.zeros(
+            (count, frames, 2), dtype=dtype, device=device
+        )
+        for index, action in enumerate(actions):
+            length = action.frame_count
+            foot_trajectory[index, :length] = action.foot_position_local
+            support_trajectory[index, :length] = action.support_mask
+            valid_frames[index, :length] = True
+            surface_delta[index, :length] = action.foot_surface_delta_m
         return cls(
             support=torch.stack([action.entry_support for action in actions]),
             joint_position=torch.stack(
@@ -728,6 +822,29 @@ class _ActionEntryCache:
             ),
             joint_velocity=torch.stack(
                 [action.joint_velocity[0] for action in actions]
+            ),
+            foot_position_local=torch.stack(
+                [action.foot_position_local[0] for action in actions]
+            ),
+            root_displacement_local=torch.stack(
+                [action.root_position_local[-1, :2] for action in actions]
+            ),
+            terminal_yaw_local=torch.stack(
+                [action.root_yaw_local[-1] for action in actions]
+            ),
+            frame_steps=torch.tensor(
+                [action.frame_count - 1 for action in actions],
+                dtype=torch.int64,
+                device=device,
+            ),
+            foot_trajectory_local=foot_trajectory,
+            support_trajectory=support_trajectory,
+            valid_frames=valid_frames,
+            surface_delta_m=surface_delta,
+            swing_foot=torch.tensor(
+                [action.swing_foot for action in actions],
+                dtype=torch.int64,
+                device=device,
             ),
         )
 
@@ -766,7 +883,189 @@ class _ActionEntryCache:
             if count:
                 rejected["joint-velocity"] += count
         eligible &= velocity
+        foot_xy = (
+            _rotate_xy(
+                self.foot_position_local[..., :2], state.root_yaw_world
+            )
+            + state.root_position_world[None, None, :2]
+        )
+        foot_z = (
+            self.foot_position_local[..., 2]
+            + state.root_position_world[2]
+        )
+        foot_world = torch.cat((foot_xy, foot_z[..., None]), dim=2)
+        foot_error = torch.linalg.vector_norm(
+            foot_world - state.foot_position_world[None, :, :], dim=2
+        )
+        entry = ~(
+            foot_error[:, state.support_mask]
+            > float(constraints.maximum_entry_foot_error_m)
+        ).any(dim=1)
+        if rejected is not None:
+            count = int((eligible & ~entry).sum().item())
+            if count:
+                rejected["entry-foot-error"] += count
+        eligible &= entry
         return torch.nonzero(eligible, as_tuple=False).flatten()
+
+    def shortlisted_indices(
+        self,
+        candidates: torch.Tensor,
+        state: OracleState,
+        schedule: CommandSchedule,
+        config: OracleSearchConfig,
+        rejected: Counter[str] | None,
+    ) -> torch.Tensor:
+        limit = int(config.transition_candidate_count)
+        if candidates.numel() <= limit:
+            return candidates
+        steps = self.frame_steps[candidates]
+        desired = schedule.displacements(state.route_frame, steps)
+        actual = _rotate_xy(
+            self.root_displacement_local[candidates], state.root_yaw_world
+        )
+        path = float(config.path_weight) * torch.sum(
+            torch.square(actual - desired), dim=1
+        )
+        desired_heading = schedule.headings(state.route_frame, steps)
+        terminal_heading = (
+            self.terminal_yaw_local[candidates] + state.root_yaw_world
+        )
+        heading_error = torch.atan2(
+            torch.sin(terminal_heading - desired_heading),
+            torch.cos(terminal_heading - desired_heading),
+        )
+        facing = float(config.facing_weight) * torch.square(heading_error)
+        joint_position = float(config.joint_position_weight) * torch.sum(
+            torch.square(
+                self.joint_position[candidates]
+                - state.joint_position[None, :]
+            ),
+            dim=1,
+        )
+        joint_velocity = float(config.joint_velocity_weight) * torch.sum(
+            torch.square(
+                self.joint_velocity[candidates]
+                - state.joint_velocity[None, :]
+            ),
+            dim=1,
+        )
+        score = path + facing + joint_position + joint_velocity
+        order = torch.argsort(score, stable=True)
+        if rejected is not None:
+            rejected["shortlist-pruned"] += int(candidates.numel()) - limit
+        return candidates[order[:limit]]
+
+    def terrain_feasibility(
+        self,
+        candidates: torch.Tensor,
+        state: OracleState,
+        sample_surface: Callable[[torch.Tensor], torch.Tensor],
+        constraints: OracleConstraints,
+    ) -> tuple[FeasibilityResult, ...]:
+        if not candidates.numel():
+            return ()
+        local = self.foot_trajectory_local[candidates]
+        foot_xy = (
+            _rotate_xy(local[..., :2], state.root_yaw_world)
+            + state.root_position_world[None, None, None, :2]
+        )
+        foot_z = local[..., 2] + state.root_position_world[2]
+        foot_world = torch.cat((foot_xy, foot_z[..., None]), dim=3)
+        surface = _sample_surface(sample_surface, foot_world[..., :2])
+        clearance = (
+            foot_world[..., 2] - surface - float(ANKLE_ORIGIN_SOLE_M)
+        )
+        support = self.support_trajectory[candidates]
+        valid = self.valid_frames[candidates]
+        swing = self.swing_foot[candidates]
+        rows = torch.arange(
+            candidates.numel(), dtype=torch.int64, device=candidates.device
+        )
+        stance = support & valid[..., None]
+        stance[rows, :, swing] = False
+        stance_error = torch.where(
+            stance, torch.abs(clearance), torch.zeros_like(clearance)
+        ).amax(dim=(1, 2))
+        terminal = self.frame_steps[candidates]
+        landing_clearance = clearance[rows, terminal, swing]
+        landing_error = torch.abs(landing_clearance)
+
+        margin = float(constraints.edge_margin_m)
+        offsets = torch.tensor(
+            (
+                (0.0, 0.0),
+                (margin, 0.0),
+                (-margin, 0.0),
+                (0.0, margin),
+                (0.0, -margin),
+            ),
+            dtype=foot_world.dtype,
+            device=foot_world.device,
+        )
+        landing_xy = foot_world[rows, terminal, swing, :2]
+        edge = _sample_surface(
+            sample_surface, landing_xy[:, None, :] + offsets[None, :, :]
+        )
+        edge_range = edge.amax(dim=1) - edge.amin(dim=1)
+
+        swing_clearance = clearance.gather(
+            2,
+            swing[:, None, None].expand(-1, clearance.shape[1], 1),
+        ).squeeze(2)
+        swing_support = support.gather(
+            2,
+            swing[:, None, None].expand(-1, support.shape[1], 1),
+        ).squeeze(2)
+        swing_samples = valid & ~swing_support
+        minimum_swing = torch.where(
+            swing_samples,
+            swing_clearance,
+            torch.full_like(swing_clearance, torch.inf),
+        ).amin(dim=1)
+        minimum_swing = torch.where(
+            swing_samples.any(dim=1), minimum_swing, landing_error
+        )
+        query_delta = (
+            surface[rows, terminal, swing] - surface[rows, 0, swing]
+        )
+        source_delta = self.surface_delta_m[candidates][
+            rows, terminal, swing
+        ]
+        deformation = torch.abs(query_delta - source_delta)
+
+        results = []
+        for index in range(int(candidates.numel())):
+            reason = None
+            if float(stance_error[index].item()) > float(
+                constraints.stance_height_tolerance_m
+            ):
+                reason = "stance-height"
+            elif float(landing_error[index].item()) > float(
+                constraints.landing_height_tolerance_m
+            ):
+                reason = "landing-height"
+            elif float(edge_range[index].item()) > float(
+                constraints.maximum_edge_height_range_m
+            ):
+                reason = "landing-edge-margin"
+            elif float(minimum_swing[index].item()) < float(
+                constraints.minimum_swing_clearance_m
+            ):
+                reason = "swing-penetration"
+            elif float(deformation[index].item()) > float(
+                constraints.maximum_height_deformation_m
+            ):
+                reason = "height-deformation"
+            results.append(
+                _result(
+                    reason,
+                    stance=float(stance_error[index].item()),
+                    landing=float(landing_error[index].item()),
+                    swing=float(minimum_swing[index].item()),
+                )
+            )
+        return tuple(results)
 
 
 def advance_state(
@@ -789,25 +1088,28 @@ def advance_state(
 def _feasible_actions(
     state: OracleState,
     actions: Sequence[ContactPhaseAction],
+    schedule: CommandSchedule,
     sample_surface: Callable[[torch.Tensor], torch.Tensor],
-    constraints: OracleConstraints,
+    config: OracleSearchConfig,
     entry_cache: _ActionEntryCache,
     rejected: Counter[str] | None = None,
 ) -> list[tuple[int, PlacedContactPhase, FeasibilityResult]]:
     output = []
-    candidate_indices = entry_cache.candidate_indices(
-        state, constraints, rejected
-    ).detach().cpu().tolist()
-    for index in candidate_indices:
+    candidates = entry_cache.candidate_indices(
+        state, config.constraints, rejected
+    )
+    candidate_indices = entry_cache.shortlisted_indices(
+        candidates, state, schedule, config, rejected
+    )
+    results = entry_cache.terrain_feasibility(
+        candidate_indices, state, sample_surface, config.constraints
+    )
+    for index, result in zip(
+        candidate_indices.detach().cpu().tolist(), results
+    ):
         action = actions[index]
-        placed = place_action(action, state)
-        result = validate_placement(
-            placed=placed,
-            state=state,
-            sample_surface=sample_surface,
-            constraints=constraints,
-        )
         if result.accepted:
+            placed = place_action(action, state)
             output.append((index, placed, result))
         elif rejected is not None:
             assert result.reason is not None
@@ -944,28 +1246,40 @@ def _search_horizon(
                 sample_surface,
                 config,
             )
-            feasible = _feasible_actions(
-                node.state,
-                actions,
-                sample_surface,
-                config.constraints,
-                entry_cache,
-                rejected,
-            )
+            if node.cached_feasible is None:
+                feasible = _feasible_actions(
+                    node.state,
+                    actions,
+                    command_schedule,
+                    sample_surface,
+                    config,
+                    entry_cache,
+                    rejected,
+                )
+            else:
+                feasible = list(node.cached_feasible)
+                if node.cached_rejected:
+                    rejected.update(node.cached_rejected)
             expanded += len(actions)
             for action_index, placed, result in feasible:
                 child_state = advance_state(node.state, placed)
                 successor_count = 0
+                successors = None
+                successor_rejected = None
                 if depth + 1 < horizon:
-                    successor_count = len(
+                    successor_rejected = Counter()
+                    successors = tuple(
                         _feasible_actions(
                             child_state,
                             actions,
+                            command_schedule,
                             sample_surface,
-                            config.constraints,
+                            config,
                             entry_cache,
+                            successor_rejected,
                         )
                     )
+                    successor_count = len(successors)
                     if successor_count == 0:
                         rejected["no-successor"] += 1
                         continue
@@ -985,6 +1299,8 @@ def _search_horizon(
                         placements=(*node.placements, placed),
                         step_costs=(*node.step_costs, edge_cost),
                         total_cost=node.total_cost + edge_cost,
+                        cached_feasible=successors,
+                        cached_rejected=successor_rejected,
                     )
                 )
         candidates.sort(

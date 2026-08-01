@@ -12,9 +12,10 @@
   },
   "schema": "g1-contact-space-oracle/v1",
   "search": {
-    "beam_width": 256,
+    "beam_width": 32,
     "foothold_beam_width": 50,
-    "horizon_landings": 4
+    "horizon_landings": 4,
+    "transition_candidate_count": 32
   },
   "terrain_config": "sonic/configs/experiments/torch_grail_layered_graph_hybrid.json",
   "weights": {

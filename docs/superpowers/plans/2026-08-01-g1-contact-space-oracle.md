@@ -16,7 +16,7 @@
 - Do not change retained `TorchMotionMatcher` or `FootholdActionPolicy` behavior.
 - Use authoritative MuJoCo FK for feet and native 50 Hz source motion.
 - Use deterministic stable ordering by `(clip_index, start_frame, end_frame)`.
-- Default search horizon is four landings and beam width is 256; there is no wall-clock cutoff.
+- Default search horizon is four landings, beam width is 32, and the exact-entry candidate shortlist is 32; there is no wall-clock cutoff. This is the measured post-implementation revision from the original width-256 plan.
 - Never emit an unchecked fallback action.
 - Commit after every task with that task's exact file set.
 
@@ -349,8 +349,9 @@ class OracleCost:
 @dataclass(frozen=True)
 class OracleSearchConfig:
     horizon_landings: int = 4
-    beam_width: int = 256
+    beam_width: int = 32
     foothold_beam_width: int = 50
+    transition_candidate_count: int = 32
     constraints: OracleConstraints = OracleConstraints()
     path_weight: float = 25.0
     facing_weight: float = 10.0
@@ -370,7 +371,7 @@ Implement `search_contact_plan` by attempting the configured horizon down to one
 
 - [ ] **Step 4: Freeze the experiment configuration**
 
-Create `torch_grail_contact_oracle.json` with schema `g1-contact-space-oracle/v1`, all Task 2 constraints, all Task 3 weights, `horizon_landings: 4`, `beam_width: 256`, and `foothold_beam_width: 50`. The loader must reject missing/extra keys and non-finite values.
+Create `torch_grail_contact_oracle.json` with schema `g1-contact-space-oracle/v1`, all Task 2 constraints, all Task 3 weights, `horizon_landings: 4`, measured `beam_width: 32`, `transition_candidate_count: 32`, and `foothold_beam_width: 50`. The loader must reject missing/extra keys and non-finite values.
 
 - [ ] **Step 5: Run all search tests**
 

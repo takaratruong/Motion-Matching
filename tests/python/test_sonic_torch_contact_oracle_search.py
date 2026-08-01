@@ -4,8 +4,11 @@ from dataclasses import replace
 import json
 from pathlib import Path
 import tempfile
+from unittest import mock
 
 import torch
+
+import mm_sonic.torch_contact_oracle_search as oracle_search
 
 from mm_sonic.torch_contact_oracle_actions import ContactPhaseAction
 from mm_sonic.torch_contact_oracle_search import (
@@ -92,11 +95,29 @@ def _graph_action(index: int, entry: float, terminal: float, dx: float):
 
 
 class ContactOracleSearchTests(unittest.TestCase):
+    def test_command_schedule_batches_variable_horizon_queries(self):
+        schedule = oracle_search.CommandSchedule(
+            velocity_world_xy=torch.tensor(
+                ((1.0, 0.0), (2.0, 0.0), (3.0, 0.0), (4.0, 0.0))
+            ),
+            heading_world_yaw=torch.tensor((0.0, 0.1, 0.2, 0.3)),
+        )
+        steps = torch.tensor((0, 1, 3), dtype=torch.int64)
+
+        torch.testing.assert_close(
+            schedule.displacements(1, steps),
+            torch.tensor(((0.0, 0.0), (0.04, 0.0), (0.18, 0.0))),
+        )
+        torch.testing.assert_close(
+            schedule.headings(1, steps), torch.tensor((0.1, 0.2, 0.3))
+        )
+
     def test_loads_frozen_oracle_config_and_rejects_extra_keys(self):
         path = Path("sonic/configs/experiments/torch_grail_contact_oracle.json")
         loaded = load_contact_oracle_config(path)
         self.assertEqual(loaded.search.horizon_landings, 4)
-        self.assertEqual(loaded.search.beam_width, 256)
+        self.assertEqual(loaded.search.beam_width, 32)
+        self.assertEqual(loaded.search.transition_candidate_count, 32)
         self.assertEqual(
             loaded.search.constraints.maximum_joint_position_error_rad, 2.5
         )
@@ -282,6 +303,40 @@ class ContactOracleSearchTests(unittest.TestCase):
             "joint-velocity",
         )
 
+    def test_entry_foot_gate_runs_before_full_trajectory_placement(self):
+        action = _one_meter_forward_action()
+        feet = action.foot_position_local.clone()
+        feet[0, 0, 0] += 0.2
+        action = replace(action, foot_position_local=feet)
+
+        def flat_surface(points):
+            return torch.zeros(
+                points.shape[:-1], dtype=points.dtype, device=points.device
+            )
+
+        with mock.patch.object(
+            oracle_search,
+            "place_action",
+            side_effect=AssertionError("full placement must not run"),
+        ):
+            with self.assertRaises(OracleSearchFailure) as caught:
+                search_contact_plan(
+                    initial_state=_state(),
+                    actions=(action,),
+                    command_schedule=constant_command_schedule(
+                        velocity_world_xy=(0.3, 0.0),
+                        heading_world_yaw=0.0,
+                        frames=4,
+                        device="cpu",
+                    ),
+                    sample_surface=flat_surface,
+                    config=OracleSearchConfig(horizon_landings=1),
+                )
+        self.assertEqual(
+            dict(caught.exception.rejected_by_reason),
+            {"entry-foot-error": 1},
+        )
+
     def test_four_contact_search_rejects_cheapest_greedy_dead_end(self):
         actions = (
             _graph_action(0, entry=0.0, terminal=10.0, dx=0.006),
@@ -316,8 +371,107 @@ class ContactOracleSearchTests(unittest.TestCase):
         )
 
         self.assertEqual(plan.action_indices, (1, 2, 3))
-        self.assertGreater(plan.expansion.rejected_by_reason["no-successor"], 0)
+        self.assertGreater(
+            plan.expansion.rejected_by_reason["no-successor"], 0
+        )
 
+    def test_layered_shortlist_uses_command_cost_not_source_order(self):
+        actions = (
+            _graph_action(0, entry=0.0, terminal=0.0, dx=-0.20),
+            _graph_action(1, entry=0.0, terminal=0.0, dx=0.006),
+        )
+
+        def flat_surface(points):
+            return torch.zeros(
+                points.shape[:-1], dtype=points.dtype, device=points.device
+            )
+
+        plan = search_contact_plan(
+            initial_state=_state(),
+            actions=actions,
+            command_schedule=constant_command_schedule(
+                velocity_world_xy=(0.3, 0.0),
+                heading_world_yaw=0.0,
+                frames=4,
+                device="cpu",
+            ),
+            sample_surface=flat_surface,
+            config=OracleSearchConfig(
+                horizon_landings=1,
+                beam_width=1,
+                transition_candidate_count=1,
+                constraints=OracleConstraints(
+                    maximum_entry_foot_error_m=10.0
+                ),
+            ),
+        )
+
+        self.assertEqual(plan.action_indices, (1,))
+        self.assertEqual(
+            dict(plan.expansion.rejected_by_reason)["shortlist-pruned"], 1
+        )
+
+    def test_shortlisted_terrain_validation_is_batched(self):
+        action = _one_meter_forward_action()
+
+        def flat_surface(points):
+            return torch.zeros(
+                points.shape[:-1], dtype=points.dtype, device=points.device
+            )
+
+        with mock.patch.object(
+            oracle_search,
+            "validate_placement",
+            side_effect=AssertionError("scalar validation must not run"),
+        ):
+            plan = search_contact_plan(
+                initial_state=_state(),
+                actions=(action,),
+                command_schedule=constant_command_schedule(
+                    velocity_world_xy=(0.3, 0.0),
+                    heading_world_yaw=0.0,
+                    frames=4,
+                    device="cpu",
+                ),
+                sample_surface=flat_surface,
+                config=OracleSearchConfig(horizon_landings=1),
+            )
+
+        self.assertEqual(plan.action_indices, (0,))
+
+    def test_successor_feasibility_is_reused_at_next_depth(self):
+        action = _graph_action(0, entry=0.0, terminal=0.0, dx=0.006)
+
+        def flat_surface(points):
+            return torch.zeros(
+                points.shape[:-1], dtype=points.dtype, device=points.device
+            )
+
+        with mock.patch.object(
+            oracle_search,
+            "_feasible_actions",
+            wraps=oracle_search._feasible_actions,
+        ) as feasible:
+            plan = search_contact_plan(
+                initial_state=_state(),
+                actions=(action,),
+                command_schedule=constant_command_schedule(
+                    velocity_world_xy=(0.3, 0.0),
+                    heading_world_yaw=0.0,
+                    frames=10,
+                    device="cpu",
+                ),
+                sample_surface=flat_surface,
+                config=OracleSearchConfig(
+                    horizon_landings=2,
+                    constraints=OracleConstraints(
+                        maximum_entry_foot_error_m=10.0
+                    ),
+                ),
+            )
+
+        self.assertEqual(plan.action_indices, (0, 0))
+        self.assertEqual(feasible.call_count, 2)
     def test_search_shortens_horizon_but_never_invents_a_fallback(self):
         action = _graph_action(0, entry=0.0, terminal=10.0, dx=0.006)
 
