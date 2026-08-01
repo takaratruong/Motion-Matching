@@ -11,6 +11,7 @@ from mm_sonic.torch_contact_oracle_actions import (
     ContactPhaseAction,
     ContactPhaseActionIndex,
     ContactPhaseInventory,
+    action_from_profiles,
 )
 from mm_sonic.torch_contact_oracle_rollout import (
     run_oracle_matrix,
@@ -43,6 +44,9 @@ def _action() -> ContactPhaseAction:
     feet[:, 0, 1] = 0.1
     feet[:, 1, 1] = -0.1
     feet[:, :, 2] = 0.035
+    orientation = torch.zeros((frames, 4))
+    orientation[:, 0] = math.cos(0.2)
+    orientation[:, 1] = math.sin(0.2)
     return ContactPhaseAction(
         clip_index=0,
         start_frame=10,
@@ -55,6 +59,7 @@ def _action() -> ContactPhaseAction:
         joint_velocity=torch.zeros((frames, 29)),
         root_position_local=root,
         root_yaw_local=torch.zeros(frames),
+        root_orientation_local_wxyz=orientation,
         foot_position_local=feet,
         foot_surface_delta_m=torch.zeros((frames, 2)),
         minimum_swing_clearance_m=0.0,
@@ -65,6 +70,9 @@ def _state() -> OracleState:
     return OracleState(
         root_position_world=torch.zeros(3),
         root_yaw_world=torch.zeros(()),
+        root_orientation_world_wxyz=torch.tensor(
+            (math.cos(0.2), math.sin(0.2), 0.0, 0.0)
+        ),
         foot_position_world=torch.tensor(
             ((0.0, 0.1, 0.035), (0.0, -0.1, 0.035))
         ),
@@ -135,6 +143,107 @@ class ContactOracleRolloutTests(unittest.TestCase):
         )
         self.assertTrue(run.completed_without_exception)
         self.assertTrue(math.isfinite(run.metrics.stance_slide_m.total))
+        np.testing.assert_allclose(
+            run.arrays["qpos"][:, 3:7],
+            run.arrays["root_orientation_world_wxyz"],
+        )
+        self.assertGreater(abs(run.arrays["qpos"][0, 4]), 0.1)
+        self.assertEqual(len(run.plan_events[0].step_costs), 2)
+        self.assertEqual(len(run.plan_events[0].planned_landing_world_xyz), 2)
+        self.assertIsNotNone(run.plan_events[0].emitted_landing_world_xyz)
+        self.assertEqual(
+            len(run.plan_events[0].entry_joint_position_error_rad), 2
+        )
+
+    def test_emitted_qpos_reproduces_saved_feet_with_authoritative_fk(self):
+        from mm_sonic.torch_g1_fk import MujocoG1FootKinematics
+
+        xml = "/home/ubuntu/projects/mjx-diffphysics/env/g1/assets/g1_29dof.xml"
+        if not Path(xml).is_file():
+            self.skipTest("G1 MuJoCo model is unavailable")
+        helper = MujocoG1FootKinematics(xml)
+        frames = 2
+        roll = 0.4
+        orientation = np.repeat(
+            np.array(
+                [[math.cos(roll / 2.0), math.sin(roll / 2.0), 0.0, 0.0]]
+            ),
+            frames,
+            axis=0,
+        )
+        joints = np.zeros((frames, 29), dtype=np.float64)
+        roots = np.zeros((frames, 3), dtype=np.float64)
+        unshifted = helper.foot_positions(joints, roots, orientation)
+        roots[:, 2] = 0.035 - float(unshifted[0, :, 2].min())
+        feet = helper.foot_positions(joints, roots, orientation)
+        surface = feet[..., 2] - 0.035
+        action = action_from_profiles(
+            clip_index=0,
+            start_frame=0,
+            landing_frame=1,
+            support_mask=torch.tensor(
+                ((True, False), (True, True)), dtype=torch.bool
+            ),
+            joint_position=torch.tensor(joints, dtype=torch.float32),
+            joint_velocity=torch.zeros((frames, 29)),
+            root_position_world=torch.tensor(roots, dtype=torch.float32),
+            root_orientation_world_wxyz=torch.tensor(
+                orientation, dtype=torch.float32
+            ),
+            foot_position_world=torch.tensor(feet, dtype=torch.float32),
+            foot_surface_height_m=torch.tensor(surface, dtype=torch.float32),
+        )
+        initial = OracleState(
+            root_position_world=torch.tensor(roots[0], dtype=torch.float32),
+            root_yaw_world=torch.zeros(()),
+            root_orientation_world_wxyz=torch.tensor(
+                orientation[0], dtype=torch.float32
+            ),
+            foot_position_world=torch.tensor(feet[0], dtype=torch.float32),
+            support_mask=torch.tensor((True, False)),
+            joint_position=torch.zeros(29),
+            joint_velocity=torch.zeros(29),
+            route_frame=0,
+        )
+        reference_xy = torch.tensor(feet[0, :, :2], dtype=torch.float32)
+        reference_height = torch.tensor(surface[0], dtype=torch.float32)
+
+        def source_surface(points):
+            distance = torch.sum(
+                (points[..., None, :] - reference_xy) ** 2, dim=-1
+            )
+            return reference_height[torch.argmin(distance, dim=-1)]
+
+        planner = _RecordingPlanner(action)
+        run = run_oracle_route(
+            route=OmniRoute(
+                name="authoritative-fk",
+                commands=(
+                    RouteCommand(
+                        (0.1, 0.0), 0.0, 2, "move", reset_before=True
+                    ),
+                ),
+                required_outcome="mixed",
+                outcome=RouteOutcomeContract(),
+            ),
+            stair_frame=StairFrame((0.0, 0.0), 0.0, 0.6, 0.3, 0.18, 3),
+            initial_state=initial,
+            planner=planner,
+            terrain_sampler=source_surface,
+            clip_paths=("clip0",),
+            dataset_identity="dataset",
+            config_identity="config",
+        )
+
+        self.assertTrue(run.completed_without_exception, run.failure)
+        actual = helper.foot_positions(
+            run.arrays["joint_position"],
+            run.arrays["root_position_world"],
+            run.arrays["root_orientation_world_wxyz"],
+        )
+        np.testing.assert_allclose(
+            actual, run.arrays["foot_position_world"], rtol=0.0, atol=2e-7
+        )
 
     def test_zero_speed_frames_hold_without_invoking_planner(self):
         route = OmniRoute(
@@ -167,6 +276,45 @@ class ContactOracleRolloutTests(unittest.TestCase):
         self.assertTrue(run.completed_without_exception)
         self.assertEqual(run.arrays["selected_action_index"].tolist(), [-1, -1, -1])
         self.assertTrue((run.arrays["root_position_world"] == 0.0).all())
+
+    def test_stop_command_interrupts_an_action_on_its_first_frame(self):
+        route = OmniRoute(
+            name="move-then-stop",
+            commands=(
+                RouteCommand((0.3, 0.0), 0.0, 2, "move", reset_before=True),
+                RouteCommand((0.0, 0.0), 0.0, 3, "stop"),
+            ),
+            required_outcome="mixed",
+            outcome=RouteOutcomeContract(),
+        )
+        planner = _RecordingPlanner(_action())
+
+        def flat_surface(points):
+            return torch.zeros(
+                points.shape[:-1], dtype=points.dtype, device=points.device
+            )
+
+        run = run_oracle_route(
+            route=route,
+            stair_frame=StairFrame((0.0, 0.0), 0.0, 0.6, 0.3, 0.18, 3),
+            initial_state=_state(),
+            planner=planner,
+            terrain_sampler=flat_surface,
+            clip_paths=("clip0",),
+            dataset_identity="dataset",
+            config_identity="config",
+        )
+
+        self.assertTrue(run.completed_without_exception)
+        self.assertEqual(
+            run.arrays["selected_action_index"].tolist(), [0, 0, -1, -1, -1]
+        )
+        np.testing.assert_allclose(
+            run.arrays["root_position_world"][2:],
+            np.repeat(
+                run.arrays["root_position_world"][1][None, :], 3, axis=0
+            ),
+        )
 
     def test_search_failure_is_structured_and_never_replaced(self):
         route = OmniRoute(

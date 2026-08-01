@@ -55,6 +55,7 @@ class ContactPhaseAction:
     joint_velocity: torch.Tensor
     root_position_local: torch.Tensor
     root_yaw_local: torch.Tensor
+    root_orientation_local_wxyz: torch.Tensor
     foot_position_local: torch.Tensor
     foot_surface_delta_m: torch.Tensor
     minimum_swing_clearance_m: float
@@ -81,6 +82,7 @@ class ContactPhaseAction:
             ("joint_velocity", (frames, 29), False),
             ("root_position_local", (frames, 3), False),
             ("root_yaw_local", (frames,), False),
+            ("root_orientation_local_wxyz", (frames, 4), False),
             ("foot_position_local", (frames, 2, 3), False),
             ("foot_surface_delta_m", (frames, 2), False),
         )
@@ -150,6 +152,9 @@ def mirror_contact_phase_action(
     root[:, 1] *= -1.0
     feet = action.foot_position_local[:, [1, 0]].clone()
     feet[..., 1] *= -1.0
+    orientation = action.root_orientation_local_wxyz.clone()
+    orientation[:, 1] *= -1.0
+    orientation[:, 3] *= -1.0
     return ContactPhaseAction(
         clip_index=action.clip_index,
         start_frame=action.start_frame,
@@ -162,6 +167,7 @@ def mirror_contact_phase_action(
         joint_velocity=mirror_g1_joint_state(action.joint_velocity),
         root_position_local=root,
         root_yaw_local=-action.root_yaw_local,
+        root_orientation_local_wxyz=orientation,
         foot_position_local=feet,
         foot_surface_delta_m=action.foot_surface_delta_m[:, [1, 0]],
         minimum_swing_clearance_m=action.minimum_swing_clearance_m,
@@ -174,6 +180,22 @@ def _yaw_from_wxyz(quaternion: torch.Tensor) -> torch.Tensor:
     return torch.atan2(
         2.0 * (w * z + x * y),
         1.0 - 2.0 * (y * y + z * z),
+    )
+
+
+def _quaternion_multiply_wxyz(
+    left: torch.Tensor, right: torch.Tensor
+) -> torch.Tensor:
+    w1, x1, y1, z1 = left.unbind(dim=-1)
+    w2, x2, y2, z2 = right.unbind(dim=-1)
+    return torch.stack(
+        (
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ),
+        dim=-1,
     )
 
 
@@ -252,6 +274,17 @@ def action_from_profiles(
     foot_local = torch.cat((foot_xy, foot[..., 2:]), dim=2)
     yaw = _yaw_from_wxyz(root_orientation_world_wxyz[selection]) - start_yaw
     yaw = torch.atan2(torch.sin(yaw), torch.cos(yaw))
+    inverse_start_yaw = torch.stack(
+        (
+            torch.cos(start_yaw / 2.0),
+            torch.zeros_like(start_yaw),
+            torch.zeros_like(start_yaw),
+            -torch.sin(start_yaw / 2.0),
+        )
+    )
+    orientation_local = _quaternion_multiply_wxyz(
+        inverse_start_yaw, root_orientation_world_wxyz[selection]
+    )
     surface = (
         foot_surface_height_m[selection]
         - foot_surface_height_m[start_frame][None, :]
@@ -274,6 +307,7 @@ def action_from_profiles(
         joint_velocity=joint_velocity[selection],
         root_position_local=root_local,
         root_yaw_local=yaw,
+        root_orientation_local_wxyz=orientation_local,
         foot_position_local=foot_local,
         foot_surface_delta_m=surface,
         minimum_swing_clearance_m=float(swing_clearance.min().item()),

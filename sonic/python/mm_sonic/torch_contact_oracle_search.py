@@ -40,6 +40,7 @@ def _owned(
 class OracleState:
     root_position_world: torch.Tensor
     root_yaw_world: torch.Tensor
+    root_orientation_world_wxyz: torch.Tensor
     foot_position_world: torch.Tensor
     support_mask: torch.Tensor
     joint_position: torch.Tensor
@@ -51,6 +52,7 @@ class OracleState:
         fields = (
             ("root_position_world", (3,), False),
             ("root_yaw_world", (), False),
+            ("root_orientation_world_wxyz", (4,), False),
             ("foot_position_world", (2, 3), False),
             ("support_mask", (2,), True),
             ("joint_position", (29,), False),
@@ -92,6 +94,7 @@ class PlacedContactPhase:
     action: ContactPhaseAction
     root_position_world: torch.Tensor
     root_yaw_world: torch.Tensor
+    root_orientation_world_wxyz: torch.Tensor
     foot_position_world: torch.Tensor
 
     def __post_init__(self) -> None:
@@ -101,6 +104,7 @@ class PlacedContactPhase:
         values = (
             ("root_position_world", (frames, 3)),
             ("root_yaw_world", (frames,)),
+            ("root_orientation_world_wxyz", (frames, 4)),
             ("foot_position_world", (frames, 2, 3)),
         )
         owned = []
@@ -120,6 +124,29 @@ def _rotate_xy(values: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:
         (
             cosine * values[..., 0] - sine * values[..., 1],
             sine * values[..., 0] + cosine * values[..., 1],
+        ),
+        dim=-1,
+    )
+
+
+def _quaternion_from_yaw(yaw: torch.Tensor) -> torch.Tensor:
+    zero = torch.zeros_like(yaw)
+    return torch.stack(
+        (torch.cos(yaw / 2.0), zero, zero, torch.sin(yaw / 2.0)), dim=-1
+    )
+
+
+def _quaternion_multiply_wxyz(
+    left: torch.Tensor, right: torch.Tensor
+) -> torch.Tensor:
+    w1, x1, y1, z1 = left.unbind(dim=-1)
+    w2, x2, y2, z2 = right.unbind(dim=-1)
+    return torch.stack(
+        (
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
         ),
         dim=-1,
     )
@@ -154,10 +181,15 @@ def place_action(
     )
     yaw = action.root_yaw_local + state.root_yaw_world
     yaw = torch.atan2(torch.sin(yaw), torch.cos(yaw))
+    orientation = _quaternion_multiply_wxyz(
+        _quaternion_from_yaw(state.root_yaw_world),
+        action.root_orientation_local_wxyz,
+    )
     return PlacedContactPhase(
         action=action,
         root_position_world=torch.cat((root_xy, root_z), dim=1),
         root_yaw_world=yaw,
+        root_orientation_world_wxyz=orientation,
         foot_position_world=torch.cat((feet_xy, feet_z), dim=2),
     )
 
@@ -600,9 +632,9 @@ class OracleCost:
 @dataclass(frozen=True)
 class OracleSearchConfig:
     horizon_landings: int = 4
-    beam_width: int = 256
+    beam_width: int = 32
     foothold_beam_width: int = 50
-    transition_candidate_count: int = 64
+    transition_candidate_count: int = 32
     constraints: OracleConstraints = OracleConstraints()
     path_weight: float = 25.0
     facing_weight: float = 10.0
@@ -905,22 +937,6 @@ class _ActionEntryCache:
             if count:
                 rejected["support-order"] += count
         eligible &= support
-        position = torch.linalg.vector_norm(
-            self.joint_position - state.joint_position[None, :], dim=1
-        ) <= float(constraints.maximum_joint_position_error_rad)
-        if rejected is not None:
-            count = int((eligible & ~position).sum().item())
-            if count:
-                rejected["joint-position"] += count
-        eligible &= position
-        velocity = torch.linalg.vector_norm(
-            self.joint_velocity - state.joint_velocity[None, :], dim=1
-        ) <= float(constraints.maximum_joint_velocity_error_rad_s)
-        if rejected is not None:
-            count = int((eligible & ~velocity).sum().item())
-            if count:
-                rejected["joint-velocity"] += count
-        eligible &= velocity
         foot_xy = (
             _rotate_xy(
                 self.foot_position_local[..., :2], state.root_yaw_world
@@ -944,6 +960,22 @@ class _ActionEntryCache:
             if count:
                 rejected["entry-foot-error"] += count
         eligible &= entry
+        position = torch.linalg.vector_norm(
+            self.joint_position - state.joint_position[None, :], dim=1
+        ) <= float(constraints.maximum_joint_position_error_rad)
+        if rejected is not None:
+            count = int((eligible & ~position).sum().item())
+            if count:
+                rejected["joint-position"] += count
+        eligible &= position
+        velocity = torch.linalg.vector_norm(
+            self.joint_velocity - state.joint_velocity[None, :], dim=1
+        ) <= float(constraints.maximum_joint_velocity_error_rad_s)
+        if rejected is not None:
+            count = int((eligible & ~velocity).sum().item())
+            if count:
+                rejected["joint-velocity"] += count
+        eligible &= velocity
         return torch.nonzero(eligible, as_tuple=False).flatten()
 
     def shortlisted_indices(
@@ -1190,6 +1222,9 @@ def advance_state(
     return OracleState(
         root_position_world=placed.root_position_world[-1],
         root_yaw_world=placed.root_yaw_world[-1],
+        root_orientation_world_wxyz=(
+            placed.root_orientation_world_wxyz[-1]
+        ),
         foot_position_world=placed.foot_position_world[-1],
         support_mask=action.exit_support,
         joint_position=action.joint_position[-1],

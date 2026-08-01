@@ -27,9 +27,11 @@ from .torch_contact_oracle_search import (
     ContactOracleExperimentConfig,
     FeasibilityResult,
     OracleConstraints,
+    OracleCost,
     OraclePlan,
     OracleSearchFailure,
     OracleState,
+    advance_state,
     search_contact_plan,
     validate_placement,
 )
@@ -56,6 +58,7 @@ ORACLE_ARRAY_SHAPES = {
     "joint_velocity": (29,),
     "root_position_world": (3,),
     "root_yaw_world": (),
+    "root_orientation_world_wxyz": (4,),
     "foot_position_world": (2, 3),
     "foot_surface_height_m": (2,),
     "selected_clip_path": (),
@@ -99,7 +102,13 @@ class OraclePlanEvent:
     route_frame: int
     action_indices: tuple[int, ...]
     source_keys: tuple[tuple[int, int, int, bool], ...]
-    total_cost: float
+    step_costs: tuple[OracleCost, ...]
+    total_cost: OracleCost
+    planned_landing_feet: tuple[int, ...]
+    planned_landing_world_xyz: tuple[tuple[float, float, float], ...]
+    emitted_landing_world_xyz: tuple[float, float, float] | None
+    entry_joint_position_error_rad: tuple[float, ...]
+    entry_joint_velocity_error_rad_s: tuple[float, ...]
     rejected_by_reason: Mapping[str, int]
     beam_sizes: tuple[int, ...]
 
@@ -110,7 +119,36 @@ class OraclePlanEvent:
             or self.route_frame < 0
             or not self.action_indices
             or len(self.action_indices) != len(self.source_keys)
-            or not math.isfinite(float(self.total_cost))
+            or len(self.step_costs) != len(self.action_indices)
+            or any(not isinstance(cost, OracleCost) for cost in self.step_costs)
+            or not isinstance(self.total_cost, OracleCost)
+            or len(self.planned_landing_feet) != len(self.action_indices)
+            or any(foot not in (0, 1) for foot in self.planned_landing_feet)
+            or len(self.planned_landing_world_xyz) != len(self.action_indices)
+            or len(self.entry_joint_position_error_rad) != len(self.action_indices)
+            or len(self.entry_joint_velocity_error_rad_s) != len(self.action_indices)
+            or any(
+                len(position) != 3
+                or not all(math.isfinite(float(value)) for value in position)
+                for position in self.planned_landing_world_xyz
+            )
+            or (
+                self.emitted_landing_world_xyz is not None
+                and (
+                    len(self.emitted_landing_world_xyz) != 3
+                    or not all(
+                        math.isfinite(float(value))
+                        for value in self.emitted_landing_world_xyz
+                    )
+                )
+            )
+            or any(
+                not math.isfinite(float(value)) or float(value) < 0.0
+                for value in (
+                    *self.entry_joint_position_error_rad,
+                    *self.entry_joint_velocity_error_rad_s,
+                )
+            )
         ):
             raise ContractError("contact oracle plan event is invalid")
         object.__setattr__(self, "rejected_by_reason", MappingProxyType(rejected))
@@ -200,11 +238,6 @@ def _surface(
     return values
 
 
-def _quaternion_from_yaw(yaw: torch.Tensor) -> torch.Tensor:
-    zero = torch.zeros_like(yaw)
-    return torch.stack((torch.cos(yaw / 2.0), zero, zero, torch.sin(yaw / 2.0)))
-
-
 def _append_frame(
     rows: dict[str, list],
     *,
@@ -215,6 +248,7 @@ def _append_frame(
     joint_velocity: torch.Tensor,
     root_position: torch.Tensor,
     root_yaw: torch.Tensor,
+    root_orientation: torch.Tensor,
     feet: torch.Tensor,
     surface: torch.Tensor,
     clip_path: str,
@@ -225,8 +259,9 @@ def _append_frame(
     plan_time_ns: int,
     feasibility: FeasibilityResult,
 ) -> None:
-    quaternion = _quaternion_from_yaw(root_yaw)
-    qpos = target_state_qpos(joint_position, root_position, quaternion)
+    qpos = target_state_qpos(
+        joint_position, root_position, root_orientation
+    )
     rows["command_velocity_world_xy"].append(
         schedule.velocity_world_xy[route_frame].detach().cpu().numpy()
     )
@@ -241,6 +276,9 @@ def _append_frame(
     rows["joint_velocity"].append(joint_velocity.detach().cpu().numpy())
     rows["root_position_world"].append(root_position.detach().cpu().numpy())
     rows["root_yaw_world"].append(float(root_yaw.item()))
+    rows["root_orientation_world_wxyz"].append(
+        root_orientation.detach().cpu().numpy()
+    )
     rows["foot_position_world"].append(feet.detach().cpu().numpy())
     rows["foot_surface_height_m"].append(surface.detach().cpu().numpy())
     rows["selected_clip_path"].append(clip_path)
@@ -275,6 +313,7 @@ def _append_hold(
         joint_velocity=torch.zeros_like(state.joint_velocity),
         root_position=state.root_position_world,
         root_yaw=state.root_yaw_world,
+        root_orientation=state.root_orientation_world_wxyz,
         feet=state.foot_position_world,
         surface=_surface(terrain_sampler, state.foot_position_world),
         clip_path="<hold>",
@@ -456,25 +495,41 @@ def run_oracle_route(
                 raise ContractError(
                     f"planned first edge failed revalidation: {feasibility.reason}"
                 )
-            events.append(
-                OraclePlanEvent(
-                    route_frame=state.route_frame,
-                    action_indices=plan.action_indices,
-                    source_keys=tuple(
-                        placement.action.source_key for placement in plan.placements
-                    ),
-                    total_cost=plan.total_cost.total,
-                    rejected_by_reason=plan.expansion.rejected_by_reason,
-                    beam_sizes=plan.expansion.beam_sizes,
+            plan_state = state
+            position_errors = []
+            velocity_errors = []
+            for plan_placement in plan.placements:
+                position_errors.append(
+                    float(
+                        torch.linalg.vector_norm(
+                            plan_placement.action.joint_position[0]
+                            - plan_state.joint_position
+                        ).item()
+                    )
                 )
-            )
+                velocity_errors.append(
+                    float(
+                        torch.linalg.vector_norm(
+                            plan_placement.action.joint_velocity[0]
+                            - plan_state.joint_velocity
+                        ).item()
+                    )
+                )
+                plan_state = advance_state(plan_state, plan_placement)
             first_local_frame = 0 if not rows["qpos"] else 1
             stage = "record"
+            last_local_frame = None
             for local_frame in range(
                 first_local_frame, placed.action.frame_count
             ):
                 route_frame = state.route_frame + local_frame
                 if route_frame >= schedule.frame_count:
+                    break
+                if float(
+                    torch.linalg.vector_norm(
+                        schedule.velocity(route_frame)
+                    ).item()
+                ) <= 1e-6:
                     break
                 feet = placed.foot_position_world[local_frame]
                 _append_frame(
@@ -486,6 +541,9 @@ def run_oracle_route(
                     joint_velocity=placed.action.joint_velocity[local_frame],
                     root_position=placed.root_position_world[local_frame],
                     root_yaw=placed.root_yaw_world[local_frame],
+                    root_orientation=(
+                        placed.root_orientation_world_wxyz[local_frame]
+                    ),
                     feet=feet,
                     surface=_surface(terrain_sampler, feet),
                     clip_path=paths[placed.action.clip_index],
@@ -496,11 +554,80 @@ def run_oracle_route(
                     plan_time_ns=elapsed_ns,
                     feasibility=feasibility,
                 )
+                last_local_frame = local_frame
+            completed_landing = (
+                last_local_frame == placed.action.frame_count - 1
+            )
+            events.append(
+                OraclePlanEvent(
+                    route_frame=state.route_frame,
+                    action_indices=plan.action_indices,
+                    source_keys=tuple(
+                        placement.action.source_key
+                        for placement in plan.placements
+                    ),
+                    step_costs=plan.step_costs,
+                    total_cost=plan.total_cost,
+                    planned_landing_feet=tuple(
+                        placement.action.swing_foot
+                        for placement in plan.placements
+                    ),
+                    planned_landing_world_xyz=tuple(
+                        tuple(
+                            float(value)
+                            for value in placement.foot_position_world[
+                                -1, placement.action.swing_foot
+                            ].detach().cpu().tolist()
+                        )
+                        for placement in plan.placements
+                    ),
+                    emitted_landing_world_xyz=(
+                        tuple(
+                            float(value)
+                            for value in placed.foot_position_world[
+                                -1, placed.action.swing_foot
+                            ].detach().cpu().tolist()
+                        )
+                        if completed_landing
+                        else None
+                    ),
+                    entry_joint_position_error_rad=tuple(position_errors),
+                    entry_joint_velocity_error_rad_s=tuple(velocity_errors),
+                    rejected_by_reason=plan.expansion.rejected_by_reason,
+                    beam_sizes=plan.expansion.beam_sizes,
+                )
+            )
             if len(rows["qpos"]) >= schedule.frame_count:
                 break
-            from .torch_contact_oracle_search import advance_state
-
-            state = advance_state(state, placed)
+            if last_local_frame is None:
+                continue
+            if last_local_frame == placed.action.frame_count - 1:
+                state = advance_state(state, placed)
+            else:
+                state = OracleState(
+                    root_position_world=(
+                        placed.root_position_world[last_local_frame]
+                    ),
+                    root_yaw_world=placed.root_yaw_world[last_local_frame],
+                    root_orientation_world_wxyz=(
+                        placed.root_orientation_world_wxyz[last_local_frame]
+                    ),
+                    foot_position_world=(
+                        placed.foot_position_world[last_local_frame]
+                    ),
+                    support_mask=placed.action.support_mask[last_local_frame],
+                    joint_position=(
+                        placed.action.joint_position[last_local_frame]
+                    ),
+                    joint_velocity=(
+                        placed.action.joint_velocity[last_local_frame]
+                    ),
+                    route_frame=state.route_frame + last_local_frame,
+                    source_history=(
+                        *state.source_history,
+                        placed.action.source_key,
+                    ),
+                )
     except Exception as error:
         failure = OracleRouteFailure(
             stage=stage,
@@ -651,6 +778,7 @@ def _resolved_initial_state(resolved, segment_index, foot_kinematics) -> OracleS
     return OracleState(
         root_position_world=root,
         root_yaw_world=_yaw_from_wxyz(quaternion),
+        root_orientation_world_wxyz=quaternion,
         foot_position_world=feet,
         support_mask=support[frame],
         joint_position=joint_position,
@@ -766,6 +894,13 @@ def _failure_json(failure: OracleRouteFailure | None) -> dict | None:
     }
 
 
+def _cost_json(cost: OracleCost) -> dict[str, float]:
+    return {
+        name: float(getattr(cost, name))
+        for name in OracleCost.__dataclass_fields__
+    } | {"total": cost.total}
+
+
 def _outcome_json(outcome: RouteOutcomeEvaluation) -> dict:
     final_heading = float(outcome.final_heading_error_rad)
     return {
@@ -860,7 +995,28 @@ def save_oracle_matrix(matrix: OracleMatrix, output: str | Path) -> None:
                     "route_frame": event.route_frame,
                     "action_indices": list(event.action_indices),
                     "source_keys": [list(key) for key in event.source_keys],
-                    "total_cost": event.total_cost,
+                    "step_costs": [
+                        _cost_json(cost) for cost in event.step_costs
+                    ],
+                    "total_cost": _cost_json(event.total_cost),
+                    "planned_landing_feet": list(
+                        event.planned_landing_feet
+                    ),
+                    "planned_landing_world_xyz": [
+                        list(position)
+                        for position in event.planned_landing_world_xyz
+                    ],
+                    "emitted_landing_world_xyz": (
+                        list(event.emitted_landing_world_xyz)
+                        if event.emitted_landing_world_xyz is not None
+                        else None
+                    ),
+                    "entry_joint_position_error_rad": list(
+                        event.entry_joint_position_error_rad
+                    ),
+                    "entry_joint_velocity_error_rad_s": list(
+                        event.entry_joint_velocity_error_rad_s
+                    ),
                     "rejected_by_reason": dict(event.rejected_by_reason),
                     "beam_sizes": list(event.beam_sizes),
                 }

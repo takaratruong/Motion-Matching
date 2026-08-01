@@ -25,6 +25,8 @@ from mm_sonic.torch_contact_oracle_search import (
 
 
 def _one_meter_forward_action() -> ContactPhaseAction:
+    orientation = torch.zeros((2, 4))
+    orientation[:, 0] = 1.0
     return ContactPhaseAction(
         clip_index=0,
         start_frame=10,
@@ -37,6 +39,7 @@ def _one_meter_forward_action() -> ContactPhaseAction:
         joint_velocity=torch.zeros((2, 29)),
         root_position_local=torch.tensor(((0.0, 0.0, 0.0), (1.0, 0.0, 0.0))),
         root_yaw_local=torch.zeros(2),
+        root_orientation_local_wxyz=orientation,
         foot_position_local=torch.tensor(
             (
                 ((0.0, 0.1, 0.035), (0.0, -0.1, 0.135)),
@@ -64,6 +67,9 @@ def _state(*, yaw: float = 0.0) -> OracleState:
     return OracleState(
         root_position_world=root,
         root_yaw_world=torch.tensor(yaw),
+        root_orientation_world_wxyz=torch.tensor(
+            (math.cos(yaw / 2.0), 0.0, 0.0, math.sin(yaw / 2.0))
+        ),
         foot_position_world=feet,
         support_mask=torch.tensor((True, False)),
         joint_position=torch.zeros(29),
@@ -146,6 +152,36 @@ class ContactOracleSearchTests(unittest.TestCase):
             placed.foot_position_world[0, 0],
             _state(yaw=math.pi / 2.0).foot_position_world[0],
         )
+
+    def test_rigid_placement_preserves_full_root_orientation(self):
+        action = _one_meter_forward_action()
+        half_roll = 0.2
+        local_orientation = action.root_orientation_local_wxyz.clone()
+        local_orientation[:, 0] = math.cos(half_roll)
+        local_orientation[:, 1] = math.sin(half_roll)
+        action = replace(
+            action, root_orientation_local_wxyz=local_orientation
+        )
+
+        placed = place_action(action, _state(yaw=math.pi / 2.0))
+
+        expected = torch.tensor(
+            (
+                math.cos(math.pi / 4.0) * math.cos(half_roll),
+                math.cos(math.pi / 4.0) * math.sin(half_roll),
+                math.sin(math.pi / 4.0) * math.sin(half_roll),
+                math.sin(math.pi / 4.0) * math.cos(half_roll),
+            )
+        )
+        torch.testing.assert_close(
+            placed.root_orientation_world_wxyz[0], expected
+        )
+
+    def test_public_search_defaults_match_qualified_configuration(self):
+        config = OracleSearchConfig()
+
+        self.assertEqual(config.beam_width, 32)
+        self.assertEqual(config.transition_candidate_count, 32)
 
     def test_rejects_landing_on_height_discontinuity_inside_edge_margin(self):
         action = _one_meter_forward_action()
@@ -334,6 +370,39 @@ class ContactOracleSearchTests(unittest.TestCase):
                     sample_surface=flat_surface,
                     config=OracleSearchConfig(horizon_landings=1),
                 )
+        self.assertEqual(
+            dict(caught.exception.rejected_by_reason),
+            {"entry-foot-error": 1},
+        )
+
+    def test_entry_foot_rejection_precedes_joint_rejection_in_batch(self):
+        action = _one_meter_forward_action()
+        feet = action.foot_position_local.clone()
+        feet[0, 0, 0] += 0.2
+        joints = action.joint_position.clone()
+        joints[0] = 10.0
+        action = replace(
+            action, foot_position_local=feet, joint_position=joints
+        )
+
+        def flat_surface(points):
+            return torch.zeros(
+                points.shape[:-1], dtype=points.dtype, device=points.device
+            )
+
+        with self.assertRaises(OracleSearchFailure) as caught:
+            search_contact_plan(
+                initial_state=_state(),
+                actions=(action,),
+                command_schedule=constant_command_schedule(
+                    velocity_world_xy=(0.3, 0.0),
+                    heading_world_yaw=0.0,
+                    frames=4,
+                    device="cpu",
+                ),
+                sample_surface=flat_surface,
+                config=OracleSearchConfig(horizon_landings=1),
+            )
         self.assertEqual(
             dict(caught.exception.rejected_by_reason),
             {"entry-foot-error": 1},

@@ -1,3 +1,4 @@
+import math
 import unittest
 from types import SimpleNamespace
 
@@ -149,6 +150,51 @@ class ContactOracleActionTests(unittest.TestCase):
             torch.tensor((0.3, 0.0, 0.0), dtype=torch.float32),
         )
         self.assertAlmostEqual(action.minimum_swing_clearance_m, -0.035)
+
+    def test_extracts_and_mirrors_full_local_root_orientation(self):
+        frames = 4
+        support = torch.tensor(
+            ((True, False), (True, False), (True, False), (True, True)),
+            dtype=torch.bool,
+        )
+        root_orientation = torch.zeros((frames, 4), dtype=torch.float32)
+        yaw = math.pi / 2.0
+        roll = 0.4
+        root_orientation[:, 0] = math.cos(yaw / 2.0) * math.cos(roll / 2.0)
+        root_orientation[:, 1] = math.cos(yaw / 2.0) * math.sin(roll / 2.0)
+        root_orientation[:, 2] = math.sin(yaw / 2.0) * math.sin(roll / 2.0)
+        root_orientation[:, 3] = math.sin(yaw / 2.0) * math.cos(roll / 2.0)
+        feet = torch.zeros((frames, 2, 3), dtype=torch.float32)
+        feet[..., 2] = 0.035
+
+        action = action_from_profiles(
+            clip_index=0,
+            start_frame=0,
+            landing_frame=3,
+            support_mask=support,
+            joint_position=torch.zeros((frames, 29)),
+            joint_velocity=torch.zeros((frames, 29)),
+            root_position_world=torch.zeros((frames, 3)),
+            root_orientation_world_wxyz=root_orientation,
+            foot_position_world=feet,
+            foot_surface_height_m=torch.zeros((frames, 2)),
+        )
+        mirrored = mirror_contact_phase_action(action)
+
+        expected_local = torch.tensor(
+            (math.cos(roll / 2.0), math.sin(roll / 2.0), 0.0, 0.0)
+        )
+        torch.testing.assert_close(
+            action.root_orientation_local_wxyz[0], expected_local, atol=1e-6, rtol=1e-6
+        )
+        torch.testing.assert_close(
+            mirrored.root_orientation_local_wxyz[0],
+            torch.tensor(
+                (math.cos(roll / 2.0), -math.sin(roll / 2.0), 0.0, 0.0)
+            ),
+            atol=1e-6,
+            rtol=1e-6,
+        )
 
     def test_dataset_index_reports_inventory_and_exact_source_successor(self):
         dataset, support, feet = _index_fixture()
