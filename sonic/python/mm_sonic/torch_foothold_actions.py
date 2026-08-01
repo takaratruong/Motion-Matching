@@ -934,6 +934,39 @@ class FootholdActionPolicy:
         }
         self._cached_database_id: int | None = None
         self._cached_rows: tuple[FootholdAction | None, ...] | None = None
+        self._cached_row_action_indices: torch.Tensor | None = None
+        self._cached_terrain_rows: torch.Tensor | None = None
+        if self.index.actions:
+            self._action_feet = torch.tensor(
+                [action.landing_feet for action in self.index.actions],
+                dtype=torch.int64,
+                device=self.index.actions[0].landing_height_delta_m.device,
+            )
+            self._action_xy = torch.stack(
+                [
+                    action.landing_xy_start_frame_m
+                    for action in self.index.actions
+                ]
+            )
+            self._action_height = torch.stack(
+                [
+                    action.landing_height_delta_m
+                    for action in self.index.actions
+                ]
+            )
+            self._action_timing = torch.tensor(
+                [
+                    action.landing_frame_offsets
+                    for action in self.index.actions
+                ],
+                dtype=torch.int64,
+                device=self._action_feet.device,
+            )
+        else:
+            self._action_feet = torch.empty((0, 2), dtype=torch.int64)
+            self._action_xy = torch.empty((0, 2, 2), dtype=torch.float32)
+            self._action_height = torch.empty((0, 2), dtype=torch.float32)
+            self._action_timing = torch.empty((0, 2), dtype=torch.int64)
 
     def _sample_matcher_surface(self, points: torch.Tensor) -> torch.Tensor:
         try:
@@ -951,7 +984,92 @@ class FootholdActionPolicy:
         if self._cached_database_id != token or self._cached_rows is None:
             self._cached_rows = self.index.rows_for_database(database)
             self._cached_database_id = token
+            device = torch.device(database.device)
+            self._cached_row_action_indices = torch.tensor(
+                [
+                    -1
+                    if action is None
+                    else self._action_indices[
+                        (action.clip_index, action.start_frame)
+                    ]
+                    for action in self._cached_rows
+                ],
+                dtype=torch.int64,
+                device=device,
+            )
+            terrain_clips = torch.tensor(
+                sorted(self._terrain_clip_indices),
+                dtype=database._search_clip_index.dtype,
+                device=device,
+            )
+            self._cached_terrain_rows = torch.isin(
+                database._search_clip_index, terrain_clips
+            )
         return self._cached_rows
+
+    def _rank_all_actions(self, plan: FootholdPlan) -> FootholdRanking:
+        count = len(self.index.actions)
+        device = plan.score.device
+        eligible = torch.zeros(count, dtype=torch.bool, device=device)
+        cost = torch.zeros(count, dtype=torch.float32, device=device)
+        if count == 0 or plan.score.shape[0] == 0:
+            return FootholdRanking(eligible, cost, None)
+        feet = plan.landing_feet[:, None, :] == self._action_feet[None, :, :]
+        height_error = torch.abs(
+            plan.landing_height_delta_m[:, None, :]
+            - self._action_height[None, :, :]
+        )
+        xy_error = torch.linalg.vector_norm(
+            plan.landing_xy_command_frame_m[:, None, :, :]
+            - self._action_xy[None, :, :, :],
+            dim=-1,
+        )
+        timing_error = torch.abs(
+            plan.landing_frame_offsets[:, None, :]
+            - self._action_timing[None, :, :]
+        )
+        first_valid = (
+            feet[..., 0]
+            & (height_error[..., 0] <= self.height_tolerance_m)
+            & (xy_error[..., 0] <= self.xy_tolerance_m)
+            & (timing_error[..., 0] <= self.timing_tolerance_frames)
+        )
+        both_valid = (
+            feet.all(dim=-1)
+            & (height_error <= self.height_tolerance_m).all(dim=-1)
+            & (xy_error <= self.xy_tolerance_m).all(dim=-1)
+            & (timing_error <= self.timing_tolerance_frames).all(dim=-1)
+        )
+        normalized = (
+            torch.square(height_error / self.height_tolerance_m).sum(dim=-1)
+            + torch.square(xy_error / self.xy_tolerance_m).sum(dim=-1)
+            + torch.square(
+                timing_error.to(torch.float32)
+                / float(max(1, self.timing_tolerance_frames))
+            ).sum(dim=-1)
+            + (~feet).to(torch.float32).sum(dim=-1) * 100.0
+            + plan.score[:, None]
+        )
+        cost = normalized.min(dim=0).values.clamp_min(0.0)
+        if self.arm is FootholdSelectionArm.FIRST_CONTACT:
+            eligible = first_valid.any(dim=0)
+        elif self.arm in (
+            FootholdSelectionArm.TWO_CONTACT,
+            FootholdSelectionArm.HYBRID,
+        ):
+            eligible = both_valid.any(dim=0)
+        else:
+            eligible.fill_(True)
+        selected = None
+        if bool(eligible.any().item()):
+            selected = int(
+                torch.argmin(
+                    torch.where(
+                        eligible, cost, torch.full_like(cost, torch.inf)
+                    )
+                ).item()
+            )
+        return FootholdRanking(eligible, cost, selected)
 
     def prepare(
         self, state: object, shaped: object, database: object
@@ -998,34 +1116,20 @@ class FootholdActionPolicy:
             edge_margin_m=self.edge_margin_m,
             beam_width=self.beam_width,
         )
-        actions = self.index.actions
-        ranking = rank_foothold_actions(
-            arm=self.arm,
-            plan=plan,
-            actions=actions,
-            motion_cost=torch.zeros(
-                len(actions), dtype=torch.float32, device=device
-            ),
-            height_tolerance_m=self.height_tolerance_m,
-            xy_tolerance_m=self.xy_tolerance_m,
-            timing_tolerance_frames=self.timing_tolerance_frames,
-        )
+        ranking = self._rank_all_actions(plan)
         rows = self._rows(database)
         row_count = len(rows)
-        eligible = torch.ones(row_count, dtype=torch.bool, device=device)
+        assert self._cached_row_action_indices is not None
+        assert self._cached_terrain_rows is not None
+        action_indices = self._cached_row_action_indices
+        action_rows = action_indices >= 0
+        eligible = ~self._cached_terrain_rows
+        eligible = eligible.clone()
+        eligible[action_rows] = ranking.eligible[action_indices[action_rows]]
         additional = torch.zeros(row_count, dtype=torch.float32, device=device)
-        for row, action in enumerate(rows):
-            clip_index = int(database_clips[row].item())
-            if clip_index not in self._terrain_clip_indices:
-                continue
-            eligible[row] = False
-            if action is None:
-                continue
-            action_index = self._action_indices[
-                (action.clip_index, action.start_frame)
-            ]
-            eligible[row] = ranking.eligible[action_index]
-            additional[row] = ranking.additional_cost[action_index]
+        additional[action_rows] = ranking.additional_cost[
+            action_indices[action_rows]
+        ]
         return FootholdPolicyResult(
             row_eligibility=eligible,
             additional_row_cost=additional,

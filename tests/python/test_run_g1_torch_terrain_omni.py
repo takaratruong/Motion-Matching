@@ -4,6 +4,20 @@ from resources.run_g1_torch_terrain_omni import build_parser
 
 
 class TerrainOmniCliTests(unittest.TestCase):
+    def test_foothold_ablation_arm_is_explicit(self):
+        arguments = build_parser().parse_args(
+            [
+                "--dataset", "motions",
+                "--config", "contact.json",
+                "--g1-xml", "g1.xml",
+                "--output", "matrix",
+                "--contact-segments",
+                "--foothold-arm", "hybrid",
+            ]
+        )
+
+        self.assertEqual(arguments.foothold_arm, "hybrid")
+
     def test_contact_policy_and_latency_flags_are_explicit(self):
         arguments = build_parser().parse_args(
             [

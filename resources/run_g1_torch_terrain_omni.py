@@ -31,6 +31,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Load the contact-segment experiment schema and policy.",
     )
     parser.add_argument(
+        "--foothold-arm",
+        choices=(
+            "first-contact",
+            "two-contact",
+            "hybrid",
+            "continuous-control",
+        ),
+        help="Condition contact-segment entries on this foothold ablation arm.",
+    )
+    parser.add_argument(
         "--maximum-step-time-ms",
         type=float,
         default=1000.0,
@@ -65,6 +75,7 @@ def main() -> int:
     else:
         routes = inventory
     contact_policy = None
+    foothold_policy = None
     if args.contact_segments:
         from mm_sonic.torch_contact_segment_rollout import (
             build_contact_segment_policy,
@@ -83,6 +94,22 @@ def main() -> int:
             args.dataset,
             load_experiment_config(args.config),
             device=args.device,
+        )
+    if args.foothold_arm and contact_policy is None:
+        raise ValueError("--foothold-arm requires --contact-segments")
+    if args.foothold_arm:
+        from mm_sonic.torch_foothold_actions import (
+            FootholdActionIndex,
+            FootholdActionPolicy,
+            FootholdSelectionArm,
+        )
+
+        foothold_policy = FootholdActionPolicy(
+            index=FootholdActionIndex.from_dataset(
+                resolved.dataset, contact_policy.index
+            ),
+            extension=resolved.measurement_extension,
+            arm=FootholdSelectionArm(args.foothold_arm),
         )
     if args.maximum_step_time_ms <= 0.0:
         raise ValueError("maximum step time must be positive")
@@ -104,6 +131,7 @@ def main() -> int:
         routes=routes,
         normalization_override=normalization,
         contact_segment_policy=contact_policy,
+        foothold_action_policy=foothold_policy,
         maximum_step_time_ns=int(args.maximum_step_time_ms * 1_000_000),
     )
     save_omni_matrix(matrix, args.output)

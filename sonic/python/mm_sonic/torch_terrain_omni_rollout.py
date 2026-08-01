@@ -547,6 +547,7 @@ def run_resolved_omni_matrix(
     routes: Sequence[OmniRoute] | None = None,
     normalization_override=None,
     contact_segment_policy=None,
+    foothold_action_policy=None,
     maximum_step_time_ns: int | None = None,
 ) -> OmniMatrix:
     """Run the real Torch matcher and measure native MuJoCo FK ankle origins."""
@@ -582,6 +583,7 @@ def run_resolved_omni_matrix(
         ),
         normalization_override=normalization_override,
         contact_segment_policy=contact_segment_policy,
+        foothold_action_policy=foothold_action_policy,
     )
     model, data = build_kinematic_scene(g1_xml, resolved)
     left_ankle = int(model.body("left_ankle_roll_link").id)

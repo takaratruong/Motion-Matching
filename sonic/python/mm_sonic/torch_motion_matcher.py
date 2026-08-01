@@ -2680,7 +2680,7 @@ class TorchMotionMatcher:
         terrain_transition_eligibility = self._command_terrain_entry_rows(
             state, shaped
         )
-        if not committed_playback:
+        if not committed_playback and search:
             (
                 transition_eligibility,
                 terrain_transition_eligibility,
