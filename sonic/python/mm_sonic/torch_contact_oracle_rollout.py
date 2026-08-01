@@ -71,7 +71,7 @@ ORACLE_ARRAY_SHAPES = {
     "landing_error_m": (),
     "minimum_swing_clearance_m": (),
 }
-ORACLE_IMPLEMENTATION_ID = "g1-contact-oracle/route-anchored-continuity-v4"
+ORACLE_IMPLEMENTATION_ID = "g1-contact-oracle/full-orientation-continuity-v5"
 
 
 @dataclass(frozen=True)
