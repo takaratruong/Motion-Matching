@@ -344,6 +344,27 @@ def _hash_run(
     return digest.hexdigest()
 
 
+def oracle_arrays_sha256(arrays: Mapping[str, np.ndarray]) -> str:
+    """Hash the complete saved array payload without pickle serialization."""
+
+    if set(arrays) != set(ORACLE_ARRAY_SHAPES):
+        raise ContractError("contact oracle array inventory is invalid")
+    digest = hashlib.sha256(b"g1-contact-oracle-arrays/v1")
+    for name in sorted(arrays):
+        array = np.asarray(arrays[name])
+        digest.update(b"\0")
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(array.dtype).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(json.dumps(array.shape).encode("ascii"))
+        if array.dtype.kind in "US":
+            digest.update("\0".join(array.reshape(-1).tolist()).encode("utf-8"))
+        else:
+            digest.update(np.ascontiguousarray(array).tobytes())
+    return digest.hexdigest()
+
+
 def run_oracle_route(
     *,
     route: OmniRoute,
@@ -841,6 +862,7 @@ def save_oracle_matrix(matrix: OracleMatrix, output: str | Path) -> None:
                 "outcome": _outcome_json(run.outcome),
                 "metrics": _metrics_json(run.metrics),
                 "plan_events": events,
+                "arrays_sha256": oracle_arrays_sha256(run.arrays),
                 "deterministic_sha256": run.deterministic_sha256,
             }
             (route_dir / "diagnostics.json").write_bytes(
