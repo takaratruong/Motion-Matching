@@ -57,10 +57,13 @@ except ImportError:
 
 try:
     from mm_sonic.torch_foothold_actions import (
+        FootholdActionPolicy,
         FootholdSelectionArm,
         rank_foothold_actions,
     )
 except ImportError:
+    FootholdActionPolicy = None
+
     class FootholdSelectionArm(Enum):
         TWO_CONTACT = "two-contact"
         HYBRID = "hybrid"
@@ -119,7 +122,9 @@ def _two_contact_profiles():
     return support, foot_xy, surface, root_xy, root_yaw
 
 
-def _action(*, height=(0.0, 0.0), feet=(1, 0), xy=None):
+def _action(
+    *, height=(0.0, 0.0), feet=(1, 0), xy=None, start_frame=0
+):
     landing_xy = (
         torch.tensor(((0.30, 0.10), (0.60, -0.10)))
         if xy is None
@@ -127,8 +132,8 @@ def _action(*, height=(0.0, 0.0), feet=(1, 0), xy=None):
     )
     return FootholdAction(
         clip_index=0,
-        start_frame=0,
-        end_frame=21,
+        start_frame=start_frame,
+        end_frame=start_frame + 21,
         start_support=(True, True),
         landing_feet=feet,
         landing_frame_offsets=(10, 20),
@@ -448,6 +453,57 @@ class FootholdActionTests(unittest.TestCase):
 
         self.assertEqual(ranking.eligible.tolist(), [True, True])
         self.assertEqual(ranking.selected_action, 0)
+
+    def test_policy_maps_hard_contact_filter_back_to_database_rows(self):
+        raised = _action(height=(0.18, 0.18), start_frame=0)
+        flat = _action(start_frame=1)
+        index = FootholdActionIndex(
+            actions=(raised, flat),
+            _entries={(0, 0): raised, (0, 1): flat},
+        )
+
+        class FlatGrid:
+            @staticmethod
+            def sample_xy(points):
+                return torch.zeros(
+                    points.shape[:-1],
+                    dtype=points.dtype,
+                    device=points.device,
+                )
+
+        extension = SimpleNamespace(
+            query_grid=FlatGrid(),
+            alignment=SimpleNamespace(
+                matcher_to_scene_xy=lambda points: points
+            ),
+        )
+        policy = FootholdActionPolicy(
+            index=index,
+            extension=extension,
+            arm=FootholdSelectionArm.TWO_CONTACT,
+        )
+        database = SimpleNamespace(
+            _search_clip_index=torch.tensor((0, 0)),
+            _search_frame_index=torch.tensor((0, 1)),
+            device=torch.device("cpu"),
+        )
+        state = SimpleNamespace(
+            feature_body_position=torch.tensor(
+                (
+                    (0.0, 0.0, 0.8),
+                    (0.0, -0.1, 0.035),
+                    (0.0, 0.1, 0.035),
+                )
+            )
+        )
+        shaped = SimpleNamespace(
+            velocity_world_xy=torch.tensor((1.0, 0.0))
+        )
+
+        result = policy.prepare(state, shaped, database)
+
+        self.assertEqual(result.row_eligibility.tolist(), [False, True])
+        self.assertGreaterEqual(result.candidate_count, 1)
 
 
 if __name__ == "__main__":

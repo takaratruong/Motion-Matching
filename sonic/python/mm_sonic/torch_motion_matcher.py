@@ -1005,6 +1005,7 @@ class TorchMotionMatcher:
         config: MatcherConfig,
         emitted_window_validator: EmittedWindowValidator | None = None,
         contact_segment_policy: TerrainContactSegmentPolicy | None = None,
+        foothold_action_policy: object | None = None,
     ) -> None:
         jerk_weight = config.transition_window_jerk_weight
         if (
@@ -1084,6 +1085,11 @@ class TorchMotionMatcher:
                     "contact segment policy does not match the motion database"
                 )
         self._contact_segment_policy = contact_segment_policy
+        if foothold_action_policy is not None and not callable(
+            getattr(foothold_action_policy, "prepare", None)
+        ):
+            raise ContractError("foothold_action_policy is invalid")
+        self._foothold_action_policy = foothold_action_policy
         self._transition_eligible_rows = (
             None
             if contact_segment_policy is None
@@ -1240,6 +1246,55 @@ class TorchMotionMatcher:
         )
         return eligible & (~self._terrain_entry_rows | compatible)
 
+    def _foothold_conditioning(
+        self,
+        state: _MatcherState,
+        shaped: ShapedCommand,
+        transition_costs: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
+        eligible = self._command_transition_eligibility(state, shaped)
+        terrain_eligible = self._command_terrain_entry_rows(state, shaped)
+        policy = self._foothold_action_policy
+        if policy is None:
+            return eligible, terrain_eligible, transition_costs
+        try:
+            result = policy.prepare(state, shaped, self.database)
+            row_eligibility = result.row_eligibility
+            additional_row_cost = result.additional_row_cost
+        except ContractError:
+            raise
+        except Exception as error:
+            raise ContractError("foothold action policy failed") from error
+        row_shape = self.database._search_clip_index.shape
+        if (
+            not isinstance(row_eligibility, torch.Tensor)
+            or row_eligibility.shape != row_shape
+            or row_eligibility.dtype != torch.bool
+            or row_eligibility.device != self.device
+            or not isinstance(additional_row_cost, torch.Tensor)
+            or additional_row_cost.shape != row_shape
+            or not additional_row_cost.dtype.is_floating_point
+            or additional_row_cost.device != self.device
+            or not torch.isfinite(additional_row_cost).all()
+            or bool((additional_row_cost < 0.0).any().item())
+        ):
+            raise ContractError("foothold action policy result is invalid")
+        conditioned = (
+            row_eligibility
+            if eligible is None
+            else eligible & row_eligibility
+        )
+        conditioned_terrain = (
+            None
+            if terrain_eligible is None
+            else terrain_eligible & row_eligibility
+        )
+        return (
+            conditioned,
+            conditioned_terrain,
+            transition_costs + additional_row_cost,
+        )
+
     def _command_terrain_entry_rows(
         self, state: _MatcherState, shaped: ShapedCommand
     ) -> torch.Tensor | None:
@@ -1312,6 +1367,7 @@ class TorchMotionMatcher:
         emitted_window_validator: EmittedWindowValidator | None = None,
         normalization_override: FeatureNormalization | None = None,
         contact_segment_policy: TerrainContactSegmentPolicy | None = None,
+        foothold_action_policy: object | None = None,
     ) -> "TorchMotionMatcher":
         resolved = resolve_torch_device(
             "cuda" if device == "auto" and torch.cuda.is_available()
@@ -1366,6 +1422,7 @@ class TorchMotionMatcher:
             config,
             emitted_window_validator,
             contact_segment_policy,
+            foothold_action_policy,
         )
 
     @property
@@ -1392,7 +1449,14 @@ class TorchMotionMatcher:
         if not math.isfinite(vertical):
             raise ContractError("aligned target vertical translation must be finite")
         clip = self._clips[clip_index]
-        sl = slice(frame_index, frame_index + horizon)
+        if not 0 <= frame_index < clip.joint_position.shape[0]:
+            raise ContractError("aligned target frame is outside the source clip")
+        indices = torch.arange(
+            frame_index,
+            frame_index + horizon,
+            dtype=torch.long,
+            device=self.device,
+        ).clamp_max(clip.joint_position.shape[0] - 1)
         root = self.folder.layout.root_body_index
         bodies = torch.tensor(
             (
@@ -1402,24 +1466,28 @@ class TorchMotionMatcher:
             ),
             device=self.device,
         )
-        joint_p = clip.joint_position[sl]
-        joint_v = clip.joint_velocity[sl]
-        body_p = _rotate_z(clip.body_position[sl][:, bodies], yaw_offset)
+        joint_p = clip.joint_position[indices]
+        joint_v = clip.joint_velocity[indices]
+        body_p = _rotate_z(clip.body_position[indices][:, bodies], yaw_offset)
         body_p = body_p.clone()
         body_p[..., :2] += translation_xy
         if vertical != 0.0:
             body_p[..., 2] += vertical
-        body_v = _rotate_z(clip.body_linear_velocity[sl][:, bodies], yaw_offset)
+        body_v = _rotate_z(
+            clip.body_linear_velocity[indices][:, bodies], yaw_offset
+        )
         root_p = body_p[:, 0]
         root_v = body_v[:, 0]
         yaw_q = _quat_from_yaw(yaw_offset)
         root_q = _quat_normalize(
             _quat_mul(
                 yaw_q.expand(horizon, 4),
-                clip.body_quaternion[sl, root],
+                clip.body_quaternion[indices, root],
             )
         )
-        root_w = _rotate_z(clip.body_angular_velocity[sl, root], yaw_offset)
+        root_w = _rotate_z(
+            clip.body_angular_velocity[indices, root], yaw_offset
+        )
         return joint_p, joint_v, root_p, root_q, root_v, root_w, body_p, body_v
 
     def _ranked_terrain_rescue(
@@ -1428,6 +1496,7 @@ class TorchMotionMatcher:
         shaped: ShapedCommand,
         query: torch.Tensor,
         transition_costs: torch.Tensor,
+        transition_eligibility: torch.Tensor | None,
         successor: int | None,
         incumbent_cost: float,
         validator,
@@ -1445,9 +1514,7 @@ class TorchMotionMatcher:
             current_frame_index=state.frame_index,
             config=self.config,
             additional_transition_costs=transition_costs,
-            transition_eligible_rows=self._command_transition_eligibility(
-                state, shaped
-            ),
+            transition_eligible_rows=transition_eligibility,
         )
         rescue_time = time.perf_counter_ns() - rescue_start
         search_time = (
@@ -1518,6 +1585,7 @@ class TorchMotionMatcher:
         shaped: ShapedCommand,
         query: torch.Tensor,
         transition_costs: torch.Tensor,
+        transition_eligibility: torch.Tensor | None,
         successor: int,
         decision: SearchDecision,
         candidate: _ComposedCandidate,
@@ -1536,9 +1604,7 @@ class TorchMotionMatcher:
             current_frame_index=state.frame_index,
             config=self.config,
             additional_transition_costs=transition_costs,
-            transition_eligible_rows=self._command_transition_eligibility(
-                state, shaped
-            ),
+            transition_eligible_rows=transition_eligibility,
         )
         rerank_time = time.perf_counter_ns() - rerank_start
         search_time = (
@@ -1657,11 +1723,16 @@ class TorchMotionMatcher:
         incumbent_row: int | None,
         *,
         inherit_terrain_exit_elevation: bool = False,
+        source_override: tuple[int, int] | None = None,
     ) -> _ComposedCandidate:
-        clip_index, frame_index = self._source_for_row(selected_row)
-        transitioned = (
-            incumbent_row is None or selected_row != incumbent_row
-        )
+        if source_override is None:
+            clip_index, frame_index = self._source_for_row(selected_row)
+            transitioned = (
+                incumbent_row is None or selected_row != incumbent_row
+            )
+        else:
+            clip_index, frame_index = source_override
+            transitioned = False
         placement = None
         contact_entry_valid = True
         policy = self._contact_segment_policy
@@ -1948,13 +2019,17 @@ class TorchMotionMatcher:
         successor = self.database.row_for_source(
             state.clip_index, state.frame_index + 1
         )
+        active_commitment = (
+            state.commitment is not None
+            and state.frame_index + 1 < state.commitment.end_frame
+        )
         shaped = predict_command_trajectory(
             state.root_position[:2],
             state.shaped_velocity,
             state.shaped_heading,
             requested_velocity,
             requested_heading,
-            has_valid_successor=successor is not None,
+            has_valid_successor=(successor is not None or active_commitment),
             config=self.config,
         )
         feature_state = GeneratedFeatureState(
@@ -2526,13 +2601,17 @@ class TorchMotionMatcher:
         successor = self.database.row_for_source(
             state.clip_index, state.frame_index + 1
         )
+        active_commitment = (
+            state.commitment is not None
+            and state.frame_index + 1 < state.commitment.end_frame
+        )
         shaped = predict_command_trajectory(
             state.root_position[:2],
             state.shaped_velocity,
             state.shaped_heading,
             requested_v,
             requested_h,
-            has_valid_successor=successor is not None,
+            has_valid_successor=(successor is not None or active_commitment),
             config=self.config,
         )
         feature_state = GeneratedFeatureState(
@@ -2559,10 +2638,6 @@ class TorchMotionMatcher:
         query = self.database.normalization.normalize(raw_query)
         search = search_is_due(
             state.sequence, shaped.force_search, self.config
-        )
-        active_commitment = (
-            state.commitment is not None
-            and state.frame_index + 1 < state.commitment.end_frame
         )
         interrupting_commitment = (
             active_commitment
@@ -2599,26 +2674,60 @@ class TorchMotionMatcher:
             transition_costs = transition_costs + (
                 self._flat_support_transition_costs(state, shaped)
             )
+        transition_eligibility = self._command_transition_eligibility(
+            state, shaped
+        )
+        terrain_transition_eligibility = self._command_terrain_entry_rows(
+            state, shaped
+        )
+        if not committed_playback:
+            (
+                transition_eligibility,
+                terrain_transition_eligibility,
+                transition_costs,
+            ) = self._foothold_conditioning(
+                state, shaped, transition_costs
+            )
+        committed_source = None
         if committed_playback:
             commitment = state.commitment
             assert commitment is not None
-            if successor is None or self._source_for_row(successor) != (
-                commitment.clip_index,
-                state.frame_index + 1,
+            next_frame = state.frame_index + 1
+            expected_source = (commitment.clip_index, next_frame)
+            if (
+                commitment.clip_index != state.clip_index
+                or next_frame
+                >= self._clips[commitment.clip_index].joint_position.shape[0]
             ):
                 raise ContractError(
                     "active contact segment has no exact source successor"
                 )
+            diagnostic_row = successor
+            if (
+                diagnostic_row is None
+                or self._source_for_row(diagnostic_row) != expected_source
+            ):
+                diagnostic_row = self.database.row_for_source(
+                    commitment.clip_index,
+                    self.folder.clips[
+                        commitment.clip_index
+                    ].valid_frame_stop
+                    - 1,
+                )
+            if diagnostic_row is None:
+                raise ContractError(
+                    "active contact segment has no diagnostic source row"
+                )
             feature_cost = float(
                 torch.sum(
                     torch.square(
-                        self.database._search_features[successor] - query
+                        self.database._search_features[diagnostic_row] - query
                     )
                 ).item()
             )
             decision = SearchDecision(
-                selected_row=successor,
-                incumbent_row=successor,
+                selected_row=diagnostic_row,
+                incumbent_row=diagnostic_row,
                 incumbent_cost=feature_cost,
                 selected_feature_cost=feature_cost,
                 selected_total_cost=feature_cost,
@@ -2626,6 +2735,7 @@ class TorchMotionMatcher:
                 transitioned=False,
             )
             search_time = None
+            committed_source = expected_source
         else:
             search_start = time.perf_counter_ns()
             decision = select_exact_candidate(
@@ -2638,15 +2748,17 @@ class TorchMotionMatcher:
                 config=self.config,
                 additional_transition_penalty=settle_penalty,
                 additional_transition_costs=transition_costs,
-                transition_eligible_rows=self._command_transition_eligibility(
-                    state, shaped
-                ),
+                transition_eligible_rows=transition_eligibility,
             )
             search_time = (
                 time.perf_counter_ns() - search_start if search else None
             )
         candidate = self._compose_candidate(
-            state, shaped, decision.selected_row, successor
+            state,
+            shaped,
+            decision.selected_row,
+            successor,
+            source_override=committed_source,
         )
         transition_rejected = False
         terrain_safety_override = False
@@ -2672,9 +2784,7 @@ class TorchMotionMatcher:
                 current_frame_index=state.frame_index,
                 config=self.config,
                 additional_transition_costs=transition_costs,
-                transition_eligible_rows=self._command_terrain_entry_rows(
-                    state, shaped
-                ),
+                transition_eligible_rows=terrain_transition_eligibility,
             )
             terrain_rank_time = time.perf_counter_ns() - terrain_rank_start
             search_time = (
@@ -2740,6 +2850,7 @@ class TorchMotionMatcher:
                 shaped,
                 query,
                 transition_costs,
+                transition_eligibility,
                 successor,
                 decision.incumbent_cost,
                 validator,
@@ -2797,6 +2908,7 @@ class TorchMotionMatcher:
                         shaped,
                         query,
                         transition_costs,
+                        transition_eligibility,
                         successor,
                         decision.incumbent_cost,
                         validator,
@@ -2816,6 +2928,7 @@ class TorchMotionMatcher:
                             shaped,
                             query,
                             transition_costs,
+                            transition_eligibility,
                             successor,
                             decision.incumbent_cost,
                             validator,
@@ -2845,6 +2958,7 @@ class TorchMotionMatcher:
                                 shaped,
                                 query,
                                 transition_costs,
+                                transition_eligibility,
                                 successor,
                                 decision.incumbent_cost,
                                 validator,
@@ -2858,6 +2972,7 @@ class TorchMotionMatcher:
                                 shaped,
                                 query,
                                 transition_costs,
+                                transition_eligibility,
                                 successor,
                                 decision.incumbent_cost,
                                 validator,
@@ -2904,6 +3019,7 @@ class TorchMotionMatcher:
                 shaped,
                 query,
                 transition_costs,
+                transition_eligibility,
                 successor,
                 decision,
                 candidate,

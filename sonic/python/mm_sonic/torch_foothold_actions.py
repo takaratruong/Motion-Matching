@@ -823,7 +823,7 @@ def rank_foothold_actions(
             + (~feet).to(motion_cost.dtype).sum(dim=1) * 100.0
             + plan.score
         )
-        descriptor_cost[action_index] = normalized.min()
+        descriptor_cost[action_index] = normalized.min().clamp_min(0.0)
         if arm is FootholdSelectionArm.FIRST_CONTACT:
             eligible[action_index] = bool(first_valid.any().item())
         elif arm in (
@@ -844,3 +844,191 @@ def rank_foothold_actions(
         )
         selected = int(torch.argmin(masked).item())
     return FootholdRanking(eligible, descriptor_cost, selected)
+
+
+@dataclass(frozen=True)
+class FootholdPolicyResult:
+    row_eligibility: torch.Tensor
+    additional_row_cost: torch.Tensor
+    plan: FootholdPlan
+    candidate_count: int
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.row_eligibility, torch.Tensor)
+            or self.row_eligibility.ndim != 1
+            or self.row_eligibility.dtype != torch.bool
+            or not isinstance(self.additional_row_cost, torch.Tensor)
+            or self.additional_row_cost.shape != self.row_eligibility.shape
+            or not self.additional_row_cost.dtype.is_floating_point
+            or self.additional_row_cost.device != self.row_eligibility.device
+            or not torch.isfinite(self.additional_row_cost).all()
+            or bool((self.additional_row_cost < 0.0).any().item())
+            or not isinstance(self.plan, FootholdPlan)
+            or self.plan.score.device != self.row_eligibility.device
+            or type(self.candidate_count) is not int
+            or self.candidate_count < 0
+        ):
+            raise ContractError("foothold policy result is invalid")
+        object.__setattr__(
+            self, "row_eligibility", self.row_eligibility.detach().clone()
+        )
+        object.__setattr__(
+            self,
+            "additional_row_cost",
+            self.additional_row_cost.detach().clone(),
+        )
+
+
+@dataclass
+class FootholdActionPolicy:
+    """Map a query heightmap plan into exact motion-database row gates."""
+
+    index: FootholdActionIndex
+    extension: object
+    arm: FootholdSelectionArm
+    height_tolerance_m: float = 0.06
+    xy_tolerance_m: float = 0.25
+    timing_tolerance_frames: int = 20
+    edge_margin_m: float = 0.04
+    beam_width: int = 16
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.index, FootholdActionIndex)
+            or not isinstance(self.arm, FootholdSelectionArm)
+            or not callable(
+                getattr(getattr(self.extension, "query_grid", None),
+                        "sample_xy", None)
+            )
+            or not callable(
+                getattr(getattr(self.extension, "alignment", None),
+                        "matcher_to_scene_xy", None)
+            )
+        ):
+            raise ContractError("foothold action policy inputs are invalid")
+        if (
+            any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) <= 0.0
+                for value in (
+                    self.height_tolerance_m,
+                    self.xy_tolerance_m,
+                    self.edge_margin_m,
+                )
+            )
+            or type(self.timing_tolerance_frames) is not int
+            or self.timing_tolerance_frames < 0
+            or type(self.beam_width) is not int
+            or self.beam_width < 1
+        ):
+            raise ContractError("foothold action policy tolerances are invalid")
+        self._terrain_clip_indices = frozenset(
+            action.clip_index for action in self.index.actions
+        )
+        self._action_indices = {
+            (action.clip_index, action.start_frame): action_index
+            for action_index, action in enumerate(self.index.actions)
+        }
+        self._cached_database_id: int | None = None
+        self._cached_rows: tuple[FootholdAction | None, ...] | None = None
+
+    def _sample_matcher_surface(self, points: torch.Tensor) -> torch.Tensor:
+        try:
+            scene = self.extension.alignment.matcher_to_scene_xy(points)
+            return self.extension.query_grid.sample_xy(scene)
+        except ContractError:
+            raise
+        except Exception as error:
+            raise ContractError("foothold query terrain sampling failed") from error
+
+    def _rows(
+        self, database: object
+    ) -> tuple[FootholdAction | None, ...]:
+        token = id(database)
+        if self._cached_database_id != token or self._cached_rows is None:
+            self._cached_rows = self.index.rows_for_database(database)
+            self._cached_database_id = token
+        return self._cached_rows
+
+    def prepare(
+        self, state: object, shaped: object, database: object
+    ) -> FootholdPolicyResult:
+        try:
+            body = state.feature_body_position
+            command = shaped.velocity_world_xy
+            device = torch.device(database.device)
+            database_clips = database._search_clip_index
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ContractError("foothold policy state is invalid") from error
+        if (
+            not isinstance(body, torch.Tensor)
+            or tuple(body.shape) != (3, 3)
+            or not body.dtype.is_floating_point
+            or body.device != device
+            or not torch.isfinite(body).all()
+            or not isinstance(command, torch.Tensor)
+            or tuple(command.shape) != (2,)
+            or command.dtype != body.dtype
+            or command.device != device
+            or not torch.isfinite(command).all()
+        ):
+            raise ContractError("foothold policy state tensors are invalid")
+        feet = body[1:, :]
+        surface = self._sample_matcher_surface(feet[:, :2])
+        if (
+            not isinstance(surface, torch.Tensor)
+            or tuple(surface.shape) != (2,)
+            or surface.device != device
+            or surface.dtype != body.dtype
+            or not torch.isfinite(surface).all()
+        ):
+            raise ContractError("foothold policy support surface is invalid")
+        clearance = feet[:, 2] - surface
+        support = torch.abs(clearance - 0.035) <= 0.020
+        plan = plan_footholds(
+            foot_xy_m=feet[:, :2],
+            support_mask=support,
+            command_xy=command,
+            sample_surface=self._sample_matcher_surface,
+            reachable_forward_m=(0.20, 0.25, 0.30, 0.35, 0.40),
+            lateral_samples_m=(-0.15, -0.075, 0.0, 0.075, 0.15),
+            edge_margin_m=self.edge_margin_m,
+            beam_width=self.beam_width,
+        )
+        actions = self.index.actions
+        ranking = rank_foothold_actions(
+            arm=self.arm,
+            plan=plan,
+            actions=actions,
+            motion_cost=torch.zeros(
+                len(actions), dtype=torch.float32, device=device
+            ),
+            height_tolerance_m=self.height_tolerance_m,
+            xy_tolerance_m=self.xy_tolerance_m,
+            timing_tolerance_frames=self.timing_tolerance_frames,
+        )
+        rows = self._rows(database)
+        row_count = len(rows)
+        eligible = torch.ones(row_count, dtype=torch.bool, device=device)
+        additional = torch.zeros(row_count, dtype=torch.float32, device=device)
+        for row, action in enumerate(rows):
+            clip_index = int(database_clips[row].item())
+            if clip_index not in self._terrain_clip_indices:
+                continue
+            eligible[row] = False
+            if action is None:
+                continue
+            action_index = self._action_indices[
+                (action.clip_index, action.start_frame)
+            ]
+            eligible[row] = ranking.eligible[action_index]
+            additional[row] = ranking.additional_cost[action_index]
+        return FootholdPolicyResult(
+            row_eligibility=eligible,
+            additional_row_cost=additional,
+            plan=plan,
+            candidate_count=int(ranking.eligible.sum().item()),
+        )

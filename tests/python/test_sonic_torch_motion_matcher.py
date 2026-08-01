@@ -70,6 +70,32 @@ class _ScriptedWindowValidator:
         return self.decisions.pop(0)
 
 
+class _FakeFootholdPolicy:
+    def __init__(self, allowed_source, added_cost):
+        self.allowed_source = tuple(allowed_source)
+        self.added_cost = float(added_cost)
+        self.calls = 0
+
+    def prepare(self, state, shaped, database):
+        self.calls += 1
+        eligible = torch.zeros(
+            database._search_clip_index.shape,
+            dtype=torch.bool,
+            device=database.device,
+        )
+        row = database.row_for_source(*self.allowed_source)
+        eligible[row] = True
+        return SimpleNamespace(
+            row_eligibility=eligible,
+            additional_row_cost=torch.full(
+                eligible.shape,
+                self.added_cost,
+                dtype=torch.float32,
+                device=database.device,
+            ),
+        )
+
+
 class _ConstantGrid:
     def __init__(self, height):
         self.height = float(height)
@@ -165,6 +191,42 @@ def _install_contact_policy(
 
 
 class TorchMotionMatcherTests(unittest.TestCase):
+    def test_foothold_policy_conditions_exact_search_rows_and_costs(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            policy = _FakeFootholdPolicy((0, 20), 7.0)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=MatcherConfig(
+                    search_interval_steps=1,
+                    exclusion_frames=0,
+                ),
+                foothold_action_policy=policy,
+            )
+            matcher.reset()
+
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher.select_exact_candidate",
+                wraps=select_exact_candidate,
+            ) as search:
+                matcher.step((0.4, 0.0), 0.0)
+
+        self.assertEqual(policy.calls, 1)
+        kwargs = search.call_args.kwargs
+        allowed = matcher.database.row_for_source(0, 20)
+        self.assertEqual(
+            torch.nonzero(
+                kwargs["transition_eligible_rows"], as_tuple=False
+            ).flatten().tolist(),
+            [allowed],
+        )
+        self.assertTrue(
+            bool((kwargs["additional_transition_costs"] >= 7.0).all().item())
+        )
+
     def test_terrain_candidate_yaw_follows_commanded_facing(self):
         arrays = build_varying_takara_arrays(frames=100)
         with tempfile.TemporaryDirectory() as tmp:
@@ -398,6 +460,47 @@ class TorchMotionMatcherTests(unittest.TestCase):
                 rtol=0.0,
                 atol=1e-7,
             )
+
+    def test_contact_commitment_can_play_past_feature_horizon(self):
+        arrays = build_varying_takara_arrays(frames=100)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_takara_arrays(root / "walk", arrays)
+            matcher = TorchMotionMatcher.from_folder(
+                root,
+                device="cpu",
+                config=MatcherConfig(search_interval_steps=1, exclusion_frames=0),
+            )
+            matcher.reset()
+            _install_contact_policy(matcher, start=50, end=80)
+            entry_row = matcher.database.row_for_source(0, 50)
+            successor = matcher.database.row_for_source(0, 1)
+            self.assertIsNotNone(entry_row)
+            with mock.patch(
+                "mm_sonic.torch_motion_matcher.select_exact_candidate",
+                return_value=SearchDecision(
+                    entry_row, successor, 100.0, 1.0, 1.0, True, True
+                ),
+            ):
+                first = matcher.step((0.4, 0.0), 0.0)
+
+            frames = [first.diagnostics.selected_frame]
+            with mock.patch.object(
+                matcher,
+                "_contact_commitment_should_interrupt",
+                return_value=False,
+            ):
+                for _ in range(29):
+                    value = matcher.step((0.4, 0.0), 0.0)
+                    frames.append(value.diagnostics.selected_frame)
+                    self.assertEqual(
+                        tuple(value.dense_joint_position_window.shape),
+                        (46, 29),
+                    )
+
+            self.assertEqual(frames, list(range(50, 80)))
+            self.assertIsNone(matcher._state.commitment)
+            self.assertIsNone(matcher.database.row_for_source(0, 79))
 
     def test_forced_reversal_can_replace_active_contact_commitment(self):
         arrays = build_varying_takara_arrays(frames=120)
