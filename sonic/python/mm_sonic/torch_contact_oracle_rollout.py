@@ -71,7 +71,7 @@ ORACLE_ARRAY_SHAPES = {
     "landing_error_m": (),
     "minimum_swing_clearance_m": (),
 }
-ORACLE_IMPLEMENTATION_ID = "g1-contact-oracle/full-orientation-continuity-v5"
+ORACLE_IMPLEMENTATION_ID = "g1-contact-oracle/exhaustive-failure-audit-v6"
 
 
 @dataclass(frozen=True)
@@ -364,6 +364,7 @@ def _finalize_rows(rows: Mapping[str, list]) -> Mapping[str, np.ndarray]:
 def _hash_run(
     route: OmniRoute,
     arrays: Mapping[str, np.ndarray],
+    plan_events: Sequence[OraclePlanEvent],
     failure: OracleRouteFailure | None,
     dataset_identity: str,
     config_identity: str,
@@ -386,6 +387,12 @@ def _hash_run(
             digest.update("\0".join(array.tolist()).encode("utf-8"))
         else:
             digest.update(array.tobytes())
+    digest.update(b"\0plan-events\0")
+    digest.update(
+        _canonical_json(
+            [_plan_event_json(event) for event in plan_events]
+        )
+    )
     if failure is not None:
         digest.update(repr(failure).encode("utf-8"))
     return digest.hexdigest()
@@ -495,6 +502,31 @@ def run_oracle_route(
                 raise ContractError(
                     f"planned first edge failed revalidation: {feasibility.reason}"
                 )
+            first_local_frame = 0 if not rows["qpos"] else 1
+            terminal_route_frame = (
+                state.route_frame + placed.action.frame_count - 1
+            )
+            command_window = schedule.velocity_world_xy[
+                next_frame : min(
+                    terminal_route_frame + 1, schedule.frame_count
+                )
+            ]
+            if bool(
+                (
+                    torch.linalg.vector_norm(command_window, dim=1)
+                    <= 1e-6
+                ).any().item()
+            ):
+                stage = "command-boundary-hold"
+                state = _append_hold(
+                    rows,
+                    state=state,
+                    schedule=schedule,
+                    segment_indices=segment_indices,
+                    route_frame=next_frame,
+                    terrain_sampler=terrain_sampler,
+                )
+                continue
             plan_state = state
             position_errors = []
             velocity_errors = []
@@ -516,20 +548,12 @@ def run_oracle_route(
                     )
                 )
                 plan_state = advance_state(plan_state, plan_placement)
-            first_local_frame = 0 if not rows["qpos"] else 1
             stage = "record"
-            last_local_frame = None
             for local_frame in range(
                 first_local_frame, placed.action.frame_count
             ):
                 route_frame = state.route_frame + local_frame
                 if route_frame >= schedule.frame_count:
-                    break
-                if float(
-                    torch.linalg.vector_norm(
-                        schedule.velocity(route_frame)
-                    ).item()
-                ) <= 1e-6:
                     break
                 feet = placed.foot_position_world[local_frame]
                 _append_frame(
@@ -554,9 +578,8 @@ def run_oracle_route(
                     plan_time_ns=elapsed_ns,
                     feasibility=feasibility,
                 )
-                last_local_frame = local_frame
             completed_landing = (
-                last_local_frame == placed.action.frame_count - 1
+                route_frame == state.route_frame + placed.action.frame_count - 1
             )
             events.append(
                 OraclePlanEvent(
@@ -599,35 +622,7 @@ def run_oracle_route(
             )
             if len(rows["qpos"]) >= schedule.frame_count:
                 break
-            if last_local_frame is None:
-                continue
-            if last_local_frame == placed.action.frame_count - 1:
-                state = advance_state(state, placed)
-            else:
-                state = OracleState(
-                    root_position_world=(
-                        placed.root_position_world[last_local_frame]
-                    ),
-                    root_yaw_world=placed.root_yaw_world[last_local_frame],
-                    root_orientation_world_wxyz=(
-                        placed.root_orientation_world_wxyz[last_local_frame]
-                    ),
-                    foot_position_world=(
-                        placed.foot_position_world[last_local_frame]
-                    ),
-                    support_mask=placed.action.support_mask[last_local_frame],
-                    joint_position=(
-                        placed.action.joint_position[last_local_frame]
-                    ),
-                    joint_velocity=(
-                        placed.action.joint_velocity[last_local_frame]
-                    ),
-                    route_frame=state.route_frame + last_local_frame,
-                    source_history=(
-                        *state.source_history,
-                        placed.action.source_key,
-                    ),
-                )
+            state = advance_state(state, placed)
     except Exception as error:
         failure = OracleRouteFailure(
             stage=stage,
@@ -666,7 +661,12 @@ def run_oracle_route(
         completed_without_exception=failure is None,
         failure=failure,
         deterministic_sha256=_hash_run(
-            route, arrays, failure, dataset_identity, config_identity
+            route,
+            arrays,
+            tuple(events),
+            failure,
+            dataset_identity,
+            config_identity,
         ),
     )
 
@@ -901,6 +901,33 @@ def _cost_json(cost: OracleCost) -> dict[str, float]:
     } | {"total": cost.total}
 
 
+def _plan_event_json(event: OraclePlanEvent) -> dict:
+    return {
+        "route_frame": event.route_frame,
+        "action_indices": list(event.action_indices),
+        "source_keys": [list(key) for key in event.source_keys],
+        "step_costs": [_cost_json(cost) for cost in event.step_costs],
+        "total_cost": _cost_json(event.total_cost),
+        "planned_landing_feet": list(event.planned_landing_feet),
+        "planned_landing_world_xyz": [
+            list(position) for position in event.planned_landing_world_xyz
+        ],
+        "emitted_landing_world_xyz": (
+            list(event.emitted_landing_world_xyz)
+            if event.emitted_landing_world_xyz is not None
+            else None
+        ),
+        "entry_joint_position_error_rad": list(
+            event.entry_joint_position_error_rad
+        ),
+        "entry_joint_velocity_error_rad_s": list(
+            event.entry_joint_velocity_error_rad_s
+        ),
+        "rejected_by_reason": dict(event.rejected_by_reason),
+        "beam_sizes": list(event.beam_sizes),
+    }
+
+
 def _outcome_json(outcome: RouteOutcomeEvaluation) -> dict:
     final_heading = float(outcome.final_heading_error_rad)
     return {
@@ -990,38 +1017,7 @@ def save_oracle_matrix(matrix: OracleMatrix, output: str | Path) -> None:
             route_dir = routes_dir / run.route.name
             route_dir.mkdir()
             np.savez_compressed(route_dir / "rollout.npz", **run.arrays)
-            events = [
-                {
-                    "route_frame": event.route_frame,
-                    "action_indices": list(event.action_indices),
-                    "source_keys": [list(key) for key in event.source_keys],
-                    "step_costs": [
-                        _cost_json(cost) for cost in event.step_costs
-                    ],
-                    "total_cost": _cost_json(event.total_cost),
-                    "planned_landing_feet": list(
-                        event.planned_landing_feet
-                    ),
-                    "planned_landing_world_xyz": [
-                        list(position)
-                        for position in event.planned_landing_world_xyz
-                    ],
-                    "emitted_landing_world_xyz": (
-                        list(event.emitted_landing_world_xyz)
-                        if event.emitted_landing_world_xyz is not None
-                        else None
-                    ),
-                    "entry_joint_position_error_rad": list(
-                        event.entry_joint_position_error_rad
-                    ),
-                    "entry_joint_velocity_error_rad_s": list(
-                        event.entry_joint_velocity_error_rad_s
-                    ),
-                    "rejected_by_reason": dict(event.rejected_by_reason),
-                    "beam_sizes": list(event.beam_sizes),
-                }
-                for event in run.plan_events
-            ]
+            events = [_plan_event_json(event) for event in run.plan_events]
             diagnostics = {
                 "schema": "g1-contact-space-oracle-route/v1",
                 "route": run.route.name,

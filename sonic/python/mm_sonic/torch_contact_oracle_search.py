@@ -1249,21 +1249,33 @@ def _feasible_actions(
         state, config.constraints, rejected
     )
     candidate_indices = entry_cache.shortlisted_indices(
-        candidates, state, schedule, foothold_plan, config, rejected
+        candidates, state, schedule, foothold_plan, config, None
     )
-    results = entry_cache.terrain_feasibility(
-        candidate_indices, state, sample_surface, config.constraints
-    )
-    for index, result in zip(
-        candidate_indices.detach().cpu().tolist(), results
-    ):
-        action = actions[index]
-        if result.accepted:
-            placed = place_action(action, state)
-            output.append((index, placed, result))
-        elif rejected is not None:
-            assert result.reason is not None
-            rejected[result.reason] += 1
+
+    def evaluate(indices: torch.Tensor) -> None:
+        results = entry_cache.terrain_feasibility(
+            indices, state, sample_surface, config.constraints
+        )
+        for index, result in zip(indices.detach().cpu().tolist(), results):
+            action = actions[index]
+            if result.accepted:
+                placed = place_action(action, state)
+                output.append((index, placed, result))
+            elif rejected is not None:
+                assert result.reason is not None
+                rejected[result.reason] += 1
+
+    evaluate(candidate_indices)
+    pruned_count = int(candidates.numel() - candidate_indices.numel())
+    if output or pruned_count == 0:
+        if rejected is not None and pruned_count:
+            rejected["shortlist-pruned"] += pruned_count
+        return output
+
+    remaining = candidates[
+        ~torch.isin(candidates, candidate_indices)
+    ]
+    evaluate(remaining)
     return output
 
 

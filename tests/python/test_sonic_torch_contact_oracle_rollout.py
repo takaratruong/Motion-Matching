@@ -1,5 +1,6 @@
 import math
 import json
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
@@ -84,8 +85,9 @@ def _state() -> OracleState:
 
 
 class _RecordingPlanner:
-    def __init__(self, action):
+    def __init__(self, action, *, beam_marker=1):
         self.action = action
+        self.beam_marker = beam_marker
         self.requested_route_frames = []
 
     def __call__(self, state, _schedule):
@@ -104,7 +106,9 @@ class _RecordingPlanner:
             step_costs=costs,
             total_cost=OracleCost(),
             horizon_landings=horizon,
-            expansion=OracleExpansionDiagnostics(1, {}, (1,) * horizon),
+            expansion=OracleExpansionDiagnostics(
+                1, {}, (self.beam_marker,) * horizon
+            ),
         )
 
 
@@ -277,7 +281,7 @@ class ContactOracleRolloutTests(unittest.TestCase):
         self.assertEqual(run.arrays["selected_action_index"].tolist(), [-1, -1, -1])
         self.assertTrue((run.arrays["root_position_world"] == 0.0).all())
 
-    def test_stop_command_interrupts_an_action_on_its_first_frame(self):
+    def test_stop_boundary_never_freezes_an_unstable_mid_action_pose(self):
         route = OmniRoute(
             name="move-then-stop",
             commands=(
@@ -287,7 +291,11 @@ class ContactOracleRolloutTests(unittest.TestCase):
             required_outcome="mixed",
             outcome=RouteOutcomeContract(),
         )
-        planner = _RecordingPlanner(_action())
+        action = _action()
+        support = action.support_mask.clone()
+        support[1:-1, 1] = False
+        action = replace(action, support_mask=support)
+        planner = _RecordingPlanner(action)
 
         def flat_surface(points):
             return torch.zeros(
@@ -307,13 +315,53 @@ class ContactOracleRolloutTests(unittest.TestCase):
 
         self.assertTrue(run.completed_without_exception)
         self.assertEqual(
-            run.arrays["selected_action_index"].tolist(), [0, 0, -1, -1, -1]
+            run.arrays["selected_action_index"].tolist(), [-1, -1, -1, -1, -1]
         )
         np.testing.assert_allclose(
             run.arrays["root_position_world"][2:],
             np.repeat(
-                run.arrays["root_position_world"][1][None, :], 3, axis=0
+                run.arrays["root_position_world"][0][None, :], 3, axis=0
             ),
+        )
+
+    def test_plan_diagnostics_participate_in_route_hash(self):
+        route = OmniRoute(
+            name="diagnostic-hash",
+            commands=(
+                RouteCommand((0.3, 0.0), 0.0, 2, "move", reset_before=True),
+            ),
+            required_outcome="mixed",
+            outcome=RouteOutcomeContract(),
+        )
+
+        def flat_surface(points):
+            return torch.zeros(
+                points.shape[:-1], dtype=points.dtype, device=points.device
+            )
+
+        kwargs = dict(
+            route=route,
+            stair_frame=StairFrame((0.0, 0.0), 0.0, 0.6, 0.3, 0.18, 3),
+            initial_state=_state(),
+            terrain_sampler=flat_surface,
+            clip_paths=("clip0",),
+            dataset_identity="dataset",
+            config_identity="config",
+        )
+        first = run_oracle_route(
+            planner=_RecordingPlanner(_action(), beam_marker=1), **kwargs
+        )
+        second = run_oracle_route(
+            planner=_RecordingPlanner(_action(), beam_marker=2), **kwargs
+        )
+
+        for name in first.arrays:
+            if name != "plan_time_ns":
+                np.testing.assert_array_equal(
+                    first.arrays[name], second.arrays[name]
+                )
+        self.assertNotEqual(
+            first.deterministic_sha256, second.deterministic_sha256
         )
 
     def test_search_failure_is_structured_and_never_replaced(self):

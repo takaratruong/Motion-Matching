@@ -482,6 +482,45 @@ class ContactOracleSearchTests(unittest.TestCase):
             dict(plan.expansion.rejected_by_reason)["shortlist-pruned"], 1
         )
 
+    def test_empty_shortlist_result_falls_back_to_all_entry_candidates(self):
+        unsafe = _graph_action(0, entry=0.0, terminal=0.0, dx=0.006)
+        unsafe_feet = unsafe.foot_position_local.clone()
+        unsafe_feet[-1, unsafe.swing_foot, 2] = 0.20
+        unsafe = replace(unsafe, foot_position_local=unsafe_feet)
+        safe = _graph_action(1, entry=0.0, terminal=0.0, dx=-0.20)
+
+        def flat_surface(points):
+            return torch.zeros(
+                points.shape[:-1], dtype=points.dtype, device=points.device
+            )
+
+        plan = search_contact_plan(
+            initial_state=_state(),
+            actions=(unsafe, safe),
+            command_schedule=constant_command_schedule(
+                velocity_world_xy=(0.3, 0.0),
+                heading_world_yaw=0.0,
+                frames=20,
+                device="cpu",
+            ),
+            sample_surface=flat_surface,
+            config=OracleSearchConfig(
+                horizon_landings=1,
+                transition_candidate_count=1,
+                constraints=OracleConstraints(
+                    maximum_entry_foot_error_m=10.0
+                ),
+            ),
+        )
+
+        self.assertEqual(plan.action_indices, (1,))
+        self.assertNotIn(
+            "shortlist-pruned", plan.expansion.rejected_by_reason
+        )
+        self.assertEqual(
+            plan.expansion.rejected_by_reason["landing-height"], 1
+        )
+
     def test_route_anchored_path_cost_recovers_accumulated_lag(self):
         slow = _graph_action(0, entry=0.0, terminal=0.0, dx=0.006)
         catch_up = _graph_action(1, entry=0.0, terminal=0.0, dx=0.066)
