@@ -71,7 +71,7 @@ ORACLE_ARRAY_SHAPES = {
     "landing_error_m": (),
     "minimum_swing_clearance_m": (),
 }
-ORACLE_IMPLEMENTATION_ID = "g1-contact-oracle/exhaustive-failure-audit-v6"
+ORACLE_IMPLEMENTATION_ID = "g1-contact-oracle/all-flight-clearance-v7"
 
 
 @dataclass(frozen=True)

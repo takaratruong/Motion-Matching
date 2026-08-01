@@ -339,7 +339,7 @@ def validate_placement(
     )
     swing_foot = action.swing_foot
     stance_support = action.support_mask.clone()
-    stance_support[:, swing_foot] = False
+    stance_support[-1, swing_foot] = False
     stance_error = float(
         torch.abs(sole_clearance[stance_support]).max().item()
         if bool(stance_support.any().item())
@@ -369,9 +369,7 @@ def validate_placement(
             "landing-edge-margin", stance=stance_error, landing=landing_error
         )
 
-    swing_samples = sole_clearance[:, swing_foot][
-        ~action.support_mask[:, swing_foot]
-    ]
+    swing_samples = sole_clearance[~action.support_mask]
     minimum_swing = float(
         swing_samples.min().item() if swing_samples.numel() else landing_error
     )
@@ -1128,12 +1126,12 @@ class _ActionEntryCache:
         rows = torch.arange(
             candidates.numel(), dtype=torch.int64, device=candidates.device
         )
+        terminal = self.frame_steps[candidates]
         stance = support & valid[..., None]
-        stance[rows, :, swing] = False
+        stance[rows, terminal, swing] = False
         stance_error = torch.where(
             stance, torch.abs(clearance), torch.zeros_like(clearance)
         ).amax(dim=(1, 2))
-        terminal = self.frame_steps[candidates]
         landing_clearance = clearance[rows, terminal, swing]
         landing_error = torch.abs(landing_clearance)
 
@@ -1155,22 +1153,14 @@ class _ActionEntryCache:
         )
         edge_range = edge.amax(dim=1) - edge.amin(dim=1)
 
-        swing_clearance = clearance.gather(
-            2,
-            swing[:, None, None].expand(-1, clearance.shape[1], 1),
-        ).squeeze(2)
-        swing_support = support.gather(
-            2,
-            swing[:, None, None].expand(-1, support.shape[1], 1),
-        ).squeeze(2)
-        swing_samples = valid & ~swing_support
+        swing_samples = valid[..., None] & ~support
         minimum_swing = torch.where(
             swing_samples,
-            swing_clearance,
-            torch.full_like(swing_clearance, torch.inf),
-        ).amin(dim=1)
+            clearance,
+            torch.full_like(clearance, torch.inf),
+        ).amin(dim=(1, 2))
         minimum_swing = torch.where(
-            swing_samples.any(dim=1), minimum_swing, landing_error
+            swing_samples.any(dim=(1, 2)), minimum_swing, landing_error
         )
         query_delta = (
             surface[rows, terminal, swing] - surface[rows, 0, swing]

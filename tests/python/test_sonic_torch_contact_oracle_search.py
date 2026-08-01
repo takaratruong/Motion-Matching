@@ -86,6 +86,7 @@ def _graph_action(index: int, entry: float, terminal: float, dx: float):
     root = action.root_position_local.clone()
     root[-1, 0] = dx
     feet = action.foot_position_local.clone()
+    feet[0, action.swing_foot, 2] = 0.035
     feet[-1, 1, 0] = dx
     return replace(
         action,
@@ -256,6 +257,32 @@ class ContactOracleSearchTests(unittest.TestCase):
             constraints=OracleConstraints(),
         )
 
+        self.assertEqual(result.reason, "swing-penetration")
+
+    def test_rejects_penetration_by_any_unsupported_foot(self):
+        action = _one_meter_forward_action()
+        support = action.support_mask.clone()
+        support[0, 0] = False
+        feet = action.foot_position_local.clone()
+        feet[0, 0, 2] = 0.0
+        action = replace(
+            action, support_mask=support, foot_position_local=feet
+        )
+
+        def flat_surface(points):
+            return torch.zeros(
+                points.shape[:-1], dtype=points.dtype, device=points.device
+            )
+
+        state = _state()
+        result = validate_placement(
+            placed=place_action(action, state),
+            state=state,
+            sample_surface=flat_surface,
+            constraints=OracleConstraints(),
+        )
+
+        self.assertFalse(result.accepted)
         self.assertEqual(result.reason, "swing-penetration")
 
     def test_rejects_source_to_query_landing_height_deformation(self):
