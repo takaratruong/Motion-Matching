@@ -394,7 +394,8 @@ def _hash_run(
         )
     )
     if failure is not None:
-        digest.update(repr(failure).encode("utf-8"))
+        digest.update(b"\0failure\0")
+        digest.update(_canonical_json(_failure_json(failure)))
     return digest.hexdigest()
 
 

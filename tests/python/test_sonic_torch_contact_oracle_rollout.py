@@ -401,6 +401,45 @@ class ContactOracleRolloutTests(unittest.TestCase):
             dict(run.failure.rejected_by_reason), {"joint-position": 17}
         )
 
+    def test_failure_hash_is_independent_of_rejection_mapping_order(self):
+        route = OmniRoute(
+            name="failure-hash",
+            commands=(
+                RouteCommand((0.3, 0.0), 0.0, 2, "move", reset_before=True),
+            ),
+            required_outcome="mixed",
+            outcome=RouteOutcomeContract(),
+        )
+
+        def flat_surface(points):
+            return torch.zeros(
+                points.shape[:-1], dtype=points.dtype, device=points.device
+            )
+
+        def run(rejected):
+            def failed_planner(_state, _schedule):
+                raise OracleSearchFailure(rejected)
+
+            return run_oracle_route(
+                route=route,
+                stair_frame=StairFrame(
+                    (0.0, 0.0), 0.0, 0.6, 0.3, 0.18, 3
+                ),
+                initial_state=_state(),
+                planner=failed_planner,
+                terrain_sampler=flat_surface,
+                clip_paths=("clip0",),
+                dataset_identity="dataset",
+                config_identity="config",
+            )
+
+        first = run({"entry-foot-error": 2, "joint-position": 1})
+        second = run({"joint-position": 1, "entry-foot-error": 2})
+
+        self.assertEqual(
+            first.deterministic_sha256, second.deterministic_sha256
+        )
+
     def test_matrix_isolates_route_failures_and_hashes_deterministically(self):
         routes = (
             OmniRoute(
