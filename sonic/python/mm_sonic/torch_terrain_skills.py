@@ -181,7 +181,12 @@ def build_terrain_skill_inventory(
 
     skills: list[TerrainSkill] = []
     row_to_skill: dict[int, int] = {}
-    rejected = {"flat": 0, "no_episode": 0, "no_entry_rows": 0}
+    rejected = {
+        "flat": 0,
+        "no_episode": 0,
+        "no_entry_rows": 0,
+        "overlapping_entry_rows": 0,
+    }
     for clip_index, clip in enumerate(dataset.folder.clips):
         if dataset.clip_grids[clip_index] is None:
             rejected["flat"] += 1
@@ -200,11 +205,13 @@ def build_terrain_skill_inventory(
             rejected["no_episode"] += 1
             continue
         for interval in intervals:
-            rows = tuple(
+            candidate_rows = tuple(
                 row
                 for frame in range(interval.entry_start, interval.playback_start)
                 if (row := database.row_for_source(clip_index, frame)) is not None
             )
+            rows = tuple(row for row in candidate_rows if row not in row_to_skill)
+            rejected["overlapping_entry_rows"] += len(candidate_rows) - len(rows)
             if not rows:
                 rejected["no_entry_rows"] += 1
                 continue
@@ -219,8 +226,6 @@ def build_terrain_skill_inventory(
             )
             skills.append(skill)
             for row in rows:
-                if row in row_to_skill:
-                    raise ContractError("terrain skill entry rows overlap")
                 row_to_skill[row] = skill_index
 
     return TerrainSkillInventory(
