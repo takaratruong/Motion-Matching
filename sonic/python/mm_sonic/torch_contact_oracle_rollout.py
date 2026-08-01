@@ -18,7 +18,10 @@ import numpy as np
 import torch
 
 from .joints import ContractError
-from .torch_contact_oracle_actions import ContactPhaseActionIndex
+from .torch_contact_oracle_actions import (
+    ContactPhaseActionIndex,
+    with_mirrored_actions,
+)
 from .torch_contact_oracle_search import (
     CommandSchedule,
     ContactOracleExperimentConfig,
@@ -65,7 +68,7 @@ ORACLE_ARRAY_SHAPES = {
     "landing_error_m": (),
     "minimum_swing_clearance_m": (),
 }
-ORACLE_IMPLEMENTATION_ID = "g1-contact-oracle/foothold-shortlist-v2"
+ORACLE_IMPLEMENTATION_ID = "g1-contact-oracle/mirrored-foothold-shortlist-v3"
 
 
 @dataclass(frozen=True)
@@ -95,7 +98,7 @@ class OracleRouteFailure:
 class OraclePlanEvent:
     route_frame: int
     action_indices: tuple[int, ...]
-    source_keys: tuple[tuple[int, int, int], ...]
+    source_keys: tuple[tuple[int, int, int, bool], ...]
     total_cost: float
     rejected_by_reason: Mapping[str, int]
     beam_sizes: tuple[int, ...]
@@ -674,8 +677,10 @@ def run_resolved_oracle_matrix(
     )
     contact_policy = build_contact_segment_policy(resolved, g1_xml)
     foot_kinematics = MujocoG1FootKinematics(g1_xml)
-    action_index = ContactPhaseActionIndex.from_dataset(
-        resolved.dataset, contact_policy.index, foot_kinematics
+    action_index = with_mirrored_actions(
+        ContactPhaseActionIndex.from_dataset(
+            resolved.dataset, contact_policy.index, foot_kinematics
+        )
     )
     initial_state = _resolved_initial_state(
         resolved, contact_policy.index, foot_kinematics

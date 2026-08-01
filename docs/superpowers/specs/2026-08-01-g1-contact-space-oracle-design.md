@@ -113,6 +113,13 @@ Candidate ordering uses a stable source-row tie break. This measured revision re
 all-compatible expansion after real-corpus traces showed multi-minute first
 plans dominated by repeated candidate placement rather than useful lookahead.
 
+The resolved action inventory is augmented with an exact sagittal reflection:
+left/right contacts and joints are swapped, axial roll/yaw coordinates change
+sign, and pitch coordinates retain sign. An independent MuJoCo FK check over
+64 random G1 poses measured exactly zero ankle-position error after reflection.
+This closes measured one-to-two-order-of-magnitude gaps in handed terrain bins
+without inventing new timing or joint trajectories.
+
 Hard feasibility is applied before scoring. The soft cost contains independently
 reported terms for:
 

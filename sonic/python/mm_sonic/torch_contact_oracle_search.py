@@ -45,7 +45,7 @@ class OracleState:
     joint_position: torch.Tensor
     joint_velocity: torch.Tensor
     route_frame: int
-    source_history: tuple[tuple[int, int, int], ...] = ()
+    source_history: tuple[tuple[int, int, int, bool], ...] = ()
 
     def __post_init__(self) -> None:
         fields = (
@@ -73,8 +73,12 @@ class OracleState:
             not isinstance(history, tuple)
             or any(
                 not isinstance(key, tuple)
-                or len(key) != 3
-                or any(type(value) is not int or value < 0 for value in key)
+                or len(key) != 4
+                or any(
+                    type(value) is not int or value < 0
+                    for value in key[:3]
+                )
+                or type(key[3]) is not bool
                 for key in history
             )
         ):
@@ -770,7 +774,7 @@ class _SearchNode:
     cached_rejected: Mapping[str, int] | None = None
 
     @property
-    def source_key_path(self) -> tuple[tuple[int, int, int], ...]:
+    def source_key_path(self) -> tuple[tuple[int, int, int, bool], ...]:
         return tuple(placement.action.source_key for placement in self.placements)
 
 

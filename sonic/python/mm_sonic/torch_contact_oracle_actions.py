@@ -15,6 +15,16 @@ from .joints import ContractError
 from .torch_contact_segments import ANKLE_ORIGIN_SOLE_M
 
 
+_G1_MIRROR_PERMUTATION = (
+    1, 0, 2, 4, 3, 5, 7, 6, 8, 10, 9, 12, 11, 14, 13,
+    16, 15, 18, 17, 20, 19, 22, 21, 24, 23, 26, 25, 28, 27,
+)
+_G1_MIRROR_SIGN = (
+    1, 1, -1, -1, -1, -1, -1, -1, 1, 1, 1, 1, 1, 1, 1,
+    -1, -1, -1, -1, -1, -1, 1, 1, -1, -1, 1, 1, -1, -1,
+)
+
+
 def _owned_tensor(
     value: torch.Tensor,
     shape: tuple[int, ...],
@@ -48,6 +58,7 @@ class ContactPhaseAction:
     foot_position_local: torch.Tensor
     foot_surface_delta_m: torch.Tensor
     minimum_swing_clearance_m: float
+    mirrored: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -58,6 +69,7 @@ class ContactPhaseAction:
             or type(self.end_frame) is not int
             or self.end_frame <= self.start_frame
             or self.swing_foot not in (0, 1)
+            or type(self.mirrored) is not bool
         ):
             raise ContractError("contact oracle action bounds are invalid")
         frames = self.end_frame - self.start_frame
@@ -98,8 +110,63 @@ class ContactPhaseAction:
         return self.end_frame - self.start_frame
 
     @property
-    def source_key(self) -> tuple[int, int, int]:
-        return self.clip_index, self.start_frame, self.end_frame
+    def source_key(self) -> tuple[int, int, int, bool]:
+        return (
+            self.clip_index,
+            self.start_frame,
+            self.end_frame,
+            self.mirrored,
+        )
+
+
+def mirror_g1_joint_state(value: torch.Tensor) -> torch.Tensor:
+    """Reflect target-ordered G1 joint positions or velocities in sagittal Y."""
+
+    if (
+        not isinstance(value, torch.Tensor)
+        or value.ndim < 1
+        or value.shape[-1] != 29
+        or not value.dtype.is_floating_point
+        or not torch.isfinite(value).all()
+    ):
+        raise ContractError("G1 mirror joint state is invalid")
+    permutation = torch.tensor(
+        _G1_MIRROR_PERMUTATION, dtype=torch.int64, device=value.device
+    )
+    sign = torch.tensor(
+        _G1_MIRROR_SIGN, dtype=value.dtype, device=value.device
+    )
+    return value[..., permutation] * sign
+
+
+def mirror_contact_phase_action(
+    action: ContactPhaseAction,
+) -> ContactPhaseAction:
+    """Return the exact left/right sagittal reflection of one contact phase."""
+
+    if not isinstance(action, ContactPhaseAction):
+        raise ContractError("contact oracle mirror action is invalid")
+    root = action.root_position_local.clone()
+    root[:, 1] *= -1.0
+    feet = action.foot_position_local[:, [1, 0]].clone()
+    feet[..., 1] *= -1.0
+    return ContactPhaseAction(
+        clip_index=action.clip_index,
+        start_frame=action.start_frame,
+        end_frame=action.end_frame,
+        swing_foot=1 - action.swing_foot,
+        entry_support=action.entry_support[[1, 0]],
+        exit_support=action.exit_support[[1, 0]],
+        support_mask=action.support_mask[:, [1, 0]],
+        joint_position=mirror_g1_joint_state(action.joint_position),
+        joint_velocity=mirror_g1_joint_state(action.joint_velocity),
+        root_position_local=root,
+        root_yaw_local=-action.root_yaw_local,
+        foot_position_local=feet,
+        foot_surface_delta_m=action.foot_surface_delta_m[:, [1, 0]],
+        minimum_swing_clearance_m=action.minimum_swing_clearance_m,
+        mirrored=not action.mirrored,
+    )
 
 
 def _yaw_from_wxyz(quaternion: torch.Tensor) -> torch.Tensor:
@@ -391,11 +458,17 @@ class ContactPhaseActionIndex:
 
         ordered = tuple(sorted(actions, key=lambda action: action.source_key))
         by_entry = {
-            (action.clip_index, action.start_frame): index
+            (action.clip_index, action.start_frame, action.mirrored): index
             for index, action in enumerate(ordered)
         }
         successors = tuple(
-            by_entry.get((action.clip_index, action.end_frame - 1))
+            by_entry.get(
+                (
+                    action.clip_index,
+                    action.end_frame - 1,
+                    action.mirrored,
+                )
+            )
             for action in ordered
         )
         return cls(
@@ -416,3 +489,39 @@ class ContactPhaseActionIndex:
         self.action(index)
         successor = self.exact_successor_indices[index]
         return None if successor is None else self.actions[successor]
+
+
+def with_mirrored_actions(
+    index: ContactPhaseActionIndex,
+) -> ContactPhaseActionIndex:
+    """Augment an immutable source index with deterministic sagittal mirrors."""
+
+    if not isinstance(index, ContactPhaseActionIndex):
+        raise ContractError("contact oracle mirror index is invalid")
+    actions = tuple(
+        sorted(
+            (
+                *index.actions,
+                *(mirror_contact_phase_action(action) for action in index.actions),
+            ),
+            key=lambda action: action.source_key,
+        )
+    )
+    by_entry = {
+        (action.clip_index, action.start_frame, action.mirrored): action_index
+        for action_index, action in enumerate(actions)
+    }
+    successors = tuple(
+        by_entry.get(
+            (action.clip_index, action.end_frame - 1, action.mirrored)
+        )
+        for action in actions
+    )
+    return ContactPhaseActionIndex(
+        actions=actions,
+        inventory=ContactPhaseInventory(
+            retained_count=len(actions),
+            rejected_by_reason=index.inventory.rejected_by_reason,
+        ),
+        exact_successor_indices=successors,
+    )

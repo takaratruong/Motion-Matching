@@ -7,6 +7,9 @@ import torch
 from mm_sonic.torch_contact_oracle_actions import (
     ContactPhaseActionIndex,
     action_from_profiles,
+    mirror_contact_phase_action,
+    mirror_g1_joint_state,
+    with_mirrored_actions,
 )
 from mm_sonic.torch_contact_segments import ContactSegment
 
@@ -88,6 +91,18 @@ def _index_fixture():
 
 
 class ContactOracleActionTests(unittest.TestCase):
+    def test_g1_mirror_is_an_involution_with_axial_joint_signs(self):
+        joints = torch.arange(29, dtype=torch.float32)
+        mirrored = mirror_g1_joint_state(joints)
+
+        self.assertEqual(float(mirrored[0]), float(joints[1]))
+        self.assertEqual(float(mirrored[3]), -float(joints[4]))
+        self.assertEqual(float(mirrored[2]), -float(joints[2]))
+        self.assertEqual(float(mirrored[8]), float(joints[8]))
+        torch.testing.assert_close(
+            mirror_g1_joint_state(mirrored), joints
+        )
+
     def test_extracts_one_landing_phase_with_inclusive_terminal_contact(self):
         frames = 6
         support = torch.tensor(
@@ -154,9 +169,35 @@ class ContactOracleActionTests(unittest.TestCase):
             dict(index.inventory.rejected_by_reason),
             {"no-next-opposite-landing": 1},
         )
-        self.assertEqual(index.action(0).source_key, (0, 2, 6))
-        self.assertEqual(index.exact_successor(0).source_key, (0, 5, 9))
+        self.assertEqual(index.action(0).source_key, (0, 2, 6, False))
+        self.assertEqual(
+            index.exact_successor(0).source_key, (0, 5, 9, False)
+        )
         self.assertIsNone(index.exact_successor(1))
+
+        augmented = with_mirrored_actions(index)
+        self.assertEqual(augmented.inventory.retained_count, 4)
+        self.assertEqual(
+            [action.mirrored for action in augmented.actions],
+            [False, True, False, True],
+        )
+        self.assertEqual(
+            augmented.exact_successor(0).source_key,
+            (0, 5, 9, False),
+        )
+        self.assertEqual(
+            augmented.exact_successor(1).source_key,
+            (0, 5, 9, True),
+        )
+        restored = mirror_contact_phase_action(augmented.action(1))
+        self.assertFalse(restored.mirrored)
+        torch.testing.assert_close(
+            restored.joint_position, augmented.action(0).joint_position
+        )
+        torch.testing.assert_close(
+            restored.foot_position_local,
+            augmented.action(0).foot_position_local,
+        )
 
     def test_dataset_index_reports_distinct_rejection_reasons(self):
         dataset, support, feet = _index_fixture()
