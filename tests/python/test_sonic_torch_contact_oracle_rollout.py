@@ -1,6 +1,10 @@
 import math
+import json
+from pathlib import Path
+import tempfile
 import unittest
 
+import numpy as np
 import torch
 
 from mm_sonic.torch_contact_oracle_actions import (
@@ -11,6 +15,7 @@ from mm_sonic.torch_contact_oracle_actions import (
 from mm_sonic.torch_contact_oracle_rollout import (
     run_oracle_matrix,
     run_oracle_route,
+    save_oracle_matrix,
 )
 from mm_sonic.torch_contact_oracle_search import (
     OracleCost,
@@ -261,6 +266,21 @@ class ContactOracleRolloutTests(unittest.TestCase):
         self.assertEqual(first.runs[1].failure.stage, "oracle-search")
         self.assertFalse(first.matrix_pass)
         self.assertEqual(first.deterministic_sha256, second.deterministic_sha256)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "matrix"
+            save_oracle_matrix(first, output)
+            summary = json.loads((output / "summary.json").read_text())
+            self.assertEqual(
+                summary["deterministic_sha256"], first.deterministic_sha256
+            )
+            route_dir = output / "routes" / "hold-success"
+            self.assertTrue((route_dir / "rollout.npz").is_file())
+            self.assertTrue((route_dir / "diagnostics.json").is_file())
+            with np.load(route_dir / "rollout.npz", allow_pickle=False) as saved:
+                self.assertEqual(saved["qpos"].shape, (2, 36))
+            with self.assertRaises(FileExistsError):
+                save_oracle_matrix(first, output)
 
 
 if __name__ == "__main__":

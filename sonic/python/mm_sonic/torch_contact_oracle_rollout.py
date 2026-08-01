@@ -6,7 +6,11 @@ from dataclasses import dataclass, replace
 import hashlib
 import json
 import math
+import os
+from pathlib import Path
+import shutil
 from types import MappingProxyType
+import tempfile
 import time
 from typing import Callable, Mapping, Sequence
 
@@ -704,3 +708,171 @@ def run_resolved_oracle_matrix(
         action_index=action_index,
         constraints=experiment.search.constraints,
     )
+
+
+def _canonical_json(value: object) -> bytes:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _failure_json(failure: OracleRouteFailure | None) -> dict | None:
+    if failure is None:
+        return None
+    return {
+        "stage": failure.stage,
+        "frame_index": failure.frame_index,
+        "exception_type": failure.exception_type,
+        "message": failure.message,
+        "rejected_by_reason": dict(failure.rejected_by_reason),
+    }
+
+
+def _outcome_json(outcome: RouteOutcomeEvaluation) -> dict:
+    final_heading = float(outcome.final_heading_error_rad)
+    return {
+        "completed": outcome.completed,
+        "segment_progress_ratio": [
+            {"segment": segment, "ratio": ratio}
+            for segment, ratio in outcome.segment_progress_ratio
+        ],
+        "elevated_foot_sample_count": outcome.elevated_foot_sample_count,
+        "final_heading_error_rad": (
+            final_heading if math.isfinite(final_heading) else None
+        ),
+        "failure_reasons": list(outcome.failure_reasons),
+    }
+
+
+def _metrics_json(metrics: OmniRouteMetrics | None) -> dict | None:
+    if metrics is None:
+        return None
+
+    def distribution(value) -> dict:
+        return {
+            "count": len(value.samples),
+            "minimum": value.minimum,
+            "maximum": value.maximum,
+            "mean": value.mean,
+            "p95": value.p95,
+        }
+
+    return {
+        "stance_frame_count_per_foot": np.sum(
+            metrics.stance_mask, axis=0
+        ).astype(int).tolist(),
+        "support_height_error_m": distribution(
+            metrics.support_height_error_m
+        ),
+        "support_height_difference_m": distribution(
+            metrics.support_height_difference_m
+        ),
+        "penetration_depth_m": distribution(metrics.penetration_depth_m),
+        "stance_slide_m": {
+            "per_foot": list(metrics.stance_slide_m.per_foot),
+            "total": metrics.stance_slide_m.total,
+        },
+        "heading_error_rad": distribution(metrics.heading_error_rad),
+        "root_progress_m": metrics.root_progress_m,
+        "root_jerk_m_s3": distribution(metrics.root_jerk_m_s3),
+        "root_velocity_error_mps": distribution(
+            metrics.root_velocity_error_mps
+        ),
+        "stalled_moving_frame_count": int(
+            np.sum(metrics.stalled_moving_mask)
+        ),
+        "stalled_moving_fraction": metrics.stalled_moving_fraction,
+        "longest_stall_frames": metrics.longest_stall_frames,
+        "transition_count": metrics.transition_count,
+        "rescue_cycle_count": len(metrics.rescue_cycles),
+        "rescue_cycles": [
+            {
+                "event_indices": list(cycle.event_indices),
+                "clip_pair": list(cycle.clip_pair),
+                "root_progress_m": cycle.root_progress_m,
+            }
+            for cycle in metrics.rescue_cycles
+        ],
+        "required_outcome_completed": metrics.required_outcome_completed,
+    }
+
+
+def save_oracle_matrix(matrix: OracleMatrix, output: str | Path) -> None:
+    """Atomically publish a pickle-free contact-oracle matrix."""
+
+    if not isinstance(matrix, OracleMatrix):
+        raise TypeError("matrix must be an OracleMatrix")
+    output = Path(os.path.abspath(os.fspath(output)))
+    if output.exists() or output.is_symlink():
+        raise FileExistsError(f"contact oracle output already exists: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(prefix=f".{output.name}.", dir=output.parent)
+    )
+    try:
+        routes_dir = staging / "routes"
+        routes_dir.mkdir()
+        route_summaries = []
+        for run in matrix.runs:
+            route_dir = routes_dir / run.route.name
+            route_dir.mkdir()
+            np.savez_compressed(route_dir / "rollout.npz", **run.arrays)
+            events = [
+                {
+                    "route_frame": event.route_frame,
+                    "action_indices": list(event.action_indices),
+                    "source_keys": [list(key) for key in event.source_keys],
+                    "total_cost": event.total_cost,
+                    "rejected_by_reason": dict(event.rejected_by_reason),
+                    "beam_sizes": list(event.beam_sizes),
+                }
+                for event in run.plan_events
+            ]
+            diagnostics = {
+                "schema": "g1-contact-space-oracle-route/v1",
+                "route": run.route.name,
+                "required_outcome": run.route.required_outcome,
+                "completed_frames": run.completed_frames,
+                "completed_without_exception": run.completed_without_exception,
+                "failure": _failure_json(run.failure),
+                "outcome": _outcome_json(run.outcome),
+                "metrics": _metrics_json(run.metrics),
+                "plan_events": events,
+                "deterministic_sha256": run.deterministic_sha256,
+            }
+            (route_dir / "diagnostics.json").write_bytes(
+                _canonical_json(diagnostics) + b"\n"
+            )
+            route_summaries.append(
+                {
+                    "name": run.route.name,
+                    "required_outcome": run.route.required_outcome,
+                    "completed_frames": run.completed_frames,
+                    "completed_without_exception": (
+                        run.completed_without_exception
+                    ),
+                    "outcome_completed": run.outcome.completed,
+                    "failure": _failure_json(run.failure),
+                    "deterministic_sha256": run.deterministic_sha256,
+                }
+            )
+        summary = {
+            "schema": "g1-contact-space-oracle-matrix/v1",
+            "dataset_identity": matrix.dataset_identity,
+            "config_identity": matrix.config_identity,
+            "action_count": matrix.action_count,
+            "action_rejections": dict(matrix.action_rejections),
+            "matrix_pass": matrix.matrix_pass,
+            "deterministic_sha256": matrix.deterministic_sha256,
+            "routes": route_summaries,
+        }
+        (staging / "summary.json").write_bytes(
+            _canonical_json(summary) + b"\n"
+        )
+        os.replace(staging, output)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
