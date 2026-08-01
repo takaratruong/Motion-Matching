@@ -37,6 +37,8 @@ FK before commitment.
 | Strict two-contact gate | Strong semantic constraint | Candidate dead ends and freezing under sparse command coverage |
 | Continuous-control arm | Reversal completed | Failed side/cross/exit cases and accumulated 0.74 m slide |
 | Persistent direction gate for every moving command | Cross slide improved from 0.68 to 0.60 m | Reverse slide regressed from 0.39 to 0.68 m and penetration increased |
+| Direction-relaxed final rescue | Let cross-right finish without an exception | Required progress collapsed to 0.03, slide rose to 0.86 m, penetration remained 0.043 m, and side-mount-right still exhausted candidates |
+| 0.08 m landing-height tolerance | Stayed below half a riser | Cross-right was metric-identical and side-mount-right exceeded four minutes of enlarged search without completing |
 | Hard lateral speed floor | Cross progress rose to 0.46 | Cross slide doubled to 1.25 m; exit jerk rose to 953 m/s^3 and still missed flat ground |
 | Soft lateral speed cost | Preserved candidate coverage | Produced byte-identical selections and metrics at a safe weight |
 | Extra inertialization / output smoothing | Reduced some local discontinuities | Regressed command response and aggregate route quality |
@@ -101,6 +103,13 @@ Failures:
 The directional asymmetry and two candidate-exhaustion failures mean this is a
 feedback-ready research checkpoint, not a completed omnidirectional terrain
 matcher.
+
+The recorded query stair is also not centered on matcher y=0: its sampled
+cross-section is approximately -0.24 to +0.62 m. The route generator mirrors
+commands around y=0, so the current left/right routes are not geometric mirrors
+of the actual obstacle. This does not invalidate the reported failures, but it
+does mean the next evaluator revision should center routes on the measured stair
+midline before using left/right deltas as an algorithm metric.
 
 ## Corpus coverage finding
 
