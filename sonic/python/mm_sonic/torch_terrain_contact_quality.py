@@ -6,6 +6,19 @@ from dataclasses import dataclass
 import math
 
 import numpy as np
+import torch
+
+from .torch_contact_oracle_actions import ContactPhaseAction
+from .torch_terrain_contact_composition import (
+    build_contact_target_trajectory,
+    place_action_contact_anchored,
+    project_contact_trajectory,
+)
+from .torch_terrain_quality_preview import (
+    build_quality_preview_from_placement,
+    quality_state_as_oracle,
+)
+from .torch_terrain_quality_states import FrozenQualityState
 
 
 ANKLE_ORIGIN_SOLE_M = 0.035
@@ -241,4 +254,160 @@ def evaluate_contact_quality(
         steady_source_stance_drift_m=steady_drift,
         command_to_unload_frames=_next_event_delays(moving, unload),
         command_to_touchdown_frames=_next_event_delays(moving, touchdown),
+    )
+
+
+@dataclass(frozen=True)
+class ContactQualityAblationResult:
+    unprojected_qpos: np.ndarray
+    projected_qpos: np.ndarray
+    unprojected_foot_position_world: np.ndarray
+    projected_foot_position_world: np.ndarray
+    source_support_mask: np.ndarray
+    placement_entry_error_m: float
+    placed_stance_drift_m: float
+    unprojected_stance_drift_m: float
+    projected_stance_drift_m: float
+    projected_landing_error_m: float
+    maximum_target_error_m: float
+    maximum_joint_deformation_rad: float
+    rms_joint_deformation_rad: float
+
+    def __post_init__(self) -> None:
+        qpos = np.asarray(self.unprojected_qpos)
+        if qpos.ndim != 2 or qpos.shape[1] != 36 or qpos.shape[0] < 2:
+            raise ValueError("contact quality ablation qpos is invalid")
+        frames = qpos.shape[0]
+        arrays = (
+            ("unprojected_qpos", (frames, 36), np.float64),
+            ("projected_qpos", (frames, 36), np.float64),
+            ("unprojected_foot_position_world", (frames, 2, 3), np.float64),
+            ("projected_foot_position_world", (frames, 2, 3), np.float64),
+            ("source_support_mask", (frames, 2), np.bool_),
+        )
+        for name, shape, dtype in arrays:
+            value = np.asarray(getattr(self, name))
+            if value.shape != shape or (
+                dtype != np.bool_ and not np.isfinite(value).all()
+            ):
+                raise ValueError("contact quality ablation arrays are invalid")
+            object.__setattr__(self, name, _readonly(value, dtype=dtype))
+        for name in (
+            "placement_entry_error_m",
+            "placed_stance_drift_m",
+            "unprojected_stance_drift_m",
+            "projected_stance_drift_m",
+            "projected_landing_error_m",
+            "maximum_target_error_m",
+            "maximum_joint_deformation_rad",
+            "rms_joint_deformation_rad",
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) < 0.0
+            ):
+                raise ValueError("contact quality ablation metrics are invalid")
+            object.__setattr__(self, name, float(value))
+
+
+def _source_stance_drift(feet: np.ndarray, support: np.ndarray) -> float:
+    displacement = np.linalg.norm(np.diff(feet[:, :, :2], axis=0), axis=2)
+    return float(np.where(support[:-1] & support[1:], displacement, 0.0).sum())
+
+
+def build_contact_quality_ablation(
+    *,
+    state: FrozenQualityState,
+    action: ContactPhaseAction,
+    desired_landing_foot: int,
+    desired_landing_world_xyz: object,
+    foot_kinematics: object,
+    inertialization_halflife_s: float = 0.10,
+) -> ContactQualityAblationResult:
+    """Measure contact anchoring and projected composition on one action."""
+
+    if not isinstance(state, FrozenQualityState) or not isinstance(
+        action, ContactPhaseAction
+    ):
+        raise ValueError("contact quality ablation inputs are invalid")
+    if (
+        type(desired_landing_foot) is not int
+        or desired_landing_foot not in (0, 1)
+        or action.swing_foot != desired_landing_foot
+    ):
+        raise ValueError("contact quality ablation landing foot does not match action")
+    desired = np.asarray(desired_landing_world_xyz, dtype=np.float64)
+    if desired.shape != (3,) or not np.isfinite(desired).all():
+        raise ValueError("contact quality ablation desired landing is invalid")
+
+    current = quality_state_as_oracle(state, action.joint_position)
+    anchored = place_action_contact_anchored(action, current)
+    preview = build_quality_preview_from_placement(
+        state=state,
+        action=action,
+        placement=anchored.placed,
+        foot_kinematics=foot_kinematics,
+        inertialization_halflife_s=inertialization_halflife_s,
+    )
+    dtype = action.joint_position.dtype
+    device = action.joint_position.device
+    raw_qpos = np.asarray(preview.composed.qpos, dtype=np.float64)
+    raw_feet = torch.as_tensor(
+        np.array(preview.composed.foot_position_world, copy=True),
+        dtype=dtype,
+        device=device,
+    )
+    support = action.support_mask
+    targets = build_contact_target_trajectory(
+        raw_feet,
+        support,
+        swing_foot=action.swing_foot,
+        entry_foot_position_world=torch.as_tensor(
+            np.array(state.foot_position_world, copy=True),
+            dtype=dtype,
+            device=device,
+        ),
+        landing_target_world=torch.as_tensor(desired, dtype=dtype, device=device),
+    )
+    roots = torch.as_tensor(
+        np.array(raw_qpos[:, :3], copy=True), dtype=dtype, device=device
+    )
+    quaternions = torch.as_tensor(
+        np.array(raw_qpos[:, 3:7], copy=True), dtype=dtype, device=device
+    )
+    projection = project_contact_trajectory(
+        joint_position=torch.as_tensor(
+            np.array(raw_qpos[:, 7:], copy=True), dtype=dtype, device=device
+        ),
+        root_position_world=roots,
+        root_orientation_world_wxyz=quaternions,
+        targets=targets,
+        foot_kinematics=foot_kinematics,
+    )
+    projected_qpos = torch.cat(
+        (roots, quaternions, projection.joint_position), dim=1
+    ).detach().cpu().numpy()
+    projected_feet = projection.foot_position_world.detach().cpu().numpy()
+    support_numpy = support.detach().cpu().numpy().astype(bool, copy=True)
+    return ContactQualityAblationResult(
+        unprojected_qpos=raw_qpos,
+        projected_qpos=projected_qpos,
+        unprojected_foot_position_world=raw_feet.detach().cpu().numpy(),
+        projected_foot_position_world=projected_feet,
+        source_support_mask=support_numpy,
+        placement_entry_error_m=anchored.maximum_entry_support_error_m,
+        placed_stance_drift_m=preview.placed.source_stance_drift_m,
+        unprojected_stance_drift_m=preview.composed.source_stance_drift_m,
+        projected_stance_drift_m=_source_stance_drift(
+            projected_feet, support_numpy
+        ),
+        projected_landing_error_m=float(
+            np.linalg.norm(projected_feet[-1, action.swing_foot] - desired)
+        ),
+        maximum_target_error_m=projection.maximum_target_error_m,
+        maximum_joint_deformation_rad=projection.maximum_joint_deformation_rad,
+        rms_joint_deformation_rad=projection.rms_joint_deformation_rad,
     )

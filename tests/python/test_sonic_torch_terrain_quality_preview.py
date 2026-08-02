@@ -4,7 +4,12 @@ import numpy as np
 import torch
 
 from mm_sonic.torch_contact_oracle_actions import ContactPhaseAction
-from mm_sonic.torch_terrain_quality_preview import build_quality_preview
+from mm_sonic.torch_terrain_contact_composition import place_action_contact_anchored
+from mm_sonic.torch_terrain_quality_preview import (
+    build_quality_preview,
+    build_quality_preview_from_placement,
+    quality_state_as_oracle,
+)
 from mm_sonic.torch_terrain_quality_states import capture_quality_states
 
 
@@ -124,6 +129,23 @@ class TerrainQualityPreviewTests(unittest.TestCase):
                 foot_kinematics=object(),
                 inertialization_halflife_s=0.0,
             )
+
+    def test_explicit_contact_placement_recomputes_transition_offsets(self):
+        state = _state()
+        action = _action()
+        current = quality_state_as_oracle(state, action.joint_position)
+        contact_placement = place_action_contact_anchored(action, current).placed
+
+        preview = build_quality_preview_from_placement(
+            state=state,
+            action=action,
+            placement=contact_placement,
+            foot_kinematics=_SyntheticFeet(),
+            inertialization_halflife_s=0.10,
+        )
+
+        self.assertGreater(preview.placed.root_boundary_jump_m, 0.19)
+        self.assertAlmostEqual(preview.composed.root_boundary_jump_m, 0.0, places=6)
 
 
 if __name__ == "__main__":

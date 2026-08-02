@@ -126,7 +126,7 @@ def _quat_from_scaled_axis(value: torch.Tensor) -> torch.Tensor:
     return _quat_normalize(torch.where(angle < 1e-8, identity, quaternion))
 
 
-def _state_as_oracle(
+def quality_state_as_oracle(
     state: FrozenQualityState, reference: torch.Tensor
 ) -> OracleState:
     dtype, device = reference.dtype, reference.device
@@ -219,14 +219,15 @@ def _stage(
     )
 
 
-def build_quality_preview(
+def build_quality_preview_from_placement(
     *,
     state: FrozenQualityState,
     action: ContactPhaseAction,
+    placement: Any,
     foot_kinematics: Any,
     inertialization_halflife_s: float = 0.10,
 ) -> QualityPreview:
-    """Build native, rigidly placed, and inertialized 50 Hz action stages."""
+    """Build preview stages from one explicit rigid action placement."""
 
     if not isinstance(state, FrozenQualityState) or not isinstance(
         action, ContactPhaseAction
@@ -240,8 +241,18 @@ def build_quality_preview(
     ):
         raise ValueError("terrain quality preview halflife must be positive")
 
-    current = _state_as_oracle(state, action.joint_position)
-    placed = place_action(action, current)
+    current = quality_state_as_oracle(state, action.joint_position)
+    placed = placement
+    if (
+        not hasattr(placed, "action")
+        or placed.action is not action
+        or not isinstance(placed.root_position_world, torch.Tensor)
+        or tuple(placed.root_position_world.shape) != (action.frame_count, 3)
+        or not isinstance(placed.root_orientation_world_wxyz, torch.Tensor)
+        or tuple(placed.root_orientation_world_wxyz.shape)
+        != (action.frame_count, 4)
+    ):
+        raise ValueError("terrain quality preview placement is invalid")
     support = action.support_mask.detach().cpu().numpy().astype(bool, copy=True)
     native = _stage(
         state=state,
@@ -339,3 +350,26 @@ def build_quality_preview(
         foot_kinematics=foot_kinematics,
     )
     return QualityPreview(native=native, placed=rigid, composed=composed)
+
+
+def build_quality_preview(
+    *,
+    state: FrozenQualityState,
+    action: ContactPhaseAction,
+    foot_kinematics: Any,
+    inertialization_halflife_s: float = 0.10,
+) -> QualityPreview:
+    """Build native, root-placed, and inertialized 50 Hz action stages."""
+
+    if not isinstance(state, FrozenQualityState) or not isinstance(
+        action, ContactPhaseAction
+    ):
+        raise ValueError("terrain quality preview inputs are invalid")
+    current = quality_state_as_oracle(state, action.joint_position)
+    return build_quality_preview_from_placement(
+        state=state,
+        action=action,
+        placement=place_action(action, current),
+        foot_kinematics=foot_kinematics,
+        inertialization_halflife_s=inertialization_halflife_s,
+    )
