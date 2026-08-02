@@ -35,6 +35,7 @@ class MultiHorizonSkillsCliTest(unittest.TestCase):
         self.assertFalse(args.contact_phase_gate)
         self.assertIsNone(args.swing_clearance_margin_m)
         self.assertIsNone(args.swing_plan_sigma_frames)
+        self.assertFalse(args.support_root_height)
         self.assertEqual(args.foot_correction_halflife_s, 0.04)
         locked = build_parser().parse_args(
             [
@@ -43,6 +44,7 @@ class MultiHorizonSkillsCliTest(unittest.TestCase):
                 "--device", "cuda:3", "--foot-lock", "--contact-phase-gate",
                 "--swing-clearance-margin-m", "0.01",
                 "--swing-plan-sigma-frames", "4.0",
+                "--support-root-height",
                 "--foot-correction-halflife-s", "0.02",
             ]
         )
@@ -50,6 +52,7 @@ class MultiHorizonSkillsCliTest(unittest.TestCase):
         self.assertTrue(locked.contact_phase_gate)
         self.assertEqual(locked.swing_clearance_margin_m, 0.01)
         self.assertEqual(locked.swing_plan_sigma_frames, 4.0)
+        self.assertTrue(locked.support_root_height)
         self.assertEqual(locked.foot_correction_halflife_s, 0.02)
 
     def test_route_selection_preserves_frozen_order_and_rejects_bad_names(self):

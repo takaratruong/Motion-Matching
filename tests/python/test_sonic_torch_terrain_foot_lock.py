@@ -152,6 +152,24 @@ class TerrainFootLockTests(unittest.TestCase):
         self.assertGreater(continued_feet[1, 2], 0.035)
         self.assertEqual(foot_lock.failure_count, 0)
 
+    def test_optional_support_root_height_moves_body_toward_contact_surface(self):
+        foot_lock = TerrainFootLockFilter(
+            clip_paths=("clip.npz",),
+            support_masks=(torch.ones((1, 2), dtype=torch.bool),),
+            foot_kinematics=_LinearFeet(),
+            sample_surface=lambda xy: torch.full((xy.shape[0],), 0.1),
+            device=torch.device("cpu"),
+            support_root_height=True,
+        )
+        native = _result(0, 0.0)
+
+        corrected = foot_lock.apply(native)
+
+        self.assertGreater(
+            float(corrected.root_position_world[2]),
+            float(native.root_position_world[2]),
+        )
+
     def test_large_lock_deviation_unlocks_instead_of_contorting_pose(self):
         foot_lock = TerrainFootLockFilter(
             clip_paths=("clip.npz",),

@@ -68,6 +68,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Spread future source-path clearance backward by this sigma.",
     )
     parser.add_argument(
+        "--support-root-height",
+        action="store_true",
+        help="Reconstruct root height from active terrain support contacts.",
+    )
+    parser.add_argument(
         "--ablation",
         choices=(
             "combined",
@@ -209,6 +214,7 @@ def main(argv: list[str] | None = None) -> int:
         swing_clearance_margin_m=args.swing_clearance_margin_m,
         foot_correction_halflife_s=args.foot_correction_halflife_s,
         swing_plan_sigma_frames=args.swing_plan_sigma_frames,
+        support_root_height=args.support_root_height,
     )
     save_horizon_matrix(matrix, events, args.output)
     execution_completed = all(
@@ -227,6 +233,7 @@ def main(argv: list[str] | None = None) -> int:
                 "swing_clearance_margin_m": args.swing_clearance_margin_m,
                 "foot_correction_halflife_s": args.foot_correction_halflife_s,
                 "swing_plan_sigma_frames": args.swing_plan_sigma_frames,
+                "support_root_height": args.support_root_height,
                 "deterministic_sha256": matrix.deterministic_sha256,
                 "output": args.output,
             },
