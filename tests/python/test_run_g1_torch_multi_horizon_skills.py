@@ -38,6 +38,8 @@ class MultiHorizonSkillsCliTest(unittest.TestCase):
         self.assertIsNone(args.maximum_source_contact_p95_m)
         self.assertIsNone(args.normalization_source)
         self.assertIsNone(args.turning_source_corpus)
+        self.assertEqual(args.maximum_translation_warp_m, 0.0)
+        self.assertEqual(args.maximum_yaw_warp_rad, 0.0)
         self.assertEqual(args.foot_correction_halflife_s, 0.04)
         locked = build_parser().parse_args(
             [
@@ -50,6 +52,8 @@ class MultiHorizonSkillsCliTest(unittest.TestCase):
                 "--maximum-source-contact-p95-m", "0.02",
                 "--normalization-source", "baseline",
                 "--turning-source-corpus", "baseline",
+                "--maximum-translation-warp-m", "0.15",
+                "--maximum-yaw-warp-rad", "0.30",
             ]
         )
         self.assertTrue(locked.foot_lock)
@@ -60,6 +64,8 @@ class MultiHorizonSkillsCliTest(unittest.TestCase):
         self.assertEqual(locked.maximum_source_contact_p95_m, 0.02)
         self.assertEqual(locked.normalization_source, "baseline")
         self.assertEqual(locked.turning_source_corpus, "baseline")
+        self.assertEqual(locked.maximum_translation_warp_m, 0.15)
+        self.assertEqual(locked.maximum_yaw_warp_rad, 0.30)
 
     def test_route_selection_preserves_frozen_order_and_rejects_bad_names(self):
         routes = select_routes(

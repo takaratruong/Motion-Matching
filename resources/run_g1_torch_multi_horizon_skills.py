@@ -84,6 +84,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Restrict turning chunks to clips present in this corpus.",
     )
     parser.add_argument(
+        "--maximum-translation-warp-m",
+        type=float,
+        default=0.0,
+        help="Bound smooth per-skill root endpoint translation correction.",
+    )
+    parser.add_argument(
+        "--maximum-yaw-warp-rad",
+        type=float,
+        default=0.0,
+        help="Bound smooth per-skill root endpoint yaw correction.",
+    )
+    parser.add_argument(
         "--ablation",
         choices=(
             "combined",
@@ -228,6 +240,8 @@ def main(argv: list[str] | None = None) -> int:
         maximum_source_contact_p95_m=args.maximum_source_contact_p95_m,
         normalization_source=args.normalization_source,
         turning_source_corpus=args.turning_source_corpus,
+        maximum_translation_warp_m=args.maximum_translation_warp_m,
+        maximum_yaw_warp_rad=args.maximum_yaw_warp_rad,
     )
     save_horizon_matrix(matrix, events, args.output)
     execution_completed = all(
@@ -251,6 +265,8 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 "normalization_source": args.normalization_source,
                 "turning_source_corpus": args.turning_source_corpus,
+                "maximum_translation_warp_m": args.maximum_translation_warp_m,
+                "maximum_yaw_warp_rad": args.maximum_yaw_warp_rad,
                 "deterministic_sha256": matrix.deterministic_sha256,
                 "output": args.output,
             },

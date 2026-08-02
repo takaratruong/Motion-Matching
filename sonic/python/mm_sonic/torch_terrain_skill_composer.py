@@ -60,6 +60,8 @@ class TerrainSkillState:
     translation_world: torch.Tensor
     offsets: _Offsets
     halflife_s: float
+    endpoint_translation_warp_world_xy: torch.Tensor
+    endpoint_yaw_warp_rad: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -178,6 +180,10 @@ def start_skill(
     current: TerrainSkillPose,
     halflife_s: float = 0.10,
     playback_stop: int | None = None,
+    target_displacement_local_xy: torch.Tensor | None = None,
+    target_yaw_delta_rad: torch.Tensor | None = None,
+    maximum_translation_warp_m: float = 0.0,
+    maximum_yaw_warp_rad: float = 0.0,
 ) -> TerrainSkillState:
     """Place a skill at the current root and initialize exact pose offsets."""
 
@@ -204,6 +210,28 @@ def start_skill(
         raise ContractError("terrain skill playback endpoint must be stable double support")
     if not math.isfinite(float(halflife_s)) or halflife_s <= 0:
         raise ContractError("terrain skill inertialization halflife must be positive")
+    if (
+        (target_displacement_local_xy is None)
+        != (target_yaw_delta_rad is None)
+        or not math.isfinite(float(maximum_translation_warp_m))
+        or float(maximum_translation_warp_m) < 0.0
+        or not math.isfinite(float(maximum_yaw_warp_rad))
+        or float(maximum_yaw_warp_rad) < 0.0
+    ):
+        raise ContractError("terrain skill endpoint warp is invalid")
+    if target_displacement_local_xy is not None and (
+        not isinstance(target_displacement_local_xy, torch.Tensor)
+        or tuple(target_displacement_local_xy.shape) != (2,)
+        or target_displacement_local_xy.dtype != current.joint_position.dtype
+        or target_displacement_local_xy.device != current.joint_position.device
+        or not torch.isfinite(target_displacement_local_xy).all()
+        or not isinstance(target_yaw_delta_rad, torch.Tensor)
+        or target_yaw_delta_rad.numel() != 1
+        or target_yaw_delta_rad.dtype != current.joint_position.dtype
+        or target_yaw_delta_rad.device != current.joint_position.device
+        or not torch.isfinite(target_yaw_delta_rad).all()
+    ):
+        raise ContractError("terrain skill endpoint target is invalid")
 
     jp, jv, root, quat, root_v, root_w = _source_pose(
         folder, skill, selected_entry_frame, current.joint_position
@@ -220,6 +248,85 @@ def start_skill(
     rotation_offset = _quat_mul(
         current.root_orientation_world_wxyz, _quat_inverse(placed_quat)
     )
+    offsets = _Offsets(
+        joint_position=current.joint_position - jp,
+        joint_velocity=current.joint_velocity - jv,
+        root_position=current.root_position_world - (placed_root + translation),
+        root_velocity=current.root_linear_velocity_world - placed_root_v,
+        root_rotation_axis=_quat_to_scaled_axis(rotation_offset),
+        root_angular_velocity=current.root_angular_velocity_world - placed_root_w,
+    )
+    translation_warp = torch.zeros(
+        2, dtype=current.joint_position.dtype, device=current.joint_position.device
+    )
+    yaw_warp = torch.zeros(
+        (), dtype=current.joint_position.dtype, device=current.joint_position.device
+    )
+    if target_displacement_local_xy is not None:
+        _, _, endpoint_root, endpoint_quat, _, _ = _source_pose(
+            folder, skill, resolved_stop - 1, current.joint_position
+        )
+        endpoint_time_s = torch.as_tensor(
+            (resolved_stop - 1 - selected_entry_frame) / 50.0,
+            dtype=current.joint_position.dtype,
+            device=current.joint_position.device,
+        )
+        endpoint_root_offset, _ = decay_spring_offsets(
+            offsets.root_position,
+            offsets.root_velocity,
+            halflife_s=float(halflife_s),
+            time_s=endpoint_time_s,
+        )
+        endpoint_rotation_offset, _ = decay_spring_offsets(
+            offsets.root_rotation_axis,
+            offsets.root_angular_velocity,
+            halflife_s=float(halflife_s),
+            time_s=endpoint_time_s,
+        )
+        current_yaw = _quat_yaw(current.root_orientation_world_wxyz)
+        target_world = _rotate_z(
+            torch.cat(
+                (
+                    target_displacement_local_xy,
+                    torch.zeros(
+                        1,
+                        dtype=current.joint_position.dtype,
+                        device=current.joint_position.device,
+                    ),
+                )
+            ),
+            current_yaw,
+        )[:2]
+        source_world = (
+            _rotate_z(endpoint_root - root, yaw_offset) + endpoint_root_offset
+        )[:2]
+        translation_warp = target_world - source_world
+        length = torch.linalg.vector_norm(translation_warp)
+        limit = torch.as_tensor(
+            maximum_translation_warp_m,
+            dtype=translation_warp.dtype,
+            device=translation_warp.device,
+        )
+        translation_warp = translation_warp * torch.clamp(
+            limit / length.clamp_min(1e-8), max=1.0
+        )
+        placed_endpoint_quat = _quat_normalize(
+            _quat_mul(yaw_quat, endpoint_quat)
+        )
+        baseline_endpoint_quat = _quat_normalize(
+            _quat_mul(
+                _quat_from_scaled_axis(endpoint_rotation_offset),
+                placed_endpoint_quat,
+            )
+        )
+        source_yaw_delta = (
+            _quat_yaw(baseline_endpoint_quat)
+            - _quat_yaw(current.root_orientation_world_wxyz)
+        )
+        yaw_warp = torch.atan2(
+            torch.sin(target_yaw_delta_rad.reshape(()) - source_yaw_delta),
+            torch.cos(target_yaw_delta_rad.reshape(()) - source_yaw_delta),
+        ).clamp(-maximum_yaw_warp_rad, maximum_yaw_warp_rad)
     return TerrainSkillState(
         folder=folder,
         skill=skill,
@@ -228,15 +335,10 @@ def start_skill(
         playback_stop=resolved_stop,
         yaw_offset=yaw_offset,
         translation_world=translation,
-        offsets=_Offsets(
-            joint_position=current.joint_position - jp,
-            joint_velocity=current.joint_velocity - jv,
-            root_position=current.root_position_world - (placed_root + translation),
-            root_velocity=current.root_linear_velocity_world - placed_root_v,
-            root_rotation_axis=_quat_to_scaled_axis(rotation_offset),
-            root_angular_velocity=current.root_angular_velocity_world - placed_root_w,
-        ),
+        offsets=offsets,
         halflife_s=float(halflife_s),
+        endpoint_translation_warp_world_xy=translation_warp,
+        endpoint_yaw_warp_rad=yaw_warp,
     )
 
 
@@ -288,12 +390,34 @@ def advance_skill(state: TerrainSkillState) -> TerrainSkillStep:
         halflife_s=state.halflife_s,
         time_s=time_s,
     )
+    duration_frames = state.playback_stop - 1 - state.selected_entry_frame
+    progress = torch.as_tensor(
+        (frame_index - state.selected_entry_frame) / duration_frames,
+        dtype=reference.dtype,
+        device=reference.device,
+    )
+    smooth_progress = progress * progress * (3.0 - 2.0 * progress)
+    duration_s = duration_frames / 50.0
+    smooth_rate = 6.0 * progress * (1.0 - progress) / duration_s
+    warp_xy = smooth_progress * state.endpoint_translation_warp_world_xy
+    warp_yaw = smooth_progress * state.endpoint_yaw_warp_rad
     out_jp = jp + jpo
     out_jv = jv + jvo
     out_root = placed_root + rpo
-    out_quat = _quat_normalize(_quat_mul(_quat_from_scaled_axis(rao), placed_quat))
+    out_root = out_root.clone()
+    out_root[:2] += warp_xy
+    out_quat = _quat_normalize(
+        _quat_mul(
+            _quat_from_yaw(warp_yaw),
+            _quat_mul(_quat_from_scaled_axis(rao), placed_quat),
+        )
+    )
     out_root_v = placed_root_v + rvo
+    out_root_v = out_root_v.clone()
+    out_root_v[:2] += smooth_rate * state.endpoint_translation_warp_world_xy
     out_root_w = placed_root_w + rwo
+    out_root_w = out_root_w.clone()
+    out_root_w[2] += smooth_rate * state.endpoint_yaw_warp_rad
     residual = float(
         torch.sqrt(
             torch.sum(jpo.square())
@@ -325,6 +449,10 @@ def advance_skill(state: TerrainSkillState) -> TerrainSkillStep:
         translation_world=state.translation_world,
         offsets=state.offsets,
         halflife_s=state.halflife_s,
+        endpoint_translation_warp_world_xy=(
+            state.endpoint_translation_warp_world_xy
+        ),
+        endpoint_yaw_warp_rad=state.endpoint_yaw_warp_rad,
     )
     return TerrainSkillStep(
         frame=frame,

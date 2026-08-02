@@ -127,6 +127,8 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         result_filter: Any | None = None,
         contact_phase_gate: bool = False,
         turning_clip_paths: frozenset[str] | None = None,
+        maximum_translation_warp_m: float = 0.0,
+        maximum_yaw_warp_rad: float = 0.0,
     ) -> None:
         self.base = base_matcher
         self.database = base_matcher.database
@@ -157,6 +159,15 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         ):
             raise ContractError("turning clip paths must be a non-empty frozenset")
         self.turning_clip_paths = turning_clip_paths
+        if (
+            not math.isfinite(float(maximum_translation_warp_m))
+            or float(maximum_translation_warp_m) < 0.0
+            or not math.isfinite(float(maximum_yaw_warp_rad))
+            or float(maximum_yaw_warp_rad) < 0.0
+        ):
+            raise ContractError("endpoint warp limits must be finite non-negative")
+        self.maximum_translation_warp_m = float(maximum_translation_warp_m)
+        self.maximum_yaw_warp_rad = float(maximum_yaw_warp_rad)
         self._clip_path_to_index = {
             clip.relative_path: index
             for index, clip in enumerate(dataset.folder.clips)
@@ -347,6 +358,11 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             release_reason = "endpoint"
         self._prepared_selection = selected
         self._prepared_release_reason = release_reason
+        target_index = int(
+            torch.nonzero(
+                targets.frames == selected.target_frames, as_tuple=False
+            ).flatten()[0].item()
+        )
         return start_skill(
             self.dataset.folder,
             skill,
@@ -354,6 +370,12 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             current=self._current_pose(),
             halflife_s=self.config.inertialization_halflife_s,
             playback_stop=selected.endpoint_frame_exclusive,
+            target_displacement_local_xy=(
+                targets.displacement_local_xy[target_index]
+            ),
+            target_yaw_delta_rad=targets.yaw_delta_rad[target_index],
+            maximum_translation_warp_m=self.maximum_translation_warp_m,
+            maximum_yaw_warp_rad=self.maximum_yaw_warp_rad,
         )
 
     def prepare_step(self, *args, **kwargs):
@@ -402,6 +424,8 @@ def run_resolved_horizon_matrix(
     maximum_source_contact_p95_m: float | None = None,
     normalization_source: str | None = None,
     turning_source_corpus: str | None = None,
+    maximum_translation_warp_m: float = 0.0,
+    maximum_yaw_warp_rad: float = 0.0,
 ):
     """Run the renderer-independent route harness with horizon skill MM."""
 
@@ -548,6 +572,8 @@ def run_resolved_horizon_matrix(
             )
             + f":normalization:{normalization_identity}"
             + f":turning-source:{turning_identity}"
+            + f":translation-warp:{float(maximum_translation_warp_m):.9g}"
+            + f":yaw-warp:{float(maximum_yaw_warp_rad):.9g}"
         ).encode()
     ).hexdigest()
 
@@ -565,6 +591,8 @@ def run_resolved_horizon_matrix(
             result_filter=result_filter,
             contact_phase_gate=contact_phase_gate,
             turning_clip_paths=turning_clip_paths,
+            maximum_translation_warp_m=maximum_translation_warp_m,
+            maximum_yaw_warp_rad=maximum_yaw_warp_rad,
         )
         route_matchers[route.name] = matcher
         return matcher

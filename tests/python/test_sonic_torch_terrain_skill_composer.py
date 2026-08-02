@@ -114,6 +114,62 @@ class TerrainSkillComposerTest(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "already complete"):
             advance_skill(state)
 
+    def test_endpoint_warp_preserves_entry_and_reaches_bounded_target(self):
+        folder, skill, pose = _fixture()
+        skill.support_mask[7] = True
+        state = start_skill(
+            folder,
+            skill,
+            selected_entry_frame=3,
+            current=pose,
+            playback_stop=8,
+            target_displacement_local_xy=torch.tensor([0.20, 0.10]),
+            target_yaw_delta_rad=torch.tensor(0.40),
+            maximum_translation_warp_m=1.0,
+            maximum_yaw_warp_rad=1.0,
+        )
+        emitted = []
+        while True:
+            step = advance_skill(state)
+            emitted.append(step.frame)
+            state = step.state
+            if step.completed:
+                break
+
+        self.assertTrue(
+            torch.allclose(emitted[0].root_position_world, pose.root_position_world)
+        )
+        self.assertTrue(
+            torch.allclose(
+                emitted[-1].root_position_world[:2],
+                pose.root_position_world[:2] + torch.tensor([0.20, 0.10]),
+                atol=1e-6,
+            )
+        )
+        w, x, y, z = emitted[-1].root_orientation_world_wxyz
+        yaw = torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        self.assertAlmostEqual(float(yaw), 0.40, places=5)
+
+    def test_endpoint_warp_caps_translation_and_yaw_correction(self):
+        folder, skill, pose = _fixture()
+        skill.support_mask[7] = True
+        state = start_skill(
+            folder,
+            skill,
+            selected_entry_frame=3,
+            current=pose,
+            playback_stop=8,
+            target_displacement_local_xy=torch.tensor([1.0, 1.0]),
+            target_yaw_delta_rad=torch.tensor(2.0),
+            maximum_translation_warp_m=0.05,
+            maximum_yaw_warp_rad=0.10,
+        )
+        self.assertLessEqual(
+            float(torch.linalg.vector_norm(state.endpoint_translation_warp_world_xy)),
+            0.05 + 1e-7,
+        )
+        self.assertLessEqual(abs(float(state.endpoint_yaw_warp_rad)), 0.10 + 1e-7)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -44,7 +44,12 @@ class _FootKinematics:
 
 
 def _transactional_fixture(
-    *, result_filter=None, contact_phase_gate=False, turning_clip_paths=None
+    *,
+    result_filter=None,
+    contact_phase_gate=False,
+    turning_clip_paths=None,
+    maximum_translation_warp_m=0.0,
+    maximum_yaw_warp_rad=0.0,
 ):
     frames = 80
     body_position = np.zeros((frames, 3, 3), dtype=np.float32)
@@ -136,11 +141,22 @@ def _transactional_fixture(
         result_filter=result_filter,
         contact_phase_gate=contact_phase_gate,
         turning_clip_paths=turning_clip_paths,
+        maximum_translation_warp_m=maximum_translation_warp_m,
+        maximum_yaw_warp_rad=maximum_yaw_warp_rad,
     )
     return matcher, grid
 
 
 class TerrainSkillHorizonRolloutTest(unittest.TestCase):
+    def test_endpoint_warp_limits_are_explicit(self):
+        matcher, _grid = _transactional_fixture(
+            maximum_translation_warp_m=0.15,
+            maximum_yaw_warp_rad=0.30,
+        )
+
+        self.assertEqual(matcher.maximum_translation_warp_m, 0.15)
+        self.assertEqual(matcher.maximum_yaw_warp_rad, 0.30)
+
     def test_turning_clip_layer_is_explicit(self):
         matcher, _grid = _transactional_fixture(
             turning_clip_paths=frozenset({"terrain/motion.npz"})
