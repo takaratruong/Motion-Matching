@@ -273,6 +273,42 @@ class TerrainFootLockTests(unittest.TestCase):
         self.assertEqual(tuple(corrected.joint_position.shape), (29,))
         self.assertEqual(foot_lock.failure_count, 1)
 
+    def test_cached_swing_plan_queries_future_path_once_per_interval(self):
+        support = torch.tensor(
+            (
+                (True, False),
+                (True, False),
+                (True, False),
+                (True, True),
+            ),
+            dtype=torch.bool,
+        )
+        source_feet = torch.zeros((4, 2, 3), dtype=torch.float32)
+        source_feet[:, 1, 0] = torch.tensor((0.0, 0.1, 0.2, 0.2))
+        query_sizes = []
+
+        def recording_surface(xy):
+            query_sizes.append(int(xy.shape[0]))
+            return torch.zeros(xy.shape[0])
+
+        foot_lock = TerrainFootLockFilter(
+            clip_paths=("clip.npz",),
+            support_masks=(support,),
+            source_foot_positions=(source_feet,),
+            source_root_yaws=(torch.zeros(4),),
+            foot_kinematics=_LinearFeet(),
+            sample_surface=recording_surface,
+            device=torch.device("cpu"),
+            swing_clearance_margin_m=0.01,
+            swing_plan_sigma_frames=2.0,
+            swing_plan_cache_interval=True,
+        )
+
+        foot_lock.apply(_result(0, 0.0))
+        foot_lock.apply(_result(1, 0.01))
+
+        self.assertEqual([size for size in query_sizes if size > 1], [3])
+
     def test_unknown_source_fails_closed(self):
         foot_lock = TerrainFootLockFilter(
             clip_paths=("clip.npz",),

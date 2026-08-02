@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
 from types import SimpleNamespace
 from typing import Callable, Sequence
@@ -10,6 +11,15 @@ import numpy as np
 import torch
 
 from .torch_contact_segments import ANKLE_ORIGIN_SOLE_M
+
+
+@dataclass
+class _SwingLiftPlan:
+    clip_index: int
+    start_frame: int
+    next_frame: int
+    stop_frame_exclusive: int
+    lift_by_frame: torch.Tensor
 
 
 class TerrainFootLockFilter:
@@ -32,6 +42,7 @@ class TerrainFootLockFilter:
         maximum_output_joint_speed_rad_s: float = 12.0,
         swing_clearance_margin_m: float | None = None,
         swing_plan_sigma_frames: float | None = None,
+        swing_plan_cache_interval: bool = False,
     ) -> None:
         paths = tuple(clip_paths)
         masks = tuple(support_masks)
@@ -93,6 +104,8 @@ class TerrainFootLockFilter:
                 )
             )
             or ((source_feet is None) != (source_yaws is None))
+            or type(swing_plan_cache_interval) is not bool
+            or (swing_plan_cache_interval and swing_plan_sigma_frames is None)
             or (
                 source_feet is not None
                 and (
@@ -160,6 +173,7 @@ class TerrainFootLockFilter:
             if swing_plan_sigma_frames is None
             else float(swing_plan_sigma_frames)
         )
+        self._swing_plan_cache_interval = swing_plan_cache_interval
         self._lock_position = torch.full(
             (2, 3), float("nan"), dtype=torch.float32, device=device
         )
@@ -167,6 +181,7 @@ class TerrainFootLockFilter:
         self._locked = torch.zeros(2, dtype=torch.bool, device=device)
         self._joint_offset = torch.zeros(29, dtype=torch.float32, device=device)
         self._previous_joint_position: torch.Tensor | None = None
+        self._swing_lift_plans: list[_SwingLiftPlan | None] = [None, None]
         self._failure_count = 0
 
     @property
@@ -179,6 +194,7 @@ class TerrainFootLockFilter:
         self._locked.zero_()
         self._joint_offset.zero_()
         self._previous_joint_position = None
+        self._swing_lift_plans[:] = [None, None]
         self._failure_count = 0
 
     def _source_support(
@@ -211,6 +227,16 @@ class TerrainFootLockFilter:
         frame: int,
         foot: int,
     ) -> torch.Tensor:
+        if self._swing_plan_cache_interval:
+            cached = self._swing_lift_plans[foot]
+            if (
+                cached is not None
+                and cached.clip_index == clip_index
+                and cached.next_frame == frame
+                and frame < cached.stop_frame_exclusive
+            ):
+                cached.next_frame += 1
+                return cached.lift_by_frame[frame - cached.start_frame]
         support = self._support_masks[clip_index][:, foot]
         stop = frame + 1
         while stop < support.shape[0] and not bool(support[stop].item()):
@@ -245,6 +271,30 @@ class TerrainFootLockFilter:
         weight = torch.exp(
             -0.5 * torch.square(distance / self._swing_plan_sigma_frames)
         )
+        if self._swing_plan_cache_interval:
+            coordinates = torch.arange(
+                required.shape[0],
+                dtype=required.dtype,
+                device=self._device,
+            )
+            future_distance = coordinates[None, :] - coordinates[:, None]
+            future_weight = torch.exp(
+                -0.5
+                * torch.square(
+                    future_distance / self._swing_plan_sigma_frames
+                )
+            )
+            planned = (required[None, :] * future_weight).masked_fill(
+                future_distance < 0.0, float("-inf")
+            ).amax(dim=1)
+            self._swing_lift_plans[foot] = _SwingLiftPlan(
+                clip_index=clip_index,
+                start_frame=frame,
+                next_frame=frame + 1,
+                stop_frame_exclusive=stop,
+                lift_by_frame=planned,
+            )
+            return planned[0]
         return torch.max(required * weight)
 
     def _feet(self, result: object) -> torch.Tensor:
@@ -289,6 +339,8 @@ class TerrainFootLockFilter:
         if any(not hasattr(result, name) for name in required):
             raise ValueError("terrain foot lock result is invalid")
         support, clip_index, frame = self._source_support(result)
+        for foot in torch.nonzero(support, as_tuple=False).flatten().tolist():
+            self._swing_lift_plans[int(foot)] = None
         native_feet = self._feet(result)
         onset = support & ~self._previous_support
         self._lock_position[onset] = native_feet[onset]
@@ -428,6 +480,7 @@ def build_terrain_foot_lock(
     swing_clearance_margin_m: float | None = None,
     correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
+    swing_plan_cache_interval: bool = False,
 ):
     """Build a source-contact foot lock against the resolved query terrain."""
 
@@ -492,4 +545,5 @@ def build_terrain_foot_lock(
         swing_clearance_margin_m=swing_clearance_margin_m,
         correction_halflife_s=correction_halflife_s,
         swing_plan_sigma_frames=swing_plan_sigma_frames,
+        swing_plan_cache_interval=swing_plan_cache_interval,
     )
