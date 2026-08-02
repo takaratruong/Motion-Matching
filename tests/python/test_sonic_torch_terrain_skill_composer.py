@@ -114,6 +114,21 @@ class TerrainSkillComposerTest(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "already complete"):
             advance_skill(state)
 
+    def test_single_frame_endpoint_has_finite_zero_warp_progress(self):
+        folder, skill, pose = _fixture()
+        state = start_skill(
+            folder,
+            skill,
+            selected_entry_frame=3,
+            current=pose,
+            playback_stop=4,
+        )
+
+        step = advance_skill(state)
+
+        self.assertTrue(step.completed)
+        self.assertTrue(torch.isfinite(step.frame.qpos).all())
+
     def test_endpoint_warp_preserves_entry_and_reaches_bounded_target(self):
         folder, skill, pose = _fixture()
         skill.support_mask[7] = True

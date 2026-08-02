@@ -392,13 +392,18 @@ def advance_skill(state: TerrainSkillState) -> TerrainSkillStep:
     )
     duration_frames = state.playback_stop - 1 - state.selected_entry_frame
     progress = torch.as_tensor(
-        (frame_index - state.selected_entry_frame) / duration_frames,
+        0.0
+        if duration_frames == 0
+        else (frame_index - state.selected_entry_frame) / duration_frames,
         dtype=reference.dtype,
         device=reference.device,
     )
     smooth_progress = progress * progress * (3.0 - 2.0 * progress)
-    duration_s = duration_frames / 50.0
-    smooth_rate = 6.0 * progress * (1.0 - progress) / duration_s
+    smooth_rate = (
+        torch.zeros_like(progress)
+        if duration_frames == 0
+        else 6.0 * progress * (1.0 - progress) / (duration_frames / 50.0)
+    )
     warp_xy = smooth_progress * state.endpoint_translation_warp_world_xy
     warp_yaw = smooth_progress * state.endpoint_yaw_warp_rad
     out_jp = jp + jpo

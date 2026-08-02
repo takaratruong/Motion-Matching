@@ -182,7 +182,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                 minimum_endpoint_warp_velocity_heading_alignment
             ) <= 1.0
         ):
-            raise ContractError("endpoint warp limits must be finite non-negative")
+            raise ContractError("endpoint warp limits are invalid")
         self.maximum_translation_warp_m = float(maximum_translation_warp_m)
         self.maximum_yaw_warp_rad = float(maximum_yaw_warp_rad)
         self.minimum_endpoint_warp_yaw_rad = float(
