@@ -68,11 +68,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Spread future source-path clearance backward by this sigma.",
     )
     parser.add_argument(
-        "--swing-plan-cache-interval",
-        action="store_true",
-        help="Plan each source swing once and reuse it until contact.",
-    )
-    parser.add_argument(
         "--ablation",
         choices=(
             "combined",
@@ -214,7 +209,6 @@ def main(argv: list[str] | None = None) -> int:
         swing_clearance_margin_m=args.swing_clearance_margin_m,
         foot_correction_halflife_s=args.foot_correction_halflife_s,
         swing_plan_sigma_frames=args.swing_plan_sigma_frames,
-        swing_plan_cache_interval=args.swing_plan_cache_interval,
     )
     save_horizon_matrix(matrix, events, args.output)
     execution_completed = all(
@@ -233,7 +227,6 @@ def main(argv: list[str] | None = None) -> int:
                 "swing_clearance_margin_m": args.swing_clearance_margin_m,
                 "foot_correction_halflife_s": args.foot_correction_halflife_s,
                 "swing_plan_sigma_frames": args.swing_plan_sigma_frames,
-                "swing_plan_cache_interval": args.swing_plan_cache_interval,
                 "deterministic_sha256": matrix.deterministic_sha256,
                 "output": args.output,
             },
