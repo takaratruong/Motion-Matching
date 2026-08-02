@@ -24,11 +24,6 @@ class _HeightGrid:
         return points[:, 0]
 
 
-class _XYProductGrid:
-    def sample_xy(self, points):
-        return points[:, 0] * points[:, 1]
-
-
 class _Alignment:
     def matcher_to_scene_xy(self, points):
         return points
@@ -206,38 +201,6 @@ class TerrainSkillHorizonRolloutTest(unittest.TestCase):
             torch.allclose(
                 enriched.surface_height_delta_m,
                 expected[:, None].expand(-1, 2),
-            )
-        )
-
-    def test_terrain_height_targets_sample_left_and_right_footprints(self):
-        targets = HorizonTargets(
-            frames=torch.tensor([25, 50, 100]),
-            displacement_local_xy=torch.tensor(
-                [[0.5, 0.0], [1.0, 0.0], [2.0, 0.0]]
-            ),
-            yaw_delta_rad=torch.zeros(3),
-            root_height_delta_m=torch.zeros(3),
-            surface_height_delta_m=torch.zeros((3, 2)),
-        )
-        terrain = SimpleNamespace(
-            query_grid=_XYProductGrid(), alignment=_Alignment()
-        )
-
-        enriched = terrain_height_targets(
-            targets,
-            current_root_position_world=torch.tensor([1.0, 2.0, 0.8]),
-            current_root_yaw=torch.tensor(0.0),
-            current_foot_position_world=torch.tensor(
-                [[1.0, 2.2, 0.0], [1.0, 1.8, 0.0]]
-            ),
-            query_terrain=terrain,
-        )
-
-        self.assertTrue(
-            torch.allclose(
-                enriched.surface_height_delta_m,
-                torch.tensor([[1.1, 0.9], [2.2, 1.8], [4.4, 3.6]]),
-                atol=1e-6,
             )
         )
 

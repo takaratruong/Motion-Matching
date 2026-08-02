@@ -56,7 +56,6 @@ def terrain_height_targets(
     *,
     current_root_position_world: torch.Tensor,
     current_root_yaw: torch.Tensor,
-    current_foot_position_world: torch.Tensor | None = None,
     query_terrain: Any,
 ) -> HorizonTargets:
     """Sample desired vertical change along the commanded root path."""
@@ -75,44 +74,14 @@ def terrain_height_targets(
         or current_root_yaw.dtype != current_root_position_world.dtype
     ):
         raise ContractError("terrain height prediction root state is invalid")
-    if current_foot_position_world is not None and (
-        not isinstance(current_foot_position_world, torch.Tensor)
-        or tuple(current_foot_position_world.shape) != (2, 3)
-        or current_foot_position_world.device
-        != current_root_position_world.device
-        or current_foot_position_world.dtype != current_root_position_world.dtype
-        or not torch.isfinite(current_foot_position_world).all()
-    ):
-        raise ContractError("terrain height prediction feet are invalid")
     try:
         world_displacement = _rotate_xy(
             targets.displacement_local_xy, current_root_yaw.reshape(())
         )
         world_xy = current_root_position_world[:2].unsqueeze(0) + world_displacement
-        samples = [current_root_position_world[:2].unsqueeze(0), world_xy]
-        future_foot_xy = None
-        if current_foot_position_world is not None:
-            local_foot_offset = _rotate_xy(
-                current_foot_position_world[:, :2]
-                - current_root_position_world[:2],
-                -current_root_yaw.reshape(()),
-            )
-            future_yaw = (
-                current_root_yaw.reshape(()) + targets.yaw_delta_rad
-            )
-            future_foot_xy = world_xy[:, None, :] + _rotate_xy(
-                local_foot_offset.unsqueeze(0).expand(
-                    targets.frames.shape[0], -1, -1
-                ),
-                future_yaw[:, None],
-            )
-            samples.extend(
-                (
-                    current_foot_position_world[:, :2],
-                    future_foot_xy.reshape(-1, 2),
-                )
-            )
-        sample_xy = torch.cat(samples, dim=0)
+        sample_xy = torch.cat(
+            (current_root_position_world[:2].unsqueeze(0), world_xy), dim=0
+        )
         height = query_terrain.query_grid.sample_xy(
             query_terrain.alignment.matcher_to_scene_xy(sample_xy)
         )
@@ -120,31 +89,18 @@ def terrain_height_targets(
         raise ContractError("terrain height prediction query is invalid") from error
     if (
         not isinstance(height, torch.Tensor)
-        or tuple(height.shape) != (sample_xy.shape[0],)
+        or tuple(height.shape) != (targets.frames.shape[0] + 1,)
         or height.device != current_root_position_world.device
         or not torch.isfinite(height).all()
     ):
         raise ContractError("terrain height prediction samples are invalid")
-    horizon_count = targets.frames.shape[0]
-    delta = (height[1 : horizon_count + 1] - height[0]).to(
-        targets.displacement_local_xy.dtype
-    )
-    if current_foot_position_world is None:
-        surface_delta = delta[:, None].expand(-1, 2).clone()
-    else:
-        current_surface = height[horizon_count + 1 : horizon_count + 3]
-        future_surface = height[horizon_count + 3 :].reshape(
-            horizon_count, 2
-        )
-        surface_delta = (future_surface - current_surface).to(
-            targets.displacement_local_xy.dtype
-        )
+    delta = (height[1:] - height[0]).to(targets.displacement_local_xy.dtype)
     return HorizonTargets(
         frames=targets.frames,
         displacement_local_xy=targets.displacement_local_xy,
         yaw_delta_rad=targets.yaw_delta_rad,
         root_height_delta_m=delta,
-        surface_height_delta_m=surface_delta,
+        surface_height_delta_m=delta[:, None].expand(-1, 2).clone(),
     )
 
 
@@ -165,7 +121,6 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         terrain_tolerance_m: float = 0.06,
         result_filter: Any | None = None,
         contact_phase_gate: bool = False,
-        footprint_terrain_targets: bool = False,
     ) -> None:
         self.base = base_matcher
         self.database = base_matcher.database
@@ -186,9 +141,6 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         if type(contact_phase_gate) is not bool:
             raise ContractError("contact phase gate must be boolean")
         self.contact_phase_gate = contact_phase_gate
-        if type(footprint_terrain_targets) is not bool:
-            raise ContractError("footprint terrain targets must be boolean")
-        self.footprint_terrain_targets = footprint_terrain_targets
         self._clip_path_to_index = {
             clip.relative_path: index
             for index, clip in enumerate(dataset.folder.clips)
@@ -260,9 +212,6 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             targets,
             current_root_position_world=result.root_position_world,
             current_root_yaw=current_yaw,
-            current_foot_position_world=(
-                self._feet if self.footprint_terrain_targets else None
-            ),
             query_terrain=self.query_terrain,
         )
 
@@ -414,7 +363,6 @@ def run_resolved_horizon_matrix(
     search_config: HorizonSearchConfig = HorizonSearchConfig(),
     foot_lock: bool = False,
     contact_phase_gate: bool = False,
-    footprint_terrain_targets: bool = False,
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
@@ -531,11 +479,6 @@ def run_resolved_horizon_matrix(
                 else ":reactive-clearance"
             )
             + (":phase-gate-v1" if contact_phase_gate else ":implicit-phase")
-            + (
-                ":footprint-terrain-targets-v1"
-                if footprint_terrain_targets
-                else ":root-terrain-targets"
-            )
         ).encode()
     ).hexdigest()
 
@@ -552,7 +495,6 @@ def run_resolved_horizon_matrix(
             terrain_tolerance_m=terrain_tolerance_m,
             result_filter=result_filter,
             contact_phase_gate=contact_phase_gate,
-            footprint_terrain_targets=footprint_terrain_targets,
         )
         route_matchers[route.name] = matcher
         return matcher
