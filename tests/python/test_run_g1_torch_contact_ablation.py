@@ -19,6 +19,7 @@ class ContactAblationCliTests(unittest.TestCase):
                     "--output", "output",
                     "--device", "cuda:0",
                     "--max-actions-per-state", "3",
+                    "--projection-strategy", "stance-root",
                 ]
             )
 
@@ -33,6 +34,7 @@ class ContactAblationCliTests(unittest.TestCase):
             output="output",
             device="cuda:0",
             maximum_actions_per_state=3,
+            projection_strategy="stance-root",
         )
 
 

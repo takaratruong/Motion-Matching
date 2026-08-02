@@ -101,6 +101,7 @@ def _metrics(result: ContactQualityAblationResult) -> dict[str, float]:
             "projected_stance_drift_m",
             "projected_landing_error_m",
             "maximum_target_error_m",
+            "maximum_root_correction_m",
             "maximum_joint_deformation_rad",
             "rms_joint_deformation_rad",
         )
@@ -218,6 +219,7 @@ def run_contact_ablation(
     output: str,
     device: str,
     maximum_actions_per_state: int,
+    projection_strategy: str,
 ) -> dict[str, object]:
     """Evaluate contact composition on the authenticated frozen oracle states."""
 
@@ -239,6 +241,8 @@ def run_contact_ablation(
 
     if type(maximum_actions_per_state) is not int or maximum_actions_per_state < 1:
         raise ValueError("maximum actions per state must be positive")
+    if projection_strategy not in ("joint-only", "stance-root"):
+        raise ValueError("contact ablation projection strategy is invalid")
     output_path = Path(os.path.abspath(output))
     if output_path.exists() or output_path.is_symlink():
         raise FileExistsError(f"contact ablation output already exists: {output_path}")
@@ -325,6 +329,7 @@ def run_contact_ablation(
                     desired_landing_foot=desired_foot,
                     desired_landing_world_xyz=desired,
                     foot_kinematics=foot_kinematics,
+                    projection_strategy=projection_strategy,
                 )
             except ValueError as error:
                 reason = str(error)
@@ -398,6 +403,7 @@ def run_contact_ablation(
         "dataset_identity": oracle_summary["dataset_identity"],
         "action_count": len(index.actions),
         "maximum_actions_per_state": maximum_actions_per_state,
+        "projection_strategy": projection_strategy,
         "state_count": len(state_records),
         "states_with_accepted_action": sum(
             bool(record["accepted_action_indices"]) for record in state_records

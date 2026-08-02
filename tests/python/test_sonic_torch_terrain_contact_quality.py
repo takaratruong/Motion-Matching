@@ -116,6 +116,22 @@ class TerrainContactQualityTests(unittest.TestCase):
                 foot_kinematics=_LinearFeet(),
             )
 
+    def test_stance_root_strategy_moves_support_error_into_root(self):
+        kwargs = dict(
+            state=_state(),
+            action=_action(),
+            desired_landing_foot=1,
+            desired_landing_world_xyz=np.array((0.45, -0.08, 0.04)),
+            foot_kinematics=_LinearFeet(),
+        )
+        stance_root = build_contact_quality_ablation(
+            **kwargs, projection_strategy="stance-root"
+        )
+
+        self.assertAlmostEqual(stance_root.projected_stance_drift_m, 0.0, places=6)
+        self.assertGreater(stance_root.maximum_root_correction_m, 0.0)
+        self.assertAlmostEqual(stance_root.projected_landing_error_m, 0.0, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

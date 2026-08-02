@@ -20,6 +20,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", required=True)
     parser.add_argument("--max-actions-per-state", required=True, type=int)
+    parser.add_argument(
+        "--projection-strategy",
+        required=True,
+        choices=("joint-only", "stance-root"),
+    )
     return parser
 
 
@@ -35,6 +40,7 @@ def main(argv: list[str] | None = None) -> int:
         output=args.output,
         device=args.device,
         maximum_actions_per_state=args.max_actions_per_state,
+        projection_strategy=args.projection_strategy,
     )
     print(json.dumps(result, sort_keys=True), flush=True)
     return 0

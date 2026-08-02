@@ -13,6 +13,7 @@ from .torch_terrain_contact_composition import (
     build_contact_target_trajectory,
     place_action_contact_anchored,
     project_contact_trajectory,
+    project_contact_trajectory_with_stance_root,
 )
 from .torch_terrain_quality_preview import (
     build_quality_preview_from_placement,
@@ -270,6 +271,7 @@ class ContactQualityAblationResult:
     projected_stance_drift_m: float
     projected_landing_error_m: float
     maximum_target_error_m: float
+    maximum_root_correction_m: float
     maximum_joint_deformation_rad: float
     rms_joint_deformation_rad: float
 
@@ -299,6 +301,7 @@ class ContactQualityAblationResult:
             "projected_stance_drift_m",
             "projected_landing_error_m",
             "maximum_target_error_m",
+            "maximum_root_correction_m",
             "maximum_joint_deformation_rad",
             "rms_joint_deformation_rad",
         ):
@@ -326,6 +329,7 @@ def build_contact_quality_ablation(
     desired_landing_world_xyz: object,
     foot_kinematics: object,
     inertialization_halflife_s: float = 0.10,
+    projection_strategy: str = "joint-only",
 ) -> ContactQualityAblationResult:
     """Measure contact anchoring and projected composition on one action."""
 
@@ -342,6 +346,8 @@ def build_contact_quality_ablation(
     desired = np.asarray(desired_landing_world_xyz, dtype=np.float64)
     if desired.shape != (3,) or not np.isfinite(desired).all():
         raise ValueError("contact quality ablation desired landing is invalid")
+    if projection_strategy not in ("joint-only", "stance-root"):
+        raise ValueError("contact quality ablation projection strategy is invalid")
 
     current = quality_state_as_oracle(state, action.joint_position)
     anchored = place_action_contact_anchored(action, current)
@@ -361,34 +367,54 @@ def build_contact_quality_ablation(
         device=device,
     )
     support = action.support_mask
-    targets = build_contact_target_trajectory(
-        raw_feet,
-        support,
-        swing_foot=action.swing_foot,
-        entry_foot_position_world=torch.as_tensor(
-            np.array(state.foot_position_world, copy=True),
-            dtype=dtype,
-            device=device,
-        ),
-        landing_target_world=torch.as_tensor(desired, dtype=dtype, device=device),
+    entry_feet = torch.as_tensor(
+        np.array(state.foot_position_world, copy=True),
+        dtype=dtype,
+        device=device,
     )
+    landing = torch.as_tensor(desired, dtype=dtype, device=device)
     roots = torch.as_tensor(
         np.array(raw_qpos[:, :3], copy=True), dtype=dtype, device=device
     )
     quaternions = torch.as_tensor(
         np.array(raw_qpos[:, 3:7], copy=True), dtype=dtype, device=device
     )
-    projection = project_contact_trajectory(
-        joint_position=torch.as_tensor(
-            np.array(raw_qpos[:, 7:], copy=True), dtype=dtype, device=device
-        ),
-        root_position_world=roots,
-        root_orientation_world_wxyz=quaternions,
-        targets=targets,
-        foot_kinematics=foot_kinematics,
+    raw_joints = torch.as_tensor(
+        np.array(raw_qpos[:, 7:], copy=True), dtype=dtype, device=device
     )
+    if projection_strategy == "joint-only":
+        targets = build_contact_target_trajectory(
+            raw_feet,
+            support,
+            swing_foot=action.swing_foot,
+            entry_foot_position_world=entry_feet,
+            landing_target_world=landing,
+        )
+        projection = project_contact_trajectory(
+            joint_position=raw_joints,
+            root_position_world=roots,
+            root_orientation_world_wxyz=quaternions,
+            targets=targets,
+            foot_kinematics=foot_kinematics,
+        )
+        projected_roots = roots
+        maximum_root_correction_m = 0.0
+    else:
+        projection = project_contact_trajectory_with_stance_root(
+            joint_position=raw_joints,
+            root_position_world=roots,
+            root_orientation_world_wxyz=quaternions,
+            raw_foot_position_world=raw_feet,
+            support_mask=support,
+            swing_foot=action.swing_foot,
+            entry_foot_position_world=entry_feet,
+            landing_target_world=landing,
+            foot_kinematics=foot_kinematics,
+        )
+        projected_roots = projection.root_position_world
+        maximum_root_correction_m = projection.maximum_root_correction_m
     projected_qpos = torch.cat(
-        (roots, quaternions, projection.joint_position), dim=1
+        (projected_roots, quaternions, projection.joint_position), dim=1
     ).detach().cpu().numpy()
     projected_feet = projection.foot_position_world.detach().cpu().numpy()
     support_numpy = support.detach().cpu().numpy().astype(bool, copy=True)
@@ -408,6 +434,7 @@ def build_contact_quality_ablation(
             np.linalg.norm(projected_feet[-1, action.swing_foot] - desired)
         ),
         maximum_target_error_m=projection.maximum_target_error_m,
+        maximum_root_correction_m=maximum_root_correction_m,
         maximum_joint_deformation_rad=projection.maximum_joint_deformation_rad,
         rms_joint_deformation_rad=projection.rms_joint_deformation_rad,
     )

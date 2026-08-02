@@ -171,6 +171,60 @@ class ContactProjectionResult:
         )
 
 
+@dataclass(frozen=True)
+class StanceRootProjectionResult:
+    root_position_world: torch.Tensor
+    joint_position: torch.Tensor
+    foot_position_world: torch.Tensor
+    maximum_target_error_m: float
+    maximum_root_correction_m: float
+    maximum_joint_deformation_rad: float
+    rms_joint_deformation_rad: float
+
+    def __post_init__(self) -> None:
+        roots = self.root_position_world
+        if (
+            not isinstance(roots, torch.Tensor)
+            or roots.ndim != 2
+            or tuple(roots.shape[1:]) != (3,)
+            or roots.shape[0] < 2
+            or not roots.dtype.is_floating_point
+            or not torch.isfinite(roots).all()
+            or not isinstance(self.joint_position, torch.Tensor)
+            or tuple(self.joint_position.shape) != (roots.shape[0], 29)
+            or self.joint_position.dtype != roots.dtype
+            or self.joint_position.device != roots.device
+            or not torch.isfinite(self.joint_position).all()
+            or not isinstance(self.foot_position_world, torch.Tensor)
+            or tuple(self.foot_position_world.shape) != (roots.shape[0], 2, 3)
+            or self.foot_position_world.dtype != roots.dtype
+            or self.foot_position_world.device != roots.device
+            or not torch.isfinite(self.foot_position_world).all()
+        ):
+            raise ValueError("stance-root projection output is invalid")
+        for name in (
+            "maximum_target_error_m",
+            "maximum_root_correction_m",
+            "maximum_joint_deformation_rad",
+            "rms_joint_deformation_rad",
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) < 0.0
+            ):
+                raise ValueError("stance-root projection metrics are invalid")
+            object.__setattr__(self, name, float(value))
+        for name in (
+            "root_position_world",
+            "joint_position",
+            "foot_position_world",
+        ):
+            object.__setattr__(self, name, getattr(self, name).detach().clone())
+
+
 def _fit_entry_support(
     action: ContactPhaseAction, state: OracleState
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -435,4 +489,110 @@ def project_contact_trajectory(
         ),
         maximum_joint_deformation_rad=float(np.abs(deformation).max()),
         rms_joint_deformation_rad=float(np.sqrt(np.mean(np.square(deformation)))),
+    )
+
+
+def project_contact_trajectory_with_stance_root(
+    *,
+    joint_position: torch.Tensor,
+    root_position_world: torch.Tensor,
+    root_orientation_world_wxyz: torch.Tensor,
+    raw_foot_position_world: torch.Tensor,
+    support_mask: torch.Tensor,
+    swing_foot: int,
+    entry_foot_position_world: torch.Tensor,
+    landing_target_world: torch.Tensor,
+    foot_kinematics: object,
+) -> StanceRootProjectionResult:
+    """Lock the persistent stance with root translation, then warp the swing leg."""
+
+    joints = joint_position
+    if (
+        not isinstance(joints, torch.Tensor)
+        or joints.ndim != 2
+        or tuple(joints.shape[1:]) != (29,)
+        or joints.shape[0] < 2
+        or not joints.dtype.is_floating_point
+        or not torch.isfinite(joints).all()
+        or not isinstance(root_position_world, torch.Tensor)
+        or tuple(root_position_world.shape) != (joints.shape[0], 3)
+        or root_position_world.dtype != joints.dtype
+        or root_position_world.device != joints.device
+        or not torch.isfinite(root_position_world).all()
+        or not isinstance(root_orientation_world_wxyz, torch.Tensor)
+        or tuple(root_orientation_world_wxyz.shape) != (joints.shape[0], 4)
+        or root_orientation_world_wxyz.dtype != joints.dtype
+        or root_orientation_world_wxyz.device != joints.device
+        or not torch.isfinite(root_orientation_world_wxyz).all()
+        or not isinstance(raw_foot_position_world, torch.Tensor)
+        or tuple(raw_foot_position_world.shape) != (joints.shape[0], 2, 3)
+        or raw_foot_position_world.dtype != joints.dtype
+        or raw_foot_position_world.device != joints.device
+        or not torch.isfinite(raw_foot_position_world).all()
+        or not isinstance(support_mask, torch.Tensor)
+        or tuple(support_mask.shape) != (joints.shape[0], 2)
+        or support_mask.dtype != torch.bool
+        or support_mask.device != joints.device
+        or type(swing_foot) is not int
+        or swing_foot not in (0, 1)
+        or not isinstance(entry_foot_position_world, torch.Tensor)
+        or tuple(entry_foot_position_world.shape) != (2, 3)
+        or entry_foot_position_world.dtype != joints.dtype
+        or entry_foot_position_world.device != joints.device
+        or not torch.isfinite(entry_foot_position_world).all()
+        or not isinstance(landing_target_world, torch.Tensor)
+        or tuple(landing_target_world.shape) != (3,)
+        or landing_target_world.dtype != joints.dtype
+        or landing_target_world.device != joints.device
+        or not torch.isfinite(landing_target_world).all()
+    ):
+        raise ValueError("stance-root projection inputs are invalid")
+    stance_foot = 1 - swing_foot
+    if not bool(support_mask[:, stance_foot].all()):
+        raise ValueError("stance-root projection requires persistent opposite support")
+
+    root_correction = (
+        entry_foot_position_world[stance_foot][None]
+        - raw_foot_position_world[:, stance_foot]
+    )
+    corrected_roots = root_position_world + root_correction
+    shifted_feet = raw_foot_position_world + root_correction[:, None, :]
+    targets = build_contact_target_trajectory(
+        shifted_feet,
+        support_mask,
+        swing_foot=swing_foot,
+        entry_foot_position_world=entry_foot_position_world,
+        landing_target_world=landing_target_world,
+    )
+    swing_only = torch.zeros_like(targets.solve_mask)
+    swing_only[:, swing_foot] = True
+    projection = project_contact_trajectory(
+        joint_position=joints,
+        root_position_world=corrected_roots,
+        root_orientation_world_wxyz=root_orientation_world_wxyz,
+        targets=ContactTargetTrajectory(
+            position_world=targets.position_world,
+            solve_mask=swing_only,
+            swing_warp_weight=targets.swing_warp_weight,
+        ),
+        foot_kinematics=foot_kinematics,
+    )
+    stance_error = torch.linalg.vector_norm(
+        projection.foot_position_world[:, stance_foot]
+        - entry_foot_position_world[stance_foot],
+        dim=1,
+    )
+    return StanceRootProjectionResult(
+        root_position_world=corrected_roots,
+        joint_position=projection.joint_position,
+        foot_position_world=projection.foot_position_world,
+        maximum_target_error_m=max(
+            projection.maximum_target_error_m,
+            float(stance_error.max().item()),
+        ),
+        maximum_root_correction_m=float(
+            torch.linalg.vector_norm(root_correction, dim=1).max().item()
+        ),
+        maximum_joint_deformation_rad=projection.maximum_joint_deformation_rad,
+        rms_joint_deformation_rad=projection.rms_joint_deformation_rad,
     )

@@ -10,6 +10,7 @@ from mm_sonic.torch_terrain_contact_composition import (
     build_contact_target_trajectory,
     place_action_contact_anchored,
     project_contact_trajectory,
+    project_contact_trajectory_with_stance_root,
 )
 
 
@@ -308,6 +309,45 @@ class TerrainContactCompositionTests(unittest.TestCase):
                 targets=targets,
                 foot_kinematics=_FailingFootKinematics(),
             )
+
+    def test_stance_root_projection_locks_support_before_swing_ik(self):
+        joints = torch.zeros((3, 29))
+        joints[:, :3] = torch.tensor((0.0, 0.1, 0.0))
+        joints[:, 3:6] = torch.tensor(
+            ((0.0, -0.1, 0.2), (0.2, -0.1, 0.3), (0.4, -0.1, 0.0))
+        )
+        roots = torch.tensor(
+            ((0.0, 0.0, 0.5), (0.08, 0.0, 0.5), (0.12, 0.0, 0.5))
+        )
+        quaternions = torch.tensor(((1.0, 0.0, 0.0, 0.0),) * 3)
+        kinematics = _LinearFootKinematics()
+        raw_feet = torch.as_tensor(
+            kinematics.foot_positions(joints, roots, quaternions)
+        )
+        support = torch.tensor(
+            ((True, False), (True, False), (True, True))
+        )
+        entry = raw_feet[0].clone()
+        landing = torch.tensor((0.52, -0.08, 0.52))
+
+        projected = project_contact_trajectory_with_stance_root(
+            joint_position=joints,
+            root_position_world=roots,
+            root_orientation_world_wxyz=quaternions,
+            raw_foot_position_world=raw_feet,
+            support_mask=support,
+            swing_foot=1,
+            entry_foot_position_world=entry,
+            landing_target_world=landing,
+            foot_kinematics=kinematics,
+        )
+
+        torch.testing.assert_close(
+            projected.foot_position_world[:, 0], entry[0].expand(3, 3)
+        )
+        torch.testing.assert_close(projected.foot_position_world[-1, 1], landing)
+        self.assertGreater(projected.maximum_root_correction_m, 0.1)
+        self.assertLess(projected.maximum_joint_deformation_rad, 0.13)
 
 
 if __name__ == "__main__":
