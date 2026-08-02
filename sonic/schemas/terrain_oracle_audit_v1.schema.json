@@ -64,6 +64,66 @@
       }
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "accepted"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "accepted_intervals": {
+            "minItems": 1,
+            "maxItems": 1
+          },
+          "reasons": {
+            "maxItems": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "rejected"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "accepted_intervals": {
+            "maxItems": 0
+          },
+          "reasons": {
+            "minItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "accepted_with_intervals_removed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "accepted_intervals": {
+            "minItems": 1
+          },
+          "reasons": {
+            "minItems": 1
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "sha256": {
       "type": "string",
@@ -125,6 +185,8 @@
         "stance_skate_limit_m",
         "foot_penetration_tolerance_m",
         "body_penetration_tolerance_m",
+        "body_fk_position_tolerance_m",
+        "body_fk_orientation_tolerance_rad",
         "collision_epsilon_m",
         "cylinder_radial_segments",
         "guard_frames",
@@ -195,6 +257,12 @@
         "body_penetration_tolerance_m": {
           "$ref": "#/$defs/nonnegative_number"
         },
+        "body_fk_position_tolerance_m": {
+          "$ref": "#/$defs/positive_number"
+        },
+        "body_fk_orientation_tolerance_rad": {
+          "$ref": "#/$defs/positive_number"
+        },
         "collision_epsilon_m": {
           "$ref": "#/$defs/positive_number"
         },
@@ -229,7 +297,9 @@
         "max_incomplete_sole_fraction",
         "max_stance_skate_m",
         "max_foot_penetration_m",
-        "max_body_penetration_m"
+        "max_body_penetration_m",
+        "max_body_fk_position_error_m",
+        "max_body_fk_orientation_error_rad"
       ],
       "properties": {
         "max_joint_limit_violation_rad": {
@@ -273,6 +343,12 @@
         },
         "max_body_penetration_m": {
           "$ref": "#/$defs/nonnegative_number"
+        },
+        "max_body_fk_position_error_m": {
+          "$ref": "#/$defs/nonnegative_number"
+        },
+        "max_body_fk_orientation_error_rad": {
+          "$ref": "#/$defs/nonnegative_number"
         }
       }
     },
@@ -299,6 +375,7 @@
             "stance_skate",
             "foot_penetration",
             "body_penetration",
+            "body_fk_mismatch",
             "terrain_registration",
             "model_registration",
             "source_registration"

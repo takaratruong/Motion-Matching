@@ -37,6 +37,7 @@ _REASON_CODES = frozenset(
         "stance_skate",
         "foot_penetration",
         "body_penetration",
+        "body_fk_mismatch",
         "terrain_registration",
         "model_registration",
         "source_registration",
@@ -57,6 +58,8 @@ _METRIC_NAMES = (
     "max_stance_skate_m",
     "max_foot_penetration_m",
     "max_body_penetration_m",
+    "max_body_fk_position_error_m",
+    "max_body_fk_orientation_error_rad",
 )
 
 
@@ -120,6 +123,8 @@ class AuditThresholds:
     stance_skate_limit_m: float = 0.03
     foot_penetration_tolerance_m: float = 0.005
     body_penetration_tolerance_m: float = 0.005
+    body_fk_position_tolerance_m: float = 0.002
+    body_fk_orientation_tolerance_rad: float = 0.01
     collision_epsilon_m: float = 1.0e-9
     cylinder_radial_segments: int = 32
     guard_frames: int = 2
@@ -160,6 +165,8 @@ class AuditThresholds:
                 self.support_distance_m,
                 self.stance_skate_limit_m,
                 self.collision_epsilon_m,
+                self.body_fk_position_tolerance_m,
+                self.body_fk_orientation_tolerance_rad,
             )
             <= 0.0
             or not 0.0 <= self.minimum_surface_normal_z < 1.0
@@ -271,6 +278,21 @@ class ClipAudit:
         reasons = tuple(self.reasons)
         if any(not isinstance(reason, AuditReason) for reason in reasons):
             raise ContractError("audit reasons must be AuditReason values")
+        full_clip = intervals == (AuditInterval(0, self.frame_count),)
+        if self.status == "accepted" and (not full_clip or reasons):
+            raise ContractError(
+                "accepted audit must contain only the full clip and no reasons"
+            )
+        if self.status == "rejected" and (intervals or not reasons):
+            raise ContractError(
+                "rejected audit must contain no intervals and at least one reason"
+            )
+        if self.status == "accepted_with_intervals_removed" and (
+            not intervals or full_clip or not reasons
+        ):
+            raise ContractError(
+                "partially accepted audit must remove frames and contain reasons"
+            )
         object.__setattr__(self, "accepted_intervals", intervals)
         object.__setattr__(
             self, "thresholds", MappingProxyType(threshold_values)
@@ -296,6 +318,64 @@ class ClipAudit:
         }
         json.dumps(result, allow_nan=False, sort_keys=True)
         return result
+
+    @classmethod
+    def from_dict(cls, value: object) -> "ClipAudit":
+        if not isinstance(value, Mapping):
+            raise ContractError("audit document must be a mapping")
+        expected = {
+            "schema",
+            "clip_id",
+            "frame_count",
+            "source_sha256",
+            "model_sha256",
+            "terrain_sha256",
+            "status",
+            "accepted_intervals",
+            "thresholds",
+            "metrics",
+            "reasons",
+        }
+        if set(value) != expected:
+            raise ContractError("audit document fields do not match the schema")
+        raw_reasons = value["reasons"]
+        if not isinstance(raw_reasons, (tuple, list)):
+            raise ContractError("audit reasons must be an array")
+        reasons: list[AuditReason] = []
+        for raw in raw_reasons:
+            if not isinstance(raw, Mapping) or set(raw) != {
+                "code",
+                "severity",
+                "frame_interval",
+                "observed_maximum",
+                "threshold",
+            }:
+                raise ContractError("audit reason fields do not match the schema")
+            reasons.append(
+                AuditReason(
+                    code=raw["code"],
+                    severity=raw["severity"],
+                    frame_interval=raw["frame_interval"],
+                    observed_maximum=raw["observed_maximum"],
+                    threshold=raw["threshold"],
+                )
+            )
+        try:
+            return cls(
+                schema=value["schema"],
+                clip_id=value["clip_id"],
+                frame_count=value["frame_count"],
+                source_sha256=value["source_sha256"],
+                model_sha256=value["model_sha256"],
+                terrain_sha256=value["terrain_sha256"],
+                status=value["status"],
+                accepted_intervals=tuple(value["accepted_intervals"]),
+                thresholds=value["thresholds"],
+                metrics=value["metrics"],
+                reasons=tuple(reasons),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ContractError("invalid audit document") from error
 
 
 def _update_hash_text(digest: "hashlib._Hash", value: object) -> None:
@@ -335,6 +415,7 @@ def structural_model_sha256(model: object) -> str:
         ("jnt_type", np.int64),
         ("jnt_bodyid", np.int64),
         ("jnt_qposadr", np.int64),
+        ("jnt_dofadr", np.int64),
         ("jnt_limited", np.int64),
         ("jnt_range", np.float64),
         ("geom_bodyid", np.int64),
@@ -395,6 +476,9 @@ def _expected_joint_body(name: str) -> str:
 @dataclass(frozen=True)
 class _ModelRegistration:
     joint_ids: tuple[int, ...]
+    root_qpos_address: int
+    joint_qpos_addresses: tuple[int, ...]
+    joint_dof_addresses: tuple[int, ...]
     body_ids: tuple[int, ...]
     foot_geom_ids: tuple[tuple[int, ...], tuple[int, ...]]
     body_geom_ids: tuple[int, ...]
@@ -410,6 +494,14 @@ def _descended(model: object, body_id: int, ancestor_id: int) -> bool:
 
 
 def _validate_model(model: object) -> _ModelRegistration:
+    try:
+        import mujoco
+    except ImportError as error:
+        raise ContractError("mechanical audit requires MuJoCo") from error
+    if not isinstance(model, mujoco.MjModel):
+        raise ContractError("mechanical audit requires a MuJoCo MjModel")
+    if int(model.nq) != 36 or int(model.nv) != 35:
+        raise ContractError("model nq/nv do not equal canonical G1")
     body_names = _names(model, "body", int(model.nbody))
     joint_names = _names(model, "joint", int(model.njnt))
     if (
@@ -430,6 +522,8 @@ def _validate_model(model: object) -> _ModelRegistration:
     if (
         int(model.jnt_type[root]) != 0
         or body_names[int(model.jnt_bodyid[root])] != "pelvis"
+        or int(model.jnt_qposadr[root]) != 0
+        or int(model.jnt_dofadr[root]) != 0
     ):
         raise ContractError("model free root is not floating_base_joint on pelvis")
     for name in ISAACLAB_JOINT_NAMES:
@@ -445,6 +539,13 @@ def _validate_model(model: object) -> _ModelRegistration:
             != _expected_joint_body(name)
         ):
             raise ContractError(f"invalid exact G1 joint association for {name}")
+    joint_ids = tuple(joint_lookup[name] for name in ISAACLAB_JOINT_NAMES)
+    qpos_addresses = tuple(int(model.jnt_qposadr[index]) for index in joint_ids)
+    dof_addresses = tuple(int(model.jnt_dofadr[index]) for index in joint_ids)
+    if set(qpos_addresses) != set(range(7, 36)):
+        raise ContractError("canonical joint qpos addresses must cover [7,36)")
+    if set(dof_addresses) != set(range(6, 35)):
+        raise ContractError("canonical joint dof addresses must cover [6,35)")
     geom_count = int(model.ngeom)
     foot_bodies = tuple(body_lookup[name] for name in _FOOT_NAMES)
     foot_geoms: list[list[int]] = [[], []]
@@ -480,7 +581,10 @@ def _validate_model(model: object) -> _ModelRegistration:
     if any(not values for values in foot_geoms):
         raise ContractError("model named foot collision geometry resolved empty")
     return _ModelRegistration(
-        joint_ids=tuple(joint_lookup[name] for name in ISAACLAB_JOINT_NAMES),
+        joint_ids=joint_ids,
+        root_qpos_address=0,
+        joint_qpos_addresses=qpos_addresses,
+        joint_dof_addresses=dof_addresses,
         body_ids=tuple(body_lookup[name] for name in ISAACLAB_BODY_NAMES),
         foot_geom_ids=(tuple(foot_geoms[0]), tuple(foot_geoms[1])),
         body_geom_ids=tuple(body_geoms),
@@ -501,6 +605,15 @@ def _validate_terrain(clip: CanonicalClip, query: object) -> CanonicalMeshQuery:
         raise ContractError("clip has no explicit terrain binding")
     if not isinstance(query, CanonicalMeshQuery):
         raise ContractError("audit terrain must be a CanonicalMeshQuery")
+    verified = CanonicalMeshQuery(query.mesh, query.world_from_terrain)
+    if (
+        not np.array_equal(query._triangles, verified._triangles)
+        or not np.array_equal(query._normals, verified._normals)
+        or not np.array_equal(query._face_indices, verified._face_indices)
+        or query.mesh_sha256 != verified.mesh_sha256
+        or query.source_asset_sha256 != verified.source_asset_sha256
+    ):
+        raise ContractError("terrain query cache does not match immutable inputs")
     if (
         clip.terrain.mesh_sha256 != query.mesh_sha256
         or clip.terrain.asset_sha256 != query.source_asset_sha256
@@ -509,7 +622,7 @@ def _validate_terrain(clip: CanonicalClip, query: object) -> CanonicalMeshQuery:
         )
     ):
         raise ContractError("terrain query and clip binding provenance mismatch")
-    return query
+    return verified
 
 
 def _spans(mask: np.ndarray) -> tuple[tuple[int, int], ...]:
@@ -565,10 +678,53 @@ def _transform_points(
     return _rotate_wxyz(body_quaternion, geom_points) + body_position
 
 
+def _reconstruct_body_fk(
+    clip: CanonicalClip,
+    model: object,
+    registration: _ModelRegistration,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Reconstruct canonical body poses from root/joints with exact MuJoCo FK."""
+
+    import mujoco
+
+    data = mujoco.MjData(model)
+    positions = np.empty(
+        (clip.frame_count, len(ISAACLAB_BODY_NAMES), 3), dtype=np.float64
+    )
+    quaternions = np.empty(
+        (clip.frame_count, len(ISAACLAB_BODY_NAMES), 4), dtype=np.float64
+    )
+    body_ids = np.asarray(registration.body_ids, dtype=np.int64)
+    joint_addresses = np.asarray(
+        registration.joint_qpos_addresses, dtype=np.int64
+    )
+    for frame in range(clip.frame_count):
+        qpos = np.asarray(model.qpos0, dtype=np.float64).copy()
+        root_address = registration.root_qpos_address
+        qpos[root_address : root_address + 3] = np.asarray(
+            clip.root_position_world[frame], dtype=np.float64
+        )
+        root_quaternion = np.asarray(
+            clip.root_quaternion_world_wxyz[frame], dtype=np.float64
+        )
+        root_quaternion /= np.linalg.norm(root_quaternion)
+        qpos[root_address + 3 : root_address + 7] = root_quaternion
+        qpos[joint_addresses] = np.asarray(
+            clip.joint_position[frame], dtype=np.float64
+        )
+        data.qpos[:] = qpos
+        mujoco.mj_forward(model, data)
+        positions[frame] = np.asarray(data.xpos[body_ids], dtype=np.float64)
+        quaternions[frame] = np.asarray(data.xquat[body_ids], dtype=np.float64)
+    return positions, quaternions
+
+
 def _sole_probes(
     clip: CanonicalClip,
     model: object,
     registration: _ModelRegistration,
+    body_position_world: np.ndarray,
+    body_quaternion_world_wxyz: np.ndarray,
 ) -> np.ndarray:
     probes = np.empty((clip.frame_count, 2, 6, 3), dtype=np.float64)
     sphere_type = 2
@@ -586,10 +742,10 @@ def _sole_probes(
         reference_x = []
         for corner, geom in enumerate(spheres):
             body_name = str(model.body(int(model.geom_bodyid[geom])).name)
-            body_index = clip.body_names.index(body_name)
+            body_index = ISAACLAB_BODY_NAMES.index(body_name)
             center = _transform_points(
-                np.asarray(clip.body_position_world[:, body_index]),
-                np.asarray(clip.body_quaternion_world_wxyz[:, body_index]),
+                body_position_world[:, body_index],
+                body_quaternion_world_wxyz[:, body_index],
                 np.asarray(model.geom_pos[geom]),
                 np.asarray(model.geom_quat[geom]),
                 np.zeros(3),
@@ -611,8 +767,16 @@ def _support_audit(
     registration: _ModelRegistration,
     query: CanonicalMeshQuery,
     thresholds: AuditThresholds,
+    body_position_world: np.ndarray,
+    body_quaternion_world_wxyz: np.ndarray,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], np.ndarray]:
-    probes = _sole_probes(clip, model, registration)
+    probes = _sole_probes(
+        clip,
+        model,
+        registration,
+        body_position_world,
+        body_quaternion_world_wxyz,
+    )
     surface = query.query(probes.reshape((-1, 3)))
     shape = (clip.frame_count, 2, 6)
     closest = np.asarray(surface.closest_point_world).reshape((*shape, 3))
@@ -974,6 +1138,222 @@ def _mesh_triangles(model: object, geom: int) -> np.ndarray:
     return vertices[faces]
 
 
+@dataclass(frozen=True)
+class _BvhTopology:
+    """Deterministic median-split triangle BVH topology."""
+
+    order: np.ndarray
+    left: np.ndarray
+    right: np.ndarray
+    start: np.ndarray
+    end: np.ndarray
+
+    @classmethod
+    def build(
+        cls, triangles: np.ndarray, *, leaf_size: int = 16
+    ) -> "_BvhTopology":
+        values = np.asarray(triangles, dtype=np.float64)
+        if values.ndim != 3 or values.shape[1:] != (3, 3) or not len(values):
+            raise ContractError("BVH triangles must have shape [N>=1,3,3]")
+        centroids = np.mean(values, axis=1)
+        left: list[int] = []
+        right: list[int] = []
+        start: list[int] = []
+        end: list[int] = []
+        order: list[int] = []
+
+        def visit(indices: np.ndarray) -> int:
+            node = len(left)
+            left.append(-1)
+            right.append(-1)
+            start.append(-1)
+            end.append(-1)
+            if len(indices) <= leaf_size:
+                start[node] = len(order)
+                order.extend(int(index) for index in indices)
+                end[node] = len(order)
+                return node
+            spread = np.ptp(centroids[indices], axis=0)
+            axis = int(np.argmax(spread))
+            ranked = indices[
+                np.lexsort((indices, centroids[indices, axis]))
+            ]
+            middle = len(ranked) // 2
+            left[node] = visit(ranked[:middle])
+            right[node] = visit(ranked[middle:])
+            return node
+
+        visit(np.arange(len(values), dtype=np.int64))
+        return cls(
+            order=np.asarray(order, dtype=np.int64),
+            left=np.asarray(left, dtype=np.int32),
+            right=np.asarray(right, dtype=np.int32),
+            start=np.asarray(start, dtype=np.int32),
+            end=np.asarray(end, dtype=np.int32),
+        )
+
+    def refit(
+        self,
+        triangles: np.ndarray,
+        *,
+        upward_normals: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        triangle_minimum = np.min(triangles, axis=1)
+        triangle_maximum = np.max(triangles, axis=1)
+        if upward_normals is not None:
+            triangle_minimum = triangle_minimum.copy()
+            triangle_minimum[np.asarray(upward_normals)[:, 2] >= 0.5, 2] = -np.inf
+        node_minimum = np.empty((len(self.left), 3), dtype=np.float64)
+        node_maximum = np.empty((len(self.left), 3), dtype=np.float64)
+        for node in range(len(self.left) - 1, -1, -1):
+            if self.left[node] < 0:
+                indices = self.order[self.start[node] : self.end[node]]
+                node_minimum[node] = np.min(triangle_minimum[indices], axis=0)
+                node_maximum[node] = np.max(triangle_maximum[indices], axis=0)
+            else:
+                children = (self.left[node], self.right[node])
+                node_minimum[node] = np.minimum(
+                    node_minimum[children[0]], node_minimum[children[1]]
+                )
+                node_maximum[node] = np.maximum(
+                    node_maximum[children[0]], node_maximum[children[1]]
+                )
+        return (
+            triangle_minimum,
+            triangle_maximum,
+            node_minimum,
+            node_maximum,
+        )
+
+
+def _bvh_candidate_pairs_from_topologies(
+    robot_topology: _BvhTopology,
+    robot_bounds: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    terrain_topology: _BvhTopology,
+    terrain_bounds: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    epsilon: float,
+) -> np.ndarray:
+    robot_triangle_min, robot_triangle_max, robot_node_min, robot_node_max = (
+        robot_bounds
+    )
+    terrain_triangle_min, terrain_triangle_max, terrain_node_min, terrain_node_max = (
+        terrain_bounds
+    )
+    pairs: list[np.ndarray] = []
+    stack = [(0, 0)]
+    while stack:
+        robot_node, terrain_node = stack.pop()
+        if np.any(
+            robot_node_max[robot_node] + epsilon
+            < terrain_node_min[terrain_node]
+        ) or np.any(
+            robot_node_min[robot_node] - epsilon
+            > terrain_node_max[terrain_node]
+        ):
+            continue
+        robot_leaf = robot_topology.left[robot_node] < 0
+        terrain_leaf = terrain_topology.left[terrain_node] < 0
+        if robot_leaf and terrain_leaf:
+            robot_indices = robot_topology.order[
+                robot_topology.start[robot_node] : robot_topology.end[robot_node]
+            ]
+            terrain_indices = terrain_topology.order[
+                terrain_topology.start[terrain_node]
+                : terrain_topology.end[terrain_node]
+            ]
+            overlap = np.all(
+                robot_triangle_max[robot_indices, None] + epsilon
+                >= terrain_triangle_min[terrain_indices][None],
+                axis=2,
+            ) & np.all(
+                robot_triangle_min[robot_indices, None] - epsilon
+                <= terrain_triangle_max[terrain_indices][None],
+                axis=2,
+            )
+            locations = np.argwhere(overlap)
+            if len(locations):
+                pairs.append(
+                    np.column_stack(
+                        (
+                            robot_indices[locations[:, 0]],
+                            terrain_indices[locations[:, 1]],
+                        )
+                    )
+                )
+        elif terrain_leaf or (
+            not robot_leaf
+            and np.prod(
+                robot_node_max[robot_node] - robot_node_min[robot_node]
+            )
+            >= np.prod(
+                terrain_node_max[terrain_node]
+                - terrain_node_min[terrain_node]
+            )
+        ):
+            stack.append((int(robot_topology.right[robot_node]), terrain_node))
+            stack.append((int(robot_topology.left[robot_node]), terrain_node))
+        else:
+            stack.append((robot_node, int(terrain_topology.right[terrain_node])))
+            stack.append((robot_node, int(terrain_topology.left[terrain_node])))
+    if not pairs:
+        return np.empty((0, 2), dtype=np.int64)
+    return np.concatenate(pairs, axis=0).astype(np.int64, copy=False)
+
+
+def _bvh_candidate_pairs(
+    robot_triangles: np.ndarray,
+    terrain_triangles: np.ndarray,
+    terrain_normals: np.ndarray,
+    epsilon: float,
+) -> np.ndarray:
+    """Build deterministic BVHs and return exact finite AABB candidate pairs."""
+
+    robot_topology = _BvhTopology.build(robot_triangles)
+    terrain_topology = _BvhTopology.build(terrain_triangles)
+    return _bvh_candidate_pairs_from_topologies(
+        robot_topology,
+        robot_topology.refit(robot_triangles),
+        terrain_topology,
+        terrain_topology.refit(
+            terrain_triangles, upward_normals=terrain_normals
+        ),
+        epsilon,
+    )
+
+
+def _bvh_box_candidates(
+    topology: _BvhTopology,
+    bounds: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    minimum: np.ndarray,
+    maximum: np.ndarray,
+    epsilon: float,
+) -> np.ndarray:
+    triangle_minimum, triangle_maximum, node_minimum, node_maximum = bounds
+    results: list[np.ndarray] = []
+    stack = [0]
+    while stack:
+        node = stack.pop()
+        if np.any(maximum + epsilon < node_minimum[node]) or np.any(
+            minimum - epsilon > node_maximum[node]
+        ):
+            continue
+        if topology.left[node] < 0:
+            indices = topology.order[topology.start[node] : topology.end[node]]
+            overlap = np.all(
+                maximum + epsilon >= triangle_minimum[indices], axis=1
+            ) & np.all(
+                minimum - epsilon <= triangle_maximum[indices], axis=1
+            )
+            if np.any(overlap):
+                results.append(indices[overlap])
+        else:
+            stack.append(int(topology.right[node]))
+            stack.append(int(topology.left[node]))
+    if not results:
+        return np.empty(0, dtype=np.int64)
+    return np.concatenate(results).astype(np.int64, copy=False)
+
+
 def _triangle_candidate_mask(
     minimum: np.ndarray,
     maximum: np.ndarray,
@@ -996,6 +1376,56 @@ def _triangle_candidate_mask(
     return overlap_xy & np.where(upward, below_upward_surface, vertical_overlap)
 
 
+def _closest_points_to_triangle_batch(
+    points: np.ndarray, triangle: np.ndarray
+) -> np.ndarray:
+    """Vectorized exact closest points from many points to one triangle."""
+
+    a, b, c = triangle
+    ab = b - a
+    bc = c - b
+    ca = a - c
+
+    def segment(start: np.ndarray, direction: np.ndarray) -> np.ndarray:
+        fraction = (
+            np.sum((points - start) * direction, axis=1)
+            / np.dot(direction, direction)
+        )
+        return start + np.clip(fraction, 0.0, 1.0)[:, None] * direction
+
+    normal = np.cross(ab, c - a)
+    normal /= np.linalg.norm(normal)
+    plane_distance = np.sum((points - a) * normal, axis=1)
+    projection = points - plane_distance[:, None] * normal
+    v0 = ab
+    v1 = c - a
+    v2 = projection - a
+    dot00 = float(np.dot(v0, v0))
+    dot01 = float(np.dot(v0, v1))
+    dot11 = float(np.dot(v1, v1))
+    dot20 = np.sum(v2 * v0, axis=1)
+    dot21 = np.sum(v2 * v1, axis=1)
+    denominator = dot00 * dot11 - dot01 * dot01
+    bary_v = (dot11 * dot20 - dot01 * dot21) / denominator
+    bary_w = (dot00 * dot21 - dot01 * dot20) / denominator
+    inside = (
+        (bary_v >= -1.0e-12)
+        & (bary_w >= -1.0e-12)
+        & (bary_v + bary_w <= 1.0 + 1.0e-12)
+    )
+    candidates = np.stack(
+        (
+            segment(a, ab),
+            segment(b, bc),
+            segment(c, ca),
+            np.where(inside[:, None], projection, np.inf),
+        ),
+        axis=1,
+    )
+    squared = np.sum((candidates - points[:, None]) ** 2, axis=2)
+    return candidates[np.arange(len(points)), np.argmin(squared, axis=1)]
+
+
 def _triangle_surface_penetration(
     robot_triangles: np.ndarray,
     terrain_triangles: np.ndarray,
@@ -1003,7 +1433,55 @@ def _triangle_surface_penetration(
     terrain_minimum: np.ndarray,
     terrain_maximum: np.ndarray,
     epsilon: float,
+    candidate_pairs: np.ndarray | None = None,
 ) -> float:
+    if candidate_pairs is not None:
+        maximum_penetration = 0.0
+        pairs = np.asarray(candidate_pairs, dtype=np.int64)
+        for terrain_index in np.unique(pairs[:, 1]):
+            robot_indices = pairs[pairs[:, 1] == terrain_index, 0]
+            robots = robot_triangles[robot_indices]
+            terrain = terrain_triangles[terrain_index]
+            normal = terrain_normals[terrain_index]
+            points = robots.reshape((-1, 3))
+            closest = _closest_points_to_triangle_batch(points, terrain)
+            delta = points - closest
+            signed = np.sum(delta * normal, axis=1).reshape((-1, 3))
+            tangential = np.linalg.norm(
+                delta - np.sum(delta * normal, axis=1)[:, None] * normal,
+                axis=1,
+            ).reshape((-1, 3))
+            depths = np.max(
+                np.where(
+                    tangential <= epsilon,
+                    np.maximum(0.0, -signed),
+                    0.0,
+                ),
+                axis=1,
+            )
+            maximum_penetration = max(
+                maximum_penetration, float(np.max(depths, initial=0.0))
+            )
+            boundary = np.flatnonzero(
+                (depths <= 0.0)
+                & (
+                    np.min(robots, axis=(1, 2))
+                    <= np.max(terrain) + epsilon
+                )
+                & (
+                    np.max(robots[:, :, 2], axis=1)
+                    >= terrain_minimum[terrain_index, 2] - epsilon
+                )
+                & (
+                    np.min(robots[:, :, 2], axis=1)
+                    <= terrain_maximum[terrain_index, 2] + epsilon
+                )
+            )
+            for index in boundary:
+                if _triangles_intersect(robots[index], terrain, epsilon):
+                    maximum_penetration = max(maximum_penetration, epsilon)
+        return maximum_penetration
+
     maximum_penetration = 0.0
     robot_minimum = np.min(robot_triangles, axis=1)
     robot_maximum = np.max(robot_triangles, axis=1)
@@ -1024,14 +1502,21 @@ def _triangle_surface_penetration(
             closest = np.asarray(
                 [_closest_point_triangle(vertex, terrain) for vertex in robot]
             )
-            signed = np.sum((robot - closest) * normal, axis=1)
+            delta = robot - closest
+            signed = np.sum(delta * normal, axis=1)
+            tangential = np.linalg.norm(
+                delta - signed[:, None] * normal, axis=1
+            )
             intersects = _triangles_intersect(robot, terrain, epsilon)
-            if intersects or float(np.min(signed)) < 0.0:
+            interior_depth = np.max(
+                np.where(tangential <= epsilon, np.maximum(0.0, -signed), 0.0)
+            )
+            if intersects or interior_depth > 0.0:
                 maximum_penetration = max(
                     maximum_penetration,
                     max(
                         epsilon if intersects else 0.0,
-                        float(max(0.0, -np.min(signed))),
+                        float(interior_depth),
                     ),
                 )
     return maximum_penetration
@@ -1045,27 +1530,34 @@ def _sphere_surface_penetration(
     terrain_minimum: np.ndarray,
     terrain_maximum: np.ndarray,
     epsilon: float,
+    candidates: np.ndarray | None = None,
 ) -> float:
     minimum = center - radius
     maximum = center + radius
-    candidates = np.flatnonzero(
-        _triangle_candidate_mask(
-            minimum,
-            maximum,
-            terrain_minimum,
-            terrain_maximum,
-            terrain_normals,
-            epsilon,
+    if candidates is None:
+        candidates = np.flatnonzero(
+            _triangle_candidate_mask(
+                minimum,
+                maximum,
+                terrain_minimum,
+                terrain_maximum,
+                terrain_normals,
+                epsilon,
+            )
         )
-    )
     penetration = 0.0
     for index in candidates:
         closest = _closest_point_triangle(center, terrain_triangles[index])
         delta = center - closest
         distance = float(np.linalg.norm(delta))
         signed = float(np.dot(delta, terrain_normals[index]))
+        tangential = float(
+            np.linalg.norm(delta - signed * terrain_normals[index])
+        )
         candidate = (
-            radius + distance if signed < 0.0 else radius - distance
+            radius - signed
+            if signed < 0.0 and tangential <= epsilon
+            else radius - distance
         )
         penetration = max(penetration, candidate)
     return max(0.0, penetration)
@@ -1080,19 +1572,21 @@ def _capsule_surface_penetration(
     terrain_minimum: np.ndarray,
     terrain_maximum: np.ndarray,
     epsilon: float,
+    candidates: np.ndarray | None = None,
 ) -> float:
     minimum = np.minimum(start, end) - radius
     maximum = np.maximum(start, end) + radius
-    candidates = np.flatnonzero(
-        _triangle_candidate_mask(
-            minimum,
-            maximum,
-            terrain_minimum,
-            terrain_maximum,
-            terrain_normals,
-            epsilon,
+    if candidates is None:
+        candidates = np.flatnonzero(
+            _triangle_candidate_mask(
+                minimum,
+                maximum,
+                terrain_minimum,
+                terrain_maximum,
+                terrain_normals,
+                epsilon,
+            )
         )
-    )
     penetration = 0.0
     for index in candidates:
         on_segment, on_triangle = _closest_segment_triangle(
@@ -1101,8 +1595,13 @@ def _capsule_surface_penetration(
         delta = on_segment - on_triangle
         distance = float(np.linalg.norm(delta))
         signed = float(np.dot(delta, terrain_normals[index]))
+        tangential = float(
+            np.linalg.norm(delta - signed * terrain_normals[index])
+        )
         candidate = (
-            radius + distance if signed < 0.0 else radius - distance
+            radius - signed
+            if signed < 0.0 and tangential <= epsilon
+            else radius - distance
         )
         penetration = max(penetration, candidate)
     return max(0.0, penetration)
@@ -1114,6 +1613,8 @@ def _body_penetration(
     registration: _ModelRegistration,
     query: CanonicalMeshQuery,
     thresholds: AuditThresholds,
+    body_position_world: np.ndarray,
+    body_quaternion_world_wxyz: np.ndarray,
 ) -> np.ndarray:
     """Exact per-geom surface collision with deterministic AABB broadphase."""
 
@@ -1122,12 +1623,17 @@ def _body_penetration(
     terrain_normals = np.asarray(query._normals, dtype=np.float64)
     terrain_minimum = np.min(terrain_triangles, axis=1)
     terrain_maximum = np.max(terrain_triangles, axis=1)
+    terrain_topology = _BvhTopology.build(terrain_triangles)
+    terrain_bvh_bounds = terrain_topology.refit(
+        terrain_triangles, upward_normals=terrain_normals
+    )
     for geom in registration.body_geom_ids:
         geom_type = int(model.geom_type[geom])
         body_name = str(model.body(int(model.geom_bodyid[geom])).name)
-        body_index = clip.body_names.index(body_name)
+        body_index = ISAACLAB_BODY_NAMES.index(body_name)
         size = np.asarray(model.geom_size[geom], dtype=np.float64)
         local_triangles: np.ndarray | None = None
+        robot_topology: _BvhTopology | None = None
         if geom_type == 7:
             local_triangles = _mesh_triangles(model, geom)
         elif geom_type == 6:
@@ -1151,12 +1657,8 @@ def _body_penetration(
                 dtype=np.float64,
             )
         for frame in range(clip.frame_count):
-            body_position = np.asarray(
-                clip.body_position_world[frame, body_index]
-            )
-            body_quaternion = np.asarray(
-                clip.body_quaternion_world_wxyz[frame, body_index]
-            )
+            body_position = body_position_world[frame, body_index]
+            body_quaternion = body_quaternion_world_wxyz[frame, body_index]
             geom_position = np.asarray(model.geom_pos[geom])
             geom_quaternion = np.asarray(model.geom_quat[geom])
             if local_triangles is not None:
@@ -1185,6 +1687,16 @@ def _body_penetration(
                     geom_quaternion,
                     local_triangles.reshape((-1, 3)),
                 ).reshape(local_triangles.shape)
+                if robot_topology is None:
+                    robot_topology = _BvhTopology.build(local_triangles)
+                robot_bounds = robot_topology.refit(world)
+                candidate_pairs = _bvh_candidate_pairs_from_topologies(
+                    robot_topology,
+                    robot_bounds,
+                    terrain_topology,
+                    terrain_bvh_bounds,
+                    thresholds.collision_epsilon_m,
+                )
                 penetration = _triangle_surface_penetration(
                     world,
                     terrain_triangles,
@@ -1192,6 +1704,7 @@ def _body_penetration(
                     terrain_minimum,
                     terrain_maximum,
                     thresholds.collision_epsilon_m,
+                    candidate_pairs,
                 )
             elif geom_type == 2:
                 center = _transform_points(
@@ -1209,6 +1722,13 @@ def _body_penetration(
                     terrain_minimum,
                     terrain_maximum,
                     thresholds.collision_epsilon_m,
+                    _bvh_box_candidates(
+                        terrain_topology,
+                        terrain_bvh_bounds,
+                        center - float(size[0]),
+                        center + float(size[0]),
+                        thresholds.collision_epsilon_m,
+                    ),
                 )
             elif geom_type == 3:
                 endpoints = _transform_points(
@@ -1229,6 +1749,15 @@ def _body_penetration(
                     terrain_minimum,
                     terrain_maximum,
                     thresholds.collision_epsilon_m,
+                    _bvh_box_candidates(
+                        terrain_topology,
+                        terrain_bvh_bounds,
+                        np.minimum(endpoints[0], endpoints[1])
+                        - float(size[0]),
+                        np.maximum(endpoints[0], endpoints[1])
+                        + float(size[0]),
+                        thresholds.collision_epsilon_m,
+                    ),
                 )
             else:
                 raise ContractError(
@@ -1383,6 +1912,7 @@ def audit_clip(
             model_sha256=model_hash,
             terrain_sha256=terrain_hash,
         )
+    terrain_hash = _terrain_sha256(query)
 
     frames_count = clip.frame_count
     fps = float(clip.fps)
@@ -1399,6 +1929,7 @@ def audit_clip(
         "stance_skate": thresholds.stance_skate_limit_m,
         "foot_penetration": thresholds.foot_penetration_tolerance_m,
         "body_penetration": thresholds.body_penetration_tolerance_m,
+        "body_fk_mismatch": 1.0,
     }
 
     ranges = np.asarray(model.jnt_range)[
@@ -1468,13 +1999,54 @@ def audit_clip(
     masks["root_plausibility"] = root_excess > 1.0
     values["root_plausibility"] = root_excess
 
+    fk_body_position, fk_body_quaternion = _reconstruct_body_fk(
+        clip, model, registration
+    )
+    body_position_error = np.linalg.norm(
+        np.asarray(clip.body_position_world, dtype=np.float64)
+        - fk_body_position,
+        axis=-1,
+    )
+    quaternion_dot = np.abs(
+        np.sum(
+            np.asarray(
+                clip.body_quaternion_world_wxyz, dtype=np.float64
+            )
+            * fk_body_quaternion,
+            axis=-1,
+        )
+    )
+    body_orientation_error = 2.0 * np.arccos(
+        np.clip(quaternion_dot, 0.0, 1.0)
+    )
+    body_fk_excess = np.maximum(
+        np.max(body_position_error, axis=1)
+        / thresholds.body_fk_position_tolerance_m,
+        np.max(body_orientation_error, axis=1)
+        / thresholds.body_fk_orientation_tolerance_rad,
+    )
+    masks["body_fk_mismatch"] = body_fk_excess > 1.0
+    values["body_fk_mismatch"] = body_fk_excess
+
     support_masks, support_values, _probes = _support_audit(
-        clip, model, registration, query, thresholds
+        clip,
+        model,
+        registration,
+        query,
+        thresholds,
+        fk_body_position,
+        fk_body_quaternion,
     )
     masks.update(support_masks)
     values.update(support_values)
     body_penetration = _body_penetration(
-        clip, model, registration, query, thresholds
+        clip,
+        model,
+        registration,
+        query,
+        thresholds,
+        fk_body_position,
+        fk_body_quaternion,
     )
     masks["body_penetration"] = (
         body_penetration > thresholds.body_penetration_tolerance_m
@@ -1563,6 +2135,7 @@ def audit_clip(
         "stance_skate",
         "foot_penetration",
         "body_penetration",
+        "body_fk_mismatch",
     ):
         reasons.extend(
             _reasons_from_mask(
@@ -1613,6 +2186,12 @@ def audit_clip(
             np.max(values["foot_penetration"])
         ),
         "max_body_penetration_m": float(np.max(body_penetration)),
+        "max_body_fk_position_error_m": float(
+            np.max(body_position_error)
+        ),
+        "max_body_fk_orientation_error_rad": float(
+            np.max(body_orientation_error)
+        ),
     }
     return ClipAudit(
         schema=_SCHEMA,

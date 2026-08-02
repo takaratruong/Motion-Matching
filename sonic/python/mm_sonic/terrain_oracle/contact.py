@@ -293,11 +293,28 @@ class SurfaceQueryResult:
 class CanonicalMeshQuery:
     """Exact world-space triangle closest-point, ray, and normal queries."""
 
+    __slots__ = (
+        "_triangles",
+        "_normals",
+        "_face_indices",
+        "mesh",
+        "mesh_sha256",
+        "source_asset_sha256",
+        "world_from_terrain",
+        "_sealed",
+    )
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if getattr(self, "_sealed", False):
+            raise AttributeError("CanonicalMeshQuery is immutable")
+        object.__setattr__(self, name, value)
+
     def __init__(
         self,
         mesh: CanonicalTerrainMesh,
         world_from_terrain: RigidTransform,
     ) -> None:
+        object.__setattr__(self, "_sealed", False)
         if not isinstance(mesh, CanonicalTerrainMesh):
             raise ContractError(
                 "CanonicalMeshQuery mesh must be a CanonicalTerrainMesh"
@@ -348,18 +365,28 @@ class CanonicalMeshQuery:
         nondegenerate = normal_lengths > _GEOMETRY_EPSILON
         if not np.any(nondegenerate):
             raise ContractError("mesh has no nondegenerate valid triangle")
-        self._triangles = np.ascontiguousarray(triangles[nondegenerate])
-        self._normals = np.ascontiguousarray(
+        cached_triangles = np.ascontiguousarray(
+            triangles[nondegenerate], dtype=np.float64
+        ).copy(order="C")
+        cached_normals = np.ascontiguousarray(
             raw_normals[nondegenerate]
-            / normal_lengths[nondegenerate, None]
-        )
-        self._face_indices = np.ascontiguousarray(
+            / normal_lengths[nondegenerate, None],
+            dtype=np.float64,
+        ).copy(order="C")
+        cached_face_indices = np.ascontiguousarray(
             valid_indices[nondegenerate], dtype=np.int32
-        )
+        ).copy(order="C")
+        cached_triangles.flags.writeable = False
+        cached_normals.flags.writeable = False
+        cached_face_indices.flags.writeable = False
+        self._triangles = cached_triangles
+        self._normals = cached_normals
+        self._face_indices = cached_face_indices
         self.mesh = mesh
         self.mesh_sha256 = mesh_digest(mesh)
         self.source_asset_sha256 = mesh.source_asset_sha256
         self.world_from_terrain = world_from_terrain
+        object.__setattr__(self, "_sealed", True)
 
     @staticmethod
     def _closest_points_for_one(

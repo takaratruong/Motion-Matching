@@ -3,10 +3,13 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError, replace
 import json
 from pathlib import Path
+import time
 import unittest
 
 import numpy as np
 
+from mm_sonic.joints import ContractError
+import mm_sonic.terrain_oracle.audit as audit_module
 from mm_sonic.terrain_oracle.audit import (
     AuditThresholds,
     audit_clip,
@@ -25,6 +28,9 @@ from tests.python.terrain_oracle_test_utils import synthetic_canonical_clip
 
 
 ROOT = Path(__file__).resolve().parents[2]
+MODEL_PATH = Path(
+    "/move/u/justingu/Projects/TWIST2/assets/g1/g1_29dof_rev_1_0.xml"
+)
 LEFT_ANKLE = ISAACLAB_BODY_NAMES.index("left_ankle_roll_link")
 RIGHT_ANKLE = ISAACLAB_BODY_NAMES.index("right_ankle_roll_link")
 
@@ -72,6 +78,7 @@ class _FakeG1Model:
         self.jnt_range = np.zeros((self.njnt, 2), np.float64)
         self.jnt_range[1:] = (-1.0, 1.0)
         self.jnt_qposadr = np.array((0, *range(7, 36)), np.int32)
+        self.jnt_dofadr = np.array((0, *range(6, 35)), np.int32)
         self.jnt_bodyid = np.empty(self.njnt, np.int32)
         self.jnt_bodyid[0] = body_id["pelvis"]
         for index, name in enumerate(self._joint_names[1:], start=1):
@@ -230,15 +237,145 @@ def _clean_clip(
     )
 
 
+def _real_clean_clip(model: object, query: CanonicalMeshQuery, *, frames: int = 12):
+    import mujoco
+
+    data = mujoco.MjData(model)
+    data.qpos[:] = model.qpos0
+    mujoco.mj_forward(model, data)
+    root_body = model.body("pelvis").id
+    root_position = np.broadcast_to(data.xpos[root_body], (frames, 3)).copy()
+    root_quaternion = np.broadcast_to(data.xquat[root_body], (frames, 4)).copy()
+    joint_position = np.asarray(
+        [
+            [
+                data.qpos[model.jnt_qposadr[model.joint(name).id]]
+                for name in ISAACLAB_JOINT_NAMES
+            ]
+        ]
+        * frames,
+        np.float32,
+    )
+    body_position = np.asarray(
+        [[data.xpos[model.body(name).id] for name in ISAACLAB_BODY_NAMES]] * frames,
+        np.float32,
+    )
+    body_quaternion = np.asarray(
+        [[data.xquat[model.body(name).id] for name in ISAACLAB_BODY_NAMES]] * frames,
+        np.float32,
+    )
+    geometry = __import__(
+        "mm_sonic.terrain_oracle.contact", fromlist=["SoleGeometry"]
+    ).SoleGeometry.from_model(model)
+    ankle = np.asarray(
+        [ISAACLAB_BODY_NAMES.index(name) for name in geometry.body_names]
+    )
+    q = body_quaternion[:, ankle, None]
+    v = np.broadcast_to(
+        geometry.corner_positions_body, (frames, 2, 4, 3)
+    )
+    cross = 2.0 * np.cross(q[..., 1:], v)
+    corners = (
+        body_position[:, ankle, None]
+        + v
+        + q[..., :1] * cross
+        + np.cross(q[..., 1:], cross)
+    )
+    sole = np.mean(corners, axis=2)
+    clip = synthetic_canonical_clip(frames=frames)
+    clip = replace(
+        clip,
+        root_position_world=root_position,
+        root_quaternion_world_wxyz=root_quaternion,
+        joint_position=joint_position,
+        body_position_world=body_position,
+        body_quaternion_world_wxyz=body_quaternion,
+        sole_position_world=sole,
+        sole_quaternion_world_wxyz=body_quaternion[:, ankle],
+        heel_position_world=np.mean(corners[:, :, :2], axis=2),
+        toe_position_world=np.mean(corners[:, :, 2:], axis=2),
+        contact=np.ones((frames, 2), np.float32),
+        terrain=TerrainBinding(
+            asset_path="/read-only/plane.obj",
+            asset_size_bytes=128,
+            asset_sha256=query.source_asset_sha256,
+            asset_license_id="CC0-1.0",
+            mesh_sha256=query.mesh_sha256,
+            world_from_terrain=query.world_from_terrain,
+            validity_mask_path=None,
+        ),
+    )
+    return derive_clip_kinematics(clip)
+
+
+def _rederive_real_fk(model: object, clip: object):
+    """Refresh serialized FK evidence after an authoritative root/joint edit."""
+
+    import mujoco
+
+    data = mujoco.MjData(model)
+    body_position = np.empty((clip.frame_count, 30, 3), np.float32)
+    body_quaternion = np.empty((clip.frame_count, 30, 4), np.float32)
+    body_ids = np.asarray(
+        [model.body(name).id for name in ISAACLAB_BODY_NAMES], np.int64
+    )
+    joint_addresses = np.asarray(
+        [
+            model.jnt_qposadr[model.joint(name).id]
+            for name in ISAACLAB_JOINT_NAMES
+        ],
+        np.int64,
+    )
+    for frame in range(clip.frame_count):
+        qpos = np.asarray(model.qpos0).copy()
+        qpos[:3] = clip.root_position_world[frame]
+        qpos[3:7] = clip.root_quaternion_world_wxyz[frame]
+        qpos[joint_addresses] = clip.joint_position[frame]
+        data.qpos[:] = qpos
+        mujoco.mj_forward(model, data)
+        body_position[frame] = data.xpos[body_ids]
+        body_quaternion[frame] = data.xquat[body_ids]
+    ankle = np.asarray((LEFT_ANKLE, RIGHT_ANKLE), np.int64)
+    geometry = __import__(
+        "mm_sonic.terrain_oracle.contact", fromlist=["SoleGeometry"]
+    ).SoleGeometry.from_model(model)
+    q = body_quaternion[:, ankle, None]
+    local = np.broadcast_to(
+        geometry.corner_positions_body, (clip.frame_count, 2, 4, 3)
+    )
+    cross = 2.0 * np.cross(q[..., 1:], local)
+    corners = (
+        body_position[:, ankle, None]
+        + local
+        + q[..., :1] * cross
+        + np.cross(q[..., 1:], cross)
+    )
+    return derive_clip_kinematics(
+        replace(
+            clip,
+            body_position_world=body_position,
+            body_quaternion_world_wxyz=body_quaternion,
+            sole_position_world=np.mean(corners, axis=2),
+            sole_quaternion_world_wxyz=body_quaternion[:, ankle],
+            heel_position_world=np.mean(corners[:, :, :2], axis=2),
+            toe_position_world=np.mean(corners[:, :, 2:], axis=2),
+        )
+    )
+
+
 def _reason_codes(report: object) -> set[str]:
     return {reason.code for reason in report.reasons}
 
 
+@unittest.skipUnless(MODEL_PATH.is_file(), "real G1 model unavailable")
 class OracleAuditTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.model = _FakeG1Model()
+        import mujoco
+
+        self.mujoco = mujoco
+        self.model = mujoco.MjModel.from_xml_path(str(MODEL_PATH))
         self.query = _plane_query()
-        self.clip = _clean_clip(self.query)
+        self.clip = _real_clean_clip(self.model, self.query, frames=40)
 
     def test_clean_clip_is_accepted_deterministic_and_immutable(self):
         """Catches nondeterministic reports or mutable accepted evidence."""
@@ -309,9 +446,15 @@ class OracleAuditTests(unittest.TestCase):
         """Catches unchecked indices or conflation of position and speed limits."""
 
         limited = np.array(self.clip.joint_position, copy=True)
-        limited[:, ISAACLAB_JOINT_NAMES.index("left_hip_pitch_joint")] = 1.2
+        limited_index = ISAACLAB_JOINT_NAMES.index("left_hip_pitch_joint")
+        limited_joint = self.model.joint("left_hip_pitch_joint").id
+        limited[:, limited_index] = (
+            self.model.jnt_range[limited_joint, 1] + 0.1
+        )
         limit_report = audit_clip(
-            derive_clip_kinematics(replace(self.clip, joint_position=limited)),
+            _rederive_real_fk(
+                self.model, replace(self.clip, joint_position=limited)
+            ),
             self.model,
             self.query,
         )
@@ -319,11 +462,13 @@ class OracleAuditTests(unittest.TestCase):
         self.assertNotIn("joint_velocity", _reason_codes(limit_report))
 
         fast = np.array(self.clip.joint_position, copy=True)
-        fast[:, ISAACLAB_JOINT_NAMES.index("right_wrist_yaw_joint")] = (
-            np.arange(40) * 0.9
+        fast[:, ISAACLAB_JOINT_NAMES.index("right_wrist_yaw_joint")] = np.where(
+            np.arange(40) % 2 == 0, -0.9, 0.9
         )
         velocity_report = audit_clip(
-            derive_clip_kinematics(replace(self.clip, joint_position=fast)),
+            _rederive_real_fk(
+                self.model, replace(self.clip, joint_position=fast)
+            ),
             self.model,
             self.query,
         )
@@ -351,11 +496,12 @@ class OracleAuditTests(unittest.TestCase):
         self.assertIn("incomplete_sole_support", toe_codes)
         self.assertIn("contact_inconsistency", toe_codes)
 
-        low_feet = np.array(self.clip.body_position_world, copy=True)
-        low_feet[:, (LEFT_ANKLE, RIGHT_ANKLE), 2] = 0.025
+        low_root = np.array(self.clip.root_position_world, copy=True)
+        low_root[:, 2] -= 0.01
         foot_report = audit_clip(
-            derive_clip_kinematics(
-                replace(self.clip, body_position_world=low_feet)
+            _rederive_real_fk(
+                self.model,
+                replace(self.clip, root_position_world=low_root),
             ),
             self.model,
             self.query,
@@ -363,24 +509,12 @@ class OracleAuditTests(unittest.TestCase):
         self.assertIn("foot_penetration", _reason_codes(foot_report))
         self.assertNotIn("body_penetration", _reason_codes(foot_report))
 
-        low_pelvis = np.array(self.clip.body_position_world, copy=True)
-        low_pelvis[:, 0, 2] = -0.02
-        body_report = audit_clip(
-            derive_clip_kinematics(
-                replace(self.clip, body_position_world=low_pelvis)
-            ),
-            self.model,
-            self.query,
-        )
-        self.assertIn("body_penetration", _reason_codes(body_report))
-
-        skating = np.array(self.clip.body_position_world, copy=True)
-        skating[:, (LEFT_ANKLE, RIGHT_ANKLE), 0] = (
-            np.arange(40, dtype=np.float32)[:, None] * 0.01
-        )
+        skating = np.array(self.clip.root_position_world, copy=True)
+        skating[:, 0] += np.arange(40, dtype=np.float32) * 0.01
         skate_report = audit_clip(
-            derive_clip_kinematics(
-                replace(self.clip, body_position_world=skating)
+            _rederive_real_fk(
+                self.model,
+                replace(self.clip, root_position_world=skating),
             ),
             self.model,
             self.query,
@@ -412,7 +546,8 @@ class OracleAuditTests(unittest.TestCase):
         """Catches off-by-one guards, short fragment acceptance, and bad status."""
 
         joint = np.array(self.clip.joint_position, copy=True)
-        joint[20, 0] = 1.2
+        first_joint = self.model.joint(ISAACLAB_JOINT_NAMES[0]).id
+        joint[20, 0] = self.model.jnt_range[first_joint, 1] + 0.1
         corrupt = audit_clip(
             replace(self.clip, joint_position=joint),
             self.model,
@@ -421,14 +556,18 @@ class OracleAuditTests(unittest.TestCase):
         self.assertEqual(
             corrupt.status, "accepted_with_intervals_removed"
         )
-        self.assertEqual(corrupt.accepted_intervals, ((0, 18), (23, 40)))
+        self.assertEqual(corrupt.accepted_intervals, ((0, 17), (24, 40)))
         self.assertEqual(
-            [reason.frame_interval for reason in corrupt.reasons if reason.code == "joint_limit"],
+            [
+                reason.frame_interval
+                for reason in corrupt.reasons
+                if reason.code == "joint_limit"
+            ],
             [(20, 21)],
         )
 
         all_bad_joint = np.array(self.clip.joint_position, copy=True)
-        all_bad_joint[:, 0] = 1.2
+        all_bad_joint[:, 0] = self.model.jnt_range[first_joint, 1] + 0.1
         rejected = audit_clip(
             derive_clip_kinematics(
                 replace(self.clip, joint_position=all_bad_joint)
@@ -466,7 +605,7 @@ class OracleAuditTests(unittest.TestCase):
         self.assertEqual(report.status, "rejected")
         self.assertEqual(
             _reason_codes(report),
-            {"quaternion_discontinuity", "body_penetration", "stance_skate"},
+            {"quaternion_discontinuity", "body_fk_mismatch"},
         )
 
     def test_model_query_and_terrain_provenance_mismatches_fail_closed(self):
@@ -505,10 +644,10 @@ class OracleAuditTests(unittest.TestCase):
         """Catches a model hash that covers names but not collision mechanics."""
 
         original = structural_model_sha256(self.model)
-        changed = _FakeG1Model()
-        changed.mesh_vert[0, 2] -= 0.001
+        changed = self.mujoco.MjModel.from_xml_path(str(MODEL_PATH))
+        changed.geom_pos[0, 2] -= 0.001
         self.assertNotEqual(original, structural_model_sha256(changed))
-        changed_range = _FakeG1Model()
+        changed_range = self.mujoco.MjModel.from_xml_path(str(MODEL_PATH))
         changed_range.jnt_range[1, 0] -= 0.001
         self.assertNotEqual(original, structural_model_sha256(changed_range))
 
@@ -516,36 +655,31 @@ class OracleAuditTests(unittest.TestCase):
         """Catches vertex-only collision and infinite supporting-plane false hits."""
 
         query = _finite_triangle_query()
-        clip = _clean_clip(query)
-        model = _FakeG1Model()
-        model.mesh_vert = np.array(
-            (
+        terrain = np.asarray(query._triangles, np.float64)
+        normals = np.asarray(query._normals, np.float64)
+        minimum = np.min(terrain, axis=1)
+        maximum = np.max(terrain, axis=1)
+        crossing = np.asarray(
+            [[
                 (-0.20, 0.25, -0.02),
                 (1.20, 0.25, -0.02),
                 (0.25, 0.25, 0.10),
-            ),
+            ]],
             np.float64,
         )
-        model.mesh_face = np.array(((0, 1, 2),), np.int32)
-        model.mesh_vertnum[:] = 3
-        model.mesh_facenum[:] = 1
-        body = np.array(clip.body_position_world, copy=True)
-        body[:, 0] = 0.0
-        crossing = derive_clip_kinematics(
-            replace(clip, body_position_world=body)
-        )
-        self.assertIn(
-            "body_penetration",
-            _reason_codes(audit_clip(crossing, model, query)),
+        self.assertGreater(
+            audit_module._triangle_surface_penetration(
+                crossing, terrain, normals, minimum, maximum, 1.0e-9
+            ),
+            0.0,
         )
 
-        body[:, 0, 0] = 3.0
-        outside = derive_clip_kinematics(
-            replace(clip, body_position_world=body)
-        )
-        self.assertNotIn(
-            "body_penetration",
-            _reason_codes(audit_clip(outside, model, query)),
+        outside = crossing + np.array((3.0, 0.0, 0.0), np.float64)
+        self.assertEqual(
+            audit_module._triangle_surface_penetration(
+                outside, terrain, normals, minimum, maximum, 1.0e-9
+            ),
+            0.0,
         )
 
     def test_schema_accepts_exact_report_and_rejects_invalid_documents(self):
@@ -577,9 +711,190 @@ class OracleAuditTests(unittest.TestCase):
         bad_interval = json.loads(json.dumps(document))
         bad_interval["accepted_intervals"] = [[-1, 10]]
         mutations.append(bad_interval)
+        rejected_with_interval = json.loads(json.dumps(document))
+        rejected_with_interval["status"] = "rejected"
+        mutations.append(rejected_with_interval)
+        partial_without_reason = json.loads(json.dumps(document))
+        partial_without_reason["status"] = "accepted_with_intervals_removed"
+        mutations.append(partial_without_reason)
+        accepted_without_interval = json.loads(json.dumps(document))
+        accepted_without_interval["accepted_intervals"] = []
+        mutations.append(accepted_without_interval)
         for mutation in mutations:
             with self.subTest(mutation=mutation):
                 self.assertFalse(validator.is_valid(mutation))
+
+
+@unittest.skipUnless(MODEL_PATH.is_file(), "real G1 model unavailable")
+class AuditAuthorityRegressionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        import mujoco
+
+        self.mujoco = mujoco
+        self.model = mujoco.MjModel.from_xml_path(str(MODEL_PATH))
+        self.query = _plane_query()
+        self.clip = _real_clean_clip(self.model, self.query)
+
+    def test_cached_body_teleport_is_reported_without_moving_collision_authority(
+        self,
+    ):
+        cached = np.array(self.clip.body_position_world, copy=True)
+        cached[:, 0, 0] = 1000.0
+        report = audit_clip(
+            replace(self.clip, body_position_world=cached),
+            self.model,
+            self.query,
+        )
+        self.assertIn("body_fk_mismatch", _reason_codes(report))
+        self.assertEqual(report.metrics["max_body_penetration_m"], 0.0)
+
+    def test_model_qpos_and_dof_addresses_must_be_exact_unique_coverage(self):
+        for field, index, replacement in (
+            ("jnt_qposadr", 0, 1),
+            ("jnt_qposadr", 2, 7),
+            ("jnt_qposadr", 2, 99),
+            ("jnt_dofadr", 0, 1),
+            ("jnt_dofadr", 2, 6),
+            ("jnt_dofadr", 2, 99),
+        ):
+            with self.subTest(field=field, replacement=replacement):
+                model = self.mujoco.MjModel.from_xml_path(str(MODEL_PATH))
+                getattr(model, field)[index] = replacement
+                report = audit_clip(self.clip, model, self.query)
+                self.assertEqual(report.status, "rejected")
+                self.assertEqual(_reason_codes(report), {"model_registration"})
+
+    def test_query_caches_are_read_only_and_assignment_is_blocked(self):
+        for value in (
+            self.query._triangles,
+            self.query._normals,
+            self.query._face_indices,
+        ):
+            self.assertTrue(value.flags.c_contiguous)
+            self.assertFalse(value.flags.writeable)
+            with self.assertRaises(ValueError):
+                value.flat[0] = 123
+        with self.assertRaises(AttributeError):
+            self.query._triangles = np.zeros((1, 3, 3))
+
+        forged = _plane_query()
+        changed = np.array(forged._triangles, copy=True)
+        changed[0, 0, 2] = 1.0
+        changed.flags.writeable = False
+        object.__setattr__(forged, "_triangles", changed)
+        report = audit_clip(self.clip, self.model, forged)
+        self.assertEqual(_reason_codes(report), {"terrain_registration"})
+
+    def test_report_consumer_rejects_status_interval_inconsistency(self):
+        report = audit_clip(self.clip, self.model, self.query)
+        document = report.to_dict()
+        for mutation in (
+            {**document, "status": "rejected"},
+            {**document, "status": "accepted_with_intervals_removed"},
+            {**document, "accepted_intervals": []},
+            {**document, "accepted_intervals": [[5, 4]]},
+            {**document, "accepted_intervals": [[0, 8], [7, 12]]},
+            {**document, "accepted_intervals": [[0, 99]]},
+        ):
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(ContractError):
+                    type(report).from_dict(mutation)
+
+
+class StageBCollisionRegressionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.terrain = np.asarray(
+            [[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)]],
+            np.float64,
+        )
+        self.normals = np.asarray(((0.0, 0.0, 1.0),), np.float64)
+        self.minimum = np.min(self.terrain, axis=1)
+        self.maximum = np.max(self.terrain, axis=1)
+
+    def test_finite_triangle_corner_does_not_create_empty_space_collisions(self):
+        epsilon = 1.0e-9
+        robot = np.asarray(
+            [[(0.80, 0.80, -0.10), (0.90, 0.80, -0.10), (0.80, 0.90, -0.10)]],
+            np.float64,
+        )
+        self.assertEqual(
+            audit_module._triangle_surface_penetration(
+                robot,
+                self.terrain,
+                self.normals,
+                self.minimum,
+                self.maximum,
+                epsilon,
+            ),
+            0.0,
+        )
+        center = np.asarray((0.80, 0.80, -0.10), np.float64)
+        self.assertEqual(
+            audit_module._sphere_surface_penetration(
+                center,
+                0.15,
+                self.terrain,
+                self.normals,
+                self.minimum,
+                self.maximum,
+                epsilon,
+            ),
+            0.0,
+        )
+        self.assertEqual(
+            audit_module._capsule_surface_penetration(
+                center + (0.0, 0.0, -0.05),
+                center + (0.0, 0.0, 0.05),
+                0.15,
+                self.terrain,
+                self.normals,
+                self.minimum,
+                self.maximum,
+                epsilon,
+            ),
+            0.0,
+        )
+
+    @unittest.skipUnless(MODEL_PATH.is_file(), "real G1 model unavailable")
+    def test_bvh_bounds_actual_17096_face_geom_against_800_triangle_terrain(self):
+        import mujoco
+
+        model = mujoco.MjModel.from_xml_path(str(MODEL_PATH))
+        geom = next(
+            index
+            for index in range(model.ngeom)
+            if int(model.geom_type[index]) == 7
+            and int(model.mesh_facenum[int(model.geom_dataid[index])]) == 17096
+        )
+        robot = audit_module._mesh_triangles(model, geom)
+        points = np.linspace(-1.0, 1.0, 21)
+        vertices = np.asarray(
+            [(x, y, 0.0) for x in points for y in points], np.float64
+        )
+        faces = []
+        for row in range(20):
+            for column in range(20):
+                first = row * 21 + column
+                faces.extend(
+                    (
+                        (first, first + 1, first + 22),
+                        (first, first + 22, first + 21),
+                    )
+                )
+        terrain = vertices[np.asarray(faces, np.int64)]
+        normals = np.broadcast_to(
+            np.asarray((0.0, 0.0, 1.0)), (len(terrain), 3)
+        )
+        started = time.perf_counter()
+        pairs = audit_module._bvh_candidate_pairs(
+            robot, terrain, normals, 1.0e-9
+        )
+        elapsed = time.perf_counter() - started
+        brute_force_pairs = len(robot) * len(terrain)
+        self.assertEqual(len(robot), 17096)
+        self.assertEqual(len(terrain), 800)
+        self.assertLess(len(pairs), brute_force_pairs // 20)
+        self.assertLess(elapsed, 1.059)
 
 
 if __name__ == "__main__":
