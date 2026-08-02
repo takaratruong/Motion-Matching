@@ -37,13 +37,20 @@ def skill_entry_eligibility(
         raise ContractError("terrain skill search requires a TerrainSkillInventory")
     row_count = int(database._search_features.shape[0])
     eligible = torch.zeros(row_count, dtype=torch.bool, device=database.device)
-    for skill in inventory.skills:
-        for row in skill.entry_rows:
-            if type(row) is not int or not 0 <= row < row_count:
-                raise ContractError("terrain skill entry row is outside database")
-            if inventory.row_to_skill.get(row) != skill.skill_index:
-                raise ContractError("terrain skill row mapping is inconsistent")
-            eligible[row] = True
+    items = tuple(inventory.row_to_skill.items())
+    if not items:
+        return eligible
+    rows = torch.tensor(
+        [row for row, _ in items], dtype=torch.long, device=database.device
+    )
+    owners = torch.tensor(
+        [owner for _, owner in items], dtype=torch.long, device=database.device
+    )
+    if bool(((rows < 0) | (rows >= row_count)).any().item()):
+        raise ContractError("terrain skill entry row is outside database")
+    if bool(((owners < 0) | (owners >= len(inventory.skills))).any().item()):
+        raise ContractError("terrain skill row mapping is inconsistent")
+    eligible[rows] = True
     return eligible
 
 

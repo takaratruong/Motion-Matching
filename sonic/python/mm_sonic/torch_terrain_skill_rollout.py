@@ -257,7 +257,9 @@ class TerrainSkillMatcher:
             self._build_intent_rows()
         )
 
-    def _build_intent_rows(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def _build_intent_rows(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         row_count = self.database.feature_shape[0]
         travel = torch.full(
             (row_count, 2), float("nan"), device=self.database.device
