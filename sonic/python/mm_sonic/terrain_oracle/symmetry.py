@@ -79,6 +79,11 @@ def _mirrored_identity(clip: CanonicalClip) -> tuple[str, str | None]:
                 "with mirror_of provenance"
             )
         return f"{clip.clip_id}{_MIRROR_SUFFIX}", clip.clip_id
+    if clip.mirror_of.endswith(_MIRROR_SUFFIX):
+        raise ContractError(
+            f"mirror_of suffix {_MIRROR_SUFFIX!r} is reserved; "
+            "nested mirror lineage is not permitted"
+        )
     if clip.mirror_of == clip.clip_id:
         raise ContractError("cyclic mirror_of provenance is not permitted")
     if clip.clip_id != f"{clip.mirror_of}{_MIRROR_SUFFIX}":

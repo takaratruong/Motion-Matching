@@ -531,6 +531,20 @@ class CanonicalClipSymmetryTests(unittest.TestCase):
             with self.subTest(clip_id=reserved_id):
                 with self.assertRaisesRegex(ContractError, "reserved"):
                     mirror_clip(replace(original, clip_id=reserved_id))
+        for nested_source in (
+            "walk__mirror",
+            "walk__mirror__mirror",
+            "walk__mirror__mirror__mirror",
+        ):
+            with self.subTest(mirror_of=nested_source):
+                with self.assertRaisesRegex(ContractError, "reserved"):
+                    mirror_clip(
+                        replace(
+                            original,
+                            clip_id=f"{nested_source}__mirror",
+                            mirror_of=nested_source,
+                        )
+                    )
         generated = mirror_clip(original)
         _assert_values_exact(
             self, mirror_clip(generated), original, "valid tagged round trip"
