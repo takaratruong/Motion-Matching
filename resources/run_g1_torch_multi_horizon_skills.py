@@ -73,6 +73,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Smooth clearance over liftoff, swing, and touchdown.",
     )
     parser.add_argument(
+        "--swing-plan-include-touchdown",
+        action="store_true",
+        help="Include the first supported landing frame in swing preview.",
+    )
+    parser.add_argument(
         "--ablation",
         choices=(
             "combined",
@@ -215,6 +220,7 @@ def main(argv: list[str] | None = None) -> int:
         foot_correction_halflife_s=args.foot_correction_halflife_s,
         swing_plan_sigma_frames=args.swing_plan_sigma_frames,
         swing_plan_full_interval=args.swing_plan_full_interval,
+        swing_plan_include_touchdown=args.swing_plan_include_touchdown,
     )
     save_horizon_matrix(matrix, events, args.output)
     execution_completed = all(
@@ -234,6 +240,9 @@ def main(argv: list[str] | None = None) -> int:
                 "foot_correction_halflife_s": args.foot_correction_halflife_s,
                 "swing_plan_sigma_frames": args.swing_plan_sigma_frames,
                 "swing_plan_full_interval": args.swing_plan_full_interval,
+                "swing_plan_include_touchdown": (
+                    args.swing_plan_include_touchdown
+                ),
                 "deterministic_sha256": matrix.deterministic_sha256,
                 "output": args.output,
             },
