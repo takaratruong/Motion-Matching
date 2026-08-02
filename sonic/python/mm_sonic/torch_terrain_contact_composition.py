@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 
+import numpy as np
 import torch
 
 from .torch_contact_oracle_actions import ContactPhaseAction
@@ -122,6 +123,51 @@ class ContactTargetTrajectory:
             self,
             "swing_warp_weight",
             self.swing_warp_weight.detach().clone(),
+        )
+
+
+@dataclass(frozen=True)
+class ContactProjectionResult:
+    joint_position: torch.Tensor
+    foot_position_world: torch.Tensor
+    maximum_target_error_m: float
+    maximum_joint_deformation_rad: float
+    rms_joint_deformation_rad: float
+
+    def __post_init__(self) -> None:
+        joints = self.joint_position
+        if (
+            not isinstance(joints, torch.Tensor)
+            or joints.ndim != 2
+            or tuple(joints.shape[1:]) != (29,)
+            or not joints.dtype.is_floating_point
+            or not torch.isfinite(joints).all()
+            or not isinstance(self.foot_position_world, torch.Tensor)
+            or tuple(self.foot_position_world.shape) != (joints.shape[0], 2, 3)
+            or self.foot_position_world.dtype != joints.dtype
+            or self.foot_position_world.device != joints.device
+            or not torch.isfinite(self.foot_position_world).all()
+        ):
+            raise ValueError("contact projection output is invalid")
+        for name in (
+            "maximum_target_error_m",
+            "maximum_joint_deformation_rad",
+            "rms_joint_deformation_rad",
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) < 0.0
+            ):
+                raise ValueError("contact projection metrics are invalid")
+            object.__setattr__(self, name, float(value))
+        object.__setattr__(self, "joint_position", joints.detach().clone())
+        object.__setattr__(
+            self,
+            "foot_position_world",
+            self.foot_position_world.detach().clone(),
         )
 
 
@@ -288,4 +334,105 @@ def build_contact_target_trajectory(
         position_world=targets,
         solve_mask=solve,
         swing_warp_weight=weights,
+    )
+
+
+def project_contact_trajectory(
+    *,
+    joint_position: torch.Tensor,
+    root_position_world: torch.Tensor,
+    root_orientation_world_wxyz: torch.Tensor,
+    targets: ContactTargetTrajectory,
+    foot_kinematics: object,
+) -> ContactProjectionResult:
+    """Project selected feet onto contact targets while holding the root fixed."""
+
+    joints = joint_position
+    if (
+        not isinstance(joints, torch.Tensor)
+        or joints.ndim != 2
+        or tuple(joints.shape[1:]) != (29,)
+        or joints.shape[0] < 2
+        or not joints.dtype.is_floating_point
+        or not torch.isfinite(joints).all()
+        or not isinstance(root_position_world, torch.Tensor)
+        or tuple(root_position_world.shape) != (joints.shape[0], 3)
+        or root_position_world.dtype != joints.dtype
+        or root_position_world.device != joints.device
+        or not torch.isfinite(root_position_world).all()
+        or not isinstance(root_orientation_world_wxyz, torch.Tensor)
+        or tuple(root_orientation_world_wxyz.shape) != (joints.shape[0], 4)
+        or root_orientation_world_wxyz.dtype != joints.dtype
+        or root_orientation_world_wxyz.device != joints.device
+        or not torch.isfinite(root_orientation_world_wxyz).all()
+        or not isinstance(targets, ContactTargetTrajectory)
+        or targets.position_world.dtype != joints.dtype
+        or targets.position_world.device != joints.device
+        or targets.position_world.shape[0] != joints.shape[0]
+    ):
+        raise ValueError("contact projection inputs are invalid")
+    solve = getattr(foot_kinematics, "solve_leg_positions", None)
+    forward = getattr(foot_kinematics, "foot_positions", None)
+    if not callable(solve) or not callable(forward):
+        raise ValueError("contact projection foot kinematics is invalid")
+
+    source = joints.detach().cpu().numpy()
+    roots = root_position_world.detach().cpu().numpy()
+    quaternions = root_orientation_world_wxyz.detach().cpu().numpy()
+    masks = targets.solve_mask.detach().cpu().numpy()
+    target_feet = targets.position_world.detach().cpu().numpy()
+    projected = np.array(source, dtype=np.float64, copy=True)
+    for frame in range(joints.shape[0]):
+        if not bool(masks[frame].any()):
+            continue
+        try:
+            solved = np.asarray(
+                solve(
+                    projected[frame],
+                    roots[frame],
+                    quaternions[frame],
+                    masks[frame],
+                    target_feet[frame],
+                ),
+                dtype=np.float64,
+            )
+        except Exception as error:
+            raise ValueError(
+                f"contact projection failed at frame {frame}"
+            ) from error
+        if solved.shape != (29,) or not np.isfinite(solved).all():
+            raise ValueError(
+                f"contact projection returned invalid joints at frame {frame}"
+            )
+        projected[frame] = solved
+
+    try:
+        feet = np.asarray(
+            forward(projected, roots, quaternions),
+            dtype=np.float64,
+        )
+    except Exception as error:
+        raise ValueError("contact projection forward kinematics failed") from error
+    if feet.shape != (joints.shape[0], 2, 3) or not np.isfinite(feet).all():
+        raise ValueError("contact projection forward kinematics returned invalid feet")
+    selected_error = np.linalg.norm(feet - target_feet, axis=2)[masks]
+    deformation = projected - source
+    result_joints = torch.as_tensor(
+        projected,
+        dtype=joints.dtype,
+        device=joints.device,
+    )
+    result_feet = torch.as_tensor(
+        feet,
+        dtype=joints.dtype,
+        device=joints.device,
+    )
+    return ContactProjectionResult(
+        joint_position=result_joints,
+        foot_position_world=result_feet,
+        maximum_target_error_m=(
+            float(selected_error.max()) if selected_error.size else 0.0
+        ),
+        maximum_joint_deformation_rad=float(np.abs(deformation).max()),
+        rms_joint_deformation_rad=float(np.sqrt(np.mean(np.square(deformation)))),
     )

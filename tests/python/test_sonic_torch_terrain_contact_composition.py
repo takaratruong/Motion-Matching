@@ -6,8 +6,10 @@ import torch
 from mm_sonic.torch_contact_oracle_actions import ContactPhaseAction
 from mm_sonic.torch_contact_oracle_search import OracleState, place_action
 from mm_sonic.torch_terrain_contact_composition import (
+    ContactTargetTrajectory,
     build_contact_target_trajectory,
     place_action_contact_anchored,
+    project_contact_trajectory,
 )
 
 
@@ -56,6 +58,29 @@ def _state(feet, support=(True, False), yaw=0.0):
         joint_velocity=torch.zeros(29),
         route_frame=0,
     )
+
+
+class _LinearFootKinematics:
+    def foot_positions(self, joints, roots, quaternions):
+        del quaternions
+        feet = torch.as_tensor(joints)[:, :6].reshape(-1, 2, 3)
+        return (feet + torch.as_tensor(roots)[:, None, :]).numpy()
+
+    def solve_leg_positions(self, joints, root, quaternion, mask, targets):
+        del quaternion
+        output = torch.as_tensor(joints).clone()
+        for foot in range(2):
+            if mask[foot]:
+                output[foot * 3 : foot * 3 + 3] = torch.as_tensor(
+                    targets[foot] - root
+                )
+        return output.numpy()
+
+
+class _FailingFootKinematics(_LinearFootKinematics):
+    def solve_leg_positions(self, joints, root, quaternion, mask, targets):
+        del joints, root, quaternion, mask, targets
+        raise RuntimeError("unreachable")
 
 
 class TerrainContactCompositionTests(unittest.TestCase):
@@ -211,6 +236,78 @@ class TerrainContactCompositionTests(unittest.TestCase):
         torch.testing.assert_close(
             targets.position_world[2:, 1], landing.expand(2, 3)
         )
+
+    def test_contact_projection_hits_every_selected_target(self):
+        joints = torch.zeros((3, 29))
+        roots = torch.tensor(((1.0, 2.0, 0.5),) * 3)
+        quaternions = torch.tensor(((1.0, 0.0, 0.0, 0.0),) * 3)
+        positions = torch.tensor(
+            (
+                ((1.1, 2.1, 0.0), (0.9, 1.9, 0.1)),
+                ((1.2, 2.1, 0.0), (0.8, 1.9, 0.2)),
+                ((1.3, 2.1, 0.0), (0.7, 1.9, 0.0)),
+            )
+        )
+        targets = ContactTargetTrajectory(
+            position_world=positions,
+            solve_mask=torch.ones((3, 2), dtype=torch.bool),
+            swing_warp_weight=torch.tensor((0.0, 0.5, 1.0)),
+        )
+
+        projected = project_contact_trajectory(
+            joint_position=joints,
+            root_position_world=roots,
+            root_orientation_world_wxyz=quaternions,
+            targets=targets,
+            foot_kinematics=_LinearFootKinematics(),
+        )
+
+        torch.testing.assert_close(projected.foot_position_world, positions)
+        self.assertAlmostEqual(projected.maximum_target_error_m, 0.0, places=6)
+        self.assertGreater(projected.maximum_joint_deformation_rad, 0.0)
+
+    def test_contact_projection_preserves_unselected_leg(self):
+        joints = torch.zeros((2, 29))
+        joints[:, 3:6] = torch.tensor((0.2, -0.1, 0.3))
+        roots = torch.zeros((2, 3))
+        quaternions = torch.tensor(((1.0, 0.0, 0.0, 0.0),) * 2)
+        targets = ContactTargetTrajectory(
+            position_world=torch.tensor(
+                (
+                    ((0.1, 0.2, 0.3), (9.0, 9.0, 9.0)),
+                    ((0.2, 0.3, 0.4), (9.0, 9.0, 9.0)),
+                )
+            ),
+            solve_mask=torch.tensor(((True, False), (True, False))),
+            swing_warp_weight=torch.zeros(2),
+        )
+
+        projected = project_contact_trajectory(
+            joint_position=joints,
+            root_position_world=roots,
+            root_orientation_world_wxyz=quaternions,
+            targets=targets,
+            foot_kinematics=_LinearFootKinematics(),
+        )
+
+        torch.testing.assert_close(projected.joint_position[:, 3:6], joints[:, 3:6])
+
+    def test_contact_projection_fails_closed_on_unreachable_target(self):
+        targets = ContactTargetTrajectory(
+            position_world=torch.zeros((2, 2, 3)),
+            solve_mask=torch.ones((2, 2), dtype=torch.bool),
+            swing_warp_weight=torch.zeros(2),
+        )
+        with self.assertRaisesRegex(ValueError, "frame 0"):
+            project_contact_trajectory(
+                joint_position=torch.zeros((2, 29)),
+                root_position_world=torch.zeros((2, 3)),
+                root_orientation_world_wxyz=torch.tensor(
+                    ((1.0, 0.0, 0.0, 0.0),) * 2
+                ),
+                targets=targets,
+                foot_kinematics=_FailingFootKinematics(),
+            )
 
 
 if __name__ == "__main__":
