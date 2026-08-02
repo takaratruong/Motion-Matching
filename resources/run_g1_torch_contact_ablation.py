@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""Run the offline G1 terrain contact-composition ablation."""
+
+from __future__ import annotations
+
+import argparse
+import json
+
+from mm_sonic.torch_terrain_contact_ablation import run_contact_ablation
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", required=True)
+    parser.add_argument("--terrain-config", required=True)
+    parser.add_argument("--oracle-config", required=True)
+    parser.add_argument("--g1-xml", required=True)
+    parser.add_argument("--baseline-artifacts", required=True)
+    parser.add_argument("--quality-oracle-artifacts", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--device", required=True)
+    parser.add_argument("--max-actions-per-state", required=True, type=int)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    result = run_contact_ablation(
+        dataset=args.dataset,
+        terrain_config=args.terrain_config,
+        oracle_config=args.oracle_config,
+        g1_xml=args.g1_xml,
+        baseline_artifacts=args.baseline_artifacts,
+        quality_oracle_artifacts=args.quality_oracle_artifacts,
+        output=args.output,
+        device=args.device,
+        maximum_actions_per_state=args.max_actions_per_state,
+    )
+    print(json.dumps(result, sort_keys=True), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
