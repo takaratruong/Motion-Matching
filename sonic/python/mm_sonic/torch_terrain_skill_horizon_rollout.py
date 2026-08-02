@@ -104,6 +104,48 @@ def terrain_height_targets(
     )
 
 
+def contact_cycle_context(
+    support_mask: torch.Tensor, source_frame: int
+) -> tuple[tuple[bool, bool] | None, tuple[bool, bool] | None]:
+    """Return the nearest non-double-support states around one source frame.
+
+    Double support alone does not identify gait phase.  The preceding support
+    state identifies the foot that just landed and the following state
+    identifies the foot that should swing next.
+    """
+
+    if (
+        not isinstance(support_mask, torch.Tensor)
+        or support_mask.dtype != torch.bool
+        or support_mask.ndim != 2
+        or support_mask.shape[1] != 2
+        or type(source_frame) is not int
+        or not 0 <= source_frame < int(support_mask.shape[0])
+    ):
+        raise ContractError("contact cycle context input is invalid")
+
+    def state(frame: int) -> tuple[bool, bool]:
+        return tuple(bool(value) for value in support_mask[frame].tolist())
+
+    previous = next(
+        (
+            state(frame)
+            for frame in range(source_frame - 1, -1, -1)
+            if not bool(support_mask[frame].all().item())
+        ),
+        None,
+    )
+    following = next(
+        (
+            state(frame)
+            for frame in range(source_frame + 1, len(support_mask))
+            if not bool(support_mask[frame].all().item())
+        ),
+        None,
+    )
+    return previous, following
+
+
 class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
     """Use local outcome ranking while preserving transactional frame playback."""
 
@@ -121,6 +163,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         terrain_tolerance_m: float = 0.06,
         result_filter: Any | None = None,
         contact_phase_gate: bool = False,
+        contact_cycle_gate: bool = False,
     ) -> None:
         self.base = base_matcher
         self.database = base_matcher.database
@@ -141,6 +184,11 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         if type(contact_phase_gate) is not bool:
             raise ContractError("contact phase gate must be boolean")
         self.contact_phase_gate = contact_phase_gate
+        if type(contact_cycle_gate) is not bool:
+            raise ContractError("contact cycle gate must be boolean")
+        if contact_cycle_gate and not contact_phase_gate:
+            raise ContractError("contact cycle gate requires contact phase gate")
+        self.contact_cycle_gate = contact_cycle_gate
         self._clip_path_to_index = {
             clip.relative_path: index
             for index, clip in enumerate(dataset.folder.clips)
@@ -225,6 +273,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             current_frame = self.base._state.frame_index
 
         current_support = None
+        current_context = None
         if self.contact_phase_gate:
             current_path = str(result.diagnostics.selected_clip_path)
             source_clip = self._clip_path_to_index.get(current_path)
@@ -234,6 +283,10 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                 support_profile
             ):
                 current_support = support_profile[source_frame]
+                if self.contact_cycle_gate:
+                    current_context = contact_cycle_context(
+                        support_profile, source_frame
+                    )
 
         def compatible(
             record: int,
@@ -241,6 +294,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             endpoint: int,
             *,
             require_phase: bool,
+            require_cycle: bool,
         ) -> bool:
             skill_index = int(self.horizon_inventory.skill_index[record].item())
             skill = self.inventory.skills[skill_index]
@@ -252,6 +306,17 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                     current_support, skill.support_mask[entry_frame]
                 ):
                     return False
+                if require_cycle and current_context is not None:
+                    candidate_context = contact_cycle_context(
+                        skill.support_mask, entry_frame
+                    )
+                    if any(
+                        expected is not None and actual != expected
+                        for expected, actual in zip(
+                            current_context, candidate_context
+                        )
+                    ):
+                        return False
             return terrain_skill_compatible(
                 skill=skill,
                 canonical_entry_row=row,
@@ -264,7 +329,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                 playback_stop=endpoint,
             )
 
-        def select(*, require_phase: bool):
+        def select(*, require_phase: bool, require_cycle: bool = False):
             return select_horizon_candidate(
                 self.database,
                 self.horizon_inventory,
@@ -275,6 +340,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                     row,
                     endpoint,
                     require_phase=require_phase,
+                    require_cycle=require_cycle,
                 ),
                 config=self.search_config,
                 current_clip_index=current_clip,
@@ -283,11 +349,21 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             )
 
         try:
-            selected = select(require_phase=current_support is not None)
+            selected = select(
+                require_phase=current_support is not None,
+                require_cycle=(
+                    current_support is not None
+                    and current_context is not None
+                    and any(value is not None for value in current_context)
+                ),
+            )
         except HorizonSearchFailure:
             if current_support is None:
                 raise
-            selected = select(require_phase=False)
+            try:
+                selected = select(require_phase=True)
+            except HorizonSearchFailure:
+                selected = select(require_phase=False)
         skill_index = int(
             self.horizon_inventory.skill_index[selected.record_index].item()
         )
@@ -363,6 +439,7 @@ def run_resolved_horizon_matrix(
     search_config: HorizonSearchConfig = HorizonSearchConfig(),
     foot_lock: bool = False,
     contact_phase_gate: bool = False,
+    contact_cycle_gate: bool = False,
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
@@ -479,6 +556,7 @@ def run_resolved_horizon_matrix(
                 else ":reactive-clearance"
             )
             + (":phase-gate-v1" if contact_phase_gate else ":implicit-phase")
+            + (":cycle-gate-v1" if contact_cycle_gate else ":implicit-cycle")
         ).encode()
     ).hexdigest()
 
@@ -495,6 +573,7 @@ def run_resolved_horizon_matrix(
             terrain_tolerance_m=terrain_tolerance_m,
             result_filter=result_filter,
             contact_phase_gate=contact_phase_gate,
+            contact_cycle_gate=contact_cycle_gate,
         )
         route_matchers[route.name] = matcher
         return matcher

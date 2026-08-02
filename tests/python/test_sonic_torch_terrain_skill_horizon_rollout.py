@@ -8,6 +8,7 @@ from mm_sonic.torch_motion_features import FeatureNormalization, TorchMotionData
 from mm_sonic.torch_motion_matcher import MatcherConfig
 from mm_sonic.torch_terrain_skill_horizon_rollout import (
     TerrainSkillHorizonMatcher,
+    contact_cycle_context,
     terrain_height_targets,
 )
 from mm_sonic.torch_terrain_skill_horizon_search import HorizonTargets
@@ -138,6 +139,30 @@ def _transactional_fixture(*, result_filter=None, contact_phase_gate=False):
 
 
 class TerrainSkillHorizonRolloutTest(unittest.TestCase):
+    def test_contact_cycle_context_disambiguates_double_support(self):
+        support = torch.tensor(
+            [
+                [True, False],
+                [True, True],
+                [True, True],
+                [False, True],
+            ]
+        )
+
+        self.assertEqual(
+            contact_cycle_context(support, 1),
+            ((True, False), (False, True)),
+        )
+        self.assertEqual(
+            contact_cycle_context(support, 2),
+            ((True, False), (False, True)),
+        )
+
+    def test_contact_cycle_context_marks_missing_neighbors(self):
+        support = torch.ones((3, 2), dtype=torch.bool)
+
+        self.assertEqual(contact_cycle_context(support, 1), (None, None))
+
     def test_contact_phase_gate_is_explicit(self):
         matcher, _grid = _transactional_fixture(contact_phase_gate=True)
 
