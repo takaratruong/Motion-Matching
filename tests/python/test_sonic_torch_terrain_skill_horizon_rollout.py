@@ -56,6 +56,8 @@ def _transactional_fixture(
     maximum_endpoint_warp_terrain_delta_m=math.inf,
     minimum_endpoint_warp_velocity_heading_alignment=-1.0,
     continuous_skill_enabled=False,
+    contact_feasibility_enabled=False,
+    continuation_surface_tolerance_m=0.08,
 ):
     frames = 80
     body_position = np.zeros((frames, 3, 3), dtype=np.float32)
@@ -159,6 +161,8 @@ def _transactional_fixture(
             minimum_endpoint_warp_velocity_heading_alignment
         ),
         continuous_skill_enabled=continuous_skill_enabled,
+        contact_feasibility_enabled=contact_feasibility_enabled,
+        continuation_surface_tolerance_m=continuation_surface_tolerance_m,
     )
     return matcher, grid
 
@@ -182,6 +186,7 @@ class TerrainSkillHorizonRolloutTest(unittest.TestCase):
         self.assertEqual(
             matcher.minimum_endpoint_warp_velocity_heading_alignment, 0.80
         )
+        self.assertEqual(matcher.continuation_surface_tolerance_m, 0.08)
 
     def test_endpoint_warp_regime_latches_at_command_change(self):
         matcher, _grid = _transactional_fixture(
@@ -355,12 +360,15 @@ class ContinuationFirstMatcherTest(unittest.TestCase):
         self.assertEqual(result.diagnostics.selected_frame, 25)
 
     def test_invalid_continuation_falls_back_and_holds_when_none_exists(self):
-        matcher, _grid = _transactional_fixture(continuous_skill_enabled=True)
+        matcher, _grid = _transactional_fixture(
+            continuous_skill_enabled=True,
+            contact_feasibility_enabled=True,
+        )
         matcher.reset()
         for _ in range(26):
             matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
         clip = matcher.dataset.folder.clips[0]
-        clip.body_position_world[25:51, 1:, 2] = -0.02
+        clip.body_position_world[26:51, 1:, 2] = -0.02
         calls = []
 
         def no_replacement(*_args, **_kwargs):
@@ -374,6 +382,18 @@ class ContinuationFirstMatcherTest(unittest.TestCase):
         self.assertEqual(len(matcher.continuation_events), 0)
         self.assertEqual(result.diagnostics.selected_frame, 25)
         self.assertFalse(result.diagnostics.terrain_safety_override)
+
+    def test_continuation_only_uses_relative_surface_not_raw_foot_height(self):
+        matcher, _grid = _transactional_fixture(continuous_skill_enabled=True)
+        matcher.reset()
+        for _ in range(26):
+            matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
+        matcher.dataset.folder.clips[0].body_position_world[26:51, 1:, 2] = -0.02
+
+        result = matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
+
+        self.assertEqual(result.diagnostics.selected_frame, 26)
+        self.assertEqual(len(matcher.continuation_events), 1)
 
 
 if __name__ == "__main__":

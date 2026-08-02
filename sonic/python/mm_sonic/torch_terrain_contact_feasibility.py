@@ -157,6 +157,7 @@ def validate_placed_contact_trace(
     source_surface_height_m: torch.Tensor,
     sample_surface: Callable[[torch.Tensor], torch.Tensor],
     config: TerrainContactFeasibilityConfig,
+    align_initial_support: bool = False,
 ) -> TerrainContactFeasibilityResult:
     """Validate one already-placed two-foot trace at every source frame."""
 
@@ -178,6 +179,7 @@ def validate_placed_contact_trace(
         or not torch.isfinite(source_surface_height_m).all()
         or not callable(sample_surface)
         or not isinstance(config, TerrainContactFeasibilityConfig)
+        or type(align_initial_support) is not bool
     ):
         raise ContractError("terrain contact feasibility trace is invalid")
 
@@ -218,8 +220,26 @@ def validate_placed_contact_trace(
     except ContractError:
         return _result("terrain-domain")
 
+    vertical_offset = torch.zeros(
+        (),
+        dtype=foot_position_world.dtype,
+        device=foot_position_world.device,
+    )
+    if align_initial_support:
+        anchor_mask = support_mask[0]
+        if not bool(anchor_mask.any().item()):
+            raise ContractError(
+                "terrain contact feasibility initial support is unavailable"
+            )
+        source_sole_z = (
+            foot_position_world[0, :, 2] - float(ANKLE_ORIGIN_SOLE_M)
+        )
+        vertical_offset = (
+            surface[0, anchor_mask] - source_sole_z[anchor_mask]
+        ).mean()
     clearance = (
         foot_position_world[..., 2]
+        + vertical_offset
         - surface
         - float(ANKLE_ORIGIN_SOLE_M)
     )
@@ -382,4 +402,5 @@ def validate_terrain_skill_contact_trace(
         ].to(dtype=placed_feet.dtype),
         sample_surface=sample_query,
         config=config,
+        align_initial_support=True,
     )

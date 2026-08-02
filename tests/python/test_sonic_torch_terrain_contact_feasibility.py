@@ -54,7 +54,7 @@ class TerrainContactFeasibilityLayerTest(unittest.TestCase):
         )
         self.source_surface = torch.zeros((4, 2), dtype=torch.float32)
 
-    def validate(self, sample_surface):
+    def validate(self, sample_surface, *, align_initial_support=False):
         from mm_sonic.torch_terrain_contact_feasibility import (
             validate_placed_contact_trace,
         )
@@ -65,6 +65,7 @@ class TerrainContactFeasibilityLayerTest(unittest.TestCase):
             source_surface_height_m=self.source_surface,
             sample_surface=sample_surface,
             config=self.config,
+            align_initial_support=align_initial_support,
         )
 
     @staticmethod
@@ -131,6 +132,16 @@ class TerrainContactFeasibilityLayerTest(unittest.TestCase):
         self.assertEqual(result.maximum_stance_error_m, 0.0)
         self.assertEqual(result.landing_error_m, 0.0)
         self.assertEqual(result.minimum_swing_clearance_m, 0.0)
+
+    def test_initial_support_anchor_removes_only_global_vertical_offset(self):
+        self.feet[..., 2] -= 0.70
+
+        unaligned = self.validate(self.flat)
+        aligned = self.validate(self.flat, align_initial_support=True)
+
+        self.assertEqual(unaligned.reason, "stance-height")
+        self.assertTrue(aligned.accepted)
+        self.assertAlmostEqual(aligned.maximum_stance_error_m, 0.0, places=6)
 
 
 class TerrainSkillContactTraceIntegrationTest(unittest.TestCase):

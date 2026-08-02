@@ -150,6 +150,8 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         maximum_endpoint_warp_terrain_delta_m: float = math.inf,
         minimum_endpoint_warp_velocity_heading_alignment: float = -1.0,
         continuous_skill_enabled: bool = False,
+        contact_feasibility_enabled: bool = False,
+        continuation_surface_tolerance_m: float = 0.08,
         contact_feasibility_config: TerrainContactFeasibilityConfig = (
             TerrainContactFeasibilityConfig()
         ),
@@ -219,8 +221,11 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         self.minimum_endpoint_warp_velocity_heading_alignment = float(
             minimum_endpoint_warp_velocity_heading_alignment
         )
-        if type(continuous_skill_enabled) is not bool:
-            raise ContractError("continuous terrain skill flag must be boolean")
+        if (
+            type(continuous_skill_enabled) is not bool
+            or type(contact_feasibility_enabled) is not bool
+        ):
+            raise ContractError("continuous terrain skill flags must be boolean")
         if not isinstance(
             contact_feasibility_config, TerrainContactFeasibilityConfig
         ):
@@ -228,14 +233,20 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         if (
             not math.isfinite(float(minimum_continuation_progress_m))
             or float(minimum_continuation_progress_m) <= 0.0
+            or not math.isfinite(float(continuation_surface_tolerance_m))
+            or not 0.0 < float(continuation_surface_tolerance_m) < 0.10
             or type(maximum_continuation_stall_frames) is not int
             or maximum_continuation_stall_frames < 0
         ):
             raise ContractError("continuous terrain skill limits are invalid")
         self.continuous_skill_enabled = continuous_skill_enabled
+        self.contact_feasibility_enabled = contact_feasibility_enabled
         self.contact_feasibility_config = contact_feasibility_config
         self.minimum_continuation_progress_m = float(
             minimum_continuation_progress_m
+        )
+        self.continuation_surface_tolerance_m = float(
+            continuation_surface_tolerance_m
         )
         self.maximum_continuation_stall_frames = (
             maximum_continuation_stall_frames
@@ -310,7 +321,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             int(layout.left_foot_body_index),
             int(layout.right_foot_body_index),
         )
-        source_roots = torch.as_tensor(
+        source_roots = torch.tensor(
             clip.body_position_world[start - 1 : endpoint, root_index],
             dtype=state.translation_world.dtype,
             device=state.translation_world.device,
@@ -327,7 +338,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         ):
             return None
 
-        source_feet = torch.as_tensor(
+        source_feet = torch.tensor(
             clip.body_position_world[start - 1 : endpoint, feet_indices, :],
             dtype=state.translation_world.dtype,
             device=state.translation_world.device,
@@ -343,15 +354,58 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                 self.query_terrain.alignment.matcher_to_scene_xy(points_xy)
             )
 
-        validation = validate_placed_contact_trace(
-            foot_position_world=placed_feet,
-            support_mask=state.skill.support_mask[start - 1 : endpoint],
-            source_surface_height_m=state.skill.foot_surface_height_m[
-                start - 1 : endpoint
-            ].to(dtype=placed_feet.dtype),
-            sample_surface=sample_query,
-            config=self.contact_feasibility_config,
-        )
+        support = state.skill.support_mask[start - 1 : endpoint]
+        source_surface = state.skill.foot_surface_height_m[
+            start - 1 : endpoint
+        ].to(dtype=placed_feet.dtype)
+        if self.contact_feasibility_enabled:
+            validation = validate_placed_contact_trace(
+                foot_position_world=placed_feet,
+                support_mask=support,
+                source_surface_height_m=source_surface,
+                sample_surface=sample_query,
+                config=self.contact_feasibility_config,
+                align_initial_support=True,
+            )
+        else:
+            try:
+                target_surface = sample_query(placed_feet[..., :2])
+            except ContractError:
+                validation = TerrainContactFeasibilityResult(
+                    accepted=False,
+                    reason="terrain-domain",
+                    maximum_stance_error_m=0.0,
+                    landing_error_m=0.0,
+                    minimum_swing_clearance_m=0.0,
+                    maximum_footprint_height_range_m=0.0,
+                    maximum_height_deformation_m=0.0,
+                )
+            else:
+                anchor_mask = support[0]
+                if not bool(anchor_mask.any().item()):
+                    raise ContractError(
+                        "continuous terrain skill has no boundary support"
+                    )
+                source_anchor = source_surface[0, anchor_mask].mean()
+                target_anchor = target_surface[0, anchor_mask].mean()
+                surface_error = float(
+                    torch.abs(
+                        (target_surface - target_anchor)
+                        - (source_surface - source_anchor)
+                    )[support].max().item()
+                )
+                accepted = (
+                    surface_error <= self.continuation_surface_tolerance_m
+                )
+                validation = TerrainContactFeasibilityResult(
+                    accepted=accepted,
+                    reason=None if accepted else "surface-profile",
+                    maximum_stance_error_m=surface_error,
+                    landing_error_m=0.0,
+                    minimum_swing_clearance_m=0.0,
+                    maximum_footprint_height_range_m=0.0,
+                    maximum_height_deformation_m=surface_error,
+                )
         if not validation.accepted:
             return None
         self._prepared_continuation = TerrainContinuationEvent(
@@ -838,6 +892,11 @@ def run_resolved_horizon_matrix(
                 ":continuous-skill-v1"
                 if continuous_skill_enabled
                 else ":boundary-search-v1"
+            )
+            + (
+                ":continuous-surface-tolerance:0.08"
+                if continuous_skill_enabled
+                else ""
             )
             + (
                 f":source-contact-p95:{float(maximum_source_contact_p95_m):.9g}"
