@@ -55,11 +55,13 @@ def _transactional_fixture(
     maximum_endpoint_warp_yaw_rad=math.pi,
     maximum_endpoint_warp_terrain_delta_m=math.inf,
     minimum_endpoint_warp_velocity_heading_alignment=-1.0,
+    continuous_skill_enabled=False,
 ):
     frames = 80
     body_position = np.zeros((frames, 3, 3), dtype=np.float32)
     body_position[:, :, 0] = np.arange(frames, dtype=np.float32)[:, None] * 0.01
     body_position[:, :, 2] = 0.8
+    body_position[:, 1:, 2] = 0.035
     body_quaternion = np.zeros((frames, 3, 4), dtype=np.float32)
     body_quaternion[..., 0] = 1.0
     clip = SimpleNamespace(
@@ -156,6 +158,7 @@ def _transactional_fixture(
         minimum_endpoint_warp_velocity_heading_alignment=(
             minimum_endpoint_warp_velocity_heading_alignment
         ),
+        continuous_skill_enabled=continuous_skill_enabled,
     )
     return matcher, grid
 
@@ -288,6 +291,89 @@ class TerrainSkillHorizonRolloutTest(unittest.TestCase):
         self.assertEqual(event.target_frames, 25)
         self.assertEqual(event.endpoint_frame_exclusive, 26)
         self.assertEqual(event.release_reason, "initial")
+
+
+class ContinuationFirstMatcherTest(unittest.TestCase):
+    def test_same_nonzero_command_extends_before_global_search(self):
+        matcher, grid = _transactional_fixture(continuous_skill_enabled=True)
+        matcher.reset()
+        initial_skill = None
+        for _ in range(26):
+            matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
+            initial_skill = matcher._skill_state.skill
+        def fail_global_search(*_args, **_kwargs):
+            self.fail("unchanged held command reached global search")
+
+        matcher._try_start_skill = fail_global_search
+
+        result = matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
+
+        self.assertEqual(result.diagnostics.selected_frame, 26)
+        self.assertIs(matcher._skill_state.skill, initial_skill)
+        self.assertEqual(len(matcher.chunk_events), 1)
+        self.assertEqual(len(matcher.continuation_events), 1)
+        event = matcher.continuation_events[0]
+        self.assertEqual(event.start_frame, 26)
+        self.assertEqual(event.endpoint_frame_exclusive, 51)
+        self.assertEqual(event.command, ((1.0, 0.0), 0.0))
+
+    def test_zero_command_does_not_extend_completed_skill(self):
+        matcher, _grid = _transactional_fixture(continuous_skill_enabled=True)
+        matcher.reset()
+        for _ in range(26):
+            matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
+        calls = []
+
+        def no_replacement(*_args, **_kwargs):
+            calls.append(True)
+            return None
+
+        matcher._try_start_skill = no_replacement
+
+        result = matcher.commit(matcher.prepare_step((0.0, 0.0), 0.0))
+
+        self.assertEqual(calls, [True])
+        self.assertEqual(len(matcher.continuation_events), 0)
+        self.assertEqual(result.diagnostics.selected_frame, 25)
+
+    def test_changed_command_does_not_extend_completed_skill(self):
+        matcher, _grid = _transactional_fixture(continuous_skill_enabled=True)
+        matcher.reset()
+        for _ in range(26):
+            matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
+        calls = []
+
+        def no_replacement(*_args, **_kwargs):
+            calls.append(True)
+            return None
+
+        matcher._try_start_skill = no_replacement
+        result = matcher.commit(matcher.prepare_step((0.0, 1.0), 0.5))
+
+        self.assertEqual(calls, [True])
+        self.assertEqual(len(matcher.continuation_events), 0)
+        self.assertEqual(result.diagnostics.selected_frame, 25)
+
+    def test_invalid_continuation_falls_back_and_holds_when_none_exists(self):
+        matcher, _grid = _transactional_fixture(continuous_skill_enabled=True)
+        matcher.reset()
+        for _ in range(26):
+            matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
+        clip = matcher.dataset.folder.clips[0]
+        clip.body_position_world[25:51, 1:, 2] = -0.02
+        calls = []
+
+        def no_replacement(*_args, **_kwargs):
+            calls.append(True)
+            return None
+
+        matcher._try_start_skill = no_replacement
+        result = matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
+
+        self.assertEqual(calls, [True])
+        self.assertEqual(len(matcher.continuation_events), 0)
+        self.assertEqual(result.diagnostics.selected_frame, 25)
+        self.assertFalse(result.diagnostics.terrain_safety_override)
 
 
 if __name__ == "__main__":

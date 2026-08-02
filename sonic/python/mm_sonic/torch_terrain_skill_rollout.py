@@ -464,6 +464,11 @@ class TerrainSkillMatcher:
             halflife_s=self.config.inertialization_halflife_s,
         )
 
+    def _try_continue_skill(self, command) -> TerrainSkillState | None:
+        """Optional completed-chunk continuation hook for specialized matchers."""
+
+        return None
+
     def _skill_result(self, step, elapsed_ns: int):
         frame = step.frame
         clip = self.dataset.folder.clips[frame.clip_index]
@@ -550,9 +555,20 @@ class TerrainSkillMatcher:
         switch_attempted = False
         if can_switch:
             switch_attempted = True
-            replacement = self._try_start_skill(
-                velocity_world_xy, heading_world_yaw, shaped
-            )
+            replacement = None
+            stopped_command = command == ((0.0, 0.0), 0.0)
+            if (
+                skill_state is not None
+                and skill_state.next_source_frame >= skill_state.playback_stop
+                and not replan_requested
+                and self._last_command == command
+                and not stopped_command
+            ):
+                replacement = self._try_continue_skill(command)
+            if replacement is None:
+                replacement = self._try_start_skill(
+                    velocity_world_xy, heading_world_yaw, shaped
+                )
             if replacement is not None:
                 skill_state = replacement
         if (

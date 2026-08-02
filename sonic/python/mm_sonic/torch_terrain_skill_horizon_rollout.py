@@ -22,7 +22,12 @@ from .torch_motion_features import (
 )
 from .torch_motion_matcher import MatcherConfig, TorchMotionMatcher
 from .torch_terrain_omni_routes import OmniRoute
-from .torch_terrain_skill_composer import start_skill
+from .torch_terrain_contact_feasibility import (
+    TerrainContactFeasibilityConfig,
+    TerrainContactFeasibilityResult,
+    validate_placed_contact_trace,
+)
+from .torch_terrain_skill_composer import extend_skill_state, start_skill
 from .torch_terrain_skill_horizon_search import (
     HorizonCost,
     HorizonSearchFailure,
@@ -35,6 +40,8 @@ from .torch_terrain_skill_horizon_search import (
 from .torch_terrain_skill_horizons import (
     TerrainSkillHorizonInventory,
     build_horizon_inventory,
+    next_sequential_horizon_endpoint,
+    remaining_stall_profile,
 )
 from .torch_terrain_skill_rollout import (
     TerrainSkillMatcher,
@@ -54,6 +61,15 @@ class HorizonChunkEvent:
     cost: HorizonCost
     rejected_by_reason: Mapping[str, int]
     release_reason: str
+
+
+@dataclass(frozen=True)
+class TerrainContinuationEvent:
+    skill_index: int
+    start_frame: int
+    endpoint_frame_exclusive: int
+    command: tuple[tuple[float, float], float]
+    validation: TerrainContactFeasibilityResult
 
 
 def terrain_height_targets(
@@ -133,6 +149,12 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         maximum_endpoint_warp_yaw_rad: float = math.pi,
         maximum_endpoint_warp_terrain_delta_m: float = math.inf,
         minimum_endpoint_warp_velocity_heading_alignment: float = -1.0,
+        continuous_skill_enabled: bool = False,
+        contact_feasibility_config: TerrainContactFeasibilityConfig = (
+            TerrainContactFeasibilityConfig()
+        ),
+        minimum_continuation_progress_m: float = 0.05,
+        maximum_continuation_stall_frames: int = 5,
     ) -> None:
         self.base = base_matcher
         self.database = base_matcher.database
@@ -197,6 +219,27 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         self.minimum_endpoint_warp_velocity_heading_alignment = float(
             minimum_endpoint_warp_velocity_heading_alignment
         )
+        if type(continuous_skill_enabled) is not bool:
+            raise ContractError("continuous terrain skill flag must be boolean")
+        if not isinstance(
+            contact_feasibility_config, TerrainContactFeasibilityConfig
+        ):
+            raise ContractError("continuous terrain contact config is invalid")
+        if (
+            not math.isfinite(float(minimum_continuation_progress_m))
+            or float(minimum_continuation_progress_m) <= 0.0
+            or type(maximum_continuation_stall_frames) is not int
+            or maximum_continuation_stall_frames < 0
+        ):
+            raise ContractError("continuous terrain skill limits are invalid")
+        self.continuous_skill_enabled = continuous_skill_enabled
+        self.contact_feasibility_config = contact_feasibility_config
+        self.minimum_continuation_progress_m = float(
+            minimum_continuation_progress_m
+        )
+        self.maximum_continuation_stall_frames = (
+            maximum_continuation_stall_frames
+        )
         self._clip_path_to_index = {
             clip.relative_path: index
             for index, clip in enumerate(dataset.folder.clips)
@@ -215,6 +258,8 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         self._foot_velocity = torch.zeros((2, 3), device=self.database.device)
         self._root_velocity = torch.zeros(3, device=self.database.device)
         self._events: list[HorizonChunkEvent] = []
+        self._continuation_events: list[TerrainContinuationEvent] = []
+        self._prepared_continuation: TerrainContinuationEvent | None = None
         self._prepared_selection: TerrainSkillHorizonResult | None = None
         self._prepared_release_reason: str | None = None
         self._endpoint_warp_command = None
@@ -224,16 +269,99 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
     def chunk_events(self) -> tuple[HorizonChunkEvent, ...]:
         return tuple(self._events)
 
+    @property
+    def continuation_events(self) -> tuple[TerrainContinuationEvent, ...]:
+        return tuple(self._continuation_events)
+
     def reset(
         self, *, root_position_world_xy: tuple[float, float] = (0.0, 0.0)
     ):
         result = super().reset(root_position_world_xy=root_position_world_xy)
         self._events.clear()
+        self._continuation_events.clear()
+        self._prepared_continuation = None
         self._prepared_selection = None
         self._prepared_release_reason = None
         self._endpoint_warp_command = None
         self._endpoint_warp_command_enabled = False
         return result
+
+    def _try_continue_skill(self, command):
+        state = self._skill_state
+        if not self.continuous_skill_enabled or state is None:
+            return None
+        if bool(state.endpoint_translation_warp_world_xy.abs().max().item()) or bool(
+            state.endpoint_yaw_warp_rad.abs().item()
+        ):
+            return None
+        endpoint = next_sequential_horizon_endpoint(
+            state.skill.support_mask,
+            current_endpoint_frame_exclusive=state.playback_stop,
+            playback_stop=state.skill.interval.playback_stop,
+        )
+        if endpoint is None:
+            return None
+
+        start = state.playback_stop
+        clip = self.dataset.folder.clips[state.skill.clip_index]
+        layout = self.dataset.folder.layout
+        root_index = int(layout.root_body_index)
+        feet_indices = (
+            int(layout.left_foot_body_index),
+            int(layout.right_foot_body_index),
+        )
+        source_roots = torch.as_tensor(
+            clip.body_position_world[start - 1 : endpoint, root_index],
+            dtype=state.translation_world.dtype,
+            device=state.translation_world.device,
+        )
+        progress = float(
+            torch.linalg.vector_norm(
+                source_roots[-1, :2] - source_roots[0, :2]
+            ).item()
+        )
+        stalls = remaining_stall_profile(source_roots[:, :2])
+        if (
+            progress < self.minimum_continuation_progress_m
+            or int(stalls.max().item()) > self.maximum_continuation_stall_frames
+        ):
+            return None
+
+        source_feet = torch.as_tensor(
+            clip.body_position_world[start - 1 : endpoint, feet_indices, :],
+            dtype=state.translation_world.dtype,
+            device=state.translation_world.device,
+        )
+        placed_feet = torch.empty_like(source_feet)
+        placed_feet[..., :2] = _rotate_xy(
+            source_feet[..., :2], state.yaw_offset
+        ) + state.translation_world[:2]
+        placed_feet[..., 2] = source_feet[..., 2] + state.translation_world[2]
+
+        def sample_query(points_xy: torch.Tensor) -> torch.Tensor:
+            return self.query_terrain.query_grid.sample_xy(
+                self.query_terrain.alignment.matcher_to_scene_xy(points_xy)
+            )
+
+        validation = validate_placed_contact_trace(
+            foot_position_world=placed_feet,
+            support_mask=state.skill.support_mask[start - 1 : endpoint],
+            source_surface_height_m=state.skill.foot_surface_height_m[
+                start - 1 : endpoint
+            ].to(dtype=placed_feet.dtype),
+            sample_surface=sample_query,
+            config=self.contact_feasibility_config,
+        )
+        if not validation.accepted:
+            return None
+        self._prepared_continuation = TerrainContinuationEvent(
+            skill_index=state.skill.skill_index,
+            start_frame=start,
+            endpoint_frame_exclusive=endpoint,
+            command=command,
+            validation=validation,
+        )
+        return extend_skill_state(state, playback_stop=endpoint)
 
     def _update_endpoint_warp_command(self, command) -> None:
         if self._last_result is None:
@@ -493,6 +621,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
     def prepare_step(self, *args, **kwargs):
         self._prepared_selection = None
         self._prepared_release_reason = None
+        self._prepared_continuation = None
         try:
             velocity = (
                 args[0]
@@ -517,6 +646,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
     def commit(self, prepared):
         selected = self._prepared_selection
         release_reason = self._prepared_release_reason
+        continuation = self._prepared_continuation
         result = super().commit(prepared)
         if selected is not None:
             skill_index = int(
@@ -535,8 +665,11 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                     release_reason=release_reason or "endpoint",
                 )
             )
+        if continuation is not None:
+            self._continuation_events.append(continuation)
         self._prepared_selection = None
         self._prepared_release_reason = None
+        self._prepared_continuation = None
         return result
 
 
@@ -549,6 +682,7 @@ def run_resolved_horizon_matrix(
     search_config: HorizonSearchConfig = HorizonSearchConfig(),
     foot_lock: bool = False,
     contact_phase_gate: bool = False,
+    continuous_skill_enabled: bool = False,
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
@@ -701,6 +835,11 @@ def run_resolved_horizon_matrix(
             )
             + (":phase-gate-v1" if contact_phase_gate else ":implicit-phase")
             + (
+                ":continuous-skill-v1"
+                if continuous_skill_enabled
+                else ":boundary-search-v1"
+            )
+            + (
                 f":source-contact-p95:{float(maximum_source_contact_p95_m):.9g}"
                 if maximum_source_contact_p95_m is not None
                 else ":all-source-contact-quality"
@@ -735,6 +874,7 @@ def run_resolved_horizon_matrix(
             terrain_tolerance_m=terrain_tolerance_m,
             result_filter=result_filter,
             contact_phase_gate=contact_phase_gate,
+            continuous_skill_enabled=continuous_skill_enabled,
             turning_clip_paths=turning_clip_paths,
             maximum_translation_warp_m=maximum_translation_warp_m,
             maximum_yaw_warp_rad=maximum_yaw_warp_rad,

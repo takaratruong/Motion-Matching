@@ -272,6 +272,7 @@ class LiveMujocoSceneTests(unittest.TestCase):
                 "--config", "horizon.json",
                 "--g1-xml", "g1.xml",
                 "--multi-horizon",
+                "--continuous-skill",
                 "--foot-lock",
                 "--contact-phase-gate",
                 "--swing-clearance-margin-m", "0.01",
@@ -287,6 +288,7 @@ class LiveMujocoSceneTests(unittest.TestCase):
             ]
         )
         self.assertTrue(arguments.multi_horizon)
+        self.assertTrue(arguments.continuous_skill)
         self.assertTrue(arguments.foot_lock)
         self.assertTrue(arguments.contact_phase_gate)
         self.assertEqual(arguments.swing_clearance_margin_m, 0.01)
@@ -328,6 +330,13 @@ class LiveMujocoSceneTests(unittest.TestCase):
                 contact_segments=False,
                 foothold_arm=None,
                 contact_phase_gate=True,
+            )
+        with self.assertRaisesRegex(ContractError, "requires multi-horizon"):
+            live_module._validate_live_mode(
+                multi_horizon=False,
+                contact_segments=False,
+                foothold_arm=None,
+                continuous_skill=True,
             )
         with self.assertRaisesRegex(ContractError, "requires terrain foot lock"):
             live_module._validate_live_mode(

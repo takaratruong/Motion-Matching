@@ -531,6 +531,7 @@ def _validate_live_mode(
     foothold_arm: str | None,
     foot_lock: bool = False,
     contact_phase_gate: bool = False,
+    continuous_skill: bool = False,
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
@@ -550,6 +551,8 @@ def _validate_live_mode(
         raise ContractError("terrain foot lock requires multi-horizon mode")
     if contact_phase_gate and not multi_horizon:
         raise ContractError("contact phase gate requires multi-horizon mode")
+    if continuous_skill and not multi_horizon:
+        raise ContractError("continuous skill requires multi-horizon mode")
     if swing_clearance_margin_m is not None and not foot_lock:
         raise ContractError("swing clearance requires terrain foot lock")
     if swing_plan_sigma_frames is not None and swing_clearance_margin_m is None:
@@ -577,6 +580,7 @@ def _build_live_matcher(
     foothold_action_policy: Any,
     foot_lock: bool = False,
     contact_phase_gate: bool = False,
+    continuous_skill: bool = False,
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
@@ -629,6 +633,8 @@ def _build_live_matcher(
             )
         if contact_phase_gate:
             matcher_kwargs["contact_phase_gate"] = True
+        if continuous_skill:
+            matcher_kwargs["continuous_skill_enabled"] = True
         return TerrainSkillHorizonMatcher(
             base_matcher=base,
             skill_inventory=skills,
@@ -683,6 +689,7 @@ def run_live_viewer(
     strafe_action_gate: bool = False,
     foot_lock: bool = False,
     contact_phase_gate: bool = False,
+    continuous_skill: bool = False,
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
@@ -707,6 +714,7 @@ def run_live_viewer(
         foothold_arm=foothold_arm,
         foot_lock=foot_lock,
         contact_phase_gate=contact_phase_gate,
+        continuous_skill=continuous_skill,
         swing_clearance_margin_m=swing_clearance_margin_m,
         foot_correction_halflife_s=foot_correction_halflife_s,
         swing_plan_sigma_frames=swing_plan_sigma_frames,
@@ -811,6 +819,7 @@ def run_live_viewer(
         foothold_action_policy=foothold_action_policy,
         foot_lock=foot_lock,
         contact_phase_gate=contact_phase_gate,
+        continuous_skill=continuous_skill,
         swing_clearance_margin_m=swing_clearance_margin_m,
         foot_correction_halflife_s=foot_correction_halflife_s,
         swing_plan_sigma_frames=swing_plan_sigma_frames,
@@ -1054,6 +1063,11 @@ def build_live_viewer_argument_parser() -> argparse.ArgumentParser:
         help="Prefer skill entries with the current source support pattern.",
     )
     parser.add_argument(
+        "--continuous-skill",
+        action="store_true",
+        help="Continue an unchanged command through the same feasible terrain skill.",
+    )
+    parser.add_argument(
         "--swing-clearance-margin-m",
         type=float,
         default=None,
@@ -1189,6 +1203,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         strafe_action_gate=args.strafe_action_gate,
         foot_lock=args.foot_lock,
         contact_phase_gate=args.contact_phase_gate,
+        continuous_skill=args.continuous_skill,
         swing_clearance_margin_m=args.swing_clearance_margin_m,
         foot_correction_halflife_s=args.foot_correction_halflife_s,
         swing_plan_sigma_frames=args.swing_plan_sigma_frames,
