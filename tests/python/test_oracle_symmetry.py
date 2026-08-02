@@ -8,11 +8,6 @@ import unittest
 import numpy as np
 
 from mm_sonic.joints import ContractError
-from mm_sonic.offline_corpus import (
-    BODY_MIRROR_PERMUTATION,
-    JOINT_MIRROR_PERMUTATION,
-    JOINT_MIRROR_SIGNS,
-)
 from mm_sonic.terrain_oracle.canonical import (
     CANONICAL_COORDINATE_CONVENTION,
     CLEAN_POSE_ORIGIN,
@@ -25,7 +20,11 @@ from mm_sonic.terrain_oracle.canonical import (
     TerrainBinding,
 )
 from mm_sonic.terrain_oracle.math3d import RigidTransform
-from mm_sonic.terrain_oracle.storage import write_mesh
+from mm_sonic.terrain_oracle.storage import (
+    read_clip,
+    write_clip,
+    write_mesh,
+)
 from mm_sonic.terrain_oracle.symmetry import (
     assert_mirror_involution,
     mirror_clip,
@@ -36,6 +35,100 @@ from mm_sonic.terrain_oracle.symmetry import (
 _POLAR_SIGNS = np.array((1.0, -1.0, 1.0), dtype=np.float32)
 _AXIAL_SIGNS = np.array((-1.0, 1.0, -1.0), dtype=np.float32)
 _QUATERNION_SIGNS = np.array((1.0, -1.0, 1.0, -1.0), dtype=np.float32)
+_EXPECTED_MIRRORED_JOINT_SOURCE_NAMES = (
+    "right_hip_pitch_joint",
+    "left_hip_pitch_joint",
+    "waist_yaw_joint",
+    "right_hip_roll_joint",
+    "left_hip_roll_joint",
+    "waist_roll_joint",
+    "right_hip_yaw_joint",
+    "left_hip_yaw_joint",
+    "waist_pitch_joint",
+    "right_knee_joint",
+    "left_knee_joint",
+    "right_shoulder_pitch_joint",
+    "left_shoulder_pitch_joint",
+    "right_ankle_pitch_joint",
+    "left_ankle_pitch_joint",
+    "right_shoulder_roll_joint",
+    "left_shoulder_roll_joint",
+    "right_ankle_roll_joint",
+    "left_ankle_roll_joint",
+    "right_shoulder_yaw_joint",
+    "left_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "left_elbow_joint",
+    "right_wrist_roll_joint",
+    "left_wrist_roll_joint",
+    "right_wrist_pitch_joint",
+    "left_wrist_pitch_joint",
+    "right_wrist_yaw_joint",
+    "left_wrist_yaw_joint",
+)
+_EXPECTED_MIRRORED_JOINT_SIGNS = (
+    1.0,
+    1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+    1.0,
+    1.0,
+    -1.0,
+    -1.0,
+    1.0,
+    1.0,
+    -1.0,
+    -1.0,
+)
+_EXPECTED_MIRRORED_BODY_SOURCE_NAMES = (
+    "pelvis",
+    "right_hip_pitch_link",
+    "left_hip_pitch_link",
+    "waist_yaw_link",
+    "right_hip_roll_link",
+    "left_hip_roll_link",
+    "waist_roll_link",
+    "right_hip_yaw_link",
+    "left_hip_yaw_link",
+    "torso_link",
+    "right_knee_link",
+    "left_knee_link",
+    "right_shoulder_pitch_link",
+    "left_shoulder_pitch_link",
+    "right_ankle_pitch_link",
+    "left_ankle_pitch_link",
+    "right_shoulder_roll_link",
+    "left_shoulder_roll_link",
+    "right_ankle_roll_link",
+    "left_ankle_roll_link",
+    "right_shoulder_yaw_link",
+    "left_shoulder_yaw_link",
+    "right_elbow_link",
+    "left_elbow_link",
+    "right_wrist_roll_link",
+    "left_wrist_roll_link",
+    "right_wrist_pitch_link",
+    "left_wrist_pitch_link",
+    "right_wrist_yaw_link",
+    "left_wrist_yaw_link",
+)
 
 
 def _normalized_quaternions(leading_shape: tuple[int, ...], start: int) -> np.ndarray:
@@ -174,6 +267,10 @@ def _asymmetric_clip(*, mesh_sha256: str = "b" * 64) -> CanonicalClip:
     return clip
 
 
+def _asymmetric_flat_clip() -> CanonicalClip:
+    return replace(_asymmetric_clip(), terrain=None)
+
+
 def _asymmetric_mesh() -> CanonicalTerrainMesh:
     return CanonicalTerrainMesh(
         vertices_local=np.array(
@@ -242,11 +339,45 @@ class CanonicalClipSymmetryTests(unittest.TestCase):
     ):
         """Catches omission of any history field or reflection on a wrong axis."""
 
-        original = _asymmetric_clip()
+        original = _asymmetric_flat_clip()
         mirrored = mirror_clip(original)
         restored = mirror_clip(mirrored)
+        expected_joint_indices = np.array(
+            tuple(
+                ISAACLAB_JOINT_NAMES.index(name)
+                for name in _EXPECTED_MIRRORED_JOINT_SOURCE_NAMES
+            ),
+            dtype=np.int64,
+        )
+        expected_joint_signs = np.array(
+            _EXPECTED_MIRRORED_JOINT_SIGNS, dtype=np.float32
+        )
+        expected_body_indices = np.array(
+            tuple(
+                ISAACLAB_BODY_NAMES.index(name)
+                for name in _EXPECTED_MIRRORED_BODY_SOURCE_NAMES
+            ),
+            dtype=np.int64,
+        )
 
         _assert_values_exact(self, restored, original, "clip")
+        self.assertEqual(len(_EXPECTED_MIRRORED_JOINT_SOURCE_NAMES), 29)
+        self.assertEqual(len(_EXPECTED_MIRRORED_JOINT_SIGNS), 29)
+        self.assertEqual(len(_EXPECTED_MIRRORED_BODY_SOURCE_NAMES), 30)
+        self.assertEqual(
+            tuple(
+                ISAACLAB_JOINT_NAMES[index]
+                for index in expected_joint_indices
+            ),
+            _EXPECTED_MIRRORED_JOINT_SOURCE_NAMES,
+        )
+        self.assertEqual(
+            tuple(
+                ISAACLAB_BODY_NAMES[index]
+                for index in expected_body_indices
+            ),
+            _EXPECTED_MIRRORED_BODY_SOURCE_NAMES,
+        )
         self.assertEqual(mirrored.clip_id, "asymmetric-stair-ascent__mirror")
         self.assertEqual(mirrored.mirror_of, original.clip_id)
         self.assertEqual(mirrored.source, original.source)
@@ -269,32 +400,32 @@ class CanonicalClipSymmetryTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(
             mirrored.joint_position,
-            original.joint_position[:, JOINT_MIRROR_PERMUTATION]
-            * JOINT_MIRROR_SIGNS,
+            original.joint_position[:, expected_joint_indices]
+            * expected_joint_signs,
         )
         np.testing.assert_array_equal(
             mirrored.joint_velocity,
-            original.joint_velocity[:, JOINT_MIRROR_PERMUTATION]
-            * JOINT_MIRROR_SIGNS,
+            original.joint_velocity[:, expected_joint_indices]
+            * expected_joint_signs,
         )
         np.testing.assert_array_equal(
             mirrored.body_position_world,
-            original.body_position_world[:, BODY_MIRROR_PERMUTATION]
+            original.body_position_world[:, expected_body_indices]
             * _POLAR_SIGNS,
         )
         np.testing.assert_array_equal(
             mirrored.body_linear_velocity_world,
-            original.body_linear_velocity_world[:, BODY_MIRROR_PERMUTATION]
+            original.body_linear_velocity_world[:, expected_body_indices]
             * _POLAR_SIGNS,
         )
         np.testing.assert_array_equal(
             mirrored.body_angular_velocity_world,
-            original.body_angular_velocity_world[:, BODY_MIRROR_PERMUTATION]
+            original.body_angular_velocity_world[:, expected_body_indices]
             * _AXIAL_SIGNS,
         )
         np.testing.assert_array_equal(
             mirrored.body_quaternion_world_wxyz,
-            original.body_quaternion_world_wxyz[:, BODY_MIRROR_PERMUTATION]
+            original.body_quaternion_world_wxyz[:, expected_body_indices]
             * _QUATERNION_SIGNS,
         )
         for field_name in (
@@ -343,17 +474,6 @@ class CanonicalClipSymmetryTests(unittest.TestCase):
             mirrored.commands.inferred_yaw_rate_rad_s,
             -original.commands.inferred_yaw_rate_rad_s,
         )
-        self.assertIsNotNone(mirrored.terrain)
-        np.testing.assert_array_equal(
-            mirrored.terrain.world_from_terrain.translation_world,
-            original.terrain.world_from_terrain.translation_world * _POLAR_SIGNS,
-        )
-        np.testing.assert_array_equal(
-            mirrored.terrain.world_from_terrain.quaternion_world_from_local_wxyz,
-            original.terrain.world_from_terrain.quaternion_world_from_local_wxyz
-            * _QUATERNION_SIGNS,
-        )
-        self.assertEqual(mirrored.terrain.mesh_sha256, original.terrain.mesh_sha256)
         assert_mirror_involution(original, mirrored)
         mirrored.validate()
         _assert_arrays_read_only(self, mirrored, "mirrored")
@@ -362,7 +482,7 @@ class CanonicalClipSymmetryTests(unittest.TestCase):
     def test_root_never_uses_the_body_left_right_permutation(self):
         """Catches root pose accidentally being replaced by a permuted body pose."""
 
-        original = _asymmetric_clip()
+        original = _asymmetric_flat_clip()
         mirrored = mirror_clip(original)
 
         np.testing.assert_array_equal(
@@ -378,7 +498,7 @@ class CanonicalClipSymmetryTests(unittest.TestCase):
     def test_rejects_wrong_types_orders_and_ambiguous_pretagged_identity(self):
         """Catches reflection proceeding under an unknown layout or mirror lineage."""
 
-        original = _asymmetric_clip()
+        original = _asymmetric_flat_clip()
         with self.assertRaisesRegex(ContractError, "CanonicalClip"):
             mirror_clip(object())
         with self.assertRaisesRegex(ContractError, "joint_names"):
@@ -407,11 +527,19 @@ class CanonicalClipSymmetryTests(unittest.TestCase):
             mirror_clip(replace(original, mirror_of="unrelated-source"))
         with self.assertRaisesRegex(ContractError, "cyclic"):
             mirror_clip(replace(original, mirror_of=original.clip_id))
+        for reserved_id in ("walk__mirror", "walk__mirror__mirror"):
+            with self.subTest(clip_id=reserved_id):
+                with self.assertRaisesRegex(ContractError, "reserved"):
+                    mirror_clip(replace(original, clip_id=reserved_id))
+        generated = mirror_clip(original)
+        _assert_values_exact(
+            self, mirror_clip(generated), original, "valid tagged round trip"
+        )
 
     def test_assert_mirror_involution_reports_each_perturbed_field(self):
         """Catches a shallow involution check that ignores history or provenance."""
 
-        original = _asymmetric_clip()
+        original = _asymmetric_flat_clip()
         mirrored = mirror_clip(original)
         mutations = {
             "joint_position": replace(
@@ -443,20 +571,6 @@ class CanonicalClipSymmetryTests(unittest.TestCase):
             ),
             "action_tags": replace(
                 mirrored, action_tags=(*mirrored.action_tags, "forged")
-            ),
-            "terrain.world_from_terrain.translation_world": replace(
-                mirrored,
-                terrain=replace(
-                    mirrored.terrain,
-                    world_from_terrain=RigidTransform(
-                        np.asarray(
-                            mirrored.terrain.world_from_terrain.translation_world
-                        )
-                        + np.array((0.0, 0.1, 0.0), dtype=np.float32),
-                        mirrored.terrain.world_from_terrain
-                        .quaternion_world_from_local_wxyz,
-                    ),
-                ),
             ),
         }
         for field_name, perturbed in mutations.items():
@@ -572,7 +686,7 @@ class TerrainSymmetryTests(unittest.TestCase):
         self.assertFalse(mirrored_mesh.valid_faces.flags.writeable)
 
     def test_clip_and_terrain_pairing_is_publishable_and_double_pairs_exactly(self):
-        """Catches publishing the intermediate clip with its stale pre-mirror digest."""
+        """Catches publishing a clip whose terrain digest precedes reflection."""
 
         mesh = _asymmetric_mesh()
         with tempfile.TemporaryDirectory() as temporary:
@@ -580,13 +694,28 @@ class TerrainSymmetryTests(unittest.TestCase):
             binding = self._binding_for(mesh, root)
             original = replace(_asymmetric_clip(), terrain=binding)
 
-            intermediate = mirror_clip(original)
-            self.assertEqual(intermediate.terrain.mesh_sha256, binding.mesh_sha256)
+            with self.assertRaisesRegex(ContractError, "terrain mesh"):
+                mirror_clip(original)
+            with self.assertRaisesRegex(ContractError, "terrain"):
+                mirror_clip(_asymmetric_flat_clip(), mesh)
+            with self.assertRaisesRegex(ContractError, "terrain mesh"):
+                assert_mirror_involution(original, original)
+
+            mirrored = mirror_clip(original, mesh)
             mirrored_binding, mirrored_mesh = mirror_terrain(binding, mesh)
-            mirrored = replace(intermediate, terrain=mirrored_binding)
+            _assert_values_exact(
+                self, mirrored.terrain, mirrored_binding, "mirrored binding"
+            )
             mirrored.validate()
             mirrored_record = write_mesh(root / "paired-mirrored", mirrored_mesh)
             self.assertEqual(mirrored.terrain.mesh_sha256, mirrored_record.sha256)
+            clip_record = write_clip(root / "mirrored-clips", mirrored)
+            restored_from_storage = read_clip(
+                root / "mirrored-clips" / f"{clip_record.sha256}.npz"
+            )
+            _assert_values_exact(
+                self, restored_from_storage, mirrored, "stored mirrored clip"
+            )
             np.testing.assert_allclose(
                 mirrored.terrain.world_from_terrain.apply_points(
                     mirrored_mesh.vertices_local
@@ -596,13 +725,24 @@ class TerrainSymmetryTests(unittest.TestCase):
                 rtol=0.0,
                 atol=2.0e-6,
             )
+            assert_mirror_involution(original, mirrored, mesh)
+            stale = replace(
+                mirrored,
+                terrain=replace(
+                    mirrored.terrain, mesh_sha256=binding.mesh_sha256
+                ),
+            )
+            with self.assertRaisesRegex(
+                ContractError, r"terrain\.mesh_sha256"
+            ):
+                assert_mirror_involution(original, stale, mesh)
 
-            restored_intermediate = mirror_clip(mirrored)
+            restored = mirror_clip(mirrored, mirrored_mesh)
             restored_binding, restored_mesh = mirror_terrain(
                 mirrored_binding, mirrored_mesh
             )
-            restored = replace(
-                restored_intermediate, terrain=restored_binding
+            _assert_values_exact(
+                self, restored.terrain, restored_binding, "restored binding"
             )
 
         _assert_values_exact(self, restored, original, "clip")
@@ -627,7 +767,9 @@ class TerrainSymmetryTests(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, "mesh_sha256"):
             mirror_terrain(replace(binding, mesh_sha256="e" * 64), mesh)
         with self.assertRaisesRegex(ContractError, "CanonicalClip"):
-            assert_mirror_involution(object(), mirror_clip(_asymmetric_clip()))
+            assert_mirror_involution(
+                object(), mirror_clip(_asymmetric_flat_clip())
+            )
 
 
 if __name__ == "__main__":

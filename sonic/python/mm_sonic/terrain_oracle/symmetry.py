@@ -1,10 +1,4 @@
-"""Exact sagittal symmetry for the complete canonical terrain-motion contract.
-
-``mirror_clip`` has no terrain mesh bytes, so for a terrain-bound clip it
-returns an intermediate binding with a reflected transform and the current mesh
-digest.  Before publication, pair it with ``mirror_terrain`` and replace the
-intermediate terrain field with the returned digest-correct binding.
-"""
+"""Exact sagittal symmetry for the complete canonical terrain-motion contract."""
 
 from __future__ import annotations
 
@@ -79,6 +73,11 @@ def _validate_mirror_order(clip: CanonicalClip) -> None:
 
 def _mirrored_identity(clip: CanonicalClip) -> tuple[str, str | None]:
     if clip.mirror_of is None:
+        if clip.clip_id.endswith(_MIRROR_SUFFIX):
+            raise ContractError(
+                f"clip_id suffix {_MIRROR_SUFFIX!r} is reserved for clips "
+                "with mirror_of provenance"
+            )
         return f"{clip.clip_id}{_MIRROR_SUFFIX}", clip.clip_id
     if clip.mirror_of == clip.clip_id:
         raise ContractError("cyclic mirror_of provenance is not permitted")
@@ -99,23 +98,16 @@ def _mirror_transform(transform: RigidTransform) -> RigidTransform:
     )
 
 
-def _mirror_binding_transform(binding: TerrainBinding | None) -> TerrainBinding | None:
-    if binding is None:
-        return None
-    return replace(
-        binding,
-        world_from_terrain=_mirror_transform(binding.world_from_terrain),
-    )
-
-
-def mirror_clip(clip: CanonicalClip) -> CanonicalClip:
+def mirror_clip(
+    clip: CanonicalClip,
+    terrain_mesh: CanonicalTerrainMesh | None = None,
+) -> CanonicalClip:
     """Reflect every canonical clip field about local/world ``y=0``.
 
     Observed stick arrays follow their binding convention: channel zero is
     lateral.  Inferred arrays are robot-local ``(forward, lateral)``, so channel
-    one is lateral.  A returned terrain binding is an intermediate until paired
-    with :func:`mirror_terrain`, because this function cannot derive a content
-    digest without the referenced mesh bytes.
+    one is lateral.  Terrain-bound clips require their referenced mesh so the
+    returned binding always contains the exact mirrored content digest.
     """
 
     if not isinstance(clip, CanonicalClip):
@@ -123,6 +115,20 @@ def mirror_clip(clip: CanonicalClip) -> CanonicalClip:
     clip.validate()
     _validate_mirror_order(clip)
     clip_id, mirror_of = _mirrored_identity(clip)
+    if clip.terrain is None:
+        if terrain_mesh is not None:
+            raise ContractError(
+                "cannot supply a terrain mesh for a terrain-unbound clip"
+            )
+        mirrored_terrain = None
+    else:
+        if terrain_mesh is None:
+            raise ContractError(
+                "terrain-bound clip mirroring requires its terrain mesh"
+            )
+        mirrored_terrain, _mirrored_mesh = mirror_terrain(
+            clip.terrain, terrain_mesh
+        )
     commands = CommandTrack(
         observed_travel_stick_xy=(
             clip.commands.observed_travel_stick_xy * _OBSERVED_STICK_SIGNS
@@ -192,7 +198,7 @@ def mirror_clip(clip: CanonicalClip) -> CanonicalClip:
         contact=clip.contact[:, _LEFT_RIGHT_PERMUTATION],
         contact_confidence=clip.contact_confidence[:, _LEFT_RIGHT_PERMUTATION],
         commands=commands,
-        terrain=_mirror_binding_transform(clip.terrain),
+        terrain=mirrored_terrain,
         mirror_of=mirror_of,
     )
     mirrored.validate()
@@ -277,7 +283,9 @@ def _different_fields(actual: object, expected: object, path: str = "") -> list[
 
 
 def assert_mirror_involution(
-    original: CanonicalClip, mirrored: CanonicalClip
+    original: CanonicalClip,
+    mirrored: CanonicalClip,
+    terrain_mesh: CanonicalTerrainMesh | None = None,
 ) -> None:
     """Fail with field paths unless ``mirrored`` is the exact canonical mirror."""
 
@@ -289,13 +297,20 @@ def assert_mirror_involution(
         )
     original.validate()
     mirrored.validate()
-    expected = mirror_clip(original)
+    expected = mirror_clip(original, terrain_mesh)
     failures = _different_fields(mirrored, expected)
     if failures:
         raise ContractError(
             "canonical mirror mismatch for fields: " + ", ".join(failures)
         )
-    restored = mirror_clip(mirrored)
+    if original.terrain is None:
+        mirrored_mesh = None
+    else:
+        assert terrain_mesh is not None
+        _mirrored_binding, mirrored_mesh = mirror_terrain(
+            original.terrain, terrain_mesh
+        )
+    restored = mirror_clip(mirrored, mirrored_mesh)
     failures = _different_fields(restored, original)
     if failures:
         raise ContractError(
