@@ -218,6 +218,7 @@ class LiveMujocoSceneTests(unittest.TestCase):
                 "--foot-lock",
                 "--contact-phase-gate",
                 "--swing-clearance-margin-m", "0.01",
+                "--swing-plan-sigma-frames", "2.5",
                 "--foot-correction-halflife-s", "0.02",
             ]
         )
@@ -225,6 +226,7 @@ class LiveMujocoSceneTests(unittest.TestCase):
         self.assertTrue(arguments.foot_lock)
         self.assertTrue(arguments.contact_phase_gate)
         self.assertEqual(arguments.swing_clearance_margin_m, 0.01)
+        self.assertEqual(arguments.swing_plan_sigma_frames, 2.5)
         self.assertEqual(arguments.foot_correction_halflife_s, 0.02)
         live_module._validate_live_mode(
             multi_horizon=True,
@@ -233,6 +235,7 @@ class LiveMujocoSceneTests(unittest.TestCase):
             foot_lock=True,
             contact_phase_gate=True,
             swing_clearance_margin_m=0.01,
+            swing_plan_sigma_frames=2.5,
             foot_correction_halflife_s=0.02,
         )
         with self.assertRaisesRegex(ContractError, "mutually exclusive"):
@@ -261,6 +264,14 @@ class LiveMujocoSceneTests(unittest.TestCase):
                 contact_segments=False,
                 foothold_arm=None,
                 swing_clearance_margin_m=0.01,
+            )
+        with self.assertRaisesRegex(ContractError, "requires swing clearance"):
+            live_module._validate_live_mode(
+                multi_horizon=True,
+                contact_segments=False,
+                foothold_arm=None,
+                foot_lock=True,
+                swing_plan_sigma_frames=2.5,
             )
 
     def test_horizon_overlay_does_not_require_legacy_cost_fields(self):
