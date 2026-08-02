@@ -65,6 +65,28 @@ def _target() -> HorizonTargets:
 
 
 class HorizonTargetTest(unittest.TestCase):
+    def test_targets_can_sample_an_exact_selected_playback_duration(self):
+        target = predict_horizon_targets(
+            current_velocity_world_xy=torch.zeros(2),
+            current_heading_world_yaw=torch.tensor(0.0),
+            requested_velocity_world_xy=torch.tensor([1.0, 0.0]),
+            requested_heading_world_yaw=torch.tensor(0.0),
+            matcher_config=MatcherConfig(
+                acceleration_mps2=1000.0,
+                deceleration_mps2=1000.0,
+            ),
+            target_frames=(35,),
+        )
+
+        self.assertEqual(target.frames.tolist(), [35])
+        self.assertTrue(
+            torch.allclose(
+                target.displacement_local_xy,
+                torch.tensor([[0.7, 0.0]]),
+                atol=2e-6,
+            )
+        )
+
     def test_targets_sample_bounded_command_at_all_three_horizons(self):
         target = predict_horizon_targets(
             current_velocity_world_xy=torch.zeros(2),

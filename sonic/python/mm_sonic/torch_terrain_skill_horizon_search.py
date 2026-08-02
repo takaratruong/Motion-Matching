@@ -182,8 +182,9 @@ def predict_horizon_targets(
     desired_root_height_delta_m: torch.Tensor | None = None,
     desired_surface_height_delta_m: torch.Tensor | None = None,
     matcher_config: MatcherConfig = MatcherConfig(),
+    target_frames: tuple[int, ...] = HORIZON_TARGET_FRAMES,
 ) -> HorizonTargets:
-    """Simulate the bounded command for exactly 100 50-Hz steps."""
+    """Simulate the bounded command at requested 50-Hz frame horizons."""
 
     if (
         not isinstance(current_velocity_world_xy, torch.Tensor)
@@ -206,8 +207,12 @@ def predict_horizon_targets(
         or requested_heading_world_yaw.device != current_velocity_world_xy.device
         or current_heading_world_yaw.dtype != current_velocity_world_xy.dtype
         or requested_heading_world_yaw.dtype != current_velocity_world_xy.dtype
+        or not isinstance(target_frames, tuple)
+        or not target_frames
+        or any(type(frame) is not int or frame <= 0 for frame in target_frames)
+        or tuple(sorted(set(target_frames))) != target_frames
     ):
-        raise ContractError("horizon command headings are invalid")
+        raise ContractError("horizon command headings or frames are invalid")
 
     velocity = current_velocity_world_xy
     heading = current_heading_world_yaw.reshape(())
@@ -215,7 +220,7 @@ def predict_horizon_targets(
     displacement_world = torch.zeros_like(velocity)
     sampled_displacement: list[torch.Tensor] = []
     sampled_yaw: list[torch.Tensor] = []
-    for frame in range(1, HORIZON_TARGET_FRAMES[-1] + 1):
+    for frame in range(1, target_frames[-1] + 1):
         velocity = bounded_velocity_step(
             velocity, requested_velocity_world_xy, config=matcher_config
         )
@@ -223,7 +228,7 @@ def predict_horizon_targets(
             heading, requested_heading_world_yaw, config=matcher_config
         )
         displacement_world = displacement_world + velocity * matcher_config.dt
-        if frame in HORIZON_TARGET_FRAMES:
+        if frame in target_frames:
             sampled_displacement.append(
                 _rotate_inverse_xy(displacement_world, initial_heading)
             )
@@ -231,21 +236,24 @@ def predict_horizon_targets(
 
     device = current_velocity_world_xy.device
     dtype = current_velocity_world_xy.dtype
-    frames = torch.tensor(HORIZON_TARGET_FRAMES, dtype=torch.long, device=device)
+    frames = torch.tensor(target_frames, dtype=torch.long, device=device)
+    target_count = len(target_frames)
     if desired_root_height_delta_m is None:
-        desired_root_height_delta_m = torch.zeros(3, dtype=dtype, device=device)
+        desired_root_height_delta_m = torch.zeros(
+            target_count, dtype=dtype, device=device
+        )
     if desired_surface_height_delta_m is None:
         desired_surface_height_delta_m = torch.zeros(
-            (3, 2), dtype=dtype, device=device
+            (target_count, 2), dtype=dtype, device=device
         )
     if (
         not isinstance(desired_root_height_delta_m, torch.Tensor)
-        or tuple(desired_root_height_delta_m.shape) != (3,)
+        or tuple(desired_root_height_delta_m.shape) != (target_count,)
         or desired_root_height_delta_m.device != device
         or desired_root_height_delta_m.dtype != dtype
         or not torch.isfinite(desired_root_height_delta_m).all()
         or not isinstance(desired_surface_height_delta_m, torch.Tensor)
-        or tuple(desired_surface_height_delta_m.shape) != (3, 2)
+        or tuple(desired_surface_height_delta_m.shape) != (target_count, 2)
         or desired_surface_height_delta_m.device != device
         or desired_surface_height_delta_m.dtype != dtype
         or not torch.isfinite(desired_surface_height_delta_m).all()

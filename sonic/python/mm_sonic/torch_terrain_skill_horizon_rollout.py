@@ -363,6 +363,23 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                 targets.frames == selected.target_frames, as_tuple=False
             ).flatten()[0].item()
         )
+        warp_displacement = targets.displacement_local_xy[target_index]
+        warp_yaw = targets.yaw_delta_rad[target_index]
+        if (
+            self.maximum_translation_warp_m > 0.0
+            or self.maximum_yaw_warp_rad > 0.0
+        ):
+            exact_duration = selected.endpoint_frame_exclusive - entry_frame
+            exact_target = predict_horizon_targets(
+                current_velocity_world_xy=self._shaped_velocity,
+                current_heading_world_yaw=current_yaw,
+                requested_velocity_world_xy=requested_velocity,
+                requested_heading_world_yaw=requested_heading,
+                matcher_config=self.config,
+                target_frames=(exact_duration,),
+            )
+            warp_displacement = exact_target.displacement_local_xy[0]
+            warp_yaw = exact_target.yaw_delta_rad[0]
         return start_skill(
             self.dataset.folder,
             skill,
@@ -370,10 +387,8 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             current=self._current_pose(),
             halflife_s=self.config.inertialization_halflife_s,
             playback_stop=selected.endpoint_frame_exclusive,
-            target_displacement_local_xy=(
-                targets.displacement_local_xy[target_index]
-            ),
-            target_yaw_delta_rad=targets.yaw_delta_rad[target_index],
+            target_displacement_local_xy=warp_displacement,
+            target_yaw_delta_rad=warp_yaw,
             maximum_translation_warp_m=self.maximum_translation_warp_m,
             maximum_yaw_warp_rad=self.maximum_yaw_warp_rad,
         )
