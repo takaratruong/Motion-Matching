@@ -65,6 +65,24 @@ def _plane_query(*, toe_only: bool = False) -> CanonicalMeshQuery:
     return CanonicalMeshQuery(plane, _identity_transform())
 
 
+def _tread_with_nearby_riser_query() -> CanonicalMeshQuery:
+    terrain = _mesh(
+        (
+            (-2.0, -2.0, 0.0),
+            (2.0, -2.0, 0.0),
+            (2.0, 2.0, 0.0),
+            (-2.0, 2.0, 0.0),
+            (0.101, -2.0, 0.0),
+            (0.101, 2.0, 0.0),
+            (0.101, 2.0, 0.2),
+            (0.101, -2.0, 0.2),
+        ),
+        ((0, 1, 2), (0, 2, 3), (4, 5, 6), (4, 6, 7)),
+        (True, True, True, True),
+    )
+    return CanonicalMeshQuery(terrain, _identity_transform())
+
+
 def _analytic_geometry() -> SoleGeometry:
     return SoleGeometry(
         body_names=("left_ankle_roll_link", "right_ankle_roll_link"),
@@ -348,6 +366,40 @@ class ContactReconstructionTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(
             reconstruction.contact[:, 1], (True, True, False, False)
+        )
+
+    def test_valid_tread_ray_wins_over_nearer_vertical_riser(self):
+        """Catches a closer riser normal hiding valid support 8 mm below."""
+
+        reconstruction = reconstruct_contacts(
+            _analytic_clip(sole_height=0.008),
+            _tread_with_nearby_riser_query(),
+            _config(),
+        )
+
+        self.assertTrue(np.all(reconstruction.contact))
+        np.testing.assert_allclose(
+            reconstruction.contact_confidence,
+            np.full((4, 2), 0.6, dtype=np.float32),
+            atol=1.0e-6,
+            rtol=0.0,
+        )
+
+    def test_tread_ray_normal_drives_tangential_speed_near_riser(self):
+        """Catches selecting tread distance but projecting speed on the riser."""
+
+        reconstruction = reconstruct_contacts(
+            _analytic_clip(sole_height=0.008, foot_speed=0.15),
+            _tread_with_nearby_riser_query(),
+            _config(),
+        )
+
+        self.assertFalse(np.any(reconstruction.contact))
+        np.testing.assert_allclose(
+            reconstruction.contact_confidence,
+            np.full((4, 2), 0.15, dtype=np.float32),
+            atol=1.0e-6,
+            rtol=0.0,
         )
 
     def test_toe_only_surface_is_partial_confidence_not_full_sole_contact(self):

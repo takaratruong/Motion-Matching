@@ -678,23 +678,16 @@ def reconstruct_contacts(
     ray_normal = np.asarray(surface.downward_ray_normal_world).reshape(
         (clip.frame_count, 2, probe_count, 3)
     )
-    use_ray = np.isfinite(ray_distance) & (
-        ray_distance <= closest_distance + 1.0e-9
-    )
-    distance = np.where(use_ray, ray_distance, closest_distance)
-    normal = np.where(use_ray[..., None], ray_normal, closest_normal)
-
     probe_velocity = body_linear_velocity[:, :, None, :] + np.cross(
         body_angular_velocity[:, :, None, :], rotated_probes
     )
-    normal_velocity = np.sum(probe_velocity * normal, axis=-1)
-    tangential_velocity = (
-        probe_velocity - normal_velocity[..., None] * normal
-    )
-    tangential_speed = np.linalg.norm(tangential_velocity, axis=-1)
-    maximum_tangential_speed = np.max(tangential_speed, axis=2)
     angular_speed = np.linalg.norm(body_angular_velocity, axis=-1)
 
+    distance = np.array(closest_distance, copy=True)
+    normal = np.array(closest_normal, copy=True)
+    maximum_tangential_speed = np.empty(
+        (clip.frame_count, 2), dtype=np.float64
+    )
     contact = np.zeros((clip.frame_count, 2), dtype=np.bool_)
     for foot in range(2):
         active = False
@@ -707,15 +700,41 @@ def reconstruct_contacts(
                 distance_threshold = config.enter_distance_m
                 tangential_threshold = config.enter_tangential_speed_m_s
                 angular_threshold = config.enter_angular_speed_rad_s
-            full_probe_support = np.all(
-                (distance[frame, foot] <= distance_threshold)
+            ray_support = (
+                np.isfinite(ray_distance[frame, foot])
+                & (ray_distance[frame, foot] <= distance_threshold)
                 & (
-                    normal[frame, foot, :, 2]
+                    ray_normal[frame, foot, :, 2]
                     >= config.minimum_surface_normal_z
                 )
             )
+            closest_support = (
+                closest_distance[frame, foot] <= distance_threshold
+            ) & (
+                closest_normal[frame, foot, :, 2]
+                >= config.minimum_surface_normal_z
+            )
+            distance[frame, foot] = np.where(
+                ray_support,
+                ray_distance[frame, foot],
+                closest_distance[frame, foot],
+            )
+            normal[frame, foot] = np.where(
+                ray_support[:, None],
+                ray_normal[frame, foot],
+                closest_normal[frame, foot],
+            )
+            normal_velocity = np.sum(
+                probe_velocity[frame, foot] * normal[frame, foot], axis=-1
+            )
+            tangential_velocity = probe_velocity[frame, foot] - (
+                normal_velocity[:, None] * normal[frame, foot]
+            )
+            maximum_tangential_speed[frame, foot] = float(
+                np.max(np.linalg.norm(tangential_velocity, axis=-1))
+            )
             active = bool(
-                full_probe_support
+                np.all(ray_support | closest_support)
                 and maximum_tangential_speed[frame, foot]
                 <= tangential_threshold
                 and angular_speed[frame, foot] <= angular_threshold
