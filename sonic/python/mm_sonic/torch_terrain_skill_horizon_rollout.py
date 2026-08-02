@@ -164,6 +164,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         result_filter: Any | None = None,
         contact_phase_gate: bool = False,
         contact_cycle_gate: bool = False,
+        contact_cycle_mode: str = "both",
     ) -> None:
         self.base = base_matcher
         self.database = base_matcher.database
@@ -189,6 +190,9 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         if contact_cycle_gate and not contact_phase_gate:
             raise ContractError("contact cycle gate requires contact phase gate")
         self.contact_cycle_gate = contact_cycle_gate
+        if contact_cycle_mode not in {"previous", "next", "both"}:
+            raise ContractError("contact cycle mode is invalid")
+        self.contact_cycle_mode = contact_cycle_mode
         self._clip_path_to_index = {
             clip.relative_path: index
             for index, clip in enumerate(dataset.folder.clips)
@@ -310,11 +314,15 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                     candidate_context = contact_cycle_context(
                         skill.support_mask, entry_frame
                     )
+                    indices = {
+                        "previous": (0,),
+                        "next": (1,),
+                        "both": (0, 1),
+                    }[self.contact_cycle_mode]
                     if any(
-                        expected is not None and actual != expected
-                        for expected, actual in zip(
-                            current_context, candidate_context
-                        )
+                        current_context[index] is not None
+                        and candidate_context[index] != current_context[index]
+                        for index in indices
                     ):
                         return False
             return terrain_skill_compatible(
@@ -440,6 +448,7 @@ def run_resolved_horizon_matrix(
     foot_lock: bool = False,
     contact_phase_gate: bool = False,
     contact_cycle_gate: bool = False,
+    contact_cycle_mode: str = "both",
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
@@ -556,7 +565,11 @@ def run_resolved_horizon_matrix(
                 else ":reactive-clearance"
             )
             + (":phase-gate-v1" if contact_phase_gate else ":implicit-phase")
-            + (":cycle-gate-v1" if contact_cycle_gate else ":implicit-cycle")
+            + (
+                f":cycle-gate-v2:{contact_cycle_mode}"
+                if contact_cycle_gate
+                else ":implicit-cycle"
+            )
         ).encode()
     ).hexdigest()
 
@@ -574,6 +587,7 @@ def run_resolved_horizon_matrix(
             result_filter=result_filter,
             contact_phase_gate=contact_phase_gate,
             contact_cycle_gate=contact_cycle_gate,
+            contact_cycle_mode=contact_cycle_mode,
         )
         route_matchers[route.name] = matcher
         return matcher
