@@ -55,12 +55,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Preserve the previous and next swing-foot identity at transitions.",
     )
     parser.add_argument(
-        "--contact-cycle-mode",
-        choices=("previous", "next", "both"),
-        default="both",
-        help="Choose which side of the double-support event to preserve.",
-    )
-    parser.add_argument(
         "--swing-clearance-margin-m",
         type=float,
         default=None,
@@ -218,7 +212,6 @@ def main(argv: list[str] | None = None) -> int:
         foot_lock=args.foot_lock,
         contact_phase_gate=args.contact_phase_gate,
         contact_cycle_gate=args.contact_cycle_gate,
-        contact_cycle_mode=args.contact_cycle_mode,
         swing_clearance_margin_m=args.swing_clearance_margin_m,
         foot_correction_halflife_s=args.foot_correction_halflife_s,
         swing_plan_sigma_frames=args.swing_plan_sigma_frames,
@@ -238,7 +231,6 @@ def main(argv: list[str] | None = None) -> int:
                 "foot_lock": args.foot_lock,
                 "contact_phase_gate": args.contact_phase_gate,
                 "contact_cycle_gate": args.contact_cycle_gate,
-                "contact_cycle_mode": args.contact_cycle_mode,
                 "swing_clearance_margin_m": args.swing_clearance_margin_m,
                 "foot_correction_halflife_s": args.foot_correction_halflife_s,
                 "swing_plan_sigma_frames": args.swing_plan_sigma_frames,
