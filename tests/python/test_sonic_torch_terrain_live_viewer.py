@@ -183,6 +183,14 @@ class LiveMujocoSceneTests(unittest.TestCase):
             mock.patch.object(
                 live_module, "matcher_config_from_resolved", return_value="matcher"
             ),
+            mock.patch.object(
+                live_module.MotionFolder, "load", return_value="source-folder"
+            ),
+            mock.patch.object(
+                live_module.TorchMotionDatabase,
+                "from_folder",
+                return_value=SimpleNamespace(normalization="normalization"),
+            ) as source_database,
         ):
             result = live_module._build_live_matcher(
                 resolved,
@@ -191,6 +199,7 @@ class LiveMujocoSceneTests(unittest.TestCase):
                 contact_segment_policy=None,
                 foothold_action_policy=None,
                 maximum_source_contact_p95_m=0.033,
+                normalization_source="baseline",
             )
 
         self.assertIs(result, qualified)
@@ -198,6 +207,12 @@ class LiveMujocoSceneTests(unittest.TestCase):
         self.assertNotIn("extension", kwargs)
         self.assertNotIn("emitted_window_validator", kwargs)
         self.assertEqual(kwargs["config"], "matcher")
+        self.assertEqual(kwargs["normalization_override"], "normalization")
+        source_database.assert_called_once_with(
+            "source-folder",
+            device=resolved.device,
+            reset_clip_path="flat/motion.npz",
+        )
         build_skills.assert_called_once_with(
             resolved.dataset,
             base.database,
@@ -227,6 +242,7 @@ class LiveMujocoSceneTests(unittest.TestCase):
                 "--swing-plan-sigma-frames", "2.5",
                 "--foot-correction-halflife-s", "0.02",
                 "--maximum-source-contact-p95-m", "0.033",
+                "--normalization-source", "baseline",
             ]
         )
         self.assertTrue(arguments.multi_horizon)
@@ -236,6 +252,7 @@ class LiveMujocoSceneTests(unittest.TestCase):
         self.assertEqual(arguments.swing_plan_sigma_frames, 2.5)
         self.assertEqual(arguments.foot_correction_halflife_s, 0.02)
         self.assertEqual(arguments.maximum_source_contact_p95_m, 0.033)
+        self.assertEqual(arguments.normalization_source, "baseline")
         live_module._validate_live_mode(
             multi_horizon=True,
             contact_segments=False,
@@ -429,6 +446,7 @@ class LiveMujocoSceneTests(unittest.TestCase):
             "--swing-clearance-margin-m",
             "--foot-correction-halflife-s",
             "--maximum-source-contact-p95-m",
+            "--normalization-source",
         ):
             self.assertIn(option, help_text)
         self.assertIn(

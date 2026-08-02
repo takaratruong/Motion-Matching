@@ -17,7 +17,8 @@ import torch
 from .joints import ContractError
 from .torch_g1_fk import MujocoG1FootKinematics, target_state_qpos
 from .operator_x11 import KEYSYMS, X11KeyStateProvider
-from .torch_motion_features import CommandTrajectory
+from .torch_motion_data import MotionFolder
+from .torch_motion_features import CommandTrajectory, TorchMotionDatabase
 from .torch_motion_matcher import (
     MotionMatchResult,
     TorchMotionMatcher,
@@ -507,6 +508,7 @@ def _validate_live_mode(
     foot_correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
     maximum_source_contact_p95_m: float | None = None,
+    normalization_source: str | None = None,
 ) -> None:
     if multi_horizon and (contact_segments or foothold_arm is not None):
         raise ContractError(
@@ -522,6 +524,8 @@ def _validate_live_mode(
         raise ContractError("swing plan requires swing clearance")
     if maximum_source_contact_p95_m is not None and not multi_horizon:
         raise ContractError("source contact quality gate requires multi-horizon mode")
+    if normalization_source is not None and not multi_horizon:
+        raise ContractError("normalization source requires multi-horizon mode")
 
 
 def _build_live_matcher(
@@ -537,14 +541,26 @@ def _build_live_matcher(
     foot_correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
     maximum_source_contact_p95_m: float | None = None,
+    normalization_source: str | None = None,
 ):
     matcher_config = matcher_config_from_resolved(resolved.resolved_config)
     if multi_horizon:
+        normalization_override = None
+        if normalization_source is not None:
+            source_folder = MotionFolder.load(normalization_source)
+            source_database = TorchMotionDatabase.from_folder(
+                source_folder,
+                device=resolved.device,
+                reset_clip_path=resolved.resolved_config["reset_clip"],
+            )
+            normalization_override = source_database.normalization
+            del source_database, source_folder
         base = TorchMotionMatcher.from_folder(
             resolved.dataset.root,
             device=str(resolved.device),
             config=matcher_config,
             reset_clip_path=resolved.resolved_config["reset_clip"],
+            normalization_override=normalization_override,
         )
         skills = build_terrain_skill_inventory(
             resolved.dataset,
@@ -619,6 +635,7 @@ def run_live_viewer(
     foot_correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
     maximum_source_contact_p95_m: float | None = None,
+    normalization_source: str | None = None,
 ) -> None:
     """Run the dense 50 Hz matcher and display each committed state."""
 
@@ -637,6 +654,7 @@ def run_live_viewer(
         foot_correction_halflife_s=foot_correction_halflife_s,
         swing_plan_sigma_frames=swing_plan_sigma_frames,
         maximum_source_contact_p95_m=maximum_source_contact_p95_m,
+        normalization_source=normalization_source,
     )
     if contact_segments:
         from .torch_contact_segment_rollout import (
@@ -733,6 +751,7 @@ def run_live_viewer(
         foot_correction_halflife_s=foot_correction_halflife_s,
         swing_plan_sigma_frames=swing_plan_sigma_frames,
         maximum_source_contact_p95_m=maximum_source_contact_p95_m,
+        normalization_source=normalization_source,
     )
     from .torch_terrain_omni_rollout import resolved_stair_reset_position
 
@@ -966,6 +985,11 @@ def build_live_viewer_argument_parser() -> argparse.ArgumentParser:
         help="Exclude terrain clips with worse authenticated contact fit.",
     )
     parser.add_argument(
+        "--normalization-source",
+        default=None,
+        help="Freeze feature normalization to another motion corpus.",
+    )
+    parser.add_argument(
         "--contact-segments",
         action="store_true",
         help="Use committed authoritative-FK terrain contact segments.",
@@ -1063,6 +1087,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         maximum_source_contact_p95_m=(
             args.maximum_source_contact_p95_m
         ),
+        normalization_source=args.normalization_source,
     )
     return 0
 
