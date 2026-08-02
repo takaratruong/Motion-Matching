@@ -3,11 +3,13 @@ import hashlib
 import json
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import joblib
 import numpy as np
 
+from mm_sonic.terrain_oracle import storage
 from mm_sonic.terrain_oracle.source_grail import (
     C490_EXPECTED_COUNTS,
     C490_FAMILIES,
@@ -211,6 +213,30 @@ class GrailDiscoveryTests(unittest.TestCase):
 
 @unittest.skipUnless(MODEL.is_file(), "real G1 MuJoCo model is unavailable")
 class GrailSourceAdapterTests(unittest.TestCase):
+    def test_mesh_binding_uses_the_public_storage_digest_authority(self):
+        """Catches a second serializer drifting from canonical mesh storage."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root, _position, _rotation = _write_grail_fixture(Path(temporary))
+            authoritative_digest = "f" * 64
+            with mock.patch.object(
+                storage,
+                "mesh_digest",
+                return_value=authoritative_digest,
+            ):
+                imported = next(
+                    iter_grail_clips(
+                        root,
+                        families=("c490_stair_p1",),
+                        model_path=MODEL,
+                    )
+                )
+
+            self.assertEqual(
+                imported.clip.terrain.mesh_sha256,
+                authoritative_digest,
+            )
+
     def test_emits_clip_and_paired_content_addressed_mesh_with_exact_pose(self):
         with tempfile.TemporaryDirectory() as temporary:
             root, expected_position, expected_rotation = _write_grail_fixture(

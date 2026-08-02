@@ -268,3 +268,73 @@ PYTHONPATH=sonic/python sonic/.torch-mm-venv/bin/python -B \
 The matcher publishes overlapping 46-row windows. Physics remains fenced until
 GEAR acknowledges the final row, after which exactly one 20 ms policy interval
 is released. W/A/S/D move, Space stops, Backspace restarts, and X exits.
+
+## Audited canonical terrain corpus
+
+The phase-1 corpus tool is available as
+`python -m mm_sonic.terrain_oracle.corpus_cli` (or the lazy
+`mm_sonic.terrain_oracle.corpus_main` entry point). Its commands are
+`inventory`, `import`, `audit`, `render-audit`, `coverage`, and `freeze`.
+The normal publication sequence is:
+
+```bash
+PYTHONPATH=sonic/python:. \
+  /move/u/justingu/miniconda3/envs/isaac6_test/bin/python -B \
+  -m mm_sonic.terrain_oracle.corpus_cli import \
+  --fixture CANONICAL_FIXTURE --output RAW_CORPUS
+
+PYTHONPATH=sonic/python:. \
+  /move/u/justingu/miniconda3/envs/isaac6_test/bin/python -B \
+  -m mm_sonic.terrain_oracle.corpus_cli audit \
+  --corpus RAW_CORPUS --model G1_MODEL.xml --output AUDITED_CORPUS
+
+PYTHONPATH=sonic/python:. \
+  /move/u/justingu/miniconda3/envs/isaac6_test/bin/python -B \
+  -m mm_sonic.terrain_oracle.corpus_cli render-audit \
+  --corpus AUDITED_CORPUS --renderer PYTHON \
+  --renderer-arg ROBOT_MESH_RENDERER.py \
+  --output AUDITED_CORPUS/render-audit
+
+PYTHONPATH=sonic/python:. \
+  /move/u/justingu/miniconda3/envs/isaac6_test/bin/python -B \
+  -m mm_sonic.terrain_oracle.corpus_cli coverage \
+  --corpus AUDITED_CORPUS --output AUDITED_CORPUS/coverage.json
+
+PYTHONPATH=sonic/python:. \
+  /move/u/justingu/miniconda3/envs/isaac6_test/bin/python -B \
+  -m mm_sonic.terrain_oracle.corpus_cli freeze \
+  --corpus AUDITED_CORPUS --output FROZEN_CORPUS
+```
+
+`audit` republishes canonical clip and mesh bytes with exactly one mechanical
+report per clip. `render-audit` runs argument-vector subprocesses with
+`shell=False`; it records one video/contact-overlay pair for every accepted
+`[start,end)` interval, one contact sheet covering the complete interval set,
+and one full video for every recomputed
+`(source, action_class, terrain, direction)` stratum. Receipts bind clip,
+source, model, terrain, mesh, normalized invocation, executable, and output
+hashes. `coverage` is rebuilt from the public phase-1 coverage authority.
+`freeze` accepts no missing, extra, stale, malformed, or hash-consistent but
+mismatched audit/render/coverage evidence. The frozen release carries an
+authenticated compiled G1 MJB and reloads it to prove the same structural model
+hash, so the release does not depend on the XML's external `meshdir`.
+
+The exact real inventory command reported 173 flat clips, 18 Justin clips, and
+489 clean GRAIL pairs: 166 `c490_stair_p1`, 174 `c490_stair_p2`, 77
+`c490_slope`, and 72 `c490_curb`. The sealed inventory file SHA-256 is
+`5c1a909f7d8941c5dba724747cdea6bf7da5705d75e5682719cb0f988900a300`;
+its recomputed content hash is
+`baa643d2909676e581b4d1d2a09ba9d1a153688d7f7c5aa1f9522a5577d6b7c1`.
+The selected LAFAN G1 release contains 40 strict numeric CSVs at immutable
+revision `ce1572906efe6157840e8474d5a0d7aa87481e74`; every downloaded CSV,
+README, and LICENSE metadata sidecar records that commit. The README assigns
+the LAFAN1 motion data to `CC-BY-NC-ND-4.0`, while the separate repository/code
+LICENSE is `BSD-3-Clause`. The LAFAN inventory file SHA-256 is
+`1b1f8097c532a08c26e39e7f504f7bb2f4e887636129c59f95930ea0ef41d844`;
+its recomputed content hash is
+`98493a9a0443ed2b9151a1de4b5084ebe3283657f4f055333a92ba724588820c`.
+
+All publications use canonical relative paths, fsync-backed staging, and
+atomic no-replace semantics. Existing destinations are never overwritten.
+Contract failures—including malformed arguments—print an actionable error and
+return status 2 without a Python traceback; `--help` returns status 0.

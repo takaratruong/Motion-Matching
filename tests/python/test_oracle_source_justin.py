@@ -224,6 +224,49 @@ class JustinSourceAdapterTests(unittest.TestCase):
             with self.assertRaisesRegex(ContractError, "exclusive"):
                 list(iter_justin_clips(source, _terrain_binding()))
 
+    def test_clip_names_reject_numeric_null_and_other_non_string_values(self):
+        """Catches laundering malformed producer names through ``str(value)``."""
+
+        cases = (
+            (
+                "numeric",
+                np.array([101, 202], dtype=np.int64),
+                None,
+            ),
+            (
+                "null",
+                np.array([None, "down_zero"], dtype=object),
+                zarr.codecs.JSON(),
+            ),
+            (
+                "mixed-object",
+                np.array(["up_zero", {"name": "down_zero"}], dtype=object),
+                zarr.codecs.JSON(),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root_path = Path(tmp)
+            for case, values, object_codec in cases:
+                with self.subTest(case=case):
+                    source = _write_justin_zarr(
+                        root_path / f"{case}.zarr"
+                    )
+                    archive = zarr.open(str(source), mode="a")
+                    del archive["clip_names"]
+                    kwargs = {}
+                    if object_codec is not None:
+                        kwargs["object_codec"] = object_codec
+                    archive.create_dataset(
+                        "clip_names",
+                        data=values,
+                        **kwargs,
+                    )
+
+                    with self.assertRaisesRegex(
+                        ContractError, "clip_names.*strings"
+                    ):
+                        list(iter_justin_clips(source, _terrain_binding()))
+
 
 if __name__ == "__main__":
     unittest.main()

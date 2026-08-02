@@ -84,11 +84,15 @@ def _decode_names(value: object) -> tuple[str, ...]:
     names: list[str] = []
     for item in array:
         if isinstance(item, bytes):
-            item = item.decode("utf-8")
-        name = str(item)
-        if not name:
+            try:
+                item = item.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise _fail("clip_names must contain UTF-8 strings") from error
+        if not isinstance(item, str):
+            raise _fail("clip_names must contain only strings")
+        if not item:
             raise _fail("clip_names must be nonempty strings")
-        names.append(name)
+        names.append(item)
     if len(set(names)) != len(names):
         raise _fail("clip_names must be unique")
     return tuple(names)

@@ -75,6 +75,17 @@ class LafanSourceAdapterTests(unittest.TestCase):
             self.assertEqual(clip.source.pose_origin, "clean-motion-corpus")
             clip.validate()
 
+    def test_crlf_rows_and_one_final_line_ending_remain_valid(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = _write_lafan_csv(
+                Path(temporary) / "walk4_subject1.csv", frames=4
+            )
+            path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+
+            clip = load_lafan_csv(path, MODEL, terrain=None)
+
+            self.assertEqual(clip.frame_count, 6)
+
     def test_shortest_path_slerp_and_exact_mujoco_to_isaaclab_joint_order(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = _write_lafan_csv(
@@ -190,6 +201,26 @@ class LafanSourceAdapterTests(unittest.TestCase):
                     path.write_text(text)
                     with self.assertRaisesRegex(
                         ValueError, "36|finite|numeric|frames"
+                    ):
+                        load_lafan_csv(path, MODEL, terrain=None)
+
+    def test_rejects_comment_and_blank_physical_rows(self):
+        """Catches NumPy silently skipping lines absent from the CSV contract."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            valid = _write_lafan_csv(root / "valid.csv").read_text().splitlines()
+            cases = {
+                "comment-first.csv": ["# undocumented header", *valid],
+                "comment-middle.csv": [valid[0], "# hidden row", *valid[1:]],
+                "blank-middle.csv": [valid[0], "", *valid[1:]],
+            }
+            for name, lines in cases.items():
+                with self.subTest(name=name):
+                    path = root / name
+                    path.write_text("\n".join(lines) + "\n")
+                    with self.assertRaisesRegex(
+                        ValueError, "numeric row|blank|comment"
                     ):
                         load_lafan_csv(path, MODEL, terrain=None)
 

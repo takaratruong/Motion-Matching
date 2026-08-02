@@ -21,6 +21,7 @@ from mm_sonic.grail_terrain_source import (
     resample_grail_motion,
 )
 
+from . import storage
 from .canonical import (
     CANONICAL_COORDINATE_CONVENTION,
     CLEAN_POSE_ORIGIN,
@@ -38,7 +39,6 @@ from .math3d import (
     finite_difference,
     unroll_quaternions_wxyz,
 )
-from .storage import _canonical_json_bytes, _deterministic_npz_bytes
 
 
 C490_FAMILIES = (
@@ -209,24 +209,6 @@ def discover_clean_c490_records(
     if len(stems) != len(set(stems)):
         raise ValueError("duplicate GRAIL stem across clean c490 families")
     return tuple(records)
-
-
-def _mesh_digest(mesh: CanonicalTerrainMesh) -> str:
-    payload = _deterministic_npz_bytes(
-        {
-            "vertices_local": mesh.vertices_local,
-            "faces": mesh.faces,
-            "valid_faces": mesh.valid_faces,
-            "metadata_json": np.frombuffer(
-                _canonical_json_bytes(
-                    {"source_asset_sha256": mesh.source_asset_sha256},
-                    "mesh metadata",
-                ),
-                dtype=np.uint8,
-            ),
-        }
-    )
-    return hashlib.sha256(payload).hexdigest()
 
 
 def _load_usd_mesh(
@@ -415,7 +397,7 @@ def _canonicalize_record(
         asset_size_bytes=len(asset_bytes),
         asset_sha256=asset_sha256,
         asset_license_id="UNRECORDED",
-        mesh_sha256=_mesh_digest(mesh),
+        mesh_sha256=storage.mesh_digest(mesh),
         world_from_terrain=RigidTransform(
             record.terrain_position_env,
             record.terrain_rotation_env_wxyz,

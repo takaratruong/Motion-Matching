@@ -1,0 +1,2524 @@
+"""Command-line publication for the audited canonical terrain corpus."""
+
+from __future__ import annotations
+
+import argparse
+from collections import Counter
+import errno
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+from typing import Sequence
+
+import numpy as np
+
+from mm_sonic.joints import ContractError
+
+from . import (
+    coverage,
+    source_flat,
+    source_grail,
+    source_justin,
+    source_lafan,
+    storage,
+)
+from .audit import ClipAudit, audit_clip, structural_model_sha256
+from .canonical import CanonicalClip, CanonicalTerrainMesh, TerrainBinding
+from .contact import CanonicalMeshQuery
+from .math3d import RigidTransform
+
+
+def _reject_unsafe_cli_path(path: Path, label: str) -> Path:
+    candidate = Path(path).expanduser()
+    if any(part in ("", "..") for part in candidate.parts):
+        raise ContractError(f"{label} path must not contain traversal")
+    absolute = candidate.absolute()
+    for component in (*reversed(absolute.parents), absolute):
+        if component.is_symlink():
+            raise ContractError(f"{label} path must not traverse a symlink")
+    return absolute
+
+
+def _cli_input_directory(path: Path, label: str) -> Path:
+    resolved = _reject_unsafe_cli_path(path, label).resolve()
+    if not resolved.is_dir():
+        raise ContractError(f"{label} is not a directory: {resolved}")
+    return resolved
+
+
+def _cli_input_file(path: Path, label: str) -> Path:
+    resolved = _reject_unsafe_cli_path(path, label).resolve()
+    if not resolved.is_file():
+        raise ContractError(f"{label} is not a file: {resolved}")
+    return resolved
+
+
+def _cli_output_path(path: Path, label: str) -> Path:
+    output = _reject_unsafe_cli_path(path, label)
+    if output.name in ("", ".", ".."):
+        raise ContractError(f"{label} must be a narrow path")
+    return output
+
+
+def _load_fixture(
+    path: Path,
+) -> tuple[
+    tuple[CanonicalClip, ...],
+    tuple[CanonicalTerrainMesh, ...],
+    dict[str, object],
+]:
+    root = _cli_input_directory(path, "fixture corpus")
+    manifest = storage.load_corpus(root)
+    clips = tuple(
+        storage.read_clip(root / record.relative_path)
+        for record in manifest.clips
+    )
+    meshes = tuple(
+        storage.read_mesh(root / record.relative_path)
+        for record in manifest.meshes
+    )
+    return clips, meshes, dict(manifest.metadata)
+
+
+def _publish_bundle(
+    output: Path,
+    clips: Sequence[CanonicalClip],
+    meshes: Sequence[CanonicalTerrainMesh],
+    metadata: dict[str, object],
+) -> None:
+    destination = _cli_output_path(output, "import output")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(
+        tempfile.mkdtemp(
+            prefix=f".{destination.name}.",
+            dir=destination.parent,
+        )
+    )
+    try:
+        clip_records = tuple(
+            storage.write_clip(stage / "clips", clip)
+            for clip in clips
+        )
+        mesh_records = tuple(
+            storage.write_mesh(stage / "meshes", mesh)
+            for mesh in meshes
+        )
+        manifest_directory = storage.publish_corpus(
+            stage / "_manifest",
+            clip_records,
+            {
+                **metadata,
+                "mesh_records": [
+                    record.to_dict() for record in mesh_records
+                ],
+            },
+        )
+        os.replace(
+            manifest_directory / "manifest.json",
+            stage / "manifest.json",
+        )
+        manifest_directory.rmdir()
+        storage._fsync_directory(stage)
+        storage._rename_noreplace(stage, destination)
+        storage._fsync_directory(destination.parent)
+    except BaseException:
+        if stage.exists():
+            shutil.rmtree(stage)
+        raise
+
+
+def _import_fixture(arguments: argparse.Namespace) -> None:
+    clips, meshes, metadata = _load_fixture(arguments.fixture)
+    _publish_bundle(arguments.output, clips, meshes, metadata)
+
+
+def _model_record(path: Path, model: object) -> dict[str, object]:
+    resolved = _cli_input_file(path, "mechanical model")
+    payload = resolved.read_bytes()
+    return {
+        "asset_path": str(resolved),
+        "asset_size_bytes": len(payload),
+        "asset_sha256": hashlib.sha256(payload).hexdigest(),
+        "structural_sha256": structural_model_sha256(model),
+    }
+
+
+def _audit_entry(
+    report: ClipAudit,
+    relative_path: str,
+    report_sha256: str,
+) -> dict[str, object]:
+    return {
+        "clip_id": report.clip_id,
+        "clip_sha256": report.clip_sha256,
+        "source_sha256": report.source_sha256,
+        "model_sha256": report.model_sha256,
+        "terrain_sha256": report.terrain_sha256,
+        "status": report.status,
+        "accepted_intervals": [
+            list(interval) for interval in report.accepted_intervals
+        ],
+        "reasons": [reason.to_dict() for reason in report.reasons],
+        "relative_path": relative_path,
+        "sha256": report_sha256,
+    }
+
+
+def _verify_audit_stage(
+    stage: Path,
+    expected_index: dict[str, object],
+) -> None:
+    manifest = storage.load_corpus(stage)
+    for record in manifest.clips:
+        clip = storage.read_clip(stage / record.relative_path)
+        if (
+            clip.clip_id != record.clip_id
+            or clip.frame_count != record.frame_count
+        ):
+            raise ContractError("audited clip record does not match its bytes")
+    for record in manifest.meshes:
+        storage.read_mesh(stage / record.relative_path)
+    index_path = stage / "audit-index.json"
+    loaded_index = json.loads(index_path.read_text("ascii"))
+    if loaded_index != expected_index:
+        raise ContractError("reloaded audit index does not match publication")
+    reports = loaded_index["reports"]
+    if not isinstance(reports, list) or len(reports) != len(manifest.clips):
+        raise ContractError("audit index must contain exactly one report per clip")
+    for entry in reports:
+        if not isinstance(entry, dict):
+            raise ContractError("audit index reports must be objects")
+        report_path = stage / str(entry["relative_path"])
+        payload = report_path.read_bytes()
+        if hashlib.sha256(payload).hexdigest() != entry["sha256"]:
+            raise ContractError("audit report hash mismatch after publication")
+        report = ClipAudit.from_dict(json.loads(payload.decode("ascii")))
+        if _audit_entry(
+            report,
+            str(entry["relative_path"]),
+            str(entry["sha256"]),
+        ) != entry:
+            raise ContractError("audit report and index evidence mismatch")
+
+
+def _publish_audit_bundle(
+    output: Path,
+    clips: Sequence[CanonicalClip],
+    meshes: Sequence[CanonicalTerrainMesh],
+    metadata: dict[str, object],
+    reports: Sequence[ClipAudit],
+    source_manifest_sha256: str,
+    model_record: dict[str, object],
+) -> None:
+    destination = _cli_output_path(output, "audit output")
+    if len(reports) != len(clips):
+        raise ContractError("mechanical audit requires one report per clip")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(
+        tempfile.mkdtemp(
+            prefix=f".{destination.name}.",
+            dir=destination.parent,
+        )
+    )
+    try:
+        clip_records = tuple(
+            storage.write_clip(stage / "clips", clip)
+            for clip in clips
+        )
+        mesh_records = tuple(
+            storage.write_mesh(stage / "meshes", mesh)
+            for mesh in meshes
+        )
+        manifest_directory = storage.publish_corpus(
+            stage / "_manifest",
+            clip_records,
+            {
+                **metadata,
+                "audit": {
+                    "schema": "terrain-oracle-audit-index/v1",
+                    "source_corpus_manifest_sha256": (
+                        source_manifest_sha256
+                    ),
+                    "model": model_record,
+                },
+                "mesh_records": [
+                    record.to_dict() for record in mesh_records
+                ],
+            },
+        )
+        os.replace(
+            manifest_directory / "manifest.json",
+            stage / "manifest.json",
+        )
+        manifest_directory.rmdir()
+        output_manifest_sha256 = hashlib.sha256(
+            (stage / "manifest.json").read_bytes()
+        ).hexdigest()
+        entries: list[dict[str, object]] = []
+        for record, report in zip(
+            clip_records,
+            reports,
+            strict=True,
+        ):
+            if report.clip_sha256 != record.sha256:
+                raise ContractError(
+                    "audit report does not bind the republished clip bytes"
+                )
+            relative_path = f"audits/{record.sha256}.json"
+            payload = storage._canonical_json_bytes(
+                report.to_dict(),
+                "mechanical audit report",
+            )
+            report_sha256 = hashlib.sha256(payload).hexdigest()
+            storage._write_no_replace(stage / relative_path, payload)
+            entries.append(
+                _audit_entry(report, relative_path, report_sha256)
+            )
+        entries.sort(
+            key=lambda entry: (
+                str(entry["clip_id"]),
+                str(entry["clip_sha256"]),
+            )
+        )
+        without_hash = {
+            "schema": "terrain-oracle-audit-index/v1",
+            "source_corpus_manifest_sha256": source_manifest_sha256,
+            "corpus_manifest_sha256": output_manifest_sha256,
+            "model": model_record,
+            "reports": entries,
+        }
+        content_sha256 = hashlib.sha256(
+            storage._canonical_json_bytes(
+                without_hash,
+                "mechanical audit index",
+            )
+        ).hexdigest()
+        index = {
+            **without_hash,
+            "content_sha256": content_sha256,
+        }
+        storage._write_no_replace(
+            stage / "audit-index.json",
+            storage._canonical_json_bytes(
+                index,
+                "mechanical audit index",
+            ),
+        )
+        _verify_audit_stage(stage, index)
+        storage._fsync_directory(stage)
+        storage._rename_noreplace(stage, destination)
+        storage._fsync_directory(destination.parent)
+    except BaseException:
+        if stage.exists():
+            shutil.rmtree(stage)
+        raise
+
+
+def _audit_corpus(arguments: argparse.Namespace) -> None:
+    root = _cli_input_directory(arguments.corpus, "corpus")
+    manifest = storage.load_corpus(root)
+    clips = tuple(
+        storage.read_clip(root / record.relative_path)
+        for record in manifest.clips
+    )
+    meshes = tuple(
+        storage.read_mesh(root / record.relative_path)
+        for record in manifest.meshes
+    )
+    mesh_by_sha256 = {
+        record.sha256: mesh
+        for record, mesh in zip(
+            manifest.meshes,
+            meshes,
+            strict=True,
+        )
+    }
+    if len(mesh_by_sha256) != len(meshes):
+        raise ContractError("corpus mesh records must be unique")
+    try:
+        import mujoco
+    except ImportError as error:
+        raise ContractError("mechanical audit requires MuJoCo") from error
+    model_path = _cli_input_file(arguments.model, "mechanical model")
+    model = mujoco.MjModel.from_xml_path(str(model_path))
+    model_record = _model_record(model_path, model)
+    reports: list[ClipAudit] = []
+    for clip, record in zip(
+        clips,
+        manifest.clips,
+        strict=True,
+    ):
+        if (
+            clip.clip_id != record.clip_id
+            or clip.frame_count != record.frame_count
+        ):
+            raise ContractError("corpus clip record does not match its bytes")
+        if clip.terrain is None:
+            raise ContractError(
+                f"clip {clip.clip_id} has no exact terrain binding"
+            )
+        mesh = mesh_by_sha256.get(clip.terrain.mesh_sha256)
+        if mesh is None:
+            raise ContractError(
+                f"clip {clip.clip_id} terrain mesh is absent from corpus"
+            )
+        query = CanonicalMeshQuery(
+            mesh,
+            clip.terrain.world_from_terrain,
+        )
+        reports.append(audit_clip(clip, model, query))
+    source_manifest_sha256 = hashlib.sha256(
+        (root / "manifest.json").read_bytes()
+    ).hexdigest()
+    _publish_audit_bundle(
+        arguments.output,
+        clips,
+        meshes,
+        dict(manifest.metadata),
+        reports,
+        source_manifest_sha256,
+        model_record,
+    )
+
+
+def _canonical_relative_path(value: object, directory: str) -> str:
+    if type(value) is not str or not value:
+        raise ContractError("artifact relative path must be a nonempty string")
+    path = Path(value)
+    if (
+        path.is_absolute()
+        or value != path.as_posix()
+        or not path.parts
+        or path.parts[0] != directory
+        or any(part in ("", ".", "..") for part in path.parts)
+    ):
+        raise ContractError(
+            f"artifact relative path must be canonical beneath {directory}/"
+        )
+    return value
+
+
+def _load_audit_evidence(
+    root: Path,
+) -> tuple[
+    storage.CorpusManifest,
+    tuple[CanonicalClip, ...],
+    dict[str, object],
+    dict[str, ClipAudit],
+]:
+    manifest = storage.load_corpus(root)
+    clips = tuple(
+        storage.read_clip(root / record.relative_path)
+        for record in manifest.clips
+    )
+    try:
+        index_payload = (root / "audit-index.json").read_bytes()
+        index = json.loads(index_payload.decode("ascii"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ContractError("invalid mechanical audit index") from error
+    if not isinstance(index, dict) or set(index) != {
+        "schema",
+        "source_corpus_manifest_sha256",
+        "corpus_manifest_sha256",
+        "model",
+        "reports",
+        "content_sha256",
+    }:
+        raise ContractError("mechanical audit index fields do not match v1")
+    without_hash = dict(index)
+    declared_content_sha256 = without_hash.pop("content_sha256")
+    if (
+        index["schema"] != "terrain-oracle-audit-index/v1"
+        or declared_content_sha256
+        != hashlib.sha256(
+            storage._canonical_json_bytes(
+                without_hash,
+                "mechanical audit index",
+            )
+        ).hexdigest()
+        or index["corpus_manifest_sha256"]
+        != hashlib.sha256((root / "manifest.json").read_bytes()).hexdigest()
+    ):
+        raise ContractError("mechanical audit index hash or corpus binding is stale")
+    model_record = index["model"]
+    if not isinstance(model_record, dict) or set(model_record) != {
+        "asset_path",
+        "asset_size_bytes",
+        "asset_sha256",
+        "structural_sha256",
+    }:
+        raise ContractError("mechanical audit model fields do not match v1")
+    model_path = Path(str(model_record["asset_path"]))
+    if not model_path.is_file() or model_path.is_symlink():
+        raise ContractError("mechanical audit model asset is missing or a symlink")
+    model_payload = model_path.read_bytes()
+    if (
+        len(model_payload) != model_record["asset_size_bytes"]
+        or hashlib.sha256(model_payload).hexdigest()
+        != model_record["asset_sha256"]
+    ):
+        raise ContractError("mechanical audit model asset hash is stale")
+    try:
+        import mujoco
+    except ImportError as error:
+        raise ContractError("render audit requires MuJoCo") from error
+    model = mujoco.MjModel.from_xml_path(str(model_path))
+    if structural_model_sha256(model) != model_record["structural_sha256"]:
+        raise ContractError("mechanical audit structural model hash is stale")
+    raw_entries = index["reports"]
+    if not isinstance(raw_entries, list):
+        raise ContractError("mechanical audit reports must be a list")
+    reports: dict[str, ClipAudit] = {}
+    entries_by_sha256: dict[str, dict[str, object]] = {}
+    for entry in raw_entries:
+        if not isinstance(entry, dict) or set(entry) != {
+            "clip_id",
+            "clip_sha256",
+            "source_sha256",
+            "model_sha256",
+            "terrain_sha256",
+            "status",
+            "accepted_intervals",
+            "reasons",
+            "relative_path",
+            "sha256",
+        }:
+            raise ContractError("mechanical audit report index fields do not match v1")
+        clip_sha256 = str(entry["clip_sha256"])
+        expected_path = f"audits/{clip_sha256}.json"
+        relative_path = _canonical_relative_path(
+            entry["relative_path"],
+            "audits",
+        )
+        if relative_path != expected_path:
+            raise ContractError("mechanical audit report path is not canonical")
+        report_path = root / relative_path
+        if report_path.is_symlink() or not report_path.is_file():
+            raise ContractError("mechanical audit report is missing or a symlink")
+        payload = report_path.read_bytes()
+        if hashlib.sha256(payload).hexdigest() != entry["sha256"]:
+            raise ContractError("mechanical audit report hash mismatch")
+        try:
+            report = ClipAudit.from_dict(
+                json.loads(payload.decode("ascii"))
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ContractError("invalid mechanical audit report JSON") from error
+        if _audit_entry(
+            report,
+            relative_path,
+            str(entry["sha256"]),
+        ) != entry:
+            raise ContractError("mechanical audit report evidence is stale")
+        if clip_sha256 in reports:
+            raise ContractError("mechanical audit report clip hash is duplicated")
+        reports[clip_sha256] = report
+        entries_by_sha256[clip_sha256] = entry
+    expected_sha256 = {record.sha256 for record in manifest.clips}
+    if set(reports) != expected_sha256 or len(reports) != len(manifest.clips):
+        raise ContractError("mechanical audit reports must exactly cover corpus clips")
+    for record, clip in zip(manifest.clips, clips, strict=True):
+        report = reports[record.sha256]
+        if (
+            clip.clip_id != record.clip_id
+            or clip.frame_count != record.frame_count
+            or report.clip_id != clip.clip_id
+            or report.clip_sha256 != record.sha256
+            or report.source_sha256 != clip.source.source_sha256
+        ):
+            raise ContractError("mechanical audit and canonical clip mismatch")
+    return manifest, clips, index, reports
+
+
+def _normalized_renderer_argument(value: str) -> str:
+    candidate = Path(value).expanduser()
+    return str(candidate.resolve()) if candidate.is_file() else value
+
+
+def _accepted_interval_key(
+    clip_sha256: str,
+    start_frame: int,
+    end_frame: int,
+) -> str:
+    return f"{clip_sha256}:{start_frame}:{end_frame}"
+
+
+def _action_class(clip: CanonicalClip) -> str:
+    tags = set(clip.action_tags)
+    aliases = {
+        "up": "ascent",
+        "down": "descent",
+        "sprint": "run",
+    }
+    for alias, action_class in aliases.items():
+        if alias in tags:
+            return action_class
+    for action_class in coverage.ACTION_CLASSES:
+        if action_class != "other" and action_class in tags:
+            return action_class
+    return "other"
+
+
+def _terrain_class(clip: CanonicalClip) -> str:
+    tags = set(clip.action_tags)
+    for terrain in ("stairs", "slope", "curb", "flat"):
+        if terrain in tags:
+            return terrain
+    return "other"
+
+
+def _direction_class(
+    clip: CanonicalClip,
+    start_frame: int,
+    end_frame: int,
+) -> str:
+    velocity = np.mean(
+        clip.commands.inferred_velocity_local_xy[start_frame:end_frame],
+        axis=0,
+        dtype=np.float64,
+    )
+    if float(np.linalg.norm(velocity)) < 0.1:
+        return "stationary"
+    if abs(float(velocity[0])) >= abs(float(velocity[1])):
+        return "forward" if velocity[0] >= 0.0 else "backward"
+    return "left" if velocity[1] >= 0.0 else "right"
+
+
+def _render_input(
+    record: storage.ClipRecord,
+    clip: CanonicalClip,
+    report: ClipAudit,
+    interval: object,
+    model_record: object,
+) -> dict[str, object]:
+    if clip.terrain is None:
+        raise ContractError(
+            f"accepted clip {clip.clip_id} has no terrain binding"
+        )
+    start_frame = int(interval.start_frame)
+    end_frame = int(interval.end_frame)
+    return {
+        "interval_key": _accepted_interval_key(
+            record.sha256,
+            start_frame,
+            end_frame,
+        ),
+        "clip_id": clip.clip_id,
+        "clip_sha256": record.sha256,
+        "source_sha256": clip.source.source_sha256,
+        "model": model_record,
+        "terrain_sha256": report.terrain_sha256,
+        "terrain_mesh_sha256": clip.terrain.mesh_sha256,
+        "interval": [start_frame, end_frame],
+    }
+
+
+def _artifact_record(path: Path, relative_path: str) -> dict[str, object]:
+    if not path.is_file() or path.is_symlink():
+        raise ContractError("renderer did not produce a regular artifact file")
+    payload = path.read_bytes()
+    return {
+        "relative_path": relative_path,
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "size_bytes": len(payload),
+    }
+
+
+def _run_renderer(
+    *,
+    stage: Path,
+    renderer: Path,
+    renderer_arguments: tuple[str, ...],
+    renderer_sha256: str,
+    request: dict[str, object],
+    semantic_arguments: list[str],
+) -> tuple[dict[str, object], str]:
+    request_id = hashlib.sha256(
+        storage._canonical_json_bytes(request, "render request")
+    ).hexdigest()
+    video_relative = f"artifacts/{request_id}.mp4"
+    overlay_relative = f"artifacts/{request_id}.contact.png"
+    normalized_argv = [
+        str(renderer),
+        *renderer_arguments,
+        *semantic_arguments,
+        "--video",
+        video_relative,
+        "--overlay",
+        overlay_relative,
+    ]
+    actual_argv = [
+        *normalized_argv[:-3],
+        str(stage / video_relative),
+        "--overlay",
+        str(stage / overlay_relative),
+    ]
+    completed = subprocess.run(
+        actual_argv,
+        shell=False,
+        check=False,
+        capture_output=True,
+        text=False,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.decode(
+            "utf-8",
+            errors="replace",
+        ).strip()
+        raise ContractError(
+            "renderer failed with exit "
+            f"{completed.returncode}: {detail}"
+        )
+    renderer_record = {
+        "argv": normalized_argv,
+        "executable_sha256": renderer_sha256,
+        "invocation_sha256": hashlib.sha256(
+            storage._canonical_json_bytes(
+                normalized_argv,
+                "normalized renderer argv",
+            )
+        ).hexdigest(),
+        "shell": False,
+        "returncode": completed.returncode,
+    }
+    artifacts = {
+        "video": _artifact_record(
+            stage / video_relative,
+            video_relative,
+        ),
+        "contact_overlay": _artifact_record(
+            stage / overlay_relative,
+            overlay_relative,
+        ),
+    }
+    return {**renderer_record, **artifacts}, request_id
+
+
+def _write_render_receipt(
+    stage: Path,
+    relative_path: str,
+    receipt: dict[str, object],
+) -> dict[str, str]:
+    payload = storage._canonical_json_bytes(
+        receipt,
+        "render audit receipt",
+    )
+    storage._write_no_replace(stage / relative_path, payload)
+    return {
+        "relative_path": relative_path,
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+
+
+def _verify_render_stage(
+    stage: Path,
+    expected_index: dict[str, object],
+    expected_receipts: dict[str, dict[str, object]],
+) -> None:
+    loaded_index = json.loads(
+        (stage / "render-index.json").read_text("ascii")
+    )
+    if loaded_index != expected_index:
+        raise ContractError("reloaded render index does not match publication")
+    actual_receipt_paths = {
+        path.relative_to(stage).as_posix()
+        for directory in ("receipts", "contact-sheet", "strata")
+        for path in (stage / directory).glob("*.json")
+    }
+    if actual_receipt_paths != set(expected_receipts):
+        raise ContractError("render receipts do not form the exact required set")
+    expected_artifacts: set[str] = set()
+    for relative_path, expected_receipt in expected_receipts.items():
+        path = stage / relative_path
+        if path.is_symlink() or not path.is_file():
+            raise ContractError("render receipt is missing or a symlink")
+        loaded_receipt = json.loads(path.read_text("ascii"))
+        if loaded_receipt != expected_receipt:
+            raise ContractError("reloaded render receipt does not match publication")
+        for field in ("video", "contact_overlay"):
+            artifact = loaded_receipt[field]
+            relative_artifact = _canonical_relative_path(
+                artifact["relative_path"],
+                "artifacts",
+            )
+            expected_artifacts.add(relative_artifact)
+            artifact_path = stage / relative_artifact
+            if artifact_path.is_symlink() or not artifact_path.is_file():
+                raise ContractError("render artifact is missing or a symlink")
+            payload = artifact_path.read_bytes()
+            if (
+                len(payload) != artifact["size_bytes"]
+                or hashlib.sha256(payload).hexdigest()
+                != artifact["sha256"]
+            ):
+                raise ContractError("render artifact failed reload verification")
+    actual_artifacts = {
+        path.relative_to(stage).as_posix()
+        for path in (stage / "artifacts").iterdir()
+        if path.is_file() or path.is_symlink()
+    }
+    if actual_artifacts != expected_artifacts:
+        raise ContractError("render artifacts do not form the exact required set")
+
+
+def _expected_render_inputs(
+    manifest: storage.CorpusManifest,
+    clips: tuple[CanonicalClip, ...],
+    audit_index: dict[str, object],
+    reports: dict[str, ClipAudit],
+) -> tuple[
+    list[dict[str, object]],
+    dict[tuple[str, str, str, str], list[dict[str, object]]],
+]:
+    accepted_inputs: list[dict[str, object]] = []
+    strata: dict[
+        tuple[str, str, str, str],
+        list[dict[str, object]],
+    ] = {}
+    for record, clip in zip(manifest.clips, clips, strict=True):
+        report = reports[record.sha256]
+        for interval in report.accepted_intervals:
+            input_record = _render_input(
+                record,
+                clip,
+                report,
+                interval,
+                audit_index["model"],
+            )
+            accepted_inputs.append(input_record)
+            key = (
+                clip.source.source_format,
+                _action_class(clip),
+                _terrain_class(clip),
+                _direction_class(
+                    clip,
+                    interval.start_frame,
+                    interval.end_frame,
+                ),
+            )
+            strata.setdefault(key, []).append(input_record)
+    accepted_inputs.sort(key=lambda item: str(item["interval_key"]))
+    for inputs in strata.values():
+        inputs.sort(key=lambda item: str(item["interval_key"]))
+    return accepted_inputs, strata
+
+
+def _load_canonical_json(path: Path, label: str) -> tuple[dict[str, object], bytes]:
+    if path.is_symlink() or not path.is_file():
+        raise ContractError(f"{label} is missing or a symlink")
+    payload = path.read_bytes()
+    try:
+        value = json.loads(payload.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ContractError(f"{label} is not canonical JSON") from error
+    if not isinstance(value, dict) or payload != storage._canonical_json_bytes(
+        value,
+        label,
+    ):
+        raise ContractError(f"{label} is not canonical JSON")
+    return value, payload
+
+
+def _render_request_id(request: dict[str, object]) -> str:
+    return hashlib.sha256(
+        storage._canonical_json_bytes(request, "render request")
+    ).hexdigest()
+
+
+def _validate_render_artifact(
+    render_root: Path,
+    value: object,
+    expected_relative_path: str,
+) -> str:
+    if not isinstance(value, dict) or set(value) != {
+        "relative_path",
+        "sha256",
+        "size_bytes",
+    }:
+        raise ContractError("render artifact fields do not match v1")
+    relative_path = _canonical_relative_path(
+        value["relative_path"],
+        "artifacts",
+    )
+    if relative_path != expected_relative_path:
+        raise ContractError("render artifact path does not match its request")
+    path = render_root / relative_path
+    if path.is_symlink() or not path.is_file():
+        raise ContractError("render artifact is missing or a symlink")
+    payload = path.read_bytes()
+    if (
+        type(value["size_bytes"]) is not int
+        or value["size_bytes"] < 0
+        or len(payload) != value["size_bytes"]
+        or hashlib.sha256(payload).hexdigest() != value["sha256"]
+    ):
+        raise ContractError("render artifact size or hash mismatch")
+    return relative_path
+
+
+def _validate_renderer_evidence(
+    value: object,
+    expected_argv: list[str],
+    executable_sha256: str,
+) -> None:
+    if not isinstance(value, dict) or set(value) != {
+        "argv",
+        "executable_sha256",
+        "invocation_sha256",
+        "shell",
+        "returncode",
+    }:
+        raise ContractError("renderer evidence fields do not match v1")
+    if (
+        value["argv"] != expected_argv
+        or value["executable_sha256"] != executable_sha256
+        or value["invocation_sha256"]
+        != hashlib.sha256(
+            storage._canonical_json_bytes(
+                expected_argv,
+                "normalized renderer argv",
+            )
+        ).hexdigest()
+        or value["shell"] is not False
+        or type(value["returncode"]) is not int
+        or value["returncode"] != 0
+    ):
+        raise ContractError("renderer invocation evidence is stale")
+
+
+def _load_render_receipt(
+    render_root: Path,
+    *,
+    relative_path: str,
+    expected_fields: set[str],
+    expected_kind: str,
+    expected_argv: list[str],
+    expected_request_id: str,
+    executable_sha256: str,
+) -> tuple[dict[str, object], dict[str, str], set[str]]:
+    receipt, payload = _load_canonical_json(
+        render_root / relative_path,
+        "render receipt",
+    )
+    if (
+        set(receipt) != expected_fields
+        or receipt["schema"] != "terrain-oracle-render-receipt/v1"
+        or receipt["kind"] != expected_kind
+        or receipt["completed"] is not True
+    ):
+        raise ContractError("render receipt fields do not match v1")
+    _validate_renderer_evidence(
+        receipt["renderer"],
+        expected_argv,
+        executable_sha256,
+    )
+    artifacts = {
+        _validate_render_artifact(
+            render_root,
+            receipt["video"],
+            f"artifacts/{expected_request_id}.mp4",
+        ),
+        _validate_render_artifact(
+            render_root,
+            receipt["contact_overlay"],
+            f"artifacts/{expected_request_id}.contact.png",
+        ),
+    }
+    return (
+        receipt,
+        {
+            "relative_path": relative_path,
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        },
+        artifacts,
+    )
+
+
+def _load_render_evidence(root: Path) -> dict[str, object]:
+    """Reload and recompute the exact exhaustive render evidence set."""
+
+    corpus_root = Path(root).expanduser().resolve()
+    if not corpus_root.is_dir() or corpus_root.is_symlink():
+        raise ContractError("audited corpus is missing or a symlink")
+    manifest, clips, audit_index, reports = _load_audit_evidence(corpus_root)
+    render_root = corpus_root / "render-audit"
+    if not render_root.is_dir() or render_root.is_symlink():
+        raise ContractError("canonical render-audit directory is missing")
+    allowed_directories = {
+        "artifacts",
+        "receipts",
+        "contact-sheet",
+        "strata",
+    }
+    for directory in allowed_directories:
+        path = render_root / directory
+        if not path.is_dir() or path.is_symlink():
+            raise ContractError(
+                f"render-audit {directory} directory is missing or a symlink"
+            )
+    index, _ = _load_canonical_json(
+        render_root / "render-index.json",
+        "render audit index",
+    )
+    if set(index) != {
+        "schema",
+        "corpus_manifest_sha256",
+        "audit_index_sha256",
+        "accepted_interval_keys",
+        "renderer",
+        "interval_receipts",
+        "contact_sheet_receipt",
+        "stratum_receipts",
+        "content_sha256",
+    }:
+        raise ContractError("render audit index fields do not match v1")
+    without_hash = dict(index)
+    content_sha256 = without_hash.pop("content_sha256")
+    if (
+        index["schema"] != "terrain-oracle-render-index/v1"
+        or content_sha256
+        != hashlib.sha256(
+            storage._canonical_json_bytes(
+                without_hash,
+                "render audit index",
+            )
+        ).hexdigest()
+        or index["corpus_manifest_sha256"]
+        != hashlib.sha256(
+            (corpus_root / "manifest.json").read_bytes()
+        ).hexdigest()
+        or index["audit_index_sha256"]
+        != hashlib.sha256(
+            (corpus_root / "audit-index.json").read_bytes()
+        ).hexdigest()
+    ):
+        raise ContractError("render audit index hash or corpus binding is stale")
+    renderer_record = index["renderer"]
+    if not isinstance(renderer_record, dict) or set(renderer_record) != {
+        "argv_prefix",
+        "executable_sha256",
+    }:
+        raise ContractError("render index renderer fields do not match v1")
+    argv_prefix = renderer_record["argv_prefix"]
+    if (
+        not isinstance(argv_prefix, list)
+        or not argv_prefix
+        or any(type(value) is not str or not value for value in argv_prefix)
+    ):
+        raise ContractError("render argv prefix must be a nonempty string list")
+    executable = Path(argv_prefix[0])
+    if (
+        not executable.is_absolute()
+        or executable != executable.resolve()
+        or not executable.is_file()
+        or executable.is_symlink()
+        or hashlib.sha256(executable.read_bytes()).hexdigest()
+        != renderer_record["executable_sha256"]
+    ):
+        raise ContractError("render executable identity is stale")
+    accepted_inputs, strata = _expected_render_inputs(
+        manifest,
+        clips,
+        audit_index,
+        reports,
+    )
+    accepted_keys = [
+        str(item["interval_key"]) for item in accepted_inputs
+    ]
+    if index["accepted_interval_keys"] != accepted_keys:
+        raise ContractError(
+            "render index accepted intervals do not match mechanical audit"
+        )
+    expected_receipt_paths: set[str] = set()
+    expected_artifact_paths: set[str] = set()
+    interval_references: list[dict[str, str]] = []
+    input_by_key = {
+        str(item["interval_key"]): item for item in accepted_inputs
+    }
+    for interval_key in accepted_keys:
+        input_record = input_by_key[interval_key]
+        clip_sha256 = str(input_record["clip_sha256"])
+        start_frame, end_frame = input_record["interval"]
+        request = {
+            "kind": "accepted_interval",
+            "clip_sha256": clip_sha256,
+            "start": start_frame,
+            "end": end_frame,
+        }
+        request_id = _render_request_id(request)
+        relative_path = f"receipts/{request_id}.json"
+        expected_argv = [
+            *argv_prefix,
+            "--kind",
+            "accepted_interval",
+            "--clip-sha256",
+            clip_sha256,
+            "--start",
+            str(start_frame),
+            "--end",
+            str(end_frame),
+            "--video",
+            f"artifacts/{request_id}.mp4",
+            "--overlay",
+            f"artifacts/{request_id}.contact.png",
+        ]
+        receipt, reference, artifacts = _load_render_receipt(
+            render_root,
+            relative_path=relative_path,
+            expected_fields={
+                "schema",
+                "kind",
+                "clip_id",
+                "clip_sha256",
+                "model",
+                "terrain_sha256",
+                "terrain_mesh_sha256",
+                "interval",
+                "renderer",
+                "video",
+                "contact_overlay",
+                "completed",
+            },
+            expected_kind="accepted_interval",
+            expected_argv=expected_argv,
+            expected_request_id=request_id,
+            executable_sha256=str(renderer_record["executable_sha256"]),
+        )
+        if {
+            "clip_id": receipt["clip_id"],
+            "clip_sha256": receipt["clip_sha256"],
+            "model": receipt["model"],
+            "terrain_sha256": receipt["terrain_sha256"],
+            "terrain_mesh_sha256": receipt["terrain_mesh_sha256"],
+            "interval": receipt["interval"],
+        } != {
+            name: input_record[name]
+            for name in (
+                "clip_id",
+                "clip_sha256",
+                "model",
+                "terrain_sha256",
+                "terrain_mesh_sha256",
+                "interval",
+            )
+        }:
+            raise ContractError("interval render receipt binding is stale")
+        interval_references.append(reference)
+        expected_receipt_paths.add(relative_path)
+        expected_artifact_paths.update(artifacts)
+    interval_references.sort(key=lambda item: item["relative_path"])
+    if index["interval_receipts"] != interval_references:
+        raise ContractError("interval render receipts are not the exact required set")
+    sheet_request = {
+        "kind": "contact_sheet",
+        "interval_keys": accepted_keys,
+    }
+    sheet_id = _render_request_id(sheet_request)
+    sheet_relative = f"contact-sheet/{sheet_id}.json"
+    sheet_argv = [
+        *argv_prefix,
+        "--kind",
+        "contact_sheet",
+        *[
+            value
+            for key in accepted_keys
+            for value in ("--interval-key", key)
+        ],
+        "--video",
+        f"artifacts/{sheet_id}.mp4",
+        "--overlay",
+        f"artifacts/{sheet_id}.contact.png",
+    ]
+    sheet, sheet_reference, artifacts = _load_render_receipt(
+        render_root,
+        relative_path=sheet_relative,
+        expected_fields={
+            "schema",
+            "kind",
+            "inputs",
+            "interval_keys",
+            "renderer",
+            "video",
+            "contact_overlay",
+            "completed",
+        },
+        expected_kind="contact_sheet",
+        expected_argv=sheet_argv,
+        expected_request_id=sheet_id,
+        executable_sha256=str(renderer_record["executable_sha256"]),
+    )
+    if (
+        sheet["inputs"] != accepted_inputs
+        or sheet["interval_keys"] != accepted_keys
+        or index["contact_sheet_receipt"] != sheet_reference
+    ):
+        raise ContractError("contact sheet does not cover every accepted interval")
+    expected_receipt_paths.add(sheet_relative)
+    expected_artifact_paths.update(artifacts)
+    stratum_references: list[dict[str, str]] = []
+    for stratum_key in sorted(strata):
+        stratum = {
+            name: value
+            for name, value in zip(
+                ("source", "action_class", "terrain", "direction"),
+                stratum_key,
+                strict=True,
+            )
+        }
+        inputs = strata[stratum_key]
+        interval_keys = [
+            str(item["interval_key"]) for item in inputs
+        ]
+        request = {
+            "kind": "full_video",
+            "stratum": stratum,
+            "interval_keys": interval_keys,
+        }
+        request_id = _render_request_id(request)
+        relative_path = f"strata/{request_id}.json"
+        stratum_json = json.dumps(
+            stratum,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        expected_argv = [
+            *argv_prefix,
+            "--kind",
+            "full_video",
+            "--stratum",
+            stratum_json,
+            *[
+                value
+                for key in interval_keys
+                for value in ("--interval-key", key)
+            ],
+            "--video",
+            f"artifacts/{request_id}.mp4",
+            "--overlay",
+            f"artifacts/{request_id}.contact.png",
+        ]
+        receipt, reference, artifacts = _load_render_receipt(
+            render_root,
+            relative_path=relative_path,
+            expected_fields={
+                "schema",
+                "kind",
+                "stratum",
+                "inputs",
+                "interval_keys",
+                "renderer",
+                "video",
+                "contact_overlay",
+                "completed",
+            },
+            expected_kind="full_video",
+            expected_argv=expected_argv,
+            expected_request_id=request_id,
+            executable_sha256=str(renderer_record["executable_sha256"]),
+        )
+        if (
+            receipt["stratum"] != stratum
+            or receipt["inputs"] != inputs
+            or receipt["interval_keys"] != interval_keys
+        ):
+            raise ContractError(
+                "full-video receipt stratum was not canonically recomputed"
+            )
+        stratum_references.append(reference)
+        expected_receipt_paths.add(relative_path)
+        expected_artifact_paths.update(artifacts)
+    stratum_references.sort(key=lambda item: item["relative_path"])
+    if index["stratum_receipts"] != stratum_references:
+        raise ContractError("full-video receipts are not the exact stratum set")
+    actual_files: set[str] = set()
+    actual_directories: set[str] = set()
+    for path in render_root.rglob("*"):
+        relative_path = path.relative_to(render_root).as_posix()
+        if path.is_symlink():
+            raise ContractError("render evidence must not contain symlinks")
+        if path.is_dir():
+            actual_directories.add(relative_path)
+        elif path.is_file():
+            actual_files.add(relative_path)
+        else:
+            raise ContractError("render evidence contains a non-regular entry")
+    if actual_directories != allowed_directories:
+        raise ContractError("render evidence directories do not match v1")
+    if actual_files != {
+        "render-index.json",
+        *expected_receipt_paths,
+        *expected_artifact_paths,
+    }:
+        raise ContractError("render evidence files do not form the exact set")
+    return index
+
+
+def _render_interval_receipts(arguments: argparse.Namespace) -> None:
+    root = _cli_input_directory(arguments.corpus, "audited corpus")
+    destination = _cli_output_path(
+        arguments.output,
+        "render-audit output",
+    )
+    if destination.parent.resolve() != root or destination.name in ("", ".", ".."):
+        raise ContractError("render-audit output must be a direct corpus child")
+    manifest, clips, audit_index, reports = _load_audit_evidence(root)
+    clip_by_sha256 = {
+        record.sha256: clip
+        for record, clip in zip(manifest.clips, clips, strict=True)
+    }
+    renderer = Path(arguments.renderer).expanduser().resolve()
+    if not renderer.is_file() or renderer.is_symlink():
+        raise ContractError("renderer executable is missing or a symlink")
+    renderer_sha256 = hashlib.sha256(renderer.read_bytes()).hexdigest()
+    renderer_arguments = tuple(
+        _normalized_renderer_argument(value)
+        for value in arguments.renderer_arg
+    )
+    stage = Path(
+        tempfile.mkdtemp(
+            prefix=f".{destination.name}.",
+            dir=destination.parent,
+        )
+    )
+    try:
+        for directory in (
+            "artifacts",
+            "receipts",
+            "contact-sheet",
+            "strata",
+        ):
+            (stage / directory).mkdir()
+        accepted_inputs: list[dict[str, object]] = []
+        strata: dict[
+            tuple[str, str, str, str],
+            list[dict[str, object]],
+        ] = {}
+        interval_references: list[dict[str, str]] = []
+        expected_receipts: dict[str, dict[str, object]] = {}
+        for record in manifest.clips:
+            clip = clip_by_sha256[record.sha256]
+            report = reports[record.sha256]
+            if not report.accepted_intervals:
+                continue
+            if clip.terrain is None:
+                raise ContractError(
+                    f"accepted clip {clip.clip_id} has no terrain binding"
+                )
+            for interval in report.accepted_intervals:
+                input_record = _render_input(
+                    record,
+                    clip,
+                    report,
+                    interval,
+                    audit_index["model"],
+                )
+                accepted_inputs.append(input_record)
+                stratum_key = (
+                    clip.source.source_format,
+                    _action_class(clip),
+                    _terrain_class(clip),
+                    _direction_class(
+                        clip,
+                        interval.start_frame,
+                        interval.end_frame,
+                    ),
+                )
+                strata.setdefault(stratum_key, []).append(input_record)
+                request = {
+                    "kind": "accepted_interval",
+                    "clip_sha256": record.sha256,
+                    "start": interval.start_frame,
+                    "end": interval.end_frame,
+                }
+                rendered, request_id = _run_renderer(
+                    stage=stage,
+                    renderer=renderer,
+                    renderer_arguments=renderer_arguments,
+                    renderer_sha256=renderer_sha256,
+                    request=request,
+                    semantic_arguments=[
+                        "--kind",
+                        "accepted_interval",
+                        "--clip-sha256",
+                        record.sha256,
+                        "--start",
+                        str(interval.start_frame),
+                        "--end",
+                        str(interval.end_frame),
+                    ],
+                )
+                receipt_relative = f"receipts/{request_id}.json"
+                receipt = {
+                    "schema": "terrain-oracle-render-receipt/v1",
+                    "kind": "accepted_interval",
+                    "clip_id": clip.clip_id,
+                    "clip_sha256": record.sha256,
+                    "model": audit_index["model"],
+                    "terrain_sha256": report.terrain_sha256,
+                    "terrain_mesh_sha256": clip.terrain.mesh_sha256,
+                    "interval": [
+                        interval.start_frame,
+                        interval.end_frame,
+                    ],
+                    "renderer": {
+                        name: rendered[name]
+                        for name in (
+                            "argv",
+                            "executable_sha256",
+                            "invocation_sha256",
+                            "shell",
+                            "returncode",
+                        )
+                    },
+                    "video": rendered["video"],
+                    "contact_overlay": rendered["contact_overlay"],
+                    "completed": True,
+                }
+                reference = _write_render_receipt(
+                    stage,
+                    receipt_relative,
+                    receipt,
+                )
+                interval_references.append(reference)
+                expected_receipts[receipt_relative] = receipt
+        accepted_inputs.sort(key=lambda item: str(item["interval_key"]))
+        accepted_keys = [
+            str(item["interval_key"]) for item in accepted_inputs
+        ]
+        sheet_request = {
+            "kind": "contact_sheet",
+            "interval_keys": accepted_keys,
+        }
+        sheet_rendered, sheet_id = _run_renderer(
+            stage=stage,
+            renderer=renderer,
+            renderer_arguments=renderer_arguments,
+            renderer_sha256=renderer_sha256,
+            request=sheet_request,
+            semantic_arguments=[
+                "--kind",
+                "contact_sheet",
+                *[
+                    value
+                    for key in accepted_keys
+                    for value in ("--interval-key", key)
+                ],
+            ],
+        )
+        sheet_receipt = {
+            "schema": "terrain-oracle-render-receipt/v1",
+            "kind": "contact_sheet",
+            "inputs": accepted_inputs,
+            "interval_keys": accepted_keys,
+            "renderer": {
+                name: sheet_rendered[name]
+                for name in (
+                    "argv",
+                    "executable_sha256",
+                    "invocation_sha256",
+                    "shell",
+                    "returncode",
+                )
+            },
+            "video": sheet_rendered["video"],
+            "contact_overlay": sheet_rendered["contact_overlay"],
+            "completed": True,
+        }
+        sheet_relative = f"contact-sheet/{sheet_id}.json"
+        sheet_reference = _write_render_receipt(
+            stage,
+            sheet_relative,
+            sheet_receipt,
+        )
+        expected_receipts[sheet_relative] = sheet_receipt
+        stratum_references: list[dict[str, str]] = []
+        for stratum_key in sorted(strata):
+            stratum = {
+                name: value
+                for name, value in zip(
+                    ("source", "action_class", "terrain", "direction"),
+                    stratum_key,
+                    strict=True,
+                )
+            }
+            inputs = sorted(
+                strata[stratum_key],
+                key=lambda item: str(item["interval_key"]),
+            )
+            interval_keys = [
+                str(item["interval_key"]) for item in inputs
+            ]
+            request = {
+                "kind": "full_video",
+                "stratum": stratum,
+                "interval_keys": interval_keys,
+            }
+            stratum_json = json.dumps(
+                stratum,
+                allow_nan=False,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            rendered, request_id = _run_renderer(
+                stage=stage,
+                renderer=renderer,
+                renderer_arguments=renderer_arguments,
+                renderer_sha256=renderer_sha256,
+                request=request,
+                semantic_arguments=[
+                    "--kind",
+                    "full_video",
+                    "--stratum",
+                    stratum_json,
+                    *[
+                        value
+                        for key in interval_keys
+                        for value in ("--interval-key", key)
+                    ],
+                ],
+            )
+            receipt = {
+                "schema": "terrain-oracle-render-receipt/v1",
+                "kind": "full_video",
+                "stratum": stratum,
+                "inputs": inputs,
+                "interval_keys": interval_keys,
+                "renderer": {
+                    name: rendered[name]
+                    for name in (
+                        "argv",
+                        "executable_sha256",
+                        "invocation_sha256",
+                        "shell",
+                        "returncode",
+                    )
+                },
+                "video": rendered["video"],
+                "contact_overlay": rendered["contact_overlay"],
+                "completed": True,
+            }
+            relative_path = f"strata/{request_id}.json"
+            stratum_references.append(
+                _write_render_receipt(
+                    stage,
+                    relative_path,
+                    receipt,
+                )
+            )
+            expected_receipts[relative_path] = receipt
+        interval_references.sort(
+            key=lambda item: item["relative_path"]
+        )
+        stratum_references.sort(
+            key=lambda item: item["relative_path"]
+        )
+        without_hash = {
+            "schema": "terrain-oracle-render-index/v1",
+            "corpus_manifest_sha256": hashlib.sha256(
+                (root / "manifest.json").read_bytes()
+            ).hexdigest(),
+            "audit_index_sha256": hashlib.sha256(
+                (root / "audit-index.json").read_bytes()
+            ).hexdigest(),
+            "accepted_interval_keys": accepted_keys,
+            "renderer": {
+                "argv_prefix": [str(renderer), *renderer_arguments],
+                "executable_sha256": renderer_sha256,
+            },
+            "interval_receipts": interval_references,
+            "contact_sheet_receipt": sheet_reference,
+            "stratum_receipts": stratum_references,
+        }
+        index = {
+            **without_hash,
+            "content_sha256": hashlib.sha256(
+                storage._canonical_json_bytes(
+                    without_hash,
+                    "render audit index",
+                )
+            ).hexdigest(),
+        }
+        storage._write_no_replace(
+            stage / "render-index.json",
+            storage._canonical_json_bytes(
+                index,
+                "render audit index",
+            ),
+        )
+        _verify_render_stage(stage, index, expected_receipts)
+        for directory in (
+            "artifacts",
+            "receipts",
+            "contact-sheet",
+            "strata",
+        ):
+            storage._fsync_directory(stage / directory)
+        storage._fsync_directory(stage)
+        storage._rename_noreplace(stage, destination)
+        storage._fsync_directory(destination.parent)
+    except BaseException:
+        if stage.exists():
+            shutil.rmtree(stage)
+        raise
+
+
+def _procedural_family_id(clip: CanonicalClip) -> str | None:
+    if not clip.source.source_format.startswith("grail-clean-"):
+        return None
+    family, separator, _ = clip.clip_id.partition("/")
+    if not separator or not family:
+        raise ContractError(
+            "GRAIL clip ID must retain its procedural family prefix"
+        )
+    return family
+
+
+def _accepted_coverage_records(
+    root: Path,
+) -> tuple[coverage.AcceptedClipRecord, ...]:
+    manifest, clips, audit_index, reports = _load_audit_evidence(root)
+    meshes = tuple(
+        storage.read_mesh(root / record.relative_path)
+        for record in manifest.meshes
+    )
+    mesh_by_sha256 = {
+        record.sha256: mesh
+        for record, mesh in zip(manifest.meshes, meshes, strict=True)
+    }
+    if len(mesh_by_sha256) != len(meshes):
+        raise ContractError("corpus mesh records must be unique")
+    accepted: list[coverage.AcceptedClipRecord] = []
+    for clip_record, clip in zip(
+        manifest.clips,
+        clips,
+        strict=True,
+    ):
+        report = reports[clip_record.sha256]
+        if report.status == "rejected":
+            if report.accepted_intervals:
+                raise ContractError(
+                    "rejected audit unexpectedly contains accepted intervals"
+                )
+            continue
+        if not report.accepted_intervals:
+            raise ContractError(
+                "non-rejected audit must contain accepted intervals"
+            )
+        if clip.terrain is None:
+            raise ContractError(
+                f"accepted clip {clip.clip_id} has no terrain binding"
+            )
+        mesh = mesh_by_sha256.get(clip.terrain.mesh_sha256)
+        if mesh is None:
+            raise ContractError(
+                f"accepted clip {clip.clip_id} terrain mesh is absent"
+            )
+        query = CanonicalMeshQuery(
+            mesh,
+            clip.terrain.world_from_terrain,
+        )
+        accepted.append(
+            coverage.AcceptedClipRecord(
+                clip=clip,
+                clip_record=clip_record,
+                audit=report,
+                accepted_intervals=report.accepted_intervals,
+                terrain_mesh=mesh,
+                terrain_query=query,
+                model_sha256=report.model_sha256,
+                action_class=_action_class(clip),
+                procedural_family_id=_procedural_family_id(clip),
+            )
+        )
+    return tuple(accepted)
+
+
+def _publish_coverage(arguments: argparse.Namespace) -> None:
+    root = _cli_input_directory(arguments.corpus, "audited corpus")
+    destination = _cli_output_path(arguments.output, "coverage output")
+    if (
+        destination.parent.resolve() != root
+        or destination.name != "coverage.json"
+    ):
+        raise ContractError(
+            "coverage output must be the canonical corpus child coverage.json"
+        )
+    manifest = coverage.build_coverage(
+        _accepted_coverage_records(root)
+    )
+    coverage.freeze_coverage(destination, manifest)
+
+
+def _load_coverage_evidence(
+    root: Path,
+) -> tuple[coverage.CoverageManifest, bytes]:
+    path = root / "coverage.json"
+    value, payload = _load_canonical_json(
+        path,
+        "coverage manifest",
+    )
+    loaded = coverage.CoverageManifest.from_dict(value)
+    expected = coverage.build_coverage(
+        _accepted_coverage_records(root)
+    )
+    if loaded.to_dict() != expected.to_dict():
+        raise ContractError(
+            "coverage manifest does not equal recomputed Task 8 coverage"
+        )
+    return loaded, payload
+
+
+def _freeze_source_paths(
+    root: Path,
+    manifest: storage.CorpusManifest,
+    audit_index: dict[str, object],
+) -> tuple[str, ...]:
+    expected_files = {
+        "manifest.json",
+        "audit-index.json",
+        "coverage.json",
+        *(record.relative_path for record in manifest.clips),
+        *(record.relative_path for record in manifest.meshes),
+        *(
+            str(entry["relative_path"])
+            for entry in audit_index["reports"]
+        ),
+        *(
+            path.relative_to(root).as_posix()
+            for path in (root / "render-audit").rglob("*")
+            if path.is_file()
+        ),
+    }
+    expected_directories = {
+        parent.as_posix()
+        for relative_path in expected_files
+        for parent in Path(relative_path).parents
+        if parent.as_posix() != "."
+    }
+    actual_files: set[str] = set()
+    actual_directories: set[str] = set()
+    for path in root.rglob("*"):
+        relative_path = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            raise ContractError("freeze source must not contain symlinks")
+        if path.is_dir():
+            actual_directories.add(relative_path)
+        elif path.is_file():
+            actual_files.add(relative_path)
+        else:
+            raise ContractError("freeze source contains a non-regular entry")
+    if actual_files != expected_files:
+        raise ContractError(
+            "freeze source files do not form the exact evidence set"
+        )
+    if actual_directories != expected_directories:
+        raise ContractError(
+            "freeze source directories do not form the exact evidence set"
+        )
+    return tuple(sorted(expected_files))
+
+
+def _frozen_file_record(path: Path, relative_path: str) -> dict[str, object]:
+    payload = path.read_bytes()
+    return {
+        "relative_path": relative_path,
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "size_bytes": len(payload),
+    }
+
+
+def _canonical_frozen_path(value: object) -> str:
+    if type(value) is not str or not value:
+        raise ContractError("frozen file path must be a nonempty string")
+    path = Path(value)
+    if (
+        path.is_absolute()
+        or value != path.as_posix()
+        or any(part in ("", ".", "..") for part in path.parts)
+    ):
+        raise ContractError("frozen file path must be canonical and relative")
+    return value
+
+
+def _load_frozen_corpus(root: Path) -> dict[str, object]:
+    """Validate a frozen release without consulting its source model tree."""
+
+    frozen_root = Path(root).expanduser().resolve()
+    if not frozen_root.is_dir() or frozen_root.is_symlink():
+        raise ContractError("frozen corpus is missing or a symlink")
+    storage.load_corpus(frozen_root)
+    index, _ = _load_canonical_json(
+        frozen_root / "freeze-index.json",
+        "frozen corpus index",
+    )
+    if set(index) != {
+        "schema",
+        "source",
+        "model",
+        "files",
+        "content_sha256",
+    }:
+        raise ContractError("frozen corpus index fields do not match v1")
+    without_hash = dict(index)
+    content_sha256 = without_hash.pop("content_sha256")
+    if (
+        index["schema"] != "terrain-oracle-frozen-corpus/v1"
+        or content_sha256
+        != hashlib.sha256(
+            storage._canonical_json_bytes(
+                without_hash,
+                "frozen corpus index",
+            )
+        ).hexdigest()
+    ):
+        raise ContractError("frozen corpus index content hash is stale")
+    source = index["source"]
+    if not isinstance(source, dict) or set(source) != {
+        "corpus_manifest_sha256",
+        "audit_index_sha256",
+        "render_index_sha256",
+        "coverage_sha256",
+    }:
+        raise ContractError("frozen source evidence fields do not match v1")
+    source_paths = {
+        "corpus_manifest_sha256": frozen_root / "manifest.json",
+        "audit_index_sha256": frozen_root / "audit-index.json",
+        "render_index_sha256": (
+            frozen_root / "render-audit" / "render-index.json"
+        ),
+        "coverage_sha256": frozen_root / "coverage.json",
+    }
+    for field, path in source_paths.items():
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or hashlib.sha256(path.read_bytes()).hexdigest()
+            != source[field]
+        ):
+            raise ContractError(f"frozen {field} binding is stale")
+    declared_files = index["files"]
+    if not isinstance(declared_files, list):
+        raise ContractError("frozen corpus file evidence must be a list")
+    expected_paths: set[str] = set()
+    file_record_by_path: dict[str, dict[str, object]] = {}
+    for record in declared_files:
+        if not isinstance(record, dict) or set(record) != {
+            "relative_path",
+            "sha256",
+            "size_bytes",
+        }:
+            raise ContractError("frozen corpus file fields do not match v1")
+        relative_path = _canonical_frozen_path(record["relative_path"])
+        if relative_path in expected_paths:
+            raise ContractError("frozen corpus file path is duplicated")
+        path = frozen_root / relative_path
+        if path.is_symlink() or not path.is_file():
+            raise ContractError("frozen corpus file is missing or a symlink")
+        if _frozen_file_record(path, relative_path) != record:
+            raise ContractError("frozen corpus file hash mismatch")
+        expected_paths.add(relative_path)
+        file_record_by_path[relative_path] = record
+    if [
+        str(record["relative_path"]) for record in declared_files
+    ] != sorted(expected_paths):
+        raise ContractError("frozen corpus files are not canonically sorted")
+    actual_paths: set[str] = set()
+    actual_directories: set[str] = set()
+    for path in frozen_root.rglob("*"):
+        relative_path = path.relative_to(frozen_root).as_posix()
+        if path.is_symlink():
+            raise ContractError("frozen corpus must not contain symlinks")
+        if path.is_dir():
+            actual_directories.add(relative_path)
+        elif path.is_file():
+            actual_paths.add(relative_path)
+        else:
+            raise ContractError("frozen corpus contains a non-regular entry")
+    if actual_paths != {"freeze-index.json", *expected_paths}:
+        raise ContractError("frozen corpus files do not form the exact set")
+    expected_directories = {
+        parent.as_posix()
+        for relative_path in actual_paths
+        for parent in Path(relative_path).parents
+        if parent.as_posix() != "."
+    }
+    if actual_directories != expected_directories:
+        raise ContractError("frozen corpus directories do not form the exact set")
+    model = index["model"]
+    if not isinstance(model, dict) or set(model) != {
+        "relative_path",
+        "sha256",
+        "size_bytes",
+        "original_model_file_sha256",
+        "structural_sha256",
+    }:
+        raise ContractError("frozen model evidence fields do not match v1")
+    model_relative_path = _canonical_relative_path(
+        model["relative_path"],
+        "model",
+    )
+    if (
+        model_relative_path
+        != f"model/{model['sha256']}.mjb"
+        or file_record_by_path.get(model_relative_path)
+        != {
+            "relative_path": model_relative_path,
+            "sha256": model["sha256"],
+            "size_bytes": model["size_bytes"],
+        }
+    ):
+        raise ContractError("frozen model file evidence is stale")
+    audit_value, _ = _load_canonical_json(
+        frozen_root / "audit-index.json",
+        "frozen audit index",
+    )
+    audit_model = audit_value.get("model")
+    if (
+        not isinstance(audit_model, dict)
+        or model["original_model_file_sha256"]
+        != audit_model.get("asset_sha256")
+        or model["structural_sha256"]
+        != audit_model.get("structural_sha256")
+    ):
+        raise ContractError("frozen model provenance does not match audit")
+    try:
+        import mujoco
+
+        released_model = mujoco.MjModel.from_binary_path(
+            str(frozen_root / model_relative_path)
+        )
+    except Exception as error:
+        raise ContractError("frozen MJB model cannot be reloaded") from error
+    if (
+        structural_model_sha256(released_model)
+        != model["structural_sha256"]
+    ):
+        raise ContractError("frozen MJB structural model hash is stale")
+    coverage_value, _ = _load_canonical_json(
+        frozen_root / "coverage.json",
+        "frozen coverage manifest",
+    )
+    coverage.CoverageManifest.from_dict(coverage_value)
+    return index
+
+
+def _verify_frozen_stage(
+    stage: Path,
+    expected_index: dict[str, object],
+) -> None:
+    index = _load_frozen_corpus(stage)
+    if index != expected_index:
+        raise ContractError("reloaded frozen corpus index does not match")
+
+
+def _freeze_corpus(arguments: argparse.Namespace) -> None:
+    root = _cli_input_directory(arguments.corpus, "audited corpus")
+    destination = _cli_output_path(arguments.output, "freeze output")
+    if destination == root or root in destination.parents:
+        raise ContractError("freeze output must not be inside its source corpus")
+    manifest, _, audit_index, _ = _load_audit_evidence(root)
+    _load_render_evidence(root)
+    _, coverage_payload = _load_coverage_evidence(root)
+    source_paths = _freeze_source_paths(root, manifest, audit_index)
+    model_record = audit_index["model"]
+    model_source = Path(str(model_record["asset_path"]))
+    try:
+        import mujoco
+
+        source_model = mujoco.MjModel.from_xml_path(str(model_source))
+    except Exception as error:
+        raise ContractError(
+            "mechanical source model cannot be compiled for freeze"
+        ) from error
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(
+        tempfile.mkdtemp(
+            prefix=f".{destination.name}.",
+            dir=destination.parent,
+        )
+    )
+    try:
+        for relative_path in source_paths:
+            storage._write_no_replace(
+                stage / relative_path,
+                (root / relative_path).read_bytes(),
+            )
+        compiled_temporary = stage / ".compiled-model.mjb"
+        mujoco.mj_saveModel(
+            source_model,
+            str(compiled_temporary),
+        )
+        model_payload = compiled_temporary.read_bytes()
+        compiled_temporary.unlink()
+        model_sha256 = hashlib.sha256(model_payload).hexdigest()
+        model_relative_path = f"model/{model_sha256}.mjb"
+        storage._write_no_replace(
+            stage / model_relative_path,
+            model_payload,
+        )
+        file_records = [
+            _frozen_file_record(stage / relative_path, relative_path)
+            for relative_path in sorted(
+                (*source_paths, model_relative_path)
+            )
+        ]
+        without_hash = {
+            "schema": "terrain-oracle-frozen-corpus/v1",
+            "source": {
+                "corpus_manifest_sha256": hashlib.sha256(
+                    (root / "manifest.json").read_bytes()
+                ).hexdigest(),
+                "audit_index_sha256": hashlib.sha256(
+                    (root / "audit-index.json").read_bytes()
+                ).hexdigest(),
+                "render_index_sha256": hashlib.sha256(
+                    (root / "render-audit" / "render-index.json").read_bytes()
+                ).hexdigest(),
+                "coverage_sha256": hashlib.sha256(
+                    coverage_payload
+                ).hexdigest(),
+            },
+            "model": {
+                "relative_path": model_relative_path,
+                "sha256": model_sha256,
+                "size_bytes": len(model_payload),
+                "original_model_file_sha256": model_record["asset_sha256"],
+                "structural_sha256": model_record["structural_sha256"],
+            },
+            "files": file_records,
+        }
+        index = {
+            **without_hash,
+            "content_sha256": hashlib.sha256(
+                storage._canonical_json_bytes(
+                    without_hash,
+                    "frozen corpus index",
+                )
+            ).hexdigest(),
+        }
+        storage._write_no_replace(
+            stage / "freeze-index.json",
+            storage._canonical_json_bytes(
+                index,
+                "frozen corpus index",
+            ),
+        )
+        _verify_frozen_stage(stage, index)
+        for path in sorted(
+            (path for path in stage.rglob("*") if path.is_dir()),
+            key=lambda path: len(path.parts),
+            reverse=True,
+        ):
+            storage._fsync_directory(path)
+        storage._fsync_directory(stage)
+        storage._rename_noreplace(stage, destination)
+        storage._fsync_directory(destination.parent)
+    except BaseException:
+        if stage.exists():
+            shutil.rmtree(stage)
+        raise
+
+
+def _inventory_source_root(path: Path, label: str) -> Path:
+    return _cli_input_directory(path, f"{label} source root")
+
+
+def _clip_inventory_record(clip: CanonicalClip) -> dict[str, object]:
+    clip.validate()
+    source_path = Path(clip.source.source_path)
+    if source_path.is_symlink():
+        raise ContractError(
+            f"source for clip {clip.clip_id} must not be a symlink"
+        )
+    return {
+        "clip_id": clip.clip_id,
+        "frame_count": clip.frame_count,
+        "source_format": clip.source.source_format,
+        "source_path": clip.source.source_path,
+        "source_size_bytes": clip.source.source_size_bytes,
+        "source_sha256": clip.source.source_sha256,
+        "source_license_id": clip.source.source_license_id,
+    }
+
+
+def _duplicate_source_groups(
+    records: Sequence[dict[str, object]],
+) -> list[dict[str, object]]:
+    by_sha256: dict[str, list[str]] = {}
+    for record in records:
+        by_sha256.setdefault(
+            str(record["source_sha256"]),
+            [],
+        ).append(str(record["clip_id"]))
+    return [
+        {
+            "source_sha256": sha256,
+            "clip_ids": sorted(clip_ids),
+        }
+        for sha256, clip_ids in sorted(by_sha256.items())
+        if len(clip_ids) > 1
+    ]
+
+
+def _validated_clip_inventory(
+    clips: Sequence[CanonicalClip],
+    label: str,
+) -> dict[str, object]:
+    records = sorted(
+        (_clip_inventory_record(clip) for clip in clips),
+        key=lambda record: (
+            str(record["clip_id"]),
+            str(record["source_path"]),
+        ),
+    )
+    clip_ids = [str(record["clip_id"]) for record in records]
+    if len(clip_ids) != len(set(clip_ids)):
+        raise ContractError(f"{label} inventory contains duplicate clip IDs")
+    counts = Counter(str(record["source_format"]) for record in records)
+    return {
+        "count": len(records),
+        "counts_by_format": dict(sorted(counts.items())),
+        "records": records,
+        "duplicate_source_sha256": _duplicate_source_groups(records),
+    }
+
+
+def _flat_inventory(path: Path) -> dict[str, object]:
+    root = _inventory_source_root(path, "flat")
+    clips = tuple(
+        source_flat.iter_flat_clips(
+            root,
+            tags=("flat", "other"),
+        )
+    )
+    inventory = _validated_clip_inventory(clips, "flat")
+    return {"root": str(root), **inventory}
+
+
+def _inventory_terrain_binding() -> TerrainBinding:
+    return TerrainBinding(
+        asset_path="inventory://unresolved-terrain",
+        asset_size_bytes=1,
+        asset_sha256="0" * 64,
+        asset_license_id="UNRECORDED",
+        mesh_sha256="1" * 64,
+        world_from_terrain=RigidTransform(
+            np.zeros(3, dtype=np.float32),
+            np.array((1.0, 0.0, 0.0, 0.0), dtype=np.float32),
+        ),
+        validity_mask_path=None,
+    )
+
+
+def _justin_inventory(path: Path) -> dict[str, object]:
+    root = _inventory_source_root(path, "Justin")
+    clips = tuple(
+        source_justin.iter_justin_clips(
+            root,
+            _inventory_terrain_binding(),
+        )
+    )
+    inventory = _validated_clip_inventory(clips, "Justin")
+    return {"root": str(root), **inventory}
+
+
+def _file_identity(path: Path, relative_path: str) -> dict[str, object]:
+    if path.is_symlink() or not path.is_file():
+        raise ContractError(f"required source file is missing: {path}")
+    payload = path.read_bytes()
+    return {
+        "relative_path": relative_path,
+        "size_bytes": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+
+
+def _huggingface_metadata_identity(
+    release: Path,
+    relative_path: str,
+) -> dict[str, object]:
+    metadata_relative_path = (
+        f".cache/huggingface/download/{relative_path}.metadata"
+    )
+    metadata_path = release / metadata_relative_path
+    identity = _file_identity(
+        metadata_path,
+        metadata_relative_path,
+    )
+    try:
+        lines = metadata_path.read_text("utf-8").splitlines()
+    except UnicodeError as error:
+        raise ContractError(
+            f"Hugging Face metadata is not UTF-8: {metadata_path}"
+        ) from error
+    if (
+        len(lines) < 2
+        or lines[0] != source_lafan.LAFAN1_UPSTREAM_REVISION
+        or not lines[1]
+    ):
+        raise ContractError(
+            f"Hugging Face metadata commit is not pinned for {relative_path}"
+        )
+    return {
+        **identity,
+        "commit": lines[0],
+        "etag": lines[1],
+    }
+
+
+def _validate_lafan_license(readme: bytes, license_payload: bytes) -> None:
+    try:
+        readme_text = readme.decode("utf-8")
+        license_text = license_payload.decode("utf-8")
+    except UnicodeError as error:
+        raise ContractError("LAFAN README and LICENSE must be UTF-8") from error
+    normalized_readme = " ".join(readme_text.lower().split())
+    if (
+        "license: cc-by-nc-nd-4.0" not in normalized_readme
+        and (
+            "licensed under creative commons "
+            "attribution-noncommercial-noderivatives 4.0 international"
+        )
+        not in normalized_readme
+    ):
+        raise ContractError(
+            "LAFAN README must declare dataset license CC-BY-NC-ND-4.0"
+        )
+    normalized_license = " ".join(license_text.lower().split())
+    if (
+        not normalized_license.startswith("bsd 3-clause license")
+        or "redistribution and use in source and binary forms"
+        not in normalized_license
+    ):
+        raise ContractError(
+            "LAFAN code LICENSE does not identify BSD-3-Clause"
+        )
+
+
+def _lafan_inventory(path: Path) -> dict[str, object]:
+    root = _inventory_source_root(path, "LAFAN")
+    if root.name != "g1":
+        raise ContractError("LAFAN inventory root must be the release g1 directory")
+    release = root.parent
+    readme_path = release / "README.md"
+    license_path = release / "LICENSE"
+    readme_identity = _file_identity(readme_path, "README.md")
+    license_identity = _file_identity(license_path, "LICENSE")
+    readme_payload = readme_path.read_bytes()
+    license_payload = license_path.read_bytes()
+    _validate_lafan_license(readme_payload, license_payload)
+    supporting_files = {
+        "LICENSE": {
+            **license_identity,
+            "metadata": _huggingface_metadata_identity(
+                release,
+                "LICENSE",
+            ),
+        },
+        "README.md": {
+            **readme_identity,
+            "metadata": _huggingface_metadata_identity(
+                release,
+                "README.md",
+            ),
+        },
+    }
+    entries = sorted(root.iterdir(), key=lambda item: item.name)
+    if not entries:
+        raise ContractError("LAFAN g1 inventory is empty")
+    records: list[dict[str, object]] = []
+    source_format = (
+        "lafan1-retargeted-g1-csv-30hz@"
+        + source_lafan.LAFAN1_UPSTREAM_REVISION
+    )
+    for csv_path in entries:
+        if (
+            csv_path.is_symlink()
+            or not csv_path.is_file()
+            or csv_path.suffix != ".csv"
+        ):
+            raise ContractError(
+                f"LAFAN g1 contains a noncanonical entry: {csv_path.name}"
+            )
+        rows = source_lafan._load_rows(csv_path)
+        source_lafan.classify_lafan_name(csv_path.stem)
+        identity = _file_identity(
+            csv_path,
+            f"g1/{csv_path.name}",
+        )
+        records.append(
+            {
+                "clip_id": csv_path.stem,
+                "source_frame_count": int(rows.shape[0]),
+                "source_format": source_format,
+                "source_path": str(csv_path.resolve()),
+                "source_size_bytes": identity["size_bytes"],
+                "source_sha256": identity["sha256"],
+                "source_license_id": "CC-BY-NC-ND-4.0",
+                "metadata": _huggingface_metadata_identity(
+                    release,
+                    f"g1/{csv_path.name}",
+                ),
+            }
+        )
+    clip_ids = [str(record["clip_id"]) for record in records]
+    if len(clip_ids) != len(set(clip_ids)):
+        raise ContractError("LAFAN inventory contains duplicate clip IDs")
+    return {
+        "root": str(root),
+        "repository": "lvhaidong/LAFAN1_Retargeting_Dataset",
+        "revision": source_lafan.LAFAN1_UPSTREAM_REVISION,
+        "license_id": "CC-BY-NC-ND-4.0",
+        "code_license_id": "BSD-3-Clause",
+        "supporting_files": supporting_files,
+        "count": len(records),
+        "counts_by_format": {source_format: len(records)},
+        "records": records,
+        "duplicate_source_sha256": _duplicate_source_groups(records),
+    }
+
+
+def _grail_inventory(
+    path: Path,
+    families_value: str,
+) -> dict[str, object]:
+    root = _inventory_source_root(path, "GRAIL")
+    if type(families_value) is not str:
+        raise ContractError("GRAIL families must be comma-separated")
+    families = tuple(families_value.split(","))
+    records = source_grail.discover_clean_c490_records(
+        root,
+        families=families,
+    )
+    output_records: list[dict[str, object]] = []
+    for record in records:
+        if (
+            record.robot_path.is_symlink()
+            or not record.robot_path.is_file()
+            or record.usd_path.is_symlink()
+            or not record.usd_path.is_file()
+        ):
+            raise ContractError(
+                f"GRAIL pair is missing or symlinked: {record.stem}"
+            )
+        metadata_path = record.shard_path / "clips.json"
+        metadata = _file_identity(
+            metadata_path,
+            metadata_path.relative_to(root).as_posix(),
+        )
+        output_records.append(
+            {
+                "family": record.family,
+                "stem": record.stem,
+                "frame_count": record.n_frames,
+                "robot_path": str(record.robot_path.resolve()),
+                "robot_size_bytes": record.robot_path.stat().st_size,
+                "terrain_path": str(record.usd_path.resolve()),
+                "terrain_size_bytes": record.usd_path.stat().st_size,
+                "shard_metadata": metadata,
+                "pose_source": record.pose_source,
+            }
+        )
+    output_records.sort(
+        key=lambda record: (
+            str(record["family"]),
+            str(record["stem"]),
+        )
+    )
+    stems = [str(record["stem"]) for record in output_records]
+    if len(stems) != len(set(stems)):
+        raise ContractError("GRAIL inventory contains duplicate stems")
+    family_counts = Counter(
+        str(record["family"]) for record in output_records
+    )
+    return {
+        "root": str(root),
+        "families": list(families),
+        "count": len(output_records),
+        "counts_by_family": dict(sorted(family_counts.items())),
+        "counts_by_format": {
+            "grail-clean-paired-record": len(output_records)
+        },
+        "records": output_records,
+    }
+
+
+def _publish_inventory(arguments: argparse.Namespace) -> None:
+    sources: dict[str, object] = {}
+    if arguments.flat is not None:
+        sources["flat"] = _flat_inventory(arguments.flat)
+    if arguments.justin is not None:
+        sources["justin"] = _justin_inventory(arguments.justin)
+    if arguments.grail_root is not None:
+        sources["grail"] = _grail_inventory(
+            arguments.grail_root,
+            arguments.grail_families
+            or ",".join(source_grail.C490_FAMILIES),
+        )
+    elif arguments.grail_families is not None:
+        raise ContractError("--grail-families requires --grail-root")
+    if arguments.lafan is not None:
+        sources["lafan"] = _lafan_inventory(arguments.lafan)
+    if not sources:
+        raise ContractError("inventory requires at least one source option")
+    counts_by_source = {
+        name: int(value["count"])
+        for name, value in sorted(sources.items())
+    }
+    counts_by_format: Counter[str] = Counter()
+    for value in sources.values():
+        counts_by_format.update(value["counts_by_format"])
+    without_hash = {
+        "schema": "terrain-oracle-source-inventory/v1",
+        "sources": sources,
+        "summary": {
+            "clip_count": sum(counts_by_source.values()),
+            "counts_by_source": counts_by_source,
+            "counts_by_format": dict(sorted(counts_by_format.items())),
+        },
+    }
+    inventory = {
+        **without_hash,
+        "content_sha256": hashlib.sha256(
+            storage._canonical_json_bytes(
+                without_hash,
+                "source inventory",
+            )
+        ).hexdigest(),
+    }
+    output = _cli_output_path(arguments.output, "inventory output")
+    _write_inventory_no_replace(
+        output,
+        storage._canonical_json_bytes(inventory, "source inventory"),
+    )
+
+
+def _write_inventory_no_replace(destination: Path, payload: bytes) -> None:
+    """Atomically publish a file on Linux filesystems and NFS without replace."""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        dir=destination.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            storage._rename_noreplace(temporary, destination)
+        except OSError as error:
+            if error.errno not in (errno.EINVAL, errno.ENOTSUP):
+                raise
+            try:
+                os.link(
+                    temporary,
+                    destination,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                raise
+            finally:
+                temporary.unlink(missing_ok=True)
+        storage._fsync_directory(destination.parent)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m mm_sonic.terrain_oracle.corpus_cli"
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    inventory_parser = commands.add_parser(
+        "inventory",
+        help="validate and hash canonical source inventories",
+    )
+    inventory_parser.add_argument("--flat", type=Path)
+    inventory_parser.add_argument("--justin", type=Path)
+    inventory_parser.add_argument("--grail-root", type=Path)
+    inventory_parser.add_argument("--grail-families")
+    inventory_parser.add_argument("--lafan", type=Path)
+    inventory_parser.add_argument("--output", type=Path, required=True)
+    inventory_parser.set_defaults(handler=_publish_inventory)
+    import_parser = commands.add_parser(
+        "import",
+        help="publish canonical source clips without replacing prior output",
+    )
+    import_parser.add_argument("--fixture", type=Path, required=True)
+    import_parser.add_argument("--output", type=Path, required=True)
+    import_parser.set_defaults(handler=_import_fixture)
+    audit_parser = commands.add_parser(
+        "audit",
+        help="mechanically audit every canonical clip and republish evidence",
+    )
+    audit_parser.add_argument("--corpus", type=Path, required=True)
+    audit_parser.add_argument("--model", type=Path, required=True)
+    audit_parser.add_argument("--output", type=Path, required=True)
+    audit_parser.set_defaults(handler=_audit_corpus)
+    render_parser = commands.add_parser(
+        "render-audit",
+        help="render every mechanically accepted interval",
+    )
+    render_parser.add_argument("--corpus", type=Path, required=True)
+    render_parser.add_argument("--renderer", type=Path, required=True)
+    render_parser.add_argument(
+        "--renderer-arg",
+        action="append",
+        default=[],
+    )
+    render_parser.add_argument("--output", type=Path, required=True)
+    render_parser.set_defaults(handler=_render_interval_receipts)
+    coverage_parser = commands.add_parser(
+        "coverage",
+        help="freeze Task 8 coverage from mechanically accepted intervals",
+    )
+    coverage_parser.add_argument("--corpus", type=Path, required=True)
+    coverage_parser.add_argument("--output", type=Path, required=True)
+    coverage_parser.set_defaults(handler=_publish_coverage)
+    freeze_parser = commands.add_parser(
+        "freeze",
+        help="publish the exact audited, rendered, covered corpus",
+    )
+    freeze_parser.add_argument("--corpus", type=Path, required=True)
+    freeze_parser.add_argument("--output", type=Path, required=True)
+    freeze_parser.set_defaults(handler=_freeze_corpus)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run one corpus command, returning 2 for an actionable contract error."""
+
+    try:
+        arguments = _parser().parse_args(argv)
+    except SystemExit as error:
+        return int(error.code) if isinstance(error.code, int) else 2
+    try:
+        arguments.handler(arguments)
+    except (
+        ContractError,
+        FileExistsError,
+        IndexError,
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+    ) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

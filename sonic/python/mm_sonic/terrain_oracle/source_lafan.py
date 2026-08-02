@@ -74,10 +74,35 @@ def classify_lafan_name(name: str) -> tuple[str, ...]:
 
 
 def _load_rows(path: Path) -> np.ndarray:
+    parsed_rows: list[tuple[float, ...]] = []
     try:
-        rows = np.loadtxt(path, delimiter=",", dtype=np.float64, ndmin=2)
-    except (OSError, ValueError) as error:
-        raise _fail("must contain only comma-separated numeric rows") from error
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                line = raw_line.rstrip("\r\n")
+                if not line.strip():
+                    raise _fail(
+                        f"line {line_number} must not be a blank row"
+                    )
+                if line.lstrip().startswith("#"):
+                    raise _fail(
+                        f"line {line_number} must not be a comment row"
+                    )
+                fields = line.split(",")
+                if len(fields) != 36:
+                    raise _fail(
+                        f"line {line_number} must contain 36 numeric columns"
+                    )
+                try:
+                    parsed_rows.append(
+                        tuple(float(field) for field in fields)
+                    )
+                except ValueError as error:
+                    raise _fail(
+                        f"line {line_number} must be a numeric row"
+                    ) from error
+    except (OSError, UnicodeError) as error:
+        raise _fail("must contain only UTF-8 comma-separated numeric rows") from error
+    rows = np.asarray(parsed_rows, dtype=np.float64)
     if (
         rows.ndim != 2
         or rows.shape[0] < 2

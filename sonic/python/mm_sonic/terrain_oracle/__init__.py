@@ -1,5 +1,7 @@
 """Canonical terrain-oracle motion contracts."""
 
+from collections.abc import Sequence
+
 from .canonical import (
     CanonicalClip,
     CanonicalTerrainMesh,
@@ -10,6 +12,15 @@ from .canonical import (
 )
 from .math3d import RigidTransform
 
+
+def corpus_main(argv: Sequence[str] | None = None) -> int:
+    """Run the terrain-corpus CLI without creating an import cycle."""
+
+    from .corpus_cli import main
+
+    return main(argv)
+
+
 __all__ = (
     "CanonicalClip",
     "CanonicalTerrainMesh",
@@ -17,5 +28,6 @@ __all__ = (
     "RigidTransform",
     "SourceIdentity",
     "TerrainBinding",
+    "corpus_main",
     "derive_clip_kinematics",
 )
