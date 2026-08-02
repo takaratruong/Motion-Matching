@@ -547,14 +547,45 @@ def project_contact_trajectory_with_stance_root(
         or not torch.isfinite(landing_target_world).all()
     ):
         raise ValueError("stance-root projection inputs are invalid")
-    stance_foot = 1 - swing_foot
-    if not bool(support_mask[:, stance_foot].all()):
-        raise ValueError("stance-root projection requires persistent opposite support")
-
-    root_correction = (
-        entry_foot_position_world[stance_foot][None]
-        - raw_foot_position_world[:, stance_foot]
+    provisional = build_contact_target_trajectory(
+        raw_foot_position_world,
+        support_mask,
+        swing_foot=swing_foot,
+        entry_foot_position_world=entry_foot_position_world,
+        landing_target_world=landing_target_world,
     )
+    known = support_mask.any(dim=1)
+    known_indices = torch.nonzero(known, as_tuple=False).flatten()
+    if known_indices.numel() == 0:
+        raise ValueError("stance-root projection requires support")
+    root_correction = torch.zeros_like(root_position_world)
+    for frame in known_indices.detach().cpu().tolist():
+        supported = support_mask[frame]
+        root_correction[frame] = torch.mean(
+            provisional.position_world[frame, supported]
+            - raw_foot_position_world[frame, supported],
+            dim=0,
+        )
+    first = int(known_indices[0].item())
+    last = int(known_indices[-1].item())
+    root_correction[:first] = root_correction[first]
+    root_correction[last + 1 :] = root_correction[last]
+    known_list = known_indices.detach().cpu().tolist()
+    for left, right in zip(known_list[:-1], known_list[1:]):
+        if right == left + 1:
+            continue
+        phase = torch.linspace(
+            0.0,
+            1.0,
+            right - left + 1,
+            dtype=joints.dtype,
+            device=joints.device,
+        )
+        smoothstep = phase.square() * (3.0 - 2.0 * phase)
+        root_correction[left : right + 1] = (
+            root_correction[left][None] * (1.0 - smoothstep[:, None])
+            + root_correction[right][None] * smoothstep[:, None]
+        )
     corrected_roots = root_position_world + root_correction
     shifted_feet = raw_foot_position_world + root_correction[:, None, :]
     targets = build_contact_target_trajectory(
@@ -564,31 +595,28 @@ def project_contact_trajectory_with_stance_root(
         entry_foot_position_world=entry_foot_position_world,
         landing_target_world=landing_target_world,
     )
-    swing_only = torch.zeros_like(targets.solve_mask)
-    swing_only[:, swing_foot] = True
     projection = project_contact_trajectory(
         joint_position=joints,
         root_position_world=corrected_roots,
         root_orientation_world_wxyz=root_orientation_world_wxyz,
         targets=ContactTargetTrajectory(
             position_world=targets.position_world,
-            solve_mask=swing_only,
+            solve_mask=targets.solve_mask,
             swing_warp_weight=targets.swing_warp_weight,
         ),
         foot_kinematics=foot_kinematics,
     )
-    stance_error = torch.linalg.vector_norm(
-        projection.foot_position_world[:, stance_foot]
-        - entry_foot_position_world[stance_foot],
-        dim=1,
-    )
+    target_error = torch.linalg.vector_norm(
+        projection.foot_position_world - targets.position_world,
+        dim=2,
+    )[targets.solve_mask]
     return StanceRootProjectionResult(
         root_position_world=corrected_roots,
         joint_position=projection.joint_position,
         foot_position_world=projection.foot_position_world,
         maximum_target_error_m=max(
             projection.maximum_target_error_m,
-            float(stance_error.max().item()),
+            float(target_error.max().item()) if target_error.numel() else 0.0,
         ),
         maximum_root_correction_m=float(
             torch.linalg.vector_norm(root_correction, dim=1).max().item()
