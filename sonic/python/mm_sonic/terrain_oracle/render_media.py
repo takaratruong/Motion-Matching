@@ -36,7 +36,7 @@ FIXED_RENDER_CONFIG = {
     "width": 320,
     "height": 240,
     "fps": 50,
-    "max_frames": 100000,
+    "max_frames": 1000000,
     "camera": {
         "azimuth": 135.0,
         "elevation": -20.0,
@@ -96,6 +96,20 @@ _TRUSTED_MODULE_NAMES = (
     "storage.py",
 )
 _SUBPROCESS_TIMEOUT_SECONDS = 3600.0
+
+
+def _encoded_frame_count(
+    kind: str,
+    inputs: Sequence[dict[str, object]],
+) -> int:
+    if kind == "contact_sheet":
+        return len(inputs)
+    if kind not in ("accepted_interval", "full_video"):
+        raise ContractError("unsupported render request kind")
+    return sum(
+        int(item["end"]) - int(item["start"])
+        for item in inputs
+    )
 
 
 def _canonical_json_bytes(value: object, label: str) -> bytes:
@@ -338,9 +352,10 @@ def validate_render_request(value: object) -> dict[str, Any]:
                 "mesh_path": mesh_path,
             }
         )
-    if sum(int(item["end"]) - int(item["start"]) for item in loaded_inputs) > int(
-        FIXED_RENDER_CONFIG["max_frames"]
-    ):
+    if _encoded_frame_count(
+        str(request["kind"]),
+        loaded_inputs,
+    ) > int(FIXED_RENDER_CONFIG["max_frames"]):
         raise ContractError("render request exceeds the bounded frame limit")
     if len(loaded_inputs) > int(FIXED_RENDER_CONFIG["width"]) * int(
         FIXED_RENDER_CONFIG["height"]
@@ -566,6 +581,8 @@ def _render_input_frames(
     item: dict[str, object],
     model_path: Path,
     consume: Any,
+    *,
+    representative_only: bool,
 ) -> tuple[np.ndarray, dict[str, int], int]:
     import mujoco
 
@@ -585,9 +602,14 @@ def _render_input_frames(
     start = int(item["start"])
     end = int(item["end"])
     representative_index = start + (end - start - 1) // 2
+    frame_indices = (
+        (representative_index,)
+        if representative_only
+        else range(start, end)
+    )
     representative: np.ndarray | None = None
     try:
-        for frame_index in range(start, end):
+        for frame_index in frame_indices:
             _set_canonical_qpos(model, data, clip, frame_index)
             root = np.asarray(
                 clip.root_position_world[frame_index], dtype=np.float64
@@ -612,13 +634,15 @@ def _render_input_frames(
     return representative, {
         "visual_mesh_geom_count": visual_mesh_count,
         "terrain_face_count": int(np.count_nonzero(item["mesh"].valid_faces)),
-    }, end - start
+    }, 1 if representative_only else end - start
 
 
 def _encode_video(
     path: Path,
     inputs: Sequence[dict[str, object]],
     model_path: Path,
+    *,
+    representative_only: bool = False,
 ) -> tuple[list[np.ndarray], dict[str, int], int]:
     ffmpeg = _tool_path("ffmpeg")
     width = int(FIXED_RENDER_CONFIG["width"])
@@ -689,7 +713,10 @@ def _encode_video(
 
         for item in inputs:
             representative, item_evidence, item_frames = _render_input_frames(
-                item, model_path, consume
+                item,
+                model_path,
+                consume,
+                representative_only=representative_only,
             )
             representative_frames.append(representative)
             evidence["visual_mesh_geom_count"] = max(
@@ -935,7 +962,10 @@ def render_media(
         temporary_overlay = Path(overlay_name)
         temporary_paths.append(temporary_overlay)
         representative_frames, evidence, frame_count = _encode_video(
-            temporary_video, request["_loaded_inputs"], model_path
+            temporary_video,
+            request["_loaded_inputs"],
+            model_path,
+            representative_only=request["kind"] == "contact_sheet",
         )
         _save_overlay(
             temporary_overlay, representative_frames, request["interval_keys"]

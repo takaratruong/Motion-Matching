@@ -31,6 +31,7 @@ from mm_sonic.terrain_oracle.storage import (
     COMPLETION_MARKER,
     _seal_directory,
     load_corpus,
+    mesh_digest,
     publish_corpus,
     read_clip,
     read_mesh,
@@ -106,6 +107,39 @@ def _rewrite_hashed_document(path: Path, value: dict[str, object]) -> None:
         _canonical_json_bytes(without_hash)
     ).hexdigest()
     path.write_bytes(_canonical_json_bytes(value))
+
+
+def _write_source_inventory(
+    path: Path,
+    sources: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    counts_by_source = {
+        name: int(source["count"])
+        for name, source in sorted(sources.items())
+    }
+    counts_by_format: dict[str, int] = {}
+    for source in sources.values():
+        for name, count in source["counts_by_format"].items():
+            counts_by_format[name] = counts_by_format.get(name, 0) + int(
+                count
+            )
+    without_hash = {
+        "schema": "terrain-oracle-source-inventory/v1",
+        "sources": sources,
+        "summary": {
+            "clip_count": sum(counts_by_source.values()),
+            "counts_by_source": counts_by_source,
+            "counts_by_format": dict(sorted(counts_by_format.items())),
+        },
+    }
+    document = {
+        **without_hash,
+        "content_sha256": hashlib.sha256(
+            _canonical_json_bytes(without_hash)
+        ).hexdigest(),
+    }
+    path.write_bytes(_canonical_json_bytes(document))
+    return document
 
 
 def _reseal_corpus_directory(path: Path) -> None:
@@ -259,6 +293,305 @@ def _write_huggingface_metadata(
 
 
 class CorpusCliTests(unittest.TestCase):
+    def test_real_import_keeps_primary_and_lafan_inventory_authority_distinct(
+        self,
+    ):
+        """Catches silently replacing or merging away the pinned LAFAN manifest."""
+
+        from mm_sonic.terrain_oracle.corpus_cli import (
+            _load_import_inventories,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            primary_path = root / "inventory.json"
+            lafan_path = root / "lafan-inventory.json"
+            primary = _write_source_inventory(
+                primary_path,
+                {
+                    name: {
+                        "count": count,
+                        "counts_by_format": {f"{name}-format": count},
+                    }
+                    for name, count in (
+                        ("flat", 173),
+                        ("justin", 18),
+                        ("grail", 489),
+                    )
+                },
+            )
+            lafan = _write_source_inventory(
+                lafan_path,
+                {
+                    "lafan": {
+                        "count": 40,
+                        "counts_by_format": {"lafan-format": 40},
+                    }
+                },
+            )
+
+            loaded_primary, loaded_lafan, sources = (
+                _load_import_inventories(primary_path, lafan_path)
+            )
+            self.assertEqual(loaded_primary, primary)
+            self.assertEqual(loaded_lafan, lafan)
+            self.assertEqual(
+                set(sources),
+                {"flat", "justin", "grail", "lafan"},
+            )
+            self.assertNotEqual(
+                loaded_primary["content_sha256"],
+                loaded_lafan["content_sha256"],
+            )
+
+            wrong_lafan = root / "wrong-lafan.json"
+            _write_source_inventory(
+                wrong_lafan,
+                {
+                    "flat": {
+                        "count": 40,
+                        "counts_by_format": {"lafan-format": 40},
+                    }
+                },
+            )
+            with self.assertRaises(ContractError):
+                _load_import_inventories(primary_path, wrong_lafan)
+
+    def test_terrain_recipe_composes_world_plane_in_obstacle_local_frame(self):
+        """Catches GRAIL meshes that omit runout floor or double-apply pose."""
+
+        from mm_sonic.terrain_oracle.corpus_cli import (
+            _bind_terrain_recipe,
+        )
+        from mm_sonic.terrain_oracle.math3d import RigidTransform
+
+        model_record = {
+            "asset_path": "/authority/g1.xml",
+            "asset_size_bytes": 123,
+            "asset_sha256": "a" * 64,
+            "structural_sha256": "b" * 64,
+        }
+        obstacle = {
+            "kind": "grail-usd",
+            "path": "/authority/terrain.usd",
+            "size_bytes": 456,
+            "sha256": "c" * 64,
+            "license_id": "UNRECORDED",
+        }
+        obstacle_mesh = CanonicalTerrainMesh(
+            vertices_local=np.array(
+                ((0.0, 0.0, 0.2), (1.0, 0.0, 0.2), (0.0, 1.0, 0.2)),
+                dtype=np.float32,
+            ),
+            faces=np.array(((0, 1, 2),), dtype=np.int32),
+            valid_faces=np.array((True,), dtype=np.bool_),
+            source_asset_sha256="c" * 64,
+        )
+        transform = RigidTransform(
+            np.array((2.0, -3.0, 0.5), dtype=np.float32),
+            np.array(
+                (np.sqrt(0.5), 0.0, 0.0, np.sqrt(0.5)),
+                dtype=np.float32,
+            ),
+        )
+
+        mesh, binding, recipe = _bind_terrain_recipe(
+            model_record,
+            obstacle,
+            obstacle_mesh,
+            transform,
+        )
+        repeated = _bind_terrain_recipe(
+            model_record,
+            obstacle,
+            obstacle_mesh,
+            transform,
+        )
+
+        self.assertEqual(
+            binding.asset_sha256,
+            mesh.source_asset_sha256,
+        )
+        self.assertEqual(binding.mesh_sha256, mesh_digest(mesh))
+        self.assertEqual(binding.asset_path, f"recipe://{binding.asset_sha256}")
+        self.assertEqual(recipe["schema"], "terrain-oracle-terrain-recipe/v1")
+        self.assertEqual(recipe["obstacle"], obstacle)
+        self.assertEqual(mesh.vertices_local.shape[0], 7)
+        plane_world = transform.apply_points(mesh.vertices_local[-4:])
+        self.assertTrue(
+            np.array_equal(
+                plane_world,
+                np.array(
+                    (
+                        (-16.0, -16.0, 0.0),
+                        (16.0, -16.0, 0.0),
+                        (16.0, 16.0, 0.0),
+                        (-16.0, 16.0, 0.0),
+                    ),
+                    dtype=np.float32,
+                ),
+            )
+        )
+        self.assertEqual(
+            binding.mesh_sha256,
+            repeated[1].mesh_sha256,
+        )
+        self.assertEqual(binding.asset_sha256, repeated[1].asset_sha256)
+
+    def test_justin_urdf_boxes_are_hashed_and_triangulated_strictly(self):
+        """Catches folder-name provenance or a visually implied stair surface."""
+
+        from mm_sonic.terrain_oracle.corpus_cli import (
+            _load_justin_obstacle,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "stairs.urdf"
+            collisions = "\n".join(
+                (
+                    "<link name='box-{index}'><collision>"
+                    "<origin xyz='{x} 0 {z}' rpy='0 0 0'/>"
+                    "<geometry><box size='1 2 0.2'/></geometry>"
+                    "</collision></link>"
+                ).format(index=index, x=index, z=0.1 + index * 0.2)
+                for index in range(4)
+            )
+            path.write_text(f"<robot name='stairs'>{collisions}</robot>")
+
+            obstacle, mesh = _load_justin_obstacle(path)
+
+            payload = path.read_bytes()
+            self.assertEqual(
+                obstacle,
+                {
+                    "kind": "justin-urdf",
+                    "path": str(path.resolve()),
+                    "size_bytes": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "license_id": "UNRECORDED",
+                },
+            )
+            self.assertEqual(mesh.vertices_local.shape, (32, 3))
+            self.assertEqual(mesh.faces.shape, (48, 3))
+            self.assertTrue(mesh.valid_faces.all())
+            self.assertEqual(
+                mesh.source_asset_sha256,
+                obstacle["sha256"],
+            )
+            normals = np.cross(
+                mesh.vertices_local[mesh.faces[:, 1]]
+                - mesh.vertices_local[mesh.faces[:, 0]],
+                mesh.vertices_local[mesh.faces[:, 2]]
+                - mesh.vertices_local[mesh.faces[:, 0]],
+            )
+            self.assertEqual(int(np.count_nonzero(normals[:, 2] > 0.0)), 8)
+
+    def test_grail_same_size_swap_is_rejected_before_joblib_execution(self):
+        """Catches an inventory-to-deserialization PKL substitution window."""
+
+        from mm_sonic.terrain_oracle.corpus_cli import (
+            _load_verified_grail_source,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            robot = root / "robot.pkl"
+            terrain = root / "terrain.usd"
+            robot.write_bytes(b"trusted-pickle")
+            terrain.write_bytes(b"trusted-terrain")
+            record = mock.Mock(
+                robot_path=robot,
+                usd_path=terrain,
+                stem="same-size-swap",
+                n_frames=4,
+            )
+            inventory_record = {
+                "robot": {
+                    "path": str(robot.resolve()),
+                    "size_bytes": len(robot.read_bytes()),
+                    "sha256": hashlib.sha256(
+                        robot.read_bytes()
+                    ).hexdigest(),
+                },
+                "terrain": {
+                    "path": str(terrain.resolve()),
+                    "size_bytes": len(terrain.read_bytes()),
+                    "sha256": hashlib.sha256(
+                        terrain.read_bytes()
+                    ).hexdigest(),
+                },
+            }
+            robot.write_bytes(b"hostile-pickle")
+
+            with mock.patch("joblib.load") as unsafe_load:
+                with self.assertRaises(ContractError):
+                    _load_verified_grail_source(
+                        record,
+                        inventory_record,
+                        mock.sentinel.fk,
+                    )
+            unsafe_load.assert_not_called()
+
+    def test_import_accepts_explicit_real_source_authority(self):
+        """Catches a fixture-only importer that cannot publish audited sources."""
+
+        from mm_sonic.terrain_oracle import corpus_cli
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            arguments = [
+                "import",
+                "--inventory",
+                str(root / "inventory.json"),
+                "--lafan-inventory",
+                str(root / "lafan-inventory.json"),
+                "--flat",
+                str(root / "flat"),
+                "--justin",
+                str(root / "justin.zarr"),
+                "--grail-root",
+                str(root / "grail"),
+                "--grail-families",
+                "c490_stair_p1,c490_curb",
+                "--lafan",
+                str(root / "lafan" / "g1"),
+                "--model",
+                str(root / "g1.xml"),
+                "--justin-terrain",
+                str(root / "stairs.urdf"),
+                "--output",
+                str(root / "corpus"),
+            ]
+            with mock.patch.object(
+                corpus_cli,
+                "_import_real_sources",
+                create=True,
+            ) as import_real_sources:
+                self.assertEqual(corpus_cli.main(arguments), 0)
+
+            import_real_sources.assert_called_once()
+            namespace = import_real_sources.call_args.args[0]
+            self.assertIsNone(namespace.fixture)
+            self.assertEqual(namespace.inventory, root / "inventory.json")
+            self.assertEqual(
+                namespace.lafan_inventory,
+                root / "lafan-inventory.json",
+            )
+            self.assertEqual(namespace.flat, root / "flat")
+            self.assertEqual(namespace.justin, root / "justin.zarr")
+            self.assertEqual(namespace.grail_root, root / "grail")
+            self.assertEqual(
+                namespace.grail_families,
+                "c490_stair_p1,c490_curb",
+            )
+            self.assertEqual(namespace.lafan, root / "lafan" / "g1")
+            self.assertEqual(namespace.model, root / "g1.xml")
+            self.assertEqual(
+                namespace.justin_terrain,
+                root / "stairs.urdf",
+            )
+            self.assertEqual(namespace.output, root / "corpus")
+
     def test_fixture_import_is_deterministic_and_publishes_a_complete_corpus(self):
         """Catches partial, path-dependent, or nondeterministic publication."""
 
@@ -326,6 +659,65 @@ class CorpusCliTests(unittest.TestCase):
             )
 
     @unittest.skipUnless(MODEL_PATH.is_file(), "real G1 model unavailable")
+    def test_audit_publishes_unbound_clip_as_terrain_registration_rejection(
+        self,
+    ):
+        """Catches aborting the corpus instead of retaining rejection evidence."""
+
+        from mm_sonic.terrain_oracle.corpus_cli import main
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "unbound"
+            source.mkdir()
+            record = write_clip(
+                source / "clips",
+                synthetic_canonical_clip(frames=8),
+            )
+            manifest_only = publish_corpus(
+                root / "unbound-manifest",
+                (record,),
+                {"mesh_records": []},
+            )
+            (source / "manifest.json").write_bytes(
+                (manifest_only / "manifest.json").read_bytes()
+            )
+            _seal_directory(
+                source,
+                excluded_top_level=("coverage.json", "render-audit"),
+            )
+            audited = root / "audited"
+
+            self.assertEqual(
+                main(
+                    [
+                        "audit",
+                        "--corpus",
+                        str(source),
+                        "--model",
+                        str(MODEL_PATH),
+                        "--output",
+                        str(audited),
+                    ]
+                ),
+                0,
+            )
+            index = json.loads(
+                (audited / "audit-index.json").read_text("ascii")
+            )
+            report_path = (
+                audited / index["reports"][0]["relative_path"]
+            )
+            report = json.loads(report_path.read_text("ascii"))
+            self.assertEqual(report["status"], "rejected")
+            self.assertEqual(report["terrain_sha256"], "0" * 64)
+            self.assertEqual(report["accepted_intervals"], [])
+            self.assertEqual(
+                [reason["code"] for reason in report["reasons"]],
+                ["terrain_registration"],
+            )
+
+    @unittest.skipUnless(MODEL_PATH.is_file(), "real G1 model unavailable")
     def test_directory_publication_uses_nfs_completion_protocol_on_einval(
         self,
     ):
@@ -348,7 +740,6 @@ class CorpusCliTests(unittest.TestCase):
             audited = root / "audited"
             rendered = audited / "render-audit"
             frozen = root / "frozen"
-            renderer = _write_interval_renderer(root / "renderer.py")
             forced_einval = OSError(
                 errno.EINVAL,
                 "forced renameat2 RENAME_NOREPLACE rejection",
@@ -394,10 +785,6 @@ class CorpusCliTests(unittest.TestCase):
                             "render-audit",
                             "--corpus",
                             str(audited),
-                            "--renderer",
-                            str(Path(sys.executable).resolve()),
-                            "--renderer-arg",
-                            str(renderer),
                             "--output",
                             str(rendered),
                         ]
@@ -893,8 +1280,8 @@ class CorpusCliTests(unittest.TestCase):
                 _load_audit_evidence(coordinated)
 
     @unittest.skipUnless(MODEL_PATH.is_file(), "real G1 model unavailable")
-    def test_render_audit_records_exact_interval_subprocess_evidence(self):
-        """Catches unbound renderer argv or receipts unrelated to output bytes."""
+    def test_external_renderer_cannot_publish_acceptable_evidence(self):
+        """Catches restoring an arbitrary-byte production renderer escape."""
 
         from mm_sonic.terrain_oracle.corpus_cli import main
 
@@ -949,133 +1336,76 @@ class CorpusCliTests(unittest.TestCase):
             except BaseException:
                 self.assertFalse(renders.exists())
                 raise
-            self.assertEqual(status, 0)
-
-            audit_index = json.loads(
-                (audited / "audit-index.json").read_text("ascii")
-            )
-            audit_entry = audit_index["reports"][0]
-            manifest = load_corpus(audited)
-            clip = read_clip(
-                audited / manifest.clips[0].relative_path
-            )
-            receipts = [
-                json.loads(path.read_text("ascii"))
-                for path in sorted((renders / "receipts").glob("*.json"))
-            ]
-            self.assertEqual(len(receipts), 2)
+            self.assertEqual(status, 2)
+            self.assertFalse(renders.exists())
             self.assertEqual(
-                {tuple(receipt["interval"]) for receipt in receipts},
-                {(0, 17), (24, 40)},
+                list(audited.glob(".render-audit.*")),
+                [],
             )
-            for receipt in receipts:
-                self.assertEqual(
-                    set(receipt),
-                    {
-                        "schema",
-                        "kind",
-                        "clip_id",
-                        "clip_sha256",
-                        "model",
-                        "terrain_sha256",
-                        "terrain_mesh_sha256",
-                        "interval",
-                        "renderer",
-                        "video",
-                        "contact_overlay",
-                        "completed",
-                    },
-                )
-                self.assertEqual(
-                    receipt["schema"],
-                    "terrain-oracle-render-receipt/v1",
-                )
-                self.assertEqual(receipt["kind"], "accepted_interval")
-                self.assertEqual(receipt["clip_id"], clip.clip_id)
-                self.assertEqual(
-                    receipt["clip_sha256"],
-                    manifest.clips[0].sha256,
-                )
-                self.assertEqual(receipt["model"], audit_index["model"])
-                self.assertEqual(
-                    receipt["terrain_sha256"],
-                    audit_entry["terrain_sha256"],
-                )
-                self.assertEqual(
-                    receipt["terrain_mesh_sha256"],
-                    clip.terrain.mesh_sha256,
-                )
-                self.assertIs(receipt["completed"], True)
-                self.assertEqual(
-                    set(receipt["renderer"]),
-                    {
-                        "argv",
-                        "executable_sha256",
-                        "invocation_sha256",
-                        "shell",
-                        "returncode",
-                    },
-                )
-                self.assertIs(receipt["renderer"]["shell"], False)
-                self.assertEqual(receipt["renderer"]["returncode"], 0)
-                normalized_argv = receipt["renderer"]["argv"]
-                self.assertEqual(
-                    normalized_argv[:8],
+
+    @unittest.skipUnless(MODEL_PATH.is_file(), "real G1 model unavailable")
+    def test_default_render_audit_uses_authenticated_package_media(self):
+        """Catches production render evidence backed only by arbitrary bytes."""
+
+        from mm_sonic.terrain_oracle.corpus_cli import (
+            _load_render_evidence,
+            main,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = _write_audit_fixture(root)
+            audited = root / "audited"
+            rendered = audited / "render-audit"
+            self.assertEqual(
+                main(
                     [
-                        str(Path(sys.executable).resolve()),
-                        str(renderer.resolve()),
-                        "--kind",
-                        "accepted_interval",
-                        "--clip-sha256",
-                        manifest.clips[0].sha256,
-                        "--start",
-                        str(receipt["interval"][0]),
-                    ],
-                )
-                self.assertEqual(
-                    normalized_argv[8:12],
+                        "audit",
+                        "--corpus",
+                        str(source),
+                        "--model",
+                        str(MODEL_PATH),
+                        "--output",
+                        str(audited),
+                    ]
+                ),
+                0,
+            )
+
+            self.assertEqual(
+                main(
                     [
-                        "--end",
-                        str(receipt["interval"][1]),
-                        "--video",
-                        receipt["video"]["relative_path"],
-                    ],
-                )
-                self.assertEqual(
-                    normalized_argv[12:],
-                    [
-                        "--overlay",
-                        receipt["contact_overlay"]["relative_path"],
-                    ],
-                )
-                self.assertEqual(
-                    receipt["renderer"]["invocation_sha256"],
-                    hashlib.sha256(
-                        _canonical_json_bytes(normalized_argv)
-                    ).hexdigest(),
-                )
-                self.assertEqual(
-                    receipt["renderer"]["executable_sha256"],
-                    hashlib.sha256(
-                        Path(sys.executable).resolve().read_bytes()
-                    ).hexdigest(),
-                )
-                for field in ("video", "contact_overlay"):
-                    artifact = receipt[field]
-                    self.assertEqual(
-                        set(artifact),
-                        {"relative_path", "sha256", "size_bytes"},
-                    )
-                    relative = Path(artifact["relative_path"])
-                    self.assertFalse(relative.is_absolute())
-                    self.assertNotIn("..", relative.parts)
-                    path = renders / relative
-                    payload = path.read_bytes()
-                    self.assertEqual(len(payload), artifact["size_bytes"])
-                    self.assertEqual(
-                        hashlib.sha256(payload).hexdigest(),
-                        artifact["sha256"],
-                    )
+                        "render-audit",
+                        "--corpus",
+                        str(audited),
+                        "--output",
+                        str(rendered),
+                    ]
+                ),
+                0,
+            )
+
+            index = _load_render_evidence(audited)
+            self.assertEqual(
+                index["schema"],
+                "terrain-oracle-render-index/v2",
+            )
+            self.assertEqual(
+                index["renderer"]["mode"],
+                "trusted-package-media-v1",
+            )
+            receipt_path = (
+                rendered
+                / index["interval_receipts"][0]["relative_path"]
+            )
+            receipt = json.loads(receipt_path.read_text("ascii"))
+            self.assertEqual(
+                receipt["renderer"]["result"]["schema"],
+                "terrain-oracle-render-result/v1",
+            )
+            self.assertTrue(
+                receipt["renderer"]["result"]["completed"]
+            )
 
     @unittest.skipUnless(MODEL_PATH.is_file(), "real G1 model unavailable")
     def test_render_index_covers_contact_sheet_and_recomputed_strata(self):
@@ -1089,7 +1419,6 @@ class CorpusCliTests(unittest.TestCase):
             raw = root / "raw"
             audited = root / "audited"
             renders = audited / "render-audit"
-            renderer = _write_interval_renderer(root / "renderer.py")
             self.assertEqual(
                 main(
                     [
@@ -1122,10 +1451,6 @@ class CorpusCliTests(unittest.TestCase):
                         "render-audit",
                         "--corpus",
                         str(audited),
-                        "--renderer",
-                        str(Path(sys.executable).resolve()),
-                        "--renderer-arg",
-                        str(renderer),
                         "--output",
                         str(renders),
                     ]
@@ -1157,7 +1482,7 @@ class CorpusCliTests(unittest.TestCase):
             )
             self.assertEqual(
                 index["schema"],
-                "terrain-oracle-render-index/v1",
+                "terrain-oracle-render-index/v2",
             )
             self.assertEqual(index["accepted_interval_keys"], accepted_keys)
             self.assertEqual(
@@ -1181,16 +1506,17 @@ class CorpusCliTests(unittest.TestCase):
                 ).hexdigest(),
             )
             self.assertEqual(
-                index["renderer"],
-                {
-                    "argv_prefix": [
-                        str(Path(sys.executable).resolve()),
-                        str(renderer.resolve()),
-                    ],
-                    "executable_sha256": hashlib.sha256(
-                        Path(sys.executable).resolve().read_bytes()
-                    ).hexdigest(),
-                },
+                index["renderer"]["argv_prefix"],
+                [
+                    str(Path(sys.executable).resolve()),
+                    "-B",
+                    "-m",
+                    "mm_sonic.terrain_oracle.render_media",
+                ],
+            )
+            self.assertEqual(
+                index["renderer"]["mode"],
+                "trusted-package-media-v1",
             )
             self.assertEqual(len(index["interval_receipts"]), 2)
             self.assertEqual(len(index["stratum_receipts"]), 1)
@@ -1271,11 +1597,12 @@ class CorpusCliTests(unittest.TestCase):
                     argv[:4],
                     [
                         str(Path(sys.executable).resolve()),
-                        str(renderer.resolve()),
-                        "--kind",
-                        receipt["kind"],
+                        "-B",
+                        "-m",
+                        "mm_sonic.terrain_oracle.render_media",
                     ],
                 )
+                self.assertEqual(argv[4], "--request")
                 self.assertEqual(
                     receipt["renderer"]["invocation_sha256"],
                     hashlib.sha256(
@@ -1284,20 +1611,14 @@ class CorpusCliTests(unittest.TestCase):
                 )
                 self.assertIs(receipt["renderer"]["shell"], False)
                 self.assertEqual(receipt["renderer"]["returncode"], 0)
-                if receipt["kind"] == "contact_sheet":
-                    self.assertNotIn("--stratum", argv)
-                else:
-                    position = argv.index("--stratum")
-                    self.assertEqual(
-                        json.loads(argv[position + 1]),
-                        expected_stratum,
-                    )
-                declared_keys = [
-                    argv[position + 1]
-                    for position, value in enumerate(argv)
-                    if value == "--interval-key"
-                ]
-                self.assertEqual(declared_keys, accepted_keys)
+                self.assertEqual(
+                    receipt["renderer"]["result"]["interval_keys"],
+                    accepted_keys,
+                )
+                self.assertEqual(
+                    set(receipt["renderer"]["request"]),
+                    {"relative_path", "sha256", "size_bytes"},
+                )
                 for field in ("video", "contact_overlay"):
                     artifact = receipt[field]
                     self.assertEqual(
@@ -1327,7 +1648,6 @@ class CorpusCliTests(unittest.TestCase):
             raw = root / "raw"
             audited = root / "audited"
             renders = audited / "render-audit"
-            renderer = _write_interval_renderer(root / "renderer.py")
             self.assertEqual(
                 main(
                     [
@@ -1360,10 +1680,6 @@ class CorpusCliTests(unittest.TestCase):
                         "render-audit",
                         "--corpus",
                         str(audited),
-                        "--renderer",
-                        str(Path(sys.executable).resolve()),
-                        "--renderer-arg",
-                        str(renderer),
                         "--output",
                         str(renders),
                     ]
@@ -1830,7 +2146,6 @@ class CorpusCliTests(unittest.TestCase):
             renders = audited / "render-audit"
             coverage_path = audited / "coverage.json"
             frozen = root / "frozen"
-            renderer = _write_interval_renderer(root / "renderer.py")
             self.assertEqual(
                 main(
                     [
@@ -1883,10 +2198,6 @@ class CorpusCliTests(unittest.TestCase):
                                     "render-audit",
                                     "--corpus",
                                     str(audited),
-                                    "--renderer",
-                                    str(Path(sys.executable).resolve()),
-                                    "--renderer-arg",
-                                    str(renderer),
                                     "--output",
                                     str(renders),
                                 ]
@@ -2095,7 +2406,6 @@ class CorpusCliTests(unittest.TestCase):
             audited = root / "audited"
             rendered = audited / "render-audit"
             frozen = root / "frozen"
-            renderer = _write_interval_renderer(root / "renderer.py")
             for command in (
                 [
                     "import",
@@ -2117,10 +2427,6 @@ class CorpusCliTests(unittest.TestCase):
                     "render-audit",
                     "--corpus",
                     str(audited),
-                    "--renderer",
-                    str(Path(sys.executable).resolve()),
-                    "--renderer-arg",
-                    str(renderer),
                     "--output",
                     str(rendered),
                 ],
@@ -2208,7 +2514,6 @@ class CorpusCliTests(unittest.TestCase):
             fixture = _write_audit_fixture(root)
             raw = root / "raw"
             audited = root / "audited"
-            renderer = _write_interval_renderer(root / "renderer.py")
             self.assertEqual(
                 main(
                     [
@@ -2241,10 +2546,6 @@ class CorpusCliTests(unittest.TestCase):
                         "render-audit",
                         "--corpus",
                         str(audited),
-                        "--renderer",
-                        str(Path(sys.executable).resolve()),
-                        "--renderer-arg",
-                        str(renderer),
                         "--output",
                         str(audited / "render-audit"),
                     ]

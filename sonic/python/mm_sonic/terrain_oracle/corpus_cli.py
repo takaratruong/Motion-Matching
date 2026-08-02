@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import errno
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -16,7 +17,8 @@ import stat
 import subprocess
 import sys
 import tempfile
-from typing import Sequence
+from typing import Iterable, Sequence
+import xml.etree.ElementTree as ET
 
 import numpy as np
 
@@ -37,7 +39,12 @@ from .audit import (
     terrain_query_sha256,
 )
 from .canonical import CanonicalClip, CanonicalTerrainMesh, TerrainBinding
-from .contact import CanonicalMeshQuery
+from .contact import (
+    CanonicalMeshQuery,
+    ContactConfig,
+    SoleGeometry,
+    reconstruct_contacts,
+)
 from .math3d import RigidTransform
 
 
@@ -103,8 +110,8 @@ def _load_fixture(
 
 def _publish_bundle(
     output: Path,
-    clips: Sequence[CanonicalClip],
-    meshes: Sequence[CanonicalTerrainMesh],
+    clips: Iterable[CanonicalClip],
+    meshes: Iterable[CanonicalTerrainMesh],
     metadata: dict[str, object],
 ) -> None:
     destination = _cli_output_path(output, "import output")
@@ -117,12 +124,22 @@ def _publish_bundle(
     )
     try:
         clip_records = tuple(
-            storage.write_clip(stage / "clips", clip)
-            for clip in clips
+            sorted(
+                (
+                    storage.write_clip(stage / "clips", clip)
+                    for clip in clips
+                ),
+                key=lambda record: (record.clip_id, record.sha256),
+            )
         )
         mesh_records = tuple(
-            storage.write_mesh(stage / "meshes", mesh)
-            for mesh in meshes
+            sorted(
+                (
+                    storage.write_mesh(stage / "meshes", mesh)
+                    for mesh in meshes
+                ),
+                key=lambda record: record.sha256,
+            )
         )
         manifest_directory = storage.publish_corpus(
             stage / "_manifest",
@@ -154,6 +171,894 @@ def _publish_bundle(
 def _import_fixture(arguments: argparse.Namespace) -> None:
     clips, meshes, metadata = _load_fixture(arguments.fixture)
     _publish_bundle(arguments.output, clips, meshes, metadata)
+
+
+def _import_from_arguments(arguments: argparse.Namespace) -> None:
+    real_options = (
+        arguments.inventory,
+        arguments.lafan_inventory,
+        arguments.flat,
+        arguments.justin,
+        arguments.grail_root,
+        arguments.grail_families,
+        arguments.lafan,
+        arguments.model,
+        arguments.justin_terrain,
+    )
+    if arguments.fixture is not None:
+        if any(value is not None for value in real_options):
+            raise ContractError(
+                "--fixture cannot be combined with real-source import options"
+            )
+        _import_fixture(arguments)
+        return
+    if any(value is None for value in real_options):
+        raise ContractError(
+            "real import requires --inventory, --flat, --justin, "
+            "--grail-root, --grail-families, --lafan-inventory, "
+            "--lafan, --model, and --justin-terrain"
+        )
+    _import_real_sources(arguments)
+
+
+def _validated_inventory_document(
+    path: Path,
+    label: str,
+    expected_sources: frozenset[str],
+) -> dict[str, object]:
+    inventory_path = _cli_input_file(path, label)
+    document, _ = _load_canonical_json(inventory_path, label)
+    if set(document) != {
+        "schema",
+        "sources",
+        "summary",
+        "content_sha256",
+    }:
+        raise ContractError(f"{label} fields do not match v1")
+    without_hash = dict(document)
+    content_sha256 = without_hash.pop("content_sha256")
+    if (
+        document["schema"] != "terrain-oracle-source-inventory/v1"
+        or _validated_sha256(content_sha256, f"{label} content SHA-256")
+        != hashlib.sha256(
+            storage._canonical_json_bytes(without_hash, label)
+        ).hexdigest()
+    ):
+        raise ContractError(f"{label} hash is stale")
+    sources = document["sources"]
+    if not isinstance(sources, dict) or set(sources) != expected_sources:
+        raise ContractError(
+            f"{label} must contain exactly {sorted(expected_sources)}"
+        )
+    counts_by_source: dict[str, int] = {}
+    counts_by_format: Counter[str] = Counter()
+    for name, source in sorted(sources.items()):
+        if not isinstance(source, dict):
+            raise ContractError(f"{label} source {name} must be an object")
+        count = source.get("count")
+        formats = source.get("counts_by_format")
+        if type(count) is not int or count < 1:
+            raise ContractError(
+                f"{label} source {name} count must be positive"
+            )
+        if (
+            not isinstance(formats, dict)
+            or not formats
+            or any(
+                type(format_name) is not str
+                or not format_name
+                or type(format_count) is not int
+                or format_count < 1
+                for format_name, format_count in formats.items()
+            )
+            or sum(formats.values()) != count
+        ):
+            raise ContractError(
+                f"{label} source {name} format counts are invalid"
+            )
+        counts_by_source[name] = count
+        counts_by_format.update(formats)
+    expected_summary = {
+        "clip_count": sum(counts_by_source.values()),
+        "counts_by_source": counts_by_source,
+        "counts_by_format": dict(sorted(counts_by_format.items())),
+    }
+    if document["summary"] != expected_summary:
+        raise ContractError(f"{label} summary is stale")
+    return document
+
+
+def _load_import_inventories(
+    primary_path: Path,
+    lafan_path: Path,
+) -> tuple[
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+]:
+    """Load the two independently hashed source authorities for real import."""
+
+    primary = _validated_inventory_document(
+        primary_path,
+        "primary source inventory",
+        frozenset(("flat", "justin", "grail")),
+    )
+    lafan = _validated_inventory_document(
+        lafan_path,
+        "LAFAN source inventory",
+        frozenset(("lafan",)),
+    )
+    if primary["content_sha256"] == lafan["content_sha256"]:
+        raise ContractError(
+            "primary and LAFAN inventories must have distinct authority hashes"
+        )
+    sources = {
+        **primary["sources"],
+        **lafan["sources"],
+    }
+    return primary, lafan, sources
+
+
+_BASE_PLANE_HALF_EXTENT_M = 16.0
+_BASE_PLANE_VERTICES_WORLD = np.array(
+    (
+        (-_BASE_PLANE_HALF_EXTENT_M, -_BASE_PLANE_HALF_EXTENT_M, 0.0),
+        (_BASE_PLANE_HALF_EXTENT_M, -_BASE_PLANE_HALF_EXTENT_M, 0.0),
+        (_BASE_PLANE_HALF_EXTENT_M, _BASE_PLANE_HALF_EXTENT_M, 0.0),
+        (-_BASE_PLANE_HALF_EXTENT_M, _BASE_PLANE_HALF_EXTENT_M, 0.0),
+    ),
+    dtype=np.float32,
+)
+_BASE_PLANE_FACES = np.array(
+    ((0, 1, 2), (0, 2, 3)),
+    dtype=np.int32,
+)
+
+
+def _normalized_obstacle_recipe(
+    value: object,
+) -> dict[str, object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {
+        "kind",
+        "path",
+        "size_bytes",
+        "sha256",
+        "license_id",
+    }:
+        raise ContractError("terrain obstacle recipe fields do not match v1")
+    if value["kind"] not in ("justin-urdf", "grail-usd"):
+        raise ContractError("terrain obstacle recipe kind is invalid")
+    if (
+        type(value["path"]) is not str
+        or not value["path"]
+        or type(value["size_bytes"]) is not int
+        or value["size_bytes"] < 1
+        or type(value["license_id"]) is not str
+        or not value["license_id"]
+    ):
+        raise ContractError("terrain obstacle recipe identity is invalid")
+    return {
+        "kind": value["kind"],
+        "path": value["path"],
+        "size_bytes": value["size_bytes"],
+        "sha256": _validated_sha256(
+            value["sha256"],
+            "terrain obstacle SHA-256",
+        ),
+        "license_id": value["license_id"],
+    }
+
+
+def _bind_terrain_recipe(
+    model_record: dict[str, object],
+    obstacle: dict[str, object] | None,
+    obstacle_mesh: CanonicalTerrainMesh | None,
+    world_from_terrain: RigidTransform,
+) -> tuple[
+    CanonicalTerrainMesh,
+    TerrainBinding,
+    dict[str, object],
+]:
+    """Append the canonical world floor and bind the exact derivation recipe."""
+
+    normalized_model = _normalized_model_record(
+        model_record,
+        "terrain recipe model",
+    )
+    normalized_obstacle = _normalized_obstacle_recipe(obstacle)
+    if not isinstance(world_from_terrain, RigidTransform):
+        raise ContractError("terrain recipe requires a RigidTransform")
+    if (normalized_obstacle is None) != (obstacle_mesh is None):
+        raise ContractError(
+            "terrain recipe obstacle identity and mesh must be paired"
+        )
+    if (
+        obstacle_mesh is not None
+        and obstacle_mesh.source_asset_sha256
+        != normalized_obstacle["sha256"]
+    ):
+        raise ContractError(
+            "terrain obstacle mesh does not match its source authority"
+        )
+    recipe = {
+        "schema": "terrain-oracle-terrain-recipe/v1",
+        "base_plane": {
+            "authority_model": normalized_model,
+            "geom_name": "floor",
+            "z_m": 0.0,
+            "half_extent_m": _BASE_PLANE_HALF_EXTENT_M,
+            "vertices_world": _BASE_PLANE_VERTICES_WORLD.tolist(),
+            "faces": _BASE_PLANE_FACES.tolist(),
+        },
+        "obstacle": normalized_obstacle,
+    }
+    recipe_payload = storage._canonical_json_bytes(
+        recipe,
+        "terrain recipe",
+    )
+    recipe_sha256 = hashlib.sha256(recipe_payload).hexdigest()
+    plane_local = world_from_terrain.inverse().apply_points(
+        _BASE_PLANE_VERTICES_WORLD
+    )
+    if obstacle_mesh is None:
+        vertices = plane_local
+        faces = _BASE_PLANE_FACES
+        valid_faces = np.ones(len(faces), dtype=np.bool_)
+        license_id = "LicenseRef-Procedural"
+    else:
+        vertex_count = len(obstacle_mesh.vertices_local)
+        vertices = np.concatenate(
+            (obstacle_mesh.vertices_local, plane_local),
+            axis=0,
+        )
+        faces = np.concatenate(
+            (
+                obstacle_mesh.faces,
+                _BASE_PLANE_FACES + vertex_count,
+            ),
+            axis=0,
+        )
+        valid_faces = np.concatenate(
+            (
+                obstacle_mesh.valid_faces,
+                np.ones(len(_BASE_PLANE_FACES), dtype=np.bool_),
+            ),
+            axis=0,
+        )
+        license_id = str(normalized_obstacle["license_id"])
+    mesh = CanonicalTerrainMesh(
+        vertices_local=vertices,
+        faces=faces,
+        valid_faces=valid_faces,
+        source_asset_sha256=recipe_sha256,
+    )
+    binding = TerrainBinding(
+        asset_path=f"recipe://{recipe_sha256}",
+        asset_size_bytes=len(recipe_payload),
+        asset_sha256=recipe_sha256,
+        asset_license_id=license_id,
+        mesh_sha256=storage.mesh_digest(mesh),
+        world_from_terrain=world_from_terrain,
+        validity_mask_path=None,
+    )
+    return mesh, binding, recipe
+
+
+def _urdf_vector(value: object, label: str) -> np.ndarray:
+    if type(value) is not str:
+        raise ContractError(f"Justin terrain {label} must be declared")
+    try:
+        vector = np.asarray(
+            tuple(float(component) for component in value.split()),
+            dtype=np.float64,
+        )
+    except ValueError as error:
+        raise ContractError(
+            f"Justin terrain {label} must contain three numbers"
+        ) from error
+    if vector.shape != (3,) or not np.isfinite(vector).all():
+        raise ContractError(
+            f"Justin terrain {label} must contain three finite numbers"
+        )
+    return vector
+
+
+def _rpy_rotation(rpy: np.ndarray) -> np.ndarray:
+    roll, pitch, yaw = np.asarray(rpy, dtype=np.float64)
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    return np.asarray(
+        (
+            (cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr),
+            (sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr),
+            (-sp, cp * sr, cp * cr),
+        ),
+        dtype=np.float64,
+    )
+
+
+def _load_justin_obstacle(
+    path: Path,
+) -> tuple[dict[str, object], CanonicalTerrainMesh]:
+    """Parse the four authoritative Justin collision boxes without URDF code."""
+
+    resolved = _cli_input_file(path, "Justin terrain URDF")
+    payload = storage._read_regular_file_nofollow(resolved)
+    if b"<!DOCTYPE" in payload.upper() or b"<!ENTITY" in payload.upper():
+        raise ContractError("Justin terrain URDF must not declare entities")
+    try:
+        root = ET.fromstring(payload)
+    except ET.ParseError as error:
+        raise ContractError("Justin terrain URDF is invalid XML") from error
+    collisions = root.findall("./link/collision") if root.tag == "robot" else []
+    if len(collisions) != 4:
+        raise ContractError(
+            "Justin terrain URDF must contain exactly four collision boxes"
+        )
+    unit_vertices = np.asarray(
+        (
+            (-1.0, -1.0, -1.0),
+            (1.0, -1.0, -1.0),
+            (1.0, 1.0, -1.0),
+            (-1.0, 1.0, -1.0),
+            (-1.0, -1.0, 1.0),
+            (1.0, -1.0, 1.0),
+            (1.0, 1.0, 1.0),
+            (-1.0, 1.0, 1.0),
+        ),
+        dtype=np.float64,
+    )
+    box_faces = np.asarray(
+        (
+            (0, 2, 1),
+            (0, 3, 2),
+            (4, 5, 6),
+            (4, 6, 7),
+            (0, 1, 5),
+            (0, 5, 4),
+            (3, 7, 6),
+            (3, 6, 2),
+            (0, 4, 7),
+            (0, 7, 3),
+            (1, 2, 6),
+            (1, 6, 5),
+        ),
+        dtype=np.int32,
+    )
+    vertices: list[np.ndarray] = []
+    faces: list[np.ndarray] = []
+    for collision_index, collision in enumerate(collisions):
+        if set(collision.attrib):
+            raise ContractError(
+                "Justin terrain collision elements must not have attributes"
+            )
+        children = list(collision)
+        if len(children) != 2 or {child.tag for child in children} != {
+            "origin",
+            "geometry",
+        }:
+            raise ContractError(
+                "Justin terrain collisions require one origin and geometry"
+            )
+        origin = collision.find("origin")
+        geometry = collision.find("geometry")
+        if origin is None or geometry is None or set(origin.attrib) != {
+            "xyz",
+            "rpy",
+        }:
+            raise ContractError(
+                "Justin terrain collision origin fields do not match v1"
+            )
+        geometry_children = list(geometry)
+        if (
+            geometry.attrib
+            or len(geometry_children) != 1
+            or geometry_children[0].tag != "box"
+            or set(geometry_children[0].attrib) != {"size"}
+        ):
+            raise ContractError(
+                "Justin terrain collision geometry must be one box"
+            )
+        translation = _urdf_vector(
+            origin.attrib["xyz"],
+            "origin xyz",
+        )
+        rotation = _rpy_rotation(
+            _urdf_vector(origin.attrib["rpy"], "origin rpy")
+        )
+        size = _urdf_vector(
+            geometry_children[0].attrib["size"],
+            "box size",
+        )
+        if np.any(size <= 0.0):
+            raise ContractError(
+                "Justin terrain box sizes must be positive"
+            )
+        box_vertices = (
+            (unit_vertices * (size / 2.0)) @ rotation.T
+            + translation
+        )
+        vertices.append(box_vertices)
+        faces.append(box_faces + collision_index * len(unit_vertices))
+    asset_sha256 = hashlib.sha256(payload).hexdigest()
+    mesh = CanonicalTerrainMesh(
+        vertices_local=np.concatenate(vertices, axis=0),
+        faces=np.concatenate(faces, axis=0),
+        valid_faces=np.ones(4 * len(box_faces), dtype=np.bool_),
+        source_asset_sha256=asset_sha256,
+    )
+    obstacle = {
+        "kind": "justin-urdf",
+        "path": str(resolved),
+        "size_bytes": len(payload),
+        "sha256": asset_sha256,
+        "license_id": "UNRECORDED",
+    }
+    return obstacle, mesh
+
+
+_REAL_IMPORT_COUNTS = {
+    "flat": 173,
+    "justin": 18,
+    "grail": 489,
+    "lafan": 40,
+}
+
+
+def _inventory_authority_metadata(
+    path: Path,
+    document: dict[str, object],
+    label: str,
+) -> dict[str, object]:
+    resolved = _cli_input_file(path, label)
+    payload = storage._read_regular_file_nofollow(resolved)
+    try:
+        snapshot = json.loads(payload.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ContractError(f"{label} changed after validation") from error
+    if snapshot != document:
+        raise ContractError(f"{label} changed after validation")
+    return {
+        "path": str(resolved),
+        "size_bytes": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "content_sha256": document["content_sha256"],
+        "summary": document["summary"],
+    }
+
+
+def _require_exact_inventory_sources(
+    arguments: argparse.Namespace,
+    declared_sources: dict[str, object],
+) -> tuple[Path, Path, Path, tuple[str, ...], Path]:
+    flat = _cli_input_directory(arguments.flat, "flat source root")
+    justin = _cli_input_directory(arguments.justin, "Justin source root")
+    grail = _cli_input_directory(arguments.grail_root, "GRAIL source root")
+    lafan = _cli_input_directory(arguments.lafan, "LAFAN source root")
+    families = tuple(str(arguments.grail_families).split(","))
+    regenerated = {
+        "flat": _flat_inventory(flat),
+        "justin": _justin_inventory(justin),
+        "grail": _grail_inventory(
+            grail,
+            str(arguments.grail_families),
+        ),
+        "lafan": _lafan_inventory(lafan),
+    }
+    for name in ("flat", "justin", "grail", "lafan"):
+        if regenerated[name] != declared_sources[name]:
+            raise ContractError(
+                f"{name} source bytes or metadata differ from inventory authority"
+            )
+        if regenerated[name]["count"] != _REAL_IMPORT_COUNTS[name]:
+            raise ContractError(
+                f"{name} source count must equal "
+                f"{_REAL_IMPORT_COUNTS[name]} for the phase-1 release"
+            )
+    return flat, justin, grail, families, lafan
+
+
+def _verified_inventory_file_payload(
+    path: Path,
+    identity: object,
+    label: str,
+) -> bytes:
+    if not isinstance(identity, dict):
+        raise ContractError(f"{label} inventory identity must be an object")
+    required = {"path", "size_bytes", "sha256"}
+    if not required.issubset(identity):
+        raise ContractError(f"{label} inventory identity is incomplete")
+    resolved = _cli_input_file(path, label)
+    if str(resolved) != identity["path"]:
+        raise ContractError(f"{label} path differs from inventory authority")
+    payload = storage._read_regular_file_nofollow(resolved)
+    if (
+        len(payload) != identity["size_bytes"]
+        or hashlib.sha256(payload).hexdigest() != identity["sha256"]
+    ):
+        raise ContractError(f"{label} bytes differ from inventory authority")
+    return payload
+
+
+def _load_verified_grail_source(
+    record: object,
+    inventory_record: dict[str, object],
+    fk: object,
+) -> source_grail.GrailCanonicalSource:
+    """Snapshot exact PKL/USD bytes before either unsafe parser can observe them."""
+
+    robot_identity = inventory_record.get("robot")
+    terrain_identity = inventory_record.get("terrain")
+    if not isinstance(robot_identity, dict) or not isinstance(
+        terrain_identity, dict
+    ):
+        raise ContractError("GRAIL inventory pair identity is incomplete")
+    robot_payload = _verified_inventory_file_payload(
+        record.robot_path,  # type: ignore[attr-defined]
+        robot_identity,
+        f"GRAIL robot {record.stem}",  # type: ignore[attr-defined]
+    )
+    terrain_payload = _verified_inventory_file_payload(
+        record.usd_path,  # type: ignore[attr-defined]
+        terrain_identity,
+        f"GRAIL terrain {record.stem}",  # type: ignore[attr-defined]
+    )
+    try:
+        import joblib
+        from mm_sonic.grail_terrain_source import (
+            parse_grail_motion_blob,
+        )
+
+        blob = joblib.load(io.BytesIO(robot_payload))
+        motion = parse_grail_motion_blob(
+            blob,
+            expected_frames=record.n_frames,  # type: ignore[attr-defined]
+        )
+    except Exception as error:
+        raise ContractError(
+            f"verified GRAIL robot payload is invalid: "
+            f"{record.stem}"  # type: ignore[attr-defined]
+        ) from error
+    terrain_sha256 = hashlib.sha256(terrain_payload).hexdigest()
+    with tempfile.TemporaryDirectory(
+        prefix="terrain-oracle-grail-usd-"
+    ) as temporary:
+        snapshot_root = Path(temporary)
+        os.chmod(snapshot_root, 0o700)
+        snapshot_path = snapshot_root / "terrain.usd"
+        storage._write_no_replace(snapshot_path, terrain_payload)
+        try:
+            mesh = source_grail._load_usd_mesh(
+                snapshot_path,
+                source_asset_sha256=terrain_sha256,
+            )
+        except Exception as error:
+            raise ContractError(
+                f"verified GRAIL terrain payload is invalid: "
+                f"{record.stem}"  # type: ignore[attr-defined]
+            ) from error
+    return source_grail._canonicalize_verified_record(
+        record,
+        fk,
+        motion=motion,
+        mesh=mesh,
+        robot_bytes=robot_payload,
+        asset_bytes=terrain_payload,
+    )
+
+
+def _import_real_sources(arguments: argparse.Namespace) -> None:
+    primary, lafan_inventory, declared_sources = (
+        _load_import_inventories(
+            arguments.inventory,
+            arguments.lafan_inventory,
+        )
+    )
+    flat_root, justin_root, grail_root, families, lafan_root = (
+        _require_exact_inventory_sources(arguments, declared_sources)
+    )
+    model_path = _cli_input_file(arguments.model, "mechanical model")
+    try:
+        import mujoco
+    except ImportError as error:
+        raise ContractError("real import requires MuJoCo") from error
+    model = mujoco.MjModel.from_xml_path(str(model_path))
+    model_record = _model_record(model_path, model)
+    contact_config = ContactConfig(SoleGeometry.from_model(model))
+    try:
+        fk = source_grail.G1MujocoFK(model_path)
+    except Exception as error:
+        raise ContractError("could not initialize canonical G1 FK") from error
+
+    identity = RigidTransform(
+        np.zeros(3, dtype=np.float32),
+        np.array((1.0, 0.0, 0.0, 0.0), dtype=np.float32),
+    )
+    plane_mesh, plane_binding, plane_recipe = _bind_terrain_recipe(
+        model_record,
+        None,
+        None,
+        identity,
+    )
+    justin_obstacle, justin_obstacle_mesh = _load_justin_obstacle(
+        arguments.justin_terrain
+    )
+    justin_mesh, justin_binding, justin_recipe = _bind_terrain_recipe(
+        model_record,
+        justin_obstacle,
+        justin_obstacle_mesh,
+        identity,
+    )
+
+    meshes_by_sha256: dict[str, CanonicalTerrainMesh] = {}
+    recipes_by_sha256: dict[str, dict[str, object]] = {}
+
+    def register_terrain(
+        mesh: CanonicalTerrainMesh,
+        binding: TerrainBinding,
+        recipe: dict[str, object],
+    ) -> None:
+        digest = storage.mesh_digest(mesh)
+        if (
+            digest != binding.mesh_sha256
+            or mesh.source_asset_sha256 != binding.asset_sha256
+        ):
+            raise ContractError("terrain recipe binding is internally stale")
+        existing_mesh = meshes_by_sha256.setdefault(digest, mesh)
+        if storage.mesh_digest(existing_mesh) != digest:
+            raise ContractError("terrain mesh digest collision")
+        existing_recipe = recipes_by_sha256.setdefault(
+            binding.asset_sha256,
+            recipe,
+        )
+        if existing_recipe != recipe:
+            raise ContractError("terrain recipe SHA-256 collision")
+
+    register_terrain(plane_mesh, plane_binding, plane_recipe)
+    register_terrain(justin_mesh, justin_binding, justin_recipe)
+
+    primary_sources = primary["sources"]
+    lafan_sources = lafan_inventory["sources"]
+    flat_records = {
+        str(record["clip_id"]): record
+        for record in primary_sources["flat"]["records"]
+    }
+    justin_records = {
+        str(record["clip_id"]): record
+        for record in primary_sources["justin"]["records"]
+    }
+    grail_records = {
+        (str(record["family"]), str(record["stem"])): record
+        for record in primary_sources["grail"]["records"]
+    }
+    lafan_records = {
+        str(record["clip_id"]): record
+        for record in lafan_sources["lafan"]["records"]
+    }
+    expected_ids = {
+        "flat": set(flat_records),
+        "justin": set(justin_records),
+        "grail": set(grail_records),
+        "lafan": set(lafan_records),
+    }
+    seen_ids: dict[str, set[object]] = {
+        name: set() for name in expected_ids
+    }
+    published_clip_ids: set[str] = set()
+    frame_counts: Counter[str] = Counter()
+    metadata: dict[str, object] = {
+        "schema": "terrain-oracle-real-import/v1",
+        "source_inventories": {
+            "primary": _inventory_authority_metadata(
+                arguments.inventory,
+                primary,
+                "primary source inventory",
+            ),
+            "lafan": _inventory_authority_metadata(
+                arguments.lafan_inventory,
+                lafan_inventory,
+                "LAFAN source inventory",
+            ),
+        },
+        "model": model_record,
+        "terrain_recipes": recipes_by_sha256,
+    }
+
+    def bind_clip(
+        clip: CanonicalClip,
+        *,
+        source_name: str,
+        clip_id: str,
+        mesh: CanonicalTerrainMesh,
+        binding: TerrainBinding,
+    ) -> CanonicalClip:
+        if clip_id in published_clip_ids:
+            raise ContractError(f"duplicate imported clip ID: {clip_id}")
+        renamed = replace(clip, clip_id=clip_id, terrain=binding)
+        reconstructed = reconstruct_contacts(
+            renamed,
+            CanonicalMeshQuery(mesh, binding.world_from_terrain),
+            contact_config,
+        ).apply(renamed)
+        published_clip_ids.add(clip_id)
+        frame_counts[source_name] += reconstructed.frame_count
+        return reconstructed
+
+    def validate_simple_record(
+        clip: CanonicalClip,
+        expected: dict[str, object],
+        label: str,
+    ) -> None:
+        actual = _clip_inventory_record(clip)
+        if actual != expected:
+            raise ContractError(
+                f"{label} adapter output differs from inventory authority"
+            )
+
+    def clip_stream() -> Iterable[CanonicalClip]:
+        for clip in source_flat.iter_flat_clips(
+            flat_root,
+            tags=("flat", "other"),
+        ):
+            expected = flat_records.get(clip.clip_id)
+            if expected is None or clip.clip_id in seen_ids["flat"]:
+                raise ContractError(
+                    f"unexpected flat clip during import: {clip.clip_id}"
+                )
+            validate_simple_record(clip, expected, "flat")
+            seen_ids["flat"].add(clip.clip_id)
+            yield bind_clip(
+                clip,
+                source_name="flat",
+                clip_id=f"flat/{clip.clip_id}",
+                mesh=plane_mesh,
+                binding=plane_binding,
+            )
+
+        for clip in source_justin.iter_justin_clips(
+            justin_root,
+            justin_binding,
+        ):
+            expected = justin_records.get(clip.clip_id)
+            if expected is None or clip.clip_id in seen_ids["justin"]:
+                raise ContractError(
+                    f"unexpected Justin clip during import: {clip.clip_id}"
+                )
+            validate_simple_record(clip, expected, "Justin")
+            seen_ids["justin"].add(clip.clip_id)
+            yield bind_clip(
+                clip,
+                source_name="justin",
+                clip_id=f"justin/{clip.clip_id}",
+                mesh=justin_mesh,
+                binding=justin_binding,
+            )
+
+        discovered = source_grail.discover_clean_c490_records(
+            grail_root,
+            families=families,
+        )
+        for source_record in discovered:
+            key = (source_record.family, source_record.stem)
+            inventory_record = grail_records.get(key)
+            if inventory_record is None or key in seen_ids["grail"]:
+                raise ContractError(
+                    f"unexpected GRAIL clip during import: {key}"
+                )
+            source = _load_verified_grail_source(
+                source_record,
+                inventory_record,
+                fk,
+            )
+            robot = inventory_record["robot"]
+            if (
+                source.clip.source.source_path != robot["path"]
+                or source.clip.source.source_size_bytes
+                != robot["size_bytes"]
+                or source.clip.source.source_sha256 != robot["sha256"]
+                or source.clip.source.source_license_id
+                != robot["license_id"]
+            ):
+                raise ContractError(
+                    f"GRAIL adapter provenance differs for {key}"
+                )
+            terrain = inventory_record["terrain"]
+            obstacle = {
+                "kind": "grail-usd",
+                "path": terrain["path"],
+                "size_bytes": terrain["size_bytes"],
+                "sha256": terrain["sha256"],
+                "license_id": terrain["license_id"],
+            }
+            world_from_terrain = source.clip.terrain.world_from_terrain
+            mesh, binding, recipe = _bind_terrain_recipe(
+                model_record,
+                obstacle,
+                source.mesh,
+                world_from_terrain,
+            )
+            register_terrain(mesh, binding, recipe)
+            seen_ids["grail"].add(key)
+            yield bind_clip(
+                source.clip,
+                source_name="grail",
+                clip_id=f"grail/{source.clip.clip_id}",
+                mesh=mesh,
+                binding=binding,
+            )
+
+        for clip_name, inventory_record in sorted(lafan_records.items()):
+            clip = source_lafan.load_lafan_csv(
+                Path(str(inventory_record["source_path"])),
+                model_path,
+                terrain=plane_binding,
+            )
+            expected_identity = {
+                key: inventory_record[key]
+                for key in (
+                    "clip_id",
+                    "source_format",
+                    "source_path",
+                    "source_size_bytes",
+                    "source_sha256",
+                    "source_license_id",
+                )
+            }
+            if (
+                {
+                    "clip_id": clip.clip_id,
+                    "source_format": clip.source.source_format,
+                    "source_path": clip.source.source_path,
+                    "source_size_bytes": clip.source.source_size_bytes,
+                    "source_sha256": clip.source.source_sha256,
+                    "source_license_id": clip.source.source_license_id,
+                }
+                != expected_identity
+                or clip.clip_id in seen_ids["lafan"]
+            ):
+                raise ContractError(
+                    f"LAFAN adapter provenance differs for {clip_name}"
+                )
+            seen_ids["lafan"].add(clip.clip_id)
+            if "obstacle" in clip.action_tags:
+                unbound_id = f"lafan/{clip.clip_id}"
+                if unbound_id in published_clip_ids:
+                    raise ContractError(
+                        f"duplicate imported clip ID: {unbound_id}"
+                    )
+                published_clip_ids.add(unbound_id)
+                frame_counts["lafan"] += clip.frame_count
+                yield replace(clip, clip_id=unbound_id, terrain=None)
+            else:
+                yield bind_clip(
+                    clip,
+                    source_name="lafan",
+                    clip_id=f"lafan/{clip.clip_id}",
+                    mesh=plane_mesh,
+                    binding=plane_binding,
+                )
+
+        for name, expected in expected_ids.items():
+            if seen_ids[name] != expected:
+                raise ContractError(
+                    f"{name} adapter did not exactly cover its inventory"
+                )
+        metadata["summary"] = {
+            "clip_count": len(published_clip_ids),
+            "frame_count": sum(frame_counts.values()),
+            "counts_by_source": dict(_REAL_IMPORT_COUNTS),
+            "frames_by_source": dict(sorted(frame_counts.items())),
+        }
+
+    _publish_bundle(
+        arguments.output,
+        clip_stream(),
+        meshes_by_sha256.values(),
+        metadata,
+    )
 
 
 def _model_record(path: Path, model: object) -> dict[str, object]:
@@ -445,19 +1350,17 @@ def _audit_corpus(arguments: argparse.Namespace) -> None:
             or clip.frame_count != record.frame_count
         ):
             raise ContractError("corpus clip record does not match its bytes")
-        if clip.terrain is None:
-            raise ContractError(
-                f"clip {clip.clip_id} has no exact terrain binding"
+        query = None
+        if clip.terrain is not None:
+            mesh = mesh_by_sha256.get(clip.terrain.mesh_sha256)
+            if mesh is None:
+                raise ContractError(
+                    f"clip {clip.clip_id} terrain mesh is absent from corpus"
+                )
+            query = CanonicalMeshQuery(
+                mesh,
+                clip.terrain.world_from_terrain,
             )
-        mesh = mesh_by_sha256.get(clip.terrain.mesh_sha256)
-        if mesh is None:
-            raise ContractError(
-                f"clip {clip.clip_id} terrain mesh is absent from corpus"
-            )
-        query = CanonicalMeshQuery(
-            mesh,
-            clip.terrain.world_from_terrain,
-        )
         reports.append(audit_clip(clip, model, query))
     source_manifest_sha256 = hashlib.sha256(
         (root / "manifest.json").read_bytes()
@@ -818,6 +1721,115 @@ def _render_input(
     }
 
 
+def _trusted_media_model(model_record: object) -> dict[str, object]:
+    normalized = _normalized_model_record(
+        model_record,
+        "trusted renderer model",
+    )
+    return {
+        "path": normalized["asset_path"],
+        "size_bytes": normalized["asset_size_bytes"],
+        "sha256": normalized["asset_sha256"],
+        "structural_sha256": normalized["structural_sha256"],
+    }
+
+
+def _trusted_media_input(
+    root: Path,
+    record: storage.ClipRecord,
+    clip: CanonicalClip,
+    report: ClipAudit,
+    interval: object,
+    mesh_record: storage.MeshRecord,
+    mesh: CanonicalTerrainMesh,
+    *,
+    request_root: Path | None = None,
+) -> dict[str, object]:
+    if clip.terrain is None:
+        raise ContractError(
+            f"accepted clip {clip.clip_id} has no terrain binding"
+        )
+    clip_path = (root / record.relative_path).resolve()
+    mesh_path = (root / mesh_record.relative_path).resolve()
+    authority_root = root if request_root is None else request_root
+    if not authority_root.is_absolute():
+        raise ContractError("trusted render request root must be absolute")
+    request_clip_path = authority_root / record.relative_path
+    request_mesh_path = authority_root / mesh_record.relative_path
+    if (
+        clip_path.is_symlink()
+        or mesh_path.is_symlink()
+        or not clip_path.is_file()
+        or not mesh_path.is_file()
+        or clip_path.stem != record.sha256
+        or mesh_path.stem != mesh_record.sha256
+    ):
+        raise ContractError("trusted render input artifacts are not canonical")
+    start_frame = int(interval.start_frame)
+    end_frame = int(interval.end_frame)
+    interval_key = _accepted_interval_key(
+        record.sha256,
+        start_frame,
+        end_frame,
+    )
+    return {
+        "interval_key": interval_key,
+        "interval": [start_frame, end_frame],
+        "clip": {
+            "path": str(request_clip_path),
+            "size_bytes": clip_path.stat(follow_symlinks=False).st_size,
+            "sha256": record.sha256,
+            "clip_id": clip.clip_id,
+            "source_sha256": clip.source.source_sha256,
+            "frame_count": clip.frame_count,
+        },
+        "terrain_mesh": {
+            "path": str(request_mesh_path),
+            "size_bytes": mesh_path.stat(follow_symlinks=False).st_size,
+            "sha256": mesh_record.sha256,
+            "source_asset_sha256": mesh.source_asset_sha256,
+        },
+        "terrain_query": {
+            "mesh_sha256": mesh_record.sha256,
+            "query_sha256": report.terrain_sha256,
+            "world_from_terrain": {
+                "translation_world": (
+                    clip.terrain.world_from_terrain.translation_world.tolist()
+                ),
+                "quaternion_world_from_local_wxyz": (
+                    clip.terrain.world_from_terrain
+                    .quaternion_world_from_local_wxyz.tolist()
+                ),
+            },
+        },
+    }
+
+
+def _trusted_media_request(
+    kind: str,
+    inputs: Sequence[dict[str, object]],
+    model_record: object,
+) -> dict[str, object]:
+    from .render_media import FIXED_RENDER_CONFIG
+
+    ordered = sorted(
+        inputs,
+        key=lambda item: str(item["interval_key"]),
+    )
+    if not ordered:
+        raise ContractError("trusted render request cannot be empty")
+    return {
+        "schema": "terrain-oracle-render-request/v1",
+        "kind": kind,
+        "interval_keys": [
+            str(item["interval_key"]) for item in ordered
+        ],
+        "inputs": ordered,
+        "model": _trusted_media_model(model_record),
+        "render_config": FIXED_RENDER_CONFIG,
+    }
+
+
 def _artifact_record(path: Path, relative_path: str) -> dict[str, object]:
     if not path.is_file() or path.is_symlink():
         raise ContractError("renderer did not produce a regular artifact file")
@@ -826,6 +1838,136 @@ def _artifact_record(path: Path, relative_path: str) -> dict[str, object]:
         "relative_path": relative_path,
         "sha256": hashlib.sha256(payload).hexdigest(),
         "size_bytes": len(payload),
+    }
+
+
+def _validated_trusted_renderer_result(
+    *,
+    stdout: bytes,
+    stderr: bytes,
+    request: dict[str, object],
+    request_payload: bytes,
+    video_path: Path,
+    overlay_path: Path,
+    video_relative: str,
+    overlay_relative: str,
+) -> dict[str, object]:
+    from . import render_media
+
+    try:
+        result = json.loads(stdout.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ContractError(
+            "trusted renderer did not emit canonical result JSON"
+        ) from error
+    if (
+        stderr
+        or not isinstance(result, dict)
+        or stdout
+        != storage._canonical_json_bytes(
+            result,
+            "trusted renderer result",
+        )
+        or set(result)
+        != {
+            "schema",
+            "request_sha256",
+            "kind",
+            "interval_keys",
+            "video",
+            "contact_overlay",
+            "runtime_identity",
+            "render_evidence",
+            "completed",
+        }
+        or result["schema"] != "terrain-oracle-render-result/v1"
+        or result["request_sha256"]
+        != hashlib.sha256(request_payload).hexdigest()
+        or result["kind"] != request["kind"]
+        or result["interval_keys"] != request["interval_keys"]
+        or result["completed"] is not True
+    ):
+        raise ContractError("trusted renderer result authority is stale")
+    frame_count = render_media._encoded_frame_count(
+        str(request["kind"]),
+        tuple(
+            {
+                "start": int(item["interval"][0]),
+                "end": int(item["interval"][1]),
+            }
+            for item in request["inputs"]
+        ),
+    )
+    video_metadata = render_media.validate_video(
+        video_path,
+        width=int(render_media.FIXED_RENDER_CONFIG["width"]),
+        height=int(render_media.FIXED_RENDER_CONFIG["height"]),
+        fps=int(render_media.FIXED_RENDER_CONFIG["fps"]),
+        frame_count=frame_count,
+    )
+    overlay_metadata = render_media.validate_png(
+        overlay_path,
+        width=int(render_media.FIXED_RENDER_CONFIG["width"]),
+        height=int(render_media.FIXED_RENDER_CONFIG["height"]),
+        interval_keys=request["interval_keys"],
+    )
+
+    def normalized_artifact(
+        value: object,
+        path: Path,
+        relative_path: str,
+        metadata: dict[str, object],
+    ) -> dict[str, object]:
+        if not isinstance(value, dict) or set(value) != {
+            "path",
+            "size_bytes",
+            "sha256",
+            "validated_metadata",
+        }:
+            raise ContractError(
+                "trusted renderer artifact result fields do not match v1"
+            )
+        payload = storage._read_regular_file_nofollow(path)
+        if (
+            value["path"] != str(path)
+            or value["size_bytes"] != len(payload)
+            or value["sha256"] != hashlib.sha256(payload).hexdigest()
+            or value["validated_metadata"] != metadata
+        ):
+            raise ContractError(
+                "trusted renderer artifact result is stale"
+            )
+        return {
+            "relative_path": relative_path,
+            "size_bytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "validated_metadata": metadata,
+        }
+
+    if result["runtime_identity"] != render_media.runtime_identity():
+        raise ContractError("trusted renderer runtime identity is stale")
+    evidence = result["render_evidence"]
+    if (
+        not isinstance(evidence, dict)
+        or set(evidence)
+        != {"visual_mesh_geom_count", "terrain_face_count"}
+        or any(type(value) is not int or value < 1 for value in evidence.values())
+    ):
+        raise ContractError("trusted renderer visual evidence is incomplete")
+    return {
+        **result,
+        "video": normalized_artifact(
+            result["video"],
+            video_path,
+            video_relative,
+            video_metadata,
+        ),
+        "contact_overlay": normalized_artifact(
+            result["contact_overlay"],
+            overlay_path,
+            overlay_relative,
+            overlay_metadata,
+        ),
     }
 
 
@@ -838,34 +1980,98 @@ def _run_renderer(
     request: dict[str, object],
     semantic_arguments: list[str],
     timeout_seconds: float,
+    trusted_request: dict[str, object] | None = None,
 ) -> tuple[dict[str, object], str]:
     request_id = hashlib.sha256(
         storage._canonical_json_bytes(request, "render request")
     ).hexdigest()
     video_relative = f"artifacts/{request_id}.mp4"
     overlay_relative = f"artifacts/{request_id}.contact.png"
-    normalized_argv = [
-        str(renderer),
-        *renderer_arguments,
-        *semantic_arguments,
-        "--video",
-        video_relative,
-        "--overlay",
-        overlay_relative,
-    ]
-    actual_argv = [
-        *normalized_argv[:-3],
-        str(stage / video_relative),
-        "--overlay",
-        str(stage / overlay_relative),
-    ]
-    process = subprocess.Popen(
-        actual_argv,
-        shell=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
+    request_record: dict[str, object] | None = None
+    request_payload: bytes | None = None
+    if trusted_request is None:
+        normalized_argv = [
+            str(renderer),
+            *renderer_arguments,
+            *semantic_arguments,
+            "--video",
+            video_relative,
+            "--overlay",
+            overlay_relative,
+        ]
+        actual_argv = [
+            *normalized_argv[:-3],
+            str(stage / video_relative),
+            "--overlay",
+            str(stage / overlay_relative),
+        ]
+    else:
+        request_relative = f"requests/{request_id}.json"
+        request_payload = storage._canonical_json_bytes(
+            trusted_request,
+            "trusted render request",
+        )
+        storage._write_no_replace(
+            stage / request_relative,
+            request_payload,
+        )
+        request_record = {
+            "relative_path": request_relative,
+            "sha256": hashlib.sha256(request_payload).hexdigest(),
+            "size_bytes": len(request_payload),
+        }
+        normalized_argv = [
+            str(renderer),
+            *renderer_arguments,
+            "--request",
+            request_relative,
+            "--video",
+            video_relative,
+            "--overlay",
+            overlay_relative,
+        ]
+        actual_argv = [
+            str(renderer),
+            *renderer_arguments,
+            "--request",
+            str(stage / request_relative),
+            "--video",
+            str(stage / video_relative),
+            "--overlay",
+            str(stage / overlay_relative),
+        ]
+    stdout_capture = (
+        tempfile.TemporaryFile()
+        if trusted_request is not None
+        else None
     )
+    stderr_capture = (
+        tempfile.TemporaryFile()
+        if trusted_request is not None
+        else None
+    )
+    try:
+        process = subprocess.Popen(
+            actual_argv,
+            shell=False,
+            stdout=(
+                stdout_capture
+                if stdout_capture is not None
+                else subprocess.DEVNULL
+            ),
+            stderr=(
+                stderr_capture
+                if stderr_capture is not None
+                else subprocess.DEVNULL
+            ),
+            start_new_session=True,
+        )
+    except BaseException:
+        if stdout_capture is not None:
+            stdout_capture.close()
+        if stderr_capture is not None:
+            stderr_capture.close()
+        raise
     try:
         returncode = process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired as error:
@@ -874,6 +2080,10 @@ def _run_renderer(
         except ProcessLookupError:
             pass
         process.wait()
+        if stdout_capture is not None:
+            stdout_capture.close()
+        if stderr_capture is not None:
+            stderr_capture.close()
         raise ContractError(
             f"renderer timed out after {timeout_seconds:g} seconds"
         ) from error
@@ -884,7 +2094,25 @@ def _run_renderer(
             except ProcessLookupError:
                 pass
             process.wait()
+        if stdout_capture is not None:
+            stdout_capture.close()
+        if stderr_capture is not None:
+            stderr_capture.close()
         raise
+    capture_limit = 1024 * 1024
+    stdout = b""
+    stderr = b""
+    if stdout_capture is not None and stderr_capture is not None:
+        stdout_capture.seek(0)
+        stderr_capture.seek(0)
+        stdout = stdout_capture.read(capture_limit + 1)
+        stderr = stderr_capture.read(capture_limit + 1)
+        stdout_capture.close()
+        stderr_capture.close()
+        if len(stdout) > capture_limit or len(stderr) > capture_limit:
+            raise ContractError(
+                "trusted renderer output exceeded the 1 MiB evidence cap"
+            )
     if returncode != 0:
         raise ContractError(
             f"renderer failed with exit {returncode}"
@@ -911,6 +2139,20 @@ def _run_renderer(
             overlay_relative,
         ),
     }
+    if trusted_request is not None:
+        assert request_payload is not None
+        assert request_record is not None
+        renderer_record["request"] = request_record
+        renderer_record["result"] = _validated_trusted_renderer_result(
+            stdout=stdout,
+            stderr=stderr,
+            request=trusted_request,
+            request_payload=request_payload,
+            video_path=stage / video_relative,
+            overlay_path=stage / overlay_relative,
+            video_relative=video_relative,
+            overlay_relative=overlay_relative,
+        )
     return {**renderer_record, **artifacts}, request_id
 
 
@@ -928,6 +2170,27 @@ def _write_render_receipt(
         "relative_path": relative_path,
         "sha256": hashlib.sha256(payload).hexdigest(),
     }
+
+
+def _renderer_receipt_evidence(
+    rendered: dict[str, object],
+) -> dict[str, object]:
+    fields = (
+        "argv",
+        "executable_sha256",
+        "invocation_sha256",
+        "shell",
+        "returncode",
+    )
+    evidence = {name: rendered[name] for name in fields}
+    if "request" in rendered or "result" in rendered:
+        if "request" not in rendered or "result" not in rendered:
+            raise ContractError(
+                "trusted renderer request and result evidence must be paired"
+            )
+        evidence["request"] = rendered["request"]
+        evidence["result"] = rendered["result"]
+    return evidence
 
 
 def _verify_render_stage(
@@ -948,6 +2211,7 @@ def _verify_render_stage(
     if actual_receipt_paths != set(expected_receipts):
         raise ContractError("render receipts do not form the exact required set")
     expected_artifacts: set[str] = set()
+    expected_requests: set[str] = set()
     for relative_path, expected_receipt in expected_receipts.items():
         path = stage / relative_path
         if path.is_symlink() or not path.is_file():
@@ -972,6 +2236,34 @@ def _verify_render_stage(
                 != artifact["sha256"]
             ):
                 raise ContractError("render artifact failed reload verification")
+        renderer = loaded_receipt["renderer"]
+        if not isinstance(renderer, dict) or "request" not in renderer:
+            raise ContractError(
+                "render receipt lacks trusted request evidence"
+            )
+        request = renderer["request"]
+        if not isinstance(request, dict) or set(request) != {
+            "relative_path",
+            "sha256",
+            "size_bytes",
+        }:
+            raise ContractError(
+                "trusted request record fields do not match v1"
+            )
+        request_relative = _canonical_relative_path(
+            request["relative_path"],
+            "requests",
+        )
+        expected_requests.add(request_relative)
+        request_payload = storage._read_regular_file_nofollow(
+            stage / request_relative
+        )
+        if (
+            request["size_bytes"] != len(request_payload)
+            or request["sha256"]
+            != hashlib.sha256(request_payload).hexdigest()
+        ):
+            raise ContractError("trusted request failed reload verification")
     actual_artifacts = {
         path.relative_to(stage).as_posix()
         for path in (stage / "artifacts").iterdir()
@@ -979,6 +2271,13 @@ def _verify_render_stage(
     }
     if actual_artifacts != expected_artifacts:
         raise ContractError("render artifacts do not form the exact required set")
+    actual_requests = {
+        path.relative_to(stage).as_posix()
+        for path in (stage / "requests").iterdir()
+        if path.is_file() or path.is_symlink()
+    }
+    if actual_requests != expected_requests:
+        raise ContractError("trusted requests do not form the exact required set")
 
 
 def _expected_render_inputs(
@@ -1080,6 +2379,8 @@ def _validate_renderer_evidence(
     value: object,
     expected_argv: list[str],
     executable_sha256: str,
+    render_root: Path,
+    expected_request: dict[str, object],
 ) -> None:
     if not isinstance(value, dict) or set(value) != {
         "argv",
@@ -1087,8 +2388,10 @@ def _validate_renderer_evidence(
         "invocation_sha256",
         "shell",
         "returncode",
+        "request",
+        "result",
     }:
-        raise ContractError("renderer evidence fields do not match v1")
+        raise ContractError("trusted renderer evidence fields do not match v2")
     if (
         value["argv"] != expected_argv
         or value["executable_sha256"] != executable_sha256
@@ -1104,6 +2407,133 @@ def _validate_renderer_evidence(
         or value["returncode"] != 0
     ):
         raise ContractError("renderer invocation evidence is stale")
+    request_record = value["request"]
+    if not isinstance(request_record, dict) or set(request_record) != {
+        "relative_path",
+        "sha256",
+        "size_bytes",
+    }:
+        raise ContractError("trusted request record fields do not match v1")
+    expected_payload = storage._canonical_json_bytes(
+        expected_request,
+        "trusted render request",
+    )
+    request_relative = _canonical_relative_path(
+        request_record["relative_path"],
+        "requests",
+    )
+    request_payload = storage._read_regular_file_nofollow(
+        render_root / request_relative
+    )
+    if (
+        request_payload != expected_payload
+        or request_record["size_bytes"] != len(request_payload)
+        or request_record["sha256"]
+        != hashlib.sha256(request_payload).hexdigest()
+    ):
+        raise ContractError("trusted render request authority is stale")
+    result = value["result"]
+    if not isinstance(result, dict) or set(result) != {
+        "schema",
+        "request_sha256",
+        "kind",
+        "interval_keys",
+        "video",
+        "contact_overlay",
+        "runtime_identity",
+        "render_evidence",
+        "completed",
+    }:
+        raise ContractError("trusted renderer result fields do not match v1")
+    if (
+        result["schema"] != "terrain-oracle-render-result/v1"
+        or result["request_sha256"]
+        != hashlib.sha256(expected_payload).hexdigest()
+        or result["kind"] != expected_request["kind"]
+        or result["interval_keys"] != expected_request["interval_keys"]
+        or result["completed"] is not True
+    ):
+        raise ContractError("trusted renderer result binding is stale")
+
+    from . import render_media
+
+    if result["runtime_identity"] != render_media.runtime_identity():
+        raise ContractError("trusted renderer runtime identity is stale")
+    evidence = result["render_evidence"]
+    if (
+        not isinstance(evidence, dict)
+        or set(evidence)
+        != {"visual_mesh_geom_count", "terrain_face_count"}
+        or any(type(item) is not int or item < 1 for item in evidence.values())
+    ):
+        raise ContractError("trusted renderer visual evidence is incomplete")
+    frame_count = render_media._encoded_frame_count(
+        str(expected_request["kind"]),
+        tuple(
+            {
+                "start": int(item["interval"][0]),
+                "end": int(item["interval"][1]),
+            }
+            for item in expected_request["inputs"]
+        ),
+    )
+    result_artifacts: dict[str, tuple[dict[str, object], Path]] = {}
+    for name, suffix in (
+        ("video", ".mp4"),
+        ("contact_overlay", ".contact.png"),
+    ):
+        artifact = result[name]
+        if not isinstance(artifact, dict) or set(artifact) != {
+            "relative_path",
+            "size_bytes",
+            "sha256",
+            "validated_metadata",
+        }:
+            raise ContractError(
+                "trusted result artifact fields do not match v1"
+            )
+        relative = _canonical_relative_path(
+            artifact["relative_path"],
+            "artifacts",
+        )
+        if not relative.endswith(suffix):
+            raise ContractError("trusted result artifact suffix is stale")
+        result_artifacts[name] = (
+            artifact,
+            render_root / relative,
+        )
+    expected_artifacts = (
+        (
+            "video",
+            render_media.validate_video(
+                result_artifacts["video"][1],
+                width=int(render_media.FIXED_RENDER_CONFIG["width"]),
+                height=int(render_media.FIXED_RENDER_CONFIG["height"]),
+                fps=int(render_media.FIXED_RENDER_CONFIG["fps"]),
+                frame_count=frame_count,
+            ),
+        ),
+        (
+            "contact_overlay",
+            render_media.validate_png(
+                result_artifacts["contact_overlay"][1],
+                width=int(render_media.FIXED_RENDER_CONFIG["width"]),
+                height=int(render_media.FIXED_RENDER_CONFIG["height"]),
+                interval_keys=expected_request["interval_keys"],
+            ),
+        ),
+    )
+    for name, metadata in expected_artifacts:
+        artifact, artifact_path = result_artifacts[name]
+        payload = storage._read_regular_file_nofollow(
+            artifact_path
+        )
+        if (
+            artifact["size_bytes"] != len(payload)
+            or artifact["sha256"] != hashlib.sha256(payload).hexdigest()
+            or artifact["validated_metadata"] != metadata
+        ):
+            raise ContractError("trusted result artifact authority is stale")
 
 
 def _load_render_receipt(
@@ -1115,6 +2545,7 @@ def _load_render_receipt(
     expected_argv: list[str],
     expected_request_id: str,
     executable_sha256: str,
+    expected_request: dict[str, object],
 ) -> tuple[dict[str, object], dict[str, str], set[str]]:
     receipt, payload = _load_canonical_json(
         render_root / relative_path,
@@ -1131,6 +2562,8 @@ def _load_render_receipt(
         receipt["renderer"],
         expected_argv,
         executable_sha256,
+        render_root,
+        expected_request,
     )
     artifacts = {
         _validate_render_artifact(
@@ -1158,6 +2591,7 @@ def _load_render_evidence(
     root: Path,
     *,
     model_snapshot: _FreezeModelSnapshot | None = None,
+    request_root: Path | None = None,
 ) -> dict[str, object]:
     """Reload and recompute the exact exhaustive render evidence set."""
 
@@ -1168,6 +2602,46 @@ def _load_render_evidence(
         corpus_root,
         model_snapshot=model_snapshot,
     )
+    meshes = tuple(
+        storage.read_mesh(corpus_root / record.relative_path)
+        for record in manifest.meshes
+    )
+    mesh_records_by_sha256 = {
+        record.sha256: record for record in manifest.meshes
+    }
+    meshes_by_sha256 = {
+        record.sha256: mesh
+        for record, mesh in zip(manifest.meshes, meshes, strict=True)
+    }
+    trusted_inputs_by_key: dict[str, dict[str, object]] = {}
+    for record, clip in zip(manifest.clips, clips, strict=True):
+        report = reports[record.sha256]
+        for interval in report.accepted_intervals:
+            if clip.terrain is None:
+                raise ContractError(
+                    f"accepted clip {clip.clip_id} has no terrain binding"
+                )
+            mesh_record = mesh_records_by_sha256.get(
+                clip.terrain.mesh_sha256
+            )
+            mesh = meshes_by_sha256.get(clip.terrain.mesh_sha256)
+            if mesh_record is None or mesh is None:
+                raise ContractError(
+                    f"accepted clip {clip.clip_id} mesh is unavailable"
+                )
+            trusted_input = _trusted_media_input(
+                corpus_root,
+                record,
+                clip,
+                report,
+                interval,
+                mesh_record,
+                mesh,
+                request_root=request_root,
+            )
+            trusted_inputs_by_key[
+                str(trusted_input["interval_key"])
+            ] = trusted_input
     render_root = corpus_root / "render-audit"
     if not render_root.is_dir() or render_root.is_symlink():
         raise ContractError("canonical render-audit directory is missing")
@@ -1177,6 +2651,7 @@ def _load_render_evidence(
         "receipts",
         "contact-sheet",
         "strata",
+        "requests",
     }
     for directory in allowed_directories:
         path = render_root / directory
@@ -1203,7 +2678,7 @@ def _load_render_evidence(
     without_hash = dict(index)
     content_sha256 = without_hash.pop("content_sha256")
     if (
-        index["schema"] != "terrain-oracle-render-index/v1"
+        index["schema"] != "terrain-oracle-render-index/v2"
         or content_sha256
         != hashlib.sha256(
             storage._canonical_json_bytes(
@@ -1225,8 +2700,10 @@ def _load_render_evidence(
     if not isinstance(renderer_record, dict) or set(renderer_record) != {
         "argv_prefix",
         "executable_sha256",
+        "mode",
+        "module_sha256",
     }:
-        raise ContractError("render index renderer fields do not match v1")
+        raise ContractError("render index renderer fields do not match v2")
     argv_prefix = renderer_record["argv_prefix"]
     if (
         not isinstance(argv_prefix, list)
@@ -1234,14 +2711,26 @@ def _load_render_evidence(
         or any(type(value) is not str or not value for value in argv_prefix)
     ):
         raise ContractError("render argv prefix must be a nonempty string list")
+    expected_prefix = [
+        str(Path(sys.executable).resolve()),
+        "-B",
+        "-m",
+        "mm_sonic.terrain_oracle.render_media",
+    ]
     executable = Path(argv_prefix[0])
+    from . import render_media
+
     if (
-        not executable.is_absolute()
+        argv_prefix != expected_prefix
+        or renderer_record["mode"] != "trusted-package-media-v1"
+        or not executable.is_absolute()
         or executable != executable.resolve()
         or not executable.is_file()
         or executable.is_symlink()
         or hashlib.sha256(executable.read_bytes()).hexdigest()
         != renderer_record["executable_sha256"]
+        or hashlib.sha256(Path(render_media.__file__).read_bytes()).hexdigest()
+        != renderer_record["module_sha256"]
     ):
         raise ContractError("render executable identity is stale")
     accepted_inputs, strata = _expected_render_inputs(
@@ -1259,6 +2748,7 @@ def _load_render_evidence(
         )
     expected_receipt_paths: set[str] = set()
     expected_artifact_paths: set[str] = set()
+    expected_request_paths: set[str] = set()
     interval_references: list[dict[str, str]] = []
     input_by_key = {
         str(item["interval_key"]): item for item in accepted_inputs
@@ -1275,16 +2765,15 @@ def _load_render_evidence(
         }
         request_id = _render_request_id(request)
         relative_path = f"receipts/{request_id}.json"
+        trusted_request = _trusted_media_request(
+            "accepted_interval",
+            (trusted_inputs_by_key[interval_key],),
+            audit_index["model"],
+        )
         expected_argv = [
             *argv_prefix,
-            "--kind",
-            "accepted_interval",
-            "--clip-sha256",
-            clip_sha256,
-            "--start",
-            str(start_frame),
-            "--end",
-            str(end_frame),
+            "--request",
+            f"requests/{request_id}.json",
             "--video",
             f"artifacts/{request_id}.mp4",
             "--overlay",
@@ -1311,6 +2800,7 @@ def _load_render_evidence(
             expected_argv=expected_argv,
             expected_request_id=request_id,
             executable_sha256=str(renderer_record["executable_sha256"]),
+            expected_request=trusted_request,
         )
         if {
             "clip_id": receipt["clip_id"],
@@ -1334,6 +2824,7 @@ def _load_render_evidence(
         interval_references.append(reference)
         expected_receipt_paths.add(relative_path)
         expected_artifact_paths.update(artifacts)
+        expected_request_paths.add(f"requests/{request_id}.json")
     interval_references.sort(key=lambda item: item["relative_path"])
     if index["interval_receipts"] != interval_references:
         raise ContractError("interval render receipts are not the exact required set")
@@ -1343,15 +2834,15 @@ def _load_render_evidence(
     }
     sheet_id = _render_request_id(sheet_request)
     sheet_relative = f"contact-sheet/{sheet_id}.json"
+    trusted_sheet_request = _trusted_media_request(
+        "contact_sheet",
+        tuple(trusted_inputs_by_key[key] for key in accepted_keys),
+        audit_index["model"],
+    )
     sheet_argv = [
         *argv_prefix,
-        "--kind",
-        "contact_sheet",
-        *[
-            value
-            for key in accepted_keys
-            for value in ("--interval-key", key)
-        ],
+        "--request",
+        f"requests/{sheet_id}.json",
         "--video",
         f"artifacts/{sheet_id}.mp4",
         "--overlay",
@@ -1374,6 +2865,7 @@ def _load_render_evidence(
         expected_argv=sheet_argv,
         expected_request_id=sheet_id,
         executable_sha256=str(renderer_record["executable_sha256"]),
+        expected_request=trusted_sheet_request,
     )
     if (
         sheet["inputs"] != accepted_inputs
@@ -1383,6 +2875,7 @@ def _load_render_evidence(
         raise ContractError("contact sheet does not cover every accepted interval")
     expected_receipt_paths.add(sheet_relative)
     expected_artifact_paths.update(artifacts)
+    expected_request_paths.add(f"requests/{sheet_id}.json")
     stratum_references: list[dict[str, str]] = []
     for stratum_key in sorted(strata):
         stratum = {
@@ -1404,24 +2897,17 @@ def _load_render_evidence(
         }
         request_id = _render_request_id(request)
         relative_path = f"strata/{request_id}.json"
-        stratum_json = json.dumps(
-            stratum,
-            allow_nan=False,
-            ensure_ascii=True,
-            separators=(",", ":"),
-            sort_keys=True,
+        trusted_stratum_request = _trusted_media_request(
+            "full_video",
+            tuple(
+                trusted_inputs_by_key[key] for key in interval_keys
+            ),
+            audit_index["model"],
         )
         expected_argv = [
             *argv_prefix,
-            "--kind",
-            "full_video",
-            "--stratum",
-            stratum_json,
-            *[
-                value
-                for key in interval_keys
-                for value in ("--interval-key", key)
-            ],
+            "--request",
+            f"requests/{request_id}.json",
             "--video",
             f"artifacts/{request_id}.mp4",
             "--overlay",
@@ -1445,6 +2931,7 @@ def _load_render_evidence(
             expected_argv=expected_argv,
             expected_request_id=request_id,
             executable_sha256=str(renderer_record["executable_sha256"]),
+            expected_request=trusted_stratum_request,
         )
         if (
             receipt["stratum"] != stratum
@@ -1457,6 +2944,7 @@ def _load_render_evidence(
         stratum_references.append(reference)
         expected_receipt_paths.add(relative_path)
         expected_artifact_paths.update(artifacts)
+        expected_request_paths.add(f"requests/{request_id}.json")
     stratum_references.sort(key=lambda item: item["relative_path"])
     if index["stratum_receipts"] != stratum_references:
         raise ContractError("full-video receipts are not the exact stratum set")
@@ -1479,6 +2967,7 @@ def _load_render_evidence(
         "render-index.json",
         *expected_receipt_paths,
         *expected_artifact_paths,
+        *expected_request_paths,
     }:
         raise ContractError("render evidence files do not form the exact set")
     return index
@@ -1497,15 +2986,38 @@ def _render_interval_receipts(arguments: argparse.Namespace) -> None:
         record.sha256: clip
         for record, clip in zip(manifest.clips, clips, strict=True)
     }
-    renderer = _cli_input_file(
-        arguments.renderer,
-        "renderer executable",
+    meshes = tuple(
+        storage.read_mesh(root / record.relative_path)
+        for record in manifest.meshes
     )
+    mesh_records_by_sha256 = {
+        record.sha256: record for record in manifest.meshes
+    }
+    meshes_by_sha256 = {
+        record.sha256: mesh
+        for record, mesh in zip(manifest.meshes, meshes, strict=True)
+    }
+    trusted_renderer = arguments.renderer is None
+    if trusted_renderer:
+        renderer = _cli_input_file(
+            Path(sys.executable).resolve(),
+            "Python renderer executable",
+        )
+        renderer_arguments = (
+            "-B",
+            "-m",
+            "mm_sonic.terrain_oracle.render_media",
+        )
+    else:
+        renderer = _cli_input_file(
+            arguments.renderer,
+            "negative-test renderer executable",
+        )
+        renderer_arguments = tuple(
+            _normalized_renderer_argument(value)
+            for value in arguments.renderer_arg
+        )
     renderer_sha256 = hashlib.sha256(renderer.read_bytes()).hexdigest()
-    renderer_arguments = tuple(
-        _normalized_renderer_argument(value)
-        for value in arguments.renderer_arg
-    )
     timeout_seconds = float(arguments.renderer_timeout_seconds)
     if (
         not np.isfinite(timeout_seconds)
@@ -1527,6 +3039,7 @@ def _render_interval_receipts(arguments: argparse.Namespace) -> None:
             "receipts",
             "contact-sheet",
             "strata",
+            *(("requests",) if trusted_renderer else ()),
         ):
             (stage / directory).mkdir()
         accepted_inputs: list[dict[str, object]] = []
@@ -1536,6 +3049,7 @@ def _render_interval_receipts(arguments: argparse.Namespace) -> None:
         ] = {}
         interval_references: list[dict[str, str]] = []
         expected_receipts: dict[str, dict[str, object]] = {}
+        trusted_inputs_by_key: dict[str, dict[str, object]] = {}
         for record in manifest.clips:
             clip = clip_by_sha256[record.sha256]
             report = reports[record.sha256]
@@ -1554,6 +3068,28 @@ def _render_interval_receipts(arguments: argparse.Namespace) -> None:
                     audit_index["model"],
                 )
                 accepted_inputs.append(input_record)
+                mesh_record = mesh_records_by_sha256.get(
+                    clip.terrain.mesh_sha256
+                )
+                mesh = meshes_by_sha256.get(
+                    clip.terrain.mesh_sha256
+                )
+                if mesh_record is None or mesh is None:
+                    raise ContractError(
+                        f"accepted clip {clip.clip_id} mesh is unavailable"
+                    )
+                trusted_input = _trusted_media_input(
+                    root,
+                    record,
+                    clip,
+                    report,
+                    interval,
+                    mesh_record,
+                    mesh,
+                )
+                trusted_inputs_by_key[
+                    str(input_record["interval_key"])
+                ] = trusted_input
                 stratum_key = (
                     clip.source.source_format,
                     _action_class(clip),
@@ -1588,7 +3124,21 @@ def _render_interval_receipts(arguments: argparse.Namespace) -> None:
                         str(interval.end_frame),
                     ],
                     timeout_seconds=timeout_seconds,
+                    trusted_request=(
+                        _trusted_media_request(
+                            "accepted_interval",
+                            (trusted_input,),
+                            audit_index["model"],
+                        )
+                        if trusted_renderer
+                        else None
+                    ),
                 )
+                if not trusted_renderer:
+                    raise ContractError(
+                        "external renderers are restricted to negative "
+                        "failure and timeout diagnostics"
+                    )
                 receipt_relative = f"receipts/{request_id}.json"
                 receipt = {
                     "schema": "terrain-oracle-render-receipt/v1",
@@ -1602,16 +3152,7 @@ def _render_interval_receipts(arguments: argparse.Namespace) -> None:
                         interval.start_frame,
                         interval.end_frame,
                     ],
-                    "renderer": {
-                        name: rendered[name]
-                        for name in (
-                            "argv",
-                            "executable_sha256",
-                            "invocation_sha256",
-                            "shell",
-                            "returncode",
-                        )
-                    },
+                    "renderer": _renderer_receipt_evidence(rendered),
                     "video": rendered["video"],
                     "contact_overlay": rendered["contact_overlay"],
                     "completed": True,
@@ -1647,22 +3188,29 @@ def _render_interval_receipts(arguments: argparse.Namespace) -> None:
                 ],
             ],
             timeout_seconds=timeout_seconds,
+            trusted_request=(
+                _trusted_media_request(
+                    "contact_sheet",
+                    tuple(
+                        trusted_inputs_by_key[key]
+                        for key in accepted_keys
+                    ),
+                    audit_index["model"],
+                )
+                if trusted_renderer
+                else None
+            ),
         )
+        if not trusted_renderer:
+            raise ContractError(
+                "external renderers cannot publish contact-sheet evidence"
+            )
         sheet_receipt = {
             "schema": "terrain-oracle-render-receipt/v1",
             "kind": "contact_sheet",
             "inputs": accepted_inputs,
             "interval_keys": accepted_keys,
-            "renderer": {
-                name: sheet_rendered[name]
-                for name in (
-                    "argv",
-                    "executable_sha256",
-                    "invocation_sha256",
-                    "shell",
-                    "returncode",
-                )
-            },
+            "renderer": _renderer_receipt_evidence(sheet_rendered),
             "video": sheet_rendered["video"],
             "contact_overlay": sheet_rendered["contact_overlay"],
             "completed": True,
@@ -1721,6 +3269,18 @@ def _render_interval_receipts(arguments: argparse.Namespace) -> None:
                     ],
                 ],
                 timeout_seconds=timeout_seconds,
+                trusted_request=(
+                    _trusted_media_request(
+                        "full_video",
+                        tuple(
+                            trusted_inputs_by_key[key]
+                            for key in interval_keys
+                        ),
+                        audit_index["model"],
+                    )
+                    if trusted_renderer
+                    else None
+                ),
             )
             receipt = {
                 "schema": "terrain-oracle-render-receipt/v1",
@@ -1728,16 +3288,7 @@ def _render_interval_receipts(arguments: argparse.Namespace) -> None:
                 "stratum": stratum,
                 "inputs": inputs,
                 "interval_keys": interval_keys,
-                "renderer": {
-                    name: rendered[name]
-                    for name in (
-                        "argv",
-                        "executable_sha256",
-                        "invocation_sha256",
-                        "shell",
-                        "returncode",
-                    )
-                },
+                "renderer": _renderer_receipt_evidence(rendered),
                 "video": rendered["video"],
                 "contact_overlay": rendered["contact_overlay"],
                 "completed": True,
@@ -1758,7 +3309,7 @@ def _render_interval_receipts(arguments: argparse.Namespace) -> None:
             key=lambda item: item["relative_path"]
         )
         without_hash = {
-            "schema": "terrain-oracle-render-index/v1",
+            "schema": "terrain-oracle-render-index/v2",
             "corpus_manifest_sha256": hashlib.sha256(
                 (root / "manifest.json").read_bytes()
             ).hexdigest(),
@@ -1769,6 +3320,14 @@ def _render_interval_receipts(arguments: argparse.Namespace) -> None:
             "renderer": {
                 "argv_prefix": [str(renderer), *renderer_arguments],
                 "executable_sha256": renderer_sha256,
+                "mode": "trusted-package-media-v1",
+                "module_sha256": hashlib.sha256(
+                    Path(
+                        sys.modules[
+                            "mm_sonic.terrain_oracle.render_media"
+                        ].__file__
+                    ).read_bytes()
+                ).hexdigest(),
             },
             "interval_receipts": interval_references,
             "contact_sheet_receipt": sheet_reference,
@@ -2405,6 +3964,7 @@ def _freeze_corpus(arguments: argparse.Namespace) -> None:
         _load_render_evidence(
             stage,
             model_snapshot=model_snapshot,
+            request_root=root,
         )
         _, coverage_payload = _load_coverage_evidence(
             stage,
@@ -2943,9 +4503,18 @@ def _parser() -> argparse.ArgumentParser:
         "import",
         help="publish canonical source clips without replacing prior output",
     )
-    import_parser.add_argument("--fixture", type=Path, required=True)
+    import_parser.add_argument("--fixture", type=Path)
+    import_parser.add_argument("--inventory", type=Path)
+    import_parser.add_argument("--lafan-inventory", type=Path)
+    import_parser.add_argument("--flat", type=Path)
+    import_parser.add_argument("--justin", type=Path)
+    import_parser.add_argument("--grail-root", type=Path)
+    import_parser.add_argument("--grail-families")
+    import_parser.add_argument("--lafan", type=Path)
+    import_parser.add_argument("--model", type=Path)
+    import_parser.add_argument("--justin-terrain", type=Path)
     import_parser.add_argument("--output", type=Path, required=True)
-    import_parser.set_defaults(handler=_import_fixture)
+    import_parser.set_defaults(handler=_import_from_arguments)
     audit_parser = commands.add_parser(
         "audit",
         help="mechanically audit every canonical clip and republish evidence",
@@ -2959,7 +4528,11 @@ def _parser() -> argparse.ArgumentParser:
         help="render every mechanically accepted interval",
     )
     render_parser.add_argument("--corpus", type=Path, required=True)
-    render_parser.add_argument("--renderer", type=Path, required=True)
+    render_parser.add_argument(
+        "--renderer",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
     render_parser.add_argument(
         "--renderer-arg",
         action="append",
@@ -2968,7 +4541,7 @@ def _parser() -> argparse.ArgumentParser:
     render_parser.add_argument(
         "--renderer-timeout-seconds",
         type=float,
-        default=300.0,
+        default=3600.0,
     )
     render_parser.add_argument("--output", type=Path, required=True)
     render_parser.set_defaults(handler=_render_interval_receipts)

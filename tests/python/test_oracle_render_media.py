@@ -448,6 +448,28 @@ class RenderMediaCliTests(unittest.TestCase):
 
 
 class RenderStreamingTests(unittest.TestCase):
+    def test_contact_sheet_budget_is_one_authenticated_frame_per_input(self):
+        """Catches rejecting or redundantly encoding the 720-clip contact sheet."""
+
+        import mm_sonic.terrain_oracle.render_media as renderer
+
+        inputs = [
+            {"start": 0, "end": 80_000},
+            {"start": 100, "end": 90_100},
+        ]
+        self.assertEqual(
+            renderer._encoded_frame_count("contact_sheet", inputs),
+            2,
+        )
+        self.assertEqual(
+            renderer._encoded_frame_count("full_video", inputs),
+            170_000,
+        )
+        self.assertGreaterEqual(
+            renderer.FIXED_RENDER_CONFIG["max_frames"],
+            170_000,
+        )
+
     def test_ten_thousand_frames_are_streamed_one_at_a_time(self):
         """Catches reintroducing an O(frame_count) RGB-frame buffer."""
 
@@ -492,7 +514,14 @@ class RenderStreamingTests(unittest.TestCase):
 
         process = Process()
 
-        def fake_render(item, model_path, consume):
+        def fake_render(
+            item,
+            model_path,
+            consume,
+            *,
+            representative_only,
+        ):
+            self.assertFalse(representative_only)
             for _ in range(10_000):
                 consume(frame)
             return frame.copy(), {

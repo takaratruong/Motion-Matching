@@ -353,11 +353,53 @@ def _canonicalize_record(
     motion = load_grail_motion(
         record.robot_path, expected_frames=record.n_frames
     )
+    robot_bytes = record.robot_path.read_bytes()
+    asset_bytes = record.usd_path.read_bytes()
+    asset_sha256 = hashlib.sha256(asset_bytes).hexdigest()
+    mesh = _load_usd_mesh(
+        record.usd_path, source_asset_sha256=asset_sha256
+    )
+    return _canonicalize_verified_record(
+        record,
+        fk,
+        motion=motion,
+        mesh=mesh,
+        robot_bytes=robot_bytes,
+        asset_bytes=asset_bytes,
+    )
+
+
+def _canonicalize_verified_record(
+    record: GrailClipRecord,
+    fk: G1MujocoFK,
+    *,
+    motion: object,
+    mesh: CanonicalTerrainMesh,
+    robot_bytes: bytes,
+    asset_bytes: bytes,
+) -> GrailCanonicalSource:
+    """Canonicalize caller-snapshotted bytes without reopening source assets."""
+
+    if (
+        not isinstance(robot_bytes, bytes)
+        or not robot_bytes
+        or not isinstance(asset_bytes, bytes)
+        or not asset_bytes
+    ):
+        raise ValueError("verified GRAIL source payloads must be nonempty bytes")
+    asset_sha256 = hashlib.sha256(asset_bytes).hexdigest()
+    if (
+        not isinstance(mesh, CanonicalTerrainMesh)
+        or mesh.source_asset_sha256 != asset_sha256
+    ):
+        raise ValueError(
+            "verified GRAIL terrain mesh does not match its asset bytes"
+        )
     resampled = resample_grail_motion(
-        motion.root_position,
-        motion.root_quaternion_xyzw,
-        motion.dof_mujoco,
-        source_fps=motion.fps,
+        motion.root_position,  # type: ignore[attr-defined]
+        motion.root_quaternion_xyzw,  # type: ignore[attr-defined]
+        motion.dof_mujoco,  # type: ignore[attr-defined]
+        source_fps=motion.fps,  # type: ignore[attr-defined]
         target_fps=50.0,
     )
     forward = fk.forward(
@@ -386,12 +428,6 @@ def _canonicalize_record(
     sole_position = forward.body_position_world[:, _FOOT_BODY_INDICES]
     sole_quaternion = body_wxyz[:, _FOOT_BODY_INDICES]
 
-    robot_bytes = record.robot_path.read_bytes()
-    asset_bytes = record.usd_path.read_bytes()
-    asset_sha256 = hashlib.sha256(asset_bytes).hexdigest()
-    mesh = _load_usd_mesh(
-        record.usd_path, source_asset_sha256=asset_sha256
-    )
     terrain = TerrainBinding(
         asset_path=str(record.usd_path.resolve()),
         asset_size_bytes=len(asset_bytes),

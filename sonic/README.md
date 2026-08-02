@@ -291,8 +291,7 @@ PYTHONPATH=sonic/python:. \
 PYTHONPATH=sonic/python:. \
   /move/u/justingu/miniconda3/envs/isaac6_test/bin/python -B \
   -m mm_sonic.terrain_oracle.corpus_cli render-audit \
-  --corpus AUDITED_CORPUS --renderer PYTHON \
-  --renderer-arg ROBOT_MESH_RENDERER.py \
+  --corpus AUDITED_CORPUS \
   --output AUDITED_CORPUS/render-audit
 
 PYTHONPATH=sonic/python:. \
@@ -307,8 +306,9 @@ PYTHONPATH=sonic/python:. \
 ```
 
 `audit` republishes canonical clip and mesh bytes with exactly one mechanical
-report per clip. `render-audit` runs argument-vector subprocesses with
-`shell=False`; it records one video/contact-overlay pair for every accepted
+report per clip. `render-audit` invokes the fixed package-owned MuJoCo renderer
+with `shell=False`; production evidence cannot be supplied by an external
+renderer. It records one H.264 video/contact-overlay PNG pair for every accepted
 `[start,end)` interval, one contact sheet covering the complete interval set,
 and one full video for every recomputed
 `(source, action_class, terrain, direction)` stratum. Receipts bind clip,
@@ -322,9 +322,9 @@ hash, so the release does not depend on the XML's external `meshdir`.
 The exact real inventory command reported 173 flat clips, 18 Justin clips, and
 489 clean GRAIL pairs: 166 `c490_stair_p1`, 174 `c490_stair_p2`, 77
 `c490_slope`, and 72 `c490_curb`. The sealed inventory file SHA-256 is
-`5c1a909f7d8941c5dba724747cdea6bf7da5705d75e5682719cb0f988900a300`;
+`a7d6157116eec567b5a4df2daf21c95f4a6363b8dc8c6dfe1a8a5c6652c6063c`;
 its recomputed content hash is
-`baa643d2909676e581b4d1d2a09ba9d1a153688d7f7c5aa1f9522a5577d6b7c1`.
+`901dd172146444f18e77d8c427c910bfef0f0f7935fab543a7e245c7713a21eb`.
 The selected LAFAN G1 release contains 40 strict numeric CSVs at immutable
 revision `ce1572906efe6157840e8474d5a0d7aa87481e74`; every downloaded CSV,
 README, and LICENSE metadata sidecar records that commit. The README assigns
@@ -334,7 +334,11 @@ LICENSE is `BSD-3-Clause`. The LAFAN inventory file SHA-256 is
 its recomputed content hash is
 `98493a9a0443ed2b9151a1de4b5084ebe3283657f4f055333a92ba724588820c`.
 
-All publications use canonical relative paths, fsync-backed staging, and
-atomic no-replace semantics. Existing destinations are never overwritten.
+Directory publications use canonical relative paths, fsync-backed staging,
+exclusive no-replace destination claims, and authenticated logical-completion
+markers. Linux `renameat2` is used when the filesystem supports it; the NFS
+fallback is intentionally described as logically complete, not kernel-atomic.
+Existing destinations are never overwritten, and readers reject incomplete,
+changed, or still-writer-owned trees.
 Contract failures—including malformed arguments—print an actionable error and
 return status 2 without a Python traceback; `--help` returns status 0.
