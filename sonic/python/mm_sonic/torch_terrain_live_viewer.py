@@ -406,12 +406,16 @@ def dense_patch_positions(
         try:
             origin = grid.origin_xy
             ny, nx = grid.height_z.shape
+            margin = max(1.0e-6, float(grid.cell_size_m) * 1.0e-4)
+            minimum = origin + margin
             maximum = origin + torch.tensor(
                 ((nx - 1) * grid.cell_size_m, (ny - 1) * grid.cell_size_m),
                 dtype=scene_xy.dtype,
                 device=scene_xy.device,
+            ) - margin
+            clamped = torch.maximum(
+                torch.minimum(scene_xy, maximum), minimum
             )
-            clamped = torch.maximum(torch.minimum(scene_xy, maximum), origin)
             height = grid.sample_xy(clamped)
         except (AttributeError, TypeError) as clamp_error:
             raise ContractError(
