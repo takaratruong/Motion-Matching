@@ -32,6 +32,7 @@ class TerrainFootLockFilter:
         maximum_output_joint_speed_rad_s: float = 12.0,
         swing_clearance_margin_m: float | None = None,
         swing_plan_sigma_frames: float | None = None,
+        swing_plan_full_interval: bool = False,
     ) -> None:
         paths = tuple(clip_paths)
         masks = tuple(support_masks)
@@ -93,6 +94,8 @@ class TerrainFootLockFilter:
                 )
             )
             or ((source_feet is None) != (source_yaws is None))
+            or type(swing_plan_full_interval) is not bool
+            or (swing_plan_full_interval and swing_plan_sigma_frames is None)
             or (
                 source_feet is not None
                 and (
@@ -160,6 +163,7 @@ class TerrainFootLockFilter:
             if swing_plan_sigma_frames is None
             else float(swing_plan_sigma_frames)
         )
+        self._swing_plan_full_interval = swing_plan_full_interval
         self._lock_position = torch.full(
             (2, 3), float("nan"), dtype=torch.float32, device=device
         )
@@ -215,8 +219,19 @@ class TerrainFootLockFilter:
         stop = frame + 1
         while stop < support.shape[0] and not bool(support[stop].item()):
             stop += 1
-        source = self._source_foot_positions[clip_index][frame:stop, foot]
-        delta = source - source[0]
+        start = frame
+        range_stop = stop
+        if self._swing_plan_full_interval:
+            while start > 0 and not bool(support[start - 1].item()):
+                start -= 1
+            if start > 0:
+                start -= 1
+            range_stop = min(stop + 1, support.shape[0])
+        source = self._source_foot_positions[clip_index][
+            start:range_stop, foot
+        ]
+        anchor = self._source_foot_positions[clip_index][frame, foot]
+        delta = source - anchor
         output_yaw = self._yaw_from_wxyz(
             result.root_orientation_world_wxyz
         )
@@ -239,6 +254,24 @@ class TerrainFootLockFilter:
             - placed_z,
             min=0.0,
         )
+        if self._swing_plan_full_interval:
+            count = required.shape[0]
+            index = frame - start
+            coordinates = torch.arange(
+                count, dtype=required.dtype, device=self._device
+            )
+            distance = coordinates[:, None] - coordinates[None, :]
+            weight = torch.exp(
+                -0.5
+                * torch.square(distance / self._swing_plan_sigma_frames)
+            )
+            envelope = torch.amax(weight * required[None, :], dim=1)
+            if count > 1:
+                phase = coordinates / float(count - 1)
+                endpoint_window = torch.sin(math.pi * phase)
+                envelope = envelope * endpoint_window
+            planned = torch.maximum(required, envelope)
+            return planned[index]
         distance = torch.arange(
             required.shape[0], dtype=required.dtype, device=self._device
         )
@@ -428,6 +461,7 @@ def build_terrain_foot_lock(
     swing_clearance_margin_m: float | None = None,
     correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
+    swing_plan_full_interval: bool = False,
 ):
     """Build a source-contact foot lock against the resolved query terrain."""
 
@@ -492,4 +526,5 @@ def build_terrain_foot_lock(
         swing_clearance_margin_m=swing_clearance_margin_m,
         correction_halflife_s=correction_halflife_s,
         swing_plan_sigma_frames=swing_plan_sigma_frames,
+        swing_plan_full_interval=swing_plan_full_interval,
     )

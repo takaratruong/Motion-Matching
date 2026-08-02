@@ -273,6 +273,45 @@ class TerrainFootLockTests(unittest.TestCase):
         self.assertEqual(tuple(corrected.joint_position.shape), (29,))
         self.assertEqual(foot_lock.failure_count, 1)
 
+    def test_full_interval_swing_plan_includes_touchdown_endpoint(self):
+        support = torch.tensor(
+            (
+                (True, True),
+                (True, False),
+                (True, False),
+                (True, False),
+                (True, True),
+            ),
+            dtype=torch.bool,
+        )
+        source_feet = torch.zeros((5, 2, 3), dtype=torch.float32)
+        source_feet[:, 1, 0] = torch.tensor((0.0, 0.0, 0.1, 0.2, 0.3))
+        foot_lock = TerrainFootLockFilter(
+            clip_paths=("clip.npz",),
+            support_masks=(support,),
+            source_foot_positions=(source_feet,),
+            source_root_yaws=(torch.zeros(5),),
+            foot_kinematics=_LinearFeet(),
+            sample_surface=lambda xy: torch.where(
+                xy[:, 0] >= 0.25,
+                torch.full((xy.shape[0],), 0.1),
+                torch.zeros(xy.shape[0]),
+            ),
+            device=torch.device("cpu"),
+            swing_clearance_margin_m=0.01,
+            swing_plan_sigma_frames=2.0,
+            swing_plan_full_interval=True,
+        )
+        native = _result(1, 0.0)
+        native.joint_position[5] = -0.44
+
+        corrected = foot_lock.apply(native)
+
+        self.assertGreater(
+            float(corrected.joint_position[5]),
+            float(native.joint_position[5]),
+        )
+
     def test_unknown_source_fails_closed(self):
         foot_lock = TerrainFootLockFilter(
             clip_paths=("clip.npz",),
