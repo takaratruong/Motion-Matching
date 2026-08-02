@@ -280,6 +280,13 @@ class OracleCoverageTests(CoverageFixture, unittest.TestCase):
         self.assertEqual(len(deduplicate((original, mirror)).unique_records), 2)
         split = assign_grouped_splits((mirror, original), "oracle-v1")
         self.assertEqual(split["walk"], split["walk__mirror"])
+        evidence = {
+            (contribution.semantic_digest, contribution.dedup_group_id)
+            for cell in build_coverage((original, mirror)).occupied_cells
+            for contribution in cell.contributions
+        }
+        self.assertEqual(len({semantic for semantic, _ in evidence}), 2)
+        self.assertEqual(len({group for _, group in evidence}), 1)
 
     def test_source_terrain_procedural_and_transitive_constraints_never_leak(self):
         a = self.record("a", source_sha="1" * 64, terrain_asset_sha="a" * 64)
@@ -720,6 +727,118 @@ class OracleCoverageTests(CoverageFixture, unittest.TestCase):
         for mutation in mutations:
             with self.subTest(mutation=mutation), self.assertRaises(ContractError):
                 CoverageManifest.from_dict(rehash(mutation))
+
+    def test_one_semantic_digest_cannot_belong_to_multiple_valid_groups(self):
+        records = (
+            self.record(
+                "inverse-one",
+                x_speed=0.4,
+                intervals=((0, 5), (9, 14)),
+                terrain_asset_sha="1" * 64,
+            ),
+            self.record(
+                "inverse-two",
+                x_speed=0.8,
+                intervals=((0, 5), (9, 14)),
+                terrain_asset_sha="2" * 64,
+            ),
+        )
+        document = build_coverage(records).to_dict()
+        semantics = sorted(
+            {
+                contribution["semantic_digest"]
+                for cell in document["occupied_cells"]
+                for contribution in cell["contributions"]
+            }
+        )
+        self.assertEqual(len(semantics), 2)
+        combined_group = hashlib.sha256(
+            (
+                "terrain-oracle-split-group/v1\0"
+                + "\0".join(semantics)
+            ).encode()
+        ).hexdigest()
+
+        for cell in document["occupied_cells"]:
+            for contribution in cell["contributions"]:
+                if contribution["accepted_interval"] != [9, 14]:
+                    continue
+                contribution["dedup_group_id"] = combined_group
+                contribution["contribution_id"] = hashlib.sha256(
+                    (
+                        json.dumps(
+                            {
+                                "schema": "terrain-oracle-coverage-contribution/v1",
+                                "semantic_digest": contribution["semantic_digest"],
+                                "dedup_group_id": contribution["dedup_group_id"],
+                                "accepted_interval": contribution["accepted_interval"],
+                            },
+                            allow_nan=False,
+                            ensure_ascii=True,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        )
+                        + "\n"
+                    ).encode("ascii")
+                ).hexdigest()
+            cell["contributions"].sort(key=lambda item: item["contribution_id"])
+            cell["dedup_group_ids"] = sorted(
+                {item["dedup_group_id"] for item in cell["contributions"]}
+            )
+            cell["contribution_count"] = len(cell["contributions"])
+            cell["intervals"] = sorted(
+                {tuple(item["accepted_interval"]) for item in cell["contributions"]}
+            )
+            cell["intervals"] = [list(interval) for interval in cell["intervals"]]
+
+        groups_by_semantic = {}
+        semantics_by_group = {}
+        for cell in document["occupied_cells"]:
+            for contribution in cell["contributions"]:
+                groups_by_semantic.setdefault(
+                    contribution["semantic_digest"], set()
+                ).add(contribution["dedup_group_id"])
+                semantics_by_group.setdefault(
+                    contribution["dedup_group_id"], set()
+                ).add(contribution["semantic_digest"])
+        self.assertTrue(
+            all(len(groups) == 2 for groups in groups_by_semantic.values())
+        )
+        self.assertEqual(semantics_by_group[combined_group], set(semantics))
+
+        marginal_evidence = {}
+        for cell in document["occupied_cells"]:
+            identifiers = {
+                item["contribution_id"] for item in cell["contributions"]
+            }
+            for axis, category in cell["coordinates"].items():
+                marginal_evidence.setdefault((axis, category), set()).update(
+                    identifiers
+                )
+        document["marginal_counts"] = {
+            axis: {
+                category: len(marginal_evidence[(axis, category)])
+                for category in document["marginal_counts"][axis]
+            }
+            for axis in document["marginal_counts"]
+        }
+        payload = dict(document)
+        payload.pop("content_sha256")
+        document["content_sha256"] = hashlib.sha256(
+            (
+                json.dumps(
+                    payload,
+                    allow_nan=False,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("ascii")
+        ).hexdigest()
+
+        with self.assertRaisesRegex(ContractError, "semantic digest.*split group"):
+            CoverageManifest.from_dict(document)
 
     def test_freeze_refuses_symlink_and_cleans_temp_after_publish_exception(self):
         manifest = build_coverage((self.record("atomic", terrain_asset_sha="1" * 64),))

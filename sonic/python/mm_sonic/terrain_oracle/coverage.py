@@ -902,6 +902,7 @@ def _derived_marginals(
 def _validate_contribution_groups(cells: tuple[CoverageCell, ...]) -> None:
     by_identifier: dict[str, CoverageContribution] = {}
     semantics_by_group: dict[str, set[str]] = {}
+    group_by_semantic: dict[str, str] = {}
     for cell in cells:
         for contribution in cell.contributions:
             previous = by_identifier.setdefault(
@@ -909,6 +910,13 @@ def _validate_contribution_groups(cells: tuple[CoverageCell, ...]) -> None:
             )
             if previous != contribution:
                 raise ContractError("one contribution ID has conflicting evidence")
+            previous_group = group_by_semantic.setdefault(
+                contribution.semantic_digest, contribution.dedup_group_id
+            )
+            if previous_group != contribution.dedup_group_id:
+                raise ContractError(
+                    "one semantic digest belongs to multiple split groups"
+                )
             semantics_by_group.setdefault(
                 contribution.dedup_group_id, set()
             ).add(contribution.semantic_digest)
