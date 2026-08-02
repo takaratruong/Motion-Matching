@@ -92,8 +92,10 @@ def command_skill_compatible(
             return False
         requested_speed = torch.linalg.vector_norm(requested_velocity_local_xy)
         travel_length = torch.linalg.vector_norm(skill_travel_local_xy)
-        if float(requested_speed.item()) <= 0.05 or float(travel_length.item()) <= 0.05:
+        if float(requested_speed.item()) <= 0.05:
             return True
+        if float(travel_length.item()) <= 0.05:
+            return False
         alignment = torch.dot(
             requested_velocity_local_xy / requested_speed,
             skill_travel_local_xy / travel_length,
@@ -103,8 +105,10 @@ def command_skill_compatible(
         return False
     requested_speed = torch.linalg.vector_norm(requested_velocity_local_xy)
     travel_length = torch.linalg.vector_norm(skill_travel_local_xy)
-    if float(requested_speed.item()) <= 0.05 or float(travel_length.item()) <= 0.05:
+    if float(requested_speed.item()) <= 0.05:
         return True
+    if float(travel_length.item()) <= 0.05:
+        return False
     alignment = torch.dot(
         requested_velocity_local_xy / requested_speed,
         skill_travel_local_xy / travel_length,
@@ -311,7 +315,7 @@ class TerrainSkillMatcher:
             alignment = torch.sum(
                 self._intent_travel_local * (requested_local / speed), dim=1
             ) / lengths.clamp_min(1e-8)
-            return turn_valid & ((lengths <= 0.05) | (alignment >= 0.25))
+            return turn_valid & (lengths > 0.05) & (alignment >= 0.25)
         valid &= torch.abs(self._intent_yaw_delta) <= math.radians(60.0)
         speed = torch.linalg.vector_norm(requested_local)
         lengths = torch.linalg.vector_norm(self._intent_travel_local, dim=1)
@@ -320,7 +324,7 @@ class TerrainSkillMatcher:
         alignment = torch.sum(
             self._intent_travel_local * (requested_local / speed), dim=1
         ) / lengths.clamp_min(1e-8)
-        return valid & ((lengths <= 0.05) | (alignment >= 0.70))
+        return valid & (lengths > 0.05) & (alignment >= 0.70)
 
     def _feet_for_result(self, result: Any) -> torch.Tensor:
         feet = self.foot_kinematics.foot_positions(

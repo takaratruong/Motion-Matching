@@ -57,6 +57,16 @@ class TerrainSkillRolloutTest(unittest.TestCase):
             )
         )
 
+    def test_whole_skill_gate_rejects_stationary_skill_for_moving_command(self):
+        self.assertFalse(
+            command_skill_compatible(
+                skill_travel_local_xy=torch.zeros(2),
+                skill_yaw_delta_rad=torch.tensor(0.0),
+                requested_velocity_local_xy=torch.tensor([0.4, 0.0]),
+                requested_heading_delta_rad=torch.tensor(0.0),
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
