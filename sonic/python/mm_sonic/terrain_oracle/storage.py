@@ -292,6 +292,19 @@ def _clip_arrays(clip: CanonicalClip) -> dict[str, np.ndarray]:
     return arrays
 
 
+def _clip_payload(clip: CanonicalClip) -> bytes:
+    if not isinstance(clip, CanonicalClip):
+        raise ContractError("clip payload requires a CanonicalClip")
+    clip.validate()
+    return _deterministic_npz_bytes(_clip_arrays(clip))
+
+
+def clip_digest(clip: CanonicalClip) -> str:
+    """Return the SHA-256 of the exact canonical bytes used by ``write_clip``."""
+
+    return hashlib.sha256(_clip_payload(clip)).hexdigest()
+
+
 def _read_json_array(archive: np.lib.npyio.NpzFile, name: str) -> dict[str, object]:
     try:
         return json.loads(bytes(np.asarray(archive[name], dtype=np.uint8)).decode("ascii"))
@@ -312,8 +325,7 @@ def write_clip(output: Path, clip: CanonicalClip) -> ClipRecord:
 
     if not isinstance(clip, CanonicalClip):
         raise ContractError("write_clip requires a CanonicalClip")
-    clip.validate()
-    payload = _deterministic_npz_bytes(_clip_arrays(clip))
+    payload = _clip_payload(clip)
     digest = hashlib.sha256(payload).hexdigest()
     directory = Path(output)
     _write_no_replace(directory / f"{digest}.npz", payload)

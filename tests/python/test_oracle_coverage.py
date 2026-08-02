@@ -8,10 +8,12 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
 from mm_sonic.joints import ContractError
+import mm_sonic.terrain_oracle.coverage as coverage_module
 from mm_sonic.terrain_oracle.audit import AuditReason, AuditThresholds, ClipAudit
 from mm_sonic.terrain_oracle.canonical import CanonicalTerrainMesh, TerrainBinding
 from mm_sonic.terrain_oracle.contact import (
@@ -21,6 +23,7 @@ from mm_sonic.terrain_oracle.contact import (
 from mm_sonic.terrain_oracle.coverage import (
     ACTION_CLASSES,
     AcceptedClipRecord,
+    CoverageContribution,
     CoverageManifest,
     assign_grouped_splits,
     build_coverage,
@@ -29,6 +32,7 @@ from mm_sonic.terrain_oracle.coverage import (
 )
 from mm_sonic.terrain_oracle.math3d import RigidTransform
 from mm_sonic.terrain_oracle.storage import write_clip
+from mm_sonic.terrain_oracle.storage import ClipRecord, clip_digest
 from tests.python.terrain_oracle_test_utils import synthetic_canonical_clip
 
 
@@ -101,6 +105,10 @@ class CoverageFixture:
         yaw_rate=0.0,
         contact_pattern=None,
         z_profile=None,
+        sole_yaw_by_leg=(0.0, 0.0),
+        sole_z_by_leg=(0.0, 0.0),
+        heel_z_offset_by_leg=(0.0, 0.0),
+        toe_z_offset_by_leg=(0.0, 0.0),
     ):
         frames = 14
         clip = synthetic_canonical_clip(frames=frames)
@@ -128,13 +136,24 @@ class CoverageFixture:
         sole[:, :, :2] = root[:, None, :2]
         sole[:, 0, 1] += 0.1
         sole[:, 1, 1] -= 0.1
+        sole[:, :, 2] = np.asarray(sole_z_by_leg, np.float32)
         # Touchdowns carry independently hand-authored step displacement.
         sole[:, 0, 0] += np.arange(frames, dtype=np.float32) * 0.02
         sole[:, 1, 0] += np.arange(frames, dtype=np.float32) * 0.01
         heel = sole.copy()
         heel[:, :, 0] -= 0.1
+        heel[:, :, 2] += np.asarray(heel_z_offset_by_leg, np.float32)
         toe = sole.copy()
         toe[:, :, 0] += 0.1
+        toe[:, :, 2] += np.asarray(toe_z_offset_by_leg, np.float32)
+        sole_quaternion = np.zeros((frames, 2, 4), np.float32)
+        for leg in range(2):
+            sole_quaternion[:, leg, 0] = np.cos(
+                np.float32(sole_yaw_by_leg[leg]) / 2
+            )
+            sole_quaternion[:, leg, 3] = np.sin(
+                np.float32(sole_yaw_by_leg[leg]) / 2
+            )
         terrain = TerrainBinding(
             asset_path=f"/readonly/{asset_sha}.obj",
             asset_size_bytes=10,
@@ -161,9 +180,7 @@ class CoverageFixture:
                 np.array((0, 0, yaw_rate), np.float32), (frames, 1)
             ),
             sole_position_world=sole,
-            sole_quaternion_world_wxyz=np.broadcast_to(
-                quat[:, None], (frames, 2, 4)
-            ),
+            sole_quaternion_world_wxyz=sole_quaternion,
             heel_position_world=heel,
             toe_position_world=toe,
             contact=contact,
@@ -172,7 +189,10 @@ class CoverageFixture:
             action_tags=("motion", CONTACT_RECONSTRUCTION_TAG),
         )
         clip.validate()
-        artifact = write_clip(self.root / f"clips-{len(list(self.root.iterdir()))}", clip)
+        artifact = write_clip(
+            self.root / f"artifact-{len(list(self.root.iterdir()))}" / "clips",
+            clip,
+        )
         intervals = tuple(intervals or ((0, frames),))
         status = "accepted" if intervals == ((0, frames),) else "accepted_with_intervals_removed"
         reasons = ()
@@ -185,6 +205,7 @@ class CoverageFixture:
             clip_id=clip_id,
             frame_count=frames,
             source_sha256=source_sha,
+            clip_sha256=artifact.sha256,
             model_sha256=self.model_sha,
             terrain_sha256=_query_hash(query),
             status=status,
@@ -231,11 +252,12 @@ class OracleCoverageTests(CoverageFixture, unittest.TestCase):
                 source_sha256="2" * 64,
             ),
         )
-        artifact = write_clip(self.root / "copy", copied_clip)
+        artifact = write_clip(self.root / "copy" / "clips", copied_clip)
         audit = replace(
             original.audit,
             clip_id="copy",
             source_sha256="2" * 64,
+            clip_sha256=artifact.sha256,
         )
         copied = replace(
             original,
@@ -303,6 +325,46 @@ class OracleCoverageTests(CoverageFixture, unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(ContractError):
                 replace(record, **changes)
 
+    def test_audit_binds_exact_clip_artifact_and_canonical_record_path(self):
+        record = self.record("artifact-bound", terrain_asset_sha="1" * 64)
+        changed_root = np.array(record.clip.root_position_world, copy=True)
+        changed_root[4, 0] += np.float32(0.125)
+        changed_command = np.array(
+            record.clip.commands.inferred_yaw_rate_rad_s, copy=True
+        )
+        changed_command[4] += np.float32(0.25)
+        changed_contact = np.array(record.clip.contact, copy=True)
+        changed_contact[4] = changed_contact[4, ::-1]
+        changed_clips = (
+            replace(record.clip, root_position_world=changed_root),
+            replace(
+                record.clip,
+                commands=replace(
+                    record.clip.commands,
+                    inferred_yaw_rate_rad_s=changed_command,
+                ),
+            ),
+            replace(record.clip, contact=changed_contact),
+        )
+        for changed in changed_clips:
+            fresh = ClipRecord(
+                relative_path=f"clips/{clip_digest(changed)}.npz",
+                sha256=clip_digest(changed),
+                clip_id=changed.clip_id,
+                frame_count=changed.frame_count,
+            )
+            with self.subTest(digest=fresh.sha256), self.assertRaisesRegex(
+                ContractError, "audit|artifact|digest"
+            ):
+                replace(record, clip=changed, clip_record=fresh)
+
+        forged_path = replace(
+            record.clip_record,
+            relative_path=f"elsewhere/{record.clip_record.sha256}.npz",
+        )
+        with self.assertRaisesRegex(ContractError, "relative_path"):
+            replace(record, clip_record=forged_path)
+
     def test_coverage_has_every_axis_and_preserves_ascent_descent_support(self):
         pattern = np.zeros((14, 2), np.float32)
         pattern[:4, 0] = 1
@@ -351,6 +413,83 @@ class OracleCoverageTests(CoverageFixture, unittest.TestCase):
         self.assertNotIn("reverse", manifest.marginal_counts["transition"])
         self.assertTrue(all(cell.interval in ((0, 5), (9, 14)) for cell in manifest.occupied_cells))
 
+    def test_stationary_flight_and_nonunique_swing_publish_none(self):
+        flight = np.zeros((14, 2), np.float32)
+        record = self.record(
+            "stationary-flight",
+            x_speed=0.0,
+            contact_pattern=flight,
+            sole_z_by_leg=(0.2, 0.3),
+            terrain_asset_sha="1" * 64,
+        )
+        manifest = build_coverage((record,))
+        coordinates = [cell.to_dict()["coordinates"] for cell in manifest.occupied_cells]
+        self.assertTrue(coordinates)
+        self.assertEqual({row["movement_facing_offset"] for row in coordinates}, {"none"})
+        self.assertEqual({row["surface_normal"] for row in coordinates}, {"none"})
+        self.assertEqual({row["contact_yaw"] for row in coordinates}, {"none"})
+        self.assertEqual({row["swing_clearance"] for row in coordinates}, {"none"})
+
+    def test_right_contact_uses_right_yaw_and_double_support_emits_both_legs(self):
+        right_only = np.zeros((14, 2), np.float32)
+        right_only[:, 1] = 1
+        right = self.record(
+            "right-only",
+            contact_pattern=right_only,
+            sole_yaw_by_leg=(0.0, 1.2),
+            terrain_asset_sha="1" * 64,
+        )
+        right_rows = [
+            cell.to_dict()["coordinates"] for cell in build_coverage((right,)).occupied_cells
+        ]
+        self.assertEqual({row["support_leg"] for row in right_rows}, {"right"})
+        self.assertNotIn("[0,0.392699)", {row["contact_yaw"] for row in right_rows})
+
+        double = np.ones((14, 2), np.float32)
+        both = self.record(
+            "both",
+            contact_pattern=double,
+            sole_yaw_by_leg=(-1.2, 1.2),
+            terrain_asset_sha="2" * 64,
+        )
+        both_rows = [
+            cell.to_dict()["coordinates"] for cell in build_coverage((both,)).occupied_cells
+        ]
+        self.assertEqual({row["support_leg"] for row in both_rows}, {"left", "right"})
+        self.assertGreaterEqual(len({row["contact_yaw"] for row in both_rows}), 2)
+
+    def test_swing_clearance_uses_conservative_sole_heel_toe_geometry(self):
+        left_support = np.zeros((14, 2), np.float32)
+        left_support[:, 0] = 1
+        record = self.record(
+            "clearance-probes",
+            contact_pattern=left_support,
+            sole_z_by_leg=(0.0, 0.20),
+            heel_z_offset_by_leg=(0.0, -0.19),
+            toe_z_offset_by_leg=(0.0, 0.10),
+            terrain_asset_sha="1" * 64,
+        )
+        rows = [
+            cell.to_dict()["coordinates"] for cell in build_coverage((record,)).occupied_cells
+        ]
+        self.assertEqual({row["swing_clearance"] for row in rows}, {"[0,0.015)"})
+
+    def test_simultaneous_touchdowns_preserve_independent_step_displacements(self):
+        pattern = np.zeros((14, 2), np.float32)
+        pattern[0:2] = 1
+        pattern[10:12] = 1
+        record = self.record(
+            "two-touchdowns",
+            contact_pattern=pattern,
+            terrain_asset_sha="1" * 64,
+        )
+        rows = [
+            cell.to_dict()["coordinates"] for cell in build_coverage((record,)).occupied_cells
+        ]
+        touchdown = [row for row in rows if row["step_forward"] != "none"]
+        self.assertEqual({row["support_leg"] for row in touchdown}, {"left", "right"})
+        self.assertGreaterEqual(len({row["step_forward"] for row in touchdown}), 2)
+
     def test_boundaries_use_deterministic_underflow_overflow_and_disconnected_components(self):
         slow = self.record("slow", x_speed=0.0, terrain_asset_sha="1" * 64)
         fast = self.record("fast", x_speed=99.0, yaw_rate=-99, terrain_asset_sha="2" * 64)
@@ -366,7 +505,7 @@ class OracleCoverageTests(CoverageFixture, unittest.TestCase):
         self.assertEqual(CoverageManifest.from_dict(document), manifest)
         mutated = json.loads(json.dumps(document))
         mutated["marginal_counts"]["action_class"]["walk"] += 1
-        with self.assertRaisesRegex(ContractError, "content hash"):
+        with self.assertRaisesRegex(ContractError, "marginal|content hash"):
             CoverageManifest.from_dict(mutated)
 
         schema = json.loads(
@@ -378,20 +517,31 @@ class OracleCoverageTests(CoverageFixture, unittest.TestCase):
             )
         )
         self.assertTrue(validator_roots, "Task 2 isolated schema validator is missing")
+        invalid_documents = []
         invalid = json.loads(json.dumps(document))
         invalid["unknown"] = 1
+        invalid_documents.append(invalid)
+        invalid = json.loads(json.dumps(document))
+        invalid["bin_definitions"]["planar_speed"]["edges"][1] = 0.11
+        invalid_documents.append(invalid)
+        invalid = json.loads(json.dumps(document))
+        invalid["occupied_cells"][0]["coordinates"]["support_leg"] = "both"
+        invalid_documents.append(invalid)
+        invalid = json.loads(json.dumps(document))
+        invalid["occupied_cells"][0]["contributions"][0]["unknown"] = 1
+        invalid_documents.append(invalid)
         schema_path = self.root / "schema.json"
         valid_path = self.root / "valid.json"
         invalid_path = self.root / "invalid.json"
         schema_path.write_text(json.dumps(schema))
         valid_path.write_text(json.dumps(document))
-        invalid_path.write_text(json.dumps(invalid))
+        invalid_path.write_text(json.dumps(invalid_documents))
         script = (
             "import json,sys\n"
             "from jsonschema import Draft202012Validator as V\n"
             "s=json.load(open(sys.argv[1])); good=json.load(open(sys.argv[2])); bad=json.load(open(sys.argv[3]))\n"
             "V.check_schema(s); v=V(s); v.validate(good)\n"
-            "assert list(v.iter_errors(bad))\n"
+            "assert all(list(v.iter_errors(item)) for item in bad)\n"
         )
         environment = dict(os.environ)
         environment["PYTHONPATH"] = str(validator_roots[0])
@@ -412,6 +562,109 @@ class OracleCoverageTests(CoverageFixture, unittest.TestCase):
             freeze_coverage(destination, manifest)
         self.assertEqual(list(destination.parent.glob(f".{destination.name}.*")), [])
 
+    def test_cells_publish_recomputable_actual_contribution_evidence(self):
+        record = self.record("evidence", terrain_asset_sha="1" * 64)
+        manifest = build_coverage((record,))
+        self.assertTrue(manifest.occupied_cells)
+        for cell in manifest.occupied_cells:
+            self.assertEqual(cell.contribution_count, len(cell.contributions))
+            self.assertEqual(
+                cell.source_ids,
+                tuple(sorted({item.source_sha256 for item in cell.contributions})),
+            )
+            self.assertEqual(
+                cell.dedup_group_ids,
+                tuple(sorted({item.dedup_group_id for item in cell.contributions})),
+            )
+            self.assertEqual(
+                cell.intervals,
+                tuple(sorted({item.accepted_interval for item in cell.contributions})),
+            )
+            for contribution in cell.contributions:
+                self.assertEqual(contribution.source_sha256, record.clip.source.source_sha256)
+                self.assertEqual(contribution.clip_sha256, record.clip_record.sha256)
+
+    def test_rehashed_manifest_relation_mutations_all_fail(self):
+        manifest = build_coverage((self.record("relations", terrain_asset_sha="1" * 64),))
+        original = manifest.to_dict()
+
+        def rehash(document):
+            payload = dict(document)
+            payload.pop("content_sha256", None)
+            document["content_sha256"] = hashlib.sha256(
+                (
+                    json.dumps(
+                        payload,
+                        allow_nan=False,
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                    + "\n"
+                ).encode("ascii")
+            ).hexdigest()
+            return document
+
+        mutations = []
+        changed = json.loads(json.dumps(original))
+        changed["adjacency_rule"] = "forged"
+        mutations.append(changed)
+        changed = json.loads(json.dumps(original))
+        changed["bin_definitions"]["planar_speed"]["edges"][1] = 0.11
+        mutations.append(changed)
+        changed = json.loads(json.dumps(original))
+        changed["marginal_counts"]["action_class"]["walk"] += 1
+        mutations.append(changed)
+        changed = json.loads(json.dumps(original))
+        changed["occupied_cells"][0]["contribution_count"] += 1
+        mutations.append(changed)
+        changed = json.loads(json.dumps(original))
+        changed["occupied_cells"][0]["source_ids"][0] = "f" * 64
+        mutations.append(changed)
+        changed = json.loads(json.dumps(original))
+        changed["occupied_cells"][0]["contributions"][0]["source_sha256"] = "f" * 64
+        mutations.append(changed)
+        changed = json.loads(json.dumps(original))
+        changed["occupied_cells"][0]["contributions"][0]["accepted_interval"][1] -= 1
+        mutations.append(changed)
+        changed = json.loads(json.dumps(original))
+        changed["occupied_cells"][0]["contributions"][0]["contribution_id"] = "f" * 64
+        mutations.append(changed)
+        changed = json.loads(json.dumps(original))
+        changed["occupied_cells"][0]["cell_id"] = "f" * 64
+        mutations.append(changed)
+        changed = json.loads(json.dumps(original))
+        changed["connected_components"] = []
+        mutations.append(changed)
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), self.assertRaises(ContractError):
+                CoverageManifest.from_dict(rehash(mutation))
+
+    def test_freeze_refuses_symlink_and_cleans_temp_after_publish_exception(self):
+        manifest = build_coverage((self.record("atomic", terrain_asset_sha="1" * 64),))
+        parent = self.root / "atomic-freeze"
+        parent.mkdir()
+        sentinel = parent / "sentinel"
+        sentinel.write_text("unchanged")
+        destination = parent / "coverage.json"
+        destination.symlink_to(sentinel)
+        with self.assertRaises(FileExistsError):
+            freeze_coverage(destination, manifest)
+        self.assertTrue(destination.is_symlink())
+        self.assertEqual(sentinel.read_text(), "unchanged")
+        self.assertEqual(list(parent.glob(f".{destination.name}.*")), [])
+
+        destination.unlink()
+        with mock.patch.object(
+            coverage_module,
+            "_rename_noreplace",
+            side_effect=OSError("injected publication failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "injected"):
+                freeze_coverage(destination, manifest)
+        self.assertFalse(destination.exists())
+        self.assertEqual(list(parent.glob(f".{destination.name}.*")), [])
+
     def test_action_class_enum_is_closed(self):
         self.assertEqual(
             ACTION_CLASSES,
@@ -419,6 +672,64 @@ class OracleCoverageTests(CoverageFixture, unittest.TestCase):
         )
         with self.assertRaises(ContractError):
             self.record("bad-action", action_class="stairs", terrain_asset_sha="1" * 64)
+
+    def test_reserved_mirror_suffix_requires_valid_explicit_original(self):
+        original = self.record("plain", terrain_asset_sha="1" * 64)
+        untagged = self.record("plain__mirror", terrain_asset_sha="2" * 64)
+        missing = self.record(
+            "missing__mirror", mirror_of="missing", terrain_asset_sha="3" * 64
+        )
+        nested = self.record(
+            "plain__mirror__mirror",
+            mirror_of="plain__mirror",
+            terrain_asset_sha="4" * 64,
+        )
+        for records in ((original, untagged), (missing,), (original, nested)):
+            with self.subTest(records=records), self.assertRaises(ContractError):
+                assign_grouped_splits(records, "oracle-v1")
+
+        tagged = self.record(
+            "plain__mirror",
+            mirror_of="plain",
+            y_speed=-0.2,
+            terrain_asset_sha="2" * 64,
+        )
+        split = assign_grouped_splits((tagged, original), "oracle-v1")
+        self.assertEqual(split["plain"], split["plain__mirror"])
+
+    def test_public_outputs_recursively_own_nested_inputs(self):
+        records = (self.record("owned", terrain_asset_sha="1" * 64),)
+        split = assign_grouped_splits(records, "seed")
+        assignments = dict(split.assignments)
+        groups = dict(split.group_ids)
+        rebuilt_split = type(split)(
+            split.seed, split.rule, list(split.proportions), assignments, groups
+        )
+        before_split = rebuilt_split.to_dict()
+        assignments["owned"] = "test"
+        groups["owned"] = "0" * 64
+        self.assertEqual(rebuilt_split.to_dict(), before_split)
+        with self.assertRaises(TypeError):
+            rebuilt_split.assignments["owned"] = "test"
+
+        manifest = build_coverage(records)
+        definitions = json.loads(json.dumps(manifest.to_dict()["bin_definitions"]))
+        marginals = json.loads(json.dumps(manifest.to_dict()["marginal_counts"]))
+        rebuilt = CoverageManifest(
+            manifest.schema,
+            manifest.adjacency_rule,
+            definitions,
+            marginals,
+            list(manifest.occupied_cells),
+            [list(component) for component in manifest.connected_components],
+            manifest.content_sha256,
+        )
+        before = rebuilt.to_dict()
+        definitions["planar_speed"]["edges"][0] = -999
+        marginals["action_class"]["walk"] = 999
+        self.assertEqual(rebuilt.to_dict(), before)
+        with self.assertRaises(TypeError):
+            rebuilt.bin_definitions["planar_speed"]["kind"] = "changed"
 
 
 if __name__ == "__main__":

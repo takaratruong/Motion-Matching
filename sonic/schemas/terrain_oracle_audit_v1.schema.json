@@ -9,6 +9,7 @@
     "clip_id",
     "frame_count",
     "source_sha256",
+    "clip_sha256",
     "model_sha256",
     "terrain_sha256",
     "status",
@@ -30,6 +31,9 @@
       "minimum": 2
     },
     "source_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "clip_sha256": {
       "$ref": "#/$defs/sha256"
     },
     "model_sha256": {

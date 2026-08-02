@@ -25,7 +25,7 @@ from .contact import (
     CONTACT_RECONSTRUCTION_TAG,
     CanonicalMeshQuery,
 )
-from .storage import ClipRecord, _clip_arrays, _deterministic_npz_bytes
+from .storage import ClipRecord, clip_digest
 
 
 SCHEMA = "terrain-oracle-coverage/v1"
@@ -40,6 +40,17 @@ AXES = (
     "duration", "action_class",
 )
 SPLIT_PROPORTIONS = (0.8, 0.1, 0.1)
+DIRECTION_SPEED_THRESHOLD_M_S = 0.1
+_NONE_NUMERIC_AXES = frozenset(
+    (
+        "movement_facing_offset",
+        "step_forward",
+        "step_lateral",
+        "step_vertical",
+        "contact_yaw",
+        "swing_clearance",
+    )
+)
 _NUMERIC_EDGES = {
     "movement_facing_offset": (-math.pi, -2.35619449, -1.57079633, -0.78539816, 0.0, 0.78539816, 1.57079633, 2.35619449, math.pi),
     "planar_speed": (0.0, 0.1, 0.3, 0.6, 1.0, 1.5, 2.5),
@@ -54,17 +65,22 @@ _NUMERIC_EDGES = {
 _CATEGORIES = {
     "transition": ("start", "steady", "stop", "reverse"),
     "support_phase": ("flight", "single", "double"),
-    "support_leg": ("none", "left", "right", "both"),
+    "support_leg": ("none", "left", "right"),
     "surface_normal": tuple(
         f"{tilt}:{azimuth}"
         for tilt in ("flat", "moderate", "steep", "overhang")
         for azimuth in ("level", "forward", "left", "backward", "right")
-    ),
+    ) + ("none",),
     "action_class": ACTION_CLASSES,
 }
 _SHA_CHARS = frozenset("0123456789abcdef")
 _AT_FDCWD = -100
 _RENAME_NOREPLACE = 1
+ADJACENCY_RULE = (
+    "Two cells are adjacent iff exactly one numeric axis differs by one "
+    "published ordered category rank; none is nonordered; all categorical "
+    "axes and other numeric axes are equal."
+)
 
 
 def _sha(value: object, label: str) -> str:
@@ -150,7 +166,8 @@ class AcceptedClipRecord:
             raise ContractError("accepted intervals must exactly equal reviewed audit intervals")
         object.__setattr__(self, "accepted_intervals", intervals)
         clip = self.clip
-        record = self.clip_record
+        record = ClipRecord.from_dict(self.clip_record.to_dict())
+        object.__setattr__(self, "clip_record", record)
         audit = self.audit
         if (
             record.clip_id != clip.clip_id
@@ -161,9 +178,9 @@ class AcceptedClipRecord:
             or audit.model_sha256 != self.model_sha256
         ):
             raise ContractError("clip, artifact, source, model, or frame identities mismatch")
-        actual_artifact = hashlib.sha256(_deterministic_npz_bytes(_clip_arrays(clip))).hexdigest()
-        if record.sha256 != actual_artifact:
-            raise ContractError("ClipRecord digest does not bind the validated CanonicalClip")
+        actual_artifact = clip_digest(clip)
+        if record.sha256 != actual_artifact or audit.clip_sha256 != actual_artifact:
+            raise ContractError("audit and ClipRecord digest must bind the exact CanonicalClip")
         if audit.status == "rejected" or not intervals:
             raise ContractError("rejected or unreviewed clips cannot enter coverage")
         if (
@@ -241,8 +258,62 @@ class Deduplication:
     duplicate_clips_by_digest: Mapping[str, tuple[str, ...]]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "semantic_digest_by_clip", MappingProxyType(dict(self.semantic_digest_by_clip)))
-        object.__setattr__(self, "duplicate_clips_by_digest", MappingProxyType(dict(self.duplicate_clips_by_digest)))
+        records = tuple(self.unique_records)
+        if any(not isinstance(record, AcceptedClipRecord) for record in records):
+            raise ContractError("unique_records must contain AcceptedClipRecord values")
+        record_digests = tuple(_semantic_digest(record) for record in records)
+        if (
+            record_digests != tuple(sorted(record_digests))
+            or len(set(record_digests)) != len(record_digests)
+        ):
+            raise ContractError("unique_records must be sorted unique semantic records")
+        semantic = dict(self.semantic_digest_by_clip)
+        duplicates = {
+            _sha(digest, "semantic digest"): tuple(clip_ids)
+            for digest, clip_ids in dict(self.duplicate_clips_by_digest).items()
+        }
+        for clip_id, digest in semantic.items():
+            _text(clip_id, "clip ID")
+            _sha(digest, "semantic digest")
+        if any(
+            not values
+            or tuple(sorted(values)) != values
+            or len(values) != len(set(values))
+            or any(type(value) is not str or not value for value in values)
+            for values in duplicates.values()
+        ):
+            raise ContractError("duplicate clip groups must be sorted unique nonempty tuples")
+        if (
+            set(duplicates) != set(record_digests)
+            or set(semantic) != {
+                clip_id for values in duplicates.values() for clip_id in values
+            }
+            or any(
+                semantic.get(clip_id) != digest
+                for digest, values in duplicates.items()
+                for clip_id in values
+            )
+            or any(
+                record.clip.clip_id not in duplicates[digest]
+                for record, digest in zip(records, record_digests)
+            )
+        ):
+            raise ContractError("deduplication maps do not match unique records")
+        object.__setattr__(self, "unique_records", records)
+        object.__setattr__(self, "semantic_digest_by_clip", MappingProxyType(semantic))
+        object.__setattr__(self, "duplicate_clips_by_digest", MappingProxyType(duplicates))
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "unique_clip_ids": [record.clip.clip_id for record in self.unique_records],
+            "semantic_digest_by_clip": dict(
+                sorted(self.semantic_digest_by_clip.items())
+            ),
+            "duplicate_clips_by_digest": {
+                digest: list(self.duplicate_clips_by_digest[digest])
+                for digest in sorted(self.duplicate_clips_by_digest)
+            },
+        }
 
 
 def deduplicate(records: Sequence[AcceptedClipRecord]) -> Deduplication:
@@ -313,10 +384,6 @@ def _groups(records: Sequence[AcceptedClipRecord]) -> tuple[dict[str, str], dict
             ("source", record.clip.source.source_sha256),
             ("terrain", record.clip.terrain.asset_sha256),
         ]
-        lineage = record.clip.mirror_of or (
-            clip_id[:-10] if clip_id.endswith("__mirror") else clip_id
-        )
-        keys.append(("mirror", lineage))
         if record.procedural_family_id is not None:
             keys.append(("procedural", record.procedural_family_id))
         for key in keys:
@@ -324,6 +391,22 @@ def _groups(records: Sequence[AcceptedClipRecord]) -> tuple[dict[str, str], dict
     for members in buckets.values():
         for member in members[1:]:
             uf.union(members[0], member)
+    for clip_id in ids:
+        record = by_id[clip_id]
+        lineage = record.clip.mirror_of
+        if lineage is None:
+            if clip_id.endswith("__mirror"):
+                raise ContractError("reserved mirror suffix requires explicit mirror_of lineage")
+            continue
+        if (
+            clip_id != f"{lineage}__mirror"
+            or lineage.endswith("__mirror")
+            or lineage not in by_id
+            or by_id[lineage].clip.mirror_of is not None
+            or by_id[lineage].clip.clip_id.endswith("__mirror")
+        ):
+            raise ContractError("mirror_of must name a present valid original record")
+        uf.union(clip_id, lineage)
     components: dict[str, list[str]] = {}
     for clip_id in ids:
         components.setdefault(uf.find(clip_id), []).append(clip_id)
@@ -347,8 +430,23 @@ class SplitManifest:
     group_ids: Mapping[str, str]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "assignments", MappingProxyType(dict(self.assignments)))
-        object.__setattr__(self, "group_ids", MappingProxyType(dict(self.group_ids)))
+        _text(self.seed, "seed")
+        _text(self.rule, "split rule")
+        proportions = tuple(self.proportions)
+        if proportions != SPLIT_PROPORTIONS:
+            raise ContractError("split proportions must equal the published v1 boundaries")
+        assignments = dict(self.assignments)
+        groups = dict(self.group_ids)
+        if set(assignments) != set(groups):
+            raise ContractError("split assignments and group IDs must cover identical clips")
+        for clip_id in assignments:
+            _text(clip_id, "clip ID")
+            if assignments[clip_id] not in ("train", "validation", "test"):
+                raise ContractError("unknown split assignment")
+            _sha(groups[clip_id], "split group ID")
+        object.__setattr__(self, "proportions", proportions)
+        object.__setattr__(self, "assignments", MappingProxyType(assignments))
+        object.__setattr__(self, "group_ids", MappingProxyType(groups))
 
     def __getitem__(self, clip_id: str) -> str:
         return self.assignments[clip_id]
@@ -407,6 +505,33 @@ def _surface_category(normal: np.ndarray) -> str:
     return f"{tilt_name}:{azimuth}"
 
 
+def _support_surface(
+    query: CanonicalMeshQuery, probes: np.ndarray
+) -> tuple[str, float | None]:
+    surface = query.query(np.asarray(probes, dtype=np.float64))
+    ray_distance = np.asarray(surface.downward_ray_distance_m, dtype=np.float64)
+    ray_normal = np.asarray(surface.downward_ray_normal_world, dtype=np.float64)
+    ray_valid = (
+        (np.asarray(surface.downward_ray_face_index) >= 0)
+        & np.isfinite(ray_distance)
+        & (ray_normal[:, 2] >= 0.5)
+    )
+    if np.any(ray_valid):
+        candidates = np.flatnonzero(ray_valid)
+        selected = int(candidates[np.argmin(ray_distance[candidates])])
+        return _surface_category(ray_normal[selected]), float(ray_distance[selected])
+    closest_distance = np.asarray(surface.distance_m, dtype=np.float64)
+    closest_normal = np.asarray(surface.surface_normal_world, dtype=np.float64)
+    closest_valid = closest_normal[:, 2] >= 0.5
+    if np.any(closest_valid):
+        candidates = np.flatnonzero(closest_valid)
+        selected = int(candidates[np.argmin(closest_distance[candidates])])
+        return _surface_category(closest_normal[selected]), float(
+            closest_distance[selected]
+        )
+    return "none", None
+
+
 def _definitions() -> dict[str, object]:
     result: dict[str, object] = {}
     for axis in AXES:
@@ -414,21 +539,38 @@ def _definitions() -> dict[str, object]:
             edges = _NUMERIC_EDGES[axis]
             labels = [_number_label(edges[0] - 1, edges)[0]]
             labels.extend(_number_label(edges[i], edges)[0] for i in range(len(edges)))
+            if axis in _NONE_NUMERIC_AXES:
+                labels.append("none")
             result[axis] = {"kind": "numeric", "edges": list(edges), "categories": labels, "boundary_rule": "half-open; exact edge enters bin beginning at that edge; final category is overflow"}
+            if axis == "movement_facing_offset":
+                result[axis]["direction_speed_threshold_m_s"] = DIRECTION_SPEED_THRESHOLD_M_S
         else:
             result[axis] = {"kind": "categorical", "categories": list(_CATEGORIES[axis])}
     return result
 
 
 def _freeze_definitions(value: Mapping[str, object]) -> Mapping[str, object]:
+    if not isinstance(value, Mapping) or tuple(value) != AXES:
+        raise ContractError("bin definition axes/order do not match v1")
     frozen = {}
-    for axis in AXES:
-        raw = value[axis]
-        item = {"kind": raw["kind"], "categories": tuple(raw["categories"])}
-        if raw["kind"] == "numeric":
-            item["edges"] = tuple(float(edge) for edge in raw["edges"])
-            item["boundary_rule"] = raw["boundary_rule"]
-        frozen[axis] = MappingProxyType(item)
+    try:
+        for axis in AXES:
+            raw = value[axis]
+            if not isinstance(raw, Mapping):
+                raise ContractError("each bin definition must be a mapping")
+            item = {"kind": raw["kind"], "categories": tuple(raw["categories"])}
+            if raw["kind"] == "numeric":
+                item["edges"] = tuple(float(edge) for edge in raw["edges"])
+                item["boundary_rule"] = raw["boundary_rule"]
+                if axis == "movement_facing_offset":
+                    item["direction_speed_threshold_m_s"] = float(
+                        raw["direction_speed_threshold_m_s"]
+                    )
+            frozen[axis] = MappingProxyType(item)
+    except ContractError:
+        raise
+    except (KeyError, TypeError, ValueError) as error:
+        raise ContractError("invalid bin definitions") from error
     return MappingProxyType(frozen)
 
 
@@ -440,8 +582,90 @@ def _plain_definitions(value: Mapping[str, object]) -> dict[str, object]:
         if raw["kind"] == "numeric":
             item["edges"] = list(raw["edges"])
             item["boundary_rule"] = raw["boundary_rule"]
+            if axis == "movement_facing_offset":
+                item["direction_speed_threshold_m_s"] = raw[
+                    "direction_speed_threshold_m_s"
+                ]
         result[axis] = item
     return result
+
+
+@dataclass(frozen=True)
+class CoverageContribution:
+    contribution_id: str
+    semantic_digest: str
+    source_sha256: str
+    dedup_group_id: str
+    clip_sha256: str
+    accepted_interval: tuple[int, int]
+
+    def __post_init__(self) -> None:
+        for name in (
+            "contribution_id",
+            "semantic_digest",
+            "source_sha256",
+            "dedup_group_id",
+            "clip_sha256",
+        ):
+            _sha(getattr(self, name), name)
+        interval = tuple(self.accepted_interval)
+        if (
+            len(interval) != 2
+            or type(interval[0]) is not int
+            or type(interval[1]) is not int
+            or not 0 <= interval[0] < interval[1]
+        ):
+            raise ContractError("contribution accepted_interval must be half-open")
+        object.__setattr__(self, "accepted_interval", interval)
+        if self.contribution_id != _contribution_id(
+            self.semantic_digest, self.dedup_group_id, interval
+        ):
+            raise ContractError("contribution_id does not match its semantic evidence")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "contribution_id": self.contribution_id,
+            "semantic_digest": self.semantic_digest,
+            "source_sha256": self.source_sha256,
+            "dedup_group_id": self.dedup_group_id,
+            "clip_sha256": self.clip_sha256,
+            "accepted_interval": list(self.accepted_interval),
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> "CoverageContribution":
+        expected = {
+            "contribution_id", "semantic_digest", "source_sha256",
+            "dedup_group_id", "clip_sha256", "accepted_interval",
+        }
+        if not isinstance(value, dict) or set(value) != expected:
+            raise ContractError("coverage contribution fields do not match v1")
+        try:
+            return cls(
+                value["contribution_id"],
+                value["semantic_digest"],
+                value["source_sha256"],
+                value["dedup_group_id"],
+                value["clip_sha256"],
+                tuple(value["accepted_interval"]),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ContractError("invalid coverage contribution") from error
+
+
+def _contribution_id(
+    semantic_digest: str, dedup_group_id: str, interval: tuple[int, int]
+) -> str:
+    return hashlib.sha256(
+        _json_bytes(
+            {
+                "schema": "terrain-oracle-coverage-contribution/v1",
+                "semantic_digest": semantic_digest,
+                "dedup_group_id": dedup_group_id,
+                "accepted_interval": list(interval),
+            }
+        )
+    ).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -452,6 +676,41 @@ class CoverageCell:
     dedup_group_ids: tuple[str, ...]
     contribution_count: int
     intervals: tuple[tuple[int, int], ...]
+    contributions: tuple[CoverageContribution, ...]
+
+    def __post_init__(self) -> None:
+        _sha(self.cell_id, "cell_id")
+        coordinates = tuple(self.coordinates)
+        if (
+            len(coordinates) != len(AXES)
+            or any(type(value) is not str or not value for value in coordinates)
+            or self.cell_id != _cell_id(coordinates)
+        ):
+            raise ContractError("coverage cell coordinates/id mismatch")
+        contributions = tuple(self.contributions)
+        if (
+            any(not isinstance(item, CoverageContribution) for item in contributions)
+            or not contributions
+            or tuple(item.contribution_id for item in contributions)
+            != tuple(sorted(item.contribution_id for item in contributions))
+            or len({item.contribution_id for item in contributions}) != len(contributions)
+        ):
+            raise ContractError("cell contributions must be sorted unique evidence")
+        sources = tuple(sorted({item.source_sha256 for item in contributions}))
+        groups = tuple(sorted({item.dedup_group_id for item in contributions}))
+        intervals = tuple(sorted({item.accepted_interval for item in contributions}))
+        if (
+            tuple(self.source_ids) != sources
+            or tuple(self.dedup_group_ids) != groups
+            or tuple(tuple(value) for value in self.intervals) != intervals
+            or self.contribution_count != len(contributions)
+        ):
+            raise ContractError("cell aggregates do not match contribution evidence")
+        object.__setattr__(self, "coordinates", coordinates)
+        object.__setattr__(self, "source_ids", sources)
+        object.__setattr__(self, "dedup_group_ids", groups)
+        object.__setattr__(self, "intervals", intervals)
+        object.__setattr__(self, "contributions", contributions)
 
     @property
     def interval(self) -> tuple[int, int]:
@@ -464,7 +723,35 @@ class CoverageCell:
             "source_ids": list(self.source_ids), "dedup_group_ids": list(self.dedup_group_ids),
             "contribution_count": self.contribution_count,
             "intervals": [list(value) for value in self.intervals],
+            "contributions": [value.to_dict() for value in self.contributions],
         }
+
+    @classmethod
+    def from_dict(cls, value: object) -> "CoverageCell":
+        expected = {
+            "cell_id", "coordinates", "source_ids", "dedup_group_ids",
+            "contribution_count", "intervals", "contributions",
+        }
+        if not isinstance(value, dict) or set(value) != expected:
+            raise ContractError("coverage cell fields do not match v1")
+        coordinates = value["coordinates"]
+        if not isinstance(coordinates, dict) or tuple(coordinates) != AXES:
+            raise ContractError("coverage cell coordinate axes/order do not match v1")
+        try:
+            return cls(
+                value["cell_id"],
+                tuple(coordinates[axis] for axis in AXES),
+                tuple(value["source_ids"]),
+                tuple(value["dedup_group_ids"]),
+                value["contribution_count"],
+                tuple(tuple(interval) for interval in value["intervals"]),
+                tuple(
+                    CoverageContribution.from_dict(item)
+                    for item in value["contributions"]
+                ),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ContractError("invalid coverage cell") from error
 
 
 def _cell_id(coordinates: tuple[str, ...]) -> str:
@@ -496,17 +783,18 @@ def _interval_coordinates(record: AcceptedClipRecord, interval: AuditInterval):
             transition[i] = "reverse"
     contact = np.asarray(clip.contact[start:end]) >= 0.5
     support_phase = np.where(np.sum(contact, axis=1) == 0, "flight", np.where(np.sum(contact, axis=1) == 2, "double", "single"))
-    support_leg = np.array([
-        "both" if left and right else ("left" if left else ("right" if right else "none"))
-        for left, right in contact
-    ], dtype=object)
     sole = np.asarray(clip.sole_position_world[start:end], np.float64)
-    surface = record.terrain_query.query(sole.reshape((-1, 3)))
-    clearance = np.asarray(surface.distance_m).reshape((count, 2))
-    root_surface = record.terrain_query.query(position)
-    normals = np.asarray(root_surface.surface_normal_world)
-    sole_yaw = _yaw(np.asarray(clip.sole_quaternion_world_wxyz[start:end, 0]))
-    step = np.full((count, 3), np.nan)
+    heel = np.asarray(clip.heel_position_world[start:end], np.float64)
+    toe = np.asarray(clip.toe_position_world[start:end], np.float64)
+    probes = np.stack((sole, heel, toe), axis=2)
+    sole_yaw = np.stack(
+        (
+            _yaw(np.asarray(clip.sole_quaternion_world_wxyz[start:end, 0])),
+            _yaw(np.asarray(clip.sole_quaternion_world_wxyz[start:end, 1])),
+        ),
+        axis=1,
+    )
+    step = np.full((count, 2, 3), np.nan)
     last_touchdown: list[np.ndarray | None] = [None, None]
     for i in range(count):
         for leg in range(2):
@@ -515,26 +803,74 @@ def _interval_coordinates(record: AcceptedClipRecord, interval: AuditInterval):
                 if last_touchdown[leg] is not None:
                     delta = sole[i, leg] - last_touchdown[leg]
                     c, s = math.cos(-facing[i]), math.sin(-facing[i])
-                    step[i] = (c * delta[0] - s * delta[1], s * delta[0] + c * delta[1], delta[2])
+                    step[i, leg] = (
+                        c * delta[0] - s * delta[1],
+                        s * delta[0] + c * delta[1],
+                        delta[2],
+                    )
                 last_touchdown[leg] = sole[i, leg].copy()
     duration = count / clip.fps
     for i in range(count):
-        values: list[str] = []
-        for axis, scalar in (
-            ("movement_facing_offset", offset[i]), ("planar_speed", speed[i]),
-            ("yaw_rate", yaw_rate[i]),
-        ):
-            values.append(_number_label(float(scalar), _NUMERIC_EDGES[axis])[0])
-        values.extend((str(transition[i]), str(support_phase[i]), str(support_leg[i])))
-        for index, axis in enumerate(("step_forward", "step_lateral", "step_vertical")):
-            values.append("none" if np.isnan(step[i, index]) else _number_label(float(step[i, index]), _NUMERIC_EDGES[axis])[0])
-        values.append(_surface_category(normals[i]))
-        values.append(_number_label(float(sole_yaw[i]), _NUMERIC_EDGES["contact_yaw"])[0] if np.any(contact[i]) else "none")
-        swing = clearance[i, ~contact[i]]
-        values.append(_number_label(float(np.max(swing)) if len(swing) else 0.0, _NUMERIC_EDGES["swing_clearance"])[0])
-        values.append(_number_label(duration, _NUMERIC_EDGES["duration"])[0])
-        values.append(record.action_class)
-        yield tuple(values)
+        contacting = tuple(int(leg) for leg in np.flatnonzero(contact[i]))
+        contribution_legs: tuple[int | None, ...] = contacting or (None,)
+        swing_clearance = "none"
+        if len(contacting) == 1:
+            swing_leg = 1 - contacting[0]
+            _surface, clearance = _support_surface(
+                record.terrain_query, probes[i, swing_leg]
+            )
+            if clearance is not None:
+                swing_clearance = _number_label(
+                    clearance, _NUMERIC_EDGES["swing_clearance"]
+                )[0]
+        for leg in contribution_legs:
+            values: list[str] = [
+                (
+                    "none"
+                    if speed[i] < DIRECTION_SPEED_THRESHOLD_M_S
+                    else _number_label(
+                        float(offset[i]), _NUMERIC_EDGES["movement_facing_offset"]
+                    )[0]
+                ),
+                _number_label(float(speed[i]), _NUMERIC_EDGES["planar_speed"])[0],
+                _number_label(float(yaw_rate[i]), _NUMERIC_EDGES["yaw_rate"])[0],
+                str(transition[i]),
+                str(support_phase[i]),
+                "none" if leg is None else ("left" if leg == 0 else "right"),
+            ]
+            for component, axis in enumerate(
+                ("step_forward", "step_lateral", "step_vertical")
+            ):
+                values.append(
+                    "none"
+                    if leg is None or np.isnan(step[i, leg, component])
+                    else _number_label(
+                        float(step[i, leg, component]), _NUMERIC_EDGES[axis]
+                    )[0]
+                )
+            if leg is None:
+                values.extend(("none", "none"))
+            else:
+                surface_normal, _clearance = _support_surface(
+                    record.terrain_query, probes[i, leg]
+                )
+                values.append(surface_normal)
+                contact_angle = (
+                    float(sole_yaw[i, leg]) + math.pi
+                ) % (2 * math.pi) - math.pi
+                values.append(
+                    _number_label(
+                        contact_angle, _NUMERIC_EDGES["contact_yaw"]
+                    )[0]
+                )
+            values.extend(
+                (
+                    swing_clearance,
+                    _number_label(duration, _NUMERIC_EDGES["duration"])[0],
+                    record.action_class,
+                )
+            )
+            yield tuple(values)
 
 
 def _adjacent(left: tuple[str, ...], right: tuple[str, ...], definitions: Mapping[str, object]) -> bool:
@@ -545,10 +881,52 @@ def _adjacent(left: tuple[str, ...], right: tuple[str, ...], definitions: Mappin
     axis = AXES[index]
     if definitions[axis]["kind"] != "numeric":
         return False
+    if left[index] == "none" or right[index] == "none":
+        return False
     categories = definitions[axis]["categories"]
     if left[index] not in categories or right[index] not in categories:
         return False
     return abs(categories.index(left[index]) - categories.index(right[index])) == 1
+
+
+def _derived_marginals(
+    cells: tuple[CoverageCell, ...]
+) -> dict[str, dict[str, int]]:
+    evidence: dict[tuple[str, str], set[str]] = {}
+    for cell in cells:
+        contribution_ids = {item.contribution_id for item in cell.contributions}
+        for axis, category in zip(AXES, cell.coordinates):
+            evidence.setdefault((axis, category), set()).update(contribution_ids)
+    result: dict[str, dict[str, int]] = {axis: {} for axis in AXES}
+    for (axis, category), identifiers in sorted(evidence.items()):
+        result[axis][category] = len(identifiers)
+    return result
+
+
+def _derived_components(
+    cells: tuple[CoverageCell, ...], definitions: Mapping[str, object]
+) -> tuple[tuple[str, ...], ...]:
+    by_id = {cell.cell_id: cell for cell in cells}
+    remaining = set(by_id)
+    components: list[tuple[str, ...]] = []
+    while remaining:
+        queue = [min(remaining)]
+        component: set[str] = set()
+        while queue:
+            current = queue.pop(0)
+            if current in component:
+                continue
+            component.add(current)
+            for candidate in sorted(remaining - component):
+                if _adjacent(
+                    by_id[current].coordinates,
+                    by_id[candidate].coordinates,
+                    definitions,
+                ):
+                    queue.append(candidate)
+        remaining -= component
+        components.append(tuple(sorted(component)))
+    return tuple(sorted(components))
 
 
 @dataclass(frozen=True)
@@ -564,9 +942,37 @@ class CoverageManifest:
     def __post_init__(self) -> None:
         if self.schema != SCHEMA:
             raise ContractError("unknown coverage schema")
+        if self.adjacency_rule != ADJACENCY_RULE:
+            raise ContractError("adjacency rule does not equal the published v1 rule")
         _sha(self.content_sha256, "content_sha256")
-        object.__setattr__(self, "bin_definitions", _freeze_definitions(self.bin_definitions))
-        object.__setattr__(self, "marginal_counts", MappingProxyType({k: MappingProxyType(dict(v)) for k, v in self.marginal_counts.items()}))
+        definitions = _freeze_definitions(self.bin_definitions)
+        if _plain_definitions(definitions) != _definitions():
+            raise ContractError("bin definitions do not equal the published v1 atlas")
+        cells = tuple(self.occupied_cells)
+        if (
+            any(not isinstance(cell, CoverageCell) for cell in cells)
+            or tuple(cell.cell_id for cell in cells)
+            != tuple(sorted(cell.cell_id for cell in cells))
+            or len({cell.cell_id for cell in cells}) != len(cells)
+        ):
+            raise ContractError("occupied cells must be canonically sorted and unique")
+        for cell in cells:
+            for axis, category in zip(AXES, cell.coordinates):
+                if category not in definitions[axis]["categories"]:
+                    raise ContractError("cell coordinate is outside published categories")
+        marginal = {
+            axis: dict(self.marginal_counts[axis])
+            for axis in AXES
+        } if isinstance(self.marginal_counts, Mapping) and set(self.marginal_counts) == set(AXES) else None
+        if marginal is None or marginal != _derived_marginals(cells):
+            raise ContractError("marginal counts do not match contribution evidence")
+        components = tuple(tuple(component) for component in self.connected_components)
+        if components != _derived_components(cells, definitions):
+            raise ContractError("connected components do not match deterministic adjacency")
+        object.__setattr__(self, "bin_definitions", definitions)
+        object.__setattr__(self, "marginal_counts", MappingProxyType({axis: MappingProxyType(dict(sorted(marginal[axis].items()))) for axis in AXES}))
+        object.__setattr__(self, "occupied_cells", cells)
+        object.__setattr__(self, "connected_components", components)
         expected = hashlib.sha256(_json_bytes(self._dict_without_hash())).hexdigest()
         if self.content_sha256 != expected:
             raise ContractError("coverage content hash mismatch")
@@ -598,82 +1004,62 @@ class CoverageManifest:
             raise ContractError("coverage document fields do not match schema")
         if tuple(value["bin_definitions"]) != AXES or tuple(value["marginal_counts"]) != AXES:
             raise ContractError("coverage axes/order do not match v1")
-        cells = []
-        ids = set()
-        for raw in value["occupied_cells"]:
-            if not isinstance(raw, dict) or set(raw) != {"cell_id", "coordinates", "source_ids", "dedup_group_ids", "contribution_count", "intervals"}:
-                raise ContractError("invalid occupied cell fields")
-            coordinates = tuple(raw["coordinates"].get(axis) for axis in AXES)
-            if set(raw["coordinates"]) != set(AXES) or _cell_id(coordinates) != raw["cell_id"]:
-                raise ContractError("occupied cell coordinates/id mismatch")
-            if raw["cell_id"] in ids:
-                raise ContractError("duplicate occupied cell")
-            ids.add(raw["cell_id"])
-            cells.append(CoverageCell(raw["cell_id"], coordinates, tuple(raw["source_ids"]), tuple(raw["dedup_group_ids"]), raw["contribution_count"], tuple(tuple(x) for x in raw["intervals"])))
-        if [cell.cell_id for cell in cells] != sorted(ids):
-            raise ContractError("occupied cells must be canonically sorted")
-        components = tuple(tuple(component) for component in value["connected_components"])
-        flattened = [cell for component in components for cell in component]
-        if sorted(flattened) != sorted(ids) or len(flattened) != len(set(flattened)):
-            raise ContractError("connected components must partition occupied cells")
-        return cls(value["schema"], value["adjacency_rule"], value["bin_definitions"], value["marginal_counts"], tuple(cells), components, value["content_sha256"])
+        try:
+            cells = tuple(CoverageCell.from_dict(raw) for raw in value["occupied_cells"])
+            components = tuple(tuple(component) for component in value["connected_components"])
+            return cls(value["schema"], value["adjacency_rule"], value["bin_definitions"], value["marginal_counts"], cells, components, value["content_sha256"])
+        except ContractError:
+            raise
+        except (KeyError, TypeError, ValueError) as error:
+            raise ContractError("invalid coverage manifest") from error
 
 
 def build_coverage(records: Sequence[AcceptedClipRecord]) -> CoverageManifest:
     deduped = deduplicate(records)
     _, semantic_groups = _groups(records)
     definitions = _definitions()
-    contributions: dict[tuple[str, ...], set[tuple[str, int]]] = {}
-    intervals_by_cell: dict[tuple[str, ...], set[tuple[int, int]]] = {}
-    sources_by_cell: dict[tuple[str, ...], set[str]] = {}
-    groups_by_cell: dict[tuple[str, ...], set[str]] = {}
+    contributions: dict[
+        tuple[str, ...], dict[str, CoverageContribution]
+    ] = {}
     for record in deduped.unique_records:
         semantic = _semantic_digest(record)
-        for interval_index, interval in enumerate(record.accepted_intervals):
+        group = semantic_groups[semantic]
+        for interval in record.accepted_intervals:
+            interval_tuple = tuple(interval)
+            contribution = CoverageContribution(
+                _contribution_id(semantic, group, interval_tuple),
+                semantic,
+                record.clip.source.source_sha256,
+                group,
+                record.clip_record.sha256,
+                interval_tuple,
+            )
             for coordinates in _interval_coordinates(record, interval):
-                contributions.setdefault(coordinates, set()).add((semantic, interval_index))
-                intervals_by_cell.setdefault(coordinates, set()).add(tuple(interval))
-                sources_by_cell.setdefault(coordinates, set()).add(semantic)
-                groups_by_cell.setdefault(coordinates, set()).add(semantic_groups[semantic])
+                existing = contributions.setdefault(coordinates, {}).get(
+                    contribution.contribution_id
+                )
+                if existing is not None and existing != contribution:
+                    raise ContractError("density-equivalent contribution evidence conflicts")
+                contributions[coordinates][contribution.contribution_id] = contribution
     cells = tuple(sorted((
-        CoverageCell(
-            _cell_id(coordinates), coordinates,
-            tuple(sorted(sources_by_cell[coordinates])),
-            tuple(sorted(groups_by_cell[coordinates])),
-            len(contributions[coordinates]),
-            tuple(sorted(intervals_by_cell[coordinates])),
-        )
+        (
+            lambda evidence: CoverageCell(
+                _cell_id(coordinates),
+                coordinates,
+                tuple(sorted({item.source_sha256 for item in evidence})),
+                tuple(sorted({item.dedup_group_id for item in evidence})),
+                len(evidence),
+                tuple(sorted({item.accepted_interval for item in evidence})),
+                evidence,
+            )
+        )(tuple(contributions[coordinates][key] for key in sorted(contributions[coordinates])))
         for coordinates in contributions
     ), key=lambda cell: cell.cell_id))
-    marginal: dict[str, dict[str, int]] = {axis: {} for axis in AXES}
-    marginal_seen: dict[tuple[str, str], set[tuple[str, int]]] = {}
-    for coordinates, contribution_set in contributions.items():
-        for axis, category in zip(AXES, coordinates):
-            marginal_seen.setdefault((axis, category), set()).update(contribution_set)
-    for (axis, category), values in sorted(marginal_seen.items()):
-        marginal[axis][category] = len(values)
-    remaining = {cell.cell_id: cell for cell in cells}
-    components: list[tuple[str, ...]] = []
-    while remaining:
-        seed = min(remaining)
-        queue = [seed]
-        component = set()
-        while queue:
-            current = queue.pop(0)
-            if current in component:
-                continue
-            component.add(current)
-            left = remaining[current].coordinates
-            for candidate in sorted(remaining):
-                if candidate not in component and _adjacent(left, remaining[candidate].coordinates, definitions):
-                    queue.append(candidate)
-        for item in component:
-            remaining.pop(item)
-        components.append(tuple(sorted(component)))
-    components.sort()
+    marginal = _derived_marginals(cells)
+    components = _derived_components(cells, definitions)
     without_hash = {
         "schema": SCHEMA,
-        "adjacency_rule": "Two cells are adjacent iff exactly one numeric axis differs by one published category rank; all categorical axes and other numeric axes are equal.",
+        "adjacency_rule": ADJACENCY_RULE,
         "bin_definitions": definitions,
         "marginal_counts": marginal,
         "occupied_cells": [cell.to_dict() for cell in cells],
@@ -682,7 +1068,7 @@ def build_coverage(records: Sequence[AcceptedClipRecord]) -> CoverageManifest:
     content_hash = hashlib.sha256(_json_bytes(without_hash)).hexdigest()
     return CoverageManifest(
         SCHEMA, without_hash["adjacency_rule"], definitions, marginal, cells,
-        tuple(components), content_hash,
+        components, content_hash,
     )
 
 
@@ -730,7 +1116,8 @@ def freeze_coverage(path: Path, manifest: CoverageManifest) -> None:
 
 
 __all__ = (
-    "ACTION_CLASSES", "AcceptedClipRecord", "CoverageCell", "CoverageManifest",
+    "ACTION_CLASSES", "AcceptedClipRecord", "CoverageCell",
+    "CoverageContribution", "CoverageManifest",
     "Deduplication", "SplitManifest", "assign_grouped_splits", "build_coverage",
     "deduplicate", "freeze_coverage",
 )

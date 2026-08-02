@@ -18,8 +18,7 @@
       "const": "terrain-oracle-coverage/v1"
     },
     "adjacency_rule": {
-      "type": "string",
-      "minLength": 1
+      "const": "Two cells are adjacent iff exactly one numeric axis differs by one published ordered category rank; none is nonordered; all categorical axes and other numeric axes are equal."
     },
     "bin_definitions": {
       "$ref": "#/$defs/axes_of_bin_definitions"
@@ -106,6 +105,9 @@
             },
             "boundary_rule": {
               "const": "half-open; exact edge enters bin beginning at that edge; final category is overflow"
+            },
+            "direction_speed_threshold_m_s": {
+              "const": 0.1
             }
           }
         },
@@ -153,20 +155,97 @@
         "action_class"
       ],
       "properties": {
-        "movement_facing_offset": {"$ref": "#/$defs/bin_definition"},
-        "planar_speed": {"$ref": "#/$defs/bin_definition"},
-        "yaw_rate": {"$ref": "#/$defs/bin_definition"},
-        "transition": {"$ref": "#/$defs/bin_definition"},
-        "support_phase": {"$ref": "#/$defs/bin_definition"},
-        "support_leg": {"$ref": "#/$defs/bin_definition"},
-        "step_forward": {"$ref": "#/$defs/bin_definition"},
-        "step_lateral": {"$ref": "#/$defs/bin_definition"},
-        "step_vertical": {"$ref": "#/$defs/bin_definition"},
-        "surface_normal": {"$ref": "#/$defs/bin_definition"},
-        "contact_yaw": {"$ref": "#/$defs/bin_definition"},
-        "swing_clearance": {"$ref": "#/$defs/bin_definition"},
-        "duration": {"$ref": "#/$defs/bin_definition"},
-        "action_class": {"$ref": "#/$defs/bin_definition"}
+        "movement_facing_offset": {
+          "const": {
+            "kind": "numeric",
+            "edges": [-3.141592653589793, -2.35619449, -1.57079633, -0.78539816, 0.0, 0.78539816, 1.57079633, 2.35619449, 3.141592653589793],
+            "categories": ["[-inf,-3.14159)", "[-3.14159,-2.35619)", "[-2.35619,-1.5708)", "[-1.5708,-0.785398)", "[-0.785398,0)", "[0,0.785398)", "[0.785398,1.5708)", "[1.5708,2.35619)", "[2.35619,3.14159)", "[3.14159,+inf)", "none"],
+            "boundary_rule": "half-open; exact edge enters bin beginning at that edge; final category is overflow",
+            "direction_speed_threshold_m_s": 0.1
+          }
+        },
+        "planar_speed": {
+          "const": {
+            "kind": "numeric",
+            "edges": [0.0, 0.1, 0.3, 0.6, 1.0, 1.5, 2.5],
+            "categories": ["[-inf,0)", "[0,0.1)", "[0.1,0.3)", "[0.3,0.6)", "[0.6,1)", "[1,1.5)", "[1.5,2.5)", "[2.5,+inf)"],
+            "boundary_rule": "half-open; exact edge enters bin beginning at that edge; final category is overflow"
+          }
+        },
+        "yaw_rate": {
+          "const": {
+            "kind": "numeric",
+            "edges": [-3.0, -1.5, -0.5, -0.1, 0.1, 0.5, 1.5, 3.0],
+            "categories": ["[-inf,-3)", "[-3,-1.5)", "[-1.5,-0.5)", "[-0.5,-0.1)", "[-0.1,0.1)", "[0.1,0.5)", "[0.5,1.5)", "[1.5,3)", "[3,+inf)"],
+            "boundary_rule": "half-open; exact edge enters bin beginning at that edge; final category is overflow"
+          }
+        },
+        "transition": {
+          "const": {"kind": "categorical", "categories": ["start", "steady", "stop", "reverse"]}
+        },
+        "support_phase": {
+          "const": {"kind": "categorical", "categories": ["flight", "single", "double"]}
+        },
+        "support_leg": {
+          "const": {"kind": "categorical", "categories": ["none", "left", "right"]}
+        },
+        "step_forward": {
+          "const": {
+            "kind": "numeric",
+            "edges": [-0.6, -0.2, -0.05, 0.05, 0.2, 0.6],
+            "categories": ["[-inf,-0.6)", "[-0.6,-0.2)", "[-0.2,-0.05)", "[-0.05,0.05)", "[0.05,0.2)", "[0.2,0.6)", "[0.6,+inf)", "none"],
+            "boundary_rule": "half-open; exact edge enters bin beginning at that edge; final category is overflow"
+          }
+        },
+        "step_lateral": {
+          "const": {
+            "kind": "numeric",
+            "edges": [-0.4, -0.15, -0.03, 0.03, 0.15, 0.4],
+            "categories": ["[-inf,-0.4)", "[-0.4,-0.15)", "[-0.15,-0.03)", "[-0.03,0.03)", "[0.03,0.15)", "[0.15,0.4)", "[0.4,+inf)", "none"],
+            "boundary_rule": "half-open; exact edge enters bin beginning at that edge; final category is overflow"
+          }
+        },
+        "step_vertical": {
+          "const": {
+            "kind": "numeric",
+            "edges": [-0.3, -0.08, -0.015, 0.015, 0.08, 0.3],
+            "categories": ["[-inf,-0.3)", "[-0.3,-0.08)", "[-0.08,-0.015)", "[-0.015,0.015)", "[0.015,0.08)", "[0.08,0.3)", "[0.3,+inf)", "none"],
+            "boundary_rule": "half-open; exact edge enters bin beginning at that edge; final category is overflow"
+          }
+        },
+        "surface_normal": {
+          "const": {
+            "kind": "categorical",
+            "categories": ["flat:level", "flat:forward", "flat:left", "flat:backward", "flat:right", "moderate:level", "moderate:forward", "moderate:left", "moderate:backward", "moderate:right", "steep:level", "steep:forward", "steep:left", "steep:backward", "steep:right", "overhang:level", "overhang:forward", "overhang:left", "overhang:backward", "overhang:right", "none"]
+          }
+        },
+        "contact_yaw": {
+          "const": {
+            "kind": "numeric",
+            "edges": [-3.141592653589793, -1.57079633, -0.39269908, 0.39269908, 1.57079633, 3.141592653589793],
+            "categories": ["[-inf,-3.14159)", "[-3.14159,-1.5708)", "[-1.5708,-0.392699)", "[-0.392699,0.392699)", "[0.392699,1.5708)", "[1.5708,3.14159)", "[3.14159,+inf)", "none"],
+            "boundary_rule": "half-open; exact edge enters bin beginning at that edge; final category is overflow"
+          }
+        },
+        "swing_clearance": {
+          "const": {
+            "kind": "numeric",
+            "edges": [0.0, 0.015, 0.04, 0.08, 0.16, 0.32],
+            "categories": ["[-inf,0)", "[0,0.015)", "[0.015,0.04)", "[0.04,0.08)", "[0.08,0.16)", "[0.16,0.32)", "[0.32,+inf)", "none"],
+            "boundary_rule": "half-open; exact edge enters bin beginning at that edge; final category is overflow"
+          }
+        },
+        "duration": {
+          "const": {
+            "kind": "numeric",
+            "edges": [0.0, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0],
+            "categories": ["[-inf,0)", "[0,0.2)", "[0.2,0.5)", "[0.5,1)", "[1,2)", "[2,5)", "[5,10)", "[10,+inf)"],
+            "boundary_rule": "half-open; exact edge enters bin beginning at that edge; final category is overflow"
+          }
+        },
+        "action_class": {
+          "const": {"kind": "categorical", "categories": ["walk", "run", "start", "stop", "reverse", "ascent", "descent", "turn", "sidestep", "other"]}
+        }
       }
     },
     "counts": {
@@ -235,19 +314,19 @@
         "action_class"
       ],
       "properties": {
-        "movement_facing_offset": {"type": "string", "minLength": 1},
-        "planar_speed": {"type": "string", "minLength": 1},
-        "yaw_rate": {"type": "string", "minLength": 1},
+        "movement_facing_offset": {"enum": ["[-inf,-3.14159)", "[-3.14159,-2.35619)", "[-2.35619,-1.5708)", "[-1.5708,-0.785398)", "[-0.785398,0)", "[0,0.785398)", "[0.785398,1.5708)", "[1.5708,2.35619)", "[2.35619,3.14159)", "[3.14159,+inf)", "none"]},
+        "planar_speed": {"enum": ["[-inf,0)", "[0,0.1)", "[0.1,0.3)", "[0.3,0.6)", "[0.6,1)", "[1,1.5)", "[1.5,2.5)", "[2.5,+inf)"]},
+        "yaw_rate": {"enum": ["[-inf,-3)", "[-3,-1.5)", "[-1.5,-0.5)", "[-0.5,-0.1)", "[-0.1,0.1)", "[0.1,0.5)", "[0.5,1.5)", "[1.5,3)", "[3,+inf)"]},
         "transition": {"enum": ["start", "steady", "stop", "reverse"]},
         "support_phase": {"enum": ["flight", "single", "double"]},
-        "support_leg": {"enum": ["none", "left", "right", "both"]},
-        "step_forward": {"type": "string", "minLength": 1},
-        "step_lateral": {"type": "string", "minLength": 1},
-        "step_vertical": {"type": "string", "minLength": 1},
-        "surface_normal": {"type": "string", "pattern": "^(flat|moderate|steep|overhang):(level|forward|left|backward|right)$"},
-        "contact_yaw": {"type": "string", "minLength": 1},
-        "swing_clearance": {"type": "string", "minLength": 1},
-        "duration": {"type": "string", "minLength": 1},
+        "support_leg": {"enum": ["none", "left", "right"]},
+        "step_forward": {"enum": ["[-inf,-0.6)", "[-0.6,-0.2)", "[-0.2,-0.05)", "[-0.05,0.05)", "[0.05,0.2)", "[0.2,0.6)", "[0.6,+inf)", "none"]},
+        "step_lateral": {"enum": ["[-inf,-0.4)", "[-0.4,-0.15)", "[-0.15,-0.03)", "[-0.03,0.03)", "[0.03,0.15)", "[0.15,0.4)", "[0.4,+inf)", "none"]},
+        "step_vertical": {"enum": ["[-inf,-0.3)", "[-0.3,-0.08)", "[-0.08,-0.015)", "[-0.015,0.015)", "[0.015,0.08)", "[0.08,0.3)", "[0.3,+inf)", "none"]},
+        "surface_normal": {"enum": ["flat:level", "flat:forward", "flat:left", "flat:backward", "flat:right", "moderate:level", "moderate:forward", "moderate:left", "moderate:backward", "moderate:right", "steep:level", "steep:forward", "steep:left", "steep:backward", "steep:right", "overhang:level", "overhang:forward", "overhang:left", "overhang:backward", "overhang:right", "none"]},
+        "contact_yaw": {"enum": ["[-inf,-3.14159)", "[-3.14159,-1.5708)", "[-1.5708,-0.392699)", "[-0.392699,0.392699)", "[0.392699,1.5708)", "[1.5708,3.14159)", "[3.14159,+inf)", "none"]},
+        "swing_clearance": {"enum": ["[-inf,0)", "[0,0.015)", "[0.015,0.04)", "[0.04,0.08)", "[0.08,0.16)", "[0.16,0.32)", "[0.32,+inf)", "none"]},
+        "duration": {"enum": ["[-inf,0)", "[0,0.2)", "[0.2,0.5)", "[0.5,1)", "[1,2)", "[2,5)", "[5,10)", "[10,+inf)"]},
         "action_class": {"enum": ["walk", "run", "start", "stop", "reverse", "ascent", "descent", "turn", "sidestep", "other"]}
       }
     },
@@ -270,7 +349,8 @@
         "source_ids",
         "dedup_group_ids",
         "contribution_count",
-        "intervals"
+        "intervals",
+        "contributions"
       ],
       "properties": {
         "cell_id": {"$ref": "#/$defs/sha256"},
@@ -296,7 +376,33 @@
           "minItems": 1,
           "uniqueItems": true,
           "items": {"$ref": "#/$defs/frame_interval"}
+        },
+        "contributions": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/contribution"}
         }
+      }
+    },
+    "contribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contribution_id",
+        "semantic_digest",
+        "source_sha256",
+        "dedup_group_id",
+        "clip_sha256",
+        "accepted_interval"
+      ],
+      "properties": {
+        "contribution_id": {"$ref": "#/$defs/sha256"},
+        "semantic_digest": {"$ref": "#/$defs/sha256"},
+        "source_sha256": {"$ref": "#/$defs/sha256"},
+        "dedup_group_id": {"$ref": "#/$defs/sha256"},
+        "clip_sha256": {"$ref": "#/$defs/sha256"},
+        "accepted_interval": {"$ref": "#/$defs/frame_interval"}
       }
     }
   }

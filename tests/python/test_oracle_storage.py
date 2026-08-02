@@ -14,6 +14,7 @@ from mm_sonic.terrain_oracle.canonical import CanonicalTerrainMesh, TerrainBindi
 from mm_sonic.terrain_oracle.math3d import RigidTransform
 from mm_sonic.terrain_oracle.storage import (
     MeshRecord,
+    clip_digest,
     load_corpus,
     publish_corpus,
     read_clip,
@@ -59,6 +60,21 @@ class OracleStorageTests(unittest.TestCase):
         )
         with self.assertRaises(FileExistsError):
             write_clip(self.root / "clips", clip)
+
+    def test_public_clip_digest_is_the_exact_write_clip_payload_authority(self):
+        """Catches audit and storage hashing different canonical payloads."""
+
+        clip = synthetic_canonical_clip(frames=8)
+        expected = clip_digest(clip)
+        record = write_clip(self.root / "clips", clip)
+
+        self.assertEqual(record.sha256, expected)
+        changed_contact = np.array(clip.contact, copy=True)
+        changed_contact[3, 1] = 1.0
+        self.assertNotEqual(
+            clip_digest(replace(clip, contact=changed_contact)),
+            expected,
+        )
 
     def test_clip_reader_rejects_an_artifact_with_a_mismatched_filename_digest(self):
         """Catches accepting NPZ bytes under a forged content-addressed name."""

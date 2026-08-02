@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, replace
 import json
+import os
 from pathlib import Path
+import subprocess
+import tempfile
 import time
 import unittest
 
@@ -13,6 +16,7 @@ import mm_sonic.terrain_oracle.audit as audit_module
 from mm_sonic.terrain_oracle.audit import (
     AuditReason,
     AuditThresholds,
+    ClipAudit,
     audit_clip,
     structural_model_sha256,
 )
@@ -25,6 +29,7 @@ from mm_sonic.terrain_oracle.canonical import (
 )
 from mm_sonic.terrain_oracle.contact import CanonicalMeshQuery
 from mm_sonic.terrain_oracle.math3d import RigidTransform
+from mm_sonic.terrain_oracle.storage import clip_digest
 from tests.python.terrain_oracle_test_utils import synthetic_canonical_clip
 
 
@@ -34,6 +39,80 @@ MODEL_PATH = Path(
 )
 LEFT_ANKLE = ISAACLAB_BODY_NAMES.index("left_ankle_roll_link")
 RIGHT_ANKLE = ISAACLAB_BODY_NAMES.index("right_ankle_roll_link")
+
+
+class AuditSchemaIsolationTests(unittest.TestCase):
+    def test_audit_schema_requires_exact_clip_artifact_digest_without_skips(self):
+        metrics = {
+            name: 0.0
+            for name in (
+                "max_joint_limit_violation_rad", "max_joint_speed_rad_s",
+                "max_quaternion_step_rad", "max_root_speed_m_s",
+                "min_root_height_m", "max_root_height_m",
+                "max_root_acceleration_m_s2", "max_root_angular_speed_rad_s",
+                "max_derivative_error", "max_contact_disagreement",
+                "max_incomplete_sole_fraction", "max_stance_skate_m",
+                "max_foot_penetration_m", "max_body_penetration_m",
+                "max_body_fk_position_error_m",
+                "max_body_fk_orientation_error_rad",
+            )
+        }
+        document = ClipAudit(
+            schema="terrain-oracle-audit/v1",
+            clip_id="schema-fixture",
+            frame_count=8,
+            source_sha256="1" * 64,
+            clip_sha256="2" * 64,
+            model_sha256="3" * 64,
+            terrain_sha256="4" * 64,
+            status="accepted",
+            accepted_intervals=((0, 8),),
+            thresholds=AuditThresholds().to_dict(),
+            metrics=metrics,
+            reasons=(),
+        ).to_dict()
+        validator_roots = sorted(
+            (
+                ROOT
+                / ".superpowers/sdd/2026-08-01-terrain-oracle-01-audited-corpus"
+            ).glob(".schema-validation.*")
+        )
+        self.assertTrue(validator_roots, "Task 2 isolated schema validator is missing")
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_path = Path(temporary)
+            good = temporary_path / "good.json"
+            bad = temporary_path / "bad.json"
+            good.write_text(json.dumps(document))
+            missing = dict(document)
+            missing.pop("clip_sha256")
+            uppercase = dict(document)
+            uppercase["clip_sha256"] = "A" * 64
+            bad.write_text(json.dumps((missing, uppercase)))
+            script = (
+                "import json,sys\n"
+                "from jsonschema import Draft202012Validator as V\n"
+                "s=json.load(open(sys.argv[1])); good=json.load(open(sys.argv[2])); bad=json.load(open(sys.argv[3]))\n"
+                "V.check_schema(s); v=V(s); v.validate(good)\n"
+                "assert all(list(v.iter_errors(item)) for item in bad)\n"
+            )
+            environment = dict(os.environ)
+            environment["PYTHONPATH"] = str(validator_roots[0])
+            completed = subprocess.run(
+                [
+                    "/move/u/bodow/miniconda3/envs/cloc3/bin/python",
+                    "-B",
+                    "-c",
+                    script,
+                    str(ROOT / "sonic/schemas/terrain_oracle_audit_v1.schema.json"),
+                    str(good),
+                    str(bad),
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
 
 class _Named:
@@ -389,6 +468,7 @@ class OracleAuditTests(unittest.TestCase):
         self.assertEqual(first.accepted_intervals, ((0, 40),))
         self.assertEqual(first.reasons, ())
         self.assertEqual(first.source_sha256, self.clip.source.source_sha256)
+        self.assertEqual(first.clip_sha256, clip_digest(self.clip))
         self.assertEqual(len(first.model_sha256), 64)
         self.assertEqual(len(first.terrain_sha256), 64)
         self.assertEqual(first.to_dict(), second.to_dict())

@@ -20,6 +20,7 @@ from .canonical import (
 )
 from .contact import CanonicalMeshQuery
 from .math3d import angular_velocity_world_wxyz, finite_difference
+from .storage import clip_digest
 
 
 _SCHEMA = "terrain-oracle-audit/v1"
@@ -231,6 +232,7 @@ class ClipAudit:
     clip_id: str
     frame_count: int
     source_sha256: str
+    clip_sha256: str
     model_sha256: str
     terrain_sha256: str
     status: str
@@ -246,7 +248,7 @@ class ClipAudit:
             raise ContractError("audit clip_id must be nonempty")
         if type(self.frame_count) is not int or self.frame_count < 2:
             raise ContractError("audit frame_count must be at least two")
-        for name in ("source_sha256", "model_sha256", "terrain_sha256"):
+        for name in ("source_sha256", "clip_sha256", "model_sha256", "terrain_sha256"):
             _sha(getattr(self, name), name)
         if self.status not in (
             "accepted",
@@ -313,6 +315,7 @@ class ClipAudit:
             "clip_id": self.clip_id,
             "frame_count": self.frame_count,
             "source_sha256": self.source_sha256,
+            "clip_sha256": self.clip_sha256,
             "model_sha256": self.model_sha256,
             "terrain_sha256": self.terrain_sha256,
             "status": self.status,
@@ -335,6 +338,7 @@ class ClipAudit:
             "clip_id",
             "frame_count",
             "source_sha256",
+            "clip_sha256",
             "model_sha256",
             "terrain_sha256",
             "status",
@@ -373,6 +377,7 @@ class ClipAudit:
                 clip_id=value["clip_id"],
                 frame_count=value["frame_count"],
                 source_sha256=value["source_sha256"],
+                clip_sha256=value["clip_sha256"],
                 model_sha256=value["model_sha256"],
                 terrain_sha256=value["terrain_sha256"],
                 status=value["status"],
@@ -1905,11 +1910,16 @@ def _fatal_report(
         and all(character in _SHA256 for character in source)
     ):
         source = "0" * 64
+    try:
+        artifact = clip_digest(clip)
+    except ContractError:
+        artifact = "0" * 64
     return ClipAudit(
         schema=_SCHEMA,
         clip_id=str(getattr(clip, "clip_id", "invalid-source")) or "invalid-source",
         frame_count=frame_count,
         source_sha256=source,
+        clip_sha256=artifact,
         model_sha256=model_sha256,
         terrain_sha256=terrain_sha256,
         status="rejected",
@@ -2279,6 +2289,7 @@ def audit_clip(
         clip_id=clip.clip_id,
         frame_count=frames_count,
         source_sha256=clip.source.source_sha256,
+        clip_sha256=clip_digest(clip),
         model_sha256=model_hash,
         terrain_sha256=terrain_hash,
         status=status,
