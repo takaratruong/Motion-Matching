@@ -57,6 +57,7 @@ def terrain_height_targets(
     current_root_position_world: torch.Tensor,
     current_root_yaw: torch.Tensor,
     current_foot_position_world: torch.Tensor | None = None,
+    footprint_split_gain: float = 1.0,
     query_terrain: Any,
 ) -> HorizonTargets:
     """Sample desired vertical change along the commanded root path."""
@@ -84,6 +85,13 @@ def terrain_height_targets(
         or not torch.isfinite(current_foot_position_world).all()
     ):
         raise ContractError("terrain height prediction feet are invalid")
+    if (
+        isinstance(footprint_split_gain, bool)
+        or not isinstance(footprint_split_gain, (int, float))
+        or not math.isfinite(float(footprint_split_gain))
+        or not 0.0 <= float(footprint_split_gain) <= 1.0
+    ):
+        raise ContractError("footprint split gain is invalid")
     try:
         world_displacement = _rotate_xy(
             targets.displacement_local_xy, current_root_yaw.reshape(())
@@ -142,7 +150,9 @@ def terrain_height_targets(
         lateral_split = raw_surface_delta - raw_surface_delta.mean(
             dim=1, keepdim=True
         )
-        surface_delta = delta[:, None] + lateral_split
+        surface_delta = delta[:, None] + (
+            float(footprint_split_gain) * lateral_split
+        )
     return HorizonTargets(
         frames=targets.frames,
         displacement_local_xy=targets.displacement_local_xy,
@@ -170,6 +180,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         result_filter: Any | None = None,
         contact_phase_gate: bool = False,
         footprint_terrain_targets: bool = False,
+        footprint_split_gain: float = 1.0,
     ) -> None:
         self.base = base_matcher
         self.database = base_matcher.database
@@ -193,6 +204,14 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         if type(footprint_terrain_targets) is not bool:
             raise ContractError("footprint terrain targets must be boolean")
         self.footprint_terrain_targets = footprint_terrain_targets
+        if (
+            isinstance(footprint_split_gain, bool)
+            or not isinstance(footprint_split_gain, (int, float))
+            or not math.isfinite(float(footprint_split_gain))
+            or not 0.0 <= float(footprint_split_gain) <= 1.0
+        ):
+            raise ContractError("footprint split gain is invalid")
+        self.footprint_split_gain = float(footprint_split_gain)
         self._clip_path_to_index = {
             clip.relative_path: index
             for index, clip in enumerate(dataset.folder.clips)
@@ -267,6 +286,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             current_foot_position_world=(
                 self._feet if self.footprint_terrain_targets else None
             ),
+            footprint_split_gain=self.footprint_split_gain,
             query_terrain=self.query_terrain,
         )
 
@@ -419,6 +439,7 @@ def run_resolved_horizon_matrix(
     foot_lock: bool = False,
     contact_phase_gate: bool = False,
     footprint_terrain_targets: bool = False,
+    footprint_split_gain: float = 1.0,
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
@@ -540,6 +561,7 @@ def run_resolved_horizon_matrix(
                 if footprint_terrain_targets
                 else ":root-terrain-targets"
             )
+            + f":footprint-split-gain:{float(footprint_split_gain):.9g}"
         ).encode()
     ).hexdigest()
 
@@ -557,6 +579,7 @@ def run_resolved_horizon_matrix(
             result_filter=result_filter,
             contact_phase_gate=contact_phase_gate,
             footprint_terrain_targets=footprint_terrain_targets,
+            footprint_split_gain=footprint_split_gain,
         )
         route_matchers[route.name] = matcher
         return matcher
