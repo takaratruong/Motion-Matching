@@ -124,7 +124,7 @@ class HorizonRankingTest(unittest.TestCase):
             config,
         )
         index = int(torch.nonzero(ranked.candidate_indices == 2)[0])
-        entry = 27 * 0.2**2
+        entry = config.entry_weight * 27 * 0.2**2
         displacement = config.displacement_weight * (
             ((0.4 - 0.5) / 0.5) ** 2 + ((0.1 - 0.0) / 0.5) ** 2
         )

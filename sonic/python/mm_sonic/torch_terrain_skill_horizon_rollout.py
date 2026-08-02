@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import asdict
 import hashlib
+import json
 import math
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
@@ -330,17 +332,8 @@ def run_resolved_horizon_matrix(
     )
     skills = build_terrain_skill_inventory(resolved.dataset, base.database)
     horizons = build_horizon_inventory(resolved.dataset, base.database, skills)
-    matcher = TerrainSkillHorizonMatcher(
-        base_matcher=base,
-        skill_inventory=skills,
-        horizon_inventory=horizons,
-        dataset=resolved.dataset,
-        query_terrain=resolved.measurement_extension,
-        foot_kinematics=MujocoG1FootKinematics(g1_xml),
-        config=config,
-        search_config=search_config,
-        terrain_tolerance_m=terrain_tolerance_m,
-    )
+    foot_kinematics = MujocoG1FootKinematics(g1_xml)
+    route_matchers: dict[str, TerrainSkillHorizonMatcher] = {}
     model, data = build_kinematic_scene(g1_xml, resolved)
     left_ankle = int(model.body("left_ankle_roll_link").id)
     right_ankle = int(model.body("right_ankle_roll_link").id)
@@ -389,17 +382,42 @@ def run_resolved_horizon_matrix(
         riser_height_m=0.1778,
         tread_count=3,
     )
+    search_identity = json.dumps(
+        asdict(search_config), sort_keys=True, separators=(",", ":")
+    )
     identity = hashlib.sha256(
-        (resolved.base_config_sha256 + ":horizon-skills-v1").encode()
+        (
+            resolved.base_config_sha256
+            + ":horizon-skills-v1:"
+            + search_identity
+        ).encode()
     ).hexdigest()
+
+    def matcher_factory(route: OmniRoute) -> TerrainSkillHorizonMatcher:
+        matcher = TerrainSkillHorizonMatcher(
+            base_matcher=base,
+            skill_inventory=skills,
+            horizon_inventory=horizons,
+            dataset=resolved.dataset,
+            query_terrain=resolved.measurement_extension,
+            foot_kinematics=foot_kinematics,
+            config=config,
+            search_config=search_config,
+            terrain_tolerance_m=terrain_tolerance_m,
+        )
+        route_matchers[route.name] = matcher
+        return matcher
+
     matrix = run_omni_matrix(
         routes=tuple(routes),
         stair_frame=stair_frame,
-        matcher_factory=lambda _route: matcher,
+        matcher_factory=matcher_factory,
         kinematics=kinematics,
         terrain_sampler=terrain_sampler,
         dataset_identity=resolved.dataset.manifest_sha256,
         config_identity=identity,
         reset_root_position_world_xy=resolved_stair_reset_position(resolved),
     )
-    return matrix, matcher.chunk_events
+    return matrix, {
+        name: matcher.chunk_events for name, matcher in route_matchers.items()
+    }

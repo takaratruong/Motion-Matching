@@ -24,7 +24,9 @@ from .torch_terrain_skill_horizons import (
 
 @dataclass(frozen=True)
 class HorizonSearchConfig:
-    entry_weight: float = 1.0
+    # The entry term sums 27 normalized feature dimensions; average it so the
+    # entry and low-dimensional outcome groups have comparable natural scale.
+    entry_weight: float = 1.0 / 27.0
     displacement_weight: float = 8.0
     yaw_weight: float = 3.0
     height_weight: float = 4.0
