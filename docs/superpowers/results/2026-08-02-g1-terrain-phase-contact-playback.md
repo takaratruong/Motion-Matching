@@ -101,6 +101,10 @@ The two clean 3 cm swing-clearance matrices have the identical SHA-256
   help: legacy entry weight passed 2/6, entry-only 3/6, and outcome-only 4/6.
 - Swing-clearance margins from 0 to 5 cm all retained 6/6, but the clean sweep
   had a clear optimum at 3 cm. Larger margins increased slide.
+- Layered candidate swing-clearance gates at -5, -3, and -1 cm were rejected:
+  they passed 5/6, 5/6, and 4/6 routes respectively, and the stricter versions
+  produced worse penetration tails. Hard deletion cannot substitute for a
+  contact-space swing trajectory.
 
 ## Literature alignment
 
@@ -125,11 +129,11 @@ The two clean 3 cm swing-clearance matrices have the identical SHA-256
 
 The timing experiments show that a scalar phase descriptor is not the missing
 signal. The remaining long-tail penetration and mixed-route regression point
-instead to future toe/landing geometry. The next high-value experiment is a
-layered future-toe terrain descriptor (or contact-space swing trajectory),
-evaluated against this frozen 6/6 result. Learned Motion Matching's rough-
-terrain setup similarly queries terrain under future toes rather than using a
-denser root-centered height grid.
+instead to future toe/landing geometry. A naive future-toe hard gate also
+fails, so the next high-value experiment is a continuous future-toe terrain
+descriptor or contact-space swing trajectory, evaluated against this frozen
+6/6 result. Learned Motion Matching's rough-terrain setup similarly queries
+terrain under future toes rather than using a denser root-centered height grid.
 
 ## Verification
 
