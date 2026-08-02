@@ -246,6 +246,7 @@ class TerrainSkillMatcher:
         foot_kinematics: Any,
         config: MatcherConfig,
         terrain_tolerance_m: float = 0.06,
+        result_filter: Any | None = None,
     ) -> None:
         self.base = base_matcher
         self.database = base_matcher.database
@@ -255,6 +256,12 @@ class TerrainSkillMatcher:
         self.foot_kinematics = foot_kinematics
         self.config = config
         self.terrain_tolerance_m = float(terrain_tolerance_m)
+        if result_filter is not None and (
+            not callable(getattr(result_filter, "reset", None))
+            or not callable(getattr(result_filter, "apply", None))
+        ):
+            raise ContractError("terrain skill result filter is invalid")
+        self.result_filter = result_filter
         self._pending = None
         self._skill_state: TerrainSkillState | None = None
         self._last_result = None
@@ -352,6 +359,9 @@ class TerrainSkillMatcher:
         self, *, root_position_world_xy: tuple[float, float] = (0.0, 0.0)
     ):
         result = self.base.reset(root_position_world_xy=root_position_world_xy)
+        if self.result_filter is not None:
+            self.result_filter.reset()
+            result = self.result_filter.apply(result)
         self._pending = None
         self._skill_state = None
         self._last_result = result
@@ -593,6 +603,8 @@ class TerrainSkillMatcher:
             result = prepared.result
             if prepared.kind == "skill":
                 self._skill_state = prepared.payload
+        if self.result_filter is not None:
+            result = self.result_filter.apply(result)
         self._last_result = result
         self._last_command = prepared.command
         self._replan_pending = prepared.replan_pending

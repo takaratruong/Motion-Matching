@@ -21,7 +21,10 @@ from mm_sonic.torch_terrain_live_viewer import (
     dense_patch_positions,
     matcher_result_qpos,
 )
-from mm_sonic.torch_terrain_features import TerrainSceneAlignment
+from mm_sonic.torch_terrain_features import (
+    TerrainSceneAlignment,
+    _TorchHeightGrid,
+)
 from mm_sonic.torch_terrain_rollout import (
     ResolvedStairConfig,
 )
@@ -212,19 +215,39 @@ class LiveMujocoSceneTests(unittest.TestCase):
                 "--config", "horizon.json",
                 "--g1-xml", "g1.xml",
                 "--multi-horizon",
+                "--foot-lock",
+                "--contact-phase-gate",
             ]
         )
         self.assertTrue(arguments.multi_horizon)
+        self.assertTrue(arguments.foot_lock)
+        self.assertTrue(arguments.contact_phase_gate)
         live_module._validate_live_mode(
             multi_horizon=True,
             contact_segments=False,
             foothold_arm=None,
+            foot_lock=True,
+            contact_phase_gate=True,
         )
         with self.assertRaisesRegex(ContractError, "mutually exclusive"):
             live_module._validate_live_mode(
                 multi_horizon=True,
                 contact_segments=True,
                 foothold_arm=None,
+            )
+        with self.assertRaisesRegex(ContractError, "requires multi-horizon"):
+            live_module._validate_live_mode(
+                multi_horizon=False,
+                contact_segments=False,
+                foothold_arm=None,
+                foot_lock=True,
+            )
+        with self.assertRaisesRegex(ContractError, "requires multi-horizon"):
+            live_module._validate_live_mode(
+                multi_horizon=False,
+                contact_segments=False,
+                foothold_arm=None,
+                contact_phase_gate=True,
             )
 
     def test_horizon_overlay_does_not_require_legacy_cost_fields(self):
@@ -369,6 +392,8 @@ class LiveMujocoSceneTests(unittest.TestCase):
         for option in (
             "--dataset", "--config", "--g1-xml", "--device",
             "--contact-segments", "--foothold-arm", "--multi-horizon",
+            "--foot-lock",
+            "--contact-phase-gate",
         ):
             self.assertIn(option, help_text)
         self.assertIn(
@@ -459,6 +484,38 @@ class LiveMujocoSceneTests(unittest.TestCase):
         self.assertFalse(
             np.array_equal(straight_points[91:], lateral_points[91:])
         )
+
+    def test_dense_patch_display_clamps_outside_grid_without_weakening_search(self):
+        measurement = SimpleNamespace(
+            alignment=TerrainSceneAlignment(
+                translation_scene_xy=torch.zeros(2),
+                yaw_scene_from_matcher=torch.zeros(()),
+            ),
+            query_grid=_TorchHeightGrid(
+                origin_xy=torch.tensor((-0.1, -0.1)),
+                cell_size_m=0.1,
+                height_z=torch.zeros((3, 3)),
+            ),
+        )
+        result = SimpleNamespace(
+            root_position_world=torch.tensor([0.0, 0.0, 0.8]),
+            root_orientation_world_wxyz=torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        )
+        trajectory = CommandTrajectory(
+            position_world_xy=torch.tensor(
+                [[1.0, 0.0], [2.0, 0.0], [3.0, 0.0]]
+            ),
+            facing_world_xy=torch.tensor(
+                [[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]
+            ),
+        )
+
+        points = dense_patch_positions(result, measurement, trajectory)
+
+        self.assertEqual(points.shape, (95, 3))
+        self.assertTrue(np.isfinite(points).all())
+        with self.assertRaisesRegex(ContractError, "outside"):
+            measurement.query_grid.sample_xy(torch.tensor([[1.0, 0.0]]))
 
 
 if __name__ == "__main__":

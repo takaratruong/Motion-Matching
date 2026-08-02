@@ -20,6 +20,7 @@ from .torch_terrain_omni_routes import OmniRoute
 from .torch_terrain_skill_composer import start_skill
 from .torch_terrain_skill_horizon_search import (
     HorizonCost,
+    HorizonSearchFailure,
     HorizonSearchConfig,
     HorizonTargets,
     TerrainSkillHorizonResult,
@@ -118,6 +119,8 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         config: MatcherConfig,
         search_config: HorizonSearchConfig = HorizonSearchConfig(),
         terrain_tolerance_m: float = 0.06,
+        result_filter: Any | None = None,
+        contact_phase_gate: bool = False,
     ) -> None:
         self.base = base_matcher
         self.database = base_matcher.database
@@ -129,6 +132,22 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         self.config = config
         self.search_config = search_config
         self.terrain_tolerance_m = float(terrain_tolerance_m)
+        if result_filter is not None and (
+            not callable(getattr(result_filter, "reset", None))
+            or not callable(getattr(result_filter, "apply", None))
+        ):
+            raise ContractError("terrain skill result filter is invalid")
+        self.result_filter = result_filter
+        if type(contact_phase_gate) is not bool:
+            raise ContractError("contact phase gate must be boolean")
+        self.contact_phase_gate = contact_phase_gate
+        self._clip_path_to_index = {
+            clip.relative_path: index
+            for index, clip in enumerate(dataset.folder.clips)
+        }
+        self._support_by_clip = {
+            skill.clip_index: skill.support_mask for skill in skill_inventory.skills
+        }
         self._pending = None
         self._skill_state = None
         self._last_result = None
@@ -205,9 +224,34 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             current_clip = self.base._state.clip_index
             current_frame = self.base._state.frame_index
 
-        def compatible(record: int, row: int, endpoint: int) -> bool:
+        current_support = None
+        if self.contact_phase_gate:
+            current_path = str(result.diagnostics.selected_clip_path)
+            source_clip = self._clip_path_to_index.get(current_path)
+            support_profile = self._support_by_clip.get(source_clip)
+            source_frame = int(result.diagnostics.selected_frame)
+            if support_profile is not None and 0 <= source_frame < len(
+                support_profile
+            ):
+                current_support = support_profile[source_frame]
+
+        def compatible(
+            record: int,
+            row: int,
+            endpoint: int,
+            *,
+            require_phase: bool,
+        ) -> bool:
             skill_index = int(self.horizon_inventory.skill_index[record].item())
             skill = self.inventory.skills[skill_index]
+            if require_phase and current_support is not None:
+                entry_frame = int(
+                    self.horizon_inventory.entry_frame[record].item()
+                )
+                if not torch.equal(
+                    current_support, skill.support_mask[entry_frame]
+                ):
+                    return False
             return terrain_skill_compatible(
                 skill=skill,
                 canonical_entry_row=row,
@@ -220,17 +264,30 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                 playback_stop=endpoint,
             )
 
-        selected = select_horizon_candidate(
-            self.database,
-            self.horizon_inventory,
-            normalized_query,
-            targets,
-            terrain_validator=compatible,
-            config=self.search_config,
-            current_clip_index=current_clip,
-            current_frame_index=current_frame,
-            matcher_config=self.config,
-        )
+        def select(*, require_phase: bool):
+            return select_horizon_candidate(
+                self.database,
+                self.horizon_inventory,
+                normalized_query,
+                targets,
+                terrain_validator=lambda record, row, endpoint: compatible(
+                    record,
+                    row,
+                    endpoint,
+                    require_phase=require_phase,
+                ),
+                config=self.search_config,
+                current_clip_index=current_clip,
+                current_frame_index=current_frame,
+                matcher_config=self.config,
+            )
+
+        try:
+            selected = select(require_phase=current_support is not None)
+        except HorizonSearchFailure:
+            if current_support is None:
+                raise
+            selected = select(require_phase=False)
         skill_index = int(
             self.horizon_inventory.skill_index[selected.record_index].item()
         )
@@ -304,6 +361,8 @@ def run_resolved_horizon_matrix(
     routes: Sequence[OmniRoute],
     terrain_tolerance_m: float = 0.06,
     search_config: HorizonSearchConfig = HorizonSearchConfig(),
+    foot_lock: bool = False,
+    contact_phase_gate: bool = False,
 ):
     """Run the renderer-independent route harness with horizon skill MM."""
 
@@ -333,6 +392,11 @@ def run_resolved_horizon_matrix(
     skills = build_terrain_skill_inventory(resolved.dataset, base.database)
     horizons = build_horizon_inventory(resolved.dataset, base.database, skills)
     foot_kinematics = MujocoG1FootKinematics(g1_xml)
+    result_filter = None
+    if foot_lock:
+        from .torch_terrain_foot_lock import build_terrain_foot_lock
+
+        result_filter = build_terrain_foot_lock(resolved, foot_kinematics)
     route_matchers: dict[str, TerrainSkillHorizonMatcher] = {}
     model, data = build_kinematic_scene(g1_xml, resolved)
     left_ankle = int(model.body("left_ankle_roll_link").id)
@@ -390,6 +454,8 @@ def run_resolved_horizon_matrix(
             resolved.base_config_sha256
             + ":horizon-skills-v1:"
             + search_identity
+            + (":foot-lock-v1" if foot_lock else ":raw-playback")
+            + (":phase-gate-v1" if contact_phase_gate else ":implicit-phase")
         ).encode()
     ).hexdigest()
 
@@ -404,6 +470,8 @@ def run_resolved_horizon_matrix(
             config=config,
             search_config=search_config,
             terrain_tolerance_m=terrain_tolerance_m,
+            result_filter=result_filter,
+            contact_phase_gate=contact_phase_gate,
         )
         route_matchers[route.name] = matcher
         return matcher

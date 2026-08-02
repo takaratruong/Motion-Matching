@@ -43,7 +43,7 @@ class _FootKinematics:
         return np.repeat(root[:, None, :], 2, axis=1)
 
 
-def _transactional_fixture():
+def _transactional_fixture(*, result_filter=None, contact_phase_gate=False):
     frames = 80
     body_position = np.zeros((frames, 3, 3), dtype=np.float32)
     body_position[:, :, 0] = np.arange(frames, dtype=np.float32)[:, None] * 0.01
@@ -131,11 +131,49 @@ def _transactional_fixture():
         query_terrain=SimpleNamespace(query_grid=grid, alignment=_Alignment()),
         foot_kinematics=_FootKinematics(),
         config=MatcherConfig(),
+        result_filter=result_filter,
+        contact_phase_gate=contact_phase_gate,
     )
     return matcher, grid
 
 
 class TerrainSkillHorizonRolloutTest(unittest.TestCase):
+    def test_contact_phase_gate_is_explicit(self):
+        matcher, _grid = _transactional_fixture(contact_phase_gate=True)
+
+        self.assertTrue(matcher.contact_phase_gate)
+
+    def test_optional_result_filter_owns_reset_and_committed_state(self):
+        class _Filter:
+            def __init__(self):
+                self.reset_count = 0
+                self.apply_count = 0
+
+            def reset(self):
+                self.reset_count += 1
+
+            def apply(self, result):
+                self.apply_count += 1
+                return SimpleNamespace(
+                    **{
+                        **vars(result),
+                        "root_position_world": result.root_position_world
+                        + torch.tensor((0.0, 0.0, 0.01)),
+                    }
+                )
+
+        result_filter = _Filter()
+        matcher, _grid = _transactional_fixture(result_filter=result_filter)
+
+        reset = matcher.reset()
+        committed = matcher.commit(matcher.prepare_step((0.0, 0.0), 0.0))
+
+        self.assertEqual(result_filter.reset_count, 1)
+        self.assertEqual(result_filter.apply_count, 2)
+        self.assertAlmostEqual(float(reset.root_position_world[2]), 0.81)
+        self.assertAlmostEqual(float(committed.root_position_world[2]), 0.82)
+        self.assertIs(matcher._last_result, committed)
+
     def test_terrain_height_targets_follow_commanded_world_path(self):
         targets = HorizonTargets(
             frames=torch.tensor([25, 50, 100]),

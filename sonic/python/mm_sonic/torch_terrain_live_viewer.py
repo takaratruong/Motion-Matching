@@ -397,7 +397,26 @@ def dense_patch_positions(
     )
     matcher_xy = dense_query_points(root[:2], yaw, trajectory)
     scene_xy = measurement.alignment.matcher_to_scene_xy(matcher_xy)
-    height = measurement.query_grid.sample_xy(scene_xy)
+    try:
+        height = measurement.query_grid.sample_xy(scene_xy)
+    except ContractError as error:
+        if "outside the authoritative terrain domain" not in str(error):
+            raise
+        grid = measurement.query_grid
+        try:
+            origin = grid.origin_xy
+            ny, nx = grid.height_z.shape
+            maximum = origin + torch.tensor(
+                ((nx - 1) * grid.cell_size_m, (ny - 1) * grid.cell_size_m),
+                dtype=scene_xy.dtype,
+                device=scene_xy.device,
+            )
+            clamped = torch.maximum(torch.minimum(scene_xy, maximum), origin)
+            height = grid.sample_xy(clamped)
+        except (AttributeError, TypeError) as clamp_error:
+            raise ContractError(
+                "cannot clamp visualization markers to terrain domain"
+            ) from clamp_error
     points = torch.cat((matcher_xy, height[:, None]), dim=1)
     output = points.detach().to("cpu").numpy().astype(np.float64)
     if output.shape != (95, 3) or not np.isfinite(output).all():
@@ -478,11 +497,17 @@ def _validate_live_mode(
     multi_horizon: bool,
     contact_segments: bool,
     foothold_arm: str | None,
+    foot_lock: bool = False,
+    contact_phase_gate: bool = False,
 ) -> None:
     if multi_horizon and (contact_segments or foothold_arm is not None):
         raise ContractError(
             "multi-horizon and contact/foothold modes are mutually exclusive"
         )
+    if foot_lock and not multi_horizon:
+        raise ContractError("terrain foot lock requires multi-horizon mode")
+    if contact_phase_gate and not multi_horizon:
+        raise ContractError("contact phase gate requires multi-horizon mode")
 
 
 def _build_live_matcher(
@@ -492,6 +517,8 @@ def _build_live_matcher(
     multi_horizon: bool,
     contact_segment_policy: Any,
     foothold_action_policy: Any,
+    foot_lock: bool = False,
+    contact_phase_gate: bool = False,
 ):
     matcher_config = matcher_config_from_resolved(resolved.resolved_config)
     if multi_horizon:
@@ -505,17 +532,28 @@ def _build_live_matcher(
         horizons = build_horizon_inventory(
             resolved.dataset, base.database, skills
         )
+        foot_kinematics = MujocoG1FootKinematics(str(g1_xml))
+        matcher_kwargs = {}
+        if foot_lock:
+            from .torch_terrain_foot_lock import build_terrain_foot_lock
+
+            matcher_kwargs["result_filter"] = build_terrain_foot_lock(
+                resolved, foot_kinematics
+            )
+        if contact_phase_gate:
+            matcher_kwargs["contact_phase_gate"] = True
         return TerrainSkillHorizonMatcher(
             base_matcher=base,
             skill_inventory=skills,
             horizon_inventory=horizons,
             dataset=resolved.dataset,
             query_terrain=resolved.measurement_extension,
-            foot_kinematics=MujocoG1FootKinematics(str(g1_xml)),
+            foot_kinematics=foot_kinematics,
             config=matcher_config,
             search_config=horizon_search_config_from_experiment(
                 resolved.resolved_config
             ),
+            **matcher_kwargs,
         )
     return TorchMotionMatcher.from_folder(
         resolved.dataset.root,
@@ -549,6 +587,8 @@ def run_live_viewer(
     small_turn_lateral_root_warp_gain: float = 0.25,
     reversal_lateral_root_warp_gain: float = 0.25,
     strafe_action_gate: bool = False,
+    foot_lock: bool = False,
+    contact_phase_gate: bool = False,
 ) -> None:
     """Run the dense 50 Hz matcher and display each committed state."""
 
@@ -561,6 +601,8 @@ def run_live_viewer(
         multi_horizon=multi_horizon,
         contact_segments=contact_segments,
         foothold_arm=foothold_arm,
+        foot_lock=foot_lock,
+        contact_phase_gate=contact_phase_gate,
     )
     if contact_segments:
         from .torch_contact_segment_rollout import (
@@ -651,6 +693,8 @@ def run_live_viewer(
         multi_horizon=multi_horizon,
         contact_segment_policy=contact_segment_policy,
         foothold_action_policy=foothold_action_policy,
+        foot_lock=foot_lock,
+        contact_phase_gate=contact_phase_gate,
     )
     from .torch_terrain_omni_rollout import resolved_stair_reset_position
 
@@ -850,6 +894,16 @@ def build_live_viewer_argument_parser() -> argparse.ArgumentParser:
         help="Use the qualified stable-endpoint multi-horizon matcher.",
     )
     parser.add_argument(
+        "--foot-lock",
+        action="store_true",
+        help="Pin source-supported feet to query terrain during multi-horizon playback.",
+    )
+    parser.add_argument(
+        "--contact-phase-gate",
+        action="store_true",
+        help="Prefer skill entries with the current source support pattern.",
+    )
+    parser.add_argument(
         "--contact-segments",
         action="store_true",
         help="Use committed authoritative-FK terrain contact segments.",
@@ -939,6 +993,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.reversal_lateral_root_warp_gain
         ),
         strafe_action_gate=args.strafe_action_gate,
+        foot_lock=args.foot_lock,
+        contact_phase_gate=args.contact_phase_gate,
     )
     return 0
 

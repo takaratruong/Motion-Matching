@@ -40,6 +40,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--route", action="append", default=[])
     parser.add_argument("--qualification-slice", action="store_true")
     parser.add_argument(
+        "--foot-lock",
+        action="store_true",
+        help="Pin source-supported feet to the query terrain during playback.",
+    )
+    parser.add_argument(
+        "--contact-phase-gate",
+        action="store_true",
+        help="Prefer skill entries with the current source support pattern.",
+    )
+    parser.add_argument(
         "--ablation",
         choices=(
             "combined",
@@ -176,6 +186,8 @@ def main(argv: list[str] | None = None) -> int:
         g1_xml=args.g1_xml,
         routes=select_routes(args.route, args.qualification_slice),
         search_config=search_config,
+        foot_lock=args.foot_lock,
+        contact_phase_gate=args.contact_phase_gate,
     )
     save_horizon_matrix(matrix, events, args.output)
     execution_completed = all(
@@ -189,6 +201,8 @@ def main(argv: list[str] | None = None) -> int:
                 "route_count": len(matrix.runs),
                 "chunk_count": sum(len(values) for values in events.values()),
                 "ablation": args.ablation,
+                "foot_lock": args.foot_lock,
+                "contact_phase_gate": args.contact_phase_gate,
                 "deterministic_sha256": matrix.deterministic_sha256,
                 "output": args.output,
             },

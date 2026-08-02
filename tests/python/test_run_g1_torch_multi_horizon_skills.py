@@ -31,6 +31,17 @@ class MultiHorizonSkillsCliTest(unittest.TestCase):
         self.assertEqual(args.device, "cuda:3")
         self.assertTrue(args.qualification_slice)
         self.assertEqual(args.ablation, "combined")
+        self.assertFalse(args.foot_lock)
+        self.assertFalse(args.contact_phase_gate)
+        locked = build_parser().parse_args(
+            [
+                "--dataset", "data", "--config", "config.json",
+                "--g1-xml", "g1.xml", "--output", "out",
+                "--device", "cuda:3", "--foot-lock", "--contact-phase-gate",
+            ]
+        )
+        self.assertTrue(locked.foot_lock)
+        self.assertTrue(locked.contact_phase_gate)
 
     def test_route_selection_preserves_frozen_order_and_rejects_bad_names(self):
         routes = select_routes(
