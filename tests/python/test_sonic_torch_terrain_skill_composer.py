@@ -8,6 +8,7 @@ from mm_sonic.torch_terrain_skill_composer import (
     TerrainSkillPose,
     advance_skill,
     can_interrupt_skill,
+    extend_skill_state,
     start_skill,
 )
 from mm_sonic.torch_terrain_skills import SkillInterval, TerrainSkill
@@ -184,6 +185,62 @@ class TerrainSkillComposerTest(unittest.TestCase):
             0.05 + 1e-7,
         )
         self.assertLessEqual(abs(float(state.endpoint_yaw_warp_rad)), 0.10 + 1e-7)
+
+
+class TerrainSkillExtensionTest(unittest.TestCase):
+    def completed_state(self):
+        folder, skill, pose = _fixture()
+        skill.support_mask[7] = True
+        state = start_skill(
+            folder,
+            skill,
+            selected_entry_frame=3,
+            current=pose,
+            playback_stop=8,
+        )
+        while state.next_source_frame < state.playback_stop:
+            state = advance_skill(state).state
+        return state
+
+    def test_extension_preserves_placement_and_offsets(self):
+        completed = self.completed_state()
+
+        extended = extend_skill_state(completed, playback_stop=12)
+
+        self.assertEqual(extended.next_source_frame, 8)
+        self.assertEqual(extended.playback_stop, 12)
+        self.assertIs(extended.offsets, completed.offsets)
+        self.assertIs(extended.translation_world, completed.translation_world)
+        self.assertIs(extended.yaw_offset, completed.yaw_offset)
+
+    def test_extended_frames_are_exactly_the_unplayed_suffix(self):
+        state = extend_skill_state(self.completed_state(), playback_stop=12)
+        emitted = []
+        while state.next_source_frame < state.playback_stop:
+            step = advance_skill(state)
+            emitted.append(step.frame.source_frame)
+            state = step.state
+
+        self.assertEqual(emitted, [8, 9, 10, 11])
+
+    def test_extension_rejects_nonzero_endpoint_warp(self):
+        folder, skill, pose = _fixture()
+        skill.support_mask[7] = True
+        state = start_skill(
+            folder,
+            skill,
+            selected_entry_frame=3,
+            current=pose,
+            playback_stop=8,
+            target_displacement_local_xy=torch.tensor([1.0, 0.0]),
+            target_yaw_delta_rad=torch.tensor(0.0),
+            maximum_translation_warp_m=0.05,
+        )
+        while state.next_source_frame < state.playback_stop:
+            state = advance_skill(state).state
+
+        with self.assertRaisesRegex(Exception, "zero endpoint warp"):
+            extend_skill_state(state, playback_stop=12)
 
 
 if __name__ == "__main__":

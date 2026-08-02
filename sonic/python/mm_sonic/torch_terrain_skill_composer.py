@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from typing import Any
 
@@ -348,6 +348,33 @@ def can_interrupt_skill(skill: TerrainSkill, source_frame: int) -> bool:
     if not 0 <= source_frame < int(skill.support_mask.shape[0]):
         raise ContractError("terrain skill interrupt frame is invalid")
     return bool(skill.support_mask[source_frame].all().item())
+
+
+def extend_skill_state(
+    state: TerrainSkillState, *, playback_stop: int
+) -> TerrainSkillState:
+    """Extend a completed zero-warp chunk without restarting its placement."""
+
+    if not isinstance(state, TerrainSkillState):
+        raise ContractError("terrain skill extension state is invalid")
+    if state.next_source_frame != state.playback_stop:
+        raise ContractError("terrain skill extension requires a completed chunk")
+    if bool(state.endpoint_translation_warp_world_xy.abs().max().item()) or bool(
+        state.endpoint_yaw_warp_rad.abs().item()
+    ):
+        raise ContractError("terrain skill extension requires zero endpoint warp")
+    if (
+        type(playback_stop) is not int
+        or not state.playback_stop
+        < playback_stop
+        <= state.skill.interval.playback_stop
+    ):
+        raise ContractError("terrain skill extension endpoint is invalid")
+    if not bool(state.skill.support_mask[playback_stop - 1].all().item()):
+        raise ContractError(
+            "terrain skill extension endpoint must be stable double support"
+        )
+    return replace(state, playback_stop=playback_stop)
 
 
 def advance_skill(state: TerrainSkillState) -> TerrainSkillStep:

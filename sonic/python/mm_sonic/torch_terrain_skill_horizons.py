@@ -98,6 +98,42 @@ def stable_horizon_endpoints(
     return tuple(output)
 
 
+def next_sequential_horizon_endpoint(
+    support_mask: torch.Tensor,
+    *,
+    current_endpoint_frame_exclusive: int,
+    playback_stop: int,
+    target_frames: int = 25,
+) -> int | None:
+    """Return the first later stable endpoint for the same placed skill."""
+
+    if (
+        not isinstance(support_mask, torch.Tensor)
+        or support_mask.dtype != torch.bool
+        or support_mask.ndim != 2
+        or support_mask.shape[1] != 2
+    ):
+        raise ContractError("sequential horizon support mask must have boolean shape (T, 2)")
+    frame_count = int(support_mask.shape[0])
+    if (
+        type(current_endpoint_frame_exclusive) is not int
+        or type(playback_stop) is not int
+        or type(target_frames) is not int
+        or target_frames < 1
+        or not 0 < current_endpoint_frame_exclusive < playback_stop <= frame_count
+    ):
+        raise ContractError("sequential horizon source bounds are invalid")
+    first = current_endpoint_frame_exclusive + target_frames - 1
+    final = min(
+        playback_stop - 1,
+        first + MAXIMUM_ENDPOINT_LATENESS_FRAMES,
+    )
+    for frame in range(first, final + 1):
+        if bool(support_mask[frame].all().item()):
+            return frame + 1
+    return None
+
+
 def remaining_stall_profile(root_position_world_xy: torch.Tensor) -> torch.Tensor:
     """Longest consecutive future low-speed run beginning at each frame."""
 

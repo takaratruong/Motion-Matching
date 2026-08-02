@@ -11,6 +11,7 @@ from mm_sonic.torch_terrain_features import TerrainDataset
 from mm_sonic.torch_terrain_skill_horizons import (
     build_horizon_inventory,
     describe_horizon,
+    next_sequential_horizon_endpoint,
     remaining_stall_profile,
     stable_horizon_endpoints,
 )
@@ -141,6 +142,34 @@ class TerrainSkillHorizonPrimitiveTest(unittest.TestCase):
             inventory.endpoint_frame_exclusive.tolist(), [30, 53, 30, 53]
         )
         self.assertEqual(inventory.rejected_by_reason, {"no_endpoint": 2})
+
+
+class SequentialEndpointTest(unittest.TestCase):
+    def test_next_endpoint_is_after_current_exclusive_endpoint(self):
+        support = torch.zeros((100, 2), dtype=torch.bool)
+        support[24] = True
+        support[49] = True
+        support[74] = True
+
+        endpoint = next_sequential_horizon_endpoint(
+            support,
+            current_endpoint_frame_exclusive=25,
+            playback_stop=75,
+        )
+
+        self.assertEqual(endpoint, 50)
+
+    def test_no_later_stable_endpoint_returns_none(self):
+        support = torch.zeros((75, 2), dtype=torch.bool)
+        support[24] = True
+
+        self.assertIsNone(
+            next_sequential_horizon_endpoint(
+                support,
+                current_endpoint_frame_exclusive=25,
+                playback_stop=75,
+            )
+        )
 
 
 if __name__ == "__main__":
