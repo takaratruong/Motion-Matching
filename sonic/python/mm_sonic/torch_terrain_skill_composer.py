@@ -55,6 +55,7 @@ class TerrainSkillState:
     skill: TerrainSkill
     selected_entry_frame: int
     next_source_frame: int
+    playback_stop: int
     yaw_offset: torch.Tensor
     translation_world: torch.Tensor
     offsets: _Offsets
@@ -176,6 +177,7 @@ def start_skill(
     selected_entry_frame: int,
     current: TerrainSkillPose,
     halflife_s: float = 0.10,
+    playback_stop: int | None = None,
 ) -> TerrainSkillState:
     """Place a skill at the current root and initialize exact pose offsets."""
 
@@ -189,6 +191,17 @@ def start_skill(
         < skill.interval.playback_stop
     ):
         raise ContractError("selected frame is outside the terrain skill entry window")
+    resolved_stop = (
+        skill.interval.playback_stop
+        if playback_stop is None
+        else playback_stop
+    )
+    if (
+        type(resolved_stop) is not int
+        or not selected_entry_frame < resolved_stop <= skill.interval.playback_stop
+        or not bool(skill.support_mask[resolved_stop - 1].all().item())
+    ):
+        raise ContractError("terrain skill playback endpoint must be stable double support")
     if not math.isfinite(float(halflife_s)) or halflife_s <= 0:
         raise ContractError("terrain skill inertialization halflife must be positive")
 
@@ -212,6 +225,7 @@ def start_skill(
         skill=skill,
         selected_entry_frame=selected_entry_frame,
         next_source_frame=selected_entry_frame,
+        playback_stop=resolved_stop,
         yaw_offset=yaw_offset,
         translation_world=translation,
         offsets=_Offsets(
@@ -240,7 +254,7 @@ def advance_skill(state: TerrainSkillState) -> TerrainSkillStep:
     if not isinstance(state, TerrainSkillState):
         raise ContractError("terrain skill state is invalid")
     frame_index = state.next_source_frame
-    if frame_index >= state.skill.interval.playback_stop:
+    if frame_index >= state.playback_stop:
         raise ContractError("terrain skill playback is already complete")
     reference = state.offsets.joint_position
     jp, jv, root, quat, root_v, root_w = _source_pose(
@@ -306,6 +320,7 @@ def advance_skill(state: TerrainSkillState) -> TerrainSkillStep:
         skill=state.skill,
         selected_entry_frame=state.selected_entry_frame,
         next_source_frame=frame_index + 1,
+        playback_stop=state.playback_stop,
         yaw_offset=state.yaw_offset,
         translation_world=state.translation_world,
         offsets=state.offsets,
@@ -314,5 +329,5 @@ def advance_skill(state: TerrainSkillState) -> TerrainSkillStep:
     return TerrainSkillStep(
         frame=frame,
         state=next_state,
-        completed=next_state.next_source_frame >= state.skill.interval.playback_stop,
+        completed=next_state.next_source_frame >= state.playback_stop,
     )

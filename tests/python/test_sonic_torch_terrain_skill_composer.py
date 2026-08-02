@@ -92,6 +92,28 @@ class TerrainSkillComposerTest(unittest.TestCase):
         state = start_skill(folder, skill, selected_entry_frame=8, current=pose)
         self.assertEqual(advance_skill(state).frame.source_frame, 8)
 
+    def test_explicit_stable_endpoint_stops_before_whole_skill(self):
+        folder, skill, pose = _fixture()
+        skill.support_mask[7] = True
+        state = start_skill(
+            folder,
+            skill,
+            selected_entry_frame=3,
+            current=pose,
+            playback_stop=8,
+        )
+        emitted = []
+        while True:
+            step = advance_skill(state)
+            emitted.append(step.frame.source_frame)
+            state = step.state
+            if step.completed:
+                break
+
+        self.assertEqual(emitted, [3, 4, 5, 6, 7])
+        with self.assertRaisesRegex(Exception, "already complete"):
+            advance_skill(state)
+
 
 if __name__ == "__main__":
     unittest.main()

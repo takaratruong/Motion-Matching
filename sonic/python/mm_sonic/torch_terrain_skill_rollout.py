@@ -127,6 +127,7 @@ def terrain_skill_compatible(
     current_root_orientation_world_wxyz: torch.Tensor,
     tolerance_m: float = 0.06,
     sample_stride: int = 5,
+    playback_stop: int | None = None,
 ) -> bool:
     """Compare a placed skill's supported surface trace to the query scene."""
 
@@ -153,6 +154,17 @@ def terrain_skill_compatible(
     if int(database._search_clip_index[canonical_entry_row].item()) != skill.clip_index:
         raise ContractError("terrain compatibility row does not own skill clip")
     entry_frame = int(database._search_frame_index[canonical_entry_row].item())
+    resolved_stop = (
+        skill.interval.playback_stop
+        if playback_stop is None
+        else playback_stop
+    )
+    if (
+        type(resolved_stop) is not int
+        or not entry_frame < resolved_stop <= skill.interval.playback_stop
+        or not bool(skill.support_mask[resolved_stop - 1].all().item())
+    ):
+        raise ContractError("terrain compatibility endpoint is invalid")
     clip = dataset.folder.clips[skill.clip_index]
     layout = dataset.folder.layout
     root_index = layout.root_body_index
@@ -172,12 +184,12 @@ def terrain_skill_compatible(
     )
     frames = torch.arange(
         entry_frame,
-        skill.interval.playback_stop,
+        resolved_stop,
         sample_stride,
         dtype=torch.long,
         device=database.device,
     )
-    last = skill.interval.playback_stop - 1
+    last = resolved_stop - 1
     if frames.numel() == 0 or int(frames[-1].item()) != last:
         frames = torch.cat(
             (frames, torch.tensor([last], dtype=torch.long, device=database.device))
@@ -516,7 +528,7 @@ class TerrainSkillMatcher:
         replan_requested = self._replan_pending or command_changed
         can_switch = (
             skill_state is None
-            or skill_state.next_source_frame >= skill_state.skill.interval.playback_stop
+            or skill_state.next_source_frame >= skill_state.playback_stop
             or (
                 replan_requested
                 and skill_state.next_source_frame > skill_state.selected_entry_frame
@@ -535,7 +547,7 @@ class TerrainSkillMatcher:
                 skill_state = replacement
         if (
             skill_state is not None
-            and skill_state.next_source_frame < skill_state.skill.interval.playback_stop
+            and skill_state.next_source_frame < skill_state.playback_stop
         ):
             step = advance_skill(skill_state)
             result = self._skill_result(step, time.perf_counter_ns() - start_ns)

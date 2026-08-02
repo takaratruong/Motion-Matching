@@ -1,0 +1,405 @@
+"""Transactional fixed-horizon terrain-skill rollout and qualification adapter."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import hashlib
+import math
+from types import MappingProxyType
+from typing import Any, Mapping, Sequence
+
+import numpy as np
+import torch
+
+from .joints import ContractError
+from .torch_motion_features import GeneratedFeatureState, extract_query_features
+from .torch_motion_matcher import MatcherConfig, TorchMotionMatcher
+from .torch_terrain_omni_routes import OmniRoute
+from .torch_terrain_skill_composer import start_skill
+from .torch_terrain_skill_horizon_search import (
+    HorizonCost,
+    HorizonSearchConfig,
+    HorizonTargets,
+    TerrainSkillHorizonResult,
+    predict_horizon_targets,
+    select_horizon_candidate,
+)
+from .torch_terrain_skill_horizons import (
+    TerrainSkillHorizonInventory,
+    build_horizon_inventory,
+)
+from .torch_terrain_skill_rollout import (
+    TerrainSkillMatcher,
+    _rotate_xy,
+    _yaw_from_wxyz,
+    terrain_skill_compatible,
+)
+from .torch_terrain_skills import TerrainSkillInventory, build_terrain_skill_inventory
+
+
+@dataclass(frozen=True)
+class HorizonChunkEvent:
+    entry_row: int
+    skill_index: int
+    target_frames: int
+    endpoint_frame_exclusive: int
+    cost: HorizonCost
+    rejected_by_reason: Mapping[str, int]
+    release_reason: str
+
+
+def terrain_height_targets(
+    targets: HorizonTargets,
+    *,
+    current_root_position_world: torch.Tensor,
+    current_root_yaw: torch.Tensor,
+    query_terrain: Any,
+) -> HorizonTargets:
+    """Sample desired vertical change along the commanded root path."""
+
+    if not isinstance(targets, HorizonTargets):
+        raise ContractError("terrain height prediction requires HorizonTargets")
+    if (
+        not isinstance(current_root_position_world, torch.Tensor)
+        or tuple(current_root_position_world.shape) != (3,)
+        or current_root_position_world.device != targets.displacement_local_xy.device
+        or current_root_position_world.dtype != targets.displacement_local_xy.dtype
+        or not torch.isfinite(current_root_position_world).all()
+        or not isinstance(current_root_yaw, torch.Tensor)
+        or current_root_yaw.numel() != 1
+        or current_root_yaw.device != current_root_position_world.device
+        or current_root_yaw.dtype != current_root_position_world.dtype
+    ):
+        raise ContractError("terrain height prediction root state is invalid")
+    try:
+        world_displacement = _rotate_xy(
+            targets.displacement_local_xy, current_root_yaw.reshape(())
+        )
+        world_xy = current_root_position_world[:2].unsqueeze(0) + world_displacement
+        sample_xy = torch.cat(
+            (current_root_position_world[:2].unsqueeze(0), world_xy), dim=0
+        )
+        height = query_terrain.query_grid.sample_xy(
+            query_terrain.alignment.matcher_to_scene_xy(sample_xy)
+        )
+    except (AttributeError, TypeError) as error:
+        raise ContractError("terrain height prediction query is invalid") from error
+    if (
+        not isinstance(height, torch.Tensor)
+        or tuple(height.shape) != (targets.frames.shape[0] + 1,)
+        or height.device != current_root_position_world.device
+        or not torch.isfinite(height).all()
+    ):
+        raise ContractError("terrain height prediction samples are invalid")
+    delta = (height[1:] - height[0]).to(targets.displacement_local_xy.dtype)
+    return HorizonTargets(
+        frames=targets.frames,
+        displacement_local_xy=targets.displacement_local_xy,
+        yaw_delta_rad=targets.yaw_delta_rad,
+        root_height_delta_m=delta,
+        surface_height_delta_m=delta[:, None].expand(-1, 2).clone(),
+    )
+
+
+class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
+    """Use local outcome ranking while preserving transactional frame playback."""
+
+    def __init__(
+        self,
+        *,
+        base_matcher: TorchMotionMatcher,
+        skill_inventory: TerrainSkillInventory,
+        horizon_inventory: TerrainSkillHorizonInventory,
+        dataset: Any,
+        query_terrain: Any,
+        foot_kinematics: Any,
+        config: MatcherConfig,
+        search_config: HorizonSearchConfig = HorizonSearchConfig(),
+        terrain_tolerance_m: float = 0.06,
+    ) -> None:
+        self.base = base_matcher
+        self.database = base_matcher.database
+        self.inventory = skill_inventory
+        self.horizon_inventory = horizon_inventory
+        self.dataset = dataset
+        self.query_terrain = query_terrain
+        self.foot_kinematics = foot_kinematics
+        self.config = config
+        self.search_config = search_config
+        self.terrain_tolerance_m = float(terrain_tolerance_m)
+        self._pending = None
+        self._skill_state = None
+        self._last_result = None
+        self._last_command = None
+        self._replan_pending = False
+        self._shaped_velocity = torch.zeros(2, device=self.database.device)
+        self._shaped_heading = torch.zeros((), device=self.database.device)
+        self._feet = None
+        self._foot_velocity = torch.zeros((2, 3), device=self.database.device)
+        self._root_velocity = torch.zeros(3, device=self.database.device)
+        self._events: list[HorizonChunkEvent] = []
+        self._prepared_selection: TerrainSkillHorizonResult | None = None
+        self._prepared_release_reason: str | None = None
+
+    @property
+    def chunk_events(self) -> tuple[HorizonChunkEvent, ...]:
+        return tuple(self._events)
+
+    def reset(
+        self, *, root_position_world_xy: tuple[float, float] = (0.0, 0.0)
+    ):
+        result = super().reset(root_position_world_xy=root_position_world_xy)
+        self._events.clear()
+        self._prepared_selection = None
+        self._prepared_release_reason = None
+        return result
+
+    def _try_start_skill(
+        self,
+        velocity_world_xy: tuple[float, float],
+        heading_world_yaw: float,
+        shaped: Any,
+    ):
+        result = self._last_result
+        feature_state = GeneratedFeatureState(
+            root_position_world=result.root_position_world,
+            root_orientation_world_wxyz=result.root_orientation_world_wxyz,
+            root_linear_velocity_world=self._root_velocity,
+            left_foot_position_world=self._feet[0],
+            right_foot_position_world=self._feet[1],
+            left_foot_velocity_world=self._foot_velocity[0],
+            right_foot_velocity_world=self._foot_velocity[1],
+        )
+        normalized_query = self.database.normalization.normalize(
+            extract_query_features(feature_state, shaped.trajectory)
+        )
+        current_yaw = _yaw_from_wxyz(result.root_orientation_world_wxyz)
+        requested_velocity = torch.tensor(
+            velocity_world_xy, dtype=torch.float32, device=self.database.device
+        )
+        requested_heading = torch.tensor(
+            heading_world_yaw, dtype=torch.float32, device=self.database.device
+        )
+        targets = predict_horizon_targets(
+            current_velocity_world_xy=self._shaped_velocity,
+            current_heading_world_yaw=current_yaw,
+            requested_velocity_world_xy=requested_velocity,
+            requested_heading_world_yaw=requested_heading,
+            matcher_config=self.config,
+        )
+        targets = terrain_height_targets(
+            targets,
+            current_root_position_world=result.root_position_world,
+            current_root_yaw=current_yaw,
+            query_terrain=self.query_terrain,
+        )
+
+        current_clip: int | None = None
+        current_frame: int | None = None
+        if self._skill_state is not None:
+            current_clip = self._skill_state.skill.clip_index
+            current_frame = self._skill_state.next_source_frame - 1
+        elif self.base._state is not None:
+            current_clip = self.base._state.clip_index
+            current_frame = self.base._state.frame_index
+
+        def compatible(record: int, row: int, endpoint: int) -> bool:
+            skill_index = int(self.horizon_inventory.skill_index[record].item())
+            skill = self.inventory.skills[skill_index]
+            return terrain_skill_compatible(
+                skill=skill,
+                canonical_entry_row=row,
+                dataset=self.dataset,
+                database=self.database,
+                query_terrain=self.query_terrain,
+                current_root_position_world=result.root_position_world,
+                current_root_orientation_world_wxyz=result.root_orientation_world_wxyz,
+                tolerance_m=self.terrain_tolerance_m,
+                playback_stop=endpoint,
+            )
+
+        selected = select_horizon_candidate(
+            self.database,
+            self.horizon_inventory,
+            normalized_query,
+            targets,
+            terrain_validator=compatible,
+            config=self.search_config,
+            current_clip_index=current_clip,
+            current_frame_index=current_frame,
+            matcher_config=self.config,
+        )
+        skill_index = int(
+            self.horizon_inventory.skill_index[selected.record_index].item()
+        )
+        if not 0 <= skill_index < len(self.inventory.skills):
+            raise ContractError("selected horizon has no terrain skill owner")
+        skill = self.inventory.skills[skill_index]
+        if self.inventory.row_to_skill.get(selected.entry_row) != skill_index:
+            raise ContractError("selected horizon row ownership is inconsistent")
+        entry_frame = int(
+            self.horizon_inventory.entry_frame[selected.record_index].item()
+        )
+        if self._skill_state is None:
+            release_reason = "initial"
+        elif self._replan_pending or (
+            self._last_command is not None
+            and (
+                (float(velocity_world_xy[0]), float(velocity_world_xy[1])),
+                float(heading_world_yaw),
+            )
+            != self._last_command
+        ):
+            release_reason = "command_change"
+        else:
+            release_reason = "endpoint"
+        self._prepared_selection = selected
+        self._prepared_release_reason = release_reason
+        return start_skill(
+            self.dataset.folder,
+            skill,
+            selected_entry_frame=entry_frame,
+            current=self._current_pose(),
+            halflife_s=self.config.inertialization_halflife_s,
+            playback_stop=selected.endpoint_frame_exclusive,
+        )
+
+    def prepare_step(self, *args, **kwargs):
+        self._prepared_selection = None
+        self._prepared_release_reason = None
+        return super().prepare_step(*args, **kwargs)
+
+    def commit(self, prepared):
+        selected = self._prepared_selection
+        release_reason = self._prepared_release_reason
+        result = super().commit(prepared)
+        if selected is not None:
+            skill_index = int(
+                self.horizon_inventory.skill_index[selected.record_index].item()
+            )
+            self._events.append(
+                HorizonChunkEvent(
+                    entry_row=selected.entry_row,
+                    skill_index=skill_index,
+                    target_frames=selected.target_frames,
+                    endpoint_frame_exclusive=selected.endpoint_frame_exclusive,
+                    cost=selected.cost,
+                    rejected_by_reason=MappingProxyType(
+                        dict(selected.rejected_by_reason)
+                    ),
+                    release_reason=release_reason or "endpoint",
+                )
+            )
+        self._prepared_selection = None
+        self._prepared_release_reason = None
+        return result
+
+
+def run_resolved_horizon_matrix(
+    resolved,
+    *,
+    g1_xml: str,
+    routes: Sequence[OmniRoute],
+    terrain_tolerance_m: float = 0.06,
+    search_config: HorizonSearchConfig = HorizonSearchConfig(),
+):
+    """Run the renderer-independent route harness with horizon skill MM."""
+
+    import mujoco
+
+    from .torch_g1_fk import MujocoG1FootKinematics
+    from .torch_terrain_live_viewer import (
+        apply_kinematic_state,
+        build_kinematic_scene,
+        matcher_result_qpos,
+    )
+    from .torch_terrain_omni_rollout import (
+        KinematicSample,
+        resolved_stair_reset_position,
+        run_omni_matrix,
+    )
+    from .torch_terrain_omni_routes import StairFrame
+    from .torch_terrain_rollout import matcher_config_from_resolved
+
+    config = matcher_config_from_resolved(resolved.resolved_config)
+    base = TorchMotionMatcher.from_folder(
+        resolved.dataset.root,
+        device=str(resolved.device),
+        config=config,
+        reset_clip_path=resolved.resolved_config["reset_clip"],
+    )
+    skills = build_terrain_skill_inventory(resolved.dataset, base.database)
+    horizons = build_horizon_inventory(resolved.dataset, base.database, skills)
+    matcher = TerrainSkillHorizonMatcher(
+        base_matcher=base,
+        skill_inventory=skills,
+        horizon_inventory=horizons,
+        dataset=resolved.dataset,
+        query_terrain=resolved.measurement_extension,
+        foot_kinematics=MujocoG1FootKinematics(g1_xml),
+        config=config,
+        search_config=search_config,
+        terrain_tolerance_m=terrain_tolerance_m,
+    )
+    model, data = build_kinematic_scene(g1_xml, resolved)
+    left_ankle = int(model.body("left_ankle_roll_link").id)
+    right_ankle = int(model.body("right_ankle_roll_link").id)
+
+    def kinematics(result) -> KinematicSample:
+        qpos = matcher_result_qpos(result)
+        apply_kinematic_state(mujoco, model, data, qpos)
+        w, x, y, z = qpos[3:7]
+        yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        return KinematicSample(
+            qpos=qpos,
+            joint_position=result.joint_position.detach().cpu().numpy(),
+            joint_velocity=result.joint_velocity.detach().cpu().numpy(),
+            root_position_world=result.root_position_world.detach().cpu().numpy(),
+            root_yaw_world=yaw,
+            foot_position_world=np.stack(
+                (data.xpos[left_ankle], data.xpos[right_ankle])
+            ).astype(np.float64, copy=True),
+        )
+
+    measurement = resolved.measurement_extension
+
+    def terrain_sampler(matcher_xy: np.ndarray) -> np.ndarray:
+        points = torch.tensor(
+            matcher_xy, dtype=torch.float32, device=resolved.device
+        )
+        return (
+            measurement.query_grid.sample_xy(
+                measurement.alignment.matcher_to_scene_xy(points)
+            )
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64)
+        )
+
+    direction = np.asarray(
+        resolved.resolved_config["reference_direction_matcher_xy"],
+        dtype=np.float64,
+    )
+    stair_frame = StairFrame(
+        origin_world_xy=(0.0, 0.0),
+        ascent_world_yaw=math.atan2(float(direction[1]), float(direction[0])),
+        width_m=0.6223,
+        tread_depth_m=0.3302,
+        riser_height_m=0.1778,
+        tread_count=3,
+    )
+    identity = hashlib.sha256(
+        (resolved.base_config_sha256 + ":horizon-skills-v1").encode()
+    ).hexdigest()
+    matrix = run_omni_matrix(
+        routes=tuple(routes),
+        stair_frame=stair_frame,
+        matcher_factory=lambda _route: matcher,
+        kinematics=kinematics,
+        terrain_sampler=terrain_sampler,
+        dataset_identity=resolved.dataset.manifest_sha256,
+        config_identity=identity,
+        reset_root_position_world_xy=resolved_stair_reset_position(resolved),
+    )
+    return matrix, matcher.chunk_events
