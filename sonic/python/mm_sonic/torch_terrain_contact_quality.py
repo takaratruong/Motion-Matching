@@ -354,7 +354,7 @@ def build_contact_quality_ablation(
     desired = np.asarray(desired_landing_world_xyz, dtype=np.float64)
     if desired.shape != (3,) or not np.isfinite(desired).all():
         raise ValueError("contact quality ablation desired landing is invalid")
-    if projection_strategy not in ("joint-only", "stance-root"):
+    if projection_strategy not in ("joint-only", "stance-root", "root-only"):
         raise ValueError("contact quality ablation projection strategy is invalid")
 
     current = quality_state_as_oracle(state, action.joint_position)
@@ -423,6 +423,7 @@ def build_contact_quality_ablation(
             root_smoothing_passes=root_smoothing_passes,
             joint_smoothing_passes=joint_smoothing_passes,
             reproject_smoothed_joints=reproject_smoothed_joints,
+            joint_projection_enabled=projection_strategy != "root-only",
         )
         projected_roots = projection.root_position_world
         maximum_root_correction_m = projection.maximum_root_correction_m

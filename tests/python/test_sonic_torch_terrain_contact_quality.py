@@ -132,6 +132,19 @@ class TerrainContactQualityTests(unittest.TestCase):
         self.assertGreater(stance_root.maximum_root_correction_m, 0.0)
         self.assertAlmostEqual(stance_root.projected_landing_error_m, 0.0, places=6)
 
+    def test_root_only_strategy_does_not_edit_joint_motion(self):
+        result = build_contact_quality_ablation(
+            state=_state(),
+            action=_action(),
+            desired_landing_foot=1,
+            desired_landing_world_xyz=np.array((0.45, -0.08, 0.04)),
+            foot_kinematics=_LinearFeet(),
+            projection_strategy="root-only",
+        )
+
+        self.assertEqual(result.maximum_joint_deformation_rad, 0.0)
+        self.assertEqual(result.maximum_joint_correction_speed_rad_s, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -23,7 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--projection-strategy",
         required=True,
-        choices=("joint-only", "stance-root"),
+        choices=("joint-only", "stance-root", "root-only"),
     )
     parser.add_argument(
         "--selection-strategy",

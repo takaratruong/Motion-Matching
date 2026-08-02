@@ -498,7 +498,7 @@ def run_contact_ablation(
 
     if type(maximum_actions_per_state) is not int or maximum_actions_per_state < 1:
         raise ValueError("maximum actions per state must be positive")
-    if projection_strategy not in ("joint-only", "stance-root"):
+    if projection_strategy not in ("joint-only", "stance-root", "root-only"):
         raise ValueError("contact ablation projection strategy is invalid")
     if selection_strategy not in ("saved", "contact-anchored"):
         raise ValueError("contact ablation selection strategy is invalid")

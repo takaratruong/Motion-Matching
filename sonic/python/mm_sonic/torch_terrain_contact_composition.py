@@ -517,6 +517,7 @@ def project_contact_trajectory_with_stance_root(
     root_smoothing_passes: int = 0,
     joint_smoothing_passes: int = 0,
     reproject_smoothed_joints: bool = False,
+    joint_projection_enabled: bool = True,
 ) -> StanceRootProjectionResult:
     """Lock the persistent stance with root translation, then warp the swing leg."""
 
@@ -568,6 +569,9 @@ def project_contact_trajectory_with_stance_root(
         or type(joint_smoothing_passes) is not int
         or not 0 <= joint_smoothing_passes <= 10
         or type(reproject_smoothed_joints) is not bool
+        or type(joint_projection_enabled) is not bool
+        or (not joint_projection_enabled and joint_smoothing_passes != 0)
+        or (not joint_projection_enabled and reproject_smoothed_joints)
     ):
         raise ValueError("stance-root projection inputs are invalid")
     provisional = build_contact_target_trajectory(
@@ -635,21 +639,31 @@ def project_contact_trajectory_with_stance_root(
         entry_foot_position_world=entry_foot_position_world,
         landing_target_world=landing_target_world,
     )
-    projection = project_contact_trajectory(
-        joint_position=joints,
-        root_position_world=corrected_roots,
-        root_orientation_world_wxyz=root_orientation_world_wxyz,
-        targets=ContactTargetTrajectory(
-            position_world=targets.position_world,
-            solve_mask=targets.solve_mask,
-            swing_warp_weight=targets.swing_warp_weight,
-        ),
-        foot_kinematics=foot_kinematics,
-    )
-    projected_joints = projection.joint_position
-    projected_feet = projection.foot_position_world
+    if joint_projection_enabled:
+        projection = project_contact_trajectory(
+            joint_position=joints,
+            root_position_world=corrected_roots,
+            root_orientation_world_wxyz=root_orientation_world_wxyz,
+            targets=ContactTargetTrajectory(
+                position_world=targets.position_world,
+                solve_mask=targets.solve_mask,
+                swing_warp_weight=targets.swing_warp_weight,
+            ),
+            foot_kinematics=foot_kinematics,
+        )
+        projected_joints = projection.joint_position
+        projected_feet = projection.foot_position_world
+        maximum_projection_error = projection.maximum_target_error_m
+    else:
+        projected_joints = joints
+        projected_feet = shifted_feet
+        support_error = torch.linalg.vector_norm(
+            projected_feet - targets.position_world, dim=2
+        )[support_mask]
+        maximum_projection_error = (
+            float(support_error.max().item()) if support_error.numel() else 0.0
+        )
     total_root_correction = root_correction
-    maximum_projection_error = projection.maximum_target_error_m
     if joint_smoothing_passes:
         joint_correction = projected_joints - joints
         joint_boundary_start = joint_correction[0].clone()
