@@ -172,6 +172,8 @@ rather than relying on a denser root-centered height grid.
 - 65 relevant tests passed from a clean detached worktree at commit `2ec4a31`.
 - 78 terrain matcher/viewer tests passed from the clean detached worktree at
   commit `13d3c0a`.
+- 90 terrain matcher/viewer tests passed from the clean detached worktree at
+  final commit `2a06f15`.
 - The clean six-route matrix at `bc93c5e` passed 6/6 twice with an identical hash.
 - The clean 3 cm swing-clearance matrix at `13d3c0a` passed 6/6 twice with an
   identical hash; maximum joint speed was 12.00 rad/s.
