@@ -33,7 +33,6 @@ class TerrainFootLockFilter:
         swing_clearance_margin_m: float | None = None,
         swing_plan_sigma_frames: float | None = None,
         swing_plan_full_interval: bool = False,
-        swing_plan_include_touchdown: bool = False,
     ) -> None:
         paths = tuple(clip_paths)
         masks = tuple(support_masks)
@@ -97,11 +96,6 @@ class TerrainFootLockFilter:
             or ((source_feet is None) != (source_yaws is None))
             or type(swing_plan_full_interval) is not bool
             or (swing_plan_full_interval and swing_plan_sigma_frames is None)
-            or type(swing_plan_include_touchdown) is not bool
-            or (
-                swing_plan_include_touchdown
-                and swing_plan_sigma_frames is None
-            )
             or (
                 source_feet is not None
                 and (
@@ -170,7 +164,6 @@ class TerrainFootLockFilter:
             else float(swing_plan_sigma_frames)
         )
         self._swing_plan_full_interval = swing_plan_full_interval
-        self._swing_plan_include_touchdown = swing_plan_include_touchdown
         self._lock_position = torch.full(
             (2, 3), float("nan"), dtype=torch.float32, device=device
         )
@@ -227,11 +220,7 @@ class TerrainFootLockFilter:
         while stop < support.shape[0] and not bool(support[stop].item()):
             stop += 1
         start = frame
-        range_stop = (
-            min(stop + 1, support.shape[0])
-            if self._swing_plan_include_touchdown
-            else stop
-        )
+        range_stop = stop
         if self._swing_plan_full_interval:
             while start > 0 and not bool(support[start - 1].item()):
                 start -= 1
@@ -473,7 +462,6 @@ def build_terrain_foot_lock(
     correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
     swing_plan_full_interval: bool = False,
-    swing_plan_include_touchdown: bool = False,
 ):
     """Build a source-contact foot lock against the resolved query terrain."""
 
@@ -539,5 +527,4 @@ def build_terrain_foot_lock(
         correction_halflife_s=correction_halflife_s,
         swing_plan_sigma_frames=swing_plan_sigma_frames,
         swing_plan_full_interval=swing_plan_full_interval,
-        swing_plan_include_touchdown=swing_plan_include_touchdown,
     )

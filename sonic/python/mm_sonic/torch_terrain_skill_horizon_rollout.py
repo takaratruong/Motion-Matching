@@ -367,7 +367,6 @@ def run_resolved_horizon_matrix(
     foot_correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
     swing_plan_full_interval: bool = False,
-    swing_plan_include_touchdown: bool = False,
 ):
     """Run the renderer-independent route harness with horizon skill MM."""
 
@@ -411,7 +410,6 @@ def run_resolved_horizon_matrix(
             correction_halflife_s=foot_correction_halflife_s,
             swing_plan_sigma_frames=swing_plan_sigma_frames,
             swing_plan_full_interval=swing_plan_full_interval,
-            swing_plan_include_touchdown=swing_plan_include_touchdown,
         )
     route_matchers: dict[str, TerrainSkillHorizonMatcher] = {}
     model, data = build_kinematic_scene(g1_xml, resolved)
@@ -487,11 +485,6 @@ def run_resolved_horizon_matrix(
                 ":full-swing-interval-v1"
                 if swing_plan_full_interval
                 else ":future-only-swing"
-            )
-            + (
-                ":touchdown-preview-v1"
-                if swing_plan_include_touchdown
-                else ":pre-touchdown-only"
             )
         ).encode()
     ).hexdigest()
