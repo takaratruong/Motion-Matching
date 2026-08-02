@@ -191,6 +191,12 @@ identical SHA-256
   from 16/21 to 14/21, with aggregate frozen slide rising from 1.923 m to
   2.207 m. Per-foot height is useful evidence, but a greedy query cannot know
   which future contact is reachable and compatible with the next command.
+- Double-support gait context was tested as a layered hard gate using the foot
+  that just landed, the foot that swings next, and both together. Every form
+  dropped the frozen gate from 6/6 to 4/6 and increased aggregate slide. Some
+  individual maneuvers improved (notably reversal with previous-contact context
+  and diagonal descent with next-contact context), confirming that gait context
+  is informative, but a hard identity constraint overfits sparse transitions.
 
 ## Literature alignment
 
