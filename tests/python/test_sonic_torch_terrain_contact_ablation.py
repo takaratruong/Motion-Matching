@@ -6,6 +6,7 @@ import numpy as np
 from mm_sonic.torch_terrain_contact_ablation import (
     contact_anchored_prefilter,
     contact_ablation_passes,
+    measure_projected_terrain,
     selected_ranked_action_indices,
 )
 from mm_sonic.torch_contact_oracle_actions import (
@@ -49,6 +50,8 @@ class TerrainContactAblationTests(unittest.TestCase):
             "maximum_root_correction_m": 0.05,
             "maximum_root_correction_speed_m_s": 0.5,
             "maximum_joint_correction_speed_rad_s": 5.0,
+            "maximum_projected_stance_height_error_m": 0.01,
+            "minimum_projected_swing_clearance_m": 0.02,
         }
         self.assertTrue(contact_ablation_passes(passing))
         self.assertFalse(
@@ -81,6 +84,16 @@ class TerrainContactAblationTests(unittest.TestCase):
                 {**passing, "maximum_joint_correction_speed_rad_s": 8.01}
             )
         )
+        self.assertFalse(
+            contact_ablation_passes(
+                {**passing, "maximum_projected_stance_height_error_m": 0.051}
+            )
+        )
+        self.assertFalse(
+            contact_ablation_passes(
+                {**passing, "minimum_projected_swing_clearance_m": -0.031}
+            )
+        )
 
     def test_contact_prefilter_ranks_after_support_foot_anchoring(self):
         first = _action()
@@ -105,6 +118,29 @@ class TerrainContactAblationTests(unittest.TestCase):
         )
 
         self.assertEqual(ranked[0], 1)
+
+    def test_projected_terrain_metrics_separate_stance_and_swing(self):
+        feet = np.array(
+            (
+                ((0.0, 0.1, 0.035), (0.0, -0.1, 0.10)),
+                ((0.0, 0.1, 0.045), (0.1, -0.1, 0.02)),
+            )
+        )
+        support = np.array(((True, False), (True, True)))
+        surface = np.zeros((2, 2))
+
+        metrics = measure_projected_terrain(
+            foot_position_world=feet,
+            source_support_mask=support,
+            foot_surface_height_m=surface,
+        )
+
+        self.assertAlmostEqual(
+            metrics["maximum_projected_stance_height_error_m"], 0.015
+        )
+        self.assertAlmostEqual(
+            metrics["minimum_projected_swing_clearance_m"], 0.065
+        )
 
 
 if __name__ == "__main__":

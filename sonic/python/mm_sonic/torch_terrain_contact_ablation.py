@@ -15,6 +15,7 @@ import numpy as np
 import torch
 
 from .torch_contact_oracle_search import OracleConstraints
+from .torch_contact_segments import ANKLE_ORIGIN_SOLE_M
 from .torch_terrain_action_quality import NativeActionQuality
 from .torch_terrain_contact_quality import (
     ContactQualityAblationResult,
@@ -82,12 +83,21 @@ def contact_ablation_passes(metrics: Mapping[str, object]) -> bool:
         "maximum_root_correction_m",
         "maximum_root_correction_speed_m_s",
         "maximum_joint_correction_speed_rad_s",
+        "maximum_projected_stance_height_error_m",
+        "minimum_projected_swing_clearance_m",
     )
     try:
         values = {name: float(metrics[name]) for name in names}
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("contact ablation metrics are incomplete") from error
-    if any(not np.isfinite(value) or value < 0.0 for value in values.values()):
+    nonnegative = (
+        name
+        for name in names
+        if name != "minimum_projected_swing_clearance_m"
+    )
+    if any(
+        not np.isfinite(value) for value in values.values()
+    ) or any(values[name] < 0.0 for name in nonnegative):
         raise ValueError("contact ablation metrics are invalid")
     return bool(
         values["projected_stance_drift_m"] <= 0.03
@@ -98,7 +108,44 @@ def contact_ablation_passes(metrics: Mapping[str, object]) -> bool:
         and values["maximum_root_correction_m"] <= 0.10
         and values["maximum_root_correction_speed_m_s"] <= 1.0
         and values["maximum_joint_correction_speed_rad_s"] <= 8.0
+        and values["maximum_projected_stance_height_error_m"] <= 0.05
+        and values["minimum_projected_swing_clearance_m"] >= -0.03
     )
+
+
+def measure_projected_terrain(
+    *,
+    foot_position_world: object,
+    source_support_mask: object,
+    foot_surface_height_m: object,
+) -> dict[str, float]:
+    """Measure projected contact height error and unsupported clearance."""
+
+    feet = np.asarray(foot_position_world, dtype=np.float64)
+    support = np.asarray(source_support_mask)
+    surface = np.asarray(foot_surface_height_m, dtype=np.float64)
+    if (
+        feet.ndim != 3
+        or feet.shape[1:] != (2, 3)
+        or feet.shape[0] < 2
+        or support.dtype != np.bool_
+        or support.shape != feet.shape[:2]
+        or surface.shape != feet.shape[:2]
+        or not np.isfinite(feet).all()
+        or not np.isfinite(surface).all()
+    ):
+        raise ValueError("projected terrain metric inputs are invalid")
+    clearance = feet[:, :, 2] - surface - float(ANKLE_ORIGIN_SOLE_M)
+    stance_error = np.abs(clearance[support])
+    swing_clearance = clearance[~support]
+    return {
+        "maximum_projected_stance_height_error_m": (
+            float(stance_error.max()) if stance_error.size else 0.0
+        ),
+        "minimum_projected_swing_clearance_m": (
+            float(swing_clearance.min()) if swing_clearance.size else 0.0
+        ),
+    }
 
 
 def _rotate_batch_xy(values: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:
@@ -642,6 +689,23 @@ def run_contact_ablation(
                 )
                 continue
             metrics = _metrics(result)
+            projected_feet = torch.as_tensor(
+                np.array(result.projected_foot_position_world, copy=True),
+                dtype=torch.float32,
+                device=baseline_resolved.device,
+            )
+            projected_surface = sample_surface(
+                projected_feet[..., :2].reshape(-1, 2)
+            ).reshape(projected_feet.shape[:2])
+            metrics.update(
+                measure_projected_terrain(
+                    foot_position_world=result.projected_foot_position_world,
+                    source_support_mask=result.source_support_mask,
+                    foot_surface_height_m=(
+                        projected_surface.detach().cpu().numpy()
+                    ),
+                )
+            )
             accepted = contact_ablation_passes(metrics)
             successful[action_index] = result
             action_records.append(
