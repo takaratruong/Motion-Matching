@@ -7,6 +7,9 @@ import numpy as np
 from mm_sonic.terrain_oracle.canonical import (
     CanonicalClip,
     CommandTrack,
+    CLEAN_POSE_ORIGIN,
+    ISAACLAB_BODY_NAMES,
+    ISAACLAB_JOINT_NAMES,
     SourceIdentity,
     derive_clip_kinematics,
 )
@@ -31,9 +34,12 @@ def synthetic_canonical_clip(
             source_format="synthetic",
             source_path="synthetic://forward",
             source_sha256="0" * 64,
-            coordinate_convention="world-right-handed-z-up",
+            coordinate_convention="z-up-right-handed",
             quaternion_convention="wxyz",
+            pose_origin=CLEAN_POSE_ORIGIN,
         ),
+        joint_names=ISAACLAB_JOINT_NAMES,
+        body_names=ISAACLAB_BODY_NAMES,
         root_position_world=root_position,
         root_quaternion_world_wxyz=identity_quaternion,
         joint_position=np.zeros((frames, 29), dtype=np.float32),

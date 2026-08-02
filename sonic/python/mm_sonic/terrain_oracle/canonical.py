@@ -13,6 +13,75 @@ from .math3d import RigidTransform, angular_velocity_world_wxyz, finite_differen
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+CANONICAL_COORDINATE_CONVENTION = "z-up-right-handed"
+CLEAN_POSE_ORIGIN = "clean-motion-corpus"
+
+# Kept here rather than imported from a source adapter so the canonical boundary
+# remains usable without optional simulator/runtime dependencies.
+ISAACLAB_JOINT_NAMES = (
+    "left_hip_pitch_joint",
+    "right_hip_pitch_joint",
+    "waist_yaw_joint",
+    "left_hip_roll_joint",
+    "right_hip_roll_joint",
+    "waist_roll_joint",
+    "left_hip_yaw_joint",
+    "right_hip_yaw_joint",
+    "waist_pitch_joint",
+    "left_knee_joint",
+    "right_knee_joint",
+    "left_shoulder_pitch_joint",
+    "right_shoulder_pitch_joint",
+    "left_ankle_pitch_joint",
+    "right_ankle_pitch_joint",
+    "left_shoulder_roll_joint",
+    "right_shoulder_roll_joint",
+    "left_ankle_roll_joint",
+    "right_ankle_roll_joint",
+    "left_shoulder_yaw_joint",
+    "right_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "right_elbow_joint",
+    "left_wrist_roll_joint",
+    "right_wrist_roll_joint",
+    "left_wrist_pitch_joint",
+    "right_wrist_pitch_joint",
+    "left_wrist_yaw_joint",
+    "right_wrist_yaw_joint",
+)
+
+ISAACLAB_BODY_NAMES = (
+    "pelvis",
+    "left_hip_pitch_link",
+    "right_hip_pitch_link",
+    "waist_yaw_link",
+    "left_hip_roll_link",
+    "right_hip_roll_link",
+    "waist_roll_link",
+    "left_hip_yaw_link",
+    "right_hip_yaw_link",
+    "torso_link",
+    "left_knee_link",
+    "right_knee_link",
+    "left_shoulder_pitch_link",
+    "right_shoulder_pitch_link",
+    "left_ankle_pitch_link",
+    "right_ankle_pitch_link",
+    "left_shoulder_roll_link",
+    "right_shoulder_roll_link",
+    "left_ankle_roll_link",
+    "right_ankle_roll_link",
+    "left_shoulder_yaw_link",
+    "right_shoulder_yaw_link",
+    "left_elbow_link",
+    "right_elbow_link",
+    "left_wrist_roll_link",
+    "right_wrist_roll_link",
+    "left_wrist_pitch_link",
+    "right_wrist_pitch_link",
+    "left_wrist_yaw_link",
+    "right_wrist_yaw_link",
+)
 
 
 def _readonly_float32(value: object, label: str) -> np.ndarray:
@@ -68,6 +137,7 @@ class SourceIdentity:
     source_sha256: str
     coordinate_convention: str
     quaternion_convention: str
+    pose_origin: str
 
     def __post_init__(self) -> None:
         for name in (
@@ -75,6 +145,7 @@ class SourceIdentity:
             "source_path",
             "coordinate_convention",
             "quaternion_convention",
+            "pose_origin",
         ):
             _nonempty(getattr(self, name), name)
         _hash(self.source_sha256, "source_sha256")
@@ -161,6 +232,8 @@ class CanonicalClip:
     clip_id: str
     fps: float
     source: SourceIdentity
+    joint_names: tuple[str, ...]
+    body_names: tuple[str, ...]
     root_position_world: np.ndarray
     root_quaternion_world_wxyz: np.ndarray
     joint_position: np.ndarray
@@ -186,6 +259,12 @@ class CanonicalClip:
         _nonempty(self.clip_id, "clip_id")
         if not isinstance(self.source, SourceIdentity):
             raise ContractError("source must be a SourceIdentity")
+        if type(self.joint_names) not in (tuple, list):
+            raise ContractError("joint_names must be a tuple of strings")
+        if type(self.body_names) not in (tuple, list):
+            raise ContractError("body_names must be a tuple of strings")
+        object.__setattr__(self, "joint_names", tuple(self.joint_names))
+        object.__setattr__(self, "body_names", tuple(self.body_names))
         for name in (
             "root_position_world",
             "root_quaternion_world_wxyz",
@@ -225,6 +304,16 @@ class CanonicalClip:
             raise ContractError("canonical clip must contain at least two 50 Hz frames")
         if self.source.quaternion_convention != "wxyz":
             raise ContractError("root quaternion provenance must explicitly be wxyz")
+        if self.source.coordinate_convention != CANONICAL_COORDINATE_CONVENTION:
+            raise ContractError(
+                "coordinate convention must explicitly be z-up-right-handed"
+            )
+        if self.source.pose_origin != CLEAN_POSE_ORIGIN:
+            raise ContractError("canonical clip must have a clean pose origin")
+        if self.joint_names != ISAACLAB_JOINT_NAMES:
+            raise ContractError("joint_names must equal the IsaacLab canonical order")
+        if self.body_names != ISAACLAB_BODY_NAMES:
+            raise ContractError("body_names must equal the IsaacLab canonical order")
         frame_count = self.frame_count
         expected = {
             "root_position_world": (frame_count, 3),

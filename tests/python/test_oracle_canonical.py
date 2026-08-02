@@ -49,6 +49,49 @@ class CanonicalClipTests(unittest.TestCase):
                 self.assertTrue(value.flags.c_contiguous)
                 self.assertFalse(value.flags.writeable)
 
+    def test_canonical_clip_rejects_non_z_up_right_handed_provenance(self):
+        """Catches canonical poses admitted from a different world convention."""
+
+        clip = synthetic_canonical_clip(frames=6)
+        bad = replace(
+            clip,
+            source=replace(
+                clip.source, coordinate_convention="y-up-right-handed"
+            ),
+        )
+        with self.assertRaisesRegex(ContractError, "coordinate"):
+            bad.validate()
+
+    def test_canonical_clip_rejects_sonic_rollout_pose_origin(self):
+        """Catches SONIC rollout poses being passed off as clean corpus motion."""
+
+        clip = synthetic_canonical_clip(frames=6)
+        bad = replace(
+            clip,
+            source=replace(clip.source, pose_origin="sonic-rollout-window"),
+        )
+        with self.assertRaisesRegex(ContractError, "clean pose origin"):
+            bad.validate()
+
+    def test_canonical_clip_rejects_noncanonical_joint_and_body_orders(self):
+        """Catches canonical-shaped arrays whose rows have been silently reordered."""
+
+        clip = synthetic_canonical_clip(frames=6)
+        swapped_joints = (
+            clip.joint_names[1],
+            clip.joint_names[0],
+            *clip.joint_names[2:],
+        )
+        with self.assertRaisesRegex(ContractError, "joint_names"):
+            replace(clip, joint_names=swapped_joints).validate()
+        swapped_bodies = (
+            clip.body_names[1],
+            clip.body_names[0],
+            *clip.body_names[2:],
+        )
+        with self.assertRaisesRegex(ContractError, "body_names"):
+            replace(clip, body_names=swapped_bodies).validate()
+
 
 class CanonicalMathTests(unittest.TestCase):
     def test_quaternion_unrolling_is_independent_for_each_body_trace(self):
@@ -72,8 +115,9 @@ class CanonicalMathTests(unittest.TestCase):
             source_format="fixture",
             source_path="fixture://clip",
             source_sha256="1" * 64,
-            coordinate_convention="world-right-handed-z-up",
+            coordinate_convention="z-up-right-handed",
             quaternion_convention="wxyz",
+            pose_origin="clean-motion-corpus",
         )
         self.assertEqual(identity.quaternion_convention, "wxyz")
 
