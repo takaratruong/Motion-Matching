@@ -84,6 +84,15 @@ class _FailingFootKinematics(_LinearFootKinematics):
         raise RuntimeError("unreachable")
 
 
+class _CountingFootKinematics(_LinearFootKinematics):
+    def __init__(self):
+        self.solve_count = 0
+
+    def solve_leg_positions(self, joints, root, quaternion, mask, targets):
+        self.solve_count += 1
+        return super().solve_leg_positions(joints, root, quaternion, mask, targets)
+
+
 class TerrainContactCompositionTests(unittest.TestCase):
     def test_single_support_anchor_eliminates_entry_error(self):
         state = _state(((2.25, 3.15, 0.05), (2.0, 2.9, 0.08)))
@@ -372,6 +381,45 @@ class TerrainContactCompositionTests(unittest.TestCase):
             regularized.maximum_joint_correction_speed_rad_s,
             projected.maximum_joint_correction_speed_rad_s,
         )
+
+    def test_stance_root_projection_can_reproject_smoothed_contact_targets(self):
+        joints = torch.zeros((3, 29))
+        joints[:, :3] = torch.tensor((0.0, 0.1, 0.0))
+        joints[:, 3:6] = torch.tensor(
+            ((0.0, -0.1, 0.2), (0.2, -0.1, 0.3), (0.4, -0.1, 0.0))
+        )
+        roots = torch.tensor(
+            ((0.0, 0.0, 0.5), (0.08, 0.0, 0.5), (0.12, 0.0, 0.5))
+        )
+        quaternions = torch.tensor(((1.0, 0.0, 0.0, 0.0),) * 3)
+        kinematics = _CountingFootKinematics()
+        raw_feet = torch.as_tensor(
+            kinematics.foot_positions(joints, roots, quaternions)
+        )
+        support = torch.tensor(
+            ((True, False), (True, False), (True, True))
+        )
+        landing = torch.tensor((0.52, -0.08, 0.52))
+
+        projected = project_contact_trajectory_with_stance_root(
+            joint_position=joints,
+            root_position_world=roots,
+            root_orientation_world_wxyz=quaternions,
+            raw_foot_position_world=raw_feet,
+            support_mask=support,
+            swing_foot=1,
+            entry_foot_position_world=raw_feet[0],
+            landing_target_world=landing,
+            foot_kinematics=kinematics,
+            root_correction_scale=0.75,
+            root_smoothing_passes=2,
+            joint_smoothing_passes=2,
+            reproject_smoothed_joints=True,
+        )
+
+        self.assertEqual(kinematics.solve_count, 6)
+        torch.testing.assert_close(projected.foot_position_world[-1, 1], landing)
+        self.assertLess(projected.maximum_target_error_m, 1.0e-6)
 
 
 if __name__ == "__main__":

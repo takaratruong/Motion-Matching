@@ -337,6 +337,7 @@ def build_contact_quality_ablation(
     root_correction_scale: float = 1.0,
     root_smoothing_passes: int = 0,
     joint_smoothing_passes: int = 0,
+    reproject_smoothed_joints: bool = False,
 ) -> ContactQualityAblationResult:
     """Measure contact anchoring and projected composition on one action."""
 
@@ -421,6 +422,7 @@ def build_contact_quality_ablation(
             root_correction_scale=root_correction_scale,
             root_smoothing_passes=root_smoothing_passes,
             joint_smoothing_passes=joint_smoothing_passes,
+            reproject_smoothed_joints=reproject_smoothed_joints,
         )
         projected_roots = projection.root_position_world
         maximum_root_correction_m = projection.maximum_root_correction_m

@@ -516,6 +516,7 @@ def project_contact_trajectory_with_stance_root(
     root_correction_scale: float = 1.0,
     root_smoothing_passes: int = 0,
     joint_smoothing_passes: int = 0,
+    reproject_smoothed_joints: bool = False,
 ) -> StanceRootProjectionResult:
     """Lock the persistent stance with root translation, then warp the swing leg."""
 
@@ -566,6 +567,7 @@ def project_contact_trajectory_with_stance_root(
         or not 0 <= root_smoothing_passes <= 10
         or type(joint_smoothing_passes) is not int
         or not 0 <= joint_smoothing_passes <= 10
+        or type(reproject_smoothed_joints) is not bool
     ):
         raise ValueError("stance-root projection inputs are invalid")
     provisional = build_contact_target_trajectory(
@@ -647,6 +649,7 @@ def project_contact_trajectory_with_stance_root(
     projected_joints = projection.joint_position
     projected_feet = projection.foot_position_world
     total_root_correction = root_correction
+    maximum_projection_error = projection.maximum_target_error_m
     if joint_smoothing_passes:
         joint_correction = projected_joints - joints
         joint_boundary_start = joint_correction[0].clone()
@@ -693,37 +696,52 @@ def project_contact_trajectory_with_stance_root(
         projected_feet = torch.as_tensor(
             smoothed_feet_numpy, dtype=joints.dtype, device=joints.device
         )
-        residual_root = torch.zeros_like(root_correction)
-        residual_known = support_mask.any(dim=1)
-        residual_indices = torch.nonzero(
-            residual_known, as_tuple=False
-        ).flatten()
-        for frame in residual_indices.detach().cpu().tolist():
-            supported = support_mask[frame]
-            residual_root[frame] = torch.mean(
-                targets.position_world[frame, supported]
-                - projected_feet[frame, supported],
-                dim=0,
+        if reproject_smoothed_joints:
+            polished = project_contact_trajectory(
+                joint_position=projected_joints,
+                root_position_world=corrected_roots,
+                root_orientation_world_wxyz=root_orientation_world_wxyz,
+                targets=targets,
+                foot_kinematics=foot_kinematics,
             )
-        residual_list = residual_indices.detach().cpu().tolist()
-        for left, right in zip(residual_list[:-1], residual_list[1:]):
-            if right == left + 1:
-                continue
-            phase = torch.linspace(
-                0.0,
-                1.0,
-                right - left + 1,
-                dtype=joints.dtype,
-                device=joints.device,
+            projected_joints = polished.joint_position
+            projected_feet = polished.foot_position_world
+            maximum_projection_error = max(
+                maximum_projection_error,
+                polished.maximum_target_error_m,
             )
-            smoothstep = phase.square() * (3.0 - 2.0 * phase)
-            residual_root[left : right + 1] = (
-                residual_root[left][None] * (1.0 - smoothstep[:, None])
-                + residual_root[right][None] * smoothstep[:, None]
-            )
-        corrected_roots = corrected_roots + residual_root
-        projected_feet = projected_feet + residual_root[:, None, :]
-        total_root_correction = root_correction + residual_root
+        else:
+            residual_root = torch.zeros_like(root_correction)
+            residual_known = support_mask.any(dim=1)
+            residual_indices = torch.nonzero(
+                residual_known, as_tuple=False
+            ).flatten()
+            for frame in residual_indices.detach().cpu().tolist():
+                supported = support_mask[frame]
+                residual_root[frame] = torch.mean(
+                    targets.position_world[frame, supported]
+                    - projected_feet[frame, supported],
+                    dim=0,
+                )
+            residual_list = residual_indices.detach().cpu().tolist()
+            for left, right in zip(residual_list[:-1], residual_list[1:]):
+                if right == left + 1:
+                    continue
+                phase = torch.linspace(
+                    0.0,
+                    1.0,
+                    right - left + 1,
+                    dtype=joints.dtype,
+                    device=joints.device,
+                )
+                smoothstep = phase.square() * (3.0 - 2.0 * phase)
+                residual_root[left : right + 1] = (
+                    residual_root[left][None] * (1.0 - smoothstep[:, None])
+                    + residual_root[right][None] * smoothstep[:, None]
+                )
+            corrected_roots = corrected_roots + residual_root
+            projected_feet = projected_feet + residual_root[:, None, :]
+            total_root_correction = root_correction + residual_root
     target_error = torch.linalg.vector_norm(
         projected_feet - targets.position_world,
         dim=2,
@@ -734,7 +752,7 @@ def project_contact_trajectory_with_stance_root(
         joint_position=projected_joints,
         foot_position_world=projected_feet,
         maximum_target_error_m=max(
-            projection.maximum_target_error_m,
+            maximum_projection_error,
             float(target_error.max().item()) if target_error.numel() else 0.0,
         ),
         maximum_root_correction_m=float(
