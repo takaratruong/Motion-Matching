@@ -244,6 +244,40 @@ class TerrainFootLockTests(unittest.TestCase):
             float(native.joint_position[5]),
         )
 
+    def test_source_swing_plan_uses_toe_and_heel_clearance_when_provided(self):
+        support = torch.tensor(
+            ((True, False), (True, False), (True, True)), dtype=torch.bool
+        )
+        source_feet = torch.zeros((3, 2, 3), dtype=torch.float32)
+        source_points = torch.zeros((3, 2, 4, 3), dtype=torch.float32)
+        source_points[..., 2] = -0.035
+        source_points[:, 1, 0, 0] = 0.12
+        foot_lock = TerrainFootLockFilter(
+            clip_paths=("clip.npz",),
+            support_masks=(support,),
+            source_foot_positions=(source_feet,),
+            source_foot_points=(source_points,),
+            source_root_yaws=(torch.zeros(3),),
+            foot_kinematics=_LinearFeet(),
+            sample_surface=lambda xy: torch.where(
+                xy[:, 0] >= 0.10,
+                torch.full((xy.shape[0],), 0.1),
+                torch.zeros(xy.shape[0]),
+            ),
+            device=torch.device("cpu"),
+            swing_clearance_margin_m=0.01,
+            swing_plan_sigma_frames=2.0,
+        )
+        native = _result(0, 0.0)
+        native.joint_position[5] = -0.44
+
+        corrected = foot_lock.apply(native)
+
+        self.assertGreater(
+            float(corrected.joint_position[5]),
+            float(native.joint_position[5]),
+        )
+
     def test_source_swing_plan_falls_back_at_terrain_grid_boundary(self):
         support = torch.tensor(
             ((True, False), (True, False), (True, True)), dtype=torch.bool
