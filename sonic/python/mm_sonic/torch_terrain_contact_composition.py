@@ -133,6 +133,7 @@ class ContactProjectionResult:
     maximum_target_error_m: float
     maximum_joint_deformation_rad: float
     rms_joint_deformation_rad: float
+    maximum_joint_correction_speed_rad_s: float
 
     def __post_init__(self) -> None:
         joints = self.joint_position
@@ -153,6 +154,7 @@ class ContactProjectionResult:
             "maximum_target_error_m",
             "maximum_joint_deformation_rad",
             "rms_joint_deformation_rad",
+            "maximum_joint_correction_speed_rad_s",
         ):
             value = getattr(self, name)
             if (
@@ -181,6 +183,7 @@ class StanceRootProjectionResult:
     maximum_root_correction_speed_m_s: float
     maximum_joint_deformation_rad: float
     rms_joint_deformation_rad: float
+    maximum_joint_correction_speed_rad_s: float
 
     def __post_init__(self) -> None:
         roots = self.root_position_world
@@ -209,6 +212,7 @@ class StanceRootProjectionResult:
             "maximum_root_correction_speed_m_s",
             "maximum_joint_deformation_rad",
             "rms_joint_deformation_rad",
+            "maximum_joint_correction_speed_rad_s",
         ):
             value = getattr(self, name)
             if (
@@ -491,6 +495,10 @@ def project_contact_trajectory(
         ),
         maximum_joint_deformation_rad=float(np.abs(deformation).max()),
         rms_joint_deformation_rad=float(np.sqrt(np.mean(np.square(deformation)))),
+        maximum_joint_correction_speed_rad_s=float(
+            np.linalg.norm(np.diff(deformation, axis=0), axis=1).max(initial=0.0)
+            * 50.0
+        ),
     )
 
 
@@ -507,6 +515,7 @@ def project_contact_trajectory_with_stance_root(
     foot_kinematics: object,
     root_correction_scale: float = 1.0,
     root_smoothing_passes: int = 0,
+    joint_smoothing_passes: int = 0,
 ) -> StanceRootProjectionResult:
     """Lock the persistent stance with root translation, then warp the swing leg."""
 
@@ -555,6 +564,8 @@ def project_contact_trajectory_with_stance_root(
         or not 0.0 <= float(root_correction_scale) <= 1.0
         or type(root_smoothing_passes) is not int
         or not 0 <= root_smoothing_passes <= 10
+        or type(joint_smoothing_passes) is not int
+        or not 0 <= joint_smoothing_passes <= 10
     ):
         raise ValueError("stance-root projection inputs are invalid")
     provisional = build_contact_target_trajectory(
@@ -633,27 +644,118 @@ def project_contact_trajectory_with_stance_root(
         ),
         foot_kinematics=foot_kinematics,
     )
+    projected_joints = projection.joint_position
+    projected_feet = projection.foot_position_world
+    total_root_correction = root_correction
+    if joint_smoothing_passes:
+        joint_correction = projected_joints - joints
+        joint_boundary_start = joint_correction[0].clone()
+        joint_boundary_end = joint_correction[-1].clone()
+        for _ in range(joint_smoothing_passes):
+            padded = torch.cat(
+                (
+                    joint_correction[:1].expand(2, 29),
+                    joint_correction,
+                    joint_correction[-1:].expand(2, 29),
+                ),
+                dim=0,
+            )
+            joint_correction = sum(
+                weight * padded[offset : offset + joints.shape[0]]
+                for offset, weight in enumerate(weights)
+            ) / sum(weights)
+            joint_correction[0] = joint_boundary_start
+            joint_correction[-1] = joint_boundary_end
+        projected_joints = joints + joint_correction
+        forward = getattr(foot_kinematics, "foot_positions", None)
+        if not callable(forward):
+            raise ValueError("stance-root projection foot kinematics is invalid")
+        try:
+            smoothed_feet_numpy = np.asarray(
+                forward(
+                    projected_joints.detach().cpu().numpy(),
+                    corrected_roots.detach().cpu().numpy(),
+                    root_orientation_world_wxyz.detach().cpu().numpy(),
+                ),
+                dtype=np.float64,
+            )
+        except Exception as error:
+            raise ValueError(
+                "stance-root projection smoothing forward kinematics failed"
+            ) from error
+        if (
+            smoothed_feet_numpy.shape != (joints.shape[0], 2, 3)
+            or not np.isfinite(smoothed_feet_numpy).all()
+        ):
+            raise ValueError(
+                "stance-root projection smoothing returned invalid feet"
+            )
+        projected_feet = torch.as_tensor(
+            smoothed_feet_numpy, dtype=joints.dtype, device=joints.device
+        )
+        residual_root = torch.zeros_like(root_correction)
+        residual_known = support_mask.any(dim=1)
+        residual_indices = torch.nonzero(
+            residual_known, as_tuple=False
+        ).flatten()
+        for frame in residual_indices.detach().cpu().tolist():
+            supported = support_mask[frame]
+            residual_root[frame] = torch.mean(
+                targets.position_world[frame, supported]
+                - projected_feet[frame, supported],
+                dim=0,
+            )
+        residual_list = residual_indices.detach().cpu().tolist()
+        for left, right in zip(residual_list[:-1], residual_list[1:]):
+            if right == left + 1:
+                continue
+            phase = torch.linspace(
+                0.0,
+                1.0,
+                right - left + 1,
+                dtype=joints.dtype,
+                device=joints.device,
+            )
+            smoothstep = phase.square() * (3.0 - 2.0 * phase)
+            residual_root[left : right + 1] = (
+                residual_root[left][None] * (1.0 - smoothstep[:, None])
+                + residual_root[right][None] * smoothstep[:, None]
+            )
+        corrected_roots = corrected_roots + residual_root
+        projected_feet = projected_feet + residual_root[:, None, :]
+        total_root_correction = root_correction + residual_root
     target_error = torch.linalg.vector_norm(
-        projection.foot_position_world - targets.position_world,
+        projected_feet - targets.position_world,
         dim=2,
-    )[targets.solve_mask]
+    )[support_mask]
+    joint_deformation = projected_joints - joints
     return StanceRootProjectionResult(
         root_position_world=corrected_roots,
-        joint_position=projection.joint_position,
-        foot_position_world=projection.foot_position_world,
+        joint_position=projected_joints,
+        foot_position_world=projected_feet,
         maximum_target_error_m=max(
             projection.maximum_target_error_m,
             float(target_error.max().item()) if target_error.numel() else 0.0,
         ),
         maximum_root_correction_m=float(
-            torch.linalg.vector_norm(root_correction, dim=1).max().item()
+            torch.linalg.vector_norm(total_root_correction, dim=1).max().item()
         ),
         maximum_root_correction_speed_m_s=float(
             torch.linalg.vector_norm(
-                torch.diff(root_correction, dim=0), dim=1
+                torch.diff(total_root_correction, dim=0), dim=1
             ).max().item()
             * 50.0
         ),
-        maximum_joint_deformation_rad=projection.maximum_joint_deformation_rad,
-        rms_joint_deformation_rad=projection.rms_joint_deformation_rad,
+        maximum_joint_deformation_rad=float(
+            torch.abs(joint_deformation).max().item()
+        ),
+        rms_joint_deformation_rad=float(
+            torch.sqrt(torch.mean(joint_deformation.square())).item()
+        ),
+        maximum_joint_correction_speed_rad_s=float(
+            torch.linalg.vector_norm(
+                torch.diff(joint_deformation, dim=0), dim=1
+            ).max().item()
+            * 50.0
+        ),
     )

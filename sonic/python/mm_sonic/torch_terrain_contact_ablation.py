@@ -81,6 +81,7 @@ def contact_ablation_passes(metrics: Mapping[str, object]) -> bool:
         "maximum_target_error_m",
         "maximum_root_correction_m",
         "maximum_root_correction_speed_m_s",
+        "maximum_joint_correction_speed_rad_s",
     )
     try:
         values = {name: float(metrics[name]) for name in names}
@@ -96,6 +97,7 @@ def contact_ablation_passes(metrics: Mapping[str, object]) -> bool:
         and values["maximum_target_error_m"] <= 0.005
         and values["maximum_root_correction_m"] <= 0.10
         and values["maximum_root_correction_speed_m_s"] <= 1.0
+        and values["maximum_joint_correction_speed_rad_s"] <= 8.0
     )
 
 
@@ -300,6 +302,7 @@ def _metrics(result: ContactQualityAblationResult) -> dict[str, float]:
             "maximum_root_correction_speed_m_s",
             "maximum_joint_deformation_rad",
             "rms_joint_deformation_rad",
+            "maximum_joint_correction_speed_rad_s",
         )
     }
 
@@ -419,6 +422,7 @@ def run_contact_ablation(
     selection_strategy: str,
     root_correction_scale: float,
     root_smoothing_passes: int,
+    joint_smoothing_passes: int,
 ) -> dict[str, object]:
     """Evaluate contact composition on the authenticated frozen oracle states."""
 
@@ -457,6 +461,8 @@ def run_contact_ablation(
         or not 0.0 <= float(root_correction_scale) <= 1.0
         or type(root_smoothing_passes) is not int
         or not 0 <= root_smoothing_passes <= 10
+        or type(joint_smoothing_passes) is not int
+        or not 0 <= joint_smoothing_passes <= 10
     ):
         raise ValueError("contact ablation root regularization is invalid")
     output_path = Path(os.path.abspath(output))
@@ -622,6 +628,7 @@ def run_contact_ablation(
                     projection_strategy=projection_strategy,
                     root_correction_scale=float(root_correction_scale),
                     root_smoothing_passes=root_smoothing_passes,
+                    joint_smoothing_passes=joint_smoothing_passes,
                 )
             except ValueError as error:
                 reason = str(error)
@@ -699,6 +706,7 @@ def run_contact_ablation(
         "selection_strategy": selection_strategy,
         "root_correction_scale": float(root_correction_scale),
         "root_smoothing_passes": root_smoothing_passes,
+        "joint_smoothing_passes": joint_smoothing_passes,
         "state_count": len(state_records),
         "states_with_accepted_action": sum(
             bool(record["accepted_action_indices"]) for record in state_records

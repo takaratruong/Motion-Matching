@@ -48,6 +48,7 @@ class TerrainContactAblationTests(unittest.TestCase):
             "maximum_target_error_m": 0.004,
             "maximum_root_correction_m": 0.05,
             "maximum_root_correction_speed_m_s": 0.5,
+            "maximum_joint_correction_speed_rad_s": 5.0,
         }
         self.assertTrue(contact_ablation_passes(passing))
         self.assertFalse(
@@ -73,6 +74,11 @@ class TerrainContactAblationTests(unittest.TestCase):
         self.assertFalse(
             contact_ablation_passes(
                 {**passing, "maximum_root_correction_speed_m_s": 1.01}
+            )
+        )
+        self.assertFalse(
+            contact_ablation_passes(
+                {**passing, "maximum_joint_correction_speed_rad_s": 8.01}
             )
         )
 

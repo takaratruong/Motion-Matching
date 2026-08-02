@@ -275,6 +275,7 @@ class ContactQualityAblationResult:
     maximum_root_correction_speed_m_s: float
     maximum_joint_deformation_rad: float
     rms_joint_deformation_rad: float
+    maximum_joint_correction_speed_rad_s: float
 
     def __post_init__(self) -> None:
         qpos = np.asarray(self.unprojected_qpos)
@@ -306,6 +307,7 @@ class ContactQualityAblationResult:
             "maximum_root_correction_speed_m_s",
             "maximum_joint_deformation_rad",
             "rms_joint_deformation_rad",
+            "maximum_joint_correction_speed_rad_s",
         ):
             value = getattr(self, name)
             if (
@@ -334,6 +336,7 @@ def build_contact_quality_ablation(
     projection_strategy: str = "joint-only",
     root_correction_scale: float = 1.0,
     root_smoothing_passes: int = 0,
+    joint_smoothing_passes: int = 0,
 ) -> ContactQualityAblationResult:
     """Measure contact anchoring and projected composition on one action."""
 
@@ -417,6 +420,7 @@ def build_contact_quality_ablation(
             foot_kinematics=foot_kinematics,
             root_correction_scale=root_correction_scale,
             root_smoothing_passes=root_smoothing_passes,
+            joint_smoothing_passes=joint_smoothing_passes,
         )
         projected_roots = projection.root_position_world
         maximum_root_correction_m = projection.maximum_root_correction_m
@@ -448,4 +452,7 @@ def build_contact_quality_ablation(
         maximum_root_correction_speed_m_s=maximum_root_correction_speed_m_s,
         maximum_joint_deformation_rad=projection.maximum_joint_deformation_rad,
         rms_joint_deformation_rad=projection.rms_joint_deformation_rad,
+        maximum_joint_correction_speed_rad_s=(
+            projection.maximum_joint_correction_speed_rad_s
+        ),
     )

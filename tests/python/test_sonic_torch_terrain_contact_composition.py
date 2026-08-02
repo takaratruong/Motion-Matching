@@ -361,12 +361,17 @@ class TerrainContactCompositionTests(unittest.TestCase):
             foot_kinematics=kinematics,
             root_correction_scale=0.5,
             root_smoothing_passes=2,
+            joint_smoothing_passes=2,
         )
         self.assertLess(
             regularized.maximum_root_correction_m,
             projected.maximum_root_correction_m,
         )
         torch.testing.assert_close(regularized.foot_position_world[-1, 1], landing)
+        self.assertLessEqual(
+            regularized.maximum_joint_correction_speed_rad_s,
+            projected.maximum_joint_correction_speed_rad_s,
+        )
 
 
 if __name__ == "__main__":
