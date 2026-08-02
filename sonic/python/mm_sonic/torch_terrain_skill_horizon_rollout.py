@@ -129,6 +129,8 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         turning_clip_paths: frozenset[str] | None = None,
         maximum_translation_warp_m: float = 0.0,
         maximum_yaw_warp_rad: float = 0.0,
+        minimum_endpoint_warp_yaw_rad: float = 0.0,
+        maximum_endpoint_warp_yaw_rad: float = math.pi,
     ) -> None:
         self.base = base_matcher
         self.database = base_matcher.database
@@ -164,10 +166,21 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             or float(maximum_translation_warp_m) < 0.0
             or not math.isfinite(float(maximum_yaw_warp_rad))
             or float(maximum_yaw_warp_rad) < 0.0
+            or not math.isfinite(float(minimum_endpoint_warp_yaw_rad))
+            or not math.isfinite(float(maximum_endpoint_warp_yaw_rad))
+            or not 0.0 <= float(minimum_endpoint_warp_yaw_rad)
+            <= float(maximum_endpoint_warp_yaw_rad)
+            <= math.pi
         ):
             raise ContractError("endpoint warp limits must be finite non-negative")
         self.maximum_translation_warp_m = float(maximum_translation_warp_m)
         self.maximum_yaw_warp_rad = float(maximum_yaw_warp_rad)
+        self.minimum_endpoint_warp_yaw_rad = float(
+            minimum_endpoint_warp_yaw_rad
+        )
+        self.maximum_endpoint_warp_yaw_rad = float(
+            maximum_endpoint_warp_yaw_rad
+        )
         self._clip_path_to_index = {
             clip.relative_path: index
             for index, clip in enumerate(dataset.folder.clips)
@@ -365,9 +378,19 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         )
         warp_displacement = targets.displacement_local_xy[target_index]
         warp_yaw = targets.yaw_delta_rad[target_index]
+        desired_yaw_magnitude = abs(float(warp_yaw.item()))
+        warp_enabled = (
+            self.minimum_endpoint_warp_yaw_rad
+            <= desired_yaw_magnitude
+            <= self.maximum_endpoint_warp_yaw_rad
+        )
+        translation_limit = (
+            self.maximum_translation_warp_m if warp_enabled else 0.0
+        )
+        yaw_limit = self.maximum_yaw_warp_rad if warp_enabled else 0.0
         if (
-            self.maximum_translation_warp_m > 0.0
-            or self.maximum_yaw_warp_rad > 0.0
+            translation_limit > 0.0
+            or yaw_limit > 0.0
         ):
             exact_duration = selected.endpoint_frame_exclusive - entry_frame
             exact_target = predict_horizon_targets(
@@ -389,8 +412,8 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             playback_stop=selected.endpoint_frame_exclusive,
             target_displacement_local_xy=warp_displacement,
             target_yaw_delta_rad=warp_yaw,
-            maximum_translation_warp_m=self.maximum_translation_warp_m,
-            maximum_yaw_warp_rad=self.maximum_yaw_warp_rad,
+            maximum_translation_warp_m=translation_limit,
+            maximum_yaw_warp_rad=yaw_limit,
         )
 
     def prepare_step(self, *args, **kwargs):
@@ -441,6 +464,8 @@ def run_resolved_horizon_matrix(
     turning_source_corpus: str | None = None,
     maximum_translation_warp_m: float = 0.0,
     maximum_yaw_warp_rad: float = 0.0,
+    minimum_endpoint_warp_yaw_rad: float = 0.0,
+    maximum_endpoint_warp_yaw_rad: float = math.pi,
 ):
     """Run the renderer-independent route harness with horizon skill MM."""
 
@@ -589,6 +614,8 @@ def run_resolved_horizon_matrix(
             + f":turning-source:{turning_identity}"
             + f":translation-warp:{float(maximum_translation_warp_m):.9g}"
             + f":yaw-warp:{float(maximum_yaw_warp_rad):.9g}"
+            + f":warp-yaw-min:{float(minimum_endpoint_warp_yaw_rad):.9g}"
+            + f":warp-yaw-max:{float(maximum_endpoint_warp_yaw_rad):.9g}"
         ).encode()
     ).hexdigest()
 
@@ -608,6 +635,8 @@ def run_resolved_horizon_matrix(
             turning_clip_paths=turning_clip_paths,
             maximum_translation_warp_m=maximum_translation_warp_m,
             maximum_yaw_warp_rad=maximum_yaw_warp_rad,
+            minimum_endpoint_warp_yaw_rad=minimum_endpoint_warp_yaw_rad,
+            maximum_endpoint_warp_yaw_rad=maximum_endpoint_warp_yaw_rad,
         )
         route_matchers[route.name] = matcher
         return matcher

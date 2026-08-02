@@ -7,6 +7,7 @@ import argparse
 from dataclasses import replace
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -94,6 +95,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="Bound smooth per-skill root endpoint yaw correction.",
+    )
+    parser.add_argument(
+        "--minimum-endpoint-warp-yaw-rad",
+        type=float,
+        default=0.0,
+        help="Apply endpoint warp only at or above this desired yaw change.",
+    )
+    parser.add_argument(
+        "--maximum-endpoint-warp-yaw-rad",
+        type=float,
+        default=math.pi,
+        help="Apply endpoint warp only at or below this desired yaw change.",
     )
     parser.add_argument(
         "--ablation",
@@ -242,6 +255,8 @@ def main(argv: list[str] | None = None) -> int:
         turning_source_corpus=args.turning_source_corpus,
         maximum_translation_warp_m=args.maximum_translation_warp_m,
         maximum_yaw_warp_rad=args.maximum_yaw_warp_rad,
+        minimum_endpoint_warp_yaw_rad=args.minimum_endpoint_warp_yaw_rad,
+        maximum_endpoint_warp_yaw_rad=args.maximum_endpoint_warp_yaw_rad,
     )
     save_horizon_matrix(matrix, events, args.output)
     execution_completed = all(
@@ -267,6 +282,12 @@ def main(argv: list[str] | None = None) -> int:
                 "turning_source_corpus": args.turning_source_corpus,
                 "maximum_translation_warp_m": args.maximum_translation_warp_m,
                 "maximum_yaw_warp_rad": args.maximum_yaw_warp_rad,
+                "minimum_endpoint_warp_yaw_rad": (
+                    args.minimum_endpoint_warp_yaw_rad
+                ),
+                "maximum_endpoint_warp_yaw_rad": (
+                    args.maximum_endpoint_warp_yaw_rad
+                ),
                 "deterministic_sha256": matrix.deterministic_sha256,
                 "output": args.output,
             },
