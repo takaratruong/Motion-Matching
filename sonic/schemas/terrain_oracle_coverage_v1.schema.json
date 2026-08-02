@@ -1,0 +1,303 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://motion-matching.local/schemas/terrain_oracle_coverage_v1.schema.json",
+  "title": "Terrain Oracle Coverage Atlas v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "adjacency_rule",
+    "bin_definitions",
+    "marginal_counts",
+    "occupied_cells",
+    "connected_components",
+    "content_sha256"
+  ],
+  "properties": {
+    "schema": {
+      "const": "terrain-oracle-coverage/v1"
+    },
+    "adjacency_rule": {
+      "type": "string",
+      "minLength": 1
+    },
+    "bin_definitions": {
+      "$ref": "#/$defs/axes_of_bin_definitions"
+    },
+    "marginal_counts": {
+      "$ref": "#/$defs/axes_of_counts"
+    },
+    "occupied_cells": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/occupied_cell"
+      }
+    },
+    "connected_components": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "minItems": 1,
+        "uniqueItems": true,
+        "items": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "content_sha256": {
+      "$ref": "#/$defs/sha256"
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "axis_names": {
+      "enum": [
+        "movement_facing_offset",
+        "planar_speed",
+        "yaw_rate",
+        "transition",
+        "support_phase",
+        "support_leg",
+        "step_forward",
+        "step_lateral",
+        "step_vertical",
+        "surface_normal",
+        "contact_yaw",
+        "swing_clearance",
+        "duration",
+        "action_class"
+      ]
+    },
+    "bin_definition": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "edges",
+            "categories",
+            "boundary_rule"
+          ],
+          "properties": {
+            "kind": {
+              "const": "numeric"
+            },
+            "edges": {
+              "type": "array",
+              "minItems": 2,
+              "items": {
+                "type": "number",
+                "minimum": -1e+308,
+                "maximum": 1e+308
+              }
+            },
+            "categories": {
+              "type": "array",
+              "minItems": 3,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "boundary_rule": {
+              "const": "half-open; exact edge enters bin beginning at that edge; final category is overflow"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "categories"
+          ],
+          "properties": {
+            "kind": {
+              "const": "categorical"
+            },
+            "categories": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "axes_of_bin_definitions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "movement_facing_offset",
+        "planar_speed",
+        "yaw_rate",
+        "transition",
+        "support_phase",
+        "support_leg",
+        "step_forward",
+        "step_lateral",
+        "step_vertical",
+        "surface_normal",
+        "contact_yaw",
+        "swing_clearance",
+        "duration",
+        "action_class"
+      ],
+      "properties": {
+        "movement_facing_offset": {"$ref": "#/$defs/bin_definition"},
+        "planar_speed": {"$ref": "#/$defs/bin_definition"},
+        "yaw_rate": {"$ref": "#/$defs/bin_definition"},
+        "transition": {"$ref": "#/$defs/bin_definition"},
+        "support_phase": {"$ref": "#/$defs/bin_definition"},
+        "support_leg": {"$ref": "#/$defs/bin_definition"},
+        "step_forward": {"$ref": "#/$defs/bin_definition"},
+        "step_lateral": {"$ref": "#/$defs/bin_definition"},
+        "step_vertical": {"$ref": "#/$defs/bin_definition"},
+        "surface_normal": {"$ref": "#/$defs/bin_definition"},
+        "contact_yaw": {"$ref": "#/$defs/bin_definition"},
+        "swing_clearance": {"$ref": "#/$defs/bin_definition"},
+        "duration": {"$ref": "#/$defs/bin_definition"},
+        "action_class": {"$ref": "#/$defs/bin_definition"}
+      }
+    },
+    "counts": {
+      "type": "object",
+      "propertyNames": {
+        "minLength": 1
+      },
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 1
+      }
+    },
+    "axes_of_counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "movement_facing_offset",
+        "planar_speed",
+        "yaw_rate",
+        "transition",
+        "support_phase",
+        "support_leg",
+        "step_forward",
+        "step_lateral",
+        "step_vertical",
+        "surface_normal",
+        "contact_yaw",
+        "swing_clearance",
+        "duration",
+        "action_class"
+      ],
+      "properties": {
+        "movement_facing_offset": {"$ref": "#/$defs/counts"},
+        "planar_speed": {"$ref": "#/$defs/counts"},
+        "yaw_rate": {"$ref": "#/$defs/counts"},
+        "transition": {"$ref": "#/$defs/counts"},
+        "support_phase": {"$ref": "#/$defs/counts"},
+        "support_leg": {"$ref": "#/$defs/counts"},
+        "step_forward": {"$ref": "#/$defs/counts"},
+        "step_lateral": {"$ref": "#/$defs/counts"},
+        "step_vertical": {"$ref": "#/$defs/counts"},
+        "surface_normal": {"$ref": "#/$defs/counts"},
+        "contact_yaw": {"$ref": "#/$defs/counts"},
+        "swing_clearance": {"$ref": "#/$defs/counts"},
+        "duration": {"$ref": "#/$defs/counts"},
+        "action_class": {"$ref": "#/$defs/counts"}
+      }
+    },
+    "coordinates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "movement_facing_offset",
+        "planar_speed",
+        "yaw_rate",
+        "transition",
+        "support_phase",
+        "support_leg",
+        "step_forward",
+        "step_lateral",
+        "step_vertical",
+        "surface_normal",
+        "contact_yaw",
+        "swing_clearance",
+        "duration",
+        "action_class"
+      ],
+      "properties": {
+        "movement_facing_offset": {"type": "string", "minLength": 1},
+        "planar_speed": {"type": "string", "minLength": 1},
+        "yaw_rate": {"type": "string", "minLength": 1},
+        "transition": {"enum": ["start", "steady", "stop", "reverse"]},
+        "support_phase": {"enum": ["flight", "single", "double"]},
+        "support_leg": {"enum": ["none", "left", "right", "both"]},
+        "step_forward": {"type": "string", "minLength": 1},
+        "step_lateral": {"type": "string", "minLength": 1},
+        "step_vertical": {"type": "string", "minLength": 1},
+        "surface_normal": {"type": "string", "pattern": "^(flat|moderate|steep|overhang):(level|forward|left|backward|right)$"},
+        "contact_yaw": {"type": "string", "minLength": 1},
+        "swing_clearance": {"type": "string", "minLength": 1},
+        "duration": {"type": "string", "minLength": 1},
+        "action_class": {"enum": ["walk", "run", "start", "stop", "reverse", "ascent", "descent", "turn", "sidestep", "other"]}
+      }
+    },
+    "frame_interval": {
+      "type": "array",
+      "prefixItems": [
+        {"type": "integer", "minimum": 0},
+        {"type": "integer", "minimum": 1}
+      ],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "occupied_cell": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cell_id",
+        "coordinates",
+        "source_ids",
+        "dedup_group_ids",
+        "contribution_count",
+        "intervals"
+      ],
+      "properties": {
+        "cell_id": {"$ref": "#/$defs/sha256"},
+        "coordinates": {"$ref": "#/$defs/coordinates"},
+        "source_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/sha256"}
+        },
+        "dedup_group_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/sha256"}
+        },
+        "contribution_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "intervals": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/frame_interval"}
+        }
+      }
+    }
+  }
+}
