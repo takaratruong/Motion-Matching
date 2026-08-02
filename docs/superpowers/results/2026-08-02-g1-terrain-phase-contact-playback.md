@@ -177,6 +177,20 @@ identical SHA-256
   improvement. The source gait's landing acquisition should remain governed
   by contact onset; forcing the query height into its raw swing endpoint makes
   the ankle IK fight the clip.
+- Caching one fixed correction plan per source swing was rejected and removed.
+  It retained 6/6 routes but raised slide by 19% and worsened peak penetration.
+  A plan anchored at swing onset becomes stale as the composed root/foot
+  placement evolves; the retained receding source-path query is beneficial
+  because it re-anchors the same phase-preserving objective every frame.
+- Future left/right terrain heights sampled at predicted foot locations were
+  rejected, both as a direct query and as a second search constrained to the
+  baseline-selected horizon. The direct query had no scalar gain that improved
+  all routes: gains up to 0.12 reproduced the baseline exactly, while the first
+  effective gain changed a shared early decision and lost two routes. Holding
+  the baseline horizon still dropped the frozen gate to 4/6 and the broad gate
+  from 16/21 to 14/21, with aggregate frozen slide rising from 1.923 m to
+  2.207 m. Per-foot height is useful evidence, but a greedy query cannot know
+  which future contact is reachable and compatible with the next command.
 
 ## Literature alignment
 
