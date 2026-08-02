@@ -244,6 +244,35 @@ class TerrainFootLockTests(unittest.TestCase):
             float(native.joint_position[5]),
         )
 
+    def test_source_swing_plan_falls_back_at_terrain_grid_boundary(self):
+        support = torch.tensor(
+            ((True, False), (True, False), (True, True)), dtype=torch.bool
+        )
+        source_feet = torch.zeros((3, 2, 3), dtype=torch.float32)
+        source_feet[:, 1, 0] = torch.tensor((0.0, 0.1, 0.1))
+
+        def bounded_surface(xy):
+            if bool((xy[:, 0] > 0.05).any()):
+                raise ValueError("outside grid")
+            return torch.zeros(xy.shape[0])
+
+        foot_lock = TerrainFootLockFilter(
+            clip_paths=("clip.npz",),
+            support_masks=(support,),
+            source_foot_positions=(source_feet,),
+            source_root_yaws=(torch.zeros(3),),
+            foot_kinematics=_LinearFeet(),
+            sample_surface=bounded_surface,
+            device=torch.device("cpu"),
+            swing_clearance_margin_m=0.01,
+            swing_plan_sigma_frames=2.0,
+        )
+
+        corrected = foot_lock.apply(_result(0, 0.0))
+
+        self.assertEqual(tuple(corrected.joint_position.shape), (29,))
+        self.assertEqual(foot_lock.failure_count, 1)
+
     def test_unknown_source_fails_closed(self):
         foot_lock = TerrainFootLockFilter(
             clip_paths=("clip.npz",),

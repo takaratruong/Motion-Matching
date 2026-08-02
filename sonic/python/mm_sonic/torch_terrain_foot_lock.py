@@ -92,6 +92,14 @@ class TerrainFootLockFilter:
                     or swing_clearance_margin_m is None
                 )
             )
+            or ((source_feet is None) != (source_yaws is None))
+            or (
+                source_feet is not None
+                and (
+                    len(source_feet) != len(paths)
+                    or len(source_yaws) != len(paths)
+                )
+            )
             or not callable(getattr(foot_kinematics, "foot_positions", None))
             or not callable(
                 getattr(foot_kinematics, "solve_leg_positions", None)
@@ -108,7 +116,10 @@ class TerrainFootLockFilter:
         self._source_root_yaws = (
             None
             if source_yaws is None
-            else tuple(value.detach().to(device=device).clone() for value in source_yaws)
+            else tuple(
+                value.detach().to(device=device).clone()
+                for value in source_yaws
+            )
         )
         if self._source_foot_positions is not None:
             for mask, feet, yaw in zip(
@@ -348,10 +359,9 @@ class TerrainFootLockFilter:
                                 frame,
                                 int(foot),
                             )
-                        except Exception as error:
-                            raise ValueError(
-                                "terrain swing-plan sampling failed"
-                            ) from error
+                        except Exception:
+                            self._failure_count += 1
+                            continue
                         minimum_z[local] = torch.maximum(
                             minimum_z[local],
                             native_feet[foot, 2] + planned_lift,
