@@ -228,7 +228,7 @@ class TerrainSkillHorizonRolloutTest(unittest.TestCase):
             current_root_position_world=torch.tensor([1.0, 2.0, 0.8]),
             current_root_yaw=torch.tensor(0.0),
             current_foot_position_world=torch.tensor(
-                [[1.0, 2.3, 0.0], [1.0, 1.8, 0.0]]
+                [[1.0, 2.2, 0.0], [1.0, 1.8, 0.0]]
             ),
             query_terrain=terrain,
         )
@@ -236,9 +236,7 @@ class TerrainSkillHorizonRolloutTest(unittest.TestCase):
         self.assertTrue(
             torch.allclose(
                 enriched.surface_height_delta_m,
-                torch.tensor(
-                    [[1.125, 0.875], [2.25, 1.75], [4.5, 3.5]]
-                ),
+                torch.tensor([[1.1, 0.9], [2.2, 1.8], [4.4, 3.6]]),
                 atol=1e-6,
             )
         )
