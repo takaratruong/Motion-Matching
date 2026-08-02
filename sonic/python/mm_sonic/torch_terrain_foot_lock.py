@@ -20,6 +20,8 @@ class TerrainFootLockFilter:
         *,
         clip_paths: Sequence[str],
         support_masks: Sequence[torch.Tensor],
+        source_foot_positions: Sequence[torch.Tensor] | None = None,
+        source_root_yaws: Sequence[torch.Tensor] | None = None,
         foot_kinematics: object,
         sample_surface: Callable[[torch.Tensor], torch.Tensor],
         device: torch.device,
@@ -29,9 +31,18 @@ class TerrainFootLockFilter:
         maximum_joint_correction_rad: float = 0.35,
         maximum_output_joint_speed_rad_s: float = 12.0,
         swing_clearance_margin_m: float | None = None,
+        swing_plan_sigma_frames: float | None = None,
     ) -> None:
         paths = tuple(clip_paths)
         masks = tuple(support_masks)
+        source_feet = (
+            None
+            if source_foot_positions is None
+            else tuple(source_foot_positions)
+        )
+        source_yaws = (
+            None if source_root_yaws is None else tuple(source_root_yaws)
+        )
         if (
             not paths
             or len(paths) != len(masks)
@@ -67,6 +78,20 @@ class TerrainFootLockFilter:
                     or not 0.0 <= float(swing_clearance_margin_m) <= 0.20
                 )
             )
+            or (
+                swing_plan_sigma_frames is not None
+                and (
+                    source_feet is None
+                    or source_yaws is None
+                    or len(source_feet) != len(paths)
+                    or len(source_yaws) != len(paths)
+                    or isinstance(swing_plan_sigma_frames, bool)
+                    or not isinstance(swing_plan_sigma_frames, (int, float))
+                    or not math.isfinite(float(swing_plan_sigma_frames))
+                    or not 0.25 <= float(swing_plan_sigma_frames) <= 20.0
+                    or swing_clearance_margin_m is None
+                )
+            )
             or not callable(getattr(foot_kinematics, "foot_positions", None))
             or not callable(
                 getattr(foot_kinematics, "solve_leg_positions", None)
@@ -77,6 +102,29 @@ class TerrainFootLockFilter:
         self._support_masks = tuple(
             mask.detach().to(device=device).clone() for mask in masks
         )
+        self._source_foot_positions = None if source_feet is None else tuple(
+            value.detach().to(device=device).clone() for value in source_feet
+        )
+        self._source_root_yaws = (
+            None
+            if source_yaws is None
+            else tuple(value.detach().to(device=device).clone() for value in source_yaws)
+        )
+        if self._source_foot_positions is not None:
+            for mask, feet, yaw in zip(
+                self._support_masks,
+                self._source_foot_positions,
+                self._source_root_yaws,
+            ):
+                if (
+                    tuple(feet.shape) != (mask.shape[0], 2, 3)
+                    or tuple(yaw.shape) != (mask.shape[0],)
+                    or not feet.dtype.is_floating_point
+                    or not yaw.dtype.is_floating_point
+                    or not torch.isfinite(feet).all()
+                    or not torch.isfinite(yaw).all()
+                ):
+                    raise ValueError("terrain foot lock source paths are invalid")
         self._foot_kinematics = foot_kinematics
         self._sample_surface = sample_surface
         self._device = device
@@ -95,6 +143,11 @@ class TerrainFootLockFilter:
             None
             if swing_clearance_margin_m is None
             else float(swing_clearance_margin_m)
+        )
+        self._swing_plan_sigma_frames = (
+            None
+            if swing_plan_sigma_frames is None
+            else float(swing_plan_sigma_frames)
         )
         self._lock_position = torch.full(
             (2, 3), float("nan"), dtype=torch.float32, device=device
@@ -117,7 +170,9 @@ class TerrainFootLockFilter:
         self._previous_joint_position = None
         self._failure_count = 0
 
-    def _source_support(self, result: object) -> torch.Tensor:
+    def _source_support(
+        self, result: object
+    ) -> tuple[torch.Tensor, int, int]:
         try:
             path = str(result.diagnostics.selected_clip_path)
             frame = int(result.diagnostics.selected_frame)
@@ -127,7 +182,59 @@ class TerrainFootLockFilter:
             raise ValueError("terrain foot lock source is invalid") from error
         if not 0 <= frame < support.shape[0]:
             raise ValueError("terrain foot lock source frame is invalid")
-        return support[frame]
+        return support[frame], clip_index, frame
+
+    @staticmethod
+    def _yaw_from_wxyz(quaternion: torch.Tensor) -> torch.Tensor:
+        w, x, y, z = quaternion.unbind()
+        return torch.atan2(
+            2.0 * (w * z + x * y),
+            1.0 - 2.0 * (y * y + z * z),
+        )
+
+    def _planned_swing_lift(
+        self,
+        result: object,
+        native_feet: torch.Tensor,
+        clip_index: int,
+        frame: int,
+        foot: int,
+    ) -> torch.Tensor:
+        support = self._support_masks[clip_index][:, foot]
+        stop = frame + 1
+        while stop < support.shape[0] and not bool(support[stop].item()):
+            stop += 1
+        source = self._source_foot_positions[clip_index][frame:stop, foot]
+        delta = source - source[0]
+        output_yaw = self._yaw_from_wxyz(
+            result.root_orientation_world_wxyz
+        )
+        yaw_delta = output_yaw - self._source_root_yaws[clip_index][frame]
+        cosine = torch.cos(yaw_delta)
+        sine = torch.sin(yaw_delta)
+        placed_xy = native_feet[foot, :2] + torch.stack(
+            (
+                cosine * delta[:, 0] - sine * delta[:, 1],
+                sine * delta[:, 0] + cosine * delta[:, 1],
+            ),
+            dim=1,
+        )
+        placed_z = native_feet[foot, 2] + delta[:, 2]
+        surface = self._sample_surface(placed_xy).to(placed_z.dtype)
+        required = torch.clamp(
+            surface
+            + float(ANKLE_ORIGIN_SOLE_M)
+            + self._swing_clearance_margin_m
+            - placed_z,
+            min=0.0,
+        )
+        distance = torch.arange(
+            required.shape[0], dtype=required.dtype, device=self._device
+        )
+        weight = torch.exp(
+            -0.5 * torch.square(distance / self._swing_plan_sigma_frames)
+        )
+        return torch.max(required * weight)
 
     def _feet(self, result: object) -> torch.Tensor:
         try:
@@ -170,7 +277,7 @@ class TerrainFootLockFilter:
         )
         if any(not hasattr(result, name) for name in required):
             raise ValueError("terrain foot lock result is invalid")
-        support = self._source_support(result)
+        support, clip_index, frame = self._source_support(result)
         native_feet = self._feet(result)
         onset = support & ~self._previous_support
         self._lock_position[onset] = native_feet[onset]
@@ -231,6 +338,24 @@ class TerrainFootLockFilter:
                     + float(ANKLE_ORIGIN_SOLE_M)
                     + self._swing_clearance_margin_m
                 )
+                if self._swing_plan_sigma_frames is not None:
+                    for local, foot in enumerate(swing_indices.tolist()):
+                        try:
+                            planned_lift = self._planned_swing_lift(
+                                result,
+                                native_feet,
+                                clip_index,
+                                frame,
+                                int(foot),
+                            )
+                        except Exception as error:
+                            raise ValueError(
+                                "terrain swing-plan sampling failed"
+                            ) from error
+                        minimum_z[local] = torch.maximum(
+                            minimum_z[local],
+                            native_feet[foot, 2] + planned_lift,
+                        )
                 needs_lift = native_feet[swing_indices, 2] < minimum_z
                 lifted = swing_indices[needs_lift]
                 correction_mask[lifted] = True
@@ -292,6 +417,7 @@ def build_terrain_foot_lock(
     *,
     swing_clearance_margin_m: float | None = None,
     correction_halflife_s: float = 0.04,
+    swing_plan_sigma_frames: float | None = None,
 ):
     """Build a source-contact foot lock against the resolved query terrain."""
 
@@ -305,8 +431,38 @@ def build_terrain_foot_lock(
             source_support_mask(resolved.dataset, index)
             for index in range(len(clip_paths))
         )
-        measurement = resolved.measurement_extension
         device = resolved.device
+        source_foot_positions = None
+        source_root_yaws = None
+        if swing_plan_sigma_frames is not None:
+            feet_indices = (
+                resolved.dataset.folder.layout.left_foot_body_index,
+                resolved.dataset.folder.layout.right_foot_body_index,
+            )
+            root_index = resolved.dataset.folder.layout.root_body_index
+            source_foot_positions = tuple(
+                torch.tensor(
+                    clip.body_position_world[:, feet_indices],
+                    dtype=torch.float32,
+                    device=device,
+                )
+                for clip in resolved.dataset.folder.clips
+            )
+            source_root_yaws = tuple(
+                torch.atan2(
+                    2.0 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]),
+                    1.0 - 2.0 * (q[:, 2] * q[:, 2] + q[:, 3] * q[:, 3]),
+                )
+                for clip in resolved.dataset.folder.clips
+                for q in (
+                    torch.tensor(
+                        clip.body_quaternion_world_wxyz[:, root_index],
+                        dtype=torch.float32,
+                        device=device,
+                    ),
+                )
+            )
+        measurement = resolved.measurement_extension
     except Exception as error:
         raise ValueError("cannot build terrain foot lock") from error
 
@@ -318,9 +474,12 @@ def build_terrain_foot_lock(
     return TerrainFootLockFilter(
         clip_paths=clip_paths,
         support_masks=support_masks,
+        source_foot_positions=source_foot_positions,
+        source_root_yaws=source_root_yaws,
         foot_kinematics=foot_kinematics,
         sample_surface=sample_surface,
         device=device,
         swing_clearance_margin_m=swing_clearance_margin_m,
         correction_halflife_s=correction_halflife_s,
+        swing_plan_sigma_frames=swing_plan_sigma_frames,
     )

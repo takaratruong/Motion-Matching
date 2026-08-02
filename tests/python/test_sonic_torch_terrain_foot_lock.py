@@ -214,6 +214,36 @@ class TerrainFootLockTests(unittest.TestCase):
             float(native.joint_position[2]),
         )
 
+    def test_optional_source_swing_plan_anticipates_future_path_riser(self):
+        support = torch.tensor(
+            ((True, False), (True, False), (True, True)), dtype=torch.bool
+        )
+        source_feet = torch.zeros((3, 2, 3), dtype=torch.float32)
+        source_feet[:, 1, 0] = torch.tensor((0.0, 0.1, 0.1))
+        foot_lock = TerrainFootLockFilter(
+            clip_paths=("clip.npz",),
+            support_masks=(support,),
+            source_foot_positions=(source_feet,),
+            source_root_yaws=(torch.zeros(3),),
+            foot_kinematics=_LinearFeet(),
+            sample_surface=lambda xy: torch.where(
+                xy[:, 0] >= 0.08,
+                torch.full((xy.shape[0],), 0.1),
+                torch.zeros(xy.shape[0]),
+            ),
+            device=torch.device("cpu"),
+            swing_clearance_margin_m=0.01,
+            swing_plan_sigma_frames=2.0,
+        )
+        native = _result(0, 0.0)
+
+        corrected = foot_lock.apply(native)
+
+        self.assertGreater(
+            float(corrected.joint_position[5]),
+            float(native.joint_position[5]),
+        )
+
     def test_unknown_source_fails_closed(self):
         foot_lock = TerrainFootLockFilter(
             clip_paths=("clip.npz",),

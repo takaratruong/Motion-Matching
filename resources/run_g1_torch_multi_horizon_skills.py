@@ -62,6 +62,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Inertialization halflife for terrain foot corrections.",
     )
     parser.add_argument(
+        "--swing-plan-sigma-frames",
+        type=float,
+        default=None,
+        help="Spread future source-path clearance backward by this sigma.",
+    )
+    parser.add_argument(
         "--ablation",
         choices=(
             "combined",
@@ -202,6 +208,7 @@ def main(argv: list[str] | None = None) -> int:
         contact_phase_gate=args.contact_phase_gate,
         swing_clearance_margin_m=args.swing_clearance_margin_m,
         foot_correction_halflife_s=args.foot_correction_halflife_s,
+        swing_plan_sigma_frames=args.swing_plan_sigma_frames,
     )
     save_horizon_matrix(matrix, events, args.output)
     execution_completed = all(
@@ -219,6 +226,7 @@ def main(argv: list[str] | None = None) -> int:
                 "contact_phase_gate": args.contact_phase_gate,
                 "swing_clearance_margin_m": args.swing_clearance_margin_m,
                 "foot_correction_halflife_s": args.foot_correction_halflife_s,
+                "swing_plan_sigma_frames": args.swing_plan_sigma_frames,
                 "deterministic_sha256": matrix.deterministic_sha256,
                 "output": args.output,
             },
