@@ -21,7 +21,6 @@ class TerrainFootLockFilter:
         clip_paths: Sequence[str],
         support_masks: Sequence[torch.Tensor],
         source_foot_positions: Sequence[torch.Tensor] | None = None,
-        source_foot_points: Sequence[torch.Tensor] | None = None,
         source_root_yaws: Sequence[torch.Tensor] | None = None,
         foot_kinematics: object,
         sample_surface: Callable[[torch.Tensor], torch.Tensor],
@@ -40,9 +39,6 @@ class TerrainFootLockFilter:
             None
             if source_foot_positions is None
             else tuple(source_foot_positions)
-        )
-        source_points = (
-            None if source_foot_points is None else tuple(source_foot_points)
         )
         source_yaws = (
             None if source_root_yaws is None else tuple(source_root_yaws)
@@ -98,10 +94,6 @@ class TerrainFootLockFilter:
             )
             or ((source_feet is None) != (source_yaws is None))
             or (
-                source_points is not None
-                and (source_feet is None or len(source_points) != len(paths))
-            )
-            or (
                 source_feet is not None
                 and (
                     len(source_feet) != len(paths)
@@ -121,9 +113,6 @@ class TerrainFootLockFilter:
         self._source_foot_positions = None if source_feet is None else tuple(
             value.detach().to(device=device).clone() for value in source_feet
         )
-        self._source_foot_points = None if source_points is None else tuple(
-            value.detach().to(device=device).clone() for value in source_points
-        )
         self._source_root_yaws = (
             None
             if source_yaws is None
@@ -133,12 +122,10 @@ class TerrainFootLockFilter:
             )
         )
         if self._source_foot_positions is not None:
-            for index, (mask, feet, yaw) in enumerate(
-                zip(
-                    self._support_masks,
-                    self._source_foot_positions,
-                    self._source_root_yaws,
-                )
+            for mask, feet, yaw in zip(
+                self._support_masks,
+                self._source_foot_positions,
+                self._source_root_yaws,
             ):
                 if (
                     tuple(feet.shape) != (mask.shape[0], 2, 3)
@@ -149,16 +136,6 @@ class TerrainFootLockFilter:
                     or not torch.isfinite(yaw).all()
                 ):
                     raise ValueError("terrain foot lock source paths are invalid")
-                if self._source_foot_points is not None:
-                    points = self._source_foot_points[index]
-                    if (
-                        tuple(points.shape) != (mask.shape[0], 2, 4, 3)
-                        or not points.dtype.is_floating_point
-                        or not torch.isfinite(points).all()
-                    ):
-                        raise ValueError(
-                            "terrain foot lock source points are invalid"
-                        )
         self._foot_kinematics = foot_kinematics
         self._sample_surface = sample_surface
         self._device = device
@@ -239,11 +216,7 @@ class TerrainFootLockFilter:
         while stop < support.shape[0] and not bool(support[stop].item()):
             stop += 1
         source = self._source_foot_positions[clip_index][frame:stop, foot]
-        if self._source_foot_points is None:
-            delta = source - source[0]
-        else:
-            points = self._source_foot_points[clip_index][frame:stop, foot]
-            delta = points - source[0]
+        delta = source - source[0]
         output_yaw = self._yaw_from_wxyz(
             result.root_orientation_world_wxyz
         )
@@ -252,29 +225,20 @@ class TerrainFootLockFilter:
         sine = torch.sin(yaw_delta)
         placed_xy = native_feet[foot, :2] + torch.stack(
             (
-                cosine * delta[..., 0] - sine * delta[..., 1],
-                sine * delta[..., 0] + cosine * delta[..., 1],
+                cosine * delta[:, 0] - sine * delta[:, 1],
+                sine * delta[:, 0] + cosine * delta[:, 1],
             ),
-            dim=-1,
+            dim=1,
         )
-        placed_z = native_feet[foot, 2] + delta[..., 2]
-        if self._source_foot_points is None:
-            surface = self._sample_surface(placed_xy).to(placed_z.dtype)
-            required = torch.clamp(
-                surface
-                + float(ANKLE_ORIGIN_SOLE_M)
-                + self._swing_clearance_margin_m
-                - placed_z,
-                min=0.0,
-            )
-        else:
-            surface = self._sample_surface(placed_xy.reshape(-1, 2)).reshape(
-                placed_z.shape
-            ).to(placed_z.dtype)
-            required = torch.clamp(
-                surface + self._swing_clearance_margin_m - placed_z,
-                min=0.0,
-            ).amax(dim=1)
+        placed_z = native_feet[foot, 2] + delta[:, 2]
+        surface = self._sample_surface(placed_xy).to(placed_z.dtype)
+        required = torch.clamp(
+            surface
+            + float(ANKLE_ORIGIN_SOLE_M)
+            + self._swing_clearance_margin_m
+            - placed_z,
+            min=0.0,
+        )
         distance = torch.arange(
             required.shape[0], dtype=required.dtype, device=self._device
         )
@@ -464,16 +428,10 @@ def build_terrain_foot_lock(
     swing_clearance_margin_m: float | None = None,
     correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
-    swing_foot_geometry: bool = False,
 ):
     """Build a source-contact foot lock against the resolved query terrain."""
 
     from .torch_contact_segments import source_support_mask
-
-    if type(swing_foot_geometry) is not bool or (
-        swing_foot_geometry and swing_plan_sigma_frames is None
-    ):
-        raise ValueError("swing foot geometry requires source swing planning")
 
     try:
         clip_paths = tuple(
@@ -485,7 +443,6 @@ def build_terrain_foot_lock(
         )
         device = resolved.device
         source_foot_positions = None
-        source_foot_points = None
         source_root_yaws = None
         if swing_plan_sigma_frames is not None:
             feet_indices = (
@@ -501,36 +458,6 @@ def build_terrain_foot_lock(
                 )
                 for clip in resolved.dataset.folder.clips
             )
-            if swing_foot_geometry:
-                local_points = torch.tensor(
-                    (
-                        (-0.05, 0.025, -ANKLE_ORIGIN_SOLE_M),
-                        (-0.05, -0.025, -ANKLE_ORIGIN_SOLE_M),
-                        (0.12, 0.03, -ANKLE_ORIGIN_SOLE_M),
-                        (0.12, -0.03, -ANKLE_ORIGIN_SOLE_M),
-                    ),
-                    dtype=torch.float32,
-                    device=device,
-                )
-                source_foot_points = []
-                for clip, ankles in zip(
-                    resolved.dataset.folder.clips, source_foot_positions
-                ):
-                    quaternion = torch.tensor(
-                        clip.body_quaternion_world_wxyz[:, feet_indices],
-                        dtype=torch.float32,
-                        device=device,
-                    )
-                    vector = local_points.reshape(1, 1, 4, 3)
-                    xyz = quaternion[..., 1:].unsqueeze(2)
-                    cross = 2.0 * torch.linalg.cross(xyz, vector, dim=-1)
-                    rotated = (
-                        vector
-                        + quaternion[..., :1].unsqueeze(2) * cross
-                        + torch.linalg.cross(xyz, cross, dim=-1)
-                    )
-                    source_foot_points.append(ankles.unsqueeze(2) + rotated)
-                source_foot_points = tuple(source_foot_points)
             source_root_yaws = tuple(
                 torch.atan2(
                     2.0 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]),
@@ -558,7 +485,6 @@ def build_terrain_foot_lock(
         clip_paths=clip_paths,
         support_masks=support_masks,
         source_foot_positions=source_foot_positions,
-        source_foot_points=source_foot_points,
         source_root_yaws=source_root_yaws,
         foot_kinematics=foot_kinematics,
         sample_surface=sample_surface,
