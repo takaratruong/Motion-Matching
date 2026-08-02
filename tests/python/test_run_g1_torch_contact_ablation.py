@@ -21,6 +21,8 @@ class ContactAblationCliTests(unittest.TestCase):
                     "--max-actions-per-state", "3",
                     "--projection-strategy", "stance-root",
                     "--selection-strategy", "contact-anchored",
+                    "--root-correction-scale", "0.5",
+                    "--root-smoothing-passes", "2",
                 ]
             )
 
@@ -37,6 +39,8 @@ class ContactAblationCliTests(unittest.TestCase):
             maximum_actions_per_state=3,
             projection_strategy="stance-root",
             selection_strategy="contact-anchored",
+            root_correction_scale=0.5,
+            root_smoothing_passes=2,
         )
 
 

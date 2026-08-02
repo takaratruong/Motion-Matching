@@ -80,6 +80,7 @@ def contact_ablation_passes(metrics: Mapping[str, object]) -> bool:
         "projected_landing_error_m",
         "maximum_target_error_m",
         "maximum_root_correction_m",
+        "maximum_root_correction_speed_m_s",
     )
     try:
         values = {name: float(metrics[name]) for name in names}
@@ -94,6 +95,7 @@ def contact_ablation_passes(metrics: Mapping[str, object]) -> bool:
         and values["projected_landing_error_m"] <= 0.12
         and values["maximum_target_error_m"] <= 0.005
         and values["maximum_root_correction_m"] <= 0.10
+        and values["maximum_root_correction_speed_m_s"] <= 1.0
     )
 
 
@@ -295,6 +297,7 @@ def _metrics(result: ContactQualityAblationResult) -> dict[str, float]:
             "projected_landing_error_m",
             "maximum_target_error_m",
             "maximum_root_correction_m",
+            "maximum_root_correction_speed_m_s",
             "maximum_joint_deformation_rad",
             "rms_joint_deformation_rad",
         )
@@ -414,6 +417,8 @@ def run_contact_ablation(
     maximum_actions_per_state: int,
     projection_strategy: str,
     selection_strategy: str,
+    root_correction_scale: float,
+    root_smoothing_passes: int,
 ) -> dict[str, object]:
     """Evaluate contact composition on the authenticated frozen oracle states."""
 
@@ -445,6 +450,15 @@ def run_contact_ablation(
         raise ValueError("contact ablation projection strategy is invalid")
     if selection_strategy not in ("saved", "contact-anchored"):
         raise ValueError("contact ablation selection strategy is invalid")
+    if (
+        isinstance(root_correction_scale, bool)
+        or not isinstance(root_correction_scale, (int, float))
+        or not np.isfinite(float(root_correction_scale))
+        or not 0.0 <= float(root_correction_scale) <= 1.0
+        or type(root_smoothing_passes) is not int
+        or not 0 <= root_smoothing_passes <= 10
+    ):
+        raise ValueError("contact ablation root regularization is invalid")
     output_path = Path(os.path.abspath(output))
     if output_path.exists() or output_path.is_symlink():
         raise FileExistsError(f"contact ablation output already exists: {output_path}")
@@ -606,6 +620,8 @@ def run_contact_ablation(
                     desired_landing_world_xyz=desired,
                     foot_kinematics=foot_kinematics,
                     projection_strategy=projection_strategy,
+                    root_correction_scale=float(root_correction_scale),
+                    root_smoothing_passes=root_smoothing_passes,
                 )
             except ValueError as error:
                 reason = str(error)
@@ -681,6 +697,8 @@ def run_contact_ablation(
         "maximum_actions_per_state": maximum_actions_per_state,
         "projection_strategy": projection_strategy,
         "selection_strategy": selection_strategy,
+        "root_correction_scale": float(root_correction_scale),
+        "root_smoothing_passes": root_smoothing_passes,
         "state_count": len(state_records),
         "states_with_accepted_action": sum(
             bool(record["accepted_action_indices"]) for record in state_records

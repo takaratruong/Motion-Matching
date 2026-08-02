@@ -349,6 +349,25 @@ class TerrainContactCompositionTests(unittest.TestCase):
         self.assertGreater(projected.maximum_root_correction_m, 0.07)
         self.assertLess(projected.maximum_joint_deformation_rad, 0.13)
 
+        regularized = project_contact_trajectory_with_stance_root(
+            joint_position=joints,
+            root_position_world=roots,
+            root_orientation_world_wxyz=quaternions,
+            raw_foot_position_world=raw_feet,
+            support_mask=support,
+            swing_foot=1,
+            entry_foot_position_world=entry,
+            landing_target_world=landing,
+            foot_kinematics=kinematics,
+            root_correction_scale=0.5,
+            root_smoothing_passes=2,
+        )
+        self.assertLess(
+            regularized.maximum_root_correction_m,
+            projected.maximum_root_correction_m,
+        )
+        torch.testing.assert_close(regularized.foot_position_world[-1, 1], landing)
+
 
 if __name__ == "__main__":
     unittest.main()

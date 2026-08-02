@@ -30,6 +30,8 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         choices=("saved", "contact-anchored"),
     )
+    parser.add_argument("--root-correction-scale", required=True, type=float)
+    parser.add_argument("--root-smoothing-passes", required=True, type=int)
     return parser
 
 
@@ -47,6 +49,8 @@ def main(argv: list[str] | None = None) -> int:
         maximum_actions_per_state=args.max_actions_per_state,
         projection_strategy=args.projection_strategy,
         selection_strategy=args.selection_strategy,
+        root_correction_scale=args.root_correction_scale,
+        root_smoothing_passes=args.root_smoothing_passes,
     )
     print(json.dumps(result, sort_keys=True), flush=True)
     return 0

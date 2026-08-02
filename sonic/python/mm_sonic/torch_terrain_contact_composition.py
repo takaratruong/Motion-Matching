@@ -178,6 +178,7 @@ class StanceRootProjectionResult:
     foot_position_world: torch.Tensor
     maximum_target_error_m: float
     maximum_root_correction_m: float
+    maximum_root_correction_speed_m_s: float
     maximum_joint_deformation_rad: float
     rms_joint_deformation_rad: float
 
@@ -205,6 +206,7 @@ class StanceRootProjectionResult:
         for name in (
             "maximum_target_error_m",
             "maximum_root_correction_m",
+            "maximum_root_correction_speed_m_s",
             "maximum_joint_deformation_rad",
             "rms_joint_deformation_rad",
         ):
@@ -503,6 +505,8 @@ def project_contact_trajectory_with_stance_root(
     entry_foot_position_world: torch.Tensor,
     landing_target_world: torch.Tensor,
     foot_kinematics: object,
+    root_correction_scale: float = 1.0,
+    root_smoothing_passes: int = 0,
 ) -> StanceRootProjectionResult:
     """Lock the persistent stance with root translation, then warp the swing leg."""
 
@@ -545,6 +549,12 @@ def project_contact_trajectory_with_stance_root(
         or landing_target_world.dtype != joints.dtype
         or landing_target_world.device != joints.device
         or not torch.isfinite(landing_target_world).all()
+        or isinstance(root_correction_scale, bool)
+        or not isinstance(root_correction_scale, (int, float))
+        or not math.isfinite(float(root_correction_scale))
+        or not 0.0 <= float(root_correction_scale) <= 1.0
+        or type(root_smoothing_passes) is not int
+        or not 0 <= root_smoothing_passes <= 10
     ):
         raise ValueError("stance-root projection inputs are invalid")
     provisional = build_contact_target_trajectory(
@@ -586,6 +596,23 @@ def project_contact_trajectory_with_stance_root(
             root_correction[left][None] * (1.0 - smoothstep[:, None])
             + root_correction[right][None] * smoothstep[:, None]
         )
+    boundary_start = root_correction[0].clone()
+    weights = (1.0, 2.0, 3.0, 2.0, 1.0)
+    for _ in range(root_smoothing_passes):
+        padded = torch.cat(
+            (
+                root_correction[:1].expand(2, 3),
+                root_correction,
+                root_correction[-1:].expand(2, 3),
+            ),
+            dim=0,
+        )
+        root_correction = sum(
+            weight * padded[offset : offset + joints.shape[0]]
+            for offset, weight in enumerate(weights)
+        ) / sum(weights)
+        root_correction[0] = boundary_start
+    root_correction = root_correction * float(root_correction_scale)
     corrected_roots = root_position_world + root_correction
     shifted_feet = raw_foot_position_world + root_correction[:, None, :]
     targets = build_contact_target_trajectory(
@@ -620,6 +647,12 @@ def project_contact_trajectory_with_stance_root(
         ),
         maximum_root_correction_m=float(
             torch.linalg.vector_norm(root_correction, dim=1).max().item()
+        ),
+        maximum_root_correction_speed_m_s=float(
+            torch.linalg.vector_norm(
+                torch.diff(root_correction, dim=0), dim=1
+            ).max().item()
+            * 50.0
         ),
         maximum_joint_deformation_rad=projection.maximum_joint_deformation_rad,
         rms_joint_deformation_rad=projection.rms_joint_deformation_rad,

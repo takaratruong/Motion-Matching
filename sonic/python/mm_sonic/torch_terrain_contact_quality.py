@@ -272,6 +272,7 @@ class ContactQualityAblationResult:
     projected_landing_error_m: float
     maximum_target_error_m: float
     maximum_root_correction_m: float
+    maximum_root_correction_speed_m_s: float
     maximum_joint_deformation_rad: float
     rms_joint_deformation_rad: float
 
@@ -302,6 +303,7 @@ class ContactQualityAblationResult:
             "projected_landing_error_m",
             "maximum_target_error_m",
             "maximum_root_correction_m",
+            "maximum_root_correction_speed_m_s",
             "maximum_joint_deformation_rad",
             "rms_joint_deformation_rad",
         ):
@@ -330,6 +332,8 @@ def build_contact_quality_ablation(
     foot_kinematics: object,
     inertialization_halflife_s: float = 0.10,
     projection_strategy: str = "joint-only",
+    root_correction_scale: float = 1.0,
+    root_smoothing_passes: int = 0,
 ) -> ContactQualityAblationResult:
     """Measure contact anchoring and projected composition on one action."""
 
@@ -399,6 +403,7 @@ def build_contact_quality_ablation(
         )
         projected_roots = roots
         maximum_root_correction_m = 0.0
+        maximum_root_correction_speed_m_s = 0.0
     else:
         projection = project_contact_trajectory_with_stance_root(
             joint_position=raw_joints,
@@ -410,9 +415,14 @@ def build_contact_quality_ablation(
             entry_foot_position_world=entry_feet,
             landing_target_world=landing,
             foot_kinematics=foot_kinematics,
+            root_correction_scale=root_correction_scale,
+            root_smoothing_passes=root_smoothing_passes,
         )
         projected_roots = projection.root_position_world
         maximum_root_correction_m = projection.maximum_root_correction_m
+        maximum_root_correction_speed_m_s = (
+            projection.maximum_root_correction_speed_m_s
+        )
     projected_qpos = torch.cat(
         (projected_roots, quaternions, projection.joint_position), dim=1
     ).detach().cpu().numpy()
@@ -435,6 +445,7 @@ def build_contact_quality_ablation(
         ),
         maximum_target_error_m=projection.maximum_target_error_m,
         maximum_root_correction_m=maximum_root_correction_m,
+        maximum_root_correction_speed_m_s=maximum_root_correction_speed_m_s,
         maximum_joint_deformation_rad=projection.maximum_joint_deformation_rad,
         rms_joint_deformation_rad=projection.rms_joint_deformation_rad,
     )
