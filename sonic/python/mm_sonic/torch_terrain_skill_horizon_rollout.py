@@ -364,6 +364,7 @@ def run_resolved_horizon_matrix(
     foot_lock: bool = False,
     contact_phase_gate: bool = False,
     swing_clearance_margin_m: float | None = None,
+    foot_correction_halflife_s: float = 0.04,
 ):
     """Run the renderer-independent route harness with horizon skill MM."""
 
@@ -404,6 +405,7 @@ def run_resolved_horizon_matrix(
             resolved,
             foot_kinematics,
             swing_clearance_margin_m=swing_clearance_margin_m,
+            correction_halflife_s=foot_correction_halflife_s,
         )
     route_matchers: dict[str, TerrainSkillHorizonMatcher] = {}
     model, data = build_kinematic_scene(g1_xml, resolved)
@@ -468,6 +470,7 @@ def run_resolved_horizon_matrix(
                 if swing_clearance_margin_m is not None
                 else ":native-swing"
             )
+            + f":foot-halflife:{float(foot_correction_halflife_s):.9g}"
             + (":phase-gate-v1" if contact_phase_gate else ":implicit-phase")
         ).encode()
     ).hexdigest()

@@ -291,6 +291,7 @@ def build_terrain_foot_lock(
     foot_kinematics: object,
     *,
     swing_clearance_margin_m: float | None = None,
+    correction_halflife_s: float = 0.04,
 ):
     """Build a source-contact foot lock against the resolved query terrain."""
 
@@ -321,4 +322,5 @@ def build_terrain_foot_lock(
         sample_surface=sample_surface,
         device=device,
         swing_clearance_margin_m=swing_clearance_margin_m,
+        correction_halflife_s=correction_halflife_s,
     )

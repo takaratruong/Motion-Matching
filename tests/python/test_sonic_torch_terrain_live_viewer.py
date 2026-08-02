@@ -218,12 +218,14 @@ class LiveMujocoSceneTests(unittest.TestCase):
                 "--foot-lock",
                 "--contact-phase-gate",
                 "--swing-clearance-margin-m", "0.01",
+                "--foot-correction-halflife-s", "0.02",
             ]
         )
         self.assertTrue(arguments.multi_horizon)
         self.assertTrue(arguments.foot_lock)
         self.assertTrue(arguments.contact_phase_gate)
         self.assertEqual(arguments.swing_clearance_margin_m, 0.01)
+        self.assertEqual(arguments.foot_correction_halflife_s, 0.02)
         live_module._validate_live_mode(
             multi_horizon=True,
             contact_segments=False,
@@ -231,6 +233,7 @@ class LiveMujocoSceneTests(unittest.TestCase):
             foot_lock=True,
             contact_phase_gate=True,
             swing_clearance_margin_m=0.01,
+            foot_correction_halflife_s=0.02,
         )
         with self.assertRaisesRegex(ContractError, "mutually exclusive"):
             live_module._validate_live_mode(
@@ -405,6 +408,7 @@ class LiveMujocoSceneTests(unittest.TestCase):
             "--foot-lock",
             "--contact-phase-gate",
             "--swing-clearance-margin-m",
+            "--foot-correction-halflife-s",
         ):
             self.assertIn(option, help_text)
         self.assertIn(

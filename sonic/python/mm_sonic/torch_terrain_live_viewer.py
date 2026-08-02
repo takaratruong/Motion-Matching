@@ -504,6 +504,7 @@ def _validate_live_mode(
     foot_lock: bool = False,
     contact_phase_gate: bool = False,
     swing_clearance_margin_m: float | None = None,
+    foot_correction_halflife_s: float = 0.04,
 ) -> None:
     if multi_horizon and (contact_segments or foothold_arm is not None):
         raise ContractError(
@@ -527,6 +528,7 @@ def _build_live_matcher(
     foot_lock: bool = False,
     contact_phase_gate: bool = False,
     swing_clearance_margin_m: float | None = None,
+    foot_correction_halflife_s: float = 0.04,
 ):
     matcher_config = matcher_config_from_resolved(resolved.resolved_config)
     if multi_horizon:
@@ -549,6 +551,7 @@ def _build_live_matcher(
                 resolved,
                 foot_kinematics,
                 swing_clearance_margin_m=swing_clearance_margin_m,
+                correction_halflife_s=foot_correction_halflife_s,
             )
         if contact_phase_gate:
             matcher_kwargs["contact_phase_gate"] = True
@@ -600,6 +603,7 @@ def run_live_viewer(
     foot_lock: bool = False,
     contact_phase_gate: bool = False,
     swing_clearance_margin_m: float | None = None,
+    foot_correction_halflife_s: float = 0.04,
 ) -> None:
     """Run the dense 50 Hz matcher and display each committed state."""
 
@@ -615,6 +619,7 @@ def run_live_viewer(
         foot_lock=foot_lock,
         contact_phase_gate=contact_phase_gate,
         swing_clearance_margin_m=swing_clearance_margin_m,
+        foot_correction_halflife_s=foot_correction_halflife_s,
     )
     if contact_segments:
         from .torch_contact_segment_rollout import (
@@ -708,6 +713,7 @@ def run_live_viewer(
         foot_lock=foot_lock,
         contact_phase_gate=contact_phase_gate,
         swing_clearance_margin_m=swing_clearance_margin_m,
+        foot_correction_halflife_s=foot_correction_halflife_s,
     )
     from .torch_terrain_omni_rollout import resolved_stair_reset_position
 
@@ -923,6 +929,12 @@ def build_live_viewer_argument_parser() -> argparse.ArgumentParser:
         help="Lift unsupported ankles above query terrain by this margin.",
     )
     parser.add_argument(
+        "--foot-correction-halflife-s",
+        type=float,
+        default=0.04,
+        help="Inertialization halflife for terrain foot corrections.",
+    )
+    parser.add_argument(
         "--contact-segments",
         action="store_true",
         help="Use committed authoritative-FK terrain contact segments.",
@@ -1015,6 +1027,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         foot_lock=args.foot_lock,
         contact_phase_gate=args.contact_phase_gate,
         swing_clearance_margin_m=args.swing_clearance_margin_m,
+        foot_correction_halflife_s=args.foot_correction_halflife_s,
     )
     return 0
 

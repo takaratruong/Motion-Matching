@@ -56,6 +56,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Lift unsupported ankles above query terrain by this margin.",
     )
     parser.add_argument(
+        "--foot-correction-halflife-s",
+        type=float,
+        default=0.04,
+        help="Inertialization halflife for terrain foot corrections.",
+    )
+    parser.add_argument(
         "--ablation",
         choices=(
             "combined",
@@ -195,6 +201,7 @@ def main(argv: list[str] | None = None) -> int:
         foot_lock=args.foot_lock,
         contact_phase_gate=args.contact_phase_gate,
         swing_clearance_margin_m=args.swing_clearance_margin_m,
+        foot_correction_halflife_s=args.foot_correction_halflife_s,
     )
     save_horizon_matrix(matrix, events, args.output)
     execution_completed = all(
@@ -211,6 +218,7 @@ def main(argv: list[str] | None = None) -> int:
                 "foot_lock": args.foot_lock,
                 "contact_phase_gate": args.contact_phase_gate,
                 "swing_clearance_margin_m": args.swing_clearance_margin_m,
+                "foot_correction_halflife_s": args.foot_correction_halflife_s,
                 "deterministic_sha256": matrix.deterministic_sha256,
                 "output": args.output,
             },
