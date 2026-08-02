@@ -157,6 +157,33 @@ class ControlEdgeLatch:
         return edges
 
 
+class LiveActionChunkLatch:
+    """Finish one selected terrain chunk after movement input is released."""
+
+    def __init__(self) -> None:
+        self._moving_command: LiveControlCommand | None = None
+
+    def reset(self) -> None:
+        self._moving_command = None
+
+    def resolve(
+        self,
+        command: LiveControlCommand,
+        *,
+        selected_frame: int,
+        endpoint: int | None,
+    ) -> LiveControlCommand | None:
+        if command.advance_matcher:
+            self._moving_command = command
+            return command
+        if self._moving_command is None or endpoint is None:
+            return None
+        if int(selected_frame) >= int(endpoint) - 1:
+            self._moving_command = None
+            return None
+        return self._moving_command
+
+
 def matcher_result_qpos(result: object) -> np.ndarray:
     """Convert one target-ordered matcher result into native G1 qpos."""
 
@@ -836,6 +863,7 @@ def run_live_viewer(
     ).trajectory
     provider: X11KeyStateProvider | None = None
     latch = ControlEdgeLatch()
+    action_latch = LiveActionChunkLatch()
     horizon_fault: str | None = None
     fault_command: tuple[tuple[float, float], float] | None = None
     try:
@@ -871,6 +899,7 @@ def run_live_viewer(
                     result = matcher.reset(
                         root_position_world_xy=reset_position
                     )
+                    action_latch.reset()
                     shaped_velocity.zero_()
                     shaped_heading.zero_()
                     heading = float(
@@ -920,12 +949,32 @@ def run_live_viewer(
                 if fault_command is not None and command_identity != fault_command:
                     horizon_fault = None
                     fault_command = None
-                if not edges.reset_requested and command.advance_matcher:
+                horizon_event = (
+                    matcher.chunk_events[-1]
+                    if multi_horizon and matcher.chunk_events
+                    else None
+                )
+                playback_command = None
+                if not edges.reset_requested:
+                    playback_command = (
+                        action_latch.resolve(
+                            command,
+                            selected_frame=int(result.diagnostics.selected_frame),
+                            endpoint=(
+                                horizon_event.endpoint_frame_exclusive
+                                if horizon_event is not None
+                                else None
+                            ),
+                        )
+                        if multi_horizon
+                        else (command if command.advance_matcher else None)
+                    )
+                if playback_command is not None:
                     if fault_command is None:
-                        heading = command.heading_world_yaw
+                        heading = playback_command.heading_world_yaw
                         try:
                             prepared = matcher.prepare_step(
-                                command_identity[0],
+                                tuple(playback_command.velocity_world_xy),
                                 heading,
                                 dt=_DT_S,
                             )

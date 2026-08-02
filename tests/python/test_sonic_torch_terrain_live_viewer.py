@@ -64,6 +64,32 @@ def _minimal_g1_xml(path: Path) -> None:
 
 
 class LiveCommandTests(unittest.TestCase):
+    def test_release_finishes_only_the_active_chunk(self):
+        latch_type = getattr(live_module, "LiveActionChunkLatch", None)
+        self.assertIsNotNone(latch_type)
+        latch = latch_type()
+        moving = command_from_keys(
+            frozenset(("W",)),
+            reference_direction_xy=np.array([1.0, 0.0]),
+            speed_mps=0.4,
+            previous_heading_rad=0.0,
+        )
+        stopped = command_from_keys(
+            frozenset(),
+            reference_direction_xy=np.array([1.0, 0.0]),
+            speed_mps=0.4,
+            previous_heading_rad=0.0,
+        )
+
+        self.assertIs(latch.resolve(moving, selected_frame=396, endpoint=466), moving)
+        self.assertIs(latch.resolve(stopped, selected_frame=418, endpoint=466), moving)
+        self.assertIsNone(latch.resolve(stopped, selected_frame=465, endpoint=466))
+        self.assertIsNone(latch.resolve(stopped, selected_frame=465, endpoint=466))
+
+        latch.resolve(moving, selected_frame=396, endpoint=466)
+        latch.reset()
+        self.assertIsNone(latch.resolve(stopped, selected_frame=418, endpoint=466))
+
     def test_wasd_uses_reference_frame_and_normalizes_diagonals(self):
         reference = np.array([0.0, 1.0])
         speed = 0.4
