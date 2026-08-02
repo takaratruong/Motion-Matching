@@ -1,5 +1,4 @@
 import math
-from dataclasses import replace
 import unittest
 
 import torch
@@ -161,35 +160,6 @@ class HorizonRankingTest(unittest.TestCase):
         self.assertEqual(visited, [(2, 2, 30), (3, 3, 30)])
         self.assertEqual(result.record_index, 3)
         self.assertEqual(result.rejected_by_reason["terrain"], 1)
-
-    def test_selection_can_preserve_a_required_horizon_layer(self):
-        inventory = replace(
-            self.inventory,
-            target_frames=torch.tensor([25, 25, 25, 50]),
-        )
-        target = HorizonTargets(
-            frames=torch.tensor([25, 50]),
-            displacement_local_xy=torch.tensor([[0.5, 0.0], [0.5, 0.0]]),
-            yaw_delta_rad=torch.tensor([0.7, 0.7]),
-            root_height_delta_m=torch.tensor([0.1, 0.1]),
-            surface_height_delta_m=torch.tensor([[0.1, 0.1], [0.1, 0.1]]),
-        )
-        visited = []
-
-        result = select_horizon_candidate(
-            self.database,
-            inventory,
-            torch.zeros(27),
-            target,
-            terrain_validator=lambda record, row, endpoint: (
-                visited.append(record) is None
-            ),
-            required_target_frames=50,
-        )
-
-        self.assertEqual(visited, [3])
-        self.assertEqual(result.record_index, 3)
-        self.assertEqual(result.rejected_by_reason["horizon"], 1)
 
     def test_current_source_neighborhood_is_excluded(self):
         ranked = rank_horizon_candidates(

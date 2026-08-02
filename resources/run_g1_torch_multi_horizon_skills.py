@@ -61,11 +61,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Scale the mean-preserving left/right terrain-height split.",
     )
     parser.add_argument(
-        "--footprint-preserve-horizon",
-        action="store_true",
-        help="Rerank footprint candidates within the baseline horizon layer.",
-    )
-    parser.add_argument(
         "--swing-clearance-margin-m",
         type=float,
         default=None,
@@ -224,7 +219,6 @@ def main(argv: list[str] | None = None) -> int:
         contact_phase_gate=args.contact_phase_gate,
         footprint_terrain_targets=args.footprint_terrain_targets,
         footprint_split_gain=args.footprint_split_gain,
-        footprint_preserve_horizon=args.footprint_preserve_horizon,
         swing_clearance_margin_m=args.swing_clearance_margin_m,
         foot_correction_halflife_s=args.foot_correction_halflife_s,
         swing_plan_sigma_frames=args.swing_plan_sigma_frames,
@@ -245,7 +239,6 @@ def main(argv: list[str] | None = None) -> int:
                 "contact_phase_gate": args.contact_phase_gate,
                 "footprint_terrain_targets": args.footprint_terrain_targets,
                 "footprint_split_gain": args.footprint_split_gain,
-                "footprint_preserve_horizon": args.footprint_preserve_horizon,
                 "swing_clearance_margin_m": args.swing_clearance_margin_m,
                 "foot_correction_halflife_s": args.foot_correction_halflife_s,
                 "swing_plan_sigma_frames": args.swing_plan_sigma_frames,
