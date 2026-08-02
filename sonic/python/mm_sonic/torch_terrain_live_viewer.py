@@ -506,6 +506,7 @@ def _validate_live_mode(
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
+    maximum_source_contact_p95_m: float | None = None,
 ) -> None:
     if multi_horizon and (contact_segments or foothold_arm is not None):
         raise ContractError(
@@ -519,6 +520,8 @@ def _validate_live_mode(
         raise ContractError("swing clearance requires terrain foot lock")
     if swing_plan_sigma_frames is not None and swing_clearance_margin_m is None:
         raise ContractError("swing plan requires swing clearance")
+    if maximum_source_contact_p95_m is not None and not multi_horizon:
+        raise ContractError("source contact quality gate requires multi-horizon mode")
 
 
 def _build_live_matcher(
@@ -533,6 +536,7 @@ def _build_live_matcher(
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
+    maximum_source_contact_p95_m: float | None = None,
 ):
     matcher_config = matcher_config_from_resolved(resolved.resolved_config)
     if multi_horizon:
@@ -542,7 +546,11 @@ def _build_live_matcher(
             config=matcher_config,
             reset_clip_path=resolved.resolved_config["reset_clip"],
         )
-        skills = build_terrain_skill_inventory(resolved.dataset, base.database)
+        skills = build_terrain_skill_inventory(
+            resolved.dataset,
+            base.database,
+            maximum_source_contact_p95_m=maximum_source_contact_p95_m,
+        )
         horizons = build_horizon_inventory(
             resolved.dataset, base.database, skills
         )
@@ -610,6 +618,7 @@ def run_live_viewer(
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
+    maximum_source_contact_p95_m: float | None = None,
 ) -> None:
     """Run the dense 50 Hz matcher and display each committed state."""
 
@@ -627,6 +636,7 @@ def run_live_viewer(
         swing_clearance_margin_m=swing_clearance_margin_m,
         foot_correction_halflife_s=foot_correction_halflife_s,
         swing_plan_sigma_frames=swing_plan_sigma_frames,
+        maximum_source_contact_p95_m=maximum_source_contact_p95_m,
     )
     if contact_segments:
         from .torch_contact_segment_rollout import (
@@ -722,6 +732,7 @@ def run_live_viewer(
         swing_clearance_margin_m=swing_clearance_margin_m,
         foot_correction_halflife_s=foot_correction_halflife_s,
         swing_plan_sigma_frames=swing_plan_sigma_frames,
+        maximum_source_contact_p95_m=maximum_source_contact_p95_m,
     )
     from .torch_terrain_omni_rollout import resolved_stair_reset_position
 
@@ -949,6 +960,12 @@ def build_live_viewer_argument_parser() -> argparse.ArgumentParser:
         help="Spread future source-path clearance backward by this sigma.",
     )
     parser.add_argument(
+        "--maximum-source-contact-p95-m",
+        type=float,
+        default=None,
+        help="Exclude terrain clips with worse authenticated contact fit.",
+    )
+    parser.add_argument(
         "--contact-segments",
         action="store_true",
         help="Use committed authoritative-FK terrain contact segments.",
@@ -1043,6 +1060,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         swing_clearance_margin_m=args.swing_clearance_margin_m,
         foot_correction_halflife_s=args.foot_correction_halflife_s,
         swing_plan_sigma_frames=args.swing_plan_sigma_frames,
+        maximum_source_contact_p95_m=(
+            args.maximum_source_contact_p95_m
+        ),
     )
     return 0
 

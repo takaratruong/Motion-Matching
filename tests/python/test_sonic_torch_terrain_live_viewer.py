@@ -163,7 +163,7 @@ class LiveMujocoSceneTests(unittest.TestCase):
             ) as from_folder,
             mock.patch.object(
                 live_module, "build_terrain_skill_inventory", return_value="skills"
-            ),
+            ) as build_skills,
             mock.patch.object(
                 live_module, "build_horizon_inventory", return_value="horizons"
             ),
@@ -190,6 +190,7 @@ class LiveMujocoSceneTests(unittest.TestCase):
                 multi_horizon=True,
                 contact_segment_policy=None,
                 foothold_action_policy=None,
+                maximum_source_contact_p95_m=0.033,
             )
 
         self.assertIs(result, qualified)
@@ -197,6 +198,11 @@ class LiveMujocoSceneTests(unittest.TestCase):
         self.assertNotIn("extension", kwargs)
         self.assertNotIn("emitted_window_validator", kwargs)
         self.assertEqual(kwargs["config"], "matcher")
+        build_skills.assert_called_once_with(
+            resolved.dataset,
+            base.database,
+            maximum_source_contact_p95_m=0.033,
+        )
         adapter.assert_called_once_with(
             base_matcher=base,
             skill_inventory="skills",
@@ -220,6 +226,7 @@ class LiveMujocoSceneTests(unittest.TestCase):
                 "--swing-clearance-margin-m", "0.01",
                 "--swing-plan-sigma-frames", "2.5",
                 "--foot-correction-halflife-s", "0.02",
+                "--maximum-source-contact-p95-m", "0.033",
             ]
         )
         self.assertTrue(arguments.multi_horizon)
@@ -228,6 +235,7 @@ class LiveMujocoSceneTests(unittest.TestCase):
         self.assertEqual(arguments.swing_clearance_margin_m, 0.01)
         self.assertEqual(arguments.swing_plan_sigma_frames, 2.5)
         self.assertEqual(arguments.foot_correction_halflife_s, 0.02)
+        self.assertEqual(arguments.maximum_source_contact_p95_m, 0.033)
         live_module._validate_live_mode(
             multi_horizon=True,
             contact_segments=False,
@@ -420,6 +428,7 @@ class LiveMujocoSceneTests(unittest.TestCase):
             "--contact-phase-gate",
             "--swing-clearance-margin-m",
             "--foot-correction-halflife-s",
+            "--maximum-source-contact-p95-m",
         ):
             self.assertIn(option, help_text)
         self.assertIn(
