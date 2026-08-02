@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "terrain-oracle-corpus/v1",
+  "title": "Immutable canonical terrain-oracle corpus manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "coordinate_frame",
+    "quaternion_convention",
+    "fps",
+    "joint_order",
+    "body_order",
+    "clips",
+    "meshes",
+    "metadata"
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "clip": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relative_path", "sha256", "clip_id", "frame_count"],
+      "properties": {
+        "relative_path": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "clip_id": {"type": "string", "minLength": 1},
+        "frame_count": {"type": "integer", "minimum": 1}
+      }
+    },
+    "mesh": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relative_path", "sha256", "vertex_count", "face_count"],
+      "properties": {
+        "relative_path": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "vertex_count": {"type": "integer", "minimum": 1},
+        "face_count": {"type": "integer", "minimum": 1}
+      }
+    }
+  },
+  "properties": {
+    "schema": {"const": "terrain-oracle-corpus/v1"},
+    "coordinate_frame": {"const": "z-up-right-handed"},
+    "quaternion_convention": {"const": "wxyz"},
+    "fps": {"const": 50.0},
+    "joint_order": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "minItems": 29,
+      "maxItems": 29
+    },
+    "body_order": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "minItems": 30,
+      "maxItems": 30
+    },
+    "clips": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/clip"}
+    },
+    "meshes": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/mesh"}
+    },
+    "metadata": {"type": "object"}
+  }
+}
