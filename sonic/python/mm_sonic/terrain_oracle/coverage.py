@@ -414,11 +414,20 @@ def _groups(records: Sequence[AcceptedClipRecord]) -> tuple[dict[str, str], dict
     semantic_group: dict[str, str] = {}
     for members in components.values():
         semantics = sorted({deduped.semantic_digest_by_clip[item] for item in members})
-        group_id = hashlib.sha256(("terrain-oracle-split-group/v1\0" + "\0".join(semantics)).encode()).hexdigest()
+        group_id = _split_group_id(semantics)
         for member in members:
             group_for_clip[member] = group_id
             semantic_group[deduped.semantic_digest_by_clip[member]] = group_id
     return group_for_clip, semantic_group
+
+
+def _split_group_id(semantic_digests: Sequence[str]) -> str:
+    values = tuple(sorted(set(semantic_digests)))
+    if not values or any(_sha(value, "semantic digest") != value for value in values):
+        raise ContractError("split group requires semantic digests")
+    return hashlib.sha256(
+        ("terrain-oracle-split-group/v1\0" + "\0".join(values)).encode()
+    ).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -550,8 +559,8 @@ def _definitions() -> dict[str, object]:
 
 
 def _freeze_definitions(value: Mapping[str, object]) -> Mapping[str, object]:
-    if not isinstance(value, Mapping) or tuple(value) != AXES:
-        raise ContractError("bin definition axes/order do not match v1")
+    if not isinstance(value, Mapping) or set(value) != set(AXES):
+        raise ContractError("bin definition axes do not match v1")
     frozen = {}
     try:
         for axis in AXES:
@@ -594,18 +603,14 @@ def _plain_definitions(value: Mapping[str, object]) -> dict[str, object]:
 class CoverageContribution:
     contribution_id: str
     semantic_digest: str
-    source_sha256: str
     dedup_group_id: str
-    clip_sha256: str
     accepted_interval: tuple[int, int]
 
     def __post_init__(self) -> None:
         for name in (
             "contribution_id",
             "semantic_digest",
-            "source_sha256",
             "dedup_group_id",
-            "clip_sha256",
         ):
             _sha(getattr(self, name), name)
         interval = tuple(self.accepted_interval)
@@ -626,17 +631,15 @@ class CoverageContribution:
         return {
             "contribution_id": self.contribution_id,
             "semantic_digest": self.semantic_digest,
-            "source_sha256": self.source_sha256,
             "dedup_group_id": self.dedup_group_id,
-            "clip_sha256": self.clip_sha256,
             "accepted_interval": list(self.accepted_interval),
         }
 
     @classmethod
     def from_dict(cls, value: object) -> "CoverageContribution":
         expected = {
-            "contribution_id", "semantic_digest", "source_sha256",
-            "dedup_group_id", "clip_sha256", "accepted_interval",
+            "contribution_id", "semantic_digest", "dedup_group_id",
+            "accepted_interval",
         }
         if not isinstance(value, dict) or set(value) != expected:
             raise ContractError("coverage contribution fields do not match v1")
@@ -644,9 +647,7 @@ class CoverageContribution:
             return cls(
                 value["contribution_id"],
                 value["semantic_digest"],
-                value["source_sha256"],
                 value["dedup_group_id"],
-                value["clip_sha256"],
                 tuple(value["accepted_interval"]),
             )
         except (KeyError, TypeError, ValueError) as error:
@@ -672,7 +673,6 @@ def _contribution_id(
 class CoverageCell:
     cell_id: str
     coordinates: tuple[str, ...]
-    source_ids: tuple[str, ...]
     dedup_group_ids: tuple[str, ...]
     contribution_count: int
     intervals: tuple[tuple[int, int], ...]
@@ -696,18 +696,15 @@ class CoverageCell:
             or len({item.contribution_id for item in contributions}) != len(contributions)
         ):
             raise ContractError("cell contributions must be sorted unique evidence")
-        sources = tuple(sorted({item.source_sha256 for item in contributions}))
         groups = tuple(sorted({item.dedup_group_id for item in contributions}))
         intervals = tuple(sorted({item.accepted_interval for item in contributions}))
         if (
-            tuple(self.source_ids) != sources
-            or tuple(self.dedup_group_ids) != groups
+            tuple(self.dedup_group_ids) != groups
             or tuple(tuple(value) for value in self.intervals) != intervals
             or self.contribution_count != len(contributions)
         ):
             raise ContractError("cell aggregates do not match contribution evidence")
         object.__setattr__(self, "coordinates", coordinates)
-        object.__setattr__(self, "source_ids", sources)
         object.__setattr__(self, "dedup_group_ids", groups)
         object.__setattr__(self, "intervals", intervals)
         object.__setattr__(self, "contributions", contributions)
@@ -720,7 +717,7 @@ class CoverageCell:
         return {
             "cell_id": self.cell_id,
             "coordinates": {axis: value for axis, value in zip(AXES, self.coordinates)},
-            "source_ids": list(self.source_ids), "dedup_group_ids": list(self.dedup_group_ids),
+            "dedup_group_ids": list(self.dedup_group_ids),
             "contribution_count": self.contribution_count,
             "intervals": [list(value) for value in self.intervals],
             "contributions": [value.to_dict() for value in self.contributions],
@@ -729,19 +726,18 @@ class CoverageCell:
     @classmethod
     def from_dict(cls, value: object) -> "CoverageCell":
         expected = {
-            "cell_id", "coordinates", "source_ids", "dedup_group_ids",
+            "cell_id", "coordinates", "dedup_group_ids",
             "contribution_count", "intervals", "contributions",
         }
         if not isinstance(value, dict) or set(value) != expected:
             raise ContractError("coverage cell fields do not match v1")
         coordinates = value["coordinates"]
-        if not isinstance(coordinates, dict) or tuple(coordinates) != AXES:
+        if not isinstance(coordinates, dict) or set(coordinates) != set(AXES):
             raise ContractError("coverage cell coordinate axes/order do not match v1")
         try:
             return cls(
                 value["cell_id"],
                 tuple(coordinates[axis] for axis in AXES),
-                tuple(value["source_ids"]),
                 tuple(value["dedup_group_ids"]),
                 value["contribution_count"],
                 tuple(tuple(interval) for interval in value["intervals"]),
@@ -903,6 +899,24 @@ def _derived_marginals(
     return result
 
 
+def _validate_contribution_groups(cells: tuple[CoverageCell, ...]) -> None:
+    by_identifier: dict[str, CoverageContribution] = {}
+    semantics_by_group: dict[str, set[str]] = {}
+    for cell in cells:
+        for contribution in cell.contributions:
+            previous = by_identifier.setdefault(
+                contribution.contribution_id, contribution
+            )
+            if previous != contribution:
+                raise ContractError("one contribution ID has conflicting evidence")
+            semantics_by_group.setdefault(
+                contribution.dedup_group_id, set()
+            ).add(contribution.semantic_digest)
+    for group_id, semantic_digests in semantics_by_group.items():
+        if group_id != _split_group_id(tuple(semantic_digests)):
+            raise ContractError("dedup group ID does not match semantic evidence")
+
+
 def _derived_components(
     cells: tuple[CoverageCell, ...], definitions: Mapping[str, object]
 ) -> tuple[tuple[str, ...], ...]:
@@ -960,6 +974,7 @@ class CoverageManifest:
             for axis, category in zip(AXES, cell.coordinates):
                 if category not in definitions[axis]["categories"]:
                     raise ContractError("cell coordinate is outside published categories")
+        _validate_contribution_groups(cells)
         marginal = {
             axis: dict(self.marginal_counts[axis])
             for axis in AXES
@@ -1002,7 +1017,10 @@ class CoverageManifest:
             "occupied_cells", "connected_components", "content_sha256",
         }:
             raise ContractError("coverage document fields do not match schema")
-        if tuple(value["bin_definitions"]) != AXES or tuple(value["marginal_counts"]) != AXES:
+        if (
+            set(value["bin_definitions"]) != set(AXES)
+            or set(value["marginal_counts"]) != set(AXES)
+        ):
             raise ContractError("coverage axes/order do not match v1")
         try:
             cells = tuple(CoverageCell.from_dict(raw) for raw in value["occupied_cells"])
@@ -1029,9 +1047,7 @@ def build_coverage(records: Sequence[AcceptedClipRecord]) -> CoverageManifest:
             contribution = CoverageContribution(
                 _contribution_id(semantic, group, interval_tuple),
                 semantic,
-                record.clip.source.source_sha256,
                 group,
-                record.clip_record.sha256,
                 interval_tuple,
             )
             for coordinates in _interval_coordinates(record, interval):
@@ -1046,7 +1062,6 @@ def build_coverage(records: Sequence[AcceptedClipRecord]) -> CoverageManifest:
             lambda evidence: CoverageCell(
                 _cell_id(coordinates),
                 coordinates,
-                tuple(sorted({item.source_sha256 for item in evidence})),
                 tuple(sorted({item.dedup_group_id for item in evidence})),
                 len(evidence),
                 tuple(sorted({item.accepted_interval for item in evidence})),

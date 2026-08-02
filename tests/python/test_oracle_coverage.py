@@ -401,6 +401,44 @@ class OracleCoverageTests(CoverageFixture, unittest.TestCase):
         many = build_coverage((down, up, up, down, up))
         self.assertEqual(one.to_dict(), many.to_dict())
 
+    def test_lexically_earlier_identity_copy_does_not_change_manifest(self):
+        original = self.record(
+            "z_original", action_class="ascent", terrain_asset_sha="1" * 64
+        )
+        copied_clip = replace(
+            original.clip,
+            clip_id="a_copy",
+            source=replace(
+                original.clip.source,
+                source_path="synthetic://identity-copy",
+                source_sha256="f" * 64,
+            ),
+        )
+        artifact = write_clip(self.root / "identity-copy" / "clips", copied_clip)
+        copied = replace(
+            original,
+            clip=copied_clip,
+            clip_record=artifact,
+            audit=replace(
+                original.audit,
+                clip_id="a_copy",
+                source_sha256="f" * 64,
+                clip_sha256=artifact.sha256,
+            ),
+        )
+
+        expected = build_coverage((original,))
+        for records in (
+            (original, copied),
+            (copied, original),
+            (copied, original, copied, original),
+        ):
+            with self.subTest(records=tuple(item.clip.clip_id for item in records)):
+                actual = build_coverage(records)
+                self.assertEqual(actual, expected)
+                self.assertEqual(actual.to_dict(), expected.to_dict())
+                self.assertEqual(actual.content_sha256, expected.content_sha256)
+
     def test_accepted_interval_gap_is_never_bridged(self):
         pattern = np.zeros((14, 2), np.float32)
         pattern[1:4, 0] = 1
@@ -533,8 +571,17 @@ class OracleCoverageTests(CoverageFixture, unittest.TestCase):
         schema_path = self.root / "schema.json"
         valid_path = self.root / "valid.json"
         invalid_path = self.root / "invalid.json"
+        reordered_document = json.loads(json.dumps(document))
+        reordered_document["bin_definitions"] = dict(
+            reversed(tuple(reordered_document["bin_definitions"].items()))
+        )
+        reordered_document["marginal_counts"] = dict(
+            reversed(tuple(reordered_document["marginal_counts"].items()))
+        )
+        for cell in reordered_document["occupied_cells"]:
+            cell["coordinates"] = dict(reversed(tuple(cell["coordinates"].items())))
         schema_path.write_text(json.dumps(schema))
-        valid_path.write_text(json.dumps(document))
+        valid_path.write_text(json.dumps(reordered_document))
         invalid_path.write_text(json.dumps(invalid_documents))
         script = (
             "import json,sys\n"
@@ -562,16 +609,12 @@ class OracleCoverageTests(CoverageFixture, unittest.TestCase):
             freeze_coverage(destination, manifest)
         self.assertEqual(list(destination.parent.glob(f".{destination.name}.*")), [])
 
-    def test_cells_publish_recomputable_actual_contribution_evidence(self):
+    def test_cells_publish_recomputable_canonical_contribution_evidence(self):
         record = self.record("evidence", terrain_asset_sha="1" * 64)
         manifest = build_coverage((record,))
         self.assertTrue(manifest.occupied_cells)
         for cell in manifest.occupied_cells:
             self.assertEqual(cell.contribution_count, len(cell.contributions))
-            self.assertEqual(
-                cell.source_ids,
-                tuple(sorted({item.source_sha256 for item in cell.contributions})),
-            )
             self.assertEqual(
                 cell.dedup_group_ids,
                 tuple(sorted({item.dedup_group_id for item in cell.contributions})),
@@ -581,8 +624,31 @@ class OracleCoverageTests(CoverageFixture, unittest.TestCase):
                 tuple(sorted({item.accepted_interval for item in cell.contributions})),
             )
             for contribution in cell.contributions:
-                self.assertEqual(contribution.source_sha256, record.clip.source.source_sha256)
-                self.assertEqual(contribution.clip_sha256, record.clip_record.sha256)
+                self.assertEqual(
+                    contribution.semantic_digest,
+                    deduplicate((record,)).semantic_digest_by_clip[record.clip.clip_id],
+                )
+        self.assertEqual(record.clip_record.sha256, record.audit.clip_sha256)
+        self.assertEqual(record.clip.source.source_sha256, record.audit.source_sha256)
+
+    def test_json_object_insertion_order_is_not_semantic(self):
+        manifest = build_coverage((self.record("json-order", terrain_asset_sha="1" * 64),))
+        document = manifest.to_dict()
+        document["bin_definitions"] = dict(
+            reversed(tuple(document["bin_definitions"].items()))
+        )
+        document["marginal_counts"] = dict(
+            reversed(tuple(document["marginal_counts"].items()))
+        )
+        for cell in document["occupied_cells"]:
+            cell["coordinates"] = dict(
+                reversed(tuple(cell["coordinates"].items()))
+            )
+
+        restored = CoverageManifest.from_dict(document)
+        self.assertEqual(restored, manifest)
+        self.assertEqual(restored.to_dict(), manifest.to_dict())
+        self.assertEqual(restored.content_sha256, manifest.content_sha256)
 
     def test_rehashed_manifest_relation_mutations_all_fail(self):
         manifest = build_coverage((self.record("relations", terrain_asset_sha="1" * 64),))
@@ -619,16 +685,31 @@ class OracleCoverageTests(CoverageFixture, unittest.TestCase):
         changed["occupied_cells"][0]["contribution_count"] += 1
         mutations.append(changed)
         changed = json.loads(json.dumps(original))
-        changed["occupied_cells"][0]["source_ids"][0] = "f" * 64
-        mutations.append(changed)
-        changed = json.loads(json.dumps(original))
-        changed["occupied_cells"][0]["contributions"][0]["source_sha256"] = "f" * 64
-        mutations.append(changed)
-        changed = json.loads(json.dumps(original))
         changed["occupied_cells"][0]["contributions"][0]["accepted_interval"][1] -= 1
         mutations.append(changed)
         changed = json.loads(json.dumps(original))
         changed["occupied_cells"][0]["contributions"][0]["contribution_id"] = "f" * 64
+        mutations.append(changed)
+        changed = json.loads(json.dumps(original))
+        contribution = changed["occupied_cells"][0]["contributions"][0]
+        contribution["semantic_digest"] = "f" * 64
+        contribution["contribution_id"] = hashlib.sha256(
+            (
+                json.dumps(
+                    {
+                        "schema": "terrain-oracle-coverage-contribution/v1",
+                        "semantic_digest": contribution["semantic_digest"],
+                        "dedup_group_id": contribution["dedup_group_id"],
+                        "accepted_interval": contribution["accepted_interval"],
+                    },
+                    allow_nan=False,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("ascii")
+        ).hexdigest()
         mutations.append(changed)
         changed = json.loads(json.dumps(original))
         changed["occupied_cells"][0]["cell_id"] = "f" * 64
