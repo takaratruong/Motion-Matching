@@ -215,6 +215,46 @@ baseline, while thresholds at or below 3.2 cm lose route coverage.
   alone does not replace the targeted lateral-exit and turning coverage in the
   curated corpus; the follow-up evaluates their deduplicated union.
 
+## Overnight corpus and motion-warp continuation
+
+The deduplicated union contains 1,967 clips: the curated 760-clip set plus a
+balanced sample from all curb and stair partitions. Freezing feature
+normalization to the curated corpus removed corpus-statistics drift. The union
+then passed 6/6 frozen routes with 1.591 m stance slide and zero worst-route
+p95 penetration, but it passed only 13/21 broad routes. It lost both upper
+180-degree turns and the middle-right 90-degree turn. Restricting only turning
+chunks to curated clips still passed 13/21 and lost the frozen mixed route.
+This rejects both raw corpus replacement and per-chunk specialist routing:
+extra clips change the state that arrives at a later turn, so filtering only
+the turn itself is too late.
+
+A separately gated endpoint-warp experiment smoothly deforms each selected
+skill toward the bounded command target over its actual playback duration.
+The entry pose and velocity remain continuous, and translation/yaw corrections
+are independently capped. Unrestricted 2.5 cm / 0.1 rad warping fixed both
+previously failing 45-degree stair turns, proving that endpoint lateness and
+command-path drift are causal. It was not qualified: the broad matrix fell to
+11/21 because root-only warping changes contact geometry.
+
+Restricting warp to target height changes at or below 2 cm recovered 6/6
+frozen routes, fixed both 45-degree turns, and reduced frozen slide from 1.732
+to 1.389 m. On the full matrix it remained 16/21: it exchanged the two fixed
+turns for new `side-mount-left` and `turn-90-middle-right` failures. Broad
+slide improved from 6.616 to 4.972 m and worst p95 penetration improved from
+0.192 to 0.147 m, but peak penetration increased from 0.273 to 0.385 m.
+Translation-only warping produced the behavioral gains; yaw-only warping did
+not. The endpoint-warp controls remain available for research in the runner
+and live viewer, but the zero-warp source-quality configuration remains the
+recommended demo.
+
+The causal conflict is important for manual control: before a command change,
+the matcher cannot know whether the same forward stair approach will later
+turn, reverse, or exit sideways. A rigid root-path correction that prepares
+one continuation can make another unreachable. The next representation must
+therefore deform stance and swing contacts together, or synthesize the pose
+conditioned on the newly observed command, rather than applying more scalar
+candidate gates.
+
 ## Literature alignment
 
 - Daniel Holden's production note describes contact acquisition, inertialized
