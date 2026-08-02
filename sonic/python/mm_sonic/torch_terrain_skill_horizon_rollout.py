@@ -201,6 +201,8 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         self._events: list[HorizonChunkEvent] = []
         self._prepared_selection: TerrainSkillHorizonResult | None = None
         self._prepared_release_reason: str | None = None
+        self._endpoint_warp_command = None
+        self._endpoint_warp_command_enabled = False
 
     @property
     def chunk_events(self) -> tuple[HorizonChunkEvent, ...]:
@@ -213,7 +215,41 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         self._events.clear()
         self._prepared_selection = None
         self._prepared_release_reason = None
+        self._endpoint_warp_command = None
+        self._endpoint_warp_command_enabled = False
         return result
+
+    def _update_endpoint_warp_command(self, command) -> None:
+        if self._last_result is None:
+            raise ContractError("endpoint warp command requires reset")
+        try:
+            velocity, requested_heading = command
+            normalized = (
+                (float(velocity[0]), float(velocity[1])),
+                float(requested_heading),
+            )
+        except (IndexError, TypeError, ValueError) as error:
+            raise ContractError("endpoint warp command is invalid") from error
+        current_yaw = _yaw_from_wxyz(
+            self._last_result.root_orientation_world_wxyz
+        )
+        desired = torch.as_tensor(
+            normalized[1], dtype=current_yaw.dtype, device=current_yaw.device
+        )
+        magnitude = abs(
+            float(
+                torch.atan2(
+                    torch.sin(desired - current_yaw),
+                    torch.cos(desired - current_yaw),
+                ).item()
+            )
+        )
+        self._endpoint_warp_command = normalized
+        self._endpoint_warp_command_enabled = (
+            self.minimum_endpoint_warp_yaw_rad
+            <= magnitude
+            <= self.maximum_endpoint_warp_yaw_rad
+        )
 
     def _try_start_skill(
         self,
@@ -378,12 +414,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         )
         warp_displacement = targets.displacement_local_xy[target_index]
         warp_yaw = targets.yaw_delta_rad[target_index]
-        desired_yaw_magnitude = abs(float(warp_yaw.item()))
-        warp_enabled = (
-            self.minimum_endpoint_warp_yaw_rad
-            <= desired_yaw_magnitude
-            <= self.maximum_endpoint_warp_yaw_rad
-        )
+        warp_enabled = self._endpoint_warp_command_enabled
         translation_limit = (
             self.maximum_translation_warp_m if warp_enabled else 0.0
         )
@@ -419,6 +450,25 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
     def prepare_step(self, *args, **kwargs):
         self._prepared_selection = None
         self._prepared_release_reason = None
+        try:
+            velocity = (
+                args[0]
+                if len(args) >= 1
+                else kwargs["velocity_world_xy"]
+            )
+            heading = (
+                args[1]
+                if len(args) >= 2
+                else kwargs["heading_world_yaw"]
+            )
+            command = (
+                (float(velocity[0]), float(velocity[1])),
+                float(heading),
+            )
+        except (IndexError, KeyError, TypeError, ValueError) as error:
+            raise ContractError("endpoint warp step command is invalid") from error
+        if command != self._endpoint_warp_command:
+            self._update_endpoint_warp_command(command)
         return super().prepare_step(*args, **kwargs)
 
     def commit(self, prepared):

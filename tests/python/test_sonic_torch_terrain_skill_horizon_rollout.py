@@ -166,6 +166,22 @@ class TerrainSkillHorizonRolloutTest(unittest.TestCase):
         self.assertEqual(matcher.minimum_endpoint_warp_yaw_rad, 0.30)
         self.assertEqual(matcher.maximum_endpoint_warp_yaw_rad, 0.90)
 
+    def test_endpoint_warp_regime_latches_at_command_change(self):
+        matcher, _grid = _transactional_fixture(
+            maximum_translation_warp_m=0.025,
+            maximum_yaw_warp_rad=0.10,
+            minimum_endpoint_warp_yaw_rad=0.30,
+            maximum_endpoint_warp_yaw_rad=0.90,
+        )
+        matcher.reset()
+
+        matcher._update_endpoint_warp_command(((0.0, 0.0), 0.60))
+        self.assertTrue(matcher._endpoint_warp_command_enabled)
+        matcher._update_endpoint_warp_command(((0.0, 0.0), 1.20))
+        self.assertFalse(matcher._endpoint_warp_command_enabled)
+        matcher._update_endpoint_warp_command(((0.0, 0.0), 0.0))
+        self.assertFalse(matcher._endpoint_warp_command_enabled)
+
     def test_turning_clip_layer_is_explicit(self):
         matcher, _grid = _transactional_fixture(
             turning_clip_paths=frozenset({"terrain/motion.npz"})
