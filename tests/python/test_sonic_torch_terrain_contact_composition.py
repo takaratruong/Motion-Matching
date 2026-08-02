@@ -510,6 +510,9 @@ class TerrainContactCompositionTests(unittest.TestCase):
             reprojection_blend=1.0,
         )
         self.assertFalse(torch.equal(relaxed.joint_position, exact.joint_position))
+        self.assertFalse(
+            torch.equal(relaxed.root_position_world, exact.root_position_world)
+        )
         torch.testing.assert_close(relaxed.foot_position_world[-1, 1], landing)
 
 

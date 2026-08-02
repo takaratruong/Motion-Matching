@@ -502,6 +502,43 @@ def project_contact_trajectory(
     )
 
 
+def _support_root_residual(
+    *,
+    projected_feet: torch.Tensor,
+    target_feet: torch.Tensor,
+    support_mask: torch.Tensor,
+) -> torch.Tensor:
+    residual = torch.zeros(
+        (projected_feet.shape[0], 3),
+        dtype=projected_feet.dtype,
+        device=projected_feet.device,
+    )
+    indices = torch.nonzero(support_mask.any(dim=1), as_tuple=False).flatten()
+    for frame in indices.detach().cpu().tolist():
+        supported = support_mask[frame]
+        residual[frame] = torch.mean(
+            target_feet[frame, supported] - projected_feet[frame, supported],
+            dim=0,
+        )
+    index_list = indices.detach().cpu().tolist()
+    for left, right in zip(index_list[:-1], index_list[1:]):
+        if right == left + 1:
+            continue
+        phase = torch.linspace(
+            0.0,
+            1.0,
+            right - left + 1,
+            dtype=projected_feet.dtype,
+            device=projected_feet.device,
+        )
+        smoothstep = phase.square() * (3.0 - 2.0 * phase)
+        residual[left : right + 1] = (
+            residual[left][None] * (1.0 - smoothstep[:, None])
+            + residual[right][None] * smoothstep[:, None]
+        )
+    return residual
+
+
 def project_contact_trajectory_with_stance_root(
     *,
     joint_position: torch.Tensor,
@@ -756,35 +793,17 @@ def project_contact_trajectory_with_stance_root(
                     dtype=joints.dtype,
                     device=joints.device,
                 )
-        else:
-            residual_root = torch.zeros_like(root_correction)
-            residual_known = support_mask.any(dim=1)
-            residual_indices = torch.nonzero(
-                residual_known, as_tuple=False
-            ).flatten()
-            for frame in residual_indices.detach().cpu().tolist():
-                supported = support_mask[frame]
-                residual_root[frame] = torch.mean(
-                    targets.position_world[frame, supported]
-                    - projected_feet[frame, supported],
-                    dim=0,
-                )
-            residual_list = residual_indices.detach().cpu().tolist()
-            for left, right in zip(residual_list[:-1], residual_list[1:]):
-                if right == left + 1:
-                    continue
-                phase = torch.linspace(
-                    0.0,
-                    1.0,
-                    right - left + 1,
-                    dtype=joints.dtype,
-                    device=joints.device,
-                )
-                smoothstep = phase.square() * (3.0 - 2.0 * phase)
-                residual_root[left : right + 1] = (
-                    residual_root[left][None] * (1.0 - smoothstep[:, None])
-                    + residual_root[right][None] * smoothstep[:, None]
-                )
+        residual_scale = (
+            1.0 - float(reprojection_blend)
+            if reproject_smoothed_joints
+            else 1.0
+        )
+        if residual_scale > 0.0:
+            residual_root = _support_root_residual(
+                projected_feet=projected_feet,
+                target_feet=targets.position_world,
+                support_mask=support_mask,
+            ) * residual_scale
             corrected_roots = corrected_roots + residual_root
             projected_feet = projected_feet + residual_root[:, None, :]
             total_root_correction = root_correction + residual_root
