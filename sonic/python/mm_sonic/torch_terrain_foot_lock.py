@@ -32,9 +32,6 @@ class TerrainFootLockFilter:
         maximum_output_joint_speed_rad_s: float = 12.0,
         swing_clearance_margin_m: float | None = None,
         swing_plan_sigma_frames: float | None = None,
-        support_root_height: bool = False,
-        maximum_root_correction_m: float = 0.25,
-        maximum_root_correction_speed_mps: float = 1.5,
     ) -> None:
         paths = tuple(clip_paths)
         masks = tuple(support_masks)
@@ -72,11 +69,6 @@ class TerrainFootLockFilter:
             or float(maximum_joint_correction_rad) <= 0.0
             or not math.isfinite(float(maximum_output_joint_speed_rad_s))
             or float(maximum_output_joint_speed_rad_s) <= 0.0
-            or type(support_root_height) is not bool
-            or not math.isfinite(float(maximum_root_correction_m))
-            or float(maximum_root_correction_m) <= 0.0
-            or not math.isfinite(float(maximum_root_correction_speed_mps))
-            or float(maximum_root_correction_speed_mps) <= 0.0
             or (
                 swing_clearance_margin_m is not None
                 and (
@@ -168,20 +160,12 @@ class TerrainFootLockFilter:
             if swing_plan_sigma_frames is None
             else float(swing_plan_sigma_frames)
         )
-        self._support_root_height = support_root_height
-        self._maximum_root_correction_m = float(maximum_root_correction_m)
-        self._maximum_root_correction_speed_mps = float(
-            maximum_root_correction_speed_mps
-        )
         self._lock_position = torch.full(
             (2, 3), float("nan"), dtype=torch.float32, device=device
         )
         self._previous_support = torch.zeros(2, dtype=torch.bool, device=device)
         self._locked = torch.zeros(2, dtype=torch.bool, device=device)
         self._joint_offset = torch.zeros(29, dtype=torch.float32, device=device)
-        self._root_height_offset = torch.zeros(
-            (), dtype=torch.float32, device=device
-        )
         self._previous_joint_position: torch.Tensor | None = None
         self._failure_count = 0
 
@@ -194,7 +178,6 @@ class TerrainFootLockFilter:
         self._previous_support.zero_()
         self._locked.zero_()
         self._joint_offset.zero_()
-        self._root_height_offset.zero_()
         self._previous_joint_position = None
         self._failure_count = 0
 
@@ -284,24 +267,13 @@ class TerrainFootLockFilter:
 
     @staticmethod
     def _copy_result(
-        result: object,
-        *,
-        joints: torch.Tensor,
-        velocity: torch.Tensor,
-        root_position: torch.Tensor,
-        root_velocity: torch.Tensor | None,
+        result: object, *, joints: torch.Tensor, velocity: torch.Tensor
     ):
         try:
             values = vars(result).copy()
         except TypeError as error:
             raise ValueError("terrain foot lock result is not copyable") from error
-        values.update(
-            joint_position=joints,
-            joint_velocity=velocity,
-            root_position_world=root_position,
-        )
-        if root_velocity is not None:
-            values["root_linear_velocity_world"] = root_velocity
+        values.update(joint_position=joints, joint_velocity=velocity)
         return SimpleNamespace(**values)
 
     def apply(self, result: object):
@@ -398,40 +370,11 @@ class TerrainFootLockFilter:
                 lifted = swing_indices[needs_lift]
                 correction_mask[lifted] = True
                 targets[lifted, 2] = minimum_z[needs_lift]
-        previous_root_offset = self._root_height_offset.clone()
-        target_root_offset = torch.zeros_like(self._root_height_offset)
-        if self._support_root_height and bool(active.any()):
-            target_root_offset = torch.mean(
-                targets[active, 2] - native_feet[active, 2]
-            ).clamp(
-                -self._maximum_root_correction_m,
-                self._maximum_root_correction_m,
-            )
-        candidate_root_offset = self._root_height_offset + self._correction_alpha * (
-            target_root_offset - self._root_height_offset
-        )
-        maximum_root_step = (
-            self._maximum_root_correction_speed_mps * self._dt_s
-        )
-        self._root_height_offset = self._root_height_offset + torch.clamp(
-            candidate_root_offset - self._root_height_offset,
-            min=-maximum_root_step,
-            max=maximum_root_step,
-        )
-        corrected_root = result.root_position_world.clone()
-        corrected_root[2] += self._root_height_offset
-        root_velocity = None
-        if hasattr(result, "root_linear_velocity_world"):
-            root_velocity = result.root_linear_velocity_world.clone()
-            root_velocity[2] += (
-                self._root_height_offset - previous_root_offset
-            ) / self._dt_s
-        correction_failed = False
         if bool(correction_mask.any()):
             try:
                 solved_numpy = self._foot_kinematics.solve_leg_positions(
                     result.joint_position.detach().cpu().numpy(),
-                    corrected_root.detach().cpu().numpy(),
+                    result.root_position_world.detach().cpu().numpy(),
                     result.root_orientation_world_wxyz.detach().cpu().numpy(),
                     correction_mask.detach().cpu().numpy(),
                     targets.detach().cpu().numpy(),
@@ -450,21 +393,10 @@ class TerrainFootLockFilter:
                 ) > self._maximum_joint_correction_rad:
                     self._locked[active] = False
                     desired = result.joint_position.clone()
-                    correction_failed = True
             except Exception:
                 self._failure_count += 1
                 self._locked[active] = False
                 desired = result.joint_position.clone()
-                correction_failed = True
-        if correction_failed:
-            self._root_height_offset = previous_root_offset
-            corrected_root = result.root_position_world.clone()
-            corrected_root[2] += self._root_height_offset
-            root_velocity = (
-                result.root_linear_velocity_world.clone()
-                if hasattr(result, "root_linear_velocity_world")
-                else None
-            )
         desired_offset = desired - result.joint_position
         self._joint_offset = self._joint_offset + self._correction_alpha * (
             desired_offset - self._joint_offset
@@ -486,13 +418,7 @@ class TerrainFootLockFilter:
             velocity = (solved - self._previous_joint_position) / self._dt_s
         self._previous_joint_position = solved.clone()
         self._previous_support = support.clone()
-        return self._copy_result(
-            result,
-            joints=solved,
-            velocity=velocity,
-            root_position=corrected_root,
-            root_velocity=root_velocity,
-        )
+        return self._copy_result(result, joints=solved, velocity=velocity)
 
 
 def build_terrain_foot_lock(
@@ -502,7 +428,6 @@ def build_terrain_foot_lock(
     swing_clearance_margin_m: float | None = None,
     correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
-    support_root_height: bool = False,
 ):
     """Build a source-contact foot lock against the resolved query terrain."""
 
@@ -567,5 +492,4 @@ def build_terrain_foot_lock(
         swing_clearance_margin_m=swing_clearance_margin_m,
         correction_halflife_s=correction_halflife_s,
         swing_plan_sigma_frames=swing_plan_sigma_frames,
-        support_root_height=support_root_height,
     )
