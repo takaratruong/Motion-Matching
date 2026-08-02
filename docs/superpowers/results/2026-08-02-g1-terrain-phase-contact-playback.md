@@ -239,6 +239,14 @@ baseline, while thresholds at or below 3.2 cm lose route coverage.
   targets jointly. This is the closest published diagnosis of our remaining
   reactive-clearance limitation:
   https://arxiv.org/html/2606.08059
+- The same Perceptive BFM paper also provides a direct later-stage answer to
+  the proposed MM-to-depth/kinematics distillation hypothesis: it trains a
+  blind teacher on terrain-conformal references, expresses the teacher's
+  effective PD target in the raw-reference action frame, and anneals teacher
+  control during DAgger-style vision-student rollouts. Its deployed actor uses
+  proprioceptive history, a 21-step reference window, and a torso-centered
+  17 x 11 local height scan. That is a strong architecture candidate after the
+  privileged kinematic teacher is good enough.
 - Recurrent Transition Networks uses a root-relative 13 x 13 terrain patch and
   reports that terrain conditioning helps for longer, obstacle-relevant
   transitions, while short 30-frame transitions often contain too little
