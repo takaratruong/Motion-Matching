@@ -50,6 +50,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Prefer skill entries with the current source support pattern.",
     )
     parser.add_argument(
+        "--route-anchor",
+        action="store_true",
+        help="Carry accumulated command-path error across skill chunks.",
+    )
+    parser.add_argument(
         "--swing-clearance-margin-m",
         type=float,
         default=None,
@@ -206,6 +211,7 @@ def main(argv: list[str] | None = None) -> int:
         search_config=search_config,
         foot_lock=args.foot_lock,
         contact_phase_gate=args.contact_phase_gate,
+        route_anchor=args.route_anchor,
         swing_clearance_margin_m=args.swing_clearance_margin_m,
         foot_correction_halflife_s=args.foot_correction_halflife_s,
         swing_plan_sigma_frames=args.swing_plan_sigma_frames,
@@ -224,6 +230,7 @@ def main(argv: list[str] | None = None) -> int:
                 "ablation": args.ablation,
                 "foot_lock": args.foot_lock,
                 "contact_phase_gate": args.contact_phase_gate,
+                "route_anchor": args.route_anchor,
                 "swing_clearance_margin_m": args.swing_clearance_margin_m,
                 "foot_correction_halflife_s": args.foot_correction_halflife_s,
                 "swing_plan_sigma_frames": args.swing_plan_sigma_frames,

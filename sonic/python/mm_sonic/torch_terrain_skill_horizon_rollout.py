@@ -51,6 +51,47 @@ class HorizonChunkEvent:
     release_reason: str
 
 
+def route_anchored_targets(
+    targets: HorizonTargets,
+    *,
+    current_root_position_world: torch.Tensor,
+    current_root_yaw: torch.Tensor,
+    route_target_world_xy: torch.Tensor,
+) -> HorizonTargets:
+    """Add accumulated world-space route error to every local horizon."""
+
+    if not isinstance(targets, HorizonTargets):
+        raise ContractError("route anchoring requires HorizonTargets")
+    reference = targets.displacement_local_xy
+    if (
+        not isinstance(current_root_position_world, torch.Tensor)
+        or tuple(current_root_position_world.shape) != (3,)
+        or current_root_position_world.device != reference.device
+        or current_root_position_world.dtype != reference.dtype
+        or not torch.isfinite(current_root_position_world).all()
+        or not isinstance(current_root_yaw, torch.Tensor)
+        or current_root_yaw.numel() != 1
+        or current_root_yaw.device != reference.device
+        or current_root_yaw.dtype != reference.dtype
+        or not torch.isfinite(current_root_yaw).all()
+        or not isinstance(route_target_world_xy, torch.Tensor)
+        or tuple(route_target_world_xy.shape) != (2,)
+        or route_target_world_xy.device != reference.device
+        or route_target_world_xy.dtype != reference.dtype
+        or not torch.isfinite(route_target_world_xy).all()
+    ):
+        raise ContractError("route anchoring state is invalid")
+    error_world_xy = route_target_world_xy - current_root_position_world[:2]
+    error_local_xy = _rotate_xy(error_world_xy, -current_root_yaw.reshape(()))
+    return HorizonTargets(
+        frames=targets.frames,
+        displacement_local_xy=reference + error_local_xy,
+        yaw_delta_rad=targets.yaw_delta_rad,
+        root_height_delta_m=targets.root_height_delta_m,
+        surface_height_delta_m=targets.surface_height_delta_m,
+    )
+
+
 def terrain_height_targets(
     targets: HorizonTargets,
     *,
@@ -121,6 +162,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         terrain_tolerance_m: float = 0.06,
         result_filter: Any | None = None,
         contact_phase_gate: bool = False,
+        route_anchor: bool = False,
     ) -> None:
         self.base = base_matcher
         self.database = base_matcher.database
@@ -141,6 +183,9 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         if type(contact_phase_gate) is not bool:
             raise ContractError("contact phase gate must be boolean")
         self.contact_phase_gate = contact_phase_gate
+        if type(route_anchor) is not bool:
+            raise ContractError("route anchor must be boolean")
+        self.route_anchor = route_anchor
         self._clip_path_to_index = {
             clip.relative_path: index
             for index, clip in enumerate(dataset.folder.clips)
@@ -155,6 +200,9 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         self._replan_pending = False
         self._shaped_velocity = torch.zeros(2, device=self.database.device)
         self._shaped_heading = torch.zeros((), device=self.database.device)
+        self._route_target_world_xy = torch.zeros(
+            2, dtype=torch.float32, device=self.database.device
+        )
         self._feet = None
         self._foot_velocity = torch.zeros((2, 3), device=self.database.device)
         self._root_velocity = torch.zeros(3, device=self.database.device)
@@ -173,6 +221,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         self._events.clear()
         self._prepared_selection = None
         self._prepared_release_reason = None
+        self._route_target_world_xy = result.root_position_world[:2].clone()
         return result
 
     def _try_start_skill(
@@ -208,6 +257,13 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             requested_heading_world_yaw=requested_heading,
             matcher_config=self.config,
         )
+        if self.route_anchor:
+            targets = route_anchored_targets(
+                targets,
+                current_root_position_world=result.root_position_world,
+                current_root_yaw=current_yaw,
+                route_target_world_xy=self._route_target_world_xy,
+            )
         targets = terrain_height_targets(
             targets,
             current_root_position_world=result.root_position_world,
@@ -332,6 +388,10 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         selected = self._prepared_selection
         release_reason = self._prepared_release_reason
         result = super().commit(prepared)
+        if self.route_anchor:
+            self._route_target_world_xy.add_(
+                self._shaped_velocity * self.config.dt
+            )
         if selected is not None:
             skill_index = int(
                 self.horizon_inventory.skill_index[selected.record_index].item()
@@ -363,6 +423,7 @@ def run_resolved_horizon_matrix(
     search_config: HorizonSearchConfig = HorizonSearchConfig(),
     foot_lock: bool = False,
     contact_phase_gate: bool = False,
+    route_anchor: bool = False,
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
@@ -479,6 +540,7 @@ def run_resolved_horizon_matrix(
                 else ":reactive-clearance"
             )
             + (":phase-gate-v1" if contact_phase_gate else ":implicit-phase")
+            + (":route-anchor-v1" if route_anchor else ":local-path-targets")
         ).encode()
     ).hexdigest()
 
@@ -495,6 +557,7 @@ def run_resolved_horizon_matrix(
             terrain_tolerance_m=terrain_tolerance_m,
             result_filter=result_filter,
             contact_phase_gate=contact_phase_gate,
+            route_anchor=route_anchor,
         )
         route_matchers[route.name] = matcher
         return matcher
