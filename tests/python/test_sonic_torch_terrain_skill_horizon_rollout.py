@@ -48,7 +48,13 @@ class _FootKinematics:
         return np.repeat(root[:, None, :], 2, axis=1)
 
 
-def _transactional_fixture(*, result_filter=None, contact_phase_gate=False):
+def _transactional_fixture(
+    *,
+    result_filter=None,
+    contact_phase_gate=False,
+    footprint_terrain_targets=False,
+    footprint_preserve_horizon=False,
+):
     frames = 80
     body_position = np.zeros((frames, 3, 3), dtype=np.float32)
     body_position[:, :, 0] = np.arange(frames, dtype=np.float32)[:, None] * 0.01
@@ -138,11 +144,21 @@ def _transactional_fixture(*, result_filter=None, contact_phase_gate=False):
         config=MatcherConfig(),
         result_filter=result_filter,
         contact_phase_gate=contact_phase_gate,
+        footprint_terrain_targets=footprint_terrain_targets,
+        footprint_preserve_horizon=footprint_preserve_horizon,
     )
     return matcher, grid
 
 
 class TerrainSkillHorizonRolloutTest(unittest.TestCase):
+    def test_footprint_horizon_layer_is_explicit(self):
+        matcher, _grid = _transactional_fixture(
+            footprint_terrain_targets=True,
+            footprint_preserve_horizon=True,
+        )
+
+        self.assertTrue(matcher.footprint_preserve_horizon)
+
     def test_contact_phase_gate_is_explicit(self):
         matcher, _grid = _transactional_fixture(contact_phase_gate=True)
 

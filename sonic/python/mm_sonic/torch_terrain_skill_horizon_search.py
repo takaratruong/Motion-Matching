@@ -472,11 +472,17 @@ def select_horizon_candidate(
     current_clip_index: int | None = None,
     current_frame_index: int | None = None,
     matcher_config: MatcherConfig = MatcherConfig(),
+    required_target_frames: int | None = None,
 ) -> TerrainSkillHorizonResult:
     """Validate candidates in ranked order and return the first valid chunk."""
 
     if not callable(terrain_validator):
         raise ContractError("horizon terrain validator must be callable")
+    if required_target_frames is not None and (
+        type(required_target_frames) is not int
+        or required_target_frames not in HORIZON_TARGET_FRAMES
+    ):
+        raise ContractError("required horizon target is invalid")
     ranked = rank_horizon_candidates(
         database,
         inventory,
@@ -488,6 +494,7 @@ def select_horizon_candidate(
         matcher_config=matcher_config,
     )
     terrain_rejected = 0
+    horizon_rejected = 0
     diagnostics = torch.stack(
         (
             ranked.candidate_indices.to(torch.float64),
@@ -504,10 +511,18 @@ def select_horizon_candidate(
     ).cpu().tolist()
     for values in diagnostics:
         record = int(values[0])
+        if (
+            required_target_frames is not None
+            and int(inventory.target_frames[record].item())
+            != required_target_frames
+        ):
+            horizon_rejected += 1
+            continue
         row = int(inventory.entry_row[record].item())
         endpoint = int(inventory.endpoint_frame_exclusive[record].item())
         if terrain_validator(record, row, endpoint):
             rejected = dict(ranked.rejected_by_reason)
+            rejected["horizon"] = horizon_rejected
             rejected["terrain"] = terrain_rejected
             return TerrainSkillHorizonResult(
                 record_index=record,
@@ -528,5 +543,6 @@ def select_horizon_candidate(
             )
         terrain_rejected += 1
     rejected = dict(ranked.rejected_by_reason)
+    rejected["horizon"] = horizon_rejected
     rejected["terrain"] = terrain_rejected
     raise HorizonSearchFailure(rejected)

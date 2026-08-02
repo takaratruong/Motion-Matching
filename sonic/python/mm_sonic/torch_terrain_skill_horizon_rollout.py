@@ -181,6 +181,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         contact_phase_gate: bool = False,
         footprint_terrain_targets: bool = False,
         footprint_split_gain: float = 1.0,
+        footprint_preserve_horizon: bool = False,
     ) -> None:
         self.base = base_matcher
         self.database = base_matcher.database
@@ -212,6 +213,13 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         ):
             raise ContractError("footprint split gain is invalid")
         self.footprint_split_gain = float(footprint_split_gain)
+        if type(footprint_preserve_horizon) is not bool or (
+            footprint_preserve_horizon and not footprint_terrain_targets
+        ):
+            raise ContractError(
+                "footprint horizon layer requires footprint terrain targets"
+            )
+        self.footprint_preserve_horizon = footprint_preserve_horizon
         self._clip_path_to_index = {
             clip.relative_path: index
             for index, clip in enumerate(dataset.folder.clips)
@@ -272,23 +280,29 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         requested_heading = torch.tensor(
             heading_world_yaw, dtype=torch.float32, device=self.database.device
         )
-        targets = predict_horizon_targets(
+        command_targets = predict_horizon_targets(
             current_velocity_world_xy=self._shaped_velocity,
             current_heading_world_yaw=current_yaw,
             requested_velocity_world_xy=requested_velocity,
             requested_heading_world_yaw=requested_heading,
             matcher_config=self.config,
         )
-        targets = terrain_height_targets(
-            targets,
+        baseline_targets = terrain_height_targets(
+            command_targets,
             current_root_position_world=result.root_position_world,
             current_root_yaw=current_yaw,
-            current_foot_position_world=(
-                self._feet if self.footprint_terrain_targets else None
-            ),
-            footprint_split_gain=self.footprint_split_gain,
             query_terrain=self.query_terrain,
         )
+        targets = baseline_targets
+        if self.footprint_terrain_targets:
+            targets = terrain_height_targets(
+                command_targets,
+                current_root_position_world=result.root_position_world,
+                current_root_yaw=current_yaw,
+                current_foot_position_world=self._feet,
+                footprint_split_gain=self.footprint_split_gain,
+                query_terrain=self.query_terrain,
+            )
 
         current_clip: int | None = None
         current_frame: int | None = None
@@ -339,12 +353,17 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                 playback_stop=endpoint,
             )
 
-        def select(*, require_phase: bool):
+        def select(
+            target_values: HorizonTargets,
+            *,
+            require_phase: bool,
+            required_target_frames: int | None = None,
+        ):
             return select_horizon_candidate(
                 self.database,
                 self.horizon_inventory,
                 normalized_query,
-                targets,
+                target_values,
                 terrain_validator=lambda record, row, endpoint: compatible(
                     record,
                     row,
@@ -355,14 +374,40 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                 current_clip_index=current_clip,
                 current_frame_index=current_frame,
                 matcher_config=self.config,
+                required_target_frames=required_target_frames,
             )
 
-        try:
-            selected = select(require_phase=current_support is not None)
-        except HorizonSearchFailure:
-            if current_support is None:
-                raise
-            selected = select(require_phase=False)
+        def select_with_phase(
+            target_values: HorizonTargets,
+            *,
+            required_target_frames: int | None = None,
+        ):
+            try:
+                return select(
+                    target_values,
+                    require_phase=current_support is not None,
+                    required_target_frames=required_target_frames,
+                )
+            except HorizonSearchFailure:
+                if current_support is None:
+                    raise
+                return select(
+                    target_values,
+                    require_phase=False,
+                    required_target_frames=required_target_frames,
+                )
+
+        if self.footprint_preserve_horizon:
+            baseline_selected = select_with_phase(baseline_targets)
+            try:
+                selected = select_with_phase(
+                    targets,
+                    required_target_frames=baseline_selected.target_frames,
+                )
+            except HorizonSearchFailure:
+                selected = baseline_selected
+        else:
+            selected = select_with_phase(targets)
         skill_index = int(
             self.horizon_inventory.skill_index[selected.record_index].item()
         )
@@ -440,6 +485,7 @@ def run_resolved_horizon_matrix(
     contact_phase_gate: bool = False,
     footprint_terrain_targets: bool = False,
     footprint_split_gain: float = 1.0,
+    footprint_preserve_horizon: bool = False,
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
@@ -562,6 +608,11 @@ def run_resolved_horizon_matrix(
                 else ":root-terrain-targets"
             )
             + f":footprint-split-gain:{float(footprint_split_gain):.9g}"
+            + (
+                ":preserve-baseline-horizon-v1"
+                if footprint_preserve_horizon
+                else ":free-footprint-horizon"
+            )
         ).encode()
     ).hexdigest()
 
@@ -580,6 +631,7 @@ def run_resolved_horizon_matrix(
             contact_phase_gate=contact_phase_gate,
             footprint_terrain_targets=footprint_terrain_targets,
             footprint_split_gain=footprint_split_gain,
+            footprint_preserve_horizon=footprint_preserve_horizon,
         )
         route_matchers[route.name] = matcher
         return matcher
