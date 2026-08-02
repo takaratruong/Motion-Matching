@@ -74,6 +74,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Exclude source clips with worse authenticated contact fit.",
     )
     parser.add_argument(
+        "--normalization-source",
+        default=None,
+        help="Freeze feature normalization to another motion corpus.",
+    )
+    parser.add_argument(
         "--ablation",
         choices=(
             "combined",
@@ -216,6 +221,7 @@ def main(argv: list[str] | None = None) -> int:
         foot_correction_halflife_s=args.foot_correction_halflife_s,
         swing_plan_sigma_frames=args.swing_plan_sigma_frames,
         maximum_source_contact_p95_m=args.maximum_source_contact_p95_m,
+        normalization_source=args.normalization_source,
     )
     save_horizon_matrix(matrix, events, args.output)
     execution_completed = all(
@@ -237,6 +243,7 @@ def main(argv: list[str] | None = None) -> int:
                 "maximum_source_contact_p95_m": (
                     args.maximum_source_contact_p95_m
                 ),
+                "normalization_source": args.normalization_source,
                 "deterministic_sha256": matrix.deterministic_sha256,
                 "output": args.output,
             },

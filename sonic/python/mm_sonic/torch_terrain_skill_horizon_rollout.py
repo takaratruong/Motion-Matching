@@ -14,7 +14,12 @@ import numpy as np
 import torch
 
 from .joints import ContractError
-from .torch_motion_features import GeneratedFeatureState, extract_query_features
+from .torch_motion_data import MotionFolder
+from .torch_motion_features import (
+    GeneratedFeatureState,
+    TorchMotionDatabase,
+    extract_query_features,
+)
 from .torch_motion_matcher import MatcherConfig, TorchMotionMatcher
 from .torch_terrain_omni_routes import OmniRoute
 from .torch_terrain_skill_composer import start_skill
@@ -367,6 +372,7 @@ def run_resolved_horizon_matrix(
     foot_correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
     maximum_source_contact_p95_m: float | None = None,
+    normalization_source: str | None = None,
 ):
     """Run the renderer-independent route harness with horizon skill MM."""
 
@@ -390,11 +396,24 @@ def run_resolved_horizon_matrix(
     from .torch_terrain_rollout import matcher_config_from_resolved
 
     config = matcher_config_from_resolved(resolved.resolved_config)
+    normalization_override = None
+    normalization_identity = "self"
+    if normalization_source is not None:
+        source_folder = MotionFolder.load(normalization_source)
+        source_database = TorchMotionDatabase.from_folder(
+            source_folder,
+            device=resolved.device,
+            reset_clip_path=resolved.resolved_config["reset_clip"],
+        )
+        normalization_override = source_database.normalization
+        normalization_identity = source_folder.inventory_sha256
+        del source_database, source_folder
     base = TorchMotionMatcher.from_folder(
         resolved.dataset.root,
         device=str(resolved.device),
         config=config,
         reset_clip_path=resolved.resolved_config["reset_clip"],
+        normalization_override=normalization_override,
     )
     skills = build_terrain_skill_inventory(
         resolved.dataset,
@@ -489,6 +508,7 @@ def run_resolved_horizon_matrix(
                 if maximum_source_contact_p95_m is not None
                 else ":all-source-contact-quality"
             )
+            + f":normalization:{normalization_identity}"
         ).encode()
     ).hexdigest()
 
