@@ -244,15 +244,15 @@ class TerrainFootLockFilter:
 def build_terrain_foot_lock(resolved: object, foot_kinematics: object):
     """Build a source-contact foot lock against the resolved query terrain."""
 
-    from .torch_contact_segments import ContactSegmentIndex
+    from .torch_contact_segments import source_support_mask
 
     try:
-        contacts = ContactSegmentIndex.from_dataset(resolved.dataset)
         clip_paths = tuple(
             clip.relative_path for clip in resolved.dataset.folder.clips
         )
         support_masks = tuple(
-            contacts.support_mask(index) for index in range(len(clip_paths))
+            source_support_mask(resolved.dataset, index)
+            for index in range(len(clip_paths))
         )
         measurement = resolved.measurement_extension
         device = resolved.device
