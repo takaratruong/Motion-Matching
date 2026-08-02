@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr
 from dataclasses import replace
+import errno
 import hashlib
 import io
 import json
@@ -9,7 +10,9 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -25,6 +28,8 @@ from mm_sonic.terrain_oracle.contact import (
     CanonicalMeshQuery,
 )
 from mm_sonic.terrain_oracle.storage import (
+    COMPLETION_MARKER,
+    _seal_directory,
     load_corpus,
     publish_corpus,
     read_clip,
@@ -66,6 +71,10 @@ def _write_fixture_bundle(root: Path) -> tuple[Path, str, str]:
     (bundle / "manifest.json").write_bytes(
         (manifest_only / "manifest.json").read_bytes()
     )
+    _seal_directory(
+        bundle,
+        excluded_top_level=("coverage.json", "render-audit"),
+    )
     return bundle, clip_record.sha256, mesh_record.sha256
 
 
@@ -99,6 +108,14 @@ def _rewrite_hashed_document(path: Path, value: dict[str, object]) -> None:
     path.write_bytes(_canonical_json_bytes(value))
 
 
+def _reseal_corpus_directory(path: Path) -> None:
+    (path / COMPLETION_MARKER).unlink()
+    _seal_directory(
+        path,
+        excluded_top_level=("coverage.json", "render-audit"),
+    )
+
+
 def _write_audit_fixture(root: Path) -> Path:
     import mujoco
 
@@ -128,6 +145,10 @@ def _write_audit_fixture(root: Path) -> Path:
     )
     (bundle / "manifest.json").write_bytes(
         (manifest_only / "manifest.json").read_bytes()
+    )
+    _seal_directory(
+        bundle,
+        excluded_top_level=("coverage.json", "render-audit"),
     )
     return bundle
 
@@ -191,6 +212,25 @@ arguments.overlay.parent.mkdir(parents=True, exist_ok=True)
 arguments.video.symlink_to("/dev/null")
 arguments.overlay.symlink_to("/dev/null")
 """.replace("__MODE__", mode)
+    )
+    return path
+
+
+def _write_hanging_renderer(path: Path) -> Path:
+    path.write_text(
+        """from pathlib import Path
+import subprocess
+import sys
+import time
+
+marker = Path(sys.argv[1])
+child = (
+    "from pathlib import Path; import sys, time; "
+    "time.sleep(0.7); Path(sys.argv[1]).write_text('orphan')"
+)
+subprocess.Popen([sys.executable, "-c", child, str(marker)])
+time.sleep(60.0)
+"""
     )
     return path
 
@@ -284,6 +324,275 @@ class CorpusCliTests(unittest.TestCase):
                 read_mesh(mesh_path).source_asset_sha256,
                 "a" * 64,
             )
+
+    @unittest.skipUnless(MODEL_PATH.is_file(), "real G1 model unavailable")
+    def test_directory_publication_uses_nfs_completion_protocol_on_einval(
+        self,
+    ):
+        """Catches renameat2-only import, audit, render, or freeze publication."""
+
+        from mm_sonic.terrain_oracle import (
+            coverage as oracle_coverage,
+            storage as oracle_storage,
+        )
+        from mm_sonic.terrain_oracle.corpus_cli import (
+            _load_frozen_corpus,
+            _load_render_evidence,
+            main,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = _write_audit_fixture(root)
+            raw = root / "raw"
+            audited = root / "audited"
+            rendered = audited / "render-audit"
+            frozen = root / "frozen"
+            renderer = _write_interval_renderer(root / "renderer.py")
+            forced_einval = OSError(
+                errno.EINVAL,
+                "forced renameat2 RENAME_NOREPLACE rejection",
+            )
+            with mock.patch.object(
+                oracle_storage,
+                "_rename_noreplace",
+                side_effect=forced_einval,
+            ), mock.patch.object(
+                oracle_coverage,
+                "_rename_noreplace",
+                side_effect=forced_einval,
+            ):
+                self.assertEqual(
+                    main(
+                        [
+                            "import",
+                            "--fixture",
+                            str(fixture),
+                            "--output",
+                            str(raw),
+                        ]
+                    ),
+                    0,
+                )
+                self.assertEqual(
+                    main(
+                        [
+                            "audit",
+                            "--corpus",
+                            str(raw),
+                            "--model",
+                            str(MODEL_PATH),
+                            "--output",
+                            str(audited),
+                        ]
+                    ),
+                    0,
+                )
+                self.assertEqual(
+                    main(
+                        [
+                            "render-audit",
+                            "--corpus",
+                            str(audited),
+                            "--renderer",
+                            str(Path(sys.executable).resolve()),
+                            "--renderer-arg",
+                            str(renderer),
+                            "--output",
+                            str(rendered),
+                        ]
+                    ),
+                    0,
+                )
+                self.assertEqual(
+                    main(
+                        [
+                            "coverage",
+                            "--corpus",
+                            str(audited),
+                            "--output",
+                            str(audited / "coverage.json"),
+                        ]
+                    ),
+                    0,
+                )
+                self.assertEqual(
+                    main(
+                        [
+                            "freeze",
+                            "--corpus",
+                            str(audited),
+                            "--output",
+                            str(frozen),
+                        ]
+                    ),
+                    0,
+                )
+
+            for published in (raw, audited, rendered, frozen):
+                marker = published / COMPLETION_MARKER
+                self.assertTrue(marker.is_file())
+                document = json.loads(marker.read_text("ascii"))
+                self.assertEqual(
+                    set(document),
+                    {
+                        "schema",
+                        "excluded_top_level",
+                        "file_count",
+                        "tree_sha256",
+                    },
+                )
+                self.assertEqual(
+                    document["schema"],
+                    "terrain-oracle-complete/v1",
+                )
+                self.assertEqual(
+                    document["excluded_top_level"],
+                    (
+                        ["coverage.json", "render-audit"]
+                        if published in (raw, audited)
+                        else []
+                    ),
+                )
+            load_corpus(raw)
+            _load_render_evidence(audited)
+            _load_frozen_corpus(frozen)
+
+    def test_completion_marker_rejects_missing_tampered_and_extra_content(self):
+        """Catches readers treating an incomplete or changed tree as published."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture, _, _ = _write_fixture_bundle(root)
+
+            missing = root / "missing-marker"
+            shutil.copytree(fixture, missing)
+            (missing / COMPLETION_MARKER).unlink()
+
+            tampered = root / "tampered-file"
+            shutil.copytree(fixture, tampered)
+            with (tampered / "manifest.json").open("ab") as stream:
+                stream.write(b" ")
+
+            extra = root / "unexpected-file"
+            shutil.copytree(fixture, extra)
+            (extra / "untrusted.bin").write_bytes(b"not in the sealed tree")
+
+            for case in (missing, tampered, extra):
+                with self.subTest(case=case.name):
+                    with self.assertRaisesRegex(
+                        ContractError,
+                        "completion|digest",
+                    ):
+                        load_corpus(case)
+
+    def test_nfs_copy_claim_preserves_preexisting_and_foreign_destinations(self):
+        """Catches fallback publication overwriting or deleting another writer."""
+
+        from mm_sonic.terrain_oracle import storage as oracle_storage
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture, _, _ = _write_fixture_bundle(root)
+            forced_einval = OSError(
+                errno.EINVAL,
+                "forced renameat2 RENAME_NOREPLACE rejection",
+            )
+
+            preexisting = root / "preexisting"
+            preexisting.mkdir()
+            (preexisting / "sentinel").write_bytes(b"owned elsewhere")
+            before = _tree_bytes(preexisting)
+            with mock.patch.object(
+                oracle_storage,
+                "_rename_noreplace",
+                side_effect=forced_einval,
+            ):
+                with self.assertRaises(FileExistsError):
+                    oracle_storage._publish_directory_no_replace(
+                        fixture,
+                        preexisting,
+                    )
+            self.assertEqual(_tree_bytes(preexisting), before)
+            self.assertTrue(fixture.is_dir())
+
+            original_write = oracle_storage._write_no_replace
+            owned_failure = root / "owned-failure"
+
+            def fail_owned_copy(path: Path, payload: bytes) -> None:
+                if (
+                    owned_failure in path.parents
+                    and path.name != oracle_storage._OWNER_MARKER
+                ):
+                    raise OSError(errno.EIO, "forced copy failure")
+                original_write(path, payload)
+
+            with mock.patch.object(
+                oracle_storage,
+                "_write_no_replace",
+                side_effect=fail_owned_copy,
+            ):
+                with self.assertRaisesRegex(OSError, "forced copy failure"):
+                    oracle_storage._copy_directory_claim_noreplace(
+                        fixture,
+                        owned_failure,
+                    )
+            self.assertFalse(owned_failure.exists())
+            self.assertTrue(fixture.is_dir())
+
+            foreign_failure = root / "foreign-failure"
+            foreign_owner = b"terrain-oracle-owner-v1:foreign-writer\n"
+
+            def fail_after_owner_change(path: Path, payload: bytes) -> None:
+                if (
+                    foreign_failure in path.parents
+                    and path.name != oracle_storage._OWNER_MARKER
+                ):
+                    (
+                        foreign_failure / oracle_storage._OWNER_MARKER
+                    ).write_bytes(foreign_owner)
+                    raise OSError(errno.EIO, "forced foreign copy failure")
+                original_write(path, payload)
+
+            with mock.patch.object(
+                oracle_storage,
+                "_write_no_replace",
+                side_effect=fail_after_owner_change,
+            ):
+                with self.assertRaisesRegex(
+                    OSError,
+                    "forced foreign copy failure",
+                ):
+                    oracle_storage._copy_directory_claim_noreplace(
+                        fixture,
+                        foreign_failure,
+                    )
+            self.assertTrue(foreign_failure.is_dir())
+            self.assertEqual(
+                (
+                    foreign_failure / oracle_storage._OWNER_MARKER
+                ).read_bytes(),
+                foreign_owner,
+            )
+
+            inode_changed = root / "inode-changed"
+            inode_changed.mkdir()
+            owner_payload = b"terrain-oracle-owner-v1:original-writer\n"
+            owner_path = inode_changed / oracle_storage._OWNER_MARKER
+            owner_path.write_bytes(owner_payload)
+            metadata = inode_changed.stat()
+            identity = (metadata.st_dev, metadata.st_ino)
+            inode_changed.rename(root / "displaced-owned-directory")
+            inode_changed.mkdir()
+            (inode_changed / oracle_storage._OWNER_MARKER).write_bytes(
+                owner_payload
+            )
+            oracle_storage._cleanup_owned_destination(
+                inode_changed,
+                identity=identity,
+                owner_payload=owner_payload,
+            )
+            self.assertTrue(inode_changed.is_dir())
 
     @unittest.skipUnless(MODEL_PATH.is_file(), "real G1 model unavailable")
     def test_audit_publishes_exact_closed_evidence_deterministically(self):
@@ -443,6 +752,147 @@ class CorpusCliTests(unittest.TestCase):
             self.assertEqual(_tree_bytes(first), before)
 
     @unittest.skipUnless(MODEL_PATH.is_file(), "real G1 model unavailable")
+    def test_audit_loader_rejects_rehashed_forged_model_and_terrain_authority(
+        self,
+    ):
+        """Catches internally consistent reports detached from exact authority."""
+
+        from mm_sonic.terrain_oracle.corpus_cli import (
+            _load_audit_evidence,
+            main,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = _write_audit_fixture(root)
+            raw = root / "raw"
+            audited = root / "audited"
+            self.assertEqual(
+                main(
+                    [
+                        "import",
+                        "--fixture",
+                        str(fixture),
+                        "--output",
+                        str(raw),
+                    ]
+                ),
+                0,
+            )
+            self.assertEqual(
+                main(
+                    [
+                        "audit",
+                        "--corpus",
+                        str(raw),
+                        "--model",
+                        str(MODEL_PATH),
+                        "--output",
+                        str(audited),
+                    ]
+                ),
+                0,
+            )
+            _load_audit_evidence(audited)
+
+            for field, forged in (
+                ("model_sha256", "f" * 64),
+                ("terrain_sha256", "e" * 64),
+            ):
+                with self.subTest(field=field):
+                    variant = root / f"forged-{field}"
+                    shutil.copytree(audited, variant)
+                    index_path = variant / "audit-index.json"
+                    index = json.loads(index_path.read_text("ascii"))
+                    entry = index["reports"][0]
+                    report_path = variant / entry["relative_path"]
+                    report = json.loads(report_path.read_text("ascii"))
+                    report[field] = forged
+                    report_payload = _canonical_json_bytes(report)
+                    report_path.write_bytes(report_payload)
+                    entry[field] = forged
+                    entry["sha256"] = hashlib.sha256(
+                        report_payload
+                    ).hexdigest()
+                    _rewrite_hashed_document(index_path, index)
+                    _reseal_corpus_directory(variant)
+
+                    with self.assertRaisesRegex(
+                        ContractError,
+                        "model|terrain|authority|binding",
+                    ):
+                        _load_audit_evidence(variant)
+
+            for case, mutate_audit_metadata in (
+                (
+                    "source-corpus",
+                    lambda audit: audit.__setitem__(
+                        "source_corpus_manifest_sha256",
+                        "d" * 64,
+                    ),
+                ),
+                (
+                    "model",
+                    lambda audit: audit["model"].__setitem__(
+                        "structural_sha256",
+                        "c" * 64,
+                    ),
+                ),
+                (
+                    "extra-field",
+                    lambda audit: audit.__setitem__("untrusted", True),
+                ),
+            ):
+                with self.subTest(manifest_audit=case):
+                    variant = root / f"forged-manifest-{case}"
+                    shutil.copytree(audited, variant)
+                    manifest_path = variant / "manifest.json"
+                    manifest = json.loads(manifest_path.read_text("ascii"))
+                    mutate_audit_metadata(manifest["metadata"]["audit"])
+                    manifest_payload = _canonical_json_bytes(manifest)
+                    manifest_path.write_bytes(manifest_payload)
+                    index_path = variant / "audit-index.json"
+                    index = json.loads(index_path.read_text("ascii"))
+                    index["corpus_manifest_sha256"] = hashlib.sha256(
+                        manifest_payload
+                    ).hexdigest()
+                    _rewrite_hashed_document(index_path, index)
+                    _reseal_corpus_directory(variant)
+
+                    with self.assertRaisesRegex(
+                        ContractError,
+                        "manifest|model|source|metadata|authority|binding",
+                    ):
+                        _load_audit_evidence(variant)
+
+            coordinated = root / "forged-coordinated-source"
+            shutil.copytree(audited, coordinated)
+            manifest_path = coordinated / "manifest.json"
+            manifest = json.loads(manifest_path.read_text("ascii"))
+            forged_source_sha256 = "b" * 64
+            manifest["metadata"]["audit"][
+                "source_corpus_manifest_sha256"
+            ] = forged_source_sha256
+            manifest_payload = _canonical_json_bytes(manifest)
+            manifest_path.write_bytes(manifest_payload)
+            index_path = coordinated / "audit-index.json"
+            index = json.loads(index_path.read_text("ascii"))
+            index[
+                "source_corpus_manifest_sha256"
+            ] = forged_source_sha256
+            index["corpus_manifest_sha256"] = hashlib.sha256(
+                manifest_payload
+            ).hexdigest()
+            _rewrite_hashed_document(index_path, index)
+            _reseal_corpus_directory(coordinated)
+
+            with self.assertRaisesRegex(
+                ContractError,
+                "source.*manifest|manifest.*source|authority|binding",
+            ):
+                _load_audit_evidence(coordinated)
+
+    @unittest.skipUnless(MODEL_PATH.is_file(), "real G1 model unavailable")
     def test_render_audit_records_exact_interval_subprocess_evidence(self):
         """Catches unbound renderer argv or receipts unrelated to output bytes."""
 
@@ -489,7 +939,7 @@ class CorpusCliTests(unittest.TestCase):
                         "--corpus",
                         str(audited),
                         "--renderer",
-                        sys.executable,
+                        str(Path(sys.executable).resolve()),
                         "--renderer-arg",
                         str(renderer),
                         "--output",
@@ -673,7 +1123,7 @@ class CorpusCliTests(unittest.TestCase):
                         "--corpus",
                         str(audited),
                         "--renderer",
-                        sys.executable,
+                        str(Path(sys.executable).resolve()),
                         "--renderer-arg",
                         str(renderer),
                         "--output",
@@ -911,7 +1361,7 @@ class CorpusCliTests(unittest.TestCase):
                         "--corpus",
                         str(audited),
                         "--renderer",
-                        sys.executable,
+                        str(Path(sys.executable).resolve()),
                         "--renderer-arg",
                         str(renderer),
                         "--output",
@@ -1081,7 +1531,7 @@ class CorpusCliTests(unittest.TestCase):
                                 "--corpus",
                                 str(audited),
                                 "--renderer",
-                                sys.executable,
+                                str(Path(sys.executable).resolve()),
                                 "--renderer-arg",
                                 str(renderer),
                                 "--output",
@@ -1096,6 +1546,154 @@ class CorpusCliTests(unittest.TestCase):
                         list(audited.glob(".render-audit.*")),
                         [],
                     )
+
+    @unittest.skipUnless(MODEL_PATH.is_file(), "real G1 model unavailable")
+    def test_renderer_path_rejects_symlink_before_resolution(self):
+        """Catches direct and ancestor symlinks erased by eager resolution."""
+
+        from mm_sonic.terrain_oracle.corpus_cli import main
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = _write_audit_fixture(root)
+            raw = root / "raw"
+            audited = root / "audited"
+            renderer = _write_interval_renderer(root / "renderer.py")
+            self.assertEqual(
+                main(
+                    [
+                        "import",
+                        "--fixture",
+                        str(fixture),
+                        "--output",
+                        str(raw),
+                    ]
+                ),
+                0,
+            )
+            self.assertEqual(
+                main(
+                    [
+                        "audit",
+                        "--corpus",
+                        str(raw),
+                        "--model",
+                        str(MODEL_PATH),
+                        "--output",
+                        str(audited),
+                    ]
+                ),
+                0,
+            )
+            executable = Path(sys.executable).resolve()
+            direct_alias = root / "python-alias"
+            direct_alias.symlink_to(executable)
+            ancestor_alias = root / "bin-alias"
+            ancestor_alias.symlink_to(
+                executable.parent,
+                target_is_directory=True,
+            )
+            for case, renderer_path in (
+                ("direct", direct_alias),
+                ("ancestor", ancestor_alias / executable.name),
+            ):
+                with self.subTest(case=case):
+                    corpus = root / f"audited-{case}"
+                    shutil.copytree(audited, corpus)
+                    output = corpus / "render-audit"
+                    with redirect_stderr(io.StringIO()):
+                        status = main(
+                            [
+                                "render-audit",
+                                "--corpus",
+                                str(corpus),
+                                "--renderer",
+                                str(renderer_path),
+                                "--renderer-arg",
+                                str(renderer),
+                                "--output",
+                                str(output),
+                            ]
+                        )
+                    self.assertEqual(status, 2)
+                    self.assertFalse(output.exists())
+                    self.assertEqual(
+                        list(corpus.glob(".render-audit.*")),
+                        [],
+                    )
+
+    @unittest.skipUnless(MODEL_PATH.is_file(), "real G1 model unavailable")
+    def test_renderer_timeout_kills_process_group_and_cleans_stage(self):
+        """Catches an unbounded renderer or a surviving renderer child."""
+
+        from mm_sonic.terrain_oracle.corpus_cli import main
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = _write_audit_fixture(root)
+            raw = root / "raw"
+            audited = root / "audited"
+            output = audited / "render-audit"
+            marker = root / "orphan-marker"
+            renderer = _write_hanging_renderer(root / "hang.py")
+            self.assertEqual(
+                main(
+                    [
+                        "import",
+                        "--fixture",
+                        str(fixture),
+                        "--output",
+                        str(raw),
+                    ]
+                ),
+                0,
+            )
+            self.assertEqual(
+                main(
+                    [
+                        "audit",
+                        "--corpus",
+                        str(raw),
+                        "--model",
+                        str(MODEL_PATH),
+                        "--output",
+                        str(audited),
+                    ]
+                ),
+                0,
+            )
+            errors = io.StringIO()
+            started = time.monotonic()
+            with redirect_stderr(errors):
+                status = main(
+                    [
+                        "render-audit",
+                        "--corpus",
+                        str(audited),
+                        "--renderer",
+                        str(Path(sys.executable).resolve()),
+                        "--renderer-arg",
+                        str(renderer),
+                        "--renderer-arg",
+                        str(marker),
+                        "--renderer-timeout-seconds",
+                        "0.1",
+                        "--output",
+                        str(output),
+                    ]
+                )
+            elapsed = time.monotonic() - started
+
+            self.assertEqual(status, 2)
+            self.assertIn("timed out", errors.getvalue().lower())
+            self.assertLess(elapsed, 3.0)
+            time.sleep(1.0)
+            self.assertFalse(marker.exists())
+            self.assertFalse(output.exists())
+            self.assertEqual(
+                list(audited.glob(".render-audit.*")),
+                [],
+            )
 
     @unittest.skipUnless(MODEL_PATH.is_file(), "real G1 model unavailable")
     def test_coverage_rebuilds_public_task8_manifest_without_replacement(self):
@@ -1286,7 +1884,7 @@ class CorpusCliTests(unittest.TestCase):
                                     "--corpus",
                                     str(audited),
                                     "--renderer",
-                                    sys.executable,
+                                    str(Path(sys.executable).resolve()),
                                     "--renderer-arg",
                                     str(renderer),
                                     "--output",
@@ -1425,7 +2023,11 @@ class CorpusCliTests(unittest.TestCase):
                 {
                     path.relative_to(frozen).as_posix()
                     for path in frozen.rglob("*")
-                    if path.is_file() and path != freeze_index_path
+                    if (
+                        path.is_file()
+                        and path != freeze_index_path
+                        and path != frozen / COMPLETION_MARKER
+                    )
                 },
             )
             for item in declared_files:
@@ -1479,6 +2081,120 @@ class CorpusCliTests(unittest.TestCase):
                         _load_frozen_corpus(variant)
 
     @unittest.skipUnless(MODEL_PATH.is_file(), "real G1 model unavailable")
+    def test_freeze_snapshots_before_validation_and_ignores_later_source_swap(
+        self,
+    ):
+        """Catches a post-validation symlink swap entering the frozen release."""
+
+        from mm_sonic.terrain_oracle import corpus_cli
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = _write_audit_fixture(root)
+            raw = root / "raw"
+            audited = root / "audited"
+            rendered = audited / "render-audit"
+            frozen = root / "frozen"
+            renderer = _write_interval_renderer(root / "renderer.py")
+            for command in (
+                [
+                    "import",
+                    "--fixture",
+                    str(fixture),
+                    "--output",
+                    str(raw),
+                ],
+                [
+                    "audit",
+                    "--corpus",
+                    str(raw),
+                    "--model",
+                    str(MODEL_PATH),
+                    "--output",
+                    str(audited),
+                ],
+                [
+                    "render-audit",
+                    "--corpus",
+                    str(audited),
+                    "--renderer",
+                    str(Path(sys.executable).resolve()),
+                    "--renderer-arg",
+                    str(renderer),
+                    "--output",
+                    str(rendered),
+                ],
+                [
+                    "coverage",
+                    "--corpus",
+                    str(audited),
+                    "--output",
+                    str(audited / "coverage.json"),
+                ],
+            ):
+                self.assertEqual(corpus_cli.main(command), 0)
+
+            render_index = json.loads(
+                (rendered / "render-index.json").read_text("ascii")
+            )
+            receipt_path = (
+                rendered
+                / render_index["interval_receipts"][0]["relative_path"]
+            )
+            receipt = json.loads(receipt_path.read_text("ascii"))
+            artifact_relative_path = receipt["video"]["relative_path"]
+            source_artifact = rendered / artifact_relative_path
+            original_payload = source_artifact.read_bytes()
+            replacement = root / "replacement.mp4"
+            replacement.write_bytes(b"X" * len(original_payload))
+            original_freeze_source_paths = corpus_cli._freeze_source_paths
+            swapped = False
+
+            def swap_after_validation(
+                snapshot_root,
+                manifest,
+                audit_index,
+            ):
+                nonlocal swapped
+                result = original_freeze_source_paths(
+                    snapshot_root,
+                    manifest,
+                    audit_index,
+                )
+                if not swapped:
+                    source_artifact.unlink()
+                    source_artifact.symlink_to(replacement)
+                    swapped = True
+                return result
+
+            with mock.patch.object(
+                corpus_cli,
+                "_freeze_source_paths",
+                side_effect=swap_after_validation,
+            ):
+                self.assertEqual(
+                    corpus_cli.main(
+                        [
+                            "freeze",
+                            "--corpus",
+                            str(audited),
+                            "--output",
+                            str(frozen),
+                        ]
+                    ),
+                    0,
+                )
+            self.assertTrue(swapped)
+            self.assertEqual(
+                (
+                    frozen
+                    / "render-audit"
+                    / artifact_relative_path
+                ).read_bytes(),
+                original_payload,
+            )
+
+    @unittest.skipUnless(MODEL_PATH.is_file(), "real G1 model unavailable")
     def test_freeze_rejects_missing_extra_stale_mismatched_and_malformed_evidence(
         self,
     ):
@@ -1526,7 +2242,7 @@ class CorpusCliTests(unittest.TestCase):
                         "--corpus",
                         str(audited),
                         "--renderer",
-                        sys.executable,
+                        str(Path(sys.executable).resolve()),
                         "--renderer-arg",
                         str(renderer),
                         "--output",
@@ -1804,6 +2520,108 @@ class CorpusCliTests(unittest.TestCase):
                 )
             self.assertIn("exist", errors.getvalue().lower())
             self.assertEqual(output.read_bytes(), before)
+
+    def test_grail_inventory_hashes_pair_bytes_pose_and_license_identity(self):
+        """Catches same-size PKL/USD substitution outside inventory authority."""
+
+        from mm_sonic.terrain_oracle.corpus_cli import main
+        from tests.python.test_oracle_source_grail import (
+            _write_grail_fixture,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            grail, expected_position, expected_rotation = (
+                _write_grail_fixture(root / "grail")
+            )
+            stem = "terrain_stairs__fixture__0000"
+            robot_path = (
+                grail
+                / "c490_stair_p1_0000"
+                / "robot"
+                / f"{stem}.pkl"
+            )
+            terrain_path = (
+                grail
+                / "c490_stair_p1_0000"
+                / "object_usd"
+                / f"{stem}.usd"
+            )
+            original_robot = robot_path.read_bytes()
+            original_terrain = terrain_path.read_bytes()
+
+            def publish(name: str) -> dict[str, object]:
+                output = root / f"{name}.json"
+                self.assertEqual(
+                    main(
+                        [
+                            "inventory",
+                            "--grail-root",
+                            str(grail),
+                            "--grail-families",
+                            "c490_stair_p1",
+                            "--output",
+                            str(output),
+                        ]
+                    ),
+                    0,
+                )
+                return json.loads(output.read_text("ascii"))
+
+            original = publish("original")
+            robot_path.write_bytes(
+                bytes((original_robot[0] ^ 1,)) + original_robot[1:]
+            )
+            robot_substitution = publish("robot-substitution")
+            robot_path.write_bytes(original_robot)
+            terrain_path.write_bytes(
+                bytes((original_terrain[0] ^ 1,)) + original_terrain[1:]
+            )
+            terrain_substitution = publish("terrain-substitution")
+
+            self.assertNotEqual(
+                original["content_sha256"],
+                robot_substitution["content_sha256"],
+            )
+            self.assertNotEqual(
+                original["content_sha256"],
+                terrain_substitution["content_sha256"],
+            )
+            record = next(
+                item
+                for item in original["sources"]["grail"]["records"]
+                if item["stem"] == stem
+            )
+            self.assertEqual(
+                record["robot"],
+                {
+                    "relative_path": robot_path.relative_to(grail).as_posix(),
+                    "path": str(robot_path.resolve()),
+                    "size_bytes": len(original_robot),
+                    "sha256": hashlib.sha256(original_robot).hexdigest(),
+                    "license_id": "UNRECORDED",
+                },
+            )
+            self.assertEqual(
+                record["terrain"],
+                {
+                    "relative_path": terrain_path.relative_to(grail).as_posix(),
+                    "path": str(terrain_path.resolve()),
+                    "size_bytes": len(original_terrain),
+                    "sha256": hashlib.sha256(original_terrain).hexdigest(),
+                    "license_id": "UNRECORDED",
+                    "world_from_terrain": {
+                        "translation_world": np.asarray(
+                            expected_position,
+                            dtype=np.float32,
+                        ).tolist(),
+                        "quaternion_world_from_local_wxyz": np.asarray(
+                            expected_rotation,
+                            dtype=np.float32,
+                        ).tolist(),
+                    },
+                },
+            )
 
     def test_main_returns_parse_status_without_leaking_system_exit(self):
         """Catches programmatic CLI parse failures escaping as exceptions."""

@@ -464,7 +464,13 @@ def structural_model_sha256(model: object) -> str:
     return digest.hexdigest()
 
 
-def _terrain_sha256(query: CanonicalMeshQuery) -> str:
+def terrain_query_sha256(query: CanonicalMeshQuery) -> str:
+    """Hash the exact immutable terrain-query surface and world transform."""
+
+    if not isinstance(query, CanonicalMeshQuery):
+        raise ContractError(
+            "terrain query hash requires a CanonicalMeshQuery"
+        )
     digest = hashlib.sha256(b"terrain-oracle-exact-query-surface/v1\0")
     _update_hash_text(digest, query.mesh_sha256)
     _update_hash_text(digest, query.source_asset_sha256)
@@ -1951,7 +1957,7 @@ def audit_clip(
         model_hash = "0" * 64
     try:
         terrain_hash = (
-            _terrain_sha256(terrain)
+            terrain_query_sha256(terrain)
             if isinstance(terrain, CanonicalMeshQuery)
             else "0" * 64
         )
@@ -1987,7 +1993,7 @@ def audit_clip(
             model_sha256=model_hash,
             terrain_sha256=terrain_hash,
         )
-    terrain_hash = _terrain_sha256(query)
+    terrain_hash = terrain_query_sha256(query)
 
     frames_count = clip.frame_count
     fps = float(clip.fps)

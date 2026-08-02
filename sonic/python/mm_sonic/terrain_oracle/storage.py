@@ -10,6 +10,9 @@ import io
 import json
 import os
 from pathlib import Path
+import secrets
+import shutil
+import stat
 import tempfile
 from typing import Mapping, Sequence
 import zipfile
@@ -34,6 +37,10 @@ from .math3d import RigidTransform
 _AT_FDCWD = -100
 _RENAME_NOREPLACE = 1
 _ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
+COMPLETION_MARKER = ".terrain-oracle-complete.json"
+_OWNER_MARKER = ".terrain-oracle-publishing-owner"
+_COMPLETE_SCHEMA = "terrain-oracle-complete/v1"
+_CORPUS_EXTENSIONS = ("coverage.json", "render-audit")
 _CLIP_ARRAY_NAMES = (
     "root_position_world",
     "root_quaternion_world_wxyz",
@@ -235,11 +242,321 @@ def _write_no_replace(destination: Path, payload: bytes) -> None:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
-        _rename_noreplace(temporary, destination)
+        try:
+            _rename_noreplace(temporary, destination)
+        except OSError as error:
+            if error.errno not in (errno.EINVAL, errno.ENOTSUP):
+                raise
+            try:
+                os.link(
+                    temporary,
+                    destination,
+                    follow_symlinks=False,
+                )
+            finally:
+                temporary.unlink(missing_ok=True)
         _fsync_directory(destination.parent)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
+
+
+def _read_regular_file_nofollow(path: Path) -> bytes:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ContractError(f"publication entry is not regular: {path}")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _normalized_excluded_top_level(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list) or any(
+        type(item) is not str for item in value
+    ):
+        raise ContractError(
+            "completion excluded_top_level must be a string list"
+        )
+    result = tuple(value)
+    if result not in ((), _CORPUS_EXTENSIONS):
+        raise ContractError(
+            "completion excluded_top_level is not a canonical profile"
+        )
+    return result
+
+
+def _validate_extension_entries(
+    root: Path,
+    excluded_top_level: tuple[str, ...],
+) -> None:
+    for name in excluded_top_level:
+        path = root / name
+        if not os.path.lexists(path):
+            continue
+        if path.is_symlink():
+            raise ContractError("corpus extension must not be a symlink")
+        if name == "coverage.json" and not path.is_file():
+            raise ContractError("coverage.json extension must be a regular file")
+        if name == "render-audit" and not path.is_dir():
+            raise ContractError("render-audit extension must be a directory")
+
+
+def _directory_tree_evidence(
+    root: Path,
+    excluded_top_level: tuple[str, ...],
+) -> tuple[list[str], list[dict[str, object]], str]:
+    if root.is_symlink() or not root.is_dir():
+        raise ContractError("publication tree root must be a regular directory")
+    _validate_extension_entries(root, excluded_top_level)
+    directories: list[str] = []
+    files: list[dict[str, object]] = []
+    for path in sorted(
+        root.rglob("*"),
+        key=lambda item: item.relative_to(root).as_posix(),
+    ):
+        relative_path = path.relative_to(root).as_posix()
+        parts = Path(relative_path).parts
+        if relative_path in (COMPLETION_MARKER, _OWNER_MARKER):
+            continue
+        if parts and parts[0] in excluded_top_level:
+            continue
+        if path.is_symlink():
+            raise ContractError("publication tree must not contain symlinks")
+        if path.is_dir():
+            directories.append(relative_path)
+            continue
+        if not path.is_file():
+            raise ContractError(
+                "publication tree contains a non-regular entry"
+            )
+        payload = _read_regular_file_nofollow(path)
+        files.append(
+            {
+                "relative_path": relative_path,
+                "size_bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        )
+    evidence = {
+        "directories": directories,
+        "files": files,
+    }
+    tree_sha256 = hashlib.sha256(
+        _canonical_json_bytes(evidence, "publication tree evidence")
+    ).hexdigest()
+    return directories, files, tree_sha256
+
+
+def _seal_directory(
+    root: Path,
+    *,
+    excluded_top_level: Sequence[str] = (),
+) -> dict[str, object]:
+    excluded = tuple(excluded_top_level)
+    if excluded not in ((), _CORPUS_EXTENSIONS):
+        raise ContractError(
+            "publication exclusions must use the canonical corpus profile"
+        )
+    if os.path.lexists(root / COMPLETION_MARKER):
+        raise FileExistsError(root / COMPLETION_MARKER)
+    if os.path.lexists(root / _OWNER_MARKER):
+        raise ContractError("publication staging tree contains an owner marker")
+    for name in excluded:
+        if os.path.lexists(root / name):
+            raise ContractError(
+                "excluded corpus extensions must be absent while sealing"
+            )
+    _directories, files, tree_sha256 = _directory_tree_evidence(
+        root,
+        excluded,
+    )
+    marker = {
+        "schema": _COMPLETE_SCHEMA,
+        "excluded_top_level": list(excluded),
+        "file_count": len(files),
+        "tree_sha256": tree_sha256,
+    }
+    _write_no_replace(
+        root / COMPLETION_MARKER,
+        _canonical_json_bytes(marker, "publication completion marker"),
+    )
+    _fsync_directory(root)
+    return marker
+
+
+def _validate_complete_directory(root: Path) -> dict[str, object]:
+    directory = Path(root)
+    if directory.is_symlink() or not directory.is_dir():
+        raise ContractError("published tree is missing or a symlink")
+    if os.path.lexists(directory / _OWNER_MARKER):
+        raise ContractError("published tree is still owned by a writer")
+    marker_path = directory / COMPLETION_MARKER
+    if marker_path.is_symlink() or not marker_path.is_file():
+        raise ContractError("published tree completion marker is missing")
+    payload = _read_regular_file_nofollow(marker_path)
+    try:
+        marker = json.loads(payload.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ContractError("invalid publication completion marker") from error
+    if (
+        not isinstance(marker, dict)
+        or set(marker) != {
+            "schema",
+            "excluded_top_level",
+            "file_count",
+            "tree_sha256",
+        }
+        or marker["schema"] != _COMPLETE_SCHEMA
+        or payload
+        != _canonical_json_bytes(
+            marker,
+            "publication completion marker",
+        )
+        or type(marker["file_count"]) is not int
+        or marker["file_count"] < 1
+    ):
+        raise ContractError("publication completion marker fields are stale")
+    excluded = _normalized_excluded_top_level(
+        marker["excluded_top_level"]
+    )
+    _directories, files, tree_sha256 = _directory_tree_evidence(
+        directory,
+        excluded,
+    )
+    if (
+        marker["file_count"] != len(files)
+        or _sha256(marker["tree_sha256"]) != tree_sha256
+    ):
+        raise ContractError("published tree completion digest is stale")
+    return marker
+
+
+def _cleanup_owned_destination(
+    destination: Path,
+    *,
+    identity: tuple[int, int],
+    owner_payload: bytes,
+) -> None:
+    try:
+        metadata = os.lstat(destination)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or (metadata.st_dev, metadata.st_ino) != identity
+            or _read_regular_file_nofollow(destination / _OWNER_MARKER)
+            != owner_payload
+        ):
+            return
+    except (FileNotFoundError, OSError, ContractError):
+        return
+    shutil.rmtree(destination)
+
+
+def _copy_directory_claim_noreplace(
+    source: Path,
+    destination: Path,
+) -> None:
+    marker = _validate_complete_directory(source)
+    marker_payload = _read_regular_file_nofollow(
+        source / COMPLETION_MARKER
+    )
+    owner_payload = (
+        f"terrain-oracle-owner-v1:{secrets.token_hex(32)}\n"
+    ).encode("ascii")
+    os.mkdir(destination, mode=0o700)
+    claimed = os.lstat(destination)
+    identity = (claimed.st_dev, claimed.st_ino)
+    try:
+        _write_no_replace(destination / _OWNER_MARKER, owner_payload)
+        directories = [
+            path
+            for path in sorted(
+                source.rglob("*"),
+                key=lambda item: (
+                    len(item.relative_to(source).parts),
+                    item.relative_to(source).as_posix(),
+                ),
+            )
+            if path.is_dir() and not path.is_symlink()
+        ]
+        for directory in directories:
+            relative = directory.relative_to(source)
+            os.mkdir(destination / relative)
+        for path in sorted(
+            source.rglob("*"),
+            key=lambda item: item.relative_to(source).as_posix(),
+        ):
+            if path.is_symlink():
+                raise ContractError(
+                    "publication source tree contains a symlink"
+                )
+            if not path.is_file():
+                continue
+            relative = path.relative_to(source)
+            if relative.as_posix() == COMPLETION_MARKER:
+                continue
+            _write_no_replace(
+                destination / relative,
+                _read_regular_file_nofollow(path),
+            )
+        _directories, files, tree_sha256 = _directory_tree_evidence(
+            destination,
+            tuple(marker["excluded_top_level"]),
+        )
+        if (
+            len(files) != marker["file_count"]
+            or tree_sha256 != marker["tree_sha256"]
+        ):
+            raise ContractError(
+                "NFS publication copy does not match sealed staging tree"
+            )
+        for directory in sorted(
+            (path for path in destination.rglob("*") if path.is_dir()),
+            key=lambda item: len(item.parts),
+            reverse=True,
+        ):
+            _fsync_directory(directory)
+        _write_no_replace(
+            destination / COMPLETION_MARKER,
+            marker_payload,
+        )
+        _fsync_directory(destination)
+        (destination / _OWNER_MARKER).unlink()
+        _fsync_directory(destination)
+        _validate_complete_directory(destination)
+    except BaseException:
+        _cleanup_owned_destination(
+            destination,
+            identity=identity,
+            owner_payload=owner_payload,
+        )
+        raise
+    shutil.rmtree(source)
+
+
+def _publish_directory_no_replace(
+    source: Path,
+    destination: Path,
+) -> None:
+    _validate_complete_directory(source)
+    try:
+        _rename_noreplace(source, destination)
+    except OSError as error:
+        if error.errno not in (errno.EINVAL, errno.ENOTSUP):
+            raise
+        _copy_directory_claim_noreplace(source, destination)
+    _fsync_directory(destination.parent)
+    _validate_complete_directory(destination)
 
 
 def _clip_metadata(clip: CanonicalClip) -> dict[str, object]:
@@ -480,9 +797,8 @@ def publish_corpus(
     )
     try:
         _write_no_replace(temporary / "manifest.json", _canonical_json_bytes(manifest, "corpus manifest"))
-        _fsync_directory(temporary)
-        _rename_noreplace(temporary, destination)
-        _fsync_directory(destination.parent)
+        _seal_directory(temporary)
+        _publish_directory_no_replace(temporary, destination)
     except BaseException:
         if temporary.exists():
             for child in temporary.iterdir():
@@ -497,6 +813,7 @@ def load_corpus(path: Path) -> CorpusManifest:
 
     manifest_path = Path(path)
     if manifest_path.is_dir():
+        _validate_complete_directory(manifest_path)
         manifest_path /= "manifest.json"
     try:
         document = json.loads(manifest_path.read_text("ascii"))

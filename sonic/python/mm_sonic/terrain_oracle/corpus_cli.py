@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from dataclasses import dataclass
 import errno
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -27,10 +30,23 @@ from . import (
     source_lafan,
     storage,
 )
-from .audit import ClipAudit, audit_clip, structural_model_sha256
+from .audit import (
+    ClipAudit,
+    audit_clip,
+    structural_model_sha256,
+    terrain_query_sha256,
+)
 from .canonical import CanonicalClip, CanonicalTerrainMesh, TerrainBinding
 from .contact import CanonicalMeshQuery
 from .math3d import RigidTransform
+
+
+@dataclass(frozen=True)
+class _FreezeModelSnapshot:
+    asset_path: str
+    asset_payload: bytes
+    compiled_mjb_payload: bytes
+    model: object
 
 
 def _reject_unsafe_cli_path(path: Path, label: str) -> Path:
@@ -122,10 +138,13 @@ def _publish_bundle(
             manifest_directory / "manifest.json",
             stage / "manifest.json",
         )
+        (manifest_directory / storage.COMPLETION_MARKER).unlink()
         manifest_directory.rmdir()
-        storage._fsync_directory(stage)
-        storage._rename_noreplace(stage, destination)
-        storage._fsync_directory(destination.parent)
+        storage._seal_directory(
+            stage,
+            excluded_top_level=("coverage.json", "render-audit"),
+        )
+        storage._publish_directory_no_replace(stage, destination)
     except BaseException:
         if stage.exists():
             shutil.rmtree(stage)
@@ -145,6 +164,71 @@ def _model_record(path: Path, model: object) -> dict[str, object]:
         "asset_size_bytes": len(payload),
         "asset_sha256": hashlib.sha256(payload).hexdigest(),
         "structural_sha256": structural_model_sha256(model),
+    }
+
+
+def _validated_sha256(value: object, label: str) -> str:
+    if type(value) is not str or len(value) != 64 or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        raise ContractError(f"{label} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _normalized_model_record(
+    value: object,
+    label: str,
+) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != {
+        "asset_path",
+        "asset_size_bytes",
+        "asset_sha256",
+        "structural_sha256",
+    }:
+        raise ContractError(f"{label} fields do not match v1")
+    asset_path = value["asset_path"]
+    asset_size_bytes = value["asset_size_bytes"]
+    if type(asset_path) is not str or not asset_path:
+        raise ContractError(f"{label} asset_path must be a nonempty string")
+    if type(asset_size_bytes) is not int or asset_size_bytes < 1:
+        raise ContractError(
+            f"{label} asset_size_bytes must be a positive integer"
+        )
+    return {
+        "asset_path": asset_path,
+        "asset_size_bytes": asset_size_bytes,
+        "asset_sha256": _validated_sha256(
+            value["asset_sha256"],
+            f"{label} asset_sha256",
+        ),
+        "structural_sha256": _validated_sha256(
+            value["structural_sha256"],
+            f"{label} structural_sha256",
+        ),
+    }
+
+
+def _normalized_manifest_audit_metadata(
+    value: object,
+) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != {
+        "schema",
+        "source_corpus_manifest_sha256",
+        "model",
+    }:
+        raise ContractError("manifest audit metadata fields do not match v1")
+    if value["schema"] != "terrain-oracle-audit-index/v1":
+        raise ContractError("manifest audit metadata schema is stale")
+    return {
+        "schema": value["schema"],
+        "source_corpus_manifest_sha256": _validated_sha256(
+            value["source_corpus_manifest_sha256"],
+            "manifest source corpus SHA-256",
+        ),
+        "model": _normalized_model_record(
+            value["model"],
+            "manifest audit model",
+        ),
     }
 
 
@@ -255,6 +339,7 @@ def _publish_audit_bundle(
             manifest_directory / "manifest.json",
             stage / "manifest.json",
         )
+        (manifest_directory / storage.COMPLETION_MARKER).unlink()
         manifest_directory.rmdir()
         output_manifest_sha256 = hashlib.sha256(
             (stage / "manifest.json").read_bytes()
@@ -309,10 +394,12 @@ def _publish_audit_bundle(
                 "mechanical audit index",
             ),
         )
+        storage._seal_directory(
+            stage,
+            excluded_top_level=("coverage.json", "render-audit"),
+        )
         _verify_audit_stage(stage, index)
-        storage._fsync_directory(stage)
-        storage._rename_noreplace(stage, destination)
-        storage._fsync_directory(destination.parent)
+        storage._publish_directory_no_replace(stage, destination)
     except BaseException:
         if stage.exists():
             shutil.rmtree(stage)
@@ -405,17 +492,49 @@ def _canonical_relative_path(value: object, directory: str) -> str:
 
 def _load_audit_evidence(
     root: Path,
+    *,
+    model_snapshot: _FreezeModelSnapshot | None = None,
 ) -> tuple[
     storage.CorpusManifest,
     tuple[CanonicalClip, ...],
     dict[str, object],
     dict[str, ClipAudit],
 ]:
+    manifest_document, manifest_payload = _load_canonical_json(
+        root / "manifest.json",
+        "audited corpus manifest",
+    )
+    if set(manifest_document) != {
+        "schema",
+        "coordinate_frame",
+        "quaternion_convention",
+        "fps",
+        "joint_order",
+        "body_order",
+        "clips",
+        "meshes",
+        "metadata",
+    }:
+        raise ContractError("audited corpus manifest fields do not match v1")
     manifest = storage.load_corpus(root)
     clips = tuple(
         storage.read_clip(root / record.relative_path)
         for record in manifest.clips
     )
+    meshes = tuple(
+        storage.read_mesh(root / record.relative_path)
+        for record in manifest.meshes
+    )
+    mesh_by_sha256 = {
+        record.sha256: mesh
+        for record, mesh in zip(
+            manifest.meshes,
+            meshes,
+            strict=True,
+        )
+    }
+    if len(mesh_by_sha256) != len(meshes):
+        raise ContractError("audited corpus mesh records must be unique")
     try:
         index_payload = (root / "audit-index.json").read_bytes()
         index = json.loads(index_payload.decode("ascii"))
@@ -442,32 +561,75 @@ def _load_audit_evidence(
             )
         ).hexdigest()
         or index["corpus_manifest_sha256"]
-        != hashlib.sha256((root / "manifest.json").read_bytes()).hexdigest()
+        != hashlib.sha256(manifest_payload).hexdigest()
     ):
         raise ContractError("mechanical audit index hash or corpus binding is stale")
-    model_record = index["model"]
-    if not isinstance(model_record, dict) or set(model_record) != {
-        "asset_path",
-        "asset_size_bytes",
-        "asset_sha256",
-        "structural_sha256",
+    source_manifest_sha256 = _validated_sha256(
+        index["source_corpus_manifest_sha256"],
+        "audit source corpus SHA-256",
+    )
+    _validated_sha256(
+        index["corpus_manifest_sha256"],
+        "audited corpus manifest SHA-256",
+    )
+    model_record = _normalized_model_record(
+        index["model"],
+        "mechanical audit model",
+    )
+    manifest_audit = _normalized_manifest_audit_metadata(
+        manifest.metadata.get("audit")
+    )
+    if manifest_audit != {
+        "schema": "terrain-oracle-audit-index/v1",
+        "source_corpus_manifest_sha256": source_manifest_sha256,
+        "model": model_record,
     }:
-        raise ContractError("mechanical audit model fields do not match v1")
-    model_path = Path(str(model_record["asset_path"]))
-    if not model_path.is_file() or model_path.is_symlink():
-        raise ContractError("mechanical audit model asset is missing or a symlink")
-    model_payload = model_path.read_bytes()
+        raise ContractError(
+            "manifest audit metadata does not match index authority"
+        )
+    reconstructed_source = dict(manifest_document)
+    reconstructed_metadata = dict(reconstructed_source["metadata"])
+    removed_audit = reconstructed_metadata.pop("audit", None)
+    if removed_audit is None:
+        raise ContractError("audited corpus manifest lacks audit metadata")
+    reconstructed_source["metadata"] = reconstructed_metadata
+    if source_manifest_sha256 != hashlib.sha256(
+        storage._canonical_json_bytes(
+            reconstructed_source,
+            "reconstructed source corpus manifest",
+        )
+    ).hexdigest():
+        raise ContractError(
+            "audit source manifest authority does not match reconstructed bytes"
+        )
+    if model_snapshot is None:
+        model_path = _cli_input_file(
+            Path(str(model_record["asset_path"])),
+            "mechanical audit model asset",
+        )
+        if str(model_path) != model_record["asset_path"]:
+            raise ContractError(
+                "mechanical audit model asset path is not canonical"
+            )
+        model_payload = storage._read_regular_file_nofollow(model_path)
+        try:
+            import mujoco
+        except ImportError as error:
+            raise ContractError("render audit requires MuJoCo") from error
+        model = mujoco.MjModel.from_xml_path(str(model_path))
+    else:
+        if model_snapshot.asset_path != model_record["asset_path"]:
+            raise ContractError(
+                "freeze model snapshot path does not match audit authority"
+            )
+        model_payload = model_snapshot.asset_payload
+        model = model_snapshot.model
     if (
         len(model_payload) != model_record["asset_size_bytes"]
         or hashlib.sha256(model_payload).hexdigest()
         != model_record["asset_sha256"]
     ):
         raise ContractError("mechanical audit model asset hash is stale")
-    try:
-        import mujoco
-    except ImportError as error:
-        raise ContractError("render audit requires MuJoCo") from error
-    model = mujoco.MjModel.from_xml_path(str(model_path))
     if structural_model_sha256(model) != model_record["structural_sha256"]:
         raise ContractError("mechanical audit structural model hash is stale")
     raw_entries = index["reports"]
@@ -528,10 +690,48 @@ def _load_audit_evidence(
             clip.clip_id != record.clip_id
             or clip.frame_count != record.frame_count
             or report.clip_id != clip.clip_id
+            or report.frame_count != clip.frame_count
             or report.clip_sha256 != record.sha256
             or report.source_sha256 != clip.source.source_sha256
         ):
             raise ContractError("mechanical audit and canonical clip mismatch")
+        if report.model_sha256 != model_record["structural_sha256"]:
+            raise ContractError(
+                "mechanical audit model authority mismatch"
+            )
+        if clip.terrain is None:
+            expected_terrain_sha256 = "0" * 64
+            if (
+                report.status != "rejected"
+                or report.accepted_intervals
+                or not any(
+                    reason.code == "terrain_registration"
+                    for reason in report.reasons
+                )
+            ):
+                raise ContractError(
+                    "unbound clip audit must be a terrain-registration rejection"
+                )
+        else:
+            mesh = mesh_by_sha256.get(clip.terrain.mesh_sha256)
+            if (
+                mesh is None
+                or mesh.source_asset_sha256
+                != clip.terrain.asset_sha256
+            ):
+                raise ContractError(
+                    "canonical clip terrain binding does not match exact mesh"
+                )
+            expected_terrain_sha256 = terrain_query_sha256(
+                CanonicalMeshQuery(
+                    mesh,
+                    clip.terrain.world_from_terrain,
+                )
+            )
+        if report.terrain_sha256 != expected_terrain_sha256:
+            raise ContractError(
+                "mechanical audit terrain query authority mismatch"
+            )
     return manifest, clips, index, reports
 
 
@@ -637,6 +837,7 @@ def _run_renderer(
     renderer_sha256: str,
     request: dict[str, object],
     semantic_arguments: list[str],
+    timeout_seconds: float,
 ) -> tuple[dict[str, object], str]:
     request_id = hashlib.sha256(
         storage._canonical_json_bytes(request, "render request")
@@ -658,21 +859,35 @@ def _run_renderer(
         "--overlay",
         str(stage / overlay_relative),
     ]
-    completed = subprocess.run(
+    process = subprocess.Popen(
         actual_argv,
         shell=False,
-        check=False,
-        capture_output=True,
-        text=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
     )
-    if completed.returncode != 0:
-        detail = completed.stderr.decode(
-            "utf-8",
-            errors="replace",
-        ).strip()
+    try:
+        returncode = process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired as error:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
         raise ContractError(
-            "renderer failed with exit "
-            f"{completed.returncode}: {detail}"
+            f"renderer timed out after {timeout_seconds:g} seconds"
+        ) from error
+    except BaseException:
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+        raise
+    if returncode != 0:
+        raise ContractError(
+            f"renderer failed with exit {returncode}"
         )
     renderer_record = {
         "argv": normalized_argv,
@@ -684,7 +899,7 @@ def _run_renderer(
             )
         ).hexdigest(),
         "shell": False,
-        "returncode": completed.returncode,
+        "returncode": returncode,
     }
     artifacts = {
         "video": _artifact_record(
@@ -939,16 +1154,24 @@ def _load_render_receipt(
     )
 
 
-def _load_render_evidence(root: Path) -> dict[str, object]:
+def _load_render_evidence(
+    root: Path,
+    *,
+    model_snapshot: _FreezeModelSnapshot | None = None,
+) -> dict[str, object]:
     """Reload and recompute the exact exhaustive render evidence set."""
 
     corpus_root = Path(root).expanduser().resolve()
     if not corpus_root.is_dir() or corpus_root.is_symlink():
         raise ContractError("audited corpus is missing or a symlink")
-    manifest, clips, audit_index, reports = _load_audit_evidence(corpus_root)
+    manifest, clips, audit_index, reports = _load_audit_evidence(
+        corpus_root,
+        model_snapshot=model_snapshot,
+    )
     render_root = corpus_root / "render-audit"
     if not render_root.is_dir() or render_root.is_symlink():
         raise ContractError("canonical render-audit directory is missing")
+    storage._validate_complete_directory(render_root)
     allowed_directories = {
         "artifacts",
         "receipts",
@@ -1252,6 +1475,7 @@ def _load_render_evidence(root: Path) -> dict[str, object]:
     if actual_directories != allowed_directories:
         raise ContractError("render evidence directories do not match v1")
     if actual_files != {
+        storage.COMPLETION_MARKER,
         "render-index.json",
         *expected_receipt_paths,
         *expected_artifact_paths,
@@ -1273,14 +1497,24 @@ def _render_interval_receipts(arguments: argparse.Namespace) -> None:
         record.sha256: clip
         for record, clip in zip(manifest.clips, clips, strict=True)
     }
-    renderer = Path(arguments.renderer).expanduser().resolve()
-    if not renderer.is_file() or renderer.is_symlink():
-        raise ContractError("renderer executable is missing or a symlink")
+    renderer = _cli_input_file(
+        arguments.renderer,
+        "renderer executable",
+    )
     renderer_sha256 = hashlib.sha256(renderer.read_bytes()).hexdigest()
     renderer_arguments = tuple(
         _normalized_renderer_argument(value)
         for value in arguments.renderer_arg
     )
+    timeout_seconds = float(arguments.renderer_timeout_seconds)
+    if (
+        not np.isfinite(timeout_seconds)
+        or timeout_seconds <= 0.0
+        or timeout_seconds > 3600.0
+    ):
+        raise ContractError(
+            "renderer timeout must be finite in (0, 3600] seconds"
+        )
     stage = Path(
         tempfile.mkdtemp(
             prefix=f".{destination.name}.",
@@ -1353,6 +1587,7 @@ def _render_interval_receipts(arguments: argparse.Namespace) -> None:
                         "--end",
                         str(interval.end_frame),
                     ],
+                    timeout_seconds=timeout_seconds,
                 )
                 receipt_relative = f"receipts/{request_id}.json"
                 receipt = {
@@ -1411,6 +1646,7 @@ def _render_interval_receipts(arguments: argparse.Namespace) -> None:
                     for value in ("--interval-key", key)
                 ],
             ],
+            timeout_seconds=timeout_seconds,
         )
         sheet_receipt = {
             "schema": "terrain-oracle-render-receipt/v1",
@@ -1484,6 +1720,7 @@ def _render_interval_receipts(arguments: argparse.Namespace) -> None:
                         for value in ("--interval-key", key)
                     ],
                 ],
+                timeout_seconds=timeout_seconds,
             )
             receipt = {
                 "schema": "terrain-oracle-render-receipt/v1",
@@ -1561,9 +1798,8 @@ def _render_interval_receipts(arguments: argparse.Namespace) -> None:
             "strata",
         ):
             storage._fsync_directory(stage / directory)
-        storage._fsync_directory(stage)
-        storage._rename_noreplace(stage, destination)
-        storage._fsync_directory(destination.parent)
+        storage._seal_directory(stage)
+        storage._publish_directory_no_replace(stage, destination)
     except BaseException:
         if stage.exists():
             shutil.rmtree(stage)
@@ -1583,8 +1819,13 @@ def _procedural_family_id(clip: CanonicalClip) -> str | None:
 
 def _accepted_coverage_records(
     root: Path,
+    *,
+    model_snapshot: _FreezeModelSnapshot | None = None,
 ) -> tuple[coverage.AcceptedClipRecord, ...]:
-    manifest, clips, audit_index, reports = _load_audit_evidence(root)
+    manifest, clips, audit_index, reports = _load_audit_evidence(
+        root,
+        model_snapshot=model_snapshot,
+    )
     meshes = tuple(
         storage.read_mesh(root / record.relative_path)
         for record in manifest.meshes
@@ -1659,6 +1900,8 @@ def _publish_coverage(arguments: argparse.Namespace) -> None:
 
 def _load_coverage_evidence(
     root: Path,
+    *,
+    model_snapshot: _FreezeModelSnapshot | None = None,
 ) -> tuple[coverage.CoverageManifest, bytes]:
     path = root / "coverage.json"
     value, payload = _load_canonical_json(
@@ -1667,7 +1910,10 @@ def _load_coverage_evidence(
     )
     loaded = coverage.CoverageManifest.from_dict(value)
     expected = coverage.build_coverage(
-        _accepted_coverage_records(root)
+        _accepted_coverage_records(
+            root,
+            model_snapshot=model_snapshot,
+        )
     )
     if loaded.to_dict() != expected.to_dict():
         raise ContractError(
@@ -1676,12 +1922,221 @@ def _load_coverage_evidence(
     return loaded, payload
 
 
+def _stable_descriptor_bytes(descriptor: int, label: str) -> bytes:
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode):
+        raise ContractError(f"{label} is not a regular file")
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    after = os.fstat(descriptor)
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    payload = b"".join(chunks)
+    if before_identity != after_identity or len(payload) != after.st_size:
+        raise ContractError(f"{label} changed while it was snapshotted")
+    return payload
+
+
+def _snapshot_directory_nofollow(source: Path, destination: Path) -> None:
+    """Copy one exact tree through directory descriptors without following links."""
+
+    if destination.is_symlink() or not destination.is_dir():
+        raise ContractError("freeze snapshot destination must be a directory")
+    if any(destination.iterdir()):
+        raise ContractError("freeze snapshot destination must be empty")
+
+    def copy_directory(source_descriptor: int, target: Path) -> None:
+        names = sorted(os.listdir(source_descriptor))
+        for name in names:
+            if name in ("", ".", "..") or "/" in name:
+                raise ContractError("freeze source contains a noncanonical name")
+            before = os.stat(
+                name,
+                dir_fd=source_descriptor,
+                follow_symlinks=False,
+            )
+            output = target / name
+            if stat.S_ISDIR(before.st_mode):
+                os.mkdir(output, mode=0o700)
+                child_descriptor = os.open(
+                    name,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | os.O_CLOEXEC
+                    | os.O_NOFOLLOW,
+                    dir_fd=source_descriptor,
+                )
+                try:
+                    opened = os.fstat(child_descriptor)
+                    if (
+                        not stat.S_ISDIR(opened.st_mode)
+                        or (opened.st_dev, opened.st_ino)
+                        != (before.st_dev, before.st_ino)
+                    ):
+                        raise ContractError(
+                            "freeze source directory changed during snapshot"
+                        )
+                    copy_directory(child_descriptor, output)
+                    closed = os.fstat(child_descriptor)
+                    if (closed.st_dev, closed.st_ino) != (
+                        opened.st_dev,
+                        opened.st_ino,
+                    ):
+                        raise ContractError(
+                            "freeze source directory identity changed"
+                        )
+                finally:
+                    os.close(child_descriptor)
+                continue
+            if not stat.S_ISREG(before.st_mode):
+                raise ContractError(
+                    "freeze source contains a symlink or non-regular entry"
+                )
+            file_descriptor = os.open(
+                name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=source_descriptor,
+            )
+            try:
+                opened = os.fstat(file_descriptor)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or (opened.st_dev, opened.st_ino)
+                    != (before.st_dev, before.st_ino)
+                ):
+                    raise ContractError(
+                        "freeze source file changed during snapshot"
+                    )
+                payload = _stable_descriptor_bytes(
+                    file_descriptor,
+                    f"freeze source file {name}",
+                )
+            finally:
+                os.close(file_descriptor)
+            storage._write_no_replace(output, payload)
+        if sorted(os.listdir(source_descriptor)) != names:
+            raise ContractError(
+                "freeze source directory listing changed during snapshot"
+            )
+
+    source_descriptor = os.open(
+        source,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    try:
+        copy_directory(source_descriptor, destination)
+    finally:
+        os.close(source_descriptor)
+    for directory in sorted(
+        (path for path in destination.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        storage._fsync_directory(directory)
+    storage._fsync_directory(destination)
+
+
+def _snapshot_freeze_model(
+    corpus_snapshot: Path,
+    temporary_parent: Path,
+) -> _FreezeModelSnapshot:
+    index, _ = _load_canonical_json(
+        corpus_snapshot / "audit-index.json",
+        "freeze model audit index",
+    )
+    model_record = _normalized_model_record(
+        index.get("model"),
+        "freeze model audit authority",
+    )
+    model_path = _cli_input_file(
+        Path(str(model_record["asset_path"])),
+        "freeze mechanical model",
+    )
+    if str(model_path) != model_record["asset_path"]:
+        raise ContractError("freeze mechanical model path is not canonical")
+    model_payload = storage._read_regular_file_nofollow(model_path)
+    if (
+        len(model_payload) != model_record["asset_size_bytes"]
+        or hashlib.sha256(model_payload).hexdigest()
+        != model_record["asset_sha256"]
+    ):
+        raise ContractError("freeze mechanical model bytes are stale")
+    try:
+        import mujoco
+
+        source_model = mujoco.MjModel.from_xml_path(str(model_path))
+    except Exception as error:
+        raise ContractError(
+            "mechanical source model cannot be compiled for freeze"
+        ) from error
+    if storage._read_regular_file_nofollow(model_path) != model_payload:
+        raise ContractError(
+            "mechanical source model changed during freeze snapshot"
+        )
+    if (
+        structural_model_sha256(source_model)
+        != model_record["structural_sha256"]
+    ):
+        raise ContractError("freeze source model structural hash is stale")
+
+    descriptor, compiled_name = tempfile.mkstemp(
+        prefix=".terrain-oracle-model.",
+        suffix=".mjb",
+        dir=temporary_parent,
+    )
+    os.close(descriptor)
+    compiled_path = Path(compiled_name)
+    try:
+        mujoco.mj_saveModel(source_model, str(compiled_path))
+        compiled_payload = storage._read_regular_file_nofollow(
+            compiled_path
+        )
+        released_model = mujoco.MjModel.from_binary_path(
+            str(compiled_path)
+        )
+    except Exception as error:
+        raise ContractError(
+            "freeze MJB model snapshot cannot be produced or reloaded"
+        ) from error
+    finally:
+        compiled_path.unlink(missing_ok=True)
+    if (
+        not compiled_payload
+        or structural_model_sha256(released_model)
+        != model_record["structural_sha256"]
+    ):
+        raise ContractError("freeze MJB structural model hash is stale")
+    return _FreezeModelSnapshot(
+        asset_path=str(model_record["asset_path"]),
+        asset_payload=model_payload,
+        compiled_mjb_payload=compiled_payload,
+        model=released_model,
+    )
+
+
 def _freeze_source_paths(
     root: Path,
     manifest: storage.CorpusManifest,
     audit_index: dict[str, object],
 ) -> tuple[str, ...]:
     expected_files = {
+        storage.COMPLETION_MARKER,
         "manifest.json",
         "audit-index.json",
         "coverage.json",
@@ -1723,7 +2178,9 @@ def _freeze_source_paths(
         raise ContractError(
             "freeze source directories do not form the exact evidence set"
         )
-    return tuple(sorted(expected_files))
+    return tuple(
+        sorted(expected_files - {storage.COMPLETION_MARKER})
+    )
 
 
 def _frozen_file_record(path: Path, relative_path: str) -> dict[str, object]:
@@ -1842,7 +2299,11 @@ def _load_frozen_corpus(root: Path) -> dict[str, object]:
             actual_paths.add(relative_path)
         else:
             raise ContractError("frozen corpus contains a non-regular entry")
-    if actual_paths != {"freeze-index.json", *expected_paths}:
+    if actual_paths != {
+        storage.COMPLETION_MARKER,
+        "freeze-index.json",
+        *expected_paths,
+    }:
         raise ContractError("frozen corpus files do not form the exact set")
     expected_directories = {
         parent.as_posix()
@@ -1924,20 +2385,6 @@ def _freeze_corpus(arguments: argparse.Namespace) -> None:
     destination = _cli_output_path(arguments.output, "freeze output")
     if destination == root or root in destination.parents:
         raise ContractError("freeze output must not be inside its source corpus")
-    manifest, _, audit_index, _ = _load_audit_evidence(root)
-    _load_render_evidence(root)
-    _, coverage_payload = _load_coverage_evidence(root)
-    source_paths = _freeze_source_paths(root, manifest, audit_index)
-    model_record = audit_index["model"]
-    model_source = Path(str(model_record["asset_path"]))
-    try:
-        import mujoco
-
-        source_model = mujoco.MjModel.from_xml_path(str(model_source))
-    except Exception as error:
-        raise ContractError(
-            "mechanical source model cannot be compiled for freeze"
-        ) from error
     destination.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(
         tempfile.mkdtemp(
@@ -1946,18 +2393,31 @@ def _freeze_corpus(arguments: argparse.Namespace) -> None:
         )
     )
     try:
-        for relative_path in source_paths:
-            storage._write_no_replace(
-                stage / relative_path,
-                (root / relative_path).read_bytes(),
-            )
-        compiled_temporary = stage / ".compiled-model.mjb"
-        mujoco.mj_saveModel(
-            source_model,
-            str(compiled_temporary),
+        _snapshot_directory_nofollow(root, stage)
+        model_snapshot = _snapshot_freeze_model(
+            stage,
+            destination.parent,
         )
-        model_payload = compiled_temporary.read_bytes()
-        compiled_temporary.unlink()
+        manifest, _, audit_index, _ = _load_audit_evidence(
+            stage,
+            model_snapshot=model_snapshot,
+        )
+        _load_render_evidence(
+            stage,
+            model_snapshot=model_snapshot,
+        )
+        _, coverage_payload = _load_coverage_evidence(
+            stage,
+            model_snapshot=model_snapshot,
+        )
+        source_paths = _freeze_source_paths(
+            stage,
+            manifest,
+            audit_index,
+        )
+        model_record = audit_index["model"]
+        (stage / storage.COMPLETION_MARKER).unlink()
+        model_payload = model_snapshot.compiled_mjb_payload
         model_sha256 = hashlib.sha256(model_payload).hexdigest()
         model_relative_path = f"model/{model_sha256}.mjb"
         storage._write_no_replace(
@@ -1974,13 +2434,17 @@ def _freeze_corpus(arguments: argparse.Namespace) -> None:
             "schema": "terrain-oracle-frozen-corpus/v1",
             "source": {
                 "corpus_manifest_sha256": hashlib.sha256(
-                    (root / "manifest.json").read_bytes()
+                    (stage / "manifest.json").read_bytes()
                 ).hexdigest(),
                 "audit_index_sha256": hashlib.sha256(
-                    (root / "audit-index.json").read_bytes()
+                    (stage / "audit-index.json").read_bytes()
                 ).hexdigest(),
                 "render_index_sha256": hashlib.sha256(
-                    (root / "render-audit" / "render-index.json").read_bytes()
+                    (
+                        stage
+                        / "render-audit"
+                        / "render-index.json"
+                    ).read_bytes()
                 ).hexdigest(),
                 "coverage_sha256": hashlib.sha256(
                     coverage_payload
@@ -2011,16 +2475,15 @@ def _freeze_corpus(arguments: argparse.Namespace) -> None:
                 "frozen corpus index",
             ),
         )
-        _verify_frozen_stage(stage, index)
         for path in sorted(
             (path for path in stage.rglob("*") if path.is_dir()),
             key=lambda path: len(path.parts),
             reverse=True,
         ):
             storage._fsync_directory(path)
-        storage._fsync_directory(stage)
-        storage._rename_noreplace(stage, destination)
-        storage._fsync_directory(destination.parent)
+        storage._seal_directory(stage)
+        _verify_frozen_stage(stage, index)
+        storage._publish_directory_no_replace(stage, destination)
     except BaseException:
         if stage.exists():
             shutil.rmtree(stage)
@@ -2314,15 +2777,39 @@ def _grail_inventory(
             metadata_path,
             metadata_path.relative_to(root).as_posix(),
         )
+        robot_identity = _file_identity(
+            record.robot_path,
+            record.robot_path.relative_to(root).as_posix(),
+        )
+        terrain_identity = _file_identity(
+            record.usd_path,
+            record.usd_path.relative_to(root).as_posix(),
+        )
         output_records.append(
             {
                 "family": record.family,
                 "stem": record.stem,
                 "frame_count": record.n_frames,
-                "robot_path": str(record.robot_path.resolve()),
-                "robot_size_bytes": record.robot_path.stat().st_size,
-                "terrain_path": str(record.usd_path.resolve()),
-                "terrain_size_bytes": record.usd_path.stat().st_size,
+                "robot": {
+                    **robot_identity,
+                    "path": str(record.robot_path.resolve()),
+                    "license_id": "UNRECORDED",
+                },
+                "terrain": {
+                    **terrain_identity,
+                    "path": str(record.usd_path.resolve()),
+                    "license_id": "UNRECORDED",
+                    "world_from_terrain": {
+                        "translation_world": np.asarray(
+                            record.terrain_position_env,
+                            dtype=np.float32,
+                        ).tolist(),
+                        "quaternion_world_from_local_wxyz": np.asarray(
+                            record.terrain_rotation_env_wxyz,
+                            dtype=np.float32,
+                        ).tolist(),
+                    },
+                },
                 "shard_metadata": metadata,
                 "pose_source": record.pose_source,
             }
@@ -2477,6 +2964,11 @@ def _parser() -> argparse.ArgumentParser:
         "--renderer-arg",
         action="append",
         default=[],
+    )
+    render_parser.add_argument(
+        "--renderer-timeout-seconds",
+        type=float,
+        default=300.0,
     )
     render_parser.add_argument("--output", type=Path, required=True)
     render_parser.set_defaults(handler=_render_interval_receipts)

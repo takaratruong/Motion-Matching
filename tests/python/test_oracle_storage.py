@@ -13,7 +13,9 @@ from mm_sonic.joints import ContractError
 from mm_sonic.terrain_oracle.canonical import CanonicalTerrainMesh, TerrainBinding
 from mm_sonic.terrain_oracle.math3d import RigidTransform
 from mm_sonic.terrain_oracle.storage import (
+    COMPLETION_MARKER,
     MeshRecord,
+    _seal_directory,
     clip_digest,
     load_corpus,
     publish_corpus,
@@ -191,9 +193,13 @@ class OracleStorageTests(unittest.TestCase):
                 forged = json.loads(json.dumps(original))
                 forged[collection][0]["relative_path"] = path
                 manifest_path.write_text(json.dumps(forged), "ascii")
+                (corpus_path / COMPLETION_MARKER).unlink()
+                _seal_directory(corpus_path)
                 with self.assertRaisesRegex(ContractError, "relative_path"):
                     load_corpus(corpus_path)
         manifest_path.write_text(json.dumps(original), "ascii")
+        (corpus_path / COMPLETION_MARKER).unlink()
+        _seal_directory(corpus_path)
 
     def test_publish_corpus_validates_direct_mesh_records_before_creating_output(self):
         """Catches direct records bypassing the manifest record-path contract."""

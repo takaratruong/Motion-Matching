@@ -1131,7 +1131,19 @@ def freeze_coverage(path: Path, manifest: CoverageManifest) -> None:
             stream.write(_json_bytes(manifest.to_dict()))
             stream.flush()
             os.fsync(stream.fileno())
-        _rename_noreplace(temporary, path)
+        try:
+            _rename_noreplace(temporary, path)
+        except OSError as error:
+            if error.errno not in (errno.EINVAL, errno.ENOTSUP):
+                raise
+            try:
+                os.link(
+                    temporary,
+                    path,
+                    follow_symlinks=False,
+                )
+            finally:
+                temporary.unlink(missing_ok=True)
         _fsync_directory(path.parent)
     except BaseException:
         temporary.unlink(missing_ok=True)
