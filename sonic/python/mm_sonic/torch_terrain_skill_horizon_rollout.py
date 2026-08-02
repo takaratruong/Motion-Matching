@@ -126,6 +126,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         terrain_tolerance_m: float = 0.06,
         result_filter: Any | None = None,
         contact_phase_gate: bool = False,
+        turning_clip_paths: frozenset[str] | None = None,
     ) -> None:
         self.base = base_matcher
         self.database = base_matcher.database
@@ -146,6 +147,16 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         if type(contact_phase_gate) is not bool:
             raise ContractError("contact phase gate must be boolean")
         self.contact_phase_gate = contact_phase_gate
+        if turning_clip_paths is not None and (
+            not isinstance(turning_clip_paths, frozenset)
+            or not turning_clip_paths
+            or any(
+                not isinstance(path, str) or not path
+                for path in turning_clip_paths
+            )
+        ):
+            raise ContractError("turning clip paths must be a non-empty frozenset")
+        self.turning_clip_paths = turning_clip_paths
         self._clip_path_to_index = {
             clip.relative_path: index
             for index, clip in enumerate(dataset.folder.clips)
@@ -219,6 +230,11 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             current_root_yaw=current_yaw,
             query_terrain=self.query_terrain,
         )
+        desired_turning_by_frames = {
+            int(frame.item()): abs(float(yaw.item()))
+            >= self.search_config.turn_gate_rad
+            for frame, yaw in zip(targets.frames, targets.yaw_delta_rad)
+        }
 
         current_clip: int | None = None
         current_frame: int | None = None
@@ -249,6 +265,18 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         ) -> bool:
             skill_index = int(self.horizon_inventory.skill_index[record].item())
             skill = self.inventory.skills[skill_index]
+            if self.turning_clip_paths is not None:
+                target_frames = int(
+                    self.horizon_inventory.target_frames[record].item()
+                )
+                clip_path = self.dataset.folder.clips[
+                    skill.clip_index
+                ].relative_path
+                if (
+                    desired_turning_by_frames[target_frames]
+                    and clip_path not in self.turning_clip_paths
+                ):
+                    return False
             if require_phase and current_support is not None:
                 entry_frame = int(
                     self.horizon_inventory.entry_frame[record].item()
@@ -373,6 +401,7 @@ def run_resolved_horizon_matrix(
     swing_plan_sigma_frames: float | None = None,
     maximum_source_contact_p95_m: float | None = None,
     normalization_source: str | None = None,
+    turning_source_corpus: str | None = None,
 ):
     """Run the renderer-independent route harness with horizon skill MM."""
 
@@ -408,6 +437,15 @@ def run_resolved_horizon_matrix(
         normalization_override = source_database.normalization
         normalization_identity = source_folder.inventory_sha256
         del source_database, source_folder
+    turning_clip_paths = None
+    turning_identity = "all"
+    if turning_source_corpus is not None:
+        turning_folder = MotionFolder.load(turning_source_corpus)
+        turning_clip_paths = frozenset(
+            clip.relative_path for clip in turning_folder.clips
+        )
+        turning_identity = turning_folder.inventory_sha256
+        del turning_folder
     base = TorchMotionMatcher.from_folder(
         resolved.dataset.root,
         device=str(resolved.device),
@@ -509,6 +547,7 @@ def run_resolved_horizon_matrix(
                 else ":all-source-contact-quality"
             )
             + f":normalization:{normalization_identity}"
+            + f":turning-source:{turning_identity}"
         ).encode()
     ).hexdigest()
 
@@ -525,6 +564,7 @@ def run_resolved_horizon_matrix(
             terrain_tolerance_m=terrain_tolerance_m,
             result_filter=result_filter,
             contact_phase_gate=contact_phase_gate,
+            turning_clip_paths=turning_clip_paths,
         )
         route_matchers[route.name] = matcher
         return matcher
