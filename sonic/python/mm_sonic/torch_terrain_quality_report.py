@@ -29,6 +29,7 @@ from .torch_terrain_action_quality import (
 )
 from .torch_terrain_quality_artifacts import analyze_saved_route
 from .torch_terrain_quality_oracle import (
+    QualityActionCache,
     QualityCandidateScore,
     QualityOracleResult,
     build_quality_action_cache,
@@ -96,6 +97,110 @@ def derive_native_thresholds(
             [value.boundary_motion for value in samples]
         ),
         sample_count=len(samples),
+    )
+
+
+def selected_source_acceptance(
+    *,
+    selected_clip_path: str,
+    selected_source_frame: int,
+    clip_paths: Mapping[int, str],
+    qualities: Sequence[NativeActionQuality],
+    thresholds: NativeQualityThresholds,
+) -> tuple[bool, int]:
+    """Judge only source actions containing the selected source frame."""
+
+    if not isinstance(thresholds, NativeQualityThresholds):
+        raise ValueError("selected source thresholds are invalid")
+    matches = tuple(
+        quality
+        for quality in qualities
+        if not quality.source_key[3]
+        and clip_paths.get(quality.source_key[0]) == selected_clip_path
+        and quality.source_key[1] <= selected_source_frame < quality.source_key[2]
+    )
+    if not matches:
+        return True, 0
+    acceptable = any(
+        quality.source_stance_drift_m <= thresholds.stance_drift_m
+        and max(quality.entry_joint_speed_norm, quality.terminal_joint_speed_norm)
+        <= thresholds.boundary_motion
+        for quality in matches
+    )
+    return acceptable, len(matches)
+
+
+def _native_target_candidates(
+    *,
+    state,
+    desired_landing_world_xyz: np.ndarray,
+    command_target_world_xy: np.ndarray,
+    cache: QualityActionCache,
+    qualities: Sequence[NativeActionQuality],
+    thresholds: NativeQualityThresholds,
+) -> set[int]:
+    device = cache.terminal_foot_local.device
+    dtype = cache.terminal_foot_local.dtype
+    yaw = torch.as_tensor(state.root_yaw_world, dtype=dtype, device=device)
+    cosine, sine = torch.cos(yaw), torch.sin(yaw)
+
+    def rotate(values: torch.Tensor) -> torch.Tensor:
+        return torch.stack(
+            (
+                cosine * values[..., 0] - sine * values[..., 1],
+                sine * values[..., 0] + cosine * values[..., 1],
+            ),
+            dim=-1,
+        )
+
+    root = torch.as_tensor(
+        np.array(state.root_position_world, copy=True), dtype=dtype, device=device
+    )
+    desired = torch.as_tensor(desired_landing_world_xyz, dtype=dtype, device=device)
+    target = torch.as_tensor(command_target_world_xy, dtype=dtype, device=device)
+    landing_xy = rotate(cache.terminal_foot_local[:, :2]) + root[None, :2]
+    landing_z = cache.terminal_foot_local[:, 2] + root[2]
+    landing = torch.cat((landing_xy, landing_z[:, None]), dim=1)
+    terminal_root = rotate(cache.terminal_root_local_xy) + root[None, :2]
+    facing_delta = (
+        cache.terminal_yaw_local + yaw - float(state.command_heading_world_yaw)
+    )
+    boundary = torch.tensor(
+        [
+            max(quality.entry_joint_speed_norm, quality.terminal_joint_speed_norm)
+            for quality in qualities
+        ],
+        dtype=dtype,
+        device=device,
+    )
+    stance = torch.tensor(
+        [quality.source_stance_drift_m for quality in qualities],
+        dtype=dtype,
+        device=device,
+    )
+    support = torch.as_tensor(
+        np.array(state.source_support_mask, copy=True),
+        dtype=torch.bool,
+        device=device,
+    )
+    accepted = (
+        (cache.entry_support == support[None]).all(dim=1)
+        & (torch.linalg.vector_norm(landing - desired[None], dim=1) <= 0.12)
+        & (torch.linalg.vector_norm(terminal_root - target[None], dim=1) <= 0.25)
+        & (
+            torch.abs(torch.atan2(torch.sin(facing_delta), torch.cos(facing_delta)))
+            <= 0.60
+        )
+        & (stance <= thresholds.stance_drift_m)
+        & (boundary <= thresholds.boundary_motion)
+    )
+    return set(
+        int(value)
+        for value in torch.nonzero(accepted, as_tuple=False)
+        .flatten()
+        .detach()
+        .cpu()
+        .tolist()
     )
 
 
@@ -334,6 +439,10 @@ def run_quality_oracle(
     qualities = build_native_quality_index(index)
     quality_cache = build_quality_action_cache(index)
     thresholds = _native_thresholds(qualities)
+    clip_lookup = {
+        clip_index: str(clip.relative_path)
+        for clip_index, clip in enumerate(contact_resolved.dataset.folder.clips)
+    }
     measurement = baseline_resolved.measurement_extension
 
     def sample_surface(points: torch.Tensor) -> torch.Tensor:
@@ -458,33 +567,28 @@ def run_quality_oracle(
                 )
                 for action_index in selected_indices
             }
-            native_count = sum(
-                tuple(bool(value) for value in quality.entry_support)
-                == tuple(bool(value) for value in state.source_support_mask)
-                and quality.source_stance_drift_m <= thresholds.stance_drift_m
-                and max(
-                    quality.entry_joint_speed_norm,
-                    quality.terminal_joint_speed_norm,
-                )
-                <= thresholds.boundary_motion
-                for quality in qualities
+            native_target = _native_target_candidates(
+                state=state,
+                desired_landing_world_xyz=desired,
+                command_target_world_xy=command_target,
+                cache=quality_cache,
+                qualities=qualities,
+                thresholds=thresholds,
             )
-            placed_count = ranking.evaluated_action_count - sum(
-                ranking.rejected_by_reason.values()
-            )
+            placed_good = {
+                row.action_index
+                for row in ranking.best_landing
+                if row.action_index in native_target and row.landing_error_m <= 0.12
+            }
             composed_good = {
                 action_index
                 for action_index, preview in previews.items()
-                if preview.composed.source_stance_drift_m
-                <= max(0.01, thresholds.stance_drift_m)
+                if action_index in placed_good
+                and preview.composed.source_stance_drift_m <= 0.03
                 and preview.composed.joint_boundary_jump_rad
                 <= experiment.search.constraints.maximum_joint_position_error_rad
                 and preview.composed.joint_velocity_boundary_jump_rad_s
                 <= experiment.search.constraints.maximum_joint_velocity_error_rad_s
-            }
-            clip_lookup = {
-                clip_index: str(clip.relative_path)
-                for clip_index, clip in enumerate(index.actions and contact_resolved.dataset.folder.clips)
             }
             baseline_good = any(
                 action_index in composed_good
@@ -498,13 +602,18 @@ def run_quality_oracle(
             two_step_count = sum(
                 row.action_index in composed_good for row in ranking.best_two_step
             )
+            source_acceptable, source_action_count = selected_source_acceptance(
+                selected_clip_path=state.selected_clip_path,
+                selected_source_frame=state.selected_source_frame,
+                clip_paths=clip_lookup,
+                qualities=qualities,
+                thresholds=thresholds,
+            )
             evidence = StateClassificationEvidence(
                 state_id=state.state_id,
-                source_acceptable=(
-                    route_quality.metrics.contact_agreement_fraction >= 0.5
-                ),
-                native_acceptable_count=native_count,
-                placed_acceptable_count=placed_count,
+                source_acceptable=source_acceptable,
+                native_acceptable_count=len(native_target),
+                placed_acceptable_count=len(placed_good),
                 composed_acceptable_count=len(composed_good),
                 baseline_selected_acceptable=baseline_good,
                 two_step_acceptable_count=two_step_count,
@@ -513,6 +622,11 @@ def run_quality_oracle(
                     "native_stance_threshold_m": thresholds.stance_drift_m,
                     "native_boundary_threshold": thresholds.boundary_motion,
                     "planned_foothold_count": int(footholds.score.numel()),
+                    "source_action_count": source_action_count,
+                    "target_landing_tolerance_m": 0.12,
+                    "target_displacement_tolerance_m": 0.25,
+                    "target_facing_tolerance_rad": 0.60,
+                    "composed_stance_drift_tolerance_m": 0.03,
                 },
             )
             key_arrays = {}

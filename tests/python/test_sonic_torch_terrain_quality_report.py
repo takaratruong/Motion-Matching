@@ -1,11 +1,15 @@
 import unittest
 
+import numpy as np
+
 from mm_sonic.torch_terrain_quality_report import (
     NativeCorpusSample,
     StateClassificationEvidence,
     classify_state,
     derive_native_thresholds,
+    selected_source_acceptance,
 )
+from mm_sonic.torch_terrain_action_quality import NativeActionQuality
 
 
 def _evidence(**changes):
@@ -65,6 +69,48 @@ class TerrainQualityReportTests(unittest.TestCase):
         self.assertEqual(evidence.trigger_metrics["landing_error_m"], 0.01)
         with self.assertRaises(TypeError):
             evidence.trigger_metrics["new"] = 1.0
+
+    def test_source_label_uses_selected_native_action_not_route_disagreement(self):
+        def quality(drift):
+            return NativeActionQuality(
+                action_index=0,
+                source_key=(3, 10, 20, False),
+                entry_support=(True, False),
+                swing_foot=1,
+                landing_frame_offset=9,
+                natural_landing_local_xyz=np.zeros(3),
+                root_displacement_local_xy=np.zeros(2),
+                root_yaw_delta_rad=0.0,
+                source_stance_drift_m=drift,
+                minimum_swing_clearance_m=0.05,
+                entry_joint_speed_norm=1.0,
+                terminal_joint_speed_norm=1.0,
+                exact_successor_index=None,
+            )
+
+        thresholds = derive_native_thresholds(
+            (NativeCorpusSample(0.01, 1.0), NativeCorpusSample(0.02, 2.0))
+        )
+        self.assertEqual(
+            selected_source_acceptance(
+                selected_clip_path="clip.npz",
+                selected_source_frame=15,
+                clip_paths={3: "clip.npz"},
+                qualities=(quality(0.50),),
+                thresholds=thresholds,
+            ),
+            (False, 1),
+        )
+        self.assertEqual(
+            selected_source_acceptance(
+                selected_clip_path="other.npz",
+                selected_source_frame=15,
+                clip_paths={3: "clip.npz"},
+                qualities=(quality(0.50),),
+                thresholds=thresholds,
+            ),
+            (True, 0),
+        )
 
 
 if __name__ == "__main__":
