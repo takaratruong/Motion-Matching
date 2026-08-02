@@ -153,6 +153,14 @@ identical SHA-256
   routes, raised aggregate slide above 3.3 m, and produced root-jerk maxima
   above 3,600 m/s^3. Root reconstruction must be solved over a whole contact
   interval with continuity constraints, not applied as a frame-local offset.
+- Carrying the absolute integrated command path across skill boundaries was
+  rejected and removed. It dropped the frozen gate from 6/6 to 3/6 and the
+  broad matrix from 16/21 to 8/21. The clips contain systematic root drift
+  that is compatible with their contacts and the route contracts; treating
+  the raw command integral as an exact global path over-pulled the selector,
+  losing cross-tread, turn, mount, and mixed routes. The experiment confirms
+  that the contact-graph oracle's route cost does not transfer as a hard
+  displacement-target shift in the live matcher.
 
 ## Literature alignment
 
