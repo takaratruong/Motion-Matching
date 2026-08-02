@@ -8,7 +8,6 @@ from mm_sonic.torch_motion_features import FeatureNormalization, TorchMotionData
 from mm_sonic.torch_motion_matcher import MatcherConfig
 from mm_sonic.torch_terrain_skill_horizon_rollout import (
     TerrainSkillHorizonMatcher,
-    route_anchored_targets,
     terrain_height_targets,
 )
 from mm_sonic.torch_terrain_skill_horizon_search import HorizonTargets
@@ -44,9 +43,7 @@ class _FootKinematics:
         return np.repeat(root[:, None, :], 2, axis=1)
 
 
-def _transactional_fixture(
-    *, result_filter=None, contact_phase_gate=False, route_anchor=False
-):
+def _transactional_fixture(*, result_filter=None, contact_phase_gate=False):
     frames = 80
     body_position = np.zeros((frames, 3, 3), dtype=np.float32)
     body_position[:, :, 0] = np.arange(frames, dtype=np.float32)[:, None] * 0.01
@@ -136,47 +133,11 @@ def _transactional_fixture(
         config=MatcherConfig(),
         result_filter=result_filter,
         contact_phase_gate=contact_phase_gate,
-        route_anchor=route_anchor,
     )
     return matcher, grid
 
 
 class TerrainSkillHorizonRolloutTest(unittest.TestCase):
-    def test_route_anchor_adds_accumulated_world_error_in_current_frame(self):
-        targets = HorizonTargets(
-            frames=torch.tensor([25, 50, 100]),
-            displacement_local_xy=torch.tensor(
-                [[0.5, 0.0], [1.0, 0.0], [2.0, 0.0]]
-            ),
-            yaw_delta_rad=torch.zeros(3),
-            root_height_delta_m=torch.zeros(3),
-            surface_height_delta_m=torch.zeros((3, 2)),
-        )
-
-        anchored = route_anchored_targets(
-            targets,
-            current_root_position_world=torch.tensor([1.0, 1.0, 0.8]),
-            current_root_yaw=torch.tensor(torch.pi / 2.0),
-            route_target_world_xy=torch.tensor([2.0, 1.0]),
-        )
-
-        expected = targets.displacement_local_xy + torch.tensor([0.0, -1.0])
-        self.assertTrue(
-            torch.allclose(anchored.displacement_local_xy, expected, atol=1e-6)
-        )
-
-    def test_route_anchor_integrates_shaped_command_from_reset_origin(self):
-        matcher, _grid = _transactional_fixture(route_anchor=True)
-        reset = matcher.reset(root_position_world_xy=(1.0, 2.0))
-
-        prepared = matcher.prepare_step((0.5, 0.0), 0.0)
-        matcher.commit(prepared)
-
-        expected = reset.root_position_world[:2] + (
-            matcher._shaped_velocity * matcher.config.dt
-        )
-        self.assertTrue(torch.allclose(matcher._route_target_world_xy, expected))
-
     def test_contact_phase_gate_is_explicit(self):
         matcher, _grid = _transactional_fixture(contact_phase_gate=True)
 
