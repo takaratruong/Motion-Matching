@@ -11,6 +11,7 @@ import numpy as np
 from mm_sonic.joints import ContractError
 import mm_sonic.terrain_oracle.audit as audit_module
 from mm_sonic.terrain_oracle.audit import (
+    AuditReason,
     AuditThresholds,
     audit_clip,
     structural_model_sha256,
@@ -644,12 +645,19 @@ class OracleAuditTests(unittest.TestCase):
         """Catches a model hash that covers names but not collision mechanics."""
 
         original = structural_model_sha256(self.model)
-        changed = self.mujoco.MjModel.from_xml_path(str(MODEL_PATH))
-        changed.geom_pos[0, 2] -= 0.001
-        self.assertNotEqual(original, structural_model_sha256(changed))
-        changed_range = self.mujoco.MjModel.from_xml_path(str(MODEL_PATH))
-        changed_range.jnt_range[1, 0] -= 0.001
-        self.assertNotEqual(original, structural_model_sha256(changed_range))
+        for field, index in (
+            ("body_pos", (1, 2)),
+            ("body_quat", (1, 0)),
+            ("jnt_pos", (1, 2)),
+            ("jnt_axis", (1, 0)),
+            ("qpos0", (7,)),
+            ("geom_pos", (0, 2)),
+            ("jnt_range", (1, 0)),
+        ):
+            with self.subTest(field=field):
+                changed = self.mujoco.MjModel.from_xml_path(str(MODEL_PATH))
+                getattr(changed, field)[index] += 0.001
+                self.assertNotEqual(original, structural_model_sha256(changed))
 
     def test_mesh_collision_uses_exact_triangle_crossing_and_finite_broadphase(self):
         """Catches vertex-only collision and infinite supporting-plane false hits."""
@@ -667,11 +675,37 @@ class OracleAuditTests(unittest.TestCase):
             ]],
             np.float64,
         )
-        self.assertGreater(
+        self.assertAlmostEqual(
             audit_module._triangle_surface_penetration(
                 crossing, terrain, normals, minimum, maximum, 1.0e-9
             ),
-            0.0,
+            0.02,
+            delta=1.0e-7,
+        )
+        angle = 0.47
+        rotation = np.asarray(
+            (
+                (1.0, 0.0, 0.0),
+                (0.0, np.cos(angle), -np.sin(angle)),
+                (0.0, np.sin(angle), np.cos(angle)),
+            ),
+            np.float64,
+        )
+        translation = np.asarray((0.3, -0.4, 1.2), np.float64)
+        sloped_terrain = terrain @ rotation.T + translation
+        sloped_crossing = crossing @ rotation.T + translation
+        sloped_normals = normals @ rotation.T
+        self.assertAlmostEqual(
+            audit_module._triangle_surface_penetration(
+                sloped_crossing,
+                sloped_terrain,
+                sloped_normals,
+                np.min(sloped_terrain, axis=1),
+                np.max(sloped_terrain, axis=1),
+                1.0e-9,
+            ),
+            0.02,
+            delta=1.0e-7,
         )
 
         outside = crossing + np.array((3.0, 0.0, 0.0), np.float64)
@@ -698,6 +732,12 @@ class OracleAuditTests(unittest.TestCase):
         validator = Draft202012Validator(schema)
         document = audit_clip(self.clip, self.model, self.query).to_dict()
         validator.validate(document)
+        short_document = audit_clip(
+            _real_clean_clip(self.model, self.query, frames=6),
+            self.model,
+            self.query,
+        ).to_dict()
+        validator.validate(short_document)
         mutations = []
         extra = json.loads(json.dumps(document))
         extra["extra"] = 1
@@ -720,6 +760,19 @@ class OracleAuditTests(unittest.TestCase):
         accepted_without_interval = json.loads(json.dumps(document))
         accepted_without_interval["accepted_intervals"] = []
         mutations.append(accepted_without_interval)
+        invalid_reason_span = json.loads(json.dumps(document))
+        invalid_reason_span["status"] = "rejected"
+        invalid_reason_span["accepted_intervals"] = []
+        invalid_reason_span["reasons"] = [
+            {
+                "code": "joint_limit",
+                "severity": "error",
+                "frame_interval": [0, 0],
+                "observed_maximum": 1.0,
+                "threshold": 0.0,
+            }
+        ]
+        mutations.append(invalid_reason_span)
         for mutation in mutations:
             with self.subTest(mutation=mutation):
                 self.assertFalse(validator.is_valid(mutation))
@@ -799,6 +852,107 @@ class AuditAuthorityRegressionTests(unittest.TestCase):
             with self.subTest(mutation=mutation):
                 with self.assertRaises(ContractError):
                     type(report).from_dict(mutation)
+
+        for span in ((5, 4), (0, report.frame_count + 1)):
+            changed = json.loads(json.dumps(document))
+            changed["status"] = "rejected"
+            changed["accepted_intervals"] = []
+            changed["reasons"] = [
+                {
+                    "code": "joint_limit",
+                    "severity": "error",
+                    "frame_interval": list(span),
+                    "observed_maximum": 1.0,
+                    "threshold": 0.0,
+                }
+            ]
+            with self.subTest(reason_span=span):
+                with self.assertRaises(ContractError):
+                    type(report).from_dict(changed)
+
+        out_of_range_reason = AuditReason(
+            "joint_limit",
+            "error",
+            (0, report.frame_count + 1),
+            1.0,
+            0.0,
+        )
+        with self.assertRaises(ContractError):
+            replace(
+                report,
+                status="rejected",
+                accepted_intervals=(),
+                reasons=(out_of_range_reason,),
+            )
+
+    def test_clean_short_clip_is_rejected_with_structured_reason(self):
+        clip = _real_clean_clip(self.model, self.query, frames=6)
+        report = audit_clip(clip, self.model, self.query)
+        self.assertEqual(report.status, "rejected")
+        self.assertEqual(_reason_codes(report), {"interval_too_short"})
+        self.assertEqual(report.reasons[0].frame_interval, (0, 6))
+        self.assertEqual(report.reasons[0].observed_maximum, 6.0)
+        self.assertEqual(report.reasons[0].threshold, 8.0)
+        self.assertEqual(
+            report,
+            audit_clip(clip, self.model, self.query),
+        )
+        self.assertEqual(type(report).from_dict(report.to_dict()), report)
+
+        joint = np.array(clip.joint_position, copy=True)
+        joint[:, 0] = (
+            self.model.jnt_range[
+                self.model.joint(ISAACLAB_JOINT_NAMES[0]).id, 1
+            ]
+            + 0.1
+        )
+        corrupt = audit_clip(
+            _rederive_real_fk(
+                self.model, replace(clip, joint_position=joint)
+            ),
+            self.model,
+            self.query,
+        )
+        self.assertIn("joint_limit", _reason_codes(corrupt))
+
+    def test_real_g1_finite_overlap_depth_emits_body_penetration(self):
+        model = self.mujoco.MjModel.from_xml_path(str(MODEL_PATH))
+        geom = next(
+            index
+            for index in range(model.ngeom)
+            if model.body(int(model.geom_bodyid[index])).name == "pelvis"
+            and int(model.geom_contype[index]) != 0
+        )
+        model.geom_type[geom] = 6
+        model.geom_size[geom] = (0.10, 0.10, 0.10)
+        model.geom_quat[geom] = (1.0, 0.0, 0.0, 0.0)
+        clip = _real_clean_clip(model, self.query, frames=8)
+        model.geom_pos[geom] = (
+            0.0,
+            0.0,
+            0.08 - float(clip.root_position_world[0, 2]),
+        )
+        terrain = CanonicalTerrainMesh(
+            vertices_local=np.asarray(
+                ((-0.02, -0.02, 0.0), (0.02, -0.02, 0.0), (0.0, 0.02, 0.0)),
+                np.float32,
+            ),
+            faces=np.asarray(((0, 1, 2),), np.int32),
+            valid_faces=np.asarray((True,)),
+            source_asset_sha256="c" * 64,
+        )
+        query = CanonicalMeshQuery(terrain, _identity_transform())
+        clip = replace(
+            clip,
+            terrain=replace(
+                clip.terrain,
+                asset_sha256=query.source_asset_sha256,
+                mesh_sha256=query.mesh_sha256,
+            ),
+        )
+        report = audit_clip(clip, model, query)
+        self.assertGreater(report.metrics["max_body_penetration_m"], 0.005)
+        self.assertIn("body_penetration", _reason_codes(report))
 
 
 class StageBCollisionRegressionTests(unittest.TestCase):
@@ -885,16 +1039,33 @@ class StageBCollisionRegressionTests(unittest.TestCase):
         normals = np.broadcast_to(
             np.asarray((0.0, 0.0, 1.0)), (len(terrain), 3)
         )
-        started = time.perf_counter()
+        candidate_started = time.perf_counter()
         pairs = audit_module._bvh_candidate_pairs(
             robot, terrain, normals, 1.0e-9
         )
-        elapsed = time.perf_counter() - started
+        candidate_elapsed = time.perf_counter() - candidate_started
+        narrowphase_started = time.perf_counter()
+        depth = audit_module._triangle_surface_penetration(
+            robot,
+            terrain,
+            normals,
+            np.min(terrain, axis=1),
+            np.max(terrain, axis=1),
+            1.0e-9,
+            pairs,
+        )
+        narrowphase_elapsed = time.perf_counter() - narrowphase_started
+        repeated_pairs = audit_module._bvh_candidate_pairs(
+            robot, terrain, normals, 1.0e-9
+        )
         brute_force_pairs = len(robot) * len(terrain)
         self.assertEqual(len(robot), 17096)
         self.assertEqual(len(terrain), 800)
+        self.assertEqual(len(pairs), 23944)
+        self.assertTrue(np.array_equal(pairs, repeated_pairs))
         self.assertLess(len(pairs), brute_force_pairs // 20)
-        self.assertLess(elapsed, 1.059)
+        self.assertTrue(np.isfinite(depth))
+        self.assertLess(candidate_elapsed + narrowphase_elapsed, 5.0)
 
 
 if __name__ == "__main__":

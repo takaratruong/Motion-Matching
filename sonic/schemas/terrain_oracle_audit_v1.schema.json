@@ -376,6 +376,7 @@
             "foot_penetration",
             "body_penetration",
             "body_fk_mismatch",
+            "interval_too_short",
             "terrain_registration",
             "model_registration",
             "source_registration"

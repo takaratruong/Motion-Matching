@@ -38,6 +38,7 @@ _REASON_CODES = frozenset(
         "foot_penetration",
         "body_penetration",
         "body_fk_mismatch",
+        "interval_too_short",
         "terrain_registration",
         "model_registration",
         "source_registration",
@@ -278,6 +279,12 @@ class ClipAudit:
         reasons = tuple(self.reasons)
         if any(not isinstance(reason, AuditReason) for reason in reasons):
             raise ContractError("audit reasons must be AuditReason values")
+        for reason in reasons:
+            _interval(
+                reason.frame_interval,
+                self.frame_count,
+                "reason frame_interval",
+            )
         full_clip = intervals == (AuditInterval(0, self.frame_count),)
         if self.status == "accepted" and (not full_clip or reasons):
             raise ContractError(
@@ -412,12 +419,17 @@ def structural_model_sha256(model: object) -> str:
             _update_hash_text(digest, name)
     arrays = (
         ("body_parentid", np.int64),
+        ("body_pos", np.float64),
+        ("body_quat", np.float64),
         ("jnt_type", np.int64),
         ("jnt_bodyid", np.int64),
         ("jnt_qposadr", np.int64),
         ("jnt_dofadr", np.int64),
+        ("jnt_pos", np.float64),
+        ("jnt_axis", np.float64),
         ("jnt_limited", np.int64),
         ("jnt_range", np.float64),
+        ("qpos0", np.float64),
         ("geom_bodyid", np.int64),
         ("geom_type", np.int64),
         ("geom_dataid", np.int64),
@@ -1376,54 +1388,148 @@ def _triangle_candidate_mask(
     return overlap_xy & np.where(upward, below_upward_surface, vertical_overlap)
 
 
-def _closest_points_to_triangle_batch(
-    points: np.ndarray, triangle: np.ndarray
+def _projected_overlap_penetrations(
+    robot: np.ndarray,
+    terrain: np.ndarray,
+    terrain_normal: np.ndarray,
+    epsilon: float,
 ) -> np.ndarray:
-    """Vectorized exact closest points from many points to one triangle."""
+    """Vectorized signed depth over finite terrain-plane overlap polygons."""
 
-    a, b, c = triangle
-    ab = b - a
-    bc = c - b
-    ca = a - c
-
-    def segment(start: np.ndarray, direction: np.ndarray) -> np.ndarray:
-        fraction = (
-            np.sum((points - start) * direction, axis=1)
-            / np.dot(direction, direction)
-        )
-        return start + np.clip(fraction, 0.0, 1.0)[:, None] * direction
-
-    normal = np.cross(ab, c - a)
-    normal /= np.linalg.norm(normal)
-    plane_distance = np.sum((points - a) * normal, axis=1)
-    projection = points - plane_distance[:, None] * normal
-    v0 = ab
-    v1 = c - a
-    v2 = projection - a
-    dot00 = float(np.dot(v0, v0))
-    dot01 = float(np.dot(v0, v1))
-    dot11 = float(np.dot(v1, v1))
-    dot20 = np.sum(v2 * v0, axis=1)
-    dot21 = np.sum(v2 * v1, axis=1)
-    denominator = dot00 * dot11 - dot01 * dot01
-    bary_v = (dot11 * dot20 - dot01 * dot21) / denominator
-    bary_w = (dot00 * dot21 - dot01 * dot20) / denominator
-    inside = (
-        (bary_v >= -1.0e-12)
-        & (bary_w >= -1.0e-12)
-        & (bary_v + bary_w <= 1.0 + 1.0e-12)
-    )
-    candidates = np.stack(
+    robots = np.asarray(robot, dtype=np.float64)
+    terrains = np.asarray(terrain, dtype=np.float64)
+    normals = np.asarray(terrain_normal, dtype=np.float64)
+    normals = normals / np.linalg.norm(normals, axis=1)[:, None]
+    origins = terrains[:, 0]
+    terrain_edges_world = np.stack(
         (
-            segment(a, ab),
-            segment(b, bc),
-            segment(c, ca),
-            np.where(inside[:, None], projection, np.inf),
+            terrains[:, 1] - terrains[:, 0],
+            terrains[:, 2] - terrains[:, 1],
+            terrains[:, 0] - terrains[:, 2],
         ),
         axis=1,
     )
-    squared = np.sum((candidates - points[:, None]) ** 2, axis=2)
-    return candidates[np.arange(len(points)), np.argmin(squared, axis=1)]
+    longest = np.argmax(np.linalg.norm(terrain_edges_world, axis=2), axis=1)
+    basis_u = terrain_edges_world[np.arange(len(terrains)), longest]
+    basis_u = basis_u / np.linalg.norm(basis_u, axis=1)[:, None]
+    basis_v = np.cross(normals, basis_u)
+
+    def project(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        relative = points - origins[:, None]
+        return (
+            np.stack(
+                (
+                    np.sum(relative * basis_u[:, None], axis=2),
+                    np.sum(relative * basis_v[:, None], axis=2),
+                ),
+                axis=2,
+            ),
+            np.sum(relative * normals[:, None], axis=2),
+        )
+
+    def cross_2d(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+        return left[..., 0] * right[..., 1] - left[..., 1] * right[..., 0]
+
+    terrain_2d, _terrain_height = project(terrains)
+    robot_2d, robot_height = project(robots)
+    terrain_edge_start = terrain_2d
+    terrain_edge_end = terrain_2d[:, (1, 2, 0)]
+    terrain_edges = terrain_edge_end - terrain_edge_start
+    orientation = np.where(
+        cross_2d(
+            terrain_2d[:, 1] - terrain_2d[:, 0],
+            terrain_2d[:, 2] - terrain_2d[:, 0],
+        )
+        >= 0.0,
+        1.0,
+        -1.0,
+    )
+    robot_sides = orientation[:, None, None] * cross_2d(
+        terrain_edges[:, :, None],
+        robot_2d[:, None] - terrain_edge_start[:, :, None],
+    )
+    robot_inside = np.all(robot_sides >= -epsilon, axis=1)
+    vertex_depth = np.max(
+        np.where(robot_inside, -robot_height, 0.0), axis=1
+    )
+
+    robot_edge_start = robot_2d
+    robot_edge_end = robot_2d[:, (1, 2, 0)]
+    robot_edges = robot_edge_end - robot_edge_start
+    relative = (
+        terrain_edge_start[:, None] - robot_edge_start[:, :, None]
+    )
+    denominator = cross_2d(
+        robot_edges[:, :, None], terrain_edges[:, None]
+    )
+    safe_denominator = np.where(
+        np.abs(denominator) > epsilon, denominator, 1.0
+    )
+    robot_fraction = (
+        cross_2d(relative, terrain_edges[:, None]) / safe_denominator
+    )
+    terrain_fraction = (
+        cross_2d(relative, robot_edges[:, :, None]) / safe_denominator
+    )
+    edge_intersection = (
+        (np.abs(denominator) > epsilon)
+        & (robot_fraction >= -epsilon)
+        & (robot_fraction <= 1.0 + epsilon)
+        & (terrain_fraction >= -epsilon)
+        & (terrain_fraction <= 1.0 + epsilon)
+    )
+    robot_height_end = robot_height[:, (1, 2, 0)]
+    intersection_height = (
+        robot_height[:, :, None]
+        + robot_fraction
+        * (robot_height_end - robot_height)[:, :, None]
+    )
+    intersection_depth = np.max(
+        np.where(edge_intersection, -intersection_height, 0.0),
+        axis=(1, 2),
+    )
+
+    first_edge = robot_2d[:, 1] - robot_2d[:, 0]
+    second_edge = robot_2d[:, 2] - robot_2d[:, 0]
+    robot_denominator = cross_2d(first_edge, second_edge)
+    terrain_relative = terrain_2d - robot_2d[:, :1]
+    safe_robot_denominator = np.where(
+        np.abs(robot_denominator) > epsilon,
+        robot_denominator,
+        1.0,
+    )
+    first_fraction = (
+        cross_2d(terrain_relative, second_edge[:, None])
+        / safe_robot_denominator[:, None]
+    )
+    second_fraction = (
+        cross_2d(first_edge[:, None], terrain_relative)
+        / safe_robot_denominator[:, None]
+    )
+    terrain_inside = (
+        (np.abs(robot_denominator) > epsilon)[:, None]
+        & (first_fraction >= -epsilon)
+        & (second_fraction >= -epsilon)
+        & (first_fraction + second_fraction <= 1.0 + epsilon)
+    )
+    terrain_vertex_height = (
+        robot_height[:, :1]
+        + first_fraction
+        * (robot_height[:, 1] - robot_height[:, 0])[:, None]
+        + second_fraction
+        * (robot_height[:, 2] - robot_height[:, 0])[:, None]
+    )
+    terrain_vertex_depth = np.max(
+        np.where(terrain_inside, -terrain_vertex_height, 0.0), axis=1
+    )
+    return np.maximum.reduce(
+        (
+            np.zeros(len(robots), dtype=np.float64),
+            vertex_depth,
+            intersection_depth,
+            terrain_vertex_depth,
+        )
+    )
 
 
 def _triangle_surface_penetration(
@@ -1435,90 +1541,49 @@ def _triangle_surface_penetration(
     epsilon: float,
     candidate_pairs: np.ndarray | None = None,
 ) -> float:
-    if candidate_pairs is not None:
-        maximum_penetration = 0.0
+    if candidate_pairs is None:
+        pair_values: list[tuple[int, int]] = []
+        robot_minimum = np.min(robot_triangles, axis=1)
+        robot_maximum = np.max(robot_triangles, axis=1)
+        for index in range(len(robot_triangles)):
+            pair_values.extend(
+                (index, int(terrain_index))
+                for terrain_index in np.flatnonzero(
+                    _triangle_candidate_mask(
+                        robot_minimum[index],
+                        robot_maximum[index],
+                        terrain_minimum,
+                        terrain_maximum,
+                        terrain_normals,
+                        epsilon,
+                    )
+                )
+            )
+        pairs = np.asarray(pair_values, dtype=np.int64).reshape((-1, 2))
+    else:
         pairs = np.asarray(candidate_pairs, dtype=np.int64)
-        for terrain_index in np.unique(pairs[:, 1]):
-            robot_indices = pairs[pairs[:, 1] == terrain_index, 0]
-            robots = robot_triangles[robot_indices]
-            terrain = terrain_triangles[terrain_index]
-            normal = terrain_normals[terrain_index]
-            points = robots.reshape((-1, 3))
-            closest = _closest_points_to_triangle_batch(points, terrain)
-            delta = points - closest
-            signed = np.sum(delta * normal, axis=1).reshape((-1, 3))
-            tangential = np.linalg.norm(
-                delta - np.sum(delta * normal, axis=1)[:, None] * normal,
-                axis=1,
-            ).reshape((-1, 3))
-            depths = np.max(
-                np.where(
-                    tangential <= epsilon,
-                    np.maximum(0.0, -signed),
-                    0.0,
-                ),
-                axis=1,
-            )
-            maximum_penetration = max(
-                maximum_penetration, float(np.max(depths, initial=0.0))
-            )
-            boundary = np.flatnonzero(
-                (depths <= 0.0)
-                & (
-                    np.min(robots, axis=(1, 2))
-                    <= np.max(terrain) + epsilon
-                )
-                & (
-                    np.max(robots[:, :, 2], axis=1)
-                    >= terrain_minimum[terrain_index, 2] - epsilon
-                )
-                & (
-                    np.min(robots[:, :, 2], axis=1)
-                    <= terrain_maximum[terrain_index, 2] + epsilon
-                )
-            )
-            for index in boundary:
-                if _triangles_intersect(robots[index], terrain, epsilon):
-                    maximum_penetration = max(maximum_penetration, epsilon)
-        return maximum_penetration
-
-    maximum_penetration = 0.0
-    robot_minimum = np.min(robot_triangles, axis=1)
-    robot_maximum = np.max(robot_triangles, axis=1)
-    for index, robot in enumerate(robot_triangles):
-        candidates = np.flatnonzero(
-            _triangle_candidate_mask(
-                robot_minimum[index],
-                robot_maximum[index],
-                terrain_minimum,
-                terrain_maximum,
-                terrain_normals,
-                epsilon,
-            )
-        )
-        for terrain_index in candidates:
-            terrain = terrain_triangles[terrain_index]
-            normal = terrain_normals[terrain_index]
-            closest = np.asarray(
-                [_closest_point_triangle(vertex, terrain) for vertex in robot]
-            )
-            delta = robot - closest
-            signed = np.sum(delta * normal, axis=1)
-            tangential = np.linalg.norm(
-                delta - signed[:, None] * normal, axis=1
-            )
-            intersects = _triangles_intersect(robot, terrain, epsilon)
-            interior_depth = np.max(
-                np.where(tangential <= epsilon, np.maximum(0.0, -signed), 0.0)
-            )
-            if intersects or interior_depth > 0.0:
-                maximum_penetration = max(
-                    maximum_penetration,
-                    max(
-                        epsilon if intersects else 0.0,
-                        float(interior_depth),
-                    ),
-                )
+    if not len(pairs):
+        return 0.0
+    robots = robot_triangles[pairs[:, 0]]
+    terrains = terrain_triangles[pairs[:, 1]]
+    normals = terrain_normals[pairs[:, 1]]
+    depths = _projected_overlap_penetrations(
+        robots, terrains, normals, epsilon
+    )
+    maximum_penetration = float(np.max(depths, initial=0.0))
+    signed = np.sum(
+        (robots - terrains[:, :1]) * normals[:, None], axis=2
+    )
+    boundary_pairs = np.flatnonzero(
+        (depths <= epsilon)
+        & (np.min(signed, axis=1) <= epsilon)
+        & (np.max(signed, axis=1) >= -epsilon)
+    )
+    for pair_index in boundary_pairs:
+        if _triangles_intersect(
+            robots[pair_index], terrains[pair_index], epsilon
+        ):
+            maximum_penetration = max(maximum_penetration, epsilon)
     return maximum_penetration
 
 
@@ -2142,6 +2207,26 @@ def audit_clip(
                 code, masks[code], values[code], threshold_by_code[code]
             )
         )
+    invalid = np.zeros(frames_count, dtype=np.bool_)
+    for mask in masks.values():
+        invalid |= mask
+    guarded = _guard(invalid, thresholds.guard_frames)
+    candidate_intervals = _spans(~guarded)
+    short_intervals = tuple(
+        (start, end)
+        for start, end in candidate_intervals
+        if end - start < thresholds.minimum_interval_frames
+    )
+    reasons.extend(
+        AuditReason(
+            code="interval_too_short",
+            severity="error",
+            frame_interval=(start, end),
+            observed_maximum=float(end - start),
+            threshold=float(thresholds.minimum_interval_frames),
+        )
+        for start, end in short_intervals
+    )
     reasons.sort(
         key=lambda reason: (
             reason.frame_interval[0],
@@ -2149,13 +2234,9 @@ def audit_clip(
             reason.code,
         )
     )
-    invalid = np.zeros(frames_count, dtype=np.bool_)
-    for mask in masks.values():
-        invalid |= mask
-    guarded = _guard(invalid, thresholds.guard_frames)
     accepted = tuple(
         (start, end)
-        for start, end in _spans(~guarded)
+        for start, end in candidate_intervals
         if end - start >= thresholds.minimum_interval_frames
     )
     if not accepted:
