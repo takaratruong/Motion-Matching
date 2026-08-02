@@ -15,7 +15,8 @@ PYTHONPATH=sonic/python:. sonic/.torch-mm-venv/bin/python -B \
   --dataset build/torch-grail-terrain-feedback-v2 \
   --config sonic/configs/experiments/torch_grail_multi_horizon_skills.json \
   --g1-xml /home/ubuntu/projects/mjx-diffphysics/env/g1/assets/g1_29dof.xml \
-  --device cuda:0 --multi-horizon --contact-phase-gate --foot-lock
+  --device cuda:0 --multi-horizon --contact-phase-gate --foot-lock \
+  --swing-clearance-margin-m 0.03
 ```
 
 This remains kinematic-only: no physics and no Sonic tracking are active.
@@ -27,6 +28,7 @@ This remains kinematic-only: no physics and no Sonic tracking are active.
 | Previous multi-horizon baseline | 5/6 | 2.882 m | 0.175 m | 10.85 rad/s |
 | Contact-phase gate only | 6/6 | 3.418 m | 0.094 m | 14.53 rad/s |
 | Phase gate + capped foot cleanup | **6/6** | **2.451 m** | **0.093 m** | **12.00 rad/s** |
+| Phase + foot cleanup + 3 cm swing clearance | **6/6** | **2.320 m** | **0.093 m** | **12.00 rad/s** |
 
 The clean committed combined version reduces aggregate stance slide by 14.9% relative to the
 previous baseline while fixing the failed side exit. It is not uniformly
@@ -35,6 +37,14 @@ improves from 0.508 m to 0.480 m, turn-on-stair from 0.627 m to 0.275 m,
 diagonal descent from 0.948 m to 0.761 m, and side exit from 0.320 m to
 0.244 m.
 
+The optional 3 cm swing-clearance layer is the new recommended visual demo.
+On the clean committed solver it lowers aggregate slide another 5.4%, from
+2.451 m to 2.320 m, and reduces source-unsupported samples below terrain from
+8.13% to 6.29% (22.7% relative). Five routes improve or remain close; the
+mixed route's slide rises from 0.027 m to 0.100 m and turn-on-stair rises from
+0.275 m to 0.295 m. The maximum route p95 penetration remains 0.093 m, so this
+is a bounded improvement rather than a claim that clearance is solved.
+
 Artifacts:
 
 - baseline: `build/multi-horizon-terrain-skills/qualified-v2-final`
@@ -42,11 +52,15 @@ Artifacts:
 - deterministic phase repeat: `build/multi-horizon-terrain-skills/contact-phase-v2-repeat`
 - recommended clean combined: `build/multi-horizon-terrain-skills/phase-foot-lock-capped-clean-v2`
 - deterministic clean repeat: `build/multi-horizon-terrain-skills/phase-foot-lock-capped-clean-v3-repeat`
+- recommended clean swing clearance: `build/multi-horizon-terrain-skills/phase-foot-lock-swing-clearance-m030-clean-v1`
+- deterministic swing-clearance repeat: `build/multi-horizon-terrain-skills/phase-foot-lock-swing-clearance-m030-clean-v2-repeat`
 
 The two phase-only matrices have the identical deterministic SHA-256
 `dbb4e87fc7252bc5cd0212218b9b7148cd86a812894e67510535aabe92207e54`.
 The two clean combined matrices have the identical deterministic SHA-256
 `1e0c5cc86ac65e74101720b0282ce4be45b001d268643c27fe5c15a1839d5fb7`.
+The two clean 3 cm swing-clearance matrices have the identical SHA-256
+`e104fd51c3429b1ab85e7bfa07b9fbb483e170ab9ce7a20a6ce3612c7cc0f6f6`.
 
 ## What changed
 
@@ -65,6 +79,9 @@ The two clean combined matrices have the identical deterministic SHA-256
    finite terrain boundary. The authoritative matcher queries remain strict.
    This fixes the reproducible viewer crash when the operator walks outside the
    height-grid domain.
+5. An optional swing-clearance pass samples the query surface under source-
+   unsupported ankles, raises only penetrating targets, and uses the same
+   bounded IK, inertialization, correction ceiling, and 12 rad/s output cap.
 
 ## Ablations rejected
 
@@ -77,6 +94,13 @@ The two clean combined matrices have the identical deterministic SHA-256
 - Relaxed local contact composition with five candidates accepted 12/92 frozen
   difficult states. Doubling search to ten candidates only reached 14/92, so
   brute-force breadth is not the main bottleneck.
+- A hard time-to-next-contact gate failed every tested tolerance from 8 to 28
+  frames (best: 5/6 routes). A soft timing cost passed 6/6 only at weights too
+  small to change any selected clip; the first effective weights lost routes.
+- Reweighting the existing entry/outcome terms with the phase gate did not
+  help: legacy entry weight passed 2/6, entry-only 3/6, and outcome-only 4/6.
+- Swing-clearance margins from 0 to 5 cm all retained 6/6, but the clean sweep
+  had a clear optimum at 3 cm. Larger margins increased slide.
 
 ## Literature alignment
 
@@ -99,18 +123,23 @@ The two clean combined matrices have the identical deterministic SHA-256
 
 ## Remaining limitation and next experiment
 
-The riser-reversal route passes, but its slide regression indicates that an
-exact binary support-pattern gate is still too coarse during reversal. The next
-high-value experiment is a short contact-horizon descriptor: current support,
-time-to-release, next touchdown foot, touchdown XY/Z, and a small transition
-penalty. It should be evaluated as a layered gate/penalty against this frozen
-6/6 result, not merged speculatively.
+The timing experiments show that a scalar phase descriptor is not the missing
+signal. The remaining long-tail penetration and mixed-route regression point
+instead to future toe/landing geometry. The next high-value experiment is a
+layered future-toe terrain descriptor (or contact-space swing trajectory),
+evaluated against this frozen 6/6 result. Learned Motion Matching's rough-
+terrain setup similarly queries terrain under future toes rather than using a
+denser root-centered height grid.
 
 ## Verification
 
 - 92 focused unit/integration tests passed in the working tree.
 - 65 relevant tests passed from a clean detached worktree at commit `2ec4a31`.
+- 78 terrain matcher/viewer tests passed from the clean detached worktree at
+  commit `13d3c0a`.
 - The clean six-route matrix at `bc93c5e` passed 6/6 twice with an identical hash.
+- The clean 3 cm swing-clearance matrix at `13d3c0a` passed 6/6 twice with an
+  identical hash; maximum joint speed was 12.00 rad/s.
 - An automated live run walked beyond the finite height-grid boundary, entered
   a recoverable search-failure state, and reset without terminating the viewer.
 - No physics or Sonic dependencies were added to the kinematic viewer.
