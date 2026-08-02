@@ -20,6 +20,7 @@ class ContactAblationCliTests(unittest.TestCase):
                     "--device", "cuda:0",
                     "--max-actions-per-state", "3",
                     "--projection-strategy", "stance-root",
+                    "--selection-strategy", "contact-anchored",
                 ]
             )
 
@@ -35,6 +36,7 @@ class ContactAblationCliTests(unittest.TestCase):
             device="cuda:0",
             maximum_actions_per_state=3,
             projection_strategy="stance-root",
+            selection_strategy="contact-anchored",
         )
 
 

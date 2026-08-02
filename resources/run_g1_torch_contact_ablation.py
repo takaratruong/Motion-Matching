@@ -25,6 +25,11 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         choices=("joint-only", "stance-root"),
     )
+    parser.add_argument(
+        "--selection-strategy",
+        required=True,
+        choices=("saved", "contact-anchored"),
+    )
     return parser
 
 
@@ -41,6 +46,7 @@ def main(argv: list[str] | None = None) -> int:
         device=args.device,
         maximum_actions_per_state=args.max_actions_per_state,
         projection_strategy=args.projection_strategy,
+        selection_strategy=args.selection_strategy,
     )
     print(json.dumps(result, sort_keys=True), flush=True)
     return 0
