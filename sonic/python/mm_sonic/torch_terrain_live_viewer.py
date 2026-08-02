@@ -503,6 +503,7 @@ def _validate_live_mode(
     foothold_arm: str | None,
     foot_lock: bool = False,
     contact_phase_gate: bool = False,
+    swing_clearance_margin_m: float | None = None,
 ) -> None:
     if multi_horizon and (contact_segments or foothold_arm is not None):
         raise ContractError(
@@ -512,6 +513,8 @@ def _validate_live_mode(
         raise ContractError("terrain foot lock requires multi-horizon mode")
     if contact_phase_gate and not multi_horizon:
         raise ContractError("contact phase gate requires multi-horizon mode")
+    if swing_clearance_margin_m is not None and not foot_lock:
+        raise ContractError("swing clearance requires terrain foot lock")
 
 
 def _build_live_matcher(
@@ -523,6 +526,7 @@ def _build_live_matcher(
     foothold_action_policy: Any,
     foot_lock: bool = False,
     contact_phase_gate: bool = False,
+    swing_clearance_margin_m: float | None = None,
 ):
     matcher_config = matcher_config_from_resolved(resolved.resolved_config)
     if multi_horizon:
@@ -542,7 +546,9 @@ def _build_live_matcher(
             from .torch_terrain_foot_lock import build_terrain_foot_lock
 
             matcher_kwargs["result_filter"] = build_terrain_foot_lock(
-                resolved, foot_kinematics
+                resolved,
+                foot_kinematics,
+                swing_clearance_margin_m=swing_clearance_margin_m,
             )
         if contact_phase_gate:
             matcher_kwargs["contact_phase_gate"] = True
@@ -593,6 +599,7 @@ def run_live_viewer(
     strafe_action_gate: bool = False,
     foot_lock: bool = False,
     contact_phase_gate: bool = False,
+    swing_clearance_margin_m: float | None = None,
 ) -> None:
     """Run the dense 50 Hz matcher and display each committed state."""
 
@@ -607,6 +614,7 @@ def run_live_viewer(
         foothold_arm=foothold_arm,
         foot_lock=foot_lock,
         contact_phase_gate=contact_phase_gate,
+        swing_clearance_margin_m=swing_clearance_margin_m,
     )
     if contact_segments:
         from .torch_contact_segment_rollout import (
@@ -699,6 +707,7 @@ def run_live_viewer(
         foothold_action_policy=foothold_action_policy,
         foot_lock=foot_lock,
         contact_phase_gate=contact_phase_gate,
+        swing_clearance_margin_m=swing_clearance_margin_m,
     )
     from .torch_terrain_omni_rollout import resolved_stair_reset_position
 
@@ -908,6 +917,12 @@ def build_live_viewer_argument_parser() -> argparse.ArgumentParser:
         help="Prefer skill entries with the current source support pattern.",
     )
     parser.add_argument(
+        "--swing-clearance-margin-m",
+        type=float,
+        default=None,
+        help="Lift unsupported ankles above query terrain by this margin.",
+    )
+    parser.add_argument(
         "--contact-segments",
         action="store_true",
         help="Use committed authoritative-FK terrain contact segments.",
@@ -999,6 +1014,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         strafe_action_gate=args.strafe_action_gate,
         foot_lock=args.foot_lock,
         contact_phase_gate=args.contact_phase_gate,
+        swing_clearance_margin_m=args.swing_clearance_margin_m,
     )
     return 0
 

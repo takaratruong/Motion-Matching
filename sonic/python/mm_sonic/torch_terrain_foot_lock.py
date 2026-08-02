@@ -28,6 +28,7 @@ class TerrainFootLockFilter:
         correction_halflife_s: float = 0.04,
         maximum_joint_correction_rad: float = 0.35,
         maximum_output_joint_speed_rad_s: float = 12.0,
+        swing_clearance_margin_m: float | None = None,
     ) -> None:
         paths = tuple(clip_paths)
         masks = tuple(support_masks)
@@ -57,6 +58,15 @@ class TerrainFootLockFilter:
             or float(maximum_joint_correction_rad) <= 0.0
             or not math.isfinite(float(maximum_output_joint_speed_rad_s))
             or float(maximum_output_joint_speed_rad_s) <= 0.0
+            or (
+                swing_clearance_margin_m is not None
+                and (
+                    isinstance(swing_clearance_margin_m, bool)
+                    or not isinstance(swing_clearance_margin_m, (int, float))
+                    or not math.isfinite(float(swing_clearance_margin_m))
+                    or not 0.0 <= float(swing_clearance_margin_m) <= 0.20
+                )
+            )
             or not callable(getattr(foot_kinematics, "foot_positions", None))
             or not callable(
                 getattr(foot_kinematics, "solve_leg_positions", None)
@@ -80,6 +90,11 @@ class TerrainFootLockFilter:
         )
         self._maximum_output_joint_speed_rad_s = float(
             maximum_output_joint_speed_rad_s
+        )
+        self._swing_clearance_margin_m = (
+            None
+            if swing_clearance_margin_m is None
+            else float(swing_clearance_margin_m)
         )
         self._lock_position = torch.full(
             (2, 3), float("nan"), dtype=torch.float32, device=device
@@ -172,6 +187,7 @@ class TerrainFootLockFilter:
             active = support & self._locked
         targets = native_feet.clone()
         desired = result.joint_position.clone()
+        correction_mask = active.clone()
         if bool(active.any()):
             locked = self._lock_position[active]
             try:
@@ -191,12 +207,41 @@ class TerrainFootLockFilter:
             targets[active, 2] = surface.to(targets.dtype) + float(
                 ANKLE_ORIGIN_SOLE_M
             )
+        if self._swing_clearance_margin_m is not None:
+            swing_indices = torch.nonzero(~support, as_tuple=False).flatten()
+            if swing_indices.numel():
+                swing_xy = native_feet[swing_indices, :2]
+                try:
+                    swing_surface = self._sample_surface(swing_xy)
+                except Exception as error:
+                    raise ValueError(
+                        "terrain swing-clearance surface sampling failed"
+                    ) from error
+                if (
+                    not isinstance(swing_surface, torch.Tensor)
+                    or tuple(swing_surface.shape) != (swing_indices.numel(),)
+                    or swing_surface.device != self._device
+                    or not torch.isfinite(swing_surface).all()
+                ):
+                    raise ValueError(
+                        "terrain swing-clearance surface samples are invalid"
+                    )
+                minimum_z = (
+                    swing_surface.to(targets.dtype)
+                    + float(ANKLE_ORIGIN_SOLE_M)
+                    + self._swing_clearance_margin_m
+                )
+                needs_lift = native_feet[swing_indices, 2] < minimum_z
+                lifted = swing_indices[needs_lift]
+                correction_mask[lifted] = True
+                targets[lifted, 2] = minimum_z[needs_lift]
+        if bool(correction_mask.any()):
             try:
                 solved_numpy = self._foot_kinematics.solve_leg_positions(
                     result.joint_position.detach().cpu().numpy(),
                     result.root_position_world.detach().cpu().numpy(),
                     result.root_orientation_world_wxyz.detach().cpu().numpy(),
-                    active.detach().cpu().numpy(),
+                    correction_mask.detach().cpu().numpy(),
                     targets.detach().cpu().numpy(),
                 )
                 desired = torch.as_tensor(
@@ -241,7 +286,12 @@ class TerrainFootLockFilter:
         return self._copy_result(result, joints=solved, velocity=velocity)
 
 
-def build_terrain_foot_lock(resolved: object, foot_kinematics: object):
+def build_terrain_foot_lock(
+    resolved: object,
+    foot_kinematics: object,
+    *,
+    swing_clearance_margin_m: float | None = None,
+):
     """Build a source-contact foot lock against the resolved query terrain."""
 
     from .torch_contact_segments import source_support_mask
@@ -270,4 +320,5 @@ def build_terrain_foot_lock(resolved: object, foot_kinematics: object):
         foot_kinematics=foot_kinematics,
         sample_surface=sample_surface,
         device=device,
+        swing_clearance_margin_m=swing_clearance_margin_m,
     )

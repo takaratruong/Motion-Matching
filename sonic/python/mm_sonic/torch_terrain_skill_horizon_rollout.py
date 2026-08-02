@@ -363,8 +363,12 @@ def run_resolved_horizon_matrix(
     search_config: HorizonSearchConfig = HorizonSearchConfig(),
     foot_lock: bool = False,
     contact_phase_gate: bool = False,
+    swing_clearance_margin_m: float | None = None,
 ):
     """Run the renderer-independent route harness with horizon skill MM."""
+
+    if swing_clearance_margin_m is not None and not foot_lock:
+        raise ContractError("swing clearance requires terrain foot lock")
 
     import mujoco
 
@@ -396,7 +400,11 @@ def run_resolved_horizon_matrix(
     if foot_lock:
         from .torch_terrain_foot_lock import build_terrain_foot_lock
 
-        result_filter = build_terrain_foot_lock(resolved, foot_kinematics)
+        result_filter = build_terrain_foot_lock(
+            resolved,
+            foot_kinematics,
+            swing_clearance_margin_m=swing_clearance_margin_m,
+        )
     route_matchers: dict[str, TerrainSkillHorizonMatcher] = {}
     model, data = build_kinematic_scene(g1_xml, resolved)
     left_ankle = int(model.body("left_ankle_roll_link").id)
@@ -455,6 +463,11 @@ def run_resolved_horizon_matrix(
             + ":horizon-skills-v1:"
             + search_identity
             + (":foot-lock-v1" if foot_lock else ":raw-playback")
+            + (
+                f":swing-clearance-v1:{float(swing_clearance_margin_m):.9g}"
+                if swing_clearance_margin_m is not None
+                else ":native-swing"
+            )
             + (":phase-gate-v1" if contact_phase_gate else ":implicit-phase")
         ).encode()
     ).hexdigest()

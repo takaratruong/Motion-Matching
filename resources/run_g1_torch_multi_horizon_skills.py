@@ -50,6 +50,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Prefer skill entries with the current source support pattern.",
     )
     parser.add_argument(
+        "--swing-clearance-margin-m",
+        type=float,
+        default=None,
+        help="Lift unsupported ankles above query terrain by this margin.",
+    )
+    parser.add_argument(
         "--ablation",
         choices=(
             "combined",
@@ -188,6 +194,7 @@ def main(argv: list[str] | None = None) -> int:
         search_config=search_config,
         foot_lock=args.foot_lock,
         contact_phase_gate=args.contact_phase_gate,
+        swing_clearance_margin_m=args.swing_clearance_margin_m,
     )
     save_horizon_matrix(matrix, events, args.output)
     execution_completed = all(
@@ -203,6 +210,7 @@ def main(argv: list[str] | None = None) -> int:
                 "ablation": args.ablation,
                 "foot_lock": args.foot_lock,
                 "contact_phase_gate": args.contact_phase_gate,
+                "swing_clearance_margin_m": args.swing_clearance_margin_m,
                 "deterministic_sha256": matrix.deterministic_sha256,
                 "output": args.output,
             },

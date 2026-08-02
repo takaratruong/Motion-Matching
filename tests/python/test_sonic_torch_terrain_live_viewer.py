@@ -217,17 +217,20 @@ class LiveMujocoSceneTests(unittest.TestCase):
                 "--multi-horizon",
                 "--foot-lock",
                 "--contact-phase-gate",
+                "--swing-clearance-margin-m", "0.01",
             ]
         )
         self.assertTrue(arguments.multi_horizon)
         self.assertTrue(arguments.foot_lock)
         self.assertTrue(arguments.contact_phase_gate)
+        self.assertEqual(arguments.swing_clearance_margin_m, 0.01)
         live_module._validate_live_mode(
             multi_horizon=True,
             contact_segments=False,
             foothold_arm=None,
             foot_lock=True,
             contact_phase_gate=True,
+            swing_clearance_margin_m=0.01,
         )
         with self.assertRaisesRegex(ContractError, "mutually exclusive"):
             live_module._validate_live_mode(
@@ -248,6 +251,13 @@ class LiveMujocoSceneTests(unittest.TestCase):
                 contact_segments=False,
                 foothold_arm=None,
                 contact_phase_gate=True,
+            )
+        with self.assertRaisesRegex(ContractError, "requires terrain foot lock"):
+            live_module._validate_live_mode(
+                multi_horizon=True,
+                contact_segments=False,
+                foothold_arm=None,
+                swing_clearance_margin_m=0.01,
             )
 
     def test_horizon_overlay_does_not_require_legacy_cost_fields(self):
@@ -394,6 +404,7 @@ class LiveMujocoSceneTests(unittest.TestCase):
             "--contact-segments", "--foothold-arm", "--multi-horizon",
             "--foot-lock",
             "--contact-phase-gate",
+            "--swing-clearance-margin-m",
         ):
             self.assertIn(option, help_text)
         self.assertIn(
