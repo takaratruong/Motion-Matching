@@ -70,7 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--swing-foot-geometry",
         action="store_true",
-        help="Preview the oriented toe/heel midpoint during swing.",
+        help="Preview four oriented toe/heel sole points during swing.",
     )
     parser.add_argument(
         "--ablation",

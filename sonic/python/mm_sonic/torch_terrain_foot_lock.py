@@ -243,7 +243,7 @@ class TerrainFootLockFilter:
             delta = source - source[0]
         else:
             points = self._source_foot_points[clip_index][frame:stop, foot]
-            delta = points.mean(dim=1) - source[0]
+            delta = points - source[0]
         output_yaw = self._yaw_from_wxyz(
             result.root_orientation_world_wxyz
         )
@@ -268,11 +268,13 @@ class TerrainFootLockFilter:
                 min=0.0,
             )
         else:
-            surface = self._sample_surface(placed_xy).to(placed_z.dtype)
+            surface = self._sample_surface(placed_xy.reshape(-1, 2)).reshape(
+                placed_z.shape
+            ).to(placed_z.dtype)
             required = torch.clamp(
                 surface + self._swing_clearance_margin_m - placed_z,
                 min=0.0,
-            )
+            ).amax(dim=1)
         distance = torch.arange(
             required.shape[0], dtype=required.dtype, device=self._device
         )
