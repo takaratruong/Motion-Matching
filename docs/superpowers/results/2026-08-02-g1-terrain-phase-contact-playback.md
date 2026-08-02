@@ -148,6 +148,11 @@ identical SHA-256
 - The source-path planner is also bounded: smoothing scales of 3--6 frames
   retained route completion but raised slide to 2.338--2.440 m. The useful
   basin was 2--2.75 frames, with a clean optimum at 2.5 frames and 2.5 cm.
+- Online support-aware root-height reconstruction was rejected and removed.
+  Both the reactive and source-path variants lost the mixed and side-exit
+  routes, raised aggregate slide above 3.3 m, and produced root-jerk maxima
+  above 3,600 m/s^3. Root reconstruction must be solved over a whole contact
+  interval with continuity constraints, not applied as a frame-local offset.
 
 ## Literature alignment
 
