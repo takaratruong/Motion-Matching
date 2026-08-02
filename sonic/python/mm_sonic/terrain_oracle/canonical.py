@@ -128,13 +128,27 @@ def _nonempty(value: object, label: str) -> str:
     return value
 
 
+def _nonnegative_int(value: object, label: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ContractError(f"{label} must be a nonnegative integer")
+    return value
+
+
+def _positive_int(value: object, label: str) -> int:
+    if type(value) is not int or value < 1:
+        raise ContractError(f"{label} must be a positive integer")
+    return value
+
+
 @dataclass(frozen=True)
 class SourceIdentity:
     """Provenance that makes coordinate and quaternion conventions explicit."""
 
     source_format: str
     source_path: str
+    source_size_bytes: int
     source_sha256: str
+    source_license_id: str
     coordinate_convention: str
     quaternion_convention: str
     pose_origin: str
@@ -143,11 +157,13 @@ class SourceIdentity:
         for name in (
             "source_format",
             "source_path",
+            "source_license_id",
             "coordinate_convention",
             "quaternion_convention",
             "pose_origin",
         ):
             _nonempty(getattr(self, name), name)
+        _nonnegative_int(self.source_size_bytes, "source_size_bytes")
         _hash(self.source_sha256, "source_sha256")
 
 
@@ -190,14 +206,18 @@ class CommandTrack:
 @dataclass(frozen=True)
 class TerrainBinding:
     asset_path: str
+    asset_size_bytes: int
     asset_sha256: str
+    asset_license_id: str
     mesh_sha256: str
     world_from_terrain: RigidTransform
     validity_mask_path: str | None
 
     def __post_init__(self) -> None:
         _nonempty(self.asset_path, "asset_path")
+        _positive_int(self.asset_size_bytes, "asset_size_bytes")
         _hash(self.asset_sha256, "asset_sha256")
+        _nonempty(self.asset_license_id, "asset_license_id")
         _hash(self.mesh_sha256, "mesh_sha256")
         if not isinstance(self.world_from_terrain, RigidTransform):
             raise ContractError("world_from_terrain must be a RigidTransform")

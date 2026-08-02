@@ -77,9 +77,10 @@ class ClipRecord:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> "ClipRecord":
+        digest = _sha256(value.get("sha256"))
         return cls(
-            relative_path=_string(value, "relative_path"),
-            sha256=_sha256(value.get("sha256")),
+            relative_path=_record_relative_path(value, "clips", digest),
+            sha256=digest,
             clip_id=_string(value, "clip_id"),
             frame_count=_positive_int(value, "frame_count"),
         )
@@ -102,9 +103,10 @@ class MeshRecord:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> "MeshRecord":
+        digest = _sha256(value.get("sha256"))
         return cls(
-            relative_path=_string(value, "relative_path"),
-            sha256=_sha256(value.get("sha256")),
+            relative_path=_record_relative_path(value, "meshes", digest),
+            sha256=digest,
             vertex_count=_positive_int(value, "vertex_count"),
             face_count=_positive_int(value, "face_count"),
         )
@@ -143,6 +145,16 @@ def _sha256(value: object) -> str:
     ):
         raise ContractError("sha256 must be a lowercase SHA-256 digest")
     return value
+
+
+def _record_relative_path(
+    value: Mapping[str, object], directory: str, digest: str
+) -> str:
+    relative_path = _string(value, "relative_path")
+    expected = f"{directory}/{digest}.npz"
+    if relative_path != expected:
+        raise ContractError(f"relative_path must equal {expected}")
+    return relative_path
 
 
 def _canonical_json_bytes(value: object, label: str) -> bytes:
@@ -235,7 +247,9 @@ def _clip_metadata(clip: CanonicalClip) -> dict[str, object]:
     if clip.terrain is not None:
         terrain = {
             "asset_path": clip.terrain.asset_path,
+            "asset_size_bytes": clip.terrain.asset_size_bytes,
             "asset_sha256": clip.terrain.asset_sha256,
+            "asset_license_id": clip.terrain.asset_license_id,
             "mesh_sha256": clip.terrain.mesh_sha256,
             "world_from_terrain": {
                 "translation_world": clip.terrain.world_from_terrain.translation_world.tolist(),
@@ -249,7 +263,9 @@ def _clip_metadata(clip: CanonicalClip) -> dict[str, object]:
         "source": {
             "source_format": clip.source.source_format,
             "source_path": clip.source.source_path,
+            "source_size_bytes": clip.source.source_size_bytes,
             "source_sha256": clip.source.source_sha256,
+            "source_license_id": clip.source.source_license_id,
             "coordinate_convention": clip.source.coordinate_convention,
             "quaternion_convention": clip.source.quaternion_convention,
             "pose_origin": clip.source.pose_origin,
@@ -317,7 +333,9 @@ def read_clip(path: Path) -> CanonicalClip:
                 transform = terrain_data["world_from_terrain"]
                 terrain = TerrainBinding(
                     asset_path=terrain_data["asset_path"],
+                    asset_size_bytes=terrain_data["asset_size_bytes"],
                     asset_sha256=terrain_data["asset_sha256"],
+                    asset_license_id=terrain_data["asset_license_id"],
                     mesh_sha256=terrain_data["mesh_sha256"],
                     world_from_terrain=RigidTransform(**transform),
                     validity_mask_path=terrain_data["validity_mask_path"],
@@ -392,14 +410,21 @@ def read_mesh(path: Path) -> CanonicalTerrainMesh:
 def _metadata_and_mesh_records(
     metadata: Mapping[str, object],
 ) -> tuple[dict[str, object], tuple[MeshRecord, ...]]:
-    copied = json.loads(_canonical_json_bytes(dict(metadata), "corpus metadata"))
+    copied = dict(metadata)
     supplied = copied.pop("mesh_records", [])
     if not isinstance(supplied, list):
         raise ContractError("metadata.mesh_records must be a list of mesh records")
     try:
-        return copied, tuple(MeshRecord.from_dict(value) for value in supplied)
+        mesh_records = tuple(
+            value if isinstance(value, MeshRecord) else MeshRecord.from_dict(value)
+            for value in supplied
+        )
     except (AttributeError, TypeError) as error:
         raise ContractError("metadata.mesh_records must contain mesh records") from error
+    return (
+        json.loads(_canonical_json_bytes(copied, "corpus metadata")),
+        mesh_records,
+    )
 
 
 def publish_corpus(
@@ -411,6 +436,7 @@ def publish_corpus(
         raise ContractError("corpus metadata must be a dict")
     if not records or any(not isinstance(record, ClipRecord) for record in records):
         raise ContractError("corpus requires one or more ClipRecord values")
+    records = tuple(ClipRecord.from_dict(record.to_dict()) for record in records)
     manifest_metadata, mesh_records = _metadata_and_mesh_records(metadata)
     manifest = {
         "schema": "terrain-oracle-corpus/v1",
@@ -453,6 +479,8 @@ def load_corpus(path: Path) -> CorpusManifest:
         clips = tuple(ClipRecord.from_dict(value) for value in document["clips"])
         meshes = tuple(MeshRecord.from_dict(value) for value in document["meshes"])
         metadata = document["metadata"]
+    except ContractError:
+        raise
     except (KeyError, TypeError, ValueError, UnicodeDecodeError) as error:
         raise ContractError(f"invalid corpus manifest: {manifest_path}") from error
     if (

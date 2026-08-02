@@ -6,8 +6,8 @@ import unittest
 import numpy as np
 
 from mm_sonic.joints import ContractError
-from mm_sonic.terrain_oracle.canonical import SourceIdentity
-from mm_sonic.terrain_oracle.math3d import unroll_quaternions_wxyz
+from mm_sonic.terrain_oracle.canonical import SourceIdentity, TerrainBinding
+from mm_sonic.terrain_oracle.math3d import RigidTransform, unroll_quaternions_wxyz
 from tests.python.terrain_oracle_test_utils import synthetic_canonical_clip
 
 
@@ -114,12 +114,40 @@ class CanonicalMathTests(unittest.TestCase):
         identity = SourceIdentity(
             source_format="fixture",
             source_path="fixture://clip",
+            source_size_bytes=1,
             source_sha256="1" * 64,
+            source_license_id="CC-BY-4.0",
             coordinate_convention="z-up-right-handed",
             quaternion_convention="wxyz",
             pose_origin="clean-motion-corpus",
         )
         self.assertEqual(identity.quaternion_convention, "wxyz")
+        with self.assertRaisesRegex(ContractError, "source_size_bytes"):
+            replace(identity, source_size_bytes=-1)
+
+    def test_terrain_binding_requires_a_licensed_nonempty_asset(self):
+        """Catches provenance that cannot identify a usable licensed terrain file."""
+
+        transform = RigidTransform(
+            translation_world=np.zeros(3, dtype=np.float32),
+            quaternion_world_from_local_wxyz=np.array(
+                (1.0, 0.0, 0.0, 0.0), dtype=np.float32
+            ),
+        )
+        fields = {
+            "asset_path": "/readonly/terrain.obj",
+            "asset_size_bytes": 1,
+            "asset_sha256": "a" * 64,
+            "asset_license_id": "CC-BY-4.0",
+            "mesh_sha256": "b" * 64,
+            "world_from_terrain": transform,
+            "validity_mask_path": None,
+        }
+        TerrainBinding(**fields)
+        with self.assertRaisesRegex(ContractError, "asset_size_bytes"):
+            TerrainBinding(**{**fields, "asset_size_bytes": 0})
+        with self.assertRaisesRegex(ContractError, "asset_license_id"):
+            TerrainBinding(**{**fields, "asset_license_id": ""})
 
 
 if __name__ == "__main__":

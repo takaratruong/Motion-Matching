@@ -33,7 +33,9 @@ def synthetic_canonical_clip(
         source=SourceIdentity(
             source_format="synthetic",
             source_path="synthetic://forward",
+            source_size_bytes=0,
             source_sha256="0" * 64,
+            source_license_id="CC0-1.0",
             coordinate_convention="z-up-right-handed",
             quaternion_convention="wxyz",
             pose_origin=CLEAN_POSE_ORIGIN,
