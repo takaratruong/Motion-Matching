@@ -363,12 +363,10 @@ def read_clip(path: Path) -> CanonicalClip:
     return clip
 
 
-def write_mesh(output: Path, mesh: CanonicalTerrainMesh) -> MeshRecord:
-    """Publish one content-addressed canonical terrain mesh NPZ."""
-
+def _mesh_payload(mesh: CanonicalTerrainMesh) -> bytes:
     if not isinstance(mesh, CanonicalTerrainMesh):
-        raise ContractError("write_mesh requires a CanonicalTerrainMesh")
-    payload = _deterministic_npz_bytes(
+        raise ContractError("mesh payload requires a CanonicalTerrainMesh")
+    return _deterministic_npz_bytes(
         {
             "vertices_local": mesh.vertices_local,
             "faces": mesh.faces,
@@ -381,6 +379,18 @@ def write_mesh(output: Path, mesh: CanonicalTerrainMesh) -> MeshRecord:
             ),
         }
     )
+
+
+def mesh_digest(mesh: CanonicalTerrainMesh) -> str:
+    """Return the SHA-256 of the exact canonical bytes published by ``write_mesh``."""
+
+    return hashlib.sha256(_mesh_payload(mesh)).hexdigest()
+
+
+def write_mesh(output: Path, mesh: CanonicalTerrainMesh) -> MeshRecord:
+    """Publish one content-addressed canonical terrain mesh NPZ."""
+
+    payload = _mesh_payload(mesh)
     digest = hashlib.sha256(payload).hexdigest()
     directory = Path(output)
     _write_no_replace(directory / f"{digest}.npz", payload)

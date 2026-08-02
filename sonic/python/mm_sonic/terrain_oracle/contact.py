@@ -14,6 +14,7 @@ from .canonical import (
     CanonicalTerrainMesh,
 )
 from .math3d import RigidTransform
+from .storage import mesh_digest
 
 
 CONTACT_PLACEHOLDER_TAG = "contacts-unreconstructed"
@@ -355,6 +356,9 @@ class CanonicalMeshQuery:
         self._face_indices = np.ascontiguousarray(
             valid_indices[nondegenerate], dtype=np.int32
         )
+        self.mesh = mesh
+        self.mesh_sha256 = mesh_digest(mesh)
+        self.source_asset_sha256 = mesh.source_asset_sha256
         self.world_from_terrain = world_from_terrain
 
     @staticmethod

@@ -1,0 +1,325 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://motion-matching.local/schemas/terrain_oracle_audit_v1.schema.json",
+  "title": "Terrain Oracle Mechanical Audit v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "clip_id",
+    "frame_count",
+    "source_sha256",
+    "model_sha256",
+    "terrain_sha256",
+    "status",
+    "accepted_intervals",
+    "thresholds",
+    "metrics",
+    "reasons"
+  ],
+  "properties": {
+    "schema": {
+      "const": "terrain-oracle-audit/v1"
+    },
+    "clip_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "frame_count": {
+      "type": "integer",
+      "minimum": 2
+    },
+    "source_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "model_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "terrain_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "status": {
+      "enum": [
+        "accepted",
+        "accepted_with_intervals_removed",
+        "rejected"
+      ]
+    },
+    "accepted_intervals": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/frame_interval"
+      }
+    },
+    "thresholds": {
+      "$ref": "#/$defs/thresholds"
+    },
+    "metrics": {
+      "$ref": "#/$defs/metrics"
+    },
+    "reasons": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/reason"
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "finite_number": {
+      "type": "number",
+      "minimum": -1e+308,
+      "maximum": 1e+308
+    },
+    "nonnegative_number": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1e+308
+    },
+    "positive_number": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 1e+308
+    },
+    "frame_interval": {
+      "type": "array",
+      "description": "A half-open [start_frame,end_frame) interval; producers additionally enforce start_frame < end_frame.",
+      "prefixItems": [
+        {
+          "type": "integer",
+          "minimum": 0
+        },
+        {
+          "type": "integer",
+          "minimum": 1
+        }
+      ],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "thresholds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "joint_limit_tolerance_rad",
+        "joint_velocity_limit_rad_s",
+        "quaternion_step_limit_rad",
+        "root_speed_limit_m_s",
+        "root_height_min_m",
+        "root_height_max_m",
+        "root_acceleration_limit_m_s2",
+        "root_angular_speed_limit_rad_s",
+        "derivative_root_linear_tolerance_m_s",
+        "derivative_root_angular_tolerance_rad_s",
+        "derivative_joint_tolerance_rad_s",
+        "derivative_body_linear_tolerance_m_s",
+        "derivative_body_angular_tolerance_rad_s",
+        "derivative_acceleration_limit_rad_s2",
+        "support_distance_m",
+        "minimum_surface_normal_z",
+        "contact_label_threshold",
+        "stance_skate_limit_m",
+        "foot_penetration_tolerance_m",
+        "body_penetration_tolerance_m",
+        "collision_epsilon_m",
+        "cylinder_radial_segments",
+        "guard_frames",
+        "minimum_interval_frames"
+      ],
+      "properties": {
+        "joint_limit_tolerance_rad": {
+          "$ref": "#/$defs/nonnegative_number"
+        },
+        "joint_velocity_limit_rad_s": {
+          "$ref": "#/$defs/positive_number"
+        },
+        "quaternion_step_limit_rad": {
+          "$ref": "#/$defs/positive_number"
+        },
+        "root_speed_limit_m_s": {
+          "$ref": "#/$defs/positive_number"
+        },
+        "root_height_min_m": {
+          "$ref": "#/$defs/nonnegative_number"
+        },
+        "root_height_max_m": {
+          "$ref": "#/$defs/positive_number"
+        },
+        "root_acceleration_limit_m_s2": {
+          "$ref": "#/$defs/positive_number"
+        },
+        "root_angular_speed_limit_rad_s": {
+          "$ref": "#/$defs/positive_number"
+        },
+        "derivative_root_linear_tolerance_m_s": {
+          "$ref": "#/$defs/positive_number"
+        },
+        "derivative_root_angular_tolerance_rad_s": {
+          "$ref": "#/$defs/positive_number"
+        },
+        "derivative_joint_tolerance_rad_s": {
+          "$ref": "#/$defs/positive_number"
+        },
+        "derivative_body_linear_tolerance_m_s": {
+          "$ref": "#/$defs/positive_number"
+        },
+        "derivative_body_angular_tolerance_rad_s": {
+          "$ref": "#/$defs/positive_number"
+        },
+        "derivative_acceleration_limit_rad_s2": {
+          "$ref": "#/$defs/positive_number"
+        },
+        "support_distance_m": {
+          "$ref": "#/$defs/positive_number"
+        },
+        "minimum_surface_normal_z": {
+          "type": "number",
+          "minimum": 0,
+          "exclusiveMaximum": 1
+        },
+        "contact_label_threshold": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "exclusiveMaximum": 1
+        },
+        "stance_skate_limit_m": {
+          "$ref": "#/$defs/positive_number"
+        },
+        "foot_penetration_tolerance_m": {
+          "$ref": "#/$defs/nonnegative_number"
+        },
+        "body_penetration_tolerance_m": {
+          "$ref": "#/$defs/nonnegative_number"
+        },
+        "collision_epsilon_m": {
+          "$ref": "#/$defs/positive_number"
+        },
+        "cylinder_radial_segments": {
+          "type": "integer",
+          "minimum": 3
+        },
+        "guard_frames": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "minimum_interval_frames": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_joint_limit_violation_rad",
+        "max_joint_speed_rad_s",
+        "max_quaternion_step_rad",
+        "max_root_speed_m_s",
+        "min_root_height_m",
+        "max_root_height_m",
+        "max_root_acceleration_m_s2",
+        "max_root_angular_speed_rad_s",
+        "max_derivative_error",
+        "max_contact_disagreement",
+        "max_incomplete_sole_fraction",
+        "max_stance_skate_m",
+        "max_foot_penetration_m",
+        "max_body_penetration_m"
+      ],
+      "properties": {
+        "max_joint_limit_violation_rad": {
+          "$ref": "#/$defs/nonnegative_number"
+        },
+        "max_joint_speed_rad_s": {
+          "$ref": "#/$defs/nonnegative_number"
+        },
+        "max_quaternion_step_rad": {
+          "$ref": "#/$defs/nonnegative_number"
+        },
+        "max_root_speed_m_s": {
+          "$ref": "#/$defs/nonnegative_number"
+        },
+        "min_root_height_m": {
+          "$ref": "#/$defs/finite_number"
+        },
+        "max_root_height_m": {
+          "$ref": "#/$defs/finite_number"
+        },
+        "max_root_acceleration_m_s2": {
+          "$ref": "#/$defs/nonnegative_number"
+        },
+        "max_root_angular_speed_rad_s": {
+          "$ref": "#/$defs/nonnegative_number"
+        },
+        "max_derivative_error": {
+          "$ref": "#/$defs/nonnegative_number"
+        },
+        "max_contact_disagreement": {
+          "$ref": "#/$defs/nonnegative_number"
+        },
+        "max_incomplete_sole_fraction": {
+          "$ref": "#/$defs/nonnegative_number"
+        },
+        "max_stance_skate_m": {
+          "$ref": "#/$defs/nonnegative_number"
+        },
+        "max_foot_penetration_m": {
+          "$ref": "#/$defs/nonnegative_number"
+        },
+        "max_body_penetration_m": {
+          "$ref": "#/$defs/nonnegative_number"
+        }
+      }
+    },
+    "reason": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "severity",
+        "frame_interval",
+        "observed_maximum",
+        "threshold"
+      ],
+      "properties": {
+        "code": {
+          "enum": [
+            "joint_limit",
+            "joint_velocity",
+            "quaternion_discontinuity",
+            "root_plausibility",
+            "derivative_discontinuity",
+            "contact_inconsistency",
+            "incomplete_sole_support",
+            "stance_skate",
+            "foot_penetration",
+            "body_penetration",
+            "terrain_registration",
+            "model_registration",
+            "source_registration"
+          ]
+        },
+        "severity": {
+          "enum": [
+            "error",
+            "fatal"
+          ]
+        },
+        "frame_interval": {
+          "$ref": "#/$defs/frame_interval"
+        },
+        "observed_maximum": {
+          "$ref": "#/$defs/finite_number"
+        },
+        "threshold": {
+          "$ref": "#/$defs/finite_number"
+        }
+      }
+    }
+  }
+}
