@@ -95,15 +95,27 @@ def _decode_names(value: object) -> tuple[str, ...]:
 
 
 def _validate_order(root: object) -> str:
-    joint_names = root.attrs.get("joint_names")  # type: ignore[attr-defined]
-    body_names = root.attrs.get("body_names")  # type: ignore[attr-defined]
-    if joint_names is None and body_names is None:
+    attrs = root.attrs  # type: ignore[attr-defined]
+    has_joint_names = "joint_names" in attrs
+    has_body_names = "body_names" in attrs
+    if not has_joint_names and not has_body_names:
         return "justin-zarr-legacy-isaaclab-v1"
-    if joint_names is None or body_names is None:
+    if not has_joint_names or not has_body_names:
         raise _fail("joint_names and body_names attrs must be declared together")
-    if tuple(str(name) for name in joint_names) != ISAACLAB_JOINT_NAMES:
+    joint_names = attrs["joint_names"]
+    body_names = attrs["body_names"]
+    if joint_names is None or body_names is None:
+        raise _fail("joint_names and body_names attrs must not be null")
+    try:
+        joint_order = tuple(str(name) for name in joint_names)
+        body_order = tuple(str(name) for name in body_names)
+    except TypeError as error:
+        raise _fail(
+            "joint_names and body_names attrs must be name sequences"
+        ) from error
+    if joint_order != ISAACLAB_JOINT_NAMES:
         raise _fail("joint_names do not equal the canonical IsaacLab order")
-    if tuple(str(name) for name in body_names) != ISAACLAB_BODY_NAMES:
+    if body_order != ISAACLAB_BODY_NAMES:
         raise _fail("body_names do not equal the canonical IsaacLab order")
     return "justin-zarr-isaaclab-v1"
 

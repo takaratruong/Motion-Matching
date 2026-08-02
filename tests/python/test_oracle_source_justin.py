@@ -35,6 +35,7 @@ def _write_justin_zarr(
     *,
     include_order_names: bool = False,
     contradictory_joint_names: bool = False,
+    cross_clip_antipodes: bool = False,
 ) -> Path:
     frames = 8
     timeline = np.arange(frames, dtype=np.float32) / np.float32(50.0)
@@ -48,6 +49,14 @@ def _write_justin_zarr(
     body_position[:, 19, 0] = 2.0 + timeline
     body_quaternion_xyzw = np.zeros((frames, 30, 4), dtype=np.float32)
     body_quaternion_xyzw[..., 3] = 1.0
+    if cross_clip_antipodes:
+        second_clip_yaw = np.array([0.3, 0.4, 0.5, 0.6], dtype=np.float32)
+        body_quaternion_xyzw[4:, :, 2] = -np.sin(
+            second_clip_yaw[:, None] / np.float32(2.0)
+        )
+        body_quaternion_xyzw[4:, :, 3] = -np.cos(
+            second_clip_yaw[:, None] / np.float32(2.0)
+        )
     body_linear_velocity = np.zeros((frames, 30, 3), dtype=np.float32)
     body_linear_velocity[:, 0, 0] = 0.5
     body_angular_velocity = np.zeros((frames, 30, 3), dtype=np.float32)
@@ -141,6 +150,70 @@ class JustinSourceAdapterTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ContractError, "joint_names"):
                 list(iter_justin_clips(contradictory, _terrain_binding()))
+
+    def test_present_null_order_attrs_never_enter_the_legacy_fallback(self):
+        cases = (
+            ("joint-only-null", {"joint_names": None}),
+            ("body-only-null", {"body_names": None}),
+            (
+                "both-null",
+                {"joint_names": None, "body_names": None},
+            ),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for case, attrs in cases:
+                with self.subTest(case=case):
+                    source = _write_justin_zarr(root / f"{case}.zarr")
+                    archive = zarr.open(str(source), mode="a")
+                    archive.attrs.update(attrs)
+
+                    with self.assertRaisesRegex(
+                        ContractError, "joint_names|body_names"
+                    ):
+                        list(iter_justin_clips(source, _terrain_binding()))
+
+    def test_quaternion_and_inferred_state_are_independent_at_clip_boundaries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = _write_justin_zarr(
+                Path(tmp) / "antipodes.zarr",
+                cross_clip_antipodes=True,
+            )
+
+            first, second = iter_justin_clips(source, _terrain_binding())
+
+            np.testing.assert_allclose(
+                first.root_quaternion_world_wxyz[-1],
+                (1.0, 0.0, 0.0, 0.0),
+                rtol=0.0,
+                atol=1.0e-7,
+            )
+            np.testing.assert_allclose(
+                second.root_quaternion_world_wxyz[0],
+                (
+                    -np.cos(0.15),
+                    0.0,
+                    0.0,
+                    -np.sin(0.15),
+                ),
+                rtol=0.0,
+                atol=1.0e-7,
+            )
+            np.testing.assert_allclose(
+                first.commands.inferred_facing_local_xy,
+                np.tile(
+                    np.array([1.0, 0.0], dtype=np.float32),
+                    (4, 1),
+                ),
+                rtol=0.0,
+                atol=1.0e-7,
+            )
+            np.testing.assert_allclose(
+                second.commands.inferred_facing_local_xy[0],
+                (np.cos(0.3), np.sin(0.3)),
+                rtol=0.0,
+                atol=1.0e-6,
+            )
 
     def test_legacy_schema_rejects_nonexclusive_or_noncontiguous_ranges(self):
         with tempfile.TemporaryDirectory() as tmp:
