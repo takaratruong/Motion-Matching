@@ -173,6 +173,7 @@ def contact_anchored_prefilter(
     command_target_world_xy: object,
     constraints: OracleConstraints,
     maximum_count: int,
+    entry_pose_cost_weight: float = 1.0,
 ) -> tuple[int, ...]:
     """Rank every action after its entry contacts, rather than root, are fitted."""
 
@@ -192,6 +193,10 @@ def contact_anchored_prefilter(
         or not isinstance(constraints, OracleConstraints)
         or type(maximum_count) is not int
         or maximum_count < 1
+        or isinstance(entry_pose_cost_weight, bool)
+        or not isinstance(entry_pose_cost_weight, (int, float))
+        or not np.isfinite(float(entry_pose_cost_weight))
+        or float(entry_pose_cost_weight) <= 0.0
     ):
         raise ValueError("contact anchored prefilter inputs are invalid")
     if count == 0:
@@ -323,7 +328,8 @@ def contact_anchored_prefilter(
         10.0 * (landing_error / 0.12).square()
         + 3.0 * (command_error / 0.25).square()
         + 2.0 * (facing_error / 0.60).square()
-        + (joint_position_error / constraints.maximum_joint_position_error_rad).square()
+        + float(entry_pose_cost_weight)
+        * (joint_position_error / constraints.maximum_joint_position_error_rad).square()
         + (joint_velocity_error / constraints.maximum_joint_velocity_error_rad_s).square()
         + 4.0 * (entry_error / constraints.maximum_entry_foot_error_m).square()
         + 2.0 * (root_correction / 0.15).square()
@@ -472,6 +478,7 @@ def run_contact_ablation(
     joint_smoothing_passes: int,
     reproject_smoothed_joints: bool,
     reprojection_blend: float,
+    entry_pose_cost_weight: float,
 ) -> dict[str, object]:
     """Evaluate contact composition on the authenticated frozen oracle states."""
 
@@ -517,6 +524,10 @@ def run_contact_ablation(
         or not isinstance(reprojection_blend, (int, float))
         or not np.isfinite(float(reprojection_blend))
         or not 0.0 <= float(reprojection_blend) <= 1.0
+        or isinstance(entry_pose_cost_weight, bool)
+        or not isinstance(entry_pose_cost_weight, (int, float))
+        or not np.isfinite(float(entry_pose_cost_weight))
+        or float(entry_pose_cost_weight) <= 0.0
     ):
         raise ValueError("contact ablation root regularization is invalid")
     output_path = Path(os.path.abspath(output))
@@ -646,6 +657,7 @@ def run_contact_ablation(
                     command_target_world_xy=command_target,
                     constraints=experiment.search.constraints,
                     maximum_count=max(256, maximum_actions_per_state),
+                    entry_pose_cost_weight=float(entry_pose_cost_weight),
                 )
                 current = quality_state_as_oracle(
                     state, index.actions[0].joint_position
@@ -782,6 +794,7 @@ def run_contact_ablation(
         "joint_smoothing_passes": joint_smoothing_passes,
         "reproject_smoothed_joints": reproject_smoothed_joints,
         "reprojection_blend": float(reprojection_blend),
+        "entry_pose_cost_weight": float(entry_pose_cost_weight),
         "state_count": len(state_records),
         "states_with_accepted_action": sum(
             bool(record["accepted_action_indices"]) for record in state_records

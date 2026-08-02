@@ -35,6 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--joint-smoothing-passes", required=True, type=int)
     parser.add_argument("--reproject-smoothed-joints", action="store_true")
     parser.add_argument("--reprojection-blend", type=float, default=1.0)
+    parser.add_argument("--entry-pose-cost-weight", type=float, default=1.0)
     return parser
 
 
@@ -57,6 +58,7 @@ def main(argv: list[str] | None = None) -> int:
         joint_smoothing_passes=args.joint_smoothing_passes,
         reproject_smoothed_joints=args.reproject_smoothed_joints,
         reprojection_blend=args.reprojection_blend,
+        entry_pose_cost_weight=args.entry_pose_cost_weight,
     )
     print(json.dumps(result, sort_keys=True), flush=True)
     return 0

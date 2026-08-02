@@ -119,6 +119,42 @@ class TerrainContactAblationTests(unittest.TestCase):
 
         self.assertEqual(ranked[0], 1)
 
+    def test_contact_prefilter_can_prioritize_entry_pose_continuity(self):
+        first = _action()
+        farther_feet = first.foot_position_local.clone()
+        farther_feet[-1, first.swing_foot, 0] += 0.4
+        discontinuous_joints = first.joint_position.clone()
+        discontinuous_joints[:, :6] += 0.6
+        second = replace(
+            first,
+            clip_index=1,
+            foot_position_local=farther_feet,
+            joint_position=discontinuous_joints,
+        )
+        index = ContactPhaseActionIndex(
+            actions=(first, second),
+            inventory=ContactPhaseInventory(retained_count=2, rejected_by_reason={}),
+            exact_successor_indices=(None, None),
+        )
+        kwargs = dict(
+            state=_state(),
+            cache=build_quality_action_cache(index),
+            native_quality=build_native_quality_index(index),
+            desired_landing_foot=1,
+            desired_landing_world_xyz=np.array((0.9, -0.1, 0.0)),
+            command_target_world_xy=np.array((0.2, 0.0)),
+            constraints=OracleConstraints(maximum_joint_position_error_rad=3.0),
+            maximum_count=2,
+        )
+
+        landing_first = contact_anchored_prefilter(**kwargs)
+        pose_first = contact_anchored_prefilter(
+            **kwargs, entry_pose_cost_weight=10_000.0
+        )
+
+        self.assertEqual(landing_first[0], 1)
+        self.assertEqual(pose_first[0], 0)
+
     def test_projected_terrain_metrics_separate_stance_and_swing(self):
         feet = np.array(
             (

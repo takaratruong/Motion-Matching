@@ -26,6 +26,7 @@ class ContactAblationCliTests(unittest.TestCase):
                     "--joint-smoothing-passes", "3",
                     "--reproject-smoothed-joints",
                     "--reprojection-blend", "0.1",
+                    "--entry-pose-cost-weight", "4.0",
                 ]
             )
 
@@ -47,6 +48,7 @@ class ContactAblationCliTests(unittest.TestCase):
             joint_smoothing_passes=3,
             reproject_smoothed_joints=True,
             reprojection_blend=0.1,
+            entry_pose_cost_weight=4.0,
         )
 
 
