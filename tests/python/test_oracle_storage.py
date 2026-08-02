@@ -13,6 +13,7 @@ from mm_sonic.joints import ContractError
 from mm_sonic.terrain_oracle.canonical import CanonicalTerrainMesh, TerrainBinding
 from mm_sonic.terrain_oracle.math3d import RigidTransform
 from mm_sonic.terrain_oracle.storage import (
+    MeshRecord,
     load_corpus,
     publish_corpus,
     read_clip,
@@ -177,6 +178,47 @@ class OracleStorageTests(unittest.TestCase):
                 with self.assertRaisesRegex(ContractError, "relative_path"):
                     load_corpus(corpus_path)
         manifest_path.write_text(json.dumps(original), "ascii")
+
+    def test_publish_corpus_validates_direct_mesh_records_before_creating_output(self):
+        """Catches direct records bypassing the manifest record-path contract."""
+
+        clip_record = write_clip(
+            self.root / "clips", synthetic_canonical_clip(frames=8)
+        )
+        invalid = MeshRecord(
+            relative_path=f"../meshes/{'a' * 64}.npz",
+            sha256="a" * 64,
+            vertex_count=3,
+            face_count=1,
+        )
+        rejected_destination = self.root / "rejected-corpus"
+
+        with self.assertRaisesRegex(ContractError, "relative_path"):
+            publish_corpus(
+                rejected_destination,
+                [clip_record],
+                {"mesh_records": [invalid]},
+            )
+        self.assertFalse(rejected_destination.exists())
+
+        valid = write_mesh(
+            self.root / "meshes",
+            CanonicalTerrainMesh(
+                vertices_local=np.array(
+                    ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+                    dtype=np.float32,
+                ),
+                faces=np.array(((0, 1, 2),), dtype=np.int32),
+                valid_faces=np.array((True,), dtype=np.bool_),
+                source_asset_sha256="a" * 64,
+            ),
+        )
+        published = publish_corpus(
+            self.root / "accepted-corpus",
+            [clip_record],
+            {"mesh_records": [valid]},
+        )
+        self.assertEqual(load_corpus(published).meshes, (valid,))
 
     def test_manifest_is_schema_valid_and_published_without_replacement(self):
         """Catches a mutable corpus manifest or drift from the canonical contract."""

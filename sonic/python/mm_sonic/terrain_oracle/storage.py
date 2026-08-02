@@ -416,7 +416,9 @@ def _metadata_and_mesh_records(
         raise ContractError("metadata.mesh_records must be a list of mesh records")
     try:
         mesh_records = tuple(
-            value if isinstance(value, MeshRecord) else MeshRecord.from_dict(value)
+            MeshRecord.from_dict(
+                value.to_dict() if isinstance(value, MeshRecord) else value
+            )
             for value in supplied
         )
     except (AttributeError, TypeError) as error:
