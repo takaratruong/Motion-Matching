@@ -37,7 +37,6 @@ class MultiHorizonSkillsCliTest(unittest.TestCase):
         self.assertIsNone(args.swing_plan_sigma_frames)
         self.assertEqual(args.foot_correction_halflife_s, 0.04)
         self.assertFalse(args.footprint_terrain_targets)
-        self.assertEqual(args.footprint_split_gain, 1.0)
         locked = build_parser().parse_args(
             [
                 "--dataset", "data", "--config", "config.json",
@@ -47,7 +46,6 @@ class MultiHorizonSkillsCliTest(unittest.TestCase):
                 "--swing-plan-sigma-frames", "4.0",
                 "--foot-correction-halflife-s", "0.02",
                 "--footprint-terrain-targets",
-                "--footprint-split-gain", "0.5",
             ]
         )
         self.assertTrue(locked.foot_lock)
@@ -56,7 +54,6 @@ class MultiHorizonSkillsCliTest(unittest.TestCase):
         self.assertEqual(locked.swing_plan_sigma_frames, 4.0)
         self.assertEqual(locked.foot_correction_halflife_s, 0.02)
         self.assertTrue(locked.footprint_terrain_targets)
-        self.assertEqual(locked.footprint_split_gain, 0.5)
 
     def test_route_selection_preserves_frozen_order_and_rejects_bad_names(self):
         routes = select_routes(

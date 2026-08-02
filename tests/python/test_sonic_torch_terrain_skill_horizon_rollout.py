@@ -230,7 +230,6 @@ class TerrainSkillHorizonRolloutTest(unittest.TestCase):
             current_foot_position_world=torch.tensor(
                 [[1.0, 2.3, 0.0], [1.0, 1.8, 0.0]]
             ),
-            footprint_split_gain=0.5,
             query_terrain=terrain,
         )
 
@@ -238,7 +237,7 @@ class TerrainSkillHorizonRolloutTest(unittest.TestCase):
             torch.allclose(
                 enriched.surface_height_delta_m,
                 torch.tensor(
-                    [[1.0625, 0.9375], [2.125, 1.875], [4.25, 3.75]]
+                    [[1.125, 0.875], [2.25, 1.75], [4.5, 3.5]]
                 ),
                 atol=1e-6,
             )
