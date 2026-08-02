@@ -31,6 +31,7 @@ from .torch_terrain_quality_artifacts import analyze_saved_route
 from .torch_terrain_quality_oracle import (
     QualityCandidateScore,
     QualityOracleResult,
+    build_quality_action_cache,
     rank_quality_actions,
 )
 from .torch_terrain_quality_preview import QualityPreview, build_quality_preview
@@ -331,6 +332,7 @@ def run_quality_oracle(
         )
     )
     qualities = build_native_quality_index(index)
+    quality_cache = build_quality_action_cache(index)
     thresholds = _native_thresholds(qualities)
     measurement = baseline_resolved.measurement_extension
 
@@ -437,6 +439,7 @@ def run_quality_oracle(
                 command_target_world_xy=command_target,
                 sample_surface=sample_surface,
                 constraints=experiment.search.constraints,
+                quality_cache=quality_cache,
                 top_k=5,
             )
             ranked_rows = (

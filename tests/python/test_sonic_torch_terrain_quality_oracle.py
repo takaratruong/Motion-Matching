@@ -1,5 +1,6 @@
 import unittest
 from dataclasses import replace
+from unittest import mock
 
 import numpy as np
 import torch
@@ -11,7 +12,11 @@ from mm_sonic.torch_contact_oracle_actions import (
 )
 from mm_sonic.torch_contact_oracle_search import OracleConstraints
 from mm_sonic.torch_terrain_action_quality import build_native_quality_index
-from mm_sonic.torch_terrain_quality_oracle import rank_quality_actions
+import mm_sonic.torch_terrain_quality_oracle as quality_oracle
+from mm_sonic.torch_terrain_quality_oracle import (
+    build_quality_action_cache,
+    rank_quality_actions,
+)
 from mm_sonic.torch_terrain_quality_states import capture_quality_states
 
 
@@ -101,16 +106,21 @@ def _flat(points):
 class TerrainQualityOracleTests(unittest.TestCase):
     def test_exhaustive_ranking_keeps_independent_winners(self):
         index = _index()
-        result = rank_quality_actions(
-            state=_state(),
-            index=index,
-            native_quality=build_native_quality_index(index),
-            desired_landing_world_xyz=np.array((0.30, -0.1, 0.035)),
-            command_target_world_xy=np.array((0.20, 0.0)),
-            sample_surface=_flat,
-            constraints=OracleConstraints(),
-            top_k=5,
-        )
+        original_place = quality_oracle.place_action
+        with mock.patch.object(
+            quality_oracle, "place_action", wraps=original_place
+        ) as placement:
+            result = rank_quality_actions(
+                state=_state(),
+                index=index,
+                native_quality=build_native_quality_index(index),
+                desired_landing_world_xyz=np.array((0.30, -0.1, 0.035)),
+                command_target_world_xy=np.array((0.20, 0.0)),
+                sample_surface=_flat,
+                constraints=OracleConstraints(),
+                quality_cache=build_quality_action_cache(index),
+                top_k=5,
+            )
 
         self.assertEqual(result.evaluated_action_count, len(index.actions))
         self.assertEqual(result.rejected_by_reason, {"entry-support": 1})
@@ -120,6 +130,7 @@ class TerrainQualityOracleTests(unittest.TestCase):
         self.assertEqual(result.best_two_step[0].action_index, 3)
         self.assertEqual(result.best_two_step[0].exact_successor_index, 4)
         self.assertEqual(len(result.deterministic_sha256), 64)
+        self.assertLessEqual(placement.call_count, 2)
 
     def test_ties_use_stable_source_key_order(self):
         action = _action(0, landing_x=0.30)
