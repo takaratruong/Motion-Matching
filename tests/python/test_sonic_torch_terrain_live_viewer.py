@@ -200,6 +200,11 @@ class LiveMujocoSceneTests(unittest.TestCase):
                 foothold_action_policy=None,
                 maximum_source_contact_p95_m=0.033,
                 normalization_source="baseline",
+                maximum_translation_warp_m=0.025,
+                maximum_yaw_warp_rad=0.10,
+                minimum_endpoint_warp_yaw_rad=0.0,
+                maximum_endpoint_warp_yaw_rad=3.141592653589793,
+                maximum_endpoint_warp_terrain_delta_m=0.0,
             )
 
         self.assertIs(result, qualified)
@@ -227,6 +232,11 @@ class LiveMujocoSceneTests(unittest.TestCase):
             foot_kinematics="feet",
             config="matcher",
             search_config="search",
+            maximum_translation_warp_m=0.025,
+            maximum_yaw_warp_rad=0.10,
+            minimum_endpoint_warp_yaw_rad=0.0,
+            maximum_endpoint_warp_yaw_rad=3.141592653589793,
+            maximum_endpoint_warp_terrain_delta_m=0.0,
         )
 
     def test_multi_horizon_mode_is_explicit_and_exclusive(self):
@@ -243,6 +253,11 @@ class LiveMujocoSceneTests(unittest.TestCase):
                 "--foot-correction-halflife-s", "0.02",
                 "--maximum-source-contact-p95-m", "0.033",
                 "--normalization-source", "baseline",
+                "--maximum-translation-warp-m", "0.025",
+                "--maximum-yaw-warp-rad", "0.10",
+                "--minimum-endpoint-warp-yaw-rad", "0.0",
+                "--maximum-endpoint-warp-yaw-rad", "3.141592653589793",
+                "--maximum-endpoint-warp-terrain-delta-m", "0.0",
             ]
         )
         self.assertTrue(arguments.multi_horizon)
@@ -253,6 +268,11 @@ class LiveMujocoSceneTests(unittest.TestCase):
         self.assertEqual(arguments.foot_correction_halflife_s, 0.02)
         self.assertEqual(arguments.maximum_source_contact_p95_m, 0.033)
         self.assertEqual(arguments.normalization_source, "baseline")
+        self.assertEqual(arguments.maximum_translation_warp_m, 0.025)
+        self.assertEqual(arguments.maximum_yaw_warp_rad, 0.10)
+        self.assertEqual(arguments.minimum_endpoint_warp_yaw_rad, 0.0)
+        self.assertAlmostEqual(arguments.maximum_endpoint_warp_yaw_rad, math.pi)
+        self.assertEqual(arguments.maximum_endpoint_warp_terrain_delta_m, 0.0)
         live_module._validate_live_mode(
             multi_horizon=True,
             contact_segments=False,

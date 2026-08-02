@@ -509,6 +509,11 @@ def _validate_live_mode(
     swing_plan_sigma_frames: float | None = None,
     maximum_source_contact_p95_m: float | None = None,
     normalization_source: str | None = None,
+    maximum_translation_warp_m: float = 0.0,
+    maximum_yaw_warp_rad: float = 0.0,
+    minimum_endpoint_warp_yaw_rad: float = 0.0,
+    maximum_endpoint_warp_yaw_rad: float = math.pi,
+    maximum_endpoint_warp_terrain_delta_m: float = math.inf,
 ) -> None:
     if multi_horizon and (contact_segments or foothold_arm is not None):
         raise ContractError(
@@ -526,6 +531,14 @@ def _validate_live_mode(
         raise ContractError("source contact quality gate requires multi-horizon mode")
     if normalization_source is not None and not multi_horizon:
         raise ContractError("normalization source requires multi-horizon mode")
+    if (
+        maximum_translation_warp_m != 0.0
+        or maximum_yaw_warp_rad != 0.0
+        or minimum_endpoint_warp_yaw_rad != 0.0
+        or maximum_endpoint_warp_yaw_rad != math.pi
+        or maximum_endpoint_warp_terrain_delta_m != math.inf
+    ) and not multi_horizon:
+        raise ContractError("endpoint warp requires multi-horizon mode")
 
 
 def _build_live_matcher(
@@ -542,6 +555,11 @@ def _build_live_matcher(
     swing_plan_sigma_frames: float | None = None,
     maximum_source_contact_p95_m: float | None = None,
     normalization_source: str | None = None,
+    maximum_translation_warp_m: float = 0.0,
+    maximum_yaw_warp_rad: float = 0.0,
+    minimum_endpoint_warp_yaw_rad: float = 0.0,
+    maximum_endpoint_warp_yaw_rad: float = math.pi,
+    maximum_endpoint_warp_terrain_delta_m: float = math.inf,
 ):
     matcher_config = matcher_config_from_resolved(resolved.resolved_config)
     if multi_horizon:
@@ -595,6 +613,13 @@ def _build_live_matcher(
             search_config=horizon_search_config_from_experiment(
                 resolved.resolved_config
             ),
+            maximum_translation_warp_m=maximum_translation_warp_m,
+            maximum_yaw_warp_rad=maximum_yaw_warp_rad,
+            minimum_endpoint_warp_yaw_rad=minimum_endpoint_warp_yaw_rad,
+            maximum_endpoint_warp_yaw_rad=maximum_endpoint_warp_yaw_rad,
+            maximum_endpoint_warp_terrain_delta_m=(
+                maximum_endpoint_warp_terrain_delta_m
+            ),
             **matcher_kwargs,
         )
     return TorchMotionMatcher.from_folder(
@@ -636,6 +661,11 @@ def run_live_viewer(
     swing_plan_sigma_frames: float | None = None,
     maximum_source_contact_p95_m: float | None = None,
     normalization_source: str | None = None,
+    maximum_translation_warp_m: float = 0.0,
+    maximum_yaw_warp_rad: float = 0.0,
+    minimum_endpoint_warp_yaw_rad: float = 0.0,
+    maximum_endpoint_warp_yaw_rad: float = math.pi,
+    maximum_endpoint_warp_terrain_delta_m: float = math.inf,
 ) -> None:
     """Run the dense 50 Hz matcher and display each committed state."""
 
@@ -655,6 +685,13 @@ def run_live_viewer(
         swing_plan_sigma_frames=swing_plan_sigma_frames,
         maximum_source_contact_p95_m=maximum_source_contact_p95_m,
         normalization_source=normalization_source,
+        maximum_translation_warp_m=maximum_translation_warp_m,
+        maximum_yaw_warp_rad=maximum_yaw_warp_rad,
+        minimum_endpoint_warp_yaw_rad=minimum_endpoint_warp_yaw_rad,
+        maximum_endpoint_warp_yaw_rad=maximum_endpoint_warp_yaw_rad,
+        maximum_endpoint_warp_terrain_delta_m=(
+            maximum_endpoint_warp_terrain_delta_m
+        ),
     )
     if contact_segments:
         from .torch_contact_segment_rollout import (
@@ -752,6 +789,13 @@ def run_live_viewer(
         swing_plan_sigma_frames=swing_plan_sigma_frames,
         maximum_source_contact_p95_m=maximum_source_contact_p95_m,
         normalization_source=normalization_source,
+        maximum_translation_warp_m=maximum_translation_warp_m,
+        maximum_yaw_warp_rad=maximum_yaw_warp_rad,
+        minimum_endpoint_warp_yaw_rad=minimum_endpoint_warp_yaw_rad,
+        maximum_endpoint_warp_yaw_rad=maximum_endpoint_warp_yaw_rad,
+        maximum_endpoint_warp_terrain_delta_m=(
+            maximum_endpoint_warp_terrain_delta_m
+        ),
     )
     from .torch_terrain_omni_rollout import resolved_stair_reset_position
 
@@ -990,6 +1034,21 @@ def build_live_viewer_argument_parser() -> argparse.ArgumentParser:
         help="Freeze feature normalization to another motion corpus.",
     )
     parser.add_argument(
+        "--maximum-translation-warp-m", type=float, default=0.0
+    )
+    parser.add_argument("--maximum-yaw-warp-rad", type=float, default=0.0)
+    parser.add_argument(
+        "--minimum-endpoint-warp-yaw-rad", type=float, default=0.0
+    )
+    parser.add_argument(
+        "--maximum-endpoint-warp-yaw-rad", type=float, default=math.pi
+    )
+    parser.add_argument(
+        "--maximum-endpoint-warp-terrain-delta-m",
+        type=float,
+        default=math.inf,
+    )
+    parser.add_argument(
         "--contact-segments",
         action="store_true",
         help="Use committed authoritative-FK terrain contact segments.",
@@ -1088,6 +1147,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.maximum_source_contact_p95_m
         ),
         normalization_source=args.normalization_source,
+        maximum_translation_warp_m=args.maximum_translation_warp_m,
+        maximum_yaw_warp_rad=args.maximum_yaw_warp_rad,
+        minimum_endpoint_warp_yaw_rad=(
+            args.minimum_endpoint_warp_yaw_rad
+        ),
+        maximum_endpoint_warp_yaw_rad=(
+            args.maximum_endpoint_warp_yaw_rad
+        ),
+        maximum_endpoint_warp_terrain_delta_m=(
+            args.maximum_endpoint_warp_terrain_delta_m
+        ),
     )
     return 0
 
