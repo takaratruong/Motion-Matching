@@ -138,7 +138,10 @@ def _source_pose(folder: Any, skill: TerrainSkill, frame: int, reference: torch.
         )
     except (AttributeError, IndexError, TypeError) as error:
         raise ContractError("terrain skill source frame is unavailable") from error
-    return tuple(torch.as_tensor(value, dtype=reference.dtype, device=reference.device) for value in values)
+    return tuple(
+        torch.tensor(value, dtype=reference.dtype, device=reference.device)
+        for value in values
+    )
 
 
 def _validate_current(current: TerrainSkillPose) -> None:
@@ -183,7 +186,7 @@ def start_skill(
         type(selected_entry_frame) is not int
         or not skill.interval.entry_start
         <= selected_entry_frame
-        < skill.interval.playback_start
+        < skill.interval.playback_stop
     ):
         raise ContractError("selected frame is outside the terrain skill entry window")
     if not math.isfinite(float(halflife_s)) or halflife_s <= 0:

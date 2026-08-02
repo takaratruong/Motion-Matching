@@ -87,6 +87,11 @@ class TerrainSkillComposerTest(unittest.TestCase):
         self.assertFalse(can_interrupt_skill(skill, 7))
         self.assertTrue(can_interrupt_skill(skill, 8))
 
+    def test_can_enter_at_internal_double_support_frame(self):
+        folder, skill, pose = _fixture()
+        state = start_skill(folder, skill, selected_entry_frame=8, current=pose)
+        self.assertEqual(advance_skill(state).frame.source_frame, 8)
+
 
 if __name__ == "__main__":
     unittest.main()

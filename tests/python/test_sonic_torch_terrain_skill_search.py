@@ -58,7 +58,7 @@ class TerrainSkillSearchTest(unittest.TestCase):
         eligible = skill_entry_eligibility(self.database, self.inventory)
         self.assertEqual(torch.nonzero(eligible).flatten().tolist(), [2, 3, 7])
 
-    def test_terrain_gate_removes_candidates_before_feature_ranking(self):
+    def test_ranked_entries_skip_incompatible_candidate(self):
         visited = []
 
         result = select_terrain_skill(
@@ -72,7 +72,7 @@ class TerrainSkillSearchTest(unittest.TestCase):
             and skill.skill_index == 1,
         )
 
-        self.assertEqual(visited, [(0, 3), (1, 7)])
+        self.assertEqual(visited, [(0, 3), (0, 2), (1, 7)])
         self.assertEqual(result.skill.skill_index, 1)
         self.assertEqual(result.selected_row, 7)
         self.assertEqual(result.rejected_by_reason, {"terrain": 2})

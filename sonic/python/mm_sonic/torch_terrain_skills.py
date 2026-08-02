@@ -167,6 +167,7 @@ def build_terrain_skill_inventory(
     entry_window_frames: int = 50,
     minimum_surface_change_m: float = 0.08,
     stable_gap_frames: int = 50,
+    minimum_remaining_frames: int = 50,
 ) -> TerrainSkillInventory:
     """Build an owned, deterministic terrain skill inventory."""
 
@@ -174,6 +175,8 @@ def build_terrain_skill_inventory(
         raise ContractError("terrain skill inventory requires a TerrainDataset")
     if not isinstance(database, TorchMotionDatabase):
         raise ContractError("terrain skill inventory requires a TorchMotionDatabase")
+    if type(minimum_remaining_frames) is not int or minimum_remaining_frames < 1:
+        raise ContractError("terrain skill minimum remaining frames must be positive")
     if database.folder is not dataset.folder and (
         database.folder.inventory_sha256 != dataset.folder.inventory_sha256
     ):
@@ -204,11 +207,27 @@ def build_terrain_skill_inventory(
         if not intervals:
             rejected["no_episode"] += 1
             continue
+        stable_frames = frozenset(
+            int(frame)
+            for frame in torch.nonzero(
+                support.all(dim=1), as_tuple=False
+            ).flatten().cpu().tolist()
+        )
         for interval in intervals:
             candidate_rows = tuple(
                 row
-                for frame in range(interval.entry_start, interval.playback_start)
-                if (row := database.row_for_source(clip_index, frame)) is not None
+                for frame in range(
+                    interval.entry_start,
+                    min(
+                        interval.playback_stop - minimum_remaining_frames + 1,
+                        clip.valid_frame_stop,
+                    ),
+                )
+                if (
+                    frame < interval.playback_start
+                    or frame in stable_frames
+                )
+                and (row := database.row_for_source(clip_index, frame)) is not None
             )
             rows = tuple(row for row in candidate_rows if row not in row_to_skill)
             rejected["overlapping_entry_rows"] += len(candidate_rows) - len(rows)

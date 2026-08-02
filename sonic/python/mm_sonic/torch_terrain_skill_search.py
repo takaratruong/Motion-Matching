@@ -56,29 +56,22 @@ def select_terrain_skill(
     current_frame_index: int,
     terrain_validator: TerrainValidator,
     config: MatcherConfig = MatcherConfig(),
+    command_eligible_rows: torch.Tensor | None = None,
 ) -> TerrainSkillSearchResult:
     """Hard-gate terrain compatibility, then rank entries by exact MM cost."""
 
     if not callable(terrain_validator):
         raise ContractError("terrain validator must be callable")
     eligible = skill_entry_eligibility(database, inventory)
-    rejected = 0
-    for skill in inventory.skills:
-        if not skill.entry_rows:
-            continue
-        # Terrain compatibility belongs to the coherent skill, not each of its
-        # many equivalent pre-entry feature rows.  Evaluate at the entry row
-        # closest to playback and gate every row atomically.
-        canonical_row = skill.entry_rows[-1]
-        if not bool(terrain_validator(skill, canonical_row)):
-            rows = torch.as_tensor(
-                skill.entry_rows, dtype=torch.long, device=database.device
-            )
-            eligible[rows] = False
-            rejected += len(skill.entry_rows)
-    if not bool(eligible.any().item()):
-        raise ContractError("no terrain-compatible skill entry exists")
-
+    if command_eligible_rows is not None:
+        if (
+            not isinstance(command_eligible_rows, torch.Tensor)
+            or command_eligible_rows.dtype != torch.bool
+            or tuple(command_eligible_rows.shape) != tuple(eligible.shape)
+            or command_eligible_rows.device != eligible.device
+        ):
+            raise ContractError("terrain skill command eligibility is invalid")
+        eligible &= command_eligible_rows
     ranked = rank_exact_transition_candidates(
         database,
         normalized_query,
@@ -87,15 +80,18 @@ def select_terrain_skill(
         config=config,
         transition_eligible_rows=eligible,
     )
-    if not ranked:
-        raise ContractError("no terrain-compatible skill entry exists")
-    decision = ranked[0]
-    skill_index = inventory.row_to_skill.get(decision.selected_row)
-    if skill_index is None:
-        raise ContractError("selected terrain skill row has no owner")
-    return TerrainSkillSearchResult(
-        skill=inventory.skills[skill_index],
-        selected_row=decision.selected_row,
-        selected_feature_cost=decision.selected_feature_cost,
-        rejected_by_reason=MappingProxyType({"terrain": rejected}),
-    )
+    rejected = 0
+    for decision in ranked:
+        skill_index = inventory.row_to_skill.get(decision.selected_row)
+        if skill_index is None:
+            raise ContractError("selected terrain skill row has no owner")
+        skill = inventory.skills[skill_index]
+        if bool(terrain_validator(skill, decision.selected_row)):
+            return TerrainSkillSearchResult(
+                skill=skill,
+                selected_row=decision.selected_row,
+                selected_feature_cost=decision.selected_feature_cost,
+                rejected_by_reason=MappingProxyType({"terrain": rejected}),
+            )
+        rejected += 1
+    raise ContractError("no terrain-compatible skill entry exists")
