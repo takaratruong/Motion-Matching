@@ -6,6 +6,7 @@ import torch
 from mm_sonic.torch_contact_oracle_actions import ContactPhaseAction
 from mm_sonic.torch_contact_oracle_search import OracleState, place_action
 from mm_sonic.torch_terrain_contact_composition import (
+    build_contact_target_trajectory,
     place_action_contact_anchored,
 )
 
@@ -127,6 +128,89 @@ class TerrainContactCompositionTests(unittest.TestCase):
                     support=(False, True),
                 ),
             )
+
+    def test_contact_targets_lock_stance_and_warp_swing_to_landing(self):
+        raw = torch.tensor(
+            (
+                ((0.00, 0.10, 0.00), (0.00, -0.10, 0.20)),
+                ((0.01, 0.10, 0.00), (0.10, -0.10, 0.25)),
+                ((0.02, 0.10, 0.00), (0.20, -0.10, 0.30)),
+                ((0.03, 0.10, 0.00), (0.30, -0.10, 0.20)),
+                ((0.04, 0.10, 0.00), (0.40, -0.10, 0.00)),
+            )
+        )
+        support = torch.tensor(
+            ((True, False),) * 4 + ((True, True),)
+        )
+        entry = torch.tensor(((1.0, 2.0, 0.0), (0.0, 0.0, 0.0)))
+        landing = torch.tensor((0.48, -0.06, 0.12))
+
+        targets = build_contact_target_trajectory(
+            raw,
+            support,
+            swing_foot=1,
+            entry_foot_position_world=entry,
+            landing_target_world=landing,
+        )
+
+        torch.testing.assert_close(
+            targets.position_world[:, 0], entry[0].expand(5, 3)
+        )
+        torch.testing.assert_close(targets.position_world[0, 1], raw[0, 1])
+        torch.testing.assert_close(targets.position_world[-1, 1], landing)
+        torch.testing.assert_close(
+            targets.swing_warp_weight,
+            torch.tensor((0.0, 0.15625, 0.5, 0.84375, 1.0)),
+        )
+        self.assertTrue(bool(targets.solve_mask.all()))
+
+    def test_zero_landing_warp_preserves_raw_swing_trajectory(self):
+        raw = torch.tensor(
+            (
+                ((0.0, 0.1, 0.0), (0.0, -0.1, 0.2)),
+                ((0.0, 0.1, 0.0), (0.1, -0.1, 0.3)),
+                ((0.0, 0.1, 0.0), (0.2, -0.1, 0.0)),
+            )
+        )
+        support = torch.tensor(
+            ((True, False), (True, False), (True, True))
+        )
+
+        targets = build_contact_target_trajectory(
+            raw,
+            support,
+            swing_foot=1,
+            entry_foot_position_world=raw[0],
+            landing_target_world=raw[-1, 1],
+        )
+
+        torch.testing.assert_close(targets.position_world[:, 1], raw[:, 1])
+
+    def test_landed_swing_remains_locked_after_touchdown(self):
+        raw = torch.tensor(
+            (
+                ((0.0, 0.1, 0.0), (0.0, -0.1, 0.2)),
+                ((0.0, 0.1, 0.0), (0.1, -0.1, 0.3)),
+                ((0.0, 0.1, 0.0), (0.2, -0.1, 0.0)),
+                ((0.0, 0.1, 0.0), (0.3, -0.1, 0.0)),
+            )
+        )
+        support = torch.tensor(
+            ((True, False), (True, False), (True, True), (True, True))
+        )
+        landing = torch.tensor((0.25, -0.08, 0.04))
+
+        targets = build_contact_target_trajectory(
+            raw,
+            support,
+            swing_foot=1,
+            entry_foot_position_world=raw[0],
+            landing_target_world=landing,
+        )
+
+        torch.testing.assert_close(
+            targets.position_world[2:, 1], landing.expand(2, 3)
+        )
 
 
 if __name__ == "__main__":

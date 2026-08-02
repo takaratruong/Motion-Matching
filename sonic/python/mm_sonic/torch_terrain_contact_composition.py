@@ -83,6 +83,48 @@ class ContactAnchoredPlacement:
         )
 
 
+@dataclass(frozen=True)
+class ContactTargetTrajectory:
+    position_world: torch.Tensor
+    solve_mask: torch.Tensor
+    swing_warp_weight: torch.Tensor
+
+    def __post_init__(self) -> None:
+        position = self.position_world
+        if (
+            not isinstance(position, torch.Tensor)
+            or position.ndim != 3
+            or tuple(position.shape[1:]) != (2, 3)
+            or not position.dtype.is_floating_point
+            or not torch.isfinite(position).all()
+        ):
+            raise ValueError("contact target positions are invalid")
+        frames = position.shape[0]
+        if frames < 2:
+            raise ValueError("contact target trajectory is too short")
+        if (
+            not isinstance(self.solve_mask, torch.Tensor)
+            or tuple(self.solve_mask.shape) != (frames, 2)
+            or self.solve_mask.dtype != torch.bool
+            or self.solve_mask.device != position.device
+            or not isinstance(self.swing_warp_weight, torch.Tensor)
+            or tuple(self.swing_warp_weight.shape) != (frames,)
+            or self.swing_warp_weight.dtype != position.dtype
+            or self.swing_warp_weight.device != position.device
+            or not torch.isfinite(self.swing_warp_weight).all()
+            or bool((self.swing_warp_weight < 0.0).any())
+            or bool((self.swing_warp_weight > 1.0).any())
+        ):
+            raise ValueError("contact target metadata is invalid")
+        object.__setattr__(self, "position_world", position.detach().clone())
+        object.__setattr__(self, "solve_mask", self.solve_mask.detach().clone())
+        object.__setattr__(
+            self,
+            "swing_warp_weight",
+            self.swing_warp_weight.detach().clone(),
+        )
+
+
 def _fit_entry_support(
     action: ContactPhaseAction, state: OracleState
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -153,4 +195,97 @@ def place_action_contact_anchored(
         yaw_world=yaw,
         translation_world=translation,
         maximum_entry_support_error_m=float(entry_error.max().item()),
+    )
+
+
+def build_contact_target_trajectory(
+    raw_foot_position_world: torch.Tensor,
+    support_mask: torch.Tensor,
+    *,
+    swing_foot: int,
+    entry_foot_position_world: torch.Tensor,
+    landing_target_world: torch.Tensor,
+) -> ContactTargetTrajectory:
+    """Lock stance contacts and smoothly warp one swing endpoint."""
+
+    raw = raw_foot_position_world
+    if (
+        not isinstance(raw, torch.Tensor)
+        or raw.ndim != 3
+        or tuple(raw.shape[1:]) != (2, 3)
+        or raw.shape[0] < 2
+        or not raw.dtype.is_floating_point
+        or not torch.isfinite(raw).all()
+    ):
+        raise ValueError("contact target raw feet are invalid")
+    frames = raw.shape[0]
+    if (
+        not isinstance(support_mask, torch.Tensor)
+        or tuple(support_mask.shape) != (frames, 2)
+        or support_mask.dtype != torch.bool
+        or support_mask.device != raw.device
+        or type(swing_foot) is not int
+        or swing_foot not in (0, 1)
+        or not isinstance(entry_foot_position_world, torch.Tensor)
+        or tuple(entry_foot_position_world.shape) != (2, 3)
+        or entry_foot_position_world.dtype != raw.dtype
+        or entry_foot_position_world.device != raw.device
+        or not torch.isfinite(entry_foot_position_world).all()
+        or not isinstance(landing_target_world, torch.Tensor)
+        or tuple(landing_target_world.shape) != (3,)
+        or landing_target_world.dtype != raw.dtype
+        or landing_target_world.device != raw.device
+        or not torch.isfinite(landing_target_world).all()
+    ):
+        raise ValueError("contact target inputs are invalid")
+
+    swing_support = support_mask[:, swing_foot]
+    unsupported = torch.nonzero(~swing_support, as_tuple=False).flatten()
+    if unsupported.numel() == 0:
+        raise ValueError("contact target swing interval is missing")
+    flight_start = int(unsupported[0].item())
+    touchdown_candidates = torch.nonzero(
+        swing_support[flight_start:], as_tuple=False
+    ).flatten()
+    if touchdown_candidates.numel() == 0:
+        raise ValueError("contact target touchdown is missing")
+    touchdown = flight_start + int(touchdown_candidates[0].item())
+
+    targets = raw.clone()
+    solve = support_mask.clone()
+    weights = torch.zeros((frames,), dtype=raw.dtype, device=raw.device)
+
+    for foot in range(2):
+        if bool(support_mask[0, foot]):
+            releases = torch.nonzero(~support_mask[:, foot], as_tuple=False).flatten()
+            release = int(releases[0].item()) if releases.numel() else frames
+            targets[:release, foot] = entry_foot_position_world[foot]
+
+    flight_length = touchdown - flight_start
+    phase = torch.linspace(
+        0.0,
+        1.0,
+        flight_length + 1,
+        dtype=raw.dtype,
+        device=raw.device,
+    )
+    smoothstep = phase.square() * (3.0 - 2.0 * phase)
+    weights[flight_start : touchdown + 1] = smoothstep
+    landing_delta = landing_target_world - raw[touchdown, swing_foot]
+    targets[flight_start : touchdown + 1, swing_foot] = (
+        raw[flight_start : touchdown + 1, swing_foot]
+        + smoothstep[:, None] * landing_delta
+    )
+    solve[flight_start : touchdown + 1, swing_foot] = True
+
+    releases = torch.nonzero(
+        ~swing_support[touchdown:], as_tuple=False
+    ).flatten()
+    release = touchdown + (int(releases[0].item()) if releases.numel() else frames - touchdown)
+    targets[touchdown:release, swing_foot] = landing_target_world
+    weights[touchdown:release] = 1.0
+    return ContactTargetTrajectory(
+        position_world=targets,
+        solve_mask=solve,
+        swing_warp_weight=weights,
     )
