@@ -456,6 +456,62 @@ class TerrainContactCompositionTests(unittest.TestCase):
         self.assertEqual(projected.maximum_joint_deformation_rad, 0.0)
         self.assertEqual(projected.maximum_joint_correction_speed_rad_s, 0.0)
 
+    def test_smoothed_contact_reprojection_can_be_relaxed(self):
+        joints = torch.zeros((3, 29))
+        joints[:, :3] = torch.tensor((0.0, 0.1, 0.0))
+        joints[:, 3:6] = torch.tensor(
+            ((0.0, -0.1, 0.2), (0.2, -0.1, 0.3), (0.4, -0.1, 0.0))
+        )
+        roots = torch.tensor(
+            ((0.0, 0.0, 0.5), (0.08, 0.0, 0.5), (0.12, 0.0, 0.5))
+        )
+        quaternions = torch.tensor(((1.0, 0.0, 0.0, 0.0),) * 3)
+        kinematics = _CountingFootKinematics()
+        raw_feet = torch.as_tensor(
+            kinematics.foot_positions(joints, roots, quaternions)
+        )
+        landing = torch.tensor((0.52, -0.08, 0.52))
+
+        relaxed = project_contact_trajectory_with_stance_root(
+            joint_position=joints,
+            root_position_world=roots,
+            root_orientation_world_wxyz=quaternions,
+            raw_foot_position_world=raw_feet,
+            support_mask=torch.tensor(
+                ((True, False), (True, False), (True, True))
+            ),
+            swing_foot=1,
+            entry_foot_position_world=raw_feet[0],
+            landing_target_world=landing,
+            foot_kinematics=kinematics,
+            root_correction_scale=0.75,
+            root_smoothing_passes=2,
+            joint_smoothing_passes=2,
+            reproject_smoothed_joints=True,
+            reprojection_blend=0.10,
+        )
+
+        exact = project_contact_trajectory_with_stance_root(
+            joint_position=joints,
+            root_position_world=roots,
+            root_orientation_world_wxyz=quaternions,
+            raw_foot_position_world=raw_feet,
+            support_mask=torch.tensor(
+                ((True, False), (True, False), (True, True))
+            ),
+            swing_foot=1,
+            entry_foot_position_world=raw_feet[0],
+            landing_target_world=landing,
+            foot_kinematics=kinematics,
+            root_correction_scale=0.75,
+            root_smoothing_passes=2,
+            joint_smoothing_passes=2,
+            reproject_smoothed_joints=True,
+            reprojection_blend=1.0,
+        )
+        self.assertFalse(torch.equal(relaxed.joint_position, exact.joint_position))
+        torch.testing.assert_close(relaxed.foot_position_world[-1, 1], landing)
+
 
 if __name__ == "__main__":
     unittest.main()

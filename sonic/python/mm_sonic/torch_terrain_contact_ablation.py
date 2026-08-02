@@ -471,6 +471,7 @@ def run_contact_ablation(
     root_smoothing_passes: int,
     joint_smoothing_passes: int,
     reproject_smoothed_joints: bool,
+    reprojection_blend: float,
 ) -> dict[str, object]:
     """Evaluate contact composition on the authenticated frozen oracle states."""
 
@@ -512,6 +513,10 @@ def run_contact_ablation(
         or type(joint_smoothing_passes) is not int
         or not 0 <= joint_smoothing_passes <= 10
         or type(reproject_smoothed_joints) is not bool
+        or isinstance(reprojection_blend, bool)
+        or not isinstance(reprojection_blend, (int, float))
+        or not np.isfinite(float(reprojection_blend))
+        or not 0.0 <= float(reprojection_blend) <= 1.0
     ):
         raise ValueError("contact ablation root regularization is invalid")
     output_path = Path(os.path.abspath(output))
@@ -679,6 +684,7 @@ def run_contact_ablation(
                     root_smoothing_passes=root_smoothing_passes,
                     joint_smoothing_passes=joint_smoothing_passes,
                     reproject_smoothed_joints=reproject_smoothed_joints,
+                    reprojection_blend=float(reprojection_blend),
                 )
             except ValueError as error:
                 reason = str(error)
@@ -775,6 +781,7 @@ def run_contact_ablation(
         "root_smoothing_passes": root_smoothing_passes,
         "joint_smoothing_passes": joint_smoothing_passes,
         "reproject_smoothed_joints": reproject_smoothed_joints,
+        "reprojection_blend": float(reprojection_blend),
         "state_count": len(state_records),
         "states_with_accepted_action": sum(
             bool(record["accepted_action_indices"]) for record in state_records

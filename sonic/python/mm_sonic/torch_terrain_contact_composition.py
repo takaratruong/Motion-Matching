@@ -518,6 +518,7 @@ def project_contact_trajectory_with_stance_root(
     joint_smoothing_passes: int = 0,
     reproject_smoothed_joints: bool = False,
     joint_projection_enabled: bool = True,
+    reprojection_blend: float = 1.0,
 ) -> StanceRootProjectionResult:
     """Lock the persistent stance with root translation, then warp the swing leg."""
 
@@ -570,6 +571,10 @@ def project_contact_trajectory_with_stance_root(
         or not 0 <= joint_smoothing_passes <= 10
         or type(reproject_smoothed_joints) is not bool
         or type(joint_projection_enabled) is not bool
+        or isinstance(reprojection_blend, bool)
+        or not isinstance(reprojection_blend, (int, float))
+        or not math.isfinite(float(reprojection_blend))
+        or not 0.0 <= float(reprojection_blend) <= 1.0
         or (not joint_projection_enabled and joint_smoothing_passes != 0)
         or (not joint_projection_enabled and reproject_smoothed_joints)
     ):
@@ -718,12 +723,39 @@ def project_contact_trajectory_with_stance_root(
                 targets=targets,
                 foot_kinematics=foot_kinematics,
             )
-            projected_joints = polished.joint_position
-            projected_feet = polished.foot_position_world
-            maximum_projection_error = max(
-                maximum_projection_error,
-                polished.maximum_target_error_m,
-            )
+            blend = float(reprojection_blend)
+            if blend >= 1.0:
+                projected_joints = polished.joint_position
+                projected_feet = polished.foot_position_world
+            else:
+                projected_joints = torch.lerp(
+                    projected_joints, polished.joint_position, blend
+                )
+                try:
+                    blended_feet_numpy = np.asarray(
+                        forward(
+                            projected_joints.detach().cpu().numpy(),
+                            corrected_roots.detach().cpu().numpy(),
+                            root_orientation_world_wxyz.detach().cpu().numpy(),
+                        ),
+                        dtype=np.float64,
+                    )
+                except Exception as error:
+                    raise ValueError(
+                        "stance-root relaxed reprojection forward kinematics failed"
+                    ) from error
+                if (
+                    blended_feet_numpy.shape != (joints.shape[0], 2, 3)
+                    or not np.isfinite(blended_feet_numpy).all()
+                ):
+                    raise ValueError(
+                        "stance-root relaxed reprojection returned invalid feet"
+                    )
+                projected_feet = torch.as_tensor(
+                    blended_feet_numpy,
+                    dtype=joints.dtype,
+                    device=joints.device,
+                )
         else:
             residual_root = torch.zeros_like(root_correction)
             residual_known = support_mask.any(dim=1)
