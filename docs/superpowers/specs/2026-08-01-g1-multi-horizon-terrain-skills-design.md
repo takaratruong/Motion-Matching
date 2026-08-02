@@ -47,7 +47,7 @@ multi-horizon chunks pass terrain safety but fail only from myopic choices.
 
 ## Descriptor inventory
 
-Each searchable stable entry row owns up to three immutable
+Each searchable entry row owns up to three immutable
 `TerrainSkillHorizon` records. Target horizons are 25, 50, and 100 source
 frames. For a target, the endpoint is the first stable double-support frame at
 or after the target and no more than 25 frames later. A horizon is rejected if
