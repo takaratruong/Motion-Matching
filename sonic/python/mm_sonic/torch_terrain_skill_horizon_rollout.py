@@ -136,9 +136,13 @@ def terrain_height_targets(
         future_surface = height[horizon_count + 3 :].reshape(
             horizon_count, 2
         )
-        surface_delta = (future_surface - current_surface).to(
+        raw_surface_delta = (future_surface - current_surface).to(
             targets.displacement_local_xy.dtype
         )
+        lateral_split = raw_surface_delta - raw_surface_delta.mean(
+            dim=1, keepdim=True
+        )
+        surface_delta = delta[:, None] + lateral_split
     return HorizonTargets(
         frames=targets.frames,
         displacement_local_xy=targets.displacement_local_xy,
