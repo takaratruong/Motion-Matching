@@ -132,6 +132,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         minimum_endpoint_warp_yaw_rad: float = 0.0,
         maximum_endpoint_warp_yaw_rad: float = math.pi,
         maximum_endpoint_warp_terrain_delta_m: float = math.inf,
+        minimum_endpoint_warp_velocity_heading_alignment: float = -1.0,
     ) -> None:
         self.base = base_matcher
         self.database = base_matcher.database
@@ -174,6 +175,12 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             <= math.pi
             or math.isnan(float(maximum_endpoint_warp_terrain_delta_m))
             or float(maximum_endpoint_warp_terrain_delta_m) < 0.0
+            or not math.isfinite(
+                float(minimum_endpoint_warp_velocity_heading_alignment)
+            )
+            or not -1.0 <= float(
+                minimum_endpoint_warp_velocity_heading_alignment
+            ) <= 1.0
         ):
             raise ContractError("endpoint warp limits must be finite non-negative")
         self.maximum_translation_warp_m = float(maximum_translation_warp_m)
@@ -186,6 +193,9 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         )
         self.maximum_endpoint_warp_terrain_delta_m = float(
             maximum_endpoint_warp_terrain_delta_m
+        )
+        self.minimum_endpoint_warp_velocity_heading_alignment = float(
+            minimum_endpoint_warp_velocity_heading_alignment
         )
         self._clip_path_to_index = {
             clip.relative_path: index
@@ -250,11 +260,23 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                 ).item()
             )
         )
+        speed = math.hypot(*normalized[0])
+        alignment = (
+            1.0
+            if speed <= 1e-8
+            else (
+                normalized[0][0] * math.cos(normalized[1])
+                + normalized[0][1] * math.sin(normalized[1])
+            )
+            / speed
+        )
         self._endpoint_warp_command = normalized
         self._endpoint_warp_command_enabled = (
             self.minimum_endpoint_warp_yaw_rad
             <= magnitude
             <= self.maximum_endpoint_warp_yaw_rad
+            and alignment
+            >= self.minimum_endpoint_warp_velocity_heading_alignment
         )
 
     def _try_start_skill(
@@ -538,6 +560,7 @@ def run_resolved_horizon_matrix(
     minimum_endpoint_warp_yaw_rad: float = 0.0,
     maximum_endpoint_warp_yaw_rad: float = math.pi,
     maximum_endpoint_warp_terrain_delta_m: float = math.inf,
+    minimum_endpoint_warp_velocity_heading_alignment: float = -1.0,
 ):
     """Run the renderer-independent route harness with horizon skill MM."""
 
@@ -692,6 +715,10 @@ def run_resolved_horizon_matrix(
                 ":warp-terrain-max:"
                 f"{float(maximum_endpoint_warp_terrain_delta_m):.9g}"
             )
+            + (
+                ":warp-velocity-heading-min:"
+                f"{float(minimum_endpoint_warp_velocity_heading_alignment):.9g}"
+            )
         ).encode()
     ).hexdigest()
 
@@ -715,6 +742,9 @@ def run_resolved_horizon_matrix(
             maximum_endpoint_warp_yaw_rad=maximum_endpoint_warp_yaw_rad,
             maximum_endpoint_warp_terrain_delta_m=(
                 maximum_endpoint_warp_terrain_delta_m
+            ),
+            minimum_endpoint_warp_velocity_heading_alignment=(
+                minimum_endpoint_warp_velocity_heading_alignment
             ),
         )
         route_matchers[route.name] = matcher

@@ -54,6 +54,7 @@ def _transactional_fixture(
     minimum_endpoint_warp_yaw_rad=0.0,
     maximum_endpoint_warp_yaw_rad=math.pi,
     maximum_endpoint_warp_terrain_delta_m=math.inf,
+    minimum_endpoint_warp_velocity_heading_alignment=-1.0,
 ):
     frames = 80
     body_position = np.zeros((frames, 3, 3), dtype=np.float32)
@@ -152,6 +153,9 @@ def _transactional_fixture(
         maximum_endpoint_warp_terrain_delta_m=(
             maximum_endpoint_warp_terrain_delta_m
         ),
+        minimum_endpoint_warp_velocity_heading_alignment=(
+            minimum_endpoint_warp_velocity_heading_alignment
+        ),
     )
     return matcher, grid
 
@@ -164,6 +168,7 @@ class TerrainSkillHorizonRolloutTest(unittest.TestCase):
             minimum_endpoint_warp_yaw_rad=0.30,
             maximum_endpoint_warp_yaw_rad=0.90,
             maximum_endpoint_warp_terrain_delta_m=0.02,
+            minimum_endpoint_warp_velocity_heading_alignment=0.80,
         )
 
         self.assertEqual(matcher.maximum_translation_warp_m, 0.15)
@@ -171,6 +176,9 @@ class TerrainSkillHorizonRolloutTest(unittest.TestCase):
         self.assertEqual(matcher.minimum_endpoint_warp_yaw_rad, 0.30)
         self.assertEqual(matcher.maximum_endpoint_warp_yaw_rad, 0.90)
         self.assertEqual(matcher.maximum_endpoint_warp_terrain_delta_m, 0.02)
+        self.assertEqual(
+            matcher.minimum_endpoint_warp_velocity_heading_alignment, 0.80
+        )
 
     def test_endpoint_warp_regime_latches_at_command_change(self):
         matcher, _grid = _transactional_fixture(
@@ -181,11 +189,11 @@ class TerrainSkillHorizonRolloutTest(unittest.TestCase):
         )
         matcher.reset()
 
-        matcher._update_endpoint_warp_command(((0.0, 0.0), 0.60))
+        matcher._update_endpoint_warp_command(((1.0, 0.0), 0.60))
         self.assertTrue(matcher._endpoint_warp_command_enabled)
-        matcher._update_endpoint_warp_command(((0.0, 0.0), 1.20))
+        matcher._update_endpoint_warp_command(((1.0, 0.0), 1.20))
         self.assertFalse(matcher._endpoint_warp_command_enabled)
-        matcher._update_endpoint_warp_command(((0.0, 0.0), 0.0))
+        matcher._update_endpoint_warp_command(((1.0, 0.0), 0.0))
         self.assertFalse(matcher._endpoint_warp_command_enabled)
 
     def test_turning_clip_layer_is_explicit(self):

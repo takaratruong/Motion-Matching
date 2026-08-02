@@ -115,6 +115,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable endpoint warp when the selected target changes height more.",
     )
     parser.add_argument(
+        "--minimum-endpoint-warp-velocity-heading-alignment",
+        type=float,
+        default=-1.0,
+        help="Warp only commands whose velocity/facing cosine exceeds this.",
+    )
+    parser.add_argument(
         "--ablation",
         choices=(
             "combined",
@@ -266,6 +272,9 @@ def main(argv: list[str] | None = None) -> int:
         maximum_endpoint_warp_terrain_delta_m=(
             args.maximum_endpoint_warp_terrain_delta_m
         ),
+        minimum_endpoint_warp_velocity_heading_alignment=(
+            args.minimum_endpoint_warp_velocity_heading_alignment
+        ),
     )
     save_horizon_matrix(matrix, events, args.output)
     execution_completed = all(
@@ -299,6 +308,9 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 "maximum_endpoint_warp_terrain_delta_m": (
                     args.maximum_endpoint_warp_terrain_delta_m
+                ),
+                "minimum_endpoint_warp_velocity_heading_alignment": (
+                    args.minimum_endpoint_warp_velocity_heading_alignment
                 ),
                 "deterministic_sha256": matrix.deterministic_sha256,
                 "output": args.output,
