@@ -42,6 +42,7 @@ class MultiHorizonSkillsCliTest(unittest.TestCase):
         self.assertEqual(args.maximum_yaw_warp_rad, 0.0)
         self.assertEqual(args.minimum_endpoint_warp_yaw_rad, 0.0)
         self.assertAlmostEqual(args.maximum_endpoint_warp_yaw_rad, math.pi)
+        self.assertTrue(math.isinf(args.maximum_endpoint_warp_terrain_delta_m))
         self.assertEqual(args.foot_correction_halflife_s, 0.04)
         locked = build_parser().parse_args(
             [
@@ -58,6 +59,7 @@ class MultiHorizonSkillsCliTest(unittest.TestCase):
                 "--maximum-yaw-warp-rad", "0.30",
                 "--minimum-endpoint-warp-yaw-rad", "0.30",
                 "--maximum-endpoint-warp-yaw-rad", "0.90",
+                "--maximum-endpoint-warp-terrain-delta-m", "0.02",
             ]
         )
         self.assertTrue(locked.foot_lock)
@@ -72,6 +74,7 @@ class MultiHorizonSkillsCliTest(unittest.TestCase):
         self.assertEqual(locked.maximum_yaw_warp_rad, 0.30)
         self.assertEqual(locked.minimum_endpoint_warp_yaw_rad, 0.30)
         self.assertEqual(locked.maximum_endpoint_warp_yaw_rad, 0.90)
+        self.assertEqual(locked.maximum_endpoint_warp_terrain_delta_m, 0.02)
 
     def test_route_selection_preserves_frozen_order_and_rejects_bad_names(self):
         routes = select_routes(

@@ -53,6 +53,7 @@ def _transactional_fixture(
     maximum_yaw_warp_rad=0.0,
     minimum_endpoint_warp_yaw_rad=0.0,
     maximum_endpoint_warp_yaw_rad=math.pi,
+    maximum_endpoint_warp_terrain_delta_m=math.inf,
 ):
     frames = 80
     body_position = np.zeros((frames, 3, 3), dtype=np.float32)
@@ -148,6 +149,9 @@ def _transactional_fixture(
         maximum_yaw_warp_rad=maximum_yaw_warp_rad,
         minimum_endpoint_warp_yaw_rad=minimum_endpoint_warp_yaw_rad,
         maximum_endpoint_warp_yaw_rad=maximum_endpoint_warp_yaw_rad,
+        maximum_endpoint_warp_terrain_delta_m=(
+            maximum_endpoint_warp_terrain_delta_m
+        ),
     )
     return matcher, grid
 
@@ -159,12 +163,14 @@ class TerrainSkillHorizonRolloutTest(unittest.TestCase):
             maximum_yaw_warp_rad=0.30,
             minimum_endpoint_warp_yaw_rad=0.30,
             maximum_endpoint_warp_yaw_rad=0.90,
+            maximum_endpoint_warp_terrain_delta_m=0.02,
         )
 
         self.assertEqual(matcher.maximum_translation_warp_m, 0.15)
         self.assertEqual(matcher.maximum_yaw_warp_rad, 0.30)
         self.assertEqual(matcher.minimum_endpoint_warp_yaw_rad, 0.30)
         self.assertEqual(matcher.maximum_endpoint_warp_yaw_rad, 0.90)
+        self.assertEqual(matcher.maximum_endpoint_warp_terrain_delta_m, 0.02)
 
     def test_endpoint_warp_regime_latches_at_command_change(self):
         matcher, _grid = _transactional_fixture(

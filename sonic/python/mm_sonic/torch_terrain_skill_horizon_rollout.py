@@ -131,6 +131,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         maximum_yaw_warp_rad: float = 0.0,
         minimum_endpoint_warp_yaw_rad: float = 0.0,
         maximum_endpoint_warp_yaw_rad: float = math.pi,
+        maximum_endpoint_warp_terrain_delta_m: float = math.inf,
     ) -> None:
         self.base = base_matcher
         self.database = base_matcher.database
@@ -171,6 +172,8 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             or not 0.0 <= float(minimum_endpoint_warp_yaw_rad)
             <= float(maximum_endpoint_warp_yaw_rad)
             <= math.pi
+            or math.isnan(float(maximum_endpoint_warp_terrain_delta_m))
+            or float(maximum_endpoint_warp_terrain_delta_m) < 0.0
         ):
             raise ContractError("endpoint warp limits must be finite non-negative")
         self.maximum_translation_warp_m = float(maximum_translation_warp_m)
@@ -180,6 +183,9 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         )
         self.maximum_endpoint_warp_yaw_rad = float(
             maximum_endpoint_warp_yaw_rad
+        )
+        self.maximum_endpoint_warp_terrain_delta_m = float(
+            maximum_endpoint_warp_terrain_delta_m
         )
         self._clip_path_to_index = {
             clip.relative_path: index
@@ -414,7 +420,22 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         )
         warp_displacement = targets.displacement_local_xy[target_index]
         warp_yaw = targets.yaw_delta_rad[target_index]
-        warp_enabled = self._endpoint_warp_command_enabled
+        terrain_delta = float(
+            torch.max(
+                torch.abs(
+                    torch.cat(
+                        (
+                            targets.root_height_delta_m[target_index].reshape(1),
+                            targets.surface_height_delta_m[target_index],
+                        )
+                    )
+                )
+            ).item()
+        )
+        warp_enabled = (
+            self._endpoint_warp_command_enabled
+            and terrain_delta <= self.maximum_endpoint_warp_terrain_delta_m
+        )
         translation_limit = (
             self.maximum_translation_warp_m if warp_enabled else 0.0
         )
@@ -516,6 +537,7 @@ def run_resolved_horizon_matrix(
     maximum_yaw_warp_rad: float = 0.0,
     minimum_endpoint_warp_yaw_rad: float = 0.0,
     maximum_endpoint_warp_yaw_rad: float = math.pi,
+    maximum_endpoint_warp_terrain_delta_m: float = math.inf,
 ):
     """Run the renderer-independent route harness with horizon skill MM."""
 
@@ -666,6 +688,10 @@ def run_resolved_horizon_matrix(
             + f":yaw-warp:{float(maximum_yaw_warp_rad):.9g}"
             + f":warp-yaw-min:{float(minimum_endpoint_warp_yaw_rad):.9g}"
             + f":warp-yaw-max:{float(maximum_endpoint_warp_yaw_rad):.9g}"
+            + (
+                ":warp-terrain-max:"
+                f"{float(maximum_endpoint_warp_terrain_delta_m):.9g}"
+            )
         ).encode()
     ).hexdigest()
 
@@ -687,6 +713,9 @@ def run_resolved_horizon_matrix(
             maximum_yaw_warp_rad=maximum_yaw_warp_rad,
             minimum_endpoint_warp_yaw_rad=minimum_endpoint_warp_yaw_rad,
             maximum_endpoint_warp_yaw_rad=maximum_endpoint_warp_yaw_rad,
+            maximum_endpoint_warp_terrain_delta_m=(
+                maximum_endpoint_warp_terrain_delta_m
+            ),
         )
         route_matchers[route.name] = matcher
         return matcher

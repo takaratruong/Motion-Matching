@@ -109,6 +109,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Apply endpoint warp only at or below this desired yaw change.",
     )
     parser.add_argument(
+        "--maximum-endpoint-warp-terrain-delta-m",
+        type=float,
+        default=math.inf,
+        help="Disable endpoint warp when the selected target changes height more.",
+    )
+    parser.add_argument(
         "--ablation",
         choices=(
             "combined",
@@ -257,6 +263,9 @@ def main(argv: list[str] | None = None) -> int:
         maximum_yaw_warp_rad=args.maximum_yaw_warp_rad,
         minimum_endpoint_warp_yaw_rad=args.minimum_endpoint_warp_yaw_rad,
         maximum_endpoint_warp_yaw_rad=args.maximum_endpoint_warp_yaw_rad,
+        maximum_endpoint_warp_terrain_delta_m=(
+            args.maximum_endpoint_warp_terrain_delta_m
+        ),
     )
     save_horizon_matrix(matrix, events, args.output)
     execution_completed = all(
@@ -287,6 +296,9 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 "maximum_endpoint_warp_yaw_rad": (
                     args.maximum_endpoint_warp_yaw_rad
+                ),
+                "maximum_endpoint_warp_terrain_delta_m": (
+                    args.maximum_endpoint_warp_terrain_delta_m
                 ),
                 "deterministic_sha256": matrix.deterministic_sha256,
                 "output": args.output,
