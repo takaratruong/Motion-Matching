@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from types import MappingProxyType
 from typing import Mapping
 
@@ -36,6 +37,28 @@ class TerrainSkillInventory:
     skills: tuple[TerrainSkill, ...]
     rejected_by_reason: Mapping[str, int]
     row_to_skill: Mapping[int, int]
+
+
+def source_contact_height_p95_m(
+    dataset: TerrainDataset, clip_index: int
+) -> float | None:
+    """Return the authenticated source contact-fit p95 for one terrain clip."""
+
+    try:
+        descriptor = dataset.manifest["clips"][clip_index]
+        if descriptor.get("kind") == "flat":
+            return None
+        value = descriptor["admission"]["contact_height_error_m"]["p95"]
+    except (AttributeError, IndexError, KeyError, TypeError) as error:
+        raise ContractError("terrain source contact quality is unavailable") from error
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        or float(value) < 0.0
+    ):
+        raise ContractError("terrain source contact quality is invalid")
+    return float(value)
 
 
 def _validate_profiles(
@@ -168,6 +191,7 @@ def build_terrain_skill_inventory(
     minimum_surface_change_m: float = 0.08,
     stable_gap_frames: int = 50,
     minimum_remaining_frames: int = 50,
+    maximum_source_contact_p95_m: float | None = None,
 ) -> TerrainSkillInventory:
     """Build an owned, deterministic terrain skill inventory."""
 
@@ -177,6 +201,13 @@ def build_terrain_skill_inventory(
         raise ContractError("terrain skill inventory requires a TorchMotionDatabase")
     if type(minimum_remaining_frames) is not int or minimum_remaining_frames < 1:
         raise ContractError("terrain skill minimum remaining frames must be positive")
+    if maximum_source_contact_p95_m is not None and (
+        not isinstance(maximum_source_contact_p95_m, (int, float))
+        or isinstance(maximum_source_contact_p95_m, bool)
+        or not math.isfinite(float(maximum_source_contact_p95_m))
+        or float(maximum_source_contact_p95_m) <= 0.0
+    ):
+        raise ContractError("maximum source contact p95 must be positive")
     if database.folder is not dataset.folder and (
         database.folder.inventory_sha256 != dataset.folder.inventory_sha256
     ):
@@ -189,10 +220,17 @@ def build_terrain_skill_inventory(
         "no_episode": 0,
         "no_entry_rows": 0,
         "overlapping_entry_rows": 0,
+        "source_quality": 0,
     }
     for clip_index, clip in enumerate(dataset.folder.clips):
         if dataset.clip_grids[clip_index] is None:
             rejected["flat"] += 1
+            continue
+        if maximum_source_contact_p95_m is not None and (
+            source_contact_height_p95_m(dataset, clip_index)
+            > float(maximum_source_contact_p95_m)
+        ):
+            rejected["source_quality"] += 1
             continue
         support = source_support_mask(dataset, clip_index).detach().clone()
         heights = _surface_height_profile(dataset, clip_index).detach().clone()

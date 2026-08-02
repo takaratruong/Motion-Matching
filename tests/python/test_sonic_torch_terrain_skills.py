@@ -3,10 +3,57 @@ import unittest
 import torch
 
 from mm_sonic.joints import ContractError
-from mm_sonic.torch_terrain_skills import SkillInterval, extract_skill_intervals
+from mm_sonic.torch_terrain_skills import (
+    SkillInterval,
+    extract_skill_intervals,
+    source_contact_height_p95_m,
+)
 
 
 class TerrainSkillIntervalTest(unittest.TestCase):
+    def test_source_contact_quality_reads_expanded_manifest(self):
+        dataset = type(
+            "Dataset",
+            (),
+            {
+                "manifest": {
+                    "clips": [
+                        {"kind": "flat", "terrain": {"kind": "flat"}},
+                        {
+                            "kind": "terrain",
+                            "admission": {
+                                "contact_height_error_m": {"p95": 0.0125}
+                            },
+                        },
+                    ]
+                }
+            },
+        )()
+
+        self.assertIsNone(source_contact_height_p95_m(dataset, 0))
+        self.assertEqual(source_contact_height_p95_m(dataset, 1), 0.0125)
+
+    def test_source_contact_quality_rejects_malformed_value(self):
+        dataset = type(
+            "Dataset",
+            (),
+            {
+                "manifest": {
+                    "clips": [
+                        {
+                            "kind": "terrain",
+                            "admission": {
+                                "contact_height_error_m": {"p95": "bad"}
+                            },
+                        }
+                    ]
+                }
+            },
+        )()
+
+        with self.assertRaisesRegex(ContractError, "contact quality"):
+            source_contact_height_p95_m(dataset, 0)
+
     def test_extracts_complete_episode_with_pre_skill_entry(self):
         support = torch.ones((30, 2), dtype=torch.bool)
         heights = torch.zeros((30, 2), dtype=torch.float32)

@@ -366,6 +366,7 @@ def run_resolved_horizon_matrix(
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
+    maximum_source_contact_p95_m: float | None = None,
 ):
     """Run the renderer-independent route harness with horizon skill MM."""
 
@@ -395,7 +396,11 @@ def run_resolved_horizon_matrix(
         config=config,
         reset_clip_path=resolved.resolved_config["reset_clip"],
     )
-    skills = build_terrain_skill_inventory(resolved.dataset, base.database)
+    skills = build_terrain_skill_inventory(
+        resolved.dataset,
+        base.database,
+        maximum_source_contact_p95_m=maximum_source_contact_p95_m,
+    )
     horizons = build_horizon_inventory(resolved.dataset, base.database, skills)
     foot_kinematics = MujocoG1FootKinematics(g1_xml)
     result_filter = None
@@ -479,6 +484,11 @@ def run_resolved_horizon_matrix(
                 else ":reactive-clearance"
             )
             + (":phase-gate-v1" if contact_phase_gate else ":implicit-phase")
+            + (
+                f":source-contact-p95:{float(maximum_source_contact_p95_m):.9g}"
+                if maximum_source_contact_p95_m is not None
+                else ":all-source-contact-quality"
+            )
         ).encode()
     ).hexdigest()
 
