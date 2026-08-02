@@ -39,17 +39,12 @@ class TerrainSkillInventory:
     row_to_skill: Mapping[int, int]
 
 
-def source_contact_height_p95_m(
-    dataset: TerrainDataset, clip_index: int
-) -> float | None:
-    """Return the authenticated source contact-fit p95 for one terrain clip."""
-
+def _source_contact_height_p95_descriptor(descriptor: object) -> float | None:
     try:
-        descriptor = dataset.manifest["clips"][clip_index]
         if descriptor.get("kind") == "flat":
             return None
         value = descriptor["admission"]["contact_height_error_m"]["p95"]
-    except (AttributeError, IndexError, KeyError, TypeError) as error:
+    except (AttributeError, KeyError, TypeError) as error:
         raise ContractError("terrain source contact quality is unavailable") from error
     if (
         not isinstance(value, (int, float))
@@ -59,6 +54,18 @@ def source_contact_height_p95_m(
     ):
         raise ContractError("terrain source contact quality is invalid")
     return float(value)
+
+
+def source_contact_height_p95_m(
+    dataset: TerrainDataset, clip_index: int
+) -> float | None:
+    """Return the authenticated source contact-fit p95 for one terrain clip."""
+
+    try:
+        descriptor = dataset.manifest["clips"][clip_index]
+    except (AttributeError, IndexError, KeyError, TypeError) as error:
+        raise ContractError("terrain source contact quality is unavailable") from error
+    return _source_contact_height_p95_descriptor(descriptor)
 
 
 def _validate_profiles(
@@ -213,6 +220,23 @@ def build_terrain_skill_inventory(
     ):
         raise ContractError("terrain skill database does not match dataset")
 
+    source_quality: tuple[float | None, ...] | None = None
+    if maximum_source_contact_p95_m is not None:
+        try:
+            descriptors = dataset.manifest["clips"]
+        except (AttributeError, KeyError, TypeError) as error:
+            raise ContractError(
+                "terrain source contact quality is unavailable"
+            ) from error
+        if not isinstance(descriptors, list) or len(descriptors) != len(
+            dataset.folder.clips
+        ):
+            raise ContractError("terrain source contact quality is misaligned")
+        source_quality = tuple(
+            _source_contact_height_p95_descriptor(descriptor)
+            for descriptor in descriptors
+        )
+
     skills: list[TerrainSkill] = []
     row_to_skill: dict[int, int] = {}
     rejected = {
@@ -226,9 +250,10 @@ def build_terrain_skill_inventory(
         if dataset.clip_grids[clip_index] is None:
             rejected["flat"] += 1
             continue
-        if maximum_source_contact_p95_m is not None and (
-            source_contact_height_p95_m(dataset, clip_index)
-            > float(maximum_source_contact_p95_m)
+        clip_quality = None if source_quality is None else source_quality[clip_index]
+        if (
+            clip_quality is not None
+            and clip_quality > float(maximum_source_contact_p95_m)
         ):
             rejected["source_quality"] += 1
             continue
