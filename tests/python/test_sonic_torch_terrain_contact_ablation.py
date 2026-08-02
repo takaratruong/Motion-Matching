@@ -34,6 +34,7 @@ class TerrainContactAblationTests(unittest.TestCase):
             "projected_stance_drift_m": 0.018,
             "projected_landing_error_m": 0.003,
             "maximum_target_error_m": 0.004,
+            "maximum_root_correction_m": 0.05,
         }
         self.assertTrue(contact_ablation_passes(passing))
         self.assertFalse(
@@ -49,6 +50,11 @@ class TerrainContactAblationTests(unittest.TestCase):
         self.assertFalse(
             contact_ablation_passes(
                 {**passing, "maximum_target_error_m": 0.006}
+            )
+        )
+        self.assertFalse(
+            contact_ablation_passes(
+                {**passing, "maximum_root_correction_m": 0.101}
             )
         )
 

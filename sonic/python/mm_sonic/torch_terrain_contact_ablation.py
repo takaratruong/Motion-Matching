@@ -75,6 +75,7 @@ def contact_ablation_passes(metrics: Mapping[str, object]) -> bool:
         "projected_stance_drift_m",
         "projected_landing_error_m",
         "maximum_target_error_m",
+        "maximum_root_correction_m",
     )
     try:
         values = {name: float(metrics[name]) for name in names}
@@ -88,6 +89,7 @@ def contact_ablation_passes(metrics: Mapping[str, object]) -> bool:
         <= values["placed_stance_drift_m"] + 0.01
         and values["projected_landing_error_m"] <= 0.12
         and values["maximum_target_error_m"] <= 0.005
+        and values["maximum_root_correction_m"] <= 0.10
     )
 
 
