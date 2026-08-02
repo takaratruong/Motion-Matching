@@ -18,7 +18,8 @@ PYTHONPATH=sonic/python:. sonic/.torch-mm-venv/bin/python -B \
   --device cuda:0 --multi-horizon --contact-phase-gate --foot-lock \
   --swing-clearance-margin-m 0.025 \
   --foot-correction-halflife-s 0.025 \
-  --swing-plan-sigma-frames 2.5
+  --swing-plan-sigma-frames 2.5 \
+  --maximum-source-contact-p95-m 0.033
 ```
 
 This remains kinematic-only: no physics and no Sonic tracking are active.
@@ -33,6 +34,7 @@ This remains kinematic-only: no physics and no Sonic tracking are active.
 | Phase + foot cleanup + 3 cm swing clearance | **6/6** | **2.320 m** | **0.093 m** | **12.00 rad/s** |
 | 3 cm clearance + 25 ms correction half-life | **6/6** | **2.024 m** | **0.093 m** | **12.00 rad/s** |
 | Recommended: source-path swing plan | **6/6** | **1.923 m** | **0.093 m** | **12.00 rad/s** |
+| Source plan + 3.3 cm source-quality ceiling | **6/6** | **1.732 m** | **0.093 m** | **12.00 rad/s** |
 
 The clean committed combined version reduces aggregate stance slide by 14.9% relative to the
 previous baseline while fixing the failed side exit. It is not uniformly
@@ -92,6 +94,15 @@ The three clean 25 ms matrices have the identical SHA-256
 Four clean source-path-plan matrices, including the post-audit build, have the
 identical SHA-256
 `40b1fa392c324954b379873b50a4c2a1de710affccff9497b935b67e79f1d1ae`.
+
+The final source-quality layer excludes GRAIL clips whose authenticated source
+foot/terrain contact-fit p95 exceeds 3.3 cm. It preserves 6/6 frozen and 16/21
+broad outcomes, keeps the same worst penetration values, reduces frozen slide
+by 10.0% (1.923 to 1.732 m), and reduces broad slide by 6.2% (7.051 to
+6.616 m). Two exact frozen runs have SHA-256
+`46d7877d73218a267da22be221a44f9a71d5293d3a3d36fea76eeee32f4023f3`.
+The useful interval is narrow and discrete: 3.5 cm reproduces the prior
+baseline, while thresholds at or below 3.2 cm lose route coverage.
 
 ## What changed
 
@@ -197,6 +208,12 @@ identical SHA-256
   individual maneuvers improved (notably reversal with previous-contact context
   and diagonal descent with next-contact context), confirming that gait context
   is informative, but a hard identity constraint overfits sparse transitions.
+- Raw corpus expansion was also tested. GRAIL exposes 1,769 curb candidates
+  and 6,094 candidates in each stair partition, versus the working corpus's
+  760 total clips. A balanced 512-per-partition build published 1,415 accepted
+  clips, but using it as a replacement passed only 2/6 frozen routes. Quantity
+  alone does not replace the targeted lateral-exit and turning coverage in the
+  curated corpus; the follow-up evaluates their deduplicated union.
 
 ## Literature alignment
 
