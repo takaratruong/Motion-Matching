@@ -4,12 +4,13 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import torch
 
 import mm_sonic.torch_terrain_live_viewer as live_module
-from mm_sonic.joints import PINNED_TARGET_TO_SOURCE_PERMUTATION
+from mm_sonic.joints import ContractError, PINNED_TARGET_TO_SOURCE_PERMUTATION
 from mm_sonic.torch_motion_features import CommandTrajectory
 from mm_sonic.torch_terrain_live_viewer import (
     ControlEdgeLatch,
@@ -142,6 +143,117 @@ class LiveCommandTests(unittest.TestCase):
 
 
 class LiveMujocoSceneTests(unittest.TestCase):
+    def test_multi_horizon_factory_uses_plain_27_value_base_database(self):
+        resolved = SimpleNamespace(
+            dataset=SimpleNamespace(root=Path("motions")),
+            device=torch.device("cpu"),
+            resolved_config={"reset_clip": "flat/motion.npz"},
+            measurement_extension=object(),
+        )
+        base = SimpleNamespace(database=object())
+        qualified = object()
+        with (
+            mock.patch.object(
+                live_module.TorchMotionMatcher,
+                "from_folder",
+                return_value=base,
+            ) as from_folder,
+            mock.patch.object(
+                live_module, "build_terrain_skill_inventory", return_value="skills"
+            ),
+            mock.patch.object(
+                live_module, "build_horizon_inventory", return_value="horizons"
+            ),
+            mock.patch.object(
+                live_module, "MujocoG1FootKinematics", return_value="feet"
+            ),
+            mock.patch.object(
+                live_module,
+                "horizon_search_config_from_experiment",
+                return_value="search",
+            ),
+            mock.patch.object(
+                live_module,
+                "TerrainSkillHorizonMatcher",
+                return_value=qualified,
+            ) as adapter,
+            mock.patch.object(
+                live_module, "matcher_config_from_resolved", return_value="matcher"
+            ),
+        ):
+            result = live_module._build_live_matcher(
+                resolved,
+                "g1.xml",
+                multi_horizon=True,
+                contact_segment_policy=None,
+                foothold_action_policy=None,
+            )
+
+        self.assertIs(result, qualified)
+        kwargs = from_folder.call_args.kwargs
+        self.assertNotIn("extension", kwargs)
+        self.assertNotIn("emitted_window_validator", kwargs)
+        self.assertEqual(kwargs["config"], "matcher")
+        adapter.assert_called_once_with(
+            base_matcher=base,
+            skill_inventory="skills",
+            horizon_inventory="horizons",
+            dataset=resolved.dataset,
+            query_terrain=resolved.measurement_extension,
+            foot_kinematics="feet",
+            config="matcher",
+            search_config="search",
+        )
+
+    def test_multi_horizon_mode_is_explicit_and_exclusive(self):
+        arguments = build_live_viewer_argument_parser().parse_args(
+            [
+                "--dataset", "motions",
+                "--config", "horizon.json",
+                "--g1-xml", "g1.xml",
+                "--multi-horizon",
+            ]
+        )
+        self.assertTrue(arguments.multi_horizon)
+        live_module._validate_live_mode(
+            multi_horizon=True,
+            contact_segments=False,
+            foothold_arm=None,
+        )
+        with self.assertRaisesRegex(ContractError, "mutually exclusive"):
+            live_module._validate_live_mode(
+                multi_horizon=True,
+                contact_segments=True,
+                foothold_arm=None,
+            )
+
+    def test_horizon_overlay_does_not_require_legacy_cost_fields(self):
+        result = SimpleNamespace(
+            diagnostics=SimpleNamespace(
+                selected_clip_path="terrain/motion.npz",
+                selected_frame=31,
+                step_time_ns=12_000_000,
+            )
+        )
+        event = SimpleNamespace(
+            target_frames=50,
+            endpoint_frame_exclusive=62,
+            cost=SimpleNamespace(entry=0.4, outcome=0.7, total=1.1),
+        )
+        command = live_module.LiveControlCommand(np.array([0.4, 0.0]), 0.0)
+
+        overlay = live_module._diagnostic_overlay(
+            result,
+            command,
+            focused=True,
+            horizon_event=event,
+        )
+
+        self.assertIn("MULTI-HORIZON", overlay[2])
+        self.assertIn("horizon=50", overlay[3])
+        self.assertIn("endpoint=62", overlay[3])
+        self.assertIn("entry=0.40", overlay[3])
+
     def test_layered_graph_arm_is_available_in_viewer(self):
         arguments = build_live_viewer_argument_parser().parse_args(
             [
@@ -247,16 +359,16 @@ class LiveMujocoSceneTests(unittest.TestCase):
         )
         self.assertIn(
             "terrain_transition_validator_from_resolved",
-            inspect.getsource(live_module.run_live_viewer),
+            inspect.getsource(live_module._build_live_matcher),
         )
         self.assertIn(
             "emitted_window_validator",
-            inspect.getsource(live_module.run_live_viewer),
+            inspect.getsource(live_module._build_live_matcher),
         )
         help_text = build_live_viewer_argument_parser().format_help()
         for option in (
             "--dataset", "--config", "--g1-xml", "--device",
-            "--contact-segments", "--foothold-arm",
+            "--contact-segments", "--foothold-arm", "--multi-horizon",
         ):
             self.assertIn(option, help_text)
         self.assertIn(

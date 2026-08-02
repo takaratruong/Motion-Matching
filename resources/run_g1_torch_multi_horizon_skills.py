@@ -7,7 +7,6 @@ import argparse
 from dataclasses import replace
 import hashlib
 import json
-import math
 import os
 from pathlib import Path
 import shutil
@@ -24,24 +23,11 @@ from mm_sonic.torch_terrain_skill_horizon_rollout import (
     HorizonChunkEvent,
     run_resolved_horizon_matrix,
 )
-from mm_sonic.torch_terrain_skill_horizon_search import HorizonSearchConfig
+from mm_sonic.torch_terrain_skill_horizon_search import (
+    HorizonSearchConfig,
+    horizon_search_config_from_experiment,
+)
 from mm_sonic.torch_terrain_skill_rollout import qualification_routes
-
-
-_SEARCH_FIELDS = {
-    "horizons",
-    "maximum_endpoint_lateness_frames",
-    "entry_weight",
-    "displacement_weight",
-    "yaw_weight",
-    "height_weight",
-    "duration_weight",
-    "stall_weight",
-    "moving_speed_mps",
-    "minimum_progress_m",
-    "turn_gate_rad",
-    "surface_gate_m",
-}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -86,27 +72,10 @@ def select_routes(names: list[str], use_qualification_slice: bool):
 
 
 def search_config_from_experiment(config: Mapping) -> HorizonSearchConfig:
-    descriptor = config.get("multi_horizon")
-    if not isinstance(descriptor, dict) or set(descriptor) != _SEARCH_FIELDS:
-        raise ValueError("multi_horizon fields are invalid")
-    if descriptor["horizons"] != [25, 50, 100]:
-        raise ValueError("multi_horizon horizons must equal [25, 50, 100]")
-    if descriptor["maximum_endpoint_lateness_frames"] != 25:
-        raise ValueError("multi_horizon endpoint lateness must equal 25")
-    values = {
-        key: descriptor[key]
-        for key in _SEARCH_FIELDS
-        if key not in {"horizons", "maximum_endpoint_lateness_frames"}
-    }
-    if any(
-        not isinstance(value, (int, float))
-        or isinstance(value, bool)
-        or not math.isfinite(float(value))
-        or float(value) < 0.0
-        for value in values.values()
-    ):
-        raise ValueError("multi_horizon weights and gates must be finite non-negative")
-    return HorizonSearchConfig(**{key: float(value) for key, value in values.items()})
+    try:
+        return horizon_search_config_from_experiment(config)
+    except Exception as error:
+        raise ValueError(str(error)) from error
 
 
 def canonical_chunk_events(events: Sequence[HorizonChunkEvent]) -> bytes:

@@ -88,6 +88,23 @@ joint state. MuJoCo renders the authenticated stair heightfield, copies each
 state into `qpos`, and runs forward kinematics only. It does not integrate
 physics and does not launch SONIC, GEAR, or a tracking policy.
 
+To drive the qualified stable-endpoint multi-horizon terrain matcher instead:
+
+```bash
+DISPLAY=:1 PYTHONPATH=sonic/python \
+  sonic/.torch-mm-venv/bin/python -B -m \
+  mm_sonic.torch_terrain_live_viewer \
+  --dataset build/torch-grail-terrain-feedback-v2 \
+  --config sonic/configs/experiments/torch_grail_multi_horizon_skills.json \
+  --g1-xml /home/ubuntu/projects/mjx-diffphysics/env/g1/assets/g1_29dof.xml \
+  --device cuda:0 \
+  --multi-horizon
+```
+
+The controls are unchanged. The right overlay shows the committed horizon,
+stable endpoint, and entry/outcome costs. A coverage failure remains visible in
+the window instead of closing it; change command or press Backspace to retry.
+
 ## 5. Record an MP4
 
 ```bash

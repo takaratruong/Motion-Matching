@@ -18,8 +18,25 @@ from .torch_motion_matcher import (
 )
 from .torch_terrain_skill_horizons import (
     HORIZON_TARGET_FRAMES,
+    MAXIMUM_ENDPOINT_LATENESS_FRAMES,
     TerrainSkillHorizonInventory,
 )
+
+
+_SEARCH_CONFIG_FIELDS = {
+    "horizons",
+    "maximum_endpoint_lateness_frames",
+    "entry_weight",
+    "displacement_weight",
+    "yaw_weight",
+    "height_weight",
+    "duration_weight",
+    "stall_weight",
+    "moving_speed_mps",
+    "minimum_progress_m",
+    "turn_gate_rad",
+    "surface_gate_m",
+}
 
 
 @dataclass(frozen=True)
@@ -96,6 +113,49 @@ class HorizonSearchFailure(ContractError):
 
 
 TerrainHorizonValidator = Callable[[int, int, int], bool]
+
+
+def horizon_search_config_from_experiment(
+    config: Mapping,
+) -> HorizonSearchConfig:
+    """Load the exact qualified horizon weights from an experiment mapping."""
+
+    descriptor = config.get("multi_horizon")
+    if (
+        not isinstance(descriptor, dict)
+        or set(descriptor) != _SEARCH_CONFIG_FIELDS
+    ):
+        raise ContractError("multi_horizon fields are invalid")
+    if descriptor["horizons"] != list(HORIZON_TARGET_FRAMES):
+        raise ContractError(
+            f"multi_horizon horizons must equal {list(HORIZON_TARGET_FRAMES)}"
+        )
+    if (
+        descriptor["maximum_endpoint_lateness_frames"]
+        != MAXIMUM_ENDPOINT_LATENESS_FRAMES
+    ):
+        raise ContractError(
+            "multi_horizon endpoint lateness must equal "
+            f"{MAXIMUM_ENDPOINT_LATENESS_FRAMES}"
+        )
+    values = {
+        key: descriptor[key]
+        for key in _SEARCH_CONFIG_FIELDS
+        if key not in {"horizons", "maximum_endpoint_lateness_frames"}
+    }
+    if any(
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        or float(value) < 0.0
+        for value in values.values()
+    ):
+        raise ContractError(
+            "multi_horizon weights and gates must be finite non-negative"
+        )
+    return HorizonSearchConfig(
+        **{key: float(value) for key, value in values.items()}
+    )
 
 
 def _rotate_inverse_xy(values: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:

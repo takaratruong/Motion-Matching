@@ -8,14 +8,14 @@ import math
 from pathlib import Path
 import tempfile
 import time
-from typing import Sequence
+from typing import Any, Sequence
 import xml.etree.ElementTree as ET
 
 import numpy as np
 import torch
 
 from .joints import ContractError
-from .torch_g1_fk import target_state_qpos
+from .torch_g1_fk import MujocoG1FootKinematics, target_state_qpos
 from .operator_x11 import KEYSYMS, X11KeyStateProvider
 from .torch_motion_features import CommandTrajectory
 from .torch_motion_matcher import (
@@ -31,6 +31,12 @@ from .torch_terrain_rollout import (
     resolve_stair_config,
     terrain_transition_validator_from_resolved,
 )
+from .torch_terrain_skill_horizon_rollout import TerrainSkillHorizonMatcher
+from .torch_terrain_skill_horizon_search import (
+    horizon_search_config_from_experiment,
+)
+from .torch_terrain_skill_horizons import build_horizon_inventory
+from .torch_terrain_skills import build_terrain_skill_inventory
 
 
 _DT_S = 0.02
@@ -420,27 +426,109 @@ def _set_patch_markers(mujoco_module, viewer, positions: np.ndarray) -> None:
 
 
 def _diagnostic_overlay(
-    result: MotionMatchResult,
+    result: object,
     command: LiveControlCommand,
     *,
     focused: bool,
+    horizon_event: object | None = None,
+    fault: str | None = None,
+    multi_horizon: bool = False,
 ) -> tuple[None, None, str, str]:
     diagnostic = result.diagnostics
+    horizon_mode = multi_horizon or horizon_event is not None
     left = (
-        "KINEMATIC ONLY / NO PHYSICS / NO SONIC\n"
-        "WASD move  Space stop  Backspace reset  X exit\n"
+        (
+            "MULTI-HORIZON KINEMATIC / NO PHYSICS / NO SONIC\n"
+            if horizon_mode
+            else "KINEMATIC ONLY / NO PHYSICS / NO SONIC\n"
+        )
+        + "WASD move  Space stop  Backspace reset  X exit\n"
         f"focus={'LIVE' if focused else 'click MuJoCo window'}\n"
         f"command=({command.velocity_world_xy[0]:+.3f}, "
         f"{command.velocity_world_xy[1]:+.3f}) m/s"
     )
-    right = (
-        f"{diagnostic.selected_clip_path}:{diagnostic.selected_frame}\n"
-        f"motion={diagnostic.motion_feature_cost:.2f}  "
-        f"terrain={diagnostic.extension_feature_cost:.2f}\n"
-        f"total={diagnostic.selected_total_cost:.2f}\n"
-        f"matcher={diagnostic.step_time_ns / 1e6:.2f} ms"
-    )
+    if fault is not None:
+        right = (
+            f"SEARCH FAILURE: {fault}\n"
+            "change command or Backspace reset"
+        )
+    elif horizon_event is not None:
+        right = (
+            f"{diagnostic.selected_clip_path}:{diagnostic.selected_frame}\n"
+            f"horizon={horizon_event.target_frames}  "
+            f"endpoint={horizon_event.endpoint_frame_exclusive}\n"
+            f"entry={horizon_event.cost.entry:.2f}  "
+            f"outcome={horizon_event.cost.outcome:.2f}\n"
+            f"total={horizon_event.cost.total:.2f}  "
+            f"matcher={diagnostic.step_time_ns / 1e6:.2f} ms"
+        )
+    else:
+        right = (
+            f"{diagnostic.selected_clip_path}:{diagnostic.selected_frame}\n"
+            f"motion={diagnostic.motion_feature_cost:.2f}  "
+            f"terrain={diagnostic.extension_feature_cost:.2f}\n"
+            f"total={diagnostic.selected_total_cost:.2f}\n"
+            f"matcher={diagnostic.step_time_ns / 1e6:.2f} ms"
+        )
     return (None, None, left, right)
+
+
+def _validate_live_mode(
+    *,
+    multi_horizon: bool,
+    contact_segments: bool,
+    foothold_arm: str | None,
+) -> None:
+    if multi_horizon and (contact_segments or foothold_arm is not None):
+        raise ContractError(
+            "multi-horizon and contact/foothold modes are mutually exclusive"
+        )
+
+
+def _build_live_matcher(
+    resolved: ResolvedStairConfig,
+    g1_xml: str | Path,
+    *,
+    multi_horizon: bool,
+    contact_segment_policy: Any,
+    foothold_action_policy: Any,
+):
+    matcher_config = matcher_config_from_resolved(resolved.resolved_config)
+    if multi_horizon:
+        base = TorchMotionMatcher.from_folder(
+            resolved.dataset.root,
+            device=str(resolved.device),
+            config=matcher_config,
+            reset_clip_path=resolved.resolved_config["reset_clip"],
+        )
+        skills = build_terrain_skill_inventory(resolved.dataset, base.database)
+        horizons = build_horizon_inventory(
+            resolved.dataset, base.database, skills
+        )
+        return TerrainSkillHorizonMatcher(
+            base_matcher=base,
+            skill_inventory=skills,
+            horizon_inventory=horizons,
+            dataset=resolved.dataset,
+            query_terrain=resolved.measurement_extension,
+            foot_kinematics=MujocoG1FootKinematics(str(g1_xml)),
+            config=matcher_config,
+            search_config=horizon_search_config_from_experiment(
+                resolved.resolved_config
+            ),
+        )
+    return TorchMotionMatcher.from_folder(
+        resolved.dataset.root,
+        device=str(resolved.device),
+        config=matcher_config,
+        extension=resolved.measurement_extension,
+        reset_clip_path=resolved.resolved_config["reset_clip"],
+        emitted_window_validator=terrain_transition_validator_from_resolved(
+            resolved
+        ),
+        contact_segment_policy=contact_segment_policy,
+        foothold_action_policy=foothold_action_policy,
+    )
 
 
 def run_live_viewer(
@@ -449,6 +537,7 @@ def run_live_viewer(
     config: str | Path,
     g1_xml: str | Path,
     device: str,
+    multi_horizon: bool = False,
     contact_segments: bool = False,
     foothold_arm: str | None = None,
     foothold_height_tolerance_m: float = 0.04,
@@ -468,6 +557,11 @@ def run_live_viewer(
         import mujoco.viewer
     except ImportError as error:
         raise ContractError("live terrain viewer requires mujoco viewer") from error
+    _validate_live_mode(
+        multi_horizon=multi_horizon,
+        contact_segments=contact_segments,
+        foothold_arm=foothold_arm,
+    )
     if contact_segments:
         from .torch_contact_segment_rollout import (
             build_contact_segment_policy,
@@ -551,15 +645,10 @@ def run_live_viewer(
             strafe_action_gate_enabled=bool(strafe_action_gate),
         )
     matcher_config = matcher_config_from_resolved(resolved.resolved_config)
-    matcher = TorchMotionMatcher.from_folder(
-        resolved.dataset.root,
-        device=str(resolved.device),
-        config=matcher_config,
-        extension=resolved.measurement_extension,
-        reset_clip_path=resolved.resolved_config["reset_clip"],
-        emitted_window_validator=(
-            terrain_transition_validator_from_resolved(resolved)
-        ),
+    matcher = _build_live_matcher(
+        resolved,
+        g1_xml,
+        multi_horizon=multi_horizon,
         contact_segment_policy=contact_segment_policy,
         foothold_action_policy=foothold_action_policy,
     )
@@ -602,6 +691,8 @@ def run_live_viewer(
     ).trajectory
     provider: X11KeyStateProvider | None = None
     latch = ControlEdgeLatch()
+    horizon_fault: str | None = None
+    fault_command: tuple[tuple[float, float], float] | None = None
     try:
         with mujoco.viewer.launch_passive(
             model,
@@ -651,6 +742,8 @@ def run_live_viewer(
                         shaped_heading,
                         config=matcher_config,
                     ).trajectory
+                    horizon_fault = None
+                    fault_command = None
                 else:
                     marker_result = result
                     requested_velocity = torch.tensor(
@@ -672,19 +765,38 @@ def run_live_viewer(
                         config=matcher_config,
                     )
                     marker_trajectory = shaped.trajectory
+                command_identity = (
+                    (
+                        float(command.velocity_world_xy[0]),
+                        float(command.velocity_world_xy[1]),
+                    ),
+                    float(command.heading_world_yaw),
+                )
+                if fault_command is not None and command_identity != fault_command:
+                    horizon_fault = None
+                    fault_command = None
                 if not edges.reset_requested and command.advance_matcher:
-                    heading = command.heading_world_yaw
-                    prepared = matcher.prepare_step(
-                        (
-                            float(command.velocity_world_xy[0]),
-                            float(command.velocity_world_xy[1]),
-                        ),
-                        heading,
-                        dt=_DT_S,
-                    )
-                    result = matcher.commit(prepared)
-                    shaped_velocity = shaped.velocity_world_xy.clone()
-                    shaped_heading = shaped.heading_world_yaw.clone()
+                    if fault_command is None:
+                        heading = command.heading_world_yaw
+                        try:
+                            prepared = matcher.prepare_step(
+                                command_identity[0],
+                                heading,
+                                dt=_DT_S,
+                            )
+                            result = matcher.commit(prepared)
+                            shaped_velocity = shaped.velocity_world_xy.clone()
+                            shaped_heading = shaped.heading_world_yaw.clone()
+                            horizon_fault = None
+                        except ContractError as error:
+                            if not multi_horizon:
+                                raise
+                            horizon_fault = str(error)
+                            fault_command = command_identity
+                            print(
+                                f"MULTI-HORIZON SEARCH FAILURE: {error}",
+                                flush=True,
+                            )
                 qpos = matcher_result_qpos(result)
                 patch = dense_patch_positions(
                     marker_result,
@@ -697,7 +809,16 @@ def run_live_viewer(
                     viewer.cam.lookat[:] = qpos[:3]
                 viewer.set_texts(
                     _diagnostic_overlay(
-                        result, command, focused=levels.focused
+                        result,
+                        command,
+                        focused=levels.focused,
+                        horizon_event=(
+                            matcher.chunk_events[-1]
+                            if multi_horizon and matcher.chunk_events
+                            else None
+                        ),
+                        fault=horizon_fault,
+                        multi_horizon=multi_horizon,
                     )
                 )
                 viewer.sync()
@@ -723,6 +844,11 @@ def build_live_viewer_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", required=True)
     parser.add_argument("--g1-xml", required=True)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--multi-horizon",
+        action="store_true",
+        help="Use the qualified stable-endpoint multi-horizon matcher.",
+    )
     parser.add_argument(
         "--contact-segments",
         action="store_true",
@@ -795,6 +921,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         config=args.config,
         g1_xml=args.g1_xml,
         device=args.device,
+        multi_horizon=args.multi_horizon,
         contact_segments=args.contact_segments,
         foothold_arm=args.foothold_arm,
         foothold_height_tolerance_m=args.foothold_height_tolerance_m,
