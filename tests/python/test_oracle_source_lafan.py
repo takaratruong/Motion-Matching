@@ -1,10 +1,12 @@
 import hashlib
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import numpy as np
 
+from mm_sonic.grail_terrain_source import G1MujocoFK
 from mm_sonic.terrain_oracle.canonical import (
     ISAACLAB_BODY_NAMES,
     ISAACLAB_JOINT_NAMES,
@@ -22,10 +24,12 @@ MODEL = Path(
 )
 
 
-def _write_lafan_csv(path: Path, *, frames: int = 4) -> Path:
+def _write_lafan_csv(
+    path: Path, *, frames: int = 4, root_x_step: float = 0.03
+) -> Path:
     timeline = np.arange(frames, dtype=np.float64)
     rows = np.zeros((frames, 36), dtype=np.float64)
-    rows[:, 0] = timeline * 0.03
+    rows[:, 0] = timeline * root_x_step
     rows[:, 1] = timeline * -0.01
     rows[:, 2] = 0.8
     yaw = timeline * 0.2
@@ -38,6 +42,53 @@ def _write_lafan_csv(path: Path, *, frames: int = 4) -> Path:
 
 @unittest.skipUnless(MODEL.is_file(), "real G1 MuJoCo model is unavailable")
 class LafanSourceAdapterTests(unittest.TestCase):
+    def test_snapshot_bytes_and_shared_fk_preserve_original_authority_identity(self):
+        """Catches mutable-authority reads and reopening the model per CSV."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            authority = _write_lafan_csv(
+                root / "walk4_subject1.csv", root_x_step=0.03
+            )
+            authority_alias = root / "authority-alias" / authority.name
+            authority_alias.parent.symlink_to(
+                authority.parent, target_is_directory=True
+            )
+            snapshot = _write_lafan_csv(
+                root / "private-copy.csv", root_x_step=0.09
+            )
+            snapshot_bytes = snapshot.read_bytes()
+            fk = G1MujocoFK(MODEL)
+
+            try:
+                with mock.patch(
+                    "mm_sonic.terrain_oracle.source_lafan.G1MujocoFK",
+                    side_effect=AssertionError("must reuse supplied FK"),
+                ):
+                    clip = load_lafan_csv(
+                        snapshot,
+                        MODEL,
+                        terrain=None,
+                        authority_path=authority_alias,
+                        fk=fk,
+                    )
+            except TypeError as error:
+                self.fail(f"snapshot/shared-FK API is missing: {error}")
+
+            self.assertEqual(clip.clip_id, authority.stem)
+            self.assertEqual(clip.source.source_path, str(authority_alias))
+            self.assertEqual(
+                clip.source.source_sha256,
+                hashlib.sha256(snapshot_bytes).hexdigest(),
+            )
+            self.assertEqual(clip.source.source_size_bytes, len(snapshot_bytes))
+            np.testing.assert_allclose(
+                clip.root_position_world[:, 0],
+                (0.0, 0.054, 0.108, 0.162, 0.216, 0.27),
+                rtol=0.0,
+                atol=1.0e-7,
+            )
+
     def test_30_hz_csv_resamples_to_50_hz_without_duplicate_endpoint(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = _write_lafan_csv(

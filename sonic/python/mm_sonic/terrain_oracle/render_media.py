@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
+from dataclasses import fields, is_dataclass
 from fractions import Fraction
 import hashlib
 import importlib.metadata
+import io
 import json
 import math
 import os
@@ -17,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 from typing import Any
+import zipfile
 
 os.environ.setdefault("MUJOCO_GL", "osmesa")
 
@@ -25,10 +28,17 @@ from PIL import Image, ImageDraw, PngImagePlugin, UnidentifiedImageError
 
 from mm_sonic.joints import ContractError
 
+from . import storage as canonical_storage
 from .audit import structural_model_sha256, terrain_query_sha256
+from .canonical import (
+    CanonicalClip,
+    CanonicalTerrainMesh,
+    CommandTrack,
+    SourceIdentity,
+    TerrainBinding,
+)
 from .contact import CanonicalMeshQuery
 from .math3d import RigidTransform
-from .storage import read_clip, read_mesh
 
 
 FIXED_RENDER_CONFIG = {
@@ -37,6 +47,9 @@ FIXED_RENDER_CONFIG = {
     "height": 240,
     "fps": 50,
     "max_frames": 1000000,
+    "max_inputs": 4096,
+    "max_decoded_unique_bytes": 2147483648,
+    "max_representative_frame_bytes": 1073741824,
     "camera": {
         "azimuth": 135.0,
         "elevation": -20.0,
@@ -85,7 +98,21 @@ _TRANSFORM_FIELDS = {
     "translation_world",
     "quaternion_world_from_local_wxyz",
 }
-_MODEL_FIELDS = {"path", "size_bytes", "sha256", "structural_sha256"}
+_MODEL_FIELDS = {
+    "path",
+    "size_bytes",
+    "sha256",
+    "structural_sha256",
+    "dependency_vfs",
+}
+_MODEL_VFS_FIELDS = {
+    "root_path",
+    "root_relative_path",
+    "directory_count",
+    "file_count",
+    "size_bytes",
+    "tree_sha256",
+}
 _SHA256_DIGITS = frozenset("0123456789abcdef")
 _TRUSTED_MODULE_NAMES = (
     "render_media.py",
@@ -96,6 +123,10 @@ _TRUSTED_MODULE_NAMES = (
     "storage.py",
 )
 _SUBPROCESS_TIMEOUT_SECONDS = 3600.0
+_MAX_MODEL_VFS_DIRECTORIES = 16
+_MAX_MODEL_VFS_FILES = 128
+_MAX_MODEL_VFS_BYTES = 64 * 1024 * 1024
+_MAX_MODEL_ROOT_XML_BYTES = 1024 * 1024
 
 
 def _encoded_frame_count(
@@ -150,6 +181,200 @@ def _positive_int(value: object, label: str) -> int:
     return value
 
 
+def _nonnegative_int(value: object, label: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ContractError(f"{label} must be a nonnegative integer")
+    return value
+
+
+def _overlay_grid(input_count: int) -> tuple[int, int, int, int]:
+    """Return the exact square-grid geometry, rejecting zero-sized tiles."""
+
+    count = _positive_int(input_count, "overlay input count")
+    width = int(FIXED_RENDER_CONFIG["width"])
+    height = int(FIXED_RENDER_CONFIG["height"])
+    columns = math.isqrt(count)
+    if columns * columns != count:
+        columns += 1
+    rows = (count + columns - 1) // columns
+    tile_width = width // columns
+    tile_height = height // rows
+    if tile_width < 1 or tile_height < 1:
+        raise ContractError("render request cannot produce positive overlay tiles")
+    return columns, rows, tile_width, tile_height
+
+
+def _validate_representative_frame_budget(input_count: int) -> None:
+    count = _positive_int(input_count, "render input count")
+    if count > _positive_int(
+        FIXED_RENDER_CONFIG["max_inputs"], "render_config.max_inputs"
+    ):
+        raise ContractError("render request exceeds the bounded input limit")
+    _overlay_grid(count)
+    retained_bytes = (
+        count
+        * int(FIXED_RENDER_CONFIG["width"])
+        * int(FIXED_RENDER_CONFIG["height"])
+        * 3
+    )
+    if retained_bytes > _positive_int(
+        FIXED_RENDER_CONFIG["max_representative_frame_bytes"],
+        "render_config.max_representative_frame_bytes",
+    ):
+        raise ContractError(
+            "render request exceeds the representative-frame memory limit"
+        )
+
+
+def _validate_render_resource_budget(
+    kind: str,
+    inputs: Sequence[dict[str, object]],
+) -> None:
+    _validate_representative_frame_budget(len(inputs))
+    if _encoded_frame_count(kind, inputs) > _positive_int(
+        FIXED_RENDER_CONFIG["max_frames"], "render_config.max_frames"
+    ):
+        raise ContractError("render request exceeds the bounded frame limit")
+
+
+def _decoded_artifact_nbytes(value: object) -> int:
+    """Count unique NumPy storage retained by one decoded canonical artifact."""
+
+    pending = [value]
+    visited: set[int] = set()
+    arrays: set[int] = set()
+    total = 0
+    while pending:
+        item = pending.pop()
+        if isinstance(item, np.ndarray):
+            identity = id(item)
+            if identity not in arrays:
+                arrays.add(identity)
+                total += int(item.nbytes)
+            continue
+        identity = id(item)
+        if identity in visited:
+            continue
+        visited.add(identity)
+        if is_dataclass(item) and not isinstance(item, type):
+            pending.extend(getattr(item, field.name) for field in fields(item))
+        elif isinstance(item, dict):
+            pending.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            pending.extend(item)
+    return total
+
+
+def _npz_decoded_size_upper_bound(payload: bytes, label: str) -> int:
+    """Read canonical NPZ metadata without allocating its decoded arrays."""
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload), "r") as archive:
+            members = archive.infolist()
+            if (
+                not members
+                or any(
+                    member.is_dir()
+                    or member.compress_type != zipfile.ZIP_STORED
+                    or member.flag_bits & 0x1
+                    for member in members
+                )
+            ):
+                raise ContractError(f"{label} is not a canonical stored NPZ")
+            size_bytes = sum(int(member.file_size) for member in members)
+    except ContractError:
+        raise
+    except (OSError, ValueError, zipfile.BadZipFile) as error:
+        raise ContractError(f"{label} is not a valid bounded NPZ") from error
+    if size_bytes < 1:
+        raise ContractError(f"{label} has no decoded artifact bytes")
+    return size_bytes
+
+
+def _decode_authenticated_clip_payload(payload: bytes) -> CanonicalClip:
+    """Decode one already-authenticated clip without reopening its pathname."""
+
+    array_names = canonical_storage._CLIP_ARRAY_NAMES
+    try:
+        with np.load(io.BytesIO(payload), allow_pickle=False) as archive:
+            metadata = canonical_storage._read_json_array(
+                archive,
+                "metadata_json",
+            )
+            source = SourceIdentity(**metadata["source"])
+            terrain_data = metadata["terrain"]
+            terrain = None
+            if terrain_data is not None:
+                transform = terrain_data["world_from_terrain"]
+                terrain = TerrainBinding(
+                    asset_path=terrain_data["asset_path"],
+                    asset_size_bytes=terrain_data["asset_size_bytes"],
+                    asset_sha256=terrain_data["asset_sha256"],
+                    asset_license_id=terrain_data["asset_license_id"],
+                    mesh_sha256=terrain_data["mesh_sha256"],
+                    world_from_terrain=RigidTransform(**transform),
+                    validity_mask_path=terrain_data["validity_mask_path"],
+                )
+            commands = CommandTrack(
+                **{name: archive[name] for name in array_names[16:]}
+            )
+            clip = CanonicalClip(
+                clip_id=metadata["clip_id"],
+                fps=metadata["fps"],
+                source=source,
+                joint_names=tuple(metadata["joint_names"]),
+                body_names=tuple(metadata["body_names"]),
+                **{name: archive[name] for name in array_names[:16]},
+                commands=commands,
+                terrain=terrain,
+                action_tags=tuple(metadata["action_tags"]),
+                mirror_of=metadata["mirror_of"],
+            )
+    except ContractError:
+        raise
+    except (KeyError, TypeError, ValueError) as error:
+        raise ContractError(
+            "invalid authenticated canonical clip payload"
+        ) from error
+    clip.validate()
+    return clip
+
+
+def _decode_authenticated_mesh_payload(
+    payload: bytes,
+) -> CanonicalTerrainMesh:
+    """Decode one already-authenticated mesh without reopening its pathname."""
+
+    try:
+        with np.load(io.BytesIO(payload), allow_pickle=False) as archive:
+            metadata = canonical_storage._read_json_array(
+                archive,
+                "metadata_json",
+            )
+            return CanonicalTerrainMesh(
+                vertices_local=archive["vertices_local"],
+                faces=archive["faces"],
+                valid_faces=archive["valid_faces"],
+                source_asset_sha256=metadata["source_asset_sha256"],
+            )
+    except ContractError:
+        raise
+    except (KeyError, TypeError, ValueError) as error:
+        raise ContractError(
+            "invalid authenticated canonical mesh payload"
+        ) from error
+
+
+def _checked_decoded_total(current: int, additional: int) -> int:
+    total = current + _positive_int(additional, "decoded artifact bytes")
+    if total > _positive_int(
+        FIXED_RENDER_CONFIG["max_decoded_unique_bytes"],
+        "render_config.max_decoded_unique_bytes",
+    ):
+        raise ContractError("render request exceeds the decoded artifact byte limit")
+    return total
+
+
 def _absolute_regular_path(value: object, label: str) -> Path:
     if type(value) is not str or not value:
         raise ContractError(f"{label} must be an absolute canonical path")
@@ -171,7 +396,12 @@ def _absolute_regular_path(value: object, label: str) -> Path:
     return path
 
 
-def _read_regular_file(value: object, label: str) -> tuple[Path, bytes]:
+def _read_regular_file(
+    value: object,
+    label: str,
+    *,
+    max_bytes: int | None = None,
+) -> tuple[Path, bytes]:
     path = _absolute_regular_path(value, label)
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
@@ -179,11 +409,21 @@ def _read_regular_file(value: object, label: str) -> tuple[Path, bytes]:
             metadata = os.fstat(descriptor)
             if not stat.S_ISREG(metadata.st_mode):
                 raise ContractError(f"{label} must be a regular file")
+            if max_bytes is not None and metadata.st_size > max_bytes:
+                raise ContractError(
+                    f"{label} exceeds the decoded artifact byte limit"
+                )
             chunks: list[bytes] = []
+            size_bytes = 0
             while True:
                 chunk = os.read(descriptor, 1024 * 1024)
                 if not chunk:
                     break
+                size_bytes += len(chunk)
+                if max_bytes is not None and size_bytes > max_bytes:
+                    raise ContractError(
+                        f"{label} exceeds the decoded artifact byte limit"
+                    )
                 chunks.append(chunk)
         finally:
             os.close(descriptor)
@@ -196,16 +436,328 @@ def _match_file_record(
     value: dict[str, Any],
     fields: set[str],
     label: str,
+    *,
+    max_bytes: int | None = None,
 ) -> tuple[Path, bytes]:
     record = _exact_dict(value, fields, label)
-    path, payload = _read_regular_file(record["path"], f"{label}.path")
+    expected_size = _positive_int(record["size_bytes"], f"{label}.size_bytes")
+    expected_digest = _digest(record["sha256"], f"{label}.sha256")
+    if max_bytes is not None and expected_size > max_bytes:
+        raise ContractError(
+            f"{label} exceeds the decoded artifact byte limit"
+        )
+    path, payload = _read_regular_file(
+        record["path"], f"{label}.path", max_bytes=max_bytes
+    )
     if (
-        _positive_int(record["size_bytes"], f"{label}.size_bytes") != len(payload)
-        or _digest(record["sha256"], f"{label}.sha256")
-        != hashlib.sha256(payload).hexdigest()
+        expected_size != len(payload)
+        or expected_digest != hashlib.sha256(payload).hexdigest()
     ):
         raise ContractError(f"{label} file authority is stale")
     return path, payload
+
+
+def _canonical_vfs_relative_path(value: object, label: str) -> str:
+    if type(value) is not str or not value:
+        raise ContractError(f"{label} must be a nonempty relative path")
+    path = Path(value)
+    if (
+        path.is_absolute()
+        or path.as_posix() != value
+        or any(part in ("", ".", "..") for part in path.parts)
+    ):
+        raise ContractError(f"{label} is not canonical")
+    return value
+
+
+def _absolute_directory_path(value: object, label: str) -> Path:
+    if type(value) is not str or not value:
+        raise ContractError(f"{label} must be an absolute canonical path")
+    path = Path(value)
+    if not path.is_absolute() or path != Path(os.path.normpath(path)):
+        raise ContractError(f"{label} must be absolute and canonical")
+    try:
+        resolved = path.resolve(strict=True)
+        metadata = path.stat(follow_symlinks=False)
+    except (OSError, RuntimeError) as error:
+        raise ContractError(f"{label} is unavailable") from error
+    if (
+        path != resolved
+        or path.is_symlink()
+        or not stat.S_ISDIR(metadata.st_mode)
+    ):
+        raise ContractError(f"{label} must be a canonical regular directory")
+    return path
+
+
+def _same_opened_entry(before: os.stat_result, opened: os.stat_result) -> bool:
+    return (
+        before.st_dev == opened.st_dev
+        and before.st_ino == opened.st_ino
+        and stat.S_IFMT(before.st_mode) == stat.S_IFMT(opened.st_mode)
+    )
+
+
+def _snapshot_model_vfs(
+    root: Path,
+) -> tuple[dict[str, bytes], dict[str, object]]:
+    """Capture one bounded, no-follow model tree through stable descriptors."""
+
+    root_path = _absolute_directory_path(str(root), "model VFS root")
+    try:
+        root_descriptor = os.open(
+            root_path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+        )
+    except OSError as error:
+        raise ContractError("model VFS root cannot be opened safely") from error
+    directories: list[str] = []
+    files: list[dict[str, object]] = []
+    payloads: dict[str, bytes] = {}
+    total_bytes = 0
+
+    def walk(descriptor: int, prefix: str) -> None:
+        nonlocal total_bytes
+        try:
+            names = sorted(os.listdir(descriptor))
+        except OSError as error:
+            raise ContractError("model VFS directory cannot be listed") from error
+        for name in names:
+            if not name or name in (".", "..") or "/" in name or "\0" in name:
+                raise ContractError("model VFS contains a noncanonical name")
+            relative_path = f"{prefix}/{name}" if prefix else name
+            try:
+                before = os.stat(
+                    name,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                raise ContractError(
+                    "model VFS entry cannot be inspected safely"
+                ) from error
+            if stat.S_ISDIR(before.st_mode):
+                if len(directories) >= _MAX_MODEL_VFS_DIRECTORIES:
+                    raise ContractError(
+                        "model VFS exceeds the bounded directory limit"
+                    )
+                try:
+                    child = os.open(
+                        name,
+                        os.O_RDONLY
+                        | os.O_CLOEXEC
+                        | os.O_NOFOLLOW
+                        | os.O_DIRECTORY,
+                        dir_fd=descriptor,
+                    )
+                except OSError as error:
+                    raise ContractError(
+                        "model VFS directory cannot be opened safely"
+                    ) from error
+                try:
+                    opened = os.fstat(child)
+                    if (
+                        not stat.S_ISDIR(opened.st_mode)
+                        or not _same_opened_entry(before, opened)
+                    ):
+                        raise ContractError(
+                            "model VFS directory changed during snapshot"
+                        )
+                    directories.append(relative_path)
+                    walk(child, relative_path)
+                finally:
+                    os.close(child)
+                continue
+            if not stat.S_ISREG(before.st_mode):
+                raise ContractError(
+                    "model VFS contains a symlink or non-regular entry"
+                )
+            if len(files) >= _MAX_MODEL_VFS_FILES:
+                raise ContractError("model VFS exceeds the bounded file limit")
+            if (
+                before.st_size < 1
+                or before.st_size > _MAX_MODEL_VFS_BYTES - total_bytes
+            ):
+                raise ContractError("model VFS exceeds the bounded byte limit")
+            try:
+                file_descriptor = os.open(
+                    name,
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=descriptor,
+                )
+            except OSError as error:
+                raise ContractError(
+                    "model VFS file cannot be opened safely"
+                ) from error
+            try:
+                opened = os.fstat(file_descriptor)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or not _same_opened_entry(before, opened)
+                    or opened.st_size != before.st_size
+                ):
+                    raise ContractError(
+                        "model VFS file changed during snapshot"
+                    )
+                chunks: list[bytes] = []
+                size_bytes = 0
+                while True:
+                    chunk = os.read(file_descriptor, 1024 * 1024)
+                    if not chunk:
+                        break
+                    size_bytes += len(chunk)
+                    if size_bytes > before.st_size:
+                        raise ContractError(
+                            "model VFS file changed during snapshot"
+                        )
+                    chunks.append(chunk)
+                after = os.fstat(file_descriptor)
+            finally:
+                os.close(file_descriptor)
+            if (
+                not _same_opened_entry(opened, after)
+                or size_bytes != before.st_size
+                or after.st_size != before.st_size
+                or after.st_mtime_ns != before.st_mtime_ns
+                or after.st_ctime_ns != before.st_ctime_ns
+            ):
+                raise ContractError("model VFS file changed during snapshot")
+            payload = b"".join(chunks)
+            total_bytes += len(payload)
+            payloads[relative_path] = payload
+            files.append(
+                {
+                    "relative_path": relative_path,
+                    "size_bytes": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }
+            )
+
+    try:
+        root_metadata = os.fstat(root_descriptor)
+        if not stat.S_ISDIR(root_metadata.st_mode):
+            raise ContractError("model VFS root is not a directory")
+        walk(root_descriptor, "")
+    finally:
+        os.close(root_descriptor)
+    if not files:
+        raise ContractError("model VFS must contain at least one file")
+    tree_evidence = {"directories": directories, "files": files}
+    authority = {
+        "root_path": str(root_path),
+        "directory_count": len(directories),
+        "file_count": len(files),
+        "size_bytes": total_bytes,
+        "tree_sha256": hashlib.sha256(
+            _canonical_json_bytes(tree_evidence, "model VFS tree evidence")
+        ).hexdigest(),
+    }
+    return payloads, authority
+
+
+def _normalized_model_vfs(value: object) -> dict[str, object]:
+    record = _exact_dict(value, _MODEL_VFS_FIELDS, "model dependency VFS")
+    root_path = _absolute_directory_path(
+        record["root_path"],
+        "model dependency VFS root_path",
+    )
+    root_relative_path = _canonical_vfs_relative_path(
+        record["root_relative_path"],
+        "model dependency VFS root_relative_path",
+    )
+    directory_count = _nonnegative_int(
+        record["directory_count"],
+        "model dependency VFS directory_count",
+    )
+    file_count = _positive_int(
+        record["file_count"],
+        "model dependency VFS file_count",
+    )
+    size_bytes = _positive_int(
+        record["size_bytes"],
+        "model dependency VFS size_bytes",
+    )
+    if (
+        directory_count > _MAX_MODEL_VFS_DIRECTORIES
+        or file_count > _MAX_MODEL_VFS_FILES
+        or size_bytes > _MAX_MODEL_VFS_BYTES
+    ):
+        raise ContractError("model dependency VFS authority exceeds fixed bounds")
+    return {
+        "root_path": str(root_path),
+        "root_relative_path": root_relative_path,
+        "directory_count": directory_count,
+        "file_count": file_count,
+        "size_bytes": size_bytes,
+        "tree_sha256": _digest(
+            record["tree_sha256"],
+            "model dependency VFS tree_sha256",
+        ),
+    }
+
+
+def _authenticated_model_spec(
+    value: object,
+) -> tuple[object, dict[str, object]]:
+    """Build a retained spec exclusively from one authenticated in-memory VFS."""
+
+    model_record = _exact_dict(value, _MODEL_FIELDS, "model")
+    model_path = _absolute_regular_path(model_record["path"], "model.path")
+    expected_size = _positive_int(model_record["size_bytes"], "model.size_bytes")
+    expected_sha256 = _digest(model_record["sha256"], "model.sha256")
+    expected_structural_sha256 = _digest(
+        model_record["structural_sha256"],
+        "model.structural_sha256",
+    )
+    authority = _normalized_model_vfs(model_record["dependency_vfs"])
+    root_path = Path(str(authority["root_path"]))
+    root_relative_path = str(authority["root_relative_path"])
+    if model_path != root_path / root_relative_path:
+        raise ContractError("model path is not bound to its dependency VFS root")
+    payloads, captured = _snapshot_model_vfs(root_path)
+    actual_authority = {
+        **captured,
+        "root_relative_path": root_relative_path,
+    }
+    if actual_authority != authority:
+        raise ContractError("model dependency VFS authority is stale")
+    root_payload = payloads.get(root_relative_path)
+    if (
+        root_payload is None
+        or len(root_payload) != expected_size
+        or len(root_payload) > _MAX_MODEL_ROOT_XML_BYTES
+        or hashlib.sha256(root_payload).hexdigest() != expected_sha256
+    ):
+        raise ContractError("model root XML authority is stale")
+    try:
+        root_xml = root_payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ContractError("model root XML must be UTF-8") from error
+    includes = {
+        relative_path: payload
+        for relative_path, payload in payloads.items()
+        if relative_path != root_relative_path
+        and relative_path.lower().endswith(".xml")
+    }
+    assets = {
+        relative_path: payload
+        for relative_path, payload in payloads.items()
+        if not relative_path.lower().endswith(".xml")
+    }
+    try:
+        import mujoco
+
+        model_spec = mujoco.MjSpec.from_string(
+            root_xml,
+            include=includes,
+            assets=assets,
+        )
+        model = model_spec.compile()
+    except (ImportError, RuntimeError, TypeError, ValueError) as error:
+        raise ContractError("model VFS must compile as MuJoCo XML") from error
+    if structural_model_sha256(model) != expected_structural_sha256:
+        raise ContractError("model structural authority is stale")
+    return model_spec, authority
 
 
 def _validated_transform(value: object) -> RigidTransform:
@@ -236,21 +788,7 @@ def validate_render_request(value: object) -> dict[str, Any]:
     if request["render_config"] != FIXED_RENDER_CONFIG:
         raise ContractError("render request configuration is not the fixed profile")
 
-    model_record = _exact_dict(request["model"], _MODEL_FIELDS, "model")
-    model_path, model_payload = _match_file_record(
-        model_record, _MODEL_FIELDS, "model"
-    )
-    _digest(model_record["structural_sha256"], "model.structural_sha256")
-    try:
-        import mujoco
-
-        model = mujoco.MjModel.from_xml_path(str(model_path))
-    except (ImportError, ValueError) as error:
-        raise ContractError("model must be a loadable MuJoCo XML model") from error
-    if structural_model_sha256(model) != model_record["structural_sha256"]:
-        raise ContractError("model structural authority is stale")
-    if len(model_payload) != model_record["size_bytes"]:
-        raise ContractError("model byte authority is stale")
+    model_spec, model_vfs = _authenticated_model_spec(request["model"])
 
     keys = request["interval_keys"]
     inputs = request["inputs"]
@@ -267,8 +805,12 @@ def validate_render_request(value: object) -> dict[str, Any]:
         raise ContractError("render request must bind an exact ordered interval set")
     if request["kind"] == "accepted_interval" and len(inputs) != 1:
         raise ContractError("accepted_interval requests bind exactly one input")
+    _validate_representative_frame_budget(len(inputs))
 
     loaded_inputs: list[dict[str, object]] = []
+    clip_cache: dict[bytes, tuple[Path, object]] = {}
+    mesh_cache: dict[bytes, tuple[Path, object]] = {}
+    decoded_unique_bytes = 0
     for expected_key, raw_input in zip(keys, inputs, strict=True):
         item = _exact_dict(raw_input, _INPUT_FIELDS, "render input")
         if item["interval_key"] != expected_key:
@@ -285,10 +827,35 @@ def validate_render_request(value: object) -> dict[str, Any]:
             raise ContractError("render interval must be nonempty and half-open")
 
         clip_record = _exact_dict(item["clip"], _CLIP_FIELDS, "clip")
-        clip_path, _ = _match_file_record(clip_record, _CLIP_FIELDS, "clip")
-        if clip_path.stem != clip_record["sha256"]:
-            raise ContractError("clip path is not content addressed")
-        clip = read_clip(clip_path)
+        clip_key = _canonical_json_bytes(clip_record, "clip record")
+        cached_clip = clip_cache.get(clip_key)
+        if cached_clip is None:
+            remaining_bytes = (
+                int(FIXED_RENDER_CONFIG["max_decoded_unique_bytes"])
+                - decoded_unique_bytes
+            )
+            clip_path, clip_payload = _match_file_record(
+                clip_record,
+                _CLIP_FIELDS,
+                "clip",
+                max_bytes=remaining_bytes,
+            )
+            if clip_path.stem != clip_record["sha256"]:
+                raise ContractError("clip path is not content addressed")
+            clip_decoded_bound = _npz_decoded_size_upper_bound(
+                clip_payload, "clip"
+            )
+            next_decoded_total = _checked_decoded_total(
+                decoded_unique_bytes, clip_decoded_bound
+            )
+            clip = _decode_authenticated_clip_payload(clip_payload)
+            del clip_payload
+            if _decoded_artifact_nbytes(clip) > clip_decoded_bound:
+                raise ContractError("clip decoded artifact size is inconsistent")
+            decoded_unique_bytes = next_decoded_total
+            clip_cache[clip_key] = (clip_path, clip)
+        else:
+            clip_path, clip = cached_clip
         if (
             clip.clip_id != clip_record["clip_id"]
             or clip.source.source_sha256 != clip_record["source_sha256"]
@@ -306,12 +873,37 @@ def validate_render_request(value: object) -> dict[str, Any]:
         mesh_record = _exact_dict(
             item["terrain_mesh"], _MESH_FIELDS, "terrain_mesh"
         )
-        mesh_path, _ = _match_file_record(
-            mesh_record, _MESH_FIELDS, "terrain_mesh"
-        )
-        if mesh_path.stem != mesh_record["sha256"]:
-            raise ContractError("terrain mesh path is not content addressed")
-        mesh = read_mesh(mesh_path)
+        mesh_key = _canonical_json_bytes(mesh_record, "terrain mesh record")
+        cached_mesh = mesh_cache.get(mesh_key)
+        if cached_mesh is None:
+            remaining_bytes = (
+                int(FIXED_RENDER_CONFIG["max_decoded_unique_bytes"])
+                - decoded_unique_bytes
+            )
+            mesh_path, mesh_payload = _match_file_record(
+                mesh_record,
+                _MESH_FIELDS,
+                "terrain_mesh",
+                max_bytes=remaining_bytes,
+            )
+            if mesh_path.stem != mesh_record["sha256"]:
+                raise ContractError("terrain mesh path is not content addressed")
+            mesh_decoded_bound = _npz_decoded_size_upper_bound(
+                mesh_payload, "terrain mesh"
+            )
+            next_decoded_total = _checked_decoded_total(
+                decoded_unique_bytes, mesh_decoded_bound
+            )
+            mesh = _decode_authenticated_mesh_payload(mesh_payload)
+            del mesh_payload
+            if _decoded_artifact_nbytes(mesh) > mesh_decoded_bound:
+                raise ContractError(
+                    "terrain mesh decoded artifact size is inconsistent"
+                )
+            decoded_unique_bytes = next_decoded_total
+            mesh_cache[mesh_key] = (mesh_path, mesh)
+        else:
+            mesh_path, mesh = cached_mesh
         if (
             mesh.source_asset_sha256 != mesh_record["source_asset_sha256"]
             or clip.terrain.mesh_sha256 != mesh_record["sha256"]
@@ -352,16 +944,13 @@ def validate_render_request(value: object) -> dict[str, Any]:
                 "mesh_path": mesh_path,
             }
         )
-    if _encoded_frame_count(
-        str(request["kind"]),
-        loaded_inputs,
-    ) > int(FIXED_RENDER_CONFIG["max_frames"]):
-        raise ContractError("render request exceeds the bounded frame limit")
-    if len(loaded_inputs) > int(FIXED_RENDER_CONFIG["width"]) * int(
-        FIXED_RENDER_CONFIG["height"]
-    ):
-        raise ContractError("render request has too many inputs for exact tile coverage")
-    return {**request, "_loaded_inputs": loaded_inputs, "_model": model}
+    _validate_render_resource_budget(str(request["kind"]), loaded_inputs)
+    return {
+        **request,
+        "_loaded_inputs": loaded_inputs,
+        "_model_spec": model_spec,
+        "_model_dependency_vfs": model_vfs,
+    }
 
 
 def load_render_request(path: Path) -> dict[str, object]:
@@ -490,14 +1079,14 @@ def _validated_new_output_path(value: Path, label: str) -> Path:
 
 
 def _build_scene_model(
-    model_path: Path,
+    model_spec: object,
     mesh: object,
     transform: RigidTransform,
 ) -> tuple[object, int]:
     try:
         import mujoco
 
-        spec = mujoco.MjSpec.from_file(str(model_path))
+        spec = model_spec.copy()
         faces = np.asarray(mesh.faces[mesh.valid_faces], dtype=np.int32)
         spec.add_mesh(
             name="terrain_oracle_surface",
@@ -579,7 +1168,7 @@ def _annotate_contact(frame: np.ndarray, contact: np.ndarray) -> np.ndarray:
 
 def _render_input_frames(
     item: dict[str, object],
-    model_path: Path,
+    model_spec: object,
     consume: Any,
     *,
     representative_only: bool,
@@ -588,7 +1177,7 @@ def _render_input_frames(
 
     clip = item["clip"]
     model, visual_mesh_count = _build_scene_model(
-        model_path, item["mesh"], item["transform"]
+        model_spec, item["mesh"], item["transform"]
     )
     data = mujoco.MjData(model)
     width = int(FIXED_RENDER_CONFIG["width"])
@@ -640,7 +1229,7 @@ def _render_input_frames(
 def _encode_video(
     path: Path,
     inputs: Sequence[dict[str, object]],
-    model_path: Path,
+    model_spec: object,
     *,
     representative_only: bool = False,
 ) -> tuple[list[np.ndarray], dict[str, int], int]:
@@ -714,7 +1303,7 @@ def _encode_video(
         for item in inputs:
             representative, item_evidence, item_frames = _render_input_frames(
                 item,
-                model_path,
+                model_spec,
                 consume,
                 representative_only=representative_only,
             )
@@ -755,10 +1344,9 @@ def _save_overlay(
 ) -> None:
     width = int(FIXED_RENDER_CONFIG["width"])
     height = int(FIXED_RENDER_CONFIG["height"])
-    columns = max(1, math.ceil(math.sqrt(len(representative_frames))))
-    rows = math.ceil(len(representative_frames) / columns)
-    tile_width = width // columns
-    tile_height = height // rows
+    columns, _, tile_width, tile_height = _overlay_grid(
+        len(representative_frames)
+    )
     sheet = Image.new(
         "RGB", (width, height), tuple(FIXED_RENDER_CONFIG["background_rgb"])
     )
@@ -946,7 +1534,6 @@ def render_media(
     if video == overlay:
         raise ContractError("video and overlay outputs must be distinct")
     request = load_render_request(Path(request_path))
-    model_path = Path(request["model"]["path"])
     temporary_paths: list[Path] = []
     try:
         video_descriptor, video_name = tempfile.mkstemp(
@@ -964,9 +1551,12 @@ def render_media(
         representative_frames, evidence, frame_count = _encode_video(
             temporary_video,
             request["_loaded_inputs"],
-            model_path,
+            request["_model_spec"],
             representative_only=request["kind"] == "contact_sheet",
         )
+        evidence["model_dependency_vfs"] = request[
+            "_model_dependency_vfs"
+        ]
         _save_overlay(
             temporary_overlay, representative_frames, request["interval_keys"]
         )

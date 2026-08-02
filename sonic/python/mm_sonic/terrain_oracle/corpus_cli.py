@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 import errno
+from functools import lru_cache
 import hashlib
 import io
 import json
@@ -17,7 +19,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from typing import Iterable, Sequence
+from typing import Iterable, Iterator, Sequence
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -46,6 +48,28 @@ from .contact import (
     reconstruct_contacts,
 )
 from .math3d import RigidTransform
+
+
+_PHASE1_PRIMARY_INVENTORY_SHA256 = (
+    "a7d6157116eec567b5a4df2daf21c95f"
+    "4a6363b8dc8c6dfe1a8a5c6652c6063c"
+)
+_PHASE1_LAFAN_INVENTORY_SHA256 = (
+    "1b1f8097c532a08c26e39e7f504f7bb"
+    "2f4e887636129c59f95930ea0ef41d844"
+)
+_PHASE1_G1_ROOT_NAME = "g1_29dof_rev_1_0.xml"
+_PHASE1_G1_ROOT_SHA256 = (
+    "2e92915c253c6774d305cbd9ee13e7ea"
+    "523d3c06a28551f8ce2f92fdc6138e87"
+)
+_PHASE1_G1_VFS_DIRECTORY_COUNT = 2
+_PHASE1_G1_VFS_FILE_COUNT = 88
+_PHASE1_G1_VFS_SIZE_BYTES = 60_248_622
+_PHASE1_G1_VFS_TREE_SHA256 = (
+    "e41a1311012dd9eaf3d5e733d5aefc82"
+    "62f6024dd5c2f8e55dc617ab1db3977d"
+)
 
 
 @dataclass(frozen=True)
@@ -205,9 +229,20 @@ def _validated_inventory_document(
     path: Path,
     label: str,
     expected_sources: frozenset[str],
+    trusted_file_sha256: str,
 ) -> dict[str, object]:
     inventory_path = _cli_input_file(path, label)
-    document, _ = _load_canonical_json(inventory_path, label)
+    document, payload = _load_canonical_json(inventory_path, label)
+    if (
+        _validated_sha256(
+            trusted_file_sha256,
+            f"{label} trusted file SHA-256",
+        )
+        != hashlib.sha256(payload).hexdigest()
+    ):
+        raise ContractError(
+            f"{label} is not the trusted phase-1 inventory"
+        )
     if set(document) != {
         "schema",
         "sources",
@@ -271,6 +306,9 @@ def _validated_inventory_document(
 def _load_import_inventories(
     primary_path: Path,
     lafan_path: Path,
+    *,
+    primary_sha256: str = _PHASE1_PRIMARY_INVENTORY_SHA256,
+    lafan_sha256: str = _PHASE1_LAFAN_INVENTORY_SHA256,
 ) -> tuple[
     dict[str, object],
     dict[str, object],
@@ -282,11 +320,13 @@ def _load_import_inventories(
         primary_path,
         "primary source inventory",
         frozenset(("flat", "justin", "grail")),
+        primary_sha256,
     )
     lafan = _validated_inventory_document(
         lafan_path,
         "LAFAN source inventory",
         frozenset(("lafan",)),
+        lafan_sha256,
     )
     if primary["content_sha256"] == lafan["content_sha256"]:
         raise ContractError(
@@ -661,6 +701,42 @@ def _require_exact_inventory_sources(
     return flat, justin, grail, families, lafan
 
 
+@contextmanager
+def _snapshot_real_import_roots(
+    flat: Path,
+    justin: Path,
+    lafan: Path,
+) -> Iterator[tuple[Path, Path, Path]]:
+    """Yield private no-follow snapshots for every safe real-source adapter."""
+
+    with tempfile.TemporaryDirectory(
+        prefix="terrain-oracle-import-snapshot-"
+    ) as temporary:
+        snapshot_root = Path(temporary)
+        os.chmod(snapshot_root, 0o700)
+        flat_snapshot = snapshot_root / "flat"
+        justin_snapshot = snapshot_root / "justin.zarr"
+        lafan_release_snapshot = snapshot_root / "lafan-release"
+        for destination in (
+            flat_snapshot,
+            justin_snapshot,
+            lafan_release_snapshot,
+        ):
+            destination.mkdir(mode=0o700)
+        _snapshot_directory_nofollow(flat, flat_snapshot)
+        _snapshot_directory_nofollow(justin, justin_snapshot)
+        _snapshot_directory_nofollow(
+            lafan.parent,
+            lafan_release_snapshot,
+        )
+        lafan_snapshot = lafan_release_snapshot / lafan.name
+        if not lafan_snapshot.is_dir() or lafan_snapshot.is_symlink():
+            raise ContractError(
+                "LAFAN snapshot does not contain the authoritative g1 root"
+            )
+        yield flat_snapshot, justin_snapshot, lafan_snapshot
+
+
 def _verified_inventory_file_payload(
     path: Path,
     identity: object,
@@ -683,13 +759,180 @@ def _verified_inventory_file_payload(
     return payload
 
 
+def _grail_inventory_record(
+    root: Path,
+    record: object,
+) -> dict[str, object]:
+    metadata_path = record.shard_path / "clips.json"  # type: ignore[attr-defined]
+    metadata = _file_identity(
+        metadata_path,
+        metadata_path.relative_to(root).as_posix(),
+    )
+    robot_path = record.robot_path  # type: ignore[attr-defined]
+    terrain_path = record.usd_path  # type: ignore[attr-defined]
+    robot_identity = _file_identity(
+        robot_path,
+        robot_path.relative_to(root).as_posix(),
+    )
+    terrain_identity = _file_identity(
+        terrain_path,
+        terrain_path.relative_to(root).as_posix(),
+    )
+    return {
+        "family": record.family,  # type: ignore[attr-defined]
+        "stem": record.stem,  # type: ignore[attr-defined]
+        "frame_count": record.n_frames,  # type: ignore[attr-defined]
+        "robot": {
+            **robot_identity,
+            "path": str(robot_path.resolve()),
+            "license_id": "UNRECORDED",
+        },
+        "terrain": {
+            **terrain_identity,
+            "path": str(terrain_path.resolve()),
+            "license_id": "UNRECORDED",
+            "world_from_terrain": {
+                "translation_world": np.asarray(
+                    record.terrain_position_env,  # type: ignore[attr-defined]
+                    dtype=np.float32,
+                ).tolist(),
+                "quaternion_world_from_local_wxyz": np.asarray(
+                    record.terrain_rotation_env_wxyz,  # type: ignore[attr-defined]
+                    dtype=np.float32,
+                ).tolist(),
+            },
+        },
+        "shard_metadata": metadata,
+        "pose_source": record.pose_source,  # type: ignore[attr-defined]
+    }
+
+
+def _grail_record_from_inventory(
+    root: Path,
+    value: dict[str, object],
+) -> source_grail.GrailClipRecord:
+    """Reconstruct one record from the code-anchored inventory authority."""
+
+    if not isinstance(value, dict) or set(value) != {
+        "family",
+        "stem",
+        "frame_count",
+        "robot",
+        "terrain",
+        "shard_metadata",
+        "pose_source",
+    }:
+        raise ContractError("GRAIL inventory record fields do not match v1")
+
+    def source_path(
+        identity: object,
+        label: str,
+        *,
+        require_absolute_authority: bool,
+    ) -> Path:
+        if not isinstance(identity, dict):
+            raise ContractError(f"{label} identity must be an object")
+        relative_value = identity.get("relative_path")
+        if type(relative_value) is not str or not relative_value:
+            raise ContractError(f"{label} relative path is invalid")
+        relative = Path(relative_value)
+        if (
+            relative.is_absolute()
+            or relative.as_posix() != relative_value
+            or any(part in ("", ".", "..") for part in relative.parts)
+        ):
+            raise ContractError(f"{label} relative path is not canonical")
+        path = root / relative
+        if require_absolute_authority and identity.get("path") != str(path):
+            raise ContractError(
+                f"{label} absolute path differs from inventory root"
+            )
+        return path
+
+    robot = value["robot"]
+    terrain = value["terrain"]
+    metadata = value["shard_metadata"]
+    robot_path = source_path(
+        robot,
+        "GRAIL robot",
+        require_absolute_authority=True,
+    )
+    terrain_path = source_path(
+        terrain,
+        "GRAIL terrain",
+        require_absolute_authority=True,
+    )
+    metadata_path = source_path(
+        metadata,
+        "GRAIL shard metadata",
+        require_absolute_authority=False,
+    )
+    if metadata_path.name != "clips.json":
+        raise ContractError("GRAIL shard metadata must name clips.json")
+    if not isinstance(terrain, dict):
+        raise ContractError("GRAIL terrain identity must be an object")
+    transform_value = terrain.get("world_from_terrain")
+    if not isinstance(transform_value, dict) or set(transform_value) != {
+        "translation_world",
+        "quaternion_world_from_local_wxyz",
+    }:
+        raise ContractError("GRAIL inventory terrain transform is invalid")
+    try:
+        transform = RigidTransform(
+            transform_value["translation_world"],
+            transform_value["quaternion_world_from_local_wxyz"],
+        )
+    except (TypeError, ValueError) as error:
+        raise ContractError(
+            "GRAIL inventory terrain transform is invalid"
+        ) from error
+    family = value["family"]
+    stem = value["stem"]
+    frame_count = value["frame_count"]
+    pose_source = value["pose_source"]
+    if (
+        type(family) is not str
+        or not family
+        or type(stem) is not str
+        or not stem
+        or type(frame_count) is not int
+        or frame_count < 1
+        or type(pose_source) is not str
+        or not pose_source
+    ):
+        raise ContractError("GRAIL inventory record semantics are invalid")
+    return source_grail.GrailClipRecord(
+        family=family,
+        shard_path=metadata_path.parent,
+        stem=stem,
+        robot_path=robot_path,
+        usd_path=terrain_path,
+        n_frames=frame_count,
+        terrain_position_env=np.asarray(
+            transform.translation_world,
+            dtype=np.float32,
+        ),
+        terrain_rotation_env_wxyz=np.asarray(
+            transform.quaternion_world_from_local_wxyz,
+            dtype=np.float32,
+        ),
+        pose_source=pose_source,
+    )
+
+
 def _load_verified_grail_source(
     record: object,
     inventory_record: dict[str, object],
     fk: object,
+    *,
+    grail_root: Path,
 ) -> source_grail.GrailCanonicalSource:
     """Snapshot exact PKL/USD bytes before either unsafe parser can observe them."""
 
+    if _grail_inventory_record(grail_root, record) != inventory_record:
+        raise ContractError(
+            "GRAIL record metadata or semantics differ from inventory authority"
+        )
     robot_identity = inventory_record.get("robot")
     terrain_identity = inventory_record.get("terrain")
     if not isinstance(robot_identity, dict) or not isinstance(
@@ -757,7 +1000,7 @@ def _import_real_sources(arguments: argparse.Namespace) -> None:
             arguments.lafan_inventory,
         )
     )
-    flat_root, justin_root, grail_root, families, lafan_root = (
+    flat_root, justin_root, grail_root, _families, lafan_root = (
         _require_exact_inventory_sources(arguments, declared_sources)
     )
     model_path = _cli_input_file(arguments.model, "mechanical model")
@@ -898,10 +1141,15 @@ def _import_real_sources(arguments: argparse.Namespace) -> None:
                 f"{label} adapter output differs from inventory authority"
             )
 
+    flat_import_root = flat_root
+    justin_import_root = justin_root
+    lafan_import_root = lafan_root
+
     def clip_stream() -> Iterable[CanonicalClip]:
         for clip in source_flat.iter_flat_clips(
-            flat_root,
+            flat_import_root,
             tags=("flat", "other"),
+            authority_root=flat_root,
         ):
             expected = flat_records.get(clip.clip_id)
             if expected is None or clip.clip_id in seen_ids["flat"]:
@@ -919,8 +1167,9 @@ def _import_real_sources(arguments: argparse.Namespace) -> None:
             )
 
         for clip in source_justin.iter_justin_clips(
-            justin_root,
+            justin_import_root,
             justin_binding,
+            authority_path=justin_root,
         ):
             expected = justin_records.get(clip.clip_id)
             if expected is None or clip.clip_id in seen_ids["justin"]:
@@ -937,9 +1186,12 @@ def _import_real_sources(arguments: argparse.Namespace) -> None:
                 binding=justin_binding,
             )
 
-        discovered = source_grail.discover_clean_c490_records(
-            grail_root,
-            families=families,
+        discovered = tuple(
+            _grail_record_from_inventory(
+                grail_root,
+                inventory_record,
+            )
+            for _, inventory_record in sorted(grail_records.items())
         )
         for source_record in discovered:
             key = (source_record.family, source_record.stem)
@@ -952,6 +1204,7 @@ def _import_real_sources(arguments: argparse.Namespace) -> None:
                 source_record,
                 inventory_record,
                 fk,
+                grail_root=grail_root,
             )
             robot = inventory_record["robot"]
             if (
@@ -991,10 +1244,21 @@ def _import_real_sources(arguments: argparse.Namespace) -> None:
             )
 
         for clip_name, inventory_record in sorted(lafan_records.items()):
+            authority_path = Path(
+                str(inventory_record["source_path"])
+            )
+            try:
+                relative_path = authority_path.relative_to(lafan_root)
+            except ValueError as error:
+                raise ContractError(
+                    "LAFAN inventory path escapes its authoritative root"
+                ) from error
             clip = source_lafan.load_lafan_csv(
-                Path(str(inventory_record["source_path"])),
+                lafan_import_root / relative_path,
                 model_path,
                 terrain=plane_binding,
+                authority_path=authority_path,
+                fk=fk,
             )
             expected_identity = {
                 key: inventory_record[key]
@@ -1053,12 +1317,22 @@ def _import_real_sources(arguments: argparse.Namespace) -> None:
             "frames_by_source": dict(sorted(frame_counts.items())),
         }
 
-    _publish_bundle(
-        arguments.output,
-        clip_stream(),
-        meshes_by_sha256.values(),
-        metadata,
-    )
+    with _snapshot_real_import_roots(
+        flat_root,
+        justin_root,
+        lafan_root,
+    ) as snapshots:
+        (
+            flat_import_root,
+            justin_import_root,
+            lafan_import_root,
+        ) = snapshots
+        _publish_bundle(
+            arguments.output,
+            clip_stream(),
+            meshes_by_sha256.values(),
+            metadata,
+        )
 
 
 def _model_record(path: Path, model: object) -> dict[str, object]:
@@ -1726,11 +2000,61 @@ def _trusted_media_model(model_record: object) -> dict[str, object]:
         model_record,
         "trusted renderer model",
     )
+    path = _cli_input_file(
+        Path(str(normalized["asset_path"])),
+        "pinned exact G1 model",
+    )
+    if (
+        str(path) != normalized["asset_path"]
+        or path.name != _PHASE1_G1_ROOT_NAME
+        or normalized["asset_sha256"] != _PHASE1_G1_ROOT_SHA256
+    ):
+        raise ContractError(
+            "trusted rendering requires the pinned exact G1 model authority"
+        )
+    dependency_vfs = dict(
+        _pinned_g1_dependency_vfs(str(path.parent))
+    )
     return {
-        "path": normalized["asset_path"],
+        "path": str(path),
         "size_bytes": normalized["asset_size_bytes"],
         "sha256": normalized["asset_sha256"],
         "structural_sha256": normalized["structural_sha256"],
+        "dependency_vfs": dependency_vfs,
+    }
+
+
+@lru_cache(maxsize=4)
+def _pinned_g1_dependency_vfs(root_value: str) -> dict[str, object]:
+    root = Path(root_value)
+    directories, files, tree_sha256 = storage._directory_tree_evidence(
+        root,
+        (),
+    )
+    size_bytes = sum(int(record["size_bytes"]) for record in files)
+    root_records = [
+        record
+        for record in files
+        if record["relative_path"] == _PHASE1_G1_ROOT_NAME
+    ]
+    if (
+        len(directories) != _PHASE1_G1_VFS_DIRECTORY_COUNT
+        or len(files) != _PHASE1_G1_VFS_FILE_COUNT
+        or size_bytes != _PHASE1_G1_VFS_SIZE_BYTES
+        or tree_sha256 != _PHASE1_G1_VFS_TREE_SHA256
+        or len(root_records) != 1
+        or root_records[0]["sha256"] != _PHASE1_G1_ROOT_SHA256
+    ):
+        raise ContractError(
+            "trusted rendering requires the pinned exact G1 dependency VFS"
+        )
+    return {
+        "root_path": str(root),
+        "root_relative_path": _PHASE1_G1_ROOT_NAME,
+        "directory_count": len(directories),
+        "file_count": len(files),
+        "size_bytes": size_bytes,
+        "tree_sha256": tree_sha256,
     }
 
 
@@ -1946,14 +2270,10 @@ def _validated_trusted_renderer_result(
 
     if result["runtime_identity"] != render_media.runtime_identity():
         raise ContractError("trusted renderer runtime identity is stale")
-    evidence = result["render_evidence"]
-    if (
-        not isinstance(evidence, dict)
-        or set(evidence)
-        != {"visual_mesh_geom_count", "terrain_face_count"}
-        or any(type(value) is not int or value < 1 for value in evidence.values())
-    ):
-        raise ContractError("trusted renderer visual evidence is incomplete")
+    _validate_trusted_render_evidence(
+        result["render_evidence"],
+        request,
+    )
     return {
         **result,
         "video": normalized_artifact(
@@ -1969,6 +2289,34 @@ def _validated_trusted_renderer_result(
             overlay_metadata,
         ),
     }
+
+
+def _validate_trusted_render_evidence(
+    value: object,
+    request: dict[str, object],
+) -> None:
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {
+            "visual_mesh_geom_count",
+            "terrain_face_count",
+            "model_dependency_vfs",
+        }
+        or any(
+            type(value[name]) is not int or value[name] < 1
+            for name in ("visual_mesh_geom_count", "terrain_face_count")
+        )
+    ):
+        raise ContractError("trusted renderer visual evidence is incomplete")
+    model = request.get("model")
+    if (
+        not isinstance(model, dict)
+        or value["model_dependency_vfs"] != model.get("dependency_vfs")
+    ):
+        raise ContractError(
+            "trusted renderer model dependency VFS evidence is stale"
+        )
 
 
 def _run_renderer(
@@ -2072,13 +2420,17 @@ def _run_renderer(
         if stderr_capture is not None:
             stderr_capture.close()
         raise
-    try:
-        returncode = process.wait(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired as error:
+
+    def kill_process_group() -> None:
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+
+    try:
+        returncode = process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired as error:
+        kill_process_group()
         process.wait()
         if stdout_capture is not None:
             stdout_capture.close()
@@ -2089,16 +2441,14 @@ def _run_renderer(
         ) from error
     except BaseException:
         if process.poll() is None:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            kill_process_group()
             process.wait()
         if stdout_capture is not None:
             stdout_capture.close()
         if stderr_capture is not None:
             stderr_capture.close()
         raise
+    kill_process_group()
     capture_limit = 1024 * 1024
     stdout = b""
     stderr = b""
@@ -2459,14 +2809,10 @@ def _validate_renderer_evidence(
 
     if result["runtime_identity"] != render_media.runtime_identity():
         raise ContractError("trusted renderer runtime identity is stale")
-    evidence = result["render_evidence"]
-    if (
-        not isinstance(evidence, dict)
-        or set(evidence)
-        != {"visual_mesh_geom_count", "terrain_face_count"}
-        or any(type(item) is not int or item < 1 for item in evidence.values())
-    ):
-        raise ContractError("trusted renderer visual evidence is incomplete")
+    _validate_trusted_render_evidence(
+        result["render_evidence"],
+        expected_request,
+    )
     frame_count = render_media._encoded_frame_count(
         str(expected_request["kind"]),
         tuple(
@@ -3638,8 +3984,13 @@ def _snapshot_freeze_model(
         raise ContractError("freeze mechanical model bytes are stale")
     try:
         import mujoco
+        from . import render_media
 
-        source_model = mujoco.MjModel.from_xml_path(str(model_path))
+        trusted_model = _trusted_media_model(model_record)
+        model_spec, _model_vfs = render_media._authenticated_model_spec(
+            trusted_model
+        )
+        source_model = model_spec.compile()
     except Exception as error:
         raise ContractError(
             "mechanical source model cannot be compiled for freeze"
@@ -4332,48 +4683,7 @@ def _grail_inventory(
             raise ContractError(
                 f"GRAIL pair is missing or symlinked: {record.stem}"
             )
-        metadata_path = record.shard_path / "clips.json"
-        metadata = _file_identity(
-            metadata_path,
-            metadata_path.relative_to(root).as_posix(),
-        )
-        robot_identity = _file_identity(
-            record.robot_path,
-            record.robot_path.relative_to(root).as_posix(),
-        )
-        terrain_identity = _file_identity(
-            record.usd_path,
-            record.usd_path.relative_to(root).as_posix(),
-        )
-        output_records.append(
-            {
-                "family": record.family,
-                "stem": record.stem,
-                "frame_count": record.n_frames,
-                "robot": {
-                    **robot_identity,
-                    "path": str(record.robot_path.resolve()),
-                    "license_id": "UNRECORDED",
-                },
-                "terrain": {
-                    **terrain_identity,
-                    "path": str(record.usd_path.resolve()),
-                    "license_id": "UNRECORDED",
-                    "world_from_terrain": {
-                        "translation_world": np.asarray(
-                            record.terrain_position_env,
-                            dtype=np.float32,
-                        ).tolist(),
-                        "quaternion_world_from_local_wxyz": np.asarray(
-                            record.terrain_rotation_env_wxyz,
-                            dtype=np.float32,
-                        ).tolist(),
-                    },
-                },
-                "shard_metadata": metadata,
-                "pose_source": record.pose_source,
-            }
-        )
+        output_records.append(_grail_inventory_record(root, record))
     output_records.sort(
         key=lambda record: (
             str(record["family"]),

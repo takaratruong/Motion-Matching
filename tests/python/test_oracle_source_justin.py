@@ -36,6 +36,7 @@ def _write_justin_zarr(
     include_order_names: bool = False,
     contradictory_joint_names: bool = False,
     cross_clip_antipodes: bool = False,
+    root_speed: float = 0.5,
 ) -> Path:
     frames = 8
     timeline = np.arange(frames, dtype=np.float32) / np.float32(50.0)
@@ -44,7 +45,7 @@ def _write_justin_zarr(
     ).copy()
     joint_velocity = np.zeros_like(joint_position)
     body_position = np.zeros((frames, 30, 3), dtype=np.float32)
-    body_position[:, 0, 0] = 0.5 * timeline
+    body_position[:, 0, 0] = np.float32(root_speed) * timeline
     body_position[:, 18, 0] = 1.0 + timeline
     body_position[:, 19, 0] = 2.0 + timeline
     body_quaternion_xyzw = np.zeros((frames, 30, 4), dtype=np.float32)
@@ -58,7 +59,7 @@ def _write_justin_zarr(
             second_clip_yaw[:, None] / np.float32(2.0)
         )
     body_linear_velocity = np.zeros((frames, 30, 3), dtype=np.float32)
-    body_linear_velocity[:, 0, 0] = 0.5
+    body_linear_velocity[:, 0, 0] = np.float32(root_speed)
     body_angular_velocity = np.zeros((frames, 30, 3), dtype=np.float32)
 
     root = zarr.open(str(path), mode="w")
@@ -91,6 +92,52 @@ def _write_justin_zarr(
 
 
 class JustinSourceAdapterTests(unittest.TestCase):
+    def test_snapshot_tree_drives_arrays_and_hash_but_retains_authority_path(self):
+        """Catches opening or hashing the mutable authority Zarr."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            authority = _write_justin_zarr(
+                root / "authority.zarr", root_speed=0.1
+            )
+            authority_alias = root / "authority-alias.zarr"
+            authority_alias.symlink_to(authority, target_is_directory=True)
+            snapshot = _write_justin_zarr(
+                root / "snapshot.zarr", root_speed=0.9
+            )
+
+            try:
+                clips = list(
+                    iter_justin_clips(
+                        snapshot,
+                        _terrain_binding(),
+                        authority_path=authority_alias,
+                    )
+                )
+            except TypeError as error:
+                self.fail(f"snapshot authority API is missing: {error}")
+
+            self.assertEqual(
+                clips[0].source.source_path, str(authority_alias)
+            )
+            snapshot_size = sum(
+                file.stat().st_size
+                for file in snapshot.rglob("*")
+                if file.is_file()
+            )
+            self.assertEqual(clips[0].source.source_size_bytes, snapshot_size)
+            self.assertNotEqual(
+                clips[0].source.source_sha256,
+                next(iter_justin_clips(authority, _terrain_binding()))
+                .source.source_sha256,
+            )
+            np.testing.assert_allclose(
+                clips[0].root_linear_velocity_world[:, 0],
+                np.full(4, 0.9, dtype=np.float32),
+                rtol=0.0,
+                atol=0.0,
+            )
+
     def test_legacy_adapter_reorders_explicit_xyzw_once_and_slices_exclusively(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = _write_justin_zarr(Path(tmp) / "justin.zarr")

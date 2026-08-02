@@ -14,6 +14,58 @@ from tests.python.torch_motion_test_utils import write_takara_clip
 
 
 class FlatSourceAdapterTests(unittest.TestCase):
+    def test_snapshot_bytes_drive_data_and_hash_while_authority_path_is_retained(self):
+        """Catches reparsing mutable authority bytes after a private snapshot."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            authority_root = root / "authority"
+            snapshot_root = root / "snapshot"
+            authority_source = write_takara_clip(
+                authority_root / "walk",
+                frames=60,
+                root_velocity_xy=(0.1, 0.0),
+            )
+            authority_alias = root / "authority-alias"
+            authority_alias.symlink_to(authority_root, target_is_directory=True)
+            snapshot_source = write_takara_clip(
+                snapshot_root / "walk",
+                frames=60,
+                root_velocity_xy=(0.7, 0.0),
+            )
+
+            try:
+                clip = next(
+                    iter_flat_clips(
+                        snapshot_root,
+                        tags=("flat", "walk"),
+                        authority_root=authority_alias,
+                    )
+                )
+            except TypeError as error:
+                self.fail(f"snapshot authority API is missing: {error}")
+
+            self.assertEqual(
+                clip.source.source_path,
+                str(
+                    authority_alias
+                    / authority_source.relative_to(authority_root)
+                ),
+            )
+            self.assertEqual(
+                clip.source.source_sha256,
+                hashlib.sha256(snapshot_source.read_bytes()).hexdigest(),
+            )
+            self.assertEqual(
+                clip.source.source_size_bytes, snapshot_source.stat().st_size
+            )
+            np.testing.assert_allclose(
+                clip.root_linear_velocity_world[:, 0],
+                np.full(60, 0.7, dtype=np.float32),
+                rtol=0.0,
+                atol=1.0e-6,
+            )
+
     def test_preserves_native_wxyz_50_hz_and_exact_source_provenance(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

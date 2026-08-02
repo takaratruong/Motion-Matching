@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 from typing import Iterator
 
@@ -26,6 +27,15 @@ _ROOT_BODY_INDEX = 0
 _FOOT_BODY_INDICES = (18, 19)
 _INFERRED_FACING_HORIZON_FRAMES = 24
 _CONTACT_PLACEHOLDER_TAG = "contacts-unreconstructed"
+
+
+def _lexical_authority_root(value: Path) -> Path:
+    raw = os.fspath(value)
+    if type(raw) is not str or not Path(raw).is_absolute():
+        raise ContractError("flat authority_root must be an absolute path")
+    if raw != os.path.normpath(raw):
+        raise ContractError("flat authority_root must be lexically canonical")
+    return Path(raw)
 
 
 def _yaw_from_wxyz(quaternion: np.ndarray) -> np.ndarray:
@@ -75,7 +85,10 @@ def _infer_commands(
 
 
 def iter_flat_clips(
-    root: Path, *, tags: tuple[str, ...]
+    root: Path,
+    *,
+    tags: tuple[str, ...],
+    authority_root: Path | None = None,
 ) -> Iterator[CanonicalClip]:
     """Yield every native 50 Hz/wxyz clip below ``root`` without reordering."""
 
@@ -84,6 +97,11 @@ def iter_flat_clips(
     ):
         raise ContractError("flat adapter tags must be a nonempty tuple of strings")
     folder = MotionFolder.load(root)
+    provenance_root = (
+        folder.root
+        if authority_root is None
+        else _lexical_authority_root(authority_root)
+    )
     if folder.layout.joint_count != 29 or folder.layout.body_count != 30:
         raise ContractError("flat source must use the canonical 29/30 G1 layout")
     action_tags = (
@@ -92,11 +110,12 @@ def iter_flat_clips(
         else (*tags, _CONTACT_PLACEHOLDER_TAG)
     )
     for native in folder.clips:
-        source_path = folder.root / native.relative_path
-        source_bytes = source_path.read_bytes()
+        snapshot_path = folder.root / native.relative_path
+        provenance_path = provenance_root / native.relative_path
+        source_bytes = snapshot_path.read_bytes()
         source = SourceIdentity(
             source_format="takara-motion-npz-v1",
-            source_path=str(source_path),
+            source_path=str(provenance_path),
             source_size_bytes=len(source_bytes),
             source_sha256=hashlib.sha256(source_bytes).hexdigest(),
             source_license_id="UNRECORDED",

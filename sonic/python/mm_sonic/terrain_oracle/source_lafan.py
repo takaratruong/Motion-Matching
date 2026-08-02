@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 
 import numpy as np
@@ -37,6 +38,15 @@ _TARGET_FPS = 50
 _FOOT_BODY_INDICES = (18, 19)
 _INFERRED_FACING_HORIZON_FRAMES = 24
 _CONTACT_PLACEHOLDER_TAG = "contacts-unreconstructed"
+
+
+def _lexical_authority_path(value: Path) -> Path:
+    raw = os.fspath(value)
+    if type(raw) is not str or not Path(raw).is_absolute():
+        raise ContractError("LAFAN authority_path must be an absolute path")
+    if raw != os.path.normpath(raw):
+        raise ContractError("LAFAN authority_path must be lexically canonical")
+    return Path(raw)
 
 
 def _fail(detail: str) -> ValueError:
@@ -198,19 +208,29 @@ def load_lafan_csv(
     model_path: Path,
     *,
     terrain: TerrainBinding | None,
+    authority_path: Path | None = None,
+    fk: G1MujocoFK | None = None,
 ) -> CanonicalClip:
     """Load one audited G1 CSV and convert it to the reviewed 50 Hz boundary."""
 
     if terrain is not None and not isinstance(terrain, TerrainBinding):
         raise ContractError("LAFAN terrain must be a TerrainBinding or None")
-    source_path = Path(path).expanduser().resolve()
-    if not source_path.is_file():
-        raise FileNotFoundError(source_path)
-    source_bytes = source_path.read_bytes()
-    rows = _load_rows(source_path)
+    snapshot_path = Path(path).expanduser().resolve()
+    if not snapshot_path.is_file():
+        raise FileNotFoundError(snapshot_path)
+    provenance_path = (
+        snapshot_path
+        if authority_path is None
+        else _lexical_authority_path(authority_path)
+    )
+    source_bytes = snapshot_path.read_bytes()
+    rows = _load_rows(snapshot_path)
     root_position, root_wxyz, joints_mujoco = _resample_rows(rows)
     root_xyzw = np.ascontiguousarray(root_wxyz[:, (1, 2, 3, 0)])
-    forward = G1MujocoFK(model_path).forward(
+    forward_kinematics = fk if fk is not None else G1MujocoFK(model_path)
+    if not callable(getattr(forward_kinematics, "forward", None)):
+        raise ContractError("LAFAN fk must provide a callable forward method")
+    forward = forward_kinematics.forward(
         root_position, root_xyzw, joints_mujoco
     )
     if tuple(forward.body_names) != ISAACLAB_BODY_NAMES:
@@ -232,18 +252,18 @@ def load_lafan_csv(
     sole_quaternion = body_quaternion_wxyz[:, _FOOT_BODY_INDICES]
     frame_count = len(root_position)
     action_tags = (
-        *classify_lafan_name(source_path.stem),
+        *classify_lafan_name(provenance_path.stem),
         _CONTACT_PLACEHOLDER_TAG,
     )
     clip = CanonicalClip(
-        clip_id=source_path.stem,
+        clip_id=provenance_path.stem,
         fps=50.0,
         source=SourceIdentity(
             source_format=(
                 "lafan1-retargeted-g1-csv-30hz@"
                 + LAFAN1_UPSTREAM_REVISION
             ),
-            source_path=str(source_path),
+            source_path=str(provenance_path),
             source_size_bytes=len(source_bytes),
             source_sha256=hashlib.sha256(source_bytes).hexdigest(),
             source_license_id="CC-BY-NC-ND-4.0",

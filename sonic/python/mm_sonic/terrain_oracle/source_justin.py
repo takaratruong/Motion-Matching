@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 from typing import Iterator
 
@@ -39,6 +40,15 @@ _FOOT_BODY_INDICES = (18, 19)
 _INFERRED_FACING_HORIZON_FRAMES = 24
 _CONTACT_PLACEHOLDER_TAG = "contacts-unreconstructed"
 _QUATERNION_NORM_TOLERANCE = 1.0e-4
+
+
+def _lexical_authority_path(value: Path) -> Path:
+    raw = os.fspath(value)
+    if type(raw) is not str or not Path(raw).is_absolute():
+        raise _fail("authority_path must be an absolute path")
+    if raw != os.path.normpath(raw):
+        raise _fail("authority_path must be lexically canonical")
+    return Path(raw)
 
 
 def _fail(detail: str) -> ContractError:
@@ -181,20 +191,28 @@ def _action_tags(name: str) -> tuple[str, ...]:
 
 
 def iter_justin_clips(
-    zarr_path: Path, terrain: TerrainBinding
+    zarr_path: Path,
+    terrain: TerrainBinding,
+    *,
+    authority_path: Path | None = None,
 ) -> Iterator[CanonicalClip]:
     """Yield validated [start,end) clips from Justin's IsaacLab-order archive."""
 
     if not isinstance(terrain, TerrainBinding):
         raise _fail("terrain must be a TerrainBinding")
-    source_path = Path(zarr_path).resolve()
-    if not source_path.is_dir():
-        raise _fail(f"Zarr path is not a directory: {source_path}")
+    snapshot_path = Path(zarr_path).expanduser().resolve()
+    if not snapshot_path.is_dir():
+        raise _fail(f"Zarr path is not a directory: {snapshot_path}")
+    provenance_path = (
+        snapshot_path
+        if authority_path is None
+        else _lexical_authority_path(authority_path)
+    )
     try:
         import zarr
     except ImportError as error:
         raise _fail("requires zarr") from error
-    root = zarr.open(str(source_path), mode="r")
+    root = zarr.open(str(snapshot_path), mode="r")
     missing = [name for name in _REQUIRED_ARRAYS if name not in root]
     if missing:
         raise _fail(f"is missing required arrays: {', '.join(missing)}")
@@ -269,10 +287,10 @@ def iter_justin_clips(
     if np.any(np.abs(quaternion_norm - 1.0) > _QUATERNION_NORM_TOLERANCE):
         raise _fail("body_quat_w has a quaternion norm error above 1e-4")
 
-    source_size, source_sha256 = _directory_identity(source_path)
+    source_size, source_sha256 = _directory_identity(snapshot_path)
     source = SourceIdentity(
         source_format=source_format,
-        source_path=str(source_path),
+        source_path=str(provenance_path),
         source_size_bytes=source_size,
         source_sha256=source_sha256,
         source_license_id="UNRECORDED",

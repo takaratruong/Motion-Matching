@@ -269,6 +269,24 @@ time.sleep(60.0)
     return path
 
 
+def _write_early_exit_renderer(path: Path) -> Path:
+    path.write_text(
+        """from pathlib import Path
+import subprocess
+import sys
+
+marker = Path(sys.argv[1])
+child = (
+    "from pathlib import Path; import sys, time; "
+    "time.sleep(0.7); Path(sys.argv[1]).write_text('orphan')"
+)
+subprocess.Popen([sys.executable, "-c", child, str(marker)])
+raise SystemExit(7)
+"""
+    )
+    return path
+
+
 def _write_huggingface_metadata(
     release: Path,
     relative_path: str,
@@ -292,7 +310,177 @@ def _write_huggingface_metadata(
     )
 
 
+def _grail_record_fixture(
+    root: Path,
+    *,
+    frame_count: int = 4,
+) -> tuple[object, dict[str, object]]:
+    robot = root / "robot.pkl"
+    terrain = root / "terrain.usd"
+    metadata = root / "clips.json"
+    robot.write_bytes(b"trusted-pickle")
+    terrain.write_bytes(b"trusted-terrain")
+    metadata.write_bytes(b"{}")
+    pose_source = "clips.json:test"
+    record = mock.Mock(
+        family="c490_stair_p1",
+        robot_path=robot,
+        usd_path=terrain,
+        shard_path=root,
+        stem="verified-record",
+        n_frames=frame_count,
+        terrain_position_env=np.array(
+            (1.0, 2.0, 3.0),
+            dtype=np.float32,
+        ),
+        terrain_rotation_env_wxyz=np.array(
+            (1.0, 0.0, 0.0, 0.0),
+            dtype=np.float32,
+        ),
+        pose_source=pose_source,
+    )
+
+    def identity(path: Path) -> dict[str, object]:
+        payload = path.read_bytes()
+        return {
+            "relative_path": path.name,
+            "size_bytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+
+    return record, {
+        "family": record.family,
+        "stem": record.stem,
+        "frame_count": frame_count,
+        "robot": {
+            **identity(robot),
+            "path": str(robot.resolve()),
+            "license_id": "UNRECORDED",
+        },
+        "terrain": {
+            **identity(terrain),
+            "path": str(terrain.resolve()),
+            "license_id": "UNRECORDED",
+            "world_from_terrain": {
+                "translation_world": [1.0, 2.0, 3.0],
+                "quaternion_world_from_local_wxyz": [
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+            },
+        },
+        "shard_metadata": identity(metadata),
+        "pose_source": pose_source,
+    }
+
+
 class CorpusCliTests(unittest.TestCase):
+    def test_trusted_media_rejects_self_consistent_unpinned_model_vfs(self):
+        """Catches accepting an attacker-chosen model tree and matching digest."""
+
+        import mujoco
+        from mm_sonic.terrain_oracle.corpus_cli import _trusted_media_model
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model_path = root / "attacker.xml"
+            model_path.write_text(
+                "<mujoco><worldbody/></mujoco>\n",
+                encoding="ascii",
+            )
+            payload = model_path.read_bytes()
+            model = mujoco.MjModel.from_xml_path(str(model_path))
+            record = {
+                "asset_path": str(model_path),
+                "asset_size_bytes": len(payload),
+                "asset_sha256": hashlib.sha256(payload).hexdigest(),
+                "structural_sha256": structural_model_sha256(model),
+            }
+            with self.assertRaisesRegex(ContractError, "pinned exact G1"):
+                _trusted_media_model(record)
+
+    @unittest.skipUnless(MODEL_PATH.is_file(), "real G1 model unavailable")
+    def test_trusted_media_publishes_pinned_dependency_vfs_authority(self):
+        """Catches omitting the fixed G1 visual dependency tree authority."""
+
+        import mujoco
+        from mm_sonic.terrain_oracle.corpus_cli import _trusted_media_model
+
+        payload = MODEL_PATH.read_bytes()
+        model = mujoco.MjModel.from_xml_path(str(MODEL_PATH))
+        trusted = _trusted_media_model(
+            {
+                "asset_path": str(MODEL_PATH.resolve()),
+                "asset_size_bytes": len(payload),
+                "asset_sha256": hashlib.sha256(payload).hexdigest(),
+                "structural_sha256": structural_model_sha256(model),
+            }
+        )
+        self.assertEqual(
+            trusted["dependency_vfs"],
+            {
+                "root_path": str(MODEL_PATH.parent.resolve()),
+                "root_relative_path": MODEL_PATH.name,
+                "directory_count": 2,
+                "file_count": 88,
+                "size_bytes": 60_248_622,
+                "tree_sha256": (
+                    "e41a1311012dd9eaf3d5e733d5aefc82"
+                    "62f6024dd5c2f8e55dc617ab1db3977d"
+                ),
+            },
+        )
+
+    def test_real_import_snapshots_mutable_source_trees_before_adapters(self):
+        """Catches adapters reopening live flat, Justin, or LAFAN source bytes."""
+
+        from mm_sonic.terrain_oracle.corpus_cli import (
+            _snapshot_real_import_roots,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            flat = root / "flat"
+            justin = root / "justin.zarr"
+            release = root / "lafan-release"
+            lafan = release / "g1"
+            for directory in (flat, justin, lafan):
+                directory.mkdir(parents=True)
+            (flat / "motion.npz").write_bytes(b"flat-before")
+            (justin / "zarr.json").write_bytes(b"justin-before")
+            (lafan / "walk.csv").write_bytes(b"lafan-before")
+            (release / "README.md").write_bytes(b"readme-before")
+
+            with _snapshot_real_import_roots(
+                flat,
+                justin,
+                lafan,
+            ) as (flat_snapshot, justin_snapshot, lafan_snapshot):
+                (flat / "motion.npz").write_bytes(b"flat-after!")
+                (justin / "zarr.json").write_bytes(b"justin-after!")
+                (lafan / "walk.csv").write_bytes(b"lafan-after!")
+                self.assertEqual(
+                    (flat_snapshot / "motion.npz").read_bytes(),
+                    b"flat-before",
+                )
+                self.assertEqual(
+                    (justin_snapshot / "zarr.json").read_bytes(),
+                    b"justin-before",
+                )
+                self.assertEqual(
+                    (lafan_snapshot / "walk.csv").read_bytes(),
+                    b"lafan-before",
+                )
+                self.assertEqual(
+                    (lafan_snapshot.parent / "README.md").read_bytes(),
+                    b"readme-before",
+                )
+                self.assertFalse(
+                    flat_snapshot.is_relative_to(root)
+                )
+
     def test_real_import_keeps_primary_and_lafan_inventory_authority_distinct(
         self,
     ):
@@ -330,8 +518,20 @@ class CorpusCliTests(unittest.TestCase):
                 },
             )
 
-            loaded_primary, loaded_lafan, sources = (
+            with self.assertRaisesRegex(
+                ContractError,
+                "trusted phase-1 inventory",
+            ):
                 _load_import_inventories(primary_path, lafan_path)
+            loaded_primary, loaded_lafan, sources = _load_import_inventories(
+                primary_path,
+                lafan_path,
+                primary_sha256=hashlib.sha256(
+                    primary_path.read_bytes()
+                ).hexdigest(),
+                lafan_sha256=hashlib.sha256(
+                    lafan_path.read_bytes()
+                ).hexdigest(),
             )
             self.assertEqual(loaded_primary, primary)
             self.assertEqual(loaded_lafan, lafan)
@@ -355,7 +555,16 @@ class CorpusCliTests(unittest.TestCase):
                 },
             )
             with self.assertRaises(ContractError):
-                _load_import_inventories(primary_path, wrong_lafan)
+                _load_import_inventories(
+                    primary_path,
+                    wrong_lafan,
+                    primary_sha256=hashlib.sha256(
+                        primary_path.read_bytes()
+                    ).hexdigest(),
+                    lafan_sha256=hashlib.sha256(
+                        wrong_lafan.read_bytes()
+                    ).hexdigest(),
+                )
 
     def test_terrain_recipe_composes_world_plane_in_obstacle_local_frame(self):
         """Catches GRAIL meshes that omit runout floor or double-apply pose."""
@@ -495,32 +704,8 @@ class CorpusCliTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            robot = root / "robot.pkl"
-            terrain = root / "terrain.usd"
-            robot.write_bytes(b"trusted-pickle")
-            terrain.write_bytes(b"trusted-terrain")
-            record = mock.Mock(
-                robot_path=robot,
-                usd_path=terrain,
-                stem="same-size-swap",
-                n_frames=4,
-            )
-            inventory_record = {
-                "robot": {
-                    "path": str(robot.resolve()),
-                    "size_bytes": len(robot.read_bytes()),
-                    "sha256": hashlib.sha256(
-                        robot.read_bytes()
-                    ).hexdigest(),
-                },
-                "terrain": {
-                    "path": str(terrain.resolve()),
-                    "size_bytes": len(terrain.read_bytes()),
-                    "sha256": hashlib.sha256(
-                        terrain.read_bytes()
-                    ).hexdigest(),
-                },
-            }
+            record, inventory_record = _grail_record_fixture(root)
+            robot = record.robot_path
             robot.write_bytes(b"hostile-pickle")
 
             with mock.patch("joblib.load") as unsafe_load:
@@ -529,6 +714,31 @@ class CorpusCliTests(unittest.TestCase):
                         record,
                         inventory_record,
                         mock.sentinel.fk,
+                        grail_root=root,
+                    )
+            unsafe_load.assert_not_called()
+
+    def test_grail_semantic_swap_is_rejected_before_joblib_execution(self):
+        """Catches clips.json changing frames or terrain pose after inventory."""
+
+        from mm_sonic.terrain_oracle.corpus_cli import (
+            _load_verified_grail_source,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            record, inventory_record = _grail_record_fixture(root)
+            inventory_record["frame_count"] = 5
+            with mock.patch("joblib.load") as unsafe_load:
+                with self.assertRaisesRegex(
+                    ContractError,
+                    "metadata|semantic|inventory",
+                ):
+                    _load_verified_grail_source(
+                        record,
+                        inventory_record,
+                        mock.sentinel.fk,
+                        grail_root=root,
                     )
             unsafe_load.assert_not_called()
 
@@ -1406,6 +1616,24 @@ class CorpusCliTests(unittest.TestCase):
             self.assertTrue(
                 receipt["renderer"]["result"]["completed"]
             )
+            request_path = (
+                rendered
+                / receipt["renderer"]["request"]["relative_path"]
+            )
+            request = json.loads(request_path.read_text("ascii"))
+            self.assertEqual(
+                receipt["renderer"]["result"]["render_evidence"][
+                    "model_dependency_vfs"
+                ],
+                request["model"]["dependency_vfs"],
+            )
+            self.assertEqual(
+                request["model"]["dependency_vfs"]["tree_sha256"],
+                (
+                    "e41a1311012dd9eaf3d5e733d5aefc82"
+                    "62f6024dd5c2f8e55dc617ab1db3977d"
+                ),
+            )
 
     @unittest.skipUnless(MODEL_PATH.is_file(), "real G1 model unavailable")
     def test_render_index_covers_contact_sheet_and_recomputed_strata(self):
@@ -2012,6 +2240,71 @@ class CorpusCliTests(unittest.TestCase):
             )
 
     @unittest.skipUnless(MODEL_PATH.is_file(), "real G1 model unavailable")
+    def test_renderer_early_exit_kills_process_group_and_cleans_stage(self):
+        """Catches a renderer exiting while its delayed child survives."""
+
+        from mm_sonic.terrain_oracle.corpus_cli import main
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = _write_audit_fixture(root)
+            raw = root / "raw"
+            audited = root / "audited"
+            output = audited / "render-audit"
+            marker = root / "early-exit-orphan"
+            renderer = _write_early_exit_renderer(root / "early-exit.py")
+            self.assertEqual(
+                main(
+                    [
+                        "import",
+                        "--fixture",
+                        str(fixture),
+                        "--output",
+                        str(raw),
+                    ]
+                ),
+                0,
+            )
+            self.assertEqual(
+                main(
+                    [
+                        "audit",
+                        "--corpus",
+                        str(raw),
+                        "--model",
+                        str(MODEL_PATH),
+                        "--output",
+                        str(audited),
+                    ]
+                ),
+                0,
+            )
+            with redirect_stderr(io.StringIO()):
+                status = main(
+                    [
+                        "render-audit",
+                        "--corpus",
+                        str(audited),
+                        "--renderer",
+                        str(Path(sys.executable).resolve()),
+                        "--renderer-arg",
+                        str(renderer),
+                        "--renderer-arg",
+                        str(marker),
+                        "--output",
+                        str(output),
+                    ]
+                )
+            self.assertEqual(status, 2)
+            time.sleep(1.0)
+            self.assertFalse(marker.exists())
+            self.assertFalse(output.exists())
+            self.assertEqual(
+                list(audited.glob(".render-audit.*")),
+                [],
+            )
+
+    @unittest.skipUnless(MODEL_PATH.is_file(), "real G1 model unavailable")
     def test_coverage_rebuilds_public_task8_manifest_without_replacement(self):
         """Catches CLI-specific coverage inference or overwrite behavior."""
 
@@ -2498,6 +2791,148 @@ class CorpusCliTests(unittest.TestCase):
                     / artifact_relative_path
                 ).read_bytes(),
                 original_payload,
+            )
+
+    def test_freeze_model_uses_authenticated_visual_vfs_at_parse_boundary(self):
+        """Catches visual-only include/texture swaps entering the frozen MJB."""
+
+        import mujoco
+        from PIL import Image
+        from mm_sonic.terrain_oracle.corpus_cli import (
+            _snapshot_freeze_model,
+        )
+        from tests.python.test_oracle_render_media import _model_authority
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            corpus = root / "corpus"
+            corpus.mkdir()
+            model_root = root / "model-vfs"
+            model_root.mkdir()
+            model_path = model_root / "model.xml"
+            include_path = model_root / "body.xml"
+            texture_path = model_root / "visual.png"
+            model_path.write_text(
+                '<mujoco model="freeze_visual">'
+                '<asset><texture name="visual_texture" type="2d" '
+                'file="visual.png"/>'
+                '<material name="visual_material" '
+                'texture="visual_texture"/>'
+                "</asset><include file=\"body.xml\"/></mujoco>\n",
+                encoding="ascii",
+            )
+            authenticated_include = (
+                '<mujoco><worldbody><body name="visual_body">'
+                '<geom name="visual_include_geom" type="sphere" size=".05" '
+                'rgba=".1 .2 .3 1"/>'
+                '<geom name="visual_asset_geom" type="box" '
+                'size=".1 .1 .1" material="visual_material"/>'
+                "</body></worldbody></mujoco>\n"
+            )
+            swapped_include = authenticated_include.replace(
+                'rgba=".1 .2 .3 1"',
+                'rgba=".8 .1 .6 1"',
+            )
+
+            def png_bytes(rgb):
+                buffer = io.BytesIO()
+                Image.new("RGB", (2, 2), rgb).save(
+                    buffer,
+                    format="PNG",
+                )
+                return buffer.getvalue()
+
+            authenticated_texture = png_bytes((12, 34, 56))
+            swapped_texture = png_bytes((210, 25, 150))
+            include_path.write_text(
+                authenticated_include,
+                encoding="ascii",
+            )
+            texture_path.write_bytes(authenticated_texture)
+            trusted_model = _model_authority(model_path, model_root)
+            root_payload = model_path.read_bytes()
+            authenticated_model = mujoco.MjSpec.from_string(
+                model_path.read_text(encoding="ascii"),
+                include={
+                    "body.xml": authenticated_include.encode("ascii")
+                },
+                assets={"visual.png": authenticated_texture},
+            ).compile()
+            swapped_model = mujoco.MjSpec.from_string(
+                model_path.read_text(encoding="ascii"),
+                include={"body.xml": swapped_include.encode("ascii")},
+                assets={"visual.png": swapped_texture},
+            ).compile()
+            self.assertEqual(
+                structural_model_sha256(authenticated_model),
+                structural_model_sha256(swapped_model),
+            )
+            audit_index = {
+                "model": {
+                    "asset_path": str(model_path),
+                    "asset_size_bytes": len(root_payload),
+                    "asset_sha256": hashlib.sha256(
+                        root_payload
+                    ).hexdigest(),
+                    "structural_sha256": structural_model_sha256(
+                        authenticated_model
+                    ),
+                }
+            }
+            (corpus / "audit-index.json").write_bytes(
+                _canonical_json_bytes(audit_index)
+            )
+            original_from_path = mujoco.MjModel.from_xml_path
+            original_from_string = mujoco.MjSpec.from_string
+            swapped = False
+
+            def swap_dependencies_once():
+                nonlocal swapped
+                if not swapped:
+                    include_path.write_text(
+                        swapped_include,
+                        encoding="ascii",
+                    )
+                    texture_path.write_bytes(swapped_texture)
+                    swapped = True
+
+            def swap_then_parse_path(path):
+                swap_dependencies_once()
+                return original_from_path(path)
+
+            def swap_then_parse_string(xml, include=None, assets=None):
+                swap_dependencies_once()
+                return original_from_string(
+                    xml,
+                    include=include,
+                    assets=assets,
+                )
+
+            with (
+                mock.patch(
+                    "mm_sonic.terrain_oracle.corpus_cli._trusted_media_model",
+                    return_value=trusted_model,
+                ),
+                mock.patch.object(
+                    mujoco.MjModel,
+                    "from_xml_path",
+                    side_effect=swap_then_parse_path,
+                ),
+                mock.patch.object(
+                    mujoco.MjSpec,
+                    "from_string",
+                    side_effect=swap_then_parse_string,
+                ),
+            ):
+                snapshot = _snapshot_freeze_model(corpus, root)
+            self.assertTrue(swapped)
+            np.testing.assert_array_equal(
+                snapshot.model.geom("visual_include_geom").rgba,
+                authenticated_model.geom("visual_include_geom").rgba,
+            )
+            np.testing.assert_array_equal(
+                snapshot.model.tex_data,
+                authenticated_model.tex_data,
             )
 
     @unittest.skipUnless(MODEL_PATH.is_file(), "real G1 model unavailable")
