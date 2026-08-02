@@ -161,6 +161,22 @@ identical SHA-256
   losing cross-tread, turn, mount, and mixed routes. The experiment confirms
   that the contact-graph oracle's route cost does not transfer as a hard
   displacement-target shift in the live matcher.
+- Hard four-corner sole preview and oriented mid-foot preview were both
+  rejected and removed. Both retained 6/6 routes, but every tested clearance
+  margin from 0 to 2.5 cm increased slide. The best hard-corner result was
+  2.291 m and the best mid-foot result was 2.276 m versus the retained
+  1.923 m; peak-penetration improvements were below 0.5 mm. Foot geometry
+  without a whole-swing smoothness and endpoint solve simply over-lifts the
+  leg near stair edges. This supports implementing the complete trajectory
+  objective rather than adding denser pointwise clearance constraints.
+- Whole-swing symmetric smoothing and touchdown-frame preview were rejected
+  and removed. The full-interval variant retained 6/6 and 16/21 outcomes, but
+  increased slide by 2.8% on the frozen set and 1.1% on all routes; shorter
+  smoothing scales from 1.0 to 2.25 frames did not beat the retained planner.
+  Touchdown-only preview increased frozen slide by 19% with no penetration
+  improvement. The source gait's landing acquisition should remain governed
+  by contact onset; forcing the query height into its raw swing endpoint makes
+  the ankle IK fight the clip.
 
 ## Literature alignment
 
