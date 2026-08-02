@@ -16,8 +16,9 @@ PYTHONPATH=sonic/python:. sonic/.torch-mm-venv/bin/python -B \
   --config sonic/configs/experiments/torch_grail_multi_horizon_skills.json \
   --g1-xml /home/ubuntu/projects/mjx-diffphysics/env/g1/assets/g1_29dof.xml \
   --device cuda:0 --multi-horizon --contact-phase-gate --foot-lock \
-  --swing-clearance-margin-m 0.03 \
-  --foot-correction-halflife-s 0.025
+  --swing-clearance-margin-m 0.025 \
+  --foot-correction-halflife-s 0.025 \
+  --swing-plan-sigma-frames 2.5
 ```
 
 This remains kinematic-only: no physics and no Sonic tracking are active.
@@ -30,7 +31,8 @@ This remains kinematic-only: no physics and no Sonic tracking are active.
 | Contact-phase gate only | 6/6 | 3.418 m | 0.094 m | 14.53 rad/s |
 | Phase gate + capped foot cleanup | **6/6** | **2.451 m** | **0.093 m** | **12.00 rad/s** |
 | Phase + foot cleanup + 3 cm swing clearance | **6/6** | **2.320 m** | **0.093 m** | **12.00 rad/s** |
-| Recommended: 3 cm clearance + 25 ms correction half-life | **6/6** | **2.024 m** | **0.093 m** | **12.00 rad/s** |
+| 3 cm clearance + 25 ms correction half-life | **6/6** | **2.024 m** | **0.093 m** | **12.00 rad/s** |
+| Recommended: source-path swing plan | **6/6** | **1.923 m** | **0.093 m** | **12.00 rad/s** |
 
 The clean committed combined version reduces aggregate stance slide by 14.9% relative to the
 previous baseline while fixing the failed side exit. It is not uniformly
@@ -54,6 +56,17 @@ penetration, the same command-tracking and stall metrics, and the 12 rad/s
 output cap. A clean bracket at 20, 22.5, 25, 27.5, 30, and 35 ms had a clear
 minimum at 25 ms; two exact repeats reproduced the same matrix hash.
 
+The final source-path swing plan looks through the selected clip's remaining
+unsupported interval, places that future foot path in the emitted root frame,
+measures terrain clearance along it, and spreads required lift backward with a
+short Gaussian envelope. At a 2.5 cm clearance margin and 2.5-frame sigma it
+lowers aggregate slide another 5.0%, from 2.024 m to 1.923 m. All six route
+slides improve or tie, worst-route p95 penetration remains 0.093 m, maximum
+single-frame penetration slightly improves from 0.16622 m to 0.16613 m, and
+worst-route joint-speed p95 improves from 1.9284 to 1.9238 rad/s. Predicted
+samples outside the finite terrain grid fall back to reactive clearance rather
+than terminating the viewer.
+
 Artifacts:
 
 - baseline: `build/multi-horizon-terrain-skills/qualified-v2-final`
@@ -65,6 +78,8 @@ Artifacts:
 - deterministic swing-clearance repeat: `build/multi-horizon-terrain-skills/phase-foot-lock-swing-clearance-m030-clean-v2-repeat`
 - recommended 25 ms clean run: `build/multi-horizon-terrain-skills/phase-foot-lock-swing-m030-halflife-h025-clean-v1`
 - deterministic 25 ms repeats: `build/multi-horizon-terrain-skills/phase-foot-lock-swing-m030-halflife-h025-clean-v2-repeat` and `build/multi-horizon-terrain-skills/phase-foot-lock-swing-m030-halflife-h025-clean-v3-repeat`
+- recommended source-path plan: `build/multi-horizon-terrain-skills/h025-m025-plan-s025-clean-v1`
+- post-audit final: `build/multi-horizon-terrain-skills/h025-m025-plan-s025-clean-v4-final`
 
 The two phase-only matrices have the identical deterministic SHA-256
 `dbb4e87fc7252bc5cd0212218b9b7148cd86a812894e67510535aabe92207e54`.
@@ -74,6 +89,9 @@ The two clean 3 cm swing-clearance matrices have the identical SHA-256
 `e104fd51c3429b1ab85e7bfa07b9fbb483e170ab9ce7a20a6ce3612c7cc0f6f6`.
 The three clean 25 ms matrices have the identical SHA-256
 `78a69c669138d0547e7a60622cc49a35652326e34589d0013ac3ad24f02e9b91`.
+Four clean source-path-plan matrices, including the post-audit build, have the
+identical SHA-256
+`40b1fa392c324954b379873b50a4c2a1de710affccff9497b935b67e79f1d1ae`.
 
 ## What changed
 
@@ -95,6 +113,10 @@ The three clean 25 ms matrices have the identical SHA-256
 5. An optional swing-clearance pass samples the query surface under source-
    unsupported ankles, raises only penetrating targets, and uses the same
    bounded IK, inertialization, correction ceiling, and 12 rad/s output cap.
+6. Optional source-path planning evaluates the remainder of each selected
+   swing interval in the emitted root frame and smoothly anticipates measured
+   clearance deficits without changing liftoff, landing, or clip selection.
+   Grid-boundary prediction failures degrade to the reactive pass.
 
 ## Ablations rejected
 
@@ -123,6 +145,9 @@ The three clean 25 ms matrices have the identical SHA-256
   aggregate slide to 2.417--2.541 m and raised joint-speed p95 by roughly
   14--17%. It was removed: lifting sooner is not equivalent to optimizing a
   phase-consistent swing trajectory.
+- The source-path planner is also bounded: smoothing scales of 3--6 frames
+  retained route completion but raised slide to 2.338--2.440 m. The useful
+  basin was 2--2.75 frames, with a clean optimum at 2.5 frames and 2.5 cm.
 
 ## Literature alignment
 
@@ -156,15 +181,14 @@ The three clean 25 ms matrices have the identical SHA-256
 
 ## Remaining limitation and next experiment
 
-The timing and lookahead experiments show that neither a scalar phase
-descriptor nor reactive pre-lifting is the missing signal. The remaining
-long-tail penetration and visual floating point instead to an explicit,
-phase-preserving swing path with foot geometry. The next high-value experiment
-is therefore a TCRS-style mid-foot trajectory optimizer with fixed liftoff and
-landing timing, smoothness/clearance/edge costs, support-aware root height, and
-toe/heel-aware IK, evaluated against this frozen 6/6 result. Learned Motion
-Matching's rough-terrain setup similarly queries terrain under future toes
-rather than relying on a denser root-centered height grid.
+The source-path result confirms that phase-preserving future foot geometry is
+useful, but the current planner remains an ankle-center clearance envelope.
+The next high-value experiment is the full TCRS structure: optimize a mid-foot
+trajectory with fixed liftoff and landing timing, smoothness/clearance/edge
+costs, support-aware root height, and toe/heel-aware IK. This should target the
+remaining visual floating and the mixed route's 0.093 m penetration tail.
+Learned Motion Matching's rough-terrain setup similarly queries terrain under
+future toes rather than relying on a denser root-centered height grid.
 
 ## Verification
 
@@ -174,12 +198,17 @@ rather than relying on a denser root-centered height grid.
   commit `13d3c0a`.
 - 90 terrain matcher/viewer tests passed from the clean detached worktree at
   final commit `2a06f15`.
+- 92 terrain matcher/viewer tests passed from the clean detached worktree at
+  final code commit `0908d59`.
 - The clean six-route matrix at `bc93c5e` passed 6/6 twice with an identical hash.
 - The clean 3 cm swing-clearance matrix at `13d3c0a` passed 6/6 twice with an
   identical hash; maximum joint speed was 12.00 rad/s.
 - The clean 25 ms correction matrix at `cf60556` passed 6/6 three times with an
   identical hash; aggregate slide was 2.024 m and maximum joint speed was
   12.00 rad/s.
+- The clean source-path matrix at `0908d59` passed 6/6 after the boundary
+  fallback audit and reproduced the same hash as three preceding clean runs.
+  Aggregate slide was 1.923 m and maximum joint speed was 12.00 rad/s.
 - An automated live run walked beyond the finite height-grid boundary, entered
   a recoverable search-failure state, and reset without terminating the viewer.
 - No physics or Sonic dependencies were added to the kinematic viewer.
