@@ -306,6 +306,12 @@ future toes rather than relying on a denser root-centered height grid.
 
 ## Verification
 
+- 169 terrain matcher/viewer tests passed from the clean worktree at final
+  continuation commit `be369ee`.
+- The exploratory 2 cm level-target warp passed 6/6 twice with identical
+  frozen SHA-256
+  `efcd4832b9a26267a4152e7d2dc4f1493ea376b5df6c7604db70fe1fb79fc90c`;
+  its broad regressions are why it is not the recommended default.
 - 92 focused unit/integration tests passed in the working tree.
 - 65 relevant tests passed from a clean detached worktree at commit `2ec4a31`.
 - 78 terrain matcher/viewer tests passed from the clean detached worktree at
