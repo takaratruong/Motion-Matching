@@ -34,12 +34,43 @@ class TerrainConformalSwingConfig:
     clearance_weight: float = 200.0
     edge_weight: float = 100.0
     endpoint_weight: float = 1000.0
+    sample_count: int = 128
+    iteration_count: int = 8
+    temperature: float = 0.05
+    perturbation_xy_std_m: float = 0.01
+    perturbation_z_std_m: float = 0.04
+    maximum_xy_deformation_m: float = 0.04
+    maximum_z_deformation_m: float = 0.16
 
     def __post_init__(self) -> None:
         for name in (
             "clearance_margin_m",
             "edge_probe_m",
             "maximum_edge_height_range_m",
+        ):
+            value = _finite_number(
+                getattr(self, name),
+                name=name.removesuffix("_m").replace("_", " "),
+                positive=True,
+            )
+            object.__setattr__(self, name, value)
+        for name in (
+            "sample_count",
+            "iteration_count",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ContractError(
+                    "terrain-conformal swing "
+                    + name.replace("_", " ")
+                    + " must be a positive integer"
+                )
+        for name in (
+            "temperature",
+            "perturbation_xy_std_m",
+            "perturbation_z_std_m",
+            "maximum_xy_deformation_m",
+            "maximum_z_deformation_m",
         ):
             value = _finite_number(
                 getattr(self, name),
@@ -106,6 +137,33 @@ class TerrainConformalSwingCost:
             "total",
         ):
             object.__setattr__(self, name, getattr(self, name).detach().clone())
+
+
+@dataclass(frozen=True)
+class TerrainConformalSwingResult:
+    path: torch.Tensor
+    raw_cost: TerrainConformalSwingCost
+    optimized_cost: TerrainConformalSwingCost
+    improved: bool
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.path, torch.Tensor)
+            or self.path.ndim != 2
+            or tuple(self.path.shape[1:]) != (3,)
+            or self.path.shape[0] < 3
+            or self.path.dtype != torch.float32
+            or not torch.isfinite(self.path).all()
+            or not isinstance(self.raw_cost, TerrainConformalSwingCost)
+            or not isinstance(self.optimized_cost, TerrainConformalSwingCost)
+            or self.raw_cost.total.shape != torch.Size((1,))
+            or self.optimized_cost.total.shape != torch.Size((1,))
+            or self.raw_cost.total.device != self.path.device
+            or self.optimized_cost.total.device != self.path.device
+            or type(self.improved) is not bool
+        ):
+            raise ContractError("terrain-conformal swing result is invalid")
+        object.__setattr__(self, "path", self.path.detach().clone())
 
 
 def _validate_cost_inputs(
@@ -239,4 +297,181 @@ def terrain_conformal_swing_cost(
         edge=edge,
         endpoint=endpoint,
         total=total,
+    )
+
+
+def _smooth_perturbations(values: torch.Tensor) -> torch.Tensor:
+    weights = (1.0, 2.0, 3.0, 2.0, 1.0)
+    padded = torch.cat(
+        (
+            values[:, :1].expand(-1, 2, -1),
+            values,
+            values[:, -1:].expand(-1, 2, -1),
+        ),
+        dim=1,
+    )
+    return sum(
+        weight * padded[:, offset : offset + values.shape[1]]
+        for offset, weight in enumerate(weights)
+    ) / sum(weights)
+
+
+def _bounded_candidates(
+    center: torch.Tensor,
+    raw: torch.Tensor,
+    perturbation: torch.Tensor,
+    config: TerrainConformalSwingConfig,
+) -> torch.Tensor:
+    candidates = center[None] + perturbation
+    delta = candidates - raw[None]
+    planar = torch.clamp(
+        delta[..., :2],
+        min=-float(config.maximum_xy_deformation_m),
+        max=float(config.maximum_xy_deformation_m),
+    )
+    vertical = torch.clamp(
+        delta[..., 2:],
+        min=-float(config.maximum_z_deformation_m),
+        max=float(config.maximum_z_deformation_m),
+    )
+    candidates = raw[None] + torch.cat((planar, vertical), dim=2)
+    candidates[:, 0] = raw[0]
+    candidates[:, -1] = raw[-1]
+    return candidates
+
+
+def optimize_terrain_conformal_swing(
+    raw_path: torch.Tensor,
+    swing_mask: torch.Tensor,
+    *,
+    sample_surface: Callable[[torch.Tensor], torch.Tensor],
+    toe_offset_xy: torch.Tensor,
+    heel_offset_xy: torch.Tensor,
+    config: TerrainConformalSwingConfig,
+    seed: int,
+) -> TerrainConformalSwingResult:
+    """Optimize one contiguous swing and preserve its timing and endpoints."""
+
+    if (
+        not isinstance(raw_path, torch.Tensor)
+        or raw_path.ndim != 2
+        or tuple(raw_path.shape[1:]) != (3,)
+        or raw_path.shape[0] < 3
+        or raw_path.dtype != torch.float32
+        or not torch.isfinite(raw_path).all()
+        or not isinstance(swing_mask, torch.Tensor)
+        or swing_mask.shape != raw_path.shape[:1]
+        or swing_mask.dtype != torch.bool
+        or swing_mask.device != raw_path.device
+        or not isinstance(config, TerrainConformalSwingConfig)
+        or type(seed) is not int
+        or not 0 <= seed < 2**63
+    ):
+        raise ContractError("terrain-conformal swing optimizer inputs are invalid")
+    indices = torch.nonzero(swing_mask, as_tuple=False).flatten()
+    if indices.numel() < 3:
+        raise ContractError(
+            "terrain-conformal swing mask must contain at least three samples"
+        )
+    start = int(indices[0].item())
+    stop = int(indices[-1].item()) + 1
+    expected = torch.arange(start, stop, device=raw_path.device)
+    if not bool(torch.equal(indices, expected)):
+        raise ContractError("terrain-conformal swing mask must be contiguous")
+
+    raw_swing = raw_path[start:stop]
+    raw_cost = terrain_conformal_swing_cost(
+        raw_swing[None],
+        raw_swing,
+        sample_surface=sample_surface,
+        toe_offset_xy=toe_offset_xy,
+        heel_offset_xy=heel_offset_xy,
+        config=config,
+    )
+    current = raw_swing.clone()
+    best = current.clone()
+    best_total = raw_cost.total[0].clone()
+    generator = torch.Generator(device=raw_path.device)
+    generator.manual_seed(seed)
+    standard_deviation = torch.tensor(
+        (
+            float(config.perturbation_xy_std_m),
+            float(config.perturbation_xy_std_m),
+            float(config.perturbation_z_std_m),
+        ),
+        dtype=raw_path.dtype,
+        device=raw_path.device,
+    )
+    for _ in range(config.iteration_count):
+        perturbation = torch.randn(
+            (
+                config.sample_count,
+                raw_swing.shape[0],
+                3,
+            ),
+            dtype=raw_path.dtype,
+            device=raw_path.device,
+            generator=generator,
+        ) * standard_deviation
+        perturbation = _smooth_perturbations(perturbation)
+        perturbation[:, 0] = 0.0
+        perturbation[:, -1] = 0.0
+        candidates = _bounded_candidates(
+            current, raw_swing, perturbation, config
+        )
+        costs = terrain_conformal_swing_cost(
+            candidates,
+            raw_swing,
+            sample_surface=sample_surface,
+            toe_offset_xy=toe_offset_xy,
+            heel_offset_xy=heel_offset_xy,
+            config=config,
+        )
+        minimum = costs.total.min()
+        weights = torch.softmax(
+            -(costs.total - minimum) / float(config.temperature), dim=0
+        )
+        proposal = torch.sum(weights[:, None, None] * candidates, dim=0)
+        proposal[0] = raw_swing[0]
+        proposal[-1] = raw_swing[-1]
+        proposal_cost = terrain_conformal_swing_cost(
+            proposal[None],
+            raw_swing,
+            sample_surface=sample_surface,
+            toe_offset_xy=toe_offset_xy,
+            heel_offset_xy=heel_offset_xy,
+            config=config,
+        )
+        sample_index = int(torch.argmin(costs.total).item())
+        sample_total = costs.total[sample_index]
+        if sample_total < proposal_cost.total[0]:
+            current = candidates[sample_index].clone()
+            current_total = sample_total
+        else:
+            current = proposal
+            current_total = proposal_cost.total[0]
+        if current_total < best_total:
+            best = current.clone()
+            best_total = current_total.clone()
+
+    improved = bool(best_total < raw_cost.total[0])
+    selected = best if improved else raw_swing
+    optimized_cost = terrain_conformal_swing_cost(
+        selected[None],
+        raw_swing,
+        sample_surface=sample_surface,
+        toe_offset_xy=toe_offset_xy,
+        heel_offset_xy=heel_offset_xy,
+        config=config,
+    )
+    output = raw_path.clone()
+    output[start:stop] = selected
+    output[~swing_mask] = raw_path[~swing_mask]
+    output[start] = raw_path[start]
+    output[stop - 1] = raw_path[stop - 1]
+    return TerrainConformalSwingResult(
+        path=output,
+        raw_cost=raw_cost,
+        optimized_cost=optimized_cost,
+        improved=improved,
     )
