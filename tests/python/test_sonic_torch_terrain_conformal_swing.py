@@ -111,6 +111,33 @@ class TerrainConformalSwingCostTests(unittest.TestCase):
 
         self.assertEqual(calls, [(2, 5, 5, 2)])
 
+    def test_frame_varying_foot_offsets_follow_turning_geometry(self):
+        sampled = []
+
+        def surface(points):
+            sampled.append(points.clone())
+            return torch.zeros(
+                points.shape[:-1], dtype=points.dtype, device=points.device
+            )
+
+        raw = _raw_path()
+        toe = torch.tensor(
+            ((0.08, 0.0), (0.06, 0.04), (0.0, 0.08), (-0.04, 0.06), (-0.08, 0.0))
+        )
+        heel = -toe
+        terrain_conformal_swing_cost(
+            raw[None],
+            raw,
+            sample_surface=surface,
+            toe_offset_xy=toe,
+            heel_offset_xy=heel,
+            config=TerrainConformalSwingConfig(),
+        )
+
+        queries = sampled[0][0]
+        torch.testing.assert_close(queries[:, 1] - raw[:, :2], toe)
+        torch.testing.assert_close(queries[:, 2] - raw[:, :2], heel)
+
     def test_invalid_surface_result_fails_closed(self):
         raw = _raw_path()
         with self.assertRaisesRegex(ContractError, "surface sampler"):

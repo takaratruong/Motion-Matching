@@ -189,12 +189,12 @@ def _validate_cost_inputs(
         or not torch.isfinite(raw_path).all()
         or not callable(sample_surface)
         or not isinstance(toe_offset_xy, torch.Tensor)
-        or tuple(toe_offset_xy.shape) != (2,)
+        or tuple(toe_offset_xy.shape) not in ((2,), (paths.shape[1], 2))
         or toe_offset_xy.dtype != paths.dtype
         or toe_offset_xy.device != paths.device
         or not torch.isfinite(toe_offset_xy).all()
         or not isinstance(heel_offset_xy, torch.Tensor)
-        or tuple(heel_offset_xy.shape) != (2,)
+        or tuple(heel_offset_xy.shape) not in ((2,), (paths.shape[1], 2))
         or heel_offset_xy.dtype != paths.dtype
         or heel_offset_xy.device != paths.device
         or not torch.isfinite(heel_offset_xy).all()
@@ -222,21 +222,32 @@ def terrain_conformal_swing_cost(
         heel_offset_xy,
         config,
     )
-    axis = toe_offset_xy - heel_offset_xy
-    norm = torch.linalg.vector_norm(axis)
-    if float(norm.item()) <= 1.0e-6:
+    toe = (
+        toe_offset_xy[None].expand(paths.shape[1], 2)
+        if toe_offset_xy.ndim == 1
+        else toe_offset_xy
+    )
+    heel = (
+        heel_offset_xy[None].expand(paths.shape[1], 2)
+        if heel_offset_xy.ndim == 1
+        else heel_offset_xy
+    )
+    axis = toe - heel
+    norm = torch.linalg.vector_norm(axis, dim=1)
+    if bool((norm <= 1.0e-6).any().item()):
         raise ContractError("terrain-conformal swing foot offsets are degenerate")
-    lateral = torch.stack((-axis[1], axis[0])) / norm
+    lateral = torch.stack((-axis[:, 1], axis[:, 0]), dim=1) / norm[:, None]
     offsets = torch.stack(
         (
-            torch.zeros_like(toe_offset_xy),
-            toe_offset_xy,
-            heel_offset_xy,
-            toe_offset_xy + lateral * float(config.edge_probe_m),
-            heel_offset_xy - lateral * float(config.edge_probe_m),
-        )
+            torch.zeros_like(toe),
+            toe,
+            heel,
+            toe + lateral * float(config.edge_probe_m),
+            heel - lateral * float(config.edge_probe_m),
+        ),
+        dim=1,
     )
-    sample_xy = paths[..., None, :2] + offsets[None, None, :, :]
+    sample_xy = paths[..., None, :2] + offsets[None]
     try:
         surface = sample_surface(sample_xy)
     except Exception as error:
@@ -380,12 +391,26 @@ def optimize_terrain_conformal_swing(
         raise ContractError("terrain-conformal swing mask must be contiguous")
 
     raw_swing = raw_path[start:stop]
+    toe_swing = (
+        toe_offset_xy[start:stop]
+        if isinstance(toe_offset_xy, torch.Tensor)
+        and toe_offset_xy.ndim == 2
+        and toe_offset_xy.shape[0] == raw_path.shape[0]
+        else toe_offset_xy
+    )
+    heel_swing = (
+        heel_offset_xy[start:stop]
+        if isinstance(heel_offset_xy, torch.Tensor)
+        and heel_offset_xy.ndim == 2
+        and heel_offset_xy.shape[0] == raw_path.shape[0]
+        else heel_offset_xy
+    )
     raw_cost = terrain_conformal_swing_cost(
         raw_swing[None],
         raw_swing,
         sample_surface=sample_surface,
-        toe_offset_xy=toe_offset_xy,
-        heel_offset_xy=heel_offset_xy,
+        toe_offset_xy=toe_swing,
+        heel_offset_xy=heel_swing,
         config=config,
     )
     current = raw_swing.clone()
@@ -423,8 +448,8 @@ def optimize_terrain_conformal_swing(
             candidates,
             raw_swing,
             sample_surface=sample_surface,
-            toe_offset_xy=toe_offset_xy,
-            heel_offset_xy=heel_offset_xy,
+            toe_offset_xy=toe_swing,
+            heel_offset_xy=heel_swing,
             config=config,
         )
         minimum = costs.total.min()
@@ -438,8 +463,8 @@ def optimize_terrain_conformal_swing(
             proposal[None],
             raw_swing,
             sample_surface=sample_surface,
-            toe_offset_xy=toe_offset_xy,
-            heel_offset_xy=heel_offset_xy,
+            toe_offset_xy=toe_swing,
+            heel_offset_xy=heel_swing,
             config=config,
         )
         sample_index = int(torch.argmin(costs.total).item())
@@ -460,8 +485,8 @@ def optimize_terrain_conformal_swing(
         selected[None],
         raw_swing,
         sample_surface=sample_surface,
-        toe_offset_xy=toe_offset_xy,
-        heel_offset_xy=heel_offset_xy,
+        toe_offset_xy=toe_swing,
+        heel_offset_xy=heel_swing,
         config=config,
     )
     output = raw_path.clone()
