@@ -2,6 +2,7 @@ import math
 import unittest
 from unittest import mock
 from types import SimpleNamespace
+from dataclasses import replace
 
 import numpy as np
 import torch
@@ -51,6 +52,12 @@ class _ConstantGrid:
 class _FootKinematics:
     def foot_positions(self, joint, root, quaternion):
         return np.repeat(root[:, None, :], 2, axis=1)
+
+
+class _SoleKinematics:
+    def sole_points(self, joint, root, quaternion):
+        feet = _FootKinematics().foot_positions(joint, root, quaternion)
+        return np.repeat(feet[:, :, None, :], 7, axis=2)
 
 
 class _JointHeightFootKinematics:
@@ -216,6 +223,7 @@ def _transactional_fixture(
         dataset=SimpleNamespace(folder=folder),
         query_terrain=SimpleNamespace(query_grid=grid, alignment=_Alignment()),
         foot_kinematics=_FootKinematics(),
+        sole_kinematics=_SoleKinematics(),
         config=MatcherConfig(),
         result_filter=result_filter,
         contact_phase_gate=contact_phase_gate,
@@ -336,6 +344,9 @@ class TerrainSkillHorizonRolloutTest(unittest.TestCase):
             targets,
             current_root_position_world=torch.tensor([1.0, 2.0, 0.8]),
             current_root_yaw=torch.tensor(0.0),
+            current_foot_position_world=torch.tensor(
+                [[0.9, 2.0, 0.0], [1.1, 2.0, 0.0]]
+            ),
             query_terrain=terrain,
         )
 
@@ -345,6 +356,45 @@ class TerrainSkillHorizonRolloutTest(unittest.TestCase):
             torch.allclose(
                 enriched.surface_height_delta_m,
                 expected[:, None].expand(-1, 2),
+            )
+        )
+
+    def test_terrain_height_targets_resolve_unequal_future_foot_surfaces(self):
+        targets = HorizonTargets(
+            frames=torch.tensor([25]),
+            displacement_local_xy=torch.tensor([[0.0, -0.15]]),
+            yaw_delta_rad=torch.zeros(1),
+            root_height_delta_m=torch.zeros(1),
+            surface_height_delta_m=torch.zeros((1, 2)),
+        )
+
+        class _StepGrid:
+            def sample_xy(self, points):
+                return torch.where(
+                    points[:, 1] >= -0.20,
+                    torch.full_like(points[:, 1], 0.18),
+                    torch.zeros_like(points[:, 1]),
+                )
+
+        enriched = terrain_height_targets(
+            targets,
+            current_root_position_world=torch.tensor([0.0, 0.0, 0.8]),
+            current_root_yaw=torch.tensor(0.0),
+            current_foot_position_world=torch.tensor(
+                [[0.0, 0.08, 0.0], [0.0, -0.08, 0.0]]
+            ),
+            query_terrain=SimpleNamespace(
+                query_grid=_StepGrid(), alignment=_Alignment()
+            ),
+        )
+
+        self.assertTrue(
+            torch.allclose(enriched.root_height_delta_m, torch.tensor([0.0]))
+        )
+        self.assertTrue(
+            torch.allclose(
+                enriched.surface_height_delta_m,
+                torch.tensor([[0.0, -0.18]]),
             )
         )
 
@@ -370,6 +420,24 @@ class TerrainSkillHorizonRolloutTest(unittest.TestCase):
 
 
 class ContinuationFirstMatcherTest(unittest.TestCase):
+    def test_exhausted_skill_has_no_sequential_continuation(self):
+        matcher, _grid = _transactional_fixture(
+            continuous_skill_enabled=True,
+        )
+        matcher.reset()
+        matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
+        state = matcher._skill_state
+        stop = state.skill.interval.playback_stop
+        matcher._skill_state = replace(
+            state,
+            next_source_frame=stop,
+            playback_stop=stop,
+        )
+
+        continuation = matcher._try_continue_skill(((1.0, 0.0), 0.0))
+
+        self.assertIsNone(continuation)
+
     def test_exhausted_global_search_delays_switch_to_safe_source_endpoint(self):
         matcher, _grid = _transactional_fixture(
             continuous_skill_enabled=True,
@@ -404,6 +472,40 @@ class ContinuationFirstMatcherTest(unittest.TestCase):
         )
 
         self.assertEqual(compatible.tolist(), [True, False])
+
+    def test_batched_terrain_prefilter_rejects_oriented_toe_on_riser(self):
+        matcher, grid = _transactional_fixture(single_support=True)
+        matcher.dataset.folder.clips[0].body_position_world[..., 0] = 0.0
+        grid.sample_xy = lambda points: torch.where(
+            points[..., 0] >= 0.10,
+            torch.full_like(points[..., 0], 0.18),
+            torch.zeros_like(points[..., 0]),
+        )
+        result = matcher.reset()
+
+        compatible = matcher._terrain_profile_prefilter(
+            torch.tensor([0], dtype=torch.long), result
+        )
+
+        self.assertEqual(compatible.tolist(), [False])
+
+    def test_batched_terrain_prefilter_rejects_sole_collision_without_landing(
+        self,
+    ):
+        matcher, grid = _transactional_fixture()
+        matcher.dataset.folder.clips[0].body_position_world[:, 1:, 0] = 0.0
+        grid.sample_xy = lambda points: torch.where(
+            points[..., 0] >= 0.10,
+            torch.full_like(points[..., 0], 0.18),
+            torch.zeros_like(points[..., 0]),
+        )
+        result = matcher.reset()
+
+        compatible = matcher._terrain_profile_prefilter(
+            torch.tensor([0], dtype=torch.long), result
+        )
+
+        self.assertEqual(compatible.tolist(), [False])
 
     def test_emitted_preview_rejects_invalid_cheaper_candidate(self):
         matcher, _grid = _transactional_fixture(
@@ -450,14 +552,28 @@ class ContinuationFirstMatcherTest(unittest.TestCase):
         )
         self.assertTrue(callable(select.call_args.kwargs["ranked_prefilter"]))
         self.assertEqual(
-            select.call_args.kwargs["maximum_preferred_cost_increase"], 0.0
+            select.call_args.kwargs["maximum_preferred_cost_increase"], 1.0
         )
         self.assertEqual(
             select.call_args.kwargs[
                 "maximum_preferred_outcome_cost_increase"
             ],
-            0.0,
+            0.05,
         )
+
+    def test_emitted_preview_preserves_coherent_runway_preference(self):
+        matcher, _grid = _transactional_fixture(
+            continuous_skill_enabled=True,
+            two_candidate_runway=True,
+            emitted_contact_preview_enabled=True,
+        )
+        matcher.foot_kinematics = _JointHeightFootKinematics()
+        matcher.reset()
+
+        matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
+
+        self.assertEqual(matcher.chunk_events[0].skill_index, 1)
+        self.assertEqual(matcher.chunk_events[0].selection_mode, "preferred")
 
     def test_phase_gated_command_change_preempts_single_support_chunk(self):
         matcher, _grid = _transactional_fixture(

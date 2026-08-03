@@ -27,6 +27,14 @@ class _BatchFeet:
         return feet
 
 
+class _BatchSoles:
+    def sole_points(self, joint, root, quaternion):
+        feet = _BatchFeet().foot_positions(joint, root, quaternion)
+        soles = np.repeat(feet[:, :, None, :], 5, axis=2)
+        soles[:, 1, 1, 0] += 0.12
+        return soles
+
+
 def _fixture(*, current_joint: float = 0.0, supported_entry: bool = True):
     frames = 4
     root = np.zeros((frames, 1, 3), dtype=np.float32)
@@ -162,6 +170,31 @@ class EmittedContactPreviewTest(unittest.TestCase):
                 torch.tensor(0.4),
             )
         )
+
+    def test_rejects_a_riser_under_the_actual_oriented_toe(self):
+        folder, skill, pose = _fixture()
+        skill.support_mask[:, 1] = False
+        skill.support_mask[2:, 1] = True
+
+        result = preview_emitted_contact_trace(
+            folder=folder,
+            skill=skill,
+            selected_entry_frame=0,
+            endpoint_frame_exclusive=4,
+            current=pose,
+            halflife_s=0.1,
+            foot_kinematics=_BatchFeet(),
+            sole_kinematics=_BatchSoles(),
+            sample_surface=lambda points: torch.where(
+                points[..., 0] >= 0.20,
+                torch.full_like(points[..., 0], 0.03),
+                torch.zeros_like(points[..., 0]),
+            ),
+            config=TerrainContactFeasibilityConfig(),
+        )
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "landing-edge-margin")
 
 
 if __name__ == "__main__":

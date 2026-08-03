@@ -223,24 +223,53 @@ class TerrainSkillExtensionTest(unittest.TestCase):
 
         self.assertEqual(emitted, [8, 9, 10, 11])
 
-    def test_extension_rejects_nonzero_endpoint_warp(self):
+    def test_extension_folds_completed_warp_into_continuous_placement(self):
         folder, skill, pose = _fixture()
         skill.support_mask[7] = True
+        folder.clips[0].body_position_world[8] = (
+            folder.clips[0].body_position_world[7]
+        )
         state = start_skill(
             folder,
             skill,
             selected_entry_frame=3,
             current=pose,
             playback_stop=8,
-            target_displacement_local_xy=torch.tensor([1.0, 0.0]),
-            target_yaw_delta_rad=torch.tensor(0.0),
-            maximum_translation_warp_m=0.05,
+            target_displacement_local_xy=torch.tensor([0.20, 0.10]),
+            target_yaw_delta_rad=torch.tensor(0.40),
+            maximum_translation_warp_m=1.0,
+            maximum_yaw_warp_rad=1.0,
         )
+        final = None
         while state.next_source_frame < state.playback_stop:
-            state = advance_skill(state).state
+            step = advance_skill(state)
+            final = step.frame
+            state = step.state
 
-        with self.assertRaisesRegex(Exception, "zero endpoint warp"):
-            extend_skill_state(state, playback_stop=12)
+        extended = extend_skill_state(state, playback_stop=12)
+        first_suffix = advance_skill(extended).frame
+
+        self.assertTrue(
+            torch.allclose(
+                first_suffix.root_position_world,
+                final.root_position_world,
+                atol=1e-3,
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                first_suffix.root_orientation_world_wxyz,
+                final.root_orientation_world_wxyz,
+                atol=1e-6,
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                extended.endpoint_translation_warp_world_xy,
+                torch.zeros(2),
+            )
+        )
+        self.assertEqual(float(extended.endpoint_yaw_warp_rad), 0.0)
 
 
 if __name__ == "__main__":

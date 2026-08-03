@@ -353,16 +353,12 @@ def can_interrupt_skill(skill: TerrainSkill, source_frame: int) -> bool:
 def extend_skill_state(
     state: TerrainSkillState, *, playback_stop: int
 ) -> TerrainSkillState:
-    """Extend a completed zero-warp chunk without restarting its placement."""
+    """Extend a completed chunk without restarting its world placement."""
 
     if not isinstance(state, TerrainSkillState):
         raise ContractError("terrain skill extension state is invalid")
     if state.next_source_frame != state.playback_stop:
         raise ContractError("terrain skill extension requires a completed chunk")
-    if bool(state.endpoint_translation_warp_world_xy.abs().max().item()) or bool(
-        state.endpoint_yaw_warp_rad.abs().item()
-    ):
-        raise ContractError("terrain skill extension requires zero endpoint warp")
     if (
         type(playback_stop) is not int
         or not state.playback_stop
@@ -374,7 +370,41 @@ def extend_skill_state(
         raise ContractError(
             "terrain skill extension endpoint must be stable double support"
         )
-    return replace(state, playback_stop=playback_stop)
+    has_translation_warp = bool(
+        state.endpoint_translation_warp_world_xy.abs().max().item()
+    )
+    has_yaw_warp = bool(state.endpoint_yaw_warp_rad.abs().item())
+    if not has_translation_warp and not has_yaw_warp:
+        return replace(state, playback_stop=playback_stop)
+
+    _, _, endpoint_root, _, _, _ = _source_pose(
+        state.folder,
+        state.skill,
+        state.playback_stop - 1,
+        state.offsets.joint_position,
+    )
+    folded_yaw = state.yaw_offset + state.endpoint_yaw_warp_rad
+    old_endpoint = (
+        _rotate_z(endpoint_root, state.yaw_offset)
+        + state.translation_world
+    )
+    new_endpoint = _rotate_z(endpoint_root, folded_yaw)
+    folded_translation = state.translation_world.clone()
+    folded_translation[:2] = (
+        old_endpoint[:2]
+        + state.endpoint_translation_warp_world_xy
+        - new_endpoint[:2]
+    )
+    return replace(
+        state,
+        playback_stop=playback_stop,
+        yaw_offset=folded_yaw,
+        translation_world=folded_translation,
+        endpoint_translation_warp_world_xy=torch.zeros_like(
+            state.endpoint_translation_warp_world_xy
+        ),
+        endpoint_yaw_warp_rad=torch.zeros_like(state.endpoint_yaw_warp_rad),
+    )
 
 
 def advance_skill(state: TerrainSkillState) -> TerrainSkillStep:

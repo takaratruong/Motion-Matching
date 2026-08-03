@@ -36,6 +36,7 @@ class TerrainContactFeasibilityConfig:
     edge_margin_m: float = 0.04
     maximum_edge_height_range_m: float = 0.025
     minimum_swing_clearance_m: float = -0.005
+    minimum_sole_clearance_m: float = -0.025
     maximum_height_deformation_m: float = 0.06
 
     def __post_init__(self) -> None:
@@ -53,14 +54,16 @@ class TerrainContactFeasibilityConfig:
         _positive_finite(
             self.maximum_edge_height_range_m, name="edge height range"
         )
-        if (
-            not isinstance(self.minimum_swing_clearance_m, (int, float))
-            or isinstance(self.minimum_swing_clearance_m, bool)
-            or not math.isfinite(float(self.minimum_swing_clearance_m))
-        ):
-            raise ContractError(
-                "terrain contact feasibility swing clearance is invalid"
-            )
+        for name in ("minimum_swing_clearance_m", "minimum_sole_clearance_m"):
+            value = getattr(self, name)
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(float(value))
+            ):
+                raise ContractError(
+                    "terrain contact feasibility clearance is invalid"
+                )
         _positive_finite(
             self.maximum_height_deformation_m, name="height deformation"
         )
@@ -75,6 +78,7 @@ class TerrainContactFeasibilityResult:
     maximum_stance_error_m: float
     landing_error_m: float
     minimum_swing_clearance_m: float
+    minimum_sole_clearance_m: float
     maximum_footprint_height_range_m: float
     maximum_height_deformation_m: float
 
@@ -90,6 +94,7 @@ class TerrainContactFeasibilityResult:
             self.maximum_stance_error_m,
             self.landing_error_m,
             self.minimum_swing_clearance_m,
+            self.minimum_sole_clearance_m,
             self.maximum_footprint_height_range_m,
             self.maximum_height_deformation_m,
         )
@@ -118,6 +123,7 @@ def _result(
     stance: float = 0.0,
     landing: float = 0.0,
     swing: float = 0.0,
+    sole: float = 0.0,
     footprint: float = 0.0,
     deformation: float = 0.0,
 ) -> TerrainContactFeasibilityResult:
@@ -127,6 +133,7 @@ def _result(
         maximum_stance_error_m=float(stance),
         landing_error_m=float(landing),
         minimum_swing_clearance_m=float(swing),
+        minimum_sole_clearance_m=float(sole),
         maximum_footprint_height_range_m=float(footprint),
         maximum_height_deformation_m=float(deformation),
     )
@@ -158,6 +165,7 @@ def validate_placed_contact_trace(
     sample_surface: Callable[[torch.Tensor], torch.Tensor],
     config: TerrainContactFeasibilityConfig,
     align_initial_support: bool = False,
+    landing_footprint_position_world: torch.Tensor | None = None,
 ) -> TerrainContactFeasibilityResult:
     """Validate one already-placed two-foot trace at every source frame."""
 
@@ -180,6 +188,24 @@ def validate_placed_contact_trace(
         or not callable(sample_surface)
         or not isinstance(config, TerrainContactFeasibilityConfig)
         or type(align_initial_support) is not bool
+        or (
+            landing_footprint_position_world is not None
+            and (
+                not isinstance(landing_footprint_position_world, torch.Tensor)
+                or landing_footprint_position_world.ndim != 4
+                or tuple(landing_footprint_position_world.shape[:2])
+                != tuple(foot_position_world.shape[:2])
+                or landing_footprint_position_world.shape[2] < 3
+                or landing_footprint_position_world.shape[3] != 3
+                or landing_footprint_position_world.dtype
+                != foot_position_world.dtype
+                or landing_footprint_position_world.device
+                != foot_position_world.device
+                or not torch.isfinite(
+                    landing_footprint_position_world
+                ).all()
+            )
+        )
     ):
         raise ContractError("terrain contact feasibility trace is invalid")
 
@@ -192,25 +218,41 @@ def validate_placed_contact_trace(
             sample_surface, foot_position_world[..., :2]
         )
         footprint_range = 0.0
-        if landing_indices.numel():
-            margin = float(config.edge_margin_m)
-            offsets = torch.tensor(
+        sole_clearance = 0.0
+        if landing_footprint_position_world is not None:
+            sole_surface = _sample_surface(
+                sample_surface,
+                landing_footprint_position_world[..., :2],
+            )
+            sole_clearance = float(
                 (
-                    (0.0, 0.0),
-                    (margin, 0.0),
-                    (-margin, 0.0),
-                    (0.0, margin),
-                    (0.0, -margin),
-                ),
-                dtype=foot_position_world.dtype,
-                device=foot_position_world.device,
+                    landing_footprint_position_world[..., 2]
+                    - sole_surface
+                ).min().item()
             )
-            landing_xy = foot_position_world[
-                landing_indices[:, 0], landing_indices[:, 1], :2
-            ]
-            landing_footprints = _sample_surface(
-                sample_surface, landing_xy[:, None, :] + offsets[None, :, :]
-            )
+        if landing_indices.numel():
+            if landing_footprint_position_world is None:
+                margin = float(config.edge_margin_m)
+                offsets = torch.tensor(
+                    (
+                        (0.0, 0.0),
+                        (margin, 0.0),
+                        (-margin, 0.0),
+                        (0.0, margin),
+                        (0.0, -margin),
+                    ),
+                    dtype=foot_position_world.dtype,
+                    device=foot_position_world.device,
+                )
+                landing_xy = foot_position_world[
+                    landing_indices[:, 0], landing_indices[:, 1], :2
+                ]
+                footprint_xy = landing_xy[:, None, :] + offsets[None, :, :]
+            else:
+                footprint_xy = landing_footprint_position_world[
+                    landing_indices[:, 0], landing_indices[:, 1], :, :2
+                ]
+            landing_footprints = _sample_surface(sample_surface, footprint_xy)
             footprint_range = float(
                 (
                     landing_footprints.max(dim=1).values
@@ -273,6 +315,7 @@ def validate_placed_contact_trace(
         stance=stance_error,
         landing=landing_error,
         swing=swing_clearance,
+        sole=sole_clearance,
         footprint=footprint_range,
         deformation=deformation,
     )
@@ -282,6 +325,8 @@ def validate_placed_contact_trace(
         return _result("landing-height", **metrics)
     if footprint_range > float(config.maximum_edge_height_range_m):
         return _result("landing-edge-margin", **metrics)
+    if sole_clearance < float(config.minimum_sole_clearance_m):
+        return _result("sole-penetration", **metrics)
     if swing_clearance < float(config.minimum_swing_clearance_m):
         return _result("swing-penetration", **metrics)
     if deformation > float(config.maximum_height_deformation_m):

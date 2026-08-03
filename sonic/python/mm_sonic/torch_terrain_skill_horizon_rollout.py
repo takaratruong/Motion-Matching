@@ -55,6 +55,46 @@ from .torch_terrain_skill_rollout import (
 from .torch_terrain_skills import TerrainSkillInventory, build_terrain_skill_inventory
 
 
+_G1_LOCAL_SOLE_POINTS_M = np.asarray(
+    (
+        (0.035, 0.0, -0.05),
+        (0.12, 0.0, -0.05),
+        (-0.05, 0.0, -0.05),
+        (0.12, 0.04, -0.05),
+        (0.12, -0.04, -0.05),
+        (-0.05, 0.04, -0.05),
+        (-0.05, -0.04, -0.05),
+    ),
+    dtype=np.float32,
+)
+_PREFILTER_SOLE_CLEARANCE_SLACK_M = 0.04
+
+
+def _rotation_matrices_wxyz(values: np.ndarray) -> np.ndarray:
+    quaternion = np.asarray(values, dtype=np.float32)
+    if quaternion.shape[-1:] != (4,):
+        raise ContractError("sole trace quaternion shape is invalid")
+    w, x, y, z = np.moveaxis(quaternion, -1, 0)
+    output = np.empty(quaternion.shape[:-1] + (3, 3), dtype=np.float32)
+    output[..., 0, 0] = 1 - 2 * (y * y + z * z)
+    output[..., 0, 1] = 2 * (x * y - w * z)
+    output[..., 0, 2] = 2 * (x * z + w * y)
+    output[..., 1, 0] = 2 * (x * y + w * z)
+    output[..., 1, 1] = 1 - 2 * (x * x + z * z)
+    output[..., 1, 2] = 2 * (y * z - w * x)
+    output[..., 2, 0] = 2 * (x * z - w * y)
+    output[..., 2, 1] = 2 * (y * z + w * x)
+    output[..., 2, 2] = 1 - 2 * (x * x + y * y)
+    return output
+
+
+def _rotation_matrix_wxyz(value: np.ndarray) -> np.ndarray:
+    output = _rotation_matrices_wxyz(value)
+    if output.shape != (3, 3):
+        raise ContractError("sole trace quaternion must be scalar")
+    return output
+
+
 @dataclass(frozen=True)
 class HorizonChunkEvent:
     entry_row: int
@@ -81,9 +121,10 @@ def terrain_height_targets(
     *,
     current_root_position_world: torch.Tensor,
     current_root_yaw: torch.Tensor,
+    current_foot_position_world: torch.Tensor,
     query_terrain: Any,
 ) -> HorizonTargets:
-    """Sample desired vertical change along the commanded root path."""
+    """Sample root and per-foot height change along the commanded path."""
 
     if not isinstance(targets, HorizonTargets):
         raise ContractError("terrain height prediction requires HorizonTargets")
@@ -97,15 +138,37 @@ def terrain_height_targets(
         or current_root_yaw.numel() != 1
         or current_root_yaw.device != current_root_position_world.device
         or current_root_yaw.dtype != current_root_position_world.dtype
+        or not isinstance(current_foot_position_world, torch.Tensor)
+        or tuple(current_foot_position_world.shape) != (2, 3)
+        or current_foot_position_world.device
+        != current_root_position_world.device
+        or current_foot_position_world.dtype
+        != current_root_position_world.dtype
+        or not torch.isfinite(current_foot_position_world).all()
     ):
-        raise ContractError("terrain height prediction root state is invalid")
+        raise ContractError("terrain height prediction kinematic state is invalid")
     try:
         world_displacement = _rotate_xy(
             targets.displacement_local_xy, current_root_yaw.reshape(())
         )
         world_xy = current_root_position_world[:2].unsqueeze(0) + world_displacement
+        local_foot_xy = _rotate_xy(
+            current_foot_position_world[:, :2]
+            - current_root_position_world[:2].unsqueeze(0),
+            -current_root_yaw.reshape(()),
+        )
+        future_heading = current_root_yaw.reshape(()) + targets.yaw_delta_rad
+        future_foot_xy = world_xy[:, None, :] + _rotate_xy(
+            local_foot_xy.unsqueeze(0), future_heading[:, None]
+        )
         sample_xy = torch.cat(
-            (current_root_position_world[:2].unsqueeze(0), world_xy), dim=0
+            (
+                current_root_position_world[:2].unsqueeze(0),
+                world_xy,
+                current_foot_position_world[:, :2],
+                future_foot_xy.reshape(-1, 2),
+            ),
+            dim=0,
         )
         height = query_terrain.query_grid.sample_xy(
             query_terrain.alignment.matcher_to_scene_xy(sample_xy)
@@ -114,18 +177,31 @@ def terrain_height_targets(
         raise ContractError("terrain height prediction query is invalid") from error
     if (
         not isinstance(height, torch.Tensor)
-        or tuple(height.shape) != (targets.frames.shape[0] + 1,)
+        or tuple(height.shape)
+        != (1 + 3 * targets.frames.shape[0] + 2,)
         or height.device != current_root_position_world.device
         or not torch.isfinite(height).all()
     ):
         raise ContractError("terrain height prediction samples are invalid")
-    delta = (height[1:] - height[0]).to(targets.displacement_local_xy.dtype)
+    horizon_count = int(targets.frames.shape[0])
+    root_delta = (height[1 : 1 + horizon_count] - height[0]).to(
+        targets.displacement_local_xy.dtype
+    )
+    current_foot_height = height[
+        1 + horizon_count : 1 + horizon_count + 2
+    ]
+    future_foot_height = height[1 + horizon_count + 2 :].reshape(
+        horizon_count, 2
+    )
+    foot_delta = (future_foot_height - current_foot_height).to(
+        targets.displacement_local_xy.dtype
+    )
     return HorizonTargets(
         frames=targets.frames,
         displacement_local_xy=targets.displacement_local_xy,
         yaw_delta_rad=targets.yaw_delta_rad,
-        root_height_delta_m=delta,
-        surface_height_delta_m=delta[:, None].expand(-1, 2).clone(),
+        root_height_delta_m=root_delta,
+        surface_height_delta_m=foot_delta,
     )
 
 
@@ -141,6 +217,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         dataset: Any,
         query_terrain: Any,
         foot_kinematics: Any,
+        sole_kinematics: Any | None = None,
         config: MatcherConfig,
         search_config: HorizonSearchConfig = HorizonSearchConfig(),
         terrain_tolerance_m: float = 0.06,
@@ -167,6 +244,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         maximum_preferred_cost_increase: float = 1.0,
         maximum_preferred_outcome_cost_increase: float = 0.05,
         emitted_contact_preview_enabled: bool = False,
+        maximum_emitted_contact_candidates: int = 64,
     ) -> None:
         self.base = base_matcher
         self.database = base_matcher.database
@@ -175,6 +253,11 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         self.dataset = dataset
         self.query_terrain = query_terrain
         self.foot_kinematics = foot_kinematics
+        if sole_kinematics is not None and not callable(
+            getattr(sole_kinematics, "sole_points", None)
+        ):
+            raise ContractError("terrain skill sole kinematics is invalid")
+        self.sole_kinematics = sole_kinematics
         self.config = config
         self.search_config = search_config
         self.terrain_tolerance_m = float(terrain_tolerance_m)
@@ -237,6 +320,13 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             or type(emitted_contact_preview_enabled) is not bool
         ):
             raise ContractError("continuous terrain skill flags must be boolean")
+        if (
+            type(maximum_emitted_contact_candidates) is not int
+            or not 1 <= maximum_emitted_contact_candidates <= 4096
+        ):
+            raise ContractError(
+                "maximum emitted contact candidates must be in [1, 4096]"
+            )
         if not isinstance(
             contact_feasibility_config, TerrainContactFeasibilityConfig
         ):
@@ -275,6 +365,9 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         self.continuous_skill_enabled = continuous_skill_enabled
         self.contact_feasibility_enabled = contact_feasibility_enabled
         self.emitted_contact_preview_enabled = emitted_contact_preview_enabled
+        self.maximum_emitted_contact_candidates = (
+            maximum_emitted_contact_candidates
+        )
         self.contact_feasibility_config = contact_feasibility_config
         self.minimum_continuation_progress_m = float(
             minimum_continuation_progress_m
@@ -330,6 +423,8 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         self._terrain_trace_cache: dict[
             int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
         ] = {}
+        self._landing_footprint_cache: dict[int, np.ndarray] = {}
+        self._sole_trace_cache: dict[int, np.ndarray] = {}
         self._pending = None
         self._skill_state = None
         self._last_result = None
@@ -408,6 +503,61 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         self._terrain_trace_cache[record] = cached
         return cached
 
+    def _sole_trace(self, record: int) -> np.ndarray:
+        cached = self._sole_trace_cache.get(record)
+        if cached is not None:
+            return cached
+        skill_index = int(self._horizon_skill_numpy[record])
+        skill = self.inventory.skills[skill_index]
+        entry = int(self._horizon_entry_numpy[record])
+        endpoint = int(self._horizon_endpoint_numpy[record])
+        frames = np.arange(entry, endpoint, 5, dtype=np.int64)
+        last = endpoint - 1
+        if frames.size == 0 or int(frames[-1]) != last:
+            frames = np.concatenate((frames, np.asarray([last], np.int64)))
+        clip = self.dataset.folder.clips[skill.clip_index]
+        layout = self.dataset.folder.layout
+        root_index = int(layout.root_body_index)
+        foot_indices = (
+            int(layout.left_foot_body_index),
+            int(layout.right_foot_body_index),
+        )
+        root = np.asarray(
+            clip.body_position_world[entry, root_index], np.float32
+        )
+        root_quaternion = np.asarray(
+            clip.body_quaternion_world_wxyz[entry, root_index], np.float32
+        )
+        w, x, y, z = root_quaternion
+        root_yaw = math.atan2(
+            2.0 * float(w * z + x * y),
+            1.0 - 2.0 * float(y * y + z * z),
+        )
+        positions = np.asarray(
+            clip.body_position_world[frames][:, foot_indices], np.float32
+        )
+        quaternions = np.asarray(
+            clip.body_quaternion_world_wxyz[frames][:, foot_indices],
+            np.float32,
+        )
+        rotations = _rotation_matrices_wxyz(quaternions)
+        world = positions[:, :, None, :] + np.einsum(
+            "...ij,pj->...pi",
+            rotations,
+            _G1_LOCAL_SOLE_POINTS_M,
+            optimize=True,
+        )
+        delta = world - root[None, None, None, :]
+        cosine = math.cos(root_yaw)
+        sine = math.sin(root_yaw)
+        local = np.empty_like(delta)
+        local[..., 0] = cosine * delta[..., 0] + sine * delta[..., 1]
+        local[..., 1] = -sine * delta[..., 0] + cosine * delta[..., 1]
+        local[..., 2] = delta[..., 2]
+        owned = np.ascontiguousarray(local.reshape(-1, 3), dtype=np.float32)
+        self._sole_trace_cache[record] = owned
+        return owned
+
     def _terrain_profile_prefilter(
         self, records: torch.Tensor, result: Any
     ) -> torch.Tensor:
@@ -421,6 +571,12 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         source_parts = []
         anchor_parts = []
         candidate_parts = []
+        footprint_parts = []
+        footprint_landing_parts = []
+        landing_candidate_parts = []
+        sole_parts = []
+        sole_candidate_parts = []
+        landing_count = 0
         for candidate, record_value in enumerate(record_values.tolist()):
             local, support, source, anchor = self._terrain_trace(record_value)
             local_parts.append(local)
@@ -430,6 +586,28 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             candidate_parts.append(
                 np.full(local.shape[0], candidate, dtype=np.int64)
             )
+            soles = self._sole_trace(record_value)
+            sole_parts.append(soles)
+            sole_candidate_parts.append(
+                np.full(soles.shape[0], candidate, dtype=np.int64)
+            )
+            footprints = self._landing_footprints(record_value)
+            if footprints.shape[0]:
+                footprint_parts.append(footprints.reshape(-1, 2))
+                footprint_landing_parts.append(
+                    np.repeat(
+                        np.arange(
+                            landing_count,
+                            landing_count + footprints.shape[0],
+                            dtype=np.int64,
+                        ),
+                        footprints.shape[1],
+                    )
+                )
+                landing_candidate_parts.append(
+                    np.full(footprints.shape[0], candidate, dtype=np.int64)
+                )
+                landing_count += footprints.shape[0]
         device = self.database.device
         local = torch.as_tensor(
             np.concatenate(local_parts), dtype=torch.float32, device=device
@@ -477,7 +655,176 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         maximum_error = torch.zeros(
             candidate_count, dtype=torch.float32, device=device
         ).scatter_reduce_(0, candidate, error, reduce="amax", include_self=True)
-        return maximum_error <= self.terrain_tolerance_m
+        compatible = maximum_error <= self.terrain_tolerance_m
+        sole_local = torch.as_tensor(
+            np.concatenate(sole_parts), dtype=torch.float32, device=device
+        )
+        sole_candidate = torch.as_tensor(
+            np.concatenate(sole_candidate_parts),
+            dtype=torch.long,
+            device=device,
+        )
+        sole_world_xy = result.root_position_world[:2].unsqueeze(0) + _rotate_xy(
+            sole_local[:, :2], current_yaw
+        )
+        sole_scene_xy = self.query_terrain.alignment.matcher_to_scene_xy(
+            sole_world_xy
+        )
+        sole_inside = (
+            (sole_scene_xy >= origin) & (sole_scene_xy <= maximum)
+        ).all(dim=1)
+        sole_surface = grid.sample_xy(
+            torch.minimum(torch.maximum(sole_scene_xy, origin), maximum)
+        )
+        sole_clearance = (
+            result.root_position_world[2]
+            + sole_local[:, 2]
+            - sole_surface
+        )
+        sole_clearance = torch.where(
+            sole_inside,
+            sole_clearance,
+            torch.full_like(sole_clearance, -math.inf),
+        )
+        minimum_sole_clearance = torch.full(
+            (candidate_count,), math.inf, dtype=torch.float32, device=device
+        ).scatter_reduce_(
+            0,
+            sole_candidate,
+            sole_clearance,
+            reduce="amin",
+            include_self=True,
+        )
+        compatible &= minimum_sole_clearance >= (
+            float(self.contact_feasibility_config.minimum_sole_clearance_m)
+            - _PREFILTER_SOLE_CLEARANCE_SLACK_M
+        )
+        if footprint_parts:
+            footprint_local = torch.as_tensor(
+                np.concatenate(footprint_parts),
+                dtype=torch.float32,
+                device=device,
+            )
+            footprint_landing = torch.as_tensor(
+                np.concatenate(footprint_landing_parts),
+                dtype=torch.long,
+                device=device,
+            )
+            landing_candidate = torch.as_tensor(
+                np.concatenate(landing_candidate_parts),
+                dtype=torch.long,
+                device=device,
+            )
+            footprint_world = result.root_position_world[:2].unsqueeze(0) + _rotate_xy(
+                footprint_local, current_yaw
+            )
+            footprint_scene = self.query_terrain.alignment.matcher_to_scene_xy(
+                footprint_world
+            )
+            footprint_inside = (
+                (footprint_scene >= origin) & (footprint_scene <= maximum)
+            ).all(dim=1)
+            footprint_height = grid.sample_xy(
+                torch.minimum(torch.maximum(footprint_scene, origin), maximum)
+            )
+            landing_maximum = torch.full(
+                (landing_count,), -math.inf, dtype=torch.float32, device=device
+            ).scatter_reduce_(
+                0,
+                footprint_landing,
+                footprint_height,
+                reduce="amax",
+                include_self=True,
+            )
+            landing_minimum = torch.full(
+                (landing_count,), math.inf, dtype=torch.float32, device=device
+            ).scatter_reduce_(
+                0,
+                footprint_landing,
+                footprint_height,
+                reduce="amin",
+                include_self=True,
+            )
+            outside = torch.zeros(
+                landing_count, dtype=torch.long, device=device
+            ).scatter_reduce_(
+                0,
+                footprint_landing,
+                (~footprint_inside).to(torch.long),
+                reduce="amax",
+                include_self=True,
+            )
+            landing_range = torch.where(
+                outside.bool(),
+                torch.full_like(landing_maximum, math.inf),
+                landing_maximum - landing_minimum,
+            )
+            candidate_range = torch.zeros(
+                candidate_count, dtype=torch.float32, device=device
+            ).scatter_reduce_(
+                0,
+                landing_candidate,
+                landing_range,
+                reduce="amax",
+                include_self=True,
+            )
+            compatible &= candidate_range <= float(
+                self.contact_feasibility_config.maximum_edge_height_range_m
+            )
+        return compatible
+
+    def _landing_footprints(self, record: int) -> np.ndarray:
+        cached = self._landing_footprint_cache.get(record)
+        if cached is not None:
+            return cached
+        skill_index = int(self._horizon_skill_numpy[record])
+        skill = self.inventory.skills[skill_index]
+        entry = int(self._horizon_entry_numpy[record])
+        endpoint = int(self._horizon_endpoint_numpy[record])
+        support = self._support_numpy[skill_index]
+        onset = (~support[entry : endpoint - 1]) & support[entry + 1 : endpoint]
+        events = np.argwhere(onset)
+        if events.size == 0:
+            output = np.empty((0, 7, 2), dtype=np.float32)
+            self._landing_footprint_cache[record] = output
+            return output
+        clip = self.dataset.folder.clips[skill.clip_index]
+        layout = self.dataset.folder.layout
+        root_index = int(layout.root_body_index)
+        foot_indices = (
+            int(layout.left_foot_body_index),
+            int(layout.right_foot_body_index),
+        )
+        root = np.asarray(clip.body_position_world[entry, root_index], np.float32)
+        root_quaternion = np.asarray(
+            clip.body_quaternion_world_wxyz[entry, root_index], np.float32
+        )
+        w, x, y, z = root_quaternion
+        root_yaw = math.atan2(
+            2.0 * float(w * z + x * y),
+            1.0 - 2.0 * float(y * y + z * z),
+        )
+        cosine = math.cos(root_yaw)
+        sine = math.sin(root_yaw)
+        output = []
+        for relative_frame, foot in events.tolist():
+            frame = entry + int(relative_frame) + 1
+            body = foot_indices[int(foot)]
+            position = np.asarray(clip.body_position_world[frame, body], np.float32)
+            quaternion = np.asarray(
+                clip.body_quaternion_world_wxyz[frame, body], np.float32
+            )
+            world = position + _G1_LOCAL_SOLE_POINTS_M @ _rotation_matrix_wxyz(
+                quaternion
+            ).T
+            delta = world[:, :2] - root[None, :2]
+            local = np.empty_like(delta)
+            local[:, 0] = cosine * delta[:, 0] + sine * delta[:, 1]
+            local[:, 1] = -sine * delta[:, 0] + cosine * delta[:, 1]
+            output.append(local)
+        owned = np.ascontiguousarray(np.stack(output), dtype=np.float32)
+        self._landing_footprint_cache[record] = owned
+        return owned
 
     def _source_suffix_matches_command(
         self,
@@ -572,9 +919,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         state = self._skill_state
         if not self.continuous_skill_enabled or state is None:
             return None
-        if bool(state.endpoint_translation_warp_world_xy.abs().max().item()) or bool(
-            state.endpoint_yaw_warp_rad.abs().item()
-        ):
+        if state.playback_stop >= state.skill.interval.playback_stop:
             return None
         endpoint = next_sequential_horizon_endpoint(
             state.skill.support_mask,
@@ -583,6 +928,9 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         )
         if endpoint is None:
             return None
+        continuation_state = extend_skill_state(
+            state, playback_stop=endpoint
+        )
 
         start = state.playback_stop
         clip = self.dataset.folder.clips[state.skill.clip_index]
@@ -612,7 +960,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             clip=clip,
             start_frame=start,
             endpoint_frame_exclusive=endpoint,
-            yaw_offset=state.yaw_offset,
+            yaw_offset=continuation_state.yaw_offset,
             command=command,
         ):
             return None
@@ -624,9 +972,11 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         )
         placed_feet = torch.empty_like(source_feet)
         placed_feet[..., :2] = _rotate_xy(
-            source_feet[..., :2], state.yaw_offset
-        ) + state.translation_world[:2]
-        placed_feet[..., 2] = source_feet[..., 2] + state.translation_world[2]
+            source_feet[..., :2], continuation_state.yaw_offset
+        ) + continuation_state.translation_world[:2]
+        placed_feet[..., 2] = (
+            source_feet[..., 2] + continuation_state.translation_world[2]
+        )
 
         def sample_query(points_xy: torch.Tensor) -> torch.Tensor:
             return self.query_terrain.query_grid.sample_xy(
@@ -656,6 +1006,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                     maximum_stance_error_m=0.0,
                     landing_error_m=0.0,
                     minimum_swing_clearance_m=0.0,
+                    minimum_sole_clearance_m=0.0,
                     maximum_footprint_height_range_m=0.0,
                     maximum_height_deformation_m=0.0,
                 )
@@ -682,6 +1033,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                     maximum_stance_error_m=surface_error,
                     landing_error_m=0.0,
                     minimum_swing_clearance_m=0.0,
+                    minimum_sole_clearance_m=0.0,
                     maximum_footprint_height_range_m=0.0,
                     maximum_height_deformation_m=surface_error,
                 )
@@ -694,7 +1046,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             command=command,
             validation=validation,
         )
-        return extend_skill_state(state, playback_stop=endpoint)
+        return continuation_state
 
     def _update_endpoint_warp_command(self, command) -> None:
         if self._last_result is None:
@@ -790,6 +1142,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             targets,
             current_root_position_world=result.root_position_world,
             current_root_yaw=current_yaw,
+            current_foot_position_world=self._feet,
             query_terrain=self.query_terrain,
         )
         desired_turning_by_frames = {
@@ -939,6 +1292,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                 current=self._current_pose(),
                 halflife_s=self.config.inertialization_halflife_s,
                 foot_kinematics=self.foot_kinematics,
+                sole_kinematics=self.sole_kinematics,
                 sample_surface=sample_query,
                 config=self.contact_feasibility_config,
                 result_filter=self.result_filter,
@@ -947,7 +1301,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                 maximum_translation_warp_m=translation_limit,
                 maximum_yaw_warp_rad=yaw_limit,
             )
-            return validation.accepted
+            return validation
 
         def select(*, require_phase: bool):
             prefer_runway = (
@@ -1040,17 +1394,15 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                     runway_compatible if prefer_runway else None
                 ),
                 maximum_preferred_cost_increase=(
-                    0.0
-                    if self.emitted_contact_preview_enabled
-                    else self.maximum_preferred_cost_increase
+                    self.maximum_preferred_cost_increase
                 ),
                 maximum_preferred_outcome_cost_increase=(
-                    0.0
-                    if self.emitted_contact_preview_enabled
-                    else self.maximum_preferred_outcome_cost_increase
+                    self.maximum_preferred_outcome_cost_increase
                 ),
                 maximum_validated_candidates=(
-                    64 if self.emitted_contact_preview_enabled else None
+                    self.maximum_emitted_contact_candidates
+                    if self.emitted_contact_preview_enabled
+                    else None
                 ),
                 ranked_prefilter=(
                     (
@@ -1218,6 +1570,7 @@ def run_resolved_horizon_matrix(
     contact_phase_gate: bool = False,
     continuous_skill_enabled: bool = False,
     emitted_contact_preview_enabled: bool = False,
+    maximum_emitted_contact_candidates: int = 64,
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
@@ -1239,6 +1592,7 @@ def run_resolved_horizon_matrix(
     import mujoco
 
     from .torch_g1_fk import MujocoG1FootKinematics
+    from .torch_g1_sole_kinematics import MujocoG1SoleKinematics
     from .torch_terrain_live_viewer import (
         apply_kinematic_state,
         build_kinematic_scene,
@@ -1288,6 +1642,7 @@ def run_resolved_horizon_matrix(
     )
     horizons = build_horizon_inventory(resolved.dataset, base.database, skills)
     foot_kinematics = MujocoG1FootKinematics(g1_xml)
+    sole_kinematics = MujocoG1SoleKinematics(g1_xml)
     result_filter = None
     if foot_lock:
         from .torch_terrain_foot_lock import build_terrain_foot_lock
@@ -1379,6 +1734,7 @@ def run_resolved_horizon_matrix(
                 if emitted_contact_preview_enabled
                 else ":source-contact-preview"
             )
+            + f":emitted-contact-candidates:{maximum_emitted_contact_candidates}"
             + (
                 ":continuous-surface-tolerance:0.08"
                 if continuous_skill_enabled
@@ -1414,6 +1770,7 @@ def run_resolved_horizon_matrix(
             dataset=resolved.dataset,
             query_terrain=resolved.measurement_extension,
             foot_kinematics=foot_kinematics,
+            sole_kinematics=sole_kinematics,
             config=config,
             search_config=search_config,
             terrain_tolerance_m=terrain_tolerance_m,
@@ -1421,6 +1778,9 @@ def run_resolved_horizon_matrix(
             contact_phase_gate=contact_phase_gate,
             continuous_skill_enabled=continuous_skill_enabled,
             emitted_contact_preview_enabled=emitted_contact_preview_enabled,
+            maximum_emitted_contact_candidates=(
+                maximum_emitted_contact_candidates
+            ),
             turning_clip_paths=turning_clip_paths,
             maximum_translation_warp_m=maximum_translation_warp_m,
             maximum_yaw_warp_rad=maximum_yaw_warp_rad,

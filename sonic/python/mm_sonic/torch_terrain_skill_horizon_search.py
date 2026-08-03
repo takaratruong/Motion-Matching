@@ -113,7 +113,8 @@ class HorizonSearchFailure(ContractError):
         )
 
 
-TerrainHorizonValidator = Callable[[int, int, int], bool]
+TerrainHorizonValidator = Callable[[int, int, int], object]
+PreferredHorizonValidator = Callable[[int, int, int], bool]
 RankedHorizonPrefilter = Callable[[torch.Tensor], torch.Tensor]
 
 
@@ -478,7 +479,7 @@ def select_horizon_candidate(
     targets: HorizonTargets,
     *,
     terrain_validator: TerrainHorizonValidator,
-    preferred_validator: TerrainHorizonValidator | None = None,
+    preferred_validator: PreferredHorizonValidator | None = None,
     maximum_preferred_cost_increase: float = math.inf,
     maximum_preferred_outcome_cost_increase: float = math.inf,
     maximum_validated_candidates: int | None = None,
@@ -519,6 +520,7 @@ def select_horizon_candidate(
         matcher_config=matcher_config,
     )
     terrain_rejected = 0
+    terrain_rejected_by_reason: dict[str, int] = {}
     preferred_rejected = 0
     shortlist_rejected = 0
     prefilter_rejected = 0
@@ -560,6 +562,14 @@ def select_horizon_candidate(
     ) -> TerrainSkillHorizonResult:
         rejected = dict(ranked.rejected_by_reason)
         rejected["terrain"] = terrain_rejected
+        rejected.update(
+            {
+                f"terrain:{reason}": count
+                for reason, count in sorted(
+                    terrain_rejected_by_reason.items()
+                )
+            }
+        )
         if maximum_validated_candidates is not None:
             rejected["shortlist"] = shortlist_rejected
         if ranked_prefilter is not None:
@@ -599,7 +609,19 @@ def select_horizon_candidate(
         record = int(values[0])
         row = int(inventory.entry_row[record].item())
         endpoint = int(inventory.endpoint_frame_exclusive[record].item())
-        if terrain_validator(record, row, endpoint):
+        verdict = terrain_validator(record, row, endpoint)
+        if type(verdict) is bool:
+            terrain_accepted = verdict
+            terrain_reason = None
+        else:
+            terrain_accepted = getattr(verdict, "accepted", None)
+            terrain_reason = getattr(verdict, "reason", None)
+            if type(terrain_accepted) is not bool or (
+                terrain_reason is not None
+                and (not isinstance(terrain_reason, str) or not terrain_reason)
+            ) or terrain_accepted != (terrain_reason is None):
+                raise ContractError("horizon terrain validator result is invalid")
+        if terrain_accepted:
             if preferred_validator is None:
                 return build_result(
                     values, record, row, endpoint, selection_mode="immediate"
@@ -619,6 +641,10 @@ def select_horizon_candidate(
             preferred_rejected += 1
         else:
             terrain_rejected += 1
+            if terrain_reason is not None:
+                terrain_rejected_by_reason[terrain_reason] = (
+                    terrain_rejected_by_reason.get(terrain_reason, 0) + 1
+                )
     if fallback is not None:
         values, record, row, endpoint = fallback
         return build_result(
@@ -630,6 +656,12 @@ def select_horizon_candidate(
         )
     rejected = dict(ranked.rejected_by_reason)
     rejected["terrain"] = terrain_rejected
+    rejected.update(
+        {
+            f"terrain:{reason}": count
+            for reason, count in sorted(terrain_rejected_by_reason.items())
+        }
+    )
     if maximum_validated_candidates is not None:
         rejected["shortlist"] = shortlist_rejected
     if ranked_prefilter is not None:

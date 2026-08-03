@@ -1,10 +1,20 @@
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
+import numpy as np
 import torch
 
 from mm_sonic.joints import ContractError
+from mm_sonic.torch_motion_features import (
+    FeatureNormalization,
+    TorchMotionDatabase,
+)
+from mm_sonic.torch_terrain_features import TerrainDataset
 from mm_sonic.torch_terrain_skills import (
     SkillInterval,
+    build_terrain_skill_inventory,
     extract_skill_intervals,
     source_contact_height_p95_m,
 )
@@ -112,6 +122,56 @@ class TerrainSkillIntervalTest(unittest.TestCase):
                 torch.zeros((9, 2), dtype=torch.float32),
                 valid_frame_stop=8,
             )
+
+    def test_flat_clip_is_available_as_level_surface_skill(self):
+        frames = 80
+        clip = SimpleNamespace(
+            valid_frame_stop=frames,
+            body_position_world=np.zeros((frames, 3, 3), np.float32),
+        )
+        folder = SimpleNamespace(
+            clips=(clip,),
+            layout=SimpleNamespace(
+                left_foot_body_index=1,
+                right_foot_body_index=2,
+            ),
+        )
+        dataset = TerrainDataset(
+            root=Path("."),
+            folder=folder,
+            clip_grids=(None,),
+            clip_alignments=(None,),
+            manifest_sha256="dataset",
+            _manifest={"clips": [{"kind": "flat"}]},
+            device=torch.device("cpu"),
+        )
+        zeros = torch.zeros(27)
+        database = TorchMotionDatabase(
+            folder=folder,
+            device=torch.device("cpu"),
+            normalization=FeatureNormalization(zeros, torch.ones_like(zeros)),
+            reset_row=0,
+            _search_features=torch.zeros((frames, 27)),
+            _search_clip_index=torch.zeros(frames, dtype=torch.long),
+            _search_frame_index=torch.arange(frames),
+            _source_row_map={(0, frame): frame for frame in range(frames)},
+        )
+
+        with mock.patch(
+            "mm_sonic.torch_terrain_skills.source_support_mask",
+            return_value=torch.ones((frames, 2), dtype=torch.bool),
+        ):
+            inventory = build_terrain_skill_inventory(dataset, database)
+
+        self.assertEqual(len(inventory.skills), 1)
+        skill = inventory.skills[0]
+        self.assertEqual(skill.interval, SkillInterval(0, 0, frames))
+        self.assertEqual(skill.entry_rows, tuple(range(31)))
+        self.assertTrue(
+            torch.equal(
+                skill.foot_surface_height_m, torch.zeros(frames, 2)
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -5,7 +5,10 @@ import torch
 from mm_sonic.joints import ContractError
 from mm_sonic.torch_terrain_conformal_swing import (
     TerrainConformalSwingConfig,
+    _interpolate_control_perturbations,
+    _warp_reference_to_landing_target,
     optimize_terrain_conformal_swing,
+    project_landing_to_stable_foothold,
     terrain_conformal_swing_cost,
 )
 
@@ -167,6 +170,43 @@ class TerrainConformalSwingOptimizerTests(unittest.TestCase):
             maximum_z_deformation_m=0.18,
         )
 
+    def test_landing_target_is_distributed_with_a_smooth_endpoint_warp(self):
+        raw = torch.zeros((21, 3), dtype=torch.float32)
+        target = torch.tensor((0.04, -0.02, 0.10), dtype=torch.float32)
+
+        warped = _warp_reference_to_landing_target(raw, target)
+
+        torch.testing.assert_close(warped[0], raw[0], rtol=0.0, atol=0.0)
+        torch.testing.assert_close(warped[-1], target, rtol=0.0, atol=0.0)
+        displacement = warped - raw
+        self.assertTrue(bool((torch.diff(displacement[:, 0]) >= 0.0).all()))
+        endpoint_only = raw.clone()
+        endpoint_only[-1] = target
+        warped_acceleration = torch.linalg.vector_norm(
+            torch.diff(warped, n=2, dim=0), dim=1
+        ).max()
+        endpoint_acceleration = torch.linalg.vector_norm(
+            torch.diff(endpoint_only, n=2, dim=0), dim=1
+        ).max()
+        self.assertLess(float(warped_acceleration), float(endpoint_acceleration) * 0.1)
+
+    def test_sparse_control_perturbations_interpolate_smoothly(self):
+        controls = torch.tensor(
+            (((0.0, 0.0, 0.0), (0.0, 0.0, 0.08),
+              (0.0, 0.0, 0.03), (0.0, 0.0, 0.0)),),
+            dtype=torch.float32,
+        )
+
+        path = _interpolate_control_perturbations(controls, frame_count=31)
+
+        self.assertEqual(tuple(path.shape), (1, 31, 3))
+        torch.testing.assert_close(path[:, 0], controls[:, 0])
+        torch.testing.assert_close(path[:, -1], controls[:, -1])
+        self.assertLess(
+            float(torch.diff(path[0, :, 2], n=2).abs().max()),
+            0.01,
+        )
+
     def test_optimizer_preserves_non_swing_and_swing_endpoints_bitwise(self):
         raw = torch.tensor(
             tuple((float(x), 0.0, 0.08) for x in torch.linspace(-0.3, 0.3, 7))
@@ -297,6 +337,58 @@ class TerrainConformalSwingOptimizerTests(unittest.TestCase):
                 config=self._optimizer_config(),
                 seed=0,
             )
+
+    def test_landing_projection_finds_nearest_stable_sole_patch(self):
+        landing = torch.tensor((0.03, 0.0, 0.0))
+
+        def step(points):
+            return torch.where(
+                points[..., 0] >= 0.0,
+                torch.full_like(points[..., 0], 0.18),
+                torch.zeros_like(points[..., 0]),
+            )
+
+        projected = project_landing_to_stable_foothold(
+            landing,
+            toe_offset_xy=torch.tensor((0.08, 0.0)),
+            heel_offset_xy=torch.tensor((-0.05, 0.0)),
+            sample_surface=step,
+            search_radius_m=0.15,
+            search_step_m=0.01,
+            edge_probe_m=0.04,
+            maximum_height_range_m=0.025,
+        )
+
+        self.assertTrue(projected.projected)
+        self.assertLessEqual(projected.displacement_m, 0.12)
+        self.assertLessEqual(projected.maximum_height_range_m, 0.025)
+        self.assertGreaterEqual(float(projected.position_world[0]), 0.05)
+        self.assertAlmostEqual(float(projected.position_world[2]), 0.18)
+
+    def test_optimizer_hits_explicit_terrain_valid_landing_target(self):
+        raw = torch.tensor(
+            tuple((float(x), 0.0, 0.08) for x in torch.linspace(-0.3, 0.3, 7))
+        )
+        swing = torch.tensor((False, True, True, True, True, True, False))
+        landing = raw[5].clone()
+        landing[0] -= 0.04
+        landing[2] = 0.10
+
+        result = optimize_terrain_conformal_swing(
+            raw,
+            swing,
+            sample_surface=lambda points: torch.zeros(
+                points.shape[:-1], dtype=points.dtype, device=points.device
+            ),
+            toe_offset_xy=torch.tensor((0.08, 0.0)),
+            heel_offset_xy=torch.tensor((-0.05, 0.0)),
+            landing_target_world=landing,
+            config=self._optimizer_config(),
+            seed=41,
+        )
+
+        self.assertTrue(torch.equal(result.path[5], landing))
+        self.assertTrue(torch.equal(result.path[~swing], raw[~swing]))
 
 
 if __name__ == "__main__":

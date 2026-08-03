@@ -248,7 +248,43 @@ def build_terrain_skill_inventory(
     }
     for clip_index, clip in enumerate(dataset.folder.clips):
         if dataset.clip_grids[clip_index] is None:
-            rejected["flat"] += 1
+            support = source_support_mask(dataset, clip_index).detach().clone()
+            heights = (
+                _surface_height_profile(dataset, clip_index).detach().clone()
+            )
+            interval = SkillInterval(0, 0, clip.valid_frame_stop)
+            candidate_rows = tuple(
+                row
+                for frame in range(
+                    0,
+                    clip.valid_frame_stop - minimum_remaining_frames + 1,
+                )
+                if bool(support[frame].all().item())
+                and (
+                    row := database.row_for_source(clip_index, frame)
+                )
+                is not None
+            )
+            rows = tuple(
+                row for row in candidate_rows if row not in row_to_skill
+            )
+            rejected["overlapping_entry_rows"] += len(candidate_rows) - len(rows)
+            if not rows:
+                rejected["no_entry_rows"] += 1
+                continue
+            skill_index = len(skills)
+            skills.append(
+                TerrainSkill(
+                    skill_index=skill_index,
+                    clip_index=clip_index,
+                    interval=interval,
+                    entry_rows=rows,
+                    support_mask=support,
+                    foot_surface_height_m=heights,
+                )
+            )
+            for row in rows:
+                row_to_skill[row] = skill_index
             continue
         clip_quality = None if source_quality is None else source_quality[clip_index]
         if (

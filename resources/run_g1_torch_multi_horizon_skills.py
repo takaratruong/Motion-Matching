@@ -61,6 +61,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reject candidates whose inertialized emitted feet violate terrain contacts.",
     )
     parser.add_argument(
+        "--maximum-emitted-contact-candidates",
+        type=int,
+        default=64,
+        help="Exact emitted-contact candidates validated per search.",
+    )
+    parser.add_argument(
         "--swing-clearance-margin-m",
         type=float,
         default=None,
@@ -272,6 +278,9 @@ def main(argv: list[str] | None = None) -> int:
         contact_phase_gate=args.contact_phase_gate,
         continuous_skill_enabled=args.continuous_skill,
         emitted_contact_preview_enabled=args.emitted_contact_preview,
+        maximum_emitted_contact_candidates=(
+            args.maximum_emitted_contact_candidates
+        ),
         swing_clearance_margin_m=args.swing_clearance_margin_m,
         foot_correction_halflife_s=args.foot_correction_halflife_s,
         swing_plan_sigma_frames=args.swing_plan_sigma_frames,
@@ -305,6 +314,9 @@ def main(argv: list[str] | None = None) -> int:
                 "contact_phase_gate": args.contact_phase_gate,
                 "continuous_skill": args.continuous_skill,
                 "emitted_contact_preview": args.emitted_contact_preview,
+                "maximum_emitted_contact_candidates": (
+                    args.maximum_emitted_contact_candidates
+                ),
                 "swing_clearance_margin_m": args.swing_clearance_margin_m,
                 "foot_correction_halflife_s": args.foot_correction_halflife_s,
                 "swing_plan_sigma_frames": args.swing_plan_sigma_frames,

@@ -1,5 +1,6 @@
 import math
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -183,6 +184,26 @@ class HorizonRankingTest(unittest.TestCase):
         self.assertEqual(visited, [(2, 2, 30), (3, 3, 30)])
         self.assertEqual(result.record_index, 3)
         self.assertEqual(result.rejected_by_reason["terrain"], 1)
+
+    def test_selection_preserves_structured_terrain_rejection_reason(self):
+        result = select_horizon_candidate(
+            self.database,
+            self.inventory,
+            torch.zeros(27),
+            self.target,
+            terrain_validator=lambda record, _row, _endpoint: (
+                SimpleNamespace(
+                    accepted=record == 3,
+                    reason=None if record == 3 else "sole-penetration",
+                )
+            ),
+        )
+
+        self.assertEqual(result.record_index, 3)
+        self.assertEqual(result.rejected_by_reason["terrain"], 1)
+        self.assertEqual(
+            result.rejected_by_reason["terrain:sole-penetration"], 1
+        )
 
     def test_validation_shortlist_fails_without_scanning_lower_ranked_candidates(self):
         visited = []

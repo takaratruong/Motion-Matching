@@ -624,6 +624,9 @@ def _build_live_matcher(
             resolved.dataset, base.database, skills
         )
         foot_kinematics = MujocoG1FootKinematics(str(g1_xml))
+        from .torch_g1_sole_kinematics import MujocoG1SoleKinematics
+
+        sole_kinematics = MujocoG1SoleKinematics(str(g1_xml))
         matcher_kwargs = {}
         if foot_lock:
             from .torch_terrain_foot_lock import build_terrain_foot_lock
@@ -648,6 +651,7 @@ def _build_live_matcher(
             dataset=resolved.dataset,
             query_terrain=resolved.measurement_extension,
             foot_kinematics=foot_kinematics,
+            sole_kinematics=sole_kinematics,
             config=matcher_config,
             search_config=horizon_search_config_from_experiment(
                 resolved.resolved_config

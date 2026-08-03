@@ -29,6 +29,7 @@ def _rejected(reason: str) -> TerrainContactFeasibilityResult:
         maximum_stance_error_m=0.0,
         landing_error_m=0.0,
         minimum_swing_clearance_m=0.0,
+        minimum_sole_clearance_m=0.0,
         maximum_footprint_height_range_m=0.0,
         maximum_height_deformation_m=0.0,
     )
@@ -43,6 +44,7 @@ def preview_emitted_contact_trace(
     current: TerrainSkillPose,
     halflife_s: float,
     foot_kinematics: Any,
+    sole_kinematics: Any | None = None,
     sample_surface: Callable[[torch.Tensor], torch.Tensor],
     config: TerrainContactFeasibilityConfig,
     result_filter: Any | None = None,
@@ -58,6 +60,10 @@ def preview_emitted_contact_trace(
         or type(selected_entry_frame) is not int
         or not 0 <= selected_entry_frame < skill.support_mask.shape[0]
         or not callable(getattr(foot_kinematics, "foot_positions", None))
+        or (
+            sole_kinematics is not None
+            and not callable(getattr(sole_kinematics, "sole_points", None))
+        )
         or not callable(sample_surface)
         or not isinstance(config, TerrainContactFeasibilityConfig)
         or (
@@ -141,6 +147,29 @@ def preview_emitted_contact_trace(
         or not torch.isfinite(feet).all()
     ):
         raise ContractError("emitted contact preview FK result is invalid")
+    sole_points = None
+    if sole_kinematics is not None:
+        try:
+            sole_numpy = sole_kinematics.sole_points(
+                joints.detach().cpu().numpy(),
+                roots.detach().cpu().numpy(),
+                orientations.detach().cpu().numpy(),
+            )
+        except Exception as error:
+            raise ContractError("emitted contact preview sole FK failed") from error
+        sole_points = torch.as_tensor(
+            np.asarray(sole_numpy, dtype=np.float64),
+            dtype=reference.dtype,
+            device=reference.device,
+        )
+        if (
+            sole_points.ndim != 4
+            or tuple(sole_points.shape[:2]) != (len(frames), 2)
+            or sole_points.shape[2] < 3
+            or sole_points.shape[3] != 3
+            or not torch.isfinite(sole_points).all()
+        ):
+            raise ContractError("emitted contact preview sole FK result is invalid")
 
     support = torch.stack([frame.support for frame in frames]).to(
         device=reference.device
@@ -160,4 +189,5 @@ def preview_emitted_contact_trace(
         sample_surface=sample_surface,
         config=config,
         align_initial_support=False,
+        landing_footprint_position_world=sole_points,
     )

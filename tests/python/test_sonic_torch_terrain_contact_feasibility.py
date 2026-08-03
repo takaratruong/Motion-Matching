@@ -20,6 +20,7 @@ class TerrainContactFeasibilityContractTest(unittest.TestCase):
         self.assertEqual(value.edge_margin_m, 0.04)
         self.assertEqual(value.maximum_edge_height_range_m, 0.025)
         self.assertEqual(value.minimum_swing_clearance_m, -0.005)
+        self.assertEqual(value.minimum_sole_clearance_m, -0.025)
 
     def test_result_requires_reason_exactly_when_rejected(self):
         from mm_sonic.torch_terrain_contact_feasibility import (
@@ -33,6 +34,7 @@ class TerrainContactFeasibilityContractTest(unittest.TestCase):
                 maximum_stance_error_m=0.0,
                 landing_error_m=0.0,
                 minimum_swing_clearance_m=0.0,
+                minimum_sole_clearance_m=0.0,
                 maximum_footprint_height_range_m=0.0,
                 maximum_height_deformation_m=0.0,
             )
@@ -54,7 +56,13 @@ class TerrainContactFeasibilityLayerTest(unittest.TestCase):
         )
         self.source_surface = torch.zeros((4, 2), dtype=torch.float32)
 
-    def validate(self, sample_surface, *, align_initial_support=False):
+    def validate(
+        self,
+        sample_surface,
+        *,
+        align_initial_support=False,
+        landing_footprint_position_world=None,
+    ):
         from mm_sonic.torch_terrain_contact_feasibility import (
             validate_placed_contact_trace,
         )
@@ -66,6 +74,9 @@ class TerrainContactFeasibilityLayerTest(unittest.TestCase):
             sample_surface=sample_surface,
             config=self.config,
             align_initial_support=align_initial_support,
+            landing_footprint_position_world=(
+                landing_footprint_position_world
+            ),
         )
 
     @staticmethod
@@ -108,6 +119,34 @@ class TerrainContactFeasibilityLayerTest(unittest.TestCase):
         self.assertEqual(result.reason, "landing-edge-margin")
         self.assertGreater(result.maximum_footprint_height_range_m, 0.025)
 
+    def test_oriented_sole_points_detect_a_toe_crossing_the_riser(self):
+        self.feet[:, 1, 0] = -0.08
+        sole = self.feet[:, :, None, :].expand(-1, -1, 5, -1).clone()
+        sole[:, 1, :, 0] += torch.tensor((0.0, 0.12, -0.05, 0.12, -0.05))
+        sole[:, 1, :, 1] += torch.tensor((0.0, 0.0, 0.0, 0.04, -0.04))
+
+        def step(points):
+            return torch.where(points[..., 0] >= 0.0, 0.03, 0.0)
+
+        result = self.validate(
+            step, landing_footprint_position_world=sole
+        )
+
+        self.assertEqual(result.reason, "landing-edge-margin")
+        self.assertGreater(result.maximum_footprint_height_range_m, 0.025)
+
+    def test_oriented_sole_penetration_is_checked_outside_landings(self):
+        sole = self.feet[:, :, None, :].expand(-1, -1, 5, -1).clone()
+        sole[..., 2] = 0.0
+        sole[1, 1, 1, 2] = -0.026
+
+        result = self.validate(
+            self.flat, landing_footprint_position_world=sole
+        )
+
+        self.assertEqual(result.reason, "sole-penetration")
+        self.assertLess(result.minimum_sole_clearance_m, -0.025)
+
     def test_unsupported_swing_penetration_is_checked_every_frame(self):
         self.feet[1, 1, 2] -= 0.006
 
@@ -132,6 +171,7 @@ class TerrainContactFeasibilityLayerTest(unittest.TestCase):
         self.assertEqual(result.maximum_stance_error_m, 0.0)
         self.assertEqual(result.landing_error_m, 0.0)
         self.assertEqual(result.minimum_swing_clearance_m, 0.0)
+        self.assertEqual(result.minimum_sole_clearance_m, 0.0)
 
     def test_initial_support_anchor_removes_only_global_vertical_offset(self):
         self.feet[..., 2] -= 0.70

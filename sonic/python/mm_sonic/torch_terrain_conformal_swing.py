@@ -36,6 +36,8 @@ class TerrainConformalSwingConfig:
     endpoint_weight: float = 1000.0
     sample_count: int = 128
     iteration_count: int = 8
+    control_knot_count: int = 6
+    optimize_planar_path: bool = False
     temperature: float = 0.05
     perturbation_xy_std_m: float = 0.01
     perturbation_z_std_m: float = 0.04
@@ -65,6 +67,14 @@ class TerrainConformalSwingConfig:
                     + name.replace("_", " ")
                     + " must be a positive integer"
                 )
+        if type(self.control_knot_count) is not int or self.control_knot_count < 3:
+            raise ContractError(
+                "terrain-conformal swing control knot count must be at least three"
+            )
+        if type(self.optimize_planar_path) is not bool:
+            raise ContractError(
+                "terrain-conformal swing optimize planar path must be boolean"
+            )
         for name in (
             "temperature",
             "perturbation_xy_std_m",
@@ -164,6 +174,159 @@ class TerrainConformalSwingResult:
         ):
             raise ContractError("terrain-conformal swing result is invalid")
         object.__setattr__(self, "path", self.path.detach().clone())
+
+
+@dataclass(frozen=True)
+class StableFootholdProjection:
+    position_world: torch.Tensor
+    displacement_m: float
+    maximum_height_range_m: float
+    projected: bool
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.position_world, torch.Tensor)
+            or tuple(self.position_world.shape) != (3,)
+            or self.position_world.dtype != torch.float32
+            or not torch.isfinite(self.position_world).all()
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) < 0.0
+                for value in (
+                    self.displacement_m,
+                    self.maximum_height_range_m,
+                )
+            )
+            or type(self.projected) is not bool
+        ):
+            raise ContractError("terrain-conformal foothold projection is invalid")
+        object.__setattr__(self, "position_world", self.position_world.detach().clone())
+        object.__setattr__(self, "displacement_m", float(self.displacement_m))
+        object.__setattr__(
+            self,
+            "maximum_height_range_m",
+            float(self.maximum_height_range_m),
+        )
+
+
+def project_landing_to_stable_foothold(
+    landing_position_world: torch.Tensor,
+    *,
+    toe_offset_xy: torch.Tensor,
+    heel_offset_xy: torch.Tensor,
+    sample_surface: Callable[[torch.Tensor], torch.Tensor],
+    search_radius_m: float,
+    search_step_m: float,
+    edge_probe_m: float,
+    maximum_height_range_m: float,
+) -> StableFootholdProjection:
+    """Project one landing to the nearest locally stable oriented sole patch."""
+
+    reference = landing_position_world
+    scalars = (
+        search_radius_m,
+        search_step_m,
+        edge_probe_m,
+        maximum_height_range_m,
+    )
+    if (
+        not isinstance(reference, torch.Tensor)
+        or tuple(reference.shape) != (3,)
+        or reference.dtype != torch.float32
+        or not torch.isfinite(reference).all()
+        or not isinstance(toe_offset_xy, torch.Tensor)
+        or tuple(toe_offset_xy.shape) != (2,)
+        or toe_offset_xy.dtype != reference.dtype
+        or toe_offset_xy.device != reference.device
+        or not torch.isfinite(toe_offset_xy).all()
+        or not isinstance(heel_offset_xy, torch.Tensor)
+        or tuple(heel_offset_xy.shape) != (2,)
+        or heel_offset_xy.dtype != reference.dtype
+        or heel_offset_xy.device != reference.device
+        or not torch.isfinite(heel_offset_xy).all()
+        or not callable(sample_surface)
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) <= 0.0
+            for value in scalars
+        )
+        or float(search_step_m) > float(search_radius_m)
+    ):
+        raise ContractError("terrain-conformal foothold projection inputs are invalid")
+    axis = toe_offset_xy - heel_offset_xy
+    norm = torch.linalg.vector_norm(axis)
+    if float(norm.item()) <= 1.0e-6:
+        raise ContractError("terrain-conformal foothold offsets are degenerate")
+    lateral = torch.stack((-axis[1], axis[0])) / norm
+    footprint = torch.stack(
+        (
+            torch.zeros_like(toe_offset_xy),
+            toe_offset_xy,
+            heel_offset_xy,
+            toe_offset_xy + lateral * float(edge_probe_m),
+            toe_offset_xy - lateral * float(edge_probe_m),
+            heel_offset_xy + lateral * float(edge_probe_m),
+            heel_offset_xy - lateral * float(edge_probe_m),
+        )
+    )
+    count = int(math.floor(float(search_radius_m) / float(search_step_m)))
+    values = torch.arange(
+        -count,
+        count + 1,
+        dtype=reference.dtype,
+        device=reference.device,
+    ) * float(search_step_m)
+    dx, dy = torch.meshgrid(values, values, indexing="ij")
+    shift = torch.stack((dx.flatten(), dy.flatten()), dim=1)
+    distance = torch.linalg.vector_norm(shift, dim=1)
+    inside = distance <= float(search_radius_m) + 1.0e-6
+    centers = reference[:2][None] + shift
+    points = centers[:, None, :] + footprint[None]
+    try:
+        surface = sample_surface(points)
+    except Exception as error:
+        if isinstance(error, ContractError):
+            raise
+        raise ContractError(
+            "terrain-conformal foothold surface sampler failed"
+        ) from error
+    if (
+        not isinstance(surface, torch.Tensor)
+        or surface.shape != points.shape[:-1]
+        or surface.dtype != reference.dtype
+        or surface.device != reference.device
+        or not torch.isfinite(surface).all()
+    ):
+        raise ContractError(
+            "terrain-conformal foothold surface sampler returned invalid heights"
+        )
+    height_range = surface.max(dim=1).values - surface.min(dim=1).values
+    stable = inside & (height_range <= float(maximum_height_range_m))
+    if not bool(stable.any().item()):
+        raise ContractError("no stable terrain-conformal foothold exists")
+    score = torch.where(
+        stable,
+        distance + 1.0e-3 * height_range,
+        torch.full_like(distance, float("inf")),
+    )
+    selected = int(torch.argmin(score).item())
+    position = torch.cat(
+        (centers[selected], surface[selected].max().reshape(1))
+    )
+    displacement = float(distance[selected].item())
+    return StableFootholdProjection(
+        position_world=position,
+        displacement_m=displacement,
+        maximum_height_range_m=float(height_range[selected].item()),
+        projected=bool(
+            displacement > 1.0e-6
+            or abs(float(position[2].item() - reference[2].item())) > 1.0e-6
+        ),
+    )
 
 
 def _validate_cost_inputs(
@@ -327,6 +490,42 @@ def _smooth_perturbations(values: torch.Tensor) -> torch.Tensor:
     ) / sum(weights)
 
 
+def _interpolate_control_perturbations(
+    controls: torch.Tensor, *, frame_count: int
+) -> torch.Tensor:
+    """C1 cubic-Hermite interpolation of sparse batched path controls."""
+
+    knot_count = controls.shape[1]
+    tangent = torch.empty_like(controls)
+    tangent[:, 0] = controls[:, 1] - controls[:, 0]
+    tangent[:, -1] = controls[:, -1] - controls[:, -2]
+    tangent[:, 1:-1] = 0.5 * (controls[:, 2:] - controls[:, :-2])
+    coordinate = torch.linspace(
+        0.0,
+        float(knot_count - 1),
+        frame_count,
+        dtype=controls.dtype,
+        device=controls.device,
+    )
+    segment = torch.floor(coordinate).to(torch.long).clamp(max=knot_count - 2)
+    u = coordinate - segment.to(coordinate.dtype)
+    u2 = u.square()
+    u3 = u2 * u
+    h00 = 2.0 * u3 - 3.0 * u2 + 1.0
+    h10 = u3 - 2.0 * u2 + u
+    h01 = -2.0 * u3 + 3.0 * u2
+    h11 = u3 - u2
+    result = (
+        h00[None, :, None] * controls[:, segment]
+        + h10[None, :, None] * tangent[:, segment]
+        + h01[None, :, None] * controls[:, segment + 1]
+        + h11[None, :, None] * tangent[:, segment + 1]
+    )
+    result[:, 0] = controls[:, 0]
+    result[:, -1] = controls[:, -1]
+    return result
+
+
 def _bounded_candidates(
     center: torch.Tensor,
     raw: torch.Tensor,
@@ -351,6 +550,26 @@ def _bounded_candidates(
     return candidates
 
 
+def _warp_reference_to_landing_target(
+    raw_path: torch.Tensor, landing_target_world: torch.Tensor
+) -> torch.Tensor:
+    """Distribute a landing correction over a swing with minimum-jerk timing."""
+
+    phase = torch.linspace(
+        0.0,
+        1.0,
+        raw_path.shape[0],
+        dtype=raw_path.dtype,
+        device=raw_path.device,
+    )
+    blend = 10.0 * phase**3 - 15.0 * phase**4 + 6.0 * phase**5
+    delta = landing_target_world - raw_path[-1]
+    warped = raw_path + blend[:, None] * delta[None]
+    warped[0] = raw_path[0]
+    warped[-1] = landing_target_world
+    return warped
+
+
 def optimize_terrain_conformal_swing(
     raw_path: torch.Tensor,
     swing_mask: torch.Tensor,
@@ -358,6 +577,7 @@ def optimize_terrain_conformal_swing(
     sample_surface: Callable[[torch.Tensor], torch.Tensor],
     toe_offset_xy: torch.Tensor,
     heel_offset_xy: torch.Tensor,
+    landing_target_world: torch.Tensor | None = None,
     config: TerrainConformalSwingConfig,
     seed: int,
 ) -> TerrainConformalSwingResult:
@@ -377,6 +597,16 @@ def optimize_terrain_conformal_swing(
         or not isinstance(config, TerrainConformalSwingConfig)
         or type(seed) is not int
         or not 0 <= seed < 2**63
+        or (
+            landing_target_world is not None
+            and (
+                not isinstance(landing_target_world, torch.Tensor)
+                or tuple(landing_target_world.shape) != (3,)
+                or landing_target_world.dtype != raw_path.dtype
+                or landing_target_world.device != raw_path.device
+                or not torch.isfinite(landing_target_world).all()
+            )
+        )
     ):
         raise ContractError("terrain-conformal swing optimizer inputs are invalid")
     indices = torch.nonzero(swing_mask, as_tuple=False).flatten()
@@ -391,6 +621,11 @@ def optimize_terrain_conformal_swing(
         raise ContractError("terrain-conformal swing mask must be contiguous")
 
     raw_swing = raw_path[start:stop]
+    objective_reference = raw_swing.clone()
+    if landing_target_world is not None:
+        objective_reference = _warp_reference_to_landing_target(
+            raw_swing, landing_target_world
+        )
     toe_swing = (
         toe_offset_xy[start:stop]
         if isinstance(toe_offset_xy, torch.Tensor)
@@ -407,15 +642,26 @@ def optimize_terrain_conformal_swing(
     )
     raw_cost = terrain_conformal_swing_cost(
         raw_swing[None],
-        raw_swing,
+        objective_reference,
         sample_surface=sample_surface,
         toe_offset_xy=toe_swing,
         heel_offset_xy=heel_swing,
         config=config,
     )
-    current = raw_swing.clone()
-    best = current.clone()
+    current = objective_reference.clone()
+    best = raw_swing.clone()
     best_total = raw_cost.total[0].clone()
+    current_cost = terrain_conformal_swing_cost(
+        current[None],
+        objective_reference,
+        sample_surface=sample_surface,
+        toe_offset_xy=toe_swing,
+        heel_offset_xy=heel_swing,
+        config=config,
+    )
+    if current_cost.total[0] < best_total:
+        best = current.clone()
+        best_total = current_cost.total[0].clone()
     generator = torch.Generator(device=raw_path.device)
     generator.manual_seed(seed)
     standard_deviation = torch.tensor(
@@ -428,25 +674,30 @@ def optimize_terrain_conformal_swing(
         device=raw_path.device,
     )
     for _ in range(config.iteration_count):
-        perturbation = torch.randn(
+        knot_count = min(config.control_knot_count, raw_swing.shape[0])
+        controls = torch.randn(
             (
                 config.sample_count,
-                raw_swing.shape[0],
+                knot_count,
                 3,
             ),
             dtype=raw_path.dtype,
             device=raw_path.device,
             generator=generator,
         ) * standard_deviation
-        perturbation = _smooth_perturbations(perturbation)
-        perturbation[:, 0] = 0.0
-        perturbation[:, -1] = 0.0
+        if not config.optimize_planar_path:
+            controls[..., :2] = 0.0
+        controls[:, 0] = 0.0
+        controls[:, -1] = 0.0
+        perturbation = _interpolate_control_perturbations(
+            controls, frame_count=raw_swing.shape[0]
+        )
         candidates = _bounded_candidates(
-            current, raw_swing, perturbation, config
+            current, objective_reference, perturbation, config
         )
         costs = terrain_conformal_swing_cost(
             candidates,
-            raw_swing,
+            objective_reference,
             sample_surface=sample_surface,
             toe_offset_xy=toe_swing,
             heel_offset_xy=heel_swing,
@@ -457,11 +708,11 @@ def optimize_terrain_conformal_swing(
             -(costs.total - minimum) / float(config.temperature), dim=0
         )
         proposal = torch.sum(weights[:, None, None] * candidates, dim=0)
-        proposal[0] = raw_swing[0]
-        proposal[-1] = raw_swing[-1]
+        proposal[0] = objective_reference[0]
+        proposal[-1] = objective_reference[-1]
         proposal_cost = terrain_conformal_swing_cost(
             proposal[None],
-            raw_swing,
+            objective_reference,
             sample_surface=sample_surface,
             toe_offset_xy=toe_swing,
             heel_offset_xy=heel_swing,
@@ -483,7 +734,7 @@ def optimize_terrain_conformal_swing(
     selected = best if improved else raw_swing
     optimized_cost = terrain_conformal_swing_cost(
         selected[None],
-        raw_swing,
+        objective_reference,
         sample_surface=sample_surface,
         toe_offset_xy=toe_swing,
         heel_offset_xy=heel_swing,
@@ -492,8 +743,8 @@ def optimize_terrain_conformal_swing(
     output = raw_path.clone()
     output[start:stop] = selected
     output[~swing_mask] = raw_path[~swing_mask]
-    output[start] = raw_path[start]
-    output[stop - 1] = raw_path[stop - 1]
+    output[start] = objective_reference[0]
+    output[stop - 1] = objective_reference[-1]
     return TerrainConformalSwingResult(
         path=output,
         raw_cost=raw_cost,
