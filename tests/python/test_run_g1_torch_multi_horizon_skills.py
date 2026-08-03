@@ -36,6 +36,7 @@ class MultiHorizonSkillsCliTest(unittest.TestCase):
         self.assertFalse(args.continuous_skill)
         self.assertFalse(args.emitted_contact_preview)
         self.assertEqual(args.maximum_emitted_contact_candidates, 64)
+        self.assertIsNone(args.maximum_emitted_contact_rescue_candidates)
         self.assertIsNone(args.swing_clearance_margin_m)
         self.assertIsNone(args.swing_plan_sigma_frames)
         self.assertIsNone(args.maximum_source_contact_p95_m)
@@ -58,6 +59,7 @@ class MultiHorizonSkillsCliTest(unittest.TestCase):
                 "--continuous-skill",
                 "--emitted-contact-preview",
                 "--maximum-emitted-contact-candidates", "512",
+                "--maximum-emitted-contact-rescue-candidates", "1024",
                 "--swing-clearance-margin-m", "0.01",
                 "--swing-plan-sigma-frames", "4.0",
                 "--foot-correction-halflife-s", "0.02",
@@ -77,6 +79,9 @@ class MultiHorizonSkillsCliTest(unittest.TestCase):
         self.assertTrue(locked.continuous_skill)
         self.assertTrue(locked.emitted_contact_preview)
         self.assertEqual(locked.maximum_emitted_contact_candidates, 512)
+        self.assertEqual(
+            locked.maximum_emitted_contact_rescue_candidates, 1024
+        )
         self.assertEqual(locked.swing_clearance_margin_m, 0.01)
         self.assertEqual(locked.swing_plan_sigma_frames, 4.0)
         self.assertEqual(locked.foot_correction_halflife_s, 0.02)

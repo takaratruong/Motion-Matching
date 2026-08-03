@@ -533,6 +533,8 @@ def _validate_live_mode(
     contact_phase_gate: bool = False,
     continuous_skill: bool = False,
     emitted_contact_preview: bool = False,
+    maximum_emitted_contact_candidates: int = 64,
+    maximum_emitted_contact_rescue_candidates: int | None = None,
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
@@ -585,6 +587,8 @@ def _build_live_matcher(
     contact_phase_gate: bool = False,
     continuous_skill: bool = False,
     emitted_contact_preview: bool = False,
+    maximum_emitted_contact_candidates: int = 64,
+    maximum_emitted_contact_rescue_candidates: int | None = None,
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
@@ -644,6 +648,12 @@ def _build_live_matcher(
             matcher_kwargs["continuous_skill_enabled"] = True
         if emitted_contact_preview:
             matcher_kwargs["emitted_contact_preview_enabled"] = True
+        matcher_kwargs["maximum_emitted_contact_candidates"] = (
+            maximum_emitted_contact_candidates
+        )
+        matcher_kwargs["maximum_emitted_contact_rescue_candidates"] = (
+            maximum_emitted_contact_rescue_candidates
+        )
         return TerrainSkillHorizonMatcher(
             base_matcher=base,
             skill_inventory=skills,
@@ -701,6 +711,8 @@ def run_live_viewer(
     contact_phase_gate: bool = False,
     continuous_skill: bool = False,
     emitted_contact_preview: bool = False,
+    maximum_emitted_contact_candidates: int = 64,
+    maximum_emitted_contact_rescue_candidates: int | None = None,
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
@@ -727,6 +739,12 @@ def run_live_viewer(
         contact_phase_gate=contact_phase_gate,
         continuous_skill=continuous_skill,
         emitted_contact_preview=emitted_contact_preview,
+        maximum_emitted_contact_candidates=(
+            maximum_emitted_contact_candidates
+        ),
+        maximum_emitted_contact_rescue_candidates=(
+            maximum_emitted_contact_rescue_candidates
+        ),
         swing_clearance_margin_m=swing_clearance_margin_m,
         foot_correction_halflife_s=foot_correction_halflife_s,
         swing_plan_sigma_frames=swing_plan_sigma_frames,
@@ -833,6 +851,12 @@ def run_live_viewer(
         contact_phase_gate=contact_phase_gate,
         continuous_skill=continuous_skill,
         emitted_contact_preview=emitted_contact_preview,
+        maximum_emitted_contact_candidates=(
+            maximum_emitted_contact_candidates
+        ),
+        maximum_emitted_contact_rescue_candidates=(
+            maximum_emitted_contact_rescue_candidates
+        ),
         swing_clearance_margin_m=swing_clearance_margin_m,
         foot_correction_halflife_s=foot_correction_halflife_s,
         swing_plan_sigma_frames=swing_plan_sigma_frames,
@@ -1086,6 +1110,18 @@ def build_live_viewer_argument_parser() -> argparse.ArgumentParser:
         help="Reject candidates whose inertialized emitted feet violate terrain contacts.",
     )
     parser.add_argument(
+        "--maximum-emitted-contact-candidates",
+        type=int,
+        default=64,
+        help="Exact emitted-contact candidates validated per primary search.",
+    )
+    parser.add_argument(
+        "--maximum-emitted-contact-rescue-candidates",
+        type=int,
+        default=None,
+        help="Expanded exact shortlist used only after the primary search fails.",
+    )
+    parser.add_argument(
         "--swing-clearance-margin-m",
         type=float,
         default=None,
@@ -1223,6 +1259,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         contact_phase_gate=args.contact_phase_gate,
         continuous_skill=args.continuous_skill,
         emitted_contact_preview=args.emitted_contact_preview,
+        maximum_emitted_contact_candidates=(
+            args.maximum_emitted_contact_candidates
+        ),
+        maximum_emitted_contact_rescue_candidates=(
+            args.maximum_emitted_contact_rescue_candidates
+        ),
         swing_clearance_margin_m=args.swing_clearance_margin_m,
         foot_correction_halflife_s=args.foot_correction_halflife_s,
         swing_plan_sigma_frames=args.swing_plan_sigma_frames,

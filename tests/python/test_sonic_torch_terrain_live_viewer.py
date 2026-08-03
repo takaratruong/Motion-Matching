@@ -196,6 +196,11 @@ class LiveMujocoSceneTests(unittest.TestCase):
             mock.patch.object(
                 live_module, "MujocoG1FootKinematics", return_value="feet"
             ),
+            mock.patch(
+                "mm_sonic.torch_g1_sole_kinematics."
+                "MujocoG1SoleKinematics",
+                return_value="soles",
+            ),
             mock.patch.object(
                 live_module,
                 "horizon_search_config_from_experiment",
@@ -232,6 +237,8 @@ class LiveMujocoSceneTests(unittest.TestCase):
                 maximum_endpoint_warp_yaw_rad=3.141592653589793,
                 maximum_endpoint_warp_terrain_delta_m=0.0,
                 emitted_contact_preview=True,
+                maximum_emitted_contact_candidates=64,
+                maximum_emitted_contact_rescue_candidates=256,
             )
 
         self.assertIs(result, qualified)
@@ -257,6 +264,7 @@ class LiveMujocoSceneTests(unittest.TestCase):
             dataset=resolved.dataset,
             query_terrain=resolved.measurement_extension,
             foot_kinematics="feet",
+            sole_kinematics="soles",
             config="matcher",
             search_config="search",
             maximum_translation_warp_m=0.025,
@@ -265,6 +273,8 @@ class LiveMujocoSceneTests(unittest.TestCase):
             maximum_endpoint_warp_yaw_rad=3.141592653589793,
             maximum_endpoint_warp_terrain_delta_m=0.0,
             emitted_contact_preview_enabled=True,
+            maximum_emitted_contact_candidates=64,
+            maximum_emitted_contact_rescue_candidates=256,
         )
 
     def test_multi_horizon_mode_is_explicit_and_exclusive(self):
@@ -276,6 +286,8 @@ class LiveMujocoSceneTests(unittest.TestCase):
                 "--multi-horizon",
                 "--continuous-skill",
                 "--emitted-contact-preview",
+                "--maximum-emitted-contact-candidates", "64",
+                "--maximum-emitted-contact-rescue-candidates", "256",
                 "--foot-lock",
                 "--contact-phase-gate",
                 "--swing-clearance-margin-m", "0.01",
@@ -293,6 +305,10 @@ class LiveMujocoSceneTests(unittest.TestCase):
         self.assertTrue(arguments.multi_horizon)
         self.assertTrue(arguments.continuous_skill)
         self.assertTrue(arguments.emitted_contact_preview)
+        self.assertEqual(arguments.maximum_emitted_contact_candidates, 64)
+        self.assertEqual(
+            arguments.maximum_emitted_contact_rescue_candidates, 256
+        )
         self.assertTrue(arguments.foot_lock)
         self.assertTrue(arguments.contact_phase_gate)
         self.assertEqual(arguments.swing_clearance_margin_m, 0.01)

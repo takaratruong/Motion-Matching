@@ -9,6 +9,9 @@ import torch
 
 from mm_sonic.torch_motion_features import FeatureNormalization, TorchMotionDatabase
 from mm_sonic.torch_motion_matcher import MatcherConfig
+from mm_sonic.torch_terrain_contact_feasibility import (
+    TerrainContactFeasibilityResult,
+)
 from mm_sonic.torch_terrain_skill_horizon_rollout import (
     TerrainSkillHorizonMatcher,
     terrain_height_targets,
@@ -89,6 +92,8 @@ def _transactional_fixture(
     runway_suffix_step_m: float = 0.01,
     single_support: bool = False,
     emitted_contact_preview_enabled: bool = False,
+    maximum_emitted_contact_candidates: int = 64,
+    maximum_emitted_contact_rescue_candidates: int = 64,
 ):
     frames = 80
     body_position = np.zeros((frames, 3, 3), dtype=np.float32)
@@ -241,6 +246,12 @@ def _transactional_fixture(
         continuous_skill_enabled=continuous_skill_enabled,
         contact_feasibility_enabled=contact_feasibility_enabled,
         continuation_surface_tolerance_m=continuation_surface_tolerance_m,
+        maximum_emitted_contact_candidates=(
+            maximum_emitted_contact_candidates
+        ),
+        maximum_emitted_contact_rescue_candidates=(
+            maximum_emitted_contact_rescue_candidates
+        ),
         **preview_kwargs,
     )
     return matcher, grid
@@ -510,6 +521,7 @@ class ContinuationFirstMatcherTest(unittest.TestCase):
     def test_emitted_preview_rejects_invalid_cheaper_candidate(self):
         matcher, _grid = _transactional_fixture(
             two_candidate_runway=False,
+            continuous_skill_enabled=True,
             emitted_contact_preview_enabled=True,
         )
         folder = matcher.dataset.folder
@@ -574,6 +586,39 @@ class ContinuationFirstMatcherTest(unittest.TestCase):
 
         self.assertEqual(matcher.chunk_events[0].skill_index, 1)
         self.assertEqual(matcher.chunk_events[0].selection_mode, "preferred")
+
+    def test_emitted_preview_rescue_expands_only_after_primary_failure(self):
+        matcher, _grid = _transactional_fixture(
+            two_candidate_runway=False,
+            continuous_skill_enabled=True,
+            emitted_contact_preview_enabled=True,
+            maximum_emitted_contact_candidates=64,
+            maximum_emitted_contact_rescue_candidates=256,
+        )
+        matcher.foot_kinematics = _JointHeightFootKinematics()
+        matcher.reset()
+        calls = []
+
+        def fail_primary_then_select(*args, **kwargs):
+            calls.append(
+                (
+                    kwargs["maximum_validated_candidates"],
+                    kwargs["preferred_validator"] is not None,
+                )
+            )
+            if kwargs["maximum_validated_candidates"] == 64:
+                raise HorizonSearchFailure({"terrain": 64})
+            return select_horizon_candidate(*args, **kwargs)
+
+        with mock.patch(
+            "mm_sonic.torch_terrain_skill_horizon_rollout."
+            "select_horizon_candidate",
+            side_effect=fail_primary_then_select,
+        ):
+            matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
+
+        self.assertEqual(calls, [(64, True), (256, False)])
+        self.assertEqual(matcher.chunk_events[0].selection_mode, "immediate")
 
     def test_phase_gated_command_change_preempts_single_support_chunk(self):
         matcher, _grid = _transactional_fixture(
@@ -723,6 +768,63 @@ class ContinuationFirstMatcherTest(unittest.TestCase):
         self.assertEqual(event.endpoint_frame_exclusive, 51)
         self.assertEqual(event.command, ((1.0, 0.0), 0.0))
 
+    def test_active_chunk_is_not_treated_as_completed_continuation(self):
+        matcher, _grid = _transactional_fixture(
+            continuous_skill_enabled=True
+        )
+        matcher.reset()
+        matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
+
+        continuation = matcher._try_continue_skill(
+            ((0.0, 1.0), math.pi / 2.0),
+            require_command_match=False,
+        )
+
+        self.assertIsNone(continuation)
+
+    def test_failed_stop_search_holds_completed_safe_pose(self):
+        matcher, _grid = _transactional_fixture(
+            two_candidate_runway=False
+        )
+        matcher.reset()
+        for _ in range(26):
+            matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
+
+        with mock.patch(
+            "mm_sonic.torch_terrain_skill_horizon_rollout.select_horizon_candidate",
+            side_effect=HorizonSearchFailure(
+                {"terrain": 64, "shortlist": 100}
+            ),
+        ) as select:
+            result = matcher.commit(matcher.prepare_step((0.0, 0.0), 0.0))
+            first_search_count = select.call_count
+            second = matcher.commit(
+                matcher.prepare_step((0.0, 0.0), 0.0)
+            )
+
+        self.assertEqual(result.diagnostics.selected_frame, 25)
+        self.assertFalse(result.diagnostics.terrain_safety_override)
+        self.assertGreater(first_search_count, 0)
+        self.assertEqual(select.call_count, first_search_count)
+        self.assertEqual(second.diagnostics.selected_frame, 25)
+
+    def test_failed_turn_in_place_search_remains_a_failure(self):
+        matcher, _grid = _transactional_fixture(
+            two_candidate_runway=False
+        )
+        matcher.reset()
+        for _ in range(26):
+            matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
+
+        with mock.patch(
+            "mm_sonic.torch_terrain_skill_horizon_rollout.select_horizon_candidate",
+            side_effect=HorizonSearchFailure(
+                {"terrain": 64, "shortlist": 100}
+            ),
+        ):
+            with self.assertRaises(HorizonSearchFailure):
+                matcher.prepare_step((0.0, 0.0), math.pi / 2.0)
+
     def test_zero_command_does_not_extend_completed_skill(self):
         matcher, _grid = _transactional_fixture(continuous_skill_enabled=True)
         matcher.reset()
@@ -780,6 +882,41 @@ class ContinuationFirstMatcherTest(unittest.TestCase):
         result = matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
 
         self.assertEqual(calls, [True])
+        self.assertEqual(len(matcher.continuation_events), 0)
+        self.assertEqual(result.diagnostics.selected_frame, 25)
+        self.assertFalse(result.diagnostics.terrain_safety_override)
+
+    def test_emitted_preview_rejects_unsafe_continuation(self):
+        matcher, _grid = _transactional_fixture(
+            continuous_skill_enabled=True,
+            emitted_contact_preview_enabled=True,
+        )
+        matcher.foot_kinematics = _JointHeightFootKinematics()
+        matcher.reset()
+        for _ in range(26):
+            matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
+        matcher._try_start_skill = lambda *_args, **_kwargs: None
+        rejection = TerrainContactFeasibilityResult(
+            accepted=False,
+            reason="sole-penetration",
+            maximum_stance_error_m=0.0,
+            landing_error_m=0.0,
+            minimum_swing_clearance_m=0.0,
+            minimum_sole_clearance_m=-0.05,
+            maximum_footprint_height_range_m=0.0,
+            maximum_height_deformation_m=0.0,
+        )
+
+        with mock.patch(
+            "mm_sonic.torch_terrain_skill_horizon_rollout."
+            "preview_continued_emitted_contact_trace",
+            return_value=rejection,
+        ) as preview:
+            result = matcher.commit(
+                matcher.prepare_step((1.0, 0.0), 0.0)
+            )
+
+        preview.assert_called_once()
         self.assertEqual(len(matcher.continuation_events), 0)
         self.assertEqual(result.diagnostics.selected_frame, 25)
         self.assertFalse(result.diagnostics.terrain_safety_override)

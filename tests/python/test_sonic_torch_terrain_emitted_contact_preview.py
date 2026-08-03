@@ -10,10 +10,15 @@ from mm_sonic.torch_terrain_contact_feasibility import (
     TerrainContactFeasibilityConfig,
 )
 from mm_sonic.torch_terrain_emitted_contact_preview import (
+    preview_continued_emitted_contact_trace,
     preview_emitted_contact_trace,
 )
-from mm_sonic.torch_terrain_skill_composer import TerrainSkillPose
-from mm_sonic.torch_terrain_skill_composer import start_skill
+from mm_sonic.torch_terrain_skill_composer import (
+    TerrainSkillPose,
+    advance_skill,
+    extend_skill_state,
+    start_skill,
+)
 from mm_sonic.torch_terrain_skills import SkillInterval, TerrainSkill
 
 
@@ -195,6 +200,37 @@ class EmittedContactPreviewTest(unittest.TestCase):
 
         self.assertFalse(result.accepted)
         self.assertEqual(result.reason, "landing-edge-margin")
+
+    def test_continuation_preview_checks_the_extended_emitted_sole(self):
+        folder, skill, pose = _fixture()
+        state = start_skill(
+            folder,
+            skill,
+            selected_entry_frame=0,
+            current=pose,
+            halflife_s=0.1,
+            playback_stop=2,
+        )
+        for _ in range(2):
+            state = advance_skill(state).state
+        state = extend_skill_state(state, playback_stop=4)
+
+        result = preview_continued_emitted_contact_trace(
+            folder=folder,
+            state=state,
+            current=pose,
+            foot_kinematics=_BatchFeet(),
+            sole_kinematics=_BatchSoles(),
+            sample_surface=lambda points: torch.where(
+                points[..., 0] >= 0.20,
+                torch.full_like(points[..., 0], 0.08),
+                torch.zeros_like(points[..., 0]),
+            ),
+            config=TerrainContactFeasibilityConfig(),
+        )
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "sole-penetration")
 
 
 if __name__ == "__main__":

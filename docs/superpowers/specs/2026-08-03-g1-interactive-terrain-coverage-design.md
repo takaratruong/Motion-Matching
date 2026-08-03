@@ -103,3 +103,68 @@ baseline.
 This work remains privileged-height, kinematic, and independent of Sonic,
 physics stepping, depth learning, and real-time latency optimization. Existing
 dirty contact-oracle and landing-bridge work is not modified.
+
+## Execution Findings
+
+The transactional single-support correction is retained. It preserved the
+qualified v58 route bit-for-bit and moved `cross-tread-left-to-right` past its
+frame-60 command boundary.
+
+That longer route exposed a missing qualification check: the matrix's ankle
+metric passed while exact sole geometry reached `-0.051865 m` clearance on 19
+frames. The unsafe samples came from sequential source-skill continuations,
+which used the coarse surface-profile validator instead of the exact emitted
+sole preview. Sequential continuations must therefore pass the same filtered
+pose and sole validation as newly selected chunks. A route that stops earlier
+because this check rejects an extension is safer, but is not counted as a
+locomotion-quality improvement.
+
+The following recovery ideas were tested and rejected as defaults:
+
+- ten stationary command-shaping retries only delayed diagonal descent from
+  frame 282 to frame 292 and preserved the same failure;
+- validating 512 instead of 64 candidates took more than 30 minutes per
+  two-route slice, still failed every crossing/mount route, and often selected
+  flat clips that never engaged the stair;
+- disabling the terrain prefilter failed earlier because the first 64 ranked
+  candidates were all exact-invalid; and
+- increasing the future-surface sign gate allowed the left diagonal route to
+  reach frame 360, but it moved opposite the requested descent and therefore
+  regressed command outcome despite greater frame coverage.
+
+These results rule out treating frame count alone as progress. Retained search
+changes must improve commanded segment progress and exact sole safety together.
+
+Exact continuation preview changes the old v58 turn route after output frame
+328. This is intentional: the old route stops at source frame 445, one frame
+before its selected continuation begins a landing that would reach
+`-0.174130 m` sole clearance. The replacement route completes safely (minimum
+sole clearance `-0.024206 m`) but has worse final heading and slide, so the old
+frame-count contract is not sufficient evidence of a safe indefinite hold.
+
+A latched stationary command now preserves a completed exact-safe pose when no
+stationary replacement exists. Repeating the same stop does not repeat the
+expensive deterministic search. This moved `riser-stop-restart` from a failure
+at frame 179 to its restart boundary at frame 283; it did not by itself solve
+the subsequent moving transition.
+
+A two-tier monotonic exact search is retained. The normal 64-candidate search
+and runway preference remain unchanged. Only after that search fails, a larger
+shortlist is evaluated with runway preference disabled, so increasing rescue
+coverage cannot replace an earlier successful choice. With a 256-candidate
+rescue, `riser-stop-restart` completed all 290 frames, achieved a `0.544725`
+restart progress ratio and `0.254820 m` total stance slide, and had zero sole
+samples below `-0.025 m` (minimum `-0.024206 m`). The same rescue exhausted the
+complete 167-candidate prefiltered crossing inventory without finding a safe
+cross-tread transition, proving that rescue depth is useful but not the general
+on-stair turning solution.
+
+The accepted corpus does contain turn outcomes at split-height support: 7,870
+horizons start with more than `0.10 m` foot-height split, and 278 horizons pair
+that split with more than 20 degrees yaw and less than `0.20 m` root travel.
+The remaining failure is therefore transition reachability/ranking rather than
+simple absence of turning data. A hard support-foot entry-continuity prefilter
+was also rejected: although it reduced exact stance-height rejections from 64
+to 21 at one boundary, it removed useful candidates and made the staged turn
+fail at frame 202 instead of frame 300. Transition reachability should be used
+as a soft ranking feature or a rescue-only ordering signal, not a hard gate.

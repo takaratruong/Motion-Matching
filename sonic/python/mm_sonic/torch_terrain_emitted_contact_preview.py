@@ -16,6 +16,7 @@ from .torch_terrain_contact_feasibility import (
 )
 from .torch_terrain_skill_composer import (
     TerrainSkillPose,
+    TerrainSkillState,
     advance_skill,
     start_skill,
 )
@@ -35,66 +36,18 @@ def _rejected(reason: str) -> TerrainContactFeasibilityResult:
     )
 
 
-def preview_emitted_contact_trace(
+def _validate_emitted_frames(
     *,
     folder: Any,
     skill: TerrainSkill,
-    selected_entry_frame: int,
-    endpoint_frame_exclusive: int,
+    frames: tuple[Any, ...],
     current: TerrainSkillPose,
-    halflife_s: float,
     foot_kinematics: Any,
-    sole_kinematics: Any | None = None,
+    sole_kinematics: Any | None,
     sample_surface: Callable[[torch.Tensor], torch.Tensor],
     config: TerrainContactFeasibilityConfig,
-    result_filter: Any | None = None,
-    target_displacement_local_xy: torch.Tensor | None = None,
-    target_yaw_delta_rad: torch.Tensor | None = None,
-    maximum_translation_warp_m: float = 0.0,
-    maximum_yaw_warp_rad: float = 0.0,
+    result_filter: Any | None,
 ) -> TerrainContactFeasibilityResult:
-    """Advance an isolated skill and validate the kinematics it would emit."""
-
-    if (
-        not isinstance(skill, TerrainSkill)
-        or type(selected_entry_frame) is not int
-        or not 0 <= selected_entry_frame < skill.support_mask.shape[0]
-        or not callable(getattr(foot_kinematics, "foot_positions", None))
-        or (
-            sole_kinematics is not None
-            and not callable(getattr(sole_kinematics, "sole_points", None))
-        )
-        or not callable(sample_surface)
-        or not isinstance(config, TerrainContactFeasibilityConfig)
-        or (
-            result_filter is not None
-            and not callable(getattr(result_filter, "preview", None))
-        )
-    ):
-        raise ContractError("emitted contact preview inputs are invalid")
-    if not bool(skill.support_mask[selected_entry_frame].any().item()):
-        return _rejected("unsupported-entry")
-
-    state = start_skill(
-        folder,
-        skill,
-        selected_entry_frame=selected_entry_frame,
-        current=current,
-        halflife_s=halflife_s,
-        playback_stop=endpoint_frame_exclusive,
-        target_displacement_local_xy=target_displacement_local_xy,
-        target_yaw_delta_rad=target_yaw_delta_rad,
-        maximum_translation_warp_m=maximum_translation_warp_m,
-        maximum_yaw_warp_rad=maximum_yaw_warp_rad,
-    )
-    frames = []
-    while state.next_source_frame < state.playback_stop:
-        step = advance_skill(state)
-        frames.append(step.frame)
-        state = step.state
-    if not frames:
-        raise ContractError("emitted contact preview produced no frames")
-
     if result_filter is not None:
         clip = folder.clips[skill.clip_index]
         clip_path = str(getattr(clip, "relative_path", skill.clip_index))
@@ -190,4 +143,125 @@ def preview_emitted_contact_trace(
         config=config,
         align_initial_support=False,
         landing_footprint_position_world=sole_points,
+    )
+
+
+def preview_continued_emitted_contact_trace(
+    *,
+    folder: Any,
+    state: TerrainSkillState,
+    current: TerrainSkillPose,
+    foot_kinematics: Any,
+    sole_kinematics: Any | None = None,
+    sample_surface: Callable[[torch.Tensor], torch.Tensor],
+    config: TerrainContactFeasibilityConfig,
+    result_filter: Any | None = None,
+) -> TerrainContactFeasibilityResult:
+    """Validate the exact filtered frames emitted by a skill extension."""
+
+    if (
+        not isinstance(state, TerrainSkillState)
+        or state.next_source_frame >= state.playback_stop
+        or not callable(getattr(foot_kinematics, "foot_positions", None))
+        or (
+            sole_kinematics is not None
+            and not callable(getattr(sole_kinematics, "sole_points", None))
+        )
+        or not callable(sample_surface)
+        or not isinstance(config, TerrainContactFeasibilityConfig)
+        or (
+            result_filter is not None
+            and not callable(getattr(result_filter, "preview", None))
+        )
+    ):
+        raise ContractError("continued emitted contact preview inputs are invalid")
+
+    frames = []
+    preview_state = state
+    while preview_state.next_source_frame < preview_state.playback_stop:
+        step = advance_skill(preview_state)
+        frames.append(step.frame)
+        preview_state = step.state
+    return _validate_emitted_frames(
+        folder=folder,
+        skill=state.skill,
+        frames=tuple(frames),
+        current=current,
+        foot_kinematics=foot_kinematics,
+        sole_kinematics=sole_kinematics,
+        sample_surface=sample_surface,
+        config=config,
+        result_filter=result_filter,
+    )
+
+
+def preview_emitted_contact_trace(
+    *,
+    folder: Any,
+    skill: TerrainSkill,
+    selected_entry_frame: int,
+    endpoint_frame_exclusive: int,
+    current: TerrainSkillPose,
+    halflife_s: float,
+    foot_kinematics: Any,
+    sole_kinematics: Any | None = None,
+    sample_surface: Callable[[torch.Tensor], torch.Tensor],
+    config: TerrainContactFeasibilityConfig,
+    result_filter: Any | None = None,
+    target_displacement_local_xy: torch.Tensor | None = None,
+    target_yaw_delta_rad: torch.Tensor | None = None,
+    maximum_translation_warp_m: float = 0.0,
+    maximum_yaw_warp_rad: float = 0.0,
+) -> TerrainContactFeasibilityResult:
+    """Advance an isolated skill and validate the kinematics it would emit."""
+
+    if (
+        not isinstance(skill, TerrainSkill)
+        or type(selected_entry_frame) is not int
+        or not 0 <= selected_entry_frame < skill.support_mask.shape[0]
+        or not callable(getattr(foot_kinematics, "foot_positions", None))
+        or (
+            sole_kinematics is not None
+            and not callable(getattr(sole_kinematics, "sole_points", None))
+        )
+        or not callable(sample_surface)
+        or not isinstance(config, TerrainContactFeasibilityConfig)
+        or (
+            result_filter is not None
+            and not callable(getattr(result_filter, "preview", None))
+        )
+    ):
+        raise ContractError("emitted contact preview inputs are invalid")
+    if not bool(skill.support_mask[selected_entry_frame].any().item()):
+        return _rejected("unsupported-entry")
+
+    state = start_skill(
+        folder,
+        skill,
+        selected_entry_frame=selected_entry_frame,
+        current=current,
+        halflife_s=halflife_s,
+        playback_stop=endpoint_frame_exclusive,
+        target_displacement_local_xy=target_displacement_local_xy,
+        target_yaw_delta_rad=target_yaw_delta_rad,
+        maximum_translation_warp_m=maximum_translation_warp_m,
+        maximum_yaw_warp_rad=maximum_yaw_warp_rad,
+    )
+    frames = []
+    while state.next_source_frame < state.playback_stop:
+        step = advance_skill(state)
+        frames.append(step.frame)
+        state = step.state
+    if not frames:
+        raise ContractError("emitted contact preview produced no frames")
+    return _validate_emitted_frames(
+        folder=folder,
+        skill=skill,
+        frames=tuple(frames),
+        current=current,
+        foot_kinematics=foot_kinematics,
+        sole_kinematics=sole_kinematics,
+        sample_surface=sample_surface,
+        config=config,
+        result_filter=result_filter,
     )

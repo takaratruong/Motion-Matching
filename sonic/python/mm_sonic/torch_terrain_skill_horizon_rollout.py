@@ -28,6 +28,7 @@ from .torch_terrain_contact_feasibility import (
     validate_placed_contact_trace,
 )
 from .torch_terrain_emitted_contact_preview import (
+    preview_continued_emitted_contact_trace,
     preview_emitted_contact_trace,
 )
 from .torch_terrain_skill_composer import extend_skill_state, start_skill
@@ -245,6 +246,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         maximum_preferred_outcome_cost_increase: float = 0.05,
         emitted_contact_preview_enabled: bool = False,
         maximum_emitted_contact_candidates: int = 64,
+        maximum_emitted_contact_rescue_candidates: int | None = None,
     ) -> None:
         self.base = base_matcher
         self.database = base_matcher.database
@@ -320,12 +322,21 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             or type(emitted_contact_preview_enabled) is not bool
         ):
             raise ContractError("continuous terrain skill flags must be boolean")
+        resolved_rescue_candidates = (
+            maximum_emitted_contact_candidates
+            if maximum_emitted_contact_rescue_candidates is None
+            else maximum_emitted_contact_rescue_candidates
+        )
         if (
             type(maximum_emitted_contact_candidates) is not int
             or not 1 <= maximum_emitted_contact_candidates <= 4096
+            or type(resolved_rescue_candidates) is not int
+            or not maximum_emitted_contact_candidates
+            <= resolved_rescue_candidates
+            <= 4096
         ):
             raise ContractError(
-                "maximum emitted contact candidates must be in [1, 4096]"
+                "emitted contact candidate limits are invalid"
             )
         if not isinstance(
             contact_feasibility_config, TerrainContactFeasibilityConfig
@@ -367,6 +378,9 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         self.emitted_contact_preview_enabled = emitted_contact_preview_enabled
         self.maximum_emitted_contact_candidates = (
             maximum_emitted_contact_candidates
+        )
+        self.maximum_emitted_contact_rescue_candidates = (
+            resolved_rescue_candidates
         )
         self.contact_feasibility_config = contact_feasibility_config
         self.minimum_continuation_progress_m = float(
@@ -919,6 +933,8 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         state = self._skill_state
         if not self.continuous_skill_enabled or state is None:
             return None
+        if state.next_source_frame != state.playback_stop:
+            return None
         if state.playback_stop >= state.skill.interval.playback_stop:
             return None
         endpoint = next_sequential_horizon_endpoint(
@@ -987,7 +1003,18 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         source_surface = state.skill.foot_surface_height_m[
             start - 1 : endpoint
         ].to(dtype=placed_feet.dtype)
-        if self.contact_feasibility_enabled:
+        if self.emitted_contact_preview_enabled:
+            validation = preview_continued_emitted_contact_trace(
+                folder=self.dataset.folder,
+                state=continuation_state,
+                current=self._current_pose(),
+                foot_kinematics=self.foot_kinematics,
+                sole_kinematics=self.sole_kinematics,
+                sample_surface=sample_query,
+                config=self.contact_feasibility_config,
+                result_filter=self.result_filter,
+            )
+        elif self.contact_feasibility_enabled:
             validation = validate_placed_contact_trace(
                 foot_position_world=placed_feet,
                 support_mask=support,
@@ -1099,6 +1126,15 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         shaped: Any,
     ):
         result = self._last_result
+        requested_command = (
+            (float(velocity_world_xy[0]), float(velocity_world_xy[1])),
+            float(heading_world_yaw),
+        )
+        if (
+            requested_command == self._last_command
+            and math.hypot(*velocity_world_xy) <= self.config.stop_speed_mps
+        ):
+            return None
         feature_state = GeneratedFeatureState(
             root_position_world=result.root_position_world,
             root_orientation_world_wxyz=result.root_orientation_world_wxyz,
@@ -1117,10 +1153,6 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         )
         requested_heading = torch.tensor(
             heading_world_yaw, dtype=torch.float32, device=self.database.device
-        )
-        requested_command = (
-            (float(velocity_world_xy[0]), float(velocity_world_xy[1])),
-            float(heading_world_yaw),
         )
         command_changed = (
             self._last_command is not None
@@ -1220,6 +1252,10 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             ):
                 current_support = support_profile[source_frame]
 
+        emitted_validation_cache: dict[
+            tuple[int, int, int], TerrainContactFeasibilityResult
+        ] = {}
+
         def compatible(
             record: int,
             row: int,
@@ -1284,28 +1320,38 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                     )
                 )
 
-            validation = preview_emitted_contact_trace(
-                folder=self.dataset.folder,
-                skill=skill,
-                selected_entry_frame=entry_frame,
-                endpoint_frame_exclusive=endpoint,
-                current=self._current_pose(),
-                halflife_s=self.config.inertialization_halflife_s,
-                foot_kinematics=self.foot_kinematics,
-                sole_kinematics=self.sole_kinematics,
-                sample_surface=sample_query,
-                config=self.contact_feasibility_config,
-                result_filter=self.result_filter,
-                target_displacement_local_xy=warp_displacement,
-                target_yaw_delta_rad=warp_yaw,
-                maximum_translation_warp_m=translation_limit,
-                maximum_yaw_warp_rad=yaw_limit,
-            )
+            cache_key = (record, row, endpoint)
+            validation = emitted_validation_cache.get(cache_key)
+            if validation is None:
+                validation = preview_emitted_contact_trace(
+                    folder=self.dataset.folder,
+                    skill=skill,
+                    selected_entry_frame=entry_frame,
+                    endpoint_frame_exclusive=endpoint,
+                    current=self._current_pose(),
+                    halflife_s=self.config.inertialization_halflife_s,
+                    foot_kinematics=self.foot_kinematics,
+                    sole_kinematics=self.sole_kinematics,
+                    sample_surface=sample_query,
+                    config=self.contact_feasibility_config,
+                    result_filter=self.result_filter,
+                    target_displacement_local_xy=warp_displacement,
+                    target_yaw_delta_rad=warp_yaw,
+                    maximum_translation_warp_m=translation_limit,
+                    maximum_yaw_warp_rad=yaw_limit,
+                )
+                emitted_validation_cache[cache_key] = validation
             return validation
 
-        def select(*, require_phase: bool):
+        def select(
+            *,
+            require_phase: bool,
+            maximum_candidates: int | None = None,
+            allow_preferred: bool = True,
+        ):
             prefer_runway = (
-                self.continuous_skill_enabled
+                allow_preferred
+                and self.continuous_skill_enabled
                 and math.hypot(*velocity_world_xy) > 0.05
             )
 
@@ -1400,7 +1446,11 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                     self.maximum_preferred_outcome_cost_increase
                 ),
                 maximum_validated_candidates=(
-                    self.maximum_emitted_contact_candidates
+                    (
+                        self.maximum_emitted_contact_candidates
+                        if maximum_candidates is None
+                        else maximum_candidates
+                    )
                     if self.emitted_contact_preview_enabled
                     else None
                 ),
@@ -1430,12 +1480,41 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                     selected = select(require_phase=False)
                 except HorizonSearchFailure as fallback_error:
                     search_failure = fallback_error
+        if (
+            search_failure is not None
+            and self.emitted_contact_preview_enabled
+            and self.maximum_emitted_contact_rescue_candidates
+            > self.maximum_emitted_contact_candidates
+        ):
+            try:
+                selected = select(
+                    require_phase=False,
+                    maximum_candidates=(
+                        self.maximum_emitted_contact_rescue_candidates
+                    ),
+                    allow_preferred=False,
+                )
+            except HorizonSearchFailure as rescue_error:
+                search_failure = rescue_error
+            else:
+                search_failure = None
         if search_failure is not None:
             delayed_switch = self._try_continue_skill(
                 requested_command, require_command_match=False
             )
             if delayed_switch is not None:
                 return delayed_switch
+            same_heading = self._last_command is None or abs(
+                math.atan2(
+                    math.sin(heading_world_yaw - self._last_command[1]),
+                    math.cos(heading_world_yaw - self._last_command[1]),
+                )
+            ) <= 1.0e-6
+            if (
+                math.hypot(*velocity_world_xy) <= self.config.stop_speed_mps
+                and same_heading
+            ):
+                return None
             raise search_failure
         skill_index = int(
             self.horizon_inventory.skill_index[selected.record_index].item()
@@ -1580,6 +1659,7 @@ def run_resolved_horizon_matrix(
     continuous_skill_enabled: bool = False,
     emitted_contact_preview_enabled: bool = False,
     maximum_emitted_contact_candidates: int = 64,
+    maximum_emitted_contact_rescue_candidates: int | None = None,
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
@@ -1715,6 +1795,11 @@ def run_resolved_horizon_matrix(
     search_identity = json.dumps(
         asdict(search_config), sort_keys=True, separators=(",", ":")
     )
+    resolved_rescue_candidates = (
+        maximum_emitted_contact_candidates
+        if maximum_emitted_contact_rescue_candidates is None
+        else maximum_emitted_contact_rescue_candidates
+    )
     identity = hashlib.sha256(
         (
             resolved.base_config_sha256
@@ -1744,6 +1829,10 @@ def run_resolved_horizon_matrix(
                 else ":source-contact-preview"
             )
             + f":emitted-contact-candidates:{maximum_emitted_contact_candidates}"
+            + (
+                ":emitted-contact-rescue-candidates:"
+                f"{resolved_rescue_candidates}"
+            )
             + (
                 ":continuous-surface-tolerance:0.08"
                 if continuous_skill_enabled
@@ -1789,6 +1878,9 @@ def run_resolved_horizon_matrix(
             emitted_contact_preview_enabled=emitted_contact_preview_enabled,
             maximum_emitted_contact_candidates=(
                 maximum_emitted_contact_candidates
+            ),
+            maximum_emitted_contact_rescue_candidates=(
+                resolved_rescue_candidates
             ),
             turning_clip_paths=turning_clip_paths,
             maximum_translation_warp_m=maximum_translation_warp_m,

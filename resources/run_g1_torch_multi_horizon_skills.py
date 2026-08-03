@@ -67,6 +67,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Exact emitted-contact candidates validated per search.",
     )
     parser.add_argument(
+        "--maximum-emitted-contact-rescue-candidates",
+        type=int,
+        default=None,
+        help=(
+            "Expanded exact shortlist used only after the primary search "
+            "fails; disables runway preference to preserve earlier choices."
+        ),
+    )
+    parser.add_argument(
         "--swing-clearance-margin-m",
         type=float,
         default=None,
@@ -251,6 +260,10 @@ def save_horizon_matrix(matrix, events_by_route, output: str | Path) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.maximum_emitted_contact_rescue_candidates is None:
+        args.maximum_emitted_contact_rescue_candidates = (
+            args.maximum_emitted_contact_candidates
+        )
     config = load_experiment_config(args.config)
     search_config = search_config_from_experiment(config)
     if args.ablation == "entry-only":
@@ -280,6 +293,9 @@ def main(argv: list[str] | None = None) -> int:
         emitted_contact_preview_enabled=args.emitted_contact_preview,
         maximum_emitted_contact_candidates=(
             args.maximum_emitted_contact_candidates
+        ),
+        maximum_emitted_contact_rescue_candidates=(
+            args.maximum_emitted_contact_rescue_candidates
         ),
         swing_clearance_margin_m=args.swing_clearance_margin_m,
         foot_correction_halflife_s=args.foot_correction_halflife_s,
@@ -316,6 +332,9 @@ def main(argv: list[str] | None = None) -> int:
                 "emitted_contact_preview": args.emitted_contact_preview,
                 "maximum_emitted_contact_candidates": (
                     args.maximum_emitted_contact_candidates
+                ),
+                "maximum_emitted_contact_rescue_candidates": (
+                    args.maximum_emitted_contact_rescue_candidates
                 ),
                 "swing_clearance_margin_m": args.swing_clearance_margin_m,
                 "foot_correction_halflife_s": args.foot_correction_halflife_s,
