@@ -198,6 +198,34 @@ class HorizonRankingTest(unittest.TestCase):
         self.assertEqual(ranked.candidate_indices.tolist(), [3])
         self.assertEqual(ranked.rejected_by_reason["local"], 1)
 
+    def test_preferred_validator_beats_cheaper_immediate_candidate(self):
+        result = select_horizon_candidate(
+            self.database,
+            self.inventory,
+            torch.zeros(27),
+            self.target,
+            terrain_validator=lambda _record, _row, _endpoint: True,
+            preferred_validator=lambda record, _row, _endpoint: record == 3,
+        )
+
+        self.assertEqual(result.record_index, 3)
+        self.assertEqual(result.selection_mode, "preferred")
+        self.assertEqual(result.rejected_by_reason["preferred"], 1)
+
+    def test_preferred_exhaustion_returns_cheapest_immediate_fallback(self):
+        result = select_horizon_candidate(
+            self.database,
+            self.inventory,
+            torch.zeros(27),
+            self.target,
+            terrain_validator=lambda _record, _row, _endpoint: True,
+            preferred_validator=lambda _record, _row, _endpoint: False,
+        )
+
+        self.assertEqual(result.record_index, 2)
+        self.assertEqual(result.selection_mode, "immediate-fallback")
+        self.assertEqual(result.rejected_by_reason["preferred"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

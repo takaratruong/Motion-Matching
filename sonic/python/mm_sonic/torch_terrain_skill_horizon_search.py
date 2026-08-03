@@ -98,6 +98,7 @@ class TerrainSkillHorizonResult:
     target_frames: int
     cost: HorizonCost
     rejected_by_reason: Mapping[str, int]
+    selection_mode: str
 
 
 class HorizonSearchFailure(ContractError):
@@ -476,6 +477,7 @@ def select_horizon_candidate(
     targets: HorizonTargets,
     *,
     terrain_validator: TerrainHorizonValidator,
+    preferred_validator: TerrainHorizonValidator | None = None,
     config: HorizonSearchConfig = HorizonSearchConfig(),
     current_clip_index: int | None = None,
     current_frame_index: int | None = None,
@@ -483,7 +485,9 @@ def select_horizon_candidate(
 ) -> TerrainSkillHorizonResult:
     """Validate candidates in ranked order and return the first valid chunk."""
 
-    if not callable(terrain_validator):
+    if not callable(terrain_validator) or (
+        preferred_validator is not None and not callable(preferred_validator)
+    ):
         raise ContractError("horizon terrain validator must be callable")
     ranked = rank_horizon_candidates(
         database,
@@ -496,6 +500,7 @@ def select_horizon_candidate(
         matcher_config=matcher_config,
     )
     terrain_rejected = 0
+    preferred_rejected = 0
     diagnostics = torch.stack(
         (
             ranked.candidate_indices.to(torch.float64),
@@ -510,31 +515,66 @@ def select_horizon_candidate(
         ),
         dim=1,
     ).cpu().tolist()
+    fallback: tuple[list[float], int, int, int] | None = None
+
+    def build_result(
+        values: list[float],
+        record: int,
+        row: int,
+        endpoint: int,
+        *,
+        selection_mode: str,
+    ) -> TerrainSkillHorizonResult:
+        rejected = dict(ranked.rejected_by_reason)
+        rejected["terrain"] = terrain_rejected
+        if preferred_validator is not None:
+            rejected["preferred"] = preferred_rejected
+        return TerrainSkillHorizonResult(
+            record_index=record,
+            entry_row=row,
+            endpoint_frame_exclusive=endpoint,
+            target_frames=int(inventory.target_frames[record].item()),
+            cost=HorizonCost(
+                entry=float(values[1]),
+                displacement=float(values[2]),
+                yaw=float(values[3]),
+                height=float(values[4]),
+                duration=float(values[5]),
+                stall=float(values[6]),
+                outcome=float(values[7]),
+                total=float(values[8]),
+            ),
+            rejected_by_reason=MappingProxyType(rejected),
+            selection_mode=selection_mode,
+        )
+
     for values in diagnostics:
         record = int(values[0])
         row = int(inventory.entry_row[record].item())
         endpoint = int(inventory.endpoint_frame_exclusive[record].item())
         if terrain_validator(record, row, endpoint):
-            rejected = dict(ranked.rejected_by_reason)
-            rejected["terrain"] = terrain_rejected
-            return TerrainSkillHorizonResult(
-                record_index=record,
-                entry_row=row,
-                endpoint_frame_exclusive=endpoint,
-                target_frames=int(inventory.target_frames[record].item()),
-                cost=HorizonCost(
-                    entry=float(values[1]),
-                    displacement=float(values[2]),
-                    yaw=float(values[3]),
-                    height=float(values[4]),
-                    duration=float(values[5]),
-                    stall=float(values[6]),
-                    outcome=float(values[7]),
-                    total=float(values[8]),
-                ),
-                rejected_by_reason=MappingProxyType(rejected),
-            )
-        terrain_rejected += 1
+            if preferred_validator is None:
+                return build_result(
+                    values, record, row, endpoint, selection_mode="immediate"
+                )
+            if fallback is None:
+                fallback = (values, record, row, endpoint)
+            if preferred_validator(record, row, endpoint):
+                return build_result(
+                    values, record, row, endpoint, selection_mode="preferred"
+                )
+            preferred_rejected += 1
+        else:
+            terrain_rejected += 1
+    if fallback is not None:
+        values, record, row, endpoint = fallback
+        return build_result(
+            values,
+            record,
+            row,
+            endpoint,
+            selection_mode="immediate-fallback",
+        )
     rejected = dict(ranked.rejected_by_reason)
     rejected["terrain"] = terrain_rejected
     raise HorizonSearchFailure(rejected)
