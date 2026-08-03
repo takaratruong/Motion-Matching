@@ -48,6 +48,16 @@ class _FootKinematics:
         return np.repeat(root[:, None, :], 2, axis=1)
 
 
+class _JointHeightFootKinematics:
+    def foot_positions(self, joint, root, quaternion):
+        joint = np.asarray(joint)
+        feet = np.zeros((joint.shape[0], 2, 3), dtype=np.float64)
+        feet[:, 0, 0] = -0.1
+        feet[:, 1, 0] = 0.1
+        feet[:, :, 2] = 0.045 + joint[:, :1]
+        return feet
+
+
 def _transactional_fixture(
     *,
     result_filter=None,
@@ -66,6 +76,7 @@ def _transactional_fixture(
     runway_suffix_direction: tuple[float, float] = (1.0, 0.0),
     runway_suffix_step_m: float = 0.01,
     single_support: bool = False,
+    emitted_contact_preview_enabled: bool = False,
 ):
     frames = 80
     body_position = np.zeros((frames, 3, 3), dtype=np.float32)
@@ -188,6 +199,11 @@ def _transactional_fixture(
             return reset_result
 
     grid = _ConstantGrid()
+    preview_kwargs = (
+        {"emitted_contact_preview_enabled": True}
+        if emitted_contact_preview_enabled
+        else {}
+    )
     matcher = TerrainSkillHorizonMatcher(
         base_matcher=_Base(),
         skill_inventory=skills,
@@ -212,6 +228,7 @@ def _transactional_fixture(
         continuous_skill_enabled=continuous_skill_enabled,
         contact_feasibility_enabled=contact_feasibility_enabled,
         continuation_surface_tolerance_m=continuation_surface_tolerance_m,
+        **preview_kwargs,
     )
     return matcher, grid
 
@@ -348,6 +365,43 @@ class TerrainSkillHorizonRolloutTest(unittest.TestCase):
 
 
 class ContinuationFirstMatcherTest(unittest.TestCase):
+    def test_emitted_preview_rejects_invalid_cheaper_candidate(self):
+        matcher, _grid = _transactional_fixture(
+            two_candidate_runway=False,
+            emitted_contact_preview_enabled=True,
+        )
+        folder = matcher.dataset.folder
+        bad_clip = folder.clips[0]
+        bad_clip.joint_position[:, 0] = 0.2
+        good_clip = SimpleNamespace(
+            **{
+                **vars(bad_clip),
+                "relative_path": "terrain/good-motion.npz",
+                "joint_position": np.zeros_like(bad_clip.joint_position),
+            }
+        )
+        folder.clips = (bad_clip, good_clip)
+        second = TerrainSkill(
+            **{
+                **matcher.inventory.skills[1].__dict__,
+                "clip_index": 1,
+            }
+        )
+        matcher.inventory = TerrainSkillInventory(
+            skills=(matcher.inventory.skills[0], second),
+            rejected_by_reason={},
+            row_to_skill={0: 0, 1: 1},
+        )
+        matcher.horizon_inventory.clip_index[1] = 1
+        matcher.database._search_clip_index[1] = 1
+        matcher.database._source_row_map[(1, 0)] = 1
+        matcher.foot_kinematics = _JointHeightFootKinematics()
+        matcher.reset()
+
+        matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
+
+        self.assertEqual(matcher.chunk_events[0].skill_index, 1)
+
     def test_phase_gated_command_change_preempts_single_support_chunk(self):
         matcher, _grid = _transactional_fixture(
             contact_phase_gate=True,

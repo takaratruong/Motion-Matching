@@ -27,6 +27,9 @@ from .torch_terrain_contact_feasibility import (
     TerrainContactFeasibilityResult,
     validate_placed_contact_trace,
 )
+from .torch_terrain_emitted_contact_preview import (
+    preview_emitted_contact_trace,
+)
 from .torch_terrain_skill_composer import extend_skill_state, start_skill
 from .torch_terrain_skill_horizon_search import (
     HorizonCost,
@@ -163,6 +166,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         maximum_continuation_heading_regression_rad: float = 0.15,
         maximum_preferred_cost_increase: float = 1.0,
         maximum_preferred_outcome_cost_increase: float = 0.05,
+        emitted_contact_preview_enabled: bool = False,
     ) -> None:
         self.base = base_matcher
         self.database = base_matcher.database
@@ -230,6 +234,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         if (
             type(continuous_skill_enabled) is not bool
             or type(contact_feasibility_enabled) is not bool
+            or type(emitted_contact_preview_enabled) is not bool
         ):
             raise ContractError("continuous terrain skill flags must be boolean")
         if not isinstance(
@@ -269,6 +274,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             raise ContractError("continuous terrain skill limits are invalid")
         self.continuous_skill_enabled = continuous_skill_enabled
         self.contact_feasibility_enabled = contact_feasibility_enabled
+        self.emitted_contact_preview_enabled = emitted_contact_preview_enabled
         self.contact_feasibility_config = contact_feasibility_config
         self.minimum_continuation_progress_m = float(
             minimum_continuation_progress_m
@@ -687,7 +693,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                     current_support, skill.support_mask[entry_frame]
                 ):
                     return False
-            return terrain_skill_compatible(
+            if not terrain_skill_compatible(
                 skill=skill,
                 canonical_entry_row=row,
                 dataset=self.dataset,
@@ -697,7 +703,34 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                 current_root_orientation_world_wxyz=result.root_orientation_world_wxyz,
                 tolerance_m=self.terrain_tolerance_m,
                 playback_stop=endpoint,
+            ):
+                return False
+            if not self.emitted_contact_preview_enabled:
+                return True
+
+            entry_frame = int(
+                self.horizon_inventory.entry_frame[record].item()
             )
+
+            def sample_query(points_xy: torch.Tensor) -> torch.Tensor:
+                return self.query_terrain.query_grid.sample_xy(
+                    self.query_terrain.alignment.matcher_to_scene_xy(
+                        points_xy
+                    )
+                )
+
+            validation = preview_emitted_contact_trace(
+                folder=self.dataset.folder,
+                skill=skill,
+                selected_entry_frame=entry_frame,
+                endpoint_frame_exclusive=endpoint,
+                current=self._current_pose(),
+                halflife_s=self.config.inertialization_halflife_s,
+                foot_kinematics=self.foot_kinematics,
+                sample_surface=sample_query,
+                config=self.contact_feasibility_config,
+            )
+            return validation.accepted
 
         def select(*, require_phase: bool):
             prefer_runway = (
