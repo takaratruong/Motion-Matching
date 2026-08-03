@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 from types import SimpleNamespace
 
 import numpy as np
@@ -12,6 +13,7 @@ from mm_sonic.torch_terrain_emitted_contact_preview import (
     preview_emitted_contact_trace,
 )
 from mm_sonic.torch_terrain_skill_composer import TerrainSkillPose
+from mm_sonic.torch_terrain_skill_composer import start_skill
 from mm_sonic.torch_terrain_skills import SkillInterval, TerrainSkill
 
 
@@ -126,6 +128,40 @@ class EmittedContactPreviewTest(unittest.TestCase):
         )
 
         self.assertTrue(result.accepted)
+
+    def test_previews_the_same_bounded_endpoint_warp_as_committed_playback(self):
+        folder, skill, pose = _fixture()
+        with mock.patch(
+            "mm_sonic.torch_terrain_emitted_contact_preview.start_skill",
+            wraps=start_skill,
+        ) as start:
+            preview_emitted_contact_trace(
+                folder=folder,
+                skill=skill,
+                selected_entry_frame=0,
+                endpoint_frame_exclusive=4,
+                current=pose,
+                halflife_s=0.1,
+                foot_kinematics=_BatchFeet(),
+                sample_surface=lambda points: torch.zeros(
+                    points.shape[:-1],
+                    dtype=points.dtype,
+                    device=points.device,
+                ),
+                config=TerrainContactFeasibilityConfig(),
+                target_displacement_local_xy=torch.tensor([0.2, 0.0]),
+                target_yaw_delta_rad=torch.tensor(0.4),
+                maximum_translation_warp_m=0.1,
+                maximum_yaw_warp_rad=0.3,
+            )
+
+        self.assertEqual(start.call_args.kwargs["maximum_yaw_warp_rad"], 0.3)
+        self.assertTrue(
+            torch.equal(
+                start.call_args.kwargs["target_yaw_delta_rad"],
+                torch.tensor(0.4),
+            )
+        )
 
 
 if __name__ == "__main__":

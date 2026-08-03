@@ -798,6 +798,55 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             for frame, yaw in zip(targets.frames, targets.yaw_delta_rad)
         }
 
+        def endpoint_warp_parameters(
+            record: int, entry_frame: int, endpoint: int
+        ):
+            target_frames = int(
+                self.horizon_inventory.target_frames[record].item()
+            )
+            target_index = int(
+                torch.nonzero(
+                    targets.frames == target_frames, as_tuple=False
+                ).flatten()[0].item()
+            )
+            displacement = targets.displacement_local_xy[target_index]
+            yaw = targets.yaw_delta_rad[target_index]
+            terrain_delta = float(
+                torch.max(
+                    torch.abs(
+                        torch.cat(
+                            (
+                                targets.root_height_delta_m[
+                                    target_index
+                                ].reshape(1),
+                                targets.surface_height_delta_m[target_index],
+                            )
+                        )
+                    )
+                ).item()
+            )
+            enabled = (
+                self._endpoint_warp_command_enabled
+                and terrain_delta
+                <= self.maximum_endpoint_warp_terrain_delta_m
+            )
+            translation_limit = (
+                self.maximum_translation_warp_m if enabled else 0.0
+            )
+            yaw_limit = self.maximum_yaw_warp_rad if enabled else 0.0
+            if translation_limit > 0.0 or yaw_limit > 0.0:
+                exact_target = predict_horizon_targets(
+                    current_velocity_world_xy=self._shaped_velocity,
+                    current_heading_world_yaw=current_yaw,
+                    requested_velocity_world_xy=requested_velocity,
+                    requested_heading_world_yaw=requested_heading,
+                    matcher_config=self.config,
+                    target_frames=(endpoint - entry_frame,),
+                )
+                displacement = exact_target.displacement_local_xy[0]
+                yaw = exact_target.yaw_delta_rad[0]
+            return displacement, yaw, translation_limit, yaw_limit
+
         current_clip: int | None = None
         current_frame: int | None = None
         if self._skill_state is not None:
@@ -868,6 +917,12 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             entry_frame = int(
                 self.horizon_inventory.entry_frame[record].item()
             )
+            (
+                warp_displacement,
+                warp_yaw,
+                translation_limit,
+                yaw_limit,
+            ) = endpoint_warp_parameters(record, entry_frame, endpoint)
 
             def sample_query(points_xy: torch.Tensor) -> torch.Tensor:
                 return self.query_terrain.query_grid.sample_xy(
@@ -887,6 +942,10 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                 sample_surface=sample_query,
                 config=self.contact_feasibility_config,
                 result_filter=self.result_filter,
+                target_displacement_local_xy=warp_displacement,
+                target_yaw_delta_rad=warp_yaw,
+                maximum_translation_warp_m=translation_limit,
+                maximum_yaw_warp_rad=yaw_limit,
             )
             return validation.accepted
 
@@ -1052,48 +1111,16 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             release_reason = "endpoint"
         self._prepared_selection = selected
         self._prepared_release_reason = release_reason
-        target_index = int(
-            torch.nonzero(
-                targets.frames == selected.target_frames, as_tuple=False
-            ).flatten()[0].item()
+        (
+            warp_displacement,
+            warp_yaw,
+            translation_limit,
+            yaw_limit,
+        ) = endpoint_warp_parameters(
+            selected.record_index,
+            entry_frame,
+            selected.endpoint_frame_exclusive,
         )
-        warp_displacement = targets.displacement_local_xy[target_index]
-        warp_yaw = targets.yaw_delta_rad[target_index]
-        terrain_delta = float(
-            torch.max(
-                torch.abs(
-                    torch.cat(
-                        (
-                            targets.root_height_delta_m[target_index].reshape(1),
-                            targets.surface_height_delta_m[target_index],
-                        )
-                    )
-                )
-            ).item()
-        )
-        warp_enabled = (
-            self._endpoint_warp_command_enabled
-            and terrain_delta <= self.maximum_endpoint_warp_terrain_delta_m
-        )
-        translation_limit = (
-            self.maximum_translation_warp_m if warp_enabled else 0.0
-        )
-        yaw_limit = self.maximum_yaw_warp_rad if warp_enabled else 0.0
-        if (
-            translation_limit > 0.0
-            or yaw_limit > 0.0
-        ):
-            exact_duration = selected.endpoint_frame_exclusive - entry_frame
-            exact_target = predict_horizon_targets(
-                current_velocity_world_xy=self._shaped_velocity,
-                current_heading_world_yaw=current_yaw,
-                requested_velocity_world_xy=requested_velocity,
-                requested_heading_world_yaw=requested_heading,
-                matcher_config=self.config,
-                target_frames=(exact_duration,),
-            )
-            warp_displacement = exact_target.displacement_local_xy[0]
-            warp_yaw = exact_target.yaw_delta_rad[0]
         return start_skill(
             self.dataset.folder,
             skill,

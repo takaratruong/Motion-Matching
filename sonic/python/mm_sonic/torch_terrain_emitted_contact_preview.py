@@ -46,6 +46,10 @@ def preview_emitted_contact_trace(
     sample_surface: Callable[[torch.Tensor], torch.Tensor],
     config: TerrainContactFeasibilityConfig,
     result_filter: Any | None = None,
+    target_displacement_local_xy: torch.Tensor | None = None,
+    target_yaw_delta_rad: torch.Tensor | None = None,
+    maximum_translation_warp_m: float = 0.0,
+    maximum_yaw_warp_rad: float = 0.0,
 ) -> TerrainContactFeasibilityResult:
     """Advance an isolated skill and validate the kinematics it would emit."""
 
@@ -72,6 +76,10 @@ def preview_emitted_contact_trace(
         current=current,
         halflife_s=halflife_s,
         playback_stop=endpoint_frame_exclusive,
+        target_displacement_local_xy=target_displacement_local_xy,
+        target_yaw_delta_rad=target_yaw_delta_rad,
+        maximum_translation_warp_m=maximum_translation_warp_m,
+        maximum_yaw_warp_rad=maximum_yaw_warp_rad,
     )
     frames = []
     while state.next_source_frame < state.playback_stop:
