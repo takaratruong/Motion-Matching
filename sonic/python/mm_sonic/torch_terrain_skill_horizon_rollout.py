@@ -1518,12 +1518,21 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             and command_changed
             and state is not None
             and state.next_source_frame < state.playback_stop
+            and state.next_source_frame > 0
+            and not bool(
+                state.skill.support_mask[
+                    state.next_source_frame - 1
+                ].all().item()
+            )
         ):
             self._skill_state = replace(
                 state, playback_stop=state.next_source_frame
             )
             try:
-                return super().prepare_step(*args, **kwargs)
+                try:
+                    return super().prepare_step(*args, **kwargs)
+                except HorizonSearchFailure:
+                    pass
             finally:
                 self._skill_state = state
         return super().prepare_step(*args, **kwargs)

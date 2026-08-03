@@ -603,6 +603,35 @@ class ContinuationFirstMatcherTest(unittest.TestCase):
             )
         )
 
+    def test_failed_single_support_preemption_defers_to_safe_boundary(self):
+        matcher, _grid = _transactional_fixture(
+            contact_phase_gate=True,
+            single_support=True,
+            two_candidate_runway=False,
+        )
+        matcher.reset()
+        matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
+        original_skill = matcher._skill_state.skill
+        calls = []
+
+        def fail_replacement(*_args, **_kwargs):
+            calls.append(True)
+            raise HorizonSearchFailure(
+                {"terrain": 64, "shortlist": 100}
+            )
+
+        matcher._try_start_skill = fail_replacement
+
+        prepared = matcher.prepare_step((0.0, 1.0), math.pi / 2.0)
+        result = matcher.commit(prepared)
+
+        self.assertEqual(calls, [True])
+        self.assertEqual(len(matcher.chunk_events), 1)
+        self.assertIs(matcher._skill_state.skill, original_skill)
+        self.assertEqual(result.diagnostics.selected_frame, 1)
+        self.assertTrue(matcher._replan_pending)
+        self.assertEqual(matcher._last_command, ((0.0, 1.0), math.pi / 2.0))
+
     def test_global_search_prefers_candidate_with_coherent_runway(self):
         matcher, _grid = _transactional_fixture(
             continuous_skill_enabled=True,
