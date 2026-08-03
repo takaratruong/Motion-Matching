@@ -1,3 +1,4 @@
+import math
 import unittest
 from types import SimpleNamespace
 
@@ -21,14 +22,16 @@ def _fixture():
         [np.linspace(0.0, 0.3, frames), np.linspace(0.2, -0.1, frames)], axis=1
     ).astype(np.float32)
     joint_velocity = np.gradient(joint_position, 0.02, axis=0).astype(np.float32)
-    root_position = np.zeros((frames, 1, 3), dtype=np.float32)
+    root_position = np.zeros((frames, 3, 3), dtype=np.float32)
     root_position[:, 0, 0] = np.arange(frames) * 0.01
     root_position[:, 0, 2] = 0.8
-    root_quaternion = np.zeros((frames, 1, 4), dtype=np.float32)
-    root_quaternion[:, 0, 0] = 1.0
-    root_linear_velocity = np.zeros((frames, 1, 3), dtype=np.float32)
+    root_position[:, 1] = root_position[:, 0] + np.array((-0.1, 0.1, -0.8))
+    root_position[:, 2] = root_position[:, 0] + np.array((0.1, -0.1, -0.8))
+    root_quaternion = np.zeros((frames, 3, 4), dtype=np.float32)
+    root_quaternion[..., 0] = 1.0
+    root_linear_velocity = np.zeros((frames, 3, 3), dtype=np.float32)
     root_linear_velocity[:, 0, 0] = 0.5
-    root_angular_velocity = np.zeros((frames, 1, 3), dtype=np.float32)
+    root_angular_velocity = np.zeros((frames, 3, 3), dtype=np.float32)
     clip = SimpleNamespace(
         joint_position=joint_position,
         joint_velocity=joint_velocity,
@@ -37,7 +40,14 @@ def _fixture():
         body_linear_velocity_world=root_linear_velocity,
         body_angular_velocity_world=root_angular_velocity,
     )
-    folder = SimpleNamespace(clips=(clip,), layout=SimpleNamespace(root_body_index=0))
+    folder = SimpleNamespace(
+        clips=(clip,),
+        layout=SimpleNamespace(
+            root_body_index=0,
+            left_foot_body_index=1,
+            right_foot_body_index=2,
+        ),
+    )
     support = torch.ones((frames, 2), dtype=torch.bool)
     support[7, 1] = False
     skill = TerrainSkill(
@@ -82,6 +92,78 @@ class TerrainSkillComposerTest(unittest.TestCase):
         self.assertTrue(torch.allclose(emitted[0].root_position_world, pose.root_position_world))
         residuals = [frame.inertialization_residual for frame in emitted]
         self.assertTrue(all(a >= b for a, b in zip(residuals, residuals[1:])))
+
+    def test_optional_contact_anchor_places_source_at_supported_entry_foot(self):
+        folder, skill, pose = _fixture()
+        target_feet = torch.tensor(
+            ((2.25, 1.15, 0.10), (2.0, 0.9, 0.0))
+        )
+
+        state = start_skill(
+            folder,
+            skill,
+            selected_entry_frame=3,
+            current=pose,
+            entry_foot_position_world=target_feet,
+            entry_support=torch.tensor((True, False)),
+        )
+
+        source_left = torch.tensor(
+            folder.clips[0].body_position_world[3, 1]
+        )
+        placed_left = source_left + state.translation_world
+        self.assertTrue(torch.allclose(placed_left, target_feet[0]))
+        first = advance_skill(state).frame
+        self.assertTrue(
+            torch.allclose(first.root_position_world, pose.root_position_world)
+        )
+
+    def test_contact_anchor_can_fit_bounded_yaw_from_double_support(self):
+        folder, skill, pose = _fixture()
+        source_feet = torch.tensor(
+            folder.clips[0].body_position_world[3, (1, 2)]
+        )
+        angle = torch.tensor(math.radians(20.0))
+        cosine, sine = torch.cos(angle), torch.sin(angle)
+        rotation = torch.stack(
+            (
+                torch.stack((cosine, -sine)),
+                torch.stack((sine, cosine)),
+            )
+        )
+        target_feet = source_feet.clone()
+        target_feet[:, :2] = source_feet[:, :2] @ rotation.T
+        target_feet += torch.tensor((2.0, 1.0, 0.1))
+
+        state = start_skill(
+            folder,
+            skill,
+            selected_entry_frame=3,
+            current=pose,
+            entry_foot_position_world=target_feet,
+            entry_support=torch.tensor((True, True)),
+            maximum_contact_anchor_yaw_rad=math.radians(25.0),
+        )
+
+        placed = torch.stack(
+            tuple(
+                torch.stack(
+                    (
+                        torch.cos(state.yaw_offset) * foot[0]
+                        - torch.sin(state.yaw_offset) * foot[1],
+                        torch.sin(state.yaw_offset) * foot[0]
+                        + torch.cos(state.yaw_offset) * foot[1],
+                        foot[2],
+                    )
+                )
+                + state.translation_world
+                for foot in source_feet
+            )
+        )
+        self.assertAlmostEqual(
+            float(state.yaw_offset), math.radians(20.0), places=5
+        )
+        self.assertTrue(torch.allclose(placed, target_feet, atol=1e-5))
 
     def test_interrupt_is_allowed_only_at_stable_double_support(self):
         _, skill, _ = _fixture()

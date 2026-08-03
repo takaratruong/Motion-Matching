@@ -47,6 +47,7 @@ def _validate_emitted_frames(
     sample_surface: Callable[[torch.Tensor], torch.Tensor],
     config: TerrainContactFeasibilityConfig,
     result_filter: Any | None,
+    new_chunk: bool,
 ) -> TerrainContactFeasibilityResult:
     if result_filter is not None:
         clip = folder.clips[skill.clip_index]
@@ -63,9 +64,10 @@ def _validate_emitted_frames(
                 diagnostics=SimpleNamespace(
                     selected_clip_path=clip_path,
                     selected_frame=frame.source_frame,
+                    terrain_chunk_start=(new_chunk and index == 0),
                 ),
             )
-            for frame in frames
+            for index, frame in enumerate(frames)
         )
         try:
             filtered = tuple(result_filter.preview(raw_results))
@@ -192,6 +194,7 @@ def preview_continued_emitted_contact_trace(
         sample_surface=sample_surface,
         config=config,
         result_filter=result_filter,
+        new_chunk=False,
     )
 
 
@@ -212,6 +215,9 @@ def preview_emitted_contact_trace(
     target_yaw_delta_rad: torch.Tensor | None = None,
     maximum_translation_warp_m: float = 0.0,
     maximum_yaw_warp_rad: float = 0.0,
+    entry_foot_position_world: torch.Tensor | None = None,
+    entry_support: torch.Tensor | None = None,
+    maximum_contact_anchor_yaw_rad: float = 0.0,
 ) -> TerrainContactFeasibilityResult:
     """Advance an isolated skill and validate the kinematics it would emit."""
 
@@ -246,6 +252,9 @@ def preview_emitted_contact_trace(
         target_yaw_delta_rad=target_yaw_delta_rad,
         maximum_translation_warp_m=maximum_translation_warp_m,
         maximum_yaw_warp_rad=maximum_yaw_warp_rad,
+        entry_foot_position_world=entry_foot_position_world,
+        entry_support=entry_support,
+        maximum_contact_anchor_yaw_rad=maximum_contact_anchor_yaw_rad,
     )
     frames = []
     while state.next_source_frame < state.playback_stop:
@@ -264,4 +273,5 @@ def preview_emitted_contact_trace(
         sample_surface=sample_surface,
         config=config,
         result_filter=result_filter,
+        new_chunk=True,
     )

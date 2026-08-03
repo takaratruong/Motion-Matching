@@ -94,6 +94,8 @@ def _transactional_fixture(
     emitted_contact_preview_enabled: bool = False,
     maximum_emitted_contact_candidates: int = 64,
     maximum_emitted_contact_rescue_candidates: int = 64,
+    rescue_without_surface_gate: bool = False,
+    maximum_contact_anchor_yaw_rad: float = 0.0,
 ):
     frames = 80
     body_position = np.zeros((frames, 3, 3), dtype=np.float32)
@@ -252,6 +254,8 @@ def _transactional_fixture(
         maximum_emitted_contact_rescue_candidates=(
             maximum_emitted_contact_rescue_candidates
         ),
+        rescue_without_surface_gate=rescue_without_surface_gate,
+        maximum_contact_anchor_yaw_rad=maximum_contact_anchor_yaw_rad,
         **preview_kwargs,
     )
     return matcher, grid
@@ -409,6 +413,42 @@ class TerrainSkillHorizonRolloutTest(unittest.TestCase):
             )
         )
 
+    def test_stationary_turn_does_not_rotate_planted_feet_through_riser(self):
+        targets = HorizonTargets(
+            frames=torch.tensor([100]),
+            displacement_local_xy=torch.zeros((1, 2)),
+            yaw_delta_rad=torch.tensor([math.pi]),
+            root_height_delta_m=torch.zeros(1),
+            surface_height_delta_m=torch.zeros((1, 2)),
+        )
+
+        class _SplitGrid:
+            def sample_xy(self, points):
+                return torch.where(
+                    points[:, 0] >= 0.0,
+                    torch.full_like(points[:, 0], 0.18),
+                    torch.zeros_like(points[:, 0]),
+                )
+
+        enriched = terrain_height_targets(
+            targets,
+            current_root_position_world=torch.tensor([0.0, 0.0, 0.8]),
+            current_root_yaw=torch.tensor(0.0),
+            current_foot_position_world=torch.tensor(
+                [[0.1, 0.0, 0.0], [-0.1, 0.0, 0.0]]
+            ),
+            query_terrain=SimpleNamespace(
+                query_grid=_SplitGrid(), alignment=_Alignment()
+            ),
+        )
+
+        self.assertTrue(
+            torch.equal(
+                enriched.surface_height_delta_m,
+                torch.zeros((1, 2)),
+            )
+        )
+
     def test_committed_chunk_searches_once_and_emits_consecutive_source_frames(self):
         matcher, grid = _transactional_fixture()
         matcher.reset()
@@ -483,6 +523,112 @@ class ContinuationFirstMatcherTest(unittest.TestCase):
         )
 
         self.assertEqual(compatible.tolist(), [True, False])
+
+    def test_candidate_specific_height_cost_softly_ranks_supported_trace(self):
+        matcher, _grid = _transactional_fixture(two_candidate_runway=False)
+        first = matcher._surface_numpy[0].copy()
+        second = matcher._surface_numpy[1].copy()
+        second[5:] = 0.2
+        matcher._surface_numpy = (first, second)
+        result = matcher.reset()
+
+        cost = matcher._terrain_profile_height_cost(
+            torch.tensor([0, 1], dtype=torch.long), result
+        )
+
+        self.assertEqual(tuple(cost.shape), (2,))
+        self.assertAlmostEqual(float(cost[0]), 0.0, places=6)
+        self.assertGreater(float(cost[1]), 0.0)
+
+    def test_contact_anchored_height_cost_uses_actual_support_frame(self):
+        matcher, grid = _transactional_fixture(single_support=True)
+        clip = matcher.dataset.folder.clips[0]
+        clip.body_position_world[:, 1, 0] = -0.2
+        clip.body_position_world[0, 1, 0] = 0.2
+        grid.sample_xy = lambda points: torch.where(
+            points[..., 0] >= 0.0,
+            torch.full_like(points[..., 0], 0.18),
+            torch.zeros_like(points[..., 0]),
+        )
+        result = matcher.reset()
+        matcher._feet[0, 0] = -0.2
+
+        root_centered = matcher._terrain_profile_height_cost(
+            torch.tensor([0], dtype=torch.long), result
+        )
+        contact_centered = matcher._terrain_profile_height_cost(
+            torch.tensor([0], dtype=torch.long),
+            result,
+            contact_anchor=True,
+            current_support=torch.tensor((True, False)),
+        )
+
+        self.assertGreater(float(root_centered[0]), 0.0)
+        self.assertAlmostEqual(float(contact_centered[0]), 0.0, places=6)
+
+    def test_contact_geometry_cost_only_activates_on_engaged_terrain(self):
+        matcher, grid = _transactional_fixture()
+        result = matcher.reset()
+        records = torch.tensor([0], dtype=torch.long)
+        support = torch.tensor((True, True))
+        matcher._feet[:, :2] = torch.tensor(((0.0, 0.0), (0.30, 0.0)))
+
+        flat = matcher._terrain_profile_height_cost(
+            records,
+            result,
+            contact_anchor=True,
+            current_support=support,
+        )
+        grid.sample_xy = lambda points: torch.full(
+            points.shape[:-1], 0.18, device=points.device
+        )
+        elevated = matcher._terrain_profile_height_cost(
+            records,
+            result,
+            contact_anchor=True,
+            current_support=support,
+        )
+
+        self.assertAlmostEqual(float(flat[0]), 0.0, places=6)
+        self.assertGreater(float(elevated[0]), float(flat[0]))
+
+    def test_contact_geometry_cost_uses_same_bounded_yaw_fit_as_rescue(self):
+        fixed, fixed_grid = _transactional_fixture(
+            emitted_contact_preview_enabled=True,
+            rescue_without_surface_gate=True,
+        )
+        fitted, fitted_grid = _transactional_fixture(
+            emitted_contact_preview_enabled=True,
+            rescue_without_surface_gate=True,
+            maximum_contact_anchor_yaw_rad=math.pi / 2,
+        )
+        support = torch.tensor((True, True))
+        for matcher, grid in ((fixed, fixed_grid), (fitted, fitted_grid)):
+            clip = matcher.dataset.folder.clips[0]
+            clip.body_position_world[:, 1, :2] = np.array((-0.15, 0.0))
+            clip.body_position_world[:, 2, :2] = np.array((0.15, 0.0))
+            matcher._terrain_trace_cache.clear()
+            matcher.reset()
+            matcher._feet[:, :2] = torch.tensor(((0.0, -0.15), (0.0, 0.15)))
+            grid.sample_xy = lambda points: torch.full(
+                points.shape[:-1], 0.18, device=points.device
+            )
+
+        fixed_cost = fixed._terrain_profile_height_cost(
+            torch.tensor([0]),
+            fixed._last_result,
+            contact_anchor=True,
+            current_support=support,
+        )
+        fitted_cost = fitted._terrain_profile_height_cost(
+            torch.tensor([0]),
+            fitted._last_result,
+            contact_anchor=True,
+            current_support=support,
+        )
+
+        self.assertGreater(float(fixed_cost[0]), 0.0)
+        self.assertAlmostEqual(float(fitted_cost[0]), 0.0, places=5)
 
     def test_batched_terrain_prefilter_rejects_oriented_toe_on_riser(self):
         matcher, grid = _transactional_fixture(single_support=True)
@@ -592,8 +738,10 @@ class ContinuationFirstMatcherTest(unittest.TestCase):
             two_candidate_runway=False,
             continuous_skill_enabled=True,
             emitted_contact_preview_enabled=True,
+            contact_phase_gate=True,
             maximum_emitted_contact_candidates=64,
             maximum_emitted_contact_rescue_candidates=256,
+            rescue_without_surface_gate=True,
         )
         matcher.foot_kinematics = _JointHeightFootKinematics()
         matcher.reset()
@@ -604,6 +752,9 @@ class ContinuationFirstMatcherTest(unittest.TestCase):
                 (
                     kwargs["maximum_validated_candidates"],
                     kwargs["preferred_validator"] is not None,
+                    kwargs["apply_surface_gate"],
+                    kwargs["ranked_prefilter"] is not None,
+                    kwargs["ranked_height_cost"] is not None,
                 )
             )
             if kwargs["maximum_validated_candidates"] == 64:
@@ -617,8 +768,17 @@ class ContinuationFirstMatcherTest(unittest.TestCase):
         ):
             matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
 
-        self.assertEqual(calls, [(64, True), (256, False)])
-        self.assertEqual(matcher.chunk_events[0].selection_mode, "immediate")
+        self.assertEqual(
+            calls,
+            [
+                (64, True, True, True, False),
+                (256, False, False, False, True),
+            ],
+        )
+        self.assertEqual(
+            matcher.chunk_events[0].selection_mode,
+            "immediate",
+        )
 
     def test_phase_gated_command_change_preempts_single_support_chunk(self):
         matcher, _grid = _transactional_fixture(

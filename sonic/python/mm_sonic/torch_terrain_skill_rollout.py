@@ -475,6 +475,9 @@ class TerrainSkillMatcher:
         diagnostics = SimpleNamespace(
             selected_clip_path=clip.relative_path,
             selected_frame=frame.source_frame,
+            terrain_chunk_start=(
+                frame.source_frame == step.state.selected_entry_frame
+            ),
             terrain_safety_override=True,
             step_time_ns=elapsed_ns,
             search_time_ns=None,

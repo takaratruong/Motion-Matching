@@ -1,5 +1,6 @@
 import math
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 
 import torch
@@ -138,6 +139,30 @@ class HorizonRankingTest(unittest.TestCase):
         self.assertEqual(ranked.rejected_by_reason["progress"], 1)
         self.assertEqual(ranked.rejected_by_reason["turn"], 1)
 
+    def test_surface_gate_can_be_relaxed_for_exact_rescue_only(self):
+        inventory = replace(
+            self.inventory,
+            surface_height_delta_m=torch.full((4, 2), -0.1),
+        )
+
+        normal = rank_horizon_candidates(
+            self.database,
+            inventory,
+            torch.zeros(27),
+            self.target,
+        )
+        rescue = rank_horizon_candidates(
+            self.database,
+            inventory,
+            torch.zeros(27),
+            self.target,
+            apply_surface_gate=False,
+        )
+
+        self.assertEqual(normal.candidate_indices.tolist(), [])
+        self.assertEqual(rescue.candidate_indices.tolist(), [2, 3])
+        self.assertEqual(rescue.rejected_by_reason["surface"], 0)
+
     def test_combined_cost_matches_independent_components(self):
         config = HorizonSearchConfig()
         ranked = rank_horizon_candidates(
@@ -241,6 +266,39 @@ class HorizonRankingTest(unittest.TestCase):
         self.assertEqual(visited, [3])
         self.assertEqual(result.record_index, 3)
         self.assertEqual(result.rejected_by_reason["prefilter"], 1)
+
+    def test_ranked_height_cost_prioritizes_candidate_specific_terrain(self):
+        visited = []
+        result = select_horizon_candidate(
+            self.database,
+            self.inventory,
+            torch.zeros(27),
+            self.target,
+            ranked_height_cost=lambda records: torch.where(
+                records == 2,
+                torch.full_like(records, 1.0, dtype=torch.float32),
+                torch.zeros_like(records, dtype=torch.float32),
+            ),
+            terrain_validator=lambda record, _row, _endpoint: (
+                visited.append(record) is None and True
+            ),
+            maximum_validated_candidates=1,
+        )
+
+        self.assertEqual(visited, [3])
+        self.assertEqual(result.record_index, 3)
+        self.assertAlmostEqual(
+            result.cost.height,
+            float(
+                rank_horizon_candidates(
+                    self.database,
+                    self.inventory,
+                    torch.zeros(27),
+                    self.target,
+                ).height_cost[1]
+            ),
+            places=6,
+        )
 
     def test_current_source_neighborhood_is_excluded(self):
         ranked = rank_horizon_candidates(

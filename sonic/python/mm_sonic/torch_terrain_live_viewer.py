@@ -537,6 +537,10 @@ def _validate_live_mode(
     maximum_emitted_contact_rescue_candidates: int | None = None,
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
+    root_height_correction_halflife_s: float | None = None,
+    touchdown_projection_max_shift_m: float | None = None,
+    anticipatory_touchdown_projection: bool = False,
+    maximum_contact_anchor_yaw_rad: float = 0.0,
     swing_plan_sigma_frames: float | None = None,
     maximum_source_contact_p95_m: float | None = None,
     normalization_source: str | None = None,
@@ -560,6 +564,27 @@ def _validate_live_mode(
         raise ContractError("emitted contact preview requires multi-horizon mode")
     if swing_clearance_margin_m is not None and not foot_lock:
         raise ContractError("swing clearance requires terrain foot lock")
+    if touchdown_projection_max_shift_m is not None and not foot_lock:
+        raise ContractError("touchdown projection requires terrain foot lock")
+    if (
+        touchdown_projection_max_shift_m is not None
+        and not emitted_contact_preview
+    ):
+        raise ContractError(
+            "touchdown projection requires exact emitted contact preview"
+        )
+    if maximum_contact_anchor_yaw_rad != 0.0 and (
+        not multi_horizon or touchdown_projection_max_shift_m is None
+    ):
+        raise ContractError(
+            "contact-anchor yaw requires projected multi-horizon rescue"
+        )
+    if anticipatory_touchdown_projection and (
+        touchdown_projection_max_shift_m is None
+    ):
+        raise ContractError(
+            "anticipatory touchdown requires touchdown projection"
+        )
     if swing_plan_sigma_frames is not None and swing_clearance_margin_m is None:
         raise ContractError("swing plan requires swing clearance")
     if maximum_source_contact_p95_m is not None and not multi_horizon:
@@ -591,6 +616,10 @@ def _build_live_matcher(
     maximum_emitted_contact_rescue_candidates: int | None = None,
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
+    root_height_correction_halflife_s: float | None = None,
+    touchdown_projection_max_shift_m: float | None = None,
+    anticipatory_touchdown_projection: bool = False,
+    maximum_contact_anchor_yaw_rad: float = 0.0,
     swing_plan_sigma_frames: float | None = None,
     maximum_source_contact_p95_m: float | None = None,
     normalization_source: str | None = None,
@@ -638,9 +667,19 @@ def _build_live_matcher(
             matcher_kwargs["result_filter"] = build_terrain_foot_lock(
                 resolved,
                 foot_kinematics,
+                sole_kinematics,
                 swing_clearance_margin_m=swing_clearance_margin_m,
                 correction_halflife_s=foot_correction_halflife_s,
+                root_height_correction_halflife_s=(
+                    root_height_correction_halflife_s
+                ),
                 swing_plan_sigma_frames=swing_plan_sigma_frames,
+                touchdown_projection_max_shift_m=(
+                    touchdown_projection_max_shift_m
+                ),
+                anticipatory_touchdown_projection=(
+                    anticipatory_touchdown_projection
+                ),
             )
         if contact_phase_gate:
             matcher_kwargs["contact_phase_gate"] = True
@@ -654,6 +693,12 @@ def _build_live_matcher(
         matcher_kwargs["maximum_emitted_contact_rescue_candidates"] = (
             maximum_emitted_contact_rescue_candidates
         )
+        if touchdown_projection_max_shift_m is not None:
+            matcher_kwargs["rescue_without_surface_gate"] = True
+        if maximum_contact_anchor_yaw_rad != 0.0:
+            matcher_kwargs["maximum_contact_anchor_yaw_rad"] = (
+                maximum_contact_anchor_yaw_rad
+            )
         return TerrainSkillHorizonMatcher(
             base_matcher=base,
             skill_inventory=skills,
@@ -715,6 +760,10 @@ def run_live_viewer(
     maximum_emitted_contact_rescue_candidates: int | None = None,
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
+    root_height_correction_halflife_s: float | None = None,
+    touchdown_projection_max_shift_m: float | None = None,
+    anticipatory_touchdown_projection: bool = False,
+    maximum_contact_anchor_yaw_rad: float = 0.0,
     swing_plan_sigma_frames: float | None = None,
     maximum_source_contact_p95_m: float | None = None,
     normalization_source: str | None = None,
@@ -747,6 +796,16 @@ def run_live_viewer(
         ),
         swing_clearance_margin_m=swing_clearance_margin_m,
         foot_correction_halflife_s=foot_correction_halflife_s,
+        root_height_correction_halflife_s=(
+            root_height_correction_halflife_s
+        ),
+        touchdown_projection_max_shift_m=(
+            touchdown_projection_max_shift_m
+        ),
+        anticipatory_touchdown_projection=(
+            anticipatory_touchdown_projection
+        ),
+        maximum_contact_anchor_yaw_rad=maximum_contact_anchor_yaw_rad,
         swing_plan_sigma_frames=swing_plan_sigma_frames,
         maximum_source_contact_p95_m=maximum_source_contact_p95_m,
         normalization_source=normalization_source,
@@ -859,6 +918,16 @@ def run_live_viewer(
         ),
         swing_clearance_margin_m=swing_clearance_margin_m,
         foot_correction_halflife_s=foot_correction_halflife_s,
+        root_height_correction_halflife_s=(
+            root_height_correction_halflife_s
+        ),
+        touchdown_projection_max_shift_m=(
+            touchdown_projection_max_shift_m
+        ),
+        anticipatory_touchdown_projection=(
+            anticipatory_touchdown_projection
+        ),
+        maximum_contact_anchor_yaw_rad=maximum_contact_anchor_yaw_rad,
         swing_plan_sigma_frames=swing_plan_sigma_frames,
         maximum_source_contact_p95_m=maximum_source_contact_p95_m,
         normalization_source=normalization_source,
@@ -1134,6 +1203,29 @@ def build_live_viewer_argument_parser() -> argparse.ArgumentParser:
         help="Inertialization halflife for terrain foot corrections.",
     )
     parser.add_argument(
+        "--root-height-correction-halflife-s",
+        type=float,
+        default=None,
+        help="Optional support-aware pelvis-height correction halflife.",
+    )
+    parser.add_argument(
+        "--touchdown-projection-max-shift-m",
+        type=float,
+        default=None,
+        help="Optional maximum XY shift for safe full-sole touchdown projection.",
+    )
+    parser.add_argument(
+        "--maximum-contact-anchor-yaw-rad",
+        type=float,
+        default=0.0,
+        help="Optional rescue-only yaw fit from double-support contacts.",
+    )
+    parser.add_argument(
+        "--anticipatory-touchdown-projection",
+        action="store_true",
+        help="Blend touchdown projection during the final swing frames.",
+    )
+    parser.add_argument(
         "--swing-plan-sigma-frames",
         type=float,
         default=None,
@@ -1267,6 +1359,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         swing_clearance_margin_m=args.swing_clearance_margin_m,
         foot_correction_halflife_s=args.foot_correction_halflife_s,
+        root_height_correction_halflife_s=(
+            args.root_height_correction_halflife_s
+        ),
+        touchdown_projection_max_shift_m=(
+            args.touchdown_projection_max_shift_m
+        ),
+        maximum_contact_anchor_yaw_rad=(
+            args.maximum_contact_anchor_yaw_rad
+        ),
+        anticipatory_touchdown_projection=(
+            args.anticipatory_touchdown_projection
+        ),
         swing_plan_sigma_frames=args.swing_plan_sigma_frames,
         maximum_source_contact_p95_m=(
             args.maximum_source_contact_p95_m

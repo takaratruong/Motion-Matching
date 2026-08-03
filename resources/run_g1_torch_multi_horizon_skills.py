@@ -88,6 +88,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Inertialization halflife for terrain foot corrections.",
     )
     parser.add_argument(
+        "--root-height-correction-halflife-s",
+        type=float,
+        default=None,
+        help="Optional support-aware pelvis-height correction halflife.",
+    )
+    parser.add_argument(
+        "--touchdown-projection-max-shift-m",
+        type=float,
+        default=None,
+        help="Optional maximum XY shift for safe full-sole touchdown projection.",
+    )
+    parser.add_argument(
+        "--anticipatory-touchdown-projection",
+        action="store_true",
+        help="Blend safe touchdown projection into the preceding swing.",
+    )
+    parser.add_argument(
+        "--maximum-contact-anchor-yaw-rad",
+        type=float,
+        default=0.0,
+        help="Optional rescue-only yaw fit from double-support contacts.",
+    )
+    parser.add_argument(
         "--swing-plan-sigma-frames",
         type=float,
         default=None,
@@ -299,6 +322,18 @@ def main(argv: list[str] | None = None) -> int:
         ),
         swing_clearance_margin_m=args.swing_clearance_margin_m,
         foot_correction_halflife_s=args.foot_correction_halflife_s,
+        root_height_correction_halflife_s=(
+            args.root_height_correction_halflife_s
+        ),
+        touchdown_projection_max_shift_m=(
+            args.touchdown_projection_max_shift_m
+        ),
+        anticipatory_touchdown_projection=(
+            args.anticipatory_touchdown_projection
+        ),
+        maximum_contact_anchor_yaw_rad=(
+            args.maximum_contact_anchor_yaw_rad
+        ),
         swing_plan_sigma_frames=args.swing_plan_sigma_frames,
         maximum_source_contact_p95_m=args.maximum_source_contact_p95_m,
         normalization_source=args.normalization_source,
@@ -338,6 +373,18 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 "swing_clearance_margin_m": args.swing_clearance_margin_m,
                 "foot_correction_halflife_s": args.foot_correction_halflife_s,
+                "root_height_correction_halflife_s": (
+                    args.root_height_correction_halflife_s
+                ),
+                "touchdown_projection_max_shift_m": (
+                    args.touchdown_projection_max_shift_m
+                ),
+                "anticipatory_touchdown_projection": (
+                    args.anticipatory_touchdown_projection
+                ),
+                "maximum_contact_anchor_yaw_rad": (
+                    args.maximum_contact_anchor_yaw_rad
+                ),
                 "swing_plan_sigma_frames": args.swing_plan_sigma_frames,
                 "maximum_source_contact_p95_m": (
                     args.maximum_source_contact_p95_m

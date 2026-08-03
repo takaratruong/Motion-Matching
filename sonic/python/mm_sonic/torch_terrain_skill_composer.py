@@ -184,6 +184,9 @@ def start_skill(
     target_yaw_delta_rad: torch.Tensor | None = None,
     maximum_translation_warp_m: float = 0.0,
     maximum_yaw_warp_rad: float = 0.0,
+    entry_foot_position_world: torch.Tensor | None = None,
+    entry_support: torch.Tensor | None = None,
+    maximum_contact_anchor_yaw_rad: float = 0.0,
 ) -> TerrainSkillState:
     """Place a skill at the current root and initialize exact pose offsets."""
 
@@ -217,6 +220,8 @@ def start_skill(
         or float(maximum_translation_warp_m) < 0.0
         or not math.isfinite(float(maximum_yaw_warp_rad))
         or float(maximum_yaw_warp_rad) < 0.0
+        or not math.isfinite(float(maximum_contact_anchor_yaw_rad))
+        or not 0.0 <= float(maximum_contact_anchor_yaw_rad) <= math.pi
     ):
         raise ContractError("terrain skill endpoint warp is invalid")
     if target_displacement_local_xy is not None and (
@@ -232,6 +237,21 @@ def start_skill(
         or not torch.isfinite(target_yaw_delta_rad).all()
     ):
         raise ContractError("terrain skill endpoint target is invalid")
+    if (entry_foot_position_world is None) != (entry_support is None):
+        raise ContractError("terrain skill contact anchor is incomplete")
+    if entry_foot_position_world is not None and (
+        not isinstance(entry_foot_position_world, torch.Tensor)
+        or tuple(entry_foot_position_world.shape) != (2, 3)
+        or entry_foot_position_world.dtype != current.joint_position.dtype
+        or entry_foot_position_world.device != current.joint_position.device
+        or not torch.isfinite(entry_foot_position_world).all()
+        or not isinstance(entry_support, torch.Tensor)
+        or tuple(entry_support.shape) != (2,)
+        or entry_support.dtype != torch.bool
+        or entry_support.device != current.joint_position.device
+        or not bool(entry_support.any().item())
+    ):
+        raise ContractError("terrain skill contact anchor is invalid")
 
     jp, jv, root, quat, root_v, root_w = _source_pose(
         folder, skill, selected_entry_frame, current.joint_position
@@ -239,9 +259,74 @@ def start_skill(
     if tuple(jp.shape) != tuple(current.joint_position.shape):
         raise ContractError("terrain skill source joint layout does not match current pose")
     yaw_offset = _quat_yaw(current.root_orientation_world_wxyz) - _quat_yaw(quat)
+    source_feet = None
+    anchor_support = None
+    if entry_foot_position_world is not None:
+        anchor_support = entry_support & skill.support_mask[
+            selected_entry_frame
+        ]
+        if not bool(anchor_support.any().item()):
+            raise ContractError("terrain skill contact anchor has no support")
+        try:
+            clip = folder.clips[skill.clip_index]
+            foot_indices = (
+                int(folder.layout.left_foot_body_index),
+                int(folder.layout.right_foot_body_index),
+            )
+            source_feet = torch.tensor(
+                clip.body_position_world[
+                    selected_entry_frame, list(foot_indices)
+                ],
+                dtype=current.joint_position.dtype,
+                device=current.joint_position.device,
+            )
+        except (AttributeError, IndexError, TypeError) as error:
+            raise ContractError(
+                "terrain skill contact anchor source is unavailable"
+            ) from error
+        if tuple(source_feet.shape) != (2, 3) or not torch.isfinite(
+            source_feet
+        ).all():
+            raise ContractError("terrain skill contact anchor source is invalid")
+        anchor_indices = torch.nonzero(
+            anchor_support, as_tuple=False
+        ).flatten()
+        if (
+            anchor_indices.numel() >= 2
+            and maximum_contact_anchor_yaw_rad > 0.0
+        ):
+            first, second = anchor_indices[:2]
+            source_axis = source_feet[second, :2] - source_feet[first, :2]
+            target_axis = (
+                entry_foot_position_world[second, :2]
+                - entry_foot_position_world[first, :2]
+            )
+            if bool(
+                (torch.linalg.vector_norm(source_axis) > 1.0e-4).item()
+                and (torch.linalg.vector_norm(target_axis) > 1.0e-4).item()
+            ):
+                fitted_yaw = torch.atan2(
+                    target_axis[1], target_axis[0]
+                ) - torch.atan2(source_axis[1], source_axis[0])
+                delta = torch.atan2(
+                    torch.sin(fitted_yaw - yaw_offset),
+                    torch.cos(fitted_yaw - yaw_offset),
+                ).clamp(
+                    -float(maximum_contact_anchor_yaw_rad),
+                    float(maximum_contact_anchor_yaw_rad),
+                )
+                yaw_offset = yaw_offset + delta
     yaw_quat = _quat_from_yaw(yaw_offset)
     placed_root = _rotate_z(root, yaw_offset)
     translation = current.root_position_world - placed_root
+    if source_feet is not None:
+        placed_feet = torch.stack(
+            tuple(_rotate_z(foot, yaw_offset) for foot in source_feet)
+        )
+        translation = (
+            entry_foot_position_world[anchor_support]
+            - placed_feet[anchor_support]
+        ).mean(dim=0)
     placed_quat = _quat_normalize(_quat_mul(yaw_quat, quat))
     placed_root_v = _rotate_z(root_v, yaw_offset)
     placed_root_w = _rotate_z(root_w, yaw_offset)

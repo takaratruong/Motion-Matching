@@ -69,6 +69,9 @@ _G1_LOCAL_SOLE_POINTS_M = np.asarray(
     dtype=np.float32,
 )
 _PREFILTER_SOLE_CLEARANCE_SLACK_M = 0.04
+_STATIONARY_FOOTHOLD_DISPLACEMENT_M = 0.05
+_CONTACT_ENTRY_POSITION_SCALE_M = 0.10
+_TERRAIN_ENGAGED_HEIGHT_M = 0.05
 
 
 def _rotation_matrices_wxyz(values: np.ndarray) -> np.ndarray:
@@ -159,8 +162,16 @@ def terrain_height_targets(
             -current_root_yaw.reshape(()),
         )
         future_heading = current_root_yaw.reshape(()) + targets.yaw_delta_rad
-        future_foot_xy = world_xy[:, None, :] + _rotate_xy(
+        rotated_future_foot_xy = world_xy[:, None, :] + _rotate_xy(
             local_foot_xy.unsqueeze(0), future_heading[:, None]
+        )
+        stationary = torch.linalg.vector_norm(
+            targets.displacement_local_xy, dim=1
+        ) <= _STATIONARY_FOOTHOLD_DISPLACEMENT_M
+        future_foot_xy = torch.where(
+            stationary[:, None, None],
+            current_foot_position_world[None, :, :2],
+            rotated_future_foot_xy,
         )
         sample_xy = torch.cat(
             (
@@ -247,6 +258,8 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         emitted_contact_preview_enabled: bool = False,
         maximum_emitted_contact_candidates: int = 64,
         maximum_emitted_contact_rescue_candidates: int | None = None,
+        rescue_without_surface_gate: bool = False,
+        maximum_contact_anchor_yaw_rad: float = 0.0,
     ) -> None:
         self.base = base_matcher
         self.database = base_matcher.database
@@ -338,6 +351,22 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             raise ContractError(
                 "emitted contact candidate limits are invalid"
             )
+        if type(rescue_without_surface_gate) is not bool or (
+            rescue_without_surface_gate
+            and not emitted_contact_preview_enabled
+        ):
+            raise ContractError(
+                "surface-gate rescue requires exact emitted preview"
+            )
+        if (
+            not math.isfinite(float(maximum_contact_anchor_yaw_rad))
+            or not 0.0 <= float(maximum_contact_anchor_yaw_rad) <= math.pi
+            or (
+                float(maximum_contact_anchor_yaw_rad) > 0.0
+                and not rescue_without_surface_gate
+            )
+        ):
+            raise ContractError("contact-anchor yaw limit is invalid")
         if not isinstance(
             contact_feasibility_config, TerrainContactFeasibilityConfig
         ):
@@ -381,6 +410,10 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         )
         self.maximum_emitted_contact_rescue_candidates = (
             resolved_rescue_candidates
+        )
+        self.rescue_without_surface_gate = rescue_without_surface_gate
+        self.maximum_contact_anchor_yaw_rad = float(
+            maximum_contact_anchor_yaw_rad
         )
         self.contact_feasibility_config = contact_feasibility_config
         self.minimum_continuation_progress_m = float(
@@ -571,6 +604,205 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         owned = np.ascontiguousarray(local.reshape(-1, 3), dtype=np.float32)
         self._sole_trace_cache[record] = owned
         return owned
+
+    def _terrain_profile_height_cost(
+        self,
+        records: torch.Tensor,
+        result: Any,
+        *,
+        contact_anchor: bool = False,
+        current_support: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Score source support heights at each candidate's placed feet."""
+
+        if type(contact_anchor) is not bool or contact_anchor != (
+            current_support is not None
+        ):
+            raise ContractError("terrain height-cost contact anchor is invalid")
+        if current_support is not None and (
+            not isinstance(current_support, torch.Tensor)
+            or tuple(current_support.shape) != (2,)
+            or current_support.dtype != torch.bool
+            or current_support.device != self.database.device
+            or not bool(current_support.any().item())
+        ):
+            raise ContractError("terrain height-cost support is invalid")
+
+        record_values = records.detach().cpu().numpy().astype(
+            np.int64, copy=False
+        )
+        if record_values.size == 0:
+            return torch.zeros(
+                0, dtype=torch.float32, device=self.database.device
+            )
+        local_parts = []
+        support_parts = []
+        source_parts = []
+        anchor_parts = []
+        candidate_parts = []
+        entry_local_parts = []
+        entry_support_parts = []
+        for candidate, record_value in enumerate(record_values.tolist()):
+            local, support, source, anchor = self._terrain_trace(record_value)
+            local_parts.append(local)
+            support_parts.append(support)
+            source_parts.append(source)
+            anchor_parts.append(anchor)
+            candidate_parts.append(
+                np.full(local.shape[0], candidate, dtype=np.int64)
+            )
+            entry_local_parts.append(local[:2])
+            entry_support_parts.append(support[:2])
+        device = self.database.device
+        local = torch.as_tensor(
+            np.concatenate(local_parts), dtype=torch.float32, device=device
+        )
+        support = torch.as_tensor(
+            np.concatenate(support_parts), dtype=torch.bool, device=device
+        )
+        source_delta = torch.as_tensor(
+            np.concatenate(source_parts), dtype=torch.float32, device=device
+        )
+        anchor_weight = torch.as_tensor(
+            np.concatenate(anchor_parts), dtype=torch.float32, device=device
+        )
+        candidate = torch.as_tensor(
+            np.concatenate(candidate_parts), dtype=torch.long, device=device
+        )
+        current_yaw = _yaw_from_wxyz(
+            result.root_orientation_world_wxyz
+        ).reshape(())
+        candidate_root_xy = result.root_position_world[:2].unsqueeze(0).expand(
+            int(record_values.size), 2
+        )
+        candidate_yaw = current_yaw.expand(int(record_values.size)).clone()
+        entry_geometry_error = torch.zeros(
+            int(record_values.size), dtype=torch.float32, device=device
+        )
+        missing_anchor = torch.zeros(
+            int(record_values.size), dtype=torch.bool, device=device
+        )
+        if contact_anchor:
+            entry_local = torch.as_tensor(
+                np.stack(entry_local_parts),
+                dtype=torch.float32,
+                device=device,
+            )
+            entry_support = torch.as_tensor(
+                np.stack(entry_support_parts),
+                dtype=torch.bool,
+                device=device,
+            )
+            overlap = entry_support & current_support.unsqueeze(0)
+            overlap_count = overlap.sum(dim=1)
+            missing_anchor = overlap_count == 0
+            double_support = overlap_count >= 2
+            if (
+                self.maximum_contact_anchor_yaw_rad > 0.0
+                and bool(double_support.any().item())
+            ):
+                source_axis = entry_local[:, 1] - entry_local[:, 0]
+                target_axis = self._feet[1, :2] - self._feet[0, :2]
+                source_angle = torch.atan2(
+                    source_axis[:, 1], source_axis[:, 0]
+                )
+                target_angle = torch.atan2(target_axis[1], target_axis[0])
+                fitted_delta = torch.atan2(
+                    torch.sin(target_angle - source_angle - current_yaw),
+                    torch.cos(target_angle - source_angle - current_yaw),
+                ).clamp(
+                    -self.maximum_contact_anchor_yaw_rad,
+                    self.maximum_contact_anchor_yaw_rad,
+                )
+                candidate_yaw = candidate_yaw + torch.where(
+                    double_support,
+                    fitted_delta,
+                    torch.zeros_like(fitted_delta),
+                )
+            placed_entry = _rotate_xy(
+                entry_local, candidate_yaw.unsqueeze(1)
+            )
+            translation = self._feet[:, :2].unsqueeze(0) - placed_entry
+            candidate_root_xy = (
+                translation * overlap.unsqueeze(-1)
+            ).sum(dim=1) / overlap_count.clamp_min(1).unsqueeze(-1)
+            placed_entry = placed_entry + candidate_root_xy.unsqueeze(1)
+            entry_residual_squared = torch.square(
+                self._feet[:, :2].unsqueeze(0) - placed_entry
+            ).sum(dim=2)
+            entry_geometry_error = (
+                entry_residual_squared
+                * overlap.to(entry_residual_squared.dtype)
+            ).sum(dim=1) / overlap_count.clamp_min(1)
+        placed_xy = candidate_root_xy[candidate] + _rotate_xy(
+            local, candidate_yaw[candidate]
+        )
+        scene_xy = self.query_terrain.alignment.matcher_to_scene_xy(placed_xy)
+        grid = self.query_terrain.query_grid
+        origin = grid.origin_xy
+        ny, nx = grid.height_z.shape
+        maximum = origin + grid.cell_size_m * torch.tensor(
+            [nx - 1, ny - 1], dtype=torch.float32, device=device
+        )
+        inside = ((scene_xy >= origin) & (scene_xy <= maximum)).all(dim=1)
+        sampled = grid.sample_xy(
+            torch.minimum(torch.maximum(scene_xy, origin), maximum)
+        )
+        candidate_count = int(record_values.size)
+        target_anchor = torch.zeros(
+            candidate_count, dtype=torch.float32, device=device
+        ).scatter_add_(0, candidate, sampled * anchor_weight)
+        normalized_squared_error = torch.square(
+            ((sampled - target_anchor[candidate]) - source_delta) / 0.18
+        )
+        normalized_squared_error = torch.where(
+            support, normalized_squared_error, torch.zeros_like(sampled)
+        )
+        error_sum = torch.zeros(
+            candidate_count, dtype=torch.float32, device=device
+        ).scatter_add_(0, candidate, normalized_squared_error)
+        support_count = torch.zeros(
+            candidate_count, dtype=torch.float32, device=device
+        ).scatter_add_(0, candidate, support.to(torch.float32))
+        cost = (
+            float(self.search_config.height_weight)
+            * error_sum
+            / support_count
+        )
+        if contact_anchor:
+            current_scene_xy = (
+                self.query_terrain.alignment.matcher_to_scene_xy(
+                    self._feet[current_support, :2]
+                )
+            )
+            current_surface = grid.sample_xy(current_scene_xy)
+            base_surface = torch.min(grid.height_z)
+            terrain_engaged = bool(
+                (
+                    torch.max(current_surface) - base_surface
+                    > _TERRAIN_ENGAGED_HEIGHT_M
+                ).item()
+                or (
+                    torch.max(current_surface) - torch.min(current_surface)
+                    > _TERRAIN_ENGAGED_HEIGHT_M
+                ).item()
+            )
+            if terrain_engaged:
+                cost = cost + float(self.search_config.height_weight) * (
+                    entry_geometry_error
+                    / (_CONTACT_ENTRY_POSITION_SCALE_M**2)
+                )
+        outside = torch.zeros(
+            candidate_count, dtype=torch.long, device=device
+        ).scatter_reduce_(
+            0,
+            candidate,
+            (support & ~inside).to(torch.long),
+            reduce="amax",
+            include_self=True,
+        )
+        invalid = outside.bool() | missing_anchor
+        return torch.where(invalid, torch.full_like(cost, 1.0e6), cost)
 
     def _terrain_profile_prefilter(
         self, records: torch.Tensor, result: Any
@@ -1253,7 +1485,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                 current_support = support_profile[source_frame]
 
         emitted_validation_cache: dict[
-            tuple[int, int, int], TerrainContactFeasibilityResult
+            tuple[int, int, int, bool], TerrainContactFeasibilityResult
         ] = {}
 
         def compatible(
@@ -1262,6 +1494,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             endpoint: int,
             *,
             require_phase: bool,
+            contact_anchor: bool,
         ) -> bool:
             skill_index = int(self.horizon_inventory.skill_index[record].item())
             skill = self.inventory.skills[skill_index]
@@ -1306,6 +1539,18 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             entry_frame = int(
                 self.horizon_inventory.entry_frame[record].item()
             )
+            resolved_contact_anchor = (
+                contact_anchor
+                and current_support is not None
+                and bool(
+                    (
+                        current_support
+                        & skill.support_mask[entry_frame]
+                    ).any().item()
+                )
+            )
+            if contact_anchor and not resolved_contact_anchor:
+                return False
             (
                 warp_displacement,
                 warp_yaw,
@@ -1320,7 +1565,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                     )
                 )
 
-            cache_key = (record, row, endpoint)
+            cache_key = (record, row, endpoint, resolved_contact_anchor)
             validation = emitted_validation_cache.get(cache_key)
             if validation is None:
                 validation = preview_emitted_contact_trace(
@@ -1339,6 +1584,21 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                     target_yaw_delta_rad=warp_yaw,
                     maximum_translation_warp_m=translation_limit,
                     maximum_yaw_warp_rad=yaw_limit,
+                    entry_foot_position_world=(
+                        self._feet
+                        if resolved_contact_anchor
+                        else None
+                    ),
+                    entry_support=(
+                        current_support
+                        if resolved_contact_anchor
+                        else None
+                    ),
+                    maximum_contact_anchor_yaw_rad=(
+                        self.maximum_contact_anchor_yaw_rad
+                        if resolved_contact_anchor
+                        else 0.0
+                    ),
                 )
                 emitted_validation_cache[cache_key] = validation
             return validation
@@ -1348,6 +1608,10 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             require_phase: bool,
             maximum_candidates: int | None = None,
             allow_preferred: bool = True,
+            apply_surface_gate: bool = True,
+            apply_profile_prefilter: bool = True,
+            apply_profile_height_cost: bool = False,
+            contact_anchor: bool = False,
         ):
             prefer_runway = (
                 allow_preferred
@@ -1435,6 +1699,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                     row,
                     endpoint,
                     require_phase=require_phase,
+                    contact_anchor=contact_anchor,
                 ),
                 preferred_validator=(
                     runway_compatible if prefer_runway else None
@@ -1454,13 +1719,31 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                     if self.emitted_contact_preview_enabled
                     else None
                 ),
+                apply_surface_gate=apply_surface_gate,
                 ranked_prefilter=(
                     (
                         lambda records: self._terrain_profile_prefilter(
                             records, result
                         )
                     )
-                    if self.emitted_contact_preview_enabled
+                    if (
+                        self.emitted_contact_preview_enabled
+                        and apply_profile_prefilter
+                    )
+                    else None
+                ),
+                ranked_height_cost=(
+                    (
+                        lambda records: self._terrain_profile_height_cost(
+                            records,
+                            result,
+                            contact_anchor=contact_anchor,
+                            current_support=(
+                                current_support if contact_anchor else None
+                            ),
+                        )
+                    )
+                    if apply_profile_height_cost
                     else None
                 ),
                 config=self.search_config,
@@ -1470,6 +1753,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             )
 
         search_failure = None
+        selected_contact_anchor = False
         try:
             selected = select(require_phase=current_support is not None)
         except HorizonSearchFailure as error:
@@ -1493,11 +1777,36 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                         self.maximum_emitted_contact_rescue_candidates
                     ),
                     allow_preferred=False,
+                    apply_surface_gate=(
+                        not self.rescue_without_surface_gate
+                    ),
+                    apply_profile_prefilter=(
+                        not self.rescue_without_surface_gate
+                    ),
+                    apply_profile_height_cost=(
+                        self.rescue_without_surface_gate
+                    ),
+                    contact_anchor=(
+                        self.rescue_without_surface_gate
+                        and current_support is not None
+                    ),
                 )
             except HorizonSearchFailure as rescue_error:
                 search_failure = rescue_error
             else:
                 search_failure = None
+                selected_contact_anchor = (
+                    self.rescue_without_surface_gate
+                    and current_support is not None
+                )
+                if selected_contact_anchor:
+                    selected = replace(
+                        selected,
+                        selection_mode=(
+                            "contact-anchored-rescue-"
+                            + selected.selection_mode
+                        ),
+                    )
         if search_failure is not None:
             delayed_switch = self._try_continue_skill(
                 requested_command, require_command_match=False
@@ -1563,6 +1872,17 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             target_yaw_delta_rad=warp_yaw,
             maximum_translation_warp_m=translation_limit,
             maximum_yaw_warp_rad=yaw_limit,
+            entry_foot_position_world=(
+                self._feet if selected_contact_anchor else None
+            ),
+            entry_support=(
+                current_support if selected_contact_anchor else None
+            ),
+            maximum_contact_anchor_yaw_rad=(
+                self.maximum_contact_anchor_yaw_rad
+                if selected_contact_anchor
+                else 0.0
+            ),
         )
 
     def prepare_step(self, *args, **kwargs):
@@ -1662,6 +1982,10 @@ def run_resolved_horizon_matrix(
     maximum_emitted_contact_rescue_candidates: int | None = None,
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
+    root_height_correction_halflife_s: float | None = None,
+    touchdown_projection_max_shift_m: float | None = None,
+    anticipatory_touchdown_projection: bool = False,
+    maximum_contact_anchor_yaw_rad: float = 0.0,
     swing_plan_sigma_frames: float | None = None,
     maximum_source_contact_p95_m: float | None = None,
     normalization_source: str | None = None,
@@ -1739,9 +2063,19 @@ def run_resolved_horizon_matrix(
         result_filter = build_terrain_foot_lock(
             resolved,
             foot_kinematics,
+            sole_kinematics,
             swing_clearance_margin_m=swing_clearance_margin_m,
             correction_halflife_s=foot_correction_halflife_s,
+            root_height_correction_halflife_s=(
+                root_height_correction_halflife_s
+            ),
             swing_plan_sigma_frames=swing_plan_sigma_frames,
+            touchdown_projection_max_shift_m=(
+                touchdown_projection_max_shift_m
+            ),
+            anticipatory_touchdown_projection=(
+                anticipatory_touchdown_projection
+            ),
         )
     route_matchers: dict[str, TerrainSkillHorizonMatcher] = {}
     model, data = build_kinematic_scene(g1_xml, resolved)
@@ -1805,13 +2139,44 @@ def run_resolved_horizon_matrix(
             resolved.base_config_sha256
             + ":horizon-skills-v1:"
             + search_identity
-            + (":foot-lock-v1" if foot_lock else ":raw-playback")
+            + (
+                ":foot-lock-v3-speed-bound"
+                if foot_lock
+                else ":raw-playback"
+            )
             + (
                 f":swing-clearance-v1:{float(swing_clearance_margin_m):.9g}"
                 if swing_clearance_margin_m is not None
                 else ":native-swing"
             )
             + f":foot-halflife:{float(foot_correction_halflife_s):.9g}"
+            + (
+                ":terrain-gated-support-root-halflife:"
+                f"{float(root_height_correction_halflife_s):.9g}"
+                if root_height_correction_halflife_s is not None
+                else ":fixed-root-height"
+            )
+            + (
+                ":touchdown-project-v10-speed-bound:"
+                "terrain-gated-contact-geometry:"
+                f"{float(touchdown_projection_max_shift_m):.9g}"
+                if touchdown_projection_max_shift_m is not None
+                else ":native-touchdown"
+            )
+            + (
+                ":anticipatory-touchdown"
+                if anticipatory_touchdown_projection
+                else ":onset-touchdown"
+            )
+            + (
+                ":surface-gate-rescue-off"
+                if touchdown_projection_max_shift_m is not None
+                else ":surface-gate-always"
+            )
+            + (
+                ":contact-anchor-yaw:"
+                f"{float(maximum_contact_anchor_yaw_rad):.9g}"
+            )
             + (
                 f":swing-plan-v1:{float(swing_plan_sigma_frames):.9g}"
                 if swing_plan_sigma_frames is not None
@@ -1881,6 +2246,12 @@ def run_resolved_horizon_matrix(
             ),
             maximum_emitted_contact_rescue_candidates=(
                 resolved_rescue_candidates
+            ),
+            rescue_without_surface_gate=(
+                touchdown_projection_max_shift_m is not None
+            ),
+            maximum_contact_anchor_yaw_rad=(
+                maximum_contact_anchor_yaw_rad
             ),
             turning_clip_paths=turning_clip_paths,
             maximum_translation_warp_m=maximum_translation_warp_m,

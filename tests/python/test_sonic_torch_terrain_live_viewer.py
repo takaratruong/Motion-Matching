@@ -293,6 +293,10 @@ class LiveMujocoSceneTests(unittest.TestCase):
                 "--swing-clearance-margin-m", "0.01",
                 "--swing-plan-sigma-frames", "2.5",
                 "--foot-correction-halflife-s", "0.02",
+                "--root-height-correction-halflife-s", "0.05",
+                "--touchdown-projection-max-shift-m", "0.05",
+                "--maximum-contact-anchor-yaw-rad", "0.2",
+                "--anticipatory-touchdown-projection",
                 "--maximum-source-contact-p95-m", "0.033",
                 "--normalization-source", "baseline",
                 "--maximum-translation-warp-m", "0.025",
@@ -314,6 +318,10 @@ class LiveMujocoSceneTests(unittest.TestCase):
         self.assertEqual(arguments.swing_clearance_margin_m, 0.01)
         self.assertEqual(arguments.swing_plan_sigma_frames, 2.5)
         self.assertEqual(arguments.foot_correction_halflife_s, 0.02)
+        self.assertEqual(arguments.root_height_correction_halflife_s, 0.05)
+        self.assertEqual(arguments.touchdown_projection_max_shift_m, 0.05)
+        self.assertEqual(arguments.maximum_contact_anchor_yaw_rad, 0.2)
+        self.assertTrue(arguments.anticipatory_touchdown_projection)
         self.assertEqual(arguments.maximum_source_contact_p95_m, 0.033)
         self.assertEqual(arguments.normalization_source, "baseline")
         self.assertEqual(arguments.maximum_translation_warp_m, 0.025)
@@ -380,6 +388,14 @@ class LiveMujocoSceneTests(unittest.TestCase):
                 foothold_arm=None,
                 foot_lock=True,
                 swing_plan_sigma_frames=2.5,
+            )
+        with self.assertRaisesRegex(ContractError, "requires exact"):
+            live_module._validate_live_mode(
+                multi_horizon=True,
+                contact_segments=False,
+                foothold_arm=None,
+                foot_lock=True,
+                touchdown_projection_max_shift_m=0.05,
             )
 
     def test_horizon_overlay_does_not_require_legacy_cost_fields(self):

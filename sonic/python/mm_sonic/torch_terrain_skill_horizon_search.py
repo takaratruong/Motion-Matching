@@ -116,6 +116,7 @@ class HorizonSearchFailure(ContractError):
 TerrainHorizonValidator = Callable[[int, int, int], object]
 PreferredHorizonValidator = Callable[[int, int, int], bool]
 RankedHorizonPrefilter = Callable[[torch.Tensor], torch.Tensor]
+RankedHorizonHeightCost = Callable[[torch.Tensor], torch.Tensor]
 
 
 def horizon_search_config_from_experiment(
@@ -347,6 +348,7 @@ def rank_horizon_candidates(
     targets: HorizonTargets,
     config: HorizonSearchConfig = HorizonSearchConfig(),
     *,
+    apply_surface_gate: bool = True,
     current_clip_index: int | None = None,
     current_frame_index: int | None = None,
     matcher_config: MatcherConfig = MatcherConfig(),
@@ -354,6 +356,8 @@ def rank_horizon_candidates(
     """Hard-gate and stably rank all row/horizon records on the device."""
 
     _validate_ranking_inputs(database, inventory, normalized_query, targets, config)
+    if type(apply_surface_gate) is not bool:
+        raise ContractError("horizon surface gate flag must be boolean")
     matches = inventory.target_frames[:, None] == targets.frames[None, :]
     known_target = matches.any(dim=1)
     target_index = torch.argmax(matches.to(torch.long), dim=1)
@@ -407,9 +411,11 @@ def rank_horizon_candidates(
     )
     desired_surface_mean = desired_surface.mean(dim=1)
     candidate_surface_mean = inventory.surface_height_delta_m.mean(dim=1)
-    rejected_surface = (
-        torch.abs(desired_surface_mean) >= config.surface_gate_m
-    ) & (desired_surface_mean * candidate_surface_mean <= 0)
+    rejected_surface = torch.zeros_like(known_target)
+    if apply_surface_gate:
+        rejected_surface = (
+            torch.abs(desired_surface_mean) >= config.surface_gate_m
+        ) & (desired_surface_mean * candidate_surface_mean <= 0)
     finite = (
         known_target
         & torch.isfinite(entry)
@@ -484,6 +490,8 @@ def select_horizon_candidate(
     maximum_preferred_outcome_cost_increase: float = math.inf,
     maximum_validated_candidates: int | None = None,
     ranked_prefilter: RankedHorizonPrefilter | None = None,
+    ranked_height_cost: RankedHorizonHeightCost | None = None,
+    apply_surface_gate: bool = True,
     config: HorizonSearchConfig = HorizonSearchConfig(),
     current_clip_index: int | None = None,
     current_frame_index: int | None = None,
@@ -495,6 +503,8 @@ def select_horizon_candidate(
         preferred_validator is not None and not callable(preferred_validator)
     ) or (
         ranked_prefilter is not None and not callable(ranked_prefilter)
+    ) or (
+        ranked_height_cost is not None and not callable(ranked_height_cost)
     ):
         raise ContractError("horizon terrain validator must be callable")
     if (
@@ -515,6 +525,7 @@ def select_horizon_candidate(
         normalized_query,
         targets,
         config,
+        apply_surface_gate=apply_surface_gate,
         current_clip_index=current_clip_index,
         current_frame_index=current_frame_index,
         matcher_config=matcher_config,
@@ -538,6 +549,24 @@ def select_horizon_candidate(
         ),
         dim=1,
     )
+    if ranked_height_cost is not None:
+        added_height = ranked_height_cost(ranked.candidate_indices)
+        if (
+            not isinstance(added_height, torch.Tensor)
+            or not added_height.dtype.is_floating_point
+            or tuple(added_height.shape) != tuple(ranked.candidate_indices.shape)
+            or added_height.device != ranked.candidate_indices.device
+            or not torch.isfinite(added_height).all()
+            or bool((added_height < 0).any().item())
+        ):
+            raise ContractError("ranked horizon height cost is invalid")
+        added_height = added_height.to(dtype=diagnostics_tensor.dtype)
+        diagnostics_tensor[:, 4] += added_height
+        diagnostics_tensor[:, 7] += added_height
+        diagnostics_tensor[:, 8] += added_height
+        diagnostics_tensor = diagnostics_tensor[
+            torch.argsort(diagnostics_tensor[:, 8], stable=True)
+        ]
     if ranked_prefilter is not None:
         keep = ranked_prefilter(ranked.candidate_indices)
         if (
