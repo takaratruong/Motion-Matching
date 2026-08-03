@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import hashlib
 import json
 import math
@@ -61,6 +61,7 @@ class HorizonChunkEvent:
     cost: HorizonCost
     rejected_by_reason: Mapping[str, int]
     release_reason: str
+    selection_mode: str = "immediate"
 
 
 @dataclass(frozen=True)
@@ -157,6 +158,11 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         ),
         minimum_continuation_progress_m: float = 0.05,
         maximum_continuation_stall_frames: int = 5,
+        minimum_continuation_velocity_alignment: float = 0.5,
+        minimum_continuation_commanded_progress_ratio: float = 0.35,
+        maximum_continuation_heading_regression_rad: float = 0.15,
+        maximum_preferred_cost_increase: float = 1.0,
+        maximum_preferred_outcome_cost_increase: float = 0.05,
     ) -> None:
         self.base = base_matcher
         self.database = base_matcher.database
@@ -237,6 +243,28 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             or not 0.0 < float(continuation_surface_tolerance_m) < 0.10
             or type(maximum_continuation_stall_frames) is not int
             or maximum_continuation_stall_frames < 0
+            or not math.isfinite(
+                float(minimum_continuation_velocity_alignment)
+            )
+            or not -1.0 <= float(
+                minimum_continuation_velocity_alignment
+            ) <= 1.0
+            or not math.isfinite(
+                float(minimum_continuation_commanded_progress_ratio)
+            )
+            or not 0.0 < float(
+                minimum_continuation_commanded_progress_ratio
+            ) <= 1.0
+            or not math.isfinite(
+                float(maximum_continuation_heading_regression_rad)
+            )
+            or float(maximum_continuation_heading_regression_rad) < 0.0
+            or not math.isfinite(float(maximum_preferred_cost_increase))
+            or float(maximum_preferred_cost_increase) < 0.0
+            or not math.isfinite(
+                float(maximum_preferred_outcome_cost_increase)
+            )
+            or float(maximum_preferred_outcome_cost_increase) < 0.0
         ):
             raise ContractError("continuous terrain skill limits are invalid")
         self.continuous_skill_enabled = continuous_skill_enabled
@@ -250,6 +278,21 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         )
         self.maximum_continuation_stall_frames = (
             maximum_continuation_stall_frames
+        )
+        self.minimum_continuation_velocity_alignment = float(
+            minimum_continuation_velocity_alignment
+        )
+        self.minimum_continuation_commanded_progress_ratio = float(
+            minimum_continuation_commanded_progress_ratio
+        )
+        self.maximum_continuation_heading_regression_rad = float(
+            maximum_continuation_heading_regression_rad
+        )
+        self.maximum_preferred_cost_increase = float(
+            maximum_preferred_cost_increase
+        )
+        self.maximum_preferred_outcome_cost_increase = float(
+            maximum_preferred_outcome_cost_increase
         )
         self._clip_path_to_index = {
             clip.relative_path: index
@@ -275,6 +318,74 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         self._prepared_release_reason: str | None = None
         self._endpoint_warp_command = None
         self._endpoint_warp_command_enabled = False
+
+    def _source_suffix_matches_command(
+        self,
+        *,
+        clip: Any,
+        start_frame: int,
+        endpoint_frame_exclusive: int,
+        yaw_offset: torch.Tensor,
+        command: tuple[tuple[float, float], float],
+    ) -> bool:
+        """Reject source continuations that leave the held command manifold."""
+
+        root_index = int(self.dataset.folder.layout.root_body_index)
+        roots = torch.tensor(
+            clip.body_position_world[
+                start_frame - 1 : endpoint_frame_exclusive, root_index
+            ],
+            dtype=yaw_offset.dtype,
+            device=yaw_offset.device,
+        )
+        velocity = torch.as_tensor(
+            command[0], dtype=yaw_offset.dtype, device=yaw_offset.device
+        )
+        speed = torch.linalg.vector_norm(velocity)
+        displacement_world = _rotate_xy(
+            roots[-1, :2] - roots[0, :2], yaw_offset
+        )
+        progress = torch.linalg.vector_norm(displacement_world)
+        if float(speed.item()) > 0.05 and float(progress.item()) > 1e-8:
+            alignment = torch.dot(displacement_world, velocity) / (
+                progress * speed
+            )
+            if float(alignment.item()) < (
+                self.minimum_continuation_velocity_alignment
+            ):
+                return False
+            commanded_progress = torch.dot(
+                displacement_world, velocity / speed
+            )
+            expected_progress = speed * (
+                (endpoint_frame_exclusive - start_frame) * self.config.dt
+            )
+            if float(commanded_progress.item()) < float(
+                expected_progress.item()
+            ) * self.minimum_continuation_commanded_progress_ratio:
+                return False
+
+        orientations = torch.tensor(
+            clip.body_quaternion_world_wxyz[
+                [start_frame - 1, endpoint_frame_exclusive - 1], root_index
+            ],
+            dtype=yaw_offset.dtype,
+            device=yaw_offset.device,
+        )
+        placed_yaw = _yaw_from_wxyz(orientations) + yaw_offset
+        desired_heading = torch.as_tensor(
+            command[1], dtype=yaw_offset.dtype, device=yaw_offset.device
+        )
+        heading_error = torch.abs(
+            torch.atan2(
+                torch.sin(desired_heading - placed_yaw),
+                torch.cos(desired_heading - placed_yaw),
+            )
+        )
+        return float(heading_error[1].item()) <= (
+            float(heading_error[0].item())
+            + self.maximum_continuation_heading_regression_rad
+        )
 
     @property
     def chunk_events(self) -> tuple[HorizonChunkEvent, ...]:
@@ -335,6 +446,14 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         if (
             progress < self.minimum_continuation_progress_m
             or int(stalls.max().item()) > self.maximum_continuation_stall_frames
+        ):
+            return None
+        if not self._source_suffix_matches_command(
+            clip=clip,
+            start_frame=start,
+            endpoint_frame_exclusive=endpoint,
+            yaw_offset=state.yaw_offset,
+            command=command,
         ):
             return None
 
@@ -487,8 +606,21 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         requested_heading = torch.tensor(
             heading_world_yaw, dtype=torch.float32, device=self.database.device
         )
+        requested_command = (
+            (float(velocity_world_xy[0]), float(velocity_world_xy[1])),
+            float(heading_world_yaw),
+        )
+        command_changed = (
+            self._last_command is not None
+            and requested_command != self._last_command
+        )
+        search_current_velocity = (
+            requested_velocity
+            if self.contact_phase_gate and command_changed
+            else self._shaped_velocity
+        )
         targets = predict_horizon_targets(
-            current_velocity_world_xy=self._shaped_velocity,
+            current_velocity_world_xy=search_current_velocity,
             current_heading_world_yaw=current_yaw,
             requested_velocity_world_xy=requested_velocity,
             requested_heading_world_yaw=requested_heading,
@@ -568,6 +700,81 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             )
 
         def select(*, require_phase: bool):
+            prefer_runway = (
+                self.continuous_skill_enabled
+                and math.hypot(*velocity_world_xy) > 0.05
+            )
+
+            def runway_compatible(
+                record: int, row: int, endpoint: int
+            ) -> bool:
+                skill_index = int(
+                    self.horizon_inventory.skill_index[record].item()
+                )
+                skill = self.inventory.skills[skill_index]
+                if endpoint >= skill.interval.playback_stop:
+                    return False
+                later = next_sequential_horizon_endpoint(
+                    skill.support_mask,
+                    current_endpoint_frame_exclusive=endpoint,
+                    playback_stop=skill.interval.playback_stop,
+                )
+                if later is None:
+                    return False
+                clip = self.dataset.folder.clips[skill.clip_index]
+                root_index = int(self.dataset.folder.layout.root_body_index)
+                roots = torch.tensor(
+                    clip.body_position_world[endpoint - 1 : later, root_index],
+                    dtype=torch.float32,
+                    device=self.database.device,
+                )
+                progress = float(
+                    torch.linalg.vector_norm(
+                        roots[-1, :2] - roots[0, :2]
+                    ).item()
+                )
+                if progress < self.minimum_continuation_progress_m:
+                    return False
+                if int(remaining_stall_profile(roots[:, :2]).max().item()) > (
+                    self.maximum_continuation_stall_frames
+                ):
+                    return False
+                entry_frame = int(
+                    self.horizon_inventory.entry_frame[record].item()
+                )
+                entry_orientation = torch.tensor(
+                    clip.body_quaternion_world_wxyz[
+                        entry_frame,
+                        int(self.dataset.folder.layout.root_body_index),
+                    ],
+                    dtype=current_yaw.dtype,
+                    device=current_yaw.device,
+                )
+                yaw_offset = current_yaw - _yaw_from_wxyz(
+                    entry_orientation
+                )
+                if not self._source_suffix_matches_command(
+                    clip=clip,
+                    start_frame=endpoint,
+                    endpoint_frame_exclusive=later,
+                    yaw_offset=yaw_offset,
+                    command=(velocity_world_xy, heading_world_yaw),
+                ):
+                    return False
+                return terrain_skill_compatible(
+                    skill=skill,
+                    canonical_entry_row=row,
+                    dataset=self.dataset,
+                    database=self.database,
+                    query_terrain=self.query_terrain,
+                    current_root_position_world=result.root_position_world,
+                    current_root_orientation_world_wxyz=(
+                        result.root_orientation_world_wxyz
+                    ),
+                    tolerance_m=self.continuation_surface_tolerance_m,
+                    playback_stop=later,
+                )
+
             return select_horizon_candidate(
                 self.database,
                 self.horizon_inventory,
@@ -578,6 +785,15 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                     row,
                     endpoint,
                     require_phase=require_phase,
+                ),
+                preferred_validator=(
+                    runway_compatible if prefer_runway else None
+                ),
+                maximum_preferred_cost_increase=(
+                    self.maximum_preferred_cost_increase
+                ),
+                maximum_preferred_outcome_cost_increase=(
+                    self.maximum_preferred_outcome_cost_increase
                 ),
                 config=self.search_config,
                 current_clip_index=current_clip,
@@ -695,6 +911,23 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             raise ContractError("endpoint warp step command is invalid") from error
         if command != self._endpoint_warp_command:
             self._update_endpoint_warp_command(command)
+        state = self._skill_state
+        command_changed = (
+            self._last_command is not None and command != self._last_command
+        )
+        if (
+            self.contact_phase_gate
+            and command_changed
+            and state is not None
+            and state.next_source_frame < state.playback_stop
+        ):
+            self._skill_state = replace(
+                state, playback_stop=state.next_source_frame
+            )
+            try:
+                return super().prepare_step(*args, **kwargs)
+            finally:
+                self._skill_state = state
         return super().prepare_step(*args, **kwargs)
 
     def commit(self, prepared):
@@ -717,6 +950,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                         dict(selected.rejected_by_reason)
                     ),
                     release_reason=release_reason or "endpoint",
+                    selection_mode=selected.selection_mode,
                 )
             )
         if continuation is not None:

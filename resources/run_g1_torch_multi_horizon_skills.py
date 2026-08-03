@@ -186,6 +186,7 @@ def canonical_chunk_events(events: Sequence[HorizonChunkEvent]) -> bytes:
                 "total_cost": event.cost.total,
                 "rejected_by_reason": dict(event.rejected_by_reason),
                 "release_reason": event.release_reason,
+                "selection_mode": event.selection_mode,
             }
         )
     identity_payload = {"schema": "g1-terrain-horizon-chunks/v1", "chunks": chunks}

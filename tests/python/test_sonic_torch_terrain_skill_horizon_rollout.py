@@ -1,5 +1,6 @@
 import math
 import unittest
+from unittest import mock
 from types import SimpleNamespace
 
 import numpy as np
@@ -11,7 +12,10 @@ from mm_sonic.torch_terrain_skill_horizon_rollout import (
     TerrainSkillHorizonMatcher,
     terrain_height_targets,
 )
-from mm_sonic.torch_terrain_skill_horizon_search import HorizonTargets
+from mm_sonic.torch_terrain_skill_horizon_search import (
+    HorizonTargets,
+    predict_horizon_targets,
+)
 from mm_sonic.torch_terrain_skill_horizons import TerrainSkillHorizonInventory
 from mm_sonic.torch_terrain_skills import (
     SkillInterval,
@@ -58,12 +62,27 @@ def _transactional_fixture(
     continuous_skill_enabled=False,
     contact_feasibility_enabled=False,
     continuation_surface_tolerance_m=0.08,
+    two_candidate_runway: bool | None = None,
+    runway_suffix_direction: tuple[float, float] = (1.0, 0.0),
+    runway_suffix_step_m: float = 0.01,
+    single_support: bool = False,
 ):
     frames = 80
     body_position = np.zeros((frames, 3, 3), dtype=np.float32)
     body_position[:, :, 0] = np.arange(frames, dtype=np.float32)[:, None] * 0.01
     body_position[:, :, 2] = 0.8
     body_position[:, 1:, 2] = 0.035
+    if two_candidate_runway is not None:
+        suffix = (
+            np.arange(frames - 25, dtype=np.float32)[:, None]
+            * runway_suffix_step_m
+        )
+        body_position[25:, :, 0] = body_position[25, 0, 0] + (
+            suffix * runway_suffix_direction[0]
+        )
+        body_position[25:, :, 1] = body_position[25, 0, 1] + (
+            suffix * runway_suffix_direction[1]
+        )
     body_quaternion = np.zeros((frames, 3, 4), dtype=np.float32)
     body_quaternion[..., 0] = 1.0
     clip = SimpleNamespace(
@@ -84,6 +103,8 @@ def _transactional_fixture(
         ),
     )
     support = torch.ones((frames, 2), dtype=torch.bool)
+    if single_support:
+        support[0, 1] = False
     skill = TerrainSkill(
         skill_index=0,
         clip_index=0,
@@ -92,22 +113,48 @@ def _transactional_fixture(
         support_mask=support,
         foot_surface_height_m=torch.zeros((frames, 2)),
     )
+    skill_values = (skill,)
+    row_to_skill = {0: 0}
+    if two_candidate_runway is not None:
+        skill = TerrainSkill(
+            **{
+                **skill.__dict__,
+                "interval": SkillInterval(0, 1, 26),
+            }
+        )
+        runway_skill = TerrainSkill(
+            skill_index=1,
+            clip_index=0,
+            interval=SkillInterval(
+                0, 1, 60 if two_candidate_runway else 26
+            ),
+            entry_rows=(1,),
+            support_mask=support,
+            foot_surface_height_m=torch.zeros((frames, 2)),
+        )
+        skill_values = (skill, runway_skill)
+        row_to_skill = {0: 0, 1: 1}
     skills = TerrainSkillInventory(
-        skills=(skill,), rejected_by_reason={}, row_to_skill={0: 0}
+        skills=skill_values, rejected_by_reason={}, row_to_skill=row_to_skill
     )
+    record_count = len(skill_values)
     horizons = TerrainSkillHorizonInventory(
-        entry_row=torch.tensor([0]),
-        skill_index=torch.tensor([0]),
-        clip_index=torch.tensor([0]),
-        entry_frame=torch.tensor([0]),
-        target_frames=torch.tensor([25]),
-        endpoint_frame_exclusive=torch.tensor([26]),
-        root_displacement_local_xy=torch.tensor([[0.25, 0.0]]),
-        yaw_delta_rad=torch.zeros(1),
-        root_height_delta_m=torch.zeros(1),
-        surface_height_delta_m=torch.zeros((1, 2)),
-        maximum_stall_frames=torch.zeros(1, dtype=torch.long),
-        duration_frames=torch.tensor([26]),
+        entry_row=torch.arange(record_count),
+        skill_index=torch.arange(record_count),
+        clip_index=torch.zeros(record_count, dtype=torch.long),
+        entry_frame=torch.zeros(record_count, dtype=torch.long),
+        target_frames=torch.full((record_count,), 25, dtype=torch.long),
+        endpoint_frame_exclusive=torch.full(
+            (record_count,), 26, dtype=torch.long
+        ),
+        root_displacement_local_xy=torch.tensor(
+            [[0.25, 0.0]] * record_count
+        ),
+        yaw_delta_rad=torch.zeros(record_count),
+        root_height_delta_m=torch.zeros(record_count),
+        surface_height_delta_m=torch.zeros((record_count, 2)),
+        maximum_stall_frames=torch.zeros(record_count, dtype=torch.long),
+        duration_frames=torch.full((record_count,), 26, dtype=torch.long),
         rejected_by_reason={},
     )
     zeros = torch.zeros(27)
@@ -116,9 +163,11 @@ def _transactional_fixture(
         device=torch.device("cpu"),
         normalization=FeatureNormalization(zeros, torch.ones_like(zeros)),
         reset_row=0,
-        _search_features=torch.zeros((1, 27)),
-        _search_clip_index=torch.tensor([0]),
-        _search_frame_index=torch.tensor([0]),
+        _search_features=torch.stack(
+            (torch.zeros(27), torch.full((27,), -0.5))
+        )[:record_count],
+        _search_clip_index=torch.zeros(record_count, dtype=torch.long),
+        _search_frame_index=torch.zeros(record_count, dtype=torch.long),
         _source_row_map={(0, 0): 0},
     )
     reset_result = SimpleNamespace(
@@ -299,6 +348,102 @@ class TerrainSkillHorizonRolloutTest(unittest.TestCase):
 
 
 class ContinuationFirstMatcherTest(unittest.TestCase):
+    def test_phase_gated_command_change_preempts_single_support_chunk(self):
+        matcher, _grid = _transactional_fixture(
+            contact_phase_gate=True,
+            single_support=True,
+            two_candidate_runway=False,
+        )
+        matcher.config = MatcherConfig(exclusion_frames=0)
+        matcher.horizon_inventory.entry_frame[1] = 1
+        matcher.reset()
+        matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
+
+        with mock.patch(
+            "mm_sonic.torch_terrain_skill_horizon_rollout.predict_horizon_targets",
+            wraps=predict_horizon_targets,
+        ) as predict:
+            matcher.commit(matcher.prepare_step((0.0, 1.0), 0.0))
+
+        self.assertEqual(len(matcher.chunk_events), 2)
+        self.assertEqual(
+            matcher.chunk_events[-1].release_reason, "command_change"
+        )
+        self.assertTrue(
+            torch.equal(
+                predict.call_args.kwargs["current_velocity_world_xy"],
+                torch.tensor([0.0, 1.0]),
+            )
+        )
+
+    def test_global_search_prefers_candidate_with_coherent_runway(self):
+        matcher, _grid = _transactional_fixture(
+            continuous_skill_enabled=True,
+            two_candidate_runway=True,
+        )
+        matcher.reset()
+
+        matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
+
+        self.assertEqual(matcher.chunk_events[0].skill_index, 1)
+        self.assertEqual(matcher.chunk_events[0].selection_mode, "preferred")
+
+    def test_global_search_falls_back_when_no_candidate_has_runway(self):
+        matcher, _grid = _transactional_fixture(
+            continuous_skill_enabled=True,
+            two_candidate_runway=False,
+        )
+        matcher.reset()
+
+        matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
+
+        self.assertEqual(matcher.chunk_events[0].skill_index, 0)
+        self.assertEqual(
+            matcher.chunk_events[0].selection_mode, "immediate-fallback"
+        )
+
+    def test_global_search_rejects_runway_that_diverges_from_command(self):
+        matcher, _grid = _transactional_fixture(
+            continuous_skill_enabled=True,
+            two_candidate_runway=True,
+            runway_suffix_direction=(0.0, 1.0),
+        )
+        matcher.reset()
+
+        matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
+
+        self.assertEqual(matcher.chunk_events[0].skill_index, 0)
+        self.assertEqual(
+            matcher.chunk_events[0].selection_mode, "immediate-fallback"
+        )
+
+    def test_global_search_rejects_runway_that_creeps_under_moving_command(self):
+        matcher, _grid = _transactional_fixture(
+            continuous_skill_enabled=True,
+            two_candidate_runway=True,
+            runway_suffix_step_m=0.002,
+        )
+        matcher.reset()
+
+        matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
+
+        self.assertEqual(matcher.chunk_events[0].skill_index, 0)
+        self.assertEqual(
+            matcher.chunk_events[0].selection_mode, "immediate-fallback"
+        )
+
+    def test_default_off_keeps_cheapest_immediate_candidate(self):
+        matcher, _grid = _transactional_fixture(
+            continuous_skill_enabled=False,
+            two_candidate_runway=True,
+        )
+        matcher.reset()
+
+        matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
+
+        self.assertEqual(matcher.chunk_events[0].skill_index, 0)
+        self.assertEqual(matcher.chunk_events[0].selection_mode, "immediate")
+
     def test_same_nonzero_command_extends_before_global_search(self):
         matcher, grid = _transactional_fixture(continuous_skill_enabled=True)
         matcher.reset()

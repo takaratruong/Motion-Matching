@@ -478,6 +478,8 @@ def select_horizon_candidate(
     *,
     terrain_validator: TerrainHorizonValidator,
     preferred_validator: TerrainHorizonValidator | None = None,
+    maximum_preferred_cost_increase: float = math.inf,
+    maximum_preferred_outcome_cost_increase: float = math.inf,
     config: HorizonSearchConfig = HorizonSearchConfig(),
     current_clip_index: int | None = None,
     current_frame_index: int | None = None,
@@ -489,6 +491,13 @@ def select_horizon_candidate(
         preferred_validator is not None and not callable(preferred_validator)
     ):
         raise ContractError("horizon terrain validator must be callable")
+    if (
+        math.isnan(float(maximum_preferred_cost_increase))
+        or float(maximum_preferred_cost_increase) < 0.0
+        or math.isnan(float(maximum_preferred_outcome_cost_increase))
+        or float(maximum_preferred_outcome_cost_increase) < 0.0
+    ):
+        raise ContractError("preferred horizon cost budget is invalid")
     ranked = rank_horizon_candidates(
         database,
         inventory,
@@ -549,6 +558,10 @@ def select_horizon_candidate(
         )
 
     for values in diagnostics:
+        if fallback is not None and values[8] > (
+            fallback[0][8] + float(maximum_preferred_cost_increase)
+        ):
+            break
         record = int(values[0])
         row = int(inventory.entry_row[record].item())
         endpoint = int(inventory.endpoint_frame_exclusive[record].item())
@@ -559,6 +572,12 @@ def select_horizon_candidate(
                 )
             if fallback is None:
                 fallback = (values, record, row, endpoint)
+            if values[7] > (
+                fallback[0][7]
+                + float(maximum_preferred_outcome_cost_increase)
+            ):
+                preferred_rejected += 1
+                continue
             if preferred_validator(record, row, endpoint):
                 return build_result(
                     values, record, row, endpoint, selection_mode="preferred"

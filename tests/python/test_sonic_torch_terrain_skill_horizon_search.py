@@ -226,6 +226,36 @@ class HorizonRankingTest(unittest.TestCase):
         self.assertEqual(result.selection_mode, "immediate-fallback")
         self.assertEqual(result.rejected_by_reason["preferred"], 2)
 
+    def test_preferred_candidate_cannot_exceed_cost_regret_budget(self):
+        self.database._search_features[3].fill_(10.0)
+        result = select_horizon_candidate(
+            self.database,
+            self.inventory,
+            torch.zeros(27),
+            self.target,
+            terrain_validator=lambda _record, _row, _endpoint: True,
+            preferred_validator=lambda record, _row, _endpoint: record == 3,
+            maximum_preferred_cost_increase=1.0,
+        )
+
+        self.assertEqual(result.record_index, 2)
+        self.assertEqual(result.selection_mode, "immediate-fallback")
+
+    def test_preferred_candidate_must_remain_outcome_equivalent(self):
+        self.inventory.root_displacement_local_xy[3, 1] = 0.11
+        result = select_horizon_candidate(
+            self.database,
+            self.inventory,
+            torch.zeros(27),
+            self.target,
+            terrain_validator=lambda _record, _row, _endpoint: True,
+            preferred_validator=lambda record, _row, _endpoint: record == 3,
+            maximum_preferred_outcome_cost_increase=0.01,
+        )
+
+        self.assertEqual(result.record_index, 2)
+        self.assertEqual(result.selection_mode, "immediate-fallback")
+
 
 if __name__ == "__main__":
     unittest.main()
