@@ -420,6 +420,39 @@ class TerrainFootLockFilter:
         self._previous_support = support.clone()
         return self._copy_result(result, joints=solved, velocity=velocity)
 
+    def preview(self, results: Sequence[object]) -> tuple[object, ...]:
+        """Apply an isolated sequence without changing persistent lock state."""
+
+        snapshot = (
+            self._lock_position.clone(),
+            self._previous_support.clone(),
+            self._locked.clone(),
+            self._joint_offset.clone(),
+            (
+                None
+                if self._previous_joint_position is None
+                else self._previous_joint_position.clone()
+            ),
+            self._failure_count,
+        )
+        try:
+            return tuple(self.apply(result) for result in results)
+        finally:
+            (
+                lock_position,
+                previous_support,
+                locked,
+                joint_offset,
+                previous_joint_position,
+                failure_count,
+            ) = snapshot
+            self._lock_position.copy_(lock_position)
+            self._previous_support.copy_(previous_support)
+            self._locked.copy_(locked)
+            self._joint_offset.copy_(joint_offset)
+            self._previous_joint_position = previous_joint_position
+            self._failure_count = failure_count
+
 
 def build_terrain_foot_lock(
     resolved: object,

@@ -64,7 +64,10 @@ def _fixture(*, current_joint: float = 0.0, supported_entry: bool = True):
     return folder, skill, pose
 
 
-def _preview(*, current_joint: float = 0.0, supported_entry: bool = True):
+def _preview(
+    *, current_joint: float = 0.0, supported_entry: bool = True,
+    result_filter=None,
+):
     folder, skill, pose = _fixture(
         current_joint=current_joint, supported_entry=supported_entry
     )
@@ -80,6 +83,7 @@ def _preview(*, current_joint: float = 0.0, supported_entry: bool = True):
             points.shape[:-1], dtype=points.dtype, device=points.device
         ),
         config=TerrainContactFeasibilityConfig(),
+        result_filter=result_filter,
     )
 
 
@@ -101,6 +105,27 @@ class EmittedContactPreviewTest(unittest.TestCase):
 
         self.assertFalse(result.accepted)
         self.assertEqual(result.reason, "unsupported-entry")
+
+    def test_validates_the_filtered_pose_when_a_preview_filter_is_present(self):
+        class _ZeroJointPreview:
+            def preview(self, results):
+                return tuple(
+                    SimpleNamespace(
+                        **{
+                            **vars(result),
+                            "joint_position": torch.zeros_like(
+                                result.joint_position
+                            ),
+                        }
+                    )
+                    for result in results
+                )
+
+        result = _preview(
+            current_joint=0.2, result_filter=_ZeroJointPreview()
+        )
+
+        self.assertTrue(result.accepted)
 
 
 if __name__ == "__main__":

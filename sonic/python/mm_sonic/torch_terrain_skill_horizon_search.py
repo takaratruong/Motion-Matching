@@ -114,6 +114,7 @@ class HorizonSearchFailure(ContractError):
 
 
 TerrainHorizonValidator = Callable[[int, int, int], bool]
+RankedHorizonPrefilter = Callable[[torch.Tensor], torch.Tensor]
 
 
 def horizon_search_config_from_experiment(
@@ -480,6 +481,8 @@ def select_horizon_candidate(
     preferred_validator: TerrainHorizonValidator | None = None,
     maximum_preferred_cost_increase: float = math.inf,
     maximum_preferred_outcome_cost_increase: float = math.inf,
+    maximum_validated_candidates: int | None = None,
+    ranked_prefilter: RankedHorizonPrefilter | None = None,
     config: HorizonSearchConfig = HorizonSearchConfig(),
     current_clip_index: int | None = None,
     current_frame_index: int | None = None,
@@ -489,6 +492,8 @@ def select_horizon_candidate(
 
     if not callable(terrain_validator) or (
         preferred_validator is not None and not callable(preferred_validator)
+    ) or (
+        ranked_prefilter is not None and not callable(ranked_prefilter)
     ):
         raise ContractError("horizon terrain validator must be callable")
     if (
@@ -498,6 +503,11 @@ def select_horizon_candidate(
         or float(maximum_preferred_outcome_cost_increase) < 0.0
     ):
         raise ContractError("preferred horizon cost budget is invalid")
+    if maximum_validated_candidates is not None and (
+        type(maximum_validated_candidates) is not int
+        or maximum_validated_candidates < 1
+    ):
+        raise ContractError("maximum validated horizon candidates is invalid")
     ranked = rank_horizon_candidates(
         database,
         inventory,
@@ -510,7 +520,9 @@ def select_horizon_candidate(
     )
     terrain_rejected = 0
     preferred_rejected = 0
-    diagnostics = torch.stack(
+    shortlist_rejected = 0
+    prefilter_rejected = 0
+    diagnostics_tensor = torch.stack(
         (
             ranked.candidate_indices.to(torch.float64),
             ranked.entry_cost.to(torch.float64),
@@ -523,7 +535,19 @@ def select_horizon_candidate(
             ranked.total_cost.to(torch.float64),
         ),
         dim=1,
-    ).cpu().tolist()
+    )
+    if ranked_prefilter is not None:
+        keep = ranked_prefilter(ranked.candidate_indices)
+        if (
+            not isinstance(keep, torch.Tensor)
+            or keep.dtype != torch.bool
+            or tuple(keep.shape) != tuple(ranked.candidate_indices.shape)
+            or keep.device != ranked.candidate_indices.device
+        ):
+            raise ContractError("ranked horizon prefilter result is invalid")
+        prefilter_rejected = int((~keep).sum().item())
+        diagnostics_tensor = diagnostics_tensor[keep]
+    diagnostics = diagnostics_tensor.cpu().tolist()
     fallback: tuple[list[float], int, int, int] | None = None
 
     def build_result(
@@ -536,6 +560,10 @@ def select_horizon_candidate(
     ) -> TerrainSkillHorizonResult:
         rejected = dict(ranked.rejected_by_reason)
         rejected["terrain"] = terrain_rejected
+        if maximum_validated_candidates is not None:
+            rejected["shortlist"] = shortlist_rejected
+        if ranked_prefilter is not None:
+            rejected["prefilter"] = prefilter_rejected
         if preferred_validator is not None:
             rejected["preferred"] = preferred_rejected
         return TerrainSkillHorizonResult(
@@ -557,7 +585,13 @@ def select_horizon_candidate(
             selection_mode=selection_mode,
         )
 
-    for values in diagnostics:
+    for candidate_rank, values in enumerate(diagnostics):
+        if (
+            maximum_validated_candidates is not None
+            and candidate_rank >= maximum_validated_candidates
+        ):
+            shortlist_rejected = len(diagnostics) - candidate_rank
+            break
         if fallback is not None and values[8] > (
             fallback[0][8] + float(maximum_preferred_cost_increase)
         ):
@@ -596,4 +630,8 @@ def select_horizon_candidate(
         )
     rejected = dict(ranked.rejected_by_reason)
     rejected["terrain"] = terrain_rejected
+    if maximum_validated_candidates is not None:
+        rejected["shortlist"] = shortlist_rejected
+    if ranked_prefilter is not None:
+        rejected["prefilter"] = prefilter_rejected
     raise HorizonSearchFailure(rejected)

@@ -13,8 +13,10 @@ from mm_sonic.torch_terrain_skill_horizon_rollout import (
     terrain_height_targets,
 )
 from mm_sonic.torch_terrain_skill_horizon_search import (
+    HorizonSearchFailure,
     HorizonTargets,
     predict_horizon_targets,
+    select_horizon_candidate,
 )
 from mm_sonic.torch_terrain_skill_horizons import TerrainSkillHorizonInventory
 from mm_sonic.torch_terrain_skills import (
@@ -37,6 +39,9 @@ class _Alignment:
 class _ConstantGrid:
     def __init__(self):
         self.calls = 0
+        self.origin_xy = torch.tensor([-10.0, -10.0])
+        self.cell_size_m = 1.0
+        self.height_z = torch.zeros((21, 21))
 
     def sample_xy(self, points):
         self.calls += 1
@@ -365,6 +370,41 @@ class TerrainSkillHorizonRolloutTest(unittest.TestCase):
 
 
 class ContinuationFirstMatcherTest(unittest.TestCase):
+    def test_exhausted_global_search_delays_switch_to_safe_source_endpoint(self):
+        matcher, _grid = _transactional_fixture(
+            continuous_skill_enabled=True,
+        )
+        matcher.reset()
+        for _ in range(26):
+            matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
+
+        with mock.patch.object(
+            matcher, "_source_suffix_matches_command", return_value=False
+        ), mock.patch(
+            "mm_sonic.torch_terrain_skill_horizon_rollout.select_horizon_candidate",
+            side_effect=HorizonSearchFailure({"terrain": 1}),
+        ):
+            result = matcher.commit(
+                matcher.prepare_step((1.0, 0.0), 0.0)
+            )
+
+        self.assertEqual(result.diagnostics.selected_frame, 26)
+        self.assertEqual(len(matcher.continuation_events), 1)
+
+    def test_batched_terrain_prefilter_checks_full_supported_height_trace(self):
+        matcher, _grid = _transactional_fixture(two_candidate_runway=False)
+        first = matcher._surface_numpy[0].copy()
+        second = matcher._surface_numpy[1].copy()
+        second[5:] = 0.2
+        matcher._surface_numpy = (first, second)
+        result = matcher.reset()
+
+        compatible = matcher._terrain_profile_prefilter(
+            torch.tensor([0, 1], dtype=torch.long), result
+        )
+
+        self.assertEqual(compatible.tolist(), [True, False])
+
     def test_emitted_preview_rejects_invalid_cheaper_candidate(self):
         matcher, _grid = _transactional_fixture(
             two_candidate_runway=False,
@@ -398,9 +438,26 @@ class ContinuationFirstMatcherTest(unittest.TestCase):
         matcher.foot_kinematics = _JointHeightFootKinematics()
         matcher.reset()
 
-        matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
+        with mock.patch(
+            "mm_sonic.torch_terrain_skill_horizon_rollout.select_horizon_candidate",
+            wraps=select_horizon_candidate,
+        ) as select:
+            matcher.commit(matcher.prepare_step((1.0, 0.0), 0.0))
 
         self.assertEqual(matcher.chunk_events[0].skill_index, 1)
+        self.assertEqual(
+            select.call_args.kwargs["maximum_validated_candidates"], 64
+        )
+        self.assertTrue(callable(select.call_args.kwargs["ranked_prefilter"]))
+        self.assertEqual(
+            select.call_args.kwargs["maximum_preferred_cost_increase"], 0.0
+        )
+        self.assertEqual(
+            select.call_args.kwargs[
+                "maximum_preferred_outcome_cost_increase"
+            ],
+            0.0,
+        )
 
     def test_phase_gated_command_change_preempts_single_support_chunk(self):
         matcher, _grid = _transactional_fixture(

@@ -6,6 +6,7 @@ import torch
 from mm_sonic.torch_motion_features import FeatureNormalization, TorchMotionDatabase
 from mm_sonic.torch_motion_matcher import MatcherConfig
 from mm_sonic.torch_terrain_skill_horizon_search import (
+    HorizonSearchFailure,
     HorizonSearchConfig,
     HorizonTargets,
     predict_horizon_targets,
@@ -182,6 +183,43 @@ class HorizonRankingTest(unittest.TestCase):
         self.assertEqual(visited, [(2, 2, 30), (3, 3, 30)])
         self.assertEqual(result.record_index, 3)
         self.assertEqual(result.rejected_by_reason["terrain"], 1)
+
+    def test_validation_shortlist_fails_without_scanning_lower_ranked_candidates(self):
+        visited = []
+        with self.assertRaises(HorizonSearchFailure) as caught:
+            select_horizon_candidate(
+                self.database,
+                self.inventory,
+                torch.zeros(27),
+                self.target,
+                terrain_validator=lambda record, _row, _endpoint: (
+                    visited.append(record) is None and False
+                ),
+                maximum_validated_candidates=1,
+            )
+
+        self.assertEqual(visited, [2])
+        self.assertEqual(caught.exception.rejected_by_reason["terrain"], 1)
+        self.assertEqual(caught.exception.rejected_by_reason["shortlist"], 1)
+
+    def test_ranked_prefilter_removes_infeasible_candidates_before_validation(self):
+        visited = []
+        result = select_horizon_candidate(
+            self.database,
+            self.inventory,
+            torch.zeros(27),
+            self.target,
+            ranked_prefilter=lambda records: torch.tensor(
+                [False, True], device=records.device
+            ),
+            terrain_validator=lambda record, _row, _endpoint: (
+                visited.append(record) is None and True
+            ),
+        )
+
+        self.assertEqual(visited, [3])
+        self.assertEqual(result.record_index, 3)
+        self.assertEqual(result.rejected_by_reason["prefilter"], 1)
 
     def test_current_source_neighborhood_is_excluded(self):
         ranked = rank_horizon_candidates(

@@ -42,6 +42,38 @@ def _result(frame, root_x):
 
 
 class TerrainFootLockTests(unittest.TestCase):
+    def test_preview_restores_all_persistent_filter_state(self):
+        foot_lock = TerrainFootLockFilter(
+            clip_paths=("clip.npz",),
+            support_masks=(torch.ones((2, 2), dtype=torch.bool),),
+            foot_kinematics=_LinearFeet(),
+            sample_surface=lambda xy: torch.zeros(xy.shape[0]),
+            device=torch.device("cpu"),
+        )
+        foot_lock.apply(_result(0, 0.0))
+        before = (
+            foot_lock._lock_position.clone(),
+            foot_lock._previous_support.clone(),
+            foot_lock._locked.clone(),
+            foot_lock._joint_offset.clone(),
+            foot_lock._previous_joint_position.clone(),
+            foot_lock.failure_count,
+        )
+
+        preview = foot_lock.preview((_result(1, 0.1),))
+
+        self.assertEqual(len(preview), 1)
+        after = (
+            foot_lock._lock_position,
+            foot_lock._previous_support,
+            foot_lock._locked,
+            foot_lock._joint_offset,
+            foot_lock._previous_joint_position,
+        )
+        for expected, actual in zip(before[:-1], after):
+            self.assertTrue(torch.allclose(expected, actual, equal_nan=True))
+        self.assertEqual(foot_lock.failure_count, before[-1])
+
     def test_failed_solve_unlocks_until_the_next_contact(self):
         class _FailingFeet(_LinearFeet):
             def __init__(self):

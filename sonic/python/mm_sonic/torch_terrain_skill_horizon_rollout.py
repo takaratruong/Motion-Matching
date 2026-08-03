@@ -307,6 +307,29 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         self._support_by_clip = {
             skill.clip_index: skill.support_mask for skill in skill_inventory.skills
         }
+        self._support_numpy = tuple(
+            skill.support_mask.detach().cpu().numpy().astype(np.bool_, copy=False)
+            for skill in skill_inventory.skills
+        )
+        self._surface_numpy = tuple(
+            skill.foot_surface_height_m.detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32, copy=False)
+            for skill in skill_inventory.skills
+        )
+        self._horizon_skill_numpy = (
+            horizon_inventory.skill_index.detach().cpu().numpy()
+        )
+        self._horizon_entry_numpy = (
+            horizon_inventory.entry_frame.detach().cpu().numpy()
+        )
+        self._horizon_endpoint_numpy = (
+            horizon_inventory.endpoint_frame_exclusive.detach().cpu().numpy()
+        )
+        self._terrain_trace_cache: dict[
+            int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+        ] = {}
         self._pending = None
         self._skill_state = None
         self._last_result = None
@@ -324,6 +347,137 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         self._prepared_release_reason: str | None = None
         self._endpoint_warp_command = None
         self._endpoint_warp_command_enabled = False
+
+    def _terrain_trace(self, record: int):
+        cached = self._terrain_trace_cache.get(record)
+        if cached is not None:
+            return cached
+        skill_index = int(self._horizon_skill_numpy[record])
+        skill = self.inventory.skills[skill_index]
+        entry = int(self._horizon_entry_numpy[record])
+        endpoint = int(self._horizon_endpoint_numpy[record])
+        frames = np.arange(entry, endpoint, 5, dtype=np.int64)
+        last = endpoint - 1
+        if frames.size == 0 or int(frames[-1]) != last:
+            frames = np.concatenate((frames, np.asarray([last], np.int64)))
+        clip = self.dataset.folder.clips[skill.clip_index]
+        layout = self.dataset.folder.layout
+        root_index = int(layout.root_body_index)
+        feet_indices = (
+            int(layout.left_foot_body_index),
+            int(layout.right_foot_body_index),
+        )
+        root = np.asarray(
+            clip.body_position_world[entry, root_index], np.float32
+        )
+        quaternion = np.asarray(
+            clip.body_quaternion_world_wxyz[entry, root_index], np.float32
+        )
+        w, x, y, z = quaternion
+        source_yaw = math.atan2(
+            2.0 * float(w * z + x * y),
+            1.0 - 2.0 * float(y * y + z * z),
+        )
+        feet_xy = np.asarray(
+            clip.body_position_world[frames][:, feet_indices, :2], np.float32
+        )
+        delta = feet_xy - root[None, None, :2]
+        cosine = math.cos(source_yaw)
+        sine = math.sin(source_yaw)
+        local_xy = np.empty_like(delta)
+        local_xy[..., 0] = cosine * delta[..., 0] + sine * delta[..., 1]
+        local_xy[..., 1] = -sine * delta[..., 0] + cosine * delta[..., 1]
+        support = self._support_numpy[skill_index][frames]
+        if not bool(support.any()):
+            raise ContractError("terrain horizon trace has no support")
+        source_surface = self._surface_numpy[skill_index][frames]
+        first_supported = int(np.flatnonzero(support.any(axis=1))[0])
+        anchor_mask = support[first_supported]
+        source_anchor = float(source_surface[first_supported][anchor_mask].mean())
+        source_delta = source_surface - source_anchor
+        anchor_weight = np.zeros_like(source_surface, dtype=np.float32)
+        anchor_weight[first_supported, anchor_mask] = 1.0 / float(
+            anchor_mask.sum()
+        )
+        cached = (
+            np.ascontiguousarray(local_xy.reshape(-1, 2)),
+            np.ascontiguousarray(support.reshape(-1)),
+            np.ascontiguousarray(source_delta.reshape(-1)),
+            np.ascontiguousarray(anchor_weight.reshape(-1)),
+        )
+        self._terrain_trace_cache[record] = cached
+        return cached
+
+    def _terrain_profile_prefilter(
+        self, records: torch.Tensor, result: Any
+    ) -> torch.Tensor:
+        """Batch the full supported-foot height trace before pose preview."""
+
+        record_values = records.detach().cpu().numpy().astype(np.int64, copy=False)
+        if record_values.size == 0:
+            return torch.zeros_like(records, dtype=torch.bool)
+        local_parts = []
+        support_parts = []
+        source_parts = []
+        anchor_parts = []
+        candidate_parts = []
+        for candidate, record_value in enumerate(record_values.tolist()):
+            local, support, source, anchor = self._terrain_trace(record_value)
+            local_parts.append(local)
+            support_parts.append(support)
+            source_parts.append(source)
+            anchor_parts.append(anchor)
+            candidate_parts.append(
+                np.full(local.shape[0], candidate, dtype=np.int64)
+            )
+        device = self.database.device
+        local = torch.as_tensor(
+            np.concatenate(local_parts), dtype=torch.float32, device=device
+        )
+        support = torch.as_tensor(
+            np.concatenate(support_parts), dtype=torch.bool, device=device
+        )
+        source_delta = torch.as_tensor(
+            np.concatenate(source_parts), dtype=torch.float32, device=device
+        )
+        anchor_weight = torch.as_tensor(
+            np.concatenate(anchor_parts), dtype=torch.float32, device=device
+        )
+        candidate = torch.as_tensor(
+            np.concatenate(candidate_parts), dtype=torch.long, device=device
+        )
+        current_yaw = _yaw_from_wxyz(
+            result.root_orientation_world_wxyz
+        ).reshape(())
+        placed_xy = result.root_position_world[:2].unsqueeze(0) + _rotate_xy(
+            local, current_yaw
+        )
+        scene_xy = self.query_terrain.alignment.matcher_to_scene_xy(placed_xy)
+        grid = self.query_terrain.query_grid
+        origin = grid.origin_xy
+        ny, nx = grid.height_z.shape
+        maximum = origin + grid.cell_size_m * torch.tensor(
+            [nx - 1, ny - 1], dtype=torch.float32, device=device
+        )
+        inside = ((scene_xy >= origin) & (scene_xy <= maximum)).all(dim=1)
+        sampled = grid.sample_xy(torch.minimum(torch.maximum(scene_xy, origin), maximum))
+        candidate_count = int(record_values.size)
+        target_anchor = torch.zeros(
+            candidate_count, dtype=torch.float32, device=device
+        ).scatter_add_(0, candidate, sampled * anchor_weight)
+        error = torch.abs(
+            (sampled - target_anchor[candidate]) - source_delta
+        )
+        error = torch.where(support, error, torch.zeros_like(error))
+        error = torch.where(
+            support & ~inside,
+            torch.full_like(error, math.inf),
+            error,
+        )
+        maximum_error = torch.zeros(
+            candidate_count, dtype=torch.float32, device=device
+        ).scatter_reduce_(0, candidate, error, reduce="amax", include_self=True)
+        return maximum_error <= self.terrain_tolerance_m
 
     def _source_suffix_matches_command(
         self,
@@ -414,7 +568,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
         self._endpoint_warp_command_enabled = False
         return result
 
-    def _try_continue_skill(self, command):
+    def _try_continue_skill(self, command, *, require_command_match: bool = True):
         state = self._skill_state
         if not self.continuous_skill_enabled or state is None:
             return None
@@ -454,7 +608,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
             or int(stalls.max().item()) > self.maximum_continuation_stall_frames
         ):
             return None
-        if not self._source_suffix_matches_command(
+        if require_command_match and not self._source_suffix_matches_command(
             clip=clip,
             start_frame=start,
             endpoint_frame_exclusive=endpoint,
@@ -693,18 +847,21 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                     current_support, skill.support_mask[entry_frame]
                 ):
                     return False
-            if not terrain_skill_compatible(
-                skill=skill,
-                canonical_entry_row=row,
-                dataset=self.dataset,
-                database=self.database,
-                query_terrain=self.query_terrain,
-                current_root_position_world=result.root_position_world,
-                current_root_orientation_world_wxyz=result.root_orientation_world_wxyz,
-                tolerance_m=self.terrain_tolerance_m,
-                playback_stop=endpoint,
-            ):
-                return False
+            if not self.emitted_contact_preview_enabled:
+                if not terrain_skill_compatible(
+                    skill=skill,
+                    canonical_entry_row=row,
+                    dataset=self.dataset,
+                    database=self.database,
+                    query_terrain=self.query_terrain,
+                    current_root_position_world=result.root_position_world,
+                    current_root_orientation_world_wxyz=(
+                        result.root_orientation_world_wxyz
+                    ),
+                    tolerance_m=self.terrain_tolerance_m,
+                    playback_stop=endpoint,
+                ):
+                    return False
             if not self.emitted_contact_preview_enabled:
                 return True
 
@@ -729,6 +886,7 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                 foot_kinematics=self.foot_kinematics,
                 sample_surface=sample_query,
                 config=self.contact_feasibility_config,
+                result_filter=self.result_filter,
             )
             return validation.accepted
 
@@ -823,10 +981,26 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                     runway_compatible if prefer_runway else None
                 ),
                 maximum_preferred_cost_increase=(
-                    self.maximum_preferred_cost_increase
+                    0.0
+                    if self.emitted_contact_preview_enabled
+                    else self.maximum_preferred_cost_increase
                 ),
                 maximum_preferred_outcome_cost_increase=(
-                    self.maximum_preferred_outcome_cost_increase
+                    0.0
+                    if self.emitted_contact_preview_enabled
+                    else self.maximum_preferred_outcome_cost_increase
+                ),
+                maximum_validated_candidates=(
+                    64 if self.emitted_contact_preview_enabled else None
+                ),
+                ranked_prefilter=(
+                    (
+                        lambda records: self._terrain_profile_prefilter(
+                            records, result
+                        )
+                    )
+                    if self.emitted_contact_preview_enabled
+                    else None
                 ),
                 config=self.search_config,
                 current_clip_index=current_clip,
@@ -834,12 +1008,24 @@ class TerrainSkillHorizonMatcher(TerrainSkillMatcher):
                 matcher_config=self.config,
             )
 
+        search_failure = None
         try:
             selected = select(require_phase=current_support is not None)
-        except HorizonSearchFailure:
+        except HorizonSearchFailure as error:
             if current_support is None:
-                raise
-            selected = select(require_phase=False)
+                search_failure = error
+            else:
+                try:
+                    selected = select(require_phase=False)
+                except HorizonSearchFailure as fallback_error:
+                    search_failure = fallback_error
+        if search_failure is not None:
+            delayed_switch = self._try_continue_skill(
+                requested_command, require_command_match=False
+            )
+            if delayed_switch is not None:
+                return delayed_switch
+            raise search_failure
         skill_index = int(
             self.horizon_inventory.skill_index[selected.record_index].item()
         )

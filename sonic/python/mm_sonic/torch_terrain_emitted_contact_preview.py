@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any, Callable
 
 import numpy as np
@@ -44,6 +45,7 @@ def preview_emitted_contact_trace(
     foot_kinematics: Any,
     sample_surface: Callable[[torch.Tensor], torch.Tensor],
     config: TerrainContactFeasibilityConfig,
+    result_filter: Any | None = None,
 ) -> TerrainContactFeasibilityResult:
     """Advance an isolated skill and validate the kinematics it would emit."""
 
@@ -54,6 +56,10 @@ def preview_emitted_contact_trace(
         or not callable(getattr(foot_kinematics, "foot_positions", None))
         or not callable(sample_surface)
         or not isinstance(config, TerrainContactFeasibilityConfig)
+        or (
+            result_filter is not None
+            and not callable(getattr(result_filter, "preview", None))
+        )
     ):
         raise ContractError("emitted contact preview inputs are invalid")
     if not bool(skill.support_mask[selected_entry_frame].any().item()):
@@ -75,11 +81,39 @@ def preview_emitted_contact_trace(
     if not frames:
         raise ContractError("emitted contact preview produced no frames")
 
+    if result_filter is not None:
+        clip = folder.clips[skill.clip_index]
+        clip_path = str(getattr(clip, "relative_path", skill.clip_index))
+        raw_results = tuple(
+            SimpleNamespace(
+                joint_position=frame.joint_position,
+                joint_velocity=frame.joint_velocity,
+                root_position_world=frame.root_position_world,
+                root_orientation_world_wxyz=(
+                    frame.root_orientation_world_wxyz
+                ),
+                root_linear_velocity_world=frame.root_linear_velocity_world,
+                diagnostics=SimpleNamespace(
+                    selected_clip_path=clip_path,
+                    selected_frame=frame.source_frame,
+                ),
+            )
+            for frame in frames
+        )
+        try:
+            filtered = tuple(result_filter.preview(raw_results))
+        except Exception as error:
+            raise ContractError("emitted contact filter preview failed") from error
+        if len(filtered) != len(frames):
+            raise ContractError("emitted contact filter preview length is invalid")
+    else:
+        filtered = frames
+
     reference = current.joint_position
-    joints = torch.stack([frame.joint_position for frame in frames])
-    roots = torch.stack([frame.root_position_world for frame in frames])
+    joints = torch.stack([frame.joint_position for frame in filtered])
+    roots = torch.stack([frame.root_position_world for frame in filtered])
     orientations = torch.stack(
-        [frame.root_orientation_world_wxyz for frame in frames]
+        [frame.root_orientation_world_wxyz for frame in filtered]
     )
     try:
         feet_numpy = foot_kinematics.foot_positions(
