@@ -480,3 +480,284 @@ playback untouched, makes only a safely projected support leg immediate before
 the global output speed limiter, and leaves ordinary supported-leg correction
 soft. This removes the direct-touchdown speed-limit bypass without imposing the
 rejected hard task on every elevated contact.
+
+Shortening ordinary foot-lock decay is also rejected. With the projected leg
+still bounded at `12 rad/s`, `0.020 s` fails the crossing at frame 63 and
+`0.015 s` fails at frame 185; the retained `0.025 s` reaches frame 254. Faster
+ordinary correction changes transition reachability without solving the
+projected touchdown, so the half-life remains `0.025 s`.
+
+The `12 rad/s` projected-touchdown bound is itself too restrictive for the
+lateral rescue. It removes the former `19.625183 rad/s` snap, but also removes
+the exact-valid transition that completed the route. The bound is therefore an
+explicit offline and live-viewer parameter included in the configuration
+identity and result summary, rather than a hidden constant. The default remains
+conservative until a route-qualified recommendation is selected.
+
+At `16 rad/s`, the 15-degree contact-yaw crossing completes all 410 frames and
+passes the outcome contract. Total stance slide drops from `1.021976 m` in the
+unbounded v105 result to `0.779092 m`, lateral progress remains passing at
+`0.494908`, and peak joint speed is exactly `16 rad/s`. An independent full
+MuJoCo sole audit measures `-0.024954 m` minimum clearance and zero samples
+below `-0.025 m`. The 18 and 20 rad/s variants choose the same route outcome and
+improve slide by only `0.000130 m` and `0.000236 m`, respectively, while raising
+the peak to 18 and `19.625183 rad/s`.
+
+Refining the lower threshold finds a better sequence. Both 14 and 15 rad/s
+complete, but 13 rad/s reduces slide to `0.741733 m`, p95 root jerk to
+`865.941196 m/s^3`, and retains passing lateral progress at `0.490994`. The
+12.5 rad/s route also completes and reduces slide further to `0.726178 m`, but
+raises p95 jerk to `875.710489 m/s^3`; 12 rad/s fails. The retained default is
+therefore 13 rad/s: it has a 0.5 rad/s margin over the measured transition
+threshold and the best combined slide/jerk result. Its independent full-sole
+audit again has `-0.024954 m` minimum clearance and zero samples below
+`-0.025 m`.
+
+Allowing 30, 60, or 90 degrees of contact-frame yaw does not solve the on-stair
+180-degree turn. All three variants retain the exact frame-285 trajectory and
+failure boundary, with stance-height accounting for the majority of rejected
+candidates. The useful yaw fit remains capped at 15 degrees; the unresolved
+turn is not a rigid-placement-angle problem.
+
+Expanding the exact rescue shortlist from 512 to 2,048 also fails to solve that
+turn and regresses its boundary from frame 285 to frame 202 by selecting a
+different locally valid rescue. All 2,048 terminal candidates are still
+invalid: 853 fail stance height, 544 sole penetration, 453 landing edge margin,
+and 198 landing height. Search depth alone is therefore rejected. The local
+choice is non-monotonic and needs either entry-state reachability or successor
+feasibility, not a larger one-step shortlist.
+
+The lateral crossing remains asymmetric. The mirrored right-to-left route is
+bit-for-bit identical with 16 and 20 rad/s output bounds, stops at frame 266,
+and reaches only 0.555 commanded lateral progress. Its natural peak joint speed
+is 10.513 rad/s, proving that this boundary is not caused by the output-speed
+cap. `side-exit-upper-left` and `diagonal-down-left` both stop at frame 282;
+the former reaches only 0.252 exit progress and the latter moves against the
+command at -0.199 progress. The riser reversal emits all 390 frames but reaches
+only 0.051 reverse progress. These are distinct command/contact reachability
+failures rather than variants of the solved projected-touchdown snap.
+
+The wider representative slice adds one genuine success. At the 16 rad/s
+experimental bound, `side-mount-left` emits all 370 frames, passes both
+mount/continue-up segments, and has zero ankle penetration. Total stance slide
+is still 0.552 m and the montage remains crouched, so this is a reachability
+baseline rather than finished visual quality. An independent full-sole audit
+finds a -0.024954 m minimum and zero samples below -0.025 m.
+
+The same slice exposes two ranking defects. `diagonal-up-left` reaches frame
+179 and `diagonal-down-right` reaches frame 282 before all 512 rescue candidates
+fail; stance height accounts for 396 and 469 rejections respectively. The
+terrain-profile score averaged support-height fit across the full chunk, so a
+candidate with the wrong entry foot-height split could outrank an entry-valid
+candidate. An explicit contact-relative entry height-split score is rejected:
+it leaves both diagonal failures and the frame-303 90-degree-turn dead end
+unchanged, including the final 445 stance-height rejections. Separately,
+`turn-45-lower-left` emits all
+290 frames but finishes with 0.510 rad heading error: its 30-degree
+sign-consistency gate switches off before the 0.35 rad route contract is met.
+The 15-degree follow-up is bit-for-bit identical and is rejected. The gate is
+applied to bounded yaw change within each search horizon, not to total live
+heading error, so even a 0.510 rad residual can produce a sub-threshold local
+target. A 0.10 rad diagnostic improves final heading error from 0.510 to 0.432
+rad and slide from 0.528 to 0.416 m, but still fails both heading and lateral
+drift while reducing pivot progress from 0.469 to 0.366. It remains an
+unqualified diagnostic pending a clean lower-threshold comparison.
+
+At the retained 13 rad/s bound, `turn-90-middle-left` reaches frame 303 with
+passing 0.495 pivot progress and only 0.128 rad heading error, then exhausts its
+successors; 445 of the final 512 exact candidates fail stance height. This is
+not a turning-direction failure like the 45-degree threshold issue. It is a
+post-turn contact-state dead end. The rejected entry-height term does not alter
+its path or failure boundary.
+
+The original `riser-stop-restart` contract produces a false positive. It emits
+all 290 frames, safely restarts with 0.526 progress, and has zero full-sole
+samples below -0.025 m, but visual inspection shows the matcher finishing a
+high-knee chunk throughout most of the 30-frame stop window. Root drift during
+the nominal stop is 0.202 m. The benchmark now measures maximum displacement
+from the start of every zero-velocity segment and caps it at 0.05 m; under that
+corrected contract the route fails `segment:stop-at-riser:stopped-drift`. This
+is evidence for a short stop-specific horizon or safe touchdown-and-hold path,
+not a reason to report the old matrix flag as success.
+
+A transactional double-support hold does not solve that benchmark. The stop
+arrives 13 frames into a 70-frame source chunk, and its remaining source frames
+contain no double-support boundary during the entire 30-frame stop command.
+The experiment is metric-identical at 0.202 m stopped drift and is removed.
+Stopping therefore requires an interruptible landing retarget or a shorter
+contact chunk; freezing at an already-safe boundary is insufficient.
+
+Relaxing the existing safe-runway preference is also rejected. Increasing its
+total/outcome cost budgets from 1.0/0.05 to 8.0/2.0 and then 100/100 leaves
+`diagonal-down-right` bit-for-bit identical: both variants stop at frame 282
+with the same negative -0.507 progress and 469 stance-height rejections. A
+same-clip safe runway was already preferred wherever one existed; the missing
+post-command contact transition is not hidden below the preference budget.
+The temporary CLI controls are removed.
+
+Validating the emitted same-source successor before assigning runway
+preference is also rejected. On `side-mount-right` it moves the failure from
+frame 266 to frame 230, reduces mount progress from 0.085 to zero, and never
+engages the stair. Requiring a safe same-source continuation is not equivalent
+to general successor reachability because a valid next chunk may switch clips.
+The approximation cannot be promoted to a hard preference condition.
+
+The retained corpus has 760 clips, while the authenticated GRAIL inventory
+contains 13,957 records. A full corpus is being built in a separate artifact
+for a coverage comparison. It does not replace the qualified corpus unless it
+improves the same adversarial route contracts and visual checks.
+
+This diagnosis is consistent with the newer Terrain Consistent
+Reference-Guided RL result: its terrain adaptation projects desired footsteps
+onto valid footholds and adjusts swing-foot and center-of-mass trajectories as
+one synthesis problem, rather than repairing only a root path or only an ankle
+after selection: https://arxiv.org/abs/2605.15517. Together with TCRS, this
+supports retaining exact contact-aware ranking now while treating coupled
+foothold/swing/root synthesis as the next representation-level step.
+
+The clean `0.05 rad` local turn-gate comparison is rejected. Like the earlier
+`0.10 rad` diagnostic it completes all 290 frames, but it still fails final
+heading at `0.431863 rad` and lateral drift while reducing pivot progress from
+`0.46888` to `0.365713`. The experimental CLI override is removed; a smaller
+per-horizon sign gate does not control the accumulated live heading error.
+
+Softly ranking candidates against a stable two-foothold query plan is also
+rejected. It changes `side-mount-right` from the retained frame-266 failure
+with `0.084705` mount progress to a frame-232 failure with zero progress. More
+decisively, it changes the passing 370-frame `side-mount-left` control into a
+frame-229 failure with zero progress. The selected early foothold is locally
+stable but leaves no feasible successor. Both handedness results reproduce the
+local-foothold-versus-reachability trap; the implementation is removed.
+
+The next structural ablation exposes supported single-support source entries
+while retaining exact support-pattern gating and the complete emitted sole,
+landing, edge, and contact checks. The default inventory remains restricted to
+stable entries. This tests whether the present double-support-only inventory,
+rather than another scalar cost, causes delayed stops and freezes by making an
+active half-step impossible to replace with a phase-compatible remainder.
+
+Unrestricted single-support entry ranking is rejected. It moves
+`side-mount-right` from frame 266 to 300, increases mount-direction progress
+from `0.084705` to `0.416032`, and reduces slide from `0.376412 m` to
+`0.150287 m`, but never establishes an elevated contact and stops at the first
+riser. The montage confirms a cleaner approach followed by an exact-contact
+dead end. More importantly, it regresses both established controls:
+`side-mount-left` and `cross-tread-left-to-right` stop at the identical frame
+153 with no terrain engagement, instead of completing 370 and 410 frames.
+Immediate validity of an arbitrary mid-step replacement is therefore not
+enough.
+
+The narrowed follow-up exposes those entries only for a zero-speed command.
+Every moving search prefilters back to the original double-support records
+before the exact shortlist, preserving their relative order; the broader set
+is visible only when attempting to stop mid-step. This directly isolates the
+`0.202 m` stopped-drift failure without changing moving command selection.
+
+The first narrowed build still regressed both moving controls at frame 227.
+The selection mask was correct, but inventory construction assigned newly
+added single-support rows before later stable skills claimed their canonical
+rows; overlapping row ownership therefore changed the original stable
+inventory underneath the mask. The corrected builder now constructs and
+freezes the complete default inventory first, asserts its owners through unit
+coverage, and only then assigns previously unowned stop rows. The stop and
+controls are rerun from this behavior-preserving inventory.
+
+That owner-preserving pass revealed that canonical pre-skill entries are not
+all double support; filtering by contact label still removed intentional
+baseline records. The final isolation therefore carries explicit canonical
+row provenance from inventory construction into every horizon record. Moving
+commands accept that exact original set, while stopped commands may also use
+the newly added rows. Contact state is no longer used as a proxy for record
+provenance.
+
+The explicit-provenance version is also rejected and removed. The stop route
+regresses from 290 emitted frames to a frame-190 exact-contact failure, and the
+passing cross-tread control regresses from 410 to frame 253. Side-mount-left
+still completes its 370-frame control, so this is not a loader or general
+execution failure. Enlarging the inventory changes the globally ranked
+shortlist even when non-canonical moving records are filtered afterward; more
+importantly, the added stop records still do not provide a valid landing-and-
+hold successor. This closes the mid-step-entry experiment rather than leaving
+an unqualified mode in the runner.
+
+The full authenticated corpus build completed with 12,646 accepted clips and
+1,312 rejected records, compared with 760 clips in the curated corpus. The
+next coverage ablation searches that complete horizon inventory with
+same-skill continuation preference disabled. The source-neighborhood
+exclusion remains only a ±20-frame anti-self-match rule; candidate ranking is
+otherwise global across all clips. Outcomes remain expressed in the
+character-heading frame so clips are reusable at arbitrary world poses.
+
+The first literal full-corpus query exhausts a 46 GB GPU before emitting frame
+one. Ranking itself fits, but the emitted-terrain prefilter expands every
+globally ranked record's support, sole, and landing traces before applying the
+64-candidate exact-validation budget; one attempted allocation alone is
+2.185 GB after the device is nearly full. This is a layered-retrieval defect,
+not evidence against global coverage. The prefilter is changed to consume
+stable ranked batches and stop as soon as the exact-validation shortlist is
+full. Unit coverage requires that a one-record shortlist never evaluates a
+second ranked prefilter batch. Full-corpus qualification is rerun only through
+that bounded retrieval path.
+
+Here “global sequence search” means more than a global candidate inventory.
+The retained matcher still commits the cheapest one-step exact-valid chunk,
+which can end at a state with no valid next chunk. The proposed next layer
+keeps a bounded beam of exact-valid first chunks, rolls each to its emitted
+terminal pose, and ranks the first edge by its own cost plus the best valid
+successor cost. This directly tests the repeated locally-valid/global-dead-end
+diagnosis without changing the terrain coordinate convention.
+
+Disabling coherent continuation is not a valid proxy for global search. On the
+760-clip corpus, that ablation regresses `turn-90-middle-left` from the retained
+frame-303 boundary to frame 122 with only three chunks; 473 of the final 512
+exact candidates fail stance height. The global mode therefore preserves a
+safe same-skill continuation under an unchanged command. At a required
+boundary search it evaluates a bounded set of exact-valid first edges, rolls
+each through the retained output filter to obtain its terminal pose, performs
+a general cross-clip successor search from that pose, and minimizes first-edge
+plus successor cost. The second edge uses the exact source terrain/contact
+contract as a feasibility approximation; the committed first edge still uses
+the full emitted foot/sole validator.
+
+Bounded layered retrieval makes the 12,646-clip corpus executable, but the
+coverage result is negative. With continuation disabled, the full corpus fails
+`turn-90-middle-left` at frame 121 with four chunks, compared with frame 122
+and three chunks for the 760-clip corpus. At the terminal search, 235 of the
+512 exact candidates fail landing edge margin, 145 stance height, 91 landing
+height, and 41 sole penetration. The extra corpus therefore changes the local
+choice but does not create a useful route; the qualified dataset is not
+replaced. The layered prefilter remains a general scalability correction.
+
+Four-wide two-edge sequence scoring with turn-boundary replanning is also not
+sufficient. It reaches the same frame-303 boundary as the retained greedy
+turn, with seven committed chunks, then finds zero emitted-valid first edges
+among the 512 rescue records: 440 fail stance height, 55 sole penetration, 14
+landing height, and 3 landing edge margin. The approximate second edge judged
+earlier endpoints to have source-compatible successors, but those successors
+did not preserve emitted foot/sole feasibility when reached. A useful global
+planner must therefore carry the output-filter/contact state across both
+edges, not only roll the first edge exactly and validate the second against
+its source trace.
+
+The final global ablation does carry that state. For each exact-valid first
+edge, it generates the second edge from the first edge's filtered terminal
+pose, previews both raw edge sequences through one isolated foot-lock/IK state
+machine, discards the filtered prefix, and applies the full emitted
+foot/sole/contact validator to the second edge. Beam width is fixed at two for
+the first qualification; second-edge exact shortlist widths 8 and 16 run in
+parallel. The prefix contract has direct unit coverage proving that prefix
+frames advance filter state without entering the second-edge validation
+window.
+
+That exact two-edge version is rejected as well. With beam width two and eight
+exact emitted successor candidates per branch, it still reaches frame 303 and
+then has zero emitted-valid outgoing edges: 443 fail stance height, 55 sole
+penetration, 13 landing height, and 1 landing edge margin. A 16-successor run
+is stopped after the 8-successor result because deeper successor evaluation
+cannot help at a node whose current-edge rescue contains no valid action. The
+global CLI, chained-preview API, and sequence-selection surface are removed;
+only the independently qualified batched prefilter remains. The experiment
+shows that lookahead over the current double-support chunk graph cannot repair
+this turn. The next representation must make a different action available
+before frame 303: shorter interruptible contact actions or coupled
+foothold/swing/root synthesis.

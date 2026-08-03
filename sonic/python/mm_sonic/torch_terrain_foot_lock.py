@@ -58,7 +58,7 @@ class TerrainFootLockFilter:
         root_height_correction_halflife_s: float | None = None,
         terrain_base_m: float | None = None,
         maximum_joint_correction_rad: float = 0.35,
-        maximum_output_joint_speed_rad_s: float = 12.0,
+        maximum_output_joint_speed_rad_s: float = 13.0,
         swing_clearance_margin_m: float | None = None,
         swing_plan_sigma_frames: float | None = None,
         touchdown_projection_max_shift_m: float | None = None,
@@ -911,6 +911,7 @@ def build_terrain_foot_lock(
     *,
     swing_clearance_margin_m: float | None = None,
     correction_halflife_s: float = 0.04,
+    maximum_output_joint_speed_rad_s: float = 13.0,
     root_height_correction_halflife_s: float | None = None,
     swing_plan_sigma_frames: float | None = None,
     touchdown_projection_max_shift_m: float | None = None,
@@ -979,6 +980,7 @@ def build_terrain_foot_lock(
         device=device,
         swing_clearance_margin_m=swing_clearance_margin_m,
         correction_halflife_s=correction_halflife_s,
+        maximum_output_joint_speed_rad_s=maximum_output_joint_speed_rad_s,
         root_height_correction_halflife_s=(
             root_height_correction_halflife_s
         ),

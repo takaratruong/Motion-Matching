@@ -373,6 +373,30 @@ class OmnidirectionalRolloutContractTests(unittest.TestCase):
         self.assertFalse(outcome.completed)
         self.assertIn("moving-command:stall", outcome.failure_reasons)
 
+    def test_route_outcome_rejects_drift_during_stopped_command(self):
+        route = OmniRoute(
+            "drifting-stop",
+            (RouteCommand((0.0, 0.0), 0.0, 5, "stop", True),),
+            "mixed",
+            RouteOutcomeContract(maximum_stopped_segment_drift_m=0.05),
+        )
+        root = np.zeros((5, 3))
+        root[:, 0] = np.linspace(0.0, 0.20, 5)
+        arrays = {
+            "root_position_world": root,
+            "root_yaw_world": np.zeros(5),
+            "command_velocity_world_xy": np.zeros((5, 2)),
+            "command_heading_world_yaw": np.zeros(5),
+            "command_segment_index": np.zeros(5, dtype=np.int32),
+            "foot_surface_height_m": np.zeros((5, 2)),
+        }
+
+        outcome = evaluate_route_outcome(route, arrays)
+
+        self.assertFalse(outcome.completed)
+        self.assertIn("segment:stop:stopped-drift", outcome.failure_reasons)
+        self.assertEqual(outcome.stopped_segment_drift_m, (("stop", 0.20),))
+
     def test_matrix_pass_requires_behavioral_outcome_completion(self):
         route = OmniRoute(
             "cannot-mount",

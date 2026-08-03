@@ -1,12 +1,17 @@
+import io
 import json
 import math
 import unittest
+from contextlib import redirect_stdout
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from mm_sonic.torch_terrain_skill_horizon_rollout import HorizonChunkEvent
 from mm_sonic.torch_terrain_skill_horizon_search import HorizonCost
 from resources.run_g1_torch_multi_horizon_skills import (
     build_parser,
     canonical_chunk_events,
+    main,
     search_config_from_experiment,
     select_routes,
 )
@@ -51,6 +56,7 @@ class MultiHorizonSkillsCliTest(unittest.TestCase):
             args.minimum_endpoint_warp_velocity_heading_alignment, -1.0
         )
         self.assertEqual(args.foot_correction_halflife_s, 0.04)
+        self.assertEqual(args.maximum_output_joint_speed_rad_s, 13.0)
         self.assertIsNone(args.root_height_correction_halflife_s)
         self.assertIsNone(args.touchdown_projection_max_shift_m)
         self.assertFalse(args.anticipatory_touchdown_projection)
@@ -67,6 +73,7 @@ class MultiHorizonSkillsCliTest(unittest.TestCase):
                 "--swing-clearance-margin-m", "0.01",
                 "--swing-plan-sigma-frames", "4.0",
                 "--foot-correction-halflife-s", "0.02",
+                "--maximum-output-joint-speed-rad-s", "16.0",
                 "--root-height-correction-halflife-s", "0.05",
                 "--touchdown-projection-max-shift-m", "0.05",
                 "--anticipatory-touchdown-projection",
@@ -93,6 +100,7 @@ class MultiHorizonSkillsCliTest(unittest.TestCase):
         self.assertEqual(locked.swing_clearance_margin_m, 0.01)
         self.assertEqual(locked.swing_plan_sigma_frames, 4.0)
         self.assertEqual(locked.foot_correction_halflife_s, 0.02)
+        self.assertEqual(locked.maximum_output_joint_speed_rad_s, 16.0)
         self.assertEqual(locked.root_height_correction_halflife_s, 0.05)
         self.assertEqual(locked.touchdown_projection_max_shift_m, 0.05)
         self.assertTrue(locked.anticipatory_touchdown_projection)
@@ -122,6 +130,49 @@ class MultiHorizonSkillsCliTest(unittest.TestCase):
             select_routes(["diagonal-down-left", "diagonal-down-left"], False)
         with self.assertRaisesRegex(ValueError, "unknown"):
             select_routes(["does-not-exist"], False)
+
+    def test_main_propagates_output_speed_cap_to_rollout_and_summary(self):
+        matrix = SimpleNamespace(
+            runs=[SimpleNamespace(completed_without_exception=True)],
+            matrix_pass=True,
+            deterministic_sha256="matrix-sha",
+        )
+        output = io.StringIO()
+        module = "resources.run_g1_torch_multi_horizon_skills"
+        with (
+            patch(f"{module}.load_experiment_config", return_value={}),
+            patch(
+                f"{module}.search_config_from_experiment",
+                return_value=SimpleNamespace(turn_gate_rad=0.5),
+            ),
+            patch(f"{module}.resolve_stair_config", return_value="resolved"),
+            patch(
+                f"{module}.run_resolved_horizon_matrix",
+                return_value=(matrix, {"route": ()}),
+            ) as run_matrix,
+            patch(f"{module}.save_horizon_matrix"),
+            redirect_stdout(output),
+        ):
+            return_code = main(
+                [
+                    "--dataset", "data",
+                    "--config", "config.json",
+                    "--g1-xml", "g1.xml",
+                    "--output", "out",
+                    "--device", "cuda:3",
+                    "--maximum-output-joint-speed-rad-s", "16.0",
+                ]
+            )
+
+        self.assertEqual(return_code, 0)
+        self.assertEqual(
+            run_matrix.call_args.kwargs["maximum_output_joint_speed_rad_s"],
+            16.0,
+        )
+        self.assertEqual(
+            json.loads(output.getvalue())["maximum_output_joint_speed_rad_s"],
+            16.0,
+        )
 
     def test_search_config_is_strict_and_pins_horizons(self):
         descriptor = {

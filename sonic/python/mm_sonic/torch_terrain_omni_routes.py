@@ -49,6 +49,7 @@ class RouteOutcomeContract:
     final_heading_error_max_rad: float | None = None
     final_command_lateral_drift_max_m: float | None = None
     maximum_moving_stall_frames: int | None = None
+    maximum_stopped_segment_drift_m: float | None = None
 
 
 @dataclass(frozen=True)
@@ -97,6 +98,7 @@ def _route(
                 final_command_lateral_drift_max_m
             ),
             maximum_moving_stall_frames=10,
+            maximum_stopped_segment_drift_m=0.05,
         ),
     )
 

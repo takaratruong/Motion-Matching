@@ -88,6 +88,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Inertialization halflife for terrain foot corrections.",
     )
     parser.add_argument(
+        "--maximum-output-joint-speed-rad-s",
+        type=float,
+        default=13.0,
+        help="Maximum emitted joint speed after terrain correction.",
+    )
+    parser.add_argument(
         "--root-height-correction-halflife-s",
         type=float,
         default=None,
@@ -322,6 +328,9 @@ def main(argv: list[str] | None = None) -> int:
         ),
         swing_clearance_margin_m=args.swing_clearance_margin_m,
         foot_correction_halflife_s=args.foot_correction_halflife_s,
+        maximum_output_joint_speed_rad_s=(
+            args.maximum_output_joint_speed_rad_s
+        ),
         root_height_correction_halflife_s=(
             args.root_height_correction_halflife_s
         ),
@@ -361,6 +370,7 @@ def main(argv: list[str] | None = None) -> int:
                 "route_count": len(matrix.runs),
                 "chunk_count": sum(len(values) for values in events.values()),
                 "ablation": args.ablation,
+                "turn_gate_rad": search_config.turn_gate_rad,
                 "foot_lock": args.foot_lock,
                 "contact_phase_gate": args.contact_phase_gate,
                 "continuous_skill": args.continuous_skill,
@@ -373,6 +383,9 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 "swing_clearance_margin_m": args.swing_clearance_margin_m,
                 "foot_correction_halflife_s": args.foot_correction_halflife_s,
+                "maximum_output_joint_speed_rad_s": (
+                    args.maximum_output_joint_speed_rad_s
+                ),
                 "root_height_correction_halflife_s": (
                     args.root_height_correction_halflife_s
                 ),

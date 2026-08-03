@@ -55,6 +55,7 @@ class RouteOutcomeEvaluation:
     elevated_foot_sample_count: int
     final_heading_error_rad: float
     failure_reasons: tuple[str, ...]
+    stopped_segment_drift_m: tuple[tuple[str, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -105,7 +106,7 @@ def evaluate_route_outcome(
         raise ValueError("route outcome arrays are invalid")
     if frame_count == 0:
         return RouteOutcomeEvaluation(
-            False, (), 0, math.inf, ("no-frames",)
+            False, (), 0, math.inf, ("no-frames",), ()
         )
 
     reasons: list[str] = []
@@ -207,12 +208,32 @@ def evaluate_route_outcome(
         if longest > int(stall_limit):
             reasons.append("moving-command:stall")
 
+    stopped_drifts: list[tuple[str, float]] = []
+    stopped_drift_limit = route.outcome.maximum_stopped_segment_drift_m
+    if stopped_drift_limit is not None:
+        for index, command in enumerate(route.commands):
+            if math.hypot(*command.velocity_stair_xy) > 1.0e-8:
+                continue
+            frames = np.flatnonzero(segment_index == index)
+            if frames.size < 2:
+                drift = math.inf
+            else:
+                drift = float(
+                    np.linalg.norm(
+                        root[frames, :2] - root[frames[0], :2], axis=1
+                    ).max()
+                )
+            stopped_drifts.append((command.segment, drift))
+            if drift > float(stopped_drift_limit):
+                reasons.append(f"segment:{command.segment}:stopped-drift")
+
     return RouteOutcomeEvaluation(
         completed=not reasons,
         segment_progress_ratio=tuple(ratios),
         elevated_foot_sample_count=elevated_count,
         final_heading_error_rad=final_heading_error,
         failure_reasons=tuple(reasons),
+        stopped_segment_drift_m=tuple(stopped_drifts),
     )
 
 
@@ -322,6 +343,15 @@ def _hash_run(
                     "final_surface": route.outcome.final_surface,
                     "final_heading_error_max_rad": (
                         route.outcome.final_heading_error_max_rad
+                    ),
+                    "final_command_lateral_drift_max_m": (
+                        route.outcome.final_command_lateral_drift_max_m
+                    ),
+                    "maximum_moving_stall_frames": (
+                        route.outcome.maximum_moving_stall_frames
+                    ),
+                    "maximum_stopped_segment_drift_m": (
+                        route.outcome.maximum_stopped_segment_drift_m
                     ),
                 },
                 "commands": [
@@ -890,6 +920,10 @@ def _outcome_json(outcome: RouteOutcomeEvaluation) -> dict:
         ],
         "elevated_foot_sample_count": outcome.elevated_foot_sample_count,
         "final_heading_error_rad": outcome.final_heading_error_rad,
+        "stopped_segment_drift_m": [
+            {"segment": segment, "drift_m": drift}
+            for segment, drift in outcome.stopped_segment_drift_m
+        ],
         "failure_reasons": list(outcome.failure_reasons),
     }
 

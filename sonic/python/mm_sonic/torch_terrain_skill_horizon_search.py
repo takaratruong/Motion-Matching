@@ -490,6 +490,7 @@ def select_horizon_candidate(
     maximum_preferred_outcome_cost_increase: float = math.inf,
     maximum_validated_candidates: int | None = None,
     ranked_prefilter: RankedHorizonPrefilter | None = None,
+    ranked_prefilter_batch_size: int = 4096,
     ranked_height_cost: RankedHorizonHeightCost | None = None,
     apply_surface_gate: bool = True,
     config: HorizonSearchConfig = HorizonSearchConfig(),
@@ -519,6 +520,11 @@ def select_horizon_candidate(
         or maximum_validated_candidates < 1
     ):
         raise ContractError("maximum validated horizon candidates is invalid")
+    if (
+        type(ranked_prefilter_batch_size) is not int
+        or ranked_prefilter_batch_size < 1
+    ):
+        raise ContractError("ranked horizon prefilter batch size is invalid")
     ranked = rank_horizon_candidates(
         database,
         inventory,
@@ -568,16 +574,52 @@ def select_horizon_candidate(
             torch.argsort(diagnostics_tensor[:, 8], stable=True)
         ]
     if ranked_prefilter is not None:
-        keep = ranked_prefilter(ranked.candidate_indices)
+        filtered = []
+        visited = 0
+        kept = 0
+        target = maximum_validated_candidates
+        ordered_records = diagnostics_tensor[:, 0].to(torch.long)
+        total_records = int(ordered_records.shape[0])
+        cursor = 0
+        while cursor < total_records:
+            if target is not None and kept >= target:
+                break
+            batch_size = ranked_prefilter_batch_size
+            if target is not None:
+                batch_size = min(batch_size, target - kept)
+            start = cursor
+            stop = min(
+                start + batch_size,
+                total_records,
+            )
+            records = ordered_records[start:stop]
+            keep = ranked_prefilter(records)
+            if (
+                not isinstance(keep, torch.Tensor)
+                or keep.dtype != torch.bool
+                or tuple(keep.shape) != tuple(records.shape)
+                or keep.device != records.device
+            ):
+                raise ContractError(
+                    "ranked horizon prefilter result is invalid"
+                )
+            cursor = stop
+            visited = stop
+            prefilter_rejected += int((~keep).sum().item())
+            accepted = diagnostics_tensor[start:stop][keep]
+            if int(accepted.shape[0]) > 0:
+                filtered.append(accepted)
+                kept += int(accepted.shape[0])
+        diagnostics_tensor = (
+            torch.cat(filtered, dim=0)
+            if filtered
+            else diagnostics_tensor[:0]
+        )
         if (
-            not isinstance(keep, torch.Tensor)
-            or keep.dtype != torch.bool
-            or tuple(keep.shape) != tuple(ranked.candidate_indices.shape)
-            or keep.device != ranked.candidate_indices.device
+            maximum_validated_candidates is not None
+            and visited < total_records
         ):
-            raise ContractError("ranked horizon prefilter result is invalid")
-        prefilter_rejected = int((~keep).sum().item())
-        diagnostics_tensor = diagnostics_tensor[keep]
+            shortlist_rejected = total_records - visited
     diagnostics = diagnostics_tensor.cpu().tolist()
     fallback: tuple[list[float], int, int, int] | None = None
 

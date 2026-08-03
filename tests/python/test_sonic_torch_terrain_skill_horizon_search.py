@@ -267,6 +267,29 @@ class HorizonRankingTest(unittest.TestCase):
         self.assertEqual(result.record_index, 3)
         self.assertEqual(result.rejected_by_reason["prefilter"], 1)
 
+    def test_ranked_prefilter_stops_when_validation_shortlist_is_full(self):
+        prefiltered = []
+        visited = []
+        result = select_horizon_candidate(
+            self.database,
+            self.inventory,
+            torch.zeros(27),
+            self.target,
+            ranked_prefilter=lambda records: (
+                prefiltered.append(records.detach().cpu().tolist())
+                or torch.ones_like(records, dtype=torch.bool)
+            ),
+            terrain_validator=lambda record, _row, _endpoint: (
+                visited.append(record) is None and True
+            ),
+            maximum_validated_candidates=1,
+        )
+
+        self.assertEqual(prefiltered, [[2]])
+        self.assertEqual(visited, [2])
+        self.assertEqual(result.record_index, 2)
+        self.assertEqual(result.rejected_by_reason["shortlist"], 1)
+
     def test_ranked_height_cost_prioritizes_candidate_specific_terrain(self):
         visited = []
         result = select_horizon_candidate(
@@ -299,6 +322,30 @@ class HorizonRankingTest(unittest.TestCase):
             ),
             places=6,
         )
+
+    def test_prefilter_receives_height_reranked_records(self):
+        prefiltered = []
+        result = select_horizon_candidate(
+            self.database,
+            self.inventory,
+            torch.zeros(27),
+            self.target,
+            ranked_height_cost=lambda records: torch.where(
+                records == 2,
+                torch.full_like(records, 1.0, dtype=torch.float32),
+                torch.zeros_like(records, dtype=torch.float32),
+            ),
+            ranked_prefilter=lambda records: (
+                prefiltered.append(records.detach().cpu().tolist())
+                or torch.ones_like(records, dtype=torch.bool)
+            ),
+            terrain_validator=lambda _record, _row, _endpoint: True,
+            maximum_validated_candidates=1,
+            ranked_prefilter_batch_size=1,
+        )
+
+        self.assertEqual(prefiltered, [[3]])
+        self.assertEqual(result.record_index, 3)
 
     def test_current_source_neighborhood_is_excluded(self):
         ranked = rank_horizon_candidates(

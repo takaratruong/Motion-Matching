@@ -1982,6 +1982,7 @@ def run_resolved_horizon_matrix(
     maximum_emitted_contact_rescue_candidates: int | None = None,
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
+    maximum_output_joint_speed_rad_s: float = 13.0,
     root_height_correction_halflife_s: float | None = None,
     touchdown_projection_max_shift_m: float | None = None,
     anticipatory_touchdown_projection: bool = False,
@@ -2066,6 +2067,9 @@ def run_resolved_horizon_matrix(
             sole_kinematics,
             swing_clearance_margin_m=swing_clearance_margin_m,
             correction_halflife_s=foot_correction_halflife_s,
+            maximum_output_joint_speed_rad_s=(
+                maximum_output_joint_speed_rad_s
+            ),
             root_height_correction_halflife_s=(
                 root_height_correction_halflife_s
             ),
@@ -2150,6 +2154,10 @@ def run_resolved_horizon_matrix(
                 else ":native-swing"
             )
             + f":foot-halflife:{float(foot_correction_halflife_s):.9g}"
+            + (
+                ":maximum-output-joint-speed-rad-s:"
+                f"{float(maximum_output_joint_speed_rad_s):.9g}"
+            )
             + (
                 ":terrain-gated-support-root-halflife:"
                 f"{float(root_height_correction_halflife_s):.9g}"

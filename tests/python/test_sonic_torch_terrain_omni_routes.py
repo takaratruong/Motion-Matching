@@ -63,6 +63,9 @@ class SameStairOmnidirectionalRouteTests(unittest.TestCase):
             )
             self.assertGreater(route.outcome.min_segment_progress_ratio, 0.0)
             self.assertGreater(route.outcome.min_elevated_foot_samples, 0)
+            self.assertEqual(
+                route.outcome.maximum_stopped_segment_drift_m, 0.05
+            )
 
         for route in routes:
             if route.required_outcome == "turn":

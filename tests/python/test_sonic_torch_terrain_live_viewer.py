@@ -293,6 +293,7 @@ class LiveMujocoSceneTests(unittest.TestCase):
                 "--swing-clearance-margin-m", "0.01",
                 "--swing-plan-sigma-frames", "2.5",
                 "--foot-correction-halflife-s", "0.02",
+                "--maximum-output-joint-speed-rad-s", "16.0",
                 "--root-height-correction-halflife-s", "0.05",
                 "--touchdown-projection-max-shift-m", "0.05",
                 "--maximum-contact-anchor-yaw-rad", "0.2",
@@ -318,6 +319,7 @@ class LiveMujocoSceneTests(unittest.TestCase):
         self.assertEqual(arguments.swing_clearance_margin_m, 0.01)
         self.assertEqual(arguments.swing_plan_sigma_frames, 2.5)
         self.assertEqual(arguments.foot_correction_halflife_s, 0.02)
+        self.assertEqual(arguments.maximum_output_joint_speed_rad_s, 16.0)
         self.assertEqual(arguments.root_height_correction_halflife_s, 0.05)
         self.assertEqual(arguments.touchdown_projection_max_shift_m, 0.05)
         self.assertEqual(arguments.maximum_contact_anchor_yaw_rad, 0.2)

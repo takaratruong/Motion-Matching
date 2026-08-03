@@ -537,6 +537,7 @@ def _validate_live_mode(
     maximum_emitted_contact_rescue_candidates: int | None = None,
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
+    maximum_output_joint_speed_rad_s: float = 13.0,
     root_height_correction_halflife_s: float | None = None,
     touchdown_projection_max_shift_m: float | None = None,
     anticipatory_touchdown_projection: bool = False,
@@ -564,6 +565,11 @@ def _validate_live_mode(
         raise ContractError("emitted contact preview requires multi-horizon mode")
     if swing_clearance_margin_m is not None and not foot_lock:
         raise ContractError("swing clearance requires terrain foot lock")
+    if foot_lock and (
+        not math.isfinite(float(maximum_output_joint_speed_rad_s))
+        or float(maximum_output_joint_speed_rad_s) <= 0.0
+    ):
+        raise ContractError("maximum output joint speed must be positive")
     if touchdown_projection_max_shift_m is not None and not foot_lock:
         raise ContractError("touchdown projection requires terrain foot lock")
     if (
@@ -616,6 +622,7 @@ def _build_live_matcher(
     maximum_emitted_contact_rescue_candidates: int | None = None,
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
+    maximum_output_joint_speed_rad_s: float = 13.0,
     root_height_correction_halflife_s: float | None = None,
     touchdown_projection_max_shift_m: float | None = None,
     anticipatory_touchdown_projection: bool = False,
@@ -670,6 +677,9 @@ def _build_live_matcher(
                 sole_kinematics,
                 swing_clearance_margin_m=swing_clearance_margin_m,
                 correction_halflife_s=foot_correction_halflife_s,
+                maximum_output_joint_speed_rad_s=(
+                    maximum_output_joint_speed_rad_s
+                ),
                 root_height_correction_halflife_s=(
                     root_height_correction_halflife_s
                 ),
@@ -760,6 +770,7 @@ def run_live_viewer(
     maximum_emitted_contact_rescue_candidates: int | None = None,
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
+    maximum_output_joint_speed_rad_s: float = 13.0,
     root_height_correction_halflife_s: float | None = None,
     touchdown_projection_max_shift_m: float | None = None,
     anticipatory_touchdown_projection: bool = False,
@@ -796,6 +807,9 @@ def run_live_viewer(
         ),
         swing_clearance_margin_m=swing_clearance_margin_m,
         foot_correction_halflife_s=foot_correction_halflife_s,
+        maximum_output_joint_speed_rad_s=(
+            maximum_output_joint_speed_rad_s
+        ),
         root_height_correction_halflife_s=(
             root_height_correction_halflife_s
         ),
@@ -918,6 +932,9 @@ def run_live_viewer(
         ),
         swing_clearance_margin_m=swing_clearance_margin_m,
         foot_correction_halflife_s=foot_correction_halflife_s,
+        maximum_output_joint_speed_rad_s=(
+            maximum_output_joint_speed_rad_s
+        ),
         root_height_correction_halflife_s=(
             root_height_correction_halflife_s
         ),
@@ -1203,6 +1220,12 @@ def build_live_viewer_argument_parser() -> argparse.ArgumentParser:
         help="Inertialization halflife for terrain foot corrections.",
     )
     parser.add_argument(
+        "--maximum-output-joint-speed-rad-s",
+        type=float,
+        default=13.0,
+        help="Maximum emitted joint speed after terrain correction.",
+    )
+    parser.add_argument(
         "--root-height-correction-halflife-s",
         type=float,
         default=None,
@@ -1359,6 +1382,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         swing_clearance_margin_m=args.swing_clearance_margin_m,
         foot_correction_halflife_s=args.foot_correction_halflife_s,
+        maximum_output_joint_speed_rad_s=(
+            args.maximum_output_joint_speed_rad_s
+        ),
         root_height_correction_halflife_s=(
             args.root_height_correction_halflife_s
         ),
