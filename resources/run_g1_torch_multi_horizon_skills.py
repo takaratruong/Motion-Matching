@@ -56,6 +56,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Continue unchanged commands through sequential same-skill horizons.",
     )
     parser.add_argument(
+        "--emitted-contact-preview",
+        action="store_true",
+        help="Reject candidates whose inertialized emitted feet violate terrain contacts.",
+    )
+    parser.add_argument(
         "--swing-clearance-margin-m",
         type=float,
         default=None,
@@ -266,6 +271,7 @@ def main(argv: list[str] | None = None) -> int:
         foot_lock=args.foot_lock,
         contact_phase_gate=args.contact_phase_gate,
         continuous_skill_enabled=args.continuous_skill,
+        emitted_contact_preview_enabled=args.emitted_contact_preview,
         swing_clearance_margin_m=args.swing_clearance_margin_m,
         foot_correction_halflife_s=args.foot_correction_halflife_s,
         swing_plan_sigma_frames=args.swing_plan_sigma_frames,
@@ -298,6 +304,7 @@ def main(argv: list[str] | None = None) -> int:
                 "foot_lock": args.foot_lock,
                 "contact_phase_gate": args.contact_phase_gate,
                 "continuous_skill": args.continuous_skill,
+                "emitted_contact_preview": args.emitted_contact_preview,
                 "swing_clearance_margin_m": args.swing_clearance_margin_m,
                 "foot_correction_halflife_s": args.foot_correction_halflife_s,
                 "swing_plan_sigma_frames": args.swing_plan_sigma_frames,

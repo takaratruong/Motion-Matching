@@ -1004,6 +1004,7 @@ def run_resolved_horizon_matrix(
     foot_lock: bool = False,
     contact_phase_gate: bool = False,
     continuous_skill_enabled: bool = False,
+    emitted_contact_preview_enabled: bool = False,
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
@@ -1161,6 +1162,11 @@ def run_resolved_horizon_matrix(
                 else ":boundary-search-v1"
             )
             + (
+                ":emitted-contact-preview-v1"
+                if emitted_contact_preview_enabled
+                else ":source-contact-preview"
+            )
+            + (
                 ":continuous-surface-tolerance:0.08"
                 if continuous_skill_enabled
                 else ""
@@ -1201,6 +1207,7 @@ def run_resolved_horizon_matrix(
             result_filter=result_filter,
             contact_phase_gate=contact_phase_gate,
             continuous_skill_enabled=continuous_skill_enabled,
+            emitted_contact_preview_enabled=emitted_contact_preview_enabled,
             turning_clip_paths=turning_clip_paths,
             maximum_translation_warp_m=maximum_translation_warp_m,
             maximum_yaw_warp_rad=maximum_yaw_warp_rad,

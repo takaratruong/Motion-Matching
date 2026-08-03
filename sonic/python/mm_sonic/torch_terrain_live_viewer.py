@@ -532,6 +532,7 @@ def _validate_live_mode(
     foot_lock: bool = False,
     contact_phase_gate: bool = False,
     continuous_skill: bool = False,
+    emitted_contact_preview: bool = False,
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
@@ -553,6 +554,8 @@ def _validate_live_mode(
         raise ContractError("contact phase gate requires multi-horizon mode")
     if continuous_skill and not multi_horizon:
         raise ContractError("continuous skill requires multi-horizon mode")
+    if emitted_contact_preview and not multi_horizon:
+        raise ContractError("emitted contact preview requires multi-horizon mode")
     if swing_clearance_margin_m is not None and not foot_lock:
         raise ContractError("swing clearance requires terrain foot lock")
     if swing_plan_sigma_frames is not None and swing_clearance_margin_m is None:
@@ -581,6 +584,7 @@ def _build_live_matcher(
     foot_lock: bool = False,
     contact_phase_gate: bool = False,
     continuous_skill: bool = False,
+    emitted_contact_preview: bool = False,
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
@@ -635,6 +639,8 @@ def _build_live_matcher(
             matcher_kwargs["contact_phase_gate"] = True
         if continuous_skill:
             matcher_kwargs["continuous_skill_enabled"] = True
+        if emitted_contact_preview:
+            matcher_kwargs["emitted_contact_preview_enabled"] = True
         return TerrainSkillHorizonMatcher(
             base_matcher=base,
             skill_inventory=skills,
@@ -690,6 +696,7 @@ def run_live_viewer(
     foot_lock: bool = False,
     contact_phase_gate: bool = False,
     continuous_skill: bool = False,
+    emitted_contact_preview: bool = False,
     swing_clearance_margin_m: float | None = None,
     foot_correction_halflife_s: float = 0.04,
     swing_plan_sigma_frames: float | None = None,
@@ -715,6 +722,7 @@ def run_live_viewer(
         foot_lock=foot_lock,
         contact_phase_gate=contact_phase_gate,
         continuous_skill=continuous_skill,
+        emitted_contact_preview=emitted_contact_preview,
         swing_clearance_margin_m=swing_clearance_margin_m,
         foot_correction_halflife_s=foot_correction_halflife_s,
         swing_plan_sigma_frames=swing_plan_sigma_frames,
@@ -820,6 +828,7 @@ def run_live_viewer(
         foot_lock=foot_lock,
         contact_phase_gate=contact_phase_gate,
         continuous_skill=continuous_skill,
+        emitted_contact_preview=emitted_contact_preview,
         swing_clearance_margin_m=swing_clearance_margin_m,
         foot_correction_halflife_s=foot_correction_halflife_s,
         swing_plan_sigma_frames=swing_plan_sigma_frames,
@@ -1068,6 +1077,11 @@ def build_live_viewer_argument_parser() -> argparse.ArgumentParser:
         help="Continue an unchanged command through the same feasible terrain skill.",
     )
     parser.add_argument(
+        "--emitted-contact-preview",
+        action="store_true",
+        help="Reject candidates whose inertialized emitted feet violate terrain contacts.",
+    )
+    parser.add_argument(
         "--swing-clearance-margin-m",
         type=float,
         default=None,
@@ -1204,6 +1218,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         foot_lock=args.foot_lock,
         contact_phase_gate=args.contact_phase_gate,
         continuous_skill=args.continuous_skill,
+        emitted_contact_preview=args.emitted_contact_preview,
         swing_clearance_margin_m=args.swing_clearance_margin_m,
         foot_correction_halflife_s=args.foot_correction_halflife_s,
         swing_plan_sigma_frames=args.swing_plan_sigma_frames,

@@ -231,6 +231,7 @@ class LiveMujocoSceneTests(unittest.TestCase):
                 minimum_endpoint_warp_yaw_rad=0.0,
                 maximum_endpoint_warp_yaw_rad=3.141592653589793,
                 maximum_endpoint_warp_terrain_delta_m=0.0,
+                emitted_contact_preview=True,
             )
 
         self.assertIs(result, qualified)
@@ -263,6 +264,7 @@ class LiveMujocoSceneTests(unittest.TestCase):
             minimum_endpoint_warp_yaw_rad=0.0,
             maximum_endpoint_warp_yaw_rad=3.141592653589793,
             maximum_endpoint_warp_terrain_delta_m=0.0,
+            emitted_contact_preview_enabled=True,
         )
 
     def test_multi_horizon_mode_is_explicit_and_exclusive(self):
@@ -273,6 +275,7 @@ class LiveMujocoSceneTests(unittest.TestCase):
                 "--g1-xml", "g1.xml",
                 "--multi-horizon",
                 "--continuous-skill",
+                "--emitted-contact-preview",
                 "--foot-lock",
                 "--contact-phase-gate",
                 "--swing-clearance-margin-m", "0.01",
@@ -289,6 +292,7 @@ class LiveMujocoSceneTests(unittest.TestCase):
         )
         self.assertTrue(arguments.multi_horizon)
         self.assertTrue(arguments.continuous_skill)
+        self.assertTrue(arguments.emitted_contact_preview)
         self.assertTrue(arguments.foot_lock)
         self.assertTrue(arguments.contact_phase_gate)
         self.assertEqual(arguments.swing_clearance_margin_m, 0.01)
@@ -310,6 +314,7 @@ class LiveMujocoSceneTests(unittest.TestCase):
             swing_clearance_margin_m=0.01,
             swing_plan_sigma_frames=2.5,
             foot_correction_halflife_s=0.02,
+            emitted_contact_preview=True,
         )
         with self.assertRaisesRegex(ContractError, "mutually exclusive"):
             live_module._validate_live_mode(
@@ -337,6 +342,13 @@ class LiveMujocoSceneTests(unittest.TestCase):
                 contact_segments=False,
                 foothold_arm=None,
                 continuous_skill=True,
+            )
+        with self.assertRaisesRegex(ContractError, "requires multi-horizon"):
+            live_module._validate_live_mode(
+                multi_horizon=False,
+                contact_segments=False,
+                foothold_arm=None,
+                emitted_contact_preview=True,
             )
         with self.assertRaisesRegex(ContractError, "requires terrain foot lock"):
             live_module._validate_live_mode(
