@@ -761,3 +761,55 @@ shows that lookahead over the current double-support chunk graph cannot repair
 this turn. The next representation must make a different action available
 before frame 303: shorter interruptible contact actions or coupled
 foothold/swing/root synthesis.
+
+An optional 10-frame-labelled contact-transfer inventory tests the first
+alternative. A short record is admitted only when its source interval crosses
+at least one non-double-support frame and ends at the first later
+double-support frame; remaining inside one double-support plateau is not an
+action. Allowing those records to compete globally at every search is rejected:
+on the matched `turn-90-middle-left` comparison it moves the terminal boundary
+from frame 167 to 293 and increases the chunk count from 5 to 11, but raises
+stance slide from `0.016807 m` to `0.774817 m` and still terminates with 511 of
+512 candidates failing sole penetration.
+
+The layered form is structurally useful. Fixed 25/50/100-frame actions retain
+exclusive access to ordinary search and expanded fixed-action rescue.
+Interruptible records become visible only after both fixed layers are
+exhausted. This preserves the first five baseline chunks exactly, admits one
+contact-anchored short edge at the frame-167 dead end, returns immediately to
+fixed actions, and emits all 345 route frames without an exception or ankle
+penetration. Final heading error is `0.081461 rad`, longest stall is one frame,
+and stance slide is `0.364548 m`. It remains an unqualified behavior result:
+the pivot segment reaches only `0.326952` commanded progress and fails the
+final lateral-drift contract.
+
+A follow-up that attempted to expose a short action only when a command-change
+fixed action exceeded outcome cost 1.0 is rejected and removed. It is
+bit-for-bit identical to the layered result because transactional command
+deferral consumes the one-frame command-change signal before the eventual
+contact-boundary search. Desired transition intent must persist across contact
+boundaries; it cannot be inferred from a transient per-frame flag.
+
+This result motivates a stair-relative contact-state motion graph. Nodes must
+carry stair-relative root pose, heading/velocity, left and right foothold
+levels, and support phase. Edges are complete exact-contact traversals or
+offline optimized connectors. The first graph covers ascent, descent, both
+lateral directions, and four diagonals on one fixed staircase, then measures
+direction-change reachability at every safe landing state. Missing edges are
+generated offline by optimizing root, joint, timing, swing-foot, and touchdown
+trajectories around one or more source-motion splices. Runtime motion matching
+remains a local motion-prior/retrieval layer; the graph owns global route
+progress and persistent transition intent.
+
+The first graph audit corrects the meaning of “exact contact.” The previous
+17-route matrix is ankle-valid but not G1-sole-valid: many selected motions put
+the rectangular sole 0.20 to 0.37 m through the next riser. A bounded
+double-support splice can likewise match both ankle targets within numerical
+tolerance while its right sole intersects the riser by 0.189 m. These
+artifacts are discarded as graph inputs. New extraction recomputes every sole
+sample from the MuJoCo G1 geometry, queries the authenticated staircase height
+field, and rejects each complete landing-to-landing edge whose minimum
+clearance is below `-0.025 m`. Connector synthesis may begin only from that
+sole-filtered graph; when it contains no compatible fixed endpoints, the
+optimization variables must include touchdown placement, swing clearance, and
+contact timing.
