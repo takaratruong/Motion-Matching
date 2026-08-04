@@ -25,6 +25,8 @@ def _enforce_metrics(metrics: dict[str, int | float]) -> None:
         raise ContractError("traversal contains an unsupported frame")
     if float(metrics["maximum_stance_contact_error_m"]) > 0.020:
         raise ContractError("traversal loses stance contact")
+    if float(metrics["maximum_stance_horizontal_step_m"]) > 0.010:
+        raise ContractError("traversal stance foot slides horizontally")
     if float(metrics["minimum_sole_clearance_m"]) < -0.025:
         raise ContractError("traversal penetrates the staircase")
     if int(metrics["minimum_supported_sole_points"]) < 3:
@@ -94,6 +96,10 @@ def main() -> int:
     supported_points = (
         (sole_clearance >= -0.025) & (sole_clearance <= 0.035)
     ).sum(axis=2)
+    consecutive_support = support[:-1] & support[1:]
+    horizontal_foot_step = np.linalg.norm(
+        np.diff(feet[..., :2], axis=0), axis=2
+    )
     metrics: dict[str, int | float | str] = {
         "schema": "g1-terrain-traversal-validation/v1",
         "frame_count": frame_count,
@@ -106,6 +112,11 @@ def main() -> int:
         ),
         "maximum_stance_contact_error_m": float(
             np.abs(foot_clearance[support]).max()
+        ),
+        "maximum_stance_horizontal_step_m": float(
+            horizontal_foot_step[consecutive_support].max()
+            if bool(consecutive_support.any())
+            else 0.0
         ),
         "minimum_sole_clearance_m": float(sole_clearance.min()),
         "minimum_supported_sole_points": int(

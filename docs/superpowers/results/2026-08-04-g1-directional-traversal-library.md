@@ -50,7 +50,8 @@ least 5 supported sole samples:
 The current v3 full demonstration continues from that head-on state and
 descends the staircase. It has 476 frames, 0 unsupported frames, 0.291 rad
 maximum joint step, 0.039 m maximum root step, 0.0164 m maximum stance error,
--0.0208 m minimum sole clearance, and at least 5 supported sole samples:
+-0.0208 m minimum sole clearance, 0.00447 m maximum planted-foot horizontal
+step, and at least 5 supported sole samples:
 
 `build/g1-traversal-library/horizontal-diagonal-head-on-descent-route-v3/traversal.npz`
 
@@ -172,6 +173,10 @@ PYTHONPATH=sonic/python sonic/.torch-mm-venv/bin/python -B \
   --g1-xml /home/ubuntu/projects/mjx-diffphysics/env/g1/assets/g1_29dof.xml \
   --output build/g1-traversal-library/horizontal-turn-diagonal-route/validation.json
 ```
+
+Validation rejects a route if a continuously supported foot moves more than
+0.010 m horizontally in one frame. This prevents a height-correct but visibly
+sliding traversal from passing the library contract.
 
 Render a contact sheet or launch passive playback:
 

@@ -22,6 +22,7 @@ class ValidateTraversalTests(unittest.TestCase):
             {
                 "unsupported_frame_count": 0,
                 "maximum_stance_contact_error_m": 0.019,
+                "maximum_stance_horizontal_step_m": 0.009,
                 "minimum_sole_clearance_m": -0.024,
                 "minimum_supported_sole_points": 3,
             }
@@ -33,6 +34,7 @@ class ValidateTraversalTests(unittest.TestCase):
                 {
                     "unsupported_frame_count": 1,
                     "maximum_stance_contact_error_m": 0.0,
+                    "maximum_stance_horizontal_step_m": 0.0,
                     "minimum_sole_clearance_m": 0.0,
                     "minimum_supported_sole_points": 8,
                 }
@@ -44,7 +46,20 @@ class ValidateTraversalTests(unittest.TestCase):
                 {
                     "unsupported_frame_count": 0,
                     "maximum_stance_contact_error_m": 0.0,
+                    "maximum_stance_horizontal_step_m": 0.0,
                     "minimum_sole_clearance_m": 0.0,
                     "minimum_supported_sole_points": 2,
+                }
+            )
+
+    def test_rejects_horizontal_stance_sliding(self):
+        with self.assertRaisesRegex(Exception, "slides"):
+            _MODULE._enforce_metrics(
+                {
+                    "unsupported_frame_count": 0,
+                    "maximum_stance_contact_error_m": 0.0,
+                    "maximum_stance_horizontal_step_m": 0.011,
+                    "minimum_sole_clearance_m": 0.0,
+                    "minimum_supported_sole_points": 8,
                 }
             )
