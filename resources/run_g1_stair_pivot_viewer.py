@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 import time
 
@@ -62,6 +63,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--g1-xml", type=Path, required=True)
     parser.add_argument("--loop", action="store_true")
+    parser.add_argument("--frames-per-second", type=float, default=50.0)
     parser.add_argument("--render-contact-sheet", type=Path)
     return parser
 
@@ -129,6 +131,12 @@ def _render_contact_sheet(
 
 def main() -> int:
     args = _parser().parse_args()
+    if (
+        not math.isfinite(args.frames_per_second)
+        or args.frames_per_second <= 0.0
+    ):
+        raise ContractError("viewer frame rate must be positive")
+    frame_delay = 1.0 / args.frames_per_second
     try:
         import mujoco
         import mujoco.viewer
@@ -217,11 +225,11 @@ def main() -> int:
                         frame = 0
                     else:
                         paused = True
-                next_tick += 0.02
+                next_tick += frame_delay
                 delay = next_tick - time.perf_counter()
                 if delay > 0.0:
                     time.sleep(delay)
-                elif delay < -0.02:
+                elif delay < -frame_delay:
                     next_tick = time.perf_counter()
     finally:
         if provider is not None:

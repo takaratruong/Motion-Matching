@@ -35,6 +35,24 @@ class RunG1StairPivotViewerTest(unittest.TestCase):
 
         self.assertEqual(args.render_contact_sheet, Path("sheet.png"))
 
+    def test_parser_accepts_native_motionbricks_frame_rate(self):
+        args = MODULE._parser().parse_args(
+            (
+                "--connector",
+                "connector.npz",
+                "--dataset",
+                "dataset",
+                "--config",
+                "config.json",
+                "--g1-xml",
+                "g1.xml",
+                "--frames-per-second",
+                "30",
+            )
+        )
+
+        self.assertEqual(args.frames_per_second, 30.0)
+
     def test_loader_accepts_exact_connector_inventory(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "connector.npz"

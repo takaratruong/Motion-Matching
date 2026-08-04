@@ -145,6 +145,68 @@ def infer_generated_support(
     )
 
 
+def endpoint_support_schedule(
+    *,
+    initial_support: object,
+    target_support: object,
+    frame_count: int,
+    target_window_frames: int = 4,
+) -> np.ndarray:
+    """Lock initial contacts until MotionBricks' exact target window."""
+
+    initial = np.asarray(initial_support)
+    target = np.asarray(target_support)
+    if (
+        initial.dtype != np.bool_
+        or target.dtype != np.bool_
+        or initial.shape != (2,)
+        or target.shape != (2,)
+        or not bool(initial.any())
+        or not bool(target.any())
+        or type(frame_count) is not int
+        or type(target_window_frames) is not int
+        or target_window_frames < 1
+        or frame_count <= target_window_frames
+    ):
+        raise ContractError("MotionBricks support schedule is invalid")
+    output = np.tile(initial, (frame_count, 1))
+    output[-target_window_frames:] = target
+    return np.ascontiguousarray(output)
+
+
+def flight_support_schedule(
+    *,
+    initial_support: object,
+    target_support: object,
+    frame_count: int,
+    context_frames: int = 4,
+    target_window_frames: int = 4,
+) -> np.ndarray:
+    """Represent an explicit support-to-flight-to-landing transition."""
+
+    initial = np.asarray(initial_support)
+    target = np.asarray(target_support)
+    if (
+        initial.dtype != np.bool_
+        or target.dtype != np.bool_
+        or initial.shape != (2,)
+        or target.shape != (2,)
+        or not bool(initial.any())
+        or not bool(target.any())
+        or type(frame_count) is not int
+        or type(context_frames) is not int
+        or type(target_window_frames) is not int
+        or context_frames < 1
+        or target_window_frames < 1
+        or frame_count <= context_frames + target_window_frames
+    ):
+        raise ContractError("MotionBricks flight schedule is invalid")
+    output = np.zeros((frame_count, 2), dtype=np.bool_)
+    output[:context_frames] = initial
+    output[-target_window_frames:] = target
+    return output
+
+
 def _validated_native_qpos(value: object, name: str) -> np.ndarray:
     qpos = np.asarray(value, dtype=np.float64)
     if (

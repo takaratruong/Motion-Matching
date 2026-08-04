@@ -5,7 +5,9 @@ import numpy as np
 from mm_sonic.joints import ContractError
 from mm_sonic.torch_motionbricks_task_actor import (
     assemble_generated_route,
+    endpoint_support_schedule,
     extract_proxy_keyframes,
+    flight_support_schedule,
     infer_generated_support,
 )
 
@@ -103,6 +105,40 @@ class MotionBricksTaskActorTests(unittest.TestCase):
         self.assertEqual(len(route["joint_position"]), 12)
         np.testing.assert_array_equal(
             route["segment_boundaries"], np.array((4, 9, 12))
+        )
+
+    def test_support_schedule_locks_start_then_exact_target_window(self):
+        schedule = endpoint_support_schedule(
+            initial_support=np.array((False, True)),
+            target_support=np.array((True, False)),
+            frame_count=12,
+            target_window_frames=4,
+        )
+
+        np.testing.assert_array_equal(
+            schedule[:8],
+            np.tile((False, True), (8, 1)),
+        )
+        np.testing.assert_array_equal(
+            schedule[8:],
+            np.tile((True, False), (4, 1)),
+        )
+
+    def test_flight_schedule_has_explicit_takeoff_and_landing(self):
+        schedule = flight_support_schedule(
+            initial_support=np.array((True, False)),
+            target_support=np.array((True, True)),
+            frame_count=12,
+            context_frames=4,
+            target_window_frames=4,
+        )
+
+        np.testing.assert_array_equal(
+            schedule[:4], np.tile((True, False), (4, 1))
+        )
+        self.assertFalse(schedule[4:8].any())
+        np.testing.assert_array_equal(
+            schedule[8:], np.tile((True, True), (4, 1))
         )
 
 
