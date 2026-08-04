@@ -68,40 +68,34 @@ crossing, and departure phases. The optimizer may change the continuous
 trajectory substantially, but every retained route records which source
 actions and contact schedule initialized it.
 
-## Trajectory optimization
+## Hybrid trajectory synthesis
 
 Rigidly align a sequence of flat and terrain actions to the global staircase
 frame and target travel direction. Concatenate them into one complete
-flat-to-flat warm start. Jointly optimize the entire route rather than
-accepting independently corrected clips.
+flat-to-flat anchor sequence.
 
-The continuous decision variables are:
+Use the pinned upstream ARDY G1 model only for short in-between windows between
+those anchors. Supply the adjacent GRAIL full-body states, root trajectory,
+feet, and contact-boundary states as kinematic constraints. ARDY does not
+choose footholds, contact order, mount height, or route semantics.
 
-- root position and orientation at every frame;
-- all G1 joint positions at every frame;
-- planted-foot poses during each source contact phase;
-- splice-window duration and phase timing within bounded ranges.
+The first integration pins ARDY upstream commit
+`693f74d13b3d04a0a22ce127ee79c929dd89756b` and uses the released G1 25 FPS
+checkpoint. Resample only the generated transition windows to the library's
+50 Hz output. Original GRAIL anchor frames remain unchanged.
 
-The discrete contact order comes from the selected source-action sequence in
-the first implementation. Contact-implicit schedule discovery is out of scope.
+After in-betweening, apply bounded leg IK and temporal smoothing only where
+needed to restore the prescribed planted sole poses. Reject a result rather
+than moving a foothold or changing the source contact schedule.
 
-The objective ranks:
-
-1. deviation from the aligned source-motion priors;
-2. joint velocity and acceleration;
-3. root and upper-body smoothness;
-4. foot slide during planted phases;
-5. clearance margin during swing;
-6. seam duration and distortion.
-
-Hard constraints enforce:
+Hard validation enforces:
 
 - the five required route phases and commanded lateral progress;
+- the GRAIL-derived contact order and footholds;
 - full oriented sole support on every planted frame;
 - swing-foot and body collision clearance;
 - exact flat-ground start and end boundaries;
-- joint position, speed, and acceleration limits;
-- the source contact order.
+- joint position, speed, and acceleration limits.
 
 Warm-start sequences are rejected before continuous optimization when:
 
@@ -119,9 +113,9 @@ qualified flat or terrain contact action. This graph is an internal search
 representation, not the runtime product.
 
 For each horizontal line and direction, use dynamic programming to enumerate
-promising warm-start sequences over the five required phases. Run trajectory
-optimization on each sequence and admit only converged, independently
-validated solutions.
+promising anchor sequences over the five required phases. Preserve each
+GRAIL action and invoke ARDY only on the splice windows. Admit only
+independently validated solutions.
 
 The generator retains every non-dominated complete route that differs in
 source-action sequence or contact schedule. Dominated duplicates are removed

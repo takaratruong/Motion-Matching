@@ -4,9 +4,9 @@
 
 **Goal:** Generate an offline library of complete G1 flat–mount–cross–descend–flat trajectories for every 10 cm horizontal line across one authenticated staircase in both directions.
 
-**Architecture:** Treat complete accepted GRAIL curb and stair clips as whole-route warm starts. Characterize their contact/height phases, align each feasible seed to each horizontal staircase line, then run bounded contact-aware kinematic trajectory optimization and independent full-sole validation. Save every non-dominated valid route and explicit failures; do not build an online motion matcher.
+**Architecture:** Treat complete accepted GRAIL curb and stair clips as whole-route anchors and use them unchanged whenever possible. When a complete route requires a splice, use the pinned ARDY G1 model only for the short constrained in-between window, then apply bounded contact repair and independent full-sole validation. Save every non-dominated valid route and explicit failures; do not build an online motion matcher.
 
-**Tech Stack:** Python 3, NumPy, PyTorch, MuJoCo G1 FK/sole kinematics, existing `TerrainDataset`, `ContactSegmentIndex`, and stair-frame utilities.
+**Tech Stack:** Python 3, NumPy, PyTorch, MuJoCo G1 FK/sole kinematics, existing `TerrainDataset`, `ContactSegmentIndex`, stair-frame utilities, and ARDY G1.
 
 ## Global Constraints
 
@@ -15,6 +15,8 @@
 - Every accepted route contains flat approach, terrain-action mount, tread crossing, terrain-action descent, and flat departure.
 - Mount/descent seeds may come from accepted GRAIL curb or staircase clips.
 - Online motion matching, Sonic tracking, physics control, depth, and realtime latency are out of scope.
+- Pin ARDY upstream to `693f74d13b3d04a0a22ce127ee79c929dd89756b`; do not modify its source.
+- ARDY may generate splice windows only. GRAIL determines footholds, contact order, and route phases.
 - Full-sole penetration must be at least `-0.025 m`; planted terminal sole error must be at most `0.025 m`.
 - Failed lines remain explicit failures; constraints are never relaxed to manufacture coverage.
 - Preserve unrelated working-tree changes.
@@ -251,7 +253,120 @@ git commit -m "feat: inventory complete terrain traversal seeds"
 
 ---
 
-### Task 3: Contact-aware whole-route trajectory optimizer
+### Task 3: Constrained ARDY in-betweening and contact repair
+
+**Files:**
+- Create: `sonic/python/mm_sonic/torch_ardy_inbetween.py`
+- Create: `resources/run_g1_ardy_inbetween_worker.py`
+- Create: `tests/python/test_sonic_torch_ardy_inbetween.py`
+- Create: `tests/python/test_run_g1_ardy_inbetween_worker.py`
+
+**Interfaces:**
+- Consumes `HorizontalRouteSeed` plus adjacent GRAIL full-body, root, feet,
+  and contact-boundary anchor states.
+- Produces:
+  - `ArdyInbetweenRequest`
+  - `ArdyInbetweenResult`
+  - `generate_ardy_inbetween(request, worker_python, worker_script)`
+  - `repair_and_validate_inbetween(result, support_mask, sole_targets, kinematics, sample_surface_height_m)`
+
+- [ ] **Step 1: Write failing bridge and anchor-preservation tests**
+
+```python
+def test_request_downsamples_only_transition_to_ardy_25hz():
+    request = ArdyInbetweenRequest.from_grail_50hz(
+        leading_anchor=leading_50hz,
+        trailing_anchor=trailing_50hz,
+        transition_frame_count_50hz=40,
+        root_waypoints_world=root_waypoints,
+        foot_constraints_world=foot_constraints,
+    )
+    assert request.ardy_frame_count_25hz == 20
+
+def test_contact_repair_preserves_grail_boundary_frames_exactly():
+    repaired = repair_and_validate_inbetween(
+        generated_result,
+        prescribed_support_mask=support,
+        prescribed_sole_pose_world=sole_targets,
+        kinematics=fake_bounded_kinematics,
+        sample_surface_height_m=fake_surface_sampler,
+    )
+    np.testing.assert_array_equal(repaired.joint_position[0], leading_joint)
+    np.testing.assert_array_equal(repaired.joint_position[-1], trailing_joint)
+```
+
+- [ ] **Step 2: Run tests and verify the missing adapter failure**
+
+Run:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=sonic/python:. \
+sonic/.torch-mm-venv/bin/python -B -m unittest -q \
+tests.python.test_sonic_torch_ardy_inbetween \
+tests.python.test_run_g1_ardy_inbetween_worker
+```
+
+Expected: FAIL because the ARDY adapter and worker are missing.
+
+- [ ] **Step 3: Install and verify official pinned ARDY**
+
+```bash
+git clone https://github.com/nv-tlabs/ardy.git /home/ubuntu/projects/ardy
+git -C /home/ubuntu/projects/ardy checkout \
+  693f74d13b3d04a0a22ce127ee79c929dd89756b
+python3.11 -m venv /home/ubuntu/projects/ardy/.venv
+/home/ubuntu/projects/ardy/.venv/bin/pip install torch torchvision \
+  --index-url https://download.pytorch.org/whl/cu126
+/home/ubuntu/projects/ardy/.venv/bin/pip install -e \
+  "/home/ubuntu/projects/ardy[demo]"
+test "$(git -C /home/ubuntu/projects/ardy rev-parse HEAD)" = \
+  693f74d13b3d04a0a22ce127ee79c929dd89756b
+```
+
+Expected: `import ardy` succeeds from the pinned unmodified checkout. Missing
+checkpoint credentials are reported as an external blocker; do not substitute
+an unconstrained interpolator while calling it ARDY.
+
+- [ ] **Step 4: Implement the isolated ARDY worker**
+
+The worker accepts one authenticated NPZ request and emits one NPZ result. It
+loads the released G1 Horizon-52 checkpoint and supplies full-body leading and
+trailing keyframes, dense root waypoints, and constrained feet at prescribed
+contact frames. It uses a deterministic seed and makes no text-driven route
+decisions.
+
+- [ ] **Step 5: Implement 50 Hz reconstruction and contact repair**
+
+Resample generated frames from 25 Hz to 50 Hz, restore both exact GRAIL
+boundary frames, then hold every prescribed planted seven-point sole pose with
+bounded leg IK. Reject unreachable projection, changed contact order, a
+boundary mismatch, or any full-sole/speed/acceleration violation.
+
+- [ ] **Step 6: Run tests and one real canary**
+
+Run the Step 2 command, then generate one constrained one-second G1 in-between
+between compatible GRAIL flat boundaries.
+
+Expected: tests pass, both anchors are byte-identical, and the real canary
+passes independent G1 full-sole validation.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add sonic/python/mm_sonic/torch_ardy_inbetween.py \
+  resources/run_g1_ardy_inbetween_worker.py \
+  tests/python/test_sonic_torch_ardy_inbetween.py \
+  tests/python/test_run_g1_ardy_inbetween_worker.py
+git commit -m "feat: add constrained ARDY G1 in-betweening"
+```
+
+---
+
+### Deferred fallback: Full-route projected trajectory optimization
+
+Do not execute this fallback unless the pinned ARDY G1 checkpoint is genuinely
+blocked or its constrained canary fails terrain validation. The hybrid path
+above is the selected implementation.
 
 **Files:**
 - Create: `sonic/python/mm_sonic/torch_horizontal_trajectory_optimizer.py`
@@ -447,7 +562,8 @@ For each 10 cm line and both directions:
 1. compute target tread elevation from the authenticated staircase query;
 2. rank whole-route seeds by elevation ratio, travel distance, source contact
    error, and family (`curb` wins ties);
-3. optimize at most 32 seeds;
+3. try at most 32 anchor sequences, invoking ARDY only when a splice is
+   required;
 4. retain all valid non-dominated trajectories;
 5. otherwise record the failed phase and complete rejection histogram.
 
@@ -463,7 +579,8 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=sonic/python:. \
 sonic/.torch-mm-venv/bin/python -B -m unittest -q \
 tests.python.test_sonic_torch_horizontal_traversal_library \
 tests.python.test_sonic_torch_horizontal_traversal_sources \
-tests.python.test_sonic_torch_horizontal_trajectory_optimizer \
+tests.python.test_sonic_torch_ardy_inbetween \
+tests.python.test_run_g1_ardy_inbetween_worker \
 tests.python.test_run_g1_horizontal_traversal_library
 ```
 
