@@ -37,6 +37,9 @@ def _load_frame(path: Path, frame: int) -> dict[str, np.ndarray]:
             "quaternion": np.asarray(
                 archive["root_orientation_world_wxyz"]
             )[frame].copy(),
+            "support": np.asarray(
+                archive["source_support_mask"], dtype=np.bool_
+            )[frame].copy(),
         }
     return output
 
@@ -49,6 +52,8 @@ def _two_step_schedule(
     first_landing_frame: int,
     second_liftoff_frame: int,
     second_landing_frame: int,
+    initial_support_foot: int,
+    final_support_foot: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     start = np.asarray(start_feet, dtype=np.float64)
     stop = np.asarray(stop_feet, dtype=np.float64)
@@ -57,6 +62,8 @@ def _two_step_schedule(
         or stop.shape != (2, 3)
         or not np.isfinite(start).all()
         or not np.isfinite(stop).all()
+        or initial_support_foot not in (0, 1)
+        or final_support_foot not in (0, 1)
         or not 0
         < first_landing_frame
         < second_liftoff_frame
@@ -66,11 +73,13 @@ def _two_step_schedule(
         raise ContractError("ARDY terrain bridge schedule is invalid")
     targets = np.empty((frame_count, 2, 3), dtype=np.float64)
     support = np.zeros((frame_count, 2), dtype=np.bool_)
+    first_moving_foot = 1 - initial_support_foot
+    second_moving_foot = initial_support_foot
     for frame in range(frame_count):
-        left_alpha = float(
+        first_alpha = float(
             np.clip(frame / first_landing_frame, 0.0, 1.0)
         )
-        right_alpha = float(
+        second_alpha = float(
             np.clip(
                 (frame - second_liftoff_frame)
                 / (second_landing_frame - second_liftoff_frame),
@@ -78,26 +87,26 @@ def _two_step_schedule(
                 1.0,
             )
         )
-        left_smooth = left_alpha**2 * (3.0 - 2.0 * left_alpha)
-        right_smooth = right_alpha**2 * (3.0 - 2.0 * right_alpha)
-        targets[frame, 0] = (
-            (1.0 - left_smooth) * start[0] + left_smooth * stop[0]
+        alpha = np.ones(2, dtype=np.float64)
+        alpha[first_moving_foot] = first_alpha
+        alpha[second_moving_foot] = second_alpha
+        smooth = alpha * alpha * (3.0 - 2.0 * alpha)
+        targets[frame] = (
+            (1.0 - smooth[:, None]) * start
+            + smooth[:, None] * stop
         )
-        targets[frame, 1] = (
-            (1.0 - right_smooth) * start[1] + right_smooth * stop[1]
+        targets[frame, first_moving_foot, 2] += (
+            0.08 * 4.0 * first_alpha * (1.0 - first_alpha)
         )
-        targets[frame, 0, 2] += (
-            0.08 * 4.0 * left_alpha * (1.0 - left_alpha)
-        )
-        targets[frame, 1, 2] += (
-            0.10 * 4.0 * right_alpha * (1.0 - right_alpha)
+        targets[frame, second_moving_foot, 2] += (
+            0.10 * 4.0 * second_alpha * (1.0 - second_alpha)
         )
         if frame <= first_landing_frame:
-            support[frame, 1] = True
+            support[frame, initial_support_foot] = True
         elif frame <= second_landing_frame:
-            support[frame, 0] = True
+            support[frame, first_moving_foot] = True
         else:
-            support[frame, 1] = True
+            support[frame, final_support_foot] = True
     return targets, support
 
 
@@ -148,6 +157,10 @@ def main() -> int:
     first_landing = int(round(0.24 * frame_count))
     second_liftoff = int(round(0.28 * frame_count))
     second_landing = int(round(0.68 * frame_count))
+    if incoming["support"].sum() != 1 or outgoing["support"].sum() != 1:
+        raise ContractError(
+            "ARDY terrain bridge endpoints require singleton support"
+        )
     targets, support = _two_step_schedule(
         start_feet=start_feet,
         stop_feet=stop_feet,
@@ -155,6 +168,8 @@ def main() -> int:
         first_landing_frame=first_landing,
         second_liftoff_frame=second_liftoff,
         second_landing_frame=second_landing,
+        initial_support_foot=int(np.flatnonzero(incoming["support"])[0]),
+        final_support_foot=int(np.flatnonzero(outgoing["support"])[0]),
     )
     retargeter = WideBoundG1TerrainRetargeter(
         args.g1_xml,

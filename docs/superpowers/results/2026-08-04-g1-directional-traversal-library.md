@@ -23,12 +23,27 @@ terrain IK, and temporal repair. Its validated metrics are:
 - -0.0229 m minimum sole clearance
 - 5 minimum supported sole samples
 
+The same pipeline now produces a 45-degree-to-head-on transition while
+inheriting the actual singleton support foot from each endpoint. Its metrics
+are 50 frames, 0 unsupported frames, 0.331 rad maximum joint step, 0.028 m
+maximum root step, 0.000001 m maximum stance error, -0.0170 m minimum sole
+clearance, and 7 minimum supported sole samples. Time reversal supplies the
+opposite graph edges, so horizontal, 45-degree, and head-on nodes are connected
+bidirectionally.
+
 Finally, the horizontal ascent, elevated turn, and diagonal descent compose
 into a 230-frame end-to-end route with 0 unsupported frames, 0.0071 m maximum
 stance error, -0.0233 m minimum sole clearance, and at least 5 supported sole
 samples. The route is at:
 
 `build/g1-traversal-library/horizontal-turn-diagonal-route/traversal.npz`
+
+A second 189-frame route enters horizontally and changes direction twice,
+ending head-on while remaining on the staircase. It also has 0 unsupported
+frames, 0.0071 m maximum stance error, -0.0229 m minimum sole clearance, and at
+least 5 supported sole samples:
+
+`build/g1-traversal-library/horizontal-diagonal-head-on-route/traversal.npz`
 
 ## What the experiments established
 
@@ -42,6 +57,11 @@ had unsupported or penetrating frames; the best raw sample still had 8
 unsupported frames and 0.177 m sole penetration. ARDY is useful as a whole-body
 motion prior, but terrain validity must come from an explicit contact schedule
 and terrain projection.
+
+The contact schedule must inherit endpoint support identity. A hard-coded
+right-foot terminal support worked for horizontal-to-45-degree because both
+endpoints happened to use right support, but falsely reported a 0.157 m stance
+error for the head-on endpoint, whose authenticated support foot is left.
 
 This agrees with the broader structure used in terrain trajectory optimization:
 motion/phase proposals and terrain/contact feasibility are separate constraints.

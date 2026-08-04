@@ -30,6 +30,8 @@ class ArdyTerrainBridgeTests(unittest.TestCase):
             first_landing_frame=12,
             second_liftoff_frame=14,
             second_landing_frame=34,
+            initial_support_foot=1,
+            final_support_foot=0,
         )
 
         self.assertTrue(support.any(axis=1).all())
@@ -37,4 +39,4 @@ class ArdyTerrainBridgeTests(unittest.TestCase):
         np.testing.assert_allclose(targets[-1], stop)
         self.assertTrue(support[0, 1])
         self.assertTrue(support[20, 0])
-        self.assertTrue(support[-1, 1])
+        self.assertTrue(support[-1, 0])
