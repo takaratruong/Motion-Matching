@@ -30,6 +30,55 @@ class PlacedStepUpValidation:
     minimum_sole_clearance_m: float
 
 
+def smooth_swing_clearance_lift(
+    *,
+    support_mask: object,
+    minimum_sole_clearance_m: object,
+    minimum_allowed_clearance_m: float = -0.025,
+    clearance_margin_m: float = 0.005,
+    smoothing_radius_frames: int = 8,
+) -> np.ndarray:
+    """Spread required swing-foot lifts into a smooth collision-avoidance arc."""
+
+    support = np.asarray(support_mask)
+    clearance = np.asarray(minimum_sole_clearance_m, dtype=np.float64)
+    if (
+        support.dtype != np.bool_
+        or support.ndim != 2
+        or support.shape[1:] != (2,)
+        or clearance.shape != support.shape
+        or len(support) < 1
+        or not np.isfinite(clearance).all()
+        or not math.isfinite(float(minimum_allowed_clearance_m))
+        or not math.isfinite(float(clearance_margin_m))
+        or minimum_allowed_clearance_m >= clearance_margin_m
+        or clearance_margin_m < 0.0
+        or type(smoothing_radius_frames) is not int
+        or smoothing_radius_frames < 1
+    ):
+        raise ContractError("smooth swing-clearance input is invalid")
+    required = np.where(
+        (~support) & (clearance < float(minimum_allowed_clearance_m)),
+        float(clearance_margin_m) - clearance,
+        0.0,
+    )
+    output = np.zeros_like(required)
+    radius = smoothing_radius_frames
+    for frame, foot in np.argwhere(required > 0.0):
+        start = max(0, int(frame) - radius)
+        stop = min(len(support), int(frame) + radius + 1)
+        offsets = np.arange(start, stop) - int(frame)
+        weight = 0.5 + 0.5 * np.cos(
+            math.pi * np.abs(offsets) / float(radius + 1)
+        )
+        output[start:stop, foot] = np.maximum(
+            output[start:stop, foot],
+            required[frame, foot] * weight,
+        )
+    output[support] = 0.0
+    return np.ascontiguousarray(output)
+
+
 def swing_clearance_targets(
     *,
     foot_position_world: object,
@@ -239,13 +288,18 @@ def validate_placed_step_up(
         raise ContractError("placed step-up sole penetration is excessive")
     contact_sole = np.concatenate(
         (
-            sole[first, landing_foot].reshape(-1),
-            sole[trailing:stop, trailing_foot].reshape(-1),
-        )
+            sole[first, landing_foot][None, :],
+            sole[trailing:stop, trailing_foot],
+        ),
+        axis=0,
     )
+    supported_points = (
+        (contact_sole >= -maximum_penetration_m)
+        & (contact_sole <= maximum_contact_sole_clearance_m)
+    ).sum(axis=1)
     if (
         float(contact_sole.min()) < -maximum_penetration_m
-        or float(contact_sole.max()) > maximum_contact_sole_clearance_m
+        or bool((supported_points < 3).any())
     ):
         raise ContractError("placed step-up sole contact is incomplete")
     stance_error = float(np.abs(ankle[start:stop][support[start:stop]]).max())

@@ -7,6 +7,7 @@ from mm_sonic.joints import ContractError
 from mm_sonic.torch_supported_step_up import (
     find_complete_step_up_sequence,
     swing_clearance_targets,
+    smooth_swing_clearance_lift,
     validate_placed_step_up,
 )
 
@@ -189,8 +190,65 @@ class PlacedStepUpValidationTests(unittest.TestCase):
                 target_final_height_delta_m=0.18,
             )
 
+    def test_accepts_a_supported_sole_with_lower_tread_overhang(self):
+        self.sole_clearance[20, 0, 3:] = 0.18
+        self.sole_clearance[50:53, 1, 3:] = 0.18
+
+        result = validate_placed_step_up(
+            sequence=self.sequence,
+            source_support_mask=self.support,
+            ankle_clearance_m=self.ankle_clearance,
+            sole_clearance_m=self.sole_clearance,
+            target_final_height_delta_m=0.18,
+        )
+
+        self.assertTrue(result.final_split_height_contact_transfer)
+
+    def test_rejects_a_sole_with_only_two_supported_points(self):
+        self.sole_clearance[20, 0, 2:] = 0.18
+
+        with self.assertRaisesRegex(ContractError, "incomplete"):
+            validate_placed_step_up(
+                sequence=self.sequence,
+                source_support_mask=self.support,
+                ankle_clearance_m=self.ankle_clearance,
+                sole_clearance_m=self.sole_clearance,
+                target_final_height_delta_m=0.18,
+            )
+
 
 class SwingClearanceTargetTests(unittest.TestCase):
+    def test_swing_clearance_lift_tapers_around_a_collision(self):
+        support = np.zeros((9, 2), dtype=np.bool_)
+        support[:, 0] = True
+        clearance = np.full((9, 2), 0.10)
+        clearance[4, 1] = -0.05
+
+        lift = smooth_swing_clearance_lift(
+            support_mask=support,
+            minimum_sole_clearance_m=clearance,
+            smoothing_radius_frames=3,
+        )
+
+        self.assertAlmostEqual(lift[4, 1], 0.055)
+        self.assertGreater(lift[3, 1], lift[2, 1])
+        self.assertGreater(lift[2, 1], lift[1, 1])
+        np.testing.assert_allclose(lift[:, 0], 0.0)
+
+    def test_swing_clearance_lift_never_moves_a_support_frame(self):
+        support = np.zeros((7, 2), dtype=np.bool_)
+        support[2:5, 1] = True
+        clearance = np.full((7, 2), 0.10)
+        clearance[1, 1] = -0.05
+
+        lift = smooth_swing_clearance_lift(
+            support_mask=support,
+            minimum_sole_clearance_m=clearance,
+            smoothing_radius_frames=3,
+        )
+
+        np.testing.assert_allclose(lift[2:5, 1], 0.0)
+
     def test_lifts_only_a_colliding_unsupported_foot(self):
         feet = np.array(((0.0, 0.0, 0.20), (0.2, 0.0, 0.30)))
 
