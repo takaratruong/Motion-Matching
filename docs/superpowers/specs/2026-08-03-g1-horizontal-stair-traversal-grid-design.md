@@ -42,8 +42,11 @@ the mount or descent, or reaches the opposite side only through root sliding.
 
 ## Motion inventory
 
-Use the full accepted GRAIL curb corpus for mount and descent actions and the
-accepted flat locomotion corpus for approach, crossing, and departure.
+Use the full accepted GRAIL curb and staircase corpora for mount and descent
+actions and the accepted flat locomotion corpus for approach, crossing, and
+departure. Side mounting is expected to favor curb actions, but a staircase
+action is admissible when its contact geometry and travel direction match the
+horizontal route more closely.
 
 Each source clip is segmented into landing-to-landing contact actions. Record:
 
@@ -55,10 +58,10 @@ Each source clip is segmented into landing-to-landing contact actions. Record:
 - boundary joint pose and velocity;
 - full oriented sole trajectory.
 
-Mount and descent phases must use curb-family actions. The solver may not
-silently replace them with stair-up clips or the geometric pivot generator.
-Geometric correction may align an otherwise suitable curb action to a target
-edge, but it may not invent the entire mount or descent.
+Mount and descent phases must use curb- or staircase-family terrain actions.
+The solver may not silently replace them with flat walking or the geometric
+pivot generator. Geometric correction may align an otherwise suitable terrain
+action to a target edge, but it may not invent the entire mount or descent.
 
 ## Placement and retargeting
 
@@ -103,7 +106,8 @@ and the MuJoCo G1 seven-point oriented sole model.
 A successful route must satisfy:
 
 - complete flat-to-flat lateral traversal;
-- curb-up and curb-down source provenance;
+- terrain-action source provenance for the mount and descent, including the
+  selected curb or staircase family;
 - correct commanded progress;
 - no full-sole penetration below `-0.025 m`;
 - terminal planted-sole error at most `0.025 m`;
@@ -138,7 +142,8 @@ The prototype is ready for feedback when:
   directions;
 - at least one line completes the full
   approach–mount–cross–descend–depart route;
-- the successful example visibly retains curb-style body and leg motion;
+- the successful example visibly retains the selected curb- or stair-style
+  body and leg motion;
 - all successful routes pass the full-sole, progress, seam, speed, and
   acceleration contracts;
 - the coverage report explains why higher unreachable lines failed.
