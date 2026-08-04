@@ -19,6 +19,18 @@ _SPEC.loader.exec_module(_MODULE)
 
 
 class ArdyTerrainBridgeTests(unittest.TestCase):
+    def test_stance_height_shift_uses_only_the_supported_foot(self):
+        clearance = np.array(
+            ((0.02, 0.001), (-0.003, 0.05)), dtype=np.float64
+        )
+        support = np.array(
+            ((False, True), (True, False)), dtype=np.bool_
+        )
+
+        result = _MODULE._stance_height_shift(clearance, support)
+
+        np.testing.assert_allclose(result, (0.001, -0.003))
+
     def test_schedule_always_has_one_support_and_reaches_both_feet(self):
         start = np.array(((0.0, 0.0, 0.1), (0.0, 0.2, 0.2)))
         stop = np.array(((0.1, 0.0, 0.1), (0.1, 0.2, 0.2)))

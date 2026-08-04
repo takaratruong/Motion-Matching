@@ -9,27 +9,29 @@ approach angles and their time-reversed descents:
 |---|---:|---:|---:|---:|
 | horizontal ascent/descent | 91 | 0.291 rad | 0.019 m | 0 |
 | 45-degree ascent/descent | 91 | 0.238 rad | 0.020 m | 0 |
-| head-on ascent/descent | 96 | 0.458 rad | 0.032 m | 0 |
+| head-on ascent/descent v2 | 191 | 0.229 rad | 0.016 m | 0 |
 
 The pipeline also produces an elevated horizontal-to-45-degree transition. It
 uses an ARDY-generated motion prior, an explicit two-step contact schedule,
-terrain IK, and temporal repair. Its validated metrics are:
+terrain IK, stance-height normalization, swing-only collision repair, and 2x
+temporal resampling. Its v2 validated metrics are:
 
-- 50 frames
+- 99 frames
 - 0 unsupported frames
-- 0.291 rad maximum joint step
-- 0.028 m maximum root step
-- 0.0071 m maximum stance contact error
-- -0.0229 m minimum sole clearance
+- 0.285 rad maximum joint step
+- 0.021 m maximum root step
+- 0.0131 m maximum stance contact error
+- -0.0208 m minimum sole clearance
 - 5 minimum supported sole samples
 
 The same pipeline now produces a 45-degree-to-head-on transition while
-inheriting the actual singleton support foot from each endpoint. Its metrics
-are 50 frames, 0 unsupported frames, 0.331 rad maximum joint step, 0.028 m
-maximum root step, 0.000001 m maximum stance error, -0.0170 m minimum sole
-clearance, and 7 minimum supported sole samples. Time reversal supplies the
-opposite graph edges, so horizontal, 45-degree, and head-on nodes are connected
-bidirectionally.
+inheriting the actual singleton support foot from each endpoint. The v2 edge
+repairs only six colliding swing-foot frames and then resamples by 2, preserving
+the exact endpoint. Its metrics are 99 frames, 0 unsupported frames, 0.190 rad
+maximum joint step, 0.039 m maximum root step, 0.0164 m maximum stance error,
+-0.0177 m minimum sole clearance, and 7 minimum supported sole samples. Time
+reversal supplies the opposite graph edges, so horizontal, 45-degree, and
+head-on nodes are connected bidirectionally.
 
 Finally, the horizontal ascent, elevated turn, and diagonal descent compose
 into a 230-frame end-to-end route with 0 unsupported frames, 0.0071 m maximum
@@ -44,6 +46,13 @@ frames, 0.0071 m maximum stance error, -0.0229 m minimum sole clearance, and at
 least 5 supported sole samples:
 
 `build/g1-traversal-library/horizontal-diagonal-head-on-route/traversal.npz`
+
+The current v3 full demonstration continues from that head-on state and
+descends the staircase. It has 476 frames, 0 unsupported frames, 0.291 rad
+maximum joint step, 0.039 m maximum root step, 0.0164 m maximum stance error,
+-0.0208 m minimum sole clearance, and at least 5 supported sole samples:
+
+`build/g1-traversal-library/horizontal-diagonal-head-on-descent-route-v3/traversal.npz`
 
 ## What the experiments established
 
@@ -62,6 +71,13 @@ The contact schedule must inherit endpoint support identity. A hard-coded
 right-foot terminal support worked for horizontal-to-45-degree because both
 endpoints happened to use right support, but falsely reported a 0.157 m stance
 error for the head-on endpoint, whose authenticated support foot is left.
+
+A full 12,646-clip scan found no head-on candidate that passed the strict
+contract at its single preferred placement. The selected source event also
+failed at every geometrically compatible placement, and the top 20 placements
+of the other promising events failed. This does not prove that no native GRAIL
+placement exists, but it explains why temporal synthesis is currently more
+productive than further nearest-placement tuning.
 
 This agrees with the broader structure used in terrain trajectory optimization:
 motion/phase proposals and terrain/contact feasibility are separate constraints.
@@ -110,7 +126,7 @@ PYTHONPATH=sonic/python sonic/.torch-mm-venv/bin/python -B \
   --output build/g1-traversal-library/ardy-horizontal-to-diagonal/terrain-bridge
 ```
 
-Repair the two endpoint IK branches:
+The older baseline repaired two endpoint IK branches:
 
 ```bash
 PYTHONPATH=sonic/python sonic/.torch-mm-venv/bin/python -B \
@@ -132,6 +148,17 @@ PYTHONPATH=sonic/python sonic/.torch-mm-venv/bin/python -B \
   --segment build/g1-traversal-library/ardy-horizontal-to-diagonal/final/traversal.npz \
   --segment build/g1-traversal-library/diagonal-descent/traversal.npz \
   --output build/g1-traversal-library/horizontal-turn-diagonal-route
+```
+
+Improve the temporally repaired head-on primitive without changing its exact
+endpoints:
+
+```bash
+PYTHONPATH=sonic/python sonic/.torch-mm-venv/bin/python -B \
+  resources/run_g1_resample_traversal.py \
+  --input build/g1-step-up-search/angle-90-repaired-r9/traversal.npz \
+  --factor 2 \
+  --output build/g1-traversal-library/head-on-ascent-v2
 ```
 
 Validate every scheduled contact and sole sample in the composed route:
@@ -161,8 +188,8 @@ MUJOCO_GL=egl PYTHONPATH=sonic/python \
 
 ## Remaining limitation
 
-The head-on primitive is valid but temporally weaker than the horizontal and
-45-degree primitives. Its source placement begins too deep in the target stair
-for clean regeneration, so the current version uses temporal repair. The next
-library-quality improvement is to search a new head-on placement/source event
-rather than increasing repair strength.
+The motion-prior CSVs are generated by the separately installed ARDY model and
+live under `build/`; they are not committed source assets. Reproducing an edge
+from scratch therefore requires the qualified ARDY checkout and model weights.
+Once a prior exists, all contact projection, resampling, composition, and
+validation stages run in the motion-matching Torch environment.

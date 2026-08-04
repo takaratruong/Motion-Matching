@@ -23,6 +23,7 @@ from mm_sonic.torch_g1_sole_kinematics import MujocoG1SoleKinematics
 from mm_sonic.torch_horizontal_terrain_retarget import (
     WideBoundG1TerrainRetargeter,
 )
+from mm_sonic.torch_supported_step_up import smooth_swing_clearance_lift
 from mm_sonic.torch_terrain_rollout import (
     load_experiment_config,
     resolve_stair_config,
@@ -42,6 +43,29 @@ def _load_frame(path: Path, frame: int) -> dict[str, np.ndarray]:
             )[frame].copy(),
         }
     return output
+
+
+def _stance_height_shift(
+    ankle_clearance: object, support_mask: object
+) -> np.ndarray:
+    clearance = np.asarray(ankle_clearance, dtype=np.float64)
+    support = np.asarray(support_mask)
+    if (
+        clearance.ndim != 2
+        or clearance.shape[1:] != (2,)
+        or support.shape != clearance.shape
+        or support.dtype != np.bool_
+        or not np.isfinite(clearance).all()
+        or not bool(support.any(axis=1).all())
+    ):
+        raise ContractError("ARDY stance-height normalization is invalid")
+    return np.asarray(
+        [
+            float(clearance[frame, support[frame]].mean())
+            for frame in range(len(clearance))
+        ],
+        dtype=np.float64,
+    )
 
 
 def _two_step_schedule(
@@ -216,6 +240,66 @@ def main() -> int:
         ankles[..., 2] - ankle_surface - float(ANKLE_ORIGIN_SOLE_M)
     )
     sole_clearance = soles[..., 2] - sole_surface
+    stance_height_shift = _stance_height_shift(
+        ankle_clearance, support
+    )
+    roots[:, 2] -= stance_height_shift
+    ankles[..., 2] -= stance_height_shift[:, None]
+    soles[..., 2] -= stance_height_shift[:, None, None]
+    ankle_clearance -= stance_height_shift[:, None]
+    sole_clearance -= stance_height_shift[:, None, None]
+    planned_lift = smooth_swing_clearance_lift(
+        support_mask=support,
+        minimum_sole_clearance_m=sole_clearance.min(axis=2),
+        smoothing_radius_frames=4,
+    )
+    swing_retargeter = WideBoundG1TerrainRetargeter(
+        args.g1_xml,
+        maximum_root_height_deviation_m=1.0e-6,
+        maximum_root_horizontal_deviation_m=1.0e-6,
+        maximum_target_error_m=0.04,
+    )
+    corrected_frames = 0
+    for frame in np.flatnonzero((planned_lift > 0.0).any(axis=1)):
+        solve = planned_lift[frame] > 0.0
+        targets = ankles[frame].copy()
+        targets[:, 2] += planned_lift[frame]
+        joints[frame], roots[frame] = swing_retargeter.solve_frame(
+            joint_position=joints[frame],
+            root_position_world=roots[frame],
+            root_orientation_world_wxyz=quaternions[frame],
+            solve_feet=solve,
+            target_foot_position_world=targets,
+            level_feet=np.zeros(2, dtype=np.bool_),
+            initial_joint_position=(
+                None if frame == 0 else joints[frame - 1]
+            ),
+            initial_root_position_world=(
+                None if frame == 0 else roots[frame - 1]
+            ),
+        )
+        corrected_frames += 1
+    if corrected_frames:
+        ankles = foot_kinematics.foot_positions(
+            joints, roots, quaternions
+        )
+        soles = sole_kinematics.sole_points(joints, roots, quaternions)
+        ankle_surface = grid.sample_xy(
+            alignment.matcher_to_scene_xy(
+                torch.tensor(ankles[..., :2], dtype=torch.float32)
+            )
+        ).cpu().numpy()
+        sole_surface = grid.sample_xy(
+            alignment.matcher_to_scene_xy(
+                torch.tensor(soles[..., :2], dtype=torch.float32)
+            )
+        ).cpu().numpy()
+        ankle_clearance = (
+            ankles[..., 2]
+            - ankle_surface
+            - float(ANKLE_ORIGIN_SOLE_M)
+        )
+        sole_clearance = soles[..., 2] - sole_surface
     metrics = {
         "schema": "g1-ardy-terrain-bridge/v1",
         "frame_count": frame_count,
@@ -230,6 +314,10 @@ def main() -> int:
         ),
         "minimum_sole_clearance_m": float(sole_clearance.min()),
         "unsupported_frame_count": int((~support.any(axis=1)).sum()),
+        "swing_corrected_frame_count": corrected_frames,
+        "maximum_stance_root_correction_m": float(
+            np.abs(stance_height_shift).max()
+        ),
     }
     args.output.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
