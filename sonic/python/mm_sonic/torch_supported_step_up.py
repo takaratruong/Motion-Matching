@@ -24,10 +24,44 @@ class CompleteStepUpSequence:
 @dataclass(frozen=True)
 class PlacedStepUpValidation:
     unsupported_frame_count: int
-    final_split_height_double_support: bool
+    final_split_height_contact_transfer: bool
     contact_height_pattern_error_m: float
     maximum_stance_contact_error_m: float
     minimum_sole_clearance_m: float
+
+
+def swing_clearance_targets(
+    *,
+    foot_position_world: object,
+    support_mask: object,
+    minimum_sole_clearance_m: object,
+    minimum_allowed_clearance_m: float = -0.025,
+    clearance_margin_m: float = 0.005,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return ankle targets that lift only colliding unsupported feet."""
+
+    feet = np.asarray(foot_position_world, dtype=np.float64)
+    support = np.asarray(support_mask)
+    clearance = np.asarray(minimum_sole_clearance_m, dtype=np.float64)
+    if (
+        feet.shape != (2, 3)
+        or support.dtype != np.bool_
+        or support.shape != (2,)
+        or clearance.shape != (2,)
+        or not np.isfinite(feet).all()
+        or not np.isfinite(clearance).all()
+        or not math.isfinite(float(minimum_allowed_clearance_m))
+        or not math.isfinite(float(clearance_margin_m))
+        or minimum_allowed_clearance_m >= clearance_margin_m
+        or clearance_margin_m < 0.0
+    ):
+        raise ContractError("step-up swing-clearance input is invalid")
+    mask = (~support) & (
+        clearance < float(minimum_allowed_clearance_m)
+    )
+    targets = feet.copy()
+    targets[mask, 2] += float(clearance_margin_m) - clearance[mask]
+    return np.ascontiguousarray(mask), np.ascontiguousarray(targets)
 
 
 def _contact_arrays(
@@ -104,7 +138,6 @@ def find_complete_step_up_sequence(
         if (
             not bool(previous.any())
             and bool(support[frame:stop, trailing_foot].all())
-            and bool(support[frame:stop, landing_foot].all())
         ):
             trailing_contact = frame
             break
@@ -137,6 +170,7 @@ def validate_placed_step_up(
     target_final_height_delta_m: float,
     stance_contact_tolerance_m: float = 0.020,
     contact_height_tolerance_m: float = 0.025,
+    minimum_split_height_m: float = 0.080,
     maximum_penetration_m: float = 0.025,
     maximum_contact_sole_clearance_m: float = 0.035,
 ) -> PlacedStepUpValidation:
@@ -152,6 +186,7 @@ def validate_placed_step_up(
         target_final_height_delta_m,
         stance_contact_tolerance_m,
         contact_height_tolerance_m,
+        minimum_split_height_m,
         maximum_penetration_m,
         maximum_contact_sole_clearance_m,
     )
@@ -179,15 +214,22 @@ def validate_placed_step_up(
         raise ContractError("placed step-up contains an unsupported frame")
     if not bool(mapped[first, landing_foot]):
         raise ContractError("placed step-up leading contact is unsupported")
-    if not bool(mapped[trailing:stop].all()):
+    trailing_foot = 1 - landing_foot
+    if not bool(mapped[trailing:stop, trailing_foot].all()):
         raise ContractError(
-            "placed step-up does not finish in double support"
+            "placed step-up does not finish with a stable contact transfer"
         )
 
     height_error = abs(
         float(target_final_height_delta_m)
         - sequence.source_final_height_delta_m
     )
+    if (
+        abs(float(target_final_height_delta_m)) < minimum_split_height_m
+        or abs(sequence.source_final_height_delta_m)
+        < minimum_split_height_m
+    ):
+        raise ContractError("placed step-up does not finish at split height")
     if height_error > contact_height_tolerance_m:
         raise ContractError("placed step-up contact height pattern is invalid")
 
@@ -198,7 +240,7 @@ def validate_placed_step_up(
     contact_sole = np.concatenate(
         (
             sole[first, landing_foot].reshape(-1),
-            sole[trailing:stop].reshape(-1),
+            sole[trailing:stop, trailing_foot].reshape(-1),
         )
     )
     if (
@@ -209,7 +251,7 @@ def validate_placed_step_up(
     stance_error = float(np.abs(ankle[start:stop][support[start:stop]]).max())
     return PlacedStepUpValidation(
         unsupported_frame_count=unsupported,
-        final_split_height_double_support=True,
+        final_split_height_contact_transfer=True,
         contact_height_pattern_error_m=height_error,
         maximum_stance_contact_error_m=stance_error,
         minimum_sole_clearance_m=minimum_clearance,

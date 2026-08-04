@@ -49,7 +49,7 @@ Write a self-contained NPZ containing joint positions, root position and
 orientation, contact masks, phase boundaries, and per-frame minimum sole
 clearance. The metrics file reports both contact frames, source and target
 contact-height differences, unsupported frame count, final split-height
-double-support status, contact error, sole clearance, and the selected source
+split-height contact-transfer status, contact error, sole clearance, and the selected source
 identity.
 
 Render a contact sheet for inspection before launching the existing passive
@@ -67,4 +67,6 @@ Automated tests cover contact-event extraction and reject:
 - excessive penetration.
 
 The final artifact is accepted only when its reported unsupported-frame count is
-zero and its final split-height double-support flag is true.
+zero and its final split-height contact-transfer flag is true. A dynamic
+transfer is valid when the trailing contact is stable and support is
+continuous, even if the landing foot has begun its next swing.

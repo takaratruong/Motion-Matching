@@ -190,7 +190,10 @@ PYTHONPATH=sonic/python \
   --output build/g1-step-up-search/uneven-complete
 ```
 
-Expected: exit 0, at least one accepted native sequence, zero unsupported frames, and final split-height double support.
+Expected: exit 0, at least one accepted native sequence, zero unsupported
+frames, and a final stable split-height contact transfer. The landing foot may
+already be lifting as the trailing foot establishes its new contact; dynamic
+stair walking must not be forced into double support.
 
 - [ ] **Step 8: Commit Task 2**
 
@@ -236,7 +239,7 @@ Run the two focused test modules again and parse `metrics.json` to assert:
 
 ```python
 assert metrics["unsupported_frame_count"] == 0
-assert metrics["final_split_height_double_support"]
+assert metrics["final_split_height_contact_transfer"]
 assert metrics["minimum_sole_clearance_m"] >= -0.025
 assert metrics["contact_height_pattern_error_m"] <= 0.025
 ```
