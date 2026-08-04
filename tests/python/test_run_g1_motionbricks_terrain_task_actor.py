@@ -115,6 +115,17 @@ class MotionBricksTerrainTaskActorRunnerTests(unittest.TestCase):
             masks[7], torch.tensor(((0, 1, 0),), dtype=torch.int64)
         )
 
+    def test_proxy_cadence_maps_to_nearest_checkpoint_duration(self):
+        self.assertEqual(
+            _MODULE.preferred_candidate_frame_count(
+                source_frame_count=44,
+                source_frames_per_second=50.0,
+                output_frames_per_second=30.0,
+                available_frame_counts=(24, 28, 32, 36),
+            ),
+            28,
+        )
+
     def test_select_candidate_rejects_penetration_before_smoothness(self):
         bad = {
             "candidate_id": "bad",
@@ -159,6 +170,33 @@ class MotionBricksTerrainTaskActorRunnerTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ContractError, "no valid"):
             _MODULE.select_candidate((heading, unsupported))
+
+    def test_select_candidate_preserves_preferred_traversal_cadence(self):
+        timed = {
+            "candidate_id": "timed",
+            "frame_count": 28,
+            "minimum_sole_clearance_m": 0.0,
+            "maximum_stance_contact_error_m": 0.0,
+            "maximum_stance_horizontal_step_m": 0.0,
+            "maximum_heading_error_rad": 0.0,
+            "endpoint_root_error_m": 0.040,
+            "unsupported_frame_count": 0,
+            "mean_joint_acceleration": 0.010,
+            "maximum_joint_step_rad": 0.20,
+        }
+        stretched = dict(timed)
+        stretched.update(
+            candidate_id="stretched",
+            frame_count=64,
+            endpoint_root_error_m=0.030,
+            mean_joint_acceleration=0.005,
+        )
+
+        selected = _MODULE.select_candidate(
+            (stretched, timed), preferred_frame_count=28
+        )
+
+        self.assertEqual(selected["candidate_id"], "timed")
 
 
 if __name__ == "__main__":

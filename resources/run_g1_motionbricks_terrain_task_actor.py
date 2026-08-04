@@ -112,6 +112,40 @@ def allowed_token_masks(
     return output
 
 
+def preferred_candidate_frame_count(
+    *,
+    source_frame_count: int,
+    source_frames_per_second: float,
+    output_frames_per_second: float,
+    available_frame_counts: tuple[int, ...],
+) -> int:
+    """Map proxy timing to the nearest supported generated duration."""
+
+    if (
+        type(source_frame_count) is not int
+        or source_frame_count < 1
+        or not math.isfinite(source_frames_per_second)
+        or source_frames_per_second <= 0.0
+        or not math.isfinite(output_frames_per_second)
+        or output_frames_per_second <= 0.0
+        or not available_frame_counts
+        or any(
+            type(frame_count) is not int or frame_count < 1
+            for frame_count in available_frame_counts
+        )
+    ):
+        raise ContractError("MotionBricks proxy cadence is invalid")
+    target = (
+        source_frame_count
+        * output_frames_per_second
+        / source_frames_per_second
+    )
+    return min(
+        available_frame_counts,
+        key=lambda frame_count: (abs(frame_count - target), frame_count),
+    )
+
+
 def normalize_generated_qpos(value: object) -> np.ndarray:
     """Normalize bounded quaternion roundoff from MotionBricks decoding."""
 
@@ -182,15 +216,34 @@ def _candidate_rejections(
 
 def select_candidate(
     candidates: object,
+    *,
+    preferred_frame_count: int | None = None,
 ) -> dict[str, object]:
     """Select the best hard-valid MotionBricks candidate."""
 
     if not isinstance(candidates, (tuple, list)) or not candidates:
         raise ContractError("MotionBricks candidates are invalid")
+    if (
+        preferred_frame_count is not None
+        and (
+            type(preferred_frame_count) is not int
+            or preferred_frame_count < 1
+        )
+    ):
+        raise ContractError(
+            "MotionBricks preferred frame count is invalid"
+        )
     valid: list[dict[str, object]] = []
     for value in candidates:
         if not isinstance(value, dict):
             raise ContractError("MotionBricks candidates are invalid")
+        if preferred_frame_count is not None and (
+            type(value.get("frame_count")) is not int
+            or int(value["frame_count"]) < 1
+        ):
+            raise ContractError(
+                "MotionBricks candidate frame count is invalid"
+            )
         if not _candidate_rejections(value):
             valid.append(value)
     if not valid:
@@ -198,6 +251,11 @@ def select_candidate(
     return min(
         valid,
         key=lambda item: (
+            (
+                abs(int(item["frame_count"]) - preferred_frame_count)
+                if preferred_frame_count is not None
+                else 0
+            ),
             float(item["endpoint_root_error_m"]),
             float(item["maximum_stance_horizontal_step_m"]),
             -float(item["minimum_sole_clearance_m"]),
@@ -630,6 +688,7 @@ def main() -> int:
     transitions: list[np.ndarray] = []
     transition_support: list[np.ndarray] = []
     context = proxies.qpos[0].copy()
+    planned_flight_seen = False
 
     with _motionbricks_working_directory(root):
         from motionbricks.motion_backbone.demo.utils import navigation_demo
@@ -644,6 +703,15 @@ def main() -> int:
         for segment_index, target in enumerate(proxies.qpos[1:]):
             records: list[dict[str, object]] = []
             candidates: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+            source_start = proxies.endpoint_frames[segment_index]
+            source_stop = proxies.endpoint_frames[segment_index + 1]
+            is_planned_flight = bool(
+                (
+                    ~np.asarray(route["source_support_mask"])[
+                        source_start : source_stop + 1
+                    ].any(axis=1)
+                ).any()
+            )
             for token_count, mask in masks.items():
                 constraints = motionbricks_constraints(
                     agent, context, target
@@ -674,17 +742,6 @@ def main() -> int:
                         proxies.support_mask[segment_index, -1]
                         if segment_index == 0
                         else transition_support[-1][-1]
-                    )
-                    source_start = proxies.endpoint_frames[segment_index]
-                    source_stop = proxies.endpoint_frames[
-                        segment_index + 1
-                    ]
-                    is_planned_flight = bool(
-                        (
-                            ~np.asarray(
-                                route["source_support_mask"]
-                            )[source_start : source_stop + 1].any(axis=1)
-                        ).any()
                     )
                     planned_support = (
                         flight_support_schedule(
@@ -779,13 +836,29 @@ def main() -> int:
                 raise ContractError(
                     "MotionBricks contact projection rejected every candidate"
                 )
-            selected = select_candidate(records)
+            preferred_frames = (
+                preferred_candidate_frame_count(
+                    source_frame_count=source_stop - source_start,
+                    source_frames_per_second=50.0,
+                    output_frames_per_second=30.0,
+                    available_frame_counts=tuple(
+                        token_count * 4 for token_count in masks
+                    ),
+                )
+                if not planned_flight_seen and not is_planned_flight
+                else None
+            )
+            selected = select_candidate(
+                records, preferred_frame_count=preferred_frames
+            )
+            selected["preferred_frame_count"] = preferred_frames
             candidate, support = candidates[str(selected["candidate_id"])]
             transitions.append(candidate)
             transition_support.append(support)
             selected_metrics.append(selected)
             all_metrics.extend(records)
             context = candidate[-4:].copy()
+            planned_flight_seen = planned_flight_seen or is_planned_flight
 
     assembled = assemble_generated_route(
         context_qpos=proxies.qpos[0],
