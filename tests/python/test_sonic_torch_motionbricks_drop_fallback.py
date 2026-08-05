@@ -61,6 +61,41 @@ class MotionBricksDropFallbackTests(unittest.TestCase):
         np.testing.assert_allclose(envelope[:, 1], 0.0)
         np.testing.assert_allclose(envelope[[0, -1]], 0.0)
 
+    def test_clearance_envelope_can_lift_a_generated_stop_window(self):
+        clearance = np.zeros((8, 2), dtype=np.float64)
+        clearance[-1, 0] = -0.05
+
+        envelope = terrain_clearance_envelope(
+            minimum_sole_clearance_by_frame_foot=clearance,
+            accepted_clearance_m=-0.02,
+            maximum_correction_step_m=0.01,
+            preserve_stop_endpoint=False,
+        )
+
+        np.testing.assert_allclose(envelope[0], 0.0)
+        self.assertAlmostEqual(float(envelope[-1, 0]), 0.03)
+        self.assertTrue(
+            (
+                np.abs(np.diff(envelope[:, 0]))
+                <= 0.01 + 1.0e-12
+            ).all()
+        )
+
+    def test_clearance_envelope_preserves_full_context_window(self):
+        clearance = np.zeros((10, 2), dtype=np.float64)
+        clearance[6, 0] = -0.05
+
+        envelope = terrain_clearance_envelope(
+            minimum_sole_clearance_by_frame_foot=clearance,
+            accepted_clearance_m=-0.02,
+            maximum_correction_step_m=0.01,
+            preserve_start_frames=4,
+            preserve_stop_endpoint=False,
+        )
+
+        np.testing.assert_allclose(envelope[:4], 0.0)
+        self.assertAlmostEqual(float(envelope[6, 0]), 0.03)
+
     def test_landing_solver_retargets_released_pose_to_exact_footprints(self):
         template = np.load(TEMPLATE, allow_pickle=False)
         kinematics = MujocoG1FootKinematics(G1_XML)

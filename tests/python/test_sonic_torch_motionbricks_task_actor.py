@@ -5,10 +5,14 @@ import numpy as np
 from mm_sonic.joints import ContractError
 from mm_sonic.torch_motionbricks_task_actor import (
     assemble_generated_route,
+    contact_phase_support,
     endpoint_support_schedule,
     extract_proxy_keyframes,
     flight_support_schedule,
     infer_generated_support,
+    stance_root_clearance_lift,
+    stance_root_height_correction,
+    stance_anchor_targets,
 )
 
 
@@ -32,6 +36,93 @@ def _route(frame_count: int = 40) -> dict[str, np.ndarray]:
 
 
 class MotionBricksTaskActorTests(unittest.TestCase):
+    def test_contact_phase_switches_support_instead_of_holding_start_foot(self):
+        channels = np.array(
+            (
+                (0.8, 0.7, 0.1, 0.0),
+                (0.7, 0.6, 0.2, 0.1),
+                (0.3, 0.2, 0.6, 0.7),
+                (0.1, 0.0, 0.8, 0.7),
+            ),
+            dtype=np.float64,
+        )
+
+        support = contact_phase_support(
+            channels,
+            initial_support=np.array((True, False)),
+            terminal_support=np.array((False, True)),
+            endpoint_window_frames=1,
+        )
+
+        np.testing.assert_array_equal(
+            support,
+            np.array(
+                (
+                    (True, False),
+                    (True, False),
+                    (False, True),
+                    (False, True),
+                )
+            ),
+        )
+
+    def test_new_stance_anchors_at_generated_touchdown_not_start_position(self):
+        feet = np.zeros((6, 2, 3), dtype=np.float64)
+        feet[:, 0, 0] = 0.10
+        feet[:, 1, 0] = np.array((0.30, 0.40, 0.50, 0.60, 0.60, 0.60))
+        support = np.array(
+            (
+                (True, False),
+                (True, False),
+                (False, True),
+                (False, True),
+                (False, True),
+                (False, True),
+            ),
+            dtype=np.bool_,
+        )
+
+        targets = stance_anchor_targets(
+            foot_position_world=feet,
+            support_mask=support,
+            surface_height_m=np.zeros((6, 2), dtype=np.float64),
+            ankle_origin_sole_m=0.05,
+        )
+
+        np.testing.assert_allclose(
+            targets[:2, 0], np.tile((0.10, 0.0, 0.05), (2, 1))
+        )
+        np.testing.assert_allclose(
+            targets[2:, 1], np.tile((0.50, 0.0, 0.05), (4, 1))
+        )
+
+    def test_stance_height_correction_lands_supported_ankle(self):
+        actual = np.array(
+            ((0.1, 0.2, 0.09), (0.3, 0.4, 0.20)),
+            dtype=np.float64,
+        )
+        target = np.array(
+            ((0.1, 0.2, 0.05), (0.3, 0.4, 0.40)),
+            dtype=np.float64,
+        )
+
+        correction = stance_root_height_correction(
+            actual_foot_position_world=actual,
+            target_foot_position_world=target,
+            support_mask=np.array((True, False)),
+        )
+
+        self.assertAlmostEqual(correction, -0.04)
+
+    def test_stance_clearance_lift_uses_worst_supported_sole(self):
+        lift = stance_root_clearance_lift(
+            minimum_sole_clearance_m=np.array((-0.044, -0.20)),
+            support_mask=np.array((True, False)),
+            accepted_clearance_m=-0.02,
+        )
+
+        self.assertAlmostEqual(lift, 0.024)
+
     def test_extracts_ordered_four_frame_proxy_windows(self):
         route = _route()
 

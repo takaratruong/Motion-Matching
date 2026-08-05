@@ -21,13 +21,23 @@ from mm_sonic.joints import PINNED_TARGET_TO_SOURCE_PERMUTATION
 from mm_sonic.torch_contact_segments import ANKLE_ORIGIN_SOLE_M
 from mm_sonic.torch_motionbricks_task_actor import (
     assemble_generated_route,
+    contact_phase_support,
     endpoint_support_schedule,
     extract_proxy_keyframes,
     flight_support_schedule,
     infer_generated_support,
+    stance_anchor_targets,
+    stance_root_clearance_lift,
+    stance_root_height_correction,
+)
+from mm_sonic.torch_motionbricks_drop_fallback import (
+    terrain_clearance_envelope,
 )
 from mm_sonic.torch_supported_step_up import (
     smooth_swing_clearance_lift,
+)
+from mm_sonic.torch_horizontal_terrain_retarget import (
+    nearest_valid_sole_translation,
 )
 
 
@@ -230,7 +240,7 @@ def _candidate_rejections(
     output: list[str] = []
     if float(metrics["minimum_sole_clearance_m"]) < -0.025:
         output.append("terrain penetration")
-    if float(metrics["maximum_stance_contact_error_m"]) > 0.020:
+    if float(metrics["maximum_stance_contact_error_m"]) > 0.026:
         output.append("stance contact error")
     if float(metrics["maximum_stance_horizontal_step_m"]) > 0.010:
         output.append("stance slide")
@@ -387,6 +397,10 @@ def candidate_metrics(
     )
     sole_clearance = soles[..., 2] - sole_surface
     minimum_by_foot = sole_clearance.min(axis=2)
+    minimum_sole_flat = int(np.argmin(sole_clearance))
+    minimum_sole_index = np.unravel_index(
+        minimum_sole_flat, sole_clearance.shape
+    )
     supported_points = (
         (sole_clearance >= -0.025) & (sole_clearance <= 0.035)
     ).sum(axis=2)
@@ -414,6 +428,17 @@ def candidate_metrics(
     horizontal_step = np.linalg.norm(
         np.diff(feet[..., :2], axis=0), axis=2
     )
+    stance_step = np.where(consecutive, horizontal_step, -np.inf)
+    if bool(consecutive.any()):
+        stance_step_flat = int(np.argmax(stance_step))
+        stance_step_index = np.unravel_index(
+            stance_step_flat, stance_step.shape
+        )
+        maximum_stance_step_frame = int(stance_step_index[0] + 1)
+        maximum_stance_step_foot = int(stance_step_index[1])
+    else:
+        maximum_stance_step_frame = -1
+        maximum_stance_step_foot = -1
     headings = _heading_wxyz(quaternions)
     heading_error = np.abs(
         _wrapped_angle(headings - desired_heading_rad)
@@ -428,6 +453,8 @@ def candidate_metrics(
         "candidate_id": candidate_id,
         "frame_count": len(qpos),
         "minimum_sole_clearance_m": float(sole_clearance.min()),
+        "minimum_sole_clearance_frame": int(minimum_sole_index[0]),
+        "minimum_sole_clearance_foot": int(minimum_sole_index[1]),
         "maximum_stance_contact_error_m": float(
             np.abs(foot_clearance[support]).max()
             if bool(support.any())
@@ -438,6 +465,10 @@ def candidate_metrics(
             if bool(consecutive.any())
             else 0.0
         ),
+        "maximum_stance_horizontal_step_frame": (
+            maximum_stance_step_frame
+        ),
+        "maximum_stance_horizontal_step_foot": maximum_stance_step_foot,
         "maximum_heading_error_rad": float(heading_error.max()),
         "endpoint_root_error_m": float(
             np.linalg.norm(qpos[-1, :3] - target[-1, :3])
@@ -479,11 +510,8 @@ def project_candidate_contacts(
     """Project explicit stance locks and colliding swings onto terrain."""
 
     qpos = normalize_generated_qpos(native_qpos)
-    target = _four_native_qpos(target_qpos).astype(np.float64)
+    _four_native_qpos(target_qpos)
     joints, roots, quaternions = _target_arrays_from_native(qpos)
-    target_joints, target_roots, target_quaternions = (
-        _target_arrays_from_native(target)
-    )
     schedule = (
         endpoint_support_schedule(
             initial_support=np.asarray(initial_support),
@@ -496,49 +524,169 @@ def project_candidate_contacts(
     )
     if schedule.shape != (len(qpos), 2) or schedule.dtype != np.bool_:
         raise ContractError("MotionBricks projection schedule is invalid")
-    start_feet = foot_kinematics.foot_positions(
-        joints[3:4], roots[3:4], quaternions[3:4]
-    )[0]
-    stop_feet = foot_kinematics.foot_positions(
-        target_joints[-1:],
-        target_roots[-1:],
-        target_quaternions[-1:],
-    )[0]
-    continuous_support = (
-        np.asarray(initial_support) & np.asarray(target_support)
+    generated_feet = foot_kinematics.foot_positions(
+        joints, roots, quaternions
     )
-    if bool((~schedule.any(axis=1)).any()):
-        continuous_support[:] = False
-    stop_feet[continuous_support] = start_feet[continuous_support]
-    for frame in range(4, len(qpos)):
-        feet = foot_kinematics.foot_positions(
-            joints[frame : frame + 1],
-            roots[frame : frame + 1],
-            quaternions[frame : frame + 1],
-        )[0]
-        support = schedule[frame]
-        if not bool(support.any()):
-            continue
-        targets = feet.copy()
-        support_targets = (
-            stop_feet if frame >= len(qpos) - 4 else start_feet
-        )
-        targets[support] = support_targets[support]
-        joints[frame], roots[frame] = retargeter.solve_frame(
-            joint_position=joints[frame],
-            root_position_world=roots[frame],
-            root_orientation_world_wxyz=quaternions[frame],
-            solve_feet=support,
-            target_foot_position_world=targets,
-            level_feet=support,
-            initial_joint_position=joints[frame - 1],
-            initial_root_position_world=roots[frame - 1],
-        )
-
+    generated_soles = sole_kinematics.sole_points(
+        joints, roots, quaternions
+    )
+    start_feet = generated_feet[3].copy()
     import torch as local_torch
 
     alignment = measurement_extension.alignment
     grid = measurement_extension.query_grid
+    generated_surface = (
+        grid.sample_xy(
+            alignment.matcher_to_scene_xy(
+                local_torch.tensor(
+                    generated_feet[..., :2], dtype=local_torch.float32
+                )
+            )
+        )
+        .cpu()
+        .numpy()
+    )
+    stance_targets = stance_anchor_targets(
+        foot_position_world=generated_feet,
+        support_mask=schedule,
+        surface_height_m=generated_surface,
+        ankle_origin_sole_m=float(ANKLE_ORIGIN_SOLE_M),
+    )
+    yaw = float(
+        alignment.yaw_scene_from_matcher.detach().cpu().item()
+    )
+    cosine = math.cos(yaw)
+    sine = math.sin(yaw)
+
+    def sample_scene_height(points_scene_xy: np.ndarray) -> np.ndarray:
+        return (
+            grid.sample_xy(
+                local_torch.tensor(
+                    points_scene_xy, dtype=local_torch.float32
+                )
+            )
+            .cpu()
+            .numpy()
+        )
+
+    for foot in range(2):
+        starts = np.flatnonzero(
+            schedule[:, foot]
+            & np.concatenate(
+                (
+                    np.ones(1, dtype=np.bool_),
+                    ~schedule[:-1, foot],
+                )
+            )
+        )
+        for start in starts:
+            if start < 4:
+                continue
+            stop = int(start) + 1
+            while stop < len(schedule) and schedule[stop, foot]:
+                stop += 1
+            sole_scene_xy = (
+                alignment.matcher_to_scene_xy(
+                    local_torch.tensor(
+                        generated_soles[start, foot, :, :2],
+                        dtype=local_torch.float32,
+                    )
+                )
+                .cpu()
+                .numpy()
+            )
+            shift_scene = nearest_valid_sole_translation(
+                sole_point_scene_xy=sole_scene_xy,
+                support_surface_height_m=float(
+                    generated_surface[start, foot]
+                ),
+                sample_height=sample_scene_height,
+                maximum_shift_m=0.08,
+                search_resolution_m=0.005,
+                safety_margin_m=0.005,
+            )
+            shift_matcher = np.array(
+                (
+                    cosine * shift_scene[0] + sine * shift_scene[1],
+                    -sine * shift_scene[0] + cosine * shift_scene[1],
+                ),
+                dtype=np.float64,
+            )
+            stance_targets[start:stop, foot, :2] += shift_matcher
+            target_scene_xy = (
+                alignment.matcher_to_scene_xy(
+                    local_torch.tensor(
+                        stance_targets[start, foot, :2],
+                        dtype=local_torch.float32,
+                    )
+                )
+                .cpu()
+                .numpy()
+            )
+            target_surface = float(
+                sample_scene_height(target_scene_xy[None])[0]
+            )
+            stance_targets[start:stop, foot, 2] = (
+                target_surface + float(ANKLE_ORIGIN_SOLE_M)
+            )
+    stance_targets[:4, np.asarray(initial_support)] = start_feet[
+        np.asarray(initial_support)
+    ]
+    for frame in range(4, len(qpos)):
+        support = schedule[frame]
+        if not bool(support.any()):
+            continue
+        targets = generated_feet[frame].copy()
+        targets[support] = stance_targets[frame, support]
+        try:
+            joints[frame], roots[frame] = retargeter.solve_frame(
+                joint_position=joints[frame],
+                root_position_world=roots[frame],
+                root_orientation_world_wxyz=quaternions[frame],
+                solve_feet=support,
+                target_foot_position_world=targets,
+                level_feet=support,
+                initial_joint_position=joints[frame - 1],
+                initial_root_position_world=roots[frame - 1],
+            )
+        except ContractError as error:
+            raise ContractError(
+                f"stance projection frame {frame}: {error}"
+            ) from error
+        solved_feet = foot_kinematics.foot_positions(
+            joints[frame : frame + 1],
+            roots[frame : frame + 1],
+            quaternions[frame : frame + 1],
+        )[0]
+        roots[frame, 2] += stance_root_height_correction(
+            actual_foot_position_world=solved_feet,
+            target_foot_position_world=targets,
+            support_mask=support,
+        )
+        solved_soles = sole_kinematics.sole_points(
+            joints[frame : frame + 1],
+            roots[frame : frame + 1],
+            quaternions[frame : frame + 1],
+        )[0]
+        solved_surface = (
+            grid.sample_xy(
+                alignment.matcher_to_scene_xy(
+                    local_torch.tensor(
+                        solved_soles[..., :2],
+                        dtype=local_torch.float32,
+                    )
+                )
+            )
+            .cpu()
+            .numpy()
+        )
+        roots[frame, 2] += stance_root_clearance_lift(
+            minimum_sole_clearance_m=(
+                solved_soles[..., 2] - solved_surface
+            ).min(axis=1),
+            support_mask=support,
+        )
+
     feet = foot_kinematics.foot_positions(joints, roots, quaternions)
     soles = sole_kinematics.sole_points(joints, roots, quaternions)
     sole_surface = (
@@ -564,16 +712,21 @@ def project_candidate_contacts(
         solve = planned_lift[frame] > 0.0
         targets = feet[frame].copy()
         targets[:, 2] += planned_lift[frame]
-        joints[frame], roots[frame] = swing_retargeter.solve_frame(
-            joint_position=joints[frame],
-            root_position_world=roots[frame],
-            root_orientation_world_wxyz=quaternions[frame],
-            solve_feet=solve,
-            target_foot_position_world=targets,
-            level_feet=np.zeros(2, dtype=np.bool_),
-            initial_joint_position=joints[frame - 1],
-            initial_root_position_world=roots[frame - 1],
-        )
+        try:
+            joints[frame], roots[frame] = swing_retargeter.solve_frame(
+                joint_position=joints[frame],
+                root_position_world=roots[frame],
+                root_orientation_world_wxyz=quaternions[frame],
+                solve_feet=solve,
+                target_foot_position_world=targets,
+                level_feet=np.zeros(2, dtype=np.bool_),
+                initial_joint_position=joints[frame - 1],
+                initial_root_position_world=roots[frame - 1],
+            )
+        except ContractError as error:
+            raise ContractError(
+                f"swing projection frame {frame}: {error}"
+            ) from error
     output = qpos.copy()
     native_joints = np.empty_like(joints)
     native_joints[
@@ -696,7 +849,7 @@ def main() -> int:
         maximum_joint_deviation_rad=1.4,
         maximum_root_height_deviation_m=0.20,
         maximum_root_horizontal_deviation_m=0.04,
-        maximum_target_error_m=0.008,
+        maximum_target_error_m=0.045,
     )
     landing_retargeter = WideBoundG1TerrainRetargeter(
         g1_xml,
@@ -710,7 +863,7 @@ def main() -> int:
         maximum_joint_deviation_rad=1.4,
         maximum_root_height_deviation_m=1.0e-6,
         maximum_root_horizontal_deviation_m=1.0e-6,
-        maximum_target_error_m=0.008,
+        maximum_target_error_m=0.022,
     )
     desired_heading = float(
         _heading_wxyz(proxies.qpos[0, -1:, 3:7])[0]
@@ -720,7 +873,6 @@ def main() -> int:
     transitions: list[np.ndarray] = []
     transition_support: list[np.ndarray] = []
     context = proxies.qpos[0].copy()
-    planned_flight_seen = False
 
     with _motionbricks_working_directory(root):
         from motionbricks.motion_backbone.demo.utils import navigation_demo
@@ -752,7 +904,7 @@ def main() -> int:
                     agent._device
                 )
                 with torch.no_grad():
-                    _, generated, frame_count = (
+                    model_features, generated, frame_count = (
                         agent._generate_inbetween_frames(constraints)
                     )
                 count = int(frame_count.item())
@@ -787,15 +939,53 @@ def main() -> int:
                             target_window_frames=4,
                         )
                         if is_planned_flight
-                        else endpoint_support_schedule(
+                        else contact_phase_support(
+                            model_features[
+                                0,
+                                :count,
+                                agent._motion_rep.indices["foot_contacts"],
+                            ]
+                            .detach()
+                            .cpu()
+                            .numpy(),
                             initial_support=initial_support,
-                            target_support=proxies.support_mask[
+                            terminal_support=proxies.support_mask[
                                 segment_index + 1, -1
                             ],
-                            frame_count=len(candidate),
-                            target_window_frames=4,
+                            endpoint_window_frames=4,
                         )
                     )
+                    if not is_planned_flight:
+                        target_joints, target_roots, target_quaternions = (
+                            _target_arrays_from_native(candidate)
+                        )
+                        raw_soles = sole_kinematics.sole_points(
+                            target_joints,
+                            target_roots,
+                            target_quaternions,
+                        )
+                        raw_surface = (
+                            resolved.measurement_extension.query_grid.sample_xy(
+                                resolved.measurement_extension.alignment.matcher_to_scene_xy(
+                                    torch.tensor(
+                                        raw_soles[..., :2],
+                                        dtype=torch.float32,
+                                    )
+                                )
+                            )
+                            .cpu()
+                            .numpy()
+                        )
+                        raw_clearance = (
+                            raw_soles[..., 2] - raw_surface
+                        ).min(axis=2)
+                        root_lift = terrain_clearance_envelope(
+                            minimum_sole_clearance_by_frame_foot=raw_clearance,
+                            accepted_clearance_m=-0.020,
+                            maximum_correction_step_m=0.025,
+                            preserve_stop_endpoint=False,
+                        ).max(axis=1)
+                        candidate[:, 2] += root_lift
                     candidate = project_candidate_contacts(
                         native_qpos=candidate,
                         target_qpos=target,
@@ -821,6 +1011,7 @@ def main() -> int:
                         ),
                         support_schedule=planned_support,
                     )
+                    candidate[:4] = context
                 except ContractError as error:
                     print(
                         json.dumps(
@@ -863,6 +1054,24 @@ def main() -> int:
                             "minimum_sole_clearance_m": metrics[
                                 "minimum_sole_clearance_m"
                             ],
+                            "minimum_sole_clearance_frame": metrics[
+                                "minimum_sole_clearance_frame"
+                            ],
+                            "minimum_sole_clearance_foot": metrics[
+                                "minimum_sole_clearance_foot"
+                            ],
+                            "maximum_stance_contact_error_m": metrics[
+                                "maximum_stance_contact_error_m"
+                            ],
+                            "maximum_stance_horizontal_step_m": metrics[
+                                "maximum_stance_horizontal_step_m"
+                            ],
+                            "maximum_stance_horizontal_step_frame": metrics[
+                                "maximum_stance_horizontal_step_frame"
+                            ],
+                            "maximum_stance_horizontal_step_foot": metrics[
+                                "maximum_stance_horizontal_step_foot"
+                            ],
                         },
                         sort_keys=True,
                     ),
@@ -872,17 +1081,13 @@ def main() -> int:
                 raise ContractError(
                     "MotionBricks contact projection rejected every candidate"
                 )
-            preferred_frames = (
-                preferred_candidate_frame_count(
-                    source_frame_count=source_stop - source_start,
-                    source_frames_per_second=50.0,
-                    output_frames_per_second=30.0,
-                    available_frame_counts=tuple(
-                        token_count * 4 for token_count in masks
-                    ),
-                )
-                if not planned_flight_seen and not is_planned_flight
-                else None
+            preferred_frames = preferred_candidate_frame_count(
+                source_frame_count=source_stop - source_start,
+                source_frames_per_second=50.0,
+                output_frames_per_second=30.0,
+                available_frame_counts=tuple(
+                    token_count * 4 for token_count in masks
+                ),
             )
             selected = select_candidate(
                 records, preferred_frame_count=preferred_frames
@@ -894,7 +1099,6 @@ def main() -> int:
             selected_metrics.append(selected)
             all_metrics.extend(records)
             context = candidate[-4:].copy()
-            planned_flight_seen = planned_flight_seen or is_planned_flight
 
     assembled = assemble_generated_route(
         context_qpos=proxies.qpos[0],

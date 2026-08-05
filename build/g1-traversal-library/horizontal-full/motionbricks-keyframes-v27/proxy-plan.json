@@ -1,0 +1,22 @@
+{
+  "frames_per_second": 30.0,
+  "motionbricks_checkout": "/home/ubuntu/projects/gear-sonic-worktrees/motionbricks-contact-transition/motionbricks",
+  "proxy_endpoints": [
+    29,
+    73,
+    132,
+    201,
+    232,
+    257
+  ],
+  "proxy_route": "/home/ubuntu/projects/motion-matching/.worktrees/g1-low-latency-driver/build/g1-traversal-library/horizontal-full/motionbricks-contact-exit-v4/traversal.npz",
+  "schema": "g1-motionbricks-terrain-task-actor/v1",
+  "selected_candidates": [
+    "segment-00-tokens-14",
+    "segment-01-tokens-06",
+    "segment-02-tokens-06",
+    "segment-03-tokens-10",
+    "segment-04-tokens-08",
+    "segment-05-tokens-06"
+  ]
+}

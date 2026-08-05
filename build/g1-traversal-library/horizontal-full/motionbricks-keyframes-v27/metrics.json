@@ -1,0 +1,9 @@
+{
+  "frame_count": 180,
+  "maximum_stance_contact_error_m": 0.025635672729163478,
+  "maximum_stance_horizontal_step_m": 0.0054883421535322895,
+  "minimum_sole_clearance_m": -0.02406656942072216,
+  "schema": "g1-motionbricks-terrain-task-actor-metrics/v1",
+  "segment_count": 6,
+  "unsupported_frame_count": 24
+}

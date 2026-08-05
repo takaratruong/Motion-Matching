@@ -113,8 +113,10 @@ def terrain_clearance_envelope(
     minimum_sole_clearance_by_frame_foot: object,
     accepted_clearance_m: float,
     maximum_correction_step_m: float,
+    preserve_start_frames: int = 1,
+    preserve_stop_endpoint: bool = True,
 ) -> np.ndarray:
-    """Build the smallest endpoint-anchored lift with bounded frame slope."""
+    """Build the smallest start-anchored lift with bounded frame slope."""
 
     clearance = np.asarray(
         minimum_sole_clearance_by_frame_foot, dtype=np.float64
@@ -128,15 +130,23 @@ def terrain_clearance_envelope(
         or accepted_clearance_m >= 0.0
         or not math.isfinite(float(maximum_correction_step_m))
         or maximum_correction_step_m <= 0.0
+        or type(preserve_start_frames) is not int
+        or preserve_start_frames < 1
+        or preserve_start_frames > len(clearance)
+        or type(preserve_stop_endpoint) is not bool
     ):
         raise ContractError("terrain clearance envelope input is invalid")
     raw = np.maximum(0.0, float(accepted_clearance_m) - clearance)
-    endpoint_capacity = (
-        np.minimum(
-            np.arange(len(raw)),
+    endpoint_distance = np.maximum(
+        0, np.arange(len(raw)) - preserve_start_frames + 1
+    )
+    if preserve_stop_endpoint:
+        endpoint_distance = np.minimum(
+            endpoint_distance,
             np.arange(len(raw) - 1, -1, -1),
-        )[:, None]
-        * float(maximum_correction_step_m)
+        )
+    endpoint_capacity = (
+        endpoint_distance[:, None] * float(maximum_correction_step_m)
     )
     if bool((raw > endpoint_capacity + 1.0e-9).any()):
         raise ContractError(
@@ -153,7 +163,9 @@ def terrain_clearance_envelope(
             envelope[frame], envelope[frame + 1] - step
         )
     envelope = np.minimum(envelope, endpoint_capacity)
-    envelope[[0, -1]] = 0.0
+    envelope[:preserve_start_frames] = 0.0
+    if preserve_stop_endpoint:
+        envelope[-1] = 0.0
     return np.ascontiguousarray(envelope)
 
 

@@ -20,6 +20,154 @@ class ProxyKeyframeSequence:
     endpoint_frames: tuple[int, ...]
 
 
+def contact_phase_support(
+    contact_channels: object,
+    *,
+    initial_support: object,
+    terminal_support: object,
+    endpoint_window_frames: int = 4,
+) -> np.ndarray:
+    """Convert MotionBricks heel/toe channels into a supported gait phase."""
+
+    channels = np.asarray(contact_channels, dtype=np.float64)
+    initial = np.asarray(initial_support)
+    terminal = np.asarray(terminal_support)
+    frame_count = len(channels)
+    if (
+        channels.shape != (frame_count, 4)
+        or frame_count < 2
+        or not np.isfinite(channels).all()
+        or initial.shape != (2,)
+        or terminal.shape != (2,)
+        or initial.dtype != np.bool_
+        or terminal.dtype != np.bool_
+        or not bool(initial.any())
+        or not bool(terminal.any())
+        or type(endpoint_window_frames) is not int
+        or endpoint_window_frames < 1
+        or 2 * endpoint_window_frames > frame_count
+    ):
+        raise ContractError("MotionBricks contact phase input is invalid")
+    foot_scores = channels.reshape(frame_count, 2, 2).max(axis=2)
+    support = np.zeros((frame_count, 2), dtype=np.bool_)
+    selected = np.argmax(foot_scores, axis=1)
+    support[np.arange(frame_count), selected] = True
+    support[:endpoint_window_frames] = initial
+    support[-endpoint_window_frames:] = terminal
+    return np.ascontiguousarray(support)
+
+
+def stance_anchor_targets(
+    *,
+    foot_position_world: object,
+    support_mask: object,
+    surface_height_m: object,
+    ankle_origin_sole_m: float,
+) -> np.ndarray:
+    """Hold each stance at its generated touchdown location."""
+
+    feet = np.asarray(foot_position_world, dtype=np.float64)
+    support = np.asarray(support_mask)
+    surface = np.asarray(surface_height_m, dtype=np.float64)
+    frame_count = len(feet)
+    if (
+        feet.shape != (frame_count, 2, 3)
+        or support.shape != (frame_count, 2)
+        or support.dtype != np.bool_
+        or surface.shape != (frame_count, 2)
+        or not np.isfinite(feet).all()
+        or not np.isfinite(surface).all()
+        or not np.isfinite(ankle_origin_sole_m)
+        or ankle_origin_sole_m <= 0.0
+    ):
+        raise ContractError("MotionBricks stance anchor input is invalid")
+    targets = feet.copy()
+    for foot in range(2):
+        anchor: np.ndarray | None = None
+        for frame in range(frame_count):
+            if not support[frame, foot]:
+                anchor = None
+                continue
+            if anchor is None:
+                anchor = feet[frame, foot].copy()
+                anchor[2] = (
+                    surface[frame, foot] + float(ankle_origin_sole_m)
+                )
+            targets[frame, foot] = anchor
+    return np.ascontiguousarray(targets)
+
+
+def stance_root_height_correction(
+    *,
+    actual_foot_position_world: object,
+    target_foot_position_world: object,
+    support_mask: object,
+    maximum_absolute_correction_m: float = 0.08,
+) -> float:
+    """Return the bounded pelvis-Z shift that lands supported ankles."""
+
+    actual = np.asarray(actual_foot_position_world, dtype=np.float64)
+    target = np.asarray(target_foot_position_world, dtype=np.float64)
+    support = np.asarray(support_mask)
+    if (
+        actual.shape != (2, 3)
+        or target.shape != (2, 3)
+        or support.shape != (2,)
+        or support.dtype != np.bool_
+        or not bool(support.any())
+        or not np.isfinite(actual).all()
+        or not np.isfinite(target).all()
+        or not np.isfinite(maximum_absolute_correction_m)
+        or maximum_absolute_correction_m <= 0.0
+    ):
+        raise ContractError("MotionBricks stance height input is invalid")
+    correction = float(
+        np.mean(target[support, 2] - actual[support, 2])
+    )
+    if abs(correction) > float(maximum_absolute_correction_m):
+        raise ContractError(
+            "MotionBricks stance height correction is too large"
+        )
+    return correction
+
+
+def stance_root_clearance_lift(
+    *,
+    minimum_sole_clearance_m: object,
+    support_mask: object,
+    accepted_clearance_m: float = -0.02,
+    maximum_lift_m: float = 0.04,
+) -> float:
+    """Lift the pelvis enough to clear the worst supported sole point."""
+
+    clearance = np.asarray(
+        minimum_sole_clearance_m, dtype=np.float64
+    )
+    support = np.asarray(support_mask)
+    if (
+        clearance.shape != (2,)
+        or support.shape != (2,)
+        or support.dtype != np.bool_
+        or not bool(support.any())
+        or not np.isfinite(clearance).all()
+        or not np.isfinite(accepted_clearance_m)
+        or accepted_clearance_m >= 0.0
+        or not np.isfinite(maximum_lift_m)
+        or maximum_lift_m <= 0.0
+    ):
+        raise ContractError("MotionBricks stance clearance input is invalid")
+    lift = max(
+        0.0,
+        float(accepted_clearance_m)
+        - float(clearance[support].min()),
+    )
+    if lift > float(maximum_lift_m):
+        raise ContractError(
+            "MotionBricks stance clearance lift is too large"
+        )
+    return lift
+
+
 def _native_qpos(
     joints: np.ndarray,
     roots: np.ndarray,
