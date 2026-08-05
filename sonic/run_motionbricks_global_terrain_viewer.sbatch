@@ -1,7 +1,7 @@
 #!/bin/bash
 # Switch-controller viewer: live MotionBricks plus bidirectional terrain portals.
 
-#SBATCH --job-name=hiv-global-terrain
+#SBATCH --job-name=hiv-kinematic
 #SBATCH --account=move
 #SBATCH --partition=move
 #SBATCH --qos=normal
@@ -10,7 +10,7 @@
 #SBATCH --mem=4G
 #SBATCH --time=04:00:00
 #SBATCH --output=/move/u/bodow/Projects/Motion-Matching-takara-corpus/slurm-mb-global-terrain-viewer-%j.out
-#SBATCH --comment=motionbricks-global-terrain-v6:lane-axis-jit-bidirectional
+#SBATCH --comment=motion_bank=/move/u/bodow/Projects/Motion-Matching-takara-corpus/artifacts/generic_terrain/waypoint_routes/mixed_gauntlet_v1/portals_entry_v2/portal_manifest.json
 
 set -euo pipefail
 
