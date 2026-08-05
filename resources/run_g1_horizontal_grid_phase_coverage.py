@@ -26,7 +26,6 @@ from mm_sonic.torch_path_motion_grid import (
 from mm_sonic.torch_path_motion_placement import (
     PathContactSignature,
     RawMotionWindow,
-    contact_signature_cost,
     extract_raw_motion_windows,
     path_contact_signature,
 )
@@ -216,6 +215,131 @@ def _ordered_phase_records(records: object) -> tuple[dict[str, object], ...]:
     )
 
 
+def _batched_signature_costs(
+    queries: tuple[PathContactSignature, ...],
+    windows: tuple[RawMotionWindow, ...],
+) -> np.ndarray:
+    if (
+        not isinstance(queries, tuple)
+        or not queries
+        or any(not isinstance(query, PathContactSignature) for query in queries)
+        or not isinstance(windows, tuple)
+        or not windows
+        or any(not isinstance(window, RawMotionWindow) for window in windows)
+    ):
+        raise ContractError("batched phase scoring inputs are invalid")
+    count = len(queries[0].foot_order)
+    if (
+        any(len(query.foot_order) != count for query in queries)
+        or any(len(window.events) != count for window in windows)
+    ):
+        raise ContractError("batched phase event counts differ")
+
+    event_xy = np.asarray(
+        [
+            [event.position_world_xy for event in window.events]
+            for window in windows
+        ],
+        dtype=np.float64,
+    )
+    displacement = event_xy[:, -1] - event_xy[:, 0]
+    norm = np.linalg.norm(displacement, axis=1)
+    if np.any(norm <= 1.0e-6):
+        raise ContractError("batched phase window has zero displacement")
+    forward_axis = displacement / norm[:, None]
+    lateral_axis = np.column_stack(
+        (-forward_axis[:, 1], forward_axis[:, 0])
+    )
+    root_start = np.asarray(
+        [window.root_start_world_xy for window in windows],
+        dtype=np.float64,
+    )
+    relative = event_xy - root_start[:, None, :]
+    source_forward = np.einsum("nci,ni->nc", relative, forward_axis)
+    source_lateral = np.einsum("nci,ni->nc", relative, lateral_axis)
+    source_height = np.asarray(
+        [
+            [event.surface_height_m for event in window.events]
+            for window in windows
+        ],
+        dtype=np.float64,
+    )
+    source_height -= source_height[:, :1]
+    source_time = np.asarray(
+        [
+            [event.frame for event in window.events]
+            for window in windows
+        ],
+        dtype=np.float64,
+    )
+    source_time -= source_time[:, :1]
+    source_foot = np.asarray(
+        [[event.foot for event in window.events] for window in windows],
+        dtype=np.int64,
+    )
+
+    query_forward = np.asarray(
+        [query.forward_m for query in queries], dtype=np.float64
+    )
+    query_forward -= query_forward[:, :1]
+    query_lateral = np.asarray(
+        [query.lateral_m for query in queries], dtype=np.float64
+    )
+    query_height = np.asarray(
+        [query.height_pattern_m for query in queries], dtype=np.float64
+    )
+    query_time = np.asarray(
+        [query.contact_frame for query in queries], dtype=np.float64
+    )
+    query_time -= query_time[:, :1]
+    query_foot = np.asarray(
+        [query.foot_order for query in queries], dtype=np.int64
+    )
+    progress = np.asarray(
+        [window.forward_progress_m for window in windows], dtype=np.float64
+    )
+    heading = np.asarray(
+        [window.heading_error_rad for window in windows], dtype=np.float64
+    )
+
+    cost = (
+        20.0
+        * np.sum(
+            source_foot[:, None, :] != query_foot[None, :, :], axis=2
+        )
+        + 60.0
+        * np.mean(
+            np.square(
+                source_height[:, None, :] - query_height[None, :, :]
+            ),
+            axis=2,
+        )
+        + 2.0
+        * np.mean(
+            np.square(
+                source_forward[:, None, :] - query_forward[None, :, :]
+            ),
+            axis=2,
+        )
+        + 2.0
+        * np.mean(
+            np.square(
+                source_lateral[:, None, :] - query_lateral[None, :, :]
+            ),
+            axis=2,
+        )
+        + 0.002
+        * np.mean(
+            np.square(source_time[:, None, :] - query_time[None, :, :]),
+            axis=2,
+        )
+        + 2.0
+        * np.square(progress[:, None] - query_forward[None, :, -1])
+        + 2.0 * np.square(heading[:, None])
+    )
+    return np.min(cost, axis=1)
+
+
 def _score_windows_for_tasks(
     windows: tuple[RawMotionWindow, ...],
     task_queries: tuple[tuple[PathContactSignature, ...], ...],
@@ -242,6 +366,10 @@ def _score_windows_for_tasks(
         )
     ):
         raise ContractError("phase scoring inputs are invalid")
+    windows_by_count: dict[int, tuple[RawMotionWindow, ...]] = {}
+    for window in windows:
+        windows_by_count.setdefault(len(window.events), ())
+        windows_by_count[len(window.events)] += (window,)
     output = []
     for queries, path_length in zip(task_queries, task_lengths):
         by_count: dict[int, tuple[PathContactSignature, ...]] = {}
@@ -249,16 +377,18 @@ def _score_windows_for_tasks(
             by_count.setdefault(len(query.foot_order), ())
             by_count[len(query.foot_order)] += (query,)
         rows = []
-        for window in windows:
-            compatible = by_count.get(len(window.events), ())
-            if not compatible:
+        for count, compatible in by_count.items():
+            matching_windows = windows_by_count.get(count, ())
+            if not matching_windows:
                 continue
-            cost = min(
-                contact_signature_cost(query, window)
-                for query in compatible
+            costs = _batched_signature_costs(
+                compatible, matching_windows
             )
-            if math.isfinite(cost):
-                rows.append(_window_to_row(window, cost))
+            rows.extend(
+                _window_to_row(window, float(cost))
+                for window, cost in zip(matching_windows, costs)
+                if math.isfinite(float(cost))
+            )
         output.append(
             _retain_event_count_diversity(
                 rows, per_count=2, target_progress_m=path_length

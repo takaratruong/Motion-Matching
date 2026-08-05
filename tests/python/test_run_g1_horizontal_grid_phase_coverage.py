@@ -2,8 +2,15 @@ import unittest
 
 import numpy as np
 
+from mm_sonic.torch_path_motion_placement import (
+    PathContactSignature,
+    RawContactEvent,
+    RawMotionWindow,
+    contact_signature_cost,
+)
 from mm_sonic.torch_path_terrain_phases import TerrainPathPhase
 from resources.run_g1_horizontal_grid_phase_coverage import (
+    _batched_signature_costs,
     _classify_lane_phases,
     _ordered_phase_records,
     _phase_queries,
@@ -100,6 +107,50 @@ class RunG1HorizontalGridPhaseCoverageTests(unittest.TestCase):
                 (1, "interior"),
             ],
         )
+
+    def test_batched_cost_is_equivalent_to_scalar_reference(self):
+        queries = tuple(
+            PathContactSignature(
+                foot_order=(0, 1, 0),
+                forward_m=(0.2, 0.5, 0.8),
+                lateral_m=(0.1, -0.1, 0.1),
+                contact_frame=(10, 30, 50),
+                height_pattern_m=heights,
+            )
+            for heights in ((0.0, 0.2, 0.2), (0.0, 0.0, 0.0))
+        )
+        windows = tuple(
+            RawMotionWindow(
+                source_clip=f"clip-{index}",
+                start_frame=0,
+                stop_frame=60,
+                events=tuple(
+                    RawContactEvent(
+                        frame=frame,
+                        foot=foot,
+                        position_world_xy=(forward, lateral),
+                        surface_height_m=height + offset,
+                    )
+                    for frame, foot, forward, lateral, height in (
+                        (10, 0, 0.2, 0.1, 0.0),
+                        (30, 1, 0.5, -0.1, 0.2),
+                        (50, 0, 0.8, 0.1, 0.2),
+                    )
+                ),
+                root_start_world_xy=(0.0, 0.0),
+                forward_progress_m=0.9,
+                heading_error_rad=0.05 * index,
+            )
+            for index, offset in enumerate((0.0, 0.4))
+        )
+
+        actual = _batched_signature_costs(queries, windows)
+        expected = np.asarray([
+            min(contact_signature_cost(query, window) for query in queries)
+            for window in windows
+        ])
+
+        np.testing.assert_allclose(actual, expected, atol=1.0e-12)
 
 
 if __name__ == "__main__":
