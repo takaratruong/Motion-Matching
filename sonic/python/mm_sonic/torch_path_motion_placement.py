@@ -74,6 +74,7 @@ class RawMotionWindow:
     start_frame: int
     stop_frame: int
     events: tuple[RawContactEvent, ...]
+    root_start_world_xy: tuple[float, float]
     forward_progress_m: float
     heading_error_rad: float
 
@@ -94,6 +95,13 @@ class RawMotionWindow:
             or self.heading_error_rad < 0.0
         ):
             raise ContractError("raw motion window is invalid")
+        object.__setattr__(
+            self,
+            "root_start_world_xy",
+            _finite_tuple(
+                self.root_start_world_xy, 2, "window root start"
+            ),
+        )
         object.__setattr__(
             self, "forward_progress_m", float(self.forward_progress_m)
         )
@@ -251,31 +259,46 @@ def extract_raw_motion_windows(
                 for left, right in zip(selected[:-1], selected[1:])
             ):
                 continue
-            start = selected[0].frame
-            stop = min(frames, selected[-1].frame + 11)
-            if stop - start < 4:
-                continue
-            displacement = roots[stop - 1, :2] - roots[start, :2]
-            progress = float(np.linalg.norm(displacement))
-            if progress < float(minimum_progress_m):
-                continue
-            travel_yaw = math.atan2(float(displacement[1]), float(displacement[0]))
-            error = np.abs(
-                np.arctan2(
-                    np.sin(yaw[start:stop] - travel_yaw),
-                    np.cos(yaw[start:stop] - travel_yaw),
-                )
+            starts = sorted(
+                {
+                    max(0, selected[0].frame - lead_in)
+                    for lead_in in (0, 20, 40, 60)
+                }
             )
-            output.append(
-                RawMotionWindow(
-                    source_clip=source_clip,
-                    start_frame=start,
-                    stop_frame=stop,
-                    events=selected,
-                    forward_progress_m=progress,
-                    heading_error_rad=float(np.quantile(error, 0.95)),
-                )
+            stops = sorted(
+                {
+                    min(frames, selected[-1].frame + tail)
+                    for tail in (11, 20, 40)
+                }
             )
+            for start in starts:
+                for stop in stops:
+                    if stop - start < 4:
+                        continue
+                    displacement = roots[stop - 1, :2] - roots[start, :2]
+                    progress = float(np.linalg.norm(displacement))
+                    if progress < float(minimum_progress_m):
+                        continue
+                    travel_yaw = math.atan2(
+                        float(displacement[1]), float(displacement[0])
+                    )
+                    error = np.abs(
+                        np.arctan2(
+                            np.sin(yaw[start:stop] - travel_yaw),
+                            np.cos(yaw[start:stop] - travel_yaw),
+                        )
+                    )
+                    output.append(
+                        RawMotionWindow(
+                            source_clip=source_clip,
+                            start_frame=start,
+                            stop_frame=stop,
+                            events=selected,
+                            root_start_world_xy=tuple(roots[start, :2]),
+                            forward_progress_m=progress,
+                            heading_error_rad=float(np.quantile(error, 0.95)),
+                        )
+                    )
     return tuple(sorted(output))
 
 
@@ -299,7 +322,9 @@ def contact_signature_cost(
         return math.inf
     forward = displacement / norm
     lateral = np.array((-forward[1], forward[0]), dtype=np.float64)
-    relative = event_xy - event_xy[0]
+    relative = event_xy - np.asarray(
+        window.root_start_world_xy, dtype=np.float64
+    )
     source_forward = relative @ forward
     source_lateral = relative @ lateral
     source_height = np.asarray(
@@ -326,6 +351,7 @@ def contact_signature_cost(
         + 2.0 * np.mean(np.square(source_forward - query_forward))
         + 2.0 * np.mean(np.square(source_lateral - query_lateral))
         + 0.002 * np.mean(np.square(source_time - query_time))
+        + 2.0 * (window.forward_progress_m - query_forward[-1]) ** 2
         + 2.0 * window.heading_error_rad**2
     )
 

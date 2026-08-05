@@ -158,6 +158,35 @@ class PathMotionPlacementTests(unittest.TestCase):
             contact_signature_cost(signature, flat),
         )
 
+    def test_extraction_keeps_approach_before_first_detected_landing(self):
+        frames = 140
+        roots = np.zeros((frames, 3))
+        roots[:, 0] = np.linspace(0.0, 1.5, frames)
+        quaternions = np.tile((1.0, 0.0, 0.0, 0.0), (frames, 1))
+        feet = np.zeros((frames, 2, 3))
+        feet[:, 0, 1] = 0.1
+        feet[:, 1, 1] = -0.1
+        support = np.zeros((frames, 2), dtype=np.bool_)
+        surface = np.zeros((frames, 2))
+        for frame, foot in ((45, 0), (60, 1), (75, 0), (90, 1)):
+            support[frame:min(frames, frame + 5), foot] = True
+            feet[frame:min(frames, frame + 5), foot, 0] = roots[frame, 0]
+
+        windows = extract_raw_motion_windows(
+            source_clip="late-first-contact",
+            root_position_world=roots,
+            root_orientation_world_wxyz=quaternions,
+            foot_position_world=feet,
+            support_mask=support,
+            foot_surface_height_m=surface,
+            minimum_events=4,
+            maximum_events=4,
+        )
+
+        padded = next(window for window in windows if window.start_frame == 0)
+        self.assertEqual(padded.root_start_world_xy, (0.0, 0.0))
+        self.assertTrue(any(window.stop_frame >= 110 for window in windows))
+
     def test_rejects_zero_event_bounds(self):
         with self.assertRaises(ContractError):
             extract_raw_motion_windows(
