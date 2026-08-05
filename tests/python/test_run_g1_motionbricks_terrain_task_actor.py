@@ -107,6 +107,24 @@ class MotionBricksTerrainTaskActorRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, "quaternion"):
             _MODULE.normalize_generated_qpos(qpos)
 
+    def test_measures_contact_projection_correction(self):
+        raw = _qpos(0.0).astype(np.float64)
+        projected = raw.copy()
+        projected[2, 0] += 0.03
+        projected[2, 7] += 0.20
+
+        metrics = _MODULE.contact_projection_metrics(raw, projected)
+
+        self.assertAlmostEqual(
+            metrics["maximum_contact_projection_joint_delta_rad"], 0.20
+        )
+        self.assertAlmostEqual(
+            metrics["maximum_contact_projection_root_delta_m"], 0.03
+        )
+        self.assertEqual(
+            metrics["maximum_contact_projection_frame"], 2
+        )
+
     def test_allowed_token_masks_select_each_checkpoint_duration(self):
         masks = _MODULE.allowed_token_masks(6, 8)
 

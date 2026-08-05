@@ -167,6 +167,38 @@ def normalize_generated_qpos(value: object) -> np.ndarray:
     return np.ascontiguousarray(output)
 
 
+def contact_projection_metrics(
+    raw_qpos: object,
+    projected_qpos: object,
+) -> dict[str, object]:
+    """Measure how much terrain projection changed a generated motion."""
+
+    raw = normalize_generated_qpos(raw_qpos)
+    projected = normalize_generated_qpos(projected_qpos)
+    if raw.shape != projected.shape:
+        raise ContractError(
+            "MotionBricks contact projection arrays do not match"
+        )
+    joint_delta = np.abs(projected[:, 7:] - raw[:, 7:])
+    root_delta = np.linalg.norm(
+        projected[:, :3] - raw[:, :3], axis=1
+    )
+    joint_by_frame = joint_delta.max(axis=1)
+    combined = np.maximum(joint_by_frame, root_delta)
+    return {
+        "mean_contact_projection_joint_delta_rad": float(
+            joint_delta.mean()
+        ),
+        "maximum_contact_projection_joint_delta_rad": float(
+            joint_delta.max()
+        ),
+        "maximum_contact_projection_root_delta_m": float(
+            root_delta.max()
+        ),
+        "maximum_contact_projection_frame": int(combined.argmax()),
+    }
+
+
 def _candidate_rejections(
     metrics: dict[str, object],
 ) -> tuple[str, ...]:
@@ -737,6 +769,7 @@ def main() -> int:
                 candidate_id = (
                     f"segment-{segment_index:02d}-tokens-{token_count:02d}"
                 )
+                raw_candidate = candidate.copy()
                 try:
                     initial_support = (
                         proxies.support_mask[segment_index, -1]
@@ -814,6 +847,9 @@ def main() -> int:
                     planned_flight=is_planned_flight,
                 )
                 metrics["contact_projection"] = True
+                metrics.update(
+                    contact_projection_metrics(raw_candidate, candidate)
+                )
                 records.append(metrics)
                 candidates[candidate_id] = (candidate, support)
                 print(
