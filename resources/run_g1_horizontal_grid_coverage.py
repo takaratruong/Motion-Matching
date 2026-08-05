@@ -394,6 +394,50 @@ def _write_lane_artifacts(
         np.savez_compressed(lane_root / "traversal.npz", **connector)
 
 
+def _path_polyline_matcher(
+    *,
+    lane: HorizontalGridLane,
+    sample_surface,
+    target_root_scene_xy: np.ndarray,
+    alignment_yaw: float,
+    sample_count: int = 33,
+) -> np.ndarray:
+    if (
+        not callable(sample_surface)
+        or np.asarray(target_root_scene_xy).shape != (2,)
+        or not np.isfinite(target_root_scene_xy).all()
+        or not math.isfinite(float(alignment_yaw))
+        or type(sample_count) is not int
+        or sample_count < 2
+    ):
+        raise ContractError("grid path polyline input is invalid")
+    scene_xy = np.column_stack(
+        (
+            np.linspace(
+                lane.start_scene_xy[0],
+                lane.stop_scene_xy[0],
+                sample_count,
+            ),
+            np.full(sample_count, lane.center_y_m),
+        )
+    )
+    height = np.asarray(sample_surface(scene_xy), dtype=np.float64)
+    if height.shape != (sample_count,) or not np.isfinite(height).all():
+        raise ContractError("grid path polyline terrain is invalid")
+    relative = scene_xy - np.asarray(
+        target_root_scene_xy, dtype=np.float64
+    )
+    cosine, sine = math.cos(alignment_yaw), math.sin(alignment_yaw)
+    matcher_xy = np.stack(
+        (
+            cosine * relative[:, 0] + sine * relative[:, 1],
+            -sine * relative[:, 0] + cosine * relative[:, 1],
+        ),
+        axis=-1,
+    )
+    return np.column_stack((matcher_xy, height + 0.03))
+
+
 def main() -> int:
     args = _parser().parse_args()
     lanes = _grid_lanes_from_args(args)
@@ -509,6 +553,12 @@ def main() -> int:
         )
         summary["coarse_rows_returned"] = returned_rows[lane_index]
         summary["coarse_pool_retained"] = len(pools[lane_index])
+        summary["path_polyline_matcher_xyz"] = _path_polyline_matcher(
+            lane=lane,
+            sample_surface=sample_numpy,
+            target_root_scene_xy=target_root_scene_xy,
+            alignment_yaw=alignment_yaw,
+        ).tolist()
         lane_summaries.append(summary)
         _write_lane_artifacts(
             args.output, lane, connector, reports

@@ -1,5 +1,7 @@
 import unittest
 
+import numpy as np
+
 from mm_sonic.torch_path_motion_placement import (
     PathContactSignature,
     RawContactEvent,
@@ -7,6 +9,7 @@ from mm_sonic.torch_path_motion_placement import (
 )
 from resources.run_g1_horizontal_grid_coverage import (
     _grid_lanes_from_args,
+    _path_polyline_matcher,
     _parser,
     _score_windows_for_lanes,
     _trim_lane_pool,
@@ -107,6 +110,40 @@ class RunG1HorizontalGridCoverageTests(unittest.TestCase):
         self.assertIn(
             "clip-5", {row["source_clip"] for row in retained}
         )
+
+    def test_path_polyline_follows_terrain_in_matcher_frame(self):
+        lane = _grid_lanes_from_args(
+            _parser().parse_args(
+                (
+                    "--source-dataset",
+                    "dataset",
+                    "--target-scene",
+                    "stair",
+                    "--g1-xml",
+                    "g1.xml",
+                    "--minimum-y",
+                    "0",
+                    "--maximum-y",
+                    "0",
+                    "--output",
+                    "output",
+                )
+            )
+        )[0]
+
+        points = _path_polyline_matcher(
+            lane=lane,
+            sample_surface=lambda xy: 0.5 * xy[:, 0],
+            target_root_scene_xy=np.zeros(2),
+            alignment_yaw=0.0,
+            sample_count=3,
+        )
+
+        self.assertEqual(points.shape, (3, 3))
+        np.testing.assert_allclose(points[:, 0], np.linspace(
+            lane.start_scene_xy[0], lane.stop_scene_xy[0], 3
+        ))
+        np.testing.assert_allclose(points[:, 2], 0.5 * points[:, 0] + 0.03)
 
 
 if __name__ == "__main__":

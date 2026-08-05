@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from pathlib import Path
 import time
@@ -65,7 +66,169 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--frames-per-second", type=float, default=50.0)
     parser.add_argument("--render-contact-sheet", type=Path)
+    parser.add_argument("--grid-summary", type=Path)
+    parser.add_argument("--playlist-metadata", type=Path)
     return parser
+
+
+def _load_grid_overlay(
+    summary_path: Path,
+    playlist_path: Path,
+    *,
+    frame_count: int,
+) -> dict[str, object]:
+    try:
+        summary = json.loads(summary_path.read_text("utf-8"))
+        playlist = json.loads(playlist_path.read_text("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ContractError("grid viewer metadata is unreadable") from error
+    lanes = summary.get("lanes")
+    segments = playlist.get("segments")
+    if (
+        summary.get("schema") != "g1-horizontal-grid-coverage/v1"
+        or summary.get("grid", {}).get("lane_count") != 11
+        or not isinstance(lanes, list)
+        or len(lanes) != 11
+        or playlist.get("schema") != "g1-horizontal-grid-playlist/v1"
+        or playlist.get("frame_count") != frame_count
+        or not isinstance(segments, list)
+    ):
+        raise ContractError("grid viewer metadata contract is invalid")
+    validated_lanes = []
+    lane_ids = set()
+    for expected_index, lane in enumerate(lanes):
+        try:
+            lane_id = str(lane["lane_id"])
+            lane_index = int(lane["lane_index"])
+            center_y = float(lane["center_y_m"])
+            classification = str(lane["classification"])
+            polyline = np.asarray(
+                lane["path_polyline_matcher_xyz"], dtype=np.float64
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ContractError("grid viewer lane is invalid") from error
+        if (
+            not lane_id
+            or lane_id in lane_ids
+            or lane_index != expected_index
+            or not math.isfinite(center_y)
+            or classification not in ("full", "partial", "infeasible")
+            or polyline.ndim != 2
+            or polyline.shape[0] < 2
+            or polyline.shape[1] != 3
+            or not np.isfinite(polyline).all()
+        ):
+            raise ContractError("grid viewer lane is invalid")
+        lane_ids.add(lane_id)
+        validated_lanes.append(
+            {
+                **lane,
+                "lane_id": lane_id,
+                "lane_index": lane_index,
+                "center_y_m": center_y,
+                "classification": classification,
+                "path_polyline_matcher_xyz": polyline,
+            }
+        )
+    validated_segments = []
+    previous_stop = 0
+    for segment in segments:
+        try:
+            lane_id = str(segment["lane_id"])
+            start, stop = (
+                int(value) for value in segment["segment_frames"]
+            )
+            motion_start, motion_stop = (
+                int(value) for value in segment["motion_frames"]
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ContractError("grid viewer segment is invalid") from error
+        if (
+            lane_id not in lane_ids
+            or not 0 <= start <= motion_start < motion_stop <= stop
+            or stop > frame_count
+            or start != previous_stop
+        ):
+            raise ContractError("grid viewer segment is invalid")
+        validated_segments.append(
+            {
+                **segment,
+                "lane_id": lane_id,
+                "segment_frames": [start, stop],
+                "motion_frames": [motion_start, motion_stop],
+            }
+        )
+        previous_stop = stop
+    if validated_segments and previous_stop != frame_count:
+        raise ContractError("grid viewer playlist does not cover all frames")
+    return {
+        "lanes": validated_lanes,
+        "segments": validated_segments,
+    }
+
+
+def _grid_line_colors(
+    overlay: dict[str, object],
+    *,
+    current_lane_id: str | None,
+) -> tuple[tuple[float, float, float, float], ...]:
+    palette = {
+        "full": (0.1, 0.9, 0.2, 0.9),
+        "partial": (1.0, 0.65, 0.0, 0.9),
+        "infeasible": (0.9, 0.1, 0.1, 0.9),
+    }
+    return tuple(
+        (
+            (1.0, 1.0, 1.0, 1.0)
+            if lane["lane_id"] == current_lane_id
+            else palette[str(lane["classification"])]
+        )
+        for lane in overlay["lanes"]
+    )
+
+
+def _active_grid_segment(
+    overlay: dict[str, object], frame: int
+) -> dict[str, object] | None:
+    for segment in overlay["segments"]:
+        start, stop = segment["segment_frames"]
+        if start <= frame < stop:
+            return segment
+    return None
+
+
+def _set_grid_markers(
+    mujoco_module,
+    viewer,
+    overlay: dict[str, object],
+    *,
+    current_lane_id: str | None,
+) -> None:
+    scene = viewer.user_scn
+    segment_count = sum(
+        len(lane["path_polyline_matcher_xyz"]) - 1
+        for lane in overlay["lanes"]
+    )
+    if scene is None or scene.maxgeom < segment_count:
+        raise ContractError("MuJoCo user scene cannot hold path grid")
+    colors = _grid_line_colors(
+        overlay, current_lane_id=current_lane_id
+    )
+    scene.ngeom = 0
+    for lane, color in zip(overlay["lanes"], colors):
+        polyline = lane["path_polyline_matcher_xyz"]
+        for start, stop in zip(polyline[:-1], polyline[1:]):
+            mujoco_module.mjv_connector(
+                scene.geoms[scene.ngeom],
+                mujoco_module.mjtGeom.mjGEOM_CAPSULE,
+                0.008,
+                start,
+                stop,
+            )
+            scene.geoms[scene.ngeom].rgba[:] = np.asarray(
+                color, dtype=np.float32
+            )
+            scene.ngeom += 1
 
 
 def _render_contact_sheet(
@@ -143,6 +306,19 @@ def main() -> int:
     except ImportError as error:
         raise ContractError("stair pivot viewer requires MuJoCo") from error
     arrays = _load_connector(args.connector)
+    if (args.grid_summary is None) != (args.playlist_metadata is None):
+        raise ContractError(
+            "grid summary and playlist metadata must be provided together"
+        )
+    grid_overlay = (
+        None
+        if args.grid_summary is None
+        else _load_grid_overlay(
+            args.grid_summary,
+            args.playlist_metadata,
+            frame_count=len(arrays["joint_position"]),
+        )
+    )
     resolved = resolve_stair_config(
         args.dataset,
         load_experiment_config(args.config),
@@ -205,15 +381,38 @@ def main() -> int:
                 )
                 data.qvel[:] = 0.0
                 mujoco.mj_forward(model, data)
+                active = (
+                    None
+                    if grid_overlay is None
+                    else _active_grid_segment(grid_overlay, frame)
+                )
                 with viewer.lock():
                     viewer.cam.lookat[:] = data.qpos[:3]
+                    if grid_overlay is not None:
+                        _set_grid_markers(
+                            mujoco,
+                            viewer,
+                            grid_overlay,
+                            current_lane_id=(
+                                None
+                                if active is None
+                                else str(active["lane_id"])
+                            ),
+                        )
+                lane_text = ""
+                if active is not None:
+                    lane_text = (
+                        f"\nlane={active['lane_id']} "
+                        f"y={float(active['center_y_m']):+.1f}m "
+                        f"{active['classification']}"
+                    )
                 viewer.set_texts(
                     (
                         None,
                         None,
                         "KINEMATIC STAIR PIVOT / NO PHYSICS\n"
                         "Space pause  arrows step  Backspace rewind  X exit",
-                        f"frame={frame + 1}/{frame_count}",
+                        f"frame={frame + 1}/{frame_count}{lane_text}",
                     )
                 )
                 viewer.sync()
