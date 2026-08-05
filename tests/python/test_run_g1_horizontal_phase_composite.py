@@ -6,6 +6,7 @@ from resources.run_g1_horizontal_phase_composite import (
     _accepted_metrics,
     _oriented_sole_contact_metrics,
     _phase_source_slice,
+    _terminal_supported_stop,
 )
 
 
@@ -60,6 +61,20 @@ class HorizontalPhaseCompositeRunnerTests(unittest.TestCase):
         self.assertEqual(metrics["unsupported_frame_count"], 0)
         self.assertAlmostEqual(metrics["maximum_stance_error_m"], 0.02)
         self.assertAlmostEqual(metrics["minimum_sole_clearance_m"], -0.01)
+
+    def test_trims_only_contiguous_unsupported_terminal_tail(self):
+        support = np.array(
+            (
+                (True, False),
+                (False, False),
+                (False, True),
+                (False, False),
+                (False, False),
+            ),
+            dtype=np.bool_,
+        )
+
+        self.assertEqual(_terminal_supported_stop(support), 3)
 
 
 if __name__ == "__main__":

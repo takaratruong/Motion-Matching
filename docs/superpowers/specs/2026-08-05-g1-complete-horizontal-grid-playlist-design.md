@@ -22,8 +22,9 @@ and every frame has at least one supported foot.
 Concatenate all accepted complete traversals with frozen separator frames and
 write playlist metadata that identifies the active lane. Emit an explicit
 per-lane result for all 11 lines: `complete` when all three phases compose and
-pass, otherwise `infeasible` with the failed phase or terrain gate. A high
-mount that cannot be produced by the library is a valid infeasible result.
+pass, `infeasible` only when an explicit height or terrain gate rules it out,
+and `unresolved` when retrieval or composition has not yet produced all three
+phases. A search miss alone is not proof of physical infeasibility.
 
 ## Verification
 

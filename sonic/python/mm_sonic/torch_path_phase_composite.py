@@ -60,36 +60,40 @@ def _joint_velocity(joints: np.ndarray) -> np.ndarray:
 
 
 def _select_overlap(
-    mount: dict[str, np.ndarray],
-    interior: dict[str, np.ndarray],
+    first: dict[str, np.ndarray],
+    second: dict[str, np.ndarray],
     *,
     blend_frames: int,
     maximum_root_gap_m: float,
+    first_frame_minimum: int = 0,
+    label: str = "mount/interior",
 ) -> tuple[int, int, float]:
-    mount_velocity = _joint_velocity(mount["joint_position"])
-    interior_velocity = _joint_velocity(interior["joint_position"])
+    first_velocity = _joint_velocity(first["joint_position"])
+    second_velocity = _joint_velocity(second["joint_position"])
     candidates = []
-    maximum_interior_frame = len(interior["joint_position"]) - blend_frames
-    for mount_frame in range(len(mount["joint_position"])):
-        for interior_frame in range(maximum_interior_frame + 1):
+    maximum_second_frame = len(second["joint_position"]) - blend_frames
+    for first_frame in range(
+        first_frame_minimum, len(first["joint_position"])
+    ):
+        for second_frame in range(maximum_second_frame + 1):
             root_gap = float(
                 np.linalg.norm(
-                    mount["root_position_world"][mount_frame]
-                    - interior["root_position_world"][interior_frame]
+                    first["root_position_world"][first_frame]
+                    - second["root_position_world"][second_frame]
                 )
             )
             if root_gap > maximum_root_gap_m:
                 continue
             joint_gap = float(
                 np.linalg.norm(
-                    mount["joint_position"][mount_frame]
-                    - interior["joint_position"][interior_frame]
+                    first["joint_position"][first_frame]
+                    - second["joint_position"][second_frame]
                 )
             )
             velocity_gap = float(
                 np.linalg.norm(
-                    mount_velocity[mount_frame]
-                    - interior_velocity[interior_frame]
+                    first_velocity[first_frame]
+                    - second_velocity[second_frame]
                 )
             )
             score = (
@@ -98,19 +102,19 @@ def _select_overlap(
                 + 0.02 * velocity_gap
                 + 1.0e-6
                 * (
-                    len(mount["joint_position"])
+                    len(first["joint_position"])
                     - 1
-                    - mount_frame
-                    + interior_frame
+                    - first_frame
+                    + second_frame
                 )
             )
             candidates.append(
-                (score, root_gap, mount_frame, interior_frame)
+                (score, root_gap, first_frame, second_frame)
             )
     if not candidates:
-        raise ContractError("path phase mount/interior overlap is unavailable")
-    _, root_gap, mount_frame, interior_frame = min(candidates)
-    return int(mount_frame), int(interior_frame), float(root_gap)
+        raise ContractError(f"path phase {label} overlap is unavailable")
+    _, root_gap, first_frame, second_frame = min(candidates)
+    return int(first_frame), int(second_frame), float(root_gap)
 
 
 def _blend(
@@ -185,33 +189,41 @@ def compose_path_phases(
     ):
         raise ContractError("path phase blend exceeds a source phase")
 
-    interior_shift = (
-        placed_dismount["root_position_world"][0]
-        - placed_interior["root_position_world"][-1]
-    )
-    placed_interior["root_position_world"] += interior_shift
+    interior_shift = np.zeros(3, dtype=np.float64)
     mount_frame, interior_frame, first_root_gap = _select_overlap(
         placed_mount,
         placed_interior,
         blend_frames=blend_frames,
         maximum_root_gap_m=float(maximum_root_gap_m),
     )
+    interior_stop_frame, dismount_frame, second_root_gap = _select_overlap(
+        placed_interior,
+        placed_dismount,
+        blend_frames=blend_frames,
+        maximum_root_gap_m=float(maximum_root_gap_m),
+        first_frame_minimum=interior_frame + blend_frames - 1,
+        label="interior/dismount",
+    )
 
     mount_prefix = {
         name: array[: mount_frame + 1]
         for name, array in placed_mount.items()
     }
-    interior_suffix = {
-        name: array[interior_frame:]
+    interior_segment = {
+        name: array[interior_frame : interior_stop_frame + 1]
         for name, array in placed_interior.items()
     }
+    dismount_suffix = {
+        name: array[dismount_frame:]
+        for name, array in placed_dismount.items()
+    }
     blended_interior = _blend(
-        interior_suffix,
+        interior_segment,
         previous=mount_prefix,
         blend_frames=blend_frames,
     )
     blended_dismount = _blend(
-        placed_dismount,
+        dismount_suffix,
         previous=blended_interior,
         blend_frames=blend_frames,
     )
@@ -232,8 +244,8 @@ def compose_path_phases(
         np.concatenate(
             (
                 supports[0][: mount_frame + 1],
-                supports[1][interior_frame:],
-                supports[2],
+                supports[1][interior_frame : interior_stop_frame + 1],
+                supports[2][dismount_frame:],
             ),
             axis=0,
         )
@@ -248,14 +260,11 @@ def compose_path_phases(
         "blend_frames": blend_frames,
         "mount_source_stop_frame": mount_frame + 1,
         "interior_source_start_frame": interior_frame,
+        "interior_source_stop_frame": interior_stop_frame + 1,
+        "dismount_source_start_frame": dismount_frame,
         "interior_translation_matcher_xyz": interior_shift.tolist(),
         "mount_interior_root_gap_m": first_root_gap,
-        "interior_dismount_root_gap_m": float(
-            np.linalg.norm(
-                placed_interior["root_position_world"][-1]
-                - placed_dismount["root_position_world"][0]
-            )
-        ),
+        "interior_dismount_root_gap_m": second_root_gap,
         "splice_output_frames": [first_boundary, second_boundary],
         "maximum_joint_step_rad": float(
             np.abs(np.diff(arrays["joint_position"], axis=0)).max()

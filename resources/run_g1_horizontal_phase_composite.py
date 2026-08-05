@@ -108,6 +108,16 @@ def _oriented_sole_contact_metrics(
     return np.asarray(support, dtype=np.bool_), metrics
 
 
+def _terminal_supported_stop(support: object) -> int:
+    array = np.asarray(support)
+    if array.ndim != 2 or array.shape[1] != 2 or array.dtype != np.bool_:
+        raise ContractError("target support mask is invalid")
+    supported = np.flatnonzero(array.any(axis=1))
+    if not len(supported):
+        raise ContractError("composite has no supported frame")
+    return int(supported[-1]) + 1
+
+
 def _load_json(path: Path) -> dict[str, object]:
     try:
         value = json.loads(path.read_text())
@@ -210,6 +220,32 @@ def main() -> int:
     sole_clearance = soles[..., 2] - sole_surface
     target_support, contact_metrics = _oriented_sole_contact_metrics(
         sole_clearance
+    )
+    original_frame_count = len(target_support)
+    supported_stop = _terminal_supported_stop(target_support)
+    if supported_stop < original_frame_count:
+        arrays = {
+            name: np.ascontiguousarray(value[:supported_stop])
+            for name, value in arrays.items()
+        }
+        composed_source_support = np.ascontiguousarray(
+            composed_source_support[:supported_stop]
+        )
+        sole_clearance = sole_clearance[:supported_stop]
+        target_support, contact_metrics = _oriented_sole_contact_metrics(
+            sole_clearance
+        )
+        metrics["frame_count"] = supported_stop
+        metrics["maximum_joint_step_rad"] = float(
+            np.abs(np.diff(arrays["joint_position"], axis=0)).max()
+        )
+        metrics["maximum_root_step_m"] = float(
+            np.linalg.norm(
+                np.diff(arrays["root_position_world"], axis=0), axis=1
+            ).max()
+        )
+    metrics["trimmed_terminal_frame_count"] = (
+        original_frame_count - supported_stop
     )
     metrics.update(contact_metrics)
     metrics.update(

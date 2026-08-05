@@ -113,6 +113,35 @@ class PathPhaseCompositeTests(unittest.TestCase):
 
         self.assertFalse(support[4].any())
 
+    def test_uses_existing_second_overlap_without_translating_interior(self):
+        mount = self.connector(0.0, 1.0, 40)
+        interior = self.connector(0.65, 1.8, 50)
+        dismount = self.connector(1.3, 2.4, 45)
+
+        _, _, metrics = compose_path_phases(
+            mount=mount,
+            interior=interior,
+            dismount=dismount,
+            mount_support=np.ones((40, 2), dtype=np.bool_),
+            interior_support=np.ones((50, 2), dtype=np.bool_),
+            dismount_support=np.ones((45, 2), dtype=np.bool_),
+            blend_frames=10,
+        )
+
+        np.testing.assert_allclose(
+            metrics["interior_translation_matcher_xyz"],
+            (0.0, 0.0, 0.0),
+            atol=0.0,
+        )
+        self.assertLessEqual(
+            metrics["interior_dismount_root_gap_m"],
+            0.12,
+        )
+        self.assertLess(
+            metrics["interior_source_start_frame"],
+            metrics["interior_source_stop_frame"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
