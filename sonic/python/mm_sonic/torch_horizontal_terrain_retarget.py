@@ -12,6 +12,151 @@ from .joints import ContractError, PINNED_TARGET_TO_SOURCE_PERMUTATION
 from .torch_g1_fk import MujocoG1FootKinematics, target_state_qpos
 
 
+def stance_segment_anchors(
+    *,
+    foot_position_world: object,
+    support_mask: object,
+    preserve_segment_endpoints: bool = False,
+) -> np.ndarray:
+    """Hold each continuous support interval at its touchdown position."""
+
+    feet = np.asarray(foot_position_world, dtype=np.float64)
+    support = np.asarray(support_mask)
+    if (
+        feet.ndim != 3
+        or feet.shape[1:] != (2, 3)
+        or len(feet) < 1
+        or support.shape != feet.shape[:2]
+        or support.dtype != np.bool_
+        or type(preserve_segment_endpoints) is not bool
+        or not np.isfinite(feet).all()
+        or not bool(support.any(axis=1).all())
+    ):
+        raise ContractError("stance segment anchor input is invalid")
+    anchors = np.full_like(feet, np.nan)
+    for foot in range(2):
+        starts = np.flatnonzero(
+            support[:, foot]
+            & np.concatenate(
+                (np.ones(1, dtype=np.bool_), ~support[:-1, foot])
+            )
+        )
+        stops = np.flatnonzero(
+            support[:, foot]
+            & np.concatenate(
+                (~support[1:, foot], np.ones(1, dtype=np.bool_))
+            )
+        )
+        for start, stop in zip(starts, stops):
+            count = int(stop - start + 1)
+            if preserve_segment_endpoints and count > 1:
+                alpha = np.linspace(0.0, 1.0, count)
+                smooth = alpha * alpha * (3.0 - 2.0 * alpha)
+                anchors[start : stop + 1, foot] = (
+                    (1.0 - smooth[:, None]) * feet[start, foot]
+                    + smooth[:, None] * feet[stop, foot]
+                )
+            else:
+                anchors[start : stop + 1, foot] = feet[start, foot]
+    return anchors
+
+
+def raise_penetrating_stance_anchors(
+    *,
+    stance_anchor_world: object,
+    support_mask: object,
+    minimum_sole_clearance_by_foot_m: object,
+    penetration_threshold_m: float = -0.025,
+    clearance_target_m: float = -0.020,
+) -> np.ndarray:
+    """Lift an entire support interval when its touchdown penetrates terrain."""
+
+    anchors = np.asarray(stance_anchor_world, dtype=np.float64)
+    support = np.asarray(support_mask)
+    clearance = np.asarray(
+        minimum_sole_clearance_by_foot_m, dtype=np.float64
+    )
+    if (
+        anchors.ndim != 3
+        or anchors.shape[1:] != (2, 3)
+        or support.shape != anchors.shape[:2]
+        or support.dtype != np.bool_
+        or clearance.shape != support.shape
+        or not bool(support.any(axis=1).all())
+        or not np.isfinite(anchors[support]).all()
+        or not np.isfinite(clearance).all()
+        or not math.isfinite(float(penetration_threshold_m))
+        or not math.isfinite(float(clearance_target_m))
+        or penetration_threshold_m >= clearance_target_m
+    ):
+        raise ContractError("stance anchor clearance input is invalid")
+    output = anchors.copy()
+    for foot in range(2):
+        start: int | None = None
+        for frame in range(len(anchors)):
+            if support[frame, foot] and start is None:
+                start = frame
+                if clearance[frame, foot] < penetration_threshold_m:
+                    lift = clearance_target_m - clearance[frame, foot]
+                    output[frame, foot, 2] += lift
+            elif support[frame, foot] and start is not None:
+                output[frame, foot, 2] = output[start, foot, 2]
+            else:
+                start = None
+    return output
+
+
+def contact_repair_targets(
+    *,
+    foot_position_world: object,
+    support_mask: object,
+    stance_anchor_world: object,
+    minimum_sole_clearance_by_foot_m: object,
+    swing_clearance_margin_m: float,
+    maximum_swing_lift_per_solve_m: float,
+    swing_collision_threshold_m: float = -0.020,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Constrain stance anchors and incrementally lift colliding swing feet."""
+
+    feet = np.asarray(foot_position_world, dtype=np.float64)
+    support = np.asarray(support_mask)
+    anchors = np.asarray(stance_anchor_world, dtype=np.float64)
+    clearance = np.asarray(
+        minimum_sole_clearance_by_foot_m, dtype=np.float64
+    )
+    scalar_values = (
+        swing_clearance_margin_m,
+        maximum_swing_lift_per_solve_m,
+        swing_collision_threshold_m,
+    )
+    if (
+        feet.shape != (2, 3)
+        or support.shape != (2,)
+        or support.dtype != np.bool_
+        or not bool(support.any())
+        or anchors.shape != (2, 3)
+        or clearance.shape != (2,)
+        or not np.isfinite(feet).all()
+        or not np.isfinite(anchors[support]).all()
+        or not np.isfinite(clearance).all()
+        or any(not math.isfinite(float(value)) for value in scalar_values)
+        or swing_clearance_margin_m < 0.0
+        or maximum_swing_lift_per_solve_m <= 0.0
+        or swing_collision_threshold_m >= swing_clearance_margin_m
+    ):
+        raise ContractError("contact repair target input is invalid")
+    colliding_swing = (~support) & (
+        clearance < float(swing_collision_threshold_m)
+    )
+    targets = feet.copy()
+    targets[support] = anchors[support]
+    targets[colliding_swing, 2] += np.minimum(
+        float(maximum_swing_lift_per_solve_m),
+        float(swing_clearance_margin_m) - clearance[colliding_swing],
+    )
+    return support | colliding_swing, targets
+
+
 def nearest_valid_sole_translation(
     *,
     sole_point_scene_xy: object,
@@ -174,6 +319,11 @@ class WideBoundG1TerrainRetargeter:
         maximum_root_height_deviation_m: float = 0.20,
         maximum_root_horizontal_deviation_m: float = 1.0e-6,
         maximum_target_error_m: float = 0.005,
+        maximum_warm_joint_step_rad: float = 0.25,
+        foot_position_scale: float = 100.0,
+        foot_orientation_scale: float = 5.0,
+        center_of_mass_scale: float = 10.0,
+        hip_yaw_posture_scale: float = 0.003,
     ) -> None:
         if (
             not math.isfinite(float(maximum_joint_deviation_rad))
@@ -186,6 +336,16 @@ class WideBoundG1TerrainRetargeter:
             or maximum_root_horizontal_deviation_m <= 0.0
             or not math.isfinite(float(maximum_target_error_m))
             or maximum_target_error_m <= 0.0
+            or not math.isfinite(float(maximum_warm_joint_step_rad))
+            or maximum_warm_joint_step_rad <= 0.0
+            or not math.isfinite(float(foot_position_scale))
+            or foot_position_scale <= 0.0
+            or not math.isfinite(float(foot_orientation_scale))
+            or foot_orientation_scale <= 0.0
+            or not math.isfinite(float(center_of_mass_scale))
+            or center_of_mass_scale <= 0.0
+            or not math.isfinite(float(hip_yaw_posture_scale))
+            or hip_yaw_posture_scale <= 0.0
         ):
             raise ContractError("horizontal terrain retarget bounds are invalid")
         self._kinematics = MujocoG1FootKinematics(g1_xml)
@@ -195,6 +355,13 @@ class WideBoundG1TerrainRetargeter:
             maximum_root_horizontal_deviation_m
         )
         self._maximum_target_error = float(maximum_target_error_m)
+        self._maximum_warm_joint_step = float(
+            maximum_warm_joint_step_rad
+        )
+        self._foot_position_scale = float(foot_position_scale)
+        self._foot_orientation_scale = float(foot_orientation_scale)
+        self._center_of_mass_scale = float(center_of_mass_scale)
+        self._hip_yaw_posture_scale = float(hip_yaw_posture_scale)
 
     @property
     def kinematics(self) -> MujocoG1FootKinematics:
@@ -207,7 +374,11 @@ class WideBoundG1TerrainRetargeter:
         root_position_world: object,
         root_orientation_world_wxyz: object,
         solve_feet: object,
+        enforce_target_error_feet: object | None = None,
         target_foot_position_world: object,
+        target_foot_position_weights: object | None = None,
+        target_foot_rotation_world: object | None = None,
+        target_center_of_mass_world_xy: object | None = None,
         level_feet: object | None = None,
         initial_joint_position: object | None = None,
         initial_root_position_world: object | None = None,
@@ -218,7 +389,29 @@ class WideBoundG1TerrainRetargeter:
             root_orientation_world_wxyz, dtype=np.float64
         )
         mask = np.asarray(solve_feet)
+        required_mask = (
+            np.asarray(enforce_target_error_feet)
+            if enforce_target_error_feet is not None
+            else mask.copy()
+        )
         targets = np.asarray(target_foot_position_world, dtype=np.float64)
+        position_weights = (
+            np.asarray(target_foot_position_weights, dtype=np.float64)
+            if target_foot_position_weights is not None
+            else np.ones(2, dtype=np.float64)
+        )
+        rotation_targets = (
+            np.asarray(target_foot_rotation_world, dtype=np.float64)
+            if target_foot_rotation_world is not None
+            else None
+        )
+        center_of_mass_target = (
+            np.asarray(
+                target_center_of_mass_world_xy, dtype=np.float64
+            )
+            if target_center_of_mass_world_xy is not None
+            else None
+        )
         level_mask = (
             np.asarray(level_feet)
             if level_feet is not None
@@ -245,7 +438,39 @@ class WideBoundG1TerrainRetargeter:
             or mask.dtype != np.bool_
             or mask.shape != (2,)
             or not bool(mask.any())
+            or required_mask.dtype != np.bool_
+            or required_mask.shape != (2,)
+            or not bool(required_mask.any())
+            or bool((required_mask & ~mask).any())
             or targets.shape != (2, 3)
+            or position_weights.shape != (2,)
+            or not np.isfinite(position_weights).all()
+            or bool((position_weights <= 0.0).any())
+            or (
+                center_of_mass_target is not None
+                and (
+                    center_of_mass_target.shape != (2,)
+                    or not np.isfinite(center_of_mass_target).all()
+                )
+            )
+            or (
+                rotation_targets is not None
+                and (
+                    rotation_targets.shape != (2, 3, 3)
+                    or not np.isfinite(rotation_targets).all()
+                    or not np.allclose(
+                        np.swapaxes(rotation_targets, 1, 2)
+                        @ rotation_targets,
+                        np.eye(3),
+                        atol=1.0e-4,
+                    )
+                    or not np.allclose(
+                        np.linalg.det(rotation_targets),
+                        1.0,
+                        atol=1.0e-4,
+                    )
+                )
+            )
             or level_mask.dtype != np.bool_
             or level_mask.shape != (2,)
             or bool((level_mask & ~mask).any())
@@ -292,12 +517,28 @@ class WideBoundG1TerrainRetargeter:
             int(index): (
                 np.array((0.0, 0.0, 1.0), dtype=np.float64)
                 if level_mask[index]
-                else data.xmat[
-                    kinematics._foot_body_ids[index]
-                ].reshape(3, 3)[:, 2].copy()
+                else (
+                    rotation_targets[index, :, 2].copy()
+                    if rotation_targets is not None
+                    else data.xmat[
+                        kinematics._foot_body_ids[index]
+                    ].reshape(3, 3)[:, 2].copy()
+                )
             )
             for index in selected_feet
         }
+        heading_targets = {}
+        if rotation_targets is not None:
+            for index in selected_feet:
+                target_z = orientation_targets[int(index)]
+                target_x = rotation_targets[index, :, 0].copy()
+                target_x -= float(target_x @ target_z) * target_z
+                norm = float(np.linalg.norm(target_x))
+                if norm <= 1.0e-6:
+                    raise ContractError(
+                        "horizontal terrain retarget foot heading is invalid"
+                    )
+                heading_targets[int(index)] = target_x / norm
         seed_joints = data.qpos[selected_qpos].copy()
         seed = np.concatenate((seed_joints, root))
         lower = np.concatenate(
@@ -333,19 +574,28 @@ class WideBoundG1TerrainRetargeter:
             initial = np.concatenate(
                 (initial_qpos[selected_qpos], initial_root)
             )
-            lower[:-3] = np.maximum(
-                lower[:-3], initial[:-3] - 0.25
+            base_lower = lower.copy()
+            base_upper = upper.copy()
+            warm_lower = lower.copy()
+            warm_upper = upper.copy()
+            warm_lower[:-3] = np.maximum(
+                warm_lower[:-3],
+                initial[:-3] - self._maximum_warm_joint_step,
             )
-            upper[:-3] = np.minimum(
-                upper[:-3], initial[:-3] + 0.25
+            warm_upper[:-3] = np.minimum(
+                warm_upper[:-3],
+                initial[:-3] + self._maximum_warm_joint_step,
             )
             root_step = np.array((0.02, 0.02, 0.02))
-            lower[-3:] = np.maximum(
-                lower[-3:], initial_root - root_step
+            warm_lower[-3:] = np.maximum(
+                warm_lower[-3:], initial_root - root_step
             )
-            upper[-3:] = np.minimum(
-                upper[-3:], initial_root + root_step
+            warm_upper[-3:] = np.minimum(
+                warm_upper[-3:], initial_root + root_step
             )
+            disjoint = warm_lower > warm_upper
+            lower = np.where(disjoint, base_lower, warm_lower)
+            upper = np.where(disjoint, base_upper, warm_upper)
             collapsed = upper - lower < 2.0e-9
             if bool(collapsed.any()):
                 middle = 0.5 * (lower[collapsed] + upper[collapsed])
@@ -365,10 +615,15 @@ class WideBoundG1TerrainRetargeter:
         # Position-only IK otherwise uses extreme ankle pitch/roll to satisfy
         # unequal tread heights, tipping a sole through the neighboring tread.
         for selected_order in range(len(selected_feet)):
+            posture_scale[selected_order * 6 + 2] = (
+                self._hip_yaw_posture_scale
+            )
             posture_scale[selected_order * 6 + 4 : selected_order * 6 + 6] = 0.3
         root_scale = np.array((0.1, 0.1, 0.01), dtype=np.float64)
-        orientation_scale = 5.0
-        position_scale = 100.0
+        orientation_scales = self._foot_orientation_scale * np.where(
+            position_weights >= 20.0, 2.0, 1.0
+        )
+        position_scales = self._foot_position_scale * position_weights
 
         def set_state(value: np.ndarray) -> None:
             data.qpos[selected_qpos] = value[:-3]
@@ -379,7 +634,7 @@ class WideBoundG1TerrainRetargeter:
             set_state(value)
             feet = np.concatenate(
                 [
-                    position_scale
+                    position_scales[index]
                     * (
                         data.xpos[kinematics._foot_body_ids[index]]
                         - targets[index]
@@ -389,7 +644,7 @@ class WideBoundG1TerrainRetargeter:
             )
             orientations = np.concatenate(
                 [
-                    orientation_scale
+                    orientation_scales[index]
                     * (
                         data.xmat[
                             kinematics._foot_body_ids[index]
@@ -399,9 +654,36 @@ class WideBoundG1TerrainRetargeter:
                     for index in selected_feet
                 ]
             )
+            headings = (
+                np.concatenate(
+                    [
+                        orientation_scales[index]
+                        * (
+                            data.xmat[
+                                kinematics._foot_body_ids[index]
+                            ].reshape(3, 3)[:, 0]
+                            - heading_targets[int(index)]
+                        )
+                        for index in selected_feet
+                    ]
+                )
+                if heading_targets
+                else np.empty(0, dtype=np.float64)
+            )
+            center_of_mass = (
+                self._center_of_mass_scale
+                * (
+                    data.subtree_com[kinematics._pelvis_body_id, :2]
+                    - center_of_mass_target
+                )
+                if center_of_mass_target is not None
+                else np.empty(0, dtype=np.float64)
+            )
             values = [
                 feet,
                 orientations,
+                headings,
+                center_of_mass,
                 posture_scale * (value[:-3] - seed_joints),
                 root_scale * (value[-3:] - root),
             ]
@@ -415,6 +697,7 @@ class WideBoundG1TerrainRetargeter:
             set_state(value)
             foot_rows = []
             orientation_rows = []
+            heading_rows = []
             for index in selected_feet:
                 row = np.zeros((3, model.nv), dtype=np.float64)
                 rotation_row = np.zeros(
@@ -428,7 +711,7 @@ class WideBoundG1TerrainRetargeter:
                     int(kinematics._foot_body_ids[index]),
                 )
                 foot_rows.append(
-                    position_scale
+                    position_scales[index]
                     * np.concatenate(
                         (
                             row[:, selected_dofs],
@@ -450,7 +733,7 @@ class WideBoundG1TerrainRetargeter:
                 orientation_rows.append(
                     np.concatenate(
                         (
-                            -orientation_scale
+                            -orientation_scales[index]
                             * skew
                             @ rotation_row[:, selected_dofs],
                             np.zeros((3, 3)),
@@ -458,6 +741,28 @@ class WideBoundG1TerrainRetargeter:
                         axis=1,
                     )
                 )
+                if heading_targets:
+                    body_x = data.xmat[
+                        kinematics._foot_body_ids[index]
+                    ].reshape(3, 3)[:, 0]
+                    x_skew = np.array(
+                        (
+                            (0.0, -body_x[2], body_x[1]),
+                            (body_x[2], 0.0, -body_x[0]),
+                            (-body_x[1], body_x[0], 0.0),
+                        )
+                    )
+                    heading_rows.append(
+                        np.concatenate(
+                            (
+                                -orientation_scales[index]
+                                * x_skew
+                                @ rotation_row[:, selected_dofs],
+                                np.zeros((3, 3)),
+                            ),
+                            axis=1,
+                        )
+                    )
             posture = np.concatenate(
                 (
                     np.diag(posture_scale),
@@ -467,7 +772,37 @@ class WideBoundG1TerrainRetargeter:
             )
             root_row = np.zeros((3, len(selected_dofs) + 3))
             root_row[:, -3:] = np.diag(root_scale)
-            rows = [*foot_rows, *orientation_rows, posture, root_row]
+            center_of_mass_rows = []
+            if center_of_mass_target is not None:
+                center_of_mass_jacobian = np.zeros(
+                    (3, model.nv), dtype=np.float64
+                )
+                mujoco.mj_jacSubtreeCom(
+                    model,
+                    data,
+                    center_of_mass_jacobian,
+                    kinematics._pelvis_body_id,
+                )
+                center_of_mass_rows.append(
+                    self._center_of_mass_scale
+                    * np.concatenate(
+                        (
+                            center_of_mass_jacobian[
+                                :2, selected_dofs
+                            ],
+                            center_of_mass_jacobian[:2, :3],
+                        ),
+                        axis=1,
+                    )
+                )
+            rows = [
+                *foot_rows,
+                *orientation_rows,
+                *heading_rows,
+                *center_of_mass_rows,
+                posture,
+                root_row,
+            ]
             if has_initial:
                 rows.append(
                     np.concatenate(
@@ -492,17 +827,30 @@ class WideBoundG1TerrainRetargeter:
             gtol=1e-10,
         )
         set_state(result.x)
-        errors = [
-            np.linalg.norm(
-                data.xpos[kinematics._foot_body_ids[index]]
-                - targets[index]
+        errors = {
+            int(index): float(
+                np.linalg.norm(
+                    data.xpos[kinematics._foot_body_ids[index]]
+                    - targets[index]
+                )
             )
             for index in selected_feet
+        }
+        error_vectors = {
+            int(index): (
+                data.xpos[kinematics._foot_body_ids[index]]
+                - targets[index]
+            ).tolist()
+            for index in selected_feet
+        }
+        required_errors = [
+            errors[int(index)] for index in np.flatnonzero(required_mask)
         ]
-        if max(errors) > self._maximum_target_error:
+        if max(required_errors) > self._maximum_target_error:
             raise ContractError(
                 "horizontal terrain retarget target is unreachable: "
-                f"{max(errors):.6f} m (per-foot={errors})"
+                f"{max(required_errors):.6f} m "
+                f"(per-foot={errors}, delta={error_vectors})"
             )
         source_joints = np.asarray(data.qpos[7:], dtype=np.float64)
         target_joints = source_joints[
