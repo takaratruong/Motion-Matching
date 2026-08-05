@@ -64,6 +64,22 @@ def test_motionbricks_context_is_resampled_at_thirty_hertz() -> None:
     )
 
 
+def test_terminal_course_with_one_entry_seam_loads(tmp_path) -> None:
+    course = _course()
+    path = tmp_path / "terminal_course.npz"
+    np.savez_compressed(
+        path,
+        fps=np.asarray(course.fps),
+        root_position_world=course.root_position_world,
+        root_quaternion_world_wxyz=course.root_quaternion_world_wxyz,
+        joint_position=course.joint_position_isaaclab,
+        seam_indices=np.asarray((40,), dtype=np.int64),
+    )
+    loaded = MotionBricksTerrainCourse.load(path)
+    assert loaded.seam_indices == (40,)
+    assert loaded.frame_count == course.frame_count
+
+
 def test_portal_catalog_prefers_the_compatible_entry_family() -> None:
     first = _course()
     shifted_root = first.root_position_world.copy()

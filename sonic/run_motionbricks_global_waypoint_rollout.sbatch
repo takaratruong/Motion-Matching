@@ -17,8 +17,9 @@ set -euo pipefail
 PROJECT=/move/u/bodow/Projects/Motion-Matching-takara-corpus
 MOTIONBRICKS=/move/u/bodow/Projects/reference-nvidia-groot-wbc/motionbricks
 DIFFUSION=/move/u/bodow/Projects/TML-BeyondMimic-autoresearch-simple-policy
-MANIFEST=${PROJECT}/artifacts/generic_terrain/waypoint_routes/canary_portal_aligned_s_v2/portals_v1/portal_manifest.json
+MANIFEST=${TAKARA_MANIFEST:-${PROJECT}/artifacts/generic_terrain/waypoint_routes/canary_portal_aligned_s_v2/portals_v1/portal_manifest.json}
 OUTPUT=${TAKARA_OUTPUT:-${PROJECT}/artifacts/generic_terrain/waypoint_routes/canary_portal_aligned_s_v2/live_rollout_seed17_v5_tangent_resume}
+MAXIMUM_TICKS=${TAKARA_MAXIMUM_TICKS:-2400}
 
 cd "${PROJECT}"
 export PYTHONPATH="${PROJECT}/sonic/python:${MOTIONBRICKS}:${MOTIONBRICKS}/scripts:${DIFFUSION}"
@@ -32,4 +33,5 @@ export XDG_CACHE_HOME=/tmp/mb-global-route-cache-${SLURM_JOB_ID}
     --portal-manifest "${MANIFEST}" \
     --motionbricks-root "${MOTIONBRICKS}" \
     --output-dir "${OUTPUT}" \
-    --seed 17
+    --seed 17 \
+    --maximum-ticks "${MAXIMUM_TICKS}"

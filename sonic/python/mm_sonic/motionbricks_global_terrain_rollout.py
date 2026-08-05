@@ -24,7 +24,9 @@ from .gear_action import mujoco_to_isaaclab_joint_vector
 from .motionbricks_global_terrain_viewer import (
     DEFAULT_MOTIONBRICKS_ROOT,
     _guard_flat_velocity,
+    _project_live_root_above_support,
     _submit_motionbricks,
+    _submit_phase_matched_course_exit,
     _terrain_surface_height,
 )
 from .motionbricks_terrain_portal import (
@@ -34,6 +36,7 @@ from .motionbricks_terrain_portal import (
     _yaw_wxyz,
 )
 from .render_stitched_motion import render_stitched_motion
+from .terrain_oracle.reference_stitch import _G1FootfallAdapter
 from .terrain_oracle.stitch import FrameProvenance, StitchedMotion
 
 
@@ -90,99 +93,6 @@ def _course_exit_command(
         speed = 0.58
     mode = "slow_walk" if speed < 0.38 else "walk"
     return velocity, _yaw_wxyz(course.root_quaternion_world_wxyz[-1]), mode
-
-
-def _submit_phase_matched_course_exit(
-    full_agent: object,
-    controller: object,
-    *,
-    context_qpos: np.ndarray,
-    velocity_world_xy: np.ndarray,
-    facing_yaw_world: float,
-    mode_name: str,
-    support_height_world: float,
-) -> dict[str, object]:
-    """Choose the target gait phase that least crouches from a portal exit.
-
-    MotionBricks' ``random_seed`` indexes the target locomotion clip phase.
-    A fixed seed therefore asks every authored landing pose to inbetween toward
-    the same arbitrary gait phase.  Rank a small deterministic phase set by
-    early root-height loss, simultaneous knee flexion, pose gap, and joint
-    step, then leave the agent populated with the best continuation.
-    """
-
-    import torch
-
-    context = np.asarray(context_qpos, dtype=np.float64)
-    if context.ndim != 2 or context.shape[1] != 36:
-        raise ValueError("course exit context must have shape (T,36)")
-    candidates: list[dict[str, float | int]] = []
-    for seed in range(0, 64, 4):
-        _submit_motionbricks(
-            full_agent,
-            controller,
-            context_qpos=context,
-            velocity_world_xy=velocity_world_xy,
-            facing_yaw_world=facing_yaw_world,
-            mode_name=mode_name,
-            force=True,
-            random_seed=seed,
-            support_height_world=support_height_world,
-        )
-        generated_value = full_agent.frames["mujoco_qpos"]
-        generated = (
-            generated_value[0].detach().cpu().numpy()
-            if isinstance(generated_value, torch.Tensor)
-            else np.asarray(generated_value)[0]
-        )
-        horizon = min(len(generated), 24)
-        review = np.asarray(generated[:horizon], dtype=np.float64)
-        root_drop = max(0.0, float(context[-1, 2] - np.min(review[:, 2])))
-        # MuJoCo joint order: left knee is joint 3 and right knee joint 9.
-        double_knee = float(np.max(np.mean(review[:, (10, 16)], axis=1)))
-        pose_gap = float(
-            np.sqrt(np.mean((review[0, 7:] - context[-1, 7:]) ** 2))
-        )
-        joint_step = float(
-            np.max(
-                np.abs(
-                    np.diff(
-                        np.concatenate((context[-1:, 7:], review[:, 7:]), axis=0),
-                        axis=0,
-                    )
-                )
-            )
-        )
-        score = 4.0 * root_drop + 0.20 * double_knee + 0.50 * pose_gap + 0.20 * joint_step
-        candidates.append(
-            {
-                "seed": seed,
-                "score": score,
-                "root_drop_m": root_drop,
-                "double_knee_peak_rad": double_knee,
-                "first_pose_rmse_rad": pose_gap,
-                "maximum_joint_step_rad": joint_step,
-            }
-        )
-    selected = min(candidates, key=lambda value: float(value["score"]))
-    _submit_motionbricks(
-        full_agent,
-        controller,
-        context_qpos=context,
-        velocity_world_xy=velocity_world_xy,
-        facing_yaw_world=facing_yaw_world,
-        mode_name=mode_name,
-        force=True,
-        random_seed=int(selected["seed"]),
-        support_height_world=support_height_world,
-    )
-    return {
-        "selected": selected,
-        "candidate_count": len(candidates),
-        "score_minimum": float(selected["score"]),
-        "score_median": float(np.median([value["score"] for value in candidates])),
-        "score_maximum": float(max(value["score"] for value in candidates)),
-    }
 
 
 def _point_to_polyline_distance(points: np.ndarray, line: np.ndarray) -> np.ndarray:
@@ -347,6 +257,14 @@ def rollout(
         ),
     )
     ray_origin_z = float(np.max(terrain.vertices_world[:, 2]) + 2.0)
+    import zarr
+
+    archive = zarr.open_group(str(C490_ARCHIVE), mode="r")
+    sole_adapter = _G1FootfallAdapter(
+        model_path,
+        tuple(str(value) for value in archive["joint_names"][:]),
+        maximum_joint_correction_rad=0.1,
+    )
 
     root = motionbricks_root.expanduser().resolve()
     for value in (root, root / "scripts"):
@@ -360,13 +278,15 @@ def rollout(
     )
     start_xy = (
         first.root_position_world[0, :2]
-        - 1.35 * first.approach_direction_world_xy
-        + 0.65 * normal
+        - 0.90 * first.approach_direction_world_xy
+        + 0.35 * normal
     )
     last = courses[-1]
-    last_direction = last.approach_direction_world_xy
-    last_normal = np.asarray((-last_direction[1], last_direction[0]))
-    final_xy = last.root_position_world[-1, :2] + 0.95 * last_direction - 0.65 * last_normal
+    last_velocity, _, _ = _course_exit_command(last)
+    last_direction = last_velocity / max(
+        float(np.linalg.norm(last_velocity)), 1.0e-8
+    )
+    final_xy = last.root_position_world[-1, :2] + 0.95 * last_direction
 
     context = first.resampled_context_qpos(at_end=False, target_fps=30.0, frame_count=4)
     context[:, :2] += start_xy - first.root_position_world[0, :2]
@@ -387,11 +307,17 @@ def rollout(
         random_seed=flat_phase_seed,
         support_height_world=flat_support_height,
     )
-    current = np.asarray(full_agent.get_next_frame(), dtype=np.float64)
+    current, initial_clearance_lift = _project_live_root_above_support(
+        np.asarray(full_agent.get_next_frame(), dtype=np.float64),
+        sole_adapter=sole_adapter,
+        terrain=terrain,
+        ray_origin_z=ray_origin_z,
+    )
     timestamps = [0.0]
     qposes = [current.copy()]
     modes = ["flat"]
     requested = [desired_velocity.copy()]
+    clearance_lifts = [initial_clearance_lift]
     pending = 0
     playback: TerrainCoursePlayback | None = None
     active_course: MotionBricksTerrainCourse | None = None
@@ -401,6 +327,7 @@ def rollout(
     completed = False
 
     for tick in range(int(maximum_ticks)):
+        clearance_lift = 0.0
         flat_target, terminal_direction = _next_flat_target(
             courses, pending, final_xy
         )
@@ -452,6 +379,13 @@ def rollout(
         if playback is not None:
             assert active_course is not None
             current = playback.next_qpos()
+            if playback.index <= playback.blend_frames:
+                current, clearance_lift = _project_live_root_above_support(
+                    current,
+                    sole_adapter=sole_adapter,
+                    terrain=terrain,
+                    ray_origin_z=ray_origin_z,
+                )
             dt = 1.0 / active_course.fps
             mode = f"course_{pending}"
             if playback.done:
@@ -483,7 +417,6 @@ def rollout(
                         **phase_result,
                     }
                 )
-                current = np.asarray(full_agent.get_next_frame(), dtype=np.float64)
                 desired_velocity = next_velocity
                 desired_facing = next_facing
                 playback = None
@@ -509,7 +442,12 @@ def rollout(
                 random_seed=flat_phase_seed,
                 support_height_world=flat_support_height,
             )
-            current = np.asarray(full_agent.get_next_frame(), dtype=np.float64)
+            current, clearance_lift = _project_live_root_above_support(
+                np.asarray(full_agent.get_next_frame(), dtype=np.float64),
+                sole_adapter=sole_adapter,
+                terrain=terrain,
+                ray_origin_z=ray_origin_z,
+            )
             dt = 1.0 / 30.0
             mode = "flat"
 
@@ -517,6 +455,7 @@ def rollout(
         qposes.append(current.copy())
         modes.append(mode)
         requested.append(desired_velocity.copy())
+        clearance_lifts.append(clearance_lift)
         if pending >= len(courses) and float(np.linalg.norm(final_xy - current[:2])) < 0.10:
             completed = True
             break
@@ -545,6 +484,9 @@ def rollout(
         timestamp_s=np.asarray(timestamps, dtype=np.float32),
         mujoco_qpos=np.asarray(qposes, dtype=np.float32),
         requested_velocity_world_xy=np.asarray(requested, dtype=np.float32),
+        terrain_root_clearance_lift_m=np.asarray(
+            clearance_lifts, dtype=np.float32
+        ),
         mode=np.asarray(modes, dtype=np.str_),
         resampled_timestamp_s=np.asarray(time_array, dtype=np.float32),
         intended_polyline_xy=np.asarray(intended, dtype=np.float32),
@@ -575,6 +517,12 @@ def rollout(
         "flat_frame_count": int(sum(value == "flat" for value in modes)),
         "course_frame_count": int(sum(value != "flat" for value in modes)),
         "terrain_guard_blocked_frame_count": int(blocked_count),
+        "terrain_root_clearance_lift_maximum_m": float(
+            np.max(clearance_lifts)
+        ),
+        "terrain_root_clearance_lift_p95_m": float(
+            np.percentile(clearance_lifts, 95.0)
+        ),
         "duration_s": float(timestamps[-1]),
         "root_path_length_m": float(np.sum(np.linalg.norm(np.diff(actual, axis=0), axis=1))),
         "planned_route_length_m": float(

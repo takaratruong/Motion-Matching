@@ -23,6 +23,7 @@ import numpy as np
 
 from .build_grail_terrain_archive import DEFAULT_G1_MJCF
 from .generate_motionbricks_terrain_transitions import _load_demo
+from .gear_action import mujoco_to_isaaclab_joint_vector
 from .motionbricks_terrain_portal import (
     MotionBricksTerrainCourse,
     PortalCapture,
@@ -36,6 +37,7 @@ from .terrain_interactive_viewer import (
     _configure_terrain_browser_ui,
 )
 from .terrain_oracle.math3d import RigidTransform
+from .terrain_oracle.reference_stitch import _G1FootfallAdapter
 from .terrain_oracle.render_media import _build_scene_model
 from .terrain_oracle.source_grail import _load_usd_mesh
 from .terrain_oracle.terrain_mesh import TerrainMeshIndex
@@ -284,6 +286,144 @@ def _guard_flat_velocity(
     return (np.zeros(2, dtype=np.float64) if unsafe else velocity), unsafe
 
 
+def _project_live_root_above_support(
+    qpos: np.ndarray,
+    *,
+    sole_adapter: _G1FootfallAdapter,
+    terrain: object,
+    ray_origin_z: float,
+    sole_clearance_m: float = 0.003,
+    maximum_lift_m: float = 0.06,
+) -> tuple[np.ndarray, float]:
+    """Apply the globally privileged game-style root-height projection."""
+
+    value = np.asarray(qpos, dtype=np.float64).copy()
+    soles = sole_adapter.sole_support_points_for_pose(
+        root_position=value[:3],
+        root_quaternion_wxyz=value[3:7],
+        joints=mujoco_to_isaaclab_joint_vector(value[7:]),
+    )
+    required_lifts = [
+        _terrain_surface_height(
+            terrain, point[:2], ray_origin_z=ray_origin_z
+        )
+        + float(sole_clearance_m)
+        - float(point[2])
+        for points in soles
+        for point in np.asarray(points, dtype=np.float64)
+    ]
+    lift = float(
+        np.clip(
+            max(required_lifts, default=0.0),
+            0.0,
+            float(maximum_lift_m),
+        )
+    )
+    value[2] += lift
+    return value, lift
+
+
+def _submit_phase_matched_course_exit(
+    full_agent: object,
+    controller: object,
+    *,
+    context_qpos: np.ndarray,
+    velocity_world_xy: np.ndarray,
+    facing_yaw_world: float,
+    mode_name: str,
+    support_height_world: float,
+) -> dict[str, object]:
+    """Seed the least-disruptive live gait phase after an authored portal."""
+
+    import torch
+
+    context = np.asarray(context_qpos, dtype=np.float64)
+    if context.ndim != 2 or context.shape[1] != 36:
+        raise ValueError("course exit context must have shape (T,36)")
+    candidates: list[dict[str, float | int]] = []
+    for seed in range(0, 64, 4):
+        _submit_motionbricks(
+            full_agent,
+            controller,
+            context_qpos=context,
+            velocity_world_xy=velocity_world_xy,
+            facing_yaw_world=facing_yaw_world,
+            mode_name=mode_name,
+            force=True,
+            random_seed=seed,
+            support_height_world=support_height_world,
+        )
+        generated_value = full_agent.frames["mujoco_qpos"]
+        generated = (
+            generated_value[0].detach().cpu().numpy()
+            if isinstance(generated_value, torch.Tensor)
+            else np.asarray(generated_value)[0]
+        )
+        future_start = len(context)
+        horizon = min(len(generated) - future_start, 24)
+        if horizon < 2:
+            raise RuntimeError("MotionBricks exit has no future frames")
+        review = np.asarray(
+            generated[future_start : future_start + horizon], dtype=np.float64
+        )
+        root_drop = max(0.0, float(context[-1, 2] - np.min(review[:, 2])))
+        double_knee = float(np.max(np.mean(review[:, (10, 16)], axis=1)))
+        pose_gap = float(
+            np.sqrt(np.mean((review[0, 7:] - context[-1, 7:]) ** 2))
+        )
+        joint_step = float(
+            np.max(
+                np.abs(
+                    np.diff(
+                        np.concatenate((context[-1:, 7:], review[:, 7:]), axis=0),
+                        axis=0,
+                    )
+                )
+            )
+        )
+        score = (
+            4.0 * root_drop
+            + 0.20 * double_knee
+            + 0.50 * pose_gap
+            + 0.20 * joint_step
+        )
+        candidates.append(
+            {
+                "seed": seed,
+                "score": score,
+                "root_drop_m": root_drop,
+                "double_knee_peak_rad": double_knee,
+                "first_pose_rmse_rad": pose_gap,
+                "maximum_joint_step_rad": joint_step,
+            }
+        )
+    selected = min(candidates, key=lambda value: float(value["score"]))
+    _submit_motionbricks(
+        full_agent,
+        controller,
+        context_qpos=context,
+        velocity_world_xy=velocity_world_xy,
+        facing_yaw_world=facing_yaw_world,
+        mode_name=mode_name,
+        force=True,
+        random_seed=int(selected["seed"]),
+        support_height_world=support_height_world,
+    )
+    # The decoded prefix is the conditioning history, not new motion.
+    for _ in range(len(context)):
+        full_agent.get_next_frame()
+    return {
+        "selected": selected,
+        "candidate_count": len(candidates),
+        "score_minimum": float(selected["score"]),
+        "score_median": float(
+            np.median([value["score"] for value in candidates])
+        ),
+        "score_maximum": float(max(value["score"] for value in candidates)),
+        "discarded_conditioning_frame_count": len(context),
+    }
+
+
 def run(
     *,
     target_clip_index: int | None,
@@ -350,6 +490,14 @@ def run(
         terrain_path, source_asset_sha256="0" * 64
     )
     terrain_index = TerrainMeshIndex(terrain_mesh, terrain_transform)
+    import zarr
+
+    support_archive = zarr.open_group(str(stairs_archive), mode="r")
+    sole_adapter = _G1FootfallAdapter(
+        model_path,
+        tuple(str(value) for value in support_archive["joint_names"][:]),
+        maximum_joint_correction_rad=0.1,
+    )
     spec = mujoco.MjSpec.from_file(str(model_path.expanduser().resolve()))
     model, visual_mesh_count = _build_scene_model(
         spec, terrain_mesh, terrain_transform
@@ -407,6 +555,26 @@ def run(
         context = course.resampled_context_qpos(
             at_end=at_end, target_fps=30.0, frame_count=4
         )
+        support_height = _terrain_surface_height(
+            terrain_index, current_qpos[:2], ray_origin_z=ray_origin_z
+        )
+        if at_end:
+            phase_result = _submit_phase_matched_course_exit(
+                full_agent,
+                controller,
+                context_qpos=context,
+                velocity_world_xy=velocity,
+                facing_yaw_world=facing,
+                mode_name=name,
+                support_height_world=support_height,
+            )
+            print(
+                "[GLOBAL TERRAIN] selected live exit phase "
+                f"seed={phase_result['selected']['seed']} "
+                f"score={phase_result['score_minimum']:.4f}",
+                flush=True,
+            )
+            return
         _submit_motionbricks(
             full_agent,
             controller,
@@ -415,8 +583,16 @@ def run(
             facing_yaw_world=facing,
             mode_name=name,
             force=True,
+            support_height_world=support_height,
         )
-        current_qpos = np.asarray(full_agent.get_next_frame(), dtype=np.float64)
+        for _ in range(len(context)):
+            full_agent.get_next_frame()
+        current_qpos, _ = _project_live_root_above_support(
+            np.asarray(full_agent.get_next_frame(), dtype=np.float64),
+            sole_adapter=sole_adapter,
+            terrain=terrain_index,
+            ray_origin_z=ray_origin_z,
+        )
 
     def reset_session() -> None:
         nonlocal current_qpos, desired_facing_yaw, playback, active_course, mode
@@ -551,6 +727,12 @@ def run(
                     active_course = candidate_course
                     mode = "course"
                     current_qpos = playback.next_qpos()
+                    current_qpos, _ = _project_live_root_above_support(
+                        current_qpos,
+                        sole_adapter=sole_adapter,
+                        terrain=terrain_index,
+                        ray_origin_z=ray_origin_z,
+                    )
                     dt = 1.0 / candidate_course.fps
                     print(
                         f"frame={tick:06d} PORTAL_COMMIT "
@@ -578,9 +760,19 @@ def run(
                         facing_yaw_world=desired_facing_yaw,
                         mode_name=mode_name,
                         force=False,
+                        support_height_world=_terrain_surface_height(
+                            terrain_index,
+                            current_qpos[:2],
+                            ray_origin_z=ray_origin_z,
+                        ),
                     )
-                    current_qpos = np.asarray(
-                        full_agent.get_next_frame(), dtype=np.float64
+                    current_qpos, _ = _project_live_root_above_support(
+                        np.asarray(
+                            full_agent.get_next_frame(), dtype=np.float64
+                        ),
+                        sole_adapter=sole_adapter,
+                        terrain=terrain_index,
+                        ray_origin_z=ray_origin_z,
                     )
                     mode = "flat"
                     dt = flat_dt
@@ -588,6 +780,13 @@ def run(
                 if active_course is None:
                     raise RuntimeError("course playback lost its active course")
                 current_qpos = playback.next_qpos()
+                if playback.index <= playback.blend_frames:
+                    current_qpos, _ = _project_live_root_above_support(
+                        current_qpos,
+                        sole_adapter=sole_adapter,
+                        terrain=terrain_index,
+                        ray_origin_z=ray_origin_z,
+                    )
                 dt = 1.0 / active_course.fps
                 if playback.done:
                     seed_motionbricks(

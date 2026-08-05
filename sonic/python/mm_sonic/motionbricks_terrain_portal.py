@@ -89,7 +89,7 @@ class MotionBricksTerrainCourse:
     root_position_world: np.ndarray
     root_quaternion_world_wxyz: np.ndarray
     joint_position_isaaclab: np.ndarray
-    seam_indices: tuple[int, int]
+    seam_indices: tuple[int, ...]
 
     @classmethod
     def load(cls, path: Path) -> "MotionBricksTerrainCourse":
@@ -110,8 +110,10 @@ class MotionBricksTerrainCourse:
             or quaternion.shape != (len(root), 4)
             or joints.shape != (len(root), 29)
             or len(root) < 8
-            or len(seams) != 2
-            or not 0 < seams[0] < seams[1] < len(root)
+            or len(seams) not in (1, 2)
+            or seams != tuple(sorted(seams))
+            or not 0 < seams[0]
+            or not seams[-1] < len(root)
             or not np.isfinite(root).all()
             or not np.isfinite(quaternion).all()
             or not np.isfinite(joints).all()

@@ -16,10 +16,10 @@ set -euo pipefail
 
 MM_ROOT=/move/u/bodow/Projects/Motion-Matching-takara-corpus
 RUN_ROOT=${TAKARA_RUN_ROOT:-/move/data/terrain-aware/sonic-rollouts/takara_bones_mm_abrupt_v1_task12}
-SHARD=${SLURM_ARRAY_TASK_ID}
+SHARD=${TAKARA_SHARD:-${SLURM_ARRAY_TASK_ID}}
 CORPUS=${TAKARA_CORPUS_PATH:-${RUN_ROOT}/_source/takara_bones_mm_abrupt.zarr}
-ROLLOUT=${RUN_ROOT}/noisy_shard${SHARD}
-OUTPUT=${RUN_ROOT}/noisy_shard${SHARD}_commands.zarr
+ROLLOUT=${TAKARA_ROLLOUT:-${RUN_ROOT}/noisy_shard${SHARD}}
+OUTPUT=${TAKARA_OUTPUT:-${RUN_ROOT}/noisy_shard${SHARD}_commands.zarr}
 
 if [[ ! -f "${ROLLOUT}/collect_summary.json" ]]; then
     echo "missing finalized noisy rollout shard: ${ROLLOUT}" >&2

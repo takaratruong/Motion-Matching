@@ -42,6 +42,29 @@ def _match_score(row: dict[str, object], target: object) -> float:
     )
 
 
+def _extend_route_endpoints(
+    start_xy: object,
+    end_xy: object,
+    margin_m: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Include the support immediately before and after a ramp crossing.
+
+    The root-defined window begins near the ramp edge, while a planted sole
+    can extend 10--20 cm behind it.  Without endpoint context, the geometry
+    warp applies the first ramp-height offset to that sole even when it is
+    actually on the adjacent plateau.  Extending both source and target routes
+    keeps the root correspondence while giving those feet the correct local
+    support profile.
+    """
+
+    start = np.asarray(start_xy, dtype=np.float64)
+    end = np.asarray(end_xy, dtype=np.float64)
+    direction = end - start
+    direction /= np.linalg.norm(direction)
+    margin = float(margin_m)
+    return start - margin * direction, end + margin * direction
+
+
 def generate(
     *,
     terrain_usd: Path,
@@ -76,8 +99,17 @@ def generate(
             f"got kind={target_profile.kind}, delta={delta:.4f} m"
         )
     traversal = "up" if delta > 0.0 else "down"
+    target_support_start, target_support_end = _extend_route_endpoints(
+        start_xy, end_xy, 0.30
+    )
+    target_support_profile = sample_terrain_route_profile(
+        target_mesh,
+        target_support_start,
+        target_support_end,
+        sample_spacing_m=0.01,
+    )
     target_route = continuous_profile_support_route(
-        target_profile, level_count=profile_level_count
+        target_support_profile, level_count=profile_level_count
     )
     archive_source = archive_path.expanduser().resolve()
     archive = zarr.open_group(str(archive_source), mode="r")
@@ -100,10 +132,13 @@ def generate(
     for rank, row in enumerate(candidates[: int(candidate_limit)]):
         clip_index = int(row["clip_index"])
         source_mesh = _archive_terrain_index(archive, clip_index)
+        source_support_start, source_support_end = _extend_route_endpoints(
+            row["route_start_xy"], row["route_end_xy"], 0.30
+        )
         source_profile = sample_terrain_route_profile(
             source_mesh,
-            row["route_start_xy"],
-            row["route_end_xy"],
+            source_support_start,
+            source_support_end,
             sample_spacing_m=0.01,
         )
         source_route = continuous_profile_support_route(
@@ -139,6 +174,7 @@ def generate(
                 maximum_sole_penetration_m=0.003,
                 maximum_root_clearance_lift_m=0.025,
                 support_contact_tolerance_m=0.025,
+                stance_conditioned_pelvis_anchor=True,
             )
             audit = audit_stair_motion_collisions(
                 warped.motion,
@@ -173,6 +209,12 @@ def generate(
                         ),
                         "maximum_foot_target_error_m": float(
                             warped.maximum_foot_target_error_m
+                        ),
+                        "maximum_stance_foot_target_error_m": float(
+                            warped.maximum_stance_foot_target_error_m
+                        ),
+                        "maximum_swing_foot_target_error_m": float(
+                            warped.maximum_swing_foot_target_error_m
                         ),
                         "maximum_root_clearance_lift_m": float(
                             warped.maximum_root_clearance_lift_m

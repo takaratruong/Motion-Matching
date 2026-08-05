@@ -1075,3 +1075,42 @@ alternating steps with no deep squat, freeze, fall, or pose snap.  Path error
 is 5.43 cm RMS / 16.48 cm p95, worse than v4 but accepted because the visible
 state-distribution failure is removed without losing completion.  Evidence:
 `artifacts/generic_terrain/waypoint_routes/canary_portal_aligned_s_v2/live_rollout_seed17_v9_support_once_move`.
+
+### Five-event live terrain gauntlet (2026-08-05)
+
+The retained runtime now uses entry-only terrain portals.  Each portal owns
+the flat approach and exact non-flat traversal, then hands control immediately
+back to live MotionBricks at the final authored pose.  The first four decoded
+MotionBricks frames overlap the conditioning history and are discarded rather
+than replayed.  A deterministic 16-phase search selects the least disruptive
+future gait at each exit.  This removes the delayed steering and finite-landing
+overshoot caused by prerecorded exits.
+
+The mixed route contains five independently compiled events: ramp ascent,
+curb up/down, four-step stair ascent, four-step stair descent, and ramp
+descent.  Live MotionBricks generates all curved flat travel and turns between
+them.  The accepted rollout captures all five portals, reaches the terminal
+waypoint without a terrain-guard stop, travels 28.69 m over a 28.06 m planned
+route, and has 4.24 cm RMS / 7.99 cm p95 route deviation.  It runs for 62.39 s.
+
+Because clean MotionBricks poses and the G1 collision-sphere floor differ by
+a few centimetres at some gait phases, the globally privileged ceiling now
+applies the standard game-animation root-height projection: exact sole support
+points are lifted only enough to retain 3 mm terrain clearance.  The lift is
+2.96 cm maximum and 1.08 cm p95.  It does not change joint motion and is not
+fed back into MotionBricks.  The same implementation is shared by the
+headless evaluator and browser/Switch viewer.
+
+An exact complete-G1 audit over all 3,120 resampled frames accepts the full
+motion: 4.209 mm maximum foot penetration, zero forbidden-body penetration,
+and zero threshold-exceedance frames.  Dense full-route, stair, and final-exit
+video review shows continuous locomotion without a freeze, fall, body-through-
+terrain event, or obvious final handoff snap.  The largest joint step is
+0.357 rad at the final downhill-to-flat handoff, which remains the visually
+riskier boundary.  Evidence:
+`artifacts/generic_terrain/waypoint_routes/mixed_gauntlet_v1/live_rollout_seed17_v8_exact_clearance`.
+
+This is still a globally privileged, purely kinematic ceiling.  It proves that
+live arbitrary flat steering and multiple exact-safe terrain traversals can be
+combined without replaying whole prerecorded scenes; it is not yet a SONIC
+tracking qualification or a causal onboard terrain selector.

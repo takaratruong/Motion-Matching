@@ -246,6 +246,8 @@ class StairGeometryWarpResult:
     target_route: StairSupportRoute
     maximum_joint_correction_rad: float
     maximum_foot_target_error_m: float
+    maximum_stance_foot_target_error_m: float
+    maximum_swing_foot_target_error_m: float
     maximum_sole_penetration_m: float
     maximum_triangle_sphere_penetration_m: float
     minimum_sole_clearance_m: float
@@ -648,6 +650,7 @@ def warp_archive_clip_to_stair_geometry(
     minimum_stance_support_points: int = 1,
     support_contact_tolerance_m: float = 0.02,
     support_maximum_sole_speed_m_s: float = 0.25,
+    stance_conditioned_pelvis_anchor: bool = False,
 ) -> StairGeometryWarpResult:
     """Fit one authored clip onto a supplied mesh-only route.
 
@@ -745,6 +748,7 @@ def warp_archive_clip_to_stair_geometry(
     adapted_joints = np.empty_like(source_joints)
     corrections = np.empty(len(source_joints), dtype=np.float64)
     errors = np.empty(len(source_joints), dtype=np.float64)
+    per_foot_errors = np.empty((len(source_joints), 2), dtype=np.float64)
     ray_origin_height = (
         float(np.max(target_mesh.vertices_world[:, 2])) + 1.0
     )
@@ -1201,6 +1205,7 @@ def warp_archive_clip_to_stair_geometry(
     foothold_shifts_by_frame: list[tuple[float, float]] = []
     foothold_yaws_by_frame: list[tuple[float, float]] = []
     scaffold_clearances = np.empty(frame_count, dtype=np.float64)
+    pelvis_shifts = np.empty((frame_count, 3), dtype=np.float64)
     for frame in range(frame_count):
         target_soles = raw_target_soles_by_frame[frame]
         foothold_shifts = tuple(float(value) for value in foothold_shift[frame])
@@ -1226,9 +1231,12 @@ def warp_archive_clip_to_stair_geometry(
         target_soles = (transformed_soles[0], transformed_soles[1])
         # Mapping the pelvis independently can raise it onto the next tread
         # before the trailing foot, or compress a leading swing on a short top
-        # tread.  Centre its translation between the two warped feet so route
-        # deformation cannot tear the skeleton apart.  This uses only source
-        # FK and target geometry; no target pose sample participates.
+        # tread.  Anchor its translation to the authored stance foot whenever
+        # one exists; averaging a planted target with an unconstrained swing
+        # target can move the pelvis away from support by several centimetres,
+        # especially when a ramp route is length-scaled.  Double support still
+        # averages both feet, and flight falls back to both.  This uses only
+        # source contact, source FK, and target geometry.
         provisional_soles = adapter.sole_positions_for_pose(
             root_position=warped_root[frame],
             root_quaternion_wxyz=warped_quaternions[frame],
@@ -1241,8 +1249,15 @@ def warp_archive_clip_to_stair_geometry(
                 for foot in range(2)
             ]
         )
-        pelvis_shift = np.mean(foot_shifts, axis=0)
-        warped_root[frame] += pelvis_shift
+        if stance_conditioned_pelvis_anchor:
+            stance_feet = np.flatnonzero(source_stance[frame])
+            pelvis_shift = np.mean(
+                foot_shifts[stance_feet] if len(stance_feet) else foot_shifts,
+                axis=0,
+            )
+        else:
+            pelvis_shift = np.mean(foot_shifts, axis=0)
+        pelvis_shifts[frame] = pelvis_shift
         target_soles_by_frame.append(target_soles)
         target_support = tuple(
             target_soles[foot]
@@ -1251,6 +1266,36 @@ def warp_archive_clip_to_stair_geometry(
             for foot in range(2)
         )
         scaffold_clearances[frame] = vertical_clearance(target_support)
+
+    # Contact labels change discretely even though the physical transfer of
+    # load is continuous.  Smooth the stance-conditioned pelvis anchor before
+    # applying it; otherwise a left/right label switch can inject a one-frame
+    # root acceleration and joint correction despite smooth source motion.
+    if stance_conditioned_pelvis_anchor:
+        smoothing_radius = 6
+        smoothing_sigma = 3.0
+        offsets = np.arange(
+            -smoothing_radius, smoothing_radius + 1, dtype=np.float64
+        )
+        smoothing_kernel = np.exp(
+            -0.5 * (offsets / smoothing_sigma) ** 2
+        )
+        smoothing_kernel /= np.sum(smoothing_kernel)
+        padded_shifts = np.pad(
+            pelvis_shifts,
+            ((smoothing_radius, smoothing_radius), (0, 0)),
+            mode="edge",
+        )
+        pelvis_shifts = np.stack(
+            [
+                np.convolve(
+                    padded_shifts[:, axis], smoothing_kernel, mode="valid"
+                )
+                for axis in range(3)
+            ],
+            axis=1,
+        )
+    warped_root += pelvis_shifts
 
     required_lift = np.maximum(
         0.0, -scaffold_penetration_budget - scaffold_clearances
@@ -1319,6 +1364,19 @@ def warp_archive_clip_to_stair_geometry(
             root_quaternion_wxyz=warped_quaternions[frame],
             joints=adapted_joints[frame],
         )
+        per_foot_errors[frame] = np.asarray(
+            [
+                np.max(
+                    np.linalg.norm(
+                        np.asarray(final_centres[foot])
+                        - np.asarray(target_soles[foot]),
+                        axis=1,
+                    )
+                )
+                for foot in range(2)
+            ],
+            dtype=np.float64,
+        )
         support_points = adapter.sole_support_points_for_pose(
             root_position=warped_root[frame],
             root_quaternion_wxyz=warped_quaternions[frame],
@@ -1347,6 +1405,15 @@ def warp_archive_clip_to_stair_geometry(
 
     maximum_correction = float(np.max(corrections))
     maximum_error = float(np.max(errors))
+    stance_error_values = per_foot_errors[source_stance]
+    maximum_stance_error = (
+        float(np.max(stance_error_values))
+        if len(stance_error_values)
+        else 0.0
+    )
+    maximum_swing_error = float(
+        np.max(per_foot_errors[~source_stance])
+    ) if np.any(~source_stance) else 0.0
     minimum_clearance = float(np.min(minimum_clearances))
     maximum_penetration = max(0.0, -minimum_clearance)
     maximum_triangle_penetration = float(np.max(triangle_penetrations))
@@ -1369,7 +1436,36 @@ def warp_archive_clip_to_stair_geometry(
             "geometry warp exceeds joint-correction bound: "
             f"{maximum_correction:.6f} rad"
         )
-    if maximum_error > maximum_foot_target_error_m:
+    if (
+        stance_conditioned_pelvis_anchor
+        and maximum_stance_error > maximum_foot_target_error_m
+    ):
+        masked_errors = np.where(source_stance, per_foot_errors, -np.inf)
+        worst_error_frame, worst_error_foot = np.unravel_index(
+            int(np.argmax(masked_errors)), masked_errors.shape
+        )
+        raise ValueError(
+            "geometry warp misses stance-foot target: "
+            f"{maximum_stance_error:.6f} m at frame {worst_error_frame}, "
+            f"foot {worst_error_foot}; "
+            "progress shifts="
+            f"{foothold_shifts_by_frame[worst_error_frame]}, "
+            "yaw adjustments="
+            f"{foothold_yaws_by_frame[worst_error_frame]}"
+        )
+    # A swing target is a clearance/style scaffold, not a contact equality
+    # constraint.  Keep a broad sanity cap while leaving exact-mesh collision,
+    # mechanics, and the next stance interval as the authoritative checks.
+    if stance_conditioned_pelvis_anchor:
+        swing_error_limit = max(
+            0.20, 4.0 * float(maximum_foot_target_error_m)
+        )
+        if maximum_swing_error > swing_error_limit:
+            raise ValueError(
+                "geometry warp misses swing-foot scaffold excessively: "
+                f"{maximum_swing_error:.6f} m > {swing_error_limit:.6f} m"
+            )
+    elif maximum_error > maximum_foot_target_error_m:
         worst_error_frame = int(np.argmax(errors))
         raise ValueError(
             "geometry warp misses foot target: "
@@ -1426,6 +1522,8 @@ def warp_archive_clip_to_stair_geometry(
         target_route=target_route,
         maximum_joint_correction_rad=maximum_correction,
         maximum_foot_target_error_m=maximum_error,
+        maximum_stance_foot_target_error_m=maximum_stance_error,
+        maximum_swing_foot_target_error_m=maximum_swing_error,
         maximum_sole_penetration_m=maximum_penetration,
         maximum_triangle_sphere_penetration_m=(
             maximum_triangle_penetration

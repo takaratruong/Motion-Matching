@@ -495,3 +495,43 @@ larger collision/contact tolerance.
   distribution seam is materially removed; waypoint tuning did not solve it.
 - Evidence:
   `artifacts/generic_terrain/waypoint_routes/canary_portal_aligned_s_v2/live_rollout_seed17_v9_support_once_move`.
+
+## 2026-08-05 five-event entry-only portal rollout
+
+- Prerecorded flat exits were removed from the preferred portal form.  They
+  delayed joystick authority and could carry the robot beyond a finite upper
+  landing before live route feedback took effect.  Every one of the five
+  mixed-route events compiled as an accepted one-seam entry-only course; the
+  previous approach/traversal/exit form remains only a compiler fallback.
+- Runtime handoff debugging found that MotionBricks decodes the supplied four
+  conditioning poses at the start of its output.  Replaying those frames after
+  already displaying the authored landing caused a visible rewind.  Exit
+  phase ranking now starts at the first future frame, and all four context
+  frames are consumed before live output resumes.  The last authored portal
+  frame is also retained for its own tick instead of being overwritten by the
+  first live frame.
+- The final waypoint originally inherited the course approach direction after
+  a descent, which sent the robot off the finite floor.  It now uses the
+  measured exit tangent and a bounded terminal distance inside the mesh.
+- A globally privileged sole-support root projection removes the remaining
+  nominal-floor mismatch in live flat frames and the short portal-entry blend.
+  It lifts only root z, caps correction at 6 cm, targets 3 mm sole clearance,
+  and never feeds the corrected world root back into MotionBricks.
+- The accepted seed-17 run completes ramp up, curb up/down, stairs up, stairs
+  down, and ramp down in 62.39 s.  It captures 5/5 portals, reaches the final
+  waypoint, records zero blocked frames, travels 28.69 m, and tracks the
+  intended 28.06 m route at 4.24 cm RMS / 7.99 cm p95 error.  Clearance lift
+  is 2.96 cm maximum / 1.08 cm p95.
+- The exact whole-motion collision audit over 3,120 frames accepts at 4.209 mm
+  maximum foot penetration and zero forbidden-body penetration, with no foot
+  or body threshold exceedance.  Dense contact sheets around the final
+  downhill handoff show a continuous stride despite the numeric 0.357 rad
+  maximum joint step.
+- Evidence:
+  `artifacts/generic_terrain/waypoint_routes/mixed_gauntlet_v1/portals_entry_v2`
+  and
+  `artifacts/generic_terrain/waypoint_routes/mixed_gauntlet_v1/live_rollout_seed17_v8_exact_clearance`.
+- Abrupt robustness noising shard 1 produced 27,483/27,486 valid FP32 windows
+  before bounded retry retirement (99.989% coverage).  This is retained rather
+  than recomputed.  The remaining ten shards were relaunched one L40 at a time
+  as job 16519088, with CPU command annotation chained as job 16519089.

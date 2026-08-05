@@ -715,9 +715,16 @@ def compose(
     forced_exit_phase_index: int | None = None,
     maximum_seam_foot_error_m: float = 0.018,
     target_mesh: TerrainMeshIndex | None = None,
+    include_exit: bool = True,
 ) -> dict[str, object]:
     approach = _resample_motionbricks(approach_raw, label="motionbricks_approach")
-    exit_motion = _resample_motionbricks(exit_raw, label="motionbricks_exit")
+    exit_motion = (
+        _resample_motionbricks(exit_raw, label="motionbricks_exit")
+        if include_exit
+        else None
+    )
+    if not include_exit and forced_exit_phase_index is not None:
+        raise ValueError("a terminal entry-only course has no exit phase")
     stair = _load_stair_motion(stair_motion)
     import zarr
 
@@ -767,24 +774,28 @@ def compose(
     # selection therefore treats the complete planar registration as free;
     # its score still includes velocity and lower-body compatibility in the
     # stair route frame.
-    exit_candidates = _phase_candidates(
-        exit_motion,
-        stair,
-        source_is_approach=False,
-        maximum_position_correction_m=2.0,
-        maximum_yaw_correction_rad=math.radians(32.0),
-        candidate_limit=(
-            len(exit_motion.root_position_world)
-            if forced_exit_phase_index is not None
-            else provisional_candidate_limit
-        ),
-        sole_adapter=adapter,
-        # MotionBricks has a command-generation buffer after reset.  An idle
-        # phase can look deceptively compatible with the stationary landing
-        # pose, but it leaves a support leg pinned when locomotion begins.
-        # Select an already-active gait phase for a smooth continuation.
-        minimum_planar_speed_mps=0.10,
-        planar_registration_is_free=True,
+    exit_candidates = (
+        _phase_candidates(
+            exit_motion,
+            stair,
+            source_is_approach=False,
+            maximum_position_correction_m=2.0,
+            maximum_yaw_correction_rad=math.radians(32.0),
+            candidate_limit=(
+                len(exit_motion.root_position_world)
+                if forced_exit_phase_index is not None
+                else provisional_candidate_limit
+            ),
+            sole_adapter=adapter,
+            # MotionBricks has a command-generation buffer after reset.  An
+            # idle phase can look deceptively compatible with the stationary
+            # landing pose, but it leaves a support leg pinned when locomotion
+            # begins. Select an active gait phase for a smooth continuation.
+            minimum_planar_speed_mps=0.10,
+            planar_registration_is_free=True,
+        )
+        if exit_motion is not None
+        else ()
     )
     if forced_approach_phase_index is not None:
         approach_candidates = tuple(
@@ -814,7 +825,7 @@ def compose(
                 model_path=model_path,
             )
         )
-    if forced_exit_phase_index is None:
+    if exit_motion is not None and forced_exit_phase_index is None:
         exit_candidates, exit_segment_audits = (
             _filter_exact_safe_phase_segments(
                 exit_motion,
@@ -839,6 +850,8 @@ def compose(
         ),
         "forced_approach_phase_index": forced_approach_phase_index,
         "forced_exit_phase_index": forced_exit_phase_index,
+        "maximum_seam_foot_error_m": float(maximum_seam_foot_error_m),
+        "include_exit": bool(include_exit),
         "stair_trim": stair_trim,
         "approach_phase_candidates": [
             _candidate_row(value) for value in approach_candidates
@@ -851,7 +864,7 @@ def compose(
         "trials": [],
         "status": "phase_coverage_failed",
     }
-    if not approach_candidates or not exit_candidates:
+    if not approach_candidates or (include_exit and not exit_candidates):
         (output_dir / "summary.json").write_text(
             json.dumps(summary, indent=2, sort_keys=True) + "\n"
         )
@@ -859,11 +872,20 @@ def compose(
 
     ranked_pairs = sorted(
         (
-            (approach_row.score + exit_row.score, approach_row, exit_row)
+            (
+                approach_row.score
+                + (0.0 if exit_row is None else exit_row.score),
+                approach_row,
+                exit_row,
+            )
             for approach_row in approach_candidates
-            for exit_row in exit_candidates
+            for exit_row in (exit_candidates if include_exit else (None,))
         ),
-        key=lambda value: (value[0], value[1].index, value[2].index),
+        key=lambda value: (
+            value[0],
+            value[1].index,
+            -1 if value[2] is None else value[2].index,
+        ),
     )[: int(maximum_candidate_combinations)]
     selected = None
     best_rejected = None
@@ -879,29 +901,38 @@ def compose(
                 approach_row.support_translation_world_xyz
             ),
         )
-        aligned_exit = _align_sample(
-            exit_motion,
-            sample_index=exit_row.index,
-            target_position=stair.root_position_world[-1],
-            target_quaternion_wxyz=stair.root_quaternion_world_wxyz[-1],
-            support_translation_world_xyz=(
-                exit_row.support_translation_world_xyz
-            ),
-        )
         approach_segment = _slice(aligned_approach, 0, approach_row.index + 1)
-        exit_segment = _slice(
-            aligned_exit, exit_row.index, len(aligned_exit.root_position_world)
-        )
-        segments = [approach_segment, stair, exit_segment]
+        exit_segment = None
+        if exit_row is not None:
+            assert exit_motion is not None
+            aligned_exit = _align_sample(
+                exit_motion,
+                sample_index=exit_row.index,
+                target_position=stair.root_position_world[-1],
+                target_quaternion_wxyz=stair.root_quaternion_world_wxyz[-1],
+                support_translation_world_xyz=(
+                    exit_row.support_translation_world_xyz
+                ),
+            )
+            exit_segment = _slice(
+                aligned_exit,
+                exit_row.index,
+                len(aligned_exit.root_position_world),
+            )
+        segments = [approach_segment, stair]
+        if exit_segment is not None:
+            segments.append(exit_segment)
         seam_metrics = [
-            endpoint_seam_metrics(segments[0], segments[1]),
-            endpoint_seam_metrics(segments[1], segments[2]),
+            endpoint_seam_metrics(left, right)
+            for left, right in zip(segments, segments[1:])
         ]
         for halflife in halflives:
             trial: dict[str, object] = {
                 "pair_index": pair_index,
                 "approach_phase": _candidate_row(approach_row),
-                "exit_phase": _candidate_row(exit_row),
+                "exit_phase": (
+                    None if exit_row is None else _candidate_row(exit_row)
+                ),
                 "inertialization_halflife_s": halflife,
                 "raw_seams": seam_metrics,
             }
@@ -915,13 +946,11 @@ def compose(
             # same mechanics and exact-mesh audits below.
             seam_mode_options = (
                 (
-                    "source_contact_release",
-                    "source_contact_release",
-                ),
-                (
-                    "source_contact_release",
-                    "staggered",
-                ),
+                    ("source_contact_release", "source_contact_release"),
+                    ("source_contact_release", "staggered"),
+                )
+                if include_exit
+                else (("source_contact_release",),)
             )
             retarget_errors: list[str] = []
             chosen_seam_modes = None
@@ -1057,7 +1086,7 @@ def compose(
                 continue
             quality = float(
                 approach_row.score
-                + exit_row.score
+                + (0.0 if exit_row is None else exit_row.score)
                 + mechanics["maximum_seam_root_acceleration_m_s2"] / 20.0
                 + mechanics["maximum_seam_joint_acceleration_rad_s2"] / 180.0
                 + audit.maximum_foot_penetration_m / 0.005
@@ -1101,17 +1130,20 @@ def compose(
                 seam_indices=(),
             ),
         )
-        _save_motion(
-            output_dir / "selected_motionbricks_exit.npz",
-            StitchedMotion(
-                fps=TARGET_FPS,
-                root_position_world=exit_segment.root_position_world,
-                root_quaternion_world_wxyz=exit_segment.root_quaternion_world_wxyz,
-                joint_position=exit_segment.joint_position,
-                provenance=exit_segment.provenance,
-                seam_indices=(),
-            ),
-        )
+        if exit_segment is not None:
+            _save_motion(
+                output_dir / "selected_motionbricks_exit.npz",
+                StitchedMotion(
+                    fps=TARGET_FPS,
+                    root_position_world=exit_segment.root_position_world,
+                    root_quaternion_world_wxyz=(
+                        exit_segment.root_quaternion_world_wxyz
+                    ),
+                    joint_position=exit_segment.joint_position,
+                    provenance=exit_segment.provenance,
+                    seam_indices=(),
+                ),
+            )
         _save_motion(
             output_dir / "selected_stair_traversal.npz",
             StitchedMotion(
@@ -1128,12 +1160,14 @@ def compose(
         summary["status"] = "accepted"
         summary["quality"] = quality
         summary["selected_trial"] = selected_trial
-        summary["artifacts"] = {
+        artifacts = {
             "motion": "motion.npz",
             "approach": "selected_motionbricks_approach.npz",
-            "exit": "selected_motionbricks_exit.npz",
             "stair": "selected_stair_traversal.npz",
         }
+        if exit_segment is not None:
+            artifacts["exit"] = "selected_motionbricks_exit.npz"
+        summary["artifacts"] = artifacts
         if render:
             summary["render"] = render_stitched_motion(
                 motion,
@@ -1179,6 +1213,11 @@ def main() -> None:
     parser.add_argument("--forced-approach-phase-index", type=int)
     parser.add_argument("--forced-exit-phase-index", type=int)
     parser.add_argument("--maximum-seam-foot-error-m", type=float, default=0.018)
+    parser.add_argument(
+        "--omit-exit",
+        action="store_true",
+        help="end at the authored traversal and let the runtime synthesize the exit",
+    )
     parser.add_argument("--no-render", action="store_true")
     arguments = parser.parse_args()
     result = compose(
@@ -1195,6 +1234,7 @@ def main() -> None:
         forced_approach_phase_index=arguments.forced_approach_phase_index,
         forced_exit_phase_index=arguments.forced_exit_phase_index,
         maximum_seam_foot_error_m=arguments.maximum_seam_foot_error_m,
+        include_exit=not arguments.omit_exit,
     )
     print(json.dumps(result, indent=2, sort_keys=True), flush=True)
 
