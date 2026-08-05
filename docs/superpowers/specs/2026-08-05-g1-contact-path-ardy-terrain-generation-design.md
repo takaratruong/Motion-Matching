@@ -138,7 +138,48 @@ the pelvis from copying sharp height-field discontinuities.
 The root heading remains constant for the current milestone. Later turning
 uses the same planner along a curved command path with locally varying tangent.
 
-## ARDY Constraint Synthesis
+## Synthesis Backend Priority
+
+The released ARDY G1 checkpoints were trained on Bones Rigplay 1, not GRAIL.
+The GRAIL robot trajectories come from a separate synthetic-video,
+reconstruction, retargeting, and SONIC realization pipeline. ARDY therefore
+cannot be assumed to reproduce the GRAIL terrain-motion distribution.
+
+The primary synthesis backend is a globally regularized retargeting of an
+authenticated GRAIL gait. ARDY receives the same schedule as an experimental
+second backend. Both outputs pass the same validator and visual-quality review;
+the planner does not prefer ARDY merely because it generated a complete
+sequence.
+
+## GRAIL-Native Trajectory Retargeting
+
+Select a clean GRAIL gait with cadence and commanded velocity close to the
+requested motion. Preserve its contact phase and use its root-relative joint
+trajectory as the motion prior.
+
+Solve the complete traversal, or overlapping contact-to-contact windows, as one
+temporally regularized kinematic optimization. Variables are root position and
+G1 joint positions for every frame. The objective preserves:
+
+- source joint pose and joint velocity;
+- source root-relative foot swing shape;
+- source pelvis and torso orientation;
+- contact phase and stance duration;
+- smooth joint acceleration and root acceleration.
+
+Hard constraints enforce:
+
+- planned stance sole position and yaw for every stance frame;
+- heel and toe support rather than ankle-point support;
+- swing clearance waypoints;
+- the planned root corridor and bounded pelvis height;
+- G1 joint limits and exact start/terminal state when required.
+
+This differs from the previous framewise overlay: the complete motion is solved
+jointly, stance feet include orientation and sole extent, and continuity is an
+optimization constraint rather than a post-hoc blend.
+
+## Optional ARDY Constraint Synthesis
 
 The pinned official G1 ARDY model runs at 25 Hz. The adapter converts MuJoCo
 Z-up/XY-ground coordinates to ARDY Y-up/XZ-ground coordinates.
@@ -156,9 +197,10 @@ poses rather than isolated XYZ targets:
 - sparse full-body constraints are used only at the exact start and terminal
   states.
 
-The first generation batch varies diffusion seed and conditioning density.
-Candidates are ranked only after independent terrain validation. ARDY is a
-motion synthesizer, not the terrain feasibility oracle.
+The ARDY comparison batch varies diffusion seed and conditioning density.
+Candidates are ranked only after independent terrain validation. ARDY is an
+optional motion synthesizer, not the terrain feasibility oracle or the primary
+backend.
 
 Output is converted back to MuJoCo coordinates and resampled to 50 Hz.
 
@@ -211,11 +253,11 @@ The first benchmark uses the same staircase and start state for:
 2. 45-degree crossing;
 3. head-on ascent/descent as a control case.
 
-Each experiment generates multiple ARDY candidates and compares them with the
-best current GRAIL/IK baseline. Contact validity is mandatory. A contact-valid
-motion is not declared good unless rendered motion also avoids visible
-floating, crouch shuffling, inward-splayed ankles, large lunges, and sliding
-dismounts.
+Each experiment first produces a GRAIL-native globally retargeted candidate,
+then optionally generates ARDY candidates from the identical contact and root
+constraints. Contact validity is mandatory. A contact-valid motion is not
+declared good unless rendered motion also avoids visible floating, crouch
+shuffling, inward-splayed ankles, large lunges, and sliding dismounts.
 
 After those pass, sweep headings every 15 degrees and translate/rotate the
 terrain to test equivariance and prevent overfitting to one approach.
