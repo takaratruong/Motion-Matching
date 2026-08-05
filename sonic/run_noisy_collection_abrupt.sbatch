@@ -10,7 +10,7 @@
 #SBATCH --array=0-11%2
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=16G
+#SBATCH --mem=10G
 #SBATCH --time=01:30:00
 #SBATCH --output=/move/u/bodow/Projects/Motion-Matching-takara-corpus/slurm-takara-abrupt-noise-%A_%a.out
 
