@@ -1,5 +1,10 @@
 # G1 Action-Conditioned Terrain Contact Graph
 
+> Superseded on 2026-08-05 by
+> `2026-08-05-g1-contact-path-ardy-terrain-generation-design.md`. Experiments
+> showed that making source actions the primary graph edges still couples
+> simple terrain contact placement to incomplete motion-library coverage.
+
 ## Purpose
 
 Replace the nominal-footprint-first terrain planner with an offline contact
