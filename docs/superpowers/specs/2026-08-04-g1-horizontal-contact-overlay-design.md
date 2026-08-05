@@ -15,8 +15,8 @@ GRAIL staircase. It excludes diagonal and head-on routes, interactive motion
 matching, Sonic, physics tracking, depth input, and realtime constraints.
 
 The word `horizontal` means travel parallel to the stair risers. On the current
-scene grid, height varies primarily along scene X, so the horizontal route
-travels primarily along scene Y. Existing angle labels are not accepted as
+scene grid, height varies primarily along scene Y, so the horizontal route
+travels primarily along scene X. Existing angle labels are not accepted as
 evidence of direction; the generated root path and height gradient determine
 the route classification.
 

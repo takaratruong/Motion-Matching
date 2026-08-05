@@ -35,11 +35,11 @@ NPZ/height grids, optional installed G1 ARDY checkpoint, unittest.
 
 **Interfaces:**
 - Consumes: flat-gait sole positions, support masks, target height sampler, and
-  fixed scene-Y route endpoints.
+  fixed scene-X route endpoints.
 - Produces: `ContactInterval`, `HorizontalContactPlan`, and
   `horizontal_contact_plan(...)`.
 
-- [ ] Write failing tests proving that horizontal means scene-Y travel on the
+- [ ] Write failing tests proving that horizontal means scene-X travel on the
   representative grid, stance soles never straddle a riser, phase/lead-foot
   variants are deterministic, and the plan contains approach, entry, two
   alternating split-height steps, exit, and departure.
@@ -114,7 +114,7 @@ NPZ/height grids, optional installed G1 ARDY checkpoint, unittest.
 - Produces: `validation.json`, `contact-sheet.png`, and a looped passive MuJoCo
   viewer.
 
-- [ ] Write failing tests for required semantic phases, scene-Y route
+- [ ] Write failing tests for required semantic phases, scene-X route
   classification, two alternating split-height steps, monotonic progress,
   heading, support, sole, sliding, correction, and derivative gates.
 - [ ] Run focused tests and verify expected failures.
