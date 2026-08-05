@@ -17,6 +17,29 @@ _SPEC.loader.exec_module(_MODULE)
 
 
 class ValidateTraversalTests(unittest.TestCase):
+    def test_parser_accepts_heading_and_planned_footprints(self):
+        args = _MODULE.parser().parse_args(
+            [
+                "--input",
+                "traversal.npz",
+                "--target-dataset",
+                "dataset",
+                "--config",
+                "config.json",
+                "--g1-xml",
+                "g1.xml",
+                "--expected-heading-degrees",
+                "45",
+                "--planned-footprints",
+                "footprints.json",
+                "--output",
+                "metrics.json",
+            ]
+        )
+
+        self.assertEqual(args.expected_heading_degrees, 45.0)
+        self.assertEqual(args.minimum_supported_sole_points, 3)
+
     def test_accepts_contact_valid_metrics(self):
         _MODULE._enforce_metrics(
             {
@@ -39,6 +62,18 @@ class ValidateTraversalTests(unittest.TestCase):
                     "minimum_supported_sole_points": 8,
                 }
             )
+
+    def test_accepts_a_bounded_dynamic_flight_phase(self):
+        _MODULE._enforce_metrics(
+            {
+                "unsupported_frame_count": 5,
+                "maximum_stance_contact_error_m": 0.019,
+                "maximum_stance_horizontal_step_m": 0.009,
+                "minimum_sole_clearance_m": -0.024,
+                "minimum_supported_sole_points": 3,
+            },
+            maximum_unsupported_frames=5,
+        )
 
     def test_rejects_incomplete_sole_support(self):
         with self.assertRaisesRegex(Exception, "sole support"):
@@ -63,3 +98,20 @@ class ValidateTraversalTests(unittest.TestCase):
                     "minimum_supported_sole_points": 8,
                 }
             )
+
+    def test_rejects_terminal_mid_swing_and_missing_provenance(self):
+        metrics = {
+            "unsupported_frame_count": 0,
+            "maximum_stance_contact_error_m": 0.0,
+            "maximum_stance_horizontal_step_m": 0.0,
+            "minimum_sole_clearance_m": 0.0,
+            "minimum_supported_sole_points": 8,
+            "terminal_complete_support": False,
+            "provenance_coverage": 0.5,
+        }
+        with self.assertRaisesRegex(Exception, "terminal"):
+            _MODULE._enforce_metrics(metrics)
+
+        metrics["terminal_complete_support"] = True
+        with self.assertRaisesRegex(Exception, "provenance"):
+            _MODULE._enforce_metrics(metrics)

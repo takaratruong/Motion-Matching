@@ -191,6 +191,36 @@ def _surface_sampler(terrain: object):
     return sampler
 
 
+def _scene_to_world_xy(terrain: object, points: np.ndarray) -> np.ndarray:
+    transform = getattr(terrain, "scene_to_world_xy", None)
+    if transform is None:
+        return np.asarray(points, dtype=np.float64)
+    output = np.asarray(transform(points), dtype=np.float64)
+    if output.shape != np.asarray(points).shape or not np.isfinite(
+        output
+    ).all():
+        raise ContractError("heading realization scene transform is invalid")
+    return output
+
+
+def _scene_heading_to_world(
+    terrain: object, heading: np.ndarray
+) -> np.ndarray:
+    transform = getattr(terrain, "scene_heading_to_world", None)
+    output = (
+        np.asarray(heading, dtype=np.float64)
+        if transform is None
+        else np.asarray(transform(heading), dtype=np.float64)
+    )
+    if (
+        output.shape != (2,)
+        or not np.isfinite(output).all()
+        or np.linalg.norm(output) <= 1.0e-6
+    ):
+        raise ContractError("heading realization heading transform is invalid")
+    return output / np.linalg.norm(output)
+
+
 def _support_anchors(
     *,
     support: np.ndarray,
@@ -268,9 +298,12 @@ def realize_heading_footprint_plan(
         action_index,
         support_for_clip,
     ) = _source_inventory(source)
+    target_heading_world = _scene_heading_to_world(
+        terrain, plan.heading_scene_xy.detach().cpu().numpy()
+    )
     target_yaw = math.atan2(
-        float(plan.heading_scene_xy[1].item()),
-        float(plan.heading_scene_xy[0].item()),
+        float(target_heading_world[1]),
+        float(target_heading_world[0]),
     )
 
     all_joints: list[np.ndarray] = []
@@ -386,7 +419,14 @@ def realize_heading_footprint_plan(
         )
 
         if previous_feet is None:
-            translation = np.zeros(3, dtype=np.float64)
+            requested_root = getattr(
+                source, "start_root_position_world", None
+            )
+            translation = (
+                np.zeros(3, dtype=np.float64)
+                if requested_root is None
+                else np.asarray(requested_root, dtype=np.float64) - root[0]
+            )
         else:
             translation = (
                 previous_feet[support[0]]
@@ -426,10 +466,14 @@ def realize_heading_footprint_plan(
         ]
         touchdown_targets = {}
         for event, footprint in zip(expected_events, edge_footprints):
+            target_world_xy = _scene_to_world_xy(
+                terrain,
+                footprint.center_scene_xy.detach().cpu().numpy(),
+            )
             touchdown_targets[event] = np.array(
                 (
-                    float(footprint.center_scene_xy[0].item()),
-                    float(footprint.center_scene_xy[1].item()),
+                    float(target_world_xy[0]),
+                    float(target_world_xy[1]),
                     footprint.surface_height_m
                     + float(ankle_origin_sole_m),
                 ),
