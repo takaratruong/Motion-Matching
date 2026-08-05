@@ -471,3 +471,27 @@ larger collision/contact tolerance.
   prepared; GPU noising remains gated on visual/trajectory acceptance.
   Evidence:
   `/move/data/terrain-aware/sonic-rollouts/takara_bones_mm_abrupt_v1_task12`.
+
+## 2026-08-05 raised-support MotionBricks continuation
+
+- The post-terrain crouch was not primarily a waypoint or gait-phase problem.
+  Both authored courses end on a support surface 0.25 m above MotionBricks'
+  training floor, and the unnormalized continuation lowered its pelvis by
+  approximately 0.33 m while returning toward floor-relative training poses.
+- The retained interface subtracts the current support height from the four
+  context root-z values before MotionBricks generation, then restores that
+  support height to each newly generated batch exactly once.  An initial
+  implementation restored it on cached batches too and accumulated 0.25 m per
+  controller tick; that failed rollout was rejected and the ownership test is
+  now based on whether a new qpos batch was actually emitted.
+- The corrected v9 rollout captures both portals and reaches the final
+  waypoint.  Its two selected continuations lose only 15.64 and 10.43 mm of
+  pelvis height, versus roughly 0.33 m before support normalization.  Dense
+  25 fps review around both exits shows continuous alternating steps and only
+  a mild ordinary knee bend, with no deep squat, fall, freeze, or pose snap.
+- Route tracking remains accepted but is slightly less precise than v4:
+  5.43 cm RMS and 16.48 cm p95 deviation, with 13 terrain-guarded frames.
+  This trade is retained because the route completes and the visible
+  distribution seam is materially removed; waypoint tuning did not solve it.
+- Evidence:
+  `artifacts/generic_terrain/waypoint_routes/canary_portal_aligned_s_v2/live_rollout_seed17_v9_support_once_move`.

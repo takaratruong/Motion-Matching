@@ -591,6 +591,27 @@ sbatch --partition=move --array=0-3%4 \
 Stages 1 and 3 request no GPU. Only physical SONIC tracking/rendering and noisy
 rollout collection consume GPU lanes.
 
+For robustness to deliberately bad joystick timing, the smooth corpus has a
+separate additive abrupt-command bank.  It contains 102 canonical traces and
+their exact sagittal mirrors, with one-frame travel reversals, heading
+reversals, simultaneous two-stick changes, stop/restart, and speed jumps at
+varied gait phases.  `data/command_event_mask` labels the exact hard frames so
+training can oversample their surrounding windows without overweighting every
+held frame of each clip.  Keep this as an explicitly weighted supplement to
+the smooth omnidirectional bank rather than replacing normal steering data.
+
+```bash
+# Materialize the 204-clip clean abrupt bank and all 12 tracker inputs.
+sbatch sonic/run_abrupt_corpus.sbatch
+
+# Qualify one shard, then collect the complete bank with two concurrent L40s.
+sbatch sonic/run_noisy_collection_abrupt_canary.sbatch
+sbatch sonic/run_noisy_collection_abrupt.sbatch
+
+# CPU-only Task4/Task12 and event-mask sidecars after collection finishes.
+sbatch sonic/run_annotate_abrupt_shards.sbatch
+```
+
 The supplied checkpoint bundle must pair Justin's Takara weights with the
 configuration used by his successful evaluations:
 

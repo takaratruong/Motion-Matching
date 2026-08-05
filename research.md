@@ -1063,3 +1063,15 @@ measured 0.5 s exit tangent and changing the slow/walk boundary both retained
 visual fixes.  This local state-distribution seam is not being hidden by the
 route metrics and requires pose-compatible exit retrieval or learned
 inertialization rather than another waypoint-controller tweak.
+
+The crouch was subsequently localized to the vertical coordinate convention,
+not the waypoint controller.  Both exits sit on support 0.25 m above the flat
+MotionBricks training floor.  Canonicalizing the four-frame context to that
+local support height before generation, then restoring the support offset once
+per newly generated batch, reduces the two early continuation root drops from
+about 0.33 m to 15.64 and 10.43 mm.  The corrected rollout still captures both
+portals and the final waypoint.  Dense 25 fps exit review shows continuous
+alternating steps with no deep squat, freeze, fall, or pose snap.  Path error
+is 5.43 cm RMS / 16.48 cm p95, worse than v4 but accepted because the visible
+state-distribution failure is removed without losing completion.  Evidence:
+`artifacts/generic_terrain/waypoint_routes/canary_portal_aligned_s_v2/live_rollout_seed17_v9_support_once_move`.

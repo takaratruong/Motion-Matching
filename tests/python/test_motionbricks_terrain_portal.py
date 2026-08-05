@@ -1,10 +1,15 @@
+import sys
+import types
+
 import numpy as np
+import torch
 
 from mm_sonic.motionbricks_terrain_portal import (
     MotionBricksTerrainCourse,
     TerrainCoursePlayback,
     select_terrain_portal,
 )
+from mm_sonic.motionbricks_global_terrain_viewer import _submit_motionbricks
 
 
 def _course() -> MotionBricksTerrainCourse:
@@ -77,3 +82,75 @@ def test_portal_catalog_prefers_the_compatible_entry_family() -> None:
     )
     assert selected.course_index == 1
     assert selected.capture.accepted
+
+
+def test_raised_support_is_restored_once_per_generated_batch(monkeypatch) -> None:
+    clips = types.ModuleType("motionbricks.motion_backbone.demo.clips")
+    clips.clip_holder_G1 = types.SimpleNamespace(CLIPS={"walk": object()})
+    for name in (
+        "motionbricks",
+        "motionbricks.motion_backbone",
+        "motionbricks.motion_backbone.demo",
+    ):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, clips.__name__, clips)
+
+    class Controller:
+        @staticmethod
+        def get_default_allowed_pred_num_tokens(_mode: int) -> int:
+            return 12
+
+        @staticmethod
+        def get_controller_dt() -> float:
+            return 1.0 / 30.0
+
+    class Agent:
+        def __init__(self) -> None:
+            self.frames = {"mujoco_qpos": torch.zeros((1, 1, 36))}
+            self.generate_next = False
+            self.last_signals = None
+
+        def generate_new_frames(
+            self, signals, _duration: float, *, force_generation: bool
+        ) -> None:
+            self.last_signals = signals
+            if force_generation or self.generate_next:
+                generated = torch.zeros((1, 8, 36))
+                generated[..., 2] = 0.70
+                self.frames["mujoco_qpos"] = generated
+                self.generate_next = False
+
+    context = np.zeros((4, 36), dtype=np.float32)
+    context[:, 2] = 1.03
+    agent = Agent()
+    controller = Controller()
+    arguments = {
+        "context_qpos": context,
+        "velocity_world_xy": np.asarray((0.3, 0.0)),
+        "facing_yaw_world": 0.0,
+        "mode_name": "walk",
+        "random_seed": 0,
+        "support_height_world": 0.33,
+    }
+
+    _submit_motionbricks(agent, controller, force=True, **arguments)
+    np.testing.assert_allclose(
+        agent.last_signals["context_mujoco_qpos"][..., 2], 0.70, atol=1.0e-6
+    )
+    np.testing.assert_allclose(
+        agent.frames["mujoco_qpos"][..., 2], 1.03, atol=1.0e-6
+    )
+
+    # A cached batch is returned unchanged; its world support offset must not
+    # be accumulated again on every controller tick.
+    _submit_motionbricks(agent, controller, force=False, **arguments)
+    np.testing.assert_allclose(
+        agent.frames["mujoco_qpos"][..., 2], 1.03, atol=1.0e-6
+    )
+
+    # When the agent really generates a new batch, restore the offset once.
+    agent.generate_next = True
+    _submit_motionbricks(agent, controller, force=False, **arguments)
+    np.testing.assert_allclose(
+        agent.frames["mujoco_qpos"][..., 2], 1.03, atol=1.0e-6
+    )
