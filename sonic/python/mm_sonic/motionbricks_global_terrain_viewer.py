@@ -52,6 +52,8 @@ DEFAULT_COURSE = Path(
     "motionbricks_course_target26_pos45_v1/"
     "reused_composition_v10_automatic_safe_phase/motion.npz"
 )
+PORTAL_ENTRY_LEAD_TIME_S = 0.80
+FLAT_TERRAIN_GUARD_LOOKAHEAD_M = 0.32
 
 
 def _catalog_course_paths(catalog_path: Path, target_clip_index: int) -> tuple[Path, ...]:
@@ -76,7 +78,13 @@ def _catalog_course_paths(catalog_path: Path, target_clip_index: int) -> tuple[P
 
 def _route_manifest(
     manifest_path: Path,
-) -> tuple[Path, tuple[float, float, float], tuple[float, float, float, float], tuple[Path, ...]]:
+) -> tuple[
+    Path,
+    tuple[float, float, float],
+    tuple[float, float, float, float],
+    tuple[Path, ...],
+    tuple[tuple[float, float], ...],
+]:
     """Load one compiled multi-event terrain scene for the browser viewer."""
 
     payload = json.loads(manifest_path.expanduser().resolve().read_text())
@@ -91,6 +99,16 @@ def _route_manifest(
     )
     if not courses:
         raise ValueError("terrain route manifest has no portal courses")
+    events = payload.get("events", ())
+    if not isinstance(events, list) or len(events) != len(courses):
+        raise ValueError("terrain route manifest has no per-course event axes")
+    lateral_axes = []
+    for event in events:
+        start = np.asarray(event["start_xy"], dtype=np.float64)
+        end = np.asarray(event["end_xy"], dtype=np.float64)
+        direction = end - start
+        direction /= max(float(np.linalg.norm(direction)), 1.0e-8)
+        lateral_axes.append((-float(direction[1]), float(direction[0])))
     position = tuple(float(value) for value in payload["terrain_position_world"])
     quaternion = tuple(
         float(value)
@@ -103,6 +121,7 @@ def _route_manifest(
         position,
         quaternion,
         courses,
+        tuple(lateral_axes),
     )
 
 
@@ -266,6 +285,8 @@ def _guard_flat_velocity(
     velocity_world_xy: object,
     *,
     ray_origin_z: float,
+    lookahead_distance_m: float = FLAT_TERRAIN_GUARD_LOOKAHEAD_M,
+    maximum_support_change_m: float = 0.018,
 ) -> tuple[np.ndarray, bool]:
     root = np.asarray(root_xyz, dtype=np.float64)
     velocity = np.asarray(velocity_world_xy, dtype=np.float64)
@@ -274,16 +295,132 @@ def _guard_flat_velocity(
     current_height = _terrain_surface_height(
         terrain, root[:2], ray_origin_z=ray_origin_z
     )
-    future_height = _terrain_surface_height(
-        terrain,
-        root[:2] + 0.40 * velocity,
-        ray_origin_z=ray_origin_z,
+    direction = velocity / float(np.linalg.norm(velocity))
+    distances = np.linspace(
+        min(0.08, float(lookahead_distance_m)),
+        float(lookahead_distance_m),
+        6,
+    )
+    future_heights = np.asarray(
+        [
+            _terrain_surface_height(
+                terrain,
+                root[:2] + distance * direction,
+                ray_origin_z=ray_origin_z,
+            )
+            for distance in distances
+        ],
+        dtype=np.float64,
     )
     unsafe = bool(
-        future_height - current_height > 0.07
-        or current_height - future_height > 0.12
+        np.max(np.abs(future_heights - current_height))
+        > float(maximum_support_change_m)
     )
     return (np.zeros(2, dtype=np.float64) if unsafe else velocity), unsafe
+
+
+def _laterally_registered_course(
+    course: MotionBricksTerrainCourse,
+    current_xy: object,
+    *,
+    entry_lead_time_s: float,
+    maximum_lateral_shift_m: float = 3.0,
+    lateral_axis_world_xy: object | None = None,
+) -> tuple[MotionBricksTerrainCourse, float]:
+    """Place an authored crossing in the operator's current terrain lane."""
+
+    entry_frame = course.entry_frame_index(entry_lead_time_s)
+    if lateral_axis_world_xy is None:
+        direction = course.travel_direction_world_xy(entry_frame)
+        normal = np.asarray((-direction[1], direction[0]), dtype=np.float64)
+    else:
+        normal = np.asarray(lateral_axis_world_xy, dtype=np.float64)
+        normal /= max(float(np.linalg.norm(normal)), 1.0e-8)
+    delta = (
+        np.asarray(current_xy, dtype=np.float64)
+        - course.root_position_world[entry_frame, :2]
+    )
+    requested_shift = float(np.dot(delta, normal))
+    lateral_shift = float(
+        np.clip(
+            requested_shift,
+            -float(maximum_lateral_shift_m),
+            float(maximum_lateral_shift_m),
+        )
+    )
+    if abs(lateral_shift) < 1.0e-6:
+        return course, 0.0
+    root = course.root_position_world.copy()
+    root[:, :2] += lateral_shift * normal[None]
+    return (
+        MotionBricksTerrainCourse(
+            path=course.path,
+            fps=course.fps,
+            root_position_world=root,
+            root_quaternion_world_wxyz=(
+                course.root_quaternion_world_wxyz
+            ),
+            joint_position_isaaclab=course.joint_position_isaaclab,
+            seam_indices=course.seam_indices,
+        ),
+        lateral_shift,
+    )
+
+
+def _registration_matches_terrain(
+    original: MotionBricksTerrainCourse,
+    registered: MotionBricksTerrainCourse,
+    *,
+    terrain: TerrainMeshIndex,
+    ray_origin_z: float,
+    entry_frame: int,
+    maximum_height_error_m: float = 0.003,
+    lateral_axis_world_xy: object | None = None,
+) -> bool:
+    """Verify that a lane shift preserves the exact support-height profile."""
+
+    frames = np.unique(
+        np.linspace(
+            int(entry_frame),
+            original.frame_count - 1,
+            min(64, original.frame_count - int(entry_frame)),
+        ).round().astype(np.int64)
+    )
+    if lateral_axis_world_xy is None:
+        direction = original.travel_direction_world_xy(entry_frame)
+        normal = np.asarray((-direction[1], direction[0]), dtype=np.float64)
+    else:
+        normal = np.asarray(lateral_axis_world_xy, dtype=np.float64)
+        normal /= max(float(np.linalg.norm(normal)), 1.0e-8)
+    for frame in frames:
+        for sole_offset in (-0.16, 0.0, 0.16):
+            source_xy = (
+                original.root_position_world[frame, :2]
+                + sole_offset * normal
+            )
+            target_xy = (
+                registered.root_position_world[frame, :2]
+                + sole_offset * normal
+            )
+            source_hit = terrain.raycast(
+                np.asarray((source_xy[0], source_xy[1], ray_origin_z)),
+                np.asarray((0.0, 0.0, -1.0)),
+            )
+            target_hit = terrain.raycast(
+                np.asarray((target_xy[0], target_xy[1], ray_origin_z)),
+                np.asarray((0.0, 0.0, -1.0)),
+            )
+            if source_hit is None or target_hit is None:
+                return False
+            if (
+                abs(
+                    float(source_hit.position_world[2])
+                    - float(target_hit.position_world[2])
+                )
+                > float(maximum_height_error_m)
+            ):
+                return False
+    return True
 
 
 def _project_live_root_above_support(
@@ -294,6 +431,7 @@ def _project_live_root_above_support(
     ray_origin_z: float,
     sole_clearance_m: float = 0.003,
     maximum_lift_m: float = 0.06,
+    support_height_world: float | None = None,
 ) -> tuple[np.ndarray, float]:
     """Apply the globally privileged game-style root-height projection."""
 
@@ -304,8 +442,12 @@ def _project_live_root_above_support(
         joints=mujoco_to_isaaclab_joint_vector(value[7:]),
     )
     required_lifts = [
-        _terrain_surface_height(
-            terrain, point[:2], ray_origin_z=ray_origin_z
+        (
+            _terrain_surface_height(
+                terrain, point[:2], ray_origin_z=ray_origin_z
+            )
+            if support_height_world is None
+            else float(support_height_world)
         )
         + float(sole_clearance_m)
         - float(point[2])
@@ -428,6 +570,7 @@ def run(
     *,
     target_clip_index: int | None,
     course_paths: tuple[Path, ...],
+    course_lateral_axes: tuple[tuple[float, float] | None, ...] | None,
     motionbricks_root: Path,
     stairs_archive: Path,
     terrain_usd: Path | None,
@@ -455,6 +598,16 @@ def run(
     )
     if not courses:
         raise ValueError("viewer needs at least one terrain course")
+    if course_lateral_axes is None:
+        lateral_axes: tuple[tuple[float, float] | None, ...] = (None,) * len(
+            courses
+        )
+    else:
+        lateral_axes = tuple(course_lateral_axes)
+        if len(lateral_axes) != len(courses):
+            raise ValueError(
+                "course_lateral_axes must contain one entry per terrain course"
+            )
     primary_course = courses[0]
     primary_course_qpos = primary_course.native_mujoco_qpos()
 
@@ -526,6 +679,9 @@ def run(
     camera.elevation = -18.0
 
     current_qpos = primary_course_qpos[0].copy()
+    flat_support_height = _terrain_surface_height(
+        terrain_index, current_qpos[:2], ray_origin_z=ray_origin_z
+    )
     desired_facing_yaw = primary_course.start_yaw_world
     playback: TerrainCoursePlayback | None = None
     active_course: MotionBricksTerrainCourse | None = None
@@ -551,13 +707,14 @@ def run(
         facing: float,
         name: str,
     ) -> None:
-        nonlocal current_qpos
+        nonlocal current_qpos, flat_support_height
         context = course.resampled_context_qpos(
             at_end=at_end, target_fps=30.0, frame_count=4
         )
         support_height = _terrain_surface_height(
             terrain_index, current_qpos[:2], ray_origin_z=ray_origin_z
         )
+        flat_support_height = support_height
         if at_end:
             phase_result = _submit_phase_matched_course_exit(
                 full_agent,
@@ -592,10 +749,12 @@ def run(
             sole_adapter=sole_adapter,
             terrain=terrain_index,
             ray_origin_z=ray_origin_z,
+            support_height_world=flat_support_height,
         )
 
     def reset_session() -> None:
         nonlocal current_qpos, desired_facing_yaw, playback, active_course, mode
+        nonlocal flat_support_height
         nonlocal tick, sim_time_s, blocked_by_terrain, last_capture
         full_agent.reset()
         current_qpos = primary_course_qpos[0].copy()
@@ -662,6 +821,13 @@ def run(
         "course_motions": [str(course.path) for course in courses],
         "course_frame_counts": [course.frame_count for course in courses],
         "course_fps": [course.fps for course in courses],
+        "course_lateral_axes_world_xy": [
+            None if axis is None else list(axis) for axis in lateral_axes
+        ],
+        "portal_entry_lead_time_s": PORTAL_ENTRY_LEAD_TIME_S,
+        "flat_terrain_guard_lookahead_m": (
+            FLAT_TERRAIN_GUARD_LOOKAHEAD_M
+        ),
         "course_seam_indices": [
             list(course.seam_indices) for course in courses
         ],
@@ -708,21 +874,55 @@ def run(
             )
             blocked_by_terrain = False
             if playback is None:
-                selection = select_terrain_portal(
-                    courses, current_qpos, requested_velocity
+                registered_rows = [
+                    _laterally_registered_course(
+                        course,
+                        current_qpos[:2],
+                        entry_lead_time_s=PORTAL_ENTRY_LEAD_TIME_S,
+                        lateral_axis_world_xy=lateral_axis,
+                    )
+                    for course, lateral_axis in zip(courses, lateral_axes)
+                ]
+                registered_courses = tuple(
+                    row[0] for row in registered_rows
                 )
-                candidate_course = courses[selection.course_index]
+                selection = select_terrain_portal(
+                    registered_courses,
+                    current_qpos,
+                    requested_velocity,
+                    entry_lead_time_s=PORTAL_ENTRY_LEAD_TIME_S,
+                )
+                candidate_course = registered_courses[selection.course_index]
+                lateral_shift = registered_rows[selection.course_index][1]
                 last_capture = selection.capture
                 selected_path = candidate_course.root_position_world[
-                    :: max(1, candidate_course.frame_count // 80)
+                    selection.entry_frame_index :: max(
+                        1, candidate_course.frame_count // 80
+                    )
                 ].copy()
                 selected_path[:, 2] += 0.10
                 selected_facing = np.tile(
                     np.asarray((1.0, 0.0)), (len(selected_path), 1)
                 )
-                if last_capture.accepted:
+                terrain_equivalent = (
+                    last_capture.accepted
+                    and _registration_matches_terrain(
+                        courses[selection.course_index],
+                        candidate_course,
+                        terrain=terrain_index,
+                        ray_origin_z=ray_origin_z,
+                        entry_frame=selection.entry_frame_index,
+                        lateral_axis_world_xy=(
+                            lateral_axes[selection.course_index]
+                        ),
+                    )
+                )
+                if last_capture.accepted and terrain_equivalent:
                     playback = TerrainCoursePlayback(
-                        candidate_course, current_qpos, blend_frames=18
+                        candidate_course,
+                        current_qpos,
+                        blend_frames=18,
+                        start_frame=selection.entry_frame_index,
                     )
                     active_course = candidate_course
                     mode = "course"
@@ -737,12 +937,22 @@ def run(
                     print(
                         f"frame={tick:06d} PORTAL_COMMIT "
                         f"family={selection.course_index} "
+                        f"entry_frame={selection.entry_frame_index} "
+                        f"lateral_shift={lateral_shift:.3f} "
                         f"position_error={last_capture.position_error_m:.3f} "
                         f"yaw_error_deg={math.degrees(last_capture.yaw_error_rad):.1f} "
                         f"pose_rmse={last_capture.lower_body_rmse_rad:.3f}",
                         flush=True,
                     )
                 else:
+                    if last_capture.accepted and not terrain_equivalent:
+                        last_capture = PortalCapture(
+                            False,
+                            last_capture.position_error_m,
+                            last_capture.yaw_error_rad,
+                            last_capture.travel_alignment,
+                            last_capture.lower_body_rmse_rad,
+                        )
                     guarded_velocity, blocked_by_terrain = _guard_flat_velocity(
                         terrain_index,
                         current_qpos[:3],
@@ -760,11 +970,7 @@ def run(
                         facing_yaw_world=desired_facing_yaw,
                         mode_name=mode_name,
                         force=False,
-                        support_height_world=_terrain_surface_height(
-                            terrain_index,
-                            current_qpos[:2],
-                            ray_origin_z=ray_origin_z,
-                        ),
+                        support_height_world=flat_support_height,
                     )
                     current_qpos, _ = _project_live_root_above_support(
                         np.asarray(
@@ -773,6 +979,7 @@ def run(
                         sole_adapter=sole_adapter,
                         terrain=terrain_index,
                         ray_origin_z=ray_origin_z,
+                        support_height_world=flat_support_height,
                     )
                     mode = "flat"
                     dt = flat_dt
@@ -780,7 +987,10 @@ def run(
                 if active_course is None:
                     raise RuntimeError("course playback lost its active course")
                 current_qpos = playback.next_qpos()
-                if playback.index <= playback.blend_frames:
+                if (
+                    playback.index
+                    <= playback.start_frame + playback.blend_frames
+                ):
                     current_qpos, _ = _project_live_root_above_support(
                         current_qpos,
                         sole_adapter=sole_adapter,
@@ -889,7 +1099,9 @@ def main() -> None:
     parser.add_argument("--target-clip-index", type=int)
     parser.add_argument("--course-motion", type=Path, action="append")
     parser.add_argument("--terrain-catalog", type=Path)
-    parser.add_argument("--terrain-route-manifest", type=Path)
+    parser.add_argument(
+        "--terrain-route-manifest", type=Path, action="append"
+    )
     parser.add_argument("--terrain-usd", type=Path)
     parser.add_argument(
         "--terrain-position",
@@ -915,13 +1127,31 @@ def main() -> None:
     arguments = parser.parse_args()
     target_clip_index = arguments.target_clip_index
     manifest_scene = None
+    manifest_courses: list[Path] = []
+    manifest_lateral_axes: list[tuple[float, float]] = []
     if arguments.terrain_route_manifest is not None:
         if arguments.terrain_usd is not None or arguments.terrain_catalog is not None:
             parser.error(
                 "--terrain-route-manifest cannot be combined with "
                 "--terrain-usd or --terrain-catalog"
             )
-        manifest_scene = _route_manifest(arguments.terrain_route_manifest)
+        manifest_scenes = [
+            _route_manifest(path)
+            for path in arguments.terrain_route_manifest
+        ]
+        manifest_scene = manifest_scenes[0]
+        for scene in manifest_scenes:
+            if (
+                scene[0] != manifest_scene[0]
+                or not np.allclose(scene[1], manifest_scene[1], atol=1.0e-8)
+                or not np.allclose(scene[2], manifest_scene[2], atol=1.0e-8)
+            ):
+                parser.error(
+                    "all --terrain-route-manifest values must describe the "
+                    "same globally placed terrain"
+                )
+            manifest_courses.extend(scene[3])
+            manifest_lateral_axes.extend(scene[4])
     if (
         arguments.terrain_usd is None
         and manifest_scene is None
@@ -929,25 +1159,37 @@ def main() -> None:
     ):
         target_clip_index = 26
     course_paths = list(arguments.course_motion or ())
+    course_lateral_axes: list[tuple[float, float] | None] = [
+        None for _ in course_paths
+    ]
     if arguments.terrain_catalog is not None:
         if target_clip_index is None:
             parser.error("--terrain-catalog requires --target-clip-index")
-        course_paths.extend(
-            _catalog_course_paths(
-                arguments.terrain_catalog, target_clip_index
-            )
+        catalog_paths = _catalog_course_paths(
+            arguments.terrain_catalog, target_clip_index
         )
+        course_paths.extend(catalog_paths)
+        course_lateral_axes.extend(None for _ in catalog_paths)
     if manifest_scene is not None:
-        course_paths.extend(manifest_scene[3])
-    course_paths = list(dict.fromkeys(course_paths))
+        course_paths.extend(manifest_courses)
+        course_lateral_axes.extend(manifest_lateral_axes)
+    unique_courses: dict[Path, tuple[float, float] | None] = {}
+    for path, lateral_axis in zip(course_paths, course_lateral_axes):
+        unique_courses.setdefault(path, lateral_axis)
+    course_paths = list(unique_courses)
+    course_lateral_axes = list(unique_courses.values())
     terrain_usd = arguments.terrain_usd
     terrain_position = tuple(arguments.terrain_position)
     terrain_quaternion = tuple(arguments.terrain_quaternion_wxyz)
     if manifest_scene is not None:
-        terrain_usd, terrain_position, terrain_quaternion, _ = manifest_scene
+        terrain_usd, terrain_position, terrain_quaternion, _, _ = manifest_scene
+    if not course_paths:
+        course_paths = [DEFAULT_COURSE]
+        course_lateral_axes = [None]
     run(
         target_clip_index=target_clip_index,
-        course_paths=tuple(course_paths or (DEFAULT_COURSE,)),
+        course_paths=tuple(course_paths),
+        course_lateral_axes=tuple(course_lateral_axes),
         motionbricks_root=arguments.motionbricks_root,
         stairs_archive=arguments.stairs_archive,
         terrain_usd=terrain_usd,

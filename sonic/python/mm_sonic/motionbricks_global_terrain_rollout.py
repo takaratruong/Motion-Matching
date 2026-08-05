@@ -312,6 +312,7 @@ def rollout(
         sole_adapter=sole_adapter,
         terrain=terrain,
         ray_origin_z=ray_origin_z,
+        support_height_world=flat_support_height,
     )
     timestamps = [0.0]
     qposes = [current.copy()]
@@ -379,7 +380,10 @@ def rollout(
         if playback is not None:
             assert active_course is not None
             current = playback.next_qpos()
-            if playback.index <= playback.blend_frames:
+            if (
+                playback.index
+                <= playback.start_frame + playback.blend_frames
+            ):
                 current, clearance_lift = _project_live_root_above_support(
                     current,
                     sole_adapter=sole_adapter,
@@ -447,6 +451,7 @@ def rollout(
                 sole_adapter=sole_adapter,
                 terrain=terrain,
                 ray_origin_z=ray_origin_z,
+                support_height_world=flat_support_height,
             )
             dt = 1.0 / 30.0
             mode = "flat"

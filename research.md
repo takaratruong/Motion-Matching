@@ -1114,3 +1114,31 @@ This is still a globally privileged, purely kinematic ceiling.  It proves that
 live arbitrary flat steering and multiple exact-safe terrain traversals can be
 combined without replaying whole prerecorded scenes; it is not yet a SONIC
 tracking qualification or a causal onboard terrain selector.
+
+### Interactive portal correction (2026-08-05)
+
+The first browser version did not reproduce the headless route result.  It
+committed at frame zero of a long authored approach, allowed the flat gait's
+root to follow non-flat support, exposed only one traversal direction, and
+derived lateral registration from small sideways wiggles in the authored root
+trajectory.  In practice this locked out the joystick for seconds, floated or
+carried the robot onto ramps, rejected off-centre stair captures, and made
+reverse traversal impossible.
+
+The corrected runtime commits 0.8 s before the terrain seam, keeps live flat
+root height on its current support plane, exposes forward and reverse portals,
+and shifts each portal only along the exact obstacle-lateral axis stored in the
+route manifest.  It verifies the shifted course against the exact terrain
+support profile before committing.  All ten directional courses retain the
+same support profile at lateral shifts of -1.0, -0.5, +0.5, and +1.0 m.
+
+An off-centre stair-ascent probe starting from an official MotionBricks flat
+gait captures 16 cm before the late portal with 0.087 rad lower-body phase
+error.  The complete ascent passes the exact G1 audit at 2.000 mm maximum foot
+penetration and zero forbidden-body collision.  The corresponding reverse
+ramp probe also captures from live flat gait and passes with zero foot or body
+penetration.  Dense video review shows neither the reported freeze nor a
+root-height teleport.  Evidence:
+`artifacts/generic_terrain/interactive_probes/stairs_up_jit080_lane_flat_mb_v2`
+and
+`artifacts/generic_terrain/interactive_probes/ramp_down_jit_lane_flat_mb_v2`.

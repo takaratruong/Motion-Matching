@@ -80,6 +80,7 @@ class PortalSelection:
     course_index: int
     capture: PortalCapture
     score: float
+    entry_frame_index: int = 0
 
 
 @dataclass(frozen=True)
@@ -142,6 +143,27 @@ class MotionBricksTerrainCourse:
             raise ValueError("terrain course has no approach displacement")
         return direction / norm
 
+    def entry_frame_index(self, lead_time_s: float) -> int:
+        """Return a late flat-approach frame for just-in-time commitment."""
+
+        if not math.isfinite(lead_time_s) or lead_time_s <= 0.0:
+            raise ValueError("portal lead time must be positive and finite")
+        lead_frames = max(2, int(round(float(lead_time_s) * self.fps)))
+        return max(0, self.seam_indices[0] - lead_frames)
+
+    def travel_direction_world_xy(self, frame_index: int = 0) -> np.ndarray:
+        frame = int(frame_index)
+        if frame < 0 or frame >= self.seam_indices[0]:
+            raise ValueError("portal entry frame must precede the terrain seam")
+        direction = (
+            self.root_position_world[-1, :2]
+            - self.root_position_world[frame, :2]
+        )
+        norm = float(np.linalg.norm(direction))
+        if norm < 1.0e-6:
+            raise ValueError("terrain course has no entry displacement")
+        return direction / norm
+
     def native_mujoco_qpos(self) -> np.ndarray:
         result = np.empty((self.frame_count, 36), dtype=np.float64)
         result[:, :3] = self.root_position_world
@@ -163,15 +185,20 @@ class MotionBricksTerrainCourse:
         maximum_yaw_error_rad: float = math.radians(45.0),
         minimum_travel_alignment: float = 0.45,
         maximum_lower_body_rmse_rad: float = 0.38,
+        frame_index: int = 0,
     ) -> PortalCapture:
         qpos = np.asarray(current_qpos, dtype=np.float64)
         velocity = np.asarray(requested_velocity_world_xy, dtype=np.float64)
         if qpos.shape != (36,) or velocity.shape != (2,):
             raise ValueError("portal capture expects qpos[36] and velocity[2]")
+        frame = int(frame_index)
+        if frame < 0 or frame >= self.seam_indices[0]:
+            raise ValueError("portal capture frame must precede the terrain seam")
         position_error = float(
-            np.linalg.norm(qpos[:2] - self.root_position_world[0, :2])
+            np.linalg.norm(qpos[:2] - self.root_position_world[frame, :2])
         )
-        yaw_error = abs(_wrap(_yaw_wxyz(qpos[3:7]) - self.start_yaw_world))
+        reference_yaw = _yaw_wxyz(self.root_quaternion_world_wxyz[frame])
+        yaw_error = abs(_wrap(_yaw_wxyz(qpos[3:7]) - reference_yaw))
         speed = float(np.linalg.norm(velocity))
         alignment = (
             -1.0
@@ -179,12 +206,15 @@ class MotionBricksTerrainCourse:
             else float(
                 np.dot(
                     velocity / speed,
-                    self.approach_direction_world_xy,
+                    self.travel_direction_world_xy(frame),
                 )
             )
         )
         current_isaac = mujoco_to_isaaclab_joint_vector(qpos[7:])
-        difference = current_isaac[LOWER_BODY] - self.joint_position_isaaclab[0, LOWER_BODY]
+        difference = (
+            current_isaac[LOWER_BODY]
+            - self.joint_position_isaaclab[frame, LOWER_BODY]
+        )
         lower_body_rmse = float(np.sqrt(np.mean(np.square(difference))))
         accepted = bool(
             position_error <= float(maximum_position_error_m)
@@ -242,6 +272,8 @@ def select_terrain_portal(
     courses: tuple[MotionBricksTerrainCourse, ...],
     current_qpos: object,
     requested_velocity_world_xy: object,
+    *,
+    entry_lead_time_s: float | None = None,
 ) -> PortalSelection:
     """Choose the best globally known entry portal for the live pose.
 
@@ -253,10 +285,17 @@ def select_terrain_portal(
 
     if not courses:
         raise ValueError("terrain portal selection needs at least one course")
-    ranked: list[tuple[bool, float, int, PortalCapture]] = []
+    ranked: list[tuple[bool, float, int, PortalCapture, int]] = []
     for index, course in enumerate(courses):
+        entry_frame = (
+            0
+            if entry_lead_time_s is None
+            else course.entry_frame_index(entry_lead_time_s)
+        )
         capture = course.portal_capture(
-            current_qpos, requested_velocity_world_xy
+            current_qpos,
+            requested_velocity_world_xy,
+            frame_index=entry_frame,
         )
         alignment_error = max(0.0, 0.45 - capture.travel_alignment)
         score = float(
@@ -265,9 +304,11 @@ def select_terrain_portal(
             + capture.lower_body_rmse_rad / 0.38
             + alignment_error / 0.45
         )
-        ranked.append((not capture.accepted, score, index, capture))
-    _, score, index, capture = min(ranked, key=lambda value: value[:3])
-    return PortalSelection(index, capture, score)
+        ranked.append((not capture.accepted, score, index, capture, entry_frame))
+    _, score, index, capture, entry_frame = min(
+        ranked, key=lambda value: value[:3]
+    )
+    return PortalSelection(index, capture, score, entry_frame)
 
 
 class TerrainCoursePlayback:
@@ -279,17 +320,25 @@ class TerrainCoursePlayback:
         current_qpos: object,
         *,
         blend_frames: int = 18,
+        start_frame: int = 0,
     ) -> None:
         current = np.asarray(current_qpos, dtype=np.float64)
         if current.shape != (36,) or not np.isfinite(current).all():
             raise ValueError("course playback needs one finite qpos[36]")
-        if blend_frames < 2 or blend_frames >= course.seam_indices[0]:
+        first = int(start_frame)
+        if first < 0 or first >= course.seam_indices[0]:
+            raise ValueError("course playback must start before the terrain seam")
+        if (
+            blend_frames < 2
+            or blend_frames >= course.seam_indices[0] - first
+        ):
             raise ValueError("course entry blend must finish before the stair seam")
         self.course = course
         self.course_qpos = course.native_mujoco_qpos()
         self.start_qpos = current.copy()
         self.blend_frames = int(blend_frames)
-        self.index = 0
+        self.start_frame = first
+        self.index = first
 
     @property
     def done(self) -> bool:
@@ -300,19 +349,24 @@ class TerrainCoursePlayback:
             return self.course_qpos[-1].copy()
         frame = self.index
         result = self.course_qpos[frame].copy()
-        if frame < self.blend_frames:
-            alpha = _smoothstep(frame / float(self.blend_frames - 1))
+        blend_frame = frame - self.start_frame
+        if blend_frame < self.blend_frames:
+            alpha = _smoothstep(
+                blend_frame / float(self.blend_frames - 1)
+            )
             # Preserve the authored course displacement while smoothly paying
             # back the small capture residual on the collision-free flat lead.
             residual_weight = 1.0 - alpha
             result[:3] += residual_weight * (
-                self.start_qpos[:3] - self.course_qpos[0, :3]
+                self.start_qpos[:3]
+                - self.course_qpos[self.start_frame, :3]
             )
             result[3:7] = _slerp_wxyz(
                 self.start_qpos[3:7], result[3:7], alpha
             )
             result[7:] += residual_weight * (
-                self.start_qpos[7:] - self.course_qpos[0, 7:]
+                self.start_qpos[7:]
+                - self.course_qpos[self.start_frame, 7:]
             )
         self.index += 1
         return result

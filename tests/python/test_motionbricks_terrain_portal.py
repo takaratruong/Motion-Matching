@@ -9,7 +9,13 @@ from mm_sonic.motionbricks_terrain_portal import (
     TerrainCoursePlayback,
     select_terrain_portal,
 )
-from mm_sonic.motionbricks_global_terrain_viewer import _submit_motionbricks
+from mm_sonic.motionbricks_global_terrain_viewer import (
+    PORTAL_ENTRY_LEAD_TIME_S,
+    _guard_flat_velocity,
+    _laterally_registered_course,
+    _registration_matches_terrain,
+    _submit_motionbricks,
+)
 
 
 def _course() -> MotionBricksTerrainCourse:
@@ -50,6 +56,32 @@ def test_entry_blend_starts_at_live_pose_and_finishes_on_authored_course() -> No
     np.testing.assert_allclose(first, current, atol=1.0e-10)
     values = [playback.next_qpos() for _ in range(17)]
     np.testing.assert_allclose(values[-1], course.native_mujoco_qpos()[17])
+
+
+def test_just_in_time_entry_skips_the_long_authored_approach() -> None:
+    course = _course()
+    entry_frame = course.entry_frame_index(0.40)
+    assert entry_frame == 20
+    current = course.native_mujoco_qpos()[entry_frame]
+    current[:2] += (0.03, -0.02)
+    selected = select_terrain_portal(
+        (course,),
+        current,
+        np.asarray((0.3, 0.0)),
+        entry_lead_time_s=0.40,
+    )
+    assert selected.capture.accepted
+    assert selected.entry_frame_index == entry_frame
+
+    playback = TerrainCoursePlayback(
+        course,
+        current,
+        blend_frames=18,
+        start_frame=selected.entry_frame_index,
+    )
+    np.testing.assert_allclose(playback.next_qpos(), current, atol=1.0e-10)
+    values = [playback.next_qpos() for _ in range(17)]
+    np.testing.assert_allclose(values[-1], course.native_mujoco_qpos()[37])
 
 
 def test_motionbricks_context_is_resampled_at_thirty_hertz() -> None:
@@ -98,6 +130,161 @@ def test_portal_catalog_prefers_the_compatible_entry_family() -> None:
     )
     assert selected.course_index == 1
     assert selected.capture.accepted
+
+
+def test_portal_lane_registration_preserves_longitudinal_trajectory() -> None:
+    course = _course()
+    entry = course.entry_frame_index(0.40)
+    registered, shift = _laterally_registered_course(
+        course,
+        course.root_position_world[entry, :2] + np.asarray((0.0, 0.65)),
+        entry_lead_time_s=0.40,
+    )
+    assert shift == 0.65
+    np.testing.assert_allclose(
+        registered.root_position_world[:, 0], course.root_position_world[:, 0]
+    )
+    np.testing.assert_allclose(
+        registered.root_position_world[:, 1],
+        course.root_position_world[:, 1] + 0.65,
+    )
+
+
+def test_manifest_axis_ignores_authored_lateral_root_wiggle() -> None:
+    course = _course()
+    root = course.root_position_world.copy()
+    root[:, 1] = np.linspace(0.0, 0.25, len(root))
+    wiggly = MotionBricksTerrainCourse(
+        path=course.path,
+        fps=course.fps,
+        root_position_world=root,
+        root_quaternion_world_wxyz=course.root_quaternion_world_wxyz,
+        joint_position_isaaclab=course.joint_position_isaaclab,
+        seam_indices=course.seam_indices,
+    )
+    entry = wiggly.entry_frame_index(0.40)
+    registered, shift = _laterally_registered_course(
+        wiggly,
+        wiggly.root_position_world[entry, :2] + np.asarray((0.0, 0.65)),
+        entry_lead_time_s=0.40,
+        lateral_axis_world_xy=(0.0, 1.0),
+    )
+    assert shift == 0.65
+    np.testing.assert_allclose(
+        registered.root_position_world[:, 0], wiggly.root_position_world[:, 0]
+    )
+    np.testing.assert_allclose(
+        registered.root_position_world[:, 1],
+        wiggly.root_position_world[:, 1] + 0.65,
+    )
+
+
+def test_flat_guard_stops_before_ramp_instead_of_carrying_root_up() -> None:
+    class Terrain:
+        @staticmethod
+        def raycast(origin, _direction):
+            x = float(origin[0])
+            height = max(0.0, 0.125 * x)
+            return types.SimpleNamespace(
+                position_world=np.asarray((x, float(origin[1]), height))
+            )
+
+    terrain = Terrain()
+    velocity = np.asarray((0.5, 0.0))
+    guarded, blocked = _guard_flat_velocity(
+        terrain,  # type: ignore[arg-type]
+        np.asarray((-0.05, 0.0, 0.8)),
+        velocity,
+        ray_origin_z=2.0,
+    )
+    assert blocked
+    np.testing.assert_allclose(guarded, np.zeros(2))
+
+    flat, blocked = _guard_flat_velocity(
+        terrain,  # type: ignore[arg-type]
+        np.asarray((-1.0, 0.0, 0.8)),
+        velocity,
+        ray_origin_z=2.0,
+    )
+    assert not blocked
+    np.testing.assert_allclose(flat, velocity)
+
+
+def test_portal_capture_opens_before_flat_guard_at_a_step() -> None:
+    class Terrain:
+        @staticmethod
+        def raycast(origin, _direction):
+            x = float(origin[0])
+            height = 0.20 if x >= 0.0 else 0.0
+            return types.SimpleNamespace(
+                position_world=np.asarray((x, float(origin[1]), height))
+            )
+
+    base = _course()
+    root = base.root_position_world.copy()
+    root[:, 0] -= 0.21
+    course = MotionBricksTerrainCourse(
+        path=base.path,
+        fps=base.fps,
+        root_position_world=root,
+        root_quaternion_world_wxyz=base.root_quaternion_world_wxyz,
+        joint_position_isaaclab=base.joint_position_isaaclab,
+        seam_indices=base.seam_indices,
+    )
+    entry = course.entry_frame_index(PORTAL_ENTRY_LEAD_TIME_S)
+    assert entry == 0
+    current = course.native_mujoco_qpos()[entry]
+    current[0] = -0.34
+    velocity = np.asarray((0.5, 0.0))
+    assert course.portal_capture(current, velocity, frame_index=entry).accepted
+    guarded, blocked = _guard_flat_velocity(
+        Terrain(),  # type: ignore[arg-type]
+        current[:3],
+        velocity,
+        ray_origin_z=2.0,
+    )
+    assert not blocked
+    np.testing.assert_allclose(guarded, velocity)
+
+
+def test_lane_registration_requires_the_same_support_profile() -> None:
+    class Terrain:
+        @staticmethod
+        def raycast(origin, _direction):
+            x, y = float(origin[0]), float(origin[1])
+            if abs(y) > 1.0:
+                return None
+            return types.SimpleNamespace(
+                position_world=np.asarray((x, y, 0.1 * x))
+            )
+
+    course = _course()
+    entry = course.entry_frame_index(0.40)
+    shifted, _ = _laterally_registered_course(
+        course,
+        course.root_position_world[entry, :2] + np.asarray((0.0, 0.40)),
+        entry_lead_time_s=0.40,
+    )
+    assert _registration_matches_terrain(
+        course,
+        shifted,
+        terrain=Terrain(),  # type: ignore[arg-type]
+        ray_origin_z=2.0,
+        entry_frame=entry,
+    )
+
+    outside, _ = _laterally_registered_course(
+        course,
+        course.root_position_world[entry, :2] + np.asarray((0.0, 1.40)),
+        entry_lead_time_s=0.40,
+    )
+    assert not _registration_matches_terrain(
+        course,
+        outside,
+        terrain=Terrain(),  # type: ignore[arg-type]
+        ray_origin_z=2.0,
+        entry_frame=entry,
+    )
 
 
 def test_raised_support_is_restored_once_per_generated_batch(monkeypatch) -> None:

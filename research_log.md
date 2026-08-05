@@ -535,3 +535,27 @@ larger collision/contact tolerance.
   before bounded retry retirement (99.989% coverage).  This is retained rather
   than recomputed.  The remaining ten shards were relaunched one L40 at a time
   as job 16519646, with CPU command annotation chained as job 16519647.
+
+## 2026-08-05 interactive portal deadlock correction
+
+- Direct Switch testing exposed failures hidden by the privileged waypoint
+  rollout: frame-zero course commitment locked steering for 5.6--10.0 s,
+  flat root projection could carry the gait onto a ramp, reverse portals were
+  absent, and a trajectory-derived lateral normal moved stair courses partly
+  along the obstacle.  The exact-profile gate then rejected those shifted
+  courses and left the robot frozen in front of the stairs.
+- Runtime commitment now begins 0.8 s before the terrain seam.  Flat generation
+  keeps a constant current-support height, while a 0.32 m terrain guard stops
+  unowned non-flat entry.  Forward and reverse manifests supply ten traversal
+  directions.
+- Lateral placement uses each manifest event's exact start-to-end axis rather
+  than the noisy authored root tangent.  The exact support-profile check passes
+  all ten courses at four tested lateral shifts (-1.0, -0.5, +0.5, +1.0 m).
+- The retained off-centre staircase probe captures at 16 cm / 0.087 rad phase
+  error and passes the full-G1 audit at 2.000 mm foot / 0 body penetration.
+  The retained reverse-ramp probe passes at 0 foot / 0 body penetration.
+  Dense video review finds no entry freeze, float, or teleport.
+- Evidence:
+  `artifacts/generic_terrain/interactive_probes/stairs_up_jit080_lane_flat_mb_v2`
+  and
+  `artifacts/generic_terrain/interactive_probes/ramp_down_jit_lane_flat_mb_v2`.
