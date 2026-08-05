@@ -92,4 +92,3 @@ graph. The next work is to:
    one raw window;
 3. validate splice pose, velocity, support, and contact continuity;
 4. report explicit graph gaps where the corpus has no compatible transition.
-

@@ -341,4 +341,3 @@ Commit:
 git add docs/superpowers/results/2026-08-05-g1-path-motion-placement.md
 git commit -m "docs: report path motion placement evidence"
 ```
-
