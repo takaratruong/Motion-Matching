@@ -320,6 +320,33 @@ class PathMotionPlacementTests(unittest.TestCase):
                 sample_surface=lambda points: np.zeros(points.shape[:-1]),
             )
 
+    def test_rigid_placement_searches_legal_lateral_phase(self):
+        source = self.placement_source()
+        window, joints, roots, quaternions, feet, soles, support = source
+
+        placed = place_raw_window_on_path(
+            window=window,
+            joint_position=joints,
+            root_position_world=roots,
+            root_orientation_world_wxyz=quaternions,
+            foot_position_world=feet,
+            sole_position_world=soles,
+            support_mask=support,
+            path_start_scene_xy=np.zeros(2),
+            path_heading_scene_xy=np.array((1.0, 0.0)),
+            sample_surface=lambda points: np.where(
+                points[..., 1] < -0.02, 0.18, 0.0
+            ),
+        )
+
+        self.assertGreater(placed.translation_scene_xyz[1], 0.05)
+        self.assertLessEqual(
+            placed.metrics.maximum_lateral_error_m, 0.15
+        )
+        self.assertLessEqual(
+            placed.metrics.maximum_stance_error_m, 0.03
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

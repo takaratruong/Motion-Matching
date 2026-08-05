@@ -535,63 +535,30 @@ def place_raw_window_on_path(
     cosine, sine = math.cos(yaw_delta), math.sin(yaw_delta)
     rotation = np.array(((cosine, -sine), (sine, cosine)), dtype=np.float64)
     source_origin = roots[start, :2]
-    translation_xy = path_start - source_origin @ rotation.T
+    base_translation_xy = path_start - source_origin @ rotation.T
 
     selection = slice(start, stop)
-    placed_roots = roots[selection].copy()
-    placed_feet = feet[selection].copy()
-    placed_soles = soles[selection].copy()
-    placed_roots[:, :2] = roots[selection, :2] @ rotation.T + translation_xy
-    placed_feet[..., :2] = (
-        feet[selection, ..., :2] @ rotation.T + translation_xy
+    base_roots = roots[selection].copy()
+    base_feet = feet[selection].copy()
+    base_soles = soles[selection].copy()
+    base_roots[:, :2] = (
+        roots[selection, :2] @ rotation.T + base_translation_xy
     )
-    placed_soles[..., :2] = (
-        soles[selection, ..., :2] @ rotation.T + translation_xy
+    base_feet[..., :2] = (
+        feet[selection, ..., :2] @ rotation.T + base_translation_xy
+    )
+    base_soles[..., :2] = (
+        soles[selection, ..., :2] @ rotation.T + base_translation_xy
     )
     placed_support = support[selection]
-    try:
-        foot_surface = np.asarray(
-            sample_surface(placed_feet[..., :2]), dtype=np.float64
-        )
-    except PlacementRejected:
-        raise
-    except Exception as error:
-        raise ContractError("path placement terrain sampling failed") from error
-    if (
-        foot_surface.shape != placed_support.shape
-        or not np.isfinite(foot_surface).all()
-        or not bool(placed_support.any())
-    ):
-        raise ContractError("path placement terrain samples are invalid")
-    height_residual = (
-        foot_surface[placed_support] + 0.035
-        - placed_feet[..., 2][placed_support]
-    )
-    translation_z = float(np.median(height_residual))
-    placed_roots[:, 2] += translation_z
-    placed_feet[..., 2] += translation_z
-    placed_soles[..., 2] += translation_z
-
-    foot_clearance = placed_feet[..., 2] - foot_surface - 0.035
-    stance_error = float(np.max(np.abs(foot_clearance[placed_support])))
-    try:
-        sole_surface = np.asarray(
-            sample_surface(placed_soles[..., :2]), dtype=np.float64
-        )
-    except Exception as error:
-        raise ContractError("path placement sole sampling failed") from error
-    if sole_surface.shape != placed_soles.shape[:-1] or not np.isfinite(
-        sole_surface
-    ).all():
-        raise ContractError("path placement sole samples are invalid")
-    sole_clearance = placed_soles[..., 2] - sole_surface
-    minimum_clearance = float(sole_clearance.min())
-
-    relative_root = placed_roots[:, :2] - path_start
     lateral_axis = np.array((-heading[1], heading[0]), dtype=np.float64)
-    along = relative_root @ heading
-    lateral = relative_root @ lateral_axis
-    maximum_lateral = float(np.max(np.abs(lateral)))
+    base_relative_root = base_roots[:, :2] - path_start
+    base_lateral = base_relative_root @ lateral_axis
+    lower_offset = float(-maximum_lateral_error_m - base_lateral.min())
+    upper_offset = float(maximum_lateral_error_m - base_lateral.max())
+    if lower_offset > upper_offset + 1.0e-9:
+        raise PlacementRejected("lateral-path")
+
     rotated_quaternion = _quaternion_multiply_wxyz(
         np.array(
             (
@@ -613,12 +580,117 @@ def place_raw_window_on_path(
     heading_p95 = float(np.quantile(heading_error, 0.95))
     if heading_p95 > float(maximum_heading_error_rad):
         raise PlacementRejected("heading")
-    if maximum_lateral > float(maximum_lateral_error_m):
-        raise PlacementRejected("lateral-path")
-    if stance_error > float(maximum_stance_error_m):
+
+    step = 0.01
+    first_step = int(math.ceil((lower_offset - 1.0e-12) / step))
+    last_step = int(math.floor((upper_offset + 1.0e-12) / step))
+    offsets = [
+        float(index * step)
+        for index in range(first_step, last_step + 1)
+    ]
+    offsets.extend((lower_offset, upper_offset))
+    if lower_offset <= 0.0 <= upper_offset:
+        offsets.append(0.0)
+    lateral_offsets = np.asarray(
+        sorted({round(value, 12) for value in offsets}),
+        dtype=np.float64,
+    )
+    foot_offset_xy = (
+        lateral_offsets[:, None, None, None]
+        * lateral_axis[None, None, None, :]
+    )
+    sole_offset_xy = (
+        lateral_offsets[:, None, None, None, None]
+        * lateral_axis[None, None, None, None, :]
+    )
+    candidate_feet_xy = base_feet[None, ..., :2] + foot_offset_xy
+    candidate_soles_xy = base_soles[None, ..., :2] + sole_offset_xy
+    try:
+        foot_surface = np.asarray(
+            sample_surface(candidate_feet_xy), dtype=np.float64
+        )
+    except PlacementRejected:
+        raise
+    except Exception as error:
+        raise ContractError("path placement terrain sampling failed") from error
+    if (
+        foot_surface.shape
+        != (len(lateral_offsets),) + placed_support.shape
+        or not np.isfinite(foot_surface).all()
+        or not bool(placed_support.any())
+    ):
+        raise ContractError("path placement terrain samples are invalid")
+    height_residual = (
+        foot_surface + 0.035 - base_feet[None, ..., 2]
+    )
+    translation_z = np.median(
+        height_residual[:, placed_support], axis=1
+    )
+    foot_clearance = (
+        base_feet[None, ..., 2]
+        + translation_z[:, None, None]
+        - foot_surface
+        - 0.035
+    )
+    stance_error = np.max(
+        np.abs(foot_clearance[:, placed_support]), axis=1
+    )
+    try:
+        sole_surface = np.asarray(
+            sample_surface(candidate_soles_xy), dtype=np.float64
+        )
+    except Exception as error:
+        raise ContractError("path placement sole sampling failed") from error
+    if (
+        sole_surface.shape
+        != (len(lateral_offsets),) + base_soles.shape[:-1]
+        or not np.isfinite(sole_surface).all()
+    ):
+        raise ContractError("path placement sole samples are invalid")
+    sole_clearance = (
+        base_soles[None, ..., 2]
+        + translation_z[:, None, None, None]
+        - sole_surface
+    )
+    minimum_clearance = np.min(
+        sole_clearance, axis=tuple(range(1, sole_clearance.ndim))
+    )
+    stance_valid = stance_error <= float(maximum_stance_error_m)
+    if not bool(stance_valid.any()):
         raise PlacementRejected("stance-height")
-    if minimum_clearance < float(minimum_sole_clearance_m):
+    fully_valid = stance_valid & (
+        minimum_clearance >= float(minimum_sole_clearance_m)
+    )
+    if not bool(fully_valid.any()):
         raise PlacementRejected("sole-penetration")
+    valid_indices = np.flatnonzero(fully_valid)
+    chosen = min(
+        valid_indices,
+        key=lambda index: (
+            abs(float(lateral_offsets[index])),
+            float(stance_error[index]),
+            -float(minimum_clearance[index]),
+            float(lateral_offsets[index]),
+        ),
+    )
+    lateral_offset = float(lateral_offsets[chosen])
+    selected_translation_z = float(translation_z[chosen])
+    translation_xy = (
+        base_translation_xy + lateral_offset * lateral_axis
+    )
+    placed_roots = base_roots.copy()
+    placed_feet = base_feet.copy()
+    placed_soles = base_soles.copy()
+    placed_roots[:, :2] += lateral_offset * lateral_axis
+    placed_feet[..., :2] += lateral_offset * lateral_axis
+    placed_soles[..., :2] += lateral_offset * lateral_axis
+    placed_roots[:, 2] += selected_translation_z
+    placed_feet[..., 2] += selected_translation_z
+    placed_soles[..., 2] += selected_translation_z
+    relative_root = placed_roots[:, :2] - path_start
+    along = relative_root @ heading
+    lateral = relative_root @ lateral_axis
+    maximum_lateral = float(np.max(np.abs(lateral)))
     covered_start = max(0.0, float(along.min()))
     covered_stop = float(along.max())
     if covered_stop <= covered_start:
@@ -629,7 +701,7 @@ def place_raw_window_on_path(
         translation_scene_xyz=(
             float(translation_xy[0]),
             float(translation_xy[1]),
-            translation_z,
+            selected_translation_z,
         ),
         joint_position=joints[selection],
         root_position_scene=placed_roots,
@@ -639,7 +711,7 @@ def place_raw_window_on_path(
             covered_stop_m=covered_stop,
             heading_error_p95_rad=heading_p95,
             maximum_lateral_error_m=maximum_lateral,
-            maximum_stance_error_m=stance_error,
-            minimum_sole_clearance_m=minimum_clearance,
+            maximum_stance_error_m=float(stance_error[chosen]),
+            minimum_sole_clearance_m=float(minimum_clearance[chosen]),
         ),
     )
