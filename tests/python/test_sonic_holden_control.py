@@ -65,6 +65,19 @@ class HoldenControlMapperTests(unittest.TestCase):
             mapped.desired_heading_mujoco_wxyz, (1.0, 0.0, 0.0, 0.0)
         )
 
+    def test_robot_local_forward_is_not_rotated_by_camera_or_command_heading(self) -> None:
+        mapper = HoldenControlMapper(
+            initial_heading_yaw_rad=math.pi / 2.0,
+            movement_frame="robot_local",
+            run_speeds_mps=(0.72, 0.55, 0.55),
+        )
+        mapped = mapper.update(
+            NormalizedControlState(left_z=-1.0, strafe=True),
+            0.02,
+        )
+        self.assertAlmostEqual(mapped.velocity_mujoco[0], 0.72, places=6)
+        self.assertAlmostEqual(mapped.velocity_mujoco[1], 0.0, places=6)
+
     def test_physical_to_virtual_heading_offset_does_not_rotate_forward_velocity(self) -> None:
         mapper = HoldenControlMapper(
             initial_heading_yaw_rad=-math.pi / 2.0,

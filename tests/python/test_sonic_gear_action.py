@@ -4,6 +4,7 @@ import numpy as np
 
 from mm_sonic.gear_action import (
     isaaclab_to_mujoco_joint_vector,
+    mujoco_to_isaaclab_joint_vector,
     policy_action_lowcmd_target_bounds,
     policy_action_to_lowcmd_target,
 )
@@ -21,6 +22,16 @@ class PolicyActionToLowCmdTargetTests(unittest.TestCase):
         actual = isaaclab_to_mujoco_joint_vector(source)
         self.assertEqual(actual.dtype, np.float64)
         np.testing.assert_array_equal(actual, source[permutation])
+
+    def test_mujoco_joint_vector_is_exact_inverse_of_isaaclab_mapping(self):
+        source = np.linspace(-1.4, 1.4, 29, dtype=np.float32)
+
+        actual = mujoco_to_isaaclab_joint_vector(
+            isaaclab_to_mujoco_joint_vector(source)
+        )
+
+        self.assertEqual(actual.dtype, np.float64)
+        np.testing.assert_array_equal(actual, source.astype(np.float64))
 
     def test_zero_action_recovers_exact_float32_default_pose(self):
         expected = np.asarray(

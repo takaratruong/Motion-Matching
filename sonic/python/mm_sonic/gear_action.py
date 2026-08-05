@@ -62,6 +62,21 @@ def isaaclab_to_mujoco_joint_vector(values: object) -> np.ndarray:
     )
 
 
+def mujoco_to_isaaclab_joint_vector(values: object) -> np.ndarray:
+    """Invert the frozen 29-DoF MuJoCo/IsaacLab joint permutation."""
+
+    source = np.asarray(values)
+    if (
+        source.shape != (29,)
+        or source.dtype.kind not in "iuf"
+        or not np.all(np.isfinite(source))
+    ):
+        raise ValueError("MuJoCo joint vector must contain 29 finite values")
+    result = np.empty(29, dtype=np.float64)
+    result[np.asarray(_ISAACLAB_TO_MUJOCO)] = source
+    return np.ascontiguousarray(result)
+
+
 def policy_action_to_lowcmd_target(
     action: Sequence[float],
 ) -> tuple[float, ...]:
@@ -127,6 +142,7 @@ def policy_action_lowcmd_target_bounds(
 
 __all__ = [
     "isaaclab_to_mujoco_joint_vector",
+    "mujoco_to_isaaclab_joint_vector",
     "policy_action_lowcmd_target_bounds",
     "policy_action_to_lowcmd_target",
 ]

@@ -114,6 +114,7 @@ class HoldenControlMapper:
 
     RUN_SPEEDS_MPS = (0.9, 0.6, 0.6)
     WALK_SPEEDS_MPS = (0.5, 0.4, 0.4)
+    MOVEMENT_FRAMES = ("camera_world", "robot_local")
     GAIT_HALFLIFE_S = 0.1
     CAMERA_RATE_RAD_S = 2.0
     ZOOM_RATE_M_S = 10.0
@@ -127,6 +128,8 @@ class HoldenControlMapper:
         heading_frame_offset_yaw_rad: float = 0.0,
         initial_altitude_rad: float = 0.4,
         initial_distance_m: float = 3.0,
+        movement_frame: str = "camera_world",
+        run_speeds_mps: tuple[float, float, float] | None = None,
     ) -> None:
         values = (
             initial_heading_yaw_rad,
@@ -139,6 +142,27 @@ class HoldenControlMapper:
             for value in values
         ):
             raise ContractError("Holden control initial state must be finite")
+        if movement_frame not in self.MOVEMENT_FRAMES:
+            raise ContractError(
+                f"movement_frame must be one of {self.MOVEMENT_FRAMES}"
+            )
+        run_speeds = (
+            self.RUN_SPEEDS_MPS
+            if run_speeds_mps is None
+            else tuple(run_speeds_mps)
+        )
+        if (
+            len(run_speeds) != 3
+            or any(
+                type(value) not in (int, float)
+                or not math.isfinite(float(value))
+                or float(value) <= 0.0
+                for value in run_speeds
+            )
+        ):
+            raise ContractError("run_speeds_mps must contain three positive values")
+        self._movement_frame = movement_frame
+        self._run_speeds_mps = tuple(float(value) for value in run_speeds)
         self._desired_yaw = float(initial_heading_yaw_rad)
         self._heading_frame_offset = float(heading_frame_offset_yaw_rad)
         self._camera_azimuth = float(initial_heading_yaw_rad)
@@ -221,7 +245,10 @@ class HoldenControlMapper:
         sh = math.sin(self._desired_yaw)
         local_forward = ch * world_forward + sh * world_left
         local_left = -sh * world_forward + ch * world_left
-        run_forward, run_side, run_back = self.RUN_SPEEDS_MPS
+        if self._movement_frame == "robot_local":
+            local_forward = forward
+            local_left = left
+        run_forward, run_side, run_back = self._run_speeds_mps
         walk_forward, walk_side, walk_back = self.WALK_SPEEDS_MPS
         forward_speed = run_forward + (walk_forward - run_forward) * self._gait
         side_speed = run_side + (walk_side - run_side) * self._gait
@@ -230,8 +257,14 @@ class HoldenControlMapper:
             forward_speed if local_forward >= 0.0 else back_speed
         )
         scaled_left = local_left * side_speed
-        velocity_x = ch * scaled_forward - sh * scaled_left
-        velocity_y = sh * scaled_forward + ch * scaled_left
+        if self._movement_frame == "robot_local":
+            # The Torch committer rotates this local vector by the matcher's
+            # current generated root yaw. No global position is needed.
+            velocity_x = scaled_forward
+            velocity_y = scaled_left
+        else:
+            velocity_x = ch * scaled_forward - sh * scaled_left
+            velocity_y = sh * scaled_forward + ch * scaled_left
 
         if state.strafe:
             heading_forward = 1.0

@@ -66,6 +66,60 @@ The `torch-mm` extra declares only `torch>=2.13`; the native Takara loader in
 `mm_sonic.torch_motion_data` itself imports no Torch, so baseline test discovery
 never depends on the optional runtime.
 
+## Privileged G1 terrain motion matching
+
+The globally informed kinematic bootstrap combines the 173-clip Takara/BONES
+flat bank with the clean 500-clip G1 stair archive. It supports two paths:
+
+- `CarpetTerrainMotionMatcher` performs rolling full-bank search using future
+  surface heights beneath both feet at 0/15/30/45 frames, matching the terrain
+  feature used by Learned Motion Matching.
+- `build_target_specific_warped_library` compiles a mechanically audited G1
+  source traverse onto an exact known target staircase. Leave-one-target-out
+  evaluation removes the target motion entirely before online search.
+
+Run the current scripted diagonal-entry evaluation on one L40S:
+
+```bash
+sbatch sonic/run_carpet_terrain_eval.sbatch
+```
+
+Launch the dedicated clean-kinematic Switch-controller viewer:
+
+```bash
+sbatch sonic/run_privileged_warped_viewer.sbatch
+```
+
+Launch the globally informed four-way playground instead:
+
+```bash
+sbatch sonic/run_privileged_course_viewer.sbatch
+```
+
+That scene has a finite raised platform with a staircase on every side.  The
+up/down target clips are both removed from retrieval; separately warped and
+mechanically audited G1 sources are shared across all four placements.  Global
+character position and command direction select a nearby physical portal,
+while ordinary pose/trajectory matching selects the motion.  The platform
+therefore tests repeated flat→stair→flat transfer and the same stair animation
+at four world orientations, rather than replaying one globally fixed route.
+
+Run the scripted west-ascent/platform/east-descent qualification with:
+
+```bash
+sbatch sonic/run_privileged_course_eval.sbatch
+```
+
+The viewer receipt is authoritative. It reports the Torch backend,
+`takara_ball`, robot-local left-stick travel, independent right-stick facing,
+no command-side root-translation odometry, target exclusion, and the exact
+warped source. This remains a globally privileged one-way stair scene, not a
+SONIC physics result. The main entry points are
+`mm_sonic.privileged_terrain_matcher`, `mm_sonic.privileged_terrain_course`,
+`mm_sonic.carpet_terrain_matcher`,
+`mm_sonic.evaluate_privileged_online_matcher`, and
+`mm_sonic.privileged_terrain_interactive_viewer`.
+
 The `integration` extra installs the three pinned upstream runtime dependencies
 (`scipy==1.15.3`, `PyYAML==6.0.3`, `cyclonedds==0.10.2`) alongside `mujoco` and
 `pyzmq`. It intentionally does **not** declare a PyPI `unitree_sdk2py`: the
@@ -333,6 +387,13 @@ LICENSE is `BSD-3-Clause`. The LAFAN inventory file SHA-256 is
 `1b1f8097c532a08c26e39e7f504f7bb2f4e887636129c59f95930ea0ef41d844`;
 its recomputed content hash is
 `98493a9a0443ed2b9151a1de4b5084ebe3283657f4f055333a92ba724588820c`.
+The two file hashes are code-anchored phase-1 trust roots: real import rejects
+even a self-consistent replacement inventory before any GRAIL pickle can be
+deserialized. Flat, Justin, and LAFAN adapters parse private no-follow source
+snapshots while retaining the original authority paths; GRAIL records are
+reconstructed from the anchored inventory and their exact PKL, USD,
+`clips.json`, frame-count, and terrain-pose authorities are rechecked before
+deserialization.
 
 Directory publications use canonical relative paths, fsync-backed staging,
 exclusive no-replace destination claims, and authenticated logical-completion
@@ -342,3 +403,215 @@ Existing destinations are never overwritten, and readers reject incomplete,
 changed, or still-writer-owned trees.
 Contract failures—including malformed arguments—print an actionable error and
 return status 2 without a Python traceback; `--help` returns status 0.
+
+The Torch demo defaults to `--torch-trajectory-model takara_ball` and
+`--torch-max-source-joint-step-rad 0.35`, matching offline corpus generation;
+pass `--torch-trajectory-model legacy` only for an explicit A/B.
+Its periodic terminal diagnostic prints raw stick velocity, filtered ball
+velocity, root-to-ball separation, and clamp displacement for live controller
+inspection.
+
+On the `slam` workstation, the same configuration is packaged as:
+
+```bash
+sonic/launch_takara_ball_interactive.sh
+```
+
+Run it from the graphical desktop/session where `DISPLAY` and the controller
+mapping are available.  It deliberately refuses a headless shell.  The default
+responsive horizon is five source intervals (0.2 seconds); set
+`TAKARA_RESPONSIVE_SOURCE_INTERVALS=10` for the more conservative 0.4-second
+variant.  All external paths can be overridden with the `TAKARA_*` variables
+declared at the top of the launcher.
+
+## Hybrid flat↔Justin-stair kinematic motion-matching viewer
+
+The first terrain viewer isolates motion-matching quality from SONIC tracking
+and dynamics. It uses the full 173-clip Takara/BONES bank for unrestricted
+flat locomotion, hands off to the fixed-world Justin archive before stair
+contact, and returns to flat motion matching at a double-support landing. It
+writes those clean kinematics directly into the articulated G1 MuJoCo model
+and calls forward kinematics only:
+
+```bash
+sonic/launch_terrain_mm_kinematic_interactive.sh
+```
+
+The default frontend is the same tokenized browser controller used by the
+SONIC interactive evaluation. The launcher prints an SSH tunnel command and a
+`localhost` URL. Open that URL locally, select the Switch controller in the
+Gamepad panel, verify or change its four axis indices, and press **Start
+simulation**. Both sticks remain native analog inputs; the browser exposes raw
+axes and deadzone control. Its reset, center, and end buttons control this
+kinematic session.
+
+An X11 keyboard fallback remains available with
+`TERRAIN_MM_FRONTEND=x11`. In that mode `W/A/S/D` requests robot-local travel,
+`Ctrl` plus the arrow keys provides an independent facing stick, arrows without
+`Ctrl` orbit the camera, `Shift` selects slower walking, `Space` stops at
+double support, `Backspace` restarts, and `X` exits.
+
+The cyan path is the critically damped command-ball intention re-centred at
+the current robot, orange is the selected clean motion's future, and red is
+the realized root trail. Flat matching uses 96,012 searchable frames. A stair
+handoff is considered only inside a pre-contact approach window and is gated
+by fixed-world root pose, commanded path/facing, source pose/velocity, and
+planted-foot geometry. Once committed, stair search runs every five 50 Hz
+frames with the 10 mm planted-foot execution gate. The return to flat waits
+for double support after the recorded exit window and inertializes into a
+new flat match at the landing's world pose and height.
+
+This viewer is explicitly not a tracker or stability test. It uses orientation
+to express robot-local commands but stores no global root position or
+translation odometry as a policy or joystick input. World position is used
+inside this kinematic test only to align the clean motion to the fixed visible
+staircase. Override the flat bank or Torch device with
+`TERRAIN_MM_FLAT_MOTIONS` and `TERRAIN_MM_FLAT_DEVICE`; CPU is the default and
+runs comfortably faster than the 50 Hz viewer deadline.
+
+The same real catalog can be checked without a display:
+
+```bash
+PYTHONPATH=sonic/python \
+  /move/u/justingu/miniconda3/envs/isaac6_test/bin/python \
+  -m mm_sonic.terrain_interactive_viewer --headless-frames 300
+```
+
+## Optional BONES walking support bank
+
+The single TakaraWalk source does not physically cover every lateral,
+backward, turning, and start/stop request. A curated BONES bank can be
+exported from the clean, retargeted 50 Hz G1 kinematics without using the
+short/reset-heavy BONES rollout episodes as command labels:
+
+```bash
+cd /move/u/bodow/Projects/Motion-Matching-takara-corpus
+PYTHONPATH=sonic/python \
+  /move/u/justingu/miniconda3/envs/env_isaaclab/bin/python \
+  -m mm_sonic.export_bones_motion_bank \
+  --source-zarr /move/data/bones/g1/zarr/locomotion_50hz.zarr \
+  --include-legacy-takara-npz \
+    /move/u/justingu/rmr_tracking/motions/isaac6/takara_walk_50hz.npz \
+  --output-dir \
+    /move/data/terrain-aware/motion-matching/takara_bones_walk_support_v2_startstop
+```
+
+The default export contains 86 BONES base clips and their 86 explicit mirrors,
+plus the clean TakaraWalk clip when `--include-legacy-takara-npz` is supplied.
+Seventy-seven of those base clips (154 after mirroring) contain start or stop
+transitions spanning forward, backward, lateral, diagonal, and turn-then-walk
+motion; the remainder supplies loops, arcs, and in-place turns. It writes the
+same native
+`*/motion.npz` layout consumed by `--motions-dir`, plus a provenance
+manifest. The exporter is read-only with respect to BONES and refuses to
+overwrite an existing output directory.
+
+Use BONES as a *kinematic support bank*, keep the generated joystick and
+persistent-ball streams as the training commands, and run a clean physical
+tracker gate before any noisy collection. The existing BONES rollout zarr is
+not a substitute: those episodes are only about one second long and their
+command channels were reconstructed from realized motion rather than retained
+from a human joystick.
+
+## Takara two-stick flat-data corpus
+
+The offline corpus path turns deterministic, human-like two-stick traces into
+trackable Takara references and then uses Justin's SONIC data collector to add
+the recovery noise used by TML-BeyondMimic. The left stick requests planar
+travel in the robot's live root-yaw frame: pushing forward remains robot
+forward even after a 180-degree turn. The right stick requests facing in the
+controller frame; a centered right stick retains the last facing request.
+This conversion needs orientation but never root position or translation
+odometry. The 60 base traces include starts/stops, speed
+changes, forward/backward reversals, lateral toggles, smooth arcs, circles,
+slaloms, zigzags, independent travel/facing, in-place spins, and seeded
+human-like random stick movements.  Every base trace is followed by an exact
+sagittal mirror, producing 120 balanced 12-second clips at 50 Hz.
+
+The zarr retains both the operator request and the generated result:
+
+- raw left/right stick and button channels;
+- robot-local requested velocity, its matcher-world realization, facing, and
+  the raw integrated path;
+- the persistent critically damped Takara simulation-ball position, velocity,
+  facing, and exact yaw rate used by motion matching;
+- selected source frames, search costs, transition flags, root-adjustment
+  magnitudes, and safety-clamp activity;
+- clean joint and full-body kinematics;
+- intended/realized Task-4 diagnostics and the direct H24 Task12 command:
+  filtered-ball `[local_vx, local_vy, yaw_rate]` at +6/+12/+18/+24 frames.
+
+The ball is controller state, not odometry. At reset it starts at the robot,
+then its velocity and facing are critically damped toward the two live stick
+requests using Takara's C++ constants (`0.27 s` half-lives). Search sees the
+ball's predicted positions/facing at H15/H30/H45. The character root is gently
+adjusted toward the ball (velocity-bounded `0.10 s` position and `0.20 s`
+rotation half-lives) and is finally clamped to `0.15 m` / `pi/2`. This uses no
+world localization, map, or remembered robot root position at policy
+inference. Task12 is position-free: the policy receives four future local
+velocity/yaw-rate knots from the controller filter. The motion-matching
+generator uses only its current generated root yaw to rotate the operator's
+local left-stick velocity internally.
+
+The source safety filter rejects any candidate whose published 46-frame
+window contains either a joint change larger than `0.35 rad` in one 20 ms
+step or a stored joint speed above the equivalent `17.5 rad/s`. Checking both
+also catches a dangerous candidate first frame whose incoming pose step lies
+just outside its window. This matters because Takara's flat source contains a
+few very fast arm segments that are invisible to the pelvis/foot search
+features and are unsuitable for the physical tracker.
+
+The legacy Takara NPZ has a misleading `body_quat_w` field name: its stored
+values are XYZW.  `offline_corpus` converts this explicitly to the canonical
+WXYZ convention at ingestion.  All output zarrs and Justin pipeline manifests
+are WXYZ.
+
+Run the stages in order:
+
+```bash
+# 1. Generate the CPU-only kinematic smoke and prepare its tracker bundle.
+sbatch --partition=move sonic/run_offline_corpus_smoke.sbatch
+
+# 2. Require clean physical tracking and inspect paths/gait before scaling.
+sbatch --partition=move sonic/run_clean_tracker_gate.sbatch
+sbatch --partition=move sonic/run_clean_tracker_review.sbatch
+
+# 3. Generate all 60 base traces plus exact mirrors.
+sbatch --partition=move sonic/run_full_corpus.sbatch
+
+# 4. Collect four disjoint, mirror-paired noisy shards in parallel.
+sbatch --partition=move --array=0-3%4 \
+  sonic/run_noisy_collection_shard.sbatch
+
+# 5. Join the retained command stream to each physical rollout.
+sbatch --partition=move --array=0-3%4 \
+  sonic/run_annotate_noisy_shard.sbatch
+```
+
+Stages 1 and 3 request no GPU. Only physical SONIC tracking/rendering and noisy
+rollout collection consume GPU lanes.
+
+The supplied checkpoint bundle must pair Justin's Takara weights with the
+configuration used by his successful evaluations:
+
+```text
+weights: /move/u/justingu/Projects/grail-stairs/sonic_port/takara/ft_runs/poc/last.pt
+config:  /move/u/justingu/Projects/grail-stairs/sonic_port/takara/ft_runs/poc/config.yaml
+```
+
+The physical tracker receives no global root position or odometry command.
+Task 4 remains a diagnostic in the current physical pelvis-yaw frame. The
+training Task12 is copied directly from the retained filtered-ball intention,
+not reconstructed from noisy realized motion. The raw joystick is retained
+separately. Sharding keeps every base/mirror pair together, and all collectors
+use the real flat rigid slab from Justin's Takara assets.
+
+For interactive inspection after GPUs are available, the existing C++/SONIC
+interactive path already owns the same persistent simulation ball and supports
+keyboard/gamepad input. The offline Torch port intentionally uses the same
+spring and adjustment constants. Its motion-matching mode uses robot-local
+left-stick velocity and caps run speed at `0.72/0.55/0.55 m/s`
+(forward/lateral/back), matching the corpus rather than the older
+`0.9/0.6/0.6 m/s` viewer defaults. Interactive joystick behavior is therefore
+a direct sanity check of corpus-generation semantics rather than a separate
+controller.

@@ -15,6 +15,8 @@ to the current root in the same heading frame.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
+from typing import Mapping
 
 import torch
 
@@ -91,9 +93,18 @@ class TorchMotionDatabase:
 
     @staticmethod
     def from_folder(
-        folder: MotionFolder, *, device: "str | torch.device"
+        folder: MotionFolder,
+        *,
+        device: "str | torch.device",
+        group_weights: Mapping[str, float] | None = None,
+        max_joint_step_rad: float | None = None,
     ) -> "TorchMotionDatabase":
-        return _build_database(folder, device)
+        return _build_database(
+            folder,
+            device,
+            group_weights=group_weights,
+            max_joint_step_rad=max_joint_step_rad,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -223,8 +234,12 @@ def extract_query_features(
 # ---------------------------------------------------------------------------
 
 def _clip_feature_rows(
-    clip: MotionClip, device: torch.device, layout
-) -> tuple[torch.Tensor, torch.Tensor]:
+    clip: MotionClip,
+    device: torch.device,
+    layout,
+    *,
+    max_joint_step_rad: float | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Transfer one clip once and extract all searchable rows as one batch."""
     # The loader owns read-only NumPy arrays. These four calls make one owned
     # device copy per source array, independent of the clip's frame count.
@@ -239,6 +254,9 @@ def _clip_feature_rows(
     )
     joint_vel = torch.tensor(
         clip.joint_velocity, dtype=torch.float32, device=device
+    )
+    joint_pos = torch.tensor(
+        clip.joint_position, dtype=torch.float32, device=device
     )
     root = layout.root_body_index
     lf = layout.left_foot_body_index
@@ -266,11 +284,50 @@ def _clip_feature_rows(
         facing_world_xy=facing_xy.contiguous(),
     )
     joint_velocity_sq = (joint_vel[frames] ** 2).sum(dim=-1)
-    return _feature_row(state, trajectory), joint_velocity_sq
+    features = _feature_row(state, trajectory)
+    if max_joint_step_rad is None:
+        safe = torch.ones(
+            clip.valid_frame_stop, dtype=torch.bool, device=device
+        )
+    else:
+        if (
+            not math.isfinite(float(max_joint_step_rad))
+            or float(max_joint_step_rad) <= 0.0
+        ):
+            raise ContractError("max_joint_step_rad must be finite and positive")
+        # Every published candidate owns a dense 46-frame window. Reject a
+        # start row if any of its 45 consecutive target steps, or any stored
+        # velocity in the window, exceeds the same per-step trackability
+        # threshold. The velocity check also catches a dangerous first frame
+        # whose incoming step lies just before the candidate window.
+        per_step = torch.amax(
+            torch.abs(joint_pos[1:] - joint_pos[:-1]), dim=1
+        )
+        dense_window_max = torch.amax(
+            per_step.unfold(0, FEATURE_HORIZON_FRAMES[-1], 1), dim=1
+        )
+        per_frame_speed = torch.amax(torch.abs(joint_vel), dim=1)
+        dense_window_speed_max = torch.amax(
+            per_frame_speed.unfold(
+                0, FEATURE_HORIZON_FRAMES[-1] + 1, 1
+            ),
+            dim=1,
+        )
+        safe = (
+            dense_window_max <= float(max_joint_step_rad)
+        ) & (
+            dense_window_speed_max
+            <= float(max_joint_step_rad) * float(clip.fps)
+        )
+    return features[safe], joint_velocity_sq[safe], frames[safe]
 
 
 def _build_database(
-    folder: MotionFolder, device: "str | torch.device"
+    folder: MotionFolder,
+    device: "str | torch.device",
+    *,
+    group_weights: Mapping[str, float] | None = None,
+    max_joint_step_rad: float | None = None,
 ) -> TorchMotionDatabase:
     resolved = torch.device(device) if not isinstance(device, torch.device) else device
     layout = folder.layout
@@ -282,14 +339,17 @@ def _build_database(
     source_row_map: dict[tuple[int, int], int] = {}
 
     for clip_index, clip in enumerate(folder.clips):
-        clip_rows, clip_joint_velocity_sq = _clip_feature_rows(
-            clip, resolved, layout
+        clip_rows, clip_joint_velocity_sq, clip_frames = _clip_feature_rows(
+            clip,
+            resolved,
+            layout,
+            max_joint_step_rad=max_joint_step_rad,
         )
         rows.append(clip_rows)
         joint_velocity_sq.append(clip_joint_velocity_sq)
         first_row = sum(item.shape[0] for item in rows[:-1])
-        for frame in range(clip.valid_frame_stop):
-            global_row = first_row + frame
+        for local_row, frame in enumerate(clip_frames.cpu().tolist()):
+            global_row = first_row + local_row
             source_row_map[(clip_index, frame)] = global_row
             clip_indices.append(clip_index)
             frame_indices.append(frame)
@@ -298,13 +358,29 @@ def _build_database(
         raise ContractError("motion folder produced no searchable feature rows")
 
     features = torch.cat(rows, dim=0).to(device=resolved, dtype=torch.float32)
+    if features.shape[0] == 0:
+        raise ContractError("motion folder produced no safe searchable feature rows")
     if not torch.isfinite(features).all():
         raise ContractError("search features contain non-finite values")
+
+    weights = {name: float(weight) for name, _slice, weight in FEATURE_GROUPS}
+    if group_weights is not None:
+        unknown = set(group_weights) - set(weights)
+        if unknown:
+            raise ContractError(f"unknown feature weight groups: {sorted(unknown)}")
+        for name, value in group_weights.items():
+            converted = float(value)
+            if not math.isfinite(converted) or converted <= 0.0:
+                raise ContractError(
+                    f"feature group {name!r} weight must be finite and positive"
+                )
+            weights[name] = converted
 
     component_mean = features.mean(dim=0)
     component_std = features.std(dim=0, unbiased=False)
     scale = torch.empty_like(component_mean)
-    for name, group_slice, weight in FEATURE_GROUPS:
+    for name, group_slice, _default_weight in FEATURE_GROUPS:
+        weight = weights[name]
         group_std = component_std[group_slice].mean()
         group_scale = group_std / weight
         if not torch.isfinite(group_scale) or group_scale <= 0.0:
