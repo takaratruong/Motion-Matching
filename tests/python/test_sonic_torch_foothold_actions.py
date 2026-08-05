@@ -178,6 +178,44 @@ def _plan(*, height=(0.0, 0.0), feet=(1, 0), xy=None):
 
 
 class FootholdActionTests(unittest.TestCase):
+    def test_public_descriptor_cost_is_zero_for_exact_contact_pair(self):
+        from mm_sonic.torch_foothold_actions import (
+            foothold_action_descriptor_cost,
+        )
+
+        action = _action()
+        cost = foothold_action_descriptor_cost(
+            landing_feet=torch.tensor((1, 0), dtype=torch.int64),
+            landing_xy_heading_m=action.landing_xy_start_frame_m,
+            landing_height_delta_m=action.landing_height_delta_m,
+            landing_frame_offsets=torch.tensor((10, 20)),
+            action=action,
+            xy_tolerance_m=0.10,
+            height_tolerance_m=0.04,
+            timing_tolerance_frames=8,
+        )
+
+        self.assertEqual(cost.item(), 0.0)
+
+    def test_public_descriptor_cost_hard_rejects_height_mismatch(self):
+        from mm_sonic.torch_foothold_actions import (
+            foothold_action_descriptor_cost,
+        )
+
+        action = _action()
+        cost = foothold_action_descriptor_cost(
+            landing_feet=torch.tensor((1, 0), dtype=torch.int64),
+            landing_xy_heading_m=action.landing_xy_start_frame_m,
+            landing_height_delta_m=torch.tensor((0.20, 0.0)),
+            landing_frame_offsets=torch.tensor((10, 20)),
+            action=action,
+            xy_tolerance_m=0.10,
+            height_tolerance_m=0.04,
+            timing_tolerance_frames=8,
+        )
+
+        self.assertTrue(torch.isinf(cost))
+
     def test_action_index_reports_next_replanning_entry(self):
         first = _action(start_frame=10)
         second = _action(start_frame=30)

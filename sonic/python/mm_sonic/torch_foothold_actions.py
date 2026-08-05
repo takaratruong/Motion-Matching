@@ -989,6 +989,103 @@ def first_contact_eligibility(
     return output
 
 
+def foothold_action_descriptor_cost(
+    *,
+    landing_feet: torch.Tensor,
+    landing_xy_heading_m: torch.Tensor,
+    landing_height_delta_m: torch.Tensor,
+    landing_frame_offsets: torch.Tensor,
+    action: FootholdAction,
+    xy_tolerance_m: float,
+    height_tolerance_m: float,
+    timing_tolerance_frames: int,
+) -> torch.Tensor:
+    """Hard-gate and score one planned pair against one source action."""
+
+    tensors = (
+        (landing_feet, (2,), False),
+        (landing_xy_heading_m, (2, 2), True),
+        (landing_height_delta_m, (2,), True),
+        (landing_frame_offsets, (2,), False),
+    )
+    device = None
+    dtype = None
+    for value, shape, floating in tensors:
+        if (
+            not isinstance(value, torch.Tensor)
+            or tuple(value.shape) != shape
+            or value.dtype.is_floating_point != floating
+            or (device is not None and value.device != device)
+            or (floating and not torch.isfinite(value).all())
+        ):
+            raise ContractError(
+                "foothold action descriptor query is invalid"
+            )
+        device = value.device
+        if floating:
+            if dtype is not None and value.dtype != dtype:
+                raise ContractError(
+                    "foothold action descriptor dtypes differ"
+                )
+            dtype = value.dtype
+    if (
+        landing_feet.dtype != torch.int64
+        or landing_frame_offsets.dtype != torch.int64
+        or not isinstance(action, FootholdAction)
+        or action.landing_xy_start_frame_m.device != device
+        or action.landing_xy_start_frame_m.dtype != dtype
+        or action.landing_height_delta_m.device != device
+        or action.landing_height_delta_m.dtype != dtype
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) <= 0.0
+            for value in (xy_tolerance_m, height_tolerance_m)
+        )
+        or type(timing_tolerance_frames) is not int
+        or timing_tolerance_frames < 0
+    ):
+        raise ContractError("foothold action descriptor query is invalid")
+    assert dtype is not None
+
+    rejected = torch.full((), torch.inf, dtype=dtype, device=device)
+    action_feet = torch.tensor(
+        action.landing_feet, dtype=torch.int64, device=device
+    )
+    if not bool((landing_feet == action_feet).all().item()):
+        return rejected
+    xy_error = torch.linalg.vector_norm(
+        landing_xy_heading_m - action.landing_xy_start_frame_m,
+        dim=-1,
+    )
+    height_error = torch.abs(
+        landing_height_delta_m - action.landing_height_delta_m
+    )
+    action_timing = torch.tensor(
+        action.landing_frame_offsets,
+        dtype=torch.int64,
+        device=device,
+    )
+    timing_error = torch.abs(landing_frame_offsets - action_timing)
+    if bool(
+        (xy_error > float(xy_tolerance_m)).any().item()
+        or (height_error > float(height_tolerance_m)).any().item()
+        or (timing_error > timing_tolerance_frames).any().item()
+    ):
+        return rejected
+    return (
+        torch.square(xy_error / float(xy_tolerance_m)).sum()
+        + torch.square(
+            height_error / float(height_tolerance_m)
+        ).sum()
+        + torch.square(
+            timing_error.to(dtype)
+            / float(max(1, timing_tolerance_frames))
+        ).sum()
+    )
+
+
 class FootholdSelectionArm(Enum):
     FIRST_CONTACT = "first-contact"
     TWO_CONTACT = "two-contact"
@@ -1407,6 +1504,35 @@ def rank_foothold_actions(
             + (~feet).to(motion_cost.dtype).sum(dim=1) * 100.0
             + plan.score
         )
+        if command_frame_yaw is None or not hard_yaw_gate:
+            public_cost = torch.stack(
+                [
+                    foothold_action_descriptor_cost(
+                        landing_feet=plan.landing_feet[plan_index],
+                        landing_xy_heading_m=(
+                            plan.landing_xy_command_frame_m[plan_index]
+                        ),
+                        landing_height_delta_m=(
+                            plan.landing_height_delta_m[plan_index]
+                        ),
+                        landing_frame_offsets=(
+                            plan.landing_frame_offsets[plan_index]
+                        ),
+                        action=action,
+                        xy_tolerance_m=xy_tolerance_m,
+                        height_tolerance_m=height_tolerance_m,
+                        timing_tolerance_frames=timing_tolerance_frames,
+                    )
+                    for plan_index in range(plan.score.shape[0])
+                ]
+            )
+            public_valid = torch.isfinite(public_cost)
+            both_valid = public_valid
+            normalized = torch.where(
+                public_valid,
+                public_cost + plan.score,
+                normalized,
+            )
         descriptor_cost[action_index] = normalized.min().clamp_min(0.0)
         if arm is FootholdSelectionArm.FIRST_CONTACT:
             eligible[action_index] = bool(first_valid.any().item())
