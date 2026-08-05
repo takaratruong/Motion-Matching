@@ -534,4 +534,4 @@ larger collision/contact tolerance.
 - Abrupt robustness noising shard 1 produced 27,483/27,486 valid FP32 windows
   before bounded retry retirement (99.989% coverage).  This is retained rather
   than recomputed.  The remaining ten shards were relaunched one L40 at a time
-  as job 16519088, with CPU command annotation chained as job 16519089.
+  as job 16519646, with CPU command annotation chained as job 16519647.
