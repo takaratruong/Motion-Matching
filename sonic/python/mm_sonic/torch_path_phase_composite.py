@@ -63,6 +63,8 @@ def _select_overlap(
     first: dict[str, np.ndarray],
     second: dict[str, np.ndarray],
     *,
+    first_support: np.ndarray,
+    second_support: np.ndarray,
     blend_frames: int,
     maximum_root_gap_m: float,
     first_frame_minimum: int = 0,
@@ -75,7 +77,11 @@ def _select_overlap(
     for first_frame in range(
         first_frame_minimum, len(first["joint_position"])
     ):
+        if not bool(first_support[first_frame].any()):
+            continue
         for second_frame in range(maximum_second_frame + 1):
+            if not bool(second_support[second_frame].any()):
+                continue
             root_gap = float(
                 np.linalg.norm(
                     first["root_position_world"][first_frame]
@@ -193,12 +199,16 @@ def compose_path_phases(
     mount_frame, interior_frame, first_root_gap = _select_overlap(
         placed_mount,
         placed_interior,
+        first_support=supports[0],
+        second_support=supports[1],
         blend_frames=blend_frames,
         maximum_root_gap_m=float(maximum_root_gap_m),
     )
     interior_stop_frame, dismount_frame, second_root_gap = _select_overlap(
         placed_interior,
         placed_dismount,
+        first_support=supports[1],
+        second_support=supports[2],
         blend_frames=blend_frames,
         maximum_root_gap_m=float(maximum_root_gap_m),
         first_frame_minimum=interior_frame + blend_frames - 1,

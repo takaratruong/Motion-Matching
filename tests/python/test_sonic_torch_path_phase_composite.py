@@ -142,6 +142,42 @@ class PathPhaseCompositeTests(unittest.TestCase):
             metrics["interior_source_stop_frame"],
         )
 
+    def test_splices_only_at_supported_source_frames(self):
+        mount = self.connector(0.0, 1.0, 40)
+        interior = self.connector(0.65, 1.5, 45)
+        dismount = self.connector(1.3, 2.2, 45)
+        mount_support = np.zeros((40, 2), dtype=np.bool_)
+        interior_support = np.zeros((45, 2), dtype=np.bool_)
+        dismount_support = np.zeros((45, 2), dtype=np.bool_)
+        mount_support[35:] = True
+        interior_support[5:35] = True
+        dismount_support[5:] = True
+
+        _, _, metrics = compose_path_phases(
+            mount=mount,
+            interior=interior,
+            dismount=dismount,
+            mount_support=mount_support,
+            interior_support=interior_support,
+            dismount_support=dismount_support,
+            blend_frames=5,
+        )
+
+        self.assertGreaterEqual(metrics["mount_source_stop_frame"], 36)
+        self.assertTrue(
+            interior_support[metrics["interior_source_start_frame"]].any()
+        )
+        self.assertTrue(
+            interior_support[
+                metrics["interior_source_stop_frame"] - 1
+            ].any()
+        )
+        self.assertTrue(
+            dismount_support[
+                metrics["dismount_source_start_frame"]
+            ].any()
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
