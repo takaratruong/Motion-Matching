@@ -328,3 +328,292 @@ def contact_signature_cost(
         + 0.002 * np.mean(np.square(source_time - query_time))
         + 2.0 * window.heading_error_rad**2
     )
+
+
+class PlacementRejected(ContractError):
+    """Stable rejection from rigid path placement."""
+
+    def __init__(self, reason: str):
+        if not isinstance(reason, str) or not reason:
+            raise ContractError("path placement rejection reason is invalid")
+        self.reason = reason
+        super().__init__(reason)
+
+
+@dataclass(frozen=True)
+class PlacementMetrics:
+    covered_start_m: float
+    covered_stop_m: float
+    heading_error_p95_rad: float
+    maximum_lateral_error_m: float
+    maximum_stance_error_m: float
+    minimum_sole_clearance_m: float
+
+    def __post_init__(self) -> None:
+        values = tuple(float(getattr(self, name)) for name in self.__dataclass_fields__)
+        if (
+            not all(math.isfinite(value) for value in values)
+            or values[0] < -1.0e-6
+            or values[1] <= values[0]
+            or any(value < 0.0 for value in values[2:5])
+        ):
+            raise ContractError("path placement metrics are invalid")
+        for name, value in zip(self.__dataclass_fields__, values):
+            object.__setattr__(self, name, value)
+
+
+def _owned_array(
+    value: object, shape: tuple[int, ...], label: str
+) -> np.ndarray:
+    array = np.asarray(value)
+    if array.shape != shape or not np.issubdtype(array.dtype, np.number):
+        raise ContractError(f"path placement {label} is invalid")
+    owned = np.array(array, copy=True)
+    if not np.isfinite(owned).all():
+        raise ContractError(f"path placement {label} is invalid")
+    owned.setflags(write=False)
+    return owned
+
+
+@dataclass(frozen=True)
+class PlacedRawWindow:
+    window: RawMotionWindow
+    yaw_scene_rad: float
+    translation_scene_xyz: tuple[float, float, float]
+    joint_position: np.ndarray
+    root_position_scene: np.ndarray
+    root_orientation_scene_wxyz: np.ndarray
+    metrics: PlacementMetrics
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.window, RawMotionWindow)
+            or not math.isfinite(float(self.yaw_scene_rad))
+            or not isinstance(self.metrics, PlacementMetrics)
+        ):
+            raise ContractError("placed raw window metadata is invalid")
+        frames = self.window.stop_frame - self.window.start_frame
+        object.__setattr__(
+            self,
+            "translation_scene_xyz",
+            _finite_tuple(
+                self.translation_scene_xyz, 3, "placement translation"
+            ),
+        )
+        object.__setattr__(
+            self,
+            "joint_position",
+            _owned_array(self.joint_position, (frames, 29), "joints"),
+        )
+        object.__setattr__(
+            self,
+            "root_position_scene",
+            _owned_array(self.root_position_scene, (frames, 3), "roots"),
+        )
+        quaternion = _owned_array(
+            self.root_orientation_scene_wxyz,
+            (frames, 4),
+            "orientations",
+        )
+        if np.any(np.abs(np.linalg.norm(quaternion, axis=1) - 1.0) > 1.0e-4):
+            raise ContractError("path placement orientations are invalid")
+        object.__setattr__(self, "root_orientation_scene_wxyz", quaternion)
+        object.__setattr__(self, "yaw_scene_rad", float(self.yaw_scene_rad))
+
+
+def _quaternion_multiply_wxyz(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    lw, lx, ly, lz = np.moveaxis(np.asarray(left), -1, 0)
+    rw, rx, ry, rz = np.moveaxis(np.asarray(right), -1, 0)
+    return np.stack(
+        (
+            lw * rw - lx * rx - ly * ry - lz * rz,
+            lw * rx + lx * rw + ly * rz - lz * ry,
+            lw * ry - lx * rz + ly * rw + lz * rx,
+            lw * rz + lx * ry - ly * rx + lz * rw,
+        ),
+        axis=-1,
+    )
+
+
+def place_raw_window_on_path(
+    *,
+    window: RawMotionWindow,
+    joint_position: object,
+    root_position_world: object,
+    root_orientation_world_wxyz: object,
+    foot_position_world: object,
+    sole_position_world: object,
+    support_mask: object,
+    path_start_scene_xy: object,
+    path_heading_scene_xy: object,
+    sample_surface: Callable[[np.ndarray], np.ndarray],
+    maximum_heading_error_rad: float = math.radians(15.0),
+    maximum_lateral_error_m: float = 0.15,
+    maximum_stance_error_m: float = 0.03,
+    minimum_sole_clearance_m: float = -0.03,
+) -> PlacedRawWindow:
+    """Rigidly align one raw window to a path and certify actual contacts."""
+
+    if not isinstance(window, RawMotionWindow) or not callable(sample_surface):
+        raise ContractError("path placement inputs are invalid")
+    joints = np.asarray(joint_position)
+    roots = np.asarray(root_position_world, dtype=np.float64)
+    quaternion = np.asarray(root_orientation_world_wxyz, dtype=np.float64)
+    feet = np.asarray(foot_position_world, dtype=np.float64)
+    soles = np.asarray(sole_position_world, dtype=np.float64)
+    support = np.asarray(support_mask)
+    total = len(joints)
+    sole_points = soles.shape[2] if soles.ndim == 4 else 0
+    start, stop = window.start_frame, window.stop_frame
+    heading = np.asarray(path_heading_scene_xy, dtype=np.float64)
+    path_start = np.asarray(path_start_scene_xy, dtype=np.float64)
+    thresholds = (
+        maximum_heading_error_rad,
+        maximum_lateral_error_m,
+        maximum_stance_error_m,
+    )
+    if (
+        joints.shape != (total, 29)
+        or roots.shape != (total, 3)
+        or quaternion.shape != (total, 4)
+        or feet.shape != (total, 2, 3)
+        or soles.shape != (total, 2, sole_points, 3)
+        or sole_points < 1
+        or support.shape != (total, 2)
+        or support.dtype != np.bool_
+        or not 0 <= start < stop <= total
+        or path_start.shape != (2,)
+        or heading.shape != (2,)
+        or not all(
+            np.isfinite(value).all()
+            for value in (joints, roots, quaternion, feet, soles, path_start, heading)
+        )
+        or np.any(np.abs(np.linalg.norm(quaternion, axis=1) - 1.0) > 1.0e-4)
+        or not all(math.isfinite(float(value)) and value > 0.0 for value in thresholds)
+        or not math.isfinite(float(minimum_sole_clearance_m))
+    ):
+        raise ContractError("path placement source profiles are invalid")
+    heading_norm = float(np.linalg.norm(heading))
+    if heading_norm <= 1.0e-6:
+        raise ContractError("path placement heading is zero")
+    heading /= heading_norm
+    source_displacement = roots[stop - 1, :2] - roots[start, :2]
+    source_distance = float(np.linalg.norm(source_displacement))
+    if source_distance <= 1.0e-6:
+        raise PlacementRejected("insufficient-progress")
+    source_yaw = math.atan2(
+        float(source_displacement[1]), float(source_displacement[0])
+    )
+    target_yaw = math.atan2(float(heading[1]), float(heading[0]))
+    yaw_delta = target_yaw - source_yaw
+    cosine, sine = math.cos(yaw_delta), math.sin(yaw_delta)
+    rotation = np.array(((cosine, -sine), (sine, cosine)), dtype=np.float64)
+    source_origin = roots[start, :2]
+    translation_xy = path_start - source_origin @ rotation.T
+
+    selection = slice(start, stop)
+    placed_roots = roots[selection].copy()
+    placed_feet = feet[selection].copy()
+    placed_soles = soles[selection].copy()
+    placed_roots[:, :2] = roots[selection, :2] @ rotation.T + translation_xy
+    placed_feet[..., :2] = (
+        feet[selection, ..., :2] @ rotation.T + translation_xy
+    )
+    placed_soles[..., :2] = (
+        soles[selection, ..., :2] @ rotation.T + translation_xy
+    )
+    placed_support = support[selection]
+    try:
+        foot_surface = np.asarray(
+            sample_surface(placed_feet[..., :2]), dtype=np.float64
+        )
+    except PlacementRejected:
+        raise
+    except Exception as error:
+        raise ContractError("path placement terrain sampling failed") from error
+    if (
+        foot_surface.shape != placed_support.shape
+        or not np.isfinite(foot_surface).all()
+        or not bool(placed_support.any())
+    ):
+        raise ContractError("path placement terrain samples are invalid")
+    height_residual = (
+        foot_surface[placed_support] + 0.035
+        - placed_feet[..., 2][placed_support]
+    )
+    translation_z = float(np.median(height_residual))
+    placed_roots[:, 2] += translation_z
+    placed_feet[..., 2] += translation_z
+    placed_soles[..., 2] += translation_z
+
+    foot_clearance = placed_feet[..., 2] - foot_surface - 0.035
+    stance_error = float(np.max(np.abs(foot_clearance[placed_support])))
+    try:
+        sole_surface = np.asarray(
+            sample_surface(placed_soles[..., :2]), dtype=np.float64
+        )
+    except Exception as error:
+        raise ContractError("path placement sole sampling failed") from error
+    if sole_surface.shape != placed_soles.shape[:-1] or not np.isfinite(
+        sole_surface
+    ).all():
+        raise ContractError("path placement sole samples are invalid")
+    sole_clearance = placed_soles[..., 2] - sole_surface
+    minimum_clearance = float(sole_clearance.min())
+
+    relative_root = placed_roots[:, :2] - path_start
+    lateral_axis = np.array((-heading[1], heading[0]), dtype=np.float64)
+    along = relative_root @ heading
+    lateral = relative_root @ lateral_axis
+    maximum_lateral = float(np.max(np.abs(lateral)))
+    rotated_quaternion = _quaternion_multiply_wxyz(
+        np.array(
+            (
+                math.cos(yaw_delta / 2.0),
+                0.0,
+                0.0,
+                math.sin(yaw_delta / 2.0),
+            )
+        ),
+        quaternion[selection],
+    )
+    character_yaw = _yaw_wxyz(rotated_quaternion)
+    heading_error = np.abs(
+        np.arctan2(
+            np.sin(character_yaw - target_yaw),
+            np.cos(character_yaw - target_yaw),
+        )
+    )
+    heading_p95 = float(np.quantile(heading_error, 0.95))
+    if heading_p95 > float(maximum_heading_error_rad):
+        raise PlacementRejected("heading")
+    if maximum_lateral > float(maximum_lateral_error_m):
+        raise PlacementRejected("lateral-path")
+    if stance_error > float(maximum_stance_error_m):
+        raise PlacementRejected("stance-height")
+    if minimum_clearance < float(minimum_sole_clearance_m):
+        raise PlacementRejected("sole-penetration")
+    covered_start = max(0.0, float(along.min()))
+    covered_stop = float(along.max())
+    if covered_stop <= covered_start:
+        raise PlacementRejected("insufficient-progress")
+    return PlacedRawWindow(
+        window=window,
+        yaw_scene_rad=yaw_delta,
+        translation_scene_xyz=(
+            float(translation_xy[0]),
+            float(translation_xy[1]),
+            translation_z,
+        ),
+        joint_position=joints[selection],
+        root_position_scene=placed_roots,
+        root_orientation_scene_wxyz=rotated_quaternion,
+        metrics=PlacementMetrics(
+            covered_start_m=covered_start,
+            covered_stop_m=covered_stop,
+            heading_error_p95_rad=heading_p95,
+            maximum_lateral_error_m=maximum_lateral,
+            maximum_stance_error_m=stance_error,
+            minimum_sole_clearance_m=minimum_clearance,
+        ),
+    )

@@ -10,9 +10,11 @@ from mm_sonic.torch_heading_footprint_path import (
     nominal_footprint_path,
 )
 from mm_sonic.torch_path_motion_placement import (
+    PlacementRejected,
     contact_signature_cost,
     extract_raw_motion_windows,
     path_contact_signature,
+    place_raw_window_on_path,
 )
 
 
@@ -166,6 +168,127 @@ class PathMotionPlacementTests(unittest.TestCase):
                 support_mask=np.zeros((4, 2), dtype=np.bool_),
                 foot_surface_height_m=np.zeros((4, 2)),
                 minimum_events=0,
+            )
+
+    @staticmethod
+    def placement_source(*, facing_yaw=0.0, sole_z=0.0):
+        frames = 20
+        roots = np.zeros((frames, 3))
+        roots[:, 0] = np.linspace(0.0, 1.0, frames)
+        roots[:, 2] = 0.8
+        quaternions = np.tile(
+            (
+                math.cos(facing_yaw / 2.0),
+                0.0,
+                0.0,
+                math.sin(facing_yaw / 2.0),
+            ),
+            (frames, 1),
+        )
+        joints = np.arange(frames * 29, dtype=np.float64).reshape(frames, 29)
+        feet = np.zeros((frames, 2, 3))
+        feet[..., 0] = roots[:, None, 0]
+        feet[:, 0, 1] = 0.1
+        feet[:, 1, 1] = -0.1
+        feet[..., 2] = 0.035
+        soles = np.repeat(feet[:, :, None, :], 2, axis=2)
+        soles[..., 2] = sole_z
+        support = np.ones((frames, 2), dtype=np.bool_)
+        events = (
+            (0, 0),
+            (5, 1),
+            (10, 0),
+            (15, 1),
+        )
+        surface = np.zeros((frames, 2))
+        windows = extract_raw_motion_windows(
+            source_clip="placement",
+            root_position_world=roots,
+            root_orientation_world_wxyz=quaternions,
+            foot_position_world=feet,
+            support_mask=np.zeros((frames, 2), dtype=np.bool_),
+            foot_surface_height_m=surface,
+            minimum_progress_m=0.1,
+        )
+        # A fully supported synthetic source has no onsets; construct its
+        # event mask explicitly for extraction.
+        onset_support = np.zeros((frames, 2), dtype=np.bool_)
+        for frame, foot in events:
+            onset_support[frame:min(frames, frame + 3), foot] = True
+        window = extract_raw_motion_windows(
+            source_clip="placement",
+            root_position_world=roots,
+            root_orientation_world_wxyz=quaternions,
+            foot_position_world=feet,
+            support_mask=onset_support,
+            foot_surface_height_m=surface,
+            minimum_events=4,
+            maximum_events=4,
+            minimum_progress_m=0.1,
+        )[0]
+        return window, joints, roots, quaternions, feet, soles, support
+
+    def test_rigid_placement_aligns_path_and_preserves_raw_joints(self):
+        source = self.placement_source()
+        window, joints, roots, quaternions, feet, soles, support = source
+
+        placed = place_raw_window_on_path(
+            window=window,
+            joint_position=joints,
+            root_position_world=roots,
+            root_orientation_world_wxyz=quaternions,
+            foot_position_world=feet,
+            sole_position_world=soles,
+            support_mask=support,
+            path_start_scene_xy=np.array((2.0, 3.0)),
+            path_heading_scene_xy=np.array((0.0, 1.0)),
+            sample_surface=lambda points: np.zeros(points.shape[:-1]),
+        )
+
+        np.testing.assert_array_equal(
+            placed.joint_position,
+            joints[window.start_frame:window.stop_frame],
+        )
+        np.testing.assert_allclose(
+            placed.root_position_scene[0, :2], (2.0, 3.0), atol=1e-7
+        )
+        self.assertGreater(placed.root_position_scene[-1, 1], 3.5)
+        self.assertAlmostEqual(placed.metrics.maximum_lateral_error_m, 0.0)
+
+    def test_rigid_placement_rejects_character_facing_across_path(self):
+        source = self.placement_source(facing_yaw=math.pi / 2.0)
+        window, joints, roots, quaternions, feet, soles, support = source
+
+        with self.assertRaisesRegex(PlacementRejected, "heading"):
+            place_raw_window_on_path(
+                window=window,
+                joint_position=joints,
+                root_position_world=roots,
+                root_orientation_world_wxyz=quaternions,
+                foot_position_world=feet,
+                sole_position_world=soles,
+                support_mask=support,
+                path_start_scene_xy=np.zeros(2),
+                path_heading_scene_xy=np.array((1.0, 0.0)),
+                sample_surface=lambda points: np.zeros(points.shape[:-1]),
+            )
+
+    def test_rigid_placement_rejects_complete_sole_penetration(self):
+        source = self.placement_source(sole_z=-0.05)
+        window, joints, roots, quaternions, feet, soles, support = source
+
+        with self.assertRaisesRegex(PlacementRejected, "sole-penetration"):
+            place_raw_window_on_path(
+                window=window,
+                joint_position=joints,
+                root_position_world=roots,
+                root_orientation_world_wxyz=quaternions,
+                foot_position_world=feet,
+                sole_position_world=soles,
+                support_mask=support,
+                path_start_scene_xy=np.zeros(2),
+                path_heading_scene_xy=np.array((1.0, 0.0)),
+                sample_surface=lambda points: np.zeros(points.shape[:-1]),
             )
 
 
