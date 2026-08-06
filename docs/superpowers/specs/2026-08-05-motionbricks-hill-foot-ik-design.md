@@ -65,11 +65,14 @@ Contact inference uses the raw MotionBricks pose, before IK:
 5. Both feet may be latched during a genuine slow double-support phase.
 6. State changes are committed only when the complete IK result is accepted.
 
-On a stance rising edge, preserve each sphere's world XY and set its target Z
-to terrain height at that XY plus the sphere radius. The distinct target
-heights across heel/toe and left/right probes make the ankle follow the local
-slope. While stance remains active, the complete projected sphere target stays
-fixed in world space so the foot does not skate.
+On a stance rising edge, preserve the sole centroid's world XY and set each
+sphere's target Z to terrain height at that sphere's XY plus its radius. The
+distinct target heights across heel/toe and left/right probes make the ankle
+follow the local slope. While stance remains active, the projected sphere
+heights and centroid target stay fixed in world space so the foot does not
+skate. A rigid foot cannot preserve every probe's individual XY while rotating
+onto an 18-degree slope, so the centroid is the physically feasible horizontal
+plant constraint.
 
 After release, no horizontal swing-foot target is retained.
 
@@ -77,7 +80,8 @@ After release, no horizontal swing-foot target is retained.
 
 For each active stance foot:
 
-1. Stack the positional MuJoCo Jacobians of all sole spheres.
+1. Stack the vertical Jacobian row of every sole sphere plus the X/Y rows of
+   their mean Jacobian for a planted-foot centroid constraint.
 2. Restrict the Jacobian to that leg's six degrees of freedom.
 3. Solve damped least squares with a small posture regularizer toward the raw
    MotionBricks joints.
@@ -86,10 +90,12 @@ For each active stance foot:
 6. Clamp change in IK correction from the prior accepted frame to `0.06 rad`.
 7. Respect native MuJoCo joint limits.
 
-For an unlatched swing foot, preserve its authored XY and orientation. If any
+For an unlatched swing foot, bias toward its authored joints. If any
 sole sphere would penetrate the terrain or violate `0.015 m` minimum swing
-clearance, solve only a common upward target translation sufficient to clear
-the worst sphere. Do not pull a hovering swing foot downward.
+clearance, solve only the four vertical Jacobian rows toward a common upward
+target sufficient to clear the worst sphere. Do not pull a hovering swing foot
+downward. The first observed frame is a measurement-only warmup so an unknown
+initial foot velocity cannot create a false swing correction.
 
 The root seven qpos values and every non-leg joint must be exactly copied from
 the raw MotionBricks output.
@@ -120,14 +126,22 @@ The live diagnostic line adds:
 
 ## Error Handling
 
-The IK update is transactional. Reject the complete corrected frame and render
-raw qpos when:
+The IK update is transactional. A newly planted foot may require several
+accepted frames to reach its target because correction changes are capped at
+`0.06 rad` per frame. During that acquisition ramp, a bounded correction may
+be committed above the settled `0.015 m` vertical residual only while it
+strictly reduces terrain penetration. Reject the complete corrected frame and
+render raw qpos when:
 
 - input qpos, terrain samples, Jacobians, or solved values are non-finite;
 - the G1 model lacks the expected sole spheres or leg joints;
 - a joint limit or correction bound would be exceeded;
-- stance target residual exceeds `0.015 m` after the iteration budget; or
-- a corrected pose introduces non-foot terrain collision.
+- settled stance vertical residual exceeds `0.015 m`, or an acquisition step
+  does not reduce terrain penetration; or
+- planted sole-centroid drift exceeds `0.04 m`.
+
+The first visual prototype does not enable MuJoCo terrain contact dynamics, so
+non-foot collision rejection remains outside this pass.
 
 On a rejected update, do not advance latch or correction history. Emit one
 rate-limited warning containing the reason. Repeated rejection must not stop

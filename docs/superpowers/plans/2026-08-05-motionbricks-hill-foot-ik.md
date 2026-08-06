@@ -418,10 +418,7 @@ For each selected foot, iterate:
 
 ```python
 current = self._sole_centers(foot)
-error = (target - current).reshape(-1)
-if float(np.max(np.linalg.norm(target - current, axis=1))) <= 2.5e-4:
-    break
-rows = []
+jacobians = []
 for geom_id in self._sphere_geoms[foot]:
     jacobian_position.fill(0.0)
     self._mujoco.mj_jac(
@@ -432,7 +429,18 @@ for geom_id in self._sphere_geoms[foot]:
         self._data.geom_xpos[geom_id],
         int(self.model.geom_bodyid[geom_id]),
     )
-    rows.append(jacobian_position[:, dofs].copy())
+    jacobians.append(jacobian_position[:, dofs].copy())
+vertical_error = target[:, 2] - current[:, 2]
+rows = [value[2:3] for value in jacobians]
+error = vertical_error
+if phase is FootPhase.STANCE:
+    centroid_jacobian = np.mean(np.asarray(jacobians), axis=0)
+    centroid_error = (
+        np.mean(target[:, :2], axis=0)
+        - np.mean(current[:, :2], axis=0)
+    )
+    rows.extend((centroid_jacobian[0:1], centroid_jacobian[1:2]))
+    error = np.concatenate((vertical_error, centroid_error))
 jacobian = np.vstack(rows)
 transpose = jacobian.T
 lhs = (
@@ -466,7 +474,12 @@ penetration from sole-sphere bottoms.
 - use fixed stance targets, upward-only swing targets, or no target;
 - solve into private `MjData`;
 - overwrite root and non-leg qpos from raw after solving;
-- accept only finite, bounded output with stance residual at most `0.015 m`;
+- keep the first frame measurement-only when velocity is unknown;
+- accept only finite, bounded output with settled stance vertical residual at
+  most `0.015 m`;
+- during initial stance acquisition, commit a residual above `0.015 m` only
+  when the rate-bounded correction strictly reduces terrain penetration;
+- reject planted sole-centroid drift above `0.04 m`;
 - commit proposed phases, targets, raw centres, and corrections on acceptance;
 - return raw qpos and diagnostics with `accepted=False` on any exception or
   failed bound.
