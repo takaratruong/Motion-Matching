@@ -23,6 +23,7 @@ CHECKPOINT=${TERRAIN_MANEUVER_EVAL_CHECKPOINT:-${RUN_ROOT}/sonic_finetune_v1_eva
 OUTPUT=${TERRAIN_MANEUVER_EVAL_OUTPUT:-${RUN_ROOT}/clean_eval_v1}
 DATASET_NAME=${TERRAIN_MANEUVER_EVAL_DATASET_NAME:-terrain_maneuver_bank28_finetune_clean_diagnostic}
 NUM_ENVS=${TERRAIN_MANEUVER_EVAL_NUM_ENVS:-28}
+MODEL_OVERRIDE=${TERRAIN_MANEUVER_EVAL_MODEL:-}
 
 if [[ ! -r "${BUNDLE}/motion_lib_merged.pkl" || ! -r "${BUNDLE}/objects.pkl" ]]; then
     echo "missing terrain maneuver bundle" >&2
@@ -32,12 +33,20 @@ if [[ ! -r "${TRAIN_OUTPUT}/config.yaml" ]]; then
     echo "missing completed fine-tune config" >&2
     exit 8
 fi
-mapfile -t MODELS < <(find "${TRAIN_OUTPUT}" -maxdepth 1 -type f -name 'model_step_*.pt' | sort -V)
-if (( ${#MODELS[@]} == 0 )); then
-    echo "fine-tune wrote no model checkpoint" >&2
-    exit 8
+if [[ -n "${MODEL_OVERRIDE}" ]]; then
+    if [[ ! -r "${MODEL_OVERRIDE}" ]]; then
+        echo "requested evaluation checkpoint is unreadable: ${MODEL_OVERRIDE}" >&2
+        exit 8
+    fi
+    LATEST=${MODEL_OVERRIDE}
+else
+    mapfile -t MODELS < <(find "${TRAIN_OUTPUT}" -maxdepth 1 -type f -name 'model_step_*.pt' | sort -V)
+    if (( ${#MODELS[@]} == 0 )); then
+        echo "fine-tune wrote no model checkpoint" >&2
+        exit 8
+    fi
+    LATEST=${MODELS[$((${#MODELS[@]} - 1))]}
 fi
-LATEST=${MODELS[$((${#MODELS[@]} - 1))]}
 if [[ -e "${OUTPUT}" ]]; then
     echo "refusing to overwrite ${OUTPUT}" >&2
     exit 9

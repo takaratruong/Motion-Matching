@@ -162,6 +162,7 @@ def prepare(pilots: tuple[str, ...], output: Path) -> dict[str, object]:
         list(JOINT_NAMES), list(spec.joint_names)
     )
     merged: dict[str, dict[str, object]] = {}
+    object_motions: dict[str, dict[str, object]] = {}
     clip_records: list[dict[str, object]] = []
     provenance: list[dict[str, object]] = []
     used_ids: set[str] = set()
@@ -230,6 +231,20 @@ def prepare(pilots: tuple[str, ...], output: Path) -> dict[str, object]:
                 manifest["terrain_quaternion_world_from_usd_wxyz"]
             ),
         }
+        object_position = np.asarray(terrain_pose["position_env"], dtype=np.float32)
+        object_quaternion = np.asarray(
+            terrain_pose["rotation_env_wxyz"], dtype=np.float32
+        )
+        object_quaternion /= np.linalg.norm(object_quaternion)
+        object_motions[stem] = {
+            "root_pos": np.broadcast_to(
+                object_position, (len(root), 1, 3)
+            ).copy(),
+            "root_quat": np.broadcast_to(
+                object_quaternion, (len(root), 1, 4)
+            ).copy(),
+            "fps": fps,
+        }
         clip_records.append(
             {
                 "stem": stem,
@@ -262,6 +277,7 @@ def prepare(pilots: tuple[str, ...], output: Path) -> dict[str, object]:
     assert flat_placeholder is not None
     shutil.copy2(flat_placeholder, destination / "flat_placeholder.usd")
     joblib.dump(merged, destination / "motion_lib_merged.pkl")
+    joblib.dump(object_motions, destination / "objects.pkl")
     (destination / "clips.json").write_text(
         json.dumps(clip_records, indent=2, sort_keys=True) + "\n"
     )

@@ -1375,3 +1375,19 @@ asset unchanged.  All fifteen bundled terrains were inspected as
 `failed_usdc_detection`.  A 15-environment clean physical diagnostic is job
 `16533077`, chained after the v2 all-28 gate so it consumes no extra concurrent
 GPU lane and cannot run against an unqualified checkpoint.
+
+The 200-iteration hard-nine continuation completed as job `16532758` in
+17m31s.  It reached 87.91% timeout completion in its final randomized training
+window and learned six of the nine parent failures.  The independent full-bank
+gate, job `16532759`, nevertheless passed only 6/28 clips, with median peak
+MPJPE 587.6 mm and maximum 1744.6 mm.  It forgot nearly the entire easy set and
+is rejected.  The varied-15 child `16533077` was cancelled before simulator
+startup and wrote no output.  Three one-lane evaluations now isolate the useful
+early-stopping region: parent-on-v2 job `16533277`, step-50 job `16533278`, and
+step-100 job `16533279`.  They run sequentially on one Titan RTX.
+
+Bundle preparation now writes `objects.pkl` directly.  Every constant object
+trajectory uses the same per-clip terrain position and quaternion as
+`clips.json`, so SONIC reset state and scene registration share one source of
+truth.  The varied-15 bundle was rebuilt and all fifteen object-motion entries
+were checked against their scene bindings.

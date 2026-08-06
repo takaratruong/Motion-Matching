@@ -118,6 +118,9 @@ bytes for physics schema names produces false negatives.  Bundle preparation
 now verifies rigid-body and collision APIs when USD bindings are available.
 The fifteen accepted varied-terrain motions are kept in a separate bundle and
 receive their own clean physical gate before any training or noised collection.
+Bundle preparation also writes the static object-motion file from the exact
+per-clip terrain position and quaternion; do not synthesize identity object
+motions for archive-rotated C490 terrain.
 
 ## Scale-up strata
 
