@@ -103,6 +103,16 @@ surface penetration, or pose discontinuity.  Eight are cleaner visual examples;
 six use a support pose wider than 40 cm and are tagged as robustness data.  The
 scale-up used no GPU.
 
+A follow-up sweep targets terrain diversity explicitly.  It selects twelve
+previously unused clean C490 sources from their registered terrain-following
+profiles: large rounded hills, multi-crest and valley paths, repeated shallow
+bumps, rough crests, and sustained uphill grades.  Eight sources produce
+fifteen accepted short-transition pilots.  The accepted maximums are 2.637 mm
+foot penetration, 11.003 mm stance-run drift, and 0.127 rad joint step at
+50 Hz.  Dense renders of seven representative reversals show no long frozen
+pose or cut at the pivot.  Keep this bank separate until the current tracker
+gate establishes that the smaller v2 bank remains physically trackable.
+
 ## Scale-up strata
 
 Target 200 clips only after a small clean fine-tune proves trackability.  A

@@ -1348,3 +1348,18 @@ The full v2 bundle contains all 28 candidates and keeps the same clip IDs as
 v1.  Only the seven newly scaled source pairs use the revised transition
 timing.  This makes the chained full-bank evaluation a per-clip physical A/B
 comparison rather than a differently sampled benchmark.
+
+A second CPU-only varied-terrain sweep ran as job `16532796`.  Twelve new C490
+sources were selected from archive pelvis/terrain profiles rather than by
+inventing heightfields: large hills, multi-crest/valley paths, repeated shallow
+bumps, rough crests, and sustained grades.  Eight sources yielded fifteen
+automatically accepted maneuvers; three lacked a central supported pivot, and
+one failed the pilot mechanics gate.  Across the accepted set, maximum foot
+penetration is 2.637 mm, maximum stance-run drift is 11.003 mm, and maximum
+50 Hz joint step is 0.127 rad.  Seven representative reversals were rendered
+dense at 50 Hz as job `16532832`; the contact sheets show continuous approach,
+the short supported pivot, and continuous departure without the old long
+mid-stride freeze.  This expansion remains a clean kinematic candidate bank,
+not tracker-training data, until the current 28-clip physical gate finishes.
+Evidence: `artifacts/terrain_maneuver_bank/c490_slope_varied12_v2`,
+`terrain_profiles.png`, and `varied_reverse7_grid.mp4`.
