@@ -22,6 +22,49 @@ PYTHONPATH=sonic/python sonic/.venv/bin/python -m unittest \
   tests.python.test_sonic_external -v
 ```
 
+## Experimental MotionBricks gentle-hill viewer
+
+`mm_sonic.motionbricks_hill_viewer` is a minimal kinematic probe for the
+released G1 MotionBricks model. It renders one wide 8.93-degree cosine hill and
+adds the hill's relative elevation to MotionBricks' sparse future root targets
+before model inference. Generated root orientation and joint values are not
+terrain-warped. This first spike has no foot IK, collision correction, physics,
+or terrain-normal root rotation.
+
+Prepare the pinned MotionBricks checkout and an isolated CUDA environment:
+
+```bash
+cd /home/ubuntu/projects/gear-sonic-pinned-60de0df
+git -c lfs.fetchexclude= lfs pull \
+  --include='motionbricks/out/**' --exclude=''
+
+cd /home/ubuntu/worktrees/motion-matching-hill-conditioning
+/home/ubuntu/miniconda3/envs/env_isaaclab/bin/python -m venv \
+  --system-site-packages sonic/.torch-mm-venv
+sonic/.torch-mm-venv/bin/pip install -e \
+  /home/ubuntu/projects/gear-sonic-pinned-60de0df/motionbricks
+```
+
+Launch the controllable MuJoCo window from a graphical/X11 session:
+
+```bash
+PYTHONPATH=sonic/python sonic/.torch-mm-venv/bin/python -m \
+  mm_sonic.motionbricks_hill_viewer
+```
+
+The viewer starts on the flat apron facing the hill. `W/A/S/D` controls travel
+relative to the camera; rotate the camera to change the forward direction and
+press Escape to close. The terminal prints root height, exact terrain height,
+and the four most recent terrain-height targets delivered before inference.
+
+For a bounded headless dependency/checkpoint smoke test:
+
+```bash
+PYTHONPATH=sonic/python sonic/.torch-mm-venv/bin/python -m \
+  mm_sonic.motionbricks_hill_viewer \
+  --no-viewer --smoke-steps 90 --trace-every 15
+```
+
 ## In-process Torch motion matcher runtime
 
 The in-process Torch motion matcher runs in its own candidate-local virtual

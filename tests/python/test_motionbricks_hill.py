@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+from io import StringIO
 import math
 import unittest
 
@@ -58,6 +60,21 @@ class GentleHillProfileTest(unittest.TestCase):
     def test_mesh_rejects_too_few_samples(self) -> None:
         with self.assertRaisesRegex(ValueError, "sample_count"):
             self.hill.mesh(sample_count=1)
+
+
+class HillViewerCliTest(unittest.TestCase):
+    def test_help_is_available_without_importing_motionbricks(self) -> None:
+        from mm_sonic.motionbricks_hill_viewer import main
+
+        output = StringIO()
+        with redirect_stdout(output), self.assertRaises(SystemExit) as raised:
+            main(["--help"])
+
+        self.assertEqual(raised.exception.code, 0)
+        help_text = output.getvalue()
+        self.assertIn("--motionbricks-root", help_text)
+        self.assertIn("--no-viewer", help_text)
+        self.assertIn("--smoke-steps", help_text)
 
 
 if __name__ == "__main__":
