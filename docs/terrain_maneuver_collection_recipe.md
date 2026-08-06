@@ -127,7 +127,34 @@ failures while catastrophically forgetting the previously tracked motions.
 For a bounded repair, keep every passing clip in replay and upweight failures
 with stable aliases, then re-run the original full bank.  The first balanced
 bank uses one copy of every 28-clip v2 motion plus two extra copies of each of
-the eight parent failures (44 clips total).
+the eight parent failures (44 clips total).  This improves the deterministic
+gate from 20/28 to 24/28 while retaining every parent pass.  A subsequent
+four-failure-focused replay regresses to 22/28, so repeated narrowing is not a
+safe recipe.
+
+The 24/28 core checkpoint fails all fifteen newly added hill/bump motions when
+evaluated without adaptation.  The next balanced bank therefore contains all
+28 core motions once and all 15 varied motions twice: 58 replay entries and 43
+unique evaluation motions.  At 50 iterations it passes 25/28 core plus 10/15
+varied; at 100 iterations it passes 24/28 core plus 12/15 varied.  Prefer the
+50-step checkpoint when core fidelity is primary and the 100-step checkpoint
+when varied-terrain coverage is primary, but do not collect noisy rollouts from
+either until visual review clears the high-MPJPE survivors and the remaining
+terrain failures.
+
+Full-length review now separates three different effects that a short montage
+can conflate.  The previous hard cuts were presentation cuts; the old long
+mid-stride hold was a real kinematic cadence artifact; and the remaining SONIC
+failures are gradual physical drift/stumble.  The 16/4/16 reversal timing removes
+the long hold while retaining exact terrain registration and the collision gate.
+Six full-length clean examples span hills, sustained grades, crest/valley paths,
+and repeated bumps in
+`artifacts/terrain_maneuver_bank/c490_slope_varied12_v2/varied_reverse6_full_grid.mp4`.
+The corresponding labeled physical audit is
+`/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_clean_bank28_v1/tracker_review_core43_replay58_step100_varied6_cpu_v1/varied_physical6_audit_grid.mp4`.
+Reviewed passes contain no teleport or long freeze, but small stance-foot
+shuffles and large path errors remain, so the noised-collection gate stays
+closed.
 
 ## Scale-up strata
 

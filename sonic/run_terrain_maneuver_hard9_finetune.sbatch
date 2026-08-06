@@ -22,6 +22,10 @@ OUTPUT=${TERRAIN_MANEUVER_HARD_OUTPUT:-${RUN_ROOT}/sonic_hard9_finetune_v1}
 LOG=/tmp/terrain_maneuver_hard9_${SLURM_JOB_ID}.log
 ITERATIONS=${TERRAIN_MANEUVER_HARD9_ITERS:-200}
 NUM_ENVS=${TERRAIN_MANEUVER_HARD9_ENVS:-192}
+SAVE_INTERVAL=${TERRAIN_MANEUVER_SAVE_INTERVAL:-50}
+ACTOR_LR=${TERRAIN_MANEUVER_ACTOR_LR:-}
+ADAPTIVE_LR_MIN=${TERRAIN_MANEUVER_ADAPTIVE_LR_MIN:-}
+ADAPTIVE_LR_MAX=${TERRAIN_MANEUVER_ADAPTIVE_LR_MAX:-}
 
 if [[ ! -r "${PARENT}/last.pt" || ! -r "${PARENT}/config.yaml" ]]; then
     echo "missing completed 28-clip parent checkpoint" >&2
@@ -45,6 +49,16 @@ export HYDRA_FULL_ERROR=1
 source "${MM_ROOT}/sonic/setup_writable_isaac_runtime.sh"
 
 cd "${GRAIL_ROOT}/GRAIL/imports/SONIC"
+LR_OVERRIDES=()
+if [[ -n "${ACTOR_LR}" ]]; then
+    LR_OVERRIDES+=("algo.config.actor_learning_rate=${ACTOR_LR}")
+fi
+if [[ -n "${ADAPTIVE_LR_MIN}" ]]; then
+    LR_OVERRIDES+=("algo.config.adaptive_lr_min=${ADAPTIVE_LR_MIN}")
+fi
+if [[ -n "${ADAPTIVE_LR_MAX}" ]]; then
+    LR_OVERRIDES+=("algo.config.adaptive_lr_max=${ADAPTIVE_LR_MAX}")
+fi
 python -u -m gear_sonic.train_agent_trl \
     --config-dir="${PARENT}" --config-name=config hydra.job.chdir=false \
     hydra.run.dir="${OUTPUT}/hydra" \
@@ -54,8 +68,9 @@ python -u -m gear_sonic.train_agent_trl \
     experiment_dir="${OUTPUT}" \
     num_envs="${NUM_ENVS}" multi_gpu=false num_gpus=1 headless=true use_wandb=false \
     "++algo.config.num_learning_iterations=${ITERATIONS}" \
-    '++algo.config.save_interval=50' \
-    callbacks.model_save.save_frequency=50 \
+    "++algo.config.save_interval=${SAVE_INTERVAL}" \
+    "callbacks.model_save.save_frequency=${SAVE_INTERVAL}" \
+    "${LR_OVERRIDES[@]}" \
     manager_env.config.terrain_motion_dir="${BUNDLE}" \
     manager_env.config.flat_usd_path="${BUNDLE}/flat_placeholder.usd" \
     '++manager_env.config.flat_to_terrain_ratio=0' \

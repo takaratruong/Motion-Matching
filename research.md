@@ -1323,13 +1323,12 @@ the partial directory was preserved with suffix
 `failed_driver_lock_16529858`.  L40 job `16532692` then failed before Isaac
 launch because its assigned `move4` GPU could not initialize CUDA; that partial
 directory is preserved with suffix `failed_cuda_init_16532692`.  The same
-modest 192-environment continuation is pending as Titan RTX job `16532758` on
-explicit node `move2`.  Full-bank evaluation job `16532759` is dependency
-chained with separate output and evaluates
+modest 192-environment continuation was rerun as Titan RTX job `16532758` on
+explicit node `move2`.  Full-bank evaluation job `16532759` used separate
+output and evaluated
 `/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_clean_bank28_v1/bundle_v2`.
-Its result must be checked on all 28 clips to detect forgetting.  The two
-earlier pending v1 jobs were cancelled before allocation, so they consumed no
-GPU time.
+Its result is reported below.  The two earlier pending v1 jobs were cancelled
+before allocation, so they consumed no GPU time.
 
 Dense 25 fps review of the original five-window varied-terrain montage
 confirmed that its apparent teleports occur at hard montage cuts, but also
@@ -1393,14 +1392,65 @@ A balanced replay bundle was built directly from those fair v2 outcomes at
 `/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_clean_bank28_v1/replay44_bundle_v1`.
 It contains all 28 clips once and two additional stable aliases of each of the
 eight failures: 44 clips total, 24 hard instances and 20 retained passes.  All
-44 motion, object-motion, scene-binding, and provenance IDs were checked.  A
-100-iteration continuation from the 20/28 parent is L40S job `16533346`; its
-full 28-clip diagnostic is dependency job `16533347`.  This tests hard-case
-upweighting with explicit anti-forgetting replay rather than another hard-only
-fine-tune.
+44 motion, object-motion, scene-binding, and provenance IDs were checked.  The
+100-iteration continuation, job `16533346`, passes 24/28 in the independent
+full-bank diagnostic `16533347`, with median peak MPJPE 164.7 mm and maximum
+1395.8 mm.  It retains every one of the parent's twenty passes and fixes five
+of the eight parent failures.  Balanced anti-forgetting replay is therefore a
+real improvement over hard-only continuation.
+
+A second bounded replay attempted to focus the remaining four failures while
+keeping all 28 clips.  Two L40 starts (`16533397` and `16533482`) stalled during
+Isaac initialization on the same move4 device and were preserved as
+infrastructure failures.  The healthy Titan retry `16533556` completed, but its
+full-bank diagnostic `16533557` passes only 22/28.  It regresses two stair
+motions and is rejected; the 24/28 replay-44 checkpoint remains the qualified
+core parent.
 
 Bundle preparation now writes `objects.pkl` directly.  Every constant object
 trajectory uses the same per-clip terrain position and quaternion as
 `clips.json`, so SONIC reset state and scene registration share one source of
 truth.  The varied-15 bundle was rebuilt and all fifteen object-motion entries
 were checked against their scene bindings.
+
+The replay-44 parent does not generalize physically to the new terrain bank:
+clean diagnostic `16533876` terminates on all 15 motions within 33--82 policy
+steps.  This is tracker distribution shift, not a kinematic admission result.
+A joint bank therefore keeps the 28 core motions once and the 15 varied motions
+twice (58 replay entries, 43 unique evaluation motions).  Its 100-iteration
+continuation is job `16533939`.  The step-50 full gate, job `16534018`, passes
+35/43: 25/28 core and 10/15 varied, with median peak MPJPE 179.4 mm.  The
+step-100 gate, job `16534019`, passes 36/43: 24/28 core and 12/15 varied, with
+median peak MPJPE 254.1 mm.  Step 50 favors core fidelity; step 100 covers two
+additional varied reversals.  Several surviving reversals still exceed 0.9 m
+peak MPJPE, and three varied motions still terminate at step 100, so neither
+checkpoint is approved for noisy collection.  The saved-state visual audit
+below confirms that these are genuine tracking limitations rather than a
+metric-only false alarm.
+
+The cleaner varied-terrain kinematic showcase excludes the two clip-82 motions
+and the clip-142 stop/restart from its presentation set because their stance-run
+drift exceeds 5 mm, while retaining them as stress tests.  Evidence is
+`artifacts/terrain_maneuver_bank/c490_slope_varied12_v2/varied_reverse6_showcase_grid.mp4`;
+full-length renders are generated separately so short pivot windows cannot hide
+cadence or contact artifacts.
+
+All six full-length clean showcase renders completed as CPU-only job `16533955`
+and are synchronized in
+`artifacts/terrain_maneuver_bank/c490_slope_varied12_v2/varied_reverse6_full_grid.mp4`.
+They cover real registered hill/grade, crest/valley, repeated-bump,
+multi-crest, and sustained-slope geometry.  Dense review confirms that the
+16/4/16 reversal removes the old long mid-stride freeze.  A small supported-foot
+shuffle remains visible on some pivots, so these examples are cleaner rather
+than artifact-free.
+
+The step-100 saved-state physical audit was reconstructed on the exact bundled
+terrain as CPU jobs `16534237` and `16534313`; this avoids spending a GPU merely
+to replay saved states.  The labeled comparison is
+`/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_clean_bank28_v1/tracker_review_core43_replay58_step100_varied6_cpu_v1/varied_physical6_audit_grid.mp4`.
+The three deterministic failures remain upright initially but gradually drift
+or stumble and terminate; they are genuine physical failures, not montage cuts.
+The reviewed survivors complete their stop/reversal without teleporting or a
+long freeze, although occasional stance-foot shuffle and large path error remain.
+This confirms useful varied-terrain coverage but does not clear either replay-58
+checkpoint for noisy collection.
