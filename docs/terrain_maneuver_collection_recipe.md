@@ -223,6 +223,19 @@ environments and separately evaluates iterations 50, 100, 200, 300, and 400.
 Select the checkpoint by deterministic all-motion survival plus peak MPJPE and
 visual review, not by training reward alone.
 
+The corrected run selects iteration 400: 157/200 motions survive and 120/200
+also stay at or below 300 mm peak MPJPE.  Stop/restart is already strong
+(94/100 strict passes), while reversal is the remaining specialist problem
+(26/100).  The complete labeled physical review is
+`/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/selected200_step400_physical_review8_v1/step400_physical_review8_grid.mp4`.
+
+For collection, do not replay the entire 200-motion bundle through iteration
+400.  Use `selected120_step400_qualified_bundle_v1`, which contains only that
+checkpoint's strict passes.  Train and gate a reversal-only tracker separately,
+then pool its admitted noisy rollouts with the universal tracker's admitted
+rollouts.  SONIC is an offline data generator here, so family routing is
+preferable to admitting falls from a nominally universal checkpoint.
+
 ## Per-clip record
 
 Store the clean kinematics and the causal information needed downstream:
@@ -250,5 +263,8 @@ joystick target.
 5. Collect noised SONIC rollouts, retaining failures only as diagnostics.
 6. Render depth/height observations and package the diffusion-policy dataset.
 
-Do not start the 200-clip noisy collection from the current tracker: the two-clip
-probe demonstrates that it would merely collect failures.
+Never start noised collection from training completion alone.  First create a
+checkpoint-specific qualified bundle from the deterministic full-survival and
+300 mm gate, visually inspect representative passes and failures, and collect
+only from that bundle.  Keep failed noisy attempts as diagnostics rather than
+training examples.

@@ -1543,3 +1543,34 @@ and is not a candidate checkpoint.  Equal-weight job `16542899` uses exactly
 `terrain_release` tracker.  Checkpoints at 50, 100, 200, 300, and 400 iterations
 receive separate deterministic all-200 gates; no noised rollout or depth job is
 released merely because training completed.
+
+All five deterministic gates are complete.  A pass requires both full-clip
+survival and peak MPJPE at most 300 mm.  The checkpoint progression is:
+
+| iteration | survived | strict passes | median MPJPE | p90 MPJPE |
+| ---: | ---: | ---: | ---: | ---: |
+| 50 | 116/200 | 94/200 | 227.0 mm | 485.4 mm |
+| 100 | 126/200 | 105/200 | 192.7 mm | 523.8 mm |
+| 200 | 150/200 | 116/200 | 199.7 mm | 501.6 mm |
+| 300 | 148/200 | 115/200 | 214.6 mm | 490.4 mm |
+| 400 | 157/200 | **120/200** | **185.4 mm** | **485.5 mm** |
+
+Iteration 400 is the best single universal checkpoint.  Its strict passes are
+48/50 ascent stops, 46/50 descent stops, 7/50 ascent reversals, and 19/50
+descent reversals.  The union over all five checkpoints reaches 137/200, but
+the residual failures remain concentrated in reversal rather than ordinary
+stair locomotion.  This supports routing offline collection by maneuver family
+instead of forcing one tracker to cover incompatible events.
+
+The labeled physical audit is
+`/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/selected200_step400_physical_review8_v1/step400_physical_review8_grid.mp4`.
+It shows one representative strict pass and one representative rejection for
+each ascent/descent x stop/reversal cell.  The accepted examples remain
+grounded and complete the commanded event; the rejected examples terminate
+early or retain excessive pose error, rather than hiding a terrain teleport.
+
+The 120 iteration-400 strict passes have been repackaged as
+`selected120_step400_qualified_bundle_v1`.  A separate equal-weight 100-motion
+reversal bundle is being fine-tuned from iteration 200, because further
+universal training already showed diminishing returns on the hard ascent
+reversals.  No rejected motion is included in the queued noised pilot.
