@@ -12,6 +12,7 @@ from mm_sonic.build_terrain_maneuver_pilots import _direct_terrain_transform
 from mm_sonic.prepare_terrain_maneuver_sonic_bundle import (
     _accepted_manifest_selections,
     _clip_stem,
+    _copy_physics_ready_terrain,
 )
 from mm_sonic.terrain_maneuver_composer import (
     HOLD,
@@ -45,6 +46,30 @@ def _motion(frame_count: int = 160) -> StitchedMotion:
 
 
 class TerrainManeuverComposerTests(unittest.TestCase):
+    def test_physics_ready_binary_usd_crate_is_copied(self) -> None:
+        try:
+            from pxr import Usd, UsdGeom, UsdPhysics
+        except ImportError:
+            self.skipTest("USD Python bindings are unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "terrain.usd"
+            destination = root / "copy.usd"
+            stage = Usd.Stage.CreateNew(str(source))
+            model = UsdGeom.Xform.Define(stage, "/model").GetPrim()
+            stage.SetDefaultPrim(model)
+            UsdPhysics.RigidBodyAPI.Apply(model)
+            mesh = UsdGeom.Mesh.Define(stage, "/model/mesh").GetPrim()
+            UsdPhysics.CollisionAPI.Apply(mesh)
+            stage.Save()
+
+            self.assertTrue(source.read_bytes().startswith(b"PXR-USDC"))
+            self.assertEqual(
+                _copy_physics_ready_terrain(source, destination),
+                "source_physics",
+            )
+            self.assertEqual(destination.read_bytes(), source.read_bytes())
+
     def test_bundle_stem_distinguishes_nested_pilot_directories(self) -> None:
         first = Path("bank/clip_076/pilots/manifest.json")
         second = Path("bank/clip_083/pilots/manifest.json")

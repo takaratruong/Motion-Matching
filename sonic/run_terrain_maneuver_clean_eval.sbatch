@@ -22,6 +22,7 @@ TRAIN_OUTPUT=${TERRAIN_MANEUVER_TRAIN_OUTPUT:-${RUN_ROOT}/sonic_finetune_v1}
 CHECKPOINT=${TERRAIN_MANEUVER_EVAL_CHECKPOINT:-${RUN_ROOT}/sonic_finetune_v1_eval_checkpoint}
 OUTPUT=${TERRAIN_MANEUVER_EVAL_OUTPUT:-${RUN_ROOT}/clean_eval_v1}
 DATASET_NAME=${TERRAIN_MANEUVER_EVAL_DATASET_NAME:-terrain_maneuver_bank28_finetune_clean_diagnostic}
+NUM_ENVS=${TERRAIN_MANEUVER_EVAL_NUM_ENVS:-28}
 
 if [[ ! -r "${BUNDLE}/motion_lib_merged.pkl" || ! -r "${BUNDLE}/objects.pkl" ]]; then
     echo "missing terrain maneuver bundle" >&2
@@ -66,7 +67,7 @@ python -u -m sonic_port.collect.collect_sonic_multiclip \
     --motion_file "${BUNDLE}/motion_lib_merged.pkl" \
     --out_dir "${OUTPUT}" \
     --per_clip 1 \
-    --num_envs 28 \
+    --num_envs "${NUM_ENVS}" \
     --max_rounds 1 \
     --episode_length_s 20 \
     --clean_collect \

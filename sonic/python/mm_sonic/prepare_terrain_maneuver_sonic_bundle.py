@@ -23,6 +23,24 @@ from .offline_corpus import JOINT_NAMES
 _BARE_MESH_DECLARATION = 'def Mesh "Terrain"\n{'
 
 
+def _usd_crate_has_physics(path: Path) -> bool | None:
+    """Inspect a binary USD crate when the optional USD bindings exist."""
+
+    try:
+        from pxr import Usd, UsdPhysics
+    except ImportError:
+        return None
+    stage = Usd.Stage.Open(str(path), load=Usd.Stage.LoadNone)
+    if stage is None:
+        raise ValueError(f"failed to open USD crate: {path}")
+    has_rigid_body = False
+    has_collision = False
+    for prim in stage.Traverse():
+        has_rigid_body = has_rigid_body or bool(UsdPhysics.RigidBodyAPI(prim))
+        has_collision = has_collision or bool(UsdPhysics.CollisionAPI(prim))
+    return has_rigid_body and has_collision
+
+
 def _copy_physics_ready_terrain(source: Path, destination: Path) -> str:
     """Copy a terrain, adding static collision schemas to our bare USDA meshes.
 
@@ -33,9 +51,16 @@ def _copy_physics_ready_terrain(source: Path, destination: Path) -> str:
     the same mesh is enough for the collector's kinematic rigid-object wrapper.
     """
     payload = source.read_bytes()
-    if payload.startswith(b"PXR-USDC") and b"PhysicsRigidBody" in payload:
+    if payload.startswith(b"PXR-USDC"):
+        physics_ready = _usd_crate_has_physics(source)
+        if physics_ready is False:
+            raise ValueError(f"binary USD terrain lacks physics schemas: {source}")
         destination.write_bytes(payload)
-        return "source_physics"
+        return (
+            "source_physics"
+            if physics_ready is True
+            else "source_usd_crate_uninspected"
+        )
     if b"PhysicsRigidBody" in payload and b"PhysicsCollision" in payload:
         destination.write_bytes(payload)
         return "source_physics"

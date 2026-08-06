@@ -113,6 +113,12 @@ foot penetration, 11.003 mm stance-run drift, and 0.127 rad joint step at
 pose or cut at the pivot.  Keep this bank separate until the current tracker
 gate establishes that the smaller v2 bank remains physically trackable.
 
+Binary USD crates must be inspected as USD stages; searching their compressed
+bytes for physics schema names produces false negatives.  Bundle preparation
+now verifies rigid-body and collision APIs when USD bindings are available.
+The fifteen accepted varied-terrain motions are kept in a separate bundle and
+receive their own clean physical gate before any training or noised collection.
+
 ## Scale-up strata
 
 Target 200 clips only after a small clean fine-tune proves trackability.  A

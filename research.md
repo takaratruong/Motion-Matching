@@ -1363,3 +1363,15 @@ mid-stride freeze.  This expansion remains a clean kinematic candidate bank,
 not tracker-training data, until the current 28-clip physical gate finishes.
 Evidence: `artifacts/terrain_maneuver_bank/c490_slope_varied12_v2`,
 `terrain_profiles.png`, and `varied_reverse7_grid.mp4`.
+
+The fifteen accepted motions are packaged separately at
+`/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_clean_bank28_v1/varied15_bundle_v1`.
+The first packaging attempt exposed a false negative in the binary-USD physics
+check: compressed USD crates do not reliably expose schema names as raw byte
+strings.  The copier now inspects crate stages with USD bindings when
+available, confirms both rigid-body and collision APIs, and leaves the source
+asset unchanged.  All fifteen bundled terrains were inspected as
+`source_physics`; the interrupted partial is preserved with suffix
+`failed_usdc_detection`.  A 15-environment clean physical diagnostic is job
+`16533077`, chained after the v2 all-28 gate so it consumes no extra concurrent
+GPU lane and cannot run against an unqualified checkpoint.
