@@ -1,4 +1,4 @@
-"""Build exact-grounded stop/reversal pilots from C490 terrain clips.
+"""Build exact-grounded stop/reversal pilots from registered terrain clips.
 
 Each task first exports and exact-mesh-audits one clean archive clip on its own
 terrain.  A bounded vertical clearance repair is allowed when the source is a
@@ -34,6 +34,7 @@ def build_clip(
     reverse_ramp_frames: int | None = None,
     reverse_hold_frames: int | None = None,
     pivot_speed_mps: float = 0.20,
+    allowed_families: tuple[str, ...] = ("c490_slope",),
 ) -> dict[str, object]:
     """Materialize, qualify, and compose one registered archive clip."""
 
@@ -45,8 +46,13 @@ def build_clip(
     count = len(archive["clip_names"])
     if not 0 <= index < count:
         raise ValueError(f"clip index {index} is outside [0, {count})")
-    if str(archive["clip_family"][index]) != "c490_slope":
-        raise ValueError(f"clip {index} is not a C490 slope")
+    clip_family = str(archive["clip_family"][index])
+    if clip_family not in set(allowed_families):
+        expected = ", ".join(allowed_families)
+        raise ValueError(
+            f"clip {index} has family {clip_family!r}; expected one of: "
+            f"{expected}"
+        )
 
     clip_name = str(archive["clip_names"][index])
     clip_root = output_root / f"clip_{index:03d}_{clip_name}"
@@ -60,10 +66,14 @@ def build_clip(
         repair_clearance=True,
     )
     result: dict[str, object] = {
-        "schema": "c490-terrain-maneuver-bank-clip/v1",
+        "schema": (
+            "c490-terrain-maneuver-bank-clip/v1"
+            if clip_family == "c490_slope"
+            else "registered-terrain-maneuver-bank-clip/v1"
+        ),
         "clip_index": index,
         "clip_name": clip_name,
-        "clip_family": str(archive["clip_family"][index]),
+        "clip_family": clip_family,
         "clip_traversal": str(archive["clip_traversal"][index]),
         "root_delta_z_m": float(archive["root_delta_z_m"][index]),
         "terrain_usd": str(Path(str(archive["terrain_usd_path"][index])).resolve()),
@@ -141,6 +151,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reverse-ramp-frames", type=int)
     parser.add_argument("--reverse-hold-frames", type=int)
     parser.add_argument("--pivot-speed-mps", type=float, default=0.20)
+    parser.add_argument(
+        "--allow-family",
+        action="append",
+        default=[],
+        help=(
+            "archive family accepted by this invocation; repeat for multiple "
+            "families (default: c490_slope)"
+        ),
+    )
     arguments = parser.parse_args(argv)
     result = build_clip(
         archive_path=arguments.archive,
@@ -152,6 +171,7 @@ def main(argv: list[str] | None = None) -> int:
         reverse_ramp_frames=arguments.reverse_ramp_frames,
         reverse_hold_frames=arguments.reverse_hold_frames,
         pivot_speed_mps=arguments.pivot_speed_mps,
+        allowed_families=tuple(arguments.allow_family or ("c490_slope",)),
     )
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result["status"] == "pending_dense_visual_review" else 2

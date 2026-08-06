@@ -321,9 +321,28 @@ def main(argv: list[str] | None = None) -> int:
         default=[],
         help="include every automatically admitted pilot in this manifest",
     )
+    parser.add_argument(
+        "--manifest-root",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "include admitted pilots from every clip_*/pilots/manifest.json "
+            "directly under this generated bank"
+        ),
+    )
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args(argv)
-    expanded = _accepted_manifest_selections(tuple(arguments.manifest))
+    rooted_manifests = tuple(
+        manifest
+        for root in arguments.manifest_root
+        for manifest in sorted(
+            root.expanduser().resolve().glob("clip_*/pilots/manifest.json")
+        )
+    )
+    expanded = _accepted_manifest_selections(
+        (*tuple(arguments.manifest), *rooted_manifests)
+    )
     selections = (
         *tuple(dict.fromkeys((*arguments.pilot, *expanded))),
         *tuple(arguments.repeat_pilot),
