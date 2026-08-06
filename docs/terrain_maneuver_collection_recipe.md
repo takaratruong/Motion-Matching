@@ -156,6 +156,23 @@ Reviewed passes contain no teleport or long freeze, but small stance-foot
 shuffles and large path errors remain, so the noised-collection gate stays
 closed.
 
+One low-rate repair improves coverage without clearing that quality gate.  Its
+64-entry replay bank keeps all 43 unique motions, all varied motions twice, and
+the three remaining varied failures four times.  At 25 iterations it passes
+25/28 core and 13/15 varied (38/43 total), but several reversal survivors still
+have 0.6--1.18 m peak MPJPE.  At 50 iterations varied coverage reaches 14/15
+while core coverage collapses to 21/28, so that checkpoint is rejected.  Keep
+the step-25 model only as the broadest diagnostic tracker; do not use it for
+noised collection until the high-error reversals are fixed.
+
+The required full-length visual gate for that checkpoint is
+`/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_clean_bank28_v1/tracker_review_core43_replay64_step25_varied6_cpu_v1/step25_physical6_audit_grid.mp4`.
+It confirms that the normal stop/reversal survivors have no teleport or long
+hold, although a small supported-foot shuffle remains.  It also shows why a
+binary pass is insufficient: the orange clip-94 rollout stays upright and is
+locally continuous despite reaching 1.181 m peak MPJPE.  Treat high-error
+survivors as failed tracking for collection purposes.
+
 ## Scale-up strata
 
 Target 200 clips only after a small clean fine-tune proves trackability.  A

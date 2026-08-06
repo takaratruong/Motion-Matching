@@ -1454,3 +1454,28 @@ The reviewed survivors complete their stop/reversal without teleporting or a
 long freeze, although occasional stance-foot shuffle and large path error remain.
 This confirms useful varied-terrain coverage but does not clear either replay-58
 checkpoint for noisy collection.
+
+A final bounded repair keeps the same 43 unique motions, retains the second
+copy of every varied motion, and gives the three remaining varied failures four
+total replay copies (64 entries).  It resumes the replay-58 step-100 model at a
+four-times-smaller actor learning rate (`5e-6`) with adaptive bounds
+`1e-6`--`2e-5`.  Healthy Titan job `16534785` completed 50 iterations after an
+unsupported V100 start and a stalled move4 start were isolated without writing
+checkpoints.  The step-25 full gate, job `16534786`, is the best survival result:
+38/43, split 25/28 core and 13/15 varied, with 246.6 mm median and 1180.7 mm
+maximum peak MPJPE.  Continued training is destructive: step-50 job `16534787`
+passes 35/43, split 21/28 core and 14/15 varied.  Step 50 is rejected.  Step 25
+is retained as the broadest diagnostic tracker, but its high-error reversal
+survivors still prevent noisy collection.
+
+The final step-25 physical audit was replayed without another GPU allocation as
+CPU job `16534984`.  Its labeled full-length grid is
+`/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_clean_bank28_v1/tracker_review_core43_replay64_step25_varied6_cpu_v1/step25_physical6_audit_grid.mp4`.
+The ordinary stop and reversal survivors are temporally continuous through the
+pivot, with no teleport or old long hold, but a small supported-foot shuffle is
+still visible.  The orange clip-94 survivor is the key counterexample to using
+binary survival alone: it remains upright and looks locally continuous while
+departing from the reference by 1181 mm.  The three labeled failures likewise
+drift or terminate rather than exhibiting a hidden montage cut.  Visual review
+therefore agrees with the numeric gate: step 25 is useful for diagnosis, not for
+noised data collection.
