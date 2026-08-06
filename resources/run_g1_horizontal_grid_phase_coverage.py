@@ -53,6 +53,61 @@ from resources.run_g1_path_motion_placement import (
 _PHASE_ORDER = {"mount": 0, "interior": 1, "dismount": 2}
 
 
+def _stable_mount_window(
+    window: RawMotionWindow,
+    source_support: np.ndarray,
+    *,
+    maximum_unsupported_run_frames: int = 4,
+    minimum_terminal_double_support_frames: int = 8,
+) -> bool:
+    support = np.asarray(source_support, dtype=np.bool_)
+    if (
+        not isinstance(window, RawMotionWindow)
+        or support.ndim != 2
+        or support.shape[1] != 2
+        or not 0
+        <= window.start_frame
+        < window.stop_frame
+        <= len(support)
+    ):
+        raise ContractError("mount window support inputs are invalid")
+    selected = support[window.start_frame : window.stop_frame]
+    maximum_run = 0
+    current_run = 0
+    for value in ~selected.any(axis=1):
+        current_run = current_run + 1 if value else 0
+        maximum_run = max(maximum_run, current_run)
+    terminal_double_support = 0
+    for value in selected.all(axis=1)[::-1]:
+        if not value:
+            break
+        terminal_double_support += 1
+    return (
+        maximum_run <= maximum_unsupported_run_frames
+        and terminal_double_support >= minimum_terminal_double_support_frames
+    )
+
+
+def _windows_for_phase_kind(
+    windows: tuple[RawMotionWindow, ...],
+    phase_kind: str,
+    source_support: np.ndarray,
+) -> tuple[RawMotionWindow, ...]:
+    if (
+        not isinstance(windows, tuple)
+        or any(not isinstance(window, RawMotionWindow) for window in windows)
+        or phase_kind not in _PHASE_ORDER
+    ):
+        raise ContractError("phase window routing inputs are invalid")
+    if phase_kind != "mount":
+        return windows
+    return tuple(
+        window
+        for window in windows
+        if _stable_mount_window(window, source_support)
+    )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-dataset", type=Path, required=True)
@@ -344,6 +399,9 @@ def _score_windows_for_tasks(
     windows: tuple[RawMotionWindow, ...],
     task_queries: tuple[tuple[PathContactSignature, ...], ...],
     task_lengths: tuple[float, ...],
+    *,
+    task_kinds: tuple[str, ...] | None = None,
+    source_support: np.ndarray | None = None,
 ) -> tuple[tuple[dict[str, object], ...], ...]:
     if (
         not isinstance(windows, tuple)
@@ -351,6 +409,14 @@ def _score_windows_for_tasks(
         or not isinstance(task_queries, tuple)
         or not task_queries
         or len(task_queries) != len(task_lengths)
+        or (
+            task_kinds is not None
+            and (
+                len(task_kinds) != len(task_queries)
+                or any(kind not in _PHASE_ORDER for kind in task_kinds)
+                or source_support is None
+            )
+        )
         or any(
             not isinstance(queries, tuple)
             or not queries
@@ -366,19 +432,34 @@ def _score_windows_for_tasks(
         )
     ):
         raise ContractError("phase scoring inputs are invalid")
-    windows_by_count: dict[int, tuple[RawMotionWindow, ...]] = {}
-    for window in windows:
-        windows_by_count.setdefault(len(window.events), ())
-        windows_by_count[len(window.events)] += (window,)
+    windows_by_kind = {"all": windows}
+    if task_kinds is not None and "mount" in task_kinds:
+        windows_by_kind["mount"] = _windows_for_phase_kind(
+            windows, "mount", source_support
+        )
+    windows_by_count = {}
+    for kind, selected_windows in windows_by_kind.items():
+        grouped: dict[int, tuple[RawMotionWindow, ...]] = {}
+        for window in selected_windows:
+            grouped.setdefault(len(window.events), ())
+            grouped[len(window.events)] += (window,)
+        windows_by_count[kind] = grouped
     output = []
-    for queries, path_length in zip(task_queries, task_lengths):
+    for task_index, (queries, path_length) in enumerate(
+        zip(task_queries, task_lengths)
+    ):
+        kind = (
+            "all"
+            if task_kinds is None or task_kinds[task_index] != "mount"
+            else "mount"
+        )
         by_count: dict[int, tuple[PathContactSignature, ...]] = {}
         for query in queries:
             by_count.setdefault(len(query.foot_order), ())
             by_count[len(query.foot_order)] += (query,)
         rows = []
         for count, compatible in by_count.items():
-            matching_windows = windows_by_count.get(count, ())
+            matching_windows = windows_by_count[kind].get(count, ())
             if not matching_windows:
                 continue
             costs = _batched_signature_costs(
@@ -400,7 +481,7 @@ def _score_windows_for_tasks(
 
 
 def _scan_one(arguments):
-    root_text, descriptor, task_queries, task_lengths = arguments
+    root_text, descriptor, task_queries, task_lengths, task_kinds = arguments
     try:
         profiles = _source_profiles(Path(root_text), descriptor)
         counts = tuple(
@@ -419,7 +500,11 @@ def _scan_one(arguments):
             maximum_events=max(counts),
         )
         return _score_windows_for_tasks(
-            windows, task_queries, task_lengths
+            windows,
+            task_queries,
+            task_lengths,
+            task_kinds=task_kinds,
+            source_support=profiles["support"],
         )
     except (ContractError, KeyError, OSError, ValueError):
         return tuple(() for _ in task_queries)
@@ -509,6 +594,7 @@ def main() -> int:
     task_lengths = tuple(
         float(phase.stop_m - phase.start_m) for _, phase in tasks
     )
+    task_kinds = tuple(phase.kind for _, phase in tasks)
     descriptors = [
         descriptor
         for descriptor in manifest["clips"]
@@ -517,7 +603,7 @@ def main() -> int:
     ]
     descriptors.sort(key=lambda item: item["logical_name"])
     jobs = (
-        (str(root), descriptor, task_queries, task_lengths)
+        (str(root), descriptor, task_queries, task_lengths, task_kinds)
         for descriptor in descriptors
     )
     pools: list[list[dict[str, object]]] = [[] for _ in tasks]

@@ -14,10 +14,27 @@ from resources.run_g1_horizontal_grid_phase_coverage import (
     _classify_lane_phases,
     _ordered_phase_records,
     _phase_queries,
+    _stable_mount_window,
+    _windows_for_phase_kind,
 )
 
 
 class RunG1HorizontalGridPhaseCoverageTests(unittest.TestCase):
+    @staticmethod
+    def window(frames=40):
+        return RawMotionWindow(
+            source_clip="clip",
+            start_frame=10,
+            stop_frame=10 + frames,
+            events=(
+                RawContactEvent(10, 0, (0.0, 0.1), 0.0),
+                RawContactEvent(30, 1, (0.3, -0.1), 0.2),
+            ),
+            root_start_world_xy=(0.0, 0.0),
+            forward_progress_m=0.5,
+            heading_error_rad=0.0,
+        )
+
     @staticmethod
     def phase(height=0.3):
         return TerrainPathPhase(
@@ -151,6 +168,54 @@ class RunG1HorizontalGridPhaseCoverageTests(unittest.TestCase):
         ])
 
         np.testing.assert_allclose(actual, expected, atol=1.0e-12)
+
+    def test_mount_window_rejects_long_unsupported_run(self):
+        support = np.ones((60, 2), dtype=np.bool_)
+        support[18:38] = False
+
+        self.assertFalse(_stable_mount_window(self.window(), support))
+
+    def test_mount_window_rejects_single_support_ending(self):
+        support = np.ones((60, 2), dtype=np.bool_)
+        support[42:50, 0] = False
+
+        self.assertFalse(_stable_mount_window(self.window(), support))
+
+    def test_mount_window_accepts_brief_flight_and_stable_landing(self):
+        support = np.ones((60, 2), dtype=np.bool_)
+        support[25] = False
+
+        self.assertTrue(_stable_mount_window(self.window(), support))
+
+    def test_only_mount_tasks_filter_unstable_windows(self):
+        stable = self.window(20)
+        unstable = RawMotionWindow(
+            source_clip="clip",
+            start_frame=30,
+            stop_frame=50,
+            events=(
+                RawContactEvent(30, 0, (0.0, 0.1), 0.0),
+                RawContactEvent(45, 1, (0.3, -0.1), 0.2),
+            ),
+            root_start_world_xy=(0.0, 0.0),
+            forward_progress_m=0.5,
+            heading_error_rad=0.0,
+        )
+        support = np.ones((60, 2), dtype=np.bool_)
+        support[42:50, 0] = False
+
+        self.assertEqual(
+            _windows_for_phase_kind(
+                (stable, unstable), "mount", support
+            ),
+            (stable,),
+        )
+        self.assertEqual(
+            _windows_for_phase_kind(
+                (stable, unstable), "interior", support
+            ),
+            (stable, unstable),
+        )
 
 
 if __name__ == "__main__":
