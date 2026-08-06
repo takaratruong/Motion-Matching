@@ -89,6 +89,9 @@ teleports, but freezing a mid-stride support pose for 30 frames is visibly
 unnatural.  Reversal candidates now use a shorter 16/4/16-frame timing and the
 seven varied-terrain sources still pass the exact gates.  Natural sustained
 stops should come from real start/stop motion, not a long frozen walking pose.
+The full v2 bundle preserves all 28 v1 clip IDs, replacing only the seven
+scaled source pairs.  Full-bank evaluation can therefore compare each clip
+directly and detect both improvement and forgetting.
 
 A CPU-only scale-up script tested twelve additional C490 clips stratified across
 grade and round-trip structure.  Seven source clips produced fourteen admitted

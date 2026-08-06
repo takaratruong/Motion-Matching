@@ -1312,18 +1312,24 @@ downhill reversal, and the target-76 and target-136 reversals.  Median peak
 MPJPE across all diagnostic episodes is 219.0 mm; diagnostic failures are
 retained for review and remain barred from training data.
 
-A nine-clip hard-example bundle was materialized from those exact failures at
-`/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_clean_bank28_v1/hard9_bundle_v1`.
+A nine-clip hard-example bundle was materialized from those exact failures.
+The current v2 copy is
+`/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_clean_bank28_v1/hard9_bundle_v2`;
+it replaces the target-76 and target-136 reversals with their shorter versions
+while preserving all nine clip IDs.
 The first continuation attempt was aborted before initialization when the
 evaluation process wedged the NVIDIA driver during Isaac shutdown on `move3`;
 the partial directory was preserved with suffix
 `failed_driver_lock_16529858`.  L40 job `16532692` then failed before Isaac
 launch because its assigned `move4` GPU could not initialize CUDA; that partial
 directory is preserved with suffix `failed_cuda_init_16532692`.  The same
-modest 192-environment continuation is pending as Titan RTX job `16532739` on
-explicit node `move2`.  Full-bank evaluation job `16532753` is dependency
-chained with separate output.  Its result must be checked on all 28 clips to
-detect forgetting.
+modest 192-environment continuation is pending as Titan RTX job `16532758` on
+explicit node `move2`.  Full-bank evaluation job `16532759` is dependency
+chained with separate output and evaluates
+`/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_clean_bank28_v1/bundle_v2`.
+Its result must be checked on all 28 clips to detect forgetting.  The two
+earlier pending v1 jobs were cancelled before allocation, so they consumed no
+GPU time.
 
 Dense 25 fps review of the original five-window varied-terrain montage
 confirmed that its apparent teleports occur at hard montage cuts, but also
@@ -1337,3 +1343,8 @@ stance-run drift is 2.941 mm and maximum 50 Hz joint step is 0.123 rad.  Four
 dense synchronized renders show continuous foot lock without the long frozen
 pose.  Evidence: `artifacts/terrain_maneuver_bank/c490_slope_quick7_v2` and
 `quick_reverse4_grid.mp4`.
+
+The full v2 bundle contains all 28 candidates and keeps the same clip IDs as
+v1.  Only the seven newly scaled source pairs use the revised transition
+timing.  This makes the chained full-bank evaluation a per-clip physical A/B
+comparison rather than a differently sampled benchmark.
