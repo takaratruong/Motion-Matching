@@ -1142,3 +1142,83 @@ root-height teleport.  Evidence:
 `artifacts/generic_terrain/interactive_probes/stairs_up_jit080_lane_flat_mb_v2`
 and
 `artifacts/generic_terrain/interactive_probes/ramp_down_jit_lane_flat_mb_v2`.
+
+### Verified command invalidation and grounded backward-facing portals (2026-08-05)
+
+The interactive failure in which a backward command worked but a subsequent
+forward command kept following the old track was reproduced headlessly.  The
+official MotionBricks agent deliberately retains a generated future for about
+half a second before replanning, so an abrupt joystick reversal could continue
+playing the retreat trajectory.  The shared headless/browser runtime now
+compares the operator command with the command that actually generated the
+live buffer.  Stop/start, large direction or speed changes, and large facing
+changes invalidate that future; small joystick jitter does not.  A forced
+replan is conditioned on the last four poses that were actually published and
+accepted by the exact terrain checks, and the four decoded conditioning poses
+are consumed rather than replayed.  This prevents both stale-track playback
+and a four-frame rewind.
+
+The no-match safety probe deliberately faces the G1 ninety degrees away from
+every compatible portal, holds 36 commands into the obstacle, retreats, and
+then reverses forward.  The corrected runtime blocks all 36 unsafe commands,
+accepts zero portals, retreats 1.0146 m, and then advances 0.9059 m after the
+reversal.  It records zero flat-support recoveries, zero foot/body penetration,
+5.58 mm maximum nearest-sole clearance, 0.208 rad maximum 50 Hz joint step,
+2.22 cm maximum root step, and 0.027 rad maximum root angular step.  A 48-frame
+whole-video sheet and dense 25 fps windows around both command changes show a
+continuous gait with no rewind, freeze, or flight.  Evidence:
+`artifacts/generic_terrain/interactive_probes/no_match_retreat_v3_command_invalidation`
+and the exact no-render acceptance replay
+`artifacts/generic_terrain/interactive_probes/no_match_retreat_v4_command_invalidation`.
+
+Course-exit contact transfer is now an atomic safety phase.  The selected
+phase-matched future plays until the anchored support foot has transferred to
+the landing; the newest joystick command is then replanned from verified
+post-handoff poses.  The two-leg IK uses its hard per-joint temporal constraint
+instead of merely checking the result afterward.  This retains the 0.22 rad
+30 Hz handoff bound without loosening it.
+
+The final five-event replay captures all five portals and the terminal
+waypoint over 48.06 s / 24.43 m.  It has zero terrain-guard blocks, zero flat
+support violations or recoveries, 2.779 mm maximum complete-foot penetration,
+zero forbidden-body penetration, 4.97 cm maximum / 1.79 cm p95 nearest-sole
+clearance, and 0.230 rad maximum 50 Hz joint step.  All five support handoffs
+release; their maximum step is 0.219999 rad and maximum sole-target residual is
+5.64 mm.  Route deviation is 6.65 cm RMS / 17.58 cm p95.  The whole 48-frame
+route sheet, dense terrain windows, the long course-2 handoff window, and the
+largest entry-blend window were reviewed without a visible teleport, freeze,
+or body/foot-through-terrain event.  Evidence:
+`artifacts/generic_terrain/interactive_probes/backward_facing_full_v13_bounded_atomic_handoff`.
+The current source tree is replayed without rendering at
+`artifacts/generic_terrain/interactive_probes/backward_facing_full_v15_final_code`.
+
+Opposite-direction portal synthesis is now complete without admitting the
+unsupported source approaches.  Two old entry-only source courses were
+collision-free but hovered by 16--26 cm over their global approach lanes.
+Their terrain traversals and landing phases were still useful: a genuine
+phase-matched MotionBricks exit was generated at each grounded endpoint, the
+complete motion was time-reversed, and only the grounded near-seam landing
+tail was retained.  One generated flat exit required the same exact-support
+root projection used by the live runtime (12.8 mm maximum) before reversal.
+The final five-course complementary bundle has grounded endpoints on every
+course and no support-clearance threshold exceedance.  Evidence:
+`artifacts/generic_terrain/waypoint_routes/mixed_gauntlet_reverse_backward_facing_complete_v2`.
+
+Its independent 48.63 s / 24.46 m replay captures all five portals and the
+terminal waypoint.  It records zero terrain-guard blocks, zero flat-support
+violations or recoveries, 4.088 mm maximum foot penetration, zero forbidden
+body penetration, 4.969 cm maximum / 1.771 cm p95 nearest-sole clearance, and
+0.240 rad maximum 50 Hz joint step.  All five exit handoffs release within the
+0.22 rad hard handoff bound; path deviation is 6.87 cm RMS / 17.73 cm p95.
+The full video plus dense windows around both repaired courses, the maximum
+joint-step frame, and the maximum-clearance handoff show no visible rewind,
+freeze, teleport, or flight.  Evidence:
+`artifacts/generic_terrain/interactive_probes/backward_facing_complement_full_v1`.
+
+A direct slope direction-reversal regression traverses one direction, changes
+direction at the landing, and traverses back.  It captures both portals,
+reaches the final waypoint, has zero guard blocks and support recoveries,
+2.116 mm maximum foot penetration, 2.471 cm maximum support clearance, and no
+repeated-pose run.  The dense reversal window is visually continuous.
+Evidence:
+`artifacts/generic_terrain/interactive_probes/slope_direction_reversal_roundtrip_v1`.

@@ -153,8 +153,8 @@ class MotionBricksTerrainCourse:
 
     def travel_direction_world_xy(self, frame_index: int = 0) -> np.ndarray:
         frame = int(frame_index)
-        if frame < 0 or frame >= self.seam_indices[0]:
-            raise ValueError("portal entry frame must precede the terrain seam")
+        if frame < 0 or frame > self.seam_indices[0]:
+            raise ValueError("portal entry frame must not follow the terrain seam")
         direction = (
             self.root_position_world[-1, :2]
             - self.root_position_world[frame, :2]
@@ -192,8 +192,8 @@ class MotionBricksTerrainCourse:
         if qpos.shape != (36,) or velocity.shape != (2,):
             raise ValueError("portal capture expects qpos[36] and velocity[2]")
         frame = int(frame_index)
-        if frame < 0 or frame >= self.seam_indices[0]:
-            raise ValueError("portal capture frame must precede the terrain seam")
+        if frame < 0 or frame > self.seam_indices[0]:
+            raise ValueError("portal capture frame must not follow the terrain seam")
         position_error = float(
             np.linalg.norm(qpos[:2] - self.root_position_world[frame, :2])
         )
@@ -311,6 +311,55 @@ def select_terrain_portal(
     return PortalSelection(index, capture, score, entry_frame)
 
 
+def select_terrain_seam_portal(
+    courses: tuple[MotionBricksTerrainCourse, ...],
+    current_qpos: object,
+    requested_velocity_world_xy: object,
+    *,
+    maximum_position_error_m: float = 0.05,
+    maximum_yaw_error_rad: float = math.radians(12.0),
+    maximum_lower_body_rmse_rad: float = 0.45,
+) -> PortalSelection | None:
+    """Capture a paired reverse traversal directly at a landing boundary.
+
+    A complete forward traversal ends at exactly the first terrain frame of
+    its time-reversed counterpart.  Requiring the ordinary 0.8 s approach in
+    that case would make the operator walk farther onto the landing before
+    being allowed to back down.  This tight gate permits the exact endpoint
+    handoff while rejecting ordinary poses that are not on the landing.  Gait
+    phase is deliberately looser than root position/yaw because the residual
+    is paid back over the first 0.36 s of terrain playback.
+    """
+
+    ranked: list[tuple[float, int, PortalCapture, int]] = []
+    for index, course in enumerate(courses):
+        seam = int(course.seam_indices[0])
+        capture = course.portal_capture(
+            current_qpos,
+            requested_velocity_world_xy,
+            maximum_position_error_m=maximum_position_error_m,
+            maximum_yaw_error_rad=maximum_yaw_error_rad,
+            minimum_travel_alignment=0.45,
+            maximum_lower_body_rmse_rad=maximum_lower_body_rmse_rad,
+            frame_index=seam,
+        )
+        if not capture.accepted:
+            continue
+        score = float(
+            capture.position_error_m / maximum_position_error_m
+            + capture.yaw_error_rad / maximum_yaw_error_rad
+            + capture.lower_body_rmse_rad / maximum_lower_body_rmse_rad
+            + max(0.0, 0.45 - capture.travel_alignment) / 0.45
+        )
+        ranked.append((score, index, capture, seam))
+    if not ranked:
+        return None
+    score, index, capture, seam = min(
+        ranked, key=lambda value: (value[0], value[1])
+    )
+    return PortalSelection(index, capture, score, seam)
+
+
 class TerrainCoursePlayback:
     """One committed course traversal with a short flat-entry residual blend."""
 
@@ -321,18 +370,26 @@ class TerrainCoursePlayback:
         *,
         blend_frames: int = 18,
         start_frame: int = 0,
+        allow_terrain_seam_start: bool = False,
     ) -> None:
         current = np.asarray(current_qpos, dtype=np.float64)
         if current.shape != (36,) or not np.isfinite(current).all():
             raise ValueError("course playback needs one finite qpos[36]")
         first = int(start_frame)
-        if first < 0 or first >= course.seam_indices[0]:
-            raise ValueError("course playback must start before the terrain seam")
-        if (
-            blend_frames < 2
-            or blend_frames >= course.seam_indices[0] - first
+        seam = int(course.seam_indices[0])
+        if first < 0 or first > seam or (
+            first == seam and not bool(allow_terrain_seam_start)
         ):
+            raise ValueError(
+                "course playback must start before the terrain seam unless "
+                "tight landing re-entry is enabled"
+            )
+        if blend_frames < 2:
+            raise ValueError("course entry blend must contain at least two frames")
+        if first < seam and blend_frames >= seam - first:
             raise ValueError("course entry blend must finish before the stair seam")
+        if first == seam and blend_frames >= course.frame_count - first:
+            raise ValueError("terrain-seam blend exceeds the remaining course")
         self.course = course
         self.course_qpos = course.native_mujoco_qpos()
         self.start_qpos = current.copy()

@@ -9,6 +9,7 @@ is committed only while crossing a non-flat event.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import math
 from pathlib import Path
@@ -23,8 +24,18 @@ from .generate_motionbricks_terrain_transitions import _load_demo
 from .gear_action import mujoco_to_isaaclab_joint_vector
 from .motionbricks_global_terrain_viewer import (
     DEFAULT_MOTIONBRICKS_ROOT,
+    EXIT_FOOT_LOCK_MAXIMUM_JOINT_STEP_RAD,
+    EXIT_FOOT_LOCK_MAXIMUM_TARGET_ERROR_M,
+    FLAT_SUPPORT_TOLERANCE_M,
+    LANDING_SEAM_BLEND_CLEARANCE_M,
+    MAXIMUM_SUPPORT_FOOT_CLEARANCE_M,
+    MotionBricksCommandBufferInvalidator,
+    MotionBricksExitFootLock,
+    _flat_pose_support_error,
     _guard_flat_velocity,
+    _per_foot_minimum_sole_clearance_m,
     _project_live_root_above_support,
+    _submit_responsive_motionbricks,
     _submit_motionbricks,
     _submit_phase_matched_course_exit,
     _terrain_surface_height,
@@ -34,9 +45,13 @@ from .motionbricks_terrain_portal import (
     TerrainCoursePlayback,
     _slerp_wxyz,
     _yaw_wxyz,
+    select_terrain_seam_portal,
 )
 from .render_stitched_motion import render_stitched_motion
 from .terrain_oracle.reference_stitch import _G1FootfallAdapter
+from .terrain_oracle.stair_motion_collision_audit import (
+    audit_stair_motion_collisions,
+)
 from .terrain_oracle.stitch import FrameProvenance, StitchedMotion
 
 
@@ -109,6 +124,15 @@ def _point_to_polyline_distance(points: np.ndarray, line: np.ndarray) -> np.ndar
     alpha = np.clip(alpha, 0.0, 1.0)
     closest = starts[None] + alpha[:, :, None] * vectors[None]
     return np.min(np.linalg.norm(points[:, None] - closest, axis=2), axis=1)
+
+
+def _longest_true_run(values: object) -> int:
+    longest = 0
+    current = 0
+    for value in np.asarray(values, dtype=np.bool_):
+        current = current + 1 if bool(value) else 0
+        longest = max(longest, current)
+    return int(longest)
 
 
 def _resample_qpos(
@@ -235,18 +259,32 @@ def rollout(
     model_path: Path = DEFAULT_G1_MJCF,
     seed: int = 17,
     maximum_ticks: int = 2400,
+    inter_course_dwell_s: float = 0.0,
+    prefer_landing_seam_reentry: bool = False,
+    course_indices: tuple[int, ...] | None = None,
     render: bool = True,
 ) -> dict[str, object]:
     manifest_path = portal_manifest.expanduser().resolve()
     manifest = json.loads(manifest_path.read_text())
     if manifest.get("status") != "accepted":
         raise ValueError("portal manifest must be accepted")
-    courses = tuple(
+    all_courses = tuple(
         MotionBricksTerrainCourse.load(Path(value))
         for value in manifest["course_motions"]
     )
-    if not courses:
+    if not all_courses:
         raise ValueError("portal manifest has no courses")
+    if course_indices is None:
+        course_labels = tuple(range(len(all_courses)))
+    else:
+        course_labels = tuple(int(value) for value in course_indices)
+        if (
+            not course_labels
+            or len(set(course_labels)) != len(course_labels)
+            or any(value < 0 or value >= len(all_courses) for value in course_labels)
+        ):
+            raise ValueError("course indices must be unique in-range values")
+    courses = tuple(all_courses[value] for value in course_labels)
     destination = output_dir.expanduser().resolve()
     destination.mkdir(parents=True, exist_ok=True)
     terrain = load_target_mesh(
@@ -264,6 +302,20 @@ def rollout(
         model_path,
         tuple(str(value) for value in archive["joint_names"][:]),
         maximum_joint_correction_rad=0.1,
+    )
+    exit_foot_lock_adapter = _G1FootfallAdapter(
+        model_path,
+        tuple(str(value) for value in archive["joint_names"][:]),
+        maximum_joint_correction_rad=1.6,
+        target_tolerance_m=5.0e-4,
+        maximum_iterations=96,
+        damping=0.008,
+    )
+    exit_foot_lock = MotionBricksExitFootLock(
+        sole_adapter=sole_adapter,
+        ik_adapter=exit_foot_lock_adapter,
+        terrain=terrain,
+        ray_origin_z=ray_origin_z,
     )
 
     root = motionbricks_root.expanduser().resolve()
@@ -319,16 +371,52 @@ def rollout(
     modes = ["flat"]
     requested = [desired_velocity.copy()]
     clearance_lifts = [initial_clearance_lift]
+    flat_support_errors = [
+        _flat_pose_support_error(
+            current,
+            sole_adapter=sole_adapter,
+            terrain=terrain,
+            ray_origin_z=ray_origin_z,
+            support_height_world=flat_support_height,
+        )
+    ]
+    flat_support_rejected_errors = [0.0]
+    exit_foot_lock_active = [False]
+    exit_foot_lock_raw_clearances = [0.0]
+    exit_foot_lock_corrected_clearances = [0.0]
+    exit_foot_lock_joint_corrections = [0.0]
+    exit_foot_lock_target_errors = [0.0]
+    exit_foot_lock_joint_steps = [0.0]
+    exit_foot_lock_trigger_count = 0
+    exit_foot_lock_release_count = 0
+    safe_flat_history: deque[np.ndarray] = deque((current.copy(),), maxlen=4)
+    command_buffer = MotionBricksCommandBufferInvalidator()
+    command_buffer.observe_generated(
+        velocity_world_xy=desired_velocity,
+        facing_yaw_world=desired_facing,
+        mode_name="idle",
+    )
+    command_buffer_invalidations: list[tuple[str, ...]] = []
+    flat_support_recovery_count = 0
     pending = 0
     playback: TerrainCoursePlayback | None = None
     active_course: MotionBricksTerrainCourse | None = None
     capture_rows: list[dict[str, object]] = []
     exit_phase_rows: list[dict[str, object]] = []
     blocked_count = 0
+    dwell_ticks_remaining = 0
     completed = False
 
     for tick in range(int(maximum_ticks)):
         clearance_lift = 0.0
+        flat_support_error = 0.0
+        flat_support_rejected_error = 0.0
+        handoff_active = False
+        handoff_raw_clearance = 0.0
+        handoff_corrected_clearance = 0.0
+        handoff_joint_correction = 0.0
+        handoff_target_error = 0.0
+        handoff_joint_step = 0.0
         flat_target, terminal_direction = _next_flat_target(
             courses, pending, final_xy
         )
@@ -338,9 +426,30 @@ def rollout(
             delta / distance if distance > 1.0e-6 else terminal_direction
         )
         target_speed = min(0.58, max(0.04, 0.90 * distance))
-        if pending >= len(courses) and distance < 0.10:
+        seam_reentry_ready = False
+        if pending < len(courses) and bool(prefer_landing_seam_reentry):
+            seam = courses[pending].seam_indices[0]
+            seam_reentry_ready = bool(
+                np.linalg.norm(
+                    current[:2] - courses[pending].root_position_world[seam, :2]
+                )
+                <= 0.08
+            )
+        if dwell_ticks_remaining > 0:
             target_speed = 0.0
-        if pending < len(courses) and distance < 0.12:
+            target_velocity = np.zeros(2, dtype=np.float64)
+        elif seam_reentry_ready:
+            target_speed = 0.18
+            target_velocity = (
+                target_speed
+                * courses[pending].travel_direction_world_xy(
+                    courses[pending].seam_indices[0]
+                )
+            )
+        elif pending >= len(courses) and distance < 0.10:
+            target_speed = 0.0
+            target_velocity = np.zeros(2, dtype=np.float64)
+        elif pending < len(courses) and distance < 0.12:
             # After centring on a portal, emulate the operator nudging the
             # stick through it.  Feedback-to-the-point alone changes sign at
             # zero error and can never satisfy a forward-alignment gate.
@@ -351,6 +460,9 @@ def rollout(
             desired_velocity, target_velocity, maximum_delta=1.15 / 30.0
         )
         target_yaw = (
+            desired_facing
+            if dwell_ticks_remaining > 0 or seam_reentry_ready
+            else
             courses[pending].start_yaw_world
             if pending < len(courses)
             else math.atan2(float(target_direction[1]), float(target_direction[0]))
@@ -360,14 +472,45 @@ def rollout(
         )
         desired_facing = _wrap(desired_facing)
 
-        if playback is None and pending < len(courses):
-            capture = courses[pending].portal_capture(current, desired_velocity)
+        if (
+            playback is None
+            and pending < len(courses)
+            and dwell_ticks_remaining == 0
+        ):
+            seam_selection = (
+                select_terrain_seam_portal(
+                    (courses[pending],), current, desired_velocity
+                )
+                if bool(prefer_landing_seam_reentry)
+                else None
+            )
+            entry_frame = 0
+            entry_kind = "flat_lead"
+            blend_frames = 18
+            if seam_selection is not None:
+                capture = seam_selection.capture
+                entry_frame = seam_selection.entry_frame_index
+                entry_kind = "landing_seam"
+                blend_frames = 18
+            else:
+                capture = courses[pending].portal_capture(
+                    current, desired_velocity
+                )
             if capture.accepted:
+                exit_foot_lock.reset()
                 active_course = courses[pending]
-                playback = TerrainCoursePlayback(active_course, current, blend_frames=18)
+                playback = TerrainCoursePlayback(
+                    active_course,
+                    current,
+                    blend_frames=blend_frames,
+                    start_frame=entry_frame,
+                    allow_terrain_seam_start=(entry_kind == "landing_seam"),
+                )
                 capture_rows.append(
                     {
-                        "course_index": pending,
+                        "course_index": course_labels[pending],
+                        "entry_kind": entry_kind,
+                        "entry_frame_index": entry_frame,
                         "tick": tick,
                         "time_s": timestamps[-1],
                         "position_error_m": capture.position_error_m,
@@ -389,15 +532,32 @@ def rollout(
                     sole_adapter=sole_adapter,
                     terrain=terrain,
                     ray_origin_z=ray_origin_z,
+                    sole_clearance_m=(
+                        LANDING_SEAM_BLEND_CLEARANCE_M
+                        if playback.start_frame
+                        == playback.course.seam_indices[0]
+                        else 0.003
+                    ),
                 )
             dt = 1.0 / active_course.fps
-            mode = f"course_{pending}"
+            mode = f"course_{course_labels[pending]}"
             if playback.done:
                 finished_course_index = pending
                 pending += 1
-                next_velocity, next_facing, next_mode = _course_exit_command(
-                    active_course
-                )
+                if (
+                    pending < len(courses)
+                    and float(inter_course_dwell_s) > 0.0
+                ):
+                    next_velocity = np.zeros(2, dtype=np.float64)
+                    next_facing = _yaw_wxyz(current[3:7])
+                    next_mode = "idle"
+                    dwell_ticks_remaining = max(
+                        1, int(round(float(inter_course_dwell_s) * 30.0))
+                    )
+                else:
+                    next_velocity, next_facing, next_mode = _course_exit_command(
+                        active_course
+                    )
                 context = active_course.resampled_context_qpos(
                     at_end=True, target_fps=30.0, frame_count=4
                 )
@@ -414,10 +574,17 @@ def rollout(
                     support_height_world=flat_support_height,
                 )
                 flat_phase_seed = int(phase_result["selected"]["seed"])
+                command_buffer.observe_generated(
+                    velocity_world_xy=next_velocity,
+                    facing_yaw_world=next_facing,
+                    mode_name=next_mode,
+                )
+                lock_receipt = exit_foot_lock.arm(current)
                 exit_phase_rows.append(
                     {
-                        "course_index": finished_course_index,
+                        "course_index": course_labels[finished_course_index],
                         "support_height_world_m": flat_support_height,
+                        "exit_foot_lock": lock_receipt,
                         **phase_result,
                     }
                 )
@@ -425,6 +592,8 @@ def rollout(
                 desired_facing = next_facing
                 playback = None
                 active_course = None
+                safe_flat_history.clear()
+                safe_flat_history.append(current.copy())
         else:
             guarded, blocked = _guard_flat_velocity(
                 terrain,
@@ -435,32 +604,128 @@ def rollout(
             blocked_count += int(blocked)
             speed = float(np.linalg.norm(guarded))
             mode_name = "idle" if speed < 0.06 else ("slow_walk" if speed < 0.38 else "walk")
-            _submit_motionbricks(
-                full_agent,
-                controller,
-                context_qpos=full_agent.get_context_mujoco_qpos(),
-                velocity_world_xy=guarded,
-                facing_yaw_world=desired_facing,
-                mode_name=mode_name,
-                force=False,
-                random_seed=flat_phase_seed,
-                support_height_world=flat_support_height,
-            )
-            current, clearance_lift = _project_live_root_above_support(
+            # Preserve the selected exit gait until its anchored support foot
+            # has transferred fully onto the landing.  The latest guidance is
+            # applied immediately after release from verified handoff poses.
+            if not exit_foot_lock.armed:
+                submission = _submit_responsive_motionbricks(
+                    full_agent,
+                    controller,
+                    command_buffer=command_buffer,
+                    verified_history=safe_flat_history,
+                    velocity_world_xy=guarded,
+                    facing_yaw_world=desired_facing,
+                    mode_name=mode_name,
+                    random_seed=flat_phase_seed,
+                    support_height_world=flat_support_height,
+                )
+                if submission.invalidated:
+                    command_buffer_invalidations.append(
+                        submission.invalidation_reasons
+                    )
+            proposed, clearance_lift = _project_live_root_above_support(
                 np.asarray(full_agent.get_next_frame(), dtype=np.float64),
                 sole_adapter=sole_adapter,
                 terrain=terrain,
                 ray_origin_z=ray_origin_z,
                 support_height_world=flat_support_height,
             )
+            handoff = exit_foot_lock.apply(proposed)
+            proposed = handoff.qpos
+            handoff_active = bool(
+                handoff.active or handoff.joint_correction_rad > 1.0e-10
+            )
+            if handoff_active:
+                handoff_raw_clearance = handoff.raw_minimum_clearance_m
+                handoff_corrected_clearance = (
+                    handoff.corrected_minimum_clearance_m
+                )
+                handoff_joint_correction = handoff.joint_correction_rad
+                handoff_target_error = handoff.foot_target_error_m
+                handoff_joint_step = handoff.maximum_joint_step_rad
+            exit_foot_lock_trigger_count += int(handoff.triggered)
+            exit_foot_lock_release_count += int(handoff.released)
+            proposed_support_error = (
+                0.0
+                if handoff.active
+                else _flat_pose_support_error(
+                    proposed,
+                    sole_adapter=sole_adapter,
+                    terrain=terrain,
+                    ray_origin_z=ray_origin_z,
+                    support_height_world=flat_support_height,
+                )
+            )
+            if proposed_support_error > FLAT_SUPPORT_TOLERANCE_M:
+                # Match the interactive runtime: never publish a flat frame
+                # that has wandered onto a ramp, curb, or stair without a
+                # compatible portal.  Hold the last verified pose and re-seed
+                # MotionBricks there so the operator can still back away.
+                flat_support_rejected_error = proposed_support_error
+                flat_support_recovery_count += 1
+                exit_foot_lock.reset()
+                context = np.stack(tuple(safe_flat_history))
+                if len(context) < 4:
+                    context = np.concatenate(
+                        (
+                            np.repeat(context[:1], 4 - len(context), axis=0),
+                            context,
+                        ),
+                        axis=0,
+                    )
+                current = context[-1].copy()
+                _submit_motionbricks(
+                    full_agent,
+                    controller,
+                    context_qpos=context,
+                    velocity_world_xy=np.zeros(2, dtype=np.float64),
+                    facing_yaw_world=_yaw_wxyz(current[3:7]),
+                    mode_name="idle",
+                    force=True,
+                    random_seed=flat_phase_seed,
+                    support_height_world=flat_support_height,
+                )
+                for _ in range(len(context)):
+                    full_agent.get_next_frame()
+                command_buffer.observe_generated(
+                    velocity_world_xy=np.zeros(2, dtype=np.float64),
+                    facing_yaw_world=_yaw_wxyz(current[3:7]),
+                    mode_name="idle",
+                )
+                clearance_lift = 0.0
+                flat_support_error = _flat_pose_support_error(
+                    current,
+                    sole_adapter=sole_adapter,
+                    terrain=terrain,
+                    ray_origin_z=ray_origin_z,
+                    support_height_world=flat_support_height,
+                )
+            else:
+                current = proposed
+                flat_support_error = proposed_support_error
+                safe_flat_history.append(current.copy())
             dt = 1.0 / 30.0
             mode = "flat"
+            if dwell_ticks_remaining > 0:
+                dwell_ticks_remaining -= 1
 
         timestamps.append(timestamps[-1] + dt)
         qposes.append(current.copy())
         modes.append(mode)
         requested.append(desired_velocity.copy())
         clearance_lifts.append(clearance_lift)
+        flat_support_errors.append(flat_support_error)
+        flat_support_rejected_errors.append(flat_support_rejected_error)
+        exit_foot_lock_active.append(handoff_active)
+        exit_foot_lock_raw_clearances.append(handoff_raw_clearance)
+        exit_foot_lock_corrected_clearances.append(
+            handoff_corrected_clearance
+        )
+        exit_foot_lock_joint_corrections.append(
+            handoff_joint_correction
+        )
+        exit_foot_lock_target_errors.append(handoff_target_error)
+        exit_foot_lock_joint_steps.append(handoff_joint_step)
         if pending >= len(courses) and float(np.linalg.norm(final_xy - current[:2])) < 0.10:
             completed = True
             break
@@ -471,6 +736,49 @@ def rollout(
     motion = _motion_from_qpos(resampled, fps=50.0)
     motion_path = destination / "motion.npz"
     _save_motion(motion_path, motion)
+    collision_audit = audit_stair_motion_collisions(
+        motion,
+        archive_path=C490_ARCHIVE,
+        target_clip_index=None,
+        target_mesh=terrain,
+        model_path=model_path,
+        maximum_foot_penetration_m=0.005,
+        maximum_forbidden_body_penetration_m=1.0e-6,
+    )
+    per_foot_clearances = np.asarray(
+        [
+            _per_foot_minimum_sole_clearance_m(
+                qpos,
+                sole_adapter=sole_adapter,
+                terrain=terrain,
+                ray_origin_z=ray_origin_z,
+            )
+            for qpos in resampled
+        ],
+        dtype=np.float64,
+    )
+    support_foot_clearances = np.min(per_foot_clearances, axis=1)
+    support_hover_indices = np.flatnonzero(
+        support_foot_clearances > MAXIMUM_SUPPORT_FOOT_CLEARANCE_M
+    )
+    joint_steps = np.max(np.abs(np.diff(resampled[:, 7:], axis=0)), axis=1)
+    root_steps = np.linalg.norm(np.diff(resampled[:, :3], axis=0), axis=1)
+    quaternion_dots = np.abs(
+        np.sum(resampled[:-1, 3:7] * resampled[1:, 3:7], axis=1)
+    )
+    quaternion_dots = np.clip(quaternion_dots, 0.0, 1.0)
+    root_angular_steps = 2.0 * np.arccos(quaternion_dots)
+    repeated_pose = (root_steps < 1.0e-6) & (joint_steps < 1.0e-6)
+    maximum_joint_step = float(np.max(joint_steps))
+    maximum_root_step = float(np.max(root_steps))
+    maximum_root_angular_step = float(np.max(root_angular_steps))
+    longest_repeated_pose_run = _longest_true_run(repeated_pose)
+    continuity_accepted = bool(
+        maximum_joint_step <= 0.25
+        and maximum_root_step <= 0.08
+        and maximum_root_angular_step <= 0.20
+        and longest_repeated_pose_run <= 6
+    )
     planned_parts = [start_xy[None]]
     for course in courses:
         if not np.allclose(planned_parts[-1][-1], course.root_position_world[0, :2]):
@@ -492,8 +800,33 @@ def rollout(
         terrain_root_clearance_lift_m=np.asarray(
             clearance_lifts, dtype=np.float32
         ),
+        flat_support_error_m=np.asarray(
+            flat_support_errors, dtype=np.float32
+        ),
+        flat_support_rejected_error_m=np.asarray(
+            flat_support_rejected_errors, dtype=np.float32
+        ),
+        exit_foot_lock_active=np.asarray(exit_foot_lock_active, dtype=np.bool_),
+        exit_foot_lock_raw_clearance_m=np.asarray(
+            exit_foot_lock_raw_clearances, dtype=np.float32
+        ),
+        exit_foot_lock_corrected_clearance_m=np.asarray(
+            exit_foot_lock_corrected_clearances, dtype=np.float32
+        ),
+        exit_foot_lock_joint_correction_rad=np.asarray(
+            exit_foot_lock_joint_corrections, dtype=np.float32
+        ),
+        exit_foot_lock_target_error_m=np.asarray(
+            exit_foot_lock_target_errors, dtype=np.float32
+        ),
+        exit_foot_lock_joint_step_rad=np.asarray(
+            exit_foot_lock_joint_steps, dtype=np.float32
+        ),
         mode=np.asarray(modes, dtype=np.str_),
         resampled_timestamp_s=np.asarray(time_array, dtype=np.float32),
+        minimum_sole_clearance_m=np.asarray(
+            support_foot_clearances, dtype=np.float32
+        ),
         intended_polyline_xy=np.asarray(intended, dtype=np.float32),
     )
     video_path = destination / "rollout_25fps.mp4"
@@ -509,11 +842,31 @@ def rollout(
             height=360,
             frame_stride=2,
         )
+    flat_support_violation_count = int(
+        np.sum(
+            np.asarray(flat_support_errors, dtype=np.float64)
+            > FLAT_SUPPORT_TOLERANCE_M
+        )
+    )
     summary = {
         "schema": "motionbricks-global-terrain-rollout/v1",
-        "status": "accepted" if completed and pending == len(courses) else "incomplete",
+        "status": (
+            "accepted"
+            if completed
+            and pending == len(courses)
+            and flat_support_violation_count == 0
+            and collision_audit.accepted
+            and len(support_hover_indices) == 0
+            and continuity_accepted
+            and not exit_foot_lock.armed
+            and exit_foot_lock_release_count == len(exit_phase_rows)
+            else "incomplete"
+        ),
         "portal_manifest": str(manifest_path),
         "seed": int(seed),
+        "inter_course_dwell_s": float(inter_course_dwell_s),
+        "prefer_landing_seam_reentry": bool(prefer_landing_seam_reentry),
+        "course_indices": list(course_labels),
         "completed_all_courses": pending == len(courses),
         "reached_final_waypoint": completed,
         "portal_capture_count": len(capture_rows),
@@ -522,12 +875,92 @@ def rollout(
         "flat_frame_count": int(sum(value == "flat" for value in modes)),
         "course_frame_count": int(sum(value != "flat" for value in modes)),
         "terrain_guard_blocked_frame_count": int(blocked_count),
+        "command_buffer_invalidation_count": len(
+            command_buffer_invalidations
+        ),
+        "command_buffer_invalidation_reasons": [
+            list(value) for value in command_buffer_invalidations
+        ],
         "terrain_root_clearance_lift_maximum_m": float(
             np.max(clearance_lifts)
         ),
         "terrain_root_clearance_lift_p95_m": float(
             np.percentile(clearance_lifts, 95.0)
         ),
+        "flat_support_error_maximum_m": float(
+            np.max(flat_support_errors)
+        ),
+        "flat_support_violation_frame_count": flat_support_violation_count,
+        "flat_support_tolerance_m": FLAT_SUPPORT_TOLERANCE_M,
+        "flat_support_recovery_count": int(flat_support_recovery_count),
+        "flat_support_rejected_error_maximum_m": float(
+            np.max(flat_support_rejected_errors)
+        ),
+        "course_exit_support_handoff": {
+            "trigger_count": int(exit_foot_lock_trigger_count),
+            "release_count": int(exit_foot_lock_release_count),
+            "active_frame_count": int(np.sum(exit_foot_lock_active)),
+            "maximum_raw_clearance_m": float(
+                np.max(exit_foot_lock_raw_clearances)
+            ),
+            "maximum_corrected_clearance_m": float(
+                np.max(exit_foot_lock_corrected_clearances)
+            ),
+            "maximum_joint_correction_rad": float(
+                np.max(exit_foot_lock_joint_corrections)
+            ),
+            "maximum_target_error_m": float(
+                np.max(exit_foot_lock_target_errors)
+            ),
+            "maximum_joint_step_rad": float(
+                np.max(exit_foot_lock_joint_steps)
+            ),
+            "joint_step_threshold_rad": (
+                EXIT_FOOT_LOCK_MAXIMUM_JOINT_STEP_RAD
+            ),
+            "target_error_threshold_m": (
+                EXIT_FOOT_LOCK_MAXIMUM_TARGET_ERROR_M
+            ),
+        },
+        "support_foot_clearance": {
+            "accepted": len(support_hover_indices) == 0,
+            "maximum_m": float(np.max(support_foot_clearances)),
+            "p95_m": float(np.percentile(support_foot_clearances, 95.0)),
+            "threshold_m": MAXIMUM_SUPPORT_FOOT_CLEARANCE_M,
+            "threshold_exceedance_frame_indices": support_hover_indices.tolist(),
+            "per_foot_minimum_m": [
+                float(np.min(per_foot_clearances[:, 0])),
+                float(np.min(per_foot_clearances[:, 1])),
+            ],
+        },
+        "kinematic_continuity": {
+            "accepted": continuity_accepted,
+            "maximum_joint_step_rad": maximum_joint_step,
+            "maximum_joint_step_threshold_rad": 0.25,
+            "maximum_root_translation_step_m": maximum_root_step,
+            "maximum_root_translation_step_threshold_m": 0.08,
+            "maximum_root_angular_step_rad": maximum_root_angular_step,
+            "maximum_root_angular_step_threshold_rad": 0.20,
+            "longest_exact_repeated_pose_run_frames": (
+                longest_repeated_pose_run
+            ),
+            "maximum_repeated_pose_run_frames": 6,
+        },
+        "full_body_collision_audit": {
+            "accepted": bool(collision_audit.accepted),
+            "maximum_foot_penetration_m": float(
+                collision_audit.maximum_foot_penetration_m
+            ),
+            "maximum_forbidden_body_penetration_m": float(
+                collision_audit.maximum_forbidden_body_penetration_m
+            ),
+            "foot_threshold_exceedance_frame_indices": list(
+                collision_audit.foot_threshold_exceedance_frame_indices
+            ),
+            "forbidden_body_threshold_exceedance_frame_indices": list(
+                collision_audit.forbidden_body_threshold_exceedance_frame_indices
+            ),
+        },
         "duration_s": float(timestamps[-1]),
         "root_path_length_m": float(np.sum(np.linalg.norm(np.diff(actual, axis=0), axis=1))),
         "planned_route_length_m": float(
@@ -558,6 +991,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model-path", type=Path, default=DEFAULT_G1_MJCF)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--maximum-ticks", type=int, default=2400)
+    parser.add_argument("--inter-course-dwell-s", type=float, default=0.0)
+    parser.add_argument("--prefer-landing-seam-reentry", action="store_true")
+    parser.add_argument("--course-index", type=int, action="append")
     parser.add_argument("--no-render", action="store_true")
     arguments = parser.parse_args(argv)
     result = rollout(
@@ -567,6 +1003,13 @@ def main(argv: list[str] | None = None) -> int:
         model_path=arguments.model_path,
         seed=arguments.seed,
         maximum_ticks=arguments.maximum_ticks,
+        inter_course_dwell_s=arguments.inter_course_dwell_s,
+        prefer_landing_seam_reentry=arguments.prefer_landing_seam_reentry,
+        course_indices=(
+            None
+            if arguments.course_index is None
+            else tuple(arguments.course_index)
+        ),
         render=not arguments.no_render,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
