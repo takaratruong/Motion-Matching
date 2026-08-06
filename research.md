@@ -1296,6 +1296,27 @@ requests.  A one-rollout-per-clip clean diagnostic is chained as job
 `16532493`; it retains failed episodes only so all 28 physical outcomes can be
 measured and rendered, and its output is explicitly excluded from training.
 Eight stratified third-person reviews (two stair courses, two registered
-downhill sources, and four distinct rough/hill/slope profiles) are chained as
-array job `16532504` with at most two A5000 tasks active.  No noisy collection
-is scheduled before those clean results are audited.
+downhill sources, and four distinct rough/hill/slope profiles) were initially
+chained as array job `16532504` with at most two A5000 tasks active.  That array
+was cancelled before it started after the `move3` driver wedge; the review will
+be resubmitted on L40 after the hard-example result.  No noisy collection is
+scheduled before those clean results are audited.
+
+The 400-iteration fine-tune completed successfully in 20m37s and wrote
+`model_step_000400.pt` plus `last.pt`.  Its final randomized training timeout
+rate was 90.47%, but the deterministic frame-zero gate is materially harder:
+19/28 clips completed and 9/28 terminated.  Twelve of the fourteen newly
+scaled C490 rough/hill/slope pilots completed.  The failures are all four old
+stair pilots, both old composed-slope pilots, the registered target-118
+downhill reversal, and the target-76 and target-136 reversals.  Median peak
+MPJPE across all diagnostic episodes is 219.0 mm; diagnostic failures are
+retained for review and remain barred from training data.
+
+A nine-clip hard-example bundle was materialized from those exact failures at
+`/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_clean_bank28_v1/hard9_bundle_v1`.
+The first continuation attempt was aborted before initialization when the
+evaluation process wedged the NVIDIA driver during Isaac shutdown on `move3`;
+the partial directory was preserved with suffix
+`failed_driver_lock_16529858`.  Job `16532692` requests an L40 on
+`humanoid,move`, excluding the affected A5000 node by GRES type.  Its result
+must be re-evaluated on the complete 28-clip bank to detect forgetting.

@@ -76,6 +76,13 @@ for review but cannot enter the training corpus.  A stratified visual set spans
 both stair courses, the two clean registered downhill sources, and four of the
 rough/hill/slope profiles.  No noisy collection is chained after this gate.
 
+The first deterministic physical gate completed 19/28 clips.  In particular,
+12/14 newly scaled rough/hill/slope clips survived, while all four older stair
+pilots and both older composed-slope pilots failed.  Three reversal clips also
+failed.  This is useful trackability evidence but not a collection pass.  The
+next tracker branch upweights those nine exact failures, then must re-run all
+28 clips so success cannot be purchased by forgetting the current passes.
+
 A CPU-only scale-up script tested twelve additional C490 clips stratified across
 grade and round-trip structure.  Seven source clips produced fourteen admitted
 pilots; three had no trustworthy supported pivot and two failed the source
