@@ -125,6 +125,27 @@ class MotionBricksHillConditionerTest(unittest.TestCase):
         )
         self.assertFalse(conditioner.is_installed)
 
+    def test_uses_the_spring_current_context_frame_as_height_datum(self) -> None:
+        agent = _FakeAgent()
+        conditioner = MotionBricksHillConditioner(lambda xy: float(xy[0]))
+        conditioner.install(agent)
+        inputs = _inputs(
+            target_root_positions=torch.tensor(
+                [[[0.0, 0.0, 0.0, 0.0], [3.0, 3.0, 3.0, 3.0]]],
+                dtype=torch.float32,
+            )
+        )
+        inputs["raw_context_mujoco_qpos"][0, 0, :2] = torch.tensor((1.0, 0.0))
+        inputs["raw_context_mujoco_qpos"][0, -1, :2] = torch.tensor((2.0, 0.0))
+
+        _, _, roots = agent._generate_target_joint_transforms(inputs)
+
+        np.testing.assert_allclose(
+            roots[0, :, 1].numpy(),
+            np.asarray((0.80, 0.84, 0.79, 0.82)) + 2.0,
+            atol=1.0e-6,
+        )
+
     def test_rejects_unexpected_batch_shape(self) -> None:
         agent = _FakeAgent()
         conditioner = MotionBricksHillConditioner(lambda xy: 0.0)

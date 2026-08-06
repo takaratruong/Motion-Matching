@@ -277,7 +277,7 @@ def _step_agent(
         control_info=control_info,
     )
     support_height = profile.height(
-        context[0, -1, :2].detach().cpu().numpy()
+        context[0, 0, :2].detach().cpu().numpy()
     )
     normalized_context = context.detach().clone()
     normalized_context[..., 2] -= support_height

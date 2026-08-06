@@ -213,7 +213,8 @@ class MotionBricksHillConditioner:
         )
         if target_frames == 1 and output_frames > 1:
             target_world = np.repeat(target_world, output_frames, axis=0)
-        current_world = np.asarray(raw_context[0, -1, :2], dtype=np.float64)
+        # The pinned spring model uses context frame zero for curr_root_pos.
+        current_world = np.asarray(raw_context[0, 0, :2], dtype=np.float64)
         height_deltas = terrain_height_deltas(
             current_world, target_world, self._height_query
         )
