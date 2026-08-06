@@ -1222,3 +1222,80 @@ reaches the final waypoint, has zero guard blocks and support recoveries,
 repeated-pose run.  The dense reversal window is visually continuous.
 Evidence:
 `artifacts/generic_terrain/interactive_probes/slope_direction_reversal_roundtrip_v1`.
+
+### Terrain-maneuver artifact audit and registered slope scale-up (2026-08-05)
+
+The visible hover, foot glide, and cadence hitches in the first maneuver video
+are treated as failures.  In particular, procedurally moving only the root of a
+flat walk over `rolling_bumps`, `smooth_hill`, or `cross_slope_bumps` is not a
+valid terrain adaptation.  The strict audit measures 13.99--30.33 mm p95 and
+34.26--47.54 mm maximum intended-stance hover on those candidates.  They remain
+quarantined until a support-aware leg/contact solve or genuine grounded source
+motion passes the same admission gates.
+
+A separate concrete bug was found in the prior varied-slope evidence.  C490
+slope motions are expressed against the archive's approximately -90 degree
+terrain yaw, but `slope_varied_up99_mid_v1` and
+`slope_varied_down147_mid_v1` loaded the correct USD at identity.  The mesh then
+extended along +X while the root travelled along -Y.  Those renders and the
+associated SONIC slope probe are invalidated.  Direct-source construction now
+looks up the exact terrain position and quaternion by USD path in the clean
+archive, and a regression test covers the non-identity transform.
+
+Four source motions were rebuilt against their correctly registered, distinct
+meshes: target 88 uphill, target 99 uphill, target 118 downhill, and target 147
+downhill.  Their eight stop/restart and reversal variants all pass the exact
+complete-G1 collision, planted-foot drift, double-support hold, and mechanics
+gates.  Maximum foot penetration is 4.447 mm, maximum accepted stance-run drift
+is 5.743 mm, and forbidden-body penetration is zero.  Full-rate 50 Hz windows
+around every hold boundary show no terrain teleport or new foot penetration.
+The two uphill stop poses are visibly wide and are retained only as robustness
+data; the downhill pairs and uphill reversals are the cleaner visual examples.
+Evidence:
+`artifacts/terrain_maneuver_pilot/slope_registered_up88_v1`,
+`artifacts/terrain_maneuver_pilot/slope_registered_up99_v2`,
+`artifacts/terrain_maneuver_pilot/slope_registered_down118_v2`, and
+`artifacts/terrain_maneuver_pilot/slope_registered_down147_v2`.
+
+The CPU-only twelve-source C490 scale-up completed as job `16532200`.  Seven
+sources produced fourteen automatically admitted pilots; three had no central
+supported pivot and two failed source mechanics, so they emitted no motion.
+The admitted set has 4.918 mm maximum foot penetration, 3.590 mm maximum
+stance-run drift, 0.141 rad maximum 50 Hz joint step, and zero forbidden-body
+collision.  Dense 50 Hz review of all fourteen hold boundaries shows continuous
+motion without the earlier terrain-relative hover or mesh mismatch.  Four
+source profiles have a pivot-foot separation below 40 cm and supply eight
+cleaner examples; three harder profiles supply six wide-support robustness
+examples.  Registered terrain profiles span shallow roughness, a double hill,
+crest/valley and plateau traversals, a single mound, and a sustained 46 cm
+grade.  Evidence:
+`artifacts/terrain_maneuver_bank/c490_slope_stratified12_v1` and its
+`terrain_profiles.png` overview.
+
+The current exact-grounded pilot set therefore contains twenty-eight
+mechanically admitted candidates across two stair courses and twelve real
+slope/hill geometries.  The valid stair SONIC probe still diverges, so noisy
+rollout collection remains blocked on a clean-bank fine-tune; the old
+misregistered slope tracker conclusion is intentionally not reused.
+
+The twenty-eight pilots are packaged without rematching at
+`/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_clean_bank28_v1/bundle`.
+The bundle has 28 unique motion IDs, 14 unique source manifests, 22 clips with
+the non-identity C490 terrain rotation, and a static object-motion file carrying
+the same per-clip poses into SONIC observations and physics.  The first launch
+correctly stopped on duplicate nested-manifest clip names; clip IDs now include
+the source directory and a regression test covers that collision.
+
+A five-iteration A5000 fine-tune smoke test completed as job `16532442` in 57
+seconds.  It discovered all 28 terrains, instantiated 32 exact-terrain
+environments, resumed the `terrain_release` checkpoint at step 20,000, completed
+training, and wrote `model_step_000005.pt`.  Peak host RSS was 2.8 GB.  The
+follow-up clean-bank run is job `16532461`, deliberately using one A5000, two
+CPUs, 12 GB host RAM, and 384 environments rather than the inherited 64--96 GB
+requests.  A one-rollout-per-clip clean diagnostic is chained as job
+`16532493`; it retains failed episodes only so all 28 physical outcomes can be
+measured and rendered, and its output is explicitly excluded from training.
+Eight stratified third-person reviews (two stair courses, two registered
+downhill sources, and four distinct rough/hill/slope profiles) are chained as
+array job `16532504` with at most two A5000 tasks active.  No noisy collection
+is scheduled before those clean results are audited.

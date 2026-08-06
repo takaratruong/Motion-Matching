@@ -128,12 +128,16 @@ def render_stitched_motion(
     # The robot XML carries its own flat ground plane.  When an explicit
     # terrain mesh is rendered at z=0 the coplanar surfaces z-fight, producing
     # the rapidly changing floor pattern seen in the interactive viewer.
+    # Keeping the plane invisible fixed that pattern but made the flat context
+    # outside finite ramp meshes look like flight.  Lower the render-only plane
+    # by one centimetre instead: it remains visible outside the terrain asset,
+    # cannot z-fight with the exact mesh, and stays collision-disabled.
     for ground_name in ("ground", "floor"):
         ground_id = mujoco.mj_name2id(
             model, mujoco.mjtObj.mjOBJ_GEOM, ground_name
         )
         if ground_id >= 0:
-            model.geom_rgba[ground_id, 3] = 0.0
+            model.geom_pos[ground_id, 2] -= 0.01
             model.geom_contype[ground_id] = 0
             model.geom_conaffinity[ground_id] = 0
     data = mujoco.MjData(model)
