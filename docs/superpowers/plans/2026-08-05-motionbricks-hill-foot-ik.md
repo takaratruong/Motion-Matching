@@ -461,6 +461,9 @@ self._data.qpos[addresses] = np.clip(
 
 After both feet solve, clamp correction against raw joints to `±0.35 rad`,
 then clamp its change against the last accepted correction to `±0.06 rad`.
+If that rate-bounded correction would cross a native joint limit because the
+new raw pose moved, clamp directly to the safe joint interval and mark the
+limit-forced reset so it does not cause a repeated transactional fallback.
 Forward the bounded pose once more and calculate target residual and terrain
 penetration from sole-sphere bottoms.
 
@@ -479,7 +482,8 @@ penetration from sole-sphere bottoms.
   most `0.015 m`;
 - during initial stance acquisition, commit a residual above `0.015 m` only
   when the rate-bounded correction strictly reduces terrain penetration;
-- reject planted sole-centroid drift above `0.04 m`;
+- allow the planted-centroid constraint to keep ramping under the absolute
+  joint-correction bound instead of rejecting slow authored foot drift;
 - commit proposed phases, targets, raw centres, and corrections on acceptance;
 - return raw qpos and diagnostics with `accepted=False` on any exception or
   failed bound.

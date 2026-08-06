@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import redirect_stdout
 from io import StringIO
 import math
+from types import SimpleNamespace
 import unittest
 
 import numpy as np
@@ -102,7 +103,37 @@ class HillViewerCliTest(unittest.TestCase):
         help_text = output.getvalue()
         self.assertIn("--motionbricks-root", help_text)
         self.assertIn("--no-viewer", help_text)
+        self.assertIn("--no-ik", help_text)
         self.assertIn("--smoke-steps", help_text)
+
+    def test_trace_reports_ik_fallback_reason(self) -> None:
+        from mm_sonic.motionbricks_hill_ik import (
+            FootPhase,
+            HillFootIKDiagnostics,
+        )
+        from mm_sonic.motionbricks_hill_viewer import _trace_line
+
+        diagnostics = HillFootIKDiagnostics(
+            phases=(FootPhase.SWING, FootPhase.STANCE),
+            raw_penetration_m=0.02,
+            corrected_penetration_m=0.02,
+            maximum_target_residual_m=0.0,
+            maximum_joint_correction_rad=0.0,
+            iterations=0,
+            accepted=False,
+            reason="terrain sample invalid",
+        )
+
+        line = _trace_line(
+            3,
+            np.asarray((0.0, 0.0, 0.8)),
+            GentleHillProfile(),
+            SimpleNamespace(latest_trace=None),
+            diagnostics,
+        )
+
+        self.assertIn("accepted=0", line)
+        self.assertIn("reason=terrain_sample_invalid", line)
 
 
 if __name__ == "__main__":

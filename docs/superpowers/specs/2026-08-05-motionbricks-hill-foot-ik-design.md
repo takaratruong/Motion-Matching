@@ -90,6 +90,12 @@ For each active stance foot:
 6. Clamp change in IK correction from the prior accepted frame to `0.06 rad`.
 7. Respect native MuJoCo joint limits.
 
+The correction-rate bound yields to a native joint limit when the next raw
+MotionBricks pose makes the prior correction infeasible. In that case the
+correction moves directly toward the joint-safe interval and the forced limit
+move is committed, preventing stale correction history from causing repeated
+raw-pose fallbacks.
+
 For an unlatched swing foot, bias toward its authored joints. If any
 sole sphere would penetrate the terrain or violate `0.015 m` minimum swing
 clearance, solve only the four vertical Jacobian rows toward a common upward
@@ -137,8 +143,7 @@ render raw qpos when:
 - the G1 model lacks the expected sole spheres or leg joints;
 - a joint limit or correction bound would be exceeded;
 - settled stance vertical residual exceeds `0.015 m`, or an acquisition step
-  does not reduce terrain penetration; or
-- planted sole-centroid drift exceeds `0.04 m`.
+  does not reduce terrain penetration.
 
 The first visual prototype does not enable MuJoCo terrain contact dynamics, so
 non-foot collision rejection remains outside this pass.

@@ -117,6 +117,43 @@ def _required_swing_lift(
     return lift
 
 
+def _bounded_leg_correction(
+    *,
+    raw: np.ndarray,
+    desired: np.ndarray,
+    previous: np.ndarray,
+    limits: np.ndarray,
+) -> tuple[np.ndarray, bool]:
+    raw_values = np.asarray(raw, dtype=np.float64)
+    desired_values = np.asarray(desired, dtype=np.float64)
+    previous_values = np.asarray(previous, dtype=np.float64)
+    joint_limits = np.asarray(limits, dtype=np.float64)
+    if (
+        raw_values.shape != desired_values.shape
+        or raw_values.shape != previous_values.shape
+        or joint_limits.shape != (len(raw_values), 2)
+    ):
+        raise ValueError("leg correction arrays have incompatible shapes")
+    desired_values = np.clip(desired_values, -0.35, 0.35)
+    rate_bounded = np.clip(
+        desired_values,
+        previous_values - 0.06,
+        previous_values + 0.06,
+    )
+    limit_bounded = (
+        np.clip(
+            raw_values + rate_bounded,
+            joint_limits[:, 0] + 1.0e-6,
+            joint_limits[:, 1] - 1.0e-6,
+        )
+        - raw_values
+    )
+    limit_forced = bool(
+        np.any(np.abs(limit_bounded - rate_bounded) > 1.0e-12)
+    )
+    return limit_bounded, limit_forced
+
+
 def _descendants(model: object, root_body: int) -> frozenset[int]:
     result: set[int] = set()
     for body_id in range(1, int(model.nbody)):
@@ -496,27 +533,17 @@ class MotionBricksHillFootIK:
                     )
 
             corrections: list[np.ndarray] = []
+            limit_forced: list[bool] = []
             for foot in range(2):
                 addresses = self._leg_qpos[foot]
-                desired = np.clip(
-                    self._data.qpos[addresses] - raw[addresses],
-                    -0.35,
-                    0.35,
-                )
-                bounded = np.clip(
-                    desired,
-                    self._corrections[foot] - 0.06,
-                    self._corrections[foot] + 0.06,
-                )
-                bounded = (
-                    np.clip(
-                        raw[addresses] + bounded,
-                        self._leg_limits[foot][:, 0] + 1.0e-6,
-                        self._leg_limits[foot][:, 1] - 1.0e-6,
-                    )
-                    - raw[addresses]
+                bounded, forced = _bounded_leg_correction(
+                    raw=raw[addresses],
+                    desired=self._data.qpos[addresses] - raw[addresses],
+                    previous=self._corrections[foot],
+                    limits=self._leg_limits[foot],
                 )
                 corrections.append(bounded)
+                limit_forced.append(forced)
 
             candidate = raw.copy()
             for foot in range(2):
@@ -577,40 +604,21 @@ class MotionBricksHillFootIK:
                 for value in corrections
             )
             maximum_change = max(
-                float(
-                    np.max(
-                        np.abs(value - self._corrections[foot])
+                (
+                    float(
+                        np.max(
+                            np.abs(value - self._corrections[foot])
+                        )
                     )
-                )
-                for foot, value in enumerate(corrections)
+                    for foot, value in enumerate(corrections)
+                    if not limit_forced[foot]
+                ),
+                default=0.0,
             )
             if maximum_correction > 0.35 + 1.0e-9:
                 raise ValueError("joint correction exceeded absolute bound")
             if maximum_change > 0.06 + 1.0e-9:
                 raise ValueError("joint correction exceeded frame bound")
-            maximum_stance_centroid_drift = max(
-                (
-                    float(
-                        np.linalg.norm(
-                            np.mean(
-                                proposed_targets[foot][:, :2], axis=0
-                            )
-                            - np.mean(
-                                corrected_centers[foot][:, :2], axis=0
-                            )
-                        )
-                    )
-                    for foot in range(2)
-                    if proposed_targets[foot] is not None
-                ),
-                default=0.0,
-            )
-            if maximum_stance_centroid_drift > 0.04:
-                return self._fallback(
-                    raw,
-                    "stance centroid drift exceeded 0.04 m",
-                    raw_penetration_m=raw_penetration,
-                )
             acquiring_stance = maximum_stance_residual > 0.015
             if (
                 acquiring_stance

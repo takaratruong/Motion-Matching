@@ -16,6 +16,10 @@ import numpy as np
 
 from .motionbricks_hill import GentleHillProfile
 from .motionbricks_hill_conditioning import MotionBricksHillConditioner
+from .motionbricks_hill_ik import (
+    HillFootIKDiagnostics,
+    MotionBricksHillFootIK,
+)
 
 
 DEFAULT_MOTIONBRICKS_ROOT = Path(
@@ -47,6 +51,11 @@ def _parser() -> argparse.ArgumentParser:
         "--no-viewer",
         action="store_true",
         help="run the bounded automatic smoke command without a window",
+    )
+    parser.add_argument(
+        "--no-ik",
+        action="store_true",
+        help="render raw MotionBricks qpos without stance-aware foot IK",
     )
     parser.add_argument("--random-seed", type=int, default=1234)
     parser.add_argument("--mesh-samples", type=int, default=151)
@@ -237,6 +246,7 @@ def _trace_line(
     qpos: np.ndarray,
     profile: GentleHillProfile,
     conditioner: MotionBricksHillConditioner,
+    ik_diagnostics: HillFootIKDiagnostics | None,
 ) -> str:
     terrain_height = profile.height(qpos[:2])
     trace = conditioner.latest_trace
@@ -245,9 +255,24 @@ def _trace_line(
         target_text = ",".join(
             f"{value:.3f}" for value in trace.target_heights_world
         )
+    ik_text = "ik=off"
+    if ik_diagnostics is not None:
+        phases = "/".join(
+            phase.value for phase in ik_diagnostics.phases
+        )
+        ik_text = (
+            f"ik={phases} "
+            f"penetration={ik_diagnostics.raw_penetration_m:.3f}"
+            f"->{ik_diagnostics.corrected_penetration_m:.3f} "
+            f"residual={ik_diagnostics.maximum_target_residual_m:.3f} "
+            f"correction={ik_diagnostics.maximum_joint_correction_rad:.3f} "
+            f"accepted={int(ik_diagnostics.accepted)} "
+            f"reason={ik_diagnostics.reason.replace(' ', '_')}"
+        )
     return (
         f"step={step:05d} root_z={float(qpos[2]):.3f} "
-        f"terrain_z={terrain_height:.3f} target_terrain_z=[{target_text}]"
+        f"terrain_z={terrain_height:.3f} "
+        f"target_terrain_z=[{target_text}] {ik_text}"
     )
 
 
@@ -326,17 +351,29 @@ def _run(arguments: argparse.Namespace) -> int:
         demo.mj_data = data
         conditioner = MotionBricksHillConditioner(profile.height)
         conditioner.install(demo.full_agent)
+        foot_ik = (
+            None
+            if arguments.no_ik
+            else MotionBricksHillFootIK(model, profile.height)
+        )
 
         print(
             "MotionBricks gentle hill: "
             f"max grade {profile.max_slope_degrees:.2f} degrees; "
-            "raw kinematics, no IK, no terrain-normal root rotation."
+            + (
+                "stance-aware display IK"
+                if foot_ik is not None
+                else "raw display, IK disabled"
+            )
+            + "; no terrain-normal root rotation."
         )
         print("Controls: W/A/S/D move relative to camera; rotate camera to steer; Esc closes.")
 
         if arguments.no_viewer:
             viewer = _dummy_viewer()
             qpos = np.asarray(demo.full_agent.get_next_frame())
+            ik_diagnostics = None
+            display_qpos = qpos
             for step in range(arguments.smoke_steps):
                 qpos = _step_agent(
                     demo,
@@ -345,12 +382,44 @@ def _run(arguments: argparse.Namespace) -> int:
                     random_seed=arguments.random_seed,
                     automatic=True,
                 )
+                ik_result = (
+                    None
+                    if foot_ik is None
+                    else foot_ik.apply(
+                        qpos, float(model.opt.timestep)
+                    )
+                )
+                display_qpos = (
+                    qpos if ik_result is None else ik_result.qpos
+                )
+                ik_diagnostics = (
+                    None if ik_result is None else ik_result.diagnostics
+                )
+                data.qpos[:] = display_qpos
                 mujoco.mj_forward(model, data)
                 if step % arguments.trace_every == 0:
-                    print(_trace_line(step, qpos, profile, conditioner))
-            print(_trace_line(arguments.smoke_steps, qpos, profile, conditioner))
+                    print(
+                        _trace_line(
+                            step,
+                            qpos,
+                            profile,
+                            conditioner,
+                            ik_diagnostics,
+                        )
+                    )
+            print(
+                _trace_line(
+                    arguments.smoke_steps,
+                    qpos,
+                    profile,
+                    conditioner,
+                    ik_diagnostics,
+                )
+            )
             if not np.isfinite(demo.full_agent.frames["mujoco_qpos"].detach().cpu().numpy()).all():
                 raise RuntimeError("MotionBricks generated non-finite qpos")
+            if not np.isfinite(display_qpos).all():
+                raise RuntimeError("foot IK produced non-finite qpos")
             return 0
 
         with mujoco.viewer.launch_passive(model, data) as viewer:
@@ -367,12 +436,34 @@ def _run(arguments: argparse.Namespace) -> int:
                     random_seed=arguments.random_seed,
                     automatic=False,
                 )
+                ik_result = (
+                    None
+                    if foot_ik is None
+                    else foot_ik.apply(
+                        qpos, float(model.opt.timestep)
+                    )
+                )
+                display_qpos = (
+                    qpos if ik_result is None else ik_result.qpos
+                )
+                ik_diagnostics = (
+                    None if ik_result is None else ik_result.diagnostics
+                )
+                data.qpos[:] = display_qpos
                 step += 1
                 mujoco.mj_forward(model, data)
                 viewer.cam.lookat[:] = qpos[:3]
                 viewer.sync()
                 if step % arguments.trace_every == 0:
-                    print(_trace_line(step, qpos, profile, conditioner))
+                    print(
+                        _trace_line(
+                            step,
+                            qpos,
+                            profile,
+                            conditioner,
+                            ik_diagnostics,
+                        )
+                    )
                 remaining = float(model.opt.timestep) - (
                     time.monotonic() - started
                 )

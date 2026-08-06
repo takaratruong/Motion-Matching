@@ -10,6 +10,7 @@ from mm_sonic.motionbricks_hill import GentleHillProfile
 from mm_sonic.motionbricks_hill_ik import (
     FootPhase,
     MotionBricksHillFootIK,
+    _bounded_leg_correction,
     _next_foot_phase,
     _project_stance_targets,
     _required_swing_lift,
@@ -68,6 +69,17 @@ class HillFootIKContractTest(unittest.TestCase):
             ),
             0.025,
         )
+
+    def test_joint_limit_can_force_a_safe_correction_reset(self) -> None:
+        correction, limit_forced = _bounded_leg_correction(
+            raw=np.asarray((-0.14391381,)),
+            desired=np.asarray((-0.35,)),
+            previous=np.asarray((-0.23123252,)),
+            limits=np.asarray(((-0.2618, 0.2618),)),
+        )
+
+        np.testing.assert_allclose(correction, (-0.11788519,))
+        self.assertTrue(limit_forced)
 
 
 @unittest.skipUnless(MOTIONBRICKS_G1_SCENE.is_file(), "G1 scene unavailable")
@@ -145,6 +157,26 @@ class HillFootIKModelTest(unittest.TestCase):
         self.assertLessEqual(
             final.diagnostics.maximum_joint_correction_rad,
             0.35 + 1.0e-9,
+        )
+
+    def test_stance_lock_keeps_ramping_for_slow_authored_drift(
+        self,
+    ) -> None:
+        raw = self.model.qpos0.copy()
+        solver = MotionBricksHillFootIK(self.model, lambda xy: 0.0)
+        solver.apply(raw, 1.0 / 30.0)
+        solver.apply(raw, 1.0 / 30.0)
+
+        results = []
+        for root_x in (0.02, 0.04, 0.06, 0.08):
+            shifted = raw.copy()
+            shifted[0] = root_x
+            results.append(solver.apply(shifted, 1.0 / 30.0))
+
+        self.assertTrue(all(item.diagnostics.accepted for item in results))
+        self.assertEqual(
+            results[-1].diagnostics.phases,
+            (FootPhase.STANCE, FootPhase.STANCE),
         )
 
     def test_failed_height_query_rolls_back_state(self) -> None:
