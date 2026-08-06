@@ -11,6 +11,7 @@ from mm_sonic.motionbricks_hill_ik import (
     FootPhase,
     MotionBricksHillFootIK,
     _bounded_leg_correction,
+    _bounded_root_height_correction,
     _next_foot_phase,
     _project_stance_targets,
     _required_swing_lift,
@@ -23,6 +24,43 @@ MOTIONBRICKS_G1_SCENE = Path(
 
 
 class HillFootIKContractTest(unittest.TestCase):
+    def test_supported_root_height_ramps_and_clamps(self) -> None:
+        value = 0.0
+        values = []
+        for _ in range(20):
+            value = _bounded_root_height_correction(
+                value,
+                required_support_shift_m=0.15,
+                has_support=True,
+            )
+            values.append(value)
+        self.assertAlmostEqual(values[0], 0.025)
+        self.assertTrue(
+            all(
+                abs(right - left) <= 0.025 + 1.0e-12
+                for left, right in zip(values, values[1:])
+            )
+        )
+        self.assertLessEqual(max(values), 0.20)
+
+    def test_airborne_root_height_decays_toward_raw(self) -> None:
+        self.assertAlmostEqual(
+            _bounded_root_height_correction(
+                0.08,
+                required_support_shift_m=0.0,
+                has_support=False,
+            ),
+            0.07,
+        )
+        self.assertAlmostEqual(
+            _bounded_root_height_correction(
+                -0.08,
+                required_support_shift_m=0.0,
+                has_support=False,
+            ),
+            -0.07,
+        )
+
     def test_stance_hysteresis(self) -> None:
         self.assertEqual(
             _next_foot_phase(FootPhase.SWING, 0.02, 0.20),

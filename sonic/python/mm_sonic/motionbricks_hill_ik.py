@@ -41,6 +41,9 @@ class FootPhase(str, Enum):
 @dataclass(frozen=True)
 class HillFootIKDiagnostics:
     phases: tuple[FootPhase, FootPhase]
+    authored_stance: tuple[bool, bool]
+    locked: tuple[bool, bool]
+    root_height_correction_m: float
     raw_penetration_m: float
     corrected_penetration_m: float
     maximum_target_residual_m: float
@@ -115,6 +118,32 @@ def _required_swing_lift(
     if not np.isfinite(lift):
         raise ValueError("swing lift must be finite")
     return lift
+
+
+def _bounded_root_height_correction(
+    current_m: float,
+    *,
+    required_support_shift_m: float,
+    has_support: bool,
+) -> float:
+    current = float(current_m)
+    required = float(required_support_shift_m)
+    if (
+        not np.isfinite(current)
+        or not np.isfinite(required)
+        or type(has_support) is not bool
+    ):
+        raise ValueError("root-height inputs must be finite")
+    if has_support:
+        desired = current + required
+        step = 0.025
+    else:
+        desired = 0.0
+        step = 0.010
+    rate_bounded = float(
+        np.clip(desired, current - step, current + step)
+    )
+    return float(np.clip(rate_bounded, -0.20, 0.20))
 
 
 def _bounded_leg_correction(
@@ -199,6 +228,8 @@ class MotionBricksHillFootIK:
         return self._non_leg_qpos.copy()
 
     def reset(self) -> None:
+        self._previous_contact = (False, False)
+        self._root_height_correction_m = 0.0
         self._phases = (FootPhase.SWING, FootPhase.SWING)
         self._targets: tuple[np.ndarray | None, np.ndarray | None] = (
             None,
@@ -214,21 +245,24 @@ class MotionBricksHillFootIK:
 
     def snapshot_state(
         self,
-    ) -> tuple[object, object, object, object]:
+    ) -> tuple[
+        tuple[bool, bool],
+        tuple[np.ndarray | None, np.ndarray | None],
+        float,
+        tuple[np.ndarray, np.ndarray],
+    ]:
+        targets = tuple(
+            None if target is None else target.copy()
+            for target in self._targets
+        )
+        corrections = tuple(
+            value.copy() for value in self._corrections
+        )
         return (
-            self._phases,
-            tuple(
-                None if value is None else value.copy()
-                for value in self._targets
-            ),
-            (
-                None
-                if self._previous_raw_centers is None
-                else tuple(
-                    value.copy() for value in self._previous_raw_centers
-                )
-            ),
-            tuple(value.copy() for value in self._corrections),
+            self._previous_contact,
+            targets,
+            float(self._root_height_correction_m),
+            corrections,
         )
 
     def _discover_g1_layout(self) -> None:
@@ -422,6 +456,11 @@ class MotionBricksHillFootIK:
     ) -> HillFootIKResult:
         diagnostics = HillFootIKDiagnostics(
             phases=self._phases,
+            authored_stance=self._previous_contact,
+            locked=tuple(
+                target is not None for target in self._targets
+            ),
+            root_height_correction_m=self._root_height_correction_m,
             raw_penetration_m=float(raw_penetration_m),
             corrected_penetration_m=float(raw_penetration_m),
             maximum_target_residual_m=0.0,
@@ -658,6 +697,11 @@ class MotionBricksHillFootIK:
 
             diagnostics = HillFootIKDiagnostics(
                 phases=self._phases,
+                authored_stance=self._previous_contact,
+                locked=tuple(
+                    target is not None for target in self._targets
+                ),
+                root_height_correction_m=self._root_height_correction_m,
                 raw_penetration_m=raw_penetration,
                 corrected_penetration_m=corrected_penetration,
                 maximum_target_residual_m=maximum_residual,
