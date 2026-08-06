@@ -8,11 +8,9 @@ import numpy as np
 
 from mm_sonic.motionbricks_hill import GentleHillProfile
 from mm_sonic.motionbricks_hill_ik import (
-    FootPhase,
     MotionBricksHillFootIK,
     _bounded_leg_correction,
     _bounded_root_height_correction,
-    _next_foot_phase,
     _project_stance_targets,
     _required_swing_lift,
 )
@@ -61,24 +59,6 @@ class HillFootIKContractTest(unittest.TestCase):
             -0.07,
         )
 
-    def test_stance_hysteresis(self) -> None:
-        self.assertEqual(
-            _next_foot_phase(FootPhase.SWING, 0.02, 0.20),
-            FootPhase.STANCE,
-        )
-        self.assertEqual(
-            _next_foot_phase(FootPhase.STANCE, 0.06, 0.60),
-            FootPhase.STANCE,
-        )
-        self.assertEqual(
-            _next_foot_phase(FootPhase.STANCE, 0.08, 0.20),
-            FootPhase.RELEASE,
-        )
-        self.assertEqual(
-            _next_foot_phase(FootPhase.RELEASE, 0.08, 0.80),
-            FootPhase.SWING,
-        )
-
     def test_stance_targets_follow_per_probe_terrain_height(self) -> None:
         centers = np.asarray(((1.0, 0.0, 0.2), (2.0, 0.0, 0.2)))
         radii = np.asarray((0.02, 0.03))
@@ -110,14 +90,31 @@ class HillFootIKContractTest(unittest.TestCase):
 
     def test_joint_limit_can_force_a_safe_correction_reset(self) -> None:
         correction, limit_forced = _bounded_leg_correction(
-            raw=np.asarray((-0.14391381,)),
-            desired=np.asarray((-0.35,)),
-            previous=np.asarray((-0.23123252,)),
-            limits=np.asarray(((-0.2618, 0.2618),)),
+            np.asarray((-0.14391381,)),
+            np.asarray((-0.49391381,)),
+            np.asarray((-0.23123252,)),
+            np.asarray((-0.2618,)),
+            np.asarray((0.2618,)),
+            maximum_correction_rad=0.30,
+            maximum_step_rad=0.12,
         )
 
         np.testing.assert_allclose(correction, (-0.11788519,))
         self.assertTrue(limit_forced)
+
+    def test_released_correction_decays_toward_raw(self) -> None:
+        correction, limit_forced = _bounded_leg_correction(
+            np.asarray((0.0,)),
+            np.asarray((0.0,)),
+            np.asarray((0.30,)),
+            np.asarray((-1.0,)),
+            np.asarray((1.0,)),
+            maximum_correction_rad=0.30,
+            maximum_step_rad=0.12,
+        )
+
+        np.testing.assert_allclose(correction, (0.18,))
+        self.assertFalse(limit_forced)
 
 
 @unittest.skipUnless(MOTIONBRICKS_G1_SCENE.is_file(), "G1 scene unavailable")
@@ -135,89 +132,87 @@ class HillFootIKModelTest(unittest.TestCase):
         solver = MotionBricksHillFootIK(
             self.model, GentleHillProfile().height
         )
-        solver.apply(raw, 1.0 / 30.0)
+        solver.apply(raw, (True, True), 1.0 / 30.0)
 
-        result = solver.apply(raw, 1.0 / 30.0)
+        result = solver.apply(raw, (True, True), 1.0 / 30.0)
 
-        np.testing.assert_array_equal(result.qpos[:7], raw[:7])
+        np.testing.assert_array_equal(result.qpos[:2], raw[:2])
+        np.testing.assert_array_equal(result.qpos[3:7], raw[3:7])
+        non_leg_except_root_z = solver.non_leg_qpos_addresses
+        non_leg_except_root_z = non_leg_except_root_z[
+            non_leg_except_root_z != 2
+        ]
         np.testing.assert_array_equal(
-            result.qpos[solver.non_leg_qpos_addresses],
-            raw[solver.non_leg_qpos_addresses],
+            result.qpos[non_leg_except_root_z],
+            raw[non_leg_except_root_z],
         )
         self.assertTrue(np.isfinite(result.qpos).all())
         self.assertLessEqual(
             result.diagnostics.maximum_joint_correction_rad,
-            0.35 + 1.0e-9,
+            0.30 + 1.0e-9,
         )
 
-    def test_static_flat_pose_enters_stance(self) -> None:
+    def test_authored_toe_off_clears_lock_in_same_frame(self) -> None:
         raw = self.model.qpos0.copy()
         solver = MotionBricksHillFootIK(self.model, lambda xy: 0.0)
-        solver.apply(raw, 1.0 / 30.0)
+        planted = solver.apply(raw, (True, False), 1.0 / 30.0)
+        self.assertEqual(planted.diagnostics.locked, (True, False))
 
-        result = solver.apply(raw, 1.0 / 30.0)
+        shifted = raw.copy()
+        shifted[0] += 0.03
+        released = solver.apply(
+            shifted, (False, False), 1.0 / 30.0
+        )
 
-        self.assertTrue(result.diagnostics.accepted)
         self.assertEqual(
-            result.diagnostics.phases,
-            (FootPhase.STANCE, FootPhase.STANCE),
+            released.diagnostics.authored_stance,
+            (False, False),
         )
-        self.assertLessEqual(
-            result.diagnostics.maximum_target_residual_m,
-            0.015,
-        )
+        self.assertEqual(released.diagnostics.locked, (False, False))
+        self.assertIsNone(solver.snapshot_state()[1][0])
 
-    def test_bounded_stance_acquisition_reduces_slope_penetration(
-        self,
-    ) -> None:
+    def test_display_root_reduces_eighteen_degree_penetration(self) -> None:
         hill = GentleHillProfile()
         raw = self.model.qpos0.copy()
         raw[0] = 3.25
         raw[2] += hill.height(raw[:2])
         solver = MotionBricksHillFootIK(self.model, hill.height)
-        warmup = solver.apply(raw, 1.0 / 30.0)
 
-        results = [solver.apply(raw, 1.0 / 30.0) for _ in range(6)]
+        results = [
+            solver.apply(raw, (True, True), 1.0 / 30.0)
+            for _ in range(8)
+        ]
         final = results[-1]
 
-        np.testing.assert_array_equal(warmup.qpos, raw)
-        self.assertTrue(all(item.diagnostics.accepted for item in results))
-        self.assertEqual(
-            final.diagnostics.phases,
-            (FootPhase.STANCE, FootPhase.STANCE),
-        )
-        self.assertGreater(final.diagnostics.raw_penetration_m, 0.03)
-        self.assertLess(final.diagnostics.corrected_penetration_m, 0.005)
+        np.testing.assert_array_equal(final.qpos[:2], raw[:2])
+        np.testing.assert_array_equal(final.qpos[3:7], raw[3:7])
         self.assertLessEqual(
-            final.diagnostics.maximum_target_residual_m,
-            0.015,
+            abs(final.diagnostics.root_height_correction_m),
+            0.20,
+        )
+        self.assertLess(
+            final.diagnostics.corrected_penetration_m, 0.010
         )
         self.assertLessEqual(
             final.diagnostics.maximum_joint_correction_rad,
-            0.35 + 1.0e-9,
+            0.30 + 1.0e-9,
         )
 
-    def test_stance_lock_keeps_ramping_for_slow_authored_drift(
-        self,
-    ) -> None:
+    def test_authored_swing_never_creates_a_world_lock(self) -> None:
         raw = self.model.qpos0.copy()
         solver = MotionBricksHillFootIK(self.model, lambda xy: 0.0)
-        solver.apply(raw, 1.0 / 30.0)
-        solver.apply(raw, 1.0 / 30.0)
 
-        results = []
-        for root_x in (0.02, 0.04, 0.06, 0.08):
-            shifted = raw.copy()
-            shifted[0] = root_x
-            results.append(solver.apply(shifted, 1.0 / 30.0))
+        for _ in range(4):
+            result = solver.apply(
+                raw, (False, False), 1.0 / 30.0
+            )
 
-        self.assertTrue(all(item.diagnostics.accepted for item in results))
         self.assertEqual(
-            results[-1].diagnostics.phases,
-            (FootPhase.STANCE, FootPhase.STANCE),
+            result.diagnostics.locked, (False, False)
         )
+        self.assertEqual(solver.snapshot_state()[1], (None, None))
 
-    def test_failed_height_query_rolls_back_state(self) -> None:
+    def test_invalid_terrain_cannot_resurrect_released_lock(self) -> None:
         finite = [True]
 
         def height_query(xy: object) -> float:
@@ -226,15 +221,17 @@ class HillFootIKModelTest(unittest.TestCase):
 
         raw = self.model.qpos0.copy()
         solver = MotionBricksHillFootIK(self.model, height_query)
-        solver.apply(raw, 1.0 / 30.0)
-        before = repr(solver.snapshot_state())
+        solver.apply(raw, (True, False), 1.0 / 30.0)
         finite[0] = False
 
-        result = solver.apply(raw, 1.0 / 30.0)
+        result = solver.apply(
+            raw, (False, False), 1.0 / 30.0
+        )
 
         np.testing.assert_array_equal(result.qpos, raw)
         self.assertFalse(result.diagnostics.accepted)
-        self.assertEqual(repr(solver.snapshot_state()), before)
+        self.assertEqual(result.diagnostics.locked, (False, False))
+        self.assertIsNone(solver.snapshot_state()[1][0])
 
 
 if __name__ == "__main__":

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from enum import Enum
 
 import numpy as np
 
@@ -32,15 +31,8 @@ _LEG_JOINT_NAMES = (
 )
 
 
-class FootPhase(str, Enum):
-    SWING = "swing"
-    STANCE = "stance"
-    RELEASE = "release"
-
-
 @dataclass(frozen=True)
 class HillFootIKDiagnostics:
-    phases: tuple[FootPhase, FootPhase]
     authored_stance: tuple[bool, bool]
     locked: tuple[bool, bool]
     root_height_correction_m: float
@@ -57,22 +49,6 @@ class HillFootIKDiagnostics:
 class HillFootIKResult:
     qpos: np.ndarray
     diagnostics: HillFootIKDiagnostics
-
-
-def _next_foot_phase(
-    previous: FootPhase,
-    minimum_clearance_m: float,
-    speed_mps: float,
-) -> FootPhase:
-    if previous is FootPhase.STANCE:
-        if minimum_clearance_m > 0.075 or speed_mps > 0.75:
-            return FootPhase.RELEASE
-        return FootPhase.STANCE
-    if previous is FootPhase.RELEASE:
-        return FootPhase.SWING
-    if minimum_clearance_m <= 0.035 and speed_mps <= 0.35:
-        return FootPhase.STANCE
-    return FootPhase.SWING
 
 
 def _project_stance_targets(
@@ -147,33 +123,51 @@ def _bounded_root_height_correction(
 
 
 def _bounded_leg_correction(
+    raw_leg: np.ndarray,
+    desired_leg: np.ndarray,
+    previous_correction: np.ndarray,
+    lower_limits: np.ndarray,
+    upper_limits: np.ndarray,
     *,
-    raw: np.ndarray,
-    desired: np.ndarray,
-    previous: np.ndarray,
-    limits: np.ndarray,
+    maximum_correction_rad: float,
+    maximum_step_rad: float,
 ) -> tuple[np.ndarray, bool]:
-    raw_values = np.asarray(raw, dtype=np.float64)
-    desired_values = np.asarray(desired, dtype=np.float64)
-    previous_values = np.asarray(previous, dtype=np.float64)
-    joint_limits = np.asarray(limits, dtype=np.float64)
+    raw_values = np.asarray(raw_leg, dtype=np.float64)
+    desired_values = np.asarray(desired_leg, dtype=np.float64)
+    previous_values = np.asarray(
+        previous_correction, dtype=np.float64
+    )
+    lower = np.asarray(lower_limits, dtype=np.float64)
+    upper = np.asarray(upper_limits, dtype=np.float64)
     if (
         raw_values.shape != desired_values.shape
         or raw_values.shape != previous_values.shape
-        or joint_limits.shape != (len(raw_values), 2)
+        or raw_values.shape != lower.shape
+        or raw_values.shape != upper.shape
     ):
         raise ValueError("leg correction arrays have incompatible shapes")
-    desired_values = np.clip(desired_values, -0.35, 0.35)
+    if (
+        not np.isfinite(maximum_correction_rad)
+        or maximum_correction_rad <= 0.0
+        or not np.isfinite(maximum_step_rad)
+        or maximum_step_rad <= 0.0
+    ):
+        raise ValueError("leg correction bounds must be finite and positive")
+    desired_correction = np.clip(
+        desired_values - raw_values,
+        -float(maximum_correction_rad),
+        float(maximum_correction_rad),
+    )
     rate_bounded = np.clip(
-        desired_values,
-        previous_values - 0.06,
-        previous_values + 0.06,
+        desired_correction,
+        previous_values - float(maximum_step_rad),
+        previous_values + float(maximum_step_rad),
     )
     limit_bounded = (
         np.clip(
             raw_values + rate_bounded,
-            joint_limits[:, 0] + 1.0e-6,
-            joint_limits[:, 1] - 1.0e-6,
+            lower + 1.0e-6,
+            upper - 1.0e-6,
         )
         - raw_values
     )
@@ -230,14 +224,10 @@ class MotionBricksHillFootIK:
     def reset(self) -> None:
         self._previous_contact = (False, False)
         self._root_height_correction_m = 0.0
-        self._phases = (FootPhase.SWING, FootPhase.SWING)
         self._targets: tuple[np.ndarray | None, np.ndarray | None] = (
             None,
             None,
         )
-        self._previous_raw_centers: (
-            tuple[np.ndarray, np.ndarray] | None
-        ) = None
         self._corrections = (
             np.zeros(6, dtype=np.float64),
             np.zeros(6, dtype=np.float64),
@@ -379,7 +369,8 @@ class MotionBricksHillFootIK:
         foot: int,
         target: np.ndarray,
         reference_qpos: np.ndarray,
-        phase: FootPhase,
+        *,
+        lock_horizontal: bool,
     ) -> int:
         addresses = self._leg_qpos[foot]
         dofs = self._leg_dofs[foot]
@@ -410,7 +401,7 @@ class MotionBricksHillFootIK:
             rows = [value[2:3] for value in jacobians]
             error = vertical_error
             residual = float(np.max(np.abs(vertical_error)))
-            if phase is FootPhase.STANCE:
+            if lock_horizontal:
                 centroid_error = (
                     np.mean(target[:, :2], axis=0)
                     - np.mean(current[:, :2], axis=0)
@@ -454,12 +445,14 @@ class MotionBricksHillFootIK:
         *,
         raw_penetration_m: float = 0.0,
     ) -> HillFootIKResult:
+        locked = tuple(
+            self._previous_contact[foot]
+            and self._targets[foot] is not None
+            for foot in range(2)
+        )
         diagnostics = HillFootIKDiagnostics(
-            phases=self._phases,
             authored_stance=self._previous_contact,
-            locked=tuple(
-                target is not None for target in self._targets
-            ),
+            locked=(bool(locked[0]), bool(locked[1])),
             root_height_correction_m=self._root_height_correction_m,
             raw_penetration_m=float(raw_penetration_m),
             corrected_penetration_m=float(raw_penetration_m),
@@ -471,8 +464,32 @@ class MotionBricksHillFootIK:
         )
         return HillFootIKResult(raw_qpos.copy(), diagnostics)
 
+    def _commit_releases(
+        self,
+        contact: tuple[bool, bool],
+    ) -> list[np.ndarray | None]:
+        previous_contact = self._previous_contact
+        retained = [
+            (
+                self._targets[foot].copy()
+                if (
+                    contact[foot]
+                    and previous_contact[foot]
+                    and self._targets[foot] is not None
+                )
+                else None
+            )
+            for foot in range(2)
+        ]
+        self._targets = (retained[0], retained[1])
+        self._previous_contact = contact
+        return retained
+
     def apply(
-        self, raw_qpos: object, dt_s: float
+        self,
+        raw_qpos: object,
+        authored_stance: object,
+        dt_s: float,
     ) -> HillFootIKResult:
         raw = np.asarray(raw_qpos, dtype=np.float64)
         if raw.shape != (int(self.model.nq),):
@@ -481,8 +498,21 @@ class MotionBricksHillFootIK:
             raise ValueError("raw qpos must be finite")
         if not np.isfinite(dt_s) or dt_s <= 0.0:
             raise ValueError("dt_s must be finite and positive")
+        contacts_array = np.asarray(authored_stance)
+        if (
+            contacts_array.shape != (2,)
+            or contacts_array.dtype.kind != "b"
+        ):
+            raise ValueError(
+                "authored_stance must contain two booleans"
+            )
+        contact = (
+            bool(contacts_array[0]),
+            bool(contacts_array[1]),
+        )
         raw = raw.copy()
         raw_penetration = 0.0
+        proposed_targets = self._commit_releases(contact)
 
         try:
             self._set_pose(raw)
@@ -505,89 +535,109 @@ class MotionBricksHillFootIK:
                     float(np.min(raw_clearances[1])),
                 ),
             )
-            if self._previous_raw_centers is None:
-                speeds = (float("inf"), float("inf"))
-            else:
-                speeds = tuple(
-                    float(
-                        np.linalg.norm(
-                            np.mean(raw_centers[foot], axis=0)
-                            - np.mean(
-                                self._previous_raw_centers[foot], axis=0
-                            )
-                        )
-                        / float(dt_s)
-                    )
-                    for foot in range(2)
-                )
-            phases = tuple(
-                _next_foot_phase(
-                    self._phases[foot],
-                    float(np.min(raw_clearances[foot])),
-                    speeds[foot],
-                )
+
+            root_probe = raw.copy()
+            root_probe[2] += self._root_height_correction_m
+            self._set_pose(root_probe)
+            probe_centers = (
+                self._sole_centers(0).copy(),
+                self._sole_centers(1).copy(),
+            )
+            required_shifts = [
+                float(self.height_query(center[:2]))
+                + float(radius)
+                - float(center[2])
                 for foot in range(2)
+                if contact[foot]
+                for center, radius in zip(
+                    probe_centers[foot],
+                    self._sphere_radii[foot],
+                    strict=True,
+                )
+            ]
+            next_root_correction = _bounded_root_height_correction(
+                self._root_height_correction_m,
+                required_support_shift_m=max(
+                    required_shifts, default=0.0
+                ),
+                has_support=bool(required_shifts),
+            )
+            root_adjusted = raw.copy()
+            root_adjusted[2] += next_root_correction
+            self._set_pose(root_adjusted)
+            root_adjusted_centers = (
+                self._sole_centers(0).copy(),
+                self._sole_centers(1).copy(),
             )
 
-            proposed_targets: list[np.ndarray | None] = []
             solve_targets: list[np.ndarray | None] = []
             for foot in range(2):
-                if phases[foot] is FootPhase.STANCE:
-                    if (
-                        self._phases[foot] is FootPhase.STANCE
-                        and self._targets[foot] is not None
-                    ):
-                        target = self._targets[foot].copy()
-                    else:
-                        target = _project_stance_targets(
-                            raw_centers[foot],
-                            self._sphere_radii[foot],
-                            self.height_query,
+                if contact[foot]:
+                    if proposed_targets[foot] is None:
+                        proposed_targets[foot] = (
+                            _project_stance_targets(
+                                root_adjusted_centers[foot],
+                                self._sphere_radii[foot],
+                                self.height_query,
+                            )
                         )
-                    proposed_targets.append(target.copy())
-                    solve_targets.append(target)
-                elif phases[foot] is FootPhase.SWING:
-                    target = None
-                    if self._previous_raw_centers is not None:
-                        lift = _required_swing_lift(
-                            raw_centers[foot],
-                            self._sphere_radii[foot],
-                            self.height_query,
-                        )
-                        if lift > 0.0:
-                            target = raw_centers[foot].copy()
-                            target[:, 2] += lift
-                    proposed_targets.append(None)
-                    solve_targets.append(target)
+                    solve_targets.append(
+                        proposed_targets[foot].copy()
+                    )
                 else:
-                    proposed_targets.append(None)
-                    solve_targets.append(None)
+                    lift = _required_swing_lift(
+                        root_adjusted_centers[foot],
+                        self._sphere_radii[foot],
+                        self.height_query,
+                    )
+                    if lift > 0.0:
+                        target = root_adjusted_centers[foot].copy()
+                        target[:, 2] += lift
+                        solve_targets.append(target)
+                    else:
+                        solve_targets.append(None)
 
-            self._set_pose(raw)
+            self._set_pose(root_adjusted)
             iterations = 0
             for foot, target in enumerate(solve_targets):
                 if target is not None:
                     iterations += self._solve_foot(
-                        foot, target, raw, phases[foot]
+                        foot,
+                        target,
+                        root_adjusted,
+                        lock_horizontal=contact[foot],
                     )
 
             corrections: list[np.ndarray] = []
             limit_forced: list[bool] = []
             for foot in range(2):
                 addresses = self._leg_qpos[foot]
+                desired_leg = (
+                    self._data.qpos[addresses].copy()
+                    if solve_targets[foot] is not None
+                    else raw[addresses].copy()
+                )
                 bounded, forced = _bounded_leg_correction(
-                    raw=raw[addresses],
-                    desired=self._data.qpos[addresses] - raw[addresses],
-                    previous=self._corrections[foot],
-                    limits=self._leg_limits[foot],
+                    raw[addresses],
+                    desired_leg,
+                    self._corrections[foot],
+                    self._leg_limits[foot][:, 0],
+                    self._leg_limits[foot][:, 1],
+                    maximum_correction_rad=0.30,
+                    maximum_step_rad=(
+                        0.08 if contact[foot] else 0.12
+                    ),
                 )
                 corrections.append(bounded)
                 limit_forced.append(forced)
 
-            candidate = raw.copy()
+            candidate = root_adjusted.copy()
             for foot in range(2):
-                candidate[self._leg_qpos[foot]] += corrections[foot]
+                candidate[self._leg_qpos[foot]] = (
+                    raw[self._leg_qpos[foot]] + corrections[foot]
+                )
             candidate[self._non_leg_qpos] = raw[self._non_leg_qpos]
+            candidate[2] = root_adjusted[2]
             if not np.isfinite(candidate).all():
                 raise ValueError("IK candidate must be finite")
             self._set_pose(candidate)
@@ -615,7 +665,8 @@ class MotionBricksHillFootIK:
                 float(
                     np.max(
                         np.abs(
-                            target[:, 2] - corrected_centers[foot][:, 2]
+                            target[:, 2]
+                            - corrected_centers[foot][:, 2]
                         )
                     )
                 )
@@ -642,35 +693,25 @@ class MotionBricksHillFootIK:
                 float(np.max(np.abs(value)))
                 for value in corrections
             )
-            maximum_change = max(
-                (
-                    float(
-                        np.max(
-                            np.abs(value - self._corrections[foot])
-                        )
-                    )
-                    for foot, value in enumerate(corrections)
-                    if not limit_forced[foot]
-                ),
-                default=0.0,
-            )
-            if maximum_correction > 0.35 + 1.0e-9:
-                raise ValueError("joint correction exceeded absolute bound")
-            if maximum_change > 0.06 + 1.0e-9:
-                raise ValueError("joint correction exceeded frame bound")
-            acquiring_stance = maximum_stance_residual > 0.015
-            if (
-                acquiring_stance
-                and corrected_penetration
-                >= raw_penetration - 1.0e-6
-            ):
-                return self._fallback(
-                    raw,
-                    "stance acquisition did not reduce penetration",
-                    raw_penetration_m=raw_penetration,
+            if maximum_correction > 0.30 + 1.0e-9:
+                raise ValueError(
+                    "joint correction exceeded absolute bound"
                 )
+            for foot, value in enumerate(corrections):
+                if limit_forced[foot]:
+                    continue
+                maximum_change = float(
+                    np.max(
+                        np.abs(value - self._corrections[foot])
+                    )
+                )
+                maximum_step = 0.08 if contact[foot] else 0.12
+                if maximum_change > maximum_step + 1.0e-9:
+                    raise ValueError(
+                        "joint correction exceeded frame bound"
+                    )
 
-            committed_targets = (
+            self._targets = (
                 (
                     None
                     if proposed_targets[0] is None
@@ -682,26 +723,20 @@ class MotionBricksHillFootIK:
                     else proposed_targets[1].copy()
                 ),
             )
-            committed_centers = (
-                raw_centers[0].copy(),
-                raw_centers[1].copy(),
-            )
-            committed_corrections = (
+            self._previous_contact = contact
+            self._root_height_correction_m = next_root_correction
+            self._corrections = (
                 corrections[0].copy(),
                 corrections[1].copy(),
             )
-            self._phases = (phases[0], phases[1])
-            self._targets = committed_targets
-            self._previous_raw_centers = committed_centers
-            self._corrections = committed_corrections
-
+            locked = tuple(
+                contact[foot] and self._targets[foot] is not None
+                for foot in range(2)
+            )
             diagnostics = HillFootIKDiagnostics(
-                phases=self._phases,
-                authored_stance=self._previous_contact,
-                locked=tuple(
-                    target is not None for target in self._targets
-                ),
-                root_height_correction_m=self._root_height_correction_m,
+                authored_stance=contact,
+                locked=(bool(locked[0]), bool(locked[1])),
+                root_height_correction_m=next_root_correction,
                 raw_penetration_m=raw_penetration,
                 corrected_penetration_m=corrected_penetration,
                 maximum_target_residual_m=maximum_residual,
@@ -709,7 +744,9 @@ class MotionBricksHillFootIK:
                 iterations=iterations,
                 accepted=True,
                 reason=(
-                    "acquiring stance" if acquiring_stance else "ok"
+                    "acquiring stance"
+                    if maximum_stance_residual > 0.015
+                    else "ok"
                 ),
             )
             return HillFootIKResult(candidate, diagnostics)
