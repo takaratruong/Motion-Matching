@@ -14,7 +14,7 @@
 
 **Files:**
 - Create: `sonic/python/mm_sonic/motionbricks_hill.py`
-- Test: `sonic/tests/test_motionbricks_hill.py`
+- Test: `tests/python/test_motionbricks_hill.py`
 
 **Step 1: Write the failing tests**
 
@@ -25,7 +25,7 @@ Cover the flat approach/exit, cosine crest, domain rejection, maximum slope angl
 Run:
 
 ```bash
-PYTHONPATH=sonic/python /home/ubuntu/miniconda3/envs/env_isaaclab/bin/python -m pytest -q sonic/tests/test_motionbricks_hill.py
+PYTHONPATH=sonic/python /home/ubuntu/miniconda3/envs/env_isaaclab/bin/python -m unittest -v tests.python.test_motionbricks_hill
 ```
 
 Expected: FAIL because `mm_sonic.motionbricks_hill` does not exist.
@@ -59,7 +59,7 @@ Run the command from Step 2. Expected: PASS.
 **Step 5: Commit**
 
 ```bash
-git add sonic/python/mm_sonic/motionbricks_hill.py sonic/tests/test_motionbricks_hill.py
+git add sonic/python/mm_sonic/motionbricks_hill.py tests/python/test_motionbricks_hill.py
 git commit -m "feat: add deterministic gentle hill profile"
 ```
 
@@ -67,7 +67,7 @@ git commit -m "feat: add deterministic gentle hill profile"
 
 **Files:**
 - Create: `sonic/python/mm_sonic/motionbricks_hill_conditioning.py`
-- Test: `sonic/tests/test_motionbricks_hill_conditioning.py`
+- Test: `tests/python/test_motionbricks_hill_conditioning.py`
 
 **Step 1: Write the failing tests**
 
@@ -78,7 +78,7 @@ Test canonical target XY reconstruction at zero and 90-degree headings, flat/uph
 Run:
 
 ```bash
-PYTHONPATH=sonic/python /home/ubuntu/miniconda3/envs/env_isaaclab/bin/python -m pytest -q sonic/tests/test_motionbricks_hill_conditioning.py
+PYTHONPATH=sonic/python /home/ubuntu/miniconda3/envs/env_isaaclab/bin/python -m unittest -v tests.python.test_motionbricks_hill_conditioning
 ```
 
 Expected: FAIL because the conditioning module does not exist.
@@ -114,7 +114,7 @@ Run the command from Step 2. Expected: PASS.
 **Step 6: Commit**
 
 ```bash
-git add sonic/python/mm_sonic/motionbricks_hill_conditioning.py sonic/tests/test_motionbricks_hill_conditioning.py
+git add sonic/python/mm_sonic/motionbricks_hill_conditioning.py tests/python/test_motionbricks_hill_conditioning.py
 git commit -m "feat: condition MotionBricks root targets on terrain"
 ```
 
@@ -126,14 +126,14 @@ git commit -m "feat: condition MotionBricks root targets on terrain"
 
 **Step 1: Add a bounded CLI contract test**
 
-Extend `sonic/tests/test_motionbricks_hill.py` to call `motionbricks_hill_viewer.main(["--help"])` and assert the documented runtime options without importing MotionBricks at module import time.
+Extend `tests/python/test_motionbricks_hill.py` to call `motionbricks_hill_viewer.main(["--help"])` and assert the documented runtime options without importing MotionBricks at module import time.
 
 **Step 2: Verify the test fails**
 
 Run:
 
 ```bash
-PYTHONPATH=sonic/python /home/ubuntu/miniconda3/envs/env_isaaclab/bin/python -m pytest -q sonic/tests/test_motionbricks_hill.py
+PYTHONPATH=sonic/python /home/ubuntu/miniconda3/envs/env_isaaclab/bin/python -m unittest -v tests.python.test_motionbricks_hill
 ```
 
 Expected: FAIL because the viewer module does not exist.
@@ -153,7 +153,7 @@ Add the external MotionBricks checkout, dependency install, Git-LFS, and viewer 
 Run:
 
 ```bash
-PYTHONPATH=sonic/python /home/ubuntu/miniconda3/envs/env_isaaclab/bin/python -m pytest -q sonic/tests/test_motionbricks_hill.py sonic/tests/test_motionbricks_hill_conditioning.py
+PYTHONPATH=sonic/python /home/ubuntu/miniconda3/envs/env_isaaclab/bin/python -m unittest -v tests.python.test_motionbricks_hill tests.python.test_motionbricks_hill_conditioning
 PYTHONPATH=sonic/python /home/ubuntu/miniconda3/envs/env_isaaclab/bin/python -m compileall -q sonic/python/mm_sonic
 ```
 
@@ -162,7 +162,7 @@ Expected: all focused tests pass and compilation exits zero.
 **Step 6: Commit**
 
 ```bash
-git add sonic/python/mm_sonic/motionbricks_hill_viewer.py sonic/README.md sonic/tests/test_motionbricks_hill.py
+git add sonic/python/mm_sonic/motionbricks_hill_viewer.py sonic/README.md tests/python/test_motionbricks_hill.py
 git commit -m "feat: add controllable MotionBricks hill viewer"
 ```
 
