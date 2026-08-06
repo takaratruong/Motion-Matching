@@ -4,11 +4,12 @@ Date: 2026-08-05
 
 ## Summary
 
-Test whether the released G1 MotionBricks model can generate coherent
-kinematics over a smooth hill when terrain elevation is supplied as a root
-target before inference. The first experiment is deliberately narrow: one
-deterministic forward traversal over one fixed gentle hill, with no portals,
-post-generation root warping, inverse kinematics, retraining, or physics.
+Test whether the released G1 MotionBricks model can generate coherent,
+operator-controlled kinematics over a smooth hill when terrain elevation is
+supplied as a root target before inference. The first experiment is
+deliberately narrow: one fixed gentle hill in the existing browser two-stick
+viewer, with no portals, post-generation root warping, inverse kinematics,
+retraining, or physics.
 
 MotionBricks remains the motion authority. The experiment changes only the
 vertical positions of its sparse future root constraints. The generated root,
@@ -17,7 +18,15 @@ terrain correction.
 
 ## User Outcome
 
-The first result is an A/B comparison:
+The first result is a controllable browser prototype:
+
+- the existing two-stick/WASD interface controls MotionBricks continuously;
+- one fixed smooth hill replaces the flat-only scene;
+- the operator may approach, cross, turn on, and leave the hill; and
+- a debug overlay shows sampled support height and conditioned/generated root
+  height.
+
+A deterministic A/B smoke test accompanies the viewer:
 
 - control: the released MotionBricks flat controller follows a straight command
   over flat ground;
@@ -25,9 +34,9 @@ The first result is an A/B comparison:
   follows a smooth 8--10 degree hill because its future root constraints carry
   the corresponding terrain-height changes.
 
-The result includes a terrain-rendered video and deterministic metrics. It
-answers whether the released model responds coherently enough to vertical root
-conditioning to justify a later free-roaming hill map.
+The prototype and smoke test answer whether the released model responds
+coherently enough to vertical root conditioning to justify foot IK, richer
+maps, or physics work.
 
 ## Current Baseline
 
@@ -114,7 +123,27 @@ ordinary one-time world support offset:
 The root quaternion remains whatever MotionBricks generates. In particular,
 the experiment does not align the robot root to the surface normal.
 
-### 4. Deterministic canary
+### 4. Interactive browser prototype
+
+Add a hill-only mode to the existing MotionBricks browser viewer. This mode:
+
+1. starts from a valid MotionBricks idle context on a flat apron;
+2. keeps the existing two-stick/WASD command mapping and regeneration cadence;
+3. disables terrain portal selection, portal playback, and the flat-terrain
+   stop guard;
+4. installs the pre-inference root-height conditioner for every real
+   MotionBricks generation;
+5. displays the fixed hill mesh, current trajectory, current terrain height,
+   and latest conditioned target heights; and
+6. keeps the session bounded to the hill mesh, stopping rather than sampling
+   outside its certified height domain.
+
+The first implementation may use a dedicated hill-viewer entry point when
+that keeps portal behavior unchanged and reduces integration risk. It must
+reuse the existing browser control and rendering components rather than create
+a second input protocol.
+
+### 5. Deterministic canary
 
 Add a bounded command-line canary that:
 
@@ -129,8 +158,8 @@ Add a bounded command-line canary that:
 8. writes immutable-by-convention artifacts under a caller-selected output
    directory.
 
-This first canary is scripted rather than interactive. Free joystick roaming
-is the next stage only if the treatment is coherent.
+The canary is the reproducible control for the interactive prototype rather
+than its replacement.
 
 ## Artifacts
 
@@ -148,6 +177,10 @@ Each canary writes:
 The comparison records the Motion-Matching commit, external MotionBricks commit,
 checkpoint paths or hashes, seed, command, terrain parameters, frame rate, and
 duration.
+
+The interactive viewer writes no evidence verdict. It may optionally record a
+raw session trace for debugging, but only the deterministic canary publishes
+`comparison.json`.
 
 ## Metrics
 
@@ -237,19 +270,20 @@ of the experiment.
 
 ## Non-goals
 
-- Interactive or free-roaming control.
 - Multiple hills, side slopes, arbitrary maps, or procedural terrain.
 - Stairs, curbs, discontinuities, or portals.
 - Post-generation root placement.
 - Foot IK, locking, collision correction, or joint repair.
 - MotionBricks retraining or checkpoint modification.
 - Physics, SONIC tracking, actuator limits, or hardware deployment.
+- A polished map, production UI, or quality guarantee from the first
+  time-bounded prototype.
 
 ## Next Decision
 
-If the canary is `responsive` and visually coherent, the next design may add a
-small fixed free-roaming heightfield while retaining pre-inference root
-conditioning. Foot IK remains a separate opt-in stage.
+If the canary is `responsive` and the interactive prototype is visually
+coherent, the next design may add foot IK or a richer fixed heightfield while
+retaining pre-inference root conditioning.
 
 If it is `unresponsive`, inspect delivered target tensors and model outputs once
 under the bounded diagnostic contract. If delivery is correct, stop rather than
