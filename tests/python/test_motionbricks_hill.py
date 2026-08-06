@@ -92,6 +92,13 @@ class GentleHillProfileTest(unittest.TestCase):
 
 
 class HillViewerCliTest(unittest.TestCase):
+    def test_default_interactive_budget_runs_for_hours(self) -> None:
+        from mm_sonic.motionbricks_hill_viewer import _parser
+
+        arguments = _parser().parse_args([])
+
+        self.assertGreaterEqual(arguments.max_steps, 1_000_000)
+
     def test_help_is_available_without_importing_motionbricks(self) -> None:
         from mm_sonic.motionbricks_hill_viewer import main
 

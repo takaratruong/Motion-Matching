@@ -38,7 +38,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-steps",
         type=int,
-        default=10000,
+        default=1_000_000,
         help="maximum interactive playback frames",
     )
     parser.add_argument(
