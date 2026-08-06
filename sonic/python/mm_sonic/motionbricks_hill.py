@@ -8,6 +8,15 @@ import math
 import numpy as np
 
 
+DEFAULT_HILL_SLOPE_DEGREES = 18.0
+DEFAULT_HILL_DIAMETER_M = 7.0
+DEFAULT_HILL_HEIGHT_M = (
+    math.tan(math.radians(DEFAULT_HILL_SLOPE_DEGREES))
+    * DEFAULT_HILL_DIAMETER_M
+    / math.pi
+)
+
+
 @dataclass(frozen=True)
 class GentleHillProfile:
     """Local radial cosine mound surrounded by flat ground."""
@@ -15,8 +24,8 @@ class GentleHillProfile:
     domain_x: tuple[float, float] = (-5.0, 15.0)
     half_width: float = 8.0
     hill_start_x: float = 1.5
-    hill_length: float = 7.0
-    height_m: float = 0.35
+    hill_length: float = DEFAULT_HILL_DIAMETER_M
+    height_m: float = DEFAULT_HILL_HEIGHT_M
 
     def __post_init__(self) -> None:
         start, end = self.domain_x

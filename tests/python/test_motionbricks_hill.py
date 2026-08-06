@@ -7,7 +7,11 @@ import unittest
 
 import numpy as np
 
-from mm_sonic.motionbricks_hill import GentleHillProfile
+from mm_sonic.motionbricks_hill import (
+    DEFAULT_HILL_HEIGHT_M,
+    DEFAULT_HILL_SLOPE_DEGREES,
+    GentleHillProfile,
+)
 
 
 class GentleHillProfileTest(unittest.TestCase):
@@ -24,9 +28,11 @@ class GentleHillProfileTest(unittest.TestCase):
             self.hill.height_m,
         )
 
-    def test_maximum_grade_is_between_eight_and_ten_degrees(self) -> None:
-        self.assertGreaterEqual(self.hill.max_slope_degrees, 8.0)
-        self.assertLessEqual(self.hill.max_slope_degrees, 10.0)
+    def test_default_mound_has_exact_eighteen_degree_grade(self) -> None:
+        self.assertEqual(DEFAULT_HILL_SLOPE_DEGREES, 18.0)
+        self.assertAlmostEqual(DEFAULT_HILL_HEIGHT_M, 0.7239760607, places=9)
+        self.assertAlmostEqual(self.hill.height_m, DEFAULT_HILL_HEIGHT_M)
+        self.assertAlmostEqual(self.hill.max_slope_degrees, 18.0, places=10)
 
     def test_default_map_has_room_to_steer_around_the_hill(self) -> None:
         approach_length = self.hill.hill_start_x - self.hill.domain_x[0]
