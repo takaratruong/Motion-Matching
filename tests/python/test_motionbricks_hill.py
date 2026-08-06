@@ -28,11 +28,34 @@ class GentleHillProfileTest(unittest.TestCase):
         self.assertGreaterEqual(self.hill.max_slope_degrees, 8.0)
         self.assertLessEqual(self.hill.max_slope_degrees, 10.0)
 
-    def test_height_rejects_queries_outside_certified_domain(self) -> None:
-        with self.assertRaisesRegex(ValueError, "outside"):
-            self.hill.height((self.hill.domain_x[1] + 0.01, 0.0))
-        with self.assertRaisesRegex(ValueError, "outside"):
-            self.hill.height((0.0, self.hill.half_width + 0.01))
+    def test_default_map_has_room_to_steer_around_the_hill(self) -> None:
+        approach_length = self.hill.hill_start_x - self.hill.domain_x[0]
+        exit_length = (
+            self.hill.domain_x[1]
+            - self.hill.hill_start_x
+            - self.hill.hill_length
+        )
+        self.assertGreaterEqual(self.hill.half_width, 8.0)
+        self.assertGreaterEqual(approach_length, 6.0)
+        self.assertGreaterEqual(exit_length, 6.0)
+
+    def test_ground_is_flat_outside_the_local_hill_map(self) -> None:
+        self.assertEqual(
+            self.hill.height((self.hill.domain_x[1] + 100.0, 0.0)), 0.0
+        )
+        self.assertEqual(
+            self.hill.height((0.0, self.hill.half_width + 100.0)), 0.0
+        )
+
+    def test_hill_falls_off_smoothly_in_the_lateral_direction(self) -> None:
+        center_x = self.hill.hill_start_x + 0.5 * self.hill.hill_length
+        radius = 0.5 * self.hill.hill_length
+        self.assertAlmostEqual(self.hill.height((center_x, 0.0)), self.hill.height_m)
+        self.assertAlmostEqual(
+            self.hill.height((center_x, 0.5 * radius)),
+            0.5 * self.hill.height_m,
+        )
+        self.assertEqual(self.hill.height((center_x, radius)), 0.0)
 
     def test_profile_is_continuous_at_hill_boundaries(self) -> None:
         epsilon = 1.0e-7
@@ -43,8 +66,8 @@ class GentleHillProfileTest(unittest.TestCase):
 
     def test_mesh_uses_the_same_height_contract(self) -> None:
         vertices, faces = self.hill.mesh(sample_count=41)
-        self.assertEqual(vertices.shape, (82, 3))
-        self.assertEqual(faces.shape, (80, 3))
+        self.assertGreater(vertices.shape[0], 1000)
+        self.assertGreater(faces.shape[0], 2000)
         self.assertTrue(np.isfinite(vertices).all())
         self.assertTrue(np.isfinite(faces).all())
         for vertex in vertices:
@@ -53,9 +76,8 @@ class GentleHillProfileTest(unittest.TestCase):
                 self.hill.height(vertex[:2]),
                 places=12,
             )
-        self.assertTrue(
-            np.allclose(np.abs(vertices[:, 1]), self.hill.half_width)
-        )
+        self.assertAlmostEqual(float(vertices[:, 1].min()), -self.hill.half_width)
+        self.assertAlmostEqual(float(vertices[:, 1].max()), self.hill.half_width)
 
     def test_mesh_rejects_too_few_samples(self) -> None:
         with self.assertRaisesRegex(ValueError, "sample_count"):

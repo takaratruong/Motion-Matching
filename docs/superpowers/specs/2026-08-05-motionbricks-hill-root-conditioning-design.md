@@ -65,12 +65,12 @@ the external MotionBricks checkout.
 
 ### 1. Fixed smooth hill
 
-Add a deterministic exact-mesh hill scene with flat approach and exit regions.
-The first treatment route is a smooth cosine-style longitudinal profile wide
-enough that a straight traversal never reaches a lateral boundary. Its maximum
-absolute grade is between 8 and 10 degrees, inside the approved 5--12 degree
-range. It contains no height discontinuities, steps, curbs, holes, or
-cross-slope component.
+Add a deterministic exact-mesh hill scene with flat ground around one local
+radial mound. A centerline traversal follows the same smooth cosine rise and
+fall, while lateral steering smoothly moves around the mound rather than
+reaching a hard terrain-strip boundary. Its maximum absolute grade is between
+8 and 10 degrees, inside the approved 5--12 degree range. It contains no height
+discontinuities, steps, curbs, or holes.
 
 One mathematical profile owns both mesh construction and height sampling so
 the conditioner, renderer, and evaluator cannot disagree about the surface.
@@ -135,8 +135,9 @@ Add a hill-only mode to the existing MotionBricks browser viewer. This mode:
    MotionBricks generation;
 5. displays the fixed hill mesh, current trajectory, current terrain height,
    and latest conditioned target heights; and
-6. keeps the session bounded to the hill mesh, stopping rather than sampling
-   outside its certified height domain.
+6. treats finite queries outside the local mound as surrounding flat ground,
+   matching the MuJoCo scene's ground plane instead of terminating normal
+   lateral steering.
 
 The first implementation may use a dedicated hill-viewer entry point when
 that keeps portal behavior unchanged and reduces integration risk. It should
@@ -242,7 +243,7 @@ Fail before publishing a verdict when:
 - CUDA or a required renderer dependency is unavailable;
 - the target-transform hook no longer matches the pinned preview API;
 - canonical/world coordinate reconstruction fails;
-- a height query is outside the hill domain or non-finite;
+- a height query is non-finite;
 - a generation event returns an unexpected batch, frame, or `qpos` shape;
 - the control and treatment inputs are not otherwise identical;
 - an output array contains non-finite values; or

@@ -25,11 +25,11 @@ PYTHONPATH=sonic/python sonic/.venv/bin/python -m unittest \
 ## Experimental MotionBricks gentle-hill viewer
 
 `mm_sonic.motionbricks_hill_viewer` is a minimal kinematic probe for the
-released G1 MotionBricks model. It renders one wide 8.93-degree cosine hill and
-adds the hill's relative elevation to MotionBricks' sparse future root targets
-before model inference. Generated root orientation and joint values are not
-terrain-warped. This first spike has no foot IK, collision correction, physics,
-or terrain-normal root rotation.
+released G1 MotionBricks model. It renders one local radial 8.93-degree cosine
+mound with flat ground around it and adds the hill's relative elevation to
+MotionBricks' sparse future root targets before model inference. Generated root
+orientation and joint values are not terrain-warped. This first spike has no
+foot IK, collision correction, physics, or terrain-normal root rotation.
 
 Prepare the pinned MotionBricks checkout and an isolated CUDA environment:
 

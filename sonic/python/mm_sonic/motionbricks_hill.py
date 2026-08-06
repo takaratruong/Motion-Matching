@@ -10,10 +10,10 @@ import numpy as np
 
 @dataclass(frozen=True)
 class GentleHillProfile:
-    """Wide cosine hill with flat approach and exit aprons."""
+    """Local radial cosine mound surrounded by flat ground."""
 
-    domain_x: tuple[float, float] = (-3.0, 12.0)
-    half_width: float = 3.0
+    domain_x: tuple[float, float] = (-5.0, 15.0)
+    half_width: float = 8.0
     hill_start_x: float = 1.5
     hill_length: float = 7.0
     height_m: float = 0.35
@@ -38,22 +38,20 @@ class GentleHillProfile:
             raise ValueError("hill dimensions must be finite and positive")
 
     def height(self, xy: object) -> float:
-        """Return exact terrain Z for one certified world XY query."""
+        """Return exact terrain Z for the mound on an otherwise flat plane."""
 
         point = np.asarray(xy, dtype=np.float64)
         if point.shape != (2,) or not np.isfinite(point).all():
             raise ValueError("terrain XY must contain two finite values")
         x, y = (float(value) for value in point)
-        if not (
-            self.domain_x[0] <= x <= self.domain_x[1]
-            and abs(y) <= self.half_width
-        ):
-            raise ValueError("terrain XY is outside the certified hill domain")
-        offset = x - self.hill_start_x
-        if offset <= 0.0 or offset >= self.hill_length:
+        radius = 0.5 * self.hill_length
+        center_x = self.hill_start_x + radius
+        radial_distance = math.hypot(x - center_x, y)
+        if radial_distance >= radius:
             return 0.0
-        phase = offset / self.hill_length
-        return 0.5 * self.height_m * (1.0 - math.cos(2.0 * math.pi * phase))
+        return 0.5 * self.height_m * (
+            1.0 + math.cos(math.pi * radial_distance / radius)
+        )
 
     @property
     def max_slope_degrees(self) -> float:
@@ -76,21 +74,51 @@ class GentleHillProfile:
         return np.column_stack((x_values, z_values))
 
     def mesh(self, sample_count: int = 151) -> tuple[np.ndarray, np.ndarray]:
-        """Return a two-sided strip mesh whose vertices obey :meth:`height`."""
+        """Return a rectangular grid mesh whose vertices obey :meth:`height`."""
 
-        profile = self.profile_vertices(sample_count)
-        vertices = np.empty((sample_count * 2, 3), dtype=np.float64)
-        vertices[0::2, 0] = profile[:, 0]
-        vertices[1::2, 0] = profile[:, 0]
-        vertices[0::2, 1] = -self.half_width
-        vertices[1::2, 1] = self.half_width
-        vertices[0::2, 2] = profile[:, 1]
-        vertices[1::2, 2] = profile[:, 1]
+        if not isinstance(sample_count, int) or sample_count < 2:
+            raise ValueError("sample_count must be an integer of at least two")
+        span_x = self.domain_x[1] - self.domain_x[0]
+        span_y = 2.0 * self.half_width
+        y_intervals = max(
+            1, int(round((sample_count - 1) * span_y / span_x))
+        )
+        y_count = y_intervals + 1
+        x_values = np.linspace(
+            self.domain_x[0], self.domain_x[1], sample_count, dtype=np.float64
+        )
+        y_values = np.linspace(
+            -self.half_width, self.half_width, y_count, dtype=np.float64
+        )
+        x_grid, y_grid = np.meshgrid(x_values, y_values, indexing="ij")
+        z_grid = np.asarray(
+            [
+                self.height((float(x), float(y)))
+                for x, y in zip(x_grid.ravel(), y_grid.ravel())
+            ],
+            dtype=np.float64,
+        ).reshape(x_grid.shape)
+        vertices = np.column_stack(
+            (x_grid.ravel(), y_grid.ravel(), z_grid.ravel())
+        )
 
-        faces = np.empty(((sample_count - 1) * 2, 3), dtype=np.int32)
-        for index in range(sample_count - 1):
-            left = 2 * index
-            right = left + 2
-            faces[2 * index] = (left, right, right + 1)
-            faces[2 * index + 1] = (left, right + 1, left + 1)
+        faces = np.empty(
+            ((sample_count - 1) * (y_count - 1) * 2, 3), dtype=np.int32
+        )
+        face_index = 0
+        for x_index in range(sample_count - 1):
+            for y_index in range(y_count - 1):
+                lower_left = x_index * y_count + y_index
+                lower_right = (x_index + 1) * y_count + y_index
+                faces[face_index] = (
+                    lower_left,
+                    lower_right,
+                    lower_right + 1,
+                )
+                faces[face_index + 1] = (
+                    lower_left,
+                    lower_right + 1,
+                    lower_left + 1,
+                )
+                face_index += 2
         return vertices, faces
