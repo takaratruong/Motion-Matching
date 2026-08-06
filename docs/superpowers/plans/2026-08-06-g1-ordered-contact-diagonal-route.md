@@ -222,8 +222,8 @@ PYTHONPATH=.:sonic/python sonic/.torch-mm-venv/bin/python -B \
   --source-dataset build/torch-grail-terrain-full-v1 \
   --target-scene grail-stair_p1-db7949fce1b2e48d39f4 \
   --g1-xml /home/ubuntu/projects/mjx-diffphysics/env/g1/assets/g1_29dof.xml \
-  --path-start -0.4835621836 1.4414988213 \
-  --path-stop 0.7000000000 0.2579366377 \
+  --path-start -0.4835621836 1.4914988213 \
+  --path-stop 0.7000000000 0.3079366377 \
   --ordered-contact-levels \
   --segment-length-m 0.90 --search-stride-m 0.20 \
   --step-width-m 0.20 --workers 32 \

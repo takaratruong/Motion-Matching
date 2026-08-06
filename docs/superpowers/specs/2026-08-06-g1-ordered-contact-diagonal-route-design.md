@@ -21,8 +21,8 @@ foot projection, or edited joint trajectories.
 The first route travels at -45 degrees in scene XY from:
 
 ```text
-start = (-0.4835621836, 1.4414988213)
-stop  = ( 0.7000000000, 0.2579366377)
+start = (-0.4835621836, 1.4914988213)
+stop  = ( 0.7000000000, 0.3079366377)
 length = 1.6738096920 m
 ```
 
