@@ -31,6 +31,8 @@ def build_clip(
     output_root: Path,
     ramp_frames: int = 24,
     hold_frames: int = 30,
+    reverse_ramp_frames: int | None = None,
+    reverse_hold_frames: int | None = None,
     pivot_speed_mps: float = 0.20,
 ) -> dict[str, object]:
     """Materialize, qualify, and compose one registered archive clip."""
@@ -88,6 +90,12 @@ def build_clip(
         mode=["stop_restart", "reverse"],
         ramp_frames=int(ramp_frames),
         hold_frames=int(hold_frames),
+        reverse_ramp_frames=(
+            None if reverse_ramp_frames is None else int(reverse_ramp_frames)
+        ),
+        reverse_hold_frames=(
+            None if reverse_hold_frames is None else int(reverse_hold_frames)
+        ),
         pivot_clearance_m=0.008,
         pivot_speed_mps=float(pivot_speed_mps),
         pivot_central_fraction=(0.20, 0.80),
@@ -130,6 +138,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--ramp-frames", type=int, default=24)
     parser.add_argument("--hold-frames", type=int, default=30)
+    parser.add_argument("--reverse-ramp-frames", type=int)
+    parser.add_argument("--reverse-hold-frames", type=int)
     parser.add_argument("--pivot-speed-mps", type=float, default=0.20)
     arguments = parser.parse_args(argv)
     result = build_clip(
@@ -139,6 +149,8 @@ def main(argv: list[str] | None = None) -> int:
         output_root=arguments.output_root,
         ramp_frames=arguments.ramp_frames,
         hold_frames=arguments.hold_frames,
+        reverse_ramp_frames=arguments.reverse_ramp_frames,
+        reverse_hold_frames=arguments.reverse_hold_frames,
         pivot_speed_mps=arguments.pivot_speed_mps,
     )
     print(json.dumps(result, indent=2, sort_keys=True))

@@ -342,12 +342,21 @@ def build_pilots(arguments: argparse.Namespace) -> dict[str, object]:
         )
         event = manifest["events"][event_index]
         for mode in modes:
+            ramp_frames = int(arguments.ramp_frames)
+            hold_frames = int(arguments.hold_frames)
+            if mode == "reverse":
+                reverse_ramp = getattr(arguments, "reverse_ramp_frames", None)
+                reverse_hold = getattr(arguments, "reverse_hold_frames", None)
+                if reverse_ramp is not None:
+                    ramp_frames = int(reverse_ramp)
+                if reverse_hold is not None:
+                    hold_frames = int(reverse_hold)
             schedule = build_maneuver_schedule(
                 len(source.root_position_world),
                 pivot_source_frame=pivot.frame_index,
                 mode=mode,
-                ramp_frames=arguments.ramp_frames,
-                hold_frames=arguments.hold_frames,
+                ramp_frames=ramp_frames,
+                hold_frames=hold_frames,
             )
             motion = resample_stitched_motion(source, schedule)
             label = f"event_{event_index:02d}_{event['kind']}_{mode}"
@@ -415,6 +424,8 @@ def build_pilots(arguments: argparse.Namespace) -> dict[str, object]:
                 "event_index": event_index,
                 "kind": str(event["kind"]),
                 "mode": mode,
+                "ramp_frames": ramp_frames,
+                "hold_frames": hold_frames,
                 "status": (
                     "pending_dense_visual_review"
                     if automatic
@@ -515,6 +526,16 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--ramp-frames", type=int, default=24)
     parser.add_argument("--hold-frames", type=int, default=30)
+    parser.add_argument(
+        "--reverse-ramp-frames",
+        type=int,
+        help="override --ramp-frames for direction reversals",
+    )
+    parser.add_argument(
+        "--reverse-hold-frames",
+        type=int,
+        help="override --hold-frames for direction reversals",
+    )
     parser.add_argument("--pivot-clearance-m", type=float, default=0.008)
     parser.add_argument("--pivot-speed-mps", type=float, default=0.12)
     parser.add_argument(

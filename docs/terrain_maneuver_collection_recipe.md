@@ -83,6 +83,13 @@ failed.  This is useful trackability evidence but not a collection pass.  The
 next tracker branch upweights those nine exact failures, then must re-run all
 28 clips so success cannot be purchased by forgetting the current passes.
 
+The first varied-terrain montage also exposed a presentation and data-quality
+distinction.  Hard cuts between its five review windows are not motion
+teleports, but freezing a mid-stride support pose for 30 frames is visibly
+unnatural.  Reversal candidates now use a shorter 16/4/16-frame timing and the
+seven varied-terrain sources still pass the exact gates.  Natural sustained
+stops should come from real start/stop motion, not a long frozen walking pose.
+
 A CPU-only scale-up script tested twelve additional C490 clips stratified across
 grade and round-trip structure.  Seven source clips produced fourteen admitted
 pilots; three had no trustworthy supported pivot and two failed the source

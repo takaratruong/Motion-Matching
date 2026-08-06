@@ -18,9 +18,10 @@ GRAIL_ROOT=/move/u/justingu/Projects/grail-stairs
 MM_ROOT=/move/u/bodow/Projects/Motion-Matching-takara-corpus
 RUN_ROOT=/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_clean_bank28_v1
 BUNDLE=${RUN_ROOT}/bundle
-TRAIN_OUTPUT=${RUN_ROOT}/sonic_finetune_v1
-CHECKPOINT=${RUN_ROOT}/sonic_finetune_v1_eval_checkpoint
-OUTPUT=${RUN_ROOT}/clean_eval_v1
+TRAIN_OUTPUT=${TERRAIN_MANEUVER_TRAIN_OUTPUT:-${RUN_ROOT}/sonic_finetune_v1}
+CHECKPOINT=${TERRAIN_MANEUVER_EVAL_CHECKPOINT:-${RUN_ROOT}/sonic_finetune_v1_eval_checkpoint}
+OUTPUT=${TERRAIN_MANEUVER_EVAL_OUTPUT:-${RUN_ROOT}/clean_eval_v1}
+DATASET_NAME=${TERRAIN_MANEUVER_EVAL_DATASET_NAME:-terrain_maneuver_bank28_finetune_clean_diagnostic}
 
 if [[ ! -r "${BUNDLE}/motion_lib_merged.pkl" || ! -r "${BUNDLE}/objects.pkl" ]]; then
     echo "missing terrain maneuver bundle" >&2
@@ -72,6 +73,6 @@ python -u -m sonic_port.collect.collect_sonic_multiclip \
     --accept_failed \
     --max_mpjpe_mm 10000 \
     --store_dtype float32 \
-    --dataset_name terrain_maneuver_bank28_finetune_clean_diagnostic
+    --dataset_name "${DATASET_NAME}"
 
 test -f "${OUTPUT}/collect_summary.json"

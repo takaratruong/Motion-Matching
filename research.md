@@ -1317,6 +1317,23 @@ A nine-clip hard-example bundle was materialized from those exact failures at
 The first continuation attempt was aborted before initialization when the
 evaluation process wedged the NVIDIA driver during Isaac shutdown on `move3`;
 the partial directory was preserved with suffix
-`failed_driver_lock_16529858`.  Job `16532692` requests an L40 on
-`humanoid,move`, excluding the affected A5000 node by GRES type.  Its result
-must be re-evaluated on the complete 28-clip bank to detect forgetting.
+`failed_driver_lock_16529858`.  L40 job `16532692` then failed before Isaac
+launch because its assigned `move4` GPU could not initialize CUDA; that partial
+directory is preserved with suffix `failed_cuda_init_16532692`.  The same
+modest 192-environment continuation is pending as Titan RTX job `16532739` on
+explicit node `move2`.  Full-bank evaluation job `16532753` is dependency
+chained with separate output.  Its result must be checked on all 28 clips to
+detect forgetting.
+
+Dense 25 fps review of the original five-window varied-terrain montage
+confirmed that its apparent teleports occur at hard montage cuts, but also
+confirmed a genuine source-side roughness: each 24/30/24-frame maneuver freezes
+a supported mid-stride pose long enough to look unnatural.  A v2 builder now
+permits reversal-specific timing.  The seven admitted varied-terrain sources
+were rebuilt with a 16-frame deceleration, four-frame reversal pivot, and
+16-frame acceleration; stop/restart uses 16/15/16.  All fourteen v2 motions
+pass the exact collision/mechanics gates.  Across the reversal set, maximum
+stance-run drift is 2.941 mm and maximum 50 Hz joint step is 0.123 rad.  Four
+dense synchronized renders show continuous foot lock without the long frozen
+pose.  Evidence: `artifacts/terrain_maneuver_bank/c490_slope_quick7_v2` and
+`quick_reverse4_grid.mp4`.

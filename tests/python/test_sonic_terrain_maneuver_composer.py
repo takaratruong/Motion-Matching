@@ -152,6 +152,19 @@ class TerrainManeuverComposerTests(unittest.TestCase):
         self.assertLess(float(delta[hold_indices[-1]]), 0.001)
         self.assertLessEqual(float(np.max(delta)), 1.000001)
 
+    def test_short_reverse_schedule_keeps_only_requested_hold(self) -> None:
+        schedule = build_maneuver_schedule(
+            160,
+            pivot_source_frame=80,
+            mode="reverse",
+            ramp_frames=16,
+            hold_frames=4,
+        )
+
+        hold = schedule.source_coordinate[schedule.phase == HOLD]
+        np.testing.assert_array_equal(hold, np.full(4, 80.0))
+        self.assertAlmostEqual(float(schedule.source_coordinate[-1]), 0.0)
+
     def test_fractional_resampling_keeps_commands_synchronized(self) -> None:
         source = _motion()
         schedule = build_maneuver_schedule(
