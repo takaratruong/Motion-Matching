@@ -114,14 +114,16 @@ class HillViewerCliTest(unittest.TestCase):
         self.assertIn("--smoke-steps", help_text)
 
     def test_trace_reports_ik_fallback_reason(self) -> None:
-        from mm_sonic.motionbricks_hill_ik import (
-            FootPhase,
-            HillFootIKDiagnostics,
+        from mm_sonic.motionbricks_authored_contacts import (
+            AuthoredFootContacts,
         )
+        from mm_sonic.motionbricks_hill_ik import HillFootIKDiagnostics
         from mm_sonic.motionbricks_hill_viewer import _trace_line
 
         diagnostics = HillFootIKDiagnostics(
-            phases=(FootPhase.SWING, FootPhase.STANCE),
+            authored_stance=(True, False),
+            locked=(True, False),
+            root_height_correction_m=0.025,
             raw_penetration_m=0.02,
             corrected_penetration_m=0.02,
             maximum_target_residual_m=0.0,
@@ -130,6 +132,12 @@ class HillViewerCliTest(unittest.TestCase):
             accepted=False,
             reason="terrain sample invalid",
         )
+        contacts = AuthoredFootContacts(
+            channels=(True, False, False, False),
+            stance=(True, False),
+            valid=True,
+            reason="ok",
+        )
 
         line = _trace_line(
             3,
@@ -137,8 +145,13 @@ class HillViewerCliTest(unittest.TestCase):
             GentleHillProfile(),
             SimpleNamespace(latest_trace=None),
             diagnostics,
+            contacts,
         )
 
+        self.assertIn("contacts=1000", line)
+        self.assertIn("stance=10", line)
+        self.assertIn("locked=10", line)
+        self.assertIn("root_dz=0.025", line)
         self.assertIn("accepted=0", line)
         self.assertIn("reason=terrain_sample_invalid", line)
 

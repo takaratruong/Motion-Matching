@@ -28,11 +28,14 @@ PYTHONPATH=sonic/python sonic/.venv/bin/python -m unittest \
 released G1 MotionBricks model. It renders one local radial 18-degree cosine
 mound with flat ground around it and adds the hill's relative elevation to
 MotionBricks' sparse future root targets before model inference. Generated root
-orientation is not terrain-warped. A bounded stance-aware post-process adjusts
-only the six leg joints per side for planted-foot slope alignment and upward
-swing clearance. The corrected qpos is a display-only copy: it is never written
-to `full_agent.frames` or fed back into MotionBricks context. This first spike
-has no collision dynamics, physics, or terrain-normal root rotation.
+orientation is not terrain-warped. The viewer reads MotionBricks' authored
+heel/toe contacts from the same feature frame as each displayed qpos.
+World-space foot targets exist only while those contacts are active and are
+cleared at toe-off. A bounded display-only root-Z offset handles terrain-height
+error before leg IK, while swing correction is upward-only. The corrected qpos
+is never written to `full_agent.frames` or fed back into MotionBricks context.
+This first spike has no collision dynamics, physics, or terrain-normal root
+rotation.
 
 Prepare the pinned MotionBricks checkout and an isolated CUDA environment:
 
@@ -67,7 +70,7 @@ The viewer starts on the flat apron facing the hill. `W/A/S/D` controls travel
 relative to the camera; rotate the camera to change the forward direction and
 press Escape to close. The terminal prints root height, exact terrain height,
 the four most recent terrain-height targets delivered before inference, and
-foot phase/penetration/residual/correction diagnostics.
+authored contact/lock/root-height/penetration/residual/correction diagnostics.
 
 For a bounded headless dependency/checkpoint smoke test:
 

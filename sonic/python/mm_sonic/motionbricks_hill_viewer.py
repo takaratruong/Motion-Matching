@@ -14,6 +14,10 @@ from typing import Iterator
 
 import numpy as np
 
+from .motionbricks_authored_contacts import (
+    AuthoredFootContacts,
+    sample_authored_contacts,
+)
 from .motionbricks_hill import GentleHillProfile
 from .motionbricks_hill_conditioning import MotionBricksHillConditioner
 from .motionbricks_hill_ik import (
@@ -247,6 +251,7 @@ def _trace_line(
     profile: GentleHillProfile,
     conditioner: MotionBricksHillConditioner,
     ik_diagnostics: HillFootIKDiagnostics | None,
+    contacts: AuthoredFootContacts,
 ) -> str:
     terrain_height = profile.height(qpos[:2])
     trace = conditioner.latest_trace
@@ -255,13 +260,25 @@ def _trace_line(
         target_text = ",".join(
             f"{value:.3f}" for value in trace.target_heights_world
         )
-    ik_text = "ik=off"
+    channels = "".join(
+        "1" if value else "0" for value in contacts.channels
+    )
+    stance = "".join(
+        "1" if value else "0" for value in contacts.stance
+    )
+    contact_text = (
+        f"contacts={channels} stance={stance} "
+        f"contact_valid={int(contacts.valid)}"
+    )
+    ik_text = f"{contact_text} ik=off"
     if ik_diagnostics is not None:
-        phases = "/".join(
-            phase.value for phase in ik_diagnostics.phases
+        locked = "".join(
+            "1" if value else "0"
+            for value in ik_diagnostics.locked
         )
         ik_text = (
-            f"ik={phases} "
+            f"{contact_text} locked={locked} "
+            f"root_dz={ik_diagnostics.root_height_correction_m:.3f} "
             f"penetration={ik_diagnostics.raw_penetration_m:.3f}"
             f"->{ik_diagnostics.corrected_penetration_m:.3f} "
             f"residual={ik_diagnostics.maximum_target_residual_m:.3f} "
@@ -283,9 +300,13 @@ def _step_agent(
     viewer: object,
     random_seed: int,
     automatic: bool,
-) -> np.ndarray:
+) -> tuple[np.ndarray, AuthoredFootContacts]:
     import torch
 
+    frame_index = int(demo.full_agent._current_frame_idx)
+    contacts = sample_authored_contacts(
+        demo.full_agent, frame_index
+    )
     qpos = np.asarray(demo.full_agent.get_next_frame(), dtype=np.float64)
     context = demo.full_agent.get_context_mujoco_qpos()
     demo.mj_data.qpos[:] = qpos
@@ -319,7 +340,7 @@ def _step_agent(
         )
         if demo.full_agent.frames.get("mujoco_qpos") is not previous_frames:
             demo.full_agent.frames["mujoco_qpos"][..., 2] += support_height
-    return qpos
+    return qpos, contacts
 
 
 def _run(arguments: argparse.Namespace) -> int:
@@ -361,7 +382,7 @@ def _run(arguments: argparse.Namespace) -> int:
             "MotionBricks gentle hill: "
             f"max grade {profile.max_slope_degrees:.2f} degrees; "
             + (
-                "stance-aware display IK"
+                "authored-contact display IK"
                 if foot_ik is not None
                 else "raw display, IK disabled"
             )
@@ -371,11 +392,17 @@ def _run(arguments: argparse.Namespace) -> int:
 
         if arguments.no_viewer:
             viewer = _dummy_viewer()
-            qpos = np.asarray(demo.full_agent.get_next_frame())
+            qpos = np.asarray(model.qpos0, dtype=np.float64)
+            contacts = AuthoredFootContacts(
+                channels=(False, False, False, False),
+                stance=(False, False),
+                valid=False,
+                reason="waiting for first frame",
+            )
             ik_diagnostics = None
             display_qpos = qpos
             for step in range(arguments.smoke_steps):
-                qpos = _step_agent(
+                qpos, contacts = _step_agent(
                     demo,
                     profile,
                     viewer=viewer,
@@ -386,7 +413,9 @@ def _run(arguments: argparse.Namespace) -> int:
                     None
                     if foot_ik is None
                     else foot_ik.apply(
-                        qpos, float(model.opt.timestep)
+                        qpos,
+                        contacts.stance,
+                        float(model.opt.timestep),
                     )
                 )
                 display_qpos = (
@@ -395,6 +424,17 @@ def _run(arguments: argparse.Namespace) -> int:
                 ik_diagnostics = (
                     None if ik_result is None else ik_result.diagnostics
                 )
+                if ik_diagnostics is not None and any(
+                    locked and not stance_active
+                    for locked, stance_active in zip(
+                        ik_diagnostics.locked,
+                        contacts.stance,
+                        strict=True,
+                    )
+                ):
+                    raise RuntimeError(
+                        "released authored foot retained a world lock"
+                    )
                 data.qpos[:] = display_qpos
                 mujoco.mj_forward(model, data)
                 if step % arguments.trace_every == 0:
@@ -405,6 +445,7 @@ def _run(arguments: argparse.Namespace) -> int:
                             profile,
                             conditioner,
                             ik_diagnostics,
+                            contacts,
                         )
                     )
             print(
@@ -414,6 +455,7 @@ def _run(arguments: argparse.Namespace) -> int:
                     profile,
                     conditioner,
                     ik_diagnostics,
+                    contacts,
                 )
             )
             if not np.isfinite(demo.full_agent.frames["mujoco_qpos"].detach().cpu().numpy()).all():
@@ -429,7 +471,7 @@ def _run(arguments: argparse.Namespace) -> int:
             step = 0
             while viewer.is_running() and step < arguments.max_steps:
                 started = time.monotonic()
-                qpos = _step_agent(
+                qpos, contacts = _step_agent(
                     demo,
                     profile,
                     viewer=viewer,
@@ -440,7 +482,9 @@ def _run(arguments: argparse.Namespace) -> int:
                     None
                     if foot_ik is None
                     else foot_ik.apply(
-                        qpos, float(model.opt.timestep)
+                        qpos,
+                        contacts.stance,
+                        float(model.opt.timestep),
                     )
                 )
                 display_qpos = (
@@ -449,6 +493,17 @@ def _run(arguments: argparse.Namespace) -> int:
                 ik_diagnostics = (
                     None if ik_result is None else ik_result.diagnostics
                 )
+                if ik_diagnostics is not None and any(
+                    locked and not stance_active
+                    for locked, stance_active in zip(
+                        ik_diagnostics.locked,
+                        contacts.stance,
+                        strict=True,
+                    )
+                ):
+                    raise RuntimeError(
+                        "released authored foot retained a world lock"
+                    )
                 data.qpos[:] = display_qpos
                 step += 1
                 mujoco.mj_forward(model, data)
@@ -462,6 +517,7 @@ def _run(arguments: argparse.Namespace) -> int:
                             profile,
                             conditioner,
                             ik_diagnostics,
+                            contacts,
                         )
                     )
                 remaining = float(model.opt.timestep) - (
