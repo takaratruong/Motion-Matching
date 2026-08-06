@@ -131,6 +131,25 @@ def _accepted_manifest_selections(paths: tuple[Path, ...]) -> tuple[str, ...]:
     return tuple(selections)
 
 
+def _selection_file_entries(paths: tuple[Path, ...]) -> tuple[str, ...]:
+    """Read ordered ``MANIFEST#LABEL`` entries from selection JSON files."""
+
+    selections: list[str] = []
+    for value in paths:
+        path = value.expanduser().resolve()
+        payload = json.loads(path.read_text())
+        rows = payload.get("selections")
+        if not isinstance(rows, list):
+            raise ValueError(f"{path}: expected a selections list")
+        for row in rows:
+            pilot = row.get("pilot") if isinstance(row, dict) else row
+            if not isinstance(pilot, str):
+                raise ValueError(f"{path}: selection has no string pilot")
+            _selection(pilot)
+            selections.append(pilot)
+    return tuple(selections)
+
+
 def _clip_stem(manifest_path: Path, label: str) -> str:
     """Return a stable ID that remains unique for nested bank manifests."""
 
@@ -331,6 +350,13 @@ def main(argv: list[str] | None = None) -> int:
             "directly under this generated bank"
         ),
     )
+    parser.add_argument(
+        "--selection-file",
+        type=Path,
+        action="append",
+        default=[],
+        help="include the ordered pilots in a generated selection JSON file",
+    )
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args(argv)
     rooted_manifests = tuple(
@@ -343,8 +369,9 @@ def main(argv: list[str] | None = None) -> int:
     expanded = _accepted_manifest_selections(
         (*tuple(arguments.manifest), *rooted_manifests)
     )
+    selected = _selection_file_entries(tuple(arguments.selection_file))
     selections = (
-        *tuple(dict.fromkeys((*arguments.pilot, *expanded))),
+        *tuple(dict.fromkeys((*arguments.pilot, *selected, *expanded))),
         *tuple(arguments.repeat_pilot),
     )
     result = prepare(selections, arguments.output)

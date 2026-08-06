@@ -194,6 +194,35 @@ Mirror only geometrically mirrorable clips, including the full motion history,
 commands, contacts, terrain transform, and terrain observation.  Keep the
 original/mirror pair identifier so a later audit can compare them exactly.
 
+## Stairs500 execution bank
+
+The stairs-specific scale-up is now materialized rather than hypothetical.  A
+240-source CPU sweep (120 ascent and 120 descent) yields 332 automatically
+admitted stop/restart or reversal motions from 174 clean source traversals.
+Archive sources that fail the exact complete-G1 mesh audit are discarded.
+
+Training uses a balanced 200-motion subset:
+
+- 50 ascent stop/restart;
+- 50 ascent reversal;
+- 50 descent stop/restart;
+- 50 descent reversal.
+
+The selection spans 115 distinct registered source traversals, 3--8 steps,
+0.100--0.238 m risers, 0.230--1.007 m treads, and -40.15 to +34.72 degree
+approach offsets.  Its paths are:
+
+- selection: `/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/selected200_v1.json`;
+- SONIC bundle: `/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/selected200_bundle_v1`;
+- clean review: `/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/selected200_kinematic_review_v1/selected200_kinematic_review8_grid.mp4`.
+
+Use exactly one training environment per bundle motion for the first equal-share
+tracker pass.  A 256-environment launch over this 200-motion bank duplicated 56
+clips and was quarantined at iteration 75.  The corrected run uses 200
+environments and separately evaluates iterations 50, 100, 200, 300, and 400.
+Select the checkpoint by deterministic all-motion survival plus peak MPJPE and
+visual review, not by training reward alone.
+
 ## Per-clip record
 
 Store the clean kinematics and the causal information needed downstream:

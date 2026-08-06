@@ -1479,3 +1479,67 @@ departing from the reference by 1181 mm.  The three labeled failures likewise
 drift or terminate rather than exhibiting a hidden montage cut.  Visual review
 therefore agrees with the numeric gate: step 25 is useful for diagnosis, not for
 noised data collection.
+
+### Stairs500 stop/reversal scale-up (2026-08-06)
+
+The clean stairs500 archive contains 500 full G1 traversals and 249,500 frames
+(about 83 minutes at 50 Hz), split evenly between ascent and descent.  It spans
+3--8 steps, 0.100--0.249 m risers, 0.218--1.007 m treads, and multiple registered
+approach angles.  The existing `grail_stairs500_sonic_v1` corpus already supplies
+large quantities of ordinary noisy stair tracking, so this scale-up targets the
+missing joystick events rather than recollecting unchanged traversals.
+
+A deterministic source selector chose 120 ascents and 120 descents.  CPU-only
+job `16539799` completed the exact-mesh sweep for all 240 sources.  Sources with
+centimetre-scale penetration in the nominally clean archive were rejected rather
+than repaired beyond the bounded clearance allowance.  The remaining 174 source
+manifests contain 332 automatically admitted maneuvers: 97 descent stops, 101
+descent reversals, 66 ascent stops, and 68 ascent reversals.  Every admitted
+motion preserves its original registered terrain and passes the complete-G1
+collision, mechanics, hold-support, and planted-foot gates.
+
+The training bank is a deliberately balanced subset rather than all 332 motions.
+`selected200_v1.json` contains 50 examples in each ascent/descent x
+stop/reversal cell, selected by farthest-point coverage of family, step count,
+riser, tread, approach angle, and elevation change.  It contains 200 motions
+from 115 distinct source traversals, with 3--8 steps, 0.100--0.238 m risers,
+0.230--1.007 m treads, and -40.15 to +34.72 degree approach offsets.  Maximum
+foot penetration is 4.954 mm, maximum per-frame planted-foot step is 2.174 mm,
+and maximum contiguous stance drift is 11.117 mm.  Stop/restart clips are 10.62
+seconds; reversal medians are 9.84 seconds uphill and 10.54 seconds downhill.
+
+The exact artifacts are:
+
+- generated bank:
+  `/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/full_bank_v1`;
+- balanced selection:
+  `/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/selected200_v1.json`;
+- SONIC-native bundle:
+  `/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/selected200_bundle_v1`;
+- labeled eight-motion clean review:
+  `/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/selected200_kinematic_review_v1/selected200_kinematic_review8_grid.mp4`.
+
+The eight full-trajectory reviews cover two examples from every balance cell.
+They show grounded approach, stair traversal, supported stopping or reversal,
+and departure without the old terrain-transform mismatch, root-only hover, or
+pose teleport.  The short reversal hold can still contain a small supported-foot
+shuffle, so these are robustness motions rather than claims of perfect human
+style.
+
+Per-motion specialist tracking also closes two of the four remaining legacy
+hard cases.  The clip-136 reversal completes at 291.6 mm peak MPJPE, and the
+low-rate clip-94 reversal completes at 246.5 mm.  Clip-127 survives its entire
+trajectory but remains excluded at 444.7 mm; the old grounded stair stop still
+terminates early.  Together with previously qualified routes, the legacy
+43-motion set is therefore 41/43 under the strict full-survival and at-most-300
+mm gate.  The two misses should be replaced by cleaner stairs500 candidates,
+not used to weaken the gate.
+
+The first 200-motion SONIC launch used 256 environments and was stopped at
+iteration 75 after its scene receipt exposed a 2:1 weight for 56 clips.  Its
+directory is preserved as `sonic_selected200_finetune_v1.biased_env256_16542678`
+and is not a candidate checkpoint.  Equal-weight job `16542899` uses exactly
+200 environments, 200 motions, and 200 unique terrain USDs from the original
+`terrain_release` tracker.  Checkpoints at 50, 100, 200, 300, and 400 iterations
+receive separate deterministic all-200 gates; no noised rollout or depth job is
+released merely because training completed.
