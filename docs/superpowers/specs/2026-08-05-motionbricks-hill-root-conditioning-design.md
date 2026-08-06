@@ -139,9 +139,12 @@ Add a hill-only mode to the existing MotionBricks browser viewer. This mode:
    outside its certified height domain.
 
 The first implementation may use a dedicated hill-viewer entry point when
-that keeps portal behavior unchanged and reduces integration risk. It must
-reuse the existing browser control and rendering components rather than create
-a second input protocol.
+that keeps portal behavior unchanged and reduces integration risk. It should
+reuse the existing browser control and rendering components. If that external
+browser-control package is unavailable in the checkout, the official
+MotionBricks MuJoCo WASD viewer is an accepted first-spike input path; browser
+parity is then a follow-up rather than a blocker to testing the conditioning
+hypothesis.
 
 ### 5. Deterministic canary
 
