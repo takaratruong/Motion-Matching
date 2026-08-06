@@ -14,6 +14,7 @@ from resources.run_g1_horizontal_grid_phase_coverage import (
     _classify_lane_phases,
     _ordered_phase_records,
     _phase_queries,
+    _semantic_dismount_window,
     _stable_mount_window,
     _windows_for_phase_kind,
 )
@@ -215,6 +216,112 @@ class RunG1HorizontalGridPhaseCoverageTests(unittest.TestCase):
                 (stable, unstable), "interior", support
             ),
             (stable, unstable),
+        )
+
+    @staticmethod
+    def dismount_window(
+        *,
+        landing_heights=(0.0, 0.0),
+    ):
+        return RawMotionWindow(
+            source_clip="drop",
+            start_frame=10,
+            stop_frame=50,
+            events=(
+                RawContactEvent(10, 0, (0.0, 0.1), 0.30),
+                RawContactEvent(10, 1, (0.0, -0.1), 0.30),
+                RawContactEvent(38, 0, (0.3, 0.1), landing_heights[0]),
+                RawContactEvent(44, 1, (0.5, -0.1), landing_heights[1]),
+            ),
+            root_start_world_xy=(0.0, 0.0),
+            forward_progress_m=0.5,
+            heading_error_rad=0.0,
+        )
+
+    @staticmethod
+    def dismount_profiles():
+        support = np.zeros((60, 2), dtype=np.bool_)
+        support[10:20] = True
+        support[20:25, 1] = True
+        support[38:44, 0] = True
+        support[44:50] = True
+        surface = np.zeros((60, 2), dtype=np.float64)
+        surface[10:25] = 0.30
+        return support, surface
+
+    def test_semantic_dismount_accepts_approved_contact_pattern(self):
+        support, surface = self.dismount_profiles()
+
+        self.assertTrue(
+            _semantic_dismount_window(
+                self.dismount_window(), support, surface
+            )
+        )
+
+    def test_semantic_dismount_rejects_flat_motion(self):
+        support, surface = self.dismount_profiles()
+
+        self.assertFalse(
+            _semantic_dismount_window(
+                self.dismount_window(landing_heights=(0.30, 0.30)),
+                support,
+                surface,
+            )
+        )
+
+    def test_semantic_dismount_rejects_excessive_flight(self):
+        support, surface = self.dismount_profiles()
+        support[20:44] = False
+
+        self.assertFalse(
+            _semantic_dismount_window(
+                self.dismount_window(), support, surface
+            )
+        )
+
+    def test_semantic_dismount_rejects_one_foot_landing(self):
+        support, surface = self.dismount_profiles()
+
+        self.assertFalse(
+            _semantic_dismount_window(
+                self.dismount_window(landing_heights=(0.0, 0.30)),
+                support,
+                surface,
+            )
+        )
+
+    def test_semantic_dismount_rejects_unsupported_ending(self):
+        support, surface = self.dismount_profiles()
+        support[44:50] = False
+
+        self.assertFalse(
+            _semantic_dismount_window(
+                self.dismount_window(), support, surface
+            )
+        )
+
+    def test_only_dismount_tasks_filter_non_descending_windows(self):
+        support, surface = self.dismount_profiles()
+        descending = self.dismount_window()
+        flat = self.dismount_window(landing_heights=(0.30, 0.30))
+
+        self.assertEqual(
+            _windows_for_phase_kind(
+                (descending, flat),
+                "dismount",
+                support,
+                source_surface=surface,
+            ),
+            (descending,),
+        )
+        self.assertEqual(
+            _windows_for_phase_kind(
+                (descending, flat),
+                "interior",
+                support,
+                source_surface=surface,
+            ),
+            (descending, flat),
         )
 
 

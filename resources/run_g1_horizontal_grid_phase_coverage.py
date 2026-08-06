@@ -88,10 +88,83 @@ def _stable_mount_window(
     )
 
 
+def _semantic_dismount_window(
+    window: RawMotionWindow,
+    source_support: np.ndarray,
+    source_surface: np.ndarray,
+    *,
+    minimum_initial_supported_frames: int = 8,
+    minimum_drop_height_m: float = 0.12,
+    maximum_landing_height_difference_m: float = 0.04,
+    maximum_unsupported_run_frames: int = 20,
+    minimum_terminal_supported_frames: int = 8,
+) -> bool:
+    support = np.asarray(source_support, dtype=np.bool_)
+    surface = np.asarray(source_surface, dtype=np.float64)
+    if (
+        not isinstance(window, RawMotionWindow)
+        or support.ndim != 2
+        or support.shape[1] != 2
+        or surface.shape != support.shape
+        or not np.isfinite(surface).all()
+        or not 0
+        <= window.start_frame
+        < window.stop_frame
+        <= len(support)
+        or any(
+            event.frame < window.start_frame
+            or event.frame >= window.stop_frame
+            for event in window.events
+        )
+    ):
+        raise ContractError("dismount window support inputs are invalid")
+    selected = support[window.start_frame : window.stop_frame]
+    supported = selected.any(axis=1)
+    initial_supported = 0
+    for value in supported:
+        if not value:
+            break
+        initial_supported += 1
+    terminal_supported = 0
+    for value in supported[::-1]:
+        if not value:
+            break
+        terminal_supported += 1
+    maximum_run = 0
+    current_run = 0
+    for value in ~supported:
+        current_run = current_run + 1 if value else 0
+        maximum_run = max(maximum_run, current_run)
+    initial_mask = support[window.start_frame]
+    if not initial_mask.any():
+        return False
+    initial_height = float(
+        surface[window.start_frame, initial_mask].mean()
+    )
+    landing_height = min(
+        float(event.surface_height_m) for event in window.events
+    )
+    landing_feet = {
+        int(event.foot)
+        for event in window.events
+        if abs(float(event.surface_height_m) - landing_height)
+        <= maximum_landing_height_difference_m
+    }
+    return (
+        initial_supported >= minimum_initial_supported_frames
+        and initial_height - landing_height >= minimum_drop_height_m
+        and landing_feet == {0, 1}
+        and maximum_run <= maximum_unsupported_run_frames
+        and terminal_supported >= minimum_terminal_supported_frames
+    )
+
+
 def _windows_for_phase_kind(
     windows: tuple[RawMotionWindow, ...],
     phase_kind: str,
     source_support: np.ndarray,
+    *,
+    source_surface: np.ndarray | None = None,
 ) -> tuple[RawMotionWindow, ...]:
     if (
         not isinstance(windows, tuple)
@@ -99,8 +172,18 @@ def _windows_for_phase_kind(
         or phase_kind not in _PHASE_ORDER
     ):
         raise ContractError("phase window routing inputs are invalid")
-    if phase_kind != "mount":
+    if phase_kind == "interior":
         return windows
+    if phase_kind == "dismount":
+        if source_surface is None:
+            raise ContractError("dismount surface profile is unavailable")
+        return tuple(
+            window
+            for window in windows
+            if _semantic_dismount_window(
+                window, source_support, source_surface
+            )
+        )
     return tuple(
         window
         for window in windows
@@ -402,6 +485,7 @@ def _score_windows_for_tasks(
     *,
     task_kinds: tuple[str, ...] | None = None,
     source_support: np.ndarray | None = None,
+    source_surface: np.ndarray | None = None,
 ) -> tuple[tuple[dict[str, object], ...], ...]:
     if (
         not isinstance(windows, tuple)
@@ -415,6 +499,7 @@ def _score_windows_for_tasks(
                 len(task_kinds) != len(task_queries)
                 or any(kind not in _PHASE_ORDER for kind in task_kinds)
                 or source_support is None
+                or ("dismount" in task_kinds and source_surface is None)
             )
         )
         or any(
@@ -437,6 +522,13 @@ def _score_windows_for_tasks(
         windows_by_kind["mount"] = _windows_for_phase_kind(
             windows, "mount", source_support
         )
+    if task_kinds is not None and "dismount" in task_kinds:
+        windows_by_kind["dismount"] = _windows_for_phase_kind(
+            windows,
+            "dismount",
+            source_support,
+            source_surface=source_surface,
+        )
     windows_by_count = {}
     for kind, selected_windows in windows_by_kind.items():
         grouped: dict[int, tuple[RawMotionWindow, ...]] = {}
@@ -449,10 +541,10 @@ def _score_windows_for_tasks(
         zip(task_queries, task_lengths)
     ):
         kind = (
-            "all"
-            if task_kinds is None or task_kinds[task_index] != "mount"
-            else "mount"
+            "all" if task_kinds is None else task_kinds[task_index]
         )
+        if kind == "interior":
+            kind = "all"
         by_count: dict[int, tuple[PathContactSignature, ...]] = {}
         for query in queries:
             by_count.setdefault(len(query.foot_order), ())
@@ -505,6 +597,7 @@ def _scan_one(arguments):
             task_lengths,
             task_kinds=task_kinds,
             source_support=profiles["support"],
+            source_surface=profiles["surface"],
         )
     except (ContractError, KeyError, OSError, ValueError):
         return tuple(() for _ in task_queries)
