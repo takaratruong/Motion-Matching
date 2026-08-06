@@ -122,6 +122,13 @@ Bundle preparation also writes the static object-motion file from the exact
 per-clip terrain position and quaternion; do not synthesize identity object
 motions for archive-rotated C490 terrain.
 
+Hard-only continuation is not a valid tracker recipe here: it can learn the
+failures while catastrophically forgetting the previously tracked motions.
+For a bounded repair, keep every passing clip in replay and upweight failures
+with stable aliases, then re-run the original full bank.  The first balanced
+bank uses one copy of every 28-clip v2 motion plus two extra copies of each of
+the eight parent failures (44 clips total).
+
 ## Scale-up strata
 
 Target 200 clips only after a small clean fine-tune proves trackability.  A

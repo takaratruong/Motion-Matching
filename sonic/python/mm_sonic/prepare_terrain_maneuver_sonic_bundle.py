@@ -166,6 +166,7 @@ def prepare(pilots: tuple[str, ...], output: Path) -> dict[str, object]:
     clip_records: list[dict[str, object]] = []
     provenance: list[dict[str, object]] = []
     used_ids: set[str] = set()
+    stem_counts: dict[str, int] = {}
     flat_placeholder: Path | None = None
 
     for value in pilots:
@@ -184,7 +185,14 @@ def prepare(pilots: tuple[str, ...], output: Path) -> dict[str, object]:
         if not terrain.is_file() or not motion.is_file():
             raise FileNotFoundError(f"missing motion or terrain for {label}")
 
-        stem = _clip_stem(manifest_path, label)
+        base_stem = _clip_stem(manifest_path, label)
+        repeat_index = stem_counts.get(base_stem, 0)
+        stem_counts[base_stem] = repeat_index + 1
+        stem = (
+            base_stem
+            if repeat_index == 0
+            else f"{base_stem}__repeat_{repeat_index:02d}"
+        )
         if stem in used_ids:
             raise ValueError(f"duplicate generated clip id {stem!r}")
         used_ids.add(stem)
@@ -258,21 +266,23 @@ def prepare(pilots: tuple[str, ...], output: Path) -> dict[str, object]:
                 "fps": fps,
             }
         )
-        provenance.append(
-            {
-                "clip_id": stem,
-                "pilot_manifest": str(manifest_path),
-                "pilot_label": label,
-                "motion": str(motion),
-                "motion_sha256": _sha256(motion),
-                "terrain": str(terrain),
-                "terrain_sha256": _sha256(terrain),
-                "bundled_terrain_sha256": _sha256(terrain_copy),
-                "terrain_physics": terrain_physics,
-                "automatic_gate_accepted": True,
-                "visual_review_required_before_collection_scale_up": True,
-            }
-        )
+        provenance_row = {
+            "clip_id": stem,
+            "pilot_manifest": str(manifest_path),
+            "pilot_label": label,
+            "motion": str(motion),
+            "motion_sha256": _sha256(motion),
+            "terrain": str(terrain),
+            "terrain_sha256": _sha256(terrain),
+            "bundled_terrain_sha256": _sha256(terrain_copy),
+            "terrain_physics": terrain_physics,
+            "automatic_gate_accepted": True,
+            "visual_review_required_before_collection_scale_up": True,
+        }
+        if repeat_index:
+            provenance_row["replay_alias_of"] = base_stem
+            provenance_row["replay_repeat_index"] = repeat_index
+        provenance.append(provenance_row)
 
     assert flat_placeholder is not None
     shutil.copy2(flat_placeholder, destination / "flat_placeholder.usd")
@@ -299,6 +309,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pilot", action="append", default=[])
     parser.add_argument(
+        "--repeat-pilot",
+        action="append",
+        default=[],
+        help="repeat MANIFEST#LABEL with a stable alias for replay weighting",
+    )
+    parser.add_argument(
         "--manifest",
         type=Path,
         action="append",
@@ -308,7 +324,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args(argv)
     expanded = _accepted_manifest_selections(tuple(arguments.manifest))
-    selections = tuple(dict.fromkeys((*arguments.pilot, *expanded)))
+    selections = (
+        *tuple(dict.fromkeys((*arguments.pilot, *expanded))),
+        *tuple(arguments.repeat_pilot),
+    )
     result = prepare(selections, arguments.output)
     print(
         json.dumps(

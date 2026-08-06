@@ -1382,9 +1382,22 @@ window and learned six of the nine parent failures.  The independent full-bank
 gate, job `16532759`, nevertheless passed only 6/28 clips, with median peak
 MPJPE 587.6 mm and maximum 1744.6 mm.  It forgot nearly the entire easy set and
 is rejected.  The varied-15 child `16533077` was cancelled before simulator
-startup and wrote no output.  Three one-lane evaluations now isolate the useful
-early-stopping region: parent-on-v2 job `16533277`, step-50 job `16533278`, and
-step-100 job `16533279`.  They run sequentially on one Titan RTX.
+startup and wrote no output.  The fair parent-on-v2 evaluation, L40S job
+`16533290`, passes 20/28 clips (median peak MPJPE 232.9 mm, maximum 1261.2 mm),
+so the shorter v2 transition timing gains one pass over v1.  The step-50 hard
+checkpoint, job `16533291`, passes only 2/28 (median 816.1 mm, maximum
+2575.5 mm).  Hard-only training is therefore destructive before as well as
+after convergence; step-100 job `16533292` was cancelled during startup.
+
+A balanced replay bundle was built directly from those fair v2 outcomes at
+`/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_clean_bank28_v1/replay44_bundle_v1`.
+It contains all 28 clips once and two additional stable aliases of each of the
+eight failures: 44 clips total, 24 hard instances and 20 retained passes.  All
+44 motion, object-motion, scene-binding, and provenance IDs were checked.  A
+100-iteration continuation from the 20/28 parent is L40S job `16533346`; its
+full 28-clip diagnostic is dependency job `16533347`.  This tests hard-case
+upweighting with explicit anti-forgetting replay rather than another hard-only
+fine-tune.
 
 Bundle preparation now writes `objects.pkl` directly.  Every constant object
 trajectory uses the same per-clip terrain position and quaternion as
