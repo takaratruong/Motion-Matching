@@ -1,0 +1,16 @@
+{
+  "schema": "stairs500-directional-source-selection/v1",
+  "archive": "/move/data/terrain-aware/motion-matching/grail-stairs500-clean-50hz-v1.zarr",
+  "selection": "/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/selected200_v1.json",
+  "purpose": "Target true two-stick stair motion to sources that already passed a diagonal-soft geometry audit. Both lateral polarities are attempted because the registered real terrain meshes are not symmetric; temporal reversal supplies backward ascent/descent and exact mirroring balances the final bank.",
+  "clip_indices": [8, 125, 131, 136, 207, 301, 347, 357, 387, 419, 421, 460],
+  "modes": [
+    "travel_soft_left",
+    "travel_soft_right",
+    "travel_medium_left",
+    "travel_medium_right"
+  ],
+  "include_temporal_reverse": true,
+  "exact_mesh_audit_required": true,
+  "include_mirror_after_audit": true
+}

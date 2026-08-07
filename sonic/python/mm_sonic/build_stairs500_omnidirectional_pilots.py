@@ -152,6 +152,17 @@ def _profile_knots(
         "diagonal_hard_right": ((1.0, -1.0), 32.0, 0.0, 1.0, 0.0),
         "diagonal_medium_left": ((-1.0, 1.0), 24.0, 0.0, 1.0, 0.0),
         "diagonal_medium_right": ((1.0, -1.0), 24.0, 0.0, 1.0, 0.0),
+        # Pure two-stick oblique travel: successive footholds and the root move
+        # across the staircase while body facing stays on the authored stair
+        # axis.  This avoids conflating a velocity command with an equal yaw
+        # command and supplies the missing "move diagonally while looking
+        # ahead" examples.
+        "travel_soft_left": ((-1.0, 1.0), 18.0, 0.0, 0.0, 0.0),
+        "travel_soft_right": ((1.0, -1.0), 18.0, 0.0, 0.0, 0.0),
+        "travel_medium_left": ((-1.0, 1.0), 24.0, 0.0, 0.0, 0.0),
+        "travel_medium_right": ((1.0, -1.0), 24.0, 0.0, 0.0, 0.0),
+        "travel_hard_left": ((-1.0, 1.0), 32.0, 0.0, 0.0, 0.0),
+        "travel_hard_right": ((1.0, -1.0), 32.0, 0.0, 0.0, 0.0),
         "lane_left": ((0.0, 1.0), 20.0, 0.0, 1.0, 0.0),
         "lane_right": ((0.0, -1.0), 20.0, 0.0, 1.0, 0.0),
         "lane_gentle_left": ((0.0, 1.0), 10.0, 0.0, 1.0, 0.0),

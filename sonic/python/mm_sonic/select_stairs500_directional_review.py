@@ -57,8 +57,26 @@ def select(
     # exotic behaviors visible even after the source sweep is scaled up.
     strata: tuple[tuple[str, int, Predicate], ...] = (
         (
+            "up_extreme_travel",
+            2,
+            lambda r: r["traversal"] == "up"
+            and any(
+                value in str(r["mode"])
+                for value in ("diagonal_hard", "travel_", "lane_")
+            ),
+        ),
+        (
+            "down_extreme_travel",
+            2,
+            lambda r: r["traversal"] == "down"
+            and any(
+                value in str(r["mode"])
+                for value in ("diagonal_hard", "travel_", "lane_")
+            ),
+        ),
+        (
             "up_independent_facing",
-            4,
+            3,
             lambda r: r["traversal"] == "up"
             and any(
                 value in str(r["mode"])
@@ -67,7 +85,7 @@ def select(
         ),
         (
             "down_independent_facing",
-            4,
+            3,
             lambda r: r["traversal"] == "down"
             and any(
                 value in str(r["mode"])
@@ -76,7 +94,7 @@ def select(
         ),
         (
             "up_turning_weave",
-            4,
+            3,
             lambda r: r["traversal"] == "up"
             and "turning_" in str(r["mode"])
             and any(
@@ -85,7 +103,7 @@ def select(
         ),
         (
             "down_turning_weave",
-            4,
+            3,
             lambda r: r["traversal"] == "down"
             and "turning_" in str(r["mode"])
             and any(
@@ -94,7 +112,7 @@ def select(
         ),
         (
             "up_native_diagonal",
-            4,
+            3,
             lambda r: r["traversal"] == "up"
             and r["source_kind"] == "native"
             and any(
@@ -104,7 +122,7 @@ def select(
         ),
         (
             "down_native_diagonal",
-            4,
+            3,
             lambda r: r["traversal"] == "down"
             and r["source_kind"] == "native"
             and any(
@@ -114,14 +132,14 @@ def select(
         ),
         (
             "up_backward_diagonal",
-            3,
+            4,
             lambda r: r["traversal"] == "up"
             and r["source_kind"] == "temporal_reverse"
             and "diagonal" in str(r["mode"]),
         ),
         (
             "down_backward_diagonal",
-            3,
+            4,
             lambda r: r["traversal"] == "down"
             and r["source_kind"] == "temporal_reverse"
             and "diagonal" in str(r["mode"]),
