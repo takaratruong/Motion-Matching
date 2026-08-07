@@ -52,9 +52,13 @@ def select(
         )
 
     Predicate = Callable[[dict[str, object]], bool]
-    strata: tuple[tuple[str, Predicate], ...] = (
+    # This manifest is a visual gate for the *new* command coverage, not a
+    # random sample of the much larger straight/gentle class.  Quotas keep
+    # exotic behaviors visible even after the source sweep is scaled up.
+    strata: tuple[tuple[str, int, Predicate], ...] = (
         (
             "up_independent_facing",
+            3,
             lambda r: r["traversal"] == "up"
             and any(
                 value in str(r["mode"])
@@ -63,6 +67,7 @@ def select(
         ),
         (
             "down_independent_facing",
+            3,
             lambda r: r["traversal"] == "down"
             and any(
                 value in str(r["mode"])
@@ -71,6 +76,7 @@ def select(
         ),
         (
             "up_turning_weave",
+            4,
             lambda r: r["traversal"] == "up"
             and "turning_" in str(r["mode"])
             and any(
@@ -79,6 +85,7 @@ def select(
         ),
         (
             "down_turning_weave",
+            4,
             lambda r: r["traversal"] == "down"
             and "turning_" in str(r["mode"])
             and any(
@@ -87,6 +94,7 @@ def select(
         ),
         (
             "up_native_diagonal",
+            4,
             lambda r: r["traversal"] == "up"
             and r["source_kind"] == "native"
             and any(
@@ -96,6 +104,7 @@ def select(
         ),
         (
             "down_native_diagonal",
+            4,
             lambda r: r["traversal"] == "down"
             and r["source_kind"] == "native"
             and any(
@@ -104,19 +113,46 @@ def select(
             ),
         ),
         (
+            "up_backward_diagonal",
+            3,
+            lambda r: r["traversal"] == "up"
+            and r["source_kind"] == "temporal_reverse"
+            and "diagonal" in str(r["mode"]),
+        ),
+        (
+            "down_backward_diagonal",
+            3,
+            lambda r: r["traversal"] == "down"
+            and r["source_kind"] == "temporal_reverse"
+            and "diagonal" in str(r["mode"]),
+        ),
+        (
+            "real_stair_left",
+            1,
+            lambda r: int(r["clip_index"]) == 473,
+        ),
+        (
+            "real_stair_right",
+            1,
+            lambda r: int(r["clip_index"]) == 485,
+        ),
+        (
             "up_backward_straight",
+            1,
             lambda r: r["traversal"] == "up"
             and r["source_kind"] == "temporal_reverse"
             and r["mode"] == "straight",
         ),
         (
             "down_backward_straight",
+            1,
             lambda r: r["traversal"] == "down"
             and r["source_kind"] == "temporal_reverse"
             and r["mode"] == "straight",
         ),
         (
             "up_native_weave",
+            3,
             lambda r: r["traversal"] == "up"
             and r["source_kind"] == "native"
             and any(
@@ -125,6 +161,7 @@ def select(
         ),
         (
             "down_native_weave",
+            3,
             lambda r: r["traversal"] == "down"
             and r["source_kind"] == "native"
             and any(
@@ -132,19 +169,8 @@ def select(
             ),
         ),
         (
-            "up_backward_diagonal",
-            lambda r: r["traversal"] == "up"
-            and r["source_kind"] == "temporal_reverse"
-            and "diagonal" in str(r["mode"]),
-        ),
-        (
-            "down_backward_diagonal",
-            lambda r: r["traversal"] == "down"
-            and r["source_kind"] == "temporal_reverse"
-            and "diagonal" in str(r["mode"]),
-        ),
-        (
             "up_turning",
+            3,
             lambda r: r["traversal"] == "up"
             and any(
                 value in str(r["mode"]) for value in ("turning", "crab")
@@ -152,30 +178,25 @@ def select(
         ),
         (
             "down_turning",
+            3,
             lambda r: r["traversal"] == "down"
             and any(
                 value in str(r["mode"]) for value in ("turning", "crab")
             ),
         ),
-        ("real_stair_left", lambda r: int(r["clip_index"]) == 473),
-        ("real_stair_right", lambda r: int(r["clip_index"]) == 485),
     )
     chosen: list[tuple[str, Path, dict[str, object]]] = []
     used: set[Path] = set()
-    for stratum, predicate in strata:
-        match = next(
-            (
-                (path, report)
-                for path, report in candidates
-                if path not in used and predicate(report)
-            ),
-            None,
-        )
-        if match is None:
-            continue
-        path, report = match
-        chosen.append((stratum, path, report))
-        used.add(path)
+    for stratum, quota, predicate in strata:
+        for path, report in candidates:
+            if len(chosen) == count:
+                break
+            if path in used or not predicate(report):
+                continue
+            chosen.append((stratum, path, report))
+            used.add(path)
+            if sum(value[0] == stratum for value in chosen) >= quota:
+                break
         if len(chosen) == count:
             break
     for path, report in candidates:
