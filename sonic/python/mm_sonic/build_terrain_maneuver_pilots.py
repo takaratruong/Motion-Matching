@@ -732,7 +732,10 @@ def main(argv: list[str] | None = None) -> int:
             sort_keys=True,
         )
     )
-    return 0 if result["automatic_gate_accepted_count"] else 2
+    # Zero admissions is a valid outcome for one source in a broad geometric
+    # sweep.  The manifest preserves every rejection; only true exceptions
+    # should fail an array task and block downstream aggregation.
+    return 0
 
 
 if __name__ == "__main__":

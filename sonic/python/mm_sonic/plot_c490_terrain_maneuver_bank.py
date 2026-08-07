@@ -54,7 +54,11 @@ def plot_bank(bank_root: Path, output: Path) -> Path:
             manifest = json.loads(manifest_path.read_text())
             position = manifest["terrain_position_world"]
             quaternion = manifest["terrain_quaternion_world_from_usd_wxyz"]
-            pivot_frame = int(manifest["pilots"][0]["pivot"]["frame_index"])
+            pivot_frame = (
+                int(manifest["pilots"][0]["pivot"]["frame_index"])
+                if manifest["pilots"]
+                else None
+            )
         else:
             # C490 sources share the documented registration even when the
             # downstream pivot gate rejects the clip.
