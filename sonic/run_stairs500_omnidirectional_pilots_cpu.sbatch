@@ -6,13 +6,14 @@
 #SBATCH --partition=sc-freecpu,move
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=3G
-#SBATCH --time=00:45:00
+#SBATCH --time=01:00:00
 #SBATCH --output=/move/u/bodow/Projects/Motion-Matching-takara-corpus/slurm-stairs500-omni-%A_%a.out
 
 set -euo pipefail
 
 PROJECT=/move/u/bodow/Projects/Motion-Matching-takara-corpus
 OUTPUT=${STAIRS500_OMNI_OUTPUT:?set STAIRS500_OMNI_OUTPUT}
+SELECTION=${STAIRS500_OMNI_SELECTION:-/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/selected200_v1.json}
 CLIP_LIST=${STAIRS500_OMNI_CLIPS:-364,6,343,207}
 MODE_LIST=${STAIRS500_OMNI_MODES:-}
 INCLUDE_REVERSE=${STAIRS500_OMNI_INCLUDE_REVERSE:-0}
@@ -49,6 +50,7 @@ fi
 
 /move/u/bodow/miniconda3/envs/cloc3/bin/python -u -B \
     -m mm_sonic.build_stairs500_omnidirectional_pilots \
+    --selection "${SELECTION}" \
     --clip-index "${CLIP_INDEX}" \
     "${SOURCE_ARGUMENTS[@]}" \
     --maximum-stance-sole-target-error-m 0.010 \

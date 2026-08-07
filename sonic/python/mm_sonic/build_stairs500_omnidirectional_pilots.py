@@ -53,6 +53,10 @@ DEFAULT_SELECTION = Path(
     "/move/data/terrain-aware/sonic-rollouts/"
     "terrain_maneuver_stairs500_v1/selected200_v1.json"
 )
+DEFAULT_SOURCE_BANK_ROOT = Path(
+    "/move/data/terrain-aware/sonic-rollouts/"
+    "terrain_maneuver_stairs500_v1/full_bank_v1"
+)
 DEFAULT_MODEL = Path(
     "/move/u/justingu/Projects/TWIST2/assets/g1/"
     "g1_29dof_rev_1_0.xml"
@@ -159,6 +163,12 @@ def _profile_knots(
         # ahead" examples.
         "travel_soft_left": ((-1.0, 1.0), 18.0, 0.0, 0.0, 0.0),
         "travel_soft_right": ((1.0, -1.0), 18.0, 0.0, 0.0, 0.0),
+        # Ten-degree fixed-facing travel is still visibly oblique, but fits
+        # many narrower stair clips that cannot mechanically realize the
+        # 18--32 degree families.  This is the dense coverage tier rather
+        # than a replacement for the harder stress cases below.
+        "travel_gentle_left": ((-1.0, 1.0), 10.0, 0.0, 0.0, 0.0),
+        "travel_gentle_right": ((1.0, -1.0), 10.0, 0.0, 0.0, 0.0),
         "travel_medium_left": ((-1.0, 1.0), 24.0, 0.0, 0.0, 0.0),
         "travel_medium_right": ((1.0, -1.0), 24.0, 0.0, 0.0, 0.0),
         "travel_hard_left": ((-1.0, 1.0), 32.0, 0.0, 0.0, 0.0),
@@ -243,6 +253,8 @@ def _profile_knots(
         "turning_right": ((1.0, -1.0), 18.0, 0.0, 0.5, 0.25),
         "turning_gentle_left": ((-1.0, 1.0), 10.0, 0.0, 0.5, 0.25),
         "turning_gentle_right": ((1.0, -1.0), 10.0, 0.0, 0.5, 0.25),
+        "turning_micro_left": ((-1.0, 1.0), 8.0, 0.0, 0.5, 0.25),
+        "turning_micro_right": ((1.0, -1.0), 8.0, 0.0, 0.5, 0.25),
         # Unlike the path-only slaloms, these rotate the pelvis and a fraction
         # of foot yaw with every direction change.  This is the closest clean
         # kinematic analogue of steering repeatedly while already on stairs.
@@ -843,6 +855,16 @@ def _source_paths(
     *,
     include_reverse: bool,
 ) -> tuple[tuple[str, Path], ...]:
+    direct_source = selection.get("source_motion")
+    if direct_source is not None:
+        source = Path(str(direct_source)).expanduser().resolve()
+        if not source.is_file():
+            raise FileNotFoundError(f"prepared source motion is missing: {source}")
+        if include_reverse:
+            raise ValueError(
+                "direct source selections do not provide a reverse pilot"
+            )
+        return (("native", source),)
     manifest_path = Path(str(selection["pilot"])).expanduser().resolve()
     if "#" in str(manifest_path):
         # Path strips no fragments itself, but retain support for a plain dict.
@@ -909,11 +931,37 @@ def _active_route_interval(route: object) -> tuple[float, float]:
 def _selected_rows(
     selection_path: Path,
     clip_indices: Sequence[int],
+    *,
+    source_bank_root: Path,
 ) -> list[dict[str, object]]:
     payload = json.loads(selection_path.read_text())
+    source_rows = payload.get("selections")
+    if source_rows is None:
+        source_rows = payload.get("sources")
+        if source_rows is None:
+            raise ValueError("selection must contain selections or sources")
+        expanded_rows: list[dict[str, object]] = []
+        bank = source_bank_root.expanduser().resolve()
+        for source_row in source_rows:
+            row = dict(source_row)
+            clip_index = int(row["clip_index"])
+            clip_name = str(row["clip_name"])
+            source_motion = (
+                bank
+                / f"clip_{clip_index:03d}_{clip_name}"
+                / "source"
+                / "motion.npz"
+            )
+            if not source_motion.is_file():
+                raise FileNotFoundError(
+                    f"prepared source motion is missing: {source_motion}"
+                )
+            row["source_motion"] = str(source_motion)
+            expanded_rows.append(row)
+        source_rows = expanded_rows
     requested = tuple(int(value) for value in clip_indices)
     unique: dict[int, dict[str, object]] = {}
-    for row in payload["selections"]:
+    for row in source_rows:
         index = int(row["clip_index"])
         if requested and index not in requested:
             continue
@@ -938,7 +986,11 @@ def build(arguments: argparse.Namespace) -> dict[str, object]:
         joint_names,
         maximum_joint_correction_rad=arguments.maximum_joint_correction_rad,
     )
-    rows = _selected_rows(arguments.selection, arguments.clip_index)
+    rows = _selected_rows(
+        arguments.selection,
+        arguments.clip_index,
+        source_bank_root=arguments.source_bank_root,
+    )
     modes = tuple(arguments.mode) if arguments.mode else tuple(
         name
         for name in (
@@ -1288,6 +1340,9 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--archive", type=Path, default=DEFAULT_ARCHIVE)
     parser.add_argument("--selection", type=Path, default=DEFAULT_SELECTION)
+    parser.add_argument(
+        "--source-bank-root", type=Path, default=DEFAULT_SOURCE_BANK_ROOT
+    )
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--clip-index", type=int, action="append", default=[])

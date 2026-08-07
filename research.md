@@ -1626,8 +1626,10 @@ The complete receipt is
 Straight stair traversals are insufficient for joystick distillation: they do
 not show diagonal travel, steering while already on the staircase, backward
 ascent/descent, or velocity and body facing as independent controls.  The
-directional expansion starts from 80 distinct quality-vetted clean stairs500
-traversals.  It maps each source into the registered stair-local frame, fits a
+first directional sweep attempted 80 distinct quality-vetted clean stairs500
+traversals, but only 46 source traversals contributed at least one accepted
+motion to the 856-motion bank.  It maps each source into the registered
+stair-local frame, fits a
 bounded lateral route, and exports per-frame world/local planar command
 velocity plus an independent facing yaw.  No global root position is part of
 the policy command interface.
@@ -1745,3 +1747,49 @@ launcher uses the same corrected rule.  Once that preflight passes, job
 saves every 50 iterations for early-checkpoint qualification.  If it does not
 fit, the fallback is explicit balanced bundles no larger than the environment
 count, not a partial run mislabeled as full-bank training.
+
+### Universal directional tracker and 240-source expansion (2026-08-07)
+
+Job `16554900` completed all 400 iterations over the 1,118-motion mixed bank.
+The deterministic 342-motion exotic stress gate improved from 200/342 full
+rollouts at iteration 50, to 247/342 at iteration 200, and **277/342** at
+iteration 400.  Iteration 400 is therefore the retained checkpoint.  It
+completes 221/280 direct directional motions and 56/62 stop/restart or reversal
+transitions.  The direct split is 144/146 native-time motions and 77/134 exact
+backward-time motions, making backward locomotion the remaining failure
+concentration rather than ordinary or forward directional stairs.
+
+The surviving direct families at iteration 400 are 59/74 turning slaloms,
+68/88 turning zigzags, 34/42 counter-facing traversals, 4/6 crab traversals,
+5/6 lane changes, 18/22 hard fixed-facing obliques, 31/40 medium fixed-facing
+obliques, and 2/2 medium diagonals.  Median peak MPJPE among all full rollouts
+is 155.7 mm.  The selected route audit is
+`exotic_stress342_all1118_a5000_step0400_routes18_v1`; it shows intended and
+physically tracked routes for left/right diagonals, hard obliques, lane
+changes, slaloms, zigzags, counter-facing motion, and crab motion.
+
+Exact-mesh auditing of all 342 saved iteration-400 rollouts passes 342/342.
+There are zero forbidden-body intersections and zero threshold-exceeding foot
+frames.  Maximum foot penetration is 9.14 mm, median is 4.73 mm, and p95 is
+6.66 mm under the separate 10 mm rigid-contact rollout threshold.
+
+The same checkpoint also improves the original 200-motion stable replay bank:
+193/200 motions complete, and 182/200 both complete and remain at or below
+300 mm peak MPJPE.  The stable-only parent achieved 157/200 completion and
+120/200 strict passes.  The new family breakdown is 49/50 uphill stops, 49/50
+uphill reversals, 49/50 downhill stops, and 46/50 downhill reversals.  Thus the
+directional mixture strengthened rather than erased ordinary stair tracking.
+
+The 856-motion bank nevertheless repeats too few physical sources for the
+intended collection scale.  The next expansion consumes all 240 already
+prepared clean stairs500 source traversals.  A dense tier tries ten-degree
+fixed-facing travel and eight-degree simultaneous turning in both directions;
+the hard tier tries medium/hard fixed-facing travel, lane and crab motion,
+counter-facing motion, turning slaloms and zigzags, and medium diagonals, in
+native and exact backward time.  Each accepted motion is exact-mesh gated and
+then reflected with the same full-state symmetry transform.  Generation,
+mirroring, combined export, route plotting, and paired side/overhead 32-motion
+review are chained as jobs `16554955`, `16555019`, `16555045`, `16555265`,
+`16555343`--`16555346`, `16555359`, and `16555377`--`16555378`.  The combined
+output is `omnidirectional_240source_post_v1`.  Counts from this expansion are
+not recorded until all mechanical rejects and exact mirrors have finished.

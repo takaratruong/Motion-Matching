@@ -35,6 +35,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--width", type=int, default=480)
     parser.add_argument("--height", type=int, default=270)
     parser.add_argument("--frame-stride", type=int, default=2)
+    parser.add_argument("--camera-azimuth-offset-deg", type=float, default=90.0)
+    parser.add_argument("--camera-elevation-deg", type=float, default=-16.0)
+    parser.add_argument("--camera-distance", type=float, default=2.8)
     arguments = parser.parse_args(argv)
 
     rollout = zarr.open_group(str(_rollout_zarr(arguments.rollout)), mode="r")
@@ -103,6 +106,9 @@ def main(argv: list[str] | None = None) -> int:
             width=arguments.width,
             height=arguments.height,
             frame_stride=arguments.frame_stride,
+            camera_azimuth_offset_deg=arguments.camera_azimuth_offset_deg,
+            camera_elevation_deg=arguments.camera_elevation_deg,
+            camera_distance=arguments.camera_distance,
         )
         receipts.append(
             {

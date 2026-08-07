@@ -23,6 +23,9 @@ else
     EPISODES=(9 13 16 25 35 39)
 fi
 EPISODE=${EPISODES[${SLURM_ARRAY_TASK_ID}]}
+CAMERA_AZIMUTH=${TERRAIN_TRACKER_CAMERA_AZIMUTH_OFFSET_DEG:-90}
+CAMERA_ELEVATION=${TERRAIN_TRACKER_CAMERA_ELEVATION_DEG:--16}
+CAMERA_DISTANCE=${TERRAIN_TRACKER_CAMERA_DISTANCE:-2.8}
 
 export PYTHONPATH="${PROJECT}/sonic/python"
 export OMP_NUM_THREADS=1
@@ -37,4 +40,7 @@ export OPENBLAS_NUM_THREADS=1
     --output-dir "${OUTPUT}/ep_${EPISODE}" \
     --width 480 \
     --height 270 \
-    --frame-stride 2
+    --frame-stride 2 \
+    --camera-azimuth-offset-deg "${CAMERA_AZIMUTH}" \
+    --camera-elevation-deg "${CAMERA_ELEVATION}" \
+    --camera-distance "${CAMERA_DISTANCE}"

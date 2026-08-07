@@ -15,6 +15,8 @@ def subset_bundle(
     *,
     include_pilot_regexes: tuple[str, ...],
     exclude_pilot_regexes: tuple[str, ...],
+    include_record_regexes: tuple[str, ...] = (),
+    exclude_record_regexes: tuple[str, ...] = (),
 ) -> dict[str, object]:
     import joblib
 
@@ -31,19 +33,36 @@ def subset_bundle(
 
     include_patterns = tuple(re.compile(value) for value in include_pilot_regexes)
     exclude_patterns = tuple(re.compile(value) for value in exclude_pilot_regexes)
+    include_record_patterns = tuple(
+        re.compile(value) for value in include_record_regexes
+    )
+    exclude_record_patterns = tuple(
+        re.compile(value) for value in exclude_record_regexes
+    )
     selected_indices = [
         index
         for index, row in enumerate(provenance_rows)
         if (
-            not include_patterns
+            (
+                not include_patterns
+                and not include_record_patterns
+            )
             or any(
                 pattern.search(str(row.get("pilot_label", "")))
                 for pattern in include_patterns
+            )
+            or any(
+                pattern.search(json.dumps(row, sort_keys=True))
+                for pattern in include_record_patterns
             )
         )
         and not any(
             pattern.search(str(row.get("pilot_label", "")))
             for pattern in exclude_patterns
+        )
+        and not any(
+            pattern.search(json.dumps(row, sort_keys=True))
+            for pattern in exclude_record_patterns
         )
     ]
     if not selected_indices:
@@ -88,6 +107,8 @@ def subset_bundle(
         "source": str(source),
         "include_pilot_regexes": list(include_pilot_regexes),
         "exclude_pilot_regexes": list(exclude_pilot_regexes),
+        "include_record_regexes": list(include_record_regexes),
+        "exclude_record_regexes": list(exclude_record_regexes),
         "source_clip_count": len(provenance_rows),
         "dropped_clip_count": len(provenance_rows) - len(selected_provenance),
     }
@@ -107,12 +128,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--include-pilot-regex", action="append", default=[])
     parser.add_argument("--exclude-pilot-regex", action="append", default=[])
+    parser.add_argument(
+        "--include-record-regex",
+        action="append",
+        default=[],
+        help="Include when a regex matches the serialized provenance record.",
+    )
+    parser.add_argument(
+        "--exclude-record-regex",
+        action="append",
+        default=[],
+        help="Exclude when a regex matches the serialized provenance record.",
+    )
     arguments = parser.parse_args(argv)
     result = subset_bundle(
         arguments.source,
         arguments.output,
         include_pilot_regexes=tuple(arguments.include_pilot_regex),
         exclude_pilot_regexes=tuple(arguments.exclude_pilot_regex),
+        include_record_regexes=tuple(arguments.include_record_regex),
+        exclude_record_regexes=tuple(arguments.exclude_record_regex),
     )
     print(json.dumps(result, sort_keys=True))
     return 0
