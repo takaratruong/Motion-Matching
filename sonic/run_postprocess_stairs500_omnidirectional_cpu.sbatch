@@ -42,5 +42,5 @@ export OPENBLAS_NUM_THREADS=1
 "${PYTHON}" -u -B -m mm_sonic.select_stairs500_directional_review \
     --root "${SOURCE}" \
     --root "${MIRRORS}" \
-    --count 12 \
-    --output "${OUTPUT}/review12.json"
+    --count 16 \
+    --output "${OUTPUT}/review16.json"

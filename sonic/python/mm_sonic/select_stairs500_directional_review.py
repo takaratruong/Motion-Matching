@@ -54,16 +54,54 @@ def select(
     Predicate = Callable[[dict[str, object]], bool]
     strata: tuple[tuple[str, Predicate], ...] = (
         (
+            "up_independent_facing",
+            lambda r: r["traversal"] == "up"
+            and any(
+                value in str(r["mode"])
+                for value in ("counterface", "facing_weave", "crab")
+            ),
+        ),
+        (
+            "down_independent_facing",
+            lambda r: r["traversal"] == "down"
+            and any(
+                value in str(r["mode"])
+                for value in ("counterface", "facing_weave", "crab")
+            ),
+        ),
+        (
+            "up_turning_weave",
+            lambda r: r["traversal"] == "up"
+            and "turning_" in str(r["mode"])
+            and any(
+                value in str(r["mode"]) for value in ("zigzag", "slalom")
+            ),
+        ),
+        (
+            "down_turning_weave",
+            lambda r: r["traversal"] == "down"
+            and "turning_" in str(r["mode"])
+            and any(
+                value in str(r["mode"]) for value in ("zigzag", "slalom")
+            ),
+        ),
+        (
             "up_native_diagonal",
             lambda r: r["traversal"] == "up"
             and r["source_kind"] == "native"
-            and "diagonal" in str(r["mode"]),
+            and any(
+                value in str(r["mode"])
+                for value in ("diagonal_medium", "diagonal_soft")
+            ),
         ),
         (
             "down_native_diagonal",
             lambda r: r["traversal"] == "down"
             and r["source_kind"] == "native"
-            and "diagonal" in str(r["mode"]),
+            and any(
+                value in str(r["mode"])
+                for value in ("diagonal_medium", "diagonal_soft")
+            ),
         ),
         (
             "up_backward_straight",

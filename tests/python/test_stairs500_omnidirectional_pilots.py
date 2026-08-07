@@ -51,6 +51,39 @@ class StairDirectionalProfileTest(unittest.TestCase):
         )
         self.assertGreater(profile.maximum_path_angle_deg, 10.0)
 
+    def test_facing_weave_changes_body_direction_without_bending_path(self):
+        profile = build_path_profile(
+            "facing_weave_left_right",
+            np.linspace(0.0, 1.0, 301),
+            active_length_m=2.5,
+            maximum_amplitude_m=0.42,
+        )
+        np.testing.assert_array_equal(profile.lateral_offset_m, 0.0)
+        np.testing.assert_array_equal(profile.path_yaw_offset_rad, 0.0)
+        self.assertGreater(
+            float(np.degrees(np.max(profile.facing_yaw_offset_rad))),
+            9.9,
+        )
+        self.assertLess(
+            float(np.degrees(np.min(profile.facing_yaw_offset_rad))),
+            -9.9,
+        )
+        self.assertAlmostEqual(float(profile.facing_yaw_offset_rad[0]), 0.0)
+        self.assertAlmostEqual(float(profile.facing_yaw_offset_rad[-1]), 0.0)
+
+    def test_turning_slalom_changes_path_and_pelvis_yaw_repeatedly(self):
+        profile = build_path_profile(
+            "turning_slalom_left_right",
+            np.linspace(0.0, 1.0, 401),
+            active_length_m=3.0,
+            maximum_amplitude_m=0.42,
+        )
+        self.assertGreater(float(np.max(profile.lateral_offset_m)), 0.02)
+        self.assertLess(float(np.min(profile.lateral_offset_m)), -0.02)
+        self.assertGreater(float(np.max(profile.pose_yaw_offset_rad)), 0.01)
+        self.assertLess(float(np.min(profile.pose_yaw_offset_rad)), -0.01)
+        self.assertLessEqual(profile.maximum_path_angle_deg, 12.0 + 1.0e-6)
+
     def test_straight_profile_is_identity(self):
         profile = build_path_profile(
             "straight",

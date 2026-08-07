@@ -150,6 +150,8 @@ def _profile_knots(
         "diagonal_gentle_right": ((1.0, -1.0), 10.0, 0.0, 1.0, 0.0),
         "diagonal_hard_left": ((-1.0, 1.0), 32.0, 0.0, 1.0, 0.0),
         "diagonal_hard_right": ((1.0, -1.0), 32.0, 0.0, 1.0, 0.0),
+        "diagonal_medium_left": ((-1.0, 1.0), 24.0, 0.0, 1.0, 0.0),
+        "diagonal_medium_right": ((1.0, -1.0), 24.0, 0.0, 1.0, 0.0),
         "lane_left": ((0.0, 1.0), 20.0, 0.0, 1.0, 0.0),
         "lane_right": ((0.0, -1.0), 20.0, 0.0, 1.0, 0.0),
         "lane_gentle_left": ((0.0, 1.0), 10.0, 0.0, 1.0, 0.0),
@@ -176,8 +178,19 @@ def _profile_knots(
         "crab_gentle_right": ((1.0, -1.0), 12.0, 12.0, 0.0, 0.0),
         "face_left": ((0.0, 0.0), 0.0, 28.0, 0.0, 0.0),
         "face_right": ((0.0, 0.0), 0.0, -28.0, 0.0, 0.0),
+        "face_soft_left": ((0.0, 0.0), 0.0, 12.0, 0.0, 0.0),
+        "face_soft_right": ((0.0, 0.0), 0.0, -12.0, 0.0, 0.0),
         "face_hard_left": ((0.0, 0.0), 0.0, 45.0, 0.0, 0.0),
         "face_hard_right": ((0.0, 0.0), 0.0, -45.0, 0.0, 0.0),
+        # These profiles exercise a genuinely independent second stick.  The
+        # path bends one way while the pelvis faces the other; the feet retain
+        # their authored stair yaw so variants remain mechanically auditable.
+        "counterface_left": ((-1.0, 1.0), 10.0, -10.0, 0.0, 0.0),
+        "counterface_right": ((1.0, -1.0), 10.0, 10.0, 0.0, 0.0),
+        # A facing weave changes body direction twice while the stair path is
+        # unchanged.  Its non-sinusoidal facing curve is supplied below.
+        "facing_weave_left_right": ((0.0, 0.0), 0.0, 10.0, 0.0, 0.0),
+        "facing_weave_right_left": ((0.0, 0.0), 0.0, 10.0, 0.0, 0.0),
         # A longer weave changes travel direction twice while the feet remain
         # world-locked during every detected stance run.
         "slalom_left_right": (
@@ -201,6 +214,37 @@ def _profile_knots(
         "turning_right": ((1.0, -1.0), 18.0, 0.0, 0.5, 0.25),
         "turning_gentle_left": ((-1.0, 1.0), 10.0, 0.0, 0.5, 0.25),
         "turning_gentle_right": ((1.0, -1.0), 10.0, 0.0, 0.5, 0.25),
+        # Unlike the path-only slaloms, these rotate the pelvis and a fraction
+        # of foot yaw with every direction change.  This is the closest clean
+        # kinematic analogue of steering repeatedly while already on stairs.
+        "turning_slalom_left_right": (
+            (0.0, 1.0, -1.0, 1.0, 0.0),
+            12.0,
+            0.0,
+            0.35,
+            0.15,
+        ),
+        "turning_slalom_right_left": (
+            (0.0, -1.0, 1.0, -1.0, 0.0),
+            12.0,
+            0.0,
+            0.35,
+            0.15,
+        ),
+        "turning_zigzag_left_right": (
+            (0.0, 1.0, -1.0, 0.0),
+            12.0,
+            0.0,
+            0.40,
+            0.15,
+        ),
+        "turning_zigzag_right_left": (
+            (0.0, -1.0, 1.0, 0.0),
+            12.0,
+            0.0,
+            0.40,
+            0.15,
+        ),
     }
     try:
         return profiles[mode]
@@ -245,7 +289,19 @@ def build_path_profile(
     pose_yaw = float(pose_yaw_gain) * path_yaw
     foot_yaw = float(foot_yaw_gain) * path_yaw
     # Independent facing is introduced and removed with zero endpoint speed.
-    facing_window = np.sin(np.pi * u) ** 2
+    # Most profiles use one smooth excursion.  Facing-weave profiles use
+    # explicit knots so they contain both left and right body orientations
+    # without changing the travel path.
+    facing_knots = {
+        "facing_weave_left_right": (0.0, 1.0, -1.0, 0.0),
+        "facing_weave_right_left": (0.0, -1.0, 1.0, 0.0),
+    }.get(mode)
+    if facing_knots is None:
+        facing_window = np.sin(np.pi * u) ** 2
+    else:
+        facing_window, _facing_derivative = _piecewise_quintic(
+            u, facing_knots
+        )
     facing = math.radians(facing_offset_deg) * facing_window
     return PathProfile(
         lateral_offset_m=lateral,
