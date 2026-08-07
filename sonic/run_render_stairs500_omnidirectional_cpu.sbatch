@@ -15,6 +15,7 @@ PROJECT=/move/u/bodow/Projects/Motion-Matching-takara-corpus
 MANIFEST=${STAIRS500_OMNI_RENDER_MANIFEST:?set STAIRS500_OMNI_RENDER_MANIFEST}
 OUTPUT=${STAIRS500_OMNI_RENDER_OUTPUT:?set STAIRS500_OMNI_RENDER_OUTPUT}
 PYTHON=/move/u/bodow/miniconda3/envs/cloc3/bin/python
+VIEW=${STAIRS500_OMNI_RENDER_VIEW:-side}
 
 read -r REPORT LABEL < <(
     "${PYTHON}" -c \
@@ -34,4 +35,5 @@ export OPENBLAS_NUM_THREADS=1
     --output "${OUTPUT}/${LABEL}.mp4" \
     --frame-stride 2 \
     --width 800 \
-    --height 450
+    --height 450 \
+    --view "${VIEW}"

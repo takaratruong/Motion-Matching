@@ -31,6 +31,7 @@ def main() -> None:
     parser.add_argument("--frame-stride", type=int, default=2)
     parser.add_argument("--width", type=int, default=800)
     parser.add_argument("--height", type=int, default=450)
+    parser.add_argument("--view", choices=("side", "overhead"), default="side")
     arguments = parser.parse_args()
     report_path = arguments.report.expanduser().resolve()
     report = json.loads(report_path.read_text())
@@ -45,6 +46,14 @@ def main() -> None:
         frame_stride=arguments.frame_stride,
         width=arguments.width,
         height=arguments.height,
+        camera_azimuth_offset_deg=(
+            90.0 if arguments.view == "side" else 90.0
+        ),
+        camera_elevation_deg=(
+            -16.0 if arguments.view == "side" else -68.0
+        ),
+        camera_distance=(2.8 if arguments.view == "side" else 5.2),
+        camera_follow_root=arguments.view == "side",
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 

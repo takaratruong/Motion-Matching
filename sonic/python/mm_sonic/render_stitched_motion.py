@@ -84,6 +84,10 @@ def render_stitched_motion(
     width: int = 960,
     height: int = 540,
     frame_stride: int = 1,
+    camera_azimuth_offset_deg: float = 90.0,
+    camera_elevation_deg: float = -16.0,
+    camera_distance: float = 2.8,
+    camera_follow_root: bool = True,
 ) -> dict[str, object]:
     """Render articulated G1 kinematics without stepping physics."""
 
@@ -211,9 +215,11 @@ def render_stitched_motion(
         math.atan2(float(displacement[1]), float(displacement[0]))
     )
     camera = mujoco.MjvCamera()
-    camera.distance = 2.8
-    camera.azimuth = travel_yaw_deg + 90.0
-    camera.elevation = -16.0
+    camera.distance = float(camera_distance)
+    camera.azimuth = travel_yaw_deg + float(camera_azimuth_offset_deg)
+    camera.elevation = float(camera_elevation_deg)
+    static_lookat = np.mean(motion.root_position_world, axis=0)
+    static_lookat[2] -= 0.05
     model.vis.global_.offwidth = max(int(model.vis.global_.offwidth), width)
     model.vis.global_.offheight = max(int(model.vis.global_.offheight), height)
 
@@ -241,8 +247,11 @@ def render_stitched_motion(
             )
             data.time = frame / float(motion.fps)
             mujoco.mj_forward(model, data)
-            camera.lookat[:] = motion.root_position_world[frame]
-            camera.lookat[2] -= 0.05
+            if camera_follow_root:
+                camera.lookat[:] = motion.root_position_world[frame]
+                camera.lookat[2] -= 0.05
+            else:
+                camera.lookat[:] = static_lookat
             renderer.update_scene(data, camera=camera)
             encoder.stdin.write(
                 np.ascontiguousarray(
@@ -274,6 +283,10 @@ def render_stitched_motion(
         "frame_count": len(rendered_frames),
         "source_frame_count": len(motion.root_position_world),
         "frame_stride": stride,
+        "camera_azimuth_offset_deg": float(camera_azimuth_offset_deg),
+        "camera_elevation_deg": float(camera_elevation_deg),
+        "camera_distance": float(camera_distance),
+        "camera_follow_root": bool(camera_follow_root),
         "fps": fps,
         "duration_s": (len(motion.root_position_world) - 1)
         / float(motion.fps),
