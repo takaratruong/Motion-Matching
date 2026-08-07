@@ -18,19 +18,29 @@ from .mirror_stairs500_omnidirectional_pilots import (
 
 
 def behavior_family(mode: str) -> str:
-    """Collapse many angle variants into meaningful joystick behaviors."""
+    """Collapse angle variants without erasing distinct joystick behaviors."""
 
     value = str(mode)
-    if "turning_slalom" in value or "turning_zigzag" in value:
-        return "turning_weave"
+    if "turning_slalom" in value:
+        return "turning_slalom"
+    if "turning_zigzag" in value:
+        return "turning_zigzag"
     if value.startswith("travel_"):
         return "fixed_facing_oblique"
-    if any(token in value for token in ("counterface", "crab", "facing_weave")):
-        return "independent_facing"
-    if any(token in value for token in ("diagonal", "lane")):
-        return "diagonal_lane"
-    if "slalom" in value or "zigzag" in value:
-        return "path_weave"
+    if "counterface" in value:
+        return "counterface"
+    if "crab" in value:
+        return "crab"
+    if "facing_weave" in value:
+        return "facing_weave"
+    if "diagonal" in value:
+        return "diagonal"
+    if "lane" in value:
+        return "lane"
+    if "slalom" in value:
+        return "path_slalom"
+    if "zigzag" in value:
+        return "path_zigzag"
     if value.startswith("turning_"):
         return "turning"
     if value.startswith("face_"):
