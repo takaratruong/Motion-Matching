@@ -91,6 +91,50 @@ def select_review(
     return selected
 
 
+def _local_routes(row: dict[str, object]) -> tuple[np.ndarray, np.ndarray]:
+    with np.load(str(row["motion"]), allow_pickle=False) as payload:
+        root = np.asarray(payload["root_position_world"], dtype=np.float64)
+        intended = np.asarray(
+            payload.get("intended_root_position_world", root),
+            dtype=np.float64,
+        )
+    actual_xy = root[:, :2] - root[0, :2]
+    intended_xy = intended[:, :2] - intended[0, :2]
+    reference_xy = actual_xy
+    report_path = Path(str(row.get("report", "")))
+    if report_path.is_file():
+        report = json.loads(report_path.read_text())
+        source_path = Path(str(report.get("source_motion", "")))
+        if source_path.is_file():
+            with np.load(source_path, allow_pickle=False) as source:
+                source_root = np.asarray(
+                    source["root_position_world"], dtype=np.float64
+                )
+            reference_xy = source_root[:, :2] - source_root[0, :2]
+    _left, _singular, right = np.linalg.svd(
+        reference_xy - np.mean(reference_xy, axis=0), full_matrices=False
+    )
+    forward = np.asarray(right[0], dtype=np.float64)
+    probe = reference_xy[
+        min(len(reference_xy) - 1, max(1, len(reference_xy) // 3))
+    ]
+    if float(np.dot(probe, forward)) < 0.0:
+        forward *= -1.0
+    yaw = math.atan2(float(forward[1]), float(forward[0]))
+    cosine, sine = math.cos(-yaw), math.sin(-yaw)
+
+    def rotate(values: np.ndarray) -> np.ndarray:
+        return np.stack(
+            (
+                cosine * values[:, 0] - sine * values[:, 1],
+                sine * values[:, 0] + cosine * values[:, 1],
+            ),
+            axis=1,
+        )
+
+    return rotate(actual_xy), rotate(intended_xy)
+
+
 def plot_routes(rows: list[dict[str, object]], output: Path) -> None:
     import matplotlib
 
@@ -102,26 +146,22 @@ def plot_routes(rows: list[dict[str, object]], output: Path) -> None:
     for axis, traversal in zip(axes, traversals):
         subset = [row for row in rows if row["clip_traversal"] == traversal]
         for row in subset:
-            with np.load(str(row["motion"]), allow_pickle=False) as payload:
-                root = np.asarray(payload["root_position_world"], dtype=np.float64)
-            xy = root[:, :2] - root[0, :2]
-            _left, _singular, right = np.linalg.svd(
-                xy - np.mean(xy, axis=0), full_matrices=False
+            actual, intended = _local_routes(row)
+            axis.plot(
+                intended[:, 0],
+                intended[:, 1],
+                color="tab:red",
+                linestyle="--",
+                alpha=0.12,
+                linewidth=0.8,
             )
-            forward = np.asarray(right[0], dtype=np.float64)
-            probe = xy[min(len(xy) - 1, max(1, len(xy) // 3))]
-            if float(np.dot(probe, forward)) < 0.0:
-                forward *= -1.0
-            yaw = math.atan2(float(forward[1]), float(forward[0]))
-            cosine, sine = math.cos(-yaw), math.sin(-yaw)
-            local = np.stack(
-                (
-                    cosine * xy[:, 0] - sine * xy[:, 1],
-                    sine * xy[:, 0] + cosine * xy[:, 1],
-                ),
-                axis=1,
+            axis.plot(
+                actual[:, 0],
+                actual[:, 1],
+                color="tab:blue",
+                alpha=0.25,
+                linewidth=1.0,
             )
-            axis.plot(local[:, 0], local[:, 1], alpha=0.28, linewidth=1.0)
         axis.axhline(0.0, color="black", linewidth=0.6, alpha=0.35)
         axis.set_title(f"{traversal}: {len(subset)} accepted paths")
         axis.set_xlabel("forward progress (m)")
@@ -129,6 +169,58 @@ def plot_routes(rows: list[dict[str, object]], output: Path) -> None:
         axis.set_aspect("equal", adjustable="datalim")
         axis.grid(alpha=0.2)
     figure.suptitle("Exact-gated paired terrain + motion co-warps")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output, dpi=180)
+    plt.close(figure)
+
+
+def plot_mode_routes(rows: list[dict[str, object]], output: Path) -> None:
+    """Show every command family without hiding it in one dense overlay."""
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    modes = sorted({str(row["mode"]) for row in rows})
+    columns = 4
+    row_count = max(1, math.ceil(len(modes) / columns))
+    figure, axes = plt.subplots(
+        row_count,
+        columns,
+        figsize=(4.0 * columns, 3.1 * row_count),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    for axis, mode in zip(axes.flat, modes, strict=False):
+        subset = [row for row in rows if row["mode"] == mode]
+        for row in subset:
+            actual, intended = _local_routes(row)
+            axis.plot(
+                intended[:, 0],
+                intended[:, 1],
+                color="tab:red",
+                linestyle="--",
+                alpha=0.28,
+                linewidth=0.9,
+            )
+            axis.plot(
+                actual[:, 0],
+                actual[:, 1],
+                color="tab:blue",
+                alpha=0.42,
+                linewidth=1.0,
+            )
+        axis.set_title(f"{mode.removeprefix('cowarp_')}  (n={len(subset)})")
+        axis.axhline(0.0, color="black", linewidth=0.5, alpha=0.25)
+        axis.grid(alpha=0.15)
+        axis.set_aspect("equal", adjustable="datalim")
+    for axis in axes.flat[len(modes) :]:
+        axis.set_visible(False)
+    figure.suptitle(
+        "Paired terrain maneuvers by command family\n"
+        "blue: realized G1 root, red dashed: intended root"
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output, dpi=180)
     plt.close(figure)
@@ -184,6 +276,7 @@ def summarize(root: Path, review_count: int) -> dict[str, object]:
             "accepted": "accepted.json",
             "review": "review.json",
             "routes": "all_routes.png",
+            "mode_routes": "routes_by_mode.png",
         },
     }
     (root / "accepted.json").write_text(
@@ -195,6 +288,7 @@ def summarize(root: Path, review_count: int) -> dict[str, object]:
         + "\n"
     )
     plot_routes(accepted, root / "all_routes.png")
+    plot_mode_routes(accepted, root / "routes_by_mode.png")
     (root / "summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n"
     )

@@ -540,13 +540,26 @@ def command_labels(
     facing = np.unwrap(
         np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
     )
+    cosine = np.cos(facing)
+    sine = np.sin(facing)
+    velocity_local = np.stack(
+        (
+            cosine * velocity[:, 0] + sine * velocity[:, 1],
+            -sine * velocity[:, 0] + cosine * velocity[:, 1],
+        ),
+        axis=1,
+    )
     hold = np.asarray(schedule.phase == HOLD, dtype=np.bool_)
     # ``np.gradient`` intentionally looks across a phase boundary.  The raw
     # joystick label, however, is exactly centred throughout the requested
     # hold, including its first and last held samples.
     velocity[hold] = 0.0
+    velocity_local[hold] = 0.0
     return {
         "command_velocity_world_xy": np.asarray(velocity, dtype=np.float32),
+        "command_velocity_robot_local_xy": np.asarray(
+            velocity_local, dtype=np.float32
+        ),
         "command_facing_yaw_world_rad": np.asarray(facing, dtype=np.float32),
         "command_stop": hold,
         "maneuver_phase": np.asarray(schedule.phase, dtype=np.uint8),
@@ -560,43 +573,105 @@ def save_maneuver_motion(
     path: str | Path,
     motion: StitchedMotion,
     schedule: ManeuverSchedule,
+    *,
+    source_motion_path: str | Path | None = None,
 ) -> Path:
-    """Write a regular stitched-motion bundle plus synchronized commands."""
+    """Write a stitched-motion bundle plus synchronized commands and metadata.
+
+    When a paired terrain co-warp is retimed, its contact masks, intended path,
+    and geometric audit traces remain useful.  Resample those per-frame arrays
+    by the exact same source-time coordinate instead of silently dropping them.
+    Discrete masks/counts use nearest-neighbour sampling; continuous arrays use
+    linear interpolation.  Commands are deliberately recomputed from the
+    retimed motion and therefore are never copied from the source payload.
+    """
 
     destination = Path(path).expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     labels = command_labels(motion, schedule)
-    np.savez_compressed(
-        destination,
-        fps=np.asarray(motion.fps, dtype=np.float32),
-        root_position_world=np.asarray(motion.root_position_world, np.float32),
-        root_quaternion_world_wxyz=np.asarray(
+    payload: dict[str, np.ndarray] = {
+        "fps": np.asarray(motion.fps, dtype=np.float32),
+        "root_position_world": np.asarray(
+            motion.root_position_world, np.float32
+        ),
+        "root_quaternion_world_wxyz": np.asarray(
             motion.root_quaternion_world_wxyz, np.float32
         ),
-        joint_position=np.asarray(motion.joint_position, np.float32),
-        seam_indices=np.asarray(motion.seam_indices, dtype=np.int64),
-        source_archive_clip_index=np.asarray(
+        "joint_position": np.asarray(motion.joint_position, np.float32),
+        "seam_indices": np.asarray(motion.seam_indices, dtype=np.int64),
+        "source_archive_clip_index": np.asarray(
             [value.archive_clip_index for value in motion.provenance],
             dtype=np.int64,
         ),
-        source_frame=np.asarray(
+        "source_frame": np.asarray(
             [value.source_frame for value in motion.provenance], dtype=np.int64
         ),
-        source_clip_id=np.asarray(
+        "source_clip_id": np.asarray(
             [value.clip_id for value in motion.provenance], dtype=np.str_
         ),
-        maneuver_mode=np.asarray(schedule.mode, dtype=np.str_),
-        pivot_source_frame=np.asarray(
+        "maneuver_mode": np.asarray(schedule.mode, dtype=np.str_),
+        "pivot_source_frame": np.asarray(
             schedule.pivot_source_frame, dtype=np.int64
         ),
-        pivot_source_frames=np.asarray(
+        "pivot_source_frames": np.asarray(
             schedule.pivot_source_frames
             or (schedule.pivot_source_frame,),
             dtype=np.int64,
         ),
-        maneuver_phase_names=np.asarray(PHASE_NAMES, dtype=np.str_),
+        "maneuver_phase_names": np.asarray(PHASE_NAMES, dtype=np.str_),
         **labels,
-    )
+    }
+    if source_motion_path is not None:
+        coordinate = np.asarray(schedule.source_coordinate, dtype=np.float64)
+        lower = np.floor(coordinate).astype(np.int64)
+        fraction = coordinate - lower
+        reserved = {
+            "fps",
+            "root_position_world",
+            "root_quaternion_world_wxyz",
+            "joint_position",
+            "seam_indices",
+            "source_archive_clip_index",
+            "source_frame",
+            "source_clip_id",
+            "maneuver_mode",
+            "source_maneuver_mode",
+            "pivot_source_frame",
+            "pivot_source_frames",
+            "maneuver_phase_names",
+            *labels,
+        }
+        with np.load(
+            Path(source_motion_path).expanduser().resolve(), allow_pickle=False
+        ) as source:
+            source_count = len(source["root_position_world"])
+            upper = np.minimum(lower + 1, source_count - 1)
+            if "maneuver_mode" in source:
+                payload["source_maneuver_mode"] = np.asarray(
+                    source["maneuver_mode"], dtype=np.str_
+                )
+            for name in source.files:
+                if name in reserved:
+                    continue
+                values = np.asarray(source[name])
+                if values.ndim == 0 or values.shape[0] != source_count:
+                    continue
+                if values.dtype.kind in "fc":
+                    blend_shape = (len(fraction),) + (1,) * (values.ndim - 1)
+                    weight = fraction.reshape(blend_shape)
+                    sampled = (
+                        (1.0 - weight) * values[lower]
+                        + weight * values[upper]
+                    )
+                    payload[name] = np.asarray(sampled, dtype=values.dtype)
+                else:
+                    nearest = np.clip(
+                        np.rint(coordinate).astype(np.int64), 0, source_count - 1
+                    )
+                    payload[name] = np.asarray(
+                        values[nearest], dtype=values.dtype
+                    )
+    np.savez_compressed(destination, **payload)
     return destination
 
 

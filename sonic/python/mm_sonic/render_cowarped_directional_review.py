@@ -29,6 +29,7 @@ def render_selected(
     output_root: Path,
     frame_stride: int,
     camera_azimuth_offset_deg: float,
+    view: str = "side",
 ) -> dict[str, object]:
     payload = json.loads(selection_path.read_text())
     rows = list(payload["rows"])
@@ -57,8 +58,26 @@ def render_selected(
         / f"{row['mode']}.mp4"
     )
     destination.parent.mkdir(parents=True, exist_ok=True)
+    motion = load_stitched_motion_npz(motion_path)
+    camera: dict[str, object] = {}
+    if view == "overhead":
+        path_extent = float(
+            np.max(
+                np.ptp(
+                    np.asarray(motion.root_position_world)[:, :2],
+                    axis=0,
+                )
+            )
+        )
+        camera = {
+            "camera_elevation_deg": -68.0,
+            "camera_distance": float(
+                np.clip(1.10 * path_extent + 1.6, 2.8, 5.2)
+            ),
+            "camera_follow_root": False,
+        }
     result = render_stitched_motion(
-        load_stitched_motion_npz(motion_path),
+        motion,
         model_path=model_path,
         output_path=destination,
         target_mesh=target_mesh,
@@ -67,13 +86,14 @@ def render_selected(
         height=360,
         frame_stride=max(1, int(frame_stride)),
         camera_azimuth_offset_deg=float(camera_azimuth_offset_deg),
-        camera_follow_root=True,
+        **camera,
     )
     report = {
         "status": "rendered",
         "selection_index": index,
         "clip_index": int(row["clip_index"]),
         "mode": str(row["mode"]),
+        "view": str(view),
         "motion": str(motion_path),
         "terrain_usd": str(terrain_path),
         **result,
@@ -93,6 +113,7 @@ def main() -> int:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--frame-stride", type=int, default=5)
     parser.add_argument("--camera-azimuth-offset-deg", type=float, default=90.0)
+    parser.add_argument("--view", choices=("side", "overhead"), default="side")
     arguments = parser.parse_args()
     print(
         json.dumps(
@@ -104,6 +125,7 @@ def main() -> int:
                 output_root=arguments.output_root.expanduser().resolve(),
                 frame_stride=arguments.frame_stride,
                 camera_azimuth_offset_deg=arguments.camera_azimuth_offset_deg,
+                view=arguments.view,
             ),
             indent=2,
             sort_keys=True,

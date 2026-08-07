@@ -17,6 +17,7 @@ ARCHIVE=${COWARP_REVIEW_ARCHIVE:?COWARP_REVIEW_ARCHIVE is required}
 OUTPUT=${COWARP_REVIEW_OUTPUT:?COWARP_REVIEW_OUTPUT is required}
 STRIDE=${COWARP_REVIEW_STRIDE:-5}
 AZIMUTH=${COWARP_REVIEW_AZIMUTH_DEG:-90}
+VIEW=${COWARP_REVIEW_VIEW:-side}
 PYTHON=/move/u/bodow/miniconda3/envs/cloc3/bin/python
 
 export PYTHONPATH="${PROJECT}/sonic/python"
@@ -30,4 +31,5 @@ export OPENBLAS_NUM_THREADS=1
     --archive "${ARCHIVE}" \
     --output-root "${OUTPUT}" \
     --frame-stride "${STRIDE}" \
-    --camera-azimuth-offset-deg "${AZIMUTH}"
+    --camera-azimuth-offset-deg "${AZIMUTH}" \
+    --view "${VIEW}"

@@ -9,6 +9,7 @@ import numpy as np
 import zarr
 
 from mm_sonic.build_terrain_maneuver_pilots import (
+    _cowarp_pivot_constraints,
     _direct_terrain_transform,
     _terrain_motion_interval,
 )
@@ -25,6 +26,7 @@ from mm_sonic.terrain_maneuver_composer import (
     choose_support_pivots,
     command_labels,
     resample_stitched_motion,
+    save_maneuver_motion,
 )
 from mm_sonic.terrain_oracle.stitch import FrameProvenance, StitchedMotion
 
@@ -239,6 +241,120 @@ class TerrainManeuverComposerTests(unittest.TestCase):
             0.0,
             atol=1.0e-7,
         )
+
+    def test_command_velocity_is_also_expressed_in_robot_frame(self) -> None:
+        source = _motion()
+        root = np.asarray(source.root_position_world).copy()
+        root[:, 0] = 0.0
+        root[:, 1] = np.arange(len(root), dtype=np.float32) * 0.01
+        quaternion = np.zeros_like(source.root_quaternion_world_wxyz)
+        quaternion[:, 0] = np.sqrt(0.5)
+        quaternion[:, 3] = np.sqrt(0.5)
+        source = StitchedMotion(
+            fps=source.fps,
+            root_position_world=root,
+            root_quaternion_world_wxyz=quaternion,
+            joint_position=source.joint_position,
+            provenance=source.provenance,
+            seam_indices=source.seam_indices,
+        )
+        schedule = build_maneuver_schedule(
+            160,
+            pivot_source_frame=80,
+            mode="stop_restart",
+            ramp_frames=16,
+            hold_frames=4,
+        )
+        output = resample_stitched_motion(source, schedule)
+        labels = command_labels(output, schedule)
+
+        local = labels["command_velocity_robot_local_xy"]
+        np.testing.assert_allclose(np.median(local[:20, 0]), 0.5, atol=1.0e-5)
+        np.testing.assert_allclose(np.median(local[:20, 1]), 0.0, atol=1.0e-5)
+        np.testing.assert_array_equal(local[schedule.phase == HOLD], 0.0)
+
+    def test_retimed_cowarp_metadata_is_preserved(self) -> None:
+        source = _motion()
+        schedule = build_maneuver_schedule(
+            160,
+            pivot_source_frame=80,
+            mode="reverse",
+            ramp_frames=16,
+            hold_frames=4,
+        )
+        output = resample_stitched_motion(source, schedule)
+        progress = np.linspace(0.0, 1.0, 160, dtype=np.float32)
+        stance = np.zeros((160, 2), dtype=np.bool_)
+        stance[60:90] = True
+        support = np.zeros((160, 2), dtype=np.int16)
+        support[60:90] = 4
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_path = root / "source.npz"
+            destination = root / "retimed.npz"
+            np.savez_compressed(
+                source_path,
+                root_position_world=source.root_position_world,
+                maneuver_mode=np.asarray(
+                    "cowarp_slalom_left_right", dtype=np.str_
+                ),
+                path_normalized_progress=progress,
+                authored_stance_mask=stance,
+                target_stance_support_point_count=support,
+            )
+
+            save_maneuver_motion(
+                destination,
+                output,
+                schedule,
+                source_motion_path=source_path,
+            )
+
+            with np.load(destination, allow_pickle=False) as payload:
+                expected = np.interp(
+                    schedule.source_coordinate,
+                    np.arange(160, dtype=np.float64),
+                    progress,
+                )
+                np.testing.assert_allclose(
+                    payload["path_normalized_progress"], expected, atol=1.0e-7
+                )
+                nearest = np.rint(schedule.source_coordinate).astype(np.int64)
+                np.testing.assert_array_equal(
+                    payload["authored_stance_mask"], stance[nearest]
+                )
+                self.assertEqual(
+                    str(payload["source_maneuver_mode"]),
+                    "cowarp_slalom_left_right",
+                )
+                self.assertIn("command_velocity_robot_local_xy", payload.files)
+
+    def test_cowarp_pivots_require_authored_two_foot_support(self) -> None:
+        progress = np.empty(160, dtype=np.float32)
+        progress[:81] = np.linspace(0.0, 1.0, 81)
+        progress[81:101] = 1.0
+        progress[101:] = np.linspace(0.98, 0.2, 59)
+        stance = np.zeros((160, 2), dtype=np.bool_)
+        support = np.zeros((160, 2), dtype=np.int16)
+        stance[[50, 90]] = True
+        support[50] = (4, 1)
+        support[90] = (2, 4)
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "cowarp.npz"
+            np.savez_compressed(
+                source_path,
+                root_position_world=np.zeros((160, 3), dtype=np.float32),
+                path_normalized_progress=progress,
+                authored_stance_mask=stance,
+                target_stance_support_point_count=support,
+            )
+
+            eligible, passage = _cowarp_pivot_constraints(
+                source_path, frame_count=160
+            )
+
+        self.assertEqual(passage, (0, 101))
+        self.assertEqual(np.flatnonzero(eligible).tolist(), [90])
 
     def test_pivot_requires_central_double_support(self) -> None:
         motion = _motion()

@@ -208,6 +208,60 @@ def _terrain_motion_interval(
     return 0, count, "full_motion_fallback"
 
 
+def _cowarp_pivot_constraints(
+    source_path: Path,
+    *,
+    frame_count: int,
+) -> tuple[np.ndarray | None, tuple[int, int] | None]:
+    """Read exact co-warp contact masks and isolate its first path passage.
+
+    Paired co-warps store the authored stance state and the number of target
+    surface probes supporting each sole.  A timing pivot is trustworthy only
+    when both feet were authored in stance and each retained at least two
+    probes.  Some rough-terrain clips travel out and back; stop/reversal
+    pivots are restricted to the first passage so a generated bounce cannot
+    accidentally straddle the source clip's own turnaround.
+    """
+
+    with np.load(source_path, allow_pickle=False) as payload:
+        required = {
+            "authored_stance_mask",
+            "target_stance_support_point_count",
+        }
+        if not required.issubset(payload.files):
+            return None, None
+        stance = np.asarray(payload["authored_stance_mask"], dtype=np.bool_)
+        support = np.asarray(
+            payload["target_stance_support_point_count"], dtype=np.int64
+        )
+        if (
+            stance.shape != (frame_count, 2)
+            or support.shape != (frame_count, 2)
+        ):
+            raise ValueError("invalid co-warp stance metadata shape")
+        eligible = np.all(stance, axis=1) & np.all(support >= 2, axis=1)
+        passage: tuple[int, int] | None = None
+        if "path_normalized_progress" in payload:
+            progress = np.asarray(
+                payload["path_normalized_progress"], dtype=np.float64
+            )
+            if (
+                progress.shape != (frame_count,)
+                or not np.isfinite(progress).all()
+            ):
+                raise ValueError("invalid co-warp path progress")
+            maximum = float(np.max(progress))
+            if maximum > 1.0e-6 and float(progress[-1]) < maximum - 0.05:
+                peak = int(np.argmax(progress))
+                stop = peak + 1
+                while stop < frame_count and progress[stop] >= maximum - 0.01:
+                    stop += 1
+                passage = (0, stop)
+            else:
+                passage = (0, frame_count)
+    return eligible, passage
+
+
 def _direct_terrain_transform(
     *,
     archive_path: Path,
@@ -373,19 +427,35 @@ def build_pilots(arguments: argparse.Namespace) -> dict[str, object]:
         terrain_start, terrain_stop, terrain_interval_source = (
             _terrain_motion_interval(source)
         )
+        pivot_clearance = np.asarray(source_clearance, dtype=np.float64).copy()
+        pivot_central_fraction = tuple(arguments.pivot_central_fraction)
+        pivot_eligibility, cowarp_passage = _cowarp_pivot_constraints(
+            source_path,
+            frame_count=len(source.root_position_world),
+        )
+        if pivot_eligibility is not None:
+            # Keep the array finite because the generic selector explicitly
+            # validates its inputs before thresholding support.
+            pivot_clearance[~pivot_eligibility] = max(
+                1.0, float(arguments.pivot_clearance_m) + 1.0
+            )
+            if cowarp_passage is not None:
+                terrain_start, terrain_stop = cowarp_passage
+                terrain_interval_source = "cowarp_first_path_passage"
+            pivot_central_fraction = (0.05, 0.95)
         requested_pivot_count = int(getattr(arguments, "pivot_count", 1))
         event = manifest["events"][event_index]
         try:
             pivots = choose_support_pivots(
                 source,
-                source_clearance,
+                pivot_clearance,
                 count=requested_pivot_count,
                 per_foot_speed_mps=source_foot_speed,
                 terrain_start_frame=terrain_start,
                 terrain_stop_frame=terrain_stop,
                 maximum_support_clearance_m=arguments.pivot_clearance_m,
                 maximum_support_speed_mps=arguments.pivot_speed_mps,
-                central_fraction=tuple(arguments.pivot_central_fraction),
+                central_fraction=pivot_central_fraction,
             )
         except ValueError as error:
             schedule_rejections.append(
@@ -508,7 +578,10 @@ def build_pilots(arguments: argparse.Namespace) -> dict[str, object]:
             destination = output / label
             destination.mkdir(parents=True, exist_ok=True)
             motion_path = save_maneuver_motion(
-                destination / "motion.npz", motion, schedule
+                destination / "motion.npz",
+                motion,
+                schedule,
+                source_motion_path=source_path,
             )
             clearance, centres = _foot_kinematics(
                 motion,
@@ -578,6 +651,9 @@ def build_pilots(arguments: argparse.Namespace) -> dict[str, object]:
                     "stop_frame": terrain_stop,
                     "source": terrain_interval_source,
                 },
+                "authored_pivot_constraints_used": bool(
+                    pivot_eligibility is not None
+                ),
                 "status": (
                     "pending_dense_visual_review"
                     if automatic
