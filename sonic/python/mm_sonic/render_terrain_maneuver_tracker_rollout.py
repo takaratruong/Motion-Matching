@@ -48,6 +48,9 @@ def main(argv: list[str] | None = None) -> int:
     clips = np.asarray(meta["episode_clip"][:]).astype(str)
     origins = np.asarray(meta["episode_env_origin"][:], dtype=np.float64)
     joint_names = tuple(str(value) for value in meta["joint_names"][:])
+    default_joint_position = np.asarray(
+        meta["default_joint_pos"][:], dtype=np.float64
+    )
 
     bundle = arguments.bundle.expanduser().resolve()
     records = {
@@ -80,9 +83,11 @@ def main(argv: list[str] | None = None) -> int:
             root_quaternion_world_wxyz=np.asarray(
                 data["root_rot"][start:stop], dtype=np.float64
             ),
+            # SONIC stores joint_pos relative to its default joint pose.
             joint_position=np.asarray(
                 data["joint_pos"][start:stop], dtype=np.float64
-            ),
+            )
+            + default_joint_position,
             provenance=tuple(
                 FrameProvenance(-1, frame, clip) for frame in range(frame_count)
             ),

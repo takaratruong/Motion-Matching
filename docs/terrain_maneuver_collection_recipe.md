@@ -226,8 +226,10 @@ visual review, not by training reward alone.
 The corrected run selects iteration 400: 157/200 motions survive and 120/200
 also stay at or below 300 mm peak MPJPE.  Stop/restart is already strong
 (94/100 strict passes), while reversal is the remaining specialist problem
-(26/100).  The complete labeled physical review is
-`/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/selected200_step400_physical_review8_v1/step400_physical_review8_grid.mp4`.
+(26/100).  Do not use the original `selected200_step400_physical_review8_v1`
+render: it omitted `meta/default_joint_pos` when reconstructing SONIC's
+relative joint positions.  The corrected labeled physical review is
+`/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/selected200_step400_physical_review8_fixed_v2/step400_physical_review8_fixed_grid.mp4`.
 
 For collection, do not replay the entire 200-motion bundle through iteration
 400.  Use `selected120_step400_qualified_bundle_v1`, which contains only that
@@ -253,9 +255,14 @@ quota, not a corrupt dataset: preserve the 236 admitted episodes and exclude
 the two torque-fragile motions from this checkpoint's route.
 
 Visual evidence for the retained noisy data is
-`/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/noised_selected120_step400_review4_v1/noised_selected120_step400_review4_grid.mp4`.
+`/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/noised_selected120_step400_review4_fixed_v2/noised_selected120_step400_review4_fixed_grid.mp4`.
 It contains one median-error rollout from every ascent/descent x stop/reversal
 cell and should accompany the numeric receipt when this tranche is handed off.
+The exact-mesh post-audit uses a separate physical-contact gate: at most 10 mm
+foot penetration and zero forbidden-body penetration.  All 236 episodes pass;
+the median, p90, and maximum foot contacts are 5.356, 6.733, and 9.132 mm.
+Keep the clean kinematic source limit at 5 mm; deterministic physical tracking
+itself reaches 8.154 mm because rigid-contact rollouts have solver compliance.
 
 ## Per-clip record
 

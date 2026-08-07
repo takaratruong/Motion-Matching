@@ -1562,12 +1562,20 @@ the residual failures remain concentrated in reversal rather than ordinary
 stair locomotion.  This supports routing offline collection by maneuver family
 instead of forcing one tracker to cover incompatible events.
 
-The labeled physical audit is
-`/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/selected200_step400_physical_review8_v1/step400_physical_review8_grid.mp4`.
-It shows one representative strict pass and one representative rejection for
-each ascent/descent x stop/reversal cell.  The accepted examples remain
-grounded and complete the commanded event; the rejected examples terminate
-early or retain excessive pose error, rather than hiding a terrain teleport.
+The first labeled physical-audit video in
+`selected200_step400_physical_review8_v1` is invalid.  Its offline renderer
+treated SONIC's stored joint offsets as absolute joint angles instead of adding
+`meta/default_joint_pos`, which placed the rendered feet 5--8 cm inside the
+stairs even though those were not the saved simulator poses.  The corrected
+review is
+`/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/selected200_step400_physical_review8_fixed_v2/step400_physical_review8_fixed_grid.mp4`.
+Offline forward kinematics after the fix agrees with the stored SONIC body
+positions to within 0.01 mm.  Exact-mesh reconstruction of all 200
+deterministic rollouts has 4.823 mm median and 8.154 mm maximum foot contact;
+199/200 have zero forbidden-body penetration.  The sole exception is the
+clip-191 reversal (3.383 mm forbidden-body contact), which subsequently
+produced no accepted noisy rollout and is absent from the retained batch.
+The deterministic receipt is `clean_eval_selected200_v1/geometry_audit_v1/summary.json`.
 
 The 120 iteration-400 strict passes have been repackaged as
 `selected120_step400_qualified_bundle_v1`.  A separate equal-weight 100-motion
@@ -1599,8 +1607,16 @@ descent reversals.  Only the clip-135 and clip-191 descent reversals remained at
 zero successes after 32--34 noised attempts each, so they are excluded rather
 than causing the other 236 successful rollouts to be repeated.
 
-The stratified noisy-rollout review is
-`/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/noised_selected120_step400_review4_v1/noised_selected120_step400_review4_grid.mp4`.
-It shows median-error ascent/descent stop and reversal episodes.  All four stay
-grounded, traverse the registered stairs, execute the event, and finish upright;
-there is no visible root teleport, terrain hover, or staircase penetration.
+The original noisy-review video in `noised_selected120_step400_review4_v1`
+has the same relative-versus-absolute joint-angle rendering bug and must not be
+used.  The corrected stratified review is
+`/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/noised_selected120_step400_review4_fixed_v2/noised_selected120_step400_review4_fixed_grid.mp4`.
+An exact-mesh post-audit of all 236 retained noisy episodes gives 5.356 mm
+median, 6.733 mm p90, and 9.132 mm maximum foot contact, with zero
+forbidden-body penetration in every episode.  The 5 mm source-kinematics gate
+is intentionally not reused as a rigid-contact rollout gate: deterministic
+physical tracking itself reaches 8.154 mm.  A separate 10 mm physical foot
+compliance limit plus zero forbidden-body contact admits all 236 retained
+rollouts without concealing the distinction between the two gates.
+The complete receipt is
+`noised_selected120_step400_perclip2_v1/geometry_audit_physical10_v2/summary.json`.
