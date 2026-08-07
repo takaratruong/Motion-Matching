@@ -5,7 +5,7 @@
 #SBATCH --account=move
 #SBATCH --partition=sc-freecpu,move
 #SBATCH --cpus-per-task=1
-#SBATCH --mem=8G
+#SBATCH --mem=4G
 #SBATCH --time=01:00:00
 #SBATCH --output=/move/u/bodow/Projects/Motion-Matching-takara-corpus/slurm-stairs500-dir-bundle-%j.out
 
