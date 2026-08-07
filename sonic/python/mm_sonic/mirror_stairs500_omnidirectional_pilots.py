@@ -248,7 +248,11 @@ def build(
     output: Path,
     archive_path: Path,
     model_path: Path,
+    shard_index: int = 0,
+    shard_count: int = 1,
 ) -> dict[str, object]:
+    if shard_count < 1 or not 0 <= shard_index < shard_count:
+        raise ValueError("mirror shard index must be within shard count")
     archive_path = archive_path.expanduser().resolve()
     archive = zarr.open_group(str(archive_path), mode="r")
     admitted_reports: list[Path] = []
@@ -261,7 +265,7 @@ def build(
             skipped_noop += 1
             continue
         admitted_reports.append(path)
-    reports = admitted_reports
+    reports = admitted_reports[shard_index::shard_count]
     output = output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     results = []
@@ -282,13 +286,21 @@ def build(
     summary = {
         "schema": "stairs500-omnidirectional-mirrors/v1",
         "source_root": str(root.expanduser().resolve()),
+        "source_admitted_count": len(admitted_reports),
+        "shard_index": int(shard_index),
+        "shard_count": int(shard_count),
         "attempted": len(results),
         "accepted": sum(row["status"] == "accepted" for row in results),
         "rejected": sum(row["status"] != "accepted" for row in results),
         "skipped_noop": skipped_noop,
         "reports": results,
     }
-    (output / "aggregate.json").write_text(
+    summary_name = (
+        "aggregate.json"
+        if shard_count == 1
+        else f"aggregate_shard_{shard_index:02d}_of_{shard_count:02d}.json"
+    )
+    (output / summary_name).write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n"
     )
     return summary
@@ -300,12 +312,16 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--archive", type=Path, default=DEFAULT_ARCHIVE)
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--shard-count", type=int, default=1)
     arguments = parser.parse_args()
     summary = build(
         arguments.root,
         output=arguments.output,
         archive_path=arguments.archive,
         model_path=arguments.model,
+        shard_index=arguments.shard_index,
+        shard_count=arguments.shard_count,
     )
     print(
         json.dumps(
