@@ -1689,17 +1689,31 @@ rollouts pass the exact geometry audit with zero forbidden-body penetration and
 at most 6.02 mm foot contact.  Continuing to iteration 100 falls to 3/6, so the
 universal run must evaluate early checkpoints rather than assume longer is
 better.  A separate four-motion fixed-facing canary covers 24-degree ascent,
-backward 24-degree descent, 32-degree descent, and a second 24-degree descent;
-training/eval jobs `16552280`/`16552282` are queued on one A5000 because all six
-L40s are occupied.
+backward 24-degree descent, 32-degree descent, and a second 24-degree descent.
+The first A5000 attempt (`16552280`) was canceled after spending ten minutes in
+an uninterruptible shared-filesystem read before allocating GPU memory.  Its
+incomplete output is preserved with a `stalled_move3_job16552280` suffix.  The
+replacement training/eval jobs are `16553721`/`16553722` on one move4 L40;
+video and exact-geometry jobs are already dependent on the evaluation.
 
 The universal SONIC bundle intentionally uses all 856 exact-accepted motions,
 not the 382-motion gold-only subset: the visually clean largest-angle examples
 are often silver because they require larger bounded joint correction.  It also
-includes the stable selected200 replay bank and accepted transitions derived
-from `review32.json`.  The target is
+includes the stable selected200 replay bank and 62 accepted stop/restart or
+mid-stair reversal transitions derived from `review32.json`, for 1,118 motions
+total.  The target is
 `omnidirectional_sweep28_post_v1/sonic_bundle_replay200_all_transitions32_v1`.
 Training will start from `sonic_selected200_finetune_v1/model_step_000400.pt`,
 save early checkpoints, and qualify motions only after deterministic survival,
 MPJPE, exact-mesh, and dense visual gates.  No noised collection is released
 from training completion alone.
+
+SONIC paired-terrain training does not rotate a smaller environment pool
+through a larger motion library: environment `k` remains bound to motion and
+terrain `k`.  Consequently, a nominal 192-environment run over this bundle
+would only train the leading 192 examples, regardless of iteration count.  The
+universal launcher derives `num_envs` from `clips.json` and uses one paired
+environment for each of the 1,118 clips.  Job `16553725` is a five-iteration,
+single-L40 memory preflight for this exact coverage.  If it does not fit, the
+fallback is explicit balanced bundles no larger than the environment count,
+not a partial run mislabeled as full-bank training.
