@@ -9,6 +9,7 @@ from typing import Callable, Sequence
 
 import zarr
 
+from .export_stairs500_directional_bank import _quality_tier
 from .mirror_stairs500_omnidirectional_pilots import (
     DEFAULT_ARCHIVE,
     _realized_directional_motion,
@@ -38,6 +39,7 @@ def select(
                 candidates.append((report_path, report))
     candidates.sort(
         key=lambda item: (
+            _quality_tier(item[1]) != "gold",
             bool(item[1].get("mirror_of")),
             int(item[1]["clip_index"]),
             str(item[1]["source_kind"]),
@@ -153,6 +155,7 @@ def select(
                 f"{report['source_kind']}_{report['mode']}"
             ),
             "report": str(path),
+            "quality_tier": _quality_tier(report),
         }
         for index, (stratum, path, report) in enumerate(chosen)
     ]

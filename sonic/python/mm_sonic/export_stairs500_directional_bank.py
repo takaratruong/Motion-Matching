@@ -23,16 +23,42 @@ from .mirror_stairs500_omnidirectional_pilots import (
 )
 
 
+def _quality_tier(report: dict[str, object]) -> str:
+    """Separate clean training candidates from mechanically marginal ones."""
+
+    warp = report.get("warp")
+    if not isinstance(warp, dict):
+        return "silver"
+    if bool(warp.get("identity_temporal_reverse")):
+        return "gold"
+    collision = report.get("collision_audit")
+    if not isinstance(collision, dict):
+        return "silver"
+    gold = bool(
+        float(warp.get("maximum_stance_sole_target_error_m", 1.0)) <= 0.006
+        and float(warp.get("maximum_swing_sole_target_error_m", 1.0)) <= 0.030
+        and float(warp.get("maximum_stance_run_drift_m", 1.0)) <= 0.006
+        and float(report.get("clearance_repair_maximum_m", 1.0)) <= 0.013
+        and float(warp.get("maximum_joint_correction_rad", 1.0)) <= 0.42
+        and float(collision.get("maximum_foot_penetration_m", 1.0)) <= 0.0045
+        and float(collision.get("maximum_forbidden_body_penetration_m", 1.0))
+        == 0.0
+    )
+    return "gold" if gold else "silver"
+
+
 def export(
     roots: Sequence[Path],
     *,
     archive_path: Path,
     output: Path,
     source_kinds: Sequence[str],
+    quality_tiers: Sequence[str],
 ) -> dict[str, object]:
     archive_path = archive_path.expanduser().resolve()
     archive = zarr.open_group(str(archive_path), mode="r")
     allowed_kinds = frozenset(source_kinds)
+    allowed_quality = frozenset(quality_tiers)
     report_paths = sorted(
         {
             report.resolve()
@@ -44,6 +70,7 @@ def export(
     rejected_status = 0
     rejected_kind = 0
     rejected_unrealized = 0
+    rejected_quality = 0
     for report_path in report_paths:
         report = json.loads(report_path.read_text())
         if report.get("status") != "accepted":
@@ -54,6 +81,9 @@ def export(
             continue
         if not _realized_directional_motion(report_path, report, archive):
             rejected_unrealized += 1
+            continue
+        if allowed_quality and _quality_tier(report) not in allowed_quality:
+            rejected_quality += 1
             continue
         admitted.append((report_path, report))
     if not admitted:
@@ -89,6 +119,7 @@ def export(
                 "mode": str(report["mode"]),
                 "traversal": str(report["traversal"]),
                 "symmetry_mirrored": bool(report.get("mirror_of")),
+                "quality_tier": _quality_tier(report),
             }
             if "warp" in report:
                 pilot["warp"] = report["warp"]
@@ -101,6 +132,7 @@ def export(
                     "mode": pilot["mode"],
                     "traversal": pilot["traversal"],
                     "symmetry_mirrored": pilot["symmetry_mirrored"],
+                    "quality_tier": pilot["quality_tier"],
                 }
             )
         manifest = {
@@ -128,11 +160,13 @@ def export(
         "archive": str(archive_path),
         "roots": [str(path.expanduser().resolve()) for path in roots],
         "source_kinds": sorted(allowed_kinds),
+        "quality_tiers": sorted(allowed_quality),
         "report_count": len(report_paths),
         "admitted_count": len(admitted),
         "rejected_status_count": rejected_status,
         "rejected_kind_count": rejected_kind,
         "rejected_unrealized_count": rejected_unrealized,
+        "rejected_quality_count": rejected_quality,
         "manifest_count": len(manifest_paths),
         "manifests": manifest_paths,
         "visual_review_required_before_sonic_training": True,
@@ -154,6 +188,13 @@ def main() -> None:
         default=[],
         help="Admitted source kind; defaults to native and temporal_reverse.",
     )
+    parser.add_argument(
+        "--quality-tier",
+        choices=("gold", "silver"),
+        action="append",
+        default=[],
+        help="Optional admitted quality tier; by default both are exported.",
+    )
     arguments = parser.parse_args()
     source_kinds = tuple(arguments.source_kind) or ("native", "temporal_reverse")
     summary = export(
@@ -161,6 +202,7 @@ def main() -> None:
         archive_path=arguments.archive,
         output=arguments.output,
         source_kinds=source_kinds,
+        quality_tiers=tuple(arguments.quality_tier),
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
 

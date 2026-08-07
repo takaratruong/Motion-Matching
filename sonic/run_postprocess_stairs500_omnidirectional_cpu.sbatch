@@ -33,6 +33,12 @@ export OPENBLAS_NUM_THREADS=1
     --root "${MIRRORS}" \
     --output "${OUTPUT}/sonic_selection"
 
+"${PYTHON}" -u -B -m mm_sonic.export_stairs500_directional_bank \
+    --root "${SOURCE}" \
+    --root "${MIRRORS}" \
+    --quality-tier gold \
+    --output "${OUTPUT}/sonic_selection_gold"
+
 "${PYTHON}" -u -B -m mm_sonic.select_stairs500_directional_review \
     --root "${SOURCE}" \
     --root "${MIRRORS}" \
