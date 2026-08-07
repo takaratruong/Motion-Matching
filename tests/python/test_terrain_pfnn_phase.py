@@ -16,6 +16,7 @@ from mm_sonic.terrain_oracle.canonical import (
 from mm_sonic.terrain_oracle.contact import CanonicalMeshQuery, SoleGeometry
 from mm_sonic.terrain_oracle.math3d import RigidTransform
 from mm_sonic.terrain_pfnn.phase import (
+    _float32_wrapped_phase,
     phase_from_contacts,
     reconstruct_heel_toe_contacts,
 )
@@ -98,6 +99,13 @@ def _source_with_ankles(
 
 
 class PhaseFromContactsTest(unittest.TestCase):
+    def test_float32_rounding_cannot_emit_two_pi(self) -> None:
+        almost_two_pi = np.nextafter(2.0 * math.pi, 0.0)
+        wrapped = _float32_wrapped_phase(np.asarray((almost_two_pi, 2.0 * math.pi)))
+        self.assertTrue((wrapped >= 0.0).all())
+        self.assertTrue((wrapped < 2.0 * math.pi).all())
+        np.testing.assert_array_equal(wrapped, 0.0)
+
     def test_alternating_strikes_anchor_zero_pi_and_wrap(self) -> None:
         contact = np.zeros((91, 4), dtype=bool)
         contact[3:13, 0] = True

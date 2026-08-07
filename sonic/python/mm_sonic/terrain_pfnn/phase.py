@@ -51,6 +51,14 @@ class ContactPhaseTrack:
     valid: np.ndarray
 
 
+def _float32_wrapped_phase(value: object) -> np.ndarray:
+    """Cast wrapped phases without allowing float32 rounding to emit 2*pi."""
+
+    phase = np.asarray(value, dtype=np.float32)
+    two_pi32 = np.float32(2.0 * math.pi)
+    return np.remainder(phase, two_pi32, dtype=np.float32)
+
+
 def _strike_events(
     channels: np.ndarray,
 ) -> tuple[list[tuple[int, int]], np.ndarray, dict[str, int]]:
@@ -194,7 +202,7 @@ def _phase_reconstruction(
         ContactPhaseTrack(
             channels,
             confidence_array,
-            wrapped.astype(np.float32),
+            _float32_wrapped_phase(wrapped),
             advance.astype(np.float32),
             valid,
         ),
