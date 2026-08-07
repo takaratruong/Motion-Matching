@@ -1796,3 +1796,73 @@ review are chained as jobs `16554955`, `16555019`, `16555045`, `16555265`,
 `16555343`--`16555346`, `16555359`, and `16555377`--`16555378`.  The combined
 output is `omnidirectional_240source_post_v1`.  Counts from this expansion are
 not recorded until all mechanical rejects and exact mirrors have finished.
+
+### Compound on-terrain maneuvers and behavior-preserving scale-up (2026-08-07)
+
+The first stop/reversal generator chose one globally best pivot from the full
+motion.  That was insufficient for joystick data: directional source files do
+not always carry seams, so the chosen pose could lie on a long flat approach or
+exit, and one pivot per traversal concentrated every command change at the same
+height.  The composer now localizes monotonic stair motion from the endpoint
+height plateaus, divides the true terrain interval into progress bands, and
+selects only measured double-support poses within those bands.  Ordinary
+stop/restart and reverse schedules are emitted at every supported band.  A new
+`bounce` schedule advances to an upper supported pose, decelerates, retreats to
+a lower supported pose, and resumes forward travel.  It changes only time along
+an already exact-grounded source path and never interpolates between unrelated
+animations.
+
+The corrected eight-source canary places every pivot between 20.8% and 79.5%
+of the detected stair interval.  It admits 25/25 generated pilots, with no
+forbidden-body penetration, 3.77 mm maximum foot penetration, 1.90 mm maximum
+per-frame stance step, and 0.197 rad maximum joint step.  Only one source has
+two sufficiently separated double-support windows for a full bounce; this is a
+real source-coverage limitation rather than a reason to shorten the smoothing
+ramp or relax contact gates.
+
+A broader 64-motion directional selection then produced 308 compound pilots.
+294 pass the automatic exact/mechanics gates and 263 pass the stricter showcase
+gate of at most 5 mm foot penetration, 10 mm stance-run drift, 3 mm stance step,
+0.20 rad joint step, and 30 m/s² root acceleration.  The admitted set contains
+36 bounces, 129 reversals, and 129 stop/restarts.  Its source paths reach 24
+degrees across the stair axis and 0.650 m lateral travel; source facing offsets
+reach 12 degrees.  Dense review of the strongest 24-degree example shows no
+foot-through-step event.  Side and overhead cameras are now explicit renderer
+options because the old front-follow camera visually hid lateral motion.
+
+The source selector itself was also too coarse: it grouped crab,
+counter-facing, and facing-weave motion together, and grouped lanes with
+diagonals.  The corrected selector preserves twelve distinct joystick
+families: diagonal, lane, crab, counter-face, facing weave, fixed-facing
+oblique, facing-only, path slalom, path zigzag, turning, turning slalom, and
+turning zigzag.  The new 64-source compound bank is
+`compound_exotic64_behavior_split_v3`; its strict 32-motion side review and
+12-motion overhead review are jobs `16558233` and `16558234`.  The completed
+240-source expansion will feed the same behavior-preserving selector into a
+96-source compound bank automatically (jobs `16557409`--`16557412`).
+
+The same short 16/4/16 timing was scaled over every registered C490 continuous
+terrain source rather than invented heightfields.  Of 77 real hill, grade,
+crest/valley, repeated-bump, and rough-slope sources, 65 admit motions.  The
+bank contains 376 pilots, 364 automatic admissions, and 354 strict admissions:
+52 bounces, 159 reversals, and 153 stop/restarts.  Maximum automatically
+accepted foot penetration is 4.99 mm and forbidden-body penetration is zero.
+The strict terrain-diverse 24-motion review uses 17 physical sources and is
+balanced as 12 bounces, six reversals, and six stop/restarts.  Its bank and
+profile overview are `c490_slope_compound77_onterrain_v2` and
+`c490_slope_compound77_onterrain_post_v2/terrain_profiles.png`.
+
+The registered curb bank supplies another 72 source geometries.  Fifty-one
+sources admit 278 exact/mechanical pilots, of which 203 pass the strict
+showcase gate: 37 bounces, 134 reversals, and 107 stop/restarts before the
+strict subset is applied.  The terrain-diverse 24-motion visual review is under
+`c490_curb_compound72_post_v1`.
+
+A separate experiment attempted to bend complete C490 hill traversals laterally
+and re-anchor rigid stance soles directly to the continuous mesh.  Only 7/144
+micro variants passed across three of twelve tested geometries; 31 left the
+finite terrain mesh and 106 violated the unchanged mechanics/contact gate.
+That method is retained as a diagnostic but is **not** being scaled or counted
+as general omnidirectional rough-terrain coverage.  The reliable current
+coverage is exact source traversal plus compound timing on real terrain, and
+exact support-aware path/facing warps on stairs.
