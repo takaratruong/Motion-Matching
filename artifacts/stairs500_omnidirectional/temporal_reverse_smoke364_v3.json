@@ -1,0 +1,14 @@
+[
+  {
+    "label": "backward_full_stair_straight",
+    "report": "/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/temporal_reverse_smoke364_v3/clip_364/clip_364_temporal_reverse_straight/report.json"
+  },
+  {
+    "label": "backward_full_stair_diagonal",
+    "report": "/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/temporal_reverse_smoke364_v3/clip_364/clip_364_temporal_reverse_diagonal_gentle_left/report.json"
+  },
+  {
+    "label": "backward_full_stair_zigzag",
+    "report": "/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/temporal_reverse_smoke364_v3/clip_364/clip_364_temporal_reverse_zigzag_gentle_left_right/report.json"
+  }
+]

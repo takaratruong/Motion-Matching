@@ -1,0 +1,26 @@
+[
+  {
+    "label": "native_down_diagonal_soft",
+    "report": "/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/omnidirectional_pilot4_v1/clip_207/clip_207_native_diagonal_soft_left/report.json"
+  },
+  {
+    "label": "native_down_zigzag",
+    "report": "/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/omnidirectional_pilot4_v1/clip_207/clip_207_native_zigzag_right_left/report.json"
+  },
+  {
+    "label": "native_up_turning",
+    "report": "/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/omnidirectional_pilot4_v1/clip_364/clip_364_native_turning_right/report.json"
+  },
+  {
+    "label": "reverse_up_crab",
+    "report": "/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/omnidirectional_pilot4_v1/clip_364/clip_364_reverse_crab_left/report.json"
+  },
+  {
+    "label": "reverse_up_diagonal_hard",
+    "report": "/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/omnidirectional_pilot4_v1/clip_6/clip_006_reverse_diagonal_hard_left/report.json"
+  },
+  {
+    "label": "reverse_up_zigzag",
+    "report": "/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/omnidirectional_pilot4_v1/clip_6/clip_006_reverse_zigzag_left_right/report.json"
+  }
+]
