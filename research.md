@@ -1779,6 +1779,9 @@ The same checkpoint also improves the original 200-motion stable replay bank:
 120/200 strict passes.  The new family breakdown is 49/50 uphill stops, 49/50
 uphill reversals, 49/50 downhill stops, and 46/50 downhill reversals.  Thus the
 directional mixture strengthened rather than erased ordinary stair tracking.
+The exact-mesh audit passes all 200 saved replay rollouts with zero forbidden
+body contact and zero foot-threshold violations; maximum foot penetration is
+7.47 mm.
 
 The 856-motion bank nevertheless repeats too few physical sources for the
 intended collection scale.  The next expansion consumes all 240 already
