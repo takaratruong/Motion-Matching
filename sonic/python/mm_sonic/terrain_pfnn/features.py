@@ -364,6 +364,8 @@ def _validate_track(track: ContactPhaseTrack, frames: int) -> None:
         value = np.asarray(getattr(track, name))
         if value.shape != shape:
             raise ValueError(f"phase_track.{name} must have shape {shape}")
+    if np.asarray(track.valid).dtype != np.dtype(np.bool_):
+        raise ValueError("phase_track.valid must have boolean dtype")
     if (
         not np.isfinite(track.confidence).all()
         or not np.isfinite(track.phase).all()

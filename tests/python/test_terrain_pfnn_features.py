@@ -454,6 +454,27 @@ class TrainingWindowTest(unittest.TestCase):
                 height_at=slope.height_at,
             )
 
+    def test_valid_mask_requires_exact_boolean_dtype_without_coercion(self) -> None:
+        clip, track, slope = _fixture()
+        float_mask = np.ones(clip.frame_count, dtype=np.float32)
+        float_mask[40] = np.nan
+        integer_mask = np.ones(clip.frame_count, dtype=np.int8)
+        integer_mask[40] = 2
+        for label, mask in (("float_nan", float_mask), ("integer_two", integer_mask)):
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(
+                    ValueError, r"phase_track\.valid must have boolean dtype"
+                ):
+                    build_clip_windows(
+                        clip,
+                        replace(track, valid=mask),
+                        height_at=slope.height_at,
+                    )
+
+        self.assertEqual(
+            len(build_clip_windows(clip, track, height_at=slope.height_at)), 34
+        )
+
     def test_audit_preserves_partial_and_out_of_bounds_rejection_reasons(self) -> None:
         clip, track, slope = _fixture()
         valid = np.array(track.valid, copy=True)
