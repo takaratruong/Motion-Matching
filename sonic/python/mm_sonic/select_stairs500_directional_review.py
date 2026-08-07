@@ -58,7 +58,7 @@ def select(
     strata: tuple[tuple[str, int, Predicate], ...] = (
         (
             "up_independent_facing",
-            3,
+            4,
             lambda r: r["traversal"] == "up"
             and any(
                 value in str(r["mode"])
@@ -67,7 +67,7 @@ def select(
         ),
         (
             "down_independent_facing",
-            3,
+            4,
             lambda r: r["traversal"] == "down"
             and any(
                 value in str(r["mode"])
@@ -137,20 +137,6 @@ def select(
             lambda r: int(r["clip_index"]) == 485,
         ),
         (
-            "up_backward_straight",
-            1,
-            lambda r: r["traversal"] == "up"
-            and r["source_kind"] == "temporal_reverse"
-            and r["mode"] == "straight",
-        ),
-        (
-            "down_backward_straight",
-            1,
-            lambda r: r["traversal"] == "down"
-            and r["source_kind"] == "temporal_reverse"
-            and r["mode"] == "straight",
-        ),
-        (
             "up_native_weave",
             3,
             lambda r: r["traversal"] == "up"
@@ -188,14 +174,36 @@ def select(
     chosen: list[tuple[str, Path, dict[str, object]]] = []
     used: set[Path] = set()
     for stratum, quota, predicate in strata:
-        for path, report in candidates:
-            if len(chosen) == count:
+        # Exercise both lateral polarities in the visual gate.  Without this
+        # alternation, deterministic sorting fills every quota from the
+        # unmirrored half before an exact reflected motion is ever shown.
+        for slot in range(quota):
+            preferred_mirror = bool(slot % 2)
+            match = next(
+                (
+                    (path, report)
+                    for path, report in candidates
+                    if path not in used
+                    and predicate(report)
+                    and bool(report.get("mirror_of")) == preferred_mirror
+                ),
+                None,
+            )
+            if match is None:
+                match = next(
+                    (
+                        (path, report)
+                        for path, report in candidates
+                        if path not in used and predicate(report)
+                    ),
+                    None,
+                )
+            if match is None:
                 break
-            if path in used or not predicate(report):
-                continue
+            path, report = match
             chosen.append((stratum, path, report))
             used.add(path)
-            if sum(value[0] == stratum for value in chosen) >= quota:
+            if len(chosen) == count:
                 break
         if len(chosen) == count:
             break
