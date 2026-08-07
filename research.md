@@ -1620,3 +1620,86 @@ compliance limit plus zero forbidden-body contact admits all 236 retained
 rollouts without concealing the distinction between the two gates.
 The complete receipt is
 `noised_selected120_step400_perclip2_v1/geometry_audit_physical10_v2/summary.json`.
+
+### Stairs500 stair-local two-stick expansion (2026-08-06)
+
+Straight stair traversals are insufficient for joystick distillation: they do
+not show diagonal travel, steering while already on the staircase, backward
+ascent/descent, or velocity and body facing as independent controls.  The
+directional expansion starts from 80 distinct quality-vetted clean stairs500
+traversals.  It maps each source into the registered stair-local frame, fits a
+bounded lateral route, and exports per-frame world/local planar command
+velocity plus an independent facing yaw.  No global root position is part of
+the policy command interface.
+
+The warp is contact-aware rather than a root-only transform.  Source stance
+runs are detected from full-foot support and speed, successive sole targets are
+anchored in world space, the pelvis is corrected toward the active support
+polygon, and G1 leg IK fits the authored pose to those targets.  Every candidate
+must then pass joint-step, root-acceleration, planted-foot drift, full-G1 exact
+mesh, and forbidden-body collision gates.  Mechanical rejects skip the costly
+mesh pass.  Clean temporal reversal supplies exact backward ascent/descent;
+exact reflection about each registered stair centerline mirrors root, command,
+quaternion, joints, left/right contacts, and terrain-relative fields.
+
+The important command families are:
+
+- diagonal and lane-changing paths;
+- slalom and zigzag paths, including variants that rotate the pelvis while
+  steering on the stairs;
+- independent facing and counter-facing weaves;
+- fixed-facing oblique travel, where the route changes direction but the torso
+  keeps the authored stair heading;
+- exact backward-time versions of all mechanically supported families.
+
+The final pre-mirror gate admitted 428 motions.  All 428 exact reflections pass,
+giving 856 balanced motions: 800 directional/non-straight examples and 56
+backward-straight controls.  The split is 248 up/native, 166 up/reverse-time,
+166 down/native, and 276 down/reverse-time.  Every left/right mode count is
+identical after reflection.  The realized lateral envelope reaches 0.926 m.
+Notable paired counts are 52 soft fixed-facing, 40 medium fixed-facing, 22 hard
+32-degree fixed-facing, 6 lane changes, 74 turning slaloms, 88 turning zigzags,
+and 62 micro facing weaves.  The full map is
+`omnidirectional_sweep28_post_v1/all_routes.png`; solid lines are realized G1
+roots, dashed lines are intended routes, colored arrows are travel, and black
+arrows are torso facing.
+
+The stronger fixed-facing construction matters.  A representative 24-degree
+ascent realizes 0.417 m lateral travel with 4.13 mm maximum stance target error
+and 2.33 mm stance drift.  A representative 32-degree descent realizes 0.569 m
+lateral travel with 1.04 mm maximum stance target error and 0.20 mm stance
+drift.  Both pass the exact mesh gate and dense side/overhead review without a
+teleport, hover, or body/stair intersection.  Their videos are under
+`travel_fixed_heading_visual1_v1/{side,overhead}`.  In contrast, blindly
+turning the pelvis through 32 degrees was overwhelmingly outside IK/stance
+bounds; its unstarted low-yield sweep was stopped and replaced by the
+data-supported fixed-facing construction.
+
+The visual gate is deliberately non-basic.  `review32.json` contains paired
+fixed-facing oblique ascents/descents, extreme lane changes, independent-facing
+motions, turning weaves, native diagonals, backward diagonals, and two real
+stair cases.  It alternates original and exact-mirrored examples within paired
+strata.  Side and overhead render arrays plus stop/restart/reversal transition
+generation consume this same manifest.
+
+A six-motion early SONIC canary established learnability before the final bank:
+the stable 200-motion parent is 0/6 zero-shot; a 50-iteration equal-weight
+fine-tune gives 4/6 strict passes and 5/6 full survivors.  All six saved physical
+rollouts pass the exact geometry audit with zero forbidden-body penetration and
+at most 6.02 mm foot contact.  Continuing to iteration 100 falls to 3/6, so the
+universal run must evaluate early checkpoints rather than assume longer is
+better.  A separate four-motion fixed-facing canary covers 24-degree ascent,
+backward 24-degree descent, 32-degree descent, and a second 24-degree descent;
+training/eval jobs `16552280`/`16552282` are queued on one A5000 because all six
+L40s are occupied.
+
+The universal SONIC bundle intentionally uses all 856 exact-accepted motions,
+not the 382-motion gold-only subset: the visually clean largest-angle examples
+are often silver because they require larger bounded joint correction.  It also
+includes the stable selected200 replay bank and accepted transitions derived
+from `review32.json`.  The target is
+`omnidirectional_sweep28_post_v1/sonic_bundle_replay200_all_transitions32_v1`.
+Training will start from `sonic_selected200_finetune_v1/model_step_000400.pt`,
+save early checkpoints, and qualify motions only after deterministic survival,
+MPJPE, exact-mesh, and dense visual gates.  No noised collection is released
+from training completion alone.

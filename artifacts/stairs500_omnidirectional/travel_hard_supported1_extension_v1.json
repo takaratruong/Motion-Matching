@@ -1,0 +1,17 @@
+{
+  "schema": "stairs500-directional-source-selection/v1",
+  "archive": "/move/data/terrain-aware/motion-matching/grail-stairs500-clean-50hz-v1.zarr",
+  "selection": "/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/selected200_v1.json",
+  "purpose": "Attempt 32-degree fixed-facing oblique motion on clip 460 after its 24-degree rightward variant passed the exact audit in the second targeted batch.",
+  "clip_indices": [460],
+  "modes": ["travel_hard_left", "travel_hard_right"],
+  "execution": {
+    "attempted": ["native_travel_hard_left", "native_travel_hard_right"],
+    "canceled_unstarted": ["temporal_reverse_travel_hard_left", "temporal_reverse_travel_hard_right"],
+    "accepted_count": 0,
+    "reason": "Both native polarities failed the mechanical gate, so the corresponding reverse-time attempts were stopped rather than spending more CPU on a zero-yield extension."
+  },
+  "include_temporal_reverse": true,
+  "exact_mesh_audit_required": true,
+  "include_mirror_after_audit": true
+}
