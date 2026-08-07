@@ -1288,7 +1288,11 @@ def main(argv: list[str] | None = None) -> int:
             sort_keys=True,
         )
     )
-    return 0 if int(summary["accepted"]) else 1
+    # Zero admissions from one source is a valid geometric result, not a job
+    # failure.  Every attempted variant and its rejection reason is already
+    # persisted in the reports; returning nonzero here unnecessarily blocks
+    # heterogeneous source sweeps and their post-processing dependencies.
+    return 0
 
 
 if __name__ == "__main__":
