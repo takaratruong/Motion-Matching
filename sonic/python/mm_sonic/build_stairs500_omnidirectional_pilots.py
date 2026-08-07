@@ -1156,6 +1156,25 @@ def build(arguments: argparse.Namespace) -> dict[str, object]:
                         )
                     report["realized_command_accepted"] = realized
                     report["mechanical_accepted"] = mechanical
+                    if not mechanical:
+                        # A full MuJoCo mesh audit cannot rescue a motion that
+                        # already violates the kinematic/command gate.  Keep
+                        # the compact diagnostic report, but avoid auditing
+                        # and storing an unusable multi-megabyte candidate.
+                        report["collision_audit_skipped_reason"] = (
+                            "mechanical_rejection"
+                        )
+                        (destination / "report.json").write_text(
+                            json.dumps(report, indent=2, sort_keys=True) + "\n"
+                        )
+                        reports.append(report)
+                        print(
+                            "STAIRS500_DIRECTIONAL "
+                            f"{attempted} label={label} "
+                            f"status={report['status']}",
+                            flush=True,
+                        )
+                        continue
                     collision = audit_stair_motion_collisions(
                         motion,
                         model_path=arguments.model,
