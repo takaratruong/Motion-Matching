@@ -48,7 +48,7 @@ MOTION=${VALUES[0]}
 TERRAIN=${VALUES[1]}
 LABEL=${VALUES[2]}
 RANK=$(printf '%03d' "${SLURM_ARRAY_TASK_ID}")
-DESTINATION="${OUTPUT}/rank_${RANK}_${LABEL}"
+DESTINATION="${OUTPUT}/clip_${RANK}_${LABEL}/pilots"
 
 "${PYTHON}" -u -B -m mm_sonic.build_terrain_maneuver_pilots \
     --source-motion "${MOTION}" \
