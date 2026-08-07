@@ -19,8 +19,10 @@ from .motionbricks_global_terrain_viewer import _terrain_surface_height
 from .render_stitched_motion import load_stitched_motion_npz
 from .terrain_maneuver_composer import (
     HOLD,
+    SupportPivot,
+    build_bounce_schedule,
     build_maneuver_schedule,
-    choose_support_pivot,
+    choose_support_pivots,
     resample_stitched_motion,
     save_maneuver_motion,
 )
@@ -159,6 +161,51 @@ def _quality_metrics(
         "hold_maximum_left_clearance_m": hold_left,
         "hold_maximum_right_clearance_m": hold_right,
     }
+
+
+def _pivot_payload(pivot: SupportPivot) -> dict[str, float | int]:
+    return {
+        "frame_index": int(pivot.frame_index),
+        "left_clearance_m": float(pivot.left_clearance_m),
+        "right_clearance_m": float(pivot.right_clearance_m),
+        "root_speed_mps": float(pivot.root_speed_mps),
+        "joint_speed_rms_rad_s": float(pivot.joint_speed_rms_rad_s),
+        "terrain_progress": float(pivot.terrain_progress),
+    }
+
+
+def _terrain_motion_interval(
+    motion: StitchedMotion,
+) -> tuple[int, int, str]:
+    """Locate the genuinely non-flat part of a terrain traversal.
+
+    Directional source files do not necessarily carry seam markers.  Using
+    their entire 10-second clip lets an otherwise valid "mid-stair" maneuver
+    land on the long flat approach or exit.  A monotonic height-changing
+    traversal can be localized reliably from its endpoint plateaus; rolling
+    or returning terrain falls back to authored seams/full-span selection.
+    """
+
+    root = np.asarray(motion.root_position_world, dtype=np.float64)
+    count = len(root)
+    endpoint_window = min(25, max(2, count // 10))
+    start_height = float(np.median(root[:endpoint_window, 2]))
+    stop_height = float(np.median(root[-endpoint_window:, 2]))
+    endpoint_delta = abs(stop_height - start_height)
+    vertical_range = float(np.ptp(root[:, 2]))
+    if endpoint_delta >= 0.06 and endpoint_delta >= 0.60 * vertical_range:
+        lower = min(start_height, stop_height) + 0.08 * endpoint_delta
+        upper = max(start_height, stop_height) - 0.08 * endpoint_delta
+        active = np.flatnonzero((root[:, 2] > lower) & (root[:, 2] < upper))
+        if len(active) >= 12:
+            return int(active[0]), int(active[-1]) + 1, "endpoint_height"
+    if len(motion.seam_indices) > 1:
+        return (
+            int(motion.seam_indices[0]),
+            int(motion.seam_indices[-1]),
+            "seam_indices",
+        )
+    return 0, count, "full_motion_fallback"
 
 
 def _direct_terrain_transform(
@@ -307,6 +354,7 @@ def build_pilots(arguments: argparse.Namespace) -> dict[str, object]:
     output = arguments.output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, object]] = []
+    schedule_rejections: list[dict[str, object]] = []
 
     for event_index in selected_events:
         source_path = Path(
@@ -322,44 +370,141 @@ def build_pilots(arguments: argparse.Namespace) -> dict[str, object]:
         source_foot_speed = np.linalg.norm(
             np.gradient(source_centres, axis=0) * source.fps, axis=2
         )
-        terrain_start = (
-            int(source.seam_indices[0]) if source.seam_indices else 0
+        terrain_start, terrain_stop, terrain_interval_source = (
+            _terrain_motion_interval(source)
         )
-        terrain_stop = (
-            int(source.seam_indices[-1])
-            if len(source.seam_indices) > 1
-            else len(source.root_position_world)
-        )
-        pivot = choose_support_pivot(
-            source,
-            source_clearance,
-            per_foot_speed_mps=source_foot_speed,
-            terrain_start_frame=terrain_start,
-            terrain_stop_frame=terrain_stop,
-            maximum_support_clearance_m=arguments.pivot_clearance_m,
-            maximum_support_speed_mps=arguments.pivot_speed_mps,
-            central_fraction=tuple(arguments.pivot_central_fraction),
-        )
+        requested_pivot_count = int(getattr(arguments, "pivot_count", 1))
         event = manifest["events"][event_index]
+        try:
+            pivots = choose_support_pivots(
+                source,
+                source_clearance,
+                count=requested_pivot_count,
+                per_foot_speed_mps=source_foot_speed,
+                terrain_start_frame=terrain_start,
+                terrain_stop_frame=terrain_stop,
+                maximum_support_clearance_m=arguments.pivot_clearance_m,
+                maximum_support_speed_mps=arguments.pivot_speed_mps,
+                central_fraction=tuple(arguments.pivot_central_fraction),
+            )
+        except ValueError as error:
+            schedule_rejections.append(
+                {
+                    "event_index": event_index,
+                    "kind": str(event["kind"]),
+                    "mode": "all",
+                    "reason": str(error),
+                    "terrain_interval": {
+                        "start_frame": terrain_start,
+                        "stop_frame": terrain_stop,
+                        "source": terrain_interval_source,
+                    },
+                }
+            )
+            continue
+        schedule_specs: list[
+            tuple[str, object, tuple[SupportPivot, ...], int | None, int, int]
+        ] = []
         for mode in modes:
             ramp_frames = int(arguments.ramp_frames)
             hold_frames = int(arguments.hold_frames)
-            if mode == "reverse":
+            if mode in {"reverse", "bounce"}:
                 reverse_ramp = getattr(arguments, "reverse_ramp_frames", None)
                 reverse_hold = getattr(arguments, "reverse_hold_frames", None)
                 if reverse_ramp is not None:
                     ramp_frames = int(reverse_ramp)
                 if reverse_hold is not None:
                     hold_frames = int(reverse_hold)
-            schedule = build_maneuver_schedule(
-                len(source.root_position_world),
-                pivot_source_frame=pivot.frame_index,
-                mode=mode,
-                ramp_frames=ramp_frames,
-                hold_frames=hold_frames,
-            )
+            if mode == "bounce":
+                if len(pivots) < 2:
+                    schedule_rejections.append(
+                        {
+                            "event_index": event_index,
+                            "kind": str(event["kind"]),
+                            "mode": mode,
+                            "reason": "fewer than two supported pivots",
+                        }
+                    )
+                    continue
+                lower, upper = pivots[0], pivots[-1]
+                try:
+                    schedule = build_bounce_schedule(
+                        len(source.root_position_world),
+                        lower_pivot_source_frame=lower.frame_index,
+                        upper_pivot_source_frame=upper.frame_index,
+                        ramp_frames=ramp_frames,
+                        hold_frames=hold_frames,
+                    )
+                except ValueError as error:
+                    schedule_rejections.append(
+                        {
+                            "event_index": event_index,
+                            "kind": str(event["kind"]),
+                            "mode": mode,
+                            "pivots": [
+                                _pivot_payload(upper),
+                                _pivot_payload(lower),
+                            ],
+                            "reason": str(error),
+                        }
+                    )
+                    continue
+                schedule_specs.append(
+                    (
+                        mode,
+                        schedule,
+                        (upper, lower),
+                        None,
+                        ramp_frames,
+                        hold_frames,
+                    )
+                )
+                continue
+
+            for pivot_rank, pivot in enumerate(pivots):
+                try:
+                    schedule = build_maneuver_schedule(
+                        len(source.root_position_world),
+                        pivot_source_frame=pivot.frame_index,
+                        mode=mode,
+                        ramp_frames=ramp_frames,
+                        hold_frames=hold_frames,
+                    )
+                except ValueError as error:
+                    schedule_rejections.append(
+                        {
+                            "event_index": event_index,
+                            "kind": str(event["kind"]),
+                            "mode": mode,
+                            "pivot_rank": pivot_rank,
+                            "pivot": _pivot_payload(pivot),
+                            "reason": str(error),
+                        }
+                    )
+                    continue
+                schedule_specs.append(
+                    (
+                        mode,
+                        schedule,
+                        (pivot,),
+                        pivot_rank,
+                        ramp_frames,
+                        hold_frames,
+                    )
+                )
+
+        for (
+            mode,
+            schedule,
+            used_pivots,
+            pivot_rank,
+            ramp_frames,
+            hold_frames,
+        ) in schedule_specs:
             motion = resample_stitched_motion(source, schedule)
             label = f"event_{event_index:02d}_{event['kind']}_{mode}"
+            if pivot_rank is not None and requested_pivot_count > 1:
+                label += f"_p{pivot_rank:02d}"
             destination = output / label
             destination.mkdir(parents=True, exist_ok=True)
             motion_path = save_maneuver_motion(
@@ -426,6 +571,13 @@ def build_pilots(arguments: argparse.Namespace) -> dict[str, object]:
                 "mode": mode,
                 "ramp_frames": ramp_frames,
                 "hold_frames": hold_frames,
+                "pivot_rank": pivot_rank,
+                "requested_pivot_count": requested_pivot_count,
+                "terrain_interval": {
+                    "start_frame": terrain_start,
+                    "stop_frame": terrain_stop,
+                    "source": terrain_interval_source,
+                },
                 "status": (
                     "pending_dense_visual_review"
                     if automatic
@@ -437,14 +589,10 @@ def build_pilots(arguments: argparse.Namespace) -> dict[str, object]:
                 "duration_s": float(
                     len(motion.root_position_world) / motion.fps
                 ),
-                "pivot": {
-                    "frame_index": pivot.frame_index,
-                    "left_clearance_m": pivot.left_clearance_m,
-                    "right_clearance_m": pivot.right_clearance_m,
-                    "root_speed_mps": pivot.root_speed_mps,
-                    "joint_speed_rms_rad_s": pivot.joint_speed_rms_rad_s,
-                    "terrain_progress": pivot.terrain_progress,
-                },
+                "pivot": _pivot_payload(used_pivots[0]),
+                "pivots": [
+                    _pivot_payload(value) for value in used_pivots
+                ],
                 "mechanics": mechanics,
                 "collision_audit": {
                     "accepted": bool(collision.accepted),
@@ -489,6 +637,8 @@ def build_pilots(arguments: argparse.Namespace) -> dict[str, object]:
         "automatic_gate_accepted_count": sum(
             bool(row["automatic_gate_accepted"]) for row in rows
         ),
+        "schedule_rejection_count": len(schedule_rejections),
+        "schedule_rejections": schedule_rejections,
         "pilots": rows,
     }
     (output / "manifest.json").write_text(
@@ -520,9 +670,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--event-index", type=int, action="append", default=[])
     parser.add_argument(
         "--mode",
-        choices=("stop_restart", "reverse"),
+        choices=("stop_restart", "reverse", "bounce"),
         action="append",
         default=[],
+    )
+    parser.add_argument(
+        "--pivot-count",
+        type=int,
+        default=1,
+        help="attempt this many progress-distributed support pivots per source",
     )
     parser.add_argument("--ramp-frames", type=int, default=24)
     parser.add_argument("--hold-frames", type=int, default=30)
@@ -559,6 +715,8 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
+    if arguments.pivot_count < 1:
+        _parser().error("--pivot-count must be positive")
     if not arguments.mode:
         arguments.mode = ["stop_restart", "reverse"]
     result = build_pilots(arguments)

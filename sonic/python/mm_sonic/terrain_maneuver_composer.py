@@ -52,6 +52,7 @@ class ManeuverSchedule:
     phase: np.ndarray
     pivot_source_frame: int
     mode: str
+    pivot_source_frames: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -191,6 +192,125 @@ def build_maneuver_schedule(
         phase=phases,
         pivot_source_frame=pivot,
         mode=mode,
+        pivot_source_frames=(pivot,),
+    )
+
+
+def build_bounce_schedule(
+    frame_count: int,
+    *,
+    lower_pivot_source_frame: int,
+    upper_pivot_source_frame: int,
+    ramp_frames: int = 16,
+    hold_frames: int = 4,
+) -> ManeuverSchedule:
+    """Traverse forward, retreat on terrain, then resume forward.
+
+    Both direction changes occur at measured double-support source poses.  As
+    with :func:`build_maneuver_schedule`, this only changes time along an
+    already grounded path: it cannot introduce foot sliding or terrain
+    penetration that was absent from the source motion.
+    """
+
+    count = int(frame_count)
+    lower = int(lower_pivot_source_frame)
+    upper = int(upper_pivot_source_frame)
+    ramp = int(ramp_frames)
+    hold = int(hold_frames)
+    if count < 8 or not 0 < lower < upper < count - 1:
+        raise ValueError("bounce pivots must be ordered inside the source")
+    if hold < 1:
+        raise ValueError("maneuver hold must contain at least one frame")
+
+    deceleration = _velocity_ramp(ramp, accelerating=False)
+    acceleration = _velocity_ramp(ramp, accelerating=True)
+    slow_span = float(np.sum(deceleration))
+    restart_span = float(np.sum(acceleration))
+    first_deceleration_start = float(upper) - slow_span
+    reverse_deceleration_start = float(lower) + slow_span
+    reverse_native_start = float(upper) - restart_span
+    if first_deceleration_start < 1.0:
+        raise ValueError("upper bounce pivot has insufficient approach context")
+    if reverse_native_start <= reverse_deceleration_start + 1.0:
+        raise ValueError("bounce pivots are too close for smooth reversals")
+    if float(lower) + restart_span > count - 2:
+        raise ValueError("lower bounce pivot has insufficient restart context")
+
+    native_prefix = np.arange(
+        0.0, math.floor(first_deceleration_start) + 1.0, dtype=np.float64
+    )
+    if native_prefix[-1] < first_deceleration_start - 1.0e-9:
+        native_prefix = np.append(native_prefix, first_deceleration_start)
+    else:
+        native_prefix[-1] = first_deceleration_start
+
+    decelerate_forward = first_deceleration_start + np.cumsum(deceleration)
+    decelerate_forward[-1] = float(upper)
+    hold_upper = np.full(hold, float(upper), dtype=np.float64)
+    accelerate_reverse = float(upper) - np.cumsum(acceleration)
+
+    reverse_native = np.arange(
+        math.ceil(float(accelerate_reverse[-1])) - 1.0,
+        math.floor(reverse_deceleration_start),
+        -1.0,
+        dtype=np.float64,
+    )
+    if (
+        len(reverse_native) == 0
+        or reverse_native[-1] > reverse_deceleration_start + 1.0e-9
+    ):
+        reverse_native = np.append(reverse_native, reverse_deceleration_start)
+    else:
+        reverse_native[-1] = reverse_deceleration_start
+
+    decelerate_reverse = reverse_deceleration_start - np.cumsum(deceleration)
+    decelerate_reverse[-1] = float(lower)
+    hold_lower = np.full(hold, float(lower), dtype=np.float64)
+    accelerate_forward = float(lower) + np.cumsum(acceleration)
+    native_forward_start = float(accelerate_forward[-1])
+    native_suffix = np.arange(
+        math.floor(native_forward_start) + 1.0,
+        float(count),
+        dtype=np.float64,
+    )
+
+    coordinates = np.concatenate(
+        (
+            native_prefix,
+            decelerate_forward,
+            hold_upper,
+            accelerate_reverse,
+            reverse_native,
+            decelerate_reverse,
+            hold_lower,
+            accelerate_forward,
+            native_suffix,
+        )
+    )
+    phases = np.concatenate(
+        (
+            np.full(len(native_prefix), NATIVE, dtype=np.uint8),
+            np.full(ramp, DECELERATE, dtype=np.uint8),
+            np.full(hold, HOLD, dtype=np.uint8),
+            np.full(ramp, ACCELERATE_REVERSE, dtype=np.uint8),
+            np.full(len(reverse_native), NATIVE_REVERSE, dtype=np.uint8),
+            np.full(ramp, DECELERATE, dtype=np.uint8),
+            np.full(hold, HOLD, dtype=np.uint8),
+            np.full(ramp, ACCELERATE_FORWARD, dtype=np.uint8),
+            np.full(len(native_suffix), NATIVE_FORWARD, dtype=np.uint8),
+        )
+    )
+    coordinates = np.clip(coordinates, 0.0, float(count - 1))
+    if len(coordinates) != len(phases) or not np.isfinite(coordinates).all():
+        raise RuntimeError("invalid bounce schedule")
+    if float(np.max(np.abs(np.diff(coordinates)))) > 1.000001:
+        raise RuntimeError("bounce schedule exceeds native playback speed")
+    return ManeuverSchedule(
+        source_coordinate=np.asarray(coordinates, dtype=np.float64),
+        phase=phases,
+        pivot_source_frame=upper,
+        mode="bounce",
+        pivot_source_frames=(upper, lower),
     )
 
 
@@ -286,6 +406,73 @@ def choose_support_pivot(
         joint_speed_rms_rad_s=float(joint_speed[selected]),
         terrain_progress=float((selected - start) / float(span)),
     )
+
+
+def choose_support_pivots(
+    motion: StitchedMotion,
+    per_foot_clearance_m: object,
+    *,
+    count: int,
+    per_foot_speed_mps: object | None = None,
+    terrain_start_frame: int,
+    terrain_stop_frame: int,
+    maximum_support_clearance_m: float = 0.008,
+    maximum_support_speed_mps: float = 0.12,
+    central_fraction: tuple[float, float] = (0.15, 0.85),
+    minimum_support_run_frames: int = 1,
+) -> tuple[SupportPivot, ...]:
+    """Choose distinct early/middle/late support poses on one traversal.
+
+    A single globally best pivot biases every generated maneuver toward the
+    same stair.  Splitting the admissible terrain interval into equal progress
+    bands produces behavior at several heights while preserving the exact
+    support requirements of :func:`choose_support_pivot`.  Empty bands are
+    skipped; callers can still use the pivots that are genuinely supported.
+    """
+
+    requested = int(count)
+    if requested < 1:
+        raise ValueError("support pivot count must be positive")
+    if requested == 1:
+        return (
+            choose_support_pivot(
+                motion,
+                per_foot_clearance_m,
+                per_foot_speed_mps=per_foot_speed_mps,
+                terrain_start_frame=terrain_start_frame,
+                terrain_stop_frame=terrain_stop_frame,
+                maximum_support_clearance_m=maximum_support_clearance_m,
+                maximum_support_speed_mps=maximum_support_speed_mps,
+                central_fraction=central_fraction,
+                minimum_support_run_frames=minimum_support_run_frames,
+            ),
+        )
+
+    lower, upper = map(float, central_fraction)
+    if not 0.0 <= lower < upper <= 1.0:
+        raise ValueError("invalid terrain pivot fractions")
+    edges = np.linspace(lower, upper, requested + 1, dtype=np.float64)
+    pivots: list[SupportPivot] = []
+    for band_lower, band_upper in zip(edges[:-1], edges[1:], strict=True):
+        try:
+            pivot = choose_support_pivot(
+                motion,
+                per_foot_clearance_m,
+                per_foot_speed_mps=per_foot_speed_mps,
+                terrain_start_frame=terrain_start_frame,
+                terrain_stop_frame=terrain_stop_frame,
+                maximum_support_clearance_m=maximum_support_clearance_m,
+                maximum_support_speed_mps=maximum_support_speed_mps,
+                central_fraction=(float(band_lower), float(band_upper)),
+                minimum_support_run_frames=minimum_support_run_frames,
+            )
+        except ValueError:
+            continue
+        if all(pivot.frame_index != value.frame_index for value in pivots):
+            pivots.append(pivot)
+    if not pivots:
+        raise ValueError("terrain span has no supported pivot in any band")
+    return tuple(sorted(pivots, key=lambda value: value.frame_index))
 
 
 def resample_stitched_motion(
@@ -402,6 +589,11 @@ def save_maneuver_motion(
         pivot_source_frame=np.asarray(
             schedule.pivot_source_frame, dtype=np.int64
         ),
+        pivot_source_frames=np.asarray(
+            schedule.pivot_source_frames
+            or (schedule.pivot_source_frame,),
+            dtype=np.int64,
+        ),
         maneuver_phase_names=np.asarray(PHASE_NAMES, dtype=np.str_),
         **labels,
     )
@@ -419,8 +611,10 @@ __all__ = (
     "NATIVE_REVERSE",
     "PHASE_NAMES",
     "SupportPivot",
+    "build_bounce_schedule",
     "build_maneuver_schedule",
     "choose_support_pivot",
+    "choose_support_pivots",
     "command_labels",
     "resample_stitched_motion",
     "save_maneuver_motion",

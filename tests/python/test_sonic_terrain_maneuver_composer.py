@@ -8,7 +8,10 @@ import unittest
 import numpy as np
 import zarr
 
-from mm_sonic.build_terrain_maneuver_pilots import _direct_terrain_transform
+from mm_sonic.build_terrain_maneuver_pilots import (
+    _direct_terrain_transform,
+    _terrain_motion_interval,
+)
 from mm_sonic.prepare_terrain_maneuver_sonic_bundle import (
     _accepted_manifest_selections,
     _clip_stem,
@@ -16,8 +19,10 @@ from mm_sonic.prepare_terrain_maneuver_sonic_bundle import (
 )
 from mm_sonic.terrain_maneuver_composer import (
     HOLD,
+    build_bounce_schedule,
     build_maneuver_schedule,
     choose_support_pivot,
+    choose_support_pivots,
     command_labels,
     resample_stitched_motion,
 )
@@ -190,6 +195,27 @@ class TerrainManeuverComposerTests(unittest.TestCase):
         np.testing.assert_array_equal(hold, np.full(4, 80.0))
         self.assertAlmostEqual(float(schedule.source_coordinate[-1]), 0.0)
 
+    def test_bounce_retreats_between_supported_poses_then_finishes(self) -> None:
+        schedule = build_bounce_schedule(
+            180,
+            lower_pivot_source_frame=55,
+            upper_pivot_source_frame=115,
+            ramp_frames=16,
+            hold_frames=4,
+        )
+        coordinate = schedule.source_coordinate
+        hold = coordinate[schedule.phase == HOLD]
+
+        np.testing.assert_array_equal(
+            hold,
+            np.asarray((115.0,) * 4 + (55.0,) * 4),
+        )
+        self.assertAlmostEqual(float(coordinate[0]), 0.0)
+        self.assertAlmostEqual(float(coordinate[-1]), 179.0)
+        self.assertGreater(np.sum(np.diff(coordinate) < 0.0), 20)
+        self.assertLessEqual(float(np.max(np.abs(np.diff(coordinate)))), 1.000001)
+        self.assertEqual(schedule.pivot_source_frames, (115, 55))
+
     def test_fractional_resampling_keeps_commands_synchronized(self) -> None:
         source = _motion()
         schedule = build_maneuver_schedule(
@@ -234,6 +260,50 @@ class TerrainManeuverComposerTests(unittest.TestCase):
         self.assertIn(pivot.frame_index, range(66, 71))
         self.assertLessEqual(pivot.left_clearance_m, 0.005)
         self.assertLessEqual(pivot.right_clearance_m, 0.005)
+
+    def test_height_interval_excludes_flat_approach_and_exit(self) -> None:
+        motion = _motion(180)
+        root = np.asarray(motion.root_position_world).copy()
+        root[:45, 2] = 1.4
+        root[45:135, 2] = np.linspace(1.4, 0.8, 90)
+        root[135:, 2] = 0.8
+        motion = StitchedMotion(
+            fps=motion.fps,
+            root_position_world=root,
+            root_quaternion_world_wxyz=motion.root_quaternion_world_wxyz,
+            joint_position=motion.joint_position,
+            provenance=motion.provenance,
+            seam_indices=(),
+        )
+
+        start, stop, source = _terrain_motion_interval(motion)
+
+        self.assertEqual(source, "endpoint_height")
+        self.assertGreater(start, 45)
+        self.assertLess(stop, 135)
+
+    def test_multiple_pivots_cover_distinct_terrain_progress_bands(self) -> None:
+        motion = _motion(180)
+        clearance = np.full((180, 2), 0.10, dtype=np.float64)
+        speed = np.full((180, 2), 0.5, dtype=np.float64)
+        for start in (35, 85, 135):
+            clearance[start : start + 6] = 0.003
+            speed[start : start + 6] = 0.02
+
+        pivots = choose_support_pivots(
+            motion,
+            clearance,
+            count=3,
+            per_foot_speed_mps=speed,
+            terrain_start_frame=20,
+            terrain_stop_frame=160,
+            central_fraction=(0.0, 1.0),
+        )
+
+        self.assertEqual(len(pivots), 3)
+        self.assertIn(pivots[0].frame_index, range(36, 40))
+        self.assertIn(pivots[1].frame_index, range(86, 90))
+        self.assertIn(pivots[2].frame_index, range(136, 140))
 
 
 if __name__ == "__main__":

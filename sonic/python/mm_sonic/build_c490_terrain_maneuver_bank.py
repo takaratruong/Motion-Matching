@@ -34,6 +34,8 @@ def build_clip(
     reverse_ramp_frames: int | None = None,
     reverse_hold_frames: int | None = None,
     pivot_speed_mps: float = 0.20,
+    pivot_count: int = 1,
+    modes: tuple[str, ...] = ("stop_restart", "reverse"),
     allowed_families: tuple[str, ...] = ("c490_slope",),
 ) -> dict[str, object]:
     """Materialize, qualify, and compose one registered archive clip."""
@@ -97,7 +99,8 @@ def build_clip(
         motion_archive=archive_path,
         model_path=model_path,
         event_index=[],
-        mode=["stop_restart", "reverse"],
+        mode=list(modes),
+        pivot_count=int(pivot_count),
         ramp_frames=int(ramp_frames),
         hold_frames=int(hold_frames),
         reverse_ramp_frames=(
@@ -151,6 +154,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reverse-ramp-frames", type=int)
     parser.add_argument("--reverse-hold-frames", type=int)
     parser.add_argument("--pivot-speed-mps", type=float, default=0.20)
+    parser.add_argument("--pivot-count", type=int, default=1)
+    parser.add_argument(
+        "--mode",
+        choices=("stop_restart", "reverse", "bounce"),
+        action="append",
+        default=[],
+    )
     parser.add_argument(
         "--allow-family",
         action="append",
@@ -161,6 +171,8 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     arguments = parser.parse_args(argv)
+    if arguments.pivot_count < 1:
+        parser.error("--pivot-count must be positive")
     result = build_clip(
         archive_path=arguments.archive,
         model_path=arguments.model,
@@ -171,10 +183,15 @@ def main(argv: list[str] | None = None) -> int:
         reverse_ramp_frames=arguments.reverse_ramp_frames,
         reverse_hold_frames=arguments.reverse_hold_frames,
         pivot_speed_mps=arguments.pivot_speed_mps,
+        pivot_count=arguments.pivot_count,
+        modes=tuple(arguments.mode or ("stop_restart", "reverse")),
         allowed_families=tuple(arguments.allow_family or ("c490_slope",)),
     )
     print(json.dumps(result, indent=2, sort_keys=True))
-    return 0 if result["status"] == "pending_dense_visual_review" else 2
+    # A source-level mechanical rejection is an expected result in a broad
+    # heterogeneous sweep.  Genuine exceptions still fail the task; an
+    # audited source that emits no pilot should not poison dependent arrays.
+    return 0
 
 
 if __name__ == "__main__":

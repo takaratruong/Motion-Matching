@@ -30,8 +30,10 @@ from .terrain_oracle.math3d import quaternion_multiply_wxyz
 from .terrain_oracle.reference_stitch import _G1FootfallAdapter
 from .terrain_oracle.stair_fragment_reconstruction import (
     _anchor_stance_sole_targets,
+    _blend_anchored_sole_offsets,
     _interpolate_fixed_vectors,
     _smooth_root_anchor_shifts,
+    _stance_spans,
 )
 from .terrain_oracle.stair_foothold_anchors import FootholdAnchorConfig
 from .terrain_oracle.stair_geometry_warp import (
@@ -169,6 +171,8 @@ def _profile_knots(
         # than a replacement for the harder stress cases below.
         "travel_gentle_left": ((-1.0, 1.0), 10.0, 0.0, 0.0, 0.0),
         "travel_gentle_right": ((1.0, -1.0), 10.0, 0.0, 0.0, 0.0),
+        "travel_micro_left": ((-1.0, 1.0), 5.0, 0.0, 0.0, 0.0),
+        "travel_micro_right": ((1.0, -1.0), 5.0, 0.0, 0.0, 0.0),
         "travel_medium_left": ((-1.0, 1.0), 24.0, 0.0, 0.0, 0.0),
         "travel_medium_right": ((1.0, -1.0), 24.0, 0.0, 0.0, 0.0),
         "travel_hard_left": ((-1.0, 1.0), 32.0, 0.0, 0.0, 0.0),
@@ -191,6 +195,20 @@ def _profile_knots(
             14.0,
             0.0,
             1.0,
+            0.0,
+        ),
+        "zigzag_micro_left_right": (
+            (0.0, 1.0, -1.0, 0.0),
+            6.0,
+            0.0,
+            0.0,
+            0.0,
+        ),
+        "zigzag_micro_right_left": (
+            (0.0, -1.0, 1.0, 0.0),
+            6.0,
+            0.0,
+            0.0,
             0.0,
         ),
         "crab_left": ((-1.0, 1.0), 20.0, -24.0, 0.0, 0.0),
@@ -255,6 +273,20 @@ def _profile_knots(
         "turning_gentle_right": ((1.0, -1.0), 10.0, 0.0, 0.5, 0.25),
         "turning_micro_left": ((-1.0, 1.0), 8.0, 0.0, 0.5, 0.25),
         "turning_micro_right": ((1.0, -1.0), 8.0, 0.0, 0.5, 0.25),
+        "turning_ultramicro_left": (
+            (-1.0, 1.0),
+            4.0,
+            0.0,
+            0.35,
+            0.10,
+        ),
+        "turning_ultramicro_right": (
+            (1.0, -1.0),
+            4.0,
+            0.0,
+            0.35,
+            0.10,
+        ),
         # Unlike the path-only slaloms, these rotate the pelvis and a fraction
         # of foot yaw with every direction change.  This is the closest clean
         # kinematic analogue of steering repeatedly while already on stairs.
@@ -446,6 +478,61 @@ def _terrain_height(target_mesh: object, xy: np.ndarray, ray_z: float) -> float:
     return -math.inf if hit is None else float(hit.position_world[2])
 
 
+def _anchor_stance_soles_to_continuous_mesh(
+    nominal_targets: np.ndarray,
+    stance: np.ndarray,
+    sphere_radii: Sequence[np.ndarray],
+    *,
+    target_mesh: object,
+    ray_z: float,
+) -> np.ndarray:
+    """Lock mapped stance feet directly to an arbitrary continuous surface.
+
+    Stair routes provide discrete support levels.  Hills, ramps, and rough
+    ground do not.  For those surfaces each mapped sole probe is raycast at
+    the middle of its authored stance run, then the resulting rigid target is
+    held for that complete run.  Swing offsets are interpolated between the
+    exact stance anchors, after which the regular G1 IK and complete-mesh gate
+    remain authoritative.
+    """
+
+    nominal = np.asarray(nominal_targets, dtype=np.float64)
+    stance_mask = np.asarray(stance, dtype=bool)
+    anchored = nominal.copy()
+    assigned = np.zeros(stance_mask.shape, dtype=bool)
+    for span in _stance_spans(stance_mask):
+        frame = (span.start_frame + span.stop_frame - 1) // 2
+        foot = int(span.foot_index)
+        target = np.asarray(nominal[frame, foot], dtype=np.float64).copy()
+        heights = np.asarray(
+            [
+                _terrain_height(target_mesh, point[:2], ray_z)
+                for point in target
+            ],
+            dtype=np.float64,
+        )
+        if not np.isfinite(heights).all():
+            raise ValueError(
+                "mapped stance sole leaves the continuous terrain mesh"
+            )
+        required_centres = heights + np.asarray(
+            sphere_radii[foot], dtype=np.float64
+        )
+        # A G1 sole is rigid.  Assigning every probe the terrain height can
+        # produce four non-coplanar targets on rough ground and asks the leg
+        # IK to realize an impossible foot shape.  Preserve the authored sole
+        # orientation and apply the smallest whole-foot vertical shift that
+        # clears every probe; exact support and hover checks below decide
+        # whether the resulting rigid contact is actually usable.
+        vertical_shift = float(np.max(required_centres - target[:, 2]))
+        target[:, 2] += vertical_shift
+        anchored[span.start_frame : span.stop_frame, foot] = target
+        assigned[span.start_frame : span.stop_frame, foot] = True
+    if not np.any(assigned):
+        raise ValueError("source motion has no supported stance run")
+    return _blend_anchored_sole_offsets(nominal, anchored, assigned)
+
+
 def _stance_runs_maximum_drift(
     centres: np.ndarray, stance: np.ndarray
 ) -> float:
@@ -474,7 +561,7 @@ def warp_motion(
     *,
     adapter: _G1FootfallAdapter,
     target_mesh: object,
-    target_route: object,
+    target_route: object | None,
     direction_xy: np.ndarray,
     active_start_m: float,
     active_stop_m: float,
@@ -581,27 +668,36 @@ def warp_motion(
         nominal_collision_envelopes.append(
             (mapped_envelopes[0], mapped_envelopes[1])
         )
-    target_soles_array, _anchor_diagnostics = _anchor_stance_sole_targets(
-        nominal_targets,
-        stance,
-        sphere_radii,
-        nominal_collision_envelopes,
-        target_mesh=target_mesh,
-        foothold_route=target_route,
-        ground_fallback_height_m=0.0,
-        config=FootholdAnchorConfig(
-            max_longitudinal_adjustment_m=0.16,
-            max_lateral_adjustment_m=0.0,
-            max_yaw_adjustment_rad=math.radians(12.0),
-            longitudinal_samples=17,
-            lateral_samples=1,
-            yaw_samples=5,
-            lateral_seed_offsets_m=(0.0,),
-            route_lateral_offset_m=0.0,
-            route_alignment_weight=0.0,
-            minimum_support_points=2,
-        ),
-    )
+    if target_route is None:
+        target_soles_array = _anchor_stance_soles_to_continuous_mesh(
+            nominal_targets,
+            stance,
+            sphere_radii,
+            target_mesh=target_mesh,
+            ray_z=ray_z,
+        )
+    else:
+        target_soles_array, _anchor_diagnostics = _anchor_stance_sole_targets(
+            nominal_targets,
+            stance,
+            sphere_radii,
+            nominal_collision_envelopes,
+            target_mesh=target_mesh,
+            foothold_route=target_route,
+            ground_fallback_height_m=0.0,
+            config=FootholdAnchorConfig(
+                max_longitudinal_adjustment_m=0.16,
+                max_lateral_adjustment_m=0.0,
+                max_yaw_adjustment_rad=math.radians(12.0),
+                longitudinal_samples=17,
+                lateral_samples=1,
+                yaw_samples=5,
+                lateral_seed_offsets_m=(0.0,),
+                route_lateral_offset_m=0.0,
+                route_alignment_weight=0.0,
+                minimum_support_points=2,
+            ),
+        )
     target_soles = [
         (target_soles_array[frame, 0], target_soles_array[frame, 1])
         for frame in range(len(target_soles_array))
@@ -641,7 +737,8 @@ def warp_motion(
         root_anchor_shift, root_anchor_fixed
     )
     root_anchor_shift = _smooth_root_anchor_shifts(
-        root_anchor_shift, sigma_frames=4.0
+        root_anchor_shift,
+        sigma_frames=(1.0 if target_route is None else 4.0),
     )
     mapped_roots += root_anchor_shift
 
@@ -1022,10 +1119,16 @@ def build(arguments: argparse.Namespace) -> dict[str, object]:
         direction = np.asarray(
             (math.cos(travel_yaw), math.sin(travel_yaw)), dtype=np.float64
         )
-        target_route = motion_conditioned_stair_support_route(
-            archive, clip_index
+        target_route = (
+            None
+            if arguments.continuous_terrain
+            else motion_conditioned_stair_support_route(archive, clip_index)
         )
-        active_start, active_stop = _active_route_interval(target_route)
+        if target_route is None:
+            active_start = 0.0
+            active_stop = 0.0
+        else:
+            active_start, active_stop = _active_route_interval(target_route)
         source_entries = [
             (kind, path, False)
             for kind, path in _source_paths(
@@ -1054,7 +1157,7 @@ def build(arguments: argparse.Namespace) -> dict[str, object]:
             )
             if (
                 source_progress_range < 0.50
-                or source_vertical_range < 0.06
+                or source_vertical_range < arguments.minimum_vertical_range_m
             ):
                 print(
                     "STAIRS500_DIRECTIONAL_SOURCE_SKIPPED "
@@ -1064,14 +1167,21 @@ def build(arguments: argparse.Namespace) -> dict[str, object]:
                     flush=True,
                 )
                 continue
+            if target_route is None:
+                source_active_start = 0.10 * source_progress_range
+                source_active_stop = 0.90 * source_progress_range
             if temporal_reverse:
-                source_active_start = max(
-                    0.0, source_progress_range - active_stop
-                )
-                source_active_stop = min(
-                    source_progress_range,
-                    source_progress_range - active_start,
-                )
+                if target_route is None:
+                    source_active_start = 0.10 * source_progress_range
+                    source_active_stop = 0.90 * source_progress_range
+                else:
+                    source_active_start = max(
+                        0.0, source_progress_range - active_stop
+                    )
+                    source_active_stop = min(
+                        source_progress_range,
+                        source_progress_range - active_start,
+                    )
                 if source_active_stop - source_active_start < 0.75:
                     source_active_start = 0.0
                     source_active_stop = source_progress_range
@@ -1328,6 +1438,7 @@ def build(arguments: argparse.Namespace) -> dict[str, object]:
         "include_temporal_reverse": bool(
             arguments.include_temporal_reverse
         ),
+        "continuous_terrain": bool(arguments.continuous_terrain),
         "reports": reports,
     }
     (output / "aggregate.json").write_text(
@@ -1349,6 +1460,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", action="append", default=[])
     parser.add_argument("--include-reverse", action="store_true")
     parser.add_argument("--include-temporal-reverse", action="store_true")
+    parser.add_argument(
+        "--continuous-terrain",
+        action="store_true",
+        help=(
+            "anchor stance probes directly to a continuous terrain mesh "
+            "instead of requiring discrete stair support levels"
+        ),
+    )
+    parser.add_argument("--minimum-vertical-range-m", type=float, default=0.06)
     parser.add_argument("--maximum-amplitude-m", type=float, default=0.42)
     parser.add_argument("--maximum-joint-correction-rad", type=float, default=0.45)
     parser.add_argument(
