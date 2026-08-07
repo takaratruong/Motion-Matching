@@ -55,10 +55,12 @@ def select(
         # One normalized intensity score keeps the visual review from filling
         # every behavior family with its easiest micro/gentle member.  The
         # categorical terms below still guarantee broad behavior coverage.
-        source_intensity = max(
-            path_angle_deg / 18.0,
-            facing_offset_deg / 12.0,
-            lateral_range_m / 0.40,
+        source_intensity = sum(
+            (
+                path_angle_deg / 18.0,
+                facing_offset_deg / 12.0,
+                lateral_range_m / 0.40,
+            )
         )
         manifest_path = (
             root
@@ -132,7 +134,7 @@ def select(
             score += 5.0 * (source_kind not in seen_source_kind)
             score += 4.0 * (mirrored not in seen_mirror)
             score += 3.0 * (pivot_bin not in seen_pivot_bin)
-            score += 24.0 * min(float(candidate["source_intensity"]), 2.0)
+            score += 24.0 * min(float(candidate["source_intensity"]), 4.0)
             score += {"bounce": 3.0, "reverse": 2.0, "stop_restart": 1.0}.get(
                 mode, 0.0
             )

@@ -48,6 +48,22 @@ def behavior_family(mode: str) -> str:
     return "other"
 
 
+def source_intensity(report: dict[str, object]) -> float:
+    """Rank accepted sources by realized joystick displacement, not ease."""
+
+    warp = report.get("warp", {})
+    path_angle_deg = float(warp.get("maximum_path_angle_deg", 0.0))
+    facing_offset_deg = float(warp.get("maximum_facing_offset_deg", 0.0))
+    lateral_range_m = float(warp.get("lateral_offset_range_m", 0.0))
+    return sum(
+        (
+            path_angle_deg / 18.0,
+            facing_offset_deg / 12.0,
+            lateral_range_m / 0.40,
+        )
+    )
+
+
 def select(
     roots: Sequence[Path],
     *,
@@ -92,6 +108,7 @@ def select(
     for candidates in groups.values():
         candidates.sort(
             key=lambda item: (
+                -source_intensity(item[1]),
                 _quality_tier(item[1]) != "gold",
                 int(item[1]["clip_index"]),
                 str(item[1]["mode"]),
@@ -149,6 +166,7 @@ def select(
             "behavior_family": family,
             "mirrored": bool(report.get("mirror_of")),
             "quality_tier": _quality_tier(report),
+            "source_intensity": source_intensity(report),
         }
         for rank, (path, report, family) in enumerate(selected)
     ]

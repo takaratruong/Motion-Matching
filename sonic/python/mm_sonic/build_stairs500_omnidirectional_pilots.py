@@ -33,6 +33,7 @@ from .terrain_oracle.stair_fragment_reconstruction import (
     _blend_anchored_sole_offsets,
     _interpolate_fixed_vectors,
     _smooth_root_anchor_shifts,
+    _stance_guidance_weights,
     _stance_spans,
 )
 from .terrain_oracle.stair_foothold_anchors import FootholdAnchorConfig
@@ -318,6 +319,102 @@ def _profile_knots(
             0.40,
             0.15,
         ),
+        # Co-warp profiles rotate the pelvis and the complete foot frame with
+        # the path tangent.  They are intended for paired motion+terrain
+        # deformation: the registered mesh is bent by the identical map, so
+        # these can author much stronger rough-terrain steering without
+        # asking a planted foot to conform to an unrelated fixed surface.
+        "cowarp_diagonal_left": ((-1.0, 1.0), 28.0, 0.0, 1.0, 1.0),
+        "cowarp_diagonal_right": ((1.0, -1.0), 28.0, 0.0, 1.0, 1.0),
+        "cowarp_lane_left": ((0.0, 1.0), 24.0, 0.0, 1.0, 1.0),
+        "cowarp_lane_right": ((0.0, -1.0), 24.0, 0.0, 1.0, 1.0),
+        "cowarp_slalom_left_right": (
+            (0.0, 1.0, -1.0, 1.0, 0.0),
+            18.0,
+            0.0,
+            1.0,
+            1.0,
+        ),
+        "cowarp_slalom_right_left": (
+            (0.0, -1.0, 1.0, -1.0, 0.0),
+            18.0,
+            0.0,
+            1.0,
+            1.0,
+        ),
+        "cowarp_slalom_gentle_left_right": (
+            (0.0, 1.0, -1.0, 1.0, 0.0),
+            12.0,
+            0.0,
+            1.0,
+            1.0,
+        ),
+        "cowarp_slalom_gentle_right_left": (
+            (0.0, -1.0, 1.0, -1.0, 0.0),
+            12.0,
+            0.0,
+            1.0,
+            1.0,
+        ),
+        "cowarp_zigzag_gentle_left_right": (
+            (0.0, 1.0, -1.0, 0.0),
+            12.0,
+            0.0,
+            1.0,
+            1.0,
+        ),
+        "cowarp_zigzag_gentle_right_left": (
+            (0.0, -1.0, 1.0, 0.0),
+            12.0,
+            0.0,
+            1.0,
+            1.0,
+        ),
+        # Paired terrain deformation supplies the path contact; these modes
+        # independently offset body facing so all four travel/facing sign
+        # combinations appear in the clean terrain corpus.
+        "cowarp_diagonal_left_face_left": (
+            (-1.0, 1.0),
+            14.0,
+            10.0,
+            1.0,
+            1.0,
+        ),
+        "cowarp_diagonal_left_face_right": (
+            (-1.0, 1.0),
+            14.0,
+            -10.0,
+            1.0,
+            1.0,
+        ),
+        "cowarp_diagonal_right_face_left": (
+            (1.0, -1.0),
+            14.0,
+            10.0,
+            1.0,
+            1.0,
+        ),
+        "cowarp_diagonal_right_face_right": (
+            (1.0, -1.0),
+            14.0,
+            -10.0,
+            1.0,
+            1.0,
+        ),
+        "cowarp_facing_weave_left_right": (
+            (0.0, 0.0),
+            0.0,
+            10.0,
+            0.0,
+            0.0,
+        ),
+        "cowarp_facing_weave_right_left": (
+            (0.0, 0.0),
+            0.0,
+            10.0,
+            0.0,
+            0.0,
+        ),
     }
     try:
         return profiles[mode]
@@ -370,6 +467,8 @@ def build_path_profile(
         "facing_weave_right_left": (0.0, -1.0, 1.0, 0.0),
         "facing_weave_micro_left_right": (0.0, 1.0, -1.0, 0.0),
         "facing_weave_micro_right_left": (0.0, -1.0, 1.0, 0.0),
+        "cowarp_facing_weave_left_right": (0.0, 1.0, -1.0, 0.0),
+        "cowarp_facing_weave_right_left": (0.0, -1.0, 1.0, 0.0),
     }.get(mode)
     if facing_knots is None:
         facing_window = np.sin(np.pi * u) ** 2
@@ -478,6 +577,49 @@ def _terrain_height(target_mesh: object, xy: np.ndarray, ray_z: float) -> float:
     return -math.inf if hit is None else float(hit.position_world[2])
 
 
+def _corresponding_warped_surface_point(
+    source_mesh: object,
+    target_mesh: object,
+    point_world: np.ndarray,
+    *,
+    ray_z: float,
+) -> np.ndarray | None:
+    """Map a source surface point through paired meshes by face barycentrics."""
+
+    point = np.asarray(point_world, dtype=np.float64)
+    hit = source_mesh.raycast(
+        np.asarray((point[0], point[1], ray_z), dtype=np.float64),
+        np.asarray((0.0, 0.0, -1.0), dtype=np.float64),
+    )
+    if hit is None or abs(float(point[2]) - float(hit.position_world[2])) > 0.020:
+        return None
+    face_index = int(hit.face_index)
+    if not bool(target_mesh.mesh.valid_faces[face_index]):
+        return None
+    vertex_indices = np.asarray(source_mesh.mesh.faces[face_index], dtype=np.int64)
+    source_triangle = np.asarray(
+        source_mesh.vertices_world[vertex_indices], dtype=np.float64
+    )
+    target_triangle = np.asarray(
+        target_mesh.vertices_world[vertex_indices], dtype=np.float64
+    )
+    edge0 = source_triangle[1] - source_triangle[0]
+    edge1 = source_triangle[2] - source_triangle[0]
+    relative = np.asarray(hit.position_world, dtype=np.float64) - source_triangle[0]
+    d00 = float(np.dot(edge0, edge0))
+    d01 = float(np.dot(edge0, edge1))
+    d11 = float(np.dot(edge1, edge1))
+    d20 = float(np.dot(relative, edge0))
+    d21 = float(np.dot(relative, edge1))
+    denominator = d00 * d11 - d01 * d01
+    if abs(denominator) <= 1.0e-12:
+        return None
+    weight1 = (d11 * d20 - d01 * d21) / denominator
+    weight2 = (d00 * d21 - d01 * d20) / denominator
+    weights = np.asarray((1.0 - weight1 - weight2, weight1, weight2))
+    return weights @ target_triangle
+
+
 def _anchor_stance_soles_to_continuous_mesh(
     nominal_targets: np.ndarray,
     stance: np.ndarray,
@@ -485,6 +627,9 @@ def _anchor_stance_soles_to_continuous_mesh(
     *,
     target_mesh: object,
     ray_z: float,
+    source_nominal_targets: np.ndarray | None = None,
+    source_mesh: object | None = None,
+    source_ray_z: float | None = None,
 ) -> np.ndarray:
     """Lock mapped stance feet directly to an arbitrary continuous surface.
 
@@ -504,33 +649,76 @@ def _anchor_stance_soles_to_continuous_mesh(
         frame = (span.start_frame + span.stop_frame - 1) // 2
         foot = int(span.foot_index)
         target = np.asarray(nominal[frame, foot], dtype=np.float64).copy()
-        heights = np.asarray(
-            [
-                _terrain_height(target_mesh, point[:2], ray_z)
-                for point in target
-            ],
-            dtype=np.float64,
-        )
-        if not np.isfinite(heights).all():
-            raise ValueError(
-                "mapped stance sole leaves the continuous terrain mesh"
+        radii = np.asarray(sphere_radii[foot], dtype=np.float64)
+        if source_mesh is not None:
+            if source_nominal_targets is None or source_ray_z is None:
+                raise ValueError("paired mesh anchoring needs source sole targets")
+            source_target = np.asarray(
+                source_nominal_targets[frame, foot], dtype=np.float64
             )
-        required_centres = heights + np.asarray(
-            sphere_radii[foot], dtype=np.float64
-        )
+            residuals: list[np.ndarray] = []
+            for probe, source_point in enumerate(source_target):
+                source_surface = source_point.copy()
+                source_surface[2] -= radii[probe]
+                mapped_surface = _corresponding_warped_surface_point(
+                    source_mesh,
+                    target_mesh,
+                    source_surface,
+                    ray_z=float(source_ray_z),
+                )
+                if mapped_surface is None:
+                    continue
+                required_centre = mapped_surface.copy()
+                required_centre[2] += radii[probe]
+                residuals.append(required_centre - target[probe])
+            if len(residuals) < 2:
+                raise ValueError(
+                    "mapped stance sole has fewer than two paired terrain probes"
+                )
+            residual = np.asarray(residuals, dtype=np.float64)
+            # The path map is spatially varying, while a real sole is rigid.
+            # Retain its mapped yaw and choose one whole-foot translation:
+            # least-squares in XY and the smallest clearance-preserving lift.
+            target[:, :2] += np.mean(residual[:, :2], axis=0)
+            vertical_shift = float(np.max(residual[:, 2]))
+        else:
+            heights = np.asarray(
+                [
+                    _terrain_height(target_mesh, point[:2], ray_z)
+                    for point in target
+                ],
+                dtype=np.float64,
+            )
+            supported = np.isfinite(heights)
+            if int(np.count_nonzero(supported)) < 2:
+                raise ValueError(
+                    "mapped stance sole has fewer than two terrain support probes"
+                )
+            # Narrow stair treads and rough crests legitimately leave a toe or
+            # heel probe outside the finite terrain patch.  Stance detection
+            # and final admission both require at least two supported probes.
+            required_centres = heights[supported] + radii[supported]
+            vertical_shift = float(
+                np.max(required_centres - target[supported, 2])
+            )
         # A G1 sole is rigid.  Assigning every probe the terrain height can
         # produce four non-coplanar targets on rough ground and asks the leg
         # IK to realize an impossible foot shape.  Preserve the authored sole
         # orientation and apply the smallest whole-foot vertical shift that
         # clears every probe; exact support and hover checks below decide
         # whether the resulting rigid contact is actually usable.
-        vertical_shift = float(np.max(required_centres - target[:, 2]))
         target[:, 2] += vertical_shift
         anchored[span.start_frame : span.stop_frame, foot] = target
         assigned[span.start_frame : span.stop_frame, foot] = True
     if not np.any(assigned):
         raise ValueError("source motion has no supported stance run")
-    return _blend_anchored_sole_offsets(nominal, anchored, assigned)
+    blended = _blend_anchored_sole_offsets(nominal, anchored, assigned)
+    guidance = _stance_guidance_weights(
+        stance_mask,
+        blend_frames=12,
+        release_frames=8,
+    )
+    return nominal + guidance[:, :, None, None] * (blended - nominal)
 
 
 def _stance_runs_maximum_drift(
@@ -567,6 +755,8 @@ def warp_motion(
     active_stop_m: float,
     mode: str,
     maximum_amplitude_m: float,
+    source_mesh: object | None = None,
+    spatial_sole_mapping: bool = False,
 ) -> tuple[StitchedMotion, WarpDiagnostics, dict[str, np.ndarray]]:
     """Warp one source motion and fit its legs to non-sliding sole targets."""
 
@@ -619,6 +809,8 @@ def warp_motion(
         np.gradient(source_centres, axis=0) * fps, axis=2
     )
     sphere_radii = adapter.sole_sphere_radii()
+    support_mesh = target_mesh if source_mesh is None else source_mesh
+    source_ray_z = float(np.max(support_mesh.vertices_world[:, 2]) + 1.0)
     ray_z = float(np.max(target_mesh.vertices_world[:, 2]) + 1.0)
     source_support_count = np.zeros((len(roots), 2), dtype=np.int16)
     for frame, feet in enumerate(source_soles):
@@ -626,7 +818,10 @@ def warp_motion(
             support = feet[foot].copy()
             support[:, 2] -= sphere_radii[foot]
             source_support_count[frame, foot] = sum(
-                abs(float(point[2]) - _terrain_height(target_mesh, point[:2], ray_z))
+                abs(
+                    float(point[2])
+                    - _terrain_height(support_mesh, point[:2], source_ray_z)
+                )
                 <= 0.020
                 for point in support
             )
@@ -655,16 +850,25 @@ def warp_motion(
         foot_yaw = float(root_profile.foot_yaw_offset_rad[frame])
         mapped_envelopes: list[np.ndarray] = []
         for foot in range(2):
-            nominal_targets[frame, foot] = (
-                mapped_roots[frame]
-                + _rotate_z(feet[foot] - roots[frame], foot_yaw)
-            )
-            mapped_envelopes.append(
-                mapped_roots[frame]
-                + _rotate_z(
-                    source_envelopes[frame][foot] - roots[frame], foot_yaw
+            if spatial_sole_mapping:
+                nominal_targets[frame, foot], _ = _map_rigid_sole(
+                    feet[foot], **path_arguments
                 )
-            )
+                mapped_envelope, _ = _map_rigid_sole(
+                    source_envelopes[frame][foot], **path_arguments
+                )
+                mapped_envelopes.append(mapped_envelope)
+            else:
+                nominal_targets[frame, foot] = (
+                    mapped_roots[frame]
+                    + _rotate_z(feet[foot] - roots[frame], foot_yaw)
+                )
+                mapped_envelopes.append(
+                    mapped_roots[frame]
+                    + _rotate_z(
+                        source_envelopes[frame][foot] - roots[frame], foot_yaw
+                    )
+                )
         nominal_collision_envelopes.append(
             (mapped_envelopes[0], mapped_envelopes[1])
         )
@@ -675,6 +879,9 @@ def warp_motion(
             sphere_radii,
             target_mesh=target_mesh,
             ray_z=ray_z,
+            source_nominal_targets=np.asarray(source_soles),
+            source_mesh=source_mesh,
+            source_ray_z=source_ray_z,
         )
     else:
         target_soles_array, _anchor_diagnostics = _anchor_stance_sole_targets(

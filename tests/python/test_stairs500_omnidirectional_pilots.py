@@ -95,6 +95,29 @@ class StairDirectionalProfileTest(unittest.TestCase):
         np.testing.assert_array_equal(profile.path_yaw_offset_rad, 0.0)
         np.testing.assert_array_equal(profile.facing_yaw_offset_rad, 0.0)
 
+    def test_cowarp_zigzag_changes_direction_at_bounded_angle(self):
+        profile = build_path_profile(
+            "cowarp_zigzag_gentle_left_right",
+            np.linspace(0.0, 1.0, 401),
+            active_length_m=3.0,
+            maximum_amplitude_m=0.25,
+        )
+        self.assertGreater(float(np.max(profile.lateral_offset_m)), 0.02)
+        self.assertLess(float(np.min(profile.lateral_offset_m)), -0.02)
+        self.assertLessEqual(profile.maximum_path_angle_deg, 12.0 + 1.0e-6)
+
+    def test_cowarp_facing_weave_keeps_path_straight(self):
+        profile = build_path_profile(
+            "cowarp_facing_weave_left_right",
+            np.linspace(0.0, 1.0, 401),
+            active_length_m=3.0,
+            maximum_amplitude_m=0.25,
+        )
+        np.testing.assert_array_equal(profile.lateral_offset_m, 0.0)
+        np.testing.assert_array_equal(profile.path_yaw_offset_rad, 0.0)
+        self.assertGreater(float(np.degrees(np.max(profile.facing_yaw_offset_rad))), 9.9)
+        self.assertLess(float(np.degrees(np.min(profile.facing_yaw_offset_rad))), -9.9)
+
     def test_temporal_reverse_preserves_poses_and_maps_seams(self):
         motion = StitchedMotion(
             fps=50.0,
