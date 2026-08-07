@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import math
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 
 import numpy as np
@@ -111,23 +113,32 @@ class PhaseFromContactsTest(unittest.TestCase):
     def test_same_foot_twice_rejects_the_ambiguous_span(self) -> None:
         contact = contacts_with_strikes(("left", 3), ("left", 33), ("right", 63))
         track = phase_from_contacts(contact, fps=30.0)
-        self.assertFalse(track.valid[3:33].any())
-        self.assertTrue(track.valid[33:64].all())
+        self.assertFalse(track.valid[3:34].any())
+        self.assertTrue(track.valid[34:64].all())
 
     def test_half_cycle_outside_point_two_to_one_second_is_rejected(self) -> None:
         contact = contacts_with_strikes(("left", 3), ("right", 8), ("left", 43))
         track = phase_from_contacts(contact, fps=30.0)
         self.assertFalse(track.valid[3:9].any())
 
-    def test_two_frame_contact_gap_does_not_create_a_strike(self) -> None:
+    def test_unstable_rise_is_a_barrier_to_the_candidate_half_cycle(self) -> None:
         contact = np.zeros((64, 4), dtype=bool)
         contact[3:7, 0] = True
         contact[9:19, 0] = True
         contact[33:43, 2] = True
         track = phase_from_contacts(contact, fps=30.0)
-        self.assertTrue(track.valid[3:34].all())
-        self.assertAlmostEqual(track.phase[3], 0.0)
-        self.assertAlmostEqual(track.phase[33], math.pi)
+        self.assertFalse(track.valid[3:34].any())
+
+    def test_one_stable_one_unstable_simultaneous_rise_removes_both(self) -> None:
+        contact = np.zeros((121, 4), dtype=bool)
+        contact[3:32, 0] = True
+        contact[33:43, 0] = True
+        contact[33:43, 2] = True
+        contact[63:73, 2] = True
+        contact[90:100, 0] = True
+        track = phase_from_contacts(contact, fps=30.0)
+        self.assertFalse(track.valid[3:64].any())
+        self.assertTrue(track.valid[64:91].all())
 
     def test_simultaneous_left_right_rises_are_not_phase_anchors(self) -> None:
         contact = np.zeros((64, 4), dtype=bool)
@@ -150,9 +161,19 @@ class PhaseFromContactsTest(unittest.TestCase):
             ("left", 3), ("right", 33), ("right", 63), ("left", 90), frames=121
         )
         track = phase_from_contacts(contact, fps=30.0)
-        self.assertTrue(track.valid[3:34].all())
-        self.assertFalse(track.valid[34:63].any())
-        self.assertTrue(track.valid[63:91].all())
+        self.assertTrue(track.valid[3:33].all())
+        self.assertFalse(track.valid[33:64].any())
+        self.assertTrue(track.valid[64:91].all())
+
+    def test_short_rejected_interval_removes_shared_anchors(self) -> None:
+        contact = contacts_with_strikes(
+            ("left", 3), ("right", 33), ("left", 34), ("right", 64), frames=91
+        )
+        track = phase_from_contacts(contact, fps=30.0)
+        self.assertFalse(track.valid[33:35].any())
+        self.assertTrue(track.valid[3:33].all())
+        self.assertTrue(track.valid[35:65].all())
+        self.assertTrue(np.all(track.phase_advance >= 0.0))
 
     def test_adjacent_trailing_bilateral_margin_extends_at_zero_advance(self) -> None:
         contact = np.zeros((64, 4), dtype=bool)
@@ -207,6 +228,10 @@ class PhaseFromContactsTest(unittest.TestCase):
             phase_from_contacts(np.zeros((10, 2), dtype=bool), fps=30.0)
         with self.assertRaisesRegex(ValueError, "positive fps"):
             phase_from_contacts(np.zeros((10, 4), dtype=bool), fps=math.nan)
+        for fps in (29.999, 60.0):
+            with self.subTest(fps=fps):
+                with self.assertRaisesRegex(ValueError, "exactly 30 Hz"):
+                    phase_from_contacts(np.zeros((10, 4), dtype=bool), fps=fps)
         with self.assertRaisesRegex(ValueError, "confidence"):
             confidence = np.zeros((10, 4), dtype=np.float32)
             confidence[0, 0] = np.nan
@@ -246,6 +271,46 @@ class NativeContactGeometryTest(unittest.TestCase):
             np.tile(np.array((True, False, False, False)), (source.frame_count, 1)),
         )
         self.assertTrue(np.all(track.confidence[:, 0] > track.confidence[:, 1]))
+
+    def test_paired_terrain_digest_mismatch_is_invalid_geometry(self) -> None:
+        import mujoco
+
+        model = mujoco.MjModel.from_xml_path(str(MODEL))
+        geometry = SoleGeometry.from_model(model)
+        source = replace(
+            _source_with_ankles(
+                np.zeros(3, dtype=np.float32),
+                np.array((1.0, 0.0, 0.0, 0.0), dtype=np.float32),
+            ),
+            terrain_path=Path("paired.usd"),
+            terrain_sha256="a" * 64,
+        )
+        with self.assertRaisesRegex(ValueError, "invalid geometry.*terrain digest"):
+            reconstruct_heel_toe_contacts(source, _plane_query(), geometry)
+
+    def test_nonfinite_surface_result_is_invalid_geometry(self) -> None:
+        import mujoco
+
+        class NonfiniteQuery(CanonicalMeshQuery):
+            def query(self, points_world: object) -> object:
+                count = len(np.asarray(points_world))
+                return SimpleNamespace(
+                    distance_m=np.full(count, np.nan),
+                    surface_normal_world=np.zeros((count, 3)),
+                    downward_ray_distance_m=np.full(count, np.inf),
+                    downward_ray_normal_world=np.zeros((count, 3)),
+                )
+
+        model = mujoco.MjModel.from_xml_path(str(MODEL))
+        geometry = SoleGeometry.from_model(model)
+        base_query = _plane_query()
+        query = NonfiniteQuery(base_query.mesh, base_query.world_from_terrain)
+        source = _source_with_ankles(
+            np.zeros(3, dtype=np.float32),
+            np.array((1.0, 0.0, 0.0, 0.0), dtype=np.float32),
+        )
+        with self.assertRaisesRegex(ValueError, "invalid geometry.*surface query"):
+            reconstruct_heel_toe_contacts(source, query, geometry)
 
 
 if __name__ == "__main__":

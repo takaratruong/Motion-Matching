@@ -13,6 +13,7 @@ import re
 import numpy as np
 
 from mm_sonic.grail_terrain_source import G1MujocoFK
+from mm_sonic.joints import ContractError
 from mm_sonic.terrain_oracle.canonical import ISAACLAB_BODY_NAMES
 from mm_sonic.terrain_oracle.contact import (
     CanonicalMeshQuery,
@@ -35,6 +36,8 @@ _REASON_NAMES = (
     "same_side",
     "half_cycle_too_short",
     "half_cycle_too_long",
+    "invalid_geometry",
+    "backward_phase",
 )
 _SLOPE_RE = re.compile(r"(?:^|__)(slope_\d{3})(?:__|$)")
 
@@ -48,30 +51,35 @@ class ContactPhaseTrack:
     valid: np.ndarray
 
 
-def _stable_strikes(
+def _strike_events(
     channels: np.ndarray,
-) -> tuple[list[tuple[int, int]], tuple[int, ...], dict[str, int]]:
+) -> tuple[list[tuple[int, int]], np.ndarray, dict[str, int]]:
     foot = np.column_stack(
         (channels[:, 0] | channels[:, 1], channels[:, 2] | channels[:, 3])
     )
     rising = foot & ~np.vstack((np.zeros((1, 2), dtype=bool), foot[:-1]))
-    stable = np.zeros_like(rising)
+    barrier = np.zeros(len(foot), dtype=bool)
+    strikes: list[tuple[int, int]] = []
     reasons = {name: 0 for name in _REASON_NAMES}
-    for frame, side in zip(*np.nonzero(rising), strict=True):
-        if frame < 3 or not np.all(~foot[frame - 3 : frame, side]):
-            reasons["unstable_rise"] += 1
+    for frame in range(len(foot)):
+        sides = np.flatnonzero(rising[frame])
+        if not len(sides):
+            continue
+        stable = {
+            int(side): bool(
+                frame >= 3 and np.all(~foot[frame - 3 : frame, side])
+            )
+            for side in sides
+        }
+        reasons["unstable_rise"] += sum(not value for value in stable.values())
+        if len(sides) == 2:
+            reasons["simultaneous_rise"] += 1
+            barrier[frame] = True
+        elif stable[int(sides[0])]:
+            strikes.append((frame, int(sides[0])))
         else:
-            stable[frame, side] = True
-    simultaneous = np.flatnonzero(stable[:, 0] & stable[:, 1])
-    reasons["simultaneous_rise"] = int(len(simultaneous))
-    stable[simultaneous] = False
-    strikes = [
-        (frame, side)
-        for frame in range(len(foot))
-        for side in range(2)
-        if stable[frame, side]
-    ]
-    return strikes, tuple(map(int, simultaneous)), reasons
+            barrier[frame] = True
+    return strikes, barrier, reasons
 
 
 def _phase_reconstruction(
@@ -82,31 +90,36 @@ def _phase_reconstruction(
     foot = np.column_stack(
         (channels[:, 0] | channels[:, 1], channels[:, 2] | channels[:, 3])
     )
-    strikes, simultaneous, reasons = _stable_strikes(channels)
+    strikes, barrier, reasons = _strike_events(channels)
     unwrapped = np.zeros(len(foot), dtype=np.float64)
     valid = np.zeros(len(foot), dtype=bool)
+    rejected = np.zeros(len(foot), dtype=bool)
     previous_stop_phase: float | None = None
     previous_stop_frame: int | None = None
-    first_valid_cycle: tuple[int, int, int, float] | None = None
+    valid_cycles: list[tuple[int, int, int, float]] = []
     for (start, side), (stop, next_side) in zip(strikes[:-1], strikes[1:]):
         duration = (stop - start) / float(fps)
-        ambiguous_between = any(start < frame <= stop for frame in simultaneous)
-        if ambiguous_between:
+        barrier_between = bool(np.any(barrier[start + 1 : stop]))
+        if barrier_between:
+            rejected[start : stop + 1] = True
             previous_stop_phase = None
             previous_stop_frame = None
             continue
         if next_side == side:
             reasons["same_side"] += 1
+            rejected[start : stop + 1] = True
             previous_stop_phase = None
             previous_stop_frame = None
             continue
         if duration < 0.20:
             reasons["half_cycle_too_short"] += 1
+            rejected[start : stop + 1] = True
             previous_stop_phase = None
             previous_stop_frame = None
             continue
         if duration > 1.00:
             reasons["half_cycle_too_long"] += 1
+            rejected[start : stop + 1] = True
             previous_stop_phase = None
             previous_stop_frame = None
             continue
@@ -120,14 +133,17 @@ def _phase_reconstruction(
             start_phase, stop_phase, stop - start + 1
         )
         valid[start : stop + 1] = True
-        if first_valid_cycle is None:
-            first_valid_cycle = (start, stop, side, start_phase)
+        valid_cycles.append((start, stop, side, start_phase))
         previous_stop_phase = stop_phase
         previous_stop_frame = stop
 
+    valid[rejected] = False
     if np.any(valid):
         last = int(np.flatnonzero(valid)[-1])
         bilateral = foot[:, 0] & foot[:, 1]
+        first_valid_cycle = next(
+            (cycle for cycle in valid_cycles if valid[cycle[0]]), None
+        )
         if first_valid_cycle is not None and bilateral[0]:
             start, stop, side, start_phase = first_valid_cycle
             prefix_end = 0
@@ -153,11 +169,17 @@ def _phase_reconstruction(
             unwrapped[last + 1 : trailing + 1] = unwrapped[last]
             valid[last + 1 : trailing + 1] = True
 
+    valid[rejected] = False
+    delta = np.diff(unwrapped)
+    backward = np.flatnonzero(valid[:-1] & valid[1:] & (delta < 0.0))
+    reasons["backward_phase"] = int(len(backward))
+    if len(backward):
+        valid[backward] = False
+        valid[backward + 1] = False
+
     wrapped = np.remainder(unwrapped, 2.0 * math.pi)
     advance = np.zeros(len(foot), dtype=np.float64)
-    advance[:-1] = np.where(
-        valid[:-1] & valid[1:], np.maximum(0.0, np.diff(unwrapped)), 0.0
-    )
+    advance[:-1] = np.where(valid[:-1] & valid[1:], delta, 0.0)
     return (
         ContactPhaseTrack(
             channels,
@@ -184,6 +206,8 @@ def phase_from_contacts(
         or fps <= 0.0
     ):
         raise ValueError("phase reconstruction expects contact[T,4] and positive fps")
+    if float(fps) != 30.0:
+        raise ValueError("phase reconstruction requires exactly 30 Hz")
     confidence_array = (
         channels.astype(np.float32)
         if confidence is None
@@ -208,7 +232,15 @@ def reconstruct_heel_toe_contacts(
         raise TypeError("source must be a PFNNSourceClip")
     if not isinstance(query, CanonicalMeshQuery):
         raise TypeError("query must be a CanonicalMeshQuery")
-    config = ContactConfig(geometry=geometry)
+    if (
+        source.terrain_sha256 is not None
+        and source.terrain_sha256 != query.source_asset_sha256
+    ):
+        raise ValueError("invalid geometry: paired terrain digest mismatch")
+    try:
+        config = ContactConfig(geometry=geometry)
+    except ContractError as error:
+        raise ValueError(f"invalid geometry: {error}") from error
     try:
         body_indices = np.array(
             [ISAACLAB_BODY_NAMES.index(name) for name in geometry.body_names],
@@ -245,12 +277,27 @@ def reconstruct_heel_toe_contacts(
         ),
     )
     probe_world = channel_position[:, :, None, :] + rotated_probes
-    surface = query.query(probe_world.reshape((-1, 3)))
+    try:
+        surface = query.query(probe_world.reshape((-1, 3)))
+    except (AttributeError, ContractError, TypeError, ValueError) as error:
+        raise ValueError(f"invalid geometry: surface query failed: {error}") from error
     shape = (source.frame_count, 4, grouped_offsets.shape[1])
-    closest_distance = np.asarray(surface.distance_m).reshape(shape)
-    closest_normal = np.asarray(surface.surface_normal_world).reshape((*shape, 3))
-    ray_distance = np.asarray(surface.downward_ray_distance_m).reshape(shape)
-    ray_normal = np.asarray(surface.downward_ray_normal_world).reshape((*shape, 3))
+    try:
+        closest_distance = np.asarray(surface.distance_m).reshape(shape)
+        closest_normal = np.asarray(surface.surface_normal_world).reshape((*shape, 3))
+        ray_distance = np.asarray(surface.downward_ray_distance_m).reshape(shape)
+        ray_normal = np.asarray(surface.downward_ray_normal_world).reshape((*shape, 3))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"invalid geometry: malformed surface query result: {error}"
+        ) from error
+    if (
+        not np.isfinite(closest_distance).all()
+        or not np.isfinite(closest_normal).all()
+        or np.isnan(ray_distance).any()
+        or not np.isfinite(ray_normal).all()
+    ):
+        raise ValueError("invalid geometry: nonfinite surface query result")
     probe_velocity = channel_linear_velocity[:, :, None, :] + np.cross(
         channel_angular_velocity[:, :, None, :], rotated_probes
     )
