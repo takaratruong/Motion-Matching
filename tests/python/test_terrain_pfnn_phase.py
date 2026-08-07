@@ -196,6 +196,20 @@ class PhaseFromContactsTest(unittest.TestCase):
         self.assertAlmostEqual(track.phase[94], 0.0)
         self.assertTrue(np.all(track.phase_advance >= 0.0))
 
+    def test_consecutive_short_intervals_propagate_taint_to_each_stop(self) -> None:
+        contact = np.zeros((101, 4), dtype=bool)
+        contact[3:5, 0] = True
+        contact[8:10, 2] = True
+        contact[13:15, 0] = True
+        contact[43:45, 2] = True
+        contact[73:75, 0] = True
+        track = phase_from_contacts(contact, fps=30.0)
+        self.assertFalse(track.valid[3:43].any())
+        self.assertTrue(track.valid[43:74].all())
+        self.assertAlmostEqual(track.phase[43], math.pi)
+        self.assertAlmostEqual(track.phase[73], 0.0)
+        self.assertTrue(np.all(track.phase_advance >= 0.0))
+
     def test_adjacent_trailing_bilateral_margin_extends_at_zero_advance(self) -> None:
         contact = np.zeros((64, 4), dtype=bool)
         contact[3:, 0] = True
