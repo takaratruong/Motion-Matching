@@ -57,21 +57,33 @@ def select(
     # exotic behaviors visible even after the source sweep is scaled up.
     strata: tuple[tuple[str, int, Predicate], ...] = (
         (
-            "up_extreme_travel",
+            "up_fixed_facing_oblique",
             2,
+            lambda r: r["traversal"] == "up"
+            and "travel_" in str(r["mode"]),
+        ),
+        (
+            "down_fixed_facing_oblique",
+            2,
+            lambda r: r["traversal"] == "down"
+            and "travel_" in str(r["mode"]),
+        ),
+        (
+            "up_extreme_lane",
+            1,
             lambda r: r["traversal"] == "up"
             and any(
                 value in str(r["mode"])
-                for value in ("diagonal_hard", "travel_", "lane_")
+                for value in ("diagonal_hard", "lane_")
             ),
         ),
         (
-            "down_extreme_travel",
-            2,
+            "down_extreme_lane",
+            1,
             lambda r: r["traversal"] == "down"
             and any(
                 value in str(r["mode"])
-                for value in ("diagonal_hard", "travel_", "lane_")
+                for value in ("diagonal_hard", "lane_")
             ),
         ),
         (
@@ -132,14 +144,14 @@ def select(
         ),
         (
             "up_backward_diagonal",
-            4,
+            3,
             lambda r: r["traversal"] == "up"
             and r["source_kind"] == "temporal_reverse"
             and "diagonal" in str(r["mode"]),
         ),
         (
             "down_backward_diagonal",
-            4,
+            3,
             lambda r: r["traversal"] == "down"
             and r["source_kind"] == "temporal_reverse"
             and "diagonal" in str(r["mode"]),
