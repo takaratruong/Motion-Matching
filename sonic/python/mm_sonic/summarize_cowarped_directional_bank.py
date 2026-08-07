@@ -120,6 +120,12 @@ def _local_route_data(
     intended_xy = intended[:, :2] - intended[0, :2]
     reference_xy = actual_xy
     report_path = Path(str(row.get("report", "")))
+    if not report_path.is_file():
+        manifest_path = Path(str(row.get("manifest", "")))
+        source_metadata = manifest_path.parent.parent / "source.json"
+        if source_metadata.is_file():
+            source_row = json.loads(source_metadata.read_text())
+            report_path = Path(str(source_row.get("report", "")))
     if report_path.is_file():
         report = json.loads(report_path.read_text())
         source_path = Path(str(report.get("source_motion", "")))

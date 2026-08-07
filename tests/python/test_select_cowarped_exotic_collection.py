@@ -1,6 +1,9 @@
 import unittest
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
-from mm_sonic.select_cowarped_exotic_collection import select
+from mm_sonic.select_cowarped_exotic_collection import load_rows, select
 
 
 def _row(bank: str, clip: int, source_mode: str, compound_mode: str) -> dict:
@@ -35,6 +38,54 @@ class ExoticCollectionSelectionTest(unittest.TestCase):
             key = (str(row["clip_family"]), int(row["clip_index"]))
             physical_counts[key] = physical_counts.get(key, 0) + 1
         self.assertLessEqual(max(physical_counts.values()), 2)
+
+    def test_loads_direct_directional_selection_as_direct_event(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            motion = root / "motion.npz"
+            import numpy as np
+
+            np.savez(
+                motion,
+                root_position_world=np.zeros((10, 3), dtype=np.float32),
+                fps=np.asarray(10.0, dtype=np.float32),
+            )
+            manifest = root / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "pilots": [
+                            {
+                                "label": "extreme",
+                                "motion": str(motion),
+                                "directional_report": str(root / "report.json"),
+                            }
+                        ]
+                    }
+                )
+            )
+            selection = root / "selection.json"
+            selection.write_text(
+                json.dumps(
+                    {
+                        "selections": [
+                            {
+                                "pilot": f"{manifest}#extreme",
+                                "clip_index": 7,
+                                "mode": "travel_extreme_left",
+                                "traversal": "up",
+                            }
+                        ]
+                    }
+                )
+            )
+
+            rows = load_rows((("fixed_extreme", selection),))
+
+        self.assertEqual(rows[0]["source_mode"], "travel_extreme_left")
+        self.assertEqual(rows[0]["compound_mode"], "direct")
+        self.assertEqual(rows[0]["clip_traversal"], "up")
+        self.assertEqual(rows[0]["report"], str(root / "report.json"))
 
 
 if __name__ == "__main__":

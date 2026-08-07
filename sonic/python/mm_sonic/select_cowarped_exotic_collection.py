@@ -39,16 +39,48 @@ def load_rows(
     seen: set[str] = set()
     for name, path in banks:
         payload = json.loads(path.read_text())
-        values = payload.get("rows") if isinstance(payload, dict) else payload
+        values = (
+            payload.get("rows", payload.get("selections"))
+            if isinstance(payload, dict)
+            else payload
+        )
         if not isinstance(values, list):
             raise ValueError(f"{path}: expected a row list")
         for value in values:
             row = dict(value)
+            # Direct fixed-terrain directional exports use ``mode`` rather
+            # than the source/compound pair used by retimed co-warps.  Keep
+            # them in the same balanced collection as an explicit direct
+            # event so extreme oblique/side-on ascents are not discarded.
+            if "source_mode" not in row and "mode" in row:
+                row["source_mode"] = str(row["mode"])
+            row.setdefault("compound_mode", "direct")
             pilot = str(row["pilot"])
             if pilot in seen:
                 continue
             seen.add(pilot)
             row["collection_bank"] = str(name)
+            if "motion" not in row:
+                manifest_text, label = pilot.rsplit("#", 1)
+                manifest_path = Path(manifest_text)
+                manifest = json.loads(manifest_path.read_text())
+                matches = [
+                    candidate
+                    for candidate in manifest["pilots"]
+                    if str(candidate["label"]) == label
+                ]
+                if len(matches) != 1:
+                    raise ValueError(f"cannot resolve selected pilot {pilot}")
+                matched = dict(matches[0])
+                row["motion"] = str(matched["motion"])
+                row["manifest"] = str(manifest_path)
+                if "directional_report" in matched:
+                    row["report"] = str(matched["directional_report"])
+            row.setdefault(
+                "clip_family",
+                "stairs500" if "stairs500" in pilot else "unknown",
+            )
+            row.setdefault("clip_traversal", row.get("traversal", "unknown"))
             row["duration_s"] = _duration_s(row)
             if float(row["duration_s"]) < float(minimum_duration_s):
                 continue
@@ -57,8 +89,11 @@ def load_rows(
 
 
 def _physical_source(row: dict[str, object]) -> tuple[str, int]:
+    family = str(row.get("clip_family", "unknown"))
+    if family.startswith("stairs500"):
+        family = "stairs500"
     return (
-        str(row.get("clip_family", "unknown")),
+        family,
         int(row["clip_index"]),
     )
 
@@ -131,6 +166,73 @@ def select(
     return selected
 
 
+def plot_routes(rows: list[dict[str, object]], output: Path) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    from mm_sonic.summarize_cowarped_directional_bank import _local_route_data
+
+    banks = sorted({str(row["collection_bank"]) for row in rows})
+    if not banks:
+        return
+    colors = {
+        "stop_restart": "tab:blue",
+        "reverse": "tab:orange",
+        "bounce": "tab:green",
+    }
+    figure, axes = plt.subplots(
+        1,
+        len(banks),
+        figsize=(6.0 * len(banks), 5.5),
+        squeeze=False,
+    )
+    for axis, bank in zip(axes.flat, banks, strict=False):
+        subset = [row for row in rows if str(row["collection_bank"]) == bank]
+        for row in subset:
+            actual, intended, _facing = _local_route_data(row)
+            mode = str(row["compound_mode"])
+            axis.plot(
+                intended[:, 0],
+                intended[:, 1],
+                color="0.55",
+                alpha=0.10,
+                linewidth=0.6,
+                linestyle="--",
+            )
+            axis.plot(
+                actual[:, 0],
+                actual[:, 1],
+                color=colors.get(mode, "tab:purple"),
+                alpha=0.30,
+                linewidth=0.9,
+            )
+        axis.set_title(f"{bank} (n={len(subset)})")
+        axis.set_xlabel("forward along source terrain (m)")
+        axis.set_ylabel("lateral (m)")
+        axis.set_aspect("equal", adjustable="datalim")
+        axis.axhline(0.0, color="black", alpha=0.15, linewidth=0.6)
+        axis.grid(alpha=0.12)
+    handles = [
+        Line2D((0,), (0,), color=color, label=mode.replace("_", "/"))
+        for mode, color in colors.items()
+    ]
+    handles.append(
+        Line2D((0,), (0,), color="0.55", linestyle="--", label="intended")
+    )
+    figure.legend(handles=handles, loc="lower center", ncol=len(handles))
+    figure.suptitle(
+        "Balanced exact-gated terrain collection\n"
+        "solid: realized G1 root; dashed gray: intended route"
+    )
+    figure.tight_layout(rect=(0.0, 0.08, 1.0, 0.94))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output, dpi=180)
+    plt.close(figure)
+
+
 def write_selection(
     rows: list[dict[str, object]],
     output: Path,
@@ -152,9 +254,20 @@ def write_selection(
         "by_compound_mode": dict(sorted(Counter(str(row["compound_mode"]) for row in rows).items())),
         "by_traversal": dict(sorted(Counter(str(row.get("clip_traversal", "unknown")) for row in rows).items())),
         "distinct_physical_source_count": len({_physical_source(row) for row in rows}),
+        "duration_s": {
+            "minimum": min((float(row["duration_s"]) for row in rows), default=0.0),
+            "median": float(
+                np.median([float(row["duration_s"]) for row in rows])
+            )
+            if rows
+            else 0.0,
+            "maximum": max((float(row["duration_s"]) for row in rows), default=0.0),
+        },
+        "routes_figure": str(destination.with_suffix(".routes.png")),
         "selections": rows,
     }
     destination.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    plot_routes(rows, destination.with_suffix(".routes.png"))
     return payload
 
 

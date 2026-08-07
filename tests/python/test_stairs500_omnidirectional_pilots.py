@@ -128,6 +128,44 @@ class StairDirectionalProfileTest(unittest.TestCase):
         self.assertAlmostEqual(profile.maximum_path_angle_deg, 38.0, places=3)
         self.assertGreater(float(np.ptp(profile.lateral_offset_m)), 0.5)
 
+    def test_fixed_terrain_extreme_travel_reaches_fifty_degrees(self):
+        profile = build_path_profile(
+            "travel_extreme_left",
+            np.linspace(0.0, 1.0, 2001),
+            active_length_m=4.0,
+            maximum_amplitude_m=2.0,
+        )
+        self.assertAlmostEqual(profile.maximum_path_angle_deg, 50.0, places=3)
+        np.testing.assert_array_equal(profile.pose_yaw_offset_rad, 0.0)
+        np.testing.assert_array_equal(profile.facing_yaw_offset_rad, 0.0)
+
+    def test_fixed_terrain_side_on_profile_reaches_seventy_five_degrees(self):
+        profile = build_path_profile(
+            "face_side_on_right",
+            np.linspace(0.0, 1.0, 2001),
+            active_length_m=4.0,
+            maximum_amplitude_m=2.0,
+        )
+        np.testing.assert_array_equal(profile.lateral_offset_m, 0.0)
+        self.assertAlmostEqual(
+            float(np.degrees(np.min(profile.facing_yaw_offset_rad))),
+            -75.0,
+            places=3,
+        )
+
+    def test_extreme_approach_turns_then_holds_its_new_lane(self):
+        progress = np.linspace(0.0, 1.0, 2001)
+        profile = build_path_profile(
+            "approach_extreme_left",
+            progress,
+            active_length_m=4.0,
+            maximum_amplitude_m=2.0,
+        )
+        self.assertAlmostEqual(profile.maximum_path_angle_deg, 50.0, places=3)
+        second_half = profile.lateral_offset_m[progress >= 0.5]
+        self.assertLess(float(np.ptp(second_half)), 1.0e-9)
+        self.assertGreater(float(second_half[0]), 0.0)
+
     def test_cowarp_held_lane_dwells_before_returning(self):
         progress = np.linspace(0.0, 1.0, 1201)
         profile = build_path_profile(

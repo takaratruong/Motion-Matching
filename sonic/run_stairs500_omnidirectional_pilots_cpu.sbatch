@@ -18,6 +18,7 @@ CLIP_LIST=${STAIRS500_OMNI_CLIPS:-364,6,343,207}
 MODE_LIST=${STAIRS500_OMNI_MODES:-}
 INCLUDE_REVERSE=${STAIRS500_OMNI_INCLUDE_REVERSE:-0}
 INCLUDE_TEMPORAL_REVERSE=${STAIRS500_OMNI_INCLUDE_TEMPORAL_REVERSE:-0}
+AMPLITUDE=${STAIRS500_OMNI_AMPLITUDE_M:-0.4}
 
 # Colons are accepted as an sbatch --export-safe list delimiter.  Commas in an
 # --export value are parsed by Slurm as new variable declarations.
@@ -53,6 +54,7 @@ fi
     --selection "${SELECTION}" \
     --clip-index "${CLIP_INDEX}" \
     "${SOURCE_ARGUMENTS[@]}" \
+    --maximum-amplitude-m "${AMPLITUDE}" \
     --maximum-stance-sole-target-error-m 0.010 \
     "${MODE_ARGUMENTS[@]}" \
     --output "${OUTPUT}/clip_${CLIP_INDEX}"

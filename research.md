@@ -1905,9 +1905,11 @@ velocity labels plus facing and exact zero-stick holds.  The first 24-motion
 stair subset produces 120 pilots, of which 112 pass the strict gate: 17
 bounces, 49 reversals, and 46 stop/restarts across all sixteen spatial command
 families.  They use 13 physical stair sources, have zero forbidden-body
-penetration, and reach 4.923 mm maximum foot penetration.  The full 100-source
-compound expansion and the 149-source curb/slope paired sweep remain active;
-their final counts must replace, not be inferred from, partial outputs.
+penetration, and reach 4.923 mm maximum foot penetration.  The completed
+100-source expansion attempts 422 event motions and strictly admits 370: 47
+bounces, 178 reversals, and 145 stop/restarts.  Those span all sixteen source
+command families, 14 physical stairs, 196 ascents and 174 descents; maximum
+foot penetration is 4.985 mm and forbidden-body penetration is zero.
 
 A deliberately stronger stair canary adds 38-degree hard diagonals, held lane
 changes, two-stage left/right lane changes, and slaloms whose travel and facing
@@ -1917,10 +1919,67 @@ envelope reaches 0.857 m of lateral range and 12 degrees of independent facing;
 maximum foot penetration is 4.662 mm and forbidden-body penetration remains
 zero.  Dense side and overhead renders of the hard diagonal and held-lane cases
 show continuous, grounded traversal rather than the earlier root-only slide.
-The 32-source scale and its stop/reverse/bounce compound pass remain active.
+The 32-source scale and its stop/reverse/bounce compound pass are complete.
+
+That 32-source stronger scale accepts 18 motions from eight physical stair
+sources: all eight hard-diagonal, held-lane, step-change, and counter-facing
+families are present, with six ascents and twelve descents.  It retains the
+38-degree/0.857 m envelope, reaches 12 degrees of independent facing, and has
+4.783 mm maximum foot penetration with zero forbidden-body penetration.
+Its compound pass attempts 63 motions and strictly accepts 50: four bounces,
+26 reversals, and 20 stop/restarts from six physical stairs, split as 19
+ascents and 31 descents.  All eight stronger source command families remain
+represented after the exact retiming audit.
+
+A complementary hard-crab tier explicitly separates the two sticks.  Its
+diagonal path reaches 24 degrees while a 24-degree opposing facing command
+keeps the pelvis closer to stair-forward at peak obliquity; straight-path
+facing weaves reach +/-20 degrees.  Scaling over the fifteen previously useful
+stair sources accepts twelve motions from four physical stairs, evenly split
+between ascent and descent and covering all four crab/facing families.  The
+maximum lateral range is 0.489 m, maximum foot penetration is 4.746 mm, and
+forbidden-body penetration is zero.  Side and overhead renders of the crab
+descent and its stop/restart retime show no visible pop or terrain crossing.
+The strict crab compound pass retains 13/16 event motions: seven reversals and
+six stop/restarts across all four crab/facing families.  Twelve are descents
+and one is an ascent; rejected ascent retimes are not forced into the bank.
 
 The rough-terrain 0.40 m lane tier accepted 33 direct paired motions from 21
 physical curb/slope sources.  Its compound pass attempted 167 event motions
 and strictly admitted 143: 19 bounces, 69 reversals, and 55 stop/restarts from
 20 physical sources.  The bank contains 24 uphill and 119 round-trip examples,
 with 4.794 mm maximum foot penetration and zero forbidden-body penetration.
+
+The broader 0.25 m curb/slope directional pass admits 194 motions from 33
+physical sources and covers every one of the sixteen velocity/facing command
+families.  Its envelope reaches 26.7 degrees of path angle, 0.50 m lateral
+range, and 10 degrees independent facing; maximum foot penetration is 4.991
+mm with zero forbidden-body penetration.  Rather than recomputing its already
+completed first compound half, review rows 32--63 were retimed separately.
+That novel half strictly admits 141/160 events from 21 physical sources: 19
+bounces, 67 reversals, and 55 stop/restarts, including 14 uphill and 127
+round-trip motions.  Its maximum foot penetration is 4.909 mm and forbidden
+body penetration is zero.
+
+Finally, an unchanged-stair extreme-entry probe distinguishes a true oblique
+approach from a paired bent-stair co-warp.  Full-stair 50-degree traversals and
+75-degree side-on pelvis turns were mechanically or collision rejected and
+remain negative controls.  A more realistic profile enters a neighbouring
+lane at 50 degrees and then continues straight up the original staircase.
+Clip 473 admits the native left ascent and its exact right mirror: both have
+0.337 m lateral range, 2.21 mm maximum stance-run drift, 4.78 mm maximum
+stance target error, 4.822 mm maximum foot penetration, and zero forbidden-body
+penetration.  These are retained only after side and overhead visual review.
+
+The resulting balanced collection is
+`terrain_maneuver_collection_v1/balanced_exotic200_v1`.  It contains exactly
+200 clips from 66 physical terrain sources with a five-clip-per-source cap and
+a seven-second minimum duration (median 10.4 s).  Traversal coverage is 65
+ascents, 55 descents, and 80 curb/slope round trips.  Timing coverage is 58
+bounces, 70 reversals, 70 stop/restarts, plus the symmetric pair of direct
+50-degree fixed-stair entries.  Spatial coverage also explicitly retains hard
+crab/facing, hard diagonal, lane-hold, step-change, counter-facing slalom, and
+zigzag families instead of filling the quota with basic straight climbs.
+`selection.routes.png` plots every realized and intended route by source bank,
+and `sonic_bundle` packages all 200 exact motion/terrain pairs for tracker
+fine-tuning and noisy collection.

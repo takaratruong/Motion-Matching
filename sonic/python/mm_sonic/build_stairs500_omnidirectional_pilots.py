@@ -178,6 +178,38 @@ def _profile_knots(
         "travel_medium_right": ((1.0, -1.0), 24.0, 0.0, 0.0, 0.0),
         "travel_hard_left": ((-1.0, 1.0), 32.0, 0.0, 0.0, 0.0),
         "travel_hard_right": ((1.0, -1.0), 32.0, 0.0, 0.0, 0.0),
+        # Fixed-terrain stress cases.  Unlike the paired co-warps below, the
+        # staircase is not bent under the character: these really traverse
+        # the source treads at up to fifty degrees while the pelvis keeps its
+        # authored stair-forward heading.
+        "travel_extreme_left": ((-1.0, 1.0), 50.0, 0.0, 0.0, 0.0),
+        "travel_extreme_right": ((1.0, -1.0), 50.0, 0.0, 0.0, 0.0),
+        # The matching body-aligned stress cases turn the pelvis with travel
+        # while retaining the authored foot yaw.  Exact IK/contact/collision
+        # gates decide whether an individual staircase is wide enough.
+        "diagonal_extreme_left": ((-1.0, 1.0), 50.0, 0.0, 1.0, 0.0),
+        "diagonal_extreme_right": ((1.0, -1.0), 50.0, 0.0, 1.0, 0.0),
+        # A fifty-degree *approach* is less pathological than traversing the
+        # complete staircase at fifty degrees.  These enter a neighbouring
+        # lane during the first half of the terrain passage, then continue
+        # straight for the remaining steps.  The unchanged mesh still makes
+        # this a real oblique stair entry rather than a bent-stair co-warp.
+        "approach_extreme_left": ((0.0, 1.0, 1.0), 50.0, 0.0, 0.0, 0.0),
+        "approach_extreme_right": ((0.0, -1.0, -1.0), 50.0, 0.0, 0.0, 0.0),
+        "approach_turn_extreme_left": (
+            (0.0, 1.0, 1.0),
+            50.0,
+            0.0,
+            1.0,
+            0.0,
+        ),
+        "approach_turn_extreme_right": (
+            (0.0, -1.0, -1.0),
+            50.0,
+            0.0,
+            1.0,
+            0.0,
+        ),
         "lane_left": ((0.0, 1.0), 20.0, 0.0, 1.0, 0.0),
         "lane_right": ((0.0, -1.0), 20.0, 0.0, 1.0, 0.0),
         "lane_gentle_left": ((0.0, 1.0), 10.0, 0.0, 1.0, 0.0),
@@ -224,6 +256,11 @@ def _profile_knots(
         "face_micro_right": ((0.0, 0.0), 0.0, -8.0, 0.0, 0.0),
         "face_hard_left": ((0.0, 0.0), 0.0, 45.0, 0.0, 0.0),
         "face_hard_right": ((0.0, 0.0), 0.0, -45.0, 0.0, 0.0),
+        # Near-side-on stair climbing on the unchanged source staircase.  The
+        # path remains uphill while the pelvis turns seventy-five degrees in
+        # the middle of the stair passage and eases back at the landings.
+        "face_side_on_left": ((0.0, 0.0), 0.0, 75.0, 0.0, 0.0),
+        "face_side_on_right": ((0.0, 0.0), 0.0, -75.0, 0.0, 0.0),
         # These profiles exercise a genuinely independent second stick.  The
         # path bends one way while the pelvis faces the other; the feet retain
         # their authored stair yaw so variants remain mechanically auditable.
