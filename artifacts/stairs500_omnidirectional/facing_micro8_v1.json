@@ -1,0 +1,15 @@
+{
+  "schema": "stairs500-directional-source-selection/v1",
+  "purpose": "Targeted low-pop independent-facing stair variants after 12-degree facing twists exceeded the joint-step gate.",
+  "clip_indices": [364, 357, 421, 473, 485, 385, 301, 207],
+  "modes": [
+    "face_micro_left",
+    "face_micro_right",
+    "counterface_micro_left",
+    "counterface_micro_right",
+    "facing_weave_micro_left_right",
+    "facing_weave_micro_right_left"
+  ],
+  "include_temporal_reverse": true,
+  "exact_mesh_audit_required": true
+}

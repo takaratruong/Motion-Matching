@@ -180,6 +180,8 @@ def _profile_knots(
         "face_right": ((0.0, 0.0), 0.0, -28.0, 0.0, 0.0),
         "face_soft_left": ((0.0, 0.0), 0.0, 12.0, 0.0, 0.0),
         "face_soft_right": ((0.0, 0.0), 0.0, -12.0, 0.0, 0.0),
+        "face_micro_left": ((0.0, 0.0), 0.0, 8.0, 0.0, 0.0),
+        "face_micro_right": ((0.0, 0.0), 0.0, -8.0, 0.0, 0.0),
         "face_hard_left": ((0.0, 0.0), 0.0, 45.0, 0.0, 0.0),
         "face_hard_right": ((0.0, 0.0), 0.0, -45.0, 0.0, 0.0),
         # These profiles exercise a genuinely independent second stick.  The
@@ -187,10 +189,26 @@ def _profile_knots(
         # their authored stair yaw so variants remain mechanically auditable.
         "counterface_left": ((-1.0, 1.0), 10.0, -10.0, 0.0, 0.0),
         "counterface_right": ((1.0, -1.0), 10.0, 10.0, 0.0, 0.0),
+        "counterface_micro_left": ((-1.0, 1.0), 8.0, -8.0, 0.0, 0.0),
+        "counterface_micro_right": ((1.0, -1.0), 8.0, 8.0, 0.0, 0.0),
         # A facing weave changes body direction twice while the stair path is
         # unchanged.  Its non-sinusoidal facing curve is supplied below.
         "facing_weave_left_right": ((0.0, 0.0), 0.0, 10.0, 0.0, 0.0),
         "facing_weave_right_left": ((0.0, 0.0), 0.0, 10.0, 0.0, 0.0),
+        "facing_weave_micro_left_right": (
+            (0.0, 0.0),
+            0.0,
+            8.0,
+            0.0,
+            0.0,
+        ),
+        "facing_weave_micro_right_left": (
+            (0.0, 0.0),
+            0.0,
+            8.0,
+            0.0,
+            0.0,
+        ),
         # A longer weave changes travel direction twice while the feet remain
         # world-locked during every detected stance run.
         "slalom_left_right": (
@@ -295,6 +313,8 @@ def build_path_profile(
     facing_knots = {
         "facing_weave_left_right": (0.0, 1.0, -1.0, 0.0),
         "facing_weave_right_left": (0.0, -1.0, 1.0, 0.0),
+        "facing_weave_micro_left_right": (0.0, 1.0, -1.0, 0.0),
+        "facing_weave_micro_right_left": (0.0, -1.0, 1.0, 0.0),
     }.get(mode)
     if facing_knots is None:
         facing_window = np.sin(np.pi * u) ** 2
