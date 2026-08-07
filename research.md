@@ -1688,13 +1688,22 @@ fine-tune gives 4/6 strict passes and 5/6 full survivors.  All six saved physica
 rollouts pass the exact geometry audit with zero forbidden-body penetration and
 at most 6.02 mm foot contact.  Continuing to iteration 100 falls to 3/6, so the
 universal run must evaluate early checkpoints rather than assume longer is
-better.  A separate four-motion fixed-facing canary covers 24-degree ascent,
-backward 24-degree descent, 32-degree descent, and a second 24-degree descent.
-The first A5000 attempt (`16552280`) was canceled after spending ten minutes in
-an uninterruptible shared-filesystem read before allocating GPU memory.  Its
-incomplete output is preserved with a `stalled_move3_job16552280` suffix.  The
-replacement training/eval jobs are `16553721`/`16553722` on one move4 L40;
-video and exact-geometry jobs are already dependent on the evaluation.
+better.  A separate four-motion fixed-facing canary covers oblique ascent,
+backward oblique descent, and both lateral polarities.  Its 50-iteration
+checkpoint survives only 2/4 motions.  At iteration 100 all 4/4 survive 499
+frames and all four pass the exact geometry audit with zero forbidden-body
+penetration.  Maximum foot contact is 5.46 mm.  The backward clip still has a
+906.6 mm peak MPJPE spike, so survival alone is not being mistaken for faithful
+tracking.
+
+The four-motion canary is intentionally not the visual proof for the expanded
+command space.  A separate 32-motion qualification bundle is materialized at
+`omnidirectional_sweep28_post_v1/sonic_bundle_exotic_review32_v1`.  It contains
+paired fixed-facing obliques, lane changes, independent-facing motions, turning
+slaloms and zigzags, native diagonals, backward diagonals, ascents, descents,
+and exact left/right mirrors.  A 100-iteration one-A5000 physical qualification
+and its deterministic evaluation/render/audit chain are jobs
+`16554664`--`16554667`.
 
 The universal SONIC bundle intentionally uses all 856 exact-accepted motions,
 not the 382-motion gold-only subset: the visually clean largest-angle examples
@@ -1713,7 +1722,8 @@ through a larger motion library: environment `k` remains bound to motion and
 terrain `k`.  Consequently, a nominal 192-environment run over this bundle
 would only train the leading 192 examples, regardless of iteration count.  The
 universal launcher derives `num_envs` from `clips.json` and uses one paired
-environment for each of the 1,118 clips.  Job `16553725` is a five-iteration,
-single-L40 memory preflight for this exact coverage.  If it does not fit, the
+environment for each of the 1,118 clips.  Job `16554062` is a five-iteration,
+single-L40 memory preflight for this exact coverage; the 400-iteration job
+`16554063` depends on it.  If it does not fit, the
 fallback is explicit balanced bundles no larger than the environment count,
 not a partial run mislabeled as full-bank training.
