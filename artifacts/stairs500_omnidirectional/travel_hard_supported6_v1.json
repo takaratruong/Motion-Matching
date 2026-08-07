@@ -1,0 +1,11 @@
+{
+  "schema": "stairs500-directional-source-selection/v1",
+  "archive": "/move/data/terrain-aware/motion-matching/grail-stairs500-clean-50hz-v1.zarr",
+  "selection": "/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/selected200_v1.json",
+  "purpose": "Attempt 32-degree fixed-facing oblique motion only on sources whose 24-degree fixed-facing variant already passed the exact mechanical and mesh audit. Both lateral polarities and temporal reversal are included.",
+  "clip_indices": [8, 125, 131, 136, 301, 347],
+  "modes": ["travel_hard_left", "travel_hard_right"],
+  "include_temporal_reverse": true,
+  "exact_mesh_audit_required": true,
+  "include_mirror_after_audit": true
+}

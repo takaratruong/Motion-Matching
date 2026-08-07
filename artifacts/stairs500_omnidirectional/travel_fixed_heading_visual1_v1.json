@@ -3,5 +3,10 @@
     "label": "travel_medium_fixed_heading_clip473",
     "quality_tier": "silver",
     "report": "/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/omnidirectional_sweep28_v1/clip_473/clip_473_native_travel_medium_left/report.json"
+  },
+  {
+    "label": "travel_hard_fixed_heading_clip143",
+    "quality_tier": "silver",
+    "report": "/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/omnidirectional_sweep28_v1/clip_143/clip_143_native_travel_hard_left/report.json"
   }
 ]
