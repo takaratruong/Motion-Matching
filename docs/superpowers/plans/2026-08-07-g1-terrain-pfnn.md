@@ -404,7 +404,7 @@ PYTHONPATH=sonic/python /home/ubuntu/miniconda3/bin/python \
   -m mm_sonic.terrain_pfnn.sources \
   --grail-root /home/ubuntu/datasets/GRAIL \
   --lafan-root /home/ubuntu/.cache/g1-lafan-flat/g1 \
-  --model-path /home/ubuntu/projects/gear-sonic-pinned-60de0df/motionbricks/assets/skeletons/g1/g1.xml \
+  --model-path /home/ubuntu/projects/gear-sonic-pinned-60de0df/motionbricks/assets/skeletons/g1/g1_29dof.xml \
   --inspect-one
 ```
 
@@ -551,7 +551,7 @@ PYTHONPATH=sonic/python /home/ubuntu/miniconda3/bin/python \
   -m mm_sonic.terrain_pfnn.phase \
   --robot /home/ubuntu/datasets/GRAIL/data/slope/robot/terrain_slopes__slope_113__004.pkl \
   --terrain /home/ubuntu/datasets/GRAIL/data/slope/object_usd/terrain_slopes__slope_113__004.usd \
-  --model-path /home/ubuntu/projects/gear-sonic-pinned-60de0df/motionbricks/assets/skeletons/g1/g1.xml
+  --model-path /home/ubuntu/projects/gear-sonic-pinned-60de0df/motionbricks/assets/skeletons/g1/g1_29dof.xml
 ```
 
 Expected: tests pass and audit JSON reports finite alternating phase coverage plus every rejected span reason.
@@ -762,7 +762,7 @@ PYTHONPATH=sonic/python /home/ubuntu/miniconda3/bin/python \
   -m mm_sonic.build_terrain_pfnn_dataset \
   --grail-root /home/ubuntu/datasets/GRAIL \
   --lafan-root /home/ubuntu/.cache/g1-lafan-flat/g1 \
-  --model-path /home/ubuntu/projects/gear-sonic-pinned-60de0df/motionbricks/assets/skeletons/g1/g1.xml \
+  --model-path /home/ubuntu/projects/gear-sonic-pinned-60de0df/motionbricks/assets/skeletons/g1/g1_29dof.xml \
   --output sonic/runs/terrain-pfnn-v1/canary-dataset \
   --terrain-family-limit 2
 ```
@@ -920,7 +920,7 @@ PYTHONPATH=sonic/python sonic/.torch-mm-venv/bin/python \
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=sonic/python sonic/.torch-mm-venv/bin/python \
   -m mm_sonic.train_terrain_pfnn \
   --dataset sonic/runs/terrain-pfnn-v1/canary-dataset/manifest.json \
-  --model-path /home/ubuntu/projects/gear-sonic-pinned-60de0df/motionbricks/assets/skeletons/g1/g1.xml \
+  --model-path /home/ubuntu/projects/gear-sonic-pinned-60de0df/motionbricks/assets/skeletons/g1/g1_29dof.xml \
   --output sonic/runs/terrain-pfnn-v1/pipeline-overfit \
   --overfit-samples 256 \
   --steps 4000 \
@@ -1171,7 +1171,7 @@ PYTHONPATH=sonic/python /home/ubuntu/miniconda3/bin/python \
   -m mm_sonic.build_terrain_pfnn_dataset \
   --grail-root /home/ubuntu/datasets/GRAIL \
   --lafan-root /home/ubuntu/.cache/g1-lafan-flat/g1 \
-  --model-path /home/ubuntu/projects/gear-sonic-pinned-60de0df/motionbricks/assets/skeletons/g1/g1.xml \
+  --model-path /home/ubuntu/projects/gear-sonic-pinned-60de0df/motionbricks/assets/skeletons/g1/g1_29dof.xml \
   --output sonic/runs/terrain-pfnn-v1/full-dataset
 ```
 
@@ -1184,7 +1184,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 PYTHONPATH=sonic/python \
   sonic/.torch-mm-venv/bin/torchrun --standalone --nproc_per_node=8 \
   -m mm_sonic.train_terrain_pfnn \
   --dataset sonic/runs/terrain-pfnn-v1/full-dataset/manifest.json \
-  --model-path /home/ubuntu/projects/gear-sonic-pinned-60de0df/motionbricks/assets/skeletons/g1/g1.xml \
+  --model-path /home/ubuntu/projects/gear-sonic-pinned-60de0df/motionbricks/assets/skeletons/g1/g1_29dof.xml \
   --output sonic/runs/terrain-pfnn-v1/full-training \
   --epochs 20 \
   --batch-size-per-gpu 32 \
