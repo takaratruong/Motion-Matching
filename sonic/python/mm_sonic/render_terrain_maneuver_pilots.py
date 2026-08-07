@@ -69,6 +69,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--height", type=int, default=540)
     parser.add_argument("--frame-stride", type=int, default=1)
     parser.add_argument(
+        "--view",
+        choices=("default", "side", "overhead"),
+        default="default",
+        help="camera framing; side/overhead expose lateral terrain motion",
+    )
+    parser.add_argument(
         "--hold-window-context-frames",
         type=int,
         help="render only this many full-rate frames before and after the hold",
@@ -132,6 +138,26 @@ def main(argv: list[str] | None = None) -> int:
                     spacing_m=spacing,
                     origin_xy=origin,
                 ).index
+        path_extent = float(
+            np.max(np.ptp(np.asarray(motion.root_position_world)[:, :2], axis=0))
+        )
+        camera: dict[str, object] = {}
+        if arguments.view == "side":
+            camera = {
+                "camera_azimuth_offset_deg": 90.0,
+                "camera_elevation_deg": -16.0,
+                "camera_distance": 2.8,
+                "camera_follow_root": True,
+            }
+        elif arguments.view == "overhead":
+            camera = {
+                "camera_azimuth_offset_deg": 90.0,
+                "camera_elevation_deg": -68.0,
+                "camera_distance": float(
+                    np.clip(1.10 * path_extent + 1.6, 2.8, 5.2)
+                ),
+                "camera_follow_root": False,
+            }
         receipt = render_stitched_motion(
             motion,
             target_mesh=terrain,
@@ -141,6 +167,7 @@ def main(argv: list[str] | None = None) -> int:
             width=arguments.width,
             height=arguments.height,
             frame_stride=arguments.frame_stride,
+            **camera,
         )
         results.append(
             {
@@ -148,6 +175,7 @@ def main(argv: list[str] | None = None) -> int:
                 "video": str(output),
                 "source_frame_start": source_start,
                 "source_frame_stop": source_stop,
+                "view": arguments.view,
                 **receipt,
             }
         )

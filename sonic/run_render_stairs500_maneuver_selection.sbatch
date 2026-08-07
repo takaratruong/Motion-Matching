@@ -15,6 +15,7 @@ PROJECT=/move/u/bodow/Projects/Motion-Matching-takara-corpus
 SELECTION=${STAIRS500_MANEUVER_SELECTION:?set STAIRS500_MANEUVER_SELECTION}
 OUTPUT=${STAIRS500_MANEUVER_REVIEW_OUTPUT:?set STAIRS500_MANEUVER_REVIEW_OUTPUT}
 PYTHON=/move/u/bodow/Projects/reference-nvidia-groot-wbc/.venv_motionbricks/bin/python
+VIEW=${STAIRS500_MANEUVER_REVIEW_VIEW:-side}
 
 export PYTHONPATH="${PROJECT}/sonic/python"
 export OMP_NUM_THREADS=1
@@ -36,4 +37,5 @@ rank=$(printf '%03d' "${SLURM_ARRAY_TASK_ID}")
     --output-dir "${OUTPUT}/rank_${rank}" \
     --width 480 \
     --height 270 \
-    --frame-stride 2
+    --frame-stride 2 \
+    --view "${VIEW}"
