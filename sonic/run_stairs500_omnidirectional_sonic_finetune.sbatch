@@ -39,16 +39,21 @@ if [[ -e "${OUTPUT}" ]]; then
     exit 9
 fi
 
-NUM_ENVS=$(
+CLIP_COUNT=$(
     /move/u/bodow/miniconda3/envs/cloc3/bin/python -c \
         'import json,sys; print(len(json.load(open(sys.argv[1]))))' \
         "${BUNDLE}/clips.json"
 )
-if (( NUM_ENVS < 1 )); then
+if (( CLIP_COUNT < 1 )); then
     echo "empty bundle: ${BUNDLE}" >&2
     exit 8
 fi
-echo "paired coverage: ${NUM_ENVS} clips -> ${NUM_ENVS} environments"
+# PPO splits one environment batch across four minibatches.  Round upward so
+# every paired clip is represented while keeping that split exact; any extra
+# environments wrap to the first clips rather than omitting the tail.
+NUM_MINI_BATCHES=${STAIRS500_OMNI_NUM_MINI_BATCHES:-4}
+NUM_ENVS=$(( (CLIP_COUNT + NUM_MINI_BATCHES - 1) / NUM_MINI_BATCHES * NUM_MINI_BATCHES ))
+echo "paired coverage: ${CLIP_COUNT} clips -> ${NUM_ENVS} environments (${NUM_ENVS}-${CLIP_COUNT} wrapped repeats)"
 
 source /move/u/justingu/miniconda3/etc/profile.d/conda.sh
 conda activate env_isaaclab

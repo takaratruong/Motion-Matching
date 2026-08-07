@@ -1703,7 +1703,20 @@ paired fixed-facing obliques, lane changes, independent-facing motions, turning
 slaloms and zigzags, native diagonals, backward diagonals, ascents, descents,
 and exact left/right mirrors.  A 100-iteration one-A5000 physical qualification
 and its deterministic evaluation/render/audit chain are jobs
-`16554664`--`16554667`.
+`16554664`--`16554667`.  The deterministic result is 21/32 full survivors.
+All 32 saved episodes pass the exact geometry audit with zero forbidden-body
+contact; maximum foot contact is 7.82 mm.  Turning slaloms/zigzags, native
+diagonals, forward lane change, fixed-facing travel, and a facing weave survive.
+The 11 failures cluster in backward obliques and counter-facing cases.  The
+intended-versus-physical route sheet is
+`exotic_review32_a5000_ft_step0100_routes_v1.png`.
+
+A diagnostic 100-iteration continuation on only those 11 failures is rejected:
+although its hard-subset training timeout rate rises to 72%, the complete
+32-motion reevaluation retains only 4/32 no-fall classes.  This is catastrophic
+forgetting, not an acceptable tracker.  Therefore hard-only fine-tuning is not
+the expansion recipe; hard motions must remain mixed with the stable replay and
+the other successful directional families.
 
 The universal SONIC bundle intentionally uses all 856 exact-accepted motions,
 not the 382-motion gold-only subset: the visually clean largest-angle examples
@@ -1721,9 +1734,14 @@ SONIC paired-terrain training does not rotate a smaller environment pool
 through a larger motion library: environment `k` remains bound to motion and
 terrain `k`.  Consequently, a nominal 192-environment run over this bundle
 would only train the leading 192 examples, regardless of iteration count.  The
-universal launcher derives `num_envs` from `clips.json` and uses one paired
-environment for each of the 1,118 clips.  Job `16554062` is a five-iteration,
-single-L40 memory preflight for this exact coverage; the 400-iteration job
-`16554063` depends on it.  If it does not fit, the
-fallback is explicit balanced bundles no larger than the environment count,
-not a partial run mislabeled as full-bank training.
+universal launcher derives the coverage count from `clips.json`.  PPO requires
+the environment batch to divide evenly over four minibatches, so the 1,118
+clips use 1,120 paired environments: every clip occurs once and the first two
+wrap once, with no omitted tail.  The initial exact-1,118 preflight reached all
+terrain construction but correctly stopped at the indivisible minibatch.  Job
+`16554807` is the corrected five-iteration A5000 preflight; the queued L40
+launcher uses the same corrected rule.  Once that preflight passes, job
+`16554900` trains the complete mixed bank for 400 iterations on one A5000 and
+saves every 50 iterations for early-checkpoint qualification.  If it does not
+fit, the fallback is explicit balanced bundles no larger than the environment
+count, not a partial run mislabeled as full-bank training.
