@@ -97,29 +97,36 @@ def _phase_reconstruction(
     previous_stop_phase: float | None = None
     previous_stop_frame: int | None = None
     valid_cycles: list[tuple[int, int, int, float]] = []
+    tainted_strikes: set[int] = set()
     for (start, side), (stop, next_side) in zip(strikes[:-1], strikes[1:]):
         duration = (stop - start) / float(fps)
         barrier_between = bool(np.any(barrier[start + 1 : stop]))
+        if start in tainted_strikes:
+            rejected[start:stop] = True
+            previous_stop_phase = None
+            previous_stop_frame = None
+            continue
         if barrier_between:
-            rejected[start : stop + 1] = True
+            rejected[start:stop] = True
             previous_stop_phase = None
             previous_stop_frame = None
             continue
         if next_side == side:
             reasons["same_side"] += 1
-            rejected[start : stop + 1] = True
+            rejected[start:stop] = True
             previous_stop_phase = None
             previous_stop_frame = None
             continue
         if duration < 0.20:
             reasons["half_cycle_too_short"] += 1
             rejected[start : stop + 1] = True
+            tainted_strikes.update((start, stop))
             previous_stop_phase = None
             previous_stop_frame = None
             continue
         if duration > 1.00:
             reasons["half_cycle_too_long"] += 1
-            rejected[start : stop + 1] = True
+            rejected[start:stop] = True
             previous_stop_phase = None
             previous_stop_frame = None
             continue

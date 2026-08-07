@@ -113,8 +113,9 @@ class PhaseFromContactsTest(unittest.TestCase):
     def test_same_foot_twice_rejects_the_ambiguous_span(self) -> None:
         contact = contacts_with_strikes(("left", 3), ("left", 33), ("right", 63))
         track = phase_from_contacts(contact, fps=30.0)
-        self.assertFalse(track.valid[3:34].any())
-        self.assertTrue(track.valid[34:64].all())
+        self.assertFalse(track.valid[3:33].any())
+        self.assertTrue(track.valid[33:64].all())
+        self.assertAlmostEqual(track.phase[33], 0.0)
 
     def test_half_cycle_outside_point_two_to_one_second_is_rejected(self) -> None:
         contact = contacts_with_strikes(("left", 3), ("right", 8), ("left", 43))
@@ -122,12 +123,24 @@ class PhaseFromContactsTest(unittest.TestCase):
         self.assertFalse(track.valid[3:9].any())
 
     def test_unstable_rise_is_a_barrier_to_the_candidate_half_cycle(self) -> None:
-        contact = np.zeros((64, 4), dtype=bool)
+        contact = np.zeros((91, 4), dtype=bool)
         contact[3:7, 0] = True
         contact[9:19, 0] = True
         contact[33:43, 2] = True
+        contact[63:73, 0] = True
         track = phase_from_contacts(contact, fps=30.0)
-        self.assertFalse(track.valid[3:34].any())
+        self.assertFalse(track.valid[3:33].any())
+        self.assertTrue(track.valid[33:64].all())
+        self.assertAlmostEqual(track.phase[33], math.pi)
+
+    def test_too_long_span_preserves_clean_stop_as_recovery_anchor(self) -> None:
+        contact = contacts_with_strikes(
+            ("left", 3), ("right", 40), ("left", 70), frames=91
+        )
+        track = phase_from_contacts(contact, fps=30.0)
+        self.assertFalse(track.valid[3:40].any())
+        self.assertTrue(track.valid[40:71].all())
+        self.assertAlmostEqual(track.phase[40], math.pi)
 
     def test_one_stable_one_unstable_simultaneous_rise_removes_both(self) -> None:
         contact = np.zeros((121, 4), dtype=bool)
@@ -137,8 +150,9 @@ class PhaseFromContactsTest(unittest.TestCase):
         contact[63:73, 2] = True
         contact[90:100, 0] = True
         track = phase_from_contacts(contact, fps=30.0)
-        self.assertFalse(track.valid[3:64].any())
-        self.assertTrue(track.valid[64:91].all())
+        self.assertFalse(track.valid[3:63].any())
+        self.assertTrue(track.valid[63:91].all())
+        self.assertAlmostEqual(track.phase[63], math.pi)
 
     def test_simultaneous_left_right_rises_are_not_phase_anchors(self) -> None:
         contact = np.zeros((64, 4), dtype=bool)
@@ -162,17 +176,24 @@ class PhaseFromContactsTest(unittest.TestCase):
         )
         track = phase_from_contacts(contact, fps=30.0)
         self.assertTrue(track.valid[3:33].all())
-        self.assertFalse(track.valid[33:64].any())
-        self.assertTrue(track.valid[64:91].all())
+        self.assertFalse(track.valid[33:63].any())
+        self.assertTrue(track.valid[63:91].all())
 
-    def test_short_rejected_interval_removes_shared_anchors(self) -> None:
+    def test_short_interval_taints_following_start_until_next_clean_stop(self) -> None:
         contact = contacts_with_strikes(
-            ("left", 3), ("right", 33), ("left", 34), ("right", 64), frames=91
+            ("left", 3),
+            ("right", 33),
+            ("left", 34),
+            ("right", 64),
+            ("left", 94),
+            frames=121,
         )
         track = phase_from_contacts(contact, fps=30.0)
-        self.assertFalse(track.valid[33:35].any())
+        self.assertFalse(track.valid[33:64].any())
         self.assertTrue(track.valid[3:33].all())
-        self.assertTrue(track.valid[35:65].all())
+        self.assertTrue(track.valid[64:95].all())
+        self.assertAlmostEqual(track.phase[64], math.pi)
+        self.assertAlmostEqual(track.phase[94], 0.0)
         self.assertTrue(np.all(track.phase_advance >= 0.0))
 
     def test_adjacent_trailing_bilateral_margin_extends_at_zero_advance(self) -> None:
