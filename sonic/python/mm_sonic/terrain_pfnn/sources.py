@@ -32,7 +32,7 @@ from mm_sonic.terrain_oracle.source_lafan import _load_rows
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SLOPE_RE = re.compile(r"(?:^|__)slope_\d{3}(?:__|$)")
 _FPS = 30.0
-_GRAIL_SOURCE_LICENSE_ID = "UNRECORDED"
+_GRAIL_SOURCE_LICENSE_ID = "Apache-2.0"
 _LAFAN_SOURCE_LICENSE_ID = "CC-BY-NC-ND-4.0"
 _TERRAIN_QUATERNION_WORLD_FROM_USD_WXYZ = np.array(
     (np.sqrt(0.5), 0.0, 0.0, -np.sqrt(0.5)), dtype=np.float32
