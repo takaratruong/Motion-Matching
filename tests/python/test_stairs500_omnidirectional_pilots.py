@@ -118,6 +118,84 @@ class StairDirectionalProfileTest(unittest.TestCase):
         self.assertGreater(float(np.degrees(np.max(profile.facing_yaw_offset_rad))), 9.9)
         self.assertLess(float(np.degrees(np.min(profile.facing_yaw_offset_rad))), -9.9)
 
+    def test_cowarp_hard_diagonal_reaches_requested_angle(self):
+        profile = build_path_profile(
+            "cowarp_diagonal_hard_left",
+            np.linspace(0.0, 1.0, 1001),
+            active_length_m=3.0,
+            maximum_amplitude_m=1.0,
+        )
+        self.assertAlmostEqual(profile.maximum_path_angle_deg, 38.0, places=3)
+        self.assertGreater(float(np.ptp(profile.lateral_offset_m)), 0.5)
+
+    def test_cowarp_held_lane_dwells_before_returning(self):
+        progress = np.linspace(0.0, 1.0, 1201)
+        profile = build_path_profile(
+            "cowarp_lane_hold_left",
+            progress,
+            active_length_m=3.0,
+            maximum_amplitude_m=0.5,
+        )
+        middle = profile.lateral_offset_m[
+            (progress >= 1.0 / 3.0) & (progress <= 2.0 / 3.0)
+        ]
+        self.assertLess(float(np.ptp(middle)), 1.0e-9)
+        self.assertGreater(float(middle[0]), 0.1)
+        self.assertAlmostEqual(float(profile.lateral_offset_m[0]), 0.0, places=9)
+        self.assertAlmostEqual(float(profile.lateral_offset_m[-1]), 0.0, places=9)
+
+    def test_cowarp_counterface_slalom_changes_both_sticks(self):
+        profile = build_path_profile(
+            "cowarp_slalom_counterface_left_right",
+            np.linspace(0.0, 1.0, 1001),
+            active_length_m=4.0,
+            maximum_amplitude_m=0.5,
+        )
+        self.assertGreater(float(np.max(profile.path_yaw_offset_rad)), 0.0)
+        self.assertLess(float(np.min(profile.path_yaw_offset_rad)), 0.0)
+        self.assertGreater(float(np.max(profile.facing_yaw_offset_rad)), 0.0)
+        self.assertLess(float(np.min(profile.facing_yaw_offset_rad)), 0.0)
+
+    def test_cowarp_hard_crab_opposes_path_with_facing_stick(self):
+        profile = build_path_profile(
+            "cowarp_crab_hard_left",
+            np.linspace(0.0, 1.0, 1001),
+            active_length_m=3.0,
+            maximum_amplitude_m=0.8,
+        )
+        peak = int(np.argmax(profile.path_yaw_offset_rad))
+        self.assertAlmostEqual(
+            float(np.degrees(profile.path_yaw_offset_rad[peak])),
+            24.0,
+            places=3,
+        )
+        self.assertAlmostEqual(
+            float(
+                np.degrees(
+                    profile.path_yaw_offset_rad[peak]
+                    + profile.facing_yaw_offset_rad[peak]
+                )
+            ),
+            0.0,
+            places=3,
+        )
+
+    def test_cowarp_hard_facing_weave_reaches_both_twenty_degree_offsets(self):
+        profile = build_path_profile(
+            "cowarp_facing_weave_hard_left_right",
+            np.linspace(0.0, 1.0, 1001),
+            active_length_m=3.0,
+            maximum_amplitude_m=0.8,
+        )
+        self.assertGreaterEqual(
+            float(np.degrees(np.max(profile.facing_yaw_offset_rad))),
+            19.99,
+        )
+        self.assertLessEqual(
+            float(np.degrees(np.min(profile.facing_yaw_offset_rad))),
+            -19.99,
+        )
+
     def test_temporal_reverse_preserves_poses_and_maps_seams(self):
         motion = StitchedMotion(
             fps=50.0,

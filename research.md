@@ -1866,3 +1866,61 @@ That method is retained as a diagnostic but is **not** being scaled or counted
 as general omnidirectional rough-terrain coverage.  The reliable current
 coverage is exact source traversal plus compound timing on real terrain, and
 exact support-aware path/facing warps on stairs.
+
+### Paired terrain-motion co-warps (2026-08-07)
+
+The failed fixed-mesh lateral warp identified the wrong invariant: it bent the
+robot route while leaving unrelated terrain under the stance feet.  The paired
+construction instead applies one smooth path map to both the registered mesh
+and the motion.  Swing feet retain their pelvis-local transform, while every
+stance sole is attached to the exact source face by barycentric coordinates and
+mapped to the corresponding target face.  This preserves authored contact
+without assuming an infinite heightfield or inserting a root-only clearance
+offset.  Every output is still rejected on excessive joint/root steps, IK
+correction, stance error/drift, fewer than two stance support probes, more than
+5 mm foot penetration, or any forbidden-body penetration.
+
+The completed 32-source stair sweep attempted 400 motions and accepted 100:
+48 ascents and 52 descents across all sixteen requested command families.  They
+include left/right diagonals, 0.25 m lane shifts, gentle and stronger slaloms,
+zigzags, independent facing offsets, and path/facing combinations in opposite
+directions.  The admitted envelope reaches 28 degrees of path steering, 0.50 m
+of lateral-offset range, and 10 degrees of independent facing.  A separate
+0.40 m lane tier accepts another 15 motions, split as eight ascents and seven
+descents, with path angles up to 24 degrees.  Maximum foot penetration is
+4.985 mm in the main bank and 4.924 mm in the stronger lane tier; forbidden
+body penetration is zero throughout.  The main artifacts are
+`cowarped_directional32_amp025_v1/{summary.json,all_routes.png,routes_by_mode.png}`.
+The mode-separated route plot uses the unwarped source heading as its reference
+so diagonal motion is not falsely rotated back onto a straight axis; realized
+G1 roots are solid blue and intended roots are dashed red.
+
+Timing composition is now applied to these paired assets rather than looking
+up the original straight archive terrain.  Only frames marked as authored
+double stance with at least two target support probes under each sole may be a
+stop or reversal pivot.  Out-and-back rough paths restrict pivots to the first
+monotonic passage.  Retimed files preserve the intended path, contact masks,
+support counts, and audit traces, and they recompute both world and robot-local
+velocity labels plus facing and exact zero-stick holds.  The first 24-motion
+stair subset produces 120 pilots, of which 112 pass the strict gate: 17
+bounces, 49 reversals, and 46 stop/restarts across all sixteen spatial command
+families.  They use 13 physical stair sources, have zero forbidden-body
+penetration, and reach 4.923 mm maximum foot penetration.  The full 100-source
+compound expansion and the 149-source curb/slope paired sweep remain active;
+their final counts must replace, not be inferred from, partial outputs.
+
+A deliberately stronger stair canary adds 38-degree hard diagonals, held lane
+changes, two-stage left/right lane changes, and slaloms whose travel and facing
+commands move in opposite directions.  All eight new command families are
+represented among 13 admitted motions from four source clips.  The realized
+envelope reaches 0.857 m of lateral range and 12 degrees of independent facing;
+maximum foot penetration is 4.662 mm and forbidden-body penetration remains
+zero.  Dense side and overhead renders of the hard diagonal and held-lane cases
+show continuous, grounded traversal rather than the earlier root-only slide.
+The 32-source scale and its stop/reverse/bounce compound pass remain active.
+
+The rough-terrain 0.40 m lane tier accepted 33 direct paired motions from 21
+physical curb/slope sources.  Its compound pass attempted 167 event motions
+and strictly admitted 143: 19 bounces, 69 reversals, and 55 stop/restarts from
+20 physical sources.  The bank contains 24 uphill and 119 round-trip examples,
+with 4.794 mm maximum foot penetration and zero forbidden-body penetration.

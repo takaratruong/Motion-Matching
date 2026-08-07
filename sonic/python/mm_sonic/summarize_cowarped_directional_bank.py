@@ -91,12 +91,30 @@ def select_review(
     return selected
 
 
-def _local_routes(row: dict[str, object]) -> tuple[np.ndarray, np.ndarray]:
+def _local_route_data(
+    row: dict[str, object],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     with np.load(str(row["motion"]), allow_pickle=False) as payload:
         root = np.asarray(payload["root_position_world"], dtype=np.float64)
         intended = np.asarray(
             payload.get("intended_root_position_world", root),
             dtype=np.float64,
+        )
+        facing_key = next(
+            (
+                key
+                for key in (
+                    "command_facing_yaw_world_rad",
+                    "command_facing_yaw_world",
+                )
+                if key in payload
+            ),
+            None,
+        )
+        facing_world = (
+            None
+            if facing_key is None
+            else np.asarray(payload[facing_key], dtype=np.float64)
         )
     actual_xy = root[:, :2] - root[0, :2]
     intended_xy = intended[:, :2] - intended[0, :2]
@@ -132,7 +150,20 @@ def _local_routes(row: dict[str, object]) -> tuple[np.ndarray, np.ndarray]:
             axis=1,
         )
 
-    return rotate(actual_xy), rotate(intended_xy)
+    facing_local = (
+        None
+        if facing_world is None
+        else np.arctan2(
+            np.sin(facing_world - yaw),
+            np.cos(facing_world - yaw),
+        )
+    )
+    return rotate(actual_xy), rotate(intended_xy), facing_local
+
+
+def _local_routes(row: dict[str, object]) -> tuple[np.ndarray, np.ndarray]:
+    actual, intended, _facing = _local_route_data(row)
+    return actual, intended
 
 
 def plot_routes(rows: list[dict[str, object]], output: Path) -> None:
@@ -194,8 +225,8 @@ def plot_mode_routes(rows: list[dict[str, object]], output: Path) -> None:
     )
     for axis, mode in zip(axes.flat, modes, strict=False):
         subset = [row for row in rows if row["mode"] == mode]
-        for row in subset:
-            actual, intended = _local_routes(row)
+        for row_index, row in enumerate(subset):
+            actual, intended, facing = _local_route_data(row)
             axis.plot(
                 intended[:, 0],
                 intended[:, 1],
@@ -211,6 +242,26 @@ def plot_mode_routes(rows: list[dict[str, object]], output: Path) -> None:
                 alpha=0.42,
                 linewidth=1.0,
             )
+            if row_index == 0 and facing is not None and len(actual) >= 2:
+                indices = np.linspace(
+                    0,
+                    len(actual) - 1,
+                    min(6, len(actual)),
+                    dtype=np.int64,
+                )
+                axis.quiver(
+                    actual[indices, 0],
+                    actual[indices, 1],
+                    np.cos(facing[indices]),
+                    np.sin(facing[indices]),
+                    angles="xy",
+                    scale_units="xy",
+                    scale=3.0,
+                    color="black",
+                    alpha=0.8,
+                    width=0.006,
+                    headwidth=3.0,
+                )
         axis.set_title(f"{mode.removeprefix('cowarp_')}  (n={len(subset)})")
         axis.axhline(0.0, color="black", linewidth=0.5, alpha=0.25)
         axis.grid(alpha=0.15)
@@ -219,7 +270,7 @@ def plot_mode_routes(rows: list[dict[str, object]], output: Path) -> None:
         axis.set_visible(False)
     figure.suptitle(
         "Paired terrain maneuvers by command family\n"
-        "blue: realized G1 root, red dashed: intended root"
+        "blue: realized G1 root, red dashed: intended root, black: facing command"
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output, dpi=180)

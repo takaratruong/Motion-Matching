@@ -328,6 +328,39 @@ def _profile_knots(
         "cowarp_diagonal_right": ((1.0, -1.0), 28.0, 0.0, 1.0, 1.0),
         "cowarp_lane_left": ((0.0, 1.0), 24.0, 0.0, 1.0, 1.0),
         "cowarp_lane_right": ((0.0, -1.0), 24.0, 0.0, 1.0, 1.0),
+        # A visibly wider paired-terrain tier.  Held-lane and step-change
+        # profiles dwell at their lateral extrema instead of immediately
+        # smoothing back through the centreline, which makes the command
+        # change useful to a long-horizon policy rather than a tiny wiggle.
+        "cowarp_diagonal_hard_left": ((-1.0, 1.0), 38.0, 0.0, 1.0, 1.0),
+        "cowarp_diagonal_hard_right": ((1.0, -1.0), 38.0, 0.0, 1.0, 1.0),
+        # Hard crab diagonals use the second stick to oppose the travel
+        # tangent.  At peak obliquity the pelvis remains approximately
+        # stair-forward while the paired motion and terrain travel at 24 deg.
+        "cowarp_crab_hard_left": ((-1.0, 1.0), 24.0, -24.0, 1.0, 1.0),
+        "cowarp_crab_hard_right": ((1.0, -1.0), 24.0, 24.0, 1.0, 1.0),
+        "cowarp_lane_hold_left": ((0.0, 1.0, 1.0, 0.0), 28.0, 0.0, 1.0, 1.0),
+        "cowarp_lane_hold_right": (
+            (0.0, -1.0, -1.0, 0.0),
+            28.0,
+            0.0,
+            1.0,
+            1.0,
+        ),
+        "cowarp_step_change_left_right": (
+            (0.0, 1.0, 1.0, -1.0, -1.0, 0.0),
+            26.0,
+            0.0,
+            1.0,
+            1.0,
+        ),
+        "cowarp_step_change_right_left": (
+            (0.0, -1.0, -1.0, 1.0, 1.0, 0.0),
+            26.0,
+            0.0,
+            1.0,
+            1.0,
+        ),
         "cowarp_slalom_left_right": (
             (0.0, 1.0, -1.0, 1.0, 0.0),
             18.0,
@@ -415,6 +448,37 @@ def _profile_knots(
             0.0,
             0.0,
         ),
+        "cowarp_facing_weave_hard_left_right": (
+            (0.0, 0.0),
+            0.0,
+            20.0,
+            0.0,
+            0.0,
+        ),
+        "cowarp_facing_weave_hard_right_left": (
+            (0.0, 0.0),
+            0.0,
+            20.0,
+            0.0,
+            0.0,
+        ),
+        # Both sticks change while already on the terrain: the route slaloms
+        # while body facing traverses the opposite sequence.  Foot frames
+        # still follow the paired terrain tangent, preserving stance contact.
+        "cowarp_slalom_counterface_left_right": (
+            (0.0, 1.0, -1.0, 1.0, 0.0),
+            16.0,
+            12.0,
+            1.0,
+            1.0,
+        ),
+        "cowarp_slalom_counterface_right_left": (
+            (0.0, -1.0, 1.0, -1.0, 0.0),
+            16.0,
+            12.0,
+            1.0,
+            1.0,
+        ),
     }
     try:
         return profiles[mode]
@@ -469,6 +533,10 @@ def build_path_profile(
         "facing_weave_micro_right_left": (0.0, -1.0, 1.0, 0.0),
         "cowarp_facing_weave_left_right": (0.0, 1.0, -1.0, 0.0),
         "cowarp_facing_weave_right_left": (0.0, -1.0, 1.0, 0.0),
+        "cowarp_facing_weave_hard_left_right": (0.0, 1.0, -1.0, 0.0),
+        "cowarp_facing_weave_hard_right_left": (0.0, -1.0, 1.0, 0.0),
+        "cowarp_slalom_counterface_left_right": (0.0, -1.0, 1.0, 0.0),
+        "cowarp_slalom_counterface_right_left": (0.0, 1.0, -1.0, 0.0),
     }.get(mode)
     if facing_knots is None:
         facing_window = np.sin(np.pi * u) ** 2
