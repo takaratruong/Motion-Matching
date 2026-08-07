@@ -122,6 +122,11 @@ def _realized_directional_motion(
     if float(np.ptp(progress)) < 0.50 or float(np.ptp(root[:, 2])) < 0.06:
         return False
     mode = str(report["mode"])
+    if mode == "bones_side_on":
+        alignment = report.get("source_alignment", {})
+        if isinstance(alignment, dict):
+            return abs(float(alignment.get("body_to_travel_angle_deg", 0.0))) >= 75.0
+        return False
     if mode == "straight":
         return str(report.get("source_kind")) == "temporal_reverse"
     realized_path = bool(
@@ -143,8 +148,9 @@ def mirror_one(
     output: Path,
 ) -> dict[str, object]:
     report = json.loads(report_path.read_text())
-    if report.get("status") != "accepted":
-        raise ValueError("only accepted directional pilots may be mirrored")
+    source_status = str(report.get("status"))
+    if source_status not in {"accepted", "pending_dense_visual_review"}:
+        raise ValueError("only admitted directional pilots may be mirrored")
     source_path = report_path.parent / "motion.npz"
     with np.load(source_path, allow_pickle=False) as source:
         arrays = {name: np.asarray(source[name]).copy() for name in source.files}
@@ -154,11 +160,25 @@ def mirror_one(
     arrays["root_position_world"] = _reflect_points(
         arrays["root_position_world"], lateral=lateral, centre=centre
     ).astype(np.float32)
-    if "intended_root_position_world" in arrays:
-        arrays["intended_root_position_world"] = _reflect_points(
-            arrays["intended_root_position_world"],
+    for name in (
+        "intended_root_position_world",
+        "target_sole_center_world",
+        "nominal_sole_center_world",
+        "adapted_sole_center_world",
+    ):
+        if name not in arrays:
+            continue
+        value = _reflect_points(
+            arrays[name],
             lateral=lateral,
             centre=centre,
+        ).astype(np.float32)
+        if value.ndim >= 3 and value.shape[1] == 2:
+            value = value[:, (1, 0)]
+        arrays[name] = value
+    if "terrain_root_anchor_shift_world" in arrays:
+        arrays["terrain_root_anchor_shift_world"] = _reflect_vectors(
+            arrays["terrain_root_anchor_shift_world"], lateral=lateral
         ).astype(np.float32)
     arrays["root_quaternion_world_wxyz"] = _mirror_quaternion(
         arrays["root_quaternion_world_wxyz"], axis_yaw
@@ -199,9 +219,13 @@ def mirror_one(
         "authored_stance_mask",
         "target_stance_support_point_count",
         "per_frame_sole_target_error_by_foot_m",
+        "bracketed_swing_mask",
+        "per_frame_swing_route_adjustment",
     ):
         if name in arrays:
             arrays[name] = arrays[name][:, (1, 0)]
+    if "body_to_travel_angle_deg" in arrays:
+        arrays["body_to_travel_angle_deg"] *= -1.0
     mode = _swap_left_right(str(np.asarray(arrays["maneuver_mode"])))
     arrays["maneuver_mode"] = np.asarray(mode, dtype=np.str_)
     arrays["symmetry_pair_id"] = np.asarray(str(report["label"]), dtype=np.str_)
@@ -223,6 +247,14 @@ def mirror_one(
         maximum_forbidden_body_penetration_m=0.0,
     )
     mirrored_report = dict(report)
+    source_alignment = mirrored_report.get("source_alignment")
+    if isinstance(source_alignment, dict):
+        source_alignment = dict(source_alignment)
+        if "body_to_travel_angle_deg" in source_alignment:
+            source_alignment["body_to_travel_angle_deg"] = -float(
+                source_alignment["body_to_travel_angle_deg"]
+            )
+        mirrored_report["source_alignment"] = source_alignment
     mirrored_report.update(
         {
             "label": label,
@@ -230,7 +262,9 @@ def mirror_one(
             "mirror_of": str(report_path.parent),
             "motion": str(motion_path),
             "collision_audit": collision.to_dict(),
-            "status": "accepted" if collision.accepted else "rejected",
+            "status": (
+                source_status if collision.accepted else "rejected"
+            ),
         }
     )
     (destination / "collision_audit.json").write_text(
@@ -259,7 +293,10 @@ def build(
     skipped_noop = 0
     for path in sorted(root.expanduser().resolve().rglob("report.json")):
         report = json.loads(path.read_text())
-        if report.get("status") != "accepted":
+        if report.get("status") not in {
+            "accepted",
+            "pending_dense_visual_review",
+        }:
             continue
         if not _realized_directional_motion(path, report, archive):
             skipped_noop += 1
@@ -291,7 +328,10 @@ def build(
         "shard_count": int(shard_count),
         "attempted": len(results),
         "accepted": sum(row["status"] == "accepted" for row in results),
-        "rejected": sum(row["status"] != "accepted" for row in results),
+        "pending_dense_visual_review": sum(
+            row["status"] == "pending_dense_visual_review" for row in results
+        ),
+        "rejected": sum(row["status"] == "rejected" for row in results),
         "skipped_noop": skipped_noop,
         "reports": results,
     }

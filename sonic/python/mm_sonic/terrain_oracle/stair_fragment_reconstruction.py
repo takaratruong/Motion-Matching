@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import math
 from pathlib import Path
-from typing import Collection, Sequence
+from typing import Collection, Mapping, Sequence
 
 import numpy as np
 
@@ -1008,6 +1008,9 @@ def _anchor_stance_sole_targets(
     foothold_route: StairSupportRoute,
     ground_fallback_height_m: float,
     config: FootholdAnchorConfig,
+    maximum_monotonic_level_step: int | None = None,
+    target_level_by_stance_span: Mapping[tuple[int, int, int], int]
+    | None = None,
 ) -> tuple[np.ndarray, tuple[FootholdAnchorDiagnostics, ...]]:
     """Lock every authored stance run to one terrain-valid world foothold."""
 
@@ -1020,14 +1023,59 @@ def _anchor_stance_sole_targets(
         raise PlannedFragmentReconstructionRejected(
             "target_foothold", "foothold route contains no support levels"
         )
-    for span in _stance_spans(stance_mask):
+    spans = _stance_spans(stance_mask)
+    target_levels: dict[tuple[int, int, int], int] = {}
+    if target_level_by_stance_span is not None:
+        valid_keys = {
+            (span.foot_index, span.start_frame, span.stop_frame)
+            for span in spans
+        }
+        unknown = set(target_level_by_stance_span) - valid_keys
+        if unknown:
+            raise ValueError("explicit stance-level schedule contains unknown spans")
+        for key, value in target_level_by_stance_span.items():
+            level = int(value)
+            if level < 0 or level >= len(foothold_route.levels):
+                raise ValueError("explicit stance level is outside the support route")
+            target_levels[key] = level
+    if maximum_monotonic_level_step is not None:
+        maximum_step = int(maximum_monotonic_level_step)
+        if maximum_step < 1:
+            raise ValueError("maximum monotonic level step must be positive")
+        chronological = sorted(
+            spans,
+            key=lambda value: (
+                value.start_frame + value.stop_frame,
+                value.foot_index,
+            ),
+        )
+        previous: int | None = None
+        for span in chronological:
+            frame = (span.start_frame + span.stop_frame - 1) // 2
+            foot = span.foot_index
+            radii = np.asarray(sphere_radii[foot], dtype=np.float64)
+            support = np.asarray(nominal[frame, foot], dtype=np.float64).copy()
+            support[:, 2] -= radii
+            proposed = _stance_target_level(foothold_route, support)
+            target_level = (
+                proposed
+                if previous is None
+                else max(previous, min(proposed, previous + maximum_step))
+            )
+            key = (span.foot_index, span.start_frame, span.stop_frame)
+            target_levels.setdefault(key, target_level)
+            previous = target_level
+    for span in spans:
         frame = (span.start_frame + span.stop_frame - 1) // 2
         foot = span.foot_index
         radii = np.asarray(sphere_radii[foot], dtype=np.float64)
         centres = np.asarray(nominal[frame, foot], dtype=np.float64)
         support = centres.copy()
         support[:, 2] -= radii
-        target_level = _stance_target_level(foothold_route, support)
+        target_level = target_levels.get(
+            (span.foot_index, span.start_frame, span.stop_frame),
+            _stance_target_level(foothold_route, support),
+        )
         pose = NominalFootSolePose(
             sole_center_world=np.mean(centres, axis=0),
             sole_support_points_world=support,

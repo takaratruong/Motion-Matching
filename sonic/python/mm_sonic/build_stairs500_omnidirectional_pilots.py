@@ -19,7 +19,7 @@ from dataclasses import asdict, dataclass
 import json
 import math
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 import zarr
@@ -31,8 +31,11 @@ from .terrain_oracle.reference_stitch import _G1FootfallAdapter
 from .terrain_oracle.stair_fragment_reconstruction import (
     _anchor_stance_sole_targets,
     _blend_anchored_sole_offsets,
+    _clear_swing_sole_target,
     _interpolate_fixed_vectors,
+    _replace_bracketed_swing_trajectories,
     _smooth_root_anchor_shifts,
+    _smooth_swing_route_adjustments,
     _stance_guidance_weights,
     _stance_spans,
 )
@@ -46,6 +49,7 @@ from .terrain_oracle.stair_motion_collision_audit import (
     audit_stair_motion_collisions,
 )
 from .terrain_oracle.stitch import StitchedMotion
+from .terrain_oracle.contact import CanonicalMeshQuery
 
 
 DEFAULT_ARCHIVE = Path(
@@ -849,6 +853,142 @@ def _stance_runs_maximum_drift(
     return maximum
 
 
+def _remove_short_stance_runs(
+    stance: np.ndarray, *, minimum_run_frames: int
+) -> np.ndarray:
+    """Remove isolated slow/contact samples that are not planted phases."""
+
+    result = np.asarray(stance, dtype=bool).copy()
+    minimum = int(minimum_run_frames)
+    if minimum < 1:
+        raise ValueError("minimum stance run must be positive")
+    if minimum == 1:
+        return result
+    for foot in range(2):
+        start = 0
+        while start < len(result):
+            if not result[start, foot]:
+                start += 1
+                continue
+            stop = start + 1
+            while stop < len(result) and result[stop, foot]:
+                stop += 1
+            if stop - start < minimum:
+                result[start:stop, foot] = False
+            start = stop
+    return result
+
+
+def _fill_short_stance_gaps(
+    stance: np.ndarray, *, maximum_gap_frames: int
+) -> np.ndarray:
+    """Close brief contact-classification dropouts inside one planted phase."""
+
+    result = np.asarray(stance, dtype=bool).copy()
+    maximum = int(maximum_gap_frames)
+    if maximum < 0:
+        raise ValueError("maximum stance gap must be nonnegative")
+    if maximum == 0:
+        return result
+    for foot in range(2):
+        start = 0
+        while start < len(result):
+            if result[start, foot]:
+                start += 1
+                continue
+            stop = start + 1
+            while stop < len(result) and not result[stop, foot]:
+                stop += 1
+            if (
+                0 < start
+                and stop < len(result)
+                and stop - start <= maximum
+            ):
+                result[start:stop, foot] = True
+            start = stop
+    return result
+
+
+def _terrain_clear_bracketed_swings(
+    nominal_targets: np.ndarray,
+    anchored_targets: np.ndarray,
+    stance: np.ndarray,
+    sphere_radii: Sequence[np.ndarray],
+    *,
+    target_mesh: object,
+    target_route: object,
+    minimum_clearance_m: float,
+    adjustment_taper_frames: int = 0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Lift a flat gait's complete swing phases over exact stair risers."""
+
+    targets, bracketed = _replace_bracketed_swing_trajectories(
+        nominal_targets,
+        anchored_targets,
+        stance,
+        minimum_clearance_m=float(minimum_clearance_m),
+    )
+    adjustments = np.zeros((len(targets), 2, 3), dtype=np.float64)
+    mesh_query = CanonicalMeshQuery(
+        target_mesh.mesh, target_mesh.world_from_terrain
+    )
+    for frame in range(len(targets)):
+        for foot in range(2):
+            if stance[frame, foot]:
+                continue
+            targets[frame, foot], adjustments[frame, foot] = (
+                _clear_swing_sole_target(
+                    targets[frame, foot],
+                    sphere_radii[foot],
+                    mesh=target_mesh,
+                    route=target_route,
+                    mesh_query=mesh_query,
+                )
+            )
+    smoothed = _smooth_swing_route_adjustments(adjustments, stance)
+    taper = int(adjustment_taper_frames)
+    if taper < 0:
+        raise ValueError("swing adjustment taper must be nonnegative")
+    if taper:
+        for foot in range(2):
+            start_frame = 0
+            while start_frame < len(stance):
+                if stance[start_frame, foot]:
+                    start_frame += 1
+                    continue
+                stop_frame = start_frame + 1
+                while (
+                    stop_frame < len(stance)
+                    and not stance[stop_frame, foot]
+                ):
+                    stop_frame += 1
+                for frame in range(start_frame, stop_frame):
+                    distance = min(
+                        frame - start_frame + 1,
+                        stop_frame - frame,
+                    )
+                    linear = min(1.0, distance / float(taper + 1))
+                    smooth = linear * linear * (3.0 - 2.0 * linear)
+                    smoothed[frame, foot] *= smooth
+                start_frame = stop_frame
+    direction = np.asarray(target_route.end_xy, dtype=np.float64) - np.asarray(
+        target_route.start_xy, dtype=np.float64
+    )
+    direction /= np.linalg.norm(direction)
+    for frame in range(len(targets)):
+        for foot in range(2):
+            difference = smoothed[frame, foot] - adjustments[frame, foot]
+            targets[frame, foot] += np.asarray(
+                (
+                    difference[0] * direction[0],
+                    difference[0] * direction[1],
+                    difference[2],
+                ),
+                dtype=np.float64,
+            )[None]
+    return targets, bracketed, smoothed
+
+
 def warp_motion(
     source: StitchedMotion,
     *,
@@ -862,6 +1002,25 @@ def warp_motion(
     maximum_amplitude_m: float,
     source_mesh: object | None = None,
     spatial_sole_mapping: bool = False,
+    minimum_stance_run_frames: int = 1,
+    maximum_stance_gap_frames: int = 0,
+    terrain_clear_swings: bool = False,
+    minimum_swing_clearance_m: float = 0.08,
+    swing_adjustment_taper_frames: int = 0,
+    foothold_anchor_config: FootholdAnchorConfig | None = None,
+    root_height_offset_m: np.ndarray | None = None,
+    root_progress_offset_m: np.ndarray | None = None,
+    root_anchor_smoothing_frames: float | None = None,
+    maximum_foothold_level_step: int | None = None,
+    ik_multistart: bool = False,
+    target_level_by_stance_span: Mapping[tuple[int, int, int], int]
+    | None = None,
+    maximum_ik_continuity_step_rad: float | None = None,
+    root_anchor_vertical: bool = True,
+    root_anchor_vertical_limit_m: float | None = None,
+    ik_continuity_acceptable_error_m: float = 0.008,
+    ground_fallback_height_m: float | None = None,
+    post_selection_maximum_joint_step_rad: float | None = None,
 ) -> tuple[StitchedMotion, WarpDiagnostics, dict[str, np.ndarray]]:
     """Warp one source motion and fit its legs to non-sliding sole targets."""
 
@@ -880,6 +1039,28 @@ def warp_motion(
         "maximum_amplitude_m": float(maximum_amplitude_m),
     }
     mapped_roots, root_profile = _map_points(roots, **path_arguments)
+    if root_height_offset_m is not None:
+        height_offset = np.asarray(root_height_offset_m, dtype=np.float64)
+        if height_offset.shape != (len(roots),) or not np.isfinite(
+            height_offset
+        ).all():
+            raise ValueError(
+                "root height offset must contain one finite value per frame"
+            )
+        mapped_roots[:, 2] += height_offset
+    else:
+        height_offset = np.zeros(len(roots), dtype=np.float64)
+    if root_progress_offset_m is not None:
+        progress_offset = np.asarray(root_progress_offset_m, dtype=np.float64)
+        if progress_offset.shape != (len(roots),) or not np.isfinite(
+            progress_offset
+        ).all():
+            raise ValueError(
+                "root progress offset must contain one finite value per frame"
+            )
+        mapped_roots[:, :2] += progress_offset[:, None] * direction_xy[None]
+    else:
+        progress_offset = np.zeros(len(roots), dtype=np.float64)
     mapped_quaternions = np.empty_like(quaternions)
     source_soles: list[tuple[np.ndarray, np.ndarray]] = []
     source_envelopes: list[tuple[np.ndarray, np.ndarray]] = []
@@ -930,7 +1111,13 @@ def warp_motion(
                 <= 0.020
                 for point in support
             )
-    stance = (source_support_count >= 2) & (source_speed <= 0.25)
+    stance = _remove_short_stance_runs(
+        _fill_short_stance_gaps(
+            (source_support_count >= 2) & (source_speed <= 0.25),
+            maximum_gap_frames=maximum_stance_gap_frames,
+        ),
+        minimum_run_frames=minimum_stance_run_frames,
+    )
 
     # First move each authored sole with the pelvis' path transform.  This is
     # exactly reachable when facing is unchanged.  Then freeze every authored
@@ -989,6 +1176,18 @@ def warp_motion(
             source_ray_z=source_ray_z,
         )
     else:
+        anchor_config = foothold_anchor_config or FootholdAnchorConfig(
+            max_longitudinal_adjustment_m=0.16,
+            max_lateral_adjustment_m=0.0,
+            max_yaw_adjustment_rad=math.radians(12.0),
+            longitudinal_samples=17,
+            lateral_samples=1,
+            yaw_samples=5,
+            lateral_seed_offsets_m=(0.0,),
+            route_lateral_offset_m=0.0,
+            route_alignment_weight=0.0,
+            minimum_support_points=2,
+        )
         target_soles_array, _anchor_diagnostics = _anchor_stance_sole_targets(
             nominal_targets,
             stance,
@@ -997,19 +1196,30 @@ def warp_motion(
             target_mesh=target_mesh,
             foothold_route=target_route,
             ground_fallback_height_m=0.0,
-            config=FootholdAnchorConfig(
-                max_longitudinal_adjustment_m=0.16,
-                max_lateral_adjustment_m=0.0,
-                max_yaw_adjustment_rad=math.radians(12.0),
-                longitudinal_samples=17,
-                lateral_samples=1,
-                yaw_samples=5,
-                lateral_seed_offsets_m=(0.0,),
-                route_lateral_offset_m=0.0,
-                route_alignment_weight=0.0,
-                minimum_support_points=2,
-            ),
+            config=anchor_config,
+            maximum_monotonic_level_step=maximum_foothold_level_step,
+            target_level_by_stance_span=target_level_by_stance_span,
         )
+        if terrain_clear_swings:
+            (
+                target_soles_array,
+                bracketed_swing,
+                swing_route_adjustment,
+            ) = _terrain_clear_bracketed_swings(
+                nominal_targets,
+                target_soles_array,
+                stance,
+                sphere_radii,
+                target_mesh=target_mesh,
+                target_route=target_route,
+                minimum_clearance_m=minimum_swing_clearance_m,
+                adjustment_taper_frames=swing_adjustment_taper_frames,
+            )
+        else:
+            bracketed_swing = np.zeros(stance.shape, dtype=bool)
+            swing_route_adjustment = np.zeros(
+                (len(stance), 2, 3), dtype=np.float64
+            )
     target_soles = [
         (target_soles_array[frame, 0], target_soles_array[frame, 1])
         for frame in range(len(target_soles_array))
@@ -1048,9 +1258,25 @@ def warp_motion(
     root_anchor_shift = _interpolate_fixed_vectors(
         root_anchor_shift, root_anchor_fixed
     )
+    if not root_anchor_vertical:
+        if root_anchor_vertical_limit_m is None:
+            root_anchor_shift[:, 2] = 0.0
+        else:
+            vertical_limit = float(root_anchor_vertical_limit_m)
+            if not math.isfinite(vertical_limit) or vertical_limit < 0.0:
+                raise ValueError(
+                    "root anchor vertical limit must be finite and nonnegative"
+                )
+            root_anchor_shift[:, 2] = np.clip(
+                root_anchor_shift[:, 2], -vertical_limit, vertical_limit
+            )
     root_anchor_shift = _smooth_root_anchor_shifts(
         root_anchor_shift,
-        sigma_frames=(1.0 if target_route is None else 4.0),
+        sigma_frames=(
+            float(root_anchor_smoothing_frames)
+            if root_anchor_smoothing_frames is not None
+            else (1.0 if target_route is None else 4.0)
+        ),
     )
     mapped_roots += root_anchor_shift
 
@@ -1061,15 +1287,123 @@ def warp_motion(
     adapted_centres = np.empty((len(roots), 2, 3), dtype=np.float64)
     target_support_count = np.zeros((len(roots), 2), dtype=np.int16)
     for frame in range(len(roots)):
-        adapted_joints[frame], corrections[frame], errors[frame] = (
-            adapter.adapt_to_targets(
+        warm_candidate = adapter.adapt_to_targets(
+            root_position=mapped_roots[frame],
+            root_quaternion_wxyz=mapped_quaternions[frame],
+            authored_joints=authored_joints[frame],
+            sole_targets_world=target_soles[frame],
+            initial_joints=(adapted_joints[frame - 1] if frame else None),
+            continuity_joints=(adapted_joints[frame - 1] if frame else None),
+            continuity_feet=tuple(
+                not bool(stance[frame, foot]) for foot in range(2)
+            ),
+            maximum_continuity_joint_step_rad=(
+                maximum_ik_continuity_step_rad if frame else None
+            ),
+        )
+        candidates = [warm_candidate]
+        if ik_multistart and frame:
+            candidates.append(
+                adapter.adapt_to_targets(
+                    root_position=mapped_roots[frame],
+                    root_quaternion_wxyz=mapped_quaternions[frame],
+                    authored_joints=authored_joints[frame],
+                    sole_targets_world=target_soles[frame],
+                    initial_joints=None,
+                    continuity_joints=adapted_joints[frame - 1],
+                    continuity_feet=tuple(
+                        not bool(stance[frame, foot]) for foot in range(2)
+                    ),
+                    maximum_continuity_joint_step_rad=(
+                        maximum_ik_continuity_step_rad
+                    ),
+                )
+            )
+            continuity_candidate = np.asarray(
+                authored_joints[frame], dtype=np.float64
+            ).copy()
+            leg_addresses = np.concatenate(adapter._leg_qpos)
+            leg_mask = np.isin(adapter._joint_addresses, leg_addresses)
+            continuity_candidate[leg_mask] = adapted_joints[frame - 1][
+                leg_mask
+            ]
+            continuity_feet = adapter.sole_positions_for_pose(
                 root_position=mapped_roots[frame],
                 root_quaternion_wxyz=mapped_quaternions[frame],
-                authored_joints=authored_joints[frame],
-                sole_targets_world=target_soles[frame],
-                initial_joints=(adapted_joints[frame - 1] if frame else None),
+                joints=continuity_candidate,
             )
+            continuity_error = max(
+                float(
+                    np.max(
+                        np.linalg.norm(
+                            target_soles[frame][foot]
+                            - continuity_feet[foot],
+                            axis=1,
+                        )
+                    )
+                )
+                for foot in range(2)
+            )
+            candidates.append(
+                (
+                    continuity_candidate,
+                    float(
+                        np.max(
+                            np.abs(
+                                continuity_candidate
+                                - authored_joints[frame]
+                            )
+                        )
+                    ),
+                    continuity_error,
+                )
+            )
+        acceptable = [
+            value
+            for value in candidates
+            if value[2] <= float(ik_continuity_acceptable_error_m)
+        ]
+        if acceptable:
+            near_best = acceptable
+        else:
+            best_error = min(value[2] for value in candidates)
+            near_best = [
+                value
+                for value in candidates
+                if value[2] <= best_error + 0.002
+            ]
+        selected = min(
+            near_best,
+            key=lambda value: (
+                (
+                    0.0
+                    if not frame
+                    else float(
+                        np.max(
+                            np.abs(value[0] - adapted_joints[frame - 1])
+                        )
+                    )
+                ),
+                value[1],
+            ),
         )
+        adapted_joints[frame], corrections[frame], errors[frame] = selected
+        if frame and post_selection_maximum_joint_step_rad is not None:
+            maximum_step = float(post_selection_maximum_joint_step_rad)
+            if not math.isfinite(maximum_step) or maximum_step <= 0.0:
+                raise ValueError("post-selection joint step must be positive")
+            adapted_joints[frame] = np.clip(
+                adapted_joints[frame],
+                adapted_joints[frame - 1] - maximum_step,
+                adapted_joints[frame - 1] + maximum_step,
+            )
+            corrections[frame] = float(
+                np.max(
+                    np.abs(
+                        adapted_joints[frame] - authored_joints[frame]
+                    )
+                )
+            )
         final_feet = adapter.sole_positions_for_pose(
             root_position=mapped_roots[frame],
             root_quaternion_wxyz=mapped_quaternions[frame],
@@ -1088,11 +1422,14 @@ def warp_motion(
             )
             support = final_feet[foot].copy()
             support[:, 2] -= sphere_radii[foot]
-            target_support_count[frame, foot] = sum(
-                abs(float(point[2]) - _terrain_height(target_mesh, point[:2], ray_z))
-                <= 0.020
-                for point in support
-            )
+            support_points = 0
+            for point in support:
+                height = _terrain_height(target_mesh, point[:2], ray_z)
+                if not math.isfinite(height) and ground_fallback_height_m is not None:
+                    height = float(ground_fallback_height_m)
+                if abs(float(point[2]) - height) <= 0.020:
+                    support_points += 1
+            target_support_count[frame, foot] = support_points
         errors[frame] = float(np.max(errors_by_foot[frame]))
 
     advertised_support = target_support_count[stance]
@@ -1198,6 +1535,47 @@ def warp_motion(
         ),
         "per_frame_joint_correction_rad": np.asarray(
             corrections, dtype=np.float32
+        ),
+        "target_sole_center_world": np.asarray(
+            [
+                [np.mean(value, axis=0) for value in frame]
+                for frame in target_soles
+            ],
+            dtype=np.float32,
+        ),
+        "target_sole_points_world": np.asarray(
+            target_soles_array, dtype=np.float32
+        ),
+        "nominal_sole_center_world": np.asarray(
+            np.mean(nominal_targets, axis=2), dtype=np.float32
+        ),
+        "adapted_sole_center_world": np.asarray(
+            adapted_centres, dtype=np.float32
+        ),
+        "terrain_root_anchor_shift_world": np.asarray(
+            root_anchor_shift, dtype=np.float32
+        ),
+        "bracketed_swing_mask": np.asarray(
+            (
+                bracketed_swing
+                if target_route is not None
+                else np.zeros(stance.shape, dtype=bool)
+            ),
+            dtype=np.bool_,
+        ),
+        "per_frame_swing_route_adjustment": np.asarray(
+            (
+                swing_route_adjustment
+                if target_route is not None
+                else np.zeros((len(stance), 2, 3), dtype=np.float64)
+            ),
+            dtype=np.float32,
+        ),
+        "terrain_root_height_offset_m": np.asarray(
+            height_offset, dtype=np.float32
+        ),
+        "terrain_root_progress_offset_m": np.asarray(
+            progress_offset, dtype=np.float32
         ),
     }
     return motion, diagnostics, extras

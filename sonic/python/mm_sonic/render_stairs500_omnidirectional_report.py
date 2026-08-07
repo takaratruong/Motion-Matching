@@ -37,7 +37,10 @@ def main() -> None:
     arguments = parser.parse_args()
     report_path = arguments.report.expanduser().resolve()
     report = json.loads(report_path.read_text())
-    if report.get("status") != "accepted":
+    if report.get("status") not in {
+        "accepted",
+        "pending_dense_visual_review",
+    }:
         raise ValueError("refusing to render a rejected directional pilot")
     motion = load_stitched_motion_npz(report_path.parent / "motion.npz")
     path_extent = float(

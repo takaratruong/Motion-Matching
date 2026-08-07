@@ -1983,3 +1983,48 @@ zigzag families instead of filling the quota with basic straight climbs.
 `selection.routes.png` plots every realized and intended route by source bank,
 and `sonic_bundle` packages all 200 exact motion/terrain pairs for tracker
 fine-tuning and noisy collection.
+
+### True lateral stair gait and expanded exotic bank (2026-08-07)
+
+The fixed-stair bank now distinguishes two useful but different cases.  The
+existing clip-473 pair approaches at approximately 50 degrees and blends into
+stair-forward travel.  A new MotionBricks-derived tier instead preserves a
+real lateral gait while the robot ascends with its pelvis approximately 92
+degrees from the direction of travel.  It is not a forward climb rotated over
+the mesh.
+
+The lateral construction uses the flat MotionBricks side-step source
+`omni__omni_steady_s40_t2_h0.npz`, assigns alternating lead/catch footholds on
+the registered stair, and solves a globally smooth pelvis-height path through
+the per-frame leg-reach feasible sets.  After each pelvis edit, both legs are
+refit to the unchanged world-space sole targets.  Small contact-preserving
+mesh offsets clear the rendered foot hull, while swing-only repair handles
+remaining non-contact collisions.  Uniform cadence scaling and local adaptive
+subdivision bound joint/root discontinuities.  Stance labels are conservatively
+resampled so interpolation across takeoff or landing cannot be mistaken for a
+grounded frame.
+
+Root-only clearance was explicitly rejected: although it cleared collision,
+it made stance feet hover by roughly 3 cm.  Every retained lateral motion is
+instead re-audited against the exact target mesh and must satisfy at most 5 mm
+foot penetration, zero forbidden-body penetration, at least two sole probes
+within 10 mm on every stance foot, at most 12 mm stance target error and drift,
+0.20 rad joint step, 0.035 m root step, 0.08 rad root-rotation step, and 30
+m/s^2 root acceleration.
+
+Four strict side-on ascents are accepted: native and mirrored versions on
+clips 364 and 456.  Clip 364 has 91.885-degree body-to-travel separation,
+2.807 mm maximum foot penetration, 3.595 mm maximum stance target error, and
+1.523 mm maximum stance drift.  Clip 456 has 91.685-degree separation, 4.629
+mm maximum foot penetration, 4.185 mm target error, and 1.650 mm drift.  Both
+have zero forbidden-body penetration.  Their artifacts are under
+`motionbricks_side_on_contact_refit_v1/{clip364_accepted,clip364_accepted_mirror,clip456_scale140,clip456_scale140_mirror}`;
+each native directory includes dense side and overhead review renders.
+
+The resulting collection is
+`terrain_maneuver_collection_v1/balanced_exotic204_sideon_v1`.  It contains
+204 clips from 67 physical terrain sources: the four strict side-on ascents,
+the symmetric 50-degree approach pair, 70 stop/restarts, 70 reversals, 58
+bounces, and four other direct clips.  Traversal coverage is 69 ascents, 55
+descents, and 80 curb/slope round trips.  `selection.routes.png` plots all
+realized and intended routes, including the new side-on source bank.
