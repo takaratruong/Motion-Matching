@@ -236,6 +236,27 @@ then pool its admitted noisy rollouts with the universal tracker's admitted
 rollouts.  SONIC is an offline data generator here, so family routing is
 preferable to admitting falls from a nominally universal checkpoint.
 
+The reversal-only tracker qualifies 28, 36, 48, and 49 motions at iterations
+50, 100, 200, and 300.  Keep iteration 300 as the main reversal route and
+iteration 200 for its extra uphill cases.  Across all deterministic universal
+and specialist gates, 168/200 motions have at least one strict route.  The first
+collection tranche avoids duplicates by adding 28 iteration-300 reversals, 11
+iteration-200 reversals, and 3 iteration-100 reversals that iteration 400 did
+not already qualify.
+
+The first iteration-400 collection retains 236/240 requested rollouts from
+118/120 motions, totaling 38.96 minutes at 50 Hz.  Every stored rollout passes
+the same failure and 300 mm filter (median 195.5 mm, p90 267.7 mm).  Two
+descent-reversal motions produced no acceptable noisy rollout after more than
+30 attempts each.  Treat the resulting nonzero collector exit as a partial
+quota, not a corrupt dataset: preserve the 236 admitted episodes and exclude
+the two torque-fragile motions from this checkpoint's route.
+
+Visual evidence for the retained noisy data is
+`/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/noised_selected120_step400_review4_v1/noised_selected120_step400_review4_grid.mp4`.
+It contains one median-error rollout from every ascent/descent x stop/reversal
+cell and should accompany the numeric receipt when this tranche is handed off.
+
 ## Per-clip record
 
 Store the clean kinematics and the causal information needed downstream:

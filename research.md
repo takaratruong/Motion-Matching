@@ -1571,6 +1571,36 @@ early or retain excessive pose error, rather than hiding a terrain teleport.
 
 The 120 iteration-400 strict passes have been repackaged as
 `selected120_step400_qualified_bundle_v1`.  A separate equal-weight 100-motion
-reversal bundle is being fine-tuned from iteration 200, because further
+reversal tracker was fine-tuned from universal iteration 200, because further
 universal training already showed diminishing returns on the hard ascent
-reversals.  No rejected motion is included in the queued noised pilot.
+reversals.  Its deterministic progression is:
+
+| specialist iteration | survived | strict passes | up strict | down strict |
+| ---: | ---: | ---: | ---: | ---: |
+| 50 | 59/100 | 28/100 | 10/50 | 18/50 |
+| 100 | 63/100 | 36/100 | 14/50 | 22/50 |
+| 200 | **70/100** | 48/100 | **20/50** | 28/50 |
+| 300 | 66/100 | **49/100** | 19/50 | **30/50** |
+
+Iteration 300 is the best single reversal checkpoint, while iteration 200 is
+retained for its slightly better uphill coverage.  The union of the specialist
+checkpoints qualifies 66/100 reversals; routing across both universal and
+specialist checkpoint families qualifies 168/200 motions overall.  For the
+first noised pilot, iteration 400 supplies 120 motions and specialist
+iterations 300, 200, and 100 supply 28, 11, and 3 additional non-overlapping
+reversals.  No rejected motion is admitted to those bundles.
+
+The iteration-400 noised pilot produced 236 accepted full rollouts from 118 of
+the 120 qualified motions: two rollouts per retained motion, 116,874 frames, or
+38.96 minutes at 50 Hz.  All stored episodes have `episode_failed=false`; peak
+MPJPE has median 195.5 mm, p90 267.7 mm, and maximum 298.7 mm.  The retained
+coverage is 48 ascent stops, 46 descent stops, 7 ascent reversals, and 17
+descent reversals.  Only the clip-135 and clip-191 descent reversals remained at
+zero successes after 32--34 noised attempts each, so they are excluded rather
+than causing the other 236 successful rollouts to be repeated.
+
+The stratified noisy-rollout review is
+`/move/data/terrain-aware/sonic-rollouts/terrain_maneuver_stairs500_v1/noised_selected120_step400_review4_v1/noised_selected120_step400_review4_grid.mp4`.
+It shows median-error ascent/descent stop and reversal episodes.  All four stay
+grounded, traverse the registered stairs, execute the event, and finish upright;
+there is no visible root teleport, terrain hover, or staircase penetration.
