@@ -1328,6 +1328,32 @@ def _slerp_midpoint_xyzw(left: np.ndarray, right: np.ndarray) -> np.ndarray:
     return midpoint / midpoint_norm
 
 
+def _slerp_xyzw(
+    left: np.ndarray, right: np.ndarray, fraction: np.ndarray
+) -> np.ndarray:
+    """Shortest-arc interpolation of normalized XYZW quaternion rows."""
+
+    q0 = np.asarray(left, dtype=np.float64)
+    q1 = np.asarray(right, dtype=np.float64)
+    norm0 = np.linalg.norm(q0, axis=1, keepdims=True)
+    norm1 = np.linalg.norm(q1, axis=1, keepdims=True)
+    if np.any(norm0 < 1.0e-12) or np.any(norm1 < 1.0e-12):
+        raise ValueError("root quaternions must be nonzero")
+    q0 = q0 / norm0
+    q1 = q1 / norm1
+    q1 = np.where(np.sum(q0 * q1, axis=1, keepdims=True) < 0.0, -q1, q1)
+    dot = np.clip(np.sum(q0 * q1, axis=1, keepdims=True), -1.0, 1.0)
+    theta = np.arccos(dot)
+    sine = np.sin(theta)
+    fraction_array = np.asarray(fraction, dtype=np.float64)[:, None]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        left_weight = np.sin((1.0 - fraction_array) * theta) / sine
+        right_weight = np.sin(fraction_array * theta) / sine
+    linear = (1.0 - fraction_array) * q0 + fraction_array * q1
+    output = np.where(sine < 1.0e-7, linear, left_weight * q0 + right_weight * q1)
+    return output / np.linalg.norm(output, axis=1, keepdims=True)
+
+
 def resample_grail_motion(
     root_position: object,
     root_quaternion_xyzw: object,
@@ -1336,7 +1362,7 @@ def resample_grail_motion(
     source_fps: float,
     target_fps: float,
 ) -> ResampledGrailMotion:
-    """Interpolate one GRAIL clip from exactly 25 Hz to exactly 50 Hz.
+    """Interpolate one GRAIL clip from exactly 25 Hz to 30 or 50 Hz.
 
     A clip with ``T`` source samples spans ``T - 1`` source intervals, so the
     result contains ``2 * (T - 1) + 1`` rows.  In particular, a released
@@ -1344,8 +1370,8 @@ def resample_grail_motion(
     invented.
     """
 
-    if float(source_fps) != 25.0 or float(target_fps) != 50.0:
-        raise ValueError("GRAIL terrain import supports exactly 25 Hz to 50 Hz")
+    if float(source_fps) != 25.0 or float(target_fps) not in (30.0, 50.0):
+        raise ValueError("GRAIL terrain import supports exactly 25 Hz to 30 or 50 Hz")
     root = _finite_array(
         root_position, shape_tail=(3,), label="root_position"
     )
@@ -1359,6 +1385,22 @@ def resample_grail_motion(
     )
     if len(root) < 2 or len(quaternion) != len(root) or len(joints) != len(root):
         raise ValueError("GRAIL motion arrays must have the same T >= 2")
+
+    if float(target_fps) == 30.0:
+        count = round(len(root) * 30 / 25)
+        target_coordinates = np.arange(count, dtype=np.float64) * (25.0 / 30.0)
+        left = np.minimum(np.floor(target_coordinates).astype(np.int64), len(root) - 1)
+        right = np.minimum(left + 1, len(root) - 1)
+        fraction = np.clip(target_coordinates - left, 0.0, 1.0)
+        output_root = (1.0 - fraction[:, None]) * root[left] + fraction[:, None] * root[right]
+        output_joints = (1.0 - fraction[:, None]) * joints[left] + fraction[:, None] * joints[right]
+        output_quaternion = _slerp_xyzw(quaternion[left], quaternion[right], fraction)
+        return ResampledGrailMotion(
+            root_position=np.ascontiguousarray(output_root, dtype=np.float32),
+            root_quaternion_xyzw=np.ascontiguousarray(output_quaternion, dtype=np.float32),
+            dof_mujoco=np.ascontiguousarray(output_joints, dtype=np.float32),
+            fps=30.0,
+        )
 
     count = 2 * (len(root) - 1) + 1
     output_root = np.empty((count, 3), dtype=np.float64)
