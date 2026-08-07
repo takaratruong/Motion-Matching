@@ -6,6 +6,8 @@ import argparse
 import json
 from pathlib import Path
 
+import numpy as np
+
 from .render_stitched_motion import (
     load_stitched_motion_npz,
     render_stitched_motion,
@@ -37,8 +39,13 @@ def main() -> None:
     report = json.loads(report_path.read_text())
     if report.get("status") != "accepted":
         raise ValueError("refusing to render a rejected directional pilot")
+    motion = load_stitched_motion_npz(report_path.parent / "motion.npz")
+    path_extent = float(
+        np.max(np.ptp(np.asarray(motion.root_position_world)[:, :2], axis=0))
+    )
+    overhead_distance = float(np.clip(1.10 * path_extent + 1.6, 2.8, 5.2))
     result = render_stitched_motion(
-        load_stitched_motion_npz(report_path.parent / "motion.npz"),
+        motion,
         model_path=arguments.model,
         output_path=arguments.output,
         archive_path=arguments.archive,
@@ -52,7 +59,9 @@ def main() -> None:
         camera_elevation_deg=(
             -16.0 if arguments.view == "side" else -68.0
         ),
-        camera_distance=(2.8 if arguments.view == "side" else 5.2),
+        camera_distance=(
+            2.8 if arguments.view == "side" else overhead_distance
+        ),
         camera_follow_root=arguments.view == "side",
     )
     print(json.dumps(result, indent=2, sort_keys=True))
