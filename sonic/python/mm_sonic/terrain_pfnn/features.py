@@ -25,7 +25,11 @@ from mm_sonic.terrain_oracle.math3d import quaternion_multiply_wxyz
 from .layout import INPUT_LAYOUT, OUTPUT_LAYOUT, TRAJECTORY_TIMES_S
 from .phase import ContactPhaseTrack
 from .sources import PFNNSourceClip
-from .splits import SplitName, split_identity as sealed_split_identity
+from .splits import (
+    SplitName,
+    split_identity as sealed_split_identity,
+    terrain_identity as canonical_split_identity,
+)
 
 
 TerrainClass = Literal["flat", "ascent", "descent", "transition"]
@@ -85,7 +89,8 @@ class PFNNTrainingWindow:
     y: np.ndarray
     phase: float
     clip_id: str
-    split_identity: SplitName
+    split_identity: str
+    split: SplitName
     center_frame: int
     motion_sha256: str
     terrain_sha256: str | None
@@ -100,10 +105,12 @@ class PFNNTrainingWindow:
         object.__setattr__(self, "phase", phase)
         if type(self.clip_id) is not str or not self.clip_id:
             raise ValueError("clip_id must be a nonempty string")
-        if self.split_identity not in ("train", "validation", "test"):
-            raise ValueError("split_identity must be train, validation, or test")
-        if self.split_identity != sealed_split_identity(self.clip_id):
-            raise ValueError("split_identity does not match the sealed split")
+        if self.split_identity != canonical_split_identity(self.clip_id):
+            raise ValueError("split_identity must equal the canonical identity")
+        if self.split not in ("train", "validation", "test"):
+            raise ValueError("split must be train, validation, or test")
+        if self.split != sealed_split_identity(self.split_identity):
+            raise ValueError("split does not match the sealed split")
         if self.terrain_class not in ("flat", "ascent", "descent", "transition"):
             raise ValueError("terrain_class is invalid")
         if type(self.center_frame) is not int or self.center_frame < 0:
@@ -486,7 +493,8 @@ def _pack_window(
         y=y,
         phase=(0.0 if idle else float(phase_track.phase[center_frame])) % _TWO_PI,
         clip_id=clip.clip_id,
-        split_identity=sealed_split_identity(clip.clip_id),
+        split_identity=canonical_split_identity(clip.clip_id),
+        split=sealed_split_identity(clip.clip_id),
         center_frame=center_frame,
         motion_sha256=clip.motion_sha256,
         terrain_sha256=clip.terrain_sha256,
@@ -622,6 +630,7 @@ def mirror_window(window: PFNNTrainingWindow) -> PFNNTrainingWindow:
         phase=(window.phase + math.pi) % _TWO_PI,
         clip_id=_mirrored_clip_id(window.clip_id),
         split_identity=window.split_identity,
+        split=window.split,
         center_frame=window.center_frame,
         motion_sha256=window.motion_sha256,
         terrain_sha256=window.terrain_sha256,

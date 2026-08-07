@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
 from mm_sonic.build_terrain_pfnn_dataset import (
     _height_at,
     _deterministic_npz_bytes,
+    _select_families,
     canonical_json_sha256,
     source_root_records,
     write_pfnn_dataset,
@@ -27,8 +31,8 @@ from mm_sonic.terrain_pfnn.layout import (
     OUTPUT_LAYOUT,
     TRAJECTORY_TIMES_S,
 )
-from mm_sonic.terrain_pfnn.splits import split_identity
-from mm_sonic.terrain_pfnn.sources import _GRAIL_SOURCE_LICENSE_ID
+from mm_sonic.terrain_pfnn.splits import split_identity, terrain_identity
+from mm_sonic.terrain_pfnn.sources import GrailSlopeRecord, _GRAIL_SOURCE_LICENSE_ID
 
 
 _DIGEST_A = "a" * 64
@@ -44,7 +48,8 @@ def _window(clip_id: str, value: float, frame: int) -> PFNNTrainingWindow:
         y=y,
         phase=0.25 + frame * 0.01,
         clip_id=clip_id,
-        split_identity=split_identity(clip_id),
+        split_identity=terrain_identity(clip_id),
+        split=split_identity(clip_id),
         terrain_class="flat" if clip_id.startswith("walk") else "ascent",
         center_frame=frame,
         motion_sha256=_DIGEST_A,
@@ -70,8 +75,8 @@ def _source_records(windows: list[PFNNTrainingWindow]) -> dict[str, dict[str, st
             "motion_sha256": window.motion_sha256,
             "terrain_sha256": window.terrain_sha256 or "",
             "license_id": "test-only",
-            "split_identity": window.clip_id,
-            "split": window.split_identity,
+            "split_identity": window.split_identity,
+            "split": window.split,
         }
         for window in windows
     }
@@ -162,6 +167,38 @@ class TerrainPFNNDatasetTest(unittest.TestCase):
         right = {"a": {"x": "é", "y": 2}, "z": [3, 2, 1]}
         self.assertEqual(canonical_json_sha256(left), canonical_json_sha256(right))
 
+    def test_source_set_digest_is_stable_across_absolute_root_relocation(self) -> None:
+        first = self.root / "first"
+        second = self.root / "second"
+        first_manifest = self._write(first, self.windows)
+        relocated = _source_roots()
+        relocated["synthetic"]["path"] = "/relocated/source"
+        relocated["synthetic"]["license_manifest_path"] = "/relocated/LICENSE"
+        second_manifest = write_pfnn_dataset(
+            second,
+            self.windows,
+            source_roots=relocated,
+            source_records=_source_records(self.windows),
+            rejection_counts={"invalid_phase": 2},
+            max_windows_per_shard=2,
+        )
+        self.assertEqual(
+            first_manifest["source_set_digest_sha256"],
+            second_manifest["source_set_digest_sha256"],
+        )
+
+    def test_source_root_schema_rejects_non_string_values(self) -> None:
+        roots = _source_roots()
+        roots["synthetic"]["license_id"] = 7  # type: ignore[assignment]
+        with self.assertRaisesRegex(ValueError, "string"):
+            write_pfnn_dataset(
+                self.root / "dataset",
+                self.windows,
+                source_roots=roots,
+                source_records=_source_records(self.windows),
+                rejection_counts={},
+            )
+
     def test_source_roots_validate_license_manifests_and_lafan_inventory(self) -> None:
         grail = self.root / "GRAIL"
         lafan = self.root / "lafan" / "g1"
@@ -250,13 +287,44 @@ class TerrainPFNNDatasetTest(unittest.TestCase):
             atol=1.0e-6,
         )
 
+    def test_family_selection_excludes_and_records_failed_variants(self) -> None:
+        records = tuple(
+            GrailSlopeRecord(
+                stem=f"terrain_slopes__slope_000__{index:03d}",
+                terrain_id="slope_000",
+                robot_path=self.root / f"motion-{index}.pkl",
+                terrain_path=self.root / f"terrain-{index}.usd",
+            )
+            for index in range(3)
+        )
+
+        def grade(record: GrailSlopeRecord) -> float:
+            if record.stem.endswith("__001"):
+                raise ValueError("broken terrain")
+            return 10.0 + int(record.stem[-1])
+
+        with patch(
+            "mm_sonic.build_terrain_pfnn_dataset._traversed_grade",
+            side_effect=grade,
+        ):
+            selected, audit = _select_families(records, 1)
+
+        self.assertEqual(
+            [record.stem for record in selected],
+            [records[0].stem, records[2].stem],
+        )
+        self.assertEqual(
+            audit["variant_rejections"],
+            [{"clip_id": records[1].stem, "reason": "ValueError: broken terrain"}],
+        )
+
     def test_test_values_cannot_change_normalization_bytes(self) -> None:
         first = self.root / "first"
         second = self.root / "second"
         self._write(first, self.windows)
         changed = [
             _window(window.clip_id, 1.0e6, window.center_frame)
-            if window.split_identity == "test"
+            if window.split == "test"
             else window
             for window in self.windows
         ]
@@ -281,6 +349,36 @@ class TerrainPFNNDatasetTest(unittest.TestCase):
             np.testing.assert_array_equal(normal["split_counts"], (2, 1, 1))
             self.assertEqual(normal["split_identity_digest"].shape, ())
 
+    def test_writer_canonicalizes_near_wrap_phase_after_float32_cast(self) -> None:
+        window = replace(
+            self.windows[0], phase=np.nextafter(2.0 * math.pi, 0.0)
+        )
+        output = self.root / "dataset"
+        manifest = write_pfnn_dataset(
+            output,
+            [window],
+            source_roots=_source_roots(),
+            source_records=_source_records([window]),
+            rejection_counts={},
+        )
+        with np.load(output / manifest["shards"][0]["path"], allow_pickle=False) as data:
+            self.assertEqual(float(data["phase"][0]), 0.0)
+            self.assertLess(float(data["phase"][0]), 2.0 * math.pi)
+
+    def test_writer_revalidates_phase_instead_of_trusting_window_object(self) -> None:
+        for invalid in (2.0 * math.pi, -1.0e-9, float("nan")):
+            with self.subTest(invalid=invalid):
+                window = self.windows[0]
+                object.__setattr__(window, "phase", invalid)
+                with self.assertRaisesRegex(ValueError, "phase"):
+                    write_pfnn_dataset(
+                        self.root / f"invalid-{len(str(invalid))}",
+                        [window],
+                        source_roots=_source_roots(),
+                        source_records=_source_records([window]),
+                        rejection_counts={},
+                    )
+
     def test_loader_normalizes_and_scales_only_previous_body_inputs(self) -> None:
         output = self.root / "dataset"
         self._write(output, self.windows)
@@ -292,7 +390,8 @@ class TerrainPFNNDatasetTest(unittest.TestCase):
         self.assertEqual(sample["y"].shape, (268,))
         self.assertEqual(sample["phase"].shape, ())
         self.assertEqual(sample["clip_id"], "walk1_subject1")
-        self.assertEqual(sample["split_identity"], "train")
+        self.assertEqual(sample["split_identity"], "walk1_subject1")
+        self.assertEqual(sample["split"], "train")
         self.assertEqual(sample["terrain_class"], "flat")
         np.testing.assert_array_equal(
             sample["y"][OUTPUT_LAYOUT["contact_logit"]], (0.0, 1.0, 1.0, 0.0)
@@ -386,6 +485,42 @@ class TerrainPFNNDatasetTest(unittest.TestCase):
             retained_state,
         )
 
+    def test_incomplete_resume_deduplicates_canonicalized_wrap_phase(self) -> None:
+        output = self.root / "dataset"
+        windows = [
+            replace(
+                self.windows[0], phase=np.nextafter(2.0 * math.pi, 0.0)
+            ),
+            self.windows[1],
+        ]
+        original = write_pfnn_dataset(
+            output,
+            windows,
+            source_roots=_source_roots(),
+            source_records=_source_records(windows),
+            rejection_counts={},
+            max_windows_per_shard=1,
+        )
+        missing = original["shards"].pop()
+        (output / missing["path"]).unlink()
+        (output / "normalization.npz").unlink()
+        original["status"] = "building"
+        original.pop("normalization")
+        original.pop("dataset_digest_sha256")
+        (output / "manifest.json").write_text(json.dumps(original))
+
+        resumed = write_pfnn_dataset(
+            output,
+            windows,
+            source_roots=_source_roots(),
+            source_records=_source_records(windows),
+            rejection_counts={},
+            max_windows_per_shard=1,
+            resume=True,
+        )
+
+        self.assertEqual(sum(record["count"] for record in resumed["shards"]), 2)
+
     def test_loader_rejects_corrupt_shard_before_returning_samples(self) -> None:
         output = self.root / "dataset"
         manifest = self._write(output, self.windows)
@@ -426,7 +561,7 @@ class TerrainPFNNDatasetTest(unittest.TestCase):
         outside.write_bytes((output / record["path"]).read_bytes())
         record["path"] = "../outside.npz"
         (output / "manifest.json").write_text(json.dumps(manifest))
-        with self.assertRaisesRegex(ValueError, "escapes"):
+        with self.assertRaisesRegex(ValueError, "escapes|sealed grammar"):
             write_pfnn_dataset(
                 output,
                 self.windows,
@@ -483,6 +618,166 @@ class TerrainPFNNDatasetTest(unittest.TestCase):
         (output / "manifest.json").write_text(json.dumps(manifest))
         with self.assertRaisesRegex(ValueError, "duplicate shard path"):
             PFNNShardDataset(output, "train")
+
+    def test_recomputed_hashes_cannot_hide_row_provenance_tampering(self) -> None:
+        output = self.root / "dataset"
+        manifest = self._write(output, self.windows)
+        record = manifest["shards"][0]
+        shard = output / record["path"]
+        with np.load(shard, allow_pickle=False) as data:
+            arrays = {name: np.asarray(data[name]) for name in data.files}
+        arrays["motion_sha256"] = np.full(
+            record["count"], _DIGEST_B, dtype="<U64"
+        )
+        shard.write_bytes(_deterministic_npz_bytes(arrays))
+        record["sha256"] = hashlib.sha256(shard.read_bytes()).hexdigest()
+        manifest["dataset_digest_sha256"] = canonical_json_sha256(
+            {
+                "source_set_digest_sha256": manifest["source_set_digest_sha256"],
+                "shards": sorted(manifest["shards"], key=lambda item: item["path"]),
+                "normalization_sha256": manifest["normalization"]["sha256"],
+            }
+        )
+        (output / "manifest.json").write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, "row provenance"):
+            PFNNShardDataset(output, "train")
+        with self.assertRaisesRegex(ValueError, "row provenance"):
+            write_pfnn_dataset(
+                output,
+                self.windows,
+                source_roots=_source_roots(),
+                source_records=_source_records(self.windows),
+                rejection_counts={"invalid_phase": 2},
+                max_windows_per_shard=2,
+                resume=True,
+            )
+
+    def test_recomputed_hashes_cannot_hide_unknown_shard_clip(self) -> None:
+        output = self.root / "dataset"
+        manifest = self._write(output, self.windows)
+        record = manifest["shards"][0]
+        shard = output / record["path"]
+        with np.load(shard, allow_pickle=False) as data:
+            arrays = {name: np.asarray(data[name]) for name in data.files}
+        arrays["clip_id"] = np.full(
+            record["count"], "unknown_subject", dtype="<U128"
+        )
+        shard.write_bytes(_deterministic_npz_bytes(arrays))
+        record["sha256"] = hashlib.sha256(shard.read_bytes()).hexdigest()
+        manifest["dataset_digest_sha256"] = canonical_json_sha256(
+            {
+                "source_set_digest_sha256": manifest["source_set_digest_sha256"],
+                "shards": sorted(manifest["shards"], key=lambda item: item["path"]),
+                "normalization_sha256": manifest["normalization"]["sha256"],
+            }
+        )
+        (output / "manifest.json").write_text(json.dumps(manifest))
+
+        with self.assertRaisesRegex(ValueError, "unknown shard clip_id"):
+            PFNNShardDataset(output, "train")
+        with self.assertRaisesRegex(ValueError, "unknown shard clip_id"):
+            write_pfnn_dataset(
+                output,
+                self.windows,
+                source_roots=_source_roots(),
+                source_records=_source_records(self.windows),
+                rejection_counts={"invalid_phase": 2},
+                max_windows_per_shard=2,
+                resume=True,
+            )
+
+    def test_recomputed_hashes_cannot_hide_negative_center_frame(self) -> None:
+        output = self.root / "dataset"
+        manifest = self._write(output, self.windows)
+        record = manifest["shards"][0]
+        shard = output / record["path"]
+        with np.load(shard, allow_pickle=False) as data:
+            arrays = {name: np.asarray(data[name]) for name in data.files}
+        arrays["center_frame"] = np.full(
+            record["count"], -1, dtype=np.int32
+        )
+        shard.write_bytes(_deterministic_npz_bytes(arrays))
+        record["sha256"] = hashlib.sha256(shard.read_bytes()).hexdigest()
+        manifest["dataset_digest_sha256"] = canonical_json_sha256(
+            {
+                "source_set_digest_sha256": manifest["source_set_digest_sha256"],
+                "shards": sorted(manifest["shards"], key=lambda item: item["path"]),
+                "normalization_sha256": manifest["normalization"]["sha256"],
+            }
+        )
+        (output / "manifest.json").write_text(json.dumps(manifest))
+
+        with self.assertRaisesRegex(ValueError, "center_frame"):
+            PFNNShardDataset(output, "train")
+        with self.assertRaisesRegex(ValueError, "center_frame"):
+            write_pfnn_dataset(
+                output,
+                self.windows,
+                source_roots=_source_roots(),
+                source_records=_source_records(self.windows),
+                rejection_counts={"invalid_phase": 2},
+                max_windows_per_shard=2,
+                resume=True,
+            )
+
+    def test_normalization_metadata_tamper_fails_loader_and_resume(self) -> None:
+        output = self.root / "dataset"
+        manifest = self._write(output, self.windows)
+        normalization = output / "normalization.npz"
+        with np.load(normalization, allow_pickle=False) as data:
+            arrays = {name: np.asarray(data[name]) for name in data.files}
+        arrays["training_sample_count"] = np.asarray(999, dtype=np.int64)
+        normalization.write_bytes(_deterministic_npz_bytes(arrays))
+        manifest["normalization"]["sha256"] = hashlib.sha256(
+            normalization.read_bytes()
+        ).hexdigest()
+        manifest["dataset_digest_sha256"] = canonical_json_sha256(
+            {
+                "source_set_digest_sha256": manifest["source_set_digest_sha256"],
+                "shards": sorted(manifest["shards"], key=lambda item: item["path"]),
+                "normalization_sha256": manifest["normalization"]["sha256"],
+            }
+        )
+        (output / "manifest.json").write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, "normalization metadata"):
+            PFNNShardDataset(output, "train")
+        with self.assertRaisesRegex(ValueError, "normalization metadata"):
+            write_pfnn_dataset(
+                output,
+                self.windows,
+                source_roots=_source_roots(),
+                source_records=_source_records(self.windows),
+                rejection_counts={"invalid_phase": 2},
+                max_windows_per_shard=2,
+                resume=True,
+            )
+
+    def test_resume_requires_exact_shard_path_grammar(self) -> None:
+        output = self.root / "dataset"
+        manifest = self._write(output, self.windows)
+        record = manifest["shards"][0]
+        old_path = output / record["path"]
+        new_path = old_path.with_name("renamed_00000.npz")
+        old_path.rename(new_path)
+        record["path"] = new_path.relative_to(output).as_posix()
+        manifest["dataset_digest_sha256"] = canonical_json_sha256(
+            {
+                "source_set_digest_sha256": manifest["source_set_digest_sha256"],
+                "shards": sorted(manifest["shards"], key=lambda item: item["path"]),
+                "normalization_sha256": manifest["normalization"]["sha256"],
+            }
+        )
+        (output / "manifest.json").write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, "shard path"):
+            write_pfnn_dataset(
+                output,
+                self.windows,
+                source_roots=_source_roots(),
+                source_records=_source_records(self.windows),
+                rejection_counts={"invalid_phase": 2},
+                max_windows_per_shard=2,
+                resume=True,
+            )
 
 if __name__ == "__main__":
     unittest.main()

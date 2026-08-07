@@ -19,15 +19,27 @@ from .layout import (
     OUTPUT_LAYOUT,
     TRAJECTORY_TIMES_S,
 )
+from .provenance import (
+    DATASET_SCHEMA,
+    SPLITS,
+    canonical_json_sha256,
+    source_set_payload,
+    validate_normalization_metadata,
+    validate_shard_row_provenance,
+)
+from .splits import split_identity as sealed_split, terrain_identity
 
 
 SplitName = Literal["train", "validation", "test"]
-_SPLITS = ("train", "validation", "test")
+_SPLITS = SPLITS
 _SHARD_FIELDS = {
     "x", "y", "phase", "clip_id", "split_identity", "terrain_class",
     "center_frame", "motion_sha256", "terrain_sha256",
 }
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_SHARD_PATH_RE = re.compile(
+    r"^(train|validation|test)/shard_[0-9]{5}\.npz$"
+)
 _SOURCE_ROOT_FIELDS = {
     "path", "license_id", "license_manifest_path", "license_manifest_sha256"
 }
@@ -55,20 +67,9 @@ def _artifact_path(root: Path, relative: object) -> Path:
     return path
 
 
-def _canonical_json_sha256(payload: object) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            payload,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode("utf-8")
-    ).hexdigest()
-
-
 def _validate_manifest_contract(manifest: Mapping[str, object]) -> None:
     expected = {
-        "schema": "mm-sonic-terrain-pfnn-dataset/v1",
+        "schema": DATASET_SCHEMA,
         "status": "accepted",
         "fps": 30.0,
         "input_size": INPUT_LAYOUT.size,
@@ -93,7 +94,7 @@ def _validate_manifest_contract(manifest: Mapping[str, object]) -> None:
         or not isinstance(options, dict)
     ):
         raise ValueError("dataset manifest provenance is invalid")
-    digest_roots: dict[str, dict[str, str]] = {}
+    checked_roots: dict[str, dict[str, str]] = {}
     for name, raw in sorted(roots.items()):
         if type(name) is not str or not isinstance(raw, dict) \
                 or set(raw) != _SOURCE_ROOT_FIELDS:
@@ -102,9 +103,7 @@ def _validate_manifest_contract(manifest: Mapping[str, object]) -> None:
             raise ValueError("dataset source-root provenance is invalid")
         if _SHA256_RE.fullmatch(raw["license_manifest_sha256"]) is None:
             raise ValueError("dataset source-root digest is invalid")
-        digest_roots[name] = {
-            key: value for key, value in raw.items() if key != "path"
-        }
+        checked_roots[name] = dict(raw)
     derived_identities = {split: set() for split in _SPLITS}
     checked_records: dict[str, dict[str, str]] = {}
     assignments: dict[str, str] = {}
@@ -130,6 +129,8 @@ def _validate_manifest_contract(manifest: Mapping[str, object]) -> None:
                 and _SHA256_RE.fullmatch(raw["terrain_sha256"]) is None
             )
             or (raw["source_kind"] == "lafan" and raw["terrain_sha256"])
+            or raw["split_identity"] != terrain_identity(clip_id)
+            or raw["split"] != sealed_split(raw["split_identity"])
         ):
             raise ValueError("dataset source record provenance is invalid")
         identity = raw["split_identity"]
@@ -143,17 +144,10 @@ def _validate_manifest_contract(manifest: Mapping[str, object]) -> None:
     }
     if identities != expected_identities:
         raise ValueError("dataset split identities are stale")
-    source_payload = {
-        **{name: expected[name] for name in (
-            "schema", "fps", "input_size", "output_size", "joint_order",
-            "trajectory_times_s", "contact_order",
-        )},
-        "source_roots": digest_roots,
-        "source_records": checked_records,
-        "split_identities": expected_identities,
-        "build_options": dict(sorted(options.items())),
-    }
-    if _canonical_json_sha256(source_payload) != manifest.get(
+    source_payload = source_set_payload(
+        checked_roots, checked_records, expected_identities, options
+    )
+    if canonical_json_sha256(source_payload) != manifest.get(
         "source_set_digest_sha256"
     ):
         raise ValueError("dataset source-set digest mismatch")
@@ -198,6 +192,61 @@ def normalize_pfnn_output(
     return np.ascontiguousarray((value - mean) / std, dtype=np.float32)
 
 
+def _validated_shard_arrays(
+    path: Path,
+    record: Mapping[str, object],
+    source_records: Mapping[str, Mapping[str, str]],
+) -> dict[str, np.ndarray]:
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            if set(data.files) != _SHARD_FIELDS:
+                raise ValueError("shard fields do not match the contract")
+            cache = {name: np.asarray(data[name]) for name in data.files}
+    except (OSError, ValueError, KeyError) as error:
+        raise ValueError(f"invalid PFNN shard: {path}: {error}") from error
+    count = int(record["count"])
+    expected = {
+        "x": ((count, INPUT_LAYOUT.size), np.dtype(np.float32)),
+        "y": ((count, OUTPUT_LAYOUT.size), np.dtype(np.float32)),
+        "phase": ((count,), np.dtype(np.float32)),
+        "clip_id": ((count,), np.dtype("<U128")),
+        "split_identity": ((count,), np.dtype("<U128")),
+        "terrain_class": ((count,), np.dtype("<U10")),
+        "center_frame": ((count,), np.dtype(np.int32)),
+        "motion_sha256": ((count,), np.dtype("<U64")),
+        "terrain_sha256": ((count,), np.dtype("<U64")),
+    }
+    for name, (shape, dtype) in expected.items():
+        if cache[name].shape != shape or cache[name].dtype != dtype:
+            raise ValueError(f"shard field {name} has invalid shape or dtype")
+    if (
+        not np.isfinite(cache["x"]).all()
+        or not np.isfinite(cache["y"]).all()
+        or not np.isfinite(cache["phase"]).all()
+        or not np.isin(cache["terrain_class"], _TERRAIN_CLASSES).all()
+        or np.any(cache["phase"] < 0.0)
+        or np.any(cache["phase"].astype(np.float64) >= 2.0 * np.pi)
+        or not np.isin(
+            cache["y"][:, OUTPUT_LAYOUT["contact_logit"]], (0.0, 1.0)
+        ).all()
+        or any(
+            _SHA256_RE.fullmatch(str(value)) is None
+            for value in cache["motion_sha256"]
+        )
+        or any(
+            value and _SHA256_RE.fullmatch(str(value)) is None
+            for value in cache["terrain_sha256"]
+        )
+    ):
+        raise ValueError("shard values violate the phase/finiteness contract")
+    validate_shard_row_provenance(
+        cache,
+        split=str(record["split"]),
+        source_records=source_records,
+    )
+    return cache
+
+
 class PFNNShardDataset:
     """Lazy index over one split; source motion and terrain are never reopened."""
 
@@ -211,6 +260,7 @@ class PFNNShardDataset:
         except (OSError, json.JSONDecodeError) as error:
             raise ValueError("dataset manifest is missing or invalid") from error
         _validate_manifest_contract(manifest)
+        self._source_records = manifest["source_records"]
         all_records = manifest.get("shards")
         if not isinstance(all_records, list) or not all_records:
             raise ValueError("dataset manifest shards are invalid")
@@ -226,12 +276,18 @@ class PFNNShardDataset:
                 or record["count"] < 1
             ):
                 raise ValueError("manifest shard record is invalid")
+            path_match = _SHARD_PATH_RE.fullmatch(str(record["path"]))
+            if path_match is None or path_match.group(1) != record["split"]:
+                raise ValueError("manifest shard path violates the sealed grammar")
             shard_path = _artifact_path(self.root, record.get("path"))
             if shard_path in seen_paths:
                 raise ValueError("dataset manifest contains a duplicate shard path")
             seen_paths.add(shard_path)
             if not shard_path.is_file() or _sha256(shard_path) != record["sha256"]:
                 raise ValueError(f"dataset shard hash mismatch: {shard_path}")
+            _validated_shard_arrays(
+                shard_path, record, manifest["source_records"]
+            )
         self._records = [record for record in all_records if record["split"] == split]
         self._stops: list[int] = []
         total = 0
@@ -263,17 +319,41 @@ class PFNNShardDataset:
             ),
             "normalization_sha256": normalization_record.get("sha256"),
         }
-        dataset_digest = _canonical_json_sha256(dataset_payload)
+        dataset_digest = canonical_json_sha256(dataset_payload)
         if dataset_digest != manifest.get("dataset_digest_sha256"):
             raise ValueError("dataset digest mismatch")
         try:
             with np.load(normalization_path, allow_pickle=False) as data:
-                self.x_mean = np.asarray(data["x_mean"], dtype=np.float32)
-                self.x_std = np.asarray(data["x_std"], dtype=np.float32)
-                self.y_mean = np.asarray(data["y_mean"], dtype=np.float32)
-                self.y_std = np.asarray(data["y_std"], dtype=np.float32)
+                expected_normalization = {
+                    "x_mean": ((INPUT_LAYOUT.size,), np.dtype(np.float32)),
+                    "x_std": ((INPUT_LAYOUT.size,), np.dtype(np.float32)),
+                    "y_mean": ((OUTPUT_LAYOUT.size,), np.dtype(np.float32)),
+                    "y_std": ((OUTPUT_LAYOUT.size,), np.dtype(np.float32)),
+                    "training_sample_count": ((), np.dtype(np.int64)),
+                    "split_counts": ((3,), np.dtype(np.int64)),
+                    "split_order": ((3,), np.dtype("<U10")),
+                    "split_identity_digest": ((), np.dtype("<U64")),
+                }
+                if set(data.files) != set(expected_normalization):
+                    raise ValueError("normalization fields are invalid")
+                normalization_arrays = {
+                    name: np.asarray(data[name]) for name in data.files
+                }
+                for name, (shape, dtype) in expected_normalization.items():
+                    value = normalization_arrays[name]
+                    if value.shape != shape or value.dtype != dtype:
+                        raise ValueError(f"normalization field {name} is invalid")
+                validate_normalization_metadata(
+                    normalization_arrays,
+                    shard_records=all_records,
+                    split_identities=manifest["split_identities"],
+                )
+                self.x_mean = normalization_arrays["x_mean"]
+                self.x_std = normalization_arrays["x_std"]
+                self.y_mean = normalization_arrays["y_mean"]
+                self.y_std = normalization_arrays["y_std"]
         except (OSError, ValueError, KeyError) as error:
-            raise ValueError("normalization archive is missing or invalid") from error
+            raise ValueError(f"invalid normalization archive: {error}") from error
         # Exercise the complete normalization contract at construction time.
         normalize_pfnn_input(np.zeros(INPUT_LAYOUT.size), self.x_mean, self.x_std)
         normalize_pfnn_output(np.zeros(OUTPUT_LAYOUT.size), self.y_mean, self.y_std)
@@ -294,46 +374,7 @@ class PFNNShardDataset:
             return self._cache
         record = self._records[shard_index]
         path = _artifact_path(self.root, record["path"])
-        try:
-            with np.load(path, allow_pickle=False) as data:
-                if set(data.files) != _SHARD_FIELDS:
-                    raise ValueError("shard fields do not match the contract")
-                cache = {name: np.asarray(data[name]) for name in data.files}
-        except (OSError, ValueError, KeyError) as error:
-            raise ValueError(f"invalid PFNN shard: {path}") from error
-        count = int(record["count"])
-        expected = {
-            "x": ((count, INPUT_LAYOUT.size), np.dtype(np.float32)),
-            "y": ((count, OUTPUT_LAYOUT.size), np.dtype(np.float32)),
-            "phase": ((count,), np.dtype(np.float32)),
-            "clip_id": ((count,), np.dtype("<U128")),
-            "split_identity": ((count,), np.dtype("<U128")),
-            "terrain_class": ((count,), np.dtype("<U10")),
-            "center_frame": ((count,), np.dtype(np.int32)),
-            "motion_sha256": ((count,), np.dtype("<U64")),
-            "terrain_sha256": ((count,), np.dtype("<U64")),
-        }
-        for name, (shape, dtype) in expected.items():
-            if cache[name].shape != shape or cache[name].dtype != dtype:
-                raise ValueError(f"shard field {name} has invalid shape or dtype")
-        if (
-            not np.isfinite(cache["x"]).all()
-            or not np.isfinite(cache["y"]).all()
-            or not np.isfinite(cache["phase"]).all()
-            or not np.all(cache["split_identity"] == self.split)
-            or not np.isin(cache["terrain_class"], _TERRAIN_CLASSES).all()
-            or np.any(cache["phase"] < 0.0)
-            or np.any(cache["phase"].astype(np.float64) >= 2.0 * np.pi)
-            or not np.isin(
-                cache["y"][:, OUTPUT_LAYOUT["contact_logit"]], (0.0, 1.0)
-            ).all()
-            or any(_SHA256_RE.fullmatch(str(value)) is None for value in cache["motion_sha256"])
-            or any(
-                value and _SHA256_RE.fullmatch(str(value)) is None
-                for value in cache["terrain_sha256"]
-            )
-        ):
-            raise ValueError("shard values violate the split/finiteness contract")
+        cache = _validated_shard_arrays(path, record, self._source_records)
         self._cache_index = shard_index
         self._cache = cache
         return cache
@@ -357,6 +398,7 @@ class PFNNShardDataset:
             "phase": np.asarray(data["phase"][row], dtype=np.float32),
             "clip_id": str(data["clip_id"][row]),
             "split_identity": str(data["split_identity"][row]),
+            "split": self.split,
             "terrain_class": str(data["terrain_class"][row]),
             "center_frame": int(data["center_frame"][row]),
             "motion_sha256": str(data["motion_sha256"][row]),

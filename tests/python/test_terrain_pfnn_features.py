@@ -218,7 +218,8 @@ class TrainingWindowTest(unittest.TestCase):
         self.assertEqual(sample.clip_id, clip.clip_id)
         self.assertEqual(sample.motion_sha256, clip.motion_sha256)
         self.assertEqual(sample.terrain_sha256, clip.terrain_sha256)
-        self.assertEqual(sample.split_identity, split_identity(clip.clip_id))
+        self.assertEqual(sample.split_identity, terrain_identity(clip.clip_id))
+        self.assertEqual(sample.split, split_identity(sample.split_identity))
         self.assertEqual(sample.terrain_class, "ascent")
         terrain = sample.x[INPUT_LAYOUT["terrain_height"]].reshape(12, 3)
         self.assertTrue(np.isfinite(terrain).all())
@@ -610,7 +611,8 @@ class MirrorWindowTest(unittest.TestCase):
             y=y,
             phase=0.0,
             clip_id="walk1_subject1",
-            split_identity="train",
+            split_identity="walk1_subject1",
+            split="train",
             terrain_class="flat",
             center_frame=30,
             motion_sha256="a" * 64,
@@ -626,8 +628,10 @@ class MirrorWindowTest(unittest.TestCase):
         nonbinary[OUTPUT_LAYOUT["contact_logit"]] = (0.0, 1.0, 2.0, 0.0)
         with self.assertRaisesRegex(ValueError, "binary"):
             replace(window, y=nonbinary)
+        with self.assertRaisesRegex(ValueError, "canonical identity"):
+            replace(window, split_identity="walk2_subject3")
         with self.assertRaisesRegex(ValueError, "sealed split"):
-            replace(window, split_identity="validation")
+            replace(window, split="validation")
 
 
 if __name__ == "__main__":

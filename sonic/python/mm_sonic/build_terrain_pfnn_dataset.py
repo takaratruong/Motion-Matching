@@ -38,7 +38,19 @@ from mm_sonic.terrain_pfnn.layout import (
     OUTPUT_LAYOUT,
     TRAJECTORY_TIMES_S,
 )
-from mm_sonic.terrain_pfnn.phase import reconstruct_heel_toe_contacts
+from mm_sonic.terrain_pfnn.phase import (
+    _float32_wrapped_phase,
+    reconstruct_heel_toe_contacts,
+)
+from mm_sonic.terrain_pfnn.provenance import (
+    DATASET_SCHEMA,
+    SPLITS,
+    canonical_json_sha256,
+    source_set_payload,
+    split_identity_digest,
+    validate_normalization_metadata,
+    validate_shard_row_provenance,
+)
 from mm_sonic.terrain_pfnn.sources import (
     GrailSlopeRecord,
     discover_grail_slope_records,
@@ -48,10 +60,13 @@ from mm_sonic.terrain_pfnn.sources import (
 from mm_sonic.terrain_pfnn.splits import split_identity, terrain_identity
 
 
-_SCHEMA = "mm-sonic-terrain-pfnn-dataset/v1"
-_SPLITS = ("train", "validation", "test")
+_SCHEMA = DATASET_SCHEMA
+_SPLITS = SPLITS
 _TERRAIN_CLASSES = ("flat", "ascent", "descent", "transition")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_SHARD_PATH_RE = re.compile(
+    r"^(train|validation|test)/shard_[0-9]{5}\.npz$"
+)
 _SOURCE_ROOT_FIELDS = {
     "path", "license_id", "license_manifest_path", "license_manifest_sha256"
 }
@@ -63,13 +78,6 @@ _SHARD_FIELDS = {
     "x", "y", "phase", "clip_id", "split_identity", "terrain_class",
     "center_frame", "motion_sha256", "terrain_sha256",
 }
-
-
-def canonical_json_sha256(payload: object) -> str:
-    encoded = json.dumps(
-        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _sha256(path: Path) -> str:
@@ -224,7 +232,9 @@ def _validate_roots(source_roots: Mapping[str, Mapping[str, str]]) -> dict[str, 
             raise ValueError("source root names and records are invalid")
         if set(raw) != _SOURCE_ROOT_FIELDS:
             raise ValueError(f"source root {name!r} has invalid fields")
-        record = {field: str(raw[field]) for field in sorted(_SOURCE_ROOT_FIELDS)}
+        if any(type(raw[field]) is not str for field in _SOURCE_ROOT_FIELDS):
+            raise ValueError(f"source root {name!r} fields must be strings")
+        record = {field: raw[field] for field in sorted(_SOURCE_ROOT_FIELDS)}
         if not record["path"] or not record["license_id"] or not record["license_manifest_path"]:
             raise ValueError(f"source root {name!r} contains an empty field")
         if _SHA256_RE.fullmatch(record["license_manifest_sha256"]) is None:
@@ -259,6 +269,10 @@ def _validate_source_records(
             raise ValueError("split identities must be at most 128 characters")
         if record["split"] not in _SPLITS:
             raise ValueError(f"source record {clip_id!r} split is invalid")
+        if record["split_identity"] != terrain_identity(clip_id):
+            raise ValueError(f"source record {clip_id!r} canonical identity is invalid")
+        if record["split"] != split_identity(record["split_identity"]):
+            raise ValueError(f"source record {clip_id!r} sealed split is invalid")
         output[clip_id] = record
     return output
 
@@ -277,31 +291,6 @@ def _split_identities(records: Mapping[str, Mapping[str, str]]) -> dict[str, lis
     return result
 
 
-def _source_set_payload(
-    roots: Mapping[str, Mapping[str, str]],
-    records: Mapping[str, Mapping[str, str]],
-    identities: Mapping[str, list[str]],
-    build_options: Mapping[str, object],
-) -> dict[str, object]:
-    digest_roots = {
-        name: {key: value for key, value in record.items() if key != "path"}
-        for name, record in sorted(roots.items())
-    }
-    return {
-        "schema": _SCHEMA,
-        "fps": 30.0,
-        "input_size": INPUT_LAYOUT.size,
-        "output_size": OUTPUT_LAYOUT.size,
-        "joint_order": list(ISAACLAB_JOINT_NAMES),
-        "trajectory_times_s": TRAJECTORY_TIMES_S.tolist(),
-        "contact_order": list(CONTACT_ORDER),
-        "source_roots": digest_roots,
-        "source_records": dict(sorted(records.items())),
-        "split_identities": {name: sorted(identities[name]) for name in _SPLITS},
-        "build_options": dict(sorted(build_options.items())),
-    }
-
-
 def _window_arrays(windows: list[PFNNTrainingWindow]) -> dict[str, np.ndarray]:
     if not windows:
         raise ValueError("cannot write an empty shard")
@@ -314,10 +303,19 @@ def _window_arrays(windows: list[PFNNTrainingWindow]) -> dict[str, np.ndarray]:
             raise ValueError("terrain_class is invalid")
         if window.center_frame > np.iinfo(np.int32).max:
             raise ValueError("center_frame exceeds the int32 shard contract")
+        if not np.isfinite(window.phase) or not 0.0 <= window.phase < 2.0 * np.pi:
+            raise ValueError("window phase must be finite in [0, 2*pi)")
+    phase = _float32_wrapped_phase(
+        np.asarray([window.phase for window in windows], dtype=np.float64)
+    )
+    if np.any(phase.astype(np.float64) < 0.0) or np.any(
+        phase.astype(np.float64) >= 2.0 * np.pi
+    ):
+        raise ValueError("stored phase must remain in [0, 2*pi)")
     return {
         "x": np.ascontiguousarray([window.x for window in windows], dtype=np.float32),
         "y": np.ascontiguousarray([window.y for window in windows], dtype=np.float32),
-        "phase": np.asarray([window.phase for window in windows], dtype=np.float32),
+        "phase": phase,
         "clip_id": np.asarray([window.clip_id for window in windows], dtype="<U128"),
         "split_identity": np.asarray(
             [window.split_identity for window in windows], dtype="<U128"
@@ -337,7 +335,22 @@ def _window_arrays(windows: list[PFNNTrainingWindow]) -> dict[str, np.ndarray]:
     }
 
 
-def _validate_shard(path: Path, *, expected_count: int, expected_split: str) -> dict[str, np.ndarray]:
+def _window_key(
+    clip_id: object, center_frame: object, phase: object
+) -> tuple[str, int, bytes]:
+    canonical_phase = _float32_wrapped_phase(
+        np.asarray([phase], dtype=np.float64)
+    )[0]
+    return str(clip_id), int(center_frame), canonical_phase.tobytes()
+
+
+def _validate_shard(
+    path: Path,
+    *,
+    expected_count: int,
+    expected_split: str,
+    source_records: Mapping[str, Mapping[str, str]],
+) -> dict[str, np.ndarray]:
     try:
         with np.load(path, allow_pickle=False) as archive:
             if set(archive.files) != _SHARD_FIELDS:
@@ -362,22 +375,35 @@ def _validate_shard(path: Path, *, expected_count: int, expected_split: str) -> 
     if not np.isfinite(arrays["x"]).all() or not np.isfinite(arrays["y"]).all() \
             or not np.isfinite(arrays["phase"]).all():
         raise ValueError(f"shard {path} contains nonfinite values")
-    if not np.all(arrays["split_identity"] == expected_split):
-        raise ValueError(f"shard {path} crosses split boundaries")
+    if np.any(arrays["phase"] < 0.0) or np.any(
+        arrays["phase"].astype(np.float64) >= 2.0 * np.pi
+    ):
+        raise ValueError(f"shard {path} contains phase outside [0, 2*pi)")
     if not np.isin(arrays["terrain_class"], _TERRAIN_CLASSES).all():
         raise ValueError(f"shard {path} contains an invalid terrain class")
     if not np.isin(arrays["y"][:, OUTPUT_LAYOUT["contact_logit"]], (0.0, 1.0)).all():
         raise ValueError(f"shard {path} contains nonbinary contacts")
+    validate_shard_row_provenance(
+        arrays, split=expected_split, source_records=source_records
+    )
     return arrays
 
 
-def _write_shard(path: Path, windows: list[PFNNTrainingWindow], split: str) -> str:
+def _write_shard(
+    path: Path,
+    windows: list[PFNNTrainingWindow],
+    split: str,
+    source_records: Mapping[str, Mapping[str, str]],
+) -> str:
     arrays = _window_arrays(windows)
     _atomic_validated_npz(
         path,
         arrays,
         lambda temporary: _validate_shard(
-            temporary, expected_count=len(windows), expected_split=split
+            temporary,
+            expected_count=len(windows),
+            expected_split=split,
+            source_records=source_records,
         ),
     )
     return _sha256(path)
@@ -386,6 +412,7 @@ def _write_shard(path: Path, windows: list[PFNNTrainingWindow], split: str) -> s
 def _normalization_arrays(
     root: Path, shard_records: Iterable[Mapping[str, object]],
     split_identities: Mapping[str, list[str]],
+    source_records: Mapping[str, Mapping[str, str]],
 ) -> dict[str, np.ndarray]:
     x_sum = np.zeros(INPUT_LAYOUT.size, dtype=np.float64)
     x_squared_sum = np.zeros(INPUT_LAYOUT.size, dtype=np.float64)
@@ -400,7 +427,10 @@ def _normalization_arrays(
         if split != "train":
             continue
         arrays = _validate_shard(
-            root / str(record["path"]), expected_count=count, expected_split=split
+            root / str(record["path"]),
+            expected_count=count,
+            expected_split=split,
+            source_records=source_records,
         )
         x64 = np.asarray(arrays["x"], dtype=np.float64)
         y64 = np.asarray(arrays["y"], dtype=np.float64)
@@ -431,15 +461,18 @@ def _normalization_arrays(
         "split_counts": split_counts,
         "split_order": np.asarray(_SPLITS, dtype="<U10"),
         "split_identity_digest": np.asarray(
-            canonical_json_sha256(
-                {name: sorted(split_identities[name]) for name in _SPLITS}
-            ),
+            split_identity_digest(split_identities),
             dtype="<U64",
         ),
     }
 
 
-def _validate_normalization(path: Path) -> None:
+def _validate_normalization(
+    path: Path,
+    *,
+    shard_records: list[Mapping[str, object]],
+    split_identities: Mapping[str, list[str]],
+) -> None:
     expected = {
         "x_mean": ((INPUT_LAYOUT.size,), np.dtype(np.float32)),
         "x_std": ((INPUT_LAYOUT.size,), np.dtype(np.float32)),
@@ -465,8 +498,13 @@ def _validate_normalization(path: Path) -> None:
                 raise ValueError("normalization standard deviations must be positive")
             np.testing.assert_array_equal(data["y_mean"][OUTPUT_LAYOUT["contact_logit"]], 0.0)
             np.testing.assert_array_equal(data["y_std"][OUTPUT_LAYOUT["contact_logit"]], 1.0)
+            validate_normalization_metadata(
+                {name: np.asarray(data[name]) for name in data.files},
+                shard_records=shard_records,
+                split_identities=split_identities,
+            )
     except (OSError, ValueError, KeyError, AssertionError) as error:
-        raise ValueError(f"invalid normalization archive {path}") from error
+        raise ValueError(f"invalid normalization archive {path}: {error}") from error
 
 
 def _validate_resume_files(root: Path, manifest: Mapping[str, object]) -> None:
@@ -485,13 +523,21 @@ def _validate_resume_files(root: Path, manifest: Mapping[str, object]) -> None:
             or _SHA256_RE.fullmatch(record["sha256"]) is None
         ):
             raise ValueError("resume manifest shard split/count/digest is invalid")
+        path_match = _SHARD_PATH_RE.fullmatch(str(record["path"]))
+        if path_match is None or path_match.group(1) != record["split"]:
+            raise ValueError("resume shard path does not match the sealed grammar")
         path = _artifact_path(root, record["path"])
         if path in seen_paths:
             raise ValueError("resume manifest contains a duplicate shard path")
         seen_paths.add(path)
         if not path.is_file() or _sha256(path) != record["sha256"]:
             raise ValueError(f"resume shard hash mismatch: {path}")
-        _validate_shard(path, expected_count=int(record["count"]), expected_split=str(record["split"]))
+        _validate_shard(
+            path,
+            expected_count=int(record["count"]),
+            expected_split=str(record["split"]),
+            source_records=manifest["source_records"],
+        )
     normalization = manifest.get("normalization")
     if normalization is not None:
         if not isinstance(normalization, Mapping) or set(normalization) != {"path", "sha256"}:
@@ -499,7 +545,11 @@ def _validate_resume_files(root: Path, manifest: Mapping[str, object]) -> None:
         path = _artifact_path(root, normalization["path"])
         if not path.is_file() or _sha256(path) != normalization["sha256"]:
             raise ValueError("resume normalization hash mismatch")
-        _validate_normalization(path)
+        _validate_normalization(
+            path,
+            shard_records=shards,
+            split_identities=manifest["split_identities"],
+        )
 
 
 def _validate_resume_manifest_source(manifest: Mapping[str, object]) -> str:
@@ -513,7 +563,7 @@ def _validate_resume_manifest_source(manifest: Mapping[str, object]) -> str:
         if not isinstance(options, Mapping):
             raise ValueError("resume build options are invalid")
         digest = canonical_json_sha256(
-            _source_set_payload(roots, records, identities, options)
+            source_set_payload(roots, records, identities, options)
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("resume manifest source provenance is invalid") from error
@@ -540,6 +590,7 @@ def write_pfnn_dataset(
     source_roots: Mapping[str, Mapping[str, str]],
     source_records: Mapping[str, Mapping[str, str]],
     rejection_counts: Mapping[str, int],
+    source_rejections: Iterable[Mapping[str, str]] = (),
     build_options: Mapping[str, object] | None = None,
     max_windows_per_shard: int = 50_000,
     resume: bool = False,
@@ -553,9 +604,23 @@ def write_pfnn_dataset(
     records = _validate_source_records(source_records)
     identities = _split_identities(records)
     options = dict(build_options or {})
+    validated_source_rejections: list[dict[str, str]] = []
+    for item in source_rejections:
+        if (
+            not isinstance(item, Mapping)
+            or set(item) != {"clip_id", "reason"}
+            or type(item["clip_id"]) is not str
+            or not item["clip_id"]
+            or type(item["reason"]) is not str
+            or not item["reason"]
+        ):
+            raise ValueError("source rejections must contain clip_id and reason strings")
+        validated_source_rejections.append(dict(item))
+    validated_source_rejections.sort(key=lambda item: (item["clip_id"], item["reason"]))
+    options["source_rejections"] = validated_source_rejections
     options["max_windows_per_shard"] = max_windows_per_shard
     source_set_digest = canonical_json_sha256(
-        _source_set_payload(roots, records, identities, options)
+        source_set_payload(roots, records, identities, options)
     )
     rejections = _validated_rejections(rejection_counts)
 
@@ -602,12 +667,14 @@ def write_pfnn_dataset(
             raise ValueError("resume shard path is invalid") from error
         arrays = _validate_shard(
             _artifact_path(root, record["path"]),
-            expected_count=int(record["count"]), expected_split=split,
+            expected_count=int(record["count"]),
+            expected_split=split,
+            source_records=records,
         )
         for clip_id, frame, phase in zip(
             arrays["clip_id"], arrays["center_frame"], arrays["phase"]
         ):
-            key = (str(clip_id), int(frame), np.float32(phase).tobytes())
+            key = _window_key(clip_id, frame, phase)
             if key in completed_keys:
                 raise ValueError("resume dataset contains duplicate windows")
             completed_keys.add(key)
@@ -626,6 +693,7 @@ def write_pfnn_dataset(
         "split_identities": identities,
         "shards": shard_records,
         "rejections": rejections,
+        "source_rejections": validated_source_rejections,
         "build_options": options,
         "source_set_digest_sha256": source_set_digest,
     }
@@ -642,7 +710,7 @@ def write_pfnn_dataset(
         path = root / relative
         if path.exists():
             raise ValueError(f"resume would overwrite an unlisted shard: {path}")
-        digest = _write_shard(path, buffer, active_split)
+        digest = _write_shard(path, buffer, active_split, records)
         shard_records.append(
             {
                 "path": relative,
@@ -665,24 +733,21 @@ def write_pfnn_dataset(
         if (
             record["motion_sha256"] != window.motion_sha256
             or record["terrain_sha256"] != (window.terrain_sha256 or "")
-            or record["split"] != window.split_identity
+            or record["split_identity"] != window.split_identity
+            or record["split"] != window.split
         ):
             raise ValueError(
                 f"window provenance conflicts with source record {window.clip_id!r}"
             )
-        key = (
-            window.clip_id,
-            window.center_frame,
-            np.float32(window.phase).tobytes(),
-        )
+        key = _window_key(window.clip_id, window.center_frame, window.phase)
         if key in completed_keys:
             continue
         if key in seen_keys:
             raise ValueError("input contains duplicate windows")
         seen_keys.add(key)
-        if active_split is not None and window.split_identity != active_split:
+        if active_split is not None and window.split != active_split:
             flush()
-        active_split = window.split_identity
+        active_split = window.split
         buffer.append(window)
         if len(buffer) == max_windows_per_shard:
             flush()
@@ -690,9 +755,17 @@ def write_pfnn_dataset(
     base_manifest["rejections"] = _validated_rejections(rejection_counts)
 
     normalization_path = root / "normalization.npz"
-    normalization_arrays = _normalization_arrays(root, shard_records, identities)
+    normalization_arrays = _normalization_arrays(
+        root, shard_records, identities, records
+    )
     _atomic_validated_npz(
-        normalization_path, normalization_arrays, _validate_normalization
+        normalization_path,
+        normalization_arrays,
+        lambda temporary: _validate_normalization(
+            temporary,
+            shard_records=shard_records,
+            split_identities=identities,
+        ),
     )
     normalization_record = {
         "path": "normalization.npz", "sha256": _sha256(normalization_path)
@@ -858,25 +931,36 @@ def _select_families(
     for record in records:
         grouped.setdefault(record.terrain_id, []).append(record)
     selected: list[str] = []
-    grades: dict[str, float] = {}
+    selected_grades: dict[str, float] = {}
     skipped: dict[str, str] = {}
+    selected_records: list[GrailSlopeRecord] = []
+    variant_rejections: list[dict[str, str]] = []
     for identity in sorted(grouped):
         if limit is not None and len(selected) >= limit:
             skipped[identity] = "family_limit"
             continue
-        measured: list[float] = []
+        measured: list[tuple[GrailSlopeRecord, float]] = []
         for record in sorted(grouped[identity], key=lambda item: item.stem):
             try:
                 grade = _traversed_grade(record)
-            except (ArithmeticError, OSError, TypeError, ValueError):
+            except (ArithmeticError, OSError, TypeError, ValueError) as error:
+                variant_rejections.append(
+                    {
+                        "clip_id": record.stem,
+                        "reason": f"{type(error).__name__}: {error}",
+                    }
+                )
                 continue
-            if grade is not None:
-                measured.append(grade)
+            if grade is None:
+                variant_rejections.append(
+                    {"clip_id": record.stem, "reason": "grade_unmeasurable"}
+                )
+                continue
+            measured.append((record, grade))
         if not measured:
             skipped[identity] = "grade_unmeasurable"
             continue
-        grade = max(measured)
-        grades[identity] = grade
+        grade = max(value for _, value in measured)
         if grade < 5.0 - 1.0e-6:
             skipped[identity] = "grade_below_5_degrees"
             continue
@@ -884,14 +968,13 @@ def _select_families(
             skipped[identity] = "grade_above_20_degrees"
             continue
         selected.append(identity)
-    selected_set = set(selected)
-    chosen = tuple(
-        record for record in records if record.terrain_id in selected_set
-    )
-    return chosen, {
+        selected_grades[identity] = grade
+        selected_records.extend(record for record, _ in measured)
+    return tuple(selected_records), {
         "selected_identities": selected,
-        "selected_grades_degrees": grades,
+        "selected_grades_degrees": selected_grades,
         "skipped_identities": skipped,
+        "variant_rejections": variant_rejections,
     }
 
 
@@ -1034,6 +1117,7 @@ def main(argv: list[str] | None = None) -> int:
         source_roots=roots,
         source_records=source_records,
         rejection_counts=rejection_counts,
+        source_rejections=selection["variant_rejections"],
         build_options=build_options,
         resume=arguments.resume,
     )
