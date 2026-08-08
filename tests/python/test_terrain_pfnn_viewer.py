@@ -3,20 +3,48 @@ from __future__ import annotations
 from contextlib import redirect_stdout
 from io import StringIO
 import math
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 import numpy as np
 
 
 class TerrainPFNNViewerTests(unittest.TestCase):
+    def test_viewer_loads_raw_pfnn_runtime(self) -> None:
+        from mm_sonic.terrain_pfnn.runtime import TerrainPFNNRuntime
+        from mm_sonic.terrain_pfnn_viewer import _load_runtime, _parser
+
+        arguments = _parser().parse_args([])
+        terrain = object()
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "manifest.json"
+            manifest.write_text(
+                '{"dataset_digest_sha256":"' + ("a" * 64) + '"}',
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                TerrainPFNNRuntime, "from_checkpoint", return_value=object()
+            ) as factory:
+                _load_runtime(
+                    arguments,
+                    Path("checkpoint.pt"),
+                    manifest,
+                    Path("g1.xml"),
+                    terrain,
+                )
+
+        self.assertIs(factory.call_args.kwargs["command_driven_root"], False)
+
     def test_help_and_interactive_defaults_do_not_load_runtime(self) -> None:
         from mm_sonic.terrain_pfnn_viewer import _parser, main
 
         arguments = _parser().parse_args([])
         self.assertGreaterEqual(arguments.max_steps, 1_000_000)
         self.assertEqual(arguments.device, "cuda")
-        self.assertFalse(arguments.strict_envelope)
+        self.assertFalse(hasattr(arguments, "strict_envelope"))
 
         output = StringIO()
         with redirect_stdout(output), self.assertRaises(SystemExit) as raised:
@@ -24,7 +52,7 @@ class TerrainPFNNViewerTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 0)
         self.assertIn("--checkpoint", output.getvalue())
         self.assertIn("--no-viewer", output.getvalue())
-        self.assertIn("--strict-envelope", output.getvalue())
+        self.assertNotIn("--strict-envelope", output.getvalue())
 
     def test_wasd_command_is_bounded_and_release_stops(self) -> None:
         from mm_sonic.terrain_pfnn_viewer import _command_from_pressed

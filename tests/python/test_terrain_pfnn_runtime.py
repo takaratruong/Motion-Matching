@@ -307,8 +307,8 @@ class TerrainPFNNRuntimeTests(unittest.TestCase):
         runtime.step(np.zeros(2), camera_yaw=0.0)
         runtime.step(np.array((0.4, 0.0)), camera_yaw=0.0)
         packed = model.inputs[1][0, INPUT_LAYOUT["trajectory_position"]].reshape(12, 2)
-        # index 7 uses u=.2 and the prior predicted interval velocity is .12 m/s.
-        weight = math.sqrt(0.2)
+        # The author's non-responsive PFNN blend uses 1-(1-u)^0.5.
+        weight = 1.0 - math.sqrt(1.0 - 0.2)
         expected_velocity = (1.0 - weight) * 0.12 + weight * 0.4
         self.assertAlmostEqual(float(packed[7, 0]), expected_velocity / 6.0, places=6)
         self.assertAlmostEqual(float(packed[6, 0]), 0.0, places=7)

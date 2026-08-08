@@ -122,7 +122,7 @@ class TerrainPFNNRecurrenceTests(unittest.TestCase):
         )
         self.assertEqual(planned.semantic_intent[0, 11].tolist(), [1.0, 0.0])
         self.assertEqual(planned.semantic_intent[1, 11].tolist(), [0.0, 1.0])
-        weight = math.sqrt(0.2)
+        weight = 1.0 - math.sqrt(1.0 - 0.2)
         expected_velocity = torch.tensor(
             ((1.0 - weight) * 0.12, (1.0 - weight) * 0.12 + weight * 0.3),
             dtype=self.dtype,
@@ -130,6 +130,20 @@ class TerrainPFNNRecurrenceTests(unittest.TestCase):
         torch.testing.assert_close(planned.position_world_xy[:, 7, 0], expected_velocity / 6.0)
         repeated = plan_recurrent_trajectory(state, desired_velocity_world)
         torch.testing.assert_close(repeated.position_world_xy, planned.position_world_xy)
+
+    def test_planner_uses_published_direction_bias(self) -> None:
+        state = self.make_state()
+        desired_velocity_world = torch.tensor(
+            ((0.0, 0.3), (0.0, 0.3)), dtype=self.dtype
+        )
+
+        planned = plan_recurrent_trajectory(state, desired_velocity_world)
+
+        u = 0.2
+        weight = 1.0 - (1.0 - u) ** 2
+        expected = torch.tensor((1.0 - weight, weight), dtype=self.dtype)
+        expected = expected / torch.linalg.vector_norm(expected)
+        torch.testing.assert_close(planned.direction_world_xy[0, 7], expected)
 
     def test_training_command_uses_future_displacement_and_idle_semantic(self) -> None:
         position = torch.zeros((2, 12, 2), dtype=self.dtype)

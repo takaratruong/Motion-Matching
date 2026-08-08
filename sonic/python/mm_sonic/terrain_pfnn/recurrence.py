@@ -373,13 +373,16 @@ def plan_recurrent_trajectory(
             - state.predicted_position_world_xy[:, index - 1]
         ) / knot_dt
         u = times[index] / times[-1]
-        velocity_weight = torch.sqrt(u)
+        # Holden et al.'s non-responsive trajectory bias: future knots nearer
+        # the character retain more of the PFNN prediction, while distant
+        # knots converge to the requested velocity/direction.
+        velocity_weight = 1.0 - torch.sqrt(1.0 - u)
         velocity = (
             (1.0 - velocity_weight) * predicted_velocity
             + velocity_weight * desired_velocity_world
         )
         position_values.append(position_values[-1] + knot_dt * velocity)
-        facing_weight = u.square()
+        facing_weight = 1.0 - (1.0 - u).square()
         facing = (
             (1.0 - facing_weight) * state.predicted_direction_world_xy[:, index]
             + facing_weight * desired_direction
