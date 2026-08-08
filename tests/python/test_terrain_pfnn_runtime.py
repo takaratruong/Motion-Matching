@@ -24,6 +24,13 @@ from mm_sonic.evaluate_terrain_pfnn import (
 from mm_sonic.train_terrain_pfnn import validated_normal_selection
 from mm_sonic.terrain_pfnn.dataset import pfnn_input_sha256
 from mm_sonic.terrain_pfnn.layout import INPUT_LAYOUT, OUTPUT_LAYOUT, TRAJECTORY_TIMES_S
+from mm_sonic.terrain_pfnn.recurrence import (
+    PlannedTrajectory,
+    advance_recurrent_state,
+    initialize_recurrent_state,
+    pack_recurrent_input,
+    plan_recurrent_trajectory,
+)
 from mm_sonic.terrain_pfnn.runtime import (
     ClosedLoopRecorder,
     ClosedLoopScenario,
@@ -232,6 +239,55 @@ class TerrainPFNNRuntimeTests(unittest.TestCase):
             np.any(np.abs(second[INPUT_LAYOUT["trajectory_position"]]) > 1.0e-5)
         )
 
+    def test_tick_one_input_matches_direct_shared_recurrence_kernel(self) -> None:
+        checkpoint = FakeCheckpoint()
+        seed = checkpoint.runtime_seed
+        seed_position = seed["trajectory_position"].reshape(12, 2)
+        seed_position[:, 0] = torch.as_tensor(TRAJECTORY_TIMES_S, dtype=torch.float32)
+        self.bind_identity_bootstrap(checkpoint)
+        first_prediction = physical_output(body_position=0.4, body_velocity=-0.2)
+        model = FakeModel([first_prediction, physical_output()])
+        runtime = self.make_runtime(model, checkpoint=checkpoint)
+
+        runtime.step(np.zeros(2), camera_yaw=0.0)
+        runtime.step(np.array((0.3, 0.0)), camera_yaw=0.0)
+        captured_x_tick1 = model.inputs[1][0].numpy()
+
+        state = initialize_recurrent_state(
+            trajectory_position_local=seed["trajectory_position"].reshape(1, 12, 2),
+            trajectory_direction_local=seed["trajectory_direction"].reshape(1, 12, 2),
+            semantic_intent=seed["semantic_intent"].reshape(1, 12, 2),
+            previous_body_position_local=seed["body_position"].reshape(1, 30, 3),
+            previous_body_velocity_local=seed["body_velocity"].reshape(1, 30, 3),
+            phase=seed["phase"].reshape(1),
+            root_world_xy=seed["world_xy"].reshape(1, 2),
+            root_yaw_world=seed["world_yaw"].reshape(1),
+        )
+        bootstrap_planned = PlannedTrajectory(
+            position_world_xy=state.predicted_position_world_xy,
+            direction_world_xy=state.predicted_direction_world_xy,
+            semantic_intent=seed["semantic_intent"].reshape(1, 12, 2),
+        )
+        state = advance_recurrent_state(
+            state,
+            bootstrap_planned,
+            first_prediction.reshape(1, -1),
+            phase_advance_cap=torch.tensor((0.3,), dtype=torch.float32),
+        )
+        planned = plan_recurrent_trajectory(
+            state, torch.tensor(((0.3, 0.0),), dtype=torch.float32)
+        )
+        direct_x_tick1 = pack_recurrent_input(
+            state=state,
+            planned=planned,
+            terrain_height=torch.zeros((1, 12, 3), dtype=torch.float32),
+            x_mean=checkpoint.normalization["x_mean"],
+            x_std=checkpoint.normalization["x_std"],
+        )[0].numpy()
+
+        np.testing.assert_allclose(captured_x_tick1, direct_x_tick1, atol=3e-6, rtol=0.0)
+        self.assertEqual(runtime.frame.diagnostics.get("hold_reason"), None)
+
     def test_future_blend_uses_normalized_knot_time_and_interval_velocity(self) -> None:
         checkpoint = FakeCheckpoint()
         trajectory = checkpoint.runtime_seed["trajectory_position"].reshape(12, 2)
@@ -299,8 +355,10 @@ class TerrainPFNNRuntimeTests(unittest.TestCase):
         )
         runtime = self.make_runtime(model)
         accepted = runtime.step(np.zeros(2), camera_yaw=0.0)
+        accepted_recurrent_state = runtime._recurrent_state
         held = runtime.step(np.zeros(2), camera_yaw=0.0)
         self.assertEqual(held.diagnostics["hold_reason"], "joint_step")
+        self.assertIs(runtime._recurrent_state, accepted_recurrent_state)
         np.testing.assert_array_equal(held.root_position_world, accepted.root_position_world)
         np.testing.assert_array_equal(held.joint_position_isaaclab, accepted.joint_position_isaaclab)
         self.assertEqual(held.phase, accepted.phase)
@@ -321,6 +379,25 @@ class TerrainPFNNRuntimeTests(unittest.TestCase):
         frame = runtime.step(np.zeros(2), camera_yaw=0.0)
         self.assertEqual(model.inputs, [])
         self.assertIn("terrain", frame.diagnostics["hold_reason"])
+
+    def test_predicted_root_terrain_query_uses_exact_torch_commit_coordinate(self) -> None:
+        boundary = 1.0 / 30.0
+
+        def terrain(xy: np.ndarray) -> TerrainSample:
+            point = np.asarray(xy, dtype=np.float64)
+            degrees = 21.0 if point[0] > boundary else 0.0
+            tangent = math.tan(math.radians(degrees))
+            return TerrainSample(0.0, np.array((tangent, 0.0)))
+
+        model = FakeModel([physical_output(planar_velocity=(1.0, 0.0))])
+        runtime = self.make_runtime(model, terrain=terrain)
+        initial_state = runtime._recurrent_state
+
+        frame = runtime.step(np.zeros(2), camera_yaw=0.0)
+
+        self.assertEqual(frame.diagnostics["hold_reason"], "unsupported_predicted_root_terrain")
+        self.assertIs(runtime._recurrent_state, initial_state)
+        np.testing.assert_array_equal(frame.root_position_world[:2], (0.0, 0.0))
 
     def test_seed_world_xy_and_yaw_are_honored(self) -> None:
         checkpoint = FakeCheckpoint()

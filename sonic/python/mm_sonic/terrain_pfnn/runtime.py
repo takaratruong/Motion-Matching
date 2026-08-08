@@ -8,7 +8,6 @@ teacher-forced correction path.
 
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass, replace
 import hashlib
 import json
@@ -24,9 +23,17 @@ from mm_sonic.terrain_oracle.canonical import (
     ISAACLAB_JOINT_NAMES,
 )
 
-from .dataset import normalize_pfnn_input, pfnn_input_sha256
+from .dataset import pfnn_input_sha256
 from .kinematics import TorchG1ForwardKinematics, root_tilt_quaternion_wxyz
-from .layout import INPUT_LAYOUT, OUTPUT_LAYOUT, TRAJECTORY_TIMES_S
+from .layout import INPUT_LAYOUT, OUTPUT_LAYOUT
+from .recurrence import (
+    PlannedTrajectory,
+    _integrate_root_motion,
+    advance_recurrent_state,
+    initialize_recurrent_state,
+    pack_recurrent_input,
+    plan_recurrent_trajectory,
+)
 from .training import LoadedCheckpoint, load_checkpoint
 
 
@@ -35,7 +42,6 @@ DT = 1.0 / FPS
 TWO_PI = 2.0 * math.pi
 TERRAIN_HALF_WIDTH_M = 0.25
 MAXIMUM_GRADE_DEGREES = 20.0
-STATIONARY_SPEED_M_S = 0.05
 MAXIMUM_ROOT_TRANSLATION_STEP_M = 0.060
 MAXIMUM_ROOT_ROTATION_STEP_RAD = 0.35
 MAXIMUM_JOINT_STEP_RAD = 0.25
@@ -111,15 +117,6 @@ def _root_quaternion(yaw: float, tilt: np.ndarray) -> np.ndarray:
 def _quaternion_step(left: np.ndarray, right: np.ndarray) -> float:
     dot = abs(float(np.dot(left, right)))
     return 2.0 * math.acos(float(np.clip(dot, -1.0, 1.0)))
-
-
-def _sigmoid(value: np.ndarray) -> np.ndarray:
-    result = np.empty_like(value, dtype=np.float64)
-    positive = value >= 0.0
-    result[positive] = 1.0 / (1.0 + np.exp(-value[positive]))
-    exponential = np.exp(value[~positive])
-    result[~positive] = exponential / (1.0 + exponential)
-    return result
 
 
 @dataclass(frozen=True)
@@ -284,6 +281,9 @@ class TerrainPFNNRuntime:
         self._height_and_grade_at = height_and_grade_at
         self._checkpoint = checkpoint
         self._device = torch.device(device)
+        self._limits_tensor = torch.as_tensor(
+            self._limits, dtype=torch.float64, device=self._device
+        )
         self._model = getattr(checkpoint, "build_model")() if model is None else model
         if not isinstance(self._model, torch.nn.Module):
             raise TypeError("model must be a torch module")
@@ -298,6 +298,18 @@ class TerrainPFNNRuntime:
             ).copy()
             for name in ("x_mean", "x_std", "y_mean", "y_std")
         }
+        self._x_mean = torch.as_tensor(
+            self._normalization["x_mean"], dtype=torch.float32, device=self._device
+        )
+        self._x_std = torch.as_tensor(
+            self._normalization["x_std"], dtype=torch.float32, device=self._device
+        )
+        self._y_mean = torch.as_tensor(
+            self._normalization["y_mean"], dtype=torch.float64, device=self._device
+        )
+        self._y_std = torch.as_tensor(
+            self._normalization["y_std"], dtype=torch.float64, device=self._device
+        )
         q99 = float(getattr(checkpoint, "phase_advance_q99"))
         if not math.isfinite(q99) or q99 < 0.0:
             raise ValueError("checkpoint phase_advance_q99 is invalid")
@@ -354,19 +366,34 @@ class TerrainPFNNRuntime:
         world_direction = local_direction @ rotation.T
         trajectory = PFNNTrajectoryState(world_position, world_direction, semantic)
         contacts = seed_array("contact_label", (4,))
-        self._body_position = seed_array("body_position", (30, 3)).copy()
-        self._body_velocity = seed_array("body_velocity", (30, 3)).copy()
-        self._trajectory = trajectory
-        self._yaw = yaw
-        self._last_facing = np.asarray(trajectory.direction_world_xy[6]).copy()
-        self._history: deque[tuple[np.ndarray, np.ndarray, np.ndarray]] = deque(
-            maxlen=31
+        self._recurrent_state = initialize_recurrent_state(
+            trajectory_position_local=torch.tensor(
+                local_position, dtype=torch.float32, device=self._device
+            ).reshape(1, 12, 2),
+            trajectory_direction_local=torch.tensor(
+                local_direction, dtype=torch.float32, device=self._device
+            ).reshape(1, 12, 2),
+            semantic_intent=torch.tensor(
+                semantic, dtype=torch.float32, device=self._device
+            ).reshape(1, 12, 2),
+            previous_body_position_local=torch.tensor(
+                seed_array("body_position", (30, 3)),
+                dtype=torch.float32,
+                device=self._device,
+            ).reshape(1, 30, 3),
+            previous_body_velocity_local=torch.tensor(
+                seed_array("body_velocity", (30, 3)),
+                dtype=torch.float32,
+                device=self._device,
+            ).reshape(1, 30, 3),
+            phase=torch.tensor((phase,), dtype=torch.float32, device=self._device),
+            root_world_xy=torch.tensor(
+                root_xy, dtype=torch.float32, device=self._device
+            ).reshape(1, 2),
+            root_yaw_world=torch.tensor(
+                (yaw,), dtype=torch.float32, device=self._device
+            ),
         )
-        realized_semantic = np.asarray(semantic[6], dtype=np.float64)
-        for _ in range(31):
-            self._history.append(
-                (root_xy.copy(), self._last_facing.copy(), realized_semantic.copy())
-            )
         self._bootstrap_pending = True
         self._wall_tick = 0
         self._hold_count = 0
@@ -421,11 +448,21 @@ class TerrainPFNNRuntime:
 
     @property
     def previous_body_position(self) -> np.ndarray:
-        return self._body_position.copy()
+        return np.asarray(
+            self._recurrent_state.previous_body_position_local[0]
+            .to(device="cpu", dtype=torch.float64)
+            .numpy(),
+            dtype=np.float64,
+        ).copy()
 
     @property
     def previous_body_velocity(self) -> np.ndarray:
-        return self._body_velocity.copy()
+        return np.asarray(
+            self._recurrent_state.previous_body_velocity_local[0]
+            .to(device="cpu", dtype=torch.float64)
+            .numpy(),
+            dtype=np.float64,
+        ).copy()
 
     @property
     def joint_limits(self) -> np.ndarray:
@@ -481,60 +518,6 @@ class TerrainPFNNRuntime:
             return None
         return values  # type: ignore[return-value]
 
-    def _history_trajectory(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        rows = list(self._history)
-        indices = (0, 5, 10, 15, 20, 25, 30)
-        position = np.stack([rows[index][0] for index in indices])
-        direction = np.stack([rows[index][1] for index in indices])
-        semantic = np.stack([rows[index][2] for index in indices])
-        return position, direction, semantic
-
-    def _planned_trajectory(
-        self, desired_velocity_world: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        position = np.empty((12, 2), dtype=np.float64)
-        direction = np.empty((12, 2), dtype=np.float64)
-        semantic = np.empty((12, 2), dtype=np.float64)
-        history_position, history_direction, history_semantic = (
-            self._history_trajectory()
-        )
-        position[:7] = history_position
-        direction[:7] = history_direction
-        semantic[:7] = history_semantic
-        position[6] = self._frame.root_position_world[:2]
-        speed = float(np.linalg.norm(desired_velocity_world))
-        desired_direction = (
-            desired_velocity_world / speed if speed >= 1.0e-12 else self._last_facing
-        )
-        semantic[6] = (1.0, 0.0) if speed < STATIONARY_SPEED_M_S else (0.0, 1.0)
-        predicted_position = self._trajectory.position_world_xy
-        predicted_direction = self._trajectory.direction_world_xy
-        for index in range(7, 12):
-            knot_dt = float(TRAJECTORY_TIMES_S[index] - TRAJECTORY_TIMES_S[index - 1])
-            predicted_velocity = (
-                predicted_position[index] - predicted_position[index - 1]
-            ) / knot_dt
-            u = float(TRAJECTORY_TIMES_S[index] / TRAJECTORY_TIMES_S[-1])
-            velocity_weight = u**0.5
-            velocity = (
-                (1.0 - velocity_weight) * predicted_velocity
-                + velocity_weight * desired_velocity_world
-            )
-            position[index] = position[index - 1] + knot_dt * velocity
-            facing_weight = u**2.0
-            facing = (
-                (1.0 - facing_weight) * predicted_direction[index]
-                + facing_weight * desired_direction
-            )
-            norm = float(np.linalg.norm(facing))
-            direction[index] = desired_direction if norm < 1.0e-12 else facing / norm
-            semantic[index] = (
-                (1.0, 0.0)
-                if float(np.linalg.norm(velocity)) < STATIONARY_SPEED_M_S
-                else (0.0, 1.0)
-            )
-        return position, direction, semantic
-
     def _replan_and_sample(
         self,
         position: np.ndarray,
@@ -567,28 +550,6 @@ class TerrainPFNNRuntime:
             rows.append(row)
         return position, direction, semantic, _TerrainTrack(tuple(rows)), supported
 
-    def _pack(
-        self,
-        position_world: np.ndarray,
-        direction_world: np.ndarray,
-        semantic: np.ndarray,
-        terrain: _TerrainTrack,
-    ) -> np.ndarray:
-        rotation = _rotation_2d(self._yaw)
-        root_xy = self._frame.root_position_world[:2]
-        local_position = (position_world - root_xy) @ rotation
-        local_direction = direction_world @ rotation
-        raw = np.empty(INPUT_LAYOUT.size, dtype=np.float32)
-        raw[INPUT_LAYOUT["trajectory_position"]] = local_position.reshape(-1)
-        raw[INPUT_LAYOUT["trajectory_direction"]] = local_direction.reshape(-1)
-        raw[INPUT_LAYOUT["terrain_height"]] = terrain.relative_height.reshape(-1)
-        raw[INPUT_LAYOUT["semantic_intent"]] = semantic.reshape(-1)
-        raw[INPUT_LAYOUT["previous_body_position"]] = self._body_position.reshape(-1)
-        raw[INPUT_LAYOUT["previous_body_velocity"]] = self._body_velocity.reshape(-1)
-        if not np.isfinite(raw).all():
-            raise ValueError("packed_input_nonfinite")
-        return raw
-
     def _hold(self, reason: str, **details: object) -> PFNNRuntimeFrame:
         self._hold_count += 1
         diagnostics = dict(self._frame.diagnostics)
@@ -616,17 +577,36 @@ class TerrainPFNNRuntime:
         requested_speed = float(np.linalg.norm(desired_world))
         bootstrap_tick = self._bootstrap_pending
         if bootstrap_tick:
-            position = np.asarray(
-                self._trajectory.position_world_xy, dtype=np.float64
-            ).copy()
-            direction = np.asarray(
-                self._trajectory.direction_world_xy, dtype=np.float64
-            ).copy()
-            semantic = np.asarray(
-                self._trajectory.semantic_intent, dtype=np.float64
-            ).copy()
+            planned = PlannedTrajectory(
+                position_world_xy=self._recurrent_state.predicted_position_world_xy,
+                direction_world_xy=self._recurrent_state.predicted_direction_world_xy,
+                semantic_intent=torch.tensor(
+                    self._frame.trajectory.semantic_intent,
+                    dtype=self._recurrent_state.root_world_xy.dtype,
+                    device=self._device,
+                ).reshape(1, 12, 2),
+            )
         else:
-            position, direction, semantic = self._planned_trajectory(desired_world)
+            planned = plan_recurrent_trajectory(
+                self._recurrent_state,
+                torch.as_tensor(
+                    desired_world,
+                    dtype=self._recurrent_state.root_world_xy.dtype,
+                    device=self._device,
+                ).reshape(1, 2),
+            )
+        position = np.asarray(
+            planned.position_world_xy[0].to(device="cpu", dtype=torch.float64),
+            dtype=np.float64,
+        ).copy()
+        direction = np.asarray(
+            planned.direction_world_xy[0].to(device="cpu", dtype=torch.float64),
+            dtype=np.float64,
+        ).copy()
+        semantic = np.asarray(
+            planned.semantic_intent[0].to(device="cpu", dtype=torch.float64),
+            dtype=np.float64,
+        ).copy()
         replanned = self._replan_and_sample(position, direction, semantic)
         if replanned is None:
             return self._hold("unsupported_current_terrain")
@@ -642,14 +622,36 @@ class TerrainPFNNRuntime:
             return self._hold("bootstrap_terrain_mismatch")
         effective_speed = requested_speed if supported else 0.0
         try:
-            raw_input = self._pack(position, direction, semantic, terrain)
-            normalized = normalize_pfnn_input(
-                raw_input,
-                self._normalization["x_mean"],
-                self._normalization["x_std"],
+            planned = PlannedTrajectory(
+                position_world_xy=torch.as_tensor(
+                    position,
+                    dtype=self._recurrent_state.root_world_xy.dtype,
+                    device=self._device,
+                ).reshape(1, 12, 2),
+                direction_world_xy=torch.as_tensor(
+                    direction,
+                    dtype=self._recurrent_state.root_world_xy.dtype,
+                    device=self._device,
+                ).reshape(1, 12, 2),
+                semantic_intent=torch.as_tensor(
+                    semantic,
+                    dtype=self._recurrent_state.root_world_xy.dtype,
+                    device=self._device,
+                ).reshape(1, 12, 2),
+            )
+            normalized = pack_recurrent_input(
+                state=self._recurrent_state,
+                planned=planned,
+                terrain_height=torch.as_tensor(
+                    terrain.relative_height,
+                    dtype=self._recurrent_state.root_world_xy.dtype,
+                    device=self._device,
+                ).reshape(1, 12, 3),
+                x_mean=self._x_mean,
+                x_std=self._x_std,
             )
             if bootstrap_tick and not np.allclose(
-                normalized,
+                np.asarray(normalized[0].to(device="cpu"), dtype=np.float32),
                 self._bootstrap_expected_input,
                 rtol=0.0,
                 atol=3.0e-5,
@@ -657,78 +659,67 @@ class TerrainPFNNRuntime:
                 return self._hold("bootstrap_input_digest_mismatch")
             with torch.inference_mode():
                 prediction = self._model(
-                    torch.from_numpy(normalized).reshape(1, -1).to(self._device),
-                    torch.tensor(
-                        (self._frame.phase,), dtype=torch.float32, device=self._device
-                    ),
+                    normalized,
+                    self._recurrent_state.phase,
                 )
             if not isinstance(prediction, torch.Tensor) or prediction.shape != (1, 268):
                 return self._hold("model_output_shape")
-            raw_output = np.asarray(
-                prediction.detach().to(device="cpu", dtype=torch.float32)[0],
-                dtype=np.float64,
-            )
+            raw_output = prediction.to(device=self._device, dtype=torch.float64)[0]
         except Exception as error:  # model failures are a rejected transaction
             return self._hold(f"model_exception:{type(error).__name__}")
-        if not np.isfinite(raw_output).all():
+        if not bool(torch.isfinite(raw_output).all()):
             return self._hold("model_output_nonfinite")
-        physical = raw_output.copy()
-        for name, _width in OUTPUT_LAYOUT.fields:
-            if name == "contact_logit":
-                continue
-            field = OUTPUT_LAYOUT[name]
-            physical[field] = (
-                raw_output[field] * self._normalization["y_std"][field]
-                + self._normalization["y_mean"][field]
-            )
-        if not np.isfinite(physical).all():
+        denormalized = raw_output * self._y_std + self._y_mean
+        contact_field = OUTPUT_LAYOUT["contact_logit"]
+        physical = torch.cat(
+            (denormalized[: contact_field.start], raw_output[contact_field]), dim=0
+        )
+        if not bool(torch.isfinite(physical).all()):
             return self._hold("denormalized_output_nonfinite")
 
-        local_trajectory_position = physical[
-            OUTPUT_LAYOUT["trajectory_position"]
-        ].reshape(12, 2)
         local_trajectory_direction = physical[
             OUTPUT_LAYOUT["trajectory_direction"]
         ].reshape(12, 2)
-        direction_norm = np.linalg.norm(local_trajectory_direction, axis=1)
-        if np.any(direction_norm < 0.5) or np.any(direction_norm > 1.5):
+        direction_norm = torch.linalg.vector_norm(
+            local_trajectory_direction, dim=-1
+        )
+        if bool(torch.any(direction_norm < 0.5)) or bool(
+            torch.any(direction_norm > 1.5)
+        ):
             direction_index = int(
-                np.argmax(np.maximum(0.5 - direction_norm, direction_norm - 1.5))
+                torch.argmax(
+                    torch.maximum(0.5 - direction_norm, direction_norm - 1.5)
+                ).item()
             )
             return self._hold(
                 "trajectory_direction_norm",
                 rejected_trajectory_direction_index=direction_index,
-                rejected_trajectory_direction_norm=float(
-                    direction_norm[direction_index]
-                ),
+                rejected_trajectory_direction_norm=float(direction_norm[direction_index]),
                 rejected_minimum_trajectory_direction_norm=float(
-                    np.min(direction_norm)
+                    torch.min(direction_norm)
                 ),
                 rejected_maximum_trajectory_direction_norm=float(
-                    np.max(direction_norm)
+                    torch.max(direction_norm)
                 ),
             )
-        local_trajectory_direction = (
-            local_trajectory_direction / direction_norm[:, None]
-        )
-        body_position = physical[OUTPUT_LAYOUT["body_position"]].reshape(30, 3)
-        body_velocity = physical[OUTPUT_LAYOUT["body_velocity"]].reshape(30, 3)
         root_height = float(physical[OUTPUT_LAYOUT["root_height"]][0])
         tilt = physical[OUTPUT_LAYOUT["root_tilt"]]
         joints = physical[OUTPUT_LAYOUT["joint_position"]]
-        local_velocity = physical[OUTPUT_LAYOUT["root_planar_velocity"]]
-        yaw_velocity = float(physical[OUTPUT_LAYOUT["root_yaw_velocity"]][0])
         raw_phase_advance = float(physical[OUTPUT_LAYOUT["phase_advance"]][0])
-        contacts = _sigmoid(raw_output[OUTPUT_LAYOUT["contact_logit"]])
         if root_height <= 0.0:
             return self._hold("root_height_nonpositive")
-        if np.any(joints < self._limits[:, 0]) or np.any(joints > self._limits[:, 1]):
-            return self._hold("joint_limit")
-        joint_delta = np.abs(joints - self._frame.joint_position_isaaclab)
-        if np.max(joint_delta) > (
-            MAXIMUM_JOINT_STEP_RAD + 1.0e-10
+        if bool(torch.any(joints < self._limits_tensor[:, 0])) or bool(
+            torch.any(joints > self._limits_tensor[:, 1])
         ):
-            joint_index = int(np.argmax(joint_delta))
+            return self._hold("joint_limit")
+        previous_joints = torch.tensor(
+            self._frame.joint_position_isaaclab,
+            dtype=torch.float64,
+            device=self._device,
+        )
+        joint_delta = torch.abs(joints - previous_joints)
+        if float(torch.max(joint_delta)) > MAXIMUM_JOINT_STEP_RAD + 1.0e-10:
+            joint_index = int(torch.argmax(joint_delta).item())
             return self._hold(
                 "joint_step",
                 rejected_max_joint_step_rad=float(joint_delta[joint_index]),
@@ -736,26 +727,42 @@ class TerrainPFNNRuntime:
                 rejected_joint_name=ISAACLAB_JOINT_NAMES[joint_index],
             )
 
-        old_yaw = self._yaw
-        old_rotation = _rotation_2d(old_yaw)
-        new_xy = self._frame.root_position_world[:2] + (
-            old_rotation @ local_velocity
-        ) * DT
-        new_yaw = old_yaw + yaw_velocity * DT
-        new_support = self._query(new_xy, allow_unsupported_grade=False)
-        if new_support is None:
-            return self._hold("unsupported_predicted_root_terrain")
-        new_position = np.asarray(
-            (new_xy[0], new_xy[1], new_support.height_m + root_height),
+        physical_recurrent = physical.to(
+            dtype=self._recurrent_state.root_world_xy.dtype
+        ).reshape(1, OUTPUT_LAYOUT.size)
+        candidate_root_world_xy, candidate_root_yaw_world = _integrate_root_motion(
+            self._recurrent_state, physical_recurrent
+        )
+        candidate_new_xy = np.asarray(
+            candidate_root_world_xy[0]
+            .to(device="cpu", dtype=torch.float64)
+            .numpy(),
             dtype=np.float64,
         )
+        candidate_new_yaw = float(
+            candidate_root_yaw_world[0].to(device="cpu", dtype=torch.float64)
+        )
+        new_support = self._query(candidate_new_xy, allow_unsupported_grade=False)
+        if new_support is None:
+            return self._hold("unsupported_predicted_root_terrain")
+        candidate_new_position = np.asarray(
+            (
+                candidate_new_xy[0],
+                candidate_new_xy[1],
+                new_support.height_m + root_height,
+            ),
+            dtype=np.float64,
+        )
+        tilt_report = np.asarray(
+            tilt.to(device="cpu", dtype=torch.float64), dtype=np.float64
+        )
         try:
-            new_quaternion = _root_quaternion(new_yaw, tilt)
+            new_quaternion = _root_quaternion(candidate_new_yaw, tilt_report)
         except ValueError:
             return self._hold("root_quaternion")
         if not np.isclose(np.linalg.norm(new_quaternion), 1.0, atol=1.0e-6):
             return self._hold("root_quaternion")
-        if np.linalg.norm(new_position - self._frame.root_position_world) > (
+        if np.linalg.norm(candidate_new_position - self._frame.root_position_world) > (
             MAXIMUM_ROOT_TRANSLATION_STEP_M + 1.0e-10
         ):
             return self._hold("root_translation_step")
@@ -766,19 +773,67 @@ class TerrainPFNNRuntime:
         phase_advance = float(np.clip(raw_phase_advance, 0.0, self._phase_cap))
         if not 0.0 <= phase_advance <= self._phase_cap + 1.0e-12:
             return self._hold("phase_advance_cap")
-        new_phase = (self._frame.phase + phase_advance) % TWO_PI
-
-        new_rotation = _rotation_2d(new_yaw)
-        predicted_world_position = new_xy + local_trajectory_position @ new_rotation.T
-        predicted_world_direction = local_trajectory_direction @ new_rotation.T
+        try:
+            advanced_recurrent_state = advance_recurrent_state(
+                self._recurrent_state,
+                planned,
+                physical_recurrent,
+                phase_advance_cap=torch.tensor(
+                    (self._phase_cap,),
+                    dtype=self._recurrent_state.root_world_xy.dtype,
+                    device=self._device,
+                ),
+            )
+        except (RuntimeError, TypeError, ValueError):
+            return self._hold("recurrent_state")
+        if not torch.equal(
+            advanced_recurrent_state.root_world_xy, candidate_root_world_xy
+        ) or not torch.equal(
+            advanced_recurrent_state.root_yaw_world, candidate_root_yaw_world
+        ):
+            return self._hold("recurrent_root_mismatch")
+        new_xy = np.asarray(
+            advanced_recurrent_state.root_world_xy[0]
+            .to(device="cpu", dtype=torch.float64)
+            .numpy(),
+            dtype=np.float64,
+        )
+        new_yaw = float(
+            advanced_recurrent_state.root_yaw_world[0].to(
+                device="cpu", dtype=torch.float64
+            )
+        )
+        new_quaternion = _root_quaternion(new_yaw, tilt_report)
+        new_position = np.asarray(
+            (new_xy[0], new_xy[1], new_support.height_m + root_height),
+            dtype=np.float64,
+        )
+        predicted_world_position = np.asarray(
+            advanced_recurrent_state.predicted_position_world_xy[0]
+            .to(device="cpu", dtype=torch.float64)
+            .numpy(),
+            dtype=np.float64,
+        )
+        predicted_world_direction = np.asarray(
+            advanced_recurrent_state.predicted_direction_world_xy[0]
+            .to(device="cpu", dtype=torch.float64)
+            .numpy(),
+            dtype=np.float64,
+        )
         new_trajectory = PFNNTrajectoryState(
             predicted_world_position,
             predicted_world_direction,
             semantic,
         )
-        realized_facing = np.asarray(predicted_world_direction[6]).copy()
-        realized_facing /= np.linalg.norm(realized_facing)
-        realized_semantic = np.asarray(semantic[6]).copy()
+        joints_report = np.asarray(
+            joints.to(device="cpu", dtype=torch.float64), dtype=np.float64
+        )
+        contacts = np.asarray(
+            torch.sigmoid(raw_output[contact_field]).to(
+                device="cpu", dtype=torch.float64
+            ),
+            dtype=np.float64,
+        )
         diagnostics = {
             "wall_tick": self._wall_tick,
             "hold_count": self._hold_count,
@@ -792,20 +847,19 @@ class TerrainPFNNRuntime:
         frame = PFNNRuntimeFrame(
             root_position_world=new_position,
             root_quaternion_world_wxyz=new_quaternion,
-            joint_position_isaaclab=joints,
-            phase=new_phase,
+            joint_position_isaaclab=joints_report,
+            phase=float(
+                advanced_recurrent_state.phase[0].to(
+                    device="cpu", dtype=torch.float64
+                )
+            ),
             contact_probability=contacts,
             trajectory=new_trajectory,
             supported=supported,
             diagnostics=diagnostics,
         )
         # Commit every recurrent field only after all validation above succeeds.
-        self._yaw = new_yaw
-        self._body_position = np.ascontiguousarray(body_position).copy()
-        self._body_velocity = np.ascontiguousarray(body_velocity).copy()
-        self._trajectory = new_trajectory
-        self._last_facing = realized_facing
-        self._history.append((new_xy.copy(), realized_facing, realized_semantic))
+        self._recurrent_state = advanced_recurrent_state
         self._bootstrap_pending = False
         self._frame = frame
         return frame
