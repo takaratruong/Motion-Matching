@@ -2,6 +2,8 @@ import importlib.util
 from pathlib import Path
 import unittest
 
+import numpy as np
+
 
 _PATH = (
     Path(__file__).resolve().parents[2]
@@ -17,6 +19,27 @@ _SPEC.loader.exec_module(_MODULE)
 
 
 class ValidateTraversalTests(unittest.TestCase):
+    def test_route_contract_derives_heading_and_rejects_flat_route(self):
+        heading = _MODULE._route_heading(
+            {
+                "classification": "staircase_intersecting",
+                "start_scene_xy": [0.0, 0.0],
+                "stop_scene_xy": [1.0, 1.0],
+            }
+        )
+        np.testing.assert_allclose(
+            heading, (2.0**-0.5, 2.0**-0.5), atol=1.0e-12
+        )
+
+        with self.assertRaisesRegex(Exception, "not staircase"):
+            _MODULE._route_heading(
+                {
+                    "classification": "flat_only_excluded",
+                    "start_scene_xy": [0.0, 0.0],
+                    "stop_scene_xy": [1.0, 0.0],
+                }
+            )
+
     def test_parser_accepts_heading_and_planned_footprints(self):
         args = _MODULE.parser().parse_args(
             [
@@ -32,6 +55,8 @@ class ValidateTraversalTests(unittest.TestCase):
                 "45",
                 "--planned-footprints",
                 "footprints.json",
+                "--route-contract",
+                "route.json",
                 "--output",
                 "metrics.json",
             ]
@@ -39,6 +64,29 @@ class ValidateTraversalTests(unittest.TestCase):
 
         self.assertEqual(args.expected_heading_degrees, 45.0)
         self.assertEqual(args.minimum_supported_sole_points, 3)
+        self.assertEqual(args.route_contract, Path("route.json"))
+
+    def test_staircase_mode_applies_quality_admission_after_contact_gates(self):
+        metrics = {
+            "unsupported_frame_count": 0,
+            "maximum_stance_contact_error_m": 0.0,
+            "maximum_stance_horizontal_step_m": 0.0,
+            "minimum_sole_clearance_m": 0.0,
+            "minimum_supported_sole_points": 3,
+            "terrain_events": ("ground", "opposite_ground"),
+            "maximum_complete_sole_contact_error_m": 0.0,
+            "minimum_lateral_foot_separation_m": 0.1,
+            "cadence_violation_count": 0,
+            "maximum_same_height_double_support_frames": 4,
+            "terminal_complete_support": True,
+        }
+
+        with self.assertRaisesRegex(Exception, "missing elevated"):
+            _MODULE._enforce_validation(
+                metrics, require_staircase=True
+            )
+
+        _MODULE._enforce_validation(metrics, require_staircase=False)
 
     def test_accepts_contact_valid_metrics(self):
         _MODULE._enforce_metrics(
@@ -114,4 +162,20 @@ class ValidateTraversalTests(unittest.TestCase):
 
         metrics["terminal_complete_support"] = True
         with self.assertRaisesRegex(Exception, "provenance"):
+            _MODULE._enforce_metrics(metrics)
+
+    def test_complete_sole_metric_supersedes_ankle_center_at_an_edge(self):
+        metrics = {
+            "unsupported_frame_count": 0,
+            "maximum_stance_contact_error_m": 0.027,
+            "maximum_complete_sole_contact_error_m": 0.018,
+            "maximum_stance_horizontal_step_m": 0.0,
+            "minimum_sole_clearance_m": 0.0,
+            "minimum_supported_sole_points": 7,
+        }
+
+        _MODULE._enforce_metrics(metrics)
+
+        metrics["maximum_complete_sole_contact_error_m"] = 0.026
+        with self.assertRaisesRegex(Exception, "stance contact"):
             _MODULE._enforce_metrics(metrics)

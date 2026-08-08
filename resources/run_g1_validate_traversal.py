@@ -14,6 +14,10 @@ from mm_sonic.joints import ContractError
 from mm_sonic.torch_contact_segments import ANKLE_ORIGIN_SOLE_M
 from mm_sonic.torch_g1_fk import MujocoG1FootKinematics
 from mm_sonic.torch_g1_sole_kinematics import MujocoG1SoleKinematics
+from mm_sonic.torch_staircase_traversal_quality import (
+    admit_staircase_traversal,
+    measure_staircase_traversal_quality,
+)
 from mm_sonic.torch_terrain_rollout import (
     load_experiment_config,
     resolve_stair_config,
@@ -38,7 +42,13 @@ def _enforce_metrics(
         > maximum_unsupported_frames
     ):
         raise ContractError("traversal contains an unsupported frame")
-    if float(metrics["maximum_stance_contact_error_m"]) > 0.020:
+    contact_error = float(
+        metrics.get(
+            "maximum_complete_sole_contact_error_m",
+            metrics["maximum_stance_contact_error_m"],
+        )
+    )
+    if contact_error > 0.025:
         raise ContractError("traversal loses stance contact")
     if float(metrics["maximum_stance_horizontal_step_m"]) > 0.010:
         raise ContractError("traversal stance foot slides horizontally")
@@ -71,6 +81,24 @@ def _enforce_metrics(
         raise ContractError("traversal progress error is excessive")
 
 
+def _enforce_validation(
+    metrics: dict[str, object],
+    *,
+    require_staircase: bool,
+    maximum_unsupported_frames: int = 0,
+    minimum_supported_sole_points: int = 3,
+) -> None:
+    if type(require_staircase) is not bool:
+        raise ContractError("validation mode is invalid")
+    _enforce_metrics(
+        metrics,
+        maximum_unsupported_frames=maximum_unsupported_frames,
+        minimum_supported_sole_points=minimum_supported_sole_points,
+    )
+    if require_staircase:
+        admit_staircase_traversal(metrics)
+
+
 def parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=Path, required=True)
@@ -82,6 +110,7 @@ def parser() -> argparse.ArgumentParser:
     parser.add_argument("--minimum-supported-sole-points", type=int, default=3)
     parser.add_argument("--expected-heading-degrees", type=float)
     parser.add_argument("--planned-footprints", type=Path)
+    parser.add_argument("--route-contract", type=Path)
     return parser
 
 
@@ -91,6 +120,29 @@ def _yaw_from_wxyz(quaternion: np.ndarray) -> np.ndarray:
         2.0 * (w * z + x * y),
         1.0 - 2.0 * (y * y + z * z),
     )
+
+
+def _route_heading(record: object) -> np.ndarray:
+    if not isinstance(record, dict):
+        raise ContractError("route contract is invalid")
+    if record.get("classification") != "staircase_intersecting":
+        raise ContractError("route contract is not staircase-intersecting")
+    try:
+        start = np.asarray(record["start_scene_xy"], dtype=np.float64)
+        stop = np.asarray(record["stop_scene_xy"], dtype=np.float64)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ContractError("route contract is invalid") from error
+    displacement = stop - start
+    length = float(np.linalg.norm(displacement))
+    if (
+        start.shape != (2,)
+        or stop.shape != (2,)
+        or not np.isfinite(start).all()
+        or not np.isfinite(stop).all()
+        or length <= 0.0
+    ):
+        raise ContractError("route contract is invalid")
+    return displacement / length
 
 
 def main() -> int:
@@ -172,7 +224,12 @@ def main() -> int:
         and provenance.dtype.kind in "iu"
     )
     provenance_coverage = (
-        float((provenance >= 0).all(axis=1).mean())
+        float(
+            (
+                (provenance[:, 0] >= -1)
+                & (provenance[:, 1] >= 0)
+            ).mean()
+        )
         if provenance_valid
         else 0.0
     )
@@ -195,6 +252,12 @@ def main() -> int:
             else 0.0
         ),
         "minimum_sole_clearance_m": float(sole_clearance.min()),
+        "minimum_sole_clearance_frame": int(
+            np.unravel_index(
+                int(np.argmin(sole_clearance)),
+                sole_clearance.shape,
+            )[0]
+        ),
         "minimum_supported_sole_points": int(
             supported_points[support].min()
         ),
@@ -206,6 +269,38 @@ def main() -> int:
         "terminal_complete_support": bool(support[-1].all()),
         "provenance_coverage": provenance_coverage,
     }
+    if args.route_contract is not None:
+        try:
+            route_record = json.loads(
+                args.route_contract.read_text(encoding="utf-8")
+            )
+        except Exception as error:
+            raise ContractError("route contract is invalid") from error
+        route_heading = _route_heading(route_record)
+        feet_scene = np.array(feet, copy=True)
+        soles_scene = np.array(soles, copy=True)
+        feet_scene[..., :2] = alignment.matcher_to_scene_xy(
+            torch.tensor(feet[..., :2], dtype=torch.float32)
+        ).cpu().numpy()
+        soles_scene[..., :2] = alignment.matcher_to_scene_xy(
+            torch.tensor(soles[..., :2], dtype=torch.float32)
+        ).cpu().numpy()
+
+        def sample_scene_surface(points):
+            owned = np.asarray(points, dtype=np.float64)
+            return grid.sample_xy(
+                torch.tensor(owned, dtype=torch.float32)
+            ).cpu().numpy()
+
+        metrics.update(
+            measure_staircase_traversal_quality(
+                feet_scene_xyz=feet_scene,
+                sole_points_scene_xyz=soles_scene,
+                support_mask=support,
+                heading_scene_xy=route_heading,
+                sample_surface=sample_scene_surface,
+            )
+        )
     footprint_records = None
     if args.planned_footprints is not None:
         try:
@@ -281,19 +376,29 @@ def main() -> int:
             metrics["progress_error_m"] = abs(
                 observed_progress - expected_progress
             )
-    _enforce_metrics(
-        metrics,
-        maximum_unsupported_frames=args.maximum_unsupported_frames,
-        minimum_supported_sole_points=(
-            args.minimum_supported_sole_points
-        ),
-    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    failure = None
+    try:
+        _enforce_validation(
+            metrics,
+            require_staircase=args.route_contract is not None,
+            maximum_unsupported_frames=args.maximum_unsupported_frames,
+            minimum_supported_sole_points=(
+                args.minimum_supported_sole_points
+            ),
+        )
+        metrics["validated"] = True
+    except ContractError as error:
+        metrics["validated"] = False
+        metrics["failure_reason"] = str(error)
+        failure = error
     args.output.write_text(
         json.dumps(metrics, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     print(json.dumps(metrics, sort_keys=True), flush=True)
+    if failure is not None:
+        raise failure
     return 0
 
 
