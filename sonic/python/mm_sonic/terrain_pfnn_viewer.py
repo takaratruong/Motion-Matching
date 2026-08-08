@@ -139,6 +139,7 @@ def _build_scene(scene_xml: Path, terrain: TerrainPFNNHillMap) -> tuple[object, 
         uservert=terrain.vertices.ravel(),
         userface=terrain.faces.ravel(),
         inertia=mujoco.mjtMeshInertia.mjMESH_INERTIA_SHELL,
+        smoothnormal=1,
     )
     spec.worldbody.add_geom(
         name="terrain_pfnn_three_hills",
