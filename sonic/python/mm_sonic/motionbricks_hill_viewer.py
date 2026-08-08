@@ -24,6 +24,7 @@ from .motionbricks_hill_ik import (
     HillFootIKDiagnostics,
     MotionBricksHillFootIK,
 )
+from .terrain_pfnn.hill_map import TerrainPFNNHillMap
 
 
 DEFAULT_MOTIONBRICKS_ROOT = Path(
@@ -61,6 +62,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="render raw MotionBricks qpos without stance-aware foot IK",
     )
+    parser.add_argument(
+        "--three-hills",
+        action="store_true",
+        help="use the shared 10, 15 and 18.9 degree longitudinal hill map",
+    )
     parser.add_argument("--random-seed", type=int, default=1234)
     parser.add_argument("--mesh-samples", type=int, default=151)
     parser.add_argument(
@@ -70,6 +76,30 @@ def _parser() -> argparse.ArgumentParser:
         help="print root/terrain/conditioned target heights every N frames",
     )
     return parser
+
+
+class _ThreeHillProfile:
+    """Compatibility adapter for the existing MotionBricks hill runtime."""
+
+    def __init__(self) -> None:
+        self.map = TerrainPFNNHillMap(half_width_m=4.0)
+
+    @property
+    def max_slope_degrees(self) -> float:
+        return max(self.map.requested_grades_deg)
+
+    def height(self, xy: object) -> float:
+        value = self.map.height_at(xy)
+        return 0.0 if value is None else float(value)
+
+    def mesh(self, sample_count: int = 151) -> tuple[np.ndarray, np.ndarray]:
+        if not isinstance(sample_count, int) or sample_count < 2:
+            raise ValueError("sample_count must be an integer of at least two")
+        return self.map.vertices, self.map.faces
+
+
+def _selected_profile(arguments: argparse.Namespace) -> GentleHillProfile | _ThreeHillProfile:
+    return _ThreeHillProfile() if arguments.three_hills else GentleHillProfile()
 
 
 def _checkpoint_paths(root: Path) -> tuple[Path, ...]:
@@ -361,7 +391,7 @@ def _run(arguments: argparse.Namespace) -> int:
             demo = navigation_demo(_motionbricks_arguments(root, arguments))
         demo.full_agent.reset()
 
-        profile = GentleHillProfile()
+        profile = _selected_profile(arguments)
         model, data = _build_hill_model(
             root / "assets/skeletons/g1/scene_29dof.xml",
             profile,
@@ -379,8 +409,12 @@ def _run(arguments: argparse.Namespace) -> int:
         )
 
         print(
-            "MotionBricks gentle hill: "
-            f"max grade {profile.max_slope_degrees:.2f} degrees; "
+            (
+                "MotionBricks three-hill course: "
+                if arguments.three_hills
+                else "MotionBricks gentle hill: "
+            )
+            + f"max grade {profile.max_slope_degrees:.2f} degrees; "
             + (
                 "authored-contact display IK"
                 if foot_ik is not None

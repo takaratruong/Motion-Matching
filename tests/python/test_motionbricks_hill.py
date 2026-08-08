@@ -112,6 +112,22 @@ class HillViewerCliTest(unittest.TestCase):
         self.assertIn("--no-viewer", help_text)
         self.assertIn("--no-ik", help_text)
         self.assertIn("--smoke-steps", help_text)
+        self.assertIn("--three-hills", help_text)
+
+    def test_three_hill_mode_uses_the_shared_render_and_query_map(self) -> None:
+        from mm_sonic.motionbricks_hill_viewer import _parser, _selected_profile
+
+        profile = _selected_profile(_parser().parse_args(["--three-hills"]))
+        vertices, faces = profile.mesh(17)
+
+        self.assertEqual(profile.max_slope_degrees, 18.9)
+        self.assertEqual(vertices.shape[1], 3)
+        self.assertEqual(faces.shape[1], 3)
+        self.assertTrue(any(profile.height((hill.start_x + 1.0, 0.0)) > 0.0 for hill in profile.map.hills))
+        for vertex in vertices[:: max(1, len(vertices) // 100)]:
+            self.assertAlmostEqual(
+                float(vertex[2]), profile.height(vertex[:2]), places=12
+            )
 
     def test_trace_reports_ik_fallback_reason(self) -> None:
         from mm_sonic.motionbricks_authored_contacts import (
