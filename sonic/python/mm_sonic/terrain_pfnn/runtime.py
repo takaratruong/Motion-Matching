@@ -587,6 +587,20 @@ class TerrainPFNNRuntime:
             return self._hold("invalid_command")
         desired_world = requested @ _rotation_2d(float(camera_yaw)).T
         requested_speed = float(np.linalg.norm(desired_world))
+        if self._command_driven_root and requested_speed < 1.0e-8:
+            diagnostics = dict(self._frame.diagnostics)
+            diagnostics.pop("hold_reason", None)
+            diagnostics.update(
+                {
+                    "wall_tick": self._wall_tick,
+                    "desired_speed_m_s": 0.0,
+                    "requested_speed_m_s": 0.0,
+                    "command_driven_root": True,
+                    "idle_pose_held": True,
+                }
+            )
+            self._frame = replace(self._frame, diagnostics=diagnostics)
+            return self._frame
         bootstrap_tick = self._bootstrap_pending
         if bootstrap_tick:
             planned = PlannedTrajectory(
@@ -902,6 +916,7 @@ class TerrainPFNNRuntime:
             "terrain_grade_degrees": new_support.absolute_grade_degrees,
             "replanned_unsupported_future": not supported,
             "command_driven_root": self._command_driven_root,
+            "idle_pose_held": False,
         }
         if not self._enforce_motion_envelope:
             diagnostics.update(

@@ -413,6 +413,11 @@ class TerrainPFNNRuntimeTests(unittest.TestCase):
         np.testing.assert_allclose(
             stopped.root_position_world[:2], moving.root_position_world[:2], atol=1.0e-7
         )
+        np.testing.assert_array_equal(
+            stopped.joint_position_isaaclab, moving.joint_position_isaaclab
+        )
+        self.assertEqual(stopped.phase, moving.phase)
+        self.assertTrue(stopped.diagnostics["idle_pose_held"])
         self.assertTrue(moving.diagnostics["command_driven_root"])
 
     def test_current_missing_terrain_holds_without_calling_model(self) -> None:
