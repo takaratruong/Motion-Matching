@@ -996,6 +996,119 @@ def _select_families(
     }
 
 
+def _select_grade_families(
+    records: tuple[GrailSlopeRecord, ...],
+    targets_degrees: tuple[float, ...],
+    *,
+    tolerance_degrees: float,
+) -> tuple[tuple[GrailSlopeRecord, ...], dict[str, object]]:
+    """Select distinct train families nearest required traversed grades."""
+
+    targets = tuple(float(value) for value in targets_degrees)
+    if (
+        not targets
+        or any(not np.isfinite(value) or value < 5.0 or value > 20.0 for value in targets)
+        or tuple(sorted(set(targets))) != targets
+    ):
+        raise ValueError("terrain grade targets must be unique increasing values in [5,20]")
+    tolerance = float(tolerance_degrees)
+    if not np.isfinite(tolerance) or tolerance <= 0.0:
+        raise ValueError("terrain grade tolerance must be finite and positive")
+
+    grouped: dict[str, list[GrailSlopeRecord]] = {}
+    for record in records:
+        if split_identity(record.terrain_id) == "train":
+            grouped.setdefault(record.terrain_id, []).append(record)
+
+    measured_by_identity: dict[str, list[tuple[GrailSlopeRecord, float]]] = {}
+    variant_rejections: list[dict[str, str]] = []
+    for identity in sorted(grouped):
+        measured: list[tuple[GrailSlopeRecord, float]] = []
+        for record in sorted(grouped[identity], key=lambda item: item.stem):
+            try:
+                grade = _traversed_grade(record)
+            except (ArithmeticError, OSError, TypeError, ValueError) as error:
+                variant_rejections.append(
+                    {
+                        "clip_id": record.stem,
+                        "reason": f"{type(error).__name__}: {error}",
+                    }
+                )
+                continue
+            if grade is None or not np.isfinite(grade):
+                variant_rejections.append(
+                    {"clip_id": record.stem, "reason": "grade_unmeasurable"}
+                )
+                continue
+            measured.append((record, float(grade)))
+        if measured:
+            measured_by_identity[identity] = measured
+
+    family_grade = {
+        identity: max(grade for _, grade in measured)
+        for identity, measured in measured_by_identity.items()
+        if all(5.0 <= grade <= 20.0 for _, grade in measured)
+    }
+    measured_by_identity = {
+        identity: measured_by_identity[identity] for identity in family_grade
+    }
+    unused = set(family_grade)
+    chosen_for_target: dict[float, str] = {}
+    for target in targets:
+        if not unused:
+            raise ValueError(f"no unused train terrain family covers {target:g} degrees")
+        identity = min(
+            unused,
+            key=lambda item: (abs(family_grade[item] - target), item),
+        )
+        error = abs(family_grade[identity] - target)
+        if error > tolerance:
+            raise ValueError(
+                f"no train terrain family covers {target:g} degrees within "
+                f"{tolerance:g} degrees"
+            )
+        chosen_for_target[target] = identity
+        unused.remove(identity)
+
+    selected_identities = tuple(chosen_for_target[target] for target in targets)
+    selected_records = tuple(
+        record
+        for identity in selected_identities
+        for record, _ in measured_by_identity[identity]
+    )
+    return selected_records, {
+        "required_training_grades_degrees": list(targets),
+        "maximum_grade_error_degrees": tolerance,
+        "selected_identities": list(selected_identities),
+        "selected_grades_degrees": {
+            identity: family_grade[identity] for identity in selected_identities
+        },
+        "selected_identity_by_target_grade": {
+            f"{target:g}": chosen_for_target[target] for target in targets
+        },
+        "skipped_identities": {
+            identity: "not_nearest_required_grade"
+            for identity in sorted(grouped)
+            if identity not in selected_identities
+        },
+        "variant_rejections": variant_rejections,
+    }
+
+
+def _parse_grade_targets(value: str) -> tuple[float, ...]:
+    try:
+        targets = tuple(float(item) for item in value.split(",") if item)
+    except ValueError as error:
+        raise ValueError("terrain grade targets must be comma-separated numbers") from error
+    if (
+        not targets
+        or any(not np.isfinite(item) or item < 5.0 or item > 20.0 for item in targets)
+        or tuple(sorted(set(targets))) != targets
+    ):
+        raise ValueError("terrain grade targets must be unique increasing values in [5,20]")
+    return targets
+
+
 def _inventory_source_records(
     grail_records: Iterable[GrailSlopeRecord], lafan_paths: Iterable[Path]
 ) -> dict[str, dict[str, str]]:
@@ -1081,6 +1194,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model-path", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--terrain-family-limit", type=int)
+    parser.add_argument("--terrain-grade-targets")
     parser.add_argument("--resume", action="store_true")
     arguments = parser.parse_args(argv)
     grail_root = arguments.grail_root.expanduser().resolve()
@@ -1090,9 +1204,26 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("model-path must be the existing g1_29dof.xml")
     roots = source_root_records(grail_root, lafan_root)
     discovered = discover_grail_slope_records(grail_root)
-    selected, selection = _select_families(
-        discovered, arguments.terrain_family_limit
+    if (
+        arguments.terrain_family_limit is not None
+        and arguments.terrain_grade_targets is not None
+    ):
+        raise ValueError(
+            "--terrain-family-limit and --terrain-grade-targets are mutually exclusive"
+        )
+    grade_targets = (
+        None
+        if arguments.terrain_grade_targets is None
+        else _parse_grade_targets(arguments.terrain_grade_targets)
     )
+    if grade_targets is None:
+        selected, selection = _select_families(
+            discovered, arguments.terrain_family_limit
+        )
+    else:
+        selected, selection = _select_grade_families(
+            discovered, grade_targets, tolerance_degrees=1.0
+        )
     if arguments.terrain_family_limit is not None \
             and len(selection["selected_identities"]) != arguments.terrain_family_limit:
         raise ValueError("not enough eligible GRAIL terrain families")
@@ -1125,6 +1256,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     build_options = {
         "terrain_family_limit": arguments.terrain_family_limit,
+        "terrain_grade_targets": (
+            None if grade_targets is None else list(grade_targets)
+        ),
         "terrain_family_selection": selection,
         "kinematic_model_filename": model_path.name,
         "kinematic_model_sha256": _sha256(model_path),

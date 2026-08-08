@@ -14,6 +14,8 @@ import numpy as np
 from mm_sonic.build_terrain_pfnn_dataset import (
     _height_at,
     _deterministic_npz_bytes,
+    _parse_grade_targets,
+    _select_grade_families,
     _select_families,
     canonical_json_sha256,
     source_root_records,
@@ -481,6 +483,117 @@ class TerrainPFNNDatasetTest(unittest.TestCase):
             audit["variant_rejections"],
             [{"clip_id": records[1].stem, "reason": "ValueError: broken terrain"}],
         )
+
+    def test_grade_selector_requires_train_coverage_through_18_9_degrees(self) -> None:
+        identities = ("slope_000", "slope_001", "slope_002", "slope_004")
+        records = tuple(
+            GrailSlopeRecord(
+                stem=f"terrain_slopes__{identity}__000",
+                terrain_id=identity,
+                robot_path=self.root / f"{identity}.pkl",
+                terrain_path=self.root / f"{identity}.usd",
+            )
+            for identity in identities
+        )
+        grades = {
+            "slope_000": 5.1,
+            "slope_001": 9.8,
+            "slope_002": 15.2,
+            "slope_004": 18.7,
+        }
+        with patch(
+            "mm_sonic.build_terrain_pfnn_dataset._traversed_grade",
+            side_effect=lambda record: grades[record.terrain_id],
+        ):
+            selected, audit = _select_grade_families(
+                records, (5.0, 10.0, 15.0, 18.9), tolerance_degrees=1.0
+            )
+
+        self.assertEqual(
+            [record.terrain_id for record in selected], list(identities)
+        )
+        self.assertEqual(
+            audit["required_training_grades_degrees"], [5.0, 10.0, 15.0, 18.9]
+        )
+        self.assertEqual(
+            audit["selected_grades_degrees"],
+            {identity: grades[identity] for identity in identities},
+        )
+
+        with patch(
+            "mm_sonic.build_terrain_pfnn_dataset._traversed_grade",
+            side_effect=lambda record: {"slope_000": 10.1, "slope_001": 13.6536}.get(
+                record.terrain_id, 13.6536
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "18.9"):
+                _select_grade_families(
+                    records[:2], (10.0, 18.9), tolerance_degrees=1.0
+                )
+
+    def test_grade_target_cli_values_are_exact_and_ordered(self) -> None:
+        self.assertEqual(
+            _parse_grade_targets("5,10,15,18.9"), (5.0, 10.0, 15.0, 18.9)
+        )
+        for value in ("", "10,5", "5,5", "4,10", "10,nan", "10,twenty"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                _parse_grade_targets(value)
+
+    def test_grade_selector_never_selects_family_below_supported_range(self) -> None:
+        records = tuple(
+            GrailSlopeRecord(
+                stem=f"terrain_slopes__{identity}__000",
+                terrain_id=identity,
+                robot_path=self.root / f"{identity}.pkl",
+                terrain_path=self.root / f"{identity}.usd",
+            )
+            for identity in ("slope_005", "slope_007")
+        )
+        grades = {"slope_005": 4.8, "slope_007": 5.4}
+        with patch(
+            "mm_sonic.build_terrain_pfnn_dataset._traversed_grade",
+            side_effect=lambda record: grades[record.terrain_id],
+        ):
+            selected, audit = _select_grade_families(
+                records, (5.0,), tolerance_degrees=1.0
+            )
+
+        self.assertEqual([record.terrain_id for record in selected], ["slope_007"])
+        self.assertEqual(audit["selected_grades_degrees"], {"slope_007": 5.4})
+
+    def test_grade_selector_requires_every_selected_variant_in_range(self) -> None:
+        records = tuple(
+            GrailSlopeRecord(
+                stem=f"terrain_slopes__{identity}__{variant:03d}",
+                terrain_id=identity,
+                robot_path=self.root / f"{identity}-{variant}.pkl",
+                terrain_path=self.root / f"{identity}-{variant}.usd",
+            )
+            for identity in ("slope_005", "slope_007")
+            for variant in range(2)
+        )
+        grades = {
+            ("slope_005", 0): 5.5,
+            ("slope_005", 1): 4.6,
+            ("slope_007", 0): 5.8,
+            ("slope_007", 1): 5.2,
+        }
+
+        def grade(record: GrailSlopeRecord) -> float:
+            return grades[(record.terrain_id, int(record.stem[-3:]))]
+
+        with patch(
+            "mm_sonic.build_terrain_pfnn_dataset._traversed_grade",
+            side_effect=grade,
+        ):
+            selected, audit = _select_grade_families(
+                records, (5.0,), tolerance_degrees=1.0
+            )
+
+        self.assertEqual(
+            [record.terrain_id for record in selected], ["slope_007", "slope_007"]
+        )
+        self.assertEqual(audit["selected_grades_degrees"], {"slope_007": 5.8})
 
     def test_test_values_cannot_change_normalization_bytes(self) -> None:
         first = self.root / "first"
