@@ -1,0 +1,31 @@
+{
+  "schema": "g1-object-motion-field-route-records/v1",
+  "routes": [
+    {
+      "line_id": "heading-p000p000-lane-006",
+      "heading_degrees": 0.0,
+      "artifact": "build/g1-horizontal-cadence-repair-v1/lane-pos-0p4/traversal.npz",
+      "artifact_sha256": "5a8f1252c5c98eff590f7d523d8f95aa98f839aff02fb217d4a7c08259bdb9d3",
+      "validation": "build/g1-horizontal-cadence-repair-v1/lane-pos-0p4/metrics.json",
+      "validation_sha256": "8b93fd35bbf6b76c68295a7af0313e3bf34b832869990ae05171dab547195754",
+      "classification": "staircase_intersecting",
+      "independently_validated": true,
+      "source_lane_id": "lane-pos-0p4",
+      "maximum_lateral_root_error_m": 0.0740278959274292,
+      "quality_contract": "g1-horizontal-cadence-repair/v1"
+    },
+    {
+      "line_id": "heading-p000p000-lane-007",
+      "heading_degrees": 0.0,
+      "artifact": "build/g1-horizontal-cadence-repair-v1/lane-pos-0p6/traversal.npz",
+      "artifact_sha256": "e923d1e3262aa652e9eb796b8e61a803519104ab6100d1439157298365fc3f10",
+      "validation": "build/g1-horizontal-cadence-repair-v1/lane-pos-0p6/metrics.json",
+      "validation_sha256": "0b9ada736a401ce6eb8d35482c3faba857ee33e41a5a29181f314cbd1505c611",
+      "classification": "staircase_intersecting",
+      "independently_validated": true,
+      "source_lane_id": "lane-pos-0p6",
+      "maximum_lateral_root_error_m": 0.12239331007003784,
+      "quality_contract": "g1-horizontal-cadence-repair/v1"
+    }
+  ]
+}

@@ -1,0 +1,202 @@
+{
+  "schema": "g1-object-motion-field-edge-specifications/v1",
+  "edges": [
+    {
+      "edge_id": "horizontal-lane-005-to-positive-45",
+      "artifact": "build/g1-object-motion-field-v1/transitions/h006-to-p45-db794-v1/full-successor-c679/traversal-10.npz",
+      "validation": "build/g1-object-motion-field-v1/transitions/h006-to-p45-db794-v1/full-successor-c679/validation-10.json",
+      "from_heading_degrees": 0.0,
+      "to_heading_degrees": 45.0,
+      "observed_heading_change_degrees": 44.31511427849981,
+      "provenance": [
+        {
+          "role": "authentic_turn",
+          "clip_index": 584,
+          "logical_name": "grail-stair_p1-ff294c794039c08397fa",
+          "source_frames": [230, 275],
+          "repair": "none"
+        },
+        {
+          "role": "boundary_connector",
+          "method": "full-sole rigid-pivot interpolation",
+          "frame_count": 10
+        },
+        {
+          "role": "authentic_straight_successor",
+          "clip_index": 679,
+          "logical_name": "grail-stair_p2-8d48f344770a38c73a4a",
+          "source_frames": [88, 115],
+          "repair": "none"
+        },
+        {
+          "role": "successor_boundary_connector",
+          "method": "full-sole rigid-pivot interpolation",
+          "frame_count": 10
+        }
+      ]
+    },
+    {
+      "edge_id": "horizontal-lane-005-to-negative-45",
+      "artifact": "build/g1-object-motion-field-v1/transitions/h006-to-m45-db794-v1/traversal-10.npz",
+      "validation": "build/g1-object-motion-field-v1/transitions/h006-to-m45-db794-v1/validation-10.json",
+      "from_heading_degrees": 0.0,
+      "to_heading_degrees": -45.0,
+      "observed_heading_change_degrees": -45.33132348359265,
+      "provenance": [
+        {
+          "role": "authentic_turn",
+          "clip_index": 755,
+          "logical_name": "grail-stair_p2-fbb53f36f559e2489559",
+          "source_frames": [240, 269],
+          "repair": "none"
+        },
+        {
+          "role": "boundary_connector",
+          "method": "full-sole rigid-pivot interpolation",
+          "frame_count": 10
+        }
+      ]
+    },
+    {
+      "edge_id": "positive-45-lane-005-to-positive-90",
+      "artifact": "build/g1-object-motion-field-v1/transitions/lane5-p90-authentic-v1/traversal-16.npz",
+      "validation": "build/g1-object-motion-field-v1/transitions/lane5-p90-authentic-v1/validation-16.json",
+      "from_heading_degrees": 45.0,
+      "to_heading_degrees": 90.0,
+      "observed_heading_change_degrees": 45.05822519981886,
+      "provenance": [
+        {
+          "role": "incoming_authentic_preview",
+          "source_edge_id": "horizontal-lane-005-to-positive-45",
+          "source_frames": [83, 103]
+        },
+        {
+          "role": "boundary_connector",
+          "method": "full-sole rigid-pivot interpolation",
+          "frame_count": 16
+        },
+        {
+          "role": "authentic_turn",
+          "clip_index": 308,
+          "logical_name": "grail-stair_p1-7b1ca49eac2b86c9098e",
+          "source_frames": [458, 492],
+          "repair": "none"
+        }
+      ]
+    },
+    {
+      "edge_id": "positive-45-lane-006-to-positive-90",
+      "artifact": "build/g1-object-motion-field-v1/transitions/lane6-p90-authentic-v1/traversal-16.npz",
+      "validation": "build/g1-object-motion-field-v1/transitions/lane6-p90-authentic-v1/validation-16.json",
+      "from_heading_degrees": 45.0,
+      "to_heading_degrees": 90.0,
+      "observed_heading_change_degrees": 45.05822519981886,
+      "provenance": [
+        {
+          "role": "incoming_authentic_preview",
+          "source_edge_id": "horizontal-lane-005-to-positive-45",
+          "source_frames": [83, 103]
+        },
+        {
+          "role": "boundary_connector",
+          "method": "full-sole rigid-pivot interpolation",
+          "frame_count": 16
+        },
+        {
+          "role": "authentic_turn",
+          "clip_index": 308,
+          "logical_name": "grail-stair_p1-7b1ca49eac2b86c9098e",
+          "source_frames": [458, 492],
+          "repair": "none"
+        }
+      ]
+    },
+    {
+      "edge_id": "positive-45-lane-005-to-horizontal",
+      "artifact": "build/g1-object-motion-field-v1/transitions/lane5-p0-authentic-v1/traversal-16.npz",
+      "validation": "build/g1-object-motion-field-v1/transitions/lane5-p0-authentic-v1/validation-16.json",
+      "from_heading_degrees": 45.0,
+      "to_heading_degrees": 0.0,
+      "observed_heading_change_degrees": -44.93358790784446,
+      "provenance": [
+        {
+          "role": "incoming_authentic_preview",
+          "source_edge_id": "horizontal-lane-005-to-positive-45",
+          "source_frames": [83, 103]
+        },
+        {
+          "role": "boundary_connector",
+          "method": "full-sole rigid-pivot interpolation",
+          "frame_count": 16
+        },
+        {
+          "role": "authentic_turn",
+          "clip_index": 492,
+          "logical_name": "grail-stair_p1-d3b23f279ff093e38c6a",
+          "source_frames": [433, 478],
+          "repair": "none"
+        }
+      ]
+    },
+        {
+            "edge_id": "negative-45-lane-005-to-horizontal",
+      "artifact": "build/g1-object-motion-field-v1/transitions/m45-lane5-p0-authentic-v1/traversal-16.npz",
+      "validation": "build/g1-object-motion-field-v1/transitions/m45-lane5-p0-authentic-v1/validation-16.json",
+      "from_heading_degrees": -45.0,
+      "to_heading_degrees": 0.0,
+      "observed_heading_change_degrees": 45.45869285123504,
+      "provenance": [
+        {
+          "role": "incoming_authentic_preview",
+          "source_edge_id": "horizontal-lane-005-to-negative-45",
+          "source_frames": [32, 52]
+        },
+        {
+          "role": "boundary_connector",
+          "method": "full-sole rigid-pivot interpolation",
+          "frame_count": 16
+        },
+        {
+          "role": "authentic_turn",
+          "clip_index": 140,
+          "logical_name": "grail-stair_p1-2716836526e22159d6b7",
+          "source_frames": [215, 260],
+          "repair": "none"
+                }
+            ]
+        },
+        {
+            "edge_id": "positive-90-lane-002-to-positive-45",
+            "artifact": "build/g1-object-motion-field-v1/transitions/p90-lane2-p45-authentic-v1/traversal-16.npz",
+            "validation": "build/g1-object-motion-field-v1/transitions/p90-lane2-p45-authentic-v1/validation-16.json",
+            "from_heading_degrees": 90.0,
+            "to_heading_degrees": 45.0,
+            "observed_heading_change_degrees": -45.091,
+            "provenance": [
+                {
+                    "role": "incoming_authentic_preview",
+                    "source_edge_id": "positive-45-lane-005-to-positive-90",
+                    "source_frames": [
+                        44,
+                        64
+                    ]
+                },
+                {
+                    "role": "boundary_connector",
+                    "method": "full-sole rigid-pivot interpolation",
+                    "frame_count": 16
+                },
+                {
+                    "role": "authentic_turn",
+                    "clip_index": 183,
+                    "logical_name": "grail-stair_p1-4107ab5e1df76285f868",
+                    "source_frames": [
+                        422,
+                        453
+                    ],
+                    "repair": "none"
+                }
+            ]
+        }
+  ]
+}
