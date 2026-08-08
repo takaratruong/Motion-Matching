@@ -58,7 +58,7 @@ class TerrainPFNNHillMap:
         self.summit_m = float(summit_m)
 
         hill_length = 2.0 * blend_m + 2.0 * flank_m + summit_m
-        cursor = 0.0
+        cursor = float(flat_apron_m)
         hills: list[HillSegment] = []
         for grade in self.requested_grades_deg:
             hills.append(HillSegment(cursor, cursor + hill_length, grade))

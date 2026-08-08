@@ -14,6 +14,9 @@ class TerrainPFNNHillMapTests(unittest.TestCase):
 
         self.assertEqual(terrain.requested_grades_deg, (10.0, 15.0, 18.9))
         self.assertEqual(len(terrain.hills), 3)
+        self.assertGreaterEqual(terrain.hills[0].start_x, 1.5)
+        for x in np.linspace(-0.5, 0.5, 21):
+            self.assertEqual(terrain.height_at((float(x), 0.0)), 0.0)
         for hill, requested in zip(terrain.hills, terrain.requested_grades_deg):
             samples = np.linspace(hill.start_x, hill.end_x, 2001)
             slopes = np.asarray([terrain.analytic_slope_at(float(x)) for x in samples])
