@@ -42,6 +42,7 @@ from .recurrence import (
 
 
 CHECKPOINT_SCHEMA = "mm-sonic-terrain-pfnn-checkpoint/v5"
+FITTED_TRANSITION_REPORT_SCHEMA = "mm-sonic-fitted-transition-report/v1"
 _SEQUENCE_LANES = ("motion", *(f"idle_phase_{index}" for index in range(8)))
 _NORMALIZATION_CONTRACT = {
     "continuous_loss_domain": "normalized",
@@ -493,6 +494,544 @@ def fitted_row_sha256(sample: Mapping[str, object]) -> str:
     digest.update(y.tobytes(order="C"))
     digest.update(phase.tobytes())
     return digest.hexdigest()
+
+
+def _canonical_json_sha256(value: Mapping[str, object]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+@dataclass(frozen=True)
+class FittedTransitionReport:
+    accepted: bool
+    sample_count: int
+    maxima: dict[str, float]
+    first_failure: dict[str, object] | None
+    rows_sha256: str
+    report_sha256: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema": FITTED_TRANSITION_REPORT_SCHEMA,
+            "accepted": self.accepted,
+            "sample_count": self.sample_count,
+            "maxima": dict(self.maxima),
+            "first_failure": (
+                None if self.first_failure is None else dict(self.first_failure)
+            ),
+            "rows_sha256": self.rows_sha256,
+            "report_sha256": self.report_sha256,
+        }
+
+
+def validate_fitted_transition_report(value: object) -> dict[str, object]:
+    """Return one exact canonical fitted-transition report or fail closed."""
+
+    report = value.to_dict() if isinstance(value, FittedTransitionReport) else value
+    required = {
+        "schema", "accepted", "sample_count", "maxima", "first_failure",
+        "rows_sha256", "report_sha256",
+    }
+    maximum_fields = {
+        "absolute_output",
+        "root_translation_step_m",
+        "root_rotation_step_rad",
+        "joint_step_rad",
+        "joint_limit_excess_rad",
+        "root_height_m",
+        "root_quaternion_norm_error",
+        "trajectory_direction_norm_deviation",
+        "phase_advance_rad",
+    }
+    if (
+        type(report) is not dict
+        or set(report) != required
+        or report.get("schema") != FITTED_TRANSITION_REPORT_SCHEMA
+        or type(report.get("accepted")) is not bool
+        or type(report.get("sample_count")) is not int
+        or report["sample_count"] < 1
+        or type(report.get("maxima")) is not dict
+        or set(report["maxima"]) != maximum_fields
+        or any(
+            isinstance(item, bool)
+            or not isinstance(item, (int, float))
+            or not math.isfinite(float(item))
+            or float(item) < 0.0
+            for item in report["maxima"].values()
+        )
+        or not (
+            type(report.get("rows_sha256")) is str
+            and len(report["rows_sha256"]) == 64
+            and all(
+                character in "0123456789abcdef"
+                for character in report["rows_sha256"]
+            )
+        )
+        or not (
+            type(report.get("report_sha256")) is str
+            and len(report["report_sha256"]) == 64
+            and all(
+                character in "0123456789abcdef"
+                for character in report["report_sha256"]
+            )
+        )
+    ):
+        raise ValueError("fitted transition report is invalid")
+    failure = report["first_failure"]
+    if failure is not None and (
+        type(failure) is not dict
+        or set(failure) != {
+            "clip_id", "sequence_lane", "center_frame", "field", "joint",
+            "value", "limit",
+        }
+        or type(failure.get("clip_id")) is not str
+        or not failure["clip_id"]
+        or failure.get("sequence_lane") not in _SEQUENCE_LANES
+        or type(failure.get("center_frame")) is not int
+        or failure["center_frame"] < 0
+        or type(failure.get("field")) is not str
+        or not failure["field"]
+        or (
+            failure.get("joint") is not None
+            and failure["joint"] not in ISAACLAB_JOINT_NAMES
+        )
+        or type(failure.get("value")) not in (int, float, str)
+        or type(failure.get("limit")) not in (int, float, str)
+        or (
+            type(failure.get("value")) in (int, float)
+            and not math.isfinite(float(failure["value"]))
+        )
+        or (
+            type(failure.get("limit")) in (int, float)
+            and not math.isfinite(float(failure["limit"]))
+        )
+    ):
+        raise ValueError("fitted transition report failure is invalid")
+    if report["accepted"] != (failure is None):
+        raise ValueError("fitted transition report acceptance is invalid")
+    base = {key: item for key, item in report.items() if key != "report_sha256"}
+    if report["report_sha256"] != _canonical_json_sha256(base):
+        raise ValueError("fitted transition report digest mismatch")
+    return json.loads(json.dumps(
+        report, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ))
+
+
+def fitted_adjacent_indices(
+    dataset: object, indices: Sequence[int]
+) -> tuple[tuple[int, int], ...]:
+    """Return every exact same-clip, same-lane adjacent fitted pair."""
+
+    rows: dict[tuple[str, str, int], int] = {}
+    for raw_index in indices:
+        if type(raw_index) is not int:
+            raise ValueError("fitted transition index is invalid")
+        index = int(raw_index)
+        if index < 0 or index >= len(dataset):
+            raise ValueError("fitted transition index is invalid")
+        sample = dataset[index]
+        if not isinstance(sample, Mapping):
+            raise ValueError("fitted transition row is invalid")
+        clip = sample.get("clip_id")
+        lane = sample.get("sequence_lane")
+        center = sample.get("center_frame")
+        key = (str(clip), str(lane), int(center) if type(center) is int else -1)
+        if (
+            type(clip) is not str
+            or not clip
+            or lane not in _SEQUENCE_LANES
+            or type(center) is not int
+            or center < 0
+            or key in rows
+        ):
+            raise ValueError("fitted transition row provenance is invalid")
+        fitted_row_sha256(sample)
+        rows[key] = index
+    pairs = [
+        (predecessor, rows[(clip, lane, center + 1)])
+        for (clip, lane, center), predecessor in rows.items()
+        if (clip, lane, center + 1) in rows
+    ]
+    return tuple(
+        sorted(
+            pairs,
+            key=lambda pair: (
+                str(dataset[pair[1]]["clip_id"]),
+                str(dataset[pair[1]]["sequence_lane"]),
+                int(dataset[pair[1]]["center_frame"]),
+                pair,
+            ),
+        )
+    )
+
+
+def _nonfinite_label(value: float) -> str:
+    if math.isnan(value):
+        return "nan"
+    return "positive_infinity" if value > 0.0 else "negative_infinity"
+
+
+def _fitted_failure(
+    sample: Mapping[str, object],
+    *,
+    field: str,
+    value: object,
+    limit: object,
+    joint: str | None = None,
+) -> dict[str, object]:
+    return {
+        "clip_id": str(sample["clip_id"]),
+        "sequence_lane": str(sample["sequence_lane"]),
+        "center_frame": int(sample["center_frame"]),
+        "field": field,
+        "joint": joint,
+        "value": value,
+        "limit": limit,
+    }
+
+
+def _normalized_root_quaternion(tilt: np.ndarray) -> tuple[np.ndarray, float] | None:
+    x, y = float(tilt[0]), float(tilt[1])
+    angle = math.hypot(x, y)
+    if not math.isfinite(angle):
+        return None
+    if angle < 1.0e-12:
+        quaternion = np.asarray((1.0, 0.5 * x, 0.5 * y, 0.0), np.float64)
+    else:
+        scale = math.sin(0.5 * angle) / angle
+        quaternion = np.asarray(
+            (math.cos(0.5 * angle), scale * x, scale * y, 0.0), np.float64
+        )
+    norm = float(np.linalg.norm(quaternion))
+    if not math.isfinite(norm) or norm <= 0.0:
+        return None
+    normalized = quaternion / norm
+    if not np.isfinite(normalized).all():
+        return None
+    return normalized, abs(float(np.linalg.norm(normalized)) - 1.0)
+
+
+def evaluate_fitted_transition_envelope(
+    model: nn.Module,
+    dataset: object,
+    adjacent_indices: Sequence[tuple[int, int]],
+    *,
+    normalization: object,
+    joint_limits: object,
+    phase_advance_q99: float,
+) -> FittedTransitionReport:
+    """Evaluate all raw fitted recurrent transitions in physical units."""
+
+    if not isinstance(model, nn.Module):
+        raise ValueError("fitted transition model is invalid")
+    try:
+        pairs = tuple(adjacent_indices)
+    except TypeError as error:
+        raise ValueError("fitted transition pairs are invalid") from error
+    if not pairs:
+        raise ValueError("fitted transition pairs cannot be empty")
+    if (
+        isinstance(phase_advance_q99, bool)
+        or not isinstance(phase_advance_q99, (int, float))
+        or not math.isfinite(float(phase_advance_q99))
+        or float(phase_advance_q99) < 0.0
+    ):
+        raise ValueError("fitted transition phase q99 is invalid")
+    phase_limit = min(math.pi, 1.5 * float(phase_advance_q99))
+    limits = np.asarray(joint_limits, dtype=np.float64)
+    if (
+        limits.shape != (len(ISAACLAB_JOINT_NAMES), 2)
+        or not np.isfinite(limits).all()
+        or np.any(limits[:, 0] > limits[:, 1])
+    ):
+        raise ValueError("fitted transition joint limits are invalid")
+
+    tensors = tuple(model.parameters()) + tuple(model.buffers())
+    reference = next(
+        (value for value in tensors if value.is_floating_point()), None
+    )
+    device = torch.device("cpu") if reference is None else reference.device
+    dtype = torch.float32 if reference is None else reference.dtype
+    normal = _normalization_tensors(
+        normalization, device=device, dtype=dtype
+    )
+    y_mean = normal["y_mean"].detach().cpu().numpy().astype(np.float64)
+    y_std = normal["y_std"].detach().cpu().numpy().astype(np.float64)
+    pair_receipts: list[dict[str, object]] = []
+    samples: list[tuple[Mapping[str, object], Mapping[str, object]]] = []
+    seen_pairs: set[tuple[int, int]] = set()
+    for pair in pairs:
+        if (
+            type(pair) not in (tuple, list)
+            or len(pair) != 2
+            or type(pair[0]) is not int
+            or type(pair[1]) is not int
+            or pair[0] < 0
+            or pair[1] < 0
+            or pair[0] >= len(dataset)
+            or pair[1] >= len(dataset)
+            or tuple(pair) in seen_pairs
+        ):
+            raise ValueError("fitted transition pair is invalid")
+        predecessor = dataset[pair[0]]
+        current = dataset[pair[1]]
+        if not isinstance(predecessor, Mapping) or not isinstance(current, Mapping):
+            raise ValueError("fitted transition row is invalid")
+        if (
+            predecessor.get("clip_id") != current.get("clip_id")
+            or predecessor.get("sequence_lane") != current.get("sequence_lane")
+            or type(predecessor.get("center_frame")) is not int
+            or type(current.get("center_frame")) is not int
+            or int(current["center_frame"]) != int(predecessor["center_frame"]) + 1
+        ):
+            raise ValueError("fitted transition pair is not same-lane adjacent")
+        predecessor_hash = fitted_row_sha256(predecessor)
+        current_hash = fitted_row_sha256(current)
+        pair_receipts.append({
+            "clip_id": str(current["clip_id"]),
+            "sequence_lane": str(current["sequence_lane"]),
+            "predecessor_center_frame": int(predecessor["center_frame"]),
+            "center_frame": int(current["center_frame"]),
+            "predecessor_row_sha256": predecessor_hash,
+            "current_row_sha256": current_hash,
+        })
+        samples.append((predecessor, current))
+        seen_pairs.add(tuple(pair))
+    ordered_pairs = sorted(
+        zip(pair_receipts, samples),
+        key=lambda item: (
+            item[0]["clip_id"], item[0]["sequence_lane"],
+            item[0]["center_frame"], item[0]["current_row_sha256"],
+        ),
+    )
+    pair_receipts = [item[0] for item in ordered_pairs]
+    samples = [item[1] for item in ordered_pairs]
+    rows_sha256 = _canonical_json_sha256({
+        "schema": "mm-sonic-fitted-transition-rows/v1",
+        "pairs": pair_receipts,
+    })
+
+    maxima = {
+        "absolute_output": 0.0,
+        "root_translation_step_m": 0.0,
+        "root_rotation_step_rad": 0.0,
+        "joint_step_rad": 0.0,
+        "joint_limit_excess_rad": 0.0,
+        "root_height_m": 0.0,
+        "root_quaternion_norm_error": 0.0,
+        "trajectory_direction_norm_deviation": 0.0,
+        "phase_advance_rad": 0.0,
+    }
+    first_failure: dict[str, object] | None = None
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.inference_mode():
+            for predecessor, current in samples:
+                x = torch.as_tensor(
+                    np.asarray(current["x"], dtype=np.float64),
+                    device=device,
+                    dtype=dtype,
+                ).reshape(1, -1)
+                phase = torch.as_tensor(
+                    [float(current["phase"])], device=device, dtype=dtype
+                )
+                prediction = model(x, phase)
+                if (
+                    type(prediction) is not torch.Tensor
+                    or prediction.shape != (1, OUTPUT_LAYOUT.size)
+                    or not prediction.is_floating_point()
+                ):
+                    raise ValueError("fitted transition model output is invalid")
+                normalized = prediction.detach().to(device="cpu", dtype=torch.float64)
+                physical = (
+                    normalized.numpy() * y_std[None, :] + y_mean[None, :]
+                )[0]
+                predecessor_physical = (
+                    np.asarray(predecessor["y"], dtype=np.float64) * y_std + y_mean
+                )
+                finite = np.isfinite(physical)
+                if finite.any():
+                    maxima["absolute_output"] = max(
+                        maxima["absolute_output"],
+                        float(np.max(np.abs(physical[finite]))),
+                    )
+
+                failure: dict[str, object] | None = None
+                phase_value = float(physical[OUTPUT_LAYOUT["phase_advance"]][0])
+                if not math.isfinite(phase_value):
+                    failure = _fitted_failure(
+                        current,
+                        field="phase_advance",
+                        value=_nonfinite_label(phase_value),
+                        limit="finite",
+                    )
+                elif not finite.all():
+                    value = float(physical[int(np.flatnonzero(~finite)[0])])
+                    failure = _fitted_failure(
+                        current,
+                        field="output",
+                        value=_nonfinite_label(value),
+                        limit="finite",
+                    )
+                else:
+                    translation = float(np.linalg.norm(
+                        physical[OUTPUT_LAYOUT["root_planar_velocity"]]
+                    ) / 30.0)
+                    rotation = abs(float(
+                        physical[OUTPUT_LAYOUT["root_yaw_velocity"]][0]
+                    )) / 30.0
+                    predicted_joints = physical[OUTPUT_LAYOUT["joint_position"]]
+                    reached_joints = predecessor_physical[
+                        OUTPUT_LAYOUT["joint_position"]
+                    ]
+                    joint_steps = np.abs(predicted_joints - reached_joints)
+                    lower_excess = np.maximum(limits[:, 0] - predicted_joints, 0.0)
+                    upper_excess = np.maximum(predicted_joints - limits[:, 1], 0.0)
+                    limit_excess = np.maximum(lower_excess, upper_excess)
+                    root_height = float(physical[OUTPUT_LAYOUT["root_height"]][0])
+                    quaternion = _normalized_root_quaternion(
+                        physical[OUTPUT_LAYOUT["root_tilt"]]
+                    )
+                    directions = physical[
+                        OUTPUT_LAYOUT["trajectory_direction"]
+                    ].reshape(12, 2)
+                    direction_norms = np.linalg.norm(directions, axis=1)
+                    maxima["root_translation_step_m"] = max(
+                        maxima["root_translation_step_m"], translation
+                    )
+                    maxima["root_rotation_step_rad"] = max(
+                        maxima["root_rotation_step_rad"], rotation
+                    )
+                    maxima["joint_step_rad"] = max(
+                        maxima["joint_step_rad"], float(np.max(joint_steps))
+                    )
+                    maxima["joint_limit_excess_rad"] = max(
+                        maxima["joint_limit_excess_rad"], float(np.max(limit_excess))
+                    )
+                    maxima["root_height_m"] = max(
+                        maxima["root_height_m"], abs(root_height)
+                    )
+                    if quaternion is not None:
+                        maxima["root_quaternion_norm_error"] = max(
+                            maxima["root_quaternion_norm_error"], quaternion[1]
+                        )
+                    maxima["trajectory_direction_norm_deviation"] = max(
+                        maxima["trajectory_direction_norm_deviation"],
+                        float(np.max(np.abs(direction_norms - 1.0))),
+                    )
+                    maxima["phase_advance_rad"] = max(
+                        maxima["phase_advance_rad"], abs(phase_value)
+                    )
+                    if translation > 0.060:
+                        failure = _fitted_failure(
+                            current,
+                            field="root_translation_step_m",
+                            value=translation,
+                            limit=0.060,
+                        )
+                    elif rotation > 0.35:
+                        failure = _fitted_failure(
+                            current,
+                            field="root_rotation_step_rad",
+                            value=rotation,
+                            limit=0.35,
+                        )
+                    elif np.any(joint_steps > 0.25):
+                        joint_index = int(np.flatnonzero(joint_steps > 0.25)[0])
+                        failure = _fitted_failure(
+                            current,
+                            field="joint_position",
+                            joint=ISAACLAB_JOINT_NAMES[joint_index],
+                            value=float(joint_steps[joint_index]),
+                            limit=0.25,
+                        )
+                    elif np.any(limit_excess > 0.0):
+                        joint_index = int(np.flatnonzero(limit_excess > 0.0)[0])
+                        boundary = (
+                            limits[joint_index, 0]
+                            if predicted_joints[joint_index] < limits[joint_index, 0]
+                            else limits[joint_index, 1]
+                        )
+                        failure = _fitted_failure(
+                            current,
+                            field="joint_limit",
+                            joint=ISAACLAB_JOINT_NAMES[joint_index],
+                            value=float(predicted_joints[joint_index]),
+                            limit=float(boundary),
+                        )
+                    elif root_height <= 0.0:
+                        failure = _fitted_failure(
+                            current,
+                            field="root_height",
+                            value=root_height,
+                            limit=0.0,
+                        )
+                    elif quaternion is None:
+                        failure = _fitted_failure(
+                            current,
+                            field="root_quaternion_wxyz",
+                            value="nonfinite",
+                            limit="finite_normalized",
+                        )
+                    elif np.any(direction_norms < 0.5):
+                        value = float(direction_norms[
+                            int(np.flatnonzero(direction_norms < 0.5)[0])
+                        ])
+                        failure = _fitted_failure(
+                            current,
+                            field="trajectory_direction_norm",
+                            value=value,
+                            limit=0.5,
+                        )
+                    elif np.any(direction_norms > 1.5):
+                        value = float(direction_norms[
+                            int(np.flatnonzero(direction_norms > 1.5)[0])
+                        ])
+                        failure = _fitted_failure(
+                            current,
+                            field="trajectory_direction_norm",
+                            value=value,
+                            limit=1.5,
+                        )
+                    elif phase_value < 0.0:
+                        failure = _fitted_failure(
+                            current,
+                            field="phase_advance",
+                            value=phase_value,
+                            limit=0.0,
+                        )
+                    elif phase_value > phase_limit:
+                        failure = _fitted_failure(
+                            current,
+                            field="phase_advance",
+                            value=phase_value,
+                            limit=phase_limit,
+                        )
+                if first_failure is None and failure is not None:
+                    first_failure = failure
+    finally:
+        model.train(was_training)
+
+    base: dict[str, object] = {
+        "schema": FITTED_TRANSITION_REPORT_SCHEMA,
+        "accepted": first_failure is None,
+        "sample_count": len(samples),
+        "maxima": maxima,
+        "first_failure": first_failure,
+        "rows_sha256": rows_sha256,
+    }
+    return FittedTransitionReport(
+        accepted=first_failure is None,
+        sample_count=len(samples),
+        maxima=maxima,
+        first_failure=first_failure,
+        rows_sha256=rows_sha256,
+        report_sha256=_canonical_json_sha256(base),
+    )
 
 
 def choose_runtime_seed(
@@ -1729,11 +2268,15 @@ def restore_training_state(
 __all__ = [
     "CHECKPOINT_SCHEMA",
     "DEFAULT_LOSS_WEIGHTS",
+    "FITTED_TRANSITION_REPORT_SCHEMA",
+    "FittedTransitionReport",
     "LOSS_WEIGHT_KEYS",
     "LoadedCheckpoint",
     "RolloutResult",
     "autoregressive_unroll",
     "choose_runtime_seed",
+    "evaluate_fitted_transition_envelope",
+    "fitted_adjacent_indices",
     "fitted_row_sha256",
     "finite_runtime_seed",
     "load_checkpoint",
@@ -1743,6 +2286,7 @@ __all__ = [
     "save_checkpoint",
     "selection_metadata",
     "training_phase_advance_q99",
+    "validate_fitted_transition_report",
     "validate_resume_fitted_subset",
     "validate_runtime_seed_fitted_subset",
 ]

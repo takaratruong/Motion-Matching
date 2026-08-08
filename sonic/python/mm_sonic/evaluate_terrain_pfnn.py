@@ -27,9 +27,12 @@ from mm_sonic.terrain_pfnn.runtime import (
     TerrainSample,
 )
 from mm_sonic.terrain_pfnn.training import (
+    evaluate_fitted_transition_envelope,
+    fitted_adjacent_indices,
     fitted_row_sha256,
     load_checkpoint,
     one_step_metrics,
+    validate_fitted_transition_report,
 )
 from mm_sonic.terrain_oracle.canonical import CanonicalTerrainMesh
 from mm_sonic.terrain_oracle.math3d import RigidTransform
@@ -1249,21 +1252,32 @@ def _fitted_subset_indices(
     if type(rows) is not list or not rows:
         raise ValueError("pipeline checkpoint fitted subset receipt is missing")
     wanted = {
-        (row.get("clip_id"), row.get("center_frame")): row.get("row_sha256")
+        (
+            row.get("clip_id"), row.get("sequence_lane"),
+            row.get("center_frame"),
+        ): row.get("row_sha256")
         for row in rows
         if type(row) is dict
     }
     if len(wanted) != len(rows):
         raise ValueError("pipeline checkpoint fitted subset receipt is invalid")
-    matches: dict[tuple[object, object], list[int]] = {key: [] for key in wanted}
+    matches: dict[tuple[object, object, object], list[int]] = {
+        key: [] for key in wanted
+    }
     for index in range(len(dataset)):
         sample = dataset[index]
-        key = (sample.get("clip_id"), sample.get("center_frame"))
+        key = (
+            sample.get("clip_id"), sample.get("sequence_lane"),
+            sample.get("center_frame"),
+        )
         if key in wanted and fitted_row_sha256(sample) == wanted[key]:
             matches[key].append(index)
     if any(len(indices) != 1 for indices in matches.values()):
         raise ValueError("fitted subset row membership is not unique")
-    return [matches[(row["clip_id"], row["center_frame"])][0] for row in rows]
+    return [
+        matches[(row["clip_id"], row["sequence_lane"], row["center_frame"])][0]
+        for row in rows
+    ]
 
 
 def _atomic_json(path: Path, value: object) -> None:
@@ -1428,20 +1442,25 @@ def evaluate(
     )
     closed_loop: dict[str, object]
     pipeline_promotion: dict[str, object] | None = None
+    fitted_transition_report: dict[str, object] | None = None
     if split == "train":
-        closed_loop = run_known_train_rollout(
-            checkpoint=checkpoint,
-            kinematics=kinematics,
-            model_path=model_path,
-            manifest=manifest,
-            split=split,
-            device=target_device,
-            checkpoint_sha256=checkpoint_digest,
-        )
         fitted_subset = getattr(checkpoint, "fitted_subset", None)
         selection = getattr(checkpoint, "selection", None)
-        if type(fitted_subset) is dict and type(selection) is dict:
+        if type(fitted_subset) is dict:
             fixed_indices = _fitted_subset_indices(dataset, fitted_subset)
+            adjacent = fitted_adjacent_indices(dataset, fixed_indices)
+            transition_model = checkpoint.build_model().to(torch.device("cpu"))
+            transition = evaluate_fitted_transition_envelope(
+                transition_model,
+                dataset,
+                adjacent,
+                normalization=checkpoint.normalization,
+                joint_limits=checkpoint.joint_limits,
+                phase_advance_q99=checkpoint.phase_advance_q99,
+            )
+            fitted_transition_report = validate_fitted_transition_report(
+                transition
+            )
             fixed_metrics = one_step_metrics(
                 model,
                 dataset,
@@ -1451,51 +1470,102 @@ def evaluate(
                 device=target_device,
                 loss_weights=checkpoint.loss_weights,
             )
-            from mm_sonic.train_terrain_pfnn import (
-                build_pipeline_promotion_receipt,
-                promote_pipeline_best,
-            )
-
-            scenario_sha = closed_loop["scenario_provenance"][
-                "scenario_provenance_sha256"
-            ]
-            receipt = build_pipeline_promotion_receipt(
-                checkpoint_path=checkpoint_path,
-                dataset_digest_sha256=dataset_digest,
-                kinematic_signature_sha256=kinematics.kinematic_signature_sha256,
-                scenario_provenance_sha256=scenario_sha,
-                fitted_subset_rows_sha256=fitted_subset["rows_sha256"],
-                expected_fixed_sample_score=float(selection["one_step_score"]),
-                observed_fixed_sample_score=float(fixed_metrics["one_step_score"]),
-                expected_fixed_sample_count=len(fixed_indices),
-                observed_fixed_sample_count=int(fixed_metrics["samples"]),
-                closed_loop_metrics=closed_loop,
-            )
+            receipt: dict[str, object] | None = None
             promoted = False
-            if promote_pipeline_checkpoint:
-                promoted = promote_pipeline_best(
-                    candidate_path=checkpoint_path,
-                    best_path=checkpoint_path.parent / "best.pt",
-                    receipt=receipt,
-                    dataset_digest_sha256=dataset_digest,
-                    kinematic_signature_sha256=(
-                        kinematics.kinematic_signature_sha256
-                    ),
-                    scenario_provenance_sha256=scenario_sha,
-                    fitted_subset_rows_sha256=fitted_subset["rows_sha256"],
-                )
-                if promoted:
-                    _atomic_json(
-                        checkpoint_path.parent / "pipeline-promotion-receipt.json",
-                        receipt,
+            if fitted_transition_report["accepted"] is True:
+                if promote_pipeline_checkpoint and type(selection) is not dict:
+                    raise ValueError(
+                        "pipeline promotion requires a provisional fitted checkpoint"
                     )
-            pipeline_promotion = {
-                "receipt": receipt,
-                "fixed_sample_metrics": fixed_metrics,
-                "promoted": promoted,
-            }
-        elif promote_pipeline_checkpoint:
-            raise ValueError("pipeline promotion requires a provisional fitted checkpoint")
+                closed_loop = run_known_train_rollout(
+                    checkpoint=checkpoint,
+                    kinematics=kinematics,
+                    model_path=model_path,
+                    manifest=manifest,
+                    split=split,
+                    device=target_device,
+                    checkpoint_sha256=checkpoint_digest,
+                )
+                if type(selection) is dict:
+                    from mm_sonic.train_terrain_pfnn import (
+                        build_pipeline_promotion_receipt,
+                        promote_pipeline_best,
+                    )
+
+                    scenario_sha = closed_loop["scenario_provenance"][
+                        "scenario_provenance_sha256"
+                    ]
+                    receipt = build_pipeline_promotion_receipt(
+                        checkpoint_path=checkpoint_path,
+                        dataset_digest_sha256=dataset_digest,
+                        kinematic_signature_sha256=(
+                            kinematics.kinematic_signature_sha256
+                        ),
+                        scenario_provenance_sha256=scenario_sha,
+                        fitted_subset_rows_sha256=fitted_subset["rows_sha256"],
+                        fitted_transition_report=fitted_transition_report,
+                        fitted_transition_report_sha256=fitted_transition_report[
+                            "report_sha256"
+                        ],
+                        expected_fixed_sample_score=float(
+                            selection["one_step_score"]
+                        ),
+                        observed_fixed_sample_score=float(
+                            fixed_metrics["one_step_score"]
+                        ),
+                        expected_fixed_sample_count=len(fixed_indices),
+                        observed_fixed_sample_count=int(fixed_metrics["samples"]),
+                        closed_loop_metrics=closed_loop,
+                    )
+                    if promote_pipeline_checkpoint:
+                        promoted = promote_pipeline_best(
+                            candidate_path=checkpoint_path,
+                            best_path=checkpoint_path.parent / "best.pt",
+                            receipt=receipt,
+                            dataset_digest_sha256=dataset_digest,
+                            kinematic_signature_sha256=(
+                                kinematics.kinematic_signature_sha256
+                            ),
+                            scenario_provenance_sha256=scenario_sha,
+                            fitted_subset_rows_sha256=fitted_subset["rows_sha256"],
+                            fitted_transition_report=fitted_transition_report,
+                            fitted_transition_report_sha256=(
+                                fitted_transition_report["report_sha256"]
+                            ),
+                        )
+                        if promoted:
+                            _atomic_json(
+                                checkpoint_path.parent
+                                / "pipeline-promotion-receipt.json",
+                                receipt,
+                            )
+            else:
+                closed_loop = {
+                    "status": "rejected_fitted_transition_envelope",
+                    "failure_penalty": None,
+                    "accepted": False,
+                    "first_failure": fitted_transition_report["first_failure"],
+                }
+            if type(selection) is dict:
+                pipeline_promotion = {
+                    "receipt": receipt,
+                    "fixed_sample_metrics": fixed_metrics,
+                    "promoted": promoted,
+                }
+        else:
+            if promote_pipeline_checkpoint:
+                raise ValueError(
+                    "pipeline promotion requires a provisional fitted checkpoint"
+                )
+            closed_loop = run_known_train_rollout(
+                checkpoint=checkpoint,
+                kinematics=kinematics,
+                model_path=model_path,
+                manifest=manifest,
+                split=split,
+                device=target_device,
+                checkpoint_sha256=checkpoint_digest,
+            )
     else:
         closed_loop = {
             "status": "task_8_scenarios_required",
@@ -1510,6 +1580,12 @@ def evaluate(
         "split": split,
         "sealed_test": split == "test",
         "one_step": metrics,
+        "fitted_transition_report": fitted_transition_report,
+        "fitted_transition_report_sha256": (
+            None
+            if fitted_transition_report is None
+            else fitted_transition_report["report_sha256"]
+        ),
         "closed_loop": closed_loop,
         "pipeline_promotion": pipeline_promotion,
     }
@@ -1557,10 +1633,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         promote_pipeline_checkpoint=arguments.promote_pipeline_best,
     )
     print(json.dumps(report, sort_keys=True, allow_nan=False))
-    if arguments.split == "train" and not report["closed_loop"][
-        "known_train_gate"
-    ]["accepted"]:
-        return 2
+    if arguments.split == "train":
+        transition = report.get("fitted_transition_report")
+        if type(transition) is dict and transition.get("accepted") is not True:
+            return 2
+        known = report.get("closed_loop", {}).get("known_train_gate")
+        if type(known) is not dict or known.get("accepted") is not True:
+            return 2
     return 0
 
 

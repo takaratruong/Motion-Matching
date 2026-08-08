@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import hashlib
+import json
 from dataclasses import replace
 from pathlib import Path
 import tempfile
@@ -9,6 +11,7 @@ from unittest.mock import patch
 
 import numpy as np
 import torch
+import mm_sonic.evaluate_terrain_pfnn as evaluate_module
 import mm_sonic.terrain_pfnn.runtime as runtime_module
 
 from mm_sonic.evaluate_terrain_pfnn import (
@@ -21,7 +24,7 @@ from mm_sonic.evaluate_terrain_pfnn import (
     select_known_train_grail_record,
     evaluate,
 )
-from mm_sonic.train_terrain_pfnn import validated_normal_selection
+from mm_sonic.train_terrain_pfnn import fitted_subset_metadata, validated_normal_selection
 from mm_sonic.terrain_pfnn.dataset import pfnn_input_sha256
 from mm_sonic.terrain_pfnn.layout import INPUT_LAYOUT, OUTPUT_LAYOUT, TRAJECTORY_TIMES_S
 from mm_sonic.terrain_pfnn.recurrence import (
@@ -44,7 +47,7 @@ from mm_sonic.terrain_pfnn.runtime import (
     make_validation_scenario,
     validation_identity_set_receipt,
 )
-from mm_sonic.terrain_pfnn.training import finite_runtime_seed
+from mm_sonic.terrain_pfnn.training import FittedTransitionReport, finite_runtime_seed
 from mm_sonic.terrain_oracle.canonical import CanonicalTerrainMesh
 from mm_sonic.terrain_oracle.math3d import RigidTransform
 
@@ -1098,6 +1101,224 @@ def Mesh "Terrain" {
                 self.assertIsNone(selection)
                 self.assertFalse(promote)
 
+    def test_fitted_transition_rejection_prevents_known_terrain_callback(self) -> None:
+        manifest = {
+            "dataset_digest_sha256": "a" * 64,
+            "split_identities": {
+                "train": ["slope_000"], "validation": ["slope_002"],
+            },
+        }
+
+        class Dataset:
+            split = "train"
+            x_mean = np.zeros(INPUT_LAYOUT.size, np.float32)
+            x_std = np.ones(INPUT_LAYOUT.size, np.float32)
+            y_mean = np.zeros(OUTPUT_LAYOUT.size, np.float32)
+            y_std = np.ones(OUTPUT_LAYOUT.size, np.float32)
+
+            def __init__(self) -> None:
+                self.rows = [self.row(10), self.row(11)]
+
+            @staticmethod
+            def row(center: int) -> dict[str, object]:
+                y = np.zeros(OUTPUT_LAYOUT.size, np.float32)
+                y[OUTPUT_LAYOUT["trajectory_direction"]] = np.tile((1.0, 0.0), 12)
+                y[OUTPUT_LAYOUT["root_height"]] = 0.8
+                y[OUTPUT_LAYOUT["phase_advance"]] = 0.1
+                return {
+                    "x": np.zeros(INPUT_LAYOUT.size, np.float32),
+                    "y": y,
+                    "phase": np.float32(0.1 * center),
+                    "clip_id": "terrain_slopes__slope_000__000",
+                    "center_frame": center,
+                    "split_identity": "slope_000",
+                    "split": "train",
+                    "sequence_lane": "motion",
+                    "terrain_class": "flat",
+                }
+
+            def __len__(self) -> int:
+                return len(self.rows)
+
+            def __getitem__(self, index: int) -> dict[str, object]:
+                return self.rows[index]
+
+        dataset = Dataset()
+        fitted_subset = fitted_subset_metadata(dataset, (0, 1))
+        maxima = {
+            "absolute_output": 0.251,
+            "root_translation_step_m": 0.0,
+            "root_rotation_step_rad": 0.0,
+            "joint_step_rad": 0.251,
+            "joint_limit_excess_rad": 0.0,
+            "root_height_m": 0.8,
+            "root_quaternion_norm_error": 0.0,
+            "trajectory_direction_norm_deviation": 0.0,
+            "phase_advance_rad": 0.1,
+        }
+        failure = {
+            "clip_id": "terrain_slopes__slope_000__000",
+            "sequence_lane": "motion",
+            "center_frame": 11,
+            "field": "joint_position",
+            "joint": "left_hip_pitch_joint",
+            "value": 0.251,
+            "limit": 0.25,
+        }
+        base = {
+            "schema": "mm-sonic-fitted-transition-report/v1",
+            "accepted": False,
+            "sample_count": 1,
+            "maxima": maxima,
+            "first_failure": failure,
+            "rows_sha256": "d" * 64,
+        }
+        rejected = FittedTransitionReport(
+            accepted=False,
+            sample_count=1,
+            maxima=maxima,
+            first_failure=failure,
+            rows_sha256="d" * 64,
+            report_sha256=hashlib.sha256(json.dumps(
+                base, sort_keys=True, separators=(",", ":"), allow_nan=False,
+            ).encode()).hexdigest(),
+        )
+
+        class Kinematics:
+            kinematic_signature_sha256 = "kin"
+            joint_limits = torch.tensor([[-2.0, 2.0]] * 29, dtype=torch.float64)
+
+            def to(self, _device):
+                return self
+
+        class Checkpoint:
+            kinematic_signature_sha256 = "kin"
+            joint_limits = Kinematics.joint_limits.clone()
+            train_identities = ("slope_000",)
+            validation_identities = ("slope_002",)
+            normalization = {
+                "x_mean": torch.zeros(INPUT_LAYOUT.size),
+                "x_std": torch.ones(INPUT_LAYOUT.size),
+                "y_mean": torch.zeros(OUTPUT_LAYOUT.size),
+                "y_std": torch.ones(OUTPUT_LAYOUT.size),
+            }
+            loss_weights = {}
+            phase_advance_q99 = 0.2
+            selection = {"one_step_score": 1.0, "provisional": True}
+
+            def __init__(self) -> None:
+                self.fitted_subset = fitted_subset
+
+            @staticmethod
+            def build_model():
+                return torch.nn.Linear(INPUT_LAYOUT.size, OUTPUT_LAYOUT.size)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "manifest.json").write_text(json.dumps(manifest))
+            checkpoint_path = root / "checkpoint.pt"
+            checkpoint_path.write_bytes(b"candidate")
+            output_path = root / "evaluation.json"
+            checkpoint = Checkpoint()
+            transition_devices: list[str] = []
+
+            def transition_evaluation(
+                model: torch.nn.Module, *args: object, **kwargs: object
+            ) -> FittedTransitionReport:
+                transition_devices.append(next(model.parameters()).device.type)
+                return rejected
+
+            with (
+                patch(
+                    "mm_sonic.evaluate_terrain_pfnn.TorchG1ForwardKinematics.from_mjcf",
+                    return_value=Kinematics(),
+                ),
+                patch(
+                    "mm_sonic.evaluate_terrain_pfnn.load_checkpoint",
+                    return_value=checkpoint,
+                ),
+                patch(
+                    "mm_sonic.evaluate_terrain_pfnn.PFNNShardDataset",
+                    return_value=dataset,
+                ),
+                patch(
+                    "mm_sonic.evaluate_terrain_pfnn.one_step_metrics",
+                    return_value={"one_step_score": 1.0, "samples": 2},
+                ),
+                patch(
+                    "mm_sonic.evaluate_terrain_pfnn.evaluate_fitted_transition_envelope",
+                    side_effect=transition_evaluation,
+                ),
+                patch(
+                    "mm_sonic.evaluate_terrain_pfnn.run_known_train_rollout",
+                    side_effect=AssertionError("known terrain callback opened"),
+                ) as rollout,
+            ):
+                report = evaluate(
+                    checkpoint_path=checkpoint_path,
+                    dataset_path=root / "manifest.json",
+                    model_path=MODEL_PATH,
+                    split="train",
+                    output_path=output_path,
+                    sealed_test=False,
+                    run_directory=None,
+                    batch_size=2,
+                    device="meta",
+                    closed_loop_seconds=20.0,
+                    promote_pipeline_checkpoint=True,
+                )
+                checkpoint.selection = None
+                missing_selection_report = evaluate(
+                    checkpoint_path=checkpoint_path,
+                    dataset_path=root / "manifest.json",
+                    model_path=MODEL_PATH,
+                    split="train",
+                    output_path=output_path,
+                    sealed_test=False,
+                    run_directory=None,
+                    batch_size=2,
+                    device="meta",
+                    closed_loop_seconds=20.0,
+                    promote_pipeline_checkpoint=False,
+                )
+            rollout.assert_not_called()
+            self.assertEqual(transition_devices, ["cpu", "cpu"])
+            self.assertEqual(
+                report["closed_loop"]["status"],
+                "rejected_fitted_transition_envelope",
+            )
+            self.assertEqual(report["fitted_transition_report"], rejected.to_dict())
+            self.assertEqual(
+                report["fitted_transition_report_sha256"], rejected.report_sha256
+            )
+            self.assertIsNone(report["pipeline_promotion"]["receipt"])
+            self.assertFalse(report["pipeline_promotion"]["promoted"])
+            self.assertEqual(
+                missing_selection_report["closed_loop"]["status"],
+                "rejected_fitted_transition_envelope",
+            )
+            self.assertIsNone(missing_selection_report["pipeline_promotion"])
+            self.assertFalse((root / "best.pt").exists())
+
+    def test_evaluator_cli_fails_closed_on_transition_rejection(self) -> None:
+        rejected = {
+            "fitted_transition_report": {"accepted": False},
+            "closed_loop": {
+                "status": "rejected_fitted_transition_envelope",
+                "accepted": False,
+            },
+        }
+        with (
+            patch.object(evaluate_module, "evaluate", return_value=rejected),
+            patch("builtins.print"),
+        ):
+            self.assertEqual(evaluate_module.main([
+                "--checkpoint", "candidate.pt",
+                "--dataset", "dataset",
+                "--split", "train",
+                "--closed-loop-seconds", "20",
+            ]), 2)
+
     def test_public_evaluator_allows_only_explicit_twenty_second_train_gate(self) -> None:
         manifest = {
             "dataset_digest_sha256": "a" * 64,
@@ -1178,8 +1399,24 @@ def Mesh "Terrain" {
                     device="cpu",
                     closed_loop_seconds=20.0,
                 )
+                rollout.assert_called_once()
+                rollout.reset_mock()
+                with self.assertRaisesRegex(ValueError, "provisional fitted"):
+                    evaluate(
+                        checkpoint_path=checkpoint_path,
+                        dataset_path=root / "manifest.json",
+                        model_path=MODEL_PATH,
+                        split="train",
+                        output_path=output,
+                        sealed_test=False,
+                        run_directory=None,
+                        batch_size=1,
+                        device="cpu",
+                        closed_loop_seconds=20.0,
+                        promote_pipeline_checkpoint=True,
+                    )
+                rollout.assert_not_called()
             self.assertEqual(report["closed_loop"], closed_loop)
-            rollout.assert_called_once()
             with self.assertRaisesRegex(ValueError, "20"):
                 evaluate(
                     checkpoint_path=checkpoint_path,

@@ -30,6 +30,8 @@ from mm_sonic.terrain_pfnn.training import (
     LOSS_WEIGHT_KEYS,
     autoregressive_unroll,
     choose_runtime_seed,
+    evaluate_fitted_transition_envelope,
+    fitted_adjacent_indices,
     fitted_row_sha256,
     load_checkpoint,
     one_step_metrics,
@@ -38,6 +40,7 @@ from mm_sonic.terrain_pfnn.training import (
     save_checkpoint,
     selection_metadata,
     training_phase_advance_q99,
+    validate_fitted_transition_report,
     validate_resume_fitted_subset,
 )
 
@@ -243,6 +246,8 @@ def build_pipeline_promotion_receipt(
     kinematic_signature_sha256: str,
     scenario_provenance_sha256: str,
     fitted_subset_rows_sha256: str,
+    fitted_transition_report: dict[str, object],
+    fitted_transition_report_sha256: str,
     expected_fixed_sample_score: float,
     observed_fixed_sample_score: float,
     expected_fixed_sample_count: int,
@@ -252,6 +257,9 @@ def build_pipeline_promotion_receipt(
     """Build a fail-closed verifier receipt; never infer a missing gate."""
 
     candidate = Path(checkpoint_path)
+    transition_report = validate_fitted_transition_report(
+        fitted_transition_report
+    )
     if not candidate.is_file() or any(
         not _sha256_value(value)
         for value in (
@@ -259,9 +267,15 @@ def build_pipeline_promotion_receipt(
             kinematic_signature_sha256,
             scenario_provenance_sha256,
             fitted_subset_rows_sha256,
+            fitted_transition_report_sha256,
         )
     ):
         raise ValueError("pipeline verifier bindings are invalid")
+    transition_accepted = bool(
+        transition_report["accepted"] is True
+        and transition_report["report_sha256"]
+        == fitted_transition_report_sha256
+    )
     expected_score = float(expected_fixed_sample_score)
     observed_score = float(observed_fixed_sample_score)
     fixed_reproduction = bool(
@@ -290,12 +304,15 @@ def build_pipeline_promotion_receipt(
         and known.get("responsive_flat_motion_after_return") is True
     )
     base: dict[str, object] = {
-        "schema": "mm-sonic-pipeline-promotion-receipt/v1",
+        "schema": "mm-sonic-pipeline-promotion-receipt/v2",
         "checkpoint_sha256": _file_sha256(candidate),
         "dataset_digest_sha256": dataset_digest_sha256,
         "kinematic_signature_sha256": kinematic_signature_sha256,
         "scenario_provenance_sha256": scenario_provenance_sha256,
         "fitted_subset_rows_sha256": fitted_subset_rows_sha256,
+        "fitted_transition_report": transition_report,
+        "fitted_transition_report_sha256": fitted_transition_report_sha256,
+        "required_fitted_transition_envelope": transition_accepted,
         "fixed_sample_reproduction": fixed_reproduction,
         "expected_fixed_sample_score": expected_score,
         "observed_fixed_sample_score": observed_score,
@@ -303,7 +320,12 @@ def build_pipeline_promotion_receipt(
         "observed_fixed_sample_count": observed_fixed_sample_count,
         "required_runtime_gates": required_runtime,
         "required_known_terrain_traversal": required_traversal,
-        "accepted": fixed_reproduction and required_runtime and required_traversal,
+        "accepted": bool(
+            transition_accepted
+            and fixed_reproduction
+            and required_runtime
+            and required_traversal
+        ),
     }
     return {**base, "receipt_sha256": _canonical_sha256(base)}
 
@@ -338,10 +360,21 @@ def promote_pipeline_best(
     kinematic_signature_sha256: str,
     scenario_provenance_sha256: str,
     fitted_subset_rows_sha256: str,
+    fitted_transition_report: dict[str, object],
+    fitted_transition_report_sha256: str,
 ) -> bool:
     """Atomically publish immutable ``best.pt`` only from a bound gate receipt."""
 
     if type(receipt) is not dict or receipt.get("accepted") is not True:
+        return False
+    try:
+        expected_transition_report = validate_fitted_transition_report(
+            fitted_transition_report
+        )
+        receipt_transition_report = validate_fitted_transition_report(
+            receipt.get("fitted_transition_report")
+        )
+    except ValueError:
         return False
     candidate, best = Path(candidate_path), Path(best_path)
     if not candidate.is_file() or best.exists():
@@ -353,12 +386,14 @@ def promote_pipeline_best(
             "schema", "checkpoint_sha256", "dataset_digest_sha256",
             "kinematic_signature_sha256", "scenario_provenance_sha256",
             "fitted_subset_rows_sha256", "fixed_sample_reproduction",
+            "fitted_transition_report", "fitted_transition_report_sha256",
+            "required_fitted_transition_envelope",
             "expected_fixed_sample_score", "observed_fixed_sample_score",
             "expected_fixed_sample_count", "observed_fixed_sample_count",
             "required_runtime_gates", "required_known_terrain_traversal",
             "accepted", "receipt_sha256",
         }
-        or receipt.get("schema") != "mm-sonic-pipeline-promotion-receipt/v1"
+        or receipt.get("schema") != "mm-sonic-pipeline-promotion-receipt/v2"
         or receipt_hash != _canonical_sha256(base)
         or receipt.get("checkpoint_sha256") != _file_sha256(candidate)
         or receipt.get("dataset_digest_sha256") != dataset_digest_sha256
@@ -368,6 +403,15 @@ def promote_pipeline_best(
         != scenario_provenance_sha256
         or receipt.get("fitted_subset_rows_sha256")
         != fitted_subset_rows_sha256
+        or receipt_transition_report != expected_transition_report
+        or receipt.get("fitted_transition_report_sha256")
+        != fitted_transition_report_sha256
+        or fitted_transition_report_sha256
+        != expected_transition_report["report_sha256"]
+        or receipt.get("fitted_transition_report_sha256")
+        != receipt_transition_report["report_sha256"]
+        or expected_transition_report["accepted"] is not True
+        or receipt.get("required_fitted_transition_envelope") is not True
         or receipt.get("fixed_sample_reproduction") is not True
         or receipt.get("required_runtime_gates") is not True
         or receipt.get("required_known_terrain_traversal") is not True
@@ -843,6 +887,58 @@ def _consecutive_starts(
 def _append_metric(stream: object, record: dict[str, object]) -> None:
     stream.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
     stream.flush()
+
+
+def _verify_reloaded_pipeline_candidate(
+    *,
+    candidate_path: Path,
+    dataset: object,
+    fitted_indices: Sequence[int],
+    fitted_subset: dict[str, object],
+    dataset_digest_sha256: str,
+    kinematic_signature_sha256: str,
+    joint_limits: object,
+    phase_advance_q99: float,
+    verification_request: dict[str, object],
+    pipeline_verifier: Callable[[Path, dict[str, object]], dict[str, object]]
+    | None,
+) -> tuple[object, dict[str, object] | None]:
+    """Reload, validate, and gate a fitted candidate before any verifier opens."""
+
+    reloaded = load_checkpoint(
+        candidate_path,
+        expected_dataset_digest=dataset_digest_sha256,
+        expected_kinematic_signature_sha256=kinematic_signature_sha256,
+    )
+    if fitted_subset_metadata(dataset, fitted_indices) != fitted_subset:
+        raise ValueError("reloaded candidate fitted subset source mismatch")
+    validate_resume_fitted_subset(reloaded, fitted_subset)
+    expected_limits = torch.as_tensor(joint_limits, dtype=torch.float64, device="cpu")
+    if (
+        type(reloaded.joint_limits) is not torch.Tensor
+        or not torch.equal(reloaded.joint_limits, expected_limits)
+        or float(reloaded.phase_advance_q99) != float(phase_advance_q99)
+    ):
+        raise ValueError("reloaded candidate fitted envelope contract mismatch")
+    reloaded_model = reloaded.build_model()
+    adjacent = fitted_adjacent_indices(dataset, fitted_indices)
+    report = evaluate_fitted_transition_envelope(
+        reloaded_model,
+        dataset,
+        adjacent,
+        normalization=reloaded.normalization,
+        joint_limits=reloaded.joint_limits,
+        phase_advance_q99=reloaded.phase_advance_q99,
+    )
+    report_payload = validate_fitted_transition_report(report)
+    if report_payload["accepted"] is not True or pipeline_verifier is None:
+        return report, None
+    request = {
+        **verification_request,
+        "fitted_transition_report": report_payload,
+        "fitted_transition_report_sha256": report_payload["report_sha256"],
+    }
+    return report, pipeline_verifier(candidate_path, request)
 
 
 def train(
@@ -1343,14 +1439,10 @@ def train(
         sequence_sampler_state=sequence_sampler_state,
         fitted_subset=fitted_receipt,
     )
-    load_checkpoint(
-        candidate,
-        expected_dataset_digest=dataset_digest,
-        expected_kinematic_signature_sha256=kinematics.kinematic_signature_sha256,
-    )
     pipeline_receipt: dict[str, object] | None = None
+    fitted_transition_report: dict[str, object] | None = None
     best_path: str | None = None
-    if pipeline_overfit and one_step_accepted and pipeline_verifier is not None:
+    if pipeline_overfit:
         verification_request = {
             "dataset_digest_sha256": dataset_digest,
             "kinematic_signature_sha256": (
@@ -1362,8 +1454,24 @@ def train(
             ),
             "expected_fixed_sample_count": int(gate_metrics["samples"]),
         }
-        pipeline_receipt = pipeline_verifier(candidate, verification_request)
-        if expected_pipeline_scenario_provenance_sha256 is not None:
+        transition, pipeline_receipt = _verify_reloaded_pipeline_candidate(
+            candidate_path=candidate,
+            dataset=optimization_dataset,
+            fitted_indices=optimization_indices,
+            fitted_subset=fitted_receipt,
+            dataset_digest_sha256=dataset_digest,
+            kinematic_signature_sha256=kinematics.kinematic_signature_sha256,
+            joint_limits=kinematics.joint_limits.detach().cpu(),
+            phase_advance_q99=phase_q99,
+            verification_request=verification_request,
+            pipeline_verifier=(pipeline_verifier if one_step_accepted else None),
+        )
+        fitted_transition_report = validate_fitted_transition_report(transition)
+        if (
+            fitted_transition_report["accepted"] is True
+            and pipeline_receipt is not None
+            and expected_pipeline_scenario_provenance_sha256 is not None
+        ):
             promote_best = promote_pipeline_best(
                 candidate_path=candidate,
                 best_path=output / "best.pt",
@@ -1376,11 +1484,23 @@ def train(
                     expected_pipeline_scenario_provenance_sha256
                 ),
                 fitted_subset_rows_sha256=fitted_receipt["rows_sha256"],
+                fitted_transition_report=fitted_transition_report,
+                fitted_transition_report_sha256=fitted_transition_report[
+                    "report_sha256"
+                ],
             )
             if promote_best:
                 _atomic_json(output / "pipeline-promotion-receipt.json", pipeline_receipt)
                 best_path = str(output / "best.pt")
-    elif promote_best:
+    else:
+        load_checkpoint(
+            candidate,
+            expected_dataset_digest=dataset_digest,
+            expected_kinematic_signature_sha256=(
+                kinematics.kinematic_signature_sha256
+            ),
+        )
+    if not pipeline_overfit and promote_best:
         best = output / "best.pt"
         _publish_immutable_best(candidate, best)
         best_path = str(best)
@@ -1390,11 +1510,24 @@ def train(
         "kinematic_signature_sha256": kinematics.kinematic_signature_sha256,
         "fixed_subset_samples": len(candidate_indices) if pipeline_overfit else None,
         "fitted_subset": fitted_receipt,
+        "fitted_transition_report": fitted_transition_report,
+        "fitted_transition_report_sha256": (
+            None
+            if fitted_transition_report is None
+            else fitted_transition_report["report_sha256"]
+        ),
         "initial": initial_metrics,
         "final": gate_metrics,
         "loss_ratio": float(gate_metrics["one_step_score"])
         / float(initial_metrics["one_step_score"]),
-        "accepted": bool(one_step_accepted),
+        "accepted": bool(
+            one_step_accepted
+            and (
+                not pipeline_overfit
+                or fitted_transition_report is not None
+                and fitted_transition_report["accepted"] is True
+            )
+        ),
         "checkpoint_finite_and_reloadable": True,
         "candidate_checkpoint": str(candidate),
         "best_checkpoint": best_path,
@@ -1468,6 +1601,7 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "build_pipeline_promotion_receipt",
     "main",
     "materialize_subset",
     "consecutive_overfit_subset",

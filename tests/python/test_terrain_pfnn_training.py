@@ -52,6 +52,7 @@ from mm_sonic.terrain_pfnn.training import (
     selection_metadata,
     training_phase_advance_q99,
 )
+from mm_sonic.terrain_oracle.canonical import ISAACLAB_JOINT_NAMES
 
 
 def _normalization() -> dict[str, np.ndarray]:
@@ -63,7 +64,353 @@ def _normalization() -> dict[str, np.ndarray]:
     }
 
 
+class _FittedEnvelopeRows:
+    split = "train"
+    x_mean = np.zeros(INPUT_LAYOUT.size, np.float32)
+    x_std = np.ones(INPUT_LAYOUT.size, np.float32)
+    y_mean = np.zeros(OUTPUT_LAYOUT.size, np.float32)
+    y_std = np.ones(OUTPUT_LAYOUT.size, np.float32)
+
+    def __init__(self, prediction: np.ndarray) -> None:
+        predecessor = self._physical_output()
+        current = self._physical_output()
+        self.rows = [
+            self._row(10, predecessor, phase=0.25),
+            self._row(11, current, phase=0.75),
+        ]
+
+    @staticmethod
+    def _physical_output() -> np.ndarray:
+        value = np.zeros(OUTPUT_LAYOUT.size, np.float64)
+        value[OUTPUT_LAYOUT["trajectory_direction"]] = np.tile((1.0, 0.0), 12)
+        value[OUTPUT_LAYOUT["root_height"]] = 0.8
+        value[OUTPUT_LAYOUT["phase_advance"]] = 0.1
+        return value
+
+    @staticmethod
+    def _row(
+        center: int, target: np.ndarray, *, phase: float
+    ) -> dict[str, object]:
+        x = np.zeros(INPUT_LAYOUT.size, np.float32)
+        x[0] = np.float32(center)
+        return {
+            "x": x,
+            "y": np.asarray(target, dtype=np.float32),
+            "phase": np.float32(phase),
+            "clip_id": "terrain_slopes__slope_000__000",
+            "center_frame": center,
+            "split_identity": "slope_000",
+            "split": "train",
+            "sequence_lane": "motion",
+            "terrain_class": "flat",
+        }
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, index: int) -> dict[str, object]:
+        return self.rows[index]
+
+
+class _FittedEnvelopeModel(torch.nn.Module):
+    def __init__(self, output: np.ndarray) -> None:
+        super().__init__()
+        self.register_buffer("output", torch.as_tensor(output, dtype=torch.float64))
+        self.phases: list[float] = []
+
+    def forward(self, x: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
+        self.phases.extend(float(value) for value in phase.detach().cpu())
+        return self.output.to(device=x.device).expand(len(x), -1)
+
+
 class TerrainPFNNTrainingTests(unittest.TestCase):
+    def _fitted_envelope(
+        self,
+        output: np.ndarray,
+        *,
+        joint_limits: np.ndarray | None = None,
+        phase_advance_q99: float = 0.2,
+    ) -> tuple[object, _FittedEnvelopeRows, _FittedEnvelopeModel]:
+        rows = _FittedEnvelopeRows(output)
+        model = _FittedEnvelopeModel(output)
+        report = training_module.evaluate_fitted_transition_envelope(
+            model,
+            rows,
+            ((0, 1),),
+            normalization=rows,
+            joint_limits=(
+                np.asarray([[-2.0, 2.0]] * 29, np.float64)
+                if joint_limits is None
+                else joint_limits
+            ),
+            phase_advance_q99=phase_advance_q99,
+        )
+        return report, rows, model
+
+    def test_fitted_transition_report_is_canonical_and_uses_stored_phase(self) -> None:
+        output = _FittedEnvelopeRows._physical_output()
+        report, rows, model = self._fitted_envelope(output)
+        self.assertIsInstance(report, training_module.FittedTransitionReport)
+        self.assertTrue(report.accepted)
+        self.assertEqual(report.sample_count, 1)
+        self.assertIsNone(report.first_failure)
+        self.assertEqual(model.phases, [float(rows[1]["phase"])])
+        payload = report.to_dict()
+        self.assertEqual(payload["schema"], "mm-sonic-fitted-transition-report/v1")
+        self.assertEqual(set(payload), {
+            "schema", "accepted", "sample_count", "maxima", "first_failure",
+            "rows_sha256", "report_sha256",
+        })
+        base = {key: value for key, value in payload.items() if key != "report_sha256"}
+        self.assertEqual(
+            payload["report_sha256"],
+            hashlib.sha256(json.dumps(
+                base, sort_keys=True, separators=(",", ":"), allow_nan=False,
+            ).encode()).hexdigest(),
+        )
+
+    def test_fitted_transition_rejects_diluted_joint_step_with_exact_row(self) -> None:
+        output = _FittedEnvelopeRows._physical_output()
+        output[OUTPUT_LAYOUT["joint_position"]][0] = 0.251
+        rows = _FittedEnvelopeRows(output)
+        normalized_mse = np.square(
+            output.astype(np.float32) - np.asarray(rows[1]["y"])
+        ).mean()
+        self.assertLess(normalized_mse, 0.001)
+        report, _, _ = self._fitted_envelope(output)
+        self.assertFalse(report.accepted)
+        self.assertEqual(report.first_failure["clip_id"], rows[1]["clip_id"])
+        self.assertEqual(report.first_failure["sequence_lane"], "motion")
+        self.assertEqual(report.first_failure["center_frame"], 11)
+        self.assertEqual(report.first_failure["field"], "joint_position")
+        self.assertEqual(report.first_failure["joint"], ISAACLAB_JOINT_NAMES[0])
+        self.assertAlmostEqual(report.first_failure["value"], 0.251)
+        self.assertEqual(report.first_failure["limit"], 0.25)
+
+    def test_fitted_transition_rejects_root_translation_step(self) -> None:
+        output = _FittedEnvelopeRows._physical_output()
+        output[OUTPUT_LAYOUT["root_planar_velocity"]] = (0.061 * 30.0, 0.0)
+        report, _, _ = self._fitted_envelope(output)
+        self.assertEqual(report.first_failure["field"], "root_translation_step_m")
+        self.assertAlmostEqual(report.first_failure["value"], 0.061)
+        self.assertEqual(report.first_failure["limit"], 0.060)
+
+    def test_fitted_transition_rejects_root_rotation_step(self) -> None:
+        output = _FittedEnvelopeRows._physical_output()
+        output[OUTPUT_LAYOUT["root_yaw_velocity"]] = 0.351 * 30.0
+        report, _, _ = self._fitted_envelope(output)
+        self.assertEqual(report.first_failure["field"], "root_rotation_step_rad")
+        self.assertAlmostEqual(report.first_failure["value"], 0.351)
+        self.assertEqual(report.first_failure["limit"], 0.35)
+
+    def test_fitted_transition_rejects_native_joint_limit(self) -> None:
+        output = _FittedEnvelopeRows._physical_output()
+        output[OUTPUT_LAYOUT["joint_position"]][3] = 0.11
+        limits = np.asarray([[-2.0, 2.0]] * 29, np.float64)
+        limits[3] = (-0.1, 0.1)
+        report, _, _ = self._fitted_envelope(output, joint_limits=limits)
+        self.assertEqual(report.first_failure["field"], "joint_limit")
+        self.assertEqual(report.first_failure["joint"], ISAACLAB_JOINT_NAMES[3])
+        self.assertAlmostEqual(report.first_failure["value"], 0.11)
+        self.assertEqual(report.first_failure["limit"], 0.1)
+
+    def test_fitted_transition_rejects_raw_direction_norm(self) -> None:
+        output = _FittedEnvelopeRows._physical_output()
+        output[OUTPUT_LAYOUT["trajectory_direction"]][:2] = (0.49, 0.0)
+        report, _, _ = self._fitted_envelope(output)
+        self.assertEqual(report.first_failure["field"], "trajectory_direction_norm")
+        self.assertAlmostEqual(report.first_failure["value"], 0.49)
+        self.assertEqual(report.first_failure["limit"], 0.5)
+
+    def test_fitted_transition_rejects_phase_advance_bounds(self) -> None:
+        for value, limit in ((-0.001, 0.0), (0.301, 0.3)):
+            with self.subTest(value=value):
+                output = _FittedEnvelopeRows._physical_output()
+                output[OUTPUT_LAYOUT["phase_advance"]] = value
+                report, _, _ = self._fitted_envelope(output)
+                self.assertEqual(report.first_failure["field"], "phase_advance")
+                self.assertAlmostEqual(report.first_failure["value"], value)
+                self.assertAlmostEqual(report.first_failure["limit"], limit)
+
+    def test_fitted_transition_rejects_nonfinite_phase_and_output(self) -> None:
+        for field, offset in (
+            ("phase_advance", OUTPUT_LAYOUT["phase_advance"].start),
+            ("output", OUTPUT_LAYOUT["body_position"].start),
+        ):
+            with self.subTest(field=field):
+                output = _FittedEnvelopeRows._physical_output()
+                output[offset] = np.nan
+                report, _, _ = self._fitted_envelope(output)
+                self.assertEqual(report.first_failure["field"], field)
+                self.assertEqual(report.first_failure["value"], "nan")
+                self.assertEqual(report.first_failure["limit"], "finite")
+
+    def test_fitted_transition_rejects_nonpositive_root_height(self) -> None:
+        output = _FittedEnvelopeRows._physical_output()
+        output[OUTPUT_LAYOUT["root_height"]] = 0.0
+        report, _, _ = self._fitted_envelope(output)
+        self.assertEqual(report.first_failure["field"], "root_height")
+        self.assertEqual(report.first_failure["value"], 0.0)
+        self.assertEqual(report.first_failure["limit"], 0.0)
+
+    def test_fitted_transition_rejects_nonfinite_reconstructed_quaternion(self) -> None:
+        output = _FittedEnvelopeRows._physical_output()
+        output[OUTPUT_LAYOUT["root_tilt"]] = (1.5e308, 1.5e308)
+        report, _, _ = self._fitted_envelope(output)
+        self.assertEqual(report.first_failure["field"], "root_quaternion_wxyz")
+        self.assertEqual(report.first_failure["value"], "nonfinite")
+        self.assertEqual(report.first_failure["limit"], "finite_normalized")
+
+    def test_fitted_adjacent_indices_are_complete_lane_safe_and_hash_bound(self) -> None:
+        output = _FittedEnvelopeRows._physical_output()
+        rows = _FittedEnvelopeRows(output)
+        idle = dict(rows.rows[1])
+        idle["sequence_lane"] = "idle_phase_0"
+        rows.rows.append(idle)
+        self.assertEqual(
+            training_module.fitted_adjacent_indices(rows, range(len(rows))),
+            ((0, 1),),
+        )
+        report, _, _ = self._fitted_envelope(output)
+        changed = dict(rows.rows[1])
+        changed["phase"] = np.float32(0.76)
+        rows.rows[1] = changed
+        changed_model = _FittedEnvelopeModel(output)
+        changed_report = training_module.evaluate_fitted_transition_envelope(
+            changed_model,
+            rows,
+            ((0, 1),),
+            normalization=rows,
+            joint_limits=np.asarray([[-2.0, 2.0]] * 29, np.float64),
+            phase_advance_q99=0.2,
+        )
+        self.assertNotEqual(report.rows_sha256, changed_report.rows_sha256)
+
+    def test_fitted_transition_report_canonicalizes_adjacent_pair_order(self) -> None:
+        output = _FittedEnvelopeRows._physical_output()
+        output[OUTPUT_LAYOUT["joint_position"]][0] = 0.251
+        rows = _FittedEnvelopeRows(output)
+        rows.rows.append(rows._row(
+            12, rows._physical_output(), phase=1.25
+        ))
+        arguments = {
+            "normalization": rows,
+            "joint_limits": np.asarray([[-2.0, 2.0]] * 29, np.float64),
+            "phase_advance_q99": 0.2,
+        }
+        ordered = training_module.evaluate_fitted_transition_envelope(
+            _FittedEnvelopeModel(output), rows, ((0, 1), (1, 2)), **arguments
+        )
+        reversed_pairs = training_module.evaluate_fitted_transition_envelope(
+            _FittedEnvelopeModel(output), rows, ((1, 2), (0, 1)), **arguments
+        )
+        self.assertEqual(ordered.to_dict(), reversed_pairs.to_dict())
+        self.assertEqual(ordered.first_failure["center_frame"], 11)
+
+    def test_reloaded_transition_gate_precedes_and_can_block_pipeline_verifier(self) -> None:
+        output = _FittedEnvelopeRows._physical_output()
+        rejected_output = output.copy()
+        rejected_output[OUTPUT_LAYOUT["joint_position"]][0] = 0.251
+        rejected_report = self._fitted_envelope(rejected_output)[0]
+        accepted_report = self._fitted_envelope(output)[0]
+        rows = _FittedEnvelopeRows(output)
+        fitted_subset = fitted_subset_metadata(rows, (0, 1))
+        events: list[str] = []
+
+        class Loaded:
+            normalization = {
+                "x_mean": torch.zeros(INPUT_LAYOUT.size),
+                "x_std": torch.ones(INPUT_LAYOUT.size),
+                "y_mean": torch.zeros(OUTPUT_LAYOUT.size),
+                "y_std": torch.ones(OUTPUT_LAYOUT.size),
+            }
+            joint_limits = torch.tensor([[-2.0, 2.0]] * 29, dtype=torch.float64)
+            phase_advance_q99 = 0.2
+
+            def build_model(self) -> torch.nn.Module:
+                events.append("build_reloaded_model")
+                return _FittedEnvelopeModel(output)
+
+        def loaded(*args: object, **kwargs: object) -> Loaded:
+            events.append("reload_checkpoint")
+            return Loaded()
+
+        def validate(*args: object, **kwargs: object) -> None:
+            events.append("validate_exact_subset")
+
+        def evaluated(*args: object, **kwargs: object) -> object:
+            events.append("evaluate_transitions")
+            return rejected_report
+
+        def verifier(*args: object, **kwargs: object) -> dict[str, object]:
+            events.append("open_terrain_verifier")
+            return {"accepted": True}
+
+        with (
+            patch.object(train_module, "load_checkpoint", side_effect=loaded),
+            patch.object(
+                train_module, "validate_resume_fitted_subset", side_effect=validate
+            ),
+            patch.object(
+                train_module,
+                "evaluate_fitted_transition_envelope",
+                side_effect=evaluated,
+            ),
+        ):
+            report, receipt = train_module._verify_reloaded_pipeline_candidate(
+                candidate_path=Path("candidate.pt"),
+                dataset=rows,
+                fitted_indices=(0, 1),
+                fitted_subset=fitted_subset,
+                dataset_digest_sha256="a" * 64,
+                kinematic_signature_sha256="b" * 64,
+                joint_limits=np.asarray([[-2.0, 2.0]] * 29, np.float64),
+                phase_advance_q99=0.2,
+                verification_request={"binding": "exact"},
+                pipeline_verifier=verifier,
+            )
+        self.assertEqual(report, rejected_report)
+        self.assertIsNone(receipt)
+        self.assertEqual(events, [
+            "reload_checkpoint", "validate_exact_subset", "build_reloaded_model",
+            "evaluate_transitions",
+        ])
+
+        requests: list[dict[str, object]] = []
+        with (
+            patch.object(train_module, "load_checkpoint", return_value=Loaded()),
+            patch.object(train_module, "validate_resume_fitted_subset"),
+            patch.object(
+                train_module,
+                "evaluate_fitted_transition_envelope",
+                return_value=accepted_report,
+            ),
+        ):
+            report, receipt = train_module._verify_reloaded_pipeline_candidate(
+                candidate_path=Path("candidate.pt"),
+                dataset=rows,
+                fitted_indices=(0, 1),
+                fitted_subset=fitted_subset,
+                dataset_digest_sha256="a" * 64,
+                kinematic_signature_sha256="b" * 64,
+                joint_limits=np.asarray([[-2.0, 2.0]] * 29, np.float64),
+                phase_advance_q99=0.2,
+                verification_request={"binding": "exact"},
+                pipeline_verifier=lambda _path, request: (
+                    requests.append(request) or {"accepted": True}
+                ),
+            )
+        self.assertEqual(report, accepted_report)
+        self.assertEqual(receipt, {"accepted": True})
+        self.assertEqual(requests[0]["binding"], "exact")
+        self.assertEqual(
+            requests[0]["fitted_transition_report"], accepted_report.to_dict()
+        )
+        self.assertEqual(
+            requests[0]["fitted_transition_report_sha256"],
+            accepted_report.report_sha256,
+        )
+
     def test_three_step_rollout_matches_shared_runtime_recurrence_and_gradient(self) -> None:
         dtype = torch.float64
         normal = {
@@ -846,6 +1193,15 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 "scenario_provenance_sha256": "c" * 64,
                 "fitted_subset_rows_sha256": "d" * 64,
             }
+            transition_report = self._fitted_envelope(
+                _FittedEnvelopeRows._physical_output()
+            )[0].to_dict()
+            bindings.update({
+                "fitted_transition_report": transition_report,
+                "fitted_transition_report_sha256": transition_report[
+                    "report_sha256"
+                ],
+            })
             self.assertFalse(
                 promote_pipeline_best(
                     candidate_path=candidate,
@@ -916,6 +1272,10 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 **bindings,
             )
             self.assertTrue(passing["accepted"])
+            self.assertEqual(
+                passing["schema"], "mm-sonic-pipeline-promotion-receipt/v2"
+            )
+            self.assertEqual(passing["fitted_transition_report"], transition_report)
             self.assertTrue(
                 promote_pipeline_best(
                     candidate_path=candidate,
@@ -938,6 +1298,111 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 )
             )
             self.assertFalse(forged_best.exists())
+
+            for label, mutate in (
+                (
+                    "maxima",
+                    lambda value: value["maxima"].__setitem__(
+                        "joint_step_rad", 0.125
+                    ),
+                ),
+                (
+                    "first failure",
+                    lambda value: value.__setitem__("first_failure", {
+                        "clip_id": "forged", "sequence_lane": "motion",
+                        "center_frame": 1, "field": "joint_position",
+                        "joint": ISAACLAB_JOINT_NAMES[0], "value": 0.1,
+                        "limit": 0.25,
+                    }),
+                ),
+                (
+                    "sample count",
+                    lambda value: value.__setitem__(
+                        "sample_count", value["sample_count"] + 1
+                    ),
+                ),
+                (
+                    "row digest",
+                    lambda value: value.__setitem__("rows_sha256", "e" * 64),
+                ),
+            ):
+                tampered = json.loads(json.dumps(passing))
+                nested = tampered["fitted_transition_report"]
+                mutate(nested)
+                nested_base = {
+                    key: value for key, value in nested.items()
+                    if key != "report_sha256"
+                }
+                nested["report_sha256"] = hashlib.sha256(json.dumps(
+                    nested_base, sort_keys=True, separators=(",", ":"),
+                    allow_nan=False,
+                ).encode()).hexdigest()
+                tampered["fitted_transition_report_sha256"] = nested[
+                    "report_sha256"
+                ]
+                receipt_base = {
+                    key: value for key, value in tampered.items()
+                    if key != "receipt_sha256"
+                }
+                tampered["receipt_sha256"] = hashlib.sha256(json.dumps(
+                    receipt_base, sort_keys=True, separators=(",", ":"),
+                    allow_nan=False,
+                ).encode()).hexdigest()
+                tampered_best = root / f"tampered-{label.replace(' ', '-')}.pt"
+                with self.subTest(tamper=label):
+                    self.assertFalse(promote_pipeline_best(
+                        candidate_path=candidate,
+                        best_path=tampered_best,
+                        receipt=tampered,
+                        **bindings,
+                    ))
+                    self.assertFalse(tampered_best.exists())
+
+            digest_tampered = json.loads(json.dumps(passing))
+            digest_tampered["fitted_transition_report_sha256"] = "f" * 64
+            receipt_base = {
+                key: value for key, value in digest_tampered.items()
+                if key != "receipt_sha256"
+            }
+            digest_tampered["receipt_sha256"] = hashlib.sha256(json.dumps(
+                receipt_base, sort_keys=True, separators=(",", ":"),
+                allow_nan=False,
+            ).encode()).hexdigest()
+            self.assertFalse(promote_pipeline_best(
+                candidate_path=candidate,
+                best_path=root / "tampered-report-digest.pt",
+                receipt=digest_tampered,
+                **bindings,
+            ))
+            old_v1 = dict(passing)
+            old_v1["schema"] = "mm-sonic-pipeline-promotion-receipt/v1"
+            old_base = {
+                key: value for key, value in old_v1.items()
+                if key != "receipt_sha256"
+            }
+            old_v1["receipt_sha256"] = hashlib.sha256(json.dumps(
+                old_base, sort_keys=True, separators=(",", ":"),
+                allow_nan=False,
+            ).encode()).hexdigest()
+            self.assertFalse(promote_pipeline_best(
+                candidate_path=candidate,
+                best_path=root / "old-v1.pt",
+                receipt=old_v1,
+                **bindings,
+            ))
+            nonjson = json.loads(json.dumps(passing))
+            nonjson["fitted_transition_report"]["accepted"] = False
+            nonjson["fitted_transition_report"]["first_failure"] = {
+                "clip_id": "forged", "sequence_lane": "motion",
+                "center_frame": 1, "field": "output", "joint": None,
+                "value": {"not-json"}, "limit": "finite",
+            }
+            self.assertFalse(promote_pipeline_best(
+                candidate_path=candidate,
+                best_path=root / "non-json-report.pt",
+                receipt=nonjson,
+                **bindings,
+            ))
 
     def test_materialized_overfit_subset_reads_source_once_in_sorted_order(self) -> None:
         class Rows:
