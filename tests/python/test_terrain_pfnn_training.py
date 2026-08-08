@@ -1295,6 +1295,169 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                     expected_kinematic_signature_sha256="def",
                 )
 
+    def test_train_rejects_active_sequence_sampler_mismatch_before_restore(self) -> None:
+        class Rows:
+            split = "train"
+
+            def __init__(self) -> None:
+                self.x_mean = np.zeros(INPUT_LAYOUT.size, np.float32)
+                self.x_std = np.ones(INPUT_LAYOUT.size, np.float32)
+                self.y_mean = np.zeros(OUTPUT_LAYOUT.size, np.float32)
+                self.y_std = np.ones(OUTPUT_LAYOUT.size, np.float32)
+                self.rows = [self._row(center) for center in range(10, 27)]
+
+            @staticmethod
+            def _state(center: int) -> tuple[np.ndarray, np.ndarray]:
+                trajectory = np.zeros((12, 2), np.float32)
+                trajectory[:, 0] = np.linspace(-0.2, 0.8, 12) + center * 0.001
+                direction = np.zeros((12, 2), np.float32)
+                direction[:, 0] = 1.0
+                body = np.full((30, 3), center * 0.001, np.float32)
+                return np.concatenate((trajectory.ravel(), direction.ravel())), body
+
+            @classmethod
+            def _row(cls, center: int) -> dict[str, object]:
+                current_trajectory, current_body = cls._state(center)
+                target_trajectory, target_body = cls._state(center + 1)
+                x = np.zeros(INPUT_LAYOUT.size, np.float32)
+                x[INPUT_LAYOUT["trajectory_position"]] = current_trajectory[:24]
+                x[INPUT_LAYOUT["trajectory_direction"]] = current_trajectory[24:]
+                x[INPUT_LAYOUT["semantic_intent"]] = np.tile(
+                    (1.0, 0.0), (12, 1)
+                ).ravel()
+                x[INPUT_LAYOUT["previous_body_position"]] = (
+                    current_body.ravel() * 0.1
+                )
+                x[INPUT_LAYOUT["previous_body_velocity"]] = (
+                    current_body.ravel() * 0.1
+                )
+                y = np.zeros(OUTPUT_LAYOUT.size, np.float32)
+                y[OUTPUT_LAYOUT["trajectory_position"]] = target_trajectory[:24]
+                y[OUTPUT_LAYOUT["trajectory_direction"]] = target_trajectory[24:]
+                y[OUTPUT_LAYOUT["body_position"]] = target_body.ravel()
+                y[OUTPUT_LAYOUT["body_velocity"]] = target_body.ravel()
+                y[OUTPUT_LAYOUT["root_height"]] = 0.8
+                y[OUTPUT_LAYOUT["root_planar_velocity"]] = (center * 0.001, 0.0)
+                y[OUTPUT_LAYOUT["phase_advance"]] = 0.1
+                y[OUTPUT_LAYOUT["contact_logit"]] = (1.0, 0.0, 1.0, 0.0)
+                return {
+                    "x": x,
+                    "y": y,
+                    "phase": np.float32(center * 0.1),
+                    "clip_id": "walk1_subject1",
+                    "center_frame": center,
+                    "split_identity": "walk1_subject1",
+                    "split": "train",
+                    "sequence_lane": "motion",
+                    "terrain_class": "flat",
+                }
+
+            def __len__(self) -> int:
+                return len(self.rows)
+
+            def __getitem__(self, index: int) -> dict[str, object]:
+                return self.rows[index]
+
+        class Kinematics:
+            kinematic_signature_sha256 = "def"
+            joint_limits = torch.tensor(
+                [[-2.0, 2.0]] * 29, dtype=torch.float64
+            )
+
+            def to(self, device: torch.device) -> Kinematics:
+                return self
+
+        rows = Rows()
+        active_seed = 7 + 97
+        active_sequence_count = 2
+        model = PhaseFunctionedNetwork(hidden_size=8, dropout_probability=0.30)
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=1.0e-3, weight_decay=0.0
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "manifest.json").write_text(json.dumps({
+                "dataset_digest_sha256": "abc",
+                "split_identities": {"train": [], "validation": []},
+            }))
+            arguments = train_module.argparse.Namespace(
+                dataset=str(root),
+                model_path="unused.xml",
+                output=str(root / "output"),
+                overfit_samples=None,
+                steps=2,
+                seed=7,
+                hidden_size=8,
+                batch_size=1,
+                learning_rate=1.0e-3,
+                evaluation_batch_size=1,
+                overfit_acceptance_ratio=0.5,
+                rollout_finetune_frames=16,
+                rollout_finetune_steps=1,
+                resume=str(root / "checkpoint.pt"),
+            )
+            mismatches = {
+                "count": train_module.DeterministicSequenceSampler(
+                    active_sequence_count + 1,
+                    batch_size=1,
+                    seed=active_seed,
+                ).state_dict(),
+                "seed": train_module.DeterministicSequenceSampler(
+                    active_sequence_count,
+                    batch_size=1,
+                    seed=active_seed + 1,
+                ).state_dict(),
+            }
+            for label, sampler_state in mismatches.items():
+                checkpoint_path = root / f"checkpoint-{label}.pt"
+                save_checkpoint(
+                    checkpoint_path,
+                    model,
+                    optimizer,
+                    _normalization(),
+                    dataset_digest="abc",
+                    kinematic_signature_sha256="def",
+                    runtime_seed=finite_runtime_seed(),
+                    step=1,
+                    epoch=1,
+                    seed=7,
+                    sampler_epoch=0,
+                    sampler_global_offset=0,
+                    sequence_sampler_state=sampler_state,
+                )
+                loaded = load_checkpoint(
+                    checkpoint_path,
+                    expected_dataset_digest="abc",
+                    expected_kinematic_signature_sha256="def",
+                )
+                arguments.resume = str(checkpoint_path)
+                with self.subTest(mismatch=label), patch.object(
+                    train_module, "_distributed_context",
+                    return_value=(0, 1, 0, torch.device("cpu")),
+                ), patch.object(
+                    train_module, "_dataset_root", return_value=root
+                ), patch.object(
+                    train_module, "PFNNShardDataset", return_value=rows
+                ), patch.object(
+                    train_module.TorchG1ForwardKinematics,
+                    "from_mjcf",
+                    return_value=Kinematics(),
+                ), patch.object(
+                    train_module, "load_checkpoint", return_value=loaded
+                ), patch.object(
+                    PhaseFunctionedNetwork,
+                    "load_state_dict",
+                    side_effect=AssertionError("model restore was reached"),
+                ) as model_restore, patch.object(
+                    torch.optim.Adam,
+                    "load_state_dict",
+                    side_effect=AssertionError("Adam restore was reached"),
+                ) as adam_restore:
+                    with self.assertRaisesRegex(ValueError, "sequence sampler"):
+                        train_module.train(arguments)
+                    model_restore.assert_not_called()
+                    adam_restore.assert_not_called()
+
     def test_checkpoint_rejects_inexact_nested_tensor_contracts(self) -> None:
         model = PhaseFunctionedNetwork(hidden_size=8, dropout_probability=0.0)
         optimizer = torch.optim.Adam(

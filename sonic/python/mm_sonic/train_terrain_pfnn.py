@@ -153,6 +153,29 @@ class DeterministicSequenceSampler:
         self._permutation = list(permutation)
 
 
+def _validated_active_sequence_sampler_state(
+    value: object,
+    *,
+    active_sampler: DeterministicSequenceSampler,
+) -> dict[str, object] | None:
+    """Validate saved sequence state against the active rollout without mutation."""
+
+    if value is None:
+        return None
+    probe = DeterministicSequenceSampler(
+        active_sampler.sequence_count,
+        batch_size=1,
+        seed=active_sampler.seed,
+    )
+    try:
+        probe.load_state_dict(value)
+    except ValueError as error:
+        raise ValueError(
+            "resume sequence sampler state does not match the active rollout"
+        ) from error
+    return probe.state_dict()
+
+
 def overfit_gate_accepted(initial: float, final: float, ratio: float) -> bool:
     values = (float(initial), float(final), float(ratio))
     if any(not math.isfinite(value) for value in values) or values[0] <= 0.0:
@@ -475,9 +498,10 @@ def consecutive_overfit_subset(
     """Select source-sealed consecutive GRAIL slope runs for pipeline overfit.
 
     Identities, clip variants, and maximal runs are traversed lexicographically.
-    A center emitted more than once (idle phase augmentation) is excluded and is
-    therefore a hard run boundary.  This makes every retained successor an
-    actual recurrent sample instead of an unrelated stratified row.
+    Repeated centers in different sequence lanes remain distinct recurrent
+    runs. A center repeated within the same lane is excluded and is therefore
+    a hard run boundary. This makes every retained successor an exact same-lane
+    recurrent sample instead of an unrelated stratified row.
     """
 
     if getattr(dataset, "split", None) != "train":
@@ -885,6 +909,54 @@ def train(
         fitted_subset=fitted_receipt if pipeline_overfit else None,
     )
 
+    rollout_dataset: object | None = None
+    sequences: list[tuple[int, ...]] | None = None
+    sequence_sampler: DeterministicSequenceSampler | None = None
+    if arguments.rollout_finetune_frames:
+        rollout_dataset = optimization_dataset if pipeline_overfit else train_dataset
+        sequences, _ = _consecutive_starts(
+            rollout_dataset, arguments.rollout_finetune_frames
+        )
+        seed_key = (
+            runtime_seed["provenance"]["first_fitted_clip_id"],
+            runtime_seed["provenance"]["first_fitted_sequence_lane"],
+            runtime_seed["provenance"]["first_fitted_center_frame"],
+        )
+        sixteen_frame_sequences, _ = _consecutive_starts(rollout_dataset, 16)
+
+        def sequence_key(sequence: tuple[int, ...]) -> tuple[object, object, object]:
+            assert rollout_dataset is not None
+            first = rollout_dataset[sequence[0]]
+            return (
+                first["clip_id"],
+                first["sequence_lane"],
+                first["center_frame"],
+            )
+
+        if sum(
+            sequence_key(sequence) == seed_key
+            for sequence in sixteen_frame_sequences
+        ) != 1:
+            raise RuntimeError(
+                "runtime seed sixteen-frame sequence is missing from rollout discovery"
+            )
+        seed_sequence_matches = [
+            index
+            for index, sequence in enumerate(sequences)
+            if sequence_key(sequence) == seed_key
+        ]
+        if len(seed_sequence_matches) != 1:
+            raise RuntimeError("runtime seed sequence is missing from rollout discovery")
+        sequence_sampler = DeterministicSequenceSampler(
+            len(sequences),
+            batch_size=arguments.batch_size,
+            seed=arguments.seed + 97,
+            rank=rank,
+            world_size=world_size,
+        )
+        if seed_sequence_matches[0] not in sequence_sampler.state_dict()["permutation"]:
+            raise RuntimeError("runtime seed sequence is missing from first sampler pass")
+
     torch.manual_seed(arguments.seed)
     model: torch.nn.Module = PhaseFunctionedNetwork(
         hidden_size=arguments.hidden_size, dropout_probability=0.30
@@ -907,6 +979,17 @@ def train(
             expected_kinematic_signature_sha256=kinematics.kinematic_signature_sha256,
         )
         validate_resume_fitted_subset(resumed, fitted_receipt)
+        if arguments.seed != resumed.seed:
+            raise ValueError("resume checkpoint seed mismatch")
+        if sequence_sampler is not None:
+            restored_sequence_sampler_state = (
+                _validated_active_sequence_sampler_state(
+                    resumed.sequence_sampler_state,
+                    active_sampler=sequence_sampler,
+                )
+            )
+        else:
+            restored_sequence_sampler_state = resumed.sequence_sampler_state
         restored_step, restored_epoch = restore_training_state(
             resumed,
             unwrapped,
@@ -917,9 +1000,6 @@ def train(
         )
         restored_sampler_epoch = resumed.sampler_epoch
         restored_sampler_global_offset = resumed.sampler_global_offset
-        restored_sequence_sampler_state = resumed.sequence_sampler_state
-        if arguments.seed != resumed.seed:
-            raise ValueError("resume checkpoint seed mismatch")
         if restored_step > 0 and restored_epoch != restored_sampler_epoch + 1:
             raise ValueError("resume checkpoint sampler epoch is inconsistent")
         if restored_step >= arguments.steps:
@@ -1077,50 +1157,11 @@ def train(
     if arguments.rollout_finetune_frames:
         if not one_step_accepted:
             raise RuntimeError("rollout fine-tuning requires a passing one-step gate")
-        rollout_dataset = optimization_dataset if pipeline_overfit else train_dataset
-        sequences, _ = _consecutive_starts(
-            rollout_dataset, arguments.rollout_finetune_frames
-        )
-        seed_key = (
-            runtime_seed["provenance"]["first_fitted_clip_id"],
-            runtime_seed["provenance"]["first_fitted_sequence_lane"],
-            runtime_seed["provenance"]["first_fitted_center_frame"],
-        )
-        sixteen_frame_sequences, _ = _consecutive_starts(rollout_dataset, 16)
-
-        def sequence_key(sequence: tuple[int, ...]) -> tuple[object, object, object]:
-            first = rollout_dataset[sequence[0]]
-            return (
-                first["clip_id"],
-                first["sequence_lane"],
-                first["center_frame"],
-            )
-
-        if sum(
-            sequence_key(sequence) == seed_key
-            for sequence in sixteen_frame_sequences
-        ) != 1:
-            raise RuntimeError(
-                "runtime seed sixteen-frame sequence is missing from rollout discovery"
-            )
-        seed_sequence_matches = [
-            index
-            for index, sequence in enumerate(sequences)
-            if sequence_key(sequence) == seed_key
-        ]
-        if len(seed_sequence_matches) != 1:
-            raise RuntimeError("runtime seed sequence is missing from rollout discovery")
-        sequence_sampler = DeterministicSequenceSampler(
-            len(sequences),
-            batch_size=arguments.batch_size,
-            seed=arguments.seed + 97,
-            rank=rank,
-            world_size=world_size,
-        )
+        assert rollout_dataset is not None
+        assert sequences is not None
+        assert sequence_sampler is not None
         if restored_sequence_sampler_state is not None:
             sequence_sampler.load_state_dict(restored_sequence_sampler_state)
-        elif seed_sequence_matches[0] not in sequence_sampler.state_dict()["permutation"]:
-            raise RuntimeError("runtime seed sequence is missing from first sampler pass")
         requested_rollout_steps = (
             arguments.rollout_finetune_steps
             if arguments.rollout_finetune_steps is not None
