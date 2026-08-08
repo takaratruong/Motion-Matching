@@ -873,9 +873,15 @@ class OneStepTrainingLosses(dict[str, torch.Tensor]):
         values: Mapping[str, torch.Tensor],
         *,
         envelope_reductions: Mapping[str, GlobalEnvelopeReduction],
+        bounded_envelope_reductions: Mapping[
+            str, GlobalEnvelopeReduction
+        ],
     ) -> None:
         super().__init__(values)
         self.envelope_reductions = dict(envelope_reductions)
+        self.bounded_envelope_reductions = dict(
+            bounded_envelope_reductions
+        )
 
 
 def global_max_plus_tail(
@@ -1416,10 +1422,10 @@ def one_step_training_losses(
         error_type=FloatingPointError,
     )
     losses.update(envelope)
-    weights = _loss_weights(loss_weights)
-    losses["total"] = losses["total"] + sum(
-        envelope[name] * weights[name] for name in ENVELOPE_LOSS_WEIGHT_KEYS
-    )
+    _loss_weights(loss_weights)
+    losses["total"] = losses["total"] + envelope[
+        "physical_envelope_total"
+    ]
     _collective_finite_preflight(
         (losses["total"],),
         rank=rank,
@@ -1429,7 +1435,8 @@ def one_step_training_losses(
     )
     return OneStepTrainingLosses(
         losses,
-        envelope_reductions=envelope.reductions,
+        envelope_reductions=envelope.raw_reductions,
+        bounded_envelope_reductions=envelope.bounded_reductions,
     )
 
 
@@ -1441,6 +1448,8 @@ class RolloutResult:
     phases: tuple[torch.Tensor, ...]
     envelope_risks: dict[str, torch.Tensor]
     envelope_reductions: dict[str, GlobalEnvelopeReduction]
+    bounded_envelope_surrogates: dict[str, torch.Tensor]
+    bounded_envelope_reductions: dict[str, GlobalEnvelopeReduction]
     envelope_counts: dict[str, int]
 
 
@@ -1567,7 +1576,11 @@ def autoregressive_unroll(
     phases: list[torch.Tensor] = []
     per_step: list[dict[str, torch.Tensor]] = []
     per_step_envelope_risks: dict[str, list[torch.Tensor]] = {
-        name: [] for name in ("joint_step", "joint_limit", "phase")
+        name: []
+        for name in ("joint_step", "joint_limit", "phase", "direction")
+    }
+    per_step_bounded_surrogates: dict[str, list[torch.Tensor]] = {
+        name: [] for name in per_step_envelope_risks
     }
     per_step_runtime_failures: dict[str, list[torch.Tensor]] = {
         name: [] for name in per_step_envelope_risks
@@ -1606,6 +1619,9 @@ def autoregressive_unroll(
         )
         for name in per_step_envelope_risks:
             per_step_envelope_risks[name].append(step_risks[name])
+            per_step_bounded_surrogates[name].append(
+                step_risks.bounded_surrogates[name]
+            )
             per_step_runtime_failures[name].append(
                 step_risks.runtime_failures[name]
             )
@@ -1649,6 +1665,10 @@ def autoregressive_unroll(
         name: torch.stack(values)
         for name, values in per_step_envelope_risks.items()
     }
+    bounded_envelope_surrogates = {
+        name: torch.stack(values)
+        for name, values in per_step_bounded_surrogates.items()
+    }
     runtime_failures = {
         name: torch.stack(values)
         for name, values in per_step_runtime_failures.items()
@@ -1688,6 +1708,16 @@ def autoregressive_unroll(
         )
         for name, risk in envelope_risks.items()
     }
+    bounded_envelope_reductions = {
+        name: global_max_plus_tail(
+            surrogate.reshape(-1),
+            global_ordinals=rollout_ordinals,
+            tail_fraction=envelope_contract.tail_fraction,
+            rank=rank,
+            world_size=world_size,
+        )
+        for name, surrogate in bounded_envelope_surrogates.items()
+    }
     envelope_losses: dict[str, torch.Tensor] = {}
     for name, reduction in envelope_reductions.items():
         envelope_losses[f"{name}_maximum"] = reduction.maximum
@@ -1696,8 +1726,13 @@ def autoregressive_unroll(
             reduction.positive_tail_mean
         )
         envelope_losses[f"{name}_envelope"] = reduction.loss
+    for name, reduction in bounded_envelope_reductions.items():
+        envelope_losses[f"{name}_bounded_envelope"] = (
+            envelope_contract.reference_pair_coefficient * reduction.loss
+        )
     envelope_losses["physical_envelope_total"] = sum(
-        envelope_losses[f"{name}_envelope"] for name in envelope_risks
+        envelope_losses[f"{name}_bounded_envelope"]
+        for name in bounded_envelope_surrogates
     )
     _collective_finite_preflight(
         tuple(envelope_losses.values()),
@@ -1708,11 +1743,10 @@ def autoregressive_unroll(
         metadata_message="rollout finiteness metadata is invalid",
     )
     losses.update(envelope_losses)
-    weights = _loss_weights(loss_weights)
-    losses["total"] = losses["total"] + sum(
-        envelope_losses[name] * weights[name]
-        for name in ENVELOPE_LOSS_WEIGHT_KEYS
-    )
+    _loss_weights(loss_weights)
+    losses["total"] = losses["total"] + envelope_losses[
+        "physical_envelope_total"
+    ]
     _collective_finite_preflight(
         (losses["total"],),
         rank=rank,
@@ -1731,6 +1765,14 @@ def autoregressive_unroll(
             ),
             *(
                 int(torch.count_nonzero(runtime_failures[name]))
+                for name in count_names
+            ),
+            *(
+                int(
+                    torch.count_nonzero(
+                        bounded_envelope_surrogates[name] > 0.0
+                    )
+                )
                 for name in count_names
             ),
         ),
@@ -1752,6 +1794,9 @@ def autoregressive_unroll(
         envelope_counts[f"{name}_runtime_failure_pair_time_count"] = (
             global_counts[offset + len(count_names)]
         )
+        envelope_counts[
+            f"{name}_bounded_objective_active_pair_time_count"
+        ] = global_counts[offset + 2 * len(count_names)]
     return RolloutResult(
         losses=losses,
         predictions=tuple(predictions),
@@ -1759,6 +1804,8 @@ def autoregressive_unroll(
         phases=tuple(phases),
         envelope_risks=envelope_risks,
         envelope_reductions=envelope_reductions,
+        bounded_envelope_surrogates=bounded_envelope_surrogates,
+        bounded_envelope_reductions=bounded_envelope_reductions,
         envelope_counts=envelope_counts,
     )
 

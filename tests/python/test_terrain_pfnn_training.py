@@ -372,6 +372,54 @@ class _SingleParameterEnvelopeModel(torch.nn.Module):
         return joint[:, None] * self.joint_mask[None, :] + graph_zero
 
 
+class _SharedTrunkFourFailureModel(torch.nn.Module):
+    """One shared scalar drives base fit and all four bounded families."""
+
+    def __init__(self, *, dtype: torch.dtype = torch.float64) -> None:
+        super().__init__()
+        self.W0 = torch.nn.Parameter(torch.zeros((), dtype=dtype))
+        for name in ("b0", "W1", "b1", "W2", "b2"):
+            setattr(
+                self,
+                name,
+                torch.nn.Parameter(torch.zeros((), dtype=dtype)),
+            )
+        output = torch.zeros(OUTPUT_LAYOUT.size, dtype=dtype)
+        influence = torch.zeros_like(output)
+        output[OUTPUT_LAYOUT["body_position"]] = 100.0
+        influence[OUTPUT_LAYOUT["body_position"]] = 1.0
+        joints = OUTPUT_LAYOUT["joint_position"]
+        output[joints.start] = 0.251
+        output[joints.start + 1] = 1.001
+        influence[joints.start] = 1.0
+        influence[joints.start + 1] = 1.0
+        output[OUTPUT_LAYOUT["root_height"]] = 0.8
+        output[OUTPUT_LAYOUT["phase_advance"]] = 0.501
+        influence[OUTPUT_LAYOUT["phase_advance"]] = 1.0
+        direction = output[OUTPUT_LAYOUT["trajectory_direction"]].reshape(12, 2)
+        direction[:, 0] = 0.499
+        direction_influence = influence[
+            OUTPUT_LAYOUT["trajectory_direction"]
+        ].reshape(12, 2)
+        direction_influence[:, 0] = -1.0
+        self.register_buffer("initial_output", output)
+        self.register_buffer("trunk_influence", influence)
+
+    def forward(self, x: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
+        del phase
+        graph_zero = 0.0 * (self.b0 + self.W1 + self.b1 + self.W2 + self.b2)
+        output = (
+            self.initial_output
+            + self.W0 * self.trunk_influence
+            + graph_zero
+        )
+        return output.to(device=x.device).expand(len(x), -1)
+
+    @property
+    def shared_trunk(self) -> torch.nn.Parameter:
+        return self.W0
+
+
 class _ScriptedRolloutModel(torch.nn.Module):
     """Emit a fixed differentiable output table for rollout-envelope tests."""
 
@@ -2093,6 +2141,239 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
         losses["physical_envelope_total"].backward()
         self.assertGreater(float(model.weight.grad.abs()), 0.0)
 
+    def test_one_step_v2_adds_four_bounded_families_once(self) -> None:
+        model = _SingleParameterEnvelopeModel(dtype=torch.float64)
+        current = torch.zeros(4, INPUT_LAYOUT.size, dtype=torch.float64)
+        phase = torch.zeros(4, dtype=torch.float64)
+        target = torch.zeros(4, OUTPUT_LAYOUT.size, dtype=torch.float64)
+        predecessor = torch.zeros_like(target)
+        losses = training_module.one_step_training_losses(
+            model,
+            current,
+            phase,
+            target,
+            predecessor,
+            normalization=_normalization(),
+            joint_limits=torch.tensor(
+                [[-0.10, 0.10]] * 29, dtype=torch.float64
+            ),
+            phase_advance_cap=0.20,
+            contract=training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+            global_ordinals=torch.arange(len(current), dtype=torch.int64),
+            rank=0,
+            world_size=1,
+        )
+        families = ("joint_step", "joint_limit", "phase", "direction")
+        self.assertEqual(set(losses.envelope_reductions), set(families))
+        self.assertEqual(
+            set(losses.bounded_envelope_reductions), set(families)
+        )
+        expected_bounded_total = sum(
+            losses[f"{family}_bounded_envelope"] for family in families
+        )
+        expected_base_total = sum(
+            losses[name] for name in BASE_LOSS_WEIGHT_KEYS
+        )
+        torch.testing.assert_close(
+            losses["physical_envelope_total"], expected_bounded_total
+        )
+        torch.testing.assert_close(
+            losses["total"], expected_base_total + expected_bounded_total
+        )
+        raw_total = sum(losses[f"{family}_envelope"] for family in families)
+        self.assertFalse(torch.equal(losses["physical_envelope_total"], raw_total))
+        for family in families:
+            torch.testing.assert_close(
+                losses[f"{family}_bounded_envelope"],
+                (
+                    losses.bounded_envelope_reductions[family].loss
+                    * training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE.reference_pair_coefficient
+                ),
+            )
+        losses["total"].backward()
+        self.assertTrue(torch.isfinite(model.weight.grad))
+        self.assertGreater(float(model.weight.grad.abs()), 0.0)
+
+    def test_shared_trunk_adam_clip_reduces_all_failures_without_regression(
+        self,
+    ) -> None:
+        families = ("joint_step", "joint_limit", "phase", "direction")
+        batch_size = 8
+        dtype = torch.float64
+        current = torch.zeros(batch_size, INPUT_LAYOUT.size, dtype=dtype)
+        phase = torch.zeros(batch_size, dtype=dtype)
+        target = torch.zeros(batch_size, OUTPUT_LAYOUT.size, dtype=dtype)
+        target[:, OUTPUT_LAYOUT["root_height"]] = 0.8
+        target[:, OUTPUT_LAYOUT["phase_advance"]] = 0.1
+        target[:, OUTPUT_LAYOUT["joint_position"].start + 1] = 0.99
+        target_direction = target[
+            :, OUTPUT_LAYOUT["trajectory_direction"]
+        ].reshape(batch_size, 12, 2)
+        target_direction[..., 0] = 1.0
+        predecessor = target.clone()
+        limits = torch.tensor([[-2.0, 2.0]] * 29, dtype=dtype)
+        limits[1, 1] = 1.0
+        normal = _normalization()
+
+        def run() -> dict[str, object]:
+            torch.manual_seed(7)
+            model = _SharedTrunkFourFailureModel(dtype=dtype)
+            optimizer = torch.optim.Adam(
+                model.parameters(), lr=1.0e-4, weight_decay=0.0
+            )
+
+            def snapshot() -> tuple[dict[str, int], float, float]:
+                prediction = model(current, phase)
+                base = pfnn_losses(
+                    prediction,
+                    target,
+                    model=model,
+                    normalization=normal,
+                )
+                risks = training_module.physical_envelope_risks(
+                    prediction,
+                    predecessor,
+                    normalization=normal,
+                    joint_limits=limits,
+                    phase_advance_cap=0.50,
+                    contract=(
+                        training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE
+                    ),
+                )
+                return (
+                    {
+                        family: int(
+                            torch.count_nonzero(
+                                risks.runtime_failures[family]
+                            )
+                        )
+                        for family in families
+                    },
+                    float(
+                        sum(
+                            base[name]
+                            for name in BASE_LOSS_WEIGHT_KEYS
+                            if name != "regularization"
+                        ).detach()
+                    ),
+                    float(base["trajectory_direction"].detach()),
+                )
+
+            before = snapshot()
+            trace: list[tuple[float, float, float]] = []
+            clip_exercised = False
+            for update in range(64):
+                optimizer.zero_grad(set_to_none=True)
+                losses = training_module.one_step_training_losses(
+                    model,
+                    current,
+                    phase,
+                    target,
+                    predecessor,
+                    normalization=normal,
+                    joint_limits=limits,
+                    phase_advance_cap=0.50,
+                    contract=(
+                        training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE
+                    ),
+                    global_ordinals=torch.arange(
+                        batch_size, dtype=torch.int64
+                    ),
+                    rank=0,
+                    world_size=1,
+                )
+                self.assertTrue(torch.isfinite(losses["total"]), update)
+                losses["total"].backward()
+                self.assertTrue(
+                    all(
+                        parameter.grad is not None
+                        and torch.isfinite(parameter.grad).all()
+                        for parameter in model.parameters()
+                    ),
+                    update,
+                )
+                gradient_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), 1.0
+                )
+                self.assertTrue(torch.isfinite(gradient_norm), update)
+                clip_exercised = clip_exercised or float(gradient_norm) > 1.0
+                optimizer.step()
+                self.assertTrue(
+                    all(
+                        torch.isfinite(parameter).all()
+                        for parameter in model.parameters()
+                    ),
+                    update,
+                )
+                self.assertTrue(
+                    all(
+                        not isinstance(value, torch.Tensor)
+                        or torch.isfinite(value).all()
+                        for state in optimizer.state.values()
+                        for value in state.values()
+                    ),
+                    update,
+                )
+                trace.append(
+                    (
+                        float(losses["total"].detach()),
+                        float(gradient_norm.detach()),
+                        float(model.shared_trunk.detach()),
+                    )
+                )
+            after = snapshot()
+            optimizer_state = optimizer.state_dict()
+            return {
+                "before": before,
+                "after": after,
+                "trace": trace,
+                "clip_exercised": clip_exercised,
+                "model": {
+                    name: value.detach().clone()
+                    for name, value in model.state_dict().items()
+                },
+                "adam_state": {
+                    key: {
+                        name: (
+                            value.detach().clone()
+                            if isinstance(value, torch.Tensor)
+                            else value
+                        )
+                        for name, value in state.items()
+                    }
+                    for key, state in optimizer_state["state"].items()
+                },
+                "adam_groups": optimizer_state["param_groups"],
+            }
+
+        first = run()
+        second = run()
+        before_counts, before_base, before_direction = first["before"]
+        after_counts, after_base, after_direction = first["after"]
+        for family in families:
+            self.assertLess(after_counts[family], before_counts[family], family)
+        self.assertLessEqual(after_base, before_base)
+        self.assertLessEqual(after_direction, before_direction)
+        self.assertTrue(first["clip_exercised"])
+        self.assertEqual(first["trace"], second["trace"])
+        self.assertEqual(first["adam_groups"], second["adam_groups"])
+        self.assertEqual(set(first["model"]), set(second["model"]))
+        for name in first["model"]:
+            self.assertTrue(
+                torch.equal(first["model"][name], second["model"][name]), name
+            )
+        self.assertEqual(set(first["adam_state"]), set(second["adam_state"]))
+        for key in first["adam_state"]:
+            self.assertEqual(
+                set(first["adam_state"][key]), set(second["adam_state"][key])
+            )
+            for name, value in first["adam_state"][key].items():
+                repeated = second["adam_state"][key][name]
+                if isinstance(value, torch.Tensor):
+                    self.assertTrue(torch.equal(value, repeated), name)
+                else:
+                    self.assertEqual(value, repeated, name)
+
     def test_one_step_rejects_nonfinite_envelope_before_backward(self) -> None:
         model = _SingleParameterEnvelopeModel(dtype=torch.float64)
         batch = torch.zeros(2, OUTPUT_LAYOUT.size, dtype=torch.float64)
@@ -3563,49 +3844,93 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             torch.tensor(0.0, dtype=torch.float64),
         )
 
-    def test_task1_rollout_retains_legacy_raw_three_family_schema_and_total(
+    def test_rollout_v2_uses_seed_then_prior_prediction(
         self,
     ) -> None:
         rollout = self._unsafe_three_step_rollout()
-        legacy_families = {"joint_step", "joint_limit", "phase"}
-        self.assertEqual(set(rollout.envelope_risks), legacy_families)
-        self.assertEqual(set(rollout.envelope_reductions), legacy_families)
+        families = {"joint_step", "joint_limit", "phase", "direction"}
+        self.assertEqual(set(rollout.envelope_risks), families)
+        self.assertEqual(set(rollout.envelope_reductions), families)
+        self.assertEqual(set(rollout.bounded_envelope_surrogates), families)
+        self.assertEqual(set(rollout.bounded_envelope_reductions), families)
         self.assertEqual(
             set(rollout.envelope_counts),
             {
                 "pair_time_count",
                 *(
                     f"{family}_{suffix}_pair_time_count"
-                    for family in legacy_families
-                    for suffix in ("objective_active", "runtime_failure")
+                    for family in families
+                    for suffix in (
+                        "objective_active",
+                        "runtime_failure",
+                        "bounded_objective_active",
+                    )
                 ),
             },
         )
-        expected_raw_total = sum(
-            rollout.losses[f"{family}_envelope"]
-            for family in legacy_families
+        expected_bounded_total = sum(
+            rollout.losses[f"{family}_bounded_envelope"]
+            for family in families
         )
         torch.testing.assert_close(
-            rollout.losses["physical_envelope_total"], expected_raw_total
+            rollout.losses["physical_envelope_total"], expected_bounded_total
         )
         expected_base_total = sum(
             rollout.losses[name] for name in BASE_LOSS_WEIGHT_KEYS
         )
         torch.testing.assert_close(
             rollout.losses["total"],
-            expected_base_total + expected_raw_total,
+            expected_base_total + expected_bounded_total,
         )
-        self.assertFalse(
-            any(
-                name.startswith("direction_")
-                for name in rollout.losses
-            )
+        raw_total = sum(
+            rollout.losses[f"{family}_envelope"] for family in families
+        )
+        self.assertFalse(torch.equal(rollout.losses["total"], expected_base_total + raw_total))
+        first_bounded = training_module.bounded_physical_envelope_surrogates(
+            rollout.predictions[0],
+            torch.zeros_like(rollout.predictions[0]),
+            normalization=_normalization(),
+            joint_limits=torch.tensor([[-1.0, 1.0]] * 29, dtype=torch.float64),
+            phase_advance_cap=0.50,
+            contract=training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+        )
+        prior_bounded = training_module.bounded_physical_envelope_surrogates(
+            rollout.predictions[1],
+            rollout.predictions[0],
+            normalization=_normalization(),
+            joint_limits=torch.tensor([[-1.0, 1.0]] * 29, dtype=torch.float64),
+            phase_advance_cap=0.50,
+            contract=training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+        )
+        torch.testing.assert_close(
+            rollout.bounded_envelope_surrogates["joint_step"][0],
+            first_bounded["joint_step"],
+        )
+        torch.testing.assert_close(
+            rollout.bounded_envelope_surrogates["joint_step"][1],
+            prior_bounded["joint_step"],
+        )
+        self.assertGreater(
+            float(
+                rollout.bounded_envelope_surrogates[
+                    "joint_step"
+                ][1, 0].detach()
+            ),
+            0.0,
+        )
+        self.assertEqual(
+            float(
+                rollout.bounded_envelope_surrogates[
+                    "joint_step"
+                ][2, 0].detach()
+            ),
+            0.0,
         )
 
     def test_late_rollout_envelope_gradient_reaches_prior_prediction(self) -> None:
         rollout = self._unsafe_three_step_rollout()
         gradient = torch.autograd.grad(
-            rollout.losses["joint_step_envelope"],
+            rollout.losses["joint_step_bounded_envelope"],
             rollout.predictions[0],
             retain_graph=True,
         )[0]
