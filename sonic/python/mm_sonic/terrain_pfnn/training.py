@@ -178,6 +178,424 @@ def _field_cat(value: torch.Tensor, fields: Sequence[str]) -> torch.Tensor:
     return torch.cat([value[..., OUTPUT_LAYOUT[name]] for name in fields], dim=-1)
 
 
+@dataclass(frozen=True)
+class PhysicalEnvelopeObjective:
+    schema: str = "mm-sonic-physical-envelope-objective/v1"
+    joint_step_onset_rad: float = 0.225
+    joint_step_scale_rad: float = 0.025
+    joint_limit_margin_rad: float = 0.020
+    phase_upper_margin_rad: float = 0.020
+    phase_scale_rad: float = 0.020
+    tail_fraction: float = 0.10
+    joint_step_hinge_power: int = 2
+    joint_limit_hinge_power: int = 2
+    phase_lower_hinge_power: int = 1
+    phase_upper_hinge_power: int = 2
+    maximum_coefficient: float = 1.0
+    positive_tail_mean_coefficient: float = 1.0
+
+
+DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE = PhysicalEnvelopeObjective()
+
+
+def physical_envelope_risks(
+    normalized_prediction: torch.Tensor,
+    reached_output_normalized: torch.Tensor,
+    *,
+    normalization: object,
+    joint_limits: torch.Tensor,
+    phase_advance_cap: float,
+    contract: PhysicalEnvelopeObjective,
+) -> dict[str, torch.Tensor]:
+    """Return one worst-joint physical risk per predicted transition."""
+
+    if (
+        not isinstance(normalized_prediction, torch.Tensor)
+        or not isinstance(reached_output_normalized, torch.Tensor)
+        or normalized_prediction.ndim != 2
+        or normalized_prediction.shape[1] != OUTPUT_LAYOUT.size
+        or reached_output_normalized.shape != normalized_prediction.shape
+        or not normalized_prediction.is_floating_point()
+        or reached_output_normalized.dtype != normalized_prediction.dtype
+        or reached_output_normalized.device != normalized_prediction.device
+    ):
+        raise ValueError("physical envelope tensors are invalid")
+    if not torch.isfinite(normalized_prediction).all() or not torch.isfinite(
+        reached_output_normalized
+    ).all():
+        raise ValueError("physical envelope tensors must be finite")
+    if contract != DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE:
+        raise ValueError("physical envelope objective contract mismatch")
+    try:
+        phase_cap = float(phase_advance_cap)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("physical envelope phase cap is invalid") from error
+    if (
+        isinstance(phase_advance_cap, bool)
+        or not math.isfinite(phase_cap)
+        or phase_cap <= contract.phase_upper_margin_rad
+    ):
+        raise ValueError("physical envelope phase cap is invalid")
+    try:
+        limits = torch.as_tensor(
+            joint_limits,
+            device=normalized_prediction.device,
+            dtype=normalized_prediction.dtype,
+        )
+    except (TypeError, ValueError, RuntimeError) as error:
+        raise ValueError("physical envelope joint limits are invalid") from error
+    if (
+        limits.shape != (len(ISAACLAB_JOINT_NAMES), 2)
+        or not torch.isfinite(limits).all()
+        or torch.any(
+            limits[:, 0] + contract.joint_limit_margin_rad
+            > limits[:, 1] - contract.joint_limit_margin_rad
+        )
+    ):
+        raise ValueError("physical envelope joint limits are invalid")
+
+    normal = _normalization_tensors(
+        normalization,
+        device=normalized_prediction.device,
+        dtype=normalized_prediction.dtype,
+    )
+    predicted = normalized_prediction * normal["y_std"] + normal["y_mean"]
+    reached = reached_output_normalized * normal["y_std"] + normal["y_mean"]
+    predicted_joints = predicted[:, OUTPUT_LAYOUT["joint_position"]]
+    reached_joints = reached[:, OUTPUT_LAYOUT["joint_position"]]
+    joint_step_excess = torch.relu(
+        torch.abs(predicted_joints - reached_joints)
+        - contract.joint_step_onset_rad
+    ) / contract.joint_step_scale_rad
+    lower_limit_excess = torch.relu(
+        limits[:, 0] + contract.joint_limit_margin_rad - predicted_joints
+    ) / contract.joint_limit_margin_rad
+    upper_limit_excess = torch.relu(
+        predicted_joints
+        - (limits[:, 1] - contract.joint_limit_margin_rad)
+    ) / contract.joint_limit_margin_rad
+    phase_advance = predicted[:, OUTPUT_LAYOUT["phase_advance"]].reshape(-1)
+    lower_phase_excess = torch.relu(-phase_advance) / contract.phase_scale_rad
+    upper_phase_excess = torch.relu(
+        phase_advance - (phase_cap - contract.phase_upper_margin_rad)
+    ) / contract.phase_scale_rad
+    return {
+        "joint_step": torch.amax(joint_step_excess.square(), dim=1),
+        "joint_limit": torch.amax(
+            torch.maximum(lower_limit_excess, upper_limit_excess).square(),
+            dim=1,
+        ),
+        "phase": torch.maximum(lower_phase_excess, upper_phase_excess.square()),
+    }
+
+
+@dataclass(frozen=True)
+class GlobalEnvelopeReduction:
+    maximum: torch.Tensor
+    cvar: torch.Tensor
+    tail_count: int
+    active_count: int
+    positive_tail_mean: torch.Tensor
+    loss: torch.Tensor
+
+
+def global_max_plus_tail(
+    local_risk: torch.Tensor,
+    *,
+    global_ordinals: torch.Tensor,
+    tail_fraction: float,
+    rank: int,
+    world_size: int,
+) -> GlobalEnvelopeReduction:
+    """Reduce equal local shards with deterministic DDP-equivalent gradients."""
+
+    import struct
+    import torch.distributed as dist
+
+    initialized = dist.is_available() and dist.is_initialized()
+    actual_rank = dist.get_rank() if initialized else 0
+    actual_world_size = dist.get_world_size() if initialized else 1
+    risk_is_tensor = isinstance(local_risk, torch.Tensor)
+    ordinal_is_tensor = isinstance(global_ordinals, torch.Tensor)
+    risk_dtype_code = (
+        {torch.float32: 1, torch.float64: 2}.get(local_risk.dtype, -1)
+        if risk_is_tensor
+        else -1
+    )
+    risk_device_code = (
+        {"cpu": 1, "cuda": 2}.get(local_risk.device.type, -1)
+        if risk_is_tensor
+        else -1
+    )
+    backend_name = (
+        str(dist.get_backend()).lower()
+        if initialized
+        else ("nccl" if risk_device_code == 2 else "gloo")
+    )
+    backend_code = {"gloo": 1, "nccl": 2}.get(backend_name, -1)
+    metadata_device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if backend_name == "nccl"
+        else torch.device("cpu")
+    )
+    metadata_device_code = {"cpu": 1, "cuda": 2}[metadata_device.type]
+    local_count = int(local_risk.numel()) if risk_is_tensor else -1
+    risk_shape_valid = bool(
+        risk_is_tensor and local_risk.ndim == 1 and local_count > 0
+    )
+    backend_device_valid = bool(
+        (backend_name == "gloo" and risk_device_code == 1)
+        or (backend_name == "nccl" and risk_device_code == 2)
+    )
+    try:
+        finite = bool(
+            risk_shape_valid
+            and risk_dtype_code in (1, 2)
+            and torch.isfinite(local_risk).all()
+        )
+    except (TypeError, RuntimeError):
+        finite = False
+    ordinal_shape_valid = bool(
+        ordinal_is_tensor
+        and risk_is_tensor
+        and global_ordinals.shape == local_risk.shape
+    )
+    ordinal_dtype_valid = bool(
+        ordinal_is_tensor and global_ordinals.dtype == torch.int64
+    )
+    ordinal_device_valid = bool(
+        ordinal_is_tensor
+        and risk_is_tensor
+        and global_ordinals.device == local_risk.device
+    )
+    fraction_valid = bool(
+        type(tail_fraction) is float
+        and math.isfinite(tail_fraction)
+        and 0.0 < tail_fraction <= 1.0
+    )
+    fraction_bits = (
+        struct.unpack(">Q", struct.pack(">d", tail_fraction))[0]
+        if fraction_valid
+        else -1
+    )
+
+    def int64_or_sentinel(value: object) -> int:
+        if (
+            type(value) is not int
+            or value < -(1 << 63)
+            or value > (1 << 63) - 1
+        ):
+            return -1
+        return value
+
+    metadata = torch.tensor(
+        (
+            1,
+            local_count,
+            int(risk_is_tensor),
+            int(risk_shape_valid),
+            risk_dtype_code,
+            risk_device_code,
+            int(backend_device_valid),
+            int(finite),
+            int(ordinal_is_tensor),
+            int(ordinal_shape_valid),
+            int(ordinal_dtype_valid),
+            int(ordinal_device_valid),
+            int(fraction_valid),
+            fraction_bits,
+            int64_or_sentinel(rank),
+            int64_or_sentinel(world_size),
+            actual_rank,
+            actual_world_size,
+            backend_code,
+            metadata_device_code,
+        ),
+        dtype=torch.int64,
+        device=metadata_device,
+    )
+    gathered_metadata = [
+        torch.empty_like(metadata) for _ in range(actual_world_size)
+    ]
+    if initialized:
+        dist.all_gather(gathered_metadata, metadata)
+    else:
+        gathered_metadata[0].copy_(metadata)
+    collected_metadata = torch.stack(gathered_metadata).cpu()
+    expected_ranks = torch.arange(actual_world_size, dtype=torch.int64)
+    validity_flags = collected_metadata[:, [2, 3, 6, 7, 8, 9, 10, 11, 12]]
+    if (
+        torch.any(collected_metadata[:, 0] != 1)
+        or torch.any(collected_metadata[:, 1] <= 0)
+        or torch.any(collected_metadata[:, 1] != collected_metadata[0, 1])
+        or not torch.all(validity_flags == 1)
+        or collected_metadata[0, 4].item() not in (1, 2)
+        or torch.any(collected_metadata[:, 4] != collected_metadata[0, 4])
+        or collected_metadata[0, 5].item() not in (1, 2)
+        or torch.any(collected_metadata[:, 5] != collected_metadata[0, 5])
+        or torch.any(collected_metadata[:, 13] != collected_metadata[0, 13])
+        or not torch.equal(collected_metadata[:, 14], expected_ranks)
+        or torch.any(collected_metadata[:, 15] != actual_world_size)
+        or not torch.equal(collected_metadata[:, 16], expected_ranks)
+        or torch.any(collected_metadata[:, 17] != actual_world_size)
+        or collected_metadata[0, 18].item() not in (1, 2)
+        or torch.any(collected_metadata[:, 18] != collected_metadata[0, 18])
+        or torch.any(
+            collected_metadata[:, 19]
+            != (1 if collected_metadata[0, 18] == 1 else 2)
+        )
+    ):
+        raise ValueError("global envelope metadata is invalid")
+
+    risk_for_gather = local_risk.detach().contiguous()
+    ordinal_for_gather = global_ordinals.contiguous()
+    gathered_risks = [
+        torch.empty_like(risk_for_gather) for _ in range(actual_world_size)
+    ]
+    gathered_ordinals = [
+        torch.empty_like(ordinal_for_gather) for _ in range(actual_world_size)
+    ]
+    if initialized:
+        dist.all_gather(gathered_risks, risk_for_gather)
+        dist.all_gather(gathered_ordinals, ordinal_for_gather)
+    else:
+        gathered_risks[0].copy_(risk_for_gather)
+        gathered_ordinals[0].copy_(ordinal_for_gather)
+    global_risk = torch.cat(gathered_risks)
+    global_ordinal = torch.cat(gathered_ordinals)
+    total_count = int(global_risk.numel())
+    if not torch.equal(
+        torch.sort(global_ordinal).values,
+        torch.arange(
+            total_count, dtype=torch.int64, device=global_ordinal.device
+        ),
+    ):
+        raise ValueError("global envelope ordinals must be exactly 0..N-1")
+
+    risk_values = global_risk.cpu().tolist()
+    ordinal_values = global_ordinal.cpu().tolist()
+    order = sorted(
+        range(total_count),
+        key=lambda index: (
+            -float(risk_values[index]),
+            int(ordinal_values[index]),
+        ),
+    )
+    tail_count = max(1, math.ceil(tail_fraction * total_count))
+    tail_indices = order[:tail_count]
+    active_indices = [
+        index for index in tail_indices if float(risk_values[index]) > 0.0
+    ]
+    active_count = len(active_indices)
+    tail_ordinals = sorted(
+        int(ordinal_values[index]) for index in tail_indices
+    )
+    active_ordinals = sorted(
+        int(ordinal_values[index]) for index in active_indices
+    )
+    maximum_ordinal = int(ordinal_values[order[0]])
+    local_selected = local_risk[
+        torch.isin(
+            global_ordinals,
+            torch.tensor(
+                tail_ordinals,
+                dtype=torch.int64,
+                device=local_risk.device,
+            ),
+        )
+    ].sum()
+    if active_count:
+        local_active = local_risk[
+            torch.isin(
+                global_ordinals,
+                torch.tensor(
+                    active_ordinals,
+                    dtype=torch.int64,
+                    device=local_risk.device,
+                ),
+            )
+        ].sum()
+        active_value = global_risk[active_indices].mean().to(local_risk.device)
+    else:
+        local_active = local_risk.sum() * 0.0
+        active_value = torch.zeros(
+            (), dtype=local_risk.dtype, device=local_risk.device
+        )
+    local_maximum = local_risk[global_ordinals == maximum_ordinal].sum()
+    selected_value = global_risk[tail_indices].sum().to(local_risk.device)
+    maximum_value = global_risk[order[0]].to(local_risk.device)
+    cvar_surrogate = (actual_world_size / tail_count) * local_selected
+    cvar = cvar_surrogate + (
+        selected_value / tail_count - cvar_surrogate.detach()
+    )
+    active_surrogate = (
+        actual_world_size / max(1, active_count)
+    ) * local_active
+    positive_tail_mean = active_surrogate + (
+        active_value - active_surrogate.detach()
+    )
+    maximum_surrogate = actual_world_size * local_maximum
+    maximum = maximum_surrogate + (
+        maximum_value - maximum_surrogate.detach()
+    )
+    return GlobalEnvelopeReduction(
+        maximum=maximum,
+        cvar=cvar,
+        tail_count=tail_count,
+        active_count=active_count,
+        positive_tail_mean=positive_tail_mean,
+        loss=(
+            DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE.maximum_coefficient * maximum
+            + DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE.positive_tail_mean_coefficient
+            * positive_tail_mean
+        ),
+    )
+
+
+def physical_envelope_loss(
+    normalized_predictions: torch.Tensor,
+    reached_outputs_normalized: torch.Tensor,
+    *,
+    normalization: object,
+    joint_limits: torch.Tensor,
+    phase_advance_cap: float,
+    contract: PhysicalEnvelopeObjective,
+    global_ordinals: torch.Tensor,
+    rank: int,
+    world_size: int,
+) -> dict[str, torch.Tensor]:
+    """Return independent max-plus-positive-tail physical family losses."""
+
+    risks = physical_envelope_risks(
+        normalized_predictions,
+        reached_outputs_normalized,
+        normalization=normalization,
+        joint_limits=joint_limits,
+        phase_advance_cap=phase_advance_cap,
+        contract=contract,
+    )
+    reductions = {
+        name: global_max_plus_tail(
+            value,
+            global_ordinals=global_ordinals,
+            tail_fraction=contract.tail_fraction,
+            rank=rank,
+            world_size=world_size,
+        )
+        for name, value in risks.items()
+    }
+    losses: dict[str, torch.Tensor] = {}
+    for name, reduction in reductions.items():
+        losses[f"{name}_maximum"] = reduction.maximum
+        losses[f"{name}_cvar"] = reduction.cvar
+        losses[f"{name}_positive_tail_mean"] = reduction.positive_tail_mean
+        losses[f"{name}_envelope"] = reduction.loss
+    losses["physical_envelope_total"] = sum(
+        losses[f"{name}_envelope"] for name in risks
+    )
+    return losses
+
+
 def _loss_weights(weights: Mapping[str, float] | None) -> dict[str, float]:
     candidate = DEFAULT_LOSS_WEIGHTS if weights is None else weights
     if type(candidate) is not dict or set(candidate) != set(LOSS_WEIGHT_KEYS):

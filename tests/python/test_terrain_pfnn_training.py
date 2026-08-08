@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import tempfile
+from datetime import timedelta
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -124,6 +125,235 @@ class _FittedEnvelopeModel(torch.nn.Module):
         return self.output.to(device=x.device).expand(len(x), -1)
 
 
+def _global_envelope_worker(
+    rank: int,
+    world_size: int,
+    init_method: str,
+    case: str,
+    queue: object,
+) -> None:
+    """Run one bounded global-envelope collective case in a spawned process."""
+
+    import torch.distributed as dist
+
+    dist.init_process_group(
+        "gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=5),
+    )
+    original_all_gather = dist.all_gather
+    counters = {"metadata": 0, "risk": 0, "ordinal": 0}
+    call_count = 0
+
+    def tracked_all_gather(*args: object, **kwargs: object) -> object:
+        nonlocal call_count
+        call_count += 1
+        name = ("metadata", "risk", "ordinal")[min(call_count - 1, 2)]
+        counters[name] += 1
+        return original_all_gather(*args, **kwargs)
+
+    configurations: dict[str, tuple[tuple[float, ...], tuple[int, ...], float]] = {
+        "cross_rank_max_tie": (
+            (2.0, 0.0),
+            (0, 2) if rank == 0 else (1, 3),
+            0.25,
+        ),
+        "tail_rank_1_only": (
+            (0.0, 0.0) if rank == 0 else (4.0, 3.0),
+            (0, 2) if rank == 0 else (1, 3),
+            0.50,
+        ),
+        "unequal_counts": (
+            (1.0, 0.0) if rank == 0 else (1.0,),
+            (0, 2) if rank == 0 else (1,),
+            0.10,
+        ),
+        "rank_mismatch": (
+            (1.0, 0.0),
+            (0, 2) if rank == 0 else (1, 3),
+            0.10,
+        ),
+        "rank_integer_overflow": (
+            (1.0, 0.0),
+            (0, 2) if rank == 0 else (1, 3),
+            0.10,
+        ),
+        "world_size_integer_overflow": (
+            (1.0, 0.0),
+            (0, 2) if rank == 0 else (1, 3),
+            0.10,
+        ),
+        "ordinal_gap": (
+            (1.0, 0.0),
+            (0, 3) if rank == 0 else (1, 4),
+            0.10,
+        ),
+        "one_rank_nonfinite": (
+            (1.0, 0.0) if rank == 0 else (float("inf"), 0.0),
+            (0, 2) if rank == 0 else (1, 3),
+            0.10,
+        ),
+        "dtype_mismatch": (
+            (1.0, 0.0),
+            (0, 2) if rank == 0 else (1, 3),
+            0.10,
+        ),
+        "device_mismatch": (
+            (1.0, 0.0),
+            (0, 2) if rank == 0 else (1, 3),
+            0.10,
+        ),
+        "fraction_mismatch": (
+            (1.0, 0.0),
+            (0, 2) if rank == 0 else (1, 3),
+            0.10 if rank == 0 else 0.20,
+        ),
+        "invalid_fraction": (
+            (1.0, 0.0),
+            (0, 2) if rank == 0 else (1, 3),
+            0.10 if rank == 0 else float("nan"),
+        ),
+        "safe_rank_appended": (
+            (9.0, 0.0) if rank == 0 else (0.0, 0.0),
+            (0, 2) if rank == 0 else (1, 3),
+            0.10,
+        ),
+    }
+    coefficients, ordinals, tail_fraction = configurations[case]
+    supplied_rank = (
+        2**100
+        if case == "rank_integer_overflow" and rank == 0
+        else (0 if case == "rank_mismatch" else rank)
+    )
+    supplied_world_size = (
+        2**100
+        if case == "world_size_integer_overflow" and rank == 0
+        else world_size
+    )
+    device = torch.device(
+        "cuda", torch.cuda.current_device()
+    ) if case == "device_mismatch" and rank == 1 else torch.device("cpu")
+    dtype = (
+        torch.float32
+        if case == "dtype_mismatch" and rank == 0
+        else torch.float64
+    )
+    parameter = torch.tensor(1.0, dtype=dtype, device=device, requires_grad=True)
+    local_risk = torch.tensor(coefficients, dtype=dtype, device=device) * parameter
+    global_ordinals = torch.tensor(ordinals, dtype=torch.int64, device=device)
+    payload: dict[str, object]
+    try:
+        with patch.object(dist, "all_gather", side_effect=tracked_all_gather):
+            reduction = training_module.global_max_plus_tail(
+                local_risk,
+                global_ordinals=global_ordinals,
+                tail_fraction=tail_fraction,
+                rank=supplied_rank,
+                world_size=supplied_world_size,
+            )
+        maximum_gradient = torch.autograd.grad(
+            reduction.maximum, local_risk, retain_graph=True
+        )[0]
+        parameter_gradients = {
+            "maximum": float(
+                torch.autograd.grad(
+                    reduction.maximum, parameter, retain_graph=True
+                )[0].detach().cpu()
+            ),
+            "cvar": float(
+                torch.autograd.grad(
+                    reduction.cvar, parameter, retain_graph=True
+                )[0].detach().cpu()
+            ),
+            "positive_tail_mean": float(
+                torch.autograd.grad(
+                    reduction.positive_tail_mean,
+                    parameter,
+                    retain_graph=True,
+                )[0].detach().cpu()
+            ),
+            "loss": float(
+                torch.autograd.grad(reduction.loss, parameter)[0].detach().cpu()
+            ),
+        }
+        payload = {
+            "rank": rank,
+            "error": None,
+            "ordinals": list(ordinals),
+            "maximum_gradient": maximum_gradient.detach().cpu().tolist(),
+            "parameter_gradients": parameter_gradients,
+            "maximum": float(reduction.maximum.detach().cpu()),
+            "cvar": float(reduction.cvar.detach().cpu()),
+            "tail_count": reduction.tail_count,
+            "active_count": reduction.active_count,
+            "positive_tail_mean": float(
+                reduction.positive_tail_mean.detach().cpu()
+            ),
+            "loss": float(reduction.loss.detach().cpu()),
+            "counters": counters,
+        }
+    except Exception as error:  # sent to the parent for collective assertions
+        payload = {
+            "rank": rank,
+            "error": (type(error).__name__, str(error)),
+            "counters": counters,
+        }
+    finally:
+        dist.destroy_process_group()
+    queue.put(payload)
+
+
+def _spawn_global_envelope_workers(case: str) -> list[dict[str, object]]:
+    context = torch.multiprocessing.get_context("spawn")
+    queue = context.SimpleQueue()
+    with tempfile.TemporaryDirectory() as temporary:
+        init_method = (Path(temporary) / "gloo-init").as_uri()
+        torch.multiprocessing.spawn(
+            _global_envelope_worker,
+            args=(2, init_method, case, queue),
+            nprocs=2,
+            join=True,
+        )
+        results = [queue.get() for _ in range(2)]
+    return sorted(results, key=lambda item: int(item["rank"]))
+
+
+def _single_rank_global_envelope_reference(
+    case: str,
+) -> tuple[training_module.GlobalEnvelopeReduction, dict[str, float]]:
+    coefficients, tail_fraction = {
+        "cross_rank_max_tie": ((2.0, 2.0, 0.0, 0.0), 0.25),
+        "tail_rank_1_only": ((0.0, 4.0, 0.0, 3.0), 0.50),
+    }[case]
+    parameter = torch.tensor(1.0, dtype=torch.float64, requires_grad=True)
+    reduction = training_module.global_max_plus_tail(
+        torch.tensor(coefficients, dtype=torch.float64) * parameter,
+        global_ordinals=torch.arange(4, dtype=torch.int64),
+        tail_fraction=tail_fraction,
+        rank=0,
+        world_size=1,
+    )
+    gradients = {
+        "maximum": float(
+            torch.autograd.grad(
+                reduction.maximum, parameter, retain_graph=True
+            )[0]
+        ),
+        "cvar": float(
+            torch.autograd.grad(reduction.cvar, parameter, retain_graph=True)[0]
+        ),
+        "positive_tail_mean": float(
+            torch.autograd.grad(
+                reduction.positive_tail_mean, parameter, retain_graph=True
+            )[0]
+        ),
+        "loss": float(torch.autograd.grad(reduction.loss, parameter)[0]),
+    }
+    return reduction, gradients
+
+
 class TerrainPFNNTrainingTests(unittest.TestCase):
     def _fitted_envelope(
         self,
@@ -147,6 +377,479 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             phase_advance_q99=phase_advance_q99,
         )
         return report, rows, model
+
+    def _assert_metadata_rejection(self, case: str) -> None:
+        results = _spawn_global_envelope_workers(case)
+        errors = [result["error"] for result in results]
+        self.assertEqual(errors[0], errors[1])
+        self.assertEqual(
+            errors[0],
+            ("ValueError", "global envelope metadata is invalid"),
+        )
+        for result in results:
+            self.assertEqual(
+                result["counters"],
+                {"metadata": 1, "risk": 0, "ordinal": 0},
+            )
+
+    def test_physical_envelope_risks_use_exact_margins_and_phase_gradients(
+        self,
+    ) -> None:
+        contract = training_module.PhysicalEnvelopeObjective()
+        prediction = torch.zeros(
+            (5, OUTPUT_LAYOUT.size), dtype=torch.float64, requires_grad=True
+        )
+        reached = torch.zeros_like(prediction)
+        prediction.data[:, OUTPUT_LAYOUT["joint_position"]] = 0.0
+        reached.data[:, OUTPUT_LAYOUT["joint_position"]] = 0.0
+        prediction.data[0, OUTPUT_LAYOUT["joint_position"].start] = 0.225
+        prediction.data[1, OUTPUT_LAYOUT["joint_position"].start] = 0.250
+        prediction.data[2, OUTPUT_LAYOUT["phase_advance"]] = 0.0
+        prediction.data[3, OUTPUT_LAYOUT["phase_advance"]] = 0.48
+        prediction.data[4, OUTPUT_LAYOUT["phase_advance"]] = -1.0e-12
+        risks = training_module.physical_envelope_risks(
+            prediction,
+            reached,
+            normalization=_normalization(),
+            joint_limits=torch.tensor([[-1.0, 1.0]] * 29),
+            phase_advance_cap=0.50,
+            contract=contract,
+        )
+        self.assertEqual(float(risks["joint_step"][0].detach()), 0.0)
+        self.assertAlmostEqual(
+            float(risks["joint_step"][1].detach()), 1.0, places=6
+        )
+        self.assertEqual(float(risks["phase"][2].detach()), 0.0)
+        self.assertEqual(float(risks["phase"][3].detach()), 0.0)
+        self.assertAlmostEqual(
+            float(risks["phase"][4].detach()), 5.0e-11, places=20
+        )
+        sum(value.sum() for value in risks.values()).backward()
+        self.assertEqual(
+            float(
+                prediction.grad[0, OUTPUT_LAYOUT["joint_position"].start]
+            ),
+            0.0,
+        )
+        self.assertEqual(
+            float(prediction.grad[2, OUTPUT_LAYOUT["phase_advance"].start]),
+            0.0,
+        )
+        self.assertEqual(
+            float(prediction.grad[4, OUTPUT_LAYOUT["phase_advance"].start]),
+            -50.0,
+        )
+
+    def test_physical_envelope_risks_denormalize_once_and_keep_worst_joint(
+        self,
+    ) -> None:
+        prediction = torch.zeros(
+            (6, OUTPUT_LAYOUT.size), dtype=torch.float64, requires_grad=True
+        )
+        reached = torch.zeros_like(prediction)
+        joint = OUTPUT_LAYOUT["joint_position"]
+        phase = OUTPUT_LAYOUT["phase_advance"]
+        normal = _normalization()
+        normal["y_std"][joint.start + 28] = 2.0
+        prediction.data[0, joint.start + 28] = 0.125
+        prediction.data[1, joint.start] = -1.0
+        prediction.data[2, joint.start + 1] = 1.0
+        prediction.data[3, phase] = 0.50
+        prediction.data[4, joint.start] = -0.98
+        prediction.data[5, joint.start] = 0.98
+        risks = training_module.physical_envelope_risks(
+            prediction,
+            reached,
+            normalization=normal,
+            joint_limits=torch.tensor([[-1.0, 1.0]] * 29),
+            phase_advance_cap=0.50,
+            contract=training_module.PhysicalEnvelopeObjective(),
+        )
+        torch.testing.assert_close(
+            risks["joint_step"],
+            torch.tensor(
+                (1.0, 961.0, 961.0, 0.0, 912.04, 912.04),
+                dtype=torch.float64,
+            ),
+        )
+        self.assertAlmostEqual(
+            float(risks["joint_limit"][1].detach()), 1.0, places=12
+        )
+        self.assertAlmostEqual(
+            float(risks["joint_limit"][2].detach()), 1.0, places=12
+        )
+        self.assertEqual(float(risks["joint_limit"][4].detach()), 0.0)
+        self.assertEqual(float(risks["joint_limit"][5].detach()), 0.0)
+        self.assertAlmostEqual(
+            float(risks["phase"][3].detach()), 1.0, places=12
+        )
+
+    def test_physical_envelope_satisfied_boundaries_have_zero_gradient(
+        self,
+    ) -> None:
+        prediction = torch.zeros(
+            (5, OUTPUT_LAYOUT.size), dtype=torch.float64, requires_grad=True
+        )
+        reached = torch.zeros_like(prediction)
+        joint = OUTPUT_LAYOUT["joint_position"]
+        phase = OUTPUT_LAYOUT["phase_advance"]
+        prediction.data[0, joint.start] = 0.225
+        prediction.data[1, joint.start] = -0.98
+        reached.data[1, joint.start] = -0.98
+        prediction.data[2, joint.start] = 0.98
+        reached.data[2, joint.start] = 0.98
+        prediction.data[3, phase] = 0.0
+        prediction.data[4, phase] = 0.48
+        risks = training_module.physical_envelope_risks(
+            prediction,
+            reached,
+            normalization=_normalization(),
+            joint_limits=torch.tensor([[-1.0, 1.0]] * 29),
+            phase_advance_cap=0.50,
+            contract=training_module.PhysicalEnvelopeObjective(),
+        )
+        for risk in risks.values():
+            torch.testing.assert_close(risk, torch.zeros_like(risk))
+        sum(risk.sum() for risk in risks.values()).backward()
+        self.assertEqual(float(prediction.grad.abs().sum()), 0.0)
+
+    def test_physical_envelope_risks_reject_invalid_shapes_dtypes_and_contracts(
+        self,
+    ) -> None:
+        prediction = torch.zeros(2, OUTPUT_LAYOUT.size)
+        reached = torch.zeros_like(prediction)
+        arguments = {
+            "normalization": _normalization(),
+            "joint_limits": torch.tensor([[-1.0, 1.0]] * 29),
+            "phase_advance_cap": 0.50,
+            "contract": training_module.PhysicalEnvelopeObjective(),
+        }
+        invalid_tensors = (
+            (prediction.reshape(1, 2, -1), reached.reshape(1, 2, -1)),
+            (prediction[:, :-1], reached[:, :-1]),
+            (prediction.to(torch.int64), reached.to(torch.int64)),
+            (prediction, reached.to(torch.float64)),
+        )
+        for invalid_prediction, invalid_reached in invalid_tensors:
+            with self.subTest(shape=tuple(invalid_prediction.shape)):
+                with self.assertRaisesRegex(ValueError, "tensors"):
+                    training_module.physical_envelope_risks(
+                        invalid_prediction, invalid_reached, **arguments
+                    )
+        nonfinite = prediction.clone()
+        nonfinite[0, 0] = float("nan")
+        with self.assertRaisesRegex(ValueError, "finite"):
+            training_module.physical_envelope_risks(
+                nonfinite, reached, **arguments
+            )
+        for phase_cap in (0.020, 0.0, float("nan")):
+            with self.subTest(phase_cap=phase_cap):
+                with self.assertRaisesRegex(ValueError, "phase cap"):
+                    training_module.physical_envelope_risks(
+                        prediction,
+                        reached,
+                        **{**arguments, "phase_advance_cap": phase_cap},
+                    )
+        with self.assertRaisesRegex(ValueError, "joint limits"):
+            training_module.physical_envelope_risks(
+                prediction,
+                reached,
+                **{
+                    **arguments,
+                    "joint_limits": torch.tensor([[-0.01, 0.01]] * 29),
+                },
+            )
+        with self.assertRaisesRegex(ValueError, "contract"):
+            training_module.physical_envelope_risks(
+                prediction,
+                reached,
+                **{
+                    **arguments,
+                    "contract": training_module.PhysicalEnvelopeObjective(
+                        tail_fraction=0.20
+                    ),
+                },
+            )
+
+    def test_global_max_plus_tail_is_invariant_to_appended_safe_elements(
+        self,
+    ) -> None:
+        for count in (1, 9, 10, 11, 32, 100, 1000):
+            offender = torch.tensor(9.0, dtype=torch.float64, requires_grad=True)
+            risk = torch.cat((offender.reshape(1), torch.zeros(count - 1)))
+            reduction = training_module.global_max_plus_tail(
+                risk,
+                global_ordinals=torch.arange(count, dtype=torch.int64),
+                tail_fraction=0.10,
+                rank=0,
+                world_size=1,
+            )
+            self.assertEqual(float(reduction.maximum.detach()), 9.0)
+            self.assertEqual(reduction.active_count, 1)
+            self.assertEqual(float(reduction.positive_tail_mean.detach()), 9.0)
+            self.assertEqual(float(reduction.loss.detach()), 18.0)
+            reduction.loss.backward()
+            self.assertEqual(float(offender.grad), 2.0)
+
+    def test_global_max_plus_tail_ties_use_ascending_global_ordinal(self) -> None:
+        risk = torch.ones(20, requires_grad=True)
+        ordinals = torch.arange(20, dtype=torch.int64).flip(0)
+        reduction = training_module.global_max_plus_tail(
+            risk,
+            global_ordinals=ordinals,
+            tail_fraction=0.10,
+            rank=0,
+            world_size=1,
+        )
+        reduction.positive_tail_mean.backward()
+        selected = set(
+            ordinals[torch.nonzero(risk.grad, as_tuple=False).flatten()].tolist()
+        )
+        self.assertEqual(selected, {0, 1})
+
+    def test_global_max_plus_tail_rejects_invalid_local_contract(self) -> None:
+        valid_risk = torch.ones(2)
+        valid_ordinals = torch.arange(2, dtype=torch.int64)
+        cases = (
+            (valid_risk.reshape(1, 2), valid_ordinals, 0.10, 0, 1),
+            (valid_risk.to(torch.float16), valid_ordinals, 0.10, 0, 1),
+            (torch.empty(0), torch.empty(0, dtype=torch.int64), 0.10, 0, 1),
+            (valid_risk, valid_ordinals.to(torch.int32), 0.10, 0, 1),
+            (valid_risk, valid_ordinals[:1], 0.10, 0, 1),
+            (valid_risk, valid_ordinals, 0.0, 0, 1),
+            (valid_risk, valid_ordinals, 1.01, 0, 1),
+            (valid_risk, valid_ordinals, float("nan"), 0, 1),
+            (valid_risk, valid_ordinals, 0.10, 1, 1),
+            (valid_risk, valid_ordinals, 0.10, 0, 2),
+        )
+        for risk, ordinals, fraction, rank, world_size in cases:
+            with self.subTest(
+                shape=tuple(risk.shape),
+                dtype=risk.dtype,
+                fraction=fraction,
+                rank=rank,
+                world_size=world_size,
+            ):
+                with self.assertRaisesRegex(ValueError, "metadata"):
+                    training_module.global_max_plus_tail(
+                        risk,
+                        global_ordinals=ordinals,
+                        tail_fraction=fraction,
+                        rank=rank,
+                        world_size=world_size,
+                    )
+        for ordinals in (
+            torch.tensor((0, 2)),
+            torch.tensor((0, 0)),
+            torch.tensor((-1, 0)),
+            torch.tensor((0, 3)),
+        ):
+            with self.subTest(ordinals=ordinals.tolist()):
+                with self.assertRaisesRegex(ValueError, "ordinals"):
+                    training_module.global_max_plus_tail(
+                        valid_risk,
+                        global_ordinals=ordinals,
+                        tail_fraction=0.10,
+                        rank=0,
+                        world_size=1,
+                    )
+
+    def test_physical_envelope_loss_safe_append_is_invariant_for_batch_and_rollout(
+        self,
+    ) -> None:
+        references: list[tuple[str, float, float]] = []
+        for label, sizes in (
+            ("batch", ((1,), (11,), (100,))),
+            ("rollout", ((1, 1), (5, 2), (11, 3))),
+        ):
+            for shape in sizes:
+                count = math.prod(shape)
+                prediction = torch.zeros(
+                    (*shape, OUTPUT_LAYOUT.size), dtype=torch.float64
+                ).reshape(count, OUTPUT_LAYOUT.size)
+                prediction.requires_grad_()
+                prediction.data[0, OUTPUT_LAYOUT["joint_position"].start] = 0.30
+                reached = torch.zeros_like(prediction)
+                losses = training_module.physical_envelope_loss(
+                    prediction,
+                    reached,
+                    normalization=_normalization(),
+                    joint_limits=torch.tensor([[-1.0, 1.0]] * 29),
+                    phase_advance_cap=0.50,
+                    contract=training_module.PhysicalEnvelopeObjective(),
+                    global_ordinals=torch.arange(count, dtype=torch.int64),
+                    rank=0,
+                    world_size=1,
+                )
+                losses["joint_step_envelope"].backward()
+                observed = (
+                    float(losses["joint_step_envelope"].detach()),
+                    float(
+                        prediction.grad[
+                            0, OUTPUT_LAYOUT["joint_position"].start
+                        ]
+                    ),
+                )
+                if not references or references[-1][0] != label:
+                    references.append((label, *observed))
+                self.assertEqual(observed, references[-1][1:])
+
+    def test_physical_envelope_loss_reports_independent_family_reductions(
+        self,
+    ) -> None:
+        prediction = torch.zeros(3, OUTPUT_LAYOUT.size, dtype=torch.float64)
+        prediction[0, OUTPUT_LAYOUT["joint_position"].start] = 0.25
+        prediction[1, OUTPUT_LAYOUT["joint_position"].start] = 1.0
+        prediction[2, OUTPUT_LAYOUT["phase_advance"]] = -0.02
+        losses = training_module.physical_envelope_loss(
+            prediction,
+            torch.zeros_like(prediction),
+            normalization=_normalization(),
+            joint_limits=torch.tensor([[-1.0, 1.0]] * 29),
+            phase_advance_cap=0.50,
+            contract=training_module.PhysicalEnvelopeObjective(),
+            global_ordinals=torch.arange(3, dtype=torch.int64),
+            rank=0,
+            world_size=1,
+        )
+        expected = {
+            f"{family}_{suffix}"
+            for family in ("joint_step", "joint_limit", "phase")
+            for suffix in ("maximum", "cvar", "positive_tail_mean", "envelope")
+        }
+        self.assertEqual(set(losses), {"physical_envelope_total", *expected})
+        torch.testing.assert_close(
+            losses["physical_envelope_total"],
+            sum(losses[f"{family}_envelope"] for family in (
+                "joint_step", "joint_limit", "phase"
+            )),
+        )
+
+    def test_two_rank_global_max_plus_tail_table_and_gradients(self) -> None:
+        cases = {
+            "cross_rank_max_tie": (2.0, 2.0, 1, 1, 2.0, 4.0),
+            "tail_rank_1_only": (4.0, 3.5, 2, 2, 3.5, 7.5),
+        }
+        for case, expected in cases.items():
+            with self.subTest(case=case):
+                reference, reference_gradients = (
+                    _single_rank_global_envelope_reference(case)
+                )
+                results = _spawn_global_envelope_workers(case)
+                self.assertTrue(all(result["error"] is None for result in results))
+                for result in results:
+                    observed = (
+                        result["maximum"], result["cvar"],
+                        result["tail_count"], result["active_count"],
+                        result["positive_tail_mean"], result["loss"],
+                    )
+                    self.assertEqual(observed, expected)
+                    self.assertEqual(
+                        observed,
+                        (
+                            float(reference.maximum.detach()),
+                            float(reference.cvar.detach()),
+                            reference.tail_count,
+                            reference.active_count,
+                            float(reference.positive_tail_mean.detach()),
+                            float(reference.loss.detach()),
+                        ),
+                    )
+                    self.assertEqual(
+                        result["counters"],
+                        {"metadata": 1, "risk": 1, "ordinal": 1},
+                    )
+                if case == "cross_rank_max_tie":
+                    nonzero_ordinals = {
+                        ordinal
+                        for result in results
+                        for ordinal, gradient in zip(
+                            result["ordinals"], result["maximum_gradient"]
+                        )
+                        if gradient != 0.0
+                    }
+                    self.assertEqual(nonzero_ordinals, {0})
+                averaged_gradients = {
+                    name: sum(
+                        float(result["parameter_gradients"][name])
+                        for result in results
+                    ) / len(results)
+                    for name in reference_gradients
+                }
+                self.assertEqual(averaged_gradients, reference_gradients)
+
+    def test_two_rank_global_max_plus_tail_rejects_collectively(self) -> None:
+        for case in (
+            "unequal_counts",
+            "rank_mismatch",
+            "rank_integer_overflow",
+            "world_size_integer_overflow",
+            "one_rank_nonfinite",
+        ):
+            with self.subTest(case=case):
+                self._assert_metadata_rejection(case)
+        results = _spawn_global_envelope_workers("ordinal_gap")
+        self.assertEqual(results[0]["error"], results[1]["error"])
+        self.assertEqual(
+            results[0]["error"],
+            (
+                "ValueError",
+                "global envelope ordinals must be exactly 0..N-1",
+            ),
+        )
+        for result in results:
+            self.assertEqual(
+                result["counters"],
+                {"metadata": 1, "risk": 1, "ordinal": 1},
+            )
+
+    def test_two_rank_metadata_rejects_risk_dtype_mismatch_before_value_gather(
+        self,
+    ) -> None:
+        self._assert_metadata_rejection("dtype_mismatch")
+
+    @unittest.skipUnless(
+        torch.cuda.is_available(),
+        "CUDA is unavailable; gloo CPU/CUDA mismatch requires CUDA",
+    )
+    def test_two_rank_metadata_rejects_device_type_mismatch_before_value_gather(
+        self,
+    ) -> None:
+        self._assert_metadata_rejection("device_mismatch")
+
+    def test_two_rank_metadata_rejects_fraction_bit_mismatch_before_value_gather(
+        self,
+    ) -> None:
+        self._assert_metadata_rejection("fraction_mismatch")
+
+    def test_two_rank_metadata_rejects_one_invalid_fraction_before_value_gather(
+        self,
+    ) -> None:
+        self._assert_metadata_rejection("invalid_fraction")
+
+    def test_two_rank_safe_rank_append_preserves_loss_and_ddp_gradient(self) -> None:
+        parameter = torch.tensor(1.0, dtype=torch.float64, requires_grad=True)
+        reference = training_module.global_max_plus_tail(
+            parameter.reshape(1) * 9.0,
+            global_ordinals=torch.tensor((0,), dtype=torch.int64),
+            tail_fraction=0.10,
+            rank=0,
+            world_size=1,
+        )
+        reference_gradient = torch.autograd.grad(reference.loss, parameter)[0]
+        results = _spawn_global_envelope_workers("safe_rank_appended")
+        self.assertTrue(all(result["error"] is None for result in results))
+        self.assertTrue(
+            all(
+                result["loss"] == float(reference.loss.detach())
+                for result in results
+            )
+        )
+        averaged_gradient = sum(
+            float(result["parameter_gradients"]["loss"])
+            for result in results
+        ) / len(results)
+        self.assertEqual(averaged_gradient, float(reference_gradient))
 
     def test_fitted_transition_report_is_canonical_and_uses_stored_phase(self) -> None:
         output = _FittedEnvelopeRows._physical_output()
