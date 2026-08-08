@@ -94,6 +94,12 @@ class _HillTerrainCallback:
         return np.asarray(heights, dtype=np.float64)
 
 
+def _viewer_terrain_map() -> TerrainPFNNHillMap:
+    """Build a wide extrusion so steering mistakes remain on queried terrain."""
+
+    return TerrainPFNNHillMap(grid_spacing_m=0.075, half_width_m=12.0)
+
+
 def _validate(arguments: argparse.Namespace) -> tuple[Path, Path, Path, Path]:
     paths = tuple(
         Path(value).expanduser().resolve()
@@ -186,12 +192,13 @@ def _load_runtime(
         height_and_grade_at=terrain,
         device=arguments.device,
         enforce_motion_envelope=arguments.strict_envelope,
+        command_driven_root=True,
     )
 
 
 def _run(arguments: argparse.Namespace) -> int:
     checkpoint, dataset, model_path, scene_xml = _validate(arguments)
-    terrain_map = TerrainPFNNHillMap(half_width_m=4.0)
+    terrain_map = _viewer_terrain_map()
     terrain = _HillTerrainCallback(terrain_map)
     runtime = _load_runtime(
         arguments, checkpoint, dataset, model_path, terrain

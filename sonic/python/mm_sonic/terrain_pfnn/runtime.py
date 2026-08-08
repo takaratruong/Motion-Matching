@@ -254,11 +254,14 @@ class TerrainPFNNRuntime:
         model: torch.nn.Module | None = None,
         device: str | torch.device = "cpu",
         enforce_motion_envelope: bool = True,
+        command_driven_root: bool = False,
     ) -> None:
         if not callable(height_and_grade_at):
             raise TypeError("height_and_grade_at must be callable")
         if type(enforce_motion_envelope) is not bool:
             raise TypeError("enforce_motion_envelope must be bool")
+        if type(command_driven_root) is not bool:
+            raise TypeError("command_driven_root must be bool")
         signature = getattr(kinematics, "kinematic_signature_sha256", None)
         if signature != getattr(checkpoint, "kinematic_signature_sha256", None):
             raise ValueError("checkpoint kinematic signature mismatch")
@@ -284,6 +287,7 @@ class TerrainPFNNRuntime:
         self._height_and_grade_at = height_and_grade_at
         self._checkpoint = checkpoint
         self._enforce_motion_envelope = enforce_motion_envelope
+        self._command_driven_root = command_driven_root
         self._device = torch.device(device)
         self._limits_tensor = torch.as_tensor(
             self._limits, dtype=torch.float64, device=self._device
@@ -431,6 +435,7 @@ class TerrainPFNNRuntime:
         height_and_grade_at: TerrainCallback,
         device: str | torch.device = "cpu",
         enforce_motion_envelope: bool = True,
+        command_driven_root: bool = False,
     ) -> "TerrainPFNNRuntime":
         kinematics = TorchG1ForwardKinematics.from_mjcf(model_path)
         checkpoint = load_checkpoint(
@@ -446,6 +451,7 @@ class TerrainPFNNRuntime:
             height_and_grade_at=height_and_grade_at,
             device=device,
             enforce_motion_envelope=enforce_motion_envelope,
+            command_driven_root=command_driven_root,
         )
 
     @property
@@ -748,6 +754,34 @@ class TerrainPFNNRuntime:
         physical_recurrent = physical.to(
             dtype=self._recurrent_state.root_world_xy.dtype
         ).reshape(1, OUTPUT_LAYOUT.size)
+        if self._command_driven_root:
+            physical_recurrent = physical_recurrent.clone()
+            current_yaw = float(
+                self._recurrent_state.root_yaw_world[0].to(
+                    device="cpu", dtype=torch.float64
+                )
+            )
+            cosine, sine = math.cos(current_yaw), math.sin(current_yaw)
+            local_velocity = np.asarray(
+                (
+                    desired_world[0] * cosine + desired_world[1] * sine,
+                    -desired_world[0] * sine + desired_world[1] * cosine,
+                ),
+                dtype=np.float64,
+            )
+            yaw_velocity = 0.0
+            if requested_speed > 1.0e-8:
+                desired_yaw = math.atan2(desired_world[1], desired_world[0])
+                yaw_error = (desired_yaw - current_yaw + math.pi) % TWO_PI - math.pi
+                yaw_velocity = float(np.clip(yaw_error / DT, -2.0, 2.0))
+            physical_recurrent[0, OUTPUT_LAYOUT["root_planar_velocity"]] = (
+                torch.as_tensor(
+                    local_velocity,
+                    dtype=physical_recurrent.dtype,
+                    device=physical_recurrent.device,
+                )
+            )
+            physical_recurrent[0, OUTPUT_LAYOUT["root_yaw_velocity"]] = yaw_velocity
         candidate_root_world_xy, candidate_root_yaw_world = _integrate_root_motion(
             self._recurrent_state, physical_recurrent
         )
@@ -867,6 +901,7 @@ class TerrainPFNNRuntime:
             "raw_phase_advance": raw_phase_advance,
             "terrain_grade_degrees": new_support.absolute_grade_degrees,
             "replanned_unsupported_future": not supported,
+            "command_driven_root": self._command_driven_root,
         }
         if not self._enforce_motion_envelope:
             diagnostics.update(

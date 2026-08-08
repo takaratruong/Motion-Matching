@@ -51,6 +51,14 @@ class TerrainPFNNViewerTests(unittest.TestCase):
         self.assertAlmostEqual(measured, 18.9, delta=0.05)
         self.assertIsNone(callback((terrain.x_max + 0.1, 0.0)))
 
+    def test_default_viewer_course_has_lateral_recovery_room(self) -> None:
+        from mm_sonic.terrain_pfnn_viewer import _viewer_terrain_map
+
+        terrain = _viewer_terrain_map()
+        self.assertGreaterEqual(terrain.y_max, 10.0)
+        x = terrain.hills[1].start_x + terrain.blend_m + 0.25
+        self.assertEqual(terrain.height_at((x, -9.0)), terrain.height_at((x, 9.0)))
+
 
 if __name__ == "__main__":
     unittest.main()

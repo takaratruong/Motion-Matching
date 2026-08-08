@@ -169,6 +169,7 @@ class TerrainPFNNRuntimeTests(unittest.TestCase):
         terrain=terrain_with_grade(0.0),
         checkpoint: FakeCheckpoint | None = None,
         enforce_motion_envelope: bool = True,
+        command_driven_root: bool = False,
     ) -> TerrainPFNNRuntime:
         return TerrainPFNNRuntime(
             checkpoint=FakeCheckpoint() if checkpoint is None else checkpoint,
@@ -176,6 +177,7 @@ class TerrainPFNNRuntimeTests(unittest.TestCase):
             model=model,
             height_and_grade_at=terrain,
             enforce_motion_envelope=enforce_motion_envelope,
+            command_driven_root=command_driven_root,
         )
 
     def test_checkpoint_seed_is_the_exact_reached_bootstrap_state(self) -> None:
@@ -389,6 +391,29 @@ class TerrainPFNNRuntimeTests(unittest.TestCase):
             float(np.max(np.abs(second.joint_position_isaaclab - first.joint_position_isaaclab))),
             0.25,
         )
+
+    def test_command_driven_preview_root_tracks_command_and_stops_on_release(self) -> None:
+        model = FakeModel(
+            [
+                physical_output(planar_velocity=(0.0, 1.0)),
+                physical_output(planar_velocity=(0.0, 1.0)),
+            ]
+        )
+        runtime = self.make_runtime(
+            model,
+            enforce_motion_envelope=False,
+            command_driven_root=True,
+        )
+
+        moving = runtime.step(np.asarray((0.6, 0.0)), camera_yaw=0.0)
+        stopped = runtime.step(np.zeros(2), camera_yaw=0.0)
+
+        self.assertAlmostEqual(moving.root_position_world[0], 0.6 / 30.0, places=7)
+        self.assertAlmostEqual(moving.root_position_world[1], 0.0, places=7)
+        np.testing.assert_allclose(
+            stopped.root_position_world[:2], moving.root_position_world[:2], atol=1.0e-7
+        )
+        self.assertTrue(moving.diagnostics["command_driven_root"])
 
     def test_current_missing_terrain_holds_without_calling_model(self) -> None:
         model = FakeModel([physical_output()])
