@@ -14,7 +14,7 @@ from .layout import CONTACT_ORDER, INPUT_LAYOUT, OUTPUT_LAYOUT, TRAJECTORY_TIMES
 from .splits import split_identity as sealed_split, terrain_identity
 
 
-DATASET_SCHEMA = "mm-sonic-terrain-pfnn-dataset/v1"
+DATASET_SCHEMA = "mm-sonic-terrain-pfnn-dataset/v2"
 SPLITS = ("train", "validation", "test")
 
 

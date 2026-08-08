@@ -33,7 +33,7 @@ from .splits import split_identity as sealed_split, terrain_identity
 SplitName = Literal["train", "validation", "test"]
 _SPLITS = SPLITS
 _SHARD_FIELDS = {
-    "x", "y", "phase", "clip_id", "split_identity", "terrain_class",
+    "x", "y", "phase", "clip_id", "split_identity", "sequence_lane", "terrain_class",
     "center_frame", "motion_sha256", "terrain_sha256",
 }
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -48,6 +48,7 @@ _SOURCE_RECORD_FIELDS = {
     "split_identity", "split",
 }
 _TERRAIN_CLASSES = ("flat", "ascent", "descent", "transition")
+_SEQUENCE_LANES = ("motion", *(f"idle_phase_{index}" for index in range(8)))
 
 
 def _sha256(path: Path) -> str:
@@ -67,9 +68,16 @@ def _artifact_path(root: Path, relative: object) -> Path:
     return path
 
 
+def _window_key(
+    clip_id: object, sequence_lane: object, center_frame: object
+) -> tuple[str, str, int]:
+    return str(clip_id), str(sequence_lane), int(center_frame)
+
+
 def _validate_manifest_contract(manifest: Mapping[str, object]) -> None:
+    if manifest.get("schema") != DATASET_SCHEMA:
+        raise ValueError("dataset manifest schema is invalid")
     expected = {
-        "schema": DATASET_SCHEMA,
         "status": "accepted",
         "fps": 30.0,
         "input_size": INPUT_LAYOUT.size,
@@ -230,6 +238,7 @@ def _validated_shard_arrays(
         "phase": ((count,), np.dtype(np.float32)),
         "clip_id": ((count,), np.dtype("<U128")),
         "split_identity": ((count,), np.dtype("<U128")),
+        "sequence_lane": ((count,), np.dtype("<U16")),
         "terrain_class": ((count,), np.dtype("<U10")),
         "center_frame": ((count,), np.dtype(np.int32)),
         "motion_sha256": ((count,), np.dtype("<U64")),
@@ -243,6 +252,7 @@ def _validated_shard_arrays(
         or not np.isfinite(cache["y"]).all()
         or not np.isfinite(cache["phase"]).all()
         or not np.isin(cache["terrain_class"], _TERRAIN_CLASSES).all()
+        or not np.isin(cache["sequence_lane"], _SEQUENCE_LANES).all()
         or np.any(cache["phase"] < 0.0)
         or np.any(cache["phase"].astype(np.float64) >= 2.0 * np.pi)
         or not np.isin(
@@ -284,6 +294,7 @@ class PFNNShardDataset:
         if not isinstance(all_records, list) or not all_records:
             raise ValueError("dataset manifest shards are invalid")
         seen_paths: set[Path] = set()
+        seen_windows: set[tuple[str, str, int]] = set()
         for record in all_records:
             if (
                 not isinstance(record, dict)
@@ -304,9 +315,16 @@ class PFNNShardDataset:
             seen_paths.add(shard_path)
             if not shard_path.is_file() or _sha256(shard_path) != record["sha256"]:
                 raise ValueError(f"dataset shard hash mismatch: {shard_path}")
-            _validated_shard_arrays(
+            arrays = _validated_shard_arrays(
                 shard_path, record, manifest["source_records"]
             )
+            for clip_id, sequence_lane, center_frame in zip(
+                arrays["clip_id"], arrays["sequence_lane"], arrays["center_frame"]
+            ):
+                key = _window_key(clip_id, sequence_lane, center_frame)
+                if key in seen_windows:
+                    raise ValueError("dataset contains a duplicate window identity")
+                seen_windows.add(key)
         self._records = [record for record in all_records if record["split"] == split]
         self._stops: list[int] = []
         total = 0
@@ -418,6 +436,7 @@ class PFNNShardDataset:
             "clip_id": str(data["clip_id"][row]),
             "split_identity": str(data["split_identity"][row]),
             "split": self.split,
+            "sequence_lane": str(data["sequence_lane"][row]),
             "terrain_class": str(data["terrain_class"][row]),
             "center_frame": int(data["center_frame"][row]),
             "motion_sha256": str(data["motion_sha256"][row]),

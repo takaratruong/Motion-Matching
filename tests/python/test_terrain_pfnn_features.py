@@ -210,6 +210,7 @@ class TrainingWindowTest(unittest.TestCase):
         windows = build_clip_windows(clip, track, height_at=slope.height_at)
 
         self.assertEqual([window.center_frame for window in windows], list(range(30, 64)))
+        self.assertEqual({window.sequence_lane for window in windows}, {"motion"})
         sample = windows[len(windows) // 2]
         self.assertEqual(sample.x.shape, (288,))
         self.assertEqual(sample.y.shape, (268,))
@@ -420,6 +421,10 @@ class TrainingWindowTest(unittest.TestCase):
         center = first[0].center_frame
         same_center = [window for window in first if window.center_frame == center]
         self.assertEqual(len(same_center), 8)
+        self.assertEqual(
+            {window.sequence_lane for window in same_center},
+            {f"idle_phase_{index}" for index in range(8)},
+        )
         np.testing.assert_allclose(
             [window.phase for window in same_center],
             np.arange(8) * (2.0 * math.pi / 8.0),
@@ -539,6 +544,8 @@ class MirrorWindowTest(unittest.TestCase):
         self.assertEqual(restored.motion_sha256, sample.motion_sha256)
         self.assertEqual(restored.terrain_sha256, sample.terrain_sha256)
         self.assertEqual(restored.terrain_class, sample.terrain_class)
+        self.assertEqual(mirrored.sequence_lane, sample.sequence_lane)
+        self.assertNotEqual(mirrored.clip_id, sample.clip_id)
 
         original_terrain = sample.x[INPUT_LAYOUT["terrain_height"]].reshape(12, 3)
         mirrored_terrain = mirrored.x[INPUT_LAYOUT["terrain_height"]].reshape(12, 3)
@@ -614,6 +621,7 @@ class MirrorWindowTest(unittest.TestCase):
             split_identity="walk1_subject1",
             split="train",
             terrain_class="flat",
+            sequence_lane="motion",
             center_frame=30,
             motion_sha256="a" * 64,
             terrain_sha256=None,
@@ -632,6 +640,10 @@ class MirrorWindowTest(unittest.TestCase):
             replace(window, split_identity="walk2_subject3")
         with self.assertRaisesRegex(ValueError, "sealed split"):
             replace(window, split="validation")
+        for invalid_lane in ("", "idle", "idle_phase_8", "motion_phase_0"):
+            with self.subTest(invalid_lane=invalid_lane):
+                with self.assertRaisesRegex(ValueError, "sequence_lane"):
+                    replace(window, sequence_lane=invalid_lane)
 
 
 if __name__ == "__main__":

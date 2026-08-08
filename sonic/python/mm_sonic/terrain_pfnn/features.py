@@ -41,6 +41,7 @@ _FLAT_GRADE_DEGREES = 1.0
 _STATIONARY_SPEED_M_S = 0.05
 _TWO_PI = 2.0 * math.pi
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_SEQUENCE_LANES = ("motion", *(f"idle_phase_{index}" for index in range(8)))
 _POLAR_MIRROR = np.array((1.0, -1.0, 1.0), dtype=np.float64)
 _CONTACT_MIRROR = np.array((2, 3, 0, 1), dtype=np.int64)
 
@@ -91,6 +92,7 @@ class PFNNTrainingWindow:
     clip_id: str
     split_identity: str
     split: SplitName
+    sequence_lane: str
     center_frame: int
     motion_sha256: str
     terrain_sha256: str | None
@@ -111,6 +113,8 @@ class PFNNTrainingWindow:
             raise ValueError("split must be train, validation, or test")
         if self.split != sealed_split_identity(self.split_identity):
             raise ValueError("split does not match the sealed split")
+        if self.sequence_lane not in _SEQUENCE_LANES:
+            raise ValueError("sequence_lane is invalid")
         if self.terrain_class not in ("flat", "ascent", "descent", "transition"):
             raise ValueError("terrain_class is invalid")
         if type(self.center_frame) is not int or self.center_frame < 0:
@@ -495,6 +499,7 @@ def _pack_window(
         clip_id=clip.clip_id,
         split_identity=canonical_split_identity(clip.clip_id),
         split=sealed_split_identity(clip.clip_id),
+        sequence_lane="motion",
         center_frame=center_frame,
         motion_sha256=clip.motion_sha256,
         terrain_sha256=clip.terrain_sha256,
@@ -580,7 +585,11 @@ def build_clip_windows_with_audit(
         if idle:
             for phase_bin in range(8):
                 windows.append(
-                    replace(base, phase=phase_bin * (_TWO_PI / 8.0))
+                    replace(
+                        base,
+                        phase=phase_bin * (_TWO_PI / 8.0),
+                        sequence_lane=f"idle_phase_{phase_bin}",
+                    )
                 )
         else:
             windows.append(base)
@@ -631,6 +640,7 @@ def mirror_window(window: PFNNTrainingWindow) -> PFNNTrainingWindow:
         clip_id=_mirrored_clip_id(window.clip_id),
         split_identity=window.split_identity,
         split=window.split,
+        sequence_lane=window.sequence_lane,
         center_frame=window.center_frame,
         motion_sha256=window.motion_sha256,
         terrain_sha256=window.terrain_sha256,

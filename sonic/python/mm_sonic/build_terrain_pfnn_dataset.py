@@ -75,9 +75,10 @@ _SOURCE_RECORD_FIELDS = {
     "split_identity", "split",
 }
 _SHARD_FIELDS = {
-    "x", "y", "phase", "clip_id", "split_identity", "terrain_class",
+    "x", "y", "phase", "clip_id", "split_identity", "sequence_lane", "terrain_class",
     "center_frame", "motion_sha256", "terrain_sha256",
 }
+_SEQUENCE_LANES = ("motion", *(f"idle_phase_{index}" for index in range(8)))
 
 
 def _sha256(path: Path) -> str:
@@ -301,6 +302,8 @@ def _window_arrays(windows: list[PFNNTrainingWindow]) -> dict[str, np.ndarray]:
             raise ValueError("split_identity exceeds the fixed <U128 shard contract")
         if window.terrain_class not in _TERRAIN_CLASSES:
             raise ValueError("terrain_class is invalid")
+        if window.sequence_lane not in _SEQUENCE_LANES:
+            raise ValueError("sequence_lane is invalid")
         if window.center_frame > np.iinfo(np.int32).max:
             raise ValueError("center_frame exceeds the int32 shard contract")
         if not np.isfinite(window.phase) or not 0.0 <= window.phase < 2.0 * np.pi:
@@ -320,6 +323,9 @@ def _window_arrays(windows: list[PFNNTrainingWindow]) -> dict[str, np.ndarray]:
         "split_identity": np.asarray(
             [window.split_identity for window in windows], dtype="<U128"
         ),
+        "sequence_lane": np.asarray(
+            [window.sequence_lane for window in windows], dtype="<U16"
+        ),
         "terrain_class": np.asarray(
             [window.terrain_class for window in windows], dtype="<U10"
         ),
@@ -336,12 +342,9 @@ def _window_arrays(windows: list[PFNNTrainingWindow]) -> dict[str, np.ndarray]:
 
 
 def _window_key(
-    clip_id: object, center_frame: object, phase: object
-) -> tuple[str, int, bytes]:
-    canonical_phase = _float32_wrapped_phase(
-        np.asarray([phase], dtype=np.float64)
-    )[0]
-    return str(clip_id), int(center_frame), canonical_phase.tobytes()
+    clip_id: object, sequence_lane: object, center_frame: object
+) -> tuple[str, str, int]:
+    return str(clip_id), str(sequence_lane), int(center_frame)
 
 
 def _validate_shard(
@@ -364,6 +367,7 @@ def _validate_shard(
         "phase": ((expected_count,), np.dtype(np.float32)),
         "clip_id": ((expected_count,), np.dtype("<U128")),
         "split_identity": ((expected_count,), np.dtype("<U128")),
+        "sequence_lane": ((expected_count,), np.dtype("<U16")),
         "terrain_class": ((expected_count,), np.dtype("<U10")),
         "center_frame": ((expected_count,), np.dtype(np.int32)),
         "motion_sha256": ((expected_count,), np.dtype("<U64")),
@@ -381,6 +385,8 @@ def _validate_shard(
         raise ValueError(f"shard {path} contains phase outside [0, 2*pi)")
     if not np.isin(arrays["terrain_class"], _TERRAIN_CLASSES).all():
         raise ValueError(f"shard {path} contains an invalid terrain class")
+    if not np.isin(arrays["sequence_lane"], _SEQUENCE_LANES).all():
+        raise ValueError(f"shard {path} contains an invalid sequence lane")
     if not np.isin(arrays["y"][:, OUTPUT_LAYOUT["contact_logit"]], (0.0, 1.0)).all():
         raise ValueError(f"shard {path} contains nonbinary contacts")
     validate_shard_row_provenance(
@@ -512,6 +518,7 @@ def _validate_resume_files(root: Path, manifest: Mapping[str, object]) -> None:
     if not isinstance(shards, list):
         raise ValueError("resume manifest shards are invalid")
     seen_paths: set[Path] = set()
+    seen_windows: set[tuple[str, str, int]] = set()
     for record in shards:
         if not isinstance(record, Mapping) or set(record) != {"path", "sha256", "count", "split"}:
             raise ValueError("resume manifest shard record is invalid")
@@ -532,12 +539,19 @@ def _validate_resume_files(root: Path, manifest: Mapping[str, object]) -> None:
         seen_paths.add(path)
         if not path.is_file() or _sha256(path) != record["sha256"]:
             raise ValueError(f"resume shard hash mismatch: {path}")
-        _validate_shard(
+        arrays = _validate_shard(
             path,
             expected_count=int(record["count"]),
             expected_split=str(record["split"]),
             source_records=manifest["source_records"],
         )
+        for clip_id, sequence_lane, center_frame in zip(
+            arrays["clip_id"], arrays["sequence_lane"], arrays["center_frame"]
+        ):
+            key = _window_key(clip_id, sequence_lane, center_frame)
+            if key in seen_windows:
+                raise ValueError("resume dataset contains duplicate windows")
+            seen_windows.add(key)
     normalization = manifest.get("normalization")
     if normalization is not None:
         if not isinstance(normalization, Mapping) or set(normalization) != {"path", "sha256"}:
@@ -633,6 +647,8 @@ def write_pfnn_dataset(
             existing = json.loads(manifest_path.read_text())
         except (OSError, json.JSONDecodeError) as error:
             raise ValueError("resume requires a valid manifest") from error
+        if existing.get("schema") != _SCHEMA:
+            raise ValueError("resume dataset manifest schema is invalid")
         _validate_resume_manifest_source(existing)
         if existing.get("source_set_digest_sha256") != source_set_digest:
             raise ValueError("resume source set digest mismatch")
@@ -656,7 +672,7 @@ def write_pfnn_dataset(
         root.mkdir(parents=True, exist_ok=True)
 
     shard_records = list(existing.get("shards", [])) if existing else []
-    completed_keys: set[tuple[str, int, bytes]] = set()
+    completed_keys: set[tuple[str, str, int]] = set()
     next_index = {split: 0 for split in _SPLITS}
     for record in shard_records:
         split = str(record["split"])
@@ -671,10 +687,10 @@ def write_pfnn_dataset(
             expected_split=split,
             source_records=records,
         )
-        for clip_id, frame, phase in zip(
-            arrays["clip_id"], arrays["center_frame"], arrays["phase"]
+        for clip_id, sequence_lane, frame in zip(
+            arrays["clip_id"], arrays["sequence_lane"], arrays["center_frame"]
         ):
-            key = _window_key(clip_id, frame, phase)
+            key = _window_key(clip_id, sequence_lane, frame)
             if key in completed_keys:
                 raise ValueError("resume dataset contains duplicate windows")
             completed_keys.add(key)
@@ -739,7 +755,9 @@ def write_pfnn_dataset(
             raise ValueError(
                 f"window provenance conflicts with source record {window.clip_id!r}"
             )
-        key = _window_key(window.clip_id, window.center_frame, window.phase)
+        key = _window_key(
+            window.clip_id, window.sequence_lane, window.center_frame
+        )
         if key in completed_keys:
             continue
         if key in seen_keys:

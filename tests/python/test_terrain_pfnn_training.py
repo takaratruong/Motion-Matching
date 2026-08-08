@@ -35,6 +35,7 @@ from mm_sonic.terrain_pfnn.training import (
     LOSS_WEIGHT_KEYS,
     autoregressive_unroll,
     choose_runtime_seed,
+    fitted_row_sha256,
     finite_runtime_seed,
     load_checkpoint,
     pfnn_losses,
@@ -75,6 +76,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                             "center_frame": center,
                             "split_identity": clip.split("__")[1],
                             "split": "train",
+                            "sequence_lane": "motion",
                             "terrain_class": (
                                 "flat" if center in (10, 11) else "ascent"
                             ),
@@ -137,6 +139,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                             "center_frame": center,
                             "split_identity": identity,
                             "split": "train",
+                            "sequence_lane": "motion",
                             "terrain_class": terrain_class,
                         })
 
@@ -211,6 +214,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                     "center_frame": center,
                     "split_identity": "slope_000",
                     "split": "train",
+                    "sequence_lane": "motion",
                     "terrain_class": "flat",
                 }
 
@@ -227,14 +231,17 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 name: seed["provenance"][name]
                 for name in (
                     "predecessor_clip_id", "predecessor_center_frame",
-                    "first_fitted_clip_id", "first_fitted_center_frame",
+                    "predecessor_sequence_lane", "first_fitted_clip_id",
+                    "first_fitted_center_frame", "first_fitted_sequence_lane",
                 )
             },
             {
             "predecessor_clip_id": "terrain_slopes__slope_000__000",
             "predecessor_center_frame": 10,
+            "predecessor_sequence_lane": "motion",
             "first_fitted_clip_id": "terrain_slopes__slope_000__000",
             "first_fitted_center_frame": 11,
+            "first_fitted_sequence_lane": "motion",
             },
         )
         self.assertAlmostEqual(seed["provenance"]["speed"], 0.011)
@@ -294,7 +301,8 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 return {
                     "x": x, "y": y, "phase": np.float32(center * 0.1),
                     "clip_id": clip, "center_frame": center,
-                    "split_identity": clip, "split": "train", "terrain_class": "flat",
+                    "split_identity": clip, "split": "train",
+                    "sequence_lane": "motion", "terrain_class": "flat",
                 }
 
             def __init__(self) -> None:
@@ -319,7 +327,8 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 "y": np.full(OUTPUT_LAYOUT.size, center + 1, np.float32),
                 "phase": np.float32(center * 0.1),
                 "clip_id": "clip", "center_frame": center,
-                "split_identity": "clip", "split": "train", "terrain_class": "flat",
+                "split_identity": "clip", "split": "train",
+                "sequence_lane": "motion", "terrain_class": "flat",
             }
             for center in (10, 11, 12)
         ]
@@ -341,6 +350,13 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             "fitted_subset_rows_sha256": receipt["rows_sha256"],
         })
         training_module.validate_runtime_seed_fitted_subset(seed, receipt)
+        self.assertEqual(seed["provenance"]["predecessor_sequence_lane"], "motion")
+        self.assertEqual(seed["provenance"]["first_fitted_sequence_lane"], "motion")
+        lane_seed = dict(seed)
+        lane_seed["provenance"] = dict(seed["provenance"])
+        lane_seed["provenance"]["predecessor_sequence_lane"] = "idle_phase_0"
+        with self.assertRaisesRegex(ValueError, "membership"):
+            training_module.validate_runtime_seed_fitted_subset(lane_seed, receipt)
         missing = fitted_subset_metadata(Dataset(), (0, 2))
         with self.assertRaisesRegex(ValueError, "membership"):
             training_module.validate_runtime_seed_fitted_subset(seed, missing)
@@ -355,6 +371,45 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
         training_module.validate_resume_fitted_subset(checkpoint, receipt)
         with self.assertRaisesRegex(ValueError, "fitted subset"):
             training_module.validate_resume_fitted_subset(checkpoint, missing)
+        rows[0]["sequence_lane"] = "idle_phase_0"
+        changed_lane = fitted_subset_metadata(Dataset(), range(3))
+        with self.assertRaisesRegex(ValueError, "fitted subset"):
+            training_module.validate_resume_fitted_subset(checkpoint, changed_lane)
+
+    def test_fitted_row_and_subset_receipts_bind_sequence_lane(self) -> None:
+        base = {
+            "x": np.zeros(INPUT_LAYOUT.size, np.float32),
+            "y": np.zeros(OUTPUT_LAYOUT.size, np.float32),
+            "phase": np.float32(0.0),
+            "clip_id": "walk1_subject1",
+            "center_frame": 30,
+            "split_identity": "walk1_subject1",
+            "split": "train",
+            "sequence_lane": "motion",
+            "terrain_class": "flat",
+        }
+        idle = dict(base)
+        idle["sequence_lane"] = "idle_phase_0"
+        self.assertNotEqual(fitted_row_sha256(base), fitted_row_sha256(idle))
+
+        class Dataset:
+            split = "train"
+            rows = (base, idle)
+            def __len__(self) -> int: return len(self.rows)
+            def __getitem__(self, index: int) -> dict[str, object]: return self.rows[index]
+
+        both = fitted_subset_metadata(Dataset(), (0, 1))
+        self.assertEqual(
+            [row["sequence_lane"] for row in both["rows"]],
+            ["motion", "idle_phase_0"],
+        )
+        motion = fitted_subset_metadata(Dataset(), (0,))
+        idle_only = fitted_subset_metadata(Dataset(), (1,))
+        self.assertNotEqual(motion["rows_sha256"], idle_only["rows_sha256"])
+        missing = dict(base)
+        del missing["sequence_lane"]
+        with self.assertRaisesRegex(ValueError, "fitted row receipt source"):
+            fitted_row_sha256(missing)
 
     def test_rollout_default_depends_on_pipeline_mode_and_explicit_value_wins(self) -> None:
         resolve = train_module.resolve_rollout_finetune_frames
@@ -525,6 +580,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                     "phase": np.float32(index),
                     "clip_id": f"clip-{index}",
                     "center_frame": index,
+                    "sequence_lane": "motion",
                     "terrain_class": "flat",
                 }
 
@@ -695,7 +751,8 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
         fitted_rows = [
             {
                 "clip_id": "synthetic", "center_frame": center,
-                "split_identity": "synthetic", "terrain_class": "flat",
+                "split_identity": "synthetic", "sequence_lane": "motion",
+                "terrain_class": "flat",
                 "row_sha256": digest,
             }
             for center, digest in ((0, "1" * 64), (1, "2" * 64))
@@ -725,6 +782,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 fitted_subset=fitted_subset,
             )
             payload = torch.load(path, map_location="cpu", weights_only=True)
+            self.assertEqual(payload["schema"], "mm-sonic-terrain-pfnn-checkpoint/v5")
             self.assertEqual(payload["input_layout"], [list(field) for field in INPUT_LAYOUT.fields])
             self.assertEqual(payload["output_layout"], [list(field) for field in OUTPUT_LAYOUT.fields])
             self.assertEqual(
@@ -744,6 +802,41 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             self.assertEqual(loaded.sampler_global_offset, 8)
             self.assertEqual(loaded.runtime_seed.keys(), seed.keys())
             self.assertEqual(loaded.fitted_subset, fitted_subset)
+            old_schema = payload["schema"]
+            payload["schema"] = "mm-sonic-terrain-pfnn-checkpoint/v4"
+            torch.save(payload, path)
+            with patch(
+                "mm_sonic.terrain_pfnn.training.PhaseFunctionedNetwork",
+                side_effect=AssertionError("old schema opened model state"),
+            ) as model_constructor:
+                with self.assertRaisesRegex(ValueError, "schema"):
+                    load_checkpoint(
+                        path,
+                        expected_dataset_digest="abc",
+                        expected_kinematic_signature_sha256="def",
+                    )
+                model_constructor.assert_not_called()
+            payload["schema"] = old_schema
+            torch.save(payload, path)
+            original_rows_sha256 = payload["fitted_subset"]["rows_sha256"]
+            payload["fitted_subset"]["rows"][0]["sequence_lane"] = "idle_phase_0"
+            payload["fitted_subset"]["rows_sha256"] = hashlib.sha256(
+                json.dumps(
+                    payload["fitted_subset"]["rows"],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            torch.save(payload, path)
+            with self.assertRaisesRegex(ValueError, "membership"):
+                load_checkpoint(
+                    path,
+                    expected_dataset_digest="abc",
+                    expected_kinematic_signature_sha256="def",
+                )
+            payload["fitted_subset"]["rows"][0]["sequence_lane"] = "motion"
+            payload["fitted_subset"]["rows_sha256"] = original_rows_sha256
+            torch.save(payload, path)
             class MatchingKinematics:
                 kinematic_signature_sha256 = "def"
                 joint_limits = torch.tensor(
@@ -932,6 +1025,13 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 "runtime provenance extra key",
                 lambda value: value["runtime_seed"]["provenance"].__setitem__(
                     "extra", 0
+                ),
+                "runtime seed provenance",
+            )
+            rejected(
+                "runtime predecessor lane",
+                lambda value: value["runtime_seed"]["provenance"].__setitem__(
+                    "predecessor_sequence_lane", "idle_phase_8"
                 ),
                 "runtime seed provenance",
             )
@@ -1155,15 +1255,15 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
 
     def test_rollout_sequences_ignore_storage_order_and_reject_bad_metadata(self) -> None:
         rows = [
-            {"clip_id": "walk4_subject1", "center_frame": 11, "terrain_class": "flat"},
-            {"clip_id": "walk1_subject1", "center_frame": 2, "terrain_class": "flat"},
-            {"clip_id": "walk4_subject1", "center_frame": 10, "terrain_class": "flat"},
-            {"clip_id": "walk1_subject1", "center_frame": 1, "terrain_class": "flat"},
-            {"clip_id": "walk1_subject1", "center_frame": 4, "terrain_class": "flat"},
-            {"clip_id": "walk1_subject1", "center_frame": 5, "terrain_class": "flat"},
+            {"clip_id": "walk4_subject1", "center_frame": 11, "sequence_lane": "motion", "terrain_class": "flat"},
+            {"clip_id": "walk1_subject1", "center_frame": 2, "sequence_lane": "motion", "terrain_class": "flat"},
+            {"clip_id": "walk4_subject1", "center_frame": 10, "sequence_lane": "motion", "terrain_class": "flat"},
+            {"clip_id": "walk1_subject1", "center_frame": 1, "sequence_lane": "motion", "terrain_class": "flat"},
+            {"clip_id": "walk1_subject1", "center_frame": 4, "sequence_lane": "motion", "terrain_class": "flat"},
+            {"clip_id": "walk1_subject1", "center_frame": 5, "sequence_lane": "motion", "terrain_class": "flat"},
         ]
         rows.extend(
-            {"clip_id": "walk1_subject1", "center_frame": 3, "terrain_class": "flat"}
+            {"clip_id": "walk1_subject1", "center_frame": 3, "sequence_lane": "motion", "terrain_class": "flat"}
             for _ in range(8)
         )
 

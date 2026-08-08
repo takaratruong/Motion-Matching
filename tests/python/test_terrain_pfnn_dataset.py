@@ -31,6 +31,7 @@ from mm_sonic.terrain_pfnn.layout import (
     OUTPUT_LAYOUT,
     TRAJECTORY_TIMES_S,
 )
+from mm_sonic.terrain_pfnn.provenance import DATASET_SCHEMA, source_set_payload
 from mm_sonic.terrain_pfnn.splits import split_identity, terrain_identity
 from mm_sonic.terrain_pfnn.sources import GrailSlopeRecord, _GRAIL_SOURCE_LICENSE_ID
 
@@ -39,7 +40,9 @@ _DIGEST_A = "a" * 64
 _DIGEST_B = "b" * 64
 
 
-def _window(clip_id: str, value: float, frame: int) -> PFNNTrainingWindow:
+def _window(
+    clip_id: str, value: float, frame: int, *, sequence_lane: str
+) -> PFNNTrainingWindow:
     x = np.arange(INPUT_LAYOUT.size, dtype=np.float32) + value
     y = np.arange(OUTPUT_LAYOUT.size, dtype=np.float32) - value
     y[OUTPUT_LAYOUT["contact_logit"]] = np.array((0, 1, 1, 0), np.float32)
@@ -50,6 +53,7 @@ def _window(clip_id: str, value: float, frame: int) -> PFNNTrainingWindow:
         clip_id=clip_id,
         split_identity=terrain_identity(clip_id),
         split=split_identity(clip_id),
+        sequence_lane=sequence_lane,
         terrain_class="flat" if clip_id.startswith("walk") else "ascent",
         center_frame=frame,
         motion_sha256=_DIGEST_A,
@@ -87,10 +91,10 @@ class TerrainPFNNDatasetTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.windows = [
-            _window("walk1_subject1", 1.0, 30),
-            _window("walk1_subject1", 3.0, 31),
-            _window("walk2_subject3", 5.0, 32),
-            _window("walk2_subject1", 7.0, 33),
+            _window("walk1_subject1", 1.0, 30, sequence_lane="motion"),
+            _window("walk1_subject1", 3.0, 31, sequence_lane="motion"),
+            _window("walk2_subject3", 5.0, 32, sequence_lane="motion"),
+            _window("walk2_subject1", 7.0, 33, sequence_lane="motion"),
         ]
 
     def tearDown(self) -> None:
@@ -110,7 +114,8 @@ class TerrainPFNNDatasetTest(unittest.TestCase):
         output = self.root / "dataset"
         manifest = self._write(output, self.windows)
 
-        self.assertEqual(manifest["schema"], "mm-sonic-terrain-pfnn-dataset/v1")
+        self.assertEqual(manifest["schema"], "mm-sonic-terrain-pfnn-dataset/v2")
+        self.assertEqual(DATASET_SCHEMA, "mm-sonic-terrain-pfnn-dataset/v2")
         self.assertEqual(manifest["status"], "accepted")
         self.assertEqual(manifest["fps"], 30.0)
         self.assertEqual(manifest["input_size"], 288)
@@ -119,6 +124,17 @@ class TerrainPFNNDatasetTest(unittest.TestCase):
         self.assertEqual(manifest["trajectory_times_s"], TRAJECTORY_TIMES_S.tolist())
         self.assertEqual(manifest["contact_order"], list(CONTACT_ORDER))
         self.assertEqual(manifest["rejections"], {"invalid_phase": 2})
+        self.assertEqual(
+            manifest["source_set_digest_sha256"],
+            canonical_json_sha256(
+                source_set_payload(
+                    _source_roots(),
+                    _source_records(self.windows),
+                    manifest["split_identities"],
+                    manifest["build_options"],
+                )
+            ),
+        )
         self.assertEqual(len(manifest["shards"]), 3)
         identities = manifest["split_identities"]
         self.assertEqual(identities["train"], ["walk1_subject1"])
@@ -142,6 +158,7 @@ class TerrainPFNNDatasetTest(unittest.TestCase):
                 self.assertEqual(arrays["phase"].shape, (count,))
                 self.assertEqual(arrays["clip_id"].shape, (count,))
                 self.assertEqual(arrays["split_identity"].shape, (count,))
+                self.assertEqual(arrays["sequence_lane"].shape, (count,))
                 self.assertEqual(arrays["terrain_class"].shape, (count,))
                 self.assertEqual(arrays["center_frame"].shape, (count,))
                 self.assertEqual(arrays["motion_sha256"].shape, (count,))
@@ -152,11 +169,13 @@ class TerrainPFNNDatasetTest(unittest.TestCase):
                 self.assertEqual(arrays["center_frame"].dtype, np.dtype(np.int32))
                 self.assertEqual(arrays["clip_id"].dtype, np.dtype("<U128"))
                 self.assertEqual(arrays["split_identity"].dtype, np.dtype("<U128"))
+                self.assertEqual(arrays["sequence_lane"].dtype, np.dtype("<U16"))
                 self.assertEqual(arrays["terrain_class"].dtype, np.dtype("<U10"))
                 self.assertEqual(arrays["motion_sha256"].dtype, np.dtype("<U64"))
                 self.assertEqual(arrays["terrain_sha256"].dtype, np.dtype("<U64"))
                 self.assertTrue(np.isfinite(arrays["x"]).all())
                 self.assertTrue(np.isfinite(arrays["y"]).all())
+                self.assertEqual(set(map(str, arrays["sequence_lane"])), {"motion"})
 
         persisted = json.loads((output / "manifest.json").read_text())
         self.assertEqual(persisted, manifest)
@@ -166,6 +185,151 @@ class TerrainPFNNDatasetTest(unittest.TestCase):
         left = {"z": [3, 2, 1], "a": {"y": 2, "x": "é"}}
         right = {"a": {"x": "é", "y": 2}, "z": [3, 2, 1]}
         self.assertEqual(canonical_json_sha256(left), canonical_json_sha256(right))
+
+    def test_dataset_digest_and_duplicate_identity_bind_sequence_lane(self) -> None:
+        motion = replace(self.windows[0], phase=0.0, sequence_lane="motion")
+        idle = replace(self.windows[0], phase=0.0, sequence_lane="idle_phase_0")
+        motion_output = self.root / "motion"
+        idle_output = self.root / "idle"
+        motion_manifest = self._write(motion_output, [motion])
+        idle_manifest = self._write(idle_output, [idle])
+        self.assertEqual(
+            (motion_output / "normalization.npz").read_bytes(),
+            (idle_output / "normalization.npz").read_bytes(),
+        )
+        self.assertEqual(
+            motion_manifest["source_set_digest_sha256"],
+            idle_manifest["source_set_digest_sha256"],
+        )
+        self.assertNotEqual(
+            motion_manifest["dataset_digest_sha256"],
+            idle_manifest["dataset_digest_sha256"],
+        )
+
+        both_manifest = self._write(self.root / "both", [motion, idle])
+        self.assertEqual(sum(row["count"] for row in both_manifest["shards"]), 2)
+
+    def test_duplicate_identity_is_clip_lane_frame_for_input_load_and_resume(self) -> None:
+        motion = replace(self.windows[0], phase=0.0, sequence_lane="motion")
+        changed_phase = replace(motion, phase=0.5)
+        with self.assertRaisesRegex(ValueError, "duplicate windows"):
+            self._write(self.root / "input-duplicate", [motion, changed_phase])
+
+        idle = replace(motion, phase=0.5, sequence_lane="idle_phase_0")
+        output = self.root / "persisted-duplicate"
+        manifest = self._write(output, [motion, idle])
+        record = manifest["shards"][0]
+        shard = output / record["path"]
+        with np.load(shard, allow_pickle=False) as data:
+            arrays = {name: np.asarray(data[name]) for name in data.files}
+        arrays["sequence_lane"][1] = "motion"
+        shard.write_bytes(_deterministic_npz_bytes(arrays))
+        record["sha256"] = hashlib.sha256(shard.read_bytes()).hexdigest()
+        manifest["dataset_digest_sha256"] = canonical_json_sha256(
+            {
+                "source_set_digest_sha256": manifest["source_set_digest_sha256"],
+                "shards": sorted(manifest["shards"], key=lambda item: item["path"]),
+                "normalization_sha256": manifest["normalization"]["sha256"],
+            }
+        )
+        (output / "manifest.json").write_text(json.dumps(manifest))
+
+        with self.assertRaisesRegex(ValueError, "duplicate window"):
+            PFNNShardDataset(output, "train")
+        with self.assertRaisesRegex(ValueError, "duplicate window"):
+            write_pfnn_dataset(
+                output,
+                [motion, idle],
+                source_roots=_source_roots(),
+                source_records=_source_records([motion, idle]),
+                rejection_counts={"invalid_phase": 2},
+                max_windows_per_shard=2,
+                resume=True,
+            )
+
+    def test_lane_tampering_fails_loader_and_resume(self) -> None:
+        output = self.root / "dataset"
+        manifest = self._write(output, self.windows)
+        record = manifest["shards"][0]
+        shard = output / record["path"]
+        with np.load(shard, allow_pickle=False) as data:
+            arrays = {name: np.asarray(data[name]) for name in data.files}
+        arrays["sequence_lane"][0] = "idle_phase_7"
+        shard.write_bytes(_deterministic_npz_bytes(arrays))
+
+        with self.assertRaisesRegex(ValueError, "shard hash"):
+            PFNNShardDataset(output, "train")
+        with self.assertRaisesRegex(ValueError, "shard hash"):
+            write_pfnn_dataset(
+                output,
+                self.windows,
+                source_roots=_source_roots(),
+                source_records=_source_records(self.windows),
+                rejection_counts={"invalid_phase": 2},
+                max_windows_per_shard=2,
+                resume=True,
+            )
+
+    def test_missing_lane_field_fails_loader_and_resume(self) -> None:
+        output = self.root / "dataset"
+        manifest = self._write(output, self.windows)
+        record = manifest["shards"][0]
+        shard = output / record["path"]
+        with np.load(shard, allow_pickle=False) as data:
+            arrays = {name: np.asarray(data[name]) for name in data.files}
+        del arrays["sequence_lane"]
+        shard.write_bytes(_deterministic_npz_bytes(arrays))
+        record["sha256"] = hashlib.sha256(shard.read_bytes()).hexdigest()
+        manifest["dataset_digest_sha256"] = canonical_json_sha256(
+            {
+                "source_set_digest_sha256": manifest["source_set_digest_sha256"],
+                "shards": sorted(manifest["shards"], key=lambda item: item["path"]),
+                "normalization_sha256": manifest["normalization"]["sha256"],
+            }
+        )
+        (output / "manifest.json").write_text(json.dumps(manifest))
+
+        with self.assertRaisesRegex(ValueError, "shard fields"):
+            PFNNShardDataset(output, "train")
+        with self.assertRaisesRegex(ValueError, "invalid shard"):
+            write_pfnn_dataset(
+                output,
+                self.windows,
+                source_roots=_source_roots(),
+                source_records=_source_records(self.windows),
+                rejection_counts={"invalid_phase": 2},
+                max_windows_per_shard=2,
+                resume=True,
+            )
+
+    def test_v1_schema_fails_before_shards_are_opened(self) -> None:
+        output = self.root / "dataset"
+        manifest = self._write(output, self.windows)
+        manifest["schema"] = "mm-sonic-terrain-pfnn-dataset/v1"
+        (output / "manifest.json").write_text(json.dumps(manifest))
+
+        with patch(
+            "mm_sonic.terrain_pfnn.dataset.np.load",
+            side_effect=AssertionError("old schema opened a shard"),
+        ) as load:
+            with self.assertRaisesRegex(ValueError, "schema"):
+                PFNNShardDataset(output, "train")
+            load.assert_not_called()
+        with patch(
+            "mm_sonic.build_terrain_pfnn_dataset._validate_resume_files",
+            side_effect=AssertionError("old schema opened a shard"),
+        ) as validate_files:
+            with self.assertRaisesRegex(ValueError, "schema"):
+                write_pfnn_dataset(
+                    output,
+                    self.windows,
+                    source_roots=_source_roots(),
+                    source_records=_source_records(self.windows),
+                    rejection_counts={"invalid_phase": 2},
+                    max_windows_per_shard=2,
+                    resume=True,
+                )
+            validate_files.assert_not_called()
 
     def test_source_set_digest_is_stable_across_absolute_root_relocation(self) -> None:
         first = self.root / "first"
@@ -323,7 +487,12 @@ class TerrainPFNNDatasetTest(unittest.TestCase):
         second = self.root / "second"
         self._write(first, self.windows)
         changed = [
-            _window(window.clip_id, 1.0e6, window.center_frame)
+            _window(
+                window.clip_id,
+                1.0e6,
+                window.center_frame,
+                sequence_lane=window.sequence_lane,
+            )
             if window.split == "test"
             else window
             for window in self.windows
@@ -398,6 +567,7 @@ class TerrainPFNNDatasetTest(unittest.TestCase):
         self.assertEqual(sample["clip_id"], "walk1_subject1")
         self.assertEqual(sample["split_identity"], "walk1_subject1")
         self.assertEqual(sample["split"], "train")
+        self.assertEqual(sample["sequence_lane"], "motion")
         self.assertEqual(sample["terrain_class"], "flat")
         np.testing.assert_array_equal(
             sample["y"][OUTPUT_LAYOUT["contact_logit"]], (0.0, 1.0, 1.0, 0.0)

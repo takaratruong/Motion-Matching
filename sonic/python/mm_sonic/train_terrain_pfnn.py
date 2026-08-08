@@ -43,6 +43,7 @@ from mm_sonic.terrain_pfnn.training import (
 
 
 _TERRAIN_CLASSES = ("flat", "ascent", "descent", "transition")
+_SEQUENCE_LANES = ("motion", *(f"idle_phase_{index}" for index in range(8)))
 _PIPELINE_KNOWN_TERRAIN_IDENTITY = "slope_001"
 
 
@@ -385,6 +386,7 @@ def consecutive_overfit_subset(
         row_split = sample.get("split")
         center = sample.get("center_frame")
         terrain_class = str(sample.get("terrain_class", ""))
+        sequence_lane = sample.get("sequence_lane")
         if (
             not clip
             or not identity
@@ -392,6 +394,7 @@ def consecutive_overfit_subset(
             or type(center) is not int
             or center < 0
             or terrain_class not in _TERRAIN_CLASSES
+            or sequence_lane not in _SEQUENCE_LANES
             or terrain_identity(clip) != identity
             or split_identity(identity) != "train"
         ):
@@ -469,19 +472,24 @@ def fitted_subset_metadata(
         raise ValueError("fitted subset receipt must describe training rows")
     rows: list[dict[str, object]] = []
     counts = {name: 0 for name in _TERRAIN_CLASSES}
-    seen: set[tuple[str, int]] = set()
+    seen: set[tuple[str, int, str]] = set()
     for raw_index in indices:
         sample = dataset[int(raw_index)]
         clip = str(sample.get("clip_id", ""))
         center = sample.get("center_frame")
         terrain_class = str(sample.get("terrain_class", ""))
         identity = str(sample.get("split_identity", ""))
-        key = (clip, center) if type(center) is int else (clip, -1)
+        sequence_lane = sample.get("sequence_lane")
+        key = (
+            (clip, center, str(sequence_lane))
+            if type(center) is int else (clip, -1, str(sequence_lane))
+        )
         if (
             not clip
             or type(center) is not int
             or center < 0
             or terrain_class not in counts
+            or sequence_lane not in _SEQUENCE_LANES
             or sample.get("split") != "train"
             or terrain_identity(clip) != identity
             or split_identity(identity) != "train"
@@ -494,6 +502,7 @@ def fitted_subset_metadata(
             "clip_id": clip,
             "center_frame": center,
             "split_identity": identity,
+            "sequence_lane": sequence_lane,
             "terrain_class": terrain_class,
             "row_sha256": fitted_row_sha256(sample),
         })

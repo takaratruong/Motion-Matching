@@ -32,7 +32,8 @@ from .layout import (
 from .model import PhaseFunctionedNetwork
 
 
-CHECKPOINT_SCHEMA = "mm-sonic-terrain-pfnn-checkpoint/v4"
+CHECKPOINT_SCHEMA = "mm-sonic-terrain-pfnn-checkpoint/v5"
+_SEQUENCE_LANES = ("motion", *(f"idle_phase_{index}" for index in range(8)))
 _NORMALIZATION_CONTRACT = {
     "continuous_loss_domain": "normalized",
     "contact_loss_domain": "raw_logits_binary_labels",
@@ -399,6 +400,7 @@ def fitted_row_sha256(sample: Mapping[str, object]) -> str:
             "center_frame": sample["center_frame"],
             "split_identity": sample["split_identity"],
             "split": sample["split"],
+            "sequence_lane": sample["sequence_lane"],
             "terrain_class": sample["terrain_class"],
         }
     except (KeyError, TypeError, ValueError) as error:
@@ -416,11 +418,12 @@ def fitted_row_sha256(sample: Mapping[str, object]) -> str:
         or type(provenance["split_identity"]) is not str
         or not provenance["split_identity"]
         or provenance["split"] != "train"
+        or provenance["sequence_lane"] not in _SEQUENCE_LANES
         or provenance["terrain_class"]
         not in ("flat", "ascent", "descent", "transition")
     ):
         raise ValueError("fitted row receipt source is invalid")
-    digest = hashlib.sha256(b"mm-sonic-fitted-pfnn-row/v1\0")
+    digest = hashlib.sha256(b"mm-sonic-fitted-pfnn-row/v2\0")
     digest.update(
         json.dumps(
             provenance, sort_keys=True, separators=(",", ":"), allow_nan=False
@@ -472,6 +475,7 @@ def choose_runtime_seed(
             or type(center) is not int
             or center < 0
             or sample.get("split") != "train"
+            or sample.get("sequence_lane") not in _SEQUENCE_LANES
         ):
             raise ValueError("runtime seed fitted row provenance is invalid")
         rows.setdefault((clip, center), []).append((index, sample))
@@ -486,6 +490,8 @@ def choose_runtime_seed(
             continue
         physical_target = np.asarray(sample["y"], dtype=np.float64) * y_std + y_mean
         predecessor = predecessor_entry[1]
+        if predecessor.get("sequence_lane") != sample.get("sequence_lane"):
+            continue
         predecessor_physical = (
             np.asarray(predecessor["y"], dtype=np.float64) * y_std + y_mean
         )
@@ -616,8 +622,10 @@ def choose_runtime_seed(
             "provenance": {
                 "predecessor_clip_id": str(predecessor["clip_id"]),
                 "predecessor_center_frame": int(predecessor["center_frame"]),
+                "predecessor_sequence_lane": str(predecessor["sequence_lane"]),
                 "first_fitted_clip_id": clip,
                 "first_fitted_center_frame": center,
+                "first_fitted_sequence_lane": str(first_fitted["sequence_lane"]),
                 "speed": speed,
                 "predecessor_row_sha256": fitted_row_sha256(predecessor),
                 "first_fitted_row_sha256": fitted_row_sha256(first_fitted),
@@ -746,8 +754,10 @@ def finite_runtime_seed() -> dict[str, object]:
         "provenance": {
             "predecessor_clip_id": "synthetic",
             "predecessor_center_frame": 0,
+            "predecessor_sequence_lane": "motion",
             "first_fitted_clip_id": "synthetic",
             "first_fitted_center_frame": 1,
+            "first_fitted_sequence_lane": "motion",
             "speed": 0.0,
             "predecessor_row_sha256": "0" * 64,
             "first_fitted_row_sha256": "0" * 64,
@@ -791,13 +801,20 @@ def _validate_runtime_seed(
                 type(value) is not dict
                 or set(value) != {
                     "predecessor_clip_id", "predecessor_center_frame",
-                    "first_fitted_clip_id", "first_fitted_center_frame", "speed",
+                    "predecessor_sequence_lane", "first_fitted_clip_id",
+                    "first_fitted_center_frame", "first_fitted_sequence_lane", "speed",
                     "predecessor_row_sha256", "first_fitted_row_sha256",
                     "fitted_subset_rows_sha256",
                 }
                 or any(
                     type(value[name]) is not str or not value[name]
                     for name in ("predecessor_clip_id", "first_fitted_clip_id")
+                )
+                or any(
+                    value[name] not in _SEQUENCE_LANES
+                    for name in (
+                        "predecessor_sequence_lane", "first_fitted_sequence_lane"
+                    )
                 )
                 or any(
                     type(value[name]) is not int or value[name] < 0
@@ -825,8 +842,10 @@ def _validate_runtime_seed(
             output[name] = {
                 "predecessor_clip_id": value["predecessor_clip_id"],
                 "predecessor_center_frame": value["predecessor_center_frame"],
+                "predecessor_sequence_lane": value["predecessor_sequence_lane"],
                 "first_fitted_clip_id": value["first_fitted_clip_id"],
                 "first_fitted_center_frame": value["first_fitted_center_frame"],
+                "first_fitted_sequence_lane": value["first_fitted_sequence_lane"],
                 "speed": float(value["speed"]),
                 "predecessor_row_sha256": value["predecessor_row_sha256"],
                 "first_fitted_row_sha256": value["first_fitted_row_sha256"],
@@ -900,13 +919,13 @@ def _validated_fitted_subset(value: object) -> dict[str, object] | None:
     ):
         raise ValueError("checkpoint fitted subset is invalid")
     checked_rows: list[dict[str, object]] = []
-    seen: set[tuple[str, int]] = set()
+    seen: set[tuple[str, int, str]] = set()
     for row in rows:
         if (
             type(row) is not dict
             or set(row) != {
-                "clip_id", "center_frame", "split_identity", "terrain_class",
-                "row_sha256",
+                "clip_id", "center_frame", "split_identity", "sequence_lane",
+                "terrain_class", "row_sha256",
             }
             or type(row["clip_id"]) is not str
             or not row["clip_id"]
@@ -914,19 +933,21 @@ def _validated_fitted_subset(value: object) -> dict[str, object] | None:
             or row["center_frame"] < 0
             or type(row["split_identity"]) is not str
             or not row["split_identity"]
+            or row["sequence_lane"] not in _SEQUENCE_LANES
             or row["terrain_class"] not in counts
             or type(row["row_sha256"]) is not str
             or len(row["row_sha256"]) != 64
             or any(character not in "0123456789abcdef" for character in row["row_sha256"])
         ):
             raise ValueError("checkpoint fitted subset is invalid")
-        key = (row["clip_id"], row["center_frame"])
+        key = (row["clip_id"], row["center_frame"], row["sequence_lane"])
         if key in seen:
             raise ValueError("checkpoint fitted subset is invalid")
         seen.add(key)
         checked_rows.append({
             "clip_id": key[0],
             "center_frame": key[1],
+            "sequence_lane": key[2],
             "split_identity": row["split_identity"],
             "terrain_class": row["terrain_class"],
             "row_sha256": row["row_sha256"],
@@ -961,25 +982,33 @@ def validate_runtime_seed_fitted_subset(
     predecessor_key = (
         provenance.get("predecessor_clip_id"),
         provenance.get("predecessor_center_frame"),
+        provenance.get("predecessor_sequence_lane"),
     )
     first_key = (
         provenance.get("first_fitted_clip_id"),
         provenance.get("first_fitted_center_frame"),
+        provenance.get("first_fitted_sequence_lane"),
     )
     if (
         type(predecessor_key[0]) is not str
         or type(predecessor_key[1]) is not int
         or type(first_key[0]) is not str
         or type(first_key[1]) is not int
+        or predecessor_key[2] not in _SEQUENCE_LANES
+        or first_key[2] not in _SEQUENCE_LANES
     ):
         raise ValueError("runtime seed fitted subset membership is invalid")
     rows = {
-        (row["clip_id"], row["center_frame"]): row
+        (row["clip_id"], row["center_frame"], row["sequence_lane"]): row
         for row in checked_subset["rows"]
     }
     if predecessor_key not in rows or first_key not in rows:
         raise ValueError("runtime seed fitted subset membership mismatch")
-    if predecessor_key[0] != first_key[0] or predecessor_key[1] + 1 != first_key[1]:
+    if (
+        predecessor_key[0] != first_key[0]
+        or predecessor_key[1] + 1 != first_key[1]
+        or predecessor_key[2] != first_key[2]
+    ):
         raise ValueError("runtime seed fitted rows are not adjacent")
     if (
         provenance.get("predecessor_row_sha256")
