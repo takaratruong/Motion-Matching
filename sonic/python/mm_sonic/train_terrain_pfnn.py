@@ -47,6 +47,112 @@ _SEQUENCE_LANES = ("motion", *(f"idle_phase_{index}" for index in range(8)))
 _PIPELINE_KNOWN_TERRAIN_IDENTITY = "slope_001"
 
 
+class DeterministicSequenceSampler:
+    """Draw deterministic sequence permutations without replacement."""
+
+    def __init__(
+        self,
+        sequence_count: int,
+        *,
+        batch_size: int,
+        seed: int,
+        rank: int = 0,
+        world_size: int = 1,
+    ) -> None:
+        if (
+            type(sequence_count) is not int
+            or sequence_count < 1
+            or type(batch_size) is not int
+            or batch_size < 1
+            or type(seed) is not int
+            or type(rank) is not int
+            or type(world_size) is not int
+            or world_size < 1
+            or rank < 0
+            or rank >= world_size
+        ):
+            raise ValueError("deterministic sequence sampler configuration is invalid")
+        self.sequence_count = sequence_count
+        self.batch_size = batch_size
+        self.seed = seed
+        self.rank = rank
+        self.world_size = world_size
+        self.permutation_number = 0
+        self.cursor = 0
+        self._permutation = self._make_permutation(self.permutation_number)
+
+    def _make_permutation(self, permutation_number: int) -> list[int]:
+        permutation = list(range(self.sequence_count))
+        generator = random.Random(
+            self.seed + 1_000_003 * int(permutation_number)
+        )
+        generator.shuffle(permutation)
+        return permutation
+
+    def _begin_next_permutation(self) -> None:
+        self.permutation_number += 1
+        self.cursor = 0
+        self._permutation = self._make_permutation(self.permutation_number)
+
+    def _draw_global(self, count: int) -> tuple[int, ...]:
+        output: list[int] = []
+        while len(output) < count:
+            remaining = self.sequence_count - self.cursor
+            take = min(count - len(output), remaining)
+            output.extend(self._permutation[self.cursor : self.cursor + take])
+            self.cursor += take
+            if self.cursor == self.sequence_count:
+                self._begin_next_permutation()
+        return tuple(output)
+
+    def next_batch(self) -> tuple[int, ...]:
+        """Return this rank's strided partition of the next global batch."""
+
+        global_batch = self._draw_global(self.batch_size * self.world_size)
+        return global_batch[self.rank :: self.world_size]
+
+    def state_dict(self) -> dict[str, object]:
+        return {
+            "seed": self.seed,
+            "sequence_count": self.sequence_count,
+            "permutation_number": self.permutation_number,
+            "permutation": list(self._permutation),
+            "cursor": self.cursor,
+        }
+
+    def load_state_dict(self, value: object) -> None:
+        expected_keys = {
+            "seed",
+            "sequence_count",
+            "permutation_number",
+            "permutation",
+            "cursor",
+        }
+        if type(value) is not dict or set(value) != expected_keys:
+            raise ValueError("sequence sampler state fields are invalid")
+        permutation_number = value["permutation_number"]
+        cursor = value["cursor"]
+        permutation = value["permutation"]
+        if (
+            type(value["seed"]) is not int
+            or value["seed"] != self.seed
+            or type(value["sequence_count"]) is not int
+            or value["sequence_count"] != self.sequence_count
+            or type(permutation_number) is not int
+            or permutation_number < 0
+            or type(cursor) is not int
+            or cursor < 0
+            or cursor >= self.sequence_count
+            or type(permutation) is not list
+            or any(type(index) is not int for index in permutation)
+            or permutation != self._make_permutation(permutation_number)
+        ):
+            raise ValueError("sequence sampler state is invalid")
+        self.permutation_number = permutation_number
+        self.cursor = cursor
+        self._permutation = list(permutation)
+
+
 def overfit_gate_accepted(initial: float, final: float, ratio: float) -> bool:
     values = (float(initial), float(final), float(ratio))
     if any(not math.isfinite(value) for value in values) or values[0] <= 0.0:
@@ -363,7 +469,7 @@ def consecutive_overfit_subset(
     dataset: object,
     count: int,
     *,
-    required_seed_key: tuple[str, int] | None = None,
+    required_seed_key: tuple[str, str, int] | None = None,
     known_terrain_identity: str | None = None,
 ) -> list[int]:
     """Select source-sealed consecutive GRAIL slope runs for pipeline overfit.
@@ -378,7 +484,9 @@ def consecutive_overfit_subset(
         raise ValueError("overfit subset may only be selected from training data")
     if type(count) is not int or count < 1 or count > len(dataset):
         raise ValueError("overfit subset count is outside the dataset")
-    grouped: dict[str, dict[str, dict[int, list[tuple[int, str]]]]] = {}
+    grouped: dict[
+        str, dict[str, dict[str, dict[int, list[tuple[int, str]]]]]
+    ] = {}
     for index in range(len(dataset)):
         sample = dataset[index]
         clip = str(sample.get("clip_id", ""))
@@ -400,34 +508,39 @@ def consecutive_overfit_subset(
         ):
             raise ValueError("overfit subset row provenance is not source sealed")
         grouped.setdefault(identity, {}).setdefault(clip, {}).setdefault(
-            center, []
-        ).append((index, terrain_class))
+            str(sequence_lane), {}
+        ).setdefault(center, []).append((index, terrain_class))
 
-    all_runs: list[tuple[str, str, list[int]]] = []
+    all_runs: list[tuple[str, str, str, list[int]]] = []
     for identity in sorted(grouped):
         for clip in sorted(grouped[identity]):
-            by_center = grouped[identity][clip]
-            unique = sorted(center for center, rows in by_center.items() if len(rows) == 1)
-            runs: list[list[int]] = []
-            for center in unique:
-                if not runs or center != runs[-1][-1] + 1:
-                    runs.append([center])
-                else:
-                    runs[-1].append(center)
-            all_runs.extend((identity, clip, run) for run in runs)
+            for lane in sorted(grouped[identity][clip]):
+                by_center = grouped[identity][clip][lane]
+                unique = sorted(
+                    center for center, rows in by_center.items() if len(rows) == 1
+                )
+                runs: list[list[int]] = []
+                for center in unique:
+                    if not runs or center != runs[-1][-1] + 1:
+                        runs.append([center])
+                    else:
+                        runs[-1].append(center)
+                all_runs.extend((identity, clip, lane, run) for run in runs)
 
     ordered_runs = list(all_runs)
     if required_seed_key is not None:
-        seed_clip, seed_center = required_seed_key
+        seed_clip, seed_lane, seed_center = required_seed_key
         anchors = [
             run for run in all_runs
-            if run[1] == seed_clip and seed_center in run[2]
-            and seed_center - 1 in run[2]
+            if run[1] == seed_clip
+            and run[2] == seed_lane
+            and seed_center in run[3]
+            and seed_center - 1 in run[3]
         ]
         if len(anchors) != 1:
             raise ValueError("required runtime seed is not in one unique fitted run")
         anchor = anchors[0]
-        if len(anchor[2]) > count:
+        if len(anchor[3]) > count:
             raise ValueError("requested subset cannot contain the complete seed run")
         terrain_runs = [
             run for run in all_runs
@@ -443,8 +556,8 @@ def consecutive_overfit_subset(
 
     selected: list[int] = []
     selected_classes: list[str] = []
-    for identity, clip, run in ordered_runs:
-        by_center = grouped[identity][clip]
+    for identity, clip, lane, run in ordered_runs:
+        by_center = grouped[identity][clip][lane]
         for center in run:
             index, terrain_class = by_center[center][0]
             selected.append(index)
@@ -652,47 +765,52 @@ def _consecutive_starts(
         raise ValueError("rollout fine-tuning requires at least two frames")
     if getattr(dataset, "split", None) != "train":
         raise ValueError("rollout sequences require the training split")
-    grouped: dict[str, dict[int, list[tuple[int, str]]]] = {}
+    grouped: dict[tuple[str, str], dict[int, tuple[int, str]]] = {}
     identities: dict[str, str] = {}
     for index in range(len(dataset)):
         sample = dataset[index]
-        clip = str(sample["clip_id"])
-        center = int(sample["center_frame"])
-        terrain_class = str(sample["terrain_class"])
-        identity = str(sample["split_identity"])
+        clip = sample.get("clip_id")
+        center = sample.get("center_frame")
+        terrain_class = sample.get("terrain_class")
+        identity = sample.get("split_identity")
+        lane = sample.get("sequence_lane")
         if (
-            not clip
+            type(clip) is not str
+            or not clip
+            or type(center) is not int
             or center < 0
             or terrain_class not in _TERRAIN_CLASSES
+            or type(identity) is not str
             or not identity
+            or lane not in _SEQUENCE_LANES
             or sample.get("split") != "train"
             or identity != terrain_identity(clip)
             or split_identity(identity) != "train"
         ):
-            raise ValueError("rollout sequence split/identity metadata is invalid")
+            raise ValueError(
+                "rollout sequence split/identity/lane metadata is invalid"
+            )
         previous_identity = identities.setdefault(clip, identity)
         if previous_identity != identity:
             raise ValueError("rollout sequence split/identity mismatch")
-        clip_rows = grouped.setdefault(clip, {})
-        clip_rows.setdefault(center, []).append((index, terrain_class))
+        lane_rows = grouped.setdefault((clip, str(lane)), {})
+        if center in lane_rows:
+            raise ValueError("duplicate rollout sequence clip/lane/center")
+        lane_rows[center] = (index, str(terrain_class))
     sequences: list[tuple[int, ...]] = []
     classes: list[str] = []
-    for clip in sorted(grouped):
-        clip_rows = {
-            center: rows[0]
-            for center, rows in grouped[clip].items()
-            if len(rows) == 1
-        }
-        centers = sorted(clip_rows)
+    for key in sorted(grouped):
+        lane_rows = grouped[key]
+        centers = sorted(lane_rows)
         for start in range(len(centers) - frames + 1):
             window = centers[start : start + frames]
             if any(
                 right != left + 1 for left, right in zip(window, window[1:])
             ):
                 continue
-            indices = tuple(clip_rows[center][0] for center in window)
+            indices = tuple(lane_rows[center][0] for center in window)
             sequences.append(indices)
-            classes.append(clip_rows[window[0]][1])
+            classes.append(lane_rows[window[0]][1])
     if not sequences:
         raise ValueError("training split has no consecutive rollout sequences")
     return sequences, classes
@@ -721,6 +839,8 @@ def train(
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError("dataset manifest is missing or invalid") from error
     train_dataset = PFNNShardDataset(root, "train")
+    phase_q99 = training_phase_advance_q99(train_dataset)
+    phase_advance_cap = min(math.pi, 1.5 * phase_q99)
     terrain_classes = _terrain_classes(train_dataset)
     all_indices = list(range(len(train_dataset)))
     kinematics = TorchG1ForwardKinematics.from_mjcf(arguments.model_path).to(device)
@@ -738,6 +858,7 @@ def train(
                 arguments.overfit_samples,
                 required_seed_key=(
                     str(seed_preview["provenance"]["first_fitted_clip_id"]),
+                    str(seed_preview["provenance"]["first_fitted_sequence_lane"]),
                     int(seed_preview["provenance"]["first_fitted_center_frame"]),
                 ),
                 known_terrain_identity=_PIPELINE_KNOWN_TERRAIN_IDENTITY,
@@ -758,6 +879,12 @@ def train(
         optimization_classes = terrain_classes
         optimization_indices = candidate_indices
 
+    runtime_seed = choose_runtime_seed(
+        optimization_dataset,
+        kinematics.joint_limits.detach().cpu(),
+        fitted_subset=fitted_receipt if pipeline_overfit else None,
+    )
+
     torch.manual_seed(arguments.seed)
     model: torch.nn.Module = PhaseFunctionedNetwork(
         hidden_size=arguments.hidden_size, dropout_probability=0.30
@@ -772,6 +899,7 @@ def train(
     )
     restored_step, restored_epoch = 0, 0
     restored_sampler_epoch, restored_sampler_global_offset = 0, 0
+    restored_sequence_sampler_state: dict[str, object] | None = None
     if arguments.resume is not None:
         resumed = load_checkpoint(
             arguments.resume,
@@ -789,6 +917,7 @@ def train(
         )
         restored_sampler_epoch = resumed.sampler_epoch
         restored_sampler_global_offset = resumed.sampler_global_offset
+        restored_sequence_sampler_state = resumed.sequence_sampler_state
         if arguments.seed != resumed.seed:
             raise ValueError("resume checkpoint seed mismatch")
         if restored_step > 0 and restored_epoch != restored_sampler_epoch + 1:
@@ -944,37 +1073,65 @@ def train(
         else math.isfinite(float(gate_metrics["one_step_score"]))
     )
 
+    sequence_sampler_state = restored_sequence_sampler_state
     if arguments.rollout_finetune_frames:
         if not one_step_accepted:
             raise RuntimeError("rollout fine-tuning requires a passing one-step gate")
         rollout_dataset = optimization_dataset if pipeline_overfit else train_dataset
-        sequences, sequence_classes = _consecutive_starts(
+        sequences, _ = _consecutive_starts(
             rollout_dataset, arguments.rollout_finetune_frames
         )
-        sequence_candidates = list(range(len(sequences)))
-        rollout_steps = (
+        seed_key = (
+            runtime_seed["provenance"]["first_fitted_clip_id"],
+            runtime_seed["provenance"]["first_fitted_sequence_lane"],
+            runtime_seed["provenance"]["first_fitted_center_frame"],
+        )
+        sixteen_frame_sequences, _ = _consecutive_starts(rollout_dataset, 16)
+
+        def sequence_key(sequence: tuple[int, ...]) -> tuple[object, object, object]:
+            first = rollout_dataset[sequence[0]]
+            return (
+                first["clip_id"],
+                first["sequence_lane"],
+                first["center_frame"],
+            )
+
+        if sum(
+            sequence_key(sequence) == seed_key
+            for sequence in sixteen_frame_sequences
+        ) != 1:
+            raise RuntimeError(
+                "runtime seed sixteen-frame sequence is missing from rollout discovery"
+            )
+        seed_sequence_matches = [
+            index
+            for index, sequence in enumerate(sequences)
+            if sequence_key(sequence) == seed_key
+        ]
+        if len(seed_sequence_matches) != 1:
+            raise RuntimeError("runtime seed sequence is missing from rollout discovery")
+        sequence_sampler = DeterministicSequenceSampler(
+            len(sequences),
+            batch_size=arguments.batch_size,
+            seed=arguments.seed + 97,
+            rank=rank,
+            world_size=world_size,
+        )
+        if restored_sequence_sampler_state is not None:
+            sequence_sampler.load_state_dict(restored_sequence_sampler_state)
+        elif seed_sequence_matches[0] not in sequence_sampler.state_dict()["permutation"]:
+            raise RuntimeError("runtime seed sequence is missing from first sampler pass")
+        requested_rollout_steps = (
             arguments.rollout_finetune_steps
             if arguments.rollout_finetune_steps is not None
             else arguments.steps
         )
-        for rollout_step in range(rollout_steps):
-            global_sequences = (
-                _balanced_epoch_indices(
-                    sequence_candidates,
-                    sequence_classes,
-                    seed=arguments.seed + 97,
-                    epoch=rollout_step,
-                )
-                if rank == 0 else None
-            )
-            global_sequences = _broadcast_indices(global_sequences, device)
-            rank_sequences, _ = _padded_rank_epoch(
-                global_sequences,
-                batch_size=arguments.batch_size,
-                rank=rank,
-                world_size=world_size,
-            )
-            chosen = rank_sequences[: arguments.batch_size]
+        first_pass_steps = math.ceil(
+            len(sequences) / (arguments.batch_size * world_size)
+        )
+        rollout_steps = max(requested_rollout_steps, first_pass_steps)
+        for _ in range(rollout_steps):
+            chosen = sequence_sampler.next_batch()
             rows = [
                 [rollout_dataset[index] for index in sequences[item]]
                 for item in chosen
@@ -997,6 +1154,7 @@ def train(
                 phases,
                 targets,
                 normalization=train_dataset,
+                phase_advance_cap=phase_advance_cap,
                 kinematics=kinematics,
                 loss_weights=DEFAULT_LOSS_WEIGHTS,
             )
@@ -1043,6 +1201,7 @@ def train(
                         "wall_time_seconds": time.monotonic() - started,
                     },
                 )
+        sequence_sampler_state = sequence_sampler.state_dict()
         gate_metrics = one_step_metrics(
             model,
             evaluation_dataset,
@@ -1096,12 +1255,6 @@ def train(
     dataset_digest = manifest["dataset_digest_sha256"]
     train_identities = manifest["split_identities"]["train"]
     validation_identities = manifest["split_identities"]["validation"]
-    phase_q99 = training_phase_advance_q99(train_dataset)
-    runtime_seed = choose_runtime_seed(
-        train_dataset,
-        kinematics.joint_limits.detach().cpu(),
-        fitted_subset=fitted_receipt if pipeline_overfit else None,
-    )
     closed_loop_result: ClosedLoopValidationResult | None = None
     if pipeline_overfit:
         promote_best = False
@@ -1146,6 +1299,7 @@ def train(
         selection=selection,
         sampler_epoch=max(0, epoch - 1),
         sampler_global_offset=local_offset * world_size,
+        sequence_sampler_state=sequence_sampler_state,
         fitted_subset=fitted_receipt,
     )
     load_checkpoint(

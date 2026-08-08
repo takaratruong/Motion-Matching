@@ -27,8 +27,16 @@ from mm_sonic.train_terrain_pfnn import (
     stratified_subset,
 )
 from mm_sonic.terrain_pfnn.dataset import normalize_pfnn_input, pfnn_input_sha256
-from mm_sonic.terrain_pfnn.layout import INPUT_LAYOUT, OUTPUT_LAYOUT
+from mm_sonic.terrain_pfnn.layout import INPUT_LAYOUT, OUTPUT_LAYOUT, TRAJECTORY_TIMES_S
 from mm_sonic.terrain_pfnn.model import PhaseFunctionedNetwork
+from mm_sonic.terrain_pfnn.recurrence import (
+    PlannedTrajectory,
+    advance_recurrent_state,
+    derive_training_desired_velocity,
+    initialize_recurrent_state,
+    pack_recurrent_input,
+    plan_recurrent_trajectory,
+)
 from mm_sonic.terrain_pfnn.training import (
     CHECKPOINT_SCHEMA,
     DEFAULT_LOSS_WEIGHTS,
@@ -56,6 +64,221 @@ def _normalization() -> dict[str, np.ndarray]:
 
 
 class TerrainPFNNTrainingTests(unittest.TestCase):
+    def test_three_step_rollout_matches_shared_runtime_recurrence_and_gradient(self) -> None:
+        dtype = torch.float64
+        normal = {
+            "x_mean": np.linspace(-0.4, 0.6, INPUT_LAYOUT.size, dtype=np.float64),
+            "x_std": np.linspace(0.7, 1.3, INPUT_LAYOUT.size, dtype=np.float64),
+            "y_mean": np.linspace(-0.3, 0.5, OUTPUT_LAYOUT.size, dtype=np.float64),
+            "y_std": np.linspace(0.8, 1.4, OUTPUT_LAYOUT.size, dtype=np.float64),
+        }
+        normal["y_mean"][OUTPUT_LAYOUT["contact_logit"]] = 0.0
+        normal["y_std"][OUTPUT_LAYOUT["contact_logit"]] = 1.0
+        x_mean = torch.as_tensor(normal["x_mean"], dtype=dtype)
+        x_std = torch.as_tensor(normal["x_std"], dtype=dtype)
+        y_mean = torch.as_tensor(normal["y_mean"], dtype=dtype)
+        y_std = torch.as_tensor(normal["y_std"], dtype=dtype)
+
+        raw_inputs = torch.zeros((3, 1, INPUT_LAYOUT.size), dtype=dtype)
+        times = torch.as_tensor(TRAJECTORY_TIMES_S, dtype=dtype)
+        for step in range(3):
+            trajectory = raw_inputs[
+                step, :, INPUT_LAYOUT["trajectory_position"]
+            ].reshape(1, 12, 2)
+            trajectory[..., 0] = (0.18 + 0.04 * step) * times
+            trajectory[..., 1] = 0.01 * step * times.square()
+            direction = raw_inputs[
+                step, :, INPUT_LAYOUT["trajectory_direction"]
+            ].reshape(1, 12, 2)
+            direction[..., 0] = 1.0
+            terrain = raw_inputs[
+                step, :, INPUT_LAYOUT["terrain_height"]
+            ].reshape(1, 12, 3)
+            terrain[..., 0] = 0.02 * step
+            terrain[..., 1] = torch.linspace(-0.03, 0.04, 12, dtype=dtype)
+            semantic = raw_inputs[
+                step, :, INPUT_LAYOUT["semantic_intent"]
+            ].reshape(1, 12, 2)
+            semantic[..., 1] = 1.0
+            raw_inputs[
+                step, :, INPUT_LAYOUT["previous_body_position"]
+            ] = 0.03 * (step + 1)
+            raw_inputs[
+                step, :, INPUT_LAYOUT["previous_body_velocity"]
+            ] = -0.02 * (step + 1)
+        normalized_inputs = (raw_inputs - x_mean) / x_std
+        for field in ("previous_body_position", "previous_body_velocity"):
+            normalized_inputs[..., INPUT_LAYOUT[field]] *= 0.1
+
+        class DeterministicPFNN(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                for name, value in zip(
+                    ("W0", "b0", "W1", "b1", "W2", "b2"),
+                    (0.07, 0.01, -0.02, 0.03, -0.01, 0.02),
+                ):
+                    setattr(
+                        self,
+                        name,
+                        torch.nn.Parameter(torch.tensor((value,), dtype=dtype)),
+                    )
+                base = torch.zeros(OUTPUT_LAYOUT.size, dtype=dtype)
+                base[OUTPUT_LAYOUT["trajectory_direction"]] = torch.tensor(
+                    (1.0, 0.0), dtype=dtype
+                ).repeat(12)
+                base[OUTPUT_LAYOUT["body_position"]] = 0.12
+                base[OUTPUT_LAYOUT["body_velocity"]] = -0.04
+                base[OUTPUT_LAYOUT["root_height"]] = 0.72
+                base[OUTPUT_LAYOUT["root_planar_velocity"]] = torch.tensor(
+                    (0.24, 0.03), dtype=dtype
+                )
+                base[OUTPUT_LAYOUT["root_yaw_velocity"]] = 0.08
+                base[OUTPUT_LAYOUT["phase_advance"]] = 0.11
+                self.register_buffer("physical_base", base)
+
+            def forward(
+                self, normalized: torch.Tensor, phase: torch.Tensor
+            ) -> torch.Tensor:
+                body_start = INPUT_LAYOUT["previous_body_position"].start
+                signal = (
+                    self.W0 * normalized[:, body_start : body_start + 1]
+                    + self.b0 * phase[:, None]
+                )
+                physical = self.physical_base.expand(len(normalized), -1).clone()
+                physical[:, OUTPUT_LAYOUT["trajectory_position"]] += signal
+                physical[:, OUTPUT_LAYOUT["body_position"]] += signal
+                physical[:, OUTPUT_LAYOUT["body_velocity"]] -= 0.5 * signal
+                physical[:, OUTPUT_LAYOUT["root_planar_velocity"]] += signal
+                physical[:, OUTPUT_LAYOUT["root_yaw_velocity"]] += 0.25 * signal
+                physical[:, OUTPUT_LAYOUT["phase_advance"]] += 0.1 * signal
+                return (physical - y_mean) / y_std
+
+        model = DeterministicPFNN()
+        targets = torch.zeros((3, 1, OUTPUT_LAYOUT.size), dtype=dtype)
+        targets[..., OUTPUT_LAYOUT["contact_logit"]] = 1.0
+        initial_phase = torch.tensor((0.35,), dtype=dtype)
+        phase_cap = min(np.pi, 1.5 * 0.24)
+        result = autoregressive_unroll(
+            model,
+            normalized_inputs,
+            initial_phase,
+            targets,
+            normalization=normal,
+            phase_advance_cap=phase_cap,
+        )
+
+        first_raw = normalized_inputs[0].clone()
+        for field in ("previous_body_position", "previous_body_velocity"):
+            first_raw[:, INPUT_LAYOUT[field]] /= 0.1
+        first_raw = first_raw * x_std + x_mean
+        first_semantic = first_raw[:, INPUT_LAYOUT["semantic_intent"]].reshape(
+            1, 12, 2
+        )
+        first_raw[:, INPUT_LAYOUT["semantic_intent"]] = torch.nn.functional.one_hot(
+            torch.argmax(first_semantic, dim=-1), num_classes=2
+        ).to(dtype).reshape(1, -1)
+        state = initialize_recurrent_state(
+            trajectory_position_local=first_raw[
+                :, INPUT_LAYOUT["trajectory_position"]
+            ].reshape(1, 12, 2),
+            trajectory_direction_local=first_raw[
+                :, INPUT_LAYOUT["trajectory_direction"]
+            ].reshape(1, 12, 2),
+            semantic_intent=first_raw[
+                :, INPUT_LAYOUT["semantic_intent"]
+            ].reshape(1, 12, 2),
+            previous_body_position_local=first_raw[
+                :, INPUT_LAYOUT["previous_body_position"]
+            ].reshape(1, 30, 3),
+            previous_body_velocity_local=first_raw[
+                :, INPUT_LAYOUT["previous_body_velocity"]
+            ].reshape(1, 30, 3),
+            phase=initial_phase,
+            root_world_xy=torch.zeros((1, 2), dtype=dtype),
+            root_yaw_world=torch.zeros(1, dtype=dtype),
+        )
+        planned = PlannedTrajectory(
+            position_world_xy=state.predicted_position_world_xy,
+            direction_world_xy=state.predicted_direction_world_xy,
+            semantic_intent=first_raw[
+                :, INPUT_LAYOUT["semantic_intent"]
+            ].reshape(1, 12, 2),
+        )
+        direct_inputs = [normalized_inputs[0]]
+        direct_phases = [initial_phase]
+        cap = torch.full((1,), phase_cap, dtype=dtype)
+        for step, prediction in enumerate(result.predictions[:-1]):
+            physical_output = prediction * y_std + y_mean
+            state = advance_recurrent_state(
+                state,
+                planned,
+                physical_output,
+                phase_advance_cap=cap,
+            )
+            next_raw = normalized_inputs[step + 1].clone()
+            for field in ("previous_body_position", "previous_body_velocity"):
+                next_raw[:, INPUT_LAYOUT[field]] /= 0.1
+            next_raw = next_raw * x_std + x_mean
+            next_semantic = next_raw[:, INPUT_LAYOUT["semantic_intent"]].reshape(
+                1, 12, 2
+            )
+            next_raw[:, INPUT_LAYOUT["semantic_intent"]] = (
+                torch.nn.functional.one_hot(
+                    torch.argmax(next_semantic, dim=-1), num_classes=2
+                ).to(dtype).reshape(1, -1)
+            )
+            desired_velocity = derive_training_desired_velocity(
+                next_raw[:, INPUT_LAYOUT["trajectory_position"]].reshape(1, 12, 2),
+                next_raw[:, INPUT_LAYOUT["semantic_intent"]].reshape(1, 12, 2),
+                state.root_yaw_world,
+            )
+            planned = plan_recurrent_trajectory(state, desired_velocity)
+            direct_inputs.append(
+                pack_recurrent_input(
+                    state=state,
+                    planned=planned,
+                    terrain_height=next_raw[
+                        :, INPUT_LAYOUT["terrain_height"]
+                    ].reshape(1, 12, 3),
+                    x_mean=x_mean,
+                    x_std=x_std,
+                    body_scale=0.1,
+                )
+            )
+            direct_phases.append(state.phase)
+
+        for step, (trained, direct) in enumerate(zip(result.inputs, direct_inputs)):
+            for field in (
+                "trajectory_position",
+                "trajectory_direction",
+                "terrain_height",
+                "semantic_intent",
+                "previous_body_position",
+                "previous_body_velocity",
+            ):
+                with self.subTest(step=step, field=field):
+                    torch.testing.assert_close(
+                        trained[:, INPUT_LAYOUT[field]],
+                        direct[:, INPUT_LAYOUT[field]],
+                        atol=3.0e-6,
+                        rtol=0.0,
+                    )
+            torch.testing.assert_close(
+                result.phases[step], direct_phases[step], atol=3.0e-6, rtol=0.0
+            )
+        first_prediction = result.predictions[0]
+        first_prediction.retain_grad()
+        tick_three_loss = pfnn_losses(
+            result.predictions[2],
+            targets[2],
+            model=model,
+            normalization=normal,
+        )["total"]
+        tick_three_loss.backward()
+        self.assertIsNotNone(first_prediction.grad)
+        self.assertTrue(torch.isfinite(first_prediction.grad).all())
+        self.assertGreater(float(first_prediction.grad.abs().sum()), 0.0)
+
     def test_overfit_subset_is_consecutive_source_sealed_and_mixed_terrain(self) -> None:
         class Rows:
             split = "train"
@@ -131,17 +354,23 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                     ("terrain_slopes__slope_001__001", "slope_001", range(40, 50), "descent"),
                 ):
                     for center in centers:
-                        self.rows.append({
-                            "x": np.full(INPUT_LAYOUT.size, center, np.float32),
-                            "y": np.full(OUTPUT_LAYOUT.size, center, np.float32),
-                            "phase": np.float32(center * 0.01),
-                            "clip_id": clip,
-                            "center_frame": center,
-                            "split_identity": identity,
-                            "split": "train",
-                            "sequence_lane": "motion",
-                            "terrain_class": terrain_class,
-                        })
+                        lanes = (
+                            ("motion", "idle_phase_0")
+                            if clip == "walk1_subject2"
+                            else ("motion",)
+                        )
+                        for lane in lanes:
+                            self.rows.append({
+                                "x": np.full(INPUT_LAYOUT.size, center, np.float32),
+                                "y": np.full(OUTPUT_LAYOUT.size, center, np.float32),
+                                "phase": np.float32(center * 0.01),
+                                "clip_id": clip,
+                                "center_frame": center,
+                                "split_identity": identity,
+                                "split": "train",
+                                "sequence_lane": lane,
+                                "terrain_class": terrain_class,
+                            })
 
             def __len__(self) -> int:
                 return len(self.rows)
@@ -153,17 +382,30 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
         selected = consecutive_overfit_subset(
             rows,
             18,
-            required_seed_key=("walk1_subject2", 103),
+            required_seed_key=("walk1_subject2", "idle_phase_0", 103),
             known_terrain_identity="slope_001",
         )
         keys = [
-            (rows[index]["clip_id"], rows[index]["center_frame"])
+            (
+                rows[index]["clip_id"],
+                rows[index]["sequence_lane"],
+                rows[index]["center_frame"],
+            )
             for index in selected
         ]
-        self.assertEqual(keys[:8], [("walk1_subject2", center) for center in range(100, 108)])
+        self.assertEqual(
+            keys[:8],
+            [
+                ("walk1_subject2", "idle_phase_0", center)
+                for center in range(100, 108)
+            ],
+        )
         self.assertEqual(
             keys[8:],
-            [("terrain_slopes__slope_001__000", center) for center in range(20, 30)],
+            [
+                ("terrain_slopes__slope_001__000", "motion", center)
+                for center in range(20, 30)
+            ],
         )
 
     def test_runtime_seed_predecessor_and_first_input_are_inside_fitted_run(self) -> None:
@@ -316,7 +558,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
 
             def __init__(self, duplicate_lane: str | None = None) -> None:
                 self.rows: list[dict[str, object]] = []
-                for center in (10, 11):
+                for center in range(10, 27):
                     for lane_index in reversed(range(8)):
                         lane = f"idle_phase_{lane_index}"
                         speed = 0.01 * max(lane_index, 1) if center == 11 else 0.5
@@ -362,7 +604,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
         )
         self.assertAlmostEqual(duplicate["provenance"]["speed"], 0.01)
 
-    def test_runtime_seed_minimizes_speed_before_suffix_length(self) -> None:
+    def test_runtime_seed_filters_sixteen_frame_horizon_before_speed_and_is_sampled(self) -> None:
         class Rows:
             split = "train"
             x_mean = np.zeros(INPUT_LAYOUT.size, np.float32)
@@ -406,8 +648,16 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 }
 
             def __init__(self) -> None:
-                self.rows = [self.row("long", center, 0.4) for center in range(10, 30)]
-                self.rows.extend((self.row("short", 49, 0.4), self.row("short", 50, 0.001)))
+                self.rows = [
+                    self.row("walk1_subject1", center, 0.4)
+                    for center in range(10, 30)
+                ]
+                self.rows.extend(
+                    (
+                        self.row("walk4_subject1", 49, 0.4),
+                        self.row("walk4_subject1", 50, 0.001),
+                    )
+                )
 
             def __len__(self) -> int:
                 return len(self.rows)
@@ -416,9 +666,37 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 return self.rows[index]
 
         seed = choose_runtime_seed(Rows(), torch.tensor([[-2.0, 2.0]] * 29))
-        self.assertEqual(seed["provenance"]["first_fitted_clip_id"], "short")
-        self.assertEqual(seed["provenance"]["first_fitted_center_frame"], 50)
-        self.assertAlmostEqual(seed["provenance"]["speed"], 0.001)
+        self.assertEqual(
+            seed["provenance"]["first_fitted_clip_id"], "walk1_subject1"
+        )
+        self.assertEqual(seed["provenance"]["first_fitted_center_frame"], 11)
+        self.assertAlmostEqual(seed["provenance"]["speed"], 0.4)
+
+        rows = Rows()
+        sequences, _ = train_module._consecutive_starts(rows, 16)
+        chosen_key = (
+            seed["provenance"]["first_fitted_clip_id"],
+            seed["provenance"]["first_fitted_sequence_lane"],
+            seed["provenance"]["first_fitted_center_frame"],
+        )
+        chosen_sequence = next(
+            sequence_index
+            for sequence_index, sequence in enumerate(sequences)
+            if (
+                rows[sequence[0]]["clip_id"],
+                rows[sequence[0]]["sequence_lane"],
+                rows[sequence[0]]["center_frame"],
+            ) == chosen_key
+        )
+        sampler = train_module.DeterministicSequenceSampler(
+            len(sequences), batch_size=3, seed=109
+        )
+        first_pass = [
+            index
+            for _ in range((len(sequences) + 2) // 3)
+            for index in sampler.next_batch()
+        ][: len(sequences)]
+        self.assertIn(chosen_sequence, first_pass)
 
     def test_seed_receipt_membership_adjacency_and_resume_subset_fail_closed(self) -> None:
         rows = [
@@ -872,6 +1150,11 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             "first_fitted_row_sha256": "2" * 64,
             "fitted_subset_rows_sha256": fitted_subset["rows_sha256"],
         })
+        sequence_sampler = train_module.DeterministicSequenceSampler(
+            7, batch_size=3, seed=41
+        )
+        sequence_sampler.next_batch()
+        sequence_sampler_state = sequence_sampler.state_dict()
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "checkpoint.pt"
             save_checkpoint(
@@ -879,6 +1162,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 dataset_digest="abc", kinematic_signature_sha256="def",
                 runtime_seed=seed, step=17, epoch=3,
                 sampler_epoch=2, sampler_global_offset=8,
+                sequence_sampler_state=sequence_sampler_state,
                 fitted_subset=fitted_subset,
             )
             payload = torch.load(path, map_location="cpu", weights_only=True)
@@ -890,7 +1174,12 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 "angle_axis_xy",
             )
             self.assertEqual(
-                payload["sampler_state"], {"epoch": 2, "global_offset": 8}
+                payload["sampler_state"],
+                {
+                    "epoch": 2,
+                    "global_offset": 8,
+                    "sequence": sequence_sampler_state,
+                },
             )
             loaded = load_checkpoint(
                 path, expected_dataset_digest="abc",
@@ -900,6 +1189,9 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             self.assertEqual(loaded.step, 17)
             self.assertEqual(loaded.sampler_epoch, 2)
             self.assertEqual(loaded.sampler_global_offset, 8)
+            self.assertEqual(
+                loaded.sequence_sampler_state, sequence_sampler_state
+            )
             self.assertEqual(loaded.runtime_seed.keys(), seed.keys())
             self.assertEqual(loaded.fitted_subset, fitted_subset)
             old_schema = payload["schema"]
@@ -1245,98 +1537,34 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                             )
                         restore.assert_not_called()
 
-    def test_three_step_rollout_feeds_predictions_back_without_detaching(self) -> None:
-        torch.manual_seed(11)
-        model = PhaseFunctionedNetwork(hidden_size=8, dropout_probability=0.0)
-        inputs = torch.randn(3, 2, INPUT_LAYOUT.size)
-        targets = torch.zeros(3, 2, OUTPUT_LAYOUT.size)
-        targets[..., OUTPUT_LAYOUT["contact_logit"]] = 1.0
-        normal = _normalization()
-        result = autoregressive_unroll(
-            model, inputs, torch.tensor((0.2, 0.7)), targets,
-            normalization=normal,
-        )
-        first = result.predictions[0]
-        expected_trajectory = torch.cat(
-            (
-                first[:, OUTPUT_LAYOUT["trajectory_position"]],
-                first[:, OUTPUT_LAYOUT["trajectory_direction"]],
-            ),
-            dim=1,
-        )
-        torch.testing.assert_close(result.inputs[1][:, :48], expected_trajectory)
-        torch.testing.assert_close(
-            result.inputs[1][:, INPUT_LAYOUT["terrain_height"]],
-            inputs[1, :, INPUT_LAYOUT["terrain_height"]],
-        )
-        torch.testing.assert_close(
-            result.inputs[1][:, INPUT_LAYOUT["semantic_intent"]],
-            inputs[1, :, INPUT_LAYOUT["semantic_intent"]],
-        )
-        torch.testing.assert_close(
-            result.inputs[1][:, INPUT_LAYOUT["previous_body_position"]],
-            0.1 * first[:, OUTPUT_LAYOUT["body_position"]],
-        )
-        gradient = torch.autograd.grad(
-            result.predictions[2].square().mean(), first, retain_graph=True
-        )[0]
-        self.assertTrue(torch.isfinite(gradient).all())
-        self.assertGreater(float(gradient.abs().max()), 0.0)
-
-    def test_nonzero_normalization_rollout_matches_public_input_helper(self) -> None:
-        torch.manual_seed(19)
-        model = PhaseFunctionedNetwork(hidden_size=8, dropout_probability=0.0)
-        normal = _normalization()
-        normal["x_mean"] = np.linspace(-2.0, 3.0, INPUT_LAYOUT.size, dtype=np.float32)
-        normal["x_std"] = np.linspace(0.5, 2.5, INPUT_LAYOUT.size, dtype=np.float32)
-        normal["y_mean"] = np.linspace(-1.0, 2.0, OUTPUT_LAYOUT.size, dtype=np.float32)
-        normal["y_std"] = np.linspace(0.75, 1.75, OUTPUT_LAYOUT.size, dtype=np.float32)
-        normal["y_mean"][OUTPUT_LAYOUT["contact_logit"]] = 0.0
-        normal["y_std"][OUTPUT_LAYOUT["contact_logit"]] = 1.0
-        raw_inputs = np.linspace(
-            -4.0, 5.0, 2 * INPUT_LAYOUT.size, dtype=np.float32
-        ).reshape(2, 1, INPUT_LAYOUT.size)
-        normalized_inputs = normalize_pfnn_input(
-            raw_inputs, normal["x_mean"], normal["x_std"]
-        )
-        targets = torch.zeros(2, 1, OUTPUT_LAYOUT.size)
-        result = autoregressive_unroll(
-            model,
-            torch.from_numpy(normalized_inputs),
-            torch.tensor((0.3,)),
-            targets,
-            normalization=normal,
-        )
-        prediction_physical = (
-            result.predictions[0].detach().numpy() * normal["y_std"]
-            + normal["y_mean"]
-        )
-        expected_raw = raw_inputs[1].copy()
-        for y_field, x_field in (
-            ("trajectory_position", "trajectory_position"),
-            ("trajectory_direction", "trajectory_direction"),
-            ("body_position", "previous_body_position"),
-            ("body_velocity", "previous_body_velocity"),
-        ):
-            expected_raw[:, INPUT_LAYOUT[x_field]] = prediction_physical[
-                :, OUTPUT_LAYOUT[y_field]
-            ]
-        expected = normalize_pfnn_input(
-            expected_raw, normal["x_mean"], normal["x_std"]
-        )
-        torch.testing.assert_close(result.inputs[1], torch.from_numpy(expected))
-
-    def test_phase_recurrence_clamps_forward_but_keeps_negative_advance_gradient(self) -> None:
+    def test_phase_recurrence_uses_shared_forward_clamp_and_required_cap(self) -> None:
         model = PhaseFunctionedNetwork(hidden_size=4, dropout_probability=0.0)
         with torch.no_grad():
             for parameter in model.parameters():
                 parameter.zero_()
+            output_direction = model.b2[
+                :, OUTPUT_LAYOUT["trajectory_direction"]
+            ].reshape(model.b2.shape[0], 12, 2)
+            output_direction[..., 0] = 1.0
             model.b2[:, OUTPUT_LAYOUT["phase_advance"]] = -0.25
         inputs = torch.zeros(2, 1, INPUT_LAYOUT.size)
+        input_direction = inputs[
+            ..., INPUT_LAYOUT["trajectory_direction"]
+        ].reshape(2, 1, 12, 2)
+        input_direction[..., 0] = 1.0
+        input_semantic = inputs[
+            ..., INPUT_LAYOUT["semantic_intent"]
+        ].reshape(2, 1, 12, 2)
+        input_semantic[..., 0] = 1.0
         targets = torch.zeros(2, 1, OUTPUT_LAYOUT.size)
         initial_phase = torch.tensor((0.7,))
         result = autoregressive_unroll(
-            model, inputs, initial_phase, targets, normalization=_normalization()
+            model,
+            inputs,
+            initial_phase,
+            targets,
+            normalization=_normalization(),
+            phase_advance_cap=0.2,
         )
         self.assertLess(
             float(
@@ -1351,7 +1579,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
         )[0]
         phase_gradient = gradient[:, OUTPUT_LAYOUT["phase_advance"]]
         self.assertTrue(torch.isfinite(phase_gradient).all())
-        self.assertGreater(float(phase_gradient.abs().max()), 0.0)
+        torch.testing.assert_close(phase_gradient, torch.zeros_like(phase_gradient))
 
     def test_rollout_sequences_ignore_storage_order_and_reject_bad_metadata(self) -> None:
         rows = [
@@ -1397,21 +1625,97 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             (("walk1_subject1", 4), ("walk1_subject1", 5)),
             (("walk4_subject1", 10), ("walk4_subject1", 11)),
         ]
-        self.assertEqual(metadata_sequences(rows), expected)
-        shuffled = [rows[index] for index in (10, 0, 5, 3, 8, 2, 13, 1, 6, 4, 12, 7, 9, 11)]
+        clean_rows = rows[:6]
+        self.assertEqual(metadata_sequences(clean_rows), expected)
+        shuffled = [clean_rows[index] for index in (0, 5, 3, 2, 1, 4)]
         self.assertEqual(metadata_sequences(shuffled), expected)
-        self.assertFalse(
-            any(center == 3 for sequence in expected for _, center in sequence)
-        )
+        with self.assertRaisesRegex(ValueError, "duplicate.*lane"):
+            metadata_sequences(rows)
 
-        mismatched = [dict(rows[3]), dict(rows[1])]
+        mismatched = [dict(clean_rows[3]), dict(clean_rows[1])]
         mismatched[1]["split_identity"] = "different"
         with self.assertRaisesRegex(ValueError, "split/identity"):
             train_module._consecutive_starts(Rows(mismatched), 2)
-        validation = Rows([rows[3], rows[1]])
+        validation = Rows([clean_rows[3], clean_rows[1]])
         validation.split = "validation"
         with self.assertRaisesRegex(ValueError, "training split"):
             train_module._consecutive_starts(validation, 2)
+
+    def test_rollout_sequences_are_exactly_lane_safe_and_reject_duplicates(self) -> None:
+        lanes = ("motion", *(f"idle_phase_{index}" for index in range(8)))
+        values: list[dict[str, object]] = []
+        for clip, first_center in (
+            ("walk1_subject1", 10),
+            ("walk4_subject1", 12),
+        ):
+            for lane in lanes:
+                for center in range(first_center, first_center + 3):
+                    if clip == "walk4_subject1" and lane == "idle_phase_7" and center == 13:
+                        continue
+                    values.append({
+                        "clip_id": clip,
+                        "center_frame": center,
+                        "sequence_lane": lane,
+                        "terrain_class": "flat",
+                        "split": "train",
+                        "split_identity": clip,
+                    })
+
+        class Rows:
+            split = "train"
+
+            def __init__(self, rows: list[dict[str, object]]) -> None:
+                self.rows = rows
+
+            def __len__(self) -> int:
+                return len(self.rows)
+
+            def __getitem__(self, index: int) -> dict[str, object]:
+                return self.rows[index]
+
+        sequences, _ = train_module._consecutive_starts(Rows(values), 3)
+        keys = [
+            tuple(
+                (
+                    values[index]["clip_id"],
+                    values[index]["sequence_lane"],
+                    values[index]["center_frame"],
+                )
+                for index in sequence
+            )
+            for sequence in sequences
+        ]
+        self.assertEqual(len(keys), 17)
+        self.assertEqual(len(set(keys)), 17)
+        self.assertTrue(
+            all(
+                len({clip for clip, _, _ in sequence}) == 1
+                and len({lane for _, lane, _ in sequence}) == 1
+                and all(
+                    right == left + 1
+                    for left, right in zip(
+                        [center for _, _, center in sequence],
+                        [center for _, _, center in sequence][1:],
+                    )
+                )
+                for sequence in keys
+            )
+        )
+        self.assertFalse(
+            any(
+                clip == "walk4_subject1" and lane == "idle_phase_7"
+                for sequence in keys
+                for clip, lane, _ in sequence
+            )
+        )
+
+        duplicate = values + [dict(values[0])]
+        with self.assertRaisesRegex(ValueError, "duplicate.*lane|lane.*duplicate"):
+            train_module._consecutive_starts(Rows(duplicate), 3)
+        invalid_lane = [dict(value) for value in values]
+        invalid_lane[0]["sequence_lane"] = "idle_phase_8"
+        with self.assertRaisesRegex(ValueError, "lane"):
+            train_module._consecutive_starts(Rows(invalid_lane), 3)
 
     def test_sampler_resume_reconstructs_identical_remaining_stream(self) -> None:
         classes = ["flat"] * 4 + ["ascent"] * 4 + ["descent"] * 4 + ["transition"] * 4
@@ -1444,6 +1748,69 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                         rank=1,
                         world_size=2,
                     )
+
+    def test_sequence_sampler_covers_before_replacement_resumes_and_partitions_ddp(self) -> None:
+        sampler = train_module.DeterministicSequenceSampler(
+            7, batch_size=3, seed=41
+        )
+        first_nine = [
+            index
+            for _ in range(3)
+            for index in sampler.next_batch()
+        ]
+        self.assertEqual(set(first_nine[:7]), set(range(7)))
+        self.assertEqual(len(set(first_nine[:7])), 7)
+        expected_second_pass = train_module.DeterministicSequenceSampler(
+            7, batch_size=1, seed=41
+        )
+        for _ in range(7):
+            expected_second_pass.next_batch()
+        self.assertEqual(first_nine[7], expected_second_pass.next_batch()[0])
+
+        uninterrupted = train_module.DeterministicSequenceSampler(
+            7, batch_size=3, seed=41
+        )
+        uninterrupted.next_batch()
+        state = uninterrupted.state_dict()
+        self.assertEqual(
+            set(state),
+            {
+                "seed",
+                "sequence_count",
+                "permutation_number",
+                "permutation",
+                "cursor",
+            },
+        )
+        expected_next = uninterrupted.next_batch()
+        resumed = train_module.DeterministicSequenceSampler(
+            7, batch_size=3, seed=41
+        )
+        resumed.load_state_dict(state)
+        self.assertEqual(resumed.next_batch(), expected_next)
+        malformed = dict(state)
+        malformed["permutation"] = list(reversed(state["permutation"]))
+        with self.assertRaisesRegex(ValueError, "sampler"):
+            resumed.load_state_dict(malformed)
+
+        reference = train_module.DeterministicSequenceSampler(
+            7, batch_size=4, seed=41
+        )
+        rank_zero = train_module.DeterministicSequenceSampler(
+            7, batch_size=2, seed=41, rank=0, world_size=2
+        )
+        rank_one = train_module.DeterministicSequenceSampler(
+            7, batch_size=2, seed=41, rank=1, world_size=2
+        )
+        for _ in range(4):
+            global_batch = reference.next_batch()
+            partitioned = tuple(
+                index
+                for pair in zip(rank_zero.next_batch(), rank_one.next_batch())
+                for index in pair
+            )
+            self.assertEqual(partitioned, global_batch)
+            self.assertEqual(rank_zero.state_dict(), rank_one.state_dict())
 
     def test_normal_selection_requires_closed_loop_but_overfit_is_provisional(self) -> None:
         provisional = selection_metadata(

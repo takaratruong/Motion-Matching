@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import pickle
+import random
 import subprocess
 from typing import Callable, Mapping, Sequence
 
@@ -30,6 +31,14 @@ from .layout import (
     TRAJECTORY_TIMES_S,
 )
 from .model import PhaseFunctionedNetwork
+from .recurrence import (
+    PlannedTrajectory,
+    advance_recurrent_state,
+    derive_training_desired_velocity,
+    initialize_recurrent_state,
+    pack_recurrent_input,
+    plan_recurrent_trajectory,
+)
 
 
 CHECKPOINT_SCHEMA = "mm-sonic-terrain-pfnn-checkpoint/v5"
@@ -263,33 +272,6 @@ class RolloutResult:
     phases: tuple[torch.Tensor, ...]
 
 
-def _physical_to_recurrent_input(
-    prediction: torch.Tensor,
-    ground_truth_next_input: torch.Tensor,
-    normal: Mapping[str, torch.Tensor],
-) -> torch.Tensor:
-    physical = prediction * normal["y_std"] + normal["y_mean"]
-
-    def normalized(y_field: str, x_field: str, scale: float = 1.0) -> torch.Tensor:
-        value = physical[:, OUTPUT_LAYOUT[y_field]]
-        output = (
-            value - normal["x_mean"][INPUT_LAYOUT[x_field]]
-        ) / normal["x_std"][INPUT_LAYOUT[x_field]]
-        return output * scale
-
-    return torch.cat(
-        (
-            normalized("trajectory_position", "trajectory_position"),
-            normalized("trajectory_direction", "trajectory_direction"),
-            ground_truth_next_input[:, INPUT_LAYOUT["terrain_height"]],
-            ground_truth_next_input[:, INPUT_LAYOUT["semantic_intent"]],
-            normalized("body_position", "previous_body_position", 0.1),
-            normalized("body_velocity", "previous_body_velocity", 0.1),
-        ),
-        dim=1,
-    )
-
-
 def autoregressive_unroll(
     model: nn.Module,
     ground_truth_inputs: torch.Tensor,
@@ -297,6 +279,7 @@ def autoregressive_unroll(
     targets: torch.Tensor,
     *,
     normalization: object,
+    phase_advance_cap: float,
     kinematics: nn.Module | None = None,
     loss_weights: Mapping[str, float] | None = None,
 ) -> RolloutResult:
@@ -316,16 +299,81 @@ def autoregressive_unroll(
         device=ground_truth_inputs.device,
         dtype=ground_truth_inputs.dtype,
     )
+    if (
+        isinstance(phase_advance_cap, bool)
+        or not isinstance(phase_advance_cap, (int, float))
+        or not math.isfinite(float(phase_advance_cap))
+        or float(phase_advance_cap) < 0.0
+    ):
+        raise ValueError("phase_advance_cap must be finite and nonnegative")
+
+    def physical_input(normalized: torch.Tensor) -> torch.Tensor:
+        unscaled = normalized.clone()
+        for field in ("previous_body_position", "previous_body_velocity"):
+            unscaled[:, INPUT_LAYOUT[field]] = (
+                unscaled[:, INPUT_LAYOUT[field]] / 0.1
+            )
+        physical = unscaled * normal["x_std"] + normal["x_mean"]
+        semantic = physical[:, INPUT_LAYOUT["semantic_intent"]].reshape(
+            len(normalized), 12, 2
+        )
+        physical[:, INPUT_LAYOUT["semantic_intent"]] = F.one_hot(
+            torch.argmax(semantic, dim=-1), num_classes=2
+        ).to(physical.dtype).reshape(len(normalized), -1)
+        return physical
+
+    batch_size = int(ground_truth_inputs.shape[1])
+    first_physical = physical_input(ground_truth_inputs[0])
+    recurrent_state = initialize_recurrent_state(
+        trajectory_position_local=first_physical[
+            :, INPUT_LAYOUT["trajectory_position"]
+        ].reshape(batch_size, 12, 2),
+        trajectory_direction_local=first_physical[
+            :, INPUT_LAYOUT["trajectory_direction"]
+        ].reshape(batch_size, 12, 2),
+        semantic_intent=first_physical[
+            :, INPUT_LAYOUT["semantic_intent"]
+        ].reshape(batch_size, 12, 2),
+        previous_body_position_local=first_physical[
+            :, INPUT_LAYOUT["previous_body_position"]
+        ].reshape(batch_size, 30, 3),
+        previous_body_velocity_local=first_physical[
+            :, INPUT_LAYOUT["previous_body_velocity"]
+        ].reshape(batch_size, 30, 3),
+        phase=initial_phase,
+        root_world_xy=torch.zeros(
+            (batch_size, 2),
+            dtype=ground_truth_inputs.dtype,
+            device=ground_truth_inputs.device,
+        ),
+        root_yaw_world=torch.zeros(
+            batch_size,
+            dtype=ground_truth_inputs.dtype,
+            device=ground_truth_inputs.device,
+        ),
+    )
+    planned = PlannedTrajectory(
+        position_world_xy=recurrent_state.predicted_position_world_xy,
+        direction_world_xy=recurrent_state.predicted_direction_world_xy,
+        semantic_intent=first_physical[
+            :, INPUT_LAYOUT["semantic_intent"]
+        ].reshape(batch_size, 12, 2),
+    )
+    cap = torch.full(
+        (batch_size,),
+        float(phase_advance_cap),
+        dtype=ground_truth_inputs.dtype,
+        device=ground_truth_inputs.device,
+    )
     current_input = ground_truth_inputs[0]
-    current_phase = initial_phase
     predictions: list[torch.Tensor] = []
     inputs: list[torch.Tensor] = []
     phases: list[torch.Tensor] = []
     per_step: list[dict[str, torch.Tensor]] = []
     for step in range(len(ground_truth_inputs)):
         inputs.append(current_input)
-        phases.append(current_phase)
-        prediction = model(current_input, current_phase)
+        phases.append(recurrent_state.phase)
+        prediction = model(current_input, recurrent_state.phase)
         predictions.append(prediction)
         per_step.append(
             pfnn_losses(
@@ -338,23 +386,35 @@ def autoregressive_unroll(
             )
         )
         if step + 1 < len(ground_truth_inputs):
-            current_input = _physical_to_recurrent_input(
-                prediction, ground_truth_inputs[step + 1], normal
+            physical_output = prediction * normal["y_std"] + normal["y_mean"]
+            recurrent_state = advance_recurrent_state(
+                recurrent_state,
+                planned,
+                physical_output,
+                phase_advance_cap=cap,
             )
-            physical_phase = (
-                prediction[:, OUTPUT_LAYOUT["phase_advance"]]
-                * normal["y_std"][OUTPUT_LAYOUT["phase_advance"]]
-                + normal["y_mean"][OUTPUT_LAYOUT["phase_advance"]]
-            ).squeeze(-1)
-            # The recurrence is physically nonnegative in the forward pass,
-            # while the straight-through correction preserves a learning
-            # signal for a raw negative phase-advance prediction.
-            recurrent_phase = physical_phase + (
-                torch.clamp_min(physical_phase, 0.0) - physical_phase
-            ).detach()
-            current_phase = torch.remainder(
-                current_phase + recurrent_phase,
-                2.0 * math.pi,
+            next_physical = physical_input(ground_truth_inputs[step + 1])
+            desired_velocity = derive_training_desired_velocity(
+                next_physical[:, INPUT_LAYOUT["trajectory_position"]].reshape(
+                    batch_size, 12, 2
+                ),
+                next_physical[:, INPUT_LAYOUT["semantic_intent"]].reshape(
+                    batch_size, 12, 2
+                ),
+                recurrent_state.root_yaw_world,
+            )
+            planned = plan_recurrent_trajectory(
+                recurrent_state, desired_velocity
+            )
+            current_input = pack_recurrent_input(
+                state=recurrent_state,
+                planned=planned,
+                terrain_height=next_physical[
+                    :, INPUT_LAYOUT["terrain_height"]
+                ].reshape(batch_size, 12, 3),
+                x_mean=normal["x_mean"],
+                x_std=normal["x_std"],
+                body_scale=0.1,
             )
     losses = {
         name: torch.stack([item[name] for item in per_step]).mean()
@@ -484,12 +544,21 @@ def choose_runtime_seed(
     unique = {key: value[0] for key, value in rows.items() if len(value) == 1}
     candidates: list[
         tuple[
-            tuple[float, str, str, int], Mapping[str, object], Mapping[str, object]
+            tuple[float, str, str, int, str],
+            Mapping[str, object],
+            Mapping[str, object],
         ]
     ] = []
     for (clip, lane, center), (_, sample) in unique.items():
         predecessor_entry = unique.get((clip, lane, center - 1))
-        if sample.get("terrain_class") != "flat" or predecessor_entry is None:
+        has_rollout_horizon = all(
+            (clip, lane, center + offset) in unique for offset in range(16)
+        )
+        if (
+            sample.get("terrain_class") != "flat"
+            or predecessor_entry is None
+            or not has_rollout_horizon
+        ):
             continue
         physical_target = np.asarray(sample["y"], dtype=np.float64) * y_std + y_mean
         predecessor = predecessor_entry[1]
@@ -507,11 +576,17 @@ def choose_runtime_seed(
         speed = float(
             np.linalg.norm(physical_target[OUTPUT_LAYOUT["root_planar_velocity"]])
         )
-        candidates.append(((speed, clip, lane, center), predecessor, sample))
+        candidates.append(
+            (
+                (speed, clip, lane, center, fitted_row_sha256(sample)),
+                predecessor,
+                sample,
+            )
+        )
     if not candidates:
         raise ValueError("training split has no fitted consecutive flat runtime seed")
     key, predecessor, first_fitted = min(candidates, key=lambda candidate: candidate[0])
-    speed, clip, _, center = key
+    speed, clip, _, center, _ = key
     predecessor_physical = (
         np.asarray(predecessor["y"], dtype=np.float64) * y_std + y_mean
     )
@@ -887,17 +962,68 @@ def _validate_runtime_seed(
     return output
 
 
-def _validated_sampler_state(value: object) -> dict[str, int]:
+def _validated_sequence_sampler_state(
+    value: object,
+) -> dict[str, object] | None:
+    if value is None:
+        return None
+    expected_keys = {
+        "seed",
+        "sequence_count",
+        "permutation_number",
+        "permutation",
+        "cursor",
+    }
+    if type(value) is not dict or set(value) != expected_keys:
+        raise ValueError("checkpoint sequence sampler state is invalid")
+    seed = value["seed"]
+    sequence_count = value["sequence_count"]
+    permutation_number = value["permutation_number"]
+    permutation = value["permutation"]
+    cursor = value["cursor"]
+    if (
+        type(seed) is not int
+        or type(sequence_count) is not int
+        or sequence_count < 1
+        or type(permutation_number) is not int
+        or permutation_number < 0
+        or type(permutation) is not list
+        or len(permutation) != sequence_count
+        or any(type(index) is not int for index in permutation)
+        or type(cursor) is not int
+        or cursor < 0
+        or cursor >= sequence_count
+    ):
+        raise ValueError("checkpoint sequence sampler state is invalid")
+    expected_permutation = list(range(sequence_count))
+    generator = random.Random(seed + 1_000_003 * permutation_number)
+    generator.shuffle(expected_permutation)
+    if permutation != expected_permutation:
+        raise ValueError("checkpoint sequence sampler state is invalid")
+    return {
+        "seed": seed,
+        "sequence_count": sequence_count,
+        "permutation_number": permutation_number,
+        "permutation": list(permutation),
+        "cursor": cursor,
+    }
+
+
+def _validated_sampler_state(value: object) -> dict[str, object]:
     if (
         type(value) is not dict
-        or set(value) != {"epoch", "global_offset"}
+        or set(value) != {"epoch", "global_offset", "sequence"}
         or type(value["epoch"]) is not int
         or value["epoch"] < 0
         or type(value["global_offset"]) is not int
         or value["global_offset"] < 0
     ):
         raise ValueError("checkpoint sampler state is invalid")
-    return {"epoch": value["epoch"], "global_offset": value["global_offset"]}
+    return {
+        "epoch": value["epoch"],
+        "global_offset": value["global_offset"],
+        "sequence": _validated_sequence_sampler_state(value["sequence"]),
+    }
 
 
 def _validated_fitted_subset(value: object) -> dict[str, object] | None:
@@ -1180,6 +1306,7 @@ class LoadedCheckpoint:
     code_commit: str
     sampler_epoch: int
     sampler_global_offset: int
+    sequence_sampler_state: dict[str, object] | None
     fitted_subset: dict[str, object] | None
 
     def build_model(self) -> PhaseFunctionedNetwork:
@@ -1212,6 +1339,7 @@ def save_checkpoint(
     code_commit: str | None = None,
     sampler_epoch: int = 0,
     sampler_global_offset: int = 0,
+    sequence_sampler_state: Mapping[str, object] | None = None,
     fitted_subset: Mapping[str, object] | None = None,
 ) -> None:
     unwrapped = model.module if hasattr(model, "module") else model
@@ -1249,7 +1377,15 @@ def save_checkpoint(
         )
     weights = _loss_weights(loss_weights)
     sampler_state = _validated_sampler_state(
-        {"epoch": sampler_epoch, "global_offset": sampler_global_offset}
+        {
+            "epoch": sampler_epoch,
+            "global_offset": sampler_global_offset,
+            "sequence": (
+                None
+                if sequence_sampler_state is None
+                else dict(sequence_sampler_state)
+            ),
+        }
     )
     payload = {
         "schema": CHECKPOINT_SCHEMA,
@@ -1541,6 +1677,11 @@ def load_checkpoint(
         code_commit=payload["code_commit"],
         sampler_epoch=sampler_state["epoch"],
         sampler_global_offset=sampler_state["global_offset"],
+        sequence_sampler_state=(
+            None
+            if sampler_state["sequence"] is None
+            else dict(sampler_state["sequence"])
+        ),
         fitted_subset=fitted_subset,
     )
 
