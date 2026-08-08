@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import hashlib
 import json
 import math
@@ -10,7 +11,8 @@ import os
 from pathlib import Path
 import random
 import time
-from typing import Callable, Sequence
+from types import MappingProxyType
+from typing import Callable, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -522,7 +524,7 @@ def resolve_rollout_finetune_frames(
 
 
 class _MaterializedDataset:
-    def __init__(self, source: object, rows: Sequence[dict[str, object]]) -> None:
+    def __init__(self, source: object, rows: Sequence[Mapping[str, object]]) -> None:
         self.split = getattr(source, "split")
         for name in ("x_mean", "x_std", "y_mean", "y_std"):
             setattr(self, name, np.asarray(getattr(source, name)).copy())
@@ -531,7 +533,7 @@ class _MaterializedDataset:
     def __len__(self) -> int:
         return len(self._rows)
 
-    def __getitem__(self, index: int) -> dict[str, object]:
+    def __getitem__(self, index: int) -> Mapping[str, object]:
         return self._rows[index]
 
 
@@ -549,6 +551,267 @@ def materialize_subset(source: object, indices: Sequence[int]) -> _MaterializedD
             for name, value in sample.items()
         }
     return _MaterializedDataset(source, [cache[index] for index in ordered])
+
+
+@dataclass(frozen=True)
+class FittedTransitionPair:
+    predecessor_index: int
+    current_index: int
+    clip_id: str
+    sequence_lane: str
+    predecessor_center_frame: int
+    center_frame: int
+    predecessor_row_sha256: str
+    current_row_sha256: str
+    terrain_class: str
+
+
+def _transition_pair_sort_key(
+    pair: FittedTransitionPair,
+) -> tuple[str, str, int, int, str, str]:
+    return (
+        pair.clip_id,
+        pair.sequence_lane,
+        pair.predecessor_center_frame,
+        pair.center_frame,
+        pair.predecessor_row_sha256,
+        pair.current_row_sha256,
+    )
+
+
+def _pair_from_indices(
+    dataset: object, predecessor_index: int, current_index: int
+) -> FittedTransitionPair:
+    if (
+        type(predecessor_index) is not int
+        or type(current_index) is not int
+        or predecessor_index < 0
+        or current_index < 0
+        or predecessor_index >= len(dataset)
+        or current_index >= len(dataset)
+    ):
+        raise ValueError("transition pair indices are invalid")
+    predecessor = dataset[predecessor_index]
+    current = dataset[current_index]
+    if not isinstance(predecessor, Mapping) or not isinstance(current, Mapping):
+        raise ValueError("transition pair rows are invalid")
+    if (
+        predecessor.get("split") != "train"
+        or current.get("split") != "train"
+        or predecessor.get("clip_id") != current.get("clip_id")
+        or predecessor.get("sequence_lane") != current.get("sequence_lane")
+        or type(predecessor.get("center_frame")) is not int
+        or type(current.get("center_frame")) is not int
+        or int(predecessor["center_frame"]) + 1 != int(current["center_frame"])
+    ):
+        raise ValueError("transition pair is not train-only exact adjacency")
+    return FittedTransitionPair(
+        predecessor_index=predecessor_index,
+        current_index=current_index,
+        clip_id=str(current["clip_id"]),
+        sequence_lane=str(current["sequence_lane"]),
+        predecessor_center_frame=int(predecessor["center_frame"]),
+        center_frame=int(current["center_frame"]),
+        predecessor_row_sha256=fitted_row_sha256(predecessor),
+        current_row_sha256=fitted_row_sha256(current),
+        terrain_class=str(current["terrain_class"]),
+    )
+
+
+def _pair_receipt_record(pair: FittedTransitionPair) -> dict[str, object]:
+    return {
+        "clip_id": pair.clip_id,
+        "sequence_lane": pair.sequence_lane,
+        "predecessor_center_frame": pair.predecessor_center_frame,
+        "center_frame": pair.center_frame,
+        "predecessor_row_sha256": pair.predecessor_row_sha256,
+        "current_row_sha256": pair.current_row_sha256,
+        "terrain_class": pair.terrain_class,
+    }
+
+
+def canonical_transition_pairs(
+    dataset: object,
+) -> tuple[FittedTransitionPair, ...]:
+    """Derive every canonical train-only same-lane adjacent pair."""
+
+    rows: dict[tuple[str, str, int], int] = {}
+    for index in range(len(dataset)):
+        row = dataset[index]
+        if not isinstance(row, Mapping) or row.get("split") != "train":
+            raise ValueError("transition-pair source must be train-only")
+        clip = row.get("clip_id")
+        lane = row.get("sequence_lane")
+        center = row.get("center_frame")
+        if (
+            type(clip) is not str
+            or not clip
+            or lane not in _SEQUENCE_LANES
+            or type(center) is not int
+            or center < 0
+        ):
+            raise ValueError("transition-pair provenance is invalid")
+        fitted_row_sha256(row)
+        key = (clip, str(lane), center)
+        if key in rows:
+            raise ValueError("duplicate transition-pair logical row")
+        rows[key] = index
+    pairs = [
+        _pair_from_indices(
+            dataset,
+            predecessor_index,
+            rows[(clip, lane, center + 1)],
+        )
+        for (clip, lane, center), predecessor_index in rows.items()
+        if (clip, lane, center + 1) in rows
+    ]
+    return tuple(sorted(pairs, key=_transition_pair_sort_key))
+
+
+def validate_canonical_transition_pairs(
+    dataset: object, candidate: Sequence[FittedTransitionPair]
+) -> tuple[FittedTransitionPair, ...]:
+    """Require an exact complete pair sequence from two adjacency paths."""
+
+    primary = canonical_transition_pairs(dataset)
+    independent = tuple(
+        sorted(
+            (
+                _pair_from_indices(dataset, predecessor, current)
+                for predecessor, current in fitted_adjacent_indices(
+                    dataset, tuple(range(len(dataset)))
+                )
+            ),
+            key=_transition_pair_sort_key,
+        )
+    )
+    try:
+        checked = tuple(candidate)
+    except TypeError as error:
+        raise ValueError("complete transition-pair recomputation mismatch") from error
+    if checked != primary or checked != independent:
+        raise ValueError("complete transition-pair recomputation mismatch")
+    return checked
+
+
+def fitted_transition_pair_receipt(dataset: object) -> dict[str, object]:
+    """Return a compact hash binding every active row and canonical pair."""
+
+    active_row_digests = sorted(
+        fitted_row_sha256(dataset[index]) for index in range(len(dataset))
+    )
+    pairs = validate_canonical_transition_pairs(
+        dataset, canonical_transition_pairs(dataset)
+    )
+    class_counts = {name: 0 for name in _TERRAIN_CLASSES}
+    for pair in pairs:
+        class_counts[pair.terrain_class] += 1
+    base: dict[str, object] = {
+        "schema": "mm-sonic-fitted-transition-pair-receipt/v1",
+        "active_row_count": len(active_row_digests),
+        "active_rows_sha256": _canonical_sha256(
+            {"row_sha256": active_row_digests}
+        ),
+        "sample_count": len(pairs),
+        "class_counts": class_counts,
+        "pairs_sha256": _canonical_sha256(
+            {"pairs": [_pair_receipt_record(pair) for pair in pairs]}
+        ),
+    }
+    return {**base, "receipt_sha256": _canonical_sha256(base)}
+
+
+def validate_fitted_transition_pair_receipt(
+    receipt: Mapping[str, object], dataset: object
+) -> dict[str, object]:
+    """Validate exact compact fields against a fresh complete recomputation."""
+
+    required = {
+        "schema",
+        "active_row_count",
+        "active_rows_sha256",
+        "sample_count",
+        "class_counts",
+        "pairs_sha256",
+        "receipt_sha256",
+    }
+    if (
+        not isinstance(receipt, Mapping)
+        or set(receipt) != required
+        or receipt.get("schema")
+        != "mm-sonic-fitted-transition-pair-receipt/v1"
+        or type(receipt.get("active_row_count")) is not int
+        or int(receipt["active_row_count"]) < 1
+        or not _sha256_value(receipt.get("active_rows_sha256"))
+        or type(receipt.get("sample_count")) is not int
+        or int(receipt["sample_count"]) < 1
+        or type(receipt.get("class_counts")) is not dict
+        or set(receipt["class_counts"]) != set(_TERRAIN_CLASSES)
+        or any(
+            type(receipt["class_counts"].get(name)) is not int
+            or int(receipt["class_counts"][name]) < 1
+            for name in _TERRAIN_CLASSES
+        )
+        or sum(receipt["class_counts"].values()) != receipt["sample_count"]
+        or not _sha256_value(receipt.get("pairs_sha256"))
+        or not _sha256_value(receipt.get("receipt_sha256"))
+    ):
+        raise ValueError("fitted transition pair receipt is invalid")
+    try:
+        expected = fitted_transition_pair_receipt(dataset)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("fitted transition pair receipt recomputation failed") from error
+    if dict(receipt) != expected:
+        raise ValueError("fitted transition pair receipt mismatch")
+    return json.loads(
+        json.dumps(
+            expected,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    )
+
+
+def _immutable_sample_copy(sample: Mapping[str, object]) -> Mapping[str, object]:
+    copied: dict[str, object] = {}
+    for name, value in sample.items():
+        if isinstance(value, np.ndarray):
+            array = value.copy()
+            array.flags.writeable = False
+            copied[name] = array
+        else:
+            copied[name] = value
+    return MappingProxyType(copied)
+
+
+def materialize_transition_pairs(dataset: object) -> _MaterializedDataset:
+    """Seal complete pair rows after one sorted read of every source row."""
+
+    source_rows: list[Mapping[str, object]] = []
+    for index in range(len(dataset)):
+        row = dataset[index]
+        if not isinstance(row, Mapping):
+            raise ValueError("transition-pair source row is invalid")
+        source_rows.append(_immutable_sample_copy(row))
+    cached = _MaterializedDataset(dataset, source_rows)
+    pairs = validate_canonical_transition_pairs(
+        cached, canonical_transition_pairs(cached)
+    )
+    materialized: list[Mapping[str, object]] = []
+    for pair in pairs:
+        predecessor_y = np.asarray(cached[pair.predecessor_index]["y"]).copy()
+        predecessor_y.flags.writeable = False
+        materialized.append(
+            MappingProxyType(
+                {
+                    "current": cached[pair.current_index],
+                    "predecessor_y": predecessor_y,
+                    "pair": pair,
+                }
+            )
+        )
+    return _MaterializedDataset(cached, materialized)
 
 
 def stratified_subset(
@@ -873,6 +1136,27 @@ def _batch(
         torch.as_tensor(np.stack([item["x"] for item in samples]), device=device),
         torch.as_tensor(np.asarray([item["phase"] for item in samples]), device=device),
         torch.as_tensor(np.stack([item["y"] for item in samples]), device=device),
+    )
+
+
+def _predecessor_batch(
+    dataset: object, indices: Sequence[int], device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    rows = [dataset[index] for index in indices]
+    return (
+        torch.as_tensor(
+            np.stack([row["current"]["x"] for row in rows]), device=device
+        ),
+        torch.as_tensor(
+            np.asarray([row["current"]["phase"] for row in rows]),
+            device=device,
+        ),
+        torch.as_tensor(
+            np.stack([row["current"]["y"] for row in rows]), device=device
+        ),
+        torch.as_tensor(
+            np.stack([row["predecessor_y"] for row in rows]), device=device
+        ),
     )
 
 
@@ -1668,8 +1952,12 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "FittedTransitionPair",
     "build_pipeline_promotion_receipt",
+    "canonical_transition_pairs",
+    "fitted_transition_pair_receipt",
     "main",
+    "materialize_transition_pairs",
     "materialize_subset",
     "consecutive_overfit_subset",
     "fitted_subset_metadata",
@@ -1681,4 +1969,6 @@ __all__ = [
     "seed_worker",
     "stratified_subset",
     "train",
+    "validate_canonical_transition_pairs",
+    "validate_fitted_transition_pair_receipt",
 ]

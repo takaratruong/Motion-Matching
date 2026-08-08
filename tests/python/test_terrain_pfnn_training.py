@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import tempfile
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 import unittest
@@ -123,6 +124,88 @@ class _FittedEnvelopeModel(torch.nn.Module):
     def forward(self, x: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
         self.phases.extend(float(value) for value in phase.detach().cpu())
         return self.output.to(device=x.device).expand(len(x), -1)
+
+
+class _TransitionPairRows:
+    split = "train"
+    x_mean = np.zeros(INPUT_LAYOUT.size, np.float32)
+    x_std = np.ones(INPUT_LAYOUT.size, np.float32)
+    y_mean = np.zeros(OUTPUT_LAYOUT.size, np.float32)
+    y_std = np.ones(OUTPUT_LAYOUT.size, np.float32)
+
+    _LOGICAL_ROWS = (
+        ("clip_b", "motion", 11, "descent"),
+        ("clip_a", "motion", 3, "flat"),
+        ("clip_a", "motion", 1, "ascent"),
+        ("clip_a", "idle_phase_0", 2, "transition"),
+        ("clip_b", "motion", 10, "ascent"),
+        ("clip_a", "motion", 2, "ascent"),
+        ("clip_a", "idle_phase_0", 1, "flat"),
+    )
+
+    def __init__(
+        self,
+        logical_rows: object | None = None,
+    ) -> None:
+        values = self._LOGICAL_ROWS if logical_rows is None else logical_rows
+        self.rows = [
+            self._row(clip, lane, center, terrain)
+            for clip, lane, center, terrain in values
+        ]
+        self.calls: list[int] = []
+
+    @staticmethod
+    def _row(
+        clip: str, lane: str, center: int, terrain: str
+    ) -> dict[str, object]:
+        x = np.zeros(INPUT_LAYOUT.size, np.float64)
+        y = np.zeros(OUTPUT_LAYOUT.size, np.float64)
+        x[0] = float(center)
+        y[0] = float(center) / 100.0
+        return {
+            "x": x,
+            "y": y,
+            "phase": np.float32(0.25),
+            "clip_id": clip,
+            "center_frame": center,
+            "split_identity": f"{clip}_train",
+            "split": "train",
+            "sequence_lane": lane,
+            "terrain_class": terrain,
+        }
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, index: int) -> dict[str, object]:
+        self.calls.append(index)
+        return self.rows[index]
+
+
+class _TargetEnvelopePairRows:
+    def __init__(self) -> None:
+        predecessor = np.zeros(OUTPUT_LAYOUT.size, np.float64)
+        predecessor[OUTPUT_LAYOUT["joint_position"].start + 1] = 0.98
+        boundary = predecessor.copy()
+        boundary[OUTPUT_LAYOUT["joint_position"].start] = 0.225
+        boundary[OUTPUT_LAYOUT["joint_position"].start + 1] = 0.98
+        boundary[OUTPUT_LAYOUT["phase_advance"]] = 0.48
+        tolerance = 9.5367431640625e-7
+        negative_tolerance = boundary.copy()
+        negative_tolerance[OUTPUT_LAYOUT["phase_advance"]] = -tolerance
+        self.rows = [
+            {"current": {"y": boundary}, "predecessor_y": predecessor.copy()},
+            {
+                "current": {"y": negative_tolerance},
+                "predecessor_y": predecessor.copy(),
+            },
+        ]
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, index: int) -> dict[str, object]:
+        return self.rows[index]
 
 
 def _global_envelope_worker(
@@ -989,6 +1072,345 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             phase_advance_q99=0.2,
         )
         self.assertNotEqual(report.rows_sha256, changed_report.rows_sha256)
+
+    def test_predecessor_pair_receipt_is_complete_lane_safe_and_hash_bound(
+        self,
+    ) -> None:
+        rows = _TransitionPairRows()
+        pairs = train_module.canonical_transition_pairs(rows)
+        self.assertEqual(
+            [
+                (
+                    pair.clip_id,
+                    pair.sequence_lane,
+                    pair.predecessor_center_frame,
+                    pair.center_frame,
+                )
+                for pair in pairs
+            ],
+            [
+                ("clip_a", "idle_phase_0", 1, 2),
+                ("clip_a", "motion", 1, 2),
+                ("clip_a", "motion", 2, 3),
+                ("clip_b", "motion", 10, 11),
+            ],
+        )
+        receipt = train_module.fitted_transition_pair_receipt(rows)
+        self.assertEqual(
+            receipt["schema"],
+            "mm-sonic-fitted-transition-pair-receipt/v1",
+        )
+        self.assertEqual(receipt["active_row_count"], 7)
+        self.assertEqual(receipt["sample_count"], 4)
+        self.assertEqual(
+            receipt["class_counts"],
+            {"flat": 1, "ascent": 1, "descent": 1, "transition": 1},
+        )
+        self.assertNotIn("pairs", receipt)
+        self.assertEqual(
+            train_module.validate_fitted_transition_pair_receipt(receipt, rows),
+            receipt,
+        )
+
+        reversed_rows = _TransitionPairRows(reversed(_TransitionPairRows._LOGICAL_ROWS))
+        reversed_receipt = train_module.fitted_transition_pair_receipt(reversed_rows)
+        self.assertEqual(
+            json.dumps(receipt, sort_keys=True, separators=(",", ":")),
+            json.dumps(reversed_receipt, sort_keys=True, separators=(",", ":")),
+        )
+
+        tamper_cases = {
+            "pairs digest": lambda value: value.__setitem__(
+                "pairs_sha256", "0" * 64
+            ),
+            "sample count": lambda value: value.__setitem__(
+                "sample_count", value["sample_count"] + 1
+            ),
+            "active row count": lambda value: value.__setitem__(
+                "active_row_count", value["active_row_count"] + 1
+            ),
+            "active row digest": lambda value: value.__setitem__(
+                "active_rows_sha256", "1" * 64
+            ),
+            "class count": lambda value: value["class_counts"].__setitem__(
+                "flat", value["class_counts"]["flat"] + 1
+            ),
+            "receipt digest": lambda value: value.__setitem__(
+                "receipt_sha256", "2" * 64
+            ),
+        }
+        for name, mutate in tamper_cases.items():
+            with self.subTest(tamper=name):
+                tampered = json.loads(json.dumps(receipt))
+                mutate(tampered)
+                with self.assertRaisesRegex(ValueError, "pair receipt"):
+                    train_module.validate_fitted_transition_pair_receipt(
+                        tampered, rows
+                    )
+
+        candidate_cases = {
+            "omitted": pairs[1:],
+            "extra nonadjacent": (
+                *pairs,
+                replace(pairs[-1], predecessor_center_frame=8),
+            ),
+            "duplicated": (*pairs, pairs[1]),
+            "reordered": (pairs[0], pairs[2], pairs[1], pairs[3]),
+        }
+        for name, candidate in candidate_cases.items():
+            with self.subTest(candidate=name):
+                with self.assertRaisesRegex(ValueError, "recomputation"):
+                    train_module.validate_canonical_transition_pairs(
+                        rows, candidate
+                    )
+
+        split_tampered = _TransitionPairRows()
+        split_tampered.rows[0]["split"] = "validation"
+        with self.assertRaisesRegex(ValueError, "transition-pair"):
+            train_module.validate_canonical_transition_pairs(
+                split_tampered, pairs
+            )
+
+        real_adjacent = training_module.fitted_adjacent_indices
+        with patch.object(
+            train_module,
+            "canonical_transition_pairs",
+            wraps=train_module.canonical_transition_pairs,
+        ) as primary, patch.object(
+            train_module,
+            "fitted_adjacent_indices",
+            side_effect=lambda dataset, indices: tuple(
+                reversed(real_adjacent(dataset, indices))
+            ),
+        ) as independent:
+            self.assertEqual(
+                train_module.fitted_transition_pair_receipt(rows), receipt
+            )
+        self.assertGreaterEqual(primary.call_count, 1)
+        independent.assert_called_once()
+
+        with patch.object(
+            train_module,
+            "fitted_adjacent_indices",
+            side_effect=lambda dataset, indices: real_adjacent(dataset, indices)[1:],
+        ):
+            with self.assertRaisesRegex(ValueError, "recomputation"):
+                train_module.fitted_transition_pair_receipt(rows)
+
+    def test_synthetic_target_envelope_audit_accepts_exact_boundaries_and_rejects_each_excess(
+        self,
+    ) -> None:
+        rows = _TargetEnvelopePairRows()
+        arguments = {
+            "normalization": _normalization(),
+            "joint_limits": np.asarray([[-1.0, 1.0]] * 29, np.float64),
+            "phase_advance_cap": 0.50,
+            "contract": training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+        }
+        audit = training_module.fitted_target_envelope_audit(rows, **arguments)
+        tolerance = 9.5367431640625e-7
+        self.assertEqual(
+            training_module.PHASE_AUDIT_NEGATIVE_TOLERANCE_RAD,
+            tolerance,
+        )
+        self.assertEqual(
+            training_module.PHASE_AUDIT_NEGATIVE_TOLERANCE_RAD,
+            8 * np.finfo(np.float32).eps,
+        )
+        self.assertEqual(audit["sample_count"], 2)
+        self.assertEqual(audit["maximum_joint_step_rad"], 0.225)
+        self.assertAlmostEqual(
+            audit["minimum_joint_limit_clearance_rad"], 0.02, places=15
+        )
+        self.assertEqual(audit["minimum_phase_advance_unclamped_rad"], -tolerance)
+        self.assertEqual(audit["minimum_phase_advance_rad"], 0.0)
+        self.assertEqual(audit["maximum_phase_advance_rad"], 0.48)
+        self.assertEqual(audit["joint_step_excess_count"], 0)
+        self.assertEqual(audit["joint_limit_margin_excess_count"], 0)
+        self.assertEqual(audit["phase_negative_excess_count"], 0)
+        self.assertEqual(audit["phase_upper_excess_count"], 0)
+        base = {
+            name: value
+            for name, value in audit.items()
+            if name != "audit_sha256"
+        }
+        self.assertEqual(
+            audit["audit_sha256"],
+            hashlib.sha256(
+                json.dumps(
+                    base,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode()
+            ).hexdigest(),
+        )
+
+        cases = (
+            (
+                "joint step",
+                0,
+                OUTPUT_LAYOUT["joint_position"].start,
+                0.225001,
+            ),
+            (
+                "joint limit",
+                0,
+                OUTPUT_LAYOUT["joint_position"].start + 1,
+                0.980001,
+            ),
+            (
+                "phase minimum",
+                1,
+                OUTPUT_LAYOUT["phase_advance"].start,
+                -1.0e-6,
+            ),
+            (
+                "phase upper",
+                0,
+                OUTPUT_LAYOUT["phase_advance"].start,
+                0.480001,
+            ),
+        )
+        for field, row_index, offset, value in cases:
+            with self.subTest(field=field):
+                changed = _TargetEnvelopePairRows()
+                current = dict(changed.rows[row_index]["current"])
+                target = np.asarray(current["y"]).copy()
+                target[offset] = value
+                current["y"] = target
+                changed.rows[row_index] = {
+                    **changed.rows[row_index],
+                    "current": current,
+                }
+                maximum = np.maximum
+                with patch.object(
+                    training_module.np, "maximum", wraps=maximum
+                ) as audit_clamp:
+                    with self.assertRaisesRegex(ValueError, field):
+                        training_module.fitted_target_envelope_audit(
+                            changed, **arguments
+                        )
+                if field == "phase minimum":
+                    self.assertFalse(
+                        any(
+                            len(call.args) == 2 and call.args[1] == 0.0
+                            for call in audit_clamp.call_args_list
+                        )
+                    )
+
+    def test_transition_pairs_keep_lanes_distinct_and_gaps_terminate_runs(
+        self,
+    ) -> None:
+        rows = _TransitionPairRows(
+            (
+                ("clip", "motion", 1, "flat"),
+                ("clip", "idle_phase_0", 1, "ascent"),
+                ("clip", "motion", 2, "descent"),
+                ("clip", "idle_phase_0", 2, "transition"),
+                ("clip", "motion", 4, "flat"),
+                ("clip", "motion", 6, "ascent"),
+            )
+        )
+        pairs = train_module.canonical_transition_pairs(rows)
+        self.assertEqual(
+            [
+                (pair.sequence_lane, pair.predecessor_center_frame, pair.center_frame)
+                for pair in pairs
+            ],
+            [("idle_phase_0", 1, 2), ("motion", 1, 2)],
+        )
+
+    def test_transition_pairs_reject_duplicate_logical_rows(self) -> None:
+        rows = _TransitionPairRows()
+        rows.rows.append(dict(rows.rows[2]))
+        with self.assertRaisesRegex(ValueError, "duplicate transition-pair"):
+            train_module.canonical_transition_pairs(rows)
+
+    def test_transition_pair_order_and_receipt_ignore_storage_order(self) -> None:
+        rows = _TransitionPairRows()
+        reverse = _TransitionPairRows(reversed(_TransitionPairRows._LOGICAL_ROWS))
+        ordered_pairs = train_module.canonical_transition_pairs(rows)
+        reversed_pairs = train_module.canonical_transition_pairs(reverse)
+        self.assertEqual(
+            [
+                (
+                    pair.clip_id,
+                    pair.sequence_lane,
+                    pair.predecessor_center_frame,
+                    pair.center_frame,
+                    pair.predecessor_row_sha256,
+                    pair.current_row_sha256,
+                )
+                for pair in ordered_pairs
+            ],
+            [
+                (
+                    pair.clip_id,
+                    pair.sequence_lane,
+                    pair.predecessor_center_frame,
+                    pair.center_frame,
+                    pair.predecessor_row_sha256,
+                    pair.current_row_sha256,
+                )
+                for pair in reversed_pairs
+            ],
+        )
+
+    def test_transition_pair_materialization_is_immutable_reads_once_and_excludes_run_starts(
+        self,
+    ) -> None:
+        rows = _TransitionPairRows()
+        pairs = train_module.materialize_transition_pairs(rows)
+        self.assertEqual(rows.calls, list(range(len(rows))))
+        self.assertEqual(len(pairs), 4)
+        pair_classes = [
+            str(pairs[index]["current"]["terrain_class"])
+            for index in range(len(pairs))
+        ]
+        self.assertEqual(
+            pair_classes,
+            ["transition", "ascent", "flat", "descent"],
+        )
+        self.assertEqual(
+            pair_classes,
+            [pairs[index]["pair"].terrain_class for index in range(len(pairs))],
+        )
+        sampled = train_module._balanced_epoch_indices(
+            list(range(len(pairs))), pair_classes, seed=7, epoch=0
+        )
+        self.assertEqual(set(sampled), set(range(len(pairs))))
+        current_keys = {
+            (
+                pairs[index]["pair"].clip_id,
+                pairs[index]["pair"].sequence_lane,
+                pairs[index]["pair"].center_frame,
+            )
+            for index in sampled
+        }
+        self.assertTrue(
+            {
+                ("clip_a", "idle_phase_0", 1),
+                ("clip_a", "motion", 1),
+                ("clip_b", "motion", 10),
+            }.isdisjoint(current_keys)
+        )
+        predecessor_before = np.asarray(pairs[0]["predecessor_y"]).copy()
+        rows.rows[6]["y"][0] = 999.0
+        np.testing.assert_array_equal(
+            pairs[0]["predecessor_y"], predecessor_before
+        )
+        with self.assertRaises(TypeError):
+            pairs[0]["current"] = {}
+        with self.assertRaises(ValueError):
+            pairs[0]["predecessor_y"][0] = 1.0
+        batch = train_module._predecessor_batch(
+            pairs, tuple(range(len(pairs))), torch.device("cpu")
+        )
+        self.assertEqual(
+            [tuple(value.shape) for value in batch],
+            [(4, INPUT_LAYOUT.size), (4,), (4, OUTPUT_LAYOUT.size), (4, OUTPUT_LAYOUT.size)],
+        )
 
     def test_fitted_transition_report_canonicalizes_adjacent_pair_order(self) -> None:
         output = _FittedEnvelopeRows._physical_output()

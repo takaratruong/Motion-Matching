@@ -196,6 +196,8 @@ class PhysicalEnvelopeObjective:
 
 
 DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE = PhysicalEnvelopeObjective()
+PHASE_AUDIT_NEGATIVE_TOLERANCE_RAD: float = 9.5367431640625e-7
+assert PHASE_AUDIT_NEGATIVE_TOLERANCE_RAD == 8 * np.finfo(np.float32).eps
 
 
 def physical_envelope_risks(
@@ -287,6 +289,146 @@ def physical_envelope_risks(
         ),
         "phase": torch.maximum(lower_phase_excess, upper_phase_excess.square()),
     }
+
+
+def fitted_target_envelope_audit(
+    dataset: object,
+    *,
+    normalization: object,
+    joint_limits: object,
+    phase_advance_cap: float,
+    contract: PhysicalEnvelopeObjective,
+) -> dict[str, object]:
+    """Seal feasibility of normalized predecessor/current training targets."""
+
+    if contract != DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE:
+        raise ValueError("fitted target envelope objective contract mismatch")
+    try:
+        phase_cap = float(phase_advance_cap)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("fitted target envelope phase cap is invalid") from error
+    if (
+        isinstance(phase_advance_cap, bool)
+        or not math.isfinite(phase_cap)
+        or phase_cap <= contract.phase_upper_margin_rad
+    ):
+        raise ValueError("fitted target envelope phase cap is invalid")
+    try:
+        limits = np.asarray(joint_limits, dtype=np.float64)
+    except (TypeError, ValueError) as error:
+        raise ValueError("fitted target envelope joint limits are invalid") from error
+    if (
+        limits.shape != (len(ISAACLAB_JOINT_NAMES), 2)
+        or not np.isfinite(limits).all()
+        or np.any(
+            limits[:, 0] + contract.joint_limit_margin_rad
+            > limits[:, 1] - contract.joint_limit_margin_rad
+        )
+    ):
+        raise ValueError("fitted target envelope joint limits are invalid")
+    try:
+        sample_count = len(dataset)
+    except TypeError as error:
+        raise ValueError("fitted target envelope rows are invalid") from error
+    if type(sample_count) is not int or sample_count < 1:
+        raise ValueError("fitted target envelope rows are invalid")
+
+    normalized_pairs: list[tuple[np.ndarray, np.ndarray]] = []
+    for index in range(sample_count):
+        row = dataset[index]
+        if not isinstance(row, Mapping) or not isinstance(
+            row.get("current"), Mapping
+        ):
+            raise ValueError("fitted target envelope row is invalid")
+        try:
+            predecessor = np.asarray(row["predecessor_y"], dtype=np.float64)
+            current = np.asarray(row["current"]["y"], dtype=np.float64)
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("fitted target envelope row is invalid") from error
+        if (
+            predecessor.shape != (OUTPUT_LAYOUT.size,)
+            or current.shape != (OUTPUT_LAYOUT.size,)
+            or not np.isfinite(predecessor).all()
+            or not np.isfinite(current).all()
+        ):
+            raise ValueError("fitted target envelope row is invalid")
+        normalized_pairs.append((predecessor, current))
+
+    normal = _normalization_tensors(
+        normalization, device=torch.device("cpu"), dtype=torch.float64
+    )
+    y_mean = normal["y_mean"].numpy()
+    y_std = normal["y_std"].numpy()
+    normalized = np.stack(normalized_pairs, axis=0)
+    physical = normalized * y_std.reshape(1, 1, -1) + y_mean.reshape(1, 1, -1)
+    if not np.isfinite(physical).all():
+        raise ValueError("fitted target envelope targets must be finite")
+
+    predecessor_joints = physical[:, 0, OUTPUT_LAYOUT["joint_position"]]
+    current_joints = physical[:, 1, OUTPUT_LAYOUT["joint_position"]]
+    joint_steps = np.max(
+        np.abs(current_joints - predecessor_joints), axis=1
+    )
+    lower_boundaries = limits[:, 0] + contract.joint_limit_margin_rad
+    upper_boundaries = limits[:, 1] - contract.joint_limit_margin_rad
+    joint_limit_failures = np.any(
+        (current_joints < lower_boundaries)
+        | (current_joints > upper_boundaries),
+        axis=1,
+    )
+    joint_clearances = np.minimum(
+        current_joints - limits[:, 0],
+        limits[:, 1] - current_joints,
+    )
+    phase_unclamped = physical[:, 1, OUTPUT_LAYOUT["phase_advance"]].reshape(-1)
+    minimum_phase_unclamped = float(np.min(phase_unclamped))
+    phase_negative_failures = (
+        phase_unclamped < -PHASE_AUDIT_NEGATIVE_TOLERANCE_RAD
+    )
+    phase_negative_excess_count = int(
+        np.count_nonzero(phase_negative_failures)
+    )
+    if phase_negative_excess_count:
+        raise ValueError("fitted target phase minimum exceeds audit tolerance")
+    phase = np.maximum(phase_unclamped, 0.0)
+    phase_upper_boundary = phase_cap - contract.phase_upper_margin_rad
+    phase_upper_failures = phase > phase_upper_boundary
+    joint_step_excess_count = int(
+        np.count_nonzero(joint_steps > contract.joint_step_onset_rad)
+    )
+    joint_limit_margin_excess_count = int(
+        np.count_nonzero(joint_limit_failures)
+    )
+    phase_upper_excess_count = int(np.count_nonzero(phase_upper_failures))
+
+    if joint_step_excess_count:
+        raise ValueError("fitted target joint step exceeds physical envelope")
+    if joint_limit_margin_excess_count:
+        raise ValueError("fitted target joint limit margin is infeasible")
+    if phase_upper_excess_count:
+        raise ValueError("fitted target phase upper margin is infeasible")
+
+    base: dict[str, object] = {
+        "schema": "mm-sonic-fitted-target-envelope-audit/v1",
+        "sample_count": sample_count,
+        "joint_step_onset_rad": contract.joint_step_onset_rad,
+        "joint_limit_margin_rad": contract.joint_limit_margin_rad,
+        "phase_upper_margin_rad": contract.phase_upper_margin_rad,
+        "phase_advance_cap_rad": phase_cap,
+        "phase_audit_negative_tolerance_rad": (
+            PHASE_AUDIT_NEGATIVE_TOLERANCE_RAD
+        ),
+        "maximum_joint_step_rad": float(np.max(joint_steps)),
+        "minimum_joint_limit_clearance_rad": float(np.min(joint_clearances)),
+        "minimum_phase_advance_unclamped_rad": minimum_phase_unclamped,
+        "minimum_phase_advance_rad": float(np.min(phase)),
+        "maximum_phase_advance_rad": float(np.max(phase)),
+        "joint_step_excess_count": joint_step_excess_count,
+        "joint_limit_margin_excess_count": joint_limit_margin_excess_count,
+        "phase_negative_excess_count": phase_negative_excess_count,
+        "phase_upper_excess_count": phase_upper_excess_count,
+    }
+    return {**base, "audit_sha256": _canonical_json_sha256(base)}
 
 
 @dataclass(frozen=True)
@@ -2737,12 +2879,14 @@ __all__ = [
     "FittedTransitionReport",
     "LOSS_WEIGHT_KEYS",
     "LoadedCheckpoint",
+    "PHASE_AUDIT_NEGATIVE_TOLERANCE_RAD",
     "RolloutResult",
     "autoregressive_unroll",
     "choose_runtime_seed",
     "evaluate_fitted_transition_envelope",
     "fitted_adjacent_indices",
     "fitted_row_sha256",
+    "fitted_target_envelope_audit",
     "finite_runtime_seed",
     "load_checkpoint",
     "one_step_metrics",
