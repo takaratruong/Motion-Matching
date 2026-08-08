@@ -15,6 +15,7 @@ class TerrainPFNNViewerTests(unittest.TestCase):
         arguments = _parser().parse_args([])
         self.assertGreaterEqual(arguments.max_steps, 1_000_000)
         self.assertEqual(arguments.device, "cuda")
+        self.assertFalse(arguments.strict_envelope)
 
         output = StringIO()
         with redirect_stdout(output), self.assertRaises(SystemExit) as raised:
@@ -22,6 +23,7 @@ class TerrainPFNNViewerTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 0)
         self.assertIn("--checkpoint", output.getvalue())
         self.assertIn("--no-viewer", output.getvalue())
+        self.assertIn("--strict-envelope", output.getvalue())
 
     def test_wasd_command_is_bounded_and_release_stops(self) -> None:
         from mm_sonic.terrain_pfnn_viewer import _command_from_pressed

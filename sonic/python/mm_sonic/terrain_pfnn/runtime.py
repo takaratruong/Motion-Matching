@@ -253,9 +253,12 @@ class TerrainPFNNRuntime:
         height_and_grade_at: TerrainCallback,
         model: torch.nn.Module | None = None,
         device: str | torch.device = "cpu",
+        enforce_motion_envelope: bool = True,
     ) -> None:
         if not callable(height_and_grade_at):
             raise TypeError("height_and_grade_at must be callable")
+        if type(enforce_motion_envelope) is not bool:
+            raise TypeError("enforce_motion_envelope must be bool")
         signature = getattr(kinematics, "kinematic_signature_sha256", None)
         if signature != getattr(checkpoint, "kinematic_signature_sha256", None):
             raise ValueError("checkpoint kinematic signature mismatch")
@@ -280,6 +283,7 @@ class TerrainPFNNRuntime:
         self._limits = limits.copy()
         self._height_and_grade_at = height_and_grade_at
         self._checkpoint = checkpoint
+        self._enforce_motion_envelope = enforce_motion_envelope
         self._device = torch.device(device)
         self._limits_tensor = torch.as_tensor(
             self._limits, dtype=torch.float64, device=self._device
@@ -426,6 +430,7 @@ class TerrainPFNNRuntime:
         model_path: str | Path,
         height_and_grade_at: TerrainCallback,
         device: str | torch.device = "cpu",
+        enforce_motion_envelope: bool = True,
     ) -> "TerrainPFNNRuntime":
         kinematics = TorchG1ForwardKinematics.from_mjcf(model_path)
         checkpoint = load_checkpoint(
@@ -440,6 +445,7 @@ class TerrainPFNNRuntime:
             kinematics=kinematics,
             height_and_grade_at=height_and_grade_at,
             device=device,
+            enforce_motion_envelope=enforce_motion_envelope,
         )
 
     @property
@@ -677,55 +683,67 @@ class TerrainPFNNRuntime:
         if not bool(torch.isfinite(physical).all()):
             return self._hold("denormalized_output_nonfinite")
 
+        preview_envelope_violations: list[str] = []
         local_trajectory_direction = physical[
             OUTPUT_LAYOUT["trajectory_direction"]
         ].reshape(12, 2)
         direction_norm = torch.linalg.vector_norm(
             local_trajectory_direction, dim=-1
         )
-        if bool(torch.any(direction_norm < 0.5)) or bool(
+        direction_invalid = bool(torch.any(direction_norm < 0.5)) or bool(
             torch.any(direction_norm > 1.5)
-        ):
+        )
+        if direction_invalid:
             direction_index = int(
                 torch.argmax(
                     torch.maximum(0.5 - direction_norm, direction_norm - 1.5)
                 ).item()
             )
-            return self._hold(
-                "trajectory_direction_norm",
-                rejected_trajectory_direction_index=direction_index,
-                rejected_trajectory_direction_norm=float(direction_norm[direction_index]),
-                rejected_minimum_trajectory_direction_norm=float(
-                    torch.min(direction_norm)
-                ),
-                rejected_maximum_trajectory_direction_norm=float(
-                    torch.max(direction_norm)
-                ),
-            )
+            if self._enforce_motion_envelope:
+                return self._hold(
+                    "trajectory_direction_norm",
+                    rejected_trajectory_direction_index=direction_index,
+                    rejected_trajectory_direction_norm=float(direction_norm[direction_index]),
+                    rejected_minimum_trajectory_direction_norm=float(
+                        torch.min(direction_norm)
+                    ),
+                    rejected_maximum_trajectory_direction_norm=float(
+                        torch.max(direction_norm)
+                    ),
+                )
+            preview_envelope_violations.append("trajectory_direction_norm")
         root_height = float(physical[OUTPUT_LAYOUT["root_height"]][0])
         tilt = physical[OUTPUT_LAYOUT["root_tilt"]]
         joints = physical[OUTPUT_LAYOUT["joint_position"]]
         raw_phase_advance = float(physical[OUTPUT_LAYOUT["phase_advance"]][0])
         if root_height <= 0.0:
-            return self._hold("root_height_nonpositive")
-        if bool(torch.any(joints < self._limits_tensor[:, 0])) or bool(
+            if self._enforce_motion_envelope:
+                return self._hold("root_height_nonpositive")
+            preview_envelope_violations.append("root_height_nonpositive")
+        joint_limit_invalid = bool(torch.any(joints < self._limits_tensor[:, 0])) or bool(
             torch.any(joints > self._limits_tensor[:, 1])
-        ):
-            return self._hold("joint_limit")
+        )
+        if joint_limit_invalid:
+            if self._enforce_motion_envelope:
+                return self._hold("joint_limit")
+            preview_envelope_violations.append("joint_limit")
         previous_joints = torch.tensor(
             self._frame.joint_position_isaaclab,
             dtype=torch.float64,
             device=self._device,
         )
         joint_delta = torch.abs(joints - previous_joints)
-        if float(torch.max(joint_delta)) > MAXIMUM_JOINT_STEP_RAD + 1.0e-10:
+        maximum_joint_step = float(torch.max(joint_delta))
+        if maximum_joint_step > MAXIMUM_JOINT_STEP_RAD + 1.0e-10:
             joint_index = int(torch.argmax(joint_delta).item())
-            return self._hold(
-                "joint_step",
-                rejected_max_joint_step_rad=float(joint_delta[joint_index]),
-                rejected_joint_index=joint_index,
-                rejected_joint_name=ISAACLAB_JOINT_NAMES[joint_index],
-            )
+            if self._enforce_motion_envelope:
+                return self._hold(
+                    "joint_step",
+                    rejected_max_joint_step_rad=float(joint_delta[joint_index]),
+                    rejected_joint_index=joint_index,
+                    rejected_joint_name=ISAACLAB_JOINT_NAMES[joint_index],
+                )
+            preview_envelope_violations.append("joint_step")
 
         physical_recurrent = physical.to(
             dtype=self._recurrent_state.root_world_xy.dtype
@@ -762,14 +780,20 @@ class TerrainPFNNRuntime:
             return self._hold("root_quaternion")
         if not np.isclose(np.linalg.norm(new_quaternion), 1.0, atol=1.0e-6):
             return self._hold("root_quaternion")
-        if np.linalg.norm(candidate_new_position - self._frame.root_position_world) > (
-            MAXIMUM_ROOT_TRANSLATION_STEP_M + 1.0e-10
-        ):
-            return self._hold("root_translation_step")
-        if _quaternion_step(
+        root_translation_step = float(
+            np.linalg.norm(candidate_new_position - self._frame.root_position_world)
+        )
+        if root_translation_step > MAXIMUM_ROOT_TRANSLATION_STEP_M + 1.0e-10:
+            if self._enforce_motion_envelope:
+                return self._hold("root_translation_step")
+            preview_envelope_violations.append("root_translation_step")
+        root_rotation_step = _quaternion_step(
             self._frame.root_quaternion_world_wxyz, new_quaternion
-        ) > MAXIMUM_ROOT_ROTATION_STEP_RAD + 1.0e-10:
-            return self._hold("root_rotation_step")
+        )
+        if root_rotation_step > MAXIMUM_ROOT_ROTATION_STEP_RAD + 1.0e-10:
+            if self._enforce_motion_envelope:
+                return self._hold("root_rotation_step")
+            preview_envelope_violations.append("root_rotation_step")
         phase_advance = float(np.clip(raw_phase_advance, 0.0, self._phase_cap))
         if not 0.0 <= phase_advance <= self._phase_cap + 1.0e-12:
             return self._hold("phase_advance_cap")
@@ -844,6 +868,23 @@ class TerrainPFNNRuntime:
             "terrain_grade_degrees": new_support.absolute_grade_degrees,
             "replanned_unsupported_future": not supported,
         }
+        if not self._enforce_motion_envelope:
+            diagnostics.update(
+                {
+                    "preview_envelope_violations": tuple(
+                        preview_envelope_violations
+                    ),
+                    "preview_max_joint_step_rad": maximum_joint_step,
+                    "preview_root_translation_step_m": root_translation_step,
+                    "preview_root_rotation_step_rad": root_rotation_step,
+                    "preview_minimum_trajectory_direction_norm": float(
+                        torch.min(direction_norm)
+                    ),
+                    "preview_maximum_trajectory_direction_norm": float(
+                        torch.max(direction_norm)
+                    ),
+                }
+            )
         frame = PFNNRuntimeFrame(
             root_position_world=new_position,
             root_quaternion_world_wxyz=new_quaternion,

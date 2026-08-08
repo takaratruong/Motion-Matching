@@ -45,6 +45,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--trace-every", type=int, default=30)
     parser.add_argument("--no-viewer", action="store_true")
     parser.add_argument("--smoke-steps", type=int, default=0)
+    parser.add_argument(
+        "--strict-envelope",
+        action="store_true",
+        help="freeze on envelope violations instead of previewing raw PFNN output",
+    )
     return parser
 
 
@@ -158,7 +163,8 @@ def _trace(step: int, frame: object, terrain: _HillTerrainCallback) -> str:
         f"grade={grade:.2f} phase={frame.phase:.3f} "
         f"advance={float(diagnostics.get('phase_advance', 0.0)):.3f} "
         f"speed={float(diagnostics.get('desired_speed_m_s', 0.0)):.3f} "
-        f"contacts={contacts} hold={diagnostics.get('hold_reason', '-') }"
+        f"contacts={contacts} hold={diagnostics.get('hold_reason', '-')} "
+        f"preview={','.join(diagnostics.get('preview_envelope_violations', ())) or '-'}"
     )
 
 
@@ -179,6 +185,7 @@ def _load_runtime(
         model_path=model_path,
         height_and_grade_at=terrain,
         device=arguments.device,
+        enforce_motion_envelope=arguments.strict_envelope,
     )
 
 

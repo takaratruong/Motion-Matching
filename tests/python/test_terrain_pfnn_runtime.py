@@ -168,12 +168,14 @@ class TerrainPFNNRuntimeTests(unittest.TestCase):
         *,
         terrain=terrain_with_grade(0.0),
         checkpoint: FakeCheckpoint | None = None,
+        enforce_motion_envelope: bool = True,
     ) -> TerrainPFNNRuntime:
         return TerrainPFNNRuntime(
             checkpoint=FakeCheckpoint() if checkpoint is None else checkpoint,
             kinematics=FakeKinematics(),
             model=model,
             height_and_grade_at=terrain,
+            enforce_motion_envelope=enforce_motion_envelope,
         )
 
     def test_checkpoint_seed_is_the_exact_reached_bootstrap_state(self) -> None:
@@ -370,6 +372,23 @@ class TerrainPFNNRuntimeTests(unittest.TestCase):
         third = runtime.step(np.zeros(2), camera_yaw=0.0)
         np.testing.assert_array_equal(model.inputs[1], model.inputs[2])
         self.assertEqual(third.diagnostics["hold_count"], 1)
+
+    def test_preview_mode_commits_finite_pose_and_reports_envelope_violation(self) -> None:
+        model = FakeModel(
+            [physical_output(joints=0.1), physical_output(joints=1.0)]
+        )
+        runtime = self.make_runtime(model, enforce_motion_envelope=False)
+
+        first = runtime.step(np.zeros(2), camera_yaw=0.0)
+        second = runtime.step(np.zeros(2), camera_yaw=0.0)
+
+        self.assertNotIn("hold_reason", second.diagnostics)
+        self.assertIn("joint_step", second.diagnostics["preview_envelope_violations"])
+        self.assertEqual(second.diagnostics["hold_count"], 0)
+        self.assertGreater(
+            float(np.max(np.abs(second.joint_position_isaaclab - first.joint_position_isaaclab))),
+            0.25,
+        )
 
     def test_current_missing_terrain_holds_without_calling_model(self) -> None:
         model = FakeModel([physical_output()])
