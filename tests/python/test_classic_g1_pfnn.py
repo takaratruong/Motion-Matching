@@ -9,6 +9,9 @@ import torch
 from torch.nn import functional as F
 
 from mm_sonic.train_classic_g1_pfnn import (
+    _grail_train_validation_masks,
+    _mirror_normalized_examples,
+    _parser,
     balanced_epoch_batches,
     classic_pfnn_loss,
     load_classic_checkpoint,
@@ -60,6 +63,67 @@ class ClassicG1PFNNTests(unittest.TestCase):
             self.assertEqual(int(np.count_nonzero(selected == "lafan")), 2)
         used = np.concatenate(first)
         self.assertTrue(set(range(len(source_kind))).issubset(set(used.tolist())))
+
+    def test_native_g1_training_batches_exclude_lafan_retarget_rows(self) -> None:
+        source_kind = np.asarray(("grail",) * 5 + ("lafan",) * 9, dtype="<U6")
+
+        batches = balanced_epoch_batches(
+            source_kind,
+            batch_size=4,
+            seed=23,
+            epoch=0,
+            source_filter="grail",
+        )
+
+        used = np.concatenate(batches)
+        self.assertTrue(np.all(source_kind[used] == "grail"))
+        self.assertTrue(set(range(5)).issubset(set(used.tolist())))
+        self.assertEqual(_parser().parse_args(["--dataset", "d", "--model-path", "m", "--output", "o"]).train_source, "grail")
+
+    def test_native_g1_validation_holds_out_last_present_variant_per_family(self) -> None:
+        clips = np.asarray(
+            (
+                "terrain_slopes__slope_a__000",
+                "terrain_slopes__slope_a__004",
+                "terrain_slopes__slope_b__001",
+                "terrain_slopes__slope_b__003",
+                "walk1_subject1",
+            )
+        )
+        source = np.asarray(("grail", "grail", "grail", "grail", "lafan"))
+
+        optimized, held_out = _grail_train_validation_masks(source, clips)
+
+        np.testing.assert_array_equal(optimized, (True, False, True, False, False))
+        np.testing.assert_array_equal(held_out, (False, True, False, True, False))
+
+    def test_native_g1_training_mirrors_yaw_lateral_motion_and_phase(self) -> None:
+        x = np.zeros((1, INPUT_LAYOUT.size), dtype=np.float32)
+        y = np.zeros((1, OUTPUT_LAYOUT.size), dtype=np.float32)
+        y[0, OUTPUT_LAYOUT["root_planar_velocity"]] = (0.5, -0.2)
+        y[0, OUTPUT_LAYOUT["root_yaw_velocity"]] = 0.7
+        phase = np.asarray((0.4,), dtype=np.float32)
+        normal = {
+            "x_mean": np.zeros(INPUT_LAYOUT.size, dtype=np.float32),
+            "x_std": np.ones(INPUT_LAYOUT.size, dtype=np.float32),
+            "y_mean": np.zeros(OUTPUT_LAYOUT.size, dtype=np.float32),
+            "y_std": np.ones(OUTPUT_LAYOUT.size, dtype=np.float32),
+        }
+
+        mirrored_x, mirrored_y, mirrored_phase = _mirror_normalized_examples(
+            x, y, phase, normal
+        )
+
+        self.assertEqual(mirrored_x.shape, x.shape)
+        np.testing.assert_allclose(
+            mirrored_y[0, OUTPUT_LAYOUT["root_planar_velocity"]], (0.5, 0.2)
+        )
+        np.testing.assert_allclose(
+            mirrored_y[0, OUTPUT_LAYOUT["root_yaw_velocity"]], (-0.7,)
+        )
+        self.assertAlmostEqual(
+            float(mirrored_phase[0]), (0.4 + np.pi) % (2.0 * np.pi), places=6
+        )
 
     def test_safe_checkpoint_round_trip_preserves_exact_model_output(self) -> None:
         torch.manual_seed(7)

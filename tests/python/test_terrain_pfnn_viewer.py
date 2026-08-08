@@ -68,7 +68,10 @@ class TerrainPFNNViewerTests(unittest.TestCase):
         )
         self.assertEqual(
             arguments.checkpoint,
-            Path("sonic/runs/terrain-pfnn-classic-g1/model/best.pt"),
+            Path(
+                "sonic/runs/terrain-pfnn-classic-g1/"
+                "model-grail-mirrored/best.pt"
+            ),
         )
         self.assertEqual(
             arguments.idle_clips,

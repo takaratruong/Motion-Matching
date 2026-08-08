@@ -15,7 +15,12 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .terrain_pfnn.dataset import PFNNShardDataset
+from .terrain_pfnn.dataset import (
+    PFNNShardDataset,
+    normalize_pfnn_input,
+    normalize_pfnn_output,
+)
+from .terrain_pfnn.features import PFNNTrainingWindow, mirror_window
 from .terrain_pfnn.kinematics import TorchG1ForwardKinematics
 from .terrain_pfnn.layout import INPUT_LAYOUT, OUTPUT_LAYOUT
 from .terrain_pfnn.model import PhaseFunctionedNetwork
@@ -51,12 +56,23 @@ def classic_pfnn_loss(prediction: torch.Tensor, target: torch.Tensor) -> torch.T
 
 
 def balanced_epoch_batches(
-    source_kind: object, *, batch_size: int, seed: int, epoch: int
+    source_kind: object,
+    *,
+    batch_size: int,
+    seed: int,
+    epoch: int,
+    source_filter: str = "mixed",
 ) -> tuple[np.ndarray, ...]:
-    """Return deterministic half-GRAIL/half-LAFAN batches for one epoch."""
+    """Return deterministic native-G1 or half-GRAIL/half-LAFAN batches."""
 
     kinds = np.asarray(source_kind)
-    if kinds.ndim != 1 or set(kinds.astype(str).tolist()) != {"grail", "lafan"}:
+    names = set(kinds.astype(str).tolist()) if kinds.ndim == 1 else set()
+    if (
+        kinds.ndim != 1
+        or source_filter not in ("grail", "mixed")
+        or "grail" not in names
+        or (source_filter == "mixed" and names != {"grail", "lafan"})
+    ):
         raise ValueError("classic PFNN source kinds must contain grail and lafan")
     if type(batch_size) is not int or batch_size < 2 or batch_size % 2:
         raise ValueError("classic PFNN batch size must be a positive even integer")
@@ -64,6 +80,16 @@ def balanced_epoch_batches(
         raise ValueError("classic PFNN sampler seed/epoch are invalid")
     half = batch_size // 2
     rng = np.random.default_rng(np.random.SeedSequence((seed, epoch)))
+    if source_filter == "grail":
+        indices = rng.permutation(np.flatnonzero(kinds.astype(str) == "grail"))
+        batch_count = math.ceil(len(indices) / batch_size)
+        expanded = np.resize(indices, batch_count * batch_size)
+        return tuple(
+            expanded[index * batch_size : (index + 1) * batch_size].astype(
+                np.int64, copy=False
+            )
+            for index in range(batch_count)
+        )
     groups = {
         name: rng.permutation(np.flatnonzero(kinds.astype(str) == name))
         for name in ("grail", "lafan")
@@ -260,18 +286,118 @@ def load_classic_checkpoint(path: str | Path) -> ClassicG1PFNNCheckpoint:
     return checkpoint
 
 
-def _materialize(dataset: PFNNShardDataset) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _materialize(
+    dataset: PFNNShardDataset,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     x = np.empty((len(dataset), INPUT_LAYOUT.size), dtype=np.float32)
     y = np.empty((len(dataset), OUTPUT_LAYOUT.size), dtype=np.float32)
     phase = np.empty(len(dataset), dtype=np.float32)
     source = np.empty(len(dataset), dtype="<U6")
+    clip = np.empty(len(dataset), dtype="<U96")
     for index in range(len(dataset)):
         row = dataset[index]
         x[index] = row["x"]
         y[index] = row["y"]
         phase[index] = row["phase"]
         source[index] = "grail" if str(row["clip_id"]).startswith("terrain_slopes__") else "lafan"
-    return x, y, phase, source
+        clip[index] = str(row["clip_id"])
+    return x, y, phase, source, clip
+
+
+class _IndexedTrainDataset:
+    """Read-only train view used to bind the runtime seed to optimized rows."""
+
+    split = "train"
+
+    def __init__(self, dataset: PFNNShardDataset, indices: np.ndarray) -> None:
+        self._dataset = dataset
+        self._indices = np.asarray(indices, dtype=np.int64)
+        for name in ("x_mean", "x_std", "y_mean", "y_std"):
+            setattr(self, name, getattr(dataset, name))
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+    def __getitem__(self, index: int) -> dict[str, object]:
+        return self._dataset[int(self._indices[index])]
+
+
+def _grail_train_validation_masks(
+    source_kind: object, clip_id: object
+) -> tuple[np.ndarray, np.ndarray]:
+    """Hold out the lexicographically last present variant of each family."""
+
+    source = np.asarray(source_kind).astype(str)
+    clips = np.asarray(clip_id).astype(str)
+    if source.ndim != 1 or clips.shape != source.shape:
+        raise ValueError("classic PFNN source/clip metadata is invalid")
+    grail_ids = sorted(set(clips[source == "grail"].tolist()))
+    families: dict[str, list[str]] = {}
+    for value in grail_ids:
+        if not value.startswith("terrain_slopes__") or "__" not in value:
+            raise ValueError("classic PFNN GRAIL clip id is invalid")
+        families.setdefault(value.rsplit("__", 1)[0], []).append(value)
+    if not families or any(len(values) < 2 for values in families.values()):
+        raise ValueError("classic PFNN GRAIL family has no holdout variant")
+    held_ids = {max(values) for values in families.values()}
+    held_out = (source == "grail") & np.isin(clips, tuple(sorted(held_ids)))
+    optimized = (source == "grail") & ~held_out
+    return optimized, held_out
+
+
+def _mirror_normalized_examples(
+    x: np.ndarray,
+    y: np.ndarray,
+    phase: np.ndarray,
+    normalization: Mapping[str, object],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Apply the original PFNN sagittal mirror in physical feature space."""
+
+    x_array = np.asarray(x, dtype=np.float32)
+    y_array = np.asarray(y, dtype=np.float32)
+    phase_array = np.asarray(phase, dtype=np.float32)
+    if (
+        x_array.ndim != 2
+        or x_array.shape[1] != INPUT_LAYOUT.size
+        or y_array.shape != (len(x_array), OUTPUT_LAYOUT.size)
+        or phase_array.shape != (len(x_array),)
+    ):
+        raise ValueError("classic PFNN mirror examples are invalid")
+    x_mean = np.asarray(normalization["x_mean"], dtype=np.float32)
+    x_std = np.asarray(normalization["x_std"], dtype=np.float32)
+    y_mean = np.asarray(normalization["y_mean"], dtype=np.float32)
+    y_std = np.asarray(normalization["y_std"], dtype=np.float32)
+    denormalized_x = x_array.copy()
+    for field in ("previous_body_position", "previous_body_velocity"):
+        denormalized_x[:, INPUT_LAYOUT[field]] /= np.float32(0.1)
+    denormalized_x = denormalized_x * x_std + x_mean
+    denormalized_y = y_array * y_std + y_mean
+    mirrored_x = np.empty_like(x_array)
+    mirrored_y = np.empty_like(y_array)
+    mirrored_phase = np.empty_like(phase_array)
+    for index in range(len(x_array)):
+        window = PFNNTrainingWindow(
+            x=denormalized_x[index],
+            y=denormalized_y[index],
+            phase=float(phase_array[index]),
+            clip_id="terrain_slopes__slope_000__000",
+            split_identity="slope_000",
+            split="train",
+            sequence_lane="motion",
+            center_frame=index,
+            motion_sha256="a" * 64,
+            terrain_sha256="b" * 64,
+            terrain_class="flat",
+        )
+        mirrored = mirror_window(window)
+        mirrored_x[index] = normalize_pfnn_input(
+            mirrored.x, x_mean, x_std
+        )
+        mirrored_y[index] = normalize_pfnn_output(
+            mirrored.y, y_mean, y_std
+        )
+        mirrored_phase[index] = mirrored.phase
+    return mirrored_x, mirrored_y, mirrored_phase
 
 
 def _evaluate(
@@ -306,18 +432,53 @@ def train(arguments: argparse.Namespace) -> Path:
     root = Path(arguments.dataset).expanduser().resolve().parent
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     train_dataset = PFNNShardDataset(root, "train")
-    validation_dataset = PFNNShardDataset(root, "validation")
-    train_x, train_y, train_phase, train_source = _materialize(train_dataset)
-    val_x, val_y, val_phase, _ = _materialize(validation_dataset)
+    train_x, train_y, train_phase, train_source, train_clip = _materialize(
+        train_dataset
+    )
+    if arguments.train_source == "grail":
+        optimized, held_out = _grail_train_validation_masks(
+            train_source, train_clip
+        )
+        if not np.any(optimized) or not np.any(held_out):
+            raise ValueError("classic PFNN GRAIL train/validation partition is empty")
+        optimized_indices = np.flatnonzero(optimized)
+        seed_dataset = _IndexedTrainDataset(train_dataset, optimized_indices)
+        val_x = train_x[held_out]
+        val_y = train_y[held_out]
+        val_phase = train_phase[held_out]
+        train_x = train_x[optimized]
+        train_y = train_y[optimized]
+        train_phase = train_phase[optimized]
+        train_source = train_source[optimized]
+    else:
+        validation_dataset = PFNNShardDataset(root, "validation")
+        val_x, val_y, val_phase, _, _ = _materialize(validation_dataset)
+        seed_dataset = train_dataset
     kinematics = TorchG1ForwardKinematics.from_mjcf(arguments.model_path)
-    runtime_seed = choose_runtime_seed(train_dataset, kinematics.joint_limits)
-    phase_q99 = training_phase_advance_q99(train_dataset)
+    runtime_seed = choose_runtime_seed(seed_dataset, kinematics.joint_limits)
+    phase_q99 = training_phase_advance_q99(seed_dataset)
     normalization = {
         "x_mean": train_dataset.x_mean,
         "x_std": train_dataset.x_std,
         "y_mean": train_dataset.y_mean,
         "y_std": train_dataset.y_std,
     }
+    if arguments.train_source == "grail":
+        mirror_x, mirror_y, mirror_phase = _mirror_normalized_examples(
+            train_x, train_y, train_phase, normalization
+        )
+        train_x = np.concatenate((train_x, mirror_x), axis=0)
+        train_y = np.concatenate((train_y, mirror_y), axis=0)
+        train_phase = np.concatenate((train_phase, mirror_phase), axis=0)
+        train_source = np.concatenate(
+            (train_source, np.full(len(mirror_x), "grail", dtype="<U6")), axis=0
+        )
+        val_mirror_x, val_mirror_y, val_mirror_phase = _mirror_normalized_examples(
+            val_x, val_y, val_phase, normalization
+        )
+        val_x = np.concatenate((val_x, val_mirror_x), axis=0)
+        val_y = np.concatenate((val_y, val_mirror_y), axis=0)
+        val_phase = np.concatenate((val_phase, val_mirror_phase), axis=0)
     model = PhaseFunctionedNetwork(
         hidden_size=arguments.hidden_size, dropout_probability=0.30
     ).to(device)
@@ -337,6 +498,7 @@ def train(arguments: argparse.Namespace) -> Path:
                 batch_size=arguments.batch_size,
                 seed=arguments.seed,
                 epoch=epoch,
+                source_filter=arguments.train_source,
             ):
                 x = torch.as_tensor(train_x[indices], device=device)
                 y = torch.as_tensor(train_y[indices], device=device)
@@ -387,12 +549,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--evaluation-batch-size", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=1.0e-4)
     parser.add_argument("--hidden-size", type=int, default=512)
     parser.add_argument("--seed", type=int, default=23456)
+    parser.add_argument("--train-source", choices=("grail", "mixed"), default="grail")
     return parser
 
 

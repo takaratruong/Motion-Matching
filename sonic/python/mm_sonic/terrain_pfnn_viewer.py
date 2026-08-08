@@ -32,7 +32,7 @@ DEFAULT_DATASET = Path(
     "sonic/runs/terrain-pfnn-classic-g1/dataset/manifest.json"
 )
 DEFAULT_CHECKPOINT = Path(
-    "sonic/runs/terrain-pfnn-classic-g1/model/best.pt"
+    "sonic/runs/terrain-pfnn-classic-g1/model-grail-mirrored/best.pt"
 )
 DEFAULT_IDLE_CLIPS = Path(
     "/home/ubuntu/projects/gear-sonic-pinned-60de0df/"
