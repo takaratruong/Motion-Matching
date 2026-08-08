@@ -43,6 +43,7 @@ from mm_sonic.terrain_pfnn.recurrence import (
     plan_recurrent_trajectory,
 )
 from mm_sonic.terrain_pfnn.training import (
+    BASE_LOSS_WEIGHT_KEYS,
     CHECKPOINT_SCHEMA,
     DEFAULT_LOSS_WEIGHTS,
     LOSS_WEIGHT_KEYS,
@@ -51,6 +52,7 @@ from mm_sonic.terrain_pfnn.training import (
     fitted_row_sha256,
     finite_runtime_seed,
     load_checkpoint,
+    one_step_metrics,
     pfnn_losses,
     restore_training_state,
     save_checkpoint,
@@ -1071,6 +1073,9 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
         evaluation_rows: list[tuple[object, Sequence[int] | None]] = []
         metric_records: list[dict[str, object]] = []
         real_receipt = train_module.fitted_transition_pair_receipt
+        evaluation_metric_names = tuple(
+            name for name in BASE_LOSS_WEIGHT_KEYS if name != "regularization"
+        )
 
         def record_receipt(dataset: object) -> dict[str, object]:
             receipt = real_receipt(dataset)
@@ -1085,11 +1090,16 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             **_kwargs: object,
         ) -> dict[str, object]:
             evaluation_rows.append((dataset, indices))
-            return {
-                **{name: 0.0 for name in LOSS_WEIGHT_KEYS},
+            metrics: dict[str, object] = {
+                **{name: 0.0 for name in evaluation_metric_names},
                 "one_step_score": 1.0,
                 "samples": len(dataset) if indices is None else len(indices),
             }
+            self.assertEqual(
+                tuple(metrics),
+                (*evaluation_metric_names, "one_step_score", "samples"),
+            )
+            return metrics
 
         def capture_metric(_stream: object, record: dict[str, object]) -> None:
             metric_records.append(record)
@@ -3978,6 +3988,89 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             },
         )
         self.assertTrue(all(torch.isfinite(value) for value in losses.values()))
+
+    def test_one_step_metrics_uses_exact_nonregularized_base_keys_and_uneven_batch_score(
+        self,
+    ) -> None:
+        class IdentityNormalizedRows:
+            x_mean = np.zeros(INPUT_LAYOUT.size, np.float32)
+            x_std = np.ones(INPUT_LAYOUT.size, np.float32)
+            y_mean = np.zeros(OUTPUT_LAYOUT.size, np.float32)
+            y_std = np.ones(OUTPUT_LAYOUT.size, np.float32)
+
+            def __init__(self) -> None:
+                self.rows = []
+                for index in range(3):
+                    inputs = np.zeros(INPUT_LAYOUT.size, np.float32)
+                    inputs[index] = np.float32(index + 1) / np.float32(4.0)
+                    target = np.zeros(OUTPUT_LAYOUT.size, np.float32)
+                    target[OUTPUT_LAYOUT["trajectory_position"]] = np.float32(
+                        index + 1
+                    ) / np.float32(10.0)
+                    target[OUTPUT_LAYOUT["contact_logit"]] = np.asarray(
+                        (index % 2, 1, 0, (index + 1) % 2), np.float32
+                    )
+                    self.rows.append(
+                        {
+                            "x": inputs,
+                            "phase": np.float32(index) / np.float32(3.0),
+                            "y": target,
+                        }
+                    )
+
+            def __len__(self) -> int:
+                return len(self.rows)
+
+            def __getitem__(self, index: int) -> dict[str, object]:
+                return self.rows[index]
+
+        rows = IdentityNormalizedRows()
+        torch.manual_seed(17)
+        model = PhaseFunctionedNetwork(hidden_size=4, dropout_probability=0.0)
+        kinematics = _ZeroKinematics()
+        all_inputs = torch.as_tensor(np.stack([row["x"] for row in rows.rows]))
+        all_phases = torch.as_tensor(
+            np.asarray([row["phase"] for row in rows.rows])
+        )
+        all_targets = torch.as_tensor(np.stack([row["y"] for row in rows.rows]))
+        with torch.no_grad():
+            expected = pfnn_losses(
+                model(all_inputs, all_phases),
+                all_targets,
+                model=model,
+                normalization=rows,
+                kinematics=kinematics,
+                loss_weights=DEFAULT_LOSS_WEIGHTS,
+            )
+        with patch.object(
+            training_module,
+            "_sample_batch",
+            wraps=training_module._sample_batch,
+        ) as sample_batch:
+            observed = one_step_metrics(
+                model,
+                rows,
+                kinematics=kinematics,
+                batch_size=2,
+                loss_weights=DEFAULT_LOSS_WEIGHTS,
+            )
+
+        self.assertEqual(
+            [len(call.args[1]) for call in sample_batch.call_args_list],
+            [2, 1],
+        )
+        names = tuple(
+            name for name in BASE_LOSS_WEIGHT_KEYS if name != "regularization"
+        )
+        self.assertEqual(tuple(observed), (*names, "one_step_score", "samples"))
+        self.assertEqual(observed["samples"], 3)
+        for name in names:
+            self.assertAlmostEqual(observed[name], float(expected[name]), places=6)
+        self.assertAlmostEqual(
+            observed["one_step_score"],
+            sum(float(expected[name]) * DEFAULT_LOSS_WEIGHTS[name] for name in names),
+            places=6,
+        )
 
     def test_loss_multipliers_are_frozen_to_exactly_one_at_every_boundary(self) -> None:
         model = PhaseFunctionedNetwork(hidden_size=4, dropout_probability=0.0)

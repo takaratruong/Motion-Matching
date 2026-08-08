@@ -2505,7 +2505,9 @@ def one_step_metrics(
             raise RuntimeError("distributed validation requires an initialized process group")
         rank, world_size = dist.get_rank(), dist.get_world_size()
     selected = selected[rank::world_size]
-    names = LOSS_WEIGHT_KEYS[:-1]
+    names = tuple(
+        name for name in BASE_LOSS_WEIGHT_KEYS if name != "regularization"
+    )
     sums = torch.zeros(len(names) + 1, dtype=torch.float64, device=target_device)
     was_training = model.training
     model.eval()
