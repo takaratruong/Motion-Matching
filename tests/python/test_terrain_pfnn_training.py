@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -176,7 +177,9 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                         normalization=_normalization(),
                         loss_weights=weights,
                     )
-        optimizer = torch.optim.Adam(model.parameters(), lr=1.0e-3)
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=1.0e-3, weight_decay=0.0
+        )
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "checkpoint.pt"
             for weights in (
@@ -244,7 +247,9 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
     def test_checkpoint_round_trip_and_contract_mismatch(self) -> None:
         torch.manual_seed(5)
         model = PhaseFunctionedNetwork(hidden_size=8, dropout_probability=0.0)
-        optimizer = torch.optim.Adam(model.parameters(), lr=1.0e-3)
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=1.0e-3, weight_decay=0.0
+        )
         seed = finite_runtime_seed()
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "checkpoint.pt"
@@ -284,7 +289,9 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "joint limits"):
                 validate_checkpoint_kinematics(loaded, MatchingKinematics())
             resume_model = PhaseFunctionedNetwork(hidden_size=8, dropout_probability=0.0)
-            resume_optimizer = torch.optim.Adam(resume_model.parameters(), lr=1.0e-3)
+            resume_optimizer = torch.optim.Adam(
+                resume_model.parameters(), lr=1.0e-3, weight_decay=0.0
+            )
             self.assertEqual(
                 restore_training_state(
                     loaded, resume_model, resume_optimizer,
@@ -339,7 +346,9 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
 
     def test_checkpoint_rejects_inexact_nested_tensor_contracts(self) -> None:
         model = PhaseFunctionedNetwork(hidden_size=8, dropout_probability=0.0)
-        optimizer = torch.optim.Adam(model.parameters(), lr=1.0e-3)
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=1.0e-3, weight_decay=0.0
+        )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             baseline = root / "baseline.pt"
@@ -490,6 +499,77 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 lambda value: value["sampler_state"].__setitem__("extra", 0),
                 "sampler state",
             )
+
+    def test_checkpoint_rejects_malformed_adam_group_before_restore(self) -> None:
+        model = PhaseFunctionedNetwork(hidden_size=8, dropout_probability=0.0)
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=1.0e-3, weight_decay=0.0
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            baseline = root / "baseline.pt"
+            tampered = root / "tampered.pt"
+            save_checkpoint(
+                baseline,
+                model,
+                optimizer,
+                _normalization(),
+                dataset_digest="abc",
+                kinematic_signature_sha256="def",
+                runtime_seed=finite_runtime_seed(),
+                step=1,
+            )
+
+            mutations = {
+                "string lr": lambda group: group.__setitem__("lr", "0.001"),
+                "tensor lr": lambda group: group.__setitem__("lr", torch.tensor(0.001)),
+                "numpy lr": lambda group: group.__setitem__("lr", np.float32(0.001)),
+                "nonfinite lr": lambda group: group.__setitem__("lr", float("nan")),
+                "zero eps": lambda group: group.__setitem__("eps", 0.0),
+                "negative weight decay": lambda group: group.__setitem__(
+                    "weight_decay", -1.0
+                ),
+                "malformed betas container": lambda group: group.__setitem__(
+                    "betas", {"first": 0.9, "second": 0.999}
+                ),
+                "malformed beta value": lambda group: group.__setitem__(
+                    "betas", (0.9, 1.0)
+                ),
+                "extra group key": lambda group: group.__setitem__("extra", None),
+                "invalid param id": lambda group: group.__setitem__(
+                    "params", [0, 1, 2, 3, 4, 6]
+                ),
+                "duplicate param id": lambda group: group.__setitem__(
+                    "params", [0, 1, 2, 3, 4, 4]
+                ),
+                "bool param id": lambda group: group.__setitem__(
+                    "params", [False, 1, 2, 3, 4, 5]
+                ),
+                "wrong bool flag": lambda group: group.__setitem__("amsgrad", 0),
+                "wrong foreach flag": lambda group: group.__setitem__("foreach", "no"),
+                "wrong fused flag": lambda group: group.__setitem__(
+                    "fused", torch.tensor(False)
+                ),
+            }
+            for label, mutation in mutations.items():
+                payload = torch.load(
+                    baseline, map_location="cpu", weights_only=True
+                )
+                mutation(payload["optimizer_state"]["param_groups"][0])
+                torch.save(payload, tampered)
+                with self.subTest(label=label):
+                    with patch.object(
+                        torch.optim.Adam,
+                        "load_state_dict",
+                        side_effect=AssertionError("Adam restore was reached"),
+                    ) as restore:
+                        with self.assertRaises(ValueError):
+                            load_checkpoint(
+                                tampered,
+                                expected_dataset_digest="abc",
+                                expected_kinematic_signature_sha256="def",
+                            )
+                        restore.assert_not_called()
 
     def test_three_step_rollout_feeds_predictions_back_without_detaching(self) -> None:
         torch.manual_seed(11)
@@ -704,7 +784,9 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
     def test_small_model_overfits_and_reloads_bitwise_on_cpu(self) -> None:
         torch.manual_seed(17)
         model = PhaseFunctionedNetwork(hidden_size=32, dropout_probability=0.0)
-        optimizer = torch.optim.Adam(model.parameters(), lr=1.0e-2)
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=1.0e-2, weight_decay=0.0
+        )
         x = torch.zeros(64, INPUT_LAYOUT.size)
         phase = torch.zeros(64)
         target = torch.zeros(64, OUTPUT_LAYOUT.size)

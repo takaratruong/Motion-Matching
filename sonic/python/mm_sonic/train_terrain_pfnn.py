@@ -350,7 +350,9 @@ def train(arguments: argparse.Namespace) -> dict[str, object] | None:
             model, device_ids=[local_rank] if device.type == "cuda" else None
         )
     unwrapped = model.module if hasattr(model, "module") else model
-    optimizer = torch.optim.Adam(unwrapped.parameters(), lr=arguments.learning_rate)
+    optimizer = torch.optim.Adam(
+        unwrapped.parameters(), lr=arguments.learning_rate, weight_decay=0.0
+    )
     restored_step, restored_epoch = 0, 0
     restored_sampler_epoch, restored_sampler_global_offset = 0, 0
     if arguments.resume is not None:

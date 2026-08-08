@@ -52,6 +52,31 @@ LOSS_WEIGHT_KEYS = (
 )
 DEFAULT_LOSS_WEIGHTS = {name: 1.0 for name in LOSS_WEIGHT_KEYS}
 _STATE_NAMES = ("W0", "b0", "W1", "b1", "W2", "b2")
+# Exact torch.optim.Adam group schema for the pinned trainer configuration.
+_ADAM_PARAM_GROUP_KEYS = frozenset(
+    {
+        "lr",
+        "betas",
+        "eps",
+        "weight_decay",
+        "amsgrad",
+        "maximize",
+        "foreach",
+        "capturable",
+        "differentiable",
+        "fused",
+        "decoupled_weight_decay",
+        "params",
+    }
+)
+_ADAM_BOOL_FLAGS = (
+    "amsgrad",
+    "maximize",
+    "capturable",
+    "differentiable",
+    "decoupled_weight_decay",
+)
+_ADAM_OPTIONAL_BOOL_FLAGS = ("foreach", "fused")
 
 
 def _as_tensor(
@@ -860,6 +885,7 @@ def save_checkpoint(
     plain = _plain_cpu(payload)
     if not isinstance(plain, dict) or not _finite_tree(plain):
         raise ValueError("checkpoint payload contains nonfinite values")
+    _validate_optimizer_state(plain["optimizer_state"], unwrapped)
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
@@ -898,11 +924,53 @@ def _validate_optimizer_state(
     ):
         raise ValueError("checkpoint optimizer state is invalid")
     group = value["param_groups"][0]
-    expected_group_keys = set(torch.optim.Adam(model.parameters()).state_dict()["param_groups"][0])
-    if set(group) != expected_group_keys or group.get("params") != list(range(6)):
+    if set(group) != _ADAM_PARAM_GROUP_KEYS:
+        raise ValueError("checkpoint optimizer state is invalid")
+    params = group["params"]
+    expected_params = list(range(len(tuple(model.parameters()))))
+    if (
+        type(params) is not list
+        or any(type(parameter_id) is not int for parameter_id in params)
+        or len(set(params)) != len(params)
+        or params != expected_params
+    ):
+        raise ValueError("checkpoint optimizer state is invalid")
+    for name, lower_inclusive in (
+        ("lr", False),
+        ("eps", False),
+        ("weight_decay", True),
+    ):
+        scalar = group[name]
+        if (
+            type(scalar) is not float
+            or not math.isfinite(scalar)
+            or (scalar < 0.0 if lower_inclusive else scalar <= 0.0)
+        ):
+            raise ValueError("checkpoint optimizer state is invalid")
+    betas = group["betas"]
+    if (
+        type(betas) not in (tuple, list)
+        or len(betas) != 2
+        or any(
+            type(beta) is not float
+            or not math.isfinite(beta)
+            or not 0.0 <= beta < 1.0
+            for beta in betas
+        )
+    ):
+        raise ValueError("checkpoint optimizer state is invalid")
+    if any(type(group[name]) is not bool for name in _ADAM_BOOL_FLAGS):
+        raise ValueError("checkpoint optimizer state is invalid")
+    if any(
+        group[name] is not None and type(group[name]) is not bool
+        for name in _ADAM_OPTIONAL_BOOL_FLAGS
+    ):
         raise ValueError("checkpoint optimizer state is invalid")
     state = value["state"]
-    if any(type(key) is not int or key not in range(6) for key in state):
+    if any(
+        type(key) is not int or key not in range(len(expected_params))
+        for key in state
+    ):
         raise ValueError("checkpoint optimizer state is invalid")
     parameters = list(model.parameters())
     expected_fields = {"step", "exp_avg", "exp_avg_sq"}
@@ -934,9 +1002,10 @@ def _validate_optimizer_state(
                 or tensor.layout != torch.strided
                 or not tensor.is_contiguous()
                 or tensor.requires_grad
+                or not torch.isfinite(tensor).all()
             ):
                 raise ValueError("checkpoint optimizer state is invalid")
-    probe = torch.optim.Adam(model.parameters())
+    probe = torch.optim.Adam(model.parameters(), weight_decay=0.0)
     try:
         probe.load_state_dict(value)
     except (KeyError, RuntimeError, TypeError, ValueError) as error:
