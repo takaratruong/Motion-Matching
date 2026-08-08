@@ -14,6 +14,7 @@ from mm_sonic.evaluate_terrain_pfnn import (
 from mm_sonic.train_terrain_pfnn import (
     materialize_subset,
     overfit_gate_accepted,
+    promote_pipeline_best,
     stratified_subset,
 )
 from mm_sonic.terrain_pfnn.layout import INPUT_LAYOUT, OUTPUT_LAYOUT
@@ -44,6 +45,9 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
     def test_overfit_gate_uses_the_final_post_rollout_score(self) -> None:
         self.assertTrue(overfit_gate_accepted(10.0, 4.9, 0.5))
         self.assertFalse(overfit_gate_accepted(10.0, 5.1, 0.5))
+        self.assertTrue(promote_pipeline_best(pipeline_overfit=True, accepted=True))
+        self.assertFalse(promote_pipeline_best(pipeline_overfit=True, accepted=False))
+        self.assertFalse(promote_pipeline_best(pipeline_overfit=False, accepted=True))
 
     def test_materialized_overfit_subset_reads_source_once_in_sorted_order(self) -> None:
         class Rows:
@@ -181,6 +185,10 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             payload = torch.load(path, map_location="cpu", weights_only=True)
             self.assertEqual(payload["input_layout"], [list(field) for field in INPUT_LAYOUT.fields])
             self.assertEqual(payload["output_layout"], [list(field) for field in OUTPUT_LAYOUT.fields])
+            self.assertEqual(
+                payload["normalization_contract"]["root_tilt_encoding"],
+                "angle_axis_xy",
+            )
             loaded = load_checkpoint(
                 path, expected_dataset_digest="abc",
                 expected_kinematic_signature_sha256="def",

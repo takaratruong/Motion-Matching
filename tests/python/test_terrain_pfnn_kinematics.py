@@ -13,7 +13,7 @@ from mm_sonic.terrain_oracle.canonical import (
 )
 from mm_sonic.terrain_pfnn.kinematics import (
     TorchG1ForwardKinematics,
-    root_rpy_quaternion_wxyz,
+    root_tilt_quaternion_wxyz,
 )
 
 
@@ -26,6 +26,21 @@ _SCENE = _ASSETS / "scene_29dof.xml"
 
 
 class TerrainPFNNKinematicsTests(unittest.TestCase):
+    def test_root_tilt_is_the_feature_angle_axis_encoding(self) -> None:
+        tilt = np.asarray((0.20, -0.15), np.float64)
+        angle = np.linalg.norm(tilt)
+        expected = np.asarray(
+            (
+                np.cos(0.5 * angle),
+                tilt[0] * np.sin(0.5 * angle) / angle,
+                tilt[1] * np.sin(0.5 * angle) / angle,
+                0.0,
+            )
+        )
+        np.testing.assert_allclose(
+            root_tilt_quaternion_wxyz(*tilt), expected, rtol=0.0, atol=1.0e-15
+        )
+
     def test_eight_in_limit_poses_match_mujoco_and_have_finite_gradients(self) -> None:
         model = mujoco.MjModel.from_xml_path(str(_MODEL))
         data = mujoco.MjData(model)
@@ -62,7 +77,7 @@ class TerrainPFNNKinematicsTests(unittest.TestCase):
         for pose_root, pose_joints in zip(root, joints):
             data.qpos[:] = model.qpos0
             data.qpos[:3] = (0.0, 0.0, pose_root[0])
-            data.qpos[3:7] = root_rpy_quaternion_wxyz(
+            data.qpos[3:7] = root_tilt_quaternion_wxyz(
                 pose_root[1], pose_root[2]
             )
             data.qpos[qpos_addresses] = pose_joints

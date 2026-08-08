@@ -21,17 +21,34 @@ from mm_sonic.terrain_oracle.canonical import (
 KINEMATIC_SIGNATURE_SCHEMA = "mm-sonic-g1-kinematic-signature/v1"
 
 
-def root_rpy_quaternion_wxyz(
-    roll: float, pitch: float
+def root_tilt_quaternion_wxyz(
+    tilt_x: float, tilt_y: float
 ) -> np.ndarray:
-    """Return the yaw-free WXYZ quaternion for intrinsic roll then pitch."""
+    """Decode the feature contract's yaw-free x/y angle-axis tilt."""
 
-    half_roll = 0.5 * float(roll)
-    half_pitch = 0.5 * float(pitch)
-    cr, sr = math.cos(half_roll), math.sin(half_roll)
-    cp, sp = math.cos(half_pitch), math.sin(half_pitch)
-    # R = Ry(pitch) @ Rx(roll), or q = qy * qx.
-    return np.asarray((cp * cr, cp * sr, sp * cr, -sp * sr), np.float64)
+    x, y = float(tilt_x), float(tilt_y)
+    angle = math.hypot(x, y)
+    if angle < 1.0e-12:
+        return np.asarray((1.0, 0.5 * x, 0.5 * y, 0.0), np.float64)
+    scale = math.sin(0.5 * angle) / angle
+    return np.asarray((math.cos(0.5 * angle), scale * x, scale * y, 0.0), np.float64)
+
+
+def _root_tilt_matrix(tilt: torch.Tensor) -> torch.Tensor:
+    angle_squared = tilt.square().sum(dim=-1)
+    threshold = 1.0e-8
+    safe_angle = torch.sqrt(angle_squared.clamp_min(threshold))
+    exact_scale = torch.sin(0.5 * safe_angle) / safe_angle
+    series_scale = 0.5 - angle_squared / 48.0 + angle_squared.square() / 3840.0
+    scale = torch.where(angle_squared >= threshold, exact_scale, series_scale)
+    exact_w = torch.cos(0.5 * safe_angle)
+    series_w = 1.0 - angle_squared / 8.0 + angle_squared.square() / 384.0
+    w = torch.where(angle_squared >= threshold, exact_w, series_w)
+    zero = torch.zeros_like(w)
+    quaternion = torch.stack(
+        (w, scale * tilt[:, 0], scale * tilt[:, 1], zero), dim=-1
+    )
+    return _quaternion_matrix_wxyz(quaternion)
 
 
 def _quaternion_matrix_wxyz(quaternion: torch.Tensor) -> torch.Tensor:
@@ -77,7 +94,7 @@ class TorchG1ForwardKinematics(nn.Module):
 
     Each non-root canonical body is required to own exactly one hinge.  Its
     transform is ``T_body0 @ T_joint @ R(axis, q) @ T_-joint``.  The pelvis
-    free joint is replaced by the supplied local height/roll/pitch transform.
+    free joint is replaced by the supplied local height and x/y angle-axis tilt.
     """
 
     def __init__(
@@ -223,14 +240,8 @@ class TorchG1ForwardKinematics(nn.Module):
         joint_axis = self.joint_axis.to(dtype=dtype, device=device)
         batch = len(root)
 
-        roll, pitch = root[:, 1], root[:, 2]
-        cr, sr = torch.cos(roll), torch.sin(roll)
-        cp, sp = torch.cos(pitch), torch.sin(pitch)
-        zeros = torch.zeros_like(roll)
-        ones = torch.ones_like(roll)
-        rx = torch.stack((ones, zeros, zeros, zeros, cr, -sr, zeros, sr, cr), -1).reshape(batch, 3, 3)
-        ry = torch.stack((cp, zeros, sp, zeros, ones, zeros, -sp, zeros, cp), -1).reshape(batch, 3, 3)
-        rotations: list[torch.Tensor] = [torch.bmm(ry, rx)]
+        zeros = torch.zeros_like(root[:, 0])
+        rotations: list[torch.Tensor] = [_root_tilt_matrix(root[:, 1:3])]
         positions: list[torch.Tensor] = [
             torch.stack((zeros, zeros, root[:, 0]), dim=-1)
         ]
@@ -263,5 +274,5 @@ class TorchG1ForwardKinematics(nn.Module):
 __all__ = [
     "KINEMATIC_SIGNATURE_SCHEMA",
     "TorchG1ForwardKinematics",
-    "root_rpy_quaternion_wxyz",
+    "root_tilt_quaternion_wxyz",
 ]

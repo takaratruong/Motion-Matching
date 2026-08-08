@@ -34,6 +34,7 @@ _NORMALIZATION_CONTRACT = {
     "contact_loss_domain": "raw_logits_binary_labels",
     "structural_loss_domain": "physical_denormalized",
     "recurrent_body_input_scale": 0.1,
+    "root_tilt_encoding": "angle_axis_xy",
 }
 LOSS_WEIGHT_KEYS = (
     "trajectory_mse",

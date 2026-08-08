@@ -44,6 +44,10 @@ def overfit_gate_accepted(initial: float, final: float, ratio: float) -> bool:
     return values[2] > 0.0 and values[1] < values[2] * values[0]
 
 
+def promote_pipeline_best(*, pipeline_overfit: bool, accepted: bool) -> bool:
+    return bool(pipeline_overfit and accepted)
+
+
 class _MaterializedDataset:
     def __init__(self, source: object, rows: Sequence[dict[str, object]]) -> None:
         self.split = getattr(source, "split")
@@ -586,12 +590,15 @@ def train(arguments: argparse.Namespace) -> dict[str, object] | None:
     runtime_seed = choose_runtime_seed(
         train_dataset, kinematics.joint_limits.detach().cpu()
     )
+    promote_best = promote_pipeline_best(
+        pipeline_overfit=pipeline_overfit, accepted=one_step_accepted
+    )
     selection = (
         selection_metadata(
             one_step_score=float(gate_metrics["one_step_score"]),
             pipeline_overfit=True,
         )
-        if pipeline_overfit else None
+        if promote_best else None
     )
     candidate = output / f"checkpoint-step-{step:08d}.pt"
     save_checkpoint(
@@ -618,7 +625,7 @@ def train(arguments: argparse.Namespace) -> dict[str, object] | None:
         expected_kinematic_signature_sha256=kinematics.kinematic_signature_sha256,
     )
     best_path: str | None = None
-    if pipeline_overfit:
+    if promote_best:
         best = output / "best.pt"
         save_checkpoint(
             best,
@@ -706,6 +713,7 @@ __all__ = [
     "main",
     "materialize_subset",
     "overfit_gate_accepted",
+    "promote_pipeline_best",
     "seed_worker",
     "stratified_subset",
     "train",
