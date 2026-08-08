@@ -70,6 +70,12 @@ ENVELOPE_LOSS_WEIGHT_KEYS = (
     "joint_limit_envelope",
     "phase_envelope",
 )
+BOUNDED_ENVELOPE_LOSS_KEYS = (
+    "joint_step_bounded_envelope",
+    "joint_limit_bounded_envelope",
+    "phase_bounded_envelope",
+    "direction_bounded_envelope",
+)
 LOSS_WEIGHT_KEYS = BASE_LOSS_WEIGHT_KEYS + ENVELOPE_LOSS_WEIGHT_KEYS
 DEFAULT_LOSS_WEIGHTS = {name: 1.0 for name in LOSS_WEIGHT_KEYS}
 _STATE_NAMES = ("W0", "b0", "W1", "b1", "W2", "b2")
@@ -187,7 +193,7 @@ def _field_cat(value: torch.Tensor, fields: Sequence[str]) -> torch.Tensor:
 
 @dataclass(frozen=True)
 class PhysicalEnvelopeObjective:
-    schema: str = "mm-sonic-physical-envelope-objective/v1"
+    schema: str = "mm-sonic-physical-envelope-objective/v2"
     joint_step_onset_rad: float = 0.225
     joint_step_scale_rad: float = 0.025
     joint_limit_margin_rad: float = 0.020
@@ -200,6 +206,16 @@ class PhysicalEnvelopeObjective:
     phase_upper_hinge_power: int = 2
     maximum_coefficient: float = 1.0
     positive_tail_mean_coefficient: float = 1.0
+    direction_norm_inner_lower: float = 0.55
+    direction_norm_inner_upper: float = 1.45
+    direction_norm_scale: float = 0.05
+    direction_hinge_power: int = 2
+    joint_step_smooth_l1_beta_rad: float = 0.025
+    joint_limit_smooth_l1_beta_rad: float = 0.020
+    phase_upper_smooth_l1_beta_rad: float = 0.020
+    direction_smooth_l1_beta: float = 0.05
+    reference_pair_count: int = 256
+    reference_pair_coefficient: float = 0.00390625
 
 
 DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE = PhysicalEnvelopeObjective()
@@ -220,6 +236,16 @@ _PHYSICAL_ENVELOPE_OBJECTIVE_FIELD_TYPES: dict[str, type[object]] = {
     "phase_upper_hinge_power": int,
     "maximum_coefficient": float,
     "positive_tail_mean_coefficient": float,
+    "direction_norm_inner_lower": float,
+    "direction_norm_inner_upper": float,
+    "direction_norm_scale": float,
+    "direction_hinge_power": int,
+    "joint_step_smooth_l1_beta_rad": float,
+    "joint_limit_smooth_l1_beta_rad": float,
+    "phase_upper_smooth_l1_beta_rad": float,
+    "direction_smooth_l1_beta": float,
+    "reference_pair_count": int,
+    "reference_pair_coefficient": float,
 }
 
 
@@ -241,6 +267,30 @@ def validate_physical_envelope_objective(value: object) -> dict[str, object]:
             type(value[name]) is float and not math.isfinite(value[name])
             for name in _PHYSICAL_ENVELOPE_OBJECTIVE_FIELD_TYPES
         )
+    ):
+        raise ValueError("physical envelope objective is invalid")
+    positive_fields = (
+        "joint_step_scale_rad",
+        "joint_limit_margin_rad",
+        "phase_upper_margin_rad",
+        "phase_scale_rad",
+        "direction_norm_scale",
+        "joint_step_smooth_l1_beta_rad",
+        "joint_limit_smooth_l1_beta_rad",
+        "phase_upper_smooth_l1_beta_rad",
+        "direction_smooth_l1_beta",
+        "maximum_coefficient",
+        "positive_tail_mean_coefficient",
+        "reference_pair_coefficient",
+    )
+    if (
+        any(value[name] <= 0.0 for name in positive_fields)
+        or not 0.0 < value["tail_fraction"] <= 1.0
+        or value["direction_norm_inner_lower"]
+        >= value["direction_norm_inner_upper"]
+        or value["reference_pair_count"] != 256
+        or value["reference_pair_coefficient"]
+        != 1.0 / value["reference_pair_count"]
     ):
         raise ValueError("physical envelope objective is invalid")
     return dict(value)
@@ -270,10 +320,33 @@ class PhysicalEnvelopeRisks(dict[str, torch.Tensor]):
         *,
         runtime_failures: Mapping[str, torch.Tensor],
         physical_values: Mapping[str, torch.Tensor],
+        bounded_surrogates: Mapping[str, torch.Tensor],
     ) -> None:
         super().__init__(values)
         self.runtime_failures = dict(runtime_failures)
         self.physical_values = dict(physical_values)
+        self.bounded_surrogates = dict(bounded_surrogates)
+
+
+def smooth_l1_physical_excess(
+    excess: torch.Tensor, *, beta: float
+) -> torch.Tensor:
+    """Apply exact smooth-L1 to a nonnegative physical excess."""
+
+    if (
+        not isinstance(excess, torch.Tensor)
+        or not excess.is_floating_point()
+        or torch.any(excess < 0.0)
+        or type(beta) is not float
+        or not math.isfinite(beta)
+        or beta <= 0.0
+    ):
+        raise ValueError("smooth-L1 physical excess is invalid")
+    return torch.where(
+        excess < beta,
+        0.5 * excess.square() / beta,
+        excess - 0.5 * beta,
+    )
 
 
 def physical_envelope_risks(
@@ -284,7 +357,7 @@ def physical_envelope_risks(
     joint_limits: torch.Tensor,
     phase_advance_cap: float,
     contract: PhysicalEnvelopeObjective,
-) -> dict[str, torch.Tensor]:
+) -> PhysicalEnvelopeRisks:
     """Return one worst-joint physical risk per predicted transition."""
 
     if (
@@ -341,22 +414,41 @@ def physical_envelope_risks(
     reached = reached_output_normalized * normal["y_std"] + normal["y_mean"]
     predicted_joints = predicted[:, OUTPUT_LAYOUT["joint_position"]]
     reached_joints = reached[:, OUTPUT_LAYOUT["joint_position"]]
-    joint_step_excess = torch.relu(
+    joint_step_excess_rad = torch.relu(
         torch.abs(predicted_joints - reached_joints)
         - contract.joint_step_onset_rad
-    ) / contract.joint_step_scale_rad
-    lower_limit_excess = torch.relu(
+    )
+    joint_step_excess = (
+        joint_step_excess_rad / contract.joint_step_scale_rad
+    )
+    lower_limit_excess_rad = torch.relu(
         limits[:, 0] + contract.joint_limit_margin_rad - predicted_joints
-    ) / contract.joint_limit_margin_rad
-    upper_limit_excess = torch.relu(
+    )
+    upper_limit_excess_rad = torch.relu(
         predicted_joints
         - (limits[:, 1] - contract.joint_limit_margin_rad)
-    ) / contract.joint_limit_margin_rad
+    )
+    lower_limit_excess = (
+        lower_limit_excess_rad / contract.joint_limit_margin_rad
+    )
+    upper_limit_excess = (
+        upper_limit_excess_rad / contract.joint_limit_margin_rad
+    )
     phase_advance = predicted[:, OUTPUT_LAYOUT["phase_advance"]].reshape(-1)
-    lower_phase_excess = torch.relu(-phase_advance) / contract.phase_scale_rad
-    upper_phase_excess = torch.relu(
+    lower_phase_excess_rad = torch.relu(-phase_advance)
+    upper_phase_excess_rad = torch.relu(
         phase_advance - (phase_cap - contract.phase_upper_margin_rad)
-    ) / contract.phase_scale_rad
+    )
+    lower_phase_excess = lower_phase_excess_rad / contract.phase_scale_rad
+    upper_phase_excess = upper_phase_excess_rad / contract.phase_scale_rad
+    direction = predicted[:, OUTPUT_LAYOUT["trajectory_direction"]].reshape(
+        -1, 12, 2
+    )
+    direction_norm = torch.linalg.vector_norm(direction, dim=-1)
+    direction_excess = torch.maximum(
+        torch.relu(contract.direction_norm_inner_lower - direction_norm),
+        torch.relu(direction_norm - contract.direction_norm_inner_upper),
+    )
     risks = {
         "joint_step": torch.amax(joint_step_excess.square(), dim=1),
         "joint_limit": torch.amax(
@@ -364,6 +456,42 @@ def physical_envelope_risks(
             dim=1,
         ),
         "phase": torch.maximum(lower_phase_excess, upper_phase_excess.square()),
+        "direction": torch.amax(
+            (direction_excess / contract.direction_norm_scale).square(),
+            dim=1,
+        ),
+    }
+    bounded_surrogates = {
+        "joint_step": torch.amax(
+            smooth_l1_physical_excess(
+                joint_step_excess_rad,
+                beta=contract.joint_step_smooth_l1_beta_rad,
+            ),
+            dim=1,
+        ),
+        "joint_limit": torch.amax(
+            smooth_l1_physical_excess(
+                torch.maximum(
+                    lower_limit_excess_rad, upper_limit_excess_rad
+                ),
+                beta=contract.joint_limit_smooth_l1_beta_rad,
+            ),
+            dim=1,
+        ),
+        "phase": torch.maximum(
+            lower_phase_excess_rad,
+            smooth_l1_physical_excess(
+                upper_phase_excess_rad,
+                beta=contract.phase_upper_smooth_l1_beta_rad,
+            ),
+        ),
+        "direction": torch.amax(
+            smooth_l1_physical_excess(
+                direction_excess,
+                beta=contract.direction_smooth_l1_beta,
+            ),
+            dim=1,
+        ),
     }
     return PhysicalEnvelopeRisks(
         risks,
@@ -382,6 +510,10 @@ def physical_envelope_risks(
                 dim=1,
             ),
             "phase": (phase_advance < 0.0) | (phase_advance > phase_cap),
+            "direction": torch.any(
+                (direction_norm < 0.5) | (direction_norm > 1.5),
+                dim=1,
+            ),
         },
         physical_values={
             "joint_step_rad": torch.amax(
@@ -396,7 +528,30 @@ def physical_envelope_risks(
             ),
             "phase_advance_rad": phase_advance,
         },
+        bounded_surrogates=bounded_surrogates,
     )
+
+
+def bounded_physical_envelope_surrogates(
+    normalized_prediction: torch.Tensor,
+    reached_output_normalized: torch.Tensor,
+    *,
+    normalization: object,
+    joint_limits: torch.Tensor,
+    phase_advance_cap: float,
+    contract: PhysicalEnvelopeObjective,
+) -> dict[str, torch.Tensor]:
+    """Return one worst-element bounded physical surrogate per transition."""
+
+    risks = physical_envelope_risks(
+        normalized_prediction,
+        reached_output_normalized,
+        normalization=normalization,
+        joint_limits=joint_limits,
+        phase_advance_cap=phase_advance_cap,
+        contract=contract,
+    )
+    return dict(risks.bounded_surrogates)
 
 
 def fitted_target_envelope_audit(
@@ -695,10 +850,13 @@ class PhysicalEnvelopeLosses(dict[str, torch.Tensor]):
         self,
         values: Mapping[str, torch.Tensor],
         *,
-        reductions: Mapping[str, GlobalEnvelopeReduction],
+        raw_reductions: Mapping[str, GlobalEnvelopeReduction],
+        bounded_reductions: Mapping[str, GlobalEnvelopeReduction],
     ) -> None:
         super().__init__(values)
-        self.reductions = dict(reductions)
+        self.raw_reductions = dict(raw_reductions)
+        self.bounded_reductions = dict(bounded_reductions)
+        self.reductions = self.raw_reductions
 
 
 class OneStepTrainingLosses(dict[str, torch.Tensor]):
@@ -989,7 +1147,8 @@ def physical_envelope_loss(
         phase_advance_cap=phase_advance_cap,
         contract=contract,
     )
-    reductions = {
+    bounded_surrogates = risks.bounded_surrogates
+    raw_reductions = {
         name: global_max_plus_tail(
             value,
             global_ordinals=global_ordinals,
@@ -999,16 +1158,34 @@ def physical_envelope_loss(
         )
         for name, value in risks.items()
     }
+    bounded_reductions = {
+        name: global_max_plus_tail(
+            value,
+            global_ordinals=global_ordinals,
+            tail_fraction=contract.tail_fraction,
+            rank=rank,
+            world_size=world_size,
+        )
+        for name, value in bounded_surrogates.items()
+    }
     losses: dict[str, torch.Tensor] = {}
-    for name, reduction in reductions.items():
+    for name, reduction in raw_reductions.items():
         losses[f"{name}_maximum"] = reduction.maximum
         losses[f"{name}_cvar"] = reduction.cvar
         losses[f"{name}_positive_tail_mean"] = reduction.positive_tail_mean
         losses[f"{name}_envelope"] = reduction.loss
+    for name, reduction in bounded_reductions.items():
+        losses[f"{name}_bounded_envelope"] = (
+            contract.reference_pair_coefficient * reduction.loss
+        )
     losses["physical_envelope_total"] = sum(
-        losses[f"{name}_envelope"] for name in risks
+        losses[f"{name}_bounded_envelope"] for name in bounded_surrogates
     )
-    return PhysicalEnvelopeLosses(losses, reductions=reductions)
+    return PhysicalEnvelopeLosses(
+        losses,
+        raw_reductions=raw_reductions,
+        bounded_reductions=bounded_reductions,
+    )
 
 
 def _loss_weights(weights: Mapping[str, float] | None) -> dict[str, float]:
@@ -1384,7 +1561,8 @@ def autoregressive_unroll(
     phases: list[torch.Tensor] = []
     per_step: list[dict[str, torch.Tensor]] = []
     per_step_envelope_risks: dict[str, list[torch.Tensor]] = {
-        name: [] for name in ("joint_step", "joint_limit", "phase")
+        name: []
+        for name in ("joint_step", "joint_limit", "phase", "direction")
     }
     per_step_runtime_failures: dict[str, list[torch.Tensor]] = {
         name: [] for name in per_step_envelope_risks
@@ -3584,6 +3762,7 @@ def restore_training_state(
 
 __all__ = [
     "BASE_LOSS_WEIGHT_KEYS",
+    "BOUNDED_ENVELOPE_LOSS_KEYS",
     "CHECKPOINT_SCHEMA",
     "DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE",
     "DEFAULT_LOSS_WEIGHTS",
@@ -3596,6 +3775,7 @@ __all__ = [
     "PhysicalEnvelopeObjective",
     "RolloutResult",
     "autoregressive_unroll",
+    "bounded_physical_envelope_surrogates",
     "choose_runtime_seed",
     "evaluate_fitted_transition_envelope",
     "fitted_adjacent_indices",
@@ -3607,6 +3787,7 @@ __all__ = [
     "one_step_training_losses",
     "pfnn_losses",
     "physical_envelope_objective_payload",
+    "smooth_l1_physical_excess",
     "restore_training_state",
     "save_checkpoint",
     "selection_metadata",

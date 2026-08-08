@@ -89,6 +89,22 @@ def _objective_payload() -> dict[str, object]:
         "positive_tail_mean_coefficient": (
             contract.positive_tail_mean_coefficient
         ),
+        "direction_norm_inner_lower": contract.direction_norm_inner_lower,
+        "direction_norm_inner_upper": contract.direction_norm_inner_upper,
+        "direction_norm_scale": contract.direction_norm_scale,
+        "direction_hinge_power": contract.direction_hinge_power,
+        "joint_step_smooth_l1_beta_rad": (
+            contract.joint_step_smooth_l1_beta_rad
+        ),
+        "joint_limit_smooth_l1_beta_rad": (
+            contract.joint_limit_smooth_l1_beta_rad
+        ),
+        "phase_upper_smooth_l1_beta_rad": (
+            contract.phase_upper_smooth_l1_beta_rad
+        ),
+        "direction_smooth_l1_beta": contract.direction_smooth_l1_beta,
+        "reference_pair_count": contract.reference_pair_count,
+        "reference_pair_coefficient": contract.reference_pair_coefficient,
     }
 
 
@@ -899,6 +915,104 @@ def _global_envelope_worker(
     queue.put(payload)
 
 
+def _four_family_bounded_ddp_worker(
+    rank: int,
+    world_size: int,
+    init_method: str,
+    case: str,
+    queue: object,
+) -> None:
+    """Exercise all four bounded physical families in one real gloo graph."""
+
+    import torch.distributed as dist
+
+    dist.init_process_group(
+        "gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=5),
+    )
+    ordinals = (0, 2) if rank == 0 else (1, 3)
+    prediction = torch.zeros(
+        (2, OUTPUT_LAYOUT.size), dtype=torch.float64, requires_grad=True
+    )
+    reached = torch.zeros_like(prediction)
+    joint = OUTPUT_LAYOUT["joint_position"]
+    phase = OUTPUT_LAYOUT["phase_advance"]
+    direction = OUTPUT_LAYOUT["trajectory_direction"]
+    prediction.data[:, direction] = torch.tensor(
+        (1.0, 0.0), dtype=torch.float64
+    ).repeat(12)
+    reached.data[:, direction] = prediction.data[:, direction]
+    prediction.data[:, joint.start] = 0.30
+    prediction.data[:, joint.start + 1] = 1.05
+    reached.data[:, joint.start + 1] = 1.05
+    prediction.data[:, phase] = -0.10
+    prediction.data[:, direction.start] = 1.60
+    if case == "derived_nonfinite" and rank == 1:
+        prediction.data[0, direction.start] = torch.finfo(torch.float64).max
+    try:
+        losses = training_module.physical_envelope_loss(
+            prediction,
+            reached,
+            normalization=_normalization(),
+            joint_limits=torch.tensor(
+                [[-1.0, 1.0]] * 29, dtype=torch.float64
+            ),
+            phase_advance_cap=0.50,
+            contract=training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+            global_ordinals=torch.tensor(ordinals, dtype=torch.int64),
+            rank=rank,
+            world_size=world_size,
+        )
+        losses["physical_envelope_total"].backward()
+        queue.put({
+            "rank": rank,
+            "error": None,
+            "ordinals": ordinals,
+            "weighted": {
+                family: float(losses[f"{family}_bounded_envelope"].detach())
+                for family in (
+                    "joint_step", "joint_limit", "phase", "direction"
+                )
+            },
+            "maximums": {
+                family: float(
+                    losses.bounded_reductions[family].maximum.detach()
+                )
+                for family in (
+                    "joint_step", "joint_limit", "phase", "direction"
+                )
+            },
+            "gradient_by_row": prediction.grad.abs().sum(dim=1).tolist(),
+        })
+    except Exception as error:  # sent to the parent for collective assertions
+        queue.put({
+            "rank": rank,
+            "error": (type(error).__name__, str(error)),
+        })
+    finally:
+        dist.destroy_process_group()
+
+
+def _spawn_four_family_bounded_workers(
+    case: str = "finite",
+) -> list[dict[str, object]]:
+    context = torch.multiprocessing.get_context("spawn")
+    queue = context.SimpleQueue()
+    with tempfile.TemporaryDirectory() as temporary:
+        init_method = (Path(temporary) / "four-family-gloo-init").as_uri()
+        torch.multiprocessing.spawn(
+            _four_family_bounded_ddp_worker,
+            args=(2, init_method, case, queue),
+            nprocs=2,
+            join=True,
+        )
+        results = [queue.get() for _ in range(2)]
+    return sorted(results, key=lambda item: int(item["rank"]))
+
+
 def _spawn_global_envelope_workers(case: str) -> list[dict[str, object]]:
     context = torch.multiprocessing.get_context("spawn")
     queue = context.SimpleQueue()
@@ -1208,6 +1322,252 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             "metric": one_step_records[0],
         }
 
+    def test_physical_envelope_objective_v2_requires_exact_canonical_fields(
+        self,
+    ) -> None:
+        self.assertEqual(
+            training_module.BOUNDED_ENVELOPE_LOSS_KEYS,
+            (
+                "joint_step_bounded_envelope",
+                "joint_limit_bounded_envelope",
+                "phase_bounded_envelope",
+                "direction_bounded_envelope",
+            ),
+        )
+        expected: dict[str, object] = {
+            "schema": "mm-sonic-physical-envelope-objective/v2",
+            "joint_step_onset_rad": 0.225,
+            "joint_step_scale_rad": 0.025,
+            "joint_limit_margin_rad": 0.020,
+            "phase_upper_margin_rad": 0.020,
+            "phase_scale_rad": 0.020,
+            "tail_fraction": 0.10,
+            "joint_step_hinge_power": 2,
+            "joint_limit_hinge_power": 2,
+            "phase_lower_hinge_power": 1,
+            "phase_upper_hinge_power": 2,
+            "maximum_coefficient": 1.0,
+            "positive_tail_mean_coefficient": 1.0,
+            "direction_norm_inner_lower": 0.55,
+            "direction_norm_inner_upper": 1.45,
+            "direction_norm_scale": 0.05,
+            "direction_hinge_power": 2,
+            "joint_step_smooth_l1_beta_rad": 0.025,
+            "joint_limit_smooth_l1_beta_rad": 0.020,
+            "phase_upper_smooth_l1_beta_rad": 0.020,
+            "direction_smooth_l1_beta": 0.05,
+            "reference_pair_count": 256,
+            "reference_pair_coefficient": 0.00390625,
+        }
+        payload = training_module.physical_envelope_objective_payload(
+            training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE
+        )
+        self.assertEqual(payload, expected)
+        self.assertEqual(
+            training_module.validate_physical_envelope_objective(payload),
+            expected,
+        )
+
+        missing = dict(payload)
+        missing.pop("direction_norm_inner_lower")
+        extra = {**payload, "unexpected": 1.0}
+        v1 = {**payload, "schema": "mm-sonic-physical-envelope-objective/v1"}
+        invalid_payloads = (missing, extra, v1)
+        for invalid in invalid_payloads:
+            with self.subTest(fields=tuple(sorted(invalid))):
+                with self.assertRaisesRegex(ValueError, "objective"):
+                    training_module.validate_physical_envelope_objective(invalid)
+
+        mutations: tuple[tuple[str, object], ...] = (
+            ("direction_hinge_power", True),
+            ("reference_pair_count", True),
+            ("joint_step_smooth_l1_beta_rad", 0.0),
+            ("joint_limit_smooth_l1_beta_rad", -0.020),
+            ("phase_upper_smooth_l1_beta_rad", float("inf")),
+            ("direction_smooth_l1_beta", float("nan")),
+            ("direction_norm_inner_lower", 1.45),
+            ("direction_norm_inner_upper", 0.55),
+            ("reference_pair_count", 255),
+            ("reference_pair_coefficient", 1.0 / 255.0),
+        )
+        for name, invalid_value in mutations:
+            changed = dict(payload)
+            changed[name] = invalid_value
+            with self.subTest(field=name, value=invalid_value):
+                with self.assertRaisesRegex(ValueError, "objective"):
+                    training_module.validate_physical_envelope_objective(changed)
+
+    def test_smooth_l1_physical_excess_has_exact_values_and_capped_gradients(
+        self,
+    ) -> None:
+        for beta in (0.025, 0.020, 0.05):
+            excess = torch.tensor(
+                (0.0, beta / 2.0, beta, 2.0 * beta),
+                dtype=torch.float64,
+                requires_grad=True,
+            )
+            values = training_module.smooth_l1_physical_excess(
+                excess, beta=beta
+            )
+            torch.testing.assert_close(
+                values,
+                torch.tensor(
+                    (0.0, beta / 8.0, beta / 2.0, 1.5 * beta),
+                    dtype=torch.float64,
+                ),
+                rtol=0.0,
+                atol=1.0e-15,
+            )
+            gradients = torch.autograd.grad(values.sum(), excess)[0]
+            torch.testing.assert_close(
+                gradients,
+                torch.tensor((0.0, 0.5, 1.0, 1.0), dtype=torch.float64),
+                rtol=0.0,
+                atol=1.0e-15,
+            )
+
+    def test_bounded_surrogates_use_physical_boundaries_and_worst_element(
+        self,
+    ) -> None:
+        prediction = torch.zeros(
+            (10, OUTPUT_LAYOUT.size), dtype=torch.float64, requires_grad=True
+        )
+        reached = torch.zeros_like(prediction)
+        joint = OUTPUT_LAYOUT["joint_position"]
+        phase = OUTPUT_LAYOUT["phase_advance"]
+        direction = OUTPUT_LAYOUT["trajectory_direction"]
+        prediction.data[:, direction] = torch.tensor(
+            (1.0, 0.0), dtype=torch.float64
+        ).repeat(12)
+        reached.data[:, direction] = prediction.data[:, direction]
+
+        prediction.data[0, joint.start] = 0.225
+        prediction.data[1, joint.start] = 0.275
+        prediction.data[2, joint.start] = -0.98
+        reached.data[2, joint.start] = -0.98
+        prediction.data[3, joint.start] = 0.98
+        reached.data[3, joint.start] = 0.98
+        prediction.data[4, joint.start] = -1.02
+        reached.data[4, joint.start] = -1.02
+        prediction.data[5, phase] = 0.0
+        prediction.data[6, phase] = 0.48
+        prediction.data[7, phase] = -1.0e-12
+        prediction.data[8, phase] = 0.52
+        prediction.data[9, joint.start] = 0.24
+        prediction.data[9, joint.start + 1] = 0.275
+
+        bounded = training_module.bounded_physical_envelope_surrogates(
+            prediction,
+            reached,
+            normalization=_normalization(),
+            joint_limits=torch.tensor([[-1.0, 1.0]] * 29),
+            phase_advance_cap=0.50,
+            contract=training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+        )
+        self.assertEqual(set(bounded), {
+            "joint_step", "joint_limit", "phase", "direction",
+        })
+        self.assertEqual(float(bounded["joint_step"][0].detach()), 0.0)
+        self.assertAlmostEqual(
+            float(bounded["joint_step"][1].detach()), 0.0375, places=15
+        )
+        self.assertEqual(float(bounded["joint_limit"][2].detach()), 0.0)
+        self.assertEqual(float(bounded["joint_limit"][3].detach()), 0.0)
+        self.assertAlmostEqual(
+            float(bounded["joint_limit"][4].detach()), 0.03, places=15
+        )
+        self.assertEqual(float(bounded["phase"][5].detach()), 0.0)
+        self.assertEqual(float(bounded["phase"][6].detach()), 0.0)
+        self.assertEqual(float(bounded["phase"][7].detach()), 1.0e-12)
+        self.assertAlmostEqual(
+            float(bounded["phase"][8].detach()), 0.03, places=15
+        )
+        self.assertAlmostEqual(
+            float(bounded["joint_step"][9].detach()), 0.0375, places=15
+        )
+
+        sum(value.sum() for value in bounded.values()).backward()
+        self.assertEqual(
+            float(prediction.grad[0, joint.start]), 0.0
+        )
+        self.assertEqual(
+            float(prediction.grad[2, joint.start]), 0.0
+        )
+        self.assertEqual(
+            float(prediction.grad[3, joint.start]), 0.0
+        )
+        self.assertEqual(float(prediction.grad[5, phase.start]), 0.0)
+        self.assertEqual(float(prediction.grad[6, phase.start]), 0.0)
+        self.assertEqual(float(prediction.grad[7, phase.start]), -1.0)
+        self.assertEqual(float(prediction.grad[8, phase.start]), 1.0)
+        self.assertLessEqual(float(prediction.grad.abs().max()), 1.0)
+
+    def test_direction_raw_and_bounded_bands_are_distinct(self) -> None:
+        norms = (0.0, 0.49, 0.50, 0.55, 1.0, 1.45, 1.50, 1.51)
+        prediction = torch.zeros(
+            (len(norms), OUTPUT_LAYOUT.size),
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        reached = torch.zeros_like(prediction)
+        direction = OUTPUT_LAYOUT["trajectory_direction"]
+        prediction.data[:, direction] = torch.tensor(
+            (1.0, 0.0), dtype=torch.float64
+        ).repeat(12)
+        reached.data[:, direction] = prediction.data[:, direction]
+        for row, norm in enumerate(norms):
+            prediction.data[row, direction.start:direction.start + 2] = torch.tensor(
+                (norm, 0.0), dtype=torch.float64
+            )
+
+        risks = training_module.physical_envelope_risks(
+            prediction,
+            reached,
+            normalization=_normalization(),
+            joint_limits=torch.tensor([[-1.0, 1.0]] * 29),
+            phase_advance_cap=0.50,
+            contract=training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+        )
+        bounded = training_module.bounded_physical_envelope_surrogates(
+            prediction,
+            reached,
+            normalization=_normalization(),
+            joint_limits=torch.tensor([[-1.0, 1.0]] * 29),
+            phase_advance_cap=0.50,
+            contract=training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+        )
+        torch.testing.assert_close(
+            risks["direction"],
+            torch.tensor(
+                (121.0, 1.44, 1.0, 0.0, 0.0, 0.0, 1.0, 1.44),
+                dtype=torch.float64,
+            ),
+            rtol=0.0,
+            atol=1.0e-12,
+        )
+        torch.testing.assert_close(
+            bounded["direction"],
+            torch.tensor(
+                (0.525, 0.035, 0.025, 0.0, 0.0, 0.0, 0.025, 0.035),
+                dtype=torch.float64,
+            ),
+            rtol=0.0,
+            atol=1.0e-12,
+        )
+        self.assertEqual(
+            risks.runtime_failures["direction"].tolist(),
+            [True, True, False, False, False, False, False, True],
+        )
+        bounded["direction"].sum().backward()
+        self.assertTrue(torch.isfinite(prediction.grad).all())
+        self.assertEqual(
+            float(prediction.grad[0, direction.start:direction.start + 2].sum()),
+            0.0,
+        )
+        self.assertEqual(float(prediction.grad[3, direction.start]), 0.0)
+        self.assertEqual(float(prediction.grad[5, direction.start]), 0.0)
+        self.assertLessEqual(float(prediction.grad.abs().max()), 1.0)
+
     def test_physical_envelope_risks_use_exact_margins_and_phase_gradients(
         self,
     ) -> None:
@@ -1309,6 +1669,11 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
         reached = torch.zeros_like(prediction)
         joint = OUTPUT_LAYOUT["joint_position"]
         phase = OUTPUT_LAYOUT["phase_advance"]
+        direction = OUTPUT_LAYOUT["trajectory_direction"]
+        prediction.data[:, direction] = torch.tensor(
+            (1.0, 0.0), dtype=torch.float64
+        ).repeat(12)
+        reached.data[:, direction] = prediction.data[:, direction]
         prediction.data[0, joint.start] = 0.225
         prediction.data[1, joint.start] = -0.98
         reached.data[1, joint.start] = -0.98
@@ -1510,6 +1875,128 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                     references.append((label, *observed))
                 self.assertEqual(observed, references[-1][1:])
 
+    def test_bounded_envelope_safe_append_scales_each_family_once(self) -> None:
+        family_values = {
+            "joint_step": 0.0625,
+            "joint_limit": 0.06,
+            "phase": 0.10,
+            "direction": 0.125,
+        }
+        for family in family_values:
+            references: dict[str, tuple[float, float, float, float]] = {}
+            for label, shape in (
+                ("batch", (1,)),
+                ("batch_appended", (1024,)),
+                ("rollout", (1, 1)),
+                ("rollout_appended", (32, 32)),
+            ):
+                count = math.prod(shape)
+                prediction = torch.zeros(
+                    (count, OUTPUT_LAYOUT.size),
+                    dtype=torch.float64,
+                    requires_grad=True,
+                )
+                reached = torch.zeros_like(prediction)
+                direction = OUTPUT_LAYOUT["trajectory_direction"]
+                prediction.data[:, direction] = torch.tensor(
+                    (1.0, 0.0), dtype=torch.float64
+                ).repeat(12)
+                reached.data[:, direction] = prediction.data[:, direction]
+                gradient_index = OUTPUT_LAYOUT["joint_position"].start
+                if family == "joint_step":
+                    prediction.data[0, gradient_index] = 0.30
+                elif family == "joint_limit":
+                    prediction.data[0, gradient_index] = 1.05
+                    reached.data[0, gradient_index] = 1.05
+                elif family == "phase":
+                    gradient_index = OUTPUT_LAYOUT["phase_advance"].start
+                    prediction.data[0, gradient_index] = -0.10
+                else:
+                    gradient_index = direction.start
+                    prediction.data[0, gradient_index] = 1.60
+
+                losses = training_module.physical_envelope_loss(
+                    prediction,
+                    reached,
+                    normalization=_normalization(),
+                    joint_limits=torch.tensor(
+                        [[-1.0, 1.0]] * 29, dtype=torch.float64
+                    ),
+                    phase_advance_cap=0.50,
+                    contract=training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+                    global_ordinals=torch.arange(count, dtype=torch.int64),
+                    rank=0,
+                    world_size=1,
+                )
+                reduction = losses.bounded_reductions[family]
+                weighted_name = f"{family}_bounded_envelope"
+                losses[weighted_name].backward()
+                observed = (
+                    float(reduction.maximum.detach()),
+                    float(reduction.positive_tail_mean.detach()),
+                    float(losses[weighted_name].detach()),
+                    float(prediction.grad[0, gradient_index]),
+                )
+                stage = "rollout" if label.startswith("rollout") else "batch"
+                if stage not in references:
+                    references[stage] = observed
+                self.assertEqual(observed, references[stage])
+                self.assertAlmostEqual(
+                    observed[0], family_values[family], places=15
+                )
+                self.assertAlmostEqual(
+                    observed[1], family_values[family], places=15
+                )
+                self.assertAlmostEqual(
+                    observed[2],
+                    2.0 * family_values[family] / 256.0,
+                    places=15,
+                )
+                self.assertEqual(abs(observed[3]), 2.0 / 256.0)
+
+    def test_raw_diagnostics_do_not_enter_bounded_physical_total(self) -> None:
+        prediction = torch.zeros(
+            (1, OUTPUT_LAYOUT.size), dtype=torch.float64
+        )
+        reached = torch.zeros_like(prediction)
+        direction = OUTPUT_LAYOUT["trajectory_direction"]
+        prediction[:, direction] = torch.tensor(
+            (1.0, 0.0), dtype=torch.float64
+        ).repeat(12)
+        reached[:, direction] = prediction[:, direction]
+        prediction[0, OUTPUT_LAYOUT["joint_position"].start] = 0.30
+        losses = training_module.physical_envelope_loss(
+            prediction,
+            reached,
+            normalization=_normalization(),
+            joint_limits=torch.tensor(
+                [[-1.0, 1.0]] * 29, dtype=torch.float64
+            ),
+            phase_advance_cap=0.50,
+            contract=training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+            global_ordinals=torch.tensor((0,), dtype=torch.int64),
+            rank=0,
+            world_size=1,
+        )
+        bounded_total = sum(
+            losses[f"{family}_bounded_envelope"]
+            for family in ("joint_step", "joint_limit", "phase", "direction")
+        )
+        raw_total = sum(
+            losses[f"{family}_envelope"]
+            for family in ("joint_step", "joint_limit", "phase", "direction")
+        )
+        torch.testing.assert_close(losses["physical_envelope_total"], bounded_total)
+        self.assertGreater(float(raw_total), 1000.0 * float(bounded_total))
+        self.assertEqual(
+            set(losses.raw_reductions),
+            {"joint_step", "joint_limit", "phase", "direction"},
+        )
+        self.assertEqual(
+            set(losses.bounded_reductions),
+            {"joint_step", "joint_limit", "phase", "direction"},
+        )
+
     def test_physical_envelope_loss_reports_independent_family_reductions(
         self,
     ) -> None:
@@ -1530,15 +2017,29 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
         )
         expected = {
             f"{family}_{suffix}"
-            for family in ("joint_step", "joint_limit", "phase")
+            for family in ("joint_step", "joint_limit", "phase", "direction")
             for suffix in ("maximum", "cvar", "positive_tail_mean", "envelope")
         }
-        self.assertEqual(set(losses), {"physical_envelope_total", *expected})
+        bounded = {
+            f"{family}_bounded_envelope"
+            for family in ("joint_step", "joint_limit", "phase", "direction")
+        }
+        self.assertEqual(
+            set(losses), {"physical_envelope_total", *expected, *bounded}
+        )
         torch.testing.assert_close(
             losses["physical_envelope_total"],
-            sum(losses[f"{family}_envelope"] for family in (
-                "joint_step", "joint_limit", "phase"
+            sum(losses[f"{family}_bounded_envelope"] for family in (
+                "joint_step", "joint_limit", "phase", "direction"
             )),
+        )
+        self.assertEqual(
+            set(losses.raw_reductions),
+            {"joint_step", "joint_limit", "phase", "direction"},
+        )
+        self.assertEqual(
+            set(losses.bounded_reductions),
+            {"joint_step", "joint_limit", "phase", "direction"},
         )
 
     def test_one_step_envelope_uses_predecessor_target_and_reaches_model_gradient(
@@ -1575,7 +2076,8 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
         batch = torch.zeros(2, OUTPUT_LAYOUT.size, dtype=torch.float64)
         nonfinite = training_module.PhysicalEnvelopeLosses(
             {"physical_envelope_total": torch.tensor(float("inf"))},
-            reductions={},
+            raw_reductions={},
+            bounded_reductions={},
         )
         with patch.object(
             training_module, "physical_envelope_loss", return_value=nonfinite
@@ -1669,7 +2171,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             * 2,
         )
         for result in results:
-            self.assertEqual(result["all_gather_count"], 12)
+            self.assertEqual(result["all_gather_count"], 27)
             self.assertEqual(result["risk_call_count"], 1)
             self.assertFalse(result["backward_called"])
 
@@ -1828,6 +2330,86 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                     for name in reference_gradients
                 }
                 self.assertEqual(averaged_gradients, reference_gradients)
+
+    def test_two_rank_four_family_bounded_reduction_matches_single_rank(self) -> None:
+        prediction = torch.zeros(
+            (4, OUTPUT_LAYOUT.size), dtype=torch.float64, requires_grad=True
+        )
+        reached = torch.zeros_like(prediction)
+        joint = OUTPUT_LAYOUT["joint_position"]
+        phase = OUTPUT_LAYOUT["phase_advance"]
+        direction = OUTPUT_LAYOUT["trajectory_direction"]
+        prediction.data[:, direction] = torch.tensor(
+            (1.0, 0.0), dtype=torch.float64
+        ).repeat(12)
+        reached.data[:, direction] = prediction.data[:, direction]
+        prediction.data[:, joint.start] = 0.30
+        prediction.data[:, joint.start + 1] = 1.05
+        reached.data[:, joint.start + 1] = 1.05
+        prediction.data[:, phase] = -0.10
+        prediction.data[:, direction.start] = 1.60
+        reference = training_module.physical_envelope_loss(
+            prediction,
+            reached,
+            normalization=_normalization(),
+            joint_limits=torch.tensor(
+                [[-1.0, 1.0]] * 29, dtype=torch.float64
+            ),
+            phase_advance_cap=0.50,
+            contract=training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+            global_ordinals=torch.arange(4, dtype=torch.int64),
+            rank=0,
+            world_size=1,
+        )
+        reference["physical_envelope_total"].backward()
+        results = _spawn_four_family_bounded_workers()
+        self.assertTrue(all(result["error"] is None for result in results))
+        for result in results:
+            self.assertEqual(
+                result["weighted"],
+                {
+                    family: float(
+                        reference[f"{family}_bounded_envelope"].detach()
+                    )
+                    for family in (
+                        "joint_step", "joint_limit", "phase", "direction"
+                    )
+                },
+            )
+            self.assertEqual(
+                result["maximums"],
+                {
+                    family: float(
+                        reference.bounded_reductions[family].maximum.detach()
+                    )
+                    for family in (
+                        "joint_step", "joint_limit", "phase", "direction"
+                    )
+                },
+            )
+        ddp_gradients = [0.0] * 4
+        for result in results:
+            for ordinal, gradient in zip(
+                result["ordinals"], result["gradient_by_row"]
+            ):
+                ddp_gradients[int(ordinal)] = float(gradient) / 2.0
+        torch.testing.assert_close(
+            torch.tensor(ddp_gradients, dtype=torch.float64),
+            prediction.grad.abs().sum(dim=1),
+            rtol=0.0,
+            atol=1.0e-15,
+        )
+        self.assertEqual(
+            {index for index, value in enumerate(ddp_gradients) if value > 0.0},
+            {0},
+        )
+
+    def test_two_rank_four_family_nonfinite_is_metadata_first(self) -> None:
+        results = _spawn_four_family_bounded_workers("derived_nonfinite")
+        self.assertEqual(
+            [result["error"] for result in results],
+            [("ValueError", "global envelope metadata is invalid")] * 2,
+        )
 
     def test_two_rank_global_max_plus_tail_rejects_collectively(self) -> None:
         for case in (
