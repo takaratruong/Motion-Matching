@@ -26,13 +26,18 @@ from mm_sonic.terrain_pfnn.runtime import (
     TerrainPFNNRuntime,
     TerrainSample,
 )
-from mm_sonic.terrain_pfnn.training import load_checkpoint, one_step_metrics
+from mm_sonic.terrain_pfnn.training import (
+    fitted_row_sha256,
+    load_checkpoint,
+    one_step_metrics,
+)
 from mm_sonic.terrain_oracle.canonical import CanonicalTerrainMesh
 from mm_sonic.terrain_oracle.math3d import RigidTransform
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _KNOWN_TRAIN_TICKS = 600
+_ROUTE_TURNAROUND_CLEARANCE_M = 0.85
 _USD_DECODE_SCHEMA = "mm-sonic-usd-mesh/v1"
 _GRAIL_PAIR_SCHEMA = "mm-sonic-grail-pair/v1"
 _USD_DECODE_MAXIMUM_BYTES = 64 * 1024 * 1024
@@ -521,6 +526,7 @@ class SourceAlignedTerrain:
         source_root_xy: object,
         source_root_yaw: float,
         source_support_height: float,
+        runtime_root_xy: object = (0.0, 0.0),
     ) -> None:
         vertices = np.asarray(
             world_from_mesh.apply_points(mesh.vertices_local), dtype=np.float64
@@ -539,11 +545,14 @@ class SourceAlignedTerrain:
         normals = raw_normals[usable]
         self._gradients = -normals[:, :2] / normals[:, 2:3]
         self._source_root_xy = np.asarray(source_root_xy, dtype=np.float64)
+        self._runtime_root_xy = np.asarray(runtime_root_xy, dtype=np.float64)
         self._source_root_yaw = float(source_root_yaw)
         self._source_support = float(source_support_height)
         if (
             self._source_root_xy.shape != (2,)
             or not np.isfinite(self._source_root_xy).all()
+            or self._runtime_root_xy.shape != (2,)
+            or not np.isfinite(self._runtime_root_xy).all()
             or not math.isfinite(self._source_root_yaw)
             or not math.isfinite(self._source_support)
         ):
@@ -556,18 +565,237 @@ class SourceAlignedTerrain:
         )
         self.exact_mesh_query_count = 0
         self.extrapolated_query_count = 0
+        self._runtime_route_maximum_x: float | None = None
         self.alignment_report = {
             "approach": "seed_source_anchor",
             "source_root_xy": self._source_root_xy.tolist(),
+            "runtime_root_xy": self._runtime_root_xy.tolist(),
             "source_root_yaw": self._source_root_yaw,
             "source_support_height_m": self._source_support,
             "source_sha256": mesh.source_asset_sha256,
         }
 
+    @classmethod
+    def from_supported_flat_seed(
+        cls,
+        mesh: CanonicalTerrainMesh,
+        *,
+        world_from_mesh: RigidTransform,
+        runtime_root_xy: object,
+        runtime_root_yaw: float,
+        seed_trajectory_position: object,
+        seed_trajectory_direction: object,
+        expected_relative_terrain: object,
+    ) -> "SourceAlignedTerrain":
+        """Deterministically align a flat recurrent seed on exact mesh support."""
+
+        root_xy = np.asarray(runtime_root_xy, dtype=np.float64)
+        positions = np.asarray(seed_trajectory_position, dtype=np.float64)
+        directions = np.asarray(seed_trajectory_direction, dtype=np.float64)
+        expected = np.asarray(expected_relative_terrain, dtype=np.float64)
+        if (
+            root_xy.shape != (2,)
+            or positions.shape != (12, 2)
+            or directions.shape != (12, 2)
+            or expected.shape != (12, 3)
+            or not all(
+                np.isfinite(value).all()
+                for value in (root_xy, positions, directions, expected)
+            )
+            or not math.isfinite(float(runtime_root_yaw))
+        ):
+            raise ValueError("supported-flat seed alignment inputs are invalid")
+        vertices = np.asarray(
+            world_from_mesh.apply_points(mesh.vertices_local), dtype=np.float64
+        )
+        faces = np.asarray(mesh.faces, dtype=np.int64)
+        triangles = vertices[faces[np.asarray(mesh.valid_faces, dtype=np.bool_)]]
+        normals = np.cross(
+            triangles[:, 1] - triangles[:, 0],
+            triangles[:, 2] - triangles[:, 0],
+        )
+        usable = normals[:, 2] > 1.0e-8
+        triangles, normals = triangles[usable], normals[usable]
+        gradients = -normals[:, :2] / normals[:, 2:3]
+        grades = np.degrees(np.arctan(np.linalg.norm(gradients, axis=1)))
+        nonflat = np.flatnonzero(grades >= 2.0)
+        flat = np.flatnonzero(grades <= 0.5)
+        if not len(nonflat) or not len(flat):
+            raise ValueError("known terrain needs exact flat and sloped support")
+        headings: list[float] = []
+        for index in nonflat:
+            gradient = gradients[index]
+            angle = math.atan2(float(gradient[1]), float(gradient[0]))
+            for heading in (angle, math.atan2(-math.sin(angle), -math.cos(angle))):
+                if all(
+                    abs(math.atan2(math.sin(heading - other), math.cos(heading - other)))
+                    > 1.0e-6
+                    for other in headings
+                ):
+                    headings.append(heading)
+        barycentric = np.asarray(
+            [
+                (first / 10.0, second / 10.0, (10 - first - second) / 10.0)
+                for first in range(11)
+                for second in range(11 - first)
+            ],
+            dtype=np.float64,
+        )
+        candidates = sorted(
+            {
+                tuple(np.round(weights @ triangles[index, :, :2], 10))
+                for index in flat
+                for weights in barycentric
+            }
+        )
+        runtime_rotation = np.asarray(
+            (
+                (math.cos(runtime_root_yaw), -math.sin(runtime_root_yaw)),
+                (math.sin(runtime_root_yaw), math.cos(runtime_root_yaw)),
+            ),
+            dtype=np.float64,
+        )
+        span = float(np.linalg.norm(np.ptp(vertices[:, :2], axis=0))) + 0.5
+        def assess(
+            heading: float, candidate: np.ndarray
+        ) -> tuple[tuple[float, ...], SourceAlignedTerrain] | None:
+            # The candidate lies on a known flat triangle, so the highest
+            # containing upward face defines its exact support height.
+            provisional = cls(
+                mesh,
+                world_from_mesh=world_from_mesh,
+                source_root_xy=candidate,
+                source_root_yaw=heading,
+                source_support_height=0.0,
+                runtime_root_xy=root_xy,
+            )
+            try:
+                support, _, _ = provisional._source_height_gradient(candidate)
+            except ValueError:
+                return None
+            terrain = cls(
+                mesh,
+                world_from_mesh=world_from_mesh,
+                source_root_xy=candidate,
+                source_root_yaw=heading,
+                source_support_height=support,
+                runtime_root_xy=root_xy,
+            )
+            actual = np.empty((12, 3), dtype=np.float64)
+            supported = True
+            for index in range(12):
+                norm = float(np.linalg.norm(directions[index]))
+                if norm < 1.0e-12:
+                    supported = False
+                    break
+                facing = directions[index] / norm
+                normal = np.asarray((-facing[1], facing[0]))
+                for probe, local in enumerate(
+                    (
+                        positions[index] + 0.25 * normal,
+                        positions[index],
+                        positions[index] - 0.25 * normal,
+                    )
+                ):
+                    runtime_point = root_xy + local @ runtime_rotation.T
+                    sample = terrain(runtime_point)
+                    if sample is None or sample.absolute_grade_degrees > 0.5:
+                        supported = False
+                        break
+                    actual[index, probe] = sample.height_m
+                if not supported:
+                    break
+            if not supported:
+                return None
+            error = float(np.max(np.abs(actual - expected)))
+            if error > 1.0e-4:
+                return None
+            flank_entry: float | None = None
+            continuation: float | None = None
+            last_supported = 0.0
+            route_maximum_grade = 0.0
+            for distance in np.linspace(0.0, span, max(2, int(span / 0.025) + 1)):
+                runtime_points = [
+                    root_xy
+                    + np.asarray((distance, lateral)) @ runtime_rotation.T
+                    for lateral in (0.25, 0.0, -0.25)
+                ]
+                samples = [terrain(point) for point in runtime_points]
+                if any(sample is None for sample in samples):
+                    break
+                last_supported = float(distance)
+                grade = max(sample.absolute_grade_degrees for sample in samples)
+                route_maximum_grade = max(route_maximum_grade, grade)
+                if flank_entry is None and grade >= 2.0:
+                    flank_entry = float(distance)
+                elif (
+                    continuation is None
+                    and flank_entry is not None
+                    and grade <= 0.5
+                    and distance > flank_entry + 0.05
+                ):
+                    continuation = float(distance)
+            # Keep a full future-knot horizon inside exact support at the
+            # turnaround.  The runtime replanner may stop earlier, never later.
+            turnaround = last_supported - _ROUTE_TURNAROUND_CLEARANCE_M
+            if (
+                flank_entry is None
+                or turnaround <= flank_entry + 0.10
+                or route_maximum_grade < 2.0
+            ):
+                return None
+            terrain.alignment_report.update(
+                {
+                    "approach": "supported_flat_mesh",
+                    "runtime_to_source_yaw": heading,
+                    "maximum_seed_probe_error_m": error,
+                    "verified_seed_probe_count": 36,
+                    "native_maximum_grade_degrees": float(np.max(grades)),
+                    "route_maximum_grade_degrees": route_maximum_grade,
+                    "flank_entry_runtime_x_m": flank_entry,
+                    "continuation_runtime_x_m": continuation,
+                    "has_post_flank_continuation": continuation is not None,
+                    "supported_route_extent_m": last_supported,
+                    "turnaround_runtime_x_m": turnaround,
+                    "turnaround_future_clearance_m": (
+                        _ROUTE_TURNAROUND_CLEARANCE_M
+                    ),
+                }
+            )
+            score = (
+                -route_maximum_grade,
+                -turnaround,
+                error,
+                flank_entry,
+                heading,
+                float(candidate[0]),
+                float(candidate[1]),
+            )
+            return score, terrain
+
+        best: tuple[tuple[float, ...], SourceAlignedTerrain] | None = None
+        for heading in sorted(headings):
+            for candidate_tuple in candidates:
+                assessed = assess(
+                    heading, np.asarray(candidate_tuple, dtype=np.float64)
+                )
+                if assessed is not None and (best is None or assessed[0] < best[0]):
+                    best = assessed
+        if best is None:
+            raise ValueError(
+                "no exact supported flat route has a safe flank turnaround"
+            )
+        selected = best[1]
+        selected._runtime_route_maximum_x = float(
+            selected.alignment_report["turnaround_runtime_x_m"]
+        )
+        selected.exact_mesh_query_count = 0
+        selected.extrapolated_query_count = 0
+        return selected
+
     def _source_height_gradient(
         self, point: np.ndarray
     ) -> tuple[float, np.ndarray, bool]:
-        best_distance = math.inf
         best_height = -math.inf
         best_gradient: np.ndarray | None = None
         for triangle, gradient in zip(
@@ -580,7 +808,6 @@ class SourceAlignedTerrain:
             dot01 = float(np.dot(edge0, edge1))
             dot11 = float(np.dot(edge1, edge1))
             denominator = dot00 * dot11 - dot01 * dot01
-            candidates: list[tuple[float, float]] = []
             if abs(denominator) > 1.0e-14:
                 relative = point - a
                 dot20 = float(np.dot(relative, edge0))
@@ -589,47 +816,72 @@ class SourceAlignedTerrain:
                 weight_c = (dot00 * dot21 - dot01 * dot20) / denominator
                 weight_a = 1.0 - weight_b - weight_c
                 if min(weight_a, weight_b, weight_c) >= -1.0e-12:
-                    candidates.append((0.0, float(
+                    height = float(
                         weight_a * triangle[0, 2]
                         + weight_b * triangle[1, 2]
                         + weight_c * triangle[2, 2]
-                    )))
-            for start, stop in ((0, 1), (1, 2), (2, 0)):
-                direction = xy[stop] - xy[start]
-                length_squared = float(np.dot(direction, direction))
-                if length_squared <= 1.0e-14:
-                    continue
-                fraction = float(np.clip(
-                    np.dot(point - xy[start], direction) / length_squared,
-                    0.0,
-                    1.0,
-                ))
-                closest = xy[start] + fraction * direction
-                distance = float(np.sum(np.square(point - closest)))
-                height = float(
-                    triangle[start, 2]
-                    + fraction * (triangle[stop, 2] - triangle[start, 2])
-                )
-                candidates.append((distance, height))
-            for distance, height in candidates:
-                if distance < best_distance - 1.0e-12 or (
-                    abs(distance - best_distance) <= 1.0e-12
-                    and height > best_height
-                ):
-                    best_distance = distance
-                    best_height = height
-                    best_gradient = gradient
+                    )
+                    if height > best_height:
+                        best_height = height
+                        best_gradient = gradient
         if best_gradient is None or not math.isfinite(best_height):
             raise ValueError("source-aligned terrain query failed")
-        return best_height, best_gradient, best_distance <= 1.0e-12
+        return best_height, best_gradient, True
+
+    def collision_heights_at(self, xy: object) -> np.ndarray:
+        """Vectorized exact heights for every native collision-surface sample."""
+
+        runtime = np.asarray(xy, dtype=np.float64)
+        if runtime.ndim != 2 or runtime.shape[1:] != (2,) or not np.isfinite(runtime).all():
+            raise ValueError("collision terrain points must be finite [N,2]")
+        source = self._source_root_xy + (
+            runtime - self._runtime_root_xy
+        ) @ self._source_from_runtime.T
+        heights = np.full(len(source), -math.inf, dtype=np.float64)
+        for triangle in self._triangles:
+            a, b, c = triangle[:, :2]
+            edge0, edge1 = b - a, c - a
+            dot00 = float(np.dot(edge0, edge0))
+            dot01 = float(np.dot(edge0, edge1))
+            dot11 = float(np.dot(edge1, edge1))
+            denominator = dot00 * dot11 - dot01 * dot01
+            if abs(denominator) <= 1.0e-14:
+                continue
+            relative = source - a
+            dot20 = relative @ edge0
+            dot21 = relative @ edge1
+            weight_b = (dot11 * dot20 - dot01 * dot21) / denominator
+            weight_c = (dot00 * dot21 - dot01 * dot20) / denominator
+            weight_a = 1.0 - weight_b - weight_c
+            inside = (
+                (weight_a >= -1.0e-12)
+                & (weight_b >= -1.0e-12)
+                & (weight_c >= -1.0e-12)
+            )
+            if np.any(inside):
+                values = (
+                    weight_a[inside] * triangle[0, 2]
+                    + weight_b[inside] * triangle[1, 2]
+                    + weight_c[inside] * triangle[2, 2]
+                )
+                heights[inside] = np.maximum(heights[inside], values)
+        if np.any(~np.isfinite(heights)):
+            raise ValueError("collision terrain query left exact mesh support")
+        return heights - self._source_support
 
     def __call__(self, xy: np.ndarray) -> TerrainSample | None:
         runtime_xy = np.asarray(xy, dtype=np.float64)
         if runtime_xy.shape != (2,) or not np.isfinite(runtime_xy).all():
             return None
+        if (
+            self._runtime_route_maximum_x is not None
+            and runtime_xy[0] - self._runtime_root_xy[0]
+            > self._runtime_route_maximum_x + 1.0e-10
+        ):
+            return None
         source_xy = (
             self._source_root_xy
-            + runtime_xy @ self._source_from_runtime.T
+            + (runtime_xy - self._runtime_root_xy) @ self._source_from_runtime.T
         )
         try:
             height, source_gradient, exact = self._source_height_gradient(source_xy)
@@ -654,19 +906,25 @@ def _known_train_terrain(
     provenance = seed.get("provenance") if type(seed) is dict else None
     if type(provenance) is not dict:
         raise ValueError("checkpoint runtime seed provenance is invalid")
-    name = provenance.get("first_fitted_clip_id")
-    center_frame = provenance.get("first_fitted_center_frame")
     records = manifest.get("source_records")
-    if (
-        type(name) is not str
-        or type(center_frame) is not int
-        or type(records) is not dict
-        or type(records.get(name)) is not dict
-    ):
+    fitted_subset = getattr(checkpoint, "fitted_subset", None)
+    fitted_rows = fitted_subset.get("rows") if type(fitted_subset) is dict else None
+    if type(records) is not dict or type(fitted_rows) is not list:
+        raise ValueError("checkpoint fitted source receipt is missing")
+    candidates = sorted(
+        {
+            row["clip_id"]
+            for row in fitted_rows
+            if type(row) is dict
+            and type(row.get("clip_id")) is str
+            and type(records.get(row["clip_id"])) is dict
+            and records[row["clip_id"]].get("source_kind") == "grail"
+            and records[row["clip_id"]].get("split") == split
+            and row.get("terrain_class") in ("ascent", "descent", "transition")
+        }
+    )
+    if not candidates:
         raise ValueError("checkpoint fitted GRAIL source record is missing")
-    record = dict(records[name])
-    if record.get("source_kind") != "grail" or record.get("split") != split:
-        raise ValueError("checkpoint fitted source is not in the requested GRAIL split")
     roots = manifest.get("source_roots")
     if type(roots) is not dict or type(roots.get("grail")) is not dict:
         raise ValueError("dataset GRAIL source root is invalid")
@@ -674,47 +932,67 @@ def _known_train_terrain(
     if type(root_value) is not str:
         raise ValueError("dataset GRAIL source root is invalid")
     root = Path(root_value).expanduser().resolve()
-    terrain = (root / "data" / "slope" / "object_usd" / f"{name}.usd").resolve()
-    robot = (root / "data" / "slope" / "robot" / f"{name}.pkl").resolve()
     expected_terrain_parent = (root / "data" / "slope" / "object_usd").resolve()
-    expected_robot_parent = (root / "data" / "slope" / "robot").resolve()
-    if (
-        terrain.parent != expected_terrain_parent
-        or robot.parent != expected_robot_parent
-        or not terrain.is_file()
-        or not robot.is_file()
-    ):
-        raise ValueError("paired GRAIL robot/terrain path is invalid")
-    terrain_hash = record.get("terrain_sha256")
-    robot_hash = record.get("motion_sha256")
-    if (
-        type(terrain_hash) is not str
-        or _SHA256_RE.fullmatch(terrain_hash) is None
-        or type(robot_hash) is not str
-        or _SHA256_RE.fullmatch(robot_hash) is None
-    ):
-        raise ValueError("paired GRAIL robot/terrain hash is invalid")
-    pair = _decode_grail_pair(
-        terrain,
-        robot,
-        expected_terrain_sha256=terrain_hash,
-        expected_robot_sha256=robot_hash,
-        center_frame=center_frame,
-    )
     world_from_usd = RigidTransform(
         np.zeros(3, dtype=np.float32),
         np.asarray((math.sqrt(0.5), 0.0, 0.0, -math.sqrt(0.5)), dtype=np.float32),
     )
-    aligned = SourceAlignedTerrain(
-        pair.mesh,
-        world_from_mesh=world_from_usd,
-        source_root_xy=pair.anchor_root_xy,
-        source_root_yaw=pair.anchor_yaw,
-        source_support_height=pair.anchor_support,
-    )
+    runtime_root_xy = np.asarray(seed["world_xy"], dtype=np.float64)
+    runtime_root_yaw = float(np.asarray(seed["world_yaw"]))
     positions = np.asarray(seed["trajectory_position"], dtype=np.float64)
     directions = np.asarray(seed["trajectory_direction"], dtype=np.float64)
     expected = np.asarray(seed["terrain_height"], dtype=np.float64)
+    route_candidates: list[
+        tuple[tuple[float, float, str], str, str, SourceAlignedTerrain]
+    ] = []
+    for candidate_name in candidates:
+        record = dict(records[candidate_name])
+        terrain_path = (
+            root / "data" / "slope" / "object_usd" / f"{candidate_name}.usd"
+        ).resolve()
+        terrain_hash = record.get("terrain_sha256")
+        if (
+            terrain_path.parent != expected_terrain_parent
+            or not terrain_path.is_file()
+            or type(terrain_hash) is not str
+            or _SHA256_RE.fullmatch(terrain_hash) is None
+        ):
+            raise ValueError("paired GRAIL terrain path/hash is invalid")
+        mesh = _decode_usd_mesh(terrain_path, expected_sha256=terrain_hash)
+        try:
+            route = SourceAlignedTerrain.from_supported_flat_seed(
+                mesh,
+                world_from_mesh=world_from_usd,
+                runtime_root_xy=runtime_root_xy,
+                runtime_root_yaw=runtime_root_yaw,
+                seed_trajectory_position=positions,
+                seed_trajectory_direction=directions,
+                expected_relative_terrain=expected,
+            )
+        except ValueError:
+            continue
+        route_candidates.append(
+            (
+                (
+                    -float(route.alignment_report["route_maximum_grade_degrees"]),
+                    -float(route.alignment_report["turnaround_runtime_x_m"]),
+                    candidate_name,
+                ),
+                candidate_name,
+                terrain_hash,
+                route,
+            )
+        )
+    if not route_candidates:
+        raise ValueError("no fitted GRAIL terrain has an exact supported route")
+    _, name, terrain_hash, aligned = min(route_candidates, key=lambda item: item[0])
+    rotation = np.asarray(
+        (
+            (math.cos(runtime_root_yaw), -math.sin(runtime_root_yaw)),
+            (math.sin(runtime_root_yaw), math.cos(runtime_root_yaw)),
+        ),
+        dtype=np.float64,
+    )
     actual = np.empty((12, 3), dtype=np.float64)
     for index in range(12):
         normal = np.asarray((-directions[index, 1], directions[index, 0]))
@@ -723,7 +1001,7 @@ def _known_train_terrain(
             positions[index],
             positions[index] - 0.25 * normal,
         )):
-            sample = aligned(point)
+            sample = aligned(runtime_root_xy + point @ rotation.T)
             if sample is None:
                 raise ValueError("seed terrain alignment has a missing probe")
             actual[index, probe] = sample.height_m
@@ -731,10 +1009,14 @@ def _known_train_terrain(
     if error > 1.0e-4:
         raise ValueError(f"seed terrain alignment mismatch: {error:.9g} m")
     aligned.alignment_report.update({
-        "robot_sha256": robot_hash,
-        "anchor_center_frame": center_frame,
+        "source_record": name,
+        "terrain_sha256": terrain_hash,
+        "seed_first_fitted_clip_id": provenance["first_fitted_clip_id"],
+        "seed_first_fitted_center_frame": provenance["first_fitted_center_frame"],
         "maximum_seed_probe_error_m": error,
         "verified_seed_probe_count": 36,
+        "fitted_route_candidate_count": len(candidates),
+        "valid_route_candidate_count": len(route_candidates),
     })
     return name, aligned
 
@@ -773,8 +1055,12 @@ def run_known_train_rollout(
         joint_limits=runtime.joint_limits,
         native_geometry=geometry,
         height_and_grade_at=terrain,
+        traversal_axis_world=(1.0, 0.0),
     )
     first_hold: dict[str, object] | None = None
+    realized_x: list[float] = []
+    realized_grade: list[float] = []
+    initial_x = float(runtime.frame.root_position_world[0])
     for tick in range(_KNOWN_TRAIN_TICKS):
         command, traversal_direction = known_train_command(tick, warm_command)
         frame = runtime.step(command, camera_yaw=0.0)
@@ -789,12 +1075,96 @@ def run_known_train_rollout(
             terrain_sample=sample,
             traversal_direction=traversal_direction,
         )
+        realized_x.append(float(frame.root_position_world[0]) - initial_x)
+        realized_grade.append(sample.absolute_grade_degrees)
     report = recorder.finalize()
-    known_gates = {
-        "finite_20_seconds": bool(report["gates"]["finite_20_seconds"]),
-        "no_invalid_hold": bool(report["gates"]["no_invalid_hold"]),
-        "queried_exact_paired_mesh_flank": terrain.exact_mesh_query_count > 0,
+    runtime_gate_names = (
+        "finite_20_seconds",
+        "no_invalid_hold",
+        "no_phase_reversal",
+        "no_phase_freeze",
+        "root_translation_step_within_limit",
+        "root_rotation_step_within_limit",
+        "joint_step_within_limit",
+        "no_joint_limit_violation",
+        "sole_penetration_within_limit",
+        "zero_forbidden_body_penetration",
+        "stance_sole_speed_within_limit",
+    )
+    flank_entry = float(terrain.alignment_report["flank_entry_runtime_x_m"])
+    forward_maximum = max(realized_x, default=0.0)
+    backward_minimum = min(realized_x[420:], default=forward_maximum)
+    displacement = report["traversal"]["realized_displacement_m"]
+    grade_by_direction = report["traversal"]["maximum_grade_degrees_by_direction"]
+    signed_speeds = [
+        (realized_x[index] - realized_x[index - 1]) * 30.0
+        for index in range(1, len(realized_x))
+    ]
+    flat_return_x = max(0.0, flank_entry - 0.05)
+    return_tick = next(
+        (
+            tick
+            for tick in range(421, len(realized_x))
+            if max(realized_x[:tick], default=0.0) >= flank_entry + 0.10
+            and realized_x[tick] <= flat_return_x
+            and realized_grade[tick] <= 0.5
+        ),
+        None,
+    )
+    responsive_return = bool(
+        return_tick is not None
+        and any(
+            speed <= -0.175
+            for speed in signed_speeds[
+                max(0, return_tick - 1) : min(len(signed_speeds), return_tick + 60)
+            ]
+        )
+    )
+    known_gates: dict[str, bool] = {
+        name: bool(report["gates"][name]) for name in runtime_gate_names
     }
+    known_gates.update(
+        {
+            "queried_exact_paired_mesh_flank": terrain.exact_mesh_query_count > 0,
+            "crossed_supported_known_terrain": bool(
+                forward_maximum >= flank_entry + 0.10
+                and grade_by_direction["forward"] >= 2.0
+            ),
+            "returned_to_supported_continuation": bool(
+                return_tick is not None and grade_by_direction["backward"] >= 2.0
+            ),
+            "responsive_flat_motion_after_return": responsive_return,
+            "realized_nonstationary_traversal": bool(
+                displacement["forward"] >= 0.25
+                and displacement["backward"] >= 0.25
+            ),
+        }
+    )
+    split_identities = manifest.get("split_identities", {}).get("train")
+    if type(split_identities) is not list or not split_identities:
+        raise ValueError("known-train identity-set provenance is missing")
+    identity_base = {
+        "schema": "mm-sonic-train-identity-set/v1",
+        "dataset_digest_sha256": manifest["dataset_digest_sha256"],
+        "split": "train",
+        "identities": split_identities,
+    }
+    identity_sha = hashlib.sha256(
+        json.dumps(identity_base, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    scenario_base = {
+        "schema": "mm-sonic-known-train-scenario/v1",
+        "dataset_digest_sha256": manifest["dataset_digest_sha256"],
+        "train_identity_set_sha256": identity_sha,
+        "kinematic_signature_sha256": kinematics.kinematic_signature_sha256,
+        "source_record": source_name,
+        "terrain_source_sha256": terrain.alignment_report["terrain_sha256"],
+        "terrain_query_version": "exact-upward-triangle/v2",
+        "command_script_version": "known-train-20s/v2",
+    }
+    scenario_sha = hashlib.sha256(
+        json.dumps(scenario_base, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     report.update(
         {
             "checkpoint_sha256": checkpoint_sha256,
@@ -809,6 +1179,17 @@ def run_known_train_rollout(
                 "exact_mesh_query_count": terrain.exact_mesh_query_count,
                 "extrapolated_query_count": terrain.extrapolated_query_count,
             },
+            "native_geometry_audit": {
+                "sole_geom_count": geometry.sole_geom_count,
+                "forbidden_geom_count": geometry.forbidden_geom_count,
+                "collision_surface_sample_count": (
+                    geometry.total_collision_surface_samples
+                ),
+                "terrain_query_point_count": geometry.total_terrain_query_points,
+                "mean_surface_samples_per_frame": (
+                    geometry.total_collision_surface_samples / _KNOWN_TRAIN_TICKS
+                ),
+            },
             "command_script": {
                 "duration_seconds": 20.0,
                 "warm_0_2_m_s": warm_command.tolist(),
@@ -819,10 +1200,26 @@ def run_known_train_rollout(
                 "idle_18_20_seconds": True,
             },
             "known_train_gate": {
-                "gates": known_gates,
+                **known_gates,
                 "accepted": all(known_gates.values()),
                 "claim_scope": "finite_known_train_slope_only",
                 "unseen_hill_quality_claimed": False,
+                "traverses_18_9_degrees_both_directions": False,
+                "traverses_18_9_degrees_both_directions_applicable": False,
+                "native_maximum_grade_degrees": terrain.alignment_report[
+                    "native_maximum_grade_degrees"
+                ],
+                "realized_forward_maximum_x_m": forward_maximum,
+                "realized_backward_minimum_x_m": backward_minimum,
+                "flat_return_tick": return_tick,
+                "flat_return_threshold_x_m": flat_return_x,
+                "responsive_flat_motion_after_return": responsive_return,
+                "maximum_grade_degrees_by_direction": grade_by_direction,
+                "realized_displacement_m": displacement,
+            },
+            "scenario_provenance": {
+                **scenario_base,
+                "scenario_provenance_sha256": scenario_sha,
             },
             "first_hold": first_hold,
         }
@@ -841,6 +1238,32 @@ def _sha256(path: Path) -> str:
 def _dataset_root(path: str | Path) -> Path:
     candidate = Path(path).expanduser().resolve()
     return candidate.parent if candidate.is_file() else candidate
+
+
+def _fitted_subset_indices(
+    dataset: PFNNShardDataset, fitted_subset: object
+) -> list[int]:
+    """Resolve every hash-bound fitted row without accepting a same-key duplicate."""
+
+    rows = fitted_subset.get("rows") if type(fitted_subset) is dict else None
+    if type(rows) is not list or not rows:
+        raise ValueError("pipeline checkpoint fitted subset receipt is missing")
+    wanted = {
+        (row.get("clip_id"), row.get("center_frame")): row.get("row_sha256")
+        for row in rows
+        if type(row) is dict
+    }
+    if len(wanted) != len(rows):
+        raise ValueError("pipeline checkpoint fitted subset receipt is invalid")
+    matches: dict[tuple[object, object], list[int]] = {key: [] for key in wanted}
+    for index in range(len(dataset)):
+        sample = dataset[index]
+        key = (sample.get("clip_id"), sample.get("center_frame"))
+        if key in wanted and fitted_row_sha256(sample) == wanted[key]:
+            matches[key].append(index)
+    if any(len(indices) != 1 for indices in matches.values()):
+        raise ValueError("fitted subset row membership is not unique")
+    return [matches[(row["clip_id"], row["center_frame"])][0] for row in rows]
 
 
 def _atomic_json(path: Path, value: object) -> None:
@@ -943,6 +1366,7 @@ def evaluate(
     batch_size: int,
     device: str,
     closed_loop_seconds: float | None = None,
+    promote_pipeline_checkpoint: bool = False,
 ) -> dict[str, object]:
     if split not in ("train", "validation", "test"):
         raise ValueError("evaluation split must be train, validation, or test")
@@ -1003,6 +1427,7 @@ def evaluate(
         loss_weights=checkpoint.loss_weights,
     )
     closed_loop: dict[str, object]
+    pipeline_promotion: dict[str, object] | None = None
     if split == "train":
         closed_loop = run_known_train_rollout(
             checkpoint=checkpoint,
@@ -1013,6 +1438,64 @@ def evaluate(
             device=target_device,
             checkpoint_sha256=checkpoint_digest,
         )
+        fitted_subset = getattr(checkpoint, "fitted_subset", None)
+        selection = getattr(checkpoint, "selection", None)
+        if type(fitted_subset) is dict and type(selection) is dict:
+            fixed_indices = _fitted_subset_indices(dataset, fitted_subset)
+            fixed_metrics = one_step_metrics(
+                model,
+                dataset,
+                kinematics=kinematics,
+                indices=fixed_indices,
+                batch_size=batch_size,
+                device=target_device,
+                loss_weights=checkpoint.loss_weights,
+            )
+            from mm_sonic.train_terrain_pfnn import (
+                build_pipeline_promotion_receipt,
+                promote_pipeline_best,
+            )
+
+            scenario_sha = closed_loop["scenario_provenance"][
+                "scenario_provenance_sha256"
+            ]
+            receipt = build_pipeline_promotion_receipt(
+                checkpoint_path=checkpoint_path,
+                dataset_digest_sha256=dataset_digest,
+                kinematic_signature_sha256=kinematics.kinematic_signature_sha256,
+                scenario_provenance_sha256=scenario_sha,
+                fitted_subset_rows_sha256=fitted_subset["rows_sha256"],
+                expected_fixed_sample_score=float(selection["one_step_score"]),
+                observed_fixed_sample_score=float(fixed_metrics["one_step_score"]),
+                expected_fixed_sample_count=len(fixed_indices),
+                observed_fixed_sample_count=int(fixed_metrics["samples"]),
+                closed_loop_metrics=closed_loop,
+            )
+            promoted = False
+            if promote_pipeline_checkpoint:
+                promoted = promote_pipeline_best(
+                    candidate_path=checkpoint_path,
+                    best_path=checkpoint_path.parent / "best.pt",
+                    receipt=receipt,
+                    dataset_digest_sha256=dataset_digest,
+                    kinematic_signature_sha256=(
+                        kinematics.kinematic_signature_sha256
+                    ),
+                    scenario_provenance_sha256=scenario_sha,
+                    fitted_subset_rows_sha256=fitted_subset["rows_sha256"],
+                )
+                if promoted:
+                    _atomic_json(
+                        checkpoint_path.parent / "pipeline-promotion-receipt.json",
+                        receipt,
+                    )
+            pipeline_promotion = {
+                "receipt": receipt,
+                "fixed_sample_metrics": fixed_metrics,
+                "promoted": promoted,
+            }
+        elif promote_pipeline_checkpoint:
+            raise ValueError("pipeline promotion requires a provisional fitted checkpoint")
     else:
         closed_loop = {
             "status": "task_8_scenarios_required",
@@ -1028,6 +1511,7 @@ def evaluate(
         "sealed_test": split == "test",
         "one_step": metrics,
         "closed_loop": closed_loop,
+        "pipeline_promotion": pipeline_promotion,
     }
     _atomic_json(Path(output_path), report)
     return report
@@ -1047,6 +1531,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--closed-loop-seconds", type=float)
+    parser.add_argument("--promote-pipeline-best", action="store_true")
     return parser
 
 
@@ -1069,6 +1554,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         batch_size=arguments.batch_size,
         device=arguments.device,
         closed_loop_seconds=arguments.closed_loop_seconds,
+        promote_pipeline_checkpoint=arguments.promote_pipeline_best,
     )
     print(json.dumps(report, sort_keys=True, allow_nan=False))
     if arguments.split == "train" and not report["closed_loop"][

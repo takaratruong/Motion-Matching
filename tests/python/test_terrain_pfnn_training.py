@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 import mm_sonic.train_terrain_pfnn as train_module
+import mm_sonic.terrain_pfnn.training as training_module
 from mm_sonic.evaluate_terrain_pfnn import (
     claim_sealed_test_receipt,
     validate_checkpoint_kinematics,
@@ -20,7 +21,9 @@ from mm_sonic.train_terrain_pfnn import (
     fitted_subset_metadata,
     materialize_subset,
     overfit_gate_accepted,
+    build_pipeline_promotion_receipt,
     promote_pipeline_best,
+    provisional_pipeline_selection,
     stratified_subset,
 )
 from mm_sonic.terrain_pfnn.dataset import normalize_pfnn_input, pfnn_input_sha256
@@ -65,6 +68,9 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 ):
                     for center in centers:
                         self.rows.append({
+                            "x": np.full(INPUT_LAYOUT.size, center, np.float32),
+                            "y": np.full(OUTPUT_LAYOUT.size, center, np.float32),
+                            "phase": np.float32(center * 0.01),
                             "clip_id": clip,
                             "center_frame": center,
                             "split_identity": clip.split("__")[1],
@@ -109,6 +115,53 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
         })
         self.assertEqual(len(metadata["rows"]), 6)
         self.assertEqual(len(metadata["rows_sha256"]), 64)
+        self.assertTrue(all(len(row["row_sha256"]) == 64 for row in metadata["rows"]))
+
+    def test_pipeline_subset_contains_complete_lowest_speed_seed_run(self) -> None:
+        class Rows:
+            split = "train"
+
+            def __init__(self) -> None:
+                self.rows: list[dict[str, object]] = []
+                for clip, identity, centers, terrain_class in (
+                    ("walk1_subject2", "walk1_subject2", range(100, 108), "flat"),
+                    ("terrain_slopes__slope_001__000", "slope_001", range(20, 30), "ascent"),
+                    ("terrain_slopes__slope_001__001", "slope_001", range(40, 50), "descent"),
+                ):
+                    for center in centers:
+                        self.rows.append({
+                            "x": np.full(INPUT_LAYOUT.size, center, np.float32),
+                            "y": np.full(OUTPUT_LAYOUT.size, center, np.float32),
+                            "phase": np.float32(center * 0.01),
+                            "clip_id": clip,
+                            "center_frame": center,
+                            "split_identity": identity,
+                            "split": "train",
+                            "terrain_class": terrain_class,
+                        })
+
+            def __len__(self) -> int:
+                return len(self.rows)
+
+            def __getitem__(self, index: int) -> dict[str, object]:
+                return self.rows[index]
+
+        rows = Rows()
+        selected = consecutive_overfit_subset(
+            rows,
+            18,
+            required_seed_key=("walk1_subject2", 103),
+            known_terrain_identity="slope_001",
+        )
+        keys = [
+            (rows[index]["clip_id"], rows[index]["center_frame"])
+            for index in selected
+        ]
+        self.assertEqual(keys[:8], [("walk1_subject2", center) for center in range(100, 108)])
+        self.assertEqual(
+            keys[8:],
+            [("terrain_slopes__slope_001__000", center) for center in range(20, 30)],
+        )
 
     def test_runtime_seed_predecessor_and_first_input_are_inside_fitted_run(self) -> None:
         class Rows:
@@ -170,7 +223,13 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
         rows = Rows()
         seed = choose_runtime_seed(rows, torch.tensor([[-2.0, 2.0]] * 29))
         self.assertEqual(
-            {name: value for name, value in seed["provenance"].items() if name != "speed"},
+            {
+                name: seed["provenance"][name]
+                for name in (
+                    "predecessor_clip_id", "predecessor_center_frame",
+                    "first_fitted_clip_id", "first_fitted_center_frame",
+                )
+            },
             {
             "predecessor_clip_id": "terrain_slopes__slope_000__000",
             "predecessor_center_frame": 10,
@@ -196,6 +255,107 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fitted consecutive"):
             choose_runtime_seed(isolated, torch.tensor([[-2.0, 2.0]] * 29))
 
+    def test_runtime_seed_minimizes_speed_before_suffix_length(self) -> None:
+        class Rows:
+            split = "train"
+            x_mean = np.zeros(INPUT_LAYOUT.size, np.float32)
+            x_std = np.ones(INPUT_LAYOUT.size, np.float32)
+            y_mean = np.zeros(OUTPUT_LAYOUT.size, np.float32)
+            y_std = np.ones(OUTPUT_LAYOUT.size, np.float32)
+
+            @staticmethod
+            def state(center: int) -> tuple[np.ndarray, np.ndarray]:
+                trajectory = np.zeros((12, 2), np.float32)
+                trajectory[:, 0] = center * 0.001
+                direction = np.zeros((12, 2), np.float32)
+                direction[:, 0] = 1.0
+                body = np.full((30, 3), center * 0.001, np.float32)
+                return np.concatenate((trajectory.ravel(), direction.ravel())), body
+
+            @classmethod
+            def row(cls, clip: str, center: int, speed: float) -> dict[str, object]:
+                current_trajectory, current_body = cls.state(center)
+                target_trajectory, target_body = cls.state(center + 1)
+                x = np.zeros(INPUT_LAYOUT.size, np.float32)
+                x[INPUT_LAYOUT["trajectory_position"]] = current_trajectory[:24]
+                x[INPUT_LAYOUT["trajectory_direction"]] = current_trajectory[24:]
+                x[INPUT_LAYOUT["previous_body_position"]] = current_body.ravel() * 0.1
+                x[INPUT_LAYOUT["previous_body_velocity"]] = current_body.ravel() * 0.1
+                x[INPUT_LAYOUT["semantic_intent"]] = np.tile((1.0, 0.0), (12, 1)).ravel()
+                y = np.zeros(OUTPUT_LAYOUT.size, np.float32)
+                y[OUTPUT_LAYOUT["trajectory_position"]] = target_trajectory[:24]
+                y[OUTPUT_LAYOUT["trajectory_direction"]] = target_trajectory[24:]
+                y[OUTPUT_LAYOUT["body_position"]] = target_body.ravel()
+                y[OUTPUT_LAYOUT["body_velocity"]] = target_body.ravel()
+                y[OUTPUT_LAYOUT["root_height"]] = 0.8
+                y[OUTPUT_LAYOUT["root_planar_velocity"]] = (speed, 0.0)
+                y[OUTPUT_LAYOUT["phase_advance"]] = 0.1
+                y[OUTPUT_LAYOUT["contact_logit"]] = (1.0, 0.0, 1.0, 0.0)
+                return {
+                    "x": x, "y": y, "phase": np.float32(center * 0.1),
+                    "clip_id": clip, "center_frame": center,
+                    "split_identity": clip, "split": "train", "terrain_class": "flat",
+                }
+
+            def __init__(self) -> None:
+                self.rows = [self.row("long", center, 0.4) for center in range(10, 30)]
+                self.rows.extend((self.row("short", 49, 0.4), self.row("short", 50, 0.001)))
+
+            def __len__(self) -> int:
+                return len(self.rows)
+
+            def __getitem__(self, index: int) -> dict[str, object]:
+                return self.rows[index]
+
+        seed = choose_runtime_seed(Rows(), torch.tensor([[-2.0, 2.0]] * 29))
+        self.assertEqual(seed["provenance"]["first_fitted_clip_id"], "short")
+        self.assertEqual(seed["provenance"]["first_fitted_center_frame"], 50)
+        self.assertAlmostEqual(seed["provenance"]["speed"], 0.001)
+
+    def test_seed_receipt_membership_adjacency_and_resume_subset_fail_closed(self) -> None:
+        rows = [
+            {
+                "x": np.full(INPUT_LAYOUT.size, center, np.float32),
+                "y": np.full(OUTPUT_LAYOUT.size, center + 1, np.float32),
+                "phase": np.float32(center * 0.1),
+                "clip_id": "clip", "center_frame": center,
+                "split_identity": "clip", "split": "train", "terrain_class": "flat",
+            }
+            for center in (10, 11, 12)
+        ]
+
+        class Dataset:
+            split = "train"
+            def __len__(self) -> int: return len(rows)
+            def __getitem__(self, index: int) -> dict[str, object]: return rows[index]
+
+        receipt = fitted_subset_metadata(Dataset(), range(3))
+        seed = finite_runtime_seed()
+        seed["provenance"].update({
+            "predecessor_clip_id": "clip",
+            "predecessor_center_frame": 10,
+            "first_fitted_clip_id": "clip",
+            "first_fitted_center_frame": 11,
+            "predecessor_row_sha256": receipt["rows"][0]["row_sha256"],
+            "first_fitted_row_sha256": receipt["rows"][1]["row_sha256"],
+            "fitted_subset_rows_sha256": receipt["rows_sha256"],
+        })
+        training_module.validate_runtime_seed_fitted_subset(seed, receipt)
+        missing = fitted_subset_metadata(Dataset(), (0, 2))
+        with self.assertRaisesRegex(ValueError, "membership"):
+            training_module.validate_runtime_seed_fitted_subset(seed, missing)
+        nonadjacent = dict(seed)
+        nonadjacent["provenance"] = dict(seed["provenance"])
+        nonadjacent["provenance"]["first_fitted_center_frame"] = 12
+        nonadjacent["provenance"]["first_fitted_row_sha256"] = receipt["rows"][2]["row_sha256"]
+        with self.assertRaisesRegex(ValueError, "adjacent"):
+            training_module.validate_runtime_seed_fitted_subset(nonadjacent, receipt)
+
+        checkpoint = type("Checkpoint", (), {"fitted_subset": receipt})()
+        training_module.validate_resume_fitted_subset(checkpoint, receipt)
+        with self.assertRaisesRegex(ValueError, "fitted subset"):
+            training_module.validate_resume_fitted_subset(checkpoint, missing)
+
     def test_rollout_default_depends_on_pipeline_mode_and_explicit_value_wins(self) -> None:
         resolve = train_module.resolve_rollout_finetune_frames
         self.assertEqual(resolve(None, pipeline_overfit=True), 0)
@@ -210,9 +370,141 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
     def test_overfit_gate_uses_the_final_post_rollout_score(self) -> None:
         self.assertTrue(overfit_gate_accepted(10.0, 4.9, 0.5))
         self.assertFalse(overfit_gate_accepted(10.0, 5.1, 0.5))
-        self.assertTrue(promote_pipeline_best(pipeline_overfit=True, accepted=True))
-        self.assertFalse(promote_pipeline_best(pipeline_overfit=True, accepted=False))
-        self.assertFalse(promote_pipeline_best(pipeline_overfit=False, accepted=True))
+        selection = provisional_pipeline_selection(
+            one_step_score=0.25, accepted=True
+        )
+        self.assertEqual(selection["one_step_score"], 0.25)
+        self.assertTrue(selection["provisional"])
+        self.assertIsNone(
+            provisional_pipeline_selection(one_step_score=0.25, accepted=False)
+        )
+
+    def test_pipeline_best_requires_bound_fixed_sample_and_traversal_receipt(self) -> None:
+        metrics = {
+            "gates": {
+                "finite_20_seconds": True,
+                "no_invalid_hold": True,
+                "no_phase_reversal": True,
+                "no_phase_freeze": True,
+                "root_translation_step_within_limit": True,
+                "root_rotation_step_within_limit": True,
+                "joint_step_within_limit": True,
+                "no_joint_limit_violation": True,
+                "sole_penetration_within_limit": True,
+                "zero_forbidden_body_penetration": True,
+                "stance_sole_speed_within_limit": True,
+            },
+            "global": {"predicted_stance_sample_count": 12},
+            "known_train_gate": {
+                "crossed_supported_known_terrain": True,
+                "returned_to_supported_continuation": True,
+                "realized_nonstationary_traversal": True,
+                "responsive_flat_motion_after_return": True,
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidate = root / "checkpoint-step-00000001.pt"
+            candidate.write_bytes(b"candidate")
+            best = root / "best.pt"
+            bindings = {
+                "dataset_digest_sha256": "a" * 64,
+                "kinematic_signature_sha256": "b" * 64,
+                "scenario_provenance_sha256": "c" * 64,
+                "fitted_subset_rows_sha256": "d" * 64,
+            }
+            self.assertFalse(
+                promote_pipeline_best(
+                    candidate_path=candidate,
+                    best_path=best,
+                    receipt=None,
+                    **bindings,
+                )
+            )
+            self.assertFalse(best.exists())
+
+            mismatch = build_pipeline_promotion_receipt(
+                checkpoint_path=candidate,
+                expected_fixed_sample_score=1.0,
+                observed_fixed_sample_score=1.001,
+                expected_fixed_sample_count=2048,
+                observed_fixed_sample_count=2048,
+                closed_loop_metrics=metrics,
+                **bindings,
+            )
+            self.assertFalse(mismatch["accepted"])
+            self.assertFalse(
+                promote_pipeline_best(
+                    candidate_path=candidate,
+                    best_path=best,
+                    receipt=mismatch,
+                    **bindings,
+                )
+            )
+            self.assertFalse(best.exists())
+
+            stationary_metrics = json.loads(json.dumps(metrics))
+            stationary_metrics["known_train_gate"][
+                "realized_nonstationary_traversal"
+            ] = False
+            stationary = build_pipeline_promotion_receipt(
+                checkpoint_path=candidate,
+                expected_fixed_sample_score=1.0,
+                observed_fixed_sample_score=1.0,
+                expected_fixed_sample_count=2048,
+                observed_fixed_sample_count=2048,
+                closed_loop_metrics=stationary_metrics,
+                **bindings,
+            )
+            self.assertFalse(stationary["accepted"])
+
+            unresponsive_metrics = json.loads(json.dumps(metrics))
+            unresponsive_metrics["known_train_gate"][
+                "responsive_flat_motion_after_return"
+            ] = False
+            unresponsive = build_pipeline_promotion_receipt(
+                checkpoint_path=candidate,
+                expected_fixed_sample_score=1.0,
+                observed_fixed_sample_score=1.0,
+                expected_fixed_sample_count=2048,
+                observed_fixed_sample_count=2048,
+                closed_loop_metrics=unresponsive_metrics,
+                **bindings,
+            )
+            self.assertFalse(unresponsive["accepted"])
+
+            passing = build_pipeline_promotion_receipt(
+                checkpoint_path=candidate,
+                expected_fixed_sample_score=1.0,
+                observed_fixed_sample_score=1.0,
+                expected_fixed_sample_count=2048,
+                observed_fixed_sample_count=2048,
+                closed_loop_metrics=metrics,
+                **bindings,
+            )
+            self.assertTrue(passing["accepted"])
+            self.assertTrue(
+                promote_pipeline_best(
+                    candidate_path=candidate,
+                    best_path=best,
+                    receipt=passing,
+                    **bindings,
+                )
+            )
+            self.assertEqual(best.read_bytes(), b"candidate")
+            self.assertEqual(best.stat().st_mode & 0o222, 0)
+            forged = dict(passing)
+            forged["dataset_digest_sha256"] = "e" * 64
+            forged_best = root / "forged-best.pt"
+            self.assertFalse(
+                promote_pipeline_best(
+                    candidate_path=candidate,
+                    best_path=forged_best,
+                    receipt=forged,
+                    **bindings,
+                )
+            )
+            self.assertFalse(forged_best.exists())
 
     def test_materialized_overfit_subset_reads_source_once_in_sorted_order(self) -> None:
         class Rows:
@@ -400,9 +692,14 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             model.parameters(), lr=1.0e-3, weight_decay=0.0
         )
         seed = finite_runtime_seed()
-        fitted_rows = [{
-            "clip_id": "terrain_slopes__slope_000__000", "center_frame": 10
-        }]
+        fitted_rows = [
+            {
+                "clip_id": "synthetic", "center_frame": center,
+                "split_identity": "synthetic", "terrain_class": "flat",
+                "row_sha256": digest,
+            }
+            for center, digest in ((0, "1" * 64), (1, "2" * 64))
+        ]
         fitted_subset = {
             "split": "train",
             "rows": fitted_rows,
@@ -410,9 +707,14 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 fitted_rows, sort_keys=True, separators=(",", ":")
             ).encode()).hexdigest(),
             "class_counts": {
-                "flat": 1, "ascent": 0, "descent": 0, "transition": 0,
+                "flat": 2, "ascent": 0, "descent": 0, "transition": 0,
             },
         }
+        seed["provenance"].update({
+            "predecessor_row_sha256": "1" * 64,
+            "first_fitted_row_sha256": "2" * 64,
+            "fitted_subset_rows_sha256": fitted_subset["rows_sha256"],
+        })
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "checkpoint.pt"
             save_checkpoint(

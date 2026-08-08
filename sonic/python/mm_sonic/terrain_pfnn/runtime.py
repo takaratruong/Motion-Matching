@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, replace
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -45,6 +46,21 @@ SEGMENT_NAMES = ("flat", "ascent", "summit", "descent", "landing")
 
 
 TerrainCallback = Callable[[np.ndarray], "TerrainSample | None"]
+
+
+def _canonical_receipt_sha256(value: Mapping[str, object]) -> str:
+    encoded = json.dumps(
+        dict(value), sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _owned_array(value: object, shape: tuple[int, ...], label: str) -> np.ndarray:
@@ -307,11 +323,13 @@ class TerrainPFNNRuntime:
             or np.any(joints > self._limits[:, 1])
         ):
             raise ValueError("runtime seed is outside the native runtime limits")
-        support = self._query(np.zeros(2), allow_unsupported_grade=False)
+        root_xy = seed_array("world_xy", (2,)).copy()
+        yaw = float(seed_array("world_yaw", ()).item())
+        if not math.isfinite(yaw):
+            raise ValueError("runtime seed world yaw must be finite")
+        support = self._query(root_xy, allow_unsupported_grade=False)
         if support is None:
             raise ValueError("runtime seed origin has no supported terrain")
-        root_xy = np.zeros(2, dtype=np.float64)
-        yaw = 0.0
         rotation = _rotation_2d(yaw)
         local_position = seed_array("trajectory_position", (12, 2))
         local_direction = seed_array("trajectory_direction", (12, 2))
@@ -354,7 +372,8 @@ class TerrainPFNNRuntime:
         self._hold_count = 0
         self._frame = PFNNRuntimeFrame(
             root_position_world=np.asarray(
-                (0.0, 0.0, support.height_m + root_height), dtype=np.float64
+                (root_xy[0], root_xy[1], support.height_m + root_height),
+                dtype=np.float64,
             ),
             root_quaternion_world_wxyz=_root_quaternion(yaw, tilt),
             joint_position_isaaclab=joints,
@@ -815,6 +834,96 @@ def _transform_points(rotation: np.ndarray, position: np.ndarray, points: np.nda
     return np.asarray(points, dtype=np.float64) @ rotation.T + position
 
 
+def _deterministic_collision_surface_samples(
+    kind: str,
+    size: np.ndarray,
+    rotation: np.ndarray,
+    position: np.ndarray,
+    *,
+    vertices: np.ndarray | None = None,
+) -> np.ndarray:
+    """Return deterministic world samples spanning an entire collision surface.
+
+    Primitive sampling includes uphill and lateral extrema rather than just the
+    globally lowest point.  Meshes use every transformed collision vertex.
+    """
+
+    dimensions = _owned_array(size, (3,), "collision geom size")
+    attitude = _owned_array(rotation, (3, 3), "collision geom rotation")
+    origin = _owned_array(position, (3,), "collision geom position")
+    if np.any(dimensions < 0.0):
+        raise ValueError("collision geom size must be nonnegative")
+
+    if kind == "mesh":
+        if vertices is None:
+            raise ValueError("mesh collision samples require vertices")
+        local = np.asarray(vertices, dtype=np.float64)
+        if (
+            local.ndim != 2
+            or local.shape[1:] != (3,)
+            or len(local) == 0
+            or not np.isfinite(local).all()
+        ):
+            raise ValueError("native collision mesh has invalid vertices")
+        return _transform_points(attitude, origin, local)
+
+    azimuth = np.arange(64, dtype=np.float64) * (TWO_PI / 64.0)
+    latitude = np.linspace(-0.5 * math.pi, 0.5 * math.pi, 33)
+    unit_sphere = np.asarray(
+        [
+            (
+                math.cos(lat) * math.cos(angle),
+                math.cos(lat) * math.sin(angle),
+                math.sin(lat),
+            )
+            for lat in latitude
+            for angle in azimuth
+        ],
+        dtype=np.float64,
+    )
+    if kind == "sphere":
+        local = unit_sphere * dimensions[0]
+    elif kind == "ellipsoid":
+        local = unit_sphere * dimensions
+    elif kind == "capsule":
+        radius, half_length = dimensions[:2]
+        lower = unit_sphere * radius + np.asarray((0.0, 0.0, -half_length))
+        upper = unit_sphere * radius + np.asarray((0.0, 0.0, half_length))
+        rings = np.asarray(
+            [
+                (radius * math.cos(angle), radius * math.sin(angle), z)
+                for z in (-half_length, 0.0, half_length)
+                for angle in azimuth
+            ],
+            dtype=np.float64,
+        )
+        local = np.concatenate((lower, upper, rings), axis=0)
+    elif kind == "box":
+        local = np.asarray(
+            [
+                (x, y, z)
+                for x in (-dimensions[0], dimensions[0])
+                for y in (-dimensions[1], dimensions[1])
+                for z in (-dimensions[2], dimensions[2])
+            ],
+            dtype=np.float64,
+        )
+    elif kind == "cylinder":
+        radius, half_length = dimensions[:2]
+        local = np.asarray(
+            [
+                (radius * math.cos(angle), radius * math.sin(angle), z)
+                for z in (-half_length, half_length)
+                for angle in azimuth
+            ]
+            + [(0.0, 0.0, -half_length), (0.0, 0.0, half_length)],
+            dtype=np.float64,
+        )
+    else:
+        raise ValueError(f"unsupported native collision geom kind {kind}")
+    return _transform_points(attitude, origin, local)
+
+
 class NativeG1RuntimeGeometry:
     """Raw native-MuJoCo geometry samples used by the Task-7 recorder."""
 
@@ -893,6 +1002,8 @@ class NativeG1RuntimeGeometry:
             groups.extend(((ordered[0], ordered[1]), (ordered[2], ordered[3])))
         self._sole_groups = tuple(groups)
         self._previous_group_xy: np.ndarray | None = None
+        self.total_collision_surface_samples = 0
+        self.total_terrain_query_points = 0
 
     @classmethod
     def from_mjcf(cls, path: str | Path) -> "NativeG1RuntimeGeometry":
@@ -929,58 +1040,49 @@ class NativeG1RuntimeGeometry:
         position = np.asarray(data.geom_xpos[geom], dtype=np.float64)
         rotation = np.asarray(data.geom_xmat[geom], dtype=np.float64).reshape(3, 3)
 
-        def lowest(points: np.ndarray) -> np.ndarray:
-            values = np.ascontiguousarray(points, dtype=np.float64)
-            minimum = float(np.min(values[:, 2]))
-            return values[np.isclose(values[:, 2], minimum, atol=1.0e-10, rtol=0.0)]
-
         if geom_type == int(mujoco.mjtGeom.mjGEOM_SPHERE):
-            return position[None, :] + np.asarray(((0.0, 0.0, -size[0]),))
+            kind = "sphere"
         if geom_type == int(mujoco.mjtGeom.mjGEOM_CAPSULE):
-            endpoints = _transform_points(
-                rotation,
-                position,
-                np.asarray(((0.0, 0.0, -size[1]), (0.0, 0.0, size[1]))),
-            )
-            endpoints[:, 2] -= size[0]
-            return lowest(endpoints)
+            kind = "capsule"
         if geom_type == int(mujoco.mjtGeom.mjGEOM_BOX):
-            local = np.asarray(
-                [
-                    (x, y, z)
-                    for x in (-size[0], size[0])
-                    for y in (-size[1], size[1])
-                    for z in (-size[2], size[2])
-                ]
-            )
-            return lowest(_transform_points(rotation, position, local))
+            kind = "box"
         if geom_type == int(mujoco.mjtGeom.mjGEOM_CYLINDER):
-            angles = np.arange(16, dtype=np.float64) * (TWO_PI / 16.0)
-            rings = []
-            for z in (-size[1], size[1]):
-                rings.extend((size[0] * math.cos(a), size[0] * math.sin(a), z) for a in angles)
-            return lowest(
-                _transform_points(rotation, position, np.asarray(rings))
-            )
+            kind = "cylinder"
         if geom_type == int(mujoco.mjtGeom.mjGEOM_ELLIPSOID):
-            covariance = rotation @ np.diag(size * size) @ rotation.T
-            vertical = np.asarray((0.0, 0.0, 1.0))
-            denominator = math.sqrt(float(vertical @ covariance @ vertical))
-            return (position - covariance @ vertical / denominator)[None, :]
+            kind = "ellipsoid"
         if geom_type == int(mujoco.mjtGeom.mjGEOM_MESH):
             mesh = int(model.geom_dataid[geom])
             start = int(model.mesh_vertadr[mesh])
             stop = start + int(model.mesh_vertnum[mesh])
             vertices = np.asarray(model.mesh_vert[start:stop], dtype=np.float64)
-            if not len(vertices) or not np.isfinite(vertices).all():
-                raise ValueError("native collision mesh has invalid vertices")
-            return lowest(_transform_points(rotation, position, vertices))
-        raise ValueError(f"unsupported native collision geom type {geom_type}")
+            return _deterministic_collision_surface_samples(
+                "mesh", size, rotation, position, vertices=vertices
+            )
+        if "kind" not in locals():
+            raise ValueError(f"unsupported native collision geom type {geom_type}")
+        return _deterministic_collision_surface_samples(
+            kind, size, rotation, position
+        )
+
+    def _sole_bottom_sample(self, geom: int) -> np.ndarray:
+        radius = float(self._model.geom_size[geom, 0])
+        position = np.asarray(self._data.geom_xpos[geom], dtype=np.float64)
+        return position[None, :] + np.asarray(((0.0, 0.0, -radius),))
 
     @staticmethod
     def _penetration(points: np.ndarray, callback: TerrainCallback) -> float:
+        values = np.asarray(points, dtype=np.float64)
+        batch = getattr(callback, "collision_heights_at", None)
+        if callable(batch):
+            try:
+                heights = np.asarray(batch(values[:, :2]), dtype=np.float64)
+            except (ArithmeticError, TypeError, ValueError) as error:
+                raise ValueError("geometry terrain query is missing or invalid") from error
+            if heights.shape != (len(values),) or not np.isfinite(heights).all():
+                raise ValueError("geometry terrain query is missing or invalid")
+            return max(0.0, float(np.max(heights - values[:, 2], initial=0.0)))
         maximum = 0.0
-        for point in np.asarray(points, dtype=np.float64):
+        for point in values:
             try:
                 sample = callback(np.asarray(point[:2], dtype=np.float64))
             except (ArithmeticError, TypeError, ValueError):
@@ -1008,15 +1110,19 @@ class NativeG1RuntimeGeometry:
         )
         contacts = _owned_array(contact_probability, (4,), "geometry contacts")
         self._set_qpos(root, quaternion, joints)
+        sole_samples = [self._sole_bottom_sample(geom) for geom in self._sole_geom_ids]
         sole_penetration = max(
-            self._penetration(self._geom_samples(geom), height_and_grade_at)
-            for geom in self._sole_geom_ids
+            self._penetration(samples, height_and_grade_at)
+            for samples in sole_samples
         )
+        sample_count = sum(len(samples) for samples in sole_samples)
         forbidden_penetration = 0.0
         offenders: list[str] = []
         for geom in self._forbidden_geom_ids:
+            samples = self._geom_samples(geom)
+            sample_count += len(samples)
             penetration = self._penetration(
-                self._geom_samples(geom), height_and_grade_at
+                samples, height_and_grade_at
             )
             if penetration > 0.0:
                 forbidden_penetration = max(forbidden_penetration, penetration)
@@ -1025,6 +1131,8 @@ class NativeG1RuntimeGeometry:
                 )
                 body = self._model.body(int(self._model.geom_bodyid[geom])).name
                 offenders.append(str(raw_name) if raw_name else f"{body}:geom-{geom}")
+        self.total_collision_surface_samples += sample_count
+        self.total_terrain_query_points += sample_count
         group_xy = np.asarray(
             [
                 np.mean(
@@ -1060,6 +1168,7 @@ class _RecordedFrame:
     terrain_sample: TerrainSample
     geometry: RuntimeGeometryObservation
     traversal_direction: str | None
+    realized_delta_world_xy: np.ndarray
     realized_speed_m_s: float
     phase_delta: float
     root_translation_step_m: float
@@ -1077,6 +1186,7 @@ class ClosedLoopRecorder:
         joint_limits: object,
         native_geometry: NativeG1RuntimeGeometry | None = None,
         height_and_grade_at: TerrainCallback | None = None,
+        traversal_axis_world: object = (1.0, 0.0),
     ) -> None:
         self._limits = _owned_array(joint_limits, (29, 2), "recorder joint limits")
         if np.any(self._limits[:, 0] >= self._limits[:, 1]):
@@ -1084,7 +1194,14 @@ class ClosedLoopRecorder:
         self._native_geometry = native_geometry
         self._height_and_grade_at = height_and_grade_at
         self._records: list[_RecordedFrame] = []
-        self._command_position = np.zeros(2, dtype=np.float64)
+        self._traversal_axis = _owned_array(
+            traversal_axis_world, (2,), "traversal axis"
+        )
+        norm = float(np.linalg.norm(self._traversal_axis))
+        if norm < 1.0e-12:
+            raise ValueError("traversal axis must be nonzero")
+        self._traversal_axis = self._traversal_axis / norm
+        self._command_position: np.ndarray | None = None
 
     def record(
         self,
@@ -1115,7 +1232,13 @@ class ClosedLoopRecorder:
         previous = self._records[-1] if self._records else None
         if previous is None:
             translation = rotation = joint_step = realized_speed = phase_delta = 0.0
+            realized_delta = np.zeros(2, dtype=np.float64)
+            self._command_position = frame.root_position_world[:2].copy()
         else:
+            realized_delta = (
+                frame.root_position_world[:2]
+                - previous.frame.root_position_world[:2]
+            )
             translation = float(
                 np.linalg.norm(
                     frame.root_position_world - previous.frame.root_position_world
@@ -1146,6 +1269,7 @@ class ClosedLoopRecorder:
                 phase_delta += TWO_PI
             elif phase_delta > math.pi:
                 phase_delta -= TWO_PI
+        assert self._command_position is not None
         self._command_position += desired * DT
         command_error = float(
             np.linalg.norm(frame.root_position_world[:2] - self._command_position)
@@ -1157,6 +1281,7 @@ class ClosedLoopRecorder:
                 terrain_sample=terrain_sample,
                 geometry=geometry,
                 traversal_direction=traversal_direction,
+                realized_delta_world_xy=realized_delta,
                 realized_speed_m_s=realized_speed,
                 phase_delta=phase_delta,
                 root_translation_step_m=translation,
@@ -1265,6 +1390,7 @@ class ClosedLoopRecorder:
             "median_stance_sole_speed_m_s": (
                 float(np.median(stance)) if stance else 0.0
             ),
+            "predicted_stance_sample_count": len(stance),
             "phase_reversal_count": sum(row.phase_delta < -1.0e-6 for row in values),
             "walking_freeze_count": self._walking_freezes(values),
             "held_tick_count": sum("hold_reason" in row.frame.diagnostics for row in values),
@@ -1302,6 +1428,8 @@ class ClosedLoopRecorder:
                     summary["maximum_forbidden_body_penetration_m"] == 0.0
                 ),
                 "stance_sole_speed_within_limit": (
+                    summary["predicted_stance_sample_count"] > 0
+                    and
                     summary["median_stance_sole_speed_m_s"]
                     <= MAXIMUM_STANCE_SOLE_SPEED_M_S
                 ),
@@ -1314,11 +1442,19 @@ class ClosedLoopRecorder:
                 [row for row in self._records if self._segment(row) == segment]
             )
             per_segment[segment] = {**summary, "gates": segment_gates(summary)}
-        desired_grades: dict[str, float] = {"forward": 0.0, "backward": 0.0}
+        realized_grades: dict[str, float] = {"forward": 0.0, "backward": 0.0}
+        realized_displacement: dict[str, float] = {"forward": 0.0, "backward": 0.0}
         for row in self._records:
-            if row.traversal_direction in desired_grades:
-                desired_grades[row.traversal_direction] = max(
-                    desired_grades[row.traversal_direction],
+            projected = float(np.dot(row.realized_delta_world_xy, self._traversal_axis))
+            direction = (
+                "forward" if projected > 1.0e-6
+                else "backward" if projected < -1.0e-6
+                else None
+            )
+            if direction is not None:
+                realized_displacement[direction] += abs(projected)
+                realized_grades[direction] = max(
+                    realized_grades[direction],
                     row.terrain_sample.absolute_grade_degrees,
                 )
         landing_required, landing_recovered = self._landing_recovery(self._records)
@@ -1351,11 +1487,15 @@ class ClosedLoopRecorder:
                 global_summary["maximum_forbidden_body_penetration_m"] == 0.0
             ),
             "stance_sole_speed_within_limit": (
+                global_summary["predicted_stance_sample_count"] > 0
+                and
                 global_summary["median_stance_sole_speed_m_s"]
                 <= MAXIMUM_STANCE_SOLE_SPEED_M_S
             ),
             "traverses_18_9_degrees_both_directions": all(
-                value >= 18.85 for value in desired_grades.values()
+                realized_displacement[name] > 0.0
+                and realized_grades[name] >= 18.85
+                for name in realized_grades
             ),
             "responsive_flat_landing_recovery": (
                 landing_required > 0 and landing_recovered == landing_required
@@ -1395,7 +1535,8 @@ class ClosedLoopRecorder:
             "global": global_summary,
             "segments": per_segment,
             "traversal": {
-                "maximum_grade_degrees_by_direction": desired_grades,
+                "maximum_grade_degrees_by_direction": realized_grades,
+                "realized_displacement_m": realized_displacement,
             },
             "landing_recovery": {
                 "required": landing_required,
@@ -1474,36 +1615,167 @@ class ClosedLoopValidationResult:
         )
 
 
+def validation_identity_set_receipt(
+    manifest: Mapping[str, object],
+) -> dict[str, object]:
+    """Seal the exact validation identity set from a dataset manifest."""
+
+    dataset_digest = manifest.get("dataset_digest_sha256")
+    split_identities = manifest.get("split_identities")
+    identities = (
+        split_identities.get("validation")
+        if isinstance(split_identities, Mapping)
+        else None
+    )
+    if (
+        not _is_sha256(dataset_digest)
+        or type(identities) is not list
+        or not identities
+        or any(type(identity) is not str or not identity for identity in identities)
+        or len(set(identities)) != len(identities)
+    ):
+        raise ValueError("validation identity-set manifest receipt is invalid")
+    base: dict[str, object] = {
+        "schema": "mm-sonic-validation-identity-set/v1",
+        "dataset_digest_sha256": dataset_digest,
+        "split": "validation",
+        "identities": list(identities),
+    }
+    return {**base, "receipt_sha256": _canonical_receipt_sha256(base)}
+
+
+def _validated_scenario_provenance(value: object) -> dict[str, object]:
+    if type(value) is not dict:
+        raise ValueError("closed-loop scenario provenance is invalid")
+    required = {
+        "schema",
+        "dataset_digest_sha256",
+        "split",
+        "validation_identity_set_sha256",
+        "kinematic_signature_sha256",
+        "scenario_id",
+        "terrain_source_receipt",
+        "provenance_sha256",
+    }
+    if set(value) != required:
+        raise ValueError("closed-loop scenario provenance is invalid")
+    terrain = value["terrain_source_receipt"]
+    if (
+        value["schema"] != "mm-sonic-closed-loop-scenario/v1"
+        or value["split"] != "validation"
+        or not _is_sha256(value["dataset_digest_sha256"])
+        or not _is_sha256(value["validation_identity_set_sha256"])
+        or not _is_sha256(value["kinematic_signature_sha256"])
+        or type(value["scenario_id"]) is not str
+        or not value["scenario_id"]
+        or type(terrain) is not dict
+        or not {"kind", "source_sha256", "version"}.issubset(terrain)
+        or type(terrain["kind"]) is not str
+        or not terrain["kind"]
+        or not _is_sha256(terrain["source_sha256"])
+        or type(terrain["version"]) is not str
+        or not terrain["version"]
+    ):
+        raise ValueError("closed-loop scenario provenance is invalid")
+    try:
+        canonical_terrain = json.loads(
+            json.dumps(
+                terrain, sort_keys=True, separators=(",", ":"), allow_nan=False
+            )
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("closed-loop terrain source receipt is invalid") from error
+    base = {
+        name: (canonical_terrain if name == "terrain_source_receipt" else value[name])
+        for name in required - {"provenance_sha256"}
+    }
+    if value["provenance_sha256"] != _canonical_receipt_sha256(base):
+        raise ValueError("closed-loop scenario provenance digest mismatch")
+    return {**base, "provenance_sha256": value["provenance_sha256"]}
+
+
+@dataclass(frozen=True)
+class ClosedLoopScenario:
+    """A callback paired with fail-closed, manifest-bound provenance."""
+
+    provenance: dict[str, object]
+    evaluator: Callable[[], Mapping[str, object]]
+
+    def __post_init__(self) -> None:
+        if not callable(self.evaluator):
+            raise TypeError("closed-loop scenario evaluator must be callable")
+        object.__setattr__(self, "provenance", dict(self.provenance))
+
+
+def make_validation_scenario(
+    *,
+    manifest: Mapping[str, object],
+    kinematic_signature_sha256: str,
+    scenario_id: str,
+    terrain_source_receipt: Mapping[str, object],
+    evaluator: Callable[[], Mapping[str, object]],
+) -> ClosedLoopScenario:
+    """Create a validation-only scenario sealed to manifest and terrain assets."""
+
+    identity = validation_identity_set_receipt(manifest)
+    if not _is_sha256(kinematic_signature_sha256):
+        raise ValueError("scenario kinematic signature is invalid")
+    try:
+        terrain = json.loads(
+            json.dumps(
+                dict(terrain_source_receipt),
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("scenario terrain source receipt is invalid") from error
+    base: dict[str, object] = {
+        "schema": "mm-sonic-closed-loop-scenario/v1",
+        "dataset_digest_sha256": identity["dataset_digest_sha256"],
+        "split": "validation",
+        "validation_identity_set_sha256": identity["receipt_sha256"],
+        "kinematic_signature_sha256": kinematic_signature_sha256,
+        "scenario_id": scenario_id,
+        "terrain_source_receipt": terrain,
+    }
+    provenance = {**base, "provenance_sha256": _canonical_receipt_sha256(base)}
+    checked = _validated_scenario_provenance(provenance)
+    return ClosedLoopScenario(checked, evaluator)
+
+
 def evaluate_closed_loop_scenarios(
     *,
     split: str,
-    scenarios: Sequence[Callable[[], Mapping[str, object]]],
+    scenarios: Sequence[ClosedLoopScenario],
+    expected_dataset_digest: str,
+    expected_kinematic_signature_sha256: str,
+    expected_identity_set_sha256: str,
 ) -> ClosedLoopValidationResult:
-    """Evaluate caller-supplied validation scenarios without implicit fallback."""
+    """Validate every sealed receipt before opening any scenario callback."""
 
     if split != "validation":
         raise ValueError("closed-loop scoring accepts only validation scenarios")
-    if not scenarios or any(not callable(scenario) for scenario in scenarios):
+    if not scenarios or any(not isinstance(scenario, ClosedLoopScenario) for scenario in scenarios):
         raise ValueError("closed-loop validation requires explicit scenarios")
+    checked = [_validated_scenario_provenance(scenario.provenance) for scenario in scenarios]
+    for provenance in checked:
+        if (
+            provenance["dataset_digest_sha256"] != expected_dataset_digest
+            or provenance["kinematic_signature_sha256"]
+            != expected_kinematic_signature_sha256
+            or provenance["validation_identity_set_sha256"]
+            != expected_identity_set_sha256
+        ):
+            raise ValueError("closed-loop scenario provenance does not match")
     results = [
-        ClosedLoopValidationResult.from_metrics(scenario(), split=split)
+        ClosedLoopValidationResult.from_metrics(scenario.evaluator(), split=split)
         for scenario in scenarios
     ]
-    provenance = []
-    for result in results:
-        dataset_digest = result.metrics.get("dataset_digest_sha256")
-        signature = result.metrics.get("kinematic_signature_sha256")
-        if (
-            type(dataset_digest) is not str
-            or not dataset_digest
-            or type(signature) is not str
-            or not signature
-        ):
-            raise ValueError("closed-loop scenario provenance is missing")
-        provenance.append((dataset_digest, signature))
-    if len(set(provenance)) != 1:
-        raise ValueError("closed-loop scenario provenance does not match")
-    dataset_digest, signature = provenance[0]
+    provenance_digest = _canonical_receipt_sha256(
+        {"scenarios": [value["provenance_sha256"] for value in checked]}
+    )
     return ClosedLoopValidationResult(
         evaluated=True,
         split="validation",
@@ -1512,8 +1784,11 @@ def evaluate_closed_loop_scenarios(
         metrics={
             "schema": "mm-sonic-terrain-pfnn-validation-scenarios/v1",
             "scenario_count": len(results),
-            "dataset_digest_sha256": dataset_digest,
-            "kinematic_signature_sha256": signature,
+            "dataset_digest_sha256": expected_dataset_digest,
+            "kinematic_signature_sha256": expected_kinematic_signature_sha256,
+            "validation_identity_set_sha256": expected_identity_set_sha256,
+            "scenario_provenance_sha256": provenance_digest,
+            "scenario_provenance": checked,
             "scenarios": [result.metrics for result in results],
         },
     )

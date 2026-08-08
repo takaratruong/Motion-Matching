@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
@@ -8,6 +9,7 @@ from unittest.mock import patch
 
 import numpy as np
 import torch
+import mm_sonic.terrain_pfnn.runtime as runtime_module
 
 from mm_sonic.evaluate_terrain_pfnn import (
     _decode_usd_mesh,
@@ -24,6 +26,7 @@ from mm_sonic.terrain_pfnn.dataset import pfnn_input_sha256
 from mm_sonic.terrain_pfnn.layout import INPUT_LAYOUT, OUTPUT_LAYOUT, TRAJECTORY_TIMES_S
 from mm_sonic.terrain_pfnn.runtime import (
     ClosedLoopRecorder,
+    ClosedLoopScenario,
     ClosedLoopValidationResult,
     NativeG1RuntimeGeometry,
     PFNNRuntimeFrame,
@@ -31,6 +34,8 @@ from mm_sonic.terrain_pfnn.runtime import (
     TerrainPFNNRuntime,
     TerrainSample,
     evaluate_closed_loop_scenarios,
+    make_validation_scenario,
+    validation_identity_set_receipt,
 )
 from mm_sonic.terrain_pfnn.training import finite_runtime_seed
 from mm_sonic.terrain_oracle.canonical import CanonicalTerrainMesh
@@ -317,6 +322,34 @@ class TerrainPFNNRuntimeTests(unittest.TestCase):
         self.assertEqual(model.inputs, [])
         self.assertIn("terrain", frame.diagnostics["hold_reason"])
 
+    def test_seed_world_xy_and_yaw_are_honored(self) -> None:
+        checkpoint = FakeCheckpoint()
+        checkpoint.runtime_seed["world_xy"] = torch.tensor((2.0, -1.0))
+        checkpoint.runtime_seed["world_yaw"] = torch.tensor(math.pi / 2.0)
+        local = checkpoint.runtime_seed["trajectory_position"].reshape(12, 2)
+        local[:, 0] = torch.linspace(-0.2, 0.8, 12)
+        local_direction = checkpoint.runtime_seed["trajectory_direction"].reshape(12, 2)
+        local_direction[:] = torch.tensor((1.0, 0.0))
+        self.bind_identity_bootstrap(checkpoint)
+        runtime = self.make_runtime(FakeModel([physical_output()]), checkpoint=checkpoint)
+        np.testing.assert_allclose(runtime.frame.root_position_world[:2], (2.0, -1.0))
+        expected_position = np.column_stack(
+            (2.0 - local[:, 1].numpy(), -1.0 + local[:, 0].numpy())
+        )
+        np.testing.assert_allclose(
+            runtime.frame.trajectory.position_world_xy, expected_position, atol=1.0e-7
+        )
+        np.testing.assert_allclose(
+            runtime.frame.trajectory.direction_world_xy,
+            np.tile((0.0, 1.0), (12, 1)),
+            atol=1.0e-7,
+        )
+        np.testing.assert_allclose(
+            runtime.frame.root_quaternion_world_wxyz,
+            (math.sqrt(0.5), 0.0, 0.0, math.sqrt(0.5)),
+            atol=1.0e-7,
+        )
+
 
 class ClosedLoopMetricsTests(unittest.TestCase):
     @staticmethod
@@ -367,6 +400,45 @@ class ClosedLoopMetricsTests(unittest.TestCase):
         self.assertFalse(report["gates"]["no_phase_freeze"])
         self.assertEqual(report["global"]["maximum_sole_penetration_m"], 0.01)
 
+    def test_zero_predicted_stance_samples_and_stationary_tagged_traversal_fail(self) -> None:
+        recorder = ClosedLoopRecorder(joint_limits=np.array([[-2.0, 2.0]] * 29))
+        no_stance = RuntimeGeometryObservation(0.0, 0.0, (), ())
+        grade = math.tan(math.radians(19.0))
+        for index in range(600):
+            recorder.record(
+                self.frame(0, phase=(0.1 * index) % (2.0 * math.pi)),
+                desired_velocity_world=np.array((0.3, 0.0)),
+                terrain_sample=TerrainSample(0.0, np.array((grade, 0.0))),
+                geometry=no_stance,
+                traversal_direction="forward" if index < 300 else "backward",
+            )
+        report = recorder.finalize()
+        self.assertEqual(report["global"]["predicted_stance_sample_count"], 0)
+        self.assertFalse(report["gates"]["stance_sole_speed_within_limit"])
+        self.assertFalse(report["gates"]["traverses_18_9_degrees_both_directions"])
+        self.assertEqual(
+            report["traversal"]["maximum_grade_degrees_by_direction"],
+            {"forward": 0.0, "backward": 0.0},
+        )
+
+    def test_realized_displacement_drives_bidirectional_traversal_without_tags(self) -> None:
+        recorder = ClosedLoopRecorder(joint_limits=np.array([[-2.0, 2.0]] * 29))
+        observation = RuntimeGeometryObservation(0.0, 0.0, (), (0.02,))
+        tangent = math.tan(math.radians(19.0))
+        positions = [*range(300), *range(300, 0, -1)]
+        for tick, position in enumerate(positions):
+            recorder.record(
+                self.frame(position, phase=(0.1 * tick) % (2.0 * math.pi)),
+                desired_velocity_world=np.array((0.3 if tick < 300 else -0.3, 0.0)),
+                terrain_sample=TerrainSample(0.0, np.array((tangent, 0.0))),
+                geometry=observation,
+                traversal_direction=None,
+            )
+        report = recorder.finalize()
+        self.assertTrue(report["gates"]["traverses_18_9_degrees_both_directions"])
+        self.assertGreater(report["traversal"]["realized_displacement_m"]["forward"], 1.0)
+        self.assertGreater(report["traversal"]["realized_displacement_m"]["backward"], 1.0)
+
     def test_validation_penalty_counts_boolean_failures_and_numeric_excess(self) -> None:
         metrics = {
             "gates": {
@@ -393,45 +465,104 @@ class ClosedLoopMetricsTests(unittest.TestCase):
     def test_validation_scenario_aggregate_retains_selection_provenance(self) -> None:
         calls: list[int] = []
 
-        def scenario(index: int) -> object:
+        manifest = {
+            "dataset_digest_sha256": "d" * 64,
+            "split_identities": {
+                "train": ["train-a"],
+                "validation": ["val-a", "val-b"],
+                "test": ["test-a"],
+            },
+        }
+        signature = "e" * 64
+        identity_receipt = validation_identity_set_receipt(manifest)
+
+        def scenario(index: int) -> ClosedLoopScenario:
             def evaluate() -> dict[str, object]:
                 calls.append(index)
                 return {
                     "gates": {"finite_20_seconds": True},
                     "numeric_gates": {},
-                    "dataset_digest_sha256": "data",
-                    "kinematic_signature_sha256": "kin",
                 }
 
-            return evaluate
+            return make_validation_scenario(
+                manifest=manifest,
+                kinematic_signature_sha256=signature,
+                scenario_id=f"hill-{index}",
+                terrain_source_receipt={
+                    "kind": "procedural_three_hill",
+                    "source_sha256": f"{index + 1:064x}",
+                    "version": "task8/v1",
+                },
+                evaluator=evaluate,
+            )
 
         result = evaluate_closed_loop_scenarios(
-            split="validation", scenarios=(scenario(0), scenario(1))
+            split="validation",
+            scenarios=(scenario(0), scenario(1)),
+            expected_dataset_digest="d" * 64,
+            expected_kinematic_signature_sha256=signature,
+            expected_identity_set_sha256=identity_receipt["receipt_sha256"],
         )
         self.assertEqual(calls, [0, 1])
         self.assertEqual(result.metrics["scenario_count"], 2)
-        self.assertEqual(result.metrics["dataset_digest_sha256"], "data")
-        self.assertEqual(result.metrics["kinematic_signature_sha256"], "kin")
+        self.assertEqual(result.metrics["dataset_digest_sha256"], "d" * 64)
+        self.assertEqual(result.metrics["kinematic_signature_sha256"], signature)
+        self.assertEqual(
+            result.metrics["validation_identity_set_sha256"],
+            identity_receipt["receipt_sha256"],
+        )
         selection, promote = validated_normal_selection(
             one_step_score=2.5,
             result=result,
-            dataset_digest="data",
-            kinematic_signature_sha256="kin",
+            dataset_digest="d" * 64,
+            kinematic_signature_sha256=signature,
+            validation_identity_set_sha256=identity_receipt["receipt_sha256"],
+            expected_scenario_provenance_sha256=(
+                result.metrics["scenario_provenance_sha256"]
+            ),
         )
         self.assertTrue(promote)
         self.assertEqual(selection["validation_score"], 2.5)
 
-        mismatch = scenario(2)
+    def test_validation_scenario_provenance_rejects_before_callbacks_open(self) -> None:
+        calls: list[str] = []
+        manifest = {
+            "dataset_digest_sha256": "d" * 64,
+            "split_identities": {
+                "train": ["train"], "validation": ["val"], "test": ["test"]
+            },
+        }
+        signature = "e" * 64
+        receipt = validation_identity_set_receipt(manifest)
 
-        def wrong_signature() -> dict[str, object]:
-            metrics = mismatch()
-            metrics["kinematic_signature_sha256"] = "wrong"
-            return metrics
+        def callback() -> dict[str, object]:
+            calls.append("opened")
+            return {"gates": {"finite_20_seconds": True}, "numeric_gates": {}}
 
+        scenario = make_validation_scenario(
+            manifest=manifest,
+            kinematic_signature_sha256=signature,
+            scenario_id="sealed-hill",
+            terrain_source_receipt={
+                "kind": "procedural_three_hill",
+                "source_sha256": "a" * 64,
+                "version": "task8/v1",
+            },
+            evaluator=callback,
+        )
+        forged = replace(
+            scenario,
+            provenance={**scenario.provenance, "dataset_digest_sha256": "f" * 64},
+        )
         with self.assertRaisesRegex(ValueError, "provenance"):
             evaluate_closed_loop_scenarios(
-                split="validation", scenarios=(scenario(3), wrong_signature)
+                split="validation",
+                scenarios=(scenario, forged),
+                expected_dataset_digest="d" * 64,
+                expected_kinematic_signature_sha256=signature,
+                expected_identity_set_sha256=receipt["receipt_sha256"],
             )
+        self.assertEqual(calls, [])
 
     def test_validation_rejects_train_or_test_before_opening_any_scenario(self) -> None:
         calls: list[str] = []
@@ -443,7 +574,13 @@ class ClosedLoopMetricsTests(unittest.TestCase):
         for split in ("train", "test"):
             with self.subTest(split=split):
                 with self.assertRaisesRegex(ValueError, "validation"):
-                    evaluate_closed_loop_scenarios(split=split, scenarios=(scenario,))
+                    evaluate_closed_loop_scenarios(
+                        split=split,
+                        scenarios=(scenario,),
+                        expected_dataset_digest="d" * 64,
+                        expected_kinematic_signature_sha256="e" * 64,
+                        expected_identity_set_sha256="f" * 64,
+                    )
         self.assertEqual(calls, [])
 
     @unittest.skipUnless(MODEL_PATH.is_file(), "native G1 model is unavailable")
@@ -460,9 +597,20 @@ class ClosedLoopMetricsTests(unittest.TestCase):
         self.assertTrue(math.isfinite(observation.maximum_sole_penetration_m))
         self.assertTrue(math.isfinite(observation.maximum_forbidden_body_penetration_m))
         self.assertFalse(any("ankle_roll" in name for name in observation.forbidden_geom_names))
+        collision = {
+            geom
+            for geom in range(geometry._model.ngeom)
+            if int(geometry._model.geom_bodyid[geom]) in geometry._body_ids
+            and (
+                int(geometry._model.geom_contype[geom])
+                or int(geometry._model.geom_conaffinity[geom])
+            )
+        }
+        self.assertFalse(geometry._sole_set & set(geometry._forbidden_geom_ids))
+        self.assertEqual(geometry._sole_set | set(geometry._forbidden_geom_ids), collision)
 
     @unittest.skipUnless(MODEL_PATH.is_file(), "native G1 model is unavailable")
-    def test_native_mesh_audit_queries_only_transformed_lowest_vertices(self) -> None:
+    def test_native_mesh_audit_queries_every_transformed_collision_vertex(self) -> None:
         import mujoco
 
         geometry = NativeG1RuntimeGeometry.from_mjcf(MODEL_PATH)
@@ -475,9 +623,64 @@ class ClosedLoopMetricsTests(unittest.TestCase):
         mesh_id = int(geometry._model.geom_dataid[mesh_geom])
         vertex_count = int(geometry._model.mesh_vertnum[mesh_id])
         samples = geometry._geom_samples(mesh_geom)
-        self.assertGreater(len(samples), 0)
-        self.assertLess(len(samples), vertex_count)
-        np.testing.assert_allclose(samples[:, 2], np.min(samples[:, 2]), atol=1.0e-12)
+        self.assertEqual(len(samples), vertex_count)
+
+    def test_primitive_collision_surfaces_catch_uphill_side_penetration(self) -> None:
+        tangent = math.tan(math.radians(19.0))
+        normal = np.array((tangent, 0.0, -1.0))
+        rotation = np.eye(3)
+        position = np.zeros(3)
+        sphere = runtime_module._deterministic_collision_surface_samples(
+            "sphere", np.array((0.2, 0.0, 0.0)), rotation, position
+        )
+        capsule = runtime_module._deterministic_collision_surface_samples(
+            "capsule", np.array((0.1, 0.3, 0.0)), rotation, position
+        )
+        box = runtime_module._deterministic_collision_surface_samples(
+            "box", np.array((0.2, 0.1, 0.1)), rotation, position
+        )
+        self.assertGreater(np.max(sphere @ normal), 0.2)
+        self.assertGreater(np.max(capsule @ normal), 0.1)
+        self.assertAlmostEqual(
+            float(np.max(box @ normal)), 0.2 * tangent + 0.1, places=7
+        )
+
+    def test_vectorized_collision_penetration_matches_every_scalar_slope_sample(self) -> None:
+        mesh = CanonicalTerrainMesh(
+            vertices_local=np.asarray(
+                ((-2.0, -2.0, -1.0), (2.0, -2.0, 1.0),
+                 (2.0, 2.0, 1.0), (-2.0, 2.0, -1.0)),
+                dtype=np.float32,
+            ),
+            faces=np.asarray(((0, 1, 2), (0, 2, 3)), dtype=np.int32),
+            valid_faces=np.ones(2, dtype=np.bool_),
+            source_asset_sha256="f" * 64,
+        )
+        terrain = SourceAlignedTerrain(
+            mesh,
+            world_from_mesh=RigidTransform(
+                np.zeros(3), np.asarray((1.0, 0.0, 0.0, 0.0))
+            ),
+            source_root_xy=(0.0, 0.0), source_root_yaw=0.0,
+            source_support_height=0.0,
+        )
+        points = np.asarray(
+            [
+                (x, y, 0.05 + 0.01 * ((index % 5) - 2))
+                for index, (x, y) in enumerate(
+                    (tuple(value) for value in np.random.default_rng(7).uniform(-1.9, 1.9, (257, 2)))
+                )
+            ],
+            dtype=np.float64,
+        )
+        scalar = max(
+            0.0,
+            max(terrain(point[:2]).height_m - point[2] for point in points),
+        )
+        heights = terrain.collision_heights_at(points[:, :2])
+        self.assertEqual(heights.shape, (len(points),))
+        vectorized = NativeG1RuntimeGeometry._penetration(points, terrain)
+        self.assertAlmostEqual(vectorized, scalar, places=12)
 
     def test_known_train_source_and_twenty_second_script_are_exact(self) -> None:
         manifest = {
@@ -612,6 +815,123 @@ def Mesh "Terrain" {
         self.assertAlmostEqual(origin.height_m, 0.0, places=7)
         self.assertAlmostEqual(forward.height_m, 0.0, places=7)
         np.testing.assert_allclose(origin.gradient_xy, (0.0, -1.0), atol=1.0e-7)
+        self.assertIsNone(terrain(np.array((3.0, 0.0))))
+
+    def test_source_aligned_seed_selects_supported_flat_and_crosses_exact_flank(self) -> None:
+        rise = math.tan(math.radians(10.0))
+        vertices = np.asarray(
+            [
+                (-2.0, -1.0, 0.0), (-2.0, 1.0, 0.0),
+                (0.0, -1.0, 0.0), (0.0, 1.0, 0.0),
+                (1.0, -1.0, rise), (1.0, 1.0, rise),
+                (2.0, -1.0, rise), (2.0, 1.0, rise),
+            ],
+            dtype=np.float32,
+        )
+        mesh = CanonicalTerrainMesh(
+            vertices_local=vertices,
+            faces=np.asarray(
+                (
+                    (0, 2, 3), (0, 3, 1),
+                    (2, 4, 5), (2, 5, 3),
+                    (4, 6, 7), (4, 7, 5),
+                ),
+                dtype=np.int32,
+            ),
+            valid_faces=np.ones(6, dtype=np.bool_),
+            source_asset_sha256="a" * 64,
+        )
+        positions = np.column_stack((np.linspace(-0.2, 0.2, 12), np.zeros(12)))
+        directions = np.tile((1.0, 0.0), (12, 1))
+        terrain = SourceAlignedTerrain.from_supported_flat_seed(
+            mesh,
+            world_from_mesh=RigidTransform(
+                np.zeros(3), np.asarray((1.0, 0.0, 0.0, 0.0))
+            ),
+            runtime_root_xy=(3.0, -4.0),
+            runtime_root_yaw=math.pi / 3.0,
+            seed_trajectory_position=positions,
+            seed_trajectory_direction=directions,
+            expected_relative_terrain=np.zeros((12, 3)),
+        )
+        self.assertEqual(terrain.alignment_report["approach"], "supported_flat_mesh")
+        self.assertLessEqual(
+            terrain.alignment_report["maximum_seed_probe_error_m"], 1.0e-4
+        )
+        self.assertGreaterEqual(
+            terrain.alignment_report["native_maximum_grade_degrees"], 9.99
+        )
+        self.assertIsNotNone(terrain(np.array((3.0, -4.0))))
+        self.assertIsNone(terrain(np.array((30.0, -4.0))))
+
+    def test_supported_plateau_route_turns_before_boundary_without_post_flank_flat(self) -> None:
+        rise = math.tan(math.radians(12.0)) * 1.5
+        mesh = CanonicalTerrainMesh(
+            vertices_local=np.asarray(
+                (
+                    (-1.0, -0.7, 0.0), (0.0, -0.7, 0.0),
+                    (-1.0, 0.7, 0.0), (0.0, 0.7, 0.0),
+                    (1.5, -0.7, rise), (1.5, 0.7, rise),
+                ),
+                dtype=np.float32,
+            ),
+            faces=np.asarray(
+                ((0, 1, 3), (0, 3, 2), (1, 4, 5), (1, 5, 3)),
+                dtype=np.int32,
+            ),
+            valid_faces=np.ones(4, dtype=np.bool_),
+            source_asset_sha256="b" * 64,
+        )
+        positions = np.column_stack((np.linspace(-0.1, 0.05, 12), np.zeros(12)))
+        terrain = SourceAlignedTerrain.from_supported_flat_seed(
+            mesh,
+            world_from_mesh=RigidTransform(
+                np.zeros(3), np.asarray((1.0, 0.0, 0.0, 0.0))
+            ),
+            runtime_root_xy=(0.0, 0.0),
+            runtime_root_yaw=0.0,
+            seed_trajectory_position=positions,
+            seed_trajectory_direction=np.tile((1.0, 0.0), (12, 1)),
+            expected_relative_terrain=np.zeros((12, 3)),
+        )
+        report = terrain.alignment_report
+        self.assertFalse(report["has_post_flank_continuation"])
+        self.assertGreater(report["turnaround_runtime_x_m"], report["flank_entry_runtime_x_m"])
+        self.assertLess(report["turnaround_runtime_x_m"], report["supported_route_extent_m"])
+        self.assertIsNotNone(
+            terrain(np.array((report["turnaround_runtime_x_m"], 0.0)))
+        )
+        self.assertIsNone(
+            terrain(np.array((report["turnaround_runtime_x_m"] + 0.01, 0.0)))
+        )
+
+        short_mesh = CanonicalTerrainMesh(
+            vertices_local=np.asarray(
+                (
+                    (-0.35, -0.3, 0.0), (0.0, -0.3, 0.0),
+                    (-0.35, 0.3, 0.0), (0.0, 0.3, 0.0),
+                    (0.15, -0.3, rise), (0.15, 0.3, rise),
+                ),
+                dtype=np.float32,
+            ),
+            faces=np.asarray(
+                ((0, 1, 3), (0, 3, 2), (1, 4, 5), (1, 5, 3)),
+                dtype=np.int32,
+            ),
+            valid_faces=np.ones(4, dtype=np.bool_),
+            source_asset_sha256="c" * 64,
+        )
+        with self.assertRaisesRegex(ValueError, "turnaround|route"):
+            SourceAlignedTerrain.from_supported_flat_seed(
+                short_mesh,
+                world_from_mesh=RigidTransform(
+                    np.zeros(3), np.asarray((1.0, 0.0, 0.0, 0.0))
+                ),
+                runtime_root_xy=(0.0, 0.0), runtime_root_yaw=0.0,
+                seed_trajectory_position=positions,
+                seed_trajectory_direction=np.tile((1.0, 0.0), (12, 1)),
+                expected_relative_terrain=np.zeros((12, 3)),
+            )
 
     def test_grail_pair_npz_rejects_robot_or_frame_tamper(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -648,23 +968,31 @@ def Mesh "Terrain" {
                 )
 
     def test_normal_best_requires_evaluated_validation_score_and_provenance(self) -> None:
+        data = "a" * 64
+        signature = "b" * 64
+        identity = "c" * 64
+        scenario = "d" * 64
         metrics = {
             "gates": {"finite_20_seconds": True},
             "numeric_gates": {},
-            "dataset_digest_sha256": "data",
-            "kinematic_signature_sha256": "kin",
+            "dataset_digest_sha256": data,
+            "kinematic_signature_sha256": signature,
+            "validation_identity_set_sha256": identity,
+            "scenario_provenance_sha256": scenario,
         }
         result = ClosedLoopValidationResult.from_metrics(metrics, split="validation")
         selection, promote = validated_normal_selection(
             one_step_score=2.5,
             result=result,
-            dataset_digest="data",
-            kinematic_signature_sha256="kin",
+            dataset_digest=data,
+            kinematic_signature_sha256=signature,
+            validation_identity_set_sha256=identity,
+            expected_scenario_provenance_sha256=scenario,
         )
         self.assertTrue(promote)
         self.assertEqual(selection["closed_loop_score"], 0.0)
         self.assertEqual(selection["validation_score"], 2.5)
-        for changed in (None, "wrong-data", "wrong-kin"):
+        for changed in (None, "wrong-data", "wrong-kin", "wrong-id", "wrong-scenario"):
             with self.subTest(changed=changed):
                 if changed is None:
                     bad_result = ClosedLoopValidationResult(
@@ -674,17 +1002,21 @@ def Mesh "Terrain" {
                         normalized_excess=0.0,
                         metrics=metrics,
                     )
-                    data, signature = "data", "kin"
+                    actual_data, actual_signature = data, signature
+                    actual_identity, actual_scenario = identity, scenario
                 else:
                     bad_result = result
-                    data, signature = (
-                        (changed, "kin") if "data" in changed else ("data", changed)
-                    )
+                    actual_data = "e" * 64 if "data" in changed else data
+                    actual_signature = "e" * 64 if "kin" in changed else signature
+                    actual_identity = "e" * 64 if "id" in changed else identity
+                    actual_scenario = "e" * 64 if "scenario" in changed else scenario
                 selection, promote = validated_normal_selection(
                     one_step_score=2.5,
                     result=bad_result,
-                    dataset_digest=data,
-                    kinematic_signature_sha256=signature,
+                    dataset_digest=actual_data,
+                    kinematic_signature_sha256=actual_signature,
+                    validation_identity_set_sha256=actual_identity,
+                    expected_scenario_provenance_sha256=actual_scenario,
                 )
                 self.assertIsNone(selection)
                 self.assertFalse(promote)

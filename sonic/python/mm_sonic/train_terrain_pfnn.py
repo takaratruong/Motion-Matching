@@ -20,13 +20,17 @@ from mm_sonic.evaluate_terrain_pfnn import _atomic_json, _dataset_root
 from mm_sonic.terrain_pfnn.dataset import PFNNShardDataset
 from mm_sonic.terrain_pfnn.kinematics import TorchG1ForwardKinematics
 from mm_sonic.terrain_pfnn.model import PhaseFunctionedNetwork
-from mm_sonic.terrain_pfnn.runtime import ClosedLoopValidationResult
+from mm_sonic.terrain_pfnn.runtime import (
+    ClosedLoopValidationResult,
+    validation_identity_set_receipt,
+)
 from mm_sonic.terrain_pfnn.splits import split_identity, terrain_identity
 from mm_sonic.terrain_pfnn.training import (
     DEFAULT_LOSS_WEIGHTS,
     LOSS_WEIGHT_KEYS,
     autoregressive_unroll,
     choose_runtime_seed,
+    fitted_row_sha256,
     load_checkpoint,
     one_step_metrics,
     pfnn_losses,
@@ -34,10 +38,12 @@ from mm_sonic.terrain_pfnn.training import (
     save_checkpoint,
     selection_metadata,
     training_phase_advance_q99,
+    validate_resume_fitted_subset,
 )
 
 
 _TERRAIN_CLASSES = ("flat", "ascent", "descent", "transition")
+_PIPELINE_KNOWN_TERRAIN_IDENTITY = "slope_001"
 
 
 def overfit_gate_accepted(initial: float, final: float, ratio: float) -> bool:
@@ -47,8 +53,201 @@ def overfit_gate_accepted(initial: float, final: float, ratio: float) -> bool:
     return values[2] > 0.0 and values[1] < values[2] * values[0]
 
 
-def promote_pipeline_best(*, pipeline_overfit: bool, accepted: bool) -> bool:
-    return bool(pipeline_overfit and accepted)
+def provisional_pipeline_selection(
+    *, one_step_score: float, accepted: bool
+) -> dict[str, object] | None:
+    """Record reproducible fixed-sample evidence without authorizing best."""
+
+    return (
+        selection_metadata(
+            one_step_score=float(one_step_score), pipeline_overfit=True
+        )
+        if accepted
+        else None
+    )
+
+
+_PIPELINE_REQUIRED_GATES = (
+    "finite_20_seconds",
+    "no_invalid_hold",
+    "no_phase_reversal",
+    "no_phase_freeze",
+    "root_translation_step_within_limit",
+    "root_rotation_step_within_limit",
+    "joint_step_within_limit",
+    "no_joint_limit_violation",
+    "sole_penetration_within_limit",
+    "zero_forbidden_body_penetration",
+    "stance_sole_speed_within_limit",
+)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _canonical_sha256(value: dict[str, object]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _sha256_value(value: object) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def build_pipeline_promotion_receipt(
+    *,
+    checkpoint_path: str | Path,
+    dataset_digest_sha256: str,
+    kinematic_signature_sha256: str,
+    scenario_provenance_sha256: str,
+    fitted_subset_rows_sha256: str,
+    expected_fixed_sample_score: float,
+    observed_fixed_sample_score: float,
+    expected_fixed_sample_count: int,
+    observed_fixed_sample_count: int,
+    closed_loop_metrics: dict[str, object],
+) -> dict[str, object]:
+    """Build a fail-closed verifier receipt; never infer a missing gate."""
+
+    candidate = Path(checkpoint_path)
+    if not candidate.is_file() or any(
+        not _sha256_value(value)
+        for value in (
+            dataset_digest_sha256,
+            kinematic_signature_sha256,
+            scenario_provenance_sha256,
+            fitted_subset_rows_sha256,
+        )
+    ):
+        raise ValueError("pipeline verifier bindings are invalid")
+    expected_score = float(expected_fixed_sample_score)
+    observed_score = float(observed_fixed_sample_score)
+    fixed_reproduction = bool(
+        math.isfinite(expected_score)
+        and math.isfinite(observed_score)
+        and expected_score == observed_score
+        and type(expected_fixed_sample_count) is int
+        and expected_fixed_sample_count > 0
+        and observed_fixed_sample_count == expected_fixed_sample_count
+    )
+    gates = closed_loop_metrics.get("gates")
+    global_metrics = closed_loop_metrics.get("global")
+    known = closed_loop_metrics.get("known_train_gate")
+    required_runtime = bool(
+        isinstance(gates, dict)
+        and all(gates.get(name) is True for name in _PIPELINE_REQUIRED_GATES)
+        and isinstance(global_metrics, dict)
+        and type(global_metrics.get("predicted_stance_sample_count")) is int
+        and global_metrics["predicted_stance_sample_count"] > 0
+    )
+    required_traversal = bool(
+        isinstance(known, dict)
+        and known.get("crossed_supported_known_terrain") is True
+        and known.get("returned_to_supported_continuation") is True
+        and known.get("realized_nonstationary_traversal") is True
+        and known.get("responsive_flat_motion_after_return") is True
+    )
+    base: dict[str, object] = {
+        "schema": "mm-sonic-pipeline-promotion-receipt/v1",
+        "checkpoint_sha256": _file_sha256(candidate),
+        "dataset_digest_sha256": dataset_digest_sha256,
+        "kinematic_signature_sha256": kinematic_signature_sha256,
+        "scenario_provenance_sha256": scenario_provenance_sha256,
+        "fitted_subset_rows_sha256": fitted_subset_rows_sha256,
+        "fixed_sample_reproduction": fixed_reproduction,
+        "expected_fixed_sample_score": expected_score,
+        "observed_fixed_sample_score": observed_score,
+        "expected_fixed_sample_count": expected_fixed_sample_count,
+        "observed_fixed_sample_count": observed_fixed_sample_count,
+        "required_runtime_gates": required_runtime,
+        "required_known_terrain_traversal": required_traversal,
+        "accepted": fixed_reproduction and required_runtime and required_traversal,
+    }
+    return {**base, "receipt_sha256": _canonical_sha256(base)}
+
+
+def _publish_immutable_best(candidate: Path, best: Path) -> None:
+    if best.exists():
+        raise FileExistsError("immutable best checkpoint already exists")
+    temporary = best.with_name(f".{best.name}.{os.getpid()}.verified.tmp")
+    try:
+        with candidate.open("rb") as source, temporary.open("xb") as destination:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                destination.write(block)
+            destination.flush()
+            os.fsync(destination.fileno())
+        temporary.chmod(0o444)
+        os.link(temporary, best)
+        directory_fd = os.open(best.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def promote_pipeline_best(
+    *,
+    candidate_path: str | Path,
+    best_path: str | Path,
+    receipt: dict[str, object] | None,
+    dataset_digest_sha256: str,
+    kinematic_signature_sha256: str,
+    scenario_provenance_sha256: str,
+    fitted_subset_rows_sha256: str,
+) -> bool:
+    """Atomically publish immutable ``best.pt`` only from a bound gate receipt."""
+
+    if type(receipt) is not dict or receipt.get("accepted") is not True:
+        return False
+    candidate, best = Path(candidate_path), Path(best_path)
+    if not candidate.is_file() or best.exists():
+        return False
+    receipt_hash = receipt.get("receipt_sha256")
+    base = {name: value for name, value in receipt.items() if name != "receipt_sha256"}
+    if (
+        set(receipt) != {
+            "schema", "checkpoint_sha256", "dataset_digest_sha256",
+            "kinematic_signature_sha256", "scenario_provenance_sha256",
+            "fitted_subset_rows_sha256", "fixed_sample_reproduction",
+            "expected_fixed_sample_score", "observed_fixed_sample_score",
+            "expected_fixed_sample_count", "observed_fixed_sample_count",
+            "required_runtime_gates", "required_known_terrain_traversal",
+            "accepted", "receipt_sha256",
+        }
+        or receipt.get("schema") != "mm-sonic-pipeline-promotion-receipt/v1"
+        or receipt_hash != _canonical_sha256(base)
+        or receipt.get("checkpoint_sha256") != _file_sha256(candidate)
+        or receipt.get("dataset_digest_sha256") != dataset_digest_sha256
+        or receipt.get("kinematic_signature_sha256")
+        != kinematic_signature_sha256
+        or receipt.get("scenario_provenance_sha256")
+        != scenario_provenance_sha256
+        or receipt.get("fitted_subset_rows_sha256")
+        != fitted_subset_rows_sha256
+        or receipt.get("fixed_sample_reproduction") is not True
+        or receipt.get("required_runtime_gates") is not True
+        or receipt.get("required_known_terrain_traversal") is not True
+    ):
+        return False
+    try:
+        _publish_immutable_best(candidate, best)
+    except (FileExistsError, OSError):
+        return False
+    return _file_sha256(best) == receipt["checkpoint_sha256"]
 
 
 def validated_normal_selection(
@@ -57,6 +256,8 @@ def validated_normal_selection(
     result: ClosedLoopValidationResult | None,
     dataset_digest: str,
     kinematic_signature_sha256: str,
+    validation_identity_set_sha256: str,
+    expected_scenario_provenance_sha256: str,
 ) -> tuple[dict[str, object] | None, bool]:
     """Return promotable metadata only for an actual matching validation run."""
 
@@ -67,6 +268,10 @@ def validated_normal_selection(
         or result.metrics.get("dataset_digest_sha256") != dataset_digest
         or result.metrics.get("kinematic_signature_sha256")
         != kinematic_signature_sha256
+        or result.metrics.get("validation_identity_set_sha256")
+        != validation_identity_set_sha256
+        or result.metrics.get("scenario_provenance_sha256")
+        != expected_scenario_provenance_sha256
     ):
         return None, False
     selection = selection_metadata(
@@ -153,7 +358,13 @@ def stratified_subset(
     return output
 
 
-def consecutive_overfit_subset(dataset: object, count: int) -> list[int]:
+def consecutive_overfit_subset(
+    dataset: object,
+    count: int,
+    *,
+    required_seed_key: tuple[str, int] | None = None,
+    known_terrain_identity: str | None = None,
+) -> list[int]:
     """Select source-sealed consecutive GRAIL slope runs for pipeline overfit.
 
     Identities, clip variants, and maximal runs are traversed lexicographically.
@@ -185,37 +396,56 @@ def consecutive_overfit_subset(dataset: object, count: int) -> list[int]:
             or split_identity(identity) != "train"
         ):
             raise ValueError("overfit subset row provenance is not source sealed")
-        # GRAIL slope identities are the only source with paired terrain and
-        # are preferred ahead of all flat LAFAN identities by contract.
-        if not identity.startswith("slope_"):
-            continue
         grouped.setdefault(identity, {}).setdefault(clip, {}).setdefault(
             center, []
         ).append((index, terrain_class))
 
-    selected: list[int] = []
-    selected_classes: list[str] = []
+    all_runs: list[tuple[str, str, list[int]]] = []
     for identity in sorted(grouped):
         for clip in sorted(grouped[identity]):
             by_center = grouped[identity][clip]
-            unique = sorted(
-                center for center, rows in by_center.items() if len(rows) == 1
-            )
+            unique = sorted(center for center, rows in by_center.items() if len(rows) == 1)
             runs: list[list[int]] = []
             for center in unique:
                 if not runs or center != runs[-1][-1] + 1:
                     runs.append([center])
                 else:
                     runs[-1].append(center)
-            for run in runs:
-                for center in run:
-                    index, terrain_class = by_center[center][0]
-                    selected.append(index)
-                    selected_classes.append(terrain_class)
-                    if len(selected) == count:
-                        break
-                if len(selected) == count:
-                    break
+            all_runs.extend((identity, clip, run) for run in runs)
+
+    ordered_runs = list(all_runs)
+    if required_seed_key is not None:
+        seed_clip, seed_center = required_seed_key
+        anchors = [
+            run for run in all_runs
+            if run[1] == seed_clip and seed_center in run[2]
+            and seed_center - 1 in run[2]
+        ]
+        if len(anchors) != 1:
+            raise ValueError("required runtime seed is not in one unique fitted run")
+        anchor = anchors[0]
+        if len(anchor[2]) > count:
+            raise ValueError("requested subset cannot contain the complete seed run")
+        terrain_runs = [
+            run for run in all_runs
+            if run != anchor and run[0] == known_terrain_identity
+        ]
+        remaining = [
+            run for run in all_runs
+            if run != anchor
+            and run not in terrain_runs
+            and run[0].startswith("slope_")
+        ]
+        ordered_runs = [anchor, *terrain_runs, *remaining]
+
+    selected: list[int] = []
+    selected_classes: list[str] = []
+    for identity, clip, run in ordered_runs:
+        by_center = grouped[identity][clip]
+        for center in run:
+            index, terrain_class = by_center[center][0]
+            selected.append(index)
+            selected_classes.append(terrain_class)
             if len(selected) == count:
                 break
         if len(selected) == count:
@@ -260,7 +490,13 @@ def fitted_subset_metadata(
             raise ValueError("fitted subset receipt contains an invalid row")
         seen.add(key)
         counts[terrain_class] += 1
-        rows.append({"clip_id": clip, "center_frame": center})
+        rows.append({
+            "clip_id": clip,
+            "center_frame": center,
+            "split_identity": identity,
+            "terrain_class": terrain_class,
+            "row_sha256": fitted_row_sha256(sample),
+        })
     if not rows:
         raise ValueError("fitted subset receipt cannot be empty")
     encoded = json.dumps(
@@ -462,6 +698,10 @@ def train(
     arguments: argparse.Namespace,
     *,
     closed_loop_scorer: Callable[[], ClosedLoopValidationResult] | None = None,
+    expected_validation_scenario_provenance_sha256: str | None = None,
+    pipeline_verifier: Callable[[Path, dict[str, object]], dict[str, object]]
+    | None = None,
+    expected_pipeline_scenario_provenance_sha256: str | None = None,
 ) -> dict[str, object] | None:
     import torch.distributed as dist
 
@@ -474,9 +714,25 @@ def train(
     train_dataset = PFNNShardDataset(root, "train")
     terrain_classes = _terrain_classes(train_dataset)
     all_indices = list(range(len(train_dataset)))
+    kinematics = TorchG1ForwardKinematics.from_mjcf(arguments.model_path).to(device)
     if arguments.overfit_samples is not None:
+        seed_preview = (
+            choose_runtime_seed(
+                train_dataset, kinematics.joint_limits.detach().cpu()
+            )
+            if rank == 0
+            else None
+        )
         candidate_indices = (
-            consecutive_overfit_subset(train_dataset, arguments.overfit_samples)
+            consecutive_overfit_subset(
+                train_dataset,
+                arguments.overfit_samples,
+                required_seed_key=(
+                    str(seed_preview["provenance"]["first_fitted_clip_id"]),
+                    int(seed_preview["provenance"]["first_fitted_center_frame"]),
+                ),
+                known_terrain_identity=_PIPELINE_KNOWN_TERRAIN_IDENTITY,
+            )
             if rank == 0 else None
         )
         candidate_indices = _broadcast_indices(candidate_indices, device)
@@ -493,7 +749,6 @@ def train(
         optimization_classes = terrain_classes
         optimization_indices = candidate_indices
 
-    kinematics = TorchG1ForwardKinematics.from_mjcf(arguments.model_path).to(device)
     torch.manual_seed(arguments.seed)
     model: torch.nn.Module = PhaseFunctionedNetwork(
         hidden_size=arguments.hidden_size, dropout_probability=0.30
@@ -514,6 +769,7 @@ def train(
             expected_dataset_digest=manifest["dataset_digest_sha256"],
             expected_kinematic_signature_sha256=kinematics.kinematic_signature_sha256,
         )
+        validate_resume_fitted_subset(resumed, fitted_receipt)
         restored_step, restored_epoch = restore_training_state(
             resumed,
             unwrapped,
@@ -833,20 +1089,16 @@ def train(
     validation_identities = manifest["split_identities"]["validation"]
     phase_q99 = training_phase_advance_q99(train_dataset)
     runtime_seed = choose_runtime_seed(
-        optimization_dataset, kinematics.joint_limits.detach().cpu()
+        train_dataset,
+        kinematics.joint_limits.detach().cpu(),
+        fitted_subset=fitted_receipt if pipeline_overfit else None,
     )
     closed_loop_result: ClosedLoopValidationResult | None = None
     if pipeline_overfit:
-        promote_best = promote_pipeline_best(
-            pipeline_overfit=True, accepted=one_step_accepted
-        )
-        selection = (
-            selection_metadata(
-                one_step_score=float(gate_metrics["one_step_score"]),
-                pipeline_overfit=True,
-            )
-            if promote_best
-            else None
+        promote_best = False
+        selection = provisional_pipeline_selection(
+            one_step_score=float(gate_metrics["one_step_score"]),
+            accepted=one_step_accepted,
         )
     elif one_step_accepted and closed_loop_scorer is not None:
         closed_loop_result = closed_loop_scorer()
@@ -855,6 +1107,13 @@ def train(
             result=closed_loop_result,
             dataset_digest=dataset_digest,
             kinematic_signature_sha256=kinematics.kinematic_signature_sha256,
+            validation_identity_set_sha256=validation_identity_set_receipt(
+                manifest
+            )["receipt_sha256"],
+            expected_scenario_provenance_sha256=(
+                "" if expected_validation_scenario_provenance_sha256 is None
+                else expected_validation_scenario_provenance_sha256
+            ),
         )
     else:
         selection, promote_best = None, False
@@ -885,30 +1144,41 @@ def train(
         expected_dataset_digest=dataset_digest,
         expected_kinematic_signature_sha256=kinematics.kinematic_signature_sha256,
     )
+    pipeline_receipt: dict[str, object] | None = None
     best_path: str | None = None
-    if promote_best:
+    if pipeline_overfit and one_step_accepted and pipeline_verifier is not None:
+        verification_request = {
+            "dataset_digest_sha256": dataset_digest,
+            "kinematic_signature_sha256": (
+                kinematics.kinematic_signature_sha256
+            ),
+            "fitted_subset_rows_sha256": fitted_receipt["rows_sha256"],
+            "expected_fixed_sample_score": float(
+                gate_metrics["one_step_score"]
+            ),
+            "expected_fixed_sample_count": int(gate_metrics["samples"]),
+        }
+        pipeline_receipt = pipeline_verifier(candidate, verification_request)
+        if expected_pipeline_scenario_provenance_sha256 is not None:
+            promote_best = promote_pipeline_best(
+                candidate_path=candidate,
+                best_path=output / "best.pt",
+                receipt=pipeline_receipt,
+                dataset_digest_sha256=dataset_digest,
+                kinematic_signature_sha256=(
+                    kinematics.kinematic_signature_sha256
+                ),
+                scenario_provenance_sha256=(
+                    expected_pipeline_scenario_provenance_sha256
+                ),
+                fitted_subset_rows_sha256=fitted_receipt["rows_sha256"],
+            )
+            if promote_best:
+                _atomic_json(output / "pipeline-promotion-receipt.json", pipeline_receipt)
+                best_path = str(output / "best.pt")
+    elif promote_best:
         best = output / "best.pt"
-        save_checkpoint(
-            best,
-            unwrapped,
-            optimizer,
-            train_dataset,
-            dataset_digest=dataset_digest,
-            kinematic_signature_sha256=kinematics.kinematic_signature_sha256,
-            runtime_seed=runtime_seed,
-            step=step,
-            epoch=epoch,
-            seed=arguments.seed,
-            loss_weights=DEFAULT_LOSS_WEIGHTS,
-            joint_limits=kinematics.joint_limits.detach().cpu(),
-            phase_advance_q99=phase_q99,
-            train_identities=train_identities,
-            validation_identities=validation_identities,
-            selection=selection,
-            sampler_epoch=max(0, epoch - 1),
-            sampler_global_offset=local_offset * world_size,
-            fitted_subset=fitted_receipt,
-        )
+        _publish_immutable_best(candidate, best)
         best_path = str(best)
     report = {
         "schema": "mm-sonic-terrain-pfnn-one-step-report/v1",
@@ -925,6 +1195,7 @@ def train(
         "candidate_checkpoint": str(candidate),
         "best_checkpoint": best_path,
         "selection": selection,
+        "pipeline_promotion_receipt": pipeline_receipt,
         "closed_loop": {
             "status": (
                 "evaluated"
@@ -998,6 +1269,7 @@ __all__ = [
     "consecutive_overfit_subset",
     "fitted_subset_metadata",
     "overfit_gate_accepted",
+    "provisional_pipeline_selection",
     "promote_pipeline_best",
     "validated_normal_selection",
     "resolve_rollout_finetune_frames",

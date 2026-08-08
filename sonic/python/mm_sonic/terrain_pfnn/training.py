@@ -32,7 +32,7 @@ from .layout import (
 from .model import PhaseFunctionedNetwork
 
 
-CHECKPOINT_SCHEMA = "mm-sonic-terrain-pfnn-checkpoint/v3"
+CHECKPOINT_SCHEMA = "mm-sonic-terrain-pfnn-checkpoint/v4"
 _NORMALIZATION_CONTRACT = {
     "continuous_loss_domain": "normalized",
     "contact_loss_domain": "raw_logits_binary_labels",
@@ -387,8 +387,56 @@ def training_phase_advance_q99(dataset: object) -> float:
     return float(np.quantile(values, 0.99, method="linear"))
 
 
+def fitted_row_sha256(sample: Mapping[str, object]) -> str:
+    """Hash one normalized fitted row and its sealed training provenance."""
+
+    try:
+        x = np.ascontiguousarray(np.asarray(sample["x"], dtype="<f4"))
+        y = np.ascontiguousarray(np.asarray(sample["y"], dtype="<f4"))
+        phase = np.asarray(float(sample["phase"]), dtype="<f4")
+        provenance = {
+            "clip_id": sample["clip_id"],
+            "center_frame": sample["center_frame"],
+            "split_identity": sample["split_identity"],
+            "split": sample["split"],
+            "terrain_class": sample["terrain_class"],
+        }
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("fitted row receipt source is invalid") from error
+    if (
+        x.shape != (INPUT_LAYOUT.size,)
+        or y.shape != (OUTPUT_LAYOUT.size,)
+        or not np.isfinite(x).all()
+        or not np.isfinite(y).all()
+        or not np.isfinite(phase)
+        or type(provenance["clip_id"]) is not str
+        or not provenance["clip_id"]
+        or type(provenance["center_frame"]) is not int
+        or provenance["center_frame"] < 0
+        or type(provenance["split_identity"]) is not str
+        or not provenance["split_identity"]
+        or provenance["split"] != "train"
+        or provenance["terrain_class"]
+        not in ("flat", "ascent", "descent", "transition")
+    ):
+        raise ValueError("fitted row receipt source is invalid")
+    digest = hashlib.sha256(b"mm-sonic-fitted-pfnn-row/v1\0")
+    digest.update(
+        json.dumps(
+            provenance, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+    )
+    digest.update(x.tobytes(order="C"))
+    digest.update(y.tobytes(order="C"))
+    digest.update(phase.tobytes())
+    return digest.hexdigest()
+
+
 def choose_runtime_seed(
-    dataset: object, joint_limits: object
+    dataset: object,
+    joint_limits: object,
+    *,
+    fitted_subset: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Choose a fitted recurrent state whose first inference is also fitted.
 
@@ -429,29 +477,33 @@ def choose_runtime_seed(
         rows.setdefault((clip, center), []).append((index, sample))
 
     unique = {key: value[0] for key, value in rows.items() if len(value) == 1}
-    candidates: list[tuple[tuple[float, str, int], int, Mapping[str, object], Mapping[str, object]]] = []
+    candidates: list[
+        tuple[tuple[float, str, int], Mapping[str, object], Mapping[str, object]]
+    ] = []
     for (clip, center), (_, sample) in unique.items():
         predecessor_entry = unique.get((clip, center - 1))
         if sample.get("terrain_class") != "flat" or predecessor_entry is None:
             continue
-        suffix = 1
-        while (clip, center + suffix) in unique:
-            suffix += 1
         physical_target = np.asarray(sample["y"], dtype=np.float64) * y_std + y_mean
-        if not np.isfinite(physical_target).all():
+        predecessor = predecessor_entry[1]
+        predecessor_physical = (
+            np.asarray(predecessor["y"], dtype=np.float64) * y_std + y_mean
+        )
+        predecessor_joints = predecessor_physical[OUTPUT_LAYOUT["joint_position"]]
+        if (
+            not np.isfinite(physical_target).all()
+            or not np.isfinite(predecessor_physical).all()
+            or np.any(predecessor_joints < limits[:, 0].numpy())
+            or np.any(predecessor_joints > limits[:, 1].numpy())
+        ):
             continue
         speed = float(
             np.linalg.norm(physical_target[OUTPUT_LAYOUT["root_planar_velocity"]])
         )
-        candidates.append(
-            ((speed, clip, center), suffix, predecessor_entry[1], sample)
-        )
+        candidates.append(((speed, clip, center), predecessor, sample))
     if not candidates:
         raise ValueError("training split has no fitted consecutive flat runtime seed")
-    long = [candidate for candidate in candidates if candidate[1] >= 16]
-    key, _, predecessor, first_fitted = min(
-        long if long else candidates, key=lambda candidate: candidate[0]
-    )
+    key, predecessor, first_fitted = min(candidates, key=lambda candidate: candidate[0])
     speed, clip, center = key
     predecessor_physical = (
         np.asarray(predecessor["y"], dtype=np.float64) * y_std + y_mean
@@ -567,9 +619,19 @@ def choose_runtime_seed(
                 "first_fitted_clip_id": clip,
                 "first_fitted_center_frame": center,
                 "speed": speed,
+                "predecessor_row_sha256": fitted_row_sha256(predecessor),
+                "first_fitted_row_sha256": fitted_row_sha256(first_fitted),
+                "fitted_subset_rows_sha256": (
+                    "0" * 64
+                    if fitted_subset is None
+                    else str(fitted_subset.get("rows_sha256", ""))
+                ),
             },
         }
-    return _validate_runtime_seed(best, limits)
+    checked = _validate_runtime_seed(best, limits)
+    if fitted_subset is not None:
+        validate_runtime_seed_fitted_subset(checked, fitted_subset)
+    return checked
 
 
 def _sample_batch(
@@ -687,6 +749,9 @@ def finite_runtime_seed() -> dict[str, object]:
             "first_fitted_clip_id": "synthetic",
             "first_fitted_center_frame": 1,
             "speed": 0.0,
+            "predecessor_row_sha256": "0" * 64,
+            "first_fitted_row_sha256": "0" * 64,
+            "fitted_subset_rows_sha256": "0" * 64,
         },
     }
 
@@ -727,6 +792,8 @@ def _validate_runtime_seed(
                 or set(value) != {
                     "predecessor_clip_id", "predecessor_center_frame",
                     "first_fitted_clip_id", "first_fitted_center_frame", "speed",
+                    "predecessor_row_sha256", "first_fitted_row_sha256",
+                    "fitted_subset_rows_sha256",
                 }
                 or any(
                     type(value[name]) is not str or not value[name]
@@ -744,6 +811,15 @@ def _validate_runtime_seed(
                     else type(value["speed"]) not in (int, float)
                 )
                 or not math.isfinite(float(value["speed"]))
+                or any(
+                    type(value[name]) is not str
+                    or len(value[name]) != 64
+                    or any(character not in "0123456789abcdef" for character in value[name])
+                    for name in (
+                        "predecessor_row_sha256", "first_fitted_row_sha256",
+                        "fitted_subset_rows_sha256",
+                    )
+                )
             ):
                 raise ValueError("runtime seed provenance is invalid")
             output[name] = {
@@ -752,6 +828,9 @@ def _validate_runtime_seed(
                 "first_fitted_clip_id": value["first_fitted_clip_id"],
                 "first_fitted_center_frame": value["first_fitted_center_frame"],
                 "speed": float(value["speed"]),
+                "predecessor_row_sha256": value["predecessor_row_sha256"],
+                "first_fitted_row_sha256": value["first_fitted_row_sha256"],
+                "fitted_subset_rows_sha256": value["fitted_subset_rows_sha256"],
             }
         else:
             if (
@@ -825,18 +904,33 @@ def _validated_fitted_subset(value: object) -> dict[str, object] | None:
     for row in rows:
         if (
             type(row) is not dict
-            or set(row) != {"clip_id", "center_frame"}
+            or set(row) != {
+                "clip_id", "center_frame", "split_identity", "terrain_class",
+                "row_sha256",
+            }
             or type(row["clip_id"]) is not str
             or not row["clip_id"]
             or type(row["center_frame"]) is not int
             or row["center_frame"] < 0
+            or type(row["split_identity"]) is not str
+            or not row["split_identity"]
+            or row["terrain_class"] not in counts
+            or type(row["row_sha256"]) is not str
+            or len(row["row_sha256"]) != 64
+            or any(character not in "0123456789abcdef" for character in row["row_sha256"])
         ):
             raise ValueError("checkpoint fitted subset is invalid")
         key = (row["clip_id"], row["center_frame"])
         if key in seen:
             raise ValueError("checkpoint fitted subset is invalid")
         seen.add(key)
-        checked_rows.append({"clip_id": key[0], "center_frame": key[1]})
+        checked_rows.append({
+            "clip_id": key[0],
+            "center_frame": key[1],
+            "split_identity": row["split_identity"],
+            "terrain_class": row["terrain_class"],
+            "row_sha256": row["row_sha256"],
+        })
     encoded = json.dumps(
         checked_rows, sort_keys=True, separators=(",", ":"), allow_nan=False
     ).encode("utf-8")
@@ -851,6 +945,63 @@ def _validated_fitted_subset(value: object) -> dict[str, object] | None:
             "flat", "ascent", "descent", "transition"
         )},
     }
+
+
+def validate_runtime_seed_fitted_subset(
+    runtime_seed: Mapping[str, object], fitted_subset: Mapping[str, object]
+) -> None:
+    """Bind the recurrent seed pair to two adjacent rows in one fitted receipt."""
+
+    checked_subset = _validated_fitted_subset(dict(fitted_subset))
+    if checked_subset is None:
+        raise ValueError("runtime seed fitted subset membership is missing")
+    provenance = runtime_seed.get("provenance")
+    if not isinstance(provenance, Mapping):
+        raise ValueError("runtime seed fitted subset membership is invalid")
+    predecessor_key = (
+        provenance.get("predecessor_clip_id"),
+        provenance.get("predecessor_center_frame"),
+    )
+    first_key = (
+        provenance.get("first_fitted_clip_id"),
+        provenance.get("first_fitted_center_frame"),
+    )
+    if (
+        type(predecessor_key[0]) is not str
+        or type(predecessor_key[1]) is not int
+        or type(first_key[0]) is not str
+        or type(first_key[1]) is not int
+    ):
+        raise ValueError("runtime seed fitted subset membership is invalid")
+    rows = {
+        (row["clip_id"], row["center_frame"]): row
+        for row in checked_subset["rows"]
+    }
+    if predecessor_key not in rows or first_key not in rows:
+        raise ValueError("runtime seed fitted subset membership mismatch")
+    if predecessor_key[0] != first_key[0] or predecessor_key[1] + 1 != first_key[1]:
+        raise ValueError("runtime seed fitted rows are not adjacent")
+    if (
+        provenance.get("predecessor_row_sha256")
+        != rows[predecessor_key]["row_sha256"]
+        or provenance.get("first_fitted_row_sha256")
+        != rows[first_key]["row_sha256"]
+        or provenance.get("fitted_subset_rows_sha256")
+        != checked_subset["rows_sha256"]
+    ):
+        raise ValueError("runtime seed fitted subset row hash mismatch")
+
+
+def validate_resume_fitted_subset(
+    checkpoint: object, fitted_subset: Mapping[str, object] | None
+) -> None:
+    """Reject changed fitted rows before any resume state is restored."""
+
+    current = _validated_fitted_subset(
+        None if fitted_subset is None else dict(fitted_subset)
+    )
+    if getattr(checkpoint, "fitted_subset", None) != current:
+        raise ValueError("resume fitted subset mismatch")
 
 
 def selection_metadata(
@@ -1059,6 +1210,13 @@ def save_checkpoint(
     if not math.isfinite(q99) or q99 < 0.0:
         raise ValueError("phase_advance_q99 must be finite and nonnegative")
     checked_runtime_seed = _validate_runtime_seed(dict(runtime_seed), limits)
+    checked_fitted_subset = _validated_fitted_subset(
+        None if fitted_subset is None else dict(fitted_subset)
+    )
+    if checked_fitted_subset is not None:
+        validate_runtime_seed_fitted_subset(
+            checked_runtime_seed, checked_fitted_subset
+        )
     weights = _loss_weights(loss_weights)
     sampler_state = _validated_sampler_state(
         {"epoch": sampler_epoch, "global_offset": sampler_global_offset}
@@ -1098,9 +1256,7 @@ def save_checkpoint(
             None if selection is None else dict(selection)
         ),
         "sampler_state": sampler_state,
-        "fitted_subset": _validated_fitted_subset(
-            None if fitted_subset is None else dict(fitted_subset)
-        ),
+        "fitted_subset": checked_fitted_subset,
     }
     plain = _plain_cpu(payload)
     if not isinstance(plain, dict) or not _finite_tree(plain):
@@ -1332,6 +1488,8 @@ def load_checkpoint(
     selection = _validated_selection(payload["selection"])
     sampler_state = _validated_sampler_state(payload["sampler_state"])
     fitted_subset = _validated_fitted_subset(payload["fitted_subset"])
+    if fitted_subset is not None:
+        validate_runtime_seed_fitted_subset(runtime_seed, fitted_subset)
     return LoadedCheckpoint(
         schema=payload["schema"],
         step=payload["step"],
@@ -1405,6 +1563,7 @@ __all__ = [
     "RolloutResult",
     "autoregressive_unroll",
     "choose_runtime_seed",
+    "fitted_row_sha256",
     "finite_runtime_seed",
     "load_checkpoint",
     "one_step_metrics",
@@ -1413,4 +1572,6 @@ __all__ = [
     "save_checkpoint",
     "selection_metadata",
     "training_phase_advance_q99",
+    "validate_resume_fitted_subset",
+    "validate_runtime_seed_fitted_subset",
 ]
