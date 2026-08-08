@@ -200,6 +200,19 @@ PHASE_AUDIT_NEGATIVE_TOLERANCE_RAD: float = 9.5367431640625e-7
 assert PHASE_AUDIT_NEGATIVE_TOLERANCE_RAD == 8 * np.finfo(np.float32).eps
 
 
+class PhysicalEnvelopeRisks(dict[str, torch.Tensor]):
+    """Per-pair risks with runtime-failure masks from the same physical path."""
+
+    def __init__(
+        self,
+        values: Mapping[str, torch.Tensor],
+        *,
+        runtime_failures: Mapping[str, torch.Tensor],
+    ) -> None:
+        super().__init__(values)
+        self.runtime_failures = dict(runtime_failures)
+
+
 def physical_envelope_risks(
     normalized_prediction: torch.Tensor,
     reached_output_normalized: torch.Tensor,
@@ -281,7 +294,7 @@ def physical_envelope_risks(
     upper_phase_excess = torch.relu(
         phase_advance - (phase_cap - contract.phase_upper_margin_rad)
     ) / contract.phase_scale_rad
-    return {
+    risks = {
         "joint_step": torch.amax(joint_step_excess.square(), dim=1),
         "joint_limit": torch.amax(
             torch.maximum(lower_limit_excess, upper_limit_excess).square(),
@@ -289,6 +302,25 @@ def physical_envelope_risks(
         ),
         "phase": torch.maximum(lower_phase_excess, upper_phase_excess.square()),
     }
+    return PhysicalEnvelopeRisks(
+        risks,
+        runtime_failures={
+            "joint_step": torch.any(
+                torch.abs(predicted_joints - reached_joints)
+                > (
+                    contract.joint_step_onset_rad
+                    + contract.joint_step_scale_rad
+                ),
+                dim=1,
+            ),
+            "joint_limit": torch.any(
+                (predicted_joints < limits[:, 0])
+                | (predicted_joints > limits[:, 1]),
+                dim=1,
+            ),
+            "phase": (phase_advance < 0.0) | (phase_advance > phase_cap),
+        },
+    )
 
 
 def fitted_target_envelope_audit(
@@ -858,6 +890,7 @@ def _collective_finite_preflight(
     world_size: int,
     message: str,
     error_type: type[Exception],
+    metadata_message: str = "one-step finiteness metadata is invalid",
 ) -> None:
     """Reject rank-local nonfinite tensors through one fixed-size collective."""
 
@@ -924,7 +957,7 @@ def _collective_finite_preflight(
         or not torch.equal(collected[:, 5], expected_ranks)
         or torch.any(collected[:, 6] != actual_world_size)
     ):
-        raise ValueError("one-step finiteness metadata is invalid")
+        raise ValueError(metadata_message)
     if not torch.all(collected[:, 2] == 1):
         raise error_type(message)
 
@@ -1003,6 +1036,9 @@ class RolloutResult:
     predictions: tuple[torch.Tensor, ...]
     inputs: tuple[torch.Tensor, ...]
     phases: tuple[torch.Tensor, ...]
+    envelope_risks: dict[str, torch.Tensor]
+    envelope_reductions: dict[str, GlobalEnvelopeReduction]
+    envelope_counts: dict[str, int]
 
 
 def autoregressive_unroll(
@@ -1011,8 +1047,14 @@ def autoregressive_unroll(
     initial_phase: torch.Tensor,
     targets: torch.Tensor,
     *,
+    initial_predecessor_targets: torch.Tensor,
     normalization: object,
     phase_advance_cap: float,
+    joint_limits: torch.Tensor,
+    envelope_contract: PhysicalEnvelopeObjective,
+    global_batch_ordinals: torch.Tensor,
+    rank: int,
+    world_size: int,
     kinematics: nn.Module | None = None,
     loss_weights: Mapping[str, float] | None = None,
 ) -> RolloutResult:
@@ -1025,8 +1067,26 @@ def autoregressive_unroll(
             ground_truth_inputs.shape[0], ground_truth_inputs.shape[1], OUTPUT_LAYOUT.size
         )
         or initial_phase.shape != (ground_truth_inputs.shape[1],)
+        or initial_predecessor_targets.shape
+        != (ground_truth_inputs.shape[1], OUTPUT_LAYOUT.size)
     ):
-        raise ValueError("rollout expects x[T,B,288], phase[B], and y[T,B,268]")
+        raise ValueError(
+            "rollout expects x[T,B,288], phase[B], y[T,B,268], "
+            "and predecessor_y[B,268]"
+        )
+    _collective_finite_preflight(
+        (
+            ground_truth_inputs,
+            initial_phase,
+            targets,
+            initial_predecessor_targets,
+        ),
+        rank=rank,
+        world_size=world_size,
+        message="rollout physical tensors must be finite on every rank",
+        error_type=ValueError,
+        metadata_message="rollout finiteness metadata is invalid",
+    )
     normal = _normalization_tensors(
         normalization,
         device=ground_truth_inputs.device,
@@ -1103,11 +1163,26 @@ def autoregressive_unroll(
     inputs: list[torch.Tensor] = []
     phases: list[torch.Tensor] = []
     per_step: list[dict[str, torch.Tensor]] = []
+    per_step_envelope_risks: dict[str, list[torch.Tensor]] = {
+        name: [] for name in ("joint_step", "joint_limit", "phase")
+    }
+    per_step_runtime_failures: dict[str, list[torch.Tensor]] = {
+        name: [] for name in per_step_envelope_risks
+    }
+    reached = initial_predecessor_targets
     for step in range(len(ground_truth_inputs)):
         inputs.append(current_input)
         phases.append(recurrent_state.phase)
         prediction = model(current_input, recurrent_state.phase)
         predictions.append(prediction)
+        _collective_finite_preflight(
+            (prediction, reached),
+            rank=rank,
+            world_size=world_size,
+            message="rollout physical tensors must be finite on every rank",
+            error_type=ValueError,
+            metadata_message="rollout finiteness metadata is invalid",
+        )
         per_step.append(
             pfnn_losses(
                 prediction,
@@ -1118,6 +1193,20 @@ def autoregressive_unroll(
                 loss_weights=loss_weights,
             )
         )
+        step_risks = physical_envelope_risks(
+            prediction,
+            reached,
+            normalization=normal,
+            joint_limits=joint_limits,
+            phase_advance_cap=phase_advance_cap,
+            contract=envelope_contract,
+        )
+        for name, risk in step_risks.items():
+            per_step_envelope_risks[name].append(risk)
+            per_step_runtime_failures[name].append(
+                step_risks.runtime_failures[name]
+            )
+        reached = prediction
         if step + 1 < len(ground_truth_inputs):
             physical_output = prediction * normal["y_std"] + normal["y_mean"]
             recurrent_state = advance_recurrent_state(
@@ -1153,11 +1242,119 @@ def autoregressive_unroll(
         name: torch.stack([item[name] for item in per_step]).mean()
         for name in per_step[0]
     }
+    envelope_risks = {
+        name: torch.stack(values)
+        for name, values in per_step_envelope_risks.items()
+    }
+    runtime_failures = {
+        name: torch.stack(values)
+        for name, values in per_step_runtime_failures.items()
+    }
+    ordinal_is_valid = bool(
+        isinstance(global_batch_ordinals, torch.Tensor)
+        and global_batch_ordinals.shape == (batch_size,)
+        and global_batch_ordinals.dtype == torch.int64
+        and global_batch_ordinals.device == ground_truth_inputs.device
+    )
+    if ordinal_is_valid:
+        time_offsets = (
+            torch.arange(
+                len(ground_truth_inputs),
+                dtype=torch.int64,
+                device=ground_truth_inputs.device,
+            )
+            * (batch_size * world_size)
+        )
+        rollout_ordinals = (
+            time_offsets[:, None] + global_batch_ordinals[None, :]
+        ).reshape(-1)
+    else:
+        rollout_ordinals = torch.full(
+            (len(ground_truth_inputs) * batch_size,),
+            -1,
+            dtype=torch.int64,
+            device=ground_truth_inputs.device,
+        )
+    envelope_reductions = {
+        name: global_max_plus_tail(
+            risk.reshape(-1),
+            global_ordinals=rollout_ordinals,
+            tail_fraction=envelope_contract.tail_fraction,
+            rank=rank,
+            world_size=world_size,
+        )
+        for name, risk in envelope_risks.items()
+    }
+    envelope_losses: dict[str, torch.Tensor] = {}
+    for name, reduction in envelope_reductions.items():
+        envelope_losses[f"{name}_maximum"] = reduction.maximum
+        envelope_losses[f"{name}_cvar"] = reduction.cvar
+        envelope_losses[f"{name}_positive_tail_mean"] = (
+            reduction.positive_tail_mean
+        )
+        envelope_losses[f"{name}_envelope"] = reduction.loss
+    envelope_losses["physical_envelope_total"] = sum(
+        envelope_losses[f"{name}_envelope"] for name in envelope_risks
+    )
+    _collective_finite_preflight(
+        tuple(envelope_losses.values()),
+        rank=rank,
+        world_size=world_size,
+        message="rollout physical losses must be finite on every rank",
+        error_type=FloatingPointError,
+        metadata_message="rollout finiteness metadata is invalid",
+    )
+    losses.update(envelope_losses)
+    losses["total"] = losses["total"] + envelope_losses[
+        "physical_envelope_total"
+    ]
+    _collective_finite_preflight(
+        (losses["total"],),
+        rank=rank,
+        world_size=world_size,
+        message="rollout total must be finite on every rank",
+        error_type=FloatingPointError,
+        metadata_message="rollout finiteness metadata is invalid",
+    )
+    count_names = tuple(envelope_risks)
+    count_values = torch.tensor(
+        (
+            len(ground_truth_inputs) * batch_size,
+            *(
+                int(torch.count_nonzero(envelope_risks[name] > 0.0))
+                for name in count_names
+            ),
+            *(
+                int(torch.count_nonzero(runtime_failures[name]))
+                for name in count_names
+            ),
+        ),
+        dtype=torch.int64,
+        device=ground_truth_inputs.device,
+    )
+    import torch.distributed as dist
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(count_values, op=dist.ReduceOp.SUM)
+    global_counts = [int(value) for value in count_values.cpu().tolist()]
+    envelope_counts: dict[str, int] = {
+        "pair_time_count": global_counts[0]
+    }
+    for offset, name in enumerate(count_names, start=1):
+        envelope_counts[f"{name}_objective_active_pair_time_count"] = (
+            global_counts[offset]
+        )
+        envelope_counts[f"{name}_runtime_failure_pair_time_count"] = (
+            global_counts[offset + len(count_names)]
+        )
     return RolloutResult(
         losses=losses,
         predictions=tuple(predictions),
         inputs=tuple(inputs),
         phases=tuple(phases),
+        envelope_risks=envelope_risks,
+        envelope_reductions=envelope_reductions,
+        envelope_counts=envelope_counts,
     )
 
 

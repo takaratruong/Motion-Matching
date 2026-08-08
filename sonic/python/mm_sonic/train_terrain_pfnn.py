@@ -574,6 +574,12 @@ class FittedTransitionPair:
     terrain_class: str
 
 
+@dataclass(frozen=True)
+class RolloutSequence:
+    indices: tuple[int, ...]
+    predecessor_index: int
+
+
 def _transition_pair_sort_key(
     pair: FittedTransitionPair,
 ) -> tuple[str, str, int, int, str, str]:
@@ -1189,7 +1195,7 @@ def _terrain_classes(dataset: object) -> list[str]:
 
 def _consecutive_starts(
     dataset: PFNNShardDataset, frames: int
-) -> tuple[list[tuple[int, ...]], list[str]]:
+) -> tuple[list[RolloutSequence], list[str]]:
     if frames < 2:
         raise ValueError("rollout fine-tuning requires at least two frames")
     if getattr(dataset, "split", None) != "train":
@@ -1226,7 +1232,7 @@ def _consecutive_starts(
         if center in lane_rows:
             raise ValueError("duplicate rollout sequence clip/lane/center")
         lane_rows[center] = (index, str(terrain_class))
-    sequences: list[tuple[int, ...]] = []
+    sequences: list[RolloutSequence] = []
     classes: list[str] = []
     for key in sorted(grouped):
         lane_rows = grouped[key]
@@ -1237,12 +1243,79 @@ def _consecutive_starts(
                 right != left + 1 for left, right in zip(window, window[1:])
             ):
                 continue
+            predecessor_center = window[0] - 1
+            if predecessor_center not in lane_rows:
+                continue
             indices = tuple(lane_rows[center][0] for center in window)
-            sequences.append(indices)
+            sequences.append(
+                RolloutSequence(
+                    indices=indices,
+                    predecessor_index=lane_rows[predecessor_center][0],
+                )
+            )
             classes.append(lane_rows[window[0]][1])
     if not sequences:
         raise ValueError("training split has no consecutive rollout sequences")
     return sequences, classes
+
+
+def _rollout_batch(
+    dataset: object,
+    sequences: Sequence[RolloutSequence],
+    *,
+    frames: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Batch current rollout rows and each first row's sealed predecessor."""
+
+    records = tuple(sequences)
+    if (
+        type(frames) is not int
+        or frames < 2
+        or not records
+        or any(
+            not isinstance(sequence, RolloutSequence)
+            or len(sequence.indices) != frames
+            for sequence in records
+        )
+    ):
+        raise ValueError("rollout batch sequences are invalid")
+    rows = [
+        [dataset[index] for index in sequence.indices]
+        for sequence in records
+    ]
+    return (
+        torch.as_tensor(
+            np.stack(
+                [
+                    [row[frame]["x"] for row in rows]
+                    for frame in range(frames)
+                ]
+            ),
+            device=device,
+        ),
+        torch.as_tensor(
+            np.asarray([row[0]["phase"] for row in rows]), device=device
+        ),
+        torch.as_tensor(
+            np.stack(
+                [
+                    [row[frame]["y"] for row in rows]
+                    for frame in range(frames)
+                ]
+            ),
+            device=device,
+        ),
+        torch.as_tensor(
+            np.stack(
+                [
+                    dataset[sequence.predecessor_index]["y"]
+                    for sequence in records
+                ]
+            ),
+            device=device,
+        ),
+    )
 
 
 def _append_metric(stream: object, record: dict[str, object]) -> None:
@@ -1395,7 +1468,7 @@ def train(
     )
 
     rollout_dataset: object | None = None
-    sequences: list[tuple[int, ...]] | None = None
+    sequences: list[RolloutSequence] | None = None
     sequence_sampler: DeterministicSequenceSampler | None = None
     if arguments.rollout_finetune_frames:
         rollout_dataset = optimization_dataset if pipeline_overfit else train_dataset
@@ -1409,9 +1482,11 @@ def train(
         )
         sixteen_frame_sequences, _ = _consecutive_starts(rollout_dataset, 16)
 
-        def sequence_key(sequence: tuple[int, ...]) -> tuple[object, object, object]:
+        def sequence_key(
+            sequence: RolloutSequence,
+        ) -> tuple[object, object, object]:
             assert rollout_dataset is not None
-            first = rollout_dataset[sequence[0]]
+            first = rollout_dataset[sequence.indices[0]]
             return (
                 first["clip_id"],
                 first["sequence_lane"],
@@ -1712,20 +1787,12 @@ def train(
         rollout_steps = max(requested_rollout_steps, first_pass_steps)
         for _ in range(rollout_steps):
             chosen = sequence_sampler.next_batch()
-            rows = [
-                [rollout_dataset[index] for index in sequences[item]]
-                for item in chosen
-            ]
-            inputs = torch.as_tensor(
-                np.stack([[row[frame]["x"] for row in rows] for frame in range(arguments.rollout_finetune_frames)]),
+            sequence_records = [sequences[item] for item in chosen]
+            inputs, phases, targets, predecessor_targets = _rollout_batch(
+                rollout_dataset,
+                sequence_records,
+                frames=arguments.rollout_finetune_frames,
                 device=device,
-            )
-            targets = torch.as_tensor(
-                np.stack([[row[frame]["y"] for row in rows] for frame in range(arguments.rollout_finetune_frames)]),
-                device=device,
-            )
-            phases = torch.as_tensor(
-                np.asarray([row[0]["phase"] for row in rows]), device=device
             )
             optimizer.zero_grad(set_to_none=True)
             rollout = autoregressive_unroll(
@@ -1733,8 +1800,20 @@ def train(
                 inputs,
                 phases,
                 targets,
+                initial_predecessor_targets=predecessor_targets,
                 normalization=train_dataset,
                 phase_advance_cap=phase_advance_cap,
+                joint_limits=kinematics.joint_limits,
+                envelope_contract=DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+                global_batch_ordinals=(
+                    torch.arange(
+                        len(chosen), device=device, dtype=torch.int64
+                    )
+                    * world_size
+                    + rank
+                ),
+                rank=rank,
+                world_size=world_size,
                 kinematics=kinematics,
                 loss_weights=DEFAULT_LOSS_WEIGHTS,
             )
@@ -1753,7 +1832,11 @@ def train(
             rollout_values = torch.stack(
                 [
                     rollout.losses[name].detach()
-                    for name in (*LOSS_WEIGHT_KEYS, "total")
+                    for name in (
+                        *LOSS_WEIGHT_KEYS,
+                        *_ENVELOPE_LOSS_METRIC_KEYS,
+                        "total",
+                    )
                 ]
             ).to(torch.float64)
             if world_size > 1:
@@ -1761,6 +1844,50 @@ def train(
                 rollout_values /= world_size
             if rank == 0:
                 assert metric_stream is not None
+                reported_rollout_loss_keys = (
+                    *LOSS_WEIGHT_KEYS,
+                    *_ENVELOPE_LOSS_METRIC_KEYS,
+                    "total",
+                )
+                scalar_losses = {
+                    name: float(rollout_values[index])
+                    for index, name in enumerate(reported_rollout_loss_keys)
+                }
+                envelope_metrics: dict[str, object] = dict(
+                    rollout.envelope_counts
+                )
+                if envelope_metrics["pair_time_count"] != (
+                    arguments.rollout_finetune_frames
+                    * len(chosen)
+                    * world_size
+                ):
+                    raise RuntimeError(
+                        "rollout envelope pair-time count is inconsistent"
+                    )
+                for family in _ENVELOPE_FAMILIES:
+                    reduction = rollout.envelope_reductions[family]
+                    envelope_metrics.update(
+                        {
+                            f"{family}_maximum_risk": scalar_losses[
+                                f"{family}_maximum"
+                            ],
+                            f"{family}_cvar": scalar_losses[
+                                f"{family}_cvar"
+                            ],
+                            f"{family}_tail_pair_time_count": (
+                                reduction.tail_count
+                            ),
+                            f"{family}_active_pair_time_count": (
+                                reduction.active_count
+                            ),
+                            f"{family}_positive_tail_mean": scalar_losses[
+                                f"{family}_positive_tail_mean"
+                            ],
+                            f"{family}_family_loss": scalar_losses[
+                                f"{family}_envelope"
+                            ],
+                        }
+                    )
                 _append_metric(
                     metric_stream,
                     {
@@ -1768,16 +1895,13 @@ def train(
                         "stage": "rollout_finetune",
                         "step": step,
                         "epoch": epoch,
-                        "losses": {
-                            name: float(rollout_values[index])
-                            for index, name in enumerate(
-                                (*LOSS_WEIGHT_KEYS, "total")
-                            )
-                        },
+                        "losses": scalar_losses,
+                        "envelope_metrics": envelope_metrics,
                         "learning_rate": optimizer.param_groups[0]["lr"],
                         "gradient_norm": float(gradient_norm),
                         "samples": arguments.batch_size
-                        * arguments.rollout_finetune_frames,
+                        * arguments.rollout_finetune_frames
+                        * world_size,
                         "wall_time_seconds": time.monotonic() - started,
                     },
                 )
@@ -2051,6 +2175,7 @@ if __name__ == "__main__":
 
 __all__ = [
     "FittedTransitionPair",
+    "RolloutSequence",
     "build_pipeline_promotion_receipt",
     "canonical_transition_pairs",
     "fitted_transition_pair_receipt",

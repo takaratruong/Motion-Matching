@@ -274,6 +274,53 @@ class _SingleParameterEnvelopeModel(torch.nn.Module):
         return joint[:, None] * self.joint_mask[None, :] + graph_zero
 
 
+class _ScriptedRolloutModel(torch.nn.Module):
+    """Emit a fixed differentiable output table for rollout-envelope tests."""
+
+    def __init__(self, joint_positions: torch.Tensor) -> None:
+        super().__init__()
+        if joint_positions.ndim not in (2, 3):
+            raise ValueError("scripted joints must have shape [T,B] or [T,B,J]")
+        joint_count = (
+            1 if joint_positions.ndim == 2 else int(joint_positions.shape[2])
+        )
+        if joint_count < 1 or joint_count > len(ISAACLAB_JOINT_NAMES):
+            raise ValueError("scripted joint count is invalid")
+        dtype = joint_positions.dtype
+        for name in ("W0", "b0", "W1", "b1", "W2", "b2"):
+            setattr(
+                self,
+                name,
+                torch.nn.Parameter(torch.zeros((), dtype=dtype)),
+            )
+        outputs = torch.zeros(
+            (*joint_positions.shape[:2], OUTPUT_LAYOUT.size), dtype=dtype
+        )
+        outputs[..., OUTPUT_LAYOUT["trajectory_direction"]] = torch.tensor(
+            (1.0, 0.0), dtype=dtype
+        ).repeat(12)
+        outputs[..., OUTPUT_LAYOUT["root_height"]] = 0.8
+        outputs[..., OUTPUT_LAYOUT["phase_advance"]] = 0.1
+        joints = outputs[..., OUTPUT_LAYOUT["joint_position"]]
+        if joint_positions.ndim == 2:
+            joints[..., 0] = joint_positions
+        else:
+            joints[..., :joint_count] = joint_positions
+        self.register_buffer("scripted_outputs", outputs)
+        self._step = 0
+
+    def forward(self, x: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
+        del phase
+        if self._step >= len(self.scripted_outputs):
+            raise RuntimeError("scripted rollout model exhausted")
+        output = self.scripted_outputs[self._step].to(device=x.device)
+        self._step += 1
+        graph_zero = 0.0 * (
+            self.W0 + self.b0 + self.W1 + self.b1 + self.W2 + self.b2
+        )
+        return output + graph_zero
+
+
 class _TrainerPairRows:
     """Five independent train-only pairs; the first four form the canary."""
 
@@ -474,6 +521,116 @@ def _one_step_envelope_ddp_worker(
                 if model is None or model.module.weight.grad is None
                 else bool(torch.isfinite(model.module.weight.grad))
             ),
+        }
+    finally:
+        dist.destroy_process_group()
+    queue.put(payload)
+
+
+def _rollout_envelope_ddp_worker(
+    rank: int,
+    world_size: int,
+    init_method: str,
+    case: str,
+    queue: object,
+) -> None:
+    """Exercise coordinated rollout finiteness and time-major ordinals."""
+
+    import torch.distributed as dist
+
+    dist.init_process_group(
+        "gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=5),
+    )
+    original_all_gather = dist.all_gather
+    original_risks = training_module.physical_envelope_risks
+    all_gather_count = 0
+    risk_call_count = 0
+
+    def tracked_all_gather(*args: object, **kwargs: object) -> object:
+        nonlocal all_gather_count
+        all_gather_count += 1
+        return original_all_gather(*args, **kwargs)
+
+    def tracked_risks(*args: object, **kwargs: object) -> object:
+        nonlocal risk_call_count
+        risk_call_count += 1
+        return original_risks(*args, **kwargs)
+
+    payload: dict[str, object]
+    try:
+        joints = torch.full(
+            (2, 1),
+            0.30 if rank == 0 else 0.0,
+            dtype=torch.float64,
+        )
+        model = _ScriptedRolloutModel(joints)
+        if case == "prediction_nonfinite" and rank == 1:
+            model.scripted_outputs[1, 0, 0] = float("inf")
+        inputs = torch.zeros(
+            (2, 1, INPUT_LAYOUT.size), dtype=torch.float64
+        )
+        inputs[..., INPUT_LAYOUT["trajectory_direction"]] = torch.tensor(
+            (1.0, 0.0), dtype=torch.float64
+        ).repeat(12)
+        inputs[..., INPUT_LAYOUT["semantic_intent"]] = torch.tensor(
+            (1.0, 0.0), dtype=torch.float64
+        ).repeat(12)
+        ordinal = rank
+        if case == "ordinal_gap" and rank == 1:
+            ordinal = 3
+        with patch.object(
+            dist, "all_gather", side_effect=tracked_all_gather
+        ), patch.object(
+            training_module,
+            "physical_envelope_risks",
+            side_effect=tracked_risks,
+        ):
+            rollout = training_module.autoregressive_unroll(
+                model,
+                inputs,
+                torch.zeros(1, dtype=torch.float64),
+                torch.zeros(
+                    (2, 1, OUTPUT_LAYOUT.size), dtype=torch.float64
+                ),
+                initial_predecessor_targets=torch.zeros(
+                    (1, OUTPUT_LAYOUT.size), dtype=torch.float64
+                ),
+                normalization=_normalization(),
+                phase_advance_cap=0.50,
+                joint_limits=torch.tensor(
+                    [[-1.0, 1.0]] * 29, dtype=torch.float64
+                ),
+                envelope_contract=(
+                    training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE
+                ),
+                global_batch_ordinals=torch.tensor(
+                    (ordinal,), dtype=torch.int64
+                ),
+                rank=rank,
+                world_size=world_size,
+            )
+        payload = {
+            "rank": rank,
+            "error": None,
+            "loss": float(
+                rollout.losses["joint_step_envelope"].detach()
+            ),
+            "active_count": rollout.envelope_reductions[
+                "joint_step"
+            ].active_count,
+            "all_gather_count": all_gather_count,
+            "risk_call_count": risk_call_count,
+        }
+    except Exception as error:  # returned for bounded parent assertions
+        payload = {
+            "rank": rank,
+            "error": (type(error).__name__, str(error)),
+            "all_gather_count": all_gather_count,
+            "risk_call_count": risk_call_count,
         }
     finally:
         dist.destroy_process_group()
@@ -692,6 +849,23 @@ def _spawn_one_step_envelope_workers(
     return sorted(results, key=lambda item: int(item["rank"]))
 
 
+def _spawn_rollout_envelope_workers(
+    case: str,
+) -> list[dict[str, object]]:
+    context = torch.multiprocessing.get_context("spawn")
+    queue = context.SimpleQueue()
+    with tempfile.TemporaryDirectory() as temporary:
+        init_method = (Path(temporary) / "rollout-gloo-init").as_uri()
+        torch.multiprocessing.spawn(
+            _rollout_envelope_ddp_worker,
+            args=(2, init_method, case, queue),
+            nprocs=2,
+            join=True,
+        )
+        results = [queue.get() for _ in range(2)]
+    return sorted(results, key=lambda item: int(item["rank"]))
+
+
 def _single_rank_global_envelope_reference(
     case: str,
 ) -> tuple[training_module.GlobalEnvelopeReduction, dict[str, float]]:
@@ -727,6 +901,47 @@ def _single_rank_global_envelope_reference(
 
 
 class TerrainPFNNTrainingTests(unittest.TestCase):
+    def _scripted_rollout_inputs(
+        self, *, time_steps: int, batch_size: int, dtype: torch.dtype
+    ) -> torch.Tensor:
+        inputs = torch.zeros(
+            (time_steps, batch_size, INPUT_LAYOUT.size), dtype=dtype
+        )
+        inputs[..., INPUT_LAYOUT["trajectory_direction"]] = torch.tensor(
+            (1.0, 0.0), dtype=dtype
+        ).repeat(12)
+        inputs[..., INPUT_LAYOUT["semantic_intent"]] = torch.tensor(
+            (1.0, 0.0), dtype=dtype
+        ).repeat(12)
+        return inputs
+
+    def _unsafe_three_step_rollout(self) -> training_module.RolloutResult:
+        dtype = torch.float64
+        joints = torch.tensor(((0.10,), (0.40,), (0.40,)), dtype=dtype)
+        model = _ScriptedRolloutModel(joints)
+        return autoregressive_unroll(
+            model,
+            self._scripted_rollout_inputs(
+                time_steps=3, batch_size=1, dtype=dtype
+            ),
+            torch.zeros(1, dtype=dtype),
+            torch.zeros((3, 1, OUTPUT_LAYOUT.size), dtype=dtype),
+            initial_predecessor_targets=torch.zeros(
+                (1, OUTPUT_LAYOUT.size), dtype=dtype
+            ),
+            normalization=_normalization(),
+            phase_advance_cap=0.50,
+            joint_limits=torch.tensor(
+                [[-1.0, 1.0]] * len(ISAACLAB_JOINT_NAMES), dtype=dtype
+            ),
+            envelope_contract=(
+                training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE
+            ),
+            global_batch_ordinals=torch.arange(1, dtype=torch.int64),
+            rank=0,
+            world_size=1,
+        )
+
     def _fitted_envelope(
         self,
         output: np.ndarray,
@@ -1379,6 +1594,54 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             self.assertTrue(result["backward_called"])
             self.assertEqual(result["optimizer_step_count"], 0)
             self.assertFalse(result["gradient_finite"])
+
+    def test_two_rank_rollout_prediction_finiteness_rejects_collectively(
+        self,
+    ) -> None:
+        results = _spawn_rollout_envelope_workers("prediction_nonfinite")
+        self.assertEqual(
+            [result.get("error") for result in results],
+            [
+                (
+                    "ValueError",
+                    "rollout physical tensors must be finite on every rank",
+                )
+            ]
+            * 2,
+        )
+        for result in results:
+            self.assertEqual(result["all_gather_count"], 3)
+            self.assertEqual(result["risk_call_count"], 1)
+
+    def test_two_rank_rollout_time_major_ordinals_reject_gaps_collectively(
+        self,
+    ) -> None:
+        results = _spawn_rollout_envelope_workers("ordinal_gap")
+        self.assertEqual(
+            [result.get("error") for result in results],
+            [
+                (
+                    "ValueError",
+                    "global envelope ordinals must be exactly 0..N-1",
+                )
+            ]
+            * 2,
+        )
+        for result in results:
+            self.assertEqual(result["all_gather_count"], 6)
+            self.assertEqual(result["risk_call_count"], 2)
+
+    def test_two_rank_rollout_envelope_matches_global_pair_time_reduction(
+        self,
+    ) -> None:
+        results = _spawn_rollout_envelope_workers("finite")
+        self.assertTrue(
+            all(result.get("error") is None for result in results), results
+        )
+        for result in results:
+            self.assertAlmostEqual(float(result["loss"]), 18.0, places=12)
+            self.assertEqual(result["active_count"], 1)
+            self.assertEqual(result["risk_call_count"], 2)
 
     def test_one_step_trainer_uses_mode_local_pairs_metrics_and_no_isolated_rows(
         self,
@@ -2335,8 +2598,20 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             normalized_inputs,
             initial_phase,
             targets,
+            initial_predecessor_targets=torch.zeros(
+                (1, OUTPUT_LAYOUT.size), dtype=dtype
+            ),
             normalization=normal,
             phase_advance_cap=phase_cap,
+            joint_limits=torch.tensor(
+                [[-2.0, 2.0]] * len(ISAACLAB_JOINT_NAMES), dtype=dtype
+            ),
+            envelope_contract=(
+                training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE
+            ),
+            global_batch_ordinals=torch.arange(1, dtype=torch.int64),
+            rank=0,
+            world_size=1,
         )
 
         first_raw = normalized_inputs[0].clone()
@@ -2450,6 +2725,124 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
         self.assertIsNotNone(first_prediction.grad)
         self.assertTrue(torch.isfinite(first_prediction.grad).all())
         self.assertGreater(float(first_prediction.grad.abs().sum()), 0.0)
+
+    def test_rollout_envelope_uses_seed_predecessor_then_prior_prediction(
+        self,
+    ) -> None:
+        rollout = self._unsafe_three_step_rollout()
+        joint = OUTPUT_LAYOUT["joint_position"].start
+        predecessor_joint = torch.tensor(0.0, dtype=torch.float64)
+        expected_step0 = (
+            torch.relu(
+                torch.abs(rollout.predictions[0][0, joint] - predecessor_joint)
+                - 0.225
+            )
+            / 0.025
+        ).square()
+        expected_step1 = (
+            torch.relu(
+                torch.abs(
+                    rollout.predictions[1][0, joint]
+                    - rollout.predictions[0][0, joint]
+                )
+                - 0.225
+            )
+            / 0.025
+        ).square()
+        torch.testing.assert_close(
+            rollout.envelope_risks["joint_step"][0, 0], expected_step0
+        )
+        torch.testing.assert_close(
+            rollout.envelope_risks["joint_step"][1, 0], expected_step1
+        )
+        torch.testing.assert_close(
+            rollout.envelope_risks["joint_step"][2, 0],
+            torch.tensor(0.0, dtype=torch.float64),
+        )
+
+    def test_late_rollout_envelope_gradient_reaches_prior_prediction(self) -> None:
+        rollout = self._unsafe_three_step_rollout()
+        gradient = torch.autograd.grad(
+            rollout.losses["joint_step_envelope"],
+            rollout.predictions[0],
+            retain_graph=True,
+        )[0]
+        self.assertTrue(torch.isfinite(gradient).all())
+        self.assertGreater(float(gradient.abs().sum()), 0.0)
+
+    def test_rollout_envelope_safe_append_preserves_pair_time_loss_and_gradient(
+        self,
+    ) -> None:
+        for time_steps, batch_size in ((2, 1), (5, 2), (11, 3)):
+            with self.subTest(time_steps=time_steps, batch_size=batch_size):
+                dtype = torch.float64
+                joint_positions = torch.zeros(
+                    (time_steps, batch_size, 2), dtype=dtype
+                )
+                joint_positions[:, 0, :] = 0.30
+                rollout = autoregressive_unroll(
+                    _ScriptedRolloutModel(joint_positions),
+                    self._scripted_rollout_inputs(
+                        time_steps=time_steps,
+                        batch_size=batch_size,
+                        dtype=dtype,
+                    ),
+                    torch.zeros(batch_size, dtype=dtype),
+                    torch.zeros(
+                        (time_steps, batch_size, OUTPUT_LAYOUT.size),
+                        dtype=dtype,
+                    ),
+                    initial_predecessor_targets=torch.zeros(
+                        (batch_size, OUTPUT_LAYOUT.size), dtype=dtype
+                    ),
+                    normalization=_normalization(),
+                    phase_advance_cap=0.50,
+                    joint_limits=torch.tensor(
+                        [[-1.0, 1.0]] * len(ISAACLAB_JOINT_NAMES),
+                        dtype=dtype,
+                    ),
+                    envelope_contract=(
+                        training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE
+                    ),
+                    global_batch_ordinals=torch.arange(
+                        batch_size, dtype=torch.int64
+                    ),
+                    rank=0,
+                    world_size=1,
+                )
+                risks = rollout.envelope_risks["joint_step"]
+                self.assertEqual(risks.shape, (time_steps, batch_size))
+                self.assertEqual(int(torch.count_nonzero(risks)), 1)
+                self.assertEqual(
+                    rollout.envelope_reductions["joint_step"].active_count, 1
+                )
+                self.assertEqual(
+                    rollout.envelope_counts["pair_time_count"],
+                    time_steps * batch_size,
+                )
+                self.assertEqual(
+                    rollout.envelope_counts[
+                        "joint_step_objective_active_pair_time_count"
+                    ],
+                    1,
+                )
+                self.assertEqual(
+                    rollout.envelope_counts[
+                        "joint_step_runtime_failure_pair_time_count"
+                    ],
+                    1,
+                )
+                torch.testing.assert_close(
+                    rollout.losses["joint_step_envelope"],
+                    torch.tensor(18.0, dtype=dtype),
+                )
+                gradient = torch.autograd.grad(
+                    rollout.losses["joint_step_envelope"],
+                    rollout.predictions[0],
+                )[0]
+                torch.testing.assert_close(
+                    gradient.abs().sum(), torch.tensor(480.0, dtype=dtype)
+                )
 
     def test_overfit_subset_is_consecutive_source_sealed_and_mixed_terrain(self) -> None:
         class Rows:
@@ -2855,9 +3248,9 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             sequence_index
             for sequence_index, sequence in enumerate(sequences)
             if (
-                rows[sequence[0]]["clip_id"],
-                rows[sequence[0]]["sequence_lane"],
-                rows[sequence[0]]["center_frame"],
+                rows[sequence.indices[0]]["clip_id"],
+                rows[sequence.indices[0]]["sequence_lane"],
+                rows[sequence.indices[0]]["center_frame"],
             ) == chosen_key
         )
         sampler = train_module.DeterministicSequenceSampler(
@@ -4068,8 +4461,20 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             inputs,
             initial_phase,
             targets,
+            initial_predecessor_targets=torch.zeros(
+                (1, OUTPUT_LAYOUT.size)
+            ),
             normalization=_normalization(),
             phase_advance_cap=0.2,
+            joint_limits=torch.tensor(
+                [[-2.0, 2.0]] * len(ISAACLAB_JOINT_NAMES)
+            ),
+            envelope_contract=(
+                training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE
+            ),
+            global_batch_ordinals=torch.arange(1, dtype=torch.int64),
+            rank=0,
+            world_size=1,
         )
         self.assertLess(
             float(
@@ -4092,11 +4497,14 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             {"clip_id": "walk1_subject1", "center_frame": 2, "sequence_lane": "motion", "terrain_class": "flat"},
             {"clip_id": "walk4_subject1", "center_frame": 10, "sequence_lane": "motion", "terrain_class": "flat"},
             {"clip_id": "walk1_subject1", "center_frame": 1, "sequence_lane": "motion", "terrain_class": "flat"},
-            {"clip_id": "walk1_subject1", "center_frame": 4, "sequence_lane": "motion", "terrain_class": "flat"},
-            {"clip_id": "walk1_subject1", "center_frame": 5, "sequence_lane": "motion", "terrain_class": "flat"},
+            {"clip_id": "walk1_subject1", "center_frame": 4, "sequence_lane": "idle_phase_0", "terrain_class": "flat"},
+            {"clip_id": "walk1_subject1", "center_frame": 5, "sequence_lane": "idle_phase_0", "terrain_class": "flat"},
+            {"clip_id": "walk1_subject1", "center_frame": 0, "sequence_lane": "motion", "terrain_class": "flat"},
+            {"clip_id": "walk1_subject1", "center_frame": 3, "sequence_lane": "idle_phase_0", "terrain_class": "flat"},
+            {"clip_id": "walk4_subject1", "center_frame": 9, "sequence_lane": "motion", "terrain_class": "flat"},
         ]
         rows.extend(
-            {"clip_id": "walk1_subject1", "center_frame": 3, "sequence_lane": "motion", "terrain_class": "flat"}
+            {"clip_id": "walk1_subject1", "center_frame": 3, "sequence_lane": "idle_phase_0", "terrain_class": "flat"}
             for _ in range(8)
         )
 
@@ -4120,31 +4528,143 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             return [
                 tuple(
                     (values[index]["clip_id"], values[index]["center_frame"])
-                    for index in sequence
+                    for index in sequence.indices
                 )
                 for sequence in sequences
             ]
 
         expected = [
-            (("walk1_subject1", 1), ("walk1_subject1", 2)),
             (("walk1_subject1", 4), ("walk1_subject1", 5)),
+            (("walk1_subject1", 1), ("walk1_subject1", 2)),
             (("walk4_subject1", 10), ("walk4_subject1", 11)),
         ]
-        clean_rows = rows[:6]
+        clean_rows = rows[:9]
         self.assertEqual(metadata_sequences(clean_rows), expected)
-        shuffled = [clean_rows[index] for index in (0, 5, 3, 2, 1, 4)]
+        shuffled = [
+            clean_rows[index]
+            for index in (0, 5, 7, 3, 8, 1, 6, 2, 4)
+        ]
         self.assertEqual(metadata_sequences(shuffled), expected)
         with self.assertRaisesRegex(ValueError, "duplicate.*lane"):
             metadata_sequences(rows)
 
-        mismatched = [dict(clean_rows[3]), dict(clean_rows[1])]
-        mismatched[1]["split_identity"] = "different"
+        mismatched = [
+            dict(clean_rows[6]),
+            dict(clean_rows[3]),
+            dict(clean_rows[1]),
+        ]
+        mismatched[2]["split_identity"] = "different"
         with self.assertRaisesRegex(ValueError, "split/identity"):
             train_module._consecutive_starts(Rows(mismatched), 2)
-        validation = Rows([clean_rows[3], clean_rows[1]])
+        validation = Rows([clean_rows[6], clean_rows[3], clean_rows[1]])
         validation.split = "validation"
         with self.assertRaisesRegex(ValueError, "training split"):
             train_module._consecutive_starts(validation, 2)
+
+    def test_rollout_sequence_discovery_requires_same_lane_predecessor(
+        self,
+    ) -> None:
+        values: list[dict[str, object]] = []
+        for clip, lane, centers in (
+            ("walk1_subject1", "motion", range(0, 17)),
+            ("walk4_subject1", "idle_phase_0", range(20, 37)),
+            (
+                "walk1_subject1",
+                "idle_phase_1",
+                (*range(40, 48), *range(49, 57)),
+            ),
+            ("walk4_subject1", "idle_phase_2", range(60, 76)),
+            ("walk4_subject1", "idle_phase_3", (59,)),
+        ):
+            for center in centers:
+                values.append(
+                    {
+                        "clip_id": clip,
+                        "center_frame": center,
+                        "sequence_lane": lane,
+                        "terrain_class": "flat",
+                        "split": "train",
+                        "split_identity": clip,
+                    }
+                )
+
+        class Rows:
+            split = "train"
+
+            def __len__(self) -> int:
+                return len(values)
+
+            def __getitem__(self, index: int) -> dict[str, object]:
+                return values[index]
+
+        sequences, _ = train_module._consecutive_starts(Rows(), 16)
+        self.assertEqual(len(sequences), 2)
+        discovered: set[tuple[str, str, int, tuple[int, ...]]] = set()
+        for sequence in sequences:
+            predecessor = values[sequence.predecessor_index]
+            current = [values[index] for index in sequence.indices]
+            self.assertEqual(predecessor["clip_id"], current[0]["clip_id"])
+            self.assertEqual(
+                predecessor["sequence_lane"], current[0]["sequence_lane"]
+            )
+            self.assertEqual(
+                int(predecessor["center_frame"]) + 1,
+                current[0]["center_frame"],
+            )
+            discovered.add(
+                (
+                    str(current[0]["clip_id"]),
+                    str(current[0]["sequence_lane"]),
+                    int(predecessor["center_frame"]),
+                    tuple(int(row["center_frame"]) for row in current),
+                )
+            )
+        self.assertEqual(
+            discovered,
+            {
+                (
+                    "walk1_subject1",
+                    "motion",
+                    0,
+                    tuple(range(1, 17)),
+                ),
+                (
+                    "walk4_subject1",
+                    "idle_phase_0",
+                    20,
+                    tuple(range(21, 37)),
+                ),
+            },
+        )
+
+    def test_rollout_batch_carries_exact_discovered_predecessor_target(
+        self,
+    ) -> None:
+        rows: list[dict[str, object]] = []
+        for center in range(3):
+            x = np.zeros(INPUT_LAYOUT.size, np.float32)
+            x[0] = np.float32(center)
+            y = np.zeros(OUTPUT_LAYOUT.size, np.float32)
+            y[0] = np.float32(center + 0.25)
+            rows.append({"x": x, "y": y, "phase": np.float32(center / 10)})
+
+        class Rows:
+            def __getitem__(self, index: int) -> dict[str, object]:
+                return rows[index]
+
+        sequence = train_module.RolloutSequence(
+            indices=(1, 2), predecessor_index=0
+        )
+        inputs, phases, targets, predecessors = train_module._rollout_batch(
+            Rows(), (sequence,), frames=2, device=torch.device("cpu")
+        )
+        self.assertEqual(inputs.shape, (2, 1, INPUT_LAYOUT.size))
+        self.assertEqual(phases.shape, (1,))
+        self.assertEqual(targets.shape, (2, 1, OUTPUT_LAYOUT.size))
+        self.assertEqual(predecessors.shape, (1, OUTPUT_LAYOUT.size))
+        self.assertEqual(float(inputs[0, 0, 0]), 1.0)
+        self.assertEqual(float(targets[0, 0, 0]), 1.25)
+        self.assertEqual(float(predecessors[0, 0]), 0.25)
 
     def test_rollout_sequences_are_exactly_lane_safe_and_reject_duplicates(self) -> None:
         lanes = ("motion", *(f"idle_phase_{index}" for index in range(8)))
@@ -4154,8 +4674,12 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             ("walk4_subject1", 12),
         ):
             for lane in lanes:
-                for center in range(first_center, first_center + 3):
-                    if clip == "walk4_subject1" and lane == "idle_phase_7" and center == 13:
+                for center in range(first_center, first_center + 4):
+                    if (
+                        clip == "walk4_subject1"
+                        and lane == "idle_phase_7"
+                        and center == first_center + 2
+                    ):
                         continue
                     values.append({
                         "clip_id": clip,
@@ -4186,7 +4710,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                     values[index]["sequence_lane"],
                     values[index]["center_frame"],
                 )
-                for index in sequence
+                for index in sequence.indices
             )
             for sequence in sequences
         ]
