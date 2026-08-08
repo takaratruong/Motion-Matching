@@ -23,7 +23,7 @@ from mm_sonic.terrain_oracle.canonical import ISAACLAB_JOINT_NAMES
 from mm_sonic.terrain_oracle.canonical import CanonicalTerrainMesh
 from mm_sonic.terrain_oracle.contact import CanonicalMeshQuery
 from mm_sonic.terrain_oracle.math3d import RigidTransform
-from mm_sonic.terrain_pfnn.dataset import PFNNShardDataset
+from mm_sonic.terrain_pfnn.dataset import PFNNShardDataset, normalize_pfnn_input
 from mm_sonic.terrain_pfnn.features import PFNNTrainingWindow
 from mm_sonic.terrain_pfnn.layout import (
     CONTACT_ORDER,
@@ -386,6 +386,12 @@ class TerrainPFNNDatasetTest(unittest.TestCase):
 
         self.assertEqual(len(dataset), 2)
         sample = dataset[0]
+        np.testing.assert_array_equal(
+            sample["x"],
+            normalize_pfnn_input(
+                self.windows[0].x, dataset.x_mean, dataset.x_std
+            ),
+        )
         self.assertEqual(sample["x"].shape, (288,))
         self.assertEqual(sample["y"].shape, (268,))
         self.assertEqual(sample["phase"].shape, ())

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import math
 import os
 from pathlib import Path
+import pickle
 import subprocess
 from typing import Callable, Mapping, Sequence
 
@@ -101,18 +102,51 @@ def _normalization_tensors(
     return output
 
 
+def _checkpoint_normalization_tensors(value: object) -> dict[str, torch.Tensor]:
+    expected = {
+        "x_mean": INPUT_LAYOUT.size,
+        "x_std": INPUT_LAYOUT.size,
+        "y_mean": OUTPUT_LAYOUT.size,
+        "y_std": OUTPUT_LAYOUT.size,
+    }
+    if type(value) is not dict or set(value) != set(expected):
+        raise ValueError("checkpoint normalization fields are invalid")
+    output: dict[str, torch.Tensor] = {}
+    for name, width in expected.items():
+        tensor = value[name]
+        if (
+            type(tensor) is not torch.Tensor
+            or tensor.device.type != "cpu"
+            or tensor.dtype != torch.float32
+            or tensor.layout != torch.strided
+            or tensor.shape != (width,)
+            or not tensor.is_contiguous()
+            or tensor.requires_grad
+            or not torch.isfinite(tensor).all()
+            or (name.endswith("_std") and torch.any(tensor <= 0.0))
+        ):
+            raise ValueError(f"checkpoint normalization {name} is invalid")
+        output[name] = tensor.clone()
+    contact = OUTPUT_LAYOUT["contact_logit"]
+    if not torch.equal(output["y_mean"][contact], torch.zeros(4)) or not torch.equal(
+        output["y_std"][contact], torch.ones(4)
+    ):
+        raise ValueError("checkpoint contact normalization is invalid")
+    return output
+
+
 def _field_cat(value: torch.Tensor, fields: Sequence[str]) -> torch.Tensor:
     return torch.cat([value[..., OUTPUT_LAYOUT[name]] for name in fields], dim=-1)
 
 
 def _loss_weights(weights: Mapping[str, float] | None) -> dict[str, float]:
     candidate = DEFAULT_LOSS_WEIGHTS if weights is None else weights
-    if set(candidate) != set(LOSS_WEIGHT_KEYS):
+    if type(candidate) is not dict or set(candidate) != set(LOSS_WEIGHT_KEYS):
         raise ValueError("loss weights do not match the immutable loss groups")
-    output = {name: float(candidate[name]) for name in LOSS_WEIGHT_KEYS}
-    if any(not math.isfinite(value) or value < 0.0 for value in output.values()):
-        raise ValueError("loss weights must be finite and nonnegative")
-    return output
+    if any(type(candidate[name]) is not float or candidate[name] != 1.0
+           for name in LOSS_WEIGHT_KEYS):
+        raise ValueError("loss weights are frozen to float 1.0")
+    return {name: 1.0 for name in LOSS_WEIGHT_KEYS}
 
 
 def pfnn_losses(
@@ -283,8 +317,14 @@ def autoregressive_unroll(
                 * normal["y_std"][OUTPUT_LAYOUT["phase_advance"]]
                 + normal["y_mean"][OUTPUT_LAYOUT["phase_advance"]]
             ).squeeze(-1)
+            # The recurrence is physically nonnegative in the forward pass,
+            # while the straight-through correction preserves a learning
+            # signal for a raw negative phase-advance prediction.
+            recurrent_phase = physical_phase + (
+                torch.clamp_min(physical_phase, 0.0) - physical_phase
+            ).detach()
             current_phase = torch.remainder(
-                current_phase + torch.clamp_min(physical_phase, 0.0),
+                current_phase + recurrent_phase,
                 2.0 * math.pi,
             )
     losses = {
@@ -496,28 +536,48 @@ def finite_runtime_seed() -> dict[str, object]:
 
 
 def _validate_runtime_seed(
-    seed: object, joint_limits: torch.Tensor
+    seed: object, joint_limits: torch.Tensor, *, exact_tensors: bool = False
 ) -> dict[str, object]:
     template = finite_runtime_seed()
-    if not isinstance(seed, dict) or set(seed) != set(template):
+    if type(seed) is not dict or set(seed) != set(template):
         raise ValueError("runtime seed fields are invalid")
     output: dict[str, object] = {}
     for name, expected in template.items():
         value = seed[name]
         if isinstance(expected, torch.Tensor):
-            tensor = torch.as_tensor(value, dtype=torch.float32, device="cpu").detach().clone()
+            if exact_tensors:
+                if (
+                    type(value) is not torch.Tensor
+                    or value.device.type != "cpu"
+                    or value.dtype != torch.float32
+                    or value.layout != torch.strided
+                    or value.shape != expected.shape
+                    or not value.is_contiguous()
+                    or value.requires_grad
+                    or not torch.isfinite(value).all()
+                ):
+                    raise ValueError(f"runtime seed {name} is invalid")
+                tensor = value.clone()
+            else:
+                tensor = torch.as_tensor(
+                    value, dtype=torch.float32, device="cpu"
+                ).detach().contiguous().clone()
             if tensor.shape != expected.shape or not torch.isfinite(tensor).all():
                 raise ValueError(f"runtime seed {name} is invalid")
             output[name] = tensor
         else:
             if (
-                not isinstance(value, dict)
+                type(value) is not dict
                 or set(value) != {"clip_id", "center_frame", "speed"}
                 or type(value["clip_id"]) is not str
                 or not value["clip_id"]
                 or type(value["center_frame"]) is not int
                 or value["center_frame"] < 0
-                or type(value["speed"]) not in (int, float)
+                or (
+                    type(value["speed"]) is not float
+                    if exact_tensors
+                    else type(value["speed"]) not in (int, float)
+                )
                 or not math.isfinite(float(value["speed"]))
             ):
                 raise ValueError("runtime seed provenance is invalid")
@@ -539,6 +599,19 @@ def _validate_runtime_seed(
     if not 0.0 <= float(phase) < 2.0 * math.pi:
         raise ValueError("runtime seed phase must be in [0,2*pi)")
     return output
+
+
+def _validated_sampler_state(value: object) -> dict[str, int]:
+    if (
+        type(value) is not dict
+        or set(value) != {"epoch", "global_offset"}
+        or type(value["epoch"]) is not int
+        or value["epoch"] < 0
+        or type(value["global_offset"]) is not int
+        or value["global_offset"] < 0
+    ):
+        raise ValueError("checkpoint sampler state is invalid")
+    return {"epoch": value["epoch"], "global_offset": value["global_offset"]}
 
 
 def selection_metadata(
@@ -631,7 +704,7 @@ def _code_commit() -> str:
 
 def _plain_cpu(value: object) -> object:
     if isinstance(value, torch.Tensor):
-        return value.detach().to(device="cpu").clone()
+        return value.detach().to(device="cpu").contiguous().clone()
     if isinstance(value, Mapping):
         return {key: _plain_cpu(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
@@ -660,7 +733,7 @@ _CHECKPOINT_KEYS = {
     "model_config", "model_state", "optimizer_state", "code_commit", "dataset_digest",
     "train_identities", "validation_identities", "step", "epoch", "seed",
     "loss_weights", "kinematic_signature_sha256", "joint_limits",
-    "phase_advance_q99", "runtime_seed", "selection",
+    "phase_advance_q99", "runtime_seed", "selection", "sampler_state",
 }
 
 
@@ -684,6 +757,8 @@ class LoadedCheckpoint:
     model_state: dict[str, torch.Tensor]
     optimizer_state: dict[str, object]
     code_commit: str
+    sampler_epoch: int
+    sampler_global_offset: int
 
     def build_model(self) -> PhaseFunctionedNetwork:
         model = PhaseFunctionedNetwork(
@@ -713,6 +788,8 @@ def save_checkpoint(
     validation_identities: Sequence[str] = (),
     selection: Mapping[str, object] | None = None,
     code_commit: str | None = None,
+    sampler_epoch: int = 0,
+    sampler_global_offset: int = 0,
 ) -> None:
     unwrapped = model.module if hasattr(model, "module") else model
     if not isinstance(unwrapped, PhaseFunctionedNetwork):
@@ -727,7 +804,9 @@ def save_checkpoint(
     if joint_limits is None:
         limits = torch.tensor([[-math.pi, math.pi]] * 29, dtype=torch.float64)
     else:
-        limits = torch.as_tensor(joint_limits, dtype=torch.float64, device="cpu").clone()
+        limits = torch.as_tensor(
+            joint_limits, dtype=torch.float64, device="cpu"
+        ).contiguous().clone()
     if (
         limits.shape != (29, 2)
         or not torch.isfinite(limits).all()
@@ -739,6 +818,9 @@ def save_checkpoint(
         raise ValueError("phase_advance_q99 must be finite and nonnegative")
     checked_runtime_seed = _validate_runtime_seed(dict(runtime_seed), limits)
     weights = _loss_weights(loss_weights)
+    sampler_state = _validated_sampler_state(
+        {"epoch": sampler_epoch, "global_offset": sampler_global_offset}
+    )
     payload = {
         "schema": CHECKPOINT_SCHEMA,
         "input_size": INPUT_LAYOUT.size,
@@ -773,6 +855,7 @@ def save_checkpoint(
         "selection": _validated_selection(
             None if selection is None else dict(selection)
         ),
+        "sampler_state": sampler_state,
     }
     plain = _plain_cpu(payload)
     if not isinstance(plain, dict) or not _finite_tree(plain):
@@ -797,7 +880,7 @@ def save_checkpoint(
 
 
 def _require_string_list(value: object, name: str) -> tuple[str, ...]:
-    if not isinstance(value, list) or any(type(item) is not str or not item for item in value):
+    if type(value) is not list or any(type(item) is not str or not item for item in value):
         raise ValueError(f"checkpoint {name} is invalid")
     return tuple(value)
 
@@ -831,8 +914,13 @@ def _validate_optimizer_state(
         step = raw["step"]
         if (
             type(step) is not torch.Tensor
+            or step.device.type != "cpu"
             or step.shape != ()
-            or not step.is_floating_point()
+            or step.dtype != torch.float32
+            or step.layout != torch.strided
+            or not step.is_contiguous()
+            or step.requires_grad
+            or not torch.isfinite(step)
             or float(step) < 0.0
         ):
             raise ValueError("checkpoint optimizer state is invalid")
@@ -840,8 +928,12 @@ def _validate_optimizer_state(
             tensor = raw[name]
             if (
                 type(tensor) is not torch.Tensor
+                or tensor.device.type != "cpu"
                 or tensor.shape != parameters[parameter_index].shape
                 or tensor.dtype != parameters[parameter_index].dtype
+                or tensor.layout != torch.strided
+                or not tensor.is_contiguous()
+                or tensor.requires_grad
             ):
                 raise ValueError("checkpoint optimizer state is invalid")
     probe = torch.optim.Adam(model.parameters())
@@ -860,7 +952,7 @@ def load_checkpoint(
 ) -> LoadedCheckpoint:
     try:
         payload = torch.load(Path(path), map_location="cpu", weights_only=True)
-    except (OSError, RuntimeError, EOFError, TypeError) as error:
+    except (OSError, RuntimeError, EOFError, TypeError, pickle.UnpicklingError) as error:
         raise ValueError("checkpoint cannot be loaded safely") from error
     if type(payload) is not dict or set(payload) != _CHECKPOINT_KEYS:
         raise ValueError("checkpoint fields or schema are invalid")
@@ -914,35 +1006,42 @@ def load_checkpoint(
         value = model_state[name]
         if (
             type(value) is not torch.Tensor
+            or value.device.type != "cpu"
             or value.shape != expected.shape
             or value.dtype != expected.dtype
             or value.layout != torch.strided
+            or not value.is_contiguous()
+            or value.requires_grad
         ):
             raise ValueError("checkpoint model state is invalid")
     try:
         probe.load_state_dict(model_state, strict=True)
     except RuntimeError as error:
         raise ValueError("checkpoint model state is invalid") from error
-    normal_raw = payload["normalization"]
-    if type(normal_raw) is not dict:
-        raise ValueError("checkpoint normalization is invalid")
-    normal = _normalization_tensors(
-        normal_raw, device=torch.device("cpu"), dtype=torch.float32
-    )
+    normal = _checkpoint_normalization_tensors(payload["normalization"])
     limits = payload["joint_limits"]
     if (
         type(limits) is not torch.Tensor
+        or limits.device.type != "cpu"
+        or limits.dtype != torch.float64
+        or limits.layout != torch.strided
         or limits.shape != (29, 2)
+        or not limits.is_contiguous()
+        or limits.requires_grad
+        or not torch.isfinite(limits).all()
         or torch.any(limits[:, 0] >= limits[:, 1])
     ):
         raise ValueError("checkpoint canonical joint limits are invalid")
-    runtime_seed = _validate_runtime_seed(payload["runtime_seed"], limits)
+    runtime_seed = _validate_runtime_seed(
+        payload["runtime_seed"], limits, exact_tensors=True
+    )
     weights = _loss_weights(payload["loss_weights"])
     q99 = payload["phase_advance_q99"]
     if type(q99) is not float or q99 < 0.0:
         raise ValueError("checkpoint phase_advance_q99 is invalid")
     optimizer_state = _validate_optimizer_state(payload["optimizer_state"], probe)
     selection = _validated_selection(payload["selection"])
+    sampler_state = _validated_sampler_state(payload["sampler_state"])
     return LoadedCheckpoint(
         schema=payload["schema"],
         step=payload["step"],
@@ -962,6 +1061,8 @@ def load_checkpoint(
         model_state={name: value.clone() for name, value in model_state.items()},
         optimizer_state=dict(optimizer_state),
         code_commit=payload["code_commit"],
+        sampler_epoch=sampler_state["epoch"],
+        sampler_global_offset=sampler_state["global_offset"],
     )
 
 

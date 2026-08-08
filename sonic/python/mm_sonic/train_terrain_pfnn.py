@@ -19,6 +19,7 @@ from mm_sonic.evaluate_terrain_pfnn import _atomic_json, _dataset_root
 from mm_sonic.terrain_pfnn.dataset import PFNNShardDataset
 from mm_sonic.terrain_pfnn.kinematics import TorchG1ForwardKinematics
 from mm_sonic.terrain_pfnn.model import PhaseFunctionedNetwork
+from mm_sonic.terrain_pfnn.splits import split_identity, terrain_identity
 from mm_sonic.terrain_pfnn.training import (
     DEFAULT_LOSS_WEIGHTS,
     LOSS_WEIGHT_KEYS,
@@ -46,6 +47,17 @@ def overfit_gate_accepted(initial: float, final: float, ratio: float) -> bool:
 
 def promote_pipeline_best(*, pipeline_overfit: bool, accepted: bool) -> bool:
     return bool(pipeline_overfit and accepted)
+
+
+def resolve_rollout_finetune_frames(
+    value: int | None, *, pipeline_overfit: bool
+) -> int:
+    """Resolve the mode-dependent default without overriding an explicit flag."""
+
+    resolved = (0 if pipeline_overfit else 16) if value is None else value
+    if type(resolved) is not int or resolved not in (0, *range(2, 17)):
+        raise ValueError("rollout fine-tuning frames must be 0 or in [2,16]")
+    return resolved
 
 
 class _MaterializedDataset:
@@ -199,6 +211,31 @@ def _padded_rank_epoch(
     return indices[rank::world_size], padding
 
 
+def _local_epoch_at_global_offset(
+    indices: list[int],
+    *,
+    global_offset: int,
+    batch_size: int,
+    rank: int,
+    world_size: int,
+) -> tuple[list[int], int, int]:
+    """Reconstruct a rank's epoch view and exact consumed position."""
+
+    local_epoch, padding = _padded_rank_epoch(
+        indices, batch_size=batch_size, rank=rank, world_size=world_size
+    )
+    padded_count = len(local_epoch) * world_size
+    divisor = batch_size * world_size
+    if (
+        type(global_offset) is not int
+        or global_offset < 0
+        or global_offset > padded_count
+        or global_offset % divisor != 0
+    ):
+        raise ValueError("checkpoint sampler global offset is invalid")
+    return local_epoch, global_offset // world_size, padding
+
+
 def _batch(
     dataset: object, indices: Sequence[int], device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -219,25 +256,49 @@ def _consecutive_starts(
 ) -> tuple[list[tuple[int, ...]], list[str]]:
     if frames < 2:
         raise ValueError("rollout fine-tuning requires at least two frames")
-    metadata = [
-        (
-            str(dataset[index]["clip_id"]),
-            int(dataset[index]["center_frame"]),
-            str(dataset[index]["terrain_class"]),
-        )
-        for index in range(len(dataset))
-    ]
+    if getattr(dataset, "split", None) != "train":
+        raise ValueError("rollout sequences require the training split")
+    grouped: dict[str, dict[int, list[tuple[int, str]]]] = {}
+    identities: dict[str, str] = {}
+    for index in range(len(dataset)):
+        sample = dataset[index]
+        clip = str(sample["clip_id"])
+        center = int(sample["center_frame"])
+        terrain_class = str(sample["terrain_class"])
+        identity = str(sample["split_identity"])
+        if (
+            not clip
+            or center < 0
+            or terrain_class not in _TERRAIN_CLASSES
+            or not identity
+            or sample.get("split") != "train"
+            or identity != terrain_identity(clip)
+            or split_identity(identity) != "train"
+        ):
+            raise ValueError("rollout sequence split/identity metadata is invalid")
+        previous_identity = identities.setdefault(clip, identity)
+        if previous_identity != identity:
+            raise ValueError("rollout sequence split/identity mismatch")
+        clip_rows = grouped.setdefault(clip, {})
+        clip_rows.setdefault(center, []).append((index, terrain_class))
     sequences: list[tuple[int, ...]] = []
     classes: list[str] = []
-    for start in range(len(metadata) - frames + 1):
-        clip, center, terrain_class = metadata[start]
-        if all(
-            metadata[start + offset][0] == clip
-            and metadata[start + offset][1] == center + offset
-            for offset in range(frames)
-        ):
-            sequences.append(tuple(range(start, start + frames)))
-            classes.append(terrain_class)
+    for clip in sorted(grouped):
+        clip_rows = {
+            center: rows[0]
+            for center, rows in grouped[clip].items()
+            if len(rows) == 1
+        }
+        centers = sorted(clip_rows)
+        for start in range(len(centers) - frames + 1):
+            window = centers[start : start + frames]
+            if any(
+                right != left + 1 for left, right in zip(window, window[1:])
+            ):
+                continue
+            indices = tuple(clip_rows[center][0] for center in window)
+            sequences.append(indices)
+            classes.append(clip_rows[window[0]][1])
     if not sequences:
         raise ValueError("training split has no consecutive rollout sequences")
     return sequences, classes
@@ -291,6 +352,7 @@ def train(arguments: argparse.Namespace) -> dict[str, object] | None:
     unwrapped = model.module if hasattr(model, "module") else model
     optimizer = torch.optim.Adam(unwrapped.parameters(), lr=arguments.learning_rate)
     restored_step, restored_epoch = 0, 0
+    restored_sampler_epoch, restored_sampler_global_offset = 0, 0
     if arguments.resume is not None:
         resumed = load_checkpoint(
             arguments.resume,
@@ -305,6 +367,12 @@ def train(arguments: argparse.Namespace) -> dict[str, object] | None:
             train_identities=manifest["split_identities"]["train"],
             validation_identities=manifest["split_identities"]["validation"],
         )
+        restored_sampler_epoch = resumed.sampler_epoch
+        restored_sampler_global_offset = resumed.sampler_global_offset
+        if arguments.seed != resumed.seed:
+            raise ValueError("resume checkpoint seed mismatch")
+        if restored_step > 0 and restored_epoch != restored_sampler_epoch + 1:
+            raise ValueError("resume checkpoint sampler epoch is inconsistent")
         if restored_step >= arguments.steps:
             raise ValueError("--steps must exceed the resumed checkpoint step")
         if world_size > 1:
@@ -350,6 +418,24 @@ def train(arguments: argparse.Namespace) -> dict[str, object] | None:
     local_epoch: list[int] = []
     local_offset = 0
     padding = 0
+    if arguments.resume is not None:
+        global_epoch = (
+            _balanced_epoch_indices(
+                optimization_indices,
+                optimization_classes,
+                seed=arguments.seed,
+                epoch=restored_sampler_epoch,
+            )
+            if rank == 0 else None
+        )
+        global_epoch = _broadcast_indices(global_epoch, device)
+        local_epoch, local_offset, padding = _local_epoch_at_global_offset(
+            global_epoch,
+            global_offset=restored_sampler_global_offset,
+            batch_size=arguments.batch_size,
+            rank=rank,
+            world_size=world_size,
+        )
     while step < arguments.steps:
         if local_offset + arguments.batch_size > len(local_epoch):
             global_epoch = (
@@ -618,6 +704,8 @@ def train(arguments: argparse.Namespace) -> dict[str, object] | None:
         train_identities=train_identities,
         validation_identities=validation_identities,
         selection=selection,
+        sampler_epoch=max(0, epoch - 1),
+        sampler_global_offset=local_offset * world_size,
     )
     load_checkpoint(
         candidate,
@@ -644,6 +732,8 @@ def train(arguments: argparse.Namespace) -> dict[str, object] | None:
             train_identities=train_identities,
             validation_identities=validation_identities,
             selection=selection,
+            sampler_epoch=max(0, epoch - 1),
+            sampler_global_offset=local_offset * world_size,
         )
         best_path = str(best)
     report = {
@@ -685,7 +775,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float, default=1.0e-4)
     parser.add_argument("--evaluation-batch-size", type=int, default=256)
     parser.add_argument("--overfit-acceptance-ratio", type=float, default=0.5)
-    parser.add_argument("--rollout-finetune-frames", type=int, default=0)
+    parser.add_argument("--rollout-finetune-frames", type=int, default=None)
     parser.add_argument("--rollout-finetune-steps", type=int)
     parser.add_argument("--resume")
     return parser
@@ -695,8 +785,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     if arguments.steps < 1 or arguments.batch_size < 1 or arguments.hidden_size < 1:
         raise ValueError("steps, batch size, and hidden size must be positive")
-    if arguments.rollout_finetune_frames not in (0, *range(2, 17)):
-        raise ValueError("rollout fine-tuning frames must be 0 or in [2,16]")
+    arguments.rollout_finetune_frames = resolve_rollout_finetune_frames(
+        arguments.rollout_finetune_frames,
+        pipeline_overfit=arguments.overfit_samples is not None,
+    )
     report = train(arguments)
     if report is not None:
         print(json.dumps(report, sort_keys=True, allow_nan=False))
@@ -714,6 +806,7 @@ __all__ = [
     "materialize_subset",
     "overfit_gate_accepted",
     "promote_pipeline_best",
+    "resolve_rollout_finetune_frames",
     "seed_worker",
     "stratified_subset",
     "train",
