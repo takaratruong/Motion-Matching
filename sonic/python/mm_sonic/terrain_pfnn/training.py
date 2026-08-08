@@ -443,10 +443,10 @@ def choose_runtime_seed(
 ) -> dict[str, object]:
     """Choose a fitted recurrent state whose first inference is also fitted.
 
-    A candidate row ``t`` must have its unique same-clip predecessor ``t-1``
-    present in this dataset.  The seed is predecessor ``y`` (the reached state
-    at ``t``), and its recurrent body/trajectory/phase are checked against row
-    ``t`` before it can be serialized.  Thus passing a materialized overfit
+    A candidate row ``t`` must have its unique same-clip, same-lane predecessor
+    ``t-1`` present in this dataset.  The seed is predecessor ``y`` (the reached
+    state at ``t``), and its recurrent body/trajectory/phase are checked against
+    row ``t`` before it can be serialized.  Thus passing a materialized overfit
     dataset prevents seed selection from escaping the fitted rows.
     """
 
@@ -465,7 +465,7 @@ def choose_runtime_seed(
         or np.any(x_std <= 0.0)
     ):
         raise ValueError("runtime seed input normalization is invalid")
-    rows: dict[tuple[str, int], list[tuple[int, Mapping[str, object]]]] = {}
+    rows: dict[tuple[str, str, int], list[tuple[int, Mapping[str, object]]]] = {}
     for index in range(len(dataset)):
         sample = dataset[index]
         clip = str(sample.get("clip_id", ""))
@@ -478,20 +478,21 @@ def choose_runtime_seed(
             or sample.get("sequence_lane") not in _SEQUENCE_LANES
         ):
             raise ValueError("runtime seed fitted row provenance is invalid")
-        rows.setdefault((clip, center), []).append((index, sample))
+        lane = str(sample["sequence_lane"])
+        rows.setdefault((clip, lane, center), []).append((index, sample))
 
     unique = {key: value[0] for key, value in rows.items() if len(value) == 1}
     candidates: list[
-        tuple[tuple[float, str, int], Mapping[str, object], Mapping[str, object]]
+        tuple[
+            tuple[float, str, str, int], Mapping[str, object], Mapping[str, object]
+        ]
     ] = []
-    for (clip, center), (_, sample) in unique.items():
-        predecessor_entry = unique.get((clip, center - 1))
+    for (clip, lane, center), (_, sample) in unique.items():
+        predecessor_entry = unique.get((clip, lane, center - 1))
         if sample.get("terrain_class") != "flat" or predecessor_entry is None:
             continue
         physical_target = np.asarray(sample["y"], dtype=np.float64) * y_std + y_mean
         predecessor = predecessor_entry[1]
-        if predecessor.get("sequence_lane") != sample.get("sequence_lane"):
-            continue
         predecessor_physical = (
             np.asarray(predecessor["y"], dtype=np.float64) * y_std + y_mean
         )
@@ -506,11 +507,11 @@ def choose_runtime_seed(
         speed = float(
             np.linalg.norm(physical_target[OUTPUT_LAYOUT["root_planar_velocity"]])
         )
-        candidates.append(((speed, clip, center), predecessor, sample))
+        candidates.append(((speed, clip, lane, center), predecessor, sample))
     if not candidates:
         raise ValueError("training split has no fitted consecutive flat runtime seed")
     key, predecessor, first_fitted = min(candidates, key=lambda candidate: candidate[0])
-    speed, clip, center = key
+    speed, clip, _, center = key
     predecessor_physical = (
         np.asarray(predecessor["y"], dtype=np.float64) * y_std + y_mean
     )

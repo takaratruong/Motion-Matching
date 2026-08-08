@@ -262,6 +262,106 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fitted consecutive"):
             choose_runtime_seed(isolated, torch.tensor([[-2.0, 2.0]] * 29))
 
+    def test_runtime_seed_keys_stationary_rows_by_sequence_lane(self) -> None:
+        class Rows:
+            split = "train"
+            x_mean = np.zeros(INPUT_LAYOUT.size, np.float32)
+            x_std = np.ones(INPUT_LAYOUT.size, np.float32)
+            y_mean = np.zeros(OUTPUT_LAYOUT.size, np.float32)
+            y_std = np.ones(OUTPUT_LAYOUT.size, np.float32)
+
+            @staticmethod
+            def _state(center: int) -> tuple[np.ndarray, np.ndarray]:
+                trajectory = np.zeros((12, 2), np.float32)
+                trajectory[:, 0] = center * 0.001
+                direction = np.zeros((12, 2), np.float32)
+                direction[:, 0] = 1.0
+                body = np.full((30, 3), center * 0.001, np.float32)
+                return np.concatenate((trajectory.ravel(), direction.ravel())), body
+
+            @classmethod
+            def _row(
+                cls, center: int, lane: str, speed: float
+            ) -> dict[str, object]:
+                current_trajectory, current_body = cls._state(center)
+                target_trajectory, target_body = cls._state(center + 1)
+                x = np.zeros(INPUT_LAYOUT.size, np.float32)
+                x[INPUT_LAYOUT["trajectory_position"]] = current_trajectory[:24]
+                x[INPUT_LAYOUT["trajectory_direction"]] = current_trajectory[24:]
+                x[INPUT_LAYOUT["previous_body_position"]] = current_body.ravel() * 0.1
+                x[INPUT_LAYOUT["previous_body_velocity"]] = current_body.ravel() * 0.1
+                x[INPUT_LAYOUT["semantic_intent"]] = np.tile(
+                    (1.0, 0.0), (12, 1)
+                ).ravel()
+                y = np.zeros(OUTPUT_LAYOUT.size, np.float32)
+                y[OUTPUT_LAYOUT["trajectory_position"]] = target_trajectory[:24]
+                y[OUTPUT_LAYOUT["trajectory_direction"]] = target_trajectory[24:]
+                y[OUTPUT_LAYOUT["body_position"]] = target_body.ravel()
+                y[OUTPUT_LAYOUT["body_velocity"]] = target_body.ravel()
+                y[OUTPUT_LAYOUT["root_height"]] = 0.8
+                y[OUTPUT_LAYOUT["root_planar_velocity"]] = (speed, 0.0)
+                y[OUTPUT_LAYOUT["phase_advance"]] = 0.1
+                y[OUTPUT_LAYOUT["contact_logit"]] = (1.0, 0.0, 1.0, 0.0)
+                return {
+                    "x": x,
+                    "y": y,
+                    "phase": np.float32(center * 0.1),
+                    "clip_id": "terrain_slopes__slope_000__000",
+                    "center_frame": center,
+                    "split_identity": "slope_000",
+                    "split": "train",
+                    "sequence_lane": lane,
+                    "terrain_class": "flat",
+                }
+
+            def __init__(self, duplicate_lane: str | None = None) -> None:
+                self.rows: list[dict[str, object]] = []
+                for center in (10, 11):
+                    for lane_index in reversed(range(8)):
+                        lane = f"idle_phase_{lane_index}"
+                        speed = 0.01 * max(lane_index, 1) if center == 11 else 0.5
+                        self.rows.append(self._row(center, lane, speed))
+                # This row has the fastest target, but only an idle-lane row at
+                # center 11. It must never borrow that wrong-lane predecessor.
+                self.rows.append(self._row(12, "motion", 0.0001))
+                if duplicate_lane is not None:
+                    duplicate = next(
+                        row
+                        for row in self.rows
+                        if row["center_frame"] == 11
+                        and row["sequence_lane"] == duplicate_lane
+                    )
+                    self.rows.append(dict(duplicate))
+
+            def __len__(self) -> int:
+                return len(self.rows)
+
+            def __getitem__(self, index: int) -> dict[str, object]:
+                return self.rows[index]
+
+        seed = choose_runtime_seed(Rows(), torch.tensor([[-2.0, 2.0]] * 29))
+        self.assertEqual(seed["provenance"]["predecessor_center_frame"], 10)
+        self.assertEqual(seed["provenance"]["first_fitted_center_frame"], 11)
+        self.assertEqual(
+            seed["provenance"]["predecessor_sequence_lane"], "idle_phase_0"
+        )
+        self.assertEqual(
+            seed["provenance"]["first_fitted_sequence_lane"], "idle_phase_0"
+        )
+        self.assertAlmostEqual(seed["provenance"]["speed"], 0.01)
+
+        duplicate = choose_runtime_seed(
+            Rows(duplicate_lane="idle_phase_0"),
+            torch.tensor([[-2.0, 2.0]] * 29),
+        )
+        self.assertEqual(
+            duplicate["provenance"]["predecessor_sequence_lane"], "idle_phase_1"
+        )
+        self.assertEqual(
+            duplicate["provenance"]["first_fitted_sequence_lane"], "idle_phase_1"
+        )
+        self.assertAlmostEqual(duplicate["provenance"]["speed"], 0.01)
+
     def test_runtime_seed_minimizes_speed_before_suffix_length(self) -> None:
         class Rows:
             split = "train"
