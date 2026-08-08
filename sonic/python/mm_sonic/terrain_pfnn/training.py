@@ -441,6 +441,32 @@ class GlobalEnvelopeReduction:
     loss: torch.Tensor
 
 
+class PhysicalEnvelopeLosses(dict[str, torch.Tensor]):
+    """Tensor loss mapping with the exact reductions used for diagnostics."""
+
+    def __init__(
+        self,
+        values: Mapping[str, torch.Tensor],
+        *,
+        reductions: Mapping[str, GlobalEnvelopeReduction],
+    ) -> None:
+        super().__init__(values)
+        self.reductions = dict(reductions)
+
+
+class OneStepTrainingLosses(dict[str, torch.Tensor]):
+    """Combined base/envelope losses from one predecessor-aware update."""
+
+    def __init__(
+        self,
+        values: Mapping[str, torch.Tensor],
+        *,
+        envelope_reductions: Mapping[str, GlobalEnvelopeReduction],
+    ) -> None:
+        super().__init__(values)
+        self.envelope_reductions = dict(envelope_reductions)
+
+
 def global_max_plus_tail(
     local_risk: torch.Tensor,
     *,
@@ -705,7 +731,7 @@ def physical_envelope_loss(
     global_ordinals: torch.Tensor,
     rank: int,
     world_size: int,
-) -> dict[str, torch.Tensor]:
+) -> PhysicalEnvelopeLosses:
     """Return independent max-plus-positive-tail physical family losses."""
 
     risks = physical_envelope_risks(
@@ -735,7 +761,7 @@ def physical_envelope_loss(
     losses["physical_envelope_total"] = sum(
         losses[f"{name}_envelope"] for name in risks
     )
-    return losses
+    return PhysicalEnvelopeLosses(losses, reductions=reductions)
 
 
 def _loss_weights(weights: Mapping[str, float] | None) -> dict[str, float]:
@@ -823,6 +849,56 @@ def pfnn_losses(
     weights = _loss_weights(loss_weights)
     losses["total"] = sum(losses[name] * weights[name] for name in LOSS_WEIGHT_KEYS)
     return losses
+
+
+def one_step_training_losses(
+    model: nn.Module,
+    current_inputs: torch.Tensor,
+    current_phase: torch.Tensor,
+    current_targets: torch.Tensor,
+    predecessor_targets: torch.Tensor,
+    *,
+    normalization: object,
+    joint_limits: torch.Tensor,
+    phase_advance_cap: float,
+    contract: PhysicalEnvelopeObjective,
+    global_ordinals: torch.Tensor,
+    rank: int,
+    world_size: int,
+    kinematics: nn.Module | None = None,
+    loss_weights: Mapping[str, float] | None = None,
+) -> OneStepTrainingLosses:
+    """Compute one exact current-target update from its reached predecessor."""
+
+    prediction = model(current_inputs, current_phase)
+    losses = pfnn_losses(
+        prediction,
+        current_targets,
+        model=model,
+        normalization=normalization,
+        kinematics=kinematics,
+        loss_weights=loss_weights,
+    )
+    envelope = physical_envelope_loss(
+        prediction,
+        predecessor_targets,
+        normalization=normalization,
+        joint_limits=joint_limits,
+        phase_advance_cap=phase_advance_cap,
+        contract=contract,
+        global_ordinals=global_ordinals,
+        rank=rank,
+        world_size=world_size,
+    )
+    envelope_values = torch.stack(tuple(envelope.values()))
+    if not torch.isfinite(envelope_values).all():
+        raise FloatingPointError("nonfinite physical envelope loss")
+    losses.update(envelope)
+    losses["total"] = losses["total"] + envelope["physical_envelope_total"]
+    return OneStepTrainingLosses(
+        losses,
+        envelope_reductions=envelope.reductions,
+    )
 
 
 @dataclass(frozen=True)
@@ -2890,6 +2966,7 @@ __all__ = [
     "finite_runtime_seed",
     "load_checkpoint",
     "one_step_metrics",
+    "one_step_training_losses",
     "pfnn_losses",
     "restore_training_state",
     "save_checkpoint",

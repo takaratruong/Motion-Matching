@@ -7,6 +7,7 @@ import tempfile
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
+from typing import Sequence
 import unittest
 from unittest.mock import patch
 
@@ -208,6 +209,181 @@ class _TargetEnvelopePairRows:
         return self.rows[index]
 
 
+class _SingleParameterEnvelopeModel(torch.nn.Module):
+    """Small PFNN-shaped model for predecessor-aware trainer regressions."""
+
+    def __init__(
+        self,
+        weight: float = 0.30,
+        *,
+        coefficient_input: bool = False,
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
+        super().__init__()
+        self.W0 = torch.nn.Parameter(torch.tensor(weight, dtype=dtype))
+        self.b0 = torch.nn.Parameter(torch.zeros((), dtype=dtype))
+        self.W1 = torch.nn.Parameter(torch.zeros((), dtype=dtype))
+        self.b1 = torch.nn.Parameter(torch.zeros((), dtype=dtype))
+        self.W2 = torch.nn.Parameter(torch.zeros((), dtype=dtype))
+        self.b2 = torch.nn.Parameter(torch.zeros((), dtype=dtype))
+        mask = torch.zeros(OUTPUT_LAYOUT.size, dtype=dtype)
+        mask[OUTPUT_LAYOUT["joint_position"].start] = 1.0
+        self.register_buffer("joint_mask", mask)
+        self.coefficient_input = coefficient_input
+
+    @property
+    def weight(self) -> torch.nn.Parameter:
+        return self.W0
+
+    def forward(self, x: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
+        del phase
+        if self.coefficient_input:
+            coefficient = x[:, 0].to(dtype=self.W0.dtype)
+            joint = torch.where(
+                coefficient > 0.0,
+                0.225 + 0.025 * coefficient * self.W0,
+                torch.zeros_like(coefficient),
+            )
+        else:
+            joint = self.W0.expand(len(x))
+        graph_zero = 0.0 * (self.b0 + self.W1 + self.b1 + self.W2 + self.b2)
+        return joint[:, None] * self.joint_mask[None, :] + graph_zero
+
+
+class _TrainerPairRows:
+    """Five independent train-only pairs; the first four form the canary."""
+
+    split = "train"
+    x_mean = np.zeros(INPUT_LAYOUT.size, np.float32)
+    x_std = np.ones(INPUT_LAYOUT.size, np.float32)
+    y_mean = np.zeros(OUTPUT_LAYOUT.size, np.float32)
+    y_std = np.ones(OUTPUT_LAYOUT.size, np.float32)
+
+    def __init__(self) -> None:
+        classes = ("flat", "ascent", "descent", "transition", "flat")
+        terrain_indices = (0, 1, 2, 4, 5)
+        self.rows = [
+            self._row(terrain_index, center, terrain_class)
+            for terrain_index, terrain_class in zip(terrain_indices, classes)
+            for center in (0, 1)
+        ]
+
+    @staticmethod
+    def _row(
+        terrain_index: int, center: int, terrain_class: str
+    ) -> dict[str, object]:
+        x = np.zeros(INPUT_LAYOUT.size, np.float32)
+        x[0] = np.float32(terrain_index + center / 10.0)
+        y = np.zeros(OUTPUT_LAYOUT.size, np.float32)
+        y[OUTPUT_LAYOUT["joint_position"].start] = np.float32(
+            0.0 if center == 0 else 0.29
+        )
+        y[OUTPUT_LAYOUT["phase_advance"]] = np.float32(0.10)
+        return {
+            "x": x,
+            "y": y,
+            "phase": np.float32(0.25),
+            "clip_id": (
+                f"terrain_slopes__slope_{terrain_index:03d}__000"
+            ),
+            "center_frame": center,
+            "split_identity": f"slope_{terrain_index:03d}",
+            "split": "train",
+            "sequence_lane": "motion",
+            "terrain_class": terrain_class,
+        }
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, index: int) -> dict[str, object]:
+        return self.rows[index]
+
+
+class _ZeroKinematics(torch.nn.Module):
+    kinematic_signature_sha256 = "trainer-probe-kinematics"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.register_buffer(
+            "joint_limits",
+            torch.tensor([[-1.0, 1.0]] * len(ISAACLAB_JOINT_NAMES)),
+        )
+
+    def forward(
+        self, root: torch.Tensor, joints: torch.Tensor
+    ) -> torch.Tensor:
+        del root
+        return (joints[:, :1] * 0.0).reshape(len(joints), 1, 1).expand(
+            -1, 30, 3
+        )
+
+
+def _one_step_envelope_ddp_worker(
+    rank: int,
+    world_size: int,
+    init_method: str,
+    queue: object,
+) -> None:
+    """Exercise the actual predecessor-aware one-step loss on two ranks."""
+
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel
+
+    dist.init_process_group(
+        "gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=10),
+    )
+    payload: dict[str, object]
+    try:
+        model = DistributedDataParallel(
+            _SingleParameterEnvelopeModel(
+                1.0, coefficient_input=True, dtype=torch.float64
+            )
+        )
+        coefficients = (
+            (1.0, math.sqrt(2.0))
+            if rank == 0
+            else (math.sqrt(2.0), 0.0)
+        )
+        ordinals = (0, 2) if rank == 0 else (1, 3)
+        current = torch.zeros(2, INPUT_LAYOUT.size, dtype=torch.float64)
+        current[:, 0] = torch.tensor(coefficients, dtype=torch.float64)
+        target = torch.zeros(2, OUTPUT_LAYOUT.size, dtype=torch.float64)
+        predecessor = torch.zeros_like(target)
+        losses = training_module.one_step_training_losses(
+            model,
+            current,
+            torch.zeros(2, dtype=torch.float64),
+            target,
+            predecessor,
+            normalization=_normalization(),
+            joint_limits=torch.tensor([[-1.0, 1.0]] * 29, dtype=torch.float64),
+            phase_advance_cap=0.50,
+            contract=training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+            global_ordinals=torch.tensor(ordinals, dtype=torch.int64),
+            rank=rank,
+            world_size=world_size,
+        )
+        losses["joint_step_envelope"].backward()
+        payload = {
+            "rank": rank,
+            "loss": float(losses["joint_step_envelope"].detach()),
+            "gradient": float(model.module.weight.grad),
+        }
+    except Exception as error:  # returned for bounded parent assertions
+        payload = {
+            "rank": rank,
+            "error": (type(error).__name__, str(error)),
+        }
+    finally:
+        dist.destroy_process_group()
+    queue.put(payload)
+
+
 def _global_envelope_worker(
     rank: int,
     world_size: int,
@@ -403,6 +579,21 @@ def _spawn_global_envelope_workers(case: str) -> list[dict[str, object]]:
     return sorted(results, key=lambda item: int(item["rank"]))
 
 
+def _spawn_one_step_envelope_workers() -> list[dict[str, object]]:
+    context = torch.multiprocessing.get_context("spawn")
+    queue = context.SimpleQueue()
+    with tempfile.TemporaryDirectory() as temporary:
+        init_method = (Path(temporary) / "one-step-gloo-init").as_uri()
+        torch.multiprocessing.spawn(
+            _one_step_envelope_ddp_worker,
+            args=(2, init_method, queue),
+            nprocs=2,
+            join=True,
+        )
+        results = [queue.get() for _ in range(2)]
+    return sorted(results, key=lambda item: int(item["rank"]))
+
+
 def _single_rank_global_envelope_reference(
     case: str,
 ) -> tuple[training_module.GlobalEnvelopeReduction, dict[str, float]]:
@@ -474,6 +665,144 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 result["counters"],
                 {"metadata": 1, "risk": 0, "ordinal": 0},
             )
+
+    def _run_one_step_trainer_probe(
+        self, *, pipeline_overfit: bool
+    ) -> dict[str, object]:
+        class OneStepMetricCaptured(RuntimeError):
+            pass
+
+        rows = _TrainerPairRows()
+        model = _SingleParameterEnvelopeModel()
+        receipts: list[dict[str, object]] = []
+        evaluation_rows: list[tuple[object, Sequence[int] | None]] = []
+        metric_records: list[dict[str, object]] = []
+        real_receipt = train_module.fitted_transition_pair_receipt
+
+        def record_receipt(dataset: object) -> dict[str, object]:
+            receipt = real_receipt(dataset)
+            receipts.append(receipt)
+            return receipt
+
+        def evaluation_metrics(
+            _model: object,
+            dataset: object,
+            *,
+            indices: Sequence[int] | None,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            evaluation_rows.append((dataset, indices))
+            return {
+                **{name: 0.0 for name in LOSS_WEIGHT_KEYS},
+                "one_step_score": 1.0,
+                "samples": len(dataset) if indices is None else len(indices),
+            }
+
+        def capture_metric(_stream: object, record: dict[str, object]) -> None:
+            metric_records.append(record)
+
+        candidate_indices = list(range(8))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "dataset_digest_sha256": "trainer-probe-dataset",
+                        "split_identities": {"train": [], "validation": []},
+                    }
+                )
+            )
+            arguments = train_module.argparse.Namespace(
+                dataset=str(root),
+                model_path="unused.xml",
+                output=str(root / "output"),
+                overfit_samples=(8 if pipeline_overfit else None),
+                steps=1,
+                seed=7,
+                hidden_size=4,
+                batch_size=4,
+                learning_rate=1.0e-3,
+                evaluation_batch_size=4,
+                overfit_acceptance_ratio=0.5,
+                rollout_finetune_frames=0,
+                rollout_finetune_steps=None,
+                resume=None,
+            )
+            with patch.object(
+                train_module,
+                "_distributed_context",
+                return_value=(0, 1, 0, torch.device("cpu")),
+            ), patch.object(
+                train_module, "_dataset_root", return_value=root
+            ), patch.object(
+                train_module, "PFNNShardDataset", return_value=rows
+            ), patch.object(
+                train_module,
+                "consecutive_overfit_subset",
+                return_value=candidate_indices,
+            ), patch.object(
+                train_module,
+                "choose_runtime_seed",
+                return_value=training_module.finite_runtime_seed(),
+            ), patch.object(
+                train_module.TorchG1ForwardKinematics,
+                "from_mjcf",
+                return_value=_ZeroKinematics(),
+            ), patch.object(
+                train_module,
+                "PhaseFunctionedNetwork",
+                return_value=model,
+            ), patch.object(
+                train_module,
+                "fitted_transition_pair_receipt",
+                side_effect=record_receipt,
+            ), patch.object(
+                train_module, "one_step_metrics", side_effect=evaluation_metrics
+            ), patch.object(
+                train_module, "_append_metric", side_effect=capture_metric
+            ), patch.object(
+                train_module,
+                "save_checkpoint",
+                side_effect=OneStepMetricCaptured,
+            ), patch.object(
+                train_module,
+                "_batch",
+                side_effect=AssertionError(
+                    "isolated-row batch path reached during pair training"
+                ),
+            ) as isolated_batch, patch.object(
+                train_module,
+                "_predecessor_batch",
+                wraps=train_module._predecessor_batch,
+            ) as predecessor_batch:
+                with self.assertRaises(OneStepMetricCaptured):
+                    train_module.train(arguments)
+
+        expected_active_rows = 8 if pipeline_overfit else 10
+        matching_receipts = [
+            receipt
+            for receipt in receipts
+            if receipt["active_row_count"] == expected_active_rows
+        ]
+        self.assertTrue(matching_receipts)
+        self.assertEqual(predecessor_batch.call_count, 1)
+        isolated_batch.assert_not_called()
+        self.assertEqual(len(evaluation_rows), 2)
+        evaluation_dataset, evaluation_indices = evaluation_rows[0]
+        if pipeline_overfit:
+            self.assertEqual(len(evaluation_dataset), 8)
+            self.assertEqual(list(evaluation_indices or ()), list(range(8)))
+            self.assertNotIn("current", evaluation_dataset[0])
+        self.assertIsNotNone(model.weight.grad)
+        self.assertGreater(float(model.weight.grad.abs()), 0.0)
+        one_step_records = [
+            record for record in metric_records if record.get("stage") == "one_step"
+        ]
+        self.assertEqual(len(one_step_records), 1)
+        return {
+            "receipt": matching_receipts[-1],
+            "metric": one_step_records[0],
+        }
 
     def test_physical_envelope_risks_use_exact_margins_and_phase_gradients(
         self,
@@ -807,6 +1136,142 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 "joint_step", "joint_limit", "phase"
             )),
         )
+
+    def test_one_step_envelope_uses_predecessor_target_and_reaches_model_gradient(
+        self,
+    ) -> None:
+        model = _SingleParameterEnvelopeModel(dtype=torch.float64)
+        current = torch.zeros(4, INPUT_LAYOUT.size, dtype=torch.float64)
+        phase = torch.zeros(4, dtype=torch.float64)
+        target = torch.zeros(4, OUTPUT_LAYOUT.size, dtype=torch.float64)
+        target[:, OUTPUT_LAYOUT["joint_position"].start] = 0.29
+        predecessor = torch.zeros_like(target)
+        losses = training_module.one_step_training_losses(
+            model,
+            current,
+            phase,
+            target,
+            predecessor,
+            normalization=_normalization(),
+            joint_limits=torch.tensor([[-1.0, 1.0]] * 29, dtype=torch.float64),
+            phase_advance_cap=0.50,
+            contract=training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+            global_ordinals=torch.arange(len(current), dtype=torch.int64),
+            rank=0,
+            world_size=1,
+        )
+        self.assertAlmostEqual(
+            float(losses["joint_step_envelope"].detach()), 18.0, places=12
+        )
+        losses["physical_envelope_total"].backward()
+        self.assertGreater(float(model.weight.grad.abs()), 0.0)
+
+    def test_one_step_rejects_nonfinite_envelope_before_backward(self) -> None:
+        model = _SingleParameterEnvelopeModel(dtype=torch.float64)
+        batch = torch.zeros(2, OUTPUT_LAYOUT.size, dtype=torch.float64)
+        nonfinite = training_module.PhysicalEnvelopeLosses(
+            {"physical_envelope_total": torch.tensor(float("inf"))},
+            reductions={},
+        )
+        with patch.object(
+            training_module, "physical_envelope_loss", return_value=nonfinite
+        ), self.assertRaisesRegex(FloatingPointError, "envelope"):
+            training_module.one_step_training_losses(
+                model,
+                torch.zeros(2, INPUT_LAYOUT.size, dtype=torch.float64),
+                torch.zeros(2, dtype=torch.float64),
+                batch,
+                batch,
+                normalization=_normalization(),
+                joint_limits=torch.tensor(
+                    [[-1.0, 1.0]] * 29, dtype=torch.float64
+                ),
+                phase_advance_cap=0.50,
+                contract=training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+                global_ordinals=torch.arange(2, dtype=torch.int64),
+                rank=0,
+                world_size=1,
+            )
+
+    def test_two_rank_global_max_plus_active_tail_matches_single_rank(
+        self,
+    ) -> None:
+        model = _SingleParameterEnvelopeModel(
+            1.0, coefficient_input=True, dtype=torch.float64
+        )
+        current = torch.zeros(4, INPUT_LAYOUT.size, dtype=torch.float64)
+        current[:, 0] = torch.tensor(
+            (1.0, math.sqrt(2.0), math.sqrt(2.0), 0.0),
+            dtype=torch.float64,
+        )
+        target = torch.zeros(4, OUTPUT_LAYOUT.size, dtype=torch.float64)
+        reference = training_module.one_step_training_losses(
+            model,
+            current,
+            torch.zeros(4, dtype=torch.float64),
+            target,
+            torch.zeros_like(target),
+            normalization=_normalization(),
+            joint_limits=torch.tensor([[-1.0, 1.0]] * 29, dtype=torch.float64),
+            phase_advance_cap=0.50,
+            contract=training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+            global_ordinals=torch.arange(4, dtype=torch.int64),
+            rank=0,
+            world_size=1,
+        )
+        reference["joint_step_envelope"].backward()
+        expected_loss = float(reference["joint_step_envelope"].detach())
+        expected_gradient = float(model.weight.grad)
+
+        results = _spawn_one_step_envelope_workers()
+        self.assertTrue(all("error" not in result for result in results), results)
+        for result in results:
+            self.assertAlmostEqual(float(result["loss"]), expected_loss, places=7)
+            self.assertAlmostEqual(
+                float(result["gradient"]), expected_gradient, places=7
+            )
+
+    def test_one_step_trainer_uses_mode_local_pairs_metrics_and_no_isolated_rows(
+        self,
+    ) -> None:
+        pipeline = self._run_one_step_trainer_probe(pipeline_overfit=True)
+        full = self._run_one_step_trainer_probe(pipeline_overfit=False)
+        self.assertEqual(pipeline["receipt"]["active_row_count"], 8)
+        self.assertEqual(pipeline["receipt"]["sample_count"], 4)
+        self.assertEqual(full["receipt"]["active_row_count"], 10)
+        self.assertEqual(full["receipt"]["sample_count"], 5)
+        self.assertNotEqual(
+            pipeline["receipt"]["receipt_sha256"],
+            full["receipt"]["receipt_sha256"],
+        )
+        for probe in (pipeline, full):
+            metric = probe["metric"]
+            self.assertEqual(metric["samples"], 4)
+            self.assertIn("joint_step_envelope", metric["losses"])
+            expected_metric_keys = {"pair_count"}
+            expected_metric_keys.update(
+                f"{family}_{suffix}"
+                for family in ("joint_step", "joint_limit", "phase")
+                for suffix in (
+                    "maximum_risk",
+                    "cvar",
+                    "tail_count",
+                    "active_count",
+                    "positive_tail_mean",
+                    "family_loss",
+                )
+            )
+            self.assertEqual(
+                set(metric["envelope_metrics"]), expected_metric_keys
+            )
+            self.assertEqual(metric["envelope_metrics"]["pair_count"], 4)
+            for family in ("joint_step", "joint_limit", "phase"):
+                self.assertEqual(
+                    metric["envelope_metrics"][f"{family}_tail_count"], 1
+                )
+                self.assertIsInstance(
+                    metric["envelope_metrics"][f"{family}_active_count"], int
+                )
 
     def test_two_rank_global_max_plus_tail_table_and_gradients(self) -> None:
         cases = {
@@ -3065,7 +3530,9 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                     "split_identity": "walk1_subject1",
                     "split": "train",
                     "sequence_lane": "motion",
-                    "terrain_class": "flat",
+                    "terrain_class": (
+                        "flat", "ascent", "descent", "transition"
+                    )[center % 4],
                 }
 
             def __len__(self) -> int:
@@ -3084,6 +3551,14 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 return self
 
         rows = Rows()
+        active_runtime_seed = finite_runtime_seed()
+        active_runtime_seed["provenance"].update(
+            {
+                "first_fitted_clip_id": "walk1_subject1",
+                "first_fitted_sequence_lane": "motion",
+                "first_fitted_center_frame": 10,
+            }
+        )
         active_seed = 7 + 97
         active_sequence_count = 2
         model = PhaseFunctionedNetwork(hidden_size=8, dropout_probability=0.30)
@@ -3158,6 +3633,10 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                     train_module.TorchG1ForwardKinematics,
                     "from_mjcf",
                     return_value=Kinematics(),
+                ), patch.object(
+                    train_module,
+                    "choose_runtime_seed",
+                    return_value=active_runtime_seed,
                 ), patch.object(
                     train_module, "load_checkpoint", return_value=loaded
                 ), patch.object(

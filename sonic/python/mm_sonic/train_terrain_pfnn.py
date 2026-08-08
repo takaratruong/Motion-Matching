@@ -29,6 +29,7 @@ from mm_sonic.terrain_pfnn.runtime import (
 from mm_sonic.terrain_pfnn.splits import split_identity, terrain_identity
 from mm_sonic.terrain_pfnn.training import (
     DEFAULT_LOSS_WEIGHTS,
+    DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
     LOSS_WEIGHT_KEYS,
     autoregressive_unroll,
     choose_runtime_seed,
@@ -37,6 +38,7 @@ from mm_sonic.terrain_pfnn.training import (
     fitted_row_sha256,
     load_checkpoint,
     one_step_metrics,
+    one_step_training_losses,
     pfnn_losses,
     restore_training_state,
     save_checkpoint,
@@ -50,6 +52,12 @@ from mm_sonic.terrain_pfnn.training import (
 _TERRAIN_CLASSES = ("flat", "ascent", "descent", "transition")
 _SEQUENCE_LANES = ("motion", *(f"idle_phase_{index}" for index in range(8)))
 _PIPELINE_KNOWN_TERRAIN_IDENTITY = "slope_001"
+_ENVELOPE_FAMILIES = ("joint_step", "joint_limit", "phase")
+_ENVELOPE_LOSS_METRIC_KEYS = tuple(
+    f"{family}_{suffix}"
+    for family in _ENVELOPE_FAMILIES
+    for suffix in ("maximum", "cvar", "positive_tail_mean", "envelope")
+) + ("physical_envelope_total",)
 
 
 class DeterministicSequenceSampler:
@@ -1306,7 +1314,6 @@ def train(
     train_dataset = PFNNShardDataset(root, "train")
     phase_q99 = training_phase_advance_q99(train_dataset)
     phase_advance_cap = min(math.pi, 1.5 * phase_q99)
-    terrain_classes = _terrain_classes(train_dataset)
     all_indices = list(range(len(train_dataset)))
     kinematics = TorchG1ForwardKinematics.from_mjcf(arguments.model_path).to(device)
     if arguments.overfit_samples is not None:
@@ -1334,15 +1341,32 @@ def train(
         pipeline_overfit = True
         fitted_receipt = fitted_subset_metadata(train_dataset, candidate_indices)
         optimization_dataset = materialize_subset(train_dataset, candidate_indices)
-        optimization_classes = _terrain_classes(optimization_dataset)
         optimization_indices = list(range(len(optimization_dataset)))
     else:
         candidate_indices = all_indices
         pipeline_overfit = False
         fitted_receipt = None
         optimization_dataset = train_dataset
-        optimization_classes = terrain_classes
         optimization_indices = candidate_indices
+
+    pair_records = validate_canonical_transition_pairs(
+        optimization_dataset,
+        canonical_transition_pairs(optimization_dataset),
+    )
+    pair_receipt = fitted_transition_pair_receipt(optimization_dataset)
+    pair_dataset = materialize_transition_pairs(optimization_dataset)
+    pair_classes = [
+        str(pair_dataset[index]["current"]["terrain_class"])
+        for index in range(len(pair_dataset))
+    ]
+    pair_indices = list(range(len(pair_dataset)))
+    if (
+        len(pair_records) != len(pair_dataset)
+        or pair_receipt["sample_count"] != len(pair_dataset)
+        or pair_receipt["class_counts"]
+        != {name: pair_classes.count(name) for name in _TERRAIN_CLASSES}
+    ):
+        raise RuntimeError("active transition-pair population is inconsistent")
 
     runtime_seed = choose_runtime_seed(
         optimization_dataset,
@@ -1414,6 +1438,9 @@ def train(
     restored_sampler_epoch, restored_sampler_global_offset = 0, 0
     restored_sequence_sampler_state: dict[str, object] | None = None
     if arguments.resume is not None:
+        validate_fitted_transition_pair_receipt(
+            pair_receipt, optimization_dataset
+        )
         resumed = load_checkpoint(
             arguments.resume,
             expected_dataset_digest=manifest["dataset_digest_sha256"],
@@ -1491,8 +1518,8 @@ def train(
     if arguments.resume is not None:
         global_epoch = (
             _balanced_epoch_indices(
-                optimization_indices,
-                optimization_classes,
+                pair_indices,
+                pair_classes,
                 seed=arguments.seed,
                 epoch=restored_sampler_epoch,
             )
@@ -1510,8 +1537,8 @@ def train(
         if local_offset + arguments.batch_size > len(local_epoch):
             global_epoch = (
                 _balanced_epoch_indices(
-                    optimization_indices,
-                    optimization_classes,
+                    pair_indices,
+                    pair_classes,
                     seed=arguments.seed,
                     epoch=epoch,
                 )
@@ -1528,14 +1555,36 @@ def train(
             epoch += 1
         batch_indices = local_epoch[local_offset : local_offset + arguments.batch_size]
         local_offset += arguments.batch_size
-        x, phase, y = _batch(optimization_dataset, batch_indices, device)
+        if len(batch_indices) != arguments.batch_size or not batch_indices:
+            raise RuntimeError(
+                "padded pair sampler produced an invalid local batch"
+            )
+        x, phase, y, predecessor_y = _predecessor_batch(
+            pair_dataset, batch_indices, device
+        )
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        losses = pfnn_losses(
-            model(x, phase),
+        losses = one_step_training_losses(
+            model,
+            x,
+            phase,
             y,
-            model=unwrapped,
+            predecessor_y,
             normalization=train_dataset,
+            joint_limits=kinematics.joint_limits,
+            phase_advance_cap=phase_advance_cap,
+            contract=DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+            global_ordinals=(
+                torch.arange(
+                    len(batch_indices),
+                    device=device,
+                    dtype=torch.int64,
+                )
+                * world_size
+                + rank
+            ),
+            rank=rank,
+            world_size=world_size,
             kinematics=kinematics,
             loss_weights=DEFAULT_LOSS_WEIGHTS,
         )
@@ -1547,14 +1596,44 @@ def train(
             raise FloatingPointError(f"nonfinite gradient at step {step + 1}")
         optimizer.step()
         step += 1
+        reported_loss_keys = (
+            *LOSS_WEIGHT_KEYS,
+            *_ENVELOPE_LOSS_METRIC_KEYS,
+            "total",
+        )
         values = torch.stack(
-            [losses[name].detach() for name in (*LOSS_WEIGHT_KEYS, "total")]
+            [losses[name].detach() for name in reported_loss_keys]
         ).to(torch.float64)
         if world_size > 1:
             dist.all_reduce(values, op=dist.ReduceOp.SUM)
             values /= world_size
         if rank == 0:
             assert metric_stream is not None
+            scalar_losses = {
+                name: float(values[index])
+                for index, name in enumerate(reported_loss_keys)
+            }
+            envelope_metrics: dict[str, object] = {
+                "pair_count": len(batch_indices) * world_size,
+            }
+            for family in _ENVELOPE_FAMILIES:
+                reduction = losses.envelope_reductions[family]
+                envelope_metrics.update(
+                    {
+                        f"{family}_maximum_risk": scalar_losses[
+                            f"{family}_maximum"
+                        ],
+                        f"{family}_cvar": scalar_losses[f"{family}_cvar"],
+                        f"{family}_tail_count": reduction.tail_count,
+                        f"{family}_active_count": reduction.active_count,
+                        f"{family}_positive_tail_mean": scalar_losses[
+                            f"{family}_positive_tail_mean"
+                        ],
+                        f"{family}_family_loss": scalar_losses[
+                            f"{family}_envelope"
+                        ],
+                    }
+                )
             _append_metric(
                 metric_stream,
                 {
@@ -1562,10 +1641,8 @@ def train(
                     "stage": "one_step",
                     "step": step,
                     "epoch": epoch,
-                    "losses": {
-                        name: float(values[index])
-                        for index, name in enumerate((*LOSS_WEIGHT_KEYS, "total"))
-                    },
+                    "losses": scalar_losses,
+                    "envelope_metrics": envelope_metrics,
                     "learning_rate": optimizer.param_groups[0]["lr"],
                     "gradient_norm": float(gradient_norm),
                     "samples": step * arguments.batch_size * world_size,
