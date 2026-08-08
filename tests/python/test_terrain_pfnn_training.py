@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import tempfile
 from pathlib import Path
 import unittest
@@ -14,6 +16,8 @@ from mm_sonic.evaluate_terrain_pfnn import (
     validate_checkpoint_kinematics,
 )
 from mm_sonic.train_terrain_pfnn import (
+    consecutive_overfit_subset,
+    fitted_subset_metadata,
     materialize_subset,
     overfit_gate_accepted,
     promote_pipeline_best,
@@ -27,6 +31,7 @@ from mm_sonic.terrain_pfnn.training import (
     DEFAULT_LOSS_WEIGHTS,
     LOSS_WEIGHT_KEYS,
     autoregressive_unroll,
+    choose_runtime_seed,
     finite_runtime_seed,
     load_checkpoint,
     pfnn_losses,
@@ -47,6 +52,139 @@ def _normalization() -> dict[str, np.ndarray]:
 
 
 class TerrainPFNNTrainingTests(unittest.TestCase):
+    def test_overfit_subset_is_consecutive_source_sealed_and_mixed_terrain(self) -> None:
+        class Rows:
+            split = "train"
+
+            def __init__(self) -> None:
+                self.rows: list[dict[str, object]] = []
+                for clip, centers in (
+                    ("terrain_slopes__slope_000__001", range(20, 24)),
+                    ("terrain_slopes__slope_000__000", range(10, 15)),
+                    ("terrain_slopes__slope_001__000", range(30, 36)),
+                ):
+                    for center in centers:
+                        self.rows.append({
+                            "clip_id": clip,
+                            "center_frame": center,
+                            "split_identity": clip.split("__")[1],
+                            "split": "train",
+                            "terrain_class": (
+                                "flat" if center in (10, 11) else "ascent"
+                            ),
+                        })
+                # Duplicate augmentation at center 12 must remove that center and
+                # split the otherwise consecutive source run into two runs.
+                duplicate = next(
+                    row for row in self.rows
+                    if row["clip_id"].endswith("__000")
+                    and row["center_frame"] == 12
+                )
+                self.rows.append(dict(duplicate))
+
+            def __len__(self) -> int:
+                return len(self.rows)
+
+            def __getitem__(self, index: int) -> dict[str, object]:
+                return self.rows[index]
+
+        rows = Rows()
+        selected = consecutive_overfit_subset(rows, 6)
+        keys = [
+            (rows[index]["clip_id"], rows[index]["center_frame"])
+            for index in selected
+        ]
+        self.assertEqual(keys, [
+            ("terrain_slopes__slope_000__000", 10),
+            ("terrain_slopes__slope_000__000", 11),
+            ("terrain_slopes__slope_000__000", 13),
+            ("terrain_slopes__slope_000__000", 14),
+            ("terrain_slopes__slope_000__001", 20),
+            ("terrain_slopes__slope_000__001", 21),
+        ])
+        metadata = fitted_subset_metadata(rows, selected)
+        self.assertEqual(metadata["split"], "train")
+        self.assertEqual(metadata["class_counts"], {
+            "flat": 2, "ascent": 4, "descent": 0, "transition": 0,
+        })
+        self.assertEqual(len(metadata["rows"]), 6)
+        self.assertEqual(len(metadata["rows_sha256"]), 64)
+
+    def test_runtime_seed_predecessor_and_first_input_are_inside_fitted_run(self) -> None:
+        class Rows:
+            split = "train"
+            x_mean = np.zeros(INPUT_LAYOUT.size, np.float32)
+            x_std = np.ones(INPUT_LAYOUT.size, np.float32)
+            y_mean = np.zeros(OUTPUT_LAYOUT.size, np.float32)
+            y_std = np.ones(OUTPUT_LAYOUT.size, np.float32)
+
+            def __init__(self, start: int = 10) -> None:
+                self.rows = [self._row(center) for center in range(start, 31)]
+
+            @staticmethod
+            def _state(center: int) -> tuple[np.ndarray, np.ndarray]:
+                trajectory = np.zeros((12, 2), np.float32)
+                trajectory[:, 0] = np.linspace(-0.2, 0.8, 12) + center * 0.001
+                direction = np.zeros((12, 2), np.float32)
+                direction[:, 0] = 1.0
+                body = np.full((30, 3), center * 0.001, np.float32)
+                return np.concatenate((trajectory.ravel(), direction.ravel())), body
+
+            def _row(self, center: int) -> dict[str, object]:
+                current_trajectory, current_body = self._state(center)
+                target_trajectory, target_body = self._state(center + 1)
+                x = np.zeros(INPUT_LAYOUT.size, np.float32)
+                x[INPUT_LAYOUT["trajectory_position"]] = current_trajectory[:24]
+                x[INPUT_LAYOUT["trajectory_direction"]] = current_trajectory[24:]
+                x[INPUT_LAYOUT["previous_body_position"]] = current_body.ravel() * 0.1
+                x[INPUT_LAYOUT["previous_body_velocity"]] = current_body.ravel() * 0.1
+                y = np.zeros(OUTPUT_LAYOUT.size, np.float32)
+                y[OUTPUT_LAYOUT["trajectory_position"]] = target_trajectory[:24]
+                y[OUTPUT_LAYOUT["trajectory_direction"]] = target_trajectory[24:]
+                y[OUTPUT_LAYOUT["body_position"]] = target_body.ravel()
+                y[OUTPUT_LAYOUT["body_velocity"]] = target_body.ravel()
+                y[OUTPUT_LAYOUT["root_height"]] = 0.8
+                y[OUTPUT_LAYOUT["root_planar_velocity"]] = (center * 0.001, 0.0)
+                y[OUTPUT_LAYOUT["phase_advance"]] = 0.1
+                y[OUTPUT_LAYOUT["contact_logit"]] = (1.0, 0.0, 1.0, 0.0)
+                return {
+                    "x": x,
+                    "y": y,
+                    "phase": np.float32(center * 0.1),
+                    "clip_id": "terrain_slopes__slope_000__000",
+                    "center_frame": center,
+                    "split_identity": "slope_000",
+                    "split": "train",
+                    "terrain_class": "flat",
+                }
+
+            def __len__(self) -> int:
+                return len(self.rows)
+
+            def __getitem__(self, index: int) -> dict[str, object]:
+                return self.rows[index]
+
+        rows = Rows()
+        seed = choose_runtime_seed(rows, torch.tensor([[-2.0, 2.0]] * 29))
+        self.assertEqual(
+            {name: value for name, value in seed["provenance"].items() if name != "speed"},
+            {
+            "predecessor_clip_id": "terrain_slopes__slope_000__000",
+            "predecessor_center_frame": 10,
+            "first_fitted_clip_id": "terrain_slopes__slope_000__000",
+            "first_fitted_center_frame": 11,
+            },
+        )
+        self.assertAlmostEqual(seed["provenance"]["speed"], 0.011)
+        torch.testing.assert_close(seed["phase"], torch.tensor(1.1))
+        torch.testing.assert_close(
+            seed["body_position"], torch.full((30, 3), 0.011)
+        )
+        isolated = Rows()
+        isolated.rows = isolated.rows[:1]
+        with self.assertRaisesRegex(ValueError, "fitted consecutive"):
+            choose_runtime_seed(isolated, torch.tensor([[-2.0, 2.0]] * 29))
+
     def test_rollout_default_depends_on_pipeline_mode_and_explicit_value_wins(self) -> None:
         resolve = train_module.resolve_rollout_finetune_frames
         self.assertEqual(resolve(None, pipeline_overfit=True), 0)
@@ -251,6 +389,19 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             model.parameters(), lr=1.0e-3, weight_decay=0.0
         )
         seed = finite_runtime_seed()
+        fitted_rows = [{
+            "clip_id": "terrain_slopes__slope_000__000", "center_frame": 10
+        }]
+        fitted_subset = {
+            "split": "train",
+            "rows": fitted_rows,
+            "rows_sha256": hashlib.sha256(json.dumps(
+                fitted_rows, sort_keys=True, separators=(",", ":")
+            ).encode()).hexdigest(),
+            "class_counts": {
+                "flat": 1, "ascent": 0, "descent": 0, "transition": 0,
+            },
+        }
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "checkpoint.pt"
             save_checkpoint(
@@ -258,6 +409,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 dataset_digest="abc", kinematic_signature_sha256="def",
                 runtime_seed=seed, step=17, epoch=3,
                 sampler_epoch=2, sampler_global_offset=8,
+                fitted_subset=fitted_subset,
             )
             payload = torch.load(path, map_location="cpu", weights_only=True)
             self.assertEqual(payload["input_layout"], [list(field) for field in INPUT_LAYOUT.fields])
@@ -278,6 +430,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             self.assertEqual(loaded.sampler_epoch, 2)
             self.assertEqual(loaded.sampler_global_offset, 8)
             self.assertEqual(loaded.runtime_seed.keys(), seed.keys())
+            self.assertEqual(loaded.fitted_subset, fitted_subset)
             class MatchingKinematics:
                 kinematic_signature_sha256 = "def"
                 joint_limits = torch.tensor(

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 import math
 import os
 from pathlib import Path
@@ -29,7 +31,7 @@ from .layout import (
 from .model import PhaseFunctionedNetwork
 
 
-CHECKPOINT_SCHEMA = "mm-sonic-terrain-pfnn-checkpoint/v1"
+CHECKPOINT_SCHEMA = "mm-sonic-terrain-pfnn-checkpoint/v2"
 _NORMALIZATION_CONTRACT = {
     "continuous_loss_domain": "normalized",
     "contact_loss_domain": "raw_logits_binary_labels",
@@ -387,72 +389,146 @@ def training_phase_advance_q99(dataset: object) -> float:
 def choose_runtime_seed(
     dataset: object, joint_limits: object
 ) -> dict[str, object]:
-    """Choose the deterministic lowest-speed flat reached state from training."""
+    """Choose a fitted recurrent state whose first inference is also fitted.
+
+    A candidate row ``t`` must have its unique same-clip predecessor ``t-1``
+    present in this dataset.  The seed is predecessor ``y`` (the reached state
+    at ``t``), and its recurrent body/trajectory/phase are checked against row
+    ``t`` before it can be serialized.  Thus passing a materialized overfit
+    dataset prevents seed selection from escaping the fitted rows.
+    """
 
     if getattr(dataset, "split", None) != "train":
         raise ValueError("runtime seed may only be selected from training data")
     limits = torch.as_tensor(joint_limits, dtype=torch.float64, device="cpu")
     y_mean = np.asarray(dataset.y_mean, dtype=np.float64)
     y_std = np.asarray(dataset.y_std, dtype=np.float64)
-    best_key: tuple[float, str, int] | None = None
-    best: dict[str, object] | None = None
+    x_mean = np.asarray(dataset.x_mean, dtype=np.float64)
+    x_std = np.asarray(dataset.x_std, dtype=np.float64)
+    if (
+        x_mean.shape != (INPUT_LAYOUT.size,)
+        or x_std.shape != (INPUT_LAYOUT.size,)
+        or not np.isfinite(x_mean).all()
+        or not np.isfinite(x_std).all()
+        or np.any(x_std <= 0.0)
+    ):
+        raise ValueError("runtime seed input normalization is invalid")
+    rows: dict[tuple[str, int], list[tuple[int, Mapping[str, object]]]] = {}
     for index in range(len(dataset)):
         sample = dataset[index]
-        if sample["terrain_class"] != "flat":
-            continue
-        physical = np.asarray(sample["y"], dtype=np.float64) * y_std + y_mean
-        joints = physical[OUTPUT_LAYOUT["joint_position"]]
+        clip = str(sample.get("clip_id", ""))
+        center = sample.get("center_frame")
         if (
-            not np.isfinite(physical).all()
-            or np.any(joints < limits[:, 0].numpy())
-            or np.any(joints > limits[:, 1].numpy())
+            not clip
+            or type(center) is not int
+            or center < 0
+            or sample.get("split") != "train"
         ):
+            raise ValueError("runtime seed fitted row provenance is invalid")
+        rows.setdefault((clip, center), []).append((index, sample))
+
+    unique = {key: value[0] for key, value in rows.items() if len(value) == 1}
+    candidates: list[tuple[tuple[float, str, int], int, Mapping[str, object], Mapping[str, object]]] = []
+    for (clip, center), (_, sample) in unique.items():
+        predecessor_entry = unique.get((clip, center - 1))
+        if sample.get("terrain_class") != "flat" or predecessor_entry is None:
             continue
-        speed = float(np.linalg.norm(physical[OUTPUT_LAYOUT["root_planar_velocity"]]))
-        key = (speed, str(sample["clip_id"]), int(sample["center_frame"]))
-        if best_key is not None and key >= best_key:
+        suffix = 1
+        while (clip, center + suffix) in unique:
+            suffix += 1
+        physical_target = np.asarray(sample["y"], dtype=np.float64) * y_std + y_mean
+        if not np.isfinite(physical_target).all():
             continue
-        phase_advance = float(physical[OUTPUT_LAYOUT["phase_advance"]][0])
-        phase = (float(sample["phase"]) + max(0.0, phase_advance)) % (2.0 * math.pi)
-        best_key = key
-        best = {
+        speed = float(
+            np.linalg.norm(physical_target[OUTPUT_LAYOUT["root_planar_velocity"]])
+        )
+        candidates.append(
+            ((speed, clip, center), suffix, predecessor_entry[1], sample)
+        )
+    if not candidates:
+        raise ValueError("training split has no fitted consecutive flat runtime seed")
+    long = [candidate for candidate in candidates if candidate[1] >= 16]
+    key, _, predecessor, first_fitted = min(
+        long if long else candidates, key=lambda candidate: candidate[0]
+    )
+    speed, clip, center = key
+    predecessor_physical = (
+        np.asarray(predecessor["y"], dtype=np.float64) * y_std + y_mean
+    )
+    joints = predecessor_physical[OUTPUT_LAYOUT["joint_position"]]
+    if (
+        not np.isfinite(predecessor_physical).all()
+        or np.any(joints < limits[:, 0].numpy())
+        or np.any(joints > limits[:, 1].numpy())
+    ):
+        raise ValueError("fitted runtime seed is nonfinite or outside joint limits")
+
+    first_input = np.asarray(first_fitted["x"], dtype=np.float64).copy()
+    if first_input.shape != (INPUT_LAYOUT.size,) or not np.isfinite(first_input).all():
+        raise ValueError("first fitted recurrent input is invalid")
+    for field in ("previous_body_position", "previous_body_velocity"):
+        first_input[INPUT_LAYOUT[field]] /= 0.1
+    first_input = first_input * x_std + x_mean
+    recurrent_pairs = (
+        ("trajectory_position", "trajectory_position"),
+        ("trajectory_direction", "trajectory_direction"),
+        ("body_position", "previous_body_position"),
+        ("body_velocity", "previous_body_velocity"),
+    )
+    for output_name, input_name in recurrent_pairs:
+        left = predecessor_physical[OUTPUT_LAYOUT[output_name]]
+        right = first_input[INPUT_LAYOUT[input_name]]
+        if not np.allclose(left, right, rtol=3.0e-5, atol=3.0e-5):
+            raise ValueError(
+                f"fitted recurrent {output_name} does not reconstruct first input"
+            )
+    phase_advance = max(
+        0.0, float(predecessor_physical[OUTPUT_LAYOUT["phase_advance"]][0])
+    )
+    phase = (float(predecessor["phase"]) + phase_advance) % (2.0 * math.pi)
+    first_phase = float(first_fitted["phase"])
+    phase_error = abs((phase - first_phase + math.pi) % (2.0 * math.pi) - math.pi)
+    if phase_error > 3.0e-5:
+        raise ValueError("fitted recurrent phase does not reconstruct first input")
+    best = {
             "phase": torch.tensor(phase, dtype=torch.float32),
             "world_xy": torch.zeros(2, dtype=torch.float32),
             "world_yaw": torch.tensor(0.0, dtype=torch.float32),
             "root_height": torch.tensor(
-                float(physical[OUTPUT_LAYOUT["root_height"]][0]), dtype=torch.float32
+                float(predecessor_physical[OUTPUT_LAYOUT["root_height"]][0]),
+                dtype=torch.float32,
             ),
             "root_tilt": torch.as_tensor(
-                physical[OUTPUT_LAYOUT["root_tilt"]].copy(), dtype=torch.float32
+                predecessor_physical[OUTPUT_LAYOUT["root_tilt"]].copy(), dtype=torch.float32
             ),
             "joint_position": torch.as_tensor(joints.copy(), dtype=torch.float32),
             "body_position": torch.as_tensor(
-                physical[OUTPUT_LAYOUT["body_position"]].reshape(30, 3).copy(),
+                predecessor_physical[OUTPUT_LAYOUT["body_position"]].reshape(30, 3).copy(),
                 dtype=torch.float32,
             ),
             "body_velocity": torch.as_tensor(
-                physical[OUTPUT_LAYOUT["body_velocity"]].reshape(30, 3).copy(),
+                predecessor_physical[OUTPUT_LAYOUT["body_velocity"]].reshape(30, 3).copy(),
                 dtype=torch.float32,
             ),
             "trajectory_position": torch.as_tensor(
-                physical[OUTPUT_LAYOUT["trajectory_position"]].reshape(12, 2).copy(),
+                predecessor_physical[OUTPUT_LAYOUT["trajectory_position"]].reshape(12, 2).copy(),
                 dtype=torch.float32,
             ),
             "trajectory_direction": torch.as_tensor(
-                physical[OUTPUT_LAYOUT["trajectory_direction"]].reshape(12, 2).copy(),
+                predecessor_physical[OUTPUT_LAYOUT["trajectory_direction"]].reshape(12, 2).copy(),
                 dtype=torch.float32,
             ),
             "contact_label": torch.as_tensor(
-                physical[OUTPUT_LAYOUT["contact_logit"]].copy(), dtype=torch.float32
+                predecessor_physical[OUTPUT_LAYOUT["contact_logit"]].copy(), dtype=torch.float32
             ),
             "provenance": {
-                "clip_id": str(sample["clip_id"]),
-                "center_frame": int(sample["center_frame"]),
+                "predecessor_clip_id": str(predecessor["clip_id"]),
+                "predecessor_center_frame": int(predecessor["center_frame"]),
+                "first_fitted_clip_id": clip,
+                "first_fitted_center_frame": center,
                 "speed": speed,
             },
         }
-    if best is None:
-        raise ValueError("training split has no finite in-limit flat runtime seed")
     return _validate_runtime_seed(best, limits)
 
 
@@ -556,7 +632,13 @@ def finite_runtime_seed() -> dict[str, object]:
         "trajectory_position": torch.zeros(12, 2, dtype=torch.float32),
         "trajectory_direction": direction,
         "contact_label": torch.zeros(4, dtype=torch.float32),
-        "provenance": {"clip_id": "synthetic", "center_frame": 0, "speed": 0.0},
+        "provenance": {
+            "predecessor_clip_id": "synthetic",
+            "predecessor_center_frame": 0,
+            "first_fitted_clip_id": "synthetic",
+            "first_fitted_center_frame": 1,
+            "speed": 0.0,
+        },
     }
 
 
@@ -593,11 +675,20 @@ def _validate_runtime_seed(
         else:
             if (
                 type(value) is not dict
-                or set(value) != {"clip_id", "center_frame", "speed"}
-                or type(value["clip_id"]) is not str
-                or not value["clip_id"]
-                or type(value["center_frame"]) is not int
-                or value["center_frame"] < 0
+                or set(value) != {
+                    "predecessor_clip_id", "predecessor_center_frame",
+                    "first_fitted_clip_id", "first_fitted_center_frame", "speed",
+                }
+                or any(
+                    type(value[name]) is not str or not value[name]
+                    for name in ("predecessor_clip_id", "first_fitted_clip_id")
+                )
+                or any(
+                    type(value[name]) is not int or value[name] < 0
+                    for name in (
+                        "predecessor_center_frame", "first_fitted_center_frame"
+                    )
+                )
                 or (
                     type(value["speed"]) is not float
                     if exact_tensors
@@ -607,8 +698,10 @@ def _validate_runtime_seed(
             ):
                 raise ValueError("runtime seed provenance is invalid")
             output[name] = {
-                "clip_id": value["clip_id"],
-                "center_frame": value["center_frame"],
+                "predecessor_clip_id": value["predecessor_clip_id"],
+                "predecessor_center_frame": value["predecessor_center_frame"],
+                "first_fitted_clip_id": value["first_fitted_clip_id"],
+                "first_fitted_center_frame": value["first_fitted_center_frame"],
                 "speed": float(value["speed"]),
             }
     joints = output["joint_position"]
@@ -637,6 +730,58 @@ def _validated_sampler_state(value: object) -> dict[str, int]:
     ):
         raise ValueError("checkpoint sampler state is invalid")
     return {"epoch": value["epoch"], "global_offset": value["global_offset"]}
+
+
+def _validated_fitted_subset(value: object) -> dict[str, object] | None:
+    if value is None:
+        return None
+    if type(value) is not dict or set(value) != {
+        "split", "rows", "rows_sha256", "class_counts"
+    }:
+        raise ValueError("checkpoint fitted subset is invalid")
+    rows = value["rows"]
+    counts = value["class_counts"]
+    if (
+        value["split"] != "train"
+        or type(rows) is not list
+        or not rows
+        or type(counts) is not dict
+        or set(counts) != {"flat", "ascent", "descent", "transition"}
+        or any(type(counts[name]) is not int or counts[name] < 0 for name in counts)
+        or sum(counts.values()) != len(rows)
+    ):
+        raise ValueError("checkpoint fitted subset is invalid")
+    checked_rows: list[dict[str, object]] = []
+    seen: set[tuple[str, int]] = set()
+    for row in rows:
+        if (
+            type(row) is not dict
+            or set(row) != {"clip_id", "center_frame"}
+            or type(row["clip_id"]) is not str
+            or not row["clip_id"]
+            or type(row["center_frame"]) is not int
+            or row["center_frame"] < 0
+        ):
+            raise ValueError("checkpoint fitted subset is invalid")
+        key = (row["clip_id"], row["center_frame"])
+        if key in seen:
+            raise ValueError("checkpoint fitted subset is invalid")
+        seen.add(key)
+        checked_rows.append({"clip_id": key[0], "center_frame": key[1]})
+    encoded = json.dumps(
+        checked_rows, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    if value["rows_sha256"] != digest:
+        raise ValueError("checkpoint fitted subset digest mismatch")
+    return {
+        "split": "train",
+        "rows": checked_rows,
+        "rows_sha256": digest,
+        "class_counts": {name: counts[name] for name in (
+            "flat", "ascent", "descent", "transition"
+        )},
+    }
 
 
 def selection_metadata(
@@ -759,6 +904,7 @@ _CHECKPOINT_KEYS = {
     "train_identities", "validation_identities", "step", "epoch", "seed",
     "loss_weights", "kinematic_signature_sha256", "joint_limits",
     "phase_advance_q99", "runtime_seed", "selection", "sampler_state",
+    "fitted_subset",
 }
 
 
@@ -784,6 +930,7 @@ class LoadedCheckpoint:
     code_commit: str
     sampler_epoch: int
     sampler_global_offset: int
+    fitted_subset: dict[str, object] | None
 
     def build_model(self) -> PhaseFunctionedNetwork:
         model = PhaseFunctionedNetwork(
@@ -815,6 +962,7 @@ def save_checkpoint(
     code_commit: str | None = None,
     sampler_epoch: int = 0,
     sampler_global_offset: int = 0,
+    fitted_subset: Mapping[str, object] | None = None,
 ) -> None:
     unwrapped = model.module if hasattr(model, "module") else model
     if not isinstance(unwrapped, PhaseFunctionedNetwork):
@@ -881,6 +1029,9 @@ def save_checkpoint(
             None if selection is None else dict(selection)
         ),
         "sampler_state": sampler_state,
+        "fitted_subset": _validated_fitted_subset(
+            None if fitted_subset is None else dict(fitted_subset)
+        ),
     }
     plain = _plain_cpu(payload)
     if not isinstance(plain, dict) or not _finite_tree(plain):
@@ -1111,6 +1262,7 @@ def load_checkpoint(
     optimizer_state = _validate_optimizer_state(payload["optimizer_state"], probe)
     selection = _validated_selection(payload["selection"])
     sampler_state = _validated_sampler_state(payload["sampler_state"])
+    fitted_subset = _validated_fitted_subset(payload["fitted_subset"])
     return LoadedCheckpoint(
         schema=payload["schema"],
         step=payload["step"],
@@ -1132,6 +1284,7 @@ def load_checkpoint(
         code_commit=payload["code_commit"],
         sampler_epoch=sampler_state["epoch"],
         sampler_global_offset=sampler_state["global_offset"],
+        fitted_subset=fitted_subset,
     )
 
 

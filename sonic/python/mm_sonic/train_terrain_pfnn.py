@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -123,6 +124,127 @@ def stratified_subset(
     if len(output) != count:
         raise ValueError("could not construct the requested stratified subset")
     return output
+
+
+def consecutive_overfit_subset(dataset: object, count: int) -> list[int]:
+    """Select source-sealed consecutive GRAIL slope runs for pipeline overfit.
+
+    Identities, clip variants, and maximal runs are traversed lexicographically.
+    A center emitted more than once (idle phase augmentation) is excluded and is
+    therefore a hard run boundary.  This makes every retained successor an
+    actual recurrent sample instead of an unrelated stratified row.
+    """
+
+    if getattr(dataset, "split", None) != "train":
+        raise ValueError("overfit subset may only be selected from training data")
+    if type(count) is not int or count < 1 or count > len(dataset):
+        raise ValueError("overfit subset count is outside the dataset")
+    grouped: dict[str, dict[str, dict[int, list[tuple[int, str]]]]] = {}
+    for index in range(len(dataset)):
+        sample = dataset[index]
+        clip = str(sample.get("clip_id", ""))
+        identity = str(sample.get("split_identity", ""))
+        row_split = sample.get("split")
+        center = sample.get("center_frame")
+        terrain_class = str(sample.get("terrain_class", ""))
+        if (
+            not clip
+            or not identity
+            or row_split != "train"
+            or type(center) is not int
+            or center < 0
+            or terrain_class not in _TERRAIN_CLASSES
+            or terrain_identity(clip) != identity
+            or split_identity(identity) != "train"
+        ):
+            raise ValueError("overfit subset row provenance is not source sealed")
+        # GRAIL slope identities are the only source with paired terrain and
+        # are preferred ahead of all flat LAFAN identities by contract.
+        if not identity.startswith("slope_"):
+            continue
+        grouped.setdefault(identity, {}).setdefault(clip, {}).setdefault(
+            center, []
+        ).append((index, terrain_class))
+
+    selected: list[int] = []
+    selected_classes: list[str] = []
+    for identity in sorted(grouped):
+        for clip in sorted(grouped[identity]):
+            by_center = grouped[identity][clip]
+            unique = sorted(
+                center for center, rows in by_center.items() if len(rows) == 1
+            )
+            runs: list[list[int]] = []
+            for center in unique:
+                if not runs or center != runs[-1][-1] + 1:
+                    runs.append([center])
+                else:
+                    runs[-1].append(center)
+            for run in runs:
+                for center in run:
+                    index, terrain_class = by_center[center][0]
+                    selected.append(index)
+                    selected_classes.append(terrain_class)
+                    if len(selected) == count:
+                        break
+                if len(selected) == count:
+                    break
+            if len(selected) == count:
+                break
+        if len(selected) == count:
+            break
+    if len(selected) != count:
+        raise ValueError("GRAIL training slopes lack the requested consecutive rows")
+    if "flat" not in selected_classes or not any(
+        value in ("ascent", "descent", "transition")
+        for value in selected_classes
+    ):
+        raise ValueError("consecutive overfit subset must contain flat and slope rows")
+    return selected
+
+
+def fitted_subset_metadata(
+    dataset: object, indices: Sequence[int]
+) -> dict[str, object]:
+    """Return the exact fitted row receipt stored in checkpoint and report."""
+
+    if getattr(dataset, "split", None) != "train":
+        raise ValueError("fitted subset receipt must describe training rows")
+    rows: list[dict[str, object]] = []
+    counts = {name: 0 for name in _TERRAIN_CLASSES}
+    seen: set[tuple[str, int]] = set()
+    for raw_index in indices:
+        sample = dataset[int(raw_index)]
+        clip = str(sample.get("clip_id", ""))
+        center = sample.get("center_frame")
+        terrain_class = str(sample.get("terrain_class", ""))
+        identity = str(sample.get("split_identity", ""))
+        key = (clip, center) if type(center) is int else (clip, -1)
+        if (
+            not clip
+            or type(center) is not int
+            or center < 0
+            or terrain_class not in counts
+            or sample.get("split") != "train"
+            or terrain_identity(clip) != identity
+            or split_identity(identity) != "train"
+            or key in seen
+        ):
+            raise ValueError("fitted subset receipt contains an invalid row")
+        seen.add(key)
+        counts[terrain_class] += 1
+        rows.append({"clip_id": clip, "center_frame": center})
+    if not rows:
+        raise ValueError("fitted subset receipt cannot be empty")
+    encoded = json.dumps(
+        rows, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    return {
+        "split": "train",
+        "rows": rows,
+        "rows_sha256": hashlib.sha256(encoded).hexdigest(),
+        "class_counts": counts,
+    }
 
 
 def _balanced_epoch_indices(
@@ -323,19 +445,19 @@ def train(arguments: argparse.Namespace) -> dict[str, object] | None:
     all_indices = list(range(len(train_dataset)))
     if arguments.overfit_samples is not None:
         candidate_indices = (
-            stratified_subset(
-                terrain_classes, arguments.overfit_samples, seed=arguments.seed
-            )
+            consecutive_overfit_subset(train_dataset, arguments.overfit_samples)
             if rank == 0 else None
         )
         candidate_indices = _broadcast_indices(candidate_indices, device)
         pipeline_overfit = True
+        fitted_receipt = fitted_subset_metadata(train_dataset, candidate_indices)
         optimization_dataset = materialize_subset(train_dataset, candidate_indices)
         optimization_classes = _terrain_classes(optimization_dataset)
         optimization_indices = list(range(len(optimization_dataset)))
     else:
         candidate_indices = all_indices
         pipeline_overfit = False
+        fitted_receipt = None
         optimization_dataset = train_dataset
         optimization_classes = terrain_classes
         optimization_indices = candidate_indices
@@ -676,7 +798,7 @@ def train(arguments: argparse.Namespace) -> dict[str, object] | None:
     validation_identities = manifest["split_identities"]["validation"]
     phase_q99 = training_phase_advance_q99(train_dataset)
     runtime_seed = choose_runtime_seed(
-        train_dataset, kinematics.joint_limits.detach().cpu()
+        optimization_dataset, kinematics.joint_limits.detach().cpu()
     )
     promote_best = promote_pipeline_best(
         pipeline_overfit=pipeline_overfit, accepted=one_step_accepted
@@ -708,6 +830,7 @@ def train(arguments: argparse.Namespace) -> dict[str, object] | None:
         selection=selection,
         sampler_epoch=max(0, epoch - 1),
         sampler_global_offset=local_offset * world_size,
+        fitted_subset=fitted_receipt,
     )
     load_checkpoint(
         candidate,
@@ -736,6 +859,7 @@ def train(arguments: argparse.Namespace) -> dict[str, object] | None:
             selection=selection,
             sampler_epoch=max(0, epoch - 1),
             sampler_global_offset=local_offset * world_size,
+            fitted_subset=fitted_receipt,
         )
         best_path = str(best)
     report = {
@@ -743,6 +867,7 @@ def train(arguments: argparse.Namespace) -> dict[str, object] | None:
         "dataset_digest_sha256": dataset_digest,
         "kinematic_signature_sha256": kinematics.kinematic_signature_sha256,
         "fixed_subset_samples": len(candidate_indices) if pipeline_overfit else None,
+        "fitted_subset": fitted_receipt,
         "initial": initial_metrics,
         "final": gate_metrics,
         "loss_ratio": float(gate_metrics["one_step_score"])
@@ -806,6 +931,8 @@ if __name__ == "__main__":
 __all__ = [
     "main",
     "materialize_subset",
+    "consecutive_overfit_subset",
+    "fitted_subset_metadata",
     "overfit_gate_accepted",
     "promote_pipeline_best",
     "resolve_rollout_finetune_frames",
