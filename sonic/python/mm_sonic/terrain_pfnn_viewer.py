@@ -11,9 +11,12 @@ import time
 from typing import Iterable
 
 import numpy as np
+import torch
 
 from .gear_action import isaaclab_to_mujoco_joint_vector
+from .train_classic_g1_pfnn import load_classic_checkpoint
 from .terrain_pfnn.hill_map import TerrainPFNNHillMap
+from .terrain_pfnn.kinematics import TorchG1ForwardKinematics
 from .terrain_pfnn.runtime import FPS, TerrainPFNNRuntime, TerrainSample
 
 
@@ -26,10 +29,14 @@ DEFAULT_SCENE = Path(
     "assets/skeletons/g1/scene_29dof.xml"
 )
 DEFAULT_DATASET = Path(
-    "sonic/runs/terrain-pfnn-v1/canary-dataset-recurrence-v2/manifest.json"
+    "sonic/runs/terrain-pfnn-classic-g1/dataset/manifest.json"
 )
 DEFAULT_CHECKPOINT = Path(
-    "sonic/runs/terrain-pfnn-v1/pipeline-overfit-physical-envelope-v3/best.pt"
+    "sonic/runs/terrain-pfnn-classic-g1/model/best.pt"
+)
+DEFAULT_IDLE_CLIPS = Path(
+    "/home/ubuntu/projects/gear-sonic-pinned-60de0df/"
+    "motionbricks/out/G1-clip.ckpt"
 )
 
 
@@ -39,6 +46,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--scene-xml", type=Path, default=DEFAULT_SCENE)
+    parser.add_argument("--idle-clips", type=Path, default=DEFAULT_IDLE_CLIPS)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--speed", type=float, default=0.8)
     parser.add_argument("--max-steps", type=int, default=1_000_000)
@@ -117,7 +125,7 @@ def _upright_yaw_quaternion(quaternion_wxyz: object) -> np.ndarray:
     )
 
 
-def _validate(arguments: argparse.Namespace) -> tuple[Path, Path, Path, Path]:
+def _validate(arguments: argparse.Namespace) -> tuple[Path, Path, Path, Path, Path]:
     paths = tuple(
         Path(value).expanduser().resolve()
         for value in (
@@ -125,6 +133,7 @@ def _validate(arguments: argparse.Namespace) -> tuple[Path, Path, Path, Path]:
             arguments.dataset,
             arguments.model_path,
             arguments.scene_xml,
+            arguments.idle_clips,
         )
     )
     missing = tuple(path for path in paths if not path.is_file())
@@ -139,7 +148,38 @@ def _validate(arguments: argparse.Namespace) -> tuple[Path, Path, Path, Path]:
     return paths  # type: ignore[return-value]
 
 
-def _build_scene(scene_xml: Path, terrain: TerrainPFNNHillMap) -> tuple[object, object]:
+def _motionbricks_idle_mujoco_qpos(path: Path) -> np.ndarray:
+    """Load MotionBricks' native G1 idle keyframe without executable pickle."""
+
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError("MotionBricks G1 idle clips cannot be loaded safely") from error
+    if type(payload) is not dict:
+        raise ValueError("MotionBricks G1 idle clips are invalid")
+    qpos = payload.get("mujoco_qpos")
+    counts = payload.get("num_frames_per_clip")
+    if (
+        not isinstance(qpos, torch.Tensor)
+        or qpos.ndim != 3
+        or qpos.shape[0] < 1
+        or qpos.shape[1] < 1
+        or qpos.shape[2] != 36
+        or not isinstance(counts, torch.Tensor)
+        or counts.shape != (qpos.shape[0],)
+        or int(counts[0]) < 1
+        or not bool(torch.isfinite(qpos[0, 0]).all())
+    ):
+        raise ValueError("MotionBricks G1 idle clips are invalid")
+    result = np.asarray(qpos[0, 0].to(dtype=torch.float64), dtype=np.float64).copy()
+    if result[2] <= 0.0 or not np.isclose(np.linalg.norm(result[3:7]), 1.0, atol=1.0e-4):
+        raise ValueError("MotionBricks G1 idle keyframe is invalid")
+    return result
+
+
+def _build_scene(
+    scene_xml: Path, terrain: TerrainPFNNHillMap, idle_clips: Path
+) -> tuple[object, object]:
     import mujoco
 
     spec = mujoco.MjSpec.from_file(str(scene_xml))
@@ -159,6 +199,7 @@ def _build_scene(scene_xml: Path, terrain: TerrainPFNNHillMap) -> tuple[object, 
         rgba=(0.16, 0.42, 0.20, 1.0),
     )
     model = spec.compile()
+    model.qpos0[7:36] = _motionbricks_idle_mujoco_qpos(idle_clips)[7:36]
     floor = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
     if floor >= 0:
         model.geom_rgba[floor, 3] = 0.0
@@ -171,9 +212,10 @@ def _apply_frame(model: object, data: object, frame: object) -> None:
     data.qpos[3:7] = _upright_yaw_quaternion(
         frame.root_quaternion_world_wxyz
     )
-    data.qpos[7:36] = isaaclab_to_mujoco_joint_vector(
-        frame.joint_position_isaaclab
-    )
+    if not bool(frame.diagnostics.get("initial_idle_pose_held", False)):
+        data.qpos[7:36] = isaaclab_to_mujoco_joint_vector(
+            frame.joint_position_isaaclab
+        )
 
 
 def _trace(step: int, frame: object, terrain: _HillTerrainCallback) -> str:
@@ -188,7 +230,8 @@ def _trace(step: int, frame: object, terrain: _HillTerrainCallback) -> str:
         f"{frame.root_position_world[1]:.3f}) z={frame.root_position_world[2]:.3f} "
         f"grade={grade:.2f} phase={frame.phase:.3f} "
         f"advance={float(diagnostics.get('phase_advance', 0.0)):.3f} "
-        f"speed={float(diagnostics.get('desired_speed_m_s', 0.0)):.3f} "
+        f"requested={float(diagnostics.get('desired_speed_m_s', 0.0)):.3f} "
+        f"realized={float(diagnostics.get('realized_speed_m_s', 0.0)):.3f} "
         f"contacts={contacts} hold={diagnostics.get('hold_reason', '-')}"
     )
 
@@ -204,25 +247,29 @@ def _load_runtime(
     digest = manifest.get("dataset_digest_sha256")
     if type(digest) is not str or len(digest) != 64:
         raise ValueError("dataset manifest digest is invalid")
-    return TerrainPFNNRuntime.from_checkpoint(
-        checkpoint,
-        dataset_digest=digest,
-        model_path=model_path,
+    loaded = load_classic_checkpoint(checkpoint)
+    if loaded.dataset_digest != digest:
+        raise ValueError("classic PFNN checkpoint dataset digest mismatch")
+    kinematics = TorchG1ForwardKinematics.from_mjcf(model_path)
+    return TerrainPFNNRuntime(
+        checkpoint=loaded,
+        kinematics=kinematics,
         height_and_grade_at=terrain,
         device=arguments.device,
         enforce_motion_envelope=False,
         command_driven_root=False,
+        hold_idle_pose=True,
     )
 
 
 def _run(arguments: argparse.Namespace) -> int:
-    checkpoint, dataset, model_path, scene_xml = _validate(arguments)
+    checkpoint, dataset, model_path, scene_xml, idle_clips = _validate(arguments)
     terrain_map = _viewer_terrain_map()
     terrain = _HillTerrainCallback(terrain_map)
     runtime = _load_runtime(
         arguments, checkpoint, dataset, model_path, terrain
     )
-    model, data = _build_scene(scene_xml, terrain_map)
+    model, data = _build_scene(scene_xml, terrain_map, idle_clips)
     import mujoco
 
     def advance(step: int, command: np.ndarray) -> object:

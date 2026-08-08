@@ -255,6 +255,7 @@ class TerrainPFNNRuntime:
         device: str | torch.device = "cpu",
         enforce_motion_envelope: bool = True,
         command_driven_root: bool = False,
+        hold_idle_pose: bool = False,
     ) -> None:
         if not callable(height_and_grade_at):
             raise TypeError("height_and_grade_at must be callable")
@@ -262,6 +263,8 @@ class TerrainPFNNRuntime:
             raise TypeError("enforce_motion_envelope must be bool")
         if type(command_driven_root) is not bool:
             raise TypeError("command_driven_root must be bool")
+        if type(hold_idle_pose) is not bool:
+            raise TypeError("hold_idle_pose must be bool")
         signature = getattr(kinematics, "kinematic_signature_sha256", None)
         if signature != getattr(checkpoint, "kinematic_signature_sha256", None):
             raise ValueError("checkpoint kinematic signature mismatch")
@@ -288,6 +291,7 @@ class TerrainPFNNRuntime:
         self._checkpoint = checkpoint
         self._enforce_motion_envelope = enforce_motion_envelope
         self._command_driven_root = command_driven_root
+        self._hold_idle_pose = hold_idle_pose
         self._device = torch.device(device)
         self._limits_tensor = torch.as_tensor(
             self._limits, dtype=torch.float64, device=self._device
@@ -422,6 +426,7 @@ class TerrainPFNNRuntime:
                 "runtime_seed_provenance": dict(seed["provenance"]),
                 "phase_advance": 0.0,
                 "desired_speed_m_s": 0.0,
+                "realized_speed_m_s": 0.0,
             },
         )
 
@@ -436,6 +441,7 @@ class TerrainPFNNRuntime:
         device: str | torch.device = "cpu",
         enforce_motion_envelope: bool = True,
         command_driven_root: bool = False,
+        hold_idle_pose: bool = False,
     ) -> "TerrainPFNNRuntime":
         kinematics = TorchG1ForwardKinematics.from_mjcf(model_path)
         checkpoint = load_checkpoint(
@@ -452,6 +458,7 @@ class TerrainPFNNRuntime:
             device=device,
             enforce_motion_envelope=enforce_motion_envelope,
             command_driven_root=command_driven_root,
+            hold_idle_pose=hold_idle_pose,
         )
 
     @property
@@ -587,6 +594,22 @@ class TerrainPFNNRuntime:
             return self._hold("invalid_command")
         desired_world = requested @ _rotation_2d(float(camera_yaw)).T
         requested_speed = float(np.linalg.norm(desired_world))
+        if self._hold_idle_pose and requested_speed < 1.0e-8:
+            diagnostics = dict(self._frame.diagnostics)
+            diagnostics.pop("hold_reason", None)
+            diagnostics.update(
+                {
+                    "wall_tick": self._wall_tick,
+                    "desired_speed_m_s": 0.0,
+                    "requested_speed_m_s": 0.0,
+                    "realized_speed_m_s": 0.0,
+                    "command_driven_root": self._command_driven_root,
+                    "idle_pose_held": True,
+                    "initial_idle_pose_held": self._bootstrap_pending,
+                }
+            )
+            self._frame = replace(self._frame, diagnostics=diagnostics)
+            return self._frame
         if self._command_driven_root and requested_speed < 1.0e-8:
             diagnostics = dict(self._frame.diagnostics)
             diagnostics.pop("hold_reason", None)
@@ -911,6 +934,11 @@ class TerrainPFNNRuntime:
             "hold_count": self._hold_count,
             "desired_speed_m_s": effective_speed,
             "requested_speed_m_s": requested_speed,
+            "realized_speed_m_s": float(
+                torch.linalg.vector_norm(
+                    physical[OUTPUT_LAYOUT["root_planar_velocity"]]
+                )
+            ),
             "phase_advance": phase_advance,
             "raw_phase_advance": raw_phase_advance,
             "terrain_grade_degrees": new_support.absolute_grade_degrees,

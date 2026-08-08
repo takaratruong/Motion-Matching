@@ -170,6 +170,7 @@ class TerrainPFNNRuntimeTests(unittest.TestCase):
         checkpoint: FakeCheckpoint | None = None,
         enforce_motion_envelope: bool = True,
         command_driven_root: bool = False,
+        hold_idle_pose: bool = False,
     ) -> TerrainPFNNRuntime:
         return TerrainPFNNRuntime(
             checkpoint=FakeCheckpoint() if checkpoint is None else checkpoint,
@@ -178,6 +179,7 @@ class TerrainPFNNRuntimeTests(unittest.TestCase):
             height_and_grade_at=terrain,
             enforce_motion_envelope=enforce_motion_envelope,
             command_driven_root=command_driven_root,
+            hold_idle_pose=hold_idle_pose,
         )
 
     def test_checkpoint_seed_is_the_exact_reached_bootstrap_state(self) -> None:
@@ -391,6 +393,42 @@ class TerrainPFNNRuntimeTests(unittest.TestCase):
             float(np.max(np.abs(second.joint_position_isaaclab - first.joint_position_isaaclab))),
             0.25,
         )
+
+    def test_raw_runtime_reports_network_realized_speed_separately_from_command(self) -> None:
+        model = FakeModel([physical_output(planar_velocity=(0.6, 0.0))])
+        runtime = self.make_runtime(model, enforce_motion_envelope=False)
+
+        frame = runtime.step(np.asarray((0.9, 0.0)), camera_yaw=0.0)
+
+        self.assertAlmostEqual(frame.diagnostics["requested_speed_m_s"], 0.9)
+        self.assertAlmostEqual(frame.diagnostics["desired_speed_m_s"], 0.9)
+        self.assertAlmostEqual(frame.diagnostics["realized_speed_m_s"], 0.6, places=6)
+        self.assertAlmostEqual(frame.root_position_world[0], 0.6 / 30.0, places=7)
+
+    def test_raw_runtime_can_hold_idle_without_overriding_moving_root(self) -> None:
+        model = FakeModel([physical_output(planar_velocity=(0.6, 0.0))])
+        runtime = self.make_runtime(
+            model,
+            enforce_motion_envelope=False,
+            command_driven_root=False,
+            hold_idle_pose=True,
+        )
+        initial = runtime.frame
+
+        idle = runtime.step(np.zeros(2), camera_yaw=0.0)
+        moving = runtime.step(np.asarray((0.9, 0.0)), camera_yaw=0.0)
+
+        self.assertEqual(model.inputs.__len__(), 1)
+        np.testing.assert_array_equal(idle.root_position_world, initial.root_position_world)
+        np.testing.assert_array_equal(idle.joint_position_isaaclab, initial.joint_position_isaaclab)
+        self.assertTrue(idle.diagnostics["idle_pose_held"])
+        self.assertTrue(idle.diagnostics["initial_idle_pose_held"])
+        self.assertFalse(idle.diagnostics["command_driven_root"])
+        self.assertAlmostEqual(moving.root_position_world[0], 0.6 / 30.0, places=7)
+
+        stopped = runtime.step(np.zeros(2), camera_yaw=0.0)
+        self.assertTrue(stopped.diagnostics["idle_pose_held"])
+        self.assertFalse(stopped.diagnostics["initial_idle_pose_held"])
 
     def test_command_driven_preview_root_tracks_command_and_stops_on_release(self) -> None:
         model = FakeModel(
