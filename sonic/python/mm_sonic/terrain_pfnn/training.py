@@ -851,6 +851,84 @@ def pfnn_losses(
     return losses
 
 
+def _collective_finite_preflight(
+    tensors: Sequence[object],
+    *,
+    rank: int,
+    world_size: int,
+    message: str,
+    error_type: type[Exception],
+) -> None:
+    """Reject rank-local nonfinite tensors through one fixed-size collective."""
+
+    import torch.distributed as dist
+
+    initialized = dist.is_available() and dist.is_initialized()
+    actual_rank = dist.get_rank() if initialized else 0
+    actual_world_size = dist.get_world_size() if initialized else 1
+    backend_name = str(dist.get_backend()).lower() if initialized else "gloo"
+    metadata_device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if backend_name == "nccl"
+        else torch.device("cpu")
+    )
+    values = tuple(tensors)
+    valid = bool(
+        values
+        and all(
+            isinstance(value, torch.Tensor) and value.is_floating_point()
+            for value in values
+        )
+    )
+    try:
+        finite = bool(
+            valid and all(torch.isfinite(value).all() for value in values)
+        )
+    except (TypeError, RuntimeError):
+        finite = False
+
+    def int64_or_sentinel(value: object) -> int:
+        if (
+            type(value) is not int
+            or value < -(1 << 63)
+            or value > (1 << 63) - 1
+        ):
+            return -1
+        return value
+
+    metadata = torch.tensor(
+        (
+            1,
+            int(valid),
+            int(finite),
+            int64_or_sentinel(rank),
+            int64_or_sentinel(world_size),
+            actual_rank,
+            actual_world_size,
+        ),
+        dtype=torch.int64,
+        device=metadata_device,
+    )
+    gathered = [torch.empty_like(metadata) for _ in range(actual_world_size)]
+    if initialized:
+        dist.all_gather(gathered, metadata)
+    else:
+        gathered[0].copy_(metadata)
+    collected = torch.stack(gathered).cpu()
+    expected_ranks = torch.arange(actual_world_size, dtype=torch.int64)
+    if (
+        torch.any(collected[:, 0] != 1)
+        or not torch.all(collected[:, 1] == 1)
+        or not torch.equal(collected[:, 3], expected_ranks)
+        or torch.any(collected[:, 4] != actual_world_size)
+        or not torch.equal(collected[:, 5], expected_ranks)
+        or torch.any(collected[:, 6] != actual_world_size)
+    ):
+        raise ValueError("one-step finiteness metadata is invalid")
+    if not torch.all(collected[:, 2] == 1):
+        raise error_type(message)
+
+
 def one_step_training_losses(
     model: nn.Module,
     current_inputs: torch.Tensor,
@@ -871,6 +949,13 @@ def one_step_training_losses(
     """Compute one exact current-target update from its reached predecessor."""
 
     prediction = model(current_inputs, current_phase)
+    _collective_finite_preflight(
+        (prediction, current_targets, predecessor_targets),
+        rank=rank,
+        world_size=world_size,
+        message="one-step physical tensors must be finite on every rank",
+        error_type=ValueError,
+    )
     losses = pfnn_losses(
         prediction,
         current_targets,
@@ -890,11 +975,22 @@ def one_step_training_losses(
         rank=rank,
         world_size=world_size,
     )
-    envelope_values = torch.stack(tuple(envelope.values()))
-    if not torch.isfinite(envelope_values).all():
-        raise FloatingPointError("nonfinite physical envelope loss")
+    _collective_finite_preflight(
+        tuple(envelope.values()),
+        rank=rank,
+        world_size=world_size,
+        message="physical envelope losses must be finite on every rank",
+        error_type=FloatingPointError,
+    )
     losses.update(envelope)
     losses["total"] = losses["total"] + envelope["physical_envelope_total"]
+    _collective_finite_preflight(
+        (losses["total"],),
+        rank=rank,
+        world_size=world_size,
+        message="one-step total must be finite on every rank",
+        error_type=FloatingPointError,
+    )
     return OneStepTrainingLosses(
         losses,
         envelope_reductions=envelope.reductions,

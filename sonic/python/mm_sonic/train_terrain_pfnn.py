@@ -1168,6 +1168,21 @@ def _predecessor_batch(
     )
 
 
+def _one_step_optimizer_step(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    *,
+    step: int,
+) -> torch.Tensor:
+    """Clip DDP-synchronized gradients and step only when all are finite."""
+
+    gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    if not torch.isfinite(gradient_norm):
+        raise FloatingPointError(f"nonfinite gradient at step {step}")
+    optimizer.step()
+    return gradient_norm
+
+
 def _terrain_classes(dataset: object) -> list[str]:
     return [str(dataset[index]["terrain_class"]) for index in range(len(dataset))]
 
@@ -1306,6 +1321,11 @@ def train(
     import torch.distributed as dist
 
     rank, world_size, local_rank, device = _distributed_context(arguments.seed)
+    if arguments.resume is not None:
+        raise ValueError(
+            "resume requires a checkpoint-bound fitted transition pair receipt; "
+            "checkpoint v5 is not resumable"
+        )
     root = _dataset_root(arguments.dataset)
     try:
         manifest = json.loads((root / "manifest.json").read_text())
@@ -1591,10 +1611,11 @@ def train(
         if not torch.isfinite(losses["total"]):
             raise FloatingPointError(f"nonfinite training loss at step {step + 1}")
         losses["total"].backward()
-        gradient_norm = torch.nn.utils.clip_grad_norm_(unwrapped.parameters(), 1.0)
-        if not torch.isfinite(gradient_norm):
-            raise FloatingPointError(f"nonfinite gradient at step {step + 1}")
-        optimizer.step()
+        gradient_norm = _one_step_optimizer_step(
+            unwrapped,
+            optimizer,
+            step=step + 1,
+        )
         step += 1
         reported_loss_keys = (
             *LOSS_WEIGHT_KEYS,

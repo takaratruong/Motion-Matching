@@ -209,6 +209,23 @@ class _TargetEnvelopePairRows:
         return self.rows[index]
 
 
+class _RankLocalNonfiniteGradient(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: object, value: torch.Tensor, trigger: torch.Tensor
+    ) -> torch.Tensor:
+        ctx.nonfinite = bool(trigger.detach().cpu())
+        return value
+
+    @staticmethod
+    def backward(
+        ctx: object, gradient: torch.Tensor
+    ) -> tuple[torch.Tensor, None]:
+        if ctx.nonfinite:
+            gradient = torch.full_like(gradient, float("nan"))
+        return gradient, None
+
+
 class _SingleParameterEnvelopeModel(torch.nn.Module):
     """Small PFNN-shaped model for predecessor-aware trainer regressions."""
 
@@ -217,6 +234,7 @@ class _SingleParameterEnvelopeModel(torch.nn.Module):
         weight: float = 0.30,
         *,
         coefficient_input: bool = False,
+        nonfinite_gradient_input: bool = False,
         dtype: torch.dtype = torch.float32,
     ) -> None:
         super().__init__()
@@ -230,6 +248,7 @@ class _SingleParameterEnvelopeModel(torch.nn.Module):
         mask[OUTPUT_LAYOUT["joint_position"].start] = 1.0
         self.register_buffer("joint_mask", mask)
         self.coefficient_input = coefficient_input
+        self.nonfinite_gradient_input = nonfinite_gradient_input
 
     @property
     def weight(self) -> torch.nn.Parameter:
@@ -237,15 +256,20 @@ class _SingleParameterEnvelopeModel(torch.nn.Module):
 
     def forward(self, x: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
         del phase
+        weight = self.W0
+        if self.nonfinite_gradient_input:
+            weight = _RankLocalNonfiniteGradient.apply(
+                weight, torch.any(x[:, 1] > 0.0)
+            )
         if self.coefficient_input:
             coefficient = x[:, 0].to(dtype=self.W0.dtype)
             joint = torch.where(
                 coefficient > 0.0,
-                0.225 + 0.025 * coefficient * self.W0,
+                0.225 + 0.025 * coefficient * weight,
                 torch.zeros_like(coefficient),
             )
         else:
-            joint = self.W0.expand(len(x))
+            joint = weight.expand(len(x))
         graph_zero = 0.0 * (self.b0 + self.W1 + self.b1 + self.W2 + self.b2)
         return joint[:, None] * self.joint_mask[None, :] + graph_zero
 
@@ -323,6 +347,7 @@ def _one_step_envelope_ddp_worker(
     rank: int,
     world_size: int,
     init_method: str,
+    case: str,
     queue: object,
 ) -> None:
     """Exercise the actual predecessor-aware one-step loss on two ranks."""
@@ -335,49 +360,120 @@ def _one_step_envelope_ddp_worker(
         init_method=init_method,
         rank=rank,
         world_size=world_size,
-        timeout=timedelta(seconds=10),
+        timeout=timedelta(seconds=5),
     )
+    original_all_gather = dist.all_gather
+    all_gather_count = 0
+    risk_call_count = 0
+    backward_called = False
+    optimizer_step_count = 0
+    model: DistributedDataParallel | None = None
+
+    def tracked_all_gather(*args: object, **kwargs: object) -> object:
+        nonlocal all_gather_count
+        all_gather_count += 1
+        return original_all_gather(*args, **kwargs)
+
+    original_risks = training_module.physical_envelope_risks
+
+    def tracked_risks(*args: object, **kwargs: object) -> object:
+        nonlocal risk_call_count
+        risk_call_count += 1
+        return original_risks(*args, **kwargs)
+
     payload: dict[str, object]
     try:
         model = DistributedDataParallel(
             _SingleParameterEnvelopeModel(
-                1.0, coefficient_input=True, dtype=torch.float64
+                1.0,
+                coefficient_input=True,
+                nonfinite_gradient_input=(case == "gradient_nonfinite"),
+                dtype=torch.float64,
             )
         )
+        optimizer = torch.optim.Adam(model.module.parameters(), lr=1.0e-3)
+        original_step = optimizer.step
+
+        def tracked_step(*args: object, **kwargs: object) -> object:
+            nonlocal optimizer_step_count
+            optimizer_step_count += 1
+            return original_step(*args, **kwargs)
         coefficients = (
             (1.0, math.sqrt(2.0))
             if rank == 0
             else (math.sqrt(2.0), 0.0)
         )
+        if case == "input_nonfinite" and rank == 1:
+            coefficients = (float("inf"), 0.0)
+        elif case == "total_nonfinite":
+            coefficients = (0.0, 0.0)
         ordinals = (0, 2) if rank == 0 else (1, 3)
         current = torch.zeros(2, INPUT_LAYOUT.size, dtype=torch.float64)
         current[:, 0] = torch.tensor(coefficients, dtype=torch.float64)
+        if case == "gradient_nonfinite" and rank == 1:
+            current[0, 1] = 1.0
         target = torch.zeros(2, OUTPUT_LAYOUT.size, dtype=torch.float64)
+        if case == "total_nonfinite" and rank == 1:
+            target[0, OUTPUT_LAYOUT["joint_position"].start] = 1.0e200
         predecessor = torch.zeros_like(target)
-        losses = training_module.one_step_training_losses(
-            model,
-            current,
-            torch.zeros(2, dtype=torch.float64),
-            target,
-            predecessor,
-            normalization=_normalization(),
-            joint_limits=torch.tensor([[-1.0, 1.0]] * 29, dtype=torch.float64),
-            phase_advance_cap=0.50,
-            contract=training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
-            global_ordinals=torch.tensor(ordinals, dtype=torch.int64),
-            rank=rank,
-            world_size=world_size,
-        )
-        losses["joint_step_envelope"].backward()
+        with patch.object(
+            dist, "all_gather", side_effect=tracked_all_gather
+        ), patch.object(
+            training_module,
+            "physical_envelope_risks",
+            side_effect=tracked_risks,
+        ):
+            losses = training_module.one_step_training_losses(
+                model,
+                current,
+                torch.zeros(2, dtype=torch.float64),
+                target,
+                predecessor,
+                normalization=_normalization(),
+                joint_limits=torch.tensor(
+                    [[-1.0, 1.0]] * 29, dtype=torch.float64
+                ),
+                phase_advance_cap=0.50,
+                contract=training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+                global_ordinals=torch.tensor(ordinals, dtype=torch.int64),
+                rank=rank,
+                world_size=world_size,
+            )
+            backward_called = True
+            losses[
+                "total"
+                if case in ("total_nonfinite", "gradient_nonfinite")
+                else "joint_step_envelope"
+            ].backward()
+            if case == "gradient_nonfinite":
+                with patch.object(optimizer, "step", side_effect=tracked_step):
+                    train_module._one_step_optimizer_step(
+                        model.module,
+                        optimizer,
+                        step=1,
+                    )
         payload = {
             "rank": rank,
             "loss": float(losses["joint_step_envelope"].detach()),
             "gradient": float(model.module.weight.grad),
+            "all_gather_count": all_gather_count,
+            "risk_call_count": risk_call_count,
+            "backward_called": backward_called,
+            "optimizer_step_count": optimizer_step_count,
         }
     except Exception as error:  # returned for bounded parent assertions
         payload = {
             "rank": rank,
             "error": (type(error).__name__, str(error)),
+            "all_gather_count": all_gather_count,
+            "risk_call_count": risk_call_count,
+            "backward_called": backward_called,
+            "optimizer_step_count": optimizer_step_count,
+            "gradient_finite": (
+                None
+                if model is None or model.module.weight.grad is None
+                else bool(torch.isfinite(model.module.weight.grad))
+            ),
         }
     finally:
         dist.destroy_process_group()
@@ -579,14 +675,16 @@ def _spawn_global_envelope_workers(case: str) -> list[dict[str, object]]:
     return sorted(results, key=lambda item: int(item["rank"]))
 
 
-def _spawn_one_step_envelope_workers() -> list[dict[str, object]]:
+def _spawn_one_step_envelope_workers(
+    case: str = "finite",
+) -> list[dict[str, object]]:
     context = torch.multiprocessing.get_context("spawn")
     queue = context.SimpleQueue()
     with tempfile.TemporaryDirectory() as temporary:
         init_method = (Path(temporary) / "one-step-gloo-init").as_uri()
         torch.multiprocessing.spawn(
             _one_step_envelope_ddp_worker,
-            args=(2, init_method, queue),
+            args=(2, init_method, case, queue),
             nprocs=2,
             join=True,
         )
@@ -1230,6 +1328,57 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             self.assertAlmostEqual(
                 float(result["gradient"]), expected_gradient, places=7
             )
+
+    def test_two_rank_one_step_nonfinite_rejects_before_risks_or_backward(
+        self,
+    ) -> None:
+        results = _spawn_one_step_envelope_workers("input_nonfinite")
+        self.assertEqual(
+            [result.get("error") for result in results],
+            [
+                (
+                    "ValueError",
+                    "one-step physical tensors must be finite on every rank",
+                )
+            ]
+            * 2,
+        )
+        for result in results:
+            self.assertEqual(result["all_gather_count"], 1)
+            self.assertEqual(result["risk_call_count"], 0)
+            self.assertFalse(result["backward_called"])
+
+    def test_two_rank_one_step_total_finiteness_is_collective_before_backward(
+        self,
+    ) -> None:
+        results = _spawn_one_step_envelope_workers("total_nonfinite")
+        self.assertEqual(
+            [result.get("error") for result in results],
+            [
+                (
+                    "FloatingPointError",
+                    "one-step total must be finite on every rank",
+                )
+            ]
+            * 2,
+        )
+        for result in results:
+            self.assertEqual(result["all_gather_count"], 12)
+            self.assertEqual(result["risk_call_count"], 1)
+            self.assertFalse(result["backward_called"])
+
+    def test_two_rank_nonfinite_ddp_gradient_blocks_every_optimizer_step(
+        self,
+    ) -> None:
+        results = _spawn_one_step_envelope_workers("gradient_nonfinite")
+        self.assertEqual(
+            [result.get("error") for result in results],
+            [("FloatingPointError", "nonfinite gradient at step 1")] * 2,
+        )
+        for result in results:
+            self.assertTrue(result["backward_called"])
+            self.assertEqual(result["optimizer_step_count"], 0)
+            self.assertFalse(result["gradient_finite"])
 
     def test_one_step_trainer_uses_mode_local_pairs_metrics_and_no_isolated_rows(
         self,
@@ -3476,7 +3625,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                     expected_kinematic_signature_sha256="def",
                 )
 
-    def test_train_rejects_active_sequence_sampler_mismatch_before_restore(self) -> None:
+    def test_v5_resume_rejects_missing_pair_receipt_before_restore(self) -> None:
         class Rows:
             split = "train"
 
@@ -3587,19 +3736,14 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 rollout_finetune_steps=1,
                 resume=str(root / "checkpoint.pt"),
             )
-            mismatches = {
-                "count": train_module.DeterministicSequenceSampler(
-                    active_sequence_count + 1,
+            legacy_states = {
+                "matching_sampler": train_module.DeterministicSequenceSampler(
+                    active_sequence_count,
                     batch_size=1,
                     seed=active_seed,
                 ).state_dict(),
-                "seed": train_module.DeterministicSequenceSampler(
-                    active_sequence_count,
-                    batch_size=1,
-                    seed=active_seed + 1,
-                ).state_dict(),
             }
-            for label, sampler_state in mismatches.items():
+            for label, sampler_state in legacy_states.items():
                 checkpoint_path = root / f"checkpoint-{label}.pt"
                 save_checkpoint(
                     checkpoint_path,
@@ -3639,7 +3783,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                     return_value=active_runtime_seed,
                 ), patch.object(
                     train_module, "load_checkpoint", return_value=loaded
-                ), patch.object(
+                ) as checkpoint_loader, patch.object(
                     PhaseFunctionedNetwork,
                     "load_state_dict",
                     side_effect=AssertionError("model restore was reached"),
@@ -3648,8 +3792,11 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                     "load_state_dict",
                     side_effect=AssertionError("Adam restore was reached"),
                 ) as adam_restore:
-                    with self.assertRaisesRegex(ValueError, "sequence sampler"):
+                    with self.assertRaisesRegex(
+                        ValueError, "checkpoint-bound.*pair receipt"
+                    ):
                         train_module.train(arguments)
+                    checkpoint_loader.assert_not_called()
                     model_restore.assert_not_called()
                     adam_restore.assert_not_called()
 
