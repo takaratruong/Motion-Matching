@@ -1426,6 +1426,28 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 atol=1.0e-15,
             )
 
+    def test_smooth_l1_physical_excess_is_overflow_safe_and_rejects_nonfinite(
+        self,
+    ) -> None:
+        for dtype in (torch.float32, torch.float64):
+            excess = torch.tensor(
+                torch.finfo(dtype).max, dtype=dtype, requires_grad=True
+            )
+            value = training_module.smooth_l1_physical_excess(
+                excess, beta=0.05
+            )
+            self.assertTrue(bool(torch.isfinite(value)))
+            self.assertEqual(value.detach(), excess.detach())
+            value.backward()
+            self.assertEqual(excess.grad, torch.ones((), dtype=dtype))
+
+            for invalid in (float("nan"), float("inf"), float("-inf")):
+                with self.subTest(dtype=dtype, invalid=invalid):
+                    with self.assertRaisesRegex(ValueError, "smooth-L1"):
+                        training_module.smooth_l1_physical_excess(
+                            torch.tensor(invalid, dtype=dtype), beta=0.05
+                        )
+
     def test_bounded_surrogates_use_physical_boundaries_and_worst_element(
         self,
     ) -> None:
@@ -3539,6 +3561,45 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
         torch.testing.assert_close(
             rollout.envelope_risks["joint_step"][2, 0],
             torch.tensor(0.0, dtype=torch.float64),
+        )
+
+    def test_task1_rollout_retains_legacy_raw_three_family_schema_and_total(
+        self,
+    ) -> None:
+        rollout = self._unsafe_three_step_rollout()
+        legacy_families = {"joint_step", "joint_limit", "phase"}
+        self.assertEqual(set(rollout.envelope_risks), legacy_families)
+        self.assertEqual(set(rollout.envelope_reductions), legacy_families)
+        self.assertEqual(
+            set(rollout.envelope_counts),
+            {
+                "pair_time_count",
+                *(
+                    f"{family}_{suffix}_pair_time_count"
+                    for family in legacy_families
+                    for suffix in ("objective_active", "runtime_failure")
+                ),
+            },
+        )
+        expected_raw_total = sum(
+            rollout.losses[f"{family}_envelope"]
+            for family in legacy_families
+        )
+        torch.testing.assert_close(
+            rollout.losses["physical_envelope_total"], expected_raw_total
+        )
+        expected_base_total = sum(
+            rollout.losses[name] for name in BASE_LOSS_WEIGHT_KEYS
+        )
+        torch.testing.assert_close(
+            rollout.losses["total"],
+            expected_base_total + expected_raw_total,
+        )
+        self.assertFalse(
+            any(
+                name.startswith("direction_")
+                for name in rollout.losses
+            )
         )
 
     def test_late_rollout_envelope_gradient_reaches_prior_prediction(self) -> None:

@@ -328,24 +328,30 @@ class PhysicalEnvelopeRisks(dict[str, torch.Tensor]):
         self.bounded_surrogates = dict(bounded_surrogates)
 
 
+def _smooth_l1_physical_excess_unchecked(
+    excess: torch.Tensor, *, beta: float
+) -> torch.Tensor:
+    quadratic = torch.clamp(excess, max=beta)
+    return 0.5 * quadratic.square() / beta + torch.relu(excess - beta)
+
+
 def smooth_l1_physical_excess(
     excess: torch.Tensor, *, beta: float
 ) -> torch.Tensor:
-    """Apply exact smooth-L1 to a nonnegative physical excess."""
+    """Apply overflow-safe smooth-L1 to a finite nonnegative excess."""
 
     if (
         not isinstance(excess, torch.Tensor)
         or not excess.is_floating_point()
+        or not torch.isfinite(excess).all()
         or torch.any(excess < 0.0)
         or type(beta) is not float
         or not math.isfinite(beta)
         or beta <= 0.0
     ):
         raise ValueError("smooth-L1 physical excess is invalid")
-    return torch.where(
-        excess < beta,
-        0.5 * excess.square() / beta,
-        excess - 0.5 * beta,
+    return _smooth_l1_physical_excess_unchecked(
+        excess, beta=beta
     )
 
 
@@ -463,14 +469,14 @@ def physical_envelope_risks(
     }
     bounded_surrogates = {
         "joint_step": torch.amax(
-            smooth_l1_physical_excess(
+            _smooth_l1_physical_excess_unchecked(
                 joint_step_excess_rad,
                 beta=contract.joint_step_smooth_l1_beta_rad,
             ),
             dim=1,
         ),
         "joint_limit": torch.amax(
-            smooth_l1_physical_excess(
+            _smooth_l1_physical_excess_unchecked(
                 torch.maximum(
                     lower_limit_excess_rad, upper_limit_excess_rad
                 ),
@@ -480,13 +486,13 @@ def physical_envelope_risks(
         ),
         "phase": torch.maximum(
             lower_phase_excess_rad,
-            smooth_l1_physical_excess(
+            _smooth_l1_physical_excess_unchecked(
                 upper_phase_excess_rad,
                 beta=contract.phase_upper_smooth_l1_beta_rad,
             ),
         ),
         "direction": torch.amax(
-            smooth_l1_physical_excess(
+            _smooth_l1_physical_excess_unchecked(
                 direction_excess,
                 beta=contract.direction_smooth_l1_beta,
             ),
@@ -1561,8 +1567,7 @@ def autoregressive_unroll(
     phases: list[torch.Tensor] = []
     per_step: list[dict[str, torch.Tensor]] = []
     per_step_envelope_risks: dict[str, list[torch.Tensor]] = {
-        name: []
-        for name in ("joint_step", "joint_limit", "phase", "direction")
+        name: [] for name in ("joint_step", "joint_limit", "phase")
     }
     per_step_runtime_failures: dict[str, list[torch.Tensor]] = {
         name: [] for name in per_step_envelope_risks
@@ -1599,8 +1604,8 @@ def autoregressive_unroll(
             phase_advance_cap=phase_advance_cap,
             contract=envelope_contract,
         )
-        for name, risk in step_risks.items():
-            per_step_envelope_risks[name].append(risk)
+        for name in per_step_envelope_risks:
+            per_step_envelope_risks[name].append(step_risks[name])
             per_step_runtime_failures[name].append(
                 step_risks.runtime_failures[name]
             )
