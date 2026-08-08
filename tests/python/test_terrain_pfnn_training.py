@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import tempfile
 from dataclasses import replace
 from datetime import timedelta
@@ -65,6 +66,85 @@ def _normalization() -> dict[str, np.ndarray]:
         "x_std": np.ones(INPUT_LAYOUT.size, np.float32),
         "y_mean": np.zeros(OUTPUT_LAYOUT.size, np.float32),
         "y_std": np.ones(OUTPUT_LAYOUT.size, np.float32),
+    }
+
+
+def _objective_payload() -> dict[str, object]:
+    contract = training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE
+    return {
+        "schema": contract.schema,
+        "joint_step_onset_rad": contract.joint_step_onset_rad,
+        "joint_step_scale_rad": contract.joint_step_scale_rad,
+        "joint_limit_margin_rad": contract.joint_limit_margin_rad,
+        "phase_upper_margin_rad": contract.phase_upper_margin_rad,
+        "phase_scale_rad": contract.phase_scale_rad,
+        "tail_fraction": contract.tail_fraction,
+        "joint_step_hinge_power": contract.joint_step_hinge_power,
+        "joint_limit_hinge_power": contract.joint_limit_hinge_power,
+        "phase_lower_hinge_power": contract.phase_lower_hinge_power,
+        "phase_upper_hinge_power": contract.phase_upper_hinge_power,
+        "maximum_coefficient": contract.maximum_coefficient,
+        "positive_tail_mean_coefficient": (
+            contract.positive_tail_mean_coefficient
+        ),
+    }
+
+
+def _canonical_digest(value: dict[str, object]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode()
+    ).hexdigest()
+
+
+def _pair_receipt(sample_count: int = 4) -> dict[str, object]:
+    base: dict[str, object] = {
+        "schema": "mm-sonic-fitted-transition-pair-receipt/v1",
+        "active_row_count": sample_count + 1,
+        "active_rows_sha256": "1" * 64,
+        "sample_count": sample_count,
+        "class_counts": {
+            "flat": 1,
+            "ascent": 1,
+            "descent": 1,
+            "transition": sample_count - 3,
+        },
+        "pairs_sha256": "2" * 64,
+    }
+    return {**base, "receipt_sha256": _canonical_digest(base)}
+
+
+def _target_envelope_audit(sample_count: int = 4) -> dict[str, object]:
+    base: dict[str, object] = {
+        "schema": "mm-sonic-fitted-target-envelope-audit/v1",
+        "sample_count": sample_count,
+        "joint_step_onset_rad": 0.225,
+        "joint_limit_margin_rad": 0.020,
+        "phase_upper_margin_rad": 0.020,
+        "phase_advance_cap_rad": 1.5 * 0.2,
+        "phase_audit_negative_tolerance_rad": 9.5367431640625e-7,
+        "maximum_joint_step_rad": 0.10,
+        "minimum_joint_limit_clearance_rad": 0.10,
+        "minimum_phase_advance_unclamped_rad": 0.0,
+        "minimum_phase_advance_rad": 0.0,
+        "maximum_phase_advance_rad": 0.10,
+        "joint_step_excess_count": 0,
+        "joint_limit_margin_excess_count": 0,
+        "phase_negative_excess_count": 0,
+        "phase_upper_excess_count": 0,
+    }
+    return {**base, "audit_sha256": _canonical_digest(base)}
+
+
+def _checkpoint_envelope_arguments() -> dict[str, object]:
+    return {
+        "physical_envelope_objective": (
+            training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE
+        ),
+        "fitted_pair_receipt": _pair_receipt(),
+        "target_envelope_audit": _target_envelope_audit(),
+        "phase_advance_q99": 0.2,
     }
 
 
@@ -347,7 +427,7 @@ class _TrainerPairRows:
         x[0] = np.float32(terrain_index + center / 10.0)
         y = np.zeros(OUTPUT_LAYOUT.size, np.float32)
         y[OUTPUT_LAYOUT["joint_position"].start] = np.float32(
-            0.0 if center == 0 else 0.29
+            0.0 if center == 0 else 0.20
         )
         y[OUTPUT_LAYOUT["phase_advance"]] = np.float32(0.10)
         return {
@@ -1098,7 +1178,8 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             if receipt["active_row_count"] == expected_active_rows
         ]
         self.assertTrue(matching_receipts)
-        self.assertEqual(predecessor_batch.call_count, 1)
+        # One optimizer batch plus one complete-population report batch.
+        self.assertEqual(predecessor_batch.call_count, 2)
         isolated_batch.assert_not_called()
         self.assertEqual(len(evaluation_rows), 2)
         evaluation_dataset, evaluation_indices = evaluation_rows[0]
@@ -2238,7 +2319,23 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
         self,
     ) -> None:
         rows = _TransitionPairRows()
+        discovered = train_module.validate_canonical_transition_pairs(
+            rows, train_module.canonical_transition_pairs(rows)
+        )
+        receipt = train_module.fitted_transition_pair_receipt(rows)
+        rows.calls.clear()
         pairs = train_module.materialize_transition_pairs(rows)
+        train_module._validate_active_pair_population(
+            discovered, receipt, pairs
+        )
+        reversed_pairs = train_module._MaterializedDataset(
+            pairs,
+            [pairs[index] for index in reversed(range(len(pairs)))],
+        )
+        with self.assertRaisesRegex(RuntimeError, "pair population"):
+            train_module._validate_active_pair_population(
+                discovered, receipt, reversed_pairs
+            )
         self.assertEqual(rows.calls, list(range(len(rows))))
         self.assertEqual(len(pairs), 4)
         pair_classes = [
@@ -2408,6 +2505,12 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             }
             joint_limits = torch.tensor([[-2.0, 2.0]] * 29, dtype=torch.float64)
             phase_advance_q99 = 0.2
+            physical_envelope_objective = _objective_payload()
+            physical_envelope_objective_sha256 = _canonical_digest(
+                physical_envelope_objective
+            )
+            fitted_pair_receipt = _pair_receipt()
+            target_envelope_audit = _target_envelope_audit()
 
             def build_model(self) -> torch.nn.Module:
                 events.append("build_reloaded_model")
@@ -2454,6 +2557,9 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 kinematic_signature_sha256="b" * 64,
                 joint_limits=np.asarray([[-2.0, 2.0]] * 29, np.float64),
                 phase_advance_q99=0.2,
+                physical_envelope_objective=_objective_payload(),
+                fitted_pair_receipt=_pair_receipt(),
+                target_envelope_audit=_target_envelope_audit(),
                 verification_request={"binding": "exact"},
                 pipeline_verifier=verifier,
             )
@@ -2483,6 +2589,9 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 kinematic_signature_sha256="b" * 64,
                 joint_limits=np.asarray([[-2.0, 2.0]] * 29, np.float64),
                 phase_advance_q99=0.2,
+                physical_envelope_objective=_objective_payload(),
+                fitted_pair_receipt=_pair_receipt(),
+                target_envelope_audit=_target_envelope_audit(),
                 verification_request={"binding": "exact"},
                 pipeline_verifier=lambda _path, request: (
                     requests.append(request) or {"accepted": True}
@@ -2491,6 +2600,14 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
         self.assertEqual(report, accepted_report)
         self.assertEqual(receipt, {"accepted": True})
         self.assertEqual(requests[0]["binding"], "exact")
+        self.assertEqual(
+            requests[0]["physical_envelope_objective_sha256"],
+            _canonical_digest(_objective_payload()),
+        )
+        self.assertEqual(
+            requests[0]["fitted_pair_receipt_sha256"],
+            _pair_receipt()["receipt_sha256"],
+        )
         self.assertEqual(
             requests[0]["fitted_transition_report"], accepted_report.to_dict()
         )
@@ -3410,6 +3527,12 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 "kinematic_signature_sha256": "b" * 64,
                 "scenario_provenance_sha256": "c" * 64,
                 "fitted_subset_rows_sha256": "d" * 64,
+                "physical_envelope_objective_sha256": _canonical_digest(
+                    _objective_payload()
+                ),
+                "fitted_pair_receipt_sha256": _pair_receipt()[
+                    "receipt_sha256"
+                ],
             }
             transition_report = self._fitted_envelope(
                 _FittedEnvelopeRows._physical_output()
@@ -3499,10 +3622,13 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             )
             self.assertTrue(passing["accepted"])
             self.assertEqual(
-                passing["schema"], "mm-sonic-pipeline-promotion-receipt/v2"
+                passing["schema"], "mm-sonic-pipeline-promotion-receipt/v3"
             )
             self.assertEqual(passing["fitted_transition_report"], transition_report)
             for field, forged_value in (
+                ("schema", "mm-sonic-pipeline-promotion-receipt/v2"),
+                ("physical_envelope_objective_sha256", "e" * 64),
+                ("fitted_pair_receipt_sha256", "f" * 64),
                 ("expected_fixed_sample_score", 2.0),
                 ("observed_fixed_sample_score", 2.0),
                 ("expected_fixed_sample_count", 4096),
@@ -3631,7 +3757,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 **promotion_expectations,
             ))
             old_v1 = dict(passing)
-            old_v1["schema"] = "mm-sonic-pipeline-promotion-receipt/v1"
+            old_v1["schema"] = "mm-sonic-pipeline-promotion-receipt/v2"
             old_base = {
                 key: value for key, value in old_v1.items()
                 if key != "receipt_sha256"
@@ -3796,6 +3922,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                             runtime_seed=finite_runtime_seed(),
                             step=1,
                             loss_weights=weights,
+                            **_checkpoint_envelope_arguments(),
                         )
             save_checkpoint(
                 path,
@@ -3806,6 +3933,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 kinematic_signature_sha256="def",
                 runtime_seed=finite_runtime_seed(),
                 step=1,
+                **_checkpoint_envelope_arguments(),
             )
             payload = torch.load(path, map_location="cpu", weights_only=True)
             payload["loss_weights"]["regularization"] = 2.0
@@ -3816,6 +3944,378 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                     expected_dataset_digest="abc",
                     expected_kinematic_signature_sha256="def",
                 )
+
+    def test_physical_envelope_objective_requires_exact_canonical_field_types(
+        self,
+    ) -> None:
+        expected = _objective_payload()
+        payload = training_module.physical_envelope_objective_payload(
+            training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE
+        )
+        self.assertEqual(payload, expected)
+        self.assertEqual(
+            training_module.validate_physical_envelope_objective(payload),
+            expected,
+        )
+        for name, expected_value in expected.items():
+            wrong_type = (
+                1
+                if type(expected_value) is str
+                else float(expected_value)
+                if type(expected_value) is int
+                else 1
+            )
+            wrong_constant = (
+                f"{expected_value}-tampered"
+                if type(expected_value) is str
+                else expected_value + 1
+            )
+            for label, invalid in (
+                ("type", wrong_type),
+                ("constant", wrong_constant),
+            ):
+                changed = dict(payload)
+                changed[name] = invalid
+                with self.subTest(field=name, mutation=label), self.assertRaisesRegex(
+                    ValueError, "objective"
+                ):
+                    training_module.validate_physical_envelope_objective(changed)
+                inexact_contract = replace(
+                    training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+                    **{name: invalid},
+                )
+                with self.subTest(
+                    serializer_field=name, mutation=label
+                ), self.assertRaisesRegex(ValueError, "objective"):
+                    training_module.physical_envelope_objective_payload(
+                        inexact_contract
+                    )
+
+    def test_v6_checkpoint_binds_envelope_objective_pairs_and_feasibility_before_restore(
+        self,
+    ) -> None:
+        model = PhaseFunctionedNetwork(hidden_size=8, dropout_probability=0.0)
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=1.0e-3, weight_decay=0.0
+        )
+        pair_receipt = _pair_receipt()
+        target_audit = _target_envelope_audit()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = root / "checkpoint.pt"
+            tampered = root / "tampered.pt"
+            save_checkpoint(
+                checkpoint,
+                model,
+                optimizer,
+                _normalization(),
+                dataset_digest="abc",
+                kinematic_signature_sha256="def",
+                runtime_seed=finite_runtime_seed(),
+                step=1,
+                phase_advance_q99=0.2,
+                physical_envelope_objective=(
+                    training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE
+                ),
+                fitted_pair_receipt=pair_receipt,
+                target_envelope_audit=target_audit,
+            )
+            payload = torch.load(
+                checkpoint, map_location="cpu", weights_only=True
+            )
+            self.assertEqual(
+                payload["schema"], "mm-sonic-terrain-pfnn-checkpoint/v6"
+            )
+            self.assertEqual(
+                payload["physical_envelope_objective"], _objective_payload()
+            )
+            self.assertEqual(payload["fitted_pair_receipt"], pair_receipt)
+            self.assertNotIn("pairs", payload["fitted_pair_receipt"])
+            self.assertEqual(payload["target_envelope_audit"], target_audit)
+            loaded = load_checkpoint(
+                checkpoint,
+                expected_dataset_digest="abc",
+                expected_kinematic_signature_sha256="def",
+            )
+            self.assertEqual(loaded.fitted_pair_receipt, pair_receipt)
+            self.assertEqual(loaded.target_envelope_audit, target_audit)
+            self.assertEqual(
+                loaded.physical_envelope_objective, _objective_payload()
+            )
+
+            mutations: list[tuple[str, str, str, object]] = []
+            for name, expected_value in _objective_payload().items():
+                mutations.append((
+                    f"objective.{name}",
+                    "physical_envelope_objective",
+                    name,
+                    (
+                        f"{expected_value}-tampered"
+                        if type(expected_value) is str
+                        else expected_value + 1
+                    ),
+                ))
+            mutations.extend((
+                (
+                    "pair.active_rows_sha256",
+                    "fitted_pair_receipt",
+                    "active_rows_sha256",
+                    "3" * 64,
+                ),
+                (
+                    "pair.pairs_sha256",
+                    "fitted_pair_receipt",
+                    "pairs_sha256",
+                    "3" * 64,
+                ),
+                (
+                    "audit.phase_audit_negative_tolerance_rad",
+                    "target_envelope_audit",
+                    "phase_audit_negative_tolerance_rad",
+                    1.0e-6,
+                ),
+                (
+                    "audit.minimum_phase_advance_unclamped_rad",
+                    "target_envelope_audit",
+                    "minimum_phase_advance_unclamped_rad",
+                    -1.0e-5,
+                ),
+            ))
+            for label, section, field, invalid in mutations:
+                changed = torch.load(
+                    checkpoint, map_location="cpu", weights_only=True
+                )
+                changed[section][field] = invalid
+                torch.save(changed, tampered)
+                with self.subTest(field=label), patch(
+                    "mm_sonic.terrain_pfnn.training.PhaseFunctionedNetwork",
+                    side_effect=AssertionError("model construction was reached"),
+                ) as constructor:
+                    with self.assertRaises(ValueError):
+                        load_checkpoint(
+                            tampered,
+                            expected_dataset_digest="abc",
+                            expected_kinematic_signature_sha256="def",
+                        )
+                    constructor.assert_not_called()
+            old = torch.load(
+                checkpoint, map_location="cpu", weights_only=True
+            )
+            old["schema"] = "mm-sonic-terrain-pfnn-checkpoint/v5"
+            torch.save(old, tampered)
+            with patch(
+                "mm_sonic.terrain_pfnn.training.PhaseFunctionedNetwork",
+                side_effect=AssertionError("model construction was reached"),
+            ) as constructor:
+                with self.assertRaisesRegex(ValueError, "schema"):
+                    load_checkpoint(
+                        tampered,
+                        expected_dataset_digest="abc",
+                        expected_kinematic_signature_sha256="def",
+                    )
+                constructor.assert_not_called()
+
+    def test_dataset_file_snapshot_persists_hash_size_and_mtime_ns_atomically(
+        self,
+    ) -> None:
+        paths = (
+            "manifest.json",
+            "normalization.npz",
+            "shards/train-00000.npz",
+            "shards/train-00001.npz",
+            "shards/validation-00000.npz",
+            "shards/test-00000.npz",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "dataset"
+            for index, relative in enumerate(paths):
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(bytes((index + 1,)) * (index + 2))
+                mtime_ns = 1_800_000_000_000_000_000 + index
+                os.utime(path, ns=(mtime_ns, mtime_ns))
+            snapshot = train_module.dataset_file_snapshot(root)
+            self.assertEqual(
+                [record["path"] for record in snapshot["files"]],
+                sorted(paths),
+            )
+            for record in snapshot["files"]:
+                path = root / record["path"]
+                self.assertEqual(record["sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+                self.assertEqual(record["size"], path.stat().st_size)
+                self.assertEqual(record["mtime_ns"], path.stat().st_mtime_ns)
+            destination = Path(temporary) / "snapshot.json"
+            train_module.write_dataset_file_snapshot(root, destination)
+            self.assertEqual(json.loads(destination.read_text()), snapshot)
+
+            baseline_digest = snapshot["snapshot_sha256"]
+            target = root / paths[0]
+            target.write_bytes(b"different bytes")
+            self.assertNotEqual(
+                train_module.dataset_file_snapshot(root)["snapshot_sha256"],
+                baseline_digest,
+            )
+            target.write_bytes(bytes((1,)) * 2)
+            os.utime(
+                target,
+                ns=(
+                    1_800_000_000_000_000_000,
+                    1_800_000_000_000_000_000,
+                ),
+            )
+            restored = train_module.dataset_file_snapshot(root)
+            self.assertEqual(restored["snapshot_sha256"], baseline_digest)
+            os.utime(
+                target,
+                ns=(
+                    1_800_000_000_000_000_000,
+                    1_800_000_000_000_000_001,
+                ),
+            )
+            self.assertNotEqual(
+                train_module.dataset_file_snapshot(root)["snapshot_sha256"],
+                baseline_digest,
+            )
+
+    def test_complete_fitted_pair_metrics_use_every_pair_and_pair_counts(
+        self,
+    ) -> None:
+        output = _FittedEnvelopeRows._physical_output()
+        output[OUTPUT_LAYOUT["joint_position"]][0] = 0.25
+        rows = _FittedEnvelopeRows(output)
+        pair_dataset = train_module.materialize_transition_pairs(rows)
+        metrics = train_module.complete_fitted_pair_envelope_metrics(
+            _FittedEnvelopeModel(output),
+            pair_dataset,
+            normalization=rows,
+            joint_limits=torch.tensor([[-2.0, 2.0]] * 29),
+            phase_advance_cap=1.5 * 0.2,
+            contract=training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(metrics["pair_count"], 1)
+        self.assertEqual(metrics["joint_step_tail_count"], 1)
+        self.assertEqual(metrics["joint_step_active_count"], 1)
+        self.assertEqual(metrics["joint_step_objective_active_count"], 1)
+        self.assertEqual(metrics["joint_step_runtime_failure_count"], 0)
+        self.assertAlmostEqual(metrics["joint_step_maximum_risk"], 1.0)
+        self.assertAlmostEqual(metrics["joint_step_cvar"], 1.0)
+        self.assertAlmostEqual(metrics["joint_step_positive_tail_mean"], 1.0)
+        self.assertAlmostEqual(metrics["joint_step_family_loss"], 2.0)
+        self.assertAlmostEqual(metrics["maximum_joint_step_rad"], 0.25)
+        self.assertEqual(metrics["joint_limit_objective_active_count"], 0)
+        self.assertEqual(metrics["phase_objective_active_count"], 0)
+        for name, value in metrics.items():
+            if name.endswith("_count") or name == "pair_count":
+                self.assertIs(type(value), int, name)
+                self.assertGreaterEqual(value, 0, name)
+            else:
+                self.assertIs(type(value), float, name)
+                self.assertTrue(math.isfinite(value), name)
+
+    def test_one_step_report_v2_rejects_schema_objective_pair_audit_and_metric_tampering(
+        self,
+    ) -> None:
+        objective = _objective_payload()
+        pair_receipt = _pair_receipt()
+        target_audit = _target_envelope_audit()
+        metric_names = {
+            "pair_count",
+            *(
+                f"{family}_{suffix}"
+                for family in ("joint_step", "joint_limit", "phase")
+                for suffix in (
+                    "maximum_risk",
+                    "cvar",
+                    "tail_count",
+                    "active_count",
+                    "positive_tail_mean",
+                    "family_loss",
+                    "objective_active_count",
+                    "runtime_failure_count",
+                )
+            ),
+            "maximum_joint_step_rad",
+            "maximum_joint_limit_excess_rad",
+            "minimum_phase_advance_unclamped_rad",
+            "maximum_phase_advance_rad",
+        }
+        count_names = {
+            "pair_count",
+            *(
+                f"{family}_{suffix}"
+                for family in ("joint_step", "joint_limit", "phase")
+                for suffix in (
+                    "tail_count",
+                    "active_count",
+                    "objective_active_count",
+                    "runtime_failure_count",
+                )
+            ),
+        }
+        metrics = {name: 0.0 for name in metric_names - count_names}
+        metrics.update({name: 0 for name in count_names})
+        metrics["pair_count"] = 4
+        for family in ("joint_step", "joint_limit", "phase"):
+            metrics[f"{family}_tail_count"] = 1
+        base: dict[str, object] = {
+            "schema": "mm-sonic-terrain-pfnn-one-step-report/v2",
+            "physical_envelope_objective": objective,
+            "physical_envelope_objective_sha256": _canonical_digest(objective),
+            "fitted_pair_receipt": pair_receipt,
+            "fitted_pair_receipt_sha256": pair_receipt["receipt_sha256"],
+            "target_envelope_audit": target_audit,
+            "envelope_metrics": metrics,
+            "payload": {"preserved_v1_fields": True},
+        }
+        report = train_module.seal_one_step_report(base)
+        self.assertEqual(
+            train_module.validate_one_step_report(report), report
+        )
+        mutations = (
+            lambda value: value.__setitem__(
+                "schema", "mm-sonic-terrain-pfnn-one-step-report/v1"
+            ),
+            lambda value: value["physical_envelope_objective"].__setitem__(
+                "tail_fraction", 0.2
+            ),
+            lambda value: value.__setitem__(
+                "fitted_pair_receipt_sha256", "f" * 64
+            ),
+            lambda value: value["target_envelope_audit"].__setitem__(
+                "phase_audit_negative_tolerance_rad", 1.0e-6
+            ),
+            lambda value: value["envelope_metrics"].__setitem__(
+                "maximum_joint_step_rad", 0.5
+            ),
+        )
+        for mutation in mutations:
+            tampered = json.loads(json.dumps(report))
+            mutation(tampered)
+            with self.assertRaises(ValueError):
+                train_module.validate_one_step_report(tampered)
+        for name, expected_value in objective.items():
+            tampered = json.loads(json.dumps(report))
+            tampered["physical_envelope_objective"][name] = (
+                f"{expected_value}-tampered"
+                if type(expected_value) is str
+                else expected_value + 1
+            )
+            with self.subTest(objective=name), self.assertRaises(ValueError):
+                train_module.validate_one_step_report(tampered)
+        for name, expected_value in metrics.items():
+            tampered = json.loads(json.dumps(report))
+            tampered["envelope_metrics"][name] = expected_value + 1
+            with self.subTest(metric=name), self.assertRaises(ValueError):
+                train_module.validate_one_step_report(tampered)
+        for name, invalid in (
+            ("phase_audit_negative_tolerance_rad", 1.0e-6),
+            ("minimum_phase_advance_unclamped_rad", -1.0e-5),
+        ):
+            tampered = json.loads(json.dumps(report))
+            tampered["target_envelope_audit"][name] = invalid
+            with self.subTest(audit=name), self.assertRaises(ValueError):
+                train_module.validate_one_step_report(tampered)
 
     def test_contact_loss_uses_raw_logits_and_structural_terms_are_physical(self) -> None:
         model = PhaseFunctionedNetwork(hidden_size=4, dropout_probability=0.0)
@@ -3853,10 +4353,16 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             {
                 "clip_id": "synthetic", "center_frame": center,
                 "split_identity": "synthetic", "sequence_lane": "motion",
-                "terrain_class": "flat",
+                "terrain_class": terrain_class,
                 "row_sha256": digest,
             }
-            for center, digest in ((0, "1" * 64), (1, "2" * 64))
+            for center, terrain_class, digest in (
+                (0, "flat", "1" * 64),
+                (1, "ascent", "2" * 64),
+                (2, "descent", "3" * 64),
+                (3, "transition", "4" * 64),
+                (4, "flat", "5" * 64),
+            )
         ]
         fitted_subset = {
             "split": "train",
@@ -3865,8 +4371,22 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 fitted_rows, sort_keys=True, separators=(",", ":")
             ).encode()).hexdigest(),
             "class_counts": {
-                "flat": 2, "ascent": 0, "descent": 0, "transition": 0,
+                "flat": 2, "ascent": 1, "descent": 1, "transition": 1,
             },
+        }
+        pair_base = {
+            **{
+                name: value
+                for name, value in _pair_receipt().items()
+                if name != "receipt_sha256"
+            },
+            "active_rows_sha256": _canonical_digest(
+                {"row_sha256": sorted(row["row_sha256"] for row in fitted_rows)}
+            ),
+        }
+        roundtrip_pair_receipt = {
+            **pair_base,
+            "receipt_sha256": _canonical_digest(pair_base),
         }
         seed["provenance"].update({
             "predecessor_row_sha256": "1" * 64,
@@ -3887,9 +4407,15 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 sampler_epoch=2, sampler_global_offset=8,
                 sequence_sampler_state=sequence_sampler_state,
                 fitted_subset=fitted_subset,
+                physical_envelope_objective=(
+                    training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE
+                ),
+                fitted_pair_receipt=roundtrip_pair_receipt,
+                target_envelope_audit=_target_envelope_audit(),
+                phase_advance_q99=0.2,
             )
             payload = torch.load(path, map_location="cpu", weights_only=True)
-            self.assertEqual(payload["schema"], "mm-sonic-terrain-pfnn-checkpoint/v5")
+            self.assertEqual(payload["schema"], "mm-sonic-terrain-pfnn-checkpoint/v6")
             self.assertEqual(payload["input_layout"], [list(field) for field in INPUT_LAYOUT.fields])
             self.assertEqual(payload["output_layout"], [list(field) for field in OUTPUT_LAYOUT.fields])
             self.assertEqual(
@@ -4018,7 +4544,9 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                     expected_kinematic_signature_sha256="def",
                 )
 
-    def test_v5_resume_rejects_missing_pair_receipt_before_restore(self) -> None:
+    def test_v6_resume_active_pair_mismatch_rejects_before_model_and_adam_restore(
+        self,
+    ) -> None:
         class Rows:
             split = "train"
 
@@ -4098,11 +4626,11 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             {
                 "first_fitted_clip_id": "walk1_subject1",
                 "first_fitted_sequence_lane": "motion",
-                "first_fitted_center_frame": 10,
+                "first_fitted_center_frame": 11,
             }
         )
         active_seed = 7 + 97
-        active_sequence_count = 2
+        active_sequence_count = 1
         model = PhaseFunctionedNetwork(hidden_size=8, dropout_probability=0.30)
         optimizer = torch.optim.Adam(
             model.parameters(), lr=1.0e-3, weight_decay=0.0
@@ -4129,69 +4657,93 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 rollout_finetune_steps=1,
                 resume=str(root / "checkpoint.pt"),
             )
-            legacy_states = {
-                "matching_sampler": train_module.DeterministicSequenceSampler(
-                    active_sequence_count,
-                    batch_size=1,
-                    seed=active_seed,
-                ).state_dict(),
-            }
-            for label, sampler_state in legacy_states.items():
-                checkpoint_path = root / f"checkpoint-{label}.pt"
-                save_checkpoint(
-                    checkpoint_path,
-                    model,
-                    optimizer,
-                    _normalization(),
-                    dataset_digest="abc",
-                    kinematic_signature_sha256="def",
-                    runtime_seed=finite_runtime_seed(),
-                    step=1,
-                    epoch=1,
-                    seed=7,
-                    sampler_epoch=0,
-                    sampler_global_offset=0,
-                    sequence_sampler_state=sampler_state,
-                )
-                loaded = load_checkpoint(
-                    checkpoint_path,
-                    expected_dataset_digest="abc",
-                    expected_kinematic_signature_sha256="def",
-                )
-                arguments.resume = str(checkpoint_path)
-                with self.subTest(mismatch=label), patch.object(
-                    train_module, "_distributed_context",
-                    return_value=(0, 1, 0, torch.device("cpu")),
-                ), patch.object(
-                    train_module, "_dataset_root", return_value=root
-                ), patch.object(
-                    train_module, "PFNNShardDataset", return_value=rows
-                ), patch.object(
-                    train_module.TorchG1ForwardKinematics,
-                    "from_mjcf",
-                    return_value=Kinematics(),
-                ), patch.object(
-                    train_module,
-                    "choose_runtime_seed",
-                    return_value=active_runtime_seed,
-                ), patch.object(
-                    train_module, "load_checkpoint", return_value=loaded
-                ) as checkpoint_loader, patch.object(
-                    PhaseFunctionedNetwork,
-                    "load_state_dict",
-                    side_effect=AssertionError("model restore was reached"),
-                ) as model_restore, patch.object(
-                    torch.optim.Adam,
-                    "load_state_dict",
-                    side_effect=AssertionError("Adam restore was reached"),
-                ) as adam_restore:
-                    with self.assertRaisesRegex(
-                        ValueError, "checkpoint-bound.*pair receipt"
-                    ):
-                        train_module.train(arguments)
-                    checkpoint_loader.assert_not_called()
-                    model_restore.assert_not_called()
-                    adam_restore.assert_not_called()
+            sampler_state = train_module.DeterministicSequenceSampler(
+                active_sequence_count,
+                batch_size=1,
+                seed=active_seed,
+            ).state_dict()
+            active_pair_receipt = train_module.fitted_transition_pair_receipt(
+                rows
+            )
+            tampered_pair_receipt = dict(active_pair_receipt)
+            tampered_pair_receipt["pairs_sha256"] = "0" * 64
+            tampered_pair_receipt["receipt_sha256"] = _canonical_digest(
+                {
+                    name: value
+                    for name, value in tampered_pair_receipt.items()
+                    if name != "receipt_sha256"
+                }
+            )
+            pair_dataset = train_module.materialize_transition_pairs(rows)
+            target_audit = training_module.fitted_target_envelope_audit(
+                pair_dataset,
+                normalization=rows,
+                joint_limits=Kinematics.joint_limits,
+                phase_advance_cap=1.5 * 0.1,
+                contract=training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+            )
+            checkpoint_path = root / "checkpoint.pt"
+            save_checkpoint(
+                checkpoint_path,
+                model,
+                optimizer,
+                _normalization(),
+                dataset_digest="abc",
+                kinematic_signature_sha256="def",
+                runtime_seed=finite_runtime_seed(),
+                physical_envelope_objective=(
+                    training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE
+                ),
+                fitted_pair_receipt=tampered_pair_receipt,
+                target_envelope_audit=target_audit,
+                joint_limits=Kinematics.joint_limits,
+                phase_advance_q99=0.1,
+                step=1,
+                epoch=1,
+                seed=7,
+                sampler_epoch=0,
+                sampler_global_offset=0,
+                sequence_sampler_state=sampler_state,
+            )
+            loaded = load_checkpoint(
+                checkpoint_path,
+                expected_dataset_digest="abc",
+                expected_kinematic_signature_sha256="def",
+            )
+            arguments.resume = str(checkpoint_path)
+            with patch.object(
+                train_module, "_distributed_context",
+                return_value=(0, 1, 0, torch.device("cpu")),
+            ), patch.object(
+                train_module, "_dataset_root", return_value=root
+            ), patch.object(
+                train_module, "PFNNShardDataset", return_value=rows
+            ), patch.object(
+                train_module.TorchG1ForwardKinematics,
+                "from_mjcf",
+                return_value=Kinematics(),
+            ), patch.object(
+                train_module,
+                "choose_runtime_seed",
+                return_value=active_runtime_seed,
+            ), patch.object(
+                train_module, "load_checkpoint", return_value=loaded
+            ) as checkpoint_loader, patch.object(
+                PhaseFunctionedNetwork,
+                "load_state_dict",
+                side_effect=AssertionError("model restore was reached"),
+            ) as model_restore, patch.object(
+                torch.optim.Adam,
+                "load_state_dict",
+                side_effect=AssertionError("Adam restore was reached"),
+            ) as adam_restore:
+                with self.assertRaisesRegex(
+                    ValueError, "active physical envelope"
+                ):
+                    train_module.train(arguments)
+                checkpoint_loader.assert_called_once()
+                model_restore.assert_not_called()
+                adam_restore.assert_not_called()
 
     def test_checkpoint_rejects_inexact_nested_tensor_contracts(self) -> None:
         model = PhaseFunctionedNetwork(hidden_size=8, dropout_probability=0.0)
@@ -4211,6 +4763,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 kinematic_signature_sha256="def",
                 runtime_seed=finite_runtime_seed(),
                 step=1,
+                **_checkpoint_envelope_arguments(),
             )
 
             def rejected(label: str, mutation: object, match: str) -> None:
@@ -4382,6 +4935,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 kinematic_signature_sha256="def",
                 runtime_seed=finite_runtime_seed(),
                 step=1,
+                **_checkpoint_envelope_arguments(),
             )
 
             mutations = {
@@ -4894,6 +5448,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 path, model, optimizer, normal, dataset_digest="abc",
                 kinematic_signature_sha256="def",
                 runtime_seed=finite_runtime_seed(), step=300,
+                **_checkpoint_envelope_arguments(),
             )
             loaded = load_checkpoint(
                 path, expected_dataset_digest="abc",

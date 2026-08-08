@@ -28,24 +28,30 @@ from mm_sonic.terrain_pfnn.runtime import (
 )
 from mm_sonic.terrain_pfnn.splits import split_identity, terrain_identity
 from mm_sonic.terrain_pfnn.training import (
+    BASE_LOSS_WEIGHT_KEYS,
     DEFAULT_LOSS_WEIGHTS,
     DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
-    LOSS_WEIGHT_KEYS,
     autoregressive_unroll,
     choose_runtime_seed,
     evaluate_fitted_transition_envelope,
     fitted_adjacent_indices,
     fitted_row_sha256,
+    fitted_target_envelope_audit,
     load_checkpoint,
     one_step_metrics,
     one_step_training_losses,
     pfnn_losses,
+    physical_envelope_objective_payload,
+    physical_envelope_risks,
     restore_training_state,
     save_checkpoint,
     selection_metadata,
     training_phase_advance_q99,
     validate_fitted_transition_report,
+    validate_compact_fitted_pair_receipt,
+    validate_physical_envelope_objective,
     validate_resume_fitted_subset,
+    validate_target_envelope_audit,
 )
 
 
@@ -58,6 +64,8 @@ _ENVELOPE_LOSS_METRIC_KEYS = tuple(
     for family in _ENVELOPE_FAMILIES
     for suffix in ("maximum", "cvar", "positive_tail_mean", "envelope")
 ) + ("physical_envelope_total",)
+ONE_STEP_REPORT_SCHEMA = "mm-sonic-terrain-pfnn-one-step-report/v2"
+PIPELINE_PROMOTION_RECEIPT_SCHEMA = "mm-sonic-pipeline-promotion-receipt/v3"
 
 
 class DeterministicSequenceSampler:
@@ -249,6 +257,235 @@ def _sha256_value(value: object) -> bool:
     )
 
 
+def dataset_file_snapshot(dataset_root: Path) -> dict[str, object]:
+    """Hash an immutable, canonically ordered view of every dataset file."""
+
+    root = Path(dataset_root).resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError("dataset snapshot root must be a directory")
+    records: list[dict[str, object]] = []
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        before = path.stat()
+        digest = _file_sha256(path)
+        after = path.stat()
+        if (
+            before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+        ):
+            raise RuntimeError("dataset file changed while hashing")
+        records.append(
+            {
+                "path": path.relative_to(root).as_posix(),
+                "sha256": digest,
+                "size": before.st_size,
+                "mtime_ns": before.st_mtime_ns,
+            }
+        )
+    if not records:
+        raise ValueError("dataset snapshot cannot be empty")
+    base: dict[str, object] = {
+        "schema": "mm-sonic-dataset-file-snapshot/v1",
+        "files": records,
+    }
+    return {**base, "snapshot_sha256": _canonical_sha256(base)}
+
+
+def write_dataset_file_snapshot(
+    dataset_root: Path, destination: Path
+) -> None:
+    """Atomically persist a canonical dataset-file snapshot."""
+
+    payload = dataset_file_snapshot(dataset_root)
+    encoded = (
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        + "\n"
+    ).encode("utf-8")
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+        directory_fd = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+_ENVELOPE_METRIC_FIELDS = {
+    "pair_count",
+    *(
+        f"{family}_{suffix}"
+        for family in _ENVELOPE_FAMILIES
+        for suffix in (
+            "maximum_risk",
+            "cvar",
+            "tail_count",
+            "active_count",
+            "positive_tail_mean",
+            "family_loss",
+            "objective_active_count",
+            "runtime_failure_count",
+        )
+    ),
+    "maximum_joint_step_rad",
+    "maximum_joint_limit_excess_rad",
+    "minimum_phase_advance_unclamped_rad",
+    "maximum_phase_advance_rad",
+}
+_ENVELOPE_COUNT_FIELDS = {
+    "pair_count",
+    *(
+        f"{family}_{suffix}"
+        for family in _ENVELOPE_FAMILIES
+        for suffix in (
+            "tail_count",
+            "active_count",
+            "objective_active_count",
+            "runtime_failure_count",
+        )
+    ),
+}
+
+
+def _validate_envelope_metrics(
+    value: object, *, expected_pair_count: int
+) -> dict[str, object]:
+    if (
+        type(expected_pair_count) is not int
+        or expected_pair_count < 1
+        or type(value) is not dict
+        or set(value) != _ENVELOPE_METRIC_FIELDS
+        or any(
+            type(value[name]) is not int or value[name] < 0
+            for name in _ENVELOPE_COUNT_FIELDS
+        )
+        or value["pair_count"] != expected_pair_count
+        or any(
+            type(value[name]) is not float or not math.isfinite(value[name])
+            for name in _ENVELOPE_METRIC_FIELDS - _ENVELOPE_COUNT_FIELDS
+        )
+        or any(
+            value[f"{family}_tail_count"]
+            != max(
+                1,
+                math.ceil(
+                    DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE.tail_fraction
+                    * expected_pair_count
+                ),
+            )
+            or value[f"{family}_active_count"]
+            > value[f"{family}_tail_count"]
+            or value[f"{family}_active_count"]
+            > value[f"{family}_objective_active_count"]
+            or value[f"{family}_objective_active_count"] > expected_pair_count
+            or value[f"{family}_runtime_failure_count"] > expected_pair_count
+            or value[f"{family}_cvar"] > value[f"{family}_maximum_risk"]
+            or value[f"{family}_positive_tail_mean"]
+            > value[f"{family}_maximum_risk"]
+            or not math.isclose(
+                value[f"{family}_family_loss"],
+                value[f"{family}_maximum_risk"]
+                + value[f"{family}_positive_tail_mean"],
+                rel_tol=4.0 * float(np.finfo(np.float32).eps),
+                abs_tol=4.0 * float(np.finfo(np.float32).eps),
+            )
+            or (
+                value[f"{family}_objective_active_count"] == 0
+                and value[f"{family}_maximum_risk"] != 0.0
+            )
+            for family in _ENVELOPE_FAMILIES
+        )
+        or any(
+            value[name] < 0.0
+            for name in _ENVELOPE_METRIC_FIELDS
+            - _ENVELOPE_COUNT_FIELDS
+            - {"minimum_phase_advance_unclamped_rad", "maximum_phase_advance_rad"}
+        )
+    ):
+        raise ValueError("one-step envelope metrics are invalid")
+    return dict(value)
+
+
+def _validate_one_step_report_base(value: object) -> dict[str, object]:
+    if (
+        type(value) is not dict
+        or value.get("schema") != ONE_STEP_REPORT_SCHEMA
+        or not {
+            "physical_envelope_objective",
+            "physical_envelope_objective_sha256",
+            "fitted_pair_receipt",
+            "fitted_pair_receipt_sha256",
+            "target_envelope_audit",
+            "envelope_metrics",
+        }.issubset(value)
+    ):
+        raise ValueError("one-step report fields or schema are invalid")
+    objective = validate_physical_envelope_objective(
+        value["physical_envelope_objective"]
+    )
+    if (
+        not _sha256_value(value["physical_envelope_objective_sha256"])
+        or value["physical_envelope_objective_sha256"]
+        != _canonical_sha256(objective)
+    ):
+        raise ValueError("one-step report objective digest mismatch")
+    pair_receipt = validate_compact_fitted_pair_receipt(
+        value["fitted_pair_receipt"]
+    )
+    if (
+        value["fitted_pair_receipt_sha256"]
+        != pair_receipt["receipt_sha256"]
+    ):
+        raise ValueError("one-step report pair digest mismatch")
+    validate_target_envelope_audit(
+        value["target_envelope_audit"],
+        expected_sample_count=pair_receipt["sample_count"],
+    )
+    _validate_envelope_metrics(
+        value["envelope_metrics"],
+        expected_pair_count=pair_receipt["sample_count"],
+    )
+    try:
+        return json.loads(
+            json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("one-step report is not canonical JSON") from error
+
+
+def seal_one_step_report(value: dict[str, object]) -> dict[str, object]:
+    """Validate and hash one complete v2 report before atomic persistence."""
+
+    if "report_sha256" in value:
+        raise ValueError("unsealed one-step report contains a report digest")
+    base = _validate_one_step_report_base(value)
+    return {**base, "report_sha256": _canonical_sha256(base)}
+
+
+def validate_one_step_report(value: object) -> dict[str, object]:
+    """Validate all v2 bindings and the complete report digest."""
+
+    if type(value) is not dict or not _sha256_value(value.get("report_sha256")):
+        raise ValueError("one-step report digest is invalid")
+    base = {name: item for name, item in value.items() if name != "report_sha256"}
+    checked = _validate_one_step_report_base(base)
+    if value["report_sha256"] != _canonical_sha256(checked):
+        raise ValueError("one-step report digest mismatch")
+    return {**checked, "report_sha256": value["report_sha256"]}
+
+
 def build_pipeline_promotion_receipt(
     *,
     checkpoint_path: str | Path,
@@ -258,6 +495,8 @@ def build_pipeline_promotion_receipt(
     fitted_subset_rows_sha256: str,
     fitted_transition_report: dict[str, object],
     fitted_transition_report_sha256: str,
+    physical_envelope_objective_sha256: str,
+    fitted_pair_receipt_sha256: str,
     expected_fixed_sample_score: float,
     observed_fixed_sample_score: float,
     expected_fixed_sample_count: int,
@@ -278,6 +517,8 @@ def build_pipeline_promotion_receipt(
             scenario_provenance_sha256,
             fitted_subset_rows_sha256,
             fitted_transition_report_sha256,
+            physical_envelope_objective_sha256,
+            fitted_pair_receipt_sha256,
         )
     ):
         raise ValueError("pipeline verifier bindings are invalid")
@@ -314,7 +555,7 @@ def build_pipeline_promotion_receipt(
         and known.get("responsive_flat_motion_after_return") is True
     )
     base: dict[str, object] = {
-        "schema": "mm-sonic-pipeline-promotion-receipt/v2",
+        "schema": PIPELINE_PROMOTION_RECEIPT_SCHEMA,
         "checkpoint_sha256": _file_sha256(candidate),
         "dataset_digest_sha256": dataset_digest_sha256,
         "kinematic_signature_sha256": kinematic_signature_sha256,
@@ -322,6 +563,10 @@ def build_pipeline_promotion_receipt(
         "fitted_subset_rows_sha256": fitted_subset_rows_sha256,
         "fitted_transition_report": transition_report,
         "fitted_transition_report_sha256": fitted_transition_report_sha256,
+        "physical_envelope_objective_sha256": (
+            physical_envelope_objective_sha256
+        ),
+        "fitted_pair_receipt_sha256": fitted_pair_receipt_sha256,
         "required_fitted_transition_envelope": transition_accepted,
         "fixed_sample_reproduction": fixed_reproduction,
         "expected_fixed_sample_score": expected_score,
@@ -372,6 +617,8 @@ def promote_pipeline_best(
     fitted_subset_rows_sha256: str,
     fitted_transition_report: dict[str, object],
     fitted_transition_report_sha256: str,
+    physical_envelope_objective_sha256: str,
+    fitted_pair_receipt_sha256: str,
     expected_fixed_sample_score: float,
     expected_fixed_sample_count: int,
     observed_fixed_sample_score: float | None = None,
@@ -439,13 +686,15 @@ def promote_pipeline_best(
             "kinematic_signature_sha256", "scenario_provenance_sha256",
             "fitted_subset_rows_sha256", "fixed_sample_reproduction",
             "fitted_transition_report", "fitted_transition_report_sha256",
+            "physical_envelope_objective_sha256",
+            "fitted_pair_receipt_sha256",
             "required_fitted_transition_envelope",
             "expected_fixed_sample_score", "observed_fixed_sample_score",
             "expected_fixed_sample_count", "observed_fixed_sample_count",
             "required_runtime_gates", "required_known_terrain_traversal",
             "accepted", "receipt_sha256",
         }
-        or receipt.get("schema") != "mm-sonic-pipeline-promotion-receipt/v2"
+        or receipt.get("schema") != PIPELINE_PROMOTION_RECEIPT_SCHEMA
         or receipt_hash != _canonical_sha256(base)
         or receipt.get("checkpoint_sha256") != _file_sha256(candidate)
         or receipt.get("dataset_digest_sha256") != dataset_digest_sha256
@@ -458,6 +707,12 @@ def promote_pipeline_best(
         or receipt_transition_report != expected_transition_report
         or receipt.get("fitted_transition_report_sha256")
         != fitted_transition_report_sha256
+        or receipt.get("physical_envelope_objective_sha256")
+        != physical_envelope_objective_sha256
+        or receipt.get("fitted_pair_receipt_sha256")
+        != fitted_pair_receipt_sha256
+        or not _sha256_value(physical_envelope_objective_sha256)
+        or not _sha256_value(fitted_pair_receipt_sha256)
         or fitted_transition_report_sha256
         != expected_transition_report["report_sha256"]
         or receipt.get("fitted_transition_report_sha256")
@@ -787,6 +1042,33 @@ def validate_fitted_transition_pair_receipt(
     )
 
 
+def validate_active_physical_envelope(
+    checkpoint: object,
+    *,
+    physical_envelope_objective: dict[str, object],
+    fitted_pair_receipt: dict[str, object],
+    target_envelope_audit: dict[str, object],
+) -> None:
+    """Bind a loaded checkpoint to freshly recomputed active train data."""
+
+    objective = validate_physical_envelope_objective(
+        physical_envelope_objective
+    )
+    pair_receipt = validate_compact_fitted_pair_receipt(fitted_pair_receipt)
+    audit = validate_target_envelope_audit(
+        target_envelope_audit,
+        expected_sample_count=pair_receipt["sample_count"],
+    )
+    if (
+        getattr(checkpoint, "physical_envelope_objective", None) != objective
+        or getattr(checkpoint, "physical_envelope_objective_sha256", None)
+        != _canonical_sha256(objective)
+        or getattr(checkpoint, "fitted_pair_receipt", None) != pair_receipt
+        or getattr(checkpoint, "target_envelope_audit", None) != audit
+    ):
+        raise ValueError("checkpoint does not match the active physical envelope")
+
+
 def _immutable_sample_copy(sample: Mapping[str, object]) -> Mapping[str, object]:
     copied: dict[str, object] = {}
     for name, value in sample.items():
@@ -826,6 +1108,39 @@ def materialize_transition_pairs(dataset: object) -> _MaterializedDataset:
             )
         )
     return _MaterializedDataset(cached, materialized)
+
+
+def _validate_active_pair_population(
+    discovered_records: Sequence[FittedTransitionPair],
+    pair_receipt: Mapping[str, object],
+    pair_dataset: object,
+) -> None:
+    """Require independently discovered and materialized pairs to match exactly."""
+
+    records = tuple(discovered_records)
+    checked_receipt = validate_compact_fitted_pair_receipt(pair_receipt)
+    materialized_records: list[FittedTransitionPair] = []
+    materialized_classes: list[str] = []
+    for index in range(len(pair_dataset)):
+        row = pair_dataset[index]
+        if (
+            not isinstance(row, Mapping)
+            or type(row.get("pair")) is not FittedTransitionPair
+            or not isinstance(row.get("current"), Mapping)
+        ):
+            raise RuntimeError("active transition-pair population is inconsistent")
+        materialized_records.append(row["pair"])
+        materialized_classes.append(str(row["current"].get("terrain_class")))
+    if (
+        tuple(materialized_records) != records
+        or checked_receipt["sample_count"] != len(records)
+        or checked_receipt["class_counts"]
+        != {
+            name: materialized_classes.count(name)
+            for name in _TERRAIN_CLASSES
+        }
+    ):
+        raise RuntimeError("active transition-pair population is inconsistent")
 
 
 def stratified_subset(
@@ -1174,6 +1489,127 @@ def _predecessor_batch(
     )
 
 
+def _finite_scalar_value(value: torch.Tensor, name: str) -> float:
+    if type(value) is not torch.Tensor or value.shape != ():
+        raise ValueError(f"complete fitted envelope {name} is invalid")
+    result = value.detach().to(device="cpu", dtype=torch.float64).item()
+    if type(result) is not float or not math.isfinite(result):
+        raise ValueError(f"complete fitted envelope {name} is invalid")
+    return result
+
+
+def complete_fitted_pair_envelope_metrics(
+    model: torch.nn.Module,
+    pair_dataset: object,
+    *,
+    normalization: object,
+    joint_limits: object,
+    phase_advance_cap: float,
+    contract: object,
+    device: torch.device,
+) -> dict[str, object]:
+    """Evaluate objective and unchanged-limit diagnostics on every fitted pair."""
+
+    physical_envelope_objective_payload(contract)
+    pair_count = len(pair_dataset)
+    if type(pair_count) is not int or pair_count < 1:
+        raise ValueError("complete fitted pair population is invalid")
+    indices = tuple(range(pair_count))
+    x, phase, _targets, predecessor = _predecessor_batch(
+        pair_dataset, indices, device
+    )
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.inference_mode():
+            prediction = model(x, phase)
+            if type(prediction) is not torch.Tensor:
+                raise ValueError("complete fitted prediction is invalid")
+            predecessor = predecessor.to(
+                device=prediction.device, dtype=prediction.dtype
+            )
+            risks = physical_envelope_risks(
+                prediction,
+                predecessor,
+                normalization=normalization,
+                joint_limits=joint_limits,
+                phase_advance_cap=phase_advance_cap,
+                contract=contract,
+            )
+    finally:
+        model.train(was_training)
+
+    scalar_tensors: dict[str, torch.Tensor] = {}
+    counts: dict[str, int] = {"pair_count": pair_count}
+    for family in _ENVELOPE_FAMILIES:
+        risk = risks[family]
+        detached_values = risk.detach().to(device="cpu", dtype=torch.float64).tolist()
+        order = sorted(
+            range(pair_count), key=lambda index: (-detached_values[index], index)
+        )
+        tail_count = max(1, math.ceil(contract.tail_fraction * pair_count))
+        tail_indices = order[:tail_count]
+        active_indices = [
+            index for index in tail_indices if detached_values[index] > 0.0
+        ]
+        maximum = risk[order[0]]
+        cvar = risk[tail_indices].sum() / tail_count
+        positive_tail_mean = (
+            risk[active_indices].mean()
+            if active_indices
+            else risk.sum() * 0.0
+        )
+        family_loss = (
+            contract.maximum_coefficient * maximum
+            + contract.positive_tail_mean_coefficient * positive_tail_mean
+        )
+        scalar_tensors.update(
+            {
+                f"{family}_maximum_risk": maximum,
+                f"{family}_cvar": cvar,
+                f"{family}_positive_tail_mean": positive_tail_mean,
+                f"{family}_family_loss": family_loss,
+            }
+        )
+        counts.update(
+            {
+                f"{family}_tail_count": tail_count,
+                f"{family}_active_count": len(active_indices),
+                f"{family}_objective_active_count": int(
+                    torch.count_nonzero(risk > 0.0).detach().cpu()
+                ),
+                f"{family}_runtime_failure_count": int(
+                    torch.count_nonzero(risks.runtime_failures[family])
+                    .detach()
+                    .cpu()
+                ),
+            }
+        )
+    scalar_tensors.update(
+        {
+            "maximum_joint_step_rad": torch.amax(
+                risks.physical_values["joint_step_rad"]
+            ),
+            "maximum_joint_limit_excess_rad": torch.amax(
+                risks.physical_values["joint_limit_excess_rad"]
+            ),
+            "minimum_phase_advance_unclamped_rad": torch.amin(
+                risks.physical_values["phase_advance_rad"]
+            ),
+            "maximum_phase_advance_rad": torch.amax(
+                risks.physical_values["phase_advance_rad"]
+            ),
+        }
+    )
+    values = {
+        name: _finite_scalar_value(value, name)
+        for name, value in scalar_tensors.items()
+    }
+    output: dict[str, object] = {**counts, **values}
+    _validate_envelope_metrics(output, expected_pair_count=pair_count)
+    return output
+
+
 def _one_step_optimizer_step(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -1333,6 +1769,9 @@ def _verify_reloaded_pipeline_candidate(
     kinematic_signature_sha256: str,
     joint_limits: object,
     phase_advance_q99: float,
+    physical_envelope_objective: dict[str, object],
+    fitted_pair_receipt: dict[str, object],
+    target_envelope_audit: dict[str, object],
     verification_request: dict[str, object],
     pipeline_verifier: Callable[[Path, dict[str, object]], dict[str, object]]
     | None,
@@ -1343,6 +1782,12 @@ def _verify_reloaded_pipeline_candidate(
         candidate_path,
         expected_dataset_digest=dataset_digest_sha256,
         expected_kinematic_signature_sha256=kinematic_signature_sha256,
+    )
+    validate_active_physical_envelope(
+        reloaded,
+        physical_envelope_objective=physical_envelope_objective,
+        fitted_pair_receipt=fitted_pair_receipt,
+        target_envelope_audit=target_envelope_audit,
     )
     if fitted_subset_metadata(dataset, fitted_indices) != fitted_subset:
         raise ValueError("reloaded candidate fitted subset source mismatch")
@@ -1374,8 +1819,20 @@ def _verify_reloaded_pipeline_candidate(
     report_payload = validate_fitted_transition_report(report)
     if report_payload["accepted"] is not True or pipeline_verifier is None:
         return report, None
+    expected_objective_sha256 = _canonical_sha256(
+        physical_envelope_objective
+    )
+    expected_pair_sha256 = fitted_pair_receipt["receipt_sha256"]
+    for name, expected in (
+        ("physical_envelope_objective_sha256", expected_objective_sha256),
+        ("fitted_pair_receipt_sha256", expected_pair_sha256),
+    ):
+        if name in verification_request and verification_request[name] != expected:
+            raise ValueError("pipeline verification request envelope mismatch")
     request = {
         **verification_request,
+        "physical_envelope_objective_sha256": expected_objective_sha256,
+        "fitted_pair_receipt_sha256": expected_pair_sha256,
         "fitted_transition_report": report_payload,
         "fitted_transition_report_sha256": report_payload["report_sha256"],
     }
@@ -1394,11 +1851,6 @@ def train(
     import torch.distributed as dist
 
     rank, world_size, local_rank, device = _distributed_context(arguments.seed)
-    if arguments.resume is not None:
-        raise ValueError(
-            "resume requires a checkpoint-bound fitted transition pair receipt; "
-            "checkpoint v5 is not resumable"
-        )
     root = _dataset_root(arguments.dataset)
     try:
         manifest = json.loads((root / "manifest.json").read_text())
@@ -1407,6 +1859,10 @@ def train(
     train_dataset = PFNNShardDataset(root, "train")
     phase_q99 = training_phase_advance_q99(train_dataset)
     phase_advance_cap = min(math.pi, 1.5 * phase_q99)
+    objective_payload = physical_envelope_objective_payload(
+        DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE
+    )
+    objective_sha256 = _canonical_sha256(objective_payload)
     all_indices = list(range(len(train_dataset)))
     kinematics = TorchG1ForwardKinematics.from_mjcf(arguments.model_path).to(device)
     if arguments.overfit_samples is not None:
@@ -1448,18 +1904,19 @@ def train(
     )
     pair_receipt = fitted_transition_pair_receipt(optimization_dataset)
     pair_dataset = materialize_transition_pairs(optimization_dataset)
+    target_envelope_audit = fitted_target_envelope_audit(
+        pair_dataset,
+        normalization=train_dataset,
+        joint_limits=kinematics.joint_limits.detach().cpu(),
+        phase_advance_cap=phase_advance_cap,
+        contract=DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+    )
     pair_classes = [
         str(pair_dataset[index]["current"]["terrain_class"])
         for index in range(len(pair_dataset))
     ]
     pair_indices = list(range(len(pair_dataset)))
-    if (
-        len(pair_records) != len(pair_dataset)
-        or pair_receipt["sample_count"] != len(pair_dataset)
-        or pair_receipt["class_counts"]
-        != {name: pair_classes.count(name) for name in _TERRAIN_CLASSES}
-    ):
-        raise RuntimeError("active transition-pair population is inconsistent")
+    _validate_active_pair_population(pair_records, pair_receipt, pair_dataset)
 
     runtime_seed = choose_runtime_seed(
         optimization_dataset,
@@ -1517,6 +1974,75 @@ def train(
         if seed_sequence_matches[0] not in sequence_sampler.state_dict()["permutation"]:
             raise RuntimeError("runtime seed sequence is missing from first sampler pass")
 
+    resumed: object | None = None
+    restored_step, restored_epoch = 0, 0
+    restored_sampler_epoch, restored_sampler_global_offset = 0, 0
+    restored_sequence_sampler_state: dict[str, object] | None = None
+    resumed_local_epoch: list[int] = []
+    resumed_local_offset = 0
+    resumed_padding = 0
+    if arguments.resume is not None:
+        validate_fitted_transition_pair_receipt(
+            pair_receipt, optimization_dataset
+        )
+        resumed = load_checkpoint(
+            arguments.resume,
+            expected_dataset_digest=manifest["dataset_digest_sha256"],
+            expected_kinematic_signature_sha256=(
+                kinematics.kinematic_signature_sha256
+            ),
+        )
+        validate_active_physical_envelope(
+            resumed,
+            physical_envelope_objective=objective_payload,
+            fitted_pair_receipt=pair_receipt,
+            target_envelope_audit=target_envelope_audit,
+        )
+        validate_resume_fitted_subset(resumed, fitted_receipt)
+        if arguments.seed != resumed.seed:
+            raise ValueError("resume checkpoint seed mismatch")
+        if sequence_sampler is not None:
+            restored_sequence_sampler_state = (
+                _validated_active_sequence_sampler_state(
+                    resumed.sequence_sampler_state,
+                    active_sampler=sequence_sampler,
+                )
+            )
+        elif resumed.sequence_sampler_state is not None:
+            raise ValueError(
+                "resume sequence sampler state does not match the active rollout"
+            )
+        restored_step = resumed.step
+        restored_epoch = resumed.epoch
+        restored_sampler_epoch = resumed.sampler_epoch
+        restored_sampler_global_offset = resumed.sampler_global_offset
+        if restored_step > 0 and restored_epoch != restored_sampler_epoch + 1:
+            raise ValueError("resume checkpoint sampler epoch is inconsistent")
+        if restored_step >= arguments.steps:
+            raise ValueError("--steps must exceed the resumed checkpoint step")
+        global_epoch = (
+            _balanced_epoch_indices(
+                pair_indices,
+                pair_classes,
+                seed=arguments.seed,
+                epoch=restored_sampler_epoch,
+            )
+            if rank == 0
+            else None
+        )
+        global_epoch = _broadcast_indices(global_epoch, device)
+        (
+            resumed_local_epoch,
+            resumed_local_offset,
+            resumed_padding,
+        ) = _local_epoch_at_global_offset(
+            global_epoch,
+            global_offset=restored_sampler_global_offset,
+            batch_size=arguments.batch_size,
+            rank=rank,
+            world_size=world_size,
+        )
+
     torch.manual_seed(arguments.seed)
     model: torch.nn.Module = PhaseFunctionedNetwork(
         hidden_size=arguments.hidden_size, dropout_probability=0.30
@@ -1529,31 +2055,8 @@ def train(
     optimizer = torch.optim.Adam(
         unwrapped.parameters(), lr=arguments.learning_rate, weight_decay=0.0
     )
-    restored_step, restored_epoch = 0, 0
-    restored_sampler_epoch, restored_sampler_global_offset = 0, 0
-    restored_sequence_sampler_state: dict[str, object] | None = None
-    if arguments.resume is not None:
-        validate_fitted_transition_pair_receipt(
-            pair_receipt, optimization_dataset
-        )
-        resumed = load_checkpoint(
-            arguments.resume,
-            expected_dataset_digest=manifest["dataset_digest_sha256"],
-            expected_kinematic_signature_sha256=kinematics.kinematic_signature_sha256,
-        )
-        validate_resume_fitted_subset(resumed, fitted_receipt)
-        if arguments.seed != resumed.seed:
-            raise ValueError("resume checkpoint seed mismatch")
-        if sequence_sampler is not None:
-            restored_sequence_sampler_state = (
-                _validated_active_sequence_sampler_state(
-                    resumed.sequence_sampler_state,
-                    active_sampler=sequence_sampler,
-                )
-            )
-        else:
-            restored_sequence_sampler_state = resumed.sequence_sampler_state
-        restored_step, restored_epoch = restore_training_state(
+    if resumed is not None:
+        restored = restore_training_state(
             resumed,
             unwrapped,
             optimizer,
@@ -1561,12 +2064,8 @@ def train(
             train_identities=manifest["split_identities"]["train"],
             validation_identities=manifest["split_identities"]["validation"],
         )
-        restored_sampler_epoch = resumed.sampler_epoch
-        restored_sampler_global_offset = resumed.sampler_global_offset
-        if restored_step > 0 and restored_epoch != restored_sampler_epoch + 1:
-            raise ValueError("resume checkpoint sampler epoch is inconsistent")
-        if restored_step >= arguments.steps:
-            raise ValueError("--steps must exceed the resumed checkpoint step")
+        if restored != (restored_step, restored_epoch):
+            raise ValueError("resume checkpoint state counters changed before restore")
         if world_size > 1:
             dist.barrier()
     output = Path(arguments.output)
@@ -1611,23 +2110,9 @@ def train(
     local_offset = 0
     padding = 0
     if arguments.resume is not None:
-        global_epoch = (
-            _balanced_epoch_indices(
-                pair_indices,
-                pair_classes,
-                seed=arguments.seed,
-                epoch=restored_sampler_epoch,
-            )
-            if rank == 0 else None
-        )
-        global_epoch = _broadcast_indices(global_epoch, device)
-        local_epoch, local_offset, padding = _local_epoch_at_global_offset(
-            global_epoch,
-            global_offset=restored_sampler_global_offset,
-            batch_size=arguments.batch_size,
-            rank=rank,
-            world_size=world_size,
-        )
+        local_epoch = resumed_local_epoch
+        local_offset = resumed_local_offset
+        padding = resumed_padding
     while step < arguments.steps:
         if local_offset + arguments.batch_size > len(local_epoch):
             global_epoch = (
@@ -1693,7 +2178,7 @@ def train(
         )
         step += 1
         reported_loss_keys = (
-            *LOSS_WEIGHT_KEYS,
+            *BASE_LOSS_WEIGHT_KEYS,
             *_ENVELOPE_LOSS_METRIC_KEYS,
             "total",
         )
@@ -1833,7 +2318,7 @@ def train(
                 [
                     rollout.losses[name].detach()
                     for name in (
-                        *LOSS_WEIGHT_KEYS,
+                        *BASE_LOSS_WEIGHT_KEYS,
                         *_ENVELOPE_LOSS_METRIC_KEYS,
                         "total",
                     )
@@ -1845,7 +2330,7 @@ def train(
             if rank == 0:
                 assert metric_stream is not None
                 reported_rollout_loss_keys = (
-                    *LOSS_WEIGHT_KEYS,
+                    *BASE_LOSS_WEIGHT_KEYS,
                     *_ENVELOPE_LOSS_METRIC_KEYS,
                     "total",
                 )
@@ -1938,7 +2423,7 @@ def train(
                 "epoch": epoch,
                 "losses": {
                     name: float(gate_metrics[name])
-                    for name in LOSS_WEIGHT_KEYS
+                    for name in BASE_LOSS_WEIGHT_KEYS
                     if name != "regularization"
                 },
                 "validation_score": float(gate_metrics["one_step_score"]),
@@ -1959,6 +2444,15 @@ def train(
     dataset_digest = manifest["dataset_digest_sha256"]
     train_identities = manifest["split_identities"]["train"]
     validation_identities = manifest["split_identities"]["validation"]
+    envelope_metrics = complete_fitted_pair_envelope_metrics(
+        unwrapped,
+        pair_dataset,
+        normalization=train_dataset,
+        joint_limits=kinematics.joint_limits,
+        phase_advance_cap=phase_advance_cap,
+        contract=DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+        device=device,
+    )
     closed_loop_result: ClosedLoopValidationResult | None = None
     if pipeline_overfit:
         promote_best = False
@@ -1992,6 +2486,9 @@ def train(
         dataset_digest=dataset_digest,
         kinematic_signature_sha256=kinematics.kinematic_signature_sha256,
         runtime_seed=runtime_seed,
+        physical_envelope_objective=DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+        fitted_pair_receipt=pair_receipt,
+        target_envelope_audit=target_envelope_audit,
         step=step,
         epoch=epoch,
         seed=arguments.seed,
@@ -2020,6 +2517,8 @@ def train(
                 gate_metrics["one_step_score"]
             ),
             "expected_fixed_sample_count": int(gate_metrics["samples"]),
+            "physical_envelope_objective_sha256": objective_sha256,
+            "fitted_pair_receipt_sha256": pair_receipt["receipt_sha256"],
         }
         transition, pipeline_receipt = _verify_reloaded_pipeline_candidate(
             candidate_path=candidate,
@@ -2030,6 +2529,9 @@ def train(
             kinematic_signature_sha256=kinematics.kinematic_signature_sha256,
             joint_limits=kinematics.joint_limits.detach().cpu(),
             phase_advance_q99=phase_q99,
+            physical_envelope_objective=objective_payload,
+            fitted_pair_receipt=pair_receipt,
+            target_envelope_audit=target_envelope_audit,
             verification_request=verification_request,
             pipeline_verifier=(pipeline_verifier if one_step_accepted else None),
         )
@@ -2055,6 +2557,8 @@ def train(
                 fitted_transition_report_sha256=fitted_transition_report[
                     "report_sha256"
                 ],
+                physical_envelope_objective_sha256=objective_sha256,
+                fitted_pair_receipt_sha256=pair_receipt["receipt_sha256"],
                 expected_fixed_sample_score=float(
                     verification_request["expected_fixed_sample_score"]
                 ),
@@ -2077,10 +2581,16 @@ def train(
         best = output / "best.pt"
         _publish_immutable_best(candidate, best)
         best_path = str(best)
-    report = {
-        "schema": "mm-sonic-terrain-pfnn-one-step-report/v1",
+    report_base = {
+        "schema": ONE_STEP_REPORT_SCHEMA,
         "dataset_digest_sha256": dataset_digest,
         "kinematic_signature_sha256": kinematics.kinematic_signature_sha256,
+        "physical_envelope_objective": objective_payload,
+        "physical_envelope_objective_sha256": objective_sha256,
+        "fitted_pair_receipt": pair_receipt,
+        "fitted_pair_receipt_sha256": pair_receipt["receipt_sha256"],
+        "target_envelope_audit": target_envelope_audit,
+        "envelope_metrics": envelope_metrics,
         "fixed_subset_samples": len(candidate_indices) if pipeline_overfit else None,
         "fitted_subset": fitted_receipt,
         "fitted_transition_report": fitted_transition_report,
@@ -2128,6 +2638,7 @@ def train(
             ),
         },
     }
+    report = seal_one_step_report(report_base)
     _atomic_json(output / "one-step-report.json", report)
     if world_size > 1:
         dist.barrier()
@@ -2175,9 +2686,13 @@ if __name__ == "__main__":
 
 __all__ = [
     "FittedTransitionPair",
+    "ONE_STEP_REPORT_SCHEMA",
+    "PIPELINE_PROMOTION_RECEIPT_SCHEMA",
     "RolloutSequence",
     "build_pipeline_promotion_receipt",
     "canonical_transition_pairs",
+    "complete_fitted_pair_envelope_metrics",
+    "dataset_file_snapshot",
     "fitted_transition_pair_receipt",
     "main",
     "materialize_transition_pairs",
@@ -2189,9 +2704,13 @@ __all__ = [
     "promote_pipeline_best",
     "validated_normal_selection",
     "resolve_rollout_finetune_frames",
+    "seal_one_step_report",
     "seed_worker",
     "stratified_subset",
     "train",
+    "validate_active_physical_envelope",
     "validate_canonical_transition_pairs",
     "validate_fitted_transition_pair_receipt",
+    "validate_one_step_report",
+    "write_dataset_file_snapshot",
 ]

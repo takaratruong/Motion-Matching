@@ -1421,6 +1421,47 @@ def evaluate(
         expected = torch.as_tensor(getattr(dataset, name), dtype=torch.float32)
         if not torch.equal(checkpoint.normalization[name], expected):
             raise ValueError("checkpoint normalization arrays mismatch")
+    active_fitted_indices: list[int] | None = None
+    if split == "train":
+        from mm_sonic.train_terrain_pfnn import (
+            fitted_transition_pair_receipt,
+            materialize_subset,
+            materialize_transition_pairs,
+            validate_active_physical_envelope,
+        )
+        from mm_sonic.terrain_pfnn.training import (
+            DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+            fitted_target_envelope_audit,
+            physical_envelope_objective_payload,
+        )
+
+        checkpoint_fitted_subset = getattr(checkpoint, "fitted_subset", None)
+        active_dataset: object = dataset
+        if type(checkpoint_fitted_subset) is dict:
+            active_fitted_indices = _fitted_subset_indices(
+                dataset, checkpoint_fitted_subset
+            )
+            active_dataset = materialize_subset(dataset, active_fitted_indices)
+        pair_receipt = fitted_transition_pair_receipt(active_dataset)
+        pair_dataset = materialize_transition_pairs(active_dataset)
+        phase_advance_cap = min(
+            math.pi, 1.5 * float(checkpoint.phase_advance_q99)
+        )
+        target_envelope_audit = fitted_target_envelope_audit(
+            pair_dataset,
+            normalization=checkpoint.normalization,
+            joint_limits=checkpoint.joint_limits,
+            phase_advance_cap=phase_advance_cap,
+            contract=DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+        )
+        validate_active_physical_envelope(
+            checkpoint,
+            physical_envelope_objective=physical_envelope_objective_payload(
+                DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE
+            ),
+            fitted_pair_receipt=pair_receipt,
+            target_envelope_audit=target_envelope_audit,
+        )
     checkpoint_path = Path(checkpoint_path).resolve()
     checkpoint_digest = _sha256(checkpoint_path)
     if split == "test":
@@ -1447,7 +1488,8 @@ def evaluate(
         fitted_subset = getattr(checkpoint, "fitted_subset", None)
         selection = getattr(checkpoint, "selection", None)
         if type(fitted_subset) is dict:
-            fixed_indices = _fitted_subset_indices(dataset, fitted_subset)
+            assert active_fitted_indices is not None
+            fixed_indices = active_fitted_indices
             adjacent = fitted_adjacent_indices(dataset, fixed_indices)
             transition_model = checkpoint.build_model().to(torch.device("cpu"))
             transition = evaluate_fitted_transition_envelope(
@@ -1507,6 +1549,12 @@ def evaluate(
                         fitted_transition_report_sha256=fitted_transition_report[
                             "report_sha256"
                         ],
+                        physical_envelope_objective_sha256=(
+                            checkpoint.physical_envelope_objective_sha256
+                        ),
+                        fitted_pair_receipt_sha256=checkpoint.fitted_pair_receipt[
+                            "receipt_sha256"
+                        ],
                         expected_fixed_sample_score=float(
                             selection["one_step_score"]
                         ),
@@ -1531,6 +1579,14 @@ def evaluate(
                             fitted_transition_report=fitted_transition_report,
                             fitted_transition_report_sha256=(
                                 fitted_transition_report["report_sha256"]
+                            ),
+                            physical_envelope_objective_sha256=(
+                                checkpoint.physical_envelope_objective_sha256
+                            ),
+                            fitted_pair_receipt_sha256=(
+                                checkpoint.fitted_pair_receipt[
+                                    "receipt_sha256"
+                                ]
                             ),
                             expected_fixed_sample_score=float(
                                 selection["one_step_score"]
@@ -1587,6 +1643,12 @@ def evaluate(
         "checkpoint_sha256": checkpoint_digest,
         "dataset_digest_sha256": dataset_digest,
         "kinematic_signature_sha256": kinematics.kinematic_signature_sha256,
+        "physical_envelope_objective_sha256": (
+            checkpoint.physical_envelope_objective_sha256
+        ),
+        "fitted_pair_receipt_sha256": checkpoint.fitted_pair_receipt[
+            "receipt_sha256"
+        ],
         "split": split,
         "sealed_test": split == "test",
         "one_step": metrics,

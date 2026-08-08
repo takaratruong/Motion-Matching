@@ -12,6 +12,8 @@ from unittest.mock import patch
 import numpy as np
 import torch
 import mm_sonic.evaluate_terrain_pfnn as evaluate_module
+import mm_sonic.train_terrain_pfnn as train_module
+import mm_sonic.terrain_pfnn.training as training_module
 import mm_sonic.terrain_pfnn.runtime as runtime_module
 
 from mm_sonic.evaluate_terrain_pfnn import (
@@ -1117,10 +1119,14 @@ def Mesh "Terrain" {
             y_std = np.ones(OUTPUT_LAYOUT.size, np.float32)
 
             def __init__(self) -> None:
-                self.rows = [self.row(10), self.row(11)]
+                classes = ("flat", "flat", "ascent", "descent", "transition")
+                self.rows = [
+                    self.row(center, classes[index])
+                    for index, center in enumerate(range(10, 15))
+                ]
 
             @staticmethod
-            def row(center: int) -> dict[str, object]:
+            def row(center: int, terrain_class: str) -> dict[str, object]:
                 y = np.zeros(OUTPUT_LAYOUT.size, np.float32)
                 y[OUTPUT_LAYOUT["trajectory_direction"]] = np.tile((1.0, 0.0), 12)
                 y[OUTPUT_LAYOUT["root_height"]] = 0.8
@@ -1134,7 +1140,7 @@ def Mesh "Terrain" {
                     "split_identity": "slope_000",
                     "split": "train",
                     "sequence_lane": "motion",
-                    "terrain_class": "flat",
+                    "terrain_class": terrain_class,
                 }
 
             def __len__(self) -> int:
@@ -1144,7 +1150,15 @@ def Mesh "Terrain" {
                 return self.rows[index]
 
         dataset = Dataset()
-        fitted_subset = fitted_subset_metadata(dataset, (0, 1))
+        fitted_subset = fitted_subset_metadata(dataset, range(len(dataset)))
+        active_pair_receipt = train_module.fitted_transition_pair_receipt(dataset)
+        active_target_audit = training_module.fitted_target_envelope_audit(
+            train_module.materialize_transition_pairs(dataset),
+            normalization=dataset,
+            joint_limits=torch.tensor([[-2.0, 2.0]] * 29, dtype=torch.float64),
+            phase_advance_cap=1.5 * 0.2,
+            contract=training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+        )
         maxima = {
             "absolute_output": 0.251,
             "root_translation_step_m": 0.0,
@@ -1208,6 +1222,20 @@ def Mesh "Terrain" {
 
             def __init__(self) -> None:
                 self.fitted_subset = fitted_subset
+                self.physical_envelope_objective = (
+                    training_module.physical_envelope_objective_payload(
+                        training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE
+                    )
+                )
+                self.physical_envelope_objective_sha256 = hashlib.sha256(
+                    json.dumps(
+                        self.physical_envelope_objective,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                ).hexdigest()
+                self.fitted_pair_receipt = active_pair_receipt
+                self.target_envelope_audit = active_target_audit
 
             @staticmethod
             def build_model():
@@ -1319,6 +1347,156 @@ def Mesh "Terrain" {
                 "--closed-loop-seconds", "20",
             ]), 2)
 
+    def test_active_pair_mismatch_rejects_before_evaluator_model_and_known_callback(
+        self,
+    ) -> None:
+        manifest = {
+            "dataset_digest_sha256": "a" * 64,
+            "split_identities": {
+                "train": ["slope_000"],
+                "validation": ["slope_002"],
+            },
+        }
+
+        class Dataset:
+            split = "train"
+            x_mean = np.zeros(INPUT_LAYOUT.size, np.float32)
+            x_std = np.ones(INPUT_LAYOUT.size, np.float32)
+            y_mean = np.zeros(OUTPUT_LAYOUT.size, np.float32)
+            y_std = np.ones(OUTPUT_LAYOUT.size, np.float32)
+
+            def __init__(self) -> None:
+                classes = ("flat", "flat", "ascent", "descent", "transition")
+                self.rows = [
+                    self.row(center, classes[index])
+                    for index, center in enumerate(range(10, 15))
+                ]
+
+            @staticmethod
+            def row(center: int, terrain_class: str) -> dict[str, object]:
+                y = np.zeros(OUTPUT_LAYOUT.size, np.float32)
+                y[OUTPUT_LAYOUT["trajectory_direction"]] = np.tile(
+                    (1.0, 0.0), 12
+                )
+                y[OUTPUT_LAYOUT["root_height"]] = 0.8
+                y[OUTPUT_LAYOUT["phase_advance"]] = 0.1
+                return {
+                    "x": np.zeros(INPUT_LAYOUT.size, np.float32),
+                    "y": y,
+                    "phase": np.float32(0.1 * center),
+                    "clip_id": "terrain_slopes__slope_000__000",
+                    "center_frame": center,
+                    "split_identity": "slope_000",
+                    "split": "train",
+                    "sequence_lane": "motion",
+                    "terrain_class": terrain_class,
+                }
+
+            def __len__(self) -> int:
+                return len(self.rows)
+
+            def __getitem__(self, index: int) -> dict[str, object]:
+                return self.rows[index]
+
+        class Kinematics:
+            kinematic_signature_sha256 = "kin"
+            joint_limits = torch.tensor([[-2.0, 2.0]] * 29, dtype=torch.float64)
+
+            def to(self, _device: object) -> Kinematics:
+                return self
+
+        dataset = Dataset()
+        fitted_subset = fitted_subset_metadata(dataset, range(len(dataset)))
+        pair_receipt = train_module.fitted_transition_pair_receipt(dataset)
+        pair_dataset = train_module.materialize_transition_pairs(dataset)
+        target_audit = training_module.fitted_target_envelope_audit(
+            pair_dataset,
+            normalization=dataset,
+            joint_limits=Kinematics.joint_limits,
+            phase_advance_cap=1.5 * 0.2,
+            contract=training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+        )
+        tampered_receipt = dict(pair_receipt)
+        tampered_receipt["pairs_sha256"] = "0" * 64
+        base = {
+            name: value
+            for name, value in tampered_receipt.items()
+            if name != "receipt_sha256"
+        }
+        tampered_receipt["receipt_sha256"] = hashlib.sha256(
+            json.dumps(base, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+        class Checkpoint:
+            kinematic_signature_sha256 = "kin"
+            joint_limits = Kinematics.joint_limits.clone()
+            train_identities = ("slope_000",)
+            validation_identities = ("slope_002",)
+            normalization = {
+                "x_mean": torch.zeros(INPUT_LAYOUT.size),
+                "x_std": torch.ones(INPUT_LAYOUT.size),
+                "y_mean": torch.zeros(OUTPUT_LAYOUT.size),
+                "y_std": torch.ones(OUTPUT_LAYOUT.size),
+            }
+            loss_weights = training_module.DEFAULT_LOSS_WEIGHTS
+            phase_advance_q99 = 0.2
+            physical_envelope_objective = (
+                training_module.physical_envelope_objective_payload(
+                    training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE
+                )
+            )
+            physical_envelope_objective_sha256 = hashlib.sha256(
+                json.dumps(
+                    physical_envelope_objective,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            selection = {"one_step_score": 1.0, "provisional": True}
+
+            def __init__(self) -> None:
+                self.fitted_subset = fitted_subset
+                self.fitted_pair_receipt = tampered_receipt
+                self.target_envelope_audit = target_audit
+
+            @staticmethod
+            def build_model() -> torch.nn.Module:
+                raise AssertionError("evaluator model was built")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "manifest.json").write_text(json.dumps(manifest))
+            checkpoint_path = root / "checkpoint.pt"
+            checkpoint_path.write_bytes(b"candidate")
+            with patch(
+                "mm_sonic.evaluate_terrain_pfnn.TorchG1ForwardKinematics.from_mjcf",
+                return_value=Kinematics(),
+            ), patch(
+                "mm_sonic.evaluate_terrain_pfnn.load_checkpoint",
+                return_value=Checkpoint(),
+            ), patch(
+                "mm_sonic.evaluate_terrain_pfnn.PFNNShardDataset",
+                return_value=dataset,
+            ), patch(
+                "mm_sonic.evaluate_terrain_pfnn.run_known_train_rollout",
+                side_effect=AssertionError("known terrain callback opened"),
+            ) as callback:
+                with self.assertRaisesRegex(ValueError, "active physical envelope"):
+                    evaluate(
+                        checkpoint_path=checkpoint_path,
+                        dataset_path=root / "manifest.json",
+                        model_path=MODEL_PATH,
+                        split="train",
+                        output_path=root / "evaluation.json",
+                        sealed_test=False,
+                        run_directory=None,
+                        batch_size=2,
+                        device="cpu",
+                        closed_loop_seconds=20.0,
+                        promote_pipeline_checkpoint=True,
+                    )
+                callback.assert_not_called()
+
     def test_public_evaluator_allows_only_explicit_twenty_second_train_gate(self) -> None:
         manifest = {
             "dataset_digest_sha256": "a" * 64,
@@ -1326,10 +1504,37 @@ def Mesh "Terrain" {
         }
 
         class Dataset:
+            split = "train"
             x_mean = np.zeros(INPUT_LAYOUT.size, np.float32)
             x_std = np.ones(INPUT_LAYOUT.size, np.float32)
             y_mean = np.zeros(OUTPUT_LAYOUT.size, np.float32)
             y_std = np.ones(OUTPUT_LAYOUT.size, np.float32)
+
+            def __init__(self) -> None:
+                classes = ("flat", "flat", "ascent", "descent", "transition")
+                self.rows = []
+                for index, center in enumerate(range(10, 15)):
+                    y = np.zeros(OUTPUT_LAYOUT.size, np.float32)
+                    y[OUTPUT_LAYOUT["phase_advance"]] = 0.1
+                    self.rows.append(
+                        {
+                            "x": np.zeros(INPUT_LAYOUT.size, np.float32),
+                            "y": y,
+                            "phase": np.float32(0.1),
+                            "clip_id": "train-id",
+                            "center_frame": center,
+                            "split_identity": "train-id",
+                            "split": "train",
+                            "sequence_lane": "motion",
+                            "terrain_class": classes[index],
+                        }
+                    )
+
+            def __len__(self) -> int:
+                return len(self.rows)
+
+            def __getitem__(self, index: int) -> dict[str, object]:
+                return self.rows[index]
 
         class Kinematics:
             kinematic_signature_sha256 = "kin"
@@ -1337,6 +1542,16 @@ def Mesh "Terrain" {
 
             def to(self, _device):
                 return self
+
+        dataset = Dataset()
+        active_pair_receipt = train_module.fitted_transition_pair_receipt(dataset)
+        active_target_audit = training_module.fitted_target_envelope_audit(
+            train_module.materialize_transition_pairs(dataset),
+            normalization=dataset,
+            joint_limits=Kinematics.joint_limits,
+            phase_advance_cap=1.5 * 0.2,
+            contract=training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
+        )
 
         class Checkpoint:
             kinematic_signature_sha256 = "kin"
@@ -1350,6 +1565,23 @@ def Mesh "Terrain" {
                 "y_std": torch.ones(OUTPUT_LAYOUT.size),
             }
             loss_weights = {}
+            phase_advance_q99 = 0.2
+
+            def __init__(self) -> None:
+                self.physical_envelope_objective = (
+                    training_module.physical_envelope_objective_payload(
+                        training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE
+                    )
+                )
+                self.physical_envelope_objective_sha256 = hashlib.sha256(
+                    json.dumps(
+                        self.physical_envelope_objective,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                ).hexdigest()
+                self.fitted_pair_receipt = active_pair_receipt
+                self.target_envelope_audit = active_target_audit
 
             @staticmethod
             def build_model():
@@ -1376,7 +1608,7 @@ def Mesh "Terrain" {
                 ),
                 patch(
                     "mm_sonic.evaluate_terrain_pfnn.PFNNShardDataset",
-                    return_value=Dataset(),
+                    return_value=dataset,
                 ),
                 patch(
                     "mm_sonic.evaluate_terrain_pfnn.one_step_metrics",

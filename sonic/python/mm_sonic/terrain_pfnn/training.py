@@ -41,8 +41,9 @@ from .recurrence import (
 )
 
 
-CHECKPOINT_SCHEMA = "mm-sonic-terrain-pfnn-checkpoint/v5"
+CHECKPOINT_SCHEMA = "mm-sonic-terrain-pfnn-checkpoint/v6"
 FITTED_TRANSITION_REPORT_SCHEMA = "mm-sonic-fitted-transition-report/v1"
+_TERRAIN_CLASSES = ("flat", "ascent", "descent", "transition")
 _SEQUENCE_LANES = ("motion", *(f"idle_phase_{index}" for index in range(8)))
 _NORMALIZATION_CONTRACT = {
     "continuous_loss_domain": "normalized",
@@ -51,7 +52,7 @@ _NORMALIZATION_CONTRACT = {
     "recurrent_body_input_scale": 0.1,
     "root_tilt_encoding": "angle_axis_xy",
 }
-LOSS_WEIGHT_KEYS = (
+BASE_LOSS_WEIGHT_KEYS = (
     "trajectory_mse",
     "body_mse",
     "root_pose_mse",
@@ -64,6 +65,12 @@ LOSS_WEIGHT_KEYS = (
     "fk_consistency",
     "regularization",
 )
+ENVELOPE_LOSS_WEIGHT_KEYS = (
+    "joint_step_envelope",
+    "joint_limit_envelope",
+    "phase_envelope",
+)
+LOSS_WEIGHT_KEYS = BASE_LOSS_WEIGHT_KEYS + ENVELOPE_LOSS_WEIGHT_KEYS
 DEFAULT_LOSS_WEIGHTS = {name: 1.0 for name in LOSS_WEIGHT_KEYS}
 _STATE_NAMES = ("W0", "b0", "W1", "b1", "W2", "b2")
 # Exact torch.optim.Adam group schema for the pinned trainer configuration.
@@ -199,6 +206,60 @@ DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE = PhysicalEnvelopeObjective()
 PHASE_AUDIT_NEGATIVE_TOLERANCE_RAD: float = 9.5367431640625e-7
 assert PHASE_AUDIT_NEGATIVE_TOLERANCE_RAD == 8 * np.finfo(np.float32).eps
 
+_PHYSICAL_ENVELOPE_OBJECTIVE_FIELD_TYPES: dict[str, type[object]] = {
+    "schema": str,
+    "joint_step_onset_rad": float,
+    "joint_step_scale_rad": float,
+    "joint_limit_margin_rad": float,
+    "phase_upper_margin_rad": float,
+    "phase_scale_rad": float,
+    "tail_fraction": float,
+    "joint_step_hinge_power": int,
+    "joint_limit_hinge_power": int,
+    "phase_lower_hinge_power": int,
+    "phase_upper_hinge_power": int,
+    "maximum_coefficient": float,
+    "positive_tail_mean_coefficient": float,
+}
+
+
+def validate_physical_envelope_objective(value: object) -> dict[str, object]:
+    """Return the one canonical objective payload with exact JSON types."""
+
+    if (
+        type(value) is not dict
+        or set(value) != set(_PHYSICAL_ENVELOPE_OBJECTIVE_FIELD_TYPES)
+        or any(
+            type(value[name]) is not expected_type
+            for name, expected_type in _PHYSICAL_ENVELOPE_OBJECTIVE_FIELD_TYPES.items()
+        )
+        or any(
+            value[name] != getattr(DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE, name)
+            for name in _PHYSICAL_ENVELOPE_OBJECTIVE_FIELD_TYPES
+        )
+        or any(
+            type(value[name]) is float and not math.isfinite(value[name])
+            for name in _PHYSICAL_ENVELOPE_OBJECTIVE_FIELD_TYPES
+        )
+    ):
+        raise ValueError("physical envelope objective is invalid")
+    return dict(value)
+
+
+def physical_envelope_objective_payload(
+    contract: PhysicalEnvelopeObjective,
+) -> dict[str, object]:
+    """Serialize only an exact, canonical objective dataclass."""
+
+    if type(contract) is not PhysicalEnvelopeObjective:
+        raise ValueError("physical envelope objective is invalid")
+    return validate_physical_envelope_objective(
+        {
+            name: getattr(contract, name)
+            for name in _PHYSICAL_ENVELOPE_OBJECTIVE_FIELD_TYPES
+        }
+    )
+
 
 class PhysicalEnvelopeRisks(dict[str, torch.Tensor]):
     """Per-pair risks with runtime-failure masks from the same physical path."""
@@ -208,9 +269,11 @@ class PhysicalEnvelopeRisks(dict[str, torch.Tensor]):
         values: Mapping[str, torch.Tensor],
         *,
         runtime_failures: Mapping[str, torch.Tensor],
+        physical_values: Mapping[str, torch.Tensor],
     ) -> None:
         super().__init__(values)
         self.runtime_failures = dict(runtime_failures)
+        self.physical_values = dict(physical_values)
 
 
 def physical_envelope_risks(
@@ -319,6 +382,19 @@ def physical_envelope_risks(
                 dim=1,
             ),
             "phase": (phase_advance < 0.0) | (phase_advance > phase_cap),
+        },
+        physical_values={
+            "joint_step_rad": torch.amax(
+                torch.abs(predicted_joints - reached_joints), dim=1
+            ),
+            "joint_limit_excess_rad": torch.amax(
+                torch.maximum(
+                    torch.relu(limits[:, 0] - predicted_joints),
+                    torch.relu(predicted_joints - limits[:, 1]),
+                ),
+                dim=1,
+            ),
+            "phase_advance_rad": phase_advance,
         },
     )
 
@@ -461,6 +537,145 @@ def fitted_target_envelope_audit(
         "phase_upper_excess_count": phase_upper_excess_count,
     }
     return {**base, "audit_sha256": _canonical_json_sha256(base)}
+
+
+def _sha256_value(value: object) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def validate_compact_fitted_pair_receipt(value: object) -> dict[str, object]:
+    """Validate a checkpoint's compact receipt without deserializing pairs."""
+
+    required = {
+        "schema",
+        "active_row_count",
+        "active_rows_sha256",
+        "sample_count",
+        "class_counts",
+        "pairs_sha256",
+        "receipt_sha256",
+    }
+    if (
+        type(value) is not dict
+        or set(value) != required
+        or value.get("schema")
+        != "mm-sonic-fitted-transition-pair-receipt/v1"
+        or type(value.get("active_row_count")) is not int
+        or value["active_row_count"] < 1
+        or not _sha256_value(value.get("active_rows_sha256"))
+        or type(value.get("sample_count")) is not int
+        or value["sample_count"] < 1
+        or value["active_row_count"] < value["sample_count"]
+        or type(value.get("class_counts")) is not dict
+        or set(value["class_counts"]) != set(_TERRAIN_CLASSES)
+        or any(
+            type(value["class_counts"][name]) is not int
+            or value["class_counts"][name] < 1
+            for name in _TERRAIN_CLASSES
+        )
+        or sum(value["class_counts"].values()) != value["sample_count"]
+        or not _sha256_value(value.get("pairs_sha256"))
+        or not _sha256_value(value.get("receipt_sha256"))
+    ):
+        raise ValueError("checkpoint fitted pair receipt is invalid")
+    base = {name: item for name, item in value.items() if name != "receipt_sha256"}
+    if value["receipt_sha256"] != _canonical_json_sha256(base):
+        raise ValueError("checkpoint fitted pair receipt digest mismatch")
+    return json.loads(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    )
+
+
+def validate_target_envelope_audit(
+    value: object,
+    *,
+    expected_sample_count: int,
+    expected_phase_advance_cap: float | None = None,
+) -> dict[str, object]:
+    """Validate every exact feasibility-audit field and its canonical digest."""
+
+    float_fields = {
+        "joint_step_onset_rad",
+        "joint_limit_margin_rad",
+        "phase_upper_margin_rad",
+        "phase_advance_cap_rad",
+        "phase_audit_negative_tolerance_rad",
+        "maximum_joint_step_rad",
+        "minimum_joint_limit_clearance_rad",
+        "minimum_phase_advance_unclamped_rad",
+        "minimum_phase_advance_rad",
+        "maximum_phase_advance_rad",
+    }
+    count_fields = {
+        "joint_step_excess_count",
+        "joint_limit_margin_excess_count",
+        "phase_negative_excess_count",
+        "phase_upper_excess_count",
+    }
+    required = {
+        "schema",
+        "sample_count",
+        *float_fields,
+        *count_fields,
+        "audit_sha256",
+    }
+    if (
+        type(expected_sample_count) is not int
+        or expected_sample_count < 1
+        or type(value) is not dict
+        or set(value) != required
+        or value.get("schema") != "mm-sonic-fitted-target-envelope-audit/v1"
+        or type(value.get("sample_count")) is not int
+        or value["sample_count"] != expected_sample_count
+        or any(
+            type(value[name]) is not float or not math.isfinite(value[name])
+            for name in float_fields
+        )
+        or any(
+            type(value[name]) is not int or value[name] != 0
+            for name in count_fields
+        )
+        or value["joint_step_onset_rad"]
+        != DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE.joint_step_onset_rad
+        or value["joint_limit_margin_rad"]
+        != DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE.joint_limit_margin_rad
+        or value["phase_upper_margin_rad"]
+        != DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE.phase_upper_margin_rad
+        or value["phase_audit_negative_tolerance_rad"]
+        != PHASE_AUDIT_NEGATIVE_TOLERANCE_RAD
+        or value["phase_advance_cap_rad"]
+        <= DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE.phase_upper_margin_rad
+        or value["maximum_joint_step_rad"] > value["joint_step_onset_rad"]
+        or value["minimum_joint_limit_clearance_rad"]
+        < value["joint_limit_margin_rad"]
+        or value["minimum_phase_advance_unclamped_rad"]
+        < -PHASE_AUDIT_NEGATIVE_TOLERANCE_RAD
+        or value["minimum_phase_advance_rad"]
+        != max(value["minimum_phase_advance_unclamped_rad"], 0.0)
+        or value["maximum_phase_advance_rad"]
+        > value["phase_advance_cap_rad"] - value["phase_upper_margin_rad"]
+        or not _sha256_value(value.get("audit_sha256"))
+    ):
+        raise ValueError("checkpoint target envelope audit is invalid")
+    if (
+        expected_phase_advance_cap is not None
+        and (
+            type(expected_phase_advance_cap) is not float
+            or not math.isfinite(expected_phase_advance_cap)
+            or value["phase_advance_cap_rad"] != expected_phase_advance_cap
+        )
+    ):
+        raise ValueError("checkpoint target envelope audit phase cap mismatch")
+    base = {name: item for name, item in value.items() if name != "audit_sha256"}
+    if value["audit_sha256"] != _canonical_json_sha256(base):
+        raise ValueError("checkpoint target envelope audit digest mismatch")
+    return json.loads(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    )
 
 
 @dataclass(frozen=True)
@@ -879,7 +1094,9 @@ def pfnn_losses(
     parameter_count = sum(parameter.numel() for parameter in parameters)
     losses["regularization"] = 0.01 * absolute_sum / parameter_count
     weights = _loss_weights(loss_weights)
-    losses["total"] = sum(losses[name] * weights[name] for name in LOSS_WEIGHT_KEYS)
+    losses["total"] = sum(
+        losses[name] * weights[name] for name in BASE_LOSS_WEIGHT_KEYS
+    )
     return losses
 
 
@@ -1016,7 +1233,10 @@ def one_step_training_losses(
         error_type=FloatingPointError,
     )
     losses.update(envelope)
-    losses["total"] = losses["total"] + envelope["physical_envelope_total"]
+    weights = _loss_weights(loss_weights)
+    losses["total"] = losses["total"] + sum(
+        envelope[name] * weights[name] for name in ENVELOPE_LOSS_WEIGHT_KEYS
+    )
     _collective_finite_preflight(
         (losses["total"],),
         rank=rank,
@@ -1305,9 +1525,11 @@ def autoregressive_unroll(
         metadata_message="rollout finiteness metadata is invalid",
     )
     losses.update(envelope_losses)
-    losses["total"] = losses["total"] + envelope_losses[
-        "physical_envelope_total"
-    ]
+    weights = _loss_weights(loss_weights)
+    losses["total"] = losses["total"] + sum(
+        envelope_losses[name] * weights[name]
+        for name in ENVELOPE_LOSS_WEIGHT_KEYS
+    )
     _collective_finite_preflight(
         (losses["total"],),
         rank=rank,
@@ -2795,7 +3017,8 @@ _CHECKPOINT_KEYS = {
     "train_identities", "validation_identities", "step", "epoch", "seed",
     "loss_weights", "kinematic_signature_sha256", "joint_limits",
     "phase_advance_q99", "runtime_seed", "selection", "sampler_state",
-    "fitted_subset",
+    "fitted_subset", "physical_envelope_objective", "fitted_pair_receipt",
+    "target_envelope_audit",
 }
 
 
@@ -2823,6 +3046,10 @@ class LoadedCheckpoint:
     sampler_global_offset: int
     sequence_sampler_state: dict[str, object] | None
     fitted_subset: dict[str, object] | None
+    physical_envelope_objective: dict[str, object]
+    physical_envelope_objective_sha256: str
+    fitted_pair_receipt: dict[str, object]
+    target_envelope_audit: dict[str, object]
 
     def build_model(self) -> PhaseFunctionedNetwork:
         model = PhaseFunctionedNetwork(
@@ -2842,6 +3069,9 @@ def save_checkpoint(
     dataset_digest: str,
     kinematic_signature_sha256: str,
     runtime_seed: Mapping[str, object],
+    physical_envelope_objective: PhysicalEnvelopeObjective,
+    fitted_pair_receipt: Mapping[str, object],
+    target_envelope_audit: Mapping[str, object],
     step: int,
     epoch: int = 0,
     seed: int = 0,
@@ -2883,10 +3113,36 @@ def save_checkpoint(
     if not math.isfinite(q99) or q99 < 0.0:
         raise ValueError("phase_advance_q99 must be finite and nonnegative")
     checked_runtime_seed = _validate_runtime_seed(dict(runtime_seed), limits)
+    objective_payload = physical_envelope_objective_payload(
+        physical_envelope_objective
+    )
+    checked_pair_receipt = validate_compact_fitted_pair_receipt(
+        dict(fitted_pair_receipt)
+    )
+    checked_target_audit = validate_target_envelope_audit(
+        dict(target_envelope_audit),
+        expected_sample_count=checked_pair_receipt["sample_count"],
+        expected_phase_advance_cap=min(math.pi, 1.5 * q99),
+    )
     checked_fitted_subset = _validated_fitted_subset(
         None if fitted_subset is None else dict(fitted_subset)
     )
     if checked_fitted_subset is not None:
+        expected_active_rows_sha256 = _canonical_json_sha256(
+            {
+                "row_sha256": sorted(
+                    row["row_sha256"]
+                    for row in checked_fitted_subset["rows"]
+                )
+            }
+        )
+        if (
+            checked_pair_receipt["active_row_count"]
+            != len(checked_fitted_subset["rows"])
+            or checked_pair_receipt["active_rows_sha256"]
+            != expected_active_rows_sha256
+        ):
+            raise ValueError("checkpoint fitted pair row scope mismatch")
         validate_runtime_seed_fitted_subset(
             checked_runtime_seed, checked_fitted_subset
         )
@@ -2938,6 +3194,9 @@ def save_checkpoint(
         ),
         "sampler_state": sampler_state,
         "fitted_subset": checked_fitted_subset,
+        "physical_envelope_objective": objective_payload,
+        "fitted_pair_receipt": checked_pair_receipt,
+        "target_envelope_audit": checked_target_audit,
     }
     plain = _plain_cpu(payload)
     if not isinstance(plain, dict) or not _finite_tree(plain):
@@ -3104,6 +3363,20 @@ def load_checkpoint(
         raise ValueError("checkpoint kinematic signature mismatch")
     if not _finite_tree(payload):
         raise ValueError("checkpoint contains nonfinite or unsafe values")
+    objective_payload = validate_physical_envelope_objective(
+        payload["physical_envelope_objective"]
+    )
+    fitted_pair_receipt = validate_compact_fitted_pair_receipt(
+        payload["fitted_pair_receipt"]
+    )
+    q99 = payload["phase_advance_q99"]
+    if type(q99) is not float or not math.isfinite(q99) or q99 < 0.0:
+        raise ValueError("checkpoint phase_advance_q99 is invalid")
+    target_envelope_audit = validate_target_envelope_audit(
+        payload["target_envelope_audit"],
+        expected_sample_count=fitted_pair_receipt["sample_count"],
+        expected_phase_advance_cap=min(math.pi, 1.5 * q99),
+    )
     for name in ("step", "epoch"):
         if type(payload[name]) is not int or payload[name] < 0:
             raise ValueError(f"checkpoint {name} is invalid")
@@ -3162,14 +3435,25 @@ def load_checkpoint(
         payload["runtime_seed"], limits, exact_tensors=True
     )
     weights = _loss_weights(payload["loss_weights"])
-    q99 = payload["phase_advance_q99"]
-    if type(q99) is not float or q99 < 0.0:
-        raise ValueError("checkpoint phase_advance_q99 is invalid")
     optimizer_state = _validate_optimizer_state(payload["optimizer_state"], probe)
     selection = _validated_selection(payload["selection"])
     sampler_state = _validated_sampler_state(payload["sampler_state"])
     fitted_subset = _validated_fitted_subset(payload["fitted_subset"])
     if fitted_subset is not None:
+        expected_active_rows_sha256 = _canonical_json_sha256(
+            {
+                "row_sha256": sorted(
+                    row["row_sha256"] for row in fitted_subset["rows"]
+                )
+            }
+        )
+        if (
+            fitted_pair_receipt["active_row_count"]
+            != len(fitted_subset["rows"])
+            or fitted_pair_receipt["active_rows_sha256"]
+            != expected_active_rows_sha256
+        ):
+            raise ValueError("checkpoint fitted pair row scope mismatch")
         validate_runtime_seed_fitted_subset(runtime_seed, fitted_subset)
     return LoadedCheckpoint(
         schema=payload["schema"],
@@ -3198,6 +3482,12 @@ def load_checkpoint(
             else dict(sampler_state["sequence"])
         ),
         fitted_subset=fitted_subset,
+        physical_envelope_objective=objective_payload,
+        physical_envelope_objective_sha256=_canonical_json_sha256(
+            objective_payload
+        ),
+        fitted_pair_receipt=fitted_pair_receipt,
+        target_envelope_audit=target_envelope_audit,
     )
 
 
@@ -3242,13 +3532,17 @@ def restore_training_state(
 
 
 __all__ = [
+    "BASE_LOSS_WEIGHT_KEYS",
     "CHECKPOINT_SCHEMA",
+    "DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE",
     "DEFAULT_LOSS_WEIGHTS",
+    "ENVELOPE_LOSS_WEIGHT_KEYS",
     "FITTED_TRANSITION_REPORT_SCHEMA",
     "FittedTransitionReport",
     "LOSS_WEIGHT_KEYS",
     "LoadedCheckpoint",
     "PHASE_AUDIT_NEGATIVE_TOLERANCE_RAD",
+    "PhysicalEnvelopeObjective",
     "RolloutResult",
     "autoregressive_unroll",
     "choose_runtime_seed",
@@ -3261,11 +3555,15 @@ __all__ = [
     "one_step_metrics",
     "one_step_training_losses",
     "pfnn_losses",
+    "physical_envelope_objective_payload",
     "restore_training_state",
     "save_checkpoint",
     "selection_metadata",
     "training_phase_advance_q99",
+    "validate_compact_fitted_pair_receipt",
     "validate_fitted_transition_report",
+    "validate_physical_envelope_objective",
     "validate_resume_fitted_subset",
     "validate_runtime_seed_fitted_subset",
+    "validate_target_envelope_audit",
 ]
