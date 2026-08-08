@@ -100,6 +100,14 @@ def _viewer_terrain_map() -> TerrainPFNNHillMap:
     return TerrainPFNNHillMap(grid_spacing_m=0.075, half_width_m=12.0)
 
 
+def _configure_camera(viewer: object) -> None:
+    """Use a side view so longitudinal hill grades are visibly legible."""
+
+    viewer.cam.azimuth = 90.0
+    viewer.cam.elevation = -18.0
+    viewer.cam.distance = 4.0
+
+
 def _validate(arguments: argparse.Namespace) -> tuple[Path, Path, Path, Path]:
     paths = tuple(
         Path(value).expanduser().resolve()
@@ -251,9 +259,7 @@ def _run(arguments: argparse.Namespace) -> int:
     listener.start()
     try:
         with mujoco.viewer.launch_passive(model, data) as viewer:
-            viewer.cam.azimuth = 180.0
-            viewer.cam.elevation = -18.0
-            viewer.cam.distance = 4.0
+            _configure_camera(viewer)
             step = 0
             while viewer.is_running() and not stopped[0] and step < arguments.max_steps:
                 started = time.monotonic()

@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import redirect_stdout
 from io import StringIO
 import math
+from types import SimpleNamespace
 import unittest
 
 import numpy as np
@@ -58,6 +59,17 @@ class TerrainPFNNViewerTests(unittest.TestCase):
         self.assertGreaterEqual(terrain.y_max, 10.0)
         x = terrain.hills[1].start_x + terrain.blend_m + 0.25
         self.assertEqual(terrain.height_at((x, -9.0)), terrain.height_at((x, 9.0)))
+
+    def test_camera_defaults_show_the_longitudinal_hill_profile(self) -> None:
+        from mm_sonic.terrain_pfnn_viewer import _configure_camera
+
+        viewer = SimpleNamespace(
+            cam=SimpleNamespace(azimuth=0.0, elevation=0.0, distance=0.0)
+        )
+        _configure_camera(viewer)
+        self.assertEqual(viewer.cam.azimuth, 90.0)
+        self.assertEqual(viewer.cam.elevation, -18.0)
+        self.assertEqual(viewer.cam.distance, 4.0)
 
 
 if __name__ == "__main__":
