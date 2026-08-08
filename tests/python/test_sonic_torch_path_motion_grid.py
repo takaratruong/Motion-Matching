@@ -4,13 +4,151 @@ import numpy as np
 
 from mm_sonic.joints import ContractError
 from mm_sonic.torch_path_motion_grid import (
+    StaircasePathContract,
     build_grid_playlist,
+    build_parallel_grid_playlist,
+    classify_staircase_path,
     classify_lane,
     horizontal_grid_lanes,
+    parallel_path_grid,
+    staircase_parallel_path_grid,
 )
 
 
 class HorizontalPathGridTests(unittest.TestCase):
+    def test_staircase_grid_centers_twenty_centimeter_lattice_on_elevated_band(self):
+        points = np.array(
+            [
+                (x, y)
+                for x in np.linspace(0.0, 1.0, 6)
+                for y in np.linspace(-0.51, 0.49, 6)
+            ],
+            dtype=np.float64,
+        )
+
+        paths = staircase_parallel_path_grid(
+            center_start_scene_xy=(-0.5, 0.8),
+            heading_scene_xy=(1.0, 0.0),
+            path_length_m=2.0,
+            elevated_scene_xy=points,
+            spacing_m=0.20,
+        )
+
+        np.testing.assert_allclose(
+            [path.start_scene_xy[1] for path in paths],
+            (-0.41, -0.21, -0.01, 0.19, 0.39),
+            atol=1.0e-12,
+        )
+        self.assertTrue(
+            all(-0.51 < path.start_scene_xy[1] < 0.49 for path in paths)
+        )
+
+    def test_staircase_profile_requires_approach_elevation_and_opposite_exit(self):
+        path = parallel_path_grid(
+            center_start_scene_xy=(0.0, 0.0),
+            heading_scene_xy=(1.0, 0.0),
+            path_length_m=2.0,
+            minimum_lateral_offset_m=0.0,
+            maximum_lateral_offset_m=0.0,
+            spacing_m=0.2,
+        )[0]
+
+        def staircase(points):
+            x = np.asarray(points)[:, 0]
+            return np.where((x >= 0.5) & (x <= 1.5), 0.2, 0.0)
+
+        contract = classify_staircase_path(
+            path=path, sample_surface=staircase
+        )
+
+        self.assertIsInstance(contract, StaircasePathContract)
+        self.assertEqual(
+            contract.classification, "staircase_intersecting"
+        )
+        self.assertEqual(
+            contract.ordered_surface_heights_m, (0.0, 0.2, 0.0)
+        )
+
+    def test_flat_path_is_explicitly_excluded(self):
+        path = parallel_path_grid(
+            center_start_scene_xy=(0.0, 0.0),
+            heading_scene_xy=(1.0, 0.0),
+            path_length_m=2.0,
+            minimum_lateral_offset_m=0.0,
+            maximum_lateral_offset_m=0.0,
+            spacing_m=0.2,
+        )[0]
+
+        contract = classify_staircase_path(
+            path=path,
+            sample_surface=lambda points: np.zeros(len(points)),
+        )
+
+        self.assertEqual(contract.classification, "flat_only_excluded")
+
+    def test_parallel_grid_uses_runtime_heading_bounds_and_spacing(self):
+        paths = parallel_path_grid(
+            center_start_scene_xy=(1.2, -0.4),
+            heading_scene_xy=(3.0, 4.0),
+            path_length_m=2.25,
+            minimum_lateral_offset_m=-0.30,
+            maximum_lateral_offset_m=0.30,
+            spacing_m=0.15,
+        )
+
+        self.assertEqual(len(paths), 5)
+        np.testing.assert_allclose(
+            [path.lateral_offset_m for path in paths],
+            (-0.30, -0.15, 0.0, 0.15, 0.30),
+            atol=1.0e-12,
+        )
+        heading = np.array((0.6, 0.8))
+        lateral = np.array((-0.8, 0.6))
+        for path in paths:
+            expected_start = (
+                np.array((1.2, -0.4))
+                + path.lateral_offset_m * lateral
+            )
+            np.testing.assert_allclose(
+                path.start_scene_xy, expected_start, atol=1.0e-12
+            )
+            np.testing.assert_allclose(
+                np.array(path.stop_scene_xy) - np.array(path.start_scene_xy),
+                2.25 * heading,
+                atol=1.0e-12,
+            )
+
+    def test_parallel_grid_is_rotation_equivariant(self):
+        first = parallel_path_grid(
+            center_start_scene_xy=(0.2, -0.1),
+            heading_scene_xy=(1.0, 0.0),
+            path_length_m=1.7,
+            minimum_lateral_offset_m=-0.2,
+            maximum_lateral_offset_m=0.2,
+            spacing_m=0.2,
+        )
+        second = parallel_path_grid(
+            center_start_scene_xy=(0.1, 0.2),
+            heading_scene_xy=(0.0, 1.0),
+            path_length_m=1.7,
+            minimum_lateral_offset_m=-0.2,
+            maximum_lateral_offset_m=0.2,
+            spacing_m=0.2,
+        )
+        rotation = np.array(((0.0, -1.0), (1.0, 0.0)))
+
+        for original, rotated in zip(first, second):
+            np.testing.assert_allclose(
+                rotated.start_scene_xy,
+                np.asarray(original.start_scene_xy) @ rotation.T,
+                atol=1.0e-12,
+            )
+            np.testing.assert_allclose(
+                rotated.stop_scene_xy,
+                np.asarray(original.stop_scene_xy) @ rotation.T,
+                atol=1.0e-12,
+            )
+
     def test_grid_has_exact_twenty_centimeter_lanes(self):
         lanes = horizontal_grid_lanes(
             start_x=-1.2795985755,
@@ -117,6 +255,35 @@ class HorizontalPathGridTests(unittest.TestCase):
         self.assertEqual(metadata["segments"][0]["motion_frames"], [2, 5])
         self.assertEqual(metadata["segments"][1]["motion_frames"], [9, 12])
         self.assertEqual(metadata["teleport_boundaries"], [7])
+
+    def test_parallel_playlist_preserves_runtime_path_geometry(self):
+        paths = parallel_path_grid(
+            center_start_scene_xy=(0.0, 0.0),
+            heading_scene_xy=(0.6, 0.8),
+            path_length_m=1.5,
+            minimum_lateral_offset_m=-0.15,
+            maximum_lateral_offset_m=0.15,
+            spacing_m=0.15,
+        )
+
+        arrays, metadata = build_parallel_grid_playlist(
+            (
+                (paths[0], self.connector(1.0)),
+                (paths[2], self.connector(2.0)),
+            ),
+            hold_frames=1,
+        )
+
+        self.assertEqual(arrays["joint_position"].shape, (10, 29))
+        self.assertEqual(metadata["schema"], "g1-parallel-path-playlist/v1")
+        self.assertEqual(
+            [item["path_id"] for item in metadata["segments"]],
+            [paths[0].path_id, paths[2].path_id],
+        )
+        self.assertEqual(
+            metadata["segments"][0]["start_scene_xy"],
+            list(paths[0].start_scene_xy),
+        )
 
     def test_playlist_rejects_extra_connector_arrays(self):
         lane = horizontal_grid_lanes(
