@@ -362,6 +362,10 @@ def promote_pipeline_best(
     fitted_subset_rows_sha256: str,
     fitted_transition_report: dict[str, object],
     fitted_transition_report_sha256: str,
+    expected_fixed_sample_score: float,
+    expected_fixed_sample_count: int,
+    observed_fixed_sample_score: float | None = None,
+    observed_fixed_sample_count: int | None = None,
 ) -> bool:
     """Atomically publish immutable ``best.pt`` only from a bound gate receipt."""
 
@@ -379,6 +383,44 @@ def promote_pipeline_best(
     candidate, best = Path(candidate_path), Path(best_path)
     if not candidate.is_file() or best.exists():
         return False
+    if (
+        isinstance(expected_fixed_sample_score, bool)
+        or not isinstance(expected_fixed_sample_score, (int, float))
+        or not math.isfinite(float(expected_fixed_sample_score))
+        or type(expected_fixed_sample_count) is not int
+        or expected_fixed_sample_count < 1
+        or (observed_fixed_sample_score is None)
+        != (observed_fixed_sample_count is None)
+        or (
+            observed_fixed_sample_score is not None
+            and (
+                isinstance(observed_fixed_sample_score, bool)
+                or not isinstance(observed_fixed_sample_score, (int, float))
+                or not math.isfinite(float(observed_fixed_sample_score))
+                or type(observed_fixed_sample_count) is not int
+                or observed_fixed_sample_count < 1
+            )
+        )
+    ):
+        return False
+    receipt_expected_score = receipt.get("expected_fixed_sample_score")
+    receipt_observed_score = receipt.get("observed_fixed_sample_score")
+    receipt_expected_count = receipt.get("expected_fixed_sample_count")
+    receipt_observed_count = receipt.get("observed_fixed_sample_count")
+    receipt_reproduction = bool(
+        not isinstance(receipt_expected_score, bool)
+        and isinstance(receipt_expected_score, (int, float))
+        and math.isfinite(float(receipt_expected_score))
+        and not isinstance(receipt_observed_score, bool)
+        and isinstance(receipt_observed_score, (int, float))
+        and math.isfinite(float(receipt_observed_score))
+        and type(receipt_expected_count) is int
+        and receipt_expected_count > 0
+        and type(receipt_observed_count) is int
+        and receipt_observed_count > 0
+        and float(receipt_expected_score) == float(receipt_observed_score)
+        and receipt_expected_count == receipt_observed_count
+    )
     receipt_hash = receipt.get("receipt_sha256")
     base = {name: value for name, value in receipt.items() if name != "receipt_sha256"}
     if (
@@ -412,7 +454,19 @@ def promote_pipeline_best(
         != receipt_transition_report["report_sha256"]
         or expected_transition_report["accepted"] is not True
         or receipt.get("required_fitted_transition_envelope") is not True
-        or receipt.get("fixed_sample_reproduction") is not True
+        or not receipt_reproduction
+        or float(receipt_expected_score) != float(expected_fixed_sample_score)
+        or receipt_expected_count != expected_fixed_sample_count
+        or (
+            observed_fixed_sample_score is not None
+            and float(receipt_observed_score)
+            != float(observed_fixed_sample_score)
+        )
+        or (
+            observed_fixed_sample_count is not None
+            and receipt_observed_count != observed_fixed_sample_count
+        )
+        or receipt.get("fixed_sample_reproduction") is not receipt_reproduction
         or receipt.get("required_runtime_gates") is not True
         or receipt.get("required_known_terrain_traversal") is not True
     ):
@@ -920,7 +974,14 @@ def _verify_reloaded_pipeline_candidate(
         or float(reloaded.phase_advance_q99) != float(phase_advance_q99)
     ):
         raise ValueError("reloaded candidate fitted envelope contract mismatch")
-    reloaded_model = reloaded.build_model()
+    reloaded_model = reloaded.build_model().to(torch.device("cpu"))
+    if any(
+        value.device.type != "cpu"
+        for value in (
+            tuple(reloaded_model.parameters()) + tuple(reloaded_model.buffers())
+        )
+    ):
+        raise ValueError("reloaded fitted transition model must be on CPU")
     adjacent = fitted_adjacent_indices(dataset, fitted_indices)
     report = evaluate_fitted_transition_envelope(
         reloaded_model,
@@ -1488,6 +1549,12 @@ def train(
                 fitted_transition_report_sha256=fitted_transition_report[
                     "report_sha256"
                 ],
+                expected_fixed_sample_score=float(
+                    verification_request["expected_fixed_sample_score"]
+                ),
+                expected_fixed_sample_count=int(
+                    verification_request["expected_fixed_sample_count"]
+                ),
             )
             if promote_best:
                 _atomic_json(output / "pipeline-promotion-receipt.json", pipeline_receipt)

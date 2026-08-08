@@ -1532,6 +1532,16 @@ def evaluate(
                             fitted_transition_report_sha256=(
                                 fitted_transition_report["report_sha256"]
                             ),
+                            expected_fixed_sample_score=float(
+                                selection["one_step_score"]
+                            ),
+                            expected_fixed_sample_count=len(fixed_indices),
+                            observed_fixed_sample_score=float(
+                                fixed_metrics["one_step_score"]
+                            ),
+                            observed_fixed_sample_count=int(
+                                fixed_metrics["samples"]
+                            ),
                         )
                         if promoted:
                             _atomic_json(

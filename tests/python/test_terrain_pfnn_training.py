@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import tempfile
 from pathlib import Path
 import unittest
@@ -307,6 +308,78 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
         self.assertEqual(ordered.to_dict(), reversed_pairs.to_dict())
         self.assertEqual(ordered.first_failure["center_frame"], 11)
 
+    def test_fitted_transition_rejects_duplicate_logical_pairs(self) -> None:
+        output = _FittedEnvelopeRows._physical_output()
+        rows = _FittedEnvelopeRows(output)
+        rows.rows.extend((dict(rows.rows[0]), dict(rows.rows[1])))
+        arguments = {
+            "normalization": rows,
+            "joint_limits": np.asarray([[-2.0, 2.0]] * 29, np.float64),
+            "phase_advance_q99": 0.2,
+        }
+        with self.assertRaisesRegex(ValueError, "duplicate logical"):
+            training_module.evaluate_fitted_transition_envelope(
+                _FittedEnvelopeModel(output),
+                rows,
+                ((2, 3), (0, 1)),
+                **arguments,
+            )
+
+        rows.rows.append(rows._row(12, rows._physical_output(), phase=1.25))
+        ordered = training_module.evaluate_fitted_transition_envelope(
+            _FittedEnvelopeModel(output), rows, ((0, 1), (1, 4)), **arguments
+        )
+        permuted = training_module.evaluate_fitted_transition_envelope(
+            _FittedEnvelopeModel(output), rows, ((1, 4), (0, 1)), **arguments
+        )
+        self.assertEqual(ordered.rows_sha256, permuted.rows_sha256)
+        self.assertEqual(ordered.report_sha256, permuted.report_sha256)
+
+    def test_fitted_transition_overflow_is_canonical_finite_rejection(self) -> None:
+        maximum = float(np.finfo(np.float64).max)
+        cases: list[tuple[str, np.ndarray, str]] = []
+        planar = _FittedEnvelopeRows._physical_output()
+        planar[OUTPUT_LAYOUT["root_planar_velocity"]] = (maximum, maximum)
+        cases.append(("planar velocity", planar, "root_translation_step_m"))
+        direction = _FittedEnvelopeRows._physical_output()
+        direction[OUTPUT_LAYOUT["trajectory_direction"]][:2] = (maximum, maximum)
+        cases.append(("trajectory direction", direction, "trajectory_direction_norm"))
+
+        for label, output, field in cases:
+            with self.subTest(field=label):
+                report, _, _ = self._fitted_envelope(output)
+                self.assertFalse(report.accepted)
+                self.assertEqual(report.first_failure["field"], field)
+                self.assertTrue(math.isfinite(float(report.first_failure["value"])))
+                self.assertTrue(all(math.isfinite(value) for value in report.maxima.values()))
+                self.assertEqual(
+                    training_module.validate_fitted_transition_report(report)[
+                        "report_sha256"
+                    ],
+                    report.report_sha256,
+                )
+
+        joint = _FittedEnvelopeRows._physical_output()
+        joint[OUTPUT_LAYOUT["joint_position"]][0] = 3.0e38
+        rows = _FittedEnvelopeRows(joint)
+        rows.rows[0]["y"][OUTPUT_LAYOUT["joint_position"]][0] = np.float32(-3.0e38)
+        rows.y_std = np.ones(OUTPUT_LAYOUT.size, np.float64)
+        rows.y_std[OUTPUT_LAYOUT["joint_position"]] = 3.0e269
+        limits = np.asarray([[-maximum, maximum]] * 29, np.float64)
+        report = training_module.evaluate_fitted_transition_envelope(
+            _FittedEnvelopeModel(joint),
+            rows,
+            ((0, 1),),
+            normalization=rows,
+            joint_limits=limits,
+            phase_advance_q99=0.2,
+        )
+        self.assertFalse(report.accepted)
+        self.assertEqual(report.first_failure["field"], "joint_position")
+        self.assertEqual(report.first_failure["value"], maximum)
+        self.assertTrue(all(math.isfinite(value) for value in report.maxima.values()))
+        training_module.validate_fitted_transition_report(report)
+
     def test_reloaded_transition_gate_precedes_and_can_block_pipeline_verifier(self) -> None:
         output = _FittedEnvelopeRows._physical_output()
         rejected_output = output.copy()
@@ -316,6 +389,13 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
         rows = _FittedEnvelopeRows(output)
         fitted_subset = fitted_subset_metadata(rows, (0, 1))
         events: list[str] = []
+        ordinary_model = torch.nn.Linear(1, 1, device="meta")
+
+        class ReloadedTransitionModel(_FittedEnvelopeModel):
+            def to(self, *args: object, **kwargs: object) -> torch.nn.Module:
+                device = torch.device(args[0] if args else kwargs["device"])
+                events.append(f"place_reloaded_model_{device.type}")
+                return super().to(*args, **kwargs)
 
         class Loaded:
             normalization = {
@@ -329,7 +409,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
 
             def build_model(self) -> torch.nn.Module:
                 events.append("build_reloaded_model")
-                return _FittedEnvelopeModel(output)
+                return ReloadedTransitionModel(output)
 
         def loaded(*args: object, **kwargs: object) -> Loaded:
             events.append("reload_checkpoint")
@@ -340,6 +420,12 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
 
         def evaluated(*args: object, **kwargs: object) -> object:
             events.append("evaluate_transitions")
+            transition_model = args[0]
+            self.assertEqual(ordinary_model.weight.device.type, "meta")
+            self.assertEqual(next(transition_model.buffers()).device.type, "cpu")
+            self.assertTrue(torch.equal(
+                next(transition_model.buffers()), torch.as_tensor(output)
+            ))
             return rejected_report
 
         def verifier(*args: object, **kwargs: object) -> dict[str, object]:
@@ -373,7 +459,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
         self.assertIsNone(receipt)
         self.assertEqual(events, [
             "reload_checkpoint", "validate_exact_subset", "build_reloaded_model",
-            "evaluate_transitions",
+            "place_reloaded_model_cpu", "evaluate_transitions",
         ])
 
         requests: list[dict[str, object]] = []
@@ -1202,12 +1288,19 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                     "report_sha256"
                 ],
             })
+            promotion_expectations = {
+                "expected_fixed_sample_score": 1.0,
+                "expected_fixed_sample_count": 2048,
+                "observed_fixed_sample_score": 1.0,
+                "observed_fixed_sample_count": 2048,
+            }
             self.assertFalse(
                 promote_pipeline_best(
                     candidate_path=candidate,
                     best_path=best,
                     receipt=None,
                     **bindings,
+                    **promotion_expectations,
                 )
             )
             self.assertFalse(best.exists())
@@ -1228,6 +1321,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                     best_path=best,
                     receipt=mismatch,
                     **bindings,
+                    **promotion_expectations,
                 )
             )
             self.assertFalse(best.exists())
@@ -1276,12 +1370,39 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 passing["schema"], "mm-sonic-pipeline-promotion-receipt/v2"
             )
             self.assertEqual(passing["fitted_transition_report"], transition_report)
+            for field, forged_value in (
+                ("expected_fixed_sample_score", 2.0),
+                ("observed_fixed_sample_score", 2.0),
+                ("expected_fixed_sample_count", 4096),
+                ("observed_fixed_sample_count", 4096),
+            ):
+                tampered = json.loads(json.dumps(passing))
+                tampered[field] = forged_value
+                receipt_base = {
+                    key: value for key, value in tampered.items()
+                    if key != "receipt_sha256"
+                }
+                tampered["receipt_sha256"] = hashlib.sha256(json.dumps(
+                    receipt_base, sort_keys=True, separators=(",", ":"),
+                    allow_nan=False,
+                ).encode()).hexdigest()
+                tampered_best = root / f"tampered-{field}.pt"
+                with self.subTest(tamper=field):
+                    self.assertFalse(promote_pipeline_best(
+                        candidate_path=candidate,
+                        best_path=tampered_best,
+                        receipt=tampered,
+                        **bindings,
+                        **promotion_expectations,
+                    ))
+                    self.assertFalse(tampered_best.exists())
             self.assertTrue(
                 promote_pipeline_best(
                     candidate_path=candidate,
                     best_path=best,
                     receipt=passing,
                     **bindings,
+                    **promotion_expectations,
                 )
             )
             self.assertEqual(best.read_bytes(), b"candidate")
@@ -1295,6 +1416,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                     best_path=forged_best,
                     receipt=forged,
                     **bindings,
+                    **promotion_expectations,
                 )
             )
             self.assertFalse(forged_best.exists())
@@ -1355,6 +1477,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                         best_path=tampered_best,
                         receipt=tampered,
                         **bindings,
+                        **promotion_expectations,
                     ))
                     self.assertFalse(tampered_best.exists())
 
@@ -1373,6 +1496,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 best_path=root / "tampered-report-digest.pt",
                 receipt=digest_tampered,
                 **bindings,
+                **promotion_expectations,
             ))
             old_v1 = dict(passing)
             old_v1["schema"] = "mm-sonic-pipeline-promotion-receipt/v1"
@@ -1389,6 +1513,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 best_path=root / "old-v1.pt",
                 receipt=old_v1,
                 **bindings,
+                **promotion_expectations,
             ))
             nonjson = json.loads(json.dumps(passing))
             nonjson["fitted_transition_report"]["accepted"] = False
@@ -1402,6 +1527,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 best_path=root / "non-json-report.pt",
                 receipt=nonjson,
                 **bindings,
+                **promotion_expectations,
             ))
 
     def test_materialized_overfit_subset_reads_source_once_in_sorted_order(self) -> None:

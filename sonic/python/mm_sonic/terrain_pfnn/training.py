@@ -674,6 +674,28 @@ def _nonfinite_label(value: float) -> str:
     return "positive_infinity" if value > 0.0 else "negative_infinity"
 
 
+_FLOAT64_MAX = float(np.finfo(np.float64).max)
+
+
+def _saturated_norm(values: Sequence[float], *, divisor: float = 1.0) -> float:
+    """Return a finite Euclidean norm, preserving scale before overflow."""
+
+    norm = math.hypot(*(float(value) / divisor for value in values))
+    return norm if math.isfinite(norm) else _FLOAT64_MAX
+
+
+def _saturated_absolute_difference(left: float, right: float) -> float:
+    difference = float(left) - float(right)
+    return abs(difference) if math.isfinite(difference) else _FLOAT64_MAX
+
+
+def _saturated_positive_difference(left: float, right: float) -> float:
+    difference = float(left) - float(right)
+    if math.isfinite(difference):
+        return max(difference, 0.0)
+    return _FLOAT64_MAX if left > right else 0.0
+
+
 def _fitted_failure(
     sample: Mapping[str, object],
     *,
@@ -760,9 +782,15 @@ def evaluate_fitted_transition_envelope(
     )
     y_mean = normal["y_mean"].detach().cpu().numpy().astype(np.float64)
     y_std = normal["y_std"].detach().cpu().numpy().astype(np.float64)
-    pair_receipts: list[dict[str, object]] = []
-    samples: list[tuple[Mapping[str, object], Mapping[str, object]]] = []
+    canonical_pairs: list[
+        tuple[
+            tuple[str, str, int, int, str, str],
+            dict[str, object],
+            tuple[Mapping[str, object], Mapping[str, object]],
+        ]
+    ] = []
     seen_pairs: set[tuple[int, int]] = set()
+    seen_canonical_pairs: set[tuple[str, str, int, int, str, str]] = set()
     for pair in pairs:
         if (
             type(pair) not in (tuple, list)
@@ -790,25 +818,30 @@ def evaluate_fitted_transition_envelope(
             raise ValueError("fitted transition pair is not same-lane adjacent")
         predecessor_hash = fitted_row_sha256(predecessor)
         current_hash = fitted_row_sha256(current)
-        pair_receipts.append({
+        identity = (
+            str(current["clip_id"]),
+            str(current["sequence_lane"]),
+            int(predecessor["center_frame"]),
+            int(current["center_frame"]),
+            predecessor_hash,
+            current_hash,
+        )
+        if identity in seen_canonical_pairs:
+            raise ValueError("fitted transition pair has duplicate logical identity")
+        receipt = {
             "clip_id": str(current["clip_id"]),
             "sequence_lane": str(current["sequence_lane"]),
             "predecessor_center_frame": int(predecessor["center_frame"]),
             "center_frame": int(current["center_frame"]),
             "predecessor_row_sha256": predecessor_hash,
             "current_row_sha256": current_hash,
-        })
-        samples.append((predecessor, current))
+        }
+        canonical_pairs.append((identity, receipt, (predecessor, current)))
         seen_pairs.add(tuple(pair))
-    ordered_pairs = sorted(
-        zip(pair_receipts, samples),
-        key=lambda item: (
-            item[0]["clip_id"], item[0]["sequence_lane"],
-            item[0]["center_frame"], item[0]["current_row_sha256"],
-        ),
-    )
-    pair_receipts = [item[0] for item in ordered_pairs]
-    samples = [item[1] for item in ordered_pairs]
+        seen_canonical_pairs.add(identity)
+    ordered_pairs = sorted(canonical_pairs, key=lambda item: item[0])
+    pair_receipts = [item[1] for item in ordered_pairs]
+    samples = [item[2] for item in ordered_pairs]
     rows_sha256 = _canonical_json_sha256({
         "schema": "mm-sonic-fitted-transition-rows/v1",
         "pairs": pair_receipts,
@@ -878,9 +911,10 @@ def evaluate_fitted_transition_envelope(
                         limit="finite",
                     )
                 else:
-                    translation = float(np.linalg.norm(
-                        physical[OUTPUT_LAYOUT["root_planar_velocity"]]
-                    ) / 30.0)
+                    translation = _saturated_norm(
+                        physical[OUTPUT_LAYOUT["root_planar_velocity"]],
+                        divisor=30.0,
+                    )
                     rotation = abs(float(
                         physical[OUTPUT_LAYOUT["root_yaw_velocity"]][0]
                     )) / 30.0
@@ -888,9 +922,20 @@ def evaluate_fitted_transition_envelope(
                     reached_joints = predecessor_physical[
                         OUTPUT_LAYOUT["joint_position"]
                     ]
-                    joint_steps = np.abs(predicted_joints - reached_joints)
-                    lower_excess = np.maximum(limits[:, 0] - predicted_joints, 0.0)
-                    upper_excess = np.maximum(predicted_joints - limits[:, 1], 0.0)
+                    joint_steps = np.asarray([
+                        _saturated_absolute_difference(predicted, reached)
+                        for predicted, reached in zip(
+                            predicted_joints, reached_joints
+                        )
+                    ], dtype=np.float64)
+                    lower_excess = np.asarray([
+                        _saturated_positive_difference(lower, predicted)
+                        for lower, predicted in zip(limits[:, 0], predicted_joints)
+                    ], dtype=np.float64)
+                    upper_excess = np.asarray([
+                        _saturated_positive_difference(predicted, upper)
+                        for predicted, upper in zip(predicted_joints, limits[:, 1])
+                    ], dtype=np.float64)
                     limit_excess = np.maximum(lower_excess, upper_excess)
                     root_height = float(physical[OUTPUT_LAYOUT["root_height"]][0])
                     quaternion = _normalized_root_quaternion(
@@ -899,7 +944,9 @@ def evaluate_fitted_transition_envelope(
                     directions = physical[
                         OUTPUT_LAYOUT["trajectory_direction"]
                     ].reshape(12, 2)
-                    direction_norms = np.linalg.norm(directions, axis=1)
+                    direction_norms = np.asarray([
+                        _saturated_norm(direction) for direction in directions
+                    ], dtype=np.float64)
                     maxima["root_translation_step_m"] = max(
                         maxima["root_translation_step_m"], translation
                     )
