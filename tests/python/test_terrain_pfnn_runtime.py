@@ -1262,8 +1262,12 @@ def Mesh "Terrain" {
                     return_value=Kinematics(),
                 ),
                 patch(
-                    "mm_sonic.evaluate_terrain_pfnn.load_checkpoint",
+                    "mm_sonic.evaluate_terrain_pfnn._inspect_checkpoint",
                     return_value=checkpoint,
+                ),
+                patch(
+                    "mm_sonic.evaluate_terrain_pfnn._finalize_inspected_checkpoint",
+                    side_effect=lambda value: value,
                 ),
                 patch(
                     "mm_sonic.evaluate_terrain_pfnn.PFNNShardDataset",
@@ -1427,57 +1431,50 @@ def Mesh "Terrain" {
             json.dumps(base, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
 
-        class Checkpoint:
-            kinematic_signature_sha256 = "kin"
-            joint_limits = Kinematics.joint_limits.clone()
-            train_identities = ("slope_000",)
-            validation_identities = ("slope_002",)
-            normalization = {
-                "x_mean": torch.zeros(INPUT_LAYOUT.size),
-                "x_std": torch.ones(INPUT_LAYOUT.size),
-                "y_mean": torch.zeros(OUTPUT_LAYOUT.size),
-                "y_std": torch.ones(OUTPUT_LAYOUT.size),
-            }
-            loss_weights = training_module.DEFAULT_LOSS_WEIGHTS
-            phase_advance_q99 = 0.2
-            physical_envelope_objective = (
-                training_module.physical_envelope_objective_payload(
-                    training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE
-                )
-            )
-            physical_envelope_objective_sha256 = hashlib.sha256(
-                json.dumps(
-                    physical_envelope_objective,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode()
-            ).hexdigest()
-            selection = {"one_step_score": 1.0, "provisional": True}
-
-            def __init__(self) -> None:
-                self.fitted_subset = fitted_subset
-                self.fitted_pair_receipt = tampered_receipt
-                self.target_envelope_audit = target_audit
-
-            @staticmethod
-            def build_model() -> torch.nn.Module:
-                raise AssertionError("evaluator model was built")
-
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "manifest.json").write_text(json.dumps(manifest))
             checkpoint_path = root / "checkpoint.pt"
-            checkpoint_path.write_bytes(b"candidate")
+            model = training_module.PhaseFunctionedNetwork(
+                hidden_size=8, dropout_probability=0.0
+            )
+            optimizer = torch.optim.Adam(
+                model.parameters(), lr=1.0e-3, weight_decay=0.0
+            )
+            training_module.save_checkpoint(
+                checkpoint_path,
+                model,
+                optimizer,
+                dataset,
+                dataset_digest=manifest["dataset_digest_sha256"],
+                kinematic_signature_sha256="kin",
+                runtime_seed=finite_runtime_seed(),
+                physical_envelope_objective=(
+                    training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE
+                ),
+                fitted_pair_receipt=tampered_receipt,
+                target_envelope_audit=target_audit,
+                step=1,
+                joint_limits=Kinematics.joint_limits,
+                phase_advance_q99=0.2,
+                train_identities=("slope_000",),
+                validation_identities=("slope_002",),
+            )
             with patch(
                 "mm_sonic.evaluate_terrain_pfnn.TorchG1ForwardKinematics.from_mjcf",
                 return_value=Kinematics(),
             ), patch(
-                "mm_sonic.evaluate_terrain_pfnn.load_checkpoint",
-                return_value=Checkpoint(),
-            ), patch(
                 "mm_sonic.evaluate_terrain_pfnn.PFNNShardDataset",
                 return_value=dataset,
-            ), patch(
+            ), patch.object(
+                training_module.PhaseFunctionedNetwork,
+                "load_state_dict",
+                side_effect=AssertionError("evaluator model restore was reached"),
+            ) as model_restore, patch.object(
+                torch.optim.Adam,
+                "load_state_dict",
+                side_effect=AssertionError("evaluator Adam restore was reached"),
+            ) as adam_restore, patch(
                 "mm_sonic.evaluate_terrain_pfnn.run_known_train_rollout",
                 side_effect=AssertionError("known terrain callback opened"),
             ) as callback:
@@ -1495,6 +1492,8 @@ def Mesh "Terrain" {
                         closed_loop_seconds=20.0,
                         promote_pipeline_checkpoint=True,
                     )
+                model_restore.assert_not_called()
+                adam_restore.assert_not_called()
                 callback.assert_not_called()
 
     def test_public_evaluator_allows_only_explicit_twenty_second_train_gate(self) -> None:
@@ -1603,8 +1602,12 @@ def Mesh "Terrain" {
                     return_value=Kinematics(),
                 ),
                 patch(
-                    "mm_sonic.evaluate_terrain_pfnn.load_checkpoint",
+                    "mm_sonic.evaluate_terrain_pfnn._inspect_checkpoint",
                     return_value=Checkpoint(),
+                ),
+                patch(
+                    "mm_sonic.evaluate_terrain_pfnn._finalize_inspected_checkpoint",
+                    side_effect=lambda value: value,
                 ),
                 patch(
                     "mm_sonic.evaluate_terrain_pfnn.PFNNShardDataset",

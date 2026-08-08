@@ -3023,7 +3023,7 @@ _CHECKPOINT_KEYS = {
 
 
 @dataclass(frozen=True)
-class LoadedCheckpoint:
+class _InspectedCheckpoint:
     schema: str
     step: int
     epoch: int
@@ -3050,6 +3050,11 @@ class LoadedCheckpoint:
     physical_envelope_objective_sha256: str
     fitted_pair_receipt: dict[str, object]
     target_envelope_audit: dict[str, object]
+
+
+@dataclass(frozen=True)
+class LoadedCheckpoint(_InspectedCheckpoint):
+    """Fully restoration-validated checkpoint returned by the public loader."""
 
     def build_model(self) -> PhaseFunctionedNetwork:
         model = PhaseFunctionedNetwork(
@@ -3202,6 +3207,7 @@ def save_checkpoint(
     if not isinstance(plain, dict) or not _finite_tree(plain):
         raise ValueError("checkpoint payload contains nonfinite values")
     _validate_optimizer_state(plain["optimizer_state"], unwrapped)
+    _validate_optimizer_restoration(plain["optimizer_state"], unwrapped)
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
@@ -3321,20 +3327,29 @@ def _validate_optimizer_state(
                 or not torch.isfinite(tensor).all()
             ):
                 raise ValueError("checkpoint optimizer state is invalid")
+    return value
+
+
+def _validate_optimizer_restoration(
+    value: dict[str, object], model: PhaseFunctionedNetwork
+) -> None:
+    """Exercise Adam restoration only after all required bindings are checked."""
+
     probe = torch.optim.Adam(model.parameters(), weight_decay=0.0)
     try:
         probe.load_state_dict(value)
     except (KeyError, RuntimeError, TypeError, ValueError) as error:
         raise ValueError("checkpoint optimizer state is invalid") from error
-    return value
 
 
-def load_checkpoint(
+def _inspect_checkpoint(
     path: str | Path,
     *,
     expected_dataset_digest: str,
     expected_kinematic_signature_sha256: str,
-) -> LoadedCheckpoint:
+) -> _InspectedCheckpoint:
+    """Privately inspect a safe checkpoint without restoring model/Adam state."""
+
     try:
         payload = torch.load(Path(path), map_location="cpu", weights_only=True)
     except (OSError, RuntimeError, EOFError, TypeError, pickle.UnpicklingError) as error:
@@ -3413,10 +3428,6 @@ def load_checkpoint(
             or value.requires_grad
         ):
             raise ValueError("checkpoint model state is invalid")
-    try:
-        probe.load_state_dict(model_state, strict=True)
-    except RuntimeError as error:
-        raise ValueError("checkpoint model state is invalid") from error
     normal = _checkpoint_normalization_tensors(payload["normalization"])
     limits = payload["joint_limits"]
     if (
@@ -3455,7 +3466,7 @@ def load_checkpoint(
         ):
             raise ValueError("checkpoint fitted pair row scope mismatch")
         validate_runtime_seed_fitted_subset(runtime_seed, fitted_subset)
-    return LoadedCheckpoint(
+    return _InspectedCheckpoint(
         schema=payload["schema"],
         step=payload["step"],
         epoch=payload["epoch"],
@@ -3488,6 +3499,44 @@ def load_checkpoint(
         ),
         fitted_pair_receipt=fitted_pair_receipt,
         target_envelope_audit=target_envelope_audit,
+    )
+
+
+def _finalize_inspected_checkpoint(
+    checkpoint: _InspectedCheckpoint,
+) -> LoadedCheckpoint:
+    """Validate restorability and promote one private inspection to public."""
+
+    if type(checkpoint) is not _InspectedCheckpoint:
+        raise TypeError("checkpoint inspection is invalid")
+    probe = PhaseFunctionedNetwork(
+        hidden_size=int(checkpoint.model_config["hidden_size"]),
+        dropout_probability=float(checkpoint.model_config["dropout_probability"]),
+    )
+    try:
+        probe.load_state_dict(checkpoint.model_state, strict=True)
+    except RuntimeError as error:
+        raise ValueError("checkpoint model state is invalid") from error
+    _validate_optimizer_restoration(checkpoint.optimizer_state, probe)
+    return LoadedCheckpoint(**vars(checkpoint))
+
+
+def load_checkpoint(
+    path: str | Path,
+    *,
+    expected_dataset_digest: str,
+    expected_kinematic_signature_sha256: str,
+) -> LoadedCheckpoint:
+    """Safely inspect and restoration-validate an ordinary checkpoint load."""
+
+    return _finalize_inspected_checkpoint(
+        _inspect_checkpoint(
+            path,
+            expected_dataset_digest=expected_dataset_digest,
+            expected_kinematic_signature_sha256=(
+                expected_kinematic_signature_sha256
+            ),
+        )
     )
 
 

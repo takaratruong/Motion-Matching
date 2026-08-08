@@ -28,6 +28,8 @@ from mm_sonic.terrain_pfnn.runtime import (
 )
 from mm_sonic.terrain_pfnn.splits import split_identity, terrain_identity
 from mm_sonic.terrain_pfnn.training import (
+    _finalize_inspected_checkpoint,
+    _inspect_checkpoint,
     BASE_LOSS_WEIGHT_KEYS,
     DEFAULT_LOSS_WEIGHTS,
     DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
@@ -509,6 +511,13 @@ def build_pipeline_promotion_receipt(
     transition_report = validate_fitted_transition_report(
         fitted_transition_report
     )
+    if (
+        type(expected_fixed_sample_count) is not int
+        or expected_fixed_sample_count < 1
+        or type(observed_fixed_sample_count) is not int
+        or observed_fixed_sample_count < 1
+    ):
+        raise ValueError("pipeline verifier fixed sample counts are invalid")
     if not candidate.is_file() or any(
         not _sha256_value(value)
         for value in (
@@ -533,8 +542,6 @@ def build_pipeline_promotion_receipt(
         math.isfinite(expected_score)
         and math.isfinite(observed_score)
         and expected_score == observed_score
-        and type(expected_fixed_sample_count) is int
-        and expected_fixed_sample_count > 0
         and observed_fixed_sample_count == expected_fixed_sample_count
     )
     gates = closed_loop_metrics.get("gates")
@@ -1778,27 +1785,42 @@ def _verify_reloaded_pipeline_candidate(
 ) -> tuple[object, dict[str, object] | None]:
     """Reload, validate, and gate a fitted candidate before any verifier opens."""
 
-    reloaded = load_checkpoint(
+    inspected = _inspect_checkpoint(
         candidate_path,
         expected_dataset_digest=dataset_digest_sha256,
         expected_kinematic_signature_sha256=kinematic_signature_sha256,
     )
     validate_active_physical_envelope(
-        reloaded,
+        inspected,
         physical_envelope_objective=physical_envelope_objective,
         fitted_pair_receipt=fitted_pair_receipt,
         target_envelope_audit=target_envelope_audit,
     )
     if fitted_subset_metadata(dataset, fitted_indices) != fitted_subset:
         raise ValueError("reloaded candidate fitted subset source mismatch")
-    validate_resume_fitted_subset(reloaded, fitted_subset)
+    validate_resume_fitted_subset(inspected, fitted_subset)
     expected_limits = torch.as_tensor(joint_limits, dtype=torch.float64, device="cpu")
     if (
-        type(reloaded.joint_limits) is not torch.Tensor
-        or not torch.equal(reloaded.joint_limits, expected_limits)
-        or float(reloaded.phase_advance_q99) != float(phase_advance_q99)
+        type(inspected.joint_limits) is not torch.Tensor
+        or not torch.equal(inspected.joint_limits, expected_limits)
+        or float(inspected.phase_advance_q99) != float(phase_advance_q99)
     ):
         raise ValueError("reloaded candidate fitted envelope contract mismatch")
+    expected_objective_sha256 = _canonical_sha256(
+        physical_envelope_objective
+    )
+    expected_pair_sha256 = fitted_pair_receipt["receipt_sha256"]
+    if pipeline_verifier is not None:
+        for name, expected in (
+            ("physical_envelope_objective_sha256", expected_objective_sha256),
+            ("fitted_pair_receipt_sha256", expected_pair_sha256),
+        ):
+            if (
+                type(verification_request.get(name)) is not str
+                or verification_request[name] != expected
+            ):
+                raise ValueError("pipeline verification request envelope mismatch")
+    reloaded = _finalize_inspected_checkpoint(inspected)
     reloaded_model = reloaded.build_model().to(torch.device("cpu"))
     if any(
         value.device.type != "cpu"
@@ -1819,20 +1841,8 @@ def _verify_reloaded_pipeline_candidate(
     report_payload = validate_fitted_transition_report(report)
     if report_payload["accepted"] is not True or pipeline_verifier is None:
         return report, None
-    expected_objective_sha256 = _canonical_sha256(
-        physical_envelope_objective
-    )
-    expected_pair_sha256 = fitted_pair_receipt["receipt_sha256"]
-    for name, expected in (
-        ("physical_envelope_objective_sha256", expected_objective_sha256),
-        ("fitted_pair_receipt_sha256", expected_pair_sha256),
-    ):
-        if name in verification_request and verification_request[name] != expected:
-            raise ValueError("pipeline verification request envelope mismatch")
     request = {
         **verification_request,
-        "physical_envelope_objective_sha256": expected_objective_sha256,
-        "fitted_pair_receipt_sha256": expected_pair_sha256,
         "fitted_transition_report": report_payload,
         "fitted_transition_report_sha256": report_payload["report_sha256"],
     }
@@ -1985,7 +1995,7 @@ def train(
         validate_fitted_transition_pair_receipt(
             pair_receipt, optimization_dataset
         )
-        resumed = load_checkpoint(
+        resumed = _inspect_checkpoint(
             arguments.resume,
             expected_dataset_digest=manifest["dataset_digest_sha256"],
             expected_kinematic_signature_sha256=(

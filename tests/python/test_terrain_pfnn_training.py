@@ -2537,8 +2537,21 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             events.append("open_terrain_verifier")
             return {"accepted": True}
 
+        required_request = {
+            "binding": "exact",
+            "physical_envelope_objective_sha256": _canonical_digest(
+                _objective_payload()
+            ),
+            "fitted_pair_receipt_sha256": _pair_receipt()["receipt_sha256"],
+        }
+
         with (
-            patch.object(train_module, "load_checkpoint", side_effect=loaded),
+            patch.object(train_module, "_inspect_checkpoint", side_effect=loaded),
+            patch.object(
+                train_module,
+                "_finalize_inspected_checkpoint",
+                side_effect=lambda value: value,
+            ),
             patch.object(
                 train_module, "validate_resume_fitted_subset", side_effect=validate
             ),
@@ -2560,7 +2573,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 physical_envelope_objective=_objective_payload(),
                 fitted_pair_receipt=_pair_receipt(),
                 target_envelope_audit=_target_envelope_audit(),
-                verification_request={"binding": "exact"},
+                verification_request=required_request,
                 pipeline_verifier=verifier,
             )
         self.assertEqual(report, rejected_report)
@@ -2570,9 +2583,68 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
             "place_reloaded_model_cpu", "evaluate_transitions",
         ])
 
+        for field, invalid in (
+            ("physical_envelope_objective_sha256", None),
+            ("fitted_pair_receipt_sha256", None),
+            ("physical_envelope_objective_sha256", True),
+            ("fitted_pair_receipt_sha256", 1),
+            ("physical_envelope_objective_sha256", "0" * 64),
+            ("fitted_pair_receipt_sha256", "0" * 64),
+        ):
+            opened: list[dict[str, object]] = []
+            incomplete_request = dict(required_request)
+            if invalid is None:
+                del incomplete_request[field]
+            else:
+                incomplete_request[field] = invalid
+            with (
+                patch.object(
+                    train_module, "_inspect_checkpoint", return_value=Loaded()
+                ),
+                patch.object(
+                    train_module,
+                    "_finalize_inspected_checkpoint",
+                    side_effect=lambda value: value,
+                ),
+                patch.object(train_module, "validate_resume_fitted_subset"),
+                patch.object(
+                    train_module,
+                    "evaluate_fitted_transition_envelope",
+                    return_value=accepted_report,
+                ),
+            ):
+                with self.subTest(field=field, invalid=invalid), self.assertRaisesRegex(
+                    ValueError, "verification request envelope"
+                ):
+                    train_module._verify_reloaded_pipeline_candidate(
+                        candidate_path=Path("candidate.pt"),
+                        dataset=rows,
+                        fitted_indices=(0, 1),
+                        fitted_subset=fitted_subset,
+                        dataset_digest_sha256="a" * 64,
+                        kinematic_signature_sha256="b" * 64,
+                        joint_limits=np.asarray([[-2.0, 2.0]] * 29, np.float64),
+                        phase_advance_q99=0.2,
+                        physical_envelope_objective=_objective_payload(),
+                        fitted_pair_receipt=_pair_receipt(),
+                        target_envelope_audit=_target_envelope_audit(),
+                        verification_request=incomplete_request,
+                        pipeline_verifier=lambda _path, request: (
+                            opened.append(request) or {"accepted": True}
+                        ),
+                    )
+                self.assertEqual(opened, [])
+
         requests: list[dict[str, object]] = []
         with (
-            patch.object(train_module, "load_checkpoint", return_value=Loaded()),
+            patch.object(
+                train_module, "_inspect_checkpoint", return_value=Loaded()
+            ),
+            patch.object(
+                train_module,
+                "_finalize_inspected_checkpoint",
+                side_effect=lambda value: value,
+            ),
             patch.object(train_module, "validate_resume_fitted_subset"),
             patch.object(
                 train_module,
@@ -2592,7 +2664,7 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 physical_envelope_objective=_objective_payload(),
                 fitted_pair_receipt=_pair_receipt(),
                 target_envelope_audit=_target_envelope_audit(),
-                verification_request={"binding": "exact"},
+                verification_request=required_request,
                 pipeline_verifier=lambda _path, request: (
                     requests.append(request) or {"accepted": True}
                 ),
@@ -3610,6 +3682,28 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 **bindings,
             )
             self.assertFalse(unresponsive["accepted"])
+
+            for count_name in (
+                "expected_fixed_sample_count",
+                "observed_fixed_sample_count",
+            ):
+                for invalid_count in (True, "2048", 2048.0, 0, -1):
+                    counts = {
+                        "expected_fixed_sample_count": 2048,
+                        "observed_fixed_sample_count": 2048,
+                    }
+                    counts[count_name] = invalid_count
+                    with self.subTest(
+                        count=count_name, invalid=invalid_count
+                    ), self.assertRaisesRegex(ValueError, "sample counts"):
+                        build_pipeline_promotion_receipt(
+                            checkpoint_path=candidate,
+                            expected_fixed_sample_score=1.0,
+                            observed_fixed_sample_score=1.0,
+                            closed_loop_metrics=metrics,
+                            **counts,
+                            **bindings,
+                        )
 
             passing = build_pipeline_promotion_receipt(
                 checkpoint_path=candidate,
@@ -4675,11 +4769,12 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 }
             )
             pair_dataset = train_module.materialize_transition_pairs(rows)
+            active_phase_q99 = training_phase_advance_q99(rows)
             target_audit = training_module.fitted_target_envelope_audit(
                 pair_dataset,
                 normalization=rows,
                 joint_limits=Kinematics.joint_limits,
-                phase_advance_cap=1.5 * 0.1,
+                phase_advance_cap=1.5 * active_phase_q99,
                 contract=training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE,
             )
             checkpoint_path = root / "checkpoint.pt"
@@ -4697,18 +4792,13 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 fitted_pair_receipt=tampered_pair_receipt,
                 target_envelope_audit=target_audit,
                 joint_limits=Kinematics.joint_limits,
-                phase_advance_q99=0.1,
+                phase_advance_q99=active_phase_q99,
                 step=1,
                 epoch=1,
                 seed=7,
                 sampler_epoch=0,
                 sampler_global_offset=0,
                 sequence_sampler_state=sampler_state,
-            )
-            loaded = load_checkpoint(
-                checkpoint_path,
-                expected_dataset_digest="abc",
-                expected_kinematic_signature_sha256="def",
             )
             arguments.resume = str(checkpoint_path)
             with patch.object(
@@ -4727,8 +4817,6 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 "choose_runtime_seed",
                 return_value=active_runtime_seed,
             ), patch.object(
-                train_module, "load_checkpoint", return_value=loaded
-            ) as checkpoint_loader, patch.object(
                 PhaseFunctionedNetwork,
                 "load_state_dict",
                 side_effect=AssertionError("model restore was reached"),
@@ -4741,7 +4829,66 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                     ValueError, "active physical envelope"
                 ):
                     train_module.train(arguments)
-                checkpoint_loader.assert_called_once()
+                model_restore.assert_not_called()
+                adam_restore.assert_not_called()
+
+            sequence_checkpoint = root / "sequence-mismatch.pt"
+            mismatched_sampler_state = train_module.DeterministicSequenceSampler(
+                2,
+                batch_size=1,
+                seed=active_seed,
+            ).state_dict()
+            save_checkpoint(
+                sequence_checkpoint,
+                model,
+                optimizer,
+                _normalization(),
+                dataset_digest="abc",
+                kinematic_signature_sha256="def",
+                runtime_seed=finite_runtime_seed(),
+                physical_envelope_objective=(
+                    training_module.DEFAULT_PHYSICAL_ENVELOPE_OBJECTIVE
+                ),
+                fitted_pair_receipt=active_pair_receipt,
+                target_envelope_audit=target_audit,
+                joint_limits=Kinematics.joint_limits,
+                phase_advance_q99=active_phase_q99,
+                step=1,
+                epoch=1,
+                seed=7,
+                sampler_epoch=0,
+                sampler_global_offset=0,
+                sequence_sampler_state=mismatched_sampler_state,
+            )
+            arguments.resume = str(sequence_checkpoint)
+            with patch.object(
+                train_module, "_distributed_context",
+                return_value=(0, 1, 0, torch.device("cpu")),
+            ), patch.object(
+                train_module, "_dataset_root", return_value=root
+            ), patch.object(
+                train_module, "PFNNShardDataset", return_value=rows
+            ), patch.object(
+                train_module.TorchG1ForwardKinematics,
+                "from_mjcf",
+                return_value=Kinematics(),
+            ), patch.object(
+                train_module,
+                "choose_runtime_seed",
+                return_value=active_runtime_seed,
+            ), patch.object(
+                PhaseFunctionedNetwork,
+                "load_state_dict",
+                side_effect=AssertionError("model restore was reached"),
+            ) as model_restore, patch.object(
+                torch.optim.Adam,
+                "load_state_dict",
+                side_effect=AssertionError("Adam restore was reached"),
+            ) as adam_restore:
+                with self.assertRaisesRegex(
+                    ValueError, "sequence sampler state"
+                ):
+                    train_module.train(arguments)
                 model_restore.assert_not_called()
                 adam_restore.assert_not_called()
 

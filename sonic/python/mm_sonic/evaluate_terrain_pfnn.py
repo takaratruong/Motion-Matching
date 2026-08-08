@@ -27,10 +27,11 @@ from mm_sonic.terrain_pfnn.runtime import (
     TerrainSample,
 )
 from mm_sonic.terrain_pfnn.training import (
+    _finalize_inspected_checkpoint,
+    _inspect_checkpoint,
     evaluate_fitted_transition_envelope,
     fitted_adjacent_indices,
     fitted_row_sha256,
-    load_checkpoint,
     one_step_metrics,
     validate_fitted_transition_report,
 )
@@ -1403,7 +1404,7 @@ def evaluate(
     if type(dataset_digest) is not str or _SHA256_RE.fullmatch(dataset_digest) is None:
         raise ValueError("dataset digest is invalid")
     kinematics = TorchG1ForwardKinematics.from_mjcf(model_path)
-    checkpoint = load_checkpoint(
+    checkpoint = _inspect_checkpoint(
         checkpoint_path,
         expected_dataset_digest=dataset_digest,
         expected_kinematic_signature_sha256=kinematics.kinematic_signature_sha256,
@@ -1462,6 +1463,7 @@ def evaluate(
             fitted_pair_receipt=pair_receipt,
             target_envelope_audit=target_envelope_audit,
         )
+    checkpoint = _finalize_inspected_checkpoint(checkpoint)
     checkpoint_path = Path(checkpoint_path).resolve()
     checkpoint_digest = _sha256(checkpoint_path)
     if split == "test":
