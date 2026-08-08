@@ -71,6 +71,19 @@ class TerrainPFNNViewerTests(unittest.TestCase):
         self.assertEqual(viewer.cam.elevation, -18.0)
         self.assertEqual(viewer.cam.distance, 4.0)
 
+    def test_preview_root_quaternion_keeps_yaw_and_removes_tilt(self) -> None:
+        from mm_sonic.terrain_pfnn_viewer import _upright_yaw_quaternion
+
+        rolled = np.asarray((math.cos(0.2), math.sin(0.2), 0.0, 0.0))
+        np.testing.assert_allclose(
+            _upright_yaw_quaternion(rolled), (1.0, 0.0, 0.0, 0.0), atol=1.0e-12
+        )
+        yaw = 0.75
+        yawed = np.asarray((math.cos(yaw / 2.0), 0.0, 0.0, math.sin(yaw / 2.0)))
+        np.testing.assert_allclose(
+            _upright_yaw_quaternion(yawed), yawed, atol=1.0e-12
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

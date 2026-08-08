@@ -108,6 +108,20 @@ def _configure_camera(viewer: object) -> None:
     viewer.cam.distance = 4.0
 
 
+def _upright_yaw_quaternion(quaternion_wxyz: object) -> np.ndarray:
+    """Remove roll/pitch while preserving the predicted world yaw."""
+
+    quaternion = np.asarray(quaternion_wxyz, dtype=np.float64)
+    if quaternion.shape != (4,) or not np.isfinite(quaternion).all():
+        raise ValueError("root quaternion must be finite wxyz")
+    w, x, y, z = quaternion
+    yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    return np.asarray(
+        (math.cos(0.5 * yaw), 0.0, 0.0, math.sin(0.5 * yaw)),
+        dtype=np.float64,
+    )
+
+
 def _validate(arguments: argparse.Namespace) -> tuple[Path, Path, Path, Path]:
     paths = tuple(
         Path(value).expanduser().resolve()
@@ -159,7 +173,9 @@ def _build_scene(scene_xml: Path, terrain: TerrainPFNNHillMap) -> tuple[object, 
 def _apply_frame(model: object, data: object, frame: object) -> None:
     data.qpos[:] = model.qpos0
     data.qpos[:3] = frame.root_position_world
-    data.qpos[3:7] = frame.root_quaternion_world_wxyz
+    data.qpos[3:7] = _upright_yaw_quaternion(
+        frame.root_quaternion_world_wxyz
+    )
     data.qpos[7:36] = isaaclab_to_mujoco_joint_vector(
         frame.joint_position_isaaclab
     )
