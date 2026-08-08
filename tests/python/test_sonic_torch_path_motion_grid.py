@@ -7,6 +7,7 @@ from mm_sonic.torch_path_motion_grid import (
     StaircasePathContract,
     build_grid_playlist,
     build_parallel_grid_playlist,
+    build_staircase_grid_playlist,
     classify_staircase_path,
     classify_lane,
     horizontal_grid_lanes,
@@ -283,6 +284,84 @@ class HorizontalPathGridTests(unittest.TestCase):
         self.assertEqual(
             metadata["segments"][0]["start_scene_xy"],
             list(paths[0].start_scene_xy),
+        )
+
+    def test_staircase_playlist_rejects_flat_or_unvalidated_route(self):
+        path = parallel_path_grid(
+            center_start_scene_xy=(0.0, 0.0),
+            heading_scene_xy=(1.0, 0.0),
+            path_length_m=1.0,
+            minimum_lateral_offset_m=0.0,
+            maximum_lateral_offset_m=0.0,
+            spacing_m=0.2,
+        )[0]
+        connector = self.connector(0.0)
+
+        with self.assertRaisesRegex(
+            ContractError, "not staircase-admitted"
+        ):
+            build_staircase_grid_playlist(
+                (
+                    (
+                        path,
+                        connector,
+                        {
+                            "classification": "flat_only_excluded",
+                            "independently_validated": True,
+                        },
+                    ),
+                )
+            )
+        with self.assertRaisesRegex(
+            ContractError, "not staircase-admitted"
+        ):
+            build_staircase_grid_playlist(
+                (
+                    (
+                        path,
+                        connector,
+                        {
+                            "classification": "staircase_intersecting",
+                            "independently_validated": False,
+                        },
+                    ),
+                )
+            )
+
+    def test_staircase_playlist_embeds_independent_quality(self):
+        path = parallel_path_grid(
+            center_start_scene_xy=(0.0, 0.0),
+            heading_scene_xy=(1.0, 0.0),
+            path_length_m=1.0,
+            minimum_lateral_offset_m=0.0,
+            maximum_lateral_offset_m=0.0,
+            spacing_m=0.2,
+        )[0]
+        arrays, metadata = build_staircase_grid_playlist(
+            (
+                (
+                    path,
+                    self.connector(0.0),
+                    {
+                        "classification": "staircase_intersecting",
+                        "independently_validated": True,
+                        "ordered_surface_heights_m": [0.0, 0.2, 0.0],
+                        "elevated_intervals_m": [[0.3, 0.7]],
+                        "quality": {"cadence_violation_count": 0},
+                    },
+                ),
+            ),
+            hold_frames=1,
+        )
+
+        self.assertEqual(arrays["joint_position"].shape, (5, 29))
+        self.assertEqual(
+            metadata["schema"],
+            "g1-staircase-parallel-path-playlist/v1",
+        )
+        self.assertEqual(
+            metadata["segments"][0]["quality"],
+            {"cadence_violation_count": 0},
         )
 
     def test_playlist_rejects_extra_connector_arrays(self):

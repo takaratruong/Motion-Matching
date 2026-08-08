@@ -18,6 +18,7 @@ from mm_sonic.joints import ContractError
 from mm_sonic.torch_path_motion_grid import (
     ParallelPath,
     StaircasePathContract,
+    build_staircase_grid_playlist,
     classify_staircase_path,
     parallel_path_grid,
     staircase_parallel_path_grid,
@@ -66,6 +67,17 @@ def parser() -> argparse.ArgumentParser:
     output.add_argument("--candidates-per-anchor", type=int, default=24)
     output.add_argument("--blend-frames", type=int, default=4)
     output.add_argument("--ordered-contact-levels", action="store_true")
+    output.add_argument(
+        "--validation-config",
+        type=Path,
+        default=Path(
+            "sonic/configs/experiments/"
+            "torch_grail_raw_horizontal_preview.json"
+        ),
+    )
+    output.add_argument(
+        "--maximum-unsupported-frames", type=int, default=50
+    )
     output.add_argument("--output", type=Path, required=True)
     return output
 
@@ -142,6 +154,25 @@ def classify_search_failure(
     return "no_contact_compatible_chain"
 
 
+def route_contract_record(
+    contract: StaircasePathContract,
+) -> dict[str, object]:
+    if not isinstance(contract, StaircasePathContract):
+        raise ContractError("route contract is invalid")
+    return {
+        "path_id": contract.path.path_id,
+        "classification": contract.classification,
+        "start_scene_xy": list(contract.path.start_scene_xy),
+        "stop_scene_xy": list(contract.path.stop_scene_xy),
+        "ordered_surface_heights_m": list(
+            contract.ordered_surface_heights_m
+        ),
+        "elevated_intervals_m": [
+            list(interval) for interval in contract.elevated_intervals_m
+        ],
+    }
+
+
 def root_search_command(
     *,
     python: Path,
@@ -184,6 +215,40 @@ def root_search_command(
     if ordered_contact_levels:
         command.append("--ordered-contact-levels")
     return command
+
+
+def independent_validation_command(
+    *,
+    python: Path,
+    runner: Path,
+    traversal: Path,
+    target_dataset: Path,
+    config: Path,
+    g1_xml: Path,
+    route_contract: Path,
+    expected_heading_degrees: float,
+    output: Path,
+    maximum_unsupported_frames: int,
+) -> list[str]:
+    if maximum_unsupported_frames < 0:
+        raise ContractError("independent validation allowance is invalid")
+    return [
+        str(python),
+        "-B",
+        str(runner),
+        "--input", str(traversal),
+        "--target-dataset", str(target_dataset),
+        "--config", str(config),
+        "--g1-xml", str(g1_xml),
+        "--route-contract", str(route_contract),
+        "--expected-heading-degrees", str(
+            float(expected_heading_degrees)
+        ),
+        "--maximum-unsupported-frames", str(
+            int(maximum_unsupported_frames)
+        ),
+        "--output", str(output),
+    ]
 
 
 def grid_summary(
@@ -259,6 +324,57 @@ def merge_grid_results(
     if set(by_index) != set(range(len(paths))):
         raise ContractError("parallel path result merge omitted a path")
     return tuple(by_index[index] for index in range(len(paths)))
+
+
+def playlist_entries(
+    *,
+    paths: tuple[ParallelPath, ...],
+    results: tuple[dict[str, object], ...],
+) -> tuple[tuple[ParallelPath, dict[str, np.ndarray], dict[str, object]], ...]:
+    if (
+        not isinstance(paths, tuple)
+        or not paths
+        or not isinstance(results, tuple)
+        or any(not isinstance(item, dict) for item in results)
+    ):
+        raise ContractError("staircase playlist results are invalid")
+    by_id = {path.path_id: path for path in paths}
+    output = []
+    for result in results:
+        if result.get("status") != "validated":
+            continue
+        path = by_id.get(str(result.get("path_id", "")))
+        if (
+            path is None
+            or result.get("independently_validated") is not True
+        ):
+            raise ContractError(
+                "validated staircase result lacks independent admission"
+            )
+        traversal = Path(str(result.get("traversal", "")))
+        with np.load(traversal, allow_pickle=False) as archive:
+            connector = {
+                name: np.asarray(archive[name], dtype=np.float64).copy()
+                for name in (
+                    "joint_position",
+                    "root_position_world",
+                    "root_orientation_world_wxyz",
+                )
+            }
+        admission = {
+            "classification": "staircase_intersecting",
+            "independently_validated": True,
+            "ordered_surface_heights_m": list(
+                result["ordered_surface_heights_m"]
+            ),
+            "elevated_intervals_m": [
+                list(interval)
+                for interval in result["elevated_intervals_m"]
+            ],
+            "quality": dict(result["quality"]),
+        }
+        output.append((path, connector, admission))
+    return tuple(output)
 
 
 def _geometry_record(
@@ -377,10 +493,22 @@ def _terrain_contracts(
 
 
 def _run_path(
-    *, path: ParallelPath, args: argparse.Namespace, runner: Path
+    *,
+    contract: StaircasePathContract,
+    args: argparse.Namespace,
+    runner: Path,
 ) -> dict[str, object]:
+    path = contract.path
     path_output = args.output / path.path_id
     path_output.mkdir(parents=True, exist_ok=True)
+    route_contract_path = path_output / "route-contract.json"
+    route_contract_path.write_text(
+        json.dumps(
+            route_contract_record(contract), indent=2, sort_keys=True
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     command = root_search_command(
         python=Path(sys.executable),
         runner=runner,
@@ -432,14 +560,61 @@ def _run_path(
         and traversal_path.is_file()
     ):
         report = json.loads(report_path.read_text(encoding="utf-8"))
+        validation_path = path_output / "independent-validation.json"
+        validation_log_path = path_output / "independent-validation.log"
+        validation_command = independent_validation_command(
+            python=Path(sys.executable),
+            runner=(
+                Path(__file__).resolve().parent
+                / "run_g1_validate_traversal.py"
+            ),
+            traversal=traversal_path,
+            target_dataset=path_output / "dataset",
+            config=args.validation_config,
+            g1_xml=args.g1_xml,
+            route_contract=route_contract_path,
+            expected_heading_degrees=float(args.heading_degrees),
+            output=validation_path,
+            maximum_unsupported_frames=int(
+                args.maximum_unsupported_frames
+            ),
+        )
+        with validation_log_path.open("w", encoding="utf-8") as log:
+            validation = subprocess.run(
+                validation_command,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                check=False,
+                env=environment,
+            )
+        quality = (
+            json.loads(validation_path.read_text(encoding="utf-8"))
+            if validation_path.is_file()
+            else {}
+        )
+        if validation.returncode == 0 and quality.get("validated") is True:
+            return {
+                **common,
+                "status": "validated",
+                "traversal": str(traversal_path),
+                "metrics": report.get("metrics", {}),
+                "quality": quality,
+                "independently_validated": True,
+                "independent_validation": str(validation_path),
+                "selected_candidate_ids": report.get(
+                    "selected_candidate_ids", []
+                ),
+            }
         return {
             **common,
-            "status": "validated",
-            "traversal": str(traversal_path),
-            "metrics": report.get("metrics", {}),
-            "selected_candidate_ids": report.get(
-                "selected_candidate_ids", []
+            "status": "failed",
+            "failure_code": "validation_failed",
+            "independently_validated": False,
+            "independent_validation": (
+                str(validation_path) if validation_path.is_file() else None
             ),
+            "independent_validation_log": str(validation_log_path),
+            "quality": quality,
         }
     diagnostic_path = path_output / "diagnostic.json"
     diagnostic = (
@@ -498,7 +673,7 @@ def main() -> int:
     with ThreadPoolExecutor(max_workers=args.concurrent_paths) as executor:
         pending = {
             executor.submit(
-                _run_path, path=item.path, args=args, runner=runner
+                _run_path, contract=item, args=args, runner=runner
             ): item
             for item in selected
         }
@@ -519,6 +694,25 @@ def main() -> int:
         json.dumps(summary, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    entries = playlist_entries(paths=paths, results=results)
+    if entries:
+        arrays, playlist = build_staircase_grid_playlist(entries)
+        validated_by_id = {
+            str(item["path_id"]): item
+            for item in results
+            if item["status"] == "validated"
+        }
+        for segment in playlist["segments"]:
+            result = validated_by_id[str(segment["path_id"])]
+            segment["source"] = str(result["traversal"])
+            segment["independent_validation"] = str(
+                result["independent_validation"]
+            )
+        np.savez_compressed(args.output / "grid-playlist.npz", **arrays)
+        (args.output / "grid-playlist.json").write_text(
+            json.dumps(playlist, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     return 0 if summary["validated_path_count"] else 2
 
 

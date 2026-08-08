@@ -579,3 +579,91 @@ def build_parallel_grid_playlist(
         "teleport_boundaries": teleport_boundaries,
     }
     return arrays, metadata
+
+
+def build_staircase_grid_playlist(
+    admitted_paths: object, *, hold_frames: int = 20
+) -> tuple[dict[str, np.ndarray], dict[str, object]]:
+    """Package only independently admitted staircase traversals."""
+
+    if (
+        not isinstance(admitted_paths, (list, tuple))
+        or not admitted_paths
+        or type(hold_frames) is not int
+        or hold_frames < 0
+    ):
+        raise ContractError("staircase grid playlist input is invalid")
+    chunks = {name: [] for name in _CONNECTOR_KEYS}
+    segments = []
+    teleport_boundaries = []
+    cursor = 0
+    previous_index = -1
+    for item_index, item in enumerate(admitted_paths):
+        if (
+            not isinstance(item, tuple)
+            or len(item) != 3
+            or not isinstance(item[0], ParallelPath)
+            or item[0].index <= previous_index
+            or not isinstance(item[2], dict)
+        ):
+            raise ContractError("staircase grid playlist entry is invalid")
+        path, connector_value, admission = item
+        levels = admission.get("ordered_surface_heights_m")
+        intervals = admission.get("elevated_intervals_m")
+        quality = admission.get("quality")
+        if (
+            admission.get("classification")
+            != "staircase_intersecting"
+            or admission.get("independently_validated") is not True
+            or not isinstance(levels, (list, tuple))
+            or len(levels) < 3
+            or not isinstance(intervals, (list, tuple))
+            or not intervals
+            or not isinstance(quality, dict)
+        ):
+            raise ContractError("parallel path is not staircase-admitted")
+        connector = _validated_connector(connector_value)
+        frames = len(connector["joint_position"])
+        if item_index > 0:
+            teleport_boundaries.append(cursor)
+        for name, array in connector.items():
+            chunks[name].extend(
+                (
+                    np.repeat(array[0:1], hold_frames, axis=0),
+                    np.array(array, copy=True),
+                    np.repeat(array[-1:], hold_frames, axis=0),
+                )
+            )
+        motion_start = cursor + hold_frames
+        motion_stop = motion_start + frames
+        segment_stop = motion_stop + hold_frames
+        segments.append(
+            {
+                "path_id": path.path_id,
+                "path_index": path.index,
+                "lateral_offset_m": path.lateral_offset_m,
+                "start_scene_xy": list(path.start_scene_xy),
+                "stop_scene_xy": list(path.stop_scene_xy),
+                "ordered_surface_heights_m": list(levels),
+                "elevated_intervals_m": [
+                    list(interval) for interval in intervals
+                ],
+                "quality": dict(quality),
+                "segment_frames": [cursor, segment_stop],
+                "motion_frames": [motion_start, motion_stop],
+            }
+        )
+        cursor = segment_stop
+        previous_index = path.index
+    arrays = {
+        name: np.concatenate(value, axis=0)
+        for name, value in chunks.items()
+    }
+    metadata = {
+        "schema": "g1-staircase-parallel-path-playlist/v1",
+        "hold_frames": hold_frames,
+        "frame_count": cursor,
+        "segments": segments,
+        "teleport_boundaries": teleport_boundaries,
+    }
+    return arrays, metadata
