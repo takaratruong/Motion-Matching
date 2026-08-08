@@ -1,0 +1,790 @@
+from __future__ import annotations
+
+import math
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import numpy as np
+import torch
+
+from mm_sonic.evaluate_terrain_pfnn import (
+    _decode_usd_mesh,
+    _load_decoded_grail_npz,
+    _load_decoded_usd_npz,
+    KnownSlopeTerrain,
+    SourceAlignedTerrain,
+    known_train_command,
+    select_known_train_grail_record,
+    evaluate,
+)
+from mm_sonic.train_terrain_pfnn import validated_normal_selection
+from mm_sonic.terrain_pfnn.dataset import pfnn_input_sha256
+from mm_sonic.terrain_pfnn.layout import INPUT_LAYOUT, OUTPUT_LAYOUT, TRAJECTORY_TIMES_S
+from mm_sonic.terrain_pfnn.runtime import (
+    ClosedLoopRecorder,
+    ClosedLoopValidationResult,
+    NativeG1RuntimeGeometry,
+    PFNNRuntimeFrame,
+    RuntimeGeometryObservation,
+    TerrainPFNNRuntime,
+    TerrainSample,
+    evaluate_closed_loop_scenarios,
+)
+from mm_sonic.terrain_pfnn.training import finite_runtime_seed
+from mm_sonic.terrain_oracle.canonical import CanonicalTerrainMesh
+from mm_sonic.terrain_oracle.math3d import RigidTransform
+
+
+MODEL_PATH = Path(
+    "/home/ubuntu/projects/gear-sonic-pinned-60de0df/"
+    "motionbricks/assets/skeletons/g1/g1_29dof.xml"
+)
+
+
+class FakeKinematics:
+    kinematic_signature_sha256 = "kinematic-signature"
+    joint_limits = torch.tensor([[-2.0, 2.0]] * 29, dtype=torch.float64)
+
+
+class FakeCheckpoint:
+    def __init__(self) -> None:
+        self.kinematic_signature_sha256 = FakeKinematics.kinematic_signature_sha256
+        self.joint_limits = FakeKinematics.joint_limits.clone()
+        self.runtime_seed = finite_runtime_seed()
+        self.phase_advance_q99 = 0.2
+        self.normalization = {
+            "x_mean": torch.zeros(INPUT_LAYOUT.size, dtype=torch.float32),
+            "x_std": torch.ones(INPUT_LAYOUT.size, dtype=torch.float32),
+            "y_mean": torch.zeros(OUTPUT_LAYOUT.size, dtype=torch.float32),
+            "y_std": torch.ones(OUTPUT_LAYOUT.size, dtype=torch.float32),
+        }
+        self.dataset_digest = "dataset"
+
+
+def physical_output(
+    *,
+    body_position: float = 0.0,
+    body_velocity: float = 0.0,
+    planar_velocity: tuple[float, float] = (0.0, 0.0),
+    phase_advance: float = 0.1,
+    joints: float = 0.0,
+    contact_logits: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
+) -> torch.Tensor:
+    output = torch.zeros(OUTPUT_LAYOUT.size, dtype=torch.float32)
+    trajectory = output[OUTPUT_LAYOUT["trajectory_position"]].reshape(12, 2)
+    trajectory[:, 0] = torch.as_tensor(TRAJECTORY_TIMES_S, dtype=torch.float32) * 0.12
+    direction = output[OUTPUT_LAYOUT["trajectory_direction"]].reshape(12, 2)
+    direction[:, 0] = 1.0
+    output[OUTPUT_LAYOUT["body_position"]] = body_position
+    output[OUTPUT_LAYOUT["body_velocity"]] = body_velocity
+    output[OUTPUT_LAYOUT["root_height"]] = 0.8
+    output[OUTPUT_LAYOUT["joint_position"]] = joints
+    output[OUTPUT_LAYOUT["root_planar_velocity"]] = torch.tensor(planar_velocity)
+    output[OUTPUT_LAYOUT["phase_advance"]] = phase_advance
+    output[OUTPUT_LAYOUT["contact_logit"]] = torch.tensor(contact_logits)
+    return output
+
+
+class FakeModel(torch.nn.Module):
+    def __init__(self, outputs: list[torch.Tensor]) -> None:
+        super().__init__()
+        self.outputs = list(outputs)
+        self.inputs: list[torch.Tensor] = []
+        self.phases: list[torch.Tensor] = []
+
+    def forward(self, x: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
+        self.inputs.append(x.detach().cpu().clone())
+        self.phases.append(phase.detach().cpu().clone())
+        if not self.outputs:
+            raise RuntimeError("no deterministic output remains")
+        return self.outputs.pop(0).reshape(1, -1).to(x.device)
+
+
+def terrain_with_grade(degrees: float):
+    tangent = math.tan(math.radians(degrees))
+
+    def sample(xy: np.ndarray) -> TerrainSample:
+        point = np.asarray(xy, dtype=np.float64)
+        return TerrainSample(
+            height_m=float(tangent * point[0]),
+            gradient_xy=np.array((tangent, 0.0), dtype=np.float64),
+        )
+
+    return sample
+
+
+class TerrainPFNNRuntimeTests(unittest.TestCase):
+    @staticmethod
+    def bind_identity_bootstrap(checkpoint: FakeCheckpoint) -> np.ndarray:
+        seed = checkpoint.runtime_seed
+        raw = np.zeros(INPUT_LAYOUT.size, dtype=np.float32)
+        raw[INPUT_LAYOUT["trajectory_position"]] = np.asarray(
+            seed["trajectory_position"]
+        ).reshape(-1)
+        raw[INPUT_LAYOUT["trajectory_direction"]] = np.asarray(
+            seed["trajectory_direction"]
+        ).reshape(-1)
+        raw[INPUT_LAYOUT["terrain_height"]] = np.asarray(
+            seed["terrain_height"]
+        ).reshape(-1)
+        raw[INPUT_LAYOUT["semantic_intent"]] = np.asarray(
+            seed["semantic_intent"]
+        ).reshape(-1)
+        raw[INPUT_LAYOUT["previous_body_position"]] = np.asarray(
+            seed["body_position"]
+        ).reshape(-1)
+        raw[INPUT_LAYOUT["previous_body_velocity"]] = np.asarray(
+            seed["body_velocity"]
+        ).reshape(-1)
+        normalized = raw.copy()
+        for field in ("previous_body_position", "previous_body_velocity"):
+            normalized[INPUT_LAYOUT[field]] *= 0.1
+        seed["normalized_input"] = torch.as_tensor(normalized.copy())
+        seed["normalized_input_sha256"] = pfnn_input_sha256(normalized)
+        return normalized
+
+    def make_runtime(
+        self,
+        model: FakeModel,
+        *,
+        terrain=terrain_with_grade(0.0),
+        checkpoint: FakeCheckpoint | None = None,
+    ) -> TerrainPFNNRuntime:
+        return TerrainPFNNRuntime(
+            checkpoint=FakeCheckpoint() if checkpoint is None else checkpoint,
+            kinematics=FakeKinematics(),
+            model=model,
+            height_and_grade_at=terrain,
+        )
+
+    def test_checkpoint_seed_is_the_exact_reached_bootstrap_state(self) -> None:
+        checkpoint = FakeCheckpoint()
+        seed = checkpoint.runtime_seed
+        seed["phase"] = torch.tensor(1.25, dtype=torch.float32)
+        seed["root_height"] = torch.tensor(0.91, dtype=torch.float32)
+        seed["root_tilt"] = torch.tensor((0.05, -0.02), dtype=torch.float32)
+        seed["joint_position"] = torch.linspace(-0.2, 0.2, 29)
+        seed["body_position"] = torch.arange(90, dtype=torch.float32).reshape(30, 3) / 100.0
+        seed["body_velocity"] = -seed["body_position"]
+        seed["trajectory_position"] = torch.column_stack(
+            (torch.linspace(-1.0, 1.0, 12), torch.full((12,), 0.25))
+        )
+        runtime = self.make_runtime(FakeModel([physical_output()]), checkpoint=checkpoint)
+        frame = runtime.frame
+        np.testing.assert_array_equal(
+            frame.root_position_world,
+            (0.0, 0.0, float(seed["root_height"])),
+        )
+        np.testing.assert_array_equal(
+            frame.joint_position_isaaclab,
+            seed["joint_position"].numpy(),
+        )
+        self.assertEqual(frame.phase, float(seed["phase"]))
+        np.testing.assert_allclose(
+            frame.trajectory.position_world_xy,
+            seed["trajectory_position"].numpy(),
+            atol=1.0e-7,
+        )
+        np.testing.assert_array_equal(runtime.previous_body_position, seed["body_position"])
+        np.testing.assert_array_equal(runtime.previous_body_velocity, seed["body_velocity"])
+
+    def test_first_inference_defers_command_blend_and_matches_seed_receipt(self) -> None:
+        checkpoint = FakeCheckpoint()
+        trajectory = checkpoint.runtime_seed["trajectory_position"].reshape(12, 2)
+        trajectory[:, 0] = torch.as_tensor(TRAJECTORY_TIMES_S, dtype=torch.float32)
+        checkpoint.runtime_seed["semantic_intent"][:] = torch.tensor((0.0, 1.0))
+        expected = self.bind_identity_bootstrap(checkpoint)
+        model = FakeModel([physical_output(joints=0.1)])
+        runtime = self.make_runtime(model, checkpoint=checkpoint)
+        frame = runtime.step(np.array((-0.8, 0.0)), camera_yaw=0.0)
+        self.assertNotIn("hold_reason", frame.diagnostics)
+        np.testing.assert_array_equal(model.inputs[0][0].numpy(), expected)
+        np.testing.assert_array_equal(
+            model.inputs[0][0, INPUT_LAYOUT["semantic_intent"]].reshape(12, 2),
+            np.tile((0.0, 1.0), (12, 1)),
+        )
+
+    def test_second_input_contains_first_prediction_not_teacher_state(self) -> None:
+        model = FakeModel(
+            [
+                physical_output(body_position=1.5, body_velocity=-2.0),
+                physical_output(body_position=0.25, body_velocity=0.5),
+            ]
+        )
+        runtime = self.make_runtime(model)
+        runtime.step(np.zeros(2), camera_yaw=0.0)
+        runtime.step(np.zeros(2), camera_yaw=0.0)
+        second = model.inputs[1][0].numpy()
+        np.testing.assert_allclose(
+            second[INPUT_LAYOUT["previous_body_position"]], 0.15, atol=1.0e-7
+        )
+        np.testing.assert_allclose(
+            second[INPUT_LAYOUT["previous_body_velocity"]], -0.20, atol=1.0e-7
+        )
+        self.assertTrue(
+            np.any(np.abs(second[INPUT_LAYOUT["trajectory_position"]]) > 1.0e-5)
+        )
+
+    def test_future_blend_uses_normalized_knot_time_and_interval_velocity(self) -> None:
+        checkpoint = FakeCheckpoint()
+        trajectory = checkpoint.runtime_seed["trajectory_position"].reshape(12, 2)
+        trajectory[:, 0] = torch.as_tensor(TRAJECTORY_TIMES_S, dtype=torch.float32)
+        self.bind_identity_bootstrap(checkpoint)
+        model = FakeModel([physical_output(), physical_output()])
+        runtime = self.make_runtime(model, checkpoint=checkpoint)
+        runtime.step(np.zeros(2), camera_yaw=0.0)
+        runtime.step(np.array((0.4, 0.0)), camera_yaw=0.0)
+        packed = model.inputs[1][0, INPUT_LAYOUT["trajectory_position"]].reshape(12, 2)
+        # index 7 uses u=.2 and the prior predicted interval velocity is .12 m/s.
+        weight = math.sqrt(0.2)
+        expected_velocity = (1.0 - weight) * 0.12 + weight * 0.4
+        self.assertAlmostEqual(float(packed[7, 0]), expected_velocity / 6.0, places=6)
+        self.assertAlmostEqual(float(packed[6, 0]), 0.0, places=7)
+
+    def test_unsupported_future_is_collapsed_before_packing_and_model_is_stationary(self) -> None:
+        calls: list[np.ndarray] = []
+
+        def terrain(xy: np.ndarray) -> TerrainSample:
+            point = np.asarray(xy, dtype=np.float64)
+            calls.append(point.copy())
+            degrees = 21.0 if point[0] > 0.01 else 0.0
+            tangent = math.tan(math.radians(degrees))
+            return TerrainSample(0.0, np.array((tangent, 0.0)))
+
+        model = FakeModel([physical_output(), physical_output()])
+        runtime = self.make_runtime(model, terrain=terrain)
+        runtime.step(np.zeros(2), camera_yaw=0.0)
+        frame = runtime.step(np.array((0.35, 0.0)), camera_yaw=0.0)
+        self.assertEqual(len(model.inputs), 2)
+        self.assertFalse(frame.supported)
+        self.assertEqual(frame.diagnostics["desired_speed_m_s"], 0.0)
+        packed = model.inputs[1][0].numpy()
+        future = packed[INPUT_LAYOUT["trajectory_position"]].reshape(12, 2)[6:]
+        np.testing.assert_allclose(future, 0.0, atol=1.0e-7)
+        terrain_feature = packed[INPUT_LAYOUT["terrain_height"]]
+        self.assertTrue(np.isfinite(terrain_feature).all())
+        self.assertLessEqual(float(np.max(np.abs(terrain_feature))), 1.0e-7)
+        self.assertTrue(any(point[0] > 0.01 for point in calls))
+
+    def test_nineteen_degree_calls_model_advances_phase_and_uses_raw_logits(self) -> None:
+        checkpoint = FakeCheckpoint()
+        checkpoint.runtime_seed["phase"] = torch.tensor(
+            2.0 * math.pi - 0.1, dtype=torch.float32
+        )
+        model = FakeModel(
+            [physical_output(phase_advance=0.9, contact_logits=(-2.0, 0.0, 2.0, 4.0))]
+        )
+        runtime = self.make_runtime(model, terrain=terrain_with_grade(19.0), checkpoint=checkpoint)
+        frame = runtime.step(np.zeros(2), camera_yaw=0.0)
+        self.assertEqual(len(model.inputs), 1)
+        self.assertTrue(frame.supported)
+        self.assertAlmostEqual(frame.phase, 0.2, places=5)  # q99 cap is 0.3
+        expected = torch.sigmoid(torch.tensor((-2.0, 0.0, 2.0, 4.0))).numpy()
+        np.testing.assert_allclose(frame.contact_probability, expected, atol=1.0e-7)
+
+    def test_invalid_prediction_holds_every_runtime_state_transactionally(self) -> None:
+        model = FakeModel(
+            [
+                physical_output(body_position=0.3),
+                physical_output(joints=1.0),  # step exceeds 0.25 rad
+                physical_output(body_position=0.6),
+            ]
+        )
+        runtime = self.make_runtime(model)
+        accepted = runtime.step(np.zeros(2), camera_yaw=0.0)
+        held = runtime.step(np.zeros(2), camera_yaw=0.0)
+        self.assertEqual(held.diagnostics["hold_reason"], "joint_step")
+        np.testing.assert_array_equal(held.root_position_world, accepted.root_position_world)
+        np.testing.assert_array_equal(held.joint_position_isaaclab, accepted.joint_position_isaaclab)
+        self.assertEqual(held.phase, accepted.phase)
+        third = runtime.step(np.zeros(2), camera_yaw=0.0)
+        np.testing.assert_array_equal(model.inputs[1], model.inputs[2])
+        self.assertEqual(third.diagnostics["hold_count"], 1)
+
+    def test_current_missing_terrain_holds_without_calling_model(self) -> None:
+        model = FakeModel([physical_output()])
+        calls = 0
+
+        def disappears_after_bootstrap(_xy: np.ndarray) -> TerrainSample | None:
+            nonlocal calls
+            calls += 1
+            return TerrainSample(0.0, np.zeros(2)) if calls == 1 else None
+
+        runtime = self.make_runtime(model, terrain=disappears_after_bootstrap)
+        frame = runtime.step(np.zeros(2), camera_yaw=0.0)
+        self.assertEqual(model.inputs, [])
+        self.assertIn("terrain", frame.diagnostics["hold_reason"])
+
+
+class ClosedLoopMetricsTests(unittest.TestCase):
+    @staticmethod
+    def frame(index: int, *, phase: float, supported: bool = True) -> PFNNRuntimeFrame:
+        direction = np.zeros((12, 2), np.float64)
+        direction[:, 0] = 1.0
+        from mm_sonic.terrain_pfnn.runtime import PFNNTrajectoryState
+
+        return PFNNRuntimeFrame(
+            root_position_world=np.array((0.01 * index, 0.0, 0.8)),
+            root_quaternion_world_wxyz=np.array((1.0, 0.0, 0.0, 0.0)),
+            joint_position_isaaclab=np.zeros(29),
+            phase=phase,
+            contact_probability=np.ones(4),
+            trajectory=PFNNTrajectoryState(
+                np.zeros((12, 2)), direction, np.tile((0.0, 1.0), (12, 1))
+            ),
+            supported=supported,
+            diagnostics={"hold_count": 0, "phase_advance": 0.1},
+        )
+
+    def test_recorder_emits_global_and_all_segment_gates_and_detects_freeze(self) -> None:
+        recorder = ClosedLoopRecorder(joint_limits=np.array([[-2.0, 2.0]] * 29))
+        observation = RuntimeGeometryObservation(
+            maximum_sole_penetration_m=0.01,
+            maximum_forbidden_body_penetration_m=0.0,
+            forbidden_geom_names=(),
+            stance_sole_speeds_m_s=(0.05, 0.06),
+        )
+        phase = 0.0
+        segment_names = ("flat", "ascent", "summit", "descent", "landing")
+        for index in range(600):
+            if index >= 30:
+                phase = (phase + 0.1) % (2.0 * math.pi)
+            recorder.record(
+                self.frame(index, phase=phase),
+                desired_velocity_world=np.array((0.3, 0.0)),
+                terrain_sample=TerrainSample(0.0, np.zeros(2), segment_names[index % 5]),
+                geometry=observation,
+                traversal_direction="forward" if index < 300 else "backward",
+            )
+        report = recorder.finalize()
+        self.assertEqual(report["schema"], "mm-sonic-terrain-pfnn-closed-loop/v1")
+        self.assertEqual(set(report["segments"]), set(segment_names))
+        self.assertIn("gates", report["segments"]["flat"])
+        self.assertTrue(report["gates"]["finite_20_seconds"])
+        self.assertGreaterEqual(report["global"]["walking_freeze_count"], 1)
+        self.assertFalse(report["gates"]["no_phase_freeze"])
+        self.assertEqual(report["global"]["maximum_sole_penetration_m"], 0.01)
+
+    def test_validation_penalty_counts_boolean_failures_and_numeric_excess(self) -> None:
+        metrics = {
+            "gates": {
+                "finite_20_seconds": True,
+                "no_phase_reversal": False,
+                "root_translation_step_within_limit": False,
+            },
+            "numeric_gates": {
+                "root_translation_step_m": {
+                    "value": 0.09,
+                    "limit": 0.06,
+                    "gate": "root_translation_step_within_limit",
+                },
+                "joint_step_rad": {"value": 0.10, "limit": 0.25},
+            },
+            "dataset_digest_sha256": "data",
+            "kinematic_signature_sha256": "kin",
+        }
+        result = ClosedLoopValidationResult.from_metrics(metrics, split="validation")
+        self.assertEqual(result.hard_failures, 3)
+        self.assertAlmostEqual(result.normalized_excess, 0.5)
+        self.assertEqual(result.failure_penalty, 3000.5)
+
+    def test_validation_scenario_aggregate_retains_selection_provenance(self) -> None:
+        calls: list[int] = []
+
+        def scenario(index: int) -> object:
+            def evaluate() -> dict[str, object]:
+                calls.append(index)
+                return {
+                    "gates": {"finite_20_seconds": True},
+                    "numeric_gates": {},
+                    "dataset_digest_sha256": "data",
+                    "kinematic_signature_sha256": "kin",
+                }
+
+            return evaluate
+
+        result = evaluate_closed_loop_scenarios(
+            split="validation", scenarios=(scenario(0), scenario(1))
+        )
+        self.assertEqual(calls, [0, 1])
+        self.assertEqual(result.metrics["scenario_count"], 2)
+        self.assertEqual(result.metrics["dataset_digest_sha256"], "data")
+        self.assertEqual(result.metrics["kinematic_signature_sha256"], "kin")
+        selection, promote = validated_normal_selection(
+            one_step_score=2.5,
+            result=result,
+            dataset_digest="data",
+            kinematic_signature_sha256="kin",
+        )
+        self.assertTrue(promote)
+        self.assertEqual(selection["validation_score"], 2.5)
+
+        mismatch = scenario(2)
+
+        def wrong_signature() -> dict[str, object]:
+            metrics = mismatch()
+            metrics["kinematic_signature_sha256"] = "wrong"
+            return metrics
+
+        with self.assertRaisesRegex(ValueError, "provenance"):
+            evaluate_closed_loop_scenarios(
+                split="validation", scenarios=(scenario(3), wrong_signature)
+            )
+
+    def test_validation_rejects_train_or_test_before_opening_any_scenario(self) -> None:
+        calls: list[str] = []
+
+        def scenario() -> dict[str, object]:
+            calls.append("opened")
+            return {"gates": {}, "numeric_gates": {}}
+
+        for split in ("train", "test"):
+            with self.subTest(split=split):
+                with self.assertRaisesRegex(ValueError, "validation"):
+                    evaluate_closed_loop_scenarios(split=split, scenarios=(scenario,))
+        self.assertEqual(calls, [])
+
+    @unittest.skipUnless(MODEL_PATH.is_file(), "native G1 model is unavailable")
+    def test_native_geometry_uses_exact_eight_sole_spheres(self) -> None:
+        geometry = NativeG1RuntimeGeometry.from_mjcf(MODEL_PATH)
+        observation = geometry.observe(
+            root_position_world=np.array((0.0, 0.0, 0.8)),
+            root_quaternion_world_wxyz=np.array((1.0, 0.0, 0.0, 0.0)),
+            joint_position_isaaclab=np.zeros(29),
+            contact_probability=np.ones(4),
+            height_and_grade_at=terrain_with_grade(0.0),
+        )
+        self.assertEqual(geometry.sole_geom_count, 8)
+        self.assertTrue(math.isfinite(observation.maximum_sole_penetration_m))
+        self.assertTrue(math.isfinite(observation.maximum_forbidden_body_penetration_m))
+        self.assertFalse(any("ankle_roll" in name for name in observation.forbidden_geom_names))
+
+    @unittest.skipUnless(MODEL_PATH.is_file(), "native G1 model is unavailable")
+    def test_native_mesh_audit_queries_only_transformed_lowest_vertices(self) -> None:
+        import mujoco
+
+        geometry = NativeG1RuntimeGeometry.from_mjcf(MODEL_PATH)
+        mesh_geom = next(
+            geom
+            for geom in geometry._forbidden_geom_ids
+            if int(geometry._model.geom_type[geom])
+            == int(mujoco.mjtGeom.mjGEOM_MESH)
+        )
+        mesh_id = int(geometry._model.geom_dataid[mesh_geom])
+        vertex_count = int(geometry._model.mesh_vertnum[mesh_id])
+        samples = geometry._geom_samples(mesh_geom)
+        self.assertGreater(len(samples), 0)
+        self.assertLess(len(samples), vertex_count)
+        np.testing.assert_allclose(samples[:, 2], np.min(samples[:, 2]), atol=1.0e-12)
+
+    def test_known_train_source_and_twenty_second_script_are_exact(self) -> None:
+        manifest = {
+            "source_records": {
+                "z-grail": {"source_kind": "grail", "split": "train"},
+                "a-test": {"source_kind": "grail", "split": "test"},
+                "b-grail": {"source_kind": "grail", "split": "train"},
+                "a-lafan": {"source_kind": "lafan", "split": "train"},
+            }
+        }
+        name, record = select_known_train_grail_record(manifest, split="train")
+        self.assertEqual(name, "b-grail")
+        self.assertEqual(record["split"], "train")
+        expected = {
+            0: ((0.2, 0.1), "forward"),
+            59: ((0.2, 0.1), "forward"),
+            60: ((0.35, 0.0), "forward"),
+            359: ((0.35, 0.0), "forward"),
+            360: ((0.0, 0.0), None),
+            419: ((0.0, 0.0), None),
+            420: ((-0.35, 0.0), "backward"),
+            539: ((-0.35, 0.0), "backward"),
+            540: ((0.0, 0.0), None),
+            599: ((0.0, 0.0), None),
+        }
+        for tick, (velocity, direction) in expected.items():
+            with self.subTest(tick=tick):
+                actual_velocity, actual_direction = known_train_command(
+                    tick, (0.2, 0.1)
+                )
+                np.testing.assert_array_equal(actual_velocity, velocity)
+                self.assertEqual(actual_direction, direction)
+        with self.assertRaisesRegex(ValueError, "600"):
+            known_train_command(600, (0.2, 0.1))
+
+    def test_usd_decode_is_numeric_hash_bound_and_fails_closed(self) -> None:
+        usd_text = """#usda 1.0
+(
+    defaultPrim = "Terrain"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+def Mesh "Terrain" {
+    int[] faceVertexCounts = [4]
+    int[] faceVertexIndices = [0, 1, 2, 3]
+    point3f[] points = [(0,0,0), (1,0,0), (1,1,0), (0,1,0)]
+    uniform token subdivisionScheme = "none"
+}
+"""
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            usd = root / "terrain.usda"
+            usd.write_text(usd_text)
+            digest = hashlib.sha256(usd.read_bytes()).hexdigest()
+            mesh = _decode_usd_mesh(usd, expected_sha256=digest)
+            self.assertEqual(mesh.vertices_local.shape, (4, 3))
+            self.assertEqual(mesh.faces.shape, (2, 3))
+            with self.assertRaisesRegex(ValueError, "hash"):
+                _decode_usd_mesh(usd, expected_sha256="0" * 64)
+            with self.assertRaisesRegex(ValueError, "helper"):
+                _decode_usd_mesh(
+                    usd,
+                    expected_sha256=digest,
+                    python_path=Path("/bin/false"),
+                )
+            tampered = root / "tampered.npz"
+            np.savez(
+                tampered,
+                schema=np.asarray("mm-sonic-usd-mesh/v1"),
+                source_sha256=np.asarray("f" * 64),
+                vertices=np.zeros((3, 3), np.float32),
+                faces=np.asarray(((0, 1, 2),), np.int32),
+                valid_faces=np.ones(1, dtype=np.bool_),
+            )
+            with self.assertRaisesRegex(ValueError, "hash"):
+                _load_decoded_usd_npz(tampered, expected_sha256=digest)
+
+    def test_known_slope_wrapper_has_bounded_flat_apron_then_exact_flank(self) -> None:
+        tangent = math.tan(math.radians(10.0))
+        mesh = CanonicalTerrainMesh(
+            vertices_local=np.asarray(
+                (
+                    (0.0, -0.5, 0.0),
+                    (0.0, 0.5, 0.0),
+                    (1.0, -0.5, tangent),
+                    (1.0, 0.5, tangent),
+                ),
+                dtype=np.float32,
+            ),
+            faces=np.asarray(((0, 2, 3), (0, 3, 1)), dtype=np.int32),
+            valid_faces=np.ones(2, dtype=np.bool_),
+            source_asset_sha256="a" * 64,
+        )
+        terrain = KnownSlopeTerrain.from_mesh(mesh)
+        origin = terrain(np.array((0.0, 0.0)))
+        self.assertIsNotNone(origin)
+        self.assertEqual(origin.segment, "flat")
+        np.testing.assert_array_equal(origin.gradient_xy, (0.0, 0.0))
+        self.assertEqual(terrain.alignment_report["approach"], "synthetic_flat_apron")
+        boundary = terrain(np.array((0.5, 0.0)))
+        self.assertIsNotNone(boundary)
+        self.assertAlmostEqual(boundary.height_m, 0.0, places=6)
+        flank = terrain(np.array((0.75, 0.0)))
+        self.assertIsNotNone(flank)
+        self.assertAlmostEqual(flank.absolute_grade_degrees, 10.0, places=4)
+        self.assertIsNone(terrain(np.array((-0.251, 0.0))))
+
+    def test_source_aligned_terrain_rotates_gradient_and_preserves_anchor(self) -> None:
+        mesh = CanonicalTerrainMesh(
+            vertices_local=np.asarray(
+                ((-2.0, -2.0, -2.0), (2.0, -2.0, 2.0),
+                 (2.0, 2.0, 2.0), (-2.0, 2.0, -2.0)),
+                dtype=np.float32,
+            ),
+            faces=np.asarray(((0, 1, 2), (0, 2, 3)), dtype=np.int32),
+            valid_faces=np.ones(2, dtype=np.bool_),
+            source_asset_sha256="a" * 64,
+        )
+        terrain = SourceAlignedTerrain(
+            mesh,
+            world_from_mesh=RigidTransform(
+                np.zeros(3), np.asarray((1.0, 0.0, 0.0, 0.0))
+            ),
+            source_root_xy=(0.0, 0.0),
+            source_root_yaw=math.pi / 2.0,
+            source_support_height=0.0,
+        )
+        origin = terrain(np.zeros(2))
+        forward = terrain(np.array((0.2, 0.0)))
+        self.assertAlmostEqual(origin.height_m, 0.0, places=7)
+        self.assertAlmostEqual(forward.height_m, 0.0, places=7)
+        np.testing.assert_allclose(origin.gradient_xy, (0.0, -1.0), atol=1.0e-7)
+
+    def test_grail_pair_npz_rejects_robot_or_frame_tamper(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "pair.npz"
+            fields = {
+                "schema": np.asarray("mm-sonic-grail-pair/v1"),
+                "source_sha256": np.asarray("a" * 64),
+                "robot_sha256": np.asarray("b" * 64),
+                "vertices": np.asarray(
+                    ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+                    np.float32,
+                ),
+                "faces": np.asarray(((0, 1, 2),), np.int32),
+                "valid_faces": np.ones(1, np.bool_),
+                "anchor_root_xy": np.zeros(2, np.float32),
+                "anchor_yaw": np.asarray(0.0, np.float32),
+                "anchor_support": np.asarray(0.0, np.float32),
+                "anchor_center_frame": np.asarray(82, np.int32),
+            }
+            np.savez(path, **fields)
+            decoded = _load_decoded_grail_npz(
+                path,
+                expected_terrain_sha256="a" * 64,
+                expected_robot_sha256="b" * 64,
+                expected_center_frame=82,
+            )
+            self.assertEqual(decoded.anchor_center_frame, 82)
+            with self.assertRaisesRegex(ValueError, "provenance"):
+                _load_decoded_grail_npz(
+                    path,
+                    expected_terrain_sha256="a" * 64,
+                    expected_robot_sha256="c" * 64,
+                    expected_center_frame=82,
+                )
+
+    def test_normal_best_requires_evaluated_validation_score_and_provenance(self) -> None:
+        metrics = {
+            "gates": {"finite_20_seconds": True},
+            "numeric_gates": {},
+            "dataset_digest_sha256": "data",
+            "kinematic_signature_sha256": "kin",
+        }
+        result = ClosedLoopValidationResult.from_metrics(metrics, split="validation")
+        selection, promote = validated_normal_selection(
+            one_step_score=2.5,
+            result=result,
+            dataset_digest="data",
+            kinematic_signature_sha256="kin",
+        )
+        self.assertTrue(promote)
+        self.assertEqual(selection["closed_loop_score"], 0.0)
+        self.assertEqual(selection["validation_score"], 2.5)
+        for changed in (None, "wrong-data", "wrong-kin"):
+            with self.subTest(changed=changed):
+                if changed is None:
+                    bad_result = ClosedLoopValidationResult(
+                        evaluated=False,
+                        split="validation",
+                        hard_failures=0,
+                        normalized_excess=0.0,
+                        metrics=metrics,
+                    )
+                    data, signature = "data", "kin"
+                else:
+                    bad_result = result
+                    data, signature = (
+                        (changed, "kin") if "data" in changed else ("data", changed)
+                    )
+                selection, promote = validated_normal_selection(
+                    one_step_score=2.5,
+                    result=bad_result,
+                    dataset_digest=data,
+                    kinematic_signature_sha256=signature,
+                )
+                self.assertIsNone(selection)
+                self.assertFalse(promote)
+
+    def test_public_evaluator_allows_only_explicit_twenty_second_train_gate(self) -> None:
+        manifest = {
+            "dataset_digest_sha256": "a" * 64,
+            "split_identities": {"train": ["train-id"], "validation": ["val-id"]},
+        }
+
+        class Dataset:
+            x_mean = np.zeros(INPUT_LAYOUT.size, np.float32)
+            x_std = np.ones(INPUT_LAYOUT.size, np.float32)
+            y_mean = np.zeros(OUTPUT_LAYOUT.size, np.float32)
+            y_std = np.ones(OUTPUT_LAYOUT.size, np.float32)
+
+        class Kinematics:
+            kinematic_signature_sha256 = "kin"
+            joint_limits = torch.tensor([[-2.0, 2.0]] * 29, dtype=torch.float64)
+
+            def to(self, _device):
+                return self
+
+        class Checkpoint:
+            kinematic_signature_sha256 = "kin"
+            joint_limits = Kinematics.joint_limits.clone()
+            train_identities = ("train-id",)
+            validation_identities = ("val-id",)
+            normalization = {
+                "x_mean": torch.zeros(INPUT_LAYOUT.size),
+                "x_std": torch.ones(INPUT_LAYOUT.size),
+                "y_mean": torch.zeros(OUTPUT_LAYOUT.size),
+                "y_std": torch.ones(OUTPUT_LAYOUT.size),
+            }
+            loss_weights = {}
+
+            @staticmethod
+            def build_model():
+                return torch.nn.Identity()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "manifest.json").write_text(__import__("json").dumps(manifest))
+            checkpoint_path = root / "best.pt"
+            checkpoint_path.write_bytes(b"checkpoint")
+            output = root / "evaluation.json"
+            closed_loop = {
+                "schema": "mm-sonic-terrain-pfnn-closed-loop/v1",
+                "known_train_gate": {"accepted": True},
+            }
+            with (
+                patch(
+                    "mm_sonic.evaluate_terrain_pfnn.TorchG1ForwardKinematics.from_mjcf",
+                    return_value=Kinematics(),
+                ),
+                patch(
+                    "mm_sonic.evaluate_terrain_pfnn.load_checkpoint",
+                    return_value=Checkpoint(),
+                ),
+                patch(
+                    "mm_sonic.evaluate_terrain_pfnn.PFNNShardDataset",
+                    return_value=Dataset(),
+                ),
+                patch(
+                    "mm_sonic.evaluate_terrain_pfnn.one_step_metrics",
+                    return_value={"one_step_score": 1.0, "samples": 1},
+                ),
+                patch(
+                    "mm_sonic.evaluate_terrain_pfnn.run_known_train_rollout",
+                    return_value=closed_loop,
+                ) as rollout,
+            ):
+                report = evaluate(
+                    checkpoint_path=checkpoint_path,
+                    dataset_path=root / "manifest.json",
+                    model_path=MODEL_PATH,
+                    split="train",
+                    output_path=output,
+                    sealed_test=False,
+                    run_directory=None,
+                    batch_size=1,
+                    device="cpu",
+                    closed_loop_seconds=20.0,
+                )
+            self.assertEqual(report["closed_loop"], closed_loop)
+            rollout.assert_called_once()
+            with self.assertRaisesRegex(ValueError, "20"):
+                evaluate(
+                    checkpoint_path=checkpoint_path,
+                    dataset_path=root / "manifest.json",
+                    model_path=MODEL_PATH,
+                    split="train",
+                    output_path=output,
+                    sealed_test=False,
+                    run_directory=None,
+                    batch_size=1,
+                    device="cpu",
+                    closed_loop_seconds=None,
+                )
+
+
+if __name__ == "__main__":
+    unittest.main()

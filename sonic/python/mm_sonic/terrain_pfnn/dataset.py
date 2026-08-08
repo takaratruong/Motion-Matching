@@ -192,6 +192,25 @@ def normalize_pfnn_output(
     return np.ascontiguousarray((value - mean) / std, dtype=np.float32)
 
 
+def pfnn_input_sha256(value: object) -> str:
+    """Hash one canonical normalized 288-value PFNN input.
+
+    The receipt domain is fixed and values are contiguous little-endian
+    binary32, so the digest is independent of host array strides and byte order.
+    """
+
+    array = np.ascontiguousarray(np.asarray(value, dtype="<f4"))
+    if array.shape != (INPUT_LAYOUT.size,) or not np.isfinite(array).all():
+        raise ValueError("normalized PFNN input receipt requires 288 finite values")
+    # IEEE negative zero is numerically identical and may arise from an
+    # otherwise exact frame rotation, so canonicalize both signs to +0.
+    array = array.copy()
+    array[array == 0.0] = np.float32(0.0)
+    digest = hashlib.sha256(b"mm-sonic-normalized-pfnn-input/v1\0")
+    digest.update(array.tobytes(order="C"))
+    return digest.hexdigest()
+
+
 def _validated_shard_arrays(
     path: Path,
     record: Mapping[str, object],
@@ -410,4 +429,5 @@ __all__ = [
     "PFNNShardDataset",
     "normalize_pfnn_input",
     "normalize_pfnn_output",
+    "pfnn_input_sha256",
 ]

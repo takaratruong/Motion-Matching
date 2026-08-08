@@ -22,6 +22,7 @@ from mm_sonic.terrain_oracle.canonical import (
     ISAACLAB_JOINT_NAMES,
 )
 
+from .dataset import normalize_pfnn_input, pfnn_input_sha256
 from .layout import (
     CONTACT_ORDER,
     INPUT_LAYOUT,
@@ -31,7 +32,7 @@ from .layout import (
 from .model import PhaseFunctionedNetwork
 
 
-CHECKPOINT_SCHEMA = "mm-sonic-terrain-pfnn-checkpoint/v2"
+CHECKPOINT_SCHEMA = "mm-sonic-terrain-pfnn-checkpoint/v3"
 _NORMALIZATION_CONTRACT = {
     "continuous_loss_domain": "normalized",
     "contact_loss_domain": "raw_logits_binary_labels",
@@ -463,7 +464,8 @@ def choose_runtime_seed(
     ):
         raise ValueError("fitted runtime seed is nonfinite or outside joint limits")
 
-    first_input = np.asarray(first_fitted["x"], dtype=np.float64).copy()
+    first_normalized = np.asarray(first_fitted["x"], dtype=np.float32)
+    first_input = np.asarray(first_normalized, dtype=np.float64).copy()
     if first_input.shape != (INPUT_LAYOUT.size,) or not np.isfinite(first_input).all():
         raise ValueError("first fitted recurrent input is invalid")
     for field in ("previous_body_position", "previous_body_velocity"):
@@ -490,6 +492,38 @@ def choose_runtime_seed(
     phase_error = abs((phase - first_phase + math.pi) % (2.0 * math.pi) - math.pi)
     if phase_error > 3.0e-5:
         raise ValueError("fitted recurrent phase does not reconstruct first input")
+    reconstructed_semantic = first_input[
+        INPUT_LAYOUT["semantic_intent"]
+    ].reshape(12, 2)
+    semantic = np.zeros((12, 2), dtype=np.float64)
+    semantic[np.arange(12), np.argmax(reconstructed_semantic, axis=1)] = 1.0
+    if not np.allclose(
+        reconstructed_semantic, semantic, rtol=0.0, atol=3.0e-5
+    ):
+        raise ValueError("first fitted semantic intent is not one-hot")
+    expected_terrain = first_input[INPUT_LAYOUT["terrain_height"]].reshape(12, 3).copy()
+    reconstructed = np.empty(INPUT_LAYOUT.size, dtype=np.float32)
+    reconstructed[INPUT_LAYOUT["trajectory_position"]] = predecessor_physical[
+        OUTPUT_LAYOUT["trajectory_position"]
+    ]
+    reconstructed[INPUT_LAYOUT["trajectory_direction"]] = predecessor_physical[
+        OUTPUT_LAYOUT["trajectory_direction"]
+    ]
+    reconstructed[INPUT_LAYOUT["terrain_height"]] = expected_terrain.reshape(-1)
+    reconstructed[INPUT_LAYOUT["semantic_intent"]] = semantic.reshape(-1)
+    reconstructed[INPUT_LAYOUT["previous_body_position"]] = predecessor_physical[
+        OUTPUT_LAYOUT["body_position"]
+    ]
+    reconstructed[INPUT_LAYOUT["previous_body_velocity"]] = predecessor_physical[
+        OUTPUT_LAYOUT["body_velocity"]
+    ]
+    reconstructed_normalized = normalize_pfnn_input(
+        reconstructed, dataset.x_mean, dataset.x_std
+    )
+    if not np.allclose(
+        reconstructed_normalized, first_normalized, rtol=0.0, atol=3.0e-5
+    ):
+        raise ValueError("runtime seed does not reproduce first fitted input")
     best = {
             "phase": torch.tensor(phase, dtype=torch.float32),
             "world_xy": torch.zeros(2, dtype=torch.float32),
@@ -521,6 +555,12 @@ def choose_runtime_seed(
             "contact_label": torch.as_tensor(
                 predecessor_physical[OUTPUT_LAYOUT["contact_logit"]].copy(), dtype=torch.float32
             ),
+            "semantic_intent": torch.as_tensor(semantic, dtype=torch.float32),
+            "terrain_height": torch.as_tensor(expected_terrain, dtype=torch.float32),
+            "normalized_input": torch.as_tensor(
+                first_normalized.copy(), dtype=torch.float32
+            ),
+            "normalized_input_sha256": pfnn_input_sha256(first_normalized),
             "provenance": {
                 "predecessor_clip_id": str(predecessor["clip_id"]),
                 "predecessor_center_frame": int(predecessor["center_frame"]),
@@ -620,6 +660,11 @@ def one_step_metrics(
 def finite_runtime_seed() -> dict[str, object]:
     direction = torch.zeros(12, 2, dtype=torch.float32)
     direction[:, 0] = 1.0
+    semantic = torch.zeros(12, 2, dtype=torch.float32)
+    semantic[:, 0] = 1.0
+    normalized = np.zeros(INPUT_LAYOUT.size, dtype=np.float32)
+    normalized[INPUT_LAYOUT["trajectory_direction"]] = direction.numpy().reshape(-1)
+    normalized[INPUT_LAYOUT["semantic_intent"]] = semantic.numpy().reshape(-1)
     return {
         "phase": torch.tensor(0.0, dtype=torch.float32),
         "world_xy": torch.zeros(2, dtype=torch.float32),
@@ -632,6 +677,10 @@ def finite_runtime_seed() -> dict[str, object]:
         "trajectory_position": torch.zeros(12, 2, dtype=torch.float32),
         "trajectory_direction": direction,
         "contact_label": torch.zeros(4, dtype=torch.float32),
+        "semantic_intent": semantic,
+        "terrain_height": torch.zeros(12, 3, dtype=torch.float32),
+        "normalized_input": torch.as_tensor(normalized.copy()),
+        "normalized_input_sha256": pfnn_input_sha256(normalized),
         "provenance": {
             "predecessor_clip_id": "synthetic",
             "predecessor_center_frame": 0,
@@ -672,7 +721,7 @@ def _validate_runtime_seed(
             if tensor.shape != expected.shape or not torch.isfinite(tensor).all():
                 raise ValueError(f"runtime seed {name} is invalid")
             output[name] = tensor
-        else:
+        elif name == "provenance":
             if (
                 type(value) is not dict
                 or set(value) != {
@@ -704,6 +753,14 @@ def _validate_runtime_seed(
                 "first_fitted_center_frame": value["first_fitted_center_frame"],
                 "speed": float(value["speed"]),
             }
+        else:
+            if (
+                type(value) is not str
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise ValueError("runtime seed normalized input digest is invalid")
+            output[name] = value
     joints = output["joint_position"]
     assert isinstance(joints, torch.Tensor)
     if torch.any(joints < joint_limits[:, 0]) or torch.any(joints > joint_limits[:, 1]):
@@ -712,6 +769,18 @@ def _validate_runtime_seed(
     assert isinstance(contacts, torch.Tensor)
     if torch.any((contacts != 0.0) & (contacts != 1.0)):
         raise ValueError("runtime seed contacts must be binary")
+    semantic = output["semantic_intent"]
+    assert isinstance(semantic, torch.Tensor)
+    if not torch.all((semantic == 0.0) | (semantic == 1.0)) or not torch.all(
+        semantic.sum(dim=1) == 1.0
+    ):
+        raise ValueError("runtime seed semantic intent must be one-hot")
+    normalized_input = output["normalized_input"]
+    normalized_input_sha256 = output["normalized_input_sha256"]
+    assert isinstance(normalized_input, torch.Tensor)
+    assert isinstance(normalized_input_sha256, str)
+    if pfnn_input_sha256(normalized_input.numpy()) != normalized_input_sha256:
+        raise ValueError("runtime seed normalized input digest mismatch")
     phase = output["phase"]
     assert isinstance(phase, torch.Tensor)
     if not 0.0 <= float(phase) < 2.0 * math.pi:

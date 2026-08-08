@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import random
 import time
-from typing import Sequence
+from typing import Callable, Sequence
 
 import numpy as np
 import torch
@@ -20,6 +20,7 @@ from mm_sonic.evaluate_terrain_pfnn import _atomic_json, _dataset_root
 from mm_sonic.terrain_pfnn.dataset import PFNNShardDataset
 from mm_sonic.terrain_pfnn.kinematics import TorchG1ForwardKinematics
 from mm_sonic.terrain_pfnn.model import PhaseFunctionedNetwork
+from mm_sonic.terrain_pfnn.runtime import ClosedLoopValidationResult
 from mm_sonic.terrain_pfnn.splits import split_identity, terrain_identity
 from mm_sonic.terrain_pfnn.training import (
     DEFAULT_LOSS_WEIGHTS,
@@ -48,6 +49,32 @@ def overfit_gate_accepted(initial: float, final: float, ratio: float) -> bool:
 
 def promote_pipeline_best(*, pipeline_overfit: bool, accepted: bool) -> bool:
     return bool(pipeline_overfit and accepted)
+
+
+def validated_normal_selection(
+    *,
+    one_step_score: float,
+    result: ClosedLoopValidationResult | None,
+    dataset_digest: str,
+    kinematic_signature_sha256: str,
+) -> tuple[dict[str, object] | None, bool]:
+    """Return promotable metadata only for an actual matching validation run."""
+
+    if (
+        not isinstance(result, ClosedLoopValidationResult)
+        or not result.evaluated
+        or result.split != "validation"
+        or result.metrics.get("dataset_digest_sha256") != dataset_digest
+        or result.metrics.get("kinematic_signature_sha256")
+        != kinematic_signature_sha256
+    ):
+        return None, False
+    selection = selection_metadata(
+        one_step_score=one_step_score,
+        pipeline_overfit=False,
+        closed_loop_scorer=lambda: result.failure_penalty,
+    )
+    return selection, True
 
 
 def resolve_rollout_finetune_frames(
@@ -431,7 +458,11 @@ def _append_metric(stream: object, record: dict[str, object]) -> None:
     stream.flush()
 
 
-def train(arguments: argparse.Namespace) -> dict[str, object] | None:
+def train(
+    arguments: argparse.Namespace,
+    *,
+    closed_loop_scorer: Callable[[], ClosedLoopValidationResult] | None = None,
+) -> dict[str, object] | None:
     import torch.distributed as dist
 
     rank, world_size, local_rank, device = _distributed_context(arguments.seed)
@@ -651,8 +682,9 @@ def train(arguments: argparse.Namespace) -> dict[str, object] | None:
     if arguments.rollout_finetune_frames:
         if not one_step_accepted:
             raise RuntimeError("rollout fine-tuning requires a passing one-step gate")
+        rollout_dataset = optimization_dataset if pipeline_overfit else train_dataset
         sequences, sequence_classes = _consecutive_starts(
-            train_dataset, arguments.rollout_finetune_frames
+            rollout_dataset, arguments.rollout_finetune_frames
         )
         sequence_candidates = list(range(len(sequences)))
         rollout_steps = (
@@ -678,7 +710,10 @@ def train(arguments: argparse.Namespace) -> dict[str, object] | None:
                 world_size=world_size,
             )
             chosen = rank_sequences[: arguments.batch_size]
-            rows = [[train_dataset[index] for index in sequences[item]] for item in chosen]
+            rows = [
+                [rollout_dataset[index] for index in sequences[item]]
+                for item in chosen
+            ]
             inputs = torch.as_tensor(
                 np.stack([[row[frame]["x"] for row in rows] for frame in range(arguments.rollout_finetune_frames)]),
                 device=device,
@@ -800,16 +835,29 @@ def train(arguments: argparse.Namespace) -> dict[str, object] | None:
     runtime_seed = choose_runtime_seed(
         optimization_dataset, kinematics.joint_limits.detach().cpu()
     )
-    promote_best = promote_pipeline_best(
-        pipeline_overfit=pipeline_overfit, accepted=one_step_accepted
-    )
-    selection = (
-        selection_metadata(
-            one_step_score=float(gate_metrics["one_step_score"]),
-            pipeline_overfit=True,
+    closed_loop_result: ClosedLoopValidationResult | None = None
+    if pipeline_overfit:
+        promote_best = promote_pipeline_best(
+            pipeline_overfit=True, accepted=one_step_accepted
         )
-        if promote_best else None
-    )
+        selection = (
+            selection_metadata(
+                one_step_score=float(gate_metrics["one_step_score"]),
+                pipeline_overfit=True,
+            )
+            if promote_best
+            else None
+        )
+    elif one_step_accepted and closed_loop_scorer is not None:
+        closed_loop_result = closed_loop_scorer()
+        selection, promote_best = validated_normal_selection(
+            one_step_score=float(gate_metrics["one_step_score"]),
+            result=closed_loop_result,
+            dataset_digest=dataset_digest,
+            kinematic_signature_sha256=kinematics.kinematic_signature_sha256,
+        )
+    else:
+        selection, promote_best = None, False
     candidate = output / f"checkpoint-step-{step:08d}.pt"
     save_checkpoint(
         candidate,
@@ -878,9 +926,25 @@ def train(arguments: argparse.Namespace) -> dict[str, object] | None:
         "best_checkpoint": best_path,
         "selection": selection,
         "closed_loop": {
-            "status": "pending_task_7",
-            "failure_penalty": None,
-            "accepted": None,
+            "status": (
+                "evaluated"
+                if closed_loop_result is not None
+                else (
+                    "provisional_pipeline_overfit"
+                    if pipeline_overfit
+                    else "not_evaluated_task_8_scenarios_required"
+                )
+            ),
+            "failure_penalty": (
+                None
+                if closed_loop_result is None
+                else closed_loop_result.failure_penalty
+            ),
+            "accepted": (
+                None
+                if closed_loop_result is None
+                else closed_loop_result.hard_failures == 0
+            ),
         },
     }
     _atomic_json(output / "one-step-report.json", report)
@@ -935,6 +999,7 @@ __all__ = [
     "fitted_subset_metadata",
     "overfit_gate_accepted",
     "promote_pipeline_best",
+    "validated_normal_selection",
     "resolve_rollout_finetune_frames",
     "seed_worker",
     "stratified_subset",

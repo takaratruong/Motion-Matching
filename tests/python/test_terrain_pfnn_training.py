@@ -23,7 +23,7 @@ from mm_sonic.train_terrain_pfnn import (
     promote_pipeline_best,
     stratified_subset,
 )
-from mm_sonic.terrain_pfnn.dataset import normalize_pfnn_input
+from mm_sonic.terrain_pfnn.dataset import normalize_pfnn_input, pfnn_input_sha256
 from mm_sonic.terrain_pfnn.layout import INPUT_LAYOUT, OUTPUT_LAYOUT
 from mm_sonic.terrain_pfnn.model import PhaseFunctionedNetwork
 from mm_sonic.terrain_pfnn.training import (
@@ -138,6 +138,9 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                 x[INPUT_LAYOUT["trajectory_direction"]] = current_trajectory[24:]
                 x[INPUT_LAYOUT["previous_body_position"]] = current_body.ravel() * 0.1
                 x[INPUT_LAYOUT["previous_body_velocity"]] = current_body.ravel() * 0.1
+                x[INPUT_LAYOUT["semantic_intent"]] = np.tile(
+                    (1.0, 0.0), (12, 1)
+                ).ravel()
                 y = np.zeros(OUTPUT_LAYOUT.size, np.float32)
                 y[OUTPUT_LAYOUT["trajectory_position"]] = target_trajectory[:24]
                 y[OUTPUT_LAYOUT["trajectory_direction"]] = target_trajectory[24:]
@@ -179,6 +182,14 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
         torch.testing.assert_close(seed["phase"], torch.tensor(1.1))
         torch.testing.assert_close(
             seed["body_position"], torch.full((30, 3), 0.011)
+        )
+        torch.testing.assert_close(
+            seed["semantic_intent"], torch.tensor([[1.0, 0.0]] * 12)
+        )
+        torch.testing.assert_close(seed["terrain_height"], torch.zeros(12, 3))
+        self.assertEqual(
+            seed["normalized_input_sha256"],
+            pfnn_input_sha256(rows[1]["x"]),
         )
         isolated = Rows()
         isolated.rows = isolated.rows[:1]
@@ -606,6 +617,14 @@ class TerrainPFNNTrainingTests(unittest.TestCase):
                     "body_position", torch.zeros(30, 6)[:, ::2]
                 ),
                 "runtime seed",
+            )
+            rejected(
+                "runtime seed normalized input digest",
+                lambda value: value["runtime_seed"]["normalized_input"].__setitem__(
+                    0,
+                    value["runtime_seed"]["normalized_input"][0] + 1.0,
+                ),
+                "normalized input digest",
             )
             rejected(
                 "runtime provenance extra key",
