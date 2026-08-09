@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -603,6 +604,55 @@ static void test_authenticated_bundle_and_digest_tampers()
 {
     synthetic_lmm_fixture fixture;
     char error[512] = {};
+
+    const std::filesystem::path missing_kinematics_data =
+        fixture.root / "missing-kinematics-data";
+    std::filesystem::copy(
+        fixture.data,
+        missing_kinematics_data,
+        std::filesystem::copy_options::recursive |
+            std::filesystem::copy_options::overwrite_existing);
+    const std::filesystem::path missing_kinematics_manifest =
+        missing_kinematics_data / "manifest.json";
+    std::ifstream missing_kinematics_input(
+        missing_kinematics_manifest, std::ios::binary);
+    check(missing_kinematics_input.good(),
+          "open data manifest for missing kinematics negative");
+    std::string missing_kinematics_text{
+        std::istreambuf_iterator<char>(missing_kinematics_input),
+        std::istreambuf_iterator<char>()};
+    const std::string kinematics_block =
+        "  \"kinematics_model\": {\n"
+        "    \"asset\": \"g1_29dof.xml\",\n"
+        "    \"sha256\": \"749209c06a5c0023deb27f728420028b62b1f3092a22e24920183c1a897e4376\",\n"
+        "    \"size_bytes\": 26914\n"
+        "  },\n";
+    const size_t kinematics_position =
+        missing_kinematics_text.find(kinematics_block);
+    check(kinematics_position != std::string::npos,
+          "locate data manifest kinematics model block");
+    missing_kinematics_text.erase(
+        kinematics_position, kinematics_block.size());
+    std::ofstream missing_kinematics_output(
+        missing_kinematics_manifest, std::ios::binary | std::ios::trunc);
+    check(missing_kinematics_output.good(),
+          "open missing kinematics data manifest output");
+    missing_kinematics_output.write(
+        missing_kinematics_text.data(),
+        static_cast<std::streamsize>(missing_kinematics_text.size()));
+    check(missing_kinematics_output.good(),
+          "write missing kinematics data manifest");
+    missing_kinematics_output.close();
+    g1_lmm_model_bundle rejected_missing_kinematics;
+    check(!g1_lmm_model_load_and_verify(
+              rejected_missing_kinematics,
+              fixture.model.c_str(),
+              missing_kinematics_data.c_str(),
+              error,
+              static_cast<int>(sizeof(error))) &&
+              rejected_missing_kinematics.evaluation_allocation_count == 0 &&
+              std::strstr(error, "kinematics") != nullptr,
+          "missing data kinematics model rejects before evaluation allocation");
 
     const std::filesystem::path forged_data = fixture.root / "forged-data";
     std::filesystem::create_directories(forged_data);

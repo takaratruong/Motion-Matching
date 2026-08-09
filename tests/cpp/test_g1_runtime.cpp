@@ -1521,8 +1521,131 @@ static void test_unsafe_flat_bundle_rejected(const char* root)
           "noncanonical v1/v2 flat bundle is rejected before controller state");
 }
 
+static void test_flat_kinematics_model_contract(const char* root)
+{
+    namespace fs = std::filesystem;
+    char error[512] = {};
+    std::string manifest_path;
+    check(scene_join(
+              manifest_path, root, "manifest.json", error,
+              static_cast<int>(sizeof(error))),
+          error);
+    json_value document;
+    check(json_document_load(
+              document, manifest_path.c_str(), error,
+              static_cast<int>(sizeof(error))),
+          error);
+    const json_value* kinematics_model =
+        json_member(document, "kinematics_model");
+    std::string asset, sha256;
+    int size_bytes = 0;
+    check(kinematics_model != nullptr &&
+              scene_exact_keys(
+                  *kinematics_model, {"asset","sha256","size_bytes"},
+                  "flat kinematics_model", error,
+                  static_cast<int>(sizeof(error))) &&
+              scene_member_string(
+                  asset, *kinematics_model, "asset",
+                  "flat kinematics_model", error,
+                  static_cast<int>(sizeof(error))) &&
+              asset == "g1_29dof.xml" &&
+              scene_member_string(
+                  sha256, *kinematics_model, "sha256",
+                  "flat kinematics_model", error,
+                  static_cast<int>(sizeof(error))) &&
+              sha256 ==
+                  "749209c06a5c0023deb27f728420028b62b1f3092a22e24920183c1a897e4376" &&
+              scene_member_int(
+                  size_bytes, *kinematics_model, "size_bytes",
+                  "flat kinematics_model", error,
+                  static_cast<int>(sizeof(error))) &&
+              size_bytes == 26914,
+          "canonical v3 carries the exact authenticated kinematics model");
+
+    struct manifest_edit {
+        const char* needle;
+        const char* replacement;
+        const char* failure;
+    };
+    const manifest_edit edits[] = {
+        {
+            "  \"kinematics_model\": {\n"
+            "    \"asset\": \"g1_29dof.xml\",\n"
+            "    \"sha256\": \"749209c06a5c0023deb27f728420028b62b1f3092a22e24920183c1a897e4376\",\n"
+            "    \"size_bytes\": 26914\n"
+            "  },\n",
+            "",
+            "missing flat kinematics_model is rejected",
+        },
+        {
+            "    \"asset\": \"g1_29dof.xml\",\n",
+            "    \"asset\": \"g1_29dof.xml\",\n    \"extra\": 0,\n",
+            "extra flat kinematics_model key is rejected",
+        },
+        {
+            "\"asset\": \"g1_29dof.xml\"",
+            "\"asset\": \"wrong.xml\"",
+            "tampered flat kinematics model asset is rejected",
+        },
+        {
+            "749209c06a5c0023deb27f728420028b62b1f3092a22e24920183c1a897e4376",
+            "049209c06a5c0023deb27f728420028b62b1f3092a22e24920183c1a897e4376",
+            "tampered flat kinematics model digest is rejected",
+        },
+        {
+            "\"size_bytes\": 26914",
+            "\"size_bytes\": 26915",
+            "tampered flat kinematics model size is rejected",
+        },
+        {
+            "\"size_bytes\": 26914",
+            "\"size_bytes\": \"26914\"",
+            "wrong-type flat kinematics model size is rejected",
+        },
+    };
+    for (size_t index = 0; index < sizeof(edits) / sizeof(edits[0]); ++index) {
+        const fs::path tampered =
+            fs::path("/tmp/test_g1_runtime_kinematics_tamper_") /
+            std::to_string(index);
+        fs::remove_all(tampered);
+        fs::create_directories(tampered.parent_path());
+        fs::copy(root, tampered, fs::copy_options::recursive);
+        const fs::path tampered_manifest = tampered / "manifest.json";
+        std::ifstream input(tampered_manifest, std::ios::binary);
+        check(input.good(), "open flat kinematics manifest tamper input");
+        std::string text{
+            std::istreambuf_iterator<char>(input),
+            std::istreambuf_iterator<char>()};
+        const size_t position = text.find(edits[index].needle);
+        check(position != std::string::npos,
+              "locate flat kinematics manifest tamper target");
+        text.replace(
+            position, std::strlen(edits[index].needle),
+            edits[index].replacement);
+        std::ofstream output(
+            tampered_manifest, std::ios::binary | std::ios::trunc);
+        check(output.good(), "open flat kinematics manifest tamper output");
+        output.write(text.data(), static_cast<std::streamsize>(text.size()));
+        check(output.good(), "write flat kinematics manifest tamper");
+        output.close();
+
+        motion_pack_manifest rejected;
+        error[0] = '\0';
+        check(!motion_manifest_load_and_verify(
+                  rejected, tampered.c_str(), error,
+                  static_cast<int>(sizeof(error))),
+              edits[index].failure);
+        check(!rejected.flat_lmm_bundle &&
+                  std::strstr(error, "kinematics") != nullptr,
+              "kinematics rejection occurs before flat runtime state");
+        fs::remove_all(tampered);
+    }
+    fs::remove_all("/tmp/test_g1_runtime_kinematics_tamper_");
+}
+
 static void test_flat_bundle_adapter(const char* root)
 {
+    test_flat_kinematics_model_contract(root);
     char error[512] = {};
     motion_pack_manifest manifest;
     check(motion_manifest_load_and_verify(

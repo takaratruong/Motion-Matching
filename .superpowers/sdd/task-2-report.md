@@ -111,7 +111,7 @@ Task 2 now accepts only the Task 1 walk-only `g1-lmm-flat-data/v3` identity at
 `sonic/runs/g1-lmm-flat-60hz/data-v3`. The runtime pins and reauthenticates all
 three canonical SHA-256 values before controller state:
 
-- manifest: `db01f5bfb7641333b3e40ea4a5d1eb655131c7bc72681d2738fde2dbf9298709`;
+- manifest: `5b5c48ccbb1dbabdbf87842d8b033c15b307199d72a8d90e4e39208ba5382db1`;
 - `database.bin`: `13b368759c22ff3427d937a86fd9399cd6e80646e5f288e80da01bd988daaaad`;
 - `features.bin`: `7c35809e1dd5ea14bd56b0f607cb9da22b3464ebbece01a895050372530b40df`.
 
@@ -153,3 +153,31 @@ Fresh focused GREEN compiled with the strict C++17 warning contract and passed
 canonical v3, and v2 rejection modes), `test_g1_controller_state`, and
 `test_g1_lmm`; `controller.cpp` also passed its Raylib/Raygui syntax check.
 The accepted learned model is still absent, so no viewer was launched.
+
+## Canonical kinematics-model remediation (2026-08-09)
+
+The rebuilt Task 1 v3 manifest adds the required top-level
+`kinematics_model` receipt. The runtime now requires that member to be an exact
+three-key object with asset `g1_29dof.xml`, SHA-256
+`749209c06a5c0023deb27f728420028b62b1f3092a22e24920183c1a897e4376`,
+and integer `size_bytes` `26914`. No redundant state carrier was added: a
+successful `flat_lmm_bundle` parse already means the complete exact-key
+manifest, including this receipt, was authenticated.
+
+The final canonical raw-manifest pin is
+`5b5c48ccbb1dbabdbf87842d8b033c15b307199d72a8d90e4e39208ba5382db1`.
+The database and features pins remain unchanged. Missing receipt, extra object
+member, wrong asset, wrong digest, wrong size, and string-typed size negatives
+all reject with a kinematics-specific error before database/controller state.
+A semantic-whitespace change still fails the independent raw-manifest pin.
+
+RED was recorded first in both runtime and LMM tests at the unexpected incoming
+top-level key. After the structural parser change, all field negatives passed
+but the positive intentionally remained RED on the stale raw-manifest pin.
+Only after Task 1 committed the authenticated-byte rebuild as `88d676d` was the
+pin changed to the final digest and the canonical positive turned GREEN.
+
+Fresh follow-up verification passed the strict runtime, LMM, and
+controller-state binaries; the runtime covered its ordinary unit mode, the
+canonical 255-advance v3 replay, all kinematics/raw-manifest/size negatives,
+and the v2 rejection mode. Controller syntax and full Raylib link also passed.

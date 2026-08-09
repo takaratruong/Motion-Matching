@@ -104,7 +104,7 @@ static const char G1_RuntimeSurfaceSignature[] =
     "f151c2b1c7f0498880f76c37f48a47c46c48bcf58c1285863fabc9a09fd7993a";
 static const char G1_LMMFlatDataSchema[] = "g1-lmm-flat-data/v3";
 static const char G1_LMMFlatManifestSha256[] =
-    "db01f5bfb7641333b3e40ea4a5d1eb655131c7bc72681d2738fde2dbf9298709";
+    "5b5c48ccbb1dbabdbf87842d8b033c15b307199d72a8d90e4e39208ba5382db1";
 static const char G1_LMMFlatDatabaseSha256[] =
     "13b368759c22ff3427d937a86fd9399cd6e80646e5f288e80da01bd988daaaad";
 static const char G1_LMMFlatFeaturesSha256[] =
@@ -671,6 +671,12 @@ static inline bool flat_motion_manifest_parse_and_verify(
     char* error,
     const int capacity)
 {
+    const json_value* kinematics_model =
+        json_member(document, "kinematics_model");
+    if (kinematics_model == NULL)
+        return scene_error(
+            error, capacity,
+            "flat kinematics_model is required");
     if (!scene_exact_keys(document,
             {"schema","output_fps","trajectory_horizons",
              "feature_dimensions","feature_names","feature_weights",
@@ -678,9 +684,31 @@ static inline bool flat_motion_manifest_parse_and_verify(
              "terrain_features","database_frames","total_clips",
              "source_count","dimensions","skeleton","range_count","ranges",
              "continuity","time_filters","contact","contact_observations",
-             "sources","validation","status","artifacts"},
+             "kinematics_model","sources","validation","status","artifacts"},
             "flat motion manifest", error, capacity))
         return false;
+
+    std::string kinematics_asset, kinematics_sha256;
+    int kinematics_size_bytes = 0;
+    if (!scene_exact_keys(
+            *kinematics_model, {"asset","sha256","size_bytes"},
+            "flat kinematics_model", error, capacity) ||
+        !scene_member_string(
+            kinematics_asset, *kinematics_model, "asset",
+            "flat kinematics_model", error, capacity) ||
+        kinematics_asset != "g1_29dof.xml" ||
+        !scene_member_string(
+            kinematics_sha256, *kinematics_model, "sha256",
+            "flat kinematics_model", error, capacity) ||
+        kinematics_sha256 !=
+            "749209c06a5c0023deb27f728420028b62b1f3092a22e24920183c1a897e4376" ||
+        !scene_member_int(
+            kinematics_size_bytes, *kinematics_model, "size_bytes",
+            "flat kinematics_model", error, capacity) ||
+        kinematics_size_bytes != 26914)
+        return scene_error(
+            error, capacity,
+            "flat kinematics_model identity changed");
 
     motion_pack_manifest candidate;
     candidate.flat_lmm_bundle = true;

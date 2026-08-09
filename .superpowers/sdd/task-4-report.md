@@ -211,3 +211,17 @@ source rows once without a seam. The learned recurrent LMM acceptance contract
 remains a 600-tick transactional interactive gate and is not bounded by latent
 table row count. No accepted Task 3 model is published, so this migration did
 not launch the viewer or claim the deferred 600-tick interactive result.
+
+## Kinematics-model data gate remediation (2026-08-09)
+
+Because the LMM loader internally invokes the flat-data parser before model
+artifact parsing or evaluation allocation, it now inherits the exact Task 1
+`kinematics_model` receipt gate. A copied canonical data directory with that
+top-level field removed rejects with zero evaluation allocations and a
+kinematics-specific error. The positive synthetic model dynamically binds the
+new observed raw-manifest digest; no model-binding constant or accepted model
+artifact was synthesized. The deferred learned 600-tick viewer gate remains
+unchanged and was not launched.
+
+Fresh strict `test_g1_lmm`, `test_g1_runtime`, and
+`test_g1_controller_state` runs passed, as did controller syntax and link.
