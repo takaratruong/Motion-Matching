@@ -34,7 +34,7 @@ struct motion_source_record {
 };
 struct artifact_reference {
     std::string path,schema,sha256;
-    int version=0,dimensions=0;
+    int version=0,dimensions=0,size_bytes=0;
     std::vector<std::string> columns;
 };
 struct surface_contract {
@@ -336,6 +336,28 @@ static inline bool scene_verify_sha(
     return true;
 }
 
+static inline bool scene_verify_size(
+    const std::string& path, const int expected,
+    char* error, const int capacity)
+{
+    if (expected <= 0)
+        return scene_error(error, capacity,
+            "%s: invalid expected size", path.c_str());
+    FILE* file = std::fopen(path.c_str(), "rb");
+    if (file == NULL)
+        return scene_error(error, capacity, "%s: cannot open", path.c_str());
+    const bool seek_failed = std::fseek(file, 0, SEEK_END) != 0;
+    const long observed = seek_failed ? -1 : std::ftell(file);
+    const bool close_failed = std::fclose(file) != 0;
+    if (observed < 0 || close_failed)
+        return scene_error(error, capacity, "%s: cannot size", path.c_str());
+    if (observed != static_cast<long>(expected))
+        return scene_error(error, capacity,
+            "%s: size mismatch (expected %d, got %ld)",
+            path.c_str(), expected, observed);
+    return true;
+}
+
 static inline bool scene_verify_sha(
     const char* path, const std::string& expected,
     char* error, const int capacity)
@@ -631,6 +653,7 @@ static inline bool flat_artifact_reference_parse(
         return scene_error(
             error, capacity, "flat artifact '%s' is invalid", name);
     }
+    output.size_bytes = size_bytes;
     return true;
 }
 
@@ -1236,6 +1259,11 @@ static inline bool flat_motion_manifest_parse_and_verify(
                     error, capacity) ||
         !scene_join(features_path, root, candidate.matching_features.path,
                     error, capacity) ||
+        !scene_verify_size(database_path, candidate.database.size_bytes,
+                           error, capacity) ||
+        !scene_verify_size(features_path,
+                           candidate.matching_features.size_bytes,
+                           error, capacity) ||
         !scene_verify_sha(database_path, candidate.database.sha256,
                           error, capacity) ||
         !scene_verify_sha(features_path, candidate.matching_features.sha256,

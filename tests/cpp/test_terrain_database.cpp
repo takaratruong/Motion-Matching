@@ -259,9 +259,18 @@ static void test_rotation_continuity_is_range_safe()
     fill_source_database(db, 3);
     const quat jump = quat_from_angle_axis(
         0.30f, vec3(1.0f, 0.0f, 0.0f));
+    db.bone_rotations(1, 0) = jump;
+    db.bone_rotations(2, 0) = jump;
+    char error[256] = {};
+    CHECK(!database_rotation_continuity_validate(
+        db, 0.25f, error, static_cast<int>(sizeof(error))));
+    CHECK(std::strstr(error, "rotation discontinuity") != nullptr);
+    CHECK(std::strstr(error, "bone=0") != nullptr);
+
+    db.bone_rotations(1, 0) = quat();
+    db.bone_rotations(2, 0) = quat();
     db.bone_rotations(1, 1) = jump;
     db.bone_rotations(2, 1) = jump;
-    char error[256] = {};
     CHECK(!database_rotation_continuity_validate(
         db, 0.25f, error, static_cast<int>(sizeof(error))));
     CHECK(std::strstr(error, "rotation discontinuity") != nullptr);

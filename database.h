@@ -233,7 +233,7 @@ static inline bool database_rotation_continuity_validate(
             return false;
         }
         for (int frame = start + 1; frame < stop; ++frame) {
-            for (int bone = 1; bone < db.nbones(); ++bone) {
+            for (int bone = 0; bone < db.nbones(); ++bone) {
                 const float step = quat_angle_between(
                     db.bone_rotations(frame - 1, bone),
                     db.bone_rotations(frame, bone));

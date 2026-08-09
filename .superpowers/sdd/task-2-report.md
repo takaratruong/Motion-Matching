@@ -79,3 +79,28 @@ tests, and Python bytecode validation of the runtime-log checker.
 
 Only Task 2 source/tests and this report are staged; concurrent Task 1 and
 Task 3 edits in the shared worktree are excluded.
+
+## Independent-review remediation (2026-08-09)
+
+The continuity gate now evaluates all 31 local rotations, including bone 0
+(`Simulation`). The 600-frame ordinary replay uses the same complete bone set,
+so its joint-step evidence cannot mirror the former root omission. A focused
+root-only `0.30 rad` tamper failed RED because the validator started at bone 1;
+after the correction it rejects with `bone=0`, while discontinuities exactly
+at retained-range boundaries remain admissible.
+
+The flat adapter now retains each manifest artifact `size_bytes` receipt and
+compares it with the actual `database.bin` and `features.bin` file sizes before
+SHA-256 authentication. The real-v2 replay test copies the immutable bundle,
+changes only the database size receipt by one byte, and requires a size-mismatch
+rejection. This negative failed RED because the parser previously discarded the
+field and passed GREEN after size authentication was added.
+
+Fresh focused verification directly compiled the terrain-database,
+support-matching, and G1-runtime C++ tests under the strict C++17 warning
+contract. All three source tests passed; the canonical v2 600-frame replay also
+passed with complete 31-bone continuity evidence and the new size-only negative.
+The missing chunk-server and route-CLI executables were directly compiled into
+the expected narrow test location, after which the focused Python command and
+chunk-server suites ran 41 tests: 39 passed and the two guarded external-terrain
+tests skipped because `SONIC_TERRAIN_DIR` was not supplied.

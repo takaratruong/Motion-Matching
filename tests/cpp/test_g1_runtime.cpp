@@ -7,6 +7,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <string>
 
@@ -1598,7 +1601,7 @@ static void test_flat_bundle_adapter(const char* root)
         }
         check(g1_pose_diagnostic_is_finite(result.projected),
               "600-frame flat replay keeps a finite pose");
-        for (int bone = 1; bone < G1_BoneCount; ++bone) {
+        for (int bone = 0; bone < G1_BoneCount; ++bone) {
             const float joint_step = quat_angle_between(
                 previous(bone), state.bone_rotations(bone));
             if (joint_step > maximum_joint_step) {
@@ -1629,6 +1632,44 @@ static void test_flat_bundle_adapter(const char* root)
     }
     check(maximum_joint_step <= 0.25f,
           "600-frame flat ordinary replay joint step stays within 0.25 rad");
+
+    namespace fs = std::filesystem;
+    const fs::path tampered = "/tmp/test_g1_runtime_size_tamper";
+    fs::remove_all(tampered);
+    fs::copy(root, tampered, fs::copy_options::recursive);
+    const fs::path tampered_manifest = tampered / "manifest.json";
+    std::ifstream manifest_input(tampered_manifest, std::ios::binary);
+    check(manifest_input.good(), "open flat manifest for size-only tamper");
+    std::string manifest_text{
+        std::istreambuf_iterator<char>(manifest_input),
+        std::istreambuf_iterator<char>()};
+    const std::uintmax_t database_size = fs::file_size(tampered / "database.bin");
+    const std::string size_receipt =
+        "\"size_bytes\": " + std::to_string(database_size);
+    const size_t size_position = manifest_text.find(size_receipt);
+    check(size_position != std::string::npos,
+          "locate database size receipt for size-only tamper");
+    manifest_text.replace(
+        size_position,
+        size_receipt.size(),
+        "\"size_bytes\": " + std::to_string(database_size + 1));
+    std::ofstream manifest_output(
+        tampered_manifest, std::ios::binary | std::ios::trunc);
+    check(manifest_output.good(), "open flat manifest size-only tamper output");
+    manifest_output.write(
+        manifest_text.data(), static_cast<std::streamsize>(manifest_text.size()));
+    check(manifest_output.good(), "write flat manifest size-only tamper");
+    manifest_output.close();
+
+    motion_pack_manifest rejected = manifest;
+    error[0] = '\0';
+    check(!motion_manifest_load_and_verify(
+              rejected, tampered.c_str(), error,
+              static_cast<int>(sizeof(error))),
+          "flat manifest size-only tamper is rejected");
+    check(std::strstr(error, "size") != nullptr,
+          "flat manifest size-only tamper reports the size mismatch");
+    fs::remove_all(tampered);
 }
 
 int main(int argc, char** argv)
