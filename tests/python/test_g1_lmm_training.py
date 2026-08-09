@@ -21,6 +21,7 @@ from resources.g1_lmm.dataset import (
     range_safe_windows,
 )
 from resources.g1_lmm.models import Compressor, Decompressor, Projector, Stepper
+from resources.g1_lmm import training as g1_lmm_training
 from resources.g1_lmm.training import (
     TrainingConfig,
     TrainingGateError,
@@ -1190,6 +1191,263 @@ print(json.dumps({'observed': observed, 'final': os.environ.get('CUBLAS_WORKSPAC
             )
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("CUBLAS_WORKSPACE_CONFIG", completed.stderr)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+class G1LmmCompiledCudaTrainingTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.device = torch.device("cuda:0")
+        g1_lmm_training._configure_determinism(8128, cls.device)
+        cls.dimensions = G1LmmDimensions()
+        cls.parents, target, ground = _orange_duck_loss_fixture(frames=64)
+        cls.parents_tuple = tuple(int(parent) for parent in cls.parents)
+        cls.ground_rows = {
+            name: values.to(cls.device) for name, values in ground.items()
+        }
+        generator = torch.Generator(device=cls.device)
+        generator.manual_seed(9917)
+        cls.compressor_rows = torch.randn(
+            64,
+            cls.dimensions.compressor_input,
+            generator=generator,
+            device=cls.device,
+        )
+        cls.feature_rows = torch.randn(
+            64,
+            cls.dimensions.features,
+            generator=generator,
+            device=cls.device,
+        )
+        cls.output_mean = target.mean(dim=0).to(cls.device)
+        cls.output_std = torch.full(
+            (cls.dimensions.decompressor_output,),
+            0.03,
+            device=cls.device,
+        )
+        torch.manual_seed(4411)
+        torch.cuda.manual_seed_all(4411)
+        cls.compressor = Compressor(cls.dimensions).to(cls.device)
+        cls.decompressor = Decompressor(cls.dimensions).to(cls.device)
+        cls.initial_state = {
+            f"compressor.{name}": value.detach().clone()
+            for name, value in cls.compressor.state_dict().items()
+        }
+        cls.initial_state.update(
+            {
+                f"decompressor.{name}": value.detach().clone()
+                for name, value in cls.decompressor.state_dict().items()
+            }
+        )
+        cls.kernel = g1_lmm_training._build_decompressor_training_kernel(
+            compressor=cls.compressor,
+            decompressor=cls.decompressor,
+            compressor_rows=cls.compressor_rows,
+            feature_rows=cls.feature_rows,
+            output_mean=cls.output_mean,
+            output_std=cls.output_std,
+            ground_rows=cls.ground_rows,
+            parents=cls.parents_tuple,
+            dt=1.0 / 60.0,
+            device=cls.device,
+        )
+        starts = torch.arange(400, device=cls.device).reshape(100, 4) % 63
+        cls.schedule = torch.stack((starts, starts + 1), dim=-1)
+
+    def setUp(self):
+        self._restore_initial_state()
+
+    def _restore_initial_state(self):
+        compressor_state = {
+            name.removeprefix("compressor."): value
+            for name, value in self.initial_state.items()
+            if name.startswith("compressor.")
+        }
+        decompressor_state = {
+            name.removeprefix("decompressor."): value
+            for name, value in self.initial_state.items()
+            if name.startswith("decompressor.")
+        }
+        self.compressor.load_state_dict(compressor_state)
+        self.decompressor.load_state_dict(decompressor_state)
+        self.output_std.fill_(0.03)
+        self.compressor.zero_grad(set_to_none=True)
+        self.decompressor.zero_grad(set_to_none=True)
+
+    def _eager_loss(self, batch):
+        encoded = self.compressor(self.compressor_rows[batch])
+        decoded = (
+            self.decompressor(
+                torch.cat((self.feature_rows[batch], encoded), dim=-1)
+            )
+            * self.output_std
+            + self.output_mean
+        )
+        return orange_duck_decompressor_losses(
+            decoded,
+            encoded,
+            parents=self.parents,
+            dt=1.0 / 60.0,
+            **{name: values[batch] for name, values in self.ground_rows.items()},
+        )["total"]
+
+    def _parameter_digest_after_100_steps(self):
+        self._restore_initial_state()
+        optimizer = torch.optim.AdamW(
+            [*self.compressor.parameters(), *self.decompressor.parameters()],
+            lr=1.0e-3,
+            amsgrad=True,
+            weight_decay=1.0e-3,
+        )
+        for batch in self.schedule:
+            g1_lmm_training._decompressor_training_step(
+                self.kernel, batch, optimizer
+            )
+        digest = hashlib.sha256()
+        for module_name, module in (
+            ("compressor", self.compressor),
+            ("decompressor", self.decompressor),
+        ):
+            for name, value in module.state_dict().items():
+                digest.update(f"{module_name}.{name}".encode("utf-8"))
+                digest.update(
+                    value.detach().cpu().contiguous().numpy().tobytes(order="C")
+                )
+        return digest.hexdigest()
+
+    def test_compiled_kernel_matches_eager_loss_and_parameter_gradients(self):
+        batch = self.schedule[0]
+        eager_loss = self._eager_loss(batch)
+        parameters = tuple(
+            [*self.compressor.parameters(), *self.decompressor.parameters()]
+        )
+        eager_gradients = torch.autograd.grad(eager_loss, parameters)
+
+        self.kernel.begin_step()
+        compiled_loss = self.kernel(batch)
+        compiled_gradients = torch.autograd.grad(compiled_loss, parameters)
+
+        torch.testing.assert_close(compiled_loss, eager_loss, rtol=1.0e-6, atol=1.0e-6)
+        for compiled, eager in zip(compiled_gradients, eager_gradients):
+            torch.testing.assert_close(compiled, eager, rtol=2.0e-4, atol=5.0e-6)
+        self.assertTrue(self.kernel.compiled)
+        self.assertEqual(
+            self.kernel.name,
+            "torch-compile-reduce-overhead/fullgraph/v1",
+        )
+
+    def test_compiled_kernel_has_repeatable_100_step_parameter_sha(self):
+        first = self._parameter_digest_after_100_steps()
+        second = self._parameter_digest_after_100_steps()
+        self.assertEqual(first, second)
+
+    def test_compiled_kernel_rejects_nonfinite_loss_before_optimizer_update(self):
+        optimizer = torch.optim.AdamW(
+            [*self.compressor.parameters(), *self.decompressor.parameters()],
+            lr=1.0e-3,
+            amsgrad=True,
+            weight_decay=1.0e-3,
+        )
+        before = [
+            parameter.detach().clone() for parameter in self.compressor.parameters()
+        ]
+        self.output_std.fill_(float("nan"))
+
+        with self.assertRaisesRegex(FloatingPointError, "non-finite"):
+            g1_lmm_training._decompressor_training_step(
+                self.kernel, self.schedule[0], optimizer
+            )
+
+        self.assertEqual(len(optimizer.state), 0)
+        for expected, actual in zip(before, self.compressor.parameters()):
+            torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+    def test_real_decompressor_loop_uses_kernel_and_keeps_eager_audits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_directory = root / "data"
+            staging = root / "staging"
+            staging.mkdir()
+            _write_flat_training_bundle(data_directory)
+            bundle = load_training_bundle(data_directory)
+            arrays = build_training_arrays(bundle)
+            observed = {}
+
+            class FakeKernel:
+                compiled = True
+                name = "test-compiled-kernel"
+
+                def __init__(self, parameters):
+                    self.parameters = tuple(parameters)
+                    self.begin_count = 0
+                    self.call_count = 0
+
+                def begin_step(self):
+                    self.begin_count += 1
+
+                def __call__(self, batch):
+                    self.call_count += 1
+                    return sum(
+                        parameter.square().mean() for parameter in self.parameters
+                    )
+
+            def fake_builder(**kwargs):
+                observed["parents"] = kwargs["parents"]
+                observed["device"] = kwargs["device"]
+                observed["kernel"] = FakeKernel(
+                    [
+                        *kwargs["compressor"].parameters(),
+                        *kwargs["decompressor"].parameters(),
+                    ]
+                )
+                return observed["kernel"]
+
+            original_loss = g1_lmm_training.orange_duck_decompressor_losses
+            with (
+                mock.patch.object(
+                    g1_lmm_training,
+                    "_build_decompressor_training_kernel",
+                    side_effect=fake_builder,
+                ) as builder,
+                mock.patch.object(
+                    g1_lmm_training,
+                    "orange_duck_decompressor_losses",
+                    wraps=original_loss,
+                ) as eager_loss,
+                mock.patch.object(
+                    g1_lmm_training,
+                    "_decode_reconstruction_metrics",
+                    return_value={"accepted": False},
+                ),
+            ):
+                stage = g1_lmm_training._train_decompressor_stage(
+                    staging,
+                    bundle,
+                    arrays,
+                    TrainingConfig(
+                        device="cuda:0",
+                        batch_size=4,
+                        decompressor_steps=1,
+                        overfit_steps=1,
+                        stepper_steps=1,
+                        projector_steps=1,
+                        withheld_frames=64,
+                        withheld_halo=2,
+                    ),
+                    np.array([100], dtype=np.int32),
+                    np.array([164], dtype=np.int32),
+                )
+
+            builder.assert_called_once()
+            self.assertIsInstance(observed["parents"], tuple)
+            self.assertEqual(observed["parents"], tuple(int(x) for x in bundle.parents))
+            self.assertEqual(observed["device"], torch.device("cuda:0"))
+            self.assertEqual(observed["kernel"].begin_count, 1)
+            self.assertEqual(observed["kernel"].call_count, 1)
+            self.assertEqual(eager_loss.call_count, 2)
+            self.assertEqual(
+                stage.training_metrics["training_kernel"], "test-compiled-kernel"
+            )
 
 
 if __name__ == "__main__":

@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import struct
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, NamedTuple, Sequence
+from typing import Callable, Iterable, NamedTuple, Sequence
 
 import numpy as np
 
@@ -378,7 +379,7 @@ def orange_duck_decompressor_losses(
 ) -> dict[str, torch.Tensor]:
     """Compute the exact denormalized Orange Duck decompressor objective."""
 
-    if not np.isfinite(dt) or dt <= 0.0:
+    if not math.isfinite(dt) or dt <= 0.0:
         raise ValueError("decompressor loss dt must be positive and finite")
     if prediction.ndim != 3 or latent.ndim != 3 or prediction.shape[:2] != latent.shape[:2]:
         raise ValueError("decompressor prediction and latent must be [batch, window, channels]")
@@ -513,6 +514,132 @@ def orange_duck_decompressor_losses(
     }
     terms["total"] = sum(terms.values())
     return terms
+
+
+@dataclass(frozen=True)
+class _DecompressorTrainingKernel:
+    objective: Callable[[torch.Tensor], torch.Tensor]
+    compiled: bool
+    name: str
+
+    def begin_step(self) -> None:
+        if self.compiled:
+            torch.compiler.cudagraph_mark_step_begin()
+
+    def __call__(self, batch: torch.Tensor) -> torch.Tensor:
+        return self.objective(batch)
+
+
+def _build_decompressor_training_kernel(
+    *,
+    compressor: Compressor,
+    decompressor: Decompressor,
+    compressor_rows: torch.Tensor,
+    feature_rows: torch.Tensor,
+    output_mean: torch.Tensor,
+    output_std: torch.Tensor,
+    ground_rows: dict[str, torch.Tensor],
+    parents: tuple[int, ...],
+    dt: float,
+    device: torch.device,
+) -> _DecompressorTrainingKernel:
+    """Build the fixed-shape training-only objective after eager validation."""
+
+    if device.type not in {"cpu", "cuda"}:
+        raise ValueError(f"unsupported decompressor training device: {device}")
+    if (
+        type(parents) is not tuple
+        or not parents
+        or any(type(parent) is not int for parent in parents)
+    ):
+        raise TypeError("compiled decompressor parents must be a non-empty tuple[int, ...]")
+    if not math.isfinite(dt) or dt <= 0.0:
+        raise ValueError("compiled decompressor dt must be positive and finite")
+    if compressor_rows.ndim != 2 or feature_rows.ndim != 2:
+        raise ValueError("compiled decompressor row tables must be rank two")
+    frames = compressor_rows.shape[0]
+    if feature_rows.shape[0] != frames:
+        raise ValueError("compiled decompressor row tables must have equal frame counts")
+    if output_mean.ndim != 1 or output_std.shape != output_mean.shape:
+        raise ValueError("compiled decompressor output normalization is malformed")
+    required_ground = {
+        "local_positions",
+        "local_rotation_xy",
+        "local_velocities",
+        "local_angular_velocities",
+        "character_positions",
+        "character_transforms",
+        "character_velocities",
+        "character_angular_velocities",
+        "root_velocity",
+        "root_angular_velocity",
+        "contacts",
+    }
+    if set(ground_rows) != required_ground:
+        raise ValueError("compiled decompressor ground-row fields are incomplete")
+    tensors = {
+        "compressor_rows": compressor_rows,
+        "feature_rows": feature_rows,
+        "output_mean": output_mean,
+        "output_std": output_std,
+        **ground_rows,
+    }
+    for name, values in tensors.items():
+        if values.device != device:
+            raise ValueError(f"compiled decompressor {name} is on the wrong device")
+    for name, values in ground_rows.items():
+        if values.shape[0] != frames:
+            raise ValueError(f"compiled decompressor {name} has the wrong frame count")
+    if ground_rows["local_positions"].shape[-2] != len(parents):
+        raise ValueError("compiled decompressor parents do not match the skeleton")
+
+    def objective(batch: torch.Tensor) -> torch.Tensor:
+        encoded = compressor(compressor_rows[batch])
+        decoded = (
+            decompressor(torch.cat((feature_rows[batch], encoded), dim=-1))
+            * output_std
+            + output_mean
+        )
+        return orange_duck_decompressor_losses(
+            decoded,
+            encoded,
+            parents=parents,
+            dt=dt,
+            **{name: values[batch] for name, values in ground_rows.items()},
+        )["total"]
+
+    if device.type == "cuda":
+        return _DecompressorTrainingKernel(
+            objective=torch.compile(
+                objective,
+                mode="reduce-overhead",
+                fullgraph=True,
+            ),
+            compiled=True,
+            name="torch-compile-reduce-overhead/fullgraph/v1",
+        )
+    return _DecompressorTrainingKernel(
+        objective=objective,
+        compiled=False,
+        name="eager/v1",
+    )
+
+
+def _decompressor_training_step(
+    kernel: _DecompressorTrainingKernel,
+    batch: torch.Tensor,
+    optimizer: torch.optim.Optimizer,
+) -> float:
+    """Run one fail-closed optimizer step against the training-only kernel."""
+
+    kernel.begin_step()
+    optimizer.zero_grad(set_to_none=True)
+    loss = kernel(batch)
+    if not torch.isfinite(loss):
+        raise FloatingPointError("decompressor training loss became non-finite")
+    loss.backward()
+    optimizer.step()
+    return float(loss.item())
 
 
 def _legacy_autoencoder_normalization(
@@ -861,26 +988,29 @@ def _train_decompressor_stage(
             **{name: values[batch] for name, values in ground_rows.items()},
         )
 
-    def objective(batch: torch.Tensor) -> torch.Tensor:
-        return objective_terms(batch)["total"]
-
     audit_windows = torch.as_tensor(windows[: min(len(windows), 512)], device=device)
     with torch.no_grad():
         initial_terms = objective_terms(audit_windows)
         initial_loss = float(initial_terms["total"].item())
+    training_kernel = _build_decompressor_training_kernel(
+        compressor=compressor,
+        decompressor=decompressor,
+        compressor_rows=compressor_rows,
+        feature_rows=feature_rows,
+        output_mean=output_mean,
+        output_std=output_std,
+        ground_rows=ground_rows,
+        parents=tuple(int(parent) for parent in bundle.parents),
+        dt=config.dt,
+        device=device,
+    )
     last_loss = initial_loss
     for _ in range(config.decompressor_steps):
         selected = windows[
             generator.integers(0, len(windows), size=config.batch_size, endpoint=False)
         ]
         batch = torch.as_tensor(selected, device=device)
-        optimizer.zero_grad(set_to_none=True)
-        loss = objective(batch)
-        if not torch.isfinite(loss):
-            raise FloatingPointError("decompressor training loss became non-finite")
-        loss.backward()
-        optimizer.step()
-        last_loss = float(loss.item())
+        last_loss = _decompressor_training_step(training_kernel, batch, optimizer)
 
     latent_parts = []
     prediction_parts = []
@@ -957,6 +1087,7 @@ def _train_decompressor_stage(
             },
             "objective": "orange-duck-denormalized-weighted/v1",
             "steps": config.decompressor_steps,
+            "training_kernel": training_kernel.name,
             "windows": len(windows),
         },
         gate=gate,
