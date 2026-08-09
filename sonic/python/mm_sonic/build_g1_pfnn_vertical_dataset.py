@@ -50,6 +50,7 @@ _SPLIT_FIELDS = {
     "y",
     "phase",
     "clip_id",
+    "sequence_lane",
     "center_frame_120hz",
     "terrain_class",
     "terrain_sha256",
@@ -136,6 +137,7 @@ class VerticalSplitArrays:
     y: np.ndarray
     phase: np.ndarray
     clip_id: np.ndarray
+    sequence_lane: np.ndarray
     center_frame_120hz: np.ndarray
     terrain_class: np.ndarray
     terrain_sha256: np.ndarray
@@ -148,6 +150,7 @@ class VerticalSplitArrays:
             "y": ((count, OUTPUT_LAYOUT.size), np.dtype(np.float32)),
             "phase": ((count,), np.dtype(np.float32)),
             "clip_id": ((count,), np.dtype("<U128")),
+            "sequence_lane": ((count,), np.dtype("<U16")),
             "center_frame_120hz": ((count,), np.dtype(np.int64)),
             "terrain_class": ((count,), np.dtype("<U10")),
             "terrain_sha256": ((count,), np.dtype("<U64")),
@@ -163,6 +166,11 @@ class VerticalSplitArrays:
             object.__setattr__(self, name, value)
         if count < 1:
             raise ValueError("vertical split must contain at least one row")
+        if not np.isin(
+            self.sequence_lane,
+            ("motion", *(f"idle_phase_{index}" for index in range(8))),
+        ).all():
+            raise ValueError("vertical split sequence lane is invalid")
         if not np.isin(self.terrain_class, ("flat", "ascent", "descent", "transition")).all():
             raise ValueError("vertical split terrain_class is invalid")
         if any(_SHA256_RE.fullmatch(str(value)) is None for value in self.terrain_sha256):
@@ -287,6 +295,9 @@ def _split_arrays(rows: list[tuple[PFNNTrainingWindow, int, str, bool]]) -> Vert
         y=np.stack([row.y for row, _, _, _ in rows]).astype(np.float32),
         phase=np.asarray([row.phase for row, _, _, _ in rows], dtype=np.float32),
         clip_id=np.asarray([row.clip_id for row, _, _, _ in rows], dtype="<U128"),
+        sequence_lane=np.asarray(
+            [row.sequence_lane for row, _, _, _ in rows], dtype="<U16"
+        ),
         center_frame_120hz=np.asarray([center for _, center, _, _ in rows], dtype=np.int64),
         terrain_class=np.asarray([row.terrain_class for row, _, _, _ in rows], dtype="<U10"),
         terrain_sha256=np.asarray([terrain for _, _, terrain, _ in rows], dtype="<U64"),

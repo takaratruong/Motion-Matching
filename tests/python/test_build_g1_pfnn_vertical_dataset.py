@@ -108,6 +108,8 @@ class BuildG1PFNNVerticalDatasetTest(unittest.TestCase):
         train = dataset.splits["train"]
         validation = dataset.splits["validation"]
         self.assertGreater(len(train.phase), 0)
+        self.assertEqual(train.sequence_lane.shape, train.phase.shape)
+        self.assertTrue(np.all(train.sequence_lane == "motion"))
         self.assertEqual(np.count_nonzero(train.mirrored), len(train.phase) // 2)
         self.assertFalse(np.any(validation.mirrored))
         self.assertTrue(np.all((train.center_frame_120hz >= 520) & (train.center_frame_120hz < 664)))
