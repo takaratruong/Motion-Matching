@@ -6,6 +6,7 @@ import numpy as np
 
 from mm_sonic.retarget_pfnn_bvh_g1 import (
     frame_slice,
+    postprocess_motion,
     prepare_pfnn_bvh,
     retarget_slices,
     scale_pfnn_frames,
@@ -253,6 +254,35 @@ class PFNNBVHRetargetTests(unittest.TestCase):
                 frame_count=10,
                 warmup_frames=-1,
             )
+
+    def test_source_grounding_preserves_the_gmr_world_pose(self) -> None:
+        class Motion:
+            def __init__(self) -> None:
+                self.root_pos = np.array([[0.0, 0.0, 1.0], [1.0, 2.0, 1.5]])
+
+        class Project:
+            @staticmethod
+            def postprocess(motion):
+                motion.root_pos = motion.root_pos.copy()
+                motion.root_pos[:, 2] -= 0.5
+                return motion
+
+        source = Motion()
+        preserved, offset = postprocess_motion(
+            source, project_driver=Project(), grounding="source"
+        )
+        np.testing.assert_array_equal(
+            preserved.root_pos, [[0.0, 0.0, 1.0], [1.0, 2.0, 1.5]]
+        )
+        self.assertEqual(offset, 0.0)
+
+        flattened, offset = postprocess_motion(
+            Motion(), project_driver=Project(), grounding="flat"
+        )
+        np.testing.assert_array_equal(
+            flattened.root_pos, [[0.0, 0.0, 0.5], [1.0, 2.0, 1.0]]
+        )
+        self.assertEqual(offset, 0.5)
 
 
 if __name__ == "__main__":

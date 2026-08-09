@@ -329,6 +329,21 @@ def g1_joint_limits(model: object) -> np.ndarray:
     return np.stack([item[3] for item in joints], axis=0)
 
 
+def postprocess_motion(
+    motion: object, *, project_driver: object, grounding: str
+) -> tuple[object, float]:
+    """Apply the legacy flat shift or preserve GMR's source-world trajectory."""
+
+    if grounding == "source":
+        return motion, 0.0
+    if grounding != "flat":
+        raise ValueError("grounding must be 'flat' or 'source'")
+    root_z_before = np.asarray(_field(motion, "root_pos"), dtype=np.float64)[:, 2].copy()
+    processed = project_driver.postprocess(motion)
+    root_z_after = np.asarray(_field(processed, "root_pos"), dtype=np.float64)[:, 2]
+    return processed, float(np.median(root_z_before - root_z_after))
+
+
 def _save_motion(
     output: Path,
     motion: object,
@@ -340,6 +355,7 @@ def _save_motion(
     joint_limits: np.ndarray,
     start_frame: int,
     warmup_frames: int,
+    grounding: str,
 ) -> Path:
     root_pos = np.asarray(_field(motion, "root_pos"), dtype=np.float64)
     root_quat = np.asarray(_field(motion, "root_quat"), dtype=np.float64)
@@ -386,6 +402,7 @@ def _save_motion(
         "joint_names": list(G1_JOINT_NAMES),
         "root_quaternion_order": "xyzw",
         "grounding_offset_m": float(grounding_offset),
+        "grounding": grounding,
         "pfnn_position_scale": PFNN_POSITION_SCALE,
     }
     _atomic_bytes(
@@ -404,6 +421,7 @@ def retarget_sample(
     start_frame: int = 0,
     frame_count: int | None = None,
     warmup_frames: int = 0,
+    grounding: str = "flat",
 ) -> dict[str, object]:
     """Run pinned GMR sequentially on every native source frame."""
 
@@ -495,10 +513,10 @@ def retarget_sample(
                 fps=source_receipt.fps,
                 engine="gmr",
             )
-            root_z_before = motion.root_pos[:, 2].copy()
-            motion = project_driver.postprocess(motion)
-            grounding_offset = float(
-                np.median(root_z_before - np.asarray(motion.root_pos)[:, 2])
+            motion, grounding_offset = postprocess_motion(
+                motion,
+                project_driver=project_driver,
+                grounding=grounding,
             )
             validate_g1_motion(
                 motion,
@@ -516,6 +534,7 @@ def retarget_sample(
                 joint_limits=limits,
                 start_frame=start_frame,
                 warmup_frames=actual_warmup_frames,
+                grounding=grounding,
             )
     finally:
         if sys.path and sys.path[0] == str(gmr_root):
@@ -531,6 +550,7 @@ def retarget_sample(
         "fps": source_receipt.fps,
         "output_sha256": _sha256(Path(output)),
         "grounding_offset_m": grounding_offset,
+        "grounding": grounding,
     }
 
 
@@ -543,6 +563,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-frame", type=int, default=0)
     parser.add_argument("--frame-count", type=int)
     parser.add_argument("--warmup-frames", type=int, default=0)
+    parser.add_argument("--grounding", choices=("flat", "source"), default="flat")
     return parser
 
 
@@ -556,6 +577,7 @@ def main() -> None:
         start_frame=args.start_frame,
         frame_count=args.frame_count,
         warmup_frames=args.warmup_frames,
+        grounding=args.grounding,
     )
     print(json.dumps(result, sort_keys=True))
 
