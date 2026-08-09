@@ -25,7 +25,11 @@ from mm_sonic.terrain_oracle.canonical import ISAACLAB_JOINT_NAMES
 from mm_sonic.terrain_oracle.canonical import CanonicalTerrainMesh
 from mm_sonic.terrain_oracle.contact import CanonicalMeshQuery
 from mm_sonic.terrain_oracle.math3d import RigidTransform
-from mm_sonic.terrain_pfnn.dataset import PFNNShardDataset, normalize_pfnn_input
+from mm_sonic.terrain_pfnn.dataset import (
+    PFNNShardDataset,
+    denormalize_pfnn_input,
+    normalize_pfnn_input,
+)
 from mm_sonic.terrain_pfnn.features import PFNNTrainingWindow
 from mm_sonic.terrain_pfnn.layout import (
     CONTACT_ORDER,
@@ -688,6 +692,30 @@ class TerrainPFNNDatasetTest(unittest.TestCase):
         for field in ("previous_body_position", "previous_body_velocity"):
             np.testing.assert_allclose(sample["x"][INPUT_LAYOUT[field]], -0.1)
         np.testing.assert_allclose(sample["x"][INPUT_LAYOUT["trajectory_position"]], -1.0)
+
+    def test_input_normalization_round_trip_restores_recurrent_body_scale(self) -> None:
+        raw = np.linspace(-2.0, 3.0, INPUT_LAYOUT.size, dtype=np.float32)
+        mean = np.linspace(-0.3, 0.4, INPUT_LAYOUT.size, dtype=np.float32)
+        std = np.linspace(0.2, 1.7, INPUT_LAYOUT.size, dtype=np.float32)
+        normalized = normalize_pfnn_input(raw, mean, std)
+        restored = denormalize_pfnn_input(normalized, mean, std)
+        np.testing.assert_allclose(restored, raw, rtol=2.0e-6, atol=2.0e-6)
+
+        for invalid, expected in (
+            (np.zeros(INPUT_LAYOUT.size - 1), "288 features"),
+            (np.full(INPUT_LAYOUT.size, np.nan), "finite"),
+        ):
+            with self.subTest(invalid=expected):
+                with self.assertRaisesRegex(ValueError, expected):
+                    denormalize_pfnn_input(invalid, mean, std)
+        for invalid_std in (
+            np.zeros(INPUT_LAYOUT.size),
+            np.full(INPUT_LAYOUT.size, -1.0),
+            np.full(INPUT_LAYOUT.size, np.nan),
+        ):
+            with self.subTest(invalid_std=invalid_std[0]):
+                with self.assertRaisesRegex(ValueError, "x_std|finite"):
+                    denormalize_pfnn_input(raw, mean, invalid_std)
 
     def test_refuses_nonempty_destination(self) -> None:
         output = self.root / "dataset"

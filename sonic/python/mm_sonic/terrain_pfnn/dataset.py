@@ -161,11 +161,9 @@ def _validate_manifest_contract(manifest: Mapping[str, object]) -> None:
         raise ValueError("dataset source-set digest mismatch")
 
 
-def normalize_pfnn_input(
+def _validated_input_normalization_values(
     x: object, x_mean: object, x_std: object
-) -> np.ndarray:
-    """Normalize a raw PFNN input and apply the approved recurrent-body scale."""
-
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     value = np.asarray(x, dtype=np.float32)
     mean = np.asarray(x_mean, dtype=np.float32)
     std = np.asarray(x_std, dtype=np.float32)
@@ -177,10 +175,29 @@ def normalize_pfnn_input(
         raise ValueError("x and normalization arrays must be finite")
     if np.any(std <= 0.0):
         raise ValueError("x_std must be positive")
+    return value, mean, std
+
+
+def normalize_pfnn_input(
+    x: object, x_mean: object, x_std: object
+) -> np.ndarray:
+    """Normalize a raw PFNN input and apply the approved recurrent-body scale."""
+
+    value, mean, std = _validated_input_normalization_values(x, x_mean, x_std)
     normalized = np.ascontiguousarray((value - mean) / std, dtype=np.float32)
     for field in ("previous_body_position", "previous_body_velocity"):
         normalized[..., INPUT_LAYOUT[field]] *= np.float32(0.1)
     return normalized
+
+
+def denormalize_pfnn_input(
+    x: object, x_mean: object, x_std: object
+) -> np.ndarray:
+    value, mean, std = _validated_input_normalization_values(x, x_mean, x_std)
+    normalized = np.ascontiguousarray(value, dtype=np.float32).copy()
+    for field in ("previous_body_position", "previous_body_velocity"):
+        normalized[..., INPUT_LAYOUT[field]] /= np.float32(0.1)
+    return np.ascontiguousarray(normalized * std + mean, dtype=np.float32)
 
 
 def normalize_pfnn_output(
@@ -446,6 +463,7 @@ class PFNNShardDataset:
 
 __all__ = [
     "PFNNShardDataset",
+    "denormalize_pfnn_input",
     "normalize_pfnn_input",
     "normalize_pfnn_output",
     "pfnn_input_sha256",
