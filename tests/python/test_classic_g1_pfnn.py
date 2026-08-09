@@ -101,6 +101,12 @@ class ClassicG1PFNNTests(unittest.TestCase):
             ).train_source,
             "released-pfnn",
         )
+        self.assertEqual(
+            _parser().parse_args(
+                ["--dataset", "d", "--model-path", "m", "--output", "o"]
+            ).runtime_seed,
+            "flat",
+        )
 
     def test_native_g1_validation_holds_out_last_present_variant_per_family(self) -> None:
         clips = np.asarray(

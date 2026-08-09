@@ -592,7 +592,10 @@ def train(arguments: argparse.Namespace) -> Path:
     runtime_seed = choose_runtime_seed(
         seed_dataset,
         kinematics.joint_limits,
-        require_terrain=arguments.train_source == "released-pfnn",
+        require_terrain=(
+            arguments.train_source == "released-pfnn"
+            and arguments.runtime_seed == "terrain"
+        ),
     )
     phase_q99 = training_phase_advance_q99(seed_dataset)
     normalization = {
@@ -718,6 +721,9 @@ def _parser() -> argparse.ArgumentParser:
         "--train-source",
         choices=("grail", "mixed", "released-pfnn"),
         default="grail",
+    )
+    parser.add_argument(
+        "--runtime-seed", choices=("flat", "terrain"), default="flat"
     )
     return parser
 
