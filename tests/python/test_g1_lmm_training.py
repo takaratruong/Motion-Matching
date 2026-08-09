@@ -139,6 +139,11 @@ def _write_flat_training_bundle(
         "source_count": 1,
         "range_count": len(range_starts),
         "dimensions": {"bones": 31, "features": 31, "contacts": 2},
+        "kinematics_model": {
+            "asset": "g1_29dof.xml",
+            "sha256": "749209c06a5c0023deb27f728420028b62b1f3092a22e24920183c1a897e4376",
+            "size_bytes": 26914,
+        },
         "ranges": [
             {
                 "start": int(start),
@@ -857,6 +862,36 @@ class G1LmmTrainingTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "source receipt keys"):
                 load_training_bundle(extra_source_key)
+
+    def test_loader_requires_exact_canonical_kinematics_descriptor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cases = (
+                ("missing", None),
+                ("asset", "g1.xml"),
+                ("sha256", "0" * 64),
+                ("size_bytes", 26913),
+                ("extra", True),
+            )
+            for name, value in cases:
+                data_directory = root / name
+                manifest = _write_flat_training_bundle(data_directory)
+                if name == "missing":
+                    del manifest["kinematics_model"]
+                elif name == "extra":
+                    manifest["kinematics_model"]["unexpected"] = value
+                else:
+                    manifest["kinematics_model"][name] = value
+                (data_directory / "manifest.json").write_text(
+                    json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+                    + "\n",
+                    encoding="utf-8",
+                )
+                with (
+                    self.subTest(name=name),
+                    self.assertRaisesRegex(ValueError, "kinematics model"),
+                ):
+                    load_training_bundle(data_directory)
 
     def test_all_stage_stops_after_failed_decompressor_gate_without_manifest(self):
         with tempfile.TemporaryDirectory() as directory:

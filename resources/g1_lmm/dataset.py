@@ -46,6 +46,11 @@ _CANONICAL_V3_TIME_FILTERS = {
     "contact_median_frames": 6,
     "forward_terrain_path_rows": 121,
 }
+_CANONICAL_V3_KINEMATICS_MODEL = {
+    "asset": "g1_29dof.xml",
+    "sha256": "749209c06a5c0023deb27f728420028b62b1f3092a22e24920183c1a897e4376",
+    "size_bytes": 26914,
+}
 
 
 def _json_exact(actual, expected) -> bool:
@@ -266,6 +271,10 @@ def load_training_bundle(data_directory: str | Path) -> TrainingBundle:
     )
     if dimensions != G1LmmDimensions() or manifest.get("feature_dimensions") != 31:
         raise ValueError("data manifest does not have the exact G1 LMM dimensions")
+    if not _json_exact(
+        manifest.get("kinematics_model"), _CANONICAL_V3_KINEMATICS_MODEL
+    ):
+        raise ValueError("canonical v3 kinematics model descriptor changed")
 
     database = _BinaryCursor(_artifact_payload(root, manifest, "database.bin"), "database.bin")
     positions = _read_array2(database, "<f4", (3,), "positions")
