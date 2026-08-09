@@ -60,6 +60,7 @@ struct g1_runtime_step_result
     int selected_database_frame = -1;
     int query_range = -1;
     float query[31] = {};
+    float query_normalized[31] = {};
     terrain_centerline_snapshot terrain;
     traversability_diagnostics traversal;
     motion_match_pose_diagnostic raw_selected;
@@ -77,7 +78,7 @@ struct g1_runtime_frame_feasibility
 
 struct g1_runtime_config
 {
-    float dt = 0.04f;
+    float dt = 1.0f / 60.0f;
     float trajectory_sample_time = 1.0f / 3.0f;
     float inertialize_blending_halflife = 0.10f;
     float desired_velocity_change_threshold = 50.0f;
@@ -896,9 +897,10 @@ static inline bool g1_runtime_step_internal(
         return scene_error(
             error, capacity, "runtime step requires a unit heading");
     }
-    if (!terrain_float_is_finite(config.dt) || config.dt <= 0.0f) {
+    if (!g1_dt_is_exact_60_hz(config.dt)) {
         return scene_error(
-            error, capacity, "runtime step config dt must be positive");
+            error, capacity,
+            "runtime step config dt must be exact binary32 60 Hz");
     }
     if (!g1_runtime_config_is_valid(config)) {
         return scene_error(
@@ -1198,6 +1200,18 @@ static inline bool g1_runtime_step_internal(
     if (!motion_match_query_is_finite_31d(query)) {
         return scene_error(
             error, capacity, "expected exactly 31 finite query values");
+    }
+    array1d<float> query_normalized(db.nfeatures());
+    for (int index = 0; index < db.nfeatures(); ++index) {
+        query_normalized(index) = normalize_query_feature(
+            query(index),
+            db.features_offset(index),
+            db.features_scale(index));
+    }
+    if (!motion_match_query_is_finite_31d(query_normalized)) {
+        return scene_error(
+            error, capacity,
+            "expected exactly 31 finite normalized query values");
     }
 
     const int prior_index = next.frame_index;
@@ -1632,6 +1646,7 @@ static inline bool g1_runtime_step_internal(
     result.query_range = query_range;
     for (int index = 0; index < 31; ++index) {
         result.query[index] = query(index);
+        result.query_normalized[index] = query_normalized(index);
     }
     result.terrain = terrain_query_snapshot;
     result.traversal = traversal;

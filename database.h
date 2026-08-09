@@ -11,6 +11,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <string.h>
+#include <utility>
 
 //--------------------------------------
 
@@ -50,6 +51,11 @@ struct database
     int ncontacts() const { return contact_states.cols; }
 };
 
+static inline uint32_t feature_float_bits(float value);
+static inline bool feature_float_is_finite(float value);
+static inline bool feature_float_is_positive_finite(float value);
+void database_build_bounds(database& db);
+
 void database_load(database& db, const char* filename)
 {
     FILE* f = fopen(filename, "rb");
@@ -81,6 +87,95 @@ void database_save_matching_features(const database& db, const char* filename)
     fclose(f);
 }
 
+static inline bool database_read_exact(
+    FILE* file, void* output, const size_t bytes)
+{
+    return bytes == 0 || fread(output, 1, bytes, file) == bytes;
+}
+
+static inline bool database_read_u32_le(FILE* file, uint32_t& output)
+{
+    unsigned char bytes[4] = {};
+    if (!database_read_exact(file, bytes, sizeof(bytes))) return false;
+    output = static_cast<uint32_t>(bytes[0]) |
+        (static_cast<uint32_t>(bytes[1]) << 8) |
+        (static_cast<uint32_t>(bytes[2]) << 16) |
+        (static_cast<uint32_t>(bytes[3]) << 24);
+    return true;
+}
+
+static inline bool database_load_matching_features_checked(
+    database& db,
+    const char* filename,
+    char* error,
+    const int capacity)
+{
+    FILE* file = filename == NULL ? NULL : fopen(filename, "rb");
+    if (file == NULL) {
+        if (error != NULL && capacity > 0) {
+            snprintf(error, static_cast<size_t>(capacity),
+                     "cannot open matching features");
+        }
+        return false;
+    }
+    uint32_t rows = 0, columns = 0, offsets = 0, scales = 0;
+    const bool header_ok = database_read_u32_le(file, rows) &&
+        database_read_u32_le(file, columns) &&
+        rows == static_cast<uint32_t>(db.nframes()) && columns == 31 &&
+        rows <= static_cast<uint32_t>(INT32_MAX);
+    array2d<float> values;
+    array1d<float> loaded_offsets;
+    array1d<float> loaded_scales;
+    bool ok = header_ok;
+    if (ok) {
+        values.resize(static_cast<int>(rows), static_cast<int>(columns));
+        ok = database_read_exact(
+            file,
+            values.data,
+            static_cast<size_t>(rows) * columns * sizeof(float)) &&
+            database_read_u32_le(file, offsets) && offsets == columns;
+    }
+    if (ok) {
+        loaded_offsets.resize(static_cast<int>(offsets));
+        ok = database_read_exact(
+            file, loaded_offsets.data,
+            static_cast<size_t>(offsets) * sizeof(float)) &&
+            database_read_u32_le(file, scales) && scales == columns;
+    }
+    if (ok) {
+        loaded_scales.resize(static_cast<int>(scales));
+        ok = database_read_exact(
+            file, loaded_scales.data,
+            static_cast<size_t>(scales) * sizeof(float)) &&
+            fgetc(file) == EOF && !ferror(file);
+    }
+    fclose(file);
+    for (int row = 0; ok && row < values.rows; ++row) {
+        for (int column = 0; column < values.cols; ++column) {
+            ok = feature_float_is_finite(values(row, column));
+            if (!ok) break;
+        }
+    }
+    for (int column = 0; ok && column < loaded_offsets.size; ++column) {
+        ok = feature_float_is_finite(loaded_offsets(column)) &&
+            (feature_float_is_positive_finite(loaded_scales(column)) ||
+             feature_float_bits(loaded_scales(column)) ==
+                 feature_float_bits(FLT_MAX));
+    }
+    if (!ok) {
+        if (error != NULL && capacity > 0) {
+            snprintf(error, static_cast<size_t>(capacity),
+                     "matching features are malformed or incompatible");
+        }
+        return false;
+    }
+    db.features = std::move(values);
+    db.features_offset = std::move(loaded_offsets);
+    db.features_scale = std::move(loaded_scales);
+    database_build_bounds(db);
+    return true;
+}
+
 // When we add an offset to a frame in the database there is a chance
 // it will go out of the relevant range so here we can clamp it to 
 // the last frame of that range.
@@ -105,6 +200,62 @@ static inline uint32_t feature_float_bits(const float value)
     uint32_t bits = 0;
     memcpy(&bits, &value, sizeof(bits));
     return bits;
+}
+
+static inline bool database_rotation_continuity_validate(
+    const database& db,
+    const float maximum_step,
+    char* error,
+    const int capacity,
+    float* observed_maximum = NULL)
+{
+    if (!feature_float_is_positive_finite(maximum_step) ||
+        db.bone_rotations.rows != db.nframes() ||
+        db.bone_rotations.cols != db.nbones() || db.nbones() <= 1 ||
+        db.range_starts.size <= 0 ||
+        db.range_starts.size != db.range_stops.size)
+    {
+        if (error != NULL && capacity > 0) {
+            snprintf(error, static_cast<size_t>(capacity),
+                     "database rotation continuity inputs are invalid");
+        }
+        return false;
+    }
+    float candidate_maximum = 0.0f;
+    for (int range = 0; range < db.nranges(); ++range) {
+        const int start = db.range_starts(range);
+        const int stop = db.range_stops(range);
+        if (start < 0 || stop <= start || stop > db.nframes()) {
+            if (error != NULL && capacity > 0) {
+                snprintf(error, static_cast<size_t>(capacity),
+                         "database range %d is invalid", range);
+            }
+            return false;
+        }
+        for (int frame = start + 1; frame < stop; ++frame) {
+            for (int bone = 1; bone < db.nbones(); ++bone) {
+                const float step = quat_angle_between(
+                    db.bone_rotations(frame - 1, bone),
+                    db.bone_rotations(frame, bone));
+                if (!feature_float_is_finite(step) ||
+                    step > maximum_step)
+                {
+                    if (error != NULL && capacity > 0) {
+                        snprintf(
+                            error,
+                            static_cast<size_t>(capacity),
+                            "database rotation discontinuity range=%d "
+                            "frame=%d bone=%d step=%.9g limit=%.9g",
+                            range, frame, bone, step, maximum_step);
+                    }
+                    return false;
+                }
+                candidate_maximum = maxf(candidate_maximum, step);
+            }
+        }
+    }
+    if (observed_maximum != NULL) *observed_maximum = candidate_maximum;
+    return true;
 }
 
 static inline bool feature_float_is_finite(const float value)
@@ -569,18 +720,21 @@ void compute_bone_velocity_feature(database& db, int& offset, int bone, float we
     offset += 3;
 }
 
-static inline void database_trajectory_horizons(int out[3])
+static inline void database_trajectory_horizons(
+    int out[3], const float fps)
 {
-    out[0] = 8;
-    out[1] = 17;
-    out[2] = 25;
+    assert(isfinite(fps) && fps > 0.0f);
+    out[0] = int(roundf(fps / 3.0f));
+    out[1] = int(roundf(2.0f * fps / 3.0f));
+    out[2] = int(roundf(fps));
 }
 
 // Compute the trajectory at one-third, two-thirds, and one second in the future
-void compute_trajectory_position_feature(database& db, int& offset, float weight = 1.0f)
+void compute_trajectory_position_feature(
+    database& db, int& offset, const float fps, float weight = 1.0f)
 {
     int horizons[3];
-    database_trajectory_horizons(horizons);
+    database_trajectory_horizons(horizons, fps);
 
     for (int i = 0; i < db.nframes(); i++)
     {
@@ -606,10 +760,11 @@ void compute_trajectory_position_feature(database& db, int& offset, float weight
 }
 
 // Same for direction
-void compute_trajectory_direction_feature(database& db, int& offset, float weight = 1.0f)
+void compute_trajectory_direction_feature(
+    database& db, int& offset, const float fps, float weight = 1.0f)
 {
     int horizons[3];
-    database_trajectory_horizons(horizons);
+    database_trajectory_horizons(horizons, fps);
 
     for (int i = 0; i < db.nframes(); i++)
     {
@@ -729,7 +884,8 @@ void database_build_matching_features(
     const int left_foot_bone,
     const int right_foot_bone,
     const int hip_bone,
-    const float feature_weight_terrain = 0.0f)
+    const float feature_weight_terrain = 0.0f,
+    const float fps = 60.0f)
 {
     if (left_foot_bone < 0 || left_foot_bone >= db.nbones() ||
         right_foot_bone < 0 || right_foot_bone >= db.nbones() ||
@@ -754,7 +910,8 @@ void database_build_matching_features(
         }
     }
 
-    if (db.terrain_features.rows != db.nframes() ||
+    if (!feature_float_is_positive_finite(fps) ||
+        db.terrain_features.rows != db.nframes() ||
         db.terrain_features.cols != 4)
     {
         return;
@@ -780,8 +937,10 @@ void database_build_matching_features(
     compute_bone_velocity_feature(db, offset, left_foot_bone, feature_weight_foot_velocity);
     compute_bone_velocity_feature(db, offset, right_foot_bone, feature_weight_foot_velocity);
     compute_bone_velocity_feature(db, offset, hip_bone, feature_weight_hip_velocity);
-    compute_trajectory_position_feature(db, offset, feature_weight_trajectory_positions);
-    compute_trajectory_direction_feature(db, offset, feature_weight_trajectory_directions);
+    compute_trajectory_position_feature(
+        db, offset, fps, feature_weight_trajectory_positions);
+    compute_trajectory_direction_feature(
+        db, offset, fps, feature_weight_trajectory_directions);
     compute_terrain_feature(db, offset, feature_weight_terrain);
     
     assert(offset == nfeatures);

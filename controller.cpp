@@ -975,6 +975,11 @@ int main(void)
         fprintf(stderr, "G1 motion manifest error: %s\n", artifact_error);
         return 2;
     }
+    if (motion_manifest.flat_lmm_bundle)
+    {
+        requested_terrain_weight = 1.0f;
+        effective_terrain_weight = 1.0f;
+    }
 
     std::string database_path;
     std::string feature_path;
@@ -988,22 +993,24 @@ int main(void)
         !scene_join(
             feature_path,
             terrain_directory,
-            motion_manifest.terrain_features.path,
+            motion_manifest.flat_lmm_bundle
+                ? motion_manifest.matching_features.path
+                : motion_manifest.terrain_features.path,
             artifact_error,
             static_cast<int>(sizeof(artifact_error))) ||
-        !scene_join(
+        (!motion_manifest.flat_lmm_bundle && !scene_join(
             support_path,
             terrain_directory,
             motion_manifest.terrain_support.path,
             artifact_error,
-            static_cast<int>(sizeof(artifact_error))))
+            static_cast<int>(sizeof(artifact_error)))))
     {
         fprintf(stderr, "G1 motion path error: %s\n", artifact_error);
         return 2;
     }
 
     terrain_feature_set terrain_rows;
-    if (!terrain_features_load(
+    if (!motion_manifest.flat_lmm_bundle && !terrain_features_load(
             terrain_rows,
             feature_path.c_str(),
             artifact_error,
@@ -1021,8 +1028,32 @@ int main(void)
         fprintf(stderr, "G1 database error: %s\n", artifact_error);
         return 2;
     }
-    if (terrain_rows.values.rows != db.nframes() ||
-        terrain_rows.values.cols != 4)
+    if (motion_manifest.flat_lmm_bundle &&
+        !database_rotation_continuity_validate(
+            db,
+            0.25f,
+            artifact_error,
+            static_cast<int>(sizeof(artifact_error))))
+    {
+        fprintf(stderr, "G1 flat continuity error: %s\n", artifact_error);
+        return 2;
+    }
+    if (motion_manifest.flat_lmm_bundle)
+    {
+        if (!database_load_matching_features_checked(
+                db,
+                feature_path.c_str(),
+                artifact_error,
+                static_cast<int>(sizeof(artifact_error))))
+        {
+            fprintf(stderr, "G1 matching feature error: %s\n", artifact_error);
+            return 2;
+        }
+        db.terrain_features.resize(db.nframes(), 4);
+        db.terrain_features.zero();
+    }
+    else if (terrain_rows.values.rows != db.nframes() ||
+             terrain_rows.values.cols != 4)
     {
         fprintf(
             stderr,
@@ -1033,7 +1064,10 @@ int main(void)
             terrain_rows.values.cols);
         return 2;
     }
-    db.terrain_features = terrain_rows.values;
+    else
+    {
+        db.terrain_features = terrain_rows.values;
+    }
     if (!g1_skeleton_validate(
             db, artifact_error, static_cast<int>(sizeof(artifact_error))))
     {
@@ -1046,17 +1080,21 @@ int main(void)
         fprintf(stderr, "G1 IK geometry error: %s\n", artifact_error);
         return 2;
     }
-    database_build_matching_features(
-        db,
-        feature_weight_foot_position,
-        feature_weight_foot_velocity,
-        feature_weight_hip_velocity,
-        feature_weight_trajectory_positions,
-        feature_weight_trajectory_directions,
-        G1_LeftAnkle,
-        G1_RightAnkle,
-        G1_Hips,
-        effective_terrain_weight);
+    if (!motion_manifest.flat_lmm_bundle)
+    {
+        database_build_matching_features(
+            db,
+            feature_weight_foot_position,
+            feature_weight_foot_velocity,
+            feature_weight_hip_velocity,
+            feature_weight_trajectory_positions,
+            feature_weight_trajectory_directions,
+            G1_LeftAnkle,
+            G1_RightAnkle,
+            G1_Hips,
+            effective_terrain_weight,
+            motion_manifest.output_fps);
+    }
     if (!g1_matching_features_validate(
             db, artifact_error, static_cast<int>(sizeof(artifact_error))))
     {
@@ -1078,12 +1116,18 @@ int main(void)
     }
 
     scene_catalog catalog;
-    if (!scene_catalog_load(
+    if (!(motion_manifest.flat_lmm_bundle
+            ? flat_scene_catalog_build(
+                catalog,
+                motion_manifest,
+                artifact_error,
+                static_cast<int>(sizeof(artifact_error)))
+            : scene_catalog_load(
             catalog,
             terrain_directory,
             motion_manifest,
             artifact_error,
-            static_cast<int>(sizeof(artifact_error))))
+            static_cast<int>(sizeof(artifact_error)))))
     {
         fprintf(stderr, "G1 scene index error: %s\n", artifact_error);
         return 2;
@@ -1104,14 +1148,20 @@ int main(void)
     }
 
     scene_pack active_scene;
-    if (!scene_pack_load(
+    if (!(motion_manifest.flat_lmm_bundle
+            ? flat_scene_pack_build(
+                active_scene,
+                motion_manifest,
+                artifact_error,
+                static_cast<int>(sizeof(artifact_error)))
+            : scene_pack_load(
             active_scene,
             terrain_directory,
             motion_manifest,
             catalog,
             active_scene_index,
             artifact_error,
-            static_cast<int>(sizeof(artifact_error))))
+            static_cast<int>(sizeof(artifact_error)))))
     {
         fprintf(
             stderr,
@@ -1152,7 +1202,12 @@ int main(void)
     }
 
     terrain_support_set support_rows;
-    if (!terrain_support_load(
+    if (motion_manifest.flat_lmm_bundle)
+    {
+        support_rows.values.resize(db.nframes(), 3);
+        support_rows.values.zero();
+    }
+    else if (!terrain_support_load(
             support_rows,
             support_path.c_str(),
             db.nframes(),
@@ -1207,7 +1262,7 @@ int main(void)
         fprintf(stderr, "G1 terrain visualizer could not open a window\n");
         return 2;
     }
-    SetTargetFPS(25);
+    SetTargetFPS(60);
 
     int scene_generation = 0;
     int scene_reset_count = 1;
@@ -1218,7 +1273,9 @@ int main(void)
     bool controller_exit_requested = false;
     int controller_exit_code = 0;
 
-    Model terrain_model = LoadModel(active_scene.mesh_path.c_str());
+    Model terrain_model = motion_manifest.flat_lmm_bundle
+        ? LoadModelFromMesh(GenMeshPlane(64.0f, 64.0f, 1, 1))
+        : LoadModel(active_scene.mesh_path.c_str());
     auto model_has_allocation = [](const Model& model)
     {
         return model.meshes != NULL || model.materials != NULL ||
@@ -1240,19 +1297,24 @@ int main(void)
     auto scene_loader = [&](scene_pack& candidate, int index,
                             char* error, int capacity)
     {
-        return scene_pack_load(
-            candidate,
-            terrain_directory,
-            motion_manifest,
-            catalog,
-            index,
-            error,
-            capacity);
+        return motion_manifest.flat_lmm_bundle
+            ? (index == 0 && flat_scene_pack_build(
+                candidate, motion_manifest, error, capacity))
+            : scene_pack_load(
+                candidate,
+                terrain_directory,
+                motion_manifest,
+                catalog,
+                index,
+                error,
+                capacity);
     };
     auto model_loader = [&](Model& model, const char* path,
                             char* error, int capacity)
     {
-        model = LoadModel(path);
+        model = motion_manifest.flat_lmm_bundle
+            ? LoadModelFromMesh(GenMeshPlane(64.0f, 64.0f, 1, 1))
+            : LoadModel(path);
         const bool allocated = model_has_allocation(model);
         if (allocated) ++model_load_count;
         const bool ready = IsModelReady(model) && model.meshCount > 0;
@@ -1365,7 +1427,7 @@ int main(void)
     
     // Go
 
-    const float dt = 1.0f / 25.0f;
+    const float dt = 1.0f / 60.0f;
     const float trajectory_sample_time = 1.0f / 3.0f;
 
 #ifdef MM_DISCRETE
@@ -1797,6 +1859,8 @@ int main(void)
         const motion_match_pose_diagnostic rendered_diagnostic =
             runtime_result.projected;
         const slice1d<float> query(31, runtime_result.query);
+        const slice1d<float> query_normalized(
+            31, runtime_result.query_normalized);
 
         // Keep Holden's dormant learned matcher type-checked in the visual
         // translation unit. G1 never enables or exposes this branch; the
@@ -1922,9 +1986,15 @@ int main(void)
             return;
         }
         char query_bits_hex[31 * 8 + 1] = {};
+        char query_normalized_bits_hex[31 * 8 + 1] = {};
         if (!motion_match_query_bits_hex(
-                query_bits_hex, sizeof(query_bits_hex), query)) {
-            controlled_runtime_error("cannot serialize the finite 31D query");
+                query_bits_hex, sizeof(query_bits_hex), query) ||
+            !motion_match_query_bits_hex(
+                query_normalized_bits_hex,
+                sizeof(query_normalized_bits_hex),
+                query_normalized)) {
+            controlled_runtime_error(
+                "cannot serialize the finite raw/normalized 31D query");
             return;
         }
         motion_match_log_row log_row;
@@ -1934,6 +2004,7 @@ int main(void)
         log_row.mode = test_config.name;
         log_row.route = test_config.route;
         log_row.query_bits_hex = query_bits_hex;
+        log_row.query_normalized_bits_hex = query_normalized_bits_hex;
         log_row.query_database_frame = query_database_frame;
         log_row.query_range = query_range;
         log_row.selected_database_frame = selected_database_frame;
@@ -2571,7 +2642,8 @@ int main(void)
                     requested_terrain_weight,
                     effective_terrain_weight));
 
-        if (GuiButton(Rectangle{ 150, 230, 120, 20 }, "apply / rebuild"))
+        if (GuiButton(Rectangle{ 150, 230, 120, 20 }, "apply / rebuild") &&
+            !motion_manifest.flat_lmm_bundle)
         {
             database_build_matching_features(
                 db,
@@ -2583,7 +2655,8 @@ int main(void)
                 G1_LeftAnkle,
                 G1_RightAnkle,
                 G1_Hips,
-                requested_terrain_weight);
+                requested_terrain_weight,
+                motion_manifest.output_fps);
             if (!g1_matching_features_validate(
                     db,
                     artifact_error,

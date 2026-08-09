@@ -132,12 +132,21 @@ static inline G1LegConfig g1_right_leg_config()
         G1_RightAnkle, G1_RightToe);
 }
 
-static inline bool g1_dt_is_exact_25_hz(float dt)
+static inline bool g1_dt_is_exact_60_hz(float dt)
 {
     static_assert(sizeof(float) == sizeof(uint32_t),
                   "G1 timing contract requires binary32 storage");
     uint32_t bits = 0;
     std::memcpy(&bits, &dt, sizeof(bits));
-    // Exact binary32 encoding of 1.0f / 25.0f (0.04f).
-    return bits == UINT32_C(0x3d23d70a);
+    // Exact binary32 encoding of 1.0f / 60.0f.
+    return bits == UINT32_C(0x3c888889);
+}
+
+static inline bool g1_manifest_rate_compatible(float fps)
+{
+    static_assert(sizeof(float) == sizeof(uint32_t),
+                  "G1 timing contract requires binary32 storage");
+    uint32_t bits = 0;
+    std::memcpy(&bits, &fps, sizeof(bits));
+    return bits == UINT32_C(0x42700000);
 }

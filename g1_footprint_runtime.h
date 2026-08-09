@@ -231,7 +231,7 @@ static inline bool g1_foot_contact_schedule_build(
         range_starts.size != range_stops.size ||
         range_starts.data == NULL || range_stops.data == NULL ||
         current_frame < 0 ||
-        !g1_dt_is_exact_25_hz(dt) ||
+        !g1_dt_is_exact_60_hz(dt) ||
         !terrain_float_is_positive_normal(trajectory_sample_time)) {
         return g1_footprint_schedule_failure(
             output,

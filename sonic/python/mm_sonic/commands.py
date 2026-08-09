@@ -17,9 +17,9 @@ import numpy as np
 from .joints import ContractError
 
 
-SOURCE_RATE_HZ = 25
+SOURCE_RATE_HZ = 60
 TARGET_RATE_HZ = 50
-CHUNK_INTERVALS = 10
+CHUNK_INTERVALS = 24
 ROUTE_SPEED_MPS = 0.5
 COMMAND_SCRIPT_SCHEMA = "mm-sonic-command-script/v1"
 

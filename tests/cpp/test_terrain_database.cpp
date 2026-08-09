@@ -79,7 +79,7 @@ static void fill_source_database(database& db, int frames)
             db.bone_angular_velocities(frame, bone) = vec3();
         }
         db.bone_positions(frame, G1_Simulation) =
-            vec3(0.11f * f, 0.0f, 0.013f * f * f + 0.07f * f);
+            vec3(0.11f * f, 0.0f, 0.0013f * f * f + 0.007f * f);
         db.bone_rotations(frame, G1_Simulation) =
             quat_from_angle_axis(0.025f * f, vec3(0.0f, 1.0f, 0.0f));
 
@@ -125,8 +125,7 @@ static void fill_expected_raw_features(
         expected[offset++] = value.z;
     }
 
-    int horizons[3] = {};
-    database_trajectory_horizons(horizons);
+    const int horizons[3] = {20, 40, 60};
     for (int i = 0; i < 3; ++i) {
         const int future =
             frame + horizons[i] < db.range_stops(0)
@@ -216,15 +215,15 @@ static void test_zero_weight_is_exact_and_safe()
 static void test_builder_layout_and_real_horizons()
 {
     database db;
-    fill_source_database(db, 30);
+    fill_source_database(db, 61);
     build_features(db);
 
-    CHECK(db.features.rows == 30);
+    CHECK(db.features.rows == 61);
     CHECK(db.features.cols == 31);
     CHECK(db.features_offset.size == 31);
     CHECK(db.features_scale.size == 31);
 
-    const int frames_to_check[2] = {0, 28};
+    const int frames_to_check[2] = {0, 59};
     for (int frame_index = 0; frame_index < 2; ++frame_index) {
         const int frame = frames_to_check[frame_index];
         float expected[31] = {};
@@ -233,15 +232,48 @@ static void test_builder_layout_and_real_horizons()
             const float actual =
                 db.features(frame, dimension) * db.features_scale(dimension) +
                 db.features_offset(dimension);
-            CHECK(close_enough(actual, expected[dimension]));
+            if (!close_enough(actual, expected[dimension], 1e-6f)) {
+                std::fprintf(
+                    stderr,
+                    "parity frame=%d dimension=%d actual=%.9g expected=%.9g delta=%.9g\n",
+                    frame,
+                    dimension,
+                    actual,
+                    expected[dimension],
+                    std::fabs(actual - expected[dimension]));
+            }
+            CHECK(close_enough(actual, expected[dimension], 1e-6f));
         }
     }
 
     int horizons[3] = {};
-    database_trajectory_horizons(horizons);
-    CHECK(horizons[0] == 8);
-    CHECK(horizons[1] == 17);
-    CHECK(horizons[2] == 25);
+    database_trajectory_horizons(horizons, 60.0f);
+    CHECK(horizons[0] == 20);
+    CHECK(horizons[1] == 40);
+    CHECK(horizons[2] == 60);
+}
+
+static void test_rotation_continuity_is_range_safe()
+{
+    database db;
+    fill_source_database(db, 3);
+    const quat jump = quat_from_angle_axis(
+        0.30f, vec3(1.0f, 0.0f, 0.0f));
+    db.bone_rotations(1, 1) = jump;
+    db.bone_rotations(2, 1) = jump;
+    char error[256] = {};
+    CHECK(!database_rotation_continuity_validate(
+        db, 0.25f, error, static_cast<int>(sizeof(error))));
+    CHECK(std::strstr(error, "rotation discontinuity") != nullptr);
+
+    db.range_starts.resize(2);
+    db.range_stops.resize(2);
+    db.range_starts(0) = 0;
+    db.range_stops(0) = 1;
+    db.range_starts(1) = 1;
+    db.range_stops(1) = 3;
+    CHECK(database_rotation_continuity_validate(
+        db, 0.25f, error, static_cast<int>(sizeof(error))));
 }
 
 static void seed_matching_outputs(database& db)
@@ -953,6 +985,7 @@ int main()
 {
     test_zero_weight_is_exact_and_safe();
     test_builder_layout_and_real_horizons();
+    test_rotation_continuity_is_range_safe();
     test_builder_rejects_bad_terrain_before_mutation();
     test_builder_rejects_every_nonfinite_weight_before_mutation();
     test_positive_weight_flat_terrain_is_release_safe();

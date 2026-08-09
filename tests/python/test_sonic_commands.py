@@ -50,6 +50,15 @@ def f32_bits(value: float) -> int:
 
 
 class CommandValueTests(unittest.TestCase):
+    def test_g1_route_schedule_cli_uses_exact_60_hz_rate(self) -> None:
+        source = (
+            ROOT / "sonic" / "cpp" / "route_schedule_cli.cpp"
+        ).read_text(encoding="utf-8")
+        self.assertIn("const float g1_dt = 1.0f / 60.0f;", source)
+        self.assertEqual(source.count("g1_dt"), 4)
+        self.assertNotIn("0.04f", source)
+        self.assertIn('"source_rate_hz\\\":60', source)
+
     def test_commands_module_owns_the_only_public_command_type(self) -> None:
         self.assertIs(CoordinatorCommandSample, CommandSample)
         command = CommandSample(0, (0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0))
@@ -119,8 +128,8 @@ class CommandValueTests(unittest.TestCase):
         self.assertNotIn(b" ", encoded)
         decoded = json.loads(encoded)
         self.assertEqual(decoded["schema"], "mm-sonic-command-script/v1")
-        self.assertEqual(decoded["chunk_intervals"], 10)
-        self.assertEqual(decoded["source_rate_hz"], 25)
+        self.assertEqual(decoded["chunk_intervals"], 24)
+        self.assertEqual(decoded["source_rate_hz"], 60)
         self.assertEqual(decoded["target_rate_hz"], 50)
         self.assertEqual(decoded["chunk_count"], 30)
         self.assertEqual(decoded["duration_s"], 12.0)
@@ -131,7 +140,7 @@ class CommandValueTests(unittest.TestCase):
                 route_id="flat-12s",
                 commands=commands,
             ),
-            "8137b0a6d951da2a5ead427698479d490150e963c5a458cad11a766968de6d85",
+            "8cb01ff2398dac23df585b3970571c03d51215fe6ea25f662fbbc7462f765d9d",
         )
         self.assertEqual(hashlib.sha256(encoded).hexdigest(), command_script_sha256(
             scene_id="sonic-flat-baseline", route_id="flat-12s", commands=commands
@@ -449,7 +458,7 @@ class RouteParityTests(unittest.TestCase):
                 self.assertEqual(cpp["schema"], "mm-sonic-route-schedule/v1")
                 self.assertEqual(cpp["scene_id"], scene_id)
                 self.assertEqual(cpp["route_id"], route_id)
-                self.assertEqual(cpp["source_rate_hz"], 25)
+                self.assertEqual(cpp["source_rate_hz"], 60)
                 self.assertEqual(cpp["motion_frames"], len(python_frames))
                 self.assertEqual(len(cpp["frames"]), len(python_frames))
                 for expected, observed in zip(python_frames, cpp["frames"], strict=True):
@@ -468,18 +477,18 @@ class RouteParityTests(unittest.TestCase):
             frames = route_frame_schedule(route)
             commands = compile_route_commands(route)
             with self.subTest(scene_id=scene_id, route_id=route_id):
-                self.assertEqual(len(commands), math.ceil(len(frames) / 10))
+                self.assertEqual(len(commands), math.ceil(len(frames) / 24))
                 self.assertEqual([item.chunk_index for item in commands], list(range(len(commands))))
-                frame_dx = sum(item.velocity_holden[0] for item in frames) / 25.0
-                frame_dz = sum(item.velocity_holden[2] for item in frames) / 25.0
+                frame_dx = sum(item.velocity_holden[0] for item in frames) / 60.0
+                frame_dz = sum(item.velocity_holden[2] for item in frames) / 60.0
                 chunk_dx = sum(item.requested_velocity_mujoco[0] for item in commands) * 0.4
                 chunk_dz = -sum(item.requested_velocity_mujoco[1] for item in commands) * 0.4
                 self.assertAlmostEqual(chunk_dx, frame_dx, places=6)
                 self.assertAlmostEqual(chunk_dz, frame_dz, places=6)
-                if len(frames) % 10:
-                    final_source = frames[-(len(frames) % 10):]
-                    expected_x = sum(item.velocity_holden[0] for item in final_source) / 10.0
-                    expected_z = sum(item.velocity_holden[2] for item in final_source) / 10.0
+                if len(frames) % 24:
+                    final_source = frames[-(len(frames) % 24):]
+                    expected_x = sum(item.velocity_holden[0] for item in final_source) / 24.0
+                    expected_z = sum(item.velocity_holden[2] for item in final_source) / 24.0
                     self.assertAlmostEqual(commands[-1].requested_velocity_mujoco[0], expected_x)
                     self.assertAlmostEqual(commands[-1].requested_velocity_mujoco[1], -expected_z)
                 for previous, command in zip(commands, commands[1:]):

@@ -5237,11 +5237,11 @@ G1ClearanceStatus g1_swing_clearance_validate(
             diagnostic.output, diagnostic.capacity,
             "G1 swing validation requires the fixed named-leg configuration");
     }
-    if (!g1_dt_is_exact_25_hz(dt)) {
+    if (!g1_dt_is_exact_60_hz(dt)) {
         return g1_clearance_error(
             G1ClearanceInvalidInput,
             diagnostic.output, diagnostic.capacity,
-            "G1 swing validation requires exact 25 Hz dt");
+            "G1 swing validation requires exact 60 Hz dt");
     }
     for (int index = 0; index < 4; ++index) {
         if (!g1_ik_vec3_is_runtime_value(

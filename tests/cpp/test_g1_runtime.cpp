@@ -47,6 +47,20 @@ static bool same_quat_bits(quat first, quat second)
            same_float_bits(first.z, second.z);
 }
 
+static void test_g1_rate_contract_is_exact_60_hz()
+{
+    const g1_runtime_config config;
+    check(same_float_bits(config.dt, 1.0f / 60.0f),
+          "G1 runtime default is exact binary32 60 Hz");
+    check(g1_dt_is_exact_60_hz(1.0f / 60.0f),
+          "exact binary32 60 Hz G1 dt is accepted");
+    check(!g1_dt_is_exact_60_hz(1.0f / 25.0f),
+          "stale exact binary32 25 Hz G1 dt is rejected");
+    check(g1_manifest_rate_compatible(60.0f) &&
+              !g1_manifest_rate_compatible(25.0f),
+          "only the exact 60 Hz G1 manifest rate is compatible");
+}
+
 static void make_database(database& db)
 {
     static const int parents[G1_BoneCount] = {
@@ -604,6 +618,19 @@ static void test_direct_runtime_boundary_and_advance()
     check(motion_match_query_is_finite_31d(
               slice1d<float>(31, result.query)),
           "runtime publishes exactly 31 finite query values");
+    check(motion_match_query_is_finite_31d(
+              slice1d<float>(31, result.query_normalized)),
+          "runtime publishes exactly 31 finite normalized query values");
+    for (int dimension = 0; dimension < 31; ++dimension) {
+        const float independently_normalized = normalize_query_feature(
+            result.query[dimension],
+            db.features_offset(dimension),
+            db.features_scale(dimension));
+        check(std::fabs(
+                  result.query_normalized[dimension] -
+                  independently_normalized) <= 1e-6f,
+              "runtime normalized query has 1e-6 parity with raw query");
+    }
     check(same_vec3_bits(
               state.command.intent.requested_velocity,
               request.requested_velocity_holden) &&
@@ -1062,7 +1089,7 @@ static float yaw_degrees(quat q)
 }
 
 // The turn profile caps the desired heading presented to prediction and
-// application at 120 deg/s. At the 0.04 s step this is exactly 4.8 degrees;
+// application at 120 deg/s. At the 1/60 s step this is exactly 2 degrees;
 // at the 1/3 s trajectory sample it is exactly 40 degrees per sample.
 static void test_turn_profile_caps_current_and_future_heading()
 {
@@ -1091,16 +1118,16 @@ static void test_turn_profile_caps_current_and_future_heading()
               result, state, db, support, scene, request, config, error,
               static_cast<int>(sizeof(error))),
           error);
-    check(nearly(yaw_degrees(state.desired_rotation), 4.8f),
-          "current desired heading is capped to 4.8 degrees");
+    check(nearly(yaw_degrees(state.desired_rotation), 2.0f),
+          "current desired heading is capped to 2 degrees");
     check(same_quat_bits(
               state.command.intent.desired_heading, state.desired_rotation),
           "command evidence uses capped current heading");
     check(nearly(yaw_degrees(state.command.predicted_desired_headings[0]),
-                 44.8f),
+                 42.0f),
           "first future heading advances another 40 degrees");
     check(nearly(yaw_degrees(state.command.predicted_desired_headings[3]),
-                 164.8f),
+                 162.0f),
           "future rollout advances one shared capped path");
 }
 
@@ -1129,21 +1156,21 @@ static void test_turn_profile_reversal_takes_at_least_1p5_seconds()
 
     int steps = 0;
     float previous = 0.0f;
-    while (yaw_degrees(state.desired_rotation) < 179.999f && steps < 100) {
+    while (yaw_degrees(state.desired_rotation) < 179.999f && steps < 120) {
         g1_runtime_step_result result;
         check(g1_runtime_step(
                   result, state, db, support, scene, request, config, error,
                   static_cast<int>(sizeof(error))),
               error);
         const float current = yaw_degrees(state.desired_rotation);
-        check(current - previous <= 4.8001f,
-              "each committed heading delta is at most the 4.8-degree cap");
+        check(current - previous <= 2.0001f,
+              "each committed heading delta is at most the 2-degree cap");
         check(current + 1.0e-4f >= previous,
               "committed heading advances monotonically toward the target");
         previous = current;
         ++steps;
     }
-    check(steps >= 38, "a 180-degree reversal needs at least 38 25-Hz steps");
+    check(steps >= 90, "a 180-degree reversal needs at least 90 60-Hz steps");
 }
 
 static void test_raw_and_holden_v1_headings_are_exact()
@@ -1240,7 +1267,7 @@ static void test_holden_movement_model_shapes_current_and_future()
     char error[512] = {};
 
     // Accelerating from rest: the first applied velocity respects the
-    // 1.5 m/s^2 acceleration bound (0.06 m/s per 0.04 s step) and the
+    // 1.5 m/s^2 acceleration bound (0.025 m/s per 1/60 s step) and the
     // predicted samples ramp further toward the limited target.
     g1_controller_state accel_state;
     check(g1_controller_state_reset(
@@ -1259,17 +1286,17 @@ static void test_holden_movement_model_shapes_current_and_future()
               accel_request, config, error,
               static_cast<int>(sizeof(error))),
           error);
-    check(nearly(accel_state.command.applied_velocity.x, 0.06f),
+    check(nearly(accel_state.command.applied_velocity.x, 0.025f),
           "holden-v1 shapes the current applied velocity by acceleration");
-    check(nearly(accel_state.movement_velocity.x, 0.06f),
+    check(nearly(accel_state.movement_velocity.x, 0.025f),
           "holden-v1 advances persistent movement velocity once per step");
-    check(accel_state.trajectory_desired_velocities(0).x > 0.06f &&
+    check(accel_state.trajectory_desired_velocities(0).x > 0.025f &&
               accel_state.trajectory_desired_velocities(0).x <= 0.560001f,
           "holden-v1 predicts a forward-ramping future sample from a copy");
 
     // Reversal: request the opposite direction from an established
     // positive velocity; the first shaped applied value must remain
-    // positive and brake by at most the 0.08 m/s deceleration step.
+    // positive and brake by at most the 1/30 m/s deceleration step.
     g1_controller_state brake_state;
     check(g1_controller_state_reset(
               brake_state, db, support, scene, error,
@@ -1286,7 +1313,8 @@ static void test_holden_movement_model_shapes_current_and_future()
               static_cast<int>(sizeof(error))),
           error);
     check(brake_state.command.applied_velocity.x > 0.0f &&
-              brake_state.command.applied_velocity.x >= 0.9f - 0.080001f,
+              brake_state.command.applied_velocity.x >=
+                  0.9f - (2.0f / 60.0f + 1.0e-6f),
           "holden-v1 brakes an abrupt reversal through a bounded decel step");
 }
 
@@ -1479,8 +1507,133 @@ static void test_raw_profile_preserves_generated_arrays()
     }
 }
 
-int main()
+static void test_unsafe_flat_bundle_rejected(const char* root)
 {
+    char error[512] = {};
+    motion_pack_manifest manifest;
+    check(!motion_manifest_load_and_verify(
+              manifest, root, error, static_cast<int>(sizeof(error))),
+          "unsafe unsplit v1 flat bundle is rejected before controller state");
+}
+
+static void test_flat_bundle_adapter(const char* root)
+{
+    char error[512] = {};
+    motion_pack_manifest manifest;
+    check(motion_manifest_load_and_verify(
+              manifest, root, error, static_cast<int>(sizeof(error))),
+          error);
+    check(manifest.flat_lmm_bundle &&
+              g1_manifest_rate_compatible(manifest.output_fps) &&
+              manifest.sources.size() == 13 &&
+              manifest.sources[0].terrain_id == "flat",
+          "flat adapter preserves the authenticated manifest contract");
+    std::string database_path;
+    std::string feature_path;
+    check(scene_join(
+              database_path, root, manifest.database.path,
+              error, static_cast<int>(sizeof(error))) &&
+              scene_join(
+                  feature_path, root, manifest.matching_features.path,
+                  error, static_cast<int>(sizeof(error))),
+          error);
+    database db;
+    database_load(db, database_path.c_str());
+    check(database_load_matching_features_checked(
+              db, feature_path.c_str(), error,
+              static_cast<int>(sizeof(error))),
+          error);
+    db.terrain_features.resize(db.nframes(), 4);
+    db.terrain_features.zero();
+    check(motion_manifest_validate_database(
+              manifest, db, error, static_cast<int>(sizeof(error))),
+          error);
+    scene_catalog catalog;
+    scene_pack scene;
+    check(flat_scene_catalog_build(
+              catalog, manifest, error, static_cast<int>(sizeof(error))) &&
+              flat_scene_pack_build(
+                  scene, manifest, error, static_cast<int>(sizeof(error))),
+          error);
+    check(catalog.ids.size() == 1 &&
+              terrain_heightfield_is_queryable(scene.terrain) &&
+              heightfield_sample_v2(scene.terrain, 0.0f, 0.0f) == 0.0f,
+          "flat adapter creates only the authenticated zero-height context");
+
+    terrain_support_set support;
+    support.values.resize(db.nframes(), 3);
+    support.values.zero();
+    g1_controller_state state;
+    check(g1_controller_state_reset(
+              state, db, support, scene, error,
+              static_cast<int>(sizeof(error))),
+          error);
+    g1_runtime_step_request request = make_direct_request(true);
+    request.requested_velocity_holden = vec3(0.0f, 0.0f, 0.4f);
+    const g1_runtime_config config;
+    int held_frames = 0;
+    float maximum_joint_step = 0.0f;
+    int maximum_joint_frame = -1;
+    int maximum_joint_bone = -1;
+    for (int frame = 0; frame < 600; ++frame) {
+        array1d<quat> previous = state.bone_rotations;
+        const int previous_database_frame = state.frame_index;
+        g1_runtime_step_result result;
+        check(g1_runtime_step(
+                  result, state, db, support, scene, request, config,
+                  error, static_cast<int>(sizeof(error))),
+              error);
+        if (state.frame_index == previous_database_frame) {
+            if (held_frames < 8) {
+                std::fprintf(
+                    stderr,
+                    "flat replay hold runtime_frame=%d database_frame=%d "
+                    "searched=%d transitioned=%d selected=%d query=%d\n",
+                    frame, state.frame_index, static_cast<int>(state.searched),
+                    static_cast<int>(state.transitioned),
+                    result.selected_database_frame,
+                    result.query_database_frame);
+            }
+            ++held_frames;
+        }
+        check(g1_pose_diagnostic_is_finite(result.projected),
+              "600-frame flat replay keeps a finite pose");
+        for (int bone = 1; bone < G1_BoneCount; ++bone) {
+            const float joint_step = quat_angle_between(
+                previous(bone), state.bone_rotations(bone));
+            if (joint_step > maximum_joint_step) {
+                maximum_joint_step = joint_step;
+                maximum_joint_frame = frame;
+                maximum_joint_bone = bone;
+            }
+        }
+        for (int dimension = 0; dimension < 31; ++dimension) {
+            const float independently_normalized = normalize_query_feature(
+                result.query[dimension],
+                db.features_offset(dimension),
+                db.features_scale(dimension));
+            check(std::fabs(
+                      independently_normalized -
+                      result.query_normalized[dimension]) <= 1e-6f,
+                  "600-frame flat replay preserves feature parity");
+        }
+        ++state.scene_frame;
+    }
+    check(held_frames == 0,
+          "600-frame flat ordinary replay has zero holds/resets");
+    if (maximum_joint_step > 0.25f) {
+        std::fprintf(
+            stderr,
+            "flat replay max joint step=%.9g rad frame=%d bone=%d\n",
+            maximum_joint_step, maximum_joint_frame, maximum_joint_bone);
+    }
+    check(maximum_joint_step <= 0.25f,
+          "600-frame flat ordinary replay joint step stays within 0.25 rad");
+}
+
+int main(int argc, char** argv)
+{
+    test_g1_rate_contract_is_exact_60_hz();
     test_direct_runtime_boundary_and_advance();
     test_holden_movement_model_shapes_current_and_future();
     test_holden_prediction_failure_is_transactional();
@@ -1495,5 +1648,15 @@ int main()
     test_feasible_runtime_failures_are_transactional();
     test_joint_preview_selection_and_live_parity();
     test_joint_preview_failures_are_transactional();
+    if (argc == 3 && std::strcmp(argv[1], "--flat-bundle") == 0) {
+        test_flat_bundle_adapter(argv[2]);
+    } else if (argc == 3 &&
+               std::strcmp(argv[1], "--unsafe-flat-bundle") == 0) {
+        test_unsafe_flat_bundle_rejected(argv[2]);
+    } else {
+        check(argc == 1,
+              "usage: test_g1_runtime [--flat-bundle DIRECTORY | "
+              "--unsafe-flat-bundle DIRECTORY]");
+    }
     return 0;
 }

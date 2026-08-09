@@ -901,10 +901,10 @@ static inline bool g1_foot_lock_update(
             error, error_capacity,
             "G1 planted-foot update has invalid input center");
     }
-    if (!g1_dt_is_exact_25_hz(dt)) {
+    if (!g1_dt_is_exact_60_hz(dt)) {
         return g1_ik_error(
             error, error_capacity,
-            "G1 planted-foot update requires exact binary32 25 Hz dt");
+            "G1 planted-foot update requires exact binary32 60 Hz dt");
     }
 
     G1SurfaceTarget validated_locked_surface = {};

@@ -614,7 +614,7 @@ static inline bool g1_ik_frame_begin(
     int error_capacity)
 {
     if (error_capacity < 0 ||
-        !g1_dt_is_exact_25_hz(dt) ||
+        !g1_dt_is_exact_60_hz(dt) ||
         field.version != 2 ||
         !terrain_heightfield_is_queryable(field) ||
         !g1_ik_runtime_state_is_valid(state) ||
@@ -816,7 +816,7 @@ static inline bool g1_ik_runtime_stage_swing_candidate(
 {
     if (error_capacity < 0 ||
         candidate_index >= G1SwingLiftCandidateCount ||
-        !g1_dt_is_exact_25_hz(dt) ||
+        !g1_dt_is_exact_60_hz(dt) ||
         field.version != 2 ||
         !terrain_heightfield_is_queryable(field) ||
         !g1_ik_runtime_history_is_valid(history) ||
@@ -1128,7 +1128,7 @@ static inline bool g1_ik_frame_stage_foot(
         !transaction.initialized ||
         transaction.next_foot >= 2 ||
         foot_index != transaction.next_foot ||
-        !g1_dt_is_exact_25_hz(dt) ||
+        !g1_dt_is_exact_60_hz(dt) ||
         field.version != 2 ||
         !terrain_heightfield_is_queryable(field) ||
         !g1_ik_runtime_arrays_are_exact(
@@ -1439,7 +1439,7 @@ static inline bool g1_ik_frame_finish(
             transaction.candidate_state) ||
         !g1_ik_runtime_stop_reason_is_valid(
             transaction.candidate_result.stop_reason) ||
-        !g1_dt_is_exact_25_hz(dt) ||
+        !g1_dt_is_exact_60_hz(dt) ||
         field.version != 2 ||
         !terrain_heightfield_is_queryable(field) ||
         !g1_ik_runtime_arrays_are_exact(

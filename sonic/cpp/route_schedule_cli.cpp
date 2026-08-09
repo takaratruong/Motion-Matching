@@ -11,6 +11,8 @@
 #include <unistd.h>
 #include <vector>
 
+static const float g1_dt = 1.0f / 60.0f;
+
 static bool fail(const std::string& message)
 {
     std::cerr << "route_schedule_cli: " << message << '\n';
@@ -150,7 +152,7 @@ static bool parse_route(
         }
     }
     if (matches != 1) return fail("route ID is missing or duplicated");
-    if (!deterministic_route_inputs_valid(candidate, 0.04f, 0.50f))
+    if (!deterministic_route_inputs_valid(candidate, g1_dt, 0.50f))
         return fail("route fails deterministic command validation");
     route = std::move(candidate);
     return true;
@@ -174,7 +176,8 @@ int main(int argc, char** argv)
     std::string scene_id;
     scene_route route;
     if (!parse_route(scene_id, route, document, argv[2])) return 2;
-    const int motion_frames = deterministic_route_motion_frames(route);
+    const int motion_frames = deterministic_route_motion_frames(
+        route, g1_dt, 0.50f);
     if (motion_frames <= 0) {
         std::cerr << "route_schedule_cli: invalid route motion frame count\n";
         return 2;
@@ -184,13 +187,13 @@ int main(int argc, char** argv)
         << "{\"schema\":\"mm-sonic-route-schedule/v1\","
         << "\"scene_id\":\"" << scene_id << "\","
         << "\"route_id\":\"" << route.id << "\","
-        << "\"source_rate_hz\":25,\"speed_mps\":0.5,"
+        << "\"source_rate_hz\":60,\"speed_mps\":0.5,"
         << "\"motion_frames\":" << motion_frames << ",\"frames\":[";
     char error[512] = {};
     for (int frame = 0; frame < motion_frames; ++frame) {
         deterministic_route_sample sample;
         if (!deterministic_route_command(
-                sample, route, frame, 0.04f, 0.50f,
+                sample, route, frame, g1_dt, 0.50f,
                 error, static_cast<int>(sizeof(error)))) {
             std::cerr << "route_schedule_cli: " << error << '\n';
             return 2;

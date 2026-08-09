@@ -69,7 +69,10 @@ LOCKED_SCENE_IDS = (
 # readers accept the append-only suffix without weakening that prerequisite.
 CSV_COLUMNS = GATE_A_COLUMNS
 REQUIRED_COLUMNS = set(CSV_COLUMNS)
-TEXT_COLUMNS = {"scene_id", "mode", "route", "query_bits_hex"}
+TEXT_COLUMNS = {
+    "scene_id", "mode", "route", "query_bits_hex",
+}
+NORMALIZED_QUERY_COLUMN = "query_normalized_bits_hex"
 INTEGER_COLUMNS = {
     "frame", "query_database_frame", "query_range", "selected_database_frame",
     "database_frame", "range", "source_range", "searched", "transitioned",
@@ -158,8 +161,8 @@ def _float32_ulp_distance(left, right, index):
     return abs(left_bits - right_bits)
 
 
-def _check_query_snapshot(row, index):
-    snapshot = row["query_bits_hex"]
+def _decode_query_snapshot(row, index, column):
+    snapshot = row[column]
     values = []
     for dimension in range(31):
         bits = snapshot[dimension * 8:(dimension + 1) * 8]
@@ -168,6 +171,14 @@ def _check_query_snapshot(row, index):
             raise ValueError(
                 f"row {index}: non-finite query dimension {dimension}")
         values.append(value)
+    return values
+
+
+def _check_query_snapshot(row, index):
+    snapshot = row["query_bits_hex"]
+    values = _decode_query_snapshot(row, index, "query_bits_hex")
+    if NORMALIZED_QUERY_COLUMN in row:
+        _decode_query_snapshot(row, index, NORMALIZED_QUERY_COLUMN)
     for sample in range(4):
         terrain = _float32(row, f"terrain{sample}", index)
         terrain_bits = struct.pack(">f", terrain).hex()
@@ -197,8 +208,9 @@ def _runtime_schema(rows):
 
 def _require_runtime_header(rows):
     expected = tuple(RUNTIME_COLUMNS)
+    normalized = expected + (NORMALIZED_QUERY_COLUMN,)
     for index, row in enumerate(rows):
-        if tuple(row.keys()) != expected:
+        if tuple(row.keys()) not in (expected, normalized):
             raise ValueError(
                 f"row {index}: runtime gate requires exact runtime header")
 
@@ -308,8 +320,9 @@ def check_rows(rows):
         fixed_dt = _float32(row, "fixed_dt", index)
         if fixed_dt <= 0.0:
             raise ValueError(f"row {index}: fixed_dt must be positive")
-        if runtime and struct.pack(">f", fixed_dt) != struct.pack(">f", 0.04):
-            raise ValueError(f"row {index}: fixed_dt must be float32 0.04")
+        if runtime and struct.pack(">f", fixed_dt) != struct.pack(">f", 1.0 / 60.0):
+            raise ValueError(
+                f"row {index}: fixed_dt must be exact float32 1/60")
         terrain_weight = _float32(
             row, "effective_terrain_weight", index)
         if not 0.0 <= terrain_weight <= 10.0:
@@ -410,12 +423,13 @@ def check_rows(rows):
                     name == "route" and runtime and row.get("mode") != "route")
                 if not row.get(name) and not route_may_be_empty:
                     raise ValueError(f"row {index}: empty {name}")
-                if name == "query_bits_hex" and (
+                if name in {
+                        "query_bits_hex", "query_normalized_bits_hex"} and (
                         len(row[name]) != 31 * 8 or
                         any(character not in "0123456789abcdef"
                             for character in row[name])):
                     raise ValueError(
-                        f"row {index}: query_bits_hex is not 31 float bit patterns")
+                        f"row {index}: {name} is not 31 float bit patterns")
             elif name in INTEGER_COLUMNS:
                 _integer(row, name, index)
             else:
@@ -423,6 +437,14 @@ def check_rows(rows):
         for name in FLAG_COLUMNS:
             if _integer(row, name, index) not in (0, 1):
                 raise ValueError(f"row {index}: {name} must be 0 or 1")
+        if NORMALIZED_QUERY_COLUMN in row:
+            snapshot = row[NORMALIZED_QUERY_COLUMN]
+            if (len(snapshot) != 31 * 8 or
+                    any(character not in "0123456789abcdef"
+                        for character in snapshot)):
+                raise ValueError(
+                    f"row {index}: {NORMALIZED_QUERY_COLUMN} is not 31 "
+                    "float bit patterns")
         if runtime:
             for name in RUNTIME_SUFFIX:
                 if name in RUNTIME_TEXT_COLUMNS:
@@ -990,12 +1012,12 @@ def compare_control(treatment, control):
     return treatment_error, control_error
 
 
-def check_gate_a_contract(rows, expected_frames=375):
+def check_gate_a_contract(rows, expected_frames=900):
     summary = check_rows(rows)
     if len(rows) != expected_frames:
         raise ValueError(
             f"Gate A requires exactly {expected_frames} rows, got {len(rows)}")
-    expected_dt = struct.pack(">f", 0.04)
+    expected_dt = struct.pack(">f", 1.0 / 60.0)
     expected_text = {
         "scene_id": "grail-curb-default",
         "mode": "terrain",
@@ -1011,7 +1033,8 @@ def check_gate_a_contract(rows, expected_frames=375):
     for index, row in enumerate(rows):
         fixed_dt = _finite(row, "fixed_dt", index)
         if struct.pack(">f", fixed_dt) != expected_dt:
-            raise ValueError(f"row {index}: Gate A fixed_dt must be float32 0.04")
+            raise ValueError(
+                f"row {index}: Gate A fixed_dt must be exact float32 1/60")
         for name, expected in expected_text.items():
             if row[name] != expected:
                 raise ValueError(

@@ -250,7 +250,7 @@ static inline bool deterministic_route_predict_commands(
         return false;
     }
     int checked_route_frames = 0;
-    if (current_frame < 0 || !g1_dt_is_exact_25_hz(dt) ||
+    if (current_frame < 0 || !g1_dt_is_exact_60_hz(dt) ||
         !terrain_float_is_positive_normal(speed) ||
         !terrain_float_is_positive_normal(trajectory_sample_time) ||
         !terrain_float_is_normal_or_zero_query(future_speed_scale) ||
@@ -347,7 +347,7 @@ static inline bool deterministic_route_predict_commands(
 }
 
 static inline int deterministic_route_motion_frames(
-    const scene_route& route, float dt = 0.04f, float speed = 0.50f)
+    const scene_route& route, float dt = 1.0f / 60.0f, float speed = 0.50f)
 {
     int total = 0;
     return deterministic_route_schedule_frames(total, route, dt, speed)
@@ -364,7 +364,8 @@ static inline float deterministic_route_target_height(
         float sum = 0.0f;
     };
 
-    if (!deterministic_route_inputs_valid(route, 0.04f, 0.50f) ||
+    if (!deterministic_route_inputs_valid(
+            route, 1.0f / 60.0f, 0.50f) ||
         !terrain_heightfield_is_queryable(terrain))
     {
         return NAN;

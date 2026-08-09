@@ -49,11 +49,12 @@ struct motion_match_pose_diagnostic
 struct motion_match_log_row
 {
     int frame = 0;
-    float fixed_dt = 0.04f;
+    float fixed_dt = 1.0f / 60.0f;
     const char* scene_id = "grail-curb-default";
     const char* mode = "live";
     const char* route = "manual";
     const char* query_bits_hex = "";
+    const char* query_normalized_bits_hex = "";
     int query_database_frame = 0;
     int query_range = 0;
     int selected_database_frame = 0;
@@ -188,7 +189,8 @@ struct motion_match_log
             "commanded_speed,applied_speed,route_waypoint,route_complete,"
             "route_target_height,scene_generation,scene_frame,"
             "scene_reset_count,scene_switch_failed,motion_pack_load_count,"
-            "model_load_count,model_unload_count,live_model_count\n") >= 0;
+            "model_load_count,model_unload_count,live_model_count,"
+            "query_normalized_bits_hex\n") >= 0;
         if (!header_ok || fflush(file) != 0) {
             const int saved_errno = errno;
             fclose(file);
@@ -250,7 +252,7 @@ struct motion_match_log
             ",%s,%s,%d,%.9g,"
             "%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,"
             "%s,%d,%d,%d,%.9g,%.9g,%.9g,%.9g,%d,%d,%s,"
-            "%.9g,%.9g,%.9g,%.9g,%.9g,%d,%d,%.9g,%d,%d,%d,%d,%d,%d,%d,%d\n",
+            "%.9g,%.9g,%.9g,%.9g,%.9g,%d,%d,%.9g,%d,%d,%d,%d,%d,%d,%d,%d,%s\n",
             r.source_name, r.source_terrain, r.source_index,
             r.continuation_cost,
             r.source_root_height, r.source_left_toe_height,
@@ -270,7 +272,8 @@ struct motion_match_log
             r.route_waypoint, (int)r.route_complete, r.route_target_height,
             r.scene_generation, r.scene_frame, r.scene_reset_count,
             (int)r.scene_switch_failed, r.motion_pack_load_count,
-            r.model_load_count, r.model_unload_count, r.live_model_count) >= 0;
+            r.model_load_count, r.model_unload_count, r.live_model_count,
+            r.query_normalized_bits_hex) >= 0;
         if (ok) ok = fflush(file) == 0;
         return ok ? true : io_error(error, error_capacity, "write", errno);
     }

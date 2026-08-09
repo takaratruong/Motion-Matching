@@ -665,6 +665,32 @@ class ChunkServerProtocolTest(unittest.TestCase):
 
 
 class ChunkServerSourceOwnershipTest(unittest.TestCase):
+    def test_real_reset_preflight_uses_exact_60_hz_g1_rate(self):
+        source = (ROOT / "sonic" / "cpp" / "mm_chunk_server.cpp").read_text(
+            encoding="utf-8"
+        )
+        adapter = source.index("class mm_real_adapter")
+        reset_start = source.index("    bool prepare_reset(\n", adapter)
+        reset_stop = source.index("\n    bool clone(\n", reset_start)
+        reset_body = source[reset_start:reset_stop]
+        self.assertIn("const float g1_dt = 1.0f / 60.0f;", reset_body)
+        self.assertEqual(reset_body.count("g1_dt,"), 2)
+        self.assertNotIn("0.04f", reset_body)
+
+        advance_start = source.index("    bool advance(\n", adapter)
+        advance_stop = source.index("\nprivate:", advance_start)
+        advance_body = source[advance_start:advance_stop]
+        self.assertIn("g1_runtime_config config;", advance_body)
+        runtime_call = advance_body[advance_body.index("g1_runtime_step(") :]
+        self.assertIn("config,", runtime_call)
+
+    def test_legacy_source_chunk_rate_is_not_the_g1_execution_clock(self):
+        source = (ROOT / "sonic" / "cpp" / "mm_chunk_server.cpp").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(source.count('source_rate_hz\\\":25'), 2)
+        self.assertIn("legacy source-chunk artifact grid", source)
+
     def test_real_certificate_build_order_ownership_and_runtime_binding(self):
         source = (ROOT / "sonic" / "cpp" / "mm_chunk_server.cpp").read_text(
             encoding="utf-8"

@@ -47,9 +47,13 @@ struct motion_pack_manifest {
     int feature_dimensions=0,terrain_dimensions=0,support_dimensions=0;
     int total_clips=0,grail_clips=0,skipped_clips=0,database_frames=0;
     bool diagnostic_mode=false;
+    bool flat_lmm_bundle=false;
+    float continuity_maximum_local_step=0.0f;
     std::vector<motion_source_record> sources;
+    std::vector<float> feature_offset,feature_scale;
     surface_contract surface;
     artifact_reference database,terrain_features,terrain_support;
+    artifact_reference matching_features;
     artifact_reference scene_index,validation_file;
 };
 struct scene_region { std::string id; bounds2 bounds; };
@@ -604,6 +608,643 @@ static inline bool scene_validation_validate(
     return true;
 }
 
+static inline bool flat_artifact_reference_parse(
+    artifact_reference& output,
+    const json_value& artifacts,
+    const char* name,
+    char* error,
+    const int capacity)
+{
+    const json_value* descriptor = json_member(artifacts, name);
+    int size_bytes = 0;
+    if (descriptor == NULL || !scene_exact_keys(
+            *descriptor, {"path","size_bytes","sha256"}, name,
+            error, capacity) ||
+        !scene_member_string(output.path, *descriptor, "path", name,
+                             error, capacity) ||
+        output.path != name ||
+        !scene_member_string(output.sha256, *descriptor, "sha256", name,
+                             error, capacity) ||
+        !scene_member_int(size_bytes, *descriptor, "size_bytes", name,
+                          error, capacity) || size_bytes <= 0)
+    {
+        return scene_error(
+            error, capacity, "flat artifact '%s' is invalid", name);
+    }
+    return true;
+}
+
+static inline bool flat_motion_manifest_parse_and_verify(
+    motion_pack_manifest& out,
+    const json_value& document,
+    const char* root,
+    char* error,
+    const int capacity)
+{
+    if (!scene_exact_keys(document,
+            {"schema","output_fps","trajectory_horizons",
+             "feature_dimensions","feature_names","feature_weights",
+             "feature_offset","feature_scale","feature_signature",
+             "terrain_features","database_frames","total_clips",
+             "source_count","dimensions","skeleton","range_count","ranges",
+             "continuity","time_filters","contact",
+             "sources","validation","status","artifacts"},
+            "flat motion manifest", error, capacity))
+        return false;
+
+    motion_pack_manifest candidate;
+    candidate.flat_lmm_bundle = true;
+    std::string schema, status;
+    float fps = 0.0f;
+    if (!scene_member_string(schema, document, "schema", "flat manifest",
+                             error, capacity) ||
+        schema != "g1-lmm-flat-data/v2" ||
+        !scene_member_string(status, document, "status", "flat manifest",
+                             error, capacity) || status != "accepted" ||
+        !scene_member_float(fps, document, "output_fps", "flat manifest",
+                            error, capacity) ||
+        !g1_manifest_rate_compatible(fps))
+        return scene_error(
+            error, capacity,
+            "flat bundle schema/status/rate is incompatible");
+    candidate.output_fps = fps;
+
+    const json_value* horizons = json_member(document, "trajectory_horizons");
+    if (horizons == NULL || horizons->kind != json_array ||
+        horizons->array_value.size() != 3)
+        return scene_error(error, capacity,
+                           "flat trajectory_horizons must be [20,40,60]");
+    const int expected_horizons[3] = {20, 40, 60};
+    for (int index = 0; index < 3; ++index) {
+        int value = 0;
+        if (!scene_number_int(
+                value, horizons->array_value[static_cast<size_t>(index)],
+                "flat horizon", error, capacity) ||
+            value != expected_horizons[index])
+            return scene_error(error, capacity,
+                               "flat trajectory_horizons must be [20,40,60]");
+    }
+    if (!scene_member_int(
+            candidate.feature_dimensions, document, "feature_dimensions",
+            "flat manifest", error, capacity) ||
+        candidate.feature_dimensions != 31 ||
+        !scene_member_int(candidate.database_frames, document,
+                          "database_frames", "flat manifest", error,
+                          capacity) || candidate.database_frames < 61 ||
+        !scene_member_int(candidate.total_clips, document, "total_clips",
+                          "flat manifest", error, capacity) ||
+        candidate.total_clips != 1)
+        return scene_error(error, capacity,
+                           "flat bundle dimensions or clip count changed");
+    candidate.terrain_dimensions = 4;
+    candidate.support_dimensions = 3;
+    const json_value* dimensions = json_member(document, "dimensions");
+    int bones = 0, features = 0, contacts = 0;
+    if (dimensions == NULL || !scene_exact_keys(
+            *dimensions, {"bones","features","contacts"},
+            "flat dimensions", error, capacity) ||
+        !scene_member_int(bones, *dimensions, "bones", "flat dimensions",
+                          error, capacity) || bones != 31 ||
+        !scene_member_int(features, *dimensions, "features",
+                          "flat dimensions", error, capacity) ||
+        features != 31 ||
+        !scene_member_int(contacts, *dimensions, "contacts",
+                          "flat dimensions", error, capacity) || contacts != 2)
+        return scene_error(error, capacity,
+                           "flat dimensions must be 31/31/2");
+
+    const json_value* feature_names = json_member(document, "feature_names");
+    const json_value* feature_weights = json_member(document, "feature_weights");
+    const json_value* feature_offset = json_member(document, "feature_offset");
+    const json_value* feature_scale = json_member(document, "feature_scale");
+    std::string feature_signature;
+    if (feature_names == NULL || feature_names->kind != json_array ||
+        feature_names->array_value.size() != 31 ||
+        feature_weights == NULL || feature_weights->kind != json_array ||
+        feature_weights->array_value.size() != 6 ||
+        feature_offset == NULL || feature_offset->kind != json_array ||
+        feature_offset->array_value.size() != 31 ||
+        feature_scale == NULL || feature_scale->kind != json_array ||
+        feature_scale->array_value.size() != 31 ||
+        !scene_member_string(feature_signature, document, "feature_signature",
+                             "flat manifest", error, capacity) ||
+        !scene_sha_is_valid(feature_signature))
+        return scene_error(error, capacity,
+                           "flat feature receipt dimensions changed");
+    static const char* const expected_feature_names[31] = {
+        "left_foot_position_x","left_foot_position_y","left_foot_position_z",
+        "right_foot_position_x","right_foot_position_y","right_foot_position_z",
+        "left_foot_velocity_x","left_foot_velocity_y","left_foot_velocity_z",
+        "right_foot_velocity_x","right_foot_velocity_y","right_foot_velocity_z",
+        "hip_velocity_x","hip_velocity_y","hip_velocity_z",
+        "root_position_20_x","root_position_20_z",
+        "root_position_40_x","root_position_40_z",
+        "root_position_60_x","root_position_60_z",
+        "root_facing_20_x","root_facing_20_z",
+        "root_facing_40_x","root_facing_40_z",
+        "root_facing_60_x","root_facing_60_z",
+        "terrain_height_025","terrain_height_050",
+        "terrain_height_075","terrain_height_100"};
+    for (int index = 0; index < 31; ++index) {
+        std::string name;
+        if (!scene_string(
+                name,
+                feature_names->array_value[static_cast<size_t>(index)],
+                "flat feature name", error, capacity) ||
+            name != expected_feature_names[index])
+            return scene_error(error, capacity,
+                               "flat feature name %d changed", index);
+    }
+    const float expected_weights[6] = {
+        0.75f, 1.0f, 1.0f, 1.0f, 1.5f, 1.0f};
+    for (int index = 0; index < 6; ++index) {
+        float weight = 0.0f;
+        if (!scene_number_float(
+                weight,
+                feature_weights->array_value[static_cast<size_t>(index)],
+                "flat feature weight", error, capacity) ||
+            feature_float_bits(weight) !=
+                feature_float_bits(expected_weights[index]))
+            return scene_error(error, capacity,
+                               "flat feature weight %d changed", index);
+    }
+    candidate.feature_offset.reserve(31);
+    candidate.feature_scale.reserve(31);
+    for (int index = 0; index < 31; ++index) {
+        float offset = 0.0f, scale = 0.0f;
+        if (!scene_number_float(
+                offset,
+                feature_offset->array_value[static_cast<size_t>(index)],
+                "flat feature offset", error, capacity) ||
+            !scene_number_float(
+                scale,
+                feature_scale->array_value[static_cast<size_t>(index)],
+                "flat feature scale", error, capacity) ||
+            !feature_float_is_finite(offset) ||
+            !feature_float_is_positive_finite(scale))
+            return scene_error(error, capacity,
+                               "flat feature normalization is invalid");
+        candidate.feature_offset.push_back(offset);
+        candidate.feature_scale.push_back(scale);
+    }
+    const json_value* filters = json_member(document, "time_filters");
+    int root_position_frames = 0, root_position_order = 0;
+    int root_direction_frames = 0, root_direction_order = 0;
+    int contact_median_frames = 0, forward_path_rows = 0;
+    if (filters == NULL || !scene_exact_keys(
+            *filters,
+            {"root_position_frames","root_position_order",
+             "root_direction_frames","root_direction_order",
+             "contact_median_frames","forward_terrain_path_rows"},
+            "flat time filters", error, capacity) ||
+        !scene_member_int(root_position_frames, *filters,
+                          "root_position_frames", "flat time filters",
+                          error, capacity) || root_position_frames != 31 ||
+        !scene_member_int(root_position_order, *filters,
+                          "root_position_order", "flat time filters",
+                          error, capacity) || root_position_order != 3 ||
+        !scene_member_int(root_direction_frames, *filters,
+                          "root_direction_frames", "flat time filters",
+                          error, capacity) || root_direction_frames != 61 ||
+        !scene_member_int(root_direction_order, *filters,
+                          "root_direction_order", "flat time filters",
+                          error, capacity) || root_direction_order != 3 ||
+        !scene_member_int(contact_median_frames, *filters,
+                          "contact_median_frames", "flat time filters",
+                          error, capacity) || contact_median_frames != 7 ||
+        !scene_member_int(forward_path_rows, *filters,
+                          "forward_terrain_path_rows", "flat time filters",
+                          error, capacity) || forward_path_rows != 121)
+        return scene_error(error, capacity,
+                           "flat time-filter receipt changed");
+    const json_value* flat_contact = json_member(document, "contact");
+    float contact_speed = 0.0f, contact_height = 0.0f;
+    int contact_filter = 0;
+    if (flat_contact == NULL || !scene_exact_keys(
+            *flat_contact,
+            {"speed_threshold","height_threshold","median_filter_frames"},
+            "flat contact", error, capacity) ||
+        !scene_member_float(contact_speed, *flat_contact, "speed_threshold",
+                            "flat contact", error, capacity) ||
+        contact_speed != 0.15f ||
+        !scene_member_float(contact_height, *flat_contact, "height_threshold",
+                            "flat contact", error, capacity) ||
+        contact_height != 0.06f ||
+        !scene_member_int(contact_filter, *flat_contact,
+                          "median_filter_frames", "flat contact",
+                          error, capacity) || contact_filter != 7)
+        return scene_error(error, capacity,
+                           "flat contact receipt changed");
+
+    const json_value* validation = json_member(document, "validation");
+    float fk_error = 0.0f;
+    float duration_error = 0.0f;
+    float quaternion_error = 0.0f;
+    if (validation == NULL || !scene_exact_keys(
+            *validation,
+            {"fk_max_error_m","duration_error_s",
+             "quaternion_norm_max_error"},
+            "flat validation", error, capacity) ||
+        !scene_member_float(fk_error, *validation, "fk_max_error_m",
+                            "flat validation", error, capacity) ||
+        !scene_member_float(duration_error, *validation, "duration_error_s",
+                            "flat validation", error, capacity) ||
+        !scene_member_float(quaternion_error, *validation,
+                            "quaternion_norm_max_error", "flat validation",
+                            error, capacity) ||
+        fk_error < 0.0f || fk_error > 1.0e-5f ||
+        duration_error < 0.0f || duration_error > 1.0f / 60.0f ||
+        quaternion_error < 0.0f || quaternion_error > 1.0e-4f)
+        return scene_error(error, capacity,
+                           "flat validation receipt is incompatible");
+
+    const json_value* terrain = json_member(document, "terrain_features");
+    std::string semantics;
+    double flat_value = 1.0;
+    const json_value* indices = terrain == NULL
+        ? NULL : json_member(*terrain, "indices");
+    if (terrain == NULL || !scene_exact_keys(
+            *terrain, {"indices","semantics","value_m"},
+            "flat terrain_features", error, capacity) ||
+        indices == NULL || indices->kind != json_array ||
+        indices->array_value.size() != 4 ||
+        !scene_member_string(semantics, *terrain, "semantics",
+                             "flat terrain_features", error, capacity) ||
+        semantics != "authenticated-flat-root-relative-height-deltas")
+        return scene_error(error, capacity,
+                           "flat bundle lacks the authenticated zero terrain claim");
+    const json_value* flat_value_json = json_member(*terrain, "value_m");
+    if (flat_value_json == NULL || !scene_number_double(
+            flat_value, *flat_value_json, "flat terrain value", error,
+            capacity) || flat_value != 0.0)
+        return scene_error(error, capacity,
+                           "flat bundle terrain claim must be exactly zero");
+    for (int index = 0; index < 4; ++index) {
+        int feature_index = -1;
+        if (!scene_number_int(
+                feature_index,
+                indices->array_value[static_cast<size_t>(index)],
+                "flat terrain index", error, capacity) ||
+            feature_index != 27 + index)
+            return scene_error(error, capacity,
+                               "flat terrain feature indices changed");
+    }
+
+    const json_value* ranges = json_member(document, "ranges");
+    const json_value* sources = json_member(document, "sources");
+    int range_count = 0;
+    int source_count = 0;
+    if (ranges == NULL || ranges->kind != json_array ||
+        ranges->array_value.empty() ||
+        !scene_member_int(range_count, document, "range_count",
+                          "flat manifest", error, capacity) ||
+        range_count != static_cast<int>(ranges->array_value.size()) ||
+        range_count != 13 ||
+        !scene_member_int(source_count, document, "source_count",
+                          "flat manifest", error, capacity) ||
+        source_count != 1 ||
+        sources == NULL || sources->kind != json_array ||
+        sources->array_value.size() != static_cast<size_t>(source_count))
+        return scene_error(error, capacity,
+                           "flat bundle range/source receipts are incomplete");
+    int expected_start = 0;
+    std::vector<int> range_source_first;
+    std::vector<int> range_source_last;
+    range_source_first.reserve(ranges->array_value.size());
+    range_source_last.reserve(ranges->array_value.size());
+    sha256_state range_digest_state;
+    for (size_t index = 0; index < ranges->array_value.size(); ++index) {
+        const json_value& range = ranges->array_value[index];
+        motion_source_record source;
+        std::string motion_class, terrain_class;
+        int source_first_frame = -1, source_last_frame = -1;
+        if (!scene_exact_keys(range,
+                {"start","stop","source","source_first_frame",
+                 "source_last_frame","motion_class","terrain_class"},
+                "flat range", error, capacity) ||
+            !scene_member_int(source.range_start, range, "start", "flat range",
+                              error, capacity) ||
+            source.range_start != expected_start ||
+            !scene_member_int(source.range_stop, range, "stop", "flat range",
+                              error, capacity) ||
+            source.range_stop - source.range_start < 61 ||
+            !scene_member_int(source_first_frame, range, "source_first_frame",
+                              "flat range", error, capacity) ||
+            !scene_member_int(source_last_frame, range, "source_last_frame",
+                              "flat range", error, capacity) ||
+            source_first_frame < 0 || source_last_frame < source_first_frame ||
+            !scene_member_string(motion_class, range, "motion_class",
+                                 "flat range", error, capacity) ||
+            motion_class != "flat-walk" ||
+            !scene_member_string(terrain_class, range, "terrain_class",
+                                 "flat range", error, capacity) ||
+            terrain_class != "flat" ||
+            !scene_member_string(source.name, range, "source", "flat range",
+                                 error, capacity) || source.name.empty())
+            return scene_error(error, capacity,
+                               "flat range is not a contiguous flat walk");
+        source.terrain_id = "flat";
+        expected_start = source.range_stop;
+        candidate.sources.push_back(source);
+        range_source_first.push_back(source_first_frame);
+        range_source_last.push_back(source_last_frame);
+        const int digest_values[4] = {
+            source.range_start, source.range_stop,
+            source_first_frame, source_last_frame};
+        unsigned char digest_bytes[16] = {};
+        for (int value_index = 0; value_index < 4; ++value_index) {
+            const uint32_t value = static_cast<uint32_t>(
+                digest_values[value_index]);
+            digest_bytes[value_index * 4 + 0] =
+                static_cast<unsigned char>(value);
+            digest_bytes[value_index * 4 + 1] =
+                static_cast<unsigned char>(value >> 8);
+            digest_bytes[value_index * 4 + 2] =
+                static_cast<unsigned char>(value >> 16);
+            digest_bytes[value_index * 4 + 3] =
+                static_cast<unsigned char>(value >> 24);
+        }
+        sha256_update(range_digest_state, digest_bytes, sizeof(digest_bytes));
+    }
+    if (expected_start != candidate.database_frames)
+        return scene_error(error, capacity,
+                           "flat ranges do not cover the database exactly");
+    const std::string computed_range_digest =
+        sha256_finish(range_digest_state);
+    const json_value* continuity = json_member(document, "continuity");
+    std::string continuity_schema, range_digest, source_map_digest;
+    float continuity_threshold = 0.0f;
+    float maximum_native_step = 0.0f;
+    float maximum_local_step = 0.0f;
+    int minimum_range_frames = 0;
+    int source_rejected_edges = 0;
+    int local_rejected_edges = 0;
+    int union_rejected_edges = 0;
+    int dropped_fragment_count = 0;
+    int dropped_frame_count = 0;
+    int published_range_count = 0;
+    int published_frame_count = 0;
+    if (continuity == NULL || !scene_exact_keys(
+            *continuity,
+            {"schema","threshold_rad_per_frame","minimum_range_frames",
+             "source_native_rejected_edge_count",
+             "database_local_rejected_edge_count",
+             "union_rejected_edge_count","dropped_fragment_count",
+             "dropped_frame_count","published_range_count",
+             "published_frame_count","maximum_admitted_native_step_rad",
+             "maximum_admitted_local_rotation_step_rad",
+             "range_digest_sha256","source_map_digest_sha256"},
+            "flat continuity", error, capacity) ||
+        !scene_member_string(continuity_schema, *continuity, "schema",
+                             "flat continuity", error, capacity) ||
+        continuity_schema != "g1-lmm-continuity/v1" ||
+        !scene_member_float(continuity_threshold, *continuity,
+                            "threshold_rad_per_frame", "flat continuity",
+                            error, capacity) || continuity_threshold != 0.25f ||
+        !scene_member_int(minimum_range_frames, *continuity,
+                          "minimum_range_frames", "flat continuity",
+                          error, capacity) || minimum_range_frames != 61 ||
+        !scene_member_int(source_rejected_edges, *continuity,
+                          "source_native_rejected_edge_count",
+                          "flat continuity", error, capacity) ||
+        source_rejected_edges != 31 ||
+        !scene_member_int(local_rejected_edges, *continuity,
+                          "database_local_rejected_edge_count",
+                          "flat continuity", error, capacity) ||
+        local_rejected_edges != 32 ||
+        !scene_member_int(union_rejected_edges, *continuity,
+                          "union_rejected_edge_count", "flat continuity",
+                          error, capacity) || union_rejected_edges != 32 ||
+        !scene_member_int(dropped_fragment_count, *continuity,
+                          "dropped_fragment_count", "flat continuity",
+                          error, capacity) || dropped_fragment_count != 20 ||
+        !scene_member_int(dropped_frame_count, *continuity,
+                          "dropped_frame_count", "flat continuity",
+                          error, capacity) || dropped_frame_count != 233 ||
+        !scene_member_int(published_range_count, *continuity,
+                          "published_range_count", "flat continuity",
+                          error, capacity) || published_range_count != 13 ||
+        !scene_member_int(published_frame_count, *continuity,
+                          "published_frame_count", "flat continuity",
+                          error, capacity) ||
+        published_frame_count != candidate.database_frames ||
+        published_frame_count != 3853 ||
+        !scene_member_float(maximum_native_step, *continuity,
+                            "maximum_admitted_native_step_rad",
+                            "flat continuity", error, capacity) ||
+        !scene_member_float(maximum_local_step, *continuity,
+                            "maximum_admitted_local_rotation_step_rad",
+                            "flat continuity", error, capacity) ||
+        maximum_native_step < 0.0f || maximum_native_step > 0.25f ||
+        maximum_local_step < 0.0f || maximum_local_step > 0.25f ||
+        !scene_member_string(range_digest, *continuity,
+                             "range_digest_sha256", "flat continuity",
+                             error, capacity) ||
+        range_digest != computed_range_digest ||
+        !scene_member_string(source_map_digest, *continuity,
+                             "source_map_digest_sha256", "flat continuity",
+                             error, capacity))
+        return scene_error(error, capacity,
+                           "flat continuity receipt is incompatible");
+    candidate.continuity_maximum_local_step = maximum_local_step;
+    const json_value& source_receipt = sources->array_value[0];
+    std::string source_name, source_terrain;
+    std::string source_path, source_sha, receipt_path, receipt_sha;
+    std::string receipt_schema, receipt_status;
+    int source_frames = 0, output_frames = 0;
+    float source_fps = 0.0f;
+    const json_value* left_indices = json_member(
+        source_receipt, "left_source_index");
+    const json_value* right_indices = json_member(
+        source_receipt, "right_source_index");
+    const json_value* source_alpha = json_member(
+        source_receipt, "source_alpha");
+    if (!scene_exact_keys(source_receipt,
+            {"name","terrain_id","path","sha256","receipt_path",
+             "receipt_sha256","receipt_schema","receipt_status",
+             "source_fps","source_frames","output_frames",
+             "left_source_index","right_source_index","source_alpha"},
+            "flat source", error, capacity) ||
+        !scene_member_string(source_terrain, source_receipt, "terrain_id",
+                             "flat source", error, capacity) ||
+        source_terrain != "flat" ||
+        !scene_member_string(source_name, source_receipt, "name",
+                             "flat source", error, capacity) ||
+        source_name.empty() ||
+        !scene_member_string(source_path, source_receipt, "path",
+                             "flat source", error, capacity) ||
+        source_path.empty() ||
+        !scene_member_string(source_sha, source_receipt, "sha256",
+                             "flat source", error, capacity) ||
+        !scene_sha_is_valid(source_sha) ||
+        !scene_member_string(receipt_path, source_receipt, "receipt_path",
+                             "flat source", error, capacity) ||
+        receipt_path.empty() ||
+        !scene_member_string(receipt_sha, source_receipt, "receipt_sha256",
+                             "flat source", error, capacity) ||
+        !scene_sha_is_valid(receipt_sha) ||
+        !scene_member_string(receipt_schema, source_receipt, "receipt_schema",
+                             "flat source", error, capacity) ||
+        receipt_schema != "native-g1-pfnn-sample-retarget/v1" ||
+        !scene_member_string(receipt_status, source_receipt, "receipt_status",
+                             "flat source", error, capacity) ||
+        receipt_status != "accepted" ||
+        !scene_member_float(source_fps, source_receipt, "source_fps",
+                            "flat source", error, capacity) ||
+        source_fps != 120.0f ||
+        !scene_member_int(source_frames, source_receipt, "source_frames",
+                          "flat source", error, capacity) ||
+        !scene_member_int(output_frames, source_receipt, "output_frames",
+                          "flat source", error, capacity) ||
+        output_frames != candidate.database_frames || source_frames <= 0 ||
+        left_indices == NULL || right_indices == NULL ||
+        source_alpha == NULL || left_indices->kind != json_array ||
+        right_indices->kind != json_array || source_alpha->kind != json_array ||
+        left_indices->array_value.size() !=
+            static_cast<size_t>(candidate.database_frames) ||
+        right_indices->array_value.size() != left_indices->array_value.size() ||
+        source_alpha->array_value.size() != left_indices->array_value.size())
+        return scene_error(error, capacity,
+                           "flat source reconstruction map is incompatible");
+    for (size_t index = 0; index < candidate.sources.size(); ++index) {
+        if (candidate.sources[index].name != source_name)
+            return scene_error(error, capacity,
+                               "flat range source identity changed");
+    }
+    size_t active_range = 0;
+    int previous_source_index = -1;
+    std::vector<int> source_map_left;
+    std::vector<int> source_map_right;
+    std::vector<float> source_map_alpha;
+    source_map_left.reserve(static_cast<size_t>(candidate.database_frames));
+    source_map_right.reserve(static_cast<size_t>(candidate.database_frames));
+    source_map_alpha.reserve(static_cast<size_t>(candidate.database_frames));
+    for (int frame = 0; frame < candidate.database_frames; ++frame) {
+        while (active_range + 1 < candidate.sources.size() &&
+               frame >= candidate.sources[active_range].range_stop)
+            ++active_range;
+        int left = -1, right = -1;
+        float alpha = -1.0f;
+        if (!scene_number_int(
+                left, left_indices->array_value[static_cast<size_t>(frame)],
+                "flat left source index", error, capacity) ||
+            !scene_number_int(
+                right, right_indices->array_value[static_cast<size_t>(frame)],
+                "flat right source index", error, capacity) ||
+            !scene_number_float(
+                alpha, source_alpha->array_value[static_cast<size_t>(frame)],
+                "flat source alpha", error, capacity) ||
+            left < 0 || left >= source_frames || right != left ||
+            feature_float_bits(alpha) != 0 ||
+            (frame > candidate.sources[active_range].range_start &&
+             left != previous_source_index + 2) ||
+            (frame == candidate.sources[active_range].range_start &&
+             (previous_source_index >= left ||
+              left != range_source_first[active_range])) ||
+            (frame == candidate.sources[active_range].range_stop - 1 &&
+             left != range_source_last[active_range]))
+            return scene_error(error, capacity,
+                               "flat source map changes inside a retained range");
+        source_map_left.push_back(left);
+        source_map_right.push_back(right);
+        source_map_alpha.push_back(alpha);
+        previous_source_index = left;
+    }
+    sha256_state source_map_digest_state;
+    for (int pass = 0; pass < 3; ++pass) {
+        for (int frame = 0; frame < candidate.database_frames; ++frame) {
+            const uint32_t value = pass == 0
+                ? static_cast<uint32_t>(source_map_left[
+                    static_cast<size_t>(frame)])
+                : pass == 1
+                    ? static_cast<uint32_t>(source_map_right[
+                        static_cast<size_t>(frame)])
+                    : feature_float_bits(source_map_alpha[
+                        static_cast<size_t>(frame)]);
+            const unsigned char bytes[4] = {
+                static_cast<unsigned char>(value),
+                static_cast<unsigned char>(value >> 8),
+                static_cast<unsigned char>(value >> 16),
+                static_cast<unsigned char>(value >> 24),
+            };
+            sha256_update(source_map_digest_state, bytes, sizeof(bytes));
+        }
+    }
+    if (sha256_finish(source_map_digest_state) != source_map_digest)
+        return scene_error(error, capacity,
+                           "flat source map digest differs");
+
+    const json_value* skeleton = json_member(document, "skeleton");
+    std::string skeleton_signature, basis;
+    const json_value* names = skeleton == NULL ? NULL : json_member(*skeleton, "names");
+    const json_value* parents = skeleton == NULL ? NULL : json_member(*skeleton, "parents");
+    if (skeleton == NULL || !scene_exact_keys(
+            *skeleton, {"names","parents","basis","signature"},
+            "flat skeleton", error, capacity) || names == NULL ||
+        parents == NULL || names->kind != json_array ||
+        parents->kind != json_array ||
+        names->array_value.size() != G1_BoneCount ||
+        parents->array_value.size() != G1_BoneCount ||
+        !scene_member_string(basis, *skeleton, "basis", "flat skeleton",
+                             error, capacity) ||
+        basis != "holden-y-up-right-handed-forward-plus-z" ||
+        !scene_member_string(skeleton_signature, *skeleton, "signature",
+                             "flat skeleton", error, capacity) ||
+        skeleton_signature != G1_SkeletonSignature)
+        return scene_error(error, capacity,
+                           "flat skeleton receipt is incompatible with G1");
+    static const char* const expected_flat_bone_names[G1_BoneCount] = {
+        "Simulation","Hips","LeftHipPitch","LeftHipRoll","LeftHipYaw",
+        "LeftKnee","LeftAnkle","LeftToe","RightHipPitch","RightHipRoll",
+        "RightHipYaw","RightKnee","RightAnkle","RightToe","Spine",
+        "Spine1","Spine2","LeftShoulderPitch","LeftShoulderRoll",
+        "LeftShoulderYaw","LeftElbow","LeftWristRoll","LeftWristPitch",
+        "LeftWrist","RightShoulderPitch","RightShoulderRoll",
+        "RightShoulderYaw","RightElbow","RightWristRoll","RightWristPitch",
+        "RightWrist"};
+    static const int expected_flat_parents[G1_BoneCount] = {
+        -1,0,1,2,3,4,5,6,1,8,9,10,11,12,1,14,
+        15,16,17,18,19,20,21,22,16,24,25,26,27,28,29};
+    for (int bone = 0; bone < G1_BoneCount; ++bone) {
+        std::string name;
+        int parent = -2;
+        if (!scene_string(
+                name, names->array_value[static_cast<size_t>(bone)],
+                "flat bone name", error, capacity) ||
+            !scene_number_int(
+                parent, parents->array_value[static_cast<size_t>(bone)],
+                "flat bone parent", error, capacity) ||
+            name != expected_flat_bone_names[bone] ||
+            parent != expected_flat_parents[bone])
+            return scene_error(error, capacity,
+                               "flat skeleton bone %d changed", bone);
+    }
+
+    const json_value* artifacts = json_member(document, "artifacts");
+    if (artifacts == NULL || !scene_exact_keys(
+            *artifacts, {"database.bin","features.bin"}, "flat artifacts",
+            error, capacity) ||
+        !flat_artifact_reference_parse(
+            candidate.database, *artifacts, "database.bin", error,
+            capacity) ||
+        !flat_artifact_reference_parse(
+            candidate.matching_features, *artifacts, "features.bin", error,
+            capacity))
+        return false;
+    std::string database_path, features_path;
+    if (!scene_join(database_path, root, candidate.database.path,
+                    error, capacity) ||
+        !scene_join(features_path, root, candidate.matching_features.path,
+                    error, capacity) ||
+        !scene_verify_sha(database_path, candidate.database.sha256,
+                          error, capacity) ||
+        !scene_verify_sha(features_path, candidate.matching_features.sha256,
+                          error, capacity))
+        return false;
+    out = std::move(candidate);
+    return true;
+}
+
 static inline bool motion_manifest_load_and_verify(
     motion_pack_manifest& out, const char* root,
     char* error, const int capacity)
@@ -614,6 +1255,15 @@ static inline bool motion_manifest_load_and_verify(
     json_value document;
     if (!json_document_load(document, manifest_path.c_str(), error, capacity))
         return false;
+    std::string detected_schema;
+    if (!scene_member_string(
+            detected_schema, document, "schema", "motion manifest",
+            error, capacity))
+        return false;
+    if (detected_schema == "g1-lmm-flat-data/v2") {
+        return flat_motion_manifest_parse_and_verify(
+            out, document, root, error, capacity);
+    }
     if (!scene_exact_keys(document,
             {"schema","output_fps","feature_dimensions","terrain_dimensions",
              "support_dimensions","terrain_feature_distances_m","total_clips",
@@ -635,9 +1285,10 @@ static inline bool motion_manifest_load_and_verify(
     if (!scene_required(value, document, "output_fps", "motion manifest",
                         error, capacity) ||
         !scene_number_double(fps, *value, "output_fps", error, capacity) ||
-        fps != 25.0)
-        return scene_error(error, capacity, "output_fps must be exactly 25");
-    candidate.output_fps = 25.0f;
+        fps != 60.0 ||
+        !g1_manifest_rate_compatible(static_cast<float>(fps)))
+        return scene_error(error, capacity, "output_fps must be exactly 60");
+    candidate.output_fps = 60.0f;
     if (!scene_member_int(candidate.feature_dimensions, document,
                           "feature_dimensions", "motion manifest",
                           error, capacity) ||
@@ -905,6 +1556,47 @@ static inline bool motion_manifest_validate_database(
     if (db.features.rows != db.nframes() || db.features.cols != 31)
         return scene_error(error, capacity,
             "database matching features must be shaped frames x 31");
+    if (manifest.flat_lmm_bundle) {
+        float observed_maximum = 0.0f;
+        if (!database_rotation_continuity_validate(
+                db, 0.25f, error, capacity, &observed_maximum) ||
+            fabsf(observed_maximum -
+                  manifest.continuity_maximum_local_step) > 1.0e-6f)
+            return scene_error(error, capacity,
+                "flat local continuity maximum differs: %.9g vs %.9g",
+                observed_maximum,
+                manifest.continuity_maximum_local_step);
+        if (manifest.feature_offset.size() != 31 ||
+            manifest.feature_scale.size() != 31 ||
+            db.features_offset.size != 31 || db.features_scale.size != 31)
+            return scene_error(error, capacity,
+                "flat feature normalization receipt is incomplete");
+        for (int dimension = 0; dimension < 31; ++dimension) {
+            if (feature_float_bits(db.features_offset(dimension)) !=
+                    feature_float_bits(manifest.feature_offset[
+                        static_cast<size_t>(dimension)]) ||
+                feature_float_bits(db.features_scale(dimension)) !=
+                    feature_float_bits(manifest.feature_scale[
+                        static_cast<size_t>(dimension)]))
+                return scene_error(error, capacity,
+                    "flat feature normalization differs at dimension %d",
+                    dimension);
+        }
+        for (int dimension = 27; dimension < 31; ++dimension) {
+            if (feature_float_bits(db.features_offset(dimension)) != 0 ||
+                feature_float_bits(db.features_scale(dimension)) !=
+                    feature_float_bits(FLT_MAX))
+                return scene_error(error, capacity,
+                    "flat terrain normalization changed at dimension %d",
+                    dimension);
+            for (int frame = 0; frame < db.nframes(); ++frame) {
+                if (feature_float_bits(db.features(frame, dimension)) != 0)
+                    return scene_error(error, capacity,
+                        "flat normalized terrain is nonzero at frame %d",
+                        frame);
+            }
+        }
+    }
     if (db.terrain_features.rows != db.nframes() ||
         db.terrain_features.cols != 4)
         return scene_error(error, capacity,
@@ -1798,6 +2490,84 @@ static inline void scene_pack_swap(scene_pack& first, scene_pack& second)
     std::swap(first.terrain_path, second.terrain_path);
     std::swap(first.mesh_path, second.mesh_path);
     std::swap(first.walkability_path, second.walkability_path);
+}
+
+static inline bool flat_scene_catalog_build(
+    scene_catalog& out,
+    const motion_pack_manifest& manifest,
+    char* error,
+    const int capacity)
+{
+    if (!manifest.flat_lmm_bundle ||
+        !g1_manifest_rate_compatible(manifest.output_fps) ||
+        manifest.sources.size() != 13)
+        return scene_error(error, capacity,
+                           "flat scene catalog requires a validated flat bundle");
+    for (size_t index = 0; index < manifest.sources.size(); ++index) {
+        if (manifest.sources[index].terrain_id != "flat")
+            return scene_error(error, capacity,
+                               "flat scene catalog range is not flat");
+    }
+    scene_catalog candidate;
+    candidate.default_scene_id = "g1-lmm-flat";
+    candidate.coordinate_signature =
+        "holden-y-up-right-handed-forward-plus-z";
+    candidate.surface_signature = "authenticated-flat-zero/v1";
+    candidate.ids.push_back(candidate.default_scene_id);
+    scene_descriptor descriptor;
+    descriptor.id = candidate.default_scene_id;
+    candidate.scenes.push_back(descriptor);
+    out = std::move(candidate);
+    return true;
+}
+
+static inline bool flat_scene_pack_build(
+    scene_pack& out,
+    const motion_pack_manifest& manifest,
+    char* error,
+    const int capacity)
+{
+    if (!manifest.flat_lmm_bundle || manifest.sources.size() != 13)
+        return scene_error(error, capacity,
+                           "flat scene requires a validated flat bundle");
+    for (size_t index = 0; index < manifest.sources.size(); ++index) {
+        if (manifest.sources[index].terrain_id != "flat")
+            return scene_error(error, capacity,
+                               "flat scene range is not flat");
+    }
+    scene_pack candidate;
+    candidate.metadata.id = "g1-lmm-flat";
+    candidate.metadata.label = "G1 LMM authenticated flat";
+    candidate.metadata.coordinate_signature =
+        "holden-y-up-right-handed-forward-plus-z";
+    candidate.metadata.surface_signature = "authenticated-flat-zero/v1";
+    candidate.metadata.playable_bounds = {-32.0f, -32.0f, 32.0f, 32.0f};
+    candidate.metadata.lookahead_bounds =
+        candidate.metadata.playable_bounds;
+    candidate.metadata.spawn_position = vec3();
+    candidate.metadata.spawn_yaw = 0.0f;
+    candidate.terrain.version = 2;
+    candidate.terrain.nx = 257;
+    candidate.terrain.nz = 257;
+    candidate.terrain.origin_x = -32.0f;
+    candidate.terrain.origin_z = -32.0f;
+    candidate.terrain.cell_size = 0.25f;
+    candidate.terrain.exterior_height = 0.0f;
+    candidate.terrain.heights.resize(
+        candidate.terrain.nx * candidate.terrain.nz);
+    candidate.terrain.heights.zero();
+    candidate.walkability.nx = candidate.terrain.nx;
+    candidate.walkability.nz = candidate.terrain.nz;
+    candidate.walkability.cells.resize(
+        candidate.walkability.nx * candidate.walkability.nz);
+    candidate.walkability.cells.set(1);
+    if (!terrain_heightfield_is_queryable(candidate.terrain) ||
+        !walkability_grid_matches_heightfield(
+            candidate.walkability, candidate.terrain))
+        return scene_error(error, capacity,
+                           "flat scene construction failed its query contract");
+    scene_pack_swap(out, candidate);
+    return true;
 }
 
 static inline bool scene_pack_load(

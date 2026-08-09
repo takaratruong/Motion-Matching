@@ -588,12 +588,13 @@ public:
         }
         const g1_movement_model_config movement_config =
             g1_movement_model_fixed_config();
+        const float g1_dt = 1.0f / 60.0f;
         vec3 movement_probe;
         if (!g1_movement_model_step(
                 movement_probe,
                 vec3(),
                 vec3(),
-                0.04f,
+                g1_dt,
                 movement_profile,
                 movement_config,
                 error,
@@ -608,7 +609,7 @@ public:
                 heading_probe,
                 quat(1.0f, 0.0f, 0.0f, 0.0f),
                 quat(1.0f, 0.0f, 0.0f, 0.0f),
-                0.04f,
+                g1_dt,
                 movement_profile,
                 g1_turn_model_fixed_config(),
                 error,
@@ -1554,6 +1555,8 @@ static std::string mm_json_hello_data(const mm_server_identity& identity)
     mm_json_write_string_array(writer, identity.target_joint_names);
     writer.raw(",\"skeleton_signature\":");
     writer.string(identity.skeleton_signature);
+    // This is the legacy source-chunk artifact grid, not the 60 Hz G1
+    // controller execution clock carried by g1_runtime_config.
     writer.raw(",\"source_rate_hz\":25,\"supported_source_intervals\":[5,10],"
                "\"supported_movement_models\":"
                "[\"raw\",\"holden-v1\",\"holden-turn-v1\"],"
