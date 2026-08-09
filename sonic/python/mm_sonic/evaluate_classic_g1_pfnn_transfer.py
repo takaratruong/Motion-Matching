@@ -89,9 +89,12 @@ def _source_masks(clip_ids: object, count: int) -> dict[str, np.ndarray]:
     if clips.shape != (count,):
         raise ValueError("source joint reconstruction rows and clip IDs are invalid")
     grail = np.char.startswith(clips, _GRAIL_PREFIX)
-    groups = {"released_pfnn": ~grail, "grail": grail}
-    if any(not np.any(mask) for mask in groups.values()):
-        raise ValueError("source-specific evaluation requires released PFNN and GRAIL rows")
+    released_pfnn = ~grail
+    if not np.any(released_pfnn):
+        raise ValueError("source-specific evaluation requires released PFNN rows")
+    groups = {"released_pfnn": released_pfnn}
+    if np.any(grail):
+        groups["grail"] = grail
     return groups
 
 
@@ -243,12 +246,16 @@ def evaluate(
                 arrays,
             ),
         },
-        "grail": {
-            **source_metrics["grail"],
-            "worst": _worst_provenance(
-                source_metrics["grail"], source_masks["grail"], arrays
-            ),
-        },
+        "grail": (
+            None
+            if "grail" not in source_metrics
+            else {
+                **source_metrics["grail"],
+                "worst": _worst_provenance(
+                    source_metrics["grail"], source_masks["grail"], arrays
+                ),
+            }
+        ),
         "released_pfnn_gate": {
             "thresholds": dict(RELEASED_PFNN_GATE),
             "failures": list(failures),

@@ -35,14 +35,15 @@ def _sha256(path: Path) -> str:
 
 
 def _write_evaluation_fixture(
-    root: Path, *, checkpoint_dataset_digest: str | None = None
+    root: Path, *, checkpoint_dataset_digest: str | None = None,
+    source: str = "mixed",
 ) -> tuple[Path, Path, VerticalDataset]:
     x_mean = np.full(INPUT_LAYOUT.size, np.float32(0.5))
     x_std = np.full(INPUT_LAYOUT.size, np.float32(0.25))
     y_mean = np.full(OUTPUT_LAYOUT.size, np.float32(1.5))
     y_std = np.full(OUTPUT_LAYOUT.size, np.float32(2.0))
     joint = OUTPUT_LAYOUT["joint_position"]
-    clips = np.asarray(
+    all_clips = np.asarray(
         (
             "terrain_slopes__slope_000__000",
             "released_a",
@@ -51,17 +52,30 @@ def _write_evaluation_fixture(
         ),
         dtype="<U128",
     )
+    source_indices = {
+        "mixed": np.asarray((0, 1, 2, 3), dtype=np.int64),
+        "released_only": np.asarray((1, 3), dtype=np.int64),
+        "grail_only": np.asarray((0, 2), dtype=np.int64),
+    }
+    if source not in source_indices:
+        raise ValueError("fixture source is invalid")
+    selected = source_indices[source]
+    clips = all_clips[selected]
     target = np.tile(y_mean, (len(clips), 1)).astype(np.float32)
-    target[3, joint.start + 3] = np.float32(0.0)
+    if "released_b" in clips:
+        target[int(np.flatnonzero(clips == "released_b")[0]), joint.start + 3] = np.float32(0.0)
+    all_lanes = np.asarray(
+        ("motion", "motion", "idle_phase_0", "idle_phase_0"), dtype="<U16"
+    )
+    all_centers = np.asarray((100, 200, 300, 400), dtype=np.int64)
+    all_phase = np.asarray((0.1, 0.2, 0.3, 0.4), dtype=np.float32)
     values = VerticalSplitArrays(
         x=np.full((len(clips), INPUT_LAYOUT.size), np.float32(0.75)),
         y=target,
-        phase=np.asarray((0.1, 0.2, 0.3, 0.4), dtype=np.float32),
+        phase=all_phase[selected],
         clip_id=clips,
-        sequence_lane=np.asarray(
-            ("motion", "motion", "idle_phase_0", "idle_phase_0"), dtype="<U16"
-        ),
-        center_frame_120hz=np.asarray((100, 200, 300, 400), dtype=np.int64),
+        sequence_lane=all_lanes[selected],
+        center_frame_120hz=all_centers[selected],
         root_world_xy=np.zeros((len(clips), 2), dtype=np.float32),
         root_world_yaw=np.zeros(len(clips), dtype=np.float32),
         terrain_class=np.asarray(("flat",) * len(clips), dtype="<U10"),
@@ -74,12 +88,7 @@ def _write_evaluation_fixture(
         "y_mean": y_mean,
         "y_std": y_std,
     }
-    source_roles = {
-        "terrain_slopes__slope_000__000": "validation",
-        "released_a": "validation",
-        "terrain_slopes__slope_000__001": "validation",
-        "released_b": "validation",
-    }
+    source_roles = {str(clip): "validation" for clip in clips}
     dataset = VerticalDataset(
         splits={"train": values, "validation": values},
         **normalization,
@@ -263,6 +272,55 @@ class ClassicG1PFNNTransferEvaluationTests(unittest.TestCase):
                         "--checkpoint", str(checkpoint), "--dataset", str(manifest),
                         "--device", "cpu", "--output", str(output),
                     ]
+                )
+
+    def test_released_only_evaluate_and_cli_emit_null_grail_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest, checkpoint, _ = _write_evaluation_fixture(
+                root, source="released_only"
+            )
+
+            report = transfer.evaluate(
+                checkpoint_path=checkpoint, dataset_path=manifest, device="cpu"
+            )
+
+            self.assertEqual(report["released_pfnn"]["sample_count"], 2)
+            self.assertIsNone(report["grail"])
+            self.assertEqual(
+                report["released_pfnn"]["worst"],
+                {
+                    "source_frame_index": 1,
+                    "split_index": 1,
+                    "clip_id": "released_b",
+                    "sequence_lane": "idle_phase_0",
+                    "center_frame_120hz": 400,
+                    "joint_index": 3,
+                    "joint_name": "left_hip_roll_joint",
+                },
+            )
+            self.assertEqual(report["checkpoint_sha256"], _sha256(checkpoint))
+            self.assertEqual(report["dataset_manifest_sha256"], _sha256(manifest))
+            self.assertFalse(report["released_pfnn_gate"]["accepted"])
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                status = transfer.main(
+                    [
+                        "--checkpoint", str(checkpoint), "--dataset", str(manifest),
+                        "--device", "cpu",
+                    ]
+                )
+            self.assertEqual(status, 2)
+            self.assertIsNone(json.loads(stdout.getvalue())["grail"])
+
+    def test_grail_only_evaluation_rejects_missing_released_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest, checkpoint, _ = _write_evaluation_fixture(
+                Path(directory), source="grail_only"
+            )
+
+            with self.assertRaisesRegex(ValueError, "requires released PFNN rows"):
+                transfer.evaluate(
+                    checkpoint_path=checkpoint, dataset_path=manifest, device="cpu"
                 )
 
 
