@@ -704,6 +704,96 @@ def _rotation_between_normals(source: np.ndarray, target: np.ndarray) -> np.ndar
     return np.eye(3) + skew + skew @ skew * ((1.0 - cosine) / (sine * sine))
 
 
+def _full_sole_stance_mask(
+    stance: object,
+    *,
+    boundary_frames: int = 2,
+) -> np.ndarray:
+    """Separate rigid plants from valid heel/toe contact transitions.
+
+    Contact labels include the first touchdown and final takeoff frames.  A
+    natural gait can still be rolling through the heel or toe there, so
+    forcing all four sole probes onto one tread at those frames creates an
+    artificial ankle snap and can make an otherwise reachable plant appear
+    impossible.  The interior remains a hard whole-sole plant; short runs
+    retain at least one interior frame.
+    """
+
+    authored = np.asarray(stance, dtype=bool)
+    if authored.ndim != 2 or authored.shape[1] != 2:
+        raise ValueError("stance mask must have shape [frames, 2]")
+    if int(boundary_frames) < 0:
+        raise ValueError("boundary frame count must be nonnegative")
+    core = np.zeros_like(authored)
+    for span in _stance_spans(authored):
+        length = int(span.stop_frame) - int(span.start_frame)
+        trim = min(int(boundary_frames), max(0, (length - 1) // 2))
+        core[
+            int(span.start_frame) + trim : int(span.stop_frame) - trim,
+            int(span.foot_index),
+        ] = True
+    return core
+
+
+def _clamp_bracketed_swing_overshoot(
+    sole_targets_world: object,
+    full_sole_stance: object,
+) -> tuple[np.ndarray, dict[str, float]]:
+    """Keep each swing between its preceding and following footholds.
+
+    Blending two planted-foot offsets with an independently moving source
+    swing can make the target pass beyond its next tread and then reverse into
+    contact.  On stairs that small planar overshoot intersects the following
+    riser even when both endpoint footholds are valid.  Preserve the source
+    height and sole articulation, but project its planar centre monotonically
+    along the segment joining the two actual footholds.
+    """
+
+    targets = np.asarray(sole_targets_world, dtype=np.float64).copy()
+    stance = np.asarray(full_sole_stance, dtype=bool)
+    if targets.ndim != 4 or targets.shape[:2] != stance.shape:
+        raise ValueError("swing clamp requires sole targets and stance [T,2]")
+    maximum_correction = 0.0
+    corrected_frame_foot_count = 0
+    for foot in range(2):
+        spans = sorted(
+            (span for span in _stance_spans(stance) if span.foot_index == foot),
+            key=lambda span: span.start_frame,
+        )
+        for previous, following in zip(spans, spans[1:]):
+            start = int(previous.stop_frame)
+            stop = int(following.start_frame)
+            if stop <= start:
+                continue
+            previous_centre = np.mean(
+                targets[int(previous.stop_frame) - 1, foot], axis=0
+            )
+            following_centre = np.mean(
+                targets[int(following.start_frame), foot], axis=0
+            )
+            delta = following_centre[:2] - previous_centre[:2]
+            distance = float(np.linalg.norm(delta))
+            if distance <= 1.0e-6:
+                continue
+            direction = delta / distance
+            centres = np.mean(targets[start:stop, foot], axis=1)
+            raw = (centres[:, :2] - previous_centre[:2]) @ direction
+            monotone = np.maximum.accumulate(np.clip(raw, 0.0, distance))
+            correction = (monotone - raw)[:, None] * direction[None]
+            magnitude = np.linalg.norm(correction, axis=1)
+            active = magnitude > 1.0e-8
+            targets[start:stop, foot, :, :2] += correction[:, None, :]
+            maximum_correction = max(
+                maximum_correction,
+                float(np.max(magnitude)) if len(magnitude) else 0.0,
+            )
+            corrected_frame_foot_count += int(np.count_nonzero(active))
+    return targets, {
+        "maximum_planar_swing_overshoot_correction_m": maximum_correction,
+        "corrected_swing_frame_foot_count": float(corrected_frame_foot_count),
+    }
+
+
 def _conform_stance_sole_targets_to_mesh(
     extras: dict[str, np.ndarray],
     *,
@@ -729,13 +819,14 @@ def _conform_stance_sole_targets_to_mesh(
         target_mesh.mesh, target_mesh.world_from_terrain
     )
     ray_z = float(np.max(target_mesh.vertices_world[:, 2]) + 1.0)
+    full_sole_stance = _full_sole_stance_mask(stance)
     anchored = targets.copy()
     assigned = np.zeros(stance.shape, dtype=bool)
     rotations: list[float] = []
     translations: list[float] = []
     ground_fallback_runs = 0
     partially_supported_runs = 0
-    for span in _stance_spans(stance):
+    for span in _stance_spans(full_sole_stance):
         foot = int(span.foot_index)
         frame = (int(span.start_frame) + int(span.stop_frame) - 1) // 2
         points = np.asarray(targets[frame, foot], dtype=np.float64)
@@ -808,11 +899,11 @@ def _conform_stance_sole_targets_to_mesh(
     updated["pre_conformance_target_sole_points_world"] = np.asarray(
         targets, dtype=np.float32
     )
-    updated["target_sole_points_world"] = np.asarray(
-        _blend_anchored_sole_offsets(targets, anchored, assigned),
-        dtype=np.float32,
-    )
+    blended = _blend_anchored_sole_offsets(targets, anchored, assigned)
+    updated["target_sole_points_world"] = np.asarray(blended, dtype=np.float32)
     updated["stance_sole_surface_conformance_mask"] = assigned
+    updated["full_sole_stance_mask"] = full_sole_stance
+    updated["partial_contact_stance_mask"] = stance & ~full_sole_stance
     return updated, {
         "stance_run_count": float(len(rotations)),
         "ground_fallback_run_count": float(ground_fallback_runs),
@@ -1394,6 +1485,11 @@ def _refit_motion_to_sole_targets(
         raise ValueError("sole targets must be finite three-dimensional points")
     stance = np.asarray(extras.get("authored_stance_mask"), dtype=bool)
     has_stance_schedule = stance.shape == (frame_count, 2)
+    constraint_stance = np.asarray(
+        extras.get("full_sole_stance_mask", stance), dtype=bool
+    )
+    if has_stance_schedule and constraint_stance.shape != stance.shape:
+        raise ValueError("full-sole stance mask must match authored stance")
     if stance_only and not has_stance_schedule:
         raise ValueError("stance-only refit requires authored_stance_mask [T,2]")
 
@@ -1420,7 +1516,7 @@ def _refit_motion_to_sole_targets(
             # smooth.  Preserve the actual swing geometry here; collision
             # repair remains responsible for lifting a swing that clips.
             for foot in range(2):
-                if not stance[frame, foot]:
+                if not constraint_stance[frame, foot]:
                     targets[frame, foot] = authored_feet[foot]
         authored_error = max(
             float(
@@ -1486,7 +1582,7 @@ def _refit_motion_to_sole_targets(
         ]
         if (
             has_stance_schedule
-            and np.any(stance[frame])
+            and np.any(constraint_stance[frame])
             and min(float(value[2]) for value in geometrically_scored) > 0.008
             and frame + 1 < frame_count
         ):
@@ -1608,23 +1704,7 @@ def _audit_stance_contact_support(
         raise ValueError("contact audit requires full per-frame sole targets")
     if not np.any(stance):
         raise ValueError("contact audit found no authored stance frames")
-    core_stance = np.zeros_like(stance)
-    for foot in range(2):
-        start = 0
-        while start < frame_count:
-            if not stance[start, foot]:
-                start += 1
-                continue
-            stop = start + 1
-            while stop < frame_count and stance[stop, foot]:
-                stop += 1
-            # Toe/heel roll at takeoff and landing is valid.  The middle of a
-            # planted run must nevertheless place the whole rigid sole close
-            # to the tread; otherwise a collision-free root lift can pass
-            # while the visible foot hovers.
-            trim = min(2, max(0, (stop - start - 1) // 2))
-            core_stance[start + trim : stop - trim, foot] = True
-            start = stop
+    core_stance = _full_sole_stance_mask(stance)
     if not np.any(core_stance):
         raise ValueError("contact audit found no core stance frames")
 
@@ -1946,6 +2026,83 @@ def _repair_swing_foot_clearance(
     return repaired, updated, current, diagnostics
 
 
+def _repair_swing_planar_overshoot(
+    motion: StitchedMotion,
+    extras: dict[str, np.ndarray],
+    collision: object,
+    *,
+    adapter: _G1FootfallAdapter,
+    target_mesh: TerrainMeshIndex,
+    model_path: Path,
+    joint_names: Sequence[str],
+) -> tuple[
+    StitchedMotion,
+    dict[str, np.ndarray],
+    object,
+    dict[str, float],
+]:
+    """Advance a late swing to its next foothold only when it hits a riser."""
+
+    full_sole_stance = np.asarray(
+        extras.get("full_sole_stance_mask"), dtype=bool
+    )
+    targets = np.asarray(
+        extras.get("target_sole_points_world"), dtype=np.float64
+    )
+    if full_sole_stance.shape != targets.shape[:2]:
+        return motion, extras, collision, {
+            "maximum_planar_swing_overshoot_correction_m": 0.0,
+            "corrected_swing_frame_foot_count": 0.0,
+            "reverted_no_improvement": 1.0,
+        }
+    corrected, diagnostics = _clamp_bracketed_swing_overshoot(
+        targets, full_sole_stance
+    )
+    if diagnostics["maximum_planar_swing_overshoot_correction_m"] <= 1.0e-8:
+        return motion, extras, collision, {
+            **diagnostics,
+            "reverted_no_improvement": 1.0,
+        }
+    candidate_extras = dict(extras)
+    candidate_extras["target_sole_points_world"] = np.asarray(
+        corrected, dtype=np.float32
+    )
+    candidate, candidate_extras, refit = _refit_motion_to_sole_targets(
+        motion,
+        candidate_extras,
+        adapter=adapter,
+    )
+    candidate_collision = audit_stair_motion_collisions(
+        candidate,
+        model_path=model_path,
+        target_mesh=target_mesh,
+        joint_names=joint_names,
+        maximum_foot_penetration_m=0.005,
+        maximum_forbidden_body_penetration_m=0.0,
+    )
+    improved = bool(
+        candidate_collision.maximum_forbidden_body_penetration_m
+        <= collision.maximum_forbidden_body_penetration_m + 1.0e-9
+        and candidate_collision.maximum_foot_penetration_m
+        < collision.maximum_foot_penetration_m - 1.0e-4
+    )
+    report = {
+        **diagnostics,
+        "maximum_refit_error_m": float(refit["maximum_sole_target_error_m"]),
+        "maximum_refit_joint_step_rad": float(refit["maximum_joint_step_rad"]),
+        "pre_repair_foot_penetration_m": float(
+            collision.maximum_foot_penetration_m
+        ),
+        "candidate_foot_penetration_m": float(
+            candidate_collision.maximum_foot_penetration_m
+        ),
+        "reverted_no_improvement": float(not improved),
+    }
+    if not improved:
+        return motion, extras, collision, report
+    return candidate, candidate_extras, candidate_collision, report
+
+
 def _repair_stance_foot_mesh_clearance(
     motion: StitchedMotion,
     extras: dict[str, np.ndarray],
@@ -2066,6 +2223,11 @@ def _raise_pelvis_to_reach_sole_targets(
         raise ValueError("pelvis reach solve requires full sole targets")
     if stance.shape != (frame_count, 2):
         raise ValueError("pelvis reach solve requires a stance mask")
+    constraint_stance = np.asarray(
+        extras.get("full_sole_stance_mask", stance), dtype=bool
+    )
+    if constraint_stance.shape != stance.shape:
+        raise ValueError("full-sole stance mask must match authored stance")
 
     maximum_lift = float(maximum_lift_m)
     candidates = np.arange(
@@ -2076,10 +2238,19 @@ def _raise_pelvis_to_reach_sole_targets(
     )
     feasible = np.ones((frame_count, len(candidates)), dtype=bool)
     for frame in range(frame_count):
-        if not np.any(stance[frame]):
+        if not np.any(constraint_stance[frame]):
             continue
         feasible[frame] = False
         candidate_errors: list[tuple[float, float, float]] = []
+        reach_targets = targets[frame].copy()
+        authored_feet = adapter.sole_positions_for_pose(
+            root_position=roots[frame],
+            root_quaternion_wxyz=quaternions[frame],
+            joints=joints[frame],
+        )
+        for foot in range(2):
+            if not constraint_stance[frame, foot]:
+                reach_targets[foot] = authored_feet[foot]
         for state, lift in enumerate(candidates):
             root = roots[frame].copy()
             root[2] += float(lift)
@@ -2087,7 +2258,7 @@ def _raise_pelvis_to_reach_sole_targets(
                 root_position=root,
                 root_quaternion_wxyz=quaternions[frame],
                 authored_joints=joints[frame],
-                sole_targets_world=targets[frame],
+                sole_targets_world=reach_targets,
                 initial_joints=None,
             )
             feet = adapter.sole_positions_for_pose(
@@ -2099,17 +2270,17 @@ def _raise_pelvis_to_reach_sole_targets(
                 [
                     np.max(
                         np.linalg.norm(
-                            feet[foot] - targets[frame, foot], axis=1
+                            feet[foot] - reach_targets[foot], axis=1
                         )
                     )
                     for foot in range(2)
                 ],
                 dtype=np.float64,
             )
-            stance_error = float(np.max(errors[stance[frame]]))
+            stance_error = float(np.max(errors[constraint_stance[frame]]))
             swing_error = float(
-                np.max(errors[~stance[frame]])
-                if np.any(~stance[frame])
+                np.max(errors[~constraint_stance[frame]])
+                if np.any(~constraint_stance[frame])
                 else 0.0
             )
             candidate_errors.append((float(lift), stance_error, swing_error))
@@ -2130,7 +2301,10 @@ def _raise_pelvis_to_reach_sole_targets(
             )
             raise ValueError(
                 "side-on sole targets have no feasible pelvis height: "
-                f"frame={frame} stance={stance[frame].astype(int).tolist()} "
+                f"frame={frame} "
+                f"stance={stance[frame].astype(int).tolist()} "
+                "full_sole_stance="
+                f"{constraint_stance[frame].astype(int).tolist()} "
                 f"best_lift_m={best_lift:.3f} "
                 f"stance_error_m={best_stance_error:.6f} "
                 f"swing_error_m={best_swing_error:.6f}"
@@ -2420,6 +2594,24 @@ def build(arguments: argparse.Namespace) -> dict[str, object]:
                 )
                 row["pre_clearance_collision_audit"] = collision.to_dict()
                 clearance_lift = 0.0
+                if (
+                    not collision.accepted
+                    and collision.maximum_forbidden_body_penetration_m
+                    <= 1.0e-6
+                    and collision.maximum_foot_penetration_m <= 0.025
+                ):
+                    motion, extras, collision, planar_swing_repair = (
+                        _repair_swing_planar_overshoot(
+                            motion,
+                            extras,
+                            collision,
+                            adapter=adapter,
+                            target_mesh=target_mesh,
+                            model_path=arguments.model,
+                            joint_names=joint_names,
+                        )
+                    )
+                    row["swing_planar_overshoot_repair"] = planar_swing_repair
                 if (
                     not collision.accepted
                     and collision.maximum_forbidden_body_penetration_m

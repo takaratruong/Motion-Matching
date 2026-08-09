@@ -469,6 +469,9 @@ def _source_stance_schedule_and_extras(
     }
     diagnostics = {
         "frame_count": frame_count,
+        "minimum_stance_run_frames": int(minimum_stance_run_frames),
+        "maximum_stance_gap_frames": int(maximum_stance_gap_frames),
+        "maximum_stance_speed_threshold_mps": float(maximum_stance_speed_mps),
         "stance_frame_foot_count": int(np.count_nonzero(stance)),
         "stance_span_count": len(_stance_spans(stance)),
         "minimum_source_support_point_count": int(
@@ -727,6 +730,9 @@ def _build_one(
     arm_swing_scale: float,
     wrist_swing_scale: float,
     arm_smoothing_sigma_frames: float,
+    minimum_stance_run_frames: int,
+    maximum_stance_gap_frames: int,
+    maximum_stance_speed_mps: float,
 ) -> dict[str, object]:
     row: dict[str, object] = {
         "schema": "motionbricks-contact-rough-pilot/v1",
@@ -772,6 +778,9 @@ def _build_one(
             source,
             adapter=adapter,
             source_mesh=source_mesh,
+            minimum_stance_run_frames=minimum_stance_run_frames,
+            maximum_stance_gap_frames=maximum_stance_gap_frames,
+            maximum_stance_speed_mps=maximum_stance_speed_mps,
         )
         row["source_stance_schedule"] = stance_schedule
         row["continuous_paired_warp_skipped"] = True
@@ -940,6 +949,14 @@ def _build_one(
             or motion_metrics["maximum_root_rotation_step_rad"] > 0.080
             or motion_metrics["maximum_root_acceleration_m_s2"] > 30.0
         ):
+            debug_path = destination / "rejected_smoothness_debug.npz"
+            _save_motion(
+                debug_path,
+                motion,
+                mode="motionbricks_contact_rough_smoothness_debug",
+                extras=extras,
+            )
+            row["rejected_smoothness_debug"] = str(debug_path.resolve())
             raise ValueError("rough-terrain motion failed final smoothness gate")
         upper_limb = _upper_limb_motion_metrics(
             motion.joint_position, joint_names, fps=motion.fps
@@ -1010,6 +1027,9 @@ def build(arguments: argparse.Namespace) -> dict[str, object]:
                 arm_swing_scale=arguments.arm_swing_scale,
                 wrist_swing_scale=arguments.wrist_swing_scale,
                 arm_smoothing_sigma_frames=arguments.arm_smoothing_sigma_frames,
+                minimum_stance_run_frames=arguments.minimum_stance_run_frames,
+                maximum_stance_gap_frames=arguments.maximum_stance_gap_frames,
+                maximum_stance_speed_mps=arguments.maximum_stance_speed_mps,
             )
             rows.append(row)
             print(
@@ -1043,6 +1063,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--arm-swing-scale", type=float, default=0.35)
     parser.add_argument("--wrist-swing-scale", type=float, default=0.10)
     parser.add_argument("--arm-smoothing-sigma-frames", type=float, default=2.0)
+    parser.add_argument("--minimum-stance-run-frames", type=int, default=5)
+    parser.add_argument("--maximum-stance-gap-frames", type=int, default=1)
+    parser.add_argument("--maximum-stance-speed-mps", type=float, default=0.05)
     return parser
 
 
@@ -1059,6 +1082,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--wrist-swing-scale must lie in [0,1]")
     if arguments.arm_smoothing_sigma_frames < 0.0:
         parser.error("--arm-smoothing-sigma-frames must be nonnegative")
+    if arguments.minimum_stance_run_frames < 1:
+        parser.error("--minimum-stance-run-frames must be positive")
+    if arguments.maximum_stance_gap_frames < 0:
+        parser.error("--maximum-stance-gap-frames must be nonnegative")
+    if arguments.maximum_stance_speed_mps <= 0.0:
+        parser.error("--maximum-stance-speed-mps must be positive")
     result = build(arguments)
     print(
         json.dumps(

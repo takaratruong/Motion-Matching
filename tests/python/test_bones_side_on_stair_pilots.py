@@ -6,8 +6,10 @@ import numpy as np
 from mm_sonic.build_bones_side_on_stair_pilots import (
     _adaptively_subdivide_motion_steps,
     _attenuate_upper_limb_motion,
+    _clamp_bracketed_swing_overshoot,
     _conform_stance_sole_targets_to_mesh,
     _flat_support_mesh,
+    _full_sole_stance_mask,
     _lateral_stance_level_schedule,
     _refit_motion_to_sole_targets,
     _repairable_warp_accepted,
@@ -32,6 +34,43 @@ def test_short_contact_blips_are_not_treated_as_stance() -> None:
     assert not np.any(filtered[1:3, 0])
     assert np.all(filtered[5:10, 0])
     assert np.all(filtered[2:6, 1])
+
+
+def test_full_sole_stance_preserves_heel_toe_boundaries() -> None:
+    stance = np.zeros((14, 2), dtype=bool)
+    stance[2:10, 0] = True
+    stance[5:8, 1] = True
+
+    full_sole = _full_sole_stance_mask(stance, boundary_frames=2)
+
+    np.testing.assert_array_equal(
+        np.flatnonzero(full_sole[:, 0]), np.arange(4, 8)
+    )
+    np.testing.assert_array_equal(
+        np.flatnonzero(full_sole[:, 1]), np.asarray((6,))
+    )
+
+
+def test_bracketed_swing_does_not_overshoot_then_reverse_into_foothold() -> None:
+    targets = np.zeros((10, 2, 4, 3), dtype=np.float64)
+    raw_progress = np.asarray((0.0, 0.0, 0.1, 0.4, 0.8, 1.15, 1.08, 1.0, 1.0, 1.0))
+    targets[:, 0, :, 0] = raw_progress[:, None]
+    targets[:, 0, :, 2] = np.linspace(0.02, 0.20, 10)[:, None]
+    stance = np.zeros((10, 2), dtype=bool)
+    stance[0:2, 0] = True
+    stance[7:10, 0] = True
+
+    corrected, diagnostics = _clamp_bracketed_swing_overshoot(targets, stance)
+    progress = np.mean(corrected[:, 0, :, 0], axis=1)
+
+    np.testing.assert_allclose(progress[:2], 0.0)
+    np.testing.assert_allclose(progress[7:], 1.0)
+    assert np.all(np.diff(progress[1:8]) >= -1.0e-12)
+    assert np.max(progress) <= 1.0 + 1.0e-12
+    np.testing.assert_allclose(corrected[..., 2], targets[..., 2])
+    assert math.isclose(
+        diagnostics["maximum_planar_swing_overshoot_correction_m"], 0.15
+    )
 
 
 def test_upper_limb_attenuation_reduces_swing_without_changing_legs() -> None:
@@ -159,6 +198,60 @@ def test_stance_only_refit_does_not_chase_free_swing_target() -> None:
     np.testing.assert_allclose(refitted.joint_position[:, 1], 0.0)
     np.testing.assert_allclose(
         extras["target_sole_points_world"][:, 1], 0.0
+    )
+
+
+def test_stance_only_refit_does_not_flatten_partial_contact_boundary() -> None:
+    class TwoFootAdapter:
+        @staticmethod
+        def sole_positions_for_pose(*, joints, **_kwargs):
+            left = np.tile(np.asarray((float(joints[0]), 0.0, 0.0)), (4, 1))
+            right = np.tile(np.asarray((float(joints[1]), 0.0, 0.0)), (4, 1))
+            return left, right
+
+        @staticmethod
+        def adapt_to_targets(*, sole_targets_world, **_kwargs):
+            joints = np.asarray(
+                (sole_targets_world[0, 0, 0], sole_targets_world[1, 0, 0])
+            )
+            return joints, float(np.max(np.abs(joints))), 0.0
+
+    frame_count = 5
+    motion = StitchedMotion(
+        fps=50.0,
+        root_position_world=np.zeros((frame_count, 3), dtype=np.float32),
+        root_quaternion_world_wxyz=np.tile(
+            np.asarray((1.0, 0.0, 0.0, 0.0), dtype=np.float32),
+            (frame_count, 1),
+        ),
+        joint_position=np.zeros((frame_count, 2), dtype=np.float32),
+        provenance=tuple(
+            FrameProvenance(-1, frame, "test") for frame in range(frame_count)
+        ),
+        seam_indices=(),
+    )
+    targets = np.zeros((frame_count, 2, 4, 3), dtype=np.float32)
+    targets[:, 0, :, 0] = 0.2
+    stance = np.zeros((frame_count, 2), dtype=np.bool_)
+    stance[:, 0] = True
+    full_sole = np.zeros_like(stance)
+    full_sole[2, 0] = True
+
+    refitted, extras, _metrics = _refit_motion_to_sole_targets(
+        motion,
+        {
+            "target_sole_points_world": targets,
+            "authored_stance_mask": stance,
+            "full_sole_stance_mask": full_sole,
+        },
+        adapter=TwoFootAdapter(),
+        stance_only=True,
+    )
+
+    np.testing.assert_allclose(refitted.joint_position[[0, 1, 3, 4], 0], 0.0)
+    np.testing.assert_allclose(refitted.joint_position[2, 0], 0.2)
+    np.testing.assert_allclose(
+        extras["target_sole_points_world"][[0, 1, 3, 4], 0], 0.0
     )
 
 def test_short_contact_dropout_is_merged_into_one_stance() -> None:
@@ -317,8 +410,13 @@ def test_stance_sole_conformance_flattens_a_tilted_foot_on_a_tread() -> None:
         ground_fallback_height_m=0.0,
     )
 
-    core = conformed["target_sole_points_world"][3:7, 0, :, 2]
+    core = conformed["target_sole_points_world"][4:6, 0, :, 2]
     np.testing.assert_allclose(core, 0.02, atol=1.0e-6)
+    assert np.ptp(conformed["target_sole_points_world"][3, 0, :, 2]) > 0.0
+    np.testing.assert_array_equal(
+        conformed["full_sole_stance_mask"][:, 0],
+        (False, False, False, False, True, True, False, False, False, False),
+    )
     assert diagnostics["maximum_surface_alignment_deg"] > 10.0
 
 
