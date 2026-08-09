@@ -14,7 +14,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .database import read_holden_database, write_holden_database
-from .schema import ArtifactSet
+from .schema import ArtifactSet, FeatureSet
 
 
 MAGIC = b"G1TF"
@@ -66,6 +66,57 @@ ASSET_DESCRIPTOR_KEYS = {
     },
 }
 COORDINATE_SIGNATURE = "holden-y-up-right-handed-forward-plus-z"
+
+
+def features_bytes(features: FeatureSet) -> bytes:
+    if not isinstance(features, FeatureSet):
+        raise TypeError("features must be a FeatureSet")
+    features.validate()
+    values = np.ascontiguousarray(features.values, dtype="<f4")
+    offset = np.ascontiguousarray(features.offset, dtype="<f4")
+    scale = np.ascontiguousarray(features.scale, dtype="<f4")
+    return b"".join((
+        struct.pack("<II", *values.shape), values.tobytes(order="C"),
+        struct.pack("<I", len(offset)), offset.tobytes(order="C"),
+        struct.pack("<I", len(scale)), scale.tobytes(order="C"),
+    ))
+
+
+def write_features(path: os.PathLike | str, features: FeatureSet) -> None:
+    with open(path, "wb") as stream:
+        stream.write(features_bytes(features))
+
+
+def read_features(path: os.PathLike | str) -> FeatureSet:
+    with open(path, "rb") as stream:
+        def read_exact(size, label):
+            payload = stream.read(size)
+            if len(payload) != size:
+                raise ValueError(f"{path}: truncated {label}")
+            return payload
+
+        rows, columns = struct.unpack("<II", read_exact(8, "feature header"))
+        if rows < 1 or columns != 31:
+            raise ValueError(f"{path}: invalid feature dimensions")
+        values = np.frombuffer(
+            read_exact(rows * columns * 4, "feature payload"),
+            dtype="<f4",
+        ).reshape(rows, columns).copy()
+        offset_count, = struct.unpack("<I", read_exact(4, "offset header"))
+        if offset_count != columns:
+            raise ValueError(f"{path}: invalid feature offset dimensions")
+        offset = np.frombuffer(
+            read_exact(columns * 4, "offset payload"), dtype="<f4").copy()
+        scale_count, = struct.unpack("<I", read_exact(4, "scale header"))
+        if scale_count != columns:
+            raise ValueError(f"{path}: invalid feature scale dimensions")
+        scale = np.frombuffer(
+            read_exact(columns * 4, "scale payload"), dtype="<f4").copy()
+        if stream.read(1):
+            raise ValueError(f"{path}: trailing feature bytes")
+    result = FeatureSet(values, offset, scale)
+    result.validate()
+    return result
 
 
 class PublicationCommittedError(RuntimeError):
@@ -993,6 +1044,138 @@ def publish_artifacts(
                     ) from rollback_error
                 raise
 
+            committed = True
+            if exchanged:
+                try:
+                    _remove_owned_scratch(staging, staging_identity)
+                except BaseException as cleanup_error:
+                    preserve_staging = True
+                    raise PublicationCommittedError(
+                        output_dir, staging, cleanup_error,
+                    ) from cleanup_error
+        return manifest
+    finally:
+        if not committed and not preserve_staging:
+            _remove_owned_scratch(staging, staging_identity)
+
+
+def _validate_staged_flat(staging, artifacts, features, manifest):
+    files, directories = _inspect_tree(staging)
+    if files != {"database.bin", "features.bin", "manifest.json"} \
+            or directories != {"."}:
+        raise ValueError("flat artifact tree changed")
+    expected_manifest = canonical_json_bytes(manifest)
+    if _read_regular_bytes(os.path.join(staging, "manifest.json")) \
+            != expected_manifest:
+        raise ValueError("flat manifest bytes changed")
+    for name in ("database.bin", "features.bin"):
+        descriptor = manifest["artifacts"][name]
+        path = os.path.join(staging, name)
+        node = os.stat(path)
+        if descriptor != {
+            "path": name,
+            "size_bytes": node.st_size,
+            "sha256": sha256_file(path),
+        }:
+            raise ValueError(f"flat {name} descriptor changed")
+    loaded_database = read_holden_database(
+        os.path.join(staging, "database.bin"))
+    loaded_features = read_features(os.path.join(staging, "features.bin"))
+    for field in (
+        "positions", "velocities", "rotations", "angular_velocities",
+        "parents", "range_starts", "range_stops", "contacts",
+    ):
+        if not np.array_equal(
+                getattr(loaded_database, field), getattr(artifacts, field)):
+            raise ValueError(f"flat database {field} round trip changed")
+    for field in ("values", "offset", "scale"):
+        if not np.array_equal(
+                getattr(loaded_features, field), getattr(features, field)):
+            raise ValueError(f"flat features {field} round trip changed")
+
+
+def publish_flat_artifacts(
+    output_dir, artifacts, features, manifest_base, validate_candidate,
+):
+    if not isinstance(artifacts, ArtifactSet):
+        raise TypeError("artifacts must be an ArtifactSet")
+    artifacts.validate()
+    if not isinstance(features, FeatureSet):
+        raise TypeError("features must be a FeatureSet")
+    features.validate()
+    if len(features.values) != len(artifacts.positions):
+        raise ValueError("database and matching feature rows differ")
+    if type(manifest_base) is not dict \
+            or manifest_base.get("schema") != "g1-lmm-flat-data/v1" \
+            or "artifacts" in manifest_base or "status" in manifest_base:
+        raise ValueError("flat manifest base is invalid")
+    if not callable(validate_candidate):
+        raise TypeError("validate_candidate must be callable")
+    normalized_base = json.loads(canonical_json_bytes(manifest_base))
+
+    output_dir = os.path.abspath(os.fspath(output_dir))
+    parent = os.path.dirname(output_dir)
+    basename = os.path.basename(output_dir)
+    if not basename:
+        raise ValueError("output directory must have a basename")
+    os.makedirs(parent, exist_ok=True)
+    _output_exists_as_directory(output_dir)
+    staging = tempfile.mkdtemp(prefix=f".{basename}.staging-", dir=parent)
+    staging_identity = _scratch_directory_identity(staging)
+    candidate_identity = staging_identity
+    preserve_staging = False
+    committed = False
+    try:
+        _write_database_exclusive(
+            os.path.join(staging, "database.bin"), artifacts)
+        _write_bytes_fsync(
+            os.path.join(staging, "features.bin"), features_bytes(features))
+        artifact_descriptors = {}
+        for name in ("database.bin", "features.bin"):
+            path = os.path.join(staging, name)
+            artifact_descriptors[name] = {
+                "path": name,
+                "size_bytes": os.stat(path).st_size,
+                "sha256": sha256_file(path),
+            }
+        manifest = dict(normalized_base)
+        manifest["status"] = "accepted"
+        manifest["artifacts"] = artifact_descriptors
+        _write_bytes_fsync(
+            os.path.join(staging, "manifest.json"),
+            canonical_json_bytes(manifest))
+
+        _validate_staged_flat(staging, artifacts, features, manifest)
+        validate_candidate(staging)
+        _validate_staged_flat(staging, artifacts, features, manifest)
+        _fsync_tree(staging)
+        with _locked_parent(parent) as parent_descriptor:
+            _validate_staged_flat(staging, artifacts, features, manifest)
+            output_identity = _output_directory_identity(output_dir)
+            exchanged = False
+            if output_identity is not None:
+                _rename_exchange(staging, output_dir)
+                exchanged = True
+                staging_identity = output_identity
+            else:
+                os.replace(staging, output_dir)
+                staging_identity = None
+            try:
+                _fsync_parent(parent_descriptor)
+            except BaseException as commit_error:
+                try:
+                    if exchanged:
+                        _rename_exchange(staging, output_dir)
+                    else:
+                        os.replace(output_dir, staging)
+                    staging_identity = candidate_identity
+                    _fsync_parent(parent_descriptor)
+                except BaseException as rollback_error:
+                    preserve_staging = True
+                    raise PublicationRollbackError(
+                        output_dir, staging, commit_error, rollback_error,
+                    ) from rollback_error
+                raise
             committed = True
             if exchanged:
                 try:

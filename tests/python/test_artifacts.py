@@ -27,6 +27,9 @@ from resources.g1_terrain_builder.artifacts import (
     write_support_sidecar,
     write_terrain_sidecar,
     write_walkability,
+    features_bytes,
+    read_features,
+    write_features,
 )
 from resources.g1_terrain_builder.scenes import (
     REQUIRED_SCENE_IDS,
@@ -38,6 +41,7 @@ from resources.g1_terrain_builder.scenes import (
     canonical_json_bytes as scene_json_bytes,
 )
 from resources.g1_terrain_builder.schema import ArtifactSet
+from resources.g1_terrain_builder.schema import FeatureSet
 from resources.g1_terrain_builder.terrain import (
     FlatTerrain,
     surface_semantics,
@@ -140,6 +144,30 @@ def repack_with_scene_metadata(pack, mutation):
 
 
 class ArtifactTests(unittest.TestCase):
+
+    def test_features_round_trip_matches_orange_duck_little_endian_layout(self):
+        feature_set = FeatureSet(
+            values=np.arange(93, dtype=np.float32).reshape(3, 31) / 10.0,
+            offset=np.arange(31, dtype=np.float32),
+            scale=np.arange(1, 32, dtype=np.float32),
+        )
+        expected = (
+            struct.pack("<II", 3, 31)
+            + feature_set.values.astype("<f4").tobytes()
+            + struct.pack("<I", 31)
+            + feature_set.offset.astype("<f4").tobytes()
+            + struct.pack("<I", 31)
+            + feature_set.scale.astype("<f4").tobytes()
+        )
+        self.assertEqual(features_bytes(feature_set), expected)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = os.path.join(temporary, "features.bin")
+            write_features(path, feature_set)
+            loaded = read_features(path)
+        np.testing.assert_array_equal(loaded.values, feature_set.values)
+        np.testing.assert_array_equal(loaded.offset, feature_set.offset)
+        np.testing.assert_array_equal(loaded.scale, feature_set.scale)
+
 
     def test_terrain_sidecar_round_trip_is_exact_little_endian(self):
         features = np.arange(20, dtype=np.float32).reshape(5, 4)

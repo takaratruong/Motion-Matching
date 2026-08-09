@@ -11,6 +11,7 @@ class SourceClip:
     qpos: np.ndarray
     source_frames: np.ndarray
     terrain_id: str
+    provenance: dict | None = None
 
     def validate(self) -> None:
         if self.qpos.ndim != 2 or self.qpos.shape[1] != 36:
@@ -48,6 +49,9 @@ class HoldenClip:
     terrain_support: np.ndarray
     source_frames: np.ndarray
     terrain_id: str
+    source_left_indices: np.ndarray
+    source_right_indices: np.ndarray
+    source_alpha: np.ndarray
 
     @classmethod
     def empty(cls, frames: int, bones: int) -> "HoldenClip":
@@ -62,6 +66,9 @@ class HoldenClip:
             np.zeros((frames, 3), np.float32),
             np.arange(frames),
             "flat",
+            np.arange(frames, dtype=np.int32),
+            np.arange(frames, dtype=np.int32),
+            np.zeros(frames, np.float32),
         )
 
     def validate(self) -> None:
@@ -78,6 +85,19 @@ class HoldenClip:
             raise ValueError("terrain feature shape must be (T, 4)")
         if self.terrain_support.shape != (frames, 3):
             raise ValueError("terrain support shape must be (T, 3)")
+        for name, values, dtype in (
+            ("source left", self.source_left_indices, np.int32),
+            ("source right", self.source_right_indices, np.int32),
+            ("source alpha", self.source_alpha, np.float32),
+        ):
+            if values.shape != (frames,) or values.dtype != np.dtype(dtype):
+                raise ValueError(
+                    f"{name} provenance must have shape (T,) and dtype "
+                    f"{np.dtype(dtype)}")
+        if np.any(self.source_left_indices > self.source_right_indices) \
+                or np.any(self.source_alpha < 0.0) \
+                or np.any(self.source_alpha > 1.0):
+            raise ValueError("source interpolation provenance is invalid")
         arrays = (
             self.positions, self.velocities, self.rotations,
             self.angular_velocities, self.terrain_features,
@@ -85,6 +105,30 @@ class HoldenClip:
         )
         if not all(np.isfinite(a).all() for a in arrays):
             raise ValueError("converted clip contains non-finite values")
+
+
+@dataclass(frozen=True)
+class FeatureSet:
+    values: np.ndarray
+    offset: np.ndarray
+    scale: np.ndarray
+
+    def validate(self) -> None:
+        if self.values.ndim != 2 or self.values.shape[1] != 31 \
+                or self.values.shape[0] < 1:
+            raise ValueError("matching features must have shape (T, 31)")
+        if self.offset.shape != (31,) or self.scale.shape != (31,):
+            raise ValueError("feature offset and scale must have shape (31,)")
+        for name, values in (
+            ("features", self.values), ("offset", self.offset),
+            ("scale", self.scale),
+        ):
+            if values.dtype != np.dtype(np.float32):
+                raise ValueError(f"{name} must use float32")
+            if not np.isfinite(values).all():
+                raise ValueError(f"{name} must contain only finite values")
+        if np.any(self.scale <= 0.0):
+            raise ValueError("feature scale must be strictly positive")
 
 
 @dataclass

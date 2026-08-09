@@ -3,6 +3,8 @@
 
 import argparse
 import glob
+import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -15,7 +17,10 @@ if REPOSITORY_ROOT not in sys.path:
     sys.path.insert(0, REPOSITORY_ROOT)
 
 from resources import quat as holden_quat
-from resources.g1_terrain_builder.artifacts import publish_artifacts
+from resources.g1_terrain_builder.artifacts import (
+    publish_artifacts,
+    publish_flat_artifacts,
+)
 from resources.g1_terrain_builder.database import (
     ContactConfig,
     combine_clips,
@@ -28,13 +33,22 @@ from resources.g1_terrain_builder.kinematics import (
     G1Kinematics,
     convert_source_clip,
 )
+from resources.g1_terrain_builder.features import (
+    FEATURE_NAMES,
+    FEATURE_WEIGHTS,
+    build_matching_features,
+)
 from resources.g1_terrain_builder.scenes import (
     REQUIRED_SCENE_IDS,
     all_scene_definitions,
     build_scene_pack,
     select_grail_scene_bases,
 )
-from resources.g1_terrain_builder.sources import load_grail, load_takara
+from resources.g1_terrain_builder.sources import (
+    load_grail,
+    load_retarget_npz,
+    load_takara,
+)
 from resources.g1_terrain_builder.terrain import (
     FlatTerrain,
     GrailTerrain,
@@ -58,19 +72,25 @@ OUTPUT_FPS = 25.0
 TERRAIN_DISTANCES = [0.25, 0.50, 0.75, 1.00]
 
 
-def finalize_clip(source, terrain, kin):
-    clip, skeleton, report = convert_source_clip(source, kin, OUTPUT_FPS)
+def _odd_frame_count(seconds: float, fps: float) -> int:
+    count = int(round(seconds * fps))
+    return count if count % 2 else count + 1
+
+
+def finalize_clip(source, terrain, kin, output_fps=OUTPUT_FPS):
+    clip, skeleton, report = convert_source_clip(source, kin, output_fps)
     gp, gq = forward_kinematics_arrays(
         clip.positions, clip.rotations, skeleton.parents)
     # quat.to_scaled_angle_axis uses np.where around its zero-angle branch;
     # NumPy evaluates both operands even though the finite fallback is selected.
     with np.errstate(divide="ignore", invalid="ignore"):
         clip.velocities, clip.angular_velocities = derive_velocities(
-            clip.positions, clip.rotations, OUTPUT_FPS)
+            clip.positions, clip.rotations, output_fps)
     clip.contacts = derive_contacts(
         gp, terrain,
         skeleton.names.index("LeftToe"),
-        skeleton.names.index("RightToe"), OUTPUT_FPS)
+        skeleton.names.index("RightToe"), output_fps,
+        ContactConfig(median_filter_frames=_odd_frame_count(0.1, output_fps)))
     clip.terrain_support = sample_terrain_support(
         gp,
         terrain,
@@ -79,7 +99,8 @@ def finalize_clip(source, terrain, kin):
         skeleton.names.index("RightToe"),
     )
     for frame in range(len(clip.positions)):
-        stop = min(frame + 51, len(clip.positions))
+        stop = min(frame + int(round(2.0 * output_fps)) + 1,
+                   len(clip.positions))
         path = gp[frame:stop, 0][:, [0, 2]]
         headings3 = holden_quat.mul_vec(
             gq[frame:stop, 0],
@@ -107,7 +128,7 @@ def _run_candidate_validator(staging, args):
     validator = os.path.join(
         REPOSITORY_ROOT, "resources", "validate_g1_terrain_database.py")
     argv = [sys.executable, validator, staging]
-    if args.grail_limit is None:
+    if not getattr(args, "flat_only", False) and args.grail_limit is None:
         argv.extend([
             "--full-source-validation",
             "--grail-glob", args.grail_glob,
@@ -164,6 +185,110 @@ def _inspect_grail_corpus(args):
         all_paths, motion_paths, path_by_base,
         measured_max_heights, selected_scene_bases,
     )
+
+
+def _flat_feature_signature(names, horizons, weights, offset, scale):
+    payload = {
+        "names": list(names), "horizons": list(horizons),
+        "weights": list(weights), "offset": offset.tolist(),
+        "scale": scale.tolist(),
+    }
+    return hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"),
+        allow_nan=False).encode("utf-8")).hexdigest()
+
+
+def _assemble_flat_candidate(args):
+    if float(args.output_fps) != 60.0:
+        raise ValueError("--flat-only requires --output-fps 60")
+    if not args.retarget_npz or not args.retarget_receipt:
+        raise ValueError(
+            "--flat-only requires --retarget-npz and --retarget-receipt")
+    _require_file(args.g1_xml, "G1 XML")
+    _require_file(args.retarget_npz, "released-PFNN G1 retarget")
+    _require_file(args.retarget_receipt, "released-PFNN G1 retarget receipt")
+    source = load_retarget_npz(args.retarget_npz, args.retarget_receipt)
+    if source.fps != 120.0 or source.terrain_id != "flat":
+        raise ValueError("flat released-PFNN source must be 120 Hz and flat")
+    kinematics = G1Kinematics(args.g1_xml)
+    clip, skeleton, report = finalize_clip(
+        source, FlatTerrain(), kinematics, output_fps=60.0)
+    if len(skeleton.names) != 31:
+        raise ValueError("flat G1 skeleton must contain exactly 31 bones")
+    artifacts = combine_clips([clip], skeleton)
+    horizons = (20, 40, 60)
+    features = build_matching_features(artifacts, 60.0, horizons)
+    provenance = source.provenance
+    if type(provenance) is not dict:
+        raise ValueError("flat source has no authenticated provenance")
+    manifest_base = {
+        "schema": "g1-lmm-flat-data/v1",
+        "output_fps": 60.0,
+        "trajectory_horizons": list(horizons),
+        "feature_dimensions": 31,
+        "feature_names": list(FEATURE_NAMES),
+        "feature_weights": list(FEATURE_WEIGHTS),
+        "feature_offset": features.offset.tolist(),
+        "feature_scale": features.scale.tolist(),
+        "feature_signature": _flat_feature_signature(
+            FEATURE_NAMES, horizons, FEATURE_WEIGHTS,
+            features.offset, features.scale),
+        "terrain_features": {
+            "indices": [27, 28, 29, 30],
+            "semantics": "authenticated-flat-root-relative-height-deltas",
+            "value_m": 0.0,
+        },
+        "database_frames": len(artifacts.positions),
+        "total_clips": 1,
+        "dimensions": {"bones": 31, "features": 31, "contacts": 2},
+        "skeleton": {
+            "names": list(skeleton.names),
+            "parents": skeleton.parents.tolist(),
+            "basis": "holden-y-up-right-handed-forward-plus-z",
+            "signature": skeleton.signature(),
+        },
+        "ranges": [{
+            "start": 0, "stop": len(artifacts.positions),
+            "motion_class": "flat-walk", "terrain_class": "flat",
+            "source": source.name,
+        }],
+        "time_filters": {
+            "root_position_frames": 31,
+            "root_position_order": 3,
+            "root_direction_frames": 61,
+            "root_direction_order": 3,
+            "contact_median_frames": 7,
+            "forward_terrain_path_rows": 121,
+        },
+        "contact": {
+            "speed_threshold": 0.15,
+            "height_threshold": 0.06,
+            "median_filter_frames": 7,
+        },
+        "sources": [{
+            "name": source.name,
+            "terrain_id": "flat",
+            "path": provenance["path"],
+            "sha256": provenance["sha256"],
+            "receipt_path": provenance["receipt_path"],
+            "receipt_sha256": provenance["receipt_sha256"],
+            "receipt_schema": provenance["receipt"]["schema"],
+            "receipt_status": provenance["receipt"]["status"],
+            "source_fps": source.fps,
+            "source_frames": len(source.qpos),
+            "output_frames": len(clip.positions),
+            "left_source_index": clip.source_left_indices.tolist(),
+            "right_source_index": clip.source_right_indices.tolist(),
+            "source_alpha": clip.source_alpha.tolist(),
+        }],
+        "validation": {
+            "fk_max_error_m": report["fk_max_error_m"],
+            "duration_error_s": report["duration_error_s"],
+            "quaternion_norm_max_error": report[
+                "quaternion_norm_max_error"],
+        },
+    }
+    return artifacts, features, manifest_base
 
 
 def _source_manifest_entry(source, clip, range_start: int) -> dict:
@@ -308,6 +433,11 @@ def _assemble_candidate(args):
 
 
 def build_artifacts(args: argparse.Namespace) -> dict:
+    if getattr(args, "flat_only", False):
+        artifacts, features, manifest_base = _assemble_flat_candidate(args)
+        return publish_flat_artifacts(
+            args.output, artifacts, features, manifest_base,
+            _candidate_validation_policy(args))
     artifacts, manifest_base, scene_pack = _assemble_candidate(args)
     validate_candidate = _candidate_validation_policy(args)
     return publish_artifacts(
@@ -319,6 +449,10 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Build validated Holden G1 terrain motion artifacts")
     parser.add_argument("--output", default=DEFAULTS["output"])
+    parser.add_argument("--output-fps", type=float, default=OUTPUT_FPS)
+    parser.add_argument("--flat-only", action="store_true")
+    parser.add_argument("--retarget-npz")
+    parser.add_argument("--retarget-receipt")
     parser.add_argument("--grail-glob", default=DEFAULTS["grail_glob"])
     parser.add_argument("--grail-limit", type=int)
     parser.add_argument("--g1-xml", default=DEFAULTS["g1_xml"])
@@ -334,9 +468,10 @@ def main(argv=None) -> int:
     except (OSError, TypeError, ValueError) as error:
         print(f"BUILD FAILED {args.output}: {error}", file=sys.stderr)
         return 1
+    scenes = 0 if args.flat_only else len(REQUIRED_SCENE_IDS)
     print(
         f"BUILT {manifest['schema']} frames={manifest['database_frames']} "
-        f"clips={manifest['total_clips']} scenes={len(REQUIRED_SCENE_IDS)} "
+        f"clips={manifest['total_clips']} scenes={scenes} "
         f"output={args.output}")
     return 0
 

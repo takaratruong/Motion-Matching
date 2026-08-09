@@ -16,6 +16,7 @@ from resources.g1_terrain_builder.database import (
     sample_terrain_support,
     write_holden_database,
 )
+from resources.g1_terrain_builder.features import build_matching_features
 from resources.g1_terrain_builder.schema import (
     ArtifactSet,
     HoldenClip,
@@ -52,6 +53,33 @@ def _expected_database_bytes(artifacts: ArtifactSet) -> bytes:
 
 
 class DatabaseBuilderTests(unittest.TestCase):
+    def test_matching_features_are_normalized_31d_with_60hz_horizons(self):
+        artifacts = ArtifactSet.empty(81, 31)
+        frames = np.arange(81, dtype=np.float32)
+        artifacts.positions[:, 0, 0] = frames / 60.0
+        artifacts.positions[:, 6, 1] = 0.4 + frames * 0.001
+        artifacts.positions[:, 12, 1] = 0.5 - frames * 0.003
+        artifacts.velocities[:, 0, 0] = 1.0
+        artifacts.velocities[:, 6, 1] = 0.06
+        artifacts.velocities[:, 12, 1] = -0.06
+
+        result = build_matching_features(
+            artifacts, fps=60.0, horizons=(20, 40, 60))
+
+        self.assertEqual(result.values.shape, (81, 31))
+        self.assertEqual(result.values.dtype, np.dtype(np.float32))
+        self.assertEqual(result.offset.shape, (31,))
+        self.assertEqual(result.scale.shape, (31,))
+        self.assertTrue(np.isfinite(result.values).all())
+        self.assertTrue(np.isfinite(result.offset).all())
+        self.assertTrue(np.isfinite(result.scale).all())
+        self.assertTrue(np.all(result.scale > 0.0))
+        np.testing.assert_array_equal(result.scale[0:3], result.scale[0])
+        np.testing.assert_array_equal(result.scale[3:6], result.scale[3])
+        self.assertNotEqual(result.scale[0], result.scale[3])
+        np.testing.assert_array_equal(result.values[:, 27:31], 0.0)
+        np.testing.assert_array_equal(result.offset[27:31], 0.0)
+
     def test_clips_become_nonoverlapping_ranges(self):
         skeleton = SkeletonSpec(
             ("Simulation", "Hips"), np.array([-1, 0], np.int32))

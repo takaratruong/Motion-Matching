@@ -23,6 +23,7 @@ if REPOSITORY_ROOT not in sys.path:
 
 from resources.g1_terrain_builder.artifacts import (
     SUPPORT_COLUMNS,
+    read_features,
     read_support_sidecar,
     read_terrain_sidecar,
 )
@@ -35,6 +36,7 @@ from resources.g1_terrain_builder.database import (
     read_holden_database,
     sample_terrain_support,
 )
+from resources.g1_terrain_builder.features import FEATURE_NAMES, FEATURE_WEIGHTS
 from resources.g1_terrain_builder.kinematics import (
     G1Kinematics,
     convert_source_clip,
@@ -63,10 +65,188 @@ from resources.g1_terrain_builder.terrain import (
 
 
 SCHEMA = "g1-terrain-artifacts/v2"
+FLAT_SCHEMA = "g1-lmm-flat-data/v1"
 OUTPUT_FPS = 25.0
 FEATURE_DIMENSIONS = 31
 TERRAIN_DIMENSIONS = 4
 SUPPORT_DIMENSIONS = 3
+
+
+def _validate_flat_tree(root):
+    try:
+        node = os.lstat(root)
+    except OSError as error:
+        raise ValueError("flat artifact directory does not exist") from error
+    _require(stat.S_ISDIR(node.st_mode),
+             "flat artifact directory must be a real directory")
+    actual = set()
+    with os.scandir(root) as entries:
+        for entry in entries:
+            child = entry.stat(follow_symlinks=False)
+            _require(stat.S_ISREG(child.st_mode),
+                     "flat artifact tree contains a non-regular node")
+            _require(child.st_size > 0, "flat artifact tree contains empty file")
+            actual.add(entry.name)
+    _require(actual == {"database.bin", "features.bin", "manifest.json"},
+             "flat artifact tree has missing, stale, or unexpected files")
+
+
+def _validate_flat_artifact_directory(root, manifest):
+    _validate_flat_tree(root)
+    expected_keys = {
+        "schema", "status", "output_fps", "trajectory_horizons",
+        "feature_dimensions", "feature_names", "feature_weights",
+        "feature_offset", "feature_scale", "feature_signature",
+        "terrain_features",
+        "database_frames", "total_clips", "dimensions", "skeleton",
+        "ranges", "time_filters", "contact", "sources", "validation",
+        "artifacts",
+    }
+    _require(set(manifest) == expected_keys, "flat manifest key set changed")
+    _require(manifest["schema"] == FLAT_SCHEMA, "flat manifest schema changed")
+    _require(manifest["status"] == "accepted", "flat manifest is not accepted")
+    _require(manifest["output_fps"] == 60.0,
+             "flat manifest output rate must be 60 Hz")
+    _require(manifest["trajectory_horizons"] == [20, 40, 60],
+             "flat trajectory horizons changed")
+    _require(manifest["feature_dimensions"] == 31,
+             "flat feature dimensions changed")
+    _require(manifest["feature_names"] == list(FEATURE_NAMES)
+             and manifest["feature_weights"] == list(FEATURE_WEIGHTS),
+             "flat feature ordering/weights changed")
+    _require(manifest["terrain_features"] == {
+        "indices": [27, 28, 29, 30],
+        "semantics": "authenticated-flat-root-relative-height-deltas",
+        "value_m": 0.0,
+    }, "flat terrain feature receipt changed")
+    _require(manifest["dimensions"] == {
+        "bones": 31, "features": 31, "contacts": 2,
+    }, "flat dimensions changed")
+    _require(manifest["time_filters"] == {
+        "root_position_frames": 31, "root_position_order": 3,
+        "root_direction_frames": 61, "root_direction_order": 3,
+        "contact_median_frames": 7, "forward_terrain_path_rows": 121,
+    }, "flat time-derived filters changed")
+    _require(manifest["contact"] == {
+        "speed_threshold": 0.15, "height_threshold": 0.06,
+        "median_filter_frames": 7,
+    }, "flat contact parameters changed")
+    _require(manifest["database_frames"] == 4086
+             and manifest["total_clips"] == 1,
+             "flat released-PFNN row/range count changed")
+
+    descriptors = manifest["artifacts"]
+    _require(type(descriptors) is dict
+             and set(descriptors) == {"database.bin", "features.bin"},
+             "flat artifact descriptors changed")
+    authenticated = {}
+    for name, maximum in (
+        ("database.bin", _MAX_DATABASE_BYTES),
+        ("features.bin", _MAX_FEATURE_BYTES),
+    ):
+        descriptor = descriptors[name]
+        _require(type(descriptor) is dict and set(descriptor) == {
+            "path", "size_bytes", "sha256",
+        }, f"flat {name} descriptor keys changed")
+        _require(descriptor["path"] == name
+                 and type(descriptor["size_bytes"]) is int
+                 and descriptor["size_bytes"] > 0
+                 and type(descriptor["sha256"]) is str
+                 and _HEX_SHA256.fullmatch(descriptor["sha256"]),
+                 f"flat {name} descriptor changed")
+        path = os.path.join(root, name)
+        digest, identity = _sha256_file(path, maximum)
+        _require(digest == descriptor["sha256"],
+                 f"flat {name} SHA-256 mismatch")
+        _require(os.stat(path).st_size == descriptor["size_bytes"],
+                 f"flat {name} size mismatch")
+        authenticated[name] = (path, identity)
+
+    database = read_holden_database(authenticated["database.bin"][0])
+    features = read_features(authenticated["features.bin"][0])
+    _require(database.positions.shape == (4086, 31, 3),
+             "flat database position dimensions changed")
+    _require(database.rotations.shape == (4086, 31, 4),
+             "flat database rotation dimensions changed")
+    _require(database.contacts.shape == (4086, 2),
+             "flat database contact dimensions changed")
+    _require(database.range_starts.tolist() == [0]
+             and database.range_stops.tolist() == [4086],
+             "flat database range changed")
+    _require(features.values.shape == (4086, 31),
+             "flat features dimensions changed")
+    _require(np.array_equal(
+        features.offset, np.asarray(manifest["feature_offset"], np.float32)),
+        "flat feature offsets differ from features.bin")
+    _require(np.array_equal(
+        features.scale, np.asarray(manifest["feature_scale"], np.float32)),
+        "flat feature scales differ from features.bin")
+    signature_payload = {
+        "names": list(FEATURE_NAMES),
+        "horizons": [20, 40, 60],
+        "weights": list(FEATURE_WEIGHTS),
+        "offset": features.offset.tolist(),
+        "scale": features.scale.tolist(),
+    }
+    expected_feature_signature = hashlib.sha256(json.dumps(
+        signature_payload, sort_keys=True, separators=(",", ":"),
+        allow_nan=False).encode("utf-8")).hexdigest()
+    _require(manifest["feature_signature"] == expected_feature_signature,
+             "flat feature signature changed")
+    _require(np.all(features.values[:, 27:31] == 0.0),
+             "flat terrain feature rows must be exact zero")
+
+    skeleton = manifest["skeleton"]
+    _require(type(skeleton) is dict and set(skeleton) == {
+        "names", "parents", "basis", "signature",
+    }, "flat skeleton receipt changed")
+    _require(len(skeleton["names"]) == 31
+             and skeleton["parents"] == database.parents.tolist()
+             and skeleton["basis"] ==
+             "holden-y-up-right-handed-forward-plus-z",
+             "flat skeleton dimensions/basis changed")
+    _require(_manifest_signature(
+        skeleton["names"], skeleton["parents"]) == skeleton["signature"],
+        "flat skeleton signature changed")
+    _require(manifest["ranges"] == [{
+        "start": 0, "stop": 4086, "motion_class": "flat-walk",
+        "terrain_class": "flat", "source": manifest["sources"][0]["name"],
+    }], "flat range receipt changed")
+
+    sources = manifest["sources"]
+    _require(type(sources) is list and len(sources) == 1,
+             "flat source receipt count changed")
+    source = sources[0]
+    _require(source["source_fps"] == 120.0
+             and source["source_frames"] == 8171
+             and source["output_frames"] == 4086
+             and source["terrain_id"] == "flat"
+             and source["receipt_schema"] ==
+             "native-g1-pfnn-sample-retarget/v1"
+             and source["receipt_status"] == "accepted",
+             "flat source identity/rate receipt changed")
+    expected_indices = list(range(0, 8171, 2))
+    _require(source["left_source_index"] == expected_indices
+             and source["right_source_index"] == expected_indices,
+             "flat 120-to-60 interpolation indices are not exact even rows")
+    _require(source["source_alpha"] == [0.0] * 4086,
+             "flat 120-to-60 interpolation alpha is not exact zero")
+    _require(type(source["sha256"]) is str
+             and _HEX_SHA256.fullmatch(source["sha256"])
+             and type(source["receipt_sha256"]) is str
+             and _HEX_SHA256.fullmatch(source["receipt_sha256"]),
+             "flat source hashes are invalid")
+    quaternion_error = float(np.max(np.abs(
+        np.linalg.norm(database.rotations, axis=-1) - 1.0)))
+    _require(quaternion_error <= 1e-4,
+             "flat database quaternion norm error exceeds 0.0001")
+    for name, (_, identity) in authenticated.items():
+        _require_file_identity(os.path.join(root, name), identity, name)
+    _validate_flat_tree(root)
+    return {
+        "schema": FLAT_SCHEMA, "frames": 4086, "clips": 1,
+        "bones": 31, "features": 31, "scenes": 0, "source_rows": 0,
+    }
 SCENE_CELL_SIZE = float(np.float32(0.02))
 WALKABILITY_HALO = float(np.float32(0.25))
 ENDPOINT_RADIUS = float(np.float32(0.20))
@@ -2338,10 +2518,14 @@ def validate_artifact_directory(
     _require(type(full_source_validation) is bool,
              "full_source_validation must be an exact boolean")
     root = os.path.abspath(os.fspath(artifact_dir))
-    _validate_exact_file_tree(root)
     manifest = _read_json(
         os.path.join(root, "manifest.json"), _MAX_MANIFEST_BYTES,
         "manifest JSON")
+    if type(manifest) is dict and manifest.get("schema") == FLAT_SCHEMA:
+        _require(not full_source_validation,
+                 "flat bundle does not support full corpus validation")
+        return _validate_flat_artifact_directory(root, manifest)
+    _validate_exact_file_tree(root)
     _require(
         type(manifest) is dict and manifest.get("schema") == SCHEMA,
         f"schema must be {SCHEMA}")
@@ -2431,6 +2615,7 @@ def validate_artifact_directory(
             manifest, database, scenes, source_options,
             progress=_full_source_progress)
     return {
+        "schema": SCHEMA,
         "frames": frames,
         "clips": len(sources),
         "bones": len(names),
@@ -2469,10 +2654,15 @@ def main(argv=None):
         print(f"INVALID {path}: {error}", file=sys.stderr)
         return 1
     print(
-        f"VALID {SCHEMA} frames={summary['frames']} clips={summary['clips']} "
-        f"bones={summary['bones']} terrain_dims={TERRAIN_DIMENSIONS}"
-        f" support_dims={SUPPORT_DIMENSIONS} scenes={summary['scenes']} "
-        f"source_rows={summary['source_rows']}")
+        f"VALID {summary['schema']} frames={summary['frames']} "
+        f"clips={summary['clips']} bones={summary['bones']} "
+        + (
+            f"features={summary['features']} "
+            if summary['schema'] == FLAT_SCHEMA else
+            f"terrain_dims={TERRAIN_DIMENSIONS} "
+            f"support_dims={SUPPORT_DIMENSIONS} "
+        )
+        + f"scenes={summary['scenes']} source_rows={summary['source_rows']}")
     return 0
 
 

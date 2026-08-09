@@ -7,7 +7,7 @@ from scipy import signal
 sys.path.insert(0, "/home/ubuntu/projects/motion-matching/resources")
 import quat as holden_quat
 
-from .resample import resample_quaternions_wxyz, resample_vectors
+from .resample import resample_map, resample_quaternions_wxyz, resample_vectors
 from .schema import HoldenClip, SkeletonSpec, SourceClip
 
 Q_ZUP_TO_YUP = np.array([2**-0.5, -2**-0.5, 0, 0], np.float64)
@@ -145,14 +145,17 @@ def heading_quaternions(forward: np.ndarray) -> np.ndarray:
 
 def _prepend_simulation(
     gp: np.ndarray, gq: np.ndarray, names: tuple[str, ...],
-    parents: np.ndarray,
+    parents: np.ndarray, fps: float,
 ) -> tuple[np.ndarray, np.ndarray, SkeletonSpec]:
     hips = names.index("Hips")
     torso = names.index("Spine2")
     sim_position = gp[:, torso].copy()
     sim_position[:, 1] = 0.0
+    configured_pos_window = int(round(0.5 * fps))
+    if configured_pos_window % 2 == 0:
+        configured_pos_window += 1
     pos_window = min(
-        13, len(sim_position) if len(sim_position) % 2
+        configured_pos_window, len(sim_position) if len(sim_position) % 2
         else len(sim_position) - 1)
     if pos_window >= 5:
         sim_position = signal.savgol_filter(
@@ -165,8 +168,12 @@ def _prepend_simulation(
     if np.any(lengths < 1e-6):
         raise ValueError("G1 pelvis forward projects to zero")
     forward /= lengths
+    configured_dir_window = int(round(fps))
+    if configured_dir_window % 2 == 0:
+        configured_dir_window += 1
     dir_window = min(
-        25, len(forward) if len(forward) % 2 else len(forward) - 1)
+        configured_dir_window,
+        len(forward) if len(forward) % 2 else len(forward) - 1)
     if dir_window >= 5:
         forward = signal.savgol_filter(
             forward, dir_window, min(3, dir_window - 2),
@@ -197,10 +204,10 @@ def convert_source_clip(
     gp = resample_vectors(gp_y, source.fps, target_fps)
     gq = resample_quaternions_wxyz(gq_y, source.fps, target_fps)
     positions, rotations, skeleton = _prepend_simulation(
-        gp, gq, kinematics.names, kinematics.parents)
-    output_t = np.arange(len(positions), dtype=np.float64) / target_fps
-    output_frames = np.rint(output_t * source.fps).astype(np.int64)
-    output_frames = np.clip(output_frames, 0, len(source.qpos) - 1)
+        gp, gq, kinematics.names, kinematics.parents, target_fps)
+    left, right, alpha = resample_map(
+        len(source.qpos), source.fps, target_fps)
+    output_frames = np.where(alpha < 0.5, left, right)
     positions = positions.astype(np.float32)
     rotations = rotations.astype(np.float32)
     if not np.all(np.isfinite(positions)) or not np.all(np.isfinite(rotations)):
@@ -229,6 +236,9 @@ def convert_source_clip(
         np.zeros((len(positions), 3), np.float32),
         source.source_frames[output_frames],
         source.terrain_id,
+        source.source_frames[left].astype(np.int32),
+        source.source_frames[right].astype(np.int32),
+        alpha,
     )
     source_duration = (len(source.qpos) - 1) / source.fps
     output_duration = (len(positions) - 1) / target_fps
@@ -239,4 +249,6 @@ def convert_source_clip(
         "fk_max_error_m": fk_error,
         "duration_error_s": duration_error,
         "quaternion_norm_max_error": quaternion_error,
+        "root_position_filter_frames": int(round(0.5 * target_fps)) + 1,
+        "root_direction_filter_frames": int(round(target_fps)) + 1,
     }

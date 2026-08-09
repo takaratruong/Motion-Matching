@@ -28,6 +28,48 @@ PYTHON = "/home/ubuntu/miniconda3/envs/diffsim/bin/python"
 
 
 class BuildCliTests(unittest.TestCase):
+    def test_flat_parser_requires_receipt_bound_60hz_inputs(self):
+        args = builder._parser().parse_args([
+            "--output-fps", "60", "--flat-only",
+            "--retarget-npz", "/motion/flat.npz",
+            "--retarget-receipt", "/motion/flat.receipt.json",
+            "--output", "/artifacts/flat",
+        ])
+        self.assertEqual(args.output_fps, 60.0)
+        self.assertTrue(args.flat_only)
+        self.assertEqual(args.retarget_npz, "/motion/flat.npz")
+        self.assertEqual(
+            args.retarget_receipt, "/motion/flat.receipt.json")
+
+    def test_flat_cli_writes_60hz_31d_feature_receipt(self):
+        args = SimpleNamespace(
+            output_fps=60.0, flat_only=True,
+            retarget_npz="flat.npz", retarget_receipt="flat.receipt.json",
+            output="published", g1_xml="g1.xml", grail_limit=None,
+            grail_glob="unused", takara="unused", remap="unused",
+        )
+        artifacts = object()
+        features = object()
+        manifest_base = {
+            "schema": "g1-lmm-flat-data/v1", "output_fps": 60.0,
+            "trajectory_horizons": [20, 40, 60],
+            "feature_dimensions": 31,
+        }
+        finalized = dict(manifest_base, status="accepted")
+        with (
+            mock.patch.object(
+                builder, "_assemble_flat_candidate",
+                return_value=(artifacts, features, manifest_base)),
+            mock.patch.object(
+                builder, "publish_flat_artifacts",
+                return_value=finalized) as publish,
+        ):
+            manifest = builder.build_artifacts(args)
+        self.assertEqual(manifest["output_fps"], 60.0)
+        self.assertEqual(manifest["trajectory_horizons"], [20, 40, 60])
+        self.assertEqual(manifest["feature_dimensions"], 31)
+        publish.assert_called_once()
+
     def test_grail_limit_measures_complete_corpus_before_motion_selection(self):
         args = SimpleNamespace(grail_glob="clips/*.pkl", grail_limit=1)
         paths = [

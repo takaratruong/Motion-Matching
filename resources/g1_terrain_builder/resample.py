@@ -12,6 +12,21 @@ def _times(frames: int, fps: float) -> np.ndarray:
     return np.arange(frames, dtype=np.float64) / fps
 
 
+def resample_map(
+    frames: int, source_fps: float, target_fps: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    count = output_frame_count(frames, source_fps, target_fps)
+    source_u = np.arange(count, dtype=np.float64) * source_fps / target_fps
+    left = np.floor(source_u).astype(np.int64)
+    left = np.clip(left, 0, frames - 1)
+    right = np.minimum(left + 1, frames - 1)
+    alpha = (source_u - left).astype(np.float32)
+    exact = (alpha == 0.0) | (left == right)
+    right[exact] = left[exact]
+    alpha[exact] = 0.0
+    return left.astype(np.int32), right.astype(np.int32), alpha
+
+
 def resample_vectors(
     values: np.ndarray, source_fps: float, target_fps: float,
 ) -> np.ndarray:
@@ -19,15 +34,11 @@ def resample_vectors(
     output_frame_count(len(values), source_fps, target_fps)
     if not np.all(np.isfinite(values)):
         raise ValueError("vector samples must be finite")
-    src_t = _times(len(values), source_fps)
-    count = output_frame_count(len(values), source_fps, target_fps)
-    dst_t = _times(count, target_fps)
-    flat = values.reshape(len(values), -1)
-    out = np.stack([
-        np.interp(dst_t, src_t, flat[:, i])
-        for i in range(flat.shape[1])
-    ], axis=1)
-    return out.reshape((count,) + values.shape[1:])
+    left, right, alpha = resample_map(
+        len(values), source_fps, target_fps)
+    shape = (len(alpha),) + (1,) * (values.ndim - 1)
+    blend = alpha.astype(np.float64).reshape(shape)
+    return values[left] * (1.0 - blend) + values[right] * blend
 
 
 def resample_quaternions_wxyz(
@@ -43,19 +54,11 @@ def resample_quaternions_wxyz(
     for t in range(1, len(flat)):
         signs = np.sum(flat[t - 1] * flat[t], axis=-1) < 0
         flat[t, signs] *= -1
-    src_t = _times(len(q), source_fps)
-    count = output_frame_count(len(q), source_fps, target_fps)
-    dst_t = _times(count, target_fps)
+    left, right, alpha = resample_map(len(q), source_fps, target_fps)
+    count = len(left)
     out = np.empty((count, flat.shape[1], 4), np.float64)
     for j in range(flat.shape[1]):
-        for k, t in enumerate(dst_t):
-            hi = min(
-                np.searchsorted(src_t, t, side="right"), len(src_t) - 1)
-            lo = max(0, hi - 1)
-            u = (
-                0.0 if hi == lo
-                else (t - src_t[lo]) / (src_t[hi] - src_t[lo])
-            )
+        for k, (lo, hi, u) in enumerate(zip(left, right, alpha)):
             a, b = flat[lo, j], flat[hi, j]
             dot = np.clip(np.dot(a, b), -1.0, 1.0)
             if dot > 0.9995:

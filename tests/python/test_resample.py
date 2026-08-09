@@ -1,11 +1,29 @@
 import unittest
 import numpy as np
 from resources.g1_terrain_builder.resample import (
-    output_frame_count, resample_quaternions_wxyz, resample_vectors,
+    output_frame_count, resample_map, resample_quaternions_wxyz,
+    resample_vectors,
 )
 
 
 class ResampleTests(unittest.TestCase):
+    def test_resample_map_50_to_60_has_exact_brackets_and_alpha(self):
+        left, right, alpha = resample_map(6, 50.0, 60.0)
+        np.testing.assert_array_equal(left[:4], [0, 0, 1, 2])
+        np.testing.assert_array_equal(right[:4], [0, 1, 2, 3])
+        np.testing.assert_allclose(alpha[:4], [0.0, 5/6, 2/3, 0.5])
+        self.assertEqual(left.dtype, np.dtype(np.int32))
+        self.assertEqual(right.dtype, np.dtype(np.int32))
+        self.assertEqual(alpha.dtype, np.dtype(np.float32))
+
+    def test_resample_map_120_to_60_is_exact_even_source_indices(self):
+        left, right, alpha = resample_map(8171, 120.0, 60.0)
+        expected = np.arange(0, 8171, 2, dtype=np.int32)
+        self.assertEqual(len(left), 4086)
+        np.testing.assert_array_equal(left, expected)
+        np.testing.assert_array_equal(right, expected)
+        np.testing.assert_array_equal(alpha, np.zeros(4086, np.float32))
+
     def test_duration_is_preserved(self):
         self.assertEqual(output_frame_count(250, 25.0, 25.0), 250)
 
