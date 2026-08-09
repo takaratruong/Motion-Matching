@@ -17,6 +17,7 @@ from resources.g1_terrain_builder.database import (
     write_holden_database,
 )
 from resources.g1_terrain_builder.features import build_matching_features
+from resources.g1_terrain_builder.kinematics import split_continuity_ranges
 from resources.g1_terrain_builder.schema import (
     ArtifactSet,
     HoldenClip,
@@ -53,6 +54,22 @@ def _expected_database_bytes(artifacts: ArtifactSet) -> bytes:
 
 
 class DatabaseBuilderTests(unittest.TestCase):
+    def test_continuity_split_uses_native_local_union_and_drops_short_fragments(self):
+        native = np.zeros(199, np.float64)
+        local = np.zeros(199, np.float64)
+        native[[20, 100]] = 0.3
+        local[[20, 50, 100]] = 0.4
+
+        plan = split_continuity_ranges(
+            native, local, threshold=0.25, minimum_frames=61)
+
+        self.assertEqual(plan["source_native_rejected_edge_count"], 2)
+        self.assertEqual(plan["database_local_rejected_edge_count"], 3)
+        self.assertEqual(plan["union_rejected_edge_count"], 3)
+        self.assertEqual(plan["dropped_fragment_count"], 3)
+        self.assertEqual(plan["dropped_frame_count"], 101)
+        self.assertEqual(plan["retained_ranges"], ((101, 200),))
+
     def test_matching_features_are_normalized_31d_with_60hz_horizons(self):
         artifacts = ArtifactSet.empty(81, 31)
         frames = np.arange(81, dtype=np.float32)

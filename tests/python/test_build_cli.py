@@ -1,4 +1,5 @@
 import gc
+import hashlib
 import io
 import json
 import os
@@ -14,6 +15,7 @@ from unittest import mock
 import numpy as np
 
 from resources import build_g1_terrain_database as builder
+from resources import validate_g1_terrain_database as validator
 from resources.g1_terrain_builder.artifacts import (
     read_support_sidecar,
     read_terrain_sidecar,
@@ -28,6 +30,87 @@ PYTHON = "/home/ubuntu/miniconda3/envs/diffsim/bin/python"
 
 
 class BuildCliTests(unittest.TestCase):
+    def test_v1_flat_manifest_is_rejected_before_tree_loading(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with open(
+                os.path.join(temporary, "manifest.json"), "w",
+                encoding="utf-8",
+            ) as stream:
+                json.dump(
+                    {"schema": "g1-lmm-flat-data/v1"}, stream,
+                    indent=2, sort_keys=True,
+                )
+                stream.write("\n")
+            with self.assertRaisesRegex(ValueError, "v2"):
+                validator.validate_artifact_directory(temporary)
+
+    def test_real_flat_candidate_has_exact_continuity_safe_v2_receipt(self):
+        args = builder._parser().parse_args([
+            "--output-fps", "60", "--flat-only",
+            "--retarget-npz",
+            "sonic/runs/native-g1-pfnn/sample-retarget/"
+            "LocomotionFlat01_000-120hz.npz",
+            "--retarget-receipt",
+            "sonic/runs/native-g1-pfnn/sample-retarget/"
+            "LocomotionFlat01_000-120hz.receipt.json",
+        ])
+
+        artifacts, features, manifest = builder._assemble_flat_candidate(args)
+
+        self.assertEqual(manifest["schema"], "g1-lmm-flat-data/v2")
+        self.assertEqual(len(artifacts.positions), 3853)
+        self.assertEqual(features.values.shape, (3853, 31))
+        self.assertEqual(manifest["source_count"], 1)
+        self.assertEqual(manifest["range_count"], 13)
+        self.assertEqual(len(manifest["ranges"]), 13)
+        self.assertEqual(
+            {len(entry) for entry in manifest["ranges"]}, {7})
+        self.assertEqual(set(manifest["ranges"][0]), {
+            "start", "stop", "source", "source_first_frame",
+            "source_last_frame", "motion_class", "terrain_class",
+        })
+        self.assertEqual(
+            max(entry["stop"] - entry["start"]
+                for entry in manifest["ranges"]),
+            747,
+        )
+        continuity = manifest["continuity"]
+        self.assertEqual(continuity["schema"], "g1-lmm-continuity/v1")
+        self.assertEqual(continuity["source_native_rejected_edge_count"], 31)
+        self.assertEqual(continuity["database_local_rejected_edge_count"], 32)
+        self.assertEqual(continuity["union_rejected_edge_count"], 32)
+        self.assertEqual(continuity["dropped_fragment_count"], 20)
+        self.assertEqual(continuity["dropped_frame_count"], 233)
+        self.assertEqual(continuity["published_range_count"], 13)
+        self.assertEqual(continuity["published_frame_count"], 3853)
+        self.assertAlmostEqual(
+            continuity["maximum_admitted_native_step_rad"],
+            0.2371947467327118,
+        )
+        self.assertAlmostEqual(
+            continuity["maximum_admitted_local_rotation_step_rad"],
+            0.23719475193867512,
+        )
+        digest_rows = np.asarray([[
+            entry["start"], entry["stop"], entry["source_first_frame"],
+            entry["source_last_frame"],
+        ] for entry in manifest["ranges"]], dtype="<i4")
+        self.assertEqual(
+            continuity["range_digest_sha256"],
+            hashlib.sha256(digest_rows.tobytes(order="C")).hexdigest(),
+        )
+        source = manifest["sources"][0]
+        self.assertEqual(len(source["left_source_index"]), 3853)
+        map_payload = b"".join((
+            np.asarray(source["left_source_index"], dtype="<i4").tobytes(),
+            np.asarray(source["right_source_index"], dtype="<i4").tobytes(),
+            np.asarray(source["source_alpha"], dtype="<f4").tobytes(),
+        ))
+        self.assertEqual(
+            continuity["source_map_digest_sha256"],
+            hashlib.sha256(map_payload).hexdigest(),
+        )
+
     def test_flat_parser_requires_receipt_bound_60hz_inputs(self):
         args = builder._parser().parse_args([
             "--output-fps", "60", "--flat-only",
@@ -51,7 +134,7 @@ class BuildCliTests(unittest.TestCase):
         artifacts = object()
         features = object()
         manifest_base = {
-            "schema": "g1-lmm-flat-data/v1", "output_fps": 60.0,
+            "schema": "g1-lmm-flat-data/v2", "output_fps": 60.0,
             "trajectory_horizons": [20, 40, 60],
             "feature_dimensions": 31,
         }

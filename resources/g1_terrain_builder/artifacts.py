@@ -66,6 +66,15 @@ ASSET_DESCRIPTOR_KEYS = {
     },
 }
 COORDINATE_SIGNATURE = "holden-y-up-right-handed-forward-plus-z"
+_FLAT_SOURCE_KEYS = {
+    "name", "terrain_id", "path", "sha256", "receipt_path",
+    "receipt_sha256", "receipt_schema", "receipt_status", "source_fps",
+    "source_frames", "output_frames", "left_source_index",
+    "right_source_index", "source_alpha",
+}
+_FLAT_VALIDATION_KEYS = {
+    "fk_max_error_m", "duration_error_s", "quaternion_norm_max_error",
+}
 
 
 def features_bytes(features: FeatureSet) -> bytes:
@@ -117,6 +126,97 @@ def read_features(path: os.PathLike | str) -> FeatureSet:
     result = FeatureSet(values, offset, scale)
     result.validate()
     return result
+
+
+def _authenticate_flat_manifest_inputs(manifest_base) -> None:
+    from .sources import load_retarget_npz
+
+    if type(manifest_base) is not dict \
+            or manifest_base.get("schema") != "g1-lmm-flat-data/v2":
+        raise ValueError("flat manifest schema must be g1-lmm-flat-data/v2")
+    validation = manifest_base.get("validation")
+    if type(validation) is not dict \
+            or set(validation) != _FLAT_VALIDATION_KEYS:
+        raise ValueError("flat validation receipt keys changed")
+    for key in _FLAT_VALIDATION_KEYS:
+        value = validation[key]
+        if type(value) is not float \
+                or not np.isfinite(value) or value < 0.0:
+            raise ValueError(f"flat validation {key} is invalid")
+    if validation["fk_max_error_m"] > 1e-5:
+        raise ValueError("flat validation FK error exceeds 1e-5 m")
+    if validation["quaternion_norm_max_error"] > 1e-4:
+        raise ValueError("flat validation quaternion error exceeds 1e-4")
+    output_fps = manifest_base.get("output_fps")
+    if type(output_fps) is not float or output_fps != 60.0 \
+            or validation["duration_error_s"] > 1.0 / 60.0:
+        raise ValueError("flat validation duration/rate receipt is invalid")
+
+    sources = manifest_base.get("sources")
+    if type(sources) is not list or len(sources) != 1:
+        raise ValueError("flat manifest must authenticate exactly one source")
+    source = sources[0]
+    if type(source) is not dict or set(source) != _FLAT_SOURCE_KEYS:
+        raise ValueError("flat source receipt keys changed")
+    if type(source["name"]) is not str or not source["name"] \
+            or source["terrain_id"] != "flat" \
+            or source["receipt_schema"] \
+            != "native-g1-pfnn-sample-retarget/v1" \
+            or source["receipt_status"] != "accepted" \
+            or type(source["source_fps"]) is not float \
+            or source["source_fps"] != 120.0 \
+            or type(source["source_frames"]) is not int \
+            or type(source["output_frames"]) is not int:
+        raise ValueError("flat source identity/type receipt changed")
+    for key in ("path", "receipt_path", "sha256", "receipt_sha256"):
+        if type(source[key]) is not str or not source[key]:
+            raise ValueError(f"flat source {key} is invalid")
+    if not os.path.isabs(source["path"]) \
+            or not os.path.isabs(source["receipt_path"]):
+        raise ValueError("flat source and receipt paths must be absolute")
+    try:
+        source_digest = sha256_file(source["path"])
+        receipt_digest = sha256_file(source["receipt_path"])
+    except (OSError, TypeError, ValueError) as error:
+        raise ValueError(f"flat source authentication failed: {error}") from error
+    if source_digest != source["sha256"]:
+        raise ValueError("flat source SHA-256 mismatch")
+    if receipt_digest != source["receipt_sha256"]:
+        raise ValueError("flat source receipt SHA-256 mismatch")
+    try:
+        loaded = load_retarget_npz(source["path"], source["receipt_path"])
+    except (OSError, TypeError, ValueError) as error:
+        raise ValueError(f"flat source receipt authentication failed: {error}") \
+            from error
+    provenance = loaded.provenance
+    if source["name"] != loaded.name or source["terrain_id"] != "flat" \
+            or source["source_fps"] != loaded.fps \
+            or source["source_frames"] != len(loaded.qpos) \
+            or provenance["path"] != source["path"] \
+            or provenance["sha256"] != source["sha256"] \
+            or provenance["receipt_path"] != source["receipt_path"] \
+            or provenance["receipt_sha256"] != source["receipt_sha256"] \
+            or source["receipt_schema"] != provenance["receipt"]["schema"] \
+            or source["receipt_status"] != provenance["receipt"]["status"] \
+            or source["receipt_status"] != "accepted":
+        raise ValueError("flat source/receipt identity changed")
+    output_frames = source["output_frames"]
+    left = source["left_source_index"]
+    right = source["right_source_index"]
+    alpha = source["source_alpha"]
+    if type(output_frames) is not int or output_frames < 1 \
+            or type(left) is not list or type(right) is not list \
+            or type(alpha) is not list \
+            or len(left) != output_frames or len(right) != output_frames \
+            or len(alpha) != output_frames:
+        raise ValueError("flat source interpolation map dimensions changed")
+    if any(type(value) is not int for value in left + right) \
+            or any(type(value) is not float
+                   or not np.isfinite(value) for value in alpha):
+        raise ValueError("flat source interpolation map types changed")
+    if any(value < 0 or value >= len(loaded.qpos) for value in left + right) \
+            or any(value < 0.0 or value > 1.0 for value in alpha):
+        raise ValueError("flat source interpolation map values are invalid")
 
 
 class PublicationCommittedError(RuntimeError):
@@ -1106,11 +1206,12 @@ def publish_flat_artifacts(
     if len(features.values) != len(artifacts.positions):
         raise ValueError("database and matching feature rows differ")
     if type(manifest_base) is not dict \
-            or manifest_base.get("schema") != "g1-lmm-flat-data/v1" \
+            or manifest_base.get("schema") != "g1-lmm-flat-data/v2" \
             or "artifacts" in manifest_base or "status" in manifest_base:
         raise ValueError("flat manifest base is invalid")
     if not callable(validate_candidate):
         raise TypeError("validate_candidate must be callable")
+    _authenticate_flat_manifest_inputs(manifest_base)
     normalized_base = json.loads(canonical_json_bytes(manifest_base))
 
     output_dir = os.path.abspath(os.fspath(output_dir))
@@ -1147,9 +1248,11 @@ def publish_flat_artifacts(
 
         _validate_staged_flat(staging, artifacts, features, manifest)
         validate_candidate(staging)
+        _authenticate_flat_manifest_inputs(manifest)
         _validate_staged_flat(staging, artifacts, features, manifest)
         _fsync_tree(staging)
         with _locked_parent(parent) as parent_descriptor:
+            _authenticate_flat_manifest_inputs(manifest)
             _validate_staged_flat(staging, artifacts, features, manifest)
             output_identity = _output_directory_identity(output_dir)
             exchanged = False

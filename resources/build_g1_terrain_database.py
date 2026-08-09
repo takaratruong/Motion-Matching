@@ -32,6 +32,7 @@ from resources.g1_terrain_builder.database import (
 from resources.g1_terrain_builder.kinematics import (
     G1Kinematics,
     convert_source_clip,
+    split_continuity_ranges,
 )
 from resources.g1_terrain_builder.features import (
     FEATURE_NAMES,
@@ -49,6 +50,8 @@ from resources.g1_terrain_builder.sources import (
     load_retarget_npz,
     load_takara,
 )
+from resources.g1_terrain_builder.resample import resample_map, resample_vectors
+from resources.g1_terrain_builder.schema import SourceClip
 from resources.g1_terrain_builder.terrain import (
     FlatTerrain,
     GrailTerrain,
@@ -77,8 +80,12 @@ def _odd_frame_count(seconds: float, fps: float) -> int:
     return count if count % 2 else count + 1
 
 
-def finalize_clip(source, terrain, kin, output_fps=OUTPUT_FPS):
-    clip, skeleton, report = convert_source_clip(source, kin, output_fps)
+def finalize_clip(
+    source, terrain, kin, output_fps=OUTPUT_FPS,
+    root_filter_mode="interp",
+):
+    clip, skeleton, report = convert_source_clip(
+        source, kin, output_fps, root_filter_mode=root_filter_mode)
     gp, gq = forward_kinematics_arrays(
         clip.positions, clip.rotations, skeleton.parents)
     # quat.to_scaled_angle_axis uses np.where around its zero-angle branch;
@@ -128,7 +135,9 @@ def _run_candidate_validator(staging, args):
     validator = os.path.join(
         REPOSITORY_ROOT, "resources", "validate_g1_terrain_database.py")
     argv = [sys.executable, validator, staging]
-    if not getattr(args, "flat_only", False) and args.grail_limit is None:
+    if getattr(args, "flat_only", False):
+        argv.extend(["--g1-xml", args.g1_xml])
+    elif args.grail_limit is None:
         argv.extend([
             "--full-source-validation",
             "--grail-glob", args.grail_glob,
@@ -198,6 +207,38 @@ def _flat_feature_signature(names, horizons, weights, offset, scale):
         allow_nan=False).encode("utf-8")).hexdigest()
 
 
+def _maximum_local_rotation_steps(rotations):
+    rotations = np.asarray(rotations, np.float64)
+    if rotations.ndim != 3 or rotations.shape[-1] != 4 \
+            or len(rotations) < 2 or not np.isfinite(rotations).all():
+        raise ValueError("local rotations must be a finite (T, B, 4) array")
+    norms = np.linalg.norm(rotations, axis=-1, keepdims=True)
+    if np.any(norms < 1e-12):
+        raise ValueError("local rotations contain a zero quaternion")
+    normalized = rotations / norms
+    dots = np.abs(np.sum(normalized[:-1] * normalized[1:], axis=-1))
+    return np.max(2.0 * np.arccos(np.clip(dots, 0.0, 1.0)), axis=1)
+
+
+def _flat_source_fragment(source, first_source_frame, last_source_frame):
+    first_source_frame = int(first_source_frame)
+    last_source_frame = int(last_source_frame)
+    if first_source_frame < 0 or last_source_frame < first_source_frame \
+            or last_source_frame >= len(source.qpos):
+        raise ValueError("flat continuity fragment source bounds are invalid")
+    stop = last_source_frame + 1
+    fragment = SourceClip(
+        source.name,
+        source.fps,
+        source.qpos[first_source_frame:stop].copy(),
+        source.source_frames[first_source_frame:stop].copy(),
+        source.terrain_id,
+        source.provenance,
+    )
+    fragment.validate()
+    return fragment
+
+
 def _assemble_flat_candidate(args):
     if float(args.output_fps) != 60.0:
         raise ValueError("--flat-only requires --output-fps 60")
@@ -211,18 +252,103 @@ def _assemble_flat_candidate(args):
     if source.fps != 120.0 or source.terrain_id != "flat":
         raise ValueError("flat released-PFNN source must be 120 Hz and flat")
     kinematics = G1Kinematics(args.g1_xml)
-    clip, skeleton, report = finalize_clip(
-        source, FlatTerrain(), kinematics, output_fps=60.0)
-    if len(skeleton.names) != 31:
+    preliminary, skeleton, _ = convert_source_clip(
+        source, kinematics, target_fps=60.0, root_filter_mode="nearest")
+    if len(skeleton.names) != 31 or len(preliminary.positions) != 4086:
         raise ValueError("flat G1 skeleton must contain exactly 31 bones")
-    artifacts = combine_clips([clip], skeleton)
+    native_dofs = resample_vectors(source.qpos[:, 7:], source.fps, 60.0)
+    native_steps = np.max(np.abs(np.diff(native_dofs, axis=0)), axis=1)
+    local_steps = _maximum_local_rotation_steps(preliminary.rotations)
+    continuity_plan = split_continuity_ranges(
+        native_steps, local_steps, threshold=0.25, minimum_frames=61)
+    expected_plan = {
+        "source_native_rejected_edge_count": 31,
+        "database_local_rejected_edge_count": 32,
+        "union_rejected_edge_count": 32,
+        "dropped_fragment_count": 20,
+        "dropped_frame_count": 233,
+    }
+    for key, expected in expected_plan.items():
+        if continuity_plan[key] != expected:
+            raise ValueError(
+                f"released-PFNN continuity {key} changed: "
+                f"{continuity_plan[key]} != {expected}")
+    retained = continuity_plan["retained_ranges"]
+    if len(retained) != 13 or sum(stop - start for start, stop in retained) \
+            != 3853:
+        raise ValueError("released-PFNN retained continuity ranges changed")
+
+    full_left, full_right, _full_alpha = resample_map(
+        len(source.qpos), source.fps, 60.0)
+    clips = []
+    reports = []
+    ranges = []
+    database_cursor = 0
+    expected_signature = skeleton.signature()
+    for output_start, output_stop in retained:
+        first_source = int(full_left[output_start])
+        last_source = int(full_right[output_stop - 1])
+        fragment = _flat_source_fragment(
+            source, first_source, last_source)
+        clip, fragment_skeleton, report = finalize_clip(
+            fragment, FlatTerrain(), kinematics, output_fps=60.0,
+            root_filter_mode="nearest")
+        if fragment_skeleton.signature() != expected_signature \
+                or len(clip.positions) != output_stop - output_start:
+            raise ValueError("flat continuity fragment conversion changed")
+        range_stop = database_cursor + len(clip.positions)
+        ranges.append({
+            "start": database_cursor,
+            "stop": range_stop,
+            "source": source.name,
+            "source_first_frame": int(clip.source_left_indices[0]),
+            "source_last_frame": int(clip.source_right_indices[-1]),
+            "motion_class": "flat-walk",
+            "terrain_class": "flat",
+        })
+        clips.append(clip)
+        reports.append(report)
+        database_cursor = range_stop
+
+    artifacts = combine_clips(clips, skeleton)
+    if database_cursor != 3853 \
+            or artifacts.range_starts.tolist() != [
+                entry["start"] for entry in ranges] \
+            or artifacts.range_stops.tolist() != [
+                entry["stop"] for entry in ranges]:
+        raise ValueError("flat continuity database ranges changed")
     horizons = (20, 40, 60)
     features = build_matching_features(artifacts, 60.0, horizons)
+    left_source_index = np.concatenate([
+        clip.source_left_indices for clip in clips]).astype(np.int32)
+    right_source_index = np.concatenate([
+        clip.source_right_indices for clip in clips]).astype(np.int32)
+    source_alpha = np.concatenate([
+        clip.source_alpha for clip in clips]).astype(np.float32)
+    admitted_native = max(
+        float(np.max(native_steps[start:stop - 1]))
+        for start, stop in retained)
+    admitted_local = max(
+        float(np.max(_maximum_local_rotation_steps(
+            artifacts.rotations[start:stop])))
+        for start, stop in zip(
+            artifacts.range_starts, artifacts.range_stops))
+    range_rows = np.asarray([[
+        entry["start"], entry["stop"], entry["source_first_frame"],
+        entry["source_last_frame"],
+    ] for entry in ranges], dtype="<i4")
+    range_digest = hashlib.sha256(
+        range_rows.tobytes(order="C")).hexdigest()
+    source_map_digest = hashlib.sha256(b"".join((
+        left_source_index.astype("<i4", copy=False).tobytes(order="C"),
+        right_source_index.astype("<i4", copy=False).tobytes(order="C"),
+        source_alpha.astype("<f4", copy=False).tobytes(order="C"),
+    ))).hexdigest()
     provenance = source.provenance
     if type(provenance) is not dict:
         raise ValueError("flat source has no authenticated provenance")
     manifest_base = {
-        "schema": "g1-lmm-flat-data/v1",
+        "schema": "g1-lmm-flat-data/v2",
         "output_fps": 60.0,
         "trajectory_horizons": list(horizons),
         "feature_dimensions": 31,
@@ -240,6 +366,8 @@ def _assemble_flat_candidate(args):
         },
         "database_frames": len(artifacts.positions),
         "total_clips": 1,
+        "source_count": 1,
+        "range_count": len(ranges),
         "dimensions": {"bones": 31, "features": 31, "contacts": 2},
         "skeleton": {
             "names": list(skeleton.names),
@@ -247,11 +375,19 @@ def _assemble_flat_candidate(args):
             "basis": "holden-y-up-right-handed-forward-plus-z",
             "signature": skeleton.signature(),
         },
-        "ranges": [{
-            "start": 0, "stop": len(artifacts.positions),
-            "motion_class": "flat-walk", "terrain_class": "flat",
-            "source": source.name,
-        }],
+        "ranges": ranges,
+        "continuity": {
+            "schema": "g1-lmm-continuity/v1",
+            "threshold_rad_per_frame": 0.25,
+            "minimum_range_frames": 61,
+            **{key: continuity_plan[key] for key in expected_plan},
+            "published_range_count": len(ranges),
+            "published_frame_count": len(artifacts.positions),
+            "maximum_admitted_native_step_rad": admitted_native,
+            "maximum_admitted_local_rotation_step_rad": admitted_local,
+            "range_digest_sha256": range_digest,
+            "source_map_digest_sha256": source_map_digest,
+        },
         "time_filters": {
             "root_position_frames": 31,
             "root_position_order": 3,
@@ -276,16 +412,18 @@ def _assemble_flat_candidate(args):
             "receipt_status": provenance["receipt"]["status"],
             "source_fps": source.fps,
             "source_frames": len(source.qpos),
-            "output_frames": len(clip.positions),
-            "left_source_index": clip.source_left_indices.tolist(),
-            "right_source_index": clip.source_right_indices.tolist(),
-            "source_alpha": clip.source_alpha.tolist(),
+            "output_frames": len(artifacts.positions),
+            "left_source_index": left_source_index.tolist(),
+            "right_source_index": right_source_index.tolist(),
+            "source_alpha": source_alpha.tolist(),
         }],
         "validation": {
-            "fk_max_error_m": report["fk_max_error_m"],
-            "duration_error_s": report["duration_error_s"],
-            "quaternion_norm_max_error": report[
-                "quaternion_norm_max_error"],
+            "fk_max_error_m": max(
+                float(report["fk_max_error_m"]) for report in reports),
+            "duration_error_s": max(
+                float(report["duration_error_s"]) for report in reports),
+            "quaternion_norm_max_error": max(float(
+                report["quaternion_norm_max_error"]) for report in reports),
         },
     }
     return artifacts, features, manifest_base

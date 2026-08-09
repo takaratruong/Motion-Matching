@@ -37,6 +37,7 @@ from resources.g1_terrain_builder.database import (
     sample_terrain_support,
 )
 from resources.g1_terrain_builder.features import FEATURE_NAMES, FEATURE_WEIGHTS
+from resources.g1_terrain_builder.features import build_matching_features
 from resources.g1_terrain_builder.kinematics import (
     G1Kinematics,
     convert_source_clip,
@@ -50,7 +51,13 @@ from resources.g1_terrain_builder.scenes import (
     procedural_scene_definitions,
     select_grail_scene_bases,
 )
-from resources.g1_terrain_builder.sources import load_grail, load_takara
+from resources.g1_terrain_builder.resample import resample_map, resample_vectors
+from resources.g1_terrain_builder.schema import SourceClip
+from resources.g1_terrain_builder.sources import (
+    load_grail,
+    load_retarget_npz,
+    load_takara,
+)
 from resources.g1_terrain_builder.terrain import (
     FlatTerrain,
     HEIGHTFIELD_DIAGONAL,
@@ -65,7 +72,8 @@ from resources.g1_terrain_builder.terrain import (
 
 
 SCHEMA = "g1-terrain-artifacts/v2"
-FLAT_SCHEMA = "g1-lmm-flat-data/v1"
+FLAT_SCHEMA = "g1-lmm-flat-data/v2"
+REJECTED_FLAT_SCHEMA = "g1-lmm-flat-data/v1"
 OUTPUT_FPS = 25.0
 FEATURE_DIMENSIONS = 31
 TERRAIN_DIMENSIONS = 4
@@ -91,49 +99,103 @@ def _validate_flat_tree(root):
              "flat artifact tree has missing, stale, or unexpected files")
 
 
-def _validate_flat_artifact_directory(root, manifest):
+def _flat_local_rotation_steps(rotations):
+    rotations = np.asarray(rotations, np.float64)
+    _require(rotations.ndim == 3 and rotations.shape[-1] == 4
+             and len(rotations) >= 2 and np.isfinite(rotations).all(),
+             "flat local rotations have invalid dimensions/values")
+    norms = np.linalg.norm(rotations, axis=-1, keepdims=True)
+    _require(np.all(norms > 1e-12),
+             "flat local rotations contain a zero quaternion")
+    q = rotations / norms
+    dots = np.abs(np.sum(q[:-1] * q[1:], axis=-1))
+    return np.max(2.0 * np.arccos(np.clip(dots, 0.0, 1.0)), axis=1)
+
+
+def _flat_continuity_plan(native_steps, local_steps):
+    native_rejected = np.asarray(native_steps) > 0.25
+    local_rejected = np.asarray(local_steps) > 0.25
+    _require(native_rejected.shape == local_rejected.shape,
+             "flat continuity edge vectors differ")
+    union = native_rejected | local_rejected
+    edges = np.flatnonzero(union)
+    starts = np.concatenate(([0], edges + 1)).astype(np.int64)
+    stops = np.concatenate((edges + 1, [len(union) + 1])).astype(np.int64)
+    lengths = stops - starts
+    retained = lengths >= 61
+    return {
+        "source_native_rejected_edge_count": int(native_rejected.sum()),
+        "database_local_rejected_edge_count": int(local_rejected.sum()),
+        "union_rejected_edge_count": int(union.sum()),
+        "dropped_fragment_count": int((~retained).sum()),
+        "dropped_frame_count": int(lengths[~retained].sum()),
+        "retained_ranges": tuple(
+            (int(start), int(stop))
+            for start, stop in zip(starts[retained], stops[retained])),
+    }
+
+
+def _flat_source_fragment(source, first, last):
+    stop = int(last) + 1
+    fragment = SourceClip(
+        source.name, source.fps, source.qpos[int(first):stop].copy(),
+        source.source_frames[int(first):stop].copy(), source.terrain_id,
+        source.provenance)
+    fragment.validate()
+    return fragment
+
+
+def _validate_flat_artifact_directory(root, manifest, source_options):
     _validate_flat_tree(root)
     expected_keys = {
         "schema", "status", "output_fps", "trajectory_horizons",
         "feature_dimensions", "feature_names", "feature_weights",
         "feature_offset", "feature_scale", "feature_signature",
-        "terrain_features",
-        "database_frames", "total_clips", "dimensions", "skeleton",
-        "ranges", "time_filters", "contact", "sources", "validation",
-        "artifacts",
+        "terrain_features", "database_frames", "total_clips",
+        "source_count", "range_count", "dimensions", "skeleton",
+        "ranges", "continuity", "time_filters", "contact", "sources",
+        "validation", "artifacts",
     }
-    _require(set(manifest) == expected_keys, "flat manifest key set changed")
-    _require(manifest["schema"] == FLAT_SCHEMA, "flat manifest schema changed")
+    _require(type(manifest) is dict and set(manifest) == expected_keys,
+             "flat manifest key set changed")
+    _require(manifest["schema"] == FLAT_SCHEMA,
+             "flat manifest schema must be g1-lmm-flat-data/v2")
     _require(manifest["status"] == "accepted", "flat manifest is not accepted")
-    _require(manifest["output_fps"] == 60.0,
-             "flat manifest output rate must be 60 Hz")
-    _require(manifest["trajectory_horizons"] == [20, 40, 60],
+    _require(type(manifest["output_fps"]) is float
+             and manifest["output_fps"] == 60.0,
+             "flat manifest output rate must be an exact 60 Hz float")
+    _require(_json_exact(manifest["trajectory_horizons"], [20, 40, 60]),
              "flat trajectory horizons changed")
-    _require(manifest["feature_dimensions"] == 31,
+    _require(type(manifest["feature_dimensions"]) is int
+             and manifest["feature_dimensions"] == 31,
              "flat feature dimensions changed")
-    _require(manifest["feature_names"] == list(FEATURE_NAMES)
-             and manifest["feature_weights"] == list(FEATURE_WEIGHTS),
+    _require(_json_exact(manifest["feature_names"], list(FEATURE_NAMES))
+             and _json_exact(
+                 manifest["feature_weights"], list(FEATURE_WEIGHTS)),
              "flat feature ordering/weights changed")
-    _require(manifest["terrain_features"] == {
+    _require(_json_exact(manifest["terrain_features"], {
         "indices": [27, 28, 29, 30],
         "semantics": "authenticated-flat-root-relative-height-deltas",
         "value_m": 0.0,
-    }, "flat terrain feature receipt changed")
-    _require(manifest["dimensions"] == {
+    }), "flat terrain feature receipt changed")
+    _require(_json_exact(manifest["dimensions"], {
         "bones": 31, "features": 31, "contacts": 2,
-    }, "flat dimensions changed")
-    _require(manifest["time_filters"] == {
+    }), "flat dimensions changed")
+    _require(_json_exact(manifest["time_filters"], {
         "root_position_frames": 31, "root_position_order": 3,
         "root_direction_frames": 61, "root_direction_order": 3,
         "contact_median_frames": 7, "forward_terrain_path_rows": 121,
-    }, "flat time-derived filters changed")
-    _require(manifest["contact"] == {
+    }), "flat time-derived filters changed")
+    _require(_json_exact(manifest["contact"], {
         "speed_threshold": 0.15, "height_threshold": 0.06,
         "median_filter_frames": 7,
-    }, "flat contact parameters changed")
-    _require(manifest["database_frames"] == 4086
-             and manifest["total_clips"] == 1,
-             "flat released-PFNN row/range count changed")
+    }), "flat contact parameters changed")
+    for key, expected in (
+        ("database_frames", 3853), ("total_clips", 1),
+        ("source_count", 1), ("range_count", 13),
+    ):
+        _require(type(manifest[key]) is int and manifest[key] == expected,
+                 f"flat {key} changed")
 
     descriptors = manifest["artifacts"]
     _require(type(descriptors) is dict
@@ -152,29 +214,29 @@ def _validate_flat_artifact_directory(root, manifest):
                  and type(descriptor["size_bytes"]) is int
                  and descriptor["size_bytes"] > 0
                  and type(descriptor["sha256"]) is str
-                 and _HEX_SHA256.fullmatch(descriptor["sha256"]),
+                 and bool(_HEX_SHA256.fullmatch(descriptor["sha256"])),
                  f"flat {name} descriptor changed")
         path = os.path.join(root, name)
         digest, identity = _sha256_file(path, maximum)
         _require(digest == descriptor["sha256"],
                  f"flat {name} SHA-256 mismatch")
-        _require(os.stat(path).st_size == descriptor["size_bytes"],
+        _require(os.lstat(path).st_size == descriptor["size_bytes"],
                  f"flat {name} size mismatch")
         authenticated[name] = (path, identity)
 
     database = read_holden_database(authenticated["database.bin"][0])
     features = read_features(authenticated["features.bin"][0])
-    _require(database.positions.shape == (4086, 31, 3),
-             "flat database position dimensions changed")
-    _require(database.rotations.shape == (4086, 31, 4),
-             "flat database rotation dimensions changed")
-    _require(database.contacts.shape == (4086, 2),
-             "flat database contact dimensions changed")
-    _require(database.range_starts.tolist() == [0]
-             and database.range_stops.tolist() == [4086],
-             "flat database range changed")
-    _require(features.values.shape == (4086, 31),
+    _require(database.positions.shape == (3853, 31, 3)
+             and database.rotations.shape == (3853, 31, 4)
+             and database.contacts.shape == (3853, 2),
+             "flat database dimensions changed")
+    _require(features.values.shape == (3853, 31),
              "flat features dimensions changed")
+    for key in ("feature_offset", "feature_scale"):
+        _require(type(manifest[key]) is list and len(manifest[key]) == 31
+                 and all(type(value) is float and np.isfinite(value)
+                         for value in manifest[key]),
+                 f"flat {key} scalar types changed")
     _require(np.array_equal(
         features.offset, np.asarray(manifest["feature_offset"], np.float32)),
         "flat feature offsets differ from features.bin")
@@ -182,10 +244,8 @@ def _validate_flat_artifact_directory(root, manifest):
         features.scale, np.asarray(manifest["feature_scale"], np.float32)),
         "flat feature scales differ from features.bin")
     signature_payload = {
-        "names": list(FEATURE_NAMES),
-        "horizons": [20, 40, 60],
-        "weights": list(FEATURE_WEIGHTS),
-        "offset": features.offset.tolist(),
+        "names": list(FEATURE_NAMES), "horizons": [20, 40, 60],
+        "weights": list(FEATURE_WEIGHTS), "offset": features.offset.tolist(),
         "scale": features.scale.tolist(),
     }
     expected_feature_signature = hashlib.sha256(json.dumps(
@@ -194,13 +254,17 @@ def _validate_flat_artifact_directory(root, manifest):
     _require(manifest["feature_signature"] == expected_feature_signature,
              "flat feature signature changed")
     _require(np.all(features.values[:, 27:31] == 0.0),
-             "flat terrain feature rows must be exact zero")
+             "flat terrain feature rows must be authenticated exact zero")
 
     skeleton = manifest["skeleton"]
     _require(type(skeleton) is dict and set(skeleton) == {
         "names", "parents", "basis", "signature",
     }, "flat skeleton receipt changed")
-    _require(len(skeleton["names"]) == 31
+    _require(type(skeleton["names"]) is list
+             and len(skeleton["names"]) == 31
+             and all(type(name) is str and name for name in skeleton["names"])
+             and type(skeleton["parents"]) is list
+             and all(type(parent) is int for parent in skeleton["parents"])
              and skeleton["parents"] == database.parents.tolist()
              and skeleton["basis"] ==
              "holden-y-up-right-handed-forward-plus-z",
@@ -208,44 +272,270 @@ def _validate_flat_artifact_directory(root, manifest):
     _require(_manifest_signature(
         skeleton["names"], skeleton["parents"]) == skeleton["signature"],
         "flat skeleton signature changed")
-    _require(manifest["ranges"] == [{
-        "start": 0, "stop": 4086, "motion_class": "flat-walk",
-        "terrain_class": "flat", "source": manifest["sources"][0]["name"],
-    }], "flat range receipt changed")
 
+    source_keys = {
+        "name", "terrain_id", "path", "sha256", "receipt_path",
+        "receipt_sha256", "receipt_schema", "receipt_status", "source_fps",
+        "source_frames", "output_frames", "left_source_index",
+        "right_source_index", "source_alpha",
+    }
     sources = manifest["sources"]
-    _require(type(sources) is list and len(sources) == 1,
-             "flat source receipt count changed")
-    source = sources[0]
-    _require(source["source_fps"] == 120.0
-             and source["source_frames"] == 8171
-             and source["output_frames"] == 4086
-             and source["terrain_id"] == "flat"
-             and source["receipt_schema"] ==
+    _require(type(sources) is list and len(sources) == 1
+             and type(sources[0]) is dict and set(sources[0]) == source_keys,
+             "flat source receipt keys/count changed")
+    source_receipt = sources[0]
+    _require(type(source_receipt["name"]) is str and source_receipt["name"]
+             and source_receipt["terrain_id"] == "flat"
+             and type(source_receipt["path"]) is str
+             and os.path.isabs(source_receipt["path"])
+             and type(source_receipt["receipt_path"]) is str
+             and os.path.isabs(source_receipt["receipt_path"])
+             and source_receipt["receipt_schema"] ==
              "native-g1-pfnn-sample-retarget/v1"
-             and source["receipt_status"] == "accepted",
+             and source_receipt["receipt_status"] == "accepted"
+             and type(source_receipt["source_fps"]) is float
+             and source_receipt["source_fps"] == 120.0
+             and type(source_receipt["source_frames"]) is int
+             and source_receipt["source_frames"] == 8171
+             and type(source_receipt["output_frames"]) is int
+             and source_receipt["output_frames"] == 3853,
              "flat source identity/rate receipt changed")
-    expected_indices = list(range(0, 8171, 2))
-    _require(source["left_source_index"] == expected_indices
-             and source["right_source_index"] == expected_indices,
-             "flat 120-to-60 interpolation indices are not exact even rows")
-    _require(source["source_alpha"] == [0.0] * 4086,
-             "flat 120-to-60 interpolation alpha is not exact zero")
-    _require(type(source["sha256"]) is str
-             and _HEX_SHA256.fullmatch(source["sha256"])
-             and type(source["receipt_sha256"]) is str
-             and _HEX_SHA256.fullmatch(source["receipt_sha256"]),
-             "flat source hashes are invalid")
+    for key in ("sha256", "receipt_sha256"):
+        _require(type(source_receipt[key]) is str
+                 and bool(_HEX_SHA256.fullmatch(source_receipt[key])),
+                 f"flat source {key} is invalid")
+    source_digest, source_identity = _sha256_file(
+        source_receipt["path"], 512 * 1024 * 1024)
+    receipt_digest, receipt_identity = _sha256_file(
+        source_receipt["receipt_path"], 4 * 1024 * 1024)
+    _require(source_digest == source_receipt["sha256"],
+             "flat source SHA-256 mismatch")
+    _require(receipt_digest == source_receipt["receipt_sha256"],
+             "flat source receipt SHA-256 mismatch")
+    try:
+        source = load_retarget_npz(
+            source_receipt["path"], source_receipt["receipt_path"])
+    except (OSError, TypeError, ValueError) as error:
+        raise ValueError(f"flat source/receipt authentication failed: {error}") \
+            from error
+    _require(source.name == source_receipt["name"]
+             and source.fps == 120.0 and len(source.qpos) == 8171,
+             "flat source content identity changed")
+
+    options = _validate_full_source_options(source_options)
+    kinematics = G1Kinematics(options["g1_xml"])
+    preliminary, rebuilt_skeleton, preliminary_report = convert_source_clip(
+        source, kinematics, 60.0, root_filter_mode="nearest")
+    _require(preliminary_report["fk_max_error_m"] <= 1e-5,
+             "flat full-source FK error exceeds 1e-5 m")
+    _require(rebuilt_skeleton.signature() == skeleton["signature"],
+             "flat independently rebuilt skeleton changed")
+    native_qpos = resample_vectors(source.qpos[:, 7:], 120.0, 60.0)
+    native_steps = np.max(np.abs(np.diff(native_qpos, axis=0)), axis=1)
+    local_steps = _flat_local_rotation_steps(preliminary.rotations)
+    plan = _flat_continuity_plan(native_steps, local_steps)
+    _require(plan["source_native_rejected_edge_count"] == 31
+             and plan["database_local_rejected_edge_count"] == 32
+             and plan["union_rejected_edge_count"] == 32
+             and plan["dropped_fragment_count"] == 20
+             and plan["dropped_frame_count"] == 233
+             and len(plan["retained_ranges"]) == 13
+             and sum(stop - start for start, stop
+                     in plan["retained_ranges"]) == 3853,
+             "flat independently recomputed continuity plan changed")
+
+    range_keys = {
+        "start", "stop", "source", "source_first_frame",
+        "source_last_frame", "motion_class", "terrain_class",
+    }
+    ranges = manifest["ranges"]
+    _require(type(ranges) is list and len(ranges) == 13,
+             "flat range count changed")
+    full_left, full_right, full_alpha = resample_map(8171, 120.0, 60.0)
+    expected_left = []
+    expected_right = []
+    expected_alpha = []
+    cursor = 0
+    for index, ((raw_start, raw_stop), entry) in enumerate(zip(
+            plan["retained_ranges"], ranges)):
+        _require(type(entry) is dict and set(entry) == range_keys,
+                 f"flat range {index} key set changed")
+        for key in ("start", "stop", "source_first_frame",
+                    "source_last_frame"):
+            _require(type(entry[key]) is int,
+                     f"flat range {index} {key} type changed")
+        length = raw_stop - raw_start
+        expected = {
+            "start": cursor, "stop": cursor + length,
+            "source": source.name,
+            "source_first_frame": int(full_left[raw_start]),
+            "source_last_frame": int(full_right[raw_stop - 1]),
+            "motion_class": "flat-walk", "terrain_class": "flat",
+        }
+        _require(entry == expected and length >= 61,
+                 f"flat range {index} differs from continuity plan")
+        expected_left.extend(full_left[raw_start:raw_stop].tolist())
+        expected_right.extend(full_right[raw_start:raw_stop].tolist())
+        expected_alpha.extend(full_alpha[raw_start:raw_stop].tolist())
+        cursor += length
+    _require(cursor == 3853
+             and database.range_starts.tolist() == [
+                 entry["start"] for entry in ranges]
+             and database.range_stops.tolist() == [
+                 entry["stop"] for entry in ranges],
+             "flat database ranges differ from manifest")
+
+    left = source_receipt["left_source_index"]
+    right = source_receipt["right_source_index"]
+    alpha = source_receipt["source_alpha"]
+    _require(type(left) is list and type(right) is list and type(alpha) is list
+             and len(left) == len(right) == len(alpha) == 3853
+             and all(type(value) is int for value in left + right)
+             and all(type(value) is float for value in alpha),
+             "flat source map key types/dimensions changed")
+    _require(left == expected_left and right == expected_right
+             and alpha == expected_alpha,
+             "flat source map differs from independently retained rows")
+
+    continuity_keys = {
+        "schema", "threshold_rad_per_frame", "minimum_range_frames",
+        "source_native_rejected_edge_count",
+        "database_local_rejected_edge_count", "union_rejected_edge_count",
+        "dropped_fragment_count", "dropped_frame_count",
+        "published_range_count", "published_frame_count",
+        "maximum_admitted_native_step_rad",
+        "maximum_admitted_local_rotation_step_rad", "range_digest_sha256",
+        "source_map_digest_sha256",
+    }
+    continuity = manifest["continuity"]
+    _require(type(continuity) is dict and set(continuity) == continuity_keys,
+             "flat continuity receipt keys changed")
+    _require(continuity["schema"] == "g1-lmm-continuity/v1"
+             and type(continuity["threshold_rad_per_frame"]) is float
+             and continuity["threshold_rad_per_frame"] == 0.25
+             and type(continuity["minimum_range_frames"]) is int
+             and continuity["minimum_range_frames"] == 61,
+             "flat continuity schema/threshold changed")
+    integer_receipts = {
+        **{key: plan[key] for key in (
+            "source_native_rejected_edge_count",
+            "database_local_rejected_edge_count", "union_rejected_edge_count",
+            "dropped_fragment_count", "dropped_frame_count")},
+        "published_range_count": 13, "published_frame_count": 3853,
+    }
+    for key, expected in integer_receipts.items():
+        _require(type(continuity[key]) is int and continuity[key] == expected,
+                 f"flat continuity {key} differs from recomputation")
+    range_rows = np.asarray([[
+        entry["start"], entry["stop"], entry["source_first_frame"],
+        entry["source_last_frame"],
+    ] for entry in ranges], dtype="<i4")
+    expected_range_digest = hashlib.sha256(
+        range_rows.tobytes(order="C")).hexdigest()
+    map_payload = b"".join((
+        np.asarray(left, dtype="<i4").tobytes(order="C"),
+        np.asarray(right, dtype="<i4").tobytes(order="C"),
+        np.asarray(alpha, dtype="<f4").tobytes(order="C"),
+    ))
+    expected_map_digest = hashlib.sha256(map_payload).hexdigest()
+    _require(continuity["range_digest_sha256"] == expected_range_digest,
+             "flat continuity range digest mismatch")
+    _require(continuity["source_map_digest_sha256"] == expected_map_digest,
+             "flat continuity source-map digest mismatch")
+    maximum_native = max(float(np.max(native_steps[start:stop - 1]))
+                         for start, stop in plan["retained_ranges"])
+    maximum_local = max(float(np.max(_flat_local_rotation_steps(
+        database.rotations[start:stop]))) for start, stop in zip(
+            database.range_starts, database.range_stops))
+    for key, expected in (
+        ("maximum_admitted_native_step_rad", maximum_native),
+        ("maximum_admitted_local_rotation_step_rad", maximum_local),
+    ):
+        _require(type(continuity[key]) is float
+                 and np.isfinite(continuity[key])
+                 and abs(continuity[key] - expected) <= 1e-12
+                 and continuity[key] <= 0.25,
+                 f"flat continuity {key} differs from database/source")
+
+    validation = manifest["validation"]
+    validation_keys = {
+        "fk_max_error_m", "duration_error_s", "quaternion_norm_max_error",
+    }
+    _require(type(validation) is dict and set(validation) == validation_keys,
+             "flat validation receipt keys changed")
+    _require(all(type(validation[key]) is float
+                 and np.isfinite(validation[key]) and validation[key] >= 0.0
+                 for key in validation_keys),
+             "flat validation receipt scalar types changed")
+    reports = []
+    for index, entry in enumerate(ranges):
+        fragment = _flat_source_fragment(
+            source, entry["source_first_frame"], entry["source_last_frame"])
+        rebuilt, fragment_skeleton, report = convert_source_clip(
+            fragment, kinematics, 60.0, root_filter_mode="nearest")
+        start, stop = entry["start"], entry["stop"]
+        _require(fragment_skeleton.signature() == skeleton["signature"]
+                 and len(rebuilt.positions) == stop - start,
+                 f"flat range {index} independent conversion changed")
+        _compare_f32_rows(
+            f"flat range {index} positions",
+            database.positions[start:stop], rebuilt.positions)
+        _compare_f32_rows(
+            f"flat range {index} rotations",
+            database.rotations[start:stop], rebuilt.rotations)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            velocity, angular = derive_velocities(
+                rebuilt.positions, rebuilt.rotations, 60.0)
+        _compare_f32_rows(
+            f"flat range {index} velocities",
+            database.velocities[start:stop], velocity)
+        _compare_f32_rows(
+            f"flat range {index} angular velocities",
+            database.angular_velocities[start:stop], angular)
+        gp, _ = forward_kinematics_arrays(
+            rebuilt.positions, rebuilt.rotations, database.parents)
+        contacts = derive_contacts(
+            gp, FlatTerrain(), skeleton["names"].index("LeftToe"),
+            skeleton["names"].index("RightToe"), 60.0,
+            ContactConfig(median_filter_frames=7))
+        _require(np.array_equal(database.contacts[start:stop], contacts),
+                 f"flat range {index} contacts differ from recomputation")
+        _require(report["fk_max_error_m"] <= 1e-5,
+                 f"flat range {index} FK error exceeds 1e-5 m")
+        reports.append(report)
+    expected_validation = {
+        key: max(float(report[key]) for report in reports)
+        for key in validation_keys
+    }
+    _require(all(abs(validation[key] - expected_validation[key]) <= 1e-12
+                 for key in validation_keys),
+             "flat validation receipt differs from independent conversion")
+    _require(validation["fk_max_error_m"] <= 1e-5
+             and validation["quaternion_norm_max_error"] <= 1e-4
+             and validation["duration_error_s"] <= 1.0 / 60.0,
+             "flat validation thresholds exceeded")
+    rebuilt_features = build_matching_features(
+        database, 60.0, (20, 40, 60))
+    for field in ("values", "offset", "scale"):
+        _compare_f32_rows(
+            f"flat matching feature {field}",
+            getattr(features, field), getattr(rebuilt_features, field))
+
     quaternion_error = float(np.max(np.abs(
         np.linalg.norm(database.rotations, axis=-1) - 1.0)))
     _require(quaternion_error <= 1e-4,
              "flat database quaternion norm error exceeds 0.0001")
+    _require_file_identity(
+        source_receipt["path"], source_identity, "flat source")
+    _require_file_identity(
+        source_receipt["receipt_path"], receipt_identity,
+        "flat source receipt")
     for name, (_, identity) in authenticated.items():
         _require_file_identity(os.path.join(root, name), identity, name)
     _validate_flat_tree(root)
     return {
-        "schema": FLAT_SCHEMA, "frames": 4086, "clips": 1,
-        "bones": 31, "features": 31, "scenes": 0, "source_rows": 0,
+        "schema": FLAT_SCHEMA, "frames": 3853, "clips": 1,
+        "bones": 31, "features": 31, "scenes": 0, "source_rows": 8171,
     }
 SCENE_CELL_SIZE = float(np.float32(0.02))
 WALKABILITY_HALO = float(np.float32(0.25))
@@ -2521,10 +2811,14 @@ def validate_artifact_directory(
     manifest = _read_json(
         os.path.join(root, "manifest.json"), _MAX_MANIFEST_BYTES,
         "manifest JSON")
+    if type(manifest) is dict \
+            and manifest.get("schema") == REJECTED_FLAT_SCHEMA:
+        raise ValueError(
+            "flat bundle schema v1 is rejected; g1-lmm-flat-data/v2 required")
     if type(manifest) is dict and manifest.get("schema") == FLAT_SCHEMA:
         _require(not full_source_validation,
                  "flat bundle does not support full corpus validation")
-        return _validate_flat_artifact_directory(root, manifest)
+        return _validate_flat_artifact_directory(root, manifest, source_options)
     _validate_exact_file_tree(root)
     _require(
         type(manifest) is dict and manifest.get("schema") == SCHEMA,

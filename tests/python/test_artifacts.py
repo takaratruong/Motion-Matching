@@ -145,6 +145,66 @@ def repack_with_scene_metadata(pack, mutation):
 
 class ArtifactTests(unittest.TestCase):
 
+    def test_flat_manifest_input_authentication_rejects_forgery_and_empty_validation(self):
+        joint_names = [f"joint-{index}" for index in range(29)]
+        with tempfile.TemporaryDirectory() as temporary:
+            source_path = os.path.join(temporary, "source.npz")
+            receipt_path = os.path.join(temporary, "source.receipt.json")
+            np.savez(
+                source_path,
+                root_pos=np.zeros((1, 3), np.float64),
+                root_quat=np.array([[0.0, 0.0, 0.0, 1.0]], np.float64),
+                dof=np.zeros((1, 29), np.float64),
+                fps=np.array(120.0), engine=np.array("gmr"),
+                joint_names=np.asarray(joint_names),
+                joint_limits=np.zeros((29, 2), np.float64),
+            )
+            source_sha = file_sha256(source_path)
+            receipt = {
+                "schema": "native-g1-pfnn-sample-retarget/v1",
+                "status": "accepted", "root_quaternion_order": "xyzw",
+                "output_sha256": source_sha, "frame_count": 1,
+                "fps": 120.0, "joint_names": joint_names,
+            }
+            with open(receipt_path, "w", encoding="utf-8") as stream:
+                json.dump(receipt, stream)
+            source = {
+                "name": "source", "terrain_id": "flat",
+                "path": source_path, "sha256": source_sha,
+                "receipt_path": receipt_path,
+                "receipt_sha256": file_sha256(receipt_path),
+                "receipt_schema": receipt["schema"],
+                "receipt_status": "accepted", "source_fps": 120.0,
+                "source_frames": 1, "output_frames": 1,
+                "left_source_index": [0], "right_source_index": [0],
+                "source_alpha": [0.0],
+            }
+            valid = {
+                "schema": "g1-lmm-flat-data/v2", "output_fps": 60.0,
+                "sources": [source],
+                "validation": {
+                    "fk_max_error_m": 0.0, "duration_error_s": 0.0,
+                    "quaternion_norm_max_error": 0.0,
+                },
+            }
+            artifacts_module._authenticate_flat_manifest_inputs(valid)
+            cases = []
+            missing = copy.deepcopy(valid)
+            missing["sources"][0]["path"] = os.path.join(
+                temporary, "missing.npz")
+            cases.append((missing, "source"))
+            forged = copy.deepcopy(valid)
+            forged["sources"][0]["sha256"] = "0" * 64
+            cases.append((forged, "SHA-256"))
+            empty_validation = copy.deepcopy(valid)
+            empty_validation["validation"] = {}
+            cases.append((empty_validation, "validation"))
+            for candidate, message in cases:
+                with self.subTest(message=message), self.assertRaisesRegex(
+                    ValueError, message,
+                ):
+                    artifacts_module._authenticate_flat_manifest_inputs(candidate)
+
     def test_features_round_trip_matches_orange_duck_little_endian_layout(self):
         feature_set = FeatureSet(
             values=np.arange(93, dtype=np.float32).reshape(3, 31) / 10.0,

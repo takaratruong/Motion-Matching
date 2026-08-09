@@ -13,6 +13,45 @@ from .schema import HoldenClip, SkeletonSpec, SourceClip
 Q_ZUP_TO_YUP = np.array([2**-0.5, -2**-0.5, 0, 0], np.float64)
 
 
+def split_continuity_ranges(
+    native_edge_steps: np.ndarray,
+    local_rotation_edge_steps: np.ndarray,
+    *,
+    threshold: float,
+    minimum_frames: int,
+) -> dict:
+    native = np.asarray(native_edge_steps, np.float64)
+    local = np.asarray(local_rotation_edge_steps, np.float64)
+    if native.ndim != 1 or local.shape != native.shape:
+        raise ValueError("continuity edge-step arrays must be aligned vectors")
+    if not np.isfinite(native).all() or not np.isfinite(local).all() \
+            or np.any(native < 0.0) or np.any(local < 0.0):
+        raise ValueError("continuity edge steps must be finite and nonnegative")
+    if not np.isfinite(threshold) or threshold <= 0.0:
+        raise ValueError("continuity threshold must be positive and finite")
+    if type(minimum_frames) is not int or minimum_frames < 1:
+        raise ValueError("minimum continuity range must be a positive integer")
+    native_rejected = native > threshold
+    local_rejected = local > threshold
+    union_rejected = native_rejected | local_rejected
+    rejected_edges = np.flatnonzero(union_rejected)
+    starts = np.concatenate((np.array([0], np.int64), rejected_edges + 1))
+    stops = np.concatenate((rejected_edges + 1, np.array([len(native) + 1])))
+    lengths = stops - starts
+    retained = lengths >= minimum_frames
+    return {
+        "source_native_rejected_edge_count": int(native_rejected.sum()),
+        "database_local_rejected_edge_count": int(local_rejected.sum()),
+        "union_rejected_edge_count": int(union_rejected.sum()),
+        "dropped_fragment_count": int((~retained).sum()),
+        "dropped_frame_count": int(lengths[~retained].sum()),
+        "retained_ranges": tuple(
+            (int(start), int(stop))
+            for start, stop in zip(starts[retained], stops[retained])
+        ),
+    }
+
+
 class G1Kinematics:
     def __init__(self, xml_path: str):
         self.model = mujoco.MjModel.from_xml_path(xml_path)
@@ -145,8 +184,10 @@ def heading_quaternions(forward: np.ndarray) -> np.ndarray:
 
 def _prepend_simulation(
     gp: np.ndarray, gq: np.ndarray, names: tuple[str, ...],
-    parents: np.ndarray, fps: float,
+    parents: np.ndarray, fps: float, filter_mode: str = "interp",
 ) -> tuple[np.ndarray, np.ndarray, SkeletonSpec]:
+    if filter_mode not in ("interp", "nearest"):
+        raise ValueError("simulation-root filter mode must be interp or nearest")
     hips = names.index("Hips")
     torso = names.index("Spine2")
     sim_position = gp[:, torso].copy()
@@ -160,7 +201,7 @@ def _prepend_simulation(
     if pos_window >= 5:
         sim_position = signal.savgol_filter(
             sim_position, pos_window, min(3, pos_window - 2),
-            axis=0, mode="interp")
+            axis=0, mode=filter_mode)
     forward = holden_quat.mul_vec(
         gq[:, hips], np.array([1.0, 0.0, 0.0], np.float64))
     forward[:, 1] = 0.0
@@ -177,7 +218,7 @@ def _prepend_simulation(
     if dir_window >= 5:
         forward = signal.savgol_filter(
             forward, dir_window, min(3, dir_window - 2),
-            axis=0, mode="interp")
+            axis=0, mode=filter_mode)
         forward /= np.linalg.norm(forward, axis=1, keepdims=True)
     sim_rotation = heading_quaternions(forward)
     lp, lq = world_to_local(gp, gq, parents)
@@ -197,6 +238,7 @@ def _prepend_simulation(
 
 def convert_source_clip(
     source: SourceClip, kinematics: G1Kinematics, target_fps: float = 25.0,
+    root_filter_mode: str = "interp",
 ) -> tuple[HoldenClip, SkeletonSpec, dict]:
     source.validate()
     gp_z, gq_z = kinematics.world_from_qpos(source.qpos)
@@ -204,7 +246,8 @@ def convert_source_clip(
     gp = resample_vectors(gp_y, source.fps, target_fps)
     gq = resample_quaternions_wxyz(gq_y, source.fps, target_fps)
     positions, rotations, skeleton = _prepend_simulation(
-        gp, gq, kinematics.names, kinematics.parents, target_fps)
+        gp, gq, kinematics.names, kinematics.parents, target_fps,
+        root_filter_mode)
     left, right, alpha = resample_map(
         len(source.qpos), source.fps, target_fps)
     output_frames = np.where(alpha < 0.5, left, right)
@@ -223,7 +266,7 @@ def convert_source_clip(
         skeleton.parents)
     fk_error = float(np.max(np.linalg.norm(
         exported_gp[:, 1:] - gp, axis=-1)))
-    if fk_error > 0.001:
+    if fk_error > 1e-5:
         raise ValueError(f"{source.name}: exported FK error {fk_error} m")
     clip = HoldenClip(
         source.name,
