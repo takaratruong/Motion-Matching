@@ -246,7 +246,12 @@ static void test_controller_delegates_one_renderer_free_runtime_step()
 {
     const std::string source = read_controller_source();
     check(source_call_count(source, "g1_runtime_step") == 1,
-          "controller calls exactly one renderer-free runtime step");
+          "controller retains one explicit ordinary runtime branch");
+    check(source_call_count(source, "g1_runtime_step_lmm") == 1,
+          "controller retains one explicit LMM runtime branch");
+    check(source.find("const bool runtime_step_succeeded = lmm_enabled") !=
+              std::string::npos,
+          "operator engine selection chooses exactly one runtime owner");
     const char* forbidden_calls[] = {
         "database_search",
         "inertialize_pose_update",
@@ -257,6 +262,27 @@ static void test_controller_delegates_one_renderer_free_runtime_step()
         check(source_call_count(source, forbidden) == 0,
               "render adapter does not retain ordinary matcher ownership");
     }
+}
+
+static void test_controller_exposes_fail_closed_lmm_mode()
+{
+    const std::string source = read_controller_source();
+    check(source.find("--locomotion-engine") != std::string::npos &&
+              source.find("ordinary|lmm") != std::string::npos,
+          "controller exposes the explicit ordinary/LMM operator choice");
+    check(source.find("static constexpr bool lmm_enabled") ==
+              std::string::npos,
+          "controller has no hard-coded dormant LMM gate");
+    const std::size_t model_load = source.find(
+        "g1_lmm_model_load_and_verify(");
+    const std::size_t window = source.find("InitWindow(");
+    check(model_load != std::string::npos && window != std::string::npos &&
+              model_load < window,
+          "LMM authentication fails closed before graphics or runtime state");
+    check(source_call_count(source, "projector_evaluate") == 0 &&
+              source_call_count(source, "stepper_evaluate") == 0 &&
+              source_call_count(source, "decompressor_evaluate") == 0,
+          "controller cannot apply a second non-transactional LMM pose path");
 }
 
 static void test_controller_validates_ik_geometry_before_window()
@@ -319,7 +345,7 @@ static void test_controller_publishes_independent_travel_and_heading()
     const std::size_t builder = controller_source.find(
         "const auto visual_prediction_builder", request);
     const std::size_t runtime_step = controller_source.find(
-        "if (!g1_runtime_step(", builder);
+        "const bool runtime_step_succeeded = lmm_enabled", builder);
     check(command != std::string::npos && heading != std::string::npos &&
               override_guard != std::string::npos &&
               override_assign != std::string::npos &&
@@ -478,8 +504,7 @@ static void test_controller_publishes_independent_travel_and_heading()
 static void test_failed_model_load_reaches_counted_shared_cleanup()
 {
     const std::string source = read_controller_source();
-    const std::size_t load =
-        source.find("Model terrain_model = LoadModel");
+    const std::size_t load = source.find("Model terrain_model =");
     const std::size_t camera = source.find("// Camera", load);
     check(load != std::string::npos && camera != std::string::npos,
           "terrain model startup block is present");
@@ -781,6 +806,12 @@ static void poison_array(array1d<int>& values)
     values.set(98);
 }
 
+static void poison_array(array1d<float>& values)
+{
+    values.resize(3);
+    values.set(99.0f);
+}
+
 static void poison_state(g1_controller_state& state)
 {
     state.frame_index = 999;
@@ -788,6 +819,10 @@ static void poison_state(g1_controller_state& state)
     state.search_time = 9.0f;
     state.search_timer = -9.0f;
     state.force_search_timer = -8.0f;
+    poison_array(state.lmm_features);
+    poison_array(state.lmm_latent);
+    state.lmm_stepper_count = 996;
+    state.lmm_commit_count = 995;
 
     poison_array(state.curr_bone_positions);
     poison_array(state.curr_bone_velocities);
@@ -951,9 +986,18 @@ static void fill_clone_array(array1d<int>& values, int size, int base)
     }
 }
 
+static void fill_clone_array(array1d<float>& values, int size, float base)
+{
+    values.resize(size);
+    for (int index = 0; index < size; ++index)
+        values(index) = base + static_cast<float>(index);
+}
+
 static void fill_valid_clone_shape(g1_controller_state& state)
 {
     poison_state(state);
+    fill_clone_array(state.lmm_features, 31, 180.0f);
+    fill_clone_array(state.lmm_latent, 32, 190.0f);
     float value = 200.0f;
 #define FILL_BONE_VEC(name) \
     fill_clone_array(state.name, G1_BoneCount, value); value += 10.0f
@@ -1056,7 +1100,12 @@ static bool same_state_bits(
     const g1_controller_state& second)
 {
 #define SAME_ARRAY(name) \
-    if (!same_array_bits(first.name, second.name)) return false
+    if (!same_array_bits(first.name, second.name)) { \
+        std::fprintf(stderr, "state array mismatch: %s\n", #name); \
+        return false; \
+    }
+    SAME_ARRAY(lmm_features);
+    SAME_ARRAY(lmm_latent);
     SAME_ARRAY(curr_bone_positions);
     SAME_ARRAY(curr_bone_velocities);
     SAME_ARRAY(trns_bone_positions);
@@ -1106,6 +1155,8 @@ static bool same_state_bits(
            same_float_bits(first.search_timer, second.search_timer) &&
            same_float_bits(
                first.force_search_timer, second.force_search_timer) &&
+           first.lmm_stepper_count == second.lmm_stepper_count &&
+           first.lmm_commit_count == second.lmm_commit_count &&
            same_vec3_bits(
                first.transition_src_position,
                second.transition_src_position) &&
@@ -1155,10 +1206,37 @@ static bool same_state_bits(
                &first.support,
                &second.support,
                sizeof(first.support)) == 0 &&
-           std::memcmp(
-               &first.support_observation_now,
-               &second.support_observation_now,
-               sizeof(first.support_observation_now)) == 0 &&
+           same_float_bits(
+               first.support_observation_now.source_height[0],
+               second.support_observation_now.source_height[0]) &&
+           same_float_bits(
+               first.support_observation_now.source_height[1],
+               second.support_observation_now.source_height[1]) &&
+           same_float_bits(
+               first.support_observation_now.source_height[2],
+               second.support_observation_now.source_height[2]) &&
+           same_float_bits(
+               first.support_observation_now.runtime_height[0],
+               second.support_observation_now.runtime_height[0]) &&
+           same_float_bits(
+               first.support_observation_now.runtime_height[1],
+               second.support_observation_now.runtime_height[1]) &&
+           same_float_bits(
+               first.support_observation_now.runtime_height[2],
+               second.support_observation_now.runtime_height[2]) &&
+           same_float_bits(
+               first.support_observation_now.delta[0],
+               second.support_observation_now.delta[0]) &&
+           same_float_bits(
+               first.support_observation_now.delta[1],
+               second.support_observation_now.delta[1]) &&
+           same_float_bits(
+               first.support_observation_now.delta[2],
+               second.support_observation_now.delta[2]) &&
+           first.support_observation_now.contact[0] ==
+               second.support_observation_now.contact[0] &&
+           first.support_observation_now.contact[1] ==
+               second.support_observation_now.contact[1] &&
            same_float_bits(
                first.traversal_speed_scale,
                second.traversal_speed_scale) &&
@@ -1199,12 +1277,20 @@ static void test_clone_is_deep_and_transactional()
     check(g1_controller_state_clone(
               clone, source, error, static_cast<int>(sizeof(error))),
           error);
+    check(same_array_bits(clone.lmm_features, source.lmm_features) &&
+              same_array_bits(clone.lmm_latent, source.lmm_latent),
+          "clone preserves LMM recurrent arrays");
+    check(clone.lmm_stepper_count == source.lmm_stepper_count &&
+              clone.lmm_commit_count == source.lmm_commit_count,
+          "clone preserves LMM ownership counters");
     check(same_state_bits(clone, source),
           "clone preserves every scalar and array value");
 
 #define CHECK_DISTINCT_ARRAY(name) \
     check(clone.name.data != source.name.data, \
           "clone array storage is pointer-independent")
+    CHECK_DISTINCT_ARRAY(lmm_features);
+    CHECK_DISTINCT_ARRAY(lmm_latent);
     CHECK_DISTINCT_ARRAY(curr_bone_positions);
     CHECK_DISTINCT_ARRAY(curr_bone_velocities);
     CHECK_DISTINCT_ARRAY(trns_bone_positions);
@@ -1364,6 +1450,18 @@ static void test_reset_clears_every_dynamic_subsystem()
               state.search_timer == state.search_time &&
               state.force_search_timer == state.search_time,
           "search timers reset");
+    check(state.lmm_features.size == 31 && state.lmm_latent.size == 32 &&
+              state.lmm_stepper_count == 0 && state.lmm_commit_count == 0,
+          "LMM recurrent state and ownership counters reset");
+    for (int feature = 0; feature < 31; ++feature)
+        check(same_float_bits(
+                  state.lmm_features(feature),
+                  db.features.rows == db.nframes() && db.features.cols == 31
+                      ? db.features(0, feature) : 0.0f),
+              "LMM reset features map the first database frame");
+    for (int latent = 0; latent < 32; ++latent)
+        check(state.lmm_latent(latent) == 0.0f,
+              "LMM reset latent is explicitly zero until model binding");
 
     for (int bone = 0; bone < G1_BoneCount; ++bone) {
         check(same_vec3(state.curr_bone_positions(bone),
@@ -1697,6 +1795,7 @@ int main()
 {
     test_active_scene_sources_use_checked_v2_queries();
     test_controller_delegates_one_renderer_free_runtime_step();
+    test_controller_exposes_fail_closed_lmm_mode();
     test_controller_wires_idle_match_transition_cost();
     test_controller_validates_ik_geometry_before_window();
     test_controller_publishes_independent_travel_and_heading();

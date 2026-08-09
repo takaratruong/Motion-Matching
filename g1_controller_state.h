@@ -16,6 +16,14 @@ struct g1_controller_state
     float search_timer = 0.10f;
     float force_search_timer = 0.10f;
 
+    // Learned motion matching owns these recurrent values transactionally.
+    // Ordinary motion matching leaves them reset but carries them through
+    // clone/swap so an engine choice never creates split state ownership.
+    array1d<float> lmm_features;
+    array1d<float> lmm_latent;
+    unsigned long long lmm_stepper_count = 0;
+    unsigned long long lmm_commit_count = 0;
+
     array1d<vec3> curr_bone_positions;
     array1d<vec3> curr_bone_velocities;
     array1d<vec3> trns_bone_positions;
@@ -155,6 +163,8 @@ static inline void g1_controller_state_swap(
     swap(first.force_search_timer, second.force_search_timer);
 
 #define G1_SWAP_ARRAY(name) g1_swap(first.name, second.name)
+    G1_SWAP_ARRAY(lmm_features);
+    G1_SWAP_ARRAY(lmm_latent);
     G1_SWAP_ARRAY(curr_bone_positions);
     G1_SWAP_ARRAY(curr_bone_velocities);
     G1_SWAP_ARRAY(trns_bone_positions);
@@ -242,6 +252,8 @@ static inline void g1_controller_state_swap(
     swap(first.adjustment_y, second.adjustment_y);
     swap(first.clamp_xz, second.clamp_xz);
     swap(first.clamp_y, second.clamp_y);
+    swap(first.lmm_stepper_count, second.lmm_stepper_count);
+    swap(first.lmm_commit_count, second.lmm_commit_count);
 }
 
 template<typename T>
@@ -258,6 +270,10 @@ static inline bool g1_controller_state_is_valid_shape(
     const int trajectory = G1CommandTrajectorySampleCount;
     const int contacts = 2;
     return
+        g1_controller_state_array_has_shape(
+            state.lmm_features, 31) &&
+        g1_controller_state_array_has_shape(
+            state.lmm_latent, 32) &&
         g1_controller_state_array_has_shape(
             state.curr_bone_positions, bones) &&
         g1_controller_state_array_has_shape(
@@ -399,6 +415,13 @@ static inline bool g1_controller_state_reset(
 
     g1_controller_state candidate;
     candidate.frame_index = resolved_initial_frame;
+    candidate.lmm_features.resize(31);
+    candidate.lmm_features.zero();
+    if (db.features.rows == db.nframes() && db.features.cols == 31 &&
+        db.features.data != NULL)
+        candidate.lmm_features = db.features(resolved_initial_frame);
+    candidate.lmm_latent.resize(32);
+    candidate.lmm_latent.zero();
     candidate.curr_bone_positions = db.bone_positions(candidate.frame_index);
     candidate.curr_bone_velocities = db.bone_velocities(candidate.frame_index);
     candidate.curr_bone_rotations = db.bone_rotations(candidate.frame_index);

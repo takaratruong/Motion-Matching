@@ -884,7 +884,38 @@ void update_callback(void* args)
     ((std::function<void()>*)args)->operator()();
 }
 
-int main(void)
+static bool g1_parse_locomotion_engine(
+    g1_locomotion_engine& out,
+    const int argc,
+    char** argv,
+    char* error,
+    const int capacity)
+{
+    if (argc == 1)
+    {
+        out = G1LocomotionOrdinary;
+        return true;
+    }
+    if (argc == 3 && std::strcmp(argv[1], "--locomotion-engine") == 0)
+    {
+        if (std::strcmp(argv[2], "ordinary") == 0)
+        {
+            out = G1LocomotionOrdinary;
+            return true;
+        }
+        if (std::strcmp(argv[2], "lmm") == 0)
+        {
+            out = G1LocomotionLMM;
+            return true;
+        }
+    }
+    return scene_error(
+        error,
+        capacity,
+        "usage: controller [--locomotion-engine ordinary|lmm]");
+}
+
+int main(int argc, char** argv)
 {
     const int screen_width = 1280;
     const int screen_height = 720;
@@ -895,6 +926,18 @@ int main(void)
         terrain_directory = "./resources/g1_terrain";
     }
     char artifact_error[512] = {};
+    g1_locomotion_engine locomotion_engine = G1LocomotionOrdinary;
+    if (!g1_parse_locomotion_engine(
+            locomotion_engine,
+            argc,
+            argv,
+            artifact_error,
+            static_cast<int>(sizeof(artifact_error))))
+    {
+        fprintf(stderr, "G1 locomotion option error: %s\n", artifact_error);
+        return 2;
+    }
+    const bool lmm_enabled = locomotion_engine == G1LocomotionLMM;
 
     float feature_weight_foot_position = 0.75f;
     float feature_weight_foot_velocity = 1.0f;
@@ -979,6 +1022,33 @@ int main(void)
     {
         requested_terrain_weight = 1.0f;
         effective_terrain_weight = 1.0f;
+    }
+    g1_lmm_model_bundle lmm_model;
+    if (lmm_enabled)
+    {
+        if (!motion_manifest.flat_lmm_bundle ||
+            test_config.mode == G1_TestSequential)
+        {
+            fprintf(
+                stderr,
+                "G1 LMM startup error: lmm requires the flat v2 bundle and "
+                "matching-enabled runtime\n");
+            return 2;
+        }
+        const char* model_directory = getenv("G1_LMM_MODEL_DIR");
+        if (model_directory == NULL)
+            model_directory = "./sonic/runs/g1-lmm-flat-60hz/model";
+        if (!g1_lmm_model_load_and_verify(
+                lmm_model,
+                model_directory,
+                terrain_directory,
+                motion_manifest,
+                artifact_error,
+                static_cast<int>(sizeof(artifact_error))))
+        {
+            fprintf(stderr, "G1 LMM model error: %s\n", artifact_error);
+            return 2;
+        }
     }
 
     std::string database_path;
@@ -1235,6 +1305,8 @@ int main(void)
         current.route_index = configured_route_index;
         current.route_waypoint = configured_route_index >= 0 ? 1 : 0;
         current.route_frames = 0;
+        if (lmm_enabled)
+            current.lmm_latent = lmm_model.latent(current.frame_index);
     };
     configure_route_cursor(state);
 
@@ -1411,20 +1483,6 @@ int main(void)
     float ik_unlock_radius = 0.2f;
     float ik_blending_halflife = 0.1f;
     
-    // Learned Motion Matching
-    
-    static constexpr bool lmm_enabled = false;
-    
-    // These objects keep Holden's dormant learned path type-correct, but the
-    // incompatible LAFAN networks are deliberately not loaded for G1.
-    nnet decompressor, stepper, projector;
-    nnet_evaluation decompressor_evaluation, stepper_evaluation, projector_evaluation;
-
-    array1d<float> features_proj = db.features(state.frame_index);
-    array1d<float> features_curr = db.features(state.frame_index);
-    array1d<float> latent_proj(32); latent_proj.zero();
-    array1d<float> latent_curr(32); latent_curr.zero();
-    
     // Go
 
     const float dt = 1.0f / 60.0f;
@@ -1466,14 +1524,6 @@ int main(void)
     // MM_DISCRETE owns MM_LOG for its legacy text diagnostics.
     const char* deterministic_log_path = NULL;
 #endif
-    if (!controller_exit_requested &&
-        deterministic_log_path != NULL && lmm_enabled) {
-        fprintf(stderr,
-            "G1 runtime log error: database-frame logging is unavailable "
-            "with learned motion matching\n");
-        controller_exit_code = 2;
-        controller_exit_requested = true;
-    }
     if (!controller_exit_requested && !deterministic_log.open(
             deterministic_log_path,
             artifact_error, (int)sizeof(artifact_error))) {
@@ -1828,7 +1878,19 @@ int main(void)
             };
 
         g1_runtime_step_result runtime_result;
-        if (!g1_runtime_step(
+        const bool runtime_step_succeeded = lmm_enabled
+            ? g1_runtime_step_lmm(
+                runtime_result,
+                state,
+                db,
+                active_scene,
+                lmm_model,
+                runtime_request,
+                runtime_config,
+                visual_prediction_builder,
+                artifact_error,
+                static_cast<int>(sizeof(artifact_error)))
+            : g1_runtime_step(
                 runtime_result,
                 state,
                 db,
@@ -1838,7 +1900,8 @@ int main(void)
                 runtime_config,
                 visual_prediction_builder,
                 artifact_error,
-                static_cast<int>(sizeof(artifact_error)))) {
+                static_cast<int>(sizeof(artifact_error)));
+        if (!runtime_step_succeeded) {
             controlled_runtime_error(artifact_error);
             return;
         }
@@ -1862,103 +1925,6 @@ int main(void)
         const slice1d<float> query_normalized(
             31, runtime_result.query_normalized);
 
-        // Keep Holden's dormant learned matcher type-checked in the visual
-        // translation unit. G1 never enables or exposes this branch; the
-        // renderer-free runtime owns only the ordinary database matcher.
-        if (state.searched)
-        {
-            if (lmm_enabled)
-            {
-                // Project query onto nearest feature vector
-                
-                float best_cost = FLT_MAX;
-                bool transition = false;
-                
-                projector_evaluate(
-                    transition,
-                    best_cost,
-                    features_proj,
-                    latent_proj,
-                    projector_evaluation,
-                    query,
-                    db.features_offset,
-                    db.features_scale,
-                    features_curr,
-                    projector);
-                
-                // If projection is sufficiently different from current
-                if (transition)
-                {   
-                    // Evaluate pose for projected features
-                    decompressor_evaluate(
-                        state.trns_bone_positions,
-                        state.trns_bone_velocities,
-                        state.trns_bone_rotations,
-                        state.trns_bone_angular_velocities,
-                        state.trns_bone_contacts,
-                        decompressor_evaluation,
-                        features_proj,
-                        latent_proj,
-                        state.curr_bone_positions(0),
-                        state.curr_bone_rotations(0),
-                        decompressor,
-                        dt);
-                    
-                    // Transition inertializer to this pose
-                    inertialize_pose_transition(
-                        state.bone_offset_positions,
-                        state.bone_offset_velocities,
-                        state.bone_offset_rotations,
-                        state.bone_offset_angular_velocities,
-                        state.transition_src_position,
-                        state.transition_src_rotation,
-                        state.transition_dst_position,
-                        state.transition_dst_rotation,
-                        state.bone_positions(0),
-                        state.bone_velocities(0),
-                        state.bone_rotations(0),
-                        state.bone_angular_velocities(0),
-                        state.curr_bone_positions,
-                        state.curr_bone_velocities,
-                        state.curr_bone_rotations,
-                        state.curr_bone_angular_velocities,
-                        state.trns_bone_positions,
-                        state.trns_bone_velocities,
-                        state.trns_bone_rotations,
-                        state.trns_bone_angular_velocities);
-                    
-                    // Update current features and latents
-                    features_curr = features_proj;
-                    latent_curr = latent_proj;
-                }
-            }
-        }
-
-        if (lmm_enabled)
-        {
-            // Update features and latents
-            stepper_evaluate(
-                features_curr,
-                latent_curr,
-                stepper_evaluation,
-                stepper,
-                dt);
-            
-            // Decompress next pose
-            decompressor_evaluate(
-                state.curr_bone_positions,
-                state.curr_bone_velocities,
-                state.curr_bone_rotations,
-                state.curr_bone_angular_velocities,
-                state.curr_bone_contacts,
-                decompressor_evaluation,
-                features_curr,
-                latent_curr,
-                state.curr_bone_positions(0),
-                state.curr_bone_rotations(0),
-                decompressor,
-                dt);
-        }
 #ifdef MM_DISCRETE
         const int dbg_best_index = selected_database_frame;
         const bool dbg_did_search = state.searched;
@@ -1985,6 +1951,14 @@ int main(void)
             controlled_runtime_error(artifact_error);
             return;
         }
+        if (lmm_enabled)
+        {
+            snapshot_candidate.source_name = "lmm-recurrent";
+            snapshot_candidate.source_terrain = "flat";
+            snapshot_candidate.source_index = 0;
+            snapshot_candidate.continuation_cost =
+                runtime_result.lmm_projector_cost;
+        }
         char query_bits_hex[31 * 8 + 1] = {};
         char query_normalized_bits_hex[31 * 8 + 1] = {};
         if (!motion_match_query_bits_hex(
@@ -2001,15 +1975,16 @@ int main(void)
         log_row.frame = rendered_frames;
         log_row.fixed_dt = dt;
         log_row.scene_id = active_scene.metadata.id.c_str();
-        log_row.mode = test_config.name;
+        log_row.mode = lmm_enabled ? "lmm" : test_config.name;
         log_row.route = test_config.route;
         log_row.query_bits_hex = query_bits_hex;
         log_row.query_normalized_bits_hex = query_normalized_bits_hex;
         log_row.query_database_frame = query_database_frame;
         log_row.query_range = query_range;
         log_row.selected_database_frame = selected_database_frame;
-        log_row.database_frame = state.frame_index;
-        log_row.range = g1_active_range(db, state.frame_index);
+        log_row.database_frame = lmm_enabled ? -1 : state.frame_index;
+        log_row.range = lmm_enabled
+            ? -1 : g1_active_range(db, state.frame_index);
         log_row.source_range = g1_active_range(db, selected_database_frame);
         log_row.searched = state.searched;
         log_row.transitioned = state.transitioned;
@@ -2044,9 +2019,9 @@ int main(void)
         log_row.clamp_xz = state.clamp_xz;
         log_row.clamp_y = state.clamp_y;
         log_row.matching_enabled = matching_enabled;
-        log_row.adjustment_enabled = adjustment_enabled;
-        log_row.clamping_enabled = clamping_enabled;
-        log_row.support_retargeting_enabled = true;
+        log_row.adjustment_enabled = !lmm_enabled && adjustment_enabled;
+        log_row.clamping_enabled = !lmm_enabled && clamping_enabled;
+        log_row.support_retargeting_enabled = !lmm_enabled;
         log_row.ik_enabled = ik_enabled;
         log_row.source_name = snapshot_candidate.source_name;
         log_row.source_terrain = snapshot_candidate.source_terrain;
@@ -2394,7 +2369,9 @@ int main(void)
         
         // Draw matched features
         
-        array1d<float> current_features = lmm_enabled ? slice1d<float>(features_curr) : db.features(state.frame_index);
+        array1d<float> current_features = lmm_enabled
+            ? slice1d<float>(state.lmm_features)
+            : db.features(state.frame_index);
         denormalize_features(current_features, db.features_offset, db.features_scale);        
         draw_features(current_features, state.bone_positions(0), state.bone_rotations(0), MAROON);
         
@@ -2576,7 +2553,13 @@ int main(void)
 
         GuiLabel(
             Rectangle{ 990, ui_lmm_hei + 10, 250, 20 },
-            "disabled: G1 network integration later");
+            lmm_enabled
+                ? TextFormat(
+                    "lmm step=%llu commit=%llu cost=%.4g",
+                    state.lmm_stepper_count,
+                    state.lmm_commit_count,
+                    state.selected_cost)
+                : "engine: ordinary");
         
         //---------
         

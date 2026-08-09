@@ -1,6 +1,7 @@
 #pragma once
 
 #include "g1_runtime_diagnostics.h"
+#include "lmm.h"
 #include "motion_match_log.h"
 #include "sonic/cpp/g1_turn_model.h"
 
@@ -14,6 +15,18 @@ enum g1_runtime_command_mode
     G1RuntimeRoute,
     G1RuntimeDirect
 };
+
+enum g1_locomotion_engine
+{
+    G1LocomotionOrdinary,
+    G1LocomotionLMM
+};
+
+static inline const char* g1_locomotion_engine_name(
+    const g1_locomotion_engine engine)
+{
+    return engine == G1LocomotionLMM ? "lmm" : "ordinary";
+}
 
 struct g1_runtime_step_request
 {
@@ -56,6 +69,7 @@ struct g1_runtime_joint_preview_validator
 
 struct g1_runtime_step_result
 {
+    g1_locomotion_engine engine = G1LocomotionOrdinary;
     int query_database_frame = -1;
     int selected_database_frame = -1;
     int query_range = -1;
@@ -67,6 +81,14 @@ struct g1_runtime_step_result
     motion_match_pose_diagnostic inertialized;
     motion_match_pose_diagnostic projected;
     g1_runtime_candidate_preview_diagnostic candidate_preview;
+    float lmm_projector_cost = 0.0f;
+    motion_match_pose_diagnostic lmm_provisional;
+    vec3 lmm_provisional_root_position;
+    quat lmm_provisional_root_rotation;
+    vec3 lmm_final_root_position;
+    quat lmm_final_root_rotation;
+    unsigned long long lmm_stepper_count = 0;
+    unsigned long long lmm_commit_count = 0;
 };
 
 struct g1_runtime_frame_feasibility
@@ -1887,6 +1909,610 @@ static inline bool g1_runtime_step(
         config,
         error,
         capacity);
+}
+
+static inline bool g1_lmm_pose_is_finite(
+    const slice1d<vec3> positions,
+    const slice1d<vec3> velocities,
+    const slice1d<quat> rotations,
+    const slice1d<vec3> angular_velocities,
+    const slice1d<bool> contacts)
+{
+    if (positions.size != G1_BoneCount ||
+        velocities.size != G1_BoneCount ||
+        rotations.size != G1_BoneCount ||
+        angular_velocities.size != G1_BoneCount || contacts.size != 2)
+        return false;
+    for (int bone = 0; bone < G1_BoneCount; ++bone)
+    {
+        const vec3 position = positions(bone);
+        const vec3 velocity = velocities(bone);
+        const vec3 angular_velocity = angular_velocities(bone);
+        if (!g1_command_vec3_is_finite(position) ||
+            !g1_command_vec3_is_finite(velocity) ||
+            !g1_command_vec3_is_finite(angular_velocity) ||
+            !ik_quat_is_unit(rotations(bone)))
+            return false;
+    }
+    return true;
+}
+
+static inline float g1_lmm_rotation_delta(const quat first, const quat second)
+{
+    if (terrain_float_bits(first.w) == terrain_float_bits(second.w) &&
+        terrain_float_bits(first.x) == terrain_float_bits(second.x) &&
+        terrain_float_bits(first.y) == terrain_float_bits(second.y) &&
+        terrain_float_bits(first.z) == terrain_float_bits(second.z))
+        return 0.0f;
+    return quat_angle_between(first, second);
+}
+
+static inline bool g1_lmm_sample_candidate_terrain(
+    float normalized[4],
+    terrain_centerline_snapshot& snapshot,
+    const vec3 root,
+    const g1_controller_state& state,
+    const database& db,
+    const scene_pack& scene,
+    char* error,
+    const int capacity)
+{
+    if (!terrain_centerline_inputs_are_valid(
+            root,
+            state.trajectory_positions,
+            state.trajectory_rotations))
+        return scene_error(
+            error, capacity, "LMM candidate terrain inputs are invalid");
+    snapshot = terrain_centerline_snapshot{};
+    terrain_centerline_snapshot_compute_v2(
+        snapshot,
+        scene.terrain,
+        root,
+        state.trajectory_positions,
+        state.trajectory_rotations);
+    if (!terrain_centerline_snapshot_apply_walkability_v2(
+            snapshot,
+            scene.terrain,
+            scene.walkability,
+            root,
+            root,
+            0.20f))
+        return scene_error(
+            error, capacity, "LMM candidate terrain is not queryable");
+    for (int index = 0; index < 4; ++index)
+    {
+        const int feature = 27 + index;
+        if (!terrain_float_is_finite(snapshot.values[index]) ||
+            !terrain_float_is_finite(db.features_offset(feature)) ||
+            !terrain_float_is_finite(db.features_scale(feature)) ||
+            db.features_scale(feature) <= 0.0f)
+            return scene_error(
+                error, capacity, "LMM candidate terrain feature is invalid");
+        normalized[index] = normalize_query_feature(
+            snapshot.values[index],
+            db.features_offset(feature),
+            db.features_scale(feature));
+        if (!terrain_float_is_finite(normalized[index]))
+            return scene_error(
+                error, capacity, "LMM normalized terrain is non-finite");
+    }
+    return true;
+}
+
+static inline bool g1_runtime_step_lmm_normalized(
+    g1_runtime_step_result& out,
+    g1_controller_state& state,
+    const database& db,
+    const scene_pack& active_scene,
+    g1_lmm_model_bundle& model,
+    const slice1d<float> query_normalized,
+    char* error,
+    const int capacity)
+{
+    if (!model.authenticated || model.evaluation_allocation_count != 3 ||
+        !g1_controller_state_is_valid_shape(state) ||
+        query_normalized.size != G1_LMM_FeatureCount ||
+        model.latent.rows != db.nframes() ||
+        model.latent.cols != G1_LMM_LatentCount ||
+        db.nfeatures() != G1_LMM_FeatureCount ||
+        db.nbones() != G1_BoneCount || db.ncontacts() != 2 ||
+        db.bone_parents.size != G1_BoneCount ||
+        active_scene.terrain.version != 2 ||
+        !terrain_heightfield_is_queryable(active_scene.terrain) ||
+        !walkability_grid_matches_heightfield(
+            active_scene.walkability, active_scene.terrain))
+        return scene_error(
+            error, capacity, "LMM runtime artifacts or state are invalid");
+    for (int index = 0; index < G1_LMM_FeatureCount; ++index)
+        if (!terrain_float_is_finite(query_normalized(index)))
+            return scene_error(
+                error, capacity, "LMM normalized query is non-finite");
+    if (state.lmm_stepper_count == ULLONG_MAX ||
+        state.lmm_commit_count == ULLONG_MAX)
+        return scene_error(error, capacity, "LMM ownership counter overflow");
+
+    // All recurrent and pose writes target this clone. The live state and
+    // caller-owned diagnostics are published only after every gate passes.
+    g1_controller_state next;
+    if (!g1_controller_state_clone(next, state, error, capacity)) return false;
+    g1_runtime_step_result result;
+    result.engine = G1LocomotionLMM;
+    result.query_database_frame = -1;
+    result.selected_database_frame = -1;
+    result.query_range = -1;
+    for (int index = 0; index < G1_LMM_FeatureCount; ++index)
+    {
+        result.query_normalized[index] = query_normalized(index);
+        result.query[index] =
+            query_normalized(index) * db.features_scale(index) +
+            db.features_offset(index);
+    }
+
+    array1d<float> selected_features(G1_LMM_FeatureCount);
+    array1d<float> selected_latent(G1_LMM_LatentCount);
+    bool transition = false;
+    float projector_cost = FLT_MAX;
+    if (!projector_evaluate_normalized(
+            transition,
+            projector_cost,
+            selected_features,
+            selected_latent,
+            model.projector_evaluation,
+            query_normalized,
+            state.lmm_features,
+            state.lmm_latent,
+            model.projector,
+            error,
+            capacity))
+        return false;
+
+    // Terrain is exogenous. Projector output may never invent these values.
+    for (int terrain = 0; terrain < 4; ++terrain)
+        selected_features(27 + terrain) = query_normalized(27 + terrain);
+
+    stepper_evaluate(
+        selected_features,
+        selected_latent,
+        model.stepper_evaluation,
+        model.stepper,
+        1.0f / 60.0f);
+    for (int index = 0; index < G1_LMM_FeatureCount; ++index)
+        if (!terrain_float_is_finite(selected_features(index)))
+            return scene_error(
+                error, capacity, "LMM stepper feature is non-finite");
+    for (int index = 0; index < G1_LMM_LatentCount; ++index)
+        if (!terrain_float_is_finite(selected_latent(index)))
+            return scene_error(
+                error, capacity, "LMM stepper latent is non-finite");
+
+    array1d<vec3> provisional_positions(G1_BoneCount);
+    array1d<vec3> provisional_velocities(G1_BoneCount);
+    array1d<quat> provisional_rotations(G1_BoneCount);
+    array1d<vec3> provisional_angular_velocities(G1_BoneCount);
+    array1d<bool> provisional_contacts(2);
+    decompressor_evaluate(
+        provisional_positions,
+        provisional_velocities,
+        provisional_rotations,
+        provisional_angular_velocities,
+        provisional_contacts,
+        model.decompressor_evaluation,
+        selected_features,
+        selected_latent,
+        state.bone_positions(G1_Simulation),
+        state.bone_rotations(G1_Simulation),
+        model.decompressor,
+        1.0f / 60.0f);
+    if (!g1_lmm_pose_is_finite(
+            provisional_positions,
+            provisional_velocities,
+            provisional_rotations,
+            provisional_angular_velocities,
+            provisional_contacts))
+        return scene_error(
+            error, capacity, "LMM provisional decode is invalid");
+
+    float candidate_terrain_normalized[4] = {};
+    terrain_centerline_snapshot candidate_terrain;
+    if (!g1_lmm_sample_candidate_terrain(
+            candidate_terrain_normalized,
+            candidate_terrain,
+            provisional_positions(G1_Simulation),
+            next,
+            db,
+            active_scene,
+            error,
+            capacity))
+        return false;
+    for (int terrain = 0; terrain < 4; ++terrain)
+        selected_features(27 + terrain) = candidate_terrain_normalized[terrain];
+
+    array1d<vec3> final_positions(G1_BoneCount);
+    array1d<vec3> final_velocities(G1_BoneCount);
+    array1d<quat> final_rotations(G1_BoneCount);
+    array1d<vec3> final_angular_velocities(G1_BoneCount);
+    array1d<bool> final_contacts(2);
+    decompressor_evaluate(
+        final_positions,
+        final_velocities,
+        final_rotations,
+        final_angular_velocities,
+        final_contacts,
+        model.decompressor_evaluation,
+        selected_features,
+        selected_latent,
+        state.bone_positions(G1_Simulation),
+        state.bone_rotations(G1_Simulation),
+        model.decompressor,
+        1.0f / 60.0f);
+    if (!g1_lmm_pose_is_finite(
+            final_positions,
+            final_velocities,
+            final_rotations,
+            final_angular_velocities,
+            final_contacts))
+        return scene_error(error, capacity, "LMM final decode is invalid");
+
+    float final_terrain_normalized[4] = {};
+    terrain_centerline_snapshot final_terrain;
+    if (!g1_lmm_sample_candidate_terrain(
+            final_terrain_normalized,
+            final_terrain,
+            final_positions(G1_Simulation),
+            next,
+            db,
+            active_scene,
+            error,
+            capacity))
+        return false;
+    const float fixed_point_root_delta = length(
+        final_positions(G1_Simulation) -
+        provisional_positions(G1_Simulation));
+    const float fixed_point_rotation_delta = g1_lmm_rotation_delta(
+        final_rotations(G1_Simulation),
+        provisional_rotations(G1_Simulation));
+    if (fixed_point_root_delta > 0.001f ||
+        fixed_point_rotation_delta > 0.001f)
+        return scene_error(
+            error, capacity,
+            "LMM terrain fixed-point root did not converge (%.9g m, %.9g rad)",
+            fixed_point_root_delta,
+            fixed_point_rotation_delta);
+    for (int terrain = 0; terrain < 4; ++terrain)
+        if (std::fabs(
+                final_terrain.values[terrain] -
+                candidate_terrain.values[terrain]) > 1.0e-4f)
+            return scene_error(
+                error, capacity,
+                "LMM terrain fixed-point sample did not converge");
+
+    const vec3 root_delta =
+        final_positions(G1_Simulation) - state.bone_positions(G1_Simulation);
+    if (length(root_delta) > 0.025f ||
+        g1_lmm_rotation_delta(
+            final_rotations(G1_Simulation),
+            state.bone_rotations(G1_Simulation)) > 0.145834f ||
+        length(final_velocities(G1_Simulation)) > 1.5f ||
+        length(final_angular_velocities(G1_Simulation)) > 8.75f)
+        return scene_error(
+            error, capacity, "LMM root mechanical gate failed");
+    for (int bone = 1; bone < G1_BoneCount; ++bone)
+        if (g1_lmm_rotation_delta(
+                final_rotations(bone),
+                state.bone_rotations(bone)) > 0.25f)
+            return scene_error(
+                error, capacity,
+                "LMM joint step exceeds 0.25 rad/frame at bone %d", bone);
+
+    next.lmm_features = selected_features;
+    next.lmm_latent = selected_latent;
+    next.curr_bone_positions = final_positions;
+    next.curr_bone_velocities = final_velocities;
+    next.curr_bone_rotations = final_rotations;
+    next.curr_bone_angular_velocities = final_angular_velocities;
+    next.curr_bone_contacts = final_contacts;
+    next.trns_bone_positions = final_positions;
+    next.trns_bone_velocities = final_velocities;
+    next.trns_bone_rotations = final_rotations;
+    next.trns_bone_angular_velocities = final_angular_velocities;
+    next.trns_bone_contacts = final_contacts;
+    next.bone_positions = final_positions;
+    next.bone_velocities = final_velocities;
+    next.bone_rotations = final_rotations;
+    next.bone_angular_velocities = final_angular_velocities;
+    next.adjusted_bone_positions = final_positions;
+    next.adjusted_bone_rotations = final_rotations;
+    next.contact_states = final_contacts;
+    next.simulation_position = final_positions(G1_Simulation);
+    next.simulation_velocity = final_velocities(G1_Simulation);
+    next.simulation_rotation = final_rotations(G1_Simulation);
+    next.simulation_angular_velocity =
+        final_angular_velocities(G1_Simulation);
+    next.searched = false;
+    next.transitioned = transition;
+    next.incumbent_cost = projector_cost;
+    next.selected_cost = projector_cost;
+    next.selected_terrain_error = 0.0f;
+    next.adjustment_xz = 0.0f;
+    next.adjustment_y = 0.0f;
+    next.clamp_xz = 0.0f;
+    next.clamp_y = 0.0f;
+    forward_kinematics_full(
+        next.global_bone_positions,
+        next.global_bone_rotations,
+        next.bone_positions,
+        next.bone_rotations,
+        db.bone_parents);
+    next.global_bone_computed.set(true);
+
+    const motion_match_pose_diagnostic provisional_diagnostic =
+        g1_pose_diagnostic(
+            provisional_positions,
+            provisional_rotations,
+            db.bone_parents,
+            active_scene.terrain);
+    const motion_match_pose_diagnostic final_diagnostic =
+        g1_pose_diagnostic(
+            final_positions,
+            final_rotations,
+            db.bone_parents,
+            active_scene.terrain);
+    if (!g1_pose_diagnostic_is_finite(provisional_diagnostic) ||
+        !g1_pose_diagnostic_is_finite(final_diagnostic))
+        return scene_error(
+            error, capacity, "LMM pose diagnostic is non-finite");
+
+    ++next.lmm_stepper_count;
+    ++next.lmm_commit_count;
+    result.terrain = final_terrain;
+    result.raw_selected = final_diagnostic;
+    result.inertialized = final_diagnostic;
+    result.projected = final_diagnostic;
+    result.lmm_provisional = provisional_diagnostic;
+    result.lmm_provisional_root_position =
+        provisional_positions(G1_Simulation);
+    result.lmm_provisional_root_rotation =
+        provisional_rotations(G1_Simulation);
+    result.lmm_final_root_position = final_positions(G1_Simulation);
+    result.lmm_final_root_rotation = final_rotations(G1_Simulation);
+    result.lmm_projector_cost = projector_cost;
+    result.lmm_stepper_count = next.lmm_stepper_count;
+    result.lmm_commit_count = next.lmm_commit_count;
+    g1_controller_state_swap(state, next);
+    out = result;
+    return true;
+}
+
+template<typename PredictionBuilder>
+static inline bool g1_runtime_step_lmm(
+    g1_runtime_step_result& out,
+    g1_controller_state& state,
+    const database& db,
+    const scene_pack& active_scene,
+    g1_lmm_model_bundle& model,
+    const g1_runtime_step_request& request,
+    const g1_runtime_config& config,
+    PredictionBuilder prediction_builder,
+    char* error,
+    const int capacity)
+{
+    if (!g1_runtime_request_is_valid(request) || !request.matching_enabled)
+        return scene_error(
+            error, capacity,
+            "LMM runtime requires a finite matching-enabled command");
+    if (!g1_dt_is_exact_60_hz(config.dt) ||
+        !g1_runtime_config_is_valid(config))
+        return scene_error(
+            error, capacity, "LMM runtime requires exact binary32 60 Hz");
+    if (!model.authenticated || !g1_controller_state_is_valid_shape(state) ||
+        db.nfeatures() != G1_LMM_FeatureCount ||
+        db.nbones() != G1_BoneCount || db.ncontacts() != 2 ||
+        model.latent.rows != db.nframes())
+        return scene_error(
+            error, capacity, "LMM runtime artifacts are incompatible");
+
+    g1_controller_state next;
+    if (!g1_controller_state_clone(next, state, error, capacity)) return false;
+    const float dt = config.dt;
+    const vec3 commanded_velocity = request.requested_velocity_holden;
+    quat desired_rotation_curr;
+    if (!g1_turn_model_step(
+            desired_rotation_curr,
+            next.desired_rotation,
+            request.desired_heading_holden,
+            dt,
+            next.movement_model_profile,
+            g1_turn_model_fixed_config(),
+            error,
+            capacity))
+        return false;
+
+    traversability_diagnostics traversal = {};
+    const vec3 limited_velocity = traversability_limit_command(
+        next.traversal_speed_scale,
+        next.traversal_speed_scale_velocity,
+        traversal,
+        active_scene.walkability,
+        active_scene.terrain,
+        next.simulation_position,
+        commanded_velocity,
+        dt);
+    if (!g1_runtime_traversal_is_finite(traversal) ||
+        !g1_command_vec3_is_finite(limited_velocity))
+        return scene_error(
+            error, capacity, "LMM traversal command is invalid");
+
+    vec3 desired_velocity_curr;
+    if (!g1_movement_model_step(
+            desired_velocity_curr,
+            next.movement_velocity,
+            limited_velocity,
+            dt,
+            next.movement_model_profile,
+            g1_movement_model_fixed_config(),
+            error,
+            capacity))
+        return false;
+    next.movement_velocity = desired_velocity_curr;
+    traversability_stop_blocked_planar_dynamics(
+        traversal,
+        next.simulation_velocity,
+        next.simulation_acceleration);
+    if (traversal.blocked && traversal.applied_speed <= 1.0e-4f)
+    {
+        next.movement_velocity.x = 0.0f;
+        next.movement_velocity.z = 0.0f;
+        if (next.movement_model_profile != G1MovementRaw)
+        {
+            desired_velocity_curr.x = 0.0f;
+            desired_velocity_curr.z = 0.0f;
+        }
+    }
+    next.blocked = traversal.blocked;
+    next.walkability_class = traversal.walkability_class;
+    next.blocked_distance = traversal.distance;
+    next.blocked_point = traversal.point;
+
+    next.desired_velocity_change_prev = next.desired_velocity_change_curr;
+    next.desired_velocity_change_curr =
+        (desired_velocity_curr - next.desired_velocity) / dt;
+    next.desired_velocity = desired_velocity_curr;
+    g1_controller_state_seed_first_frame_desired_velocity(next);
+    next.desired_rotation_change_prev = next.desired_rotation_change_curr;
+    next.desired_rotation_change_curr = quat_to_scaled_angle_axis(quat_abs(
+        quat_mul_inv(desired_rotation_curr, next.desired_rotation))) / dt;
+    next.desired_rotation = desired_rotation_curr;
+
+    G1CommandIntent command_intent;
+    command_intent.requested_velocity = commanded_velocity;
+    command_intent.desired_heading = desired_rotation_curr;
+    G1CommandFramePrediction frame_seed = {};
+    frame_seed.command = next.command;
+    for (int index = 0; index < G1CommandTrajectorySampleCount; ++index)
+    {
+        frame_seed.command.predicted_desired_velocities[index] =
+            next.trajectory_desired_velocities(index);
+        frame_seed.command.predicted_root_positions[index] =
+            next.trajectory_positions(index);
+        frame_seed.command.predicted_root_rotations[index] =
+            next.trajectory_rotations(index);
+        frame_seed.command.predicted_desired_headings[index] =
+            next.trajectory_desired_rotations(index);
+        frame_seed.predicted_root_velocities[index] =
+            next.trajectory_velocities(index);
+        frame_seed.predicted_root_accelerations[index] =
+            next.trajectory_accelerations(index);
+        frame_seed.predicted_root_angular_velocities[index] =
+            next.trajectory_angular_velocities(index);
+    }
+    G1CommandFramePredictionRequest frame_request;
+    frame_request.route_mode = request.mode != G1RuntimeVisual;
+    frame_request.intent = command_intent;
+    frame_request.applied_velocity = desired_velocity_curr;
+    G1CommandFramePrediction frame_prediction;
+    if (!prediction_builder(
+            frame_prediction,
+            frame_seed,
+            frame_request,
+            next,
+            config,
+            error,
+            capacity))
+        return false;
+    next.command = frame_prediction.command;
+    for (int index = 0; index < G1CommandTrajectorySampleCount; ++index)
+    {
+        next.trajectory_desired_velocities(index) =
+            frame_prediction.command.predicted_desired_velocities[index];
+        next.trajectory_positions(index) =
+            frame_prediction.command.predicted_root_positions[index];
+        next.trajectory_rotations(index) =
+            frame_prediction.command.predicted_root_rotations[index];
+        next.trajectory_desired_rotations(index) =
+            frame_prediction.command.predicted_desired_headings[index];
+        next.trajectory_velocities(index) =
+            frame_prediction.predicted_root_velocities[index];
+        next.trajectory_accelerations(index) =
+            frame_prediction.predicted_root_accelerations[index];
+        next.trajectory_angular_velocities(index) =
+            frame_prediction.predicted_root_angular_velocities[index];
+    }
+
+    array1d<float> query(G1_LMM_FeatureCount);
+    int offset = 0;
+    for (int group = 0; group < 5; ++group)
+        query_copy_denormalized_feature(
+            query,
+            offset,
+            3,
+            next.lmm_features,
+            db.features_offset,
+            db.features_scale);
+    query_compute_trajectory_position_feature(
+        query,
+        offset,
+        next.bone_positions(G1_Simulation),
+        next.bone_rotations(G1_Simulation),
+        next.trajectory_positions);
+    query_compute_trajectory_direction_feature(
+        query,
+        offset,
+        next.bone_rotations(G1_Simulation),
+        next.trajectory_rotations);
+    terrain_centerline_snapshot current_terrain = {};
+    if (!terrain_centerline_inputs_are_valid(
+            next.bone_positions(G1_Simulation),
+            next.trajectory_positions,
+            next.trajectory_rotations))
+        return scene_error(
+            error, capacity, "LMM query terrain inputs are invalid");
+    terrain_centerline_snapshot_compute_v2(
+        current_terrain,
+        active_scene.terrain,
+        next.bone_positions(G1_Simulation),
+        next.trajectory_positions,
+        next.trajectory_rotations);
+    if (!terrain_centerline_snapshot_apply_walkability_v2(
+            current_terrain,
+            active_scene.terrain,
+            active_scene.walkability,
+            next.bone_positions(G1_Simulation),
+            next.simulation_position,
+            0.20f))
+        return scene_error(
+            error, capacity, "LMM query terrain is invalid");
+    for (int terrain = 0; terrain < 4; ++terrain)
+        query(offset++) = current_terrain.values[terrain];
+    if (offset != G1_LMM_FeatureCount ||
+        !motion_match_query_is_finite_31d(query))
+        return scene_error(
+            error, capacity, "LMM raw query must have 31 finite values");
+    array1d<float> query_normalized(G1_LMM_FeatureCount);
+    for (int index = 0; index < G1_LMM_FeatureCount; ++index)
+        query_normalized(index) = normalize_query_feature(
+            query(index),
+            db.features_offset(index),
+            db.features_scale(index));
+    if (!motion_match_query_is_finite_31d(query_normalized))
+        return scene_error(
+            error, capacity,
+            "LMM normalized query must have 31 finite values");
+
+    g1_runtime_step_result result;
+    if (!g1_runtime_step_lmm_normalized(
+            result,
+            next,
+            db,
+            active_scene,
+            model,
+            query_normalized,
+            error,
+            capacity))
+        return false;
+    result.traversal = traversal;
+    g1_controller_state_swap(state, next);
+    out = result;
+    return true;
 }
 
 static inline bool g1_runtime_step(

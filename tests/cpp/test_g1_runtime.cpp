@@ -276,6 +276,8 @@ static std::uint64_t state_array_hash(const g1_controller_state& state)
 {
     std::uint64_t hash = UINT64_C(1469598103934665603);
 #define HASH_ARRAY(name) hash = hash_array(hash, state.name)
+    HASH_ARRAY(lmm_features);
+    HASH_ARRAY(lmm_latent);
     HASH_ARRAY(curr_bone_positions);
     HASH_ARRAY(curr_bone_velocities);
     HASH_ARRAY(trns_bone_positions);
