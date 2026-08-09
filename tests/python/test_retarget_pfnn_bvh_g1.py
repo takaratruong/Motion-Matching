@@ -177,6 +177,26 @@ class PFNNBVHRetargetTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             PlaybackState(frame_count=0)
 
+    def test_derives_monotone_step_platforms_from_support_heights(self) -> None:
+        from mm_sonic.view_g1_retarget import derive_step_platforms
+
+        root = np.zeros((8, 3), dtype=np.float64)
+        root[:, 0] = np.arange(8) * 0.1
+        support = np.array([0.0, 0.0, 0.1, 0.1, 0.2, 0.2, 0.15, 0.15])
+        platforms = derive_step_platforms(root, support, group_frames=2)
+        self.assertEqual(len(platforms), 4)
+        np.testing.assert_allclose(
+            [platform.top_height for platform in platforms],
+            [0.0, 0.1, 0.2, 0.2],
+            atol=1.0e-12,
+        )
+        self.assertTrue(all(platform.half_length >= 0.25 for platform in platforms))
+        self.assertTrue(all(platform.half_width == 0.4 for platform in platforms))
+        np.testing.assert_allclose([platform.yaw for platform in platforms], 0.0)
+
+        with self.assertRaises(ValueError):
+            derive_step_platforms(root, support[:-1], group_frames=2)
+
     def test_selects_bounded_debug_slice(self) -> None:
         selected = frame_slice(total_frames=8171, start_frame=240, frame_count=120)
         self.assertEqual(selected, slice(240, 360))
