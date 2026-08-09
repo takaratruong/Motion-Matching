@@ -63,9 +63,10 @@ from .terrain_oracle.math3d import quaternion_multiply_wxyz
 from .terrain_oracle.reference_stitch import _G1FootfallAdapter
 from .terrain_oracle.stair_foothold_anchors import NominalFootSolePose
 from .terrain_oracle.stair_fragment_reconstruction import (
+    _replace_bracketed_swing_trajectories,
     _sole_yaw,
-    _stance_guidance_weights,
     _stance_spans,
+    _smooth_swing_route_adjustments,
 )
 from .terrain_oracle.stair_motion_collision_audit import (
     audit_stair_motion_collisions,
@@ -236,6 +237,63 @@ def _paired_flat_support_mesh(field: object) -> object:
     return flat
 
 
+def _terrain_clear_transplanted_swings(
+    nominal_targets: np.ndarray,
+    anchored_targets: np.ndarray,
+    stance: np.ndarray,
+    sphere_radii: Sequence[np.ndarray],
+    *,
+    target_mesh: object,
+    minimum_arc_clearance_m: float = 0.025,
+    surface_clearance_m: float = 0.006,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Transplant the learned flight arc between planned fixed footholds.
+
+    A free foot cannot keep its original flat-world target after its takeoff
+    and landing plants have moved onto rough terrain.  Conversely, replacing
+    the whole flight with a synthetic parabola destroys the learned gait.  We
+    retain the authored residual above the takeoff-to-landing interpolation,
+    carry the planned anchor offsets through the complete flight, and add only
+    the vertical clearance required by the exact target height field.
+    """
+
+    targets, bracketed = _replace_bracketed_swing_trajectories(
+        nominal_targets,
+        anchored_targets,
+        stance,
+        minimum_clearance_m=float(minimum_arc_clearance_m),
+        maximum_planar_deviation_m=0.12,
+    )
+    stance_mask = np.asarray(stance, dtype=bool)
+    required = np.zeros((len(targets), 2, 3), dtype=np.float64)
+    ray_z = float(np.max(target_mesh.vertices_world[:, 2]) + 1.0)
+    for frame in range(len(targets)):
+        for foot in range(2):
+            if stance_mask[frame, foot]:
+                continue
+            radii = np.asarray(sphere_radii[foot], dtype=np.float64)
+            lift = 0.0
+            for probe, point in enumerate(targets[frame, foot]):
+                height = _terrain_height(target_mesh, point[:2], ray_z)
+                if math.isfinite(height):
+                    lift = max(
+                        lift,
+                        float(height)
+                        + float(radii[probe])
+                        + float(surface_clearance_m)
+                        - float(point[2]),
+                    )
+            required[frame, foot, 2] = max(0.0, lift)
+    smoothed = _smooth_swing_route_adjustments(
+        required,
+        stance_mask,
+        decay_frames=4.0,
+    )
+    targets = np.asarray(targets, dtype=np.float64).copy()
+    targets += smoothed[:, :, None, :]
+    return targets, bracketed, smoothed
+
+
 def _final_upper_limb_accepted(metrics: dict[str, float]) -> bool:
     return bool(
         metrics["maximum_arm_excursion_rad"] <= MAXIMUM_ARM_EXCURSION_RAD
@@ -309,6 +367,11 @@ def _repair_forbidden_body_with_root_lift(
             candidate,
             current_extras,
             adapter=adapter,
+            # A pelvis lift should carry the authored swing with the body.
+            # Only planted soles remain fixed in world space; otherwise this
+            # repair quietly reintroduces the same kick/shuffle constraint as
+            # the initial all-foot refit.
+            stance_only=True,
         )
         candidate_collision = audit_stair_motion_collisions(
             candidate,
@@ -652,14 +715,19 @@ def _plan_and_apply_fixed_terrain_footholds(
         targets,
         assigned,
     )
-    guidance = _stance_guidance_weights(
-        stance,
-        blend_frames=12,
-        release_frames=8,
+    targets, bracketed_swing, swing_adjustment = (
+        _terrain_clear_transplanted_swings(
+            planned_nominal_targets,
+            blended,
+            stance,
+            adapter.sole_sphere_radii(),
+            target_mesh=target_mesh,
+        )
     )
-    targets = planned_nominal_targets + guidance[:, :, None, None] * (
-        blended - planned_nominal_targets
-    )
+    # Every transplanted target is continuous with the fixed takeoff and
+    # landing plants.  Unlike the old contact-only fade, the complete flight
+    # now receives the same coherent anchor change.
+    guidance = np.ones_like(stance, dtype=np.float64)
     updated = dict(extras)
     updated["target_sole_points_world"] = np.asarray(targets, dtype=np.float32)
     updated["target_sole_center_world"] = np.asarray(
@@ -671,6 +739,12 @@ def _plan_and_apply_fixed_terrain_footholds(
     )
     updated["planned_nominal_sole_points_world"] = np.asarray(
         planned_nominal_targets, dtype=np.float32
+    )
+    updated["bracketed_swing_mask"] = np.asarray(
+        bracketed_swing, dtype=np.bool_
+    )
+    updated["per_frame_swing_route_adjustment"] = np.asarray(
+        swing_adjustment, dtype=np.float32
     )
     updated["planned_foothold_surface_normal_world"] = np.asarray(
         surface_normal, dtype=np.float32
@@ -806,7 +880,14 @@ def _build_one(
             "reason": "planned by fixed-terrain pelvis-height corridor",
         }
         motion, extras, refit = _refit_motion_to_sole_targets(
-            motion, extras, adapter=adapter
+            motion,
+            extras,
+            adapter=adapter,
+            # The swing target is now the learned source arc transplanted
+            # between its planned takeoff and landing footholds, with an exact
+            # height-field clearance envelope.  It is therefore meaningful to
+            # fit both feet here; the obsolete flat-world swing target that
+            # caused the kick/shuffle artifact is no longer present.
         )
         row["sole_refit"] = refit
         if (
@@ -902,6 +983,14 @@ def _build_one(
             )
             row["post_swing_stance_mesh_clearance_repair"] = stance_repair
         if not collision.accepted:
+            debug_path = destination / "rejected_collision_debug.npz"
+            _save_motion(
+                debug_path,
+                motion,
+                mode="motionbricks_contact_rough_collision_debug",
+                extras=extras,
+            )
+            row["rejected_motion_debug"] = str(debug_path.resolve())
             raise ValueError("rough-terrain motion failed exact collision gate")
         motion, extras = _retime_motion_and_extras(
             motion, extras, temporal_scale=temporal_scale

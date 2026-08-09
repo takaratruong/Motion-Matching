@@ -2028,3 +2028,56 @@ the symmetric 50-degree approach pair, 70 stop/restarts, 70 reversals, 58
 bounces, and four other direct clips.  Traversal coverage is 69 ascents, 55
 descents, and 80 curb/slope round trips.  `selection.routes.png` plots all
 realized and intended routes, including the new side-on source bank.
+
+### Natural-kinematics reset and fixed-terrain source split (2026-08-09)
+
+The mechanically large exotic bank is not a perceptually clean training bank.
+Dense review rejected the synthetic extreme-left entry and several generated
+rough-terrain clips despite their aggregate metrics: they contained visible
+gliding, repeated kick/shuffle cadence, or insufficiently anchored contacts.
+The retained working set is therefore tracked separately in
+`artifacts/review/kinematic_hand_review_v1.json`; automatic collision and
+smoothness reports are screens only, never substitutes for dense visual
+review.  SONIC trackability is deliberately not a kinematic acceptance gate.
+
+The reliable construction is now split by terrain class.  Discrete risers use
+native registered GRAIL stair primitives (or genuine lateral gait refitted to
+explicit stair footholds); flat MotionBricks gait is not forced through a
+riser.  Continuous slopes and rough ground use a source-clean MotionBricks gait
+with one rigid full-sole foothold per detected plant, a sequence-consistent
+pelvis path, stance-only IK, swing clearance, and exact mesh re-audit.  This
+preserves a natural learned swing rather than synthesizing one from root
+warping.
+
+Two implementation defects found during this reset materially affected visible
+motion.  First, pairwise foothold continuity did not cover a short plant nested
+inside a longer opposite-foot plant: a later gap could depend on a non-adjacent
+foothold and create a one-frame pelvis jump.  The planner now falls back to an
+exact per-frame sparse constraint search for these schedules.  Second, the
+rough-terrain refit constrained an airborne foot to its obsolete flat-world
+target after the pelvis moved, overconstraining both legs and producing the
+characteristic kick/shuffle.  Simply leaving that swing unconstrained was also
+wrong: the flat-ground flight then clipped a rising surface and required an
+unnaturally large emergency lift.  The current construction instead carries
+the learned source flight residual between the selected takeoff and landing
+footholds, then adds a smooth exact-height-field clearance envelope before IK.
+A later pelvis-clearance repair keeps only planted soles fixed and carries the
+authored swing with the body.
+
+The earlier transformed rough and lateral clips, including
+`reviewed_lateral_snippet_v37_mogul_retime115`, have been removed from the
+accepted set after stricter visual review: their collision numbers were clean,
+but the repeated wide crab/kick cadence was not.  The confirmed high-angle
+anchor is untouched native GRAIL clip 473, a four-step ascent whose measured
+approach heading is 40.15 degrees from the stair axis.  Dense full-rate review
+shows a natural approach and alternating climb, and exact audit passes all 499
+frames with 4.242 mm maximum foot penetration and zero forbidden-body
+penetration.  It must not be described as the rejected synthetic 50-degree
+glide.  The first generated continuous-terrain clip admitted after the reset
+is `sourceclean_v46_forward_cambered_transplanted_arc`: its transplanted learned
+swing remains visually natural over cambered ripples, with 2.01 mm exact foot
+penetration, zero body penetration, 7.41 mm maximum stance hover, 6.28 mm
+stance drift, and 0.137 rad maximum final joint step.  This is a method canary,
+not HCT-scale coverage.  Discrete-obstacle, harder rough-terrain, and
+omnidirectional coverage remains open until those variants pass the same visual
+review.
