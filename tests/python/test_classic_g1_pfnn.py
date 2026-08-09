@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 import torch
@@ -16,7 +17,14 @@ from mm_sonic.train_classic_g1_pfnn import (
     classic_pfnn_loss,
     load_classic_checkpoint,
     save_classic_checkpoint,
+    train,
+    vertical_epoch_batches,
 )
+from mm_sonic.build_g1_pfnn_vertical_dataset import (
+    build_vertical_dataset,
+    save_vertical_dataset,
+)
+from tests.python.test_build_g1_pfnn_vertical_dataset import _source
 from mm_sonic.terrain_pfnn.layout import INPUT_LAYOUT, OUTPUT_LAYOUT
 from mm_sonic.terrain_pfnn.model import PhaseFunctionedNetwork
 from mm_sonic.terrain_pfnn.training import finite_runtime_seed
@@ -79,6 +87,20 @@ class ClassicG1PFNNTests(unittest.TestCase):
         self.assertTrue(np.all(source_kind[used] == "grail"))
         self.assertTrue(set(range(5)).issubset(set(used.tolist())))
         self.assertEqual(_parser().parse_args(["--dataset", "d", "--model-path", "m", "--output", "o"]).train_source, "grail")
+
+    def test_released_pfnn_batches_are_deterministic_and_cover_each_row_once(self) -> None:
+        first = vertical_epoch_batches(11, batch_size=4, seed=23, epoch=2)
+        second = vertical_epoch_batches(11, batch_size=4, seed=23, epoch=2)
+        self.assertEqual(len(first), 3)
+        for left, right in zip(first, second):
+            np.testing.assert_array_equal(left, right)
+        np.testing.assert_array_equal(np.sort(np.concatenate(first)), np.arange(11))
+        self.assertEqual(
+            _parser().parse_args(
+                ["--dataset", "d", "--model-path", "m", "--output", "o", "--train-source", "released-pfnn"]
+            ).train_source,
+            "released-pfnn",
+        )
 
     def test_native_g1_validation_holds_out_last_present_variant_per_family(self) -> None:
         clips = np.asarray(
@@ -154,6 +176,9 @@ class ClassicG1PFNNTests(unittest.TestCase):
                 epoch=3,
                 validation_loss=0.125,
                 seed=7,
+                source_kind="released_pfnn",
+                vertical_slice_receipt_sha256="c" * 64,
+                terrain_receipt_set_sha256="d" * 64,
             )
             loaded = load_classic_checkpoint(path)
 
@@ -162,6 +187,53 @@ class ClassicG1PFNNTests(unittest.TestCase):
         self.assertEqual(loaded.epoch, 3)
         self.assertEqual(loaded.dataset_digest, "a" * 64)
         self.assertEqual(loaded.validation_loss, 0.125)
+        self.assertEqual(loaded.source_kind, "released_pfnn")
+        self.assertEqual(loaded.vertical_slice_receipt_sha256, "c" * 64)
+        self.assertEqual(loaded.terrain_receipt_set_sha256, "d" * 64)
+
+    def test_trains_one_vertical_epoch_and_binds_dataset_receipts(self) -> None:
+        dataset = build_vertical_dataset(
+            (_source("train", "released_train"), _source("validation", "released_val"))
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = save_vertical_dataset(root / "dataset", dataset)
+            arguments = _parser().parse_args(
+                [
+                    "--dataset",
+                    str(manifest),
+                    "--model-path",
+                    str(root / "unused.xml"),
+                    "--output",
+                    str(root / "run"),
+                    "--device",
+                    "cpu",
+                    "--epochs",
+                    "1",
+                    "--batch-size",
+                    "8",
+                    "--evaluation-batch-size",
+                    "16",
+                    "--hidden-size",
+                    "16",
+                    "--train-source",
+                    "released-pfnn",
+                ]
+            )
+            fake_kinematics = mock.Mock(
+                joint_limits=torch.tensor([[-2.0, 2.0]] * 29, dtype=torch.float64),
+                kinematic_signature_sha256="9" * 64,
+            )
+            with mock.patch(
+                "mm_sonic.train_classic_g1_pfnn.TorchG1ForwardKinematics.from_mjcf",
+                return_value=fake_kinematics,
+            ):
+                checkpoint_path = train(arguments)
+            checkpoint = load_classic_checkpoint(checkpoint_path)
+        self.assertEqual(checkpoint.source_kind, "released_pfnn")
+        self.assertEqual(checkpoint.dataset_digest, dataset.dataset_sha256)
+        self.assertEqual(checkpoint.vertical_slice_receipt_sha256, dataset.selection_sha256)
+        self.assertEqual(checkpoint.terrain_receipt_set_sha256, dataset.terrain_receipt_set_sha256)
 
     def test_small_fixed_set_overfits_with_classic_objective(self) -> None:
         torch.manual_seed(19)

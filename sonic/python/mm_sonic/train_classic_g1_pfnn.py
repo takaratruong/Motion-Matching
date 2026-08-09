@@ -20,6 +20,10 @@ from .terrain_pfnn.dataset import (
     normalize_pfnn_input,
     normalize_pfnn_output,
 )
+from .build_g1_pfnn_vertical_dataset import (
+    VerticalDataset,
+    load_vertical_dataset,
+)
 from .terrain_pfnn.features import PFNNTrainingWindow, mirror_window
 from .terrain_pfnn.kinematics import TorchG1ForwardKinematics
 from .terrain_pfnn.layout import INPUT_LAYOUT, OUTPUT_LAYOUT
@@ -27,7 +31,7 @@ from .terrain_pfnn.model import PhaseFunctionedNetwork
 from .terrain_pfnn.training import choose_runtime_seed, training_phase_advance_q99
 
 
-CLASSIC_CHECKPOINT_SCHEMA = "classic-g1-pfnn/v1"
+CLASSIC_CHECKPOINT_SCHEMA = "classic-g1-pfnn/v2"
 _SHA256_CHARS = frozenset("0123456789abcdef")
 
 
@@ -109,6 +113,26 @@ def balanced_epoch_batches(
     return tuple(batches)
 
 
+def vertical_epoch_batches(
+    count: int, *, batch_size: int, seed: int, epoch: int
+) -> tuple[np.ndarray, ...]:
+    """Shuffle every released-PFNN row exactly once per deterministic epoch."""
+
+    if (
+        type(count) is not int
+        or count < 1
+        or type(batch_size) is not int
+        or batch_size < 1
+        or type(seed) is not int
+        or type(epoch) is not int
+        or epoch < 0
+    ):
+        raise ValueError("released PFNN sampler arguments are invalid")
+    rng = np.random.default_rng(np.random.SeedSequence((seed, epoch)))
+    indices = rng.permutation(count).astype(np.int64, copy=False)
+    return tuple(indices[start : start + batch_size] for start in range(0, count, batch_size))
+
+
 def _plain_cpu(value: object) -> object:
     if isinstance(value, torch.Tensor):
         return value.detach().to(device="cpu").contiguous().clone()
@@ -149,6 +173,9 @@ class ClassicG1PFNNCheckpoint:
     epoch: int
     validation_loss: float
     seed: int
+    source_kind: str
+    vertical_slice_receipt_sha256: str
+    terrain_receipt_set_sha256: str
 
     def build_model(self) -> PhaseFunctionedNetwork:
         model = PhaseFunctionedNetwork(
@@ -172,6 +199,9 @@ def save_classic_checkpoint(
     epoch: int,
     validation_loss: float,
     seed: int,
+    source_kind: str,
+    vertical_slice_receipt_sha256: str,
+    terrain_receipt_set_sha256: str,
 ) -> None:
     if not isinstance(model, PhaseFunctionedNetwork):
         raise TypeError("classic PFNN checkpoint model is invalid")
@@ -185,6 +215,13 @@ def save_classic_checkpoint(
         or type(epoch) is not int
         or epoch < 0
         or type(seed) is not int
+        or source_kind not in ("grail", "mixed", "released_pfnn")
+        or type(vertical_slice_receipt_sha256) is not str
+        or len(vertical_slice_receipt_sha256) != 64
+        or not set(vertical_slice_receipt_sha256) <= _SHA256_CHARS
+        or type(terrain_receipt_set_sha256) is not str
+        or len(terrain_receipt_set_sha256) != 64
+        or not set(terrain_receipt_set_sha256) <= _SHA256_CHARS
     ):
         raise ValueError("classic PFNN checkpoint provenance is invalid")
     score = float(validation_loss)
@@ -198,7 +235,11 @@ def save_classic_checkpoint(
         "y_std": OUTPUT_LAYOUT.size,
     }
     normal = {
-        name: torch.as_tensor(normalization[name], dtype=torch.float32, device="cpu").contiguous().clone()
+        name: torch.tensor(
+            np.array(normalization[name], dtype=np.float32, copy=True),
+            dtype=torch.float32,
+            device="cpu",
+        ).contiguous()
         for name in expected_normal
     }
     if any(normal[name].shape != (width,) for name, width in expected_normal.items()):
@@ -226,6 +267,9 @@ def save_classic_checkpoint(
         "epoch": epoch,
         "validation_loss": score,
         "seed": seed,
+        "source_kind": source_kind,
+        "vertical_slice_receipt_sha256": vertical_slice_receipt_sha256,
+        "terrain_receipt_set_sha256": terrain_receipt_set_sha256,
     }
     plain = _plain_cpu(payload)
     if not isinstance(plain, dict) or not _finite_tree(plain):
@@ -253,6 +297,8 @@ def load_classic_checkpoint(path: str | Path) -> ClassicG1PFNNCheckpoint:
         "schema", "model_config", "model_state", "normalization", "runtime_seed",
         "dataset_digest", "kinematic_signature_sha256", "joint_limits",
         "phase_advance_q99", "epoch", "validation_loss", "seed",
+        "source_kind", "vertical_slice_receipt_sha256",
+        "terrain_receipt_set_sha256",
     }
     if type(payload) is not dict or set(payload) != required or payload["schema"] != CLASSIC_CHECKPOINT_SCHEMA:
         raise ValueError("classic PFNN checkpoint schema is invalid")
@@ -266,6 +312,16 @@ def load_classic_checkpoint(path: str | Path) -> ClassicG1PFNNCheckpoint:
         or not 0.0 <= config["dropout_probability"] < 1.0
     ):
         raise ValueError("classic PFNN model config is invalid")
+    if (
+        payload["source_kind"] not in ("grail", "mixed", "released_pfnn")
+        or type(payload["vertical_slice_receipt_sha256"]) is not str
+        or len(payload["vertical_slice_receipt_sha256"]) != 64
+        or not set(payload["vertical_slice_receipt_sha256"]) <= _SHA256_CHARS
+        or type(payload["terrain_receipt_set_sha256"]) is not str
+        or len(payload["terrain_receipt_set_sha256"]) != 64
+        or not set(payload["terrain_receipt_set_sha256"]) <= _SHA256_CHARS
+    ):
+        raise ValueError("classic PFNN source provenance is invalid")
     checkpoint = ClassicG1PFNNCheckpoint(
         model_state=payload["model_state"],
         hidden_size=config["hidden_size"],
@@ -279,6 +335,11 @@ def load_classic_checkpoint(path: str | Path) -> ClassicG1PFNNCheckpoint:
         epoch=payload["epoch"],
         validation_loss=float(payload["validation_loss"]),
         seed=payload["seed"],
+        source_kind=payload["source_kind"],
+        vertical_slice_receipt_sha256=payload[
+            "vertical_slice_receipt_sha256"
+        ],
+        terrain_receipt_set_sha256=payload["terrain_receipt_set_sha256"],
     )
     if not _finite_tree(payload):
         raise ValueError("classic PFNN checkpoint contains nonfinite values")
@@ -320,6 +381,57 @@ class _IndexedTrainDataset:
 
     def __getitem__(self, index: int) -> dict[str, object]:
         return self._dataset[int(self._indices[index])]
+
+
+class _VerticalTrainingView:
+    """Normalized row view over one compact released-PFNN split."""
+
+    def __init__(self, dataset: VerticalDataset, split: str) -> None:
+        if split not in ("train", "validation"):
+            raise ValueError("vertical training split is invalid")
+        self.split = split
+        self._dataset = dataset
+        self._arrays = dataset.splits[split]
+        self.x_mean = dataset.x_mean
+        self.x_std = dataset.x_std
+        self.y_mean = dataset.y_mean
+        self.y_std = dataset.y_std
+
+    def __len__(self) -> int:
+        return len(self._arrays.phase)
+
+    def __getitem__(self, index: int) -> dict[str, object]:
+        row = int(index)
+        clip = str(self._arrays.clip_id[row])
+        return {
+            "x": normalize_pfnn_input(
+                self._arrays.x[row], self.x_mean, self.x_std
+            ),
+            "y": normalize_pfnn_output(
+                self._arrays.y[row], self.y_mean, self.y_std
+            ),
+            "phase": float(self._arrays.phase[row]),
+            "clip_id": clip,
+            "center_frame": int(self._arrays.center_frame_120hz[row]) // 4,
+            "split_identity": clip.removesuffix("__mirror"),
+            "split": self.split,
+            "sequence_lane": str(self._arrays.sequence_lane[row]),
+            "terrain_class": str(self._arrays.terrain_class[row]),
+        }
+
+
+def _materialize_vertical(
+    view: _VerticalTrainingView,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    x = np.empty((len(view), INPUT_LAYOUT.size), dtype=np.float32)
+    y = np.empty((len(view), OUTPUT_LAYOUT.size), dtype=np.float32)
+    phase = np.empty(len(view), dtype=np.float32)
+    for index in range(len(view)):
+        row = view[index]
+        x[index] = row["x"]
+        y[index] = row["y"]
+        phase[index] = row["phase"]
+    return x, y, phase
 
 
 def _grail_train_validation_masks(
@@ -429,12 +541,27 @@ def train(arguments: argparse.Namespace) -> Path:
     torch.manual_seed(arguments.seed)
     np.random.seed(arguments.seed)
     device = torch.device(arguments.device)
-    root = Path(arguments.dataset).expanduser().resolve().parent
-    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
-    train_dataset = PFNNShardDataset(root, "train")
-    train_x, train_y, train_phase, train_source, train_clip = _materialize(
-        train_dataset
-    )
+    dataset_path = Path(arguments.dataset).expanduser().resolve()
+    root = dataset_path if dataset_path.is_dir() else dataset_path.parent
+    vertical_dataset: VerticalDataset | None = None
+    if arguments.train_source == "released-pfnn":
+        vertical_dataset = load_vertical_dataset(root)
+        train_dataset = _VerticalTrainingView(vertical_dataset, "train")
+        validation_dataset = _VerticalTrainingView(vertical_dataset, "validation")
+        train_x, train_y, train_phase = _materialize_vertical(train_dataset)
+        val_x, val_y, val_phase = _materialize_vertical(validation_dataset)
+        train_source = np.full(len(train_x), "released_pfnn", dtype="<U13")
+        train_clip = np.asarray(
+            vertical_dataset.splits["train"].clip_id, dtype="<U128"
+        )
+        manifest = {"dataset_digest_sha256": vertical_dataset.dataset_sha256}
+        seed_dataset = train_dataset
+    else:
+        manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+        train_dataset = PFNNShardDataset(root, "train")
+        train_x, train_y, train_phase, train_source, train_clip = _materialize(
+            train_dataset
+        )
     if arguments.train_source == "grail":
         optimized, held_out = _grail_train_validation_masks(
             train_source, train_clip
@@ -450,7 +577,7 @@ def train(arguments: argparse.Namespace) -> Path:
         train_y = train_y[optimized]
         train_phase = train_phase[optimized]
         train_source = train_source[optimized]
-    else:
+    elif arguments.train_source == "mixed":
         validation_dataset = PFNNShardDataset(root, "validation")
         val_x, val_y, val_phase, _, _ = _materialize(validation_dataset)
         seed_dataset = train_dataset
@@ -493,13 +620,23 @@ def train(arguments: argparse.Namespace) -> Path:
             model.train()
             train_total = 0.0
             train_count = 0
-            for indices in balanced_epoch_batches(
-                train_source,
-                batch_size=arguments.batch_size,
-                seed=arguments.seed,
-                epoch=epoch,
-                source_filter=arguments.train_source,
-            ):
+            batches = (
+                vertical_epoch_batches(
+                    len(train_x),
+                    batch_size=arguments.batch_size,
+                    seed=arguments.seed,
+                    epoch=epoch,
+                )
+                if arguments.train_source == "released-pfnn"
+                else balanced_epoch_batches(
+                    train_source,
+                    batch_size=arguments.batch_size,
+                    seed=arguments.seed,
+                    epoch=epoch,
+                    source_filter=arguments.train_source,
+                )
+            )
+            for indices in batches:
                 x = torch.as_tensor(train_x[indices], device=device)
                 y = torch.as_tensor(train_y[indices], device=device)
                 phase = torch.as_tensor(train_phase[indices], device=device)
@@ -539,6 +676,17 @@ def train(arguments: argparse.Namespace) -> Path:
                     epoch=epoch + 1,
                     validation_loss=validation_loss,
                     seed=arguments.seed,
+                    source_kind=arguments.train_source.replace("-", "_"),
+                    vertical_slice_receipt_sha256=(
+                        vertical_dataset.selection_sha256
+                        if vertical_dataset is not None
+                        else "0" * 64
+                    ),
+                    terrain_receipt_set_sha256=(
+                        vertical_dataset.terrain_receipt_set_sha256
+                        if vertical_dataset is not None
+                        else "0" * 64
+                    ),
                 )
     return best
 
@@ -555,7 +703,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float, default=1.0e-4)
     parser.add_argument("--hidden-size", type=int, default=512)
     parser.add_argument("--seed", type=int, default=23456)
-    parser.add_argument("--train-source", choices=("grail", "mixed"), default="grail")
+    parser.add_argument(
+        "--train-source",
+        choices=("grail", "mixed", "released-pfnn"),
+        default="grail",
+    )
     return parser
 
 
