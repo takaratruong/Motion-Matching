@@ -33,6 +33,7 @@ from resources.g1_terrain_builder.database import (
 from resources.g1_terrain_builder.kinematics import (
     G1Kinematics,
     convert_source_clip,
+    load_mujoco_xml_assets,
     split_continuity_ranges,
 )
 from resources.g1_terrain_builder.features import (
@@ -89,6 +90,11 @@ CANONICAL_FLAT_SOURCE_SHA256 = (
 CANONICAL_FLAT_PREPARED_SHA256 = (
     "d6dbbac84e68d419d27aff0356b5a8245522f39694d94a6fc83e300ab6feaf8d")
 CANONICAL_FLAT_GROUNDING_OFFSET_M = 0.06142798715901732
+CANONICAL_FLAT_KINEMATICS_MODEL = {
+    "asset": "g1_29dof.xml",
+    "sha256": "749209c06a5c0023deb27f728420028b62b1f3092a22e24920183c1a897e4376",
+    "size_bytes": 26914,
+}
 
 
 def _odd_frame_count(seconds: float, fps: float) -> int:
@@ -139,6 +145,22 @@ def finalize_clip(
 def _require_file(path: str, description: str) -> None:
     if not os.path.isfile(path):
         raise FileNotFoundError(f"missing {description}: {path}")
+
+
+def _read_canonical_flat_g1_xml(path: str) -> bytes:
+    try:
+        with open(path, "rb") as stream:
+            payload = stream.read(
+                CANONICAL_FLAT_KINEMATICS_MODEL["size_bytes"] + 1)
+    except (OSError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"canonical G1 XML authentication failed: {error}") from error
+    if len(payload) != CANONICAL_FLAT_KINEMATICS_MODEL["size_bytes"] \
+            or hashlib.sha256(payload).hexdigest() \
+            != CANONICAL_FLAT_KINEMATICS_MODEL["sha256"]:
+        raise ValueError(
+            "canonical G1 XML content SHA-256/size changed")
+    return payload
 
 
 def _require_loaded_grail_source(source, base):
@@ -373,7 +395,9 @@ def _assemble_flat_candidate(args):
     _require_file(args.retarget_receipt, "released-PFNN G1 retarget receipt")
     source = load_retarget_npz(args.retarget_npz, args.retarget_receipt)
     _require_canonical_flat_retarget(source)
-    kinematics = G1Kinematics(args.g1_xml)
+    xml_bytes = _read_canonical_flat_g1_xml(args.g1_xml)
+    kinematics = G1Kinematics.from_xml_bytes(
+        xml_bytes, load_mujoco_xml_assets(args.g1_xml))
     preliminary, skeleton, _ = convert_source_clip(
         source, kinematics, target_fps=60.0, root_filter_mode="nearest")
     if len(preliminary.positions) != 256:
@@ -482,6 +506,7 @@ def _assemble_flat_candidate(args):
         raise ValueError("flat source has no authenticated provenance")
     manifest_base = {
         "schema": "g1-lmm-flat-data/v3",
+        "kinematics_model": dict(CANONICAL_FLAT_KINEMATICS_MODEL),
         "output_fps": 60.0,
         "trajectory_horizons": list(horizons),
         "feature_dimensions": 31,

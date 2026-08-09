@@ -1,4 +1,5 @@
 import sys
+from pathlib import Path
 
 import mujoco
 import numpy as np
@@ -54,7 +55,29 @@ def split_continuity_ranges(
 
 class G1Kinematics:
     def __init__(self, xml_path: str):
-        self.model = mujoco.MjModel.from_xml_path(xml_path)
+        self._initialize(mujoco.MjModel.from_xml_path(xml_path))
+
+    @classmethod
+    def from_xml_bytes(
+        cls, xml_bytes: bytes, assets: dict[str, bytes],
+    ) -> "G1Kinematics":
+        if type(xml_bytes) is not bytes:
+            raise TypeError("xml_bytes must be exact bytes")
+        if type(assets) is not dict \
+                or any(type(name) is not str or type(payload) is not bytes
+                       for name, payload in assets.items()):
+            raise TypeError("assets must map strings to exact bytes")
+        try:
+            xml_text = xml_bytes.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("G1 XML is not valid UTF-8") from error
+        instance = cls.__new__(cls)
+        instance._initialize(
+            mujoco.MjModel.from_xml_string(xml_text, assets=assets))
+        return instance
+
+    def _initialize(self, model) -> None:
+        self.model = model
         self.data = mujoco.MjData(self.model)
         self.body_ids = np.arange(1, self.model.nbody)
         id_to_index = {int(body): i for i, body in enumerate(self.body_ids)}
@@ -126,6 +149,20 @@ class G1Kinematics:
         self, lp: np.ndarray, lq: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
         return forward_local_hierarchy(lp, lq, self.parents)
+
+
+def load_mujoco_xml_assets(xml_path: str) -> dict[str, bytes]:
+    mesh_directory = Path(xml_path).parent / "meshes"
+    try:
+        paths = sorted(
+            path for path in mesh_directory.iterdir() if path.is_file())
+        return {
+            f"meshes/{path.name}": path.read_bytes()
+            for path in paths
+        }
+    except OSError as error:
+        raise ValueError(
+            f"cannot load G1 XML mesh assets from {mesh_directory}") from error
 
 
 def forward_local_hierarchy(

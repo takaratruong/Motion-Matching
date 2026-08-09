@@ -75,7 +75,12 @@ _FLAT_SOURCE_KEYS = {
 _FLAT_VALIDATION_KEYS = {
     "fk_max_error_m", "duration_error_s", "quaternion_norm_max_error",
 }
-_FLAT_SCHEMAS = {"g1-lmm-flat-data/v2", "g1-lmm-flat-data/v3"}
+_FLAT_SCHEMA = "g1-lmm-flat-data/v3"
+_FLAT_KINEMATICS_MODEL = {
+    "asset": "g1_29dof.xml",
+    "sha256": "749209c06a5c0023deb27f728420028b62b1f3092a22e24920183c1a897e4376",
+    "size_bytes": 26914,
+}
 
 
 def features_bytes(features: FeatureSet) -> bytes:
@@ -133,8 +138,16 @@ def _authenticate_flat_manifest_inputs(manifest_base) -> None:
     from .sources import load_retarget_npz
 
     if type(manifest_base) is not dict \
-            or manifest_base.get("schema") not in _FLAT_SCHEMAS:
-        raise ValueError("flat manifest schema must be a supported v2 or v3")
+            or manifest_base.get("schema") != _FLAT_SCHEMA:
+        raise ValueError("flat manifest schema must be g1-lmm-flat-data/v3")
+    model = manifest_base.get("kinematics_model")
+    if type(model) is not dict \
+            or set(model) != set(_FLAT_KINEMATICS_MODEL) \
+            or type(model.get("asset")) is not str \
+            or type(model.get("sha256")) is not str \
+            or type(model.get("size_bytes")) is not int \
+            or model != _FLAT_KINEMATICS_MODEL:
+        raise ValueError("flat kinematics model descriptor changed")
     validation = manifest_base.get("validation")
     if type(validation) is not dict \
             or set(validation) != _FLAT_VALIDATION_KEYS:
@@ -1210,9 +1223,10 @@ def publish_flat_artifacts(
     if len(features.values) != len(artifacts.positions):
         raise ValueError("database and matching feature rows differ")
     if type(manifest_base) is not dict \
-            or manifest_base.get("schema") not in _FLAT_SCHEMAS \
+            or manifest_base.get("schema") != _FLAT_SCHEMA \
             or "artifacts" in manifest_base or "status" in manifest_base:
-        raise ValueError("flat manifest base is invalid")
+        raise ValueError(
+            "flat manifest base must use g1-lmm-flat-data/v3")
     if not callable(validate_candidate):
         raise TypeError("validate_candidate must be callable")
     _authenticate_flat_manifest_inputs(manifest_base)

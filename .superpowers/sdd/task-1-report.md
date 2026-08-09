@@ -378,3 +378,64 @@ counts are 28 airborne, 223 single-support, and 5 double-support frames.
 
 A second transactional build in a fresh temporary directory was byte-identical
 for all three files. The historical v2 directory was not overwritten.
+
+## Review correction: canonical G1 XML trust and v3-only publication
+
+The v3 database is now bound to the exact XML bytes used for G1 kinematics.
+The manifest carries the portable descriptor below; it intentionally contains
+no host path and accepts a byte-identical copy at any caller-selected location:
+
+```json
+{
+  "kinematics_model": {
+    "asset": "g1_29dof.xml",
+    "sha256": "749209c06a5c0023deb27f728420028b62b1f3092a22e24920183c1a897e4376",
+    "size_bytes": 26914
+  }
+}
+```
+
+The builder reads, bounds, and authenticates the selected XML bytes before
+constructing kinematics. Those already-authenticated bytes are passed to
+`G1Kinematics.from_xml_bytes`; the MuJoCo parser never reopens the XML path.
+The independent validator follows the same byte-consuming seam while retaining
+its own descriptor/hash constants. A mutation-after-authentication test swaps
+the selected path immediately as parsing begins and proves both paths still
+consume the authenticated bytes. Mesh payloads are supplied separately through
+MuJoCo's asset map and are outside this XML receipt.
+
+The alternate canonical-topology XML with SHA-256 `456eb9a0...` is therefore
+rejected before kinematics. The automated negative uses a portable temporary
+whitespace-only XML mutation rather than depending on another host worktree.
+Missing descriptors and altered asset, hash, integer size, or size type are
+also rejected.
+
+Direct flat publication and its repeated authentication gates now accept only
+`g1-lmm-flat-data/v3`. A v3 candidate relabeled as v2 is rejected before even
+a permissive candidate callback runs. The generic
+`g1-terrain-artifacts/v2` GRAIL/non-flat publisher remains unchanged.
+
+The focused REDs first showed the alternate XML completing the builder, all
+descriptor mutations passing flat publication authentication, the independent
+validator reaching payload loading without a descriptor, and the relabeled v2
+candidate being published. A second RED proved both producer and validator
+hashed a pathname and later reopened it. After the correction, the focused
+trust and mutation gates pass. The complete Task1 modified-area module run
+before the final byte-consuming hardening reported:
+
+```text
+Ran 98 tests in 119.401s
+OK
+```
+
+The final byte-consuming implementation also passes all five kinematics tests.
+The transactional canonical build, its candidate validator, and a subsequent
+standalone validator each reported the same accepted 256-frame, 512-source-row
+v3 bundle. A second build to a fresh directory compared byte-identically for
+all three files. Python byte-compilation and `git diff --check` also passed.
+
+| File | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `database.bin` | 413,368 | `13b368759c22ff3427d937a86fd9399cd6e80646e5f288e80da01bd988daaaad` |
+| `features.bin` | 32,008 | `7c35809e1dd5ea14bd56b0f607cb9da22b3464ebbece01a895050372530b40df` |
+| `manifest.json` | 18,021 | `5b5c48ccbb1dbabdbf87842d8b033c15b307199d72a8d90e4e39208ba5382db1` |

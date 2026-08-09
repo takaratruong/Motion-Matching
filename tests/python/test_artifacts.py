@@ -28,6 +28,7 @@ from resources.g1_terrain_builder.artifacts import (
     write_terrain_sidecar,
     write_walkability,
     features_bytes,
+    publish_flat_artifacts,
     read_features,
     write_features,
 )
@@ -191,6 +192,12 @@ class ArtifactTests(unittest.TestCase):
             }
             valid = {
                 "schema": "g1-lmm-flat-data/v3", "output_fps": 60.0,
+                "kinematics_model": {
+                    "asset": "g1_29dof.xml",
+                    "sha256":
+                        "749209c06a5c0023deb27f728420028b62b1f3092a22e24920183c1a897e4376",
+                    "size_bytes": 26914,
+                },
                 "sources": [source],
                 "validation": {
                     "fk_max_error_m": 0.0, "duration_error_s": 0.0,
@@ -209,11 +216,39 @@ class ArtifactTests(unittest.TestCase):
             empty_validation = copy.deepcopy(valid)
             empty_validation["validation"] = {}
             cases.append((empty_validation, "validation"))
+            missing_model = copy.deepcopy(valid)
+            del missing_model["kinematics_model"]
+            cases.append((missing_model, "kinematics model"))
+            for key, value in (
+                ("asset", "other-g1.xml"),
+                ("sha256", "0" * 64),
+                ("size_bytes", 26913),
+                ("size_bytes", 26914.0),
+            ):
+                tampered_model = copy.deepcopy(valid)
+                tampered_model["kinematics_model"][key] = value
+                cases.append((tampered_model, "kinematics model"))
             for candidate, message in cases:
                 with self.subTest(message=message), self.assertRaisesRegex(
                     ValueError, message,
                 ):
                     artifacts_module._authenticate_flat_manifest_inputs(candidate)
+
+            relabeled = copy.deepcopy(valid)
+            relabeled["schema"] = "g1-lmm-flat-data/v2"
+            artifacts = ArtifactSet.empty(1, 31)
+            features = FeatureSet(
+                np.zeros((1, 31), np.float32),
+                np.zeros(31, np.float32),
+                np.ones(31, np.float32),
+            )
+            callback = mock.Mock()
+            with self.assertRaisesRegex(ValueError, "v3"):
+                publish_flat_artifacts(
+                    os.path.join(temporary, "relabeled-v2"),
+                    artifacts, features, relabeled, callback,
+                )
+            callback.assert_not_called()
 
     def test_features_round_trip_matches_orange_duck_little_endian_layout(self):
         feature_set = FeatureSet(

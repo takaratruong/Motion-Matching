@@ -42,6 +42,7 @@ from resources.g1_terrain_builder.features import build_matching_features
 from resources.g1_terrain_builder.kinematics import (
     G1Kinematics,
     convert_source_clip,
+    load_mujoco_xml_assets,
 )
 from resources.g1_terrain_builder.scenes import (
     COORDINATE_SIGNATURE,
@@ -99,6 +100,11 @@ CANONICAL_FLAT_SOURCE_SHA256 = (
 CANONICAL_FLAT_PREPARED_SHA256 = (
     "d6dbbac84e68d419d27aff0356b5a8245522f39694d94a6fc83e300ab6feaf8d")
 CANONICAL_FLAT_GROUNDING_OFFSET_M = 0.06142798715901732
+CANONICAL_FLAT_KINEMATICS_MODEL = {
+    "asset": "g1_29dof.xml",
+    "sha256": "749209c06a5c0023deb27f728420028b62b1f3092a22e24920183c1a897e4376",
+    "size_bytes": 26914,
+}
 
 
 def _validate_flat_tree(root):
@@ -299,8 +305,32 @@ def _flat_source_fragment(source, first, last):
     return fragment
 
 
+def _read_canonical_flat_g1_xml(path: str) -> bytes:
+    try:
+        with open(path, "rb") as stream:
+            payload = stream.read(
+                CANONICAL_FLAT_KINEMATICS_MODEL["size_bytes"] + 1)
+    except (OSError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"canonical G1 XML authentication failed: {error}") from error
+    if len(payload) != CANONICAL_FLAT_KINEMATICS_MODEL["size_bytes"] \
+            or hashlib.sha256(payload).hexdigest() \
+            != CANONICAL_FLAT_KINEMATICS_MODEL["sha256"]:
+        raise ValueError(
+            "canonical G1 XML content SHA-256/size changed")
+    return payload
+
+
 def _validate_flat_artifact_directory(root, manifest, source_options):
     _validate_flat_tree(root)
+    _require(
+        type(manifest) is dict
+        and _json_exact(
+            manifest.get("kinematics_model"),
+            CANONICAL_FLAT_KINEMATICS_MODEL,
+        ),
+        "flat kinematics model descriptor changed",
+    )
     expected_keys = {
         "schema", "status", "output_fps", "trajectory_horizons",
         "feature_dimensions", "feature_names", "feature_weights",
@@ -309,12 +339,16 @@ def _validate_flat_artifact_directory(root, manifest, source_options):
         "source_count", "range_count", "dimensions", "skeleton",
         "ranges", "continuity", "time_filters", "contact", "sources",
         "contact_observations", "validation", "artifacts",
+        "kinematics_model",
     }
     _require(type(manifest) is dict and set(manifest) == expected_keys,
              "flat manifest key set changed")
     _require(manifest["schema"] == FLAT_SCHEMA,
              "flat manifest schema must be g1-lmm-flat-data/v3")
     _require(manifest["status"] == "accepted", "flat manifest is not accepted")
+    options = _validate_full_source_options(source_options)
+    xml_bytes = _read_canonical_flat_g1_xml(options["g1_xml"])
+    xml_assets = load_mujoco_xml_assets(options["g1_xml"])
     _require(type(manifest["output_fps"]) is float
              and manifest["output_fps"] == 60.0,
              "flat manifest output rate must be an exact 60 Hz float")
@@ -482,8 +516,7 @@ def _validate_flat_artifact_directory(root, manifest, source_options):
              "flat source content identity changed")
     _require_canonical_flat_retarget(source)
 
-    options = _validate_full_source_options(source_options)
-    kinematics = G1Kinematics(options["g1_xml"])
+    kinematics = G1Kinematics.from_xml_bytes(xml_bytes, xml_assets)
     preliminary, rebuilt_skeleton, preliminary_report = convert_source_clip(
         source, kinematics, 60.0, root_filter_mode="nearest")
     _require(preliminary_report["fk_max_error_m"] <= 1e-5,
