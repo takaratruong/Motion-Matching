@@ -42,7 +42,7 @@
 - Produces: `build_matching_features(artifacts: ArtifactSet, fps: float, horizons: tuple[int, int, int]) -> FeatureSet` with normalized `[T,31]` features plus offset/scale.
 - Produces: receipt-checked loader for `sonic/runs/native-g1-pfnn/sample-retarget/LocomotionFlat01_000-120hz.npz`.
 - Produces: CLI `resources/build_g1_terrain_database.py --output-fps 60 --flat-only --retarget-npz PATH --retarget-receipt PATH --output PATH`.
-- Produces: immutable `database.bin`, `features.bin`, and manifest with exact rate, horizons, source interpolation map, skeleton, dimensions, and hashes.
+- Produces: immutable `database.bin`, `features.bin`, and manifest with exact rate, horizons, source interpolation map, continuity-safe ranges, skeleton, dimensions, and hashes.
 
 - [ ] **Step 1: Write the failing 60 Hz resampling tests**
 
@@ -90,6 +90,12 @@ median, and 121-row forward terrain path. The real Takara 50 Hz source must
 produce exactly 41,835 output rows; an existing PFNN 120 Hz fixture must map
 every output row to the exact even source index.
 
+Before combining the real retarget, split every source edge whose maximum
+native/local joint step exceeds `0.25 rad`, discard fragments shorter than 61
+frames, and bind the independently recomputable continuity receipt. For the
+approved full retarget this rejects 31 edges and publishes exactly 3,853 rows
+in 12 ranges; the longest range has 1,177 frames.
+
 - [ ] **Step 4: Run GREEN and build the real flat bundle**
 
 Run the RED command again; expect all tests pass.
@@ -105,9 +111,10 @@ PYTHONPATH=. /home/ubuntu/miniconda3/envs/diffsim/bin/python \
   --output sonic/runs/g1-lmm-flat-60hz/data
 ```
 
-Expected: accepted manifest, one 4,086-frame flat range, exact 120-to-60 even
-source indices, 31 bones, 31 features, horizons 20/40/60, and all artifact
-hashes present.
+Expected: accepted manifest, 3,853 frames in 12 continuity-safe flat ranges,
+exact retained 120-to-60 even source indices, maximum admitted joint step
+`<=0.25 rad`, 31 bones, 31 features, horizons 20/40/60, and all artifact hashes
+present.
 
 - [ ] **Step 5: Commit**
 
@@ -320,7 +327,7 @@ automatically commit ordinary MM during an LMM acceptance run.
 Run the RED command again; expect all tests pass. Launch the viewer, drive with
 W/A/S/D for at least 20 seconds, start/stop/turn/reverse, and record a video plus
 machine receipt. Require all frames owned by LMM, zero holds/resets/fallbacks,
-joint velocity `<=6.75 rad/s` (`0.1125 rad/frame`), root translation velocity
+joint step `<=0.25 rad/frame`, root translation velocity
 `<=1.5 m/s` (`25 mm/frame`), root rotation velocity `<=8.75 rad/s`
 (`0.145834 rad/frame`), and coherent full-body articulation on visual review.
 

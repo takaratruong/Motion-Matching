@@ -140,8 +140,12 @@ independent FK reconstruction must match the source conversion within
 
 Quaternion signs are unrolled before differentiation. Native joint coordinates
 are unwrapped only where the joint topology permits it. Frames are split or
-rejected when an adjacent target joint exceeds `6.75 rad/s`; at 60 Hz this is
-`0.1125 rad/frame`. A clip range never spans a rejected interval.
+rejected when an adjacent target joint exceeds `0.25 rad/frame` at 60 Hz. This
+is an algorithmic LMM continuity gate, not a converted 25 Hz limit: the shipped
+Orange Duck 60 Hz reference database has a per-frame maximum-joint-step p99 of
+approximately `0.2516 rad`, so the earlier PFNN-specific `0.1125 rad/frame`
+bound would reject ordinary reference locomotion. A clip range never spans a
+rejected interval.
 
 All temporal preprocessing is specified in seconds and converted through the
 validated rate. At 60 Hz, the existing root-extraction durations become odd
@@ -453,8 +457,7 @@ flat, hill, and stair canary. Acceptance requires:
 - complete-foot penetration `<= 5 mm`;
 - forbidden-body penetration `= 0`;
 - planted-foot drift `<= 10 mm`;
-- maximum native joint velocity `<= 6.75 rad/s`, equivalently
-  `0.1125 rad/frame` at 60 Hz;
+- maximum native joint step `<= 0.25 rad/frame` at 60 Hz;
 - maximum root translation velocity `<= 1.5 m/s`, equivalently
   `25 mm/frame` at 60 Hz;
 - maximum root rotation velocity `<= 8.75 rad/s`, equivalently
