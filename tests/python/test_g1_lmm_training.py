@@ -58,7 +58,7 @@ def _write_flat_training_bundle(
     terrain_class: str = "flat",
 ) -> dict:
     path.mkdir()
-    frames = 3853
+    frames = 256
     bones = 31
     positions = np.zeros((frames, bones, 3), dtype=np.float32)
     positions[:, 1:, 1] = np.arange(1, bones, dtype=np.float32)[None] * 0.01
@@ -72,14 +72,16 @@ def _write_flat_training_bundle(
         rotations[5:, 1, 1] = np.sin(local_rotation_step_rad / 2.0)
     angular_velocities = np.zeros_like(positions)
     parents = np.concatenate(([-1], np.arange(0, bones - 1))).astype(np.int32)
-    range_lengths = np.array([747] + [259] * 10 + [258] * 2, dtype=np.int32)
-    range_stops = np.cumsum(range_lengths, dtype=np.int32)
-    range_starts = np.concatenate((np.array([0], np.int32), range_stops[:-1]))
+    range_starts = np.array([0], dtype=np.int32)
+    range_stops = np.array([frames], dtype=np.int32)
     if gap_after_first_range:
-        range_starts[1] += 1
-    contacts = np.stack(
-        ((np.arange(frames) // 5) % 2, (np.arange(frames) // 5 + 1) % 2), axis=1
-    ).astype(np.uint8)
+        range_starts = np.array([0, 129], dtype=np.int32)
+        range_stops = np.array([128, frames], dtype=np.int32)
+    contacts = np.zeros((frames, 2), dtype=np.uint8)
+    for start, length in ((30, 49), (90, 40), (150, 27)):
+        contacts[start : start + length, 0] = 1
+    for start, length in ((0, 45), (60, 30), (120, 30), (180, 12)):
+        contacts[start : start + length, 1] = 1
     database_payload = b"".join(
         (
             _array2_bytes(positions, "<f4"),
@@ -114,7 +116,7 @@ def _write_flat_training_bundle(
         }
         for name in ("database.bin", "features.bin")
     }
-    left_source_index = np.arange(frames, dtype=np.int32)
+    left_source_index = np.arange(7659, 8171, 2, dtype=np.int32)
     right_source_index = left_source_index.copy()
     source_alpha = np.zeros(frames, dtype=np.float32)
     source_map_digest = hashlib.sha256(
@@ -127,7 +129,7 @@ def _write_flat_training_bundle(
         )
     ).hexdigest()
     manifest = {
-        "schema": "g1-lmm-flat-data/v2",
+        "schema": "g1-lmm-flat-data/v3",
         "status": "accepted",
         "output_fps": 60.0,
         "trajectory_horizons": [20, 40, 60],
@@ -135,15 +137,15 @@ def _write_flat_training_bundle(
         "database_frames": frames,
         "total_clips": 1,
         "source_count": 1,
-        "range_count": 13,
+        "range_count": len(range_starts),
         "dimensions": {"bones": 31, "features": 31, "contacts": 2},
         "ranges": [
             {
                 "start": int(start),
                 "stop": int(stop),
-                "source": "synthetic-flat-walk",
-                "source_first_frame": int(start),
-                "source_last_frame": int(stop - 1),
+                "source": "LocomotionFlat01_000-walk-only-7659-8171-120hz",
+                "source_first_frame": int(left_source_index[start]),
+                "source_last_frame": int(right_source_index[stop - 1]),
                 "motion_class": motion_class,
                 "terrain_class": terrain_class,
             }
@@ -153,19 +155,24 @@ def _write_flat_training_bundle(
             "schema": "g1-lmm-continuity/v1",
             "threshold_rad_per_frame": 0.25,
             "minimum_range_frames": 61,
-            "source_native_rejected_edge_count": 31,
-            "database_local_rejected_edge_count": 32,
-            "union_rejected_edge_count": 32,
-            "dropped_fragment_count": 20,
-            "dropped_frame_count": 233,
-            "published_range_count": 13,
-            "published_frame_count": 3853,
+            "source_native_rejected_edge_count": 0,
+            "database_local_rejected_edge_count": 0,
+            "union_rejected_edge_count": 0,
+            "dropped_fragment_count": 0,
+            "dropped_frame_count": 0,
+            "published_range_count": len(range_starts),
+            "published_frame_count": frames,
             "maximum_admitted_native_step_rad": local_rotation_step_rad,
             "maximum_admitted_local_rotation_step_rad": local_rotation_step_rad,
             "range_digest_sha256": hashlib.sha256(
                 np.asarray(
                     [
-                        [int(start), int(stop), int(start), int(stop - 1)]
+                        [
+                            int(start),
+                            int(stop),
+                            int(left_source_index[start]),
+                            int(right_source_index[stop - 1]),
+                        ]
                         for start, stop in zip(range_starts, range_stops)
                     ],
                     dtype="<i4",
@@ -175,13 +182,46 @@ def _write_flat_training_bundle(
         },
         "sources": [
             {
-                "name": "synthetic-flat-walk",
+                "name": "LocomotionFlat01_000-walk-only-7659-8171-120hz",
+                "terrain_id": "flat",
+                "path": "/synthetic/LocomotionFlat01_000-walk-only-7659-8171-120hz.npz",
+                "sha256": "bbdeb79760950480582ae937e54b913c376caa49f344896a8958476b82f3317f",
+                "receipt_path": "/synthetic/LocomotionFlat01_000-walk-only-7659-8171-120hz.receipt.json",
+                "receipt_sha256": "2d0e93f485bab9c54773c66cf07c14d25837f5f4e50f5c007f9f8e2c5c20520f",
+                "receipt_schema": "native-g1-pfnn-sample-retarget/v1",
+                "receipt_status": "accepted",
+                "source_fps": 120.0,
+                "source_frames": 512,
                 "output_frames": frames,
                 "left_source_index": left_source_index.tolist(),
                 "right_source_index": right_source_index.tolist(),
                 "source_alpha": source_alpha.tolist(),
             }
         ],
+        "time_filters": {
+            "root_position_frames": 31,
+            "root_position_order": 3,
+            "root_direction_frames": 61,
+            "root_direction_order": 3,
+            "contact_median_frames": 6,
+            "forward_terrain_path_rows": 121,
+        },
+        "contact": {
+            "semantics": "bundled-orange-duck-global-toe-speed-only",
+            "speed_threshold": 0.15,
+            "median_filter_frames": 6,
+            "median_filter_mode": "nearest",
+        },
+        "contact_observations": {
+            "schema": "g1-lmm-bilateral-contact/v1",
+            "left_contact_frames": 116,
+            "right_contact_frames": 117,
+            "left_run_count": 3,
+            "right_run_count": 4,
+            "left_max_run_frames": 49,
+            "right_max_run_frames": 45,
+            "alternating_run_transition_count": 6,
+        },
         "artifacts": artifacts,
     }
     (path / "manifest.json").write_text(
@@ -644,7 +684,7 @@ class G1LmmTrainingTest(unittest.TestCase):
             split = root / "split-source"
             manifest = _write_flat_training_bundle(split)
             source = manifest["sources"][0]
-            cut = 2000
+            cut = 128
             first = {
                 **source,
                 "name": "synthetic-flat-walk-a",
@@ -656,7 +696,7 @@ class G1LmmTrainingTest(unittest.TestCase):
             second = {
                 **source,
                 "name": "synthetic-flat-walk-b",
-                "output_frames": 3853 - cut,
+                "output_frames": 256 - cut,
                 "left_source_index": source["left_source_index"][cut:],
                 "right_source_index": source["right_source_index"][cut:],
                 "source_alpha": source["source_alpha"][cut:],
@@ -714,18 +754,23 @@ class G1LmmTrainingTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "contiguous partition"):
                 load_training_bundle(data_directory)
 
-    def test_loader_requires_v2_continuity_receipt_and_recomputes_local_steps(self):
+    def test_loader_requires_v3_continuity_receipt_and_recomputes_local_steps(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            legacy = root / "legacy"
-            manifest = _write_flat_training_bundle(legacy)
-            manifest["schema"] = "g1-lmm-flat-data/v1"
-            (legacy / "manifest.json").write_text(
-                json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
-                encoding="utf-8",
-            )
-            with self.assertRaisesRegex(ValueError, "v2"):
-                load_training_bundle(legacy)
+            for version in ("v1", "v2"):
+                legacy = root / version
+                manifest = _write_flat_training_bundle(legacy)
+                manifest["schema"] = f"g1-lmm-flat-data/{version}"
+                (legacy / "manifest.json").write_text(
+                    json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+                    + "\n",
+                    encoding="utf-8",
+                )
+                with (
+                    self.subTest(version=version),
+                    self.assertRaisesRegex(ValueError, "v3"),
+                ):
+                    load_training_bundle(legacy)
 
             unsafe = root / "unsafe"
             _write_flat_training_bundle(unsafe, local_rotation_step_rad=0.5)
@@ -751,6 +796,67 @@ class G1LmmTrainingTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "source-map digest"):
                 load_training_bundle(source_map_mismatch)
+
+            rounded_quaternions = root / "rounded-quaternions"
+            _write_flat_training_bundle(
+                rounded_quaternions, local_rotation_step_rad=0.01
+            )
+            rounded = load_training_bundle(rounded_quaternions)
+            self.assertAlmostEqual(
+                rounded.manifest["continuity"][
+                    "maximum_admitted_local_rotation_step_rad"
+                ],
+                0.01,
+            )
+
+    def test_loader_requires_canonical_v3_walk_source_and_orange_duck_contacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            stale_source = root / "stale-source"
+            manifest = _write_flat_training_bundle(stale_source)
+            manifest["sources"][0]["name"] = "LocomotionFlat01_000-120hz"
+            manifest["ranges"][0]["source"] = "LocomotionFlat01_000-120hz"
+            (stale_source / "manifest.json").write_text(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "walk-only"):
+                load_training_bundle(stale_source)
+
+            changed_contact = root / "changed-contact"
+            manifest = _write_flat_training_bundle(changed_contact)
+            manifest["contact"]["semantics"] = "height-and-speed"
+            (changed_contact / "manifest.json").write_text(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "Orange Duck contact"):
+                load_training_bundle(changed_contact)
+
+            changed_observations = root / "changed-observations"
+            manifest = _write_flat_training_bundle(changed_observations)
+            manifest["contact_observations"]["left_contact_frames"] -= 1
+            (changed_observations / "manifest.json").write_text(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "contact observations"):
+                load_training_bundle(changed_observations)
+
+            extra_source_key = root / "extra-source-key"
+            manifest = _write_flat_training_bundle(extra_source_key)
+            manifest["sources"][0]["unexpected"] = True
+            (extra_source_key / "manifest.json").write_text(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "source receipt keys"):
+                load_training_bundle(extra_source_key)
 
     def test_all_stage_stops_after_failed_decompressor_gate_without_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -915,6 +1021,28 @@ class G1LmmTrainingTest(unittest.TestCase):
                     and start - TrainingConfig().withheld_halo <= window[-1]
                 )
 
+    def test_default_v3_withheld_block_leaves_range_safe_decompressor_windows(self):
+        config = TrainingConfig()
+        starts, stops = deterministic_withheld_ranges(
+            np.array([0], np.int32),
+            np.array([256], np.int32),
+            frames=config.withheld_frames,
+            seed=config.seed,
+            margin=config.withheld_halo,
+        )
+        np.testing.assert_array_equal(starts, np.array([131], np.int64))
+        np.testing.assert_array_equal(stops, np.array([195], np.int64))
+        windows = range_safe_windows(
+            np.array([0], np.int32),
+            np.array([256], np.int32),
+            2,
+            excluded_starts=starts,
+            excluded_stops=stops,
+            exclusion_halo=config.withheld_halo,
+        )
+        self.assertEqual(windows.shape, (70, 2))
+        np.testing.assert_array_equal(np.unique(windows), np.arange(71))
+
     def test_accepted_flat_bundle_builds_exact_legacy_training_rows(self):
         with tempfile.TemporaryDirectory() as directory:
             data_directory = Path(directory) / "data"
@@ -923,13 +1051,13 @@ class G1LmmTrainingTest(unittest.TestCase):
             arrays = build_training_arrays(bundle)
 
             self.assertEqual(bundle.dimensions, G1LmmDimensions())
-            self.assertEqual(bundle.frames, 3853)
-            self.assertEqual(int(bundle.admitted_mask.sum()), 3853)
+            self.assertEqual(bundle.frames, 256)
+            self.assertEqual(int(bundle.admitted_mask.sum()), 256)
             self.assertFalse(bundle.admitted_mask.flags.writeable)
-            self.assertEqual(arrays.compressor_input.shape, (3853, 908))
-            self.assertEqual(arrays.decompressor_target.shape, (3853, 458))
-            np.testing.assert_array_equal(arrays.compressor_input[:, :90], bundle.positions[:, 1:].reshape(3853, -1))
-            np.testing.assert_array_equal(arrays.decompressor_target[:, :90], bundle.positions[:, 1:].reshape(3853, -1))
+            self.assertEqual(arrays.compressor_input.shape, (256, 908))
+            self.assertEqual(arrays.decompressor_target.shape, (256, 458))
+            np.testing.assert_array_equal(arrays.compressor_input[:, :90], bundle.positions[:, 1:].reshape(256, -1))
+            np.testing.assert_array_equal(arrays.decompressor_target[:, :90], bundle.positions[:, 1:].reshape(256, -1))
             np.testing.assert_array_equal(arrays.decompressor_target[:, -2:], bundle.contacts.astype(np.float32))
             self.assertTrue(np.isfinite(arrays.compressor_input).all())
             self.assertTrue(np.isfinite(arrays.decompressor_target).all())

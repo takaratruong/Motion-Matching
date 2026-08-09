@@ -13,6 +13,93 @@ import numpy as np
 from resources import quat
 
 
+_CANONICAL_V3_SOURCE_NAME = (
+    "LocomotionFlat01_000-walk-only-7659-8171-120hz"
+)
+_CANONICAL_V3_SOURCE_SHA256 = (
+    "bbdeb79760950480582ae937e54b913c376caa49f344896a8958476b82f3317f"
+)
+_CANONICAL_V3_RECEIPT_SHA256 = (
+    "2d0e93f485bab9c54773c66cf07c14d25837f5f4e50f5c007f9f8e2c5c20520f"
+)
+_CANONICAL_V3_CONTACT = {
+    "semantics": "bundled-orange-duck-global-toe-speed-only",
+    "speed_threshold": 0.15,
+    "median_filter_frames": 6,
+    "median_filter_mode": "nearest",
+}
+_CANONICAL_V3_CONTACT_OBSERVATIONS = {
+    "schema": "g1-lmm-bilateral-contact/v1",
+    "left_contact_frames": 116,
+    "right_contact_frames": 117,
+    "left_run_count": 3,
+    "right_run_count": 4,
+    "left_max_run_frames": 49,
+    "right_max_run_frames": 45,
+    "alternating_run_transition_count": 6,
+}
+_CANONICAL_V3_TIME_FILTERS = {
+    "root_position_frames": 31,
+    "root_position_order": 3,
+    "root_direction_frames": 61,
+    "root_direction_order": 3,
+    "contact_median_frames": 6,
+    "forward_terrain_path_rows": 121,
+}
+
+
+def _json_exact(actual, expected) -> bool:
+    if type(actual) is not type(expected):
+        return False
+    if type(expected) is dict:
+        return set(actual) == set(expected) and all(
+            _json_exact(actual[key], value) for key, value in expected.items()
+        )
+    if type(expected) is list:
+        return len(actual) == len(expected) and all(
+            _json_exact(left, right) for left, right in zip(actual, expected)
+        )
+    return actual == expected
+
+
+def _bilateral_contact_observations(
+    contacts: np.ndarray,
+    range_starts: np.ndarray,
+    range_stops: np.ndarray,
+) -> dict:
+    run_lengths: tuple[list[int], list[int]] = ([], [])
+    events_by_range: list[list[tuple[int, int]]] = []
+    for start, stop in zip(range_starts.tolist(), range_stops.tolist()):
+        events: list[tuple[int, int]] = []
+        for side in range(2):
+            values = contacts[int(start) : int(stop), side].astype(
+                np.int8, copy=False
+            )
+            edges = np.diff(np.pad(values, (1, 1)))
+            run_starts = np.flatnonzero(edges == 1)
+            run_stops = np.flatnonzero(edges == -1)
+            for run_start, run_stop in zip(run_starts, run_stops):
+                run_lengths[side].append(int(run_stop - run_start))
+                events.append((int(run_start), side))
+        events.sort()
+        events_by_range.append(events)
+    transitions = sum(
+        left[1] != right[1]
+        for events in events_by_range
+        for left, right in zip(events, events[1:])
+    )
+    return {
+        "schema": "g1-lmm-bilateral-contact/v1",
+        "left_contact_frames": int(contacts[:, 0].sum()),
+        "right_contact_frames": int(contacts[:, 1].sum()),
+        "left_run_count": len(run_lengths[0]),
+        "right_run_count": len(run_lengths[1]),
+        "left_max_run_frames": max(run_lengths[0], default=0),
+        "right_max_run_frames": max(run_lengths[1], default=0),
+        "alternating_run_transition_count": int(transitions),
+    }
+
+
 @dataclass(frozen=True)
 class G1LmmDimensions:
     features: int = 31
@@ -160,8 +247,8 @@ def load_training_bundle(data_directory: str | Path) -> TrainingBundle:
         raise ValueError("invalid data manifest JSON") from error
     if type(manifest) is not dict:
         raise ValueError("data manifest must be an object")
-    if manifest.get("schema") != "g1-lmm-flat-data/v2":
-        raise ValueError("data manifest must use continuity-safe g1-lmm-flat-data/v2")
+    if manifest.get("schema") != "g1-lmm-flat-data/v3":
+        raise ValueError("data manifest must use canonical g1-lmm-flat-data/v3")
     if manifest.get("status") != "accepted":
         raise ValueError("data manifest is not an accepted G1 LMM flat bundle")
     if manifest.get("output_fps") != 60.0:
@@ -192,6 +279,8 @@ def load_training_bundle(data_directory: str | Path) -> TrainingBundle:
     database.finish()
 
     frames = len(positions)
+    if frames != 256:
+        raise ValueError("canonical v3 database must contain exactly 256 rows")
     expected_bones = dimensions.bones
     if not (
         positions.shape == velocities.shape == angular_velocities.shape == (frames, expected_bones, 3)
@@ -232,6 +321,8 @@ def load_training_bundle(data_directory: str | Path) -> TrainingBundle:
         raise ValueError("manifest ranges do not match database")
     if manifest.get("range_count") != len(starts):
         raise ValueError("manifest range count does not match database")
+    if len(starts) != 1:
+        raise ValueError("canonical v3 database must contain exactly one range")
     sources = manifest.get("sources")
     if (
         type(sources) is not list
@@ -243,8 +334,47 @@ def load_training_bundle(data_directory: str | Path) -> TrainingBundle:
     ):
         raise ValueError("flat training bundle must bind exactly one source and one clip")
     sole_source = sources[0]
-    if type(sole_source) is not dict or type(sole_source.get("name")) is not str:
-        raise ValueError("flat training bundle sole source is invalid")
+    source_keys = {
+        "name",
+        "terrain_id",
+        "path",
+        "sha256",
+        "receipt_path",
+        "receipt_sha256",
+        "receipt_schema",
+        "receipt_status",
+        "source_fps",
+        "source_frames",
+        "output_frames",
+        "left_source_index",
+        "right_source_index",
+        "source_alpha",
+    }
+    if type(sole_source) is not dict or set(sole_source) != source_keys:
+        raise ValueError("canonical v3 source receipt keys changed")
+    expected_source = {
+        "name": _CANONICAL_V3_SOURCE_NAME,
+        "terrain_id": "flat",
+        "sha256": _CANONICAL_V3_SOURCE_SHA256,
+        "receipt_sha256": _CANONICAL_V3_RECEIPT_SHA256,
+        "receipt_schema": "native-g1-pfnn-sample-retarget/v1",
+        "receipt_status": "accepted",
+        "source_fps": 120.0,
+        "source_frames": 512,
+        "output_frames": 256,
+    }
+    if any(
+        not _json_exact(sole_source.get(key), expected)
+        for key, expected in expected_source.items()
+    ):
+        raise ValueError("canonical v3 walk-only source identity changed")
+    if (
+        type(sole_source["path"]) is not str
+        or not Path(sole_source["path"]).is_absolute()
+        or type(sole_source["receipt_path"]) is not str
+        or not Path(sole_source["receipt_path"]).is_absolute()
+    ):
+        raise ValueError("canonical v3 source paths must be absolute")
     range_keys = {
         "start",
         "stop",
@@ -257,11 +387,14 @@ def load_training_bundle(data_directory: str | Path) -> TrainingBundle:
     for index, (start, stop) in enumerate(zip(starts, stops)):
         entry = manifest_ranges[index]
         if type(entry) is not dict or set(entry) != range_keys:
-            raise ValueError("every manifest range must have exact keys for a v2 range")
+            raise ValueError("every manifest range must have exact keys for a v3 range")
         if entry.get("start") != int(start) or entry.get("stop") != int(stop):
             raise ValueError("manifest range boundaries do not match database")
         if entry.get("source") != sole_source["name"]:
             raise ValueError("every manifest range must bind the sole source")
+        if entry.get("source_first_frame") != 7659 \
+                or entry.get("source_last_frame") != 8169:
+            raise ValueError("canonical v3 range source provenance changed")
         if entry.get("motion_class") != "flat-walk":
             raise ValueError("every admitted range must have motion_class flat-walk")
         if entry.get("terrain_class") != "flat":
@@ -285,7 +418,7 @@ def load_training_bundle(data_directory: str | Path) -> TrainingBundle:
         "source_map_digest_sha256",
     }
     if type(continuity) is not dict or set(continuity) != continuity_keys:
-        raise ValueError("v2 data manifest has no exact continuity receipt")
+        raise ValueError("v3 data manifest has no exact continuity receipt")
     if continuity["schema"] != "g1-lmm-continuity/v1":
         raise ValueError("continuity receipt schema is unsupported")
     if continuity["threshold_rad_per_frame"] != 0.25:
@@ -293,13 +426,13 @@ def load_training_bundle(data_directory: str | Path) -> TrainingBundle:
     if continuity["minimum_range_frames"] != 61:
         raise ValueError("continuity receipt must bind 61-frame minimum ranges")
     exact_counts = {
-        "source_native_rejected_edge_count": 31,
-        "database_local_rejected_edge_count": 32,
-        "union_rejected_edge_count": 32,
-        "dropped_fragment_count": 20,
-        "dropped_frame_count": 233,
-        "published_range_count": 13,
-        "published_frame_count": 3853,
+        "source_native_rejected_edge_count": 0,
+        "database_local_rejected_edge_count": 0,
+        "union_rejected_edge_count": 0,
+        "dropped_fragment_count": 0,
+        "dropped_frame_count": 0,
+        "published_range_count": 1,
+        "published_frame_count": 256,
     }
     for key, expected in exact_counts.items():
         if type(continuity[key]) is not int or continuity[key] != expected:
@@ -355,12 +488,19 @@ def load_training_bundle(data_directory: str | Path) -> TrainingBundle:
         ):
             raise ValueError("manifest source map arrays are invalid")
         if np.any(left > np.iinfo(np.int32).max) or np.any(right > np.iinfo(np.int32).max):
-            raise ValueError("manifest source indices exceed the v2 ABI")
+            raise ValueError("manifest source indices exceed the v3 ABI")
         left_parts.append(left.astype("<i4"))
         right_parts.append(right.astype("<i4"))
         alpha_parts.append(alpha.astype("<f4"))
     if sum(len(part) for part in left_parts) != frames:
         raise ValueError("manifest source maps do not cover every admitted row")
+    canonical_source_indices = np.arange(7659, 8171, 2, dtype="<i4")
+    if (
+        not np.array_equal(left_parts[0], canonical_source_indices)
+        or not np.array_equal(right_parts[0], canonical_source_indices)
+        or not np.array_equal(alpha_parts[0], np.zeros(256, dtype="<f4"))
+    ):
+        raise ValueError("canonical v3 source interpolation map changed")
     recomputed_source_map_digest = hashlib.sha256(
         b"".join(
             (
@@ -372,10 +512,14 @@ def load_training_bundle(data_directory: str | Path) -> TrainingBundle:
     ).hexdigest()
     if continuity["source_map_digest_sha256"] != recomputed_source_map_digest:
         raise ValueError("continuity source-map digest does not match manifest arrays")
+    normalized_rotations = rotations.astype(np.float64)
+    normalized_rotations /= np.linalg.norm(
+        normalized_rotations, axis=2, keepdims=True
+    )
     recomputed_max = 0.0
     for start, stop in zip(starts, stops):
-        left = rotations[int(start) : int(stop) - 1].astype(np.float64)
-        right = rotations[int(start) + 1 : int(stop)].astype(np.float64)
+        left = normalized_rotations[int(start) : int(stop) - 1]
+        right = normalized_rotations[int(start) + 1 : int(stop)]
         dot = np.clip(np.abs(np.sum(left * right, axis=2)), 0.0, 1.0)
         recomputed_max = max(recomputed_max, float(np.max(2.0 * np.arccos(dot))))
     if recomputed_max > 0.25 + 1.0e-7:
@@ -386,6 +530,22 @@ def load_training_bundle(data_directory: str | Path) -> TrainingBundle:
         recomputed_max - float(continuity["maximum_admitted_local_rotation_step_rad"])
     ) > 1.0e-6:
         raise ValueError("continuity receipt does not match recomputed local-rotation maximum")
+
+    if not _json_exact(manifest.get("time_filters"), _CANONICAL_V3_TIME_FILTERS):
+        raise ValueError("canonical v3 time-filter receipt changed")
+    if not _json_exact(manifest.get("contact"), _CANONICAL_V3_CONTACT):
+        raise ValueError("canonical v3 Orange Duck contact contract changed")
+    contact_observations = _bilateral_contact_observations(
+        contacts, starts, stops
+    )
+    if (
+        not _json_exact(
+            manifest.get("contact_observations"),
+            _CANONICAL_V3_CONTACT_OBSERVATIONS,
+        )
+        or contact_observations != _CANONICAL_V3_CONTACT_OBSERVATIONS
+    ):
+        raise ValueError("canonical v3 contact observations changed")
 
     features_cursor = _BinaryCursor(_artifact_payload(root, manifest, "features.bin"), "features.bin")
     features = _read_array2(features_cursor, "<f4", (), "features")
