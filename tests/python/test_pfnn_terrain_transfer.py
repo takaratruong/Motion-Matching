@@ -60,6 +60,18 @@ class PFNNTerrainTransferTests(unittest.TestCase):
             atol=1.0e-12,
             rtol=0.0,
         )
+        offset = 0.05224985936713168
+        np.testing.assert_allclose(
+            terrain_height_g1(
+                fit,
+                native_xy * scale,
+                scale=scale,
+                z_offset=offset,
+            ),
+            native_height * scale + offset,
+            atol=1.0e-12,
+            rtol=0.0,
+        )
         with self.assertRaises(ValueError):
             terrain_height_g1(fit, native_xy, scale=0.0)
 

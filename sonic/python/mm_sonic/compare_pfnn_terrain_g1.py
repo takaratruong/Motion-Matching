@@ -138,6 +138,7 @@ def compare_motion_to_terrain(
     model: object,
     *,
     terrain_scale: float = 1.0,
+    terrain_z_offset: float = 0.0,
 ) -> SoleGapReport:
     """Measure exact terrain gaps and apply the PFNN transfer contact gate."""
 
@@ -146,7 +147,10 @@ def compare_motion_to_terrain(
         raise ValueError("motion and terrain source intervals differ")
     flat = probes.reshape(-1, 3)
     terrain = terrain_height_g1(
-        fit, flat[:, :2], scale=terrain_scale
+        fit,
+        flat[:, :2],
+        scale=terrain_scale,
+        z_offset=terrain_z_offset,
     ).reshape(len(probes), 4)
     gaps = probes.reshape(len(probes), 4, 3)[:, :, 2] - terrain
     contacts = fit.source_contacts
@@ -184,6 +188,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--terrain-scale", type=float, choices=(1.0, 0.875), default=1.0
     )
+    parser.add_argument("--terrain-z-offset", type=float, default=0.0)
     return parser
 
 
@@ -202,13 +207,18 @@ def main() -> None:
     )
     model = mujoco.MjModel.from_xml_path(str(model_path.resolve(strict=True)))
     report = compare_motion_to_terrain(
-        motion, fit, model, terrain_scale=arguments.terrain_scale
+        motion,
+        fit,
+        model,
+        terrain_scale=arguments.terrain_scale,
+        terrain_z_offset=arguments.terrain_z_offset,
     )
     document = {
         "schema": "native-g1-pfnn-terrain-comparison/v1",
         "status": "accepted" if report.accepted else "rejected",
         "accepted": report.accepted,
         "terrain_scale": arguments.terrain_scale,
+        "terrain_z_offset": arguments.terrain_z_offset,
         "first_failure": report.first_failure,
         "stance_probe_count": report.stance_probe_count,
         "contact_probe_count": report.contact_probe_count,

@@ -388,6 +388,9 @@ def _install_numpy_umath_tests_compat() -> object:
     except ModuleNotFoundError as error:
         if error.name != name:
             raise
+    except RuntimeError as error:
+        if "cannot load _umath_tests module" not in str(error):
+            raise
     module = types.ModuleType(name)
     module.matrix_multiply = np.matmul
     sys.modules[name] = module
@@ -568,16 +571,19 @@ def terrain_height_g1(
     query_xy_m: np.ndarray,
     *,
     scale: float = 1.0,
+    z_offset: float = 0.0,
 ) -> np.ndarray:
     """Evaluate the same physical surface in GMR's Z-up G1 world."""
 
     query = _finite_array(query_xy_m, "query_xy_m", shape=(None, 2))
     if not np.isfinite(scale) or scale <= 0.0:
         raise ValueError("terrain scale must be positive and finite")
+    if not np.isfinite(z_offset):
+        raise ValueError("terrain Z offset must be finite")
     source_xz = np.column_stack(
         (100.0 * query[:, 0] / scale, -100.0 * query[:, 1] / scale)
     )
-    return scale * terrain_height_pfnn(fit, source_xz) / 100.0
+    return scale * terrain_height_pfnn(fit, source_xz) / 100.0 + z_offset
 
 
 _ARTIFACT_FIELDS = {
