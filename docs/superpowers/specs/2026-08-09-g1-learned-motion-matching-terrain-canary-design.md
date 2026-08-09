@@ -143,6 +143,15 @@ are unwrapped only where the joint topology permits it. Frames are split or
 rejected when an adjacent target joint exceeds `6.75 rad/s`; at 60 Hz this is
 `0.1125 rad/frame`. A clip range never spans a rejected interval.
 
+All temporal preprocessing is specified in seconds and converted through the
+validated rate. At 60 Hz, the existing root-extraction durations become odd
+31- and 61-frame Savitzky-Golay windows, the contact median becomes 7 frames,
+and the forward terrain path covers 121 rows including the current row. These
+derived counts and filter orders are manifest-bound. The ordinary matching
+ignore-range-end and ignore-surrounding margin remains the stock Orange Duck
+20 frames at 60 Hz; it is an algorithmic 60 Hz default, not a rescaled remnant
+of the old G1 25 Hz artifact.
+
 ## Feature Contract
 
 The canary uses 31 matching features:
@@ -385,7 +394,8 @@ flat-walk-to-stop, flat-to-uphill, uphill-to-flat, flat-to-downhill,
 downhill-to-flat, flat-to-stair, and stair-to-flat. Every case fixes the source
 row, raw command/query, normalized query, scene transform, intended destination
 motion class, destination terrain identity, exact brute-force nearest database
-target, and a 30-tick transition deadline. Each case runs for 120 ticks.
+target, and a 30-tick (`0.5 s`) transition deadline. Each case runs for 120
+ticks (`2 s`).
 
 Oracle coverage is a prerequisite, not a learned-model result. Before training,
 the unrestricted exact nearest row for each normalized query must carry the
@@ -443,9 +453,12 @@ flat, hill, and stair canary. Acceptance requires:
 - complete-foot penetration `<= 5 mm`;
 - forbidden-body penetration `= 0`;
 - planted-foot drift `<= 10 mm`;
-- maximum native joint step `<= 0.25 rad`;
-- maximum root translation `<= 60 mm/frame`;
-- maximum root rotation `<= 0.35 rad/frame`;
+- maximum native joint velocity `<= 6.75 rad/s`, equivalently
+  `0.1125 rad/frame` at 60 Hz;
+- maximum root translation velocity `<= 1.5 m/s`, equivalently
+  `25 mm/frame` at 60 Hz;
+- maximum root rotation velocity `<= 8.75 rad/s`, equivalently
+  `0.145834 rad/frame` at 60 Hz;
 - maximum denormalized pre-overwrite terrain prediction error `<= 0.020 m`;
   and
 - learned output visually no worse than the ordinary-MM control on the same
@@ -464,7 +477,7 @@ four canonical kinematic sole points in each ankle frame: heel-medial
 `(-0.05,-0.05,-0.025)`, heel-lateral `(-0.05,-0.05,+0.025)`, toe-medial
 `(+0.12,-0.05,-0.030)`, and toe-lateral `(+0.12,-0.05,+0.030)` metres.
 
-A planted interval begins after three consecutive frames whose decoded contact
+A planted interval begins after seven consecutive frames whose decoded contact
 value is at least `0.5` and ends on the first frame below `0.5`. Planted-foot
 drift is the maximum terrain-tangent displacement of the four-probe centroid
 from its stance-onset position. These points are probes, not collision geoms.
