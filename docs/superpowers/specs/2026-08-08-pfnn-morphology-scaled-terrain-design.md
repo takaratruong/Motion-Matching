@@ -27,6 +27,20 @@ meters conversion.  Scaling occurs about the same world origin used by GMR.
 The G1 motion, terrain fit parameters, contacts, timeline, and thresholds are
 unchanged.
 
+## Vertical Placement
+
+The first scaled comparison measures a median authored-stance gap of
+`0.05224985936713168` m, meaning the uniformly scaled terrain is that far below
+the G1 soles.  World height origin is arbitrary, so the approval placement adds
+this one constant to every terrain height after uniform scaling:
+
+```
+h_placed(x, y) = h_g1(x, y) + 0.05224985936713168
+```
+
+The value is derived once from the median of all 80 PFNN-authored stance probes
+and is recorded in the comparison and viewer.  It is not recomputed per frame.
+
 ## Provenance and Scope
 
 Comparison reports and the viewer record the exact scale.  The original PFNN
@@ -36,7 +50,7 @@ motion and USD terrain are already paired for G1 in meters.
 
 This design supersedes the unexecuted root-trajectory correction experiment in
 `2026-08-08-pfnn-root-trajectory-correction-design.md`.  No root correction,
-vertical anchoring, IK, foot locking, or terrain deformation is performed.
+IK, foot locking, or terrain deformation is performed.
 
 ## Acceptance
 
