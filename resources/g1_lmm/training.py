@@ -12,8 +12,16 @@ from pathlib import Path
 from typing import Iterable, NamedTuple, Sequence
 
 import numpy as np
+
+_DETERMINISTIC_CUBLAS_WORKSPACE = ":4096:8"
+if "CUBLAS_WORKSPACE_CONFIG" not in os.environ:
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = _DETERMINISTIC_CUBLAS_WORKSPACE
+
 import torch
 from torch import nn
+
+_CUDA_INITIALIZED_AT_IMPORT = torch.cuda.is_initialized()
+_CUDA_DETERMINISM_CONFIGURED = False
 
 from resources import quat
 
@@ -77,8 +85,8 @@ class TrainingConfig:
             raise ValueError("withheld_halo must be non-negative")
         if not np.isfinite(self.learning_rate) or self.learning_rate <= 0.0:
             raise ValueError("learning_rate must be positive and finite")
-        if not np.isfinite(self.dt) or self.dt <= 0.0:
-            raise ValueError("dt must be positive and finite")
+        if not np.isfinite(self.dt) or self.dt != 1.0 / 60.0:
+            raise ValueError("dt must be exactly 1/60 for the 60 Hz model ABI")
 
 
 def deterministic_withheld_ranges(
@@ -302,11 +310,35 @@ def normalized_projector_targets(
 
 
 def _configure_determinism(seed: int, device: torch.device) -> None:
+    global _CUDA_DETERMINISM_CONFIGURED
     if seed < 0:
         raise ValueError("seed must be non-negative")
+    if device.type not in {"cpu", "cuda"}:
+        raise ValueError(f"unsupported deterministic training device: {device}")
+    if device.type == "cuda":
+        if os.environ.get("CUBLAS_WORKSPACE_CONFIG") != _DETERMINISTIC_CUBLAS_WORKSPACE:
+            raise RuntimeError(
+                "CUDA training requires CUBLAS_WORKSPACE_CONFIG=:4096:8 before CUDA initialization"
+            )
+        if not _CUDA_DETERMINISM_CONFIGURED and (
+            _CUDA_INITIALIZED_AT_IMPORT or torch.cuda.is_initialized()
+        ):
+            raise RuntimeError(
+                "CUDA was initialized before fail-closed deterministic training configuration"
+            )
+        torch.use_deterministic_algorithms(True)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        if not torch.cuda.is_available():
+            raise RuntimeError("requested CUDA training device is unavailable")
+        if device.index is not None and device.index >= torch.cuda.device_count():
+            raise RuntimeError(f"requested CUDA training device is unavailable: {device}")
+        _CUDA_DETERMINISM_CONFIGURED = True
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
+    if device.type == "cuda":
         torch.cuda.manual_seed_all(seed)
     torch.use_deterministic_algorithms(True)
     if device.type == "cpu":
@@ -329,31 +361,46 @@ class AutoencoderNormalization:
 def _legacy_autoencoder_normalization(
     bundle: TrainingBundle,
     arrays: TrainingArrays,
+    fitted_rows: np.ndarray,
 ) -> AutoencoderNormalization:
+    fitted = np.asarray(fitted_rows)
+    if fitted.dtype != np.bool_ or fitted.shape != (bundle.frames,):
+        raise ValueError("autoencoder fitted rows must be an explicit frame mask")
+    if not np.any(fitted) or np.any(fitted & ~bundle.admitted_mask):
+        raise ValueError("autoencoder fitted rows must be non-empty admitted rows")
     dimensions = bundle.dimensions
     non_root = dimensions.bones - 1
-    compressor_mean = arrays.compressor_input.mean(axis=0, dtype=np.float64).astype(np.float32)
-    group_scales = (
-        (arrays.local_positions[:, 1:], non_root * 3),
-        (arrays.local_rotation_xy[:, 1:], non_root * 6),
-        (arrays.local_velocities[:, 1:], non_root * 3),
-        (arrays.local_angular_velocities[:, 1:], non_root * 3),
-        (arrays.character_positions[:, 1:], non_root * 3),
-        (arrays.character_rotation_xy[:, 1:], non_root * 6),
-        (arrays.character_velocities[:, 1:], non_root * 3),
-        (arrays.character_angular_velocities[:, 1:], non_root * 3),
-        (arrays.root_velocity, 3),
-        (arrays.root_angular_velocity, 3),
-        (bundle.contacts.astype(np.float32), dimensions.contacts),
+    compressor_rows = arrays.compressor_input[fitted]
+    target_rows = arrays.decompressor_target[fitted]
+    compressor_mean = compressor_rows.mean(axis=0, dtype=np.float64).astype(np.float32)
+    widths = (
+        non_root * 3,
+        non_root * 6,
+        non_root * 3,
+        non_root * 3,
+        non_root * 3,
+        non_root * 6,
+        non_root * 3,
+        non_root * 3,
+        3,
+        3,
+        dimensions.contacts,
     )
-    compressor_std = np.concatenate(
-        [
-            np.full(width, max(float(values.std(dtype=np.float64)), 1.0e-5), dtype=np.float32)
-            for values, width in group_scales
-        ]
-    )
-    decompressor_mean = arrays.decompressor_target.mean(axis=0, dtype=np.float64).astype(np.float32)
-    decompressor_std = _safe_std(arrays.decompressor_target, axis=0)
+    compressor_std_parts = []
+    first = 0
+    for width in widths:
+        group = compressor_rows[:, first : first + width]
+        compressor_std_parts.append(
+            np.full(
+                width,
+                max(float(group.std(dtype=np.float64)), 1.0e-5),
+                dtype=np.float32,
+            )
+        )
+        first += width
+    compressor_std = np.concatenate(compressor_std_parts)
+    decompressor_mean = target_rows.mean(axis=0, dtype=np.float64).astype(np.float32)
+    decompressor_std = _safe_std(target_rows, axis=0)
     if compressor_mean.shape != (dimensions.compressor_input,) or compressor_std.shape != (
         dimensions.compressor_input,
     ):
@@ -381,7 +428,10 @@ def _train_64_frame_overfit(
     start, stop = _first_adjacent_block(bundle, 64)
     device = torch.device(config.device)
     _configure_determinism(config.seed, device)
-    normalization = _legacy_autoencoder_normalization(bundle, arrays)
+    fitted = np.zeros(bundle.frames, dtype=bool)
+    fitted[start:stop] = True
+    fitted &= bundle.admitted_mask
+    normalization = _legacy_autoencoder_normalization(bundle, arrays, fitted)
     compressor_input = torch.as_tensor(
         (arrays.compressor_input[start:stop] - normalization.compressor_mean)
         / normalization.compressor_std,
@@ -579,7 +629,6 @@ def _train_decompressor_stage(
 ) -> AutoencoderStage:
     device = torch.device(config.device)
     _configure_determinism(config.seed + 1, device)
-    normalization = _legacy_autoencoder_normalization(bundle, arrays)
     windows = range_safe_windows(
         bundle.range_starts,
         bundle.range_stops,
@@ -590,6 +639,12 @@ def _train_decompressor_stage(
     )
     if len(windows) == 0:
         raise ValueError("no fitted decompressor windows remain after withheld halo")
+    fitted_mask = np.zeros(bundle.frames, dtype=bool)
+    fitted_mask[np.unique(windows.reshape(-1))] = True
+    fitted_mask &= bundle.admitted_mask
+    normalization = _legacy_autoencoder_normalization(
+        bundle, arrays, fitted_mask
+    )
     compressor_rows = torch.as_tensor(
         (arrays.compressor_input - normalization.compressor_mean) / normalization.compressor_std,
         device=device,
@@ -665,13 +720,6 @@ def _train_decompressor_stage(
     withheld_mask = np.zeros(bundle.frames, dtype=bool)
     for start, stop in zip(withheld_starts, withheld_stops):
         withheld_mask[int(start) : int(stop)] = True
-    fitted_mask = np.ones(bundle.frames, dtype=bool)
-    for start, stop in zip(withheld_starts, withheld_stops):
-        fitted_mask[
-            max(0, int(start) - config.withheld_halo) : min(
-                bundle.frames, int(stop) + config.withheld_halo
-            )
-        ] = False
     fitted_metrics = _decode_reconstruction_metrics(
         bundle,
         arrays,
@@ -927,6 +975,8 @@ def _train_stepper_stage(
     if len(pair_windows) == 0 or len(windows) == 0:
         raise ValueError("no fitted stepper windows remain after withheld halo")
     fitted_rows = np.unique(windows.reshape(-1))
+    if not np.all(bundle.admitted_mask[fitted_rows]):
+        raise AssertionError("stepper windows include a non-admitted row")
     features_fitted = bundle.features[fitted_rows]
     latent_fitted = autoencoder.latent[fitted_rows]
     input_mean = np.concatenate(
@@ -1080,7 +1130,7 @@ def _train_projector_stage(
 ) -> ProjectorStage:
     device = torch.device(config.device)
     _configure_determinism(config.seed + 3, device)
-    fitted = np.ones(bundle.frames, dtype=bool)
+    fitted = bundle.admitted_mask.copy()
     for start, stop in zip(withheld_starts, withheld_stops):
         fitted[
             max(0, int(start) - config.withheld_halo) : min(
@@ -1238,6 +1288,65 @@ def _publish_directory(staging: Path, output: Path) -> None:
     os.replace(staging, output)
 
 
+def _sanitize_for_json(value: object) -> object:
+    if isinstance(value, dict):
+        return {str(key): _sanitize_for_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_for_json(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return _sanitize_for_json(value.tolist())
+    if isinstance(value, np.generic):
+        return _sanitize_for_json(value.item())
+    if isinstance(value, float):
+        return value if np.isfinite(value) else None
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+def _publish_rejected_receipts(
+    staging: Path,
+    output: Path,
+    receipt: dict[str, object],
+    evaluation: dict[str, object],
+    *,
+    stopped_after: str,
+    diagnostics: dict[str, object] | None = None,
+) -> None:
+    for name in (
+        "latent.bin",
+        "decompressor.bin",
+        "stepper.bin",
+        "projector.bin",
+        "manifest.json",
+    ):
+        path = staging / name
+        if path.exists():
+            path.unlink()
+    receipt.update(
+        {
+            "accepted": False,
+            "artifacts": {},
+            "status": "rejected",
+            "stopped_after": stopped_after,
+        }
+    )
+    evaluation.update(
+        {
+            "accepted": False,
+            "artifacts": {},
+            "status": "rejected",
+            "stopped_after": stopped_after,
+        }
+    )
+    if diagnostics is not None:
+        receipt["diagnostics"] = diagnostics
+        evaluation["diagnostics"] = diagnostics
+    _atomic_write(staging / "training.json", _json_bytes(receipt))
+    _atomic_write(staging / "evaluation.json", _json_bytes(evaluation))
+    _publish_directory(staging, output)
+
+
 def train_flat_bundle(
     data_directory: str | Path,
     output_directory: str | Path,
@@ -1256,175 +1365,209 @@ def train_flat_bundle(
     bundle = load_training_bundle(data_directory)
     arrays = build_training_arrays(bundle)
     staging = Path(tempfile.mkdtemp(prefix=f".{output.name}.staging-", dir=output.parent))
-    overfit_gate = _train_64_frame_overfit(bundle, arrays, config)
     receipt = {
-        "accepted": bool(overfit_gate["accepted"]),
+        "accepted": False,
         "config": _config_receipt(config),
         "data_manifest_sha256": bundle.manifest_sha256,
-        "overfit_gate": overfit_gate,
         "schema": "g1-lmm-training-v1",
         "stage": stage,
     }
     evaluation = {
-        "accepted": receipt["accepted"],
-        "overfit_gate": overfit_gate,
+        "accepted": False,
         "schema": "g1-lmm-evaluation-v1",
     }
-    _atomic_write(staging / "training.json", _json_bytes(receipt))
-    _atomic_write(staging / "evaluation.json", _json_bytes(evaluation))
-    if not overfit_gate["accepted"]:
-        _publish_directory(staging, output)
-        raise RuntimeError("64-frame overfit gate failed; later stages were not started")
-    if stage == "overfit":
-        _publish_directory(staging, output)
-        return receipt
-    range_lengths = bundle.range_stops.astype(np.int64) - bundle.range_starts.astype(np.int64)
-    eligible = np.flatnonzero(
-        range_lengths >= config.withheld_frames + 2 * config.withheld_halo
-    )
-    if len(eligible) == 0:
-        raise ValueError("no continuity-safe range can hold the withheld block and halo")
-    longest = int(eligible[np.argmax(range_lengths[eligible])])
-    withheld_starts, withheld_stops = deterministic_withheld_ranges(
-        bundle.range_starts[longest : longest + 1],
-        bundle.range_stops[longest : longest + 1],
-        frames=config.withheld_frames,
-        seed=config.seed,
-        margin=config.withheld_halo,
-    )
-    receipt["withheld"] = {
-        "halo": config.withheld_halo,
-        "ranges": [
-            [int(start), int(stop)] for start, stop in zip(withheld_starts, withheld_stops)
-        ],
-    }
-    autoencoder = _train_decompressor_stage(
-        staging,
-        bundle,
-        arrays,
-        config,
-        withheld_starts,
-        withheld_stops,
-    )
-    receipt["decompressor_training"] = autoencoder.training_metrics
-    receipt["decompressor_gate"] = autoencoder.gate
-    evaluation["decompressor_gate"] = autoencoder.gate
-    if not autoencoder.gate["accepted"]:
-        receipt["accepted"] = False
-        receipt["stopped_after"] = "decompressor"
-        evaluation["accepted"] = False
-        evaluation["stopped_after"] = "decompressor"
-        _atomic_write(staging / "training.json", _json_bytes(receipt))
-        _atomic_write(staging / "evaluation.json", _json_bytes(evaluation))
-        _publish_directory(staging, output)
-        raise TrainingGateError("decompressor", output)
-    if stage == "decompressor":
-        receipt["accepted"] = True
-        receipt["stopped_after"] = "decompressor"
-        evaluation["accepted"] = True
-        evaluation["stopped_after"] = "decompressor"
-        _atomic_write(staging / "training.json", _json_bytes(receipt))
-        _atomic_write(staging / "evaluation.json", _json_bytes(evaluation))
-        _publish_directory(staging, output)
-        return receipt
-    stepper = _train_stepper_stage(
-        staging,
-        bundle,
-        arrays,
-        autoencoder,
-        config,
-        withheld_starts,
-        withheld_stops,
-    )
-    receipt["stepper_training"] = stepper.training_metrics
-    receipt["stepper_gate"] = stepper.gate
-    evaluation["stepper_gate"] = stepper.gate
-    if not stepper.gate["accepted"]:
-        receipt["accepted"] = False
-        receipt["stopped_after"] = "stepper"
-        evaluation["accepted"] = False
-        evaluation["stopped_after"] = "stepper"
-        _atomic_write(staging / "training.json", _json_bytes(receipt))
-        _atomic_write(staging / "evaluation.json", _json_bytes(evaluation))
-        _publish_directory(staging, output)
-        raise TrainingGateError("stepper", output)
-    if stage == "stepper":
-        receipt["accepted"] = True
-        receipt["stopped_after"] = "stepper"
-        evaluation["accepted"] = True
-        evaluation["stopped_after"] = "stepper"
-        _atomic_write(staging / "training.json", _json_bytes(receipt))
-        _atomic_write(staging / "evaluation.json", _json_bytes(evaluation))
-        _publish_directory(staging, output)
-        return receipt
+    current_stage = "overfit"
+    try:
+        overfit_gate = _train_64_frame_overfit(bundle, arrays, config)
+        receipt["overfit_gate"] = overfit_gate
+        evaluation["overfit_gate"] = overfit_gate
+        if not overfit_gate["accepted"]:
+            _publish_rejected_receipts(
+                staging, output, receipt, evaluation, stopped_after="overfit"
+            )
+            raise TrainingGateError("overfit", output)
+        if stage == "overfit":
+            _publish_rejected_receipts(
+                staging,
+                output,
+                receipt,
+                evaluation,
+                stopped_after="overfit",
+                diagnostics={"reason": "requested partial stage completed"},
+            )
+            return receipt
 
-    projector = _train_projector_stage(
-        staging,
-        bundle,
-        autoencoder,
-        config,
-        withheld_starts,
-        withheld_stops,
-    )
-    receipt["projector_training"] = projector.training_metrics
-    receipt["projector_gate"] = projector.gate
-    evaluation["projector_gate"] = projector.gate
-    if not projector.gate["accepted"]:
-        receipt["accepted"] = False
-        receipt["stopped_after"] = "projector"
-        evaluation["accepted"] = False
-        evaluation["stopped_after"] = "projector"
-        _atomic_write(staging / "training.json", _json_bytes(receipt))
-        _atomic_write(staging / "evaluation.json", _json_bytes(evaluation))
-        _publish_directory(staging, output)
-        raise TrainingGateError("projector", output)
-
-    reload_metrics = evaluate_exported_networks(staging)
-    receipt["accepted"] = True
-    receipt["reload_metrics"] = reload_metrics
-    receipt["stopped_after"] = "projector"
-    evaluation["accepted"] = True
-    evaluation["reload_metrics"] = reload_metrics
-    evaluation["stopped_after"] = "projector"
-    _atomic_write(staging / "training.json", _json_bytes(receipt))
-    _atomic_write(staging / "evaluation.json", _json_bytes(evaluation))
-    artifact_names = (
-        "latent.bin",
-        "decompressor.bin",
-        "stepper.bin",
-        "projector.bin",
-        "training.json",
-        "evaluation.json",
-    )
-    artifacts = {
-        name: {
-            "path": name,
-            "size_bytes": (staging / name).stat().st_size,
-            "sha256": _sha256(staging / name),
+        current_stage = "decompressor"
+        range_lengths = (
+            bundle.range_stops.astype(np.int64) - bundle.range_starts.astype(np.int64)
+        )
+        eligible = np.flatnonzero(
+            range_lengths >= config.withheld_frames + 2 * config.withheld_halo
+        )
+        if len(eligible) == 0:
+            raise ValueError("no continuity-safe range can hold the withheld block and halo")
+        longest = int(eligible[np.argmax(range_lengths[eligible])])
+        withheld_starts, withheld_stops = deterministic_withheld_ranges(
+            bundle.range_starts[longest : longest + 1],
+            bundle.range_stops[longest : longest + 1],
+            frames=config.withheld_frames,
+            seed=config.seed,
+            margin=config.withheld_halo,
+        )
+        receipt["withheld"] = {
+            "halo": config.withheld_halo,
+            "ranges": [
+                [int(start), int(stop)]
+                for start, stop in zip(withheld_starts, withheld_stops)
+            ],
         }
-        for name in artifact_names
-    }
-    manifest = {
-        "artifacts": artifacts,
-        "data_artifacts": {
-            name: descriptor["sha256"]
-            for name, descriptor in bundle.manifest["artifacts"].items()
-        },
-        "data_manifest_schema": bundle.manifest["schema"],
-        "data_manifest_sha256": bundle.manifest_sha256,
-        "dimensions": {
-            "bones": bundle.dimensions.bones,
-            "contacts": bundle.dimensions.contacts,
-            "features": bundle.dimensions.features,
-            "latent": bundle.dimensions.latent,
-        },
-        "output_fps": 60.0,
-        "schema": "g1-lmm-model/v1",
-        "status": "accepted",
-    }
-    _atomic_write(staging / "manifest.json", _json_bytes(manifest))
-    _publish_directory(staging, output)
-    return receipt
+        autoencoder = _train_decompressor_stage(
+            staging,
+            bundle,
+            arrays,
+            config,
+            withheld_starts,
+            withheld_stops,
+        )
+        receipt["decompressor_training"] = autoencoder.training_metrics
+        receipt["decompressor_gate"] = autoencoder.gate
+        evaluation["decompressor_gate"] = autoencoder.gate
+        if not autoencoder.gate["accepted"]:
+            _publish_rejected_receipts(
+                staging, output, receipt, evaluation, stopped_after="decompressor"
+            )
+            raise TrainingGateError("decompressor", output)
+        if stage == "decompressor":
+            _publish_rejected_receipts(
+                staging,
+                output,
+                receipt,
+                evaluation,
+                stopped_after="decompressor",
+                diagnostics={"reason": "requested partial stage completed"},
+            )
+            return receipt
+
+        current_stage = "stepper"
+        stepper = _train_stepper_stage(
+            staging,
+            bundle,
+            arrays,
+            autoencoder,
+            config,
+            withheld_starts,
+            withheld_stops,
+        )
+        receipt["stepper_training"] = stepper.training_metrics
+        receipt["stepper_gate"] = stepper.gate
+        evaluation["stepper_gate"] = stepper.gate
+        if not stepper.gate["accepted"]:
+            _publish_rejected_receipts(
+                staging, output, receipt, evaluation, stopped_after="stepper"
+            )
+            raise TrainingGateError("stepper", output)
+        if stage == "stepper":
+            _publish_rejected_receipts(
+                staging,
+                output,
+                receipt,
+                evaluation,
+                stopped_after="stepper",
+                diagnostics={"reason": "requested partial stage completed"},
+            )
+            return receipt
+
+        current_stage = "projector"
+        projector = _train_projector_stage(
+            staging,
+            bundle,
+            autoencoder,
+            config,
+            withheld_starts,
+            withheld_stops,
+        )
+        receipt["projector_training"] = projector.training_metrics
+        receipt["projector_gate"] = projector.gate
+        evaluation["projector_gate"] = projector.gate
+        if not projector.gate["accepted"]:
+            _publish_rejected_receipts(
+                staging, output, receipt, evaluation, stopped_after="projector"
+            )
+            raise TrainingGateError("projector", output)
+
+        current_stage = "reload"
+        reload_metrics = evaluate_exported_networks(staging)
+        receipt.update(
+            {
+                "accepted": True,
+                "reload_metrics": reload_metrics,
+                "status": "accepted",
+                "stopped_after": "projector",
+            }
+        )
+        evaluation.update(
+            {
+                "accepted": True,
+                "reload_metrics": reload_metrics,
+                "status": "accepted",
+                "stopped_after": "projector",
+            }
+        )
+        _atomic_write(staging / "training.json", _json_bytes(receipt))
+        _atomic_write(staging / "evaluation.json", _json_bytes(evaluation))
+        artifact_names = (
+            "latent.bin",
+            "decompressor.bin",
+            "stepper.bin",
+            "projector.bin",
+            "training.json",
+            "evaluation.json",
+        )
+        artifacts = {
+            name: {
+                "path": name,
+                "size_bytes": (staging / name).stat().st_size,
+                "sha256": _sha256(staging / name),
+            }
+            for name in artifact_names
+        }
+        manifest = {
+            "artifacts": artifacts,
+            "data_artifacts": {
+                name: descriptor["sha256"]
+                for name, descriptor in bundle.manifest["artifacts"].items()
+            },
+            "data_manifest_schema": bundle.manifest["schema"],
+            "data_manifest_sha256": bundle.manifest_sha256,
+            "dimensions": {
+                "bones": bundle.dimensions.bones,
+                "contacts": bundle.dimensions.contacts,
+                "features": bundle.dimensions.features,
+                "latent": bundle.dimensions.latent,
+            },
+            "output_fps": 60.0,
+            "schema": "g1-lmm-model/v1",
+            "status": "accepted",
+        }
+        _atomic_write(staging / "manifest.json", _json_bytes(manifest))
+        _publish_directory(staging, output)
+        return receipt
+    except TrainingGateError:
+        raise
+    except Exception as error:
+        if staging.exists() and not output.exists():
+            _publish_rejected_receipts(
+                staging,
+                output,
+                receipt,
+                evaluation,
+                stopped_after=current_stage,
+                diagnostics={
+                    "error_type": type(error).__name__,
+                    "message": str(error),
+                },
+            )
+        raise TrainingGateError(current_stage, output) from error
 
 
 def _synthetic_fixture(seed: int, dimensions: G1LmmDimensions) -> tuple[np.ndarray, ...]:
@@ -1450,7 +1593,8 @@ def _sha256(path: Path) -> str:
 
 
 def _json_bytes(value: object) -> bytes:
-    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode("utf-8")
+    sanitized = _sanitize_for_json(value)
+    return (json.dumps(sanitized, sort_keys=True, indent=2, allow_nan=False) + "\n").encode("utf-8")
 
 
 def _latent_bytes(latent: np.ndarray) -> bytes:
@@ -1496,13 +1640,11 @@ def train_tiny_fixture(
     seed: int = 1234,
     device: str = "cpu",
 ) -> dict[str, object]:
-    """Train and export a deterministic 64-frame CPU contract fixture."""
+    """Train and export a deterministic 64-frame CPU or CUDA contract fixture."""
 
     root = Path(output_directory)
     root.mkdir(parents=True, exist_ok=False)
     torch_device = torch.device(device)
-    if torch_device.type != "cpu":
-        raise ValueError("the tiny contract fixture is intentionally CPU-only")
     _configure_determinism(seed, torch_device)
     dimensions = G1LmmDimensions()
     features, compressor_rows, target = _synthetic_fixture(seed, dimensions)
@@ -1587,7 +1729,15 @@ def train_tiny_fixture(
         "steps": 24,
     }
     training_receipt = {
-        "device": "cpu",
+        "determinism": {
+            "cublas_workspace_config": (
+                os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+                if torch_device.type == "cuda"
+                else None
+            ),
+            "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+        },
+        "device": str(torch_device),
         "dimensions": {
             "bones": dimensions.bones,
             "contacts": dimensions.contacts,

@@ -1,9 +1,14 @@
 import hashlib
 import json
+import os
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
@@ -19,6 +24,7 @@ from resources.g1_lmm.models import Compressor, Decompressor, Projector, Stepper
 from resources.g1_lmm.training import (
     TrainingConfig,
     TrainingGateError,
+    _legacy_autoencoder_normalization,
     deterministic_withheld_ranges,
     evaluate_exported_networks,
     export_network,
@@ -43,7 +49,10 @@ def _array1_bytes(values, dtype):
 def _write_flat_training_bundle(
     path: Path,
     *,
+    gap_after_first_range: bool = False,
     local_rotation_step_rad: float = 0.0,
+    motion_class: str = "flat-walk",
+    terrain_class: str = "flat",
 ) -> dict:
     path.mkdir()
     frames = 3853
@@ -63,6 +72,8 @@ def _write_flat_training_bundle(
     range_lengths = np.array([747] + [259] * 10 + [258] * 2, dtype=np.int32)
     range_stops = np.cumsum(range_lengths, dtype=np.int32)
     range_starts = np.concatenate((np.array([0], np.int32), range_stops[:-1]))
+    if gap_after_first_range:
+        range_starts[1] += 1
     contacts = np.stack(
         ((np.arange(frames) // 5) % 2, (np.arange(frames) // 5 + 1) % 2), axis=1
     ).astype(np.uint8)
@@ -100,6 +111,18 @@ def _write_flat_training_bundle(
         }
         for name in ("database.bin", "features.bin")
     }
+    left_source_index = np.arange(frames, dtype=np.int32)
+    right_source_index = left_source_index.copy()
+    source_alpha = np.zeros(frames, dtype=np.float32)
+    source_map_digest = hashlib.sha256(
+        b"".join(
+            (
+                left_source_index.astype("<i4", copy=False).tobytes(order="C"),
+                right_source_index.astype("<i4", copy=False).tobytes(order="C"),
+                source_alpha.astype("<f4", copy=False).tobytes(order="C"),
+            )
+        )
+    ).hexdigest()
     manifest = {
         "schema": "g1-lmm-flat-data/v2",
         "status": "accepted",
@@ -108,6 +131,8 @@ def _write_flat_training_bundle(
         "feature_dimensions": 31,
         "database_frames": frames,
         "total_clips": 1,
+        "source_count": 1,
+        "range_count": 13,
         "dimensions": {"bones": 31, "features": 31, "contacts": 2},
         "ranges": [
             {
@@ -115,8 +140,8 @@ def _write_flat_training_bundle(
                 "stop": int(stop),
                 "source_first_frame": int(start),
                 "source_last_frame": int(stop - 1),
-                "motion_class": "flat-walk",
-                "terrain_class": "flat",
+                "motion_class": motion_class,
+                "terrain_class": terrain_class,
             }
             for start, stop in zip(range_starts, range_stops)
         ],
@@ -142,7 +167,17 @@ def _write_flat_training_bundle(
                     dtype="<i4",
                 ).tobytes(order="C")
             ).hexdigest(),
+            "source_map_digest_sha256": source_map_digest,
         },
+        "sources": [
+            {
+                "name": "synthetic-flat-walk",
+                "output_frames": frames,
+                "left_source_index": left_source_index.tolist(),
+                "right_source_index": right_source_index.tolist(),
+                "source_alpha": source_alpha.tolist(),
+            }
+        ],
         "artifacts": artifacts,
     }
     (path / "manifest.json").write_text(
@@ -152,6 +187,166 @@ def _write_flat_training_bundle(
 
 
 class G1LmmTrainingTest(unittest.TestCase):
+    def test_autoencoder_normalization_uses_only_explicit_fitted_admitted_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_directory = Path(directory) / "data"
+            _write_flat_training_bundle(data_directory)
+            bundle = load_training_bundle(data_directory)
+            arrays = build_training_arrays(bundle)
+            fitted = bundle.admitted_mask.copy()
+            fitted[100:224] = False
+
+            baseline = _legacy_autoencoder_normalization(bundle, arrays, fitted)
+            compressor = arrays.compressor_input.copy()
+            target = arrays.decompressor_target.copy()
+            compressor[~fitted] += np.float32(10_000.0)
+            target[~fitted] -= np.float32(10_000.0)
+            changed = _legacy_autoencoder_normalization(
+                bundle,
+                replace(
+                    arrays,
+                    compressor_input=compressor,
+                    decompressor_target=target,
+                ),
+                fitted,
+            )
+
+            for field in (
+                "compressor_mean",
+                "compressor_std",
+                "decompressor_mean",
+                "decompressor_std",
+            ):
+                np.testing.assert_array_equal(
+                    getattr(baseline, field), getattr(changed, field)
+                )
+
+    def test_training_loop_exception_publishes_rejected_diagnostics_atomically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_directory = root / "data"
+            output_directory = root / "rejected"
+            _write_flat_training_bundle(data_directory)
+            accepted_overfit = {
+                "accepted": True,
+                "final_loss": 0.01,
+                "frames": 64,
+                "initial_loss": 1.0,
+                "range": [0, 64],
+                "steps": 1,
+            }
+            with (
+                mock.patch(
+                    "resources.g1_lmm.training._train_64_frame_overfit",
+                    return_value=accepted_overfit,
+                ),
+                mock.patch(
+                    "resources.g1_lmm.training._train_decompressor_stage",
+                    side_effect=FloatingPointError("nonfinite loss"),
+                ),
+            ):
+                with self.assertRaisesRegex(TrainingGateError, "decompressor"):
+                    train_flat_bundle(
+                        data_directory,
+                        output_directory,
+                        config=TrainingConfig(
+                            device="cpu",
+                            overfit_steps=1,
+                            decompressor_steps=1,
+                            stepper_steps=1,
+                            projector_steps=1,
+                        ),
+                        stage="all",
+                    )
+            self.assertEqual(
+                {path.name for path in output_directory.iterdir()},
+                {"training.json", "evaluation.json"},
+            )
+            receipt = json.loads(
+                (output_directory / "training.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(receipt["status"], "rejected")
+            self.assertEqual(receipt["stopped_after"], "decompressor")
+            self.assertEqual(receipt["diagnostics"]["error_type"], "FloatingPointError")
+            self.assertEqual(receipt["diagnostics"]["message"], "nonfinite loss")
+
+    def test_nonfinite_gate_atomically_publishes_sanitized_rejected_receipts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_directory = root / "data"
+            output_directory = root / "rejected"
+            _write_flat_training_bundle(data_directory)
+            nonfinite_gate = {
+                "accepted": False,
+                "final_loss": float("nan"),
+                "frames": 64,
+                "initial_loss": float("inf"),
+                "range": [0, 64],
+                "steps": 1,
+            }
+            with mock.patch(
+                "resources.g1_lmm.training._train_64_frame_overfit",
+                return_value=nonfinite_gate,
+            ):
+                with self.assertRaisesRegex(TrainingGateError, "overfit"):
+                    train_flat_bundle(
+                        data_directory,
+                        output_directory,
+                        config=TrainingConfig(
+                            device="cpu",
+                            overfit_steps=1,
+                            decompressor_steps=1,
+                            stepper_steps=1,
+                            projector_steps=1,
+                        ),
+                        stage="all",
+                    )
+            self.assertEqual(
+                {path.name for path in output_directory.iterdir()},
+                {"training.json", "evaluation.json"},
+            )
+            raw = (output_directory / "training.json").read_text(encoding="utf-8")
+            self.assertNotIn("NaN", raw)
+            self.assertNotIn("Infinity", raw)
+            receipt = json.loads(raw)
+            self.assertEqual(receipt["status"], "rejected")
+            self.assertFalse(receipt["accepted"])
+            self.assertIsNone(receipt["overfit_gate"]["final_loss"])
+            self.assertIsNone(receipt["overfit_gate"]["initial_loss"])
+
+    def test_training_config_rejects_any_dt_other_than_exact_60hz(self):
+        self.assertEqual(TrainingConfig().dt, 1.0 / 60.0)
+        with self.assertRaisesRegex(ValueError, "exactly 1/60"):
+            TrainingConfig(dt=1.0 / 30.0)
+        with self.assertRaisesRegex(ValueError, "exactly 1/60"):
+            TrainingConfig(dt=np.nextafter(1.0 / 60.0, 1.0))
+
+    def test_loader_requires_exact_flat_walking_labels_for_every_range(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wrong_motion = root / "wrong-motion"
+            _write_flat_training_bundle(
+                wrong_motion, motion_class="idle"
+            )
+            with self.assertRaisesRegex(ValueError, "flat-walk"):
+                load_training_bundle(wrong_motion)
+
+            wrong_terrain = root / "wrong-terrain"
+            _write_flat_training_bundle(
+                wrong_terrain, terrain_class="slope"
+            )
+            with self.assertRaisesRegex(ValueError, "terrain.*flat"):
+                load_training_bundle(wrong_terrain)
+
+    def test_loader_rejects_a_gap_in_the_admitted_range_partition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_directory = Path(directory) / "gapped"
+            _write_flat_training_bundle(
+                data_directory, gap_after_first_range=True
+            )
+            with self.assertRaisesRegex(ValueError, "contiguous partition"):
+                load_training_bundle(data_directory)
+
     def test_loader_requires_v2_continuity_receipt_and_recomputes_local_steps(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -180,6 +375,16 @@ class G1LmmTrainingTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "recomputed"):
                 load_training_bundle(mismatch)
 
+            source_map_mismatch = root / "source-map-mismatch"
+            manifest = _write_flat_training_bundle(source_map_mismatch)
+            manifest["continuity"]["source_map_digest_sha256"] = "0" * 64
+            (source_map_mismatch / "manifest.json").write_text(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "source-map digest"):
+                load_training_bundle(source_map_mismatch)
+
     def test_all_stage_stops_after_failed_decompressor_gate_without_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -204,13 +409,14 @@ class G1LmmTrainingTest(unittest.TestCase):
                     config=config,
                     stage="all",
                 )
-            self.assertTrue((output_directory / "latent.bin").is_file())
-            self.assertTrue((output_directory / "decompressor.bin").is_file())
-            self.assertFalse((output_directory / "stepper.bin").exists())
-            self.assertFalse((output_directory / "projector.bin").exists())
-            self.assertFalse((output_directory / "manifest.json").exists())
+            self.assertEqual(
+                {path.name for path in output_directory.iterdir()},
+                {"training.json", "evaluation.json"},
+            )
             training = json.loads((output_directory / "training.json").read_text(encoding="utf-8"))
             self.assertFalse(training["accepted"])
+            self.assertEqual(training["status"], "rejected")
+            self.assertEqual(training["artifacts"], {})
             self.assertEqual(training["stopped_after"], "decompressor")
 
     def test_real_bundle_overfit_stage_gates_64_adjacent_rows_before_publication(self):
@@ -233,7 +439,9 @@ class G1LmmTrainingTest(unittest.TestCase):
                 ),
                 stage="overfit",
             )
-            self.assertTrue(receipt["accepted"])
+            self.assertFalse(receipt["accepted"])
+            self.assertEqual(receipt["status"], "rejected")
+            self.assertTrue(receipt["overfit_gate"]["accepted"])
             self.assertEqual(receipt["overfit_gate"]["frames"], 64)
             self.assertEqual(receipt["overfit_gate"]["range"], [0, 64])
             self.assertLess(
@@ -242,7 +450,10 @@ class G1LmmTrainingTest(unittest.TestCase):
             )
             self.assertTrue((output_directory / "training.json").is_file())
             self.assertTrue((output_directory / "evaluation.json").is_file())
-            self.assertFalse((output_directory / "manifest.json").exists())
+            self.assertEqual(
+                {path.name for path in output_directory.iterdir()},
+                {"training.json", "evaluation.json"},
+            )
 
     def test_cli_exposes_device_stage_seed_and_configurable_budgets(self):
         arguments = build_parser().parse_args(
@@ -313,6 +524,8 @@ class G1LmmTrainingTest(unittest.TestCase):
 
             self.assertEqual(bundle.dimensions, G1LmmDimensions())
             self.assertEqual(bundle.frames, 3853)
+            self.assertEqual(int(bundle.admitted_mask.sum()), 3853)
+            self.assertFalse(bundle.admitted_mask.flags.writeable)
             self.assertEqual(arrays.compressor_input.shape, (3853, 908))
             self.assertEqual(arrays.decompressor_target.shape, (3853, 458))
             np.testing.assert_array_equal(arrays.compressor_input[:, :90], bundle.positions[:, 1:].reshape(3853, -1))
@@ -477,6 +690,74 @@ class G1LmmTrainingTest(unittest.TestCase):
                     manifest["artifacts"][name]["sha256"],
                     hashlib.sha256((root / "first" / name).read_bytes()).hexdigest(),
                 )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_isolated_cuda_synthetic_exports_are_bitwise_identical(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = """
+import json
+import sys
+from pathlib import Path
+from resources.g1_lmm.training import train_tiny_fixture
+result = train_tiny_fixture(Path(sys.argv[1]), seed=1234, device='cuda:0')
+print(json.dumps(result, sort_keys=True))
+"""
+            results = []
+            for name in ("first", "second"):
+                environment = os.environ.copy()
+                environment.pop("CUBLAS_WORKSPACE_CONFIG", None)
+                environment["CUDA_VISIBLE_DEVICES"] = "1"
+                environment["PYTHONPATH"] = ".:resources"
+                completed = subprocess.run(
+                    [sys.executable, "-c", script, str(root / name)],
+                    cwd=Path(__file__).resolve().parents[2],
+                    env=environment,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                results.append(json.loads(completed.stdout.strip().splitlines()[-1]))
+            self.assertEqual(results[0]["device"], "cuda:0")
+            self.assertEqual(
+                results[0]["determinism"]["cublas_workspace_config"], ":4096:8"
+            )
+            self.assertEqual(results[0]["artifact_sha256"], results[1]["artifact_sha256"])
+            for artifact in results[0]["artifact_sha256"]:
+                self.assertEqual(
+                    (root / "first" / artifact).read_bytes(),
+                    (root / "second" / artifact).read_bytes(),
+                )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_cuda_determinism_rejects_conflicting_cublas_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = os.environ.copy()
+            environment["CUBLAS_WORKSPACE_CONFIG"] = "invalid"
+            environment["CUDA_VISIBLE_DEVICES"] = "1"
+            environment["PYTHONPATH"] = ".:resources"
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "from pathlib import Path; "
+                        "from resources.g1_lmm.training import train_tiny_fixture; "
+                        "train_tiny_fixture(Path(__import__('sys').argv[1]), device='cuda:0')"
+                    ),
+                    str(Path(directory) / "rejected"),
+                ],
+                cwd=Path(__file__).resolve().parents[2],
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("CUBLAS_WORKSPACE_CONFIG", completed.stderr)
 
 
 if __name__ == "__main__":

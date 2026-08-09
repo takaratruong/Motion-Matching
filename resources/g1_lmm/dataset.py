@@ -59,6 +59,7 @@ class TrainingBundle:
     features: np.ndarray
     feature_offset: np.ndarray
     feature_scale: np.ndarray
+    admitted_mask: np.ndarray
 
     @property
     def frames(self) -> int:
@@ -214,13 +215,31 @@ def load_training_bundle(data_directory: str | Path) -> TrainingBundle:
     if np.any(contacts > 1):
         raise ValueError("database contacts must be binary")
     starts, stops = _validated_ranges(range_starts, range_stops, row_count=frames)
+    if starts[0] != 0 or stops[-1] != frames \
+            or np.any(starts[1:] != stops[:-1]) \
+            or int(np.sum(stops - starts, dtype=np.int64)) != frames:
+        raise ValueError(
+            "database ranges must form a complete contiguous partition of all rows"
+        )
+    admitted_mask = np.zeros(frames, dtype=bool)
+    for start, stop in zip(starts, stops):
+        admitted_mask[int(start) : int(stop)] = True
+    if not np.all(admitted_mask):
+        raise ValueError("database admitted-row partition is incomplete")
+    admitted_mask.setflags(write=False)
     manifest_ranges = manifest.get("ranges")
     if type(manifest_ranges) is not list or len(manifest_ranges) != len(starts):
         raise ValueError("manifest ranges do not match database")
+    if manifest.get("range_count") != len(starts):
+        raise ValueError("manifest range count does not match database")
     for index, (start, stop) in enumerate(zip(starts, stops)):
         entry = manifest_ranges[index]
         if type(entry) is not dict or entry.get("start") != int(start) or entry.get("stop") != int(stop):
             raise ValueError("manifest range boundaries do not match database")
+        if entry.get("motion_class") != "flat-walk":
+            raise ValueError("every admitted range must have motion_class flat-walk")
+        if entry.get("terrain_class") != "flat":
+            raise ValueError("every admitted range must have terrain_class flat")
 
     continuity = manifest.get("continuity")
     continuity_keys = {
@@ -237,6 +256,7 @@ def load_training_bundle(data_directory: str | Path) -> TrainingBundle:
         "maximum_admitted_native_step_rad",
         "maximum_admitted_local_rotation_step_rad",
         "range_digest_sha256",
+        "source_map_digest_sha256",
     }
     if type(continuity) is not dict or set(continuity) != continuity_keys:
         raise ValueError("v2 data manifest has no exact continuity receipt")
@@ -258,6 +278,9 @@ def load_training_bundle(data_directory: str | Path) -> TrainingBundle:
     for key, expected in exact_counts.items():
         if type(continuity[key]) is not int or continuity[key] != expected:
             raise ValueError(f"continuity receipt {key} must equal {expected}")
+    if continuity["published_range_count"] != len(starts) \
+            or continuity["published_frame_count"] != frames:
+        raise ValueError("continuity published counts do not match database arrays")
     for key in (
         "maximum_admitted_native_step_rad",
         "maximum_admitted_local_rotation_step_rad",
@@ -284,6 +307,52 @@ def load_training_bundle(data_directory: str | Path) -> TrainingBundle:
     ).hexdigest()
     if continuity["range_digest_sha256"] != recomputed_range_digest:
         raise ValueError("continuity range digest does not match manifest ranges")
+    sources = manifest.get("sources")
+    if type(sources) is not list or not sources:
+        raise ValueError("manifest sources are missing")
+    if manifest.get("source_count") != len(sources) or manifest.get("total_clips") != len(
+        sources
+    ):
+        raise ValueError("manifest source counts do not match source receipts")
+    left_parts = []
+    right_parts = []
+    alpha_parts = []
+    for source in sources:
+        if type(source) is not dict:
+            raise ValueError("manifest source receipt is invalid")
+        left = np.asarray(source.get("left_source_index"), dtype=np.int64)
+        right = np.asarray(source.get("right_source_index"), dtype=np.int64)
+        alpha = np.asarray(source.get("source_alpha"), dtype=np.float64)
+        if (
+            left.ndim != 1
+            or right.shape != left.shape
+            or alpha.shape != left.shape
+            or source.get("output_frames") != len(left)
+            or np.any(left < 0)
+            or np.any(right < left)
+            or not np.isfinite(alpha).all()
+            or np.any(alpha < 0.0)
+            or np.any(alpha > 1.0)
+        ):
+            raise ValueError("manifest source map arrays are invalid")
+        if np.any(left > np.iinfo(np.int32).max) or np.any(right > np.iinfo(np.int32).max):
+            raise ValueError("manifest source indices exceed the v2 ABI")
+        left_parts.append(left.astype("<i4"))
+        right_parts.append(right.astype("<i4"))
+        alpha_parts.append(alpha.astype("<f4"))
+    if sum(len(part) for part in left_parts) != frames:
+        raise ValueError("manifest source maps do not cover every admitted row")
+    recomputed_source_map_digest = hashlib.sha256(
+        b"".join(
+            (
+                np.concatenate(left_parts).tobytes(order="C"),
+                np.concatenate(right_parts).tobytes(order="C"),
+                np.concatenate(alpha_parts).tobytes(order="C"),
+            )
+        )
+    ).hexdigest()
+    if continuity["source_map_digest_sha256"] != recomputed_source_map_digest:
+        raise ValueError("continuity source-map digest does not match manifest arrays")
     recomputed_max = 0.0
     for start, stop in zip(starts, stops):
         left = rotations[int(start) : int(stop) - 1].astype(np.float64)
@@ -337,6 +406,7 @@ def load_training_bundle(data_directory: str | Path) -> TrainingBundle:
         features=features,
         feature_offset=feature_offset,
         feature_scale=feature_scale,
+        admitted_mask=admitted_mask,
     )
 
 
