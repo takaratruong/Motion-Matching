@@ -825,8 +825,8 @@ def build_vertical_dataset_from_retarget(
                         source=source_path,
                         cycle_start=cycle_start,
                         cycle_stop=cycle_stop,
-                        display_start=start,
-                        display_count=stop - start,
+                        display_start=bounded_start,
+                        display_count=bounded_stop - bounded_start,
                     )
                     if (
                         fit.source_sha256 != selected["bvh_sha256"]

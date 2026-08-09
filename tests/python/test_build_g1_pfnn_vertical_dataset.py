@@ -234,7 +234,14 @@ class BuildG1PFNNVerticalDatasetTest(unittest.TestCase):
                 return contacts
 
             def fit_one(**arguments):
-                fit_calls.append((arguments["cycle_start"], arguments["cycle_stop"]))
+                fit_calls.append(
+                    (
+                        arguments["cycle_start"],
+                        arguments["cycle_stop"],
+                        arguments["display_start"],
+                        arguments["display_count"],
+                    )
+                )
                 count = arguments["display_count"]
                 return PFNNTerrainFit(
                     patch=np.zeros((2, 2)),
@@ -270,7 +277,15 @@ class BuildG1PFNNVerticalDatasetTest(unittest.TestCase):
             )
             self.assertTrue((output / "dataset" / "manifest.json").is_file())
             self.assertEqual(result.dataset_sha256, load_vertical_dataset(output / "dataset").dataset_sha256)
-            self.assertEqual(fit_calls, [(500, 600), (600, 700), (500, 600), (600, 700)])
+            self.assertEqual(
+                fit_calls,
+                [
+                    (500, 600, 520, 80),
+                    (600, 700, 600, 80),
+                    (500, 600, 520, 80),
+                    (600, 700, 600, 80),
+                ],
+            )
             self.assertEqual(len(tuple((output / "terrain").glob("*.npz"))), 4)
 
 
