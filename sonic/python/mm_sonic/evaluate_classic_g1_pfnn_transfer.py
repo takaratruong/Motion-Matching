@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from mm_sonic.build_g1_pfnn_vertical_dataset import load_vertical_dataset
+from mm_sonic.terrain_oracle.canonical import ISAACLAB_JOINT_NAMES
 from mm_sonic.terrain_pfnn.dataset import (
     normalize_pfnn_input,
     normalize_pfnn_output,
@@ -74,19 +75,48 @@ def source_joint_reconstruction_metrics(
 
     predicted = _joint_rows(predicted_physical)
     target = _joint_rows(target_physical)
-    clips = np.asarray(clip_ids).astype(str)
-    if predicted.shape != target.shape or clips.shape != (len(predicted),):
+    if predicted.shape != target.shape:
         raise ValueError("source joint reconstruction rows and clip IDs are invalid")
-    grail = np.char.startswith(clips, _GRAIL_PREFIX)
-    groups = {
-        "released_pfnn": ~grail,
-        "grail": grail,
-    }
-    if any(not np.any(mask) for mask in groups.values()):
-        raise ValueError("source-specific evaluation requires released PFNN and GRAIL rows")
+    groups = _source_masks(clip_ids, len(predicted))
     return {
         source: joint_reconstruction_metrics(predicted[mask], target[mask])
         for source, mask in groups.items()
+    }
+
+
+def _source_masks(clip_ids: object, count: int) -> dict[str, np.ndarray]:
+    clips = np.asarray(clip_ids).astype(str)
+    if clips.shape != (count,):
+        raise ValueError("source joint reconstruction rows and clip IDs are invalid")
+    grail = np.char.startswith(clips, _GRAIL_PREFIX)
+    groups = {"released_pfnn": ~grail, "grail": grail}
+    if any(not np.any(mask) for mask in groups.values()):
+        raise ValueError("source-specific evaluation requires released PFNN and GRAIL rows")
+    return groups
+
+
+def _worst_provenance(
+    metrics: Mapping[str, object], mask: np.ndarray, arrays: object
+) -> dict[str, object]:
+    source_frame = metrics.get("worst_frame_index")
+    joint_index = metrics.get("worst_joint_index")
+    split_indices = np.flatnonzero(mask)
+    if (
+        type(source_frame) is not int
+        or not 0 <= source_frame < len(split_indices)
+        or type(joint_index) is not int
+        or not 0 <= joint_index < len(ISAACLAB_JOINT_NAMES)
+    ):
+        raise ValueError("source reconstruction worst provenance is invalid")
+    split_index = int(split_indices[source_frame])
+    return {
+        "source_frame_index": source_frame,
+        "split_index": split_index,
+        "clip_id": str(arrays.clip_id[split_index]),
+        "sequence_lane": str(arrays.sequence_lane[split_index]),
+        "center_frame_120hz": int(arrays.center_frame_120hz[split_index]),
+        "joint_index": joint_index,
+        "joint_name": ISAACLAB_JOINT_NAMES[joint_index],
     }
 
 
@@ -157,6 +187,9 @@ def evaluate(
         raise ValueError("classic PFNN transfer evaluation arguments are invalid")
     checkpoint_file = Path(checkpoint_path).expanduser().resolve(strict=True)
     root = _dataset_root(Path(dataset_path))
+    manifest_file = root / "manifest.json"
+    checkpoint_sha256 = _sha256(checkpoint_file)
+    dataset_manifest_sha256 = _sha256(manifest_file)
     checkpoint = load_classic_checkpoint(checkpoint_file)
     dataset = load_vertical_dataset(root)
     if checkpoint.dataset_digest != dataset.dataset_sha256:
@@ -184,29 +217,37 @@ def evaluate(
         prediction_normalized * normalization["y_std"] + normalization["y_mean"],
         dtype=np.float32,
     )
-    source_metrics = source_joint_reconstruction_metrics(
-        predicted_physical, target_physical, arrays.clip_id
-    )
+    source_masks = _source_masks(arrays.clip_id, len(arrays.phase))
+    source_metrics = {
+        source: joint_reconstruction_metrics(
+            predicted_physical[mask], target_physical[mask]
+        )
+        for source, mask in source_masks.items()
+    }
     failures = released_pfnn_gate_failures(source_metrics["released_pfnn"])
+    if _sha256(checkpoint_file) != checkpoint_sha256:
+        raise ValueError("checkpoint bytes changed during evaluation")
+    if _sha256(manifest_file) != dataset_manifest_sha256:
+        raise ValueError("dataset manifest bytes changed during evaluation")
     return {
         "schema": "classic-g1-pfnn-transfer-evaluation/v1",
-        "checkpoint_sha256": _sha256(checkpoint_file),
-        "dataset_manifest_sha256": _sha256(root / "manifest.json"),
+        "checkpoint_sha256": checkpoint_sha256,
+        "dataset_manifest_sha256": dataset_manifest_sha256,
         "dataset_sha256": dataset.dataset_sha256,
         "split": split,
         "released_pfnn": {
             **source_metrics["released_pfnn"],
-            "worst": {
-                "frame_index": source_metrics["released_pfnn"]["worst_frame_index"],
-                "joint_index": source_metrics["released_pfnn"]["worst_joint_index"],
-            },
+            "worst": _worst_provenance(
+                source_metrics["released_pfnn"],
+                source_masks["released_pfnn"],
+                arrays,
+            ),
         },
         "grail": {
             **source_metrics["grail"],
-            "worst": {
-                "frame_index": source_metrics["grail"]["worst_frame_index"],
-                "joint_index": source_metrics["grail"]["worst_joint_index"],
-            },
+            "worst": _worst_provenance(
+                source_metrics["grail"], source_masks["grail"], arrays
+            ),
         },
         "released_pfnn_gate": {
             "thresholds": dict(RELEASED_PFNN_GATE),
