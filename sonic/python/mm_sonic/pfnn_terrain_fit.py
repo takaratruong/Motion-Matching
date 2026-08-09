@@ -563,12 +563,21 @@ def terrain_height_pfnn(fit: PFNNTerrainFit, query_xz: np.ndarray) -> np.ndarray
     return result
 
 
-def terrain_height_g1(fit: PFNNTerrainFit, query_xy_m: np.ndarray) -> np.ndarray:
+def terrain_height_g1(
+    fit: PFNNTerrainFit,
+    query_xy_m: np.ndarray,
+    *,
+    scale: float = 1.0,
+) -> np.ndarray:
     """Evaluate the same physical surface in GMR's Z-up G1 world."""
 
     query = _finite_array(query_xy_m, "query_xy_m", shape=(None, 2))
-    source_xz = np.column_stack((100.0 * query[:, 0], -100.0 * query[:, 1]))
-    return terrain_height_pfnn(fit, source_xz) / 100.0
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError("terrain scale must be positive and finite")
+    source_xz = np.column_stack(
+        (100.0 * query[:, 0] / scale, -100.0 * query[:, 1] / scale)
+    )
+    return scale * terrain_height_pfnn(fit, source_xz) / 100.0
 
 
 _ARTIFACT_FIELDS = {

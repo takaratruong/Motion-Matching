@@ -49,6 +49,20 @@ def _fit() -> PFNNTerrainFit:
 
 
 class PFNNTerrainTransferTests(unittest.TestCase):
+    def test_uniform_terrain_scale_preserves_shape_and_grade(self) -> None:
+        fit = _fit()
+        native_xy = np.array([[-0.01, 0.0], [0.0, 0.01], [0.01, -0.01]])
+        native_height = terrain_height_g1(fit, native_xy)
+        scale = 0.875
+        np.testing.assert_allclose(
+            terrain_height_g1(fit, native_xy * scale, scale=scale),
+            native_height * scale,
+            atol=1.0e-12,
+            rtol=0.0,
+        )
+        with self.assertRaises(ValueError):
+            terrain_height_g1(fit, native_xy, scale=0.0)
+
     def test_support_failure_ignores_the_nonstance_probe_on_a_stance_foot(self) -> None:
         gaps = np.array([[0.05, 0.0, 0.0, 0.0]])
         contacts = np.array([[False, True, False, False]], dtype=np.bool_)

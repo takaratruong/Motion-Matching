@@ -64,6 +64,7 @@ def terrain_mesh(
     *,
     x_samples: np.ndarray,
     y_samples: np.ndarray,
+    scale: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Triangulate exact samples of a continuous PFNN terrain fit."""
 
@@ -76,7 +77,7 @@ def terrain_mesh(
             raise ValueError(f"{label} must be strictly increasing")
     grid_x, grid_y = np.meshgrid(x, y, indexing="xy")
     xy = np.column_stack((grid_x.ravel(), grid_y.ravel()))
-    vertices = np.column_stack((xy, terrain_height_g1(fit, xy)))
+    vertices = np.column_stack((xy, terrain_height_g1(fit, xy, scale=scale)))
     faces: list[tuple[int, int, int]] = []
     columns = len(x)
     for row in range(len(y) - 1):
@@ -299,6 +300,7 @@ def _pfnn_terrain_model_xml(
     gmr_root: Path,
     fit: PFNNTerrainFit,
     root_position: np.ndarray,
+    terrain_scale: float,
 ) -> str:
     source = gmr_root / "assets" / "unitree_g1" / "g1_mocap_29dof.xml"
     tree = ET.parse(source)
@@ -318,7 +320,9 @@ def _pfnn_terrain_model_xml(
         raise ValueError("root_position must have shape [T, 3]")
     x = np.linspace(float(motion_root[:, 0].min()) - 0.65, float(motion_root[:, 0].max()) + 0.65, 96)
     y = np.linspace(float(motion_root[:, 1].min()) - 0.65, float(motion_root[:, 1].max()) + 0.65, 128)
-    vertices, faces = terrain_mesh(fit, x_samples=x, y_samples=y)
+    vertices, faces = terrain_mesh(
+        fit, x_samples=x, y_samples=y, scale=terrain_scale
+    )
     ET.SubElement(
         asset,
         "mesh",
@@ -364,6 +368,7 @@ class _PFNNTerrainMotionViewer:
         gmr_root: Path,
         motion: dict[str, object],
         fit: PFNNTerrainFit,
+        terrain_scale: float,
         keyboard_callback,
     ) -> None:
         import mujoco
@@ -373,11 +378,13 @@ class _PFNNTerrainMotionViewer:
         if fit.source_frame_count != len(np.asarray(motion["root_pos"])):
             raise ValueError("terrain artifact and motion frame counts differ")
         self.fit = fit
+        self.terrain_scale = terrain_scale
         self.model = mujoco.MjModel.from_xml_string(
             _pfnn_terrain_model_xml(
                 gmr_root=gmr_root,
                 fit=fit,
                 root_position=np.asarray(motion["root_pos"]),
+                terrain_scale=terrain_scale,
             )
         )
         self.data = mujoco.MjData(self.model)
@@ -432,7 +439,9 @@ class _PFNNTerrainMotionViewer:
             position = self.data.xpos[body_id]
             probes.extend(rotation @ offset + position for offset in offsets)
         probe_array = np.asarray(probes)
-        terrain = terrain_height_g1(self.fit, probe_array[:, :2])
+        terrain = terrain_height_g1(
+            self.fit, probe_array[:, :2], scale=self.terrain_scale
+        )
         gaps = probe_array[:, 2] - terrain
         colors = {
             "swing": np.array([0.1, 0.4, 1.0, 1.0]),
@@ -478,6 +487,7 @@ def view_motion(
     gmr_root: Path,
     terrain: str = "none",
     terrain_artifact: Path | None = None,
+    terrain_scale: float = 1.0,
 ) -> None:
     motion = load_motion(motion_path)
     gmr_root = Path(gmr_root).resolve(strict=True)
@@ -520,11 +530,12 @@ def view_motion(
                 gmr_root=gmr_root,
                 motion=motion,
                 fit=fit,
+                terrain_scale=terrain_scale,
                 keyboard_callback=keyboard_callback,
             )
             print(
                 f"Terrain: exact PFNN fitted patch {fit.selected_patch_index} | "
-                f"source frames {fit.source_start_frame}-"
+                f"scale {terrain_scale:g} | source frames {fit.source_start_frame}-"
                 f"{fit.source_start_frame + fit.source_frame_count - 1}",
                 flush=True,
             )
@@ -585,6 +596,9 @@ def _parser() -> argparse.ArgumentParser:
         "--terrain", choices=("none", "auto-steps", "pfnn-fit"), default="none"
     )
     parser.add_argument("--terrain-artifact", type=Path)
+    parser.add_argument(
+        "--terrain-scale", type=float, choices=(1.0, 0.875), default=1.0
+    )
     return parser
 
 
@@ -601,6 +615,7 @@ def main() -> None:
                     if args.terrain_artifact is None
                     else str(args.terrain_artifact.resolve())
                 ),
+                "terrain_scale": args.terrain_scale,
             },
             sort_keys=True,
         ),
@@ -611,6 +626,7 @@ def main() -> None:
         gmr_root=args.gmr_root,
         terrain=args.terrain,
         terrain_artifact=args.terrain_artifact,
+        terrain_scale=args.terrain_scale,
     )
 
 
