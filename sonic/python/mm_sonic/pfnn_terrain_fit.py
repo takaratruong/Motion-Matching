@@ -416,6 +416,33 @@ def _pfnn_contacts(global_positions: np.ndarray) -> np.ndarray:
     return np.concatenate((contacts, contacts[-1:]), axis=0)
 
 
+def released_pfnn_contacts_for_interval(
+    *,
+    pfnn_root: Path,
+    source: Path,
+    display_start_frame: int,
+    display_frame_count: int,
+) -> np.ndarray:
+    """Reconstruct released heel/toe contacts for one native 120 Hz interval."""
+
+    root = Path(pfnn_root).resolve(strict=True)
+    motion_source = Path(source)
+    if not motion_source.is_absolute():
+        motion_source = root / motion_source
+    motion_source = motion_source.resolve(strict=True)
+    bvh, animation_module = _pfnn_modules(root)
+    animation, _names, _frametime = bvh.load(str(motion_source))
+    animation.offsets *= PFNN_POSITION_SCALE
+    animation.positions *= PFNN_POSITION_SCALE
+    positions_60hz = _global_positions(animation_module, animation[::2])
+    contacts_60hz = _pfnn_contacts(positions_60hz)
+    return display_contacts(
+        contacts_60hz,
+        display_start_frame=display_start_frame,
+        display_frame_count=display_frame_count,
+    )
+
+
 def _foot_samples(
     global_positions: np.ndarray, contacts: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
