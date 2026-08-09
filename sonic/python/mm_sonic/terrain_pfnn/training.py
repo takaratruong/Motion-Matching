@@ -2529,6 +2529,7 @@ def choose_runtime_seed(
             type(terrain_digest) is str
             and len(terrain_digest) == 64
             and all(character in "0123456789abcdef" for character in terrain_digest)
+            and sample.get("terrain_fitted") is True
             and sample.get("mirrored") is False
         )
         if predecessor_entry is None or not has_rollout_horizon or (

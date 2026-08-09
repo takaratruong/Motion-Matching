@@ -22,6 +22,7 @@ from .terrain_pfnn.dataset import (
 )
 from .build_g1_pfnn_vertical_dataset import (
     VerticalDataset,
+    _flat_terrain_sha256,
     load_vertical_dataset,
 )
 from .terrain_pfnn.features import PFNNTrainingWindow, mirror_window
@@ -418,6 +419,8 @@ class _VerticalTrainingView:
             "sequence_lane": str(self._arrays.sequence_lane[row]),
             "terrain_class": str(self._arrays.terrain_class[row]),
             "terrain_sha256": str(self._arrays.terrain_sha256[row]),
+            "terrain_fitted": str(self._arrays.terrain_sha256[row])
+            != _flat_terrain_sha256(),
             "mirrored": bool(self._arrays.mirrored[row]),
             "root_world_xy": self._arrays.root_world_xy[row].copy(),
             "root_world_yaw": float(self._arrays.root_world_yaw[row]),
