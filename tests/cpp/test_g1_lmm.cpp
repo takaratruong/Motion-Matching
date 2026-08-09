@@ -151,7 +151,7 @@ struct synthetic_lmm_fixture
 {
     std::filesystem::path root = "/tmp/test_g1_lmm_bundle";
     std::filesystem::path data =
-        "sonic/runs/g1-lmm-flat-60hz/data";
+        "sonic/runs/g1-lmm-flat-60hz/data-v3";
     std::filesystem::path model = root / "model";
     motion_pack_manifest data_manifest;
     std::string data_manifest_sha;
@@ -177,9 +177,13 @@ struct synthetic_lmm_fixture
 
         {
             std::ofstream output(model / "latent.bin", std::ios::binary);
-            write_u32(output, 3853);
+            write_u32(
+                output,
+                static_cast<std::uint32_t>(data_manifest.database_frames));
             write_u32(output, 32);
-            write_zero_floats(output, 3853u * 32u);
+            write_zero_floats(
+                output,
+                static_cast<std::size_t>(data_manifest.database_frames) * 32u);
         }
         std::vector<float> decompressor_mean(458, 0.0f);
         decompressor_mean[1] = 1.0f;
@@ -221,7 +225,8 @@ struct synthetic_lmm_fixture
     void write_manifest(
         const std::string& bound_data_sha = std::string(),
         const int corrupt_artifact = -1,
-        const int corrupt_data_artifact = -1)
+        const int corrupt_data_artifact = -1,
+        const char* data_schema = "g1-lmm-flat-data/v3")
     {
         std::ofstream output(
             model / "manifest.json", std::ios::binary | std::ios::trunc);
@@ -246,7 +251,7 @@ struct synthetic_lmm_fixture
                << "  \"data_artifacts\": {\"database.bin\": \""
                << database_sha << "\", \"features.bin\": \""
                << features_sha << "\"},\n"
-               << "  \"data_manifest_schema\": \"g1-lmm-flat-data/v2\",\n"
+               << "  \"data_manifest_schema\": \"" << data_schema << "\",\n"
                << "  \"data_manifest_sha256\": \""
                << (bound_data_sha.empty() ? data_manifest_sha : bound_data_sha)
                << "\",\n"
@@ -265,7 +270,7 @@ static void make_lmm_database(database& db)
     static const int parents[G1_BoneCount] = {
         -1, 0, 1, 2, 3, 4, 5, 6, 1, 8, 9, 10, 11, 12, 1, 14,
         15, 16, 17, 18, 19, 20, 21, 22, 16, 24, 25, 26, 27, 28, 29};
-    const int frames = 3853;
+    const int frames = 256;
     db.bone_positions.resize(frames, G1_BoneCount);
     db.bone_velocities.resize(frames, G1_BoneCount);
     db.bone_rotations.resize(frames, G1_BoneCount);
@@ -634,10 +639,22 @@ static void test_authenticated_bundle_and_digest_tampers()
           error);
     check(accepted.authenticated && accepted.evaluation_allocation_count == 3,
           "accepted model allocates exactly three evaluation states");
-    check(accepted.latent.rows == 3853 && accepted.latent.cols == 32,
+    check(accepted.latent.rows == 256 && accepted.latent.cols == 32,
           "accepted latent table matches the bound database");
     test_projector_late_nan_is_transactional(accepted);
     test_transactional_lmm_tick(accepted);
+
+    fixture.write_manifest(std::string(), -1, -1, "g1-lmm-flat-data/v2");
+    g1_lmm_model_bundle rejected_v2_binding;
+    error[0] = '\0';
+    check(!g1_lmm_model_load_and_verify(
+              rejected_v2_binding,
+              fixture.model.c_str(),
+              fixture.data.c_str(),
+              error,
+              static_cast<int>(sizeof(error))) &&
+              rejected_v2_binding.evaluation_allocation_count == 0,
+          "v2 model-data binding rejects before evaluation allocation");
 
     std::string wrong_data_sha = fixture.data_manifest_sha;
     wrong_data_sha[0] = wrong_data_sha[0] == '0' ? '1' : '0';

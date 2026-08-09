@@ -285,6 +285,20 @@ static void test_rotation_continuity_is_range_safe()
         db, 0.25f, error, static_cast<int>(sizeof(error))));
 }
 
+static void test_rotation_continuity_normalizes_binary32_quaternions()
+{
+    database db;
+    fill_source_database(db, 2);
+    db.bone_rotations(0, 0).w = std::nextafter(1.0f, 0.0f);
+    db.bone_rotations(1, 0) = quat_from_angle_axis(
+        0.10f, vec3(1.0f, 0.0f, 0.0f));
+    float observed = 0.0f;
+    char error[256] = {};
+    CHECK(database_rotation_continuity_validate(
+        db, 0.25f, error, static_cast<int>(sizeof(error)), &observed));
+    CHECK(std::fabs(observed - 0.10f) <= 1.0e-6f);
+}
+
 static void seed_matching_outputs(database& db)
 {
     db.features.resize(2, 3);
@@ -995,6 +1009,7 @@ int main()
     test_zero_weight_is_exact_and_safe();
     test_builder_layout_and_real_horizons();
     test_rotation_continuity_is_range_safe();
+    test_rotation_continuity_normalizes_binary32_quaternions();
     test_builder_rejects_bad_terrain_before_mutation();
     test_builder_rejects_every_nonfinite_weight_before_mutation();
     test_positive_weight_flat_terrain_is_release_safe();

@@ -104,3 +104,52 @@ The missing chunk-server and route-CLI executables were directly compiled into
 the expected narrow test location, after which the focused Python command and
 chunk-server suites ran 41 tests: 39 passed and the two guarded external-terrain
 tests skipped because `SONIC_TERRAIN_DIR` was not supplied.
+
+## Canonical v3 walk-only migration (2026-08-09)
+
+Task 2 now accepts only the Task 1 walk-only `g1-lmm-flat-data/v3` identity at
+`sonic/runs/g1-lmm-flat-60hz/data-v3`. The runtime pins and reauthenticates all
+three canonical SHA-256 values before controller state:
+
+- manifest: `db01f5bfb7641333b3e40ea4a5d1eb655131c7bc72681d2738fde2dbf9298709`;
+- `database.bin`: `13b368759c22ff3427d937a86fd9399cd6e80646e5f288e80da01bd988daaaad`;
+- `features.bin`: `7c35809e1dd5ea14bd56b0f607cb9da22b3464ebbece01a895050372530b40df`.
+
+The flat adapter requires exactly 256 rows, one complete `[0,256)` flat-walk
+range, one authenticated 512-frame/120 Hz source receipt, and the absolute
+source map `7659,7661,...,8169`. It also requires the v3 nearest-mode Orange
+Duck contact contract (116 left / 117 right contact rows and its bilateral run
+receipt), zero continuity rejections/drops, `[20,40,60]` horizons, and the
+existing exact-zero terrain slice. The prior v2 bundle rejects, as does a
+semantically identical v3 manifest whose raw bytes no longer match the
+canonical digest. Artifact size and live SHA checks remain active.
+
+The ordinary proof no longer asks a 256-row source clip to sustain a 600-frame
+loop. It owns row 0 after reset and performs exactly 255 matching-disabled
+advances through rows 1..255. Every call asserts the query/selected identity is
+the prior row, the emitted identity is exactly prior+1, and there is no search,
+transition, hold, reset, wrap, or seam. The replay stops without calling the
+clamped end row again. Finite pose, all-31-bone `<=0.25 rad` continuity, and
+raw/normalized 31D query parity at `<=1e-6` remain required. Orange Duck's
+ordinary search implementation still uses the stock 20-frame end and
+surrounding margins; the source replay disables search rather than changing
+those margins.
+
+The real v3 database exposed a numeric mismatch in the independent continuity
+receipt check: the old C++ path multiplied slightly non-unit binary32
+quaternions directly, while Task 1 normalizes and computes the geodesic in
+float64. A focused RED reproduced a nominal `0.10 rad` step as approximately
+`0.100002 rad`. The validator now normalizes through a float64 dot/norm
+calculation before `acos`, matching the independent Task 1 definition while
+retaining the hard `0.25 rad` rejection and bone-0 coverage.
+
+RED first failed both runtime and LMM tests on the missing v3 manifest shape;
+after structural migration, the semantic-whitespace tamper remained RED until
+the canonical raw-manifest pin was added. The quaternion-normalization RED was
+observed independently in `test_terrain_database`.
+
+Fresh focused GREEN compiled with the strict C++17 warning contract and passed
+`test_terrain_database`, `test_support_matching`, `test_g1_runtime` (ordinary,
+canonical v3, and v2 rejection modes), `test_g1_controller_state`, and
+`test_g1_lmm`; `controller.cpp` also passed its Raylib/Raygui syntax check.
+The accepted learned model is still absent, so no viewer was launched.

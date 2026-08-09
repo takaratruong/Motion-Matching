@@ -416,7 +416,7 @@ static inline bool g1_lmm_model_load_and_verify(
         !scene_member_string(
             data_schema, document, "data_manifest_schema",
             "G1 LMM model manifest", error, capacity) ||
-        data_schema != "g1-lmm-flat-data/v2" ||
+        data_schema != G1_LMMFlatDataSchema ||
         !scene_member_string(
             data_sha, document, "data_manifest_sha256",
             "G1 LMM model manifest", error, capacity) ||

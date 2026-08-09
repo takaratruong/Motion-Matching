@@ -202,6 +202,33 @@ static inline uint32_t feature_float_bits(const float value)
     return bits;
 }
 
+static inline float database_quat_geodesic_angle(
+    const quat first,
+    const quat second)
+{
+    const double first_norm_squared =
+        static_cast<double>(first.w) * first.w +
+        static_cast<double>(first.x) * first.x +
+        static_cast<double>(first.y) * first.y +
+        static_cast<double>(first.z) * first.z;
+    const double second_norm_squared =
+        static_cast<double>(second.w) * second.w +
+        static_cast<double>(second.x) * second.x +
+        static_cast<double>(second.y) * second.y +
+        static_cast<double>(second.z) * second.z;
+    const double dot =
+        static_cast<double>(first.w) * second.w +
+        static_cast<double>(first.x) * second.x +
+        static_cast<double>(first.y) * second.y +
+        static_cast<double>(first.z) * second.z;
+    const double denominator = sqrt(
+        first_norm_squared * second_norm_squared);
+    if (!isfinite(denominator) || denominator <= 0.0 || !isfinite(dot))
+        return NAN;
+    const double cosine = fmin(1.0, fabs(dot) / denominator);
+    return static_cast<float>(2.0 * acos(cosine));
+}
+
 static inline bool database_rotation_continuity_validate(
     const database& db,
     const float maximum_step,
@@ -234,7 +261,7 @@ static inline bool database_rotation_continuity_validate(
         }
         for (int frame = start + 1; frame < stop; ++frame) {
             for (int bone = 0; bone < db.nbones(); ++bone) {
-                const float step = quat_angle_between(
+                const float step = database_quat_geodesic_angle(
                     db.bone_rotations(frame - 1, bone),
                     db.bone_rotations(frame, bone));
                 if (!feature_float_is_finite(step) ||

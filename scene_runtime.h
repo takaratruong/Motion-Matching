@@ -102,6 +102,13 @@ static const char G1_RuntimeCoordinateSignature[] =
     "holden-y-up-right-handed-forward-plus-z";
 static const char G1_RuntimeSurfaceSignature[] =
     "f151c2b1c7f0498880f76c37f48a47c46c48bcf58c1285863fabc9a09fd7993a";
+static const char G1_LMMFlatDataSchema[] = "g1-lmm-flat-data/v3";
+static const char G1_LMMFlatManifestSha256[] =
+    "db01f5bfb7641333b3e40ea4a5d1eb655131c7bc72681d2738fde2dbf9298709";
+static const char G1_LMMFlatDatabaseSha256[] =
+    "13b368759c22ff3427d937a86fd9399cd6e80646e5f288e80da01bd988daaaad";
+static const char G1_LMMFlatFeaturesSha256[] =
+    "7c35809e1dd5ea14bd56b0f607cb9da22b3464ebbece01a895050372530b40df";
 static const char G1_RuntimeSurfaceSemanticsJson[] =
     R"json({"barycentric_tolerance":1e-10,"bbox_tolerance_m":1e-12,"cell_size_m":0.02,"coordinate_signature":"holden-y-up-right-handed-forward-plus-z","degenerate_projected_triangle_policy":"ignore","exterior_height_m":0.0,"heightfield_cell_domain":"positive-normal-binary32","heightfield_denormal_policy":"reject-nonzero-binary32-subnormals","heightfield_diagonal":"min-x-min-z_to_max-x-max-z","heightfield_diagonal_tie_policy":"tx-greater-or-equal-tz-uses-p00-p10-p11","heightfield_domain_policy":"inclusive-authoritative-node-rectangle","heightfield_evaluation_precision":"binary64-from-binary32-samples-and-promoted-node-weights","heightfield_exterior_normal":[0.0,1.0,0.0],"heightfield_grid_line_policy":"positive-index-cell-except-maximum-edge","heightfield_interpolation":"fixed-diagonal-triangles","heightfield_normal_evaluation":"selected-triangle-binary64-gradient-scale-safe-unit-normalization","heightfield_obj_coordinate_quantization":"binary32-round-of-promoted-origin-plus-index-times-cell","heightfield_obj_face_order":"p00-p11-p10_then_p00-p01-p11","heightfield_obj_float_format":".9g-final-newline","heightfield_obj_vertex_order":"z-major-x-minor","heightfield_raster_bounds_policy":"float32-minimum-rounded-down-and-maximum-ceil-covered","heightfield_runtime_height_output":"finite-binary64-interpolation-rounded-to-binary32","heightfield_runtime_node_distinguishability_policy":"normal-or-positive-zero-strictly-increasing-proven-by-endpoints-near-zero-candidates-max-binary32-spacing-and-aligned-equality","heightfield_runtime_node_domain":"normal-or-zero-binary32","heightfield_runtime_normal_output":"unit-normal-components-rounded-to-binary32","heightfield_runtime_output_ftz_policy":"binary32-subnormals-and-signed-zero-canonicalized-to-positive-zero","heightfield_runtime_parity_domain":"normal-or-zero-binary32-coordinates","heightfield_runtime_query_domain":"normal-or-zero-binary32-coordinates","heightfield_runtime_query_encoding":"normal-or-zero-binary32-canonicalized-positive-and-promoted-to-binary64","heightfield_scalar_domain":"normal-or-zero-binary32","heightfield_scalar_encoding":"ieee754-binary32-little-endian","heightfield_schema":"G1HF/v2","heightfield_source_node_encoding":"binary32-header-values-promoted-to-binary64-arithmetic","heightfield_version":2,"heightfield_zero_encoding":"canonical-positive-zero","overlap_height_policy":"maximum-y","polygon_triangulation":"fan-from-first-index","projected_area_epsilon_m2":1e-12,"projected_area_measure":"absolute-two-times-area","projected_boundary_policy":"closed","schema":"g1-terrain-surface/v1","source_query":"vertical-triangle-top","triangle_winding_policy":"orientation-independent"})json";
 
@@ -670,7 +677,7 @@ static inline bool flat_motion_manifest_parse_and_verify(
              "feature_offset","feature_scale","feature_signature",
              "terrain_features","database_frames","total_clips",
              "source_count","dimensions","skeleton","range_count","ranges",
-             "continuity","time_filters","contact",
+             "continuity","time_filters","contact","contact_observations",
              "sources","validation","status","artifacts"},
             "flat motion manifest", error, capacity))
         return false;
@@ -681,7 +688,7 @@ static inline bool flat_motion_manifest_parse_and_verify(
     float fps = 0.0f;
     if (!scene_member_string(schema, document, "schema", "flat manifest",
                              error, capacity) ||
-        schema != "g1-lmm-flat-data/v2" ||
+        schema != G1_LMMFlatDataSchema ||
         !scene_member_string(status, document, "status", "flat manifest",
                              error, capacity) || status != "accepted" ||
         !scene_member_float(fps, document, "output_fps", "flat manifest",
@@ -713,7 +720,7 @@ static inline bool flat_motion_manifest_parse_and_verify(
         candidate.feature_dimensions != 31 ||
         !scene_member_int(candidate.database_frames, document,
                           "database_frames", "flat manifest", error,
-                          capacity) || candidate.database_frames < 61 ||
+                          capacity) || candidate.database_frames != 256 ||
         !scene_member_int(candidate.total_clips, document, "total_clips",
                           "flat manifest", error, capacity) ||
         candidate.total_clips != 1)
@@ -834,30 +841,78 @@ static inline bool flat_motion_manifest_parse_and_verify(
                           error, capacity) || root_direction_order != 3 ||
         !scene_member_int(contact_median_frames, *filters,
                           "contact_median_frames", "flat time filters",
-                          error, capacity) || contact_median_frames != 7 ||
+                          error, capacity) || contact_median_frames != 6 ||
         !scene_member_int(forward_path_rows, *filters,
                           "forward_terrain_path_rows", "flat time filters",
                           error, capacity) || forward_path_rows != 121)
         return scene_error(error, capacity,
                            "flat time-filter receipt changed");
     const json_value* flat_contact = json_member(document, "contact");
-    float contact_speed = 0.0f, contact_height = 0.0f;
+    std::string contact_semantics, contact_filter_mode;
+    float contact_speed = 0.0f;
     int contact_filter = 0;
     if (flat_contact == NULL || !scene_exact_keys(
             *flat_contact,
-            {"speed_threshold","height_threshold","median_filter_frames"},
+            {"semantics","speed_threshold","median_filter_frames",
+             "median_filter_mode"},
             "flat contact", error, capacity) ||
+        !scene_member_string(contact_semantics, *flat_contact, "semantics",
+                             "flat contact", error, capacity) ||
+        contact_semantics !=
+            "bundled-orange-duck-global-toe-speed-only" ||
         !scene_member_float(contact_speed, *flat_contact, "speed_threshold",
                             "flat contact", error, capacity) ||
         contact_speed != 0.15f ||
-        !scene_member_float(contact_height, *flat_contact, "height_threshold",
-                            "flat contact", error, capacity) ||
-        contact_height != 0.06f ||
         !scene_member_int(contact_filter, *flat_contact,
                           "median_filter_frames", "flat contact",
-                          error, capacity) || contact_filter != 7)
+                          error, capacity) || contact_filter != 6 ||
+        !scene_member_string(contact_filter_mode, *flat_contact,
+                             "median_filter_mode", "flat contact", error,
+                             capacity) || contact_filter_mode != "nearest")
         return scene_error(error, capacity,
                            "flat contact receipt changed");
+    const json_value* contact_observations =
+        json_member(document, "contact_observations");
+    std::string contact_observation_schema;
+    int left_contact_frames = 0, right_contact_frames = 0;
+    int left_run_count = 0, right_run_count = 0;
+    int left_max_run_frames = 0, right_max_run_frames = 0;
+    int alternating_run_transition_count = 0;
+    if (contact_observations == NULL || !scene_exact_keys(
+            *contact_observations,
+            {"schema","left_contact_frames","right_contact_frames",
+             "left_run_count","right_run_count","left_max_run_frames",
+             "right_max_run_frames","alternating_run_transition_count"},
+            "flat contact observations", error, capacity) ||
+        !scene_member_string(contact_observation_schema, *contact_observations,
+                             "schema", "flat contact observations", error,
+                             capacity) ||
+        contact_observation_schema != "g1-lmm-bilateral-contact/v1" ||
+        !scene_member_int(left_contact_frames, *contact_observations,
+                          "left_contact_frames", "flat contact observations",
+                          error, capacity) || left_contact_frames != 116 ||
+        !scene_member_int(right_contact_frames, *contact_observations,
+                          "right_contact_frames", "flat contact observations",
+                          error, capacity) || right_contact_frames != 117 ||
+        !scene_member_int(left_run_count, *contact_observations,
+                          "left_run_count", "flat contact observations",
+                          error, capacity) || left_run_count != 3 ||
+        !scene_member_int(right_run_count, *contact_observations,
+                          "right_run_count", "flat contact observations",
+                          error, capacity) || right_run_count != 4 ||
+        !scene_member_int(left_max_run_frames, *contact_observations,
+                          "left_max_run_frames", "flat contact observations",
+                          error, capacity) || left_max_run_frames != 49 ||
+        !scene_member_int(right_max_run_frames, *contact_observations,
+                          "right_max_run_frames", "flat contact observations",
+                          error, capacity) || right_max_run_frames != 45 ||
+        !scene_member_int(alternating_run_transition_count,
+                          *contact_observations,
+                          "alternating_run_transition_count",
+                          "flat contact observations", error, capacity) ||
+        alternating_run_transition_count != 6)
+        return scene_error(error, capacity,
+                           "flat contact observations changed");
 
     const json_value* validation = json_member(document, "validation");
     float fk_error = 0.0f;
@@ -922,7 +977,7 @@ static inline bool flat_motion_manifest_parse_and_verify(
         !scene_member_int(range_count, document, "range_count",
                           "flat manifest", error, capacity) ||
         range_count != static_cast<int>(ranges->array_value.size()) ||
-        range_count != 13 ||
+        range_count != 1 ||
         !scene_member_int(source_count, document, "source_count",
                           "flat manifest", error, capacity) ||
         source_count != 1 ||
@@ -1030,28 +1085,28 @@ static inline bool flat_motion_manifest_parse_and_verify(
         !scene_member_int(source_rejected_edges, *continuity,
                           "source_native_rejected_edge_count",
                           "flat continuity", error, capacity) ||
-        source_rejected_edges != 31 ||
+        source_rejected_edges != 0 ||
         !scene_member_int(local_rejected_edges, *continuity,
                           "database_local_rejected_edge_count",
                           "flat continuity", error, capacity) ||
-        local_rejected_edges != 32 ||
+        local_rejected_edges != 0 ||
         !scene_member_int(union_rejected_edges, *continuity,
                           "union_rejected_edge_count", "flat continuity",
-                          error, capacity) || union_rejected_edges != 32 ||
+                          error, capacity) || union_rejected_edges != 0 ||
         !scene_member_int(dropped_fragment_count, *continuity,
                           "dropped_fragment_count", "flat continuity",
-                          error, capacity) || dropped_fragment_count != 20 ||
+                          error, capacity) || dropped_fragment_count != 0 ||
         !scene_member_int(dropped_frame_count, *continuity,
                           "dropped_frame_count", "flat continuity",
-                          error, capacity) || dropped_frame_count != 233 ||
+                          error, capacity) || dropped_frame_count != 0 ||
         !scene_member_int(published_range_count, *continuity,
                           "published_range_count", "flat continuity",
-                          error, capacity) || published_range_count != 13 ||
+                          error, capacity) || published_range_count != 1 ||
         !scene_member_int(published_frame_count, *continuity,
                           "published_frame_count", "flat continuity",
                           error, capacity) ||
         published_frame_count != candidate.database_frames ||
-        published_frame_count != 3853 ||
+        published_frame_count != 256 ||
         !scene_member_float(maximum_native_step, *continuity,
                             "maximum_admitted_native_step_rad",
                             "flat continuity", error, capacity) ||
@@ -1093,19 +1148,22 @@ static inline bool flat_motion_manifest_parse_and_verify(
         source_terrain != "flat" ||
         !scene_member_string(source_name, source_receipt, "name",
                              "flat source", error, capacity) ||
-        source_name.empty() ||
+        source_name !=
+            "LocomotionFlat01_000-walk-only-7659-8171-120hz" ||
         !scene_member_string(source_path, source_receipt, "path",
                              "flat source", error, capacity) ||
         source_path.empty() ||
         !scene_member_string(source_sha, source_receipt, "sha256",
                              "flat source", error, capacity) ||
-        !scene_sha_is_valid(source_sha) ||
+        source_sha !=
+            "bbdeb79760950480582ae937e54b913c376caa49f344896a8958476b82f3317f" ||
         !scene_member_string(receipt_path, source_receipt, "receipt_path",
                              "flat source", error, capacity) ||
         receipt_path.empty() ||
         !scene_member_string(receipt_sha, source_receipt, "receipt_sha256",
                              "flat source", error, capacity) ||
-        !scene_sha_is_valid(receipt_sha) ||
+        receipt_sha !=
+            "2d0e93f485bab9c54773c66cf07c14d25837f5f4e50f5c007f9f8e2c5c20520f" ||
         !scene_member_string(receipt_schema, source_receipt, "receipt_schema",
                              "flat source", error, capacity) ||
         receipt_schema != "native-g1-pfnn-sample-retarget/v1" ||
@@ -1116,10 +1174,10 @@ static inline bool flat_motion_manifest_parse_and_verify(
                             "flat source", error, capacity) ||
         source_fps != 120.0f ||
         !scene_member_int(source_frames, source_receipt, "source_frames",
-                          "flat source", error, capacity) ||
+                          "flat source", error, capacity) || source_frames != 512 ||
         !scene_member_int(output_frames, source_receipt, "output_frames",
                           "flat source", error, capacity) ||
-        output_frames != candidate.database_frames || source_frames <= 0 ||
+        output_frames != candidate.database_frames ||
         left_indices == NULL || right_indices == NULL ||
         source_alpha == NULL || left_indices->kind != json_array ||
         right_indices->kind != json_array || source_alpha->kind != json_array ||
@@ -1157,7 +1215,8 @@ static inline bool flat_motion_manifest_parse_and_verify(
             !scene_number_float(
                 alpha, source_alpha->array_value[static_cast<size_t>(frame)],
                 "flat source alpha", error, capacity) ||
-            left < 0 || left >= source_frames || right != left ||
+            left < range_source_first[active_range] ||
+            left > range_source_last[active_range] || right != left ||
             feature_float_bits(alpha) != 0 ||
             (frame > candidate.sources[active_range].range_start &&
              left != previous_source_index + 2) ||
@@ -1252,7 +1311,9 @@ static inline bool flat_motion_manifest_parse_and_verify(
             capacity) ||
         !flat_artifact_reference_parse(
             candidate.matching_features, *artifacts, "features.bin", error,
-            capacity))
+            capacity) ||
+        candidate.database.sha256 != G1_LMMFlatDatabaseSha256 ||
+        candidate.matching_features.sha256 != G1_LMMFlatFeaturesSha256)
         return false;
     std::string database_path, features_path;
     if (!scene_join(database_path, root, candidate.database.path,
@@ -1280,17 +1341,31 @@ static inline bool motion_manifest_load_and_verify(
     std::string manifest_path;
     if (!scene_join(manifest_path, root, "manifest.json", error, capacity))
         return false;
+    std::string observed_manifest_sha;
+    if (!sha256_file_hex(
+            observed_manifest_sha, manifest_path.c_str(), error, capacity))
+        return false;
     json_value document;
-    if (!json_document_load(document, manifest_path.c_str(), error, capacity))
+    if (!scene_json_load_verified(
+            document, manifest_path.c_str(), observed_manifest_sha,
+            error, capacity))
         return false;
     std::string detected_schema;
     if (!scene_member_string(
             detected_schema, document, "schema", "motion manifest",
             error, capacity))
         return false;
-    if (detected_schema == "g1-lmm-flat-data/v2") {
-        return flat_motion_manifest_parse_and_verify(
-            out, document, root, error, capacity);
+    if (detected_schema == G1_LMMFlatDataSchema) {
+        motion_pack_manifest candidate;
+        if (!flat_motion_manifest_parse_and_verify(
+                candidate, document, root, error, capacity))
+            return false;
+        if (observed_manifest_sha != G1_LMMFlatManifestSha256)
+            return scene_error(
+                error, capacity,
+                "flat v3 manifest is not the canonical data identity");
+        out = std::move(candidate);
+        return true;
     }
     if (!scene_exact_keys(document,
             {"schema","output_fps","feature_dimensions","terrain_dimensions",
@@ -2528,7 +2603,7 @@ static inline bool flat_scene_catalog_build(
 {
     if (!manifest.flat_lmm_bundle ||
         !g1_manifest_rate_compatible(manifest.output_fps) ||
-        manifest.sources.size() != 13)
+        manifest.sources.size() != 1)
         return scene_error(error, capacity,
                            "flat scene catalog requires a validated flat bundle");
     for (size_t index = 0; index < manifest.sources.size(); ++index) {
@@ -2555,7 +2630,7 @@ static inline bool flat_scene_pack_build(
     char* error,
     const int capacity)
 {
-    if (!manifest.flat_lmm_bundle || manifest.sources.size() != 13)
+    if (!manifest.flat_lmm_bundle || manifest.sources.size() != 1)
         return scene_error(error, capacity,
                            "flat scene requires a validated flat bundle");
     for (size_t index = 0; index < manifest.sources.size(); ++index) {

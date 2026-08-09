@@ -1518,7 +1518,7 @@ static void test_unsafe_flat_bundle_rejected(const char* root)
     motion_pack_manifest manifest;
     check(!motion_manifest_load_and_verify(
               manifest, root, error, static_cast<int>(sizeof(error))),
-          "unsafe unsplit v1 flat bundle is rejected before controller state");
+          "noncanonical v1/v2 flat bundle is rejected before controller state");
 }
 
 static void test_flat_bundle_adapter(const char* root)
@@ -1530,9 +1530,14 @@ static void test_flat_bundle_adapter(const char* root)
           error);
     check(manifest.flat_lmm_bundle &&
               g1_manifest_rate_compatible(manifest.output_fps) &&
-              manifest.sources.size() == 13 &&
+              manifest.database_frames == 256 &&
+              manifest.sources.size() == 1 &&
+              manifest.sources[0].range_start == 0 &&
+              manifest.sources[0].range_stop == 256 &&
+              manifest.sources[0].name ==
+                  "LocomotionFlat01_000-walk-only-7659-8171-120hz" &&
               manifest.sources[0].terrain_id == "flat",
-          "flat adapter preserves the authenticated manifest contract");
+          "flat adapter preserves the canonical v3 walk-only contract");
     std::string database_path;
     std::string feature_path;
     check(scene_join(
@@ -1574,13 +1579,19 @@ static void test_flat_bundle_adapter(const char* root)
               static_cast<int>(sizeof(error))),
           error);
     g1_runtime_step_request request = make_direct_request(true);
+    request.matching_enabled = false;
     request.requested_velocity_holden = vec3(0.0f, 0.0f, 0.4f);
     const g1_runtime_config config;
-    int held_frames = 0;
     float maximum_joint_step = 0.0f;
     int maximum_joint_frame = -1;
     int maximum_joint_bone = -1;
-    for (int frame = 0; frame < 600; ++frame) {
+    check(db.nranges() == 1 && db.range_starts(0) == 0 &&
+              db.range_stops(0) == 256 && state.frame_index == 0,
+          "ordinary source replay starts at the sole safe v3 range");
+    const int safe_advance_count = db.range_stops(0) - db.range_starts(0) - 1;
+    check(safe_advance_count == 255,
+          "ordinary source replay has exactly 255 in-range advances");
+    for (int frame = 0; frame < safe_advance_count; ++frame) {
         array1d<quat> previous = state.bone_rotations;
         const int previous_database_frame = state.frame_index;
         g1_runtime_step_result result;
@@ -1588,21 +1599,13 @@ static void test_flat_bundle_adapter(const char* root)
                   result, state, db, support, scene, request, config,
                   error, static_cast<int>(sizeof(error))),
               error);
-        if (state.frame_index == previous_database_frame) {
-            if (held_frames < 8) {
-                std::fprintf(
-                    stderr,
-                    "flat replay hold runtime_frame=%d database_frame=%d "
-                    "searched=%d transitioned=%d selected=%d query=%d\n",
-                    frame, state.frame_index, static_cast<int>(state.searched),
-                    static_cast<int>(state.transitioned),
-                    result.selected_database_frame,
-                    result.query_database_frame);
-            }
-            ++held_frames;
-        }
+        check(result.query_database_frame == previous_database_frame &&
+                  result.selected_database_frame == previous_database_frame &&
+                  state.frame_index == previous_database_frame + 1 &&
+                  !state.searched && !state.transitioned,
+              "ordinary source replay advances once without search or a seam");
         check(g1_pose_diagnostic_is_finite(result.projected),
-              "600-frame flat replay keeps a finite pose");
+              "finite in-range flat replay keeps a finite pose");
         for (int bone = 0; bone < G1_BoneCount; ++bone) {
             const float joint_step = quat_angle_between(
                 previous(bone), state.bone_rotations(bone));
@@ -1620,12 +1623,12 @@ static void test_flat_bundle_adapter(const char* root)
             check(std::fabs(
                       independently_normalized -
                       result.query_normalized[dimension]) <= 1e-6f,
-                  "600-frame flat replay preserves feature parity");
+                  "finite in-range flat replay preserves feature parity");
         }
         ++state.scene_frame;
     }
-    check(held_frames == 0,
-          "600-frame flat ordinary replay has zero holds/resets");
+    check(state.frame_index == db.range_stops(0) - 1,
+          "ordinary source replay stops at the last safe row without looping");
     if (maximum_joint_step > 0.25f) {
         std::fprintf(
             stderr,
@@ -1633,7 +1636,7 @@ static void test_flat_bundle_adapter(const char* root)
             maximum_joint_step, maximum_joint_frame, maximum_joint_bone);
     }
     check(maximum_joint_step <= 0.25f,
-          "600-frame flat ordinary replay joint step stays within 0.25 rad");
+          "finite in-range ordinary replay joint step stays within 0.25 rad");
 
     namespace fs = std::filesystem;
     const fs::path tampered = "/tmp/test_g1_runtime_size_tamper";
@@ -1672,6 +1675,38 @@ static void test_flat_bundle_adapter(const char* root)
     check(std::strstr(error, "size") != nullptr,
           "flat manifest size-only tamper reports the size mismatch");
     fs::remove_all(tampered);
+
+    const fs::path noncanonical = "/tmp/test_g1_runtime_manifest_tamper";
+    fs::remove_all(noncanonical);
+    fs::copy(root, noncanonical, fs::copy_options::recursive);
+    const fs::path noncanonical_manifest = noncanonical / "manifest.json";
+    std::ifstream noncanonical_input(noncanonical_manifest, std::ios::binary);
+    check(noncanonical_input.good(), "open flat manifest for canonical tamper");
+    std::string noncanonical_text{
+        std::istreambuf_iterator<char>(noncanonical_input),
+        std::istreambuf_iterator<char>()};
+    const size_t opening_brace = noncanonical_text.find('{');
+    check(opening_brace != std::string::npos,
+          "locate flat manifest opening brace for canonical tamper");
+    noncanonical_text.insert(opening_brace + 1, " ");
+    std::ofstream noncanonical_output(
+        noncanonical_manifest, std::ios::binary | std::ios::trunc);
+    check(noncanonical_output.good(), "open canonical tamper output");
+    noncanonical_output.write(
+        noncanonical_text.data(),
+        static_cast<std::streamsize>(noncanonical_text.size()));
+    check(noncanonical_output.good(), "write canonical manifest tamper");
+    noncanonical_output.close();
+
+    rejected = manifest;
+    error[0] = '\0';
+    check(!motion_manifest_load_and_verify(
+              rejected, noncanonical.c_str(), error,
+              static_cast<int>(sizeof(error))),
+          "semantically identical noncanonical v3 manifest is rejected");
+    check(std::strstr(error, "canonical") != nullptr,
+          "noncanonical v3 manifest reports the identity mismatch");
+    fs::remove_all(noncanonical);
 }
 
 int main(int argc, char** argv)

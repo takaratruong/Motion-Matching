@@ -194,3 +194,20 @@ G1 LMM model error: ./sonic/runs/g1-lmm-flat-60hz/model/manifest.json: cannot op
 ```
 
 No real interactive claim was made.
+
+## Canonical v3 data binding migration (2026-08-09)
+
+The Task 4 loader now consumes only the canonical Task 1
+`g1-lmm-flat-data/v3` identity. Its production-shaped synthetic model binds the
+observed v3 manifest digest and the canonical database/features digests, and
+its latent table has exactly `256x32` values to match the walk-only database.
+A model manifest that still declares a v2 data binding rejects before any of
+the three evaluation buffers are allocated. The existing data-manifest,
+data-artifact, model-artifact, live-file, ABI, late-NaN, one-stepper/one-commit,
+and full transaction-isolation gates continue to pass against v3.
+
+Only the finite ordinary source proof changed duration: it now visits the 256
+source rows once without a seam. The learned recurrent LMM acceptance contract
+remains a 600-tick transactional interactive gate and is not bounded by latent
+table row count. No accepted Task 3 model is published, so this migration did
+not launch the viewer or claim the deferred 600-tick interactive result.

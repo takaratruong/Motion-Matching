@@ -1031,7 +1031,7 @@ int main(int argc, char** argv)
         {
             fprintf(
                 stderr,
-                "G1 LMM startup error: lmm requires the flat v2 bundle and "
+                "G1 LMM startup error: lmm requires the canonical flat v3 bundle and "
                 "matching-enabled runtime\n");
             return 2;
         }
