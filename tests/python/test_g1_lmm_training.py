@@ -1192,6 +1192,32 @@ print(json.dumps({'observed': observed, 'final': os.environ.get('CUBLAS_WORKSPAC
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("CUBLAS_WORKSPACE_CONFIG", completed.stderr)
 
+    def test_cpu_index_alias_reaches_eager_decompressor_kernel(self):
+        dimensions = G1LmmDimensions()
+        parents, target, ground_rows = _orange_duck_loss_fixture(frames=2)
+        compressor = Compressor(dimensions)
+        decompressor = Decompressor(dimensions)
+        compressor_rows = torch.zeros(2, dimensions.compressor_input)
+        feature_rows = torch.zeros(2, dimensions.features)
+        kernel = g1_lmm_training._build_decompressor_training_kernel(
+            compressor=compressor,
+            decompressor=decompressor,
+            compressor_rows=compressor_rows,
+            feature_rows=feature_rows,
+            output_mean=target.mean(dim=0),
+            output_std=torch.full((dimensions.decompressor_output,), 0.03),
+            ground_rows=ground_rows,
+            parents=tuple(int(parent) for parent in parents),
+            dt=1.0 / 60.0,
+            device=torch.device("cpu:0"),
+        )
+
+        loss = kernel(torch.tensor([[0, 1]], dtype=torch.long))
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertFalse(kernel.compiled)
+        self.assertEqual(kernel.name, "eager/v1")
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class G1LmmCompiledCudaTrainingTest(unittest.TestCase):
@@ -1335,6 +1361,44 @@ class G1LmmCompiledCudaTrainingTest(unittest.TestCase):
             self.kernel.name,
             "torch-compile-reduce-overhead/fullgraph/v1",
         )
+
+    def test_unindexed_cuda_alias_reaches_compiled_decompressor_kernel(self):
+        alias_kernel = g1_lmm_training._build_decompressor_training_kernel(
+            compressor=self.compressor,
+            decompressor=self.decompressor,
+            compressor_rows=self.compressor_rows,
+            feature_rows=self.feature_rows,
+            output_mean=self.output_mean,
+            output_std=self.output_std,
+            ground_rows=self.ground_rows,
+            parents=self.parents_tuple,
+            dt=1.0 / 60.0,
+            device=torch.device("cuda"),
+        )
+
+        alias_kernel.begin_step()
+        loss = alias_kernel(self.schedule[0])
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertTrue(alias_kernel.compiled)
+
+    def test_compiled_kernel_rejects_actual_cross_device_tensor(self):
+        mismatched_ground = dict(self.ground_rows)
+        mismatched_ground["contacts"] = mismatched_ground["contacts"].cpu()
+
+        with self.assertRaisesRegex(ValueError, "one actual device"):
+            g1_lmm_training._build_decompressor_training_kernel(
+                compressor=self.compressor,
+                decompressor=self.decompressor,
+                compressor_rows=self.compressor_rows,
+                feature_rows=self.feature_rows,
+                output_mean=self.output_mean,
+                output_std=self.output_std,
+                ground_rows=mismatched_ground,
+                parents=self.parents_tuple,
+                dt=1.0 / 60.0,
+                device=torch.device("cuda"),
+            )
 
     def test_compiled_kernel_has_repeatable_100_step_parameter_sha(self):
         first = self._parameter_digest_after_100_steps()

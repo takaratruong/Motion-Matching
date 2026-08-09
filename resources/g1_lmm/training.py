@@ -584,9 +584,30 @@ def _build_decompressor_training_kernel(
         "output_std": output_std,
         **ground_rows,
     }
-    for name, values in tensors.items():
-        if values.device != device:
-            raise ValueError(f"compiled decompressor {name} is on the wrong device")
+    tensors.update(
+        {
+            f"compressor.{name}": parameter
+            for name, parameter in compressor.named_parameters()
+        }
+    )
+    tensors.update(
+        {
+            f"decompressor.{name}": parameter
+            for name, parameter in decompressor.named_parameters()
+        }
+    )
+    actual_devices = {values.device for values in tensors.values()}
+    if len(actual_devices) != 1:
+        raise ValueError("compiled decompressor tensors must share one actual device")
+    actual_device = next(iter(actual_devices))
+    if actual_device.type != device.type:
+        raise ValueError("compiled decompressor requested device type does not match tensors")
+    if (
+        device.type == "cuda"
+        and device.index is not None
+        and device.index != actual_device.index
+    ):
+        raise ValueError("compiled decompressor requested CUDA index does not match tensors")
     for name, values in ground_rows.items():
         if values.shape[0] != frames:
             raise ValueError(f"compiled decompressor {name} has the wrong frame count")
