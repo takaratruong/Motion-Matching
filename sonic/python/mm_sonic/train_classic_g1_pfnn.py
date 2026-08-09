@@ -417,6 +417,10 @@ class _VerticalTrainingView:
             "split": self.split,
             "sequence_lane": str(self._arrays.sequence_lane[row]),
             "terrain_class": str(self._arrays.terrain_class[row]),
+            "terrain_sha256": str(self._arrays.terrain_sha256[row]),
+            "mirrored": bool(self._arrays.mirrored[row]),
+            "root_world_xy": self._arrays.root_world_xy[row].copy(),
+            "root_world_yaw": float(self._arrays.root_world_yaw[row]),
         }
 
 
@@ -582,7 +586,11 @@ def train(arguments: argparse.Namespace) -> Path:
         val_x, val_y, val_phase, _, _ = _materialize(validation_dataset)
         seed_dataset = train_dataset
     kinematics = TorchG1ForwardKinematics.from_mjcf(arguments.model_path)
-    runtime_seed = choose_runtime_seed(seed_dataset, kinematics.joint_limits)
+    runtime_seed = choose_runtime_seed(
+        seed_dataset,
+        kinematics.joint_limits,
+        require_terrain=arguments.train_source == "released-pfnn",
+    )
     phase_q99 = training_phase_advance_q99(seed_dataset)
     normalization = {
         "x_mean": train_dataset.x_mean,

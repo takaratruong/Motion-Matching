@@ -350,6 +350,7 @@ def _load_runtime(
         enforce_motion_envelope=strict,
         command_driven_root=False,
         hold_idle_pose=not released,
+        maximum_grade_degrees=89.0 if released else 20.0,
     )
 
 

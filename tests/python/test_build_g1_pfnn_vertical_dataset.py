@@ -108,6 +108,11 @@ class BuildG1PFNNVerticalDatasetTest(unittest.TestCase):
         train = dataset.splits["train"]
         validation = dataset.splits["validation"]
         self.assertGreater(len(train.phase), 0)
+        self.assertEqual(train.root_world_xy.shape, (len(train.phase), 2))
+        self.assertEqual(train.root_world_yaw.shape, train.phase.shape)
+        np.testing.assert_allclose(train.root_world_xy[:, 1], 0.0)
+        np.testing.assert_allclose(train.root_world_yaw, 0.0)
+        self.assertGreater(float(np.max(train.root_world_xy[:, 0])), 0.0)
         self.assertEqual(train.sequence_lane.shape, train.phase.shape)
         self.assertTrue(np.all(train.sequence_lane == "motion"))
         self.assertEqual(np.count_nonzero(train.mirrored), len(train.phase) // 2)

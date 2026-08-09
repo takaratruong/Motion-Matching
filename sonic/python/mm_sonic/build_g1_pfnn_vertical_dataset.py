@@ -42,7 +42,7 @@ from mm_sonic.terrain_pfnn.phase import ContactPhaseTrack, released_pfnn_phase_t
 from mm_sonic.terrain_pfnn.sources import PFNNSourceClip, load_pfnn_retarget_source
 
 
-VERTICAL_DATASET_SCHEMA = "g1-pfnn-vertical-dataset/v1"
+VERTICAL_DATASET_SCHEMA = "g1-pfnn-vertical-dataset/v2"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SPLITS = ("train", "validation")
 _SPLIT_FIELDS = {
@@ -52,6 +52,8 @@ _SPLIT_FIELDS = {
     "clip_id",
     "sequence_lane",
     "center_frame_120hz",
+    "root_world_xy",
+    "root_world_yaw",
     "terrain_class",
     "terrain_sha256",
     "mirrored",
@@ -139,6 +141,8 @@ class VerticalSplitArrays:
     clip_id: np.ndarray
     sequence_lane: np.ndarray
     center_frame_120hz: np.ndarray
+    root_world_xy: np.ndarray
+    root_world_yaw: np.ndarray
     terrain_class: np.ndarray
     terrain_sha256: np.ndarray
     mirrored: np.ndarray
@@ -152,6 +156,8 @@ class VerticalSplitArrays:
             "clip_id": ((count,), np.dtype("<U128")),
             "sequence_lane": ((count,), np.dtype("<U16")),
             "center_frame_120hz": ((count,), np.dtype(np.int64)),
+            "root_world_xy": ((count, 2), np.dtype(np.float32)),
+            "root_world_yaw": ((count,), np.dtype(np.float32)),
             "terrain_class": ((count,), np.dtype("<U10")),
             "terrain_sha256": ((count,), np.dtype("<U64")),
             "mirrored": ((count,), np.dtype(np.bool_)),
@@ -268,7 +274,7 @@ def _dataset_digest(
     terrain_receipt_set_sha256: str,
     source_roles: Mapping[str, str],
 ) -> str:
-    digest = hashlib.sha256(b"g1-pfnn-vertical-dataset/v1\0")
+    digest = hashlib.sha256(b"g1-pfnn-vertical-dataset/v2\0")
     provenance = json.dumps(
         {
             "selection_sha256": selection_sha256,
@@ -289,19 +295,39 @@ def _dataset_digest(
     return digest.hexdigest()
 
 
-def _split_arrays(rows: list[tuple[PFNNTrainingWindow, int, str, bool]]) -> VerticalSplitArrays:
+def _split_arrays(
+    rows: list[tuple[PFNNTrainingWindow, int, str, bool, np.ndarray, float]]
+) -> VerticalSplitArrays:
     return VerticalSplitArrays(
-        x=np.stack([row.x for row, _, _, _ in rows]).astype(np.float32),
-        y=np.stack([row.y for row, _, _, _ in rows]).astype(np.float32),
-        phase=np.asarray([row.phase for row, _, _, _ in rows], dtype=np.float32),
-        clip_id=np.asarray([row.clip_id for row, _, _, _ in rows], dtype="<U128"),
-        sequence_lane=np.asarray(
-            [row.sequence_lane for row, _, _, _ in rows], dtype="<U16"
+        x=np.stack([row.x for row, _, _, _, _, _ in rows]).astype(np.float32),
+        y=np.stack([row.y for row, _, _, _, _, _ in rows]).astype(np.float32),
+        phase=np.asarray(
+            [row.phase for row, _, _, _, _, _ in rows], dtype=np.float32
         ),
-        center_frame_120hz=np.asarray([center for _, center, _, _ in rows], dtype=np.int64),
-        terrain_class=np.asarray([row.terrain_class for row, _, _, _ in rows], dtype="<U10"),
-        terrain_sha256=np.asarray([terrain for _, _, terrain, _ in rows], dtype="<U64"),
-        mirrored=np.asarray([mirrored for _, _, _, mirrored in rows], dtype=np.bool_),
+        clip_id=np.asarray(
+            [row.clip_id for row, _, _, _, _, _ in rows], dtype="<U128"
+        ),
+        sequence_lane=np.asarray(
+            [row.sequence_lane for row, _, _, _, _, _ in rows], dtype="<U16"
+        ),
+        center_frame_120hz=np.asarray(
+            [center for _, center, _, _, _, _ in rows], dtype=np.int64
+        ),
+        root_world_xy=np.stack([root for _, _, _, _, root, _ in rows]).astype(
+            np.float32
+        ),
+        root_world_yaw=np.asarray(
+            [yaw for _, _, _, _, _, yaw in rows], dtype=np.float32
+        ),
+        terrain_class=np.asarray(
+            [row.terrain_class for row, _, _, _, _, _ in rows], dtype="<U10"
+        ),
+        terrain_sha256=np.asarray(
+            [terrain for _, _, terrain, _, _, _ in rows], dtype="<U64"
+        ),
+        mirrored=np.asarray(
+            [mirrored for _, _, _, mirrored, _, _ in rows], dtype=np.bool_
+        ),
     )
 
 
@@ -323,7 +349,9 @@ def build_vertical_dataset(sources: tuple[VerticalSliceSource, ...]) -> Vertical
     if len(selection) != 1 or len(retarget) != 1:
         raise ValueError("vertical source provenance mismatch")
 
-    rows: dict[str, list[tuple[PFNNTrainingWindow, int, str, bool]]] = {
+    rows: dict[
+        str, list[tuple[PFNNTrainingWindow, int, str, bool, np.ndarray, float]]
+    ] = {
         name: [] for name in _SPLITS
     }
     keys: set[tuple[str, str, int, str, bool]] = set()
@@ -342,6 +370,20 @@ def build_vertical_dataset(sources: tuple[VerticalSliceSource, ...]) -> Vertical
                     < segment.cycle_stop_frame_120hz
                 ):
                     continue
+                root_xy = np.asarray(
+                    source.clip.root_position_world[window.center_frame, :2],
+                    dtype=np.float64,
+                )
+                w, x, y, z = np.asarray(
+                    source.clip.root_quaternion_world_wxyz[window.center_frame],
+                    dtype=np.float64,
+                )
+                root_yaw = float(
+                    np.arctan2(
+                        2.0 * (w * z + x * y),
+                        1.0 - 2.0 * (y * y + z * z),
+                    )
+                )
                 values = [(window, False)]
                 if source.role == "train":
                     values.append((mirror_window(window), True))
@@ -357,7 +399,14 @@ def build_vertical_dataset(sources: tuple[VerticalSliceSource, ...]) -> Vertical
                         raise ValueError("duplicate PFNN window")
                     keys.add(key)
                     rows[source.role].append(
-                        (value, center, segment.terrain_sha256, mirrored)
+                        (
+                            value,
+                            center,
+                            segment.terrain_sha256,
+                            mirrored,
+                            root_xy,
+                            root_yaw,
+                        )
                     )
     split_arrays = {name: _split_arrays(rows[name]) for name in _SPLITS}
     train = split_arrays["train"]

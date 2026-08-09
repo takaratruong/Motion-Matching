@@ -171,6 +171,7 @@ class TerrainPFNNRuntimeTests(unittest.TestCase):
         enforce_motion_envelope: bool = True,
         command_driven_root: bool = False,
         hold_idle_pose: bool = False,
+        maximum_grade_degrees: float = 20.0,
     ) -> TerrainPFNNRuntime:
         return TerrainPFNNRuntime(
             checkpoint=FakeCheckpoint() if checkpoint is None else checkpoint,
@@ -180,6 +181,7 @@ class TerrainPFNNRuntimeTests(unittest.TestCase):
             enforce_motion_envelope=enforce_motion_envelope,
             command_driven_root=command_driven_root,
             hold_idle_pose=hold_idle_pose,
+            maximum_grade_degrees=maximum_grade_degrees,
         )
 
     def test_checkpoint_seed_is_the_exact_reached_bootstrap_state(self) -> None:
@@ -355,6 +357,17 @@ class TerrainPFNNRuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(frame.phase, 0.2, places=5)  # q99 cap is 0.3
         expected = torch.sigmoid(torch.tensor((-2.0, 0.0, 2.0, 4.0))).numpy()
         np.testing.assert_allclose(frame.contact_probability, expected, atol=1.0e-7)
+
+    def test_released_pfnn_mode_accepts_exact_rough_surface_grade(self) -> None:
+        runtime = self.make_runtime(
+            FakeModel([physical_output()]),
+            terrain=terrain_with_grade(55.0),
+            maximum_grade_degrees=89.0,
+        )
+
+        frame = runtime.step(np.zeros(2), camera_yaw=0.0)
+
+        self.assertNotIn("hold_reason", frame.diagnostics)
 
     def test_invalid_prediction_holds_every_runtime_state_transactionally(self) -> None:
         model = FakeModel(

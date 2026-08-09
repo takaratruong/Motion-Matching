@@ -2467,6 +2467,7 @@ def choose_runtime_seed(
     joint_limits: object,
     *,
     fitted_subset: Mapping[str, object] | None = None,
+    require_terrain: bool = False,
 ) -> dict[str, object]:
     """Choose a fitted recurrent state whose first inference is also fitted.
 
@@ -2477,6 +2478,8 @@ def choose_runtime_seed(
     dataset prevents seed selection from escaping the fitted rows.
     """
 
+    if type(require_terrain) is not bool:
+        raise TypeError("require_terrain must be bool")
     if getattr(dataset, "split", None) != "train":
         raise ValueError("runtime seed may only be selected from training data")
     limits = torch.as_tensor(joint_limits, dtype=torch.float64, device="cpu")
@@ -2521,11 +2524,16 @@ def choose_runtime_seed(
         has_rollout_horizon = all(
             (clip, lane, center + offset) in unique for offset in range(16)
         )
-        if (
-            sample.get("terrain_class") != "flat"
-            or predecessor_entry is None
-            or not has_rollout_horizon
-        ):
+        terrain_digest = sample.get("terrain_sha256")
+        terrain_candidate = (
+            type(terrain_digest) is str
+            and len(terrain_digest) == 64
+            and all(character in "0123456789abcdef" for character in terrain_digest)
+            and sample.get("mirrored") is False
+        )
+        if predecessor_entry is None or not has_rollout_horizon or (
+            require_terrain and not terrain_candidate
+        ) or (not require_terrain and sample.get("terrain_class") != "flat"):
             continue
         physical_target = np.asarray(sample["y"], dtype=np.float64) * y_std + y_mean
         predecessor = predecessor_entry[1]
@@ -2625,10 +2633,23 @@ def choose_runtime_seed(
         reconstructed_normalized, first_normalized, rtol=0.0, atol=3.0e-5
     ):
         raise ValueError("runtime seed does not reproduce first fitted input")
+    if require_terrain:
+        root_xy = np.asarray(first_fitted.get("root_world_xy"), dtype=np.float64)
+        root_yaw = first_fitted.get("root_world_yaw")
+        if (
+            root_xy.shape != (2,)
+            or not np.isfinite(root_xy).all()
+            or type(root_yaw) not in (float, np.float32, np.float64)
+            or not math.isfinite(float(root_yaw))
+        ):
+            raise ValueError("terrain runtime seed world placement is invalid")
+    else:
+        root_xy = np.zeros(2, dtype=np.float64)
+        root_yaw = 0.0
     best = {
             "phase": torch.tensor(phase, dtype=torch.float32),
-            "world_xy": torch.zeros(2, dtype=torch.float32),
-            "world_yaw": torch.tensor(0.0, dtype=torch.float32),
+            "world_xy": torch.as_tensor(root_xy.copy(), dtype=torch.float32),
+            "world_yaw": torch.tensor(float(root_yaw), dtype=torch.float32),
             "root_height": torch.tensor(
                 float(predecessor_physical[OUTPUT_LAYOUT["root_height"]][0]),
                 dtype=torch.float32,

@@ -151,6 +151,7 @@ class TerrainPFNNViewerTests(unittest.TestCase):
                     object(),
                 )
         self.assertIs(factory.call_args.kwargs["hold_idle_pose"], False)
+        self.assertEqual(factory.call_args.kwargs["maximum_grade_degrees"], 89.0)
 
     def test_defaults_select_the_classic_g1_artifacts(self) -> None:
         from mm_sonic.terrain_pfnn_viewer import _parser

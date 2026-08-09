@@ -256,6 +256,7 @@ class TerrainPFNNRuntime:
         enforce_motion_envelope: bool = True,
         command_driven_root: bool = False,
         hold_idle_pose: bool = False,
+        maximum_grade_degrees: float = MAXIMUM_GRADE_DEGREES,
     ) -> None:
         if not callable(height_and_grade_at):
             raise TypeError("height_and_grade_at must be callable")
@@ -265,6 +266,12 @@ class TerrainPFNNRuntime:
             raise TypeError("command_driven_root must be bool")
         if type(hold_idle_pose) is not bool:
             raise TypeError("hold_idle_pose must be bool")
+        if (
+            not math.isfinite(float(maximum_grade_degrees))
+            or not 0.0 < float(maximum_grade_degrees) < 90.0
+        ):
+            raise ValueError("maximum_grade_degrees must be finite in (0, 90)")
+        self._maximum_grade_degrees = float(maximum_grade_degrees)
         signature = getattr(kinematics, "kinematic_signature_sha256", None)
         if signature != getattr(checkpoint, "kinematic_signature_sha256", None):
             raise ValueError("checkpoint kinematic signature mismatch")
@@ -506,7 +513,8 @@ class TerrainPFNNRuntime:
             return None
         if (
             not allow_unsupported_grade
-            and raw.absolute_grade_degrees > MAXIMUM_GRADE_DEGREES + 1.0e-10
+            and raw.absolute_grade_degrees
+            > self._maximum_grade_degrees + 1.0e-10
         ):
             return None
         return raw
