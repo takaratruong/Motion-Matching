@@ -427,6 +427,23 @@ class _VerticalTrainingView:
         }
 
 
+def _released_runtime_seed_view(dataset: VerticalDataset) -> _IndexedTrainDataset:
+    """Keep appended GRAIL rows from replacing the released-PFNN bootstrap."""
+
+    view = _VerticalTrainingView(dataset, "train")
+    indices = np.asarray(
+        [
+            index
+            for index in range(len(view))
+            if not str(view[index]["clip_id"]).startswith("terrain_slopes__")
+        ],
+        dtype=np.int64,
+    )
+    if len(indices) == 0:
+        raise ValueError("released PFNN corpus contains no runtime seed rows")
+    return _IndexedTrainDataset(view, indices)
+
+
 def _materialize_vertical(
     view: _VerticalTrainingView,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -562,7 +579,7 @@ def train(arguments: argparse.Namespace) -> Path:
             vertical_dataset.splits["train"].clip_id, dtype="<U128"
         )
         manifest = {"dataset_digest_sha256": vertical_dataset.dataset_sha256}
-        seed_dataset = train_dataset
+        seed_dataset = _released_runtime_seed_view(vertical_dataset)
     else:
         manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
         train_dataset = PFNNShardDataset(root, "train")

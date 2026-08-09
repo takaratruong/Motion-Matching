@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ import torch
 from torch.nn import functional as F
 
 from mm_sonic.train_classic_g1_pfnn import (
+    _released_runtime_seed_view,
     _grail_train_validation_masks,
     _mirror_normalized_examples,
     _parser,
@@ -106,6 +108,28 @@ class ClassicG1PFNNTests(unittest.TestCase):
                 ["--dataset", "d", "--model-path", "m", "--output", "o"]
             ).runtime_seed,
             "flat",
+        )
+
+    def test_released_runtime_seed_excludes_appended_grail_rows(self) -> None:
+        dataset = build_vertical_dataset(
+            (_source("train", "released_train"), _source("validation", "released_val"))
+        )
+        arrays = dataset.splits["train"]
+        clips = np.array(arrays.clip_id, copy=True)
+        clips[-1] = "terrain_slopes__slope_000__000"
+        dataset = replace(
+            dataset,
+            splits={**dataset.splits, "train": replace(arrays, clip_id=clips)},
+        )
+
+        view = _released_runtime_seed_view(dataset)
+
+        self.assertEqual(len(view), len(arrays.clip_id) - 1)
+        self.assertTrue(
+            all(
+                not str(view[index]["clip_id"]).startswith("terrain_slopes__")
+                for index in range(len(view))
+            )
         )
 
     def test_native_g1_validation_holds_out_last_present_variant_per_family(self) -> None:
