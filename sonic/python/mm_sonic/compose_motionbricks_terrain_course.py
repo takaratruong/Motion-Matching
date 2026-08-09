@@ -631,10 +631,12 @@ def _filter_exact_safe_phase_segments(
 
     Pose/velocity similarity cannot distinguish MotionBricks' startup buffer
     from a settled gait.  Since this is the globally privileged compiler, use
-    the known exact mesh to reject a flat continuation that already collides
-    before asking inertialization or foot locking to join it.  The wider 8 mm
-    screening limit leaves a small correction band for the contact retarget;
-    the final composed route still has the authoritative 5 mm gate below.
+    the known exact mesh to reject a flat continuation with a body collision.
+    Foot-only overlap up to the existing 25 mm clearance-repair budget remains
+    eligible: an upper-platform approach can initially overlap the landing by
+    10--15 mm even though the later contact retarget and smooth clearance pass
+    resolves it cleanly.  This is only a candidate prefilter.  Every completed
+    composition still passes the unchanged 5 mm foot / zero-body final audit.
     """
 
     target_index = 0 if source_is_approach else -1
@@ -680,10 +682,17 @@ def _filter_exact_safe_phase_segments(
             maximum_foot_penetration_m=0.008,
             maximum_forbidden_body_penetration_m=1.0e-6,
         )
+        accepted_without_repair = bool(audit.accepted)
+        eligible_for_final_repair = bool(
+            audit.maximum_forbidden_body_penetration_m <= 1.0e-6
+            and audit.maximum_foot_penetration_m <= 0.025
+        )
         receipts.append(
             {
                 "phase": _candidate_row(candidate),
-                "accepted": bool(audit.accepted),
+                "accepted": eligible_for_final_repair,
+                "accepted_without_repair": accepted_without_repair,
+                "eligible_for_final_repair": eligible_for_final_repair,
                 "maximum_foot_penetration_m": float(
                     audit.maximum_foot_penetration_m
                 ),
@@ -692,7 +701,7 @@ def _filter_exact_safe_phase_segments(
                 ),
             }
         )
-        if audit.accepted:
+        if eligible_for_final_repair:
             accepted.append(candidate)
             if len(accepted) >= int(desired_count):
                 break
