@@ -102,9 +102,11 @@ upper-body naming. This matches the `bvh_nokov` path used by
 `retargeting_project`, except that the PFNN torso joint is named `Spine1`
 instead of `Spine2`. The adapter adds only that explicit alias after parsing;
 all other source joints must resolve without renaming. Each 120 Hz source file
-is deterministically subsampled by two before retargeting, matching the
+is first retargeted at its native 120 Hz rate. The accepted retarget is then
+deterministically subsampled by two for PFNN feature generation, matching the
 reference preprocessing rate of 60 Hz. Released phase, gait, and footstep
-annotations use the same subsample.
+annotations use the same 60 Hz subsample. Both the native retarget and the
+derived PFNN-rate motion carry explicit FPS metadata.
 
 The batch adapter calls GMR's pinned `bvh_nokov -> unitree_g1` mapping. It does
 not implement another IK solver. GMR supplies the pelvis, leg, ankle, torso,
@@ -115,13 +117,21 @@ shared grounding routine from `retargeting_project` using MuJoCo heel and toe
 sites. MuJoCo forward kinematics derives the 30-body positions and rotations
 used by PFNN feature generation.
 
-All 80 annotated released BVHs are retargeted independently so the released
-mirror annotations remain authoritative. There are 931,980 raw source frames,
-or 465,990 frames after the reference stride. At the repository's measured
-approximately 135 frames/second, that is about 58 minutes serial. The batch
-driver uses deterministic clip-level parallelism with at most eight workers;
-the expected retargeting stage is 15--60 minutes including loading, grounding,
-and output serialization.
+Before the batch job, `LocomotionFlat01_000.bvh` is retargeted at 120 Hz and
+saved as an independently playable G1 artifact. The MuJoCo viewer must play it
+at 120 Hz with pause, seek, loop, and camera controls. The user reviews this
+sample before any full-corpus retarget, terrain fitting, dataset generation, or
+training begins. A rejection returns to the source alias, scale, and GMR target
+configuration; it does not add pose smoothing or correction downstream.
+
+After sample approval, all 80 annotated released BVHs are retargeted
+independently so the released mirror annotations remain authoritative. There
+are 931,980 native-rate source frames and 465,990 derived 60 Hz PFNN frames. At
+the repository's measured approximately 135 retargeted frames/second, native
+retargeting is about 1.9 hours serial. The batch driver uses deterministic
+clip-level parallelism with at most eight workers; the expected full-corpus
+retargeting stage is 20--90 minutes including loading, grounding, 120 Hz output,
+60 Hz derivation, and serialization.
 
 The result is rejected if any frame is non-finite, violates a joint limit,
 swaps a left/right target, or exceeds these physical errors when compared with
@@ -223,6 +233,7 @@ root, or MotionBricks fallback.
 
 Automated acceptance requires:
 
+- user approval of the independently playable 120 Hz G1 sample retarget;
 - deterministic retargeting and dataset hashes across two clean runs;
 - all required motion categories represented in the training split;
 - no train/validation/test capture identity overlap;
