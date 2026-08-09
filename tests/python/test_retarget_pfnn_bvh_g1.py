@@ -5,7 +5,10 @@ from pathlib import Path
 import numpy as np
 
 from mm_sonic.retarget_pfnn_bvh_g1 import (
+    frame_slice,
     prepare_pfnn_bvh,
+    retarget_slices,
+    scale_pfnn_frames,
     validate_g1_motion,
 )
 
@@ -73,6 +76,8 @@ class PFNNBVHRetargetTests(unittest.TestCase):
         self.assertEqual(receipt.fps, 120.0)
         self.assertIn("JOINT Spine2", contents)
         self.assertNotIn("JOINT Spine1", contents)
+        self.assertIn("JOINT LeftToeBase", contents)
+        self.assertIn("JOINT RightToeBase", contents)
         self.assertEqual(receipt.aliases, (("Spine1", "Spine2"),))
         self.assertEqual(len(receipt.source_sha256), 64)
         self.assertEqual(len(receipt.prepared_sha256), 64)
@@ -171,6 +176,63 @@ class PFNNBVHRetargetTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             PlaybackState(frame_count=0)
+
+    def test_selects_bounded_debug_slice(self) -> None:
+        selected = frame_slice(total_frames=8171, start_frame=240, frame_count=120)
+        self.assertEqual(selected, slice(240, 360))
+        self.assertEqual(
+            frame_slice(total_frames=8171, start_frame=0, frame_count=None),
+            slice(0, 8171),
+        )
+        for values in (
+            {"total_frames": 0, "start_frame": 0, "frame_count": 1},
+            {"total_frames": 10, "start_frame": -1, "frame_count": 1},
+            {"total_frames": 10, "start_frame": 10, "frame_count": 1},
+            {"total_frames": 10, "start_frame": 0, "frame_count": 0},
+            {"total_frames": 10, "start_frame": 5, "frame_count": 6},
+        ):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                frame_slice(**values)
+
+    def test_scales_pfnn_positions_without_changing_orientations(self) -> None:
+        orientation = np.array([1.0, 0.0, 0.0, 0.0])
+        frames = [
+            {
+                "Hips": [np.array([1.0, 2.0, 3.0]), orientation.copy()],
+                "LeftFoot": [np.array([-1.0, 0.0, 4.0]), orientation.copy()],
+            }
+        ]
+        scaled = scale_pfnn_frames(frames)
+        np.testing.assert_allclose(scaled[0]["Hips"][0], [5.6444, 11.2888, 16.9332])
+        np.testing.assert_allclose(scaled[0]["LeftFoot"][0], [-5.6444, 0.0, 22.5776])
+        np.testing.assert_array_equal(scaled[0]["Hips"][1], orientation)
+        np.testing.assert_array_equal(frames[0]["Hips"][0], [1.0, 2.0, 3.0])
+
+    def test_selects_hidden_warmup_before_display_slice(self) -> None:
+        warmup, displayed = retarget_slices(
+            total_frames=8171,
+            start_frame=7700,
+            frame_count=120,
+            warmup_frames=120,
+        )
+        self.assertEqual(warmup, slice(7580, 7700))
+        self.assertEqual(displayed, slice(7700, 7820))
+        self.assertEqual(
+            retarget_slices(
+                total_frames=100,
+                start_frame=20,
+                frame_count=10,
+                warmup_frames=30,
+            ),
+            (slice(0, 20), slice(20, 30)),
+        )
+        with self.assertRaises(ValueError):
+            retarget_slices(
+                total_frames=100,
+                start_frame=20,
+                frame_count=10,
+                warmup_frames=-1,
+            )
 
 
 if __name__ == "__main__":

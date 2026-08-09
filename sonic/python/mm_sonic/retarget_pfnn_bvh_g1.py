@@ -25,6 +25,7 @@ import numpy as np
 
 GMR_COMMIT = "bb1bbe40774794fceb2a7c579a3464a28e68c844"
 RETARGET_PROJECT_COMMIT = "fb3433a6310ab4198102d3905e74b73944fc1f6b"
+PFNN_POSITION_SCALE = 5.6444
 G1_JOINT_NAMES = (
     "left_hip_pitch_joint",
     "left_hip_roll_joint",
@@ -63,8 +64,8 @@ _FRAME_TIME_RE = re.compile(
 )
 _SPINE1_RE = re.compile(r"(?m)^(\s*JOINT\s+)Spine1(\s*)$")
 _SPINE2_RE = re.compile(r"(?m)^\s*JOINT\s+Spine2\s*$")
-_LEFT_TOE_RE = re.compile(r"(?m)^\s*JOINT\s+LeftToeBase\s*$")
-_RIGHT_TOE_RE = re.compile(r"(?m)^\s*JOINT\s+RightToeBase\s*$")
+_LEFT_TOE_RE = re.compile(r"(?m)^(\s*JOINT\s+)LeftToeBase(\s*)$")
+_RIGHT_TOE_RE = re.compile(r"(?m)^(\s*JOINT\s+)RightToeBase(\s*)$")
 
 
 @dataclass(frozen=True)
@@ -140,11 +141,13 @@ def prepare_pfnn_bvh(source: Path, destination: Path) -> SourceReceipt:
         raise ValueError("PFNN BVH must declare exactly one JOINT Spine1")
     if _SPINE2_RE.search(contents) is not None:
         raise ValueError("PFNN BVH must not already declare JOINT Spine2")
-    if _LEFT_TOE_RE.search(contents) is None or _RIGHT_TOE_RE.search(contents) is None:
-        raise ValueError("PFNN BVH must declare LeftToeBase and RightToeBase")
-    prepared, substitutions = _SPINE1_RE.subn(r"\1Spine2\2", contents)
-    if substitutions != 1:
-        raise AssertionError("exact Spine1 alias substitution failed")
+    if len(_LEFT_TOE_RE.findall(contents)) != 1 or len(
+        _RIGHT_TOE_RE.findall(contents)
+    ) != 1:
+        raise ValueError("PFNN BVH must declare LeftToeBase and RightToeBase exactly once")
+    prepared, spine_substitutions = _SPINE1_RE.subn(r"\1Spine2\2", contents)
+    if spine_substitutions != 1:
+        raise AssertionError("exact PFNN-to-Nokov alias substitution failed")
     _atomic_bytes(destination, prepared.encode())
     return SourceReceipt(
         source_sha256=_sha256(source),
@@ -211,6 +214,72 @@ def validate_g1_motion(
         raise ValueError("motion contains a native G1 joint-limit violation")
 
 
+def frame_slice(
+    *, total_frames: int, start_frame: int, frame_count: int | None
+) -> slice:
+    """Select an exact bounded interval for fast retarget diagnostics."""
+
+    if type(total_frames) is not int or total_frames < 1:
+        raise ValueError("total_frames must be a positive integer")
+    if type(start_frame) is not int or not 0 <= start_frame < total_frames:
+        raise ValueError("start_frame must index the source timeline")
+    count = total_frames - start_frame if frame_count is None else frame_count
+    if type(count) is not int or count < 1:
+        raise ValueError("frame_count must be a positive integer or None")
+    stop = start_frame + count
+    if stop > total_frames:
+        raise ValueError("requested frame interval exceeds the source timeline")
+    return slice(start_frame, stop)
+
+
+def retarget_slices(
+    *,
+    total_frames: int,
+    start_frame: int,
+    frame_count: int | None,
+    warmup_frames: int,
+) -> tuple[slice, slice]:
+    """Return hidden solver warm-up and displayed source intervals."""
+
+    displayed = frame_slice(
+        total_frames=total_frames,
+        start_frame=start_frame,
+        frame_count=frame_count,
+    )
+    if type(warmup_frames) is not int or warmup_frames < 0:
+        raise ValueError("warmup_frames must be a nonnegative integer")
+    return slice(max(0, start_frame - warmup_frames), start_frame), displayed
+
+
+def scale_pfnn_frames(
+    frames: list[dict[str, list[np.ndarray]]],
+) -> list[dict[str, list[np.ndarray]]]:
+    """Undo GMR's centimeter assumption using PFNN's released unit scale."""
+
+    scaled: list[dict[str, list[np.ndarray]]] = []
+    for frame_index, frame in enumerate(frames):
+        output: dict[str, list[np.ndarray]] = {}
+        for bone, values in frame.items():
+            if len(values) != 2:
+                raise ValueError(
+                    f"frame {frame_index} bone {bone} must contain position/orientation"
+                )
+            position = np.asarray(values[0], dtype=np.float64)
+            orientation = np.asarray(values[1], dtype=np.float64)
+            if position.shape != (3,) or orientation.shape != (4,):
+                raise ValueError(
+                    f"frame {frame_index} bone {bone} has invalid pose shapes"
+                )
+            if not np.isfinite(position).all() or not np.isfinite(orientation).all():
+                raise ValueError(f"frame {frame_index} bone {bone} is nonfinite")
+            output[bone] = [
+                position.copy() * PFNN_POSITION_SCALE,
+                orientation.copy(),
+            ]
+        scaled.append(output)
+    return scaled
+
+
 def _git_commit(root: Path) -> str:
     result = subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -269,6 +338,8 @@ def _save_motion(
     retarget_project_commit: str,
     grounding_offset: float,
     joint_limits: np.ndarray,
+    start_frame: int,
+    warmup_frames: int,
 ) -> Path:
     root_pos = np.asarray(_field(motion, "root_pos"), dtype=np.float64)
     root_quat = np.asarray(_field(motion, "root_quat"), dtype=np.float64)
@@ -307,11 +378,15 @@ def _save_motion(
         "gmr_commit": gmr_commit,
         "retarget_project_commit": retarget_project_commit,
         "fps": fps,
-        "frame_count": receipt.frame_count,
+        "source_frame_count": receipt.frame_count,
+        "start_frame": start_frame,
+        "frame_count": len(root_pos),
+        "warmup_frames": warmup_frames,
         "aliases": [list(alias) for alias in receipt.aliases],
         "joint_names": list(G1_JOINT_NAMES),
         "root_quaternion_order": "xyzw",
         "grounding_offset_m": float(grounding_offset),
+        "pfnn_position_scale": PFNN_POSITION_SCALE,
     }
     _atomic_bytes(
         receipt_path,
@@ -326,6 +401,9 @@ def retarget_sample(
     gmr_root: Path,
     retarget_project_root: Path,
     output: Path,
+    start_frame: int = 0,
+    frame_count: int | None = None,
+    warmup_frames: int = 0,
 ) -> dict[str, object]:
     """Run pinned GMR sequentially on every native source frame."""
 
@@ -369,6 +447,15 @@ def retarget_sample(
                 raise ValueError(
                     f"GMR loaded {len(frames)} frames, expected {source_receipt.frame_count}"
                 )
+            warmup, selected = retarget_slices(
+                total_frames=len(frames),
+                start_frame=start_frame,
+                frame_count=frame_count,
+                warmup_frames=warmup_frames,
+            )
+            actual_warmup_frames = warmup.stop - warmup.start
+            work = slice(warmup.start, selected.stop)
+            frames = scale_pfnn_frames(frames[work])
             retargeter = GeneralMotionRetargeting(
                 src_human="bvh_nokov",
                 tgt_robot="unitree_g1",
@@ -383,6 +470,7 @@ def retarget_sample(
                         f"retargeted {index + 1}/{len(frames)} frames",
                         flush=True,
                     )
+            qpos = qpos[actual_warmup_frames:]
             limits = g1_joint_limits(retargeter.model)
 
             project_source = str(retarget_project_root / "src")
@@ -414,7 +502,7 @@ def retarget_sample(
             )
             validate_g1_motion(
                 motion,
-                expected_frames=source_receipt.frame_count,
+                expected_frames=selected.stop - selected.start,
                 expected_fps=source_receipt.fps,
                 joint_limits=limits,
             )
@@ -426,6 +514,8 @@ def retarget_sample(
                 retarget_project_commit=project_commit,
                 grounding_offset=grounding_offset,
                 joint_limits=limits,
+                start_frame=start_frame,
+                warmup_frames=actual_warmup_frames,
             )
     finally:
         if sys.path and sys.path[0] == str(gmr_root):
@@ -434,7 +524,10 @@ def retarget_sample(
         "status": "accepted",
         "output": str(Path(output).resolve()),
         "receipt": str(receipt_path.resolve()),
-        "frame_count": source_receipt.frame_count,
+        "source_frame_count": source_receipt.frame_count,
+        "start_frame": start_frame,
+        "frame_count": selected.stop - selected.start,
+        "warmup_frames": actual_warmup_frames,
         "fps": source_receipt.fps,
         "output_sha256": _sha256(Path(output)),
         "grounding_offset_m": grounding_offset,
@@ -447,6 +540,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--gmr-root", type=Path, required=True)
     parser.add_argument("--retarget-project-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--start-frame", type=int, default=0)
+    parser.add_argument("--frame-count", type=int)
+    parser.add_argument("--warmup-frames", type=int, default=0)
     return parser
 
 
@@ -457,6 +553,9 @@ def main() -> None:
         gmr_root=args.gmr_root,
         retarget_project_root=args.retarget_project_root,
         output=args.output,
+        start_frame=args.start_frame,
+        frame_count=args.frame_count,
+        warmup_frames=args.warmup_frames,
     )
     print(json.dumps(result, sort_keys=True))
 
