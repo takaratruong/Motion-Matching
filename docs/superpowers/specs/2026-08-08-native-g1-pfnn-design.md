@@ -21,6 +21,14 @@ The behavioral source of truth is the authors' release at
   state, predicted-root integration, phase update, pose smoothing, and
   contact-driven terrain IK.
 
+Offline retargeting uses the already-validated integration in
+`takaratruong/retargeting_project` at commit
+`fb3433a6310ab4198102d3905e74b73944fc1f6b`. Its preferred GMR path is backed
+by `YanjieZe/GMR` at commit
+`bb1bbe40774794fceb2a7c579a3464a28e68c844`. GMR already supplies a BVH
+reader, proportional human-to-G1 scaling, the complete 29-DoF G1 IK table,
+native joint limits, and MuJoCo output.
+
 The released assets are licensed for academic and non-commercial use. This
 implementation will retain the required PFNN citation and will not redistribute
 the original data or pretrained weights in Git.
@@ -32,7 +40,8 @@ This milestone includes:
 - all 40 annotated original BVH captures and their 40 released mirrored
   variants (`rest.bvh` is a calibration skeleton, not a motion clip);
 - the released phase, gait, and footstep annotations;
-- offline whole-body retargeting to the 29-DoF G1 model;
+- offline whole-body retargeting to the 29-DoF G1 model using the pinned GMR
+  pipeline;
 - the released terrain-patch generation and ten-patches-per-cycle fitting
   procedure, converted consistently from source units to metres;
 - a four-control-point cubic PFNN trained on native G1 features;
@@ -87,24 +96,36 @@ same 0.5 pose/velocity blend used by the reference runtime.
 
 ## Offline retargeting
 
-Each source BVH is loaded at its released rate and downsampled to 30 Hz at the
-same point as the reference pipeline. A deterministic scale is computed from
-the summed source and target hip-to-knee-to-ankle chain lengths. Root
-translations and terrain dimensions use this uniform scale; joint rotations do
-not.
+The PFNN BVHs use `Hips`, `LeftUpLeg`, `LeftLeg`, `LeftFoot`, `LeftToeBase`,
+`RightUpLeg`, `RightLeg`, `RightFoot`, `RightToeBase`, and Mixamo-style
+upper-body naming. This matches the `bvh_nokov` path used by
+`retargeting_project`, except that the PFNN torso joint is named `Spine1`
+instead of `Spine2`. The adapter adds only that explicit alias after parsing;
+all other source joints must resolve without renaming. Each 120 Hz source file
+is deterministically subsampled by two before retargeting, matching the
+reference preprocessing rate of 60 Hz. Released phase, gait, and footstep
+annotations use the same subsample.
 
-Each frame is solved onto G1 with a warm-started constrained least-squares IK:
+The batch adapter calls GMR's pinned `bvh_nokov -> unitree_g1` mapping. It does
+not implement another IK solver. GMR supplies the pelvis, leg, ankle, torso,
+shoulder, elbow, and wrist targets; proportional body scaling; warm-started
+Mink/MuJoCo IK; and native joint limits. The adapter preserves GMR's returned
+root position, XYZW root quaternion, and 29 joint coordinates, then applies the
+shared grounding routine from `retargeting_project` using MuJoCo heel and toe
+sites. MuJoCo forward kinematics derives the 30-body positions and rotations
+used by PFNN feature generation.
 
-- pelvis position and yaw;
-- both ankle positions and orientations;
-- both knee bend directions;
-- torso and head orientation;
-- both wrist positions and orientations; and
-- a joint-space continuity term relative to the preceding frame.
+All 80 annotated released BVHs are retargeted independently so the released
+mirror annotations remain authoritative. There are 931,980 raw source frames,
+or 465,990 frames after the reference stride. At the repository's measured
+approximately 135 frames/second, that is about 58 minutes serial. The batch
+driver uses deterministic clip-level parallelism with at most eight workers;
+the expected retargeting stage is 15--60 minutes including loading, grounding,
+and output serialization.
 
-The solver respects the native MuJoCo joint limits. The result is rejected if
-any frame is non-finite, violates a joint limit, swaps a left/right target, or
-exceeds these physical errors:
+The result is rejected if any frame is non-finite, violates a joint limit,
+swaps a left/right target, or exceeds these physical errors when compared with
+GMR's scaled human targets:
 
 - stance heel or toe position: 0.02 m;
 - swing ankle position: 0.04 m;
