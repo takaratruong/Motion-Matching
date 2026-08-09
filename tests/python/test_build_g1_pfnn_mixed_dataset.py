@@ -76,6 +76,36 @@ class BuildG1PFNNMixedDatasetTest(unittest.TestCase):
         self.assertEqual(mixed.selection_sha256, vertical.selection_sha256)
         self.assertNotEqual(mixed.dataset_sha256, vertical.dataset_sha256)
 
+    def test_drops_infeasible_retarget_joint_transition_before_normalizing(self) -> None:
+        vertical = build_vertical_dataset(
+            (_source("train", "released_train"), _source("validation", "released_val"))
+        )
+        grail = _GrailRows()
+        for row in grail.rows:
+            if (
+                row["clip_id"] == "terrain_slopes__slope_000__000"
+                and row["center_frame"] == 1
+            ):
+                row["y"][OUTPUT_LAYOUT["joint_position"].start] = 1.0
+
+        mixed = combine_vertical_and_grail(
+            vertical, grail, grail_dataset_sha256="9" * 64
+        )
+
+        train_clips = mixed.splits["train"].clip_id
+        self.assertEqual(
+            int(np.count_nonzero(train_clips == "terrain_slopes__slope_000__000")),
+            1,
+        )
+        self.assertEqual(
+            int(
+                np.count_nonzero(
+                    train_clips == "terrain_slopes__slope_000__000__mirror"
+                )
+            ),
+            1,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

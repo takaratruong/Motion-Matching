@@ -33,10 +33,15 @@ DEFAULT_SCENE = Path(
     "assets/skeletons/g1/scene_29dof.xml"
 )
 DEFAULT_DATASET = Path(
-    "sonic/runs/terrain-pfnn-classic-g1/dataset/manifest.json"
+    "sonic/runs/native-g1-pfnn/expanded/mixed-corpus-filtered/manifest.json"
 )
 DEFAULT_CHECKPOINT = Path(
-    "sonic/runs/terrain-pfnn-classic-g1/model-grail-mirrored/best.pt"
+    "sonic/runs/native-g1-pfnn/expanded/"
+    "model-mixed-filtered-rollout16-final/best.pt"
+)
+DEFAULT_TERRAIN_FIT = Path(
+    "sonic/runs/native-g1-pfnn/expanded/vertical-corpus/terrain/"
+    "WalkingUpSteps08_000__01550_01675.npz"
 )
 DEFAULT_IDLE_CLIPS = Path(
     "/home/ubuntu/projects/gear-sonic-pinned-60de0df/"
@@ -51,7 +56,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--scene-xml", type=Path, default=DEFAULT_SCENE)
     parser.add_argument("--idle-clips", type=Path, default=DEFAULT_IDLE_CLIPS)
-    parser.add_argument("--terrain-fit", type=Path)
+    parser.add_argument("--terrain-fit", type=Path, default=DEFAULT_TERRAIN_FIT)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--speed", type=float, default=0.8)
     parser.add_argument("--max-steps", type=int, default=1_000_000)
@@ -156,7 +161,11 @@ class _PFNNTerrainCallback:
 
     def __call__(self, xy: object) -> TerrainSample | None:
         point = np.asarray(xy, dtype=np.float64)
-        if point.shape != (2,) or not np.isfinite(point).all() or not self._supported(point):
+        if (
+            point.shape != (2,)
+            or not np.isfinite(point).all()
+            or not self._supported(point)
+        ):
             return None
         height = float(self.surface.height_at(point[None, :])[0])
         gradient = self.surface.gradient_at(point[None, :])[0]
@@ -172,6 +181,131 @@ class _PFNNTerrainCallback:
         ):
             raise ValueError("collision query left the rendered PFNN surface")
         return self.surface.height_at(points)
+
+
+class _PFNNCourseCallback:
+    """Flat run-up followed by the unchanged scaled released-PFNN surface."""
+
+    _BLEND_START_X_M = 0.75
+    _BLEND_STOP_X_M = 1.25
+
+    def __init__(
+        self,
+        surface: PlacedPFNNSurface,
+        *,
+        x_samples: np.ndarray,
+        y_samples: np.ndarray,
+    ) -> None:
+        if not isinstance(surface, PlacedPFNNSurface):
+            raise TypeError("surface must be a PlacedPFNNSurface")
+        x = np.asarray(x_samples, dtype=np.float64)
+        y = np.asarray(y_samples, dtype=np.float64)
+        if (
+            x.ndim != 1
+            or y.ndim != 1
+            or min(len(x), len(y)) < 2
+            or not np.isfinite(x).all()
+            or not np.isfinite(y).all()
+            or np.any(np.diff(x) <= 0.0)
+            or np.any(np.diff(y) <= 0.0)
+        ):
+            raise ValueError("PFNN terrain mesh axes must be finite and increasing")
+        self.surface = surface
+        # PFNN stores horizontal X/Z in centimetres.  Start half a metre before
+        # the fitted contact centre so the original surface unfolds in +world X.
+        self.source_anchor_xy = np.asarray(
+            (
+                surface.fit.contact_center_xz[0] * surface.scale / 100.0 - 0.5,
+                -surface.fit.contact_center_xz[1] * surface.scale / 100.0,
+            ),
+            dtype=np.float64,
+        )
+        self.source_height_m = float(
+            surface.height_at(self.source_anchor_xy[None, :])[0]
+        )
+        self.x_min, self.x_max = float(x[0]), float(x[-1])
+        self.y_min, self.y_max = float(y[0]), float(y[-1])
+        grid_x, grid_y = np.meshgrid(x, y, indexing="xy")
+        xy = np.stack((grid_x, grid_y), axis=-1)
+        self.vertices = np.column_stack(
+            (xy.reshape(-1, 2), self._heights_and_gradients(xy.reshape(-1, 2))[0])
+        )
+        columns = len(x)
+        self.faces = np.asarray(
+            [
+                triangle
+                for row in range(len(y) - 1)
+                for column in range(columns - 1)
+                for triangle in (
+                    (
+                        row * columns + column,
+                        row * columns + column + 1,
+                        (row + 1) * columns + column + 1,
+                    ),
+                    (
+                        row * columns + column,
+                        (row + 1) * columns + column + 1,
+                        (row + 1) * columns + column,
+                    ),
+                )
+            ],
+            dtype=np.int32,
+        )
+
+    def _supported(self, points: np.ndarray) -> bool:
+        return bool(
+            np.all(points[..., 0] >= self.x_min)
+            and np.all(points[..., 0] <= self.x_max)
+            and np.all(points[..., 1] >= self.y_min)
+            and np.all(points[..., 1] <= self.y_max)
+        )
+
+    def _heights_and_gradients(
+        self, points: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        query = np.asarray(points, dtype=np.float64)
+        source = np.empty_like(query)
+        source[:, 0] = (
+            self.source_anchor_xy[0]
+            + query[:, 0]
+            - self._BLEND_START_X_M
+        )
+        source[:, 1] = self.source_anchor_xy[1] + query[:, 1]
+        raw_height = self.surface.height_at(source) - self.source_height_m
+        raw_gradient = self.surface.gradient_at(source)
+        u = np.clip(
+            (query[:, 0] - self._BLEND_START_X_M)
+            / (self._BLEND_STOP_X_M - self._BLEND_START_X_M),
+            0.0,
+            1.0,
+        )
+        weight = u * u * (3.0 - 2.0 * u)
+        weight_derivative = (
+            6.0 * u * (1.0 - u)
+            / (self._BLEND_STOP_X_M - self._BLEND_START_X_M)
+        )
+        height = weight * raw_height
+        gradient = weight[:, None] * raw_gradient
+        gradient[:, 0] += weight_derivative * raw_height
+        return height, gradient
+
+    def __call__(self, xy: object) -> TerrainSample | None:
+        point = np.asarray(xy, dtype=np.float64)
+        if point.shape != (2,) or not np.isfinite(point).all() or not self._supported(point):
+            return None
+        height, gradient = self._heights_and_gradients(point[None, :])
+        return TerrainSample(float(height[0]), gradient[0])
+
+    def collision_heights_at(self, xy: object) -> np.ndarray:
+        points = np.asarray(xy, dtype=np.float64)
+        if (
+            points.ndim != 2
+            or points.shape[1] != 2
+            or not np.isfinite(points).all()
+            or not self._supported(points)
+        ):
+            raise ValueError("collision query left the rendered PFNN course")
+        return self._heights_and_gradients(points)[0]
 
 
 def _viewer_terrain_map() -> TerrainPFNNHillMap:
@@ -349,7 +483,7 @@ def _load_runtime(
         device=arguments.device,
         enforce_motion_envelope=strict,
         command_driven_root=False,
-        hold_idle_pose=not released,
+        hold_idle_pose=True,
         maximum_grade_degrees=89.0 if released else 20.0,
     )
 
@@ -362,9 +496,9 @@ def _run(arguments: argparse.Namespace) -> int:
         rendered_terrain = terrain_map
     else:
         surface = load_placed_pfnn_surface(arguments.terrain_fit)
-        terrain = _PFNNTerrainCallback(
+        terrain = _PFNNCourseCallback(
             surface,
-            x_samples=np.linspace(-6.0, 6.0, 321),
+            x_samples=np.linspace(-2.0, 6.0, 321),
             y_samples=np.linspace(-4.0, 4.0, 161),
         )
         rendered_terrain = terrain

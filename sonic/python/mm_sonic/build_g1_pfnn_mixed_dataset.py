@@ -141,6 +141,56 @@ def _concatenate(left: VerticalSplitArrays, right: VerticalSplitArrays) -> Verti
     )
 
 
+def _filter_infeasible_joint_transitions(
+    arrays: VerticalSplitArrays,
+    *,
+    maximum_joint_step_rad: float = 0.225,
+) -> VerticalSplitArrays:
+    """Drop rows whose target pose follows an unsafe same-lane target pose."""
+
+    rows: dict[tuple[str, str, int], int] = {}
+    keep = np.ones(len(arrays.phase), dtype=np.bool_)
+    for index in range(len(arrays.phase)):
+        key = (
+            str(arrays.clip_id[index]),
+            str(arrays.sequence_lane[index]),
+            int(arrays.center_frame_120hz[index]),
+        )
+        if key in rows:
+            raise ValueError("mixed PFNN corpus contains duplicate sequence rows")
+        rows[key] = index
+    joint = OUTPUT_LAYOUT["joint_position"]
+    for (clip, lane, center), index in rows.items():
+        predecessor = rows.get((clip, lane, center - 4))
+        if predecessor is None:
+            continue
+        step = float(
+            np.max(np.abs(arrays.y[index, joint] - arrays.y[predecessor, joint]))
+        )
+        if step > float(maximum_joint_step_rad) + 1.0e-6:
+            keep[index] = False
+    if not np.any(keep):
+        raise ValueError("mixed PFNN transition filter removed every row")
+    return VerticalSplitArrays(
+        **{
+            name: np.asarray(getattr(arrays, name))[keep]
+            for name in (
+                "x",
+                "y",
+                "phase",
+                "clip_id",
+                "sequence_lane",
+                "center_frame_120hz",
+                "root_world_xy",
+                "root_world_yaw",
+                "terrain_class",
+                "terrain_sha256",
+                "mirrored",
+            )
+        }
+    )
+
+
 def combine_vertical_and_grail(
     vertical: VerticalDataset,
     grail_train: object,
@@ -158,9 +208,11 @@ def combine_vertical_and_grail(
         values["clip_id"],
     )
     splits = {
-        "train": _concatenate(vertical.splits["train"], _grail_split(values, optimized)),
-        "validation": _concatenate(
-            vertical.splits["validation"], _grail_split(values, held_out)
+        "train": _filter_infeasible_joint_transitions(
+            _concatenate(vertical.splits["train"], _grail_split(values, optimized))
+        ),
+        "validation": _filter_infeasible_joint_transitions(
+            _concatenate(vertical.splits["validation"], _grail_split(values, held_out))
         ),
     }
     train = splits["train"]
