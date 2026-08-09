@@ -239,6 +239,44 @@ def phase_from_contacts(
     return track
 
 
+def released_pfnn_phase_track(
+    normalized_phase_120hz: object,
+    contact_120hz: object,
+) -> ContactPhaseTrack:
+    """Preserve authored PFNN phase/contact while sampling exact 30 Hz frames."""
+
+    source_phase = np.asarray(normalized_phase_120hz, dtype=np.float64)
+    source_contact = np.asarray(contact_120hz)
+    if (
+        source_phase.ndim != 1
+        or len(source_phase) < 8
+        or source_contact.shape != (len(source_phase), 4)
+        or not np.isfinite(source_phase).all()
+        or np.any(source_phase < 0.0)
+        or np.any(source_phase > 1.0)
+    ):
+        raise ValueError("released PFNN phase/contact arrays are invalid")
+    if not np.isin(source_contact, (0, 1, False, True)).all():
+        raise ValueError("released PFNN contacts must be binary contacts")
+    phase = np.remainder(source_phase[::4] * (2.0 * math.pi), 2.0 * math.pi)
+    unwrapped = np.unwrap(phase, period=2.0 * math.pi)
+    delta = np.diff(unwrapped)
+    if np.any(delta < -1.0e-6) or np.any(delta > math.pi):
+        raise ValueError("released PFNN phase discontinuity")
+    advance = np.zeros(len(phase), dtype=np.float32)
+    advance[:-1] = delta.astype(np.float32)
+    contacts = np.asarray(source_contact[::4], dtype=bool).copy()
+    confidence = contacts.astype(np.float32)
+    valid = np.ones(len(phase), dtype=bool)
+    return ContactPhaseTrack(
+        contact=contacts,
+        confidence=confidence,
+        phase=_float32_wrapped_phase(phase),
+        phase_advance=advance,
+        valid=valid,
+    )
+
+
 def reconstruct_heel_toe_contacts(
     source: PFNNSourceClip,
     query: CanonicalMeshQuery,

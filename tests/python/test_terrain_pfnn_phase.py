@@ -18,6 +18,7 @@ from mm_sonic.terrain_oracle.math3d import RigidTransform
 from mm_sonic.terrain_pfnn.phase import (
     _float32_wrapped_phase,
     phase_from_contacts,
+    released_pfnn_phase_track,
     reconstruct_heel_toe_contacts,
 )
 from mm_sonic.terrain_pfnn.sources import PFNNSourceClip
@@ -37,6 +38,33 @@ def contacts_with_strikes(*strikes: tuple[str, int], frames: int = 91) -> np.nda
         channel = 0 if side == "left" else 2
         contact[frame : min(frame + 10, frames), channel] = True
     return contact
+
+
+class ReleasedPFNNPhaseTest(unittest.TestCase):
+    def test_preserves_released_phase_contacts_and_advance_at_30hz(self) -> None:
+        normalized_phase = np.remainder(
+            0.9 + 0.025 * np.arange(16, dtype=np.float64), 1.0
+        )
+        contacts = np.zeros((16, 4), dtype=np.int32)
+        contacts[:, 0] = np.arange(16) < 8
+        contacts[:, 2] = np.arange(16) >= 8
+        track = released_pfnn_phase_track(normalized_phase, contacts)
+        expected = np.remainder(normalized_phase[::4] * (2.0 * np.pi), 2.0 * np.pi)
+        np.testing.assert_allclose(track.phase, expected, atol=3.0e-7, rtol=0.0)
+        np.testing.assert_array_equal(track.contact, contacts[::4].astype(bool))
+        np.testing.assert_allclose(
+            track.phase_advance[:-1], np.full(3, 0.2 * np.pi), atol=3.0e-7, rtol=0.0
+        )
+        self.assertTrue(np.all(track.valid))
+
+    def test_rejects_backward_phase_or_nonbinary_contacts(self) -> None:
+        phase = np.repeat(np.array([0.1, 0.2, 0.15, 0.3]), 4)
+        contacts = np.zeros((16, 4), dtype=np.int32)
+        with self.assertRaisesRegex(ValueError, "phase discontinuity"):
+            released_pfnn_phase_track(phase, contacts)
+        contacts[0, 0] = 2
+        with self.assertRaisesRegex(ValueError, "binary contacts"):
+            released_pfnn_phase_track(np.linspace(0.0, 0.3, 16), contacts)
 
 
 def _plane_query() -> CanonicalMeshQuery:

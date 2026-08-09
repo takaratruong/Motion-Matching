@@ -1,16 +1,25 @@
 import tempfile
 import unittest
 from dataclasses import replace
+import hashlib
+import json
 from pathlib import Path
 
 import joblib
 import numpy as np
 
 from mm_sonic.terrain_oracle.canonical import ISAACLAB_BODY_NAMES
+from mm_sonic.retarget_pfnn_bvh_g1 import (
+    G1_JOINT_NAMES,
+    GMR_COMMIT,
+    PFNN_POSITION_SCALE,
+    RETARGET_PROJECT_COMMIT,
+)
 from mm_sonic.terrain_pfnn.sources import (
     discover_grail_slope_records,
     load_grail_source,
     load_lafan_source,
+    load_pfnn_retarget_source,
 )
 
 
@@ -75,6 +84,55 @@ class TerrainPFNNSourcesTest(unittest.TestCase):
         rows[:, 7:] = timeline[:, None] + np.arange(29)[None, :]
         np.savetxt(self.lafan_csv, rows, delimiter=",", fmt="%.9f")
         self.fake_fk = _FakeFK()
+        self.pfnn_motion = self.root / "pfnn-retarget.npz"
+        pfnn_frames = 12
+        pfnn_root = np.zeros((pfnn_frames, 3), dtype=np.float64)
+        pfnn_root[:, 0] = np.arange(pfnn_frames, dtype=np.float64)
+        pfnn_quaternion = np.zeros((pfnn_frames, 4), dtype=np.float64)
+        pfnn_quaternion[:, 3] = 1.0
+        pfnn_dof = np.arange(pfnn_frames * 29, dtype=np.float64).reshape(
+            pfnn_frames, 29
+        ) / 1000.0
+        with self.pfnn_motion.open("wb") as stream:
+            np.savez_compressed(
+                stream,
+                root_pos=pfnn_root,
+                root_quat=pfnn_quaternion,
+                dof=pfnn_dof,
+                fps=np.asarray(120.0, dtype=np.float64),
+                engine=np.asarray("gmr"),
+                joint_names=np.asarray(G1_JOINT_NAMES),
+                joint_limits=np.repeat(
+                    np.asarray([[-2.0, 2.0]], dtype=np.float64), 29, axis=0
+                ),
+            )
+        output_sha = hashlib.sha256(self.pfnn_motion.read_bytes()).hexdigest()
+        self.pfnn_source_sha = "a" * 64
+        self.pfnn_motion.with_suffix(".receipt.json").write_text(
+            json.dumps(
+                {
+                    "schema": "native-g1-pfnn-sample-retarget/v1",
+                    "status": "accepted",
+                    "source_sha256": self.pfnn_source_sha,
+                    "prepared_sha256": "c" * 64,
+                    "output_sha256": output_sha,
+                    "gmr_commit": GMR_COMMIT,
+                    "retarget_project_commit": RETARGET_PROJECT_COMMIT,
+                    "fps": 120.0,
+                    "source_frame_count": 2000,
+                    "start_frame": 240,
+                    "frame_count": pfnn_frames,
+                    "warmup_frames": 120,
+                    "aliases": [["Spine1", "Spine2"]],
+                    "joint_names": list(G1_JOINT_NAMES),
+                    "root_quaternion_order": "xyzw",
+                    "grounding_offset_m": 0.0,
+                    "grounding": "source",
+                    "pfnn_position_scale": PFNN_POSITION_SCALE,
+                }
+            ),
+            encoding="utf-8",
+        )
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -104,3 +162,51 @@ class TerrainPFNNSourcesTest(unittest.TestCase):
             [record.stem for record in records],
             ["terrain_slopes__slope_113__000"],
         )
+
+    def test_pfnn_retarget_samples_exact_120hz_frames_at_30hz(self) -> None:
+        source = load_pfnn_retarget_source(
+            self.pfnn_motion,
+            self.fake_fk,
+            clip_id="pfnn__flat_turn__00240_00252",
+            terrain_id="flat",
+            expected_source_sha256=self.pfnn_source_sha,
+            expected_start_frame=240,
+        )
+        self.assertEqual(source.fps, 30.0)
+        self.assertEqual(source.frame_count, 3)
+        np.testing.assert_array_equal(source.root_position_world[:, 0], [0.0, 4.0, 8.0])
+        self.assertEqual(source.joint_position.shape, (3, 29))
+        self.assertEqual(source.body_position_world.shape, (3, 30, 3))
+
+    def test_pfnn_retarget_rejects_receipt_or_artifact_tampering(self) -> None:
+        receipt_path = self.pfnn_motion.with_suffix(".receipt.json")
+        original = receipt_path.read_text(encoding="utf-8")
+        for field, value, message in (
+            ("source_sha256", "b" * 64, "selected source digest"),
+            ("start_frame", 241, "selected interval"),
+            ("grounding", "flat", "source grounding"),
+        ):
+            payload = json.loads(original)
+            payload[field] = value
+            receipt_path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, message):
+                load_pfnn_retarget_source(
+                    self.pfnn_motion,
+                    self.fake_fk,
+                    clip_id="pfnn__fixture",
+                    terrain_id="flat",
+                    expected_source_sha256=self.pfnn_source_sha,
+                    expected_start_frame=240,
+                )
+        receipt_path.write_text(original, encoding="utf-8")
+        with self.pfnn_motion.open("ab") as stream:
+            stream.write(b"tamper")
+        with self.assertRaisesRegex(ValueError, "output digest"):
+            load_pfnn_retarget_source(
+                self.pfnn_motion,
+                self.fake_fk,
+                clip_id="pfnn__fixture",
+                terrain_id="flat",
+                expected_source_sha256=self.pfnn_source_sha,
+                expected_start_frame=240,
+            )

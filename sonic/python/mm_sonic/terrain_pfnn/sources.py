@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, field
 import hashlib
+import json
 from pathlib import Path
 import re
 
@@ -15,6 +16,12 @@ from mm_sonic.grail_terrain_source import (
     load_grail_motion,
     mujoco_to_isaaclab_joints,
     resample_grail_motion,
+)
+from mm_sonic.retarget_pfnn_bvh_g1 import (
+    G1_JOINT_NAMES,
+    GMR_COMMIT,
+    PFNN_POSITION_SCALE,
+    RETARGET_PROJECT_COMMIT,
 )
 from mm_sonic.terrain_oracle.canonical import (
     ISAACLAB_BODY_NAMES,
@@ -34,6 +41,36 @@ _SLOPE_RE = re.compile(r"(?:^|__)slope_\d{3}(?:__|$)")
 _FPS = 30.0
 _GRAIL_SOURCE_LICENSE_ID = "Apache-2.0"
 _LAFAN_SOURCE_LICENSE_ID = "CC-BY-NC-ND-4.0"
+_PFNN_SOURCE_LICENSE_ID = "PFNN-academic-noncommercial"
+_PFNN_RETARGET_RECEIPT_FIELDS = {
+    "schema",
+    "status",
+    "source_sha256",
+    "prepared_sha256",
+    "output_sha256",
+    "gmr_commit",
+    "retarget_project_commit",
+    "fps",
+    "source_frame_count",
+    "start_frame",
+    "frame_count",
+    "warmup_frames",
+    "aliases",
+    "joint_names",
+    "root_quaternion_order",
+    "grounding_offset_m",
+    "grounding",
+    "pfnn_position_scale",
+}
+_PFNN_RETARGET_ARRAY_FIELDS = {
+    "root_pos",
+    "root_quat",
+    "dof",
+    "fps",
+    "engine",
+    "joint_names",
+    "joint_limits",
+}
 _TERRAIN_QUATERNION_WORLD_FROM_USD_WXYZ = np.array(
     (np.sqrt(0.5), 0.0, 0.0, -np.sqrt(0.5)), dtype=np.float32
 )
@@ -362,6 +399,126 @@ def load_lafan_source(path: Path, fk: object) -> PFNNSourceClip:
         motion_sha256=_sha256(source_path),
         terrain_sha256=None,
         source_license_id=_LAFAN_SOURCE_LICENSE_ID,
+    )
+
+
+def load_pfnn_retarget_source(
+    path: Path,
+    fk: object,
+    *,
+    clip_id: str,
+    terrain_id: str,
+    expected_source_sha256: str,
+    expected_start_frame: int,
+) -> PFNNSourceClip:
+    """Load one receipt-bound 120 Hz PFNN-to-G1 retarget at exact 30 Hz."""
+
+    motion_path = Path(path).expanduser().resolve()
+    receipt_path = motion_path.with_suffix(".receipt.json")
+    if not motion_path.is_file() or not receipt_path.is_file():
+        raise FileNotFoundError("PFNN retarget motion and receipt are required")
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("PFNN retarget receipt is invalid") from error
+    if type(receipt) is not dict or set(receipt) != _PFNN_RETARGET_RECEIPT_FIELDS:
+        raise ValueError("PFNN retarget receipt fields are invalid")
+    if (
+        receipt["schema"] != "native-g1-pfnn-sample-retarget/v1"
+        or receipt["status"] != "accepted"
+    ):
+        raise ValueError("PFNN retarget receipt schema or status is invalid")
+    if receipt["source_sha256"] != expected_source_sha256:
+        raise ValueError("PFNN retarget selected source digest mismatch")
+    if type(expected_start_frame) is not int or receipt["start_frame"] != expected_start_frame:
+        raise ValueError("PFNN retarget selected interval mismatch")
+    if receipt["output_sha256"] != _sha256(motion_path):
+        raise ValueError("PFNN retarget output digest mismatch")
+    if (
+        receipt["gmr_commit"] != GMR_COMMIT
+        or receipt["retarget_project_commit"] != RETARGET_PROJECT_COMMIT
+        or receipt["fps"] != 120.0
+        or receipt["root_quaternion_order"] != "xyzw"
+        or receipt["grounding"] != "source"
+        or receipt["grounding_offset_m"] != 0.0
+        or receipt["pfnn_position_scale"] != PFNN_POSITION_SCALE
+        or receipt["joint_names"] != list(G1_JOINT_NAMES)
+    ):
+        if receipt["grounding"] != "source":
+            raise ValueError("PFNN retarget must preserve source grounding")
+        raise ValueError("PFNN retarget pinned contract is invalid")
+    for name in ("prepared_sha256",):
+        if type(receipt[name]) is not str or _SHA256_RE.fullmatch(receipt[name]) is None:
+            raise ValueError(f"PFNN retarget {name} is invalid")
+    for name in ("source_frame_count", "start_frame", "frame_count", "warmup_frames"):
+        if type(receipt[name]) is not int or receipt[name] < 0:
+            raise ValueError(f"PFNN retarget {name} is invalid")
+    if (
+        receipt["frame_count"] < 8
+        or receipt["source_frame_count"]
+        < receipt["start_frame"] + receipt["frame_count"]
+        or receipt["aliases"] != [["Spine1", "Spine2"]]
+    ):
+        raise ValueError("PFNN retarget source interval metadata is invalid")
+    try:
+        with np.load(motion_path, allow_pickle=False) as archive:
+            if set(archive.files) != _PFNN_RETARGET_ARRAY_FIELDS:
+                raise ValueError("PFNN retarget array fields are invalid")
+            root_position_120 = np.asarray(archive["root_pos"], dtype=np.float64)
+            root_xyzw_120 = np.asarray(archive["root_quat"], dtype=np.float64)
+            dof_120 = np.asarray(archive["dof"], dtype=np.float64)
+            fps = np.asarray(archive["fps"])
+            engine = np.asarray(archive["engine"])
+            joint_names = np.asarray(archive["joint_names"])
+            joint_limits = np.asarray(archive["joint_limits"], dtype=np.float64)
+    except (OSError, ValueError, KeyError) as error:
+        raise ValueError("PFNN retarget motion archive is invalid") from error
+    frames = receipt["frame_count"]
+    if (
+        root_position_120.shape != (frames, 3)
+        or root_xyzw_120.shape != (frames, 4)
+        or dof_120.shape != (frames, 29)
+        or fps.shape != ()
+        or float(fps) != 120.0
+        or engine.shape != ()
+        or str(engine) != "gmr"
+        or joint_names.shape != (29,)
+        or tuple(joint_names.astype(str).tolist()) != G1_JOINT_NAMES
+        or joint_limits.shape != (29, 2)
+    ):
+        raise ValueError("PFNN retarget motion shapes or ABI are invalid")
+    if not all(
+        np.isfinite(value).all()
+        for value in (root_position_120, root_xyzw_120, dof_120, joint_limits)
+    ):
+        raise ValueError("PFNN retarget motion must be finite")
+    if not np.allclose(
+        np.linalg.norm(root_xyzw_120, axis=1), 1.0, atol=1.0e-5, rtol=0.0
+    ):
+        raise ValueError("PFNN retarget must contain normalized XYZW quaternions")
+    if np.any(joint_limits[:, 0] > joint_limits[:, 1]) or np.any(
+        (dof_120 < joint_limits[:, 0] - 1.0e-6)
+        | (dof_120 > joint_limits[:, 1] + 1.0e-6)
+    ):
+        raise ValueError("PFNN retarget contains a joint-limit violation")
+
+    root_position = np.ascontiguousarray(root_position_120[::4], dtype=np.float32)
+    root_xyzw = np.ascontiguousarray(root_xyzw_120[::4], dtype=np.float32)
+    dof = np.ascontiguousarray(dof_120[::4], dtype=np.float32)
+    forward = _validated_forward(fk, root_position, root_xyzw, dof)
+    return _make_clip(
+        clip_id=clip_id,
+        terrain_id=terrain_id,
+        root_position=root_position,
+        root_wxyz=unroll_quaternions_wxyz(root_xyzw[:, (3, 0, 1, 2)]),
+        joints_mujoco=dof,
+        forward=forward,
+        terrain_path=None,
+        terrain_position=np.zeros(3, dtype=np.float32),
+        terrain_quaternion=np.array((1.0, 0.0, 0.0, 0.0), dtype=np.float32),
+        motion_sha256=_sha256(motion_path),
+        terrain_sha256=None,
+        source_license_id=_PFNN_SOURCE_LICENSE_ID,
     )
 
 
