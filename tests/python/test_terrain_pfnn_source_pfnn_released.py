@@ -5,9 +5,12 @@ from pathlib import Path
 import tempfile
 import unittest
 
+import numpy as np
+
 from mm_sonic.terrain_pfnn.source_pfnn_released import (
     PFNNIntervalMetrics,
     discover_released_pfnn_records,
+    interval_metrics_from_tracks,
     required_coverage,
     select_vertical_slice,
     vertical_slice_receipt,
@@ -81,7 +84,7 @@ class ReleasedPFNNSourceTest(unittest.TestCase):
 
     def test_selects_required_train_and_validation_coverage(self) -> None:
         records = discover_released_pfnn_records(self.root)
-        selection = select_vertical_slice(records, self.metrics)
+        selection = select_vertical_slice(records, tuple(self.metrics.values()))
         self.assertEqual([item.role for item in selection].count("train"), 3)
         self.assertEqual([item.role for item in selection].count("validation"), 1)
         self.assertTrue(all("_mirror" not in item.record.stem for item in selection))
@@ -113,12 +116,13 @@ class ReleasedPFNNSourceTest(unittest.TestCase):
         metrics = dict(self.metrics)
         metrics["LocomotionFlat02_000"] = _metric("LocomotionFlat02_000", left=1.2)
         with self.assertRaisesRegex(ValueError, "right_turn"):
-            select_vertical_slice(records, metrics)
+            select_vertical_slice(records, tuple(metrics.values()))
 
     def test_receipt_binds_hashes_and_is_order_independent(self) -> None:
         records = discover_released_pfnn_records(self.root)
-        selected = select_vertical_slice(records, self.metrics)
-        reversed_selected = select_vertical_slice(tuple(reversed(records)), self.metrics)
+        metrics = tuple(self.metrics.values())
+        selected = select_vertical_slice(records, metrics)
+        reversed_selected = select_vertical_slice(tuple(reversed(records)), tuple(reversed(metrics)))
         self.assertEqual(
             vertical_slice_receipt(selected), vertical_slice_receipt(reversed_selected)
         )
@@ -135,7 +139,7 @@ class ReleasedPFNNSourceTest(unittest.TestCase):
             metrics["LocomotionFlat01_000"], start_frame_120hz=100
         )
         with self.assertRaisesRegex(ValueError, "one-second context"):
-            select_vertical_slice(records, metrics)
+            select_vertical_slice(records, tuple(metrics.values()))
 
     def test_selection_rejects_metric_stem_mismatch(self) -> None:
         records = discover_released_pfnn_records(self.root)
@@ -143,8 +147,46 @@ class ReleasedPFNNSourceTest(unittest.TestCase):
         metrics["LocomotionFlat01_000"] = replace(
             metrics["LocomotionFlat01_000"], stem="LocomotionFlat09_000"
         )
-        with self.assertRaisesRegex(ValueError, "metric stem mismatch"):
-            select_vertical_slice(records, metrics)
+        with self.assertRaisesRegex(ValueError, "no source record"):
+            select_vertical_slice(records, tuple(metrics.values()))
+
+    def test_track_audit_emits_straight_turn_and_signed_grade_candidates(self) -> None:
+        frames = 1200
+        root = np.zeros((frames, 3), dtype=np.float64)
+        root[:, 0] = np.arange(frames) / 120.0
+        gait = np.zeros((frames, 8), dtype=np.float64)
+        gait[:360, 0] = 1.0
+        gait[360:, 1] = 1.0
+        straight = interval_metrics_from_tracks(
+            "LocomotionFlat01_000", root, np.zeros(frames), gait
+        )
+        self.assertTrue(any(metric.has_idle_transition for metric in straight))
+
+        gait[:, :] = 0.0
+        gait[:, 1] = 1.0
+        yaw = 0.8 * np.sin(np.linspace(0.0, 4.0 * np.pi, frames))
+        turning = interval_metrics_from_tracks(
+            "LocomotionFlat02_000", root, yaw, gait
+        )
+        self.assertTrue(
+            any(
+                metric.maximum_left_turn_rad >= 0.5
+                and metric.maximum_right_turn_rad >= 0.5
+                for metric in turning
+            )
+        )
+
+        root[:, 2] = 0.25 * np.sin(np.linspace(0.0, 4.0 * np.pi, frames))
+        terrain = interval_metrics_from_tracks(
+            "WalkingUpSteps01_000", root, np.zeros(frames), gait
+        )
+        self.assertTrue(
+            any(
+                metric.maximum_ascent_degrees >= 3.0
+                and metric.minimum_descent_degrees <= -3.0
+                for metric in terrain
+            )
+        )
 
 
 if __name__ == "__main__":
