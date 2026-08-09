@@ -1,9 +1,19 @@
 # Native G1 challenging-terrain collection
 
-This branch replaces the rejected narrow-stair spatial warps as the source of
-new, exotic terrain motion.  It trains a dynamically valid G1 controller on
-broad procedural terrain and records the resulting simulated states as clean
-kinematics for later SONIC tracking and diffusion-policy training.
+> **REJECTED — DO NOT USE AS TRAINING DATA.** The `model_4997.pt` rollout
+> package described below passed the mechanical reset/teleport checks but
+> failed dense visual review.  It exhibits a pathological repeated gait with
+> one leg kicking forward, the other leg shuffling, visibly poor sole placement,
+> and frequent apparent terrain intersection on rolling hills, diagonal arcs,
+> and rough slopes.  The 200-clip package is retained only as negative
+> experimental evidence.  Mechanical survival is not an animation-quality
+> acceptance criterion.
+
+This was an experimental reward-only RL route for generating exotic terrain
+motion. It trained a G1 controller on broad procedural terrain and recorded the
+simulated states. The experiment is now closed: the resulting trajectories are
+not clean kinematics and are not a replacement for the contact-aware kinematic
+MotionBricks/retargeting pipeline.
 
 ## Runtime interface
 
@@ -121,9 +131,9 @@ No motion enters the accepted corpus until dense videos and metrics reject:
 The previous extreme-angle narrow-stair and side-on warp videos are explicitly
 not accepted examples under this bar.
 
-## Result and model selection
+## Rejected result and diagnosis
 
-The current balanced source checkpoint is:
+The rejected checkpoint is:
 
 `/move/data/terrain-aware/g1-hct-omni/train/logs/rsl_rl/g1_hct_omni/2026-08-08_21-58-52_omni_hct_uniform_v2/model_4997.pt`
 
@@ -132,11 +142,12 @@ Its exact-mesh, unseen-seed-44 evaluation is:
 `/move/data/terrain-aware/g1-hct-omni/eval/uniform_v2_4997_seed44_exact_full.npz`
 
 It completed all 200 difficulty-9/9, 12-second cases without a reset or
-teleport.  Aggregate mixed command RMSE was 0.450, the maximum physical XY step
-was 34.3 mm, maximum joint step was 0.593 rad, and arm deviation RMS was 0.0149
-rad.  All 20 stair cases survived, although stairs remain the weakest guidance
-family (0.670 ascent and 0.753 descent mixed RMSE).  Right strafe/right arc also
-remain less accurate than their left counterparts.
+teleport, but that statistic was misleading. Dense review exposed repeated
+high forward kicks, shuffling support steps, unnatural cadence, poor sole
+placement, and visible terrain intersection. It therefore fails the visual and
+contact-quality gates and must not be used for SONIC or diffusion-policy data.
+The aggregate command RMSE of 0.450 and 200/200 survival score are recorded only
+to demonstrate that those metrics do not certify usable motion.
 
 Phase one tracked commands better (0.424 mixed RMSE) but failed two of the same
 200 exact-terrain cases and had a larger 0.723 rad joint step.  It was therefore
@@ -153,21 +164,25 @@ Dense exact-terrain review videos are in:
 
 `/move/data/terrain-aware/g1-hct-omni/video/uniform_v2_4997_seed44_exact_review`
 
-The exact geometry removes the false smeared-riser penetration seen in the old
-height-scan renders.  Diagonal stair contacts are continuous and land on
-treads.  Pure side-on descent is still visibly leaned-back and kicky, so the
-corpus is a robust dynamically generated terrain bank, not a claim that every
-command/terrain pairing is MotionBricks-quality animation.
+The exact geometry removes the old height-scan triangulation ambiguity. The
+remaining gait defects are still plainly visible and are not accepted as a
+renderer-only artifact. A direct identical-condition review of Justin's source
+checkpoint is being used to determine whether the pathology predates terrain
+continuation. If it does, this reward-only velocity policy line is unsuitable:
+its objective contains no natural-motion prior and can reward an ugly but
+stable gait.
 
-## Packaged 11-second corpus
+## Rejected 11-second package
 
 `package_g1_hct_clips.py` drops the one-second neutral lead-in and writes one
-clip per clean environment.  The verified collection is:
+clip per environment. The rejected package is:
 
 `/move/data/terrain-aware/g1-hct-omni/collection/uniform_v2_4997_seed44_200x11s`
 
 It contains exactly 200 NPZ clips, 550 frames / 11 seconds each at 50 Hz, plus
-one shared exact `terrain.npz` and `manifest.json`.  Total size is 246 MB.  Each
+one shared exact `terrain.npz` and `manifest.json`. It is retained only for
+failure analysis and is explicitly marked `rejected_visual_quality`. Total size
+is 246 MB. Each
 clip preserves root and joint state, local velocities, actions, robot-local
 joystick commands, ankle trajectories and contacts, local height scans,
 terrain/program labels, source environment, and the exact terrain origin.  The
