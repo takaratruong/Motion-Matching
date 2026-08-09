@@ -16,6 +16,7 @@ from mm_sonic.terrain_pfnn.source_pfnn_released import (
     PFNNSliceRole,
     audit_released_pfnn_metrics,
     discover_released_pfnn_records,
+    select_expanded_vertical_slice,
     select_vertical_slice,
     vertical_slice_receipt,
 )
@@ -132,7 +133,7 @@ def retarget_vertical_slice(
     resume: bool = False,
     retarget_one: Callable[..., dict[str, object]] = retarget_sample,
 ) -> dict[str, object]:
-    """Retarget exactly four sealed PFNN intervals with verified resume."""
+    """Retarget sealed PFNN intervals with verified resume."""
 
     receipt = vertical_slice_receipt(selection)
     selection_sha256 = str(receipt["sha256"])
@@ -241,6 +242,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--retarget-project-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--expanded", action="store_true")
     return parser
 
 
@@ -249,7 +251,11 @@ def main(argv: list[str] | None = None) -> int:
     pfnn_root = arguments.pfnn_root.expanduser().resolve(strict=True)
     records = discover_released_pfnn_records(pfnn_root / "data" / "animations")
     metrics = audit_released_pfnn_metrics(records, pfnn_root)
-    selection = select_vertical_slice(records, metrics)
+    selection = (
+        select_expanded_vertical_slice(records, metrics)
+        if arguments.expanded
+        else select_vertical_slice(records, metrics)
+    )
     manifest = retarget_vertical_slice(
         selection,
         output=arguments.output,

@@ -12,6 +12,7 @@ from mm_sonic.terrain_pfnn.source_pfnn_released import (
     discover_released_pfnn_records,
     interval_metrics_from_tracks,
     required_coverage,
+    select_expanded_vertical_slice,
     select_vertical_slice,
     vertical_slice_receipt,
 )
@@ -61,6 +62,7 @@ class ReleasedPFNNSourceTest(unittest.TestCase):
             "LocomotionFlat02_000",
             "WalkingUpSteps01_000",
             "WalkingUpSteps02_000",
+            "WalkingUpSteps03_001",
         ):
             _write_record(self.root, stem)
             _write_record(self.root, stem + "_mirror")
@@ -76,6 +78,9 @@ class ReleasedPFNNSourceTest(unittest.TestCase):
             ),
             "WalkingUpSteps02_000": _metric(
                 "WalkingUpSteps02_000", ascent=7.0, descent=-6.0
+            ),
+            "WalkingUpSteps03_001": _metric(
+                "WalkingUpSteps03_001", ascent=8.0, descent=-7.0
             ),
         }
 
@@ -105,6 +110,20 @@ class ReleasedPFNNSourceTest(unittest.TestCase):
             [(item.start_frame_120hz, item.stop_frame_120hz) for item in selection],
             [(120, 1320)] * 4,
         )
+
+    def test_expanded_selection_keeps_every_compatible_identity(self) -> None:
+        records = discover_released_pfnn_records(self.root)
+
+        selection = select_expanded_vertical_slice(
+            records, tuple(self.metrics.values())
+        )
+
+        self.assertEqual(len(selection), 5)
+        self.assertEqual(
+            [item.record.stem for item in selection if item.role == "validation"],
+            ["WalkingUpSteps03_001"],
+        )
+        self.assertEqual(len({item.record.stem for item in selection}), 5)
 
     def test_discovery_rejects_missing_sidecar(self) -> None:
         (self.root / "LocomotionFlat01_000.phase").unlink()

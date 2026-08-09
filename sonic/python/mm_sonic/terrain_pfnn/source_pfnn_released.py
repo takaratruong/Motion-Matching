@@ -536,6 +536,75 @@ def select_vertical_slice(
     return selected
 
 
+def select_expanded_vertical_slice(
+    records: tuple[ReleasedPFNNRecord, ...],
+    metrics: Iterable[PFNNIntervalMetrics],
+) -> tuple[PFNNSliceRole, ...]:
+    """Select one best compatible interval from every audited source identity."""
+
+    record_by_stem = {record.stem: record for record in records}
+    if len(record_by_stem) != len(records) or not all(
+        isinstance(record, ReleasedPFNNRecord) for record in records
+    ):
+        raise ValueError("expanded PFNN records contain duplicate or invalid stems")
+    by_stem: dict[
+        str, list[tuple[ReleasedPFNNRecord, PFNNIntervalMetrics, frozenset[str]]]
+    ] = {}
+    seen: set[tuple[str, int, int]] = set()
+    for metric in metrics:
+        if not isinstance(metric, PFNNIntervalMetrics):
+            raise TypeError("metrics must contain PFNNIntervalMetrics values")
+        record = record_by_stem.get(metric.stem)
+        if record is None:
+            raise ValueError(f"{metric.stem}: PFNN interval metric has no source record")
+        key = (metric.stem, metric.start_frame_120hz, metric.stop_frame_120hz)
+        if key in seen:
+            raise ValueError(f"{metric.stem}: duplicate PFNN interval metric")
+        seen.add(key)
+        coverage = _coverage(record, metric)
+        if coverage:
+            by_stem.setdefault(metric.stem, []).append((record, metric, coverage))
+    selected: list[PFNNSliceRole] = []
+    for stem in sorted(by_stem):
+        record, metric, coverage = max(
+            by_stem[stem],
+            key=lambda value: (
+                len(value[2]),
+                int(value[1].has_idle_transition),
+                value[1].root_displacement_m,
+                -value[1].start_frame_120hz,
+            ),
+        )
+        selected.append(
+            _slice(
+                record,
+                metric,
+                role="validation" if stem.endswith("_001") else "train",
+                coverage=coverage,
+            )
+        )
+    output = tuple(selected)
+    if len(output) < 4 or not any(item.role == "validation" for item in output):
+        raise ValueError("expanded PFNN slice lacks train/validation coverage")
+    required = {
+        "idle_transition",
+        "straight",
+        "left_turn",
+        "right_turn",
+        "ascent",
+        "descent",
+    }
+    train_coverage = required_coverage(
+        tuple(item for item in output if item.role == "train")
+    )
+    if required - train_coverage:
+        raise ValueError(
+            "expanded PFNN train slice lacks "
+            + ", ".join(sorted(required - train_coverage))
+        )
+    return output
+
+
 def required_coverage(selection: tuple[PFNNSliceRole, ...]) -> frozenset[str]:
     values: set[str] = set()
     for item in selection:
@@ -548,8 +617,8 @@ def required_coverage(selection: tuple[PFNNSliceRole, ...]) -> frozenset[str]:
 def vertical_slice_receipt(selection: tuple[PFNNSliceRole, ...]) -> dict[str, object]:
     """Return canonical, path-independent selection provenance."""
 
-    if len(selection) != 4:
-        raise ValueError("vertical slice receipt requires exactly four items")
+    if len(selection) < 4:
+        raise ValueError("vertical slice receipt requires at least four items")
     items = []
     for item in sorted(selection, key=lambda value: (value.role, value.record.stem)):
         record = item.record

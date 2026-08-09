@@ -731,7 +731,7 @@ def build_vertical_dataset_from_retarget(
         selection.get("schema") != "g1-pfnn-vertical-slice-selection/v1"
         or selection.get("sha256") != selection_sha
         or not isinstance(selection.get("items"), list)
-        or len(selection["items"]) != 4
+        or len(selection["items"]) < 4
     ):
         raise ValueError("vertical source selection contract is invalid")
     if (
@@ -740,7 +740,7 @@ def build_vertical_dataset_from_retarget(
         or manifest.get("status") != "accepted"
         or manifest.get("selection_sha256") != selection_sha
         or not isinstance(manifest.get("items"), list)
-        or len(manifest["items"]) != 4
+        or len(manifest["items"]) != len(selection["items"])
     ):
         raise ValueError("vertical retarget manifest contract is invalid")
     selected_by_stem = {
@@ -754,8 +754,8 @@ def build_vertical_dataset_from_retarget(
         if isinstance(item, dict)
     }
     if (
-        len(selected_by_stem) != 4
-        or len(retarget_by_stem) != 4
+        len(selected_by_stem) != len(selection["items"])
+        or len(retarget_by_stem) != len(manifest["items"])
         or set(selected_by_stem) != set(retarget_by_stem)
     ):
         raise ValueError("vertical selection and retarget identities differ")
