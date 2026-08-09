@@ -6,6 +6,7 @@ import unittest
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from resources.g1_terrain_builder import database as database_module
 from resources.g1_terrain_builder.database import (
     ContactConfig,
     combine_clips,
@@ -54,6 +55,50 @@ def _expected_database_bytes(artifacts: ArtifactSet) -> bytes:
 
 
 class DatabaseBuilderTests(unittest.TestCase):
+    def test_lmm_contacts_match_bundled_orange_duck_speed_only_rule(self):
+        frames = 12
+        positions = np.zeros((frames, 3, 3), np.float64)
+        positions[:, 1, 1] = 100.0
+        positions[:, 2, 0] = np.arange(frames) * (0.16 / 60.0)
+        rotations = np.zeros((frames, 3, 4), np.float64)
+        rotations[..., 0] = 1.0
+
+        contacts = database_module.derive_lmm_contacts(
+            positions,
+            rotations,
+            np.array([-1, 0, 0], np.int32),
+            1,
+            2,
+            60.0,
+        )
+
+        self.assertEqual(contacts.dtype, np.dtype(np.uint8))
+        np.testing.assert_array_equal(contacts[:, 0], 1)
+        np.testing.assert_array_equal(contacts[:, 1], 0)
+
+    def test_lmm_contacts_use_strict_threshold_and_exact_even_filter(self):
+        frames = 12
+        positions = np.zeros((frames, 3, 3), np.float64)
+        positions[:, 1, 0] = np.arange(frames) * (0.1501 / 60.0)
+        positions[:, 2, 0] = np.arange(frames) * (0.14 / 60.0)
+        rotations = np.zeros((frames, 3, 4), np.float64)
+        rotations[..., 0] = 1.0
+
+        contacts = database_module.derive_lmm_contacts(
+            positions,
+            rotations,
+            np.array([-1, 0, 0], np.int32),
+            1,
+            2,
+            60.0,
+        )
+
+        np.testing.assert_array_equal(contacts[:, 0], 0)
+        np.testing.assert_array_equal(contacts[:, 1], 1)
+        self.assertEqual(database_module.LMM_CONTACT_SPEED_THRESHOLD, 0.15)
+        self.assertEqual(database_module.LMM_CONTACT_MEDIAN_FILTER_FRAMES, 6)
+        self.assertEqual(database_module.LMM_CONTACT_FILTER_MODE, "nearest")
+
     def test_continuity_split_uses_native_local_union_and_drops_short_fragments(self):
         native = np.zeros(199, np.float64)
         local = np.zeros(199, np.float64)

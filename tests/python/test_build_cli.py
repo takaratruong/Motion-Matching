@@ -1,4 +1,5 @@
 import gc
+import copy
 import hashlib
 import io
 import json
@@ -60,7 +61,7 @@ class BuildCliTests(unittest.TestCase):
             qpos=np.zeros((2, 36), np.float32),
         )
         preliminary = SimpleNamespace(
-            positions=np.zeros((4086, 31, 3), np.float32),
+            positions=np.zeros((256, 31, 3), np.float32),
         )
         for name, skeleton in self._noncanonical_flat_skeletons():
             with (
@@ -68,6 +69,8 @@ class BuildCliTests(unittest.TestCase):
                 mock.patch.object(builder, "_require_file"),
                 mock.patch.object(
                     builder, "load_retarget_npz", return_value=source),
+                mock.patch.object(
+                    builder, "_require_canonical_flat_retarget"),
                 mock.patch.object(builder, "G1Kinematics"),
                 mock.patch.object(
                     builder, "convert_source_clip",
@@ -97,21 +100,25 @@ class BuildCliTests(unittest.TestCase):
             ):
                 validator._validate_flat_skeleton_receipt(receipt, database)
 
-    def test_v1_flat_manifest_is_rejected_before_tree_loading(self):
+    def test_v1_and_v2_flat_manifests_are_rejected_before_tree_loading(self):
         with tempfile.TemporaryDirectory() as temporary:
-            with open(
-                os.path.join(temporary, "manifest.json"), "w",
-                encoding="utf-8",
-            ) as stream:
-                json.dump(
-                    {"schema": "g1-lmm-flat-data/v1"}, stream,
-                    indent=2, sort_keys=True,
-                )
-                stream.write("\n")
-            with self.assertRaisesRegex(ValueError, "v2"):
-                validator.validate_artifact_directory(temporary)
+            for version in ("v1", "v2"):
+                with open(
+                    os.path.join(temporary, "manifest.json"), "w",
+                    encoding="utf-8",
+                ) as stream:
+                    json.dump(
+                        {"schema": f"g1-lmm-flat-data/{version}"}, stream,
+                        indent=2, sort_keys=True,
+                    )
+                    stream.write("\n")
+                with (
+                    self.subTest(version=version),
+                    self.assertRaisesRegex(ValueError, "v3"),
+                ):
+                    validator.validate_artifact_directory(temporary)
 
-    def test_real_flat_candidate_has_exact_continuity_safe_v2_receipt(self):
+    def test_stale_flat_retarget_rejects_before_kinematics(self):
         args = builder._parser().parse_args([
             "--output-fps", "60", "--flat-only",
             "--retarget-npz",
@@ -121,15 +128,173 @@ class BuildCliTests(unittest.TestCase):
             "sonic/runs/native-g1-pfnn/sample-retarget/"
             "LocomotionFlat01_000-120hz.receipt.json",
         ])
+        with (
+            mock.patch.object(builder, "G1Kinematics") as kinematics,
+            self.assertRaisesRegex(ValueError, "receipt fields"),
+        ):
+            builder._assemble_flat_candidate(args)
+        kinematics.assert_not_called()
+
+    def test_flat_builder_pins_canonical_receipt_before_kinematics(self):
+        args = SimpleNamespace(
+            output_fps=60.0,
+            retarget_npz="flat.npz",
+            retarget_receipt="flat.receipt.json",
+            g1_xml="g1.xml",
+        )
+        with open(
+            "sonic/runs/native-g1-pfnn/sample-retarget/"
+            "LocomotionFlat01_000-walk-only-7659-8171-120hz.receipt.json",
+            encoding="utf-8",
+        ) as stream:
+            original = json.load(stream)
+        cases = (
+            ("source_sha256", "0" * 64),
+            ("prepared_sha256", "0" * 64),
+            ("output_sha256", "0" * 64),
+            ("start_frame", 7658),
+            ("frame_count", 511),
+            ("warmup_frames", 119),
+            ("grounding", "source"),
+            ("grounding_offset_m", 0.0),
+            ("pfnn_position_scale", 1.0),
+            ("aliases", [["Spine1", "Spine2"],
+                         ["LeftToeBase", "LeftToe"]]),
+            ("gmr_commit", "0" * 40),
+            ("retarget_project_commit", "0" * 40),
+        )
+        for key, value in cases:
+            receipt = copy.deepcopy(original)
+            receipt[key] = value
+            source = SimpleNamespace(
+                name="LocomotionFlat01_000-walk-only-7659-8171-120hz",
+                fps=120.0,
+                terrain_id="flat",
+                qpos=np.zeros((512, 36), np.float32),
+                source_frames=np.arange(7659, 8171, dtype=np.int32),
+                provenance={
+                    "sha256": receipt["output_sha256"],
+                    "receipt": receipt,
+                },
+            )
+            with (
+                self.subTest(key=key),
+                mock.patch.object(builder, "_require_file"),
+                mock.patch.object(
+                    builder, "load_retarget_npz", return_value=source),
+                mock.patch.object(builder, "G1Kinematics") as kinematics,
+                self.assertRaisesRegex(ValueError, "canonical flat retarget"),
+            ):
+                builder._assemble_flat_candidate(args)
+            kinematics.assert_not_called()
+
+    def test_flat_validator_independently_pins_canonical_receipt(self):
+        source = builder.load_retarget_npz(
+            "sonic/runs/native-g1-pfnn/sample-retarget/"
+            "LocomotionFlat01_000-walk-only-7659-8171-120hz.npz",
+            "sonic/runs/native-g1-pfnn/sample-retarget/"
+            "LocomotionFlat01_000-walk-only-7659-8171-120hz.receipt.json",
+        )
+        validator._require_canonical_flat_retarget(source)
+        for key, value in (
+            ("source_sha256", "0" * 64),
+            ("prepared_sha256", "0" * 64),
+            ("start_frame", 7658),
+            ("frame_count", 511),
+            ("warmup_frames", 119),
+            ("grounding", "source"),
+            ("pfnn_position_scale", 1.0),
+            ("aliases", [["Spine1", "Spine2"],
+                         ["RightToeBase", "RightToe"]]),
+            ("gmr_commit", "0" * 40),
+            ("retarget_project_commit", "0" * 40),
+        ):
+            changed = copy.deepcopy(source)
+            changed.provenance["receipt"][key] = value
+            with (
+                self.subTest(key=key),
+                self.assertRaisesRegex(ValueError, "canonical flat retarget"),
+            ):
+                validator._require_canonical_flat_retarget(changed)
+
+    def test_flat_contact_receipt_rejects_one_sided_or_nonmeaningful_runs(self):
+        one_sided = np.zeros((20, 2), np.uint8)
+        one_sided[:4, 0] = 1
+        short = np.zeros((20, 2), np.uint8)
+        short[:4, 0] = 1
+        short[10:14, 1] = 1
+        for name, contacts in (("one-sided", one_sided), ("short", short)):
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(ValueError, "bilateral contact"),
+            ):
+                builder._flat_contact_receipt(
+                    contacts,
+                    np.array([0], np.int32),
+                    np.array([20], np.int32),
+                    median_filter_frames=6,
+                )
+
+    def test_flat_contact_receipt_reports_alternating_runs(self):
+        contacts = np.zeros((24, 2), np.uint8)
+        contacts[1:9, 0] = 1
+        contacts[14:23, 1] = 1
+        self.assertEqual(
+            builder._flat_contact_receipt(
+                contacts,
+                np.array([0], np.int32),
+                np.array([24], np.int32),
+                median_filter_frames=6,
+            ),
+            {
+                "schema": "g1-lmm-bilateral-contact/v1",
+                "left_contact_frames": 8,
+                "right_contact_frames": 9,
+                "left_run_count": 1,
+                "right_run_count": 1,
+                "left_max_run_frames": 8,
+                "right_max_run_frames": 9,
+                "alternating_run_transition_count": 1,
+            },
+        )
+
+    def test_flat_validator_recomputes_bilateral_contact_observations(self):
+        contacts = np.zeros((24, 2), np.uint8)
+        contacts[1:9, 0] = 1
+        contacts[14:23, 1] = 1
+        ranges = (np.array([0], np.int32), np.array([24], np.int32))
+        expected = builder._flat_contact_receipt(
+            contacts, *ranges, median_filter_frames=6)
+        self.assertEqual(
+            validator._flat_contact_receipt(
+                contacts, *ranges, median_filter_frames=6),
+            expected,
+        )
+        old_labels = np.zeros((24, 2), np.uint8)
+        old_labels[:4, 0] = 1
+        with self.assertRaisesRegex(ValueError, "bilateral contact"):
+            validator._flat_contact_receipt(
+                old_labels, *ranges, median_filter_frames=6)
+
+    def test_real_flat_candidate_has_exact_continuity_safe_v3_receipt(self):
+        args = builder._parser().parse_args([
+            "--output-fps", "60", "--flat-only",
+            "--retarget-npz",
+            "sonic/runs/native-g1-pfnn/sample-retarget/"
+            "LocomotionFlat01_000-walk-only-7659-8171-120hz.npz",
+            "--retarget-receipt",
+            "sonic/runs/native-g1-pfnn/sample-retarget/"
+            "LocomotionFlat01_000-walk-only-7659-8171-120hz.receipt.json",
+        ])
 
         artifacts, features, manifest = builder._assemble_flat_candidate(args)
 
-        self.assertEqual(manifest["schema"], "g1-lmm-flat-data/v2")
-        self.assertEqual(len(artifacts.positions), 3853)
-        self.assertEqual(features.values.shape, (3853, 31))
+        self.assertEqual(manifest["schema"], "g1-lmm-flat-data/v3")
+        self.assertEqual(len(artifacts.positions), 256)
+        self.assertEqual(features.values.shape, (256, 31))
         self.assertEqual(manifest["source_count"], 1)
-        self.assertEqual(manifest["range_count"], 13)
-        self.assertEqual(len(manifest["ranges"]), 13)
+        self.assertEqual(manifest["range_count"], 1)
+        self.assertEqual(len(manifest["ranges"]), 1)
         self.assertEqual(
             {len(entry) for entry in manifest["ranges"]}, {7})
         self.assertEqual(set(manifest["ranges"][0]), {
@@ -139,24 +304,24 @@ class BuildCliTests(unittest.TestCase):
         self.assertEqual(
             max(entry["stop"] - entry["start"]
                 for entry in manifest["ranges"]),
-            747,
+            256,
         )
         continuity = manifest["continuity"]
         self.assertEqual(continuity["schema"], "g1-lmm-continuity/v1")
-        self.assertEqual(continuity["source_native_rejected_edge_count"], 31)
-        self.assertEqual(continuity["database_local_rejected_edge_count"], 32)
-        self.assertEqual(continuity["union_rejected_edge_count"], 32)
-        self.assertEqual(continuity["dropped_fragment_count"], 20)
-        self.assertEqual(continuity["dropped_frame_count"], 233)
-        self.assertEqual(continuity["published_range_count"], 13)
-        self.assertEqual(continuity["published_frame_count"], 3853)
+        self.assertEqual(continuity["source_native_rejected_edge_count"], 0)
+        self.assertEqual(continuity["database_local_rejected_edge_count"], 0)
+        self.assertEqual(continuity["union_rejected_edge_count"], 0)
+        self.assertEqual(continuity["dropped_fragment_count"], 0)
+        self.assertEqual(continuity["dropped_frame_count"], 0)
+        self.assertEqual(continuity["published_range_count"], 1)
+        self.assertEqual(continuity["published_frame_count"], 256)
         self.assertAlmostEqual(
             continuity["maximum_admitted_native_step_rad"],
-            0.2371947467327118,
+            0.12608182430267334,
         )
         self.assertAlmostEqual(
             continuity["maximum_admitted_local_rotation_step_rad"],
-            0.23719475193867512,
+            0.12608181972804253,
         )
         digest_rows = np.asarray([[
             entry["start"], entry["stop"], entry["source_first_frame"],
@@ -167,7 +332,7 @@ class BuildCliTests(unittest.TestCase):
             hashlib.sha256(digest_rows.tobytes(order="C")).hexdigest(),
         )
         source = manifest["sources"][0]
-        self.assertEqual(len(source["left_source_index"]), 3853)
+        self.assertEqual(len(source["left_source_index"]), 256)
         map_payload = b"".join((
             np.asarray(source["left_source_index"], dtype="<i4").tobytes(),
             np.asarray(source["right_source_index"], dtype="<i4").tobytes(),
@@ -177,6 +342,22 @@ class BuildCliTests(unittest.TestCase):
             continuity["source_map_digest_sha256"],
             hashlib.sha256(map_payload).hexdigest(),
         )
+        self.assertEqual(manifest["contact_observations"], {
+            "schema": "g1-lmm-bilateral-contact/v1",
+            "left_contact_frames": 116,
+            "right_contact_frames": 117,
+            "left_run_count": 3,
+            "right_run_count": 4,
+            "left_max_run_frames": 49,
+            "right_max_run_frames": 45,
+            "alternating_run_transition_count": 6,
+        })
+        self.assertEqual(manifest["contact"], {
+            "semantics": "bundled-orange-duck-global-toe-speed-only",
+            "speed_threshold": 0.15,
+            "median_filter_frames": 6,
+            "median_filter_mode": "nearest",
+        })
 
     def test_flat_parser_requires_receipt_bound_60hz_inputs(self):
         args = builder._parser().parse_args([
@@ -201,7 +382,7 @@ class BuildCliTests(unittest.TestCase):
         artifacts = object()
         features = object()
         manifest_base = {
-            "schema": "g1-lmm-flat-data/v2", "output_fps": 60.0,
+            "schema": "g1-lmm-flat-data/v3", "output_fps": 60.0,
             "trajectory_horizons": [20, 40, 60],
             "feature_dimensions": 31,
         }

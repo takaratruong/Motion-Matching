@@ -165,6 +165,16 @@ class ArtifactTests(unittest.TestCase):
                 "status": "accepted", "root_quaternion_order": "xyzw",
                 "output_sha256": source_sha, "frame_count": 1,
                 "fps": 120.0, "joint_names": joint_names,
+                "source_sha256": "a" * 64,
+                "prepared_sha256": "b" * 64,
+                "gmr_commit": "bb1bbe40774794fceb2a7c579a3464a28e68c844",
+                "retarget_project_commit":
+                    "fb3433a6310ab4198102d3905e74b73944fc1f6b",
+                "source_frame_count": 241, "start_frame": 240,
+                "warmup_frames": 0,
+                "aliases": [["Spine1", "Spine2"]],
+                "grounding_offset_m": 0.0, "grounding": "flat",
+                "pfnn_position_scale": 5.6444,
             }
             with open(receipt_path, "w", encoding="utf-8") as stream:
                 json.dump(receipt, stream)
@@ -176,11 +186,11 @@ class ArtifactTests(unittest.TestCase):
                 "receipt_schema": receipt["schema"],
                 "receipt_status": "accepted", "source_fps": 120.0,
                 "source_frames": 1, "output_frames": 1,
-                "left_source_index": [0], "right_source_index": [0],
+                "left_source_index": [240], "right_source_index": [240],
                 "source_alpha": [0.0],
             }
             valid = {
-                "schema": "g1-lmm-flat-data/v2", "output_fps": 60.0,
+                "schema": "g1-lmm-flat-data/v3", "output_fps": 60.0,
                 "sources": [source],
                 "validation": {
                     "fk_max_error_m": 0.0, "duration_error_s": 0.0,

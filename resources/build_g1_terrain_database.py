@@ -25,6 +25,7 @@ from resources.g1_terrain_builder.database import (
     ContactConfig,
     combine_clips,
     derive_contacts,
+    derive_lmm_contacts,
     derive_velocities,
     forward_kinematics_arrays,
     sample_terrain_support,
@@ -77,6 +78,17 @@ DEFAULTS = {
 SCHEMA = "g1-terrain-artifacts/v2"
 OUTPUT_FPS = 25.0
 TERRAIN_DISTANCES = [0.25, 0.50, 0.75, 1.00]
+CANONICAL_FLAT_RETARGET_NAME = (
+    "LocomotionFlat01_000-walk-only-7659-8171-120hz")
+CANONICAL_FLAT_OUTPUT_SHA256 = (
+    "bbdeb79760950480582ae937e54b913c376caa49f344896a8958476b82f3317f")
+CANONICAL_FLAT_RECEIPT_SHA256 = (
+    "2d0e93f485bab9c54773c66cf07c14d25837f5f4e50f5c007f9f8e2c5c20520f")
+CANONICAL_FLAT_SOURCE_SHA256 = (
+    "4a01768df71c6f7b5bbb71312c1e94eae489af32b21c3e300fd1c8d1ffc24bc5")
+CANONICAL_FLAT_PREPARED_SHA256 = (
+    "d6dbbac84e68d419d27aff0356b5a8245522f39694d94a6fc83e300ab6feaf8d")
+CANONICAL_FLAT_GROUNDING_OFFSET_M = 0.06142798715901732
 
 
 def _odd_frame_count(seconds: float, fps: float) -> int:
@@ -224,18 +236,125 @@ def _maximum_local_rotation_steps(rotations):
     return np.max(2.0 * np.arccos(np.clip(dots, 0.0, 1.0)), axis=1)
 
 
+def _require_canonical_flat_retarget(source):
+    provenance = source.provenance
+    if type(provenance) is not dict or type(provenance.get("receipt")) is not dict:
+        raise ValueError("canonical flat retarget has no authenticated receipt")
+    receipt = provenance["receipt"]
+    expected = {
+        "schema": "native-g1-pfnn-sample-retarget/v1",
+        "status": "accepted",
+        "source_sha256": CANONICAL_FLAT_SOURCE_SHA256,
+        "prepared_sha256": CANONICAL_FLAT_PREPARED_SHA256,
+        "output_sha256": CANONICAL_FLAT_OUTPUT_SHA256,
+        "gmr_commit": "bb1bbe40774794fceb2a7c579a3464a28e68c844",
+        "retarget_project_commit":
+            "fb3433a6310ab4198102d3905e74b73944fc1f6b",
+        "fps": 120.0,
+        "source_frame_count": 8171,
+        "start_frame": 7659,
+        "frame_count": 512,
+        "warmup_frames": 120,
+        "aliases": [["Spine1", "Spine2"]],
+        "root_quaternion_order": "xyzw",
+        "grounding_offset_m": CANONICAL_FLAT_GROUNDING_OFFSET_M,
+        "grounding": "flat",
+        "pfnn_position_scale": 5.6444,
+    }
+    for key, value in expected.items():
+        if receipt.get(key) != value:
+            raise ValueError(
+                f"canonical flat retarget receipt {key} changed")
+    if source.name != CANONICAL_FLAT_RETARGET_NAME \
+            or source.fps != 120.0 or source.terrain_id != "flat" \
+            or len(source.qpos) != 512 \
+            or not np.array_equal(
+                source.source_frames, np.arange(7659, 8171, dtype=np.int32)) \
+            or provenance.get("sha256") != CANONICAL_FLAT_OUTPUT_SHA256 \
+            or provenance.get("receipt_sha256") \
+            != CANONICAL_FLAT_RECEIPT_SHA256:
+        raise ValueError("canonical flat retarget identity changed")
+
+
+def _flat_contact_receipt(
+    contacts, range_starts, range_stops, *, median_filter_frames,
+):
+    contacts = np.asarray(contacts)
+    starts = np.asarray(range_starts)
+    stops = np.asarray(range_stops)
+    if contacts.ndim != 2 or contacts.shape[1] != 2 \
+            or contacts.dtype != np.dtype(np.uint8) \
+            or np.any((contacts != 0) & (contacts != 1)):
+        raise ValueError("bilateral contact rows must be binary uint8 (T, 2)")
+    if starts.ndim != 1 or stops.shape != starts.shape or len(starts) < 1 \
+            or starts[0] != 0 or stops[-1] != len(contacts) \
+            or np.any(starts[1:] != stops[:-1]) \
+            or np.any(starts < 0) or np.any(stops <= starts):
+        raise ValueError("bilateral contact ranges must exactly cover rows")
+    if type(median_filter_frames) is not int or median_filter_frames < 1:
+        raise ValueError("bilateral contact filter size is invalid")
+
+    run_lengths = ([], [])
+    events_by_range = []
+    for start, stop in zip(starts.tolist(), stops.tolist()):
+        events = []
+        for side in range(2):
+            values = contacts[start:stop, side].astype(np.int8, copy=False)
+            edges = np.diff(np.pad(values, (1, 1)))
+            run_starts = np.flatnonzero(edges == 1)
+            run_stops = np.flatnonzero(edges == -1)
+            for run_start, run_stop in zip(run_starts, run_stops):
+                run_lengths[side].append(int(run_stop - run_start))
+                events.append((int(run_start), side))
+        events.sort()
+        events_by_range.append(events)
+    transitions = sum(
+        left[1] != right[1]
+        for events in events_by_range
+        for left, right in zip(events, events[1:])
+    )
+    receipt = {
+        "schema": "g1-lmm-bilateral-contact/v1",
+        "left_contact_frames": int(contacts[:, 0].sum()),
+        "right_contact_frames": int(contacts[:, 1].sum()),
+        "left_run_count": len(run_lengths[0]),
+        "right_run_count": len(run_lengths[1]),
+        "left_max_run_frames": max(run_lengths[0], default=0),
+        "right_max_run_frames": max(run_lengths[1], default=0),
+        "alternating_run_transition_count": int(transitions),
+    }
+    if receipt["left_contact_frames"] == 0 \
+            or receipt["right_contact_frames"] == 0 \
+            or receipt["left_max_run_frames"] < median_filter_frames \
+            or receipt["right_max_run_frames"] < median_filter_frames \
+            or transitions < 1:
+        raise ValueError(
+            "bilateral contact observations lack meaningful alternating runs")
+    return receipt
+
+
 def _flat_source_fragment(source, first_source_frame, last_source_frame):
     first_source_frame = int(first_source_frame)
     last_source_frame = int(last_source_frame)
-    if first_source_frame < 0 or last_source_frame < first_source_frame \
-            or last_source_frame >= len(source.qpos):
+    if len(source.source_frames) != len(source.qpos) \
+            or not np.array_equal(
+                source.source_frames,
+                np.arange(
+                    int(source.source_frames[0]),
+                    int(source.source_frames[0]) + len(source.source_frames),
+                    dtype=source.source_frames.dtype)):
+        raise ValueError("flat source frame provenance must be contiguous")
+    local_first = first_source_frame - int(source.source_frames[0])
+    local_last = last_source_frame - int(source.source_frames[0])
+    if local_first < 0 or local_last < local_first \
+            or local_last >= len(source.qpos):
         raise ValueError("flat continuity fragment source bounds are invalid")
-    stop = last_source_frame + 1
+    stop = local_last + 1
     fragment = SourceClip(
         source.name,
         source.fps,
-        source.qpos[first_source_frame:stop].copy(),
-        source.source_frames[first_source_frame:stop].copy(),
+        source.qpos[local_first:stop].copy(),
+        source.source_frames[local_first:stop].copy(),
         source.terrain_id,
         source.provenance,
     )
@@ -253,12 +372,11 @@ def _assemble_flat_candidate(args):
     _require_file(args.retarget_npz, "released-PFNN G1 retarget")
     _require_file(args.retarget_receipt, "released-PFNN G1 retarget receipt")
     source = load_retarget_npz(args.retarget_npz, args.retarget_receipt)
-    if source.fps != 120.0 or source.terrain_id != "flat":
-        raise ValueError("flat released-PFNN source must be 120 Hz and flat")
+    _require_canonical_flat_retarget(source)
     kinematics = G1Kinematics(args.g1_xml)
     preliminary, skeleton, _ = convert_source_clip(
         source, kinematics, target_fps=60.0, root_filter_mode="nearest")
-    if len(preliminary.positions) != 4086:
+    if len(preliminary.positions) != 256:
         raise ValueError("flat released-PFNN frame count changed")
     require_canonical_g1_skeleton(skeleton, "flat released-PFNN skeleton")
     native_dofs = resample_vectors(source.qpos[:, 7:], source.fps, 60.0)
@@ -267,11 +385,11 @@ def _assemble_flat_candidate(args):
     continuity_plan = split_continuity_ranges(
         native_steps, local_steps, threshold=0.25, minimum_frames=61)
     expected_plan = {
-        "source_native_rejected_edge_count": 31,
-        "database_local_rejected_edge_count": 32,
-        "union_rejected_edge_count": 32,
-        "dropped_fragment_count": 20,
-        "dropped_frame_count": 233,
+        "source_native_rejected_edge_count": 0,
+        "database_local_rejected_edge_count": 0,
+        "union_rejected_edge_count": 0,
+        "dropped_fragment_count": 0,
+        "dropped_frame_count": 0,
     }
     for key, expected in expected_plan.items():
         if continuity_plan[key] != expected:
@@ -279,8 +397,8 @@ def _assemble_flat_candidate(args):
                 f"released-PFNN continuity {key} changed: "
                 f"{continuity_plan[key]} != {expected}")
     retained = continuity_plan["retained_ranges"]
-    if len(retained) != 13 or sum(stop - start for start, stop in retained) \
-            != 3853:
+    if len(retained) != 1 or sum(stop - start for start, stop in retained) \
+            != 256:
         raise ValueError("released-PFNN retained continuity ranges changed")
 
     full_left, full_right, _full_alpha = resample_map(
@@ -291,13 +409,21 @@ def _assemble_flat_candidate(args):
     database_cursor = 0
     expected_signature = G1_SKELETON_SIGNATURE
     for output_start, output_stop in retained:
-        first_source = int(full_left[output_start])
-        last_source = int(full_right[output_stop - 1])
+        first_source = int(source.source_frames[full_left[output_start]])
+        last_source = int(source.source_frames[full_right[output_stop - 1]])
         fragment = _flat_source_fragment(
             source, first_source, last_source)
         clip, fragment_skeleton, report = finalize_clip(
             fragment, FlatTerrain(), kinematics, output_fps=60.0,
             root_filter_mode="nearest")
+        clip.contacts = derive_lmm_contacts(
+            clip.positions,
+            clip.rotations,
+            fragment_skeleton.parents,
+            fragment_skeleton.names.index("LeftToe"),
+            fragment_skeleton.names.index("RightToe"),
+            60.0,
+        )
         require_canonical_g1_skeleton(
             fragment_skeleton, "flat continuity fragment skeleton")
         if fragment_skeleton.signature() != expected_signature \
@@ -318,7 +444,7 @@ def _assemble_flat_candidate(args):
         database_cursor = range_stop
 
     artifacts = combine_clips(clips, skeleton)
-    if database_cursor != 3853 \
+    if database_cursor != 256 \
             or artifacts.range_starts.tolist() != [
                 entry["start"] for entry in ranges] \
             or artifacts.range_stops.tolist() != [
@@ -355,7 +481,7 @@ def _assemble_flat_candidate(args):
     if type(provenance) is not dict:
         raise ValueError("flat source has no authenticated provenance")
     manifest_base = {
-        "schema": "g1-lmm-flat-data/v2",
+        "schema": "g1-lmm-flat-data/v3",
         "output_fps": 60.0,
         "trajectory_horizons": list(horizons),
         "feature_dimensions": 31,
@@ -400,14 +526,21 @@ def _assemble_flat_candidate(args):
             "root_position_order": 3,
             "root_direction_frames": 61,
             "root_direction_order": 3,
-            "contact_median_frames": 7,
+            "contact_median_frames": 6,
             "forward_terrain_path_rows": 121,
         },
         "contact": {
+            "semantics": "bundled-orange-duck-global-toe-speed-only",
             "speed_threshold": 0.15,
-            "height_threshold": 0.06,
-            "median_filter_frames": 7,
+            "median_filter_frames": 6,
+            "median_filter_mode": "nearest",
         },
+        "contact_observations": _flat_contact_receipt(
+            artifacts.contacts,
+            artifacts.range_starts,
+            artifacts.range_stops,
+            median_filter_frames=6,
+        ),
         "sources": [{
             "name": source.name,
             "terrain_id": "flat",

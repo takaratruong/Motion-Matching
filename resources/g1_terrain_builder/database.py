@@ -13,6 +13,11 @@ import quat as holden_quat
 from .schema import ArtifactSet, HoldenClip, SkeletonSpec
 
 
+LMM_CONTACT_SPEED_THRESHOLD = 0.15
+LMM_CONTACT_MEDIAN_FILTER_FRAMES = 6
+LMM_CONTACT_FILTER_MODE = "nearest"
+
+
 @dataclass(frozen=True)
 class ContactConfig:
     speed_threshold: float = 0.15
@@ -450,6 +455,75 @@ def derive_contacts(
             contacts[:, side],
             size=int(config.median_filter_frames),
             mode="nearest",
+        )
+    return contacts.astype(np.uint8)
+
+
+def derive_lmm_contacts(
+    local_positions: np.ndarray,
+    local_rotations: np.ndarray,
+    parents: np.ndarray,
+    left: int,
+    right: int,
+    fps: float,
+) -> np.ndarray:
+    """Reproduce the bundled Orange Duck 60 Hz contact-label rule."""
+
+    positions, rotations, fps = _validated_motion_arrays(
+        local_positions, local_rotations, fps)
+    if fps != 60.0:
+        raise ValueError("LMM contacts require exact 60 Hz motion")
+    frames, bones = positions.shape[:2]
+    if frames < 4:
+        raise ValueError("LMM contacts require at least four motion frames")
+    _validate_parent_hierarchy(parents, bones)
+    if any(
+        not isinstance(index, Integral)
+        or isinstance(index, (bool, np.bool_))
+        or index < 0 or index >= bones
+        for index in (left, right)
+    ):
+        raise ValueError("LMM contact toe indices are out of range")
+    if left == right:
+        raise ValueError("LMM contact toe indices must be distinct")
+
+    velocities = np.empty_like(positions)
+    velocities[1:-1] = (
+        0.5 * (positions[2:] - positions[1:-1]) * fps
+        + 0.5 * (positions[1:-1] - positions[:-2]) * fps
+    )
+    velocities[0] = velocities[1] - (velocities[3] - velocities[2])
+    velocities[-1] = velocities[-2] + (
+        velocities[-2] - velocities[-3])
+
+    angular_velocities = np.zeros_like(positions)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        angular_velocities[1:-1] = (
+            0.5 * holden_quat.to_scaled_angle_axis(holden_quat.abs(
+                holden_quat.mul_inv(
+                    rotations[2:], rotations[1:-1]))) * fps
+            + 0.5 * holden_quat.to_scaled_angle_axis(holden_quat.abs(
+                holden_quat.mul_inv(
+                    rotations[1:-1], rotations[:-2]))) * fps
+        )
+    angular_velocities[0] = angular_velocities[1] - (
+        angular_velocities[3] - angular_velocities[2])
+    angular_velocities[-1] = angular_velocities[-2] + (
+        angular_velocities[-2] - angular_velocities[-3])
+    _global_rotations, _global_positions, global_velocities, \
+        _global_angular_velocities = holden_quat.fk_vel(
+            rotations, positions, velocities, angular_velocities, parents)
+    if not np.isfinite(global_velocities).all():
+        raise ValueError("LMM global velocities must be finite")
+
+    toe_velocities = global_velocities[:, np.asarray([left, right])]
+    speed = np.sqrt(np.sum(toe_velocities**2, axis=-1))
+    contacts = speed < LMM_CONTACT_SPEED_THRESHOLD
+    for side in range(2):
+        contacts[:, side] = ndimage.median_filter(
+            contacts[:, side],
+            size=LMM_CONTACT_MEDIAN_FILTER_FRAMES,
+            mode=LMM_CONTACT_FILTER_MODE,
         )
     return contacts.astype(np.uint8)
 

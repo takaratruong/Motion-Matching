@@ -3,8 +3,23 @@ import hashlib
 import json
 import joblib
 import numpy as np
+import re
 
 from .schema import SourceClip
+
+
+RETARGET_RECEIPT_FIELDS = frozenset({
+    "schema", "status", "source_sha256", "prepared_sha256",
+    "output_sha256", "gmr_commit", "retarget_project_commit", "fps",
+    "source_frame_count", "start_frame", "frame_count", "warmup_frames",
+    "aliases", "joint_names", "root_quaternion_order",
+    "grounding_offset_m", "grounding", "pfnn_position_scale",
+})
+RETARGET_GMR_COMMIT = "bb1bbe40774794fceb2a7c579a3464a28e68c844"
+RETARGET_PROJECT_COMMIT = "fb3433a6310ab4198102d3905e74b73944fc1f6b"
+RETARGET_ALIASES = [["Spine1", "Spine2"]]
+PFNN_POSITION_SCALE = 5.6444
+_HEX_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 
 def _sha256(path: str) -> str:
@@ -67,14 +82,49 @@ def load_grail(path: str) -> SourceClip:
 def load_retarget_npz(path: str, receipt_path: str) -> SourceClip:
     with open(receipt_path, encoding="utf-8") as stream:
         receipt = json.load(stream)
+    if type(receipt) is not dict or set(receipt) != RETARGET_RECEIPT_FIELDS:
+        raise ValueError("retarget receipt fields changed")
     required = {
         "schema": "native-g1-pfnn-sample-retarget/v1",
         "status": "accepted",
         "root_quaternion_order": "xyzw",
+        "gmr_commit": RETARGET_GMR_COMMIT,
+        "retarget_project_commit": RETARGET_PROJECT_COMMIT,
+        "aliases": RETARGET_ALIASES,
+        "grounding": "flat",
+        "pfnn_position_scale": PFNN_POSITION_SCALE,
     }
     for key, expected in required.items():
         if receipt.get(key) != expected:
             raise ValueError(f"retarget receipt {key} is not {expected!r}")
+    for key in ("source_sha256", "prepared_sha256", "output_sha256"):
+        value = receipt[key]
+        if type(value) is not str or not _HEX_SHA256.fullmatch(value):
+            raise ValueError(f"retarget receipt {key} is not a SHA-256")
+    for key in (
+        "source_frame_count", "start_frame", "frame_count", "warmup_frames",
+    ):
+        if type(receipt[key]) is not int or receipt[key] < 0:
+            raise ValueError(f"retarget receipt {key} is invalid")
+    source_frames = receipt["source_frame_count"]
+    start_frame = receipt["start_frame"]
+    frames = receipt["frame_count"]
+    warmup_frames = receipt["warmup_frames"]
+    if frames < 1 or source_frames < start_frame + frames \
+            or warmup_frames > start_frame \
+            or source_frames > np.iinfo(np.int32).max:
+        raise ValueError("retarget receipt source interval is invalid")
+    if type(receipt["fps"]) is not float or receipt["fps"] != 120.0:
+        raise ValueError("retarget receipt fps is not 120.0")
+    grounding_offset = receipt["grounding_offset_m"]
+    if type(grounding_offset) is not float \
+            or not np.isfinite(grounding_offset):
+        raise ValueError("retarget receipt grounding_offset_m is invalid")
+    if type(receipt["joint_names"]) is not list \
+            or len(receipt["joint_names"]) != 29 \
+            or any(type(name) is not str or not name
+                   for name in receipt["joint_names"]):
+        raise ValueError("retarget receipt joint names are invalid")
     output_sha256 = _sha256(path)
     if receipt.get("output_sha256") != output_sha256:
         raise ValueError("retarget NPZ SHA-256 does not match receipt")
@@ -91,23 +141,34 @@ def load_retarget_npz(path: str, receipt_path: str) -> SourceClip:
         joint_names = [str(value) for value in data["joint_names"].tolist()]
         engine = str(np.asarray(data["engine"]).item())
         limits = np.asarray(data["joint_limits"], np.float64)
-    frames = len(root)
-    if root.shape != (frames, 3) or xyzw.shape != (frames, 4) \
-            or dof.shape != (frames, 29) or limits.shape != (29, 2):
+    artifact_frames = len(root)
+    if root.shape != (artifact_frames, 3) \
+            or xyzw.shape != (artifact_frames, 4) \
+            or dof.shape != (artifact_frames, 29) \
+            or limits.shape != (29, 2):
         raise ValueError("retarget NPZ array dimensions changed")
-    if receipt.get("frame_count") != frames or receipt.get("fps") != fps:
+    if frames != artifact_frames or receipt["fps"] != fps:
         raise ValueError("retarget receipt rate/frame count changed")
     if receipt.get("joint_names") != joint_names:
         raise ValueError("retarget receipt joint names changed")
     if engine != "gmr":
         raise ValueError("retarget engine identity changed")
-    qpos = np.empty((frames, 36), np.float32)
+    if not all(np.isfinite(value).all()
+               for value in (root, xyzw, dof, limits)):
+        raise ValueError("retarget NPZ contains non-finite values")
+    if np.any(limits[:, 0] > limits[:, 1]) \
+            or np.any(dof < limits[:, 0] - 1e-6) \
+            or np.any(dof > limits[:, 1] + 1e-6):
+        raise ValueError("retarget NPZ contains a joint-limit violation")
+    qpos = np.empty((artifact_frames, 36), np.float32)
     qpos[:, :3] = root
     qpos[:, 3:7] = _normalized_wxyz(xyzw[:, [3, 0, 1, 2]])
     qpos[:, 7:] = dof
     clip = SourceClip(
         os.path.splitext(os.path.basename(path))[0], fps, qpos,
-        np.arange(frames, dtype=np.int32), "flat",
+        np.arange(
+            start_frame, start_frame + artifact_frames, dtype=np.int32),
+        "flat",
         provenance={
             "path": os.path.abspath(path),
             "sha256": output_sha256,

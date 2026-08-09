@@ -75,6 +75,7 @@ _FLAT_SOURCE_KEYS = {
 _FLAT_VALIDATION_KEYS = {
     "fk_max_error_m", "duration_error_s", "quaternion_norm_max_error",
 }
+_FLAT_SCHEMAS = {"g1-lmm-flat-data/v2", "g1-lmm-flat-data/v3"}
 
 
 def features_bytes(features: FeatureSet) -> bytes:
@@ -132,8 +133,8 @@ def _authenticate_flat_manifest_inputs(manifest_base) -> None:
     from .sources import load_retarget_npz
 
     if type(manifest_base) is not dict \
-            or manifest_base.get("schema") != "g1-lmm-flat-data/v2":
-        raise ValueError("flat manifest schema must be g1-lmm-flat-data/v2")
+            or manifest_base.get("schema") not in _FLAT_SCHEMAS:
+        raise ValueError("flat manifest schema must be a supported v2 or v3")
     validation = manifest_base.get("validation")
     if type(validation) is not dict \
             or set(validation) != _FLAT_VALIDATION_KEYS:
@@ -214,7 +215,10 @@ def _authenticate_flat_manifest_inputs(manifest_base) -> None:
             or any(type(value) is not float
                    or not np.isfinite(value) for value in alpha):
         raise ValueError("flat source interpolation map types changed")
-    if any(value < 0 or value >= len(loaded.qpos) for value in left + right) \
+    source_first = int(loaded.source_frames[0])
+    source_last = int(loaded.source_frames[-1])
+    if any(value < source_first or value > source_last
+           for value in left + right) \
             or any(value < 0.0 or value > 1.0 for value in alpha):
         raise ValueError("flat source interpolation map values are invalid")
 
@@ -1206,7 +1210,7 @@ def publish_flat_artifacts(
     if len(features.values) != len(artifacts.positions):
         raise ValueError("database and matching feature rows differ")
     if type(manifest_base) is not dict \
-            or manifest_base.get("schema") != "g1-lmm-flat-data/v2" \
+            or manifest_base.get("schema") not in _FLAT_SCHEMAS \
             or "artifacts" in manifest_base or "status" in manifest_base:
         raise ValueError("flat manifest base is invalid")
     if not callable(validate_candidate):

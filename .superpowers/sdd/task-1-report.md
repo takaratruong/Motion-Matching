@@ -294,3 +294,87 @@ files remain byte-identical:
 | `manifest.json` | 166,719 | `05c8ac4c04771fb7f8380d75d64da812f7a299e5994734f15faccd107a105f1f` |
 
 No bundle, subsystem, or terrain scope changed, and no known concern remains.
+
+---
+
+## Stale-retarget root-cause correction: walk-only flat bundle v3
+
+The v2 bundle was built from a stale retarget. Its legacy 14-field receipt
+omitted the PFNN scale, source interval, warmup, and grounding mode; used an
+obsolete prepared BVH and toe aliases; and recorded a `-0.4619996 m` grounding
+offset. The generic loader accepted that document and relabeled every selected
+interval from frame zero. The stale output produced effectively unusable
+bilateral labels (`[4, 0]`) under the prior terrain-contact path.
+
+The correction requires the exact 18-field current retarget receipt before
+kinematics, preserves the receipt's absolute `start_frame`, and independently
+re-authenticates the source, receipt, interval, continuity, contacts, skeleton,
+and binaries. The canonical canary is the independently approved pure-walk
+interval `[7659,8171)` with 120 warmup frames and flat grounding. The rejected
+full and transition-containing retargets are not used.
+
+The v3 contact channel now reproduces the bundled Orange Duck database rule,
+separately from the generic terrain contact implementation: global LeftToe and
+RightToe speed strictly below `0.15 m/s`, followed independently by
+`scipy.ndimage.median_filter(size=6, mode="nearest")`. It has no height gate.
+The generic terrain contact algorithm remains unchanged.
+
+### RED -> GREEN evidence
+
+Focused REDs proved that the stale receipt reached kinematics, `start_frame`
+was discarded, contract-field mutations were accepted, v2 remained canonical,
+and no bilateral contact gate or Orange Duck contact implementation existed.
+The focused final command covered receipt/source authentication, nonzero source
+interval publication, stale rejection before kinematics, canonical skeleton,
+v1/v2 rejection, independent continuity/contact recomputation, the real v3
+assembly, and the transactional v3 manifest path:
+
+```text
+Ran 18 tests in 0.710s
+OK
+```
+
+Both dedicated Orange Duck contact tests pass, and the pre-existing generic
+terrain contact tests also passed unchanged. Python byte-compilation and
+`git diff --check` passed.
+
+### Canonical input and output
+
+```text
+source interval = [7659, 8171) at 120 Hz
+source rows = 512
+source SHA-256 = bbdeb79760950480582ae937e54b913c376caa49f344896a8958476b82f3317f
+receipt SHA-256 = 2d0e93f485bab9c54773c66cf07c14d25837f5f4e50f5c007f9f8e2c5c20520f
+original BVH SHA-256 = 4a01768df71c6f7b5bbb71312c1e94eae489af32b21c3e300fd1c8d1ffc24bc5
+prepared BVH SHA-256 = d6dbbac84e68d419d27aff0356b5a8245522f39694d94a6fc83e300ab6feaf8d
+PFNN scale = 5.6444
+grounding = flat
+grounding offset = 0.06142798715901732 m
+```
+
+The transactional candidate validator and a separate direct invocation both
+reported:
+
+```text
+VALID g1-lmm-flat-data/v3 frames=256 clips=1 bones=31 features=31 scenes=0 source_rows=512
+BUILT g1-lmm-flat-data/v3 frames=256 clips=1 scenes=0 output=sonic/runs/g1-lmm-flat-60hz/data-v3
+```
+
+The published source map spans absolute source frames 7659 through 8169. The
+single `[0,256)` range has zero native, local, or union continuity rejections,
+zero dropped fragments/frames, native maximum `0.12608182430267334 rad`, and
+local maximum `0.12608181972804253 rad`. FK error is
+`1.711800573789496e-7 m`.
+
+Orange Duck contact evidence is 116 left / 117 right frames, 3 / 4 runs,
+longest runs 49 / 45 frames, and 6 alternating run-order transitions. Pattern
+counts are 28 airborne, 223 single-support, and 5 double-support frames.
+
+| File | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `database.bin` | 413,368 | `13b368759c22ff3427d937a86fd9399cd6e80646e5f288e80da01bd988daaaad` |
+| `features.bin` | 32,008 | `7c35809e1dd5ea14bd56b0f607cb9da22b3464ebbece01a895050372530b40df` |
+| `manifest.json` | 17,857 | `db01f5bfb7641333b3e40ea4a5d1eb655131c7bc72681d2738fde2dbf9298709` |
+
+A second transactional build in a fresh temporary directory was byte-identical
+for all three files. The historical v2 directory was not overwritten.
