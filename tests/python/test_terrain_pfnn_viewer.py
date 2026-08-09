@@ -353,6 +353,19 @@ class TerrainPFNNViewerTests(unittest.TestCase):
             frame.joint_position_isaaclab,
         )
 
+    def test_display_pose_blends_quickly_into_motion_and_smoothly_back_to_idle(self) -> None:
+        from mm_sonic.terrain_pfnn_viewer import _blend_display_joints
+
+        previous = np.zeros(29, dtype=np.float64)
+        target = np.ones(29, dtype=np.float64)
+        moving = _blend_display_joints(previous, target, idle=False)
+        settling = _blend_display_joints(target, previous, idle=True)
+
+        np.testing.assert_allclose(moving, np.full(29, 0.45), atol=0.0, rtol=0.0)
+        np.testing.assert_allclose(
+            settling, np.full(29, 0.82), atol=2.0e-16, rtol=0.0
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -421,13 +421,43 @@ def _build_scene(
     return model, mujoco.MjData(model)
 
 
-def _apply_frame(model: object, data: object, frame: object) -> None:
+def _blend_display_joints(
+    previous: object, target: object, *, idle: bool
+) -> np.ndarray:
+    """Render-only damping for clean key-down and key-release transitions."""
+
+    before = np.asarray(previous, dtype=np.float64)
+    after = np.asarray(target, dtype=np.float64)
+    if (
+        before.shape != (29,)
+        or after.shape != (29,)
+        or not np.isfinite(before).all()
+        or not np.isfinite(after).all()
+        or type(idle) is not bool
+    ):
+        raise ValueError("display joints must be finite native-G1 vectors")
+    alpha = 0.18 if idle else 0.45
+    return before + alpha * (after - before)
+
+
+def _apply_frame(
+    model: object,
+    data: object,
+    frame: object,
+    *,
+    display_joints_mujoco: np.ndarray | None = None,
+) -> None:
     data.qpos[:] = model.qpos0
     data.qpos[:3] = frame.root_position_world
     data.qpos[3:7] = _upright_yaw_quaternion(
         frame.root_quaternion_world_wxyz
     )
-    if not bool(frame.diagnostics.get("initial_idle_pose_held", False)):
+    if display_joints_mujoco is not None:
+        displayed = np.asarray(display_joints_mujoco, dtype=np.float64)
+        if displayed.shape != (29,) or not np.isfinite(displayed).all():
+            raise ValueError("display joint override must be a finite G1 vector")
+        data.qpos[7:36] = displayed
+    elif not bool(frame.diagnostics.get("initial_idle_pose_held", False)):
         data.qpos[7:36] = isaaclab_to_mujoco_joint_vector(
             frame.joint_position_isaaclab
         )
@@ -507,10 +537,25 @@ def _run(arguments: argparse.Namespace) -> int:
     )
     model, data = _build_scene(scene_xml, rendered_terrain, idle_clips)
     import mujoco
+    display_joints = np.asarray(model.qpos0[7:36], dtype=np.float64).copy()
 
     def advance(step: int, command: np.ndarray) -> object:
         frame = runtime.step(command, camera_yaw=0.0)
-        _apply_frame(model, data, frame)
+        idle = bool(frame.diagnostics.get("idle_pose_held", False))
+        target_joints = (
+            np.asarray(model.qpos0[7:36], dtype=np.float64)
+            if idle
+            else isaaclab_to_mujoco_joint_vector(frame.joint_position_isaaclab)
+        )
+        display_joints[:] = _blend_display_joints(
+            display_joints, target_joints, idle=idle
+        )
+        _apply_frame(
+            model,
+            data,
+            frame,
+            display_joints_mujoco=display_joints,
+        )
         mujoco.mj_forward(model, data)
         if step % arguments.trace_every == 0 or "hold_reason" in frame.diagnostics:
             print(_trace(step, frame, terrain), flush=True)
