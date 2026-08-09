@@ -4,7 +4,6 @@ import hashlib
 import io
 import json
 import os
-import shutil
 import struct
 import subprocess
 import tempfile
@@ -33,19 +32,10 @@ PYTHON = "/home/ubuntu/miniconda3/envs/diffsim/bin/python"
 
 class BuildCliTests(unittest.TestCase):
     @staticmethod
-    def _alternate_g1_xml(directory):
-        with open(builder.DEFAULTS["g1_xml"], "rb") as stream:
-            canonical = stream.read()
-        alternate = canonical.replace(
-            b'<mujoco model="g1_29dof_simplified">',
-            b'<mujoco  model="g1_29dof_simplified">',
-            1,
-        )
-        if alternate == canonical:
-            raise AssertionError("canonical G1 XML marker changed")
-        path = os.path.join(directory, "alternate-g1.xml")
+    def _write_xml(directory, payload, name="g1.xml"):
+        path = os.path.join(directory, name)
         with open(path, "wb") as stream:
-            stream.write(alternate)
+            stream.write(payload)
         return path
 
     @staticmethod
@@ -217,17 +207,20 @@ class BuildCliTests(unittest.TestCase):
 
     def test_flat_builder_rejects_alternate_g1_xml_before_kinematics(self):
         with tempfile.TemporaryDirectory() as temporary:
-            alternate = self._alternate_g1_xml(temporary)
-            args = builder._parser().parse_args([
-                "--output-fps", "60", "--flat-only", "--g1-xml", alternate,
-                "--retarget-npz",
-                "sonic/runs/native-g1-pfnn/sample-retarget/"
-                "LocomotionFlat01_000-walk-only-7659-8171-120hz.npz",
-                "--retarget-receipt",
-                "sonic/runs/native-g1-pfnn/sample-retarget/"
-                "LocomotionFlat01_000-walk-only-7659-8171-120hz.receipt.json",
-            ])
+            alternate = self._write_xml(
+                temporary, b"<mujoco><worldbody/></mujoco>\n")
+            args = SimpleNamespace(
+                output_fps=60.0, g1_xml=alternate,
+                retarget_npz="unused.npz",
+                retarget_receipt="unused.receipt.json",
+            )
             with (
+                mock.patch.object(builder, "_require_file"),
+                mock.patch.object(
+                    builder, "load_retarget_npz",
+                    return_value=mock.sentinel.source,
+                ),
+                mock.patch.object(builder, "_require_canonical_flat_retarget"),
                 mock.patch.object(
                     builder, "G1Kinematics", wraps=builder.G1Kinematics,
                 ) as kinematics,
@@ -241,36 +234,41 @@ class BuildCliTests(unittest.TestCase):
             pass
 
         observed = {}
-        selected_path = []
 
         def parse_bytes(xml_bytes, assets):
             observed["xml_bytes"] = xml_bytes
             observed["assets"] = assets
-            with open(selected_path[0], "ab") as stream:
+            with open(selected, "ab") as stream:
                 stream.write(b"\n<!-- swapped after authentication -->\n")
             raise ParsedAuthenticatedBytes
 
         with tempfile.TemporaryDirectory() as temporary:
-            selected = os.path.join(temporary, "g1_29dof.xml")
-            selected_path.append(selected)
-            shutil.copyfile(builder.DEFAULTS["g1_xml"], selected)
-            os.symlink(
-                os.path.join(
-                    os.path.dirname(builder.DEFAULTS["g1_xml"]), "meshes"),
-                os.path.join(temporary, "meshes"),
-                target_is_directory=True,
+            payload = b"<mujoco><worldbody/></mujoco>\n"
+            selected = self._write_xml(temporary, payload)
+            descriptor = {
+                "asset": "g1.xml",
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size_bytes": len(payload),
+            }
+            args = SimpleNamespace(
+                output_fps=60.0, g1_xml=selected,
+                retarget_npz="unused.npz",
+                retarget_receipt="unused.receipt.json",
             )
-            args = builder._parser().parse_args([
-                "--output-fps", "60", "--flat-only",
-                "--g1-xml", selected,
-                "--retarget-npz",
-                "sonic/runs/native-g1-pfnn/sample-retarget/"
-                "LocomotionFlat01_000-walk-only-7659-8171-120hz.npz",
-                "--retarget-receipt",
-                "sonic/runs/native-g1-pfnn/sample-retarget/"
-                "LocomotionFlat01_000-walk-only-7659-8171-120hz.receipt.json",
-            ])
             with (
+                mock.patch.object(builder, "_require_file"),
+                mock.patch.object(
+                    builder, "load_retarget_npz",
+                    return_value=mock.sentinel.source,
+                ),
+                mock.patch.object(builder, "_require_canonical_flat_retarget"),
+                mock.patch.object(
+                    builder, "CANONICAL_FLAT_KINEMATICS_MODEL", descriptor,
+                ),
+                mock.patch.object(
+                    builder, "load_mujoco_xml_assets",
+                    return_value={"fixture.bin": b"asset"},
+                ),
                 mock.patch.object(
                     builder.G1Kinematics, "from_xml_bytes", create=True,
                     side_effect=parse_bytes,
@@ -280,57 +278,49 @@ class BuildCliTests(unittest.TestCase):
                 builder._assemble_flat_candidate(args)
         self.assertEqual(
             hashlib.sha256(observed["xml_bytes"]).hexdigest(),
-            "749209c06a5c0023deb27f728420028b62b1f3092a22e24920183c1a897e4376",
+            descriptor["sha256"],
         )
-        self.assertIn("meshes/pelvis.STL", observed["assets"])
+        self.assertEqual(observed["assets"], {"fixture.bin": b"asset"})
 
     def test_flat_validator_authenticates_selected_g1_xml_before_payloads(self):
-        root = "sonic/runs/g1-lmm-flat-60hz/data-v3"
-        with open(os.path.join(root, "manifest.json"), encoding="utf-8") \
-                as stream:
-            manifest = json.load(stream)
         descriptor = {
             "asset": "g1_29dof.xml",
             "sha256":
                 "749209c06a5c0023deb27f728420028b62b1f3092a22e24920183c1a897e4376",
             "size_bytes": 26914,
         }
-        manifest["kinematics_model"] = descriptor
         with tempfile.TemporaryDirectory() as temporary:
-            alternate = self._alternate_g1_xml(temporary)
+            alternate = self._write_xml(
+                temporary, b"<mujoco><worldbody/></mujoco>\n")
             with (
                 mock.patch.object(
-                    validator, "read_holden_database",
-                    side_effect=AssertionError(
-                        "payload loaded before XML auth"),
+                    validator, "load_mujoco_xml_assets",
+                    side_effect=AssertionError("assets loaded before XML auth"),
                 ),
                 mock.patch.object(
                     validator, "G1Kinematics", wraps=validator.G1Kinematics,
                 ) as kinematics,
                 self.assertRaisesRegex(ValueError, "canonical G1 XML"),
             ):
-                validator._validate_flat_artifact_directory(
-                    root, manifest, {"g1_xml": alternate})
+                validator._load_flat_kinematics(
+                    {"kinematics_model": descriptor},
+                    {"g1_xml": alternate},
+                )
             kinematics.assert_not_called()
 
     def test_flat_validator_parses_authenticated_bytes_after_path_swap(self):
         class ParsedAuthenticatedBytes(Exception):
             pass
 
-        root = "sonic/runs/g1-lmm-flat-60hz/data-v3"
-        with open(os.path.join(root, "manifest.json"), encoding="utf-8") \
-                as stream:
-            manifest = json.load(stream)
         observed = {}
         with tempfile.TemporaryDirectory() as temporary:
-            selected = os.path.join(temporary, "g1_29dof.xml")
-            shutil.copyfile(builder.DEFAULTS["g1_xml"], selected)
-            os.symlink(
-                os.path.join(
-                    os.path.dirname(builder.DEFAULTS["g1_xml"]), "meshes"),
-                os.path.join(temporary, "meshes"),
-                target_is_directory=True,
-            )
+            payload = b"<mujoco><worldbody/></mujoco>\n"
+            selected = self._write_xml(temporary, payload)
+            descriptor = {
+                "asset": "g1.xml",
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size_bytes": len(payload),
+            }
 
             def parse_bytes(xml_bytes, assets):
                 observed["xml_bytes"] = xml_bytes
@@ -341,57 +331,52 @@ class BuildCliTests(unittest.TestCase):
 
             with (
                 mock.patch.object(
+                    validator, "CANONICAL_FLAT_KINEMATICS_MODEL", descriptor,
+                ),
+                mock.patch.object(
+                    validator, "load_mujoco_xml_assets",
+                    return_value={"fixture.bin": b"asset"},
+                ),
+                mock.patch.object(
                     validator.G1Kinematics, "from_xml_bytes", create=True,
                     side_effect=parse_bytes,
                 ),
                 self.assertRaises(ParsedAuthenticatedBytes),
             ):
-                validator._validate_flat_artifact_directory(
-                    root, manifest, {"g1_xml": selected})
+                validator._load_flat_kinematics(
+                    {"kinematics_model": descriptor},
+                    {"g1_xml": selected},
+                )
         self.assertEqual(
             hashlib.sha256(observed["xml_bytes"]).hexdigest(),
-            "749209c06a5c0023deb27f728420028b62b1f3092a22e24920183c1a897e4376",
+            descriptor["sha256"],
         )
-        self.assertIn("meshes/pelvis.STL", observed["assets"])
+        self.assertEqual(observed["assets"], {"fixture.bin": b"asset"})
 
     def test_flat_validator_requires_exact_kinematics_model_descriptor(self):
-        root = "sonic/runs/g1-lmm-flat-60hz/data-v3"
-        with open(os.path.join(root, "manifest.json"), encoding="utf-8") \
-                as stream:
-            original = json.load(stream)
         descriptor = {
             "asset": "g1_29dof.xml",
             "sha256":
                 "749209c06a5c0023deb27f728420028b62b1f3092a22e24920183c1a897e4376",
             "size_bytes": 26914,
         }
-        missing = copy.deepcopy(original)
-        del missing["kinematics_model"]
-        cases = [("missing", missing)]
+        cases = [("missing", {})]
         for key, value in (
             ("asset", "other-g1.xml"),
             ("sha256", "0" * 64),
             ("size_bytes", 26913),
             ("size_bytes", 26914.0),
         ):
-            manifest = copy.deepcopy(original)
-            manifest["kinematics_model"] = copy.deepcopy(descriptor)
+            manifest = {"kinematics_model": copy.deepcopy(descriptor)}
             manifest["kinematics_model"][key] = value
             cases.append((key, manifest))
         for name, manifest in cases:
             with (
                 self.subTest(name=name),
-                mock.patch.object(
-                    validator, "read_holden_database",
-                    side_effect=AssertionError(
-                        "payload loaded before descriptor auth"),
-                ),
                 self.assertRaisesRegex(ValueError, "kinematics model"),
             ):
-                validator._validate_flat_artifact_directory(
-                    root, manifest, {
-                        "g1_xml": builder.DEFAULTS["g1_xml"],
-                    })
+                validator._load_flat_kinematics(
+                    manifest, {"g1_xml": "/does/not/exist"})
 
     def test_flat_validator_independently_pins_canonical_receipt(self):
         source = builder.load_retarget_npz(

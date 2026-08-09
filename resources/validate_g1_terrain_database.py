@@ -321,8 +321,7 @@ def _read_canonical_flat_g1_xml(path: str) -> bytes:
     return payload
 
 
-def _validate_flat_artifact_directory(root, manifest, source_options):
-    _validate_flat_tree(root)
+def _load_flat_kinematics(manifest, source_options):
     _require(
         type(manifest) is dict
         and _json_exact(
@@ -331,6 +330,14 @@ def _validate_flat_artifact_directory(root, manifest, source_options):
         ),
         "flat kinematics model descriptor changed",
     )
+    options = _validate_full_source_options(source_options)
+    xml_bytes = _read_canonical_flat_g1_xml(options["g1_xml"])
+    xml_assets = load_mujoco_xml_assets(options["g1_xml"])
+    return G1Kinematics.from_xml_bytes(xml_bytes, xml_assets)
+
+
+def _validate_flat_artifact_directory(root, manifest, source_options):
+    _validate_flat_tree(root)
     expected_keys = {
         "schema", "status", "output_fps", "trajectory_horizons",
         "feature_dimensions", "feature_names", "feature_weights",
@@ -346,9 +353,7 @@ def _validate_flat_artifact_directory(root, manifest, source_options):
     _require(manifest["schema"] == FLAT_SCHEMA,
              "flat manifest schema must be g1-lmm-flat-data/v3")
     _require(manifest["status"] == "accepted", "flat manifest is not accepted")
-    options = _validate_full_source_options(source_options)
-    xml_bytes = _read_canonical_flat_g1_xml(options["g1_xml"])
-    xml_assets = load_mujoco_xml_assets(options["g1_xml"])
+    kinematics = _load_flat_kinematics(manifest, source_options)
     _require(type(manifest["output_fps"]) is float
              and manifest["output_fps"] == 60.0,
              "flat manifest output rate must be an exact 60 Hz float")
@@ -516,7 +521,6 @@ def _validate_flat_artifact_directory(root, manifest, source_options):
              "flat source content identity changed")
     _require_canonical_flat_retarget(source)
 
-    kinematics = G1Kinematics.from_xml_bytes(xml_bytes, xml_assets)
     preliminary, rebuilt_skeleton, preliminary_report = convert_source_clip(
         source, kinematics, 60.0, root_filter_mode="nearest")
     _require(preliminary_report["fk_max_error_m"] <= 1e-5,

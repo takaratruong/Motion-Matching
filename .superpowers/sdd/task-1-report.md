@@ -439,3 +439,27 @@ all three files. Python byte-compilation and `git diff --check` also passed.
 | `database.bin` | 413,368 | `13b368759c22ff3427d937a86fd9399cd6e80646e5f288e80da01bd988daaaad` |
 | `features.bin` | 32,008 | `7c35809e1dd5ea14bd56b0f607cb9da22b3464ebbece01a895050372530b40df` |
 | `manifest.json` | 18,021 | `5b5c48ccbb1dbabdbf87842d8b033c15b307199d72a8d90e4e39208ba5382db1` |
+
+### Clean-checkout test portability correction
+
+The XML trust unit tests no longer read the host-default XML, external mesh
+directory, ignored retarget files, or ignored published v3 tree. Builder tests
+use a temporary minimal XML, a mocked authenticated source, a temporary
+descriptor derived from those exact bytes, and an in-memory asset map. Validator
+tests exercise a narrow `_load_flat_kinematics` seam with the same fully
+temporary inputs before any motion payload is read. Real canonical integration
+validation remains separate from these unit fixtures.
+
+As a RED, running the five original trust tests from `/tmp` produced five
+errors: two missing the ignored retarget NPZ and three missing the ignored v3
+manifest. The corrected five-test command passes from `/tmp` in `0.004s` with
+only the repository on `PYTHONPATH`. The complete `test_build_cli` module then
+reported:
+
+```text
+Ran 31 tests in 113.951s
+OK
+```
+
+The unchanged canonical bundle independently validates with the same hashes
+listed above. Python byte-compilation and `git diff --check` pass.
