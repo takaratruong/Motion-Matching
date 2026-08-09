@@ -23,7 +23,7 @@ from torch import nn
 _CUDA_INITIALIZED_AT_IMPORT = torch.cuda.is_initialized()
 _CUDA_DETERMINISM_CONFIGURED = False
 
-from resources import quat
+from resources import quat, txform
 
 from .dataset import (
     G1LmmDimensions,
@@ -358,6 +358,163 @@ class AutoencoderNormalization:
     decompressor_std: np.ndarray
 
 
+def orange_duck_decompressor_losses(
+    prediction: torch.Tensor,
+    latent: torch.Tensor,
+    *,
+    local_positions: torch.Tensor,
+    local_rotation_xy: torch.Tensor,
+    local_velocities: torch.Tensor,
+    local_angular_velocities: torch.Tensor,
+    character_positions: torch.Tensor,
+    character_transforms: torch.Tensor,
+    character_velocities: torch.Tensor,
+    character_angular_velocities: torch.Tensor,
+    root_velocity: torch.Tensor,
+    root_angular_velocity: torch.Tensor,
+    contacts: torch.Tensor,
+    parents: np.ndarray,
+    dt: float,
+) -> dict[str, torch.Tensor]:
+    """Compute the exact denormalized Orange Duck decompressor objective."""
+
+    if not np.isfinite(dt) or dt <= 0.0:
+        raise ValueError("decompressor loss dt must be positive and finite")
+    if prediction.ndim != 3 or latent.ndim != 3 or prediction.shape[:2] != latent.shape[:2]:
+        raise ValueError("decompressor prediction and latent must be [batch, window, channels]")
+    if prediction.shape[1] < 2:
+        raise ValueError("decompressor temporal loss requires a two-frame window")
+    bones = local_positions.shape[-2]
+    non_root = bones - 1
+    position_end = 3 * non_root
+    rotation_end = 9 * non_root
+    velocity_end = 12 * non_root
+    angular_end = 15 * non_root
+    if prediction.shape[-1] != angular_end + 6 + contacts.shape[-1]:
+        raise ValueError("decompressor prediction has the wrong output dimension")
+
+    predicted_position = prediction[..., :position_end].reshape(
+        *prediction.shape[:2], non_root, 3
+    )
+    predicted_xy = prediction[..., position_end:rotation_end].reshape(
+        *prediction.shape[:2], non_root, 3, 2
+    )
+    predicted_velocity = prediction[..., rotation_end:velocity_end].reshape(
+        *prediction.shape[:2], non_root, 3
+    )
+    predicted_angular = prediction[..., velocity_end:angular_end].reshape(
+        *prediction.shape[:2], non_root, 3
+    )
+    predicted_root_velocity = prediction[..., angular_end : angular_end + 3]
+    predicted_root_angular = prediction[..., angular_end + 3 : angular_end + 6]
+    predicted_contacts = prediction[..., angular_end + 6 :]
+
+    predicted_position = torch.cat(
+        (local_positions[..., :1, :], predicted_position), dim=-2
+    )
+    predicted_xy = torch.cat(
+        (local_rotation_xy[..., :1, :, :], predicted_xy), dim=-3
+    )
+    predicted_velocity = torch.cat(
+        (local_velocities[..., :1, :], predicted_velocity), dim=-2
+    )
+    predicted_angular = torch.cat(
+        (local_angular_velocities[..., :1, :], predicted_angular), dim=-2
+    )
+    predicted_transform = txform.from_xy(predicted_xy)
+    global_transform, global_position, global_velocity, global_angular = txform.fk_vel(
+        predicted_transform,
+        predicted_position,
+        predicted_velocity,
+        predicted_angular,
+        parents,
+    )
+    predicted_character_transform = txform.inv_mul(
+        global_transform[..., 0:1, :, :], global_transform
+    )
+    predicted_character_position = txform.inv_mul_vec(
+        global_transform[..., 0:1, :, :],
+        global_position - global_position[..., 0:1, :],
+    )
+    predicted_character_velocity = txform.inv_mul_vec(
+        global_transform[..., 0:1, :, :], global_velocity
+    )
+    predicted_character_angular = txform.inv_mul_vec(
+        global_transform[..., 0:1, :, :], global_angular
+    )
+    inverse_dt = np.float32(1.0 / dt)
+
+    terms = {
+        "local_position": torch.mean(75.0 * torch.abs(local_positions - predicted_position)),
+        "local_rotation_xy": torch.mean(
+            10.0 * torch.abs(local_rotation_xy - predicted_xy)
+        ),
+        "local_velocity": torch.mean(
+            10.0 * torch.abs(local_velocities - predicted_velocity)
+        ),
+        "local_angular_velocity": torch.mean(
+            1.25 * torch.abs(local_angular_velocities - predicted_angular)
+        ),
+        "root_velocity": torch.mean(
+            2.0 * torch.abs(root_velocity - predicted_root_velocity)
+        ),
+        "root_angular_velocity": torch.mean(
+            2.0 * torch.abs(root_angular_velocity - predicted_root_angular)
+        ),
+        "contacts": torch.mean(2.0 * torch.abs(contacts - predicted_contacts)),
+        "character_position": torch.mean(
+            15.0 * torch.abs(character_positions - predicted_character_position)
+        ),
+        "character_transform": torch.mean(
+            5.0 * torch.abs(character_transforms - predicted_character_transform)
+        ),
+        "character_velocity": torch.mean(
+            2.0 * torch.abs(character_velocities - predicted_character_velocity)
+        ),
+        "character_angular_velocity": torch.mean(
+            0.75
+            * torch.abs(
+                character_angular_velocities - predicted_character_angular
+            )
+        ),
+        "local_position_delta": torch.mean(
+            10.0
+            * torch.abs(
+                torch.diff(local_positions, dim=1) * inverse_dt
+                - torch.diff(predicted_position, dim=1) * inverse_dt
+            )
+        ),
+        "local_rotation_xy_delta": torch.mean(
+            1.75
+            * torch.abs(
+                torch.diff(local_rotation_xy, dim=1) * inverse_dt
+                - torch.diff(predicted_xy, dim=1) * inverse_dt
+            )
+        ),
+        "character_position_delta": torch.mean(
+            2.0
+            * torch.abs(
+                torch.diff(character_positions, dim=1) * inverse_dt
+                - torch.diff(predicted_character_position, dim=1) * inverse_dt
+            )
+        ),
+        "character_transform_delta": torch.mean(
+            0.75
+            * torch.abs(
+                torch.diff(character_transforms, dim=1) * inverse_dt
+                - torch.diff(predicted_character_transform, dim=1) * inverse_dt
+            )
+        ),
+        "latent_l1": torch.mean(0.1 * torch.abs(latent)),
+        "latent_l2": torch.mean(0.1 * torch.square(latent)),
+        "latent_velocity": torch.mean(
+            0.01 * torch.abs(torch.diff(latent, dim=1) * inverse_dt)
+        ),
+    }
+    terms["total"] = sum(terms.values())
+    return terms
+
+
 def _legacy_autoencoder_normalization(
     bundle: TrainingBundle,
     arrays: TrainingArrays,
@@ -650,11 +807,35 @@ def _train_decompressor_stage(
         device=device,
     )
     feature_rows = torch.as_tensor(bundle.features, device=device)
-    target_rows = torch.as_tensor(
-        (arrays.decompressor_target - normalization.decompressor_mean)
-        / normalization.decompressor_std,
-        device=device,
-    )
+    output_mean = torch.as_tensor(normalization.decompressor_mean, device=device)
+    output_std = torch.as_tensor(normalization.decompressor_std, device=device)
+    ground_rows = {
+        "local_positions": torch.as_tensor(arrays.local_positions, device=device),
+        "local_rotation_xy": torch.as_tensor(arrays.local_rotation_xy, device=device),
+        "local_velocities": torch.as_tensor(arrays.local_velocities, device=device),
+        "local_angular_velocities": torch.as_tensor(
+            arrays.local_angular_velocities, device=device
+        ),
+        "character_positions": torch.as_tensor(
+            arrays.character_positions, device=device
+        ),
+        "character_transforms": torch.as_tensor(
+            arrays.character_transforms, device=device
+        ),
+        "character_velocities": torch.as_tensor(
+            arrays.character_velocities, device=device
+        ),
+        "character_angular_velocities": torch.as_tensor(
+            arrays.character_angular_velocities, device=device
+        ),
+        "root_velocity": torch.as_tensor(arrays.root_velocity, device=device),
+        "root_angular_velocity": torch.as_tensor(
+            arrays.root_angular_velocity, device=device
+        ),
+        "contacts": torch.as_tensor(
+            bundle.contacts.astype(np.float32), device=device
+        ),
+    }
     compressor = Compressor(bundle.dimensions).to(device)
     decompressor = Decompressor(bundle.dimensions).to(device)
     optimizer = torch.optim.AdamW(
@@ -665,17 +846,28 @@ def _train_decompressor_stage(
     )
     generator = np.random.default_rng(config.seed + 1)
 
-    def objective(batch: torch.Tensor) -> torch.Tensor:
+    def objective_terms(batch: torch.Tensor) -> dict[str, torch.Tensor]:
         encoded = compressor(compressor_rows[batch])
-        decoded = decompressor(torch.cat((feature_rows[batch], encoded), dim=-1))
-        reconstruction = torch.mean(torch.square(decoded - target_rows[batch]))
-        latent_value = torch.mean(torch.square(encoded)) * 1.0e-4
-        latent_velocity = torch.mean(torch.abs(encoded[:, 1] - encoded[:, 0])) * 1.0e-4
-        return reconstruction + latent_value + latent_velocity
+        decoded = (
+            decompressor(torch.cat((feature_rows[batch], encoded), dim=-1))
+            * output_std
+            + output_mean
+        )
+        return orange_duck_decompressor_losses(
+            decoded,
+            encoded,
+            parents=bundle.parents,
+            dt=config.dt,
+            **{name: values[batch] for name, values in ground_rows.items()},
+        )
+
+    def objective(batch: torch.Tensor) -> torch.Tensor:
+        return objective_terms(batch)["total"]
 
     audit_windows = torch.as_tensor(windows[: min(len(windows), 512)], device=device)
     with torch.no_grad():
-        initial_loss = float(objective(audit_windows).item())
+        initial_terms = objective_terms(audit_windows)
+        initial_loss = float(initial_terms["total"].item())
     last_loss = initial_loss
     for _ in range(config.decompressor_steps):
         selected = windows[
@@ -693,7 +885,8 @@ def _train_decompressor_stage(
     latent_parts = []
     prediction_parts = []
     with torch.no_grad():
-        final_loss = float(objective(audit_windows).item())
+        final_terms = objective_terms(audit_windows)
+        final_loss = float(final_terms["total"].item())
         for first in range(0, bundle.frames, 512):
             stop = min(bundle.frames, first + 512)
             encoded = compressor(compressor_rows[first:stop])
@@ -754,8 +947,15 @@ def _train_decompressor_stage(
         normalization=normalization,
         training_metrics={
             "final_audit_loss": final_loss,
+            "final_audit_loss_terms": {
+                name: float(value.item()) for name, value in final_terms.items()
+            },
             "final_batch_loss": last_loss,
             "initial_audit_loss": initial_loss,
+            "initial_audit_loss_terms": {
+                name: float(value.item()) for name, value in initial_terms.items()
+            },
+            "objective": "orange-duck-denormalized-weighted/v1",
             "steps": config.decompressor_steps,
             "windows": len(windows),
         },

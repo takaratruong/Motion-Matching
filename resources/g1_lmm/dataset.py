@@ -232,10 +232,36 @@ def load_training_bundle(data_directory: str | Path) -> TrainingBundle:
         raise ValueError("manifest ranges do not match database")
     if manifest.get("range_count") != len(starts):
         raise ValueError("manifest range count does not match database")
+    sources = manifest.get("sources")
+    if (
+        type(sources) is not list
+        or len(sources) != 1
+        or type(manifest.get("source_count")) is not int
+        or manifest["source_count"] != 1
+        or type(manifest.get("total_clips")) is not int
+        or manifest["total_clips"] != 1
+    ):
+        raise ValueError("flat training bundle must bind exactly one source and one clip")
+    sole_source = sources[0]
+    if type(sole_source) is not dict or type(sole_source.get("name")) is not str:
+        raise ValueError("flat training bundle sole source is invalid")
+    range_keys = {
+        "start",
+        "stop",
+        "source",
+        "source_first_frame",
+        "source_last_frame",
+        "motion_class",
+        "terrain_class",
+    }
     for index, (start, stop) in enumerate(zip(starts, stops)):
         entry = manifest_ranges[index]
-        if type(entry) is not dict or entry.get("start") != int(start) or entry.get("stop") != int(stop):
+        if type(entry) is not dict or set(entry) != range_keys:
+            raise ValueError("every manifest range must have exact keys for a v2 range")
+        if entry.get("start") != int(start) or entry.get("stop") != int(stop):
             raise ValueError("manifest range boundaries do not match database")
+        if entry.get("source") != sole_source["name"]:
+            raise ValueError("every manifest range must bind the sole source")
         if entry.get("motion_class") != "flat-walk":
             raise ValueError("every admitted range must have motion_class flat-walk")
         if entry.get("terrain_class") != "flat":
@@ -307,13 +333,6 @@ def load_training_bundle(data_directory: str | Path) -> TrainingBundle:
     ).hexdigest()
     if continuity["range_digest_sha256"] != recomputed_range_digest:
         raise ValueError("continuity range digest does not match manifest ranges")
-    sources = manifest.get("sources")
-    if type(sources) is not list or not sources:
-        raise ValueError("manifest sources are missing")
-    if manifest.get("source_count") != len(sources) or manifest.get("total_clips") != len(
-        sources
-    ):
-        raise ValueError("manifest source counts do not match source receipts")
     left_parts = []
     right_parts = []
     alpha_parts = []

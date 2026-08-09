@@ -30,9 +30,11 @@ from resources.g1_lmm.training import (
     export_network,
     load_exported_network,
     normalized_projector_targets,
+    orange_duck_decompressor_losses,
     train_flat_bundle,
     train_tiny_fixture,
 )
+from resources import txform
 from resources.train_g1_lmm import build_parser
 
 
@@ -138,6 +140,7 @@ def _write_flat_training_bundle(
             {
                 "start": int(start),
                 "stop": int(stop),
+                "source": "synthetic-flat-walk",
                 "source_first_frame": int(start),
                 "source_last_frame": int(stop - 1),
                 "motion_class": motion_class,
@@ -186,7 +189,303 @@ def _write_flat_training_bundle(
     return manifest
 
 
+def _orange_duck_loss_fixture(frames=4):
+    bones = 31
+    parents = np.concatenate(([-1], np.arange(bones - 1))).astype(np.int32)
+    local_position = torch.zeros(frames, bones, 3)
+    local_position[:, 1:, 1] = 0.01
+    local_rotation_xy = torch.zeros(frames, bones, 3, 2)
+    local_rotation_xy[..., 0, 0] = 1.0
+    local_rotation_xy[..., 1, 1] = 1.0
+    local_velocity = torch.zeros_like(local_position)
+    local_angular_velocity = torch.zeros_like(local_position)
+    local_transform = txform.from_xy(local_rotation_xy)
+    global_transform, global_position, global_velocity, global_angular_velocity = (
+        txform.fk_vel(
+            local_transform,
+            local_position,
+            local_velocity,
+            local_angular_velocity,
+            parents,
+        )
+    )
+    character_transform = txform.inv_mul(
+        global_transform[:, 0:1], global_transform
+    )
+    character_position = txform.inv_mul_vec(
+        global_transform[:, 0:1], global_position - global_position[:, 0:1]
+    )
+    character_velocity = txform.inv_mul_vec(
+        global_transform[:, 0:1], global_velocity
+    )
+    character_angular_velocity = txform.inv_mul_vec(
+        global_transform[:, 0:1], global_angular_velocity
+    )
+    root_velocity = torch.zeros(frames, 3)
+    root_angular_velocity = torch.zeros(frames, 3)
+    contacts = torch.zeros(frames, 2)
+    target = torch.cat(
+        (
+            local_position[:, 1:].reshape(frames, -1),
+            local_rotation_xy[:, 1:].reshape(frames, -1),
+            local_velocity[:, 1:].reshape(frames, -1),
+            local_angular_velocity[:, 1:].reshape(frames, -1),
+            root_velocity,
+            root_angular_velocity,
+            contacts,
+        ),
+        dim=1,
+    )
+    ground = {
+        "local_positions": local_position,
+        "local_rotation_xy": local_rotation_xy,
+        "local_velocities": local_velocity,
+        "local_angular_velocities": local_angular_velocity,
+        "character_positions": character_position,
+        "character_transforms": character_transform,
+        "character_velocities": character_velocity,
+        "character_angular_velocities": character_angular_velocity,
+        "root_velocity": root_velocity,
+        "root_angular_velocity": root_angular_velocity,
+        "contacts": contacts,
+    }
+    return parents, target, ground
+
+
 class G1LmmTrainingTest(unittest.TestCase):
+    def test_orange_duck_decompressor_loss_matches_every_reference_term(self):
+        parents, target, rows = _orange_duck_loss_fixture()
+        batch = torch.tensor([[0, 1]], dtype=torch.long)
+        ground = {name: values[batch] for name, values in rows.items()}
+        delta = torch.linspace(-0.01, 0.01, target.shape[1]).reshape(1, 1, -1)
+        prediction = target[batch] + delta * torch.tensor([1.0, 2.0]).reshape(1, 2, 1)
+        latent = torch.linspace(-0.2, 0.3, 64).reshape(1, 2, 32)
+
+        actual = orange_duck_decompressor_losses(
+            prediction,
+            latent,
+            parents=parents,
+            dt=1.0 / 60.0,
+            **ground,
+        )
+
+        non_root = 30
+        position_end = 3 * non_root
+        rotation_end = 9 * non_root
+        velocity_end = 12 * non_root
+        angular_end = 15 * non_root
+        predicted_position = prediction[..., :position_end].reshape(1, 2, non_root, 3)
+        predicted_xy = prediction[..., position_end:rotation_end].reshape(
+            1, 2, non_root, 3, 2
+        )
+        predicted_velocity = prediction[..., rotation_end:velocity_end].reshape(
+            1, 2, non_root, 3
+        )
+        predicted_angular = prediction[..., velocity_end:angular_end].reshape(
+            1, 2, non_root, 3
+        )
+        predicted_root_velocity = prediction[..., angular_end : angular_end + 3]
+        predicted_root_angular = prediction[..., angular_end + 3 : angular_end + 6]
+        predicted_contacts = prediction[..., angular_end + 6 :]
+        predicted_position = torch.cat(
+            (ground["local_positions"][..., :1, :], predicted_position), dim=-2
+        )
+        predicted_xy = torch.cat(
+            (ground["local_rotation_xy"][..., :1, :, :], predicted_xy), dim=-3
+        )
+        predicted_velocity = torch.cat(
+            (ground["local_velocities"][..., :1, :], predicted_velocity), dim=-2
+        )
+        predicted_angular = torch.cat(
+            (ground["local_angular_velocities"][..., :1, :], predicted_angular),
+            dim=-2,
+        )
+        predicted_transform = txform.from_xy(predicted_xy)
+        global_transform, global_position, global_velocity, global_angular = (
+            txform.fk_vel(
+                predicted_transform,
+                predicted_position,
+                predicted_velocity,
+                predicted_angular,
+                parents,
+            )
+        )
+        character_transform = txform.inv_mul(
+            global_transform[..., 0:1, :, :], global_transform
+        )
+        character_position = txform.inv_mul_vec(
+            global_transform[..., 0:1, :, :],
+            global_position - global_position[..., 0:1, :],
+        )
+        character_velocity = txform.inv_mul_vec(
+            global_transform[..., 0:1, :, :], global_velocity
+        )
+        character_angular = txform.inv_mul_vec(
+            global_transform[..., 0:1, :, :], global_angular
+        )
+        inverse_dt = 60.0
+        expected = {
+            "local_position": torch.mean(
+                75.0 * torch.abs(ground["local_positions"] - predicted_position)
+            ),
+            "local_rotation_xy": torch.mean(
+                10.0 * torch.abs(ground["local_rotation_xy"] - predicted_xy)
+            ),
+            "local_velocity": torch.mean(
+                10.0 * torch.abs(ground["local_velocities"] - predicted_velocity)
+            ),
+            "local_angular_velocity": torch.mean(
+                1.25
+                * torch.abs(
+                    ground["local_angular_velocities"] - predicted_angular
+                )
+            ),
+            "root_velocity": torch.mean(
+                2.0 * torch.abs(ground["root_velocity"] - predicted_root_velocity)
+            ),
+            "root_angular_velocity": torch.mean(
+                2.0
+                * torch.abs(
+                    ground["root_angular_velocity"] - predicted_root_angular
+                )
+            ),
+            "contacts": torch.mean(
+                2.0 * torch.abs(ground["contacts"] - predicted_contacts)
+            ),
+            "character_position": torch.mean(
+                15.0
+                * torch.abs(ground["character_positions"] - character_position)
+            ),
+            "character_transform": torch.mean(
+                5.0
+                * torch.abs(ground["character_transforms"] - character_transform)
+            ),
+            "character_velocity": torch.mean(
+                2.0
+                * torch.abs(ground["character_velocities"] - character_velocity)
+            ),
+            "character_angular_velocity": torch.mean(
+                0.75
+                * torch.abs(
+                    ground["character_angular_velocities"] - character_angular
+                )
+            ),
+            "local_position_delta": torch.mean(
+                10.0
+                * torch.abs(
+                    torch.diff(ground["local_positions"], dim=1) * inverse_dt
+                    - torch.diff(predicted_position, dim=1) * inverse_dt
+                )
+            ),
+            "local_rotation_xy_delta": torch.mean(
+                1.75
+                * torch.abs(
+                    torch.diff(ground["local_rotation_xy"], dim=1) * inverse_dt
+                    - torch.diff(predicted_xy, dim=1) * inverse_dt
+                )
+            ),
+            "character_position_delta": torch.mean(
+                2.0
+                * torch.abs(
+                    torch.diff(ground["character_positions"], dim=1) * inverse_dt
+                    - torch.diff(character_position, dim=1) * inverse_dt
+                )
+            ),
+            "character_transform_delta": torch.mean(
+                0.75
+                * torch.abs(
+                    torch.diff(ground["character_transforms"], dim=1) * inverse_dt
+                    - torch.diff(character_transform, dim=1) * inverse_dt
+                )
+            ),
+            "latent_l1": torch.mean(0.1 * torch.abs(latent)),
+            "latent_l2": torch.mean(0.1 * torch.square(latent)),
+            "latent_velocity": torch.mean(
+                0.01 * torch.abs(torch.diff(latent, dim=1) * inverse_dt)
+            ),
+        }
+        expected["total"] = sum(expected.values())
+        self.assertEqual(set(actual), set(expected))
+        for name in expected:
+            torch.testing.assert_close(actual[name], expected[name], rtol=1e-6, atol=1e-7)
+
+    def test_orange_duck_temporal_losses_do_not_cross_range_boundaries(self):
+        parents, target, rows = _orange_duck_loss_fixture()
+        windows = range_safe_windows(
+            np.array([0, 2], dtype=np.int32),
+            np.array([2, 4], dtype=np.int32),
+            2,
+        )
+        np.testing.assert_array_equal(windows, np.array([[0, 1], [2, 3]]))
+        batch = torch.as_tensor(windows)
+        prediction = target.clone()
+        prediction[2:, 0] += 0.1
+        latent = torch.zeros(4, 32)
+        latent[2:] = 1.0
+        safe = orange_duck_decompressor_losses(
+            prediction[batch],
+            latent[batch],
+            parents=parents,
+            dt=1.0 / 60.0,
+            **{name: values[batch] for name, values in rows.items()},
+        )
+        self.assertEqual(float(safe["local_position_delta"]), 0.0)
+        self.assertEqual(float(safe["character_position_delta"]), 0.0)
+        self.assertEqual(float(safe["latent_velocity"]), 0.0)
+
+        crossing = torch.tensor([[1, 2]])
+        unsafe = orange_duck_decompressor_losses(
+            prediction[crossing],
+            latent[crossing],
+            parents=parents,
+            dt=1.0 / 60.0,
+            **{name: values[crossing] for name, values in rows.items()},
+        )
+        self.assertGreater(float(unsafe["local_position_delta"]), 0.0)
+        self.assertGreater(float(unsafe["latent_velocity"]), 0.0)
+
+    def test_orange_duck_physical_loss_corrects_low_mse_high_fk_error(self):
+        parents, target, rows = _orange_duck_loss_fixture(frames=2)
+        prediction = target.clone()
+        theta = 0.05
+        prediction[:, 90:96] = torch.tensor(
+            [np.cos(theta), -np.sin(theta), np.sin(theta), np.cos(theta), 0.0, 0.0]
+        )
+        prediction.requires_grad_(True)
+        batch = torch.tensor([[0, 1]])
+        losses = orange_duck_decompressor_losses(
+            prediction[batch],
+            torch.zeros(1, 2, 32),
+            parents=parents,
+            dt=1.0 / 60.0,
+            **{name: values[batch] for name, values in rows.items()},
+        )
+        normalized_mse = torch.mean(torch.square(prediction - target))
+        self.assertLess(float(normalized_mse.detach()), 1.0e-4)
+
+        predicted_xy = prediction[:, 90:270].reshape(2, 30, 3, 2)
+        local_xy = torch.cat((rows["local_rotation_xy"][:, :1], predicted_xy), dim=1)
+        _, predicted_global, _, _ = txform.fk_vel(
+            txform.from_xy(local_xy),
+            rows["local_positions"],
+            rows["local_velocities"],
+            rows["local_angular_velocities"],
+            parents,
+        )
+        _, actual_global, _, _ = txform.fk_vel(
+            txform.from_xy(rows["local_rotation_xy"]),
+            rows["local_positions"],
+            rows["local_velocities"],
+            rows["local_angular_velocities"],
+            parents,
+        )
+        fk_max = torch.linalg.vector_norm(
+            predicted_global - actual_global, dim=-1
+        ).max()
+        self.assertGreater(float(fk_max.detach()), 0.01)
+        losses["total"].backward()
+        self.assertGreater(float(torch.linalg.vector_norm(prediction.grad[:, 90:96])), 0.0)
+
     def test_autoencoder_normalization_uses_only_explicit_fitted_admitted_rows(self):
         with tempfile.TemporaryDirectory() as directory:
             data_directory = Path(directory) / "data"
@@ -338,6 +637,73 @@ class G1LmmTrainingTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "terrain.*flat"):
                 load_training_bundle(wrong_terrain)
 
+    def test_loader_requires_one_source_and_exact_source_bound_range_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            split = root / "split-source"
+            manifest = _write_flat_training_bundle(split)
+            source = manifest["sources"][0]
+            cut = 2000
+            first = {
+                **source,
+                "name": "synthetic-flat-walk-a",
+                "output_frames": cut,
+                "left_source_index": source["left_source_index"][:cut],
+                "right_source_index": source["right_source_index"][:cut],
+                "source_alpha": source["source_alpha"][:cut],
+            }
+            second = {
+                **source,
+                "name": "synthetic-flat-walk-b",
+                "output_frames": 3853 - cut,
+                "left_source_index": source["left_source_index"][cut:],
+                "right_source_index": source["right_source_index"][cut:],
+                "source_alpha": source["source_alpha"][cut:],
+            }
+            manifest["sources"] = [first, second]
+            manifest["source_count"] = 2
+            manifest["total_clips"] = 2
+            for entry in manifest["ranges"]:
+                entry["source"] = (
+                    first["name"] if entry["start"] < cut else second["name"]
+                )
+            (split / "manifest.json").write_text(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "exactly one"):
+                load_training_bundle(split)
+
+            missing = root / "missing-source"
+            manifest = _write_flat_training_bundle(missing)
+            del manifest["ranges"][0]["source"]
+            (missing / "manifest.json").write_text(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "exact keys"):
+                load_training_bundle(missing)
+
+            changed = root / "changed-source"
+            manifest = _write_flat_training_bundle(changed)
+            manifest["ranges"][0]["source"] = "another-source"
+            (changed / "manifest.json").write_text(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "sole source"):
+                load_training_bundle(changed)
+
+            extra = root / "extra-range-key"
+            manifest = _write_flat_training_bundle(extra)
+            manifest["ranges"][0]["unexpected"] = True
+            (extra / "manifest.json").write_text(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "exact keys"):
+                load_training_bundle(extra)
+
     def test_loader_rejects_a_gap_in_the_admitted_range_partition(self):
         with tempfile.TemporaryDirectory() as directory:
             data_directory = Path(directory) / "gapped"
@@ -418,6 +784,39 @@ class G1LmmTrainingTest(unittest.TestCase):
             self.assertEqual(training["status"], "rejected")
             self.assertEqual(training["artifacts"], {})
             self.assertEqual(training["stopped_after"], "decompressor")
+            decompressor_training = training["decompressor_training"]
+            self.assertEqual(
+                decompressor_training["objective"],
+                "orange-duck-denormalized-weighted/v1",
+            )
+            self.assertEqual(
+                set(decompressor_training["final_audit_loss_terms"]),
+                {
+                    "character_angular_velocity",
+                    "character_position",
+                    "character_position_delta",
+                    "character_transform",
+                    "character_transform_delta",
+                    "character_velocity",
+                    "contacts",
+                    "latent_l1",
+                    "latent_l2",
+                    "latent_velocity",
+                    "local_angular_velocity",
+                    "local_position",
+                    "local_position_delta",
+                    "local_rotation_xy",
+                    "local_rotation_xy_delta",
+                    "local_velocity",
+                    "root_angular_velocity",
+                    "root_velocity",
+                    "total",
+                },
+            )
+            self.assertEqual(
+                decompressor_training["final_audit_loss"],
+                decompressor_training["final_audit_loss_terms"]["total"],
+            )
 
     def test_real_bundle_overfit_stage_gates_64_adjacent_rows_before_publication(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -730,6 +1129,39 @@ print(json.dumps(result, sort_keys=True))
                     (root / "first" / artifact).read_bytes(),
                     (root / "second" / artifact).read_bytes(),
                 )
+
+    def test_package_sets_cublas_workspace_before_first_torch_import(self):
+        script = """
+import builtins
+import json
+import os
+import sys
+original_import = builtins.__import__
+observed = []
+def probe(name, *args, **kwargs):
+    if name == 'torch' and name not in sys.modules:
+        observed.append(os.environ.get('CUBLAS_WORKSPACE_CONFIG'))
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = probe
+import resources.g1_lmm
+print(json.dumps({'observed': observed, 'final': os.environ.get('CUBLAS_WORKSPACE_CONFIG')}))
+"""
+        environment = os.environ.copy()
+        environment.pop("CUBLAS_WORKSPACE_CONFIG", None)
+        environment["PYTHONPATH"] = ".:resources"
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=Path(__file__).resolve().parents[2],
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout.strip())
+        self.assertEqual(result["observed"], [":4096:8"])
+        self.assertEqual(result["final"], ":4096:8")
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_cuda_determinism_rejects_conflicting_cublas_configuration(self):
