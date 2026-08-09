@@ -22,6 +22,11 @@ from resources.g1_lmm.dataset import (
 )
 from resources.g1_lmm.models import Compressor, Decompressor, Projector, Stepper
 from resources.g1_lmm import training as g1_lmm_training
+from resources.g1_terrain_builder.schema import (
+    G1_SKELETON_NAMES,
+    G1_SKELETON_PARENTS,
+    G1_SKELETON_SIGNATURE,
+)
 from resources.g1_lmm.training import (
     TrainingConfig,
     TrainingGateError,
@@ -56,6 +61,7 @@ def _write_flat_training_bundle(
     local_rotation_step_rad: float = 0.0,
     motion_class: str = "flat-walk",
     terrain_class: str = "flat",
+    coherent_parent_change: tuple[int, int] | None = None,
 ) -> dict:
     path.mkdir()
     frames = 256
@@ -71,7 +77,10 @@ def _write_flat_training_bundle(
         rotations[5:, 1, 0] = np.cos(local_rotation_step_rad / 2.0)
         rotations[5:, 1, 1] = np.sin(local_rotation_step_rad / 2.0)
     angular_velocities = np.zeros_like(positions)
-    parents = np.concatenate(([-1], np.arange(0, bones - 1))).astype(np.int32)
+    parents = np.asarray(G1_SKELETON_PARENTS, dtype=np.int32)
+    if coherent_parent_change is not None:
+        child, parent = coherent_parent_change
+        parents[child] = parent
     range_starts = np.array([0], dtype=np.int32)
     range_stops = np.array([frames], dtype=np.int32)
     if gap_after_first_range:
@@ -139,6 +148,25 @@ def _write_flat_training_bundle(
         "source_count": 1,
         "range_count": len(range_starts),
         "dimensions": {"bones": 31, "features": 31, "contacts": 2},
+        "skeleton": {
+            "names": list(G1_SKELETON_NAMES),
+            "parents": parents.tolist(),
+            "basis": "holden-y-up-right-handed-forward-plus-z",
+            "signature": (
+                G1_SKELETON_SIGNATURE
+                if coherent_parent_change is None
+                else hashlib.sha256(
+                    json.dumps(
+                        {
+                            "names": list(G1_SKELETON_NAMES),
+                            "parents": parents.tolist(),
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode()
+                ).hexdigest()
+            ),
+        },
         "kinematics_model": {
             "asset": "g1_29dof.xml",
             "sha256": "749209c06a5c0023deb27f728420028b62b1f3092a22e24920183c1a897e4376",
@@ -893,6 +921,131 @@ class G1LmmTrainingTest(unittest.TestCase):
                 ):
                     load_training_bundle(data_directory)
 
+    def test_loader_authenticates_exact_canonical_skeleton_and_database_parents(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cases = []
+
+            missing = root / "missing"
+            manifest = _write_flat_training_bundle(missing)
+            del manifest["skeleton"]
+            cases.append(("missing", missing, manifest))
+
+            reordered = root / "reordered"
+            manifest = _write_flat_training_bundle(reordered)
+            manifest["skeleton"]["names"][2:4] = reversed(
+                manifest["skeleton"]["names"][2:4]
+            )
+            cases.append(("reordered", reordered, manifest))
+
+            reparented = root / "reparented"
+            manifest = _write_flat_training_bundle(reparented)
+            manifest["skeleton"]["parents"][30] = 28
+            cases.append(("reparented", reparented, manifest))
+
+            changed_basis = root / "basis"
+            manifest = _write_flat_training_bundle(changed_basis)
+            manifest["skeleton"]["basis"] = "z-up"
+            cases.append(("basis", changed_basis, manifest))
+
+            changed_signature = root / "signature"
+            manifest = _write_flat_training_bundle(changed_signature)
+            manifest["skeleton"]["signature"] = "0" * 64
+            cases.append(("signature", changed_signature, manifest))
+
+            coherent = root / "coherent-db-manifest"
+            manifest = _write_flat_training_bundle(
+                coherent, coherent_parent_change=(30, 28)
+            )
+            cases.append(("coherent", coherent, manifest))
+
+            database_only = root / "coherent-database-artifact"
+            manifest = _write_flat_training_bundle(
+                database_only, coherent_parent_change=(30, 28)
+            )
+            manifest["skeleton"] = {
+                "names": list(G1_SKELETON_NAMES),
+                "parents": list(G1_SKELETON_PARENTS),
+                "basis": "holden-y-up-right-handed-forward-plus-z",
+                "signature": G1_SKELETON_SIGNATURE,
+            }
+            cases.append(("database", database_only, manifest))
+
+            for name, data_directory, manifest in cases:
+                (data_directory / "manifest.json").write_text(
+                    json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+                    + "\n",
+                    encoding="utf-8",
+                )
+                with (
+                    self.subTest(name=name),
+                    self.assertRaisesRegex(ValueError, "canonical.*skeleton"),
+                ):
+                    load_training_bundle(data_directory)
+
+    def test_loader_validates_source_map_json_losslessly_before_numpy_coercion(self):
+        def bind_source_map_digest(manifest):
+            source = manifest["sources"][0]
+            manifest["continuity"]["source_map_digest_sha256"] = hashlib.sha256(
+                b"".join(
+                    (
+                        np.asarray(
+                            source["left_source_index"], dtype="<i4"
+                        ).tobytes(order="C"),
+                        np.asarray(
+                            source["right_source_index"], dtype="<i4"
+                        ).tobytes(order="C"),
+                        np.asarray(
+                            source["source_alpha"], dtype="<f4"
+                        ).tobytes(order="C"),
+                    )
+                )
+            ).hexdigest()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            malformed = (
+                ("fractional-index", "left_source_index", 0, 7659.9),
+                ("boolean-index", "left_source_index", 0, True),
+                ("string-index", "right_source_index", 0, "7659"),
+                ("boolean-alpha", "source_alpha", 0, False),
+                ("integer-alpha", "source_alpha", 0, 0),
+                ("string-alpha", "source_alpha", 0, "0.0"),
+                ("nonfinite-alpha", "source_alpha", 0, float("nan")),
+                ("negative-zero-alpha", "source_alpha", 0, -0.0),
+                ("noncanonical-alpha", "source_alpha", 0, 0.9),
+            )
+            for name, field, index, value in malformed:
+                data_directory = root / name
+                manifest = _write_flat_training_bundle(data_directory)
+                manifest["sources"][0][field][index] = value
+                bind_source_map_digest(manifest)
+                (data_directory / "manifest.json").write_text(
+                    json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+                    + "\n",
+                    encoding="utf-8",
+                )
+                with (
+                    self.subTest(name=name),
+                    self.assertRaisesRegex(ValueError, "source map JSON"),
+                ):
+                    load_training_bundle(data_directory)
+
+            coherent = root / "coherent-digest"
+            manifest = _write_flat_training_bundle(coherent)
+            manifest["sources"][0]["left_source_index"][0] = 7661
+            manifest["sources"][0]["right_source_index"][0] = 7661
+            bind_source_map_digest(manifest)
+            (coherent / "manifest.json").write_text(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ValueError, "canonical v3 source interpolation map"
+            ):
+                load_training_bundle(coherent)
+
     def test_all_stage_stops_after_failed_decompressor_gate_without_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1077,6 +1230,97 @@ class G1LmmTrainingTest(unittest.TestCase):
         )
         self.assertEqual(windows.shape, (70, 2))
         np.testing.assert_array_equal(np.unique(windows), np.arange(71))
+
+    def test_stepper_gate_uses_exact_one_two_four_second_source_horizons(self):
+        class ZeroStepper(torch.nn.Module):
+            def forward(self, state):
+                return torch.zeros_like(state)
+
+        with tempfile.TemporaryDirectory() as directory:
+            data_directory = Path(directory) / "data"
+            _write_flat_training_bundle(data_directory)
+            bundle = load_training_bundle(data_directory)
+            arrays = build_training_arrays(bundle)
+            autoencoder = mock.Mock(
+                latent=np.zeros(
+                    (bundle.frames, bundle.dimensions.latent), dtype=np.float32
+                )
+            )
+            config = TrainingConfig(device="cpu")
+            state_dimensions = bundle.dimensions.state
+
+            def exact_source_decode(_autoencoder, state_rows, _device):
+                return arrays.decompressor_target[: len(state_rows)].copy()
+
+            with mock.patch.object(
+                g1_lmm_training,
+                "_decode_state_rows",
+                side_effect=exact_source_decode,
+            ):
+                gate = g1_lmm_training._stepper_rollout_gate(
+                    bundle,
+                    arrays,
+                    autoencoder,
+                    ZeroStepper(),
+                    np.zeros(state_dimensions, dtype=np.float32),
+                    np.ones(state_dimensions, dtype=np.float32),
+                    np.zeros(state_dimensions, dtype=np.float32),
+                    np.ones(state_dimensions, dtype=np.float32),
+                    config,
+                )
+
+            self.assertTrue(gate["accepted"])
+            self.assertEqual(gate["skipped_ranges"], [])
+            self.assertEqual(len(gate["rollouts"]), 1)
+            rollout = gate["rollouts"][0]
+            self.assertEqual(rollout["seed"], 0)
+            self.assertEqual(
+                [receipt["frames"] for receipt in rollout["horizons"]],
+                [60, 120, 240],
+            )
+            self.assertEqual(
+                [receipt["seconds"] for receipt in rollout["horizons"]],
+                [1.0, 2.0, 4.0],
+            )
+
+            frames = 240
+            short_bundle = replace(
+                bundle,
+                positions=bundle.positions[:frames],
+                rotations=bundle.rotations[:frames],
+                velocities=bundle.velocities[:frames],
+                angular_velocities=bundle.angular_velocities[:frames],
+                range_starts=np.array([0], dtype=np.int32),
+                range_stops=np.array([frames], dtype=np.int32),
+                contacts=bundle.contacts[:frames],
+                features=bundle.features[:frames],
+                admitted_mask=np.ones(frames, dtype=bool),
+            )
+            short_autoencoder = mock.Mock(
+                latent=autoencoder.latent[:frames]
+            )
+            short_gate = g1_lmm_training._stepper_rollout_gate(
+                short_bundle,
+                arrays,
+                short_autoencoder,
+                ZeroStepper(),
+                np.zeros(state_dimensions, dtype=np.float32),
+                np.ones(state_dimensions, dtype=np.float32),
+                np.zeros(state_dimensions, dtype=np.float32),
+                np.ones(state_dimensions, dtype=np.float32),
+                config,
+            )
+            self.assertFalse(short_gate["accepted"])
+            self.assertEqual(short_gate["rollouts"], [])
+            self.assertEqual(
+                short_gate["skipped_ranges"],
+                [
+                    {
+                        "range_index": 0,
+                        "reason": "range has 240 or fewer valid successors",
+                    }
+                ],
+            )
 
     def test_accepted_flat_bundle_builds_exact_legacy_training_rows(self):
         with tempfile.TemporaryDirectory() as directory:

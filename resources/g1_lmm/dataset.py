@@ -11,6 +11,11 @@ from pathlib import Path
 import numpy as np
 
 from resources import quat
+from resources.g1_terrain_builder.schema import (
+    G1_SKELETON_NAMES,
+    G1_SKELETON_PARENTS,
+    G1_SKELETON_SIGNATURE,
+)
 
 
 _CANONICAL_V3_SOURCE_NAME = (
@@ -50,6 +55,12 @@ _CANONICAL_V3_KINEMATICS_MODEL = {
     "asset": "g1_29dof.xml",
     "sha256": "749209c06a5c0023deb27f728420028b62b1f3092a22e24920183c1a897e4376",
     "size_bytes": 26914,
+}
+_CANONICAL_V3_SKELETON = {
+    "names": list(G1_SKELETON_NAMES),
+    "parents": list(G1_SKELETON_PARENTS),
+    "basis": "holden-y-up-right-handed-forward-plus-z",
+    "signature": G1_SKELETON_SIGNATURE,
 }
 
 
@@ -275,6 +286,8 @@ def load_training_bundle(data_directory: str | Path) -> TrainingBundle:
         manifest.get("kinematics_model"), _CANONICAL_V3_KINEMATICS_MODEL
     ):
         raise ValueError("canonical v3 kinematics model descriptor changed")
+    if not _json_exact(manifest.get("skeleton"), _CANONICAL_V3_SKELETON):
+        raise ValueError("canonical v3 skeleton descriptor changed")
 
     database = _BinaryCursor(_artifact_payload(root, manifest, "database.bin"), "database.bin")
     positions = _read_array2(database, "<f4", (3,), "positions")
@@ -308,8 +321,10 @@ def load_training_bundle(data_directory: str | Path) -> TrainingBundle:
     quaternion_norm = np.linalg.norm(rotations.astype(np.float64), axis=2)
     if np.max(np.abs(quaternion_norm - 1.0)) > 1.0e-5:
         raise ValueError("database rotations are not normalized")
-    if parents[0] != -1 or np.any(parents[1:] < 0) or np.any(parents[1:] >= np.arange(1, expected_bones)):
-        raise ValueError("database parent hierarchy is invalid")
+    if not np.array_equal(
+        parents, np.asarray(G1_SKELETON_PARENTS, dtype=np.int32)
+    ):
+        raise ValueError("database does not contain the canonical v3 skeleton parents")
     if np.any(contacts > 1):
         raise ValueError("database contacts must be binary")
     starts, stops = _validated_ranges(range_starts, range_stops, row_count=frames)
@@ -481,9 +496,33 @@ def load_training_bundle(data_directory: str | Path) -> TrainingBundle:
     for source in sources:
         if type(source) is not dict:
             raise ValueError("manifest source receipt is invalid")
-        left = np.asarray(source.get("left_source_index"), dtype=np.int64)
-        right = np.asarray(source.get("right_source_index"), dtype=np.int64)
-        alpha = np.asarray(source.get("source_alpha"), dtype=np.float64)
+        left_json = source.get("left_source_index")
+        right_json = source.get("right_source_index")
+        alpha_json = source.get("source_alpha")
+        if (
+            type(left_json) is not list
+            or type(right_json) is not list
+            or type(alpha_json) is not list
+            or len(left_json) != 256
+            or len(right_json) != 256
+            or len(alpha_json) != 256
+            or any(
+                type(value) is not int
+                or value < 0
+                or value > np.iinfo(np.int32).max
+                for value in (*left_json, *right_json)
+            )
+            or any(
+                type(value) is not float
+                or not np.isfinite(value)
+                or value.hex() != 0.0.hex()
+                for value in alpha_json
+            )
+        ):
+            raise ValueError("canonical v3 source map JSON values/types changed")
+        left = np.asarray(left_json, dtype=np.int64)
+        right = np.asarray(right_json, dtype=np.int64)
+        alpha = np.asarray(alpha_json, dtype=np.float64)
         if (
             left.ndim != 1
             or right.shape != left.shape

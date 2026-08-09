@@ -1199,7 +1199,7 @@ def _stepper_rollout_gate(
 ) -> dict[str, object]:
     device = torch.device(config.device)
     state = np.concatenate((bundle.features, autoencoder.latent), axis=1).astype(np.float32)
-    horizon_frames = (120, 300, 480)
+    horizon_frames = (60, 120, 240)
     rollouts = []
     skipped_ranges = []
     for range_index, (range_start, range_stop) in enumerate(
@@ -1211,7 +1211,7 @@ def _stepper_rollout_gate(
             skipped_ranges.append(
                 {
                     "range_index": range_index,
-                    "reason": "range has fewer than 480 valid successors",
+                    "reason": "range has 240 or fewer valid successors",
                 }
             )
             continue
