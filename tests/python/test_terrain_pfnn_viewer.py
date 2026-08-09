@@ -216,7 +216,7 @@ class TerrainPFNNViewerTests(unittest.TestCase):
             arguments.checkpoint,
             Path(
                 "sonic/runs/native-g1-pfnn/expanded/"
-                "model-mixed-filtered-rollout16-final/best.pt"
+                "model-mixed-filtered-rollout16-final-v2/best.pt"
             ),
         )
         self.assertEqual(
