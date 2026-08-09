@@ -1492,6 +1492,14 @@ def _refit_motion_to_sole_targets(
         raise ValueError("full-sole stance mask must match authored stance")
     if stance_only and not has_stance_schedule:
         raise ValueError("stance-only refit requires authored_stance_mask [T,2]")
+    target_masks = np.asarray(
+        extras.get("sole_target_point_mask", np.ones(targets.shape[:-1], dtype=bool)),
+        dtype=bool,
+    ).copy()
+    if target_masks.shape != targets.shape[:-1]:
+        raise ValueError("sole target point mask must match target sole points")
+    if np.any(np.sum(target_masks, axis=2) < 1):
+        raise ValueError("sole target point mask must select each foot")
 
     roots = np.asarray(motion.root_position_world, dtype=np.float64)
     quaternions = np.asarray(
@@ -1518,11 +1526,14 @@ def _refit_motion_to_sole_targets(
             for foot in range(2):
                 if not constraint_stance[frame, foot]:
                     targets[frame, foot] = authored_feet[foot]
+                    target_masks[frame, foot] = True
         authored_error = max(
             float(
                 np.max(
                     np.linalg.norm(
-                        authored_feet[foot] - targets[frame, foot], axis=1
+                        authored_feet[foot][target_masks[frame, foot]]
+                        - targets[frame, foot][target_masks[frame, foot]],
+                        axis=1,
                     )
                 )
             )
@@ -1539,6 +1550,7 @@ def _refit_motion_to_sole_targets(
                 root_quaternion_wxyz=quaternions[frame],
                 authored_joints=authored[frame],
                 sole_targets_world=targets[frame],
+                sole_target_masks=target_masks[frame],
                 initial_joints=(joints[frame - 1] if frame else None),
             )
         ]
@@ -1549,6 +1561,7 @@ def _refit_motion_to_sole_targets(
                     root_quaternion_wxyz=quaternions[frame],
                     authored_joints=authored[frame],
                     sole_targets_world=targets[frame],
+                    sole_target_masks=target_masks[frame],
                     initial_joints=None,
                 )
             )
@@ -1566,7 +1579,9 @@ def _refit_motion_to_sole_targets(
                 float(
                     np.max(
                         np.linalg.norm(
-                            candidate_feet[foot] - targets[frame, foot], axis=1
+                            candidate_feet[foot][target_masks[frame, foot]]
+                            - targets[frame, foot][target_masks[frame, foot]],
+                            axis=1,
                         )
                     )
                 )
@@ -1606,6 +1621,7 @@ def _refit_motion_to_sole_targets(
                             root_quaternion_wxyz=quaternions[frame],
                             authored_joints=authored[frame],
                             sole_targets_world=targets[frame],
+                            sole_target_masks=target_masks[frame],
                             initial_joints=authored[future],
                         )
                     )
@@ -1643,7 +1659,13 @@ def _refit_motion_to_sole_targets(
         for foot in range(2):
             centres[frame, foot] = np.mean(feet[foot], axis=0)
             errors_by_foot[frame, foot] = float(
-                np.max(np.linalg.norm(feet[foot] - targets[frame, foot], axis=1))
+                np.max(
+                    np.linalg.norm(
+                        feet[foot][target_masks[frame, foot]]
+                        - targets[frame, foot][target_masks[frame, foot]],
+                        axis=1,
+                    )
+                )
             )
 
     refitted = StitchedMotion(
@@ -1660,6 +1682,9 @@ def _refit_motion_to_sole_targets(
     )
     updated["target_sole_center_world"] = np.asarray(
         np.mean(targets, axis=2), dtype=np.float32
+    )
+    updated["sole_target_point_mask"] = np.asarray(
+        target_masks, dtype=np.bool_
     )
     updated["adapted_sole_center_world"] = np.asarray(centres, dtype=np.float32)
     updated["per_frame_sole_target_error_by_foot_m"] = np.asarray(

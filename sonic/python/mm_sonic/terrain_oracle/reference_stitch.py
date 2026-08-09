@@ -459,31 +459,96 @@ class _G1FootfallAdapter:
             output.append(points_body @ rotation.T + position)
         return output[0], output[1]
 
+    def sole_support_and_collision_envelope_points_for_pose(
+        self,
+        *,
+        root_position: np.ndarray,
+        root_quaternion_wxyz: np.ndarray,
+        joints: np.ndarray,
+    ) -> tuple[
+        tuple[np.ndarray, np.ndarray],
+        tuple[np.ndarray, np.ndarray],
+    ]:
+        """Return sole bottoms and foot-hull samples from one FK update."""
+
+        self._set_pose(
+            self._reference_data,
+            root_position,
+            root_quaternion_wxyz,
+            joints,
+        )
+        supports = []
+        for foot in range(2):
+            points = self._sole_positions(self._reference_data, foot).copy()
+            points[:, 2] -= np.asarray(
+                [
+                    self.model.geom_size[index, 0]
+                    for index in self._sphere_geoms[foot]
+                ],
+                dtype=np.float64,
+            )
+            supports.append(points)
+        envelopes = []
+        for body_id, points_body in zip(
+            self._foot_body_ids,
+            self._foot_collision_envelope_points_body,
+            strict=True,
+        ):
+            rotation = np.asarray(
+                self._reference_data.xmat[body_id], dtype=np.float64
+            ).reshape(3, 3)
+            position = np.asarray(
+                self._reference_data.xpos[body_id], dtype=np.float64
+            )
+            envelopes.append(points_body @ rotation.T + position)
+        return (
+            (supports[0], supports[1]),
+            (envelopes[0], envelopes[1]),
+        )
+
     def _solve_foot(
         self,
         foot: int,
         target: np.ndarray,
         reference_qpos: np.ndarray,
+        target_mask: np.ndarray | None = None,
     ) -> None:
         data = self._adapted_data
         dofs = self._leg_dofs[foot]
         addresses = self._leg_qpos[foot]
         limits = self._leg_limits[foot]
         reference = reference_qpos[addresses]
+        mask = (
+            np.ones(len(self._sphere_geoms[foot]), dtype=bool)
+            if target_mask is None
+            else np.asarray(target_mask, dtype=bool)
+        )
+        if mask.shape != (len(self._sphere_geoms[foot]),) or not np.any(mask):
+            raise ValueError(
+                "sole target mask must select at least one collision sphere"
+            )
+        selected_geoms = tuple(
+            geom_id
+            for geom_id, selected in zip(
+                self._sphere_geoms[foot], mask, strict=True
+            )
+            if selected
+        )
+        selected_target = np.asarray(target, dtype=np.float64)[mask]
         identity = np.eye(len(dofs), dtype=np.float64)
         jacobian_position = np.zeros(
             (3, int(self.model.nv)), dtype=np.float64
         )
         for _ in range(self.maximum_iterations):
             self._mujoco.mj_forward(self.model, data)
-            current = self._sole_positions(data, foot)
-            error = (target - current).reshape(-1)
+            current = self._sole_positions(data, foot)[mask]
+            error = (selected_target - current).reshape(-1)
             if float(
-                np.max(np.linalg.norm(target - current, axis=1))
+                np.max(np.linalg.norm(selected_target - current, axis=1))
             ) <= self.target_tolerance_m:
                 return
             rows: list[np.ndarray] = []
-            for geom_id in self._sphere_geoms[foot]:
+            for geom_id in selected_geoms:
                 point = np.asarray(
                     data.geom_xpos[geom_id], dtype=np.float64
                 )
@@ -549,12 +614,18 @@ class _G1FootfallAdapter:
         root_quaternion_wxyz: np.ndarray,
         authored_joints: np.ndarray,
         sole_targets_world: Sequence[np.ndarray],
+        sole_target_masks: Sequence[np.ndarray] | None = None,
         initial_joints: np.ndarray | None = None,
         continuity_joints: np.ndarray | None = None,
         continuity_feet: Sequence[bool] = (False, False),
         maximum_continuity_joint_step_rad: float | None = None,
     ) -> tuple[np.ndarray, float, float]:
         """Fit authored leg joints to explicit world-space sole-sphere targets.
+
+        ``sole_target_masks`` optionally selects the actual supporting sole
+        collision spheres.  Unselected sphere centres remain part of the
+        rigid foot and downstream collision audit, but are not pulled toward
+        terrain troughs during partial support or toe-off.
 
         ``initial_joints`` is an optional IK warm start.  The authored pose
         remains the posture regularizer, so a previous-frame warm start adds
@@ -570,10 +641,30 @@ class _G1FootfallAdapter:
 
         if len(sole_targets_world) != 2:
             raise ValueError("sole targets must contain left and right feet")
+        if sole_target_masks is not None and len(sole_target_masks) != 2:
+            raise ValueError("sole target masks must contain left and right feet")
         targets = (
             np.asarray(sole_targets_world[0], dtype=np.float64),
             np.asarray(sole_targets_world[1], dtype=np.float64),
         )
+        masks = (
+            (
+                np.ones(targets[0].shape[0], dtype=bool),
+                np.ones(targets[1].shape[0], dtype=bool),
+            )
+            if sole_target_masks is None
+            else (
+                np.asarray(sole_target_masks[0], dtype=bool),
+                np.asarray(sole_target_masks[1], dtype=bool),
+            )
+        )
+        for foot in range(2):
+            if targets[foot].shape != (len(self._sphere_geoms[foot]), 3):
+                raise ValueError("sole target shape does not match collision spheres")
+            if masks[foot].shape != (len(self._sphere_geoms[foot]),):
+                raise ValueError("sole target mask shape does not match collision spheres")
+            if not np.any(masks[foot]):
+                raise ValueError("sole target mask must select at least one point per foot")
         self._set_pose(
             self._adapted_data,
             root_position,
@@ -594,8 +685,8 @@ class _G1FootfallAdapter:
                 self._joint_addresses[leg_mask]
             ] = initial[leg_mask]
             self._mujoco.mj_forward(self.model, self._adapted_data)
-        self._solve_foot(0, targets[0], reference_qpos)
-        self._solve_foot(1, targets[1], reference_qpos)
+        self._solve_foot(0, targets[0], reference_qpos, masks[0])
+        self._solve_foot(1, targets[1], reference_qpos, masks[1])
         if maximum_continuity_joint_step_rad is not None:
             maximum_step = float(maximum_continuity_joint_step_rad)
             if not math.isfinite(maximum_step) or maximum_step <= 0.0:
@@ -637,8 +728,8 @@ class _G1FootfallAdapter:
             float(
                 np.max(
                     np.linalg.norm(
-                        targets[foot]
-                        - self._sole_positions(self._adapted_data, foot),
+                        targets[foot][masks[foot]]
+                        - self._sole_positions(self._adapted_data, foot)[masks[foot]],
                         axis=1,
                     )
                 )

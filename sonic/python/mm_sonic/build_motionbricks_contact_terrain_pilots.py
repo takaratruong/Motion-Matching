@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Sequence
 
 import numpy as np
+from scipy.spatial.transform import Rotation, Slerp
 import zarr
 
 from .build_bones_side_on_stair_pilots import (
@@ -28,7 +29,6 @@ from .build_bones_side_on_stair_pilots import (
     MAXIMUM_WRIST_EXCURSION_RAD,
     MAXIMUM_WRIST_RMS_VELOCITY_RAD_S,
     MAXIMUM_WRIST_VELOCITY_RAD_S,
-    _adaptively_subdivide_motion_steps,
     _attenuate_upper_limb_motion,
     _audit_stance_contact_support,
     _blend_anchored_sole_offsets,
@@ -49,9 +49,13 @@ from .canonical_terrain_matcher import RegularGridHeightField
 from .compose_coherent_block_plan import _smooth_upper_clearance_envelope
 from .build_rolling_terrain_pilots import (
     DEFAULT_SOURCE,
-    PROFILES,
+    PROFILES as ROLLING_PROFILES,
     _source_motion,
-    build_profile,
+    build_profile as build_rolling_profile,
+)
+from .challenging_terrain_profiles import (
+    PROFILES as CHALLENGING_PROFILES,
+    build_profile as build_challenging_profile,
 )
 from .build_stairs500_omnidirectional_pilots import (
     _fill_short_stance_gaps,
@@ -83,6 +87,8 @@ DEFAULT_OUTPUT = Path(
     "/move/data/terrain-aware/sonic-rollouts/"
     "motionbricks_contact_rough_v1"
 )
+
+PROFILES = ROLLING_PROFILES + CHALLENGING_PROFILES
 
 
 def _align_motion_corridor(
@@ -201,7 +207,12 @@ def _profile_for_motion(
     active_stop = float(np.max(root[:, 0]) - 0.30)
     if active_stop - active_start < 1.0:
         raise ValueError("aligned source is too short for a rough passage")
-    return build_profile(
+    builder = (
+        build_challenging_profile
+        if profile in CHALLENGING_PROFILES
+        else build_rolling_profile
+    )
+    return builder(
         profile,
         spacing_m=spacing_m,
         x_range_m=(x_min, x_max),
@@ -294,6 +305,164 @@ def _terrain_clear_transplanted_swings(
     return targets, bracketed, smoothed
 
 
+def _smooth_pelvis_planar_offset(
+    values: np.ndarray,
+    *,
+    sigma_frames: float = 2.0,
+) -> np.ndarray:
+    """Inertialize foothold-anchor changes across support exchanges.
+
+    The planner's exact active-stance mean can change in one frame when the
+    second foot touches down.  That path is position-feasible but has a lateral
+    velocity impulse.  A short zero-phase Gaussian distributes the same anchor
+    change across the surrounding support exchange; the subsequent whole-sole
+    IK keeps every authored plant fixed while the legs absorb it smoothly.
+    """
+
+    path = np.asarray(values, dtype=np.float64)
+    if path.ndim != 2 or path.shape[1:] != (2,) or not np.isfinite(path).all():
+        raise ValueError("pelvis planar offset must be finite with shape [T,2]")
+    sigma = float(sigma_frames)
+    if not math.isfinite(sigma) or sigma < 0.0:
+        raise ValueError("pelvis planar smoothing sigma must be nonnegative")
+    if sigma == 0.0 or len(path) < 2:
+        return path.copy()
+    radius = max(1, int(math.ceil(3.0 * sigma)))
+    coordinate = np.arange(-radius, radius + 1, dtype=np.float64)
+    kernel = np.exp(-0.5 * np.square(coordinate / sigma))
+    kernel /= np.sum(kernel)
+    result = np.empty_like(path)
+    for axis in range(2):
+        padded = np.pad(path[:, axis], (radius, radius), mode="edge")
+        result[:, axis] = np.convolve(padded, kernel, mode="valid")
+    return result
+
+
+def _smoothly_subdivide_motion_steps(
+    motion: StitchedMotion,
+    extras: dict[str, np.ndarray],
+    *,
+    target_joint_step_rad: float = 0.14,
+    transition_sigma_frames: float = 3.0,
+) -> tuple[StitchedMotion, dict[str, np.ndarray], dict[str, float]]:
+    """In-between a difficult IK transition with a smooth local time warp.
+
+    The former subdivision inserted extra samples only inside the offending
+    interval.  Although that reduced the joint delta, it changed the root
+    speed from full to quarter speed and back in two samples, creating a
+    visible pelvis jolt.  Here each required dilation is extended into a
+    Gaussian time-density envelope.  The hard interval receives enough
+    in-betweens, while neighbouring intervals ease into and out of the slower
+    phase.  Spatial root, pose, and command paths remain the same curves.
+    """
+
+    target = float(target_joint_step_rad)
+    sigma = float(transition_sigma_frames)
+    if not math.isfinite(target) or target <= 0.0:
+        raise ValueError("target joint step must be positive")
+    if not math.isfinite(sigma) or sigma <= 0.0:
+        raise ValueError("time-warp transition sigma must be positive")
+    old_count = len(motion.root_position_world)
+    joints = np.asarray(motion.joint_position, dtype=np.float64)
+    if old_count < 2:
+        return motion, extras, {"added_frame_count": 0.0}
+    interval_step = np.max(np.abs(np.diff(joints, axis=0)), axis=1)
+    required_density = np.maximum(1.0, interval_step / target)
+    if float(np.max(required_density)) <= 1.0 + 1.0e-12:
+        return motion, extras, {
+            "added_frame_count": 0.0,
+            "maximum_interval_dilation": 1.0,
+            "maximum_time_density_step": 0.0,
+        }
+
+    density = np.ones(old_count - 1, dtype=np.float64)
+    radius = max(1, int(math.ceil(3.0 * sigma)))
+    for centre in np.flatnonzero(required_density > 1.0 + 1.0e-12):
+        start = max(0, int(centre) - radius)
+        stop = min(len(density), int(centre) + radius + 1)
+        offset = np.arange(start, stop, dtype=np.float64) - float(centre)
+        envelope = 1.0 + (required_density[centre] - 1.0) * np.exp(
+            -0.5 * np.square(offset / sigma)
+        )
+        density[start:stop] = np.maximum(density[start:stop], envelope)
+
+    source_boundary_time = np.concatenate(
+        (np.zeros(1, dtype=np.float64), np.cumsum(density))
+    )
+    new_count = int(math.ceil(float(source_boundary_time[-1]))) + 1
+    output_time = np.linspace(
+        0.0, float(source_boundary_time[-1]), new_count, dtype=np.float64
+    )
+    old_coordinate = np.arange(old_count, dtype=np.float64)
+    new_coordinate = np.interp(
+        output_time, source_boundary_time, old_coordinate
+    )
+
+    def interpolate(values: np.ndarray) -> np.ndarray:
+        array = np.asarray(values)
+        if array.ndim == 0 or array.shape[0] != old_count:
+            return array.copy()
+        if array.dtype.kind not in "fc":
+            nearest = np.clip(
+                np.rint(new_coordinate).astype(np.int64), 0, old_count - 1
+            )
+            return array[nearest]
+        flat = array.reshape(old_count, -1)
+        return np.asarray(
+            np.stack(
+                [
+                    np.interp(new_coordinate, old_coordinate, flat[:, column])
+                    for column in range(flat.shape[1])
+                ],
+                axis=1,
+            ).reshape((new_count,) + array.shape[1:]),
+            dtype=array.dtype,
+        )
+
+    quaternion_xyzw = Slerp(
+        old_coordinate,
+        Rotation.from_quat(
+            np.asarray(motion.root_quaternion_world_wxyz)[:, (1, 2, 3, 0)]
+        ),
+    )(new_coordinate).as_quat()
+    nearest = np.clip(
+        np.rint(new_coordinate).astype(np.int64), 0, old_count - 1
+    )
+    subdivided = StitchedMotion(
+        fps=motion.fps,
+        root_position_world=np.asarray(
+            interpolate(np.asarray(motion.root_position_world)), dtype=np.float32
+        ),
+        root_quaternion_world_wxyz=np.asarray(
+            quaternion_xyzw[:, (3, 0, 1, 2)], dtype=np.float32
+        ),
+        joint_position=np.asarray(interpolate(joints), dtype=np.float32),
+        provenance=tuple(motion.provenance[index] for index in nearest),
+        seam_indices=tuple(
+            int(np.argmin(np.abs(new_coordinate - float(index))))
+            for index in motion.seam_indices
+        ),
+    )
+    subdivided_extras = {
+        key: interpolate(value) for key, value in extras.items()
+    }
+    if "authored_stance_mask" in extras:
+        original_stance = np.asarray(extras["authored_stance_mask"], dtype=bool)
+        lower = np.floor(new_coordinate).astype(np.int64)
+        upper = np.ceil(new_coordinate).astype(np.int64)
+        subdivided_extras["authored_stance_mask"] = (
+            original_stance[lower] & original_stance[upper]
+        )
+    return subdivided, subdivided_extras, {
+        "added_frame_count": float(new_count - old_count),
+        "maximum_interval_dilation": float(np.max(density)),
+        "maximum_time_density_step": float(
+            np.max(np.abs(np.diff(density))) if len(density) > 1 else 0.0
+        ),
+        "pre_subdivision_maximum_joint_step_rad": float(np.max(interval_step)),
+    }
+
+
 def _final_upper_limb_accepted(metrics: dict[str, float]) -> bool:
     return bool(
         metrics["maximum_arm_excursion_rad"] <= MAXIMUM_ARM_EXCURSION_RAD
@@ -311,6 +480,261 @@ def _final_upper_limb_accepted(metrics: dict[str, float]) -> bool:
         and metrics["p99_wrist_acceleration_rad_s2"]
         <= MAXIMUM_WRIST_P99_ACCELERATION_RAD_S2
     )
+
+
+def _audit_partial_rigid_support_contact(
+    motion: StitchedMotion,
+    extras: dict[str, np.ndarray],
+    *,
+    adapter: _G1FootfallAdapter,
+    target_mesh: object,
+    maximum_contact_clearance_m: float = 0.010,
+    maximum_partial_gap_m: float = 0.035,
+    maximum_strict_gap_m: float = 0.012,
+    minimum_partial_probe_count: int = 2,
+) -> dict[str, object]:
+    """Audit actual collision-sphere support for rigid rough-ground plants.
+
+    The legacy no-hover audit correctly requires every sole probe to lie near
+    a planar tread.  On coarse rough ground a rigid foot instead rests on a
+    separated subset of its collision spheres while the other corners bridge
+    local troughs.  This audit permits that geometry only on footholds the
+    planner explicitly marked partial, and still requires two separated real
+    G1 probes, bounded clearance, bounded stance drift/error, and the separate
+    exact no-penetration collision audit.
+    """
+
+    stance = np.asarray(extras.get("authored_stance_mask"), dtype=bool)
+    partial = np.asarray(
+        extras.get("planned_partial_rigid_support_mask"), dtype=bool
+    )
+    frame_count = len(motion.root_position_world)
+    if stance.shape != (frame_count, 2) or partial.shape != stance.shape:
+        return {
+            "applicable": False,
+            "accepted": False,
+            "reason": "partial support or stance mask is unavailable",
+        }
+    if not np.any(partial & stance):
+        return {
+            "applicable": False,
+            "accepted": False,
+            "reason": "motion has no planned partial-support stance",
+        }
+    ray_z = float(np.max(target_mesh.vertices_world[:, 2]) + 1.0)
+    roots = np.asarray(motion.root_position_world, dtype=np.float64)
+    quaternions = np.asarray(
+        motion.root_quaternion_world_wxyz, dtype=np.float64
+    )
+    joints = np.asarray(motion.joint_position, dtype=np.float64)
+    minimum_partial_count = 4
+    minimum_strict_count = 4
+    maximum_partial_gap = 0.0
+    maximum_strict_gap = 0.0
+    failed_frames: list[tuple[int, int, str]] = []
+    for frame in range(frame_count):
+        if not np.any(stance[frame]):
+            continue
+        supports = adapter.sole_support_points_for_pose(
+            root_position=roots[frame],
+            root_quaternion_wxyz=quaternions[frame],
+            joints=joints[frame],
+        )
+        for foot in range(2):
+            if not stance[frame, foot]:
+                continue
+            points = np.asarray(supports[foot], dtype=np.float64)
+            clearance = np.asarray(
+                [
+                    float(point[2])
+                    - _terrain_height(target_mesh, point[:2], ray_z)
+                    for point in points
+                ],
+                dtype=np.float64,
+            )
+            contact_count = int(
+                np.count_nonzero(clearance <= maximum_contact_clearance_m)
+            )
+            maximum_gap = float(np.max(clearance))
+            if partial[frame, foot]:
+                minimum_partial_count = min(minimum_partial_count, contact_count)
+                maximum_partial_gap = max(maximum_partial_gap, maximum_gap)
+                if contact_count < int(minimum_partial_probe_count):
+                    failed_frames.append((frame, foot, "too_few_contact_probes"))
+                if maximum_gap > float(maximum_partial_gap_m):
+                    failed_frames.append((frame, foot, "partial_gap_too_large"))
+            else:
+                minimum_strict_count = min(minimum_strict_count, contact_count)
+                maximum_strict_gap = max(maximum_strict_gap, maximum_gap)
+                if contact_count < 2:
+                    failed_frames.append((frame, foot, "strict_support_lost"))
+                if maximum_gap > float(maximum_strict_gap_m):
+                    failed_frames.append((frame, foot, "strict_hover"))
+    target_error = np.asarray(
+        extras.get("per_frame_sole_target_error_by_foot_m"), dtype=np.float64
+    )
+    maximum_stance_error = float(
+        np.max(target_error[stance])
+        if target_error.shape == stance.shape and np.any(stance)
+        else math.inf
+    )
+    accepted = bool(
+        not failed_frames and maximum_stance_error <= 0.012
+    )
+    return {
+        "applicable": True,
+        "accepted": accepted,
+        "partial_stance_frame_foot_count": int(np.count_nonzero(partial & stance)),
+        "minimum_partial_contact_probe_count": int(minimum_partial_count),
+        "minimum_strict_contact_probe_count": int(minimum_strict_count),
+        "maximum_partial_probe_gap_m": maximum_partial_gap,
+        "maximum_strict_probe_gap_m": maximum_strict_gap,
+        "maximum_stance_sole_target_error_m": maximum_stance_error,
+        "failed_frame_count": len(failed_frames),
+        "first_failed_frames": [list(value) for value in failed_frames[:12]],
+        "thresholds": {
+            "maximum_contact_clearance_m": float(maximum_contact_clearance_m),
+            "maximum_partial_gap_m": float(maximum_partial_gap_m),
+            "maximum_strict_gap_m": float(maximum_strict_gap_m),
+            "minimum_partial_probe_count": int(minimum_partial_probe_count),
+            "maximum_stance_sole_target_error_m": 0.012,
+        },
+    }
+
+
+def _repair_stance_reach_with_root_lowering(
+    motion: StitchedMotion,
+    extras: dict[str, np.ndarray],
+    *,
+    adapter: _G1FootfallAdapter,
+    target_error_m: float = 0.008,
+    maximum_total_lower_m: float = 0.035,
+    envelope_radius_frames: int = 12,
+    maximum_iterations: int = 2,
+) -> tuple[StitchedMotion, dict[str, np.ndarray], dict[str, object]]:
+    """Smoothly lower an overextended pelvis while preserving planted soles.
+
+    The geometric pelvis corridor is deliberately conservative and does not
+    know the exact G1 leg Jacobian.  On uneven double support it can therefore
+    select a legal but too-high pelvis pose: the newly planted foot solves,
+    while the trailing full-sole plant becomes overextended.  Lower only where
+    the measured stance-target residual proves this happened, extend the edit
+    through a smooth temporal envelope, and refit the unchanged world-space
+    support probes.  Exact body/foot collision audits still run afterwards.
+    """
+
+    current_motion = motion
+    current_extras = dict(extras)
+    total_lower = np.zeros(len(motion.root_position_world), dtype=np.float64)
+    iteration_reports: list[dict[str, float]] = []
+
+    def maximum_stance_error(values: dict[str, np.ndarray]) -> float:
+        stance = np.asarray(values.get("authored_stance_mask"), dtype=bool)
+        errors = np.asarray(
+            values.get("per_frame_sole_target_error_by_foot_m"),
+            dtype=np.float64,
+        )
+        if stance.shape != errors.shape or not np.any(stance):
+            return math.inf
+        return float(np.max(errors[stance]))
+
+    initial_error = maximum_stance_error(current_extras)
+    for _iteration in range(int(maximum_iterations)):
+        stance = np.asarray(
+            current_extras.get("authored_stance_mask"), dtype=bool
+        )
+        errors = np.asarray(
+            current_extras.get("per_frame_sole_target_error_by_foot_m"),
+            dtype=np.float64,
+        )
+        if stance.shape != errors.shape or not np.any(stance):
+            break
+        required = np.zeros(len(current_motion.root_position_world), dtype=np.float64)
+        for frame in range(len(required)):
+            if np.any(stance[frame]):
+                required[frame] = max(
+                    0.0,
+                    float(np.max(errors[frame, stance[frame]]))
+                    - float(target_error_m)
+                    + 0.003,
+                )
+        if float(np.max(required)) <= 1.0e-9:
+            break
+        lower = _smooth_upper_clearance_envelope(
+            required, radius_frames=int(envelope_radius_frames)
+        )
+        lower = np.minimum(
+            lower,
+            np.maximum(float(maximum_total_lower_m) - total_lower, 0.0),
+        )
+        roots = np.asarray(
+            current_motion.root_position_world, dtype=np.float64
+        ).copy()
+        corridor_minimum = np.asarray(
+            current_extras.get(
+                "planned_pelvis_height_minimum_world_m",
+                np.full(len(roots), -math.inf, dtype=np.float64),
+            ),
+            dtype=np.float64,
+        )
+        if corridor_minimum.shape == (len(roots),):
+            lower = np.minimum(
+                lower, np.maximum(roots[:, 2] - corridor_minimum, 0.0)
+            )
+        if float(np.max(lower)) <= 1.0e-9:
+            break
+        roots[:, 2] -= lower
+        candidate = StitchedMotion(
+            fps=current_motion.fps,
+            root_position_world=np.asarray(roots, dtype=np.float32),
+            root_quaternion_world_wxyz=(
+                current_motion.root_quaternion_world_wxyz
+            ),
+            joint_position=current_motion.joint_position,
+            provenance=current_motion.provenance,
+            seam_indices=current_motion.seam_indices,
+        )
+        candidate, candidate_extras, refit = _refit_motion_to_sole_targets(
+            candidate,
+            current_extras,
+            adapter=adapter,
+            stance_only=True,
+        )
+        candidate_error = maximum_stance_error(candidate_extras)
+        if candidate_error >= maximum_stance_error(current_extras) - 1.0e-6:
+            break
+        total_lower += lower
+        current_motion = candidate
+        current_extras = candidate_extras
+        iteration_reports.append(
+            {
+                "maximum_incremental_lower_m": float(np.max(lower)),
+                "maximum_stance_error_m": candidate_error,
+                "maximum_sole_target_error_m": float(
+                    refit["maximum_sole_target_error_m"]
+                ),
+                "maximum_joint_delta_rad": float(
+                    refit["maximum_joint_delta_rad"]
+                ),
+                "maximum_joint_step_rad": float(
+                    refit["maximum_joint_step_rad"]
+                ),
+            }
+        )
+
+    current_extras["stance_reach_root_lower_m"] = np.asarray(
+        total_lower, dtype=np.float32
+    )
+    return current_motion, current_extras, {
+        "applied": bool(np.any(total_lower > 1.0e-9)),
+        "initial_maximum_stance_error_m": initial_error,
+        "final_maximum_stance_error_m": maximum_stance_error(current_extras),
+        "maximum_root_lower_m": float(np.max(total_lower)),
+        "maximum_root_lower_step_m": float(
+            np.max(np.abs(np.diff(total_lower))) if len(total_lower) > 1 else 0.0
+        ),
+        "iterations": iteration_reports,
+    }
 
 
 def _repair_forbidden_body_with_root_lift(
@@ -553,6 +977,8 @@ def _plan_and_apply_fixed_terrain_footholds(
     *,
     adapter: _G1FootfallAdapter,
     target_mesh: object,
+    pelvis_planar_smoothing_sigma_frames: float = 2.0,
+    allow_partial_rigid_support: bool = False,
 ) -> tuple[StitchedMotion, dict[str, np.ndarray], dict[str, object]]:
     """Replace drifting paired-warp contacts with fixed rigid footholds.
 
@@ -631,6 +1057,11 @@ def _plan_and_apply_fixed_terrain_footholds(
             # same-foot replants without an intervening opposite-foot plant.
             # This relaxes only schedule ordering, never support geometry.
             require_alternating_feet=False,
+            allow_partial_rigid_support=allow_partial_rigid_support,
+            minimum_partial_support_point_count=(
+                2 if allow_partial_rigid_support else 3
+            ),
+            minimum_partial_support_span_m=0.080,
         ),
     )
     planning_report = asdict(result.diagnostics)
@@ -649,6 +1080,11 @@ def _plan_and_apply_fixed_terrain_footholds(
     longitudinal = np.zeros((frame_count, 2), dtype=np.float64)
     lateral = np.zeros((frame_count, 2), dtype=np.float64)
     yaw = np.zeros((frame_count, 2), dtype=np.float64)
+    partial_support = np.zeros((frame_count, 2), dtype=bool)
+    planned_support_contact_count = np.zeros((frame_count, 2), dtype=np.int16)
+    planned_support_probe_mask = np.ones(
+        targets.shape[:-1], dtype=np.bool_
+    )
     for foothold in result.plan.footholds:
         span = foothold.intent.span
         foot = span.foot_index
@@ -671,6 +1107,21 @@ def _plan_and_apply_fixed_terrain_footholds(
         yaw[span.start_frame : span.stop_frame, foot] = float(
             diagnostics.yaw_adjustment_rad or 0.0
         )
+        partial_support[span.start_frame : span.stop_frame, foot] = bool(
+            diagnostics.partial_rigid_support
+        )
+        contact_mask = foothold.sole_support_contact_mask
+        if contact_mask is None:
+            contact_mask = np.ones(targets.shape[2], dtype=bool)
+        contact_mask = np.asarray(contact_mask, dtype=bool)
+        if contact_mask.shape != (targets.shape[2],) or not np.any(contact_mask):
+            raise ValueError("foothold returned an invalid sole support mask")
+        planned_support_probe_mask[
+            span.start_frame : span.stop_frame, foot
+        ] = contact_mask
+        planned_support_contact_count[
+            span.start_frame : span.stop_frame, foot
+        ] = int(diagnostics.support_contact_point_count or 0)
     if not np.array_equal(assigned, stance):
         raise ValueError("foothold plan did not assign every authored stance")
 
@@ -681,11 +1132,15 @@ def _plan_and_apply_fixed_terrain_footholds(
     # rate-feasible pelvis correction used to make that sequence reachable.
     # Reconstructing this independently here was the source of one-frame route
     # jumps when adjacent treads preferred different local minima.
-    root_xy_offset = np.asarray(
+    raw_root_xy_offset = np.asarray(
         result.plan.pelvis_planar_offset_world_m, dtype=np.float64
     )
-    if root_xy_offset.shape != (frame_count, 2):
+    if raw_root_xy_offset.shape != (frame_count, 2):
         raise ValueError("foothold plan returned an invalid pelvis XY path")
+    root_xy_offset = _smooth_pelvis_planar_offset(
+        raw_root_xy_offset,
+        sigma_frames=pelvis_planar_smoothing_sigma_frames,
+    )
     planned_root[:, :2] += root_xy_offset
     planned_motion = StitchedMotion(
         fps=source.fps,
@@ -758,6 +1213,15 @@ def _plan_and_apply_fixed_terrain_footholds(
     updated["planned_foothold_yaw_adjustment_rad"] = np.asarray(
         yaw, dtype=np.float32
     )
+    updated["planned_partial_rigid_support_mask"] = np.asarray(
+        partial_support, dtype=np.bool_
+    )
+    updated["planned_support_contact_point_count"] = np.asarray(
+        planned_support_contact_count, dtype=np.int16
+    )
+    updated["sole_target_point_mask"] = np.asarray(
+        planned_support_probe_mask, dtype=np.bool_
+    )
     updated["planned_pelvis_height_minimum_world_m"] = np.asarray(
         corridor.minimum_height_world_m, dtype=np.float32
     )
@@ -769,6 +1233,9 @@ def _plan_and_apply_fixed_terrain_footholds(
     )
     updated["planned_pelvis_xy_offset_world_m"] = np.asarray(
         root_xy_offset, dtype=np.float32
+    )
+    updated["planned_pelvis_xy_offset_raw_world_m"] = np.asarray(
+        raw_root_xy_offset, dtype=np.float32
     )
     updated["intended_root_position_world"] = np.asarray(
         planned_root, dtype=np.float32
@@ -785,6 +1252,11 @@ def _plan_and_apply_fixed_terrain_footholds(
     )
     planning_report["maximum_horizontal_root_adjustment_step_m"] = float(
         np.max(np.linalg.norm(np.diff(root_xy_offset, axis=0), axis=1))
+        if frame_count > 1
+        else 0.0
+    )
+    planning_report["maximum_raw_horizontal_root_adjustment_step_m"] = float(
+        np.max(np.linalg.norm(np.diff(raw_root_xy_offset, axis=0), axis=1))
         if frame_count > 1
         else 0.0
     )
@@ -807,6 +1279,7 @@ def _build_one(
     minimum_stance_run_frames: int,
     maximum_stance_gap_frames: int,
     maximum_stance_speed_mps: float,
+    pelvis_planar_smoothing_sigma_frames: float,
 ) -> dict[str, object]:
     row: dict[str, object] = {
         "schema": "motionbricks-contact-rough-pilot/v1",
@@ -864,6 +1337,12 @@ def _build_one(
                 extras,
                 adapter=adapter,
                 target_mesh=field.index,
+                pelvis_planar_smoothing_sigma_frames=(
+                    pelvis_planar_smoothing_sigma_frames
+                ),
+                allow_partial_rigid_support=(
+                    profile in CHALLENGING_PROFILES
+                ),
             )
         )
         row["foothold_planning"] = foothold_planning
@@ -890,6 +1369,21 @@ def _build_one(
             # caused the kick/shuffle artifact is no longer present.
         )
         row["sole_refit"] = refit
+        motion, extras, stance_reach_repair = (
+            _repair_stance_reach_with_root_lowering(
+                motion,
+                extras,
+                adapter=adapter,
+            )
+        )
+        row["stance_reach_pelvis_lowering"] = stance_reach_repair
+        if stance_reach_repair["applied"]:
+            refit = {
+                **refit,
+                "maximum_sole_target_error_m": float(
+                    stance_reach_repair["final_maximum_stance_error_m"]
+                ),
+            }
         if (
             refit["maximum_sole_target_error_m"] > 0.005
             or refit["maximum_joint_step_rad"] > 0.20
@@ -1003,7 +1497,7 @@ def _build_one(
         for _pass in range(3):
             if _retimed_motion_metrics(motion)["maximum_joint_step_rad"] <= 0.18:
                 break
-            motion, extras, subdivision = _adaptively_subdivide_motion_steps(
+            motion, extras, subdivision = _smoothly_subdivide_motion_steps(
                 motion, extras, target_joint_step_rad=0.14
             )
             motion, extras, subdivision_refit = _refit_motion_to_sole_targets(
@@ -1030,6 +1524,28 @@ def _build_one(
             ground_fallback_height_m=0.0,
         )
         row["stance_contact_audit"] = contact
+        partial_contact = _audit_partial_rigid_support_contact(
+            motion,
+            extras,
+            adapter=adapter,
+            target_mesh=field.index,
+        )
+        if bool(partial_contact["applicable"]):
+            partial_contact["maximum_stance_run_drift_m"] = float(
+                contact["maximum_stance_run_drift_m"]
+            )
+            partial_contact["accepted"] = bool(
+                partial_contact["accepted"]
+                and float(contact["maximum_stance_run_drift_m"]) <= 0.012
+            )
+        row["partial_rigid_support_contact_audit"] = partial_contact
+        contact_accepted = bool(
+            contact["accepted"]
+            or (
+                partial_contact["applicable"]
+                and partial_contact["accepted"]
+            )
+        )
         motion_metrics = _retimed_motion_metrics(motion)
         row["motion_metrics"] = motion_metrics
         if (
@@ -1054,7 +1570,7 @@ def _build_one(
         row["upper_limb_accepted"] = _final_upper_limb_accepted(upper_limb)
         if not row["upper_limb_accepted"]:
             raise ValueError("rough-terrain motion failed upper-limb energy gate")
-        if not bool(contact["accepted"]):
+        if not contact_accepted:
             debug_path = destination / "rejected_final_contact_debug.npz"
             _save_motion(
                 debug_path,
@@ -1119,6 +1635,9 @@ def build(arguments: argparse.Namespace) -> dict[str, object]:
                 minimum_stance_run_frames=arguments.minimum_stance_run_frames,
                 maximum_stance_gap_frames=arguments.maximum_stance_gap_frames,
                 maximum_stance_speed_mps=arguments.maximum_stance_speed_mps,
+                pelvis_planar_smoothing_sigma_frames=(
+                    arguments.pelvis_planar_smoothing_sigma_frames
+                ),
             )
             rows.append(row)
             print(
@@ -1155,6 +1674,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--minimum-stance-run-frames", type=int, default=5)
     parser.add_argument("--maximum-stance-gap-frames", type=int, default=1)
     parser.add_argument("--maximum-stance-speed-mps", type=float, default=0.05)
+    parser.add_argument(
+        "--pelvis-planar-smoothing-sigma-frames", type=float, default=2.0
+    )
     return parser
 
 
@@ -1165,6 +1687,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--terrain-spacing-m must be positive")
     if arguments.temporal_scale < 1.0:
         parser.error("--temporal-scale must be at least one")
+    if arguments.pelvis_planar_smoothing_sigma_frames < 0.0:
+        parser.error("--pelvis-planar-smoothing-sigma-frames must be nonnegative")
     if not 0.0 <= arguments.arm_swing_scale <= 1.0:
         parser.error("--arm-swing-scale must lie in [0,1]")
     if not 0.0 <= arguments.wrist_swing_scale <= 1.0:

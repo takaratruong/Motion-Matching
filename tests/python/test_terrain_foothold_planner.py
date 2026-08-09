@@ -526,12 +526,60 @@ class TerrainFootholdPlannerTests(unittest.TestCase):
             terrain,
             (intent,),
             np.full(8, 0.78),
-            config=_fixed_config(maximum_vertical_adjustment_m=0.30),
+            config=_fixed_config(
+                maximum_vertical_adjustment_m=0.30,
+                allow_partial_rigid_support=True,
+            ),
         )
 
         self.assertFalse(result.accepted)
         counts = dict(result.diagnostics.foothold_searches[-1].rejection_counts)
         self.assertEqual(counts.get("surface_too_steep"), 1)
+
+    def test_partial_rigid_support_accepts_spatially_stable_rough_contacts(self):
+        terrain = _heightfield_index(
+            lambda x, y: (
+                0.008
+                * np.cos(np.pi * x / 0.09)
+                * np.cos(np.pi * y / 0.05)
+            ),
+            lower=-0.30,
+            upper=0.30,
+            spacing=0.01,
+        )
+        intent = FootholdIntent(
+            StanceSpan(0, 0, 8), _flat_sole_pose((0.0, 0.0))
+        )
+        strict = plan_terrain_footholds(
+            terrain,
+            (intent,),
+            np.full(8, 0.78),
+            config=_fixed_config(),
+        )
+        self.assertFalse(strict.accepted)
+
+        partial = plan_terrain_footholds(
+            terrain,
+            (intent,),
+            np.full(8, 0.78),
+            config=_fixed_config(allow_partial_rigid_support=True),
+        )
+
+        self.assertTrue(partial.accepted, partial.diagnostics.message)
+        assert partial.plan is not None
+        foothold = partial.plan.footholds[0]
+        self.assertTrue(foothold.diagnostics.partial_rigid_support)
+        self.assertGreaterEqual(
+            foothold.diagnostics.support_contact_point_count, 3
+        )
+        self.assertIsNotNone(foothold.sole_support_contact_mask)
+        self.assertEqual(
+            int(np.count_nonzero(foothold.sole_support_contact_mask)),
+            foothold.diagnostics.support_contact_point_count,
+        )
+        self.assertLessEqual(
+            foothold.diagnostics.maximum_surface_residual_m, 0.030
+        )
 
     def test_bounded_search_moves_a_full_footprint_off_an_edge(self):
         terrain = _quad_mesh(((-0.5, 0.5, -0.25, 0.25, 0.0),))

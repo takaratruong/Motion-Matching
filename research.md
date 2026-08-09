@@ -2045,9 +2045,10 @@ native registered GRAIL stair primitives (or genuine lateral gait refitted to
 explicit stair footholds); flat MotionBricks gait is not forced through a
 riser.  Continuous slopes and rough ground use a source-clean MotionBricks gait
 with one rigid full-sole foothold per detected plant, a sequence-consistent
-pelvis path, stance-only IK, swing clearance, and exact mesh re-audit.  This
-preserves a natural learned swing rather than synthesizing one from root
-warping.
+pelvis path, learned swing-arc transplantation between consecutive footholds,
+whole-leg IK, and exact mesh re-audit.  Later pelvis-clearance repairs constrain
+only stance.  This preserves a natural learned swing rather than synthesizing
+one from root warping or chasing the obsolete flat-world flight target.
 
 Two implementation defects found during this reset materially affected visible
 motion.  First, pairwise foothold continuity did not cover a short plant nested
@@ -2081,3 +2082,59 @@ stance drift, and 0.137 rad maximum final joint step.  This is a method canary,
 not HCT-scale coverage.  Discrete-obstacle, harder rough-terrain, and
 omnidirectional coverage remains open until those variants pass the same visual
 review.
+
+Pelvis-anchor changes are now inertialized across support exchange instead of
+applying the active-stance mean as a one-frame velocity change.  The clean
+forward regression `sourceclean_v51_forward_cambered_inertialized` retains the
+natural v46 gait while reducing maximum stance error from 6.85 mm to 0.49 mm
+and stance-run drift from 6.28 mm to 0.12 mm; exact foot penetration remains
+2.02 mm with zero forbidden-body penetration.  Full-sequence and dense
+lower-body review admit it as the stronger method canary.
+
+The harder oblique-mogul probe exposed a separate interpolation defect.  The
+old adaptive helper inserted frames only inside a large IK interval, abruptly
+changing root speed at either end of that interval.  It has been replaced by
+a Gaussian time-density envelope that eases into and out of each locally
+slowed transition while interpolating the same root, pose, and command curves.
+On `lowrepair_v52_oblique_moguls_eased`, maximum root acceleration falls from
+35.96 to 6.21 m/s^2 and the final joint step is 0.138 rad.  That clip remains
+outside the accepted bank because its landing-foot target error/drift is still
+18.18/16.79 mm; visual review and a smaller pelvis-inertialization sweep are in
+progress rather than weakening the contact requirement.
+
+Reducing the pelvis-anchor Gaussian from two frames to one resolves that
+landing without restoring the velocity impulse.  The resulting
+`lowrepair_v56_oblique_moguls_sigma1` is the first accepted non-forward
+generated rough-terrain canary after the reset.  Moving frames have a 32.5
+degree median robot-local travel angle, yet the learned alternating gait stays
+visually coherent through the entire mogul passage.  Exact penetration is
+4.68 mm with zero forbidden-body penetration; stance target error/drift are
+9.26/8.58 mm, maximum root acceleration is 10.01 m/s^2, and maximum joint step
+is 0.140 rad.  Dense full-sequence and critical-frame review found no visible
+kick/shuffle, burial, hover, stance skate, pelvis jolt, or excessive hand swing.
+
+The first HCT-style coarse-ground attempt exposed two distinct support cases
+that must not be conflated.  A rigid foot bridging a shallow trough is allowed
+to rest on a spatially separated subset of its real G1 sole spheres; those
+selected probes now define the IK objective, while every unselected corner
+remains in the exact collision audit.  The simultaneously trailing full-sole
+plant still missed its target because the geometry-only pelvis corridor chose
+a pose about 2--3 cm too high for the exact G1 leg Jacobian.  A bounded
+per-frame sweep confirmed that lowering the pelvis by 20 mm reduced the bad
+frame from 23.1 to 9.8 mm without disturbing the new support.  The production
+repair turns the measured stance residual into a smooth corridor-bounded
+lowering envelope, carries the authored swing with the body, replants the
+unchanged support probes, and reruns exact collision/contact gates.
+
+`lowrepair_v63_oblique_hct_reach_lowered` is the first accepted HCT-style
+coarse rough-ground canary.  Its median moving robot-local travel angle is
+34.1 degrees from facing.  The smooth reach repair lowers the pelvis by at
+most 31.2 mm with a 3.12 mm maximum per-frame change and reduces maximum stance
+target error from 36.2 to 5.88 mm before final processing.  Final exact foot
+penetration is 2.65 mm with zero forbidden-body penetration; stance target
+error/drift are 5.37/3.66 mm, maximum root acceleration is 8.43 m/s^2, maximum
+joint step is 0.140 rad, and arm/wrist excursion remain 0.145/0.051 rad.  Dense
+review of the full 6.64-second sequence and four full-rate critical windows
+found no kick/shuffle, foot burial, hover, stance skate, snap, pelvis jolt, or
+excessive hand swing.  This is a validated method canary, not yet broad HCT
+terrain or omnidirectional coverage.

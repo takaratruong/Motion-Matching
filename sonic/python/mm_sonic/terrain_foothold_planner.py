@@ -22,6 +22,7 @@ import time
 from typing import Protocol, Sequence
 
 import numpy as np
+from scipy.spatial import ConvexHull, QhullError
 
 from mm_sonic.joints import ContractError
 
@@ -112,6 +113,10 @@ class TerrainFootholdPlannerConfig:
     maximum_yaw_change_rad: float = math.radians(7.5)
     maximum_pelvis_planar_adjustment_step_m: float = 0.015
     foothold_sequence_smoothing_weight: float = 4.0
+    allow_partial_rigid_support: bool = False
+    maximum_partial_support_gap_m: float = 0.030
+    minimum_partial_support_point_count: int = 3
+    minimum_partial_support_span_m: float = 0.060
 
     def __post_init__(self) -> None:
         nonnegative = (
@@ -131,6 +136,8 @@ class TerrainFootholdPlannerConfig:
             self.maximum_yaw_change_rad,
             self.foothold_sequence_smoothing_weight,
             self.pelvis_smoothing_weight,
+            self.maximum_partial_support_gap_m,
+            self.minimum_partial_support_span_m,
         )
         if not all(math.isfinite(value) and value >= 0.0 for value in nonnegative):
             raise ContractError("planner limits must be finite and nonnegative")
@@ -153,11 +160,14 @@ class TerrainFootholdPlannerConfig:
                 self.lateral_samples,
                 self.yaw_samples,
                 self.pelvis_smoothing_iterations,
+                self.minimum_partial_support_point_count,
             )
         ):
             raise ContractError("planner sample and iteration counts must be positive")
         if type(self.require_alternating_feet) is not bool:
             raise ContractError("require_alternating_feet must be bool")
+        if type(self.allow_partial_rigid_support) is not bool:
+            raise ContractError("allow_partial_rigid_support must be bool")
 
 
 @dataclass(frozen=True)
@@ -175,6 +185,8 @@ class FootholdSearchDiagnostics:
     surface_slope_rad: float | None
     maximum_surface_residual_m: float | None
     maximum_normal_spread_rad: float | None
+    partial_rigid_support: bool | None = None
+    support_contact_point_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -189,6 +201,7 @@ class PlannedFoothold:
     rotation_world_from_nominal: np.ndarray
     translation_world: np.ndarray
     diagnostics: FootholdSearchDiagnostics
+    sole_support_contact_mask: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.intent, FootholdIntent):
@@ -221,6 +234,16 @@ class PlannedFoothold:
         object.__setattr__(self, "surface_normal_world", _readonly(normal / normal_norm))
         object.__setattr__(self, "rotation_world_from_nominal", _readonly(rotation))
         object.__setattr__(self, "translation_world", _readonly(translation))
+        contact = self.sole_support_contact_mask
+        if contact is not None:
+            contact_array = np.asarray(contact, dtype=bool)
+            if contact_array.shape != (len(support),) or not np.any(contact_array):
+                raise ContractError(
+                    "sole_support_contact_mask must select support points"
+                )
+            object.__setattr__(
+                self, "sole_support_contact_mask", _readonly(contact_array)
+            )
 
     def transform_points(self, points_world: object) -> np.ndarray:
         """Apply this accepted rigid edit to sphere centres or foot hulls."""
@@ -349,6 +372,9 @@ class _Candidate:
     rotation: np.ndarray
     translation: np.ndarray
     cost: float
+    partial_rigid_support: bool
+    support_contact_point_count: int
+    support_contact_mask: np.ndarray
 
 
 @dataclass
@@ -508,6 +534,108 @@ def _fit_plane(points_world: object) -> _Plane:
     )
 
 
+def _support_points_are_spatially_stable(
+    points_xy: np.ndarray,
+    *,
+    minimum_count: int,
+    minimum_span_m: float,
+) -> bool:
+    """Require several separated terrain contacts, not one high spike."""
+
+    points = np.asarray(points_xy, dtype=np.float64)
+    if len(points) < int(minimum_count):
+        return False
+    difference = points[:, None, :] - points[None, :, :]
+    if float(np.max(np.linalg.norm(difference, axis=2))) < float(minimum_span_m):
+        return False
+    # Three nominal contacts all lying on one tiny edge are not a stable foot
+    # support set.  Require two-dimensional spread when three or more points
+    # are requested; the tolerance is deliberately small relative to a G1 sole.
+    if int(minimum_count) >= 3:
+        centred = points - np.mean(points, axis=0)
+        singular = np.linalg.svd(centred, compute_uv=False)
+        if len(singular) < 2 or float(singular[1]) < 0.005:
+            return False
+    return True
+
+
+def _upper_rigid_support_plane(
+    surface_points_world: np.ndarray,
+    *,
+    config: TerrainFootholdPlannerConfig,
+) -> tuple[_Plane, int] | None:
+    """Find a nonpenetrating rigid plane supported by rough terrain.
+
+    A real rigid sole on coarse ground does not conform to every height sample;
+    it rests on an upper supporting facet.  The upper 3-D convex hull gives the
+    finite set of such planes.  We retain only gently oriented planes that keep
+    the entire footprint above the terrain, have a bounded unsupported gap,
+    and touch at least three spatially separated samples.  This mode is never
+    used for stairs or ledges unless explicitly enabled by the caller.
+    """
+
+    points = np.asarray(surface_points_world, dtype=np.float64)
+    if points.ndim != 2 or points.shape[0] < 4 or points.shape[1:] != (3,):
+        return None
+    try:
+        hull = ConvexHull(points)
+    except QhullError:
+        return None
+    candidates: list[tuple[tuple[float, ...], _Plane, int]] = []
+    for equation in np.asarray(hull.equations, dtype=np.float64):
+        normal = equation[:3]
+        offset = float(equation[3])
+        if float(normal[2]) <= 1.0e-9:
+            continue
+        coefficients = np.asarray(
+            (-normal[0] / normal[2], -normal[1] / normal[2], -offset / normal[2]),
+            dtype=np.float64,
+        )
+        upward = np.asarray(
+            (-coefficients[0], -coefficients[1], 1.0), dtype=np.float64
+        )
+        upward /= np.linalg.norm(upward)
+        slope = math.acos(float(np.clip(upward[2], -1.0, 1.0)))
+        if slope > config.maximum_surface_slope_rad:
+            continue
+        predicted = (
+            points[:, 0] * coefficients[0]
+            + points[:, 1] * coefficients[1]
+            + coefficients[2]
+        )
+        gap = predicted - points[:, 2]
+        if float(np.min(gap)) < -1.0e-7:
+            continue
+        maximum_gap = float(np.max(gap))
+        if maximum_gap > config.maximum_partial_support_gap_m:
+            continue
+        contact = gap <= config.support_height_tolerance_m
+        contact_count = int(np.count_nonzero(contact))
+        if not _support_points_are_spatially_stable(
+            points[contact, :2],
+            minimum_count=config.minimum_partial_support_point_count,
+            minimum_span_m=config.minimum_partial_support_span_m,
+        ):
+            continue
+        plane = _Plane(
+            coefficients=_readonly(coefficients),
+            normal_world=_readonly(upward),
+            maximum_residual_m=maximum_gap,
+        )
+        rank = (
+            float(np.mean(gap)),
+            maximum_gap,
+            slope,
+            float(coefficients[0]),
+            float(coefficients[1]),
+        )
+        candidates.append((rank, plane, contact_count))
+    if not candidates:
+        return None
+    _rank, plane, contact_count = min(candidates, key=lambda value: value[0])
+    return plane, contact_count
+
+
 def _basis_from_plane(normal_world: np.ndarray, yaw_rad: float) -> np.ndarray:
     normal = np.array(normal_world, dtype=np.float64, copy=True)
     normal /= np.linalg.norm(normal)
@@ -625,13 +753,32 @@ def _evaluate_candidate(
     surface_points, surface_normals = sampled
     surface_plane = _fit_plane(surface_points)
     slope = math.acos(float(np.clip(surface_plane.normal_world[2], -1.0, 1.0)))
-    if slope > config.maximum_surface_slope_rad:
-        return None, "surface_too_steep"
     normal_spread = _normal_spread(surface_normals, surface_plane.normal_world)
-    if normal_spread > config.maximum_surface_normal_spread_rad:
-        return None, "surface_normal_discontinuity"
-    if surface_plane.maximum_residual_m > config.maximum_surface_plane_residual_m:
-        return None, "surface_not_planar"
+    exact_planar_support = bool(
+        slope <= config.maximum_surface_slope_rad
+        and normal_spread <= config.maximum_surface_normal_spread_rad
+        and surface_plane.maximum_residual_m
+        <= config.maximum_surface_plane_residual_m
+    )
+    partial_support = False
+    support_contact_count = len(surface_points)
+    if not exact_planar_support:
+        partial = (
+            _upper_rigid_support_plane(surface_points, config=config)
+            if config.allow_partial_rigid_support
+            else None
+        )
+        if partial is None:
+            if slope > config.maximum_surface_slope_rad:
+                return None, "surface_too_steep"
+            if normal_spread > config.maximum_surface_normal_spread_rad:
+                return None, "surface_normal_discontinuity"
+            return None, "surface_not_planar"
+        surface_plane, support_contact_count = partial
+        slope = math.acos(
+            float(np.clip(surface_plane.normal_world[2], -1.0, 1.0))
+        )
+        partial_support = True
 
     target_basis = _basis_from_plane(
         surface_plane.normal_world,
@@ -675,16 +822,36 @@ def _evaluate_candidate(
     penetration = final_surface[:, 2] - validation_target[:, 2]
     if float(np.max(penetration)) > config.collision_clearance_m:
         return None, "sole_penetration"
-    if float(np.max(support_gap)) > config.support_height_tolerance_m:
-        return None, "unsupported_footprint"
     final_normal_spread = _normal_spread(final_normals, surface_plane.normal_world)
-    if final_normal_spread > config.maximum_surface_normal_spread_rad:
-        return None, "surface_normal_discontinuity"
-    final_residual = float(
-        np.max(np.abs(final_surface[:, 2] - validation_target[:, 2]))
-    )
-    if final_residual > config.maximum_surface_plane_residual_m:
-        return None, "surface_not_planar"
+    contact = np.ones(len(target_support), dtype=bool)
+    if partial_support:
+        dense_gap = target_dense[:, 2] - final_surface[: len(target_dense), 2]
+        if float(np.max(dense_gap)) > config.maximum_partial_support_gap_m:
+            return None, "partial_support_gap_too_large"
+        # The G1 collision model carries four sole spheres.  A high point in
+        # the footprint interior is not a physical contact if none of those
+        # probes reaches it, even though the rendered sole plate spans it.
+        # Require the stable subset on the actual rigidly transformed probes.
+        probe_gap = target_support[:, 2] - final_surface[len(target_dense) :, 2]
+        contact = probe_gap <= config.support_height_tolerance_m
+        support_contact_count = int(np.count_nonzero(contact))
+        if not _support_points_are_spatially_stable(
+            target_support[contact, :2],
+            minimum_count=config.minimum_partial_support_point_count,
+            minimum_span_m=config.minimum_partial_support_span_m,
+        ):
+            return None, "partial_support_is_unstable"
+        final_residual = float(np.max(dense_gap))
+    else:
+        if float(np.max(support_gap)) > config.support_height_tolerance_m:
+            return None, "unsupported_footprint"
+        if final_normal_spread > config.maximum_surface_normal_spread_rad:
+            return None, "surface_normal_discontinuity"
+        final_residual = float(
+            np.max(np.abs(final_surface[:, 2] - validation_target[:, 2]))
+        )
+        if final_residual > config.maximum_surface_plane_residual_m:
+            return None, "surface_not_planar"
     if pose.collision_envelope_points_world is not None:
         envelope = (
             np.asarray(pose.collision_envelope_points_world, dtype=np.float64)
@@ -713,7 +880,18 @@ def _evaluate_candidate(
         + _normalized_square(
             vertical_adjustment, config.maximum_vertical_adjustment_m
         )
-        + (final_residual / max(config.maximum_surface_plane_residual_m, 1.0e-9)) ** 2
+        + (
+            final_residual
+            / max(
+                (
+                    config.maximum_partial_support_gap_m
+                    if partial_support
+                    else config.maximum_surface_plane_residual_m
+                ),
+                1.0e-9,
+            )
+        )
+        ** 2
         + (slope / max(config.maximum_surface_slope_rad, 1.0e-9)) ** 2
     )
     return (
@@ -732,6 +910,9 @@ def _evaluate_candidate(
             rotation=rotation,
             translation=translation,
             cost=float(cost),
+            partial_rigid_support=partial_support,
+            support_contact_point_count=support_contact_count,
+            support_contact_mask=np.asarray(contact, dtype=bool),
         ),
         "accepted",
     )
@@ -832,6 +1013,10 @@ def _plan_one_foothold(
                         maximum_normal_spread_rad=(
                             candidate.maximum_normal_spread_rad
                         ),
+                        partial_rigid_support=candidate.partial_rigid_support,
+                        support_contact_point_count=(
+                            candidate.support_contact_point_count
+                        ),
                     )
                     return (
                         PlannedFoothold(
@@ -847,6 +1032,9 @@ def _plan_one_foothold(
                             rotation_world_from_nominal=candidate.rotation,
                             translation_world=candidate.translation,
                             diagnostics=diagnostics,
+                            sole_support_contact_mask=(
+                                candidate.support_contact_mask
+                            ),
                         ),
                         diagnostics,
                     )
@@ -879,6 +1067,8 @@ def _plan_one_foothold(
         surface_slope_rad=best.slope_rad,
         maximum_surface_residual_m=best.maximum_surface_residual_m,
         maximum_normal_spread_rad=best.maximum_normal_spread_rad,
+        partial_rigid_support=best.partial_rigid_support,
+        support_contact_point_count=best.support_contact_point_count,
     )
     return (
         PlannedFoothold(
@@ -890,6 +1080,7 @@ def _plan_one_foothold(
             rotation_world_from_nominal=best.rotation,
             translation_world=best.translation,
             diagnostics=diagnostics,
+            sole_support_contact_mask=best.support_contact_mask,
         ),
         diagnostics,
     )
@@ -969,6 +1160,12 @@ def _search_diagnostics(
         maximum_normal_spread_rad=(
             None if selected is None else selected.maximum_normal_spread_rad
         ),
+        partial_rigid_support=(
+            None if selected is None else selected.partial_rigid_support
+        ),
+        support_contact_point_count=(
+            None if selected is None else selected.support_contact_point_count
+        ),
     )
 
 
@@ -986,6 +1183,7 @@ def _planned_foothold(
         rotation_world_from_nominal=candidate.rotation,
         translation_world=candidate.translation,
         diagnostics=diagnostics,
+        sole_support_contact_mask=candidate.support_contact_mask,
     )
 
 
