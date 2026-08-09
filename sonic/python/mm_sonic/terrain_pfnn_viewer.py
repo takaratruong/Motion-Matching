@@ -17,6 +17,10 @@ from .gear_action import isaaclab_to_mujoco_joint_vector
 from .train_classic_g1_pfnn import load_classic_checkpoint
 from .terrain_pfnn.hill_map import TerrainPFNNHillMap
 from .terrain_pfnn.kinematics import TorchG1ForwardKinematics
+from .terrain_pfnn.pfnn_surface import (
+    PlacedPFNNSurface,
+    load_placed_pfnn_surface,
+)
 from .terrain_pfnn.runtime import FPS, TerrainPFNNRuntime, TerrainSample
 
 
@@ -47,6 +51,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--scene-xml", type=Path, default=DEFAULT_SCENE)
     parser.add_argument("--idle-clips", type=Path, default=DEFAULT_IDLE_CLIPS)
+    parser.add_argument("--terrain-fit", type=Path)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--speed", type=float, default=0.8)
     parser.add_argument("--max-steps", type=int, default=1_000_000)
@@ -97,6 +102,78 @@ class _HillTerrainCallback:
         return np.asarray(heights, dtype=np.float64)
 
 
+class _PFNNTerrainCallback:
+    """One exact placed PFNN height function shared by runtime and mesh."""
+
+    def __init__(
+        self,
+        surface: PlacedPFNNSurface,
+        *,
+        x_samples: np.ndarray,
+        y_samples: np.ndarray,
+    ) -> None:
+        if not isinstance(surface, PlacedPFNNSurface):
+            raise TypeError("surface must be a PlacedPFNNSurface")
+        x = np.asarray(x_samples, dtype=np.float64)
+        y = np.asarray(y_samples, dtype=np.float64)
+        if (
+            x.ndim != 1
+            or y.ndim != 1
+            or min(len(x), len(y)) < 2
+            or not np.isfinite(x).all()
+            or not np.isfinite(y).all()
+            or np.any(np.diff(x) <= 0.0)
+            or np.any(np.diff(y) <= 0.0)
+        ):
+            raise ValueError("PFNN terrain mesh axes must be finite and increasing")
+        self.surface = surface
+        self.x_min, self.x_max = float(x[0]), float(x[-1])
+        self.y_min, self.y_max = float(y[0]), float(y[-1])
+        grid_x, grid_y = np.meshgrid(x, y, indexing="xy")
+        xy = np.stack((grid_x, grid_y), axis=-1)
+        self.vertices = np.column_stack(
+            (xy.reshape(-1, 2), surface.height_at(xy).reshape(-1))
+        )
+        faces: list[tuple[int, int, int]] = []
+        columns = len(x)
+        for row in range(len(y) - 1):
+            for column in range(columns - 1):
+                lower_left = row * columns + column
+                lower_right = lower_left + 1
+                upper_left = lower_left + columns
+                upper_right = upper_left + 1
+                faces.append((lower_left, lower_right, upper_right))
+                faces.append((lower_left, upper_right, upper_left))
+        self.faces = np.asarray(faces, dtype=np.int32)
+
+    def _supported(self, points: np.ndarray) -> bool:
+        return bool(
+            np.all(points[..., 0] >= self.x_min)
+            and np.all(points[..., 0] <= self.x_max)
+            and np.all(points[..., 1] >= self.y_min)
+            and np.all(points[..., 1] <= self.y_max)
+        )
+
+    def __call__(self, xy: object) -> TerrainSample | None:
+        point = np.asarray(xy, dtype=np.float64)
+        if point.shape != (2,) or not np.isfinite(point).all() or not self._supported(point):
+            return None
+        height = float(self.surface.height_at(point[None, :])[0])
+        gradient = self.surface.gradient_at(point[None, :])[0]
+        return TerrainSample(height, gradient)
+
+    def collision_heights_at(self, xy: object) -> np.ndarray:
+        points = np.asarray(xy, dtype=np.float64)
+        if (
+            points.ndim != 2
+            or points.shape[1] != 2
+            or not np.isfinite(points).all()
+            or not self._supported(points)
+        ):
+            raise ValueError("collision query left the rendered PFNN surface")
+        return self.surface.height_at(points)
+
+
 def _viewer_terrain_map() -> TerrainPFNNHillMap:
     """Build a wide extrusion so steering mistakes remain on queried terrain."""
 
@@ -137,6 +214,10 @@ def _validate(arguments: argparse.Namespace) -> tuple[Path, Path, Path, Path, Pa
         )
     )
     missing = tuple(path for path in paths if not path.is_file())
+    if arguments.terrain_fit is not None:
+        terrain_fit = Path(arguments.terrain_fit).expanduser().resolve()
+        if not terrain_fit.is_file():
+            missing = (*missing, terrain_fit)
     if missing:
         raise FileNotFoundError("missing PFNN viewer input: " + ", ".join(map(str, missing)))
     if not math.isfinite(arguments.speed) or arguments.speed <= 0.0:
@@ -178,7 +259,7 @@ def _motionbricks_idle_mujoco_qpos(path: Path) -> np.ndarray:
 
 
 def _build_scene(
-    scene_xml: Path, terrain: TerrainPFNNHillMap, idle_clips: Path
+    scene_xml: Path, terrain: object, idle_clips: Path
 ) -> tuple[object, object]:
     import mujoco
 
@@ -218,7 +299,7 @@ def _apply_frame(model: object, data: object, frame: object) -> None:
         )
 
 
-def _trace(step: int, frame: object, terrain: _HillTerrainCallback) -> str:
+def _trace(step: int, frame: object, terrain: object) -> str:
     sample = terrain(frame.root_position_world[:2])
     grade = float("nan") if sample is None else sample.absolute_grade_degrees
     diagnostics = frame.diagnostics
@@ -241,35 +322,55 @@ def _load_runtime(
     checkpoint: Path,
     dataset: Path,
     model_path: Path,
-    terrain: _HillTerrainCallback,
+    terrain: object,
+    *,
+    strict: bool = False,
 ) -> TerrainPFNNRuntime:
     manifest = json.loads(dataset.read_text(encoding="utf-8"))
-    digest = manifest.get("dataset_digest_sha256")
+    digest = manifest.get("dataset_sha256", manifest.get("dataset_digest_sha256"))
     if type(digest) is not str or len(digest) != 64:
         raise ValueError("dataset manifest digest is invalid")
     loaded = load_classic_checkpoint(checkpoint)
     if loaded.dataset_digest != digest:
         raise ValueError("classic PFNN checkpoint dataset digest mismatch")
+    released = getattr(loaded, "source_kind", None) == "released_pfnn"
+    if released and (
+        manifest.get("selection_sha256")
+        != loaded.vertical_slice_receipt_sha256
+        or manifest.get("terrain_receipt_set_sha256")
+        != loaded.terrain_receipt_set_sha256
+    ):
+        raise ValueError("classic PFNN source or terrain receipt mismatch")
     kinematics = TorchG1ForwardKinematics.from_mjcf(model_path)
     return TerrainPFNNRuntime(
         checkpoint=loaded,
         kinematics=kinematics,
         height_and_grade_at=terrain,
         device=arguments.device,
-        enforce_motion_envelope=False,
+        enforce_motion_envelope=strict,
         command_driven_root=False,
-        hold_idle_pose=True,
+        hold_idle_pose=not released,
     )
 
 
 def _run(arguments: argparse.Namespace) -> int:
     checkpoint, dataset, model_path, scene_xml, idle_clips = _validate(arguments)
-    terrain_map = _viewer_terrain_map()
-    terrain = _HillTerrainCallback(terrain_map)
+    if arguments.terrain_fit is None:
+        terrain_map = _viewer_terrain_map()
+        terrain = _HillTerrainCallback(terrain_map)
+        rendered_terrain = terrain_map
+    else:
+        surface = load_placed_pfnn_surface(arguments.terrain_fit)
+        terrain = _PFNNTerrainCallback(
+            surface,
+            x_samples=np.linspace(-6.0, 6.0, 321),
+            y_samples=np.linspace(-4.0, 4.0, 161),
+        )
+        rendered_terrain = terrain
     runtime = _load_runtime(
         arguments, checkpoint, dataset, model_path, terrain
     )
-    model, data = _build_scene(scene_xml, terrain_map, idle_clips)
+    model, data = _build_scene(scene_xml, rendered_terrain, idle_clips)
     import mujoco
 
     def advance(step: int, command: np.ndarray) -> object:

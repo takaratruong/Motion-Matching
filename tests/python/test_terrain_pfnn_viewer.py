@@ -11,8 +11,55 @@ from unittest import mock
 
 import numpy as np
 
+from mm_sonic.pfnn_terrain_fit import PFNNTerrainFit
+from mm_sonic.terrain_pfnn.pfnn_surface import PlacedPFNNSurface
+
 
 class TerrainPFNNViewerTests(unittest.TestCase):
+    def test_exact_pfnn_surface_drives_runtime_collision_and_render_mesh(self) -> None:
+        from mm_sonic.terrain_pfnn_viewer import _PFNNTerrainCallback
+
+        fit = PFNNTerrainFit(
+            patch=np.arange(16, dtype=np.float64).reshape(4, 4),
+            patch_coord=np.zeros(4),
+            contact_center_xz=np.zeros(2),
+            patch_height_mean=22.5,
+            stance_height_mean=100.0,
+            rbf_centers_xz=np.array([[-1.0, 0.0], [1.0, 0.0]]),
+            rbf_epsilon=np.array([0.5, 0.5]),
+            rbf_weights=np.array([[0.25, -0.25]]),
+            source_contacts=np.ones((8, 4), dtype=np.bool_),
+            source_start_frame=120,
+            source_frame_count=8,
+            cycle_start_frame=100,
+            cycle_stop_frame=200,
+            selected_patch_index=0,
+            fitting_error=0.0,
+            source_sha256="a" * 64,
+            patches_sha256="b" * 64,
+        )
+        surface = PlacedPFNNSurface(fit)
+        callback = _PFNNTerrainCallback(
+            surface,
+            x_samples=np.linspace(-0.25, 0.25, 7),
+            y_samples=np.linspace(-0.2, 0.2, 5),
+        )
+        np.testing.assert_allclose(
+            callback.vertices[:, 2],
+            callback.collision_heights_at(callback.vertices[:, :2]),
+            atol=1.0e-12,
+            rtol=0.0,
+        )
+        sample = callback(np.array([0.0, 0.0]))
+        self.assertIsNotNone(sample)
+        assert sample is not None
+        np.testing.assert_allclose(
+            sample.gradient_xy,
+            surface.gradient_at(np.array([[0.0, 0.0]]))[0],
+            atol=1.0e-12,
+            rtol=0.0,
+        )
+
     def test_viewer_loads_raw_pfnn_runtime(self) -> None:
         import mm_sonic.terrain_pfnn_viewer as viewer_module
         from mm_sonic.terrain_pfnn_viewer import _load_runtime, _parser
@@ -22,6 +69,9 @@ class TerrainPFNNViewerTests(unittest.TestCase):
         checkpoint = SimpleNamespace(
             dataset_digest="a" * 64,
             kinematic_signature_sha256="b" * 64,
+            source_kind="grail",
+            vertical_slice_receipt_sha256="0" * 64,
+            terrain_receipt_set_sha256="0" * 64,
         )
         kinematics = SimpleNamespace(kinematic_signature_sha256="b" * 64)
         with tempfile.TemporaryDirectory() as directory:
@@ -57,6 +107,50 @@ class TerrainPFNNViewerTests(unittest.TestCase):
         self.assertIs(factory.call_args.kwargs["enforce_motion_envelope"], False)
         self.assertIs(factory.call_args.kwargs["command_driven_root"], False)
         self.assertIs(factory.call_args.kwargs["hold_idle_pose"], True)
+
+    def test_vertical_runtime_requires_exact_source_and_terrain_receipts(self) -> None:
+        import json
+        import mm_sonic.terrain_pfnn_viewer as viewer_module
+        from mm_sonic.terrain_pfnn_viewer import _load_runtime, _parser
+
+        arguments = _parser().parse_args([])
+        checkpoint = SimpleNamespace(
+            dataset_digest="a" * 64,
+            kinematic_signature_sha256="b" * 64,
+            source_kind="released_pfnn",
+            vertical_slice_receipt_sha256="c" * 64,
+            terrain_receipt_set_sha256="d" * 64,
+        )
+        kinematics = SimpleNamespace(kinematic_signature_sha256="b" * 64)
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "dataset_sha256": "a" * 64,
+                        "selection_sha256": "c" * 64,
+                        "terrain_receipt_set_sha256": "d" * 64,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                viewer_module, "load_classic_checkpoint", return_value=checkpoint
+            ), mock.patch.object(
+                viewer_module.TorchG1ForwardKinematics,
+                "from_mjcf",
+                return_value=kinematics,
+            ), mock.patch.object(
+                viewer_module, "TerrainPFNNRuntime", return_value=object()
+            ) as factory:
+                _load_runtime(
+                    arguments,
+                    Path("checkpoint.pt"),
+                    manifest,
+                    Path("g1.xml"),
+                    object(),
+                )
+        self.assertIs(factory.call_args.kwargs["hold_idle_pose"], False)
 
     def test_defaults_select_the_classic_g1_artifacts(self) -> None:
         from mm_sonic.terrain_pfnn_viewer import _parser
