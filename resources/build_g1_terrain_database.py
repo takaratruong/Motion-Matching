@@ -51,7 +51,11 @@ from resources.g1_terrain_builder.sources import (
     load_takara,
 )
 from resources.g1_terrain_builder.resample import resample_map, resample_vectors
-from resources.g1_terrain_builder.schema import SourceClip
+from resources.g1_terrain_builder.schema import (
+    G1_SKELETON_SIGNATURE,
+    SourceClip,
+    require_canonical_g1_skeleton,
+)
 from resources.g1_terrain_builder.terrain import (
     FlatTerrain,
     GrailTerrain,
@@ -254,8 +258,9 @@ def _assemble_flat_candidate(args):
     kinematics = G1Kinematics(args.g1_xml)
     preliminary, skeleton, _ = convert_source_clip(
         source, kinematics, target_fps=60.0, root_filter_mode="nearest")
-    if len(skeleton.names) != 31 or len(preliminary.positions) != 4086:
-        raise ValueError("flat G1 skeleton must contain exactly 31 bones")
+    if len(preliminary.positions) != 4086:
+        raise ValueError("flat released-PFNN frame count changed")
+    require_canonical_g1_skeleton(skeleton, "flat released-PFNN skeleton")
     native_dofs = resample_vectors(source.qpos[:, 7:], source.fps, 60.0)
     native_steps = np.max(np.abs(np.diff(native_dofs, axis=0)), axis=1)
     local_steps = _maximum_local_rotation_steps(preliminary.rotations)
@@ -284,7 +289,7 @@ def _assemble_flat_candidate(args):
     reports = []
     ranges = []
     database_cursor = 0
-    expected_signature = skeleton.signature()
+    expected_signature = G1_SKELETON_SIGNATURE
     for output_start, output_stop in retained:
         first_source = int(full_left[output_start])
         last_source = int(full_right[output_stop - 1])
@@ -293,6 +298,8 @@ def _assemble_flat_candidate(args):
         clip, fragment_skeleton, report = finalize_clip(
             fragment, FlatTerrain(), kinematics, output_fps=60.0,
             root_filter_mode="nearest")
+        require_canonical_g1_skeleton(
+            fragment_skeleton, "flat continuity fragment skeleton")
         if fragment_skeleton.signature() != expected_signature \
                 or len(clip.positions) != output_stop - output_start:
             raise ValueError("flat continuity fragment conversion changed")
@@ -373,7 +380,7 @@ def _assemble_flat_candidate(args):
             "names": list(skeleton.names),
             "parents": skeleton.parents.tolist(),
             "basis": "holden-y-up-right-handed-forward-plus-z",
-            "signature": skeleton.signature(),
+            "signature": G1_SKELETON_SIGNATURE,
         },
         "ranges": ranges,
         "continuity": {

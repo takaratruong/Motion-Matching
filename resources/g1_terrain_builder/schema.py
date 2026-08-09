@@ -4,6 +4,31 @@ import json
 import numpy as np
 
 
+G1_SKELETON_NAMES = (
+    "Simulation", "Hips",
+    "LeftHipPitch", "LeftHipRoll", "LeftHipYaw", "LeftKnee",
+    "LeftAnkle", "LeftToe",
+    "RightHipPitch", "RightHipRoll", "RightHipYaw", "RightKnee",
+    "RightAnkle", "RightToe",
+    "Spine", "Spine1", "Spine2",
+    "LeftShoulderPitch", "LeftShoulderRoll", "LeftShoulderYaw",
+    "LeftElbow", "LeftWristRoll", "LeftWristPitch", "LeftWrist",
+    "RightShoulderPitch", "RightShoulderRoll", "RightShoulderYaw",
+    "RightElbow", "RightWristRoll", "RightWristPitch", "RightWrist",
+)
+G1_SKELETON_PARENTS = (
+    -1, 0,
+    1, 2, 3, 4, 5, 6,
+    1, 8, 9, 10, 11, 12,
+    1, 14, 15,
+    16, 17, 18, 19, 20, 21, 22,
+    16, 24, 25, 26, 27, 28, 29,
+)
+G1_SKELETON_SIGNATURE = (
+    "6138d9364b6f4178c25e2c1ac7039f3ce5fedf6b11a0b8375dea712633abd2e7"
+)
+
+
 @dataclass
 class SourceClip:
     name: str
@@ -35,6 +60,18 @@ class SkeletonSpec:
             separators=(",", ":"), sort_keys=True,
         ).encode()
         return hashlib.sha256(payload).hexdigest()
+
+
+def require_canonical_g1_skeleton(
+    skeleton: SkeletonSpec, label: str = "G1 skeleton",
+) -> None:
+    parents = np.asarray(skeleton.parents)
+    if tuple(skeleton.names) != G1_SKELETON_NAMES \
+            or parents.shape != (len(G1_SKELETON_PARENTS),) \
+            or tuple(parents.tolist()) != G1_SKELETON_PARENTS \
+            or skeleton.signature() != G1_SKELETON_SIGNATURE:
+        raise ValueError(
+            f"{label} does not match the canonical G1 skeleton")
 
 
 @dataclass

@@ -52,7 +52,14 @@ from resources.g1_terrain_builder.scenes import (
     select_grail_scene_bases,
 )
 from resources.g1_terrain_builder.resample import resample_map, resample_vectors
-from resources.g1_terrain_builder.schema import SourceClip
+from resources.g1_terrain_builder.schema import (
+    G1_SKELETON_NAMES,
+    G1_SKELETON_PARENTS,
+    G1_SKELETON_SIGNATURE,
+    SkeletonSpec,
+    SourceClip,
+    require_canonical_g1_skeleton,
+)
 from resources.g1_terrain_builder.sources import (
     load_grail,
     load_retarget_npz,
@@ -133,6 +140,30 @@ def _flat_continuity_plan(native_steps, local_steps):
             (int(start), int(stop))
             for start, stop in zip(starts[retained], stops[retained])),
     }
+
+
+def _validate_flat_skeleton_receipt(skeleton, database):
+    _require(type(skeleton) is dict and set(skeleton) == {
+        "names", "parents", "basis", "signature",
+    }, "flat skeleton receipt changed")
+    names = skeleton["names"]
+    parents = skeleton["parents"]
+    _require(type(names) is list
+             and all(type(name) is str and name for name in names)
+             and type(parents) is list
+             and all(type(parent) is int for parent in parents)
+             and parents == np.asarray(database.parents, np.int64).tolist()
+             and skeleton["basis"] ==
+             "holden-y-up-right-handed-forward-plus-z",
+             "flat skeleton dimensions/basis changed")
+    _require(tuple(names) == G1_SKELETON_NAMES
+             and tuple(parents) == G1_SKELETON_PARENTS,
+             "flat manifest does not match the canonical G1 skeleton")
+    candidate = SkeletonSpec(tuple(names), np.asarray(parents, np.int32))
+    require_canonical_g1_skeleton(candidate, "flat manifest skeleton")
+    _require(skeleton["signature"] == G1_SKELETON_SIGNATURE
+             and skeleton["signature"] == candidate.signature(),
+             "flat skeleton signature changed from canonical G1 skeleton")
 
 
 def _flat_source_fragment(source, first, last):
@@ -257,21 +288,7 @@ def _validate_flat_artifact_directory(root, manifest, source_options):
              "flat terrain feature rows must be authenticated exact zero")
 
     skeleton = manifest["skeleton"]
-    _require(type(skeleton) is dict and set(skeleton) == {
-        "names", "parents", "basis", "signature",
-    }, "flat skeleton receipt changed")
-    _require(type(skeleton["names"]) is list
-             and len(skeleton["names"]) == 31
-             and all(type(name) is str and name for name in skeleton["names"])
-             and type(skeleton["parents"]) is list
-             and all(type(parent) is int for parent in skeleton["parents"])
-             and skeleton["parents"] == database.parents.tolist()
-             and skeleton["basis"] ==
-             "holden-y-up-right-handed-forward-plus-z",
-             "flat skeleton dimensions/basis changed")
-    _require(_manifest_signature(
-        skeleton["names"], skeleton["parents"]) == skeleton["signature"],
-        "flat skeleton signature changed")
+    _validate_flat_skeleton_receipt(skeleton, database)
 
     source_keys = {
         "name", "terrain_id", "path", "sha256", "receipt_path",
@@ -328,6 +345,8 @@ def _validate_flat_artifact_directory(root, manifest, source_options):
         source, kinematics, 60.0, root_filter_mode="nearest")
     _require(preliminary_report["fk_max_error_m"] <= 1e-5,
              "flat full-source FK error exceeds 1e-5 m")
+    require_canonical_g1_skeleton(
+        rebuilt_skeleton, "flat independently rebuilt skeleton")
     _require(rebuilt_skeleton.signature() == skeleton["signature"],
              "flat independently rebuilt skeleton changed")
     native_qpos = resample_vectors(source.qpos[:, 7:], 120.0, 60.0)
@@ -474,6 +493,9 @@ def _validate_flat_artifact_directory(root, manifest, source_options):
         rebuilt, fragment_skeleton, report = convert_source_clip(
             fragment, kinematics, 60.0, root_filter_mode="nearest")
         start, stop = entry["start"], entry["stop"]
+        require_canonical_g1_skeleton(
+            fragment_skeleton,
+            f"flat range {index} independently rebuilt skeleton")
         _require(fragment_skeleton.signature() == skeleton["signature"]
                  and len(rebuilt.positions) == stop - start,
                  f"flat range {index} independent conversion changed")
@@ -673,26 +695,6 @@ EXPECTED_ADDED_ROUTE_BITS = {
         (0x3f1eb852, 0x40000000),
         (0x3f1eb852, 0x40c00000)),
 }
-G1_SKELETON_NAMES = (
-    "Simulation", "Hips",
-    "LeftHipPitch", "LeftHipRoll", "LeftHipYaw", "LeftKnee",
-    "LeftAnkle", "LeftToe",
-    "RightHipPitch", "RightHipRoll", "RightHipYaw", "RightKnee",
-    "RightAnkle", "RightToe",
-    "Spine", "Spine1", "Spine2",
-    "LeftShoulderPitch", "LeftShoulderRoll", "LeftShoulderYaw",
-    "LeftElbow", "LeftWristRoll", "LeftWristPitch", "LeftWrist",
-    "RightShoulderPitch", "RightShoulderRoll", "RightShoulderYaw",
-    "RightElbow", "RightWristRoll", "RightWristPitch", "RightWrist",
-)
-G1_SKELETON_PARENTS = (
-    -1, 0,
-    1, 2, 3, 4, 5, 6,
-    1, 8, 9, 10, 11, 12,
-    1, 14, 15,
-    16, 17, 18, 19, 20, 21, 22,
-    16, 24, 25, 26, 27, 28, 29,
-)
 _HEIGHTFIELD_HEADER = struct.Struct("<4sIII4f")
 _WALKABILITY_HEADER = struct.Struct("<4sIII")
 _HEX_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -1779,7 +1781,8 @@ def _validate_skeleton(manifest, database):
     signature = skeleton["signature"]
     _require(type(signature) is str and _HEX_SHA256.fullmatch(signature),
              "skeleton signature is invalid")
-    _require(signature == _manifest_signature(names, parents),
+    _require(signature == G1_SKELETON_SIGNATURE
+             and signature == _manifest_signature(names, parents),
              "skeleton signature does not match names and parents")
     _require(database.positions.shape[1] == FEATURE_DIMENSIONS,
              "database.bin bone count does not match the G1 skeleton")

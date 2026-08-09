@@ -30,6 +30,73 @@ PYTHON = "/home/ubuntu/miniconda3/envs/diffsim/bin/python"
 
 
 class BuildCliTests(unittest.TestCase):
+    @staticmethod
+    def _noncanonical_flat_skeletons():
+        reordered_names = list(validator.G1_SKELETON_NAMES)
+        reordered_names[2], reordered_names[3] = (
+            reordered_names[3], reordered_names[2])
+        reordered = SkeletonSpec(
+            tuple(reordered_names),
+            np.asarray(validator.G1_SKELETON_PARENTS, np.int32),
+        )
+        changed_parents = list(validator.G1_SKELETON_PARENTS)
+        changed_parents[3] = 1
+        reparented = SkeletonSpec(
+            tuple(validator.G1_SKELETON_NAMES),
+            np.asarray(changed_parents, np.int32),
+        )
+        return (("reordered", reordered), ("reparented", reparented))
+
+    def test_flat_builder_rejects_noncanonical_skeleton_order_and_topology(self):
+        args = SimpleNamespace(
+            output_fps=60.0,
+            retarget_npz="flat.npz",
+            retarget_receipt="flat.receipt.json",
+            g1_xml="g1.xml",
+        )
+        source = SimpleNamespace(
+            fps=120.0,
+            terrain_id="flat",
+            qpos=np.zeros((2, 36), np.float32),
+        )
+        preliminary = SimpleNamespace(
+            positions=np.zeros((4086, 31, 3), np.float32),
+        )
+        for name, skeleton in self._noncanonical_flat_skeletons():
+            with (
+                self.subTest(name=name),
+                mock.patch.object(builder, "_require_file"),
+                mock.patch.object(
+                    builder, "load_retarget_npz", return_value=source),
+                mock.patch.object(builder, "G1Kinematics"),
+                mock.patch.object(
+                    builder, "convert_source_clip",
+                    return_value=(preliminary, skeleton, {}),
+                ),
+                mock.patch.object(
+                    builder, "resample_vectors",
+                    side_effect=AssertionError(
+                        "builder continued past a noncanonical skeleton"),
+                ),
+                self.assertRaisesRegex(ValueError, "canonical G1 skeleton"),
+            ):
+                builder._assemble_flat_candidate(args)
+
+    def test_flat_validator_rejects_self_consistent_noncanonical_skeletons(self):
+        for name, skeleton in self._noncanonical_flat_skeletons():
+            receipt = {
+                "names": list(skeleton.names),
+                "parents": skeleton.parents.tolist(),
+                "basis": "holden-y-up-right-handed-forward-plus-z",
+                "signature": skeleton.signature(),
+            }
+            database = SimpleNamespace(parents=skeleton.parents.copy())
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(ValueError, "canonical G1 skeleton"),
+            ):
+                validator._validate_flat_skeleton_receipt(receipt, database)
+
     def test_v1_flat_manifest_is_rejected_before_tree_loading(self):
         with tempfile.TemporaryDirectory() as temporary:
             with open(

@@ -1,0 +1,296 @@
+# Task 1 report: 60 Hz G1 LMM flat data bundle
+
+## Outcome
+
+Implemented the receipt-bound, flat-only `g1-lmm-flat-data/v1` vertical slice.
+It publishes exactly three immutable files: `database.bin`, `features.bin`, and
+`manifest.json`. The real released-PFNN input produces one accepted 4,086-frame
+range at 60 Hz with the exact source map `0, 2, ..., 8170` and zero alpha.
+
+No GRAIL, slope, stair, scene, or runtime subsystem was added to this bundle.
+The pre-existing `g1-terrain-artifacts/v2` path remains supported and its
+integration tests pass.
+
+## TDD evidence
+
+Initial RED command:
+
+```text
+PYTHONPATH=. /home/ubuntu/miniconda3/envs/diffsim/bin/python -m unittest -v tests.python.test_resample tests.python.test_database_builder tests.python.test_build_cli tests.python.test_artifacts
+```
+
+Expected failures were observed for missing `resample_map`, missing
+`resources.g1_terrain_builder.features`, missing feature binary codecs, and
+unrecognized `--output-fps`, `--flat-only`, `--retarget-npz`, and
+`--retarget-receipt` arguments.
+
+During scoped self-review, a second RED test exposed incorrectly combined
+left/right foot normalization groups:
+
+```text
+AssertionError: np.float32(0.015587269) == np.float32(0.015587269)
+```
+
+The exporter was corrected to match the C++ group boundaries: each foot
+position and each foot velocity is normalized as its own 3D group. The focused
+test then passed.
+
+Fresh final GREEN command (same mandated command as RED):
+
+```text
+Ran 84 tests in 117.935s
+OK
+```
+
+Additional compatibility command:
+
+```text
+PYTHONPATH=. /home/ubuntu/miniconda3/envs/diffsim/bin/python -m unittest -v tests.python.test_kinematics tests.python.test_schema
+```
+
+Result: `Ran 11 tests ... OK`.
+
+`git diff --check` and Python byte-compilation of all changed builder modules
+also passed.
+
+## Implemented contracts
+
+- `resample_map` returns int32 left/right indices and float32 alpha, including
+  equal-index/zero-alpha exact samples.
+- The real Takara source has 34,863 frames at 50 Hz and maps to exactly 41,835
+  rows at 60 Hz.
+- The released-PFNN loader verifies the accepted receipt schema/status,
+  receipt-declared NPZ SHA-256, 120 Hz rate, 8,171 frames, joint-name receipt,
+  quaternion order, array shapes, and engine identity before creating qpos.
+- Simulation-root filters are rate-derived and bind 31/61 frames at 60 Hz;
+  contacts bind a 7-frame median; forward terrain sampling binds 121 rows.
+- The feature exporter reproduces the C++ ordering: ankle positions, ankle
+  velocities, hip velocity, 20/40/60 root positions, 20/40/60 facings, then
+  four authenticated zero flat-terrain deltas.
+- `features.bin` uses the Orange Duck little-endian layout: normalized float32
+  matrix, float32 offset vector, and strictly positive finite float32 scale
+  vector.
+- Publication is staged, validated before and under the parent lock, fsynced,
+  and atomically replaced. The validator rejects stale files, bad schemas,
+  rate/horizon/filter/skeleton/range/source-map changes, binary corruption,
+  nonzero flat terrain rows, and artifact size/hash mismatches.
+
+## Real bundle evidence
+
+Build command:
+
+```text
+PYTHONPATH=. /home/ubuntu/miniconda3/envs/diffsim/bin/python resources/build_g1_terrain_database.py --output-fps 60 --flat-only --retarget-npz sonic/runs/native-g1-pfnn/sample-retarget/LocomotionFlat01_000-120hz.npz --retarget-receipt sonic/runs/native-g1-pfnn/sample-retarget/LocomotionFlat01_000-120hz.receipt.json --output sonic/runs/g1-lmm-flat-60hz/data
+```
+
+Result:
+
+```text
+VALID g1-lmm-flat-data/v1 frames=4086 clips=1 bones=31 features=31 scenes=0 source_rows=0
+BUILT g1-lmm-flat-data/v1 frames=4086 clips=1 scenes=0 output=sonic/runs/g1-lmm-flat-60hz/data
+```
+
+Artifact evidence:
+
+| File | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `database.bin` | 6,594,988 | `0803c212e7692a98430a1fee56cf70d814834cffd1cb747cc61c2699cab0906b` |
+| `features.bin` | 506,928 | `767caf71bdb667a6f496ffe8f805ef4e82f64e3b9d1f9fd88188a5bef68141c5` |
+| `manifest.json` | 172,506 | `f1b757a1aedc86cacb88eddc35a014176dc0225050bd721eb8ec10b839386bc1` |
+
+Direct reload confirmed database shape `[4086,31,3]`, contacts `[4086,2]`,
+features `[4086,31]`, one range `[0,4086)`, 31 skeleton names, the canonical
+skeleton signature `6138d9364b6f4178c25e2c1ac7039f3ce5fedf6b11a0b8375dea712633abd2e7`,
+finite data, positive scales, exact zero feature values at indices 27-30, and
+manifest artifact digests/sizes equal to the published files.
+
+## Files changed
+
+- `resources/g1_terrain_builder/resample.py`
+- `resources/g1_terrain_builder/schema.py`
+- `resources/g1_terrain_builder/kinematics.py`
+- `resources/g1_terrain_builder/sources.py`
+- `resources/g1_terrain_builder/features.py`
+- `resources/g1_terrain_builder/artifacts.py`
+- `resources/build_g1_terrain_database.py`
+- `resources/validate_g1_terrain_database.py`
+- `tests/python/test_resample.py`
+- `tests/python/test_database_builder.py`
+- `tests/python/test_build_cli.py`
+- `tests/python/test_artifacts.py`
+
+## Concerns
+
+An independent reviewer dispatch was attempted but the four-agent thread limit
+was full. The parent agent will run the independent Task 1 review after this
+commit. No known implementation or bundle blocker remains.
+
+---
+
+## Review correction: continuity-safe flat bundle v2
+
+Review rejected the original v1 publication. The correction supersedes the
+v1 result above and publishes only `g1-lmm-flat-data/v2`.
+
+### Correction RED -> GREEN evidence
+
+The correction began with new failing tests for the native/local continuity
+union, the exact real v2 receipt, explicit v1 rejection, and publication-time
+source/receipt/validation re-authentication. RED failures included the missing
+`split_continuity_ranges` and `_authenticate_flat_manifest_inputs` interfaces,
+the real candidate still reporting v1/4,086 rows, and the v1 validator path not
+emitting the required v2 rejection.
+
+The first independently sliced implementation exposed a second real RED:
+
+```text
+maximum_admitted_local_rotation_step_rad:
+0.26562131888230156 != 0.23719475193867512
+```
+
+This was a Savitzky-Golay `interp` boundary overshoot in the Hips local
+rotation. The final fragment path uses endpoint-clamped `nearest` root filters,
+so each fragment is filtered without samples from across a rejected edge and
+the independently recomputed all-31-bone maximum is admitted.
+
+Fresh full scoped GREEN:
+
+```text
+PYTHONPATH=. /home/ubuntu/miniconda3/envs/diffsim/bin/python -m unittest -v \
+  tests.python.test_resample tests.python.test_database_builder \
+  tests.python.test_build_cli tests.python.test_artifacts
+
+Ran 88 tests in 126.750s
+OK
+```
+
+Python byte-compilation and `git diff --check` also passed. The Task 2 runtime
+consumer independently reported its strict v2 parser, both artifact/digest
+checks, continuity checks, 600-frame ordinary replay, and v1 plus four v2
+tamper rejections all green.
+
+### Corrected contracts
+
+- The 60 Hz continuity gate is the union of native 29-DoF absolute steps and
+  all-31-bone local quaternion geodesic steps strictly greater than 0.25 rad.
+- Counts independently recompute to 31 native rejections, 32 local rejections,
+  and 32 union rejections. Twenty short fragments totaling 233 frames are
+  dropped; 13 ranges totaling 3,853 frames are published. The longest range is
+  747 frames.
+- Every retained source fragment is independently converted, root-filtered,
+  differentiated, contact-filtered, and trajectory-clamped. No temporal
+  preprocessing crosses a rejected edge.
+- The continuity receipt is exactly `g1-lmm-continuity/v1`, including the
+  little-endian `[N,4]` range digest and concatenated left/right/alpha source-map
+  digest.
+- Publication and validation re-hash and reload the actual absolute NPZ and
+  receipt paths. The accepted receipt schema/status, hashes, exact source/map
+  fields, exact complete validation receipt, and FK maximum `<=1e-5 m` are
+  independently enforced.
+- The validator explicitly rejects v1, reconstructs each fragment from the
+  authenticated source, compares positions, rotations, derivatives, contacts,
+  and features, and recomputes the continuity plan, all-bone in-range maximum,
+  counts, and digests.
+
+### Corrected real bundle evidence
+
+The canonical build command is unchanged except that it now publishes v2. Its
+atomic candidate validator and a fresh standalone validator both reported:
+
+```text
+VALID g1-lmm-flat-data/v2 frames=3853 clips=1 bones=31 features=31 scenes=0 source_rows=8171
+BUILT g1-lmm-flat-data/v2 frames=3853 clips=1 scenes=0 output=sonic/runs/g1-lmm-flat-60hz/data
+```
+
+Corrected artifact evidence:
+
+| File | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `database.bin` | 6,219,022 | `b8c7a8b3c831974af2f986414b549986242a5518edbf40e0ea10f795cca3834c` |
+| `features.bin` | 478,036 | `64f145efadee0a08a93a58865a2771c384c092353df9317f0b494a2f8bfef26e` |
+| `manifest.json` | 166,719 | `05c8ac4c04771fb7f8380d75d64da812f7a299e5994734f15faccd107a105f1f` |
+
+Continuity evidence:
+
+```text
+maximum_admitted_native_step_rad = 0.2371947467327118
+maximum_admitted_local_rotation_step_rad = 0.23719477124427774
+range_digest_sha256 = dc8ecdb4052fea1e70321cc4100c70df25f43cc8b01ee8dd2e406b9d47732e52
+source_map_digest_sha256 = f114924ab2f2d7bbea1f2ec4e051dda0bb7388ce67c523ae9ecd4f181cf73c5b
+fk_max_error_m = 3.141193603136488e-07
+```
+
+No GRAIL, slopes, stairs, scene sidecars, or other subsystem was added. There
+are no known Task 1 correction concerns.
+
+Correction commit: `ae7faf64c4a147e0fa81fea66eeee10f623b51e1`.
+
+---
+
+## Review correction: canonical G1 skeleton authentication
+
+An independent cross-review found that the flat builder required only 31
+bones, while the flat validator authenticated a caller-selected XML, manifest,
+and database only against one another. A reordered or reparented 31-bone XML
+could therefore publish a self-consistent noncanonical bundle.
+
+The correction moves the immutable canonical G1 names, parent topology, and
+signature into the shared skeleton schema. The builder now requires that exact
+contract before continuity processing and for every retained fragment. The
+flat validator independently requires the exact manifest names, parents, and
+`6138d9364b6f4178c25e2c1ac7039f3ce5fedf6b11a0b8375dea712633abd2e7`
+signature, exact database parents, and the same exact skeleton from the
+full-source and per-fragment XML reconstructions.
+
+### RED -> GREEN evidence
+
+The two focused negatives use both a name reorder and a valid-looking changed
+parent topology. Before production edits, the builder continued into
+resampling for both cases and the validator had no canonical receipt gate:
+
+```text
+Ran 2 tests in 0.004s
+FAILED (failures=2, errors=2)
+```
+
+After the shared exact contract and both call-site gates were implemented:
+
+```text
+Ran 2 tests in 0.002s
+OK
+```
+
+Fresh full Task 1 verification:
+
+```text
+PYTHONPATH=. /home/ubuntu/miniconda3/envs/diffsim/bin/python -m unittest -v \
+  tests.python.test_resample tests.python.test_database_builder \
+  tests.python.test_build_cli tests.python.test_artifacts
+
+Ran 90 tests in 126.490s
+OK
+```
+
+The 11 schema/kinematics compatibility tests, Python byte-compilation, and
+scoped `git diff --check` also passed.
+
+### Real bundle identity
+
+The unchanged canonical build command ran its atomic candidate validator, and
+a separate validator invocation also reported:
+
+```text
+VALID g1-lmm-flat-data/v2 frames=3853 clips=1 bones=31 features=31 scenes=0 source_rows=8171
+BUILT g1-lmm-flat-data/v2 frames=3853 clips=1 scenes=0 output=sonic/runs/g1-lmm-flat-60hz/data
+```
+
+The canonical input already used the required skeleton, so all three published
+files remain byte-identical:
+
+| File | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `database.bin` | 6,219,022 | `b8c7a8b3c831974af2f986414b549986242a5518edbf40e0ea10f795cca3834c` |
+| `features.bin` | 478,036 | `64f145efadee0a08a93a58865a2771c384c092353df9317f0b494a2f8bfef26e` |
+| `manifest.json` | 166,719 | `05c8ac4c04771fb7f8380d75d64da812f7a299e5994734f15faccd107a105f1f` |
+
+No bundle, subsystem, or terrain scope changed, and no known concern remains.
