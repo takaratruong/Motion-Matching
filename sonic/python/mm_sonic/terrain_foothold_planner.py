@@ -1140,11 +1140,10 @@ def _selected_sequence_change_metrics(
     return maximum_planar, maximum_yaw
 
 
-def _pelvis_planar_offset_path(
+def _pelvis_planar_offset_values(
     frame_count: int,
     searches: Sequence[_PreparedFootholdSearch],
     selected: Sequence[_Candidate],
-    maximum_step_m: float,
 ) -> np.ndarray:
     accumulated = np.zeros((frame_count, 2), dtype=np.float64)
     active_count = np.zeros(frame_count, dtype=np.int64)
@@ -1170,6 +1169,16 @@ def _pelvis_planar_offset_path(
             anchor_frames.astype(np.float64),
             path[anchor_frames, axis],
         )
+    return path
+
+
+def _pelvis_planar_offset_path(
+    frame_count: int,
+    searches: Sequence[_PreparedFootholdSearch],
+    selected: Sequence[_Candidate],
+    maximum_step_m: float,
+) -> np.ndarray:
+    path = _pelvis_planar_offset_values(frame_count, searches, selected)
     maximum_realized_step = (
         0.0
         if frame_count < 2
@@ -1180,6 +1189,199 @@ def _pelvis_planar_offset_path(
             "selected foothold sequence exceeds the pelvis planar step bound"
         )
     return path
+
+
+def _pelvis_planar_step_constraints(
+    frame_count: int,
+    searches: Sequence[_PreparedFootholdSearch],
+) -> tuple[tuple[tuple[int, float], ...], ...]:
+    """Express every pelvis-path step as weights on selected foothold shifts.
+
+    Chronological stance spans are not necessarily a first-order chain.  A
+    short plant can end while an older opposite-foot plant remains active, so
+    the next unsupported-gap interpolation can depend on footholds two or more
+    entries apart.  These sparse linear constraints exactly reproduce
+    :func:`_pelvis_planar_offset_values` without assuming adjacency in the
+    sorted intent list.
+    """
+
+    active: list[list[int]] = [[] for _ in range(frame_count)]
+    for index, search in enumerate(searches):
+        span = search.intent.span
+        for frame in range(span.start_frame, span.stop_frame):
+            active[frame].append(index)
+    anchored = np.asarray([bool(indices) for indices in active], dtype=bool)
+    anchor_frames = np.flatnonzero(anchored)
+    if not len(anchor_frames):
+        raise ContractError("foothold searches contain no active stance frames")
+
+    weights: list[dict[int, float]] = [dict() for _ in range(frame_count)]
+    for frame in anchor_frames:
+        amount = 1.0 / float(len(active[int(frame)]))
+        weights[int(frame)] = {
+            index: amount for index in active[int(frame)]
+        }
+    first = int(anchor_frames[0])
+    last = int(anchor_frames[-1])
+    for frame in range(first):
+        weights[frame] = dict(weights[first])
+    for frame in range(last + 1, frame_count):
+        weights[frame] = dict(weights[last])
+    for left, right in zip(anchor_frames[:-1], anchor_frames[1:], strict=True):
+        left = int(left)
+        right = int(right)
+        if right == left + 1:
+            continue
+        for frame in range(left + 1, right):
+            alpha = float(frame - left) / float(right - left)
+            value: dict[int, float] = {}
+            for index, coefficient in weights[left].items():
+                value[index] = value.get(index, 0.0) + (1.0 - alpha) * coefficient
+            for index, coefficient in weights[right].items():
+                value[index] = value.get(index, 0.0) + alpha * coefficient
+            weights[frame] = value
+
+    constraints: list[tuple[tuple[int, float], ...]] = []
+    for previous, current in zip(weights[:-1], weights[1:], strict=True):
+        difference: dict[int, float] = {}
+        for index, coefficient in current.items():
+            difference[index] = difference.get(index, 0.0) + coefficient
+        for index, coefficient in previous.items():
+            difference[index] = difference.get(index, 0.0) - coefficient
+        constraints.append(
+            tuple(
+                (index, coefficient)
+                for index, coefficient in sorted(difference.items())
+                if abs(coefficient) > 1.0e-12
+            )
+        )
+    return tuple(constraints)
+
+
+def _select_exact_rate_candidate_sequence(
+    searches: Sequence[_PreparedFootholdSearch],
+    pools: Sequence[Sequence[_Candidate]],
+    frame_count: int,
+    config: TerrainFootholdPlannerConfig,
+    metrics: _CandidateEvaluationMetrics,
+    *,
+    beam_width: int = 4096,
+) -> tuple[tuple[_Candidate, ...] | None, float | None, int | None]:
+    """Fallback beam search using the exact realized pelvis-path constraints."""
+
+    constraints = _pelvis_planar_step_constraints(frame_count, searches)
+    constraints_by_latest: list[list[tuple[tuple[int, float], ...]]] = [
+        [] for _ in searches
+    ]
+    for constraint in constraints:
+        if constraint:
+            constraints_by_latest[max(index for index, _ in constraint)].append(
+                constraint
+            )
+
+    # Each state stores the full short foothold sequence.  In practice this
+    # fallback is entered only for overlapping support schedules; the ordinary
+    # zero/first-order paths remain the fast path.
+    states: list[tuple[float, tuple[_Candidate, ...]]] = [
+        (candidate.cost, (candidate,)) for candidate in pools[0]
+    ]
+    for sequence_index in range(len(searches)):
+        if sequence_index > 0:
+            expanded: list[tuple[float, tuple[_Candidate, ...]]] = []
+            current_search = searches[sequence_index]
+            previous_search = searches[sequence_index - 1]
+            for previous_cost, previous_selected in states:
+                previous = previous_selected[-1]
+                previous_shift = _candidate_world_xy_shift(
+                    previous_search, previous
+                )
+                for current in pools[sequence_index]:
+                    metrics.transition_evaluation_count += 1
+                    current_shift = _candidate_world_xy_shift(
+                        current_search, current
+                    )
+                    planar_change = float(
+                        np.linalg.norm(current_shift - previous_shift)
+                    )
+                    yaw_change = _wrapped_angle_difference(
+                        current.yaw_adjustment_rad,
+                        previous.yaw_adjustment_rad,
+                    )
+                    if (
+                        planar_change
+                        > config.maximum_planar_reach_change_m + _EPSILON
+                        or yaw_change
+                        > config.maximum_yaw_change_rad + _EPSILON
+                    ):
+                        continue
+                    selected = previous_selected + (current,)
+                    feasible = True
+                    for constraint in constraints_by_latest[sequence_index]:
+                        step = np.zeros(2, dtype=np.float64)
+                        for index, coefficient in constraint:
+                            step += coefficient * _candidate_world_xy_shift(
+                                searches[index], selected[index]
+                            )
+                        if (
+                            float(np.linalg.norm(step))
+                            > config.maximum_pelvis_planar_adjustment_step_m
+                            + _EPSILON
+                        ):
+                            feasible = False
+                            break
+                    if not feasible:
+                        continue
+                    metrics.feasible_transition_count += 1
+                    planar_scale = max(
+                        config.maximum_planar_reach_change_m, 1.0e-9
+                    )
+                    yaw_scale = max(config.maximum_yaw_change_rad, 1.0e-9)
+                    smoothing_cost = config.foothold_sequence_smoothing_weight * (
+                        (planar_change / planar_scale) ** 2
+                        + (yaw_change / yaw_scale) ** 2
+                    )
+                    expanded.append(
+                        (
+                            previous_cost + current.cost + smoothing_cost,
+                            selected,
+                        )
+                    )
+            if not expanded:
+                return None, None, sequence_index
+            expanded.sort(
+                key=lambda state: (
+                    state[0],
+                    tuple(_candidate_rank(value) for value in state[1]),
+                )
+            )
+            states = expanded[:beam_width]
+        else:
+            filtered: list[tuple[float, tuple[_Candidate, ...]]] = []
+            for state in states:
+                candidate = state[1][0]
+                shift = _candidate_world_xy_shift(searches[0], candidate)
+                feasible = all(
+                    float(
+                        np.linalg.norm(
+                            sum(
+                                (
+                                    coefficient * shift
+                                    for _index, coefficient in constraint
+                                ),
+                                np.zeros(2, dtype=np.float64),
+                            )
+                        )
+                    )
+                    <= config.maximum_pelvis_planar_adjustment_step_m + _EPSILON
+                    for constraint in constraints_by_latest[0]
+                )
+                if feasible:
+                    filtered.append(state)
+            states = filtered
+            if not states:
+                return None, None, 0
+    best_cost, best = states[0]
+    return best, float(best_cost), None
 
 
 def _tighten_rate_feasible_bounds(
@@ -1450,6 +1652,7 @@ def plan_terrain_footholds(
 
     selected: tuple[_Candidate, ...] | None = None
     selected_cost: float | None = None
+    pelvis_planar_offset: np.ndarray | None = None
     failed_sequence_index: int | None = None
     sequence_stage = "zero_only"
     candidate_pool_sizes: tuple[int, ...] = tuple(
@@ -1459,6 +1662,12 @@ def plan_terrain_footholds(
     if zero_fast_path:
         selected = tuple(zero_candidates)
         selected_cost = float(sum(candidate.cost for candidate in selected))
+        pelvis_planar_offset = _pelvis_planar_offset_path(
+            len(pelvis),
+            searches,
+            selected,
+            settings.maximum_pelvis_planar_adjustment_step_m,
+        )
     else:
         longitudinal_values = _symmetric_samples(
             settings.maximum_longitudinal_adjustment_m,
@@ -1531,7 +1740,37 @@ def plan_terrain_footholds(
                 )
             )
             if selected is not None:
-                break
+                try:
+                    pelvis_planar_offset = _pelvis_planar_offset_path(
+                        len(pelvis),
+                        searches,
+                        selected,
+                        settings.maximum_pelvis_planar_adjustment_step_m,
+                    )
+                except ContractError:
+                    # Adjacent chronological footholds are insufficient when
+                    # a short plant ends inside a longer opposite-foot plant.
+                    # Re-select with the exact realized per-frame path rather
+                    # than allowing the builder to discover a one-frame jump.
+                    selected, selected_cost, failed_sequence_index = (
+                        _select_exact_rate_candidate_sequence(
+                            searches,
+                            final_pools,
+                            len(pelvis),
+                            settings,
+                            metrics,
+                        )
+                    )
+                    if selected is not None:
+                        pelvis_planar_offset = _pelvis_planar_offset_path(
+                            len(pelvis),
+                            searches,
+                            selected,
+                            settings.maximum_pelvis_planar_adjustment_step_m,
+                        )
+                        sequence_stage = f"{sequence_stage}_exact_rate"
+                if selected is not None:
+                    break
 
         if selected is None:
             search_diagnostics = tuple(
@@ -1613,12 +1852,7 @@ def plan_terrain_footholds(
     maximum_planar_change, maximum_yaw_change = (
         _selected_sequence_change_metrics(searches, selected)
     )
-    pelvis_planar_offset = _pelvis_planar_offset_path(
-        len(pelvis),
-        searches,
-        selected,
-        settings.maximum_pelvis_planar_adjustment_step_m,
-    )
+    assert pelvis_planar_offset is not None
     maximum_pelvis_planar_step = (
         0.0
         if len(pelvis_planar_offset) < 2

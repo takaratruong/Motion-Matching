@@ -285,6 +285,79 @@ class TerrainFootholdPlannerTests(unittest.TestCase):
             result.diagnostics.sequence_transition_evaluation_count, 0
         )
 
+    def test_exact_rate_fallback_handles_nonadjacent_support_handoff(self):
+        # Chronological order is A(right), B(left), C(left).  B is a short
+        # plant nested inside A, so after B ends the unsupported gap to C is
+        # anchored by A, not by the adjacent B entry.  The cheap first-order
+        # selector prefers A's zero shift and would create a 20 mm frame step;
+        # exact fallback must choose A's 30 mm alternative and stay at 10 mm.
+        terrain = _quad_mesh(
+            (
+                (-0.015, 0.015, -0.03, 0.03, 0.0),
+                (0.015, 0.045, -0.03, 0.03, 0.0),
+                (0.385, 0.415, -0.03, 0.03, 0.0),
+                (0.845, 0.875, -0.03, 0.03, 0.0),
+            )
+        )
+        intents = (
+            FootholdIntent(
+                StanceSpan(1, 0, 8),
+                _flat_sole_pose(
+                    (0.0, 0.0), half_length_m=0.01, half_width_m=0.01
+                ),
+            ),
+            FootholdIntent(
+                StanceSpan(0, 3, 6),
+                _flat_sole_pose(
+                    (0.40, 0.0), half_length_m=0.01, half_width_m=0.01
+                ),
+            ),
+            FootholdIntent(
+                StanceSpan(0, 10, 14),
+                _flat_sole_pose(
+                    (0.80, 0.0), half_length_m=0.01, half_width_m=0.01
+                ),
+            ),
+        )
+
+        result = plan_terrain_footholds(
+            terrain,
+            intents,
+            np.full(14, 0.78),
+            config=_fixed_config(
+                maximum_longitudinal_adjustment_m=0.06,
+                longitudinal_samples=5,
+                maximum_planar_reach_change_m=0.09,
+                maximum_pelvis_planar_adjustment_step_m=0.015,
+                require_alternating_feet=False,
+            ),
+        )
+
+        self.assertTrue(result.accepted, result.diagnostics.message)
+        assert result.plan is not None
+        self.assertTrue(
+            result.diagnostics.sequence_search_stage.endswith("_exact_rate")
+        )
+        selected_shift = np.asarray(
+            [
+                foothold.sole_center_world[0]
+                - intent.nominal_pose.sole_center_world[0]
+                for intent, foothold in zip(
+                    intents, result.plan.footholds, strict=True
+                )
+            ]
+        )
+        np.testing.assert_allclose(selected_shift, (0.03, 0.0, 0.06), atol=1e-9)
+        maximum_step = float(
+            np.max(
+                np.linalg.norm(
+                    np.diff(result.plan.pelvis_planar_offset_world_m, axis=0),
+                    axis=1,
+                )
+            )
+        )
+        self.assertLessEqual(maximum_step, 0.015 + 1.0e-12)
+
     def test_sequence_continuity_compares_world_shifts_across_local_yaws(self):
         terrain = _quad_mesh(
             (
