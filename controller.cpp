@@ -1042,7 +1042,6 @@ int main(int argc, char** argv)
                 lmm_model,
                 model_directory,
                 terrain_directory,
-                motion_manifest,
                 artifact_error,
                 static_cast<int>(sizeof(artifact_error))))
         {
@@ -1590,6 +1589,7 @@ int main(int argc, char** argv)
             }
         }
 
+        float staged_camera_azimuth = state.camera_azimuth;
 #ifdef MM_DISCRETE
         if (test_config.mode == G1_TestLive) {
         // Camera-azimuth scripting. MM_MODE selects the pattern:
@@ -1602,23 +1602,23 @@ int main(int argc, char** argv)
                           const char* n=getenv("MM_SNAPN"); if(n) snapN=atoi(n); }
         if (mode == 0)
         {
-            if (g_frame == 120) state.camera_azimuth += 0.5f * PIf;
-            if (g_frame == 240) state.camera_azimuth += 0.5f * PIf;
-            if (g_frame == 360) state.camera_azimuth -= 0.5f * PIf;
+            if (g_frame == 120) staged_camera_azimuth += 0.5f * PIf;
+            if (g_frame == 240) staged_camera_azimuth += 0.5f * PIf;
+            if (g_frame == 360) staged_camera_azimuth -= 0.5f * PIf;
         }
         else if (mode == 1)
         {
             if (g_frame >= 60 && (g_frame % snapN) == 0)
-                state.camera_azimuth += ((g_frame / snapN) % 2 ? -1.0f : 1.0f) * 0.5f * PIf;
+                staged_camera_azimuth += ((g_frame / snapN) % 2 ? -1.0f : 1.0f) * 0.5f * PIf;
         }
         else if (mode == 2)
         {
-            if (g_frame >= 60) state.camera_azimuth += 2.0f * (1.0f/60.0f); // arrow held
+            if (g_frame >= 60) staged_camera_azimuth += 2.0f * (1.0f/60.0f); // arrow held
         }
         else if (mode == 3)
         {
             // alternating 180-deg azimuth snaps -> antipodal state.desired_rotation
-            if (g_frame >= 60 && (g_frame % snapN) == 0) state.camera_azimuth += PIf;
+            if (g_frame >= 60 && (g_frame % snapN) == 0) staged_camera_azimuth += PIf;
         }
         }
 #endif
@@ -1644,25 +1644,27 @@ int main(int argc, char** argv)
         }
         
         // Get the desired gait (walk / run)
+        float staged_desired_gait = state.desired_gait;
+        float staged_desired_gait_velocity = state.desired_gait_velocity;
         if (test_config.mode != G1_TestLive) {
-            state.desired_gait = 0.0f;
-            state.desired_gait_velocity = 0.0f;
+            staged_desired_gait = 0.0f;
+            staged_desired_gait_velocity = 0.0f;
         } else {
             desired_gait_update(
-                state.desired_gait,
-                state.desired_gait_velocity,
+                staged_desired_gait,
+                staged_desired_gait_velocity,
                 dt);
         }
         
         // Get the desired simulation speeds based on the gait
-        float simulation_fwrd_speed = lerpf(simulation_run_fwrd_speed, simulation_walk_fwrd_speed, state.desired_gait);
-        float simulation_side_speed = lerpf(simulation_run_side_speed, simulation_walk_side_speed, state.desired_gait);
-        float simulation_back_speed = lerpf(simulation_run_back_speed, simulation_walk_back_speed, state.desired_gait);
+        float simulation_fwrd_speed = lerpf(simulation_run_fwrd_speed, simulation_walk_fwrd_speed, staged_desired_gait);
+        float simulation_side_speed = lerpf(simulation_run_side_speed, simulation_walk_side_speed, staged_desired_gait);
+        float simulation_back_speed = lerpf(simulation_run_back_speed, simulation_walk_back_speed, staged_desired_gait);
         
         // Get the desired velocity
         vec3 desired_velocity_curr = desired_velocity_update(
             gamepadstick_left,
-            state.camera_azimuth,
+            staged_camera_azimuth,
             state.simulation_rotation,
             simulation_fwrd_speed,
             simulation_side_speed,
@@ -1691,8 +1693,8 @@ int main(int argc, char** argv)
             }
             desired_velocity_curr = route_sample.command;
             desired_strafe = false;
-            state.route_waypoint = route_sample.waypoint;
         }
+        const int staged_route_waypoint = route_sample.waypoint;
         const vec3 commanded_velocity = desired_velocity_curr;
 
         // Heading is selected from the requested command before terrain is
@@ -1701,7 +1703,7 @@ int main(int argc, char** argv)
             state.desired_rotation,
             gamepadstick_left,
             gamepadstick_right,
-            state.camera_azimuth,
+            staged_camera_azimuth,
             desired_strafe,
             commanded_velocity);
         if (test_heading.active) {
@@ -1760,6 +1762,19 @@ int main(int argc, char** argv)
         runtime_request.requested_velocity_holden = commanded_velocity;
         runtime_request.desired_heading_holden = desired_rotation_curr;
         runtime_request.matching_enabled = matching_enabled;
+        runtime_request.stage_controller_fields = lmm_enabled;
+        runtime_request.staged_desired_gait = staged_desired_gait;
+        runtime_request.staged_desired_gait_velocity =
+            staged_desired_gait_velocity;
+        runtime_request.staged_route_waypoint = staged_route_waypoint;
+        runtime_request.staged_camera_azimuth = staged_camera_azimuth;
+
+        if (!lmm_enabled) {
+            state.desired_gait = staged_desired_gait;
+            state.desired_gait_velocity = staged_desired_gait_velocity;
+            state.route_waypoint = staged_route_waypoint;
+            state.camera_azimuth = staged_camera_azimuth;
+        }
 
         const auto visual_prediction_builder =
             [&](G1CommandFramePrediction& frame_prediction,

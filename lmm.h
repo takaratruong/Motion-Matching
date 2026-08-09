@@ -336,10 +336,13 @@ static inline bool g1_lmm_model_load_and_verify(
     g1_lmm_model_bundle& out,
     const char* model_root,
     const char* data_root,
-    const motion_pack_manifest& data_manifest,
     char* error,
     const int capacity)
 {
+    motion_pack_manifest data_manifest;
+    if (!motion_manifest_load_and_verify(
+            data_manifest, data_root, error, capacity))
+        return false;
     if (!data_manifest.flat_lmm_bundle ||
         data_manifest.database_frames <= 0 ||
         data_manifest.database.path != "database.bin" ||
@@ -717,7 +720,9 @@ static inline bool projector_evaluate_normalized(
         return scene_error(
             error, capacity, "normalized projector shapes are invalid");
 
-    slice1d<float> input_layer = evaluation.layers.front();
+    nnet_evaluation candidate_evaluation;
+    candidate_evaluation.resize(nn);
+    slice1d<float> input_layer = candidate_evaluation.layers.front();
     for (int index = 0; index < G1_LMM_FeatureCount; ++index)
     {
         if (!terrain_float_is_finite(query_normalized(index)) ||
@@ -731,14 +736,16 @@ static inline bool projector_evaluate_normalized(
             return scene_error(
                 error, capacity, "current LMM latent is non-finite");
 
-    nnet_evaluate(evaluation, nn);
-    const slice1d<float> output_layer = evaluation.layers.back();
+    nnet_evaluate(candidate_evaluation, nn);
+    const slice1d<float> output_layer = candidate_evaluation.layers.back();
+    array1d<float> candidate_features(G1_LMM_FeatureCount);
+    array1d<float> candidate_latent(G1_LMM_LatentCount);
     for (int index = 0; index < G1_LMM_FeatureCount; ++index)
     {
         if (!terrain_float_is_finite(output_layer(index)))
             return scene_error(
                 error, capacity, "normalized projector output is non-finite");
-        projected_features(index) = output_layer(index);
+        candidate_features(index) = output_layer(index);
     }
     for (int index = 0; index < G1_LMM_LatentCount; ++index)
     {
@@ -746,38 +753,50 @@ static inline bool projector_evaluate_normalized(
         if (!terrain_float_is_finite(value))
             return scene_error(
                 error, capacity, "projected LMM latent is non-finite");
-        projected_latent(index) = value;
+        candidate_latent(index) = value;
     }
 
-    best_cost = projector_cost_normalized(
-        query_normalized, projected_features);
-    if (!terrain_float_is_finite(best_cost) || best_cost == FLT_MAX)
+    float candidate_cost = projector_cost_normalized(
+        query_normalized, candidate_features);
+    if (!terrain_float_is_finite(candidate_cost) || candidate_cost == FLT_MAX)
         return scene_error(
             error, capacity, "normalized projector cost is invalid");
 
     float transition_squared = 0.0f;
     for (int index = 0; index < G1_LMM_FeatureCount; ++index)
         transition_squared += squaref(
-            current_features(index) - projected_features(index));
+            current_features(index) - candidate_features(index));
     if (!terrain_float_is_finite(transition_squared))
         return scene_error(
             error, capacity, "normalized projector transition is invalid");
 
-    transition = transition_squared > squaref(transition_cost);
-    if (transition)
+    const bool candidate_transition =
+        transition_squared > squaref(transition_cost);
+    if (candidate_transition)
     {
-        best_cost += transition_cost;
+        candidate_cost += transition_cost;
     }
     else
     {
         for (int index = 0; index < G1_LMM_FeatureCount; ++index)
-            projected_features(index) = current_features(index);
+            candidate_features(index) = current_features(index);
         for (int index = 0; index < G1_LMM_LatentCount; ++index)
-            projected_latent(index) = current_latent(index);
-        best_cost = projector_cost_normalized(
+            candidate_latent(index) = current_latent(index);
+        candidate_cost = projector_cost_normalized(
             query_normalized, current_features);
     }
-    return terrain_float_is_finite(best_cost) && best_cost != FLT_MAX;
+    if (!terrain_float_is_finite(candidate_cost) || candidate_cost == FLT_MAX)
+        return scene_error(
+            error, capacity, "normalized projector cost is invalid");
+
+    evaluation.layers.swap(candidate_evaluation.layers);
+    for (int index = 0; index < G1_LMM_FeatureCount; ++index)
+        projected_features(index) = candidate_features(index);
+    for (int index = 0; index < G1_LMM_LatentCount; ++index)
+        projected_latent(index) = candidate_latent(index);
+    transition = candidate_transition;
+    best_cost = candidate_cost;
+    return true;
 }
 
 // This function projects a set of feature values onto

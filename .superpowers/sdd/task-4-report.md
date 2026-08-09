@@ -108,3 +108,89 @@ binary set. Therefore the requested 20-second interactive LMM drive/video and
 mechanical receipt were not run. This is the expected fail-closed stopping
 condition from the brief, not an ordinary fallback or a synthetic acceptance
 claim.
+
+## Review remediation
+
+The three Important review findings were reproduced and corrected in a
+separate RED-to-GREEN cycle.
+
+The projector RED added failures at the final projected feature and final
+latent output. The original helper rejected the NaN only after mutating earlier
+caller outputs and its evaluation layers:
+
+```text
+G1 LMM test failed: late projector rejection leaves all outputs and evaluation state bitwise unchanged
+```
+
+Projector inference now uses a private evaluation candidate plus private
+feature/latent/cost/transition candidates. It swaps and copies into caller
+state only after every output and derived cost is finite. The negative test
+hashes transition, cost, both output arrays, the evaluation layer count, every
+layer shape, and every layer byte before and after each late rejection.
+
+The loader RED changed the public seam so no caller-populated
+`motion_pack_manifest` could satisfy authentication; compilation failed on the
+removed trusted metadata argument. The loader now calls
+`motion_manifest_load_and_verify` on the observed Task 1 directory itself,
+then binds the model manifest to the SHA-256 of that verified raw v2 manifest
+and its authenticated database/features digests. The positive synthetic model
+fixture is bound to the real production-shaped Task 1 v2 bundle. Arbitrary raw
+manifest text with manually plausible artifact files rejects before any
+evaluation allocation, as do a copied live-data size tamper and all prior
+digest/ABI tampers.
+
+The controller transaction RED failed to compile on the missing staged gait,
+gait-velocity, route-waypoint, and camera-azimuth request contract. These
+values are now derived in locals. LMM applies them only to its existing cloned
+runtime candidate, so the runtime's final state swap commits them together
+with an accepted tick. Ordinary mode retains its prior live-field behavior.
+The controller's compile-time camera scripting is staged through the same
+contract. A late-projector-NaN rejection test changes all four candidate
+values and verifies the live `desired_gait`, `desired_gait_velocity`,
+`route_waypoint`, and `camera_azimuth` remain bitwise unchanged; the accepted
+case verifies they commit atomically.
+
+Fresh remediation verification passed:
+
+```text
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
+  tests/cpp/test_g1_lmm.cpp -o /tmp/test_g1_lmm_remediation_strict && \
+  /tmp/test_g1_lmm_remediation_strict
+
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
+  tests/cpp/test_g1_runtime.cpp -o /tmp/test_g1_runtime_remediation_strict && \
+  /tmp/test_g1_runtime_remediation_strict && \
+  /tmp/test_g1_runtime_remediation_strict \
+    --flat-bundle sonic/runs/g1-lmm-flat-60hz/data
+
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
+  tests/cpp/test_g1_controller_state.cpp \
+  -o /tmp/test_g1_controller_state_remediation_strict && \
+  /tmp/test_g1_controller_state_remediation_strict
+
+g++ -std=c++17 -O3 -ffast-math -DNDEBUG -w -I. \
+  tests/cpp/test_g1_lmm.cpp -o /tmp/test_g1_lmm_remediation_fast && \
+  /tmp/test_g1_lmm_remediation_fast
+
+g++ -std=c++17 -fsyntax-only -I. \
+  -I/home/ubuntu/apps/raylib/src -I/home/ubuntu/apps/raygui/src \
+  controller.cpp
+
+g++ -std=c++17 -O2 -I. -I/home/ubuntu/apps/raylib/src \
+  -I/home/ubuntu/apps/raygui/src controller.cpp \
+  /home/ubuntu/apps/raylib/src/libraylib.a \
+  -lGL -lm -lpthread -ldl -lrt -lX11 \
+  -o /tmp/controller_task4_remediation
+```
+
+The linked controller still fails closed before window creation when launched
+with the canonical Task 1 bundle because the accepted Task 3 model manifest is
+absent:
+
+```text
+G1_TERRAIN_DIR=sonic/runs/g1-lmm-flat-60hz/data \
+  /tmp/controller_task4_remediation --locomotion-engine lmm
+G1 LMM model error: ./sonic/runs/g1-lmm-flat-60hz/model/manifest.json: cannot open for SHA-256 (No such file or directory)
+```
+
+No real interactive claim was made.

@@ -51,20 +51,12 @@ static void test_controller_state_owns_lmm_transaction_state()
 
 static void test_missing_bundle_fails_before_evaluation_allocation()
 {
-    motion_pack_manifest data_manifest;
-    data_manifest.flat_lmm_bundle = true;
-    data_manifest.database_frames = 3853;
-    data_manifest.database.path = "database.bin";
-    data_manifest.database.sha256 = std::string(64, '0');
-    data_manifest.matching_features.path = "features.bin";
-    data_manifest.matching_features.sha256 = std::string(64, '1');
     g1_lmm_model_bundle model;
     char error[512] = {};
     check(!g1_lmm_model_load_and_verify(
               model,
               "/definitely/missing/model",
               "/definitely/missing/data",
-              data_manifest,
               error,
               static_cast<int>(sizeof(error))),
           "missing authenticated model bundle is rejected");
@@ -158,7 +150,8 @@ static std::string file_sha(const std::filesystem::path& path)
 struct synthetic_lmm_fixture
 {
     std::filesystem::path root = "/tmp/test_g1_lmm_bundle";
-    std::filesystem::path data = root / "data";
+    std::filesystem::path data =
+        "sonic/runs/g1-lmm-flat-60hz/data";
     std::filesystem::path model = root / "model";
     motion_pack_manifest data_manifest;
     std::string data_manifest_sha;
@@ -172,33 +165,15 @@ struct synthetic_lmm_fixture
     {
         namespace fs = std::filesystem;
         fs::remove_all(root);
-        fs::create_directories(data);
         fs::create_directories(model);
-
-        {
-            std::ofstream output(data / "manifest.json", std::ios::binary);
-            output << "synthetic authenticated flat data identity\n";
-        }
-        {
-            std::ofstream output(data / "database.bin", std::ios::binary);
-            output << "database";
-        }
-        {
-            std::ofstream output(data / "features.bin", std::ios::binary);
-            output << "features";
-        }
+        char error[512] = {};
+        check(motion_manifest_load_and_verify(
+                  data_manifest,
+                  data.c_str(),
+                  error,
+                  static_cast<int>(sizeof(error))),
+              error);
         data_manifest_sha = file_sha(data / "manifest.json");
-        data_manifest.flat_lmm_bundle = true;
-        data_manifest.database_frames = 3853;
-        data_manifest.database.path = "database.bin";
-        data_manifest.database.size_bytes = static_cast<int>(
-            fs::file_size(data / "database.bin"));
-        data_manifest.database.sha256 = file_sha(data / "database.bin");
-        data_manifest.matching_features.path = "features.bin";
-        data_manifest.matching_features.size_bytes = static_cast<int>(
-            fs::file_size(data / "features.bin"));
-        data_manifest.matching_features.sha256 = file_sha(
-            data / "features.bin");
 
         {
             std::ofstream output(model / "latent.bin", std::ios::binary);
@@ -357,6 +332,104 @@ static bool same_array_bits(const array1d<T>& first, const array1d<T>& second)
                static_cast<std::size_t>(first.size) * sizeof(T)) == 0);
 }
 
+static std::uint64_t hash_bytes(
+    std::uint64_t hash,
+    const void* data,
+    const std::size_t size)
+{
+    const unsigned char* bytes = static_cast<const unsigned char*>(data);
+    for (std::size_t index = 0; index < size; ++index) {
+        hash ^= bytes[index];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static std::uint64_t hash_projector_call_state(
+    const bool transition,
+    const float best_cost,
+    const array1d<float>& projected_features,
+    const array1d<float>& projected_latent,
+    const nnet_evaluation& evaluation)
+{
+    std::uint64_t hash = UINT64_C(14695981039346656037);
+    hash = hash_bytes(hash, &transition, sizeof(transition));
+    hash = hash_bytes(hash, &best_cost, sizeof(best_cost));
+    hash = hash_bytes(
+        hash, projected_features.data,
+        static_cast<std::size_t>(projected_features.size) * sizeof(float));
+    hash = hash_bytes(
+        hash, projected_latent.data,
+        static_cast<std::size_t>(projected_latent.size) * sizeof(float));
+    const std::size_t layer_count = evaluation.layers.size();
+    hash = hash_bytes(hash, &layer_count, sizeof(layer_count));
+    for (const array1d<float>& layer : evaluation.layers) {
+        hash = hash_bytes(hash, &layer.size, sizeof(layer.size));
+        hash = hash_bytes(
+            hash, layer.data,
+            static_cast<std::size_t>(layer.size) * sizeof(float));
+    }
+    return hash;
+}
+
+static void test_projector_late_nan_is_transactional(
+    g1_lmm_model_bundle& model)
+{
+    array1d<float> query(G1_LMM_FeatureCount);
+    array1d<float> current_features(G1_LMM_FeatureCount);
+    array1d<float> current_latent(G1_LMM_LatentCount);
+    query.zero();
+    current_features.zero();
+    current_latent.zero();
+
+    const int bad_outputs[2] = {
+        G1_LMM_FeatureCount - 1,
+        G1_LMM_FeatureCount + G1_LMM_LatentCount - 1};
+    for (const int bad_output : bad_outputs) {
+        array1d<float> projected_features(G1_LMM_FeatureCount);
+        array1d<float> projected_latent(G1_LMM_LatentCount);
+        projected_features.set(17.0f);
+        projected_latent.set(-23.0f);
+        bool transition = true;
+        float best_cost = -31.0f;
+        nnet_evaluation evaluation;
+        evaluation.resize(model.projector);
+        for (array1d<float>& layer : evaluation.layers)
+            layer.set(41.0f);
+
+        model.projector.output_mean(bad_output) =
+            std::numeric_limits<float>::quiet_NaN();
+        const std::uint64_t before = hash_projector_call_state(
+            transition,
+            best_cost,
+            projected_features,
+            projected_latent,
+            evaluation);
+        char error[512] = {};
+        check(!projector_evaluate_normalized(
+                  transition,
+                  best_cost,
+                  projected_features,
+                  projected_latent,
+                  evaluation,
+                  query,
+                  current_features,
+                  current_latent,
+                  model.projector,
+                  error,
+                  static_cast<int>(sizeof(error))),
+              "late non-finite projector output is rejected");
+        check(hash_projector_call_state(
+                  transition,
+                  best_cost,
+                  projected_features,
+                  projected_latent,
+                  evaluation) == before,
+              "late projector rejection leaves all outputs and evaluation state bitwise unchanged");
+        model.projector.output_mean(bad_output) = 0.0f;
+    }
+}
+
 static void test_transactional_lmm_tick(
     g1_lmm_model_bundle& model)
 {
@@ -426,6 +499,11 @@ static void test_transactional_lmm_tick(
     request.requested_velocity_holden = vec3();
     request.desired_heading_holden = quat();
     request.matching_enabled = true;
+    request.stage_controller_fields = true;
+    request.staged_desired_gait = 0.25f;
+    request.staged_desired_gait_velocity = -0.50f;
+    request.staged_route_waypoint = 7;
+    request.staged_camera_azimuth = 0.75f;
     const g1_runtime_config config;
     g1_runtime_step_result prepared_result;
     check(g1_runtime_step_lmm(
@@ -442,6 +520,12 @@ static void test_transactional_lmm_tick(
           error);
     check(state.lmm_commit_count == 2 && state.lmm_stepper_count == 2,
           "high-level command/query LMM path still steps and commits once");
+    check(state.desired_gait == request.staged_desired_gait &&
+              state.desired_gait_velocity ==
+                  request.staged_desired_gait_velocity &&
+              state.route_waypoint == request.staged_route_waypoint &&
+              state.camera_azimuth == request.staged_camera_azimuth,
+          "accepted LMM tick atomically commits staged controller fields");
     for (int feature = 0; feature < 31; ++feature)
         check(std::fabs(
                   normalize_query_feature(
@@ -460,7 +544,13 @@ static void test_transactional_lmm_tick(
     sentinel.query_normalized[30] = 94.0f;
     sentinel.lmm_projector_cost = 95.0f;
     const g1_runtime_step_result sentinel_before = sentinel;
-    model.projector.output_mean(0) = std::numeric_limits<float>::quiet_NaN();
+    request.staged_desired_gait = 0.80f;
+    request.staged_desired_gait_velocity = 1.25f;
+    request.staged_route_waypoint = 19;
+    request.staged_camera_azimuth = -2.50f;
+    model.projector.output_mean(
+        G1_LMM_FeatureCount + G1_LMM_LatentCount - 1) =
+            std::numeric_limits<float>::quiet_NaN();
     error[0] = '\0';
     check(!g1_runtime_step_lmm(
               sentinel,
@@ -483,23 +573,62 @@ static void test_transactional_lmm_tick(
               same_array_bits(state.curr_bone_contacts,
                               before.curr_bone_contacts) &&
               std::memcmp(
-                  &state.command, &before.command, sizeof(state.command)) == 0,
-          "failed LMM tick leaves command, recurrent, pose, and contact state bitwise unchanged");
+                  &state.command, &before.command, sizeof(state.command)) == 0 &&
+              std::memcmp(
+                  &state.desired_gait,
+                  &before.desired_gait,
+                  sizeof(state.desired_gait)) == 0 &&
+              std::memcmp(
+                  &state.desired_gait_velocity,
+                  &before.desired_gait_velocity,
+                  sizeof(state.desired_gait_velocity)) == 0 &&
+              state.route_waypoint == before.route_waypoint &&
+              std::memcmp(
+                  &state.camera_azimuth,
+                  &before.camera_azimuth,
+                  sizeof(state.camera_azimuth)) == 0,
+          "failed LMM tick leaves command, recurrent, pose, contacts, gait, route, and camera bitwise unchanged");
     check(std::memcmp(&sentinel, &sentinel_before, sizeof(sentinel)) == 0,
           "failed LMM tick leaves output diagnostics bitwise unchanged");
-    model.projector.output_mean(0) = 0.0f;
+    model.projector.output_mean(
+        G1_LMM_FeatureCount + G1_LMM_LatentCount - 1) = 0.0f;
 }
 
 static void test_authenticated_bundle_and_digest_tampers()
 {
     synthetic_lmm_fixture fixture;
     char error[512] = {};
+
+    const std::filesystem::path forged_data = fixture.root / "forged-data";
+    std::filesystem::create_directories(forged_data);
+    {
+        std::ofstream output(forged_data / "manifest.json", std::ios::binary);
+        output << "arbitrary caller-asserted data identity\n";
+    }
+    {
+        std::ofstream output(forged_data / "database.bin", std::ios::binary);
+        output << "database";
+    }
+    {
+        std::ofstream output(forged_data / "features.bin", std::ios::binary);
+        output << "features";
+    }
+    g1_lmm_model_bundle rejected_forged_data;
+    check(!g1_lmm_model_load_and_verify(
+              rejected_forged_data,
+              fixture.model.c_str(),
+              forged_data.c_str(),
+              error,
+              static_cast<int>(sizeof(error))) &&
+              rejected_forged_data.evaluation_allocation_count == 0,
+          "arbitrary raw data text cannot be substituted by caller-populated metadata");
+
     g1_lmm_model_bundle accepted;
+    error[0] = '\0';
     check(g1_lmm_model_load_and_verify(
               accepted,
               fixture.model.c_str(),
               fixture.data.c_str(),
-              fixture.data_manifest,
               error,
               static_cast<int>(sizeof(error))),
           error);
@@ -507,6 +636,7 @@ static void test_authenticated_bundle_and_digest_tampers()
           "accepted model allocates exactly three evaluation states");
     check(accepted.latent.rows == 3853 && accepted.latent.cols == 32,
           "accepted latent table matches the bound database");
+    test_projector_late_nan_is_transactional(accepted);
     test_transactional_lmm_tick(accepted);
 
     std::string wrong_data_sha = fixture.data_manifest_sha;
@@ -518,7 +648,6 @@ static void test_authenticated_bundle_and_digest_tampers()
               rejected_data_manifest,
               fixture.model.c_str(),
               fixture.data.c_str(),
-              fixture.data_manifest,
               error,
               static_cast<int>(sizeof(error))) &&
               rejected_data_manifest.evaluation_allocation_count == 0,
@@ -532,7 +661,6 @@ static void test_authenticated_bundle_and_digest_tampers()
                   rejected,
                   fixture.model.c_str(),
                   fixture.data.c_str(),
-                  fixture.data_manifest,
                   error,
                   static_cast<int>(sizeof(error))) &&
                   rejected.evaluation_allocation_count == 0,
@@ -546,42 +674,36 @@ static void test_authenticated_bundle_and_digest_tampers()
                   rejected,
                   fixture.model.c_str(),
                   fixture.data.c_str(),
-                  fixture.data_manifest,
                   error,
                   static_cast<int>(sizeof(error))) &&
                   rejected.evaluation_allocation_count == 0,
               "model artifact digest tamper rejects before evaluation allocation");
     }
 
-    const std::filesystem::path real_data =
-        "sonic/runs/g1-lmm-flat-60hz/data";
-    motion_pack_manifest real_data_manifest;
-    error[0] = '\0';
-    check(motion_manifest_load_and_verify(
-              real_data_manifest,
-              real_data.c_str(),
-              error,
-              static_cast<int>(sizeof(error))),
-          error);
-    const motion_pack_manifest synthetic_data_manifest = fixture.data_manifest;
-    const std::string synthetic_data_sha = fixture.data_manifest_sha;
-    fixture.data_manifest = real_data_manifest;
-    fixture.data_manifest_sha = file_sha(real_data / "manifest.json");
     fixture.write_manifest();
-    g1_lmm_model_bundle real_bound_model;
-    check(g1_lmm_model_load_and_verify(
-              real_bound_model,
+    const std::filesystem::path tampered_data = fixture.root / "tampered-data";
+    std::filesystem::copy(
+        fixture.data,
+        tampered_data,
+        std::filesystem::copy_options::recursive |
+            std::filesystem::copy_options::overwrite_existing);
+    {
+        std::ofstream tampered(
+            tampered_data / "database.bin",
+            std::ios::binary | std::ios::app);
+        tampered.put('\0');
+    }
+    g1_lmm_model_bundle rejected_live_data;
+    error[0] = '\0';
+    check(!g1_lmm_model_load_and_verify(
+              rejected_live_data,
               fixture.model.c_str(),
-              real_data.c_str(),
-              real_data_manifest,
+              tampered_data.c_str(),
               error,
               static_cast<int>(sizeof(error))) &&
-              real_bound_model.authenticated,
-          "production-shaped synthetic model binds to the canonical Task 1 v2 bundle");
-    fixture.data_manifest = synthetic_data_manifest;
-    fixture.data_manifest_sha = synthetic_data_sha;
+              rejected_live_data.evaluation_allocation_count == 0,
+          "live data artifact tamper is reauthenticated before model evaluation allocation");
 
-    fixture.write_manifest();
     {
         std::ofstream trailing(
             fixture.model / "projector.bin",
@@ -598,30 +720,12 @@ static void test_authenticated_bundle_and_digest_tampers()
               rejected_abi,
               fixture.model.c_str(),
               fixture.data.c_str(),
-              fixture.data_manifest,
               error,
               static_cast<int>(sizeof(error))) &&
               rejected_abi.evaluation_allocation_count == 0 &&
               std::strstr(error, "trailing") != nullptr,
           "self-consistent network trailing bytes fail the exact Orange Duck ABI");
 
-    {
-        std::ofstream tampered(
-            fixture.data / "database.bin",
-            std::ios::binary | std::ios::app);
-        tampered.put('\0');
-    }
-    g1_lmm_model_bundle rejected_live_data;
-    error[0] = '\0';
-    check(!g1_lmm_model_load_and_verify(
-              rejected_live_data,
-              fixture.model.c_str(),
-              fixture.data.c_str(),
-              fixture.data_manifest,
-              error,
-              static_cast<int>(sizeof(error))) &&
-              rejected_live_data.evaluation_allocation_count == 0,
-          "live data artifact tamper is reauthenticated before model evaluation allocation");
 }
 
 int main()

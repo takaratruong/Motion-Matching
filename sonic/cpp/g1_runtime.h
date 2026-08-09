@@ -34,6 +34,11 @@ struct g1_runtime_step_request
     vec3 requested_velocity_holden;
     quat desired_heading_holden;
     bool matching_enabled = true;
+    bool stage_controller_fields = false;
+    float staged_desired_gait = 0.0f;
+    float staged_desired_gait_velocity = 0.0f;
+    int staged_route_waypoint = 1;
+    float staged_camera_azimuth = 0.0f;
 };
 
 enum g1_runtime_joint_preview_verdict
@@ -859,7 +864,13 @@ static inline bool g1_runtime_request_is_valid(
     return request.mode >= G1RuntimeVisual &&
            request.mode <= G1RuntimeDirect &&
            g1_command_vec3_is_finite(request.requested_velocity_holden) &&
-           ik_quat_is_unit(request.desired_heading_holden);
+           ik_quat_is_unit(request.desired_heading_holden) &&
+           (!request.stage_controller_fields ||
+            (terrain_float_is_finite(request.staged_desired_gait) &&
+             terrain_float_is_finite(
+                 request.staged_desired_gait_velocity) &&
+             request.staged_route_waypoint >= 0 &&
+             terrain_float_is_finite(request.staged_camera_azimuth)));
 }
 
 static inline bool g1_runtime_artifacts_are_valid(
@@ -2313,6 +2324,13 @@ static inline bool g1_runtime_step_lmm(
 
     g1_controller_state next;
     if (!g1_controller_state_clone(next, state, error, capacity)) return false;
+    if (request.stage_controller_fields)
+    {
+        next.desired_gait = request.staged_desired_gait;
+        next.desired_gait_velocity = request.staged_desired_gait_velocity;
+        next.route_waypoint = request.staged_route_waypoint;
+        next.camera_azimuth = request.staged_camera_azimuth;
+    }
     const float dt = config.dt;
     const vec3 commanded_velocity = request.requested_velocity_holden;
     quat desired_rotation_curr;

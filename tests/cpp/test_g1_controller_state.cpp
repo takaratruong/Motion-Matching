@@ -375,8 +375,26 @@ static void test_controller_publishes_independent_travel_and_heading()
                   "desired_rotation_curr;") != std::string::npos &&
               request_path.find(
                   "runtime_request.matching_enabled = matching_enabled;") !=
+                  std::string::npos &&
+              request_path.find(
+                  "runtime_request.stage_controller_fields = lmm_enabled;") !=
+                  std::string::npos &&
+              request_path.find(
+                  "runtime_request.staged_desired_gait = "
+                  "staged_desired_gait;") != std::string::npos &&
+              request_path.find(
+                  "runtime_request.staged_route_waypoint = "
+                  "staged_route_waypoint;") != std::string::npos,
+          "visual adapter publishes independent travel, heading, mode, gait, and route candidates");
+    check(request_path.find("if (!lmm_enabled)") != std::string::npos &&
+              controller_source.find(
+                  "state.route_waypoint = route_sample.waypoint;") ==
+                  std::string::npos &&
+              controller_source.find(
+                  "desired_gait_update(\n"
+                  "                state.desired_gait") ==
                   std::string::npos,
-          "visual adapter publishes independent travel, heading, and mode");
+          "only ordinary mode mutates live controller fields before its runtime call");
 
     const std::size_t frame_builder = controller_source.find(
         "g1_command_frame_prediction_build(", builder);
