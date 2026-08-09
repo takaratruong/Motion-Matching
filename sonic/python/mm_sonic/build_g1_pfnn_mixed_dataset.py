@@ -18,6 +18,7 @@ from .build_g1_pfnn_vertical_dataset import (
     save_vertical_dataset,
 )
 from .terrain_pfnn.dataset import PFNNShardDataset
+from .terrain_pfnn.dataset import denormalize_pfnn_input
 from .terrain_pfnn.layout import INPUT_LAYOUT, OUTPUT_LAYOUT
 from .train_classic_g1_pfnn import (
     _grail_train_validation_masks,
@@ -71,7 +72,7 @@ def _grail_physical_rows(dataset: object) -> dict[str, np.ndarray]:
     return {
         "x_normalized": x_normalized,
         "y_normalized": y_normalized,
-        "x": x_normalized * x_std + x_mean,
+        "x": denormalize_pfnn_input(x_normalized, x_mean, x_std),
         "y": y_normalized * y_std + y_mean,
         "phase": phase,
         "clip_id": clip,
