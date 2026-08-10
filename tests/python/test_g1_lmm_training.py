@@ -694,6 +694,31 @@ class G1LmmTrainingTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exactly 1/60"):
             TrainingConfig(dt=np.nextafter(1.0 / 60.0, 1.0))
 
+    def test_single_clip_overfit_canary_config_and_cli_are_strictly_opt_in(self):
+        self.assertIs(TrainingConfig().single_clip_overfit_canary, False)
+        self.assertIs(
+            build_parser()
+            .parse_args(["data", "model"])
+            .single_clip_overfit_canary,
+            False,
+        )
+        self.assertIs(
+            build_parser()
+            .parse_args(["data", "model", "--single-clip-overfit-canary"])
+            .single_clip_overfit_canary,
+            True,
+        )
+        self.assertIs(
+            TrainingConfig(single_clip_overfit_canary=True).single_clip_overfit_canary,
+            True,
+        )
+        for value in (1, np.bool_(True), "true", None):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "single_clip_overfit_canary.*bool"),
+            ):
+                TrainingConfig(single_clip_overfit_canary=value)
+
     def test_loader_requires_exact_flat_walking_labels_for_every_range(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1230,6 +1255,339 @@ class G1LmmTrainingTest(unittest.TestCase):
         )
         self.assertEqual(windows.shape, (70, 2))
         np.testing.assert_array_equal(np.unique(windows), np.arange(71))
+
+    def test_single_clip_canary_decompressor_fits_and_evaluates_all_admitted_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_directory = root / "data"
+            staging = root / "staging"
+            staging.mkdir()
+            _write_flat_training_bundle(data_directory)
+            bundle = load_training_bundle(data_directory)
+            arrays = build_training_arrays(bundle)
+            decoded_rows = []
+
+            def lightweight_loss(prediction, latent, **_ground):
+                total = prediction.square().mean() + latent.square().mean()
+                return {"total": total}
+
+            def accepted_metrics(_bundle, _arrays, _prediction, rows, **_kwargs):
+                decoded_rows.append(np.asarray(rows, dtype=np.int64).copy())
+                return {"accepted": True}
+
+            with (
+                mock.patch.object(
+                    g1_lmm_training,
+                    "orange_duck_decompressor_losses",
+                    side_effect=lightweight_loss,
+                ),
+                mock.patch.object(
+                    g1_lmm_training,
+                    "_decode_reconstruction_metrics",
+                    side_effect=accepted_metrics,
+                ),
+            ):
+                stage = g1_lmm_training._train_decompressor_stage(
+                    staging,
+                    bundle,
+                    arrays,
+                    TrainingConfig(
+                        device="cpu",
+                        batch_size=2,
+                        overfit_steps=1,
+                        decompressor_steps=1,
+                        stepper_steps=1,
+                        projector_steps=1,
+                        single_clip_overfit_canary=True,
+                    ),
+                    np.empty(0, dtype=np.int64),
+                    np.empty(0, dtype=np.int64),
+                )
+
+            self.assertEqual(stage.training_metrics["windows"], 255)
+            self.assertEqual(stage.training_metrics["fitted_rows"], 256)
+            self.assertTrue(stage.gate["accepted"])
+            self.assertEqual(stage.gate["withheld"], [])
+            self.assertEqual(
+                stage.gate["evaluation_scope"], "complete-corpus-overfit"
+            )
+            self.assertEqual(len(decoded_rows), 1)
+            np.testing.assert_array_equal(decoded_rows[0], np.arange(256))
+
+    def test_single_clip_canary_stepper_and_projector_use_complete_corpus(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_directory = Path(directory) / "data"
+            _write_flat_training_bundle(data_directory)
+            bundle = load_training_bundle(data_directory)
+            config = TrainingConfig(single_clip_overfit_canary=True)
+            empty = np.empty(0, dtype=np.int64)
+
+            pairs = g1_lmm_training._range_safe_training_windows(
+                bundle, 2, config, empty, empty
+            )
+            stepper = g1_lmm_training._range_safe_training_windows(
+                bundle, config.stepper_window, config, empty, empty
+            )
+            projector = g1_lmm_training._projector_fitted_mask(
+                bundle, config, empty, empty
+            )
+
+            self.assertEqual(pairs.shape, (255, 2))
+            self.assertEqual(stepper.shape, (237, 20))
+            np.testing.assert_array_equal(np.unique(pairs), np.arange(256))
+            np.testing.assert_array_equal(np.unique(stepper), np.arange(256))
+            np.testing.assert_array_equal(projector, bundle.admitted_mask)
+
+    def test_default_decompressor_cannot_accept_an_empty_withheld_population(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_directory = root / "data"
+            staging = root / "staging"
+            staging.mkdir()
+            _write_flat_training_bundle(data_directory)
+            bundle = load_training_bundle(data_directory)
+            arrays = build_training_arrays(bundle)
+            with self.assertRaisesRegex(ValueError, "withheld.*required"):
+                g1_lmm_training._train_decompressor_stage(
+                    staging,
+                    bundle,
+                    arrays,
+                    TrainingConfig(
+                        device="cpu",
+                        overfit_steps=1,
+                        decompressor_steps=1,
+                        stepper_steps=1,
+                        projector_steps=1,
+                    ),
+                    np.empty(0, dtype=np.int64),
+                    np.empty(0, dtype=np.int64),
+                )
+
+    def test_single_clip_canary_partial_receipts_bind_complete_corpus_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_directory = root / "data"
+            output_directory = root / "partial"
+            _write_flat_training_bundle(data_directory)
+            accepted_overfit = {
+                "accepted": True,
+                "final_loss": 0.01,
+                "frames": 64,
+                "initial_loss": 1.0,
+                "range": [0, 64],
+                "steps": 1,
+            }
+            accepted_autoencoder = mock.Mock(
+                gate={
+                    "accepted": True,
+                    "evaluation_scope": "complete-corpus-overfit",
+                    "fitted": {"accepted": True},
+                    "withheld": [],
+                },
+                training_metrics={"fitted_rows": 256, "windows": 255},
+            )
+            with (
+                mock.patch.object(
+                    g1_lmm_training,
+                    "_train_64_frame_overfit",
+                    return_value=accepted_overfit,
+                ),
+                mock.patch.object(
+                    g1_lmm_training,
+                    "_train_decompressor_stage",
+                    return_value=accepted_autoencoder,
+                ) as train_decompressor,
+            ):
+                receipt = train_flat_bundle(
+                    data_directory,
+                    output_directory,
+                    config=TrainingConfig(
+                        device="cpu",
+                        overfit_steps=1,
+                        decompressor_steps=1,
+                        stepper_steps=1,
+                        projector_steps=1,
+                        single_clip_overfit_canary=True,
+                    ),
+                    stage="decompressor",
+                )
+
+            call = train_decompressor.call_args.args
+            self.assertEqual(call[-2].shape, (0,))
+            self.assertEqual(call[-1].shape, (0,))
+            self.assertEqual(receipt["withheld"], [])
+            self.assertEqual(
+                receipt["model_scope"], "single-clip-overfit-canary"
+            )
+            self.assertEqual(
+                receipt["evaluation_scope"], "complete-corpus-overfit"
+            )
+            self.assertIs(receipt["config"]["single_clip_overfit_canary"], True)
+            for name in ("training.json", "evaluation.json"):
+                published = json.loads(
+                    (output_directory / name).read_text(encoding="utf-8")
+                )
+                self.assertEqual(published["status"], "rejected")
+                self.assertEqual(
+                    published["model_scope"], "single-clip-overfit-canary"
+                )
+                self.assertEqual(
+                    published["evaluation_scope"], "complete-corpus-overfit"
+                )
+                self.assertEqual(published["withheld"], [])
+
+    def test_default_train_path_still_selects_the_canonical_withheld_block(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_directory = root / "data"
+            output_directory = root / "partial"
+            _write_flat_training_bundle(data_directory)
+            accepted_overfit = {
+                "accepted": True,
+                "final_loss": 0.01,
+                "frames": 64,
+                "initial_loss": 1.0,
+                "range": [0, 64],
+                "steps": 1,
+            }
+            rejected_autoencoder = mock.Mock(
+                gate={
+                    "accepted": False,
+                    "fitted": {"accepted": True},
+                    "withheld": [{"accepted": False, "range": [131, 195]}],
+                },
+                training_metrics={"fitted_rows": 71, "windows": 70},
+            )
+            with (
+                mock.patch.object(
+                    g1_lmm_training,
+                    "_train_64_frame_overfit",
+                    return_value=accepted_overfit,
+                ),
+                mock.patch.object(
+                    g1_lmm_training,
+                    "_train_decompressor_stage",
+                    return_value=rejected_autoencoder,
+                ) as train_decompressor,
+                self.assertRaisesRegex(TrainingGateError, "decompressor"),
+            ):
+                train_flat_bundle(
+                    data_directory,
+                    output_directory,
+                    config=TrainingConfig(
+                        device="cpu",
+                        overfit_steps=1,
+                        decompressor_steps=1,
+                        stepper_steps=1,
+                        projector_steps=1,
+                    ),
+                    stage="all",
+                )
+
+            call = train_decompressor.call_args.args
+            np.testing.assert_array_equal(call[-2], np.array([131]))
+            np.testing.assert_array_equal(call[-1], np.array([195]))
+            training = json.loads(
+                (output_directory / "training.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(training["withheld"]["ranges"], [[131, 195]])
+            self.assertIs(training["config"]["single_clip_overfit_canary"], False)
+
+    def test_accepted_single_clip_canary_manifest_binds_exact_model_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_directory = root / "data"
+            output_directory = root / "accepted"
+            _write_flat_training_bundle(data_directory)
+            accepted_overfit = {
+                "accepted": True,
+                "final_loss": 0.01,
+                "frames": 64,
+                "initial_loss": 1.0,
+                "range": [0, 64],
+                "steps": 1,
+            }
+
+            def fake_decompressor(staging, bundle, *_args):
+                (staging / "latent.bin").write_bytes(b"latent")
+                (staging / "decompressor.bin").write_bytes(b"decompressor")
+                return mock.Mock(
+                    gate={
+                        "accepted": True,
+                        "evaluation_scope": "complete-corpus-overfit",
+                        "fitted": {"accepted": True},
+                        "withheld": [],
+                    },
+                    latent=np.zeros(
+                        (bundle.frames, bundle.dimensions.latent), dtype=np.float32
+                    ),
+                    training_metrics={"fitted_rows": 256, "windows": 255},
+                )
+
+            def fake_stepper(staging, *_args):
+                (staging / "stepper.bin").write_bytes(b"stepper")
+                return mock.Mock(
+                    gate={"accepted": True}, training_metrics={"windows": 237}
+                )
+
+            def fake_projector(staging, *_args):
+                (staging / "projector.bin").write_bytes(b"projector")
+                return mock.Mock(
+                    gate={"accepted": True}, training_metrics={"oracle_rows": 256}
+                )
+
+            with (
+                mock.patch.object(
+                    g1_lmm_training,
+                    "_train_64_frame_overfit",
+                    return_value=accepted_overfit,
+                ),
+                mock.patch.object(
+                    g1_lmm_training,
+                    "_train_decompressor_stage",
+                    side_effect=fake_decompressor,
+                ),
+                mock.patch.object(
+                    g1_lmm_training,
+                    "_train_stepper_stage",
+                    side_effect=fake_stepper,
+                ),
+                mock.patch.object(
+                    g1_lmm_training,
+                    "_train_projector_stage",
+                    side_effect=fake_projector,
+                ),
+                mock.patch.object(
+                    g1_lmm_training,
+                    "evaluate_exported_networks",
+                    return_value={"finite": True},
+                ),
+            ):
+                receipt = train_flat_bundle(
+                    data_directory,
+                    output_directory,
+                    config=TrainingConfig(
+                        device="cpu",
+                        overfit_steps=1,
+                        decompressor_steps=1,
+                        stepper_steps=1,
+                        projector_steps=1,
+                        single_clip_overfit_canary=True,
+                    ),
+                    stage="all",
+                )
+
+            manifest = json.loads(
+                (output_directory / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(receipt["accepted"])
+            self.assertEqual(
+                manifest["model_scope"], "single-clip-overfit-canary"
+            )
+            self.assertEqual(
+                receipt["evaluation_scope"], "complete-corpus-overfit"
+            )
+            self.assertEqual(receipt["decompressor_gate"]["withheld"], [])
 
     def test_stepper_gate_uses_exact_one_two_four_second_source_horizons(self):
         class ZeroStepper(torch.nn.Module):

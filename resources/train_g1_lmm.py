@@ -28,6 +28,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stepper-window", type=int, default=20)
     parser.add_argument("--withheld-frames", type=int, default=64)
     parser.add_argument("--withheld-halo", type=int, default=60)
+    parser.add_argument(
+        "--single-clip-overfit-canary",
+        action="store_true",
+        help=(
+            "fit and evaluate the complete admitted single-clip corpus without "
+            "claiming heldout generalization"
+        ),
+    )
     return parser
 
 
@@ -47,6 +55,7 @@ def main(argv: list[str] | None = None) -> int:
         stepper_window=arguments.stepper_window,
         withheld_frames=arguments.withheld_frames,
         withheld_halo=arguments.withheld_halo,
+        single_clip_overfit_canary=arguments.single_clip_overfit_canary,
     )
     receipt = train_flat_bundle(
         arguments.data_directory,

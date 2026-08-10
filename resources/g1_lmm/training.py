@@ -53,6 +53,12 @@ class TrainingGateError(RuntimeError):
         self.output = output
 
 
+_SINGLE_CLIP_OVERFIT_MODEL_SCOPE = "single-clip-overfit-canary"
+_SINGLE_CLIP_OVERFIT_EVALUATION_SCOPE = "complete-corpus-overfit"
+_WITHHELD_MODEL_SCOPE = "withheld-generalization"
+_WITHHELD_EVALUATION_SCOPE = "withheld-block-generalization"
+
+
 @dataclass(frozen=True)
 class TrainingConfig:
     seed: int = 1234
@@ -66,6 +72,7 @@ class TrainingConfig:
     stepper_window: int = 20
     withheld_frames: int = 64
     withheld_halo: int = 60
+    single_clip_overfit_canary: bool = False
     dt: float = 1.0 / 60.0
 
     def __post_init__(self) -> None:
@@ -84,10 +91,28 @@ class TrainingConfig:
                 raise ValueError(f"{name} must be positive")
         if self.withheld_halo < 0:
             raise ValueError("withheld_halo must be non-negative")
+        if type(self.single_clip_overfit_canary) is not bool:
+            raise ValueError("single_clip_overfit_canary must be an exact bool")
         if not np.isfinite(self.learning_rate) or self.learning_rate <= 0.0:
             raise ValueError("learning_rate must be positive and finite")
         if not np.isfinite(self.dt) or self.dt != 1.0 / 60.0:
             raise ValueError("dt must be exactly 1/60 for the 60 Hz model ABI")
+
+
+def _model_scope(config: TrainingConfig) -> str:
+    return (
+        _SINGLE_CLIP_OVERFIT_MODEL_SCOPE
+        if config.single_clip_overfit_canary
+        else _WITHHELD_MODEL_SCOPE
+    )
+
+
+def _evaluation_scope(config: TrainingConfig) -> str:
+    return (
+        _SINGLE_CLIP_OVERFIT_EVALUATION_SCOPE
+        if config.single_clip_overfit_canary
+        else _WITHHELD_EVALUATION_SCOPE
+    )
 
 
 def deterministic_withheld_ranges(
@@ -924,6 +949,64 @@ def _decode_reconstruction_metrics(
     return metrics
 
 
+def _validated_training_withheld_ranges(
+    config: TrainingConfig,
+    withheld_starts: np.ndarray,
+    withheld_stops: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    starts = np.asarray(withheld_starts, dtype=np.int64)
+    stops = np.asarray(withheld_stops, dtype=np.int64)
+    if starts.ndim != 1 or stops.ndim != 1 or starts.shape != stops.shape:
+        raise ValueError("training withheld ranges must be aligned vectors")
+    if config.single_clip_overfit_canary:
+        if len(starts) != 0:
+            raise ValueError("single-clip overfit canary must not select withheld ranges")
+    elif len(starts) == 0:
+        raise ValueError("withheld ranges are required outside the overfit canary")
+    return starts, stops
+
+
+def _range_safe_training_windows(
+    bundle: TrainingBundle,
+    window: int,
+    config: TrainingConfig,
+    withheld_starts: np.ndarray,
+    withheld_stops: np.ndarray,
+) -> np.ndarray:
+    starts, stops = _validated_training_withheld_ranges(
+        config, withheld_starts, withheld_stops
+    )
+    if config.single_clip_overfit_canary:
+        return range_safe_windows(bundle.range_starts, bundle.range_stops, window)
+    return range_safe_windows(
+        bundle.range_starts,
+        bundle.range_stops,
+        window,
+        excluded_starts=starts,
+        excluded_stops=stops,
+        exclusion_halo=config.withheld_halo,
+    )
+
+
+def _projector_fitted_mask(
+    bundle: TrainingBundle,
+    config: TrainingConfig,
+    withheld_starts: np.ndarray,
+    withheld_stops: np.ndarray,
+) -> np.ndarray:
+    starts, stops = _validated_training_withheld_ranges(
+        config, withheld_starts, withheld_stops
+    )
+    fitted = bundle.admitted_mask.copy()
+    for start, stop in zip(starts, stops):
+        fitted[
+            max(0, int(start) - config.withheld_halo) : min(
+                bundle.frames, int(stop) + config.withheld_halo
+            )
+        ] = False
+    return fitted
+
+
 def _train_decompressor_stage(
     staging: Path,
     bundle: TrainingBundle,
@@ -934,13 +1017,12 @@ def _train_decompressor_stage(
 ) -> AutoencoderStage:
     device = torch.device(config.device)
     _configure_determinism(config.seed + 1, device)
-    windows = range_safe_windows(
-        bundle.range_starts,
-        bundle.range_stops,
+    windows = _range_safe_training_windows(
+        bundle,
         2,
-        excluded_starts=withheld_starts,
-        excluded_stops=withheld_stops,
-        exclusion_halo=config.withheld_halo,
+        config,
+        withheld_starts,
+        withheld_stops,
     )
     if len(windows) == 0:
         raise ValueError("no fitted decompressor windows remain after withheld halo")
@@ -1082,12 +1164,17 @@ def _train_decompressor_stage(
         )
         metrics["range"] = [int(start), int(stop)]
         withheld_metrics.append(metrics)
-    gate = {
-        "accepted": bool(
+    if config.single_clip_overfit_canary:
+        accepted = bool(fitted_metrics["accepted"] and not withheld_metrics)
+    else:
+        accepted = bool(
             fitted_metrics["accepted"]
             and withheld_metrics
             and all(metrics["accepted"] for metrics in withheld_metrics)
-        ),
+        )
+    gate = {
+        "accepted": accepted,
+        "evaluation_scope": _evaluation_scope(config),
         "fitted": fitted_metrics,
         "withheld": withheld_metrics,
     }
@@ -1102,6 +1189,7 @@ def _train_decompressor_stage(
                 name: float(value.item()) for name, value in final_terms.items()
             },
             "final_batch_loss": last_loss,
+            "fitted_rows": int(np.count_nonzero(fitted_mask)),
             "initial_audit_loss": initial_loss,
             "initial_audit_loss_terms": {
                 name: float(value.item()) for name, value in initial_terms.items()
@@ -1308,21 +1396,19 @@ def _train_stepper_stage(
     _configure_determinism(config.seed + 2, device)
     dimensions = bundle.dimensions
     state = np.concatenate((bundle.features, autoencoder.latent), axis=1).astype(np.float32)
-    pair_windows = range_safe_windows(
-        bundle.range_starts,
-        bundle.range_stops,
+    pair_windows = _range_safe_training_windows(
+        bundle,
         2,
-        excluded_starts=withheld_starts,
-        excluded_stops=withheld_stops,
-        exclusion_halo=config.withheld_halo,
+        config,
+        withheld_starts,
+        withheld_stops,
     )
-    windows = range_safe_windows(
-        bundle.range_starts,
-        bundle.range_stops,
+    windows = _range_safe_training_windows(
+        bundle,
         config.stepper_window,
-        excluded_starts=withheld_starts,
-        excluded_stops=withheld_stops,
-        exclusion_halo=config.withheld_halo,
+        config,
+        withheld_starts,
+        withheld_stops,
     )
     if len(pair_windows) == 0 or len(windows) == 0:
         raise ValueError("no fitted stepper windows remain after withheld halo")
@@ -1482,13 +1568,9 @@ def _train_projector_stage(
 ) -> ProjectorStage:
     device = torch.device(config.device)
     _configure_determinism(config.seed + 3, device)
-    fitted = bundle.admitted_mask.copy()
-    for start, stop in zip(withheld_starts, withheld_stops):
-        fitted[
-            max(0, int(start) - config.withheld_halo) : min(
-                bundle.frames, int(stop) + config.withheld_halo
-            )
-        ] = False
+    fitted = _projector_fitted_mask(
+        bundle, config, withheld_starts, withheld_stops
+    )
     features = bundle.features[fitted]
     latent = autoencoder.latent[fitted]
     if len(features) == 0:
@@ -1627,6 +1709,7 @@ def _config_receipt(config: TrainingConfig) -> dict[str, object]:
         "overfit_steps": config.overfit_steps,
         "projector_steps": config.projector_steps,
         "seed": config.seed,
+        "single_clip_overfit_canary": config.single_clip_overfit_canary,
         "stepper_steps": config.stepper_steps,
         "stepper_window": config.stepper_window,
         "withheld_frames": config.withheld_frames,
@@ -1721,11 +1804,15 @@ def train_flat_bundle(
         "accepted": False,
         "config": _config_receipt(config),
         "data_manifest_sha256": bundle.manifest_sha256,
+        "evaluation_scope": _evaluation_scope(config),
+        "model_scope": _model_scope(config),
         "schema": "g1-lmm-training-v1",
         "stage": stage,
     }
     evaluation = {
         "accepted": False,
+        "evaluation_scope": _evaluation_scope(config),
+        "model_scope": _model_scope(config),
         "schema": "g1-lmm-evaluation-v1",
     }
     current_stage = "overfit"
@@ -1750,29 +1837,40 @@ def train_flat_bundle(
             return receipt
 
         current_stage = "decompressor"
-        range_lengths = (
-            bundle.range_stops.astype(np.int64) - bundle.range_starts.astype(np.int64)
-        )
-        eligible = np.flatnonzero(
-            range_lengths >= config.withheld_frames + 2 * config.withheld_halo
-        )
-        if len(eligible) == 0:
-            raise ValueError("no continuity-safe range can hold the withheld block and halo")
-        longest = int(eligible[np.argmax(range_lengths[eligible])])
-        withheld_starts, withheld_stops = deterministic_withheld_ranges(
-            bundle.range_starts[longest : longest + 1],
-            bundle.range_stops[longest : longest + 1],
-            frames=config.withheld_frames,
-            seed=config.seed,
-            margin=config.withheld_halo,
-        )
-        receipt["withheld"] = {
-            "halo": config.withheld_halo,
-            "ranges": [
-                [int(start), int(stop)]
-                for start, stop in zip(withheld_starts, withheld_stops)
-            ],
-        }
+        if config.single_clip_overfit_canary:
+            withheld_starts = np.empty(0, dtype=np.int64)
+            withheld_stops = np.empty(0, dtype=np.int64)
+        else:
+            range_lengths = (
+                bundle.range_stops.astype(np.int64)
+                - bundle.range_starts.astype(np.int64)
+            )
+            eligible = np.flatnonzero(
+                range_lengths >= config.withheld_frames + 2 * config.withheld_halo
+            )
+            if len(eligible) == 0:
+                raise ValueError(
+                    "no continuity-safe range can hold the withheld block and halo"
+                )
+            longest = int(eligible[np.argmax(range_lengths[eligible])])
+            withheld_starts, withheld_stops = deterministic_withheld_ranges(
+                bundle.range_starts[longest : longest + 1],
+                bundle.range_stops[longest : longest + 1],
+                frames=config.withheld_frames,
+                seed=config.seed,
+                margin=config.withheld_halo,
+            )
+        if config.single_clip_overfit_canary:
+            receipt["withheld"] = []
+            evaluation["withheld"] = []
+        else:
+            receipt["withheld"] = {
+                "halo": config.withheld_halo,
+                "ranges": [
+                    [int(start), int(stop)]
+                    for start, stop in zip(withheld_starts, withheld_stops)
+                ],
+            }
         autoencoder = _train_decompressor_stage(
             staging,
             bundle,
@@ -1898,6 +1996,7 @@ def train_flat_bundle(
                 "latent": bundle.dimensions.latent,
             },
             "output_fps": 60.0,
+            "model_scope": _model_scope(config),
             "schema": "g1-lmm-model/v1",
             "status": "accepted",
         }
