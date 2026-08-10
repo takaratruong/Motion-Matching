@@ -92,16 +92,44 @@ def _records(shard_root: Path) -> tuple[tuple[str, Path, dict[str, object]], ...
     return tuple(rows)
 
 
+def _bundle_records(
+    bundle_root: Path,
+) -> tuple[tuple[str, Path, dict[str, object]], ...]:
+    """Load all clean curb/slope pairs from a merged GRAIL bundle."""
+
+    raw = json.loads((bundle_root / "clips.json").read_text())
+    if not isinstance(raw, list):
+        raise ValueError(f"{bundle_root / 'clips.json'} must contain a list")
+    rows: list[tuple[str, Path, dict[str, object]]] = []
+    seen: set[str] = set()
+    for value in raw:
+        row = dict(value)
+        category = str(row.get("category", ""))
+        if category not in ("curb", "slope"):
+            continue
+        stem = str(row["stem"])
+        if stem in seen:
+            raise ValueError(f"duplicate bundle stem: {stem}")
+        seen.add(stem)
+        rows.append((f"bundle_{category}", bundle_root, row))
+    return tuple(rows)
+
+
 def build_archive(
     output: Path,
     *,
     shard_root: Path = DEFAULT_SHARD_ROOT,
+    bundle_root: Path | None = None,
     model_path: Path = DEFAULT_G1_MJCF,
     limit: int | None = None,
     progress_every: int = 10,
 ) -> dict[str, object]:
-    source = shard_root.expanduser().resolve()
-    rows = _records(source)
+    source = (
+        shard_root.expanduser().resolve()
+        if bundle_root is None
+        else bundle_root.expanduser().resolve()
+    )
+    rows = _records(source) if bundle_root is None else _bundle_records(source)
     if limit is not None:
         rows = rows[: int(limit)]
     fk = G1MujocoFK(model_path.expanduser().resolve())
@@ -139,7 +167,11 @@ def build_archive(
             n_frames=frame_count,
             terrain_position_env=np.zeros(3, dtype=np.float32),
             terrain_rotation_env_wxyz=TERRAIN_QUATERNION_WXYZ.copy(),
-            pose_source="c490_documented_fixed_minus90_yaw",
+            pose_source=(
+                "c490_documented_fixed_minus90_yaw"
+                if bundle_root is None
+                else str(raw.get("pose_source", "legacy_default_yaw"))
+            ),
         )
         geometry = GrailGeometry(
             stem=stem,
@@ -164,14 +196,19 @@ def build_archive(
         if progress_every > 0 and (
             index % progress_every == 0 or index == len(rows)
         ):
-            print(f"converted {index}/{len(rows)} C490 curb/slope clips", flush=True)
+            print(f"converted {index}/{len(rows)} curb/slope clips", flush=True)
 
     destination = output.expanduser().resolve()
     provenance = {
-        "schema": "mm-sonic-grail-c490-curb-slope-archive-v1",
-        "shard_root": str(source),
+        "schema": "mm-sonic-grail-curb-slope-archive-v2",
+        "source_root": str(source),
+        "source_layout": "c490_shards" if bundle_root is None else "merged_bundle",
         "g1_mjcf": str(model_path.expanduser().resolve()),
-        "source_families": list(FAMILIES),
+        "source_families": (
+            list(FAMILIES)
+            if bundle_root is None
+            else sorted({str(family) for family, _root, _row in rows})
+        ),
         "terrain_transform": {
             "position_world": [0.0, 0.0, 0.0],
             "yaw_deg": -89.99999237060547,
@@ -200,6 +237,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--shard-root", type=Path, default=DEFAULT_SHARD_ROOT)
+    parser.add_argument("--bundle-root", type=Path)
     parser.add_argument("--model", type=Path, default=DEFAULT_G1_MJCF)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--progress-every", type=int, default=10)
@@ -207,6 +245,7 @@ def main(argv: list[str] | None = None) -> int:
     result = build_archive(
         arguments.output,
         shard_root=arguments.shard_root,
+        bundle_root=arguments.bundle_root,
         model_path=arguments.model,
         limit=arguments.limit,
         progress_every=arguments.progress_every,

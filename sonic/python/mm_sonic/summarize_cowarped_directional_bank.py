@@ -14,12 +14,33 @@ import numpy as np
 def _quality(row: dict[str, object]) -> float:
     warp = dict(row["warp"])
     collision = dict(row["collision_audit"])
+    contact = dict(row.get("stance_contact_audit", {}))
+    approach = dict(row.get("stair_approach", {}))
+    natural_angle = abs(float(approach.get("signed_angle_deg_median", 0.0)))
     return float(
         float(warp["maximum_path_angle_deg"])
         + float(warp["maximum_facing_offset_deg"])
         + 20.0 * float(warp["lateral_offset_range_m"])
+        + natural_angle
         - 80.0 * float(warp["maximum_stance_run_drift_m"])
+        - 80.0 * float(contact.get("maximum_stance_sole_target_error_m", 0.0))
+        - 40.0 * float(contact.get("maximum_core_stance_probe_hover_m", 0.0))
         - 50.0 * float(collision["maximum_foot_penetration_m"])
+    )
+
+
+def _review_stratum(row: dict[str, object]) -> tuple[str, str, int, int]:
+    """Group natural phrases by terrain, traversal, and signed approach."""
+
+    approach = dict(row.get("stair_approach", {}))
+    angle = float(approach.get("signed_angle_deg_median", 0.0))
+    magnitude_bin = min(4, int(abs(angle) // 15.0))
+    sign = 0 if abs(angle) < 5.0 else (1 if angle > 0.0 else -1)
+    return (
+        str(row.get("clip_family", "unknown")),
+        str(row.get("clip_traversal", "unknown")),
+        sign,
+        magnitude_bin,
     )
 
 
@@ -51,6 +72,10 @@ def collect(root: Path) -> tuple[list[dict[str, object]], list[dict[str, object]
                 "warp": dict(report["warp"]),
                 "mesh_warp": dict(report["mesh_warp"]),
                 "collision_audit": dict(report["collision_audit"]),
+                "stance_contact_audit": dict(
+                    report.get("stance_contact_audit", {})
+                ),
+                "stair_approach": dict(report.get("stair_approach", {})),
             }
             row["selection_score"] = _quality(row)
             accepted.append(row)
@@ -69,6 +94,18 @@ def select_review(
         row = next(value for value in ordered if value["mode"] == mode)
         selected.append(row)
         selected_paths.add(str(row["report"]))
+        if len(selected) >= count:
+            return selected
+    used_strata = {_review_stratum(row) for row in selected}
+    for row in ordered:
+        if str(row["report"]) in selected_paths:
+            continue
+        stratum = _review_stratum(row)
+        if stratum in used_strata:
+            continue
+        selected.append(row)
+        selected_paths.add(str(row["report"]))
+        used_strata.add(stratum)
         if len(selected) >= count:
             return selected
     used_sources = {int(row["clip_index"]) for row in selected}
