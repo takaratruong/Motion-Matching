@@ -1505,6 +1505,10 @@ def _validate_build_mode_args(args):
         "slope_metadata",
     )
     if terrain_mode:
+        if hasattr(args, "_g1_xml_explicit") \
+                and not args._g1_xml_explicit:
+            raise ValueError(
+                "authored-slope terrain mode requires explicit --g1-xml")
         for field in (*terrain_fields, "g1_xml"):
             if not getattr(args, field, None):
                 raise ValueError(
@@ -1529,6 +1533,12 @@ def _validate_build_mode_args(args):
         raise ValueError(f"{mode} mode rejects terrain-only options")
 
 
+class _StoreExplicitG1XML(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        setattr(namespace, "_g1_xml_explicit", True)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Build validated Holden G1 terrain motion artifacts")
@@ -1546,7 +1556,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--slope-metadata")
     parser.add_argument("--grail-glob", default=DEFAULTS["grail_glob"])
     parser.add_argument("--grail-limit", type=int)
-    parser.add_argument("--g1-xml", default=DEFAULTS["g1_xml"])
+    parser.set_defaults(_g1_xml_explicit=False)
+    parser.add_argument(
+        "--g1-xml", default=DEFAULTS["g1_xml"], action=_StoreExplicitG1XML)
     parser.add_argument("--takara", default=DEFAULTS["takara"])
     parser.add_argument("--remap", default=DEFAULTS["remap"])
     return parser

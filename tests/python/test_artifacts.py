@@ -165,6 +165,30 @@ def repack_with_scene_metadata(pack, mutation):
         scene_json_bytes(index), (changed_scene, *pack.scenes[1:]))
 
 
+def repack_lmm_scene_asset(pack, attribute, payload):
+    scene = pack.scenes[0]
+    metadata = copy.deepcopy(scene.metadata)
+    descriptor_name = {
+        "terrain_bin": "heightfield",
+        "terrain_obj": "mesh",
+        "walkability_bin": "walkability",
+    }[attribute]
+    metadata[descriptor_name]["size_bytes"] = len(payload)
+    metadata[descriptor_name]["sha256"] = hashlib.sha256(payload).hexdigest()
+    scene_json = scene_json_bytes(metadata)
+    changed_scene = BuiltScene(
+        scene.scene_id,
+        scene_json,
+        payload if attribute == "terrain_bin" else scene.terrain_bin,
+        payload if attribute == "terrain_obj" else scene.terrain_obj,
+        payload if attribute == "walkability_bin" else scene.walkability_bin,
+    )
+    index = copy.deepcopy(pack.index)
+    index["scenes"][0]["size_bytes"] = len(scene_json)
+    index["scenes"][0]["sha256"] = hashlib.sha256(scene_json).hexdigest()
+    return ScenePack(scene_json_bytes(index), (changed_scene,))
+
+
 class ArtifactTests(unittest.TestCase):
 
     def test_flat_manifest_input_authentication_rejects_forgery_and_empty_validation(self):
@@ -1364,6 +1388,11 @@ class LMMTerrainPublisherTests(unittest.TestCase):
     @staticmethod
     def _publish(output, callback=lambda path: None):
         candidate = real_lmm_terrain_candidate()
+        return LMMTerrainPublisherTests._publish_candidate(
+            output, candidate, callback)
+
+    @staticmethod
+    def _publish_candidate(output, candidate, callback=lambda path: None):
         return publish_lmm_terrain_artifacts(
             output,
             candidate.artifacts,
@@ -1373,6 +1402,147 @@ class LMMTerrainPublisherTests(unittest.TestCase):
             candidate.scene_pack,
             callback,
         )
+
+    def test_lmm_terrain_publisher_decodes_coherently_rehashed_scene_assets(self):
+        candidate = real_lmm_terrain_candidate()
+        scene = candidate.scene_pack.scenes[0]
+
+        changed_heightfield = bytearray(scene.terrain_bin)
+        struct.pack_into("<f", changed_heightfield, 28, 0.0)
+
+        changed_walkability = bytearray(scene.walkability_bin)
+        nx, = struct.unpack_from("<I", changed_walkability, 8)
+        struct.pack_into("<I", changed_walkability, 8, nx + 1)
+
+        changed_classes = bytearray(scene.walkability_bin)
+        certified = changed_classes.index(1, 16)
+        changed_classes[certified] = 2
+
+        obj_lines = scene.terrain_obj.decode("ascii").splitlines(keepends=True)
+        first_vertex = obj_lines[0].split()
+        first_vertex[1] = format(float(first_vertex[1]) + 0.02, ".9g")
+        obj_lines[0] = " ".join(first_vertex) + "\n"
+        changed_obj = "".join(obj_lines).encode("ascii")
+
+        cases = (
+            ("binary exterior", "terrain_bin", bytes(changed_heightfield)),
+            ("walkability dimensions", "walkability_bin",
+             bytes(changed_walkability)),
+            ("walkability class semantics", "walkability_bin",
+             bytes(changed_classes)),
+            ("OBJ geometry", "terrain_obj", changed_obj),
+        )
+        for label, attribute, payload in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                output = os.path.join(temporary, "published")
+                changed_pack = repack_lmm_scene_asset(
+                    candidate.scene_pack, attribute, payload)
+                with self.assertRaisesRegex(ValueError, "terrain|heightfield|walkability|OBJ"):
+                    publish_lmm_terrain_artifacts(
+                        output, candidate.artifacts, candidate.features,
+                        candidate.manifest_base, candidate.validation,
+                        changed_pack, lambda path: None)
+
+    def test_lmm_terrain_publisher_recomputes_staged_dynamics_contacts_and_features(self):
+        from resources import build_g1_terrain_database as builder
+
+        def boundary_velocity(candidate):
+            candidate.artifacts.velocities[256, 0, 0] += np.float32(1.0)
+
+        def angular_velocity(candidate):
+            candidate.artifacts.angular_velocities[400, 1, 2] += np.float32(1.0)
+
+        def coherent_contact(candidate):
+            candidate.artifacts.contacts[400, 0] ^= np.uint8(1)
+            candidate.manifest_base["contact"]["observations"] = \
+                builder._flat_contact_receipt(
+                    candidate.artifacts.contacts,
+                    candidate.artifacts.range_starts,
+                    candidate.artifacts.range_stops,
+                    median_filter_frames=6,
+                )
+
+        def normalized_feature(candidate):
+            candidate.features.values[400, 0] += np.float32(1.0)
+
+        def normalized_offset(candidate):
+            candidate.features.offset[0] += np.float32(1.0)
+            candidate.manifest_base["feature"]["offset"] = \
+                candidate.features.offset.tolist()
+            candidate.manifest_base["feature"]["signature"] = \
+                builder._flat_feature_signature(
+                    candidate.manifest_base["feature"]["names"],
+                    (20, 40, 60),
+                    candidate.manifest_base["feature"]["weights"],
+                    candidate.features.offset, candidate.features.scale)
+
+        def normalized_scale(candidate):
+            candidate.features.scale[0] *= np.float32(1.1)
+            candidate.manifest_base["feature"]["scale"] = \
+                candidate.features.scale.tolist()
+            candidate.manifest_base["feature"]["signature"] = \
+                builder._flat_feature_signature(
+                    candidate.manifest_base["feature"]["names"],
+                    (20, 40, 60),
+                    candidate.manifest_base["feature"]["weights"],
+                    candidate.features.offset, candidate.features.scale)
+
+        cases = (
+            ("boundary velocity", boundary_velocity),
+            ("angular velocity", angular_velocity),
+            ("coherent contact", coherent_contact),
+            ("normalized feature", normalized_feature),
+            ("normalized offset", normalized_offset),
+            ("normalized scale", normalized_scale),
+        )
+        for label, mutation in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                candidate = copy.deepcopy(real_lmm_terrain_candidate())
+                mutation(candidate)
+                with self.assertRaisesRegex(ValueError, "terrain LMM"):
+                    self._publish_candidate(
+                        os.path.join(temporary, "published"), candidate)
+
+    def test_lmm_terrain_publisher_binds_both_database_ranges_to_sources(self):
+        cases = (("flat", 100), ("slope", 400))
+        for label, row in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                candidate = copy.deepcopy(real_lmm_terrain_candidate())
+                candidate.artifacts.positions[row, 1, 0] += np.float32(0.01)
+                with self.assertRaisesRegex(ValueError, "terrain LMM"):
+                    self._publish_candidate(
+                        os.path.join(temporary, "published"), candidate)
+
+    def test_lmm_terrain_manifest_rebuild_binds_task1_receipt_and_flat_map(self):
+        cases = ("task1 receipt", "flat source map", "continuity receipt")
+        for label in cases:
+            with self.subTest(label=label):
+                candidate = copy.deepcopy(real_lmm_terrain_candidate())
+                if label == "task1 receipt":
+                    receipt = candidate.manifest_base["slope_source_receipt"]
+                    receipt["fk_max_error_m"] += 1e-12
+                    receipt_sha = hashlib.sha256(
+                        scene_json_bytes(receipt)).hexdigest()
+                    candidate.manifest_base["terrain"] \
+                        ["source_receipt_sha256"] = receipt_sha
+                    candidate.validation["inputs"] \
+                        ["slope_source_receipt_sha256"] = receipt_sha
+                elif label == "flat source map":
+                    source_map = candidate.manifest_base["sources"][0]["source_map"]
+                    source_map["source_alpha"][100] = 0.25
+                    candidate.manifest_base["continuity"] \
+                        ["source_map_digest_sha256"] = hashlib.sha256(
+                            scene_json_bytes([
+                                source["source_map"] for source in
+                                candidate.manifest_base["sources"]
+                            ])).hexdigest()
+                else:
+                    candidate.manifest_base["continuity"] \
+                        ["maximum_admitted_local_rotation_step_rad"] -= 1e-6
+                with self.assertRaisesRegex(ValueError, "terrain LMM"):
+                    artifacts_module._normalized_lmm_terrain_inputs(
+                        candidate.manifest_base, candidate.validation,
+                        candidate.artifacts, candidate.features)
 
     @staticmethod
     def _old_output(parent):

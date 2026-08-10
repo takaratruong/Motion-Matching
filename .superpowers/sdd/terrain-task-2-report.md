@@ -113,8 +113,10 @@ validation.json
 - `py_compile` over all five modified production modules: PASS.
 - `git diff --check`: PASS.
 - Fresh atomic publication and exact 11-file tree audit: PASS.
-- The first 256 flat database/feature rows remain bit-identical to the
-  authenticated flat-v3 rebuild in the real integration test.
+- The first 256 flat database rows remain bit-identical to the authenticated
+  flat-v3 rebuild. Their normalized feature rows intentionally change because
+  Task 2 jointly fits offset/scale statistics across both published ranges;
+  those joint normalized values are independently recomputed and checked.
 - Existing flat-v3 and general builder tests in the prescribed suite pass.
 - The staged commit contains only the nine Task 2 implementation/test files
   plus this task-specific report.
@@ -128,3 +130,75 @@ separate Task 3 standalone validator remains the next independent release
 gate and is intentionally outside this commit.
 
 Concerns: None.
+
+## Review hardening follow-up
+
+Status: DONE
+
+Follow-up commit: this commit (`fix(data): independently validate terrain bundle`)
+
+### Reproduced defects
+
+A single focused RED run exercised five test methods and produced twelve
+expected failures in 6.435 s:
+
+- coherently rehashed G1HF exterior, G1WM dimensions, and OBJ geometry were
+  accepted without decoding;
+- caller-owned boundary velocity, angular velocity, coherently re-receipted
+  contact, and normalized-feature mutations were published without an
+  independent derivation;
+- flat and slope source-row substitutions were accepted;
+- a coherently rebound Task 1 receipt and flat source map were accepted; and
+- real terrain-mode CLI parsing reached payload assembly when `--g1-xml` was
+  omitted because the legacy default made it appear explicit.
+
+A subsequent semantic RED changed one valid G1WM certified byte to the valid
+stress class, coherently rehashed the pack, and was accepted. That isolated
+subtest failed in 24.288 s before the scene-authority fix.
+
+### Corrections
+
+- Each publication now rebuilds a private authority from all six hash-pinned
+  inputs. The rebuilt candidate is canonical-compared against the exact Task 1
+  receipt, flat-v3 source map, full manifest base, validation document, and
+  complete source-derived scene pack.
+- Every pre-callback, post-callback, and under-parent-lock pass decodes the
+  staged G1HF/v2 and G1WM/v1 payloads, requires the binary exterior to equal
+  the frozen terrain policy, reconstructs the canonical OBJ from G1HF, and
+  binds decoded dimensions and bounds to scene JSON.
+- Each pass binds `[0,256)` to the independently rebuilt flat-v3 database and
+  `[256,851)` to Task 1 `source[3:]`. It then derives velocity, angular
+  velocity, and Orange Duck contacts separately inside each range, jointly
+  rebuilds all 31 normalized feature columns, and bit-compares encoded values,
+  offsets, and scales. Contact, continuity, feature-signature, validation, and
+  temporal-partition receipts are compared to the recomputed/source authority.
+- Terrain mode now records whether `--g1-xml` appeared in real CLI argv and
+  rejects omission before assembly. Flat/general parsing retains the existing
+  canonical XML default, and direct programmatic callers retain compatibility.
+- Corrected the earlier report claim: flat database rows are bit-identical;
+  normalized flat feature rows intentionally use the joint two-range fit.
+
+### Verification
+
+- Original focused RED: 5 methods, 12 expected failures in 6.435 s.
+- Valid-class G1WM semantic RED: 1 expected subtest failure in 24.288 s.
+- Broader focused GREEN: 13 tests passed in 107.076 s.
+- Added encoded offset/scale and continuity-receipt GREEN: 2 tests passed in
+  45.967 s.
+- Final semantic scene GREEN: 2 tests passed in 29.003 s.
+- Fresh prescribed suite after the final production change: 161 tests passed
+  in 256.402 s.
+- Python byte compilation and `git diff --check`: PASS.
+- Hardened atomic republication: PASS, 851 frames, 2 clips, 1 scene.
+- Deterministic artifact hashes remained unchanged after republication:
+  manifest `0aa8a3b9bc21335c4b159a3b314204dbab53696b3b23daefad77a5ca9ab1ead9`,
+  database `966d0a64cb5f748157fa5840781388d12ab604d6b4553fcff1b1a05d42256156`,
+  features `e3d887be8e577eb2c9268c8bcc28efce509cdf2597dac397d2cbe37b0f73a563`.
+
+### Scope audit
+
+Only Task 2's builder, publisher, publisher/CLI tests, and this report belong
+to the follow-up. Task 3's validator implementation/tests and the preliminary
+learned output are excluded from this commit.
+
+Follow-up concerns: None.

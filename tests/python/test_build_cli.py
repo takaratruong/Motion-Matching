@@ -31,6 +31,28 @@ PYTHON = "/home/ubuntu/miniconda3/envs/diffsim/bin/python"
 
 
 class BuildCliTests(unittest.TestCase):
+    def test_authored_slope_main_requires_explicit_g1_xml_without_changing_legacy_default(self):
+        parser = builder._parser()
+        self.assertEqual(
+            parser.parse_args([]).g1_xml, builder.DEFAULTS["g1_xml"])
+        argv = [
+            "--authored-slope-terrain", "--output-fps", "60",
+            "--flat-data", "/data/flat-v3",
+            "--slope-robot", "/data/slope.pkl",
+            "--slope-usd", "/data/slope.usd",
+            "--slope-recon", "/data/recon.pkl",
+            "--slope-metadata", "/data/meta.pkl",
+        ]
+        error = io.StringIO()
+        with mock.patch.object(
+            builder, "_assemble_lmm_terrain_candidate",
+            side_effect=ValueError("payload assembly reached"),
+        ) as assemble, redirect_stderr(error):
+            status = builder.main(argv)
+        self.assertEqual(status, 1)
+        assemble.assert_not_called()
+        self.assertIn("--g1-xml", error.getvalue())
+
     def test_authored_slope_terrain_parser_is_mutually_exclusive_and_complete(self):
         values = [
             "--authored-slope-terrain", "--output-fps", "60",
