@@ -467,6 +467,52 @@ def _exact_sole_corners_world(
     )
 
 
+def _kinematic_stance_from_sole_motion(
+    sole_position_world: np.ndarray,
+    *,
+    fps: float,
+    maximum_speed_mps: float = 0.05,
+    minimum_run_frames: int = 4,
+    maximum_gap_frames: int = 2,
+) -> np.ndarray:
+    """Recover support phase when an imported clip's contact bits are sparse.
+
+    A genuine planted sole is nearly stationary in the source clip's world
+    frame even on stairs.  This remains true when the registered terrain's
+    contact reconstruction is incomplete, and is substantially safer than
+    inferring support from a target mesh after several matched snippets have
+    already been blended together.
+    """
+
+    sole = np.asarray(sole_position_world, dtype=np.float64)
+    if sole.ndim != 3 or sole.shape[1:] != (2, 3) or len(sole) < 2:
+        raise ContractError("sole motion must have shape [T,2,3] with T >= 2")
+    stance = np.linalg.norm(
+        np.gradient(sole, axis=0) * float(fps), axis=2
+    ) <= float(maximum_speed_mps)
+    for foot in range(2):
+        values = stance[:, foot]
+        starts = np.flatnonzero(~values[:-1] & values[1:]) + 1
+        stops = np.flatnonzero(values[:-1] & ~values[1:]) + 1
+        if values[0]:
+            starts = np.concatenate(([0], starts))
+        if values[-1]:
+            stops = np.concatenate((stops, [len(values)]))
+        for left, right in zip(stops[:-1], starts[1:], strict=True):
+            if 0 < right - left <= int(maximum_gap_frames):
+                values[left:right] = True
+        starts = np.flatnonzero(~values[:-1] & values[1:]) + 1
+        stops = np.flatnonzero(values[:-1] & ~values[1:]) + 1
+        if values[0]:
+            starts = np.concatenate(([0], starts))
+        if values[-1]:
+            stops = np.concatenate((stops, [len(values)]))
+        for start, stop in zip(starts, stops, strict=True):
+            if stop - start < int(minimum_run_frames):
+                values[start:stop] = False
+    return stance
+
+
 def build_terrain_row_features(
     library: CanonicalTerrainLibrary,
     database: TorchMotionDatabase,
@@ -575,7 +621,14 @@ def build_terrain_row_features(
         )
         source_path_normal[rows] = path_normal_local.astype(np.float32)
         source_path_hit[rows] = path_hit
-        current_contact = np.asarray(clip.contact[frames]) >= 0.5
+        reconstructed_contact = _kinematic_stance_from_sole_motion(
+            clip.sole_position_world,
+            fps=float(clip.fps),
+        )
+        reliable_contact = (
+            np.asarray(clip.contact, dtype=np.float32) >= 0.5
+        ) | reconstructed_contact
+        current_contact = reliable_contact[frames]
         contact_phase[rows] = (
             current_contact[:, 0].astype(np.int8)
             + 2 * current_contact[:, 1].astype(np.int8)
@@ -585,7 +638,7 @@ def build_terrain_row_features(
             + np.asarray(CONTACT_HORIZON_FRAMES, dtype=np.int64)[None]
         )
         contact_future[rows] = np.asarray(
-            clip.contact[future_contact_frames], dtype=np.float32
+            reliable_contact[future_contact_frames], dtype=np.float32
         ).transpose(0, 2, 1)
         joint_position[rows] = np.asarray(
             clip.joint_position[frames], dtype=np.float32

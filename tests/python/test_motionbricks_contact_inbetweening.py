@@ -298,6 +298,123 @@ class MotionBricksContactInbetweeningTest(unittest.TestCase):
         self.assertTrue(np.any(stance[14:, 0]))
         self.assertEqual(report["stance_span_count"], 2)
 
+    def test_trace_stance_falls_back_to_slow_exact_surface_geometry(self) -> None:
+        frame_count = 31
+        motion = StitchedMotion(
+            fps=50.0,
+            root_position_world=np.tile(
+                np.asarray((0.0, 0.0, 0.78), dtype=np.float32),
+                (frame_count, 1),
+            ),
+            root_quaternion_world_wxyz=np.tile(
+                np.asarray((1.0, 0.0, 0.0, 0.0), dtype=np.float32),
+                (frame_count, 1),
+            ),
+            joint_position=np.zeros((frame_count, 1), dtype=np.float32),
+            provenance=tuple(
+                FrameProvenance(0, frame, "synthetic")
+                for frame in range(frame_count)
+            ),
+            seam_indices=(),
+        )
+        field = RegularGridHeightField(
+            np.zeros((21, 41), dtype=np.float64),
+            spacing_m=0.1,
+            origin_xy=(-1.0, -1.0),
+        )
+
+        class Adapter:
+            frame = -1
+
+            @staticmethod
+            def sole_sphere_radii():
+                value = np.full(4, 0.02, dtype=np.float64)
+                return value, value
+
+            def sole_positions_for_pose(self, **_pose):
+                self.frame += 1
+                quad = np.asarray(
+                    (
+                        (-0.09, -0.05, 0.0),
+                        (0.09, -0.05, 0.0),
+                        (0.09, 0.05, 0.0),
+                        (-0.09, 0.05, 0.0),
+                    ),
+                    dtype=np.float64,
+                )
+                left = quad.copy()
+                right = quad.copy()
+                if self.frame <= 12:
+                    left[:, 0] += 0.0
+                    left[:, 2] = 0.02
+                else:
+                    left[:, 0] += 0.03 * (self.frame - 12)
+                    left[:, 2] = 0.12
+                if self.frame >= 16:
+                    right[:, 0] += 0.45
+                    right[:, 2] = 0.02
+                else:
+                    right[:, 0] += 0.45 - 0.03 * (16 - self.frame)
+                    right[:, 2] = 0.12
+                right[:, 1] += 0.20
+                return left, right
+
+        extras, report = _rigid_stance_extras_from_trace(
+            motion,
+            np.zeros((frame_count - 1, 2), dtype=bool),
+            adapter=Adapter(),
+            maximum_stance_speed_mps=0.18,
+            minimum_stance_run_frames=4,
+            target_height_field=field,
+        )
+
+        stance = extras["authored_stance_mask"]
+        self.assertTrue(report["geometry_fallback_used"])
+        self.assertEqual(report["source_stance_frame_foot_count"], 0)
+        self.assertTrue(np.any(stance[:12, 0]))
+        self.assertFalse(np.any(stance[16:, 0]))
+        self.assertFalse(np.any(stance[:12, 1]))
+        self.assertTrue(np.any(stance[18:, 1]))
+        self.assertEqual(report["stance_span_count"], 2)
+
+        native_speed = np.full((frame_count - 1, 2), 1.0, dtype=np.float64)
+        native_speed[:11, 0] = 0.002
+        native_speed[17:, 1] = 0.003
+        native_extras, native_report = _rigid_stance_extras_from_trace(
+            motion,
+            np.zeros((frame_count - 1, 2), dtype=bool),
+            adapter=Adapter(),
+            maximum_stance_speed_mps=0.18,
+            minimum_stance_run_frames=4,
+            target_height_field=field,
+            source_sole_speed_mps=native_speed,
+        )
+        self.assertTrue(native_report["source_kinematic_fallback_used"])
+        self.assertFalse(native_report["geometry_fallback_used"])
+        self.assertTrue(np.any(native_extras["authored_stance_mask"][:10, 0]))
+        self.assertTrue(np.any(native_extras["authored_stance_mask"][20:, 1]))
+
+        source_height = np.full((frame_count, 2), 0.08, dtype=np.float64)
+        source_height[:11, 0] = 0.006
+        source_height[17:, 1] = 0.005
+        height_extras, height_report = _rigid_stance_extras_from_trace(
+            motion,
+            np.zeros((frame_count - 1, 2), dtype=bool),
+            adapter=Adapter(),
+            maximum_stance_speed_mps=0.18,
+            minimum_stance_run_frames=4,
+            target_height_field=field,
+            source_sole_speed_mps=np.ones((frame_count, 2)),
+            source_sole_height_above_ground_m=source_height,
+            maximum_source_sole_ground_clearance_m=0.015,
+        )
+        self.assertTrue(height_report["source_ground_height_stance_used"])
+        self.assertFalse(height_report["geometry_fallback_used"])
+        np.testing.assert_array_equal(
+            height_extras["authored_stance_mask"],
+            source_height <= 0.015,
+        )
+
     def test_unreachable_slope_stance_uses_a_smooth_bounded_pelvis_tilt(self) -> None:
         frame_count = 25
         root = np.zeros((frame_count, 3), dtype=np.float32)

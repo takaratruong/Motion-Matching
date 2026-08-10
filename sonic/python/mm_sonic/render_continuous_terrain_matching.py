@@ -36,6 +36,7 @@ def main() -> int:
     parser.add_argument("--width", type=int, default=960)
     parser.add_argument("--height", type=int, default=540)
     parser.add_argument("--stride", type=int, default=2)
+    parser.add_argument("--camera-azimuth-offset-deg", type=float, default=90.0)
     args = parser.parse_args()
 
     with np.load(args.trace.expanduser().resolve(), allow_pickle=False) as data:
@@ -87,6 +88,7 @@ def main() -> int:
         joint_names=joint_names,
         width=args.width,
         height=args.height,
+        camera_azimuth_offset_deg=args.camera_azimuth_offset_deg,
     )
     print(result)
     return 0

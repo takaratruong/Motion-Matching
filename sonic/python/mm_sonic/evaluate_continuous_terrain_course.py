@@ -100,7 +100,7 @@ def build_mixed_course(
     # Candidate search includes future root/foot horizons, so a 0.4 m apron
     # made an otherwise valid traversal run off the finite query domain before
     # the character itself reached the end of the course.
-    x = np.arange(-3.5, 11.5 + spacing_m / 2.0, spacing_m)
+    x = np.arange(-3.5, 13.5 + spacing_m / 2.0, spacing_m)
     y = np.arange(-2.0, 2.0 + spacing_m / 2.0, spacing_m)
     grid_x, grid_y = np.meshgrid(x, y)
     height = np.zeros_like(grid_x)
@@ -204,6 +204,7 @@ def _reset_alignment(
     source_field: object,
     target_field: object,
     start_xy: tuple[float, float],
+    target_yaw_rad: float = 0.0,
 ) -> ForcedMotionAlignment:
     source_position = np.asarray(source_clip.root_position_world[source_frame], np.float64)
     source_yaw = _yaw(source_clip.root_quaternion_world_wxyz[source_frame])
@@ -221,7 +222,7 @@ def _reset_alignment(
     target_position = np.asarray(
         (start_xy[0], start_xy[1], float(target_surface[0]) + clearance)
     )
-    yaw_offset = -source_yaw
+    yaw_offset = float(target_yaw_rad) - source_yaw
     cosine = math.cos(yaw_offset)
     sine = math.sin(yaw_offset)
     rotated = np.asarray(
@@ -251,6 +252,16 @@ def _command_for_step(
 
     if profile == "straight":
         return (speed_mps, 0.0), 0.0, 0.0
+    if profile == "side_on_left":
+        # Traverse the terrain along +X while the body faces +Y.  This is a
+        # genuine 90-degree travel/facing request, not a pelvis-yaw relabel.
+        return (speed_mps, 0.0), math.pi / 2.0, 0.0
+    if profile == "side_on_right":
+        return (speed_mps, 0.0), -math.pi / 2.0, 0.0
+    if profile == "backward":
+        # The travel stick remains forward through the course while the body
+        # faces exactly backward, requiring a real backward terrain gait.
+        return (speed_mps, 0.0), math.pi, 0.0
     if profile == "two_stick":
         # Eight 1.6-second legs form a bounded octagonal loop.  Facing stays
         # fixed while travel spans 0, 45, 90, 135, and 180 degrees in both
@@ -350,6 +361,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
             output_grounding=args.output_grounding,
             vertical_halflife_s=args.vertical_halflife_s,
             maximum_vertical_step_m=args.maximum_vertical_step_m,
+            terrain_command_adaptation=(
+                not args.disable_terrain_command_adaptation
+            ),
         ),
         sole_geometry=sole_geometry,
     )
@@ -371,6 +385,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
         library.height_fields[flat_index],
         field,
         (args.start_x, args.start_y),
+        target_yaw_rad=math.radians(args.start_yaw_deg),
     )
     reset = matcher.reset_to_row(int(reset_row), alignment=alignment)
 
@@ -379,6 +394,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
     joints = [reset.joint_position.detach().cpu().numpy()]
     foot_probes = []
     contacts = []
+    source_sole_speeds = []
     selected_ids: list[str] = []
     selected_clip_indices: list[int] = []
     selected_source_frames: list[int] = []
@@ -395,6 +411,16 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
         library.folder.layout.left_foot_body_index,
         library.folder.layout.right_foot_body_index,
     ]
+    source_sole_speed_mps = tuple(
+        np.linalg.norm(
+            np.gradient(
+                np.asarray(clip.sole_position_world, dtype=np.float64), axis=0
+            )
+            * float(clip.fps),
+            axis=2,
+        )
+        for clip in library.canonical_clips
+    )
     for step in range(args.steps):
         requested_velocity, requested_heading, target_y = _command_for_step(
             args.command_profile,
@@ -431,6 +457,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
                 library.canonical_clips[clip_index].contact[source_frame] >= 0.5,
                 dtype=np.bool_,
             )
+        )
+        source_sole_speeds.append(
+            source_sole_speed_mps[clip_index][source_frame]
         )
         roots.append(result.root_position_world.detach().cpu().numpy())
         quaternions.append(
@@ -619,6 +648,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
         foot_position_world=foot.astype(np.float32),
         foot_probe_position_world=foot_probe.astype(np.float32),
         contact=contact,
+        source_sole_speed_mps=np.asarray(
+            source_sole_speeds, dtype=np.float32
+        ),
         requested_velocity_world_xy=requested_velocity_array.astype(np.float32),
         requested_heading_world_yaw=requested_heading_array.astype(np.float32),
         applied_velocity_world_xy=applied_velocity_array.astype(np.float32),
@@ -650,7 +682,14 @@ def main() -> int:
     parser.add_argument("--two-stick-leg-steps", type=int, default=80)
     parser.add_argument(
         "--command-profile",
-        choices=("straight", "steering", "two_stick"),
+        choices=(
+            "straight",
+            "steering",
+            "two_stick",
+            "side_on_left",
+            "side_on_right",
+            "backward",
+        ),
         default="straight",
     )
     parser.add_argument(
@@ -658,6 +697,7 @@ def main() -> int:
     )
     parser.add_argument("--start-x", type=float, default=-3.0)
     parser.add_argument("--start-y", type=float, default=0.0)
+    parser.add_argument("--start-yaw-deg", type=float, default=0.0)
     parser.add_argument("--terrain-spacing-m", type=float, default=0.05)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
@@ -685,6 +725,14 @@ def main() -> int:
     parser.add_argument("--joint-position-weight", type=float, default=0.25)
     parser.add_argument("--joint-velocity-weight", type=float, default=0.05)
     parser.add_argument("--disable-vertical-adaptation", action="store_true")
+    parser.add_argument(
+        "--disable-terrain-command-adaptation",
+        action="store_true",
+        help=(
+            "Preserve the exact two-stick travel/facing request even near "
+            "steep terrain instead of rotating it toward the terrain normal."
+        ),
+    )
     parser.add_argument("--output-grounding", action="store_true")
     parser.add_argument("--vertical-halflife-s", type=float, default=0.08)
     parser.add_argument("--maximum-vertical-step-m", type=float, default=0.012)

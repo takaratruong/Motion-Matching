@@ -14,6 +14,7 @@ from mm_sonic.canonical_terrain_matcher import (
     RegularGridHeightField,
     TerrainRowFeatures,
     _exact_sole_corners_world,
+    _kinematic_stance_from_sole_motion,
 )
 from mm_sonic.terrain_oracle.canonical import (
     ISAACLAB_BODY_NAMES,
@@ -24,6 +25,7 @@ from mm_sonic.terrain_oracle.math3d import RigidTransform
 from mm_sonic.terrain_oracle.terrain_mesh import TerrainMeshIndex
 from mm_sonic.evaluate_continuous_terrain_course import (
     _command_for_step,
+    _reset_alignment,
     build_flat_course,
 )
 from mm_sonic.torch_motion_data import MotionFolder
@@ -151,6 +153,25 @@ def test_exact_sole_corners_use_named_ankle_pose_and_rigid_geometry() -> None:
     )
 
 
+def test_kinematic_stance_recovers_alternating_plants_and_rejects_apex() -> None:
+    frames = 40
+    sole = np.zeros((frames, 2, 3), dtype=np.float64)
+    sole[:, 0, 1] = 0.10
+    sole[:, 1, 1] = -0.10
+    sole[16:, 0, 0] = np.arange(frames - 16) * 0.02
+    sole[:20, 1, 0] = np.arange(20) * 0.02
+    sole[20:, 1, 0] = sole[19, 1, 0]
+    # A two-frame stationary flight apex is too short to become a plant.
+    sole[7:9, 1] = sole[7, 1]
+
+    stance = _kinematic_stance_from_sole_motion(sole, fps=50.0)
+
+    assert np.all(stance[1:15, 0])
+    assert not np.any(stance[18:, 0])
+    assert not np.any(stance[:18, 1])
+    assert np.all(stance[21:-1, 1])
+
+
 def test_two_stick_profile_is_closed_and_spans_backward_travel() -> None:
     field, metadata = build_flat_course()
     height, _normal, hit = field.sample(
@@ -178,6 +199,65 @@ def test_two_stick_profile_is_closed_and_spans_backward_travel() -> None:
         )
     )
     assert float(np.max(separation)) == np.pi
+
+
+def test_terrain_omnidirectional_profiles_keep_travel_and_facing_independent() -> None:
+    expected_heading = {
+        "side_on_left": np.pi / 2.0,
+        "side_on_right": -np.pi / 2.0,
+        "backward": np.pi,
+    }
+    for profile, heading in expected_heading.items():
+        velocity, actual_heading, target_y = _command_for_step(
+            profile,
+            step=0,
+            root_position_world=np.zeros(3),
+            speed_mps=0.4,
+            start_x=0.0,
+        )
+        np.testing.assert_allclose(velocity, (0.4, 0.0))
+        np.testing.assert_allclose(actual_heading, heading)
+        assert target_y == 0.0
+
+
+def test_reset_alignment_preserves_requested_nonzero_world_yaw() -> None:
+    field, _metadata = build_flat_course()
+    source_yaw = 0.4
+    source = SimpleNamespace(
+        root_position_world=np.asarray(((0.5, -0.2, 0.8),)),
+        root_quaternion_world_wxyz=np.asarray(
+            ((np.cos(source_yaw / 2.0), 0.0, 0.0, np.sin(source_yaw / 2.0)),)
+        ),
+        sole_position_world=np.asarray(
+            ((((0.4, -0.3, 0.0), (0.4, -0.1, 0.0))),)
+        ).reshape(1, 2, 3),
+    )
+    target_yaw = np.pi / 2.0
+    alignment = _reset_alignment(
+        source,
+        0,
+        field,
+        field,
+        (2.0, 1.0),
+        target_yaw_rad=target_yaw,
+    )
+    np.testing.assert_allclose(
+        alignment.yaw_offset_rad,
+        target_yaw - source_yaw,
+    )
+    cosine = np.cos(alignment.yaw_offset_rad)
+    sine = np.sin(alignment.yaw_offset_rad)
+    source_root = source.root_position_world[0]
+    rotated_xy = np.asarray(
+        (
+            cosine * source_root[0] - sine * source_root[1],
+            sine * source_root[0] + cosine * source_root[1],
+        )
+    )
+    np.testing.assert_allclose(
+        rotated_xy + np.asarray(alignment.translation_world_xyz[:2]),
+        (2.0, 1.0),
+    )
 
 
 class _FlatField:

@@ -2305,3 +2305,247 @@ The aggregate deviation from the raw source reaches 0.379 rad because it
 includes both the separately bounded foothold and swing repairs; the
 aggregate gate is therefore 0.40 rad, while each nonlinear solve retains its
 0.35-rad authority and the old 0.66-rad saturated branch remains rejected.
+
+The apparent absence of descent contacts was an import-label problem, not an
+absence of usable gait phase.  Several C490 stair clips expose sparse contact
+bits over the portions selected by the matcher, while their source-world sole
+kinematics contain long, nearly stationary alternating plants.  Canonical
+terrain rows now union the imported contact bits with source-world sole-speed
+plants (<=0.05 m/s for at least four frames), and every saved continuous trace
+carries the selected source sole speed explicitly.  On stair clip 1000 this
+increases searchable support-phase rows from 35 to 377 of 454.  On the full
+phase-aware procedural course it reduces retrieval transitions from 78 to 54
+and yields eight alternating native support spans through the descent window,
+rather than trying to reconstruct plants from an already blended target pose.
+
+The phase-aware descent/ramp canary is mechanically and visually admitted.
+Using all native kinematic plants gives 0.89 mm maximum stance target error,
+0.64 mm stance-run drift, four-corner support, and no body collision.  Initial
+joint-space time subdivision made one free sole cut a riser by 20.60 mm; a
+single smooth flight-only clearance arc (33.84 mm maximum lift) reduced exact
+penetration to 3.01 mm without moving planted targets.  Eight additional local
+time-density frames then reduced the repair's 0.225-rad temporal step to 0.140
+rad while retaining 2.98 mm exact foot penetration, zero body penetration, and
+8.75 m/s^2 root acceleration.  Dense review shows a natural alternating
+descent and walk-out without the earlier kick/shuffle or knee snap.  Aggregate
+deviation from the raw proposal is 0.429 rad because it includes the separately
+bounded foothold, swing, and in-betweening edits; the visually reviewed
+aggregate ceiling is therefore 0.45 rad.  Each nonlinear solve remains bounded
+at 0.35 rad, and the old 0.66-rad saturated kick branch remains rejected.
+
+A greedy curved-course ablation increased the future-contact timing weight
+from 4 to 16.  It is rejected: although this was intended to suppress the six
+same-foot repeats in the baseline curved trace, it committed to a phase-safe
+local sequence that reached a search dead-end at step 515 near the ascent
+approach.  No target-supported successor remained (best prospective clearance
+was -22.2 mm).  Stronger local phase weighting is therefore not the correct
+fix; the next retrieval change should jointly look ahead over terrain support,
+contact phase, and command progress rather than hardening a greedy term.
+
+The completed quiet-arm MotionBricks canonical overlay was also tested on the
+same curved course with 64 balanced omnidirectional clips.  Retrieval used
+MotionBricks conservatively (75 frames total: 25 on the approach and 50 on the
+down-ramp, zero on the stairs/crest/descent), reduced transitions from 95 to
+80 and same-foot repeats from six to four, and slightly improved heading MAE
+from 28.3 to 26.5 degrees.  It is nevertheless rejected as the next expensive
+repair candidate: 36-second progress fell from 11.39 to 10.65 m and the trace
+did not reach the final rough segment.  The overlay is a useful flat/low-slope
+source, but it does not replace sequence-level terrain/facing planning.
+
+The first unified straight-course rigid-contact pass rejected before IK at the
+ascent-to-crest exchange: every stance had an exact support candidate, but the
+planner required its raw active-stance pelvis-offset path to move no more than
+15 mm per frame, and no sequence could meet that internal proposal bound near
+source frames 730--770.  A focused ascent-top canary separated proposal motion
+from delivered motion: allowing up to 50 mm in the raw proposal and applying a
+three-frame zero-phase pelvis filter reduced the realized correction step from
+31.70 to 4.22 mm.  The delivered motion has 0.98 mm sole error, 0.42 mm stance
+drift, 2.72 mm exact foot penetration, zero body penetration, 14.55 mm root
+step, 0.140 rad joint step, and 7.08 m/s^2 root acceleration.  Dense 10 fps
+review shows a normal alternating ascent and crest step with no kick, knee
+snap, or shuffle.  Its 0.506-rad aggregate difference from the raw proposal is
+admitted at a 0.55-rad aggregate ceiling; each IK solve remains limited to
+0.35 rad and the old 0.66-rad kick branch remains rejected.
+
+The next unified pass proved that the remaining rejection was localized, not
+a failure of the continuous matcher or support planner.  One long right-foot
+plant near world x=4.96 m on the early descent reached a near-singular leg
+configuration: the surrounding frames fit the identical rigid target, but the
+middle of the plant saturated the 0.35-rad leg solve and missed by 31.3 mm.
+Increasing vertical lowering to 50 mm was rejected experimentally because it
+did not improve this residual.  The bounded pelvis-pose repair already used by
+the rough-slope builder instead found a six-frame, smoothly eased correction:
+10 mm downward and 6 degrees of local pitch, with zero roll.  On the focused
+930--1080 canary this lowers the delivered planted-sole residual to 8.46 mm,
+stance drift to 6.15 mm, exact foot penetration to 2.90 mm, and body
+penetration to zero; maximum joint step is 0.140 rad, root step 16.11 mm, and
+root acceleration 8.79 m/s^2.  Dense 25-fps review shows a continuous natural
+descent without a snap, hover, buried foot, or pose teleport.  The repair is
+only invoked after measured vertical reach repair fails and all unchanged
+contact, collision, smoothness, root-height, and aggregate-IK gates still
+pass.  The complete straight course and curved steering course are now being
+re-evaluated with this localized fallback.
+
+The complete-course follow-up separated two remaining free-foot collision
+mechanisms from planted-contact quality.  A focused former 35 mm collision
+window needed only an 11.88 mm smooth swing lift and passed at 1.82 mm exact
+foot penetration.  On the complete course, planted contacts were already
+strong (1.73 mm maximum stance error, 0.73 mm stance-run drift, and zero body
+penetration), but a later flight near raw frame 1360 remained 16.35 mm inside
+terrain after a sole-only lift.  The collision-driven target exposed a second
+IK branch ambiguity: adding only 0.105 rad of anticipated swing-knee flexion,
+shared with hip and ankle before refitting the same raised sole, reduced that
+focused window to 3.35 mm penetration, zero body penetration, 0.36 mm stance
+error, 0.26 mm drift, and a 0.139 rad joint step.  The final complete course
+now passes physically with 3.66 mm maximum foot penetration, zero body
+penetration, 2.73 mm stance error, 1.77 mm stance drift, a 0.140 rad joint
+step, and 10.40 m/s^2 root acceleration.  Dense review of the complete clip
+and both formerly failing windows shows no snap, hover, buried foot, repeated
+kick, or visible glide.  Its 0.618-rad aggregate change combines several
+individually bounded edits; it is admitted under a visually reviewed 0.65-rad
+aggregate ceiling while each nonlinear solve remains capped at 0.35 rad.
+
+True side-on terrain travel requires preserving the MotionBricks gait phase
+instead of repeatedly retrieving isolated rows.  The settled
+`omni_steady_s40_t2_h6__mirror` source has approximately -88 degrees of
+travel-versus-facing separation; after rigid registration it advances along
+the course while the pelvis faces about +90 degrees.  The online matcher did
+track this command well (about 2.3 degrees heading error and 9.91 m progress)
+but introduced 33 retrieval transitions, which fragmented its plant phases.
+A direct frames-300:599 trace keeps one unbroken six-second gait.  Its first
+version also exposed a real registration bug: subtracting target height at the
+first frame embedded a source authored on z=0 by the course's initial 28.17 cm
+elevation.  Registering the source floor to absolute target height restores
+normal 0.67--0.75 m pelvis clearance and makes every rigid foothold plannable.
+
+The direct lateral source can fit the planted soles with larger proposal IK
+(8.13 mm stance-target residual and 2.54 mm drift), but that alone is rejected:
+the shin/body enters risers by 37.53 mm.  Visual and numeric localization show
+why.  Partial-support planning placed early soles only 5.7--6.6 cm from tread
+edges, while sole-only swing IK kept the newly released knee nearly straight.
+An ascent-pattern knee prior removes all later body collisions and lowers the
+worst collision to 34.09 mm, but applying that prior during stance was also
+rejected because it perturbed support reach.  The current constructive pass
+therefore combines complete-sole tread placement, a one-tread (<=19 cm)
+vertical cadence, the full bounded +/-12 cm side-on spatial warp, and
+swing-only anticipated knee flexion.  Delivered root smoothness, exact sole
+contact, and full-body collision remain the acceptance criteria.
+
+That first direct side-on source is now rejected at the source-selection
+stage, not merely at terrain IK.  Its settled six-second window produced only
+eight stable left-foot plants versus four right-foot plants under the old
+speed/contact detector, and the resulting terrain motion visibly repeated a
+kick/shuffle.  A 4.5 cm pelvis-flexion continuation reduced its worst body
+penetration from 28.43 to 12.08 mm but could not clear the riser and increased
+stance error to 43.51 mm, confirming that repair was preserving the wrong gait.
+A scan of all lateral MotionBricks steady clips found a cleaner source:
+`omni_steady_s40_t2_h5` has seven swing peaks per foot, zero same-foot repeats,
+40-frame cadence on both feet, balanced 5.2/4.5 cm median swing lift, and only
+26 lightly anti-scissor-corrected frames (4.24e-2 rad maximum hip-roll edit).
+For these flat-authored sources, sole height above the known source floor is a
+more faithful phase label than either the noisy contact bits or horizontal
+sole speed.  A 15 mm source-ground clearance threshold recovers seven left and
+eight right stance spans in perfectly alternating order; the fixed-terrain
+solver then freezes those plants in world space, so this phase recovery does
+not retain the source's horizontal stance skate.
+
+The first complete h5 plan rejected only after an exhaustive geometric search:
+all 15 stance footprints had exact full-sole support, but no sequence connected
+the left plant at frames 99:116.  This exposed an axis bug in the experiment
+configuration rather than a missing foothold.  The natural side gait keeps its
+soles at roughly -74 to -103 degrees while travelling in +x, so stair-direction
+correction is the planner's *lateral* foot axis.  The run had granted 30 cm to
+the longitudinal/cross-stair axis and hardcoded only 8 cm laterally, a mistake
+the old toe-forward shuffle had masked.  The postprocessor now exposes both
+axis bounds and lattice sizes independently; the corrected side-on solve uses
+10 cm cross-stair and 30 cm along-travel authority.
+
+That corrected foothold solve also established a more important representation
+limit.  The clean `omni_steady_s40_t2_h5` flat strafe produced a valid
+alternating full-sole plan, but fitting it to 15 cm stair rises still left
+33.26 mm stance error, 39.79 mm foot penetration, and 42.88 mm body/riser
+penetration.  The problem is no longer source phase or foothold selection: a
+flat lateral pose is the wrong prior for stair flexion, and sole-only IK cannot
+turn it into a natural side-step climb.  That branch is retired rather than
+being hidden by stronger pelvis or leg corrections.
+
+The stairs500 clean archive contains substantially better priors than the
+earlier selection exposed.  Clip 473 is a real 40.15-degree right-oblique
+ascent and clip 485 is a 34.72-degree left-oblique ascent; clip 242 supplies a
+33.07-degree left-oblique descent.  Their unmodified full-body collision
+audits admit at
+2.01--4.25 mm maximum foot penetration, zero forbidden-body penetration,
+0.1269 rad or less native joint step, and 8.04 m/s^2 or less root acceleration.
+Dense review of all three shows ordinary alternating stair cadence without the
+repeated one-leg kick/shuffle of the discarded flat-strafe source.
+
+A small paired motion-and-terrain warp extends the 40.15-degree natural ascent
+instead of inventing the gait.  The right-going 9.67-degree path warp reaches
+approximately 50 degrees while reporting 1.81 mm detected-stance error,
+0.45 mm stance-run drift, 4.75 mm maximum foot penetration, zero body
+penetration, a 0.240-rad bounded aggregate joint correction, and
+10.08 m/s^2 root acceleration.  Its mirrored path variant is comparably
+clean in dense visual review.  A stronger 35.37-degree extension reaches
+roughly 75 degrees with 1.72 mm detected-stance error, 0.40 mm drift, 4.75 mm
+foot penetration, and zero body penetration.  Directly twisting the pelvis of the
+same natural ascent by 45 or 75 degrees is rejected: it saturates the leg solve
+and yields 65--241 mm stance error.  Thus extreme approach angle must be
+authored through the path/footfall geometry, not by rotating the body over
+unchanged plants.
+
+The first stop/restart retime exposed that collision plus an aggregate stance
+minimum was still insufficient.  On clips 473/485 the narrow real stair mesh
+supported only one probe of one sole over much of the passage; source stance
+detection consequently saved 204 left-foot plant frames and zero right-foot
+plants for the 50/75-degree family.  The low reported stance error had only
+graded the recognized left foot.  These visually plausible clips are therefore
+not admitted to the training bank.  Paired directional authoring now requires
+at least two stance runs and eight two-probe supported stance frames for each
+foot, and every recognized stance frame must have at least two support probes,
+before collision auditing.  Wide synthetic stairs and exact scene mirroring
+are now used for extreme angles instead of forcing them onto narrow real
+stairs.
+
+Paired directional authoring now attenuates arms to 0.35 and wrists to 0.10
+with a two-frame Gaussian before warping.  This leaves every lower-body pose,
+root, and foothold mechanism unchanged while preventing high-energy hand swing
+from becoming a compulsory terrain-correlated cue or a real-robot thermal
+load.  The attenuated result is re-run through the same mechanics and exact
+whole-body collision audit.
+
+A wide-stair source now supplies the first strictly admitted extreme oblique
+ascent.  Stairs500 clip 385 begins as a natural 27.65-degree approach on six
+14.8 cm rises with 46.9 cm treads; a paired curve has a 21.36-degree nominal
+peak and the delivered central path measures a 55.5-degree median approach
+after gait-scale velocity oscillation is averaged out.  The source needed ten local
+in-between frames to remove one 0.240-rad IK step.  Rather than accepting the
+resulting uneven-time acceleration, a minimal 1.136x whole-clip retime keeps
+the identical path and footholds while reducing maximum joint step to 0.115
+rad and root acceleration to 27.41 m/s^2.  The serialized result has five
+stance spans per foot, 316/280 supported stance frames, four-probe core
+support, 7.17 mm maximum stance-target error, 2.43 mm stance-run drift, 2.29
+mm exact foot penetration, and zero forbidden-body penetration.  Dense ascent
+review shows an ordinary alternating stair cadence rather than the discarded
+kick/shuffle prior.
+
+The right-oblique clip-140 descent and its exact scene mirror are also now a
+strict pair.  The source realizes approximately 56 degrees and the mirrored
+motion swaps all left/right joints, stance histories, support probes, command
+labels, and the paired terrain before reversing triangle winding.  An
+independent audit of the serialized mirror—not copied source metrics—reports
+five/four stance spans, 253/228 supported frames, four-probe core support,
+5.28 mm stance-target error, 1.47 mm drift, 2.38 mm exact foot penetration,
+and zero forbidden-body penetration.  Thus left/right extreme descent
+coverage is geometry-preserving and mechanically symmetric rather than a
+second hand-authored approximation.
+
+Stop/restart, reverse, and bounce schedules were then generated only from the
+strict balanced clip-140 descent and clip-385 ascent.  The first collision and
+mechanics screen passed all seven timing pilots per source (maximum foot
+penetration 2.55 mm and zero body penetration), but the longer 30-frame stop
+exposed 16.73 mm stance-run drift on the ascent retime versus 1.84 mm on the
+descent.  The compound admission limit is therefore tightened from 20 to 10
+mm: all three planted descent stops remain admitted and all three skatey
+ascent stops are removed.  The remaining temporal variants stay outside the
+curated bank until dense visual review and are explicitly not counted as new
+spatial terrain skills.

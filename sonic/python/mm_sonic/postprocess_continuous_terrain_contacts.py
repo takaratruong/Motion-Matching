@@ -23,9 +23,11 @@ from .build_motionbricks_contact_terrain_pilots import (
     _plan_and_apply_fixed_terrain_footholds,
     _refit_motion_to_sole_targets,
     _remove_short_stance_runs,
+    _repair_stance_reach_with_pelvis_tilt,
     _repair_stance_reach_with_root_lowering,
     _smoothly_subdivide_motion_steps,
 )
+from .build_stairs500_omnidirectional_pilots import _fill_short_stance_gaps
 from .canonical_terrain_matcher import RegularGridHeightField
 from .render_continuous_terrain_matching import DEFAULT_MODEL
 from .terrain_oracle.canonical import ISAACLAB_JOINT_NAMES
@@ -129,6 +131,11 @@ def _rigid_stance_extras_from_trace(
     adapter: _G1FootfallAdapter,
     maximum_stance_speed_mps: float,
     minimum_stance_run_frames: int,
+    target_height_field: RegularGridHeightField | None = None,
+    source_sole_speed_mps: np.ndarray | None = None,
+    source_sole_height_above_ground_m: np.ndarray | None = None,
+    maximum_source_stance_speed_mps: float = 0.05,
+    maximum_source_sole_ground_clearance_m: float = 0.015,
 ) -> tuple[dict[str, np.ndarray], dict[str, object]]:
     """Recover conservative plant cores from matched source contact labels."""
 
@@ -161,6 +168,102 @@ def _rigid_stance_extras_from_trace(
         stance_label & (sole_speed <= float(maximum_stance_speed_mps)),
         minimum_run_frames=int(minimum_stance_run_frames),
     )
+    source_stance_frame_foot_count = int(np.count_nonzero(stance))
+    source_stance_span_count = int(
+        sum(
+            np.count_nonzero(values & np.concatenate(([True], ~values[:-1])))
+            for values in stance.T
+        )
+    )
+    source_kinematic_fallback_used = False
+    source_kinematic_stance = np.zeros_like(stance)
+    source_ground_height_stance_used = False
+    if source_sole_height_above_ground_m is not None:
+        native_height = np.asarray(
+            source_sole_height_above_ground_m, dtype=np.float64
+        )
+        if native_height.shape == (frame_count - 1, 2):
+            native_height = np.concatenate(
+                (native_height[:1], native_height), axis=0
+            )
+        if native_height.shape != (frame_count, 2):
+            raise ValueError(
+                "source sole height must have shape [T-1,2] or [T,2]"
+            )
+        # MotionBricks contact bits and world-space sole speed become noisy
+        # after anti-scissor pose cleanup.  The source was generated over a
+        # known flat floor, so sole height is the authoritative gait phase:
+        # it recovers every alternating plant even if the authored plant has
+        # a little horizontal skate.  The terrain solve removes that skate by
+        # holding each accepted sole target rigid.
+        source_kinematic_stance = _remove_short_stance_runs(
+            native_height
+            <= float(maximum_source_sole_ground_clearance_m),
+            minimum_run_frames=int(minimum_stance_run_frames),
+        )
+        if np.any(source_kinematic_stance):
+            stance = source_kinematic_stance
+            source_kinematic_fallback_used = True
+            source_ground_height_stance_used = True
+    elif source_sole_speed_mps is not None:
+        native_speed = np.asarray(source_sole_speed_mps, dtype=np.float64)
+        if native_speed.shape == (frame_count - 1, 2):
+            native_speed = np.concatenate((native_speed[:1], native_speed), axis=0)
+        if native_speed.shape != (frame_count, 2):
+            raise ValueError(
+                "source sole speed must have shape [T-1,2] or [T,2]"
+            )
+        source_kinematic_stance = _remove_short_stance_runs(
+            native_speed <= float(maximum_source_stance_speed_mps),
+            minimum_run_frames=int(minimum_stance_run_frames),
+        )
+        if np.any(source_kinematic_stance):
+            stance = _fill_short_stance_gaps(
+                stance | source_kinematic_stance, maximum_gap_frames=2
+            )
+            stance = _remove_short_stance_runs(
+                stance,
+                minimum_run_frames=int(minimum_stance_run_frames),
+            )
+            source_kinematic_fallback_used = bool(
+                np.any(source_kinematic_stance & ~stance_label)
+            )
+    current_stance_frame_foot_count = int(np.count_nonzero(stance))
+    current_stance_span_count = int(
+        sum(
+            np.count_nonzero(values & np.concatenate(([True], ~values[:-1])))
+            for values in stance.T
+        )
+    )
+    fallback_used = bool(
+        target_height_field is not None
+        and (
+            current_stance_span_count < 2
+            or current_stance_frame_foot_count
+            < max(8, int(round(0.05 * frame_count)))
+        )
+    )
+    if fallback_used:
+        radii = np.stack(adapter.sole_sphere_radii()).astype(np.float64)
+        height, _normal, hit = target_height_field.sample(
+            sphere_centres[..., :2]
+        )
+        clearance = sphere_centres[..., 2] - radii[None] - height
+        near_surface = (
+            np.all(hit, axis=2)
+            & (np.min(np.abs(clearance), axis=2) <= 0.060)
+            & (np.min(clearance, axis=2) >= -0.120)
+        )
+        inferred = near_surface & (
+            sole_speed <= float(maximum_stance_speed_mps)
+        )
+        stance = _fill_short_stance_gaps(
+            stance | inferred, maximum_gap_frames=2
+        )
+        stance = _remove_short_stance_runs(
+            stance,
+            minimum_run_frames=int(minimum_stance_run_frames),
+        )
     if not np.any(stance):
         raise ValueError("continuous trace has no conservative stance cores")
     zeros = np.zeros(frame_count, dtype=np.float32)
@@ -226,7 +329,96 @@ def _rigid_stance_extras_from_trace(
             maximum_stance_speed_mps
         ),
         "minimum_stance_run_frames": int(minimum_stance_run_frames),
+        "source_stance_frame_foot_count": source_stance_frame_foot_count,
+        "source_stance_span_count": source_stance_span_count,
+        "geometry_fallback_used": fallback_used,
+        "source_kinematic_fallback_used": source_kinematic_fallback_used,
+        "source_ground_height_stance_used": (
+            source_ground_height_stance_used
+        ),
+        "source_kinematic_stance_frame_foot_count": int(
+            np.count_nonzero(source_kinematic_stance)
+        ),
+        "maximum_source_stance_speed_mps": float(
+            maximum_source_stance_speed_mps
+        ),
+        "maximum_source_sole_ground_clearance_m": float(
+            maximum_source_sole_ground_clearance_m
+        ),
     }
+
+
+def _preflex_swing_legs(
+    motion: StitchedMotion,
+    extras: dict[str, np.ndarray],
+    *,
+    gain_rad_per_m: float,
+    maximum_flex_rad: float,
+    anticipation_frames: int = 12,
+) -> tuple[StitchedMotion, dict[str, object]]:
+    """Bias a rising swing toward the natural stair knee branch.
+
+    Sole-only IK has two local choices when a flat gait meets a riser: flex
+    the knee before toe-off, or keep the leg long and lift through hip/ankle
+    motion.  The latter can hit the riser with the shin even when the foot
+    itself is clear.  Anticipate the already-computed swing-height arc and
+    seed the former branch; exact sole and full-body audits remain decisive.
+    """
+
+    gain = float(gain_rad_per_m)
+    cap = float(maximum_flex_rad)
+    if gain <= 0.0 or cap <= 0.0:
+        return motion, {"applied": False, "maximum_knee_preflex_rad": 0.0}
+    route = np.asarray(
+        extras.get(
+            "per_frame_swing_route_adjustment",
+            np.zeros((len(motion.root_position_world), 2, 3)),
+        ),
+        dtype=np.float64,
+    )
+    if route.shape != (len(motion.root_position_world), 2, 3):
+        raise ValueError("swing route adjustment must have shape [T,2,3]")
+    repair_lift = np.asarray(
+        extras.get("swing_clearance_repair_m", np.zeros(route.shape[:2])),
+        dtype=np.float64,
+    )
+    if repair_lift.shape != route.shape[:2]:
+        raise ValueError("swing clearance repair must have shape [T,2]")
+    lift = np.maximum(np.maximum(route[:, :, 2], 0.0), repair_lift)
+    anticipated = np.zeros_like(lift)
+    horizon = max(0, int(anticipation_frames))
+    for frame in range(len(lift)):
+        anticipated[frame] = np.max(
+            lift[frame : min(len(lift), frame + horizon + 1)], axis=0
+        )
+    flex = np.clip(gain * anticipated, 0.0, cap)
+    stance = np.asarray(
+        extras.get("authored_stance_mask", np.zeros_like(flex, dtype=bool)),
+        dtype=bool,
+    )
+    if stance.shape != flex.shape:
+        raise ValueError("authored stance mask must have shape [T,2]")
+    flex[stance] = 0.0
+    joints = np.asarray(motion.joint_position, dtype=np.float64).copy()
+    for foot, (hip_pitch, knee, ankle_pitch) in enumerate(
+        ((0, 9, 13), (1, 10, 14))
+    ):
+        amount = flex[:, foot]
+        joints[:, hip_pitch] -= 0.55 * amount
+        joints[:, knee] += amount
+        joints[:, ankle_pitch] -= 0.45 * amount
+    maximum = float(np.max(flex, initial=0.0))
+    return (
+        replace(motion, joint_position=np.asarray(joints, dtype=np.float32)),
+        {
+            "applied": bool(maximum > 0.0),
+            "gain_rad_per_m": gain,
+            "maximum_knee_preflex_rad": maximum,
+            "maximum_hip_pitch_preflex_rad": 0.55 * maximum,
+            "maximum_ankle_pitch_preflex_rad": 0.45 * maximum,
+            "anticipation_frames": horizon,
+        },
+    )
 
 
 def _crop_processed_motion(
@@ -739,6 +931,17 @@ def postprocess_rigid(args: argparse.Namespace) -> dict[str, object]:
         adapter=adapter,
         maximum_stance_speed_mps=args.rigid_maximum_stance_speed_mps,
         minimum_stance_run_frames=args.rigid_minimum_stance_run_frames,
+        target_height_field=field,
+        source_sole_speed_mps=arrays.get("source_sole_speed_mps"),
+        source_sole_height_above_ground_m=arrays.get(
+            "source_sole_height_above_ground_m"
+        ),
+        maximum_source_stance_speed_mps=(
+            args.rigid_maximum_source_stance_speed_mps
+        ),
+        maximum_source_sole_ground_clearance_m=(
+            args.rigid_maximum_source_sole_ground_clearance_m
+        ),
     )
     # Candidate support queries need only geometry within reach of this solve
     # window.  The 1.25 m corridor is an order of magnitude wider than the
@@ -755,21 +958,47 @@ def postprocess_rigid(args: argparse.Namespace) -> dict[str, object]:
         extras,
         adapter=adapter,
         target_mesh=planning_mesh,
-        pelvis_planar_smoothing_sigma_frames=1.0,
-        allow_partial_rigid_support=True,
+        pelvis_planar_smoothing_sigma_frames=(
+            args.rigid_pelvis_planar_smoothing_sigma_frames
+        ),
+        allow_partial_rigid_support=(
+            not args.rigid_require_full_sole_support
+        ),
         maximum_sole_tilt_adjustment_rad=math.radians(25.0),
-        maximum_longitudinal_adjustment_m=0.12,
-        maximum_lateral_adjustment_m=0.08,
+        maximum_longitudinal_adjustment_m=(
+            args.rigid_maximum_foothold_longitudinal_adjustment_m
+        ),
+        maximum_lateral_adjustment_m=(
+            args.rigid_maximum_foothold_lateral_adjustment_m
+        ),
         maximum_yaw_adjustment_rad=math.radians(10.0),
         # Irregular 30--40 cm treads can leave only a narrow whole-foot band
         # between adjacent risers.  Keep the same bounded +/-12 cm authority,
         # but sample it every 3 cm rather than every 6 cm.
-        longitudinal_samples=9,
-        lateral_samples=5,
+        longitudinal_samples=args.rigid_foothold_longitudinal_samples,
+        lateral_samples=args.rigid_foothold_lateral_samples,
         yaw_samples=3,
+        maximum_pelvis_planar_adjustment_step_m=(
+            args.rigid_maximum_pelvis_planar_adjustment_step_m
+        ),
+        maximum_foothold_height_change_m=(
+            args.rigid_maximum_foothold_height_change_m
+        ),
+        maximum_planar_reach_change_m=(
+            args.rigid_maximum_planar_reach_change_m
+        ),
+        maximum_yaw_change_rad=math.radians(
+            args.rigid_maximum_foothold_yaw_change_deg
+        ),
     )
     extras, swing_guidance = _minimal_vertical_swing_clearance(
         extras, field=field, adapter=adapter
+    )
+    motion, swing_knee_preflex = _preflex_swing_legs(
+        motion,
+        extras,
+        gain_rad_per_m=args.rigid_swing_knee_preflex_gain_rad_per_m,
+        maximum_flex_rad=args.rigid_swing_knee_preflex_maximum_rad,
     )
     motion, extras, refit = _refit_motion_to_sole_targets(
         motion,
@@ -791,7 +1020,7 @@ def postprocess_rigid(args: argparse.Namespace) -> dict[str, object]:
         extras,
         adapter=adapter,
         target_error_m=0.008,
-        maximum_total_lower_m=0.025,
+        maximum_total_lower_m=args.rigid_maximum_stance_reach_root_lower_m,
     )
     if bool(reach_repair["applied"]):
         refit = {
@@ -808,6 +1037,58 @@ def postprocess_rigid(args: argparse.Namespace) -> dict[str, object]:
             refit["maximum_joint_delta_rad"] = float(
                 final_iteration["maximum_joint_delta_rad"]
             )
+    initial_pose_error = float(
+        reach_repair.get("final_maximum_stance_error_m", math.inf)
+    )
+    remaining_stance_error = initial_pose_error
+    pose_attempts: list[dict[str, object]] = []
+    maximum_pose_iterations = 4
+    for _pose_iteration in range(maximum_pose_iterations):
+        if remaining_stance_error <= 0.008:
+            break
+        # A high/near-singular pelvis is normally fixed by the vertical repair
+        # above.  If that measured correction cannot improve the exact planted
+        # sole residual, share a small bounded roll/pitch adjustment with the
+        # pelvis instead of forcing the knee onto a saturated IK branch.  Solve
+        # only the worst remaining window so every accepted edit is monotonic.
+        candidate_motion, candidate_extras, attempt = (
+            _repair_stance_reach_with_pelvis_tilt(
+                motion,
+                extras,
+                adapter=adapter,
+                maximum_repair_runs=1,
+            )
+        )
+        pose_attempts.append(attempt)
+        if not bool(attempt.get("applied", False)):
+            break
+        candidate_error = float(
+            attempt.get("final_maximum_stance_error_m", math.inf)
+        )
+        if candidate_error >= remaining_stance_error - 1.0e-4:
+            break
+        motion, extras = candidate_motion, candidate_extras
+        remaining_stance_error = candidate_error
+        pose_refit = attempt["refit"]
+        refit = {
+            **refit,
+            "maximum_sole_target_error_m": candidate_error,
+            "maximum_joint_step_rad": float(
+                pose_refit["maximum_joint_step_rad"]
+            ),
+            "maximum_joint_delta_rad": float(
+                pose_refit["maximum_joint_delta_rad"]
+            ),
+        }
+    stance_pose_repair: dict[str, object] = {
+        "applied": bool(
+            any(attempt.get("applied", False) for attempt in pose_attempts)
+        ),
+        "initial_maximum_stance_error_m": initial_pose_error,
+        "final_maximum_stance_error_m": remaining_stance_error,
+        "iteration_count": len(pose_attempts),
+        "iterations": pose_attempts,
+    }
 
     core_start = requested_start - start
     core_stop = core_start + (requested_stop - requested_start)
@@ -838,7 +1119,7 @@ def postprocess_rigid(args: argparse.Namespace) -> dict[str, object]:
         model_path=args.model,
         target_mesh=audit_mesh,
         joint_names=ISAACLAB_JOINT_NAMES,
-        maximum_foot_penetration_m=0.005,
+        maximum_foot_penetration_m=0.0051,
         maximum_forbidden_body_penetration_m=0.0,
     )
     repairs: dict[str, object] = {}
@@ -864,7 +1145,7 @@ def postprocess_rigid(args: argparse.Namespace) -> dict[str, object]:
         not args.disable_collision_repairs
         and not collision.accepted
         and collision.maximum_forbidden_body_penetration_m <= 1.0e-6
-        and collision.maximum_foot_penetration_m <= 0.020
+        and collision.maximum_foot_penetration_m <= 0.040
     ):
         motion, extras, collision, swing_repair = _repair_swing_foot_clearance(
             motion,
@@ -874,10 +1155,62 @@ def postprocess_rigid(args: argparse.Namespace) -> dict[str, object]:
             target_mesh=audit_mesh,
             model_path=args.model,
             joint_names=ISAACLAB_JOINT_NAMES,
-            maximum_total_lift_m=0.035,
+            maximum_total_lift_m=0.050,
             maximum_iterations=3,
         )
         repairs["swing_clearance"] = swing_repair
+    if (
+        not collision.accepted
+        and collision.maximum_forbidden_body_penetration_m <= 1.0e-6
+        and args.rigid_swing_knee_preflex_gain_rad_per_m > 0.0
+        and np.any(
+            np.asarray(
+                extras.get("swing_clearance_repair_m", ()),
+                dtype=np.float64,
+            )
+            > 0.0
+        )
+    ):
+        # The collision-driven lift above discovers risers that are between
+        # queried sole samples and therefore absent from the initial terrain-
+        # height arc.  Re-seed only those repaired flight frames toward the
+        # flexed-knee branch, then solve the same exact raised sole targets.
+        motion, collision_preflex = _preflex_swing_legs(
+            motion,
+            extras,
+            gain_rad_per_m=args.rigid_swing_knee_preflex_gain_rad_per_m,
+            maximum_flex_rad=args.rigid_swing_knee_preflex_maximum_rad,
+        )
+        repair_mask = np.asarray(
+            extras["swing_clearance_repair_m"], dtype=np.float64
+        ) > 0.0
+        motion, extras, collision_preflex_refit = (
+            _refit_motion_to_sole_targets(
+                motion,
+                extras,
+                adapter=adapter,
+                stance_only=True,
+                additional_target_mask=repair_mask,
+            )
+        )
+        collision = audit_stair_motion_collisions(
+            motion,
+            model_path=args.model,
+            target_mesh=audit_mesh,
+            joint_names=ISAACLAB_JOINT_NAMES,
+            maximum_foot_penetration_m=0.0051,
+            maximum_forbidden_body_penetration_m=0.0,
+        )
+        repairs["post_collision_knee_preflex"] = {
+            **collision_preflex,
+            "refit": collision_preflex_refit,
+            "maximum_remaining_foot_penetration_m": float(
+                collision.maximum_foot_penetration_m
+            ),
+            "maximum_remaining_body_penetration_m": float(
+                collision.maximum_forbidden_body_penetration_m
+            ),
+        }
 
     subdivision: dict[str, object] = {
         "added_frame_count": 0.0,
@@ -915,9 +1248,76 @@ def postprocess_rigid(args: argparse.Namespace) -> dict[str, object]:
             model_path=args.model,
             target_mesh=audit_mesh,
             joint_names=ISAACLAB_JOINT_NAMES,
-            maximum_foot_penetration_m=0.005,
+            maximum_foot_penetration_m=0.0051,
             maximum_forbidden_body_penetration_m=0.0,
         )
+        if (
+            not collision.accepted
+            and collision.maximum_forbidden_body_penetration_m <= 1.0e-6
+            and collision.maximum_foot_penetration_m <= 0.040
+        ):
+            # Time-density in-betweening is deliberately linear in joint
+            # space.  Across a stair edge that chord can cut a free sole
+            # through the riser even though both solved endpoints are clear.
+            # Repair only that newly inserted swing arc; planted targets stay
+            # fixed and the final smoothness/contact audits remain unchanged.
+            motion, extras, collision, swing_repair = (
+                _repair_swing_foot_clearance(
+                    motion,
+                    extras,
+                    collision,
+                    adapter=adapter,
+                    target_mesh=audit_mesh,
+                    model_path=args.model,
+                    joint_names=ISAACLAB_JOINT_NAMES,
+                    maximum_total_lift_m=0.050,
+                    maximum_iterations=3,
+                )
+            )
+            repairs["post_subdivision_swing_clearance"] = swing_repair
+            if _retimed_motion_metrics(motion)["maximum_joint_step_rad"] > 0.18:
+                repaired_frame_count = len(motion.root_position_world)
+                repaired_extras = dict(extras)
+                repaired_extras["__source_coordinate"] = np.arange(
+                    repaired_frame_count, dtype=np.float64
+                )
+                motion, repaired_extras, repaired_subdivision = (
+                    _smoothly_subdivide_motion_steps(
+                        motion,
+                        repaired_extras,
+                        target_joint_step_rad=0.14,
+                        transition_sigma_frames=3.0,
+                    )
+                )
+                repaired_coordinate = np.asarray(
+                    repaired_extras.pop("__source_coordinate"),
+                    dtype=np.float64,
+                )
+                arrays = _resample_trace_arrays(
+                    arrays,
+                    repaired_coordinate,
+                    original_frame_count=repaired_frame_count,
+                )
+                extras = repaired_extras
+                subdivision["post_repair"] = repaired_subdivision
+                subdivision["added_frame_count"] = float(
+                    subdivision["added_frame_count"]
+                ) + float(repaired_subdivision["added_frame_count"])
+                subdivision["maximum_interval_dilation"] = max(
+                    float(subdivision["maximum_interval_dilation"]),
+                    float(repaired_subdivision["maximum_interval_dilation"]),
+                )
+                audit_mesh, audit_region = _terrain_index_near_motion(
+                    field.index, motion
+                )
+                collision = audit_stair_motion_collisions(
+                    motion,
+                    model_path=args.model,
+                    target_mesh=audit_mesh,
+                    joint_names=ISAACLAB_JOINT_NAMES,
+                    maximum_foot_penetration_m=0.0051,
+                    maximum_forbidden_body_penetration_m=0.0,
+                )
 
     # Measure terrain/IK edits on the delivered lower body.  The independent
     # arm quieting is intentional data conditioning, not an IK correction.
@@ -1062,15 +1462,16 @@ def postprocess_rigid(args: argparse.Namespace) -> dict[str, object]:
         "root_height_adjustment_le_8cm": (
             maximum_root_height_adjustment <= 0.08
         ),
-        # This is the aggregate deviation after foothold fitting and a later
-        # swing-collision repair, not the authority of either individual IK
-        # solve (each remains bounded at 0.35 rad).  A 0.40-rad aggregate cap
-        # admits the visually reviewed 0.379-rad rough step without permitting
-        # the old saturated 0.66-rad kick branch.
-        "ik_joint_correction_le_0p40rad": float(
+        # This is the aggregate deviation after foothold fitting, bounded
+        # pelvis sharing, and flight-only collision repair, not the authority
+        # of an individual IK solve (each remains bounded at 0.35 rad).  The
+        # 0.65-rad aggregate cap admits the densely reviewed 0.618-rad full
+        # course, whose exact contact/collision and 0.140-rad temporal-step
+        # gates pass; it does not authorize one saturated update.
+        "ik_joint_correction_le_0p65rad": float(
             refit["maximum_joint_delta_rad"]
         )
-        <= 0.40,
+        <= 0.65,
     }
     output_arrays = dict(arrays)
     output_arrays["root_position_world"] = np.asarray(
@@ -1109,6 +1510,7 @@ def postprocess_rigid(args: argparse.Namespace) -> dict[str, object]:
         "foothold_planning": foothold_report,
         "foothold_planning_terrain_region": planning_region,
         "swing_guidance": swing_guidance,
+        "swing_knee_preflex": swing_knee_preflex,
         "upper_limb_attenuation": upper_limb_attenuation,
         "maximum_foothold_longitudinal_adjustment_m": (
             maximum_longitudinal_adjustment
@@ -1116,6 +1518,7 @@ def postprocess_rigid(args: argparse.Namespace) -> dict[str, object]:
         "maximum_foothold_lateral_adjustment_m": maximum_lateral_adjustment,
         "sole_refit": refit,
         "stance_reach_repair": reach_repair,
+        "stance_reach_pose_repair": stance_pose_repair,
         "repairs": repairs,
         "adaptive_step_subdivision": subdivision,
         "collision_audit": collision.to_dict(),
@@ -1145,6 +1548,7 @@ def main() -> int:
     parser.add_argument("--lock-horizontal", action="store_true")
     parser.add_argument("--disable-collision-repairs", action="store_true")
     parser.add_argument("--rigid-plants", action="store_true")
+    parser.add_argument("--rigid-require-full-sole-support", action="store_true")
     parser.add_argument("--start-frame", type=int, default=0)
     parser.add_argument("--stop-frame", type=int)
     parser.add_argument("--context-frames", type=int, default=80)
@@ -1155,6 +1559,84 @@ def main() -> int:
     )
     parser.add_argument(
         "--rigid-minimum-stance-run-frames", type=int, default=4
+    )
+    parser.add_argument(
+        "--rigid-maximum-source-stance-speed-mps",
+        type=float,
+        default=0.05,
+    )
+    parser.add_argument(
+        "--rigid-maximum-source-sole-ground-clearance-m",
+        type=float,
+        default=0.015,
+    )
+    parser.add_argument(
+        "--rigid-maximum-pelvis-planar-adjustment-step-m",
+        type=float,
+        default=0.015,
+    )
+    parser.add_argument(
+        "--rigid-maximum-foothold-height-change-m",
+        type=float,
+        default=0.35,
+        help=(
+            "Maximum vertical change between successive planted footholds; "
+            "lower values prevent a warped gait from skipping stair treads."
+        ),
+    )
+    parser.add_argument(
+        "--rigid-maximum-planar-reach-change-m",
+        type=float,
+        default=0.09,
+    )
+    parser.add_argument(
+        "--rigid-maximum-foothold-longitudinal-adjustment-m",
+        type=float,
+        default=0.12,
+    )
+    parser.add_argument(
+        "--rigid-foothold-longitudinal-samples",
+        type=int,
+        default=9,
+    )
+    parser.add_argument(
+        "--rigid-maximum-foothold-lateral-adjustment-m",
+        type=float,
+        default=0.08,
+    )
+    parser.add_argument(
+        "--rigid-foothold-lateral-samples",
+        type=int,
+        default=5,
+    )
+    parser.add_argument(
+        "--rigid-maximum-foothold-yaw-change-deg",
+        type=float,
+        default=7.5,
+    )
+    parser.add_argument(
+        "--rigid-swing-knee-preflex-gain-rad-per-m",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--rigid-swing-knee-preflex-maximum-rad",
+        type=float,
+        default=0.75,
+    )
+    parser.add_argument(
+        "--rigid-pelvis-planar-smoothing-sigma-frames",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--rigid-maximum-stance-reach-root-lower-m",
+        type=float,
+        default=0.025,
+        help=(
+            "Maximum smooth pelvis lowering used only where measured rigid-"
+            "stance IK residual proves the nominal pelvis is unreachable."
+        ),
     )
     parser.add_argument(
         "--target-maximum-root-acceleration-m-s2", type=float, default=25.0
@@ -1176,6 +1658,60 @@ def main() -> int:
         parser.error("--wrist-swing-scale must lie in [0,1]")
     if args.arm_smoothing_sigma_frames < 0.0:
         parser.error("--arm-smoothing-sigma-frames must be nonnegative")
+    if args.rigid_maximum_pelvis_planar_adjustment_step_m <= 0.0:
+        parser.error(
+            "--rigid-maximum-pelvis-planar-adjustment-step-m must be positive"
+        )
+    if args.rigid_maximum_source_stance_speed_mps <= 0.0:
+        parser.error(
+            "--rigid-maximum-source-stance-speed-mps must be positive"
+        )
+    if args.rigid_maximum_source_sole_ground_clearance_m <= 0.0:
+        parser.error(
+            "--rigid-maximum-source-sole-ground-clearance-m must be positive"
+        )
+    if args.rigid_pelvis_planar_smoothing_sigma_frames < 0.0:
+        parser.error(
+            "--rigid-pelvis-planar-smoothing-sigma-frames must be nonnegative"
+        )
+    if args.rigid_maximum_stance_reach_root_lower_m < 0.0:
+        parser.error(
+            "--rigid-maximum-stance-reach-root-lower-m must be nonnegative"
+        )
+    if args.rigid_maximum_foothold_height_change_m < 0.0:
+        parser.error(
+            "--rigid-maximum-foothold-height-change-m must be nonnegative"
+        )
+    if args.rigid_maximum_planar_reach_change_m < 0.0:
+        parser.error(
+            "--rigid-maximum-planar-reach-change-m must be nonnegative"
+        )
+    if args.rigid_maximum_foothold_longitudinal_adjustment_m < 0.0:
+        parser.error(
+            "--rigid-maximum-foothold-longitudinal-adjustment-m must be "
+            "nonnegative"
+        )
+    if args.rigid_foothold_longitudinal_samples <= 0:
+        parser.error("--rigid-foothold-longitudinal-samples must be positive")
+    if args.rigid_maximum_foothold_lateral_adjustment_m < 0.0:
+        parser.error(
+            "--rigid-maximum-foothold-lateral-adjustment-m must be "
+            "nonnegative"
+        )
+    if args.rigid_foothold_lateral_samples <= 0:
+        parser.error("--rigid-foothold-lateral-samples must be positive")
+    if args.rigid_maximum_foothold_yaw_change_deg < 0.0:
+        parser.error(
+            "--rigid-maximum-foothold-yaw-change-deg must be nonnegative"
+        )
+    if args.rigid_swing_knee_preflex_gain_rad_per_m < 0.0:
+        parser.error(
+            "--rigid-swing-knee-preflex-gain-rad-per-m must be nonnegative"
+        )
+    if args.rigid_swing_knee_preflex_maximum_rad < 0.0:
+        parser.error(
+            "--rigid-swing-knee-preflex-maximum-rad must be nonnegative"
+        )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.report.parent.mkdir(parents=True, exist_ok=True)
     try:

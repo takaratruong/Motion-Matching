@@ -112,6 +112,7 @@ class TerrainFootholdPlannerConfig:
     require_alternating_feet: bool = True
     maximum_planar_reach_change_m: float = 0.09
     maximum_yaw_change_rad: float = math.radians(7.5)
+    maximum_foothold_height_change_m: float = 0.35
     maximum_pelvis_planar_adjustment_step_m: float = 0.015
     foothold_sequence_smoothing_weight: float = 4.0
     allow_partial_rigid_support: bool = False
@@ -136,6 +137,7 @@ class TerrainFootholdPlannerConfig:
             self.maximum_pelvis_height_adjustment_m,
             self.maximum_planar_reach_change_m,
             self.maximum_yaw_change_rad,
+            self.maximum_foothold_height_change_m,
             self.foothold_sequence_smoothing_weight,
             self.pelvis_smoothing_weight,
             self.maximum_partial_support_gap_m,
@@ -1286,10 +1288,16 @@ def _select_candidate_sequence(
                     current.yaw_adjustment_rad,
                     previous.yaw_adjustment_rad,
                 )
+                height_change = abs(
+                    float(np.mean(current.support_points_world[:, 2]))
+                    - float(np.mean(previous.support_points_world[:, 2]))
+                )
                 if (
                     planar_change
                     > maximum_planar_change + _EPSILON
                     or yaw_change > config.maximum_yaw_change_rad + _EPSILON
+                    or height_change
+                    > config.maximum_foothold_height_change_m + _EPSILON
                 ):
                     continue
                 metrics.feasible_transition_count += 1
@@ -1520,11 +1528,17 @@ def _select_exact_rate_candidate_sequence(
                         current.yaw_adjustment_rad,
                         previous.yaw_adjustment_rad,
                     )
+                    height_change = abs(
+                        float(np.mean(current.support_points_world[:, 2]))
+                        - float(np.mean(previous.support_points_world[:, 2]))
+                    )
                     if (
                         planar_change
                         > config.maximum_planar_reach_change_m + _EPSILON
                         or yaw_change
                         > config.maximum_yaw_change_rad + _EPSILON
+                        or height_change
+                        > config.maximum_foothold_height_change_m + _EPSILON
                     ):
                         continue
                     selected = previous_selected + (current,)

@@ -880,6 +880,7 @@ def _repair_stance_reach_with_pelvis_tilt(
     adapter: _G1FootfallAdapter,
     target_error_m: float = 0.008,
     transition_frames: int = 12,
+    maximum_repair_runs: int | None = None,
 ) -> tuple[StitchedMotion, dict[str, np.ndarray], dict[str, object]]:
     """Use a small, smooth torso lean when uneven support defeats leg-only IK.
 
@@ -935,6 +936,21 @@ def _repair_stance_reach_with_pelvis_tilt(
             "final_maximum_stance_error_m": initial_error,
             "runs": [],
         }
+    if maximum_repair_runs is not None:
+        count = int(maximum_repair_runs)
+        if count <= 0:
+            raise ValueError("maximum pelvis-pose repair runs must be positive")
+        # Correct the worst singular support exchange first.  Applying several
+        # distant torso corrections in one nonlinear refit can make one bad
+        # window hide improvements in another and cause the whole edit to be
+        # reverted.  Callers may iterate this one-window solve, accepting each
+        # only when the global stance residual actually falls.
+        runs = sorted(
+            runs,
+            key=lambda run: float(np.max(per_frame_error[run[0] : run[1]])),
+            reverse=True,
+        )[:count]
+        runs.sort()
 
     roots = np.asarray(motion.root_position_world, dtype=np.float64).copy()
     quaternions = np.asarray(
@@ -1383,6 +1399,10 @@ def _plan_and_apply_fixed_terrain_footholds(
     longitudinal_samples: int = 9,
     lateral_samples: int = 5,
     yaw_samples: int = 5,
+    maximum_pelvis_planar_adjustment_step_m: float = 0.015,
+    maximum_foothold_height_change_m: float = 0.35,
+    maximum_planar_reach_change_m: float = 0.09,
+    maximum_yaw_change_rad: float = math.radians(7.5),
 ) -> tuple[StitchedMotion, dict[str, np.ndarray], dict[str, object]]:
     """Replace drifting paired-warp contacts with fixed rigid footholds.
 
@@ -1463,9 +1483,16 @@ def _plan_and_apply_fixed_terrain_footholds(
                 maximum_sole_tilt_adjustment_rad
             ),
             maximum_pelvis_height_step_m=0.020,
-            maximum_planar_reach_change_m=0.090,
-            maximum_yaw_change_rad=math.radians(7.5),
-            maximum_pelvis_planar_adjustment_step_m=0.015,
+            maximum_planar_reach_change_m=float(
+                maximum_planar_reach_change_m
+            ),
+            maximum_yaw_change_rad=float(maximum_yaw_change_rad),
+            maximum_foothold_height_change_m=float(
+                maximum_foothold_height_change_m
+            ),
+            maximum_pelvis_planar_adjustment_step_m=float(
+                maximum_pelvis_planar_adjustment_step_m
+            ),
             # Start/stop MotionBricks sequences can contain two separated
             # same-foot replants without an intervening opposite-foot plant.
             # This relaxes only schedule ordering, never support geometry.

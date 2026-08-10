@@ -93,7 +93,10 @@ def build_row(
         maximum_any_support_clearance_m=0.060,
         maximum_foot_penetration_m=0.005,
         maximum_stance_step_m=0.003,
-        maximum_stance_run_drift_m=0.020,
+        # A two-centimetre run can satisfy collision/contact while looking
+        # visibly skatey during a long stop.  Keep compound plants within one
+        # centimetre; this does not alter source authoring or IK authority.
+        maximum_stance_run_drift_m=0.010,
     )
     pilots = build_pilots(arguments)
     result: dict[str, object] = {
