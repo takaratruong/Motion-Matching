@@ -58,6 +58,13 @@ PFNN jog, run, crouch, crawl, and jump-only rows remain counted in exclusion
 receipts but never enter a trainable range. GRAIL sitting, pickup, and other
 non-locomotion categories never enter the inventory.
 
+PFNN trainable ranges are maximal contiguous blocks whose rows have an
+authenticated admitted gait/transition label and a valid authenticated terrain
+fit. Every excluded-gait row, missing/invalid sidecar row, mirror boundary, or
+source discontinuity terminates a range; no resampling, derivative, feature
+horizon, training window, successor, or split group crosses that boundary. The
+receipt records each excluded block and its reason.
+
 The nominal corpus is approximately 9,978,369 rows before PFNN gait,
 continuity, and quality filtering.
 
@@ -65,8 +72,13 @@ The accelerated authority path is exact:
 
 - reopen the frozen 3,970,932-row strict broad bank and authenticate its
   database, terrain, support, ranges, features, source maps, and manifest;
-- exclude its Takara range and range-locally vector-resample its 1,769 curb,
-  1,857 slope, and 12,188 stair ranges from 25 to 60 Hz;
+- exclude its Takara range and range-locally resample its 1,769 curb, 1,857
+  slope, and 12,188 stair ranges from 25 to 60 Hz: interpolate Euclidean
+  positions, support, and other continuous vectors by timestamp; interpolate
+  rotations with sign-continuous quaternion SLERP; then recompute 60 Hz
+  linear/angular velocities, contacts, support-relative placement, 31-D
+  features, quality metrics, and successor/horizon validity solely within the
+  derived range;
 - process the 23 GRAIL slope clips absent from that bank through the already
   verified raw slope adapter;
 - process Takara directly from its authenticated 50 Hz source to 60 Hz; and
@@ -100,6 +112,17 @@ Normalization is fit only on verified `clean + usable` training rows. Mirrors,
 GRAIL variants of one terrain identity, and all ranges from one canonical
 source remain in the same train, validation, or test split.
 
+Before processing lanes begin, publish a versioned split ledger that assigns
+every connected split group, defined as the transitive closure of shared
+canonical-source identity, terrain identity, and mirror identity, to train,
+validation, or test by a documented deterministic hash of the frozen build
+identity and group identity, stratified by runtime terrain class. The ledger
+records its seed, ordered group list, requested allocation, and actual
+per-class counts; a build with an empty validation or test stratum required by
+a gate is invalid. Every range inherits its connected split group's single
+assignment; therefore mirrors, terrain variants, and all ranges of one
+canonical source cannot straddle splits.
+
 ## Parallel Build
 
 After the common schema, conversion, storage, and quality interfaces are
@@ -126,6 +149,16 @@ metrics. Latent 64 is attempted only if the full-corpus held-out metrics or
 coverage diagnostics are red. A VAE is not introduced unless deterministic
 models fit training rows but fail genuinely held-out source identities.
 
+The full-corpus model is a new versioned 60 Hz ABI and rejects 25 Hz model
+artifacts. It uses `dt = 1/60`, the 31-D feature contract with 20/40/60-frame
+horizons, the established 908-D compressor input, a 31-plus-latent decoder
+input, and a 458-D pose/contact target. Publication includes one finite
+row-aligned latent vector per full-index row, the decompressor,
+normalization, architecture/configuration, seed, optimizer schedule, and the
+exact corpus-manifest digest. Runtime exact search retrieves the selected
+row's latent and decodes it with that row's feature vector; no query-to-pose
+generator or learned stepper is introduced in this milestone.
+
 Sampling is hierarchical rather than row-uniform:
 
 1. balance the four runtime terrain classes `flat|curb|slope|stair`;
@@ -135,10 +168,13 @@ Sampling is hierarchical rather than row-uniform:
 4. draw only range-safe windows.
 
 This prevents the roughly seven million stair rows from overwhelming flat,
-turning, curb, and slope coverage. Model selection uses validation/test source
-identities, never training loss alone. The selected architecture is then
-refit on all verified `clean + usable` rows while retaining the immutable
-selection receipt.
+turning, curb, and slope coverage. Model selection uses validation source
+identities only, never training loss or test rows. After architecture,
+hyperparameters, and the selected checkpoint are frozen in an immutable
+receipt, evaluate that checkpoint once on the test source identities. The
+production model is then refit on all verified `clean + usable` rows and
+carries the immutable pre-refit validation and test receipt; it is not
+re-selected using either holdout.
 
 ## Motion-Derived Runtime Root
 
@@ -151,17 +187,31 @@ distance, contact compatibility, and the frozen continuity/transition cost.
 Between searches, the range-safe successor supplies both articulation and its
 canonical planar `Simulation`-root displacement.
 
-The committed world-root displacement is the selected motion displacement
-rotated into the commanded heading. It is not independently integrated at a
-fixed speed and is not arbitrarily scaled. Stick magnitude selects among the
-walking speeds represented by the verified corpus; requests above the corpus
-95th-percentile walking speed clamp visibly to that supported envelope.
+Maintain one world `SE(2)` transform for the active motion interval. For each
+contiguous successor, compose its canonical local planar root delta and yaw
+delta exactly once. At an exact-search jump, re-anchor the selected candidate's
+local frame to the current world transform without applying a source delta or
+teleporting. If commanded heading aligns a selected candidate, apply the same
+yaw alignment to its decoded articulation, local root delta, terrain-query
+frame, and support probes; reject discontinuous alignments by the frozen
+transition cost. The root is never independently speed-integrated or rotated
+separately from the displayed motion frame.
+
+Stick magnitude selects among the walking speeds represented by the verified
+corpus; requests above the corpus 95th-percentile walking speed clamp visibly
+to that supported envelope.
 
 This makes foot motion and root travel come from the same source interval,
 addressing the principal runtime cause of visible sliding. Steering remains
 responsive because command/facing updates trigger an exact search at most
 100 ms later. Mechanically invalid learned candidates are retried in exact
 score order; native limits are never relaxed.
+
+Candidate validation uses a manifest-recorded finite exact-score retry budget.
+On exhaustion, runtime commits neither a pose nor a root delta, retains the
+last native-valid state, and emits a visible `candidate_exhausted` diagnostic;
+it never substitutes a source-pose fallback or joint clamp. Formal scripted
+routes require zero exhaustion events.
 
 ## Evaluation Gates
 
@@ -178,6 +228,8 @@ score order; native limits are never relaxed.
 
 ### Learned generator gates
 
+- the frozen selected checkpoint satisfies the following metrics on
+  validation and on the one-time test evaluation, reported separately;
 - all outputs and receipts are finite;
 - held-out joint geodesic MAE is at most 0.03 rad;
 - held-out joint frame-max p95 is at most 0.10 rad;
@@ -242,18 +294,21 @@ overlaps the five data lanes, runtime-root work, and corpus verification:
   and missing-slope lanes in parallel;
 - 10:45-11:30 PDT: verify, pack, split, normalize, and index;
 - 11:30-12:30 PDT: train and select the full-corpus generator while runtime
-  root integration completes independently;
+  root integration completes independently and a second corpus build begins;
 - 12:30-13:15 PDT: immutable all-row refit and baseline comparison; and
 - 13:15-14:00 PDT: formal MuJoCo routes, viewer inspection, and evidence
-  publication.
+  publication after the second build reproduces every corpus digest.
 
-This is an aggressive five-hour execution target. The conservative estimate
-remains 4-7 hours for the first full trained model and 6-10 hours end to end;
-meeting 14:00 requires the already-verified adapters to remain mechanical and
-all major phases to finish near their low bound. Source corruption,
-unavailable PFNN provenance, or failed held-out/slip gates can extend the
-finish. They do not authorize silently dropping sources, weakening the gates,
-or relabeling a partial corpus as complete.
+This is an aggressive five-hour execution target, not a guarantee. The
+conservative estimate remains 4-7 hours for the first full trained model and
+6-10 hours end to end; meeting 14:00 requires the already-verified adapters to
+remain mechanical, the deterministic rebuild to overlap training, and all
+major phases to finish near their low bound. At 14:00, publish the exact
+immutable lane, corpus, model, and evaluation status even if a gate remains
+red, and continue rather than labeling an incomplete result as complete.
+Source corruption, unavailable PFNN provenance, or failed held-out/slip gates
+do not authorize silently dropping sources, weakening the gates, or relabeling
+a partial corpus as complete.
 
 ## Completion Claim
 
