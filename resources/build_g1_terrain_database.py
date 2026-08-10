@@ -119,17 +119,32 @@ AUTHORED_SLOPE_INPUTS = {
         "size_bytes": 85,
     },
 }
+AUTHORED_SLOPE_FEATURE_MINIMUM = (
+    -0.05486539751291275,
+    -0.09694159030914307,
+    -0.12729622423648834,
+    -0.12729622423648834,
+)
+AUTHORED_SLOPE_FEATURE_MAXIMUM = (
+    0.05370394513010979,
+    0.09506101161241531,
+    0.12704572081565857,
+    0.12723475694656372,
+)
+AUTHORED_SLOPE_FEATURE_STD = (
+    0.02696162149121752,
+    0.04589913504391204,
+    0.05615584307619531,
+    0.06524118885644932,
+)
 
 
 @dataclass(frozen=True)
 class AuthoredSlopeSourceCandidate:
-    source: SourceClip
-    provisional_clip: HoldenClip
-    admitted_clip: HoldenClip
-    skeleton: object
+    source: HoldenClip
     terrain: GrailTerrain
     scene: object
-    receipt: dict
+    provenance: dict
 
 
 def _odd_frame_count(seconds: float, fps: float) -> int:
@@ -487,6 +502,45 @@ def _finalize_authored_slope_clip(clip, terrain, skeleton, output_fps):
     clip.validate()
 
 
+def _require_authored_slope_feature_statistics(features):
+    values = np.asarray(features)
+    if values.shape != (595, 4) or values.dtype != np.dtype(np.float32) \
+            or not np.isfinite(values).all():
+        raise ValueError(
+            "authored slope terrain features must be finite float32 (595, 4)")
+    observed_minimum = np.min(values, axis=0)
+    observed_maximum = np.max(values, axis=0)
+    expected_minimum = np.asarray(
+        AUTHORED_SLOPE_FEATURE_MINIMUM, np.float32)
+    expected_maximum = np.asarray(
+        AUTHORED_SLOPE_FEATURE_MAXIMUM, np.float32)
+    if not np.array_equal(observed_minimum, expected_minimum):
+        raise ValueError(
+            "authored slope terrain feature minimum changed: "
+            f"{observed_minimum}")
+    if not np.array_equal(observed_maximum, expected_maximum):
+        raise ValueError(
+            "authored slope terrain feature maximum changed: "
+            f"{observed_maximum}")
+    observed_std = np.std(values.astype(np.float64), axis=0)
+    expected_std = np.asarray(AUTHORED_SLOPE_FEATURE_STD, np.float64)
+    if np.max(np.abs(observed_std - expected_std)) > 1e-12:
+        raise ValueError(
+            "authored slope terrain feature standard deviation changed: "
+            f"{observed_std}")
+
+
+def _merge_admitted_holden_fields(provisional, admitted):
+    if len(provisional.positions) != 598 or len(admitted.positions) != 595:
+        raise ValueError("authored slope provisional/admitted merge changed")
+    for attribute in (
+        "velocities", "angular_velocities", "contacts",
+        "terrain_features", "terrain_support",
+    ):
+        getattr(provisional, attribute)[3:] = getattr(admitted, attribute)
+    provisional.validate()
+
+
 def _assemble_authored_slope_source(args):
     if float(args.output_fps) != 60.0:
         raise ValueError("authored slope source requires --output-fps 60")
@@ -502,7 +556,7 @@ def _assemble_authored_slope_source(args):
             raise ValueError(f"authored slope source requires --{attribute.replace('_', '-')}")
         _require_file(path, f"authored slope {description}")
 
-    source = load_authenticated_grail_slope(args.slope_robot)
+    raw_source = load_authenticated_grail_slope(args.slope_robot)
     usd_bytes = _read_authored_slope_input(args.slope_usd, "usd")
     reconstruction_bytes = _read_authored_slope_input(
         args.slope_recon, "reconstruction")
@@ -527,7 +581,7 @@ def _assemble_authored_slope_source(args):
     kinematics = G1Kinematics.from_xml_bytes(
         xml_bytes, load_mujoco_xml_assets(args.g1_xml))
     provisional, skeleton, report = convert_source_clip(
-        source, kinematics, target_fps=60.0)
+        raw_source, kinematics, target_fps=60.0)
     provisional.validate()
     require_canonical_g1_skeleton(skeleton, "authored slope skeleton")
     if len(provisional.positions) != 598:
@@ -541,26 +595,7 @@ def _assemble_authored_slope_source(args):
     _finalize_authored_slope_clip(admitted, terrain, skeleton, 60.0)
     if len(admitted.positions) != 595:
         raise ValueError("authored slope admitted frame count changed")
-    expected_minimum = np.array(
-        [-0.054865, -0.096942, -0.127296, -0.127296])
-    expected_maximum = np.array(
-        [0.053704, 0.095061, 0.127046, 0.127235])
-    expected_std = np.array(
-        [0.026962, 0.045899, 0.056156, 0.065241])
-    feature64 = admitted.terrain_features.astype(np.float64)
-    observed_feature_stats = (
-        np.min(feature64, axis=0),
-        np.max(feature64, axis=0),
-        np.std(feature64, axis=0),
-    )
-    for label, observed, expected in zip(
-        ("minimum", "maximum", "standard deviation"),
-        observed_feature_stats,
-        (expected_minimum, expected_maximum, expected_std),
-    ):
-        if not np.allclose(observed, expected, rtol=0.0, atol=5e-7):
-            raise ValueError(
-                f"authored slope terrain feature {label} changed: {observed}")
+    _require_authored_slope_feature_statistics(admitted.terrain_features)
     if not np.all(np.any(
         admitted.terrain_features[165:539] != 0.0, axis=1)):
         raise ValueError("authored slope intended nonflat exposure changed")
@@ -573,7 +608,7 @@ def _assemble_authored_slope_source(args):
         raise ValueError(
             f"authored slope inverse round trip changed: {round_trip_error} m")
 
-    source_span = (len(source.qpos) - 1) / source.fps
+    source_span = (len(raw_source.qpos) - 1) / raw_source.fps
     output_span = (len(provisional.positions) - 1) / 60.0
     output_shortfall = source_span - output_span
     if source_span != 9.96 or output_span != 9.95 \
@@ -585,7 +620,7 @@ def _assemble_authored_slope_source(args):
         "status": "provisional",
         "clip_id": AUTHORED_SLOPE_NAME,
         "hashes": {
-            "robot_sha256": source.provenance["sha256"],
+            "robot_sha256": raw_source.provenance["sha256"],
             "usd_sha256": AUTHORED_SLOPE_INPUTS["usd"]["sha256"],
             "reconstruction_sha256":
                 AUTHORED_SLOPE_INPUTS["reconstruction"]["sha256"],
@@ -628,8 +663,8 @@ def _assemble_authored_slope_source(args):
         "quaternion_norm_max_error": report["quaternion_norm_max_error"],
     }
     scene = authored_slope_scene_definition(admitted, terrain, receipt)
-    return AuthoredSlopeSourceCandidate(
-        source, provisional, admitted, skeleton, terrain, scene, receipt)
+    _merge_admitted_holden_fields(provisional, admitted)
+    return AuthoredSlopeSourceCandidate(provisional, terrain, scene, receipt)
 
 
 def _assemble_flat_candidate(args):

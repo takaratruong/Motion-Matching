@@ -704,26 +704,37 @@ def fake_grail_clip(base):
 
 
 class GrailSceneTests(unittest.TestCase):
+    _authored_candidate = None
+
+    def authored_candidate(self):
+        assemble = getattr(builder, "_assemble_authored_slope_source", None)
+        self.assertTrue(callable(assemble), "authored slope source seam is missing")
+        if assemble is None:
+            return None
+        if type(self)._authored_candidate is None:
+            name = "terrain_slopes__slope_000__000"
+            root = "/home/ubuntu/datasets/GRAIL/data/slope"
+            type(self)._authored_candidate = assemble(SimpleNamespace(
+                output_fps=60.0,
+                slope_robot=f"{root}/robot/{name}.pkl",
+                slope_usd=f"{root}/object_usd/{name}.usd",
+                slope_recon=f"{root}/recon/{name}.pkl",
+                slope_metadata=f"{root}/meta/{name}.pkl",
+                g1_xml=(
+                    "/home/ubuntu/projects/mjx-diffphysics/env/g1/assets/"
+                    "g1_29dof.xml"),
+            ))
+        return type(self)._authored_candidate
+
     def test_authored_slope_scene_uses_exact_paired_surface_and_route(self):
         constructor = getattr(
             scenes_module, "authored_slope_scene_definition", None)
-        assemble = getattr(builder, "_assemble_authored_slope_source", None)
         self.assertTrue(callable(constructor), "authored slope scene is missing")
-        self.assertTrue(callable(assemble), "authored slope source seam is missing")
-        if constructor is None or assemble is None:
+        if constructor is None:
             return
-        name = "terrain_slopes__slope_000__000"
-        root = "/home/ubuntu/datasets/GRAIL/data/slope"
-        candidate = assemble(SimpleNamespace(
-            output_fps=60.0,
-            slope_robot=f"{root}/robot/{name}.pkl",
-            slope_usd=f"{root}/object_usd/{name}.usd",
-            slope_recon=f"{root}/recon/{name}.pkl",
-            slope_metadata=f"{root}/meta/{name}.pkl",
-            g1_xml=(
-                "/home/ubuntu/projects/mjx-diffphysics/env/g1/assets/"
-                "g1_29dof.xml"),
-        ))
+        candidate = self.authored_candidate()
+        if candidate is None:
+            return
 
         scene = candidate.scene
         self.assertEqual(scene.scene_id, "authored-slope")
@@ -732,8 +743,7 @@ class GrailSceneTests(unittest.TestCase):
         self.assertEqual(scene.routes[0].route_id, "authored-forward")
         self.assertEqual(
             scene.routes[0].waypoints_xz[0],
-            (float(candidate.admitted_clip.positions[0, 0, 0]),
-             float(candidate.admitted_clip.positions[0, 0, 2])),
+            (float(scene.spawn_position[0]), float(scene.spawn_position[2])),
         )
         self.assertEqual(scene.provenance["kind"], "authenticated-grail")
         self.assertEqual(
@@ -742,6 +752,65 @@ class GrailSceneTests(unittest.TestCase):
         )
         normalized = scenes_module._validate_definition(scene)
         self.assertEqual(normalized["scene_id"], "authored-slope")
+
+    def test_authored_scene_rejects_every_receipt_identity_mismatch(self):
+        candidate = self.authored_candidate()
+        if candidate is None:
+            return
+        admitted = builder._slice_holden_clip(candidate.source, 3)
+        receipt = copy.deepcopy(candidate.provenance)
+        cases = (
+            ("clip-id", lambda value: value.__setitem__("clip_id", "other")),
+            ("hash-map", lambda value: value["hashes"].__setitem__(
+                "usd_sha256", "0" * 64)),
+            ("source-frames", lambda value: value.__setitem__(
+                "source_frames", 249)),
+            ("provisional-frames", lambda value: value.__setitem__(
+                "provisional_output_frames", 597)),
+            ("admitted-frames", lambda value: value.__setitem__(
+                "admitted_output_frames", 594)),
+            ("rejected-range", lambda value: value.__setitem__(
+                "rejected_output_ranges", [[0, 2]])),
+            ("admitted-range", lambda value: value.__setitem__(
+                "admitted_output_range", [2, 598])),
+            ("provisional-nonflat", lambda value: value.__setitem__(
+                "intended_nonflat_provisional_range", [167, 542])),
+            ("admitted-nonflat", lambda value: value.__setitem__(
+                "intended_nonflat_admitted_range", [164, 539])),
+            ("basis", lambda value: value.__setitem__("basis", "other")),
+            ("calibration", lambda value: value.__setitem__(
+                "support_calibration_m", 0.0)),
+            ("calibration-role", lambda value: value.__setitem__(
+                "support_calibration_applied_to", "motion-and-terrain")),
+            ("rotation", lambda value: value["object_rotation_binary32"][0]
+             .__setitem__(0, 0.5)),
+            ("translation", lambda value: value[
+                "object_translation_binary32"].__setitem__(0, 0.5)),
+        )
+        for name, mutation in cases:
+            changed = copy.deepcopy(receipt)
+            mutation(changed)
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(ValueError, "receipt|terrain"),
+            ):
+                scenes_module.authored_slope_scene_definition(
+                    admitted, candidate.terrain, changed)
+
+    def test_authored_scene_rejects_terrain_pose_mismatched_to_receipt(self):
+        candidate = self.authored_candidate()
+        if candidate is None:
+            return
+        admitted = builder._slice_holden_clip(candidate.source, 3)
+        receipt = candidate.provenance
+        terrain = copy.copy(candidate.terrain)
+        translation = terrain.reconstruction_translation.copy()
+        translation[0] += 0.25
+        translation.setflags(write=False)
+        terrain.reconstruction_translation = translation
+        with self.assertRaisesRegex(ValueError, "receipt|terrain"):
+            scenes_module.authored_slope_scene_definition(
+                admitted, terrain, receipt)
 
     def test_grail_scenes_union_old_route_envelope_with_six_metre_floor(self):
         clip = fake_grail_clip(GRAIL_DEFAULT_BASE)

@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import fields
 from types import SimpleNamespace
 
 import numpy as np
@@ -15,12 +16,37 @@ from resources.g1_terrain_builder.resample import (
     resample_quaternions_wxyz,
     resample_vectors,
 )
+from resources.g1_terrain_builder.schema import (
+    G1_SKELETON_NAMES,
+    G1_SKELETON_PARENTS,
+)
+from resources.g1_terrain_builder.sources import (
+    load_authenticated_grail_slope,
+)
 from mm_sonic.grail_terrain_source import resample_grail_motion
 
 
 SLOPE_NAME = "terrain_slopes__slope_000__000"
 SLOPE_ROOT = "/home/ubuntu/datasets/GRAIL/data/slope"
 G1_XML = "/home/ubuntu/projects/mjx-diffphysics/env/g1/assets/g1_29dof.xml"
+FROZEN_FEATURE_MINIMUM = np.array([
+    -0.05486539751291275,
+    -0.09694159030914307,
+    -0.12729622423648834,
+    -0.12729622423648834,
+], np.float32)
+FROZEN_FEATURE_MAXIMUM = np.array([
+    0.05370394513010979,
+    0.09506101161241531,
+    0.12704572081565857,
+    0.12723475694656372,
+], np.float32)
+FROZEN_FEATURE_STD = np.array([
+    0.02696162149121752,
+    0.04589913504391204,
+    0.05615584307619531,
+    0.06524118885644932,
+], np.float64)
 
 
 def authored_slope_args():
@@ -94,36 +120,45 @@ class AuthoredSlopePairTest(unittest.TestCase):
             type(self)._candidate = assemble(authored_slope_args())
         return type(self)._candidate
 
+    def test_candidate_handoff_has_exact_four_field_api(self):
+        candidate = self.candidate()
+        if candidate is None:
+            return
+        self.assertEqual(
+            tuple(field.name for field in fields(candidate)),
+            ("source", "terrain", "scene", "provenance"),
+        )
+        self.assertEqual(len(candidate.source.positions), 598)
+        candidate.source.validate()
+
     def test_exact_250_at_25_to_598_at_60_provenance_and_span(self):
         candidate = self.candidate()
         if candidate is None:
             return
-        provisional = candidate.provisional_clip
-        self.assertEqual(len(candidate.source.qpos), 250)
-        self.assertEqual(candidate.source.fps, 25.0)
+        provisional = candidate.source
         self.assertEqual(len(provisional.positions), 598)
         left, right, alpha = resample_map(250, 25.0, 60.0)
         np.testing.assert_array_equal(provisional.source_left_indices, left)
         np.testing.assert_array_equal(provisional.source_right_indices, right)
         np.testing.assert_array_equal(provisional.source_alpha, alpha)
-        self.assertEqual(candidate.receipt["source_span_s"], 9.96)
-        self.assertEqual(candidate.receipt["output_span_s"], 9.95)
+        self.assertEqual(candidate.provenance["source_frames"], 250)
+        self.assertEqual(candidate.provenance["source_fps"], 25.0)
+        self.assertEqual(candidate.provenance["source_span_s"], 9.96)
+        self.assertEqual(candidate.provenance["output_span_s"], 9.95)
         self.assertEqual(
-            candidate.receipt["output_shortfall_s"],
+            candidate.provenance["output_shortfall_s"],
             0.010000000000001563,
         )
-        self.assertEqual(candidate.receipt["rejected_output_ranges"], [[0, 3]])
-        self.assertEqual(len(candidate.admitted_clip.positions), 595)
+        self.assertEqual(
+            candidate.provenance["rejected_output_ranges"], [[0, 3]])
         np.testing.assert_array_equal(
-            candidate.admitted_clip.source_left_indices,
-            provisional.source_left_indices[3:],
-        )
+            provisional.terrain_features[:3], np.zeros((3, 4), np.float32))
 
     def test_simulation_is_planar_while_fk_preserves_native_global_hips(self):
         candidate = self.candidate()
         if candidate is None:
             return
-        provisional = candidate.provisional_clip
+        provisional = candidate.source
         np.testing.assert_array_equal(
             provisional.positions[:, 0, 1], np.zeros(598, np.float32))
         np.testing.assert_allclose(
@@ -133,14 +168,16 @@ class AuthoredSlopePairTest(unittest.TestCase):
         exported_gp, exported_gq = forward_local_hierarchy(
             provisional.positions.astype(np.float64),
             provisional.rotations.astype(np.float64),
-            candidate.skeleton.parents,
+            np.asarray(G1_SKELETON_PARENTS, np.int32),
         )
         kinematics = G1Kinematics(G1_XML)
-        source_gp, source_gq = kinematics.world_from_qpos(candidate.source.qpos)
+        raw_source = load_authenticated_grail_slope(
+            authored_slope_args().slope_robot)
+        source_gp, source_gq = kinematics.world_from_qpos(raw_source.qpos)
         source_gp, source_gq = change_basis_zup_to_yup(source_gp, source_gq)
         expected_gp = resample_vectors(source_gp, 25.0, 60.0)
         expected_gq = resample_quaternions_wxyz(source_gq, 25.0, 60.0)
-        hips = candidate.skeleton.names.index("Hips")
+        hips = G1_SKELETON_NAMES.index("Hips")
         np.testing.assert_allclose(
             exported_gp[:, hips], expected_gp[:, hips - 1],
             rtol=0.0, atol=1e-5,
@@ -149,34 +186,39 @@ class AuthoredSlopePairTest(unittest.TestCase):
             np.abs(np.sum(exported_gq[:, hips] * expected_gq[:, hips - 1], axis=1)),
             1.0, rtol=0.0, atol=2e-6,
         )
-        # The pelvis already follows the authored ramp. Terrain is never added
-        # again to Simulation or Hips.
-        np.testing.assert_allclose(
-            candidate.admitted_clip.positions[:, 1, 1],
-            provisional.positions[3:, 1, 1],
-            rtol=0.0, atol=0.0,
-        )
 
     def test_exact_mesh_features_match_frozen_slope_columns(self):
         candidate = self.candidate()
         if candidate is None:
             return
-        features = candidate.admitted_clip.terrain_features.astype(np.float64)
+        features = candidate.source.terrain_features[3:]
+        np.testing.assert_array_equal(
+            np.min(features, axis=0), FROZEN_FEATURE_MINIMUM)
+        np.testing.assert_array_equal(
+            np.max(features, axis=0), FROZEN_FEATURE_MAXIMUM)
         np.testing.assert_allclose(
-            np.min(features, axis=0),
-            [-0.054865, -0.096942, -0.127296, -0.127296],
-            rtol=0.0, atol=5e-7,
+            np.std(features.astype(np.float64), axis=0),
+            FROZEN_FEATURE_STD,
+            rtol=0.0, atol=1e-12,
         )
-        np.testing.assert_allclose(
-            np.max(features, axis=0),
-            [0.053704, 0.095061, 0.127046, 0.127235],
-            rtol=0.0, atol=5e-7,
-        )
-        np.testing.assert_allclose(
-            np.std(features, axis=0),
-            [0.026962, 0.045899, 0.056156, 0.065241],
-            rtol=0.0, atol=5e-7,
-        )
+
+    def test_feature_gate_rejects_a_std_drift_below_old_rounded_tolerance(self):
+        validator = getattr(
+            builder, "_require_authored_slope_feature_statistics", None)
+        self.assertTrue(callable(validator), "exact feature-stat gate is missing")
+        if validator is None:
+            return
+        candidate = self.candidate()
+        if candidate is None:
+            return
+        features = candidate.source.terrain_features[3:].copy()
+        original_minimum = np.min(features, axis=0)
+        original_maximum = np.max(features, axis=0)
+        features[100, 0] += np.float32(1e-5)
+        np.testing.assert_array_equal(np.min(features, axis=0), original_minimum)
+        np.testing.assert_array_equal(np.max(features, axis=0), original_maximum)
+        with self.assertRaisesRegex(ValueError, "standard deviation"):
+            validator(features)
 
     def test_reconstruction_basis_calibration_and_inverse_round_trip(self):
         candidate = self.candidate()
@@ -193,7 +235,8 @@ class AuthoredSlopePairTest(unittest.TestCase):
                 recovered - terrain.source_vertices, axis=1))),
             1e-9,
         )
-        self.assertLess(candidate.receipt["inverse_round_trip_max_error_m"], 1e-9)
+        self.assertLess(
+            candidate.provenance["inverse_round_trip_max_error_m"], 1e-9)
 
     def test_synthetic_tilted_plane_locks_basis_axes_and_height_sign(self):
         factory = getattr(

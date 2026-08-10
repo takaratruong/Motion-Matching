@@ -239,6 +239,18 @@ FLAT_SPAWN_LENGTH = 2.0
 LOOKAHEAD_MARGIN = 1.0
 GRAIL_DEFAULT_BASE = "terrain_curbs__curb_000__000"
 AUTHORED_SLOPE_BASE = "terrain_slopes__slope_000__000"
+AUTHORED_SLOPE_HASHES = {
+    "robot_sha256":
+        "b77480d5f8f3339a3064276d6f9d443ac3a3456f20eb9195d48add176e561ee1",
+    "usd_sha256":
+        "8d1e696fb5bd2aecfa17797549bddd001093b060773cb313185a6a46db7eb5a5",
+    "reconstruction_sha256":
+        "d05d6c5a7d6a13eff7e69da0e9e96ab5a79f700bb706611699f0b9c44c9b51ec",
+    "metadata_sha256":
+        "7d88be608419afd2be127e4ac4c5a8aa1b4863fdf84e86c5ec93356881ee861d",
+    "g1_xml_sha256":
+        "749209c06a5c0023deb27f728420028b62b1f3092a22e24920183c1a897e4376",
+}
 GRAIL_TARGETS = (
     ("grail-curb-low", 0.12),
     ("grail-curb-medium", 0.24),
@@ -1085,6 +1097,56 @@ def grail_scene_definitions(measured_max_heights, clips_by_terrain):
     return tuple(definitions)
 
 
+def _require_authored_slope_scene_receipt(terrain, receipt):
+    expected_scalars = {
+        "schema": "g1-lmm-authored-slope-source/v1",
+        "status": "provisional",
+        "clip_id": AUTHORED_SLOPE_BASE,
+        "source_fps": 25.0,
+        "target_fps": 60.0,
+        "source_frames": 250,
+        "provisional_output_frames": 598,
+        "admitted_output_frames": 595,
+        "source_span_s": 9.96,
+        "output_span_s": 9.95,
+        "output_shortfall_s": 0.010000000000001563,
+        "basis": "z-up-to-holden-shared-with-robot",
+        "support_calibration_m": 0.012000000104308128,
+        "support_calibration_applied_to": "terrain-only",
+    }
+    expected_ranges = {
+        "rejected_output_ranges": [[0, 3]],
+        "admitted_output_range": [3, 598],
+        "intended_nonflat_provisional_range": [168, 542],
+        "intended_nonflat_admitted_range": [165, 539],
+    }
+    if type(receipt) is not dict \
+            or any(receipt.get(key) != expected
+                   for key, expected in expected_scalars.items()) \
+            or any(receipt.get(key) != expected
+                   for key, expected in expected_ranges.items()) \
+            or receipt.get("hashes") != AUTHORED_SLOPE_HASHES \
+            or receipt.get("metadata") != {"scene_scale": 1.0}:
+        raise ValueError("authored-slope scene receipt identity changed")
+    try:
+        rotation = np.asarray(
+            receipt["object_rotation_binary32"], np.float64)
+        translation = np.asarray(
+            receipt["object_translation_binary32"], np.float64)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            "authored-slope scene receipt reconstruction pose is invalid") \
+            from error
+    if rotation.shape != (3, 3) or translation.shape != (3,) \
+            or terrain.reconstruction_rotation is None \
+            or terrain.reconstruction_translation is None \
+            or not np.array_equal(rotation, terrain.reconstruction_rotation) \
+            or not np.array_equal(
+                translation, terrain.reconstruction_translation):
+        raise ValueError(
+            "authored-slope terrain and receipt reconstruction pose disagree")
+
+
 def authored_slope_scene_definition(clip, terrain, receipt):
     if clip.name != AUTHORED_SLOPE_BASE \
             or clip.terrain_id != AUTHORED_SLOPE_BASE \
@@ -1096,9 +1158,9 @@ def authored_slope_scene_definition(clip, terrain, receipt):
             or terrain.exterior_height != -0.012000000104308128:
         raise ValueError("authored-slope scene requires the calibrated paired terrain")
     if type(receipt) is not dict \
-            or receipt.get("schema") != "g1-lmm-authored-slope-source/v1" \
-            or receipt.get("rejected_output_ranges") != [[0, 3]]:
+            or "registration_offset" in receipt:
         raise ValueError("authored-slope scene requires its provenance receipt")
+    _require_authored_slope_scene_receipt(terrain, receipt)
 
     path, route_points, spawn, yaw = _root_route_and_yaw(clip)
     mesh_xmin, mesh_xmax, mesh_zmin, mesh_zmax = terrain.xz_bounds()

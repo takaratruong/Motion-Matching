@@ -49,7 +49,9 @@ class BuildCliTests(unittest.TestCase):
                 "g1_29dof.xml"),
         ))
 
-        receipt = candidate.receipt
+        receipt = candidate.provenance
+        self.assertEqual(len(candidate.source.positions), 598)
+        candidate.source.validate()
         self.assertEqual(receipt["schema"], "g1-lmm-authored-slope-source/v1")
         self.assertEqual(receipt["status"], "provisional")
         self.assertEqual(receipt["clip_id"], name)
