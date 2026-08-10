@@ -16,7 +16,11 @@ import time
 
 import numpy as np
 
-from resources.build_g1_terrain_database import _assemble_authored_slope_source
+from resources.build_g1_terrain_database import (
+    _assemble_authored_slope_source,
+    _read_canonical_flat_g1_xml,
+)
+from resources.g1_terrain_builder.kinematics import load_mujoco_xml_assets
 from resources.g1_terrain_builder.resample import (
     resample_quaternions_wxyz,
     resample_vectors,
@@ -50,6 +54,8 @@ class AuthoredSlopeBundle:
     support_calibration_m: float
     hashes: Mapping[str, str]
     g1_xml_path: Path
+    g1_xml_bytes: bytes
+    g1_xml_assets: Mapping[str, bytes]
 
 
 def _frozen_array(values: object, dtype: np.dtype) -> np.ndarray:
@@ -147,6 +153,8 @@ def load_authored_slope_bundle(
         for value in (slope_robot, slope_usd, slope_recon, slope_metadata, g1_xml)
     )
     robot, usd, recon, metadata, model = paths
+    model_bytes = _read_canonical_flat_g1_xml(str(model))
+    model_assets = load_mujoco_xml_assets(str(model))
     candidate = _assemble_authored_slope_source(
         SimpleNamespace(
             output_fps=60.0,
@@ -157,6 +165,13 @@ def load_authored_slope_bundle(
             g1_xml=str(model),
         )
     )
+    if (
+        _read_canonical_flat_g1_xml(str(model)) != model_bytes
+        or load_mujoco_xml_assets(str(model)) != model_assets
+    ):
+        raise ValueError(
+            "canonical G1 XML dependencies changed during authenticated capture"
+        )
     receipt = candidate.provenance
     if (
         receipt.get("clip_id") != AUTHORED_SLOPE_CLIP_ID
@@ -188,6 +203,8 @@ def load_authored_slope_bundle(
         support_calibration_m=AUTHORED_SLOPE_SUPPORT_CALIBRATION_M,
         hashes=MappingProxyType(dict(receipt["hashes"])),
         g1_xml_path=model,
+        g1_xml_bytes=model_bytes,
+        g1_xml_assets=MappingProxyType(dict(model_assets)),
     )
 
 
@@ -198,7 +215,13 @@ def build_playback_model(bundle: AuthoredSlopeBundle):
 
     if not isinstance(bundle, AuthoredSlopeBundle):
         raise TypeError("playback model requires an authored slope bundle")
-    spec = mujoco.MjSpec.from_file(str(bundle.g1_xml_path))
+    try:
+        model_xml = bundle.g1_xml_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("captured canonical G1 XML is not UTF-8") from error
+    spec = mujoco.MjSpec.from_string(
+        model_xml, assets=dict(bundle.g1_xml_assets)
+    )
     spec.add_mesh(
         name="authored_slope_exact_mesh",
         uservert=bundle.terrain_vertices_native.ravel(),

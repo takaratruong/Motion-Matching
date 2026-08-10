@@ -1,6 +1,9 @@
 import hashlib
 import io
 import json
+import os
+from pathlib import Path
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 
@@ -143,6 +146,24 @@ class AuthenticatedAuthoredSlopeBundleTests(unittest.TestCase):
             -AUTHORED_SLOPE_SUPPORT_CALIBRATION_M,
         )
         self.assertEqual(float(model.geom_rgba[original_floor_id, 3]), 0.0)
+
+    def test_model_uses_captured_xml_and_assets_after_source_path_mutation(self):
+        canonical = Path(
+            "/home/ubuntu/projects/mjx-diffphysics/env/g1/assets/g1_29dof.xml"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            copied_xml = root / "g1_29dof.xml"
+            copied_xml.write_bytes(canonical.read_bytes())
+            mesh_link = root / "meshes"
+            os.symlink(canonical.parent / "meshes", mesh_link, target_is_directory=True)
+            bundle = load_authored_slope_bundle(g1_xml=copied_xml)
+
+            copied_xml.write_bytes(b"<mujoco model='mutated-after-load'/>")
+            mesh_link.unlink()
+            model = build_playback_model(bundle)
+
+        self.assertEqual(model.nq, 36)
 
     def test_w_cannot_leave_the_mujoco_scene_in_wireframe_mode(self):
         import mujoco
