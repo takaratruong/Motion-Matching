@@ -1128,6 +1128,28 @@ def _require_authored_slope_scene_receipt(terrain, receipt):
             or receipt.get("hashes") != AUTHORED_SLOPE_HASHES \
             or receipt.get("metadata") != {"scene_scale": 1.0}:
         raise ValueError("authored-slope scene receipt identity changed")
+    exterior = receipt.get("exterior_policy")
+    if type(exterior) is not dict \
+            or set(exterior) != {
+                "source_height_m", "runtime_height_m",
+                "gradient_xz", "mesh_wins_inside",
+            } \
+            or type(exterior["source_height_m"]) is not float \
+            or exterior["source_height_m"] != 0.0 \
+            or exterior["source_height_m"] \
+            != terrain.exterior_source_height_m \
+            or type(exterior["runtime_height_m"]) is not float \
+            or exterior["runtime_height_m"] != -0.012000000104308128 \
+            or exterior["runtime_height_m"] != terrain.exterior_height \
+            or type(exterior["gradient_xz"]) is not list \
+            or len(exterior["gradient_xz"]) != 2 \
+            or any(type(value) is not float
+                   for value in exterior["gradient_xz"]) \
+            or exterior["gradient_xz"] != [0.0, 0.0] \
+            or type(exterior["mesh_wins_inside"]) is not bool \
+            or exterior["mesh_wins_inside"] is not True:
+        raise ValueError(
+            "authored-slope terrain and receipt exterior policy disagree")
     try:
         rotation = np.asarray(
             receipt["object_rotation_binary32"], np.float64)

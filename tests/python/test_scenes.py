@@ -763,6 +763,24 @@ class GrailSceneTests(unittest.TestCase):
             ("clip-id", lambda value: value.__setitem__("clip_id", "other")),
             ("hash-map", lambda value: value["hashes"].__setitem__(
                 "usd_sha256", "0" * 64)),
+            ("exterior-source", lambda value: value["exterior_policy"]
+             .__setitem__("source_height_m", 0.25)),
+            ("exterior-runtime", lambda value: value["exterior_policy"]
+             .__setitem__("runtime_height_m", 0.0)),
+            ("exterior-gradient", lambda value: value["exterior_policy"]
+             .__setitem__("gradient_xz", [1.0, 0.0])),
+            ("exterior-mesh-wins", lambda value: value["exterior_policy"]
+             .__setitem__("mesh_wins_inside", False)),
+            ("exterior-source-type", lambda value: value["exterior_policy"]
+             .__setitem__("source_height_m", 0)),
+            ("exterior-gradient-types", lambda value: value["exterior_policy"]
+             .__setitem__("gradient_xz", [0, 0])),
+            ("exterior-mesh-wins-type", lambda value: value["exterior_policy"]
+             .__setitem__("mesh_wins_inside", 1)),
+            ("exterior-missing", lambda value: value["exterior_policy"].pop(
+                "gradient_xz")),
+            ("exterior-extra", lambda value: value["exterior_policy"]
+             .__setitem__("extension", "nearest")),
             ("source-frames", lambda value: value.__setitem__(
                 "source_frames", 249)),
             ("provisional-frames", lambda value: value.__setitem__(
