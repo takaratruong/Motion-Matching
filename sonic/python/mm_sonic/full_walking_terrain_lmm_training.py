@@ -92,6 +92,12 @@ _FULL_WALKING_ACCEPTANCE_LIMITS = {
     "fk_body_position_p95_m": 0.08,
     "support_foot_position_p95_m": 0.05,
 }
+_FULL_WALKING_LEGACY_ACCEPTANCE_LIMITS = {
+    "joint_geodesic_mae_rad": 0.03,
+    "joint_frame_max_p95_rad": 0.10,
+    "fk_body_position_p95_m": 0.08,
+    "support_foot_position_p95_m": 0.05,
+}
 _FULL_WALKING_MINIMUM_CONTACT_F1 = 0.85
 
 
@@ -761,28 +767,41 @@ def train_selection(
     )
 
 
-def _metric_receipt_valid(metrics: object) -> bool:
+def _metric_receipt_valid(
+    metrics: object,
+    *,
+    acceptance_profile: str | None = FULL_WALKING_LOCOMOTION_ACCEPTANCE_PROFILE,
+) -> bool:
     if not isinstance(metrics, dict) or metrics.get("finite") is not True:
         raise ValueError("test physical metrics are invalid")
     if type(metrics.get("rows")) is not int or metrics["rows"] <= 0:
         raise ValueError("test physical metric row count is invalid")
+    if acceptance_profile is None:
+        acceptance_limits = _FULL_WALKING_LEGACY_ACCEPTANCE_LIMITS
+        diagnostic_names = ("local_position_p95_m",)
+    elif acceptance_profile == FULL_WALKING_LOCOMOTION_ACCEPTANCE_PROFILE:
+        acceptance_limits = _FULL_WALKING_ACCEPTANCE_LIMITS
+        diagnostic_names = ("local_position_p95_m", "joint_frame_max_p95_rad")
+        if (
+            metrics.get("acceptance_profile") != acceptance_profile
+            or metrics.get("joint_frame_max_scope")
+            != "all-30-non-root-joints-diagnostic"
+        ):
+            raise ValueError("test physical acceptance scope changed")
+    else:
+        raise ValueError("test physical acceptance profile is unsupported")
     expected_limits = {
-        **_FULL_WALKING_ACCEPTANCE_LIMITS,
+        **acceptance_limits,
         "minimum_contact_f1": _FULL_WALKING_MINIMUM_CONTACT_F1,
     }
     if metrics.get("gate_limits") != expected_limits:
         raise ValueError("test physical gate limits changed")
-    if (
-        metrics.get("acceptance_profile") != FULL_WALKING_LOCOMOTION_ACCEPTANCE_PROFILE
-        or metrics.get("joint_frame_max_scope") != "all-30-non-root-joints-diagnostic"
-    ):
-        raise ValueError("test physical acceptance scope changed")
-    for name in ("local_position_p95_m", "joint_frame_max_p95_rad"):
+    for name in diagnostic_names:
         value = metrics.get(name)
         if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
             raise ValueError(f"test metric {name} is invalid")
     accepted = True
-    for name, limit in _FULL_WALKING_ACCEPTANCE_LIMITS.items():
+    for name, limit in acceptance_limits.items():
         value = metrics.get(name)
         if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
             raise ValueError(f"test metric {name} is invalid")
@@ -971,14 +990,19 @@ def _parse_test_receipt_payload(payload: bytes) -> dict[str, object]:
         "selection_validation_receipt_sha256",
     ):
         _require_sha256(value.get(name), name.replace("_", " "))
-    accepted = _metric_receipt_valid(value.get("metrics"))
+    selection_identity = value.get("selection_artifact_identity")
+    if not isinstance(selection_identity, dict):
+        raise ValueError("frozen test receipt selection identity is invalid")
+    accepted = _metric_receipt_valid(
+        value.get("metrics"),
+        acceptance_profile=selection_identity.get("acceptance_profile"),
+    )
     metrics = value["metrics"]
     assert isinstance(metrics, dict)
     if (
         value.get("accepted") is not accepted
         or value.get("status") != ("test-gates-green" if accepted else "test-gates-red")
         or value.get("test_rows") != metrics.get("rows")
-        or not isinstance(value.get("selection_artifact_identity"), dict)
     ):
         raise ValueError("frozen test receipt status/provenance is inconsistent")
     return value

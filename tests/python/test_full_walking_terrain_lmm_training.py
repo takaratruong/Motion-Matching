@@ -22,6 +22,7 @@ from mm_sonic.full_walking_terrain_lmm_training import (
     FULL_WALKING_LOCOMOTION_ACCEPTANCE_PROFILE,
     HierarchicalTrainingPools,
     _metric_receipt_valid,
+    _parse_test_receipt_payload,
     _sample_tree,
     evaluate_frozen_test,
     full_walking_model_identity,
@@ -517,6 +518,71 @@ class FullWalkingTrainingContractTests(unittest.TestCase):
         rejected["locomotion_joint_frame_max_p95_rad"] = 0.11
         rejected["accepted"] = False
         self.assertFalse(_metric_receipt_valid(rejected))
+
+    def test_legacy_test_metrics_keep_the_original_all_body_gate(self) -> None:
+        metrics = {
+            "finite": True,
+            "rows": 100,
+            "joint_geodesic_mae_rad": 0.02,
+            "joint_frame_max_p95_rad": 0.09,
+            "local_position_p95_m": 0.50,
+            "fk_body_position_p95_m": 0.04,
+            "support_foot_position_p95_m": 0.03,
+            "contact_f1": [0.99, 0.98],
+            "gate_limits": {
+                "joint_geodesic_mae_rad": 0.03,
+                "joint_frame_max_p95_rad": 0.10,
+                "fk_body_position_p95_m": 0.08,
+                "support_foot_position_p95_m": 0.05,
+                "minimum_contact_f1": 0.85,
+            },
+            "accepted": True,
+        }
+        self.assertTrue(_metric_receipt_valid(metrics, acceptance_profile=None))
+
+    def test_legacy_test_receipt_uses_legacy_selection_identity_gate(self) -> None:
+        corpus = _easy_green_corpus()
+        metrics = {
+            "finite": True,
+            "rows": 100,
+            "joint_geodesic_mae_rad": 0.02,
+            "joint_frame_max_p95_rad": 0.09,
+            "local_position_p95_m": 0.50,
+            "fk_body_position_p95_m": 0.04,
+            "support_foot_position_p95_m": 0.03,
+            "contact_f1": [0.99, 0.98],
+            "gate_limits": {
+                "joint_geodesic_mae_rad": 0.03,
+                "joint_frame_max_p95_rad": 0.10,
+                "fk_body_position_p95_m": 0.08,
+                "support_foot_position_p95_m": 0.05,
+                "minimum_contact_f1": 0.85,
+            },
+            "accepted": True,
+        }
+        receipt = {
+            "schema": "g1-full-walking-terrain-lmm-test/v1",
+            "accepted": True,
+            "status": "test-gates-green",
+            "finite": True,
+            "one_time_test": True,
+            "corpus_manifest_sha256": _sha("a"),
+            "inventory_manifest_sha256": _sha("b"),
+            "split_ledger_manifest_sha256": _sha("c"),
+            "selection_model_manifest_sha256": _sha("d"),
+            "selection_validation_receipt_sha256": _sha("e"),
+            "selection_artifact_identity": full_walking_model_identity(
+                corpus,
+                config=_config(),
+                stage="selection",
+                acceptance_profile=None,
+            ),
+            "test_rows": 100,
+            "metrics": metrics,
+        }
+        self.assertEqual(
+            _parse_test_receipt_payload(canonical_json_bytes(receipt)), receipt
+        )
 
     def test_test_split_is_not_consumed_when_validation_gates_are_red(self) -> None:
         corpus = _synthetic_full_corpus()
