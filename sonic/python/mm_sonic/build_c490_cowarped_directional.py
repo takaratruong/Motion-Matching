@@ -367,12 +367,17 @@ def build_clip(
     )
     reports: list[dict[str, object]] = []
     for mode in tuple(modes):
-        identity_qualification = str(mode) == "registered_identity"
+        registered_contact_refit = str(mode) in (
+            "registered_contact_refit",
+            # Backward-compatible alias for the first canary only.  New banks
+            # use the honest contact-refit name.
+            "registered_identity",
+        )
         mapping_mode = (
-            "cowarp_diagonal_right" if identity_qualification else str(mode)
+            "cowarp_diagonal_right" if registered_contact_refit else str(mode)
         )
         applied_amplitude = (
-            0.0 if identity_qualification else float(maximum_amplitude_m)
+            0.0 if registered_contact_refit else float(maximum_amplitude_m)
         )
         summary["attempted"] = int(summary["attempted"]) + 1
         destination = clip_root / str(mode)
@@ -383,7 +388,8 @@ def build_clip(
             "mode": str(mode),
             "source_motion": str((source_root / "motion.npz").resolve()),
             "active_route_interval_m": [active_start, active_stop],
-            "identity_qualification": identity_qualification,
+            "registered_contact_refit_qualification": registered_contact_refit,
+            "source_motion_unchanged": False,
             "applied_maximum_amplitude_m": applied_amplitude,
             "status": "rejected",
         }
@@ -529,7 +535,7 @@ def build_clip(
                 balanced_two_foot_support
             )
             realized = bool(
-                identity_qualification
+                registered_contact_refit
                 or (
                     # The requested-angle limiter can land a few tenths of a
                     # millimetre below the nominal 5 cm display threshold.

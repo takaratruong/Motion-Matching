@@ -2549,3 +2549,18 @@ mm: all three planted descent stops remain admitted and all three skatey
 ascent stops are removed.  The remaining temporal variants stay outside the
 curated bank until dense visual review and are explicitly not counted as new
 spatial terrain skills.
+
+The zero-amplitude archive screen is now named `registered_contact_refit`, not
+`registered_identity`.  It keeps the authored motion/terrain pairing, terrain
+topology, root route, and temporal cadence, while applying the same small
+whole-sole contact refit and exact post-serialization audit used by the paired
+terrain authoring path.  Calling this result unchanged was misleading.  A true
+source-unchanged clip-385 canary (apart from arm attenuation) retained
+25--32 mm stance-probe hover and roughly 32 mm stance-target error; the contact
+refit reduces those failures enough to pass the unchanged two-foot support,
+drift, penetration, body-collision, and smoothness gates.  New natural-source
+screens therefore report `registered_contact_refit_qualification: true` and
+`source_motion_unchanged: false`.  They are being used to discover already
+natural stair, curb, and slope phrases before attempting any additional
+spatial authoring; this explicitly prioritizes good kinematics over whether a
+current SONIC tracker can reproduce them.
