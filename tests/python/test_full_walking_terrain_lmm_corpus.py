@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 from mm_sonic.full_walking_terrain_lmm_contracts import (
@@ -24,6 +25,7 @@ from mm_sonic.full_walking_terrain_lmm_corpus import (
     FAMILIES,
     FullWalkingCorpus,
     _BuildWorkspace,
+    _classify_pfnn_terminal_outcomes,
     _ordered_ranges,
     _verify_terrain_semantics,
     assemble_full_corpus,
@@ -394,6 +396,36 @@ def _write_authorities(root: Path, inventory: FullWalkingInventory, ledger) -> N
 
 
 class FullWalkingTerrainLmmCorpusTests(unittest.TestCase):
+    def test_pfnn_terminal_outcomes_retain_exact_gait_and_boundary_reasons(self):
+        gait = np.zeros((12, 8), dtype=np.float64)
+        gait[:, 0] = 1.0
+        gait[4:6, :] = 0.0
+        gait[4:6, 3] = 1.0  # run
+        gait[8:10, :] = 0.0
+        gait[8:10, 5] = 1.0  # jump
+
+        outcomes = _classify_pfnn_terminal_outcomes(
+            gait, ((0, 4), (10, 12)), np.zeros(11, dtype=np.bool_)
+        )
+
+        self.assertEqual(
+            outcomes["excluded_blocks"],
+            [
+                {"start": 4, "stop": 6, "reason": "run"},
+                {"start": 6, "stop": 8, "reason": "short_fragment"},
+                {"start": 8, "stop": 10, "reason": "jump"},
+            ],
+        )
+        adjacent = _classify_pfnn_terminal_outcomes(
+            np.eye(1, 8, dtype=np.float64).repeat(4, axis=0),
+            ((0, 2), (2, 4)),
+            np.asarray([False, True, False]),
+        )
+        self.assertEqual(
+            adjacent["range_boundaries"],
+            [{"at": 2, "reason": "retarget_continuity"}],
+        )
+
     def test_pfnn_native_grid_uses_fit_authority_not_g1tf_column_aliasing(self):
         source = SourceRecord(
             "pfnn:fixture",
@@ -720,6 +752,25 @@ class FullWalkingTerrainLmmCorpusTests(unittest.TestCase):
                     )
                     with self.assertRaisesRegex(ValueError, message):
                         verify_full_corpus(target, root / f"rejected-{name}.json")
+
+    def test_standalone_verify_rechecks_terminal_range_coverage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory, ledger, lanes, scenes = self._fixture(root)
+            corpus = assemble_full_corpus(
+                lanes,
+                root / "corpus",
+                inventory=inventory,
+                split_ledger=ledger,
+                scene_authority=scenes,
+            )
+
+            with mock.patch(
+                "mm_sonic.full_walking_terrain_lmm_corpus._ordered_ranges",
+                side_effect=ValueError("terminal range coverage changed"),
+            ):
+                with self.assertRaisesRegex(ValueError, "terminal range coverage"):
+                    verify_full_corpus(corpus, root / "rejected-coverage.json")
 
     def test_publication_is_exclusive_and_reproduction_is_byte_exact(self):
         with tempfile.TemporaryDirectory() as directory:

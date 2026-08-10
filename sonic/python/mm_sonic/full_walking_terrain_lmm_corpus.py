@@ -112,6 +112,10 @@ _FROZEN_RANGE_KIND_COUNTS = {
     "source-native-takara": 1,
     "pfnn": 1_161,
 }
+_FROZEN_PFNN_ROOT = Path("/home/ubuntu/datasets/pfnn/pfnn")
+_PFNN_GAIT_CACHE: dict[str, np.ndarray] = {}
+_PFNN_CONTINUITY_CACHE: dict[str, np.ndarray] = {}
+_PFNN_EXCLUDED_GAIT_LABELS = ("jog", "run", "crouch", "jump", "crawl")
 
 
 @dataclass(frozen=True)
@@ -1215,6 +1219,184 @@ def _ordered_ranges(
     )
 
 
+def _classify_pfnn_terminal_outcomes(
+    gait: np.ndarray,
+    accepted_intervals: Sequence[tuple[int, int]],
+    continuity_breaks: np.ndarray,
+) -> dict[str, list[dict[str, object]]]:
+    """Classify every omitted native PFNN row and every retained boundary."""
+
+    values = np.asarray(gait)
+    if values.ndim != 2 or values.shape[1] != 8 or values.dtype.kind not in "iuf":
+        raise ValueError("PFNN gait must have exact numeric shape [T,8]")
+    values = values.astype(np.float64, copy=False)
+    finite = np.isfinite(values).all(axis=1)
+    bounded = ((values >= 0.0) & (values <= 1.0)).all(axis=1)
+    base_sum = values[:, :7].sum(axis=1)
+    valid = finite & bounded & np.isclose(base_sum, 1.0, rtol=0.0, atol=1e-6)
+    safe = np.where(valid[:, None], values, 0.0)
+    allowed = safe[:, 0] + safe[:, 1]
+    disallowed = safe[:, 2:7].sum(axis=1)
+    admitted = valid & (allowed > 0.0) & (allowed >= disallowed)
+
+    continuity = np.asarray(continuity_breaks)
+    if continuity.dtype != np.bool_ or continuity.shape != (max(0, len(values) - 1),):
+        raise ValueError("PFNN continuity breaks must be bool shape [T-1]")
+    accepted_set: set[tuple[int, int]] = set()
+    previous_stop = 0
+    for start, stop in accepted_intervals:
+        if (
+            type(start) is not int
+            or type(stop) is not int
+            or not (0 <= start < stop <= len(values))
+            or start < previous_stop
+        ):
+            raise ValueError("PFNN accepted terminal intervals overlap or are invalid")
+        accepted_set.add((start, stop))
+        previous_stop = stop
+
+    admitted_intervals: list[tuple[int, int]] = []
+    cursor = 0
+    while cursor < len(admitted):
+        if not admitted[cursor]:
+            cursor += 1
+            continue
+        start = cursor
+        cursor += 1
+        while (
+            cursor < len(admitted) and admitted[cursor] and not continuity[cursor - 1]
+        ):
+            cursor += 1
+        admitted_intervals.append((start, cursor))
+    admitted_set = set(admitted_intervals)
+    if not accepted_set.issubset(admitted_set):
+        raise ValueError("PFNN retained range differs from admitted range boundaries")
+
+    reasons: list[str | None] = [None] * len(values)
+    for row in np.flatnonzero(~valid):
+        reasons[int(row)] = "malformed_gait"
+    for row in np.flatnonzero(valid & ~admitted):
+        reasons[int(row)] = _PFNN_EXCLUDED_GAIT_LABELS[int(np.argmax(values[row, 2:7]))]
+    blocks: list[dict[str, object]] = []
+    cursor = 0
+    while cursor < len(reasons):
+        reason = reasons[cursor]
+        if reason is None:
+            cursor += 1
+            continue
+        start = cursor
+        cursor += 1
+        while cursor < len(reasons) and reasons[cursor] == reason:
+            cursor += 1
+        blocks.append({"start": start, "stop": cursor, "reason": reason})
+    blocks.extend(
+        {"start": start, "stop": stop, "reason": "short_fragment"}
+        for start, stop in admitted_intervals
+        if (start, stop) not in accepted_set
+    )
+    blocks.sort(key=lambda value: (int(value["start"]), int(value["stop"])))
+    boundaries = [
+        {"at": int(index + 1), "reason": "retarget_continuity"}
+        for index in np.flatnonzero(continuity)
+    ]
+    return {"excluded_blocks": blocks, "range_boundaries": boundaries}
+
+
+def _load_frozen_pfnn_gait(source: SourceRecord, frames: int) -> np.ndarray:
+    inputs = source.authority.get("inputs")
+    descriptor = inputs.get("gait") if isinstance(inputs, Mapping) else None
+    if (
+        not isinstance(descriptor, Mapping)
+        or type(descriptor.get("path")) is not str
+        or type(descriptor.get("size_bytes")) is not int
+        or not _is_sha256(descriptor.get("sha256"))
+    ):
+        raise ValueError("PFNN inventory lacks an authenticated gait descriptor")
+    root = _FROZEN_PFNN_ROOT.resolve(strict=True)
+    path = (root / descriptor["path"]).resolve(strict=True)
+    try:
+        path.relative_to(root)
+    except ValueError as error:
+        raise ValueError("PFNN gait authority escapes its frozen root") from error
+    key = f"{path}:{descriptor['sha256']}"
+    if key not in _PFNN_GAIT_CACHE:
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or path.stat().st_size != descriptor["size_bytes"]
+            or sha256_file(path) != descriptor["sha256"]
+        ):
+            raise ValueError("PFNN gait source bytes changed")
+        try:
+            gait = np.loadtxt(path, dtype=np.float64)
+        except (OSError, ValueError) as error:
+            raise ValueError("PFNN gait source failed strict decode") from error
+        gait = np.ascontiguousarray(gait, dtype=np.float64)
+        gait.setflags(write=False)
+        _PFNN_GAIT_CACHE[key] = gait
+    result = _PFNN_GAIT_CACHE[key]
+    if result.shape != (frames, 8):
+        raise ValueError("PFNN gait source frame count changed")
+    return result
+
+
+def _load_pfnn_continuity(records: Sequence[RangeRecord], frames: int) -> np.ndarray:
+    descriptors = [record.authority.get("retarget") for record in records]
+    if not descriptors or any(value != descriptors[0] for value in descriptors):
+        raise ValueError("PFNN ranges do not share one retarget authority")
+    descriptor = descriptors[0]
+    if (
+        not isinstance(descriptor, Mapping)
+        or type(descriptor.get("path")) is not str
+        or type(descriptor.get("size_bytes")) is not int
+        or not _is_sha256(descriptor.get("sha256"))
+    ):
+        raise ValueError("PFNN retarget authority is incomplete")
+    path = Path(descriptor["path"]).resolve(strict=True)
+    key = f"{path}:{descriptor['sha256']}"
+    if key not in _PFNN_CONTINUITY_CACHE:
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or path.stat().st_size != descriptor["size_bytes"]
+            or sha256_file(path) != descriptor["sha256"]
+        ):
+            raise ValueError("PFNN retarget source bytes changed")
+        try:
+            with np.load(path, allow_pickle=False) as archive:
+                root = np.asarray(archive["root_pos"], dtype=np.float64)
+                quaternion = np.asarray(archive["root_quat"], dtype=np.float64)
+                dof = np.asarray(archive["dof"], dtype=np.float64)
+                fps = float(np.asarray(archive["fps"]).item())
+        except (OSError, KeyError, ValueError) as error:
+            raise ValueError("PFNN retarget source failed strict decode") from error
+        if (
+            root.shape != (frames, 3)
+            or quaternion.shape != (frames, 4)
+            or dof.shape != (frames, 29)
+            or fps != 120.0
+            or not all(np.isfinite(value).all() for value in (root, quaternion, dof))
+        ):
+            raise ValueError("PFNN retarget source dimensions or values changed")
+        norms = np.linalg.norm(quaternion, axis=1, keepdims=True)
+        if np.any(norms < 1e-12):
+            raise ValueError("PFNN retarget source contains a zero quaternion")
+        normalized = quaternion / norms
+        planar = np.linalg.norm(np.diff(root[:, :2], axis=0), axis=1) > 0.10
+        joint = np.max(np.abs(np.diff(dof, axis=0)), axis=1) > 0.50
+        dots = np.clip(
+            np.abs(np.sum(normalized[1:] * normalized[:-1], axis=1)), 0.0, 1.0
+        )
+        rotation = 2.0 * np.arccos(dots) > 0.30
+        continuity = np.ascontiguousarray(planar | joint | rotation, dtype=np.bool_)
+        continuity.setflags(write=False)
+        _PFNN_CONTINUITY_CACHE[key] = continuity
+    result = _PFNN_CONTINUITY_CACHE[key]
+    if result.shape != (max(0, frames - 1),):
+        raise ValueError("PFNN retarget continuity frame count changed")
+    return result
+
+
 def _terminal_outcomes(
     records: Sequence[tuple[RangeRecord, str]],
     inventory: FullWalkingInventory,
@@ -1233,9 +1415,14 @@ def _terminal_outcomes(
 
     sources = []
     excluded_reason_counts: dict[str, int] = {}
+    excluded_family_reason_counts: dict[str, dict[str, dict[str, int]]] = {
+        family: {} for family in FAMILIES
+    }
+    boundary_reason_counts: dict[str, int] = {}
     for source in sorted(inventory.sources, key=lambda value: value.source_id):
         source_records = by_source[source.source_id]
         excluded_blocks: list[dict[str, object]] = []
+        range_boundaries: list[dict[str, object]] = []
         if source.authority.get("kind") == "pfnn":
             intervals = sorted(
                 tuple(record.authority.get("source_interval_120hz", ()))
@@ -1250,30 +1437,23 @@ def _terminal_outcomes(
             ):
                 raise ValueError("PFNN terminal outcome source bounds changed")
             frame_count = next(iter(frame_counts))
-            cursor = 0
-            for start, stop in intervals:
-                if start < cursor or stop <= start or stop > frame_count:
-                    raise ValueError("PFNN terminal outcome intervals overlap")
-                if cursor < start:
-                    excluded_blocks.append(
-                        {
-                            "start": cursor,
-                            "stop": start,
-                            "reason": "not-admitted-or-invalid-terrain-fit",
-                        }
-                    )
-                cursor = stop
-            if cursor < frame_count:
-                excluded_blocks.append(
-                    {
-                        "start": cursor,
-                        "stop": frame_count,
-                        "reason": "not-admitted-or-invalid-terrain-fit",
-                    }
-                )
+            gait = _load_frozen_pfnn_gait(source, frame_count)
+            continuity = _load_pfnn_continuity(source_records, frame_count)
+            classified = _classify_pfnn_terminal_outcomes(
+                gait, tuple(intervals), continuity
+            )
+            excluded_blocks = classified["excluded_blocks"]
+            range_boundaries = classified["range_boundaries"]
         for block in excluded_blocks:
             reason = str(block["reason"])
             excluded_reason_counts[reason] = excluded_reason_counts.get(reason, 0) + 1
+            family_reasons = excluded_family_reason_counts[source.family]
+            counts = family_reasons.setdefault(reason, {"blocks": 0, "rows": 0})
+            counts["blocks"] += 1
+            counts["rows"] += int(block["stop"]) - int(block["start"])
+        for boundary in range_boundaries:
+            reason = str(boundary["reason"])
+            boundary_reason_counts[reason] = boundary_reason_counts.get(reason, 0) + 1
         sources.append(
             {
                 "source_id": source.source_id,
@@ -1293,6 +1473,7 @@ def _terminal_outcomes(
                     for quality in QUALITY_IDS
                 },
                 "excluded_blocks": excluded_blocks,
+                "range_boundaries": range_boundaries,
             }
         )
     return {
@@ -1300,6 +1481,11 @@ def _terminal_outcomes(
         "quality_range_counts": quality_range_counts,
         "quality_row_counts": quality_row_counts,
         "excluded_reason_counts": dict(sorted(excluded_reason_counts.items())),
+        "excluded_family_reason_counts": {
+            family: dict(sorted(reasons.items()))
+            for family, reasons in excluded_family_reason_counts.items()
+        },
+        "boundary_reason_counts": dict(sorted(boundary_reason_counts.items())),
         "sources": sources,
     }
 
@@ -2517,6 +2703,22 @@ def _verify_normalization_independent(corpus: FullWalkingCorpus) -> None:
 
 def _verify_full_corpus_contents(root: Path) -> Mapping[str, object]:
     corpus, inventory, ledger, lanes, ranges, manifest = _load_full_corpus_details(root)
+    expected_inputs = _ordered_ranges(lanes, inventory)
+    expected_ranges = []
+    cursor = 0
+    for value in expected_inputs:
+        stop = cursor + value.rows
+        expected_ranges.append(
+            (
+                replace(value.record, start=cursor, stop=stop),
+                value.source_id,
+                value.lane.manifest_sha256,
+                value.lane_range_index,
+            )
+        )
+        cursor = stop
+    if tuple(expected_ranges) != ranges:
+        raise ValueError("corpus terminal range coverage or packed ordering changed")
     terminal_outcomes = _parse_canonical_file(
         corpus.root / "terminal-outcomes.json", "corpus terminal outcomes"
     )
