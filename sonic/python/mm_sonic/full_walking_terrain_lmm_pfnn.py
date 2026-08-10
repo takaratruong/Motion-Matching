@@ -86,7 +86,7 @@ PFNN_G1_Z_OFFSET_M = 0.05224985936713168
 PFNN_PATCHES_SHA256 = "344ec49b3aab3c93cd3f618c613e7d8fd8dfaf07964583a7461f0fb7593aae79"
 PFNN_PATCHES_SIZE = 620_692_714
 TERRAIN_FITTER_VERSION = "full-pfnn-family-fit/v2"
-PFNN_PIPELINE_VERSION = "g1-full-walking-pfnn-pipeline/v2"
+PFNN_PIPELINE_VERSION = "g1-full-walking-pfnn-pipeline/v3"
 PATCH_BATCH_SIZE = 256
 MAX_OBJECTIVE_PROBES = 256
 MAX_RBF_CENTERS = 256
@@ -104,6 +104,7 @@ PFNN_PIPELINE_SHA256 = hashlib.sha256(
             "absolute_clock_hz": TARGET_FPS,
             "minimum_range_rows": 4,
             "range_local_contacts": True,
+            "four_frame_contact_endpoints": "initialize-last-before-first/v1",
             "terrain_fitter": TERRAIN_FITTER_VERSION,
             "maximum_objective_probes": MAX_OBJECTIVE_PROBES,
             "maximum_rbf_centers": MAX_RBF_CENTERS,

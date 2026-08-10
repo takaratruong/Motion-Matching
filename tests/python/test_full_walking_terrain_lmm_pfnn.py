@@ -10,6 +10,7 @@ from mm_sonic.full_walking_terrain_lmm_contracts import RangeRecord
 from mm_sonic.full_walking_terrain_lmm_pfnn import (
     EXPECTED_EXCLUDED_COUNTS,
     PFNN_INVENTORY_SHA256,
+    PFNN_PIPELINE_VERSION,
     admitted_pfnn_ranges,
     authenticate_pfnn_runtime,
     bind_pfnn_source_frame_count,
@@ -35,6 +36,10 @@ INVENTORY = Path(
     "/home/ubuntu/worktrees/motion-matching-hill-conditioning/sonic/runs/"
     "g1-full-walking-terrain-lmm/inventory-v2.json"
 )
+
+
+def test_pipeline_version_invalidates_pre_contact_endpoint_stages() -> None:
+    assert PFNN_PIPELINE_VERSION == "g1-full-walking-pfnn-pipeline/v3"
 
 
 def test_retarget_runs_in_the_pinned_mink_environment() -> None:

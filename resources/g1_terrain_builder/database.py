@@ -54,14 +54,15 @@ class ContactConfig:
             or size < 1
             or size % 2 == 0
         ):
-            raise ValueError("contact median filter size must be a positive odd integer")
+            raise ValueError(
+                "contact median filter size must be a positive odd integer"
+            )
 
 
 def _validate_parent_hierarchy(parents: np.ndarray, bones: int) -> None:
     parents = np.asarray(parents)
     if parents.shape != (bones,):
-        raise ValueError(
-            f"parents shape must be ({bones},), got {parents.shape}")
+        raise ValueError(f"parents shape must be ({bones},), got {parents.shape}")
     if not np.issubdtype(parents.dtype, np.integer):
         raise ValueError("parents must contain integer indices")
     if bones == 0 or int(parents[0]) != -1:
@@ -71,15 +72,15 @@ def _validate_parent_hierarchy(parents: np.ndarray, bones: int) -> None:
         if parent < 0 or parent >= bone:
             raise ValueError(
                 "parents must be topologically ordered with exactly one root; "
-                f"bone {bone} has parent {parent}")
+                f"bone {bone} has parent {parent}"
+            )
 
 
 def _validate_skeleton(skeleton: SkeletonSpec) -> None:
     if not isinstance(skeleton, SkeletonSpec):
         raise TypeError("skeleton must be a SkeletonSpec")
     if len(skeleton.names) != len(skeleton.parents):
-        raise ValueError(
-            "skeleton names and parents must have the same bone count")
+        raise ValueError("skeleton names and parents must have the same bone count")
     if len(set(skeleton.names)) != len(skeleton.names):
         raise ValueError("skeleton names must be unique")
     _validate_parent_hierarchy(skeleton.parents, len(skeleton.names))
@@ -88,8 +89,7 @@ def _validate_skeleton(skeleton: SkeletonSpec) -> None:
 def _validate_binary_values(name: str, array: np.ndarray) -> None:
     array = np.asarray(array)
     if not (
-        np.issubdtype(array.dtype, np.bool_)
-        or np.issubdtype(array.dtype, np.integer)
+        np.issubdtype(array.dtype, np.bool_) or np.issubdtype(array.dtype, np.integer)
     ):
         raise ValueError(f"{name} must contain binary integer values")
     if np.any((array != 0) & (array != 1)):
@@ -106,10 +106,10 @@ def _validate_clip(clip: HoldenClip, bones: int) -> None:
     if clip.positions.shape[1] != bones:
         raise ValueError(
             f"{clip.name}: bone count {clip.positions.shape[1]} "
-            f"does not match skeleton bone count {bones}")
+            f"does not match skeleton bone count {bones}"
+        )
     if np.asarray(clip.source_frames).shape != (frames,):
-        raise ValueError(
-            f"{clip.name}: source frame shape must be ({frames},)")
+        raise ValueError(f"{clip.name}: source frame shape must be ({frames},)")
     _validate_binary_values(f"{clip.name}: contacts", clip.contacts)
 
 
@@ -120,7 +120,8 @@ def _validate_artifacts(artifacts: ArtifactSet) -> None:
     positions = np.asarray(artifacts.positions)
     if positions.ndim != 3 or positions.shape[-1] != 3:
         raise ValueError(
-            f"positions shape must be (frames, bones, 3), got {positions.shape}")
+            f"positions shape must be (frames, bones, 3), got {positions.shape}"
+        )
     frames, bones, _ = positions.shape
     if frames == 0 or bones == 0:
         raise ValueError("positions must contain at least one frame and one bone")
@@ -139,8 +140,12 @@ def _validate_artifacts(artifacts: ArtifactSet) -> None:
             raise ValueError(f"{name} shape must be {shape}, got {actual}")
 
     for name in (
-        "positions", "velocities", "rotations", "angular_velocities",
-        "terrain_features", "terrain_support",
+        "positions",
+        "velocities",
+        "rotations",
+        "angular_velocities",
+        "terrain_features",
+        "terrain_support",
     ):
         array = np.asarray(getattr(artifacts, name))
         if not np.issubdtype(array.dtype, np.number):
@@ -154,7 +159,9 @@ def _validate_artifacts(artifacts: ArtifactSet) -> None:
     starts = np.asarray(artifacts.range_starts)
     stops = np.asarray(artifacts.range_stops)
     if starts.ndim != 1 or stops.ndim != 1 or starts.shape != stops.shape:
-        raise ValueError("range starts and stops must be aligned one-dimensional arrays")
+        raise ValueError(
+            "range starts and stops must be aligned one-dimensional arrays"
+        )
     if not (
         np.issubdtype(starts.dtype, np.integer)
         and np.issubdtype(stops.dtype, np.integer)
@@ -173,7 +180,8 @@ def _validate_artifacts(artifacts: ArtifactSet) -> None:
 
 
 def combine_clips(
-    clips: list[HoldenClip], skeleton: SkeletonSpec,
+    clips: list[HoldenClip],
+    skeleton: SkeletonSpec,
 ) -> ArtifactSet:
     if not clips:
         raise ValueError("at least one clip is required")
@@ -190,29 +198,36 @@ def combine_clips(
     starts = np.concatenate((np.array([0], np.int32), stops[:-1]))
     artifacts = ArtifactSet(
         np.concatenate([clip.positions for clip in clips]).astype(
-            np.float32, copy=False),
+            np.float32, copy=False
+        ),
         np.concatenate([clip.velocities for clip in clips]).astype(
-            np.float32, copy=False),
+            np.float32, copy=False
+        ),
         np.concatenate([clip.rotations for clip in clips]).astype(
-            np.float32, copy=False),
+            np.float32, copy=False
+        ),
         np.concatenate([clip.angular_velocities for clip in clips]).astype(
-            np.float32, copy=False),
+            np.float32, copy=False
+        ),
         np.asarray(skeleton.parents, np.int32).copy(),
         starts,
         stops,
-        np.concatenate([clip.contacts for clip in clips]).astype(
-            np.uint8, copy=False),
+        np.concatenate([clip.contacts for clip in clips]).astype(np.uint8, copy=False),
         np.concatenate([clip.terrain_features for clip in clips]).astype(
-            np.float32, copy=False),
+            np.float32, copy=False
+        ),
         np.concatenate([clip.terrain_support for clip in clips]).astype(
-            np.float32, copy=False),
+            np.float32, copy=False
+        ),
     )
     _validate_artifacts(artifacts)
     return artifacts
 
 
 def slice_holden_clip(
-    clip: HoldenClip, start: int, stop: int | None = None,
+    clip: HoldenClip,
+    start: int,
+    stop: int | None = None,
 ) -> HoldenClip:
     """Copy one non-empty half-open Holden clip range without recomputation."""
 
@@ -223,8 +238,7 @@ def slice_holden_clip(
     if stop is None:
         stop = frames
     if any(
-        not isinstance(value, Integral)
-        or isinstance(value, (bool, np.bool_))
+        not isinstance(value, Integral) or isinstance(value, (bool, np.bool_))
         for value in (start, stop)
     ) or not (0 <= int(start) < int(stop) <= frames):
         raise ValueError("Holden clip slice must be a non-empty in-range interval")
@@ -249,7 +263,9 @@ def slice_holden_clip(
 
 
 def refresh_lmm_clip_dynamics(
-    clip: HoldenClip, skeleton: SkeletonSpec, fps: float,
+    clip: HoldenClip,
+    skeleton: SkeletonSpec,
+    fps: float,
 ) -> HoldenClip:
     """Derive velocity/contact channels inside one continuity-safe clip."""
 
@@ -262,15 +278,21 @@ def refresh_lmm_clip_dynamics(
         left = skeleton.names.index("LeftToe")
         right = skeleton.names.index("RightToe")
     except ValueError as error:
-        raise ValueError("LMM clip skeleton must contain LeftToe and RightToe") \
-            from error
+        raise ValueError(
+            "LMM clip skeleton must contain LeftToe and RightToe"
+        ) from error
     result = slice_holden_clip(clip, 0)
     with np.errstate(divide="ignore", invalid="ignore"):
         result.velocities, result.angular_velocities = derive_velocities(
-            result.positions, result.rotations, fps)
+            result.positions, result.rotations, fps
+        )
     result.contacts = derive_lmm_contacts(
-        result.positions, result.rotations, skeleton.parents,
-        left, right, fps,
+        result.positions,
+        result.rotations,
+        skeleton.parents,
+        left,
+        right,
+        fps,
     )
     result.validate()
     return result
@@ -322,14 +344,16 @@ def _read_exact(stream, size: int, description: str) -> bytes:
 
 def _read_array1(stream, dtype: str) -> np.ndarray:
     header = _read_exact(stream, 4, "array1 header")
-    rows, = struct.unpack("<I", header)
+    (rows,) = struct.unpack("<I", header)
     itemsize = np.dtype(dtype).itemsize
     raw = _read_exact(stream, rows * itemsize, "array payload")
     return np.frombuffer(raw, dtype=dtype, count=rows).copy()
 
 
 def _read_array2(
-    stream, dtype: str, components: tuple[int, ...] = (),
+    stream,
+    dtype: str,
+    components: tuple[int, ...] = (),
 ) -> np.ndarray:
     header = _read_exact(stream, 8, "array2 header")
     rows, columns = struct.unpack("<II", header)
@@ -337,10 +361,12 @@ def _read_array2(
     for component in components:
         component_count *= component
     count = rows * columns * component_count
-    raw = _read_exact(
-        stream, count * np.dtype(dtype).itemsize, "array payload")
-    return np.frombuffer(raw, dtype=dtype, count=count).reshape(
-        (rows, columns) + components).copy()
+    raw = _read_exact(stream, count * np.dtype(dtype).itemsize, "array payload")
+    return (
+        np.frombuffer(raw, dtype=dtype, count=count)
+        .reshape((rows, columns) + components)
+        .copy()
+    )
 
 
 def read_holden_database(path: os.PathLike | str) -> ArtifactSet:
@@ -373,16 +399,20 @@ def read_holden_database(path: os.PathLike | str) -> ArtifactSet:
 
 
 def _validated_motion_arrays(
-    positions: np.ndarray, rotations: np.ndarray, fps: float,
+    positions: np.ndarray,
+    rotations: np.ndarray,
+    fps: float,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     positions = np.asarray(positions, np.float64)
     rotations = np.asarray(rotations, np.float64)
     if positions.ndim != 3 or positions.shape[-1] != 3:
         raise ValueError(
-            f"position shape must be (frames, bones, 3), got {positions.shape}")
+            f"position shape must be (frames, bones, 3), got {positions.shape}"
+        )
     if rotations.ndim != 3 or rotations.shape[-1] != 4:
         raise ValueError(
-            f"rotation shape must be (frames, bones, 4), got {rotations.shape}")
+            f"rotation shape must be (frames, bones, 4), got {rotations.shape}"
+        )
     if positions.shape[:2] != rotations.shape[:2]:
         raise ValueError("position and rotation shapes must align")
     if len(positions) < 3:
@@ -407,18 +437,22 @@ def _validated_fps(fps: float, context: str) -> float:
 
 
 def derive_velocities(
-    positions: np.ndarray, rotations: np.ndarray, fps: float,
+    positions: np.ndarray,
+    rotations: np.ndarray,
+    fps: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    positions, rotations, fps = _validated_motion_arrays(
-        positions, rotations, fps)
+    positions, rotations, fps = _validated_motion_arrays(positions, rotations, fps)
     velocity = np.gradient(positions, axis=0, edge_order=2) * fps
-    frame_delta = holden_quat.to_scaled_angle_axis(holden_quat.abs(
-        holden_quat.mul_inv(rotations[1:], rotations[:-1]))) * fps
+    frame_delta = (
+        holden_quat.to_scaled_angle_axis(
+            holden_quat.abs(holden_quat.mul_inv(rotations[1:], rotations[:-1]))
+        )
+        * fps
+    )
     angular_velocity = np.empty(positions.shape, np.float64)
     angular_velocity[0] = frame_delta[0]
     angular_velocity[-1] = frame_delta[-1]
-    angular_velocity[1:-1] = 0.5 * (
-        frame_delta[:-1] + frame_delta[1:])
+    angular_velocity[1:-1] = 0.5 * (frame_delta[:-1] + frame_delta[1:])
     return (
         velocity.astype(np.float32),
         angular_velocity.astype(np.float32),
@@ -438,20 +472,27 @@ def sample_terrain_support(
     if not np.isfinite(positions).all():
         raise ValueError("support positions must be finite")
     indices = (root, left_toe, right_toe)
-    if any(
-        not isinstance(index, Integral)
-        or isinstance(index, (bool, np.bool_)) or index < 0
-        or index >= positions.shape[1] for index in indices
-    ) or len(set(indices)) != 3:
+    if (
+        any(
+            not isinstance(index, Integral)
+            or isinstance(index, (bool, np.bool_))
+            or index < 0
+            or index >= positions.shape[1]
+            for index in indices
+        )
+        or len(set(indices)) != 3
+    ):
         raise ValueError("support bone indices must be distinct and in range")
     if not callable(getattr(terrain, "height", None)):
         raise TypeError("support terrain must provide height(x, z)")
     support = np.empty((len(positions), 3), np.float32)
     for frame in range(len(positions)):
         for column, bone in enumerate(indices):
-            value = float(terrain.height(
-                float(positions[frame, bone, 0]),
-                float(positions[frame, bone, 2])))
+            value = float(
+                terrain.height(
+                    float(positions[frame, bone, 0]), float(positions[frame, bone, 2])
+                )
+            )
             if not np.isfinite(value):
                 raise ValueError("support terrain heights must be finite")
             with np.errstate(over="ignore", invalid="ignore"):
@@ -472,8 +513,7 @@ def derive_contacts(
 ) -> np.ndarray:
     positions = np.asarray(global_positions, np.float64)
     if positions.ndim != 3 or positions.shape[-1] != 3:
-        raise ValueError(
-            "contact positions must have shape (frames, bones, 3)")
+        raise ValueError("contact positions must have shape (frames, bones, 3)")
     if len(positions) < 3:
         raise ValueError("contacts require at least three global-position frames")
     if not np.all(np.isfinite(positions)):
@@ -505,15 +545,14 @@ def derive_contacts(
                 ground[frame, side] = float(height)
             except (TypeError, ValueError) as error:
                 raise ValueError(
-                    "terrain height queries must return finite scalar values") \
-                    from error
+                    "terrain height queries must return finite scalar values"
+                ) from error
     if not np.all(np.isfinite(ground)):
         raise ValueError("terrain height queries must return finite values")
 
     relative_height = feet[:, :, 1] - ground
-    contacts = (
-        (speed < float(config.speed_threshold))
-        & (np.abs(relative_height) < float(config.height_threshold))
+    contacts = (speed < float(config.speed_threshold)) & (
+        np.abs(relative_height) < float(config.height_threshold)
     )
     for side in range(2):
         contacts[:, side] = ndimage.median_filter(
@@ -535,7 +574,8 @@ def derive_lmm_contacts(
     """Reproduce the bundled Orange Duck 60 Hz contact-label rule."""
 
     positions, rotations, fps = _validated_motion_arrays(
-        local_positions, local_rotations, fps)
+        local_positions, local_rotations, fps
+    )
     if fps != 60.0:
         raise ValueError("LMM contacts require exact 60 Hz motion")
     frames, bones = positions.shape[:2]
@@ -545,7 +585,8 @@ def derive_lmm_contacts(
     if any(
         not isinstance(index, Integral)
         or isinstance(index, (bool, np.bool_))
-        or index < 0 or index >= bones
+        or index < 0
+        or index >= bones
         for index in (left, right)
     ):
         raise ValueError("LMM contact toe indices are out of range")
@@ -557,27 +598,37 @@ def derive_lmm_contacts(
         0.5 * (positions[2:] - positions[1:-1]) * fps
         + 0.5 * (positions[1:-1] - positions[:-2]) * fps
     )
-    velocities[-1] = velocities[-2] + (
-        velocities[-2] - velocities[-3])
+    velocities[-1] = velocities[-2] + (velocities[-2] - velocities[-3])
     velocities[0] = velocities[1] - (velocities[3] - velocities[2])
 
     angular_velocities = np.zeros_like(positions)
     with np.errstate(divide="ignore", invalid="ignore"):
         angular_velocities[1:-1] = (
-            0.5 * holden_quat.to_scaled_angle_axis(holden_quat.abs(
-                holden_quat.mul_inv(
-                    rotations[2:], rotations[1:-1]))) * fps
-            + 0.5 * holden_quat.to_scaled_angle_axis(holden_quat.abs(
-                holden_quat.mul_inv(
-                    rotations[1:-1], rotations[:-2]))) * fps
+            0.5
+            * holden_quat.to_scaled_angle_axis(
+                holden_quat.abs(holden_quat.mul_inv(rotations[2:], rotations[1:-1]))
+            )
+            * fps
+            + 0.5
+            * holden_quat.to_scaled_angle_axis(
+                holden_quat.abs(holden_quat.mul_inv(rotations[1:-1], rotations[:-2]))
+            )
+            * fps
         )
     angular_velocities[0] = angular_velocities[1] - (
-        angular_velocities[3] - angular_velocities[2])
+        angular_velocities[3] - angular_velocities[2]
+    )
     angular_velocities[-1] = angular_velocities[-2] + (
-        angular_velocities[-2] - angular_velocities[-3])
-    _global_rotations, _global_positions, global_velocities, \
-        _global_angular_velocities = holden_quat.fk_vel(
-            rotations, positions, velocities, angular_velocities, parents)
+        angular_velocities[-2] - angular_velocities[-3]
+    )
+    (
+        _global_rotations,
+        _global_positions,
+        global_velocities,
+        _global_angular_velocities,
+    ) = holden_quat.fk_vel(
+        rotations, positions, velocities, angular_velocities, parents
+    )
     if not np.isfinite(global_velocities).all():
         raise ValueError("LMM global velocities must be finite")
 
@@ -594,27 +645,27 @@ def derive_lmm_contacts(
 
 
 def forward_kinematics_arrays(
-    positions: np.ndarray, rotations: np.ndarray, parents: np.ndarray,
+    positions: np.ndarray,
+    rotations: np.ndarray,
+    parents: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     positions = np.asarray(positions)
     rotations = np.asarray(rotations)
     if positions.ndim != 3 or positions.shape[-1] != 3:
         raise ValueError(
-            f"positions shape must be (frames, bones, 3), got {positions.shape}")
+            f"positions shape must be (frames, bones, 3), got {positions.shape}"
+        )
     if rotations.shape != positions.shape[:2] + (4,):
         raise ValueError(
-            "rotations shape must align with positions as (frames, bones, 4)")
+            "rotations shape must align with positions as (frames, bones, 4)"
+        )
     if len(positions) == 0:
         raise ValueError("forward kinematics requires at least one frame")
     if not np.all(np.isfinite(positions)) or not np.all(np.isfinite(rotations)):
         raise ValueError("forward kinematics inputs must contain only finite values")
     rotation_norms = np.linalg.norm(rotations, axis=-1)
-    if (
-        np.any(rotation_norms < 1e-8)
-        or np.max(np.abs(rotation_norms - 1.0)) > 1e-3
-    ):
-        raise ValueError(
-            "forward kinematics rotations must be normalized quaternions")
+    if np.any(rotation_norms < 1e-8) or np.max(np.abs(rotation_norms - 1.0)) > 1e-3:
+        raise ValueError("forward kinematics rotations must be normalized quaternions")
     _validate_parent_hierarchy(parents, positions.shape[1])
 
     global_positions = np.empty_like(positions)
@@ -625,10 +676,9 @@ def forward_kinematics_arrays(
             global_rotations[:, bone] = rotations[:, bone]
         else:
             global_rotations[:, bone] = holden_quat.mul(
-                global_rotations[:, parent], rotations[:, bone])
-            global_positions[:, bone] = (
-                global_positions[:, parent]
-                + holden_quat.mul_vec(
-                    global_rotations[:, parent], positions[:, bone])
+                global_rotations[:, parent], rotations[:, bone]
             )
+            global_positions[:, bone] = global_positions[
+                :, parent
+            ] + holden_quat.mul_vec(global_rotations[:, parent], positions[:, bone])
     return global_positions, global_rotations
