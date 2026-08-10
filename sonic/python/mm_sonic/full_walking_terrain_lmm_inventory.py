@@ -106,7 +106,7 @@ def _strict_bank_descriptor(bank: Path) -> dict[str, Any]:
             or decoded.get("skipped_clips") != 23:
         raise ValueError("strict bank manifest cardinality contract changed")
     return {
-        "path": str(manifest_path),
+        "path": "manifest.json",
         "size_bytes": manifest_path.stat().st_size,
         "sha256": digest,
         "schema": decoded["schema"],
@@ -274,21 +274,49 @@ def build_inventory(
     if kinds != {"pfnn": 80, "grail": 15_837, "takara": 1} \
             or len(sources) != EXPECTED_IDENTITIES:
         raise ValueError("full walking inventory cardinality contract changed")
-    identity_payload = canonical_json_bytes(
+    identity_payload = _inventory_identity_bytes(sources)
+    build_id = hashlib.sha256(identity_payload).hexdigest()
+    provisional = FullWalkingInventory(build_id, sources, "")
+    manifest_sha256 = hashlib.sha256(inventory_manifest_bytes(provisional)).hexdigest()
+    return FullWalkingInventory(build_id, sources, manifest_sha256)
+
+
+def _inventory_identity_bytes(sources: tuple[SourceRecord, ...]) -> bytes:
+    return canonical_json_bytes(
         {
             "schema": INVENTORY_SCHEMA,
             "sources": [source_record_json(record) for record in sources],
         }
     )
-    build_id = hashlib.sha256(identity_payload).hexdigest()
-    provisional = FullWalkingInventory(build_id, sources, "0" * 64)
-    manifest_sha256 = hashlib.sha256(inventory_manifest_bytes(provisional)).hexdigest()
-    return FullWalkingInventory(build_id, sources, manifest_sha256)
 
 
-def load_inventory(path: Path) -> FullWalkingInventory:
+def _require_root_stable_authority(value: object, label: str) -> None:
+    if type(value) is dict:
+        for key, child in value.items():
+            if key == "path" and (
+                type(child) is not str
+                or Path(child).is_absolute()
+                or ".." in Path(child).parts
+            ):
+                raise ValueError(f"{label} contains a host-dependent path")
+            _require_root_stable_authority(child, label)
+    elif type(value) is list:
+        for child in value:
+            _require_root_stable_authority(child, label)
+
+
+def load_inventory(
+    path: Path, *, expected_manifest_sha256: str | None = None
+) -> FullWalkingInventory:
     path = _regular_file(Path(path), "walking inventory")
     payload = path.read_bytes()
+    manifest_sha256 = hashlib.sha256(payload).hexdigest()
+    if expected_manifest_sha256 is not None and (
+        type(expected_manifest_sha256) is not str
+        or len(expected_manifest_sha256) != 64
+        or manifest_sha256 != expected_manifest_sha256
+    ):
+        raise ValueError("walking inventory manifest SHA-256 mismatch")
     try:
         value = json.loads(payload.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as error:
@@ -307,11 +335,24 @@ def load_inventory(path: Path) -> FullWalkingInventory:
     for item in value["sources"]:
         if type(item) is not dict or set(item) != expected_keys:
             raise ValueError("walking inventory source keys are invalid")
+        _require_root_stable_authority(item["authority"], "source authority")
         records.append(SourceRecord(**item))
+    sources = tuple(records)
+    kinds = Counter(record.authority.get("kind") for record in sources)
+    families = Counter(record.family for record in sources)
+    if len(sources) != EXPECTED_IDENTITIES \
+            or kinds != {"pfnn": 80, "grail": 15_837, "takara": 1} \
+            or families != {"flat": 81, "curb": 1_769, "slope": 1_880,
+                            "stair": 12_188} \
+            or sum(record.mirror_of is not None for record in sources) != 40:
+        raise ValueError("walking inventory exact cardinality/family contract changed")
+    expected_build_id = hashlib.sha256(_inventory_identity_bytes(sources)).hexdigest()
+    if value["build_id"] != expected_build_id:
+        raise ValueError("walking inventory build_id does not match canonical content")
     inventory = FullWalkingInventory(
         build_id=value["build_id"],
-        sources=tuple(records),
-        manifest_sha256=hashlib.sha256(payload).hexdigest(),
+        sources=sources,
+        manifest_sha256=manifest_sha256,
     )
     if inventory_manifest_bytes(inventory) != payload:
         raise ValueError("walking inventory canonical content changed")
@@ -364,7 +405,6 @@ def _parser() -> argparse.ArgumentParser:
     inventory.add_argument("--output", type=Path, required=True)
     split = commands.add_parser("split")
     split.add_argument("--inventory", type=Path, required=True)
-    split.add_argument("--build-id")
     split.add_argument("--seed", type=int, required=True)
     split.add_argument("--output", type=Path, required=True)
     return parser
@@ -390,9 +430,7 @@ def main(argv: list[str] | None = None) -> int:
             ledger = build_split_ledger(
                 inventory, build_id=inventory.build_id, seed=arguments.seed
             )
-            split_payload = split_ledger_bytes(
-                ledger, build_id=inventory.build_id, seed=arguments.seed
-            )
+            split_payload = split_ledger_bytes(ledger)
             try:
                 _publish_file_exclusive(split_payload, arguments.split_output)
             except BaseException:
@@ -401,20 +439,19 @@ def main(argv: list[str] | None = None) -> int:
             result.update({
                 "split_path": str(arguments.split_output.resolve()),
                 "split_manifest_sha256": hashlib.sha256(split_payload).hexdigest(),
-                "assignments": len(ledger),
+                "assignments": len(ledger.assignments),
             })
     else:
         inventory = load_inventory(arguments.inventory)
-        build_id = arguments.build_id or inventory.build_id
         ledger = build_split_ledger(
-            inventory, build_id=build_id, seed=arguments.seed
+            inventory, build_id=inventory.build_id, seed=arguments.seed
         )
-        payload = split_ledger_bytes(ledger, build_id=build_id, seed=arguments.seed)
+        payload = split_ledger_bytes(ledger)
         _publish_file_exclusive(payload, arguments.output)
         result = {
             "path": str(arguments.output.resolve()),
             "manifest_sha256": hashlib.sha256(payload).hexdigest(),
-            "assignments": len(ledger),
+            "assignments": len(ledger.assignments),
         }
     print(json.dumps(result, sort_keys=True))
     return 0

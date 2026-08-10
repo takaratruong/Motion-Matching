@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -59,7 +61,8 @@ _RANGE_KEYS = {
 }
 _MANIFEST_KEYS = {
     "schema",
-    "authority_manifest_sha256",
+    "inventory_manifest_sha256",
+    "split_ledger_manifest_sha256",
     "fps",
     "rows",
     "ranges",
@@ -67,7 +70,15 @@ _MANIFEST_KEYS = {
     "members",
 }
 _MEMBER_KEYS = {"path", "size_bytes", "sha256"}
-_MEMBER_NAMES = ("database.bin", "terrain_grid.npy", "ranges.json")
+_MEMBER_NAMES = (
+    "database.bin",
+    "terrain_grid.npy",
+    "source_ids.json",
+    "source_left_indices.npy",
+    "source_right_indices.npy",
+    "source_alpha.npy",
+    "ranges.json",
+)
 
 
 @dataclass(frozen=True)
@@ -95,6 +106,17 @@ class SplitAssignment:
 
 
 @dataclass(frozen=True)
+class SplitLedger:
+    build_id: str
+    inventory_manifest_sha256: str
+    seed: int
+    requested: Mapping[str, int]
+    actual_family_counts: Mapping[str, Mapping[str, int]]
+    assignments: tuple[SplitAssignment, ...]
+    manifest_sha256: str
+
+
+@dataclass(frozen=True)
 class RangeRecord:
     range_id: str
     canonical_source_id: str
@@ -113,8 +135,14 @@ class RangeRecord:
 class LaneArtifact:
     root: Path
     manifest_sha256: str
+    inventory_manifest_sha256: str
+    split_ledger_manifest_sha256: str
     artifacts: ArtifactSet
     terrain_grid: np.ndarray
+    source_ids: tuple[str, ...]
+    source_left_indices: np.ndarray
+    source_right_indices: np.ndarray
+    source_alpha: np.ndarray
     ranges: tuple[RangeRecord, ...]
 
 
@@ -250,11 +278,17 @@ def _split_group_id(source_ids: tuple[str, ...]) -> str:
 
 def build_split_ledger(
     inventory: FullWalkingInventory, *, build_id: str, seed: int
-) -> tuple[SplitAssignment, ...]:
+) -> SplitLedger:
     if not isinstance(inventory, FullWalkingInventory):
         raise TypeError("inventory must be FullWalkingInventory")
     records = _validated_sources(inventory.sources)
-    _require_identifier(build_id, "build_id")
+    if build_id != inventory.build_id:
+        raise ValueError("split build_id must equal the inventory build_id")
+    if not _is_sha256(build_id) or not _is_sha256(inventory.manifest_sha256):
+        raise ValueError("split inventory authority must use lowercase SHA-256")
+    if hashlib.sha256(inventory_manifest_bytes(inventory)).hexdigest() \
+            != inventory.manifest_sha256:
+        raise ValueError("inventory manifest SHA-256 does not match canonical content")
     if type(seed) is not int:
         raise ValueError("split seed must be an integer")
     by_id = {record.source_id: record for record in records}
@@ -303,19 +337,66 @@ def build_split_ledger(
             SplitAssignment(group_id, split_name, source_ids)
             for (group_id, source_ids), split_name in zip(ranked, split_names)
         )
-    return tuple(sorted(assignments, key=lambda item: item.split_group_id))
+    ordered = tuple(sorted(assignments, key=lambda item: item.split_group_id))
+    actual = {
+        family: {
+            split: sum(
+                assignment.split == split
+                and by_id[assignment.source_ids[0]].family == family
+                for assignment in ordered
+            )
+            for split in SPLITS
+        }
+        for family in FAMILIES
+    }
+    provisional = SplitLedger(
+        build_id=build_id,
+        inventory_manifest_sha256=inventory.manifest_sha256,
+        seed=seed,
+        requested={"train": 80, "validation": 10, "test": 10},
+        actual_family_counts=actual,
+        assignments=ordered,
+        manifest_sha256="",
+    )
+    manifest_sha256 = hashlib.sha256(_split_ledger_payload(provisional)).hexdigest()
+    return SplitLedger(
+        build_id=provisional.build_id,
+        inventory_manifest_sha256=provisional.inventory_manifest_sha256,
+        seed=provisional.seed,
+        requested=provisional.requested,
+        actual_family_counts=provisional.actual_family_counts,
+        assignments=provisional.assignments,
+        manifest_sha256=manifest_sha256,
+    )
 
 
-def split_ledger_bytes(
-    assignments: Sequence[SplitAssignment], *, build_id: str, seed: int
-) -> bytes:
-    _require_identifier(build_id, "build_id")
-    if type(seed) is not int:
+def _split_ledger_payload(ledger: SplitLedger) -> bytes:
+    if not isinstance(ledger, SplitLedger):
+        raise TypeError("ledger must be SplitLedger")
+    if not _is_sha256(ledger.build_id) \
+            or not _is_sha256(ledger.inventory_manifest_sha256):
+        raise ValueError("split ledger parent identities must be lowercase SHA-256")
+    if type(ledger.seed) is not int:
         raise ValueError("split seed must be an integer")
+    if dict(ledger.requested) != {"train": 80, "validation": 10, "test": 10}:
+        raise ValueError("split requested allocation must be exact 80/10/10")
+    actual = {
+        family: dict(ledger.actual_family_counts.get(family, {}))
+        for family in FAMILIES
+    }
+    if set(ledger.actual_family_counts) != set(FAMILIES) or any(
+        set(counts) != set(SPLITS)
+        or any(type(count) is not int or count < 0 for count in counts.values())
+        for counts in actual.values()
+    ):
+        raise ValueError("split actual per-family counts are invalid")
     rows = []
     seen_groups: set[str] = set()
     seen_sources: set[str] = set()
-    for assignment in sorted(assignments, key=lambda item: item.split_group_id):
+    if tuple(sorted(ledger.assignments, key=lambda item: item.split_group_id)) \
+            != ledger.assignments:
+        raise ValueError("split ledger assignments must be sorted")
+    for assignment in ledger.assignments:
         if not isinstance(assignment, SplitAssignment):
             raise TypeError("ledger values must be SplitAssignment records")
         if not _is_sha256(assignment.split_group_id):
@@ -330,15 +411,30 @@ def split_ledger_bytes(
             raise ValueError("split ledger groups and sources must be unique")
         seen_groups.add(assignment.split_group_id)
         seen_sources.update(assignment.source_ids)
-        rows.append(asdict(assignment))
+        rows.append({
+            "split_group_id": assignment.split_group_id,
+            "split": assignment.split,
+            "source_ids": list(assignment.source_ids),
+        })
     return canonical_json_bytes(
         {
             "schema": SPLIT_LEDGER_SCHEMA,
-            "build_id": build_id,
-            "seed": seed,
+            "build_id": ledger.build_id,
+            "inventory_manifest_sha256": ledger.inventory_manifest_sha256,
+            "seed": ledger.seed,
+            "requested": dict(ledger.requested),
+            "actual_family_counts": actual,
             "assignments": rows,
         }
     )
+
+
+def split_ledger_bytes(ledger: SplitLedger) -> bytes:
+    payload = _split_ledger_payload(ledger)
+    digest = hashlib.sha256(payload).hexdigest()
+    if ledger.manifest_sha256 and ledger.manifest_sha256 != digest:
+        raise ValueError("split ledger manifest SHA-256 does not match its content")
+    return payload
 
 
 def _validate_array(
@@ -392,11 +488,24 @@ def _range_json(record: RangeRecord) -> dict[str, JSONValue]:
     return value
 
 
-def _validate_lane(lane: LaneArtifact) -> None:
+def _validate_lane(
+    lane: LaneArtifact,
+    *,
+    inventory: FullWalkingInventory | None = None,
+    split_ledger: SplitLedger | None = None,
+    require_unpublished: bool = False,
+) -> None:
     if not isinstance(lane, LaneArtifact):
         raise TypeError("lane must be LaneArtifact")
-    if not _is_sha256(lane.manifest_sha256):
-        raise ValueError("lane authority manifest digest must be lowercase SHA-256")
+    if require_unpublished:
+        if lane.manifest_sha256 != "":
+            raise ValueError("an unpublished lane must have an empty self manifest digest")
+    elif not _is_sha256(lane.manifest_sha256):
+        raise ValueError("lane self manifest digest must be lowercase SHA-256")
+    if not _is_sha256(lane.inventory_manifest_sha256):
+        raise ValueError("lane inventory manifest SHA-256 is invalid")
+    if not _is_sha256(lane.split_ledger_manifest_sha256):
+        raise ValueError("lane split ledger manifest SHA-256 is invalid")
     artifacts = lane.artifacts
     if not isinstance(artifacts, ArtifactSet):
         raise TypeError("lane artifacts must be ArtifactSet")
@@ -432,6 +541,21 @@ def _validate_lane(lane: LaneArtifact) -> None:
         ("terrain_features", artifacts.terrain_features, "<f4", (rows, 4), True),
         ("terrain_support", artifacts.terrain_support, "<f4", (rows, 3), True),
         ("terrain_grid", lane.terrain_grid, "<f4", (rows, 36), True),
+        (
+            "source_left_indices",
+            lane.source_left_indices,
+            "<i4",
+            (rows,),
+            False,
+        ),
+        (
+            "source_right_indices",
+            lane.source_right_indices,
+            "<i4",
+            (rows,),
+            False,
+        ),
+        ("source_alpha", lane.source_alpha, "<f4", (rows,), True),
     ):
         _validate_array(
             values,
@@ -444,8 +568,50 @@ def _validate_lane(lane: LaneArtifact) -> None:
         raise ValueError("lane does not use the canonical G1 skeleton")
     if np.any(artifacts.contacts > 1):
         raise ValueError("lane contacts must be binary")
+    if type(lane.source_ids) is not tuple \
+            or len(lane.source_ids) != len(lane.ranges) \
+            or any(
+                type(source_id) is not str or not source_id
+                for source_id in lane.source_ids
+            ):
+        raise ValueError(
+            "lane source identities must be one non-empty string per range"
+        )
+    if np.any(lane.source_left_indices < 0) \
+            or np.any(lane.source_right_indices < lane.source_left_indices) \
+            or np.any(lane.source_alpha < 0.0) \
+            or np.any(lane.source_alpha > 1.0):
+        raise ValueError("lane source interpolation provenance is out of bounds")
     if len(lane.ranges) != len(artifacts.range_starts):
         raise ValueError("lane requires one RangeRecord per artifact range")
+    source_records = (
+        {record.source_id: record for record in inventory.sources}
+        if inventory is not None
+        else None
+    )
+    split_by_source: dict[str, SplitAssignment] | None = None
+    if inventory is not None or split_ledger is not None:
+        if inventory is None or split_ledger is None:
+            raise ValueError("lane authority validation requires inventory and split ledger")
+        if hashlib.sha256(inventory_manifest_bytes(inventory)).hexdigest() \
+                != inventory.manifest_sha256:
+            raise ValueError("lane inventory object is not self-authenticating")
+        split_ledger_bytes(split_ledger)
+        expected_ledger = build_split_ledger(
+            inventory, build_id=inventory.build_id, seed=split_ledger.seed
+        )
+        if split_ledger_bytes(split_ledger) != split_ledger_bytes(expected_ledger):
+            raise ValueError(
+                "lane split authority does not match connected inventory coverage"
+            )
+        if split_ledger.inventory_manifest_sha256 != inventory.manifest_sha256 \
+                or split_ledger.manifest_sha256 != lane.split_ledger_manifest_sha256 \
+                or inventory.manifest_sha256 != lane.inventory_manifest_sha256:
+            raise ValueError("lane parent manifest authorities do not match")
+        split_by_source = {}
+        for assignment in split_ledger.assignments:
+            for source_id in assignment.source_ids:
+                split_by_source[source_id] = assignment
     range_ids: set[str] = set()
     expected_start = 0
     for index, record in enumerate(lane.ranges):
@@ -457,6 +623,34 @@ def _validate_lane(lane: LaneArtifact) -> None:
                 or record.start != int(artifacts.range_starts[index]) \
                 or record.stop != int(artifacts.range_stops[index]):
             raise ValueError("lane ranges must exactly and contiguously cover rows")
+        source_id = lane.source_ids[index]
+        authority = _normalize_authority(
+            record.authority, f"range {record.range_id!r} authority"
+        )
+        source_frame_count = authority.get("source_frame_count")
+        if source_frame_count is not None and (
+            type(source_frame_count) is not int
+            or source_frame_count < 1
+            or np.any(
+                lane.source_right_indices[record.start:record.stop]
+                >= source_frame_count
+            )
+        ):
+            raise ValueError("lane source provenance exceeds its source range bounds")
+        if source_records is not None and split_by_source is not None:
+            source = source_records.get(source_id)
+            assignment = split_by_source.get(source_id)
+            if source is None or assignment is None:
+                raise ValueError("lane range source is absent from authenticated authorities")
+            if (
+                source.canonical_source_id != record.canonical_source_id
+                or source.terrain_id != record.terrain_id
+                or source.mirror_of != record.mirror_of
+                or source.family != record.family
+                or assignment.split_group_id != record.split_group_id
+                or assignment.split != record.split
+            ):
+                raise ValueError("lane range source/split disagrees with authenticated ledger")
         expected_start = record.stop
     if expected_start != rows:
         raise ValueError("lane ranges must cover every row")
@@ -483,10 +677,44 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _rename_noreplace(source: Path, destination: Path) -> None:
+    """Atomically rename a directory only when the destination is absent."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOSYS, "renameat2 is required for immutable publication")
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        -100,
+        os.fsencode(source),
+        -100,
+        os.fsencode(destination),
+        1,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in (errno.EEXIST, errno.ENOTEMPTY):
+        raise FileExistsError(
+            error_number,
+            f"immutable lane output already exists: {destination}",
+            destination,
+        )
+    raise OSError(error_number, os.strerror(error_number), destination)
+
+
 def publish_lane_exclusive(lane: LaneArtifact, output: Path) -> Path:
     """Validate and atomically publish one immutable lane to an absent path."""
 
-    _validate_lane(lane)
+    _validate_lane(lane, require_unpublished=True)
     output = Path(output)
     if output.exists() or output.is_symlink():
         raise FileExistsError(f"immutable lane output already exists: {output}")
@@ -498,6 +726,16 @@ def publish_lane_exclusive(lane: LaneArtifact, output: Path) -> Path:
         write_holden_database(staging / "database.bin", lane.artifacts)
         with (staging / "terrain_grid.npy").open("wb") as stream:
             np.save(stream, lane.terrain_grid, allow_pickle=False)
+        (staging / "source_ids.json").write_bytes(
+            canonical_json_bytes(list(lane.source_ids))
+        )
+        for name, values in (
+            ("source_left_indices.npy", lane.source_left_indices),
+            ("source_right_indices.npy", lane.source_right_indices),
+            ("source_alpha.npy", lane.source_alpha),
+        ):
+            with (staging / name).open("wb") as stream:
+                np.save(stream, values, allow_pickle=False)
         (staging / "ranges.json").write_bytes(
             canonical_json_bytes([_range_json(record) for record in lane.ranges])
         )
@@ -508,7 +746,8 @@ def publish_lane_exclusive(lane: LaneArtifact, output: Path) -> Path:
         }
         manifest = {
             "schema": LANE_SCHEMA,
-            "authority_manifest_sha256": lane.manifest_sha256,
+            "inventory_manifest_sha256": lane.inventory_manifest_sha256,
+            "split_ledger_manifest_sha256": lane.split_ledger_manifest_sha256,
             "fps": FPS,
             "rows": len(lane.artifacts.positions),
             "ranges": len(lane.ranges),
@@ -522,9 +761,7 @@ def publish_lane_exclusive(lane: LaneArtifact, output: Path) -> Path:
         (staging / "manifest.json").write_bytes(canonical_json_bytes(manifest))
         _fsync_file(staging / "manifest.json")
         _fsync_directory(staging)
-        if output.exists() or output.is_symlink():
-            raise FileExistsError(f"immutable lane output already exists: {output}")
-        os.rename(staging, output)
+        _rename_noreplace(staging, output)
         _fsync_directory(output.parent)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
@@ -554,8 +791,86 @@ def _parse_range(value: object) -> RangeRecord:
     return record
 
 
+def load_split_ledger(
+    path: Path,
+    *,
+    inventory: FullWalkingInventory,
+    expected_manifest_sha256: str | None = None,
+) -> SplitLedger:
+    path = Path(path).resolve(strict=True)
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("split ledger must be a regular non-symlink file")
+    manifest_sha256 = sha256_file(path)
+    if expected_manifest_sha256 is not None and (
+        not _is_sha256(expected_manifest_sha256)
+        or manifest_sha256 != expected_manifest_sha256
+    ):
+        raise ValueError("split ledger manifest SHA-256 mismatch")
+    if hashlib.sha256(inventory_manifest_bytes(inventory)).hexdigest() \
+            != inventory.manifest_sha256:
+        raise ValueError("split ledger inventory object is not self-authenticating")
+    value = _parse_canonical_json(path, "split ledger")
+    keys = {
+        "schema",
+        "build_id",
+        "inventory_manifest_sha256",
+        "seed",
+        "requested",
+        "actual_family_counts",
+        "assignments",
+    }
+    if type(value) is not dict or set(value) != keys \
+            or value["schema"] != SPLIT_LEDGER_SCHEMA \
+            or type(value["assignments"]) is not list:
+        raise ValueError("split ledger has invalid schema or keys")
+    assignments = []
+    for item in value["assignments"]:
+        if type(item) is not dict \
+                or set(item) != {"split_group_id", "split", "source_ids"} \
+                or type(item["source_ids"]) is not list:
+            raise ValueError("split ledger assignment keys are invalid")
+        assignments.append(SplitAssignment(
+            split_group_id=item["split_group_id"],
+            split=item["split"],
+            source_ids=tuple(item["source_ids"]),
+        ))
+    decoded = SplitLedger(
+        build_id=value["build_id"],
+        inventory_manifest_sha256=value["inventory_manifest_sha256"],
+        seed=value["seed"],
+        requested=value["requested"],
+        actual_family_counts=value["actual_family_counts"],
+        assignments=tuple(assignments),
+        manifest_sha256=manifest_sha256,
+    )
+    split_ledger_bytes(decoded)
+    expected = build_split_ledger(
+        inventory, build_id=inventory.build_id, seed=decoded.seed
+    )
+    if split_ledger_bytes(decoded) != split_ledger_bytes(expected):
+        raise ValueError(
+            "split ledger does not match recomputed connected groups, coverage, "
+            "or family counts"
+        )
+    return decoded
+
+
+def _load_npy(path: Path, label: str) -> np.ndarray:
+    with path.open("rb") as stream:
+        values = np.load(stream, allow_pickle=False)
+        if stream.read(1):
+            raise ValueError(f"{label} has trailing bytes")
+    return values
+
+
 def load_lane(
-    root: Path, *, expected_manifest_sha256: str | None = None
+    root: Path,
+    *,
+    inventory: FullWalkingInventory,
+    split_ledger: SplitLedger,
+    expected_manifest_sha256: str | None = None,
+    expected_inventory_manifest_sha256: str | None = None,
+    expected_split_ledger_manifest_sha256: str | None = None,
 ) -> LaneArtifact:
     root = Path(root).resolve(strict=True)
     if not root.is_dir():
@@ -576,8 +891,22 @@ def load_lane(
         raise ValueError(f"lane manifest keys must be exactly {sorted(_MANIFEST_KEYS)}")
     if manifest["schema"] != LANE_SCHEMA:
         raise ValueError(f"lane manifest schema must be {LANE_SCHEMA}")
-    if not _is_sha256(manifest["authority_manifest_sha256"]):
-        raise ValueError("lane authority manifest SHA-256 is invalid")
+    inventory_sha256 = manifest["inventory_manifest_sha256"]
+    split_sha256 = manifest["split_ledger_manifest_sha256"]
+    if not _is_sha256(inventory_sha256):
+        raise ValueError("lane inventory manifest SHA-256 is invalid")
+    if not _is_sha256(split_sha256):
+        raise ValueError("lane split ledger manifest SHA-256 is invalid")
+    if expected_inventory_manifest_sha256 is not None and (
+        not _is_sha256(expected_inventory_manifest_sha256)
+        or inventory_sha256 != expected_inventory_manifest_sha256
+    ):
+        raise ValueError("lane inventory manifest SHA-256 mismatch")
+    if expected_split_ledger_manifest_sha256 is not None and (
+        not _is_sha256(expected_split_ledger_manifest_sha256)
+        or split_sha256 != expected_split_ledger_manifest_sha256
+    ):
+        raise ValueError("lane split ledger manifest SHA-256 mismatch")
     if manifest["fps"] != FPS \
             or type(manifest["rows"]) is not int \
             or type(manifest["ranges"]) is not int \
@@ -608,10 +937,18 @@ def load_lane(
             raise ValueError(f"{name} SHA-256 or size mismatch")
 
     artifacts = read_holden_database(root / "database.bin")
-    with (root / "terrain_grid.npy").open("rb") as stream:
-        terrain_grid = np.load(stream, allow_pickle=False)
-        if stream.read(1):
-            raise ValueError("terrain_grid.npy has trailing bytes")
+    terrain_grid = _load_npy(root / "terrain_grid.npy", "terrain_grid.npy")
+    source_ids_value = _parse_canonical_json(root / "source_ids.json", "source IDs")
+    if type(source_ids_value) is not list \
+            or not all(type(source_id) is str for source_id in source_ids_value):
+        raise ValueError("lane source IDs must be a JSON string array")
+    source_left_indices = _load_npy(
+        root / "source_left_indices.npy", "source_left_indices.npy"
+    )
+    source_right_indices = _load_npy(
+        root / "source_right_indices.npy", "source_right_indices.npy"
+    )
+    source_alpha = _load_npy(root / "source_alpha.npy", "source_alpha.npy")
     ranges_value = _parse_canonical_json(root / "ranges.json", "lane ranges")
     if type(ranges_value) is not list:
         raise ValueError("lane ranges must be a JSON array")
@@ -621,19 +958,19 @@ def load_lane(
         raise ValueError("lane manifest row/range counts do not match members")
     lane = LaneArtifact(
         root=root,
-        manifest_sha256=manifest["authority_manifest_sha256"],
-        artifacts=artifacts,
-        terrain_grid=terrain_grid,
-        ranges=ranges,
-    )
-    _validate_lane(lane)
-    return LaneArtifact(
-        root=root,
         manifest_sha256=manifest_sha256,
+        inventory_manifest_sha256=inventory_sha256,
+        split_ledger_manifest_sha256=split_sha256,
         artifacts=artifacts,
         terrain_grid=terrain_grid,
+        source_ids=tuple(source_ids_value),
+        source_left_indices=source_left_indices,
+        source_right_indices=source_right_indices,
+        source_alpha=source_alpha,
         ranges=ranges,
     )
+    _validate_lane(lane, inventory=inventory, split_ledger=split_ledger)
+    return lane
 
 
 __all__ = [
@@ -643,10 +980,12 @@ __all__ = [
     "RangeRecord",
     "SourceRecord",
     "SplitAssignment",
+    "SplitLedger",
     "build_split_ledger",
     "connected_split_groups",
     "inventory_manifest_bytes",
     "load_lane",
+    "load_split_ledger",
     "publish_lane_exclusive",
     "split_ledger_bytes",
 ]

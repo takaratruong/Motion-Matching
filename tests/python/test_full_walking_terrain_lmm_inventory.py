@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import json
 import re
+import tempfile
 import unittest
 from collections import Counter
 from pathlib import Path
 
-from mm_sonic.full_walking_terrain_lmm_inventory import build_inventory
+from mm_sonic.full_walking_terrain_lmm_contracts import inventory_manifest_bytes
+from mm_sonic.full_walking_terrain_lmm_inventory import (
+    build_inventory,
+    load_inventory,
+)
+
+from resources.g1_terrain_builder.artifacts import canonical_json_bytes
 
 ROOTS = {
     "bank": Path(
@@ -60,6 +68,32 @@ class FullWalkingTerrainLmmInventoryTests(unittest.TestCase):
         self.assertFalse(
             [record.source_id for record in pfnn if excluded_pfnn_identity.search(record.source_id)]
         )
+
+        payload = inventory_manifest_bytes(inventory)
+        self.assertNotIn(b"/home/ubuntu", payload)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.json"
+            path.write_bytes(payload)
+            self.assertEqual(
+                load_inventory(
+                    path, expected_manifest_sha256=inventory.manifest_sha256
+                ),
+                inventory,
+            )
+            with self.assertRaisesRegex(ValueError, "manifest SHA-256"):
+                load_inventory(path, expected_manifest_sha256="f" * 64)
+
+            changed = json.loads(payload)
+            changed["build_id"] = "f" * 64
+            path.write_bytes(canonical_json_bytes(changed))
+            with self.assertRaisesRegex(ValueError, "build_id"):
+                load_inventory(path)
+
+            changed = json.loads(payload)
+            changed["sources"].pop()
+            path.write_bytes(canonical_json_bytes(changed))
+            with self.assertRaisesRegex(ValueError, "cardinality"):
+                load_inventory(path)
 
 
 if __name__ == "__main__":
