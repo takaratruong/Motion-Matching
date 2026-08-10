@@ -43,8 +43,9 @@ The initial focused run failed during collection because
 `mm_sonic.full_walking_terrain_lmm_corpus` did not exist. Subsequent regression
 REDs covered warning-free quaternion derivatives, optional nested source-map
 rate metadata used by real Takara receipts, mandatory source-local frame-map
-bounds, the exact 4-D-to-36-D terrain-column relationship, prepublication
-validation/resume, and coherent
+bounds, the exact G1TF 4-D-to-36-D terrain-column relationship, independently
+authenticated native PFNN fit semantics, prepublication validation/resume,
+and coherent
 metadata/shard/request mutations. A later round-trip RED exposed that lane-v1
 publication omitted the required 4-D terrain and 3-D support channels; lane-v2
 now persists, authenticates, tampers-checks, and exactly reopens both arrays.
@@ -56,7 +57,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.:resources:sonic/python \
   /home/ubuntu/miniconda3/envs/diffsim/bin/python -m pytest -q -W error \
   tests/python/test_full_walking_terrain_lmm_corpus.py
 
-8 passed in 15.93s
+9 passed in 15.51s
 ```
 
 Fresh Task 1 plus Task 4 aggregate verification:
@@ -68,7 +69,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.:resources:sonic/python \
   tests/python/test_full_walking_terrain_lmm_inventory.py \
   tests/python/test_full_walking_terrain_lmm_corpus.py
 
-22 passed in 129.84s
+23 passed
 ```
 
 Static verification:

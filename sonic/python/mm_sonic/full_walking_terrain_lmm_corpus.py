@@ -481,6 +481,32 @@ def _map_digest(values: np.ndarray, dtype: str) -> str:
     ).hexdigest()
 
 
+def _verify_terrain_semantics(
+    source: SourceRecord,
+    record: RangeRecord,
+    terrain_features: np.ndarray,
+    terrain_grid: np.ndarray,
+) -> None:
+    """Verify the source-specific 4-D/36-D terrain representation contract."""
+
+    if source.authority.get("kind") == "pfnn":
+        terrain_family = record.authority.get("terrain_family")
+        terrain_fit = record.authority.get("terrain_fit")
+        if (
+            record.authority.get("kind") != "pfnn"
+            or terrain_family not in ("flat", "rocky", "jumpy", "beam")
+            or not isinstance(terrain_fit, Mapping)
+            or terrain_fit.get("schema") != "full-pfnn-family-fit/v2"
+            or terrain_fit.get("family") != terrain_family
+        ):
+            raise ValueError("PFNN terrain grid lacks its exact fit authority")
+    elif not np.array_equal(terrain_features, terrain_grid[:, (1, 3, 5, 7)]):
+        raise ValueError(
+            "G1TF compatibility terrain grid columns 1/3/5/7 must exactly equal "
+            "the four matching terrain features"
+        )
+
+
 def _verify_lane_contents(
     lane: LaneArtifact,
     inventory: FullWalkingInventory,
@@ -600,14 +626,12 @@ def _verify_lane_contents(
         ):
             if values.shape != (stop - start, columns) or not np.isfinite(values).all():
                 raise ValueError(f"lane {label} is not finite and row aligned")
-        if not np.array_equal(
+        _verify_terrain_semantics(
+            source,
+            record,
             lane.artifacts.terrain_features[start:stop],
-            lane.terrain_grid[start:stop, (1, 3, 5, 7)],
-        ):
-            raise ValueError(
-                "lane terrain grid columns 1/3/5/7 must exactly equal the four "
-                "matching terrain features"
-            )
+            lane.terrain_grid[start:stop],
+        )
 
 
 def _global_kinematics(

@@ -23,6 +23,7 @@ from mm_sonic.full_walking_terrain_lmm_corpus import (
     FAMILIES,
     FullWalkingCorpus,
     _BuildWorkspace,
+    _verify_terrain_semantics,
     assemble_full_corpus,
     load_full_corpus,
     reproduce_full_corpus,
@@ -368,6 +369,53 @@ def _write_authorities(root: Path, inventory: FullWalkingInventory, ledger) -> N
 
 
 class FullWalkingTerrainLmmCorpusTests(unittest.TestCase):
+    def test_pfnn_native_grid_uses_fit_authority_not_g1tf_column_aliasing(self):
+        source = SourceRecord(
+            "pfnn:fixture",
+            "pfnn:fixture",
+            "pfnn:terrain",
+            None,
+            "flat",
+            {"kind": "pfnn"},
+        )
+        record = RangeRecord(
+            "pfnn:range",
+            source.canonical_source_id,
+            source.terrain_id,
+            None,
+            "flat",
+            "a" * 64,
+            "train",
+            0,
+            4,
+            "clean",
+            {
+                "kind": "pfnn",
+                "terrain_family": "jumpy",
+                "terrain_fit": {
+                    "schema": "full-pfnn-family-fit/v2",
+                    "family": "jumpy",
+                },
+            },
+        )
+        features = np.ones((4, 4), dtype=np.float32)
+        native_grid = np.zeros((4, 36), dtype=np.float32)
+
+        _verify_terrain_semantics(source, record, features, native_grid)
+
+        invalid = replace(
+            record,
+            authority={
+                **record.authority,
+                "terrain_fit": {
+                    "schema": "full-pfnn-family-fit/v2",
+                    "family": "rocky",
+                },
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "PFNN terrain grid"):
+            _verify_terrain_semantics(source, invalid, features, native_grid)
+
     def _fixture(self, root: Path):
         inventory = _inventory()
         ledger = build_split_ledger(
