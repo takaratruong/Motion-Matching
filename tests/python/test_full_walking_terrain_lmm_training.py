@@ -24,6 +24,7 @@ from mm_sonic.full_walking_terrain_lmm_training import (
     full_walking_model_identity,
     load_test_receipt,
     make_training_view,
+    _sample_tree,
     train_all_rows,
     train_selection,
     validate_full_walking_corpus,
@@ -247,6 +248,14 @@ def _easy_green_corpus() -> SimpleNamespace:
 
 
 class FullWalkingTrainingContractTests(unittest.TestCase):
+    def test_hierarchy_does_not_walk_zero_allocation_branches(self) -> None:
+        tree = (
+            (0, np.asarray([11], dtype=np.int64)),
+            (1, object()),
+        )
+        sampled = _sample_tree(tree, 1, np.random.default_rng(0))
+        np.testing.assert_array_equal(sampled[0], np.asarray([11], dtype=np.int64))
+
     def test_cuda_training_import_does_not_require_build_only_usd(self) -> None:
         script = textwrap.dedent(
             """

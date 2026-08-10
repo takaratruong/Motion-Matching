@@ -508,6 +508,8 @@ def _sample_tree(
         counts[generator.permutation(child_count)[:remainder]] += 1
     sampled: list[np.ndarray] = []
     for (_, child), allocation in zip(tree, counts):
+        if allocation == 0:
+            continue
         sampled.extend(_sample_tree(child, int(allocation), generator))
     return sampled
 
