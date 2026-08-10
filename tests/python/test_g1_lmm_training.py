@@ -1493,7 +1493,7 @@ class G1LmmTrainingTest(unittest.TestCase):
             self.assertEqual(training["withheld"]["ranges"], [[131, 195]])
             self.assertIs(training["config"]["single_clip_overfit_canary"], False)
 
-    def test_accepted_single_clip_canary_manifest_binds_exact_model_scope(self):
+    def test_accepted_single_clip_canary_manifest_binds_exact_model_and_evaluation_scopes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             data_directory = root / "data"
@@ -1583,6 +1583,10 @@ class G1LmmTrainingTest(unittest.TestCase):
             self.assertTrue(receipt["accepted"])
             self.assertEqual(
                 manifest["model_scope"], "single-clip-overfit-canary"
+            )
+            self.assertIs(type(manifest["evaluation_scope"]), str)
+            self.assertEqual(
+                manifest["evaluation_scope"], "complete-corpus-overfit-canary"
             )
             self.assertEqual(
                 receipt["evaluation_scope"], "complete-corpus-overfit"

@@ -180,6 +180,15 @@ enum synthetic_model_scope_variant
     SyntheticModelScopeExtra
 };
 
+enum synthetic_evaluation_scope_variant
+{
+    SyntheticEvaluationScopeValid,
+    SyntheticEvaluationScopeMissing,
+    SyntheticEvaluationScopeWrongValue,
+    SyntheticEvaluationScopeWrongType,
+    SyntheticEvaluationScopeExtra
+};
+
 struct synthetic_lmm_fixture
 {
     std::filesystem::path root = "/tmp/test_g1_lmm_bundle";
@@ -261,7 +270,9 @@ struct synthetic_lmm_fixture
         const int corrupt_data_artifact = -1,
         const char* data_schema = "g1-lmm-flat-data/v3",
         const synthetic_model_scope_variant scope_variant =
-            SyntheticModelScopeValid)
+            SyntheticModelScopeValid,
+        const synthetic_evaluation_scope_variant evaluation_scope_variant =
+            SyntheticEvaluationScopeValid)
     {
         std::ofstream output(
             model / "manifest.json", std::ios::binary | std::ios::trunc);
@@ -305,6 +316,20 @@ struct synthetic_lmm_fixture
         }
         if (scope_variant == SyntheticModelScopeExtra)
             output << "  \"model_scope_extra\": \"unexpected\",\n";
+        if (evaluation_scope_variant != SyntheticEvaluationScopeMissing) {
+            if (evaluation_scope_variant == SyntheticEvaluationScopeWrongType) {
+                output << "  \"evaluation_scope\": 7,\n";
+            } else {
+                output << "  \"evaluation_scope\": \""
+                       << (evaluation_scope_variant ==
+                                   SyntheticEvaluationScopeWrongValue
+                               ? "withheld-block-generalization"
+                               : "complete-corpus-overfit-canary")
+                       << "\",\n";
+            }
+        }
+        if (evaluation_scope_variant == SyntheticEvaluationScopeExtra)
+            output << "  \"evaluation_scope_extra\": \"unexpected\",\n";
         output << "  \"output_fps\": 60.0,\n"
                << "  \"schema\": \"g1-lmm-model/v1\",\n"
                << "  \"status\": \"accepted\"\n}\n";
@@ -779,6 +804,47 @@ static void test_authenticated_bundle_and_digest_tampers()
     expect_scope_rejection(
         SyntheticModelScopeExtra,
         "extra model scope key rejects before evaluation allocation",
+        false);
+
+    const auto expect_evaluation_scope_rejection = [&](
+        const synthetic_evaluation_scope_variant evaluation_scope_variant,
+        const char* message,
+        const bool scope_diagnostic) {
+        fixture.write_manifest(
+            std::string(), -1, -1, "g1-lmm-flat-data/v3",
+            SyntheticModelScopeValid, evaluation_scope_variant);
+        g1_lmm_model_bundle rejected;
+        error[0] = '\0';
+        const bool rejected_before_allocation =
+            !g1_lmm_model_load_and_verify(
+                rejected,
+                fixture.model.c_str(),
+                fixture.data.c_str(),
+                error,
+                static_cast<int>(sizeof(error))) &&
+            rejected.evaluation_allocation_count == 0;
+        check(rejected_before_allocation, message);
+        check(rejected.model_scope.empty(),
+              "evaluation scope rejection leaves the output bundle unmodified");
+        if (scope_diagnostic)
+            check(std::strstr(error, "scope") != nullptr,
+                  "evaluation scope rejection reports the incompatible model field");
+    };
+    expect_evaluation_scope_rejection(
+        SyntheticEvaluationScopeMissing,
+        "missing evaluation scope rejects before evaluation allocation",
+        true);
+    expect_evaluation_scope_rejection(
+        SyntheticEvaluationScopeWrongValue,
+        "wrong evaluation scope rejects before evaluation allocation",
+        true);
+    expect_evaluation_scope_rejection(
+        SyntheticEvaluationScopeWrongType,
+        "non-string evaluation scope rejects before evaluation allocation",
+        true);
+    expect_evaluation_scope_rejection(
+        SyntheticEvaluationScopeExtra,
+        "extra evaluation scope key rejects before evaluation allocation",
         false);
 
     fixture.write_manifest(

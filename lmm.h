@@ -29,6 +29,8 @@ static const int G1_LMM_BoneCount = 31;
 static const int G1_LMM_ContactCount = 2;
 static constexpr const char* G1_LMMAcceptedModelScope =
     "single-clip-overfit-canary";
+static constexpr const char* G1_LMMAcceptedEvaluationScope =
+    "complete-corpus-overfit-canary";
 
 static inline bool g1_lmm_dimensions_valid(
     const int features,
@@ -402,11 +404,14 @@ static inline bool g1_lmm_model_load_and_verify(
     if (json_member(document, "model_scope") == NULL)
         return scene_error(
             error, capacity, "G1 LMM model scope is required");
+    if (json_member(document, "evaluation_scope") == NULL)
+        return scene_error(
+            error, capacity, "G1 LMM evaluation scope is required");
     if (!scene_exact_keys(
             document,
             {"artifacts","data_artifacts","data_manifest_schema",
-             "data_manifest_sha256","dimensions","model_scope",
-             "output_fps","schema","status"},
+             "data_manifest_sha256","dimensions","evaluation_scope",
+             "model_scope","output_fps","schema","status"},
             "G1 LMM model manifest", error, capacity))
         return false;
 
@@ -415,6 +420,7 @@ static inline bool g1_lmm_model_load_and_verify(
     std::string data_schema;
     std::string data_sha;
     std::string model_scope;
+    std::string evaluation_scope;
     float output_fps = 0.0f;
     if (!scene_member_string(
             schema, document, "schema", "G1 LMM model manifest",
@@ -444,6 +450,13 @@ static inline bool g1_lmm_model_load_and_verify(
     if (model_scope != G1_LMMAcceptedModelScope)
         return scene_error(
             error, capacity, "G1 LMM model scope is incompatible");
+    if (!scene_member_string(
+            evaluation_scope, document, "evaluation_scope",
+            "G1 LMM model manifest", error, capacity))
+        return false;
+    if (evaluation_scope != G1_LMMAcceptedEvaluationScope)
+        return scene_error(
+            error, capacity, "G1 LMM evaluation scope is incompatible");
 
     const json_value* dimensions = json_member(document, "dimensions");
     int features = 0;

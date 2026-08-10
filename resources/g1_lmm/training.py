@@ -1995,6 +1995,7 @@ def train_flat_bundle(
                 "features": bundle.dimensions.features,
                 "latent": bundle.dimensions.latent,
             },
+            "evaluation_scope": "complete-corpus-overfit-canary",
             "output_fps": 60.0,
             "model_scope": _model_scope(config),
             "schema": "g1-lmm-model/v1",
