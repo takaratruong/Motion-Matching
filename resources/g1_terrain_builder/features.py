@@ -6,7 +6,6 @@ from resources import quat as holden_quat
 
 from .schema import ArtifactSet, FeatureSet
 
-
 FEATURE_NAMES = (
     "left_foot_position_x", "left_foot_position_y", "left_foot_position_z",
     "right_foot_position_x", "right_foot_position_y", "right_foot_position_z",
@@ -69,12 +68,22 @@ def _future_indices(artifacts: ArtifactSet, horizon: int) -> np.ndarray:
     return indices
 
 
-def _normalize(raw: np.ndarray) -> FeatureSet:
+def _normalize(
+    raw: np.ndarray, fit_mask: np.ndarray | None = None,
+) -> FeatureSet:
+    if fit_mask is None:
+        fit_mask = np.ones(len(raw), np.bool_)
+    else:
+        fit_mask = np.asarray(fit_mask)
+        if fit_mask.shape != (len(raw),) or fit_mask.dtype != np.dtype(np.bool_):
+            raise ValueError("normalization fit mask must be a row-aligned boolean array")
+        if not np.any(fit_mask):
+            raise ValueError("normalization fit mask must select at least one row")
     values = np.empty_like(raw, np.float32)
     offset = np.empty(31, np.float32)
     scale = np.empty(31, np.float32)
     for (start, stop), weight in zip(_GROUPS, _NORMALIZATION_WEIGHTS):
-        group = raw[:, start:stop].astype(np.float64)
+        group = raw[fit_mask, start:stop].astype(np.float64)
         group_offset = group.mean(axis=0)
         group_std = float(np.mean(np.sqrt(np.mean(
             np.square(group - group_offset), axis=0))))
@@ -85,8 +94,10 @@ def _normalize(raw: np.ndarray) -> FeatureSet:
         else:
             group_scale = np.float32(group_std / weight)
             scale[start:stop] = group_scale
+            transform = raw[:, start:stop].astype(np.float64)
             values[:, start:stop] = (
-                (group - offset[start:stop]) / group_scale).astype(np.float32)
+                (transform - offset[start:stop]) / group_scale
+            ).astype(np.float32)
     result = FeatureSet(values, offset, scale)
     result.validate()
     return result
@@ -96,6 +107,8 @@ def build_matching_features(
     artifacts: ArtifactSet,
     fps: float,
     horizons: tuple[int, int, int],
+    *,
+    normalization_fit_mask: np.ndarray | None = None,
 ) -> FeatureSet:
     if not isinstance(artifacts, ArtifactSet):
         raise TypeError("artifacts must be an ArtifactSet")
@@ -131,7 +144,7 @@ def build_matching_features(
     raw[:, 27:31] = artifacts.terrain_features
     if not np.isfinite(raw).all():
         raise ValueError("raw matching features must be finite")
-    return _normalize(raw)
+    return _normalize(raw, normalization_fit_mask)
 
 
 def build_lmm_terrain_features(artifacts: ArtifactSet) -> FeatureSet:

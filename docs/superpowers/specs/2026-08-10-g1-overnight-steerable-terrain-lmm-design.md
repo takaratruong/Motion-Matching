@@ -66,6 +66,12 @@ The much larger all-source PFNN/GRAIL corpus continues as a resumable background
 build.  Its incompleteness cannot block delivery of the broad-corpus visualizer,
 and it cannot be described as processed if its terminal receipt is absent.
 
+The overnight PFNN supplement contains only the 17 authenticated clips whose
+released role is `train`.  Those 2,125 rows improve the fitted corpus, but they
+do not contribute source-held-out evaluation rows.  The reported held-out
+metrics therefore measure the primary Takara/GRAIL split and do not establish
+PFNN-specific generalization.
+
 ## Model and experiments
 
 The primary model follows the Orange Duck representation:
@@ -104,6 +110,25 @@ The best model is selected by the held-out tuple `(joint MAE, FK p95, contact
 error)`, never by training loss alone.  All attempted configurations and gates
 are written to immutable evaluation receipts.
 
+### Implementation variance: native-limit model gate
+
+The original gate above required every train and source-held-out decoded row to
+pass native G1 joint limits.  The delivered model does **not** meet that
+full-population requirement: an exhaustive diagnostic found 6,127 learned
+row-aligned reconstructions outside a native limit at the runtime tolerance.
+That result is retained rather than relaxing the XML limits or presenting the
+model artifact as having passed the original gate.
+
+For this proof of concept, acceptance is instead scoped to authenticated,
+scripted, supported-terrain MuJoCo routes.  Exact search retries candidates in
+score order when the learned reconstruction is outside a native joint limit.
+The selected pose is checked again against the captured native model before it
+can be committed; canonical fallback remains a separately bounded diagnostic
+path rather than an exclusion-retry trigger.  Formal evidence must show zero
+committed joint-limit violations, zero clamps, and zero fallback.  This is a
+runtime feasibility contract, not a claim that every stored row is natively
+valid or that arbitrary live-terrain-conditioned queries have been exhausted.
+
 ## Runtime motion matching
 
 Build a `scipy.spatial.cKDTree` over normalized 31-D rows.  At startup, on every
@@ -114,8 +139,7 @@ ticks:
 2. write desired future trajectory/facing from the filtered joystick command;
 3. sample the live heightfield at 0.25, 0.50, 0.75 and 1.00 m;
 4. query a candidate set from the tree;
-5. score candidates with feature distance, range-safe successor preference and
-   a transition penalty;
+5. score candidates with feature distance and a same-range transition penalty;
 6. decode the selected feature plus its learned latent;
 7. place the decoded root on live terrain using the selected row's stored
    root-support clearance;
@@ -125,6 +149,9 @@ Between searches, use the learned stepper only if its rate-matched short-horizon
 gate passes.  Otherwise use the selected range's next row and decode that row.
 This fallback remains learned display reconstruction; it is not route playback,
 because the selected range can change with command and terrain at every search.
+The delivered PoC has no separate successor-distance term during a search;
+range-safe successor preference is implemented as deterministic next-row
+advancement between searches.
 
 Controls:
 
@@ -155,7 +182,7 @@ command.  The accepted label is exactly:
 
 ## Failure policy
 
-- Data augmentation failure: continue with the immutable 459,682-row broad
+- Data augmentation failure: continue with the immutable 3,970,932-row broad
   corpus and report excluded families precisely.
 - Baseline model failure: select the latent-64 or wider deterministic model if
   and only if its held-out receipt is better and green.

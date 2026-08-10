@@ -16,6 +16,7 @@
 - Source-held-out evaluation is by complete ranges; no temporal derivative, successor or feature horizon crosses a range boundary.
 - Runtime label is `HYBRID TERRAIN LMM POC (EXACT SEARCH + LEARNED GENERATOR; SUPPORTED TERRAIN ONLY)`.
 - Learned projector is absent. Exact search is a deliberate part of this PoC.
+- The PFNN supplement's 17 released training clips are fit-only; held-out metrics come from the primary Takara/GRAIL split and are not a PFNN-generalization claim.
 - Every feature or bugfix follows RED -> GREEN -> focused regression.
 - Do not stage the existing concurrent modifications to validator/oracle files.
 
@@ -101,6 +102,13 @@ Implement deterministic compressor `908 -> width -> width -> width -> latent` an
 
 Encode/decode train and source-held-out rows in chunks. Compute joint geodesic MAE/p95, local-position p95, FK p95, support-foot p95 and bilateral contact F1. Use the practical gates in the design. Save all row latents only after train and evaluation outputs are finite.
 
+Implementation variance recorded after the full run: the canonical learned
+metrics passed, but the original all-row native-limit gate did not.  The
+exhaustive diagnostic found 6,127 learned row-aligned violations.  Do not mark
+the model artifact itself green for that gate.  The accepted PoC boundary is
+the authenticated scripted MuJoCo runtime, which retries exact candidates and
+requires every committed pose to pass native limits with zero clamp/fallback.
+
 - [ ] **Step 5: Launch bounded variants on separate GPUs**
 
 Run latent32/width512 on GPU5 and latent64/width512 on GPU6 with unique output paths. Start with 20,000 post-coverage steps. If both are red, run latent64/width1024 on GPU7. Select by held-out metrics; refit the chosen architecture on all rows for 30,000 steps while retaining the source-held-out selection receipt.
@@ -122,6 +130,10 @@ Test cKDTree/brute-force parity, stable tie resolution, range-safe successor beh
 - [ ] **Step 2: Implement exact candidate search**
 
 Build the tree over range-safe normalized rows. Search 32 candidates, expand to 64/128 when required, rescore in float64, and tie-break by lowest row. Search on command/terrain events and every 100 ms. Query pose channels come from the accepted row; trajectory/facing from the filtered command; terrain channels from the live `TerrainAuthority`.
+
+Search scoring uses normalized feature distance plus the frozen same-range
+transition penalty.  Range-safe successor preference is the deterministic
+next-row advancement between search events, not a third score term.
 
 - [ ] **Step 3: Implement learned decode transaction**
 
