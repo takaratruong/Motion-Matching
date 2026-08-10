@@ -1160,6 +1160,44 @@ class HybridTerrainViewerTests(unittest.TestCase):
         self.assertFalse(stopped)
         self.assertFalse(keys.snapshot()[1], "reset must be edge-triggered")
 
+    def test_arrow_keys_map_to_level_safe_drive_commands(self):
+        keyboard = SimpleNamespace(
+            Key=SimpleNamespace(
+                up=object(), down=object(), left=object(), right=object(), esc=object()
+            )
+        )
+        keys = KeyboardCommandSource()
+
+        for special, expected in (
+            (keyboard.Key.up, CommandState(speed=1.0)),
+            (keyboard.Key.down, CommandState(speed=-1.0)),
+            (keyboard.Key.left, CommandState(steering=1.0)),
+            (keyboard.Key.right, CommandState(steering=-1.0)),
+        ):
+            token = viewer_module._keyboard_command_token(special, keyboard)
+            keys.press(token)
+            self.assertEqual(keys.snapshot()[0], expected)
+            keys.release(token)
+            self.assertEqual(keys.snapshot()[0], CommandState())
+
+        up_token = viewer_module._keyboard_command_token(keyboard.Key.up, keyboard)
+        down_token = viewer_module._keyboard_command_token(keyboard.Key.down, keyboard)
+        keys.press(up_token)
+        keys.press(down_token)
+        self.assertEqual(keys.snapshot()[0], CommandState())
+        keys.release(up_token)
+        keys.release(down_token)
+
+        left_token = viewer_module._keyboard_command_token(keyboard.Key.left, keyboard)
+        right_token = viewer_module._keyboard_command_token(
+            keyboard.Key.right, keyboard
+        )
+        keys.press(left_token)
+        keys.press(right_token)
+        self.assertEqual(keys.snapshot()[0], CommandState())
+        keys.release(left_token)
+        keys.release(right_token)
+
     def test_space_hard_stop_overrides_an_active_gamepad(self):
         keys = KeyboardCommandSource()
         keys.press("space")

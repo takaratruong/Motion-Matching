@@ -170,6 +170,16 @@ def _select_control_command(
     return keyboard_command
 
 
+def _keyboard_command_token(key: object, keyboard_module: object) -> str | None:
+    arrows = {
+        keyboard_module.Key.up: "w",
+        keyboard_module.Key.down: "s",
+        keyboard_module.Key.left: "a",
+        keyboard_module.Key.right: "d",
+    }
+    return arrows.get(key, getattr(key, "char", None))
+
+
 def handle_key_press(
     keys: KeyboardCommandSource,
     character: str | None,
@@ -960,7 +970,7 @@ def overlay_text(
         f"search {search_text} {family_counts} | transition penalty "
         f"{float(getattr(state, 'transition_penalty', 0.0)):.3f}\n"
         f"scene evidence {scene_evidence_status}\n"
-        "W/S speed | A/D steer | Space stop | R reset | X/Esc exit"
+        "Up/Down speed | Left/Right steer | WASD aliases | Space stop | R reset | X/Esc exit"
     )
 
 
@@ -1834,11 +1844,12 @@ def run_interactive(
 
     def on_press(key: object) -> bool | None:
         escape = key == keyboard_module.Key.esc
-        character = getattr(key, "char", None)
-        return handle_key_press(keys, character, escape=escape)
+        return handle_key_press(
+            keys, _keyboard_command_token(key, keyboard_module), escape=escape
+        )
 
     def on_release(key: object) -> None:
-        keys.release(getattr(key, "char", None))
+        keys.release(_keyboard_command_token(key, keyboard_module))
 
     listener = keyboard_module.Listener(on_press=on_press, on_release=on_release)
     listener.start()
