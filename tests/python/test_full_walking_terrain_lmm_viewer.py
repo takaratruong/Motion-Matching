@@ -76,6 +76,13 @@ def _green_receipt() -> dict[str, object]:
             "corpus_manifest_authority_current": True,
             "model_manifest_authority_current": True,
             "model_corpus_binding_current": True,
+            "determinism_receipt_path": (
+                "sonic/runs/g1-full-walking-terrain-lmm/evidence/"
+                "corpus-v1-determinism.json"
+            ),
+            "determinism_receipt_schema": (
+                "g1-full-walking-terrain-lmm-determinism/v1"
+            ),
             "split_receipt_current": True,
             "test_receipt_current": True,
             "refit_receipt_current": True,
@@ -92,6 +99,26 @@ def _green_receipt() -> dict[str, object]:
                 "corpus_manifest_sha256": (
                     "084c168b473e730ec24419a49f4be1526226e5f95a2dd81ae4d367c729889cdb"
                 ),
+                "primary_cache_manifest_path": (
+                    "sonic/runs/g1-hybrid-terrain-lmm/corpus-v2-strict/manifest.json"
+                ),
+                "primary_cache_manifest_sha256": (
+                    "e6fbe9413d4cbca58697b90a92f12a1832d28b961972624dd373bc72fa45494e"
+                ),
+                "primary_cache_manifest_schema": (
+                    "g1-hybrid-terrain-lmm-corpus/v2-strict"
+                ),
+                "primary_cache_manifest_size_bytes": 3_528,
+                "primary_cache_receipt_current": True,
+                "pfnn_supplement_manifest_path": (
+                    "sonic/runs/g1-hybrid-terrain-lmm/pfnn-supplement-v1/manifest.json"
+                ),
+                "pfnn_supplement_manifest_sha256": (
+                    "618ff022ed781ffcace6d7cc95ca74420468e9be2882903548b8b103b5cc7db8"
+                ),
+                "pfnn_supplement_manifest_schema": ("pfnn-terrain-lmm-supplement/v1"),
+                "pfnn_supplement_manifest_size_bytes": 73_888,
+                "pfnn_supplement_receipt_current": True,
                 "model_path": (
                     "sonic/runs/g1-hybrid-terrain-lmm/"
                     "final-combined-v2-strict-latent32-visual-v1-allrows"
@@ -136,6 +163,26 @@ def _green_receipt() -> dict[str, object]:
                 "corpus_manifest_sha256": (
                     "084c168b473e730ec24419a49f4be1526226e5f95a2dd81ae4d367c729889cdb"
                 ),
+                "primary_cache_manifest_path": (
+                    "sonic/runs/g1-hybrid-terrain-lmm/corpus-v2-strict/manifest.json"
+                ),
+                "primary_cache_manifest_sha256": (
+                    "e6fbe9413d4cbca58697b90a92f12a1832d28b961972624dd373bc72fa45494e"
+                ),
+                "primary_cache_manifest_schema": (
+                    "g1-hybrid-terrain-lmm-corpus/v2-strict"
+                ),
+                "primary_cache_manifest_size_bytes": 3_528,
+                "primary_cache_receipt_current": True,
+                "pfnn_supplement_manifest_path": (
+                    "sonic/runs/g1-hybrid-terrain-lmm/pfnn-supplement-v1/manifest.json"
+                ),
+                "pfnn_supplement_manifest_sha256": (
+                    "618ff022ed781ffcace6d7cc95ca74420468e9be2882903548b8b103b5cc7db8"
+                ),
+                "pfnn_supplement_manifest_schema": ("pfnn-terrain-lmm-supplement/v1"),
+                "pfnn_supplement_manifest_size_bytes": 73_888,
+                "pfnn_supplement_receipt_current": True,
                 "model_path": (
                     "sonic/runs/g1-hybrid-terrain-lmm/"
                     "final-combined-v2-strict-latent32-visual-v1-allrows"
@@ -194,6 +241,11 @@ def test_formal_acceptance_rejects_every_provenance_and_runtime_shortcut() -> No
         "missing-split": ("formal_identity", "split_receipt_current", False),
         "missing-test": ("formal_identity", "test_receipt_current", False),
         "missing-refit": ("formal_identity", "refit_receipt_current", False),
+        "missing-determinism": (
+            "formal_identity",
+            "determinism_receipt_current",
+            False,
+        ),
         "command-root": ("formal_identity", "motion_root_ownership", False),
         "exhaustion": ("candidate", "safety_counts", {"candidate_exhaustion": 1}),
         "too-short": ("candidate", "forward_count", 9_999),
@@ -287,12 +339,42 @@ def test_baseline_snapshot_hashes_every_frozen_file_and_fails_closed(
         "stairs_smoke_receipt_sha256": tmp_path
         / authorities["stairs_smoke_receipt_path"],
     }
+    upstream = {
+        "primary_cache": (
+            "g1-hybrid-terrain-lmm-corpus/v2-strict",
+            "sonic/runs/g1-hybrid-terrain-lmm/corpus-v2-strict/manifest.json",
+        ),
+        "pfnn_supplement": (
+            "pfnn-terrain-lmm-supplement/v1",
+            "sonic/runs/g1-hybrid-terrain-lmm/pfnn-supplement-v1/manifest.json",
+        ),
+    }
+    upstream_receipts = {}
+    for label, (schema, relative) in upstream.items():
+        path = tmp_path / relative
+        payload = (json.dumps({"schema": schema}, sort_keys=True) + "\n").encode()
+        digest = _write_authority(path, payload)
+        prefix = "primary_cache" if label == "primary_cache" else "pfnn_supplement"
+        authorities[f"{prefix}_manifest_path"] = relative
+        authorities[f"{prefix}_manifest_sha256"] = digest
+        authorities[f"{prefix}_manifest_schema"] = schema
+        authorities[f"{prefix}_manifest_size_bytes"] = len(payload)
+        authorities[f"{prefix}_receipt_current"] = True
+        upstream_receipts[label] = {
+            "path": str(path),
+            "schema": schema,
+            "sha256": digest,
+            "size_bytes": len(payload),
+        }
     for index, (name, path) in enumerate(paths.items()):
         authorities[name] = _write_authority(path, f"authority-{index}".encode())
     monkeypatch.setattr(viewer_module, "_REPOSITORY_ROOT", tmp_path)
     monkeypatch.setattr(viewer_module, "_OVERNIGHT_BASELINE_AUTHORITIES", authorities)
     evaluator = SimpleNamespace(
-        corpus=SimpleNamespace(source_root=corpus_root),
+        corpus=SimpleNamespace(
+            source_root=corpus_root,
+            manifest_receipt={"authorities": upstream_receipts},
+        ),
         generator=SimpleNamespace(root=model_root),
     )
 
@@ -321,6 +403,22 @@ def test_baseline_snapshot_hashes_every_frozen_file_and_fails_closed(
     assert "baseline-authority-unchanged-required" in acceptance_failures(
         changed_receipt
     )
+
+    primary_path = Path(upstream_receipts["primary_cache"]["path"])
+    primary_path.unlink()
+    missing_upstream = _baseline_authority_snapshot(evaluator)
+    assert missing_upstream["primary_cache_manifest_sha256"] is None
+    assert missing_upstream["primary_cache_receipt_current"] is False
+    assert not _baseline_authority_exact(missing_upstream)
+
+    _write_authority(primary_path, b'{"schema":"tampered"}\n')
+    tampered_upstream = _baseline_authority_snapshot(evaluator)
+    assert (
+        tampered_upstream["primary_cache_manifest_sha256"]
+        != authorities["primary_cache_manifest_sha256"]
+    )
+    assert tampered_upstream["primary_cache_receipt_current"] is False
+    assert not _baseline_authority_exact(tampered_upstream)
 
 
 def test_frozen_combined_baseline_uses_the_combined_authority_loader() -> None:
@@ -392,6 +490,71 @@ def test_formal_identity_reads_authenticated_task4_corpus_manifest(
     assert identity["corpus_range_count"] == 16_999
     assert identity["corpus_eligible_row_count"] == 9_758_524
     assert identity["corpus_manifest_authority_current"] is True
+    assert identity["determinism_receipt_current"] is False
+
+
+def test_formal_identity_requires_separate_exact_deterministic_rebuild_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "corpus"
+    root.mkdir()
+    manifest = {
+        "schema": "g1-full-walking-terrain-lmm-corpus/v1",
+        "fps": 60.0,
+        "horizons": [20, 40, 60],
+        "rows": 9_758_524,
+        "ranges": 16_999,
+        "sources": 15_918,
+        "eligible_rows": 9_758_524,
+        "members": {},
+    }
+    manifest_payload = (
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+    manifest_path = root / "manifest.json"
+    manifest_path.write_bytes(manifest_payload)
+    manifest_sha = hashlib.sha256(manifest_payload).hexdigest()
+    corpus = SimpleNamespace(
+        root=root,
+        manifest_sha256=manifest_sha,
+        fps=60.0,
+        horizons=(20, 40, 60),
+        source_names=tuple(
+            [f"pfnn:{index}" for index in range(80)]
+            + [f"grail:{index}" for index in range(15_918 - 80)]
+        ),
+    )
+    receipt_path = tmp_path / (
+        "sonic/runs/g1-full-walking-terrain-lmm/evidence/corpus-v1-determinism.json"
+    )
+    receipt = {
+        "schema": "g1-full-walking-terrain-lmm-determinism/v1",
+        "status": "accepted",
+        "reference_manifest_sha256": manifest_sha,
+        "reproduced_manifest_sha256": manifest_sha,
+        "members": {
+            "manifest.json": {
+                "path": "manifest.json",
+                "sha256": manifest_sha,
+                "size_bytes": len(manifest_payload),
+            }
+        },
+    }
+    _write_authority(
+        receipt_path,
+        (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode(),
+    )
+    monkeypatch.setattr(viewer_module, "_REPOSITORY_ROOT", tmp_path)
+
+    current = viewer_module._full_corpus_authority(corpus)
+
+    assert current["determinism_receipt_current"] is True
+    assert current["determinism_receipt_schema"] == receipt["schema"]
+    assert isinstance(current["determinism_receipt_sha256"], str)
+
+    receipt_path.write_text("{}\n")
+    tampered = viewer_module._full_corpus_authority(corpus)
+    assert tampered["determinism_receipt_current"] is False
 
 
 def test_full_view_passes_full_identity_and_visible_label_overrides(

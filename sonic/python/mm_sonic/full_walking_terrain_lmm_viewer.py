@@ -80,13 +80,40 @@ _FULL_FORMAL_ARTIFACT_AUTHORITIES = {
     "corpus_manifest_authority_current": True,
     "model_manifest_authority_current": True,
     "model_corpus_binding_current": True,
+    "determinism_receipt_path": (
+        "sonic/runs/g1-full-walking-terrain-lmm/evidence/corpus-v1-determinism.json"
+    ),
+    "determinism_receipt_schema": "g1-full-walking-terrain-lmm-determinism/v1",
+    "determinism_receipt_current": True,
 }
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+_DETERMINISM_RECEIPT_PATH = (
+    "sonic/runs/g1-full-walking-terrain-lmm/evidence/corpus-v1-determinism.json"
+)
+_DETERMINISM_RECEIPT_SCHEMA = "g1-full-walking-terrain-lmm-determinism/v1"
 _OVERNIGHT_BASELINE_AUTHORITIES = {
     "corpus_path": "sonic/runs/g1-hybrid-terrain-lmm/corpus-primary-pfnn-v2-strict",
     "corpus_manifest_sha256": (
         "084c168b473e730ec24419a49f4be1526226e5f95a2dd81ae4d367c729889cdb"
     ),
+    "primary_cache_manifest_path": (
+        "sonic/runs/g1-hybrid-terrain-lmm/corpus-v2-strict/manifest.json"
+    ),
+    "primary_cache_manifest_sha256": (
+        "e6fbe9413d4cbca58697b90a92f12a1832d28b961972624dd373bc72fa45494e"
+    ),
+    "primary_cache_manifest_schema": "g1-hybrid-terrain-lmm-corpus/v2-strict",
+    "primary_cache_manifest_size_bytes": 3_528,
+    "primary_cache_receipt_current": True,
+    "pfnn_supplement_manifest_path": (
+        "sonic/runs/g1-hybrid-terrain-lmm/pfnn-supplement-v1/manifest.json"
+    ),
+    "pfnn_supplement_manifest_sha256": (
+        "618ff022ed781ffcace6d7cc95ca74420468e9be2882903548b8b103b5cc7db8"
+    ),
+    "pfnn_supplement_manifest_schema": "pfnn-terrain-lmm-supplement/v1",
+    "pfnn_supplement_manifest_size_bytes": 73_888,
+    "pfnn_supplement_receipt_current": True,
     "model_path": (
         "sonic/runs/g1-hybrid-terrain-lmm/"
         "final-combined-v2-strict-latent32-visual-v1-allrows"
@@ -167,6 +194,56 @@ def _observed_file_sha256(path: Path) -> str | None:
         return None
 
 
+def _baseline_upstream_authority(
+    corpus: object, authority_name: str, field_prefix: str
+) -> dict[str, object]:
+    receipt = _mapping(getattr(corpus, "manifest_receipt", {}))
+    authorities = _mapping(receipt.get("authorities"))
+    descriptor = _mapping(authorities.get(authority_name))
+    path_value = descriptor.get("path")
+    path = Path(path_value) if isinstance(path_value, str) else None
+    payload: bytes | None = None
+    manifest: Mapping[str, Any] = {}
+    observed_sha: str | None = None
+    if path is not None:
+        try:
+            resolved = path.resolve(strict=True)
+            if resolved.is_file():
+                payload = resolved.read_bytes()
+                decoded = json.loads(payload)
+                if type(decoded) is dict:
+                    manifest = decoded
+                observed_sha = hashlib.sha256(payload).hexdigest()
+        except (OSError, UnicodeError, json.JSONDecodeError, RuntimeError, ValueError):
+            pass
+    expected_path = _REPOSITORY_ROOT / str(
+        _OVERNIGHT_BASELINE_AUTHORITIES[f"{field_prefix}_manifest_path"]
+    )
+    expected_sha = _OVERNIGHT_BASELINE_AUTHORITIES[f"{field_prefix}_manifest_sha256"]
+    expected_schema = _OVERNIGHT_BASELINE_AUTHORITIES[f"{field_prefix}_manifest_schema"]
+    expected_size = _OVERNIGHT_BASELINE_AUTHORITIES[
+        f"{field_prefix}_manifest_size_bytes"
+    ]
+    descriptor_current = (
+        path is not None
+        and path.resolve() == expected_path.resolve()
+        and descriptor.get("sha256") == expected_sha == observed_sha
+        and descriptor.get("schema") == expected_schema == manifest.get("schema")
+        and descriptor.get("size_bytes") == expected_size
+        and payload is not None
+        and len(payload) == expected_size
+    )
+    return {
+        f"{field_prefix}_manifest_path": _path_identity(path),
+        f"{field_prefix}_manifest_sha256": observed_sha,
+        f"{field_prefix}_manifest_schema": manifest.get("schema"),
+        f"{field_prefix}_manifest_size_bytes": (
+            len(payload) if payload is not None else None
+        ),
+        f"{field_prefix}_receipt_current": descriptor_current,
+    }
+
+
 def _baseline_authority_snapshot(evaluator: object) -> dict[str, object]:
     corpus = getattr(evaluator, "corpus", None)
     generator = getattr(evaluator, "generator", None)
@@ -185,6 +262,8 @@ def _baseline_authority_snapshot(evaluator: object) -> dict[str, object]:
         _OVERNIGHT_BASELINE_AUTHORITIES["stairs_smoke_receipt_path"]
     )
     return {
+        **_baseline_upstream_authority(corpus, "primary_cache", "primary_cache"),
+        **_baseline_upstream_authority(corpus, "pfnn_supplement", "pfnn_supplement"),
         "corpus_path": _path_identity(corpus_root),
         "corpus_manifest_sha256": _observed_file_sha256(corpus_root / "manifest.json"),
         "model_path": _path_identity(Path(model_root))
@@ -222,6 +301,75 @@ def _json_file_identity(path: Path) -> tuple[Mapping[str, Any], str | None]:
         return {}, None
 
 
+def _determinism_receipt_authority(
+    corpus_root: Path, corpus_manifest: Mapping[str, Any], corpus_sha256: object
+) -> dict[str, object]:
+    path = _REPOSITORY_ROOT / _DETERMINISM_RECEIPT_PATH
+    receipt: Mapping[str, Any] = {}
+    payload: bytes | None = None
+    digest: str | None = None
+    try:
+        resolved = path.resolve(strict=True)
+        if resolved.is_file():
+            payload = resolved.read_bytes()
+            decoded = json.loads(payload)
+            if type(decoded) is dict:
+                receipt = decoded
+            digest = hashlib.sha256(payload).hexdigest()
+    except (OSError, UnicodeError, json.JSONDecodeError, RuntimeError, ValueError):
+        pass
+    manifest_path = corpus_root / "manifest.json"
+    try:
+        manifest_size = manifest_path.resolve(strict=True).stat().st_size
+    except OSError:
+        manifest_size = None
+    expected_members = dict(_mapping(corpus_manifest.get("members")))
+    expected_members["manifest.json"] = {
+        "path": "manifest.json",
+        "sha256": corpus_sha256,
+        "size_bytes": manifest_size,
+    }
+    canonical = False
+    if receipt and payload is not None:
+        try:
+            canonical = (
+                payload
+                == (
+                    json.dumps(
+                        dict(receipt),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    )
+                    + "\n"
+                ).encode()
+            )
+        except (TypeError, ValueError):
+            canonical = False
+    current = (
+        canonical
+        and set(receipt)
+        == {
+            "schema",
+            "status",
+            "reference_manifest_sha256",
+            "reproduced_manifest_sha256",
+            "members",
+        }
+        and receipt.get("schema") == _DETERMINISM_RECEIPT_SCHEMA
+        and receipt.get("status") == "accepted"
+        and receipt.get("reference_manifest_sha256") == corpus_sha256
+        and receipt.get("reproduced_manifest_sha256") == corpus_sha256
+        and receipt.get("members") == expected_members
+    )
+    return {
+        "determinism_receipt_path": _path_identity(path),
+        "determinism_receipt_schema": receipt.get("schema"),
+        "determinism_receipt_sha256": digest,
+        "determinism_receipt_current": current,
+    }
+
+
 def _full_corpus_authority(corpus: object) -> dict[str, object]:
     root_value = getattr(corpus, "root", getattr(corpus, "source_root", None))
     if root_value is None:
@@ -238,6 +386,7 @@ def _full_corpus_authority(corpus: object) -> dict[str, object]:
         and manifest.get("sources") == len(source_names)
     )
     return {
+        **_determinism_receipt_authority(Path(root_value), manifest, observed_sha),
         "corpus_schema": manifest.get("schema"),
         "fps": manifest.get("fps"),
         "horizons": manifest.get("horizons"),
@@ -710,7 +859,7 @@ def _formal_identity(
         )
         is True,
         "determinism_receipt_current": corpus_authority.get(
-            "corpus_manifest_authority_current"
+            "determinism_receipt_current"
         )
         is True,
         "full_search": full_search,
