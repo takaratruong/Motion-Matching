@@ -297,6 +297,15 @@ class FixedRateAccumulator:
         return count
 
 
+def _runtime_step_hz(matcher: object) -> float:
+    """Preserve legacy 25 Hz viewers while honoring authenticated new runtimes."""
+
+    rate = float(getattr(matcher, "fps", 25.0))
+    if not math.isfinite(rate) or rate <= 0.0:
+        raise ValueError("matcher runtime FPS must be positive and finite")
+    return rate
+
+
 def reset_without_mutation_on_failure(
     current: object, build_reset: Callable[[], object]
 ) -> tuple[object, BaseException | None]:
@@ -1785,7 +1794,7 @@ def run_interactive(
     )
     overlay_scene_status = terrain.scene_evidence_status
     data = mujoco.MjData(model)
-    accumulator = FixedRateAccumulator(step_hz=25.0)
+    accumulator = FixedRateAccumulator(step_hz=_runtime_step_hz(matcher))
     render_frames = 0
     reset_failures = 0
     started = time.monotonic()
