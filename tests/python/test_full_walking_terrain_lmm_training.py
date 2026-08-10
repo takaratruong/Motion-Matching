@@ -761,6 +761,13 @@ class FullWalkingTrainingContractTests(unittest.TestCase):
             first_receipt = root / "first-test.json"
             second_receipt = root / "second-test.json"
             evaluate_frozen_test(corpus, selection, first_receipt, device="cpu")
+            self.assertFalse(
+                (corpus.root / ".full-walking-frozen-test-ledger").exists()
+            )
+            reservation_root = (
+                corpus.root.parent / "evidence" / ".full-walking-frozen-test-ledger"
+            )
+            self.assertEqual(len(tuple(reservation_root.glob("*.json"))), 1)
             with self.assertRaisesRegex(
                 (FileExistsError, ValueError), "frozen test|already"
             ):

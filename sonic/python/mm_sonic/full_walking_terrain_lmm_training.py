@@ -875,7 +875,13 @@ def _reserve_frozen_test(
     requested_output: Path,
 ) -> None:
     authority_root = _corpus_authority_root(corpus)
-    reservation_root = authority_root / ".full-walking-frozen-test-ledger"
+    evidence_root = authority_root.parent / "evidence"
+    if evidence_root.exists() and (
+        evidence_root.is_symlink() or not evidence_root.is_dir()
+    ):
+        raise ValueError("full walking evidence authority is not a directory")
+    evidence_root.mkdir(mode=0o755, exist_ok=True)
+    reservation_root = evidence_root / ".full-walking-frozen-test-ledger"
     if reservation_root.exists() and (
         reservation_root.is_symlink() or not reservation_root.is_dir()
     ):
