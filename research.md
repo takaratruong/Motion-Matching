@@ -2599,3 +2599,16 @@ mm stance-run drift, and at least two supporting sole probes throughout every
 detected stance.  This supplies a mechanically paired left/right example while
 preserving the authored lower-body gait rather than synthesizing a second
 terrain maneuver.
+
+Backward terrain coverage is generated only by exact pose time reversal of a
+visually admitted natural traversal.  The delivered root, joints, stance
+history, support counts, and other framewise labels are reversed together;
+the two-stick velocity and stop commands are then recomputed from the reversed
+motion.  The tool now consumes the paired terrain from the accepted source
+report, so it also works on exact scene mirrors and on unchanged registered
+rough sources whose rigid foot legitimately bridges a groove.  The first
+clip-200 reverse canary preserves the source's 0.101-rad joint-step and 6.66
+m/s^2 root-acceleration bounds and independently passes with 2.11 mm maximum
+foot penetration, zero forbidden-body penetration, 7.52 mm stance-run drift,
+and two or more supporting sole probes.  It remains outside the curated bank
+until dense backward-gait review completes.
