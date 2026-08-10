@@ -1,5 +1,10 @@
 # G1 LMM Walk Command-Support Correction Implementation Plan
 
+> **Status: paused on 2026-08-09.** The user explicitly prioritized terrain
+> verification over command coverage. Do not execute this plan unless that
+> priority changes. The active plan is
+> `2026-08-09-g1-lmm-authored-slope-terrain-canary.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Publish and personally drive one honest 60 Hz G1 learned-motion-matching flat-walking canary whose projector is trained and gated on the same supported cardinal command population used at runtime.

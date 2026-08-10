@@ -1,5 +1,10 @@
 # G1 LMM Walk Command-Support Correction Design
 
+> **Status: paused on 2026-08-09.** The user explicitly prioritized terrain
+> verification over command coverage. Do not execute this design unless that
+> priority changes. The active design is
+> `2026-08-09-g1-lmm-authored-slope-terrain-canary-design.md`.
+
 ## Purpose
 
 The accepted 60 Hz G1 retarget/build pipeline, learned pose decoder, and learned
