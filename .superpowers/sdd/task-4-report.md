@@ -225,3 +225,66 @@ unchanged and was not launched.
 
 Fresh strict `test_g1_lmm`, `test_g1_runtime`, and
 `test_g1_controller_state` runs passed, as did controller syntax and link.
+
+## Accepted canary model-scope binding (2026-08-09)
+
+The runtime model manifest now requires the exact top-level key/value
+`"model_scope":"single-clip-overfit-canary"`. The key participates in the
+manifest's exact-key set, is parsed before any network evaluation allocation,
+and is published only with the fully authenticated model candidate. The scope
+is retained in `g1_lmm_model_bundle` and its transactional swap, logged once
+after successful startup authentication, and shown in the existing LMM
+controller panel. It was deliberately not added to the stable per-frame CSV
+or runtime-diagnostic ABI.
+
+The compile-stage RED was the new accepted-bundle assertion failing because
+`g1_lmm_model_bundle` had no `model_scope` member:
+
+```text
+tests/cpp/test_g1_lmm.cpp:717:20: error: 'struct g1_lmm_model_bundle'
+has no member named 'model_scope'
+```
+
+The GREEN fixture emits the exact accepted scope by default. Missing, wrong
+string, wrong type, and an extra scope-related top-level key each reject with
+zero evaluation allocations; no rejected candidate publishes scope metadata.
+A failed reload preserves an already authenticated scope and latent storage,
+and a direct metadata-only swap test proves scope exchanges symmetrically with
+the data digest, authentication flag, and allocation count. The controller
+source contract also checks the two lifetime-safe diagnostic uses (startup
+log and overlay).
+
+Fresh verification passed:
+
+```text
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
+  tests/cpp/test_g1_lmm.cpp -o /tmp/test_g1_lmm_scope_strict && \
+  /tmp/test_g1_lmm_scope_strict
+
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
+  tests/cpp/test_g1_runtime.cpp -o /tmp/test_g1_runtime_scope_strict && \
+  /tmp/test_g1_runtime_scope_strict && \
+  /tmp/test_g1_runtime_scope_strict \
+    --flat-bundle sonic/runs/g1-lmm-flat-60hz/data-v3
+
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I. \
+  tests/cpp/test_g1_controller_state.cpp \
+  -o /tmp/test_g1_controller_state_scope_strict && \
+  /tmp/test_g1_controller_state_scope_strict
+
+g++ -std=c++17 -fsyntax-only -I. \
+  -I/home/ubuntu/apps/raylib/src -I/home/ubuntu/apps/raygui/src \
+  controller.cpp
+
+g++ -std=c++17 -O2 -I. -I/home/ubuntu/apps/raylib/src \
+  -I/home/ubuntu/apps/raygui/src controller.cpp \
+  /home/ubuntu/apps/raylib/src/libraylib.a \
+  -lGL -lm -lpthread -ldl -lrt -lX11 \
+  -o /tmp/controller_model_scope
+
+git diff --check
+```
+
+The Task 3 Python publisher changes were owned by the concurrent training
+lane and were not staged or modified here. No viewer or model executable was
+launched; the deferred learned 600-tick interactive gate remains unchanged.

@@ -1048,6 +1048,10 @@ int main(int argc, char** argv)
             fprintf(stderr, "G1 LMM model error: %s\n", artifact_error);
             return 2;
         }
+        fprintf(
+            stderr,
+            "G1 LMM model accepted scope=%s\n",
+            lmm_model.model_scope.c_str());
     }
 
     std::string database_path;
@@ -2564,21 +2568,29 @@ int main(int argc, char** argv)
         
         float ui_lmm_hei = 330;
         
-        GuiGroupBox(Rectangle{ 970, ui_lmm_hei, 290, 40 }, "learned motion matching");
+        GuiGroupBox(Rectangle{ 970, ui_lmm_hei, 290, 65 }, "learned motion matching");
 
         GuiLabel(
             Rectangle{ 990, ui_lmm_hei + 10, 250, 20 },
             lmm_enabled
                 ? TextFormat(
-                    "lmm step=%llu commit=%llu cost=%.4g",
+                    "scope: %s",
+                    lmm_model.model_scope.c_str())
+                : "engine: ordinary");
+        if (lmm_enabled)
+        {
+            GuiLabel(
+                Rectangle{ 990, ui_lmm_hei + 35, 250, 20 },
+                TextFormat(
+                    "step=%llu commit=%llu cost=%.4g",
                     state.lmm_stepper_count,
                     state.lmm_commit_count,
-                    state.selected_cost)
-                : "engine: ordinary");
+                    state.selected_cost));
+        }
         
         //---------
         
-        float ui_ctrl_hei = 380;
+        float ui_ctrl_hei = 405;
         
         GuiGroupBox(Rectangle{ 970, ui_ctrl_hei, 290, 160 }, "controls");
 

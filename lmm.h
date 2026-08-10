@@ -27,6 +27,8 @@ static const int G1_LMM_FeatureCount = 31;
 static const int G1_LMM_LatentCount = 32;
 static const int G1_LMM_BoneCount = 31;
 static const int G1_LMM_ContactCount = 2;
+static constexpr const char* G1_LMMAcceptedModelScope =
+    "single-clip-overfit-canary";
 
 static inline bool g1_lmm_dimensions_valid(
     const int features,
@@ -74,6 +76,7 @@ struct g1_lmm_model_bundle
     nnet_evaluation projector_evaluation;
     array2d<float> latent;
     std::string data_manifest_sha256;
+    std::string model_scope;
     bool authenticated = false;
     int evaluation_allocation_count = 0;
 };
@@ -117,6 +120,7 @@ static inline void g1_lmm_model_bundle_swap(
         second.projector_evaluation.layers);
     g1_lmm_swap_array2d(first.latent, second.latent);
     first.data_manifest_sha256.swap(second.data_manifest_sha256);
+    first.model_scope.swap(second.model_scope);
     std::swap(first.authenticated, second.authenticated);
     std::swap(
         first.evaluation_allocation_count,
@@ -393,12 +397,16 @@ static inline bool g1_lmm_model_load_and_verify(
     json_value document;
     if (!scene_json_load_verified(
             document, model_manifest_path.c_str(),
-            observed_model_manifest_sha, error, capacity) ||
-        !scene_exact_keys(
+            observed_model_manifest_sha, error, capacity))
+        return false;
+    if (json_member(document, "model_scope") == NULL)
+        return scene_error(
+            error, capacity, "G1 LMM model scope is required");
+    if (!scene_exact_keys(
             document,
             {"artifacts","data_artifacts","data_manifest_schema",
-             "data_manifest_sha256","dimensions","output_fps",
-             "schema","status"},
+             "data_manifest_sha256","dimensions","model_scope",
+             "output_fps","schema","status"},
             "G1 LMM model manifest", error, capacity))
         return false;
 
@@ -406,6 +414,7 @@ static inline bool g1_lmm_model_load_and_verify(
     std::string status;
     std::string data_schema;
     std::string data_sha;
+    std::string model_scope;
     float output_fps = 0.0f;
     if (!scene_member_string(
             schema, document, "schema", "G1 LMM model manifest",
@@ -428,6 +437,13 @@ static inline bool g1_lmm_model_load_and_verify(
         return scene_error(
             error, capacity,
             "G1 LMM model schema/status/rate/data binding is incompatible");
+    if (!scene_member_string(
+            model_scope, document, "model_scope", "G1 LMM model manifest",
+            error, capacity))
+        return false;
+    if (model_scope != G1_LMMAcceptedModelScope)
+        return scene_error(
+            error, capacity, "G1 LMM model scope is incompatible");
 
     const json_value* dimensions = json_member(document, "dimensions");
     int features = 0;
@@ -528,6 +544,7 @@ static inline bool g1_lmm_model_load_and_verify(
     candidate.projector_evaluation.resize(candidate.projector);
     candidate.evaluation_allocation_count = 3;
     candidate.data_manifest_sha256 = data_sha;
+    candidate.model_scope = model_scope;
     candidate.authenticated = true;
     g1_lmm_model_bundle_swap(out, candidate);
     return true;

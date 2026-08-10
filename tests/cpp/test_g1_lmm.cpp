@@ -63,6 +63,29 @@ static void test_missing_bundle_fails_before_evaluation_allocation()
           "missing authenticated model bundle is rejected");
     check(model.evaluation_allocation_count == 0,
           "rejection precedes network evaluation allocation");
+    check(!model.authenticated && model.model_scope.empty(),
+          "missing bundle rejection publishes no authentication metadata");
+}
+
+static void test_model_bundle_swap_exchanges_scope_metadata()
+{
+    g1_lmm_model_bundle first;
+    g1_lmm_model_bundle second;
+    first.model_scope = "first-scope";
+    first.data_manifest_sha256 = "first-data";
+    first.authenticated = true;
+    first.evaluation_allocation_count = 3;
+    second.model_scope = "second-scope";
+    second.data_manifest_sha256 = "second-data";
+    g1_lmm_model_bundle_swap(first, second);
+    check(first.model_scope == "second-scope" &&
+              first.data_manifest_sha256 == "second-data" &&
+              !first.authenticated && first.evaluation_allocation_count == 0 &&
+              second.model_scope == "first-scope" &&
+              second.data_manifest_sha256 == "first-data" &&
+              second.authenticated &&
+              second.evaluation_allocation_count == 3,
+          "bundle swap exchanges model scope with all authentication metadata");
 }
 
 static void write_u32(std::ofstream& output, const std::uint32_t value)
@@ -148,6 +171,15 @@ static std::string file_sha(const std::filesystem::path& path)
     return digest;
 }
 
+enum synthetic_model_scope_variant
+{
+    SyntheticModelScopeValid,
+    SyntheticModelScopeMissing,
+    SyntheticModelScopeWrongValue,
+    SyntheticModelScopeWrongType,
+    SyntheticModelScopeExtra
+};
+
 struct synthetic_lmm_fixture
 {
     std::filesystem::path root = "/tmp/test_g1_lmm_bundle";
@@ -227,7 +259,9 @@ struct synthetic_lmm_fixture
         const std::string& bound_data_sha = std::string(),
         const int corrupt_artifact = -1,
         const int corrupt_data_artifact = -1,
-        const char* data_schema = "g1-lmm-flat-data/v3")
+        const char* data_schema = "g1-lmm-flat-data/v3",
+        const synthetic_model_scope_variant scope_variant =
+            SyntheticModelScopeValid)
     {
         std::ofstream output(
             model / "manifest.json", std::ios::binary | std::ios::trunc);
@@ -257,8 +291,21 @@ struct synthetic_lmm_fixture
                << (bound_data_sha.empty() ? data_manifest_sha : bound_data_sha)
                << "\",\n"
                << "  \"dimensions\": {\"bones\": 31, \"contacts\": 2, "
-                  "\"features\": 31, \"latent\": 32},\n"
-               << "  \"output_fps\": 60.0,\n"
+                  "\"features\": 31, \"latent\": 32},\n";
+        if (scope_variant != SyntheticModelScopeMissing) {
+            if (scope_variant == SyntheticModelScopeWrongType) {
+                output << "  \"model_scope\": 7,\n";
+            } else {
+                output << "  \"model_scope\": \""
+                       << (scope_variant == SyntheticModelScopeWrongValue
+                               ? "general-locomotion"
+                               : "single-clip-overfit-canary")
+                       << "\",\n";
+            }
+        }
+        if (scope_variant == SyntheticModelScopeExtra)
+            output << "  \"model_scope_extra\": \"unexpected\",\n";
+        output << "  \"output_fps\": 60.0,\n"
                << "  \"schema\": \"g1-lmm-model/v1\",\n"
                << "  \"status\": \"accepted\"\n}\n";
         output.close();
@@ -689,8 +736,69 @@ static void test_authenticated_bundle_and_digest_tampers()
           error);
     check(accepted.authenticated && accepted.evaluation_allocation_count == 3,
           "accepted model allocates exactly three evaluation states");
+    check(accepted.model_scope == "single-clip-overfit-canary",
+          "accepted model retains its exact canary scope for diagnostics");
     check(accepted.latent.rows == 256 && accepted.latent.cols == 32,
           "accepted latent table matches the bound database");
+
+    const auto expect_scope_rejection = [&](
+        const synthetic_model_scope_variant scope_variant,
+        const char* message,
+        const bool scope_diagnostic) {
+        fixture.write_manifest(
+            std::string(), -1, -1, "g1-lmm-flat-data/v3", scope_variant);
+        g1_lmm_model_bundle rejected;
+        error[0] = '\0';
+        const bool rejected_before_allocation =
+            !g1_lmm_model_load_and_verify(
+                rejected,
+                fixture.model.c_str(),
+                fixture.data.c_str(),
+                error,
+                static_cast<int>(sizeof(error))) &&
+            rejected.evaluation_allocation_count == 0;
+        check(rejected_before_allocation, message);
+        check(rejected.model_scope.empty(),
+              "scope rejection leaves the output bundle unmodified");
+        if (scope_diagnostic)
+            check(std::strstr(error, "scope") != nullptr,
+                  "scope rejection reports the incompatible model field");
+    };
+    expect_scope_rejection(
+        SyntheticModelScopeMissing,
+        "missing model scope rejects before evaluation allocation",
+        true);
+    expect_scope_rejection(
+        SyntheticModelScopeWrongValue,
+        "non-canary model scope rejects before evaluation allocation",
+        true);
+    expect_scope_rejection(
+        SyntheticModelScopeWrongType,
+        "non-string model scope rejects before evaluation allocation",
+        true);
+    expect_scope_rejection(
+        SyntheticModelScopeExtra,
+        "extra model scope key rejects before evaluation allocation",
+        false);
+
+    fixture.write_manifest(
+        std::string(), -1, -1, "g1-lmm-flat-data/v3",
+        SyntheticModelScopeWrongValue);
+    const float* const accepted_latent_data = accepted.latent.data;
+    error[0] = '\0';
+    check(!g1_lmm_model_load_and_verify(
+              accepted,
+              fixture.model.c_str(),
+              fixture.data.c_str(),
+              error,
+              static_cast<int>(sizeof(error))) &&
+              accepted.authenticated &&
+              accepted.evaluation_allocation_count == 3 &&
+              accepted.model_scope == "single-clip-overfit-canary" &&
+              accepted.latent.data == accepted_latent_data,
+          "failed scope reload preserves the authenticated bundle");
+    fixture.write_manifest();
+
     test_projector_late_nan_is_transactional(accepted);
     test_transactional_lmm_tick(accepted);
 
@@ -800,6 +908,7 @@ int main()
     test_dimensions_and_normalized_projector_cost();
     test_controller_state_owns_lmm_transaction_state();
     test_missing_bundle_fails_before_evaluation_allocation();
+    test_model_bundle_swap_exchanges_scope_metadata();
     test_authenticated_bundle_and_digest_tampers();
     return 0;
 }

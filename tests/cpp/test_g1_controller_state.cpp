@@ -283,6 +283,9 @@ static void test_controller_exposes_fail_closed_lmm_mode()
               source_call_count(source, "stepper_evaluate") == 0 &&
               source_call_count(source, "decompressor_evaluate") == 0,
           "controller cannot apply a second non-transactional LMM pose path");
+    check(count_occurrences(
+              source, "lmm_model.model_scope.c_str()") == 2,
+          "controller logs and overlays the authenticated model scope");
 }
 
 static void test_controller_validates_ik_geometry_before_window()
