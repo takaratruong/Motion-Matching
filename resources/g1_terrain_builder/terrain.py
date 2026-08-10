@@ -5,6 +5,7 @@ import math
 import os
 import pickle
 import struct
+import tempfile
 import warnings
 
 import numpy as np
@@ -210,11 +211,11 @@ def sample_terrain_features(terrain, centerline: np.ndarray) -> np.ndarray:
     return features
 
 
-def _load_usd_mesh(base: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    path = os.path.join(USD_DIR, base + ".usd")
-    stage = Usd.Stage.Open(path)
+def _load_usd_mesh_from_stage(
+    stage, source: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     if stage is None:
-        raise FileNotFoundError(f"unable to open GRAIL terrain USD: {path}")
+        raise ValueError(f"unable to open GRAIL terrain USD: {source}")
     for prim in stage.Traverse():
         if prim.IsA(UsdGeom.Mesh):
             mesh = UsdGeom.Mesh(prim)
@@ -225,12 +226,33 @@ def _load_usd_mesh(base: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             indices = _checked_int32_topology(
                 mesh.GetFaceVertexIndicesAttr().Get(), "face indices")
             if points.ndim != 2 or points.shape[1:] != (3,):
-                raise ValueError(f"invalid GRAIL mesh points in {path}")
+                raise ValueError(f"invalid GRAIL mesh points in {source}")
             if counts.ndim != 1 or indices.ndim != 1:
-                raise ValueError(f"invalid GRAIL mesh topology in {path}")
+                raise ValueError(f"invalid GRAIL mesh topology in {source}")
             _validate_mesh_topology(points, counts, indices)
             return points, counts, indices
-    raise ValueError(f"no mesh found in GRAIL terrain USD: {path}")
+    raise ValueError(f"no mesh found in GRAIL terrain USD: {source}")
+
+
+def _load_usd_mesh(base: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    path = os.path.join(USD_DIR, base + ".usd")
+    return _load_usd_mesh_from_stage(Usd.Stage.Open(path), path)
+
+
+def _load_usd_mesh_bytes(
+    payload: bytes, source: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if type(payload) is not bytes:
+        raise TypeError("GRAIL USD payload must be exact bytes")
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".usd") as temporary:
+            temporary.write(payload)
+            temporary.flush()
+            stage = Usd.Stage.Open(temporary.name)
+            return _load_usd_mesh_from_stage(stage, source)
+    except OSError as error:
+        raise ValueError(f"unable to materialize GRAIL terrain USD: {source}") \
+            from error
 
 
 def _object_pose0(base: str) -> tuple[np.ndarray, np.ndarray]:
@@ -392,7 +414,12 @@ def _mujoco_to_holden(points: np.ndarray) -> np.ndarray:
 
 
 class GrailTerrain(VerticalTriangleSurface):
-    def __init__(self, render_vertices, face_counts, face_indices):
+    def __init__(
+        self, render_vertices, face_counts, face_indices,
+        *, exterior_height=0.0, source_vertices=None,
+        reconstruction_rotation=None, reconstruction_translation=None,
+        support_calibration_m=0.0,
+    ):
         self._vertices = np.array(render_vertices, np.float64, copy=True)
         self._face_counts = _checked_int32_topology(
             face_counts, "face counts")
@@ -404,19 +431,126 @@ class GrailTerrain(VerticalTriangleSurface):
             self._vertices,
             triangulate_faces(
                 self._vertices, self._face_counts, self._face_indices),
-            exterior_height=0.0,
+            exterior_height=exterior_height,
         )
+        self.support_calibration_m = float(support_calibration_m)
+        self.exterior_source_height_m = 0.0
+        self.source_vertices = (
+            None if source_vertices is None
+            else np.array(source_vertices, np.float64, copy=True))
+        self.reconstruction_rotation = (
+            None if reconstruction_rotation is None
+            else np.array(reconstruction_rotation, np.float64, copy=True))
+        self.reconstruction_translation = (
+            None if reconstruction_translation is None
+            else np.array(reconstruction_translation, np.float64, copy=True))
         self._max_height = float(self._vertices[:, 1].max())
-        self._vertices.setflags(write=False)
-        self._face_counts.setflags(write=False)
-        self._face_indices.setflags(write=False)
+        for array in (
+            self._vertices, self._face_counts, self._face_indices,
+            self.source_vertices, self.reconstruction_rotation,
+            self.reconstruction_translation,
+        ):
+            if array is not None:
+                array.setflags(write=False)
+
+    @classmethod
+    def from_reconstructed_mesh(
+        cls, source_vertices, face_counts, face_indices,
+        reconstruction_rotation, reconstruction_translation,
+        *, support_calibration_m,
+    ) -> "GrailTerrain":
+        vertices = np.asarray(source_vertices, np.float64)
+        rotation = np.asarray(reconstruction_rotation, np.float64)
+        translation = np.asarray(reconstruction_translation, np.float64)
+        calibration = float(support_calibration_m)
+        if vertices.ndim != 2 or vertices.shape[1:] != (3,) \
+                or rotation.shape != (3, 3) or translation.shape != (3,) \
+                or not np.isfinite(vertices).all() \
+                or not np.isfinite(rotation).all() \
+                or not np.isfinite(translation).all() \
+                or not np.isfinite(calibration) or calibration < 0.0:
+            raise ValueError("GRAIL reconstruction transform/calibration is invalid")
+        reconstructed = (rotation @ vertices.T).T + translation
+        runtime = _mujoco_to_holden(reconstructed)
+        runtime[:, 1] -= calibration
+        return cls(
+            runtime, face_counts, face_indices,
+            exterior_height=-calibration,
+            source_vertices=vertices,
+            reconstruction_rotation=rotation,
+            reconstruction_translation=translation,
+            support_calibration_m=calibration,
+        )
+
+    @classmethod
+    def from_authenticated_bytes(
+        cls, usd_payload: bytes, reconstruction_payload: bytes,
+        *, usd_source: str, reconstruction_source: str,
+        support_calibration_m: float,
+    ) -> "GrailTerrain":
+        vertices, face_counts, face_indices = _load_usd_mesh_bytes(
+            usd_payload, usd_source)
+        if type(reconstruction_payload) is not bytes:
+            raise TypeError("GRAIL reconstruction payload must be exact bytes")
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="numpy.core.numeric is deprecated",
+                category=DeprecationWarning,
+            )
+            reconstruction = pickle.loads(reconstruction_payload)
+        try:
+            object_data = reconstruction["obj_data"]
+            rotation = np.asarray(object_data["obj_R"])[0]
+            translation = np.asarray(object_data["obj_t"])[0]
+        except (IndexError, KeyError, TypeError) as error:
+            raise ValueError(
+                f"invalid GRAIL reconstruction pose in {reconstruction_source}") \
+                from error
+        if rotation.dtype != np.dtype(np.float32) \
+                or translation.dtype != np.dtype(np.float32):
+            raise ValueError("GRAIL reconstruction pose must be binary32")
+        return cls.from_reconstructed_mesh(
+            vertices, face_counts, face_indices,
+            rotation.astype(np.float64), translation.astype(np.float64),
+            support_calibration_m=support_calibration_m,
+        )
 
     @classmethod
     def from_base(cls, base: str) -> "GrailTerrain":
         vertices, face_counts, face_indices = _load_usd_mesh(base)
         rotation, translation = _object_pose0(base)
-        world_vertices = (rotation @ vertices.T).T + translation
-        return cls(_mujoco_to_holden(world_vertices), face_counts, face_indices)
+        return cls.from_reconstructed_mesh(
+            vertices, face_counts, face_indices, rotation, translation,
+            support_calibration_m=0.0,
+        )
+
+    def source_to_runtime(self, points: np.ndarray) -> np.ndarray:
+        source = np.asarray(points, np.float64)
+        if source.ndim != 2 or source.shape[1:] != (3,) \
+                or not np.isfinite(source).all() \
+                or self.reconstruction_rotation is None:
+            raise ValueError("source points/reconstruction transform are invalid")
+        reconstructed = (
+            self.reconstruction_rotation @ source.T).T \
+            + self.reconstruction_translation
+        runtime = _mujoco_to_holden(reconstructed)
+        runtime[:, 1] -= self.support_calibration_m
+        return runtime
+
+    def runtime_to_source(self, points: np.ndarray) -> np.ndarray:
+        runtime = np.asarray(points, np.float64)
+        if runtime.ndim != 2 or runtime.shape[1:] != (3,) \
+                or not np.isfinite(runtime).all() \
+                or self.reconstruction_rotation is None:
+            raise ValueError("runtime points/reconstruction transform are invalid")
+        calibrated = runtime.copy()
+        calibrated[:, 1] += self.support_calibration_m
+        reconstructed = np.column_stack((
+            calibrated[:, 0], -calibrated[:, 2], calibrated[:, 1]))
+        return (
+            reconstructed - self.reconstruction_translation) \
+            @ self.reconstruction_rotation
 
     def footprint(self) -> dict:
         top = self._vertices[

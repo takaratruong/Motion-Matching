@@ -31,6 +31,56 @@ PYTHON = "/home/ubuntu/miniconda3/envs/diffsim/bin/python"
 
 
 class BuildCliTests(unittest.TestCase):
+    def test_authored_slope_source_seam_binds_all_frozen_inputs_and_policy(self):
+        assemble = getattr(builder, "_assemble_authored_slope_source", None)
+        self.assertTrue(callable(assemble), "authored slope source seam is missing")
+        if assemble is None:
+            return
+        name = "terrain_slopes__slope_000__000"
+        root = "/home/ubuntu/datasets/GRAIL/data/slope"
+        candidate = assemble(SimpleNamespace(
+            output_fps=60.0,
+            slope_robot=f"{root}/robot/{name}.pkl",
+            slope_usd=f"{root}/object_usd/{name}.usd",
+            slope_recon=f"{root}/recon/{name}.pkl",
+            slope_metadata=f"{root}/meta/{name}.pkl",
+            g1_xml=(
+                "/home/ubuntu/projects/mjx-diffphysics/env/g1/assets/"
+                "g1_29dof.xml"),
+        ))
+
+        receipt = candidate.receipt
+        self.assertEqual(receipt["schema"], "g1-lmm-authored-slope-source/v1")
+        self.assertEqual(receipt["status"], "provisional")
+        self.assertEqual(receipt["clip_id"], name)
+        self.assertEqual(receipt["hashes"], {
+            "robot_sha256":
+                "b77480d5f8f3339a3064276d6f9d443ac3a3456f20eb9195d48add176e561ee1",
+            "usd_sha256":
+                "8d1e696fb5bd2aecfa17797549bddd001093b060773cb313185a6a46db7eb5a5",
+            "reconstruction_sha256":
+                "d05d6c5a7d6a13eff7e69da0e9e96ab5a79f700bb706611699f0b9c44c9b51ec",
+            "metadata_sha256":
+                "7d88be608419afd2be127e4ac4c5a8aa1b4863fdf84e86c5ec93356881ee861d",
+            "g1_xml_sha256":
+                "749209c06a5c0023deb27f728420028b62b1f3092a22e24920183c1a897e4376",
+        })
+        self.assertEqual(receipt["metadata"], {"scene_scale": 1.0})
+        self.assertEqual(receipt["basis"], "z-up-to-holden-shared-with-robot")
+        self.assertEqual(receipt["exterior_policy"], {
+            "source_height_m": 0.0,
+            "runtime_height_m": -0.012000000104308128,
+            "gradient_xz": [0.0, 0.0],
+            "mesh_wins_inside": True,
+        })
+        self.assertEqual(receipt["support_calibration_m"], 0.012000000104308128)
+        self.assertEqual(receipt["support_calibration_applied_to"], "terrain-only")
+        self.assertNotIn("registration_offset", receipt)
+        self.assertEqual(receipt["provisional_output_frames"], 598)
+        self.assertEqual(receipt["admitted_output_frames"], 595)
+        self.assertEqual(receipt["intended_nonflat_provisional_range"], [168, 542])
+        self.assertEqual(receipt["intended_nonflat_admitted_range"], [165, 539])
+
     @staticmethod
     def _write_xml(directory, payload, name="g1.xml"):
         path = os.path.join(directory, name)

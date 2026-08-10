@@ -6,9 +6,12 @@ import os
 import struct
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
+from resources import build_g1_terrain_database as builder
+from resources.g1_terrain_builder import scenes as scenes_module
 from resources.g1_terrain_builder.artifacts import read_walkability
 from resources.g1_terrain_builder.scenes import (
     GRAIL_DEFAULT_BASE,
@@ -701,6 +704,45 @@ def fake_grail_clip(base):
 
 
 class GrailSceneTests(unittest.TestCase):
+    def test_authored_slope_scene_uses_exact_paired_surface_and_route(self):
+        constructor = getattr(
+            scenes_module, "authored_slope_scene_definition", None)
+        assemble = getattr(builder, "_assemble_authored_slope_source", None)
+        self.assertTrue(callable(constructor), "authored slope scene is missing")
+        self.assertTrue(callable(assemble), "authored slope source seam is missing")
+        if constructor is None or assemble is None:
+            return
+        name = "terrain_slopes__slope_000__000"
+        root = "/home/ubuntu/datasets/GRAIL/data/slope"
+        candidate = assemble(SimpleNamespace(
+            output_fps=60.0,
+            slope_robot=f"{root}/robot/{name}.pkl",
+            slope_usd=f"{root}/object_usd/{name}.usd",
+            slope_recon=f"{root}/recon/{name}.pkl",
+            slope_metadata=f"{root}/meta/{name}.pkl",
+            g1_xml=(
+                "/home/ubuntu/projects/mjx-diffphysics/env/g1/assets/"
+                "g1_29dof.xml"),
+        ))
+
+        scene = candidate.scene
+        self.assertEqual(scene.scene_id, "authored-slope")
+        self.assertIs(scene.surface, candidate.terrain)
+        self.assertEqual(scene.spawn_position[1], 0.0)
+        self.assertEqual(scene.routes[0].route_id, "authored-forward")
+        self.assertEqual(
+            scene.routes[0].waypoints_xz[0],
+            (float(candidate.admitted_clip.positions[0, 0, 0]),
+             float(candidate.admitted_clip.positions[0, 0, 2])),
+        )
+        self.assertEqual(scene.provenance["kind"], "authenticated-grail")
+        self.assertEqual(
+            scene.provenance["parameters"]["support_calibration_m"],
+            0.012000000104308128,
+        )
+        normalized = scenes_module._validate_definition(scene)
+        self.assertEqual(normalized["scene_id"], "authored-slope")
+
     def test_grail_scenes_union_old_route_envelope_with_six_metre_floor(self):
         clip = fake_grail_clip(GRAIL_DEFAULT_BASE)
         scene = grail_scene_definition(

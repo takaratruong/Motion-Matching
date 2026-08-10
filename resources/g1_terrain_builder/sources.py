@@ -1,5 +1,6 @@
 import os
 import hashlib
+import io
 import json
 import joblib
 import numpy as np
@@ -20,6 +21,10 @@ RETARGET_PROJECT_COMMIT = "fb3433a6310ab4198102d3905e74b73944fc1f6b"
 RETARGET_ALIASES = [["Spine1", "Spine2"]]
 PFNN_POSITION_SCALE = 5.6444
 _HEX_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+AUTHORED_SLOPE_NAME = "terrain_slopes__slope_000__000"
+AUTHORED_SLOPE_ROBOT_SHA256 = (
+    "b77480d5f8f3339a3064276d6f9d443ac3a3456f20eb9195d48add176e561ee1")
+AUTHORED_SLOPE_ROBOT_SIZE_BYTES = 198603
 
 
 def _sha256(path: str) -> str:
@@ -59,8 +64,7 @@ def load_takara(path: str, remap_path: str) -> SourceClip:
     return clip
 
 
-def load_grail(path: str) -> SourceClip:
-    records = joblib.load(path)
+def _grail_source_clip(records, path: str) -> SourceClip:
     if len(records) != 1:
         raise ValueError(f"{path}: expected one robot record, got {len(records)}")
     record = next(iter(records.values()))
@@ -76,6 +80,37 @@ def load_grail(path: str) -> SourceClip:
     name = os.path.splitext(os.path.basename(path))[0]
     clip = SourceClip(name, fps, qpos, np.arange(len(qpos)), name)
     clip.validate()
+    return clip
+
+
+def load_grail(path: str) -> SourceClip:
+    return _grail_source_clip(joblib.load(path), path)
+
+
+def load_authenticated_grail_slope(path: str) -> SourceClip:
+    try:
+        with open(path, "rb") as stream:
+            payload = stream.read(AUTHORED_SLOPE_ROBOT_SIZE_BYTES + 1)
+    except (OSError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"authored slope robot authentication failed: {error}") from error
+    digest = hashlib.sha256(payload).hexdigest()
+    if len(payload) != AUTHORED_SLOPE_ROBOT_SIZE_BYTES \
+            or digest != AUTHORED_SLOPE_ROBOT_SHA256:
+        raise ValueError("authored slope robot content SHA-256/size changed")
+    if os.path.splitext(os.path.basename(path))[0] != AUTHORED_SLOPE_NAME:
+        raise ValueError("authored slope robot basename changed")
+    clip = _grail_source_clip(joblib.load(io.BytesIO(payload)), path)
+    if clip.name != AUTHORED_SLOPE_NAME or clip.terrain_id != AUTHORED_SLOPE_NAME \
+            or clip.fps != 25.0 or clip.qpos.shape != (250, 36) \
+            or not np.array_equal(
+                clip.source_frames, np.arange(250, dtype=np.int32)):
+        raise ValueError("authored slope robot identity/rate/frame count changed")
+    clip.provenance = {
+        "path": os.path.abspath(path),
+        "sha256": digest,
+        "size_bytes": len(payload),
+    }
     return clip
 
 

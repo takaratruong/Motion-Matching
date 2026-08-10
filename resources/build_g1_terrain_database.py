@@ -2,10 +2,12 @@
 """Build the versioned G1 motion-matching terrain artifact set."""
 
 import argparse
+from dataclasses import dataclass
 import glob
 import hashlib
 import json
 import os
+import pickle
 import subprocess
 import sys
 
@@ -44,10 +46,13 @@ from resources.g1_terrain_builder.features import (
 from resources.g1_terrain_builder.scenes import (
     REQUIRED_SCENE_IDS,
     all_scene_definitions,
+    authored_slope_scene_definition,
     build_scene_pack,
     select_grail_scene_bases,
 )
 from resources.g1_terrain_builder.sources import (
+    AUTHORED_SLOPE_NAME,
+    load_authenticated_grail_slope,
     load_grail,
     load_retarget_npz,
     load_takara,
@@ -55,6 +60,7 @@ from resources.g1_terrain_builder.sources import (
 from resources.g1_terrain_builder.resample import resample_map, resample_vectors
 from resources.g1_terrain_builder.schema import (
     G1_SKELETON_SIGNATURE,
+    HoldenClip,
     SourceClip,
     require_canonical_g1_skeleton,
 )
@@ -95,6 +101,35 @@ CANONICAL_FLAT_KINEMATICS_MODEL = {
     "sha256": "749209c06a5c0023deb27f728420028b62b1f3092a22e24920183c1a897e4376",
     "size_bytes": 26914,
 }
+AUTHORED_SLOPE_SUPPORT_CALIBRATION_M = 0.012000000104308128
+AUTHORED_SLOPE_INPUTS = {
+    "usd": {
+        "sha256":
+            "8d1e696fb5bd2aecfa17797549bddd001093b060773cb313185a6a46db7eb5a5",
+        "size_bytes": 6656,
+    },
+    "reconstruction": {
+        "sha256":
+            "d05d6c5a7d6a13eff7e69da0e9e96ab5a79f700bb706611699f0b9c44c9b51ec",
+        "size_bytes": 411476,
+    },
+    "metadata": {
+        "sha256":
+            "7d88be608419afd2be127e4ac4c5a8aa1b4863fdf84e86c5ec93356881ee861d",
+        "size_bytes": 85,
+    },
+}
+
+
+@dataclass(frozen=True)
+class AuthoredSlopeSourceCandidate:
+    source: SourceClip
+    provisional_clip: HoldenClip
+    admitted_clip: HoldenClip
+    skeleton: object
+    terrain: GrailTerrain
+    scene: object
+    receipt: dict
 
 
 def _odd_frame_count(seconds: float, fps: float) -> int:
@@ -160,6 +195,22 @@ def _read_canonical_flat_g1_xml(path: str) -> bytes:
             != CANONICAL_FLAT_KINEMATICS_MODEL["sha256"]:
         raise ValueError(
             "canonical G1 XML content SHA-256/size changed")
+    return payload
+
+
+def _read_authored_slope_input(path: str, kind: str) -> bytes:
+    descriptor = AUTHORED_SLOPE_INPUTS[kind]
+    _require_file(path, f"authored slope {kind}")
+    try:
+        with open(path, "rb") as stream:
+            payload = stream.read(descriptor["size_bytes"] + 1)
+    except (OSError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"authored slope {kind} authentication failed: {error}") from error
+    if len(payload) != descriptor["size_bytes"] \
+            or hashlib.sha256(payload).hexdigest() != descriptor["sha256"]:
+        raise ValueError(
+            f"authored slope {kind} content SHA-256/size changed")
     return payload
 
 
@@ -382,6 +433,203 @@ def _flat_source_fragment(source, first_source_frame, last_source_frame):
     )
     fragment.validate()
     return fragment
+
+
+def _slice_holden_clip(clip: HoldenClip, start: int) -> HoldenClip:
+    sliced = HoldenClip(
+        clip.name,
+        np.array(clip.positions[start:], np.float32, copy=True),
+        np.zeros_like(clip.positions[start:], np.float32),
+        np.array(clip.rotations[start:], np.float32, copy=True),
+        np.zeros_like(clip.positions[start:], np.float32),
+        np.zeros((len(clip.positions) - start, 2), np.uint8),
+        np.zeros((len(clip.positions) - start, 4), np.float32),
+        np.zeros((len(clip.positions) - start, 3), np.float32),
+        np.array(clip.source_frames[start:], copy=True),
+        clip.terrain_id,
+        np.array(clip.source_left_indices[start:], np.int32, copy=True),
+        np.array(clip.source_right_indices[start:], np.int32, copy=True),
+        np.array(clip.source_alpha[start:], np.float32, copy=True),
+    )
+    sliced.validate()
+    return sliced
+
+
+def _finalize_authored_slope_clip(clip, terrain, skeleton, output_fps):
+    gp, gq = forward_kinematics_arrays(
+        clip.positions, clip.rotations, skeleton.parents)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        clip.velocities, clip.angular_velocities = derive_velocities(
+            clip.positions, clip.rotations, output_fps)
+    clip.contacts = derive_lmm_contacts(
+        clip.positions, clip.rotations, skeleton.parents,
+        skeleton.names.index("LeftToe"),
+        skeleton.names.index("RightToe"),
+        output_fps,
+    )
+    clip.terrain_support = sample_terrain_support(
+        gp, terrain,
+        skeleton.names.index("Simulation"),
+        skeleton.names.index("LeftToe"),
+        skeleton.names.index("RightToe"),
+    )
+    for frame in range(len(clip.positions)):
+        stop = min(frame + int(round(2.0 * output_fps)) + 1,
+                   len(clip.positions))
+        path = gp[frame:stop, 0][:, [0, 2]]
+        headings3 = holden_quat.mul_vec(
+            gq[frame:stop, 0],
+            np.array([0.0, 0.0, 1.0], np.float64))
+        centerline = build_facing_centerline(
+            path[0], headings3[:, [0, 2]], path)
+        clip.terrain_features[frame] = sample_terrain_features(
+            terrain, centerline)
+    clip.validate()
+
+
+def _assemble_authored_slope_source(args):
+    if float(args.output_fps) != 60.0:
+        raise ValueError("authored slope source requires --output-fps 60")
+    for attribute, description in (
+        ("slope_robot", "robot"),
+        ("slope_usd", "USD"),
+        ("slope_recon", "reconstruction"),
+        ("slope_metadata", "metadata"),
+        ("g1_xml", "G1 XML"),
+    ):
+        path = getattr(args, attribute, None)
+        if not path:
+            raise ValueError(f"authored slope source requires --{attribute.replace('_', '-')}")
+        _require_file(path, f"authored slope {description}")
+
+    source = load_authenticated_grail_slope(args.slope_robot)
+    usd_bytes = _read_authored_slope_input(args.slope_usd, "usd")
+    reconstruction_bytes = _read_authored_slope_input(
+        args.slope_recon, "reconstruction")
+    metadata_bytes = _read_authored_slope_input(
+        args.slope_metadata, "metadata")
+    metadata = pickle.loads(metadata_bytes)
+    if type(metadata) is not dict \
+            or type(metadata.get("scene_scale")) is not float \
+            or metadata["scene_scale"] != 1.0:
+        raise ValueError("authored slope metadata scene_scale changed")
+
+    terrain = GrailTerrain.from_authenticated_bytes(
+        usd_bytes, reconstruction_bytes,
+        usd_source=os.path.abspath(args.slope_usd),
+        reconstruction_source=os.path.abspath(args.slope_recon),
+        support_calibration_m=AUTHORED_SLOPE_SUPPORT_CALIBRATION_M,
+    )
+    if terrain.exterior_height != -AUTHORED_SLOPE_SUPPORT_CALIBRATION_M:
+        raise ValueError("authored slope exterior-flat calibration changed")
+
+    xml_bytes = _read_canonical_flat_g1_xml(args.g1_xml)
+    kinematics = G1Kinematics.from_xml_bytes(
+        xml_bytes, load_mujoco_xml_assets(args.g1_xml))
+    provisional, skeleton, report = convert_source_clip(
+        source, kinematics, target_fps=60.0)
+    provisional.validate()
+    require_canonical_g1_skeleton(skeleton, "authored slope skeleton")
+    if len(provisional.positions) != 598:
+        raise ValueError("authored slope provisional frame count changed")
+    if np.any(provisional.positions[:, 0, 1] != 0.0):
+        raise ValueError("authored slope Simulation is not planar")
+
+    # The exact composed-MuJoCo preflight rejects provisional [0,3). Slice
+    # before computing derivatives, contacts, support, or terrain features.
+    admitted = _slice_holden_clip(provisional, 3)
+    _finalize_authored_slope_clip(admitted, terrain, skeleton, 60.0)
+    if len(admitted.positions) != 595:
+        raise ValueError("authored slope admitted frame count changed")
+    expected_minimum = np.array(
+        [-0.054865, -0.096942, -0.127296, -0.127296])
+    expected_maximum = np.array(
+        [0.053704, 0.095061, 0.127046, 0.127235])
+    expected_std = np.array(
+        [0.026962, 0.045899, 0.056156, 0.065241])
+    feature64 = admitted.terrain_features.astype(np.float64)
+    observed_feature_stats = (
+        np.min(feature64, axis=0),
+        np.max(feature64, axis=0),
+        np.std(feature64, axis=0),
+    )
+    for label, observed, expected in zip(
+        ("minimum", "maximum", "standard deviation"),
+        observed_feature_stats,
+        (expected_minimum, expected_maximum, expected_std),
+    ):
+        if not np.allclose(observed, expected, rtol=0.0, atol=5e-7):
+            raise ValueError(
+                f"authored slope terrain feature {label} changed: {observed}")
+    if not np.all(np.any(
+        admitted.terrain_features[165:539] != 0.0, axis=1)):
+        raise ValueError("authored slope intended nonflat exposure changed")
+
+    reconstructed = terrain.source_to_runtime(terrain.source_vertices)
+    recovered = terrain.runtime_to_source(reconstructed)
+    round_trip_error = float(np.max(np.linalg.norm(
+        recovered - terrain.source_vertices, axis=1)))
+    if round_trip_error > 1e-9:
+        raise ValueError(
+            f"authored slope inverse round trip changed: {round_trip_error} m")
+
+    source_span = (len(source.qpos) - 1) / source.fps
+    output_span = (len(provisional.positions) - 1) / 60.0
+    output_shortfall = source_span - output_span
+    if source_span != 9.96 or output_span != 9.95 \
+            or output_shortfall != 0.010000000000001563 \
+            or report["duration_error_s"] != output_shortfall:
+        raise ValueError("authored slope source/output span changed")
+    receipt = {
+        "schema": "g1-lmm-authored-slope-source/v1",
+        "status": "provisional",
+        "clip_id": AUTHORED_SLOPE_NAME,
+        "hashes": {
+            "robot_sha256": source.provenance["sha256"],
+            "usd_sha256": AUTHORED_SLOPE_INPUTS["usd"]["sha256"],
+            "reconstruction_sha256":
+                AUTHORED_SLOPE_INPUTS["reconstruction"]["sha256"],
+            "metadata_sha256": AUTHORED_SLOPE_INPUTS["metadata"]["sha256"],
+            "g1_xml_sha256": CANONICAL_FLAT_KINEMATICS_MODEL["sha256"],
+        },
+        "metadata": {"scene_scale": 1.0},
+        "source_fps": 25.0,
+        "target_fps": 60.0,
+        "source_frames": 250,
+        "provisional_output_frames": 598,
+        "admitted_output_frames": 595,
+        "source_span_s": source_span,
+        "output_span_s": output_span,
+        "output_shortfall_s": output_shortfall,
+        "rejected_output_ranges": [[0, 3]],
+        "admitted_output_range": [3, 598],
+        "intended_nonflat_provisional_range": [168, 542],
+        "intended_nonflat_admitted_range": [165, 539],
+        "interpolation": {
+            "left_source_index": provisional.source_left_indices.tolist(),
+            "right_source_index": provisional.source_right_indices.tolist(),
+            "source_alpha": provisional.source_alpha.tolist(),
+        },
+        "basis": "z-up-to-holden-shared-with-robot",
+        "object_rotation_binary32":
+            terrain.reconstruction_rotation.tolist(),
+        "object_translation_binary32":
+            terrain.reconstruction_translation.tolist(),
+        "inverse_round_trip_max_error_m": round_trip_error,
+        "exterior_policy": {
+            "source_height_m": 0.0,
+            "runtime_height_m": -AUTHORED_SLOPE_SUPPORT_CALIBRATION_M,
+            "gradient_xz": [0.0, 0.0],
+            "mesh_wins_inside": True,
+        },
+        "support_calibration_m": AUTHORED_SLOPE_SUPPORT_CALIBRATION_M,
+        "support_calibration_applied_to": "terrain-only",
+        "fk_max_error_m": report["fk_max_error_m"],
+        "quaternion_norm_max_error": report["quaternion_norm_max_error"],
+    }
+    scene = authored_slope_scene_definition(admitted, terrain, receipt)
+    return AuthoredSlopeSourceCandidate(
+        source, provisional, admitted, skeleton, terrain, scene, receipt)
 
 
 def _assemble_flat_candidate(args):

@@ -238,6 +238,7 @@ PLAYABLE_HALF_WIDTH = 3.0
 FLAT_SPAWN_LENGTH = 2.0
 LOOKAHEAD_MARGIN = 1.0
 GRAIL_DEFAULT_BASE = "terrain_curbs__curb_000__000"
+AUTHORED_SLOPE_BASE = "terrain_slopes__slope_000__000"
 GRAIL_TARGETS = (
     ("grail-curb-low", 0.12),
     ("grail-curb-medium", 0.24),
@@ -1084,6 +1085,71 @@ def grail_scene_definitions(measured_max_heights, clips_by_terrain):
     return tuple(definitions)
 
 
+def authored_slope_scene_definition(clip, terrain, receipt):
+    if clip.name != AUTHORED_SLOPE_BASE \
+            or clip.terrain_id != AUTHORED_SLOPE_BASE \
+            or len(clip.positions) != 595:
+        raise ValueError("authored-slope scene requires the admitted frozen clip")
+    if not isinstance(terrain, GrailTerrain) \
+            or terrain.support_calibration_m != 0.012000000104308128 \
+            or terrain.exterior_source_height_m != 0.0 \
+            or terrain.exterior_height != -0.012000000104308128:
+        raise ValueError("authored-slope scene requires the calibrated paired terrain")
+    if type(receipt) is not dict \
+            or receipt.get("schema") != "g1-lmm-authored-slope-source/v1" \
+            or receipt.get("rejected_output_ranges") != [[0, 3]]:
+        raise ValueError("authored-slope scene requires its provenance receipt")
+
+    path, route_points, spawn, yaw = _root_route_and_yaw(clip)
+    mesh_xmin, mesh_xmax, mesh_zmin, mesh_zmax = terrain.xz_bounds()
+    path_xmin, path_zmin = path.min(axis=0)
+    path_xmax, path_zmax = path.max(axis=0)
+    playable = (
+        float(path_xmin - COURSE_HALF_WIDTH),
+        float(path_xmax + COURSE_HALF_WIDTH),
+        float(path_zmin - COURSE_HALF_WIDTH),
+        float(path_zmax + COURSE_HALF_WIDTH),
+    )
+    bounds = (
+        float(min(mesh_xmin, playable[0]) - LOOKAHEAD_MARGIN),
+        float(max(mesh_xmax, playable[1]) + LOOKAHEAD_MARGIN),
+        float(min(mesh_zmin, playable[2]) - LOOKAHEAD_MARGIN),
+        float(max(mesh_zmax, playable[3]) + LOOKAHEAD_MARGIN),
+    )
+    classification = _walkability_classification_bounds(playable)
+
+    return SceneDefinition(
+        scene_id="authored-slope",
+        label="Authenticated GRAIL Authored Slope",
+        provenance={
+            "kind": "authenticated-grail",
+            "source_ids": [AUTHORED_SLOPE_BASE],
+            "parameters": {
+                "receipt_schema": receipt["schema"],
+                "route_source": "admitted-holden-simulation-path",
+                "surface_source": "authenticated-exact-mesh",
+                "exterior_policy": "explicit-flat-zero-before-calibration",
+                "support_calibration_m": 0.012000000104308128,
+            },
+        },
+        surface=terrain,
+        heightfield_bounds_xz=bounds,
+        playable_bounds_xz=playable,
+        lookahead_bounds_xz=bounds,
+        spawn_position=spawn,
+        spawn_yaw_radians=yaw,
+        regions={
+            "certified": (_region("authored-route", playable),),
+            "stress": (),
+            "blocked": (),
+        },
+        routes=(SceneRoute(
+            "authored-forward", route_points, "traverse", 1, 0.0),),
+        walkability=lambda x, z: (
+            1 if _bounds_contains(classification, x, z) else 0),
+    )
+
+
 def all_scene_definitions(measured_max_heights, clips_by_terrain):
     definitions = grail_scene_definitions(
         measured_max_heights, clips_by_terrain) \
@@ -1262,8 +1328,11 @@ def _validate_definition(definition):
             or set(definition.provenance) != {
                 "kind", "source_ids", "parameters"}:
         raise ValueError("scene provenance fields are not locked")
-    if definition.provenance["kind"] not in ("grail", "procedural"):
-        raise ValueError("scene provenance kind must be grail or procedural")
+    if definition.provenance["kind"] not in (
+        "grail", "procedural", "authenticated-grail",
+    ):
+        raise ValueError(
+            "scene provenance kind must be grail, procedural, or authenticated-grail")
     source_ids = definition.provenance["source_ids"]
     parameters = definition.provenance["parameters"]
     if not isinstance(source_ids, (tuple, list)) \
@@ -1272,7 +1341,9 @@ def _validate_definition(definition):
         raise ValueError("scene provenance values are invalid")
     if (definition.provenance["kind"] == "procedural" and source_ids) \
             or (definition.provenance["kind"] == "grail"
-                and len(source_ids) != 2):
+                and len(source_ids) != 2) \
+            or (definition.provenance["kind"] == "authenticated-grail"
+                and source_ids != [AUTHORED_SLOPE_BASE]):
         raise ValueError("scene provenance source IDs do not match kind")
     provenance = json.loads(canonical_json_bytes(definition.provenance))
 

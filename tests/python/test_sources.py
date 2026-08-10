@@ -7,6 +7,7 @@ import tempfile
 import unittest
 import numpy as np
 
+from resources.g1_terrain_builder import sources
 from resources.g1_terrain_builder.sources import (
     load_grail,
     load_retarget_npz,
@@ -26,9 +27,47 @@ STALE_RETARGET = os.path.join(
     RETARGET_ROOT, "LocomotionFlat01_000-120hz.npz")
 STALE_RECEIPT = os.path.join(
     RETARGET_ROOT, "LocomotionFlat01_000-120hz.receipt.json")
+AUTHORED_SLOPE_ROBOT = (
+    "/home/ubuntu/datasets/GRAIL/data/slope/robot/"
+    "terrain_slopes__slope_000__000.pkl")
+AUTHORED_SLOPE_SHA256 = (
+    "b77480d5f8f3339a3064276d6f9d443ac3a3456f20eb9195d48add176e561ee1")
 
 
 class SourceTests(unittest.TestCase):
+    def test_authored_slope_loader_authenticates_exact_robot_bytes(self):
+        loader = getattr(sources, "load_authenticated_grail_slope", None)
+        self.assertTrue(callable(loader), "authenticated slope loader is missing")
+        if loader is None:
+            return
+
+        clip = loader(AUTHORED_SLOPE_ROBOT)
+
+        self.assertEqual(clip.name, "terrain_slopes__slope_000__000")
+        self.assertEqual(clip.terrain_id, clip.name)
+        self.assertEqual(clip.qpos.shape, (250, 36))
+        self.assertEqual(clip.fps, 25.0)
+        np.testing.assert_array_equal(
+            clip.source_frames, np.arange(250, dtype=np.int32))
+        self.assertEqual(clip.provenance["sha256"], AUTHORED_SLOPE_SHA256)
+        self.assertEqual(clip.provenance["size_bytes"], 198603)
+
+    def test_authored_slope_loader_rejects_tampered_robot_bytes(self):
+        loader = getattr(sources, "load_authenticated_grail_slope", None)
+        self.assertTrue(callable(loader), "authenticated slope loader is missing")
+        if loader is None:
+            return
+        with open(AUTHORED_SLOPE_ROBOT, "rb") as stream:
+            payload = bytearray(stream.read())
+        payload[-1] ^= 1
+        with tempfile.TemporaryDirectory() as temporary:
+            path = os.path.join(
+                temporary, "terrain_slopes__slope_000__000.pkl")
+            with open(path, "wb") as stream:
+                stream.write(payload)
+            with self.assertRaisesRegex(ValueError, "slope robot.*SHA-256"):
+                loader(path)
+
     def test_current_walk_only_retarget_authenticates_exact_receipt(self):
         clip = load_retarget_npz(CURRENT_RETARGET, CURRENT_RECEIPT)
 
