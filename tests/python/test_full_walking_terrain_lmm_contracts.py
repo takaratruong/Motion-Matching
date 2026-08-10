@@ -69,6 +69,8 @@ def _artifacts() -> ArtifactSet:
     positions = np.zeros((rows, 31, 3), dtype="<f4")
     rotations = np.zeros((rows, 31, 4), dtype="<f4")
     rotations[..., 0] = 1.0
+    terrain_features = np.arange(rows * 4, dtype="<f4").reshape(rows, 4) + 0.25
+    terrain_support = np.arange(rows * 3, dtype="<f4").reshape(rows, 3) - 1.5
     return ArtifactSet(
         positions=positions,
         velocities=np.zeros_like(positions),
@@ -78,8 +80,8 @@ def _artifacts() -> ArtifactSet:
         range_starts=np.asarray([0, 2], dtype="<i4"),
         range_stops=np.asarray([2, 4], dtype="<i4"),
         contacts=np.zeros((rows, 2), dtype=np.uint8),
-        terrain_features=np.zeros((rows, 4), dtype="<f4"),
-        terrain_support=np.zeros((rows, 3), dtype="<f4"),
+        terrain_features=terrain_features,
+        terrain_support=terrain_support,
     )
 
 
@@ -176,12 +178,8 @@ class FullWalkingTerrainLmmContractTests(unittest.TestCase):
         )
         inventory = _inventory(sources)
 
-        first = build_split_ledger(
-            inventory, build_id=inventory.build_id, seed=17
-        )
-        second = build_split_ledger(
-            inventory, build_id=inventory.build_id, seed=17
-        )
+        first = build_split_ledger(inventory, build_id=inventory.build_id, seed=17)
+        second = build_split_ledger(inventory, build_id=inventory.build_id, seed=17)
 
         self.assertEqual(first, second)
         self.assertEqual(first.inventory_manifest_sha256, inventory.manifest_sha256)
@@ -213,9 +211,7 @@ class FullWalkingTerrainLmmContractTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "curb.*validation.*test"):
             inventory = _inventory(sources)
-            build_split_ledger(
-                inventory, build_id=inventory.build_id, seed=17
-            )
+            build_split_ledger(inventory, build_id=inventory.build_id, seed=17)
 
     def test_split_ledger_builder_rejects_unauthenticated_inventory(self):
         inventory, _ = _lane_authorities()
@@ -257,11 +253,12 @@ class FullWalkingTerrainLmmContractTests(unittest.TestCase):
         )
         forged = replace(
             provisional,
-            manifest_sha256=hashlib.sha256(
-                split_ledger_bytes(provisional)
-            ).hexdigest(),
+            manifest_sha256=hashlib.sha256(split_ledger_bytes(provisional)).hexdigest(),
         )
-        lane = replace(_lane(inventory, ledger), split_ledger_manifest_sha256=forged.manifest_sha256)
+        lane = replace(
+            _lane(inventory, ledger),
+            split_ledger_manifest_sha256=forged.manifest_sha256,
+        )
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "lane"
             publish_lane_exclusive(lane, output)
@@ -280,18 +277,18 @@ class FullWalkingTerrainLmmContractTests(unittest.TestCase):
             publish_lane_exclusive(_lane(inventory, ledger), second)
 
             first_members = {
-                path.relative_to(first): path.read_bytes()
-                for path in first.iterdir()
+                path.relative_to(first): path.read_bytes() for path in first.iterdir()
             }
             second_members = {
-                path.relative_to(second): path.read_bytes()
-                for path in second.iterdir()
+                path.relative_to(second): path.read_bytes() for path in second.iterdir()
             }
             self.assertEqual(first_members, second_members)
             self.assertEqual(
                 set(first_members),
                 {
                     Path("database.bin"),
+                    Path("terrain_features.npy"),
+                    Path("terrain_support.npy"),
                     Path("terrain_grid.npy"),
                     Path("source_ids.json"),
                     Path("source_left_indices.npy"),
@@ -327,7 +324,9 @@ class FullWalkingTerrainLmmContractTests(unittest.TestCase):
     def test_lane_loader_rejects_schema_keys_and_member_tampering(self):
         inventory, ledger = _lane_authorities()
         mutations = {
-            "schema": lambda value: value.__setitem__("schema", "wrong/v1"),
+            "v1 schema": lambda value: value.__setitem__(
+                "schema", "g1-full-walking-terrain-lmm-lane/v1"
+            ),
             "extra key": lambda value: value.__setitem__("unexpected", True),
         }
         for label, mutate in mutations.items():
@@ -342,8 +341,17 @@ class FullWalkingTerrainLmmContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "schema|keys"):
                     load_lane(output, inventory=inventory, split_ledger=ledger)
 
-        for member in ("database.bin", "source_ids.json", "source_alpha.npy"):
-            with self.subTest(member=member), tempfile.TemporaryDirectory() as directory:
+        for member in (
+            "database.bin",
+            "terrain_features.npy",
+            "terrain_support.npy",
+            "source_ids.json",
+            "source_alpha.npy",
+        ):
+            with (
+                self.subTest(member=member),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 output = Path(directory) / "lane"
                 publish_lane_exclusive(_lane(inventory, ledger), output)
                 with (output / member).open("ab") as stream:
@@ -356,7 +364,9 @@ class FullWalkingTerrainLmmContractTests(unittest.TestCase):
         lane = _lane(inventory, ledger)
         invalid = (
             replace(lane, source_right_indices=np.asarray([0, 2, 0, 1], dtype="<i4")),
-            replace(lane, source_alpha=np.asarray([0.0, np.nan, 0.0, 0.5], dtype="<f4")),
+            replace(
+                lane, source_alpha=np.asarray([0.0, np.nan, 0.0, 0.5], dtype="<f4")
+            ),
             replace(lane, source_ids=("a",)),
         )
         for changed in invalid:
@@ -395,14 +405,30 @@ class FullWalkingTerrainLmmContractTests(unittest.TestCase):
             )
 
             self.assertEqual(loaded.manifest_sha256, digest)
-            self.assertEqual(loaded.inventory_manifest_sha256, inventory.manifest_sha256)
-            self.assertEqual(loaded.split_ledger_manifest_sha256, ledger.manifest_sha256)
+            self.assertEqual(
+                loaded.inventory_manifest_sha256, inventory.manifest_sha256
+            )
+            self.assertEqual(
+                loaded.split_ledger_manifest_sha256, ledger.manifest_sha256
+            )
             self.assertEqual(loaded.ranges, lane.ranges)
             self.assertEqual(loaded.source_ids, lane.source_ids)
-            np.testing.assert_array_equal(loaded.source_left_indices, lane.source_left_indices)
-            np.testing.assert_array_equal(loaded.source_right_indices, lane.source_right_indices)
+            np.testing.assert_array_equal(
+                loaded.source_left_indices, lane.source_left_indices
+            )
+            np.testing.assert_array_equal(
+                loaded.source_right_indices, lane.source_right_indices
+            )
             np.testing.assert_array_equal(loaded.source_alpha, lane.source_alpha)
             np.testing.assert_array_equal(loaded.terrain_grid, lane.terrain_grid)
+            np.testing.assert_array_equal(
+                loaded.artifacts.terrain_features, lane.artifacts.terrain_features
+            )
+            np.testing.assert_array_equal(
+                loaded.artifacts.terrain_support, lane.artifacts.terrain_support
+            )
+            self.assertGreater(np.count_nonzero(loaded.artifacts.terrain_features), 0)
+            self.assertGreater(np.count_nonzero(loaded.artifacts.terrain_support), 0)
             with self.assertRaisesRegex(ValueError, "manifest SHA-256"):
                 load_lane(
                     output,
