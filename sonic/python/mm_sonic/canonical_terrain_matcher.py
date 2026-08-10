@@ -410,6 +410,44 @@ def load_canonical_terrain_library(
     )
 
 
+def merge_canonical_terrain_libraries(
+    *libraries: CanonicalTerrainLibrary,
+) -> CanonicalTerrainLibrary:
+    """Combine already loaded corpora without republishing their artifacts."""
+
+    if not libraries:
+        raise ContractError("at least one canonical terrain library is required")
+    clip_ids = tuple(
+        clip_id for library in libraries for clip_id in library.clip_ids
+    )
+    if len(set(clip_ids)) != len(clip_ids):
+        raise ContractError("canonical terrain libraries contain duplicate clip ids")
+    layout = libraries[0].folder.layout
+    if any(library.folder.layout != layout for library in libraries[1:]):
+        raise ContractError("canonical terrain libraries use different layouts")
+    digest = hashlib.sha256()
+    for library in libraries:
+        digest.update(library.folder.inventory_sha256.encode("ascii"))
+    return CanonicalTerrainLibrary(
+        corpus_root=libraries[0].corpus_root,
+        clip_ids=clip_ids,
+        canonical_clips=tuple(
+            clip for library in libraries for clip in library.canonical_clips
+        ),
+        height_fields=tuple(
+            field for library in libraries for field in library.height_fields
+        ),
+        folder=MotionFolder(
+            root=libraries[0].folder.root,
+            layout=layout,
+            clips=tuple(
+                clip for library in libraries for clip in library.folder.clips
+            ),
+            inventory_sha256=digest.hexdigest(),
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class TerrainRowFeatures:
     future_foot_local_xy: torch.Tensor

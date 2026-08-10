@@ -2628,3 +2628,13 @@ This tranche supplies natural forward and exact backward/rear-diagonal rough,
 curb, and slope motion, but it does not pretend to solve genuine lateral or
 50-degree terrain gait; those spatial cases still require admitted natural
 stair phrases from the continuing source screen.
+
+The gold manifest now has a direct canonical-corpus packaging path for the
+existing terrain-conditioned motion matcher.  Each paired USD is converted to
+a canonical mesh, the exact G1 body transforms are reconstructed from the
+serialized pose, authored stance/support labels are retained, and the local
+velocity/facing commands are carried into `CommandTrack`.  A two-clip canary
+loads and merges successfully with a MotionBricks flat library in memory.  The
+gold corpus is deliberately standalone: an initial overlay attempt was stopped
+because republishing it re-hashed and copied all 1,180 base clips.  Runtime
+library merge gives the same searchable clips without that unrelated I/O tax.
