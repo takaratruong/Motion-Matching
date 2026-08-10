@@ -132,3 +132,27 @@ def build_matching_features(
     if not np.isfinite(raw).all():
         raise ValueError("raw matching features must be finite")
     return _normalize(raw)
+
+
+def build_lmm_terrain_features(artifacts: ArtifactSet) -> FeatureSet:
+    """Build the frozen two-range authored-slope canary feature table."""
+
+    if not isinstance(artifacts, ArtifactSet):
+        raise TypeError("terrain LMM artifacts must be an ArtifactSet")
+    artifacts.validate()
+    if len(artifacts.positions) != 851 \
+            or artifacts.positions.shape[1] != 31 \
+            or not np.array_equal(
+                artifacts.range_starts, np.array([0, 256], np.int32)) \
+            or not np.array_equal(
+                artifacts.range_stops, np.array([256, 851], np.int32)):
+        raise ValueError(
+            "terrain LMM database ranges must be [0,256) and [256,851)")
+    result = build_matching_features(
+        artifacts, fps=60.0, horizons=(20, 40, 60))
+    terrain_scale = result.scale[27:31]
+    if not np.all(np.isfinite(terrain_scale)) \
+            or np.any(terrain_scale <= 0.0) \
+            or np.any(terrain_scale >= _DISABLED_SCALE):
+        raise ValueError("terrain LMM normalization must keep all terrain inputs active")
+    return result

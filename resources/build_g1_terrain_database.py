@@ -10,6 +10,7 @@ import os
 import pickle
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -20,8 +21,13 @@ if REPOSITORY_ROOT not in sys.path:
 
 from resources import quat as holden_quat
 from resources.g1_terrain_builder.artifacts import (
+    _authenticate_flat_manifest_inputs,
+    canonical_json_bytes,
     publish_artifacts,
     publish_flat_artifacts,
+    publish_lmm_terrain_artifacts,
+    read_features,
+    sha256_file,
 )
 from resources.g1_terrain_builder.database import (
     ContactConfig,
@@ -30,7 +36,10 @@ from resources.g1_terrain_builder.database import (
     derive_lmm_contacts,
     derive_velocities,
     forward_kinematics_arrays,
+    read_holden_database,
+    refresh_lmm_clip_dynamics,
     sample_terrain_support,
+    slice_holden_clip,
 )
 from resources.g1_terrain_builder.kinematics import (
     G1Kinematics,
@@ -41,17 +50,23 @@ from resources.g1_terrain_builder.kinematics import (
 from resources.g1_terrain_builder.features import (
     FEATURE_NAMES,
     FEATURE_WEIGHTS,
+    build_lmm_terrain_features,
     build_matching_features,
 )
 from resources.g1_terrain_builder.scenes import (
+    BuiltScene,
     REQUIRED_SCENE_IDS,
+    ScenePack,
     all_scene_definitions,
     authored_slope_scene_definition,
+    build_scene,
     build_scene_pack,
     select_grail_scene_bases,
 )
 from resources.g1_terrain_builder.sources import (
     AUTHORED_SLOPE_NAME,
+    AUTHORED_SLOPE_ROBOT_SHA256,
+    AUTHORED_SLOPE_ROBOT_SIZE_BYTES,
     load_authenticated_grail_slope,
     load_grail,
     load_retarget_npz,
@@ -59,8 +74,11 @@ from resources.g1_terrain_builder.sources import (
 )
 from resources.g1_terrain_builder.resample import resample_map, resample_vectors
 from resources.g1_terrain_builder.schema import (
+    G1_SKELETON_NAMES,
+    G1_SKELETON_PARENTS,
     G1_SKELETON_SIGNATURE,
     HoldenClip,
+    SkeletonSpec,
     SourceClip,
     require_canonical_g1_skeleton,
 )
@@ -137,6 +155,10 @@ AUTHORED_SLOPE_FEATURE_STD = (
     0.05615584307619531,
     0.06524118885644932,
 )
+LMM_TERRAIN_SCHEMA = "g1-lmm-terrain-data/v1"
+CANONICAL_FLAT_DATA_MANIFEST_SHA256 = (
+    "5b5c48ccbb1dbabdbf87842d8b033c15b307199d72a8d90e4e39208ba5382db1"
+)
 
 
 @dataclass(frozen=True)
@@ -145,6 +167,15 @@ class AuthoredSlopeSourceCandidate:
     terrain: GrailTerrain
     scene: object
     provenance: dict
+
+
+@dataclass(frozen=True)
+class LMMTerrainCandidate:
+    artifacts: object
+    features: object
+    manifest_base: dict
+    validation: dict
+    scene_pack: ScenePack
 
 
 def _odd_frame_count(seconds: float, fps: float) -> int:
@@ -877,6 +908,432 @@ def _assemble_flat_candidate(args):
     return artifacts, features, manifest_base
 
 
+def _require_flat_data_v3(flat_data, g1_xml):
+    flat_data = os.path.abspath(os.fspath(flat_data))
+    manifest_path = os.path.join(flat_data, "manifest.json")
+    _require_file(manifest_path, "accepted flat-v3 manifest")
+    with open(manifest_path, "rb") as stream:
+        manifest_bytes = stream.read()
+    if hashlib.sha256(manifest_bytes).hexdigest() \
+            != CANONICAL_FLAT_DATA_MANIFEST_SHA256:
+        raise ValueError("accepted flat-v3 manifest SHA-256 changed")
+    try:
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("accepted flat-v3 manifest is invalid") from error
+    if canonical_json_bytes(manifest) != manifest_bytes \
+            or manifest.get("schema") != "g1-lmm-flat-data/v3" \
+            or manifest.get("status") != "accepted":
+        raise ValueError("accepted flat-v3 manifest schema/status changed")
+    _authenticate_flat_manifest_inputs(manifest)
+    artifact_descriptors = manifest.get("artifacts")
+    if type(artifact_descriptors) is not dict \
+            or set(artifact_descriptors) != {"database.bin", "features.bin"}:
+        raise ValueError("accepted flat-v3 artifact descriptors changed")
+    for name in ("database.bin", "features.bin"):
+        descriptor = artifact_descriptors[name]
+        path = os.path.join(flat_data, name)
+        _require_file(path, f"accepted flat-v3 {name}")
+        node = os.stat(path)
+        if type(descriptor) is not dict \
+                or descriptor != {
+                    "path": name,
+                    "size_bytes": node.st_size,
+                    "sha256": sha256_file(path),
+                }:
+            raise ValueError(f"accepted flat-v3 {name} descriptor changed")
+
+    source = manifest["sources"][0]
+    rebuilt_artifacts, rebuilt_features, rebuilt_base = \
+        _assemble_flat_candidate(SimpleNamespace(
+            output_fps=60.0,
+            retarget_npz=source["path"],
+            retarget_receipt=source["receipt_path"],
+            g1_xml=g1_xml,
+        ))
+    expected_base = dict(manifest)
+    del expected_base["status"]
+    del expected_base["artifacts"]
+    if canonical_json_bytes(rebuilt_base) != canonical_json_bytes(expected_base):
+        raise ValueError("independently rebuilt flat-v3 manifest changed")
+    loaded_artifacts = read_holden_database(
+        os.path.join(flat_data, "database.bin"))
+    loaded_features = read_features(os.path.join(flat_data, "features.bin"))
+    for field in (
+        "positions", "velocities", "rotations", "angular_velocities",
+        "parents", "range_starts", "range_stops", "contacts",
+    ):
+        if not np.array_equal(
+                getattr(rebuilt_artifacts, field),
+                getattr(loaded_artifacts, field)):
+            raise ValueError(f"independently rebuilt flat-v3 {field} changed")
+    for field in ("values", "offset", "scale"):
+        if not np.array_equal(
+                getattr(rebuilt_features, field), getattr(loaded_features, field)):
+            raise ValueError(
+                f"independently rebuilt flat-v3 feature {field} changed")
+    return flat_data, manifest, rebuilt_artifacts, rebuilt_features, rebuilt_base
+
+
+def _flat_artifact_clip(artifacts, flat_manifest):
+    source = flat_manifest["sources"][0]
+    clip = HoldenClip(
+        "flat",
+        np.array(artifacts.positions, np.float32, copy=True),
+        np.array(artifacts.velocities, np.float32, copy=True),
+        np.array(artifacts.rotations, np.float32, copy=True),
+        np.array(artifacts.angular_velocities, np.float32, copy=True),
+        np.array(artifacts.contacts, np.uint8, copy=True),
+        np.array(artifacts.terrain_features, np.float32, copy=True),
+        np.array(artifacts.terrain_support, np.float32, copy=True),
+        np.array(source["left_source_index"], np.int32),
+        "flat",
+        np.array(source["left_source_index"], np.int32),
+        np.array(source["right_source_index"], np.int32),
+        np.array(source["source_alpha"], np.float32),
+    )
+    clip.validate()
+    return clip
+
+
+def _file_input_descriptor(path):
+    path = os.path.abspath(os.fspath(path))
+    _require_file(path, "terrain LMM input")
+    return {
+        "path": path,
+        "size_bytes": os.stat(path).st_size,
+        "sha256": sha256_file(path),
+    }
+
+
+def _preauthenticate_lmm_terrain_cli_inputs(args):
+    flat_manifest = os.path.join(
+        os.path.abspath(os.fspath(args.flat_data)), "manifest.json")
+    expected = (
+        (flat_manifest, None, CANONICAL_FLAT_DATA_MANIFEST_SHA256,
+         "flat-v3 manifest"),
+        (args.slope_robot, AUTHORED_SLOPE_ROBOT_SIZE_BYTES,
+         AUTHORED_SLOPE_ROBOT_SHA256, "slope robot"),
+        (args.slope_usd, AUTHORED_SLOPE_INPUTS["usd"]["size_bytes"],
+         AUTHORED_SLOPE_INPUTS["usd"]["sha256"], "slope USD"),
+        (args.slope_recon,
+         AUTHORED_SLOPE_INPUTS["reconstruction"]["size_bytes"],
+         AUTHORED_SLOPE_INPUTS["reconstruction"]["sha256"],
+         "slope reconstruction"),
+        (args.slope_metadata, AUTHORED_SLOPE_INPUTS["metadata"]["size_bytes"],
+         AUTHORED_SLOPE_INPUTS["metadata"]["sha256"], "slope metadata"),
+        (args.g1_xml, CANONICAL_FLAT_KINEMATICS_MODEL["size_bytes"],
+         CANONICAL_FLAT_KINEMATICS_MODEL["sha256"], "canonical G1 XML"),
+    )
+    for path, size, digest, label in expected:
+        _require_file(path, label)
+        node = os.stat(path)
+        if (size is not None and node.st_size != size) \
+                or sha256_file(path) != digest:
+            raise ValueError(f"{label} SHA-256/size changed")
+
+
+def _authored_query_counts(clip, skeleton, terrain):
+    gp, gq = forward_kinematics_arrays(
+        clip.positions, clip.rotations, skeleton.parents)
+
+    def count(points):
+        exact = sum(
+            bool(terrain.contains_projected_point(float(x), float(z)))
+            for x, z in np.asarray(points, np.float64))
+        return {"exact_mesh": exact, "flat_extension": len(points) - exact}
+
+    feature_points = []
+    for frame in range(len(gp)):
+        stop = min(frame + 121, len(gp))
+        path = gp[frame:stop, 0][:, [0, 2]]
+        headings3 = holden_quat.mul_vec(
+            gq[frame:stop, 0], np.array([0.0, 0.0, 1.0], np.float64))
+        centerline = build_facing_centerline(
+            path[0], headings3[:, [0, 2]], path)
+        feature_points.append(centerline[0])
+        for distance in TERRAIN_DISTANCES:
+            remaining = float(distance)
+            point = centerline[-1]
+            for start, end in zip(centerline, centerline[1:]):
+                length = float(np.linalg.norm(end - start))
+                if remaining <= length:
+                    point = start + (
+                        remaining / max(length, 1e-8)) * (end - start)
+                    break
+                remaining -= length
+            feature_points.append(point)
+    support_indices = [
+        skeleton.names.index(name)
+        for name in ("Simulation", "LeftToe", "RightToe")
+    ]
+    support_points = gp[:, support_indices][:, :, [0, 2]].reshape(-1, 2)
+    route_points = gp[:, 0][:, [0, 2]]
+    return {
+        "features": count(np.asarray(feature_points)),
+        "support": count(support_points),
+        "route": count(route_points),
+    }
+
+
+def _authored_scene_pack(scene_definition, terrain_object, receipt):
+    source = build_scene(scene_definition)
+    metadata = source.metadata
+    receipt_sha = hashlib.sha256(canonical_json_bytes(receipt)).hexdigest()
+    surface_signature = hashlib.sha256(
+        canonical_json_bytes(terrain_object)).hexdigest()
+    metadata["schema"] = "g1-lmm-terrain-scene/v1"
+    metadata["surface_signature"] = surface_signature
+    metadata["provenance"] = {
+        "kind": "authenticated-grail",
+        "source_ids": [AUTHORED_SLOPE_NAME],
+        "parameters": {
+            "receipt_schema": receipt["schema"],
+            "source_receipt_sha256": receipt_sha,
+            "route_source": "admitted-holden-simulation-path",
+            "surface_source": "authenticated-exact-mesh",
+            "exterior_policy": "explicit-flat-zero-before-calibration",
+            "support_calibration_m": AUTHORED_SLOPE_SUPPORT_CALIBRATION_M,
+            "support_calibration_applied_to": "terrain-only",
+        },
+    }
+    payloads = {
+        "heightfield": source.terrain_bin,
+        "mesh": source.terrain_obj,
+        "walkability": source.walkability_bin,
+    }
+    for name, payload in payloads.items():
+        metadata[name]["size_bytes"] = len(payload)
+    scene_json = canonical_json_bytes(metadata)
+    built = BuiltScene(
+        "authored-slope", scene_json, source.terrain_bin,
+        source.terrain_obj, source.walkability_bin)
+    index = {
+        "schema": "g1-lmm-terrain-scene-index/v1",
+        "default_scene_id": "authored-slope",
+        "scene_ids": ["authored-slope"],
+        "scenes": [{
+            "id": "authored-slope",
+            "path": "scenes/authored-slope/scene.json",
+            "schema": "g1-lmm-terrain-scene/v1",
+            "size_bytes": len(scene_json),
+            "sha256": hashlib.sha256(scene_json).hexdigest(),
+        }],
+        "coordinate_signature":
+            "holden-y-up-right-handed-forward-plus-z",
+        "surface_signature": surface_signature,
+    }
+    return ScenePack(canonical_json_bytes(index), (built,))
+
+
+def _assemble_lmm_terrain_candidate(args):
+    if float(getattr(args, "output_fps", 0.0)) != 60.0:
+        raise ValueError("authored-slope terrain bundle requires --output-fps 60")
+    for attribute in (
+        "flat_data", "slope_robot", "slope_usd", "slope_recon",
+        "slope_metadata", "g1_xml",
+    ):
+        if not getattr(args, attribute, None):
+            raise ValueError(
+                "authored-slope terrain bundle requires --"
+                + attribute.replace("_", "-"))
+
+    _preauthenticate_lmm_terrain_cli_inputs(args)
+
+    flat_data, flat_manifest, flat_artifacts, _flat_features, flat_base = \
+        _require_flat_data_v3(args.flat_data, args.g1_xml)
+    slope_candidate = _assemble_authored_slope_source(args)
+    skeleton = SkeletonSpec(
+        G1_SKELETON_NAMES, np.asarray(G1_SKELETON_PARENTS, np.int32))
+    require_canonical_g1_skeleton(skeleton, "terrain LMM skeleton")
+    flat_clip = refresh_lmm_clip_dynamics(
+        _flat_artifact_clip(flat_artifacts, flat_manifest), skeleton, 60.0)
+    slope_clip = refresh_lmm_clip_dynamics(
+        slice_holden_clip(slope_candidate.source, 3), skeleton, 60.0)
+    artifacts = combine_clips([flat_clip, slope_clip], skeleton)
+    features = build_lmm_terrain_features(artifacts)
+
+    receipt = json.loads(canonical_json_bytes(slope_candidate.provenance))
+    receipt_sha = hashlib.sha256(canonical_json_bytes(receipt)).hexdigest()
+    query_counts = _authored_query_counts(slope_clip, skeleton, slope_candidate.terrain)
+    terrain_object = {
+        "schema": "g1-lmm-authored-slope-surface/v1",
+        "feature_distances_m": list(TERRAIN_DISTANCES),
+        "source_receipt_sha256": receipt_sha,
+        "basis": "z-up-to-holden-shared-with-robot",
+        "support_calibration_m": AUTHORED_SLOPE_SUPPORT_CALIBRATION_M,
+        "support_calibration_applied_to": "terrain-only",
+        "exterior_policy": dict(receipt["exterior_policy"]),
+        "query_counts": query_counts,
+    }
+    scene_pack = _authored_scene_pack(
+        slope_candidate.scene, terrain_object, receipt)
+
+    flat_source = flat_manifest["sources"][0]
+    slope_map = receipt["interpolation"]
+    sources = [{
+        "name": "flat",
+        "terrain_id": "flat",
+        "range": {"start": 0, "stop": 256},
+        "source_fps": 120.0,
+        "source_frames": 512,
+        "output_frames": 256,
+        "source_map": {
+            "left_source_index": list(flat_source["left_source_index"]),
+            "right_source_index": list(flat_source["right_source_index"]),
+            "source_alpha": list(flat_source["source_alpha"]),
+        },
+    }, {
+        "name": AUTHORED_SLOPE_NAME,
+        "terrain_id": AUTHORED_SLOPE_NAME,
+        "range": {"start": 256, "stop": 851},
+        "source_fps": 25.0,
+        "source_frames": 250,
+        "output_frames": 595,
+        "source_map": {
+            "left_source_index": list(slope_map["left_source_index"][3:]),
+            "right_source_index": list(slope_map["right_source_index"][3:]),
+            "source_alpha": list(slope_map["source_alpha"][3:]),
+        },
+    }]
+    ranges = [
+        {"start": 0, "stop": 256, "source_index": 0},
+        {"start": 256, "stop": 851, "source_index": 1},
+    ]
+    range_digest = hashlib.sha256(canonical_json_bytes(ranges)).hexdigest()
+    source_map_digest = hashlib.sha256(canonical_json_bytes([
+        source["source_map"] for source in sources
+    ])).hexdigest()
+    raw_slope = load_authenticated_grail_slope(args.slope_robot)
+    native_steps = np.max(np.abs(np.diff(raw_slope.qpos[:, 7:], axis=0)), axis=1)
+    provisional_local_steps = _maximum_local_rotation_steps(
+        slope_candidate.source.rotations)
+    admitted_local_steps = _maximum_local_rotation_steps(slope_clip.rotations)
+    continuity = {
+        "schema": "g1-lmm-continuity/v1",
+        "threshold_rad_per_frame": 0.25,
+        "minimum_range_frames": 61,
+        "source_native_rejected_edge_count": int(np.sum(native_steps > 0.25)),
+        "database_local_rejected_edge_count": int(np.sum(
+            provisional_local_steps > 0.25)),
+        "union_rejected_edge_count": int(
+            np.sum(native_steps > 0.25) + np.sum(provisional_local_steps > 0.25)),
+        "dropped_fragment_count": 1,
+        "dropped_frame_count": 3,
+        "published_range_count": 2,
+        "published_frame_count": 851,
+        "maximum_admitted_native_step_rad": max(
+            float(flat_base["continuity"]["maximum_admitted_native_step_rad"]),
+            float(np.max(native_steps))),
+        "maximum_admitted_local_rotation_step_rad": max(
+            float(flat_base["continuity"]
+                  ["maximum_admitted_local_rotation_step_rad"]),
+            float(np.max(admitted_local_steps))),
+        "range_digest_sha256": range_digest,
+        "source_map_digest_sha256": source_map_digest,
+    }
+    temporal_partition = {
+        "boundary_row": 256,
+        "derivatives": "per-source",
+        "contacts": "per-source",
+        "feature_future": "clamp-at-range-stop",
+        "cross_range_operations": 0,
+    }
+    contact_observations = _flat_contact_receipt(
+        artifacts.contacts, artifacts.range_starts, artifacts.range_stops,
+        median_filter_frames=6)
+    feature_signature = _flat_feature_signature(
+        FEATURE_NAMES, (20, 40, 60), FEATURE_WEIGHTS,
+        features.offset, features.scale)
+    inputs = {
+        "flat_data": {
+            "path": flat_data,
+            "manifest_path": "manifest.json",
+            "schema": "g1-lmm-flat-data/v3",
+            "manifest_sha256": CANONICAL_FLAT_DATA_MANIFEST_SHA256,
+        },
+        "slope_robot": _file_input_descriptor(args.slope_robot),
+        "slope_usd": _file_input_descriptor(args.slope_usd),
+        "slope_recon": _file_input_descriptor(args.slope_recon),
+        "slope_metadata": _file_input_descriptor(args.slope_metadata),
+        "g1_xml": _file_input_descriptor(args.g1_xml),
+    }
+    manifest_base = {
+        "schema": LMM_TERRAIN_SCHEMA,
+        "output_fps": 60.0,
+        "database_frames": 851,
+        "source_count": 2,
+        "range_count": 2,
+        "trajectory_horizons": [20, 40, 60],
+        "dimensions": {
+            "bones": 31, "features": 31, "latent": 32, "contacts": 2,
+        },
+        "skeleton": {
+            "names": list(G1_SKELETON_NAMES),
+            "parents": list(G1_SKELETON_PARENTS),
+            "basis": "holden-y-up-right-handed-forward-plus-z",
+            "signature": G1_SKELETON_SIGNATURE,
+        },
+        "feature": {
+            "names": list(FEATURE_NAMES),
+            "weights": list(FEATURE_WEIGHTS),
+            "offset": features.offset.tolist(),
+            "scale": features.scale.tolist(),
+            "signature": feature_signature,
+            "terrain_indices": [27, 28, 29, 30],
+        },
+        "terrain": terrain_object,
+        "support": {
+            "schema": "G1SP/v1", "dimensions": 3,
+            "columns": [
+                "source_root_height_m", "source_left_toe_height_m",
+                "source_right_toe_height_m",
+            ],
+        },
+        "contact": {
+            "semantics": "bundled-orange-duck-global-toe-speed-only",
+            "speed_threshold": 0.15,
+            "median_filter_frames": 6,
+            "median_filter_mode": "nearest",
+            "observations": contact_observations,
+        },
+        "time_filters": dict(flat_manifest["time_filters"]),
+        "inputs": inputs,
+        "slope_source_receipt": receipt,
+        "sources": sources,
+        "ranges": ranges,
+        "continuity": continuity,
+        "temporal_partition": temporal_partition,
+    }
+    validation = {
+        "schema": "g1-lmm-terrain-data-validation/v1",
+        "database": {
+            "frames": 851, "bones": 31, "contacts": 2,
+            "ranges": [[0, 256], [256, 851]],
+        },
+        "features": {
+            "rows": 851, "dimensions": 31,
+            "terrain_indices": [27, 28, 29, 30],
+            "terrain_scale": features.scale[27:31].tolist(),
+        },
+        "sidecars": {
+            "terrain_features": {"rows": 851, "dimensions": 4},
+            "terrain_support": {
+                "rows": 851, "dimensions": 3,
+                "columns": list(manifest_base["support"]["columns"]),
+            },
+        },
+        "partition": dict(temporal_partition),
+        "inputs": {
+            "flat_manifest_sha256": CANONICAL_FLAT_DATA_MANIFEST_SHA256,
+            "slope_source_receipt_sha256": receipt_sha,
+            "g1_xml_sha256": CANONICAL_FLAT_KINEMATICS_MODEL["sha256"],
+        },
+    }
+    return LMMTerrainCandidate(
+        artifacts, features, manifest_base, validation, scene_pack)
+
+
 def _source_manifest_entry(source, clip, range_start: int) -> dict:
     output_frames = len(clip.positions)
     return {
@@ -1019,6 +1476,15 @@ def _assemble_candidate(args):
 
 
 def build_artifacts(args: argparse.Namespace) -> dict:
+    _validate_build_mode_args(args)
+    if getattr(args, "authored_slope_terrain", False):
+        candidate = _assemble_lmm_terrain_candidate(args)
+        # Task 3 adds the independent full-source validator. The Task 2
+        # publisher itself performs its complete staged validation three times.
+        return publish_lmm_terrain_artifacts(
+            args.output, candidate.artifacts, candidate.features,
+            candidate.manifest_base, candidate.validation,
+            candidate.scene_pack, lambda staging: None)
     if getattr(args, "flat_only", False):
         artifacts, features, manifest_base = _assemble_flat_candidate(args)
         return publish_flat_artifacts(
@@ -1031,14 +1497,53 @@ def build_artifacts(args: argparse.Namespace) -> dict:
         validate_candidate)
 
 
+def _validate_build_mode_args(args):
+    terrain_mode = bool(getattr(args, "authored_slope_terrain", False))
+    flat_mode = bool(getattr(args, "flat_only", False))
+    terrain_fields = (
+        "flat_data", "slope_robot", "slope_usd", "slope_recon",
+        "slope_metadata",
+    )
+    if terrain_mode:
+        for field in (*terrain_fields, "g1_xml"):
+            if not getattr(args, field, None):
+                raise ValueError(
+                    "authored-slope terrain mode requires --"
+                    + field.replace("_", "-"))
+        if getattr(args, "retarget_npz", None) \
+                or getattr(args, "retarget_receipt", None):
+            raise ValueError(
+                "authored-slope terrain mode rejects flat retarget options")
+        if getattr(args, "grail_limit", None) is not None \
+                or getattr(args, "grail_glob", DEFAULTS["grail_glob"]) \
+                != DEFAULTS["grail_glob"] \
+                or getattr(args, "takara", DEFAULTS["takara"]) \
+                != DEFAULTS["takara"] \
+                or getattr(args, "remap", DEFAULTS["remap"]) \
+                != DEFAULTS["remap"]:
+            raise ValueError(
+                "authored-slope terrain mode rejects general source options")
+        return
+    if any(getattr(args, field, None) for field in terrain_fields):
+        mode = "flat" if flat_mode else "general"
+        raise ValueError(f"{mode} mode rejects terrain-only options")
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Build validated Holden G1 terrain motion artifacts")
     parser.add_argument("--output", default=DEFAULTS["output"])
     parser.add_argument("--output-fps", type=float, default=OUTPUT_FPS)
-    parser.add_argument("--flat-only", action="store_true")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--flat-only", action="store_true")
+    modes.add_argument("--authored-slope-terrain", action="store_true")
     parser.add_argument("--retarget-npz")
     parser.add_argument("--retarget-receipt")
+    parser.add_argument("--flat-data")
+    parser.add_argument("--slope-robot")
+    parser.add_argument("--slope-usd")
+    parser.add_argument("--slope-recon")
+    parser.add_argument("--slope-metadata")
     parser.add_argument("--grail-glob", default=DEFAULTS["grail_glob"])
     parser.add_argument("--grail-limit", type=int)
     parser.add_argument("--g1-xml", default=DEFAULTS["g1_xml"])
@@ -1054,10 +1559,12 @@ def main(argv=None) -> int:
     except (OSError, TypeError, ValueError) as error:
         print(f"BUILD FAILED {args.output}: {error}", file=sys.stderr)
         return 1
-    scenes = 0 if args.flat_only else len(REQUIRED_SCENE_IDS)
+    scenes = 1 if args.authored_slope_terrain else (
+        0 if args.flat_only else len(REQUIRED_SCENE_IDS))
+    clips = manifest.get("total_clips", manifest.get("source_count"))
     print(
         f"BUILT {manifest['schema']} frames={manifest['database_frames']} "
-        f"clips={manifest['total_clips']} scenes={scenes} "
+        f"clips={clips} scenes={scenes} "
         f"output={args.output}")
     return 0
 

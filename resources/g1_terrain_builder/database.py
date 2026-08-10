@@ -211,6 +211,71 @@ def combine_clips(
     return artifacts
 
 
+def slice_holden_clip(
+    clip: HoldenClip, start: int, stop: int | None = None,
+) -> HoldenClip:
+    """Copy one non-empty half-open Holden clip range without recomputation."""
+
+    if not isinstance(clip, HoldenClip):
+        raise TypeError("clip must be a HoldenClip")
+    clip.validate()
+    frames = len(clip.positions)
+    if stop is None:
+        stop = frames
+    if any(
+        not isinstance(value, Integral)
+        or isinstance(value, (bool, np.bool_))
+        for value in (start, stop)
+    ) or not (0 <= int(start) < int(stop) <= frames):
+        raise ValueError("Holden clip slice must be a non-empty in-range interval")
+    start, stop = int(start), int(stop)
+    result = HoldenClip(
+        clip.name,
+        np.array(clip.positions[start:stop], np.float32, copy=True),
+        np.array(clip.velocities[start:stop], np.float32, copy=True),
+        np.array(clip.rotations[start:stop], np.float32, copy=True),
+        np.array(clip.angular_velocities[start:stop], np.float32, copy=True),
+        np.array(clip.contacts[start:stop], np.uint8, copy=True),
+        np.array(clip.terrain_features[start:stop], np.float32, copy=True),
+        np.array(clip.terrain_support[start:stop], np.float32, copy=True),
+        np.array(clip.source_frames[start:stop], copy=True),
+        clip.terrain_id,
+        np.array(clip.source_left_indices[start:stop], np.int32, copy=True),
+        np.array(clip.source_right_indices[start:stop], np.int32, copy=True),
+        np.array(clip.source_alpha[start:stop], np.float32, copy=True),
+    )
+    result.validate()
+    return result
+
+
+def refresh_lmm_clip_dynamics(
+    clip: HoldenClip, skeleton: SkeletonSpec, fps: float,
+) -> HoldenClip:
+    """Derive velocity/contact channels inside one continuity-safe clip."""
+
+    _validate_skeleton(skeleton)
+    _validate_clip(clip, len(skeleton.names))
+    fps = _validated_fps(fps, "LMM clip")
+    if fps != 60.0:
+        raise ValueError("LMM clip dynamics require exact 60 Hz motion")
+    try:
+        left = skeleton.names.index("LeftToe")
+        right = skeleton.names.index("RightToe")
+    except ValueError as error:
+        raise ValueError("LMM clip skeleton must contain LeftToe and RightToe") \
+            from error
+    result = slice_holden_clip(clip, 0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        result.velocities, result.angular_velocities = derive_velocities(
+            result.positions, result.rotations, fps)
+    result.contacts = derive_lmm_contacts(
+        result.positions, result.rotations, skeleton.parents,
+        left, right, fps,
+    )
+    result.validate()
+    return result
+
+
 def _write_array2(stream, array: np.ndarray, dtype: str) -> None:
     values = np.ascontiguousarray(array, dtype=np.dtype(dtype))
     if values.ndim < 2:

@@ -364,6 +364,47 @@ class VerticalTriangleSurface:
         ):
             array.setflags(write=False)
 
+    def contains_projected_point(self, x: float, z: float) -> bool:
+        """Return whether the closed vertical query hits an exact mesh face."""
+
+        x, z = float(x), float(z)
+        if not np.isfinite(x) or not np.isfinite(z):
+            raise ValueError("terrain query coordinates must be finite")
+        candidates = np.flatnonzero(
+            (self._minimum_xz[:, 0] - BBOX_TOLERANCE_M <= x)
+            & (x <= self._maximum_xz[:, 0] + BBOX_TOLERANCE_M)
+            & (self._minimum_xz[:, 1] - BBOX_TOLERANCE_M <= z)
+            & (z <= self._maximum_xz[:, 1] + BBOX_TOLERANCE_M)
+        )
+        if not len(candidates):
+            return False
+        triangle = self._triangle_vertices[candidates]
+        a = triangle[:, 0]
+        b = triangle[:, 1]
+        c = triangle[:, 2]
+        v0x, v0z = b[:, 0] - a[:, 0], b[:, 2] - a[:, 2]
+        v1x, v1z = c[:, 0] - a[:, 0], c[:, 2] - a[:, 2]
+        px, pz = x - a[:, 0], z - a[:, 2]
+        determinant = v0x * v1z - v0z * v1x
+        projected = np.abs(determinant) > PROJECTED_AREA_EPSILON_M2
+        u = np.zeros_like(determinant)
+        v = np.zeros_like(determinant)
+        u[projected] = (
+            px[projected] * v1z[projected]
+            - pz[projected] * v1x[projected]
+        ) / determinant[projected]
+        v[projected] = (
+            v0x[projected] * pz[projected]
+            - v0z[projected] * px[projected]
+        ) / determinant[projected]
+        w = 1.0 - u - v
+        return bool(np.any(
+            projected
+            & (u >= -BARYCENTRIC_TOLERANCE)
+            & (v >= -BARYCENTRIC_TOLERANCE)
+            & (w >= -BARYCENTRIC_TOLERANCE)
+        ))
+
     def height(self, x: float, z: float) -> float:
         x, z = float(x), float(z)
         if not np.isfinite(x) or not np.isfinite(z):
@@ -949,7 +990,9 @@ def rasterize_heightfield(
         for ix in range(nx):
             x = origin_x + ix * encoded_cell
             heights[iz, ix] = terrain.height(x, z)
-    return HeightGrid(heights, origin_x, origin_z, encoded_cell, 0.0)
+    exterior_height = getattr(terrain, "exterior_height", 0.0)
+    return HeightGrid(
+        heights, origin_x, origin_z, encoded_cell, exterior_height)
 
 
 def _fixed_triangle_height(grid, ix, iz, tx, tz):

@@ -11,16 +11,23 @@ from resources.g1_terrain_builder.database import (
     ContactConfig,
     combine_clips,
     derive_contacts,
+    refresh_lmm_clip_dynamics,
     derive_velocities,
     forward_kinematics_arrays,
     read_holden_database,
     sample_terrain_support,
+    slice_holden_clip,
     write_holden_database,
 )
-from resources.g1_terrain_builder.features import build_matching_features
+from resources.g1_terrain_builder.features import (
+    build_lmm_terrain_features,
+    build_matching_features,
+)
 from resources.g1_terrain_builder.kinematics import split_continuity_ranges
 from resources.g1_terrain_builder.schema import (
     ArtifactSet,
+    G1_SKELETON_NAMES,
+    G1_SKELETON_PARENTS,
     HoldenClip,
     SkeletonSpec,
 )
@@ -55,6 +62,70 @@ def _expected_database_bytes(artifacts: ArtifactSet) -> bytes:
 
 
 class DatabaseBuilderTests(unittest.TestCase):
+    def test_lmm_terrain_partition_slices_and_derives_each_source_before_join(self):
+        skeleton = SkeletonSpec(
+            G1_SKELETON_NAMES,
+            np.asarray(G1_SKELETON_PARENTS, dtype=np.int32),
+        )
+        flat = HoldenClip.empty(256, 31)
+        flat.name = "flat"
+        slope = HoldenClip.empty(598, 31)
+        slope.name = "slope"
+        slope.terrain_id = "slope"
+        for clip, origin in ((flat, 0.0), (slope, 100.0)):
+            frames = np.arange(len(clip.positions), dtype=np.float32)
+            clip.positions[:, 0, 0] = origin + frames / 60.0
+            clip.positions[:, 6, 0] = 0.02 * np.sin(frames / 7.0)
+            clip.positions[:, 12, 0] = 0.02 * np.cos(frames / 9.0)
+        slope.terrain_features[:] = np.column_stack((
+            np.sin(np.arange(598) / 19.0),
+            np.cos(np.arange(598) / 23.0),
+            np.sin(np.arange(598) / 29.0),
+            np.cos(np.arange(598) / 31.0),
+        )).astype(np.float32)
+
+        flat = refresh_lmm_clip_dynamics(flat, skeleton, 60.0)
+        admitted = refresh_lmm_clip_dynamics(
+            slice_holden_clip(slope, 3), skeleton, 60.0)
+        artifacts = combine_clips([flat, admitted], skeleton)
+        features = build_lmm_terrain_features(artifacts)
+
+        self.assertEqual(len(admitted.positions), 595)
+        np.testing.assert_array_equal(admitted.source_left_indices, np.arange(3, 598))
+        np.testing.assert_array_equal(artifacts.range_starts, [0, 256])
+        np.testing.assert_array_equal(artifacts.range_stops, [256, 851])
+        self.assertEqual(features.values.shape, (851, 31))
+        self.assertTrue(np.all(np.isfinite(features.scale[27:31])))
+        self.assertTrue(np.all(features.scale[27:31] > 0.0))
+        self.assertTrue(np.all(
+            features.scale[27:31] < np.finfo(np.float32).max))
+        # The 100 m discontinuity is never differentiated across row 255/256.
+        self.assertLess(abs(float(artifacts.velocities[255, 0, 0])), 2.0)
+        self.assertLess(abs(float(artifacts.velocities[256, 0, 0])), 2.0)
+
+    def test_lmm_terrain_features_clamp_future_indices_at_row_256(self):
+        artifacts = ArtifactSet.empty(851, 31)
+        artifacts.range_starts = np.array([0, 256], np.int32)
+        artifacts.range_stops = np.array([256, 851], np.int32)
+        frames = np.arange(851, dtype=np.float32)
+        artifacts.positions[:, 0, 0] = frames
+        artifacts.terrain_features[:, :] = np.column_stack((
+            frames, frames**2, np.sin(frames), np.cos(frames),
+        )).astype(np.float32)
+
+        features = build_lmm_terrain_features(artifacts)
+
+        # Row 255's 20/40/60-frame targets all clamp to row 255, so its
+        # denormalized future root displacement is exactly zero.
+        denormalized = (
+            features.values[255] * features.scale + features.offset)
+        np.testing.assert_array_equal(denormalized[15:21], 0.0)
+
+        artifacts.range_starts = np.array([0], np.int32)
+        artifacts.range_stops = np.array([851], np.int32)
+        with self.assertRaisesRegex(ValueError, "ranges"):
+            build_lmm_terrain_features(artifacts)
+
     def test_lmm_contacts_match_bundled_orange_duck_speed_only_rule(self):
         frames = 12
         positions = np.zeros((frames, 3, 3), np.float64)

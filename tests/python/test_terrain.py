@@ -748,6 +748,21 @@ class TerrainTests(unittest.TestCase):
         ], dtype="<f4")
         np.testing.assert_array_equal(grid.heights, expected_heights)
 
+    def test_rasterize_preserves_an_explicit_surface_exterior_height(self):
+        class CalibratedSurface:
+            exterior_height = -0.012000000104308128
+
+            @staticmethod
+            def height(x, z):
+                return 0.125
+
+        grid = rasterize_heightfield(
+            CalibratedSurface(), (-0.02, 0.02, -0.02, 0.02), 0.02)
+
+        self.assertEqual(grid.exterior_height, -0.012000000104308128)
+        header = struct.unpack_from("<4sIII4f", grid.g1hf_bytes())
+        self.assertEqual(header[-1], -0.012000000104308128)
+
     def test_rasterize_heightfield_rejects_invalid_or_impossible_sizes_early(self):
         class CountingTerrain:
             def __init__(self):
@@ -869,6 +884,21 @@ class TerrainTests(unittest.TestCase):
             vertices, np.array([[0, 1, 2]], np.int32), exterior_height=-2.0)
         self.assertAlmostEqual(surface.height(0.25, 0.25), 0.375, places=12)
         self.assertEqual(surface.height(0.75, 0.75), -2.0)
+
+    def test_vertical_triangle_reports_mesh_membership_even_at_exterior_height(self):
+        vertices = np.array([
+            [0.0, -2.0, 0.0],
+            [1.0, -2.0, 0.0],
+            [0.0, -2.0, 1.0],
+        ])
+        surface = VerticalTriangleSurface(
+            vertices, np.array([[0, 1, 2]], np.int32), exterior_height=-2.0)
+
+        self.assertTrue(surface.contains_projected_point(0.25, 0.25))
+        self.assertTrue(surface.contains_projected_point(0.5, 0.5))
+        self.assertFalse(surface.contains_projected_point(0.75, 0.75))
+        with self.assertRaisesRegex(ValueError, "finite"):
+            surface.contains_projected_point(np.nan, 0.0)
 
     def test_vertical_query_is_winding_independent_and_boundary_closed(self):
         vertices = np.array([

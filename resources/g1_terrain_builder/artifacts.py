@@ -14,7 +14,13 @@ from dataclasses import dataclass
 import numpy as np
 
 from .database import read_holden_database, write_holden_database
-from .schema import ArtifactSet, FeatureSet
+from .schema import (
+    ArtifactSet,
+    FeatureSet,
+    G1_SKELETON_NAMES,
+    G1_SKELETON_PARENTS,
+    G1_SKELETON_SIGNATURE,
+)
 
 
 MAGIC = b"G1TF"
@@ -80,6 +86,44 @@ _FLAT_KINEMATICS_MODEL = {
     "asset": "g1_29dof.xml",
     "sha256": "749209c06a5c0023deb27f728420028b62b1f3092a22e24920183c1a897e4376",
     "size_bytes": 26914,
+}
+_LMM_TERRAIN_SCHEMA = "g1-lmm-terrain-data/v1"
+_LMM_TERRAIN_MANIFEST_KEYS = {
+    "schema", "output_fps", "database_frames", "source_count",
+    "range_count", "trajectory_horizons", "dimensions", "skeleton",
+    "feature", "terrain", "support", "contact", "time_filters", "inputs",
+    "slope_source_receipt", "sources", "ranges", "continuity",
+    "temporal_partition", "database", "features", "sidecars",
+    "scene_index", "validation",
+}
+_LMM_TERRAIN_DYNAMIC_KEYS = {
+    "database", "features", "sidecars", "scene_index", "validation",
+}
+_LMM_TERRAIN_BASE_KEYS = (
+    _LMM_TERRAIN_MANIFEST_KEYS - _LMM_TERRAIN_DYNAMIC_KEYS)
+_LMM_TERRAIN_VALIDATION_KEYS = {
+    "schema", "database", "features", "sidecars", "partition", "inputs",
+}
+_LMM_TERRAIN_RECEIPT_KEYS = {
+    "schema", "status", "clip_id", "hashes", "metadata", "source_fps",
+    "target_fps", "source_frames", "provisional_output_frames",
+    "admitted_output_frames", "source_span_s", "output_span_s",
+    "output_shortfall_s", "rejected_output_ranges", "admitted_output_range",
+    "intended_nonflat_provisional_range", "intended_nonflat_admitted_range",
+    "interpolation", "basis", "object_rotation_binary32",
+    "object_translation_binary32", "inverse_round_trip_max_error_m",
+    "exterior_policy", "support_calibration_m",
+    "support_calibration_applied_to", "fk_max_error_m",
+    "quaternion_norm_max_error",
+}
+_LMM_TERRAIN_SCENE_KEYS = {
+    "schema", "id", "label", "provenance", "coordinate_signature",
+    "surface_signature", "terrain_feature_distances_m", "heightfield",
+    "mesh", "walkability", "bounds", "spawn", "regions", "routes",
+}
+_LMM_TERRAIN_INDEX_KEYS = {
+    "schema", "default_scene_id", "scene_ids", "scenes",
+    "coordinate_signature", "surface_signature",
 }
 
 
@@ -1272,6 +1316,794 @@ def publish_flat_artifacts(
         with _locked_parent(parent) as parent_descriptor:
             _authenticate_flat_manifest_inputs(manifest)
             _validate_staged_flat(staging, artifacts, features, manifest)
+            output_identity = _output_directory_identity(output_dir)
+            exchanged = False
+            if output_identity is not None:
+                _rename_exchange(staging, output_dir)
+                exchanged = True
+                staging_identity = output_identity
+            else:
+                os.replace(staging, output_dir)
+                staging_identity = None
+            try:
+                _fsync_parent(parent_descriptor)
+            except BaseException as commit_error:
+                try:
+                    if exchanged:
+                        _rename_exchange(staging, output_dir)
+                    else:
+                        os.replace(output_dir, staging)
+                    staging_identity = candidate_identity
+                    _fsync_parent(parent_descriptor)
+                except BaseException as rollback_error:
+                    preserve_staging = True
+                    raise PublicationRollbackError(
+                        output_dir, staging, commit_error, rollback_error,
+                    ) from rollback_error
+                raise
+            committed = True
+            if exchanged:
+                try:
+                    _remove_owned_scratch(staging, staging_identity)
+                except BaseException as cleanup_error:
+                    preserve_staging = True
+                    raise PublicationCommittedError(
+                        output_dir, staging, cleanup_error,
+                    ) from cleanup_error
+        return manifest
+    finally:
+        if not committed and not preserve_staging:
+            _remove_owned_scratch(staging, staging_identity)
+
+
+def _require_lmm_descriptor_file(descriptor, *, expected_size, expected_sha):
+    if type(descriptor) is not dict \
+            or set(descriptor) != {"path", "size_bytes", "sha256"} \
+            or type(descriptor.get("path")) is not str \
+            or not descriptor["path"] \
+            or type(descriptor.get("size_bytes")) is not int \
+            or descriptor["size_bytes"] != expected_size \
+            or descriptor.get("sha256") != expected_sha:
+        raise ValueError("terrain LMM input descriptor changed")
+    path = descriptor["path"]
+    try:
+        node = os.stat(path)
+        digest = sha256_file(path)
+    except (OSError, TypeError, ValueError) as error:
+        raise ValueError("terrain LMM input authentication failed") from error
+    if node.st_size != expected_size or digest != expected_sha:
+        raise ValueError("terrain LMM input SHA-256/size changed")
+
+
+def _normalized_lmm_terrain_inputs(
+    manifest_base, validation, artifacts, features,
+):
+    from .features import FEATURE_NAMES, FEATURE_WEIGHTS
+
+    if not isinstance(artifacts, ArtifactSet):
+        raise TypeError("terrain LMM artifacts must be an ArtifactSet")
+    artifacts.validate()
+    if not isinstance(features, FeatureSet):
+        raise TypeError("terrain LMM features must be a FeatureSet")
+    features.validate()
+    if type(manifest_base) is not dict \
+            or set(manifest_base) != _LMM_TERRAIN_BASE_KEYS:
+        raise ValueError("terrain LMM manifest base key set changed")
+    if type(validation) is not dict \
+            or set(validation) != _LMM_TERRAIN_VALIDATION_KEYS:
+        raise ValueError("terrain LMM validation key set changed")
+    normalized = json.loads(canonical_json_bytes(manifest_base))
+    normalized_validation = json.loads(canonical_json_bytes(validation))
+    if normalized["schema"] != _LMM_TERRAIN_SCHEMA \
+            or normalized["output_fps"] != 60.0 \
+            or normalized["database_frames"] != 851 \
+            or normalized["source_count"] != 2 \
+            or normalized["range_count"] != 2 \
+            or normalized["trajectory_horizons"] != [20, 40, 60] \
+            or normalized["dimensions"] != {
+                "bones": 31, "features": 31, "latent": 32, "contacts": 2,
+            }:
+        raise ValueError("terrain LMM fixed manifest dimensions changed")
+    if artifacts.positions.shape != (851, 31, 3) \
+            or artifacts.contacts.shape != (851, 2) \
+            or not np.array_equal(
+                artifacts.range_starts, np.array([0, 256], np.int32)) \
+            or not np.array_equal(
+                artifacts.range_stops, np.array([256, 851], np.int32)) \
+            or features.values.shape != (851, 31):
+        raise ValueError("terrain LMM database/feature partition changed")
+    skeleton = normalized["skeleton"]
+    if type(skeleton) is not dict \
+            or set(skeleton) != {"names", "parents", "basis", "signature"} \
+            or skeleton != {
+                "names": list(G1_SKELETON_NAMES),
+                "parents": list(G1_SKELETON_PARENTS),
+                "basis": "holden-y-up-right-handed-forward-plus-z",
+                "signature": G1_SKELETON_SIGNATURE,
+            }:
+        raise ValueError("terrain LMM canonical skeleton changed")
+    feature = normalized["feature"]
+    if type(feature) is not dict or set(feature) != {
+        "names", "weights", "offset", "scale", "signature",
+        "terrain_indices",
+    } or feature["names"] != list(FEATURE_NAMES) \
+            or feature["weights"] != list(FEATURE_WEIGHTS) \
+            or feature["terrain_indices"] != [27, 28, 29, 30] \
+            or feature["offset"] != features.offset.tolist() \
+            or feature["scale"] != features.scale.tolist() \
+            or type(feature["signature"]) is not str \
+            or not _HEX_SHA256.fullmatch(feature["signature"]):
+        raise ValueError("terrain LMM feature receipt changed")
+    terrain_scale = features.scale[27:31]
+    if not np.isfinite(terrain_scale).all() \
+            or np.any(terrain_scale <= 0.0) \
+            or np.any(terrain_scale >= np.finfo(np.float32).max):
+        raise ValueError("terrain LMM normalization disabled a terrain input")
+
+    receipt = normalized["slope_source_receipt"]
+    if type(receipt) is not dict or set(receipt) != _LMM_TERRAIN_RECEIPT_KEYS \
+            or receipt["schema"] != "g1-lmm-authored-slope-source/v1" \
+            or receipt["status"] != "provisional" \
+            or receipt["clip_id"] != "terrain_slopes__slope_000__000" \
+            or receipt["source_fps"] != 25.0 \
+            or receipt["target_fps"] != 60.0 \
+            or receipt["source_frames"] != 250 \
+            or receipt["provisional_output_frames"] != 598 \
+            or receipt["admitted_output_frames"] != 595 \
+            or receipt["source_span_s"] != 9.96 \
+            or receipt["output_span_s"] != 9.95 \
+            or receipt["output_shortfall_s"] != 0.010000000000001563 \
+            or receipt["rejected_output_ranges"] != [[0, 3]] \
+            or receipt["admitted_output_range"] != [3, 598] \
+            or receipt["intended_nonflat_provisional_range"] != [168, 542] \
+            or receipt["intended_nonflat_admitted_range"] != [165, 539] \
+            or receipt["metadata"] != {"scene_scale": 1.0} \
+            or receipt["basis"] != "z-up-to-holden-shared-with-robot" \
+            or receipt["support_calibration_m"] != 0.012000000104308128 \
+            or receipt["support_calibration_applied_to"] != "terrain-only":
+        raise ValueError("terrain LMM slope source receipt changed")
+    interpolation = receipt.get("interpolation")
+    if type(interpolation) is not dict or set(interpolation) != {
+        "left_source_index", "right_source_index", "source_alpha",
+    } or any(len(interpolation[key]) != 598 for key in interpolation) \
+            or any(type(value) is not int for value in
+                   interpolation["left_source_index"]
+                   + interpolation["right_source_index"]) \
+            or any(left > right for left, right in zip(
+                interpolation["left_source_index"],
+                interpolation["right_source_index"])) \
+            or any(type(value) is not float or not np.isfinite(value)
+                   or value < 0.0 or value > 1.0
+                   for value in interpolation["source_alpha"]):
+        raise ValueError("terrain LMM provisional interpolation map changed")
+    try:
+        object_rotation = np.asarray(
+            receipt["object_rotation_binary32"], np.float64)
+        object_translation = np.asarray(
+            receipt["object_translation_binary32"], np.float64)
+    except (TypeError, ValueError) as error:
+        raise ValueError("terrain LMM reconstruction pose changed") from error
+    if object_rotation.shape != (3, 3) \
+            or object_translation.shape != (3,) \
+            or not np.isfinite(object_rotation).all() \
+            or not np.isfinite(object_translation).all() \
+            or not np.array_equal(
+                object_rotation,
+                object_rotation.astype(np.float32).astype(np.float64)) \
+            or not np.array_equal(
+                object_translation,
+                object_translation.astype(np.float32).astype(np.float64)) \
+            or type(receipt["inverse_round_trip_max_error_m"]) is not float \
+            or not 0.0 <= receipt["inverse_round_trip_max_error_m"] <= 1e-9 \
+            or type(receipt["fk_max_error_m"]) is not float \
+            or not 0.0 <= receipt["fk_max_error_m"] <= 1e-5 \
+            or type(receipt["quaternion_norm_max_error"]) is not float \
+            or not 0.0 <= receipt["quaternion_norm_max_error"] <= 1e-4:
+        raise ValueError("terrain LMM reconstruction/FK receipt changed")
+    receipt_sha = hashlib.sha256(canonical_json_bytes(receipt)).hexdigest()
+    terrain = normalized["terrain"]
+    if type(terrain) is not dict or set(terrain) != {
+        "schema", "feature_distances_m", "source_receipt_sha256", "basis",
+        "support_calibration_m", "support_calibration_applied_to",
+        "exterior_policy", "query_counts",
+    } or terrain["schema"] != "g1-lmm-authored-slope-surface/v1" \
+            or terrain["feature_distances_m"] != [0.25, 0.5, 0.75, 1.0] \
+            or terrain["source_receipt_sha256"] != receipt_sha \
+            or terrain["basis"] != "z-up-to-holden-shared-with-robot" \
+            or terrain["support_calibration_m"] != 0.012000000104308128 \
+            or terrain["support_calibration_applied_to"] != "terrain-only" \
+            or terrain["exterior_policy"] != {
+                "source_height_m": 0.0,
+                "runtime_height_m": -0.012000000104308128,
+                "gradient_xz": [0.0, 0.0], "mesh_wins_inside": True,
+            }:
+        raise ValueError("terrain LMM surface receipt changed")
+    counts = terrain["query_counts"]
+    expected_totals = {"features": 2975, "support": 1785, "route": 595}
+    if type(counts) is not dict or set(counts) != set(expected_totals):
+        raise ValueError("terrain LMM query count groups changed")
+    for name, total in expected_totals.items():
+        item = counts[name]
+        if type(item) is not dict or set(item) != {
+            "exact_mesh", "flat_extension",
+        } or any(type(item[key]) is not int or item[key] < 0 for key in item) \
+                or item["exact_mesh"] + item["flat_extension"] != total:
+            raise ValueError("terrain LMM query counts changed")
+    if counts != {
+        "features": {"exact_mesh": 1922, "flat_extension": 1053},
+        "support": {"exact_mesh": 1132, "flat_extension": 653},
+        "route": {"exact_mesh": 374, "flat_extension": 221},
+    }:
+        raise ValueError("terrain LMM authenticated query classification changed")
+    if normalized["support"] != {
+        "schema": "G1SP/v1", "dimensions": 3,
+        "columns": list(SUPPORT_COLUMNS),
+    }:
+        raise ValueError("terrain LMM support receipt changed")
+    contact = normalized["contact"]
+    observation_keys = {
+        "schema", "left_contact_frames", "right_contact_frames",
+        "left_run_count", "right_run_count", "left_max_run_frames",
+        "right_max_run_frames", "alternating_run_transition_count",
+    }
+    if type(contact) is not dict or set(contact) != {
+        "semantics", "speed_threshold", "median_filter_frames",
+        "median_filter_mode", "observations",
+    } or {key: contact[key] for key in (
+        "semantics", "speed_threshold", "median_filter_frames",
+        "median_filter_mode",
+    )} != {
+        "semantics": "bundled-orange-duck-global-toe-speed-only",
+        "speed_threshold": 0.15, "median_filter_frames": 6,
+        "median_filter_mode": "nearest",
+    } or type(contact["observations"]) is not dict \
+            or set(contact["observations"]) != observation_keys \
+            or contact["observations"]["schema"] \
+            != "g1-lmm-bilateral-contact/v1":
+        raise ValueError("terrain LMM contact receipt changed")
+    if normalized["time_filters"] != {
+        "root_position_frames": 31, "root_position_order": 3,
+        "root_direction_frames": 61, "root_direction_order": 3,
+        "contact_median_frames": 6, "forward_terrain_path_rows": 121,
+    }:
+        raise ValueError("terrain LMM time filters changed")
+
+    inputs = normalized["inputs"]
+    if type(inputs) is not dict or set(inputs) != {
+        "flat_data", "slope_robot", "slope_usd", "slope_recon",
+        "slope_metadata", "g1_xml",
+    }:
+        raise ValueError("terrain LMM input set changed")
+    flat_data = inputs["flat_data"]
+    if type(flat_data) is not dict or set(flat_data) != {
+        "path", "manifest_path", "schema", "manifest_sha256",
+    } or flat_data["manifest_path"] != "manifest.json" \
+            or flat_data["schema"] != _FLAT_SCHEMA \
+            or flat_data["manifest_sha256"] != (
+                "5b5c48ccbb1dbabdbf87842d8b033c15b307199d72a8d90e4e39208ba5382db1"
+            ):
+        raise ValueError("terrain LMM flat-data descriptor changed")
+    flat_manifest_path = os.path.join(
+        flat_data["path"], flat_data["manifest_path"])
+    if sha256_file(flat_manifest_path) != flat_data["manifest_sha256"]:
+        raise ValueError("terrain LMM flat manifest SHA-256 changed")
+    with open(flat_manifest_path, "rb") as stream:
+        flat_manifest = _parse_cached_json(stream.read(), "flat manifest")
+    _authenticate_flat_manifest_inputs(flat_manifest)
+    fixed_inputs = {
+        "slope_robot": (198603,
+            "b77480d5f8f3339a3064276d6f9d443ac3a3456f20eb9195d48add176e561ee1"),
+        "slope_usd": (6656,
+            "8d1e696fb5bd2aecfa17797549bddd001093b060773cb313185a6a46db7eb5a5"),
+        "slope_recon": (411476,
+            "d05d6c5a7d6a13eff7e69da0e9e96ab5a79f700bb706611699f0b9c44c9b51ec"),
+        "slope_metadata": (85,
+            "7d88be608419afd2be127e4ac4c5a8aa1b4863fdf84e86c5ec93356881ee861d"),
+        "g1_xml": (26914,
+            "749209c06a5c0023deb27f728420028b62b1f3092a22e24920183c1a897e4376"),
+    }
+    for name, (size, digest) in fixed_inputs.items():
+        _require_lmm_descriptor_file(
+            inputs[name], expected_size=size, expected_sha=digest)
+    if receipt["hashes"] != {
+        "robot_sha256": fixed_inputs["slope_robot"][1],
+        "usd_sha256": fixed_inputs["slope_usd"][1],
+        "reconstruction_sha256": fixed_inputs["slope_recon"][1],
+        "metadata_sha256": fixed_inputs["slope_metadata"][1],
+        "g1_xml_sha256": fixed_inputs["g1_xml"][1],
+    }:
+        raise ValueError("terrain LMM receipt/input hashes disagree")
+
+    sources = normalized["sources"]
+    ranges = normalized["ranges"]
+    expected_ranges = [
+        {"start": 0, "stop": 256, "source_index": 0},
+        {"start": 256, "stop": 851, "source_index": 1},
+    ]
+    if type(sources) is not list or len(sources) != 2 \
+            or ranges != expected_ranges:
+        raise ValueError("terrain LMM sources/ranges changed")
+    source_keys = {
+        "name", "terrain_id", "range", "source_fps", "source_frames",
+        "output_frames", "source_map",
+    }
+    expected_source_values = (
+        ("flat", "flat", {"start": 0, "stop": 256}, 120.0, 512, 256),
+        ("terrain_slopes__slope_000__000",
+         "terrain_slopes__slope_000__000",
+         {"start": 256, "stop": 851}, 25.0, 250, 595),
+    )
+    for source, expected in zip(sources, expected_source_values):
+        if type(source) is not dict or set(source) != source_keys \
+                or tuple(source[key] for key in (
+                    "name", "terrain_id", "range", "source_fps",
+                    "source_frames", "output_frames")) != expected:
+            raise ValueError("terrain LMM source identity changed")
+        source_map = source["source_map"]
+        output_frames = source["output_frames"]
+        if type(source_map) is not dict or set(source_map) != {
+            "left_source_index", "right_source_index", "source_alpha",
+        } or any(len(source_map[key]) != output_frames for key in source_map) \
+                or any(type(value) is not int for value in
+                       source_map["left_source_index"]
+                       + source_map["right_source_index"]) \
+                or any(left > right for left, right in zip(
+                    source_map["left_source_index"],
+                    source_map["right_source_index"])) \
+                or any(type(value) is not float or not np.isfinite(value)
+                       or value < 0.0 or value > 1.0
+                       for value in source_map["source_alpha"]):
+            raise ValueError("terrain LMM admitted source map changed")
+    if sources[1]["source_map"] != {
+        "left_source_index": interpolation["left_source_index"][3:],
+        "right_source_index": interpolation["right_source_index"][3:],
+        "source_alpha": interpolation["source_alpha"][3:],
+    }:
+        raise ValueError("terrain LMM slope map is not provisional[3:]")
+    continuity = normalized["continuity"]
+    if type(continuity) is not dict or set(continuity) != {
+        "schema", "threshold_rad_per_frame", "minimum_range_frames",
+        "source_native_rejected_edge_count",
+        "database_local_rejected_edge_count", "union_rejected_edge_count",
+        "dropped_fragment_count", "dropped_frame_count",
+        "published_range_count", "published_frame_count",
+        "maximum_admitted_native_step_rad",
+        "maximum_admitted_local_rotation_step_rad", "range_digest_sha256",
+        "source_map_digest_sha256",
+    } or continuity["schema"] != "g1-lmm-continuity/v1" \
+            or continuity["threshold_rad_per_frame"] != 0.25 \
+            or continuity["minimum_range_frames"] != 61 \
+            or continuity["published_range_count"] != 2 \
+            or continuity["published_frame_count"] != 851 \
+            or continuity["range_digest_sha256"] \
+            != hashlib.sha256(canonical_json_bytes(ranges)).hexdigest() \
+            or continuity["source_map_digest_sha256"] != hashlib.sha256(
+                canonical_json_bytes([source["source_map"] for source in sources])
+            ).hexdigest():
+        raise ValueError("terrain LMM continuity receipt changed")
+    count_fields = (
+        "source_native_rejected_edge_count",
+        "database_local_rejected_edge_count", "union_rejected_edge_count",
+        "dropped_fragment_count", "dropped_frame_count",
+        "published_range_count", "published_frame_count",
+    )
+    maximum_fields = (
+        "maximum_admitted_native_step_rad",
+        "maximum_admitted_local_rotation_step_rad",
+    )
+    if any(type(continuity[key]) is not int or continuity[key] < 0
+           for key in count_fields) \
+            or any(type(continuity[key]) is not float
+                   or not np.isfinite(continuity[key])
+                   or continuity[key] < 0.0
+                   for key in maximum_fields) \
+            or continuity["source_native_rejected_edge_count"] != 0 \
+            or continuity["database_local_rejected_edge_count"] != 0 \
+            or continuity["union_rejected_edge_count"] != 0 \
+            or continuity["dropped_fragment_count"] != 1 \
+            or continuity["dropped_frame_count"] != 3 \
+            or continuity["maximum_admitted_native_step_rad"] > 0.25 \
+            or continuity["maximum_admitted_local_rotation_step_rad"] > 0.25:
+        raise ValueError("terrain LMM continuity values changed")
+    partition = normalized["temporal_partition"]
+    if partition != {
+        "boundary_row": 256, "derivatives": "per-source",
+        "contacts": "per-source", "feature_future": "clamp-at-range-stop",
+        "cross_range_operations": 0,
+    }:
+        raise ValueError("terrain LMM temporal partition changed")
+
+    if normalized_validation["schema"] \
+            != "g1-lmm-terrain-data-validation/v1" \
+            or normalized_validation["database"] != {
+                "frames": 851, "bones": 31, "contacts": 2,
+                "ranges": [[0, 256], [256, 851]],
+            } \
+            or normalized_validation["features"] != {
+                "rows": 851, "dimensions": 31,
+                "terrain_indices": [27, 28, 29, 30],
+                "terrain_scale": features.scale[27:31].tolist(),
+            } \
+            or normalized_validation["sidecars"] != {
+                "terrain_features": {"rows": 851, "dimensions": 4},
+                "terrain_support": {
+                    "rows": 851, "dimensions": 3,
+                    "columns": list(SUPPORT_COLUMNS),
+                },
+            } \
+            or normalized_validation["partition"] != partition \
+            or normalized_validation["inputs"] != {
+                "flat_manifest_sha256": flat_data["manifest_sha256"],
+                "slope_source_receipt_sha256": receipt_sha,
+                "g1_xml_sha256": fixed_inputs["g1_xml"][1],
+            }:
+        raise ValueError("terrain LMM validation receipt changed")
+    return normalized, normalized_validation
+
+
+def _snapshot_lmm_terrain_scene_pack(scene_pack, terrain):
+    try:
+        index_json = scene_pack.index_json
+        source_scenes = tuple(scene_pack.scenes)
+    except (AttributeError, TypeError) as error:
+        raise TypeError("terrain LMM scene pack is invalid") from error
+    index = _parse_cached_json(index_json, "terrain LMM scene index")
+    surface_signature = hashlib.sha256(canonical_json_bytes(terrain)).hexdigest()
+    if type(index) is not dict or set(index) != _LMM_TERRAIN_INDEX_KEYS \
+            or index["schema"] != "g1-lmm-terrain-scene-index/v1" \
+            or index["default_scene_id"] != "authored-slope" \
+            or index["scene_ids"] != ["authored-slope"] \
+            or index["coordinate_signature"] != COORDINATE_SIGNATURE \
+            or index["surface_signature"] != surface_signature \
+            or len(source_scenes) != 1 \
+            or source_scenes[0].scene_id != "authored-slope":
+        raise ValueError("terrain LMM one-scene index changed")
+    source = source_scenes[0]
+    payloads = {
+        "scene_json": source.scene_json,
+        "terrain_bin": source.terrain_bin,
+        "terrain_obj": source.terrain_obj,
+        "walkability_bin": source.walkability_bin,
+    }
+    if any(type(payload) is not bytes or not payload
+           for payload in payloads.values()):
+        raise TypeError("terrain LMM scene payloads must be non-empty bytes")
+    descriptor = index["scenes"]
+    expected_descriptor = {
+        "id": "authored-slope",
+        "path": "scenes/authored-slope/scene.json",
+        "schema": "g1-lmm-terrain-scene/v1",
+        "size_bytes": len(payloads["scene_json"]),
+        "sha256": hashlib.sha256(payloads["scene_json"]).hexdigest(),
+    }
+    if type(descriptor) is not list or descriptor != [expected_descriptor]:
+        raise ValueError("terrain LMM scene index descriptor changed")
+    metadata = _parse_cached_json(
+        payloads["scene_json"], "terrain LMM authored scene")
+    if type(metadata) is not dict or set(metadata) != _LMM_TERRAIN_SCENE_KEYS \
+            or metadata["schema"] != "g1-lmm-terrain-scene/v1" \
+            or metadata["id"] != "authored-slope" \
+            or metadata["label"] != "Authenticated GRAIL Authored Slope" \
+            or metadata["coordinate_signature"] != COORDINATE_SIGNATURE \
+            or metadata["surface_signature"] != surface_signature \
+            or metadata["terrain_feature_distances_m"] \
+            != [0.25, 0.5, 0.75, 1.0]:
+        raise ValueError("terrain LMM authored scene identity changed")
+    receipt_sha = terrain["source_receipt_sha256"]
+    if metadata["provenance"] != {
+        "kind": "authenticated-grail",
+        "source_ids": ["terrain_slopes__slope_000__000"],
+        "parameters": {
+            "receipt_schema": "g1-lmm-authored-slope-source/v1",
+            "source_receipt_sha256": receipt_sha,
+            "route_source": "admitted-holden-simulation-path",
+            "surface_source": "authenticated-exact-mesh",
+            "exterior_policy": "explicit-flat-zero-before-calibration",
+            "support_calibration_m": 0.012000000104308128,
+            "support_calibration_applied_to": "terrain-only",
+        },
+    }:
+        raise ValueError("terrain LMM authored scene provenance changed")
+    asset_specs = {
+        "heightfield": (
+            payloads["terrain_bin"], "terrain.bin", "G1HF/v2", {
+                "path", "schema", "version", "nx", "nz", "origin_x",
+                "origin_z", "cell_size_m", "exterior_height_m",
+                "interpolation", "diagonal", "size_bytes", "sha256",
+            }),
+        "mesh": (
+            payloads["terrain_obj"], "terrain.obj", "obj/v1",
+            {"path", "schema", "size_bytes", "sha256"}),
+        "walkability": (
+            payloads["walkability_bin"], "walkability.bin", "G1WM/v1", {
+                "path", "schema", "version", "nx", "nz", "classes",
+                "size_bytes", "sha256",
+            }),
+    }
+    for name, (payload, path, schema, keys) in asset_specs.items():
+        asset = metadata[name]
+        if type(asset) is not dict or set(asset) != keys \
+                or asset["path"] != path or asset["schema"] != schema \
+                or asset["size_bytes"] != len(payload) \
+                or asset["sha256"] != hashlib.sha256(payload).hexdigest():
+            raise ValueError(f"terrain LMM scene {name} descriptor changed")
+    heightfield = metadata["heightfield"]
+    if heightfield["version"] != 2 \
+            or type(heightfield["nx"]) is not int or heightfield["nx"] < 2 \
+            or type(heightfield["nz"]) is not int or heightfield["nz"] < 2 \
+            or heightfield["interpolation"] != "fixed-diagonal-triangles" \
+            or heightfield["diagonal"] \
+            != "min-x-min-z_to_max-x-max-z" \
+            or heightfield["exterior_height_m"] \
+            != -0.012000000104308128:
+        raise ValueError("terrain LMM heightfield contract changed")
+    if metadata["walkability"].get("version") != 1 \
+            or metadata["walkability"].get("classes") != {
+                "blocked": 0, "certified": 1, "stress": 2,
+            }:
+        raise ValueError("terrain LMM walkability contract changed")
+
+    def require_f32(values, shape, label):
+        try:
+            array = np.asarray(values, np.float64)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"terrain LMM {label} changed") from error
+        if array.shape != shape or not np.isfinite(array).all() \
+                or not np.array_equal(
+                    array, array.astype(np.float32).astype(np.float64)):
+            raise ValueError(f"terrain LMM {label} changed")
+        return array
+
+    for key in ("origin_x", "origin_z", "cell_size_m", "exterior_height_m"):
+        require_f32(heightfield[key], (), f"heightfield {key}")
+    bounds = metadata["bounds"]
+    expected_bounds = {
+        "mesh_min_xyz": 3, "mesh_max_xyz": 3,
+        "heightfield_min_xyz": 3, "heightfield_max_xyz": 3,
+        "playable_min_xz": 2, "playable_max_xz": 2,
+        "lookahead_min_xz": 2, "lookahead_max_xz": 2,
+    }
+    if type(bounds) is not dict or set(bounds) != set(expected_bounds):
+        raise ValueError("terrain LMM authored scene bounds changed")
+    for name, length in expected_bounds.items():
+        try:
+            values = np.asarray(bounds[name], np.float64)
+        except (TypeError, ValueError) as error:
+            raise ValueError("terrain LMM authored scene bounds changed") \
+                from error
+        if values.shape != (length,) or not np.isfinite(values).all():
+            raise ValueError("terrain LMM authored scene bounds changed")
+    spawn = metadata["spawn"]
+    if type(spawn) is not dict or set(spawn) != {"position", "yaw_radians"}:
+        raise ValueError("terrain LMM authored spawn changed")
+    spawn_position = require_f32(spawn["position"], (3,), "spawn position")
+    require_f32(spawn["yaw_radians"], (), "spawn yaw")
+    regions = metadata["regions"]
+    if type(regions) is not dict or set(regions) != {
+        "certified", "stress", "blocked",
+    } or regions["stress"] != [] or regions["blocked"] != [] \
+            or type(regions["certified"]) is not list \
+            or len(regions["certified"]) != 1 \
+            or set(regions["certified"][0]) != {"id", "bounds_xz"} \
+            or regions["certified"][0]["id"] != "authored-route":
+        raise ValueError("terrain LMM authored regions changed")
+    require_f32(
+        regions["certified"][0]["bounds_xz"], (4,),
+        "certified region bounds")
+    routes = metadata["routes"]
+    if type(routes) is not list or len(routes) != 1 \
+            or set(routes[0]) != {
+                "id", "waypoints_xz", "expected_outcome",
+                "walkability_class", "landing_hold_seconds",
+            } or routes[0]["id"] != "authored-forward" \
+            or len(routes[0]["waypoints_xz"]) != 5 \
+            or routes[0]["expected_outcome"] != "traverse" \
+            or routes[0]["walkability_class"] != 1 \
+            or routes[0]["landing_hold_seconds"] != 0.0:
+        raise ValueError("terrain LMM authored route changed")
+    route_points = require_f32(
+        routes[0]["waypoints_xz"], (5, 2), "authored route waypoints")
+    if not np.array_equal(
+            route_points[0], spawn_position[[0, 2]]):
+        raise ValueError("terrain LMM route does not start at spawn")
+    snapshot = _SceneSnapshot(
+        "authored-slope", payloads["scene_json"], payloads["terrain_bin"],
+        payloads["terrain_obj"], payloads["walkability_bin"], metadata)
+    return _ScenePackSnapshot(index_json, index, (snapshot,))
+
+
+def _lmm_root_descriptor(staging, path, schema):
+    absolute = os.path.join(staging, path)
+    return {
+        "path": path,
+        "schema": schema,
+        "size_bytes": os.stat(absolute).st_size,
+        "sha256": sha256_file(absolute),
+    }
+
+
+def _finalize_lmm_terrain_manifest(staging, manifest_base):
+    manifest = dict(manifest_base)
+    manifest["database"] = _lmm_root_descriptor(
+        staging, "database.bin", "holden-database/v1")
+    manifest["features"] = _lmm_root_descriptor(
+        staging, "features.bin", "g1-lmm-features/v1")
+    terrain_sidecar = _lmm_root_descriptor(
+        staging, "terrain_features.bin", "G1TF/v1")
+    terrain_sidecar.update({"version": 1, "dimensions": 4})
+    support_sidecar = _lmm_root_descriptor(
+        staging, "terrain_support.bin", "G1SP/v1")
+    support_sidecar.update({
+        "version": 1, "dimensions": 3, "columns": list(SUPPORT_COLUMNS),
+    })
+    manifest["sidecars"] = {
+        "terrain_features": terrain_sidecar,
+        "terrain_support": support_sidecar,
+    }
+    manifest["scene_index"] = _lmm_root_descriptor(
+        staging, os.path.join("scenes", "index.json"),
+        "g1-lmm-terrain-scene-index/v1")
+    manifest["validation"] = _lmm_root_descriptor(
+        staging, "validation.json", "g1-lmm-terrain-data-validation/v1")
+    if set(manifest) != _LMM_TERRAIN_MANIFEST_KEYS:
+        raise ValueError("terrain LMM final manifest key set changed")
+    return manifest
+
+
+def _validate_staged_lmm_terrain(
+    staging, artifacts, features, manifest, validation, scene_pack,
+):
+    expected_files = {
+        "database.bin", "features.bin", "terrain_features.bin",
+        "terrain_support.bin", "validation.json", "manifest.json",
+        os.path.join("scenes", "index.json"),
+        os.path.join("scenes", "authored-slope", "scene.json"),
+        os.path.join("scenes", "authored-slope", "terrain.bin"),
+        os.path.join("scenes", "authored-slope", "terrain.obj"),
+        os.path.join("scenes", "authored-slope", "walkability.bin"),
+    }
+    files, directories = _inspect_tree(staging)
+    if files != expected_files or directories != {
+        ".", "scenes", os.path.join("scenes", "authored-slope"),
+    }:
+        raise ValueError("terrain LMM staged tree changed")
+    manifest_base = {
+        key: manifest[key] for key in _LMM_TERRAIN_BASE_KEYS}
+    normalized_base, normalized_validation = _normalized_lmm_terrain_inputs(
+        manifest_base, validation, artifacts, features)
+    trusted_scene_pack = _snapshot_lmm_terrain_scene_pack(
+        scene_pack, normalized_base["terrain"])
+    expected_bytes = {
+        "manifest.json": canonical_json_bytes(manifest),
+        "validation.json": canonical_json_bytes(normalized_validation),
+        os.path.join("scenes", "index.json"): trusted_scene_pack.index_json,
+    }
+    scene = trusted_scene_pack.scenes[0]
+    prefix = os.path.join("scenes", "authored-slope")
+    expected_bytes.update({
+        os.path.join(prefix, "scene.json"): scene.scene_json,
+        os.path.join(prefix, "terrain.bin"): scene.terrain_bin,
+        os.path.join(prefix, "terrain.obj"): scene.terrain_obj,
+        os.path.join(prefix, "walkability.bin"): scene.walkability_bin,
+    })
+    for relative, expected in expected_bytes.items():
+        if not _regular_file_matches_bytes(
+                os.path.join(staging, relative), expected):
+            raise ValueError(f"terrain LMM staged bytes changed: {relative}")
+    descriptors = (
+        (manifest["database"], "database.bin"),
+        (manifest["features"], "features.bin"),
+        (manifest["sidecars"]["terrain_features"], "terrain_features.bin"),
+        (manifest["sidecars"]["terrain_support"], "terrain_support.bin"),
+        (manifest["scene_index"], os.path.join("scenes", "index.json")),
+        (manifest["validation"], "validation.json"),
+    )
+    for descriptor, expected_path in descriptors:
+        path = os.path.join(staging, expected_path)
+        if descriptor["path"] != expected_path \
+                or descriptor["size_bytes"] != os.stat(path).st_size \
+                or descriptor["sha256"] != sha256_file(path):
+            raise ValueError(
+                f"terrain LMM descriptor changed for {expected_path}")
+    index_descriptor = trusted_scene_pack.index["scenes"][0]
+    scene_path = os.path.join(staging, index_descriptor["path"])
+    if index_descriptor["size_bytes"] != os.stat(scene_path).st_size \
+            or index_descriptor["sha256"] != sha256_file(scene_path):
+        raise ValueError("terrain LMM scene descriptor changed")
+    for name, filename in (
+        ("heightfield", "terrain.bin"), ("mesh", "terrain.obj"),
+        ("walkability", "walkability.bin"),
+    ):
+        descriptor = scene.metadata[name]
+        path = os.path.join(staging, prefix, filename)
+        if descriptor["size_bytes"] != os.stat(path).st_size \
+                or descriptor["sha256"] != sha256_file(path):
+            raise ValueError(f"terrain LMM {name} asset changed")
+
+    loaded_database = read_holden_database(os.path.join(staging, "database.bin"))
+    loaded_features = read_features(os.path.join(staging, "features.bin"))
+    loaded_database.terrain_features = read_terrain_sidecar(
+        os.path.join(staging, "terrain_features.bin"))
+    loaded_database.terrain_support = read_support_sidecar(
+        os.path.join(staging, "terrain_support.bin"))
+    loaded_database.validate()
+
+    def bitwise_equal(actual, expected, dtype):
+        actual = np.ascontiguousarray(actual, dtype=dtype)
+        expected = np.ascontiguousarray(expected, dtype=dtype)
+        if actual.shape != expected.shape:
+            return False
+        if dtype == "<f4":
+            return np.array_equal(actual.view("<u4"), expected.view("<u4"))
+        return np.array_equal(actual, expected)
+
+    for name, dtype in (
+        ("positions", "<f4"), ("velocities", "<f4"),
+        ("rotations", "<f4"), ("angular_velocities", "<f4"),
+        ("parents", "<i4"), ("range_starts", "<i4"),
+        ("range_stops", "<i4"), ("contacts", "u1"),
+        ("terrain_features", "<f4"), ("terrain_support", "<f4"),
+    ):
+        if not bitwise_equal(
+                getattr(loaded_database, name), getattr(artifacts, name), dtype):
+            raise ValueError(f"terrain LMM staged {name} changed")
+    for name in ("values", "offset", "scale"):
+        if not bitwise_equal(
+                getattr(loaded_features, name), getattr(features, name), "<f4"):
+            raise ValueError(f"terrain LMM staged feature {name} changed")
+
+
+def publish_lmm_terrain_artifacts(
+    output_dir, artifacts, features, manifest_base, validation, scene_pack,
+    validate_candidate,
+):
+    if not callable(validate_candidate):
+        raise TypeError("validate_candidate must be callable")
+    manifest_base, validation = _normalized_lmm_terrain_inputs(
+        manifest_base, validation, artifacts, features)
+    scene_pack = _snapshot_lmm_terrain_scene_pack(
+        scene_pack, manifest_base["terrain"])
+    output_dir = os.path.abspath(os.fspath(output_dir))
+    parent = os.path.dirname(output_dir)
+    basename = os.path.basename(output_dir)
+    if not basename:
+        raise ValueError("output directory must have a basename")
+    os.makedirs(parent, exist_ok=True)
+    _output_exists_as_directory(output_dir)
+    staging = tempfile.mkdtemp(prefix=f".{basename}.staging-", dir=parent)
+    staging_identity = _scratch_directory_identity(staging)
+    candidate_identity = staging_identity
+    preserve_staging = False
+    committed = False
+    try:
+        _write_database_exclusive(
+            os.path.join(staging, "database.bin"), artifacts)
+        _write_bytes_fsync(
+            os.path.join(staging, "features.bin"), features_bytes(features))
+        _write_bytes_fsync(
+            os.path.join(staging, "terrain_features.bin"),
+            terrain_sidecar_bytes(artifacts.terrain_features))
+        _write_bytes_fsync(
+            os.path.join(staging, "terrain_support.bin"),
+            support_sidecar_bytes(artifacts.terrain_support))
+        _write_scene_pack(staging, scene_pack)
+        _write_bytes_fsync(
+            os.path.join(staging, "validation.json"),
+            canonical_json_bytes(validation))
+        manifest = _finalize_lmm_terrain_manifest(staging, manifest_base)
+        _write_bytes_fsync(
+            os.path.join(staging, "manifest.json"),
+            canonical_json_bytes(manifest))
+
+        _validate_staged_lmm_terrain(
+            staging, artifacts, features, manifest, validation, scene_pack)
+        validate_candidate(staging)
+        _validate_staged_lmm_terrain(
+            staging, artifacts, features, manifest, validation, scene_pack)
+        _fsync_tree(staging)
+        with _locked_parent(parent) as parent_descriptor:
+            _validate_staged_lmm_terrain(
+                staging, artifacts, features, manifest, validation, scene_pack)
             output_identity = _output_directory_identity(output_dir)
             exchanged = False
             if output_identity is not None:

@@ -31,6 +31,225 @@ PYTHON = "/home/ubuntu/miniconda3/envs/diffsim/bin/python"
 
 
 class BuildCliTests(unittest.TestCase):
+    def test_authored_slope_terrain_parser_is_mutually_exclusive_and_complete(self):
+        values = [
+            "--authored-slope-terrain", "--output-fps", "60",
+            "--flat-data", "/data/flat-v3",
+            "--slope-robot", "/data/slope.pkl",
+            "--slope-usd", "/data/slope.usd",
+            "--slope-recon", "/data/recon.pkl",
+            "--slope-metadata", "/data/meta.pkl",
+            "--g1-xml", "/models/g1.xml",
+        ]
+        args = builder._parser().parse_args(values)
+        self.assertTrue(args.authored_slope_terrain)
+        self.assertFalse(args.flat_only)
+        self.assertEqual(args.flat_data, "/data/flat-v3")
+        self.assertEqual(args.slope_robot, "/data/slope.pkl")
+        self.assertEqual(args.slope_usd, "/data/slope.usd")
+        self.assertEqual(args.slope_recon, "/data/recon.pkl")
+        self.assertEqual(args.slope_metadata, "/data/meta.pkl")
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            builder._parser().parse_args(
+                values + ["--flat-only", "--retarget-npz", "flat.npz"])
+
+    def test_build_modes_reject_foreign_options_before_loading(self):
+        mandatory = dict(
+            flat_data="flat-v3", slope_robot="slope.pkl",
+            slope_usd="slope.usd", slope_recon="recon.pkl",
+            slope_metadata="meta.pkl",
+        )
+        cases = (
+            (SimpleNamespace(
+                authored_slope_terrain=True, flat_only=False,
+                output_fps=60.0, g1_xml="g1.xml", output="out",
+                retarget_npz="foreign.npz", retarget_receipt=None,
+                grail_glob=builder.DEFAULTS["grail_glob"], grail_limit=None,
+                takara=builder.DEFAULTS["takara"], remap=builder.DEFAULTS["remap"],
+                **mandatory,
+            ), "retarget"),
+            (SimpleNamespace(
+                authored_slope_terrain=False, flat_only=True,
+                output_fps=60.0, g1_xml="g1.xml", output="out",
+                retarget_npz="flat.npz", retarget_receipt="flat.json",
+                grail_glob=builder.DEFAULTS["grail_glob"], grail_limit=None,
+                takara=builder.DEFAULTS["takara"], remap=builder.DEFAULTS["remap"],
+                **mandatory,
+            ), "terrain-only"),
+            (SimpleNamespace(
+                authored_slope_terrain=False, flat_only=False,
+                output_fps=25.0, g1_xml="g1.xml", output="out",
+                retarget_npz=None, retarget_receipt=None,
+                grail_glob=builder.DEFAULTS["grail_glob"], grail_limit=1,
+                takara=builder.DEFAULTS["takara"], remap=builder.DEFAULTS["remap"],
+                **mandatory,
+            ), "terrain-only"),
+        )
+        for args, message in cases:
+            with self.subTest(message=message), mock.patch.object(
+                builder, "_assemble_lmm_terrain_candidate",
+            ) as terrain_assemble, mock.patch.object(
+                builder, "_assemble_flat_candidate",
+            ) as flat_assemble, mock.patch.object(
+                builder, "_assemble_candidate",
+            ) as general_assemble, self.assertRaisesRegex(ValueError, message):
+                builder.build_artifacts(args)
+            terrain_assemble.assert_not_called()
+            flat_assemble.assert_not_called()
+            general_assemble.assert_not_called()
+
+    def test_authored_slope_mode_requires_all_six_paths_before_assembly(self):
+        base = dict(
+            authored_slope_terrain=True, flat_only=False,
+            output_fps=60.0, output="out", retarget_npz=None,
+            retarget_receipt=None, grail_glob=builder.DEFAULTS["grail_glob"],
+            grail_limit=None, takara=builder.DEFAULTS["takara"],
+            remap=builder.DEFAULTS["remap"], flat_data="flat-v3",
+            slope_robot="slope.pkl", slope_usd="slope.usd",
+            slope_recon="recon.pkl", slope_metadata="meta.pkl",
+            g1_xml="g1.xml",
+        )
+        for missing in (
+            "flat_data", "slope_robot", "slope_usd", "slope_recon",
+            "slope_metadata", "g1_xml",
+        ):
+            values = dict(base)
+            values[missing] = None
+            with self.subTest(missing=missing), mock.patch.object(
+                builder, "_assemble_lmm_terrain_candidate",
+            ) as assemble, self.assertRaisesRegex(
+                ValueError, missing.replace("_", "-"),
+            ):
+                builder.build_artifacts(SimpleNamespace(**values))
+            assemble.assert_not_called()
+
+    def test_authored_slope_build_dispatches_hybrid_publisher(self):
+        args = SimpleNamespace(
+            authored_slope_terrain=True, flat_only=False,
+            output_fps=60.0, output="published", retarget_npz=None,
+            retarget_receipt=None, grail_glob=builder.DEFAULTS["grail_glob"],
+            grail_limit=None, takara=builder.DEFAULTS["takara"],
+            remap=builder.DEFAULTS["remap"], flat_data="flat-v3",
+            slope_robot="slope.pkl", slope_usd="slope.usd",
+            slope_recon="recon.pkl", slope_metadata="meta.pkl",
+            g1_xml="g1.xml",
+        )
+        candidate = SimpleNamespace(
+            artifacts=mock.sentinel.artifacts,
+            features=mock.sentinel.features,
+            manifest_base=mock.sentinel.manifest,
+            validation=mock.sentinel.validation,
+            scene_pack=mock.sentinel.scenes,
+        )
+        finalized = {"schema": "g1-lmm-terrain-data/v1"}
+        with mock.patch.object(
+            builder, "_assemble_lmm_terrain_candidate", return_value=candidate,
+        ), mock.patch.object(
+            builder, "publish_lmm_terrain_artifacts", return_value=finalized,
+        ) as publish:
+            observed = builder.build_artifacts(args)
+        self.assertIs(observed, finalized)
+        publish.assert_called_once()
+        call = publish.call_args.args
+        self.assertEqual(call[:6], (
+            "published", candidate.artifacts, candidate.features,
+            candidate.manifest_base, candidate.validation, candidate.scene_pack,
+        ))
+        self.assertTrue(callable(call[6]))
+
+    def test_authored_slope_authenticates_all_cli_inputs_before_payload_loading(self):
+        args = SimpleNamespace(
+            output_fps=60.0, flat_data="flat-v3", slope_robot="slope.pkl",
+            slope_usd="slope.usd", slope_recon="recon.pkl",
+            slope_metadata="meta.pkl", g1_xml="g1.xml",
+        )
+        with mock.patch.object(
+            builder, "_preauthenticate_lmm_terrain_cli_inputs",
+            side_effect=ValueError("injected last-input hash failure"),
+        ) as authenticate, mock.patch.object(
+            builder, "_require_flat_data_v3",
+            side_effect=AssertionError("flat payload loaded before all hashes"),
+        ) as load_flat, self.assertRaisesRegex(ValueError, "hash failure"):
+            builder._assemble_lmm_terrain_candidate(args)
+        authenticate.assert_called_once_with(args)
+        load_flat.assert_not_called()
+
+    def test_real_lmm_terrain_candidate_has_frozen_two_range_partition(self):
+        assemble = getattr(builder, "_assemble_lmm_terrain_candidate", None)
+        self.assertTrue(callable(assemble), "terrain LMM assembly seam is missing")
+        if assemble is None:
+            return
+        name = "terrain_slopes__slope_000__000"
+        slope_root = "/home/ubuntu/datasets/GRAIL/data/slope"
+        flat_data = "sonic/runs/g1-lmm-flat-60hz/data-v3"
+        candidate = assemble(SimpleNamespace(
+            output_fps=60.0,
+            flat_data=flat_data,
+            slope_robot=f"{slope_root}/robot/{name}.pkl",
+            slope_usd=f"{slope_root}/object_usd/{name}.usd",
+            slope_recon=f"{slope_root}/recon/{name}.pkl",
+            slope_metadata=f"{slope_root}/meta/{name}.pkl",
+            g1_xml=(
+                "/home/ubuntu/projects/mjx-diffphysics/env/g1/assets/"
+                "g1_29dof.xml"),
+        ))
+
+        self.assertEqual(candidate.artifacts.positions.shape, (851, 31, 3))
+        np.testing.assert_array_equal(
+            candidate.artifacts.range_starts, [0, 256])
+        np.testing.assert_array_equal(
+            candidate.artifacts.range_stops, [256, 851])
+        self.assertEqual(candidate.features.values.shape, (851, 31))
+        self.assertTrue(np.all(
+            candidate.features.scale[27:31]
+            < np.finfo(np.float32).max))
+        self.assertTrue(np.all(candidate.features.scale[27:31] > 0.0))
+        self.assertEqual(candidate.manifest_base["schema"],
+                         "g1-lmm-terrain-data/v1")
+        self.assertEqual(candidate.manifest_base["database_frames"], 851)
+        self.assertEqual(candidate.manifest_base["ranges"], [
+            {"start": 0, "stop": 256, "source_index": 0},
+            {"start": 256, "stop": 851, "source_index": 1},
+        ])
+        self.assertEqual(candidate.manifest_base["temporal_partition"], {
+            "boundary_row": 256,
+            "derivatives": "per-source",
+            "contacts": "per-source",
+            "feature_future": "clamp-at-range-stop",
+            "cross_range_operations": 0,
+        })
+        self.assertEqual(
+            candidate.manifest_base["terrain"]["query_counts"], {
+                "features": {"exact_mesh": 1922, "flat_extension": 1053},
+                "support": {"exact_mesh": 1132, "flat_extension": 653},
+                "route": {"exact_mesh": 374, "flat_extension": 221},
+            })
+        flat_database = read_holden_database(
+            os.path.join(flat_data, "database.bin"))
+        for field in (
+            "positions", "velocities", "rotations", "angular_velocities",
+            "contacts",
+        ):
+            np.testing.assert_array_equal(
+                getattr(candidate.artifacts, field)[:256],
+                getattr(flat_database, field),
+            )
+        slope = candidate.manifest_base["sources"][1]
+        self.assertEqual(slope["range"], {"start": 256, "stop": 851})
+        self.assertEqual(slope["output_frames"], 595)
+        self.assertEqual(len(slope["source_map"]["source_alpha"]), 595)
+        self.assertEqual(
+            slope["source_map"]["left_source_index"][0],
+            candidate.manifest_base["slope_source_receipt"]
+            ["interpolation"]["left_source_index"][3],
+        )
+        self.assertEqual(
+            tuple(scene.scene_id for scene in candidate.scene_pack.scenes),
+            ("authored-slope",),
+        )
+        self.assertEqual(candidate.validation["database"]["ranges"],
+                         [[0, 256], [256, 851]])
+
     def test_authored_slope_source_seam_binds_all_frozen_inputs_and_policy(self):
         assemble = getattr(builder, "_assemble_authored_slope_source", None)
         self.assertTrue(callable(assemble), "authored slope source seam is missing")

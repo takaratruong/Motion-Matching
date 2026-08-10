@@ -10,6 +10,7 @@ import time
 import unittest
 import warnings
 from functools import lru_cache
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -28,6 +29,7 @@ from resources.g1_terrain_builder.artifacts import (
     write_terrain_sidecar,
     write_walkability,
     features_bytes,
+    publish_lmm_terrain_artifacts,
     publish_flat_artifacts,
     read_features,
     write_features,
@@ -122,6 +124,25 @@ def tiny_manifest_base(artifacts, *, diagnostic_mode=True):
             "quaternion_norm_max_error": [0.0],
         },
     }
+
+
+@lru_cache(maxsize=1)
+def real_lmm_terrain_candidate():
+    from resources import build_g1_terrain_database as builder
+
+    name = "terrain_slopes__slope_000__000"
+    root = "/home/ubuntu/datasets/GRAIL/data/slope"
+    return builder._assemble_lmm_terrain_candidate(SimpleNamespace(
+        output_fps=60.0,
+        flat_data="sonic/runs/g1-lmm-flat-60hz/data-v3",
+        slope_robot=f"{root}/robot/{name}.pkl",
+        slope_usd=f"{root}/object_usd/{name}.usd",
+        slope_recon=f"{root}/recon/{name}.pkl",
+        slope_metadata=f"{root}/meta/{name}.pkl",
+        g1_xml=(
+            "/home/ubuntu/projects/mjx-diffphysics/env/g1/assets/"
+            "g1_29dof.xml"),
+    ))
 
 
 def file_sha256(path):
@@ -1337,6 +1358,145 @@ class ArtifactPublicationV2Tests(unittest.TestCase):
                 final_manifest = json.load(stream)
             self.assertIn(final_manifest["diagnostic_mode"], (False, True))
             self.assertEqual(self._scratch(temporary, output), [])
+
+
+class LMMTerrainPublisherTests(unittest.TestCase):
+    @staticmethod
+    def _publish(output, callback=lambda path: None):
+        candidate = real_lmm_terrain_candidate()
+        return publish_lmm_terrain_artifacts(
+            output,
+            candidate.artifacts,
+            candidate.features,
+            candidate.manifest_base,
+            candidate.validation,
+            candidate.scene_pack,
+            callback,
+        )
+
+    @staticmethod
+    def _old_output(parent):
+        output = os.path.join(parent, "published")
+        os.mkdir(output)
+        with open(os.path.join(output, "old"), "wb") as stream:
+            stream.write(b"last-good")
+        return output
+
+    def test_lmm_terrain_publisher_emits_exact_hybrid_tree_and_descriptors(self):
+        expected_files = {
+            "database.bin", "features.bin", "terrain_features.bin",
+            "terrain_support.bin", "validation.json", "manifest.json",
+            "scenes/index.json", "scenes/authored-slope/scene.json",
+            "scenes/authored-slope/terrain.bin",
+            "scenes/authored-slope/terrain.obj",
+            "scenes/authored-slope/walkability.bin",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            output = os.path.join(temporary, "published")
+            manifest = self._publish(output)
+            files, directories = artifacts_module._inspect_tree(output)
+
+            self.assertEqual(files, expected_files)
+            self.assertEqual(directories, {
+                ".", "scenes", "scenes/authored-slope",
+            })
+            self.assertEqual(manifest["schema"], "g1-lmm-terrain-data/v1")
+            self.assertEqual(set(manifest), {
+                "schema", "output_fps", "database_frames", "source_count",
+                "range_count", "trajectory_horizons", "dimensions",
+                "skeleton", "feature", "terrain", "support", "contact",
+                "time_filters", "inputs", "slope_source_receipt", "sources",
+                "ranges", "continuity", "temporal_partition", "database",
+                "features", "sidecars", "scene_index", "validation",
+            })
+            descriptors = (
+                manifest["database"], manifest["features"],
+                manifest["sidecars"]["terrain_features"],
+                manifest["sidecars"]["terrain_support"],
+                manifest["scene_index"], manifest["validation"],
+            )
+            for descriptor in descriptors:
+                path = os.path.join(output, descriptor["path"])
+                self.assertEqual(descriptor["size_bytes"], os.stat(path).st_size)
+                self.assertEqual(descriptor["sha256"], file_sha256(path))
+
+    def test_lmm_terrain_publisher_rejects_post_callback_mutation_and_nodes(self):
+        cases = ("mutation", "file", "directory", "symlink", "fifo")
+        for kind in cases:
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temporary:
+                output = self._old_output(temporary)
+
+                def corrupt(staging):
+                    if kind == "mutation":
+                        with open(os.path.join(staging, "features.bin"), "ab") \
+                                as stream:
+                            stream.write(b"changed")
+                    elif kind == "file":
+                        with open(os.path.join(staging, "extra"), "wb") as stream:
+                            stream.write(b"extra")
+                    elif kind == "directory":
+                        os.mkdir(os.path.join(staging, "extra"))
+                    elif kind == "symlink":
+                        os.symlink("manifest.json", os.path.join(staging, "extra"))
+                    else:
+                        os.mkfifo(os.path.join(staging, "extra"))
+
+                with self.assertRaises(ValueError):
+                    self._publish(output, corrupt)
+                self.assertEqual(os.listdir(output), ["old"])
+
+    def test_lmm_terrain_publisher_revalidates_under_parent_lock(self):
+        real_validate = artifacts_module._validate_staged_lmm_terrain
+        calls = 0
+        with tempfile.TemporaryDirectory() as temporary:
+            output = self._old_output(temporary)
+
+            def mutate_on_locked_validation(staging, *arguments):
+                nonlocal calls
+                calls += 1
+                if calls == 3:
+                    with open(os.path.join(staging, "late-extra"), "wb") \
+                            as stream:
+                        stream.write(b"late")
+                return real_validate(staging, *arguments)
+
+            with mock.patch.object(
+                artifacts_module, "_validate_staged_lmm_terrain",
+                side_effect=mutate_on_locked_validation,
+            ), self.assertRaisesRegex(ValueError, "tree"):
+                self._publish(output)
+            self.assertEqual(calls, 3)
+            self.assertEqual(os.listdir(output), ["old"])
+
+    def test_lmm_terrain_publisher_exchange_failure_preserves_old_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = self._old_output(temporary)
+            with mock.patch.object(
+                artifacts_module, "_rename_exchange",
+                side_effect=OSError("injected exchange failure"),
+            ), self.assertRaisesRegex(OSError, "exchange"):
+                self._publish(output)
+            self.assertEqual(os.listdir(output), ["old"])
+
+    def test_lmm_terrain_publisher_parent_fsync_failure_rolls_back(self):
+        real_fsync = artifacts_module._fsync_parent
+        calls = 0
+        with tempfile.TemporaryDirectory() as temporary:
+            output = self._old_output(temporary)
+
+            def fail_first(descriptor):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise OSError("injected parent fsync failure")
+                return real_fsync(descriptor)
+
+            with mock.patch.object(
+                artifacts_module, "_fsync_parent", side_effect=fail_first,
+            ), self.assertRaisesRegex(OSError, "parent fsync"):
+                self._publish(output)
+            self.assertEqual(calls, 2)
+            self.assertEqual(os.listdir(output), ["old"])
 
 
 if __name__ == "__main__":
