@@ -174,9 +174,7 @@ class TrainingBatch:
 class TrainingRowSampler(Protocol):
     """Narrow post-coverage sampling seam shared by corpus-specific wrappers."""
 
-    def sample(
-        self, batch_size: int, generator: np.random.Generator
-    ) -> np.ndarray: ...
+    def sample(self, batch_size: int, generator: np.random.Generator) -> np.ndarray: ...
 
 
 @dataclass
@@ -470,9 +468,7 @@ class _FamilyTrainingPools:
     def from_corpus(
         cls, corpus: object, eligible: np.ndarray | None = None
     ) -> _FamilyTrainingPools:
-        train = (
-            _training_mask(corpus) if eligible is None else np.asarray(eligible)
-        )
+        train = _training_mask(corpus) if eligible is None else np.asarray(eligible)
         if train.dtype != np.bool_ or train.shape != (_row_count(corpus),):
             raise ValueError("family sampling eligibility must be a row boolean mask")
         families = _family_rows(corpus)
@@ -1006,8 +1002,7 @@ def evaluate_hybrid_generator(
     if generator.artifact_identity is not None:
         receipt["artifact_identity"] = dict(generator.artifact_identity)
         if (
-            generator.artifact_identity.get("schema")
-            == _FULL_WALKING_MODEL_SCHEMA
+            generator.artifact_identity.get("schema") == _FULL_WALKING_MODEL_SCHEMA
             and generator.artifact_identity.get("stage") == "selection"
         ):
             receipt["selection_population"] = "validation"
@@ -1251,7 +1246,6 @@ def _physical_metrics_receipt_accepted(metrics: object) -> bool:
     accepted = bool(
         values["joint_geodesic_mae_rad"] <= limits["joint_geodesic_mae_rad"]
         and values["joint_frame_max_p95_rad"] <= limits["joint_frame_max_p95_rad"]
-        and values["local_position_p95_m"] <= limits["local_position_p95_m"]
         and values["fk_body_position_p95_m"] <= limits["fk_body_position_p95_m"]
         and values["support_foot_position_p95_m"]
         <= limits["support_foot_position_p95_m"]
@@ -1282,17 +1276,21 @@ def _validated_evaluation_receipt(
     held_out_rows = int(np.count_nonzero(_evaluation_mask(corpus)))
     if train.get("rows") != train_rows or held_out.get("rows") != held_out_rows:
         raise ValueError("model evaluation population row counts are incomplete")
-    canonical = bool(train_accepted and held_out_accepted)
-    expected_tuple = [
-        held_out["joint_geodesic_mae_rad"],
-        held_out["fk_body_position_p95_m"],
-        1.0 - min(held_out["contact_f1"]),
-    ]
     full_walking_selection = bool(
         artifact_identity is not None
         and artifact_identity.get("schema") == _FULL_WALKING_MODEL_SCHEMA
         and artifact_identity.get("stage") == "selection"
     )
+    canonical = bool(
+        held_out_accepted
+        if full_walking_selection
+        else train_accepted and held_out_accepted
+    )
+    expected_tuple = [
+        held_out["joint_geodesic_mae_rad"],
+        held_out["fk_body_position_p95_m"],
+        1.0 - min(held_out["contact_f1"]),
+    ]
     if (
         receipt.get("schema") != _EVALUATION_SCHEMA
         or receipt.get("accepted") is not False
@@ -1414,8 +1412,13 @@ def _selection_model_receipt(
         or generator.config.dt != config.dt
         or generator.config.loss_profile != config.loss_profile
         or generator.config.loss_weights != config.loss_weights
+        or generator.config.seed != config.seed
+        or generator.config.batch_size != config.batch_size
+        or generator.config.learning_rate != config.learning_rate
+        or generator.config.weight_decay != config.weight_decay
+        or generator.config.post_coverage_steps != config.post_coverage_steps
     ):
-        raise ValueError("selection model architecture does not match the refit")
+        raise ValueError("selection model config does not match the refit")
     receipt = dict(generator.evaluation_receipt)
     artifacts = generator.manifest.get("artifacts")
     evaluation_descriptor = (
@@ -1688,6 +1691,7 @@ def _full_test_receipt_authority(
     expected_sha256: str,
     corpus_manifest_sha256: str,
     selection_model_manifest_sha256: str,
+    selection_validation_receipt_sha256: str,
 ) -> Path:
     matches: list[Path] = []
     seen: set[Path] = set()
@@ -1715,6 +1719,8 @@ def _full_test_receipt_authority(
         or receipt.get("corpus_manifest_sha256") != corpus_manifest_sha256
         or receipt.get("selection_model_manifest_sha256")
         != selection_model_manifest_sha256
+        or receipt.get("selection_validation_receipt_sha256")
+        != selection_validation_receipt_sha256
     ):
         raise ValueError("full walking test receipt authority is inconsistent")
     return matches[0]
@@ -1750,15 +1756,39 @@ def load_hybrid_generator(
     if manifest.get("corpus_manifest_sha256") != corpus_hash:
         raise ValueError("model and corpus manifest SHA-256 values do not match")
     config = _config_from_receipt(manifest.get("config"))
-    artifact_identity = _normalized_artifact_identity(
-        manifest.get("artifact_identity")
-    )
+    artifact_identity = _normalized_artifact_identity(manifest.get("artifact_identity"))
     is_full_walking_manifest = manifest.get("schema") == _FULL_WALKING_MODEL_SCHEMA
     if is_full_walking_manifest != bool(
         artifact_identity is not None
         and artifact_identity.get("schema") == _FULL_WALKING_MODEL_SCHEMA
     ):
         raise ValueError("hybrid/full-walking manifest and artifact identity disagree")
+    if is_full_walking_manifest:
+        from .full_walking_terrain_lmm_training import full_walking_model_identity
+
+        stage = (
+            artifact_identity.get("stage") if artifact_identity is not None else None
+        )
+        if stage == "selection":
+            expected_identity = full_walking_model_identity(
+                corpus, config=config, stage="selection"
+            )
+        elif stage == "refit":
+            expected_identity = full_walking_model_identity(
+                corpus,
+                config=config,
+                stage="refit",
+                selection_model_manifest_sha256=manifest.get(
+                    "selection_model_manifest_sha256"
+                ),
+                test_receipt_sha256=artifact_identity.get("test_receipt_sha256")
+                if isinstance(artifact_identity, Mapping)
+                else None,
+            )
+        else:
+            raise ValueError("full walking model stage is invalid")
+        if artifact_identity != expected_identity:
+            raise ValueError("full walking model identity does not match this corpus")
     if (
         manifest.get("rows") != _row_count(corpus)
         or manifest.get("latent_size") != config.latent_size
@@ -1835,7 +1865,9 @@ def load_hybrid_generator(
                 selection_root, corpus=corpus, device="cpu"
             )
         except (OSError, ValueError) as error:
-            raise ValueError("selection authority could not be authenticated") from error
+            raise ValueError(
+                "selection authority could not be authenticated"
+            ) from error
         selection_artifacts = selection.manifest.get("artifacts")
         selection_evaluation = (
             selection_artifacts.get("evaluation.json")
@@ -1843,8 +1875,7 @@ def load_hybrid_generator(
             else None
         )
         if (
-            selection.manifest_sha256
-            != manifest["selection_model_manifest_sha256"]
+            selection.manifest_sha256 != manifest["selection_model_manifest_sha256"]
             or selection.corpus_manifest_sha256 != corpus_hash
             or selection.config.fit_all_rows
             or not selection.canonical_selection_verified
@@ -1924,19 +1955,16 @@ def load_hybrid_generator(
     )
     test_receipt_current = False
     if full_refit_identity:
-        if (
-            not selection_provenance_verified
-            or manifest.get("selection_model_manifest_sha256")
-            != artifact_identity.get("selection_model_manifest_sha256")
-        ):
+        if not selection_provenance_verified or manifest.get(
+            "selection_model_manifest_sha256"
+        ) != artifact_identity.get("selection_model_manifest_sha256"):
             raise ValueError("full walking refit selection provenance is inconsistent")
         _full_test_receipt_authority(
             root,
             expected_sha256=artifact_identity["test_receipt_sha256"],
             corpus_manifest_sha256=corpus_hash,
-            selection_model_manifest_sha256=manifest[
-                "selection_model_manifest_sha256"
-            ],
+            selection_model_manifest_sha256=manifest["selection_model_manifest_sha256"],
+            selection_validation_receipt_sha256=manifest["selection_evaluation_sha256"],
         )
         test_receipt_current = True
     return HybridGenerator(

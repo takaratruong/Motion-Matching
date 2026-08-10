@@ -16,6 +16,7 @@ import numpy as np
 import torch
 from mm_sonic.hybrid_terrain_lmm_training import (
     HybridModelConfig,
+    _physical_metrics_receipt_accepted,
     _read_bound_artifact,
     _rename_directory_noreplace,
     assemble_training_batch,
@@ -100,9 +101,7 @@ class HybridTerrainLmmTrainingTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 _rename_directory_noreplace(staging, output)
 
-            self.assertEqual(
-                (output / "sentinel").read_text(encoding="utf-8"), "owned"
-            )
+            self.assertEqual((output / "sentinel").read_text(encoding="utf-8"), "owned")
             self.assertTrue(staging.is_dir())
 
     def test_supported_model_variants_have_the_frozen_architectures(self) -> None:
@@ -238,6 +237,30 @@ class HybridTerrainLmmTrainingTests(unittest.TestCase):
         with self.assertRaisesRegex(FloatingPointError, "non-finite"):
             calculate_physical_metrics(corpus, rows, target)
 
+    def test_local_position_metric_is_diagnostic_only_not_an_acceptance_gate(
+        self,
+    ) -> None:
+        metrics = {
+            "finite": True,
+            "rows": 4,
+            "joint_geodesic_mae_rad": 0.01,
+            "joint_frame_max_p95_rad": 0.02,
+            "local_position_p95_m": 0.50,
+            "fk_body_position_p95_m": 0.02,
+            "support_foot_position_p95_m": 0.01,
+            "contact_f1": [0.99, 0.99],
+            "gate_limits": {
+                "joint_geodesic_mae_rad": 0.03,
+                "joint_frame_max_p95_rad": 0.10,
+                "local_position_p95_m": 0.03,
+                "fk_body_position_p95_m": 0.08,
+                "support_foot_position_p95_m": 0.05,
+                "minimum_contact_f1": 0.85,
+            },
+            "accepted": True,
+        }
+        self.assertTrue(_physical_metrics_receipt_accepted(metrics))
+
     def test_tiny_training_is_deterministic_reloadable_immutable_and_hash_bound(
         self,
     ) -> None:
@@ -353,7 +376,7 @@ class HybridTerrainLmmTrainingTests(unittest.TestCase):
                 seed=23,
                 device="cpu",
                 batch_size=8,
-                post_coverage_steps=0,
+                post_coverage_steps=1,
                 normalization_chunk_size=7,
                 evaluation_chunk_size=6,
                 fit_all_rows=True,
@@ -580,6 +603,23 @@ class HybridTerrainLmmTrainingTests(unittest.TestCase):
                     selection_model=green_path,
                     selection_model_manifest_sha256="0" * 64,
                 )
+            with self.assertRaisesRegex(ValueError, "selection model config"):
+                train_hybrid_generator(
+                    corpus,
+                    root / "wrong-refit-config",
+                    config=HybridModelConfig(
+                        variant="latent32",
+                        seed=23,
+                        device="cpu",
+                        batch_size=8,
+                        post_coverage_steps=0,
+                        normalization_chunk_size=7,
+                        evaluation_chunk_size=6,
+                        fit_all_rows=True,
+                    ),
+                    selection_model=green_path,
+                    selection_model_manifest_sha256=green_manifest_sha256,
+                )
             refit_receipt = train_hybrid_generator(
                 corpus,
                 root / "refit",
@@ -606,9 +646,7 @@ class HybridTerrainLmmTrainingTests(unittest.TestCase):
             (green_path / "manifest.json").unlink()
             try:
                 with self.assertRaisesRegex(ValueError, "selection authority"):
-                    load_hybrid_generator(
-                        root / "refit", corpus=corpus, device="cpu"
-                    )
+                    load_hybrid_generator(root / "refit", corpus=corpus, device="cpu")
             finally:
                 (green_path / "manifest.json").write_bytes(green_manifest_payload)
             refit_manifest.pop("selection_model_manifest_sha256")

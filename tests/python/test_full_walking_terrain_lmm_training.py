@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import tempfile
 import unittest
 from dataclasses import replace
@@ -9,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import torch
 from mm_sonic.full_walking_terrain_lmm_training import (
     FULL_WALKING_DT,
     FULL_WALKING_FPS,
@@ -27,15 +29,60 @@ from mm_sonic.hybrid_terrain_lmm_training import (
 )
 
 from resources.g1_terrain_builder.artifacts import canonical_json_bytes
+from resources.g1_terrain_builder.features import _NORMALIZATION_WEIGHTS
 from resources.g1_terrain_builder.schema import (
     G1_SKELETON_PARENTS,
     ArtifactSet,
     FeatureSet,
 )
 
+_FEATURE_GROUPS = (
+    (0, 3),
+    (3, 6),
+    (6, 9),
+    (9, 12),
+    (12, 15),
+    (15, 21),
+    (21, 27),
+    (27, 31),
+)
+_DISABLED_SCALE = np.float32(np.finfo(np.float32).max)
+
 
 def _sha(character: str) -> str:
     return character * 64
+
+
+def _json_bytes(value: object) -> bytes:
+    return (
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
+    ).encode("utf-8")
+
+
+def _normalized_features(
+    raw_features: np.ndarray, train_mask: np.ndarray
+) -> FeatureSet:
+    selected = np.flatnonzero(train_mask)
+    offset = np.empty(31, dtype=np.float32)
+    scale = np.empty(31, dtype=np.float32)
+    for (start, stop), weight in zip(_FEATURE_GROUPS, _NORMALIZATION_WEIGHTS):
+        train_values = np.asarray(raw_features[selected, start:stop], dtype=np.float64)
+        mean = train_values.mean(axis=0, dtype=np.float64)
+        group_std = float(np.mean(np.std(train_values, axis=0, dtype=np.float64)))
+        offset[start:stop] = mean.astype(np.float32)
+        if not np.isfinite(group_std) or group_std <= 0.0 or weight == 0.0:
+            scale[start:stop] = _DISABLED_SCALE
+        else:
+            scale[start:stop] = np.float32(group_std / weight)
+    values = np.empty_like(raw_features)
+    for start, stop in _FEATURE_GROUPS:
+        if np.all(scale[start:stop] == _DISABLED_SCALE):
+            values[:, start:stop] = 0.0
+        else:
+            values[:, start:stop] = (
+                (raw_features[:, start:stop] - offset[start:stop]) / scale[start:stop]
+            ).astype(np.float32)
+    return FeatureSet(values=values, offset=offset, scale=scale)
 
 
 def _synthetic_full_corpus(*, fps: float = 60.0) -> SimpleNamespace:
@@ -47,9 +94,7 @@ def _synthetic_full_corpus(*, fps: float = 60.0) -> SimpleNamespace:
     bones = 31
     positions = np.zeros((frames, bones, 3), dtype=np.float32)
     positions[:, 1:, 1] = np.float32(0.04)
-    positions[:, 1:, 0] = np.linspace(
-        0.0, 0.12, bones - 1, dtype=np.float32
-    )[None]
+    positions[:, 1:, 0] = np.linspace(0.0, 0.12, bones - 1, dtype=np.float32)[None]
     velocities = np.zeros_like(positions)
     angular_velocities = np.zeros_like(positions)
     rotations = np.zeros((frames, bones, 4), dtype=np.float32)
@@ -73,20 +118,16 @@ def _synthetic_full_corpus(*, fps: float = 60.0) -> SimpleNamespace:
         terrain_features=np.zeros((frames, 4), dtype=np.float32),
         terrain_support=np.zeros((frames, 3), dtype=np.float32),
     )
-    raw_features = np.random.default_rng(7).normal(size=(frames, 31)).astype(
-        np.float32
-    )
-    features = FeatureSet(
-        values=raw_features.copy(),
-        offset=np.zeros(31, dtype=np.float32),
-        scale=np.ones(31, dtype=np.float32),
-    )
     family_ids = np.repeat(np.arange(4, dtype=np.uint8), rows_per_family)
     within_family = np.tile(np.arange(rows_per_family), 4)
-    canonical_source_ids = (
-        family_ids.astype(np.int32) * 2 + (within_family >= 12).astype(np.int32)
-    )
+    split_stage = np.where(within_family < 16, 0, np.where(within_family < 20, 1, 2))
+    canonical_source_ids = family_ids.astype(np.int32) * 4 + np.where(
+        within_family < 8,
+        0,
+        np.where(within_family < 16, 1, np.where(within_family < 20, 2, 3)),
+    ).astype(np.int32)
     source_ids = canonical_source_ids.copy()
+    terrain_ids = family_ids.astype(np.int32) * 3 + split_stage.astype(np.int32)
     split_ids = np.empty(frames, dtype=np.uint8)
     train_mask = np.zeros(frames, dtype=bool)
     validation_mask = np.zeros(frames, dtype=bool)
@@ -105,15 +146,13 @@ def _synthetic_full_corpus(*, fps: float = 60.0) -> SimpleNamespace:
     train_mask &= eligible_mask
     validation_mask &= eligible_mask
     test_mask &= eligible_mask
+    raw_features = np.random.default_rng(7).normal(size=(frames, 31)).astype(np.float32)
+    features = _normalized_features(raw_features, train_mask)
     quality_ids = np.where(eligible_mask, within_family % 2, 2).astype(np.uint8)
     root_delta_xy = np.zeros((frames, 2), dtype=np.float32)
-    speed_pattern = np.asarray(
-        [0.0, 0.05, 0.2, 0.5, 0.8, 0.35], dtype=np.float32
-    )
+    speed_pattern = np.asarray([0.0, 0.05, 0.2, 0.5, 0.8, 0.35], dtype=np.float32)
     root_delta_xy[:, 0] = np.tile(speed_pattern / np.float32(fps), frames // 6)
-    turn_pattern = np.asarray(
-        [-0.6, -0.2, 0.0, 0.1, 0.4, 0.8], dtype=np.float32
-    )
+    turn_pattern = np.asarray([-0.6, -0.2, 0.0, 0.1, 0.4, 0.8], dtype=np.float32)
     root_delta_yaw = np.tile(turn_pattern / np.float32(fps), frames // 6)
     successor = np.arange(frames, dtype=np.int64)
     successor_valid = np.zeros(frames, dtype=bool)
@@ -130,11 +169,11 @@ def _synthetic_full_corpus(*, fps: float = 60.0) -> SimpleNamespace:
         terrain_grid=np.zeros((frames, 36), dtype=np.float32),
         family_ids=family_ids,
         source_ids=source_ids,
-        source_names=tuple(f"source-{index}" for index in range(8)),
+        source_names=tuple(f"source-{index}" for index in range(16)),
         canonical_source_ids=canonical_source_ids,
-        canonical_source_names=tuple(f"canonical-{index}" for index in range(8)),
-        terrain_ids=family_ids.astype(np.int32),
-        terrain_names=("flat", "curb", "slope", "stair"),
+        canonical_source_names=tuple(f"canonical-{index}" for index in range(16)),
+        terrain_ids=terrain_ids,
+        terrain_names=tuple(f"terrain-{index}" for index in range(12)),
         range_ids=np.repeat(np.arange(16, dtype=np.int32), 6),
         range_names=tuple(f"range-{index}" for index in range(16)),
         split_ids=split_ids,
@@ -178,6 +217,7 @@ def _easy_green_corpus() -> SimpleNamespace:
     corpus = _synthetic_full_corpus()
     artifacts = corpus.artifacts
     zero_contacts = np.zeros_like(artifacts.contacts)
+    raw_features = np.zeros_like(corpus.raw_features)
     easy_artifacts = ArtifactSet(
         positions=artifacts.positions,
         velocities=artifacts.velocities,
@@ -190,17 +230,13 @@ def _easy_green_corpus() -> SimpleNamespace:
         terrain_features=artifacts.terrain_features,
         terrain_support=artifacts.terrain_support,
     )
-    easy_features = FeatureSet(
-        values=np.zeros_like(corpus.features.values),
-        offset=corpus.features.offset,
-        scale=corpus.features.scale,
-    )
+    easy_features = _normalized_features(raw_features, corpus.train_mask)
     return SimpleNamespace(
         **{
             **vars(corpus),
             "artifacts": easy_artifacts,
             "features": easy_features,
-            "raw_features": np.zeros_like(corpus.raw_features),
+            "raw_features": raw_features,
         }
     )
 
@@ -237,6 +273,70 @@ class FullWalkingTrainingContractTests(unittest.TestCase):
                 )
             )
 
+    def test_canonical_source_and_terrain_identities_cannot_cross_splits(self) -> None:
+        corpus = _synthetic_full_corpus()
+        validate_full_walking_corpus(corpus)
+
+        crossing_source = SimpleNamespace(
+            **{
+                **vars(corpus),
+                "canonical_source_ids": np.asarray(
+                    corpus.canonical_source_ids, dtype=np.int32
+                ).copy(),
+            }
+        )
+        crossing_source.canonical_source_ids[16] = crossing_source.canonical_source_ids[
+            1
+        ]
+        with self.assertRaisesRegex(ValueError, "canonical source"):
+            validate_full_walking_corpus(crossing_source)
+
+        crossing_terrain = SimpleNamespace(
+            **{
+                **vars(corpus),
+                "terrain_ids": np.asarray(corpus.terrain_ids, dtype=np.int32).copy(),
+            }
+        )
+        crossing_terrain.terrain_ids[20] = crossing_terrain.terrain_ids[2]
+        with self.assertRaisesRegex(ValueError, "terrain identity"):
+            validate_full_walking_corpus(crossing_terrain)
+
+    def test_normalization_is_recomputed_from_raw_features_and_eligible_train_rows(
+        self,
+    ) -> None:
+        corpus = _synthetic_full_corpus()
+        validate_full_walking_corpus(corpus)
+
+        wrong_values = FeatureSet(
+            values=np.zeros_like(corpus.features.values),
+            offset=corpus.features.offset,
+            scale=corpus.features.scale,
+        )
+        with self.assertRaisesRegex(ValueError, "normalized feature"):
+            validate_full_walking_corpus(
+                SimpleNamespace(**{**vars(corpus), "features": wrong_values})
+            )
+
+        wrong_offset = FeatureSet(
+            values=corpus.features.values,
+            offset=corpus.features.offset + np.float32(0.25),
+            scale=corpus.features.scale,
+        )
+        with self.assertRaisesRegex(ValueError, "normalization offset"):
+            validate_full_walking_corpus(
+                SimpleNamespace(**{**vars(corpus), "features": wrong_offset})
+            )
+
+        wrong_scale = FeatureSet(
+            values=corpus.features.values,
+            offset=corpus.features.offset,
+            scale=corpus.features.scale * np.float32(1.05),
+        )
+        with self.assertRaisesRegex(ValueError, "normalization scale"):
+            validate_full_walking_corpus(
+                SimpleNamespace(**{**vars(corpus), "features": wrong_scale})
+            )
+
     def test_selection_view_uses_only_eligible_train_and_validation_rows(self) -> None:
         corpus = _synthetic_full_corpus()
         view = make_training_view(corpus)
@@ -249,7 +349,9 @@ class FullWalkingTrainingContractTests(unittest.TestCase):
         np.testing.assert_array_equal(view.fit_mask, corpus.eligible_mask)
         self.assertFalse(np.any(view.train_mask & corpus.test_mask))
         self.assertFalse(np.any(view.evaluation_mask & corpus.test_mask))
-        self.assertFalse(np.any((view.train_mask | view.evaluation_mask) & ~corpus.eligible_mask))
+        self.assertFalse(
+            np.any((view.train_mask | view.evaluation_mask) & ~corpus.eligible_mask)
+        )
 
     def test_hierarchical_sampler_balances_terrain_then_canonical_source(self) -> None:
         corpus = _synthetic_full_corpus()
@@ -265,7 +367,7 @@ class FullWalkingTrainingContractTests(unittest.TestCase):
         for family in range(4):
             selected = first[corpus.family_ids[first] == family]
             source_counts = np.bincount(
-                corpus.canonical_source_ids[selected], minlength=8
+                corpus.canonical_source_ids[selected], minlength=16
             )
             nonzero = source_counts[source_counts > 0]
             self.assertEqual(len(nonzero), 2)
@@ -286,14 +388,17 @@ class FullWalkingTrainingContractTests(unittest.TestCase):
         self.assertEqual(identity["stage"], "selection")
         self.assertEqual(identity["fps"], 60.0)
         self.assertEqual(identity["horizons"], [20, 40, 60])
-        self.assertEqual(identity["dimensions"], {
-            "matching_features": 31,
-            "compressor_input": 908,
-            "decoder_input": 63,
-            "target": 458,
-            "latent": 32,
-            "width": 512,
-        })
+        self.assertEqual(
+            identity["dimensions"],
+            {
+                "matching_features": 31,
+                "compressor_input": 908,
+                "decoder_input": 63,
+                "target": 458,
+                "latent": 32,
+                "width": 512,
+            },
+        )
         self.assertEqual(identity["corpus_manifest_sha256"], _sha("a"))
         self.assertEqual(identity["split_ledger_manifest_sha256"], _sha("c"))
         self.assertEqual(
@@ -343,14 +448,14 @@ class FullWalkingTrainingContractTests(unittest.TestCase):
                 selection_manifest["schema"],
                 "g1-full-walking-terrain-lmm-model/v1",
             )
-            self.assertEqual(selection_manifest["artifact_identity"]["stage"], "selection")
+            self.assertEqual(
+                selection_manifest["artifact_identity"]["stage"], "selection"
+            )
             self.assertNotIn("test", json.dumps(selection_manifest).lower())
             validation_receipt = json.loads(
                 (selection / "evaluation.json").read_bytes()
             )
-            self.assertEqual(
-                validation_receipt["selection_population"], "validation"
-            )
+            self.assertEqual(validation_receipt["selection_population"], "validation")
             self.assertEqual(
                 validation_receipt["validation"],
                 validation_receipt["source_held_out"],
@@ -378,7 +483,7 @@ class FullWalkingTrainingContractTests(unittest.TestCase):
                 refit,
                 selection_model=selection,
                 test_receipt=test_output,
-                config=_config(fit_all_rows=True),
+                config=replace(selection_config, fit_all_rows=True),
             )
             self.assertEqual(
                 refit_receipt["coverage_rows"],
@@ -402,6 +507,20 @@ class FullWalkingTrainingContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "test receipt authority"):
                 load_hybrid_generator(refit, corpus=corpus, device="cpu")
             test_output.write_bytes(test_payload)
+            changed_validation = dict(test_receipt)
+            changed_validation["selection_validation_receipt_sha256"] = _sha("1")
+            changed_validation_output = root / "changed-validation-test.json"
+            changed_validation_output.write_bytes(
+                canonical_json_bytes(changed_validation)
+            )
+            with self.assertRaisesRegex(ValueError, "validation SHA"):
+                train_all_rows(
+                    corpus,
+                    root / "changed-validation-refit",
+                    selection_model=selection,
+                    test_receipt=changed_validation_output,
+                    config=replace(selection_config, fit_all_rows=True),
+                )
 
             changed = dict(test_receipt)
             changed["selection_model_manifest_sha256"] = _sha("0")
@@ -424,6 +543,104 @@ class FullWalkingTrainingContractTests(unittest.TestCase):
                     test_receipt=test_output,
                     config=_config(fit_all_rows=False),
                 )
+
+            with self.assertRaisesRegex(ValueError, "selection model config"):
+                train_all_rows(
+                    corpus,
+                    root / "wrong-schedule",
+                    selection_model=selection,
+                    test_receipt=test_output,
+                    config=_config(fit_all_rows=True),
+                )
+
+    def test_frozen_test_is_reserved_once_globally_per_corpus_and_selection(
+        self,
+    ) -> None:
+        corpus = _easy_green_corpus()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            selection = root / "selection"
+            train_selection(corpus, selection, config=_config())
+            first_receipt = root / "first-test.json"
+            second_receipt = root / "second-test.json"
+            evaluate_frozen_test(corpus, selection, first_receipt, device="cpu")
+            with self.assertRaisesRegex(
+                (FileExistsError, ValueError), "frozen test|already"
+            ):
+                evaluate_frozen_test(corpus, selection, second_receipt, device="cpu")
+            self.assertFalse(second_receipt.exists())
+
+    def test_selection_authorization_is_validation_only_when_train_diagnostic_is_red(
+        self,
+    ) -> None:
+        corpus = _easy_green_corpus()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            selection = root / "selection"
+            train_selection(corpus, selection, config=_config())
+            patched = root / "patched-selection"
+
+            shutil.copytree(selection, patched)
+            evaluation = json.loads(
+                (patched / "evaluation.json").read_text(encoding="utf-8")
+            )
+            evaluation["train"].update(
+                {
+                    "accepted": False,
+                    "joint_geodesic_mae_rad": 0.5,
+                    "joint_frame_max_p95_rad": 0.5,
+                    "fk_body_position_p95_m": 0.5,
+                    "support_foot_position_p95_m": 0.5,
+                    "contact_f1": [0.0, 0.0],
+                }
+            )
+            evaluation_payload = _json_bytes(evaluation)
+            (patched / "evaluation.json").write_bytes(evaluation_payload)
+            manifest = json.loads(
+                (patched / "manifest.json").read_text(encoding="utf-8")
+            )
+            manifest["artifacts"]["evaluation.json"].update(
+                {
+                    "size_bytes": len(evaluation_payload),
+                    "sha256": hashlib.sha256(evaluation_payload).hexdigest(),
+                }
+            )
+            (patched / "manifest.json").write_bytes(_json_bytes(manifest))
+            loaded = load_hybrid_generator(patched, corpus=corpus, device="cpu")
+            self.assertTrue(loaded.canonical_selection_verified)
+
+    def test_loader_recomputes_full_walking_identity_exactly(self) -> None:
+        corpus = _easy_green_corpus()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            selection = root / "selection"
+            train_selection(corpus, selection, config=_config())
+            patched = root / "patched-selection"
+
+            shutil.copytree(selection, patched)
+            checkpoint = torch.load(
+                patched / "model.pt", map_location="cpu", weights_only=True
+            )
+            for filename in ("manifest.json", "training.json", "evaluation.json"):
+                payload = json.loads((patched / filename).read_text(encoding="utf-8"))
+                payload["artifact_identity"]["fps"] = 25.0
+                (patched / filename).write_bytes(_json_bytes(payload))
+            checkpoint["artifact_identity"]["fps"] = 25.0
+            torch.save(checkpoint, patched / "model.pt")
+            manifest = json.loads(
+                (patched / "manifest.json").read_text(encoding="utf-8")
+            )
+            for filename in ("model.pt", "training.json", "evaluation.json"):
+                payload = (patched / filename).read_bytes()
+                manifest["artifacts"][filename].update(
+                    {
+                        "size_bytes": len(payload),
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                    }
+                )
+            (patched / "manifest.json").write_bytes(_json_bytes(manifest))
+            with self.assertRaisesRegex(ValueError, "identity"):
+                load_hybrid_generator(patched, corpus=corpus, device="cpu")
 
 
 if __name__ == "__main__":

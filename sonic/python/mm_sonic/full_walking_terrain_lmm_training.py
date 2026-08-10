@@ -17,6 +17,7 @@ from typing import Literal
 import numpy as np
 
 from resources.g1_terrain_builder.artifacts import canonical_json_bytes
+from resources.g1_terrain_builder.features import _NORMALIZATION_WEIGHTS
 from resources.g1_terrain_builder.schema import G1_SKELETON_PARENTS
 
 from .hybrid_terrain_lmm_training import (
@@ -43,6 +44,17 @@ _SPEED_BIN_EDGES_MPS = (0.10, 0.35, 0.65)
 _TURN_BIN_EDGES_RADPS = (-0.35, -0.05, 0.05, 0.35)
 _SPEED_THRESHOLDS_MPS = np.asarray(_SPEED_BIN_EDGES_MPS, dtype=np.float32)
 _TURN_THRESHOLDS_RADPS = np.asarray(_TURN_BIN_EDGES_RADPS, dtype=np.float32)
+_FEATURE_GROUPS = (
+    (0, 3),
+    (3, 6),
+    (6, 9),
+    (9, 12),
+    (12, 15),
+    (15, 21),
+    (21, 27),
+    (27, 31),
+)
+_DISABLED_SCALE = np.float32(np.finfo(np.float32).max)
 _TEST_RECEIPT_KEYS = {
     "schema",
     "accepted",
@@ -121,6 +133,34 @@ def _mask(corpus: object, name: str, frames: int) -> np.ndarray:
     return _row_array(corpus, name, dtype=np.bool_, shape=(frames,))
 
 
+def _expected_feature_normalization(
+    raw_features: np.ndarray, train_mask: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    selected = np.flatnonzero(train_mask)
+    if not len(selected):
+        raise ValueError("full walking train split is empty")
+    offset = np.empty(_FEATURES, dtype=np.float32)
+    scale = np.empty(_FEATURES, dtype=np.float32)
+    for (start, stop), weight in zip(_FEATURE_GROUPS, _NORMALIZATION_WEIGHTS):
+        values = np.asarray(raw_features[selected, start:stop], dtype=np.float64)
+        mean = values.mean(axis=0, dtype=np.float64)
+        group_std = float(np.mean(np.std(values, axis=0, dtype=np.float64)))
+        offset[start:stop] = mean.astype(np.float32)
+        if not np.isfinite(group_std) or group_std <= 0.0 or weight == 0.0:
+            scale[start:stop] = _DISABLED_SCALE
+        else:
+            scale[start:stop] = np.float32(group_std / weight)
+    normalized = np.empty_like(raw_features)
+    for start, stop in _FEATURE_GROUPS:
+        if np.all(scale[start:stop] == _DISABLED_SCALE):
+            normalized[:, start:stop] = 0.0
+        else:
+            normalized[:, start:stop] = (
+                (raw_features[:, start:stop] - offset[start:stop]) / scale[start:stop]
+            ).astype(np.float32)
+    return normalized, offset, scale
+
+
 def _exact_string_table(value: object, label: str) -> tuple[str, ...]:
     if (
         not isinstance(value, tuple)
@@ -196,7 +236,7 @@ def validate_full_walking_corpus(corpus: object) -> int:
         features.validate()
     if features.values.shape != (frames, _FEATURES):
         raise ValueError("full walking matching features must be float32 [rows,31]")
-    _finite_row_array(
+    raw_features = _finite_row_array(
         corpus, "raw_features", dtype=np.float32, shape=(frames, _FEATURES)
     )
     _finite_row_array(
@@ -225,9 +265,7 @@ def validate_full_walking_corpus(corpus: object) -> int:
         "canonical source",
         frames=frames,
     )
-    terrain_ids = _row_array(
-        corpus, "terrain_ids", dtype=np.int32, shape=(frames,)
-    )
+    terrain_ids = _row_array(corpus, "terrain_ids", dtype=np.int32, shape=(frames,))
     _validate_ids(
         terrain_ids,
         _exact_string_table(getattr(corpus, "terrain_names", None), "terrain names"),
@@ -280,6 +318,35 @@ def validate_full_walking_corpus(corpus: object) -> int:
         present = np.unique(families[mask])
         if not np.array_equal(present, np.arange(4, dtype=np.uint8)):
             raise ValueError(f"eligible {label} rows lack a required terrain class")
+    for values, label in (
+        (canonical_ids, "canonical source"),
+        (terrain_ids, "terrain identity"),
+    ):
+        for identity in range(int(values.max(initial=-1)) + 1):
+            identity_mask = eligible & (values == identity)
+            if not np.any(identity_mask):
+                raise ValueError(f"full walking {label} has no eligible rows")
+            splits = np.unique(split_ids[identity_mask])
+            if len(splits) != 1:
+                raise ValueError(
+                    f"full walking {label} must appear in exactly one split"
+                )
+
+    expected_features, expected_offset, expected_scale = (
+        _expected_feature_normalization(raw_features, train)
+    )
+    if not np.allclose(features.offset, expected_offset, rtol=2e-6, atol=2e-6):
+        raise ValueError(
+            "full walking normalization offset changed from eligible train rows"
+        )
+    if not np.allclose(features.scale, expected_scale, rtol=2e-5, atol=2e-6):
+        raise ValueError(
+            "full walking normalization scale changed from eligible train rows"
+        )
+    if not np.allclose(features.values, expected_features, rtol=2e-6, atol=2e-6):
+        raise ValueError(
+            "full walking normalized feature table changed from raw features"
+        )
 
     source_left = _row_array(
         corpus, "source_left_indices", dtype=np.int32, shape=(frames,)
@@ -289,9 +356,7 @@ def validate_full_walking_corpus(corpus: object) -> int:
     )
     if np.any(source_left < 0) or np.any(source_left > source_right):
         raise ValueError("full walking source interpolation indices are invalid")
-    alpha = _finite_row_array(
-        corpus, "source_alpha", dtype=np.float32, shape=(frames,)
-    )
+    alpha = _finite_row_array(corpus, "source_alpha", dtype=np.float32, shape=(frames,))
     if np.any(alpha < 0.0) or np.any(alpha > 1.0):
         raise ValueError("full walking source interpolation alpha is invalid")
     successor = _row_array(corpus, "successor", dtype=np.int64, shape=(frames,))
@@ -302,12 +367,8 @@ def validate_full_walking_corpus(corpus: object) -> int:
     valid_rows = np.flatnonzero(successor_valid)
     if np.any(range_ids[valid_successors] != range_ids[valid_rows]):
         raise ValueError("full walking successor crosses a range boundary")
-    _finite_row_array(
-        corpus, "root_delta_xy", dtype=np.float32, shape=(frames, 2)
-    )
-    _finite_row_array(
-        corpus, "root_delta_yaw", dtype=np.float32, shape=(frames,)
-    )
+    _finite_row_array(corpus, "root_delta_xy", dtype=np.float32, shape=(frames, 2))
+    _finite_row_array(corpus, "root_delta_yaw", dtype=np.float32, shape=(frames,))
     return frames
 
 
@@ -496,9 +557,7 @@ class HierarchicalTrainingPools:
             tree=_nested_tree(frozen_keys, frozen_pools),
         )
 
-    def sample(
-        self, batch_size: int, generator: np.random.Generator
-    ) -> np.ndarray:
+    def sample(self, batch_size: int, generator: np.random.Generator) -> np.ndarray:
         if type(batch_size) is not int or batch_size < 4:
             raise ValueError("hierarchical batch must include every terrain class")
         if not isinstance(generator, np.random.Generator):
@@ -550,12 +609,13 @@ def full_walking_model_identity(
         raise ValueError("full walking model stage must be selection or refit")
     _validate_config(config, fit_all_rows=stage == "refit")
     if stage == "selection":
-        if selection_model_manifest_sha256 is not None or test_receipt_sha256 is not None:
+        if (
+            selection_model_manifest_sha256 is not None
+            or test_receipt_sha256 is not None
+        ):
             raise ValueError("selection identity cannot contain test/refit provenance")
     else:
-        _require_sha256(
-            selection_model_manifest_sha256, "selection model manifest"
-        )
+        _require_sha256(selection_model_manifest_sha256, "selection model manifest")
         _require_sha256(test_receipt_sha256, "test receipt")
     identity: dict[str, object] = {
         "schema": FULL_WALKING_MODEL_SCHEMA,
@@ -603,9 +663,7 @@ def full_walking_model_identity(
         "lane_manifest_sha256": list(corpus.lane_manifest_sha256),
     }
     if stage == "refit":
-        identity["selection_model_manifest_sha256"] = (
-            selection_model_manifest_sha256
-        )
+        identity["selection_model_manifest_sha256"] = selection_model_manifest_sha256
         identity["test_receipt_sha256"] = test_receipt_sha256
     return identity
 
@@ -618,10 +676,7 @@ def _manifest_payload(root: Path) -> tuple[dict[str, object], bytes, str]:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("selection model manifest cannot be decoded") from error
     canonical_model_payload = (
-        json.dumps(
-            value, sort_keys=True, separators=(",", ":"), allow_nan=False
-        )
-        + "\n"
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
     ).encode("utf-8")
     if not isinstance(value, dict) or canonical_model_payload != payload:
         raise ValueError("selection model manifest is not canonical JSON")
@@ -662,9 +717,7 @@ def train_selection(
     view = make_training_view(corpus)
     _validate_config(config, fit_all_rows=False)
     sampler = HierarchicalTrainingPools.from_corpus(view, view.train_mask)
-    identity = full_walking_model_identity(
-        corpus, config=config, stage="selection"
-    )
+    identity = full_walking_model_identity(corpus, config=config, stage="selection")
     return train_hybrid_generator(
         view,
         output,
@@ -737,9 +790,7 @@ def _publish_file_exclusive(payload: bytes, output: Path) -> Path:
             raise FileExistsError(
                 f"immutable test receipt already exists: {output}"
             ) from error
-        directory = os.open(
-            output.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-        )
+        directory = os.open(output.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
             os.fsync(directory)
         finally:
@@ -747,6 +798,51 @@ def _publish_file_exclusive(payload: bytes, output: Path) -> Path:
     finally:
         staging.unlink(missing_ok=True)
     return output
+
+
+def _reserve_frozen_test(
+    selection_root: Path,
+    *,
+    corpus_manifest_sha256: str,
+    selection_model_manifest_sha256: str,
+    requested_output: Path,
+) -> None:
+    reservation_root = selection_root.parent / (
+        ".full-walking-frozen-test-"
+        f"{corpus_manifest_sha256}-{selection_model_manifest_sha256}"
+    )
+    try:
+        reservation_root.mkdir(mode=0o755)
+    except FileExistsError as error:
+        raise FileExistsError(
+            "frozen test is already reserved for this corpus and selection model"
+        ) from error
+    descriptor, staging_name = tempfile.mkstemp(
+        prefix=".reservation-", dir=reservation_root
+    )
+    staging = Path(staging_name)
+    reservation = {
+        "schema": "g1-full-walking-terrain-lmm-frozen-test-reservation/v1",
+        "status": "reserved-before-evaluation",
+        "corpus_manifest_sha256": corpus_manifest_sha256,
+        "selection_model_manifest_sha256": selection_model_manifest_sha256,
+        "requested_output": str(requested_output),
+    }
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(canonical_json_bytes(reservation))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(staging, reservation_root / "reservation.json")
+        directory = os.open(
+            reservation_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        staging.unlink(missing_ok=True)
 
 
 def evaluate_frozen_test(
@@ -763,6 +859,12 @@ def evaluate_frozen_test(
         raise FileExistsError(f"immutable test receipt already exists: {output}")
     generator, manifest, selection_sha256 = _selection_generator(
         corpus, Path(model), device=device
+    )
+    _reserve_frozen_test(
+        Path(model).expanduser().resolve(),
+        corpus_manifest_sha256=corpus.manifest_sha256,
+        selection_model_manifest_sha256=selection_sha256,
+        requested_output=output,
     )
     rows = np.flatnonzero(corpus.test_mask & corpus.eligible_mask).astype(
         np.int64, copy=False
@@ -826,8 +928,7 @@ def load_test_receipt(path: Path) -> dict[str, object]:
     assert isinstance(metrics, dict)
     if (
         value.get("accepted") is not accepted
-        or value.get("status")
-        != ("test-gates-green" if accepted else "test-gates-red")
+        or value.get("status") != ("test-gates-green" if accepted else "test-gates-red")
         or value.get("test_rows") != metrics.get("rows")
         or not isinstance(value.get("selection_artifact_identity"), dict)
     ):
@@ -847,7 +948,7 @@ def train_all_rows(
 
     view = make_training_view(corpus)
     _validate_config(config, fit_all_rows=True)
-    selection, _, selection_sha256 = _selection_generator(
+    selection, selection_manifest, selection_sha256 = _selection_generator(
         corpus, Path(selection_model), device="cpu"
     )
     receipt_path = Path(test_receipt).expanduser().resolve()
@@ -862,12 +963,30 @@ def train_all_rows(
     }
     if any(receipt.get(name) != value for name, value in expected_bindings.items()):
         raise ValueError("test receipt is not bound to this selection model/corpus")
+    selection_artifacts = selection_manifest.get("artifacts")
+    selection_evaluation = (
+        selection_artifacts.get("evaluation.json")
+        if isinstance(selection_artifacts, dict)
+        else None
+    )
+    selection_validation_sha256 = (
+        selection_evaluation.get("sha256")
+        if isinstance(selection_evaluation, dict)
+        else None
+    )
+    if (
+        receipt.get("selection_validation_receipt_sha256")
+        != selection_validation_sha256
+    ):
+        raise ValueError("test receipt validation SHA does not match the selection")
     if receipt.get("selection_artifact_identity") != dict(
         selection.artifact_identity or {}
     ):
         raise ValueError("test receipt selection model identity changed")
     if receipt.get("accepted") is not True:
-        raise ValueError("all-row refit requires a frozen test receipt with green gates")
+        raise ValueError(
+            "all-row refit requires a frozen test receipt with green gates"
+        )
     identity = full_walking_model_identity(
         corpus,
         config=config,
@@ -891,7 +1010,9 @@ def _load_cli_corpus(path: Path) -> object:
     try:
         from .full_walking_terrain_lmm_corpus import load_full_corpus
     except ImportError as error:
-        raise RuntimeError("Task 4 full walking corpus loader is unavailable") from error
+        raise RuntimeError(
+            "Task 4 full walking corpus loader is unavailable"
+        ) from error
     return load_full_corpus(path)
 
 
@@ -918,7 +1039,9 @@ def _add_training_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--corpus", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--device", required=True)
-    parser.add_argument("--variant", choices=("latent32", "latent64"), default="latent32")
+    parser.add_argument(
+        "--variant", choices=("latent32", "latent64"), default="latent32"
+    )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--post-coverage-steps", type=int, default=30_000)
