@@ -16,6 +16,7 @@ from mm_sonic.full_walking_terrain_lmm_contracts import (
     SourceRecord,
     build_split_ledger,
     inventory_manifest_bytes,
+    load_lane,
     publish_lane_exclusive,
     split_ledger_bytes,
 )
@@ -23,6 +24,7 @@ from mm_sonic.full_walking_terrain_lmm_corpus import (
     FAMILIES,
     FullWalkingCorpus,
     _BuildWorkspace,
+    _ordered_ranges,
     _verify_terrain_semantics,
     assemble_full_corpus,
     load_full_corpus,
@@ -80,7 +82,15 @@ def _inventory() -> FullWalkingInventory:
                     f"{family}:terrain-base",
                     None,
                     family,
-                    {"kind": "fixture", "identity": base},
+                    {
+                        "kind": "fixture",
+                        "identity": base,
+                        "source_fps": FPS,
+                        "expected_range_ids": [
+                            f"{family}:range:{base}",
+                            f"{family}:range:quarantine",
+                        ],
+                    },
                 ),
                 SourceRecord(
                     f"{family}:mirror",
@@ -88,7 +98,12 @@ def _inventory() -> FullWalkingInventory:
                     f"{family}:terrain-mirror",
                     base,
                     family,
-                    {"kind": "fixture", "identity": f"{family}:mirror"},
+                    {
+                        "kind": "fixture",
+                        "identity": f"{family}:mirror",
+                        "source_fps": FPS,
+                        "expected_range_ids": [f"{family}:range:{family}:mirror"],
+                    },
                 ),
                 SourceRecord(
                     f"{family}:one",
@@ -96,7 +111,12 @@ def _inventory() -> FullWalkingInventory:
                     f"{family}:terrain-one",
                     None,
                     family,
-                    {"kind": "fixture", "identity": f"{family}:one"},
+                    {
+                        "kind": "fixture",
+                        "identity": f"{family}:one",
+                        "source_fps": FPS,
+                        "expected_range_ids": [f"{family}:range:{family}:one"],
+                    },
                 ),
                 SourceRecord(
                     f"{family}:two",
@@ -104,7 +124,12 @@ def _inventory() -> FullWalkingInventory:
                     f"{family}:terrain-two",
                     None,
                     family,
-                    {"kind": "fixture", "identity": f"{family}:two"},
+                    {
+                        "kind": "fixture",
+                        "identity": f"{family}:two",
+                        "source_fps": FPS,
+                        "expected_range_ids": [f"{family}:range:{family}:two"],
+                    },
                 ),
             )
         )
@@ -534,6 +559,13 @@ class FullWalkingTerrainLmmCorpusTests(unittest.TestCase):
                 ),
                 SCENE_IDS,
             )
+            outcomes = json.loads((first / "terminal-outcomes.json").read_text())
+            self.assertEqual(
+                outcomes["quality_range_counts"]["quarantined"], len(FAMILIES)
+            )
+            self.assertTrue(
+                any(source["ranges"] == 2 for source in outcomes["sources"])
+            )
 
     def test_assembly_rejects_coherently_rehashed_source_map_mutation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -545,10 +577,17 @@ class FullWalkingTerrainLmmCorpusTests(unittest.TestCase):
             values[1] = values[0]
             with source_map_path.open("wb") as stream:
                 np.save(stream, values, allow_pickle=False)
+            ranges_path = lane / "ranges.json"
+            ranges = json.loads(ranges_path.read_text())
+            ranges[0]["authority"]["source_map"]["left_sha256"] = _digest_array(
+                values[:ROWS_PER_RANGE], "<i4"
+            )
+            ranges_path.write_bytes(canonical_json_bytes(ranges))
             manifest = json.loads((lane / "manifest.json").read_text())
-            descriptor = manifest["members"][source_map_path.name]
-            descriptor["size_bytes"] = source_map_path.stat().st_size
-            descriptor["sha256"] = sha256_file(source_map_path)
+            for member in (source_map_path, ranges_path):
+                descriptor = manifest["members"][member.name]
+                descriptor["size_bytes"] = member.stat().st_size
+                descriptor["sha256"] = sha256_file(member)
             (lane / "manifest.json").write_bytes(canonical_json_bytes(manifest))
 
             with self.assertRaisesRegex(ValueError, "source map|provenance|SHA-256"):
@@ -559,6 +598,33 @@ class FullWalkingTerrainLmmCorpusTests(unittest.TestCase):
                     split_ledger=ledger,
                     scene_authority=scenes,
                 )
+
+    def test_terminal_coverage_rejects_dropped_second_range_for_a_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory, ledger, lanes, _scenes = self._fixture(root)
+            loaded = [
+                load_lane(path, inventory=inventory, split_ledger=ledger)
+                for path in lanes
+            ]
+            lane = loaded[0]
+            quarantine = next(
+                index
+                for index, record in enumerate(lane.ranges)
+                if record.range_id.endswith(":quarantine")
+            )
+            loaded[0] = replace(
+                lane,
+                ranges=lane.ranges[:quarantine] + lane.ranges[quarantine + 1 :],
+                source_ids=(
+                    lane.source_ids[:quarantine] + lane.source_ids[quarantine + 1 :]
+                ),
+            )
+
+            with self.assertRaisesRegex(
+                ValueError, "terminal.*coverage|range.*coverage"
+            ):
+                _ordered_ranges(tuple(loaded), inventory)
 
     def test_assembly_requires_source_local_map_bounds_for_every_range(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -725,7 +791,7 @@ class FullWalkingTerrainLmmCorpusTests(unittest.TestCase):
                 )
             first.close()
             self.assertFalse(output.exists())
-            self.assertTrue((root / ".corpus.building/resume.json").is_file())
+            self.assertTrue(first.state_path.is_file())
             self.assertFalse((root / ".corpus.building/manifest.json").exists())
 
             resumed = _BuildWorkspace(output, request)
@@ -736,6 +802,96 @@ class FullWalkingTerrainLmmCorpusTests(unittest.TestCase):
                 {"schema": "fixture/v1", "members": {"payload.bin": descriptor}}
             )
             self.assertEqual((output / "payload.bin").read_bytes(), b"durable payload")
+
+    def test_resume_recomputes_a_self_consistently_corrupted_array(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "corpus"
+            request = "b" * 64
+            first = _BuildWorkspace(output, request)
+            member = first.write_npy(
+                "values.npy",
+                dtype="<i4",
+                shape=(4,),
+                fill=lambda values: values.__setitem__(
+                    slice(None), np.arange(4, dtype=np.int32)
+                ),
+            )
+            first.close()
+
+            corrupted = np.full(4, 9, dtype=np.int32)
+            with member.open("wb") as stream:
+                np.save(stream, corrupted, allow_pickle=False)
+            state = json.loads(first.state_path.read_text())
+            state["completed"]["values.npy"] = {
+                "path": "values.npy",
+                "size_bytes": member.stat().st_size,
+                "sha256": sha256_file(member),
+            }
+            first.state_path.write_bytes(canonical_json_bytes(state))
+
+            resumed = _BuildWorkspace(output, request)
+            resumed.write_npy(
+                "values.npy",
+                dtype="<i4",
+                shape=(4,),
+                fill=lambda values: values.__setitem__(
+                    slice(None), np.arange(4, dtype=np.int32)
+                ),
+            )
+            np.testing.assert_array_equal(
+                np.load(member, allow_pickle=False), np.arange(4, dtype=np.int32)
+            )
+            resumed.close()
+
+    def test_reproduction_receipt_cannot_be_deleted_with_owned_scratch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory, ledger, lanes, scenes = self._fixture(root)
+            corpus = assemble_full_corpus(
+                lanes,
+                root / "corpus",
+                inventory=inventory,
+                split_ledger=ledger,
+                scene_authority=scenes,
+            )
+            scratch = root / ".reproduction"
+
+            with self.assertRaisesRegex(ValueError, "receipt.*scratch"):
+                reproduce_full_corpus(
+                    corpus,
+                    lanes,
+                    scratch,
+                    scratch / "determinism.json",
+                    inventory=inventory,
+                    split_ledger=ledger,
+                    scene_authority=scenes,
+                )
+
+    def test_receipts_cannot_modify_the_immutable_reference_corpus(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory, ledger, lanes, scenes = self._fixture(root)
+            corpus = assemble_full_corpus(
+                lanes,
+                root / "corpus",
+                inventory=inventory,
+                split_ledger=ledger,
+                scene_authority=scenes,
+            )
+
+            with self.assertRaisesRegex(ValueError, "receipt.*corpus"):
+                verify_full_corpus(corpus, corpus / "verification.json")
+            with self.assertRaisesRegex(ValueError, "receipt.*corpus"):
+                reproduce_full_corpus(
+                    corpus,
+                    lanes,
+                    root / ".reproduction",
+                    corpus / "determinism.json",
+                    inventory=inventory,
+                    split_ledger=ledger,
+                    scene_authority=scenes,
+                )
 
     def test_verify_rejects_coherent_name_shard_and_request_mutations(self):
         with tempfile.TemporaryDirectory() as directory:

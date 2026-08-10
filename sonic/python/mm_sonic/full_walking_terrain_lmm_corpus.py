@@ -24,6 +24,7 @@ from resources.g1_terrain_builder.database import (
     derive_velocities,
 )
 from resources.g1_terrain_builder.features import _NORMALIZATION_WEIGHTS
+from resources.g1_terrain_builder.resample import resample_map
 from resources.g1_terrain_builder.scenes import (
     COORDINATE_SIGNATURE,
     SceneDefinition,
@@ -91,6 +92,26 @@ _SHA256_CHARS = frozenset("0123456789abcdef")
 _AT_FDCWD = -100
 _RENAME_NOREPLACE = 1
 _BLOCK_ROWS = 262_144
+_FROZEN_INVENTORY_SHA256 = (
+    "7d1efd01abba6eea86280cb7720f999173fd8cedca89ddf56a61caad81a341e4"
+)
+_FROZEN_SPLIT_LEDGER_SHA256 = (
+    "5185bd42c153518c80b67c3dd68f54e9122e2e81970893209e9235ff5cc2feb5"
+)
+_FROZEN_LANE_MANIFESTS = frozenset(
+    {
+        "e7cf6a83c65f642a69cf7e1f90b822a0e37cf4a5e8db0fe72298e1d2bfc19d78",
+        "21e504ee7f2ec83921174a5c541ec7e0a19b43655c4cf9f7e6650edbcd0f22c8",
+        "f8436be15845b1f42693d1161e453a8b628d53ebd5685480e066d3e9cbe4074b",
+        "ceff0acb02ac1d189eac9da96cc3a21bbe88fe65259afb85bbc488dc79d706b7",
+    }
+)
+_FROZEN_RANGE_KIND_COUNTS = {
+    "derived-grail-parent-range": 15_814,
+    "source-native-grail-slope": 23,
+    "source-native-takara": 1,
+    "pfnn": 1_161,
+}
 
 
 @dataclass(frozen=True)
@@ -256,7 +277,10 @@ class _BuildWorkspace:
         if self.output.exists() or self.output.is_symlink():
             self.close()
             raise FileExistsError(f"immutable corpus output exists: {self.output}")
-        self.state_path = self.staging / "resume.json"
+        # Keep the journal outside the directory that is atomically renamed.
+        # It therefore remains durable until publication without ever becoming
+        # an unauthenticated member of the immutable output tree.
+        self.state_path = self.output.parent / f".{self.output.name}.resume.json"
         if self.staging.exists():
             if self.staging.is_symlink() or not self.staging.is_dir():
                 self.close()
@@ -293,6 +317,7 @@ class _BuildWorkspace:
             os.fsync(stream.fileno())
         os.replace(temporary, self.state_path)
         _fsync_file(self.state_path)
+        _fsync_directory(self.state_path.parent)
         _fsync_directory(self.staging)
 
     def _completed_valid(self, relative: str) -> bool:
@@ -308,7 +333,14 @@ class _BuildWorkspace:
         )
 
     def write_bytes(self, relative: str, payload: bytes) -> Path:
-        if self._completed_valid(relative):
+        expected_sha256 = hashlib.sha256(payload).hexdigest()
+        descriptor = self.completed.get(relative)
+        if (
+            self._completed_valid(relative)
+            and descriptor is not None
+            and descriptor.get("size_bytes") == len(payload)
+            and descriptor.get("sha256") == expected_sha256
+        ):
             return self.staging / relative
         path = self.staging / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -332,8 +364,6 @@ class _BuildWorkspace:
         shape: tuple[int, ...],
         fill: Callable[[np.memmap], None],
     ) -> Path:
-        if self._completed_valid(relative):
-            return self.staging / relative
         path = self.staging / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         partial = path.with_name(f".{path.name}.partial")
@@ -348,6 +378,14 @@ class _BuildWorkspace:
         values.flush()
         del values
         _fsync_file(partial)
+        if self._completed_valid(relative):
+            descriptor = self.completed[relative]
+            if (
+                partial.stat().st_size == descriptor["size_bytes"]
+                and sha256_file(partial) == descriptor["sha256"]
+            ):
+                partial.unlink()
+                return path
         os.replace(partial, path)
         _fsync_directory(path.parent)
         self.completed[relative] = _member_descriptor(path, relative)
@@ -370,7 +408,9 @@ class _BuildWorkspace:
             manifest_path.unlink(missing_ok=True)
             _fsync_directory(self.staging)
             raise
-        self.state_path.unlink()
+        # The external resume journal is intentionally retained until after
+        # the no-replace rename. A crash before rename is resumable; a crash
+        # after rename has already published the exact validated directory.
         self.completed.pop("resume.json", None)
         _fsync_directory(self.staging)
         for directory, subdirectories, _files in os.walk(self.staging, topdown=False):
@@ -378,6 +418,8 @@ class _BuildWorkspace:
                 _fsync_directory(Path(directory) / name)
             _fsync_directory(Path(directory))
         _rename_noreplace(self.staging, self.output)
+        _fsync_directory(self.output.parent)
+        self.state_path.unlink(missing_ok=True)
         _fsync_directory(self.output.parent)
         self.close()
         return self.output
@@ -481,6 +523,123 @@ def _map_digest(values: np.ndarray, dtype: str) -> str:
     ).hexdigest()
 
 
+def _input_sha256(source: SourceRecord, role: str) -> str | None:
+    inputs = source.authority.get("inputs")
+    descriptor = inputs.get(role) if isinstance(inputs, Mapping) else None
+    digest = descriptor.get("sha256") if isinstance(descriptor, Mapping) else None
+    return digest if _is_sha256(digest) else None
+
+
+def _expected_source_map(
+    source: SourceRecord, record: RangeRecord
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Reconstruct a range's map from its independent inventory source kind."""
+
+    authority = record.authority
+    source_kind = source.authority.get("kind")
+    range_kind = authority.get("kind")
+    frames = authority.get("source_frame_count")
+    if type(frames) is not int or frames < 1:
+        raise ValueError("lane source map requires an exact source frame count")
+
+    if source_kind == "pfnn":
+        interval = authority.get("source_interval_120hz")
+        fit = authority.get("terrain_fit")
+        motion_sha256 = _input_sha256(source, "motion")
+        if (
+            range_kind != "pfnn"
+            or type(interval) is not list
+            or len(interval) != 2
+            or any(type(value) is not int for value in interval)
+            or not (0 <= interval[0] < interval[1] <= frames)
+            or not isinstance(fit, Mapping)
+            or motion_sha256 is None
+            or fit.get("source_sha256") != motion_sha256
+            or fit.get("source_start") != interval[0]
+            or fit.get("source_stop") != interval[1]
+        ):
+            raise ValueError("PFNN source map or fit differs from inventory authority")
+        first = interval[0] + (interval[0] & 1)
+        left = np.arange(first, interval[1], 2, dtype=np.int32)
+        right = left.copy()
+        alpha = np.zeros(len(left), dtype=np.float32)
+        if authority.get("output_rows_60hz") != len(left) or authority.get(
+            "absolute_source_rows_sha256"
+        ) != _map_digest(left, "<i4"):
+            raise ValueError("PFNN absolute 120-to-60 Hz source clock changed")
+        identity_keys = (
+            "schema",
+            "family",
+            "mode",
+            "source_sha256",
+            "patches_sha256",
+            "source_start",
+            "source_stop",
+            "selected_patch_index",
+            "beam_seed",
+            "maximum_objective_probes",
+            "maximum_rbf_centers",
+        )
+        if any(key not in fit for key in identity_keys):
+            raise ValueError("PFNN terrain fit identity is incomplete")
+        identity = {key: fit[key] for key in identity_keys}
+        if hashlib.sha256(canonical_json_bytes(identity)).hexdigest() != fit.get(
+            "fit_id"
+        ):
+            raise ValueError("PFNN terrain fit identity digest changed")
+        return left, right, alpha
+
+    if source_kind == "grail":
+        if range_kind == "derived-grail-parent-range":
+            if (
+                authority.get("parent_manifest_sha256")
+                != source.authority.get("bank_manifest_sha256")
+                or type(authority.get("parent_start")) is not int
+                or type(authority.get("parent_stop")) is not int
+                or authority["parent_stop"] - authority["parent_start"] != frames
+            ):
+                raise ValueError("inherited GRAIL parent authority changed")
+        elif range_kind == "source-native-grail-slope":
+            input_sha256 = authority.get("input_sha256")
+            source_inputs = source.authority.get("inputs")
+            expected_inputs = (
+                {
+                    role: descriptor.get("sha256")
+                    for role, descriptor in source_inputs.items()
+                    if isinstance(descriptor, Mapping)
+                }
+                if isinstance(source_inputs, Mapping)
+                else None
+            )
+            if input_sha256 != expected_inputs:
+                raise ValueError("source-native GRAIL input authority changed")
+        else:
+            raise ValueError("GRAIL range kind changed")
+        return resample_map(frames, 25.0, FPS)
+
+    if source_kind == "takara":
+        if range_kind != "source-native-takara" or authority.get(
+            "motion_sha256"
+        ) != _input_sha256(source, "motion"):
+            raise ValueError("Takara source authority changed")
+        return resample_map(frames, 50.0, FPS)
+
+    if source_kind == "fixture":
+        source_fps = source.authority.get("source_fps")
+        source_map = authority.get("source_map")
+        if (
+            range_kind != "fixture"
+            or type(source_fps) not in (int, float)
+            or not isinstance(source_map, Mapping)
+            or source_map.get("source_fps") != source_fps
+            or source_map.get("target_fps") not in (None, FPS)
+        ):
+            raise ValueError("fixture source map authority changed")
+        return resample_map(frames, float(source_fps), FPS)
+
+    raise ValueError(f"unsupported independent source-map authority {source_kind!r}")
+
+
 def _verify_terrain_semantics(
     source: SourceRecord,
     record: RangeRecord,
@@ -555,6 +714,9 @@ def _verify_lane_contents(
         left = lane.source_left_indices[start:stop]
         right = lane.source_right_indices[start:stop]
         alpha = lane.source_alpha[start:stop]
+        expected_left, expected_right, expected_alpha = _expected_source_map(
+            source, record
+        )
         source_frame_count = record.authority.get("source_frame_count")
         if (
             type(source_frame_count) is not int
@@ -570,6 +732,14 @@ def _verify_lane_contents(
             raise ValueError(
                 "lane source map requires an exact source frame count and bounded, "
                 "monotone source-local provenance"
+            )
+        if (
+            not np.array_equal(left, expected_left)
+            or not np.array_equal(right, expected_right)
+            or not np.array_equal(alpha, expected_alpha)
+        ):
+            raise ValueError(
+                "lane source map differs from the independently reconstructed clock"
             )
         source_map = record.authority.get("source_map")
         if isinstance(source_map, Mapping):
@@ -997,6 +1167,41 @@ def _ordered_ranges(
             "full corpus source terminal coverage changed: "
             f"missing={missing[:3]} unexpected={unexpected[:3]}"
         )
+    ranges_by_source: dict[str, set[str]] = {
+        source_id: set() for source_id in inventory_ids
+    }
+    for value in inputs:
+        ranges_by_source[value.source_id].add(value.record.range_id)
+    for source in inventory.sources:
+        expected = source.authority.get("expected_range_ids")
+        if expected is None:
+            continue
+        if (
+            type(expected) is not list
+            or not expected
+            or not all(type(range_id) is str for range_id in expected)
+            or ranges_by_source[source.source_id] != set(expected)
+        ):
+            raise ValueError(
+                f"source terminal range coverage changed for {source.source_id}"
+            )
+    if inventory.manifest_sha256 == _FROZEN_INVENTORY_SHA256:
+        lane_manifests = {lane.manifest_sha256 for lane in lanes}
+        kind_counts: dict[str, int] = {}
+        for value in inputs:
+            kind = value.record.authority.get("kind")
+            if type(kind) is not str:
+                raise ValueError("frozen range terminal kind is missing")
+            kind_counts[kind] = kind_counts.get(kind, 0) + 1
+        if (
+            lane_manifests != _FROZEN_LANE_MANIFESTS
+            or kind_counts != _FROZEN_RANGE_KIND_COUNTS
+            or len(inputs) != 16_999
+            or sum(value.rows for value in inputs) != 9_758_524
+        ):
+            raise ValueError(
+                "frozen full-corpus lane or terminal range coverage changed"
+            )
     return tuple(
         sorted(
             inputs,
@@ -1008,6 +1213,95 @@ def _ordered_ranges(
             ),
         )
     )
+
+
+def _terminal_outcomes(
+    records: Sequence[tuple[RangeRecord, str]],
+    inventory: FullWalkingInventory,
+) -> dict[str, object]:
+    """Build an exact per-source quality and excluded-block ledger."""
+
+    by_source: dict[str, list[RangeRecord]] = {
+        source.source_id: [] for source in inventory.sources
+    }
+    quality_range_counts = {quality: 0 for quality in QUALITY_IDS}
+    quality_row_counts = {quality: 0 for quality in QUALITY_IDS}
+    for record, source_id in records:
+        by_source[source_id].append(record)
+        quality_range_counts[record.quality] += 1
+        quality_row_counts[record.quality] += record.stop - record.start
+
+    sources = []
+    excluded_reason_counts: dict[str, int] = {}
+    for source in sorted(inventory.sources, key=lambda value: value.source_id):
+        source_records = by_source[source.source_id]
+        excluded_blocks: list[dict[str, object]] = []
+        if source.authority.get("kind") == "pfnn":
+            intervals = sorted(
+                tuple(record.authority.get("source_interval_120hz", ()))
+                for record in source_records
+            )
+            frame_counts = {
+                record.authority.get("source_frame_count") for record in source_records
+            }
+            if len(frame_counts) != 1 or any(
+                len(interval) != 2 or any(type(value) is not int for value in interval)
+                for interval in intervals
+            ):
+                raise ValueError("PFNN terminal outcome source bounds changed")
+            frame_count = next(iter(frame_counts))
+            cursor = 0
+            for start, stop in intervals:
+                if start < cursor or stop <= start or stop > frame_count:
+                    raise ValueError("PFNN terminal outcome intervals overlap")
+                if cursor < start:
+                    excluded_blocks.append(
+                        {
+                            "start": cursor,
+                            "stop": start,
+                            "reason": "not-admitted-or-invalid-terrain-fit",
+                        }
+                    )
+                cursor = stop
+            if cursor < frame_count:
+                excluded_blocks.append(
+                    {
+                        "start": cursor,
+                        "stop": frame_count,
+                        "reason": "not-admitted-or-invalid-terrain-fit",
+                    }
+                )
+        for block in excluded_blocks:
+            reason = str(block["reason"])
+            excluded_reason_counts[reason] = excluded_reason_counts.get(reason, 0) + 1
+        sources.append(
+            {
+                "source_id": source.source_id,
+                "family": source.family,
+                "ranges": len(source_records),
+                "rows": sum(record.stop - record.start for record in source_records),
+                "quality_range_counts": {
+                    quality: sum(record.quality == quality for record in source_records)
+                    for quality in QUALITY_IDS
+                },
+                "quality_row_counts": {
+                    quality: sum(
+                        record.stop - record.start
+                        for record in source_records
+                        if record.quality == quality
+                    )
+                    for quality in QUALITY_IDS
+                },
+                "excluded_blocks": excluded_blocks,
+            }
+        )
+    return {
+        "schema": "g1-full-walking-terminal-outcomes/v1",
+        "quality_range_counts": quality_range_counts,
+        "quality_row_counts": quality_row_counts,
+        "excluded_reason_counts": dict(sorted(excluded_reason_counts.items())),
+        "sources": sources,
+    }
 
 
 def _request_identity(
@@ -1212,6 +1506,15 @@ def assemble_full_corpus(
         )
         workspace.write_bytes("split-ledger.json", split_ledger_bytes(split_value))
         workspace.write_bytes("ranges.json", canonical_json_bytes(corpus_ranges))
+        workspace.write_bytes(
+            "terminal-outcomes.json",
+            canonical_json_bytes(
+                _terminal_outcomes(
+                    tuple((value.record, value.source_id) for value in ordered),
+                    inventory_value,
+                )
+            ),
+        )
         workspace.write_bytes("lane-bindings.json", canonical_json_bytes(lane_bindings))
         workspace.write_bytes(
             "metadata.json",
@@ -1556,9 +1859,7 @@ def assemble_full_corpus(
         }
         published = workspace.finish(
             manifest,
-            validator=lambda path: _load_full_corpus_details(
-                path, _allow_resume_state=True
-            ),
+            validator=lambda path: _verify_full_corpus_contents(path),
         )
     except BaseException:
         workspace.close()
@@ -2216,6 +2517,15 @@ def _verify_normalization_independent(corpus: FullWalkingCorpus) -> None:
 
 def _verify_full_corpus_contents(root: Path) -> Mapping[str, object]:
     corpus, inventory, ledger, lanes, ranges, manifest = _load_full_corpus_details(root)
+    terminal_outcomes = _parse_canonical_file(
+        corpus.root / "terminal-outcomes.json", "corpus terminal outcomes"
+    )
+    expected_terminal_outcomes = _terminal_outcomes(
+        tuple((record, source_id) for record, source_id, _lane, _index in ranges),
+        inventory,
+    )
+    if terminal_outcomes != expected_terminal_outcomes:
+        raise ValueError("corpus terminal outcome or exclusion ledger changed")
     for lane in lanes:
         _verify_lane_contents(lane, inventory, ledger)
     lane_by_sha = {lane.manifest_sha256: lane for lane in lanes}
@@ -2488,7 +2798,15 @@ def _verify_full_corpus_contents(root: Path) -> Mapping[str, object]:
 def verify_full_corpus(root: Path, receipt: Path) -> Path:
     """Independently reconstruct every lane/range and publish a receipt."""
 
-    result = _verify_full_corpus_contents(Path(root))
+    root = Path(root).resolve(strict=True)
+    receipt = Path(receipt).resolve()
+    try:
+        receipt.relative_to(root)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("verification receipt must be outside immutable corpus")
+    result = _verify_full_corpus_contents(root)
     return _publish_file_exclusive(canonical_json_bytes(dict(result)), Path(receipt))
 
 
@@ -2512,9 +2830,23 @@ def reproduce_full_corpus(
 ) -> Path:
     """Build a second corpus, compare every byte, then remove owned scratch."""
 
-    reference_result = _verify_full_corpus_contents(Path(corpus))
-    reference = load_full_corpus(Path(corpus))
-    scratch = Path(scratch)
+    reference_root = Path(corpus).resolve(strict=True)
+    scratch = Path(scratch).resolve()
+    receipt = Path(receipt).resolve()
+    try:
+        receipt.relative_to(scratch)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("reproduction receipt must be outside owned scratch")
+    try:
+        receipt.relative_to(reference_root)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("reproduction receipt must be outside immutable corpus")
+    reference_result = _verify_full_corpus_contents(reference_root)
+    reference = load_full_corpus(reference_root)
     reproduced_path = assemble_full_corpus(
         lanes,
         scratch,
@@ -2543,7 +2875,7 @@ def reproduce_full_corpus(
         "reproduced_manifest_sha256": load_full_corpus(reproduced_path).manifest_sha256,
         "members": reference_files,
     }
-    published = _publish_file_exclusive(canonical_json_bytes(result), Path(receipt))
+    published = _publish_file_exclusive(canonical_json_bytes(result), receipt)
     # This target was supplied as this command's dedicated scratch output and
     # has just been authenticated as the exact reproduced corpus.
     shutil.rmtree(reproduced_path)
