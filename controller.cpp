@@ -2567,8 +2567,11 @@ int main(int argc, char** argv)
         //---------
         
         float ui_lmm_hei = 330;
+        const float ui_lmm_height = lmm_enabled ? 65.0f : 40.0f;
         
-        GuiGroupBox(Rectangle{ 970, ui_lmm_hei, 290, 65 }, "learned motion matching");
+        GuiGroupBox(
+            Rectangle{ 970, ui_lmm_hei, 290, ui_lmm_height },
+            "learned motion matching");
 
         GuiLabel(
             Rectangle{ 990, ui_lmm_hei + 10, 250, 20 },
@@ -2590,7 +2593,7 @@ int main(int argc, char** argv)
         
         //---------
         
-        float ui_ctrl_hei = 405;
+        const float ui_ctrl_hei = lmm_enabled ? 405.0f : 380.0f;
         
         GuiGroupBox(Rectangle{ 970, ui_ctrl_hei, 290, 160 }, "controls");
 

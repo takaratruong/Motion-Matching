@@ -288,6 +288,23 @@ static void test_controller_exposes_fail_closed_lmm_mode()
           "controller logs and overlays the authenticated model scope");
 }
 
+static void test_controller_preserves_engine_specific_lmm_layout()
+{
+    const std::string source = read_controller_source();
+    check(source.find(
+              "const float ui_lmm_height = "
+              "lmm_enabled ? 65.0f : 40.0f;") != std::string::npos,
+          "ordinary keeps the 40-pixel LMM panel while LMM alone expands it");
+    check(source.find(
+              "const float ui_ctrl_hei = "
+              "lmm_enabled ? 405.0f : 380.0f;") != std::string::npos,
+          "ordinary keeps controls at y=380 while LMM alone moves them");
+    check(source.find(
+              "Rectangle{ 970, ui_lmm_hei, 290, ui_lmm_height }") !=
+              std::string::npos,
+          "the LMM panel consumes the engine-specific height");
+}
+
 static void test_controller_validates_ik_geometry_before_window()
 {
     const std::string source = read_controller_source();
@@ -1817,6 +1834,7 @@ int main()
     test_active_scene_sources_use_checked_v2_queries();
     test_controller_delegates_one_renderer_free_runtime_step();
     test_controller_exposes_fail_closed_lmm_mode();
+    test_controller_preserves_engine_specific_lmm_layout();
     test_controller_wires_idle_match_transition_cost();
     test_controller_validates_ik_geometry_before_window();
     test_controller_publishes_independent_travel_and_heading();

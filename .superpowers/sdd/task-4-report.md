@@ -288,3 +288,19 @@ git diff --check
 The Task 3 Python publisher changes were owned by the concurrent training
 lane and were not staged or modified here. No viewer or model executable was
 launched; the deferred learned 600-tick interactive gate remains unchanged.
+
+## Ordinary overlay geometry remediation (2026-08-09)
+
+Review found that the canary-scope overlay had unconditionally expanded the
+learned-motion-matching panel from 40 to 65 pixels and moved the controls from
+`y=380` to `y=405`, including in ordinary mode. The focused RED failed with:
+
+```text
+controller reset test failed: ordinary keeps the 40-pixel LMM panel while LMM alone expands it
+```
+
+The layout now selects `40/380` for ordinary mode and `65/405` only for LMM.
+The authenticated scope remains visible only on the LMM path. The focused
+controller-state test, controller syntax and full desktop link, and
+`git diff --check` passed. No viewer or GPU/model process was launched or
+modified.
