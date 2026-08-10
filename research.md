@@ -2564,3 +2564,27 @@ screens therefore report `registered_contact_refit_qualification: true` and
 natural stair, curb, and slope phrases before attempting any additional
 spatial authoring; this explicitly prioritizes good kinematics over whether a
 current SONIC tracker can reproduce them.
+
+The larger readable GRAIL bundle contributes 304 additional authored
+curb/slope pairs (147 curb and 157 slope) beyond the first 149-clip archive.
+Its uneven sources exposed a separate zero-amplitude failure: the clip-200
+irregular-slope source already had a 0.101-rad maximum joint step, 6.66 m/s^2
+root acceleration, 2.11 mm exact foot penetration, and zero body penetration,
+but the unnecessary sole IK refit increased stance drift to 25.98 mm and sole
+error to 37.42 mm.  A new `registered_source` path therefore preserves the
+authored lower body and cadence, attenuates only the upper limbs, derives
+two-stick command and stance labels from the delivered motion, and reruns the
+full serialized contact/collision audit.
+
+Rough terrain also cannot use the flat/stair assumption that every planted
+sole has terrain within 12 mm under three or four probes.  A rigid foot can
+legitimately bridge a groove while two probes carry support.  This relaxation
+is confined to unchanged registered rough sources: every detected stance
+frame must still retain at least two supported probes, closest contact must be
+within 10 mm, stance drift must stay below 10 mm, foot penetration below 5 mm,
+and body penetration zero.  Stairs and any authored warp retain the stricter
+three-probe/full-sole rule.  Under that geometry-aware rule, rough clip 200
+passes with four stance runs per foot, 7.52 mm maximum run drift, 2.11 mm foot
+penetration, and zero body penetration.  Dense review of its ten-second
+irregular rising passage shows an ordinary alternating gait rather than the
+discarded kick/shuffle prior.

@@ -23,9 +23,14 @@ import zarr
 from .build_c490_curb_slope_archive import DEFAULT_OUTPUT as DEFAULT_ARCHIVE
 from .build_grail_terrain_archive import DEFAULT_G1_MJCF
 from .build_stairs500_omnidirectional_pilots import (
+    WarpDiagnostics,
+    _fill_short_stance_gaps,
     _map_points,
     _path_coordinates,
+    _remove_short_stance_runs,
     _save_motion,
+    _stance_runs_maximum_drift,
+    _terrain_height,
     warp_motion,
 )
 from .compose_coherent_block_plan import _repair_exact_mesh_clearance
@@ -253,6 +258,124 @@ def _realized_stair_approach(
     }
 
 
+def _registered_source_motion(
+    motion: object,
+    *,
+    adapter: _G1FootfallAdapter,
+    target_mesh: TerrainMeshIndex,
+    path_progress: np.ndarray,
+) -> tuple[object, WarpDiagnostics, dict[str, np.ndarray]]:
+    """Label an authored terrain motion without changing its lower body."""
+
+    frame_count = len(motion.root_position_world)
+    targets: list[tuple[np.ndarray, np.ndarray]] = []
+    support_count = np.zeros((frame_count, 2), dtype=np.int16)
+    centres = np.zeros((frame_count, 2, 3), dtype=np.float64)
+    ray_z = float(np.max(target_mesh.vertices_world[:, 2]) + 1.0)
+    for frame, (root, quaternion, joints) in enumerate(
+        zip(
+            motion.root_position_world,
+            motion.root_quaternion_world_wxyz,
+            motion.joint_position,
+            strict=True,
+        )
+    ):
+        feet = adapter.sole_positions_for_pose(
+            root_position=np.asarray(root, dtype=np.float64),
+            root_quaternion_wxyz=np.asarray(quaternion, dtype=np.float64),
+            joints=np.asarray(joints, dtype=np.float64),
+        )
+        support = adapter.sole_support_points_for_pose(
+            root_position=np.asarray(root, dtype=np.float64),
+            root_quaternion_wxyz=np.asarray(quaternion, dtype=np.float64),
+            joints=np.asarray(joints, dtype=np.float64),
+        )
+        targets.append(
+            (
+                np.asarray(feet[0], dtype=np.float64),
+                np.asarray(feet[1], dtype=np.float64),
+            )
+        )
+        for foot in range(2):
+            centres[frame, foot] = np.mean(feet[foot], axis=0)
+            gaps = []
+            for point in support[foot]:
+                height = _terrain_height(target_mesh, point[:2], ray_z)
+                gaps.append(
+                    math.inf if not math.isfinite(height) else point[2] - height
+                )
+            support_count[frame, foot] = int(
+                np.count_nonzero(np.abs(np.asarray(gaps)) <= 0.010)
+            )
+
+    foot_speed = np.linalg.norm(
+        np.gradient(centres[:, :, :2], axis=0) * float(motion.fps), axis=2
+    )
+    stance = _remove_short_stance_runs(
+        _fill_short_stance_gaps(
+            (support_count >= 2) & (foot_speed <= 0.12),
+            maximum_gap_frames=2,
+        ),
+        minimum_run_frames=3,
+    )
+    target_array = np.asarray(targets, dtype=np.float64)
+    roots = np.asarray(motion.root_position_world, dtype=np.float64)
+    quaternions = np.asarray(
+        motion.root_quaternion_world_wxyz, dtype=np.float64
+    )
+    joints = np.asarray(motion.joint_position, dtype=np.float64)
+    root_acceleration = np.diff(roots, n=2, axis=0) * motion.fps * motion.fps
+    quaternion_dot = np.abs(np.sum(quaternions[1:] * quaternions[:-1], axis=1))
+    progress = np.asarray(path_progress, dtype=np.float64)
+    normalized_progress = (progress - np.min(progress)) / max(
+        float(np.ptp(progress)), 1.0e-8
+    )
+    extras = {
+        "target_sole_points_world": np.asarray(target_array, dtype=np.float32),
+        "authored_stance_mask": np.asarray(stance, dtype=bool),
+        "target_stance_support_point_count": np.asarray(
+            support_count, dtype=np.int16
+        ),
+        "path_normalized_progress": np.asarray(
+            normalized_progress, dtype=np.float32
+        ),
+        "path_lateral_offset_m": np.zeros(frame_count, dtype=np.float32),
+        "path_yaw_offset_rad": np.zeros(frame_count, dtype=np.float32),
+    }
+    advertised = support_count[stance]
+    diagnostics = WarpDiagnostics(
+        maximum_joint_correction_rad=0.0,
+        maximum_sole_target_error_m=0.0,
+        maximum_stance_sole_target_error_m=0.0,
+        maximum_swing_sole_target_error_m=0.0,
+        maximum_stance_run_drift_m=_stance_runs_maximum_drift(
+            centres, stance
+        ),
+        minimum_stance_support_point_count=(
+            int(np.min(advertised)) if len(advertised) else 0
+        ),
+        maximum_root_translation_step_m=float(
+            np.max(np.linalg.norm(np.diff(roots, axis=0), axis=1))
+        ),
+        maximum_root_rotation_step_rad=float(
+            np.max(2.0 * np.arccos(np.clip(quaternion_dot, 0.0, 1.0)))
+        ),
+        maximum_joint_step_rad=float(np.max(np.abs(np.diff(joints, axis=0)))),
+        maximum_root_acceleration_m_s2=float(
+            np.max(np.linalg.norm(root_acceleration, axis=1))
+        ),
+        maximum_root_anchor_shift_m=0.0,
+        maximum_lateral_offset_m=0.0,
+        lateral_offset_range_m=0.0,
+        maximum_path_angle_deg=0.0,
+        maximum_facing_offset_deg=0.0,
+        realized_root_progress_range_m=float(np.ptp(progress)),
+        realized_root_lateral_range_m=0.0,
+        realized_root_vertical_range_m=float(np.ptp(roots[:, 2])),
+    )
+    return motion, diagnostics, extras
+
+
 def build_clip(
     *,
     archive_path: Path,
@@ -367,6 +490,7 @@ def build_clip(
     )
     reports: list[dict[str, object]] = []
     for mode in tuple(modes):
+        registered_source = str(mode) == "registered_source"
         registered_contact_refit = str(mode) in (
             "registered_contact_refit",
             # Backward-compatible alias for the first canary only.  New banks
@@ -374,10 +498,14 @@ def build_clip(
             "registered_identity",
         )
         mapping_mode = (
-            "cowarp_diagonal_right" if registered_contact_refit else str(mode)
+            "cowarp_diagonal_right"
+            if registered_contact_refit or registered_source
+            else str(mode)
         )
         applied_amplitude = (
-            0.0 if registered_contact_refit else float(maximum_amplitude_m)
+            0.0
+            if registered_contact_refit or registered_source
+            else float(maximum_amplitude_m)
         )
         summary["attempted"] = int(summary["attempted"]) + 1
         destination = clip_root / str(mode)
@@ -389,7 +517,9 @@ def build_clip(
             "source_motion": str((source_root / "motion.npz").resolve()),
             "active_route_interval_m": [active_start, active_stop],
             "registered_contact_refit_qualification": registered_contact_refit,
+            "registered_source_qualification": registered_source,
             "source_motion_unchanged": False,
+            "source_lower_body_unchanged": registered_source,
             "applied_maximum_amplitude_m": applied_amplitude,
             "status": "rejected",
         }
@@ -406,23 +536,31 @@ def build_clip(
             terrain_usd = write_terrain_usd(
                 target_mesh, destination / "terrain.usda"
             )
-            motion, diagnostics, extras = warp_motion(
-                source,
-                adapter=adapter,
-                source_mesh=source_mesh,
-                target_mesh=target_mesh,
-                target_route=None,
-                direction_xy=direction,
-                active_start_m=active_start,
-                active_stop_m=active_stop,
-                mode=mapping_mode,
-                maximum_amplitude_m=applied_amplitude,
-                # Swing feet follow the pelvis-local transform so a leading
-                # foot does not enter the curve before the body can reach it.
-                # Complete stance runs are then locked through exact paired
-                # face correspondence inside ``warp_motion``.
-                spatial_sole_mapping=False,
-            )
+            if registered_source:
+                motion, diagnostics, extras = _registered_source_motion(
+                    source,
+                    adapter=adapter,
+                    target_mesh=target_mesh,
+                    path_progress=progress,
+                )
+            else:
+                motion, diagnostics, extras = warp_motion(
+                    source,
+                    adapter=adapter,
+                    source_mesh=source_mesh,
+                    target_mesh=target_mesh,
+                    target_route=None,
+                    direction_xy=direction,
+                    active_start_m=active_start,
+                    active_stop_m=active_stop,
+                    mode=mapping_mode,
+                    maximum_amplitude_m=applied_amplitude,
+                    # Swing feet follow the pelvis-local transform so a leading
+                    # foot does not enter the curve before the body can reach it.
+                    # Complete stance runs are then locked through exact paired
+                    # face correspondence inside ``warp_motion``.
+                    spatial_sole_mapping=False,
+                )
             temporal_inbetweening: dict[str, float] = {
                 "added_frame_count": 0.0,
                 "maximum_interval_subdivision": 1.0,
@@ -536,6 +674,7 @@ def build_clip(
             )
             realized = bool(
                 registered_contact_refit
+                or registered_source
                 or (
                     # The requested-angle limiter can land a few tenths of a
                     # millimetre below the nominal 5 cm display threshold.
@@ -607,6 +746,12 @@ def build_clip(
                     target_mesh=target_mesh,
                     ground_fallback_height_m=float(
                         np.min(target_mesh.vertices_world[:, 2])
+                    ),
+                    maximum_core_stance_probe_hover_m=(
+                        0.10 if registered_source else 0.012
+                    ),
+                    minimum_core_stance_support_point_count=(
+                        2 if registered_source else 3
                     ),
                 )
                 report["stance_contact_audit"] = contact

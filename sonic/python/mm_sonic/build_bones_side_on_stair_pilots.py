@@ -1762,6 +1762,7 @@ def _audit_stance_contact_support(
     maximum_stance_target_error_m: float = 0.012,
     maximum_stance_drift_m: float = 0.012,
     maximum_core_stance_probe_hover_m: float = 0.012,
+    minimum_core_stance_support_point_count: int = 3,
 ) -> dict[str, object]:
     """Reject collision-free clips whose authored stance feet are hovering."""
 
@@ -1868,7 +1869,8 @@ def _audit_stance_contact_support(
         and maximum_closest_distance <= float(support_tolerance_m)
         and maximum_target_error <= float(maximum_stance_target_error_m)
         and maximum_drift <= float(maximum_stance_drift_m)
-        and minimum_core_support >= 3
+        and minimum_core_support
+        >= int(minimum_core_stance_support_point_count)
         and maximum_core_hover <= float(maximum_core_stance_probe_hover_m)
     )
     return {
@@ -1886,6 +1888,9 @@ def _audit_stance_contact_support(
         ),
         "maximum_any_stance_probe_hover_m": float(max(all_probe_hover)),
         "minimum_core_stance_support_point_count": minimum_core_support,
+        "minimum_core_stance_support_point_count_threshold": int(
+            minimum_core_stance_support_point_count
+        ),
         "maximum_core_stance_probe_hover_m": maximum_core_hover,
         "maximum_core_stance_probe_hover_threshold_m": float(
             maximum_core_stance_probe_hover_m
