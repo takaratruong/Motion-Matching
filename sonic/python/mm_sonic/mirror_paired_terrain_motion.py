@@ -241,6 +241,12 @@ def build(
         ground_fallback_height_m=float(
             np.min(mirrored_terrain.vertices_world[:, 2])
         ),
+        maximum_core_stance_probe_hover_m=(
+            0.10 if bool(source.get("registered_source_qualification")) else 0.012
+        ),
+        minimum_core_stance_support_point_count=(
+            2 if bool(source.get("registered_source_qualification")) else 3
+        ),
     )
     stance = np.asarray(arrays["authored_stance_mask"], dtype=bool)
     support = np.asarray(
@@ -285,6 +291,9 @@ def build(
         "stance_spans_per_foot": spans,
         "supported_stance_frames_per_foot": supported_frames,
         "balanced_two_foot_support_accepted": balanced,
+        "registered_source_qualification": bool(
+            source.get("registered_source_qualification")
+        ),
     }
     if render and mirrored_report["status"] == "accepted":
         media = render_stitched_motion(

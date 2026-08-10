@@ -2588,3 +2588,14 @@ passes with four stance runs per foot, 7.52 mm maximum run drift, 2.11 mm foot
 penetration, and zero body penetration.  Dense review of its ten-second
 irregular rising passage shows an ordinary alternating gait rather than the
 discarded kick/shuffle prior.
+
+Exact scene reflection is now enabled for these unchanged registered rough
+sources without weakening the ordinary stair/warp admission path.  The
+clip-200 canary mirrors the robot joints, stance histories, command labels,
+support masks, terrain vertices, and triangle winding together, then reruns
+the serialized contact and collision audits.  It is independently accepted
+with 2.11 mm maximum foot penetration, zero forbidden-body penetration, 7.52
+mm stance-run drift, and at least two supporting sole probes throughout every
+detected stance.  This supplies a mechanically paired left/right example while
+preserving the authored lower-body gait rather than synthesizing a second
+terrain maneuver.
