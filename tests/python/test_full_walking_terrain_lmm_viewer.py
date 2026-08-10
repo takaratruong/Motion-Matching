@@ -10,6 +10,7 @@ from unittest import mock
 import mm_sonic.full_walking_terrain_lmm_viewer as viewer_module
 import numpy as np
 import pytest
+from resources.g1_terrain_builder.artifacts import canonical_json_bytes
 from mm_sonic.full_walking_terrain_lmm_viewer import (
     FORMAL_SCENE_IDS,
     FULL_LABEL,
@@ -540,10 +541,7 @@ def test_formal_identity_requires_separate_exact_deterministic_rebuild_receipt(
             }
         },
     }
-    _write_authority(
-        receipt_path,
-        (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode(),
-    )
+    _write_authority(receipt_path, canonical_json_bytes(receipt))
     monkeypatch.setattr(viewer_module, "_REPOSITORY_ROOT", tmp_path)
 
     current = viewer_module._full_corpus_authority(corpus)
@@ -552,9 +550,11 @@ def test_formal_identity_requires_separate_exact_deterministic_rebuild_receipt(
     assert current["determinism_receipt_schema"] == receipt["schema"]
     assert isinstance(current["determinism_receipt_sha256"], str)
 
-    receipt_path.write_text("{}\n")
-    tampered = viewer_module._full_corpus_authority(corpus)
-    assert tampered["determinism_receipt_current"] is False
+    receipt_path.write_bytes(
+        (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    )
+    noncanonical = viewer_module._full_corpus_authority(corpus)
+    assert noncanonical["determinism_receipt_current"] is False
 
 
 def test_full_view_passes_full_identity_and_visible_label_overrides(

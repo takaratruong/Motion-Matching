@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from resources.g1_terrain_builder.artifacts import canonical_json_bytes
 
 from .full_walking_terrain_lmm_evaluation import (
     EvaluationSeries,
@@ -332,18 +333,7 @@ def _determinism_receipt_authority(
     canonical = False
     if receipt and payload is not None:
         try:
-            canonical = (
-                payload
-                == (
-                    json.dumps(
-                        dict(receipt),
-                        sort_keys=True,
-                        separators=(",", ":"),
-                        allow_nan=False,
-                    )
-                    + "\n"
-                ).encode()
-            )
+            canonical = payload == canonical_json_bytes(dict(receipt))
         except (TypeError, ValueError):
             canonical = False
     current = (
