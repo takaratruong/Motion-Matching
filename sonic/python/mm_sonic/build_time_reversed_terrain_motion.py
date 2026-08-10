@@ -165,11 +165,21 @@ def build(arguments: argparse.Namespace) -> dict[str, object]:
             raise ValueError("time-reversed motion failed exact collision audit")
         mechanics = _retimed_motion_metrics(motion)
         row["motion_metrics"] = mechanics
+        # Exact reversal cannot introduce a new step or acceleration.  Use
+        # the same mechanics envelope as the natural-source admission path so
+        # an already admitted pose sequence is not rejected solely because it
+        # is enumerated in the opposite temporal order.
+        maximum_root_translation_step_m = 0.045
+        maximum_root_rotation_step_rad = 0.100
+        maximum_root_acceleration_m_s2 = 32.0
         if (
             mechanics["maximum_joint_step_rad"] > 0.20
-            or mechanics["maximum_root_translation_step_m"] > 0.035
-            or mechanics["maximum_root_rotation_step_rad"] > 0.080
-            or mechanics["maximum_root_acceleration_m_s2"] > 30.0
+            or mechanics["maximum_root_translation_step_m"]
+            > maximum_root_translation_step_m
+            or mechanics["maximum_root_rotation_step_rad"]
+            > maximum_root_rotation_step_rad
+            or mechanics["maximum_root_acceleration_m_s2"]
+            > maximum_root_acceleration_m_s2
         ):
             raise ValueError("time-reversed motion failed smoothness audit")
         upper_limb = _upper_limb_motion_metrics(

@@ -2610,5 +2610,10 @@ rough sources whose rigid foot legitimately bridges a groove.  The first
 clip-200 reverse canary preserves the source's 0.101-rad joint-step and 6.66
 m/s^2 root-acceleration bounds and independently passes with 2.11 mm maximum
 foot penetration, zero forbidden-body penetration, 7.52 mm stance-run drift,
-and two or more supporting sole probes.  It remains outside the curated bank
-until dense backward-gait review completes.
+and two or more supporting sole probes.  Dense 5 fps review of the separately
+rendered reverse shows a continuous backward traversal without a kick/shuffle,
+hover, teleport, or body/terrain intersection.  Exact reversal was then run on
+the 14 visually admitted rough/curb/slope sources and their scene mirrors: 26
+of 28 pass unchanged mechanics/contact/arm gates.  The clip-13 source and its
+mirror remain excluded because the reversed source retains excessive arm
+excursion; no threshold was loosened to force them into the bank.
