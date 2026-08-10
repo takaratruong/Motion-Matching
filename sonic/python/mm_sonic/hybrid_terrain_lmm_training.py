@@ -8,6 +8,8 @@ no complete training table is ever materialized or copied to CUDA.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import io
 import json
@@ -19,6 +21,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
+from typing import Protocol
 
 import numpy as np
 
@@ -37,6 +40,7 @@ _MODEL_SCHEMA = "g1-hybrid-terrain-lmm-model/v1"
 _TRAINING_SCHEMA = "g1-hybrid-terrain-lmm-training/v1"
 _EVALUATION_SCHEMA = "g1-hybrid-terrain-lmm-evaluation/v1"
 _MANIFEST_SCHEMA = "g1-hybrid-terrain-lmm-manifest/v1"
+_FULL_WALKING_MODEL_SCHEMA = "g1-full-walking-terrain-lmm-model/v1"
 _ARTIFACT_NAMES = ("latent.npy", "model.pt", "training.json", "evaluation.json")
 _CONTINUOUS_OUTPUTS = 456
 _OUTPUTS = 458
@@ -97,8 +101,10 @@ class HybridModelConfig:
                 raise ValueError(f"{name} must be finite and non-negative")
         if self.learning_rate == 0.0:
             raise ValueError("learning_rate must be positive")
-        if type(self.dt) is not float or self.dt != 0.04:
-            raise ValueError("the hybrid terrain LMM ABI requires dt=0.04 exactly")
+        if type(self.dt) is not float or self.dt not in (0.04, 1.0 / 60.0):
+            raise ValueError(
+                "the hybrid terrain LMM ABI requires dt=0.04 or dt=1/60 exactly"
+            )
         if type(self.fit_all_rows) is not bool:
             raise ValueError("fit_all_rows must be an exact bool")
         if self.loss_profile not in _LOSS_PROFILES:
@@ -165,6 +171,14 @@ class TrainingBatch:
     target: np.ndarray
 
 
+class TrainingRowSampler(Protocol):
+    """Narrow post-coverage sampling seam shared by corpus-specific wrappers."""
+
+    def sample(
+        self, batch_size: int, generator: np.random.Generator
+    ) -> np.ndarray: ...
+
+
 @dataclass
 class HybridGenerator:
     root: Path | None
@@ -177,6 +191,7 @@ class HybridGenerator:
     output_scale: torch.Tensor
     latent: np.ndarray | None
     corpus_manifest_sha256: str
+    artifact_identity: Mapping[str, object] | None
     device: torch.device
     manifest: Mapping[str, object]
     training_receipt: Mapping[str, object]
@@ -184,6 +199,8 @@ class HybridGenerator:
     manifest_sha256: str | None
     canonical_selection_verified: bool
     selection_provenance_verified: bool
+    test_receipt_current: bool
+    refit_receipt_current: bool
 
     def encode_rows(self, corpus: object, rows: np.ndarray) -> np.ndarray:
         indices = _row_indices(rows, _row_count(corpus))
@@ -276,6 +293,47 @@ def _mask(corpus: object, name: str) -> np.ndarray:
     return values
 
 
+def _eligible_mask(corpus: object) -> np.ndarray:
+    if getattr(corpus, "eligible_mask", None) is None:
+        return np.ones(_row_count(corpus), dtype=bool)
+    return _mask(corpus, "eligible_mask")
+
+
+def _training_mask(corpus: object) -> np.ndarray:
+    train = _mask(corpus, "train_mask")
+    if getattr(corpus, "eligible_mask", None) is not None:
+        train = np.asarray(train & _eligible_mask(corpus), dtype=bool)
+    return train
+
+
+def _evaluation_mask(corpus: object) -> np.ndarray:
+    if getattr(corpus, "evaluation_mask", None) is not None:
+        evaluation = _mask(corpus, "evaluation_mask")
+    elif getattr(corpus, "validation_mask", None) is not None:
+        evaluation = _mask(corpus, "validation_mask")
+    else:
+        raise ValueError(
+            "corpus must expose evaluation_mask or an explicit validation_mask"
+        )
+    if getattr(corpus, "eligible_mask", None) is not None:
+        evaluation = np.asarray(evaluation & _eligible_mask(corpus), dtype=bool)
+    return evaluation
+
+
+def _fitted_mask(corpus: object, config: HybridModelConfig) -> np.ndarray:
+    if not config.fit_all_rows:
+        return _training_mask(corpus)
+    if getattr(corpus, "fit_mask", None) is not None:
+        fitted = _mask(corpus, "fit_mask")
+    else:
+        fitted = _eligible_mask(corpus)
+    if not np.any(fitted):
+        raise ValueError("all-row fit mask must select at least one eligible row")
+    if np.any(fitted & ~_eligible_mask(corpus)):
+        raise ValueError("all-row fit mask includes an ineligible row")
+    return fitted
+
+
 def _validate_corpus(corpus: object) -> None:
     artifacts = getattr(corpus, "artifacts", None)
     if artifacts is None:
@@ -303,10 +361,18 @@ def _validate_corpus(corpus: object) -> None:
     for first in range(0, frames, validation_chunk):
         if not np.isfinite(features[first : first + validation_chunk]).all():
             raise ValueError("corpus matching features must be finite float32")
-    train = _mask(corpus, "train_mask")
-    evaluation = _mask(corpus, "evaluation_mask")
-    if np.any(train & evaluation) or not np.all(train | evaluation):
-        raise ValueError("train/evaluation masks must be a disjoint complete partition")
+    train = _training_mask(corpus)
+    evaluation = _evaluation_mask(corpus)
+    eligible = _eligible_mask(corpus)
+    if np.any(train & evaluation):
+        raise ValueError("train/evaluation masks must be disjoint")
+    if getattr(corpus, "eligible_mask", None) is None:
+        if not np.all(train | evaluation):
+            raise ValueError(
+                "legacy train/evaluation masks must be a complete partition"
+            )
+    elif np.any((train | evaluation) & ~eligible):
+        raise ValueError("train/evaluation masks include an ineligible row")
     if not np.any(train) or not np.any(evaluation):
         raise ValueError("train and evaluation masks must both be non-empty")
     _family_rows(corpus)
@@ -376,7 +442,7 @@ def sample_training_rows(
         raise ValueError("batch_size must be a positive integer")
     if not isinstance(generator, np.random.Generator):
         raise TypeError("generator must be numpy.random.Generator")
-    train = _mask(corpus, "train_mask")
+    train = _training_mask(corpus)
     families = _family_rows(corpus)
     family_values = np.unique(families)
     if batch_size < len(family_values):
@@ -405,7 +471,7 @@ class _FamilyTrainingPools:
         cls, corpus: object, eligible: np.ndarray | None = None
     ) -> _FamilyTrainingPools:
         train = (
-            _mask(corpus, "train_mask") if eligible is None else np.asarray(eligible)
+            _training_mask(corpus) if eligible is None else np.asarray(eligible)
         )
         if train.dtype != np.bool_ or train.shape != (_row_count(corpus),):
             raise ValueError("family sampling eligibility must be a row boolean mask")
@@ -447,7 +513,7 @@ def iter_coverage_batches(
         raise ValueError("batch_size must be a positive integer")
     if not isinstance(generator, np.random.Generator):
         raise TypeError("generator must be numpy.random.Generator")
-    rows = np.flatnonzero(_mask(corpus, "train_mask")).astype(np.int64, copy=False)
+    rows = np.flatnonzero(_training_mask(corpus)).astype(np.int64, copy=False)
     yield from _iter_coverage_row_batches(rows, batch_size, generator)
 
 
@@ -854,6 +920,31 @@ def calculate_physical_metrics(
     return accumulator.finish()
 
 
+def evaluate_hybrid_rows(
+    corpus: object,
+    generator: HybridGenerator,
+    rows: np.ndarray,
+    *,
+    chunk_size: int | None = None,
+) -> dict[str, object]:
+    """Evaluate one explicit population without inventing a split contract."""
+
+    if not isinstance(generator, HybridGenerator):
+        raise TypeError("generator must be a HybridGenerator")
+    if generator.corpus_manifest_sha256 != _corpus_manifest_sha256(corpus):
+        raise ValueError("generator is bound to a different corpus manifest")
+    selected = _row_indices(rows, _row_count(corpus))
+    size = generator.config.evaluation_chunk_size if chunk_size is None else chunk_size
+    if type(size) is not int or size <= 0:
+        raise ValueError("evaluation chunk_size must be a positive integer")
+    accumulator = _MetricAccumulator.empty()
+    for first in range(0, len(selected), size):
+        chunk = selected[first : first + size]
+        decoded = generator.decode_corpus_rows(corpus, chunk)
+        accumulator.add(corpus, chunk, decoded)
+    return accumulator.finish()
+
+
 def evaluate_hybrid_generator(
     corpus: object,
     generator: HybridGenerator | str | Path,
@@ -874,17 +965,14 @@ def evaluate_hybrid_generator(
     if type(size) is not int or size <= 0:
         raise ValueError("evaluation chunk_size must be a positive integer")
     results: dict[str, object] = {}
-    for receipt_name, mask_name in (
-        ("train", "train_mask"),
-        ("source_held_out", "evaluation_mask"),
+    for receipt_name, population_mask in (
+        ("train", _training_mask(corpus)),
+        ("source_held_out", _evaluation_mask(corpus)),
     ):
-        selected = np.flatnonzero(_mask(corpus, mask_name)).astype(np.int64, copy=False)
-        accumulator = _MetricAccumulator.empty()
-        for first in range(0, len(selected), size):
-            rows = selected[first : first + size]
-            decoded = generator.decode_corpus_rows(corpus, rows)
-            accumulator.add(corpus, rows, decoded)
-        results[receipt_name] = accumulator.finish()
+        selected = np.flatnonzero(population_mask).astype(np.int64, copy=False)
+        results[receipt_name] = evaluate_hybrid_rows(
+            corpus, generator, selected, chunk_size=size
+        )
     held_out = results["source_held_out"]
     assert isinstance(held_out, dict)
     canonical_selection_accepted = bool(
@@ -915,6 +1003,15 @@ def evaluate_hybrid_generator(
             else "source-held-out-selection"
         ),
     }
+    if generator.artifact_identity is not None:
+        receipt["artifact_identity"] = dict(generator.artifact_identity)
+        if (
+            generator.artifact_identity.get("schema")
+            == _FULL_WALKING_MODEL_SCHEMA
+            and generator.artifact_identity.get("stage") == "selection"
+        ):
+            receipt["selection_population"] = "validation"
+            receipt["validation"] = held_out
     _require_json_finite(receipt)
     return receipt
 
@@ -986,6 +1083,8 @@ def _checkpoint_bytes(generator: HybridGenerator) -> bytes:
         "output_scale": generator.output_scale.detach().cpu(),
         "variant": generator.config.variant,
     }
+    if generator.artifact_identity is not None:
+        checkpoint["artifact_identity"] = dict(generator.artifact_identity)
     output = io.BytesIO()
     torch.save(checkpoint, output)
     return output.getvalue()
@@ -1041,11 +1140,70 @@ def _atomic_write(path: Path, payload: bytes) -> None:
         raise
 
 
+def _rename_directory_noreplace(source: Path, destination: Path) -> None:
+    """Atomically publish one model directory without replacing a racing owner."""
+
+    library = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(library, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOSYS, "immutable model publication requires renameat2")
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        -100,
+        os.fsencode(source),
+        -100,
+        os.fsencode(destination),
+        1,
+    )
+    if result == 0:
+        directory = os.open(
+            destination.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        return
+    error_number = ctypes.get_errno()
+    if error_number in (errno.EEXIST, errno.ENOTEMPTY):
+        raise FileExistsError(
+            error_number,
+            f"immutable model output already exists: {destination}",
+            destination,
+        )
+    raise OSError(error_number, os.strerror(error_number), destination)
+
+
 def _json_bytes(value: object) -> bytes:
     _require_json_finite(value)
     return (
         json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
     ).encode("utf-8")
+
+
+def _normalized_artifact_identity(
+    value: Mapping[str, object] | None,
+) -> dict[str, object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or not value:
+        raise ValueError("artifact identity must be a non-empty mapping")
+    if not all(type(key) is str and key for key in value):
+        raise ValueError("artifact identity keys must be non-empty strings")
+    try:
+        normalized = json.loads(_json_bytes(dict(value)))
+    except (TypeError, ValueError) as error:
+        raise ValueError("artifact identity must be canonical JSON data") from error
+    if not isinstance(normalized, dict) or not normalized:
+        raise ValueError("artifact identity must be a non-empty JSON object")
+    return normalized
 
 
 def _require_json_finite(value: object) -> None:
@@ -1110,6 +1268,7 @@ def _validated_evaluation_receipt(
     corpus: object,
     config: HybridModelConfig,
     corpus_manifest_sha256: str,
+    artifact_identity: Mapping[str, object] | None,
 ) -> bool:
     if not isinstance(receipt, dict):
         # Artifact-contract violations use ValueError consistently at load seams.
@@ -1119,8 +1278,8 @@ def _validated_evaluation_receipt(
     train_accepted = _physical_metrics_receipt_accepted(train)
     held_out_accepted = _physical_metrics_receipt_accepted(held_out)
     assert isinstance(train, dict) and isinstance(held_out, dict)
-    train_rows = int(np.count_nonzero(_mask(corpus, "train_mask")))
-    held_out_rows = int(np.count_nonzero(_mask(corpus, "evaluation_mask")))
+    train_rows = int(np.count_nonzero(_training_mask(corpus)))
+    held_out_rows = int(np.count_nonzero(_evaluation_mask(corpus)))
     if train.get("rows") != train_rows or held_out.get("rows") != held_out_rows:
         raise ValueError("model evaluation population row counts are incomplete")
     canonical = bool(train_accepted and held_out_accepted)
@@ -1129,6 +1288,11 @@ def _validated_evaluation_receipt(
         held_out["fk_body_position_p95_m"],
         1.0 - min(held_out["contact_f1"]),
     ]
+    full_walking_selection = bool(
+        artifact_identity is not None
+        and artifact_identity.get("schema") == _FULL_WALKING_MODEL_SCHEMA
+        and artifact_identity.get("stage") == "selection"
+    )
     if (
         receipt.get("schema") != _EVALUATION_SCHEMA
         or receipt.get("accepted") is not False
@@ -1146,6 +1310,16 @@ def _validated_evaluation_receipt(
             else "source-held-out-selection"
         )
         or receipt.get("selection_tuple") != expected_tuple
+        or receipt.get("artifact_identity")
+        != (None if artifact_identity is None else dict(artifact_identity))
+        or (
+            full_walking_selection
+            and (
+                receipt.get("selection_population") != "validation"
+                or receipt.get("validation") != held_out
+                or "test" in receipt
+            )
+        )
     ):
         raise ValueError("model canonical evaluation status is inconsistent")
     return canonical
@@ -1158,15 +1332,12 @@ def _validated_training_receipt(
     config: HybridModelConfig,
     corpus_manifest_sha256: str,
     canonical: bool,
+    artifact_identity: Mapping[str, object] | None,
 ) -> None:
     if not isinstance(receipt, dict):
         # Artifact-contract violations use ValueError consistently at load seams.
         raise ValueError("model training receipt is invalid")  # noqa: TRY004
-    fitted_rows = (
-        _row_count(corpus)
-        if config.fit_all_rows
-        else int(np.count_nonzero(_mask(corpus, "train_mask")))
-    )
+    fitted_rows = int(np.count_nonzero(_fitted_mask(corpus, config)))
     expected_batches = math.ceil(fitted_rows / config.batch_size)
     losses = receipt.get("losses")
     if (
@@ -1194,6 +1365,8 @@ def _validated_training_receipt(
         )
         or not losses
         or receipt.get("final_loss") != losses[-1]
+        or receipt.get("artifact_identity")
+        != (None if artifact_identity is None else dict(artifact_identity))
     ):
         raise ValueError("model training coverage/status is inconsistent")
 
@@ -1238,6 +1411,7 @@ def _selection_model_receipt(
         )
     if (
         generator.config.variant != config.variant
+        or generator.config.dt != config.dt
         or generator.config.loss_profile != config.loss_profile
         or generator.config.loss_weights != config.loss_weights
     ):
@@ -1268,12 +1442,19 @@ def train_hybrid_generator(
     config: HybridModelConfig | None = None,
     selection_model: str | Path | None = None,
     selection_model_manifest_sha256: str | None = None,
+    post_coverage_sampler: TrainingRowSampler | None = None,
+    artifact_identity: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Train one immutable variant with a mandatory full train-row coverage pass."""
 
     config = HybridModelConfig() if config is None else config
     if not isinstance(config, HybridModelConfig):
         raise TypeError("config must be HybridModelConfig")
+    identity = _normalized_artifact_identity(artifact_identity)
+    if post_coverage_sampler is not None and not callable(
+        getattr(post_coverage_sampler, "sample", None)
+    ):
+        raise TypeError("post_coverage_sampler must implement sample()")
     _validate_corpus(corpus)
     output = Path(output_directory).expanduser().resolve()
     if output.exists():
@@ -1299,11 +1480,7 @@ def train_hybrid_generator(
         )
     device = torch.device(config.device)
     _configure_determinism(config.seed, device)
-    fitted_mask = (
-        np.ones(_row_count(corpus), dtype=bool)
-        if config.fit_all_rows
-        else _mask(corpus, "train_mask")
-    )
+    fitted_mask = _fitted_mask(corpus, config)
     train_rows = np.flatnonzero(fitted_mask).astype(np.int64, copy=False)
     compressor_mean, compressor_scale, output_mean, output_scale = (
         _streaming_normalization(corpus, train_rows, config.normalization_chunk_size)
@@ -1321,6 +1498,9 @@ def train_hybrid_generator(
         output_scale=_to_device(output_scale, device),
         latent=None,
         corpus_manifest_sha256=corpus_hash,
+        artifact_identity=(
+            None if identity is None else MappingProxyType(dict(identity))
+        ),
         device=device,
         manifest=MappingProxyType({}),
         training_receipt=MappingProxyType({}),
@@ -1328,6 +1508,8 @@ def train_hybrid_generator(
         manifest_sha256=None,
         canonical_selection_verified=False,
         selection_provenance_verified=False,
+        test_receipt_current=False,
+        refit_receipt_current=False,
     )
     optimizer = torch.optim.AdamW(
         (*compressor.parameters(), *decompressor.parameters()),
@@ -1335,14 +1517,27 @@ def train_hybrid_generator(
         weight_decay=config.weight_decay,
     )
     random = np.random.default_rng(config.seed)
-    family_pools = _FamilyTrainingPools.from_corpus(corpus, fitted_mask)
+    family_pools = (
+        _FamilyTrainingPools.from_corpus(corpus, fitted_mask)
+        if post_coverage_sampler is None
+        else None
+    )
     losses: list[float] = []
     coverage_batches = 0
     for rows in _iter_coverage_row_batches(train_rows, config.batch_size, random):
         losses.append(_training_step(corpus, rows, generator, optimizer))
         coverage_batches += 1
     for _ in range(config.post_coverage_steps):
-        rows = family_pools.sample(config.batch_size, random)
+        rows = (
+            family_pools.sample(config.batch_size, random)
+            if family_pools is not None
+            else post_coverage_sampler.sample(config.batch_size, random)
+        )
+        rows = _row_indices(rows, _row_count(corpus))
+        if len(rows) != config.batch_size or np.any(~fitted_mask[rows]):
+            raise ValueError(
+                "post-coverage sampler returned a wrong-sized or ineligible batch"
+            )
         losses.append(_training_step(corpus, rows, generator, optimizer))
     if not losses or not np.isfinite(losses).all():
         raise FloatingPointError(
@@ -1368,6 +1563,8 @@ def train_hybrid_generator(
         training_receipt["selection_evaluation_sha256"] = selection_sha256
         training_receipt["selection_model_manifest_sha256"] = selection_manifest_sha256
         training_receipt["selection_tuple"] = selection_receipt["selection_tuple"]
+    if identity is not None:
+        training_receipt["artifact_identity"] = identity
     staging = Path(
         tempfile.mkdtemp(prefix=f".{output.name}.staging-", dir=output.parent)
     )
@@ -1390,8 +1587,14 @@ def train_hybrid_generator(
         artifacts = {
             name: _artifact_descriptor(staging / name) for name in _ARTIFACT_NAMES
         }
+        manifest_schema = (
+            _FULL_WALKING_MODEL_SCHEMA
+            if identity is not None
+            and identity.get("schema") == _FULL_WALKING_MODEL_SCHEMA
+            else _MANIFEST_SCHEMA
+        )
         manifest = {
-            "schema": _MANIFEST_SCHEMA,
+            "schema": manifest_schema,
             "corpus_manifest_sha256": corpus_hash,
             "rows": _row_count(corpus),
             "latent_size": config.latent_size,
@@ -1401,6 +1604,8 @@ def train_hybrid_generator(
             "runtime_acceptance": "pending-native-joint-limit-and-smoke-gates",
             "artifacts": artifacts,
         }
+        if identity is not None:
+            manifest["artifact_identity"] = identity
         if selection_receipt is not None:
             manifest["selection_evaluation_sha256"] = selection_sha256
             manifest["selection_model_manifest_sha256"] = selection_manifest_sha256
@@ -1414,7 +1619,7 @@ def train_hybrid_generator(
             raise FileExistsError(
                 f"refusing to replace immutable model output: {output}"
             )
-        os.replace(staging, output)
+        _rename_directory_noreplace(staging, output)
         return training_receipt
     except BaseException:
         if staging.exists():
@@ -1477,6 +1682,44 @@ def _selection_authority_root(root: Path, manifest_sha256: str) -> Path:
     return matches[0]
 
 
+def _full_test_receipt_authority(
+    root: Path,
+    *,
+    expected_sha256: str,
+    corpus_manifest_sha256: str,
+    selection_model_manifest_sha256: str,
+) -> Path:
+    matches: list[Path] = []
+    seen: set[Path] = set()
+    for pattern in ("*.json", "*/*.json"):
+        for candidate in sorted(root.parent.glob(pattern)):
+            if candidate in seen or candidate.is_symlink() or not candidate.is_file():
+                continue
+            seen.add(candidate)
+            try:
+                payload = candidate.read_bytes()
+            except OSError:
+                continue
+            if hashlib.sha256(payload).hexdigest() == expected_sha256:
+                matches.append(candidate)
+    if len(matches) != 1:
+        raise ValueError(
+            "full walking test receipt authority must resolve to exactly one "
+            "immutable JSON file"
+        )
+    from .full_walking_terrain_lmm_training import load_test_receipt
+
+    receipt = load_test_receipt(matches[0])
+    if (
+        receipt.get("accepted") is not True
+        or receipt.get("corpus_manifest_sha256") != corpus_manifest_sha256
+        or receipt.get("selection_model_manifest_sha256")
+        != selection_model_manifest_sha256
+    ):
+        raise ValueError("full walking test receipt authority is inconsistent")
+    return matches[0]
+
+
 def load_hybrid_generator(
     output_directory: str | Path,
     *,
@@ -1492,7 +1735,10 @@ def load_hybrid_generator(
         manifest = json.loads(manifest_payload)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("invalid hybrid model manifest JSON") from error
-    if not isinstance(manifest, dict) or manifest.get("schema") != _MANIFEST_SCHEMA:
+    if not isinstance(manifest, dict) or manifest.get("schema") not in {
+        _MANIFEST_SCHEMA,
+        _FULL_WALKING_MODEL_SCHEMA,
+    }:
         raise ValueError("hybrid model manifest schema is unsupported")
     if manifest_payload != _json_bytes(manifest):
         raise ValueError("hybrid model manifest is not canonical JSON")
@@ -1504,6 +1750,15 @@ def load_hybrid_generator(
     if manifest.get("corpus_manifest_sha256") != corpus_hash:
         raise ValueError("model and corpus manifest SHA-256 values do not match")
     config = _config_from_receipt(manifest.get("config"))
+    artifact_identity = _normalized_artifact_identity(
+        manifest.get("artifact_identity")
+    )
+    is_full_walking_manifest = manifest.get("schema") == _FULL_WALKING_MODEL_SCHEMA
+    if is_full_walking_manifest != bool(
+        artifact_identity is not None
+        and artifact_identity.get("schema") == _FULL_WALKING_MODEL_SCHEMA
+    ):
+        raise ValueError("hybrid/full-walking manifest and artifact identity disagree")
     if (
         manifest.get("rows") != _row_count(corpus)
         or manifest.get("latent_size") != config.latent_size
@@ -1541,6 +1796,7 @@ def load_hybrid_generator(
         corpus=corpus,
         config=config,
         corpus_manifest_sha256=corpus_hash,
+        artifact_identity=artifact_identity,
     )
     _validated_training_receipt(
         training_receipt,
@@ -1548,6 +1804,7 @@ def load_hybrid_generator(
         config=config,
         corpus_manifest_sha256=corpus_hash,
         canonical=canonical_verified,
+        artifact_identity=artifact_identity,
     )
     if (
         manifest.get("canonical_selection_accepted") is not canonical_verified
@@ -1613,6 +1870,7 @@ def load_hybrid_generator(
         or checkpoint.get("schema") != _MODEL_SCHEMA
         or checkpoint.get("corpus_manifest_sha256") != corpus_hash
         or checkpoint.get("variant") != config.variant
+        or checkpoint.get("artifact_identity") != artifact_identity
     ):
         raise ValueError("hybrid checkpoint identity does not match its manifest")
     compressor = _Compressor(config)
@@ -1653,6 +1911,34 @@ def load_hybrid_generator(
     for first in range(0, len(latent), config.evaluation_chunk_size):
         if not np.isfinite(latent[first : first + config.evaluation_chunk_size]).all():
             raise ValueError("published latent table contains non-finite values")
+    full_refit_identity = bool(
+        artifact_identity is not None
+        and artifact_identity.get("schema") == _FULL_WALKING_MODEL_SCHEMA
+        and artifact_identity.get("stage") == "refit"
+        and type(artifact_identity.get("test_receipt_sha256")) is str
+        and len(artifact_identity["test_receipt_sha256"]) == 64
+        and all(
+            character in "0123456789abcdef"
+            for character in artifact_identity["test_receipt_sha256"]
+        )
+    )
+    test_receipt_current = False
+    if full_refit_identity:
+        if (
+            not selection_provenance_verified
+            or manifest.get("selection_model_manifest_sha256")
+            != artifact_identity.get("selection_model_manifest_sha256")
+        ):
+            raise ValueError("full walking refit selection provenance is inconsistent")
+        _full_test_receipt_authority(
+            root,
+            expected_sha256=artifact_identity["test_receipt_sha256"],
+            corpus_manifest_sha256=corpus_hash,
+            selection_model_manifest_sha256=manifest[
+                "selection_model_manifest_sha256"
+            ],
+        )
+        test_receipt_current = True
     return HybridGenerator(
         root=root,
         config=config,
@@ -1664,6 +1950,11 @@ def load_hybrid_generator(
         output_scale=normalizations[3],
         latent=latent,
         corpus_manifest_sha256=corpus_hash,
+        artifact_identity=(
+            None
+            if artifact_identity is None
+            else MappingProxyType(dict(artifact_identity))
+        ),
         device=target_device,
         manifest=MappingProxyType(manifest),
         training_receipt=MappingProxyType(training_receipt),
@@ -1671,6 +1962,12 @@ def load_hybrid_generator(
         manifest_sha256=hashlib.sha256(manifest_payload).hexdigest(),
         canonical_selection_verified=canonical_verified,
         selection_provenance_verified=selection_provenance_verified,
+        test_receipt_current=test_receipt_current,
+        refit_receipt_current=(
+            full_refit_identity
+            and selection_provenance_verified
+            and test_receipt_current
+        ),
     )
 
 
@@ -1778,9 +2075,11 @@ __all__ = [
     "HybridGenerator",
     "HybridModelConfig",
     "TrainingBatch",
+    "TrainingRowSampler",
     "assemble_training_batch",
     "calculate_physical_metrics",
     "evaluate_hybrid_generator",
+    "evaluate_hybrid_rows",
     "hybrid_generator_loss",
     "iter_coverage_batches",
     "load_hybrid_generator",

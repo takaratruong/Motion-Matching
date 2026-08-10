@@ -17,6 +17,7 @@ import torch
 from mm_sonic.hybrid_terrain_lmm_training import (
     HybridModelConfig,
     _read_bound_artifact,
+    _rename_directory_noreplace,
     assemble_training_batch,
     calculate_physical_metrics,
     evaluate_hybrid_generator,
@@ -86,6 +87,24 @@ def _synthetic_corpus(*, manifest_sha256: str = "a" * 64) -> SimpleNamespace:
 
 
 class HybridTerrainLmmTrainingTests(unittest.TestCase):
+    def test_immutable_model_publication_never_replaces_a_racing_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            staging = root / "staging"
+            output = root / "model"
+            staging.mkdir()
+            output.mkdir()
+            (staging / "new").write_text("new", encoding="utf-8")
+            (output / "sentinel").write_text("owned", encoding="utf-8")
+
+            with self.assertRaises(FileExistsError):
+                _rename_directory_noreplace(staging, output)
+
+            self.assertEqual(
+                (output / "sentinel").read_text(encoding="utf-8"), "owned"
+            )
+            self.assertTrue(staging.is_dir())
+
     def test_supported_model_variants_have_the_frozen_architectures(self) -> None:
         expected = {
             "latent32": (32, 512),
@@ -97,6 +116,11 @@ class HybridTerrainLmmTrainingTests(unittest.TestCase):
             self.assertEqual(config.latent_size, latent)
             self.assertEqual(config.width, width)
             self.assertEqual(config.dt, 0.04)
+
+        sixty_hz = HybridModelConfig(dt=1.0 / 60.0, device="cpu")
+        self.assertEqual(sixty_hz.dt, 1.0 / 60.0)
+        with self.assertRaisesRegex(ValueError, "dt"):
+            HybridModelConfig(dt=1.0 / 50.0, device="cpu")
 
     def test_visual_articulation_loss_prioritizes_native_pose_channels(self) -> None:
         def loss_with_error(profile: str, channel: int) -> float:
