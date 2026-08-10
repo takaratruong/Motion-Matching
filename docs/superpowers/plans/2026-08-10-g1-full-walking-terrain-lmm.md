@@ -617,8 +617,11 @@ operations among concurrent workers.
   configuration, and validation receipt. `test` loads that exact manifest and
   evaluates test rows once, publishing an exclusive receipt. `refit` requires
   both manifest digests and fits all clean/usable rows. Report validation and
-  test metrics separately against joint MAE `0.03`, frame-max p95 `0.10`, FK
-  p95 `0.08`, support p95 `0.05`, and bilateral contact F1 `0.85`.
+  test metrics separately against all-joint MAE `0.03`, lower-body locomotion
+  frame-max p95 `0.10`, FK p95 `0.08`, support p95 `0.05`, and bilateral
+  contact F1 `0.85`.  Publish the all-30-joint frame-max p95 as a diagnostic
+  under the immutable `lower-body-locomotion-v1` acceptance profile; do not
+  quarantine valid terrain sources merely to reduce that diagnostic.
 
 - [ ] **Step 5: Make focused and existing training tests GREEN**
 

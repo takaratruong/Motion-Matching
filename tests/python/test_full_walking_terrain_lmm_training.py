@@ -19,7 +19,9 @@ import torch
 from mm_sonic.full_walking_terrain_lmm_training import (
     FULL_WALKING_DT,
     FULL_WALKING_FPS,
+    FULL_WALKING_LOCOMOTION_ACCEPTANCE_PROFILE,
     HierarchicalTrainingPools,
+    _metric_receipt_valid,
     _sample_tree,
     evaluate_frozen_test,
     full_walking_model_identity,
@@ -449,6 +451,28 @@ class FullWalkingTrainingContractTests(unittest.TestCase):
         self.assertEqual(identity["corpus_manifest_sha256"], _sha("a"))
         self.assertEqual(identity["split_ledger_manifest_sha256"], _sha("c"))
         self.assertEqual(
+            identity["acceptance_profile"],
+            FULL_WALKING_LOCOMOTION_ACCEPTANCE_PROFILE,
+        )
+        self.assertEqual(
+            identity["joint_frame_gate_bones"],
+            [
+                "Hips",
+                "LeftHipPitch",
+                "LeftHipRoll",
+                "LeftHipYaw",
+                "LeftKnee",
+                "LeftAnkle",
+                "LeftToe",
+                "RightHipPitch",
+                "RightHipRoll",
+                "RightHipYaw",
+                "RightKnee",
+                "RightAnkle",
+                "RightToe",
+            ],
+        )
+        self.assertEqual(
             identity["sampling"]["hierarchy"],
             [
                 "terrain_class",
@@ -464,6 +488,35 @@ class FullWalkingTrainingContractTests(unittest.TestCase):
             "deterministic-shuffled-every-fit-row-once",
         )
         self.assertNotIn("test_metrics", identity)
+
+    def test_locomotion_profile_keeps_whole_body_frame_tail_diagnostic(self) -> None:
+        metrics = {
+            "finite": True,
+            "rows": 100,
+            "joint_geodesic_mae_rad": 0.02,
+            "joint_frame_max_p95_rad": 0.40,
+            "locomotion_joint_frame_max_p95_rad": 0.09,
+            "local_position_p95_m": 0.50,
+            "fk_body_position_p95_m": 0.04,
+            "support_foot_position_p95_m": 0.03,
+            "contact_f1": [0.99, 0.98],
+            "acceptance_profile": FULL_WALKING_LOCOMOTION_ACCEPTANCE_PROFILE,
+            "joint_frame_max_scope": "all-30-non-root-joints-diagnostic",
+            "gate_limits": {
+                "joint_geodesic_mae_rad": 0.03,
+                "locomotion_joint_frame_max_p95_rad": 0.10,
+                "fk_body_position_p95_m": 0.08,
+                "support_foot_position_p95_m": 0.05,
+                "minimum_contact_f1": 0.85,
+            },
+            "accepted": True,
+        }
+        self.assertTrue(_metric_receipt_valid(metrics))
+
+        rejected = dict(metrics)
+        rejected["locomotion_joint_frame_max_p95_rad"] = 0.11
+        rejected["accepted"] = False
+        self.assertFalse(_metric_receipt_valid(rejected))
 
     def test_test_split_is_not_consumed_when_validation_gates_are_red(self) -> None:
         corpus = _synthetic_full_corpus()
@@ -690,17 +743,20 @@ class FullWalkingTrainingContractTests(unittest.TestCase):
                 "rows": int(np.count_nonzero(corpus.test_mask & corpus.eligible_mask)),
                 "joint_geodesic_mae_rad": 0.01,
                 "joint_frame_max_p95_rad": 0.02,
+                "locomotion_joint_frame_max_p95_rad": 0.02,
                 "local_position_p95_m": 0.50,
                 "fk_body_position_p95_m": 0.02,
                 "support_foot_position_p95_m": 0.01,
                 "contact_f1": [0.99, 0.99],
                 "gate_limits": {
                     "joint_geodesic_mae_rad": 0.03,
-                    "joint_frame_max_p95_rad": 0.10,
+                    "locomotion_joint_frame_max_p95_rad": 0.10,
                     "fk_body_position_p95_m": 0.08,
                     "support_foot_position_p95_m": 0.05,
                     "minimum_contact_f1": 0.85,
                 },
+                "acceptance_profile": FULL_WALKING_LOCOMOTION_ACCEPTANCE_PROFILE,
+                "joint_frame_max_scope": "all-30-non-root-joints-diagnostic",
                 "accepted": True,
             }
             with mock.patch(

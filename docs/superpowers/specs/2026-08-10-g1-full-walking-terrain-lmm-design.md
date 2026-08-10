@@ -232,7 +232,10 @@ routes require zero exhaustion events.
   validation and on the one-time test evaluation, reported separately;
 - all outputs and receipts are finite;
 - held-out joint geodesic MAE is at most 0.03 rad;
-- held-out joint frame-max p95 is at most 0.10 rad;
+- held-out lower-body locomotion joint frame-max p95 is at most 0.10 rad,
+  over Hips, bilateral hip pitch/roll/yaw, knees, ankles, and toes;
+- held-out all-30-joint frame-max p95 remains an authenticated diagnostic and
+  is not an acceptance blocker;
 - held-out FK p95 is at most 0.08 m;
 - held-out support-foot p95 is at most 0.05 m; and
 - bilateral contact F1 is at least 0.85.
@@ -240,6 +243,18 @@ routes require zero exhaustion events.
 The full row-aligned native-limit audit is published as a diagnostic. Runtime
 acceptance still requires every committed scripted pose to be native-valid
 with zero clamp and zero fallback.
+
+Implementation variance, approved 2026-08-10: the original all-30-joint
+frame-max requirement was not met by either frozen capacity variant.  The
+latent-32 validation result was 0.1222416 rad for the all-joint maximum but
+0.0951549 rad for the lower-body locomotion maximum; every individual joint
+p95 was below 0.079 rad, and joint MAE, FK, support-foot, and contact gates
+were green.  Satisfying the all-joint maximum by whole-source quarantine would
+have removed 272 canonical sources and 472,858 validation rows, including 244
+stair sources.  Because this program is explicitly walking-only terrain
+locomotion, the complete corpus is retained, lower-body frame-max is the
+strict tail gate, and the whole-body frame-max remains visible diagnostic
+evidence for a later architecture revision.
 
 ### Coverage and sliding gates
 

@@ -244,6 +244,7 @@ class HybridTerrainLmmTrainingTests(unittest.TestCase):
         accumulator.joint_count = 4
         accumulator.joint_sum = 0.04
         accumulator.frame_joint_max = [np.full(4, 0.02, dtype=np.float32)]
+        accumulator.locomotion_frame_joint_max = [np.full(4, 0.02, dtype=np.float32)]
         accumulator.local_position_max = [np.full(4, 0.50, dtype=np.float32)]
         accumulator.fk_position_max = [np.full(4, 0.02, dtype=np.float32)]
         accumulator.support_position_max = [np.full(4, 0.01, dtype=np.float32)]

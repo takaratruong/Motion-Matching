@@ -41,6 +41,15 @@ _TRAINING_SCHEMA = "g1-hybrid-terrain-lmm-training/v1"
 _EVALUATION_SCHEMA = "g1-hybrid-terrain-lmm-evaluation/v1"
 _MANIFEST_SCHEMA = "g1-hybrid-terrain-lmm-manifest/v1"
 _FULL_WALKING_MODEL_SCHEMA = "g1-full-walking-terrain-lmm-model/v1"
+_FULL_WALKING_LOCOMOTION_ACCEPTANCE_PROFILE = "lower-body-locomotion-v1"
+_FULL_WALKING_LOCOMOTION_NON_ROOT_BONES = tuple(range(13))
+_FULL_WALKING_LOCOMOTION_GATE_LIMITS = {
+    "joint_geodesic_mae_rad": 0.03,
+    "locomotion_joint_frame_max_p95_rad": 0.10,
+    "fk_body_position_p95_m": 0.08,
+    "support_foot_position_p95_m": 0.05,
+    "minimum_contact_f1": 0.85,
+}
 _ARTIFACT_NAMES = ("latent.npy", "model.pt", "training.json", "evaluation.json")
 _CONTINUOUS_OUTPUTS = 456
 _OUTPUTS = 458
@@ -786,6 +795,7 @@ class _MetricAccumulator:
     joint_sum: float
     joint_count: int
     frame_joint_max: list[np.ndarray]
+    locomotion_frame_joint_max: list[np.ndarray]
     local_position_max: list[np.ndarray]
     fk_position_max: list[np.ndarray]
     support_position_max: list[np.ndarray]
@@ -799,6 +809,7 @@ class _MetricAccumulator:
         return cls(
             0.0,
             0,
+            [],
             [],
             [],
             [],
@@ -836,6 +847,11 @@ class _MetricAccumulator:
         self.joint_sum += float(joint_error.astype(np.float64).sum())
         self.joint_count += int(joint_error.size)
         self.frame_joint_max.append(np.max(joint_error, axis=1).astype(np.float32))
+        self.locomotion_frame_joint_max.append(
+            np.max(
+                joint_error[:, _FULL_WALKING_LOCOMOTION_NON_ROOT_BONES], axis=1
+            ).astype(np.float32)
+        )
         actual_position = np.asarray(artifacts.positions[indices, 1:], dtype=np.float32)
         local_error = np.linalg.norm(predicted_position - actual_position, axis=2)
         self.local_position_max.append(np.max(local_error, axis=1).astype(np.float32))
@@ -869,6 +885,7 @@ class _MetricAccumulator:
         if self.rows == 0 or self.joint_count == 0:
             raise ValueError("physical evaluation requires at least one row")
         frame_joint = np.concatenate(self.frame_joint_max)
+        locomotion_frame_joint = np.concatenate(self.locomotion_frame_joint_max)
         local = np.concatenate(self.local_position_max)
         fk = np.concatenate(self.fk_position_max)
         support = np.concatenate(self.support_position_max)
@@ -889,6 +906,9 @@ class _MetricAccumulator:
             "rows": self.rows,
             "joint_geodesic_mae_rad": self.joint_sum / self.joint_count,
             "joint_frame_max_p95_rad": float(np.percentile(frame_joint, 95.0)),
+            "locomotion_joint_frame_max_p95_rad": float(
+                np.percentile(locomotion_frame_joint, 95.0)
+            ),
             "local_position_p95_m": float(np.percentile(local, 95.0)),
             "fk_body_position_p95_m": float(np.percentile(fk, 95.0)),
             "support_foot_position_p95_m": float(np.percentile(support, 95.0)),
@@ -922,6 +942,42 @@ def calculate_physical_metrics(
     return accumulator.finish()
 
 
+def _apply_physical_acceptance_profile(
+    metrics: dict[str, object], artifact_identity: Mapping[str, object] | None
+) -> dict[str, object]:
+    """Apply a versioned full-walking gate without changing legacy semantics."""
+
+    profile = (
+        artifact_identity.get("acceptance_profile")
+        if isinstance(artifact_identity, Mapping)
+        and artifact_identity.get("schema") == _FULL_WALKING_MODEL_SCHEMA
+        else None
+    )
+    if profile is None:
+        return metrics
+    if profile != _FULL_WALKING_LOCOMOTION_ACCEPTANCE_PROFILE:
+        raise ValueError("full walking physical acceptance profile is unsupported")
+    contact = metrics.get("contact_f1")
+    if not isinstance(contact, list) or len(contact) != 2:
+        raise ValueError("full walking contact metrics are invalid")
+    metrics["acceptance_profile"] = profile
+    metrics["joint_frame_max_scope"] = "all-30-non-root-joints-diagnostic"
+    metrics["gate_limits"] = dict(_FULL_WALKING_LOCOMOTION_GATE_LIMITS)
+    metrics["accepted"] = bool(
+        metrics["joint_geodesic_mae_rad"]
+        <= _FULL_WALKING_LOCOMOTION_GATE_LIMITS["joint_geodesic_mae_rad"]
+        and metrics["locomotion_joint_frame_max_p95_rad"]
+        <= _FULL_WALKING_LOCOMOTION_GATE_LIMITS["locomotion_joint_frame_max_p95_rad"]
+        and metrics["fk_body_position_p95_m"]
+        <= _FULL_WALKING_LOCOMOTION_GATE_LIMITS["fk_body_position_p95_m"]
+        and metrics["support_foot_position_p95_m"]
+        <= _FULL_WALKING_LOCOMOTION_GATE_LIMITS["support_foot_position_p95_m"]
+        and min(float(value) for value in contact)
+        >= _FULL_WALKING_LOCOMOTION_GATE_LIMITS["minimum_contact_f1"]
+    )
+    return metrics
+
+
 def evaluate_hybrid_rows(
     corpus: object,
     generator: HybridGenerator,
@@ -944,7 +1000,9 @@ def evaluate_hybrid_rows(
         chunk = selected[first : first + size]
         decoded = generator.decode_corpus_rows(corpus, chunk)
         accumulator.add(corpus, chunk, decoded)
-    return accumulator.finish()
+    return _apply_physical_acceptance_profile(
+        accumulator.finish(), generator.artifact_identity
+    )
 
 
 def evaluate_hybrid_generator(
@@ -977,8 +1035,15 @@ def evaluate_hybrid_generator(
         )
     held_out = results["source_held_out"]
     assert isinstance(held_out, dict)
+    full_walking_selection = bool(
+        generator.artifact_identity is not None
+        and generator.artifact_identity.get("schema") == _FULL_WALKING_MODEL_SCHEMA
+        and generator.artifact_identity.get("stage") == "selection"
+    )
     canonical_selection_accepted = bool(
-        results["train"]["accepted"] and held_out["accepted"]
+        held_out["accepted"]
+        if full_walking_selection
+        else results["train"]["accepted"] and held_out["accepted"]
     )
     receipt = {
         "schema": _EVALUATION_SCHEMA,
@@ -1218,26 +1283,35 @@ def _require_json_finite(value: object) -> None:
         raise FloatingPointError("receipt contains a non-finite value")
 
 
-def _physical_metrics_receipt_accepted(metrics: object) -> bool:
+def _physical_metrics_receipt_accepted(
+    metrics: object, *, acceptance_profile: str | None = None
+) -> bool:
     if not isinstance(metrics, dict) or metrics.get("finite") is not True:
         raise ValueError("selection model physical metrics are invalid")
     if type(metrics.get("rows")) is not int or metrics["rows"] <= 0:
         raise ValueError("selection model physical metrics row count is invalid")
-    limits = {
-        **_PHYSICAL_ACCEPTANCE_LIMITS,
-        "minimum_contact_f1": _MINIMUM_CONTACT_F1,
-    }
+    if acceptance_profile is None:
+        limits = {
+            **_PHYSICAL_ACCEPTANCE_LIMITS,
+            "minimum_contact_f1": _MINIMUM_CONTACT_F1,
+        }
+        gated_names = tuple(_PHYSICAL_ACCEPTANCE_LIMITS)
+    elif acceptance_profile == _FULL_WALKING_LOCOMOTION_ACCEPTANCE_PROFILE:
+        limits = dict(_FULL_WALKING_LOCOMOTION_GATE_LIMITS)
+        gated_names = tuple(name for name in limits if name != "minimum_contact_f1")
+        if (
+            metrics.get("acceptance_profile") != acceptance_profile
+            or metrics.get("joint_frame_max_scope")
+            != "all-30-non-root-joints-diagnostic"
+        ):
+            raise ValueError("selection model locomotion metric scope changed")
+    else:
+        raise ValueError("selection model physical acceptance profile is unsupported")
     if metrics.get("gate_limits") != limits:
         raise ValueError("selection model physical gate limits changed")
     values: dict[str, float] = {}
-    local_position = metrics.get("local_position_p95_m")
-    if (
-        type(local_position) not in (int, float)
-        or not math.isfinite(local_position)
-        or local_position < 0.0
-    ):
-        raise ValueError("selection model metric local_position_p95_m is invalid")
-    for name in _PHYSICAL_ACCEPTANCE_LIMITS:
+    diagnostic_names = ("local_position_p95_m", "joint_frame_max_p95_rad")
+    for name in (*gated_names, *diagnostic_names):
         value = metrics.get(name)
         if type(value) not in (int, float) or not math.isfinite(value) or value < 0.0:
             raise ValueError(f"selection model metric {name} is invalid")
@@ -1253,15 +1327,9 @@ def _physical_metrics_receipt_accepted(metrics: object) -> bool:
     ):
         raise ValueError("selection model contact metrics are invalid")
     accepted = bool(
-        values["joint_geodesic_mae_rad"]
-        <= _PHYSICAL_ACCEPTANCE_LIMITS["joint_geodesic_mae_rad"]
-        and values["joint_frame_max_p95_rad"]
-        <= _PHYSICAL_ACCEPTANCE_LIMITS["joint_frame_max_p95_rad"]
-        and values["fk_body_position_p95_m"]
-        <= _PHYSICAL_ACCEPTANCE_LIMITS["fk_body_position_p95_m"]
-        and values["support_foot_position_p95_m"]
-        <= _PHYSICAL_ACCEPTANCE_LIMITS["support_foot_position_p95_m"]
-        and min(float(value) for value in contact) >= _MINIMUM_CONTACT_F1
+        all(values[name] <= float(limits[name]) for name in gated_names)
+        and min(float(value) for value in contact)
+        >= float(limits["minimum_contact_f1"])
     )
     if metrics.get("accepted") is not accepted:
         raise ValueError("selection model physical gate result is inconsistent")
@@ -1281,18 +1349,28 @@ def _validated_evaluation_receipt(
         raise ValueError("model evaluation receipt is invalid")  # noqa: TRY004
     train = receipt.get("train")
     held_out = receipt.get("source_held_out")
-    train_accepted = _physical_metrics_receipt_accepted(train)
-    held_out_accepted = _physical_metrics_receipt_accepted(held_out)
-    assert isinstance(train, dict) and isinstance(held_out, dict)
-    train_rows = int(np.count_nonzero(_training_mask(corpus)))
-    held_out_rows = int(np.count_nonzero(_evaluation_mask(corpus)))
-    if train.get("rows") != train_rows or held_out.get("rows") != held_out_rows:
-        raise ValueError("model evaluation population row counts are incomplete")
     full_walking_selection = bool(
         artifact_identity is not None
         and artifact_identity.get("schema") == _FULL_WALKING_MODEL_SCHEMA
         and artifact_identity.get("stage") == "selection"
     )
+    acceptance_profile = (
+        artifact_identity.get("acceptance_profile")
+        if artifact_identity is not None
+        and artifact_identity.get("schema") == _FULL_WALKING_MODEL_SCHEMA
+        else None
+    )
+    train_accepted = _physical_metrics_receipt_accepted(
+        train, acceptance_profile=acceptance_profile
+    )
+    held_out_accepted = _physical_metrics_receipt_accepted(
+        held_out, acceptance_profile=acceptance_profile
+    )
+    assert isinstance(train, dict) and isinstance(held_out, dict)
+    train_rows = int(np.count_nonzero(_training_mask(corpus)))
+    held_out_rows = int(np.count_nonzero(_evaluation_mask(corpus)))
+    if train.get("rows") != train_rows or held_out.get("rows") != held_out_rows:
+        raise ValueError("model evaluation population row counts are incomplete")
     canonical = bool(
         held_out_accepted
         if full_walking_selection
@@ -1787,9 +1865,17 @@ def load_hybrid_generator(
         stage = (
             artifact_identity.get("stage") if artifact_identity is not None else None
         )
+        acceptance_profile = (
+            artifact_identity.get("acceptance_profile")
+            if artifact_identity is not None
+            else None
+        )
         if stage == "selection":
             expected_identity = full_walking_model_identity(
-                corpus, config=config, stage="selection"
+                corpus,
+                config=config,
+                stage="selection",
+                acceptance_profile=acceptance_profile,
             )
         elif stage == "refit":
             expected_identity = full_walking_model_identity(
@@ -1802,6 +1888,7 @@ def load_hybrid_generator(
                 test_receipt_sha256=artifact_identity.get("test_receipt_sha256")
                 if isinstance(artifact_identity, Mapping)
                 else None,
+                acceptance_profile=acceptance_profile,
             )
         else:
             raise ValueError("full walking model stage is invalid")

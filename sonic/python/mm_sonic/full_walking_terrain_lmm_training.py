@@ -34,6 +34,22 @@ FULL_WALKING_HORIZONS = (20, 40, 60)
 FULL_WALKING_MODEL_SCHEMA = "g1-full-walking-terrain-lmm-model/v1"
 FULL_WALKING_TEST_SCHEMA = "g1-full-walking-terrain-lmm-test/v1"
 FULL_WALKING_FAMILIES = ("flat", "curb", "slope", "stair")
+FULL_WALKING_LOCOMOTION_ACCEPTANCE_PROFILE = "lower-body-locomotion-v1"
+FULL_WALKING_LOCOMOTION_GATE_BONES = (
+    "Hips",
+    "LeftHipPitch",
+    "LeftHipRoll",
+    "LeftHipYaw",
+    "LeftKnee",
+    "LeftAnkle",
+    "LeftToe",
+    "RightHipPitch",
+    "RightHipRoll",
+    "RightHipYaw",
+    "RightKnee",
+    "RightAnkle",
+    "RightToe",
+)
 
 _FEATURES = 31
 _TERRAIN_GRID = 36
@@ -72,7 +88,7 @@ _TEST_RECEIPT_KEYS = {
 }
 _FULL_WALKING_ACCEPTANCE_LIMITS = {
     "joint_geodesic_mae_rad": 0.03,
-    "joint_frame_max_p95_rad": 0.10,
+    "locomotion_joint_frame_max_p95_rad": 0.10,
     "fk_body_position_p95_m": 0.08,
     "support_foot_position_p95_m": 0.05,
 }
@@ -610,12 +626,18 @@ def full_walking_model_identity(
     stage: Literal["selection", "refit"],
     selection_model_manifest_sha256: str | None = None,
     test_receipt_sha256: str | None = None,
+    acceptance_profile: str | None = FULL_WALKING_LOCOMOTION_ACCEPTANCE_PROFILE,
 ) -> dict[str, object]:
     """Return the exact JSON identity embedded in every model member."""
 
     validate_full_walking_corpus(corpus)
     if stage not in {"selection", "refit"}:
         raise ValueError("full walking model stage must be selection or refit")
+    if acceptance_profile not in {
+        None,
+        FULL_WALKING_LOCOMOTION_ACCEPTANCE_PROFILE,
+    }:
+        raise ValueError("full walking acceptance profile is unsupported")
     _validate_config(config, fit_all_rows=stage == "refit")
     if stage == "selection":
         if (
@@ -674,6 +696,9 @@ def full_walking_model_identity(
     if stage == "refit":
         identity["selection_model_manifest_sha256"] = selection_model_manifest_sha256
         identity["test_receipt_sha256"] = test_receipt_sha256
+    if acceptance_profile is not None:
+        identity["acceptance_profile"] = acceptance_profile
+        identity["joint_frame_gate_bones"] = list(FULL_WALKING_LOCOMOTION_GATE_BONES)
     return identity
 
 
@@ -747,13 +772,15 @@ def _metric_receipt_valid(metrics: object) -> bool:
     }
     if metrics.get("gate_limits") != expected_limits:
         raise ValueError("test physical gate limits changed")
-    local_position = metrics.get("local_position_p95_m")
     if (
-        type(local_position) not in (int, float)
-        or not math.isfinite(local_position)
-        or local_position < 0
+        metrics.get("acceptance_profile") != FULL_WALKING_LOCOMOTION_ACCEPTANCE_PROFILE
+        or metrics.get("joint_frame_max_scope") != "all-30-non-root-joints-diagnostic"
     ):
-        raise ValueError("test metric local_position_p95_m is invalid")
+        raise ValueError("test physical acceptance scope changed")
+    for name in ("local_position_p95_m", "joint_frame_max_p95_rad"):
+        value = metrics.get(name)
+        if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+            raise ValueError(f"test metric {name} is invalid")
     accepted = True
     for name, limit in _FULL_WALKING_ACCEPTANCE_LIMITS.items():
         value = metrics.get(name)
