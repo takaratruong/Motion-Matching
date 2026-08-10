@@ -100,6 +100,7 @@ class TerrainFootholdPlannerConfig:
     maximum_surface_plane_residual_m: float = 0.004
     maximum_surface_normal_spread_rad: float = math.radians(10.0)
     maximum_surface_slope_rad: float = math.radians(25.0)
+    maximum_sole_tilt_adjustment_rad: float = math.pi
     support_height_tolerance_m: float = 0.006
     collision_clearance_m: float = 0.0025
     ray_origin_margin_m: float = 1.0
@@ -128,6 +129,7 @@ class TerrainFootholdPlannerConfig:
             self.maximum_surface_plane_residual_m,
             self.maximum_surface_normal_spread_rad,
             self.maximum_surface_slope_rad,
+            self.maximum_sole_tilt_adjustment_rad,
             self.support_height_tolerance_m,
             self.collision_clearance_m,
             self.pelvis_reach_slack_m,
@@ -151,6 +153,8 @@ class TerrainFootholdPlannerConfig:
             raise ContractError("planner spacing and height-step limits must be positive")
         if self.maximum_surface_slope_rad >= math.pi / 2.0:
             raise ContractError("maximum surface slope must be less than pi/2")
+        if self.maximum_sole_tilt_adjustment_rad > math.pi:
+            raise ContractError("maximum sole tilt adjustment must not exceed pi")
         if self.maximum_surface_normal_spread_rad >= math.pi:
             raise ContractError("surface normal spread must be less than pi")
         if any(
@@ -785,6 +789,17 @@ def _evaluate_candidate(
         pose.yaw_rad + yaw_adjustment_rad,
     )
     rotation = target_basis @ nominal_basis.T
+    tilt_adjustment = math.acos(
+        float(
+            np.clip(
+                nominal_plane.normal_world @ surface_plane.normal_world,
+                -1.0,
+                1.0,
+            )
+        )
+    )
+    if tilt_adjustment > config.maximum_sole_tilt_adjustment_rad:
+        return None, "sole_tilt_adjustment_exceeds_bound"
     support = np.asarray(pose.sole_support_points_world, dtype=np.float64)
     relative = support - center
     rotated_relative = relative @ rotation.T

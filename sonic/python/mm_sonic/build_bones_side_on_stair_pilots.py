@@ -1465,6 +1465,7 @@ def _refit_motion_to_sole_targets(
     *,
     adapter: _G1FootfallAdapter,
     stance_only: bool = False,
+    additional_target_mask: np.ndarray | None = None,
 ) -> tuple[StitchedMotion, dict[str, np.ndarray], dict[str, float]]:
     """Replant both soles after a pelvis edit or temporal interpolation.
 
@@ -1492,13 +1493,25 @@ def _refit_motion_to_sole_targets(
         raise ValueError("full-sole stance mask must match authored stance")
     if stance_only and not has_stance_schedule:
         raise ValueError("stance-only refit requires authored_stance_mask [T,2]")
+    if additional_target_mask is None:
+        additional_constraints = np.zeros((frame_count, 2), dtype=bool)
+    else:
+        additional_constraints = np.asarray(
+            additional_target_mask, dtype=bool
+        )
+        if additional_constraints.shape != (frame_count, 2):
+            raise ValueError("additional target mask must have shape [T,2]")
+        if not stance_only and np.any(additional_constraints):
+            raise ValueError(
+                "additional target mask is only meaningful for stance-only refit"
+            )
     target_masks = np.asarray(
         extras.get("sole_target_point_mask", np.ones(targets.shape[:-1], dtype=bool)),
         dtype=bool,
     ).copy()
     if target_masks.shape != targets.shape[:-1]:
         raise ValueError("sole target point mask must match target sole points")
-    if np.any(np.sum(target_masks, axis=2) < 1):
+    if not stance_only and np.any(np.sum(target_masks, axis=2) < 1):
         raise ValueError("sole target point mask must select each foot")
 
     roots = np.asarray(motion.root_position_world, dtype=np.float64)
@@ -1518,15 +1531,41 @@ def _refit_motion_to_sole_targets(
             joints=authored[frame],
         )
         if stance_only:
-            # Terrain correspondence is a hard constraint only while a foot
-            # is planted.  Chasing a warped swing target can force an IK branch
-            # jump even though that free leg's authored gait pose was already
-            # smooth.  Preserve the actual swing geometry here; collision
-            # repair remains responsible for lifting a swing that clips.
+            # Terrain correspondence is normally a hard constraint only while
+            # a foot is planted.  Chasing an arbitrary warped swing target can
+            # force an IK branch jump even though that leg's authored gait was
+            # already smooth.  The caller may additionally select a complete
+            # anchor-to-anchor flight that was explicitly reconstructed from
+            # the authored residual arc; all other swing geometry stays exact.
+            constrained_now = (
+                constraint_stance[frame] | additional_constraints[frame]
+            )
+            if np.any(
+                constrained_now
+                & (np.sum(target_masks[frame], axis=1) < 1)
+            ):
+                raise ValueError(
+                    "sole target point mask must select each constrained foot"
+                )
             for foot in range(2):
-                if not constraint_stance[frame, foot]:
+                if not constrained_now[foot]:
                     targets[frame, foot] = authored_feet[foot]
-                    target_masks[frame, foot] = True
+                    target_masks[frame, foot] = False
+            if not np.any(constrained_now):
+                # Nothing is constrained on this flight frame.  The authored
+                # pose is already the exact desired swing, so running two
+                # nonlinear IK solves here can only waste time or switch to a
+                # different local leg branch.  Full collision repair still
+                # audits and edits an airborne foot later if necessary.
+                for foot in range(2):
+                    centres[frame, foot] = np.mean(
+                        authored_feet[foot], axis=0
+                    )
+                joints[frame] = authored[frame]
+                continue
+        constrained_feet = tuple(
+            foot for foot in range(2) if np.any(target_masks[frame, foot])
+        )
         authored_error = max(
             float(
                 np.max(
@@ -1537,7 +1576,7 @@ def _refit_motion_to_sole_targets(
                     )
                 )
             )
-            for foot in range(2)
+            for foot in constrained_feet
         )
         # The input motion was already fitted once.  Keep it as a candidate so
         # a local IK branch switch cannot replace a modest swing-target error
@@ -1552,6 +1591,7 @@ def _refit_motion_to_sole_targets(
                 sole_targets_world=targets[frame],
                 sole_target_masks=target_masks[frame],
                 initial_joints=(joints[frame - 1] if frame else None),
+                allow_unconstrained_feet=stance_only,
             )
         ]
         if frame:
@@ -1563,6 +1603,7 @@ def _refit_motion_to_sole_targets(
                     sole_targets_world=targets[frame],
                     sole_target_masks=target_masks[frame],
                     initial_joints=None,
+                    allow_unconstrained_feet=stance_only,
                 )
             )
 
@@ -1585,7 +1626,7 @@ def _refit_motion_to_sole_targets(
                         )
                     )
                 )
-                for foot in range(2)
+                for foot in constrained_feet
             )
             return candidate_joints, candidate_correction, geometric_error
 
@@ -1597,7 +1638,9 @@ def _refit_motion_to_sole_targets(
         ]
         if (
             has_stance_schedule
-            and np.any(constraint_stance[frame])
+            and np.any(
+                constraint_stance[frame] | additional_constraints[frame]
+            )
             and min(float(value[2]) for value in geometrically_scored) > 0.008
             and frame + 1 < frame_count
         ):
@@ -1623,6 +1666,7 @@ def _refit_motion_to_sole_targets(
                             sole_targets_world=targets[frame],
                             sole_target_masks=target_masks[frame],
                             initial_joints=authored[future],
+                            allow_unconstrained_feet=stance_only,
                         )
                     )
                 )
@@ -1658,15 +1702,16 @@ def _refit_motion_to_sole_targets(
         )
         for foot in range(2):
             centres[frame, foot] = np.mean(feet[foot], axis=0)
-            errors_by_foot[frame, foot] = float(
-                np.max(
-                    np.linalg.norm(
-                        feet[foot][target_masks[frame, foot]]
-                        - targets[frame, foot][target_masks[frame, foot]],
-                        axis=1,
+            if np.any(target_masks[frame, foot]):
+                errors_by_foot[frame, foot] = float(
+                    np.max(
+                        np.linalg.norm(
+                            feet[foot][target_masks[frame, foot]]
+                            - targets[frame, foot][target_masks[frame, foot]],
+                            axis=1,
+                        )
                     )
                 )
-            )
 
     refitted = StitchedMotion(
         fps=motion.fps,
@@ -1858,6 +1903,7 @@ def _repair_swing_foot_clearance(
     model_path: Path,
     joint_names: Sequence[str],
     maximum_total_lift_m: float = 0.060,
+    maximum_iterations: int = 4,
 ) -> tuple[
     StitchedMotion,
     dict[str, np.ndarray],
@@ -1891,7 +1937,7 @@ def _repair_swing_foot_clearance(
     iterations = 0
     maximum_per_foot_required = np.zeros(2, dtype=np.float64)
 
-    for iteration in range(4):
+    for iteration in range(int(maximum_iterations)):
         if bool(current.accepted):
             break
         if float(current.maximum_forbidden_body_penetration_m) > 1.0e-6:
@@ -2011,10 +2057,26 @@ def _repair_swing_foot_clearance(
         updated["swing_clearance_repair_m"] = np.asarray(
             total, dtype=np.float32
         )
+        repair_mask = total > 0.0
+        point_mask = np.asarray(
+            updated.get(
+                "sole_target_point_mask",
+                np.ones(targets.shape[:-1], dtype=bool),
+            ),
+            dtype=bool,
+        ).copy()
+        # The stance-only refit deliberately clears masks for unconstrained
+        # flight feet.  A later collision repair makes exactly those feet
+        # constrained again, so restore their complete rigid-sole target
+        # before asking IK to follow the lifted swing arc.
+        point_mask[repair_mask] = True
+        updated["sole_target_point_mask"] = point_mask
         repaired, updated, _refit = _refit_motion_to_sole_targets(
             repaired,
             updated,
             adapter=adapter,
+            stance_only=True,
+            additional_target_mask=repair_mask,
         )
         current = audit_stair_motion_collisions(
             repaired,
@@ -2193,6 +2255,7 @@ def _repair_stance_foot_mesh_clearance(
         motion,
         candidate_extras,
         adapter=adapter,
+        stance_only=True,
     )
     candidate_collision = audit_stair_motion_collisions(
         candidate,

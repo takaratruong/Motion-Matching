@@ -63,8 +63,13 @@ from .build_stairs500_omnidirectional_pilots import (
     _save_motion,
     _terrain_height,
 )
-from .terrain_oracle.math3d import quaternion_multiply_wxyz
+from .terrain_oracle.math3d import (
+    RigidTransform,
+    quaternion_multiply_wxyz,
+    unroll_quaternions_wxyz,
+)
 from .terrain_oracle.reference_stitch import _G1FootfallAdapter
+from .terrain_oracle.stair_geometry_warp import _archive_terrain_index
 from .terrain_oracle.stair_foothold_anchors import NominalFootSolePose
 from .terrain_oracle.stair_fragment_reconstruction import (
     _replace_bracketed_swing_trajectories,
@@ -75,7 +80,8 @@ from .terrain_oracle.stair_fragment_reconstruction import (
 from .terrain_oracle.stair_motion_collision_audit import (
     audit_stair_motion_collisions,
 )
-from .terrain_oracle.stitch import StitchedMotion
+from .terrain_oracle.stitch import FrameProvenance, StitchedMotion
+from .terrain_oracle.terrain_mesh import TerrainMeshIndex
 from .terrain_foothold_planner import (
     FootholdIntent,
     TerrainFootholdPlannerConfig,
@@ -246,6 +252,136 @@ def _paired_flat_support_mesh(field: object) -> object:
     if not np.array_equal(flat.mesh.faces, field.index.mesh.faces):
         raise ValueError("flat and target terrain topology do not match")
     return flat
+
+
+def _registered_source_motion_and_mesh(
+    archive: object,
+    clip_index: int,
+) -> tuple[StitchedMotion, TerrainMeshIndex, str]:
+    """Load one genuine terrain-aware archive clip with its exact mesh."""
+
+    index = int(clip_index)
+    if not 0 <= index < len(archive["clip_names"]):
+        raise ValueError(f"registered source index {index} is outside the archive")
+    start = int(archive["clip_start_idx"][index])
+    stop = int(archive["clip_end_idx"][index])
+    clip_name = str(archive["clip_names"][index])
+    raw_xyzw = np.asarray(
+        archive["body_quat_w"][start:stop, 0], dtype=np.float64
+    )
+    quaternion = unroll_quaternions_wxyz(raw_xyzw[..., (3, 0, 1, 2)])
+    motion = StitchedMotion(
+        fps=float(archive["fps"][0]),
+        root_position_world=np.asarray(
+            archive["body_pos_w"][start:stop, 0], dtype=np.float32
+        ),
+        root_quaternion_world_wxyz=np.asarray(quaternion, dtype=np.float32),
+        joint_position=np.asarray(
+            archive["joint_pos"][start:stop], dtype=np.float32
+        ),
+        provenance=tuple(
+            FrameProvenance(index, frame, clip_name)
+            for frame in range(stop - start)
+        ),
+        seam_indices=(),
+    )
+    return motion, _archive_terrain_index(archive, index), clip_name
+
+
+def _align_source_mesh(
+    source_mesh: TerrainMeshIndex,
+    *,
+    source_root_start_world: np.ndarray,
+    alignment_yaw_rad: float,
+) -> TerrainMeshIndex:
+    """Apply the exact corridor alignment used for the source motion."""
+
+    yaw = float(alignment_yaw_rad)
+    cosine, sine = math.cos(yaw), math.sin(yaw)
+    rotation_xy = np.asarray(
+        ((cosine, -sine), (sine, cosine)), dtype=np.float64
+    )
+    root_xy = np.asarray(source_root_start_world, dtype=np.float64)[:2]
+    translation = np.asarray(
+        (*(-rotation_xy @ root_xy), 0.0), dtype=np.float32
+    )
+    quaternion = np.asarray(
+        (math.cos(0.5 * yaw), 0.0, 0.0, math.sin(0.5 * yaw)),
+        dtype=np.float32,
+    )
+    alignment = RigidTransform(translation, quaternion)
+    return TerrainMeshIndex(
+        source_mesh.mesh,
+        alignment.compose(source_mesh.world_from_terrain),
+    )
+
+
+def _transfer_registered_root_height_to_target(
+    source: StitchedMotion,
+    *,
+    source_mesh: TerrainMeshIndex,
+    target_mesh: TerrainMeshIndex,
+    smoothing_radius_frames: int = 12,
+) -> tuple[StitchedMotion, np.ndarray, dict[str, float]]:
+    """Preserve pelvis clearance relative to the source and target surfaces.
+
+    Registered terrain primitives already contain the right crouch/rise
+    timing.  Their absolute root Z is meaningful only relative to their source
+    mesh, however.  Transfer the terrain-under-pelvis height difference before
+    the exact foothold planner makes its smaller per-foot corrections.
+    """
+
+    roots = np.asarray(source.root_position_world, dtype=np.float64)
+    source_ray = float(np.max(source_mesh.vertices_world[:, 2]) + 1.0)
+    target_ray = float(np.max(target_mesh.vertices_world[:, 2]) + 1.0)
+    source_height = np.asarray(
+        [
+            _terrain_height(source_mesh, point[:2], source_ray)
+            for point in roots
+        ],
+        dtype=np.float64,
+    )
+    target_height = np.asarray(
+        [
+            _terrain_height(target_mesh, point[:2], target_ray)
+            for point in roots
+        ],
+        dtype=np.float64,
+    )
+    # Finite source terrain assets commonly omit their flat approach apron.
+    # Those missing edge samples are ground level, not a reason to extrapolate
+    # the nearest curb or slope beneath the character.
+    source_height[~np.isfinite(source_height)] = 0.0
+    if not np.isfinite(target_height).all():
+        raise ValueError("registered source route leaves the target terrain")
+    raw = target_height - source_height
+    radius = int(smoothing_radius_frames)
+    coordinate = np.arange(-radius, radius + 1, dtype=np.float64)
+    sigma = max(1.0, radius / 3.0)
+    kernel = np.exp(-0.5 * np.square(coordinate / sigma))
+    kernel /= np.sum(kernel)
+    transfer = np.convolve(
+        np.pad(raw, (radius, radius), mode="edge"), kernel, mode="valid"
+    )
+    mapped_root = roots.copy()
+    mapped_root[:, 2] += transfer
+    mapped = StitchedMotion(
+        fps=source.fps,
+        root_position_world=np.asarray(mapped_root, dtype=np.float32),
+        root_quaternion_world_wxyz=source.root_quaternion_world_wxyz,
+        joint_position=source.joint_position,
+        provenance=source.provenance,
+        seam_indices=source.seam_indices,
+    )
+    return mapped, np.asarray(transfer, dtype=np.float32), {
+        "maximum_absolute_raw_transfer_m": float(np.max(np.abs(raw))),
+        "maximum_absolute_smoothed_transfer_m": float(
+            np.max(np.abs(transfer))
+        ),
+        "maximum_transfer_step_m": float(
+            np.max(np.abs(np.diff(transfer))) if len(transfer) > 1 else 0.0
+        ),
+    }
 
 
 def _terrain_clear_transplanted_swings(
@@ -737,6 +873,267 @@ def _repair_stance_reach_with_root_lowering(
     }
 
 
+def _repair_stance_reach_with_pelvis_tilt(
+    motion: StitchedMotion,
+    extras: dict[str, np.ndarray],
+    *,
+    adapter: _G1FootfallAdapter,
+    target_error_m: float = 0.008,
+    transition_frames: int = 12,
+) -> tuple[StitchedMotion, dict[str, np.ndarray], dict[str, object]]:
+    """Use a small, smooth torso lean when uneven support defeats leg-only IK.
+
+    A rigid sole on a real slope can be reachable only after the pelvis shares
+    a little of the roll/pitch change.  Search the worst frame of each
+    contiguous bad stance window using the exact G1 leg IK, then ease that
+    bounded local-frame correction into and out of the complete window.  This
+    is deliberately not a terrain-normal pose copy: the smallest correction
+    that actually reduces the measured sole residual wins.
+    """
+
+    stance = np.asarray(extras.get("authored_stance_mask"), dtype=bool)
+    errors = np.asarray(
+        extras.get("per_frame_sole_target_error_by_foot_m"), dtype=np.float64
+    )
+    targets = np.asarray(
+        extras.get("target_sole_points_world"), dtype=np.float64
+    )
+    masks = np.asarray(
+        extras.get("sole_target_point_mask", np.ones(targets.shape[:-1], bool)),
+        dtype=bool,
+    )
+    frame_count = len(motion.root_position_world)
+    if (
+        stance.shape != (frame_count, 2)
+        or errors.shape != stance.shape
+        or targets.shape[:2] != stance.shape
+        or masks.shape != targets.shape[:-1]
+    ):
+        return motion, extras, {
+            "applied": False,
+            "reason": "missing_stance_target_arrays",
+        }
+
+    per_frame_error = np.max(np.where(stance, errors, 0.0), axis=1)
+    initial_error = float(np.max(per_frame_error))
+    bad = per_frame_error > float(target_error_m)
+    runs: list[tuple[int, int]] = []
+    start = 0
+    while start < frame_count:
+        if not bad[start]:
+            start += 1
+            continue
+        stop = start + 1
+        while stop < frame_count and bad[stop]:
+            stop += 1
+        runs.append((start, stop))
+        start = stop
+    if not runs:
+        return motion, extras, {
+            "applied": False,
+            "initial_maximum_stance_error_m": initial_error,
+            "final_maximum_stance_error_m": initial_error,
+            "runs": [],
+        }
+
+    roots = np.asarray(motion.root_position_world, dtype=np.float64).copy()
+    quaternions = np.asarray(
+        motion.root_quaternion_world_wxyz, dtype=np.float64
+    ).copy()
+    joints = np.asarray(motion.joint_position, dtype=np.float64)
+    corridor_minimum = np.asarray(
+        extras.get(
+            "planned_pelvis_height_minimum_world_m",
+            np.full(frame_count, -math.inf),
+        ),
+        dtype=np.float64,
+    )
+    corridor_maximum = np.asarray(
+        extras.get(
+            "planned_pelvis_height_maximum_world_m",
+            np.full(frame_count, math.inf),
+        ),
+        dtype=np.float64,
+    )
+    correction = np.zeros((frame_count, 3), dtype=np.float64)
+    run_reports: list[dict[str, object]] = []
+
+    def score(frame: int, dz: float, roll: float, pitch: float) -> float:
+        base = Rotation.from_quat(quaternions[frame, (1, 2, 3, 0)])
+        candidate_rotation = base * Rotation.from_euler(
+            "xy", (float(roll), float(pitch))
+        )
+        xyzw = candidate_rotation.as_quat()
+        candidate_quaternion = xyzw[[3, 0, 1, 2]]
+        candidate_root = roots[frame].copy()
+        candidate_root[2] = np.clip(
+            candidate_root[2] + float(dz),
+            corridor_minimum[frame],
+            corridor_maximum[frame],
+        )
+        candidate_targets = targets[frame].copy()
+        candidate_masks = masks[frame].copy()
+        authored_feet = adapter.sole_positions_for_pose(
+            root_position=candidate_root,
+            root_quaternion_wxyz=candidate_quaternion,
+            joints=joints[frame],
+        )
+        for foot in range(2):
+            if not stance[frame, foot]:
+                candidate_targets[foot] = authored_feet[foot]
+                candidate_masks[foot] = True
+        solved = adapter.adapt_to_targets(
+            root_position=candidate_root,
+            root_quaternion_wxyz=candidate_quaternion,
+            authored_joints=joints[frame],
+            sole_targets_world=candidate_targets,
+            sole_target_masks=candidate_masks,
+            initial_joints=joints[frame],
+        )[0]
+        feet = adapter.sole_positions_for_pose(
+            root_position=candidate_root,
+            root_quaternion_wxyz=candidate_quaternion,
+            joints=solved,
+        )
+        return max(
+            float(
+                np.max(
+                    np.linalg.norm(
+                        feet[foot][candidate_masks[foot]]
+                        - candidate_targets[foot][candidate_masks[foot]],
+                        axis=1,
+                    )
+                )
+            )
+            for foot in range(2)
+            if stance[frame, foot]
+        )
+
+    for run_start, run_stop in runs:
+        anchor = run_start + int(np.argmax(per_frame_error[run_start:run_stop]))
+        candidates: list[tuple[float, float, float, float]] = []
+        for dz in (-0.010, 0.0, 0.010):
+            for roll_degrees in (-6.0, -3.0, 0.0, 3.0, 6.0):
+                for pitch_degrees in (-6.0, -3.0, 0.0, 3.0, 6.0):
+                    roll = math.radians(roll_degrees)
+                    pitch = math.radians(pitch_degrees)
+                    value = score(anchor, dz, roll, pitch)
+                    candidates.append((value, dz, roll, pitch))
+        best_error, dz, roll, pitch = min(
+            candidates,
+            key=lambda value: (
+                value[0],
+                abs(value[1]) + abs(value[2]) + abs(value[3]),
+            ),
+        )
+        if best_error >= per_frame_error[anchor] - 0.001:
+            run_reports.append(
+                {
+                    "start_frame": run_start,
+                    "stop_frame": run_stop,
+                    "anchor_frame": anchor,
+                    "initial_anchor_error_m": float(per_frame_error[anchor]),
+                    "candidate_anchor_error_m": float(best_error),
+                    "applied": False,
+                }
+            )
+            continue
+        weight = np.zeros(frame_count, dtype=np.float64)
+        weight[run_start:run_stop] = 1.0
+        radius = int(transition_frames)
+        for offset in range(1, radius + 1):
+            phase = 1.0 - float(offset) / float(radius + 1)
+            smooth = phase * phase * (3.0 - 2.0 * phase)
+            if run_start - offset >= 0:
+                weight[run_start - offset] = max(
+                    weight[run_start - offset], smooth
+                )
+            if run_stop - 1 + offset < frame_count:
+                weight[run_stop - 1 + offset] = max(
+                    weight[run_stop - 1 + offset], smooth
+                )
+        correction[:, 0] += weight * float(dz)
+        correction[:, 1] += weight * float(roll)
+        correction[:, 2] += weight * float(pitch)
+        run_reports.append(
+            {
+                "start_frame": run_start,
+                "stop_frame": run_stop,
+                "anchor_frame": anchor,
+                "initial_anchor_error_m": float(per_frame_error[anchor]),
+                "candidate_anchor_error_m": float(best_error),
+                "root_z_adjustment_m": float(dz),
+                "local_roll_adjustment_rad": float(roll),
+                "local_pitch_adjustment_rad": float(pitch),
+                "applied": True,
+            }
+        )
+
+    if not np.any(np.abs(correction) > 1.0e-10):
+        return motion, extras, {
+            "applied": False,
+            "initial_maximum_stance_error_m": initial_error,
+            "final_maximum_stance_error_m": initial_error,
+            "runs": run_reports,
+        }
+    roots[:, 2] = np.clip(
+        roots[:, 2] + correction[:, 0], corridor_minimum, corridor_maximum
+    )
+    for frame in range(frame_count):
+        base = Rotation.from_quat(quaternions[frame, (1, 2, 3, 0)])
+        rotated = base * Rotation.from_euler(
+            "xy", correction[frame, 1:3]
+        )
+        xyzw = rotated.as_quat()
+        quaternions[frame] = xyzw[[3, 0, 1, 2]]
+    candidate = StitchedMotion(
+        fps=motion.fps,
+        root_position_world=np.asarray(roots, dtype=np.float32),
+        root_quaternion_world_wxyz=np.asarray(quaternions, dtype=np.float32),
+        joint_position=motion.joint_position,
+        provenance=motion.provenance,
+        seam_indices=motion.seam_indices,
+    )
+    candidate, candidate_extras, refit = _refit_motion_to_sole_targets(
+        candidate, extras, adapter=adapter, stance_only=True
+    )
+    final_errors = np.asarray(
+        candidate_extras["per_frame_sole_target_error_by_foot_m"],
+        dtype=np.float64,
+    )
+    final_error = float(np.max(final_errors[stance]))
+    if final_error >= initial_error - 1.0e-4:
+        return motion, extras, {
+            "applied": False,
+            "reverted_no_improvement": True,
+            "initial_maximum_stance_error_m": initial_error,
+            "final_maximum_stance_error_m": initial_error,
+            "runs": run_reports,
+        }
+    candidate_extras["stance_reach_pelvis_pose_adjustment"] = np.asarray(
+        correction, dtype=np.float32
+    )
+    return candidate, candidate_extras, {
+        "applied": True,
+        "reverted_no_improvement": False,
+        "initial_maximum_stance_error_m": initial_error,
+        "final_maximum_stance_error_m": final_error,
+        "maximum_root_z_adjustment_m": float(np.max(np.abs(correction[:, 0]))),
+        "maximum_local_roll_adjustment_rad": float(
+            np.max(np.abs(correction[:, 1]))
+        ),
+        "maximum_local_pitch_adjustment_rad": float(
+            np.max(np.abs(correction[:, 2]))
+        ),
+        "maximum_correction_step": [
+            float(np.max(np.abs(np.diff(correction[:, index]))))
+            for index in range(3)
+        ],
+        "refit": refit,
+        "runs": run_reports,
+    }
+
+
 def _repair_forbidden_body_with_root_lift(
     motion: StitchedMotion,
     extras: dict[str, np.ndarray],
@@ -979,6 +1376,13 @@ def _plan_and_apply_fixed_terrain_footholds(
     target_mesh: object,
     pelvis_planar_smoothing_sigma_frames: float = 2.0,
     allow_partial_rigid_support: bool = False,
+    maximum_sole_tilt_adjustment_rad: float = math.pi,
+    maximum_longitudinal_adjustment_m: float = 0.24,
+    maximum_lateral_adjustment_m: float = 0.12,
+    maximum_yaw_adjustment_rad: float = math.radians(15.0),
+    longitudinal_samples: int = 9,
+    lateral_samples: int = 5,
+    yaw_samples: int = 5,
 ) -> tuple[StitchedMotion, dict[str, np.ndarray], dict[str, object]]:
     """Replace drifting paired-warp contacts with fixed rigid footholds.
 
@@ -1044,11 +1448,20 @@ def _plan_and_apply_fixed_terrain_footholds(
             # half-foot in either direction at the same 6 cm resolution;
             # downstream whole-leg IK, planted-foot drift, and exact body
             # collision audits still reject an unreachable re-placement.
-            maximum_longitudinal_adjustment_m=0.24,
-            maximum_lateral_adjustment_m=0.12,
-            maximum_yaw_adjustment_rad=math.radians(15.0),
-            longitudinal_samples=9,
+            maximum_longitudinal_adjustment_m=float(
+                maximum_longitudinal_adjustment_m
+            ),
+            maximum_lateral_adjustment_m=float(
+                maximum_lateral_adjustment_m
+            ),
+            maximum_yaw_adjustment_rad=float(maximum_yaw_adjustment_rad),
+            longitudinal_samples=int(longitudinal_samples),
+            lateral_samples=int(lateral_samples),
+            yaw_samples=int(yaw_samples),
             maximum_surface_slope_rad=math.radians(25.0),
+            maximum_sole_tilt_adjustment_rad=(
+                maximum_sole_tilt_adjustment_rad
+            ),
             maximum_pelvis_height_step_m=0.020,
             maximum_planar_reach_change_m=0.090,
             maximum_yaw_change_rad=math.radians(7.5),
@@ -1075,6 +1488,7 @@ def _plan_and_apply_fixed_terrain_footholds(
     if targets.ndim != 4 or targets.shape[:2] != (frame_count, 2):
         raise ValueError("fixed-terrain planning requires sole targets [T,2,P,3]")
     targets = targets.copy()
+    source_nominal_targets = targets.copy()
     assigned = np.zeros((frame_count, 2), dtype=bool)
     surface_normal = np.zeros((frame_count, 2, 3), dtype=np.float64)
     longitudinal = np.zeros((frame_count, 2), dtype=np.float64)
@@ -1170,6 +1584,16 @@ def _plan_and_apply_fixed_terrain_footholds(
         targets,
         assigned,
     )
+    # Also retain a route whose airborne middle stays in the retrieved
+    # motion's original world-space arc.  This is useful when a bounded pelvis
+    # correction for one planted foot would otherwise carry the free foot
+    # sideways into a neighbouring riser.  Takeoff and landing offsets still
+    # blend continuously into the exact planned footholds.
+    source_anchored_targets = _blend_anchored_sole_offsets(
+        source_nominal_targets,
+        targets,
+        assigned,
+    )
     targets, bracketed_swing, swing_adjustment = (
         _terrain_clear_transplanted_swings(
             planned_nominal_targets,
@@ -1194,6 +1618,9 @@ def _plan_and_apply_fixed_terrain_footholds(
     )
     updated["planned_nominal_sole_points_world"] = np.asarray(
         planned_nominal_targets, dtype=np.float32
+    )
+    updated["source_anchored_sole_points_world"] = np.asarray(
+        source_anchored_targets, dtype=np.float32
     )
     updated["bracketed_swing_mask"] = np.asarray(
         bracketed_swing, dtype=np.bool_
@@ -1264,10 +1691,12 @@ def _plan_and_apply_fixed_terrain_footholds(
 
 
 def _build_one(
-    source_path: Path,
+    source_path: Path | None,
     profile: str,
     *,
     destination: Path,
+    source_archive: object | None = None,
+    registered_source_index: int | None = None,
     adapter: _G1FootfallAdapter,
     joint_names: Sequence[str],
     model_path: Path,
@@ -1281,16 +1710,44 @@ def _build_one(
     maximum_stance_speed_mps: float,
     pelvis_planar_smoothing_sigma_frames: float,
 ) -> dict[str, object]:
+    if (source_path is None) == (registered_source_index is None):
+        raise ValueError(
+            "exactly one flat source path or registered source index is required"
+        )
+    source_label = (
+        source_path.stem
+        if source_path is not None
+        else f"registered_{int(registered_source_index):03d}"
+    )
     row: dict[str, object] = {
         "schema": "motionbricks-contact-rough-pilot/v1",
-        "label": f"{source_path.stem}__{profile}",
+        "label": f"{source_label}__{profile}",
         "profile": profile,
-        "source_motion": str(source_path),
+        "source_motion": (
+            str(source_path)
+            if source_path is not None
+            else f"archive_clip:{int(registered_source_index)}"
+        ),
         "status": "rejected",
     }
     destination.mkdir(parents=True, exist_ok=True)
     try:
-        source = _source_motion(source_path)
+        registered_source_mesh = None
+        if registered_source_index is None:
+            assert source_path is not None
+            source = _source_motion(source_path)
+        else:
+            if source_archive is None:
+                raise ValueError("registered source requires its archive")
+            source, registered_source_mesh, registered_name = (
+                _registered_source_motion_and_mesh(
+                    source_archive, registered_source_index
+                )
+            )
+            row["registered_source_clip_index"] = int(
+                registered_source_index
+            )
+            row["registered_source_clip_name"] = registered_name
         quiet_joints, arm_attenuation = _attenuate_upper_limb_motion(
             source.joint_position,
             joint_names,
@@ -1307,7 +1764,16 @@ def _build_one(
             provenance=source.provenance,
             seam_indices=source.seam_indices,
         )
+        source_root_start = np.asarray(
+            source.root_position_world[0], dtype=np.float64
+        ).copy()
         source, alignment = _align_motion_corridor(source)
+        if registered_source_mesh is not None:
+            registered_source_mesh = _align_source_mesh(
+                registered_source_mesh,
+                source_root_start_world=source_root_start,
+                alignment_yaw_rad=float(alignment["alignment_yaw_rad"]),
+            )
         row["source_alignment"] = alignment
         row["upper_limb_attenuation"] = arm_attenuation
         field, terrain_metadata = _profile_for_motion(
@@ -1320,7 +1786,11 @@ def _build_one(
         # Stance detection needs only a flat mesh with the exact target grid
         # extent.  No expensive terrain IK is run until discrete full-foot
         # footholds and a feasible pelvis corridor have been selected.
-        source_mesh = _paired_flat_support_mesh(field)
+        source_mesh = (
+            _paired_flat_support_mesh(field)
+            if registered_source_mesh is None
+            else registered_source_mesh
+        )
         extras, stance_schedule = _source_stance_schedule_and_extras(
             source,
             adapter=adapter,
@@ -1330,6 +1800,21 @@ def _build_one(
             maximum_stance_speed_mps=maximum_stance_speed_mps,
         )
         row["source_stance_schedule"] = stance_schedule
+        if registered_source_mesh is not None:
+            source, root_height_transfer, root_height_report = (
+                _transfer_registered_root_height_to_target(
+                    source,
+                    source_mesh=registered_source_mesh,
+                    target_mesh=field.index,
+                )
+            )
+            extras["registered_terrain_height_transfer_m"] = (
+                root_height_transfer
+            )
+            extras["intended_root_position_world"] = np.asarray(
+                source.root_position_world, dtype=np.float32
+            )
+            row["registered_root_height_transfer"] = root_height_report
         row["continuous_paired_warp_skipped"] = True
         motion, extras, foothold_planning = (
             _plan_and_apply_fixed_terrain_footholds(
@@ -1342,6 +1827,16 @@ def _build_one(
                 ),
                 allow_partial_rigid_support=(
                     profile in CHALLENGING_PROFILES
+                ),
+                # On coarse nominally-flat roughness, reject a foothold that
+                # would wrench the clean source sole through an extreme
+                # orientation change.  Search a nearby support patch instead.
+                # True macro slopes retain the wider bound and are handled by
+                # the pelvis-orientation repair below.
+                maximum_sole_tilt_adjustment_rad=(
+                    math.radians(18.0)
+                    if profile == "hct_rough_flat"
+                    else math.radians(35.0)
                 ),
             )
         )
@@ -1362,11 +1857,12 @@ def _build_one(
             motion,
             extras,
             adapter=adapter,
-            # The swing target is now the learned source arc transplanted
-            # between its planned takeoff and landing footholds, with an exact
-            # height-field clearance envelope.  It is therefore meaningful to
-            # fit both feet here; the obsolete flat-world swing target that
-            # caused the kick/shuffle artifact is no longer present.
+            # A registered terrain source already carries a natural swing
+            # trajectory.  Replant its stance feet on the new surface, but do
+            # not make the IK chase a synthetic free-foot target displaced by
+            # a very different curb/block height profile.  Exact swing
+            # collision repair below adds only the clearance actually needed.
+            stance_only=(registered_source_index is not None),
         )
         row["sole_refit"] = refit
         motion, extras, stance_reach_repair = (
@@ -1384,6 +1880,40 @@ def _build_one(
                     stance_reach_repair["final_maximum_stance_error_m"]
                 ),
             }
+            if stance_reach_repair["iterations"]:
+                last_reach_iteration = stance_reach_repair["iterations"][-1]
+                refit["maximum_joint_step_rad"] = float(
+                    last_reach_iteration["maximum_joint_step_rad"]
+                )
+                refit["maximum_joint_delta_rad"] = float(
+                    last_reach_iteration["maximum_joint_delta_rad"]
+                )
+        if (
+            profile == "hct_rough_slope"
+            and refit["maximum_sole_target_error_m"] > 0.008
+        ):
+            motion, extras, stance_pose_repair = (
+                _repair_stance_reach_with_pelvis_tilt(
+                    motion,
+                    extras,
+                    adapter=adapter,
+                )
+            )
+            row["stance_reach_pelvis_tilt"] = stance_pose_repair
+            if stance_pose_repair["applied"]:
+                pose_refit = stance_pose_repair["refit"]
+                refit = {
+                    **refit,
+                    "maximum_sole_target_error_m": float(
+                        stance_pose_repair["final_maximum_stance_error_m"]
+                    ),
+                    "maximum_joint_step_rad": float(
+                        pose_refit["maximum_joint_step_rad"]
+                    ),
+                    "maximum_joint_delta_rad": float(
+                        pose_refit["maximum_joint_delta_rad"]
+                    ),
+                }
         if (
             refit["maximum_sole_target_error_m"] > 0.005
             or refit["maximum_joint_step_rad"] > 0.20
@@ -1457,6 +1987,10 @@ def _build_one(
                 model_path=model_path,
                 joint_names=joint_names,
                 maximum_total_lift_m=0.070,
+                # Coarse blocks can require several independently located
+                # swing collisions to be cleared.  Each pass is still
+                # followed by the unchanged exact mesh audit.
+                maximum_iterations=6,
             )
             row["swing_clearance_repair"] = swing_repair
         if (
@@ -1613,17 +2147,39 @@ def build(arguments: argparse.Namespace) -> dict[str, object]:
     )
     output = arguments.output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
-    sources = tuple(arguments.source) or (DEFAULT_SOURCE,)
+    sources = tuple(arguments.source)
+    registered_sources = tuple(arguments.registered_source_index)
+    if any(
+        index < 0 or index >= len(archive["clip_names"])
+        for index in registered_sources
+    ):
+        raise ValueError("registered source index is outside the motion archive")
+    if not sources and not registered_sources:
+        sources = (DEFAULT_SOURCE,)
     profiles = tuple(arguments.profile) or PROFILES
     rows: list[dict[str, object]] = []
-    for source in sources:
-        source_path = source.expanduser().resolve()
+    work = [
+        (source.expanduser().resolve(), None) for source in sources
+    ] + [
+        (None, int(index)) for index in registered_sources
+    ]
+    for source_path, registered_source_index in work:
+        source_label = (
+            source_path.stem
+            if source_path is not None
+            else (
+                f"registered_{registered_source_index:03d}_"
+                f"{str(archive['clip_names'][registered_source_index])}"
+            )
+        )
         for profile in profiles:
-            destination = output / f"{source_path.stem}__{profile}"
+            destination = output / f"{source_label}__{profile}"
             row = _build_one(
                 source_path,
                 profile,
                 destination=destination,
+                source_archive=archive,
+                registered_source_index=registered_source_index,
                 adapter=adapter,
                 joint_names=joint_names,
                 model_path=arguments.model_path.resolve(),
@@ -1662,6 +2218,9 @@ def build(arguments: argparse.Namespace) -> dict[str, object]:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, action="append", default=[])
+    parser.add_argument(
+        "--registered-source-index", type=int, action="append", default=[]
+    )
     parser.add_argument("--profile", choices=PROFILES, action="append", default=[])
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--motion-archive", type=Path, default=DEFAULT_ARCHIVE)

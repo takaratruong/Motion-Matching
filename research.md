@@ -2138,3 +2138,170 @@ review of the full 6.64-second sequence and four full-rate critical windows
 found no kick/shuffle, foot burial, hover, stance skate, snap, pelvis jolt, or
 excessive hand swing.  This is a validated method canary, not yet broad HCT
 terrain or omnidirectional coverage.
+
+### Continuous global matching and minimal contact refinement (2026-08-09)
+
+The next scale test is a 24-second privileged mixed-terrain course containing
+flat approach, ramps, rolling ground, irregular ascent and descent treads, a
+cross-sloped crest, and bounded roughness.  The matcher composes genuine
+registered source snippets online instead of warping one flat gait through the
+whole course.  Adding prospective swing-foot clearance to candidate reranking
+reduced raw maximum foot penetration from 51.75 to 27.48 mm, terrain-profile
+RMS error from 25.36 to 20.14 mm, and source transitions from 54 to 43.  A
+four-times stronger clearance weight was rejected because it selected worse
+kinematics and increased raw penetration to 68.87 mm.
+
+The exact contact layer now solves each requested review window with 80 hidden
+frames of motion context on both sides and only then crops the result.  This
+removed a false body-collision failure caused by beginning the old solve in
+mid-flight.  Exact collision audit is accelerated without changing geometry by
+retaining every terrain triangle intersecting a 1.25 m corridor around the
+solved root path; the current stair window retains about 26 percent of the full
+course mesh.
+
+Constraining every airborne frame between two planted contacts is explicitly
+rejected.  Although the intent was to guide the foot over each tread, that
+branch produced 162.76 mm maximum sole-target error, saturated the 0.35 rad IK
+limit, raised maximum joint step to 0.435 rad, and still left 43.64 mm foot
+penetration.  The replacement preserves the selected source swing in world XY
+and constrains only the minimum vertical lift proved necessary by the exact
+target height and the G1 sole-sphere radii.  Planted feet retain the sequence
+foothold solve; unconstrained flight legs remain exactly authored.
+
+A separate canonical overlay converts the validated MotionBricks flat bank to
+the same corpus schema as the registered terrain data.  It preserves each
+recording's observed travel and facing sticks, reconstructs flat-ground
+contacts, and computes exact G1 FK rather than storing a pose-only shortcut.
+The 10-motion canary loads as 730 clips (720 existing plus 10 new), with all new
+clips at 599 frames and valid recorded command masks.  The balanced continuous
+course selector now includes the `motionbricks/` family, so the overlay expands
+flat omnidirectional steering rather than merely existing unused on disk.
+
+Minimal vertical swing guidance was also rejected on the first irregular-stair
+window.  It preserved stance very accurately (1.42 mm maximum stance target
+error and 0.42 mm drift) and removed forbidden-body penetration, but the
+selected source required as much as 94.38 mm of airborne lift.  IK saturated at
+0.35 rad, the maximum joint step reached 0.435 rad, and exact foot penetration
+remained 43.55 mm.  Dense review confirms the corresponding kick/burial rather
+than revealing a harmless metric artifact.  The failure begins in source
+`grail/c490_stair_p1/terrain_stairs__stairs_0868__0002` around frames 397--405;
+it is now treated as an upstream retrieval rejection, not a reason to increase
+the IK or swing-warp authority.
+
+The retrieval gate uses relative flight clearance rather than an absolute link
+height.  For every candidate, it compares future foot clearance on the target
+surface with that same pose's clearance on its registered source surface and
+hard-gates only horizons whose source contact state is airborne.  Stance
+height changes remain available to the explicit rigid-foothold solver.  This
+avoids both representation offsets in heel/sole/toe links and the dead-end
+caused by applying the first relative bound indiscriminately to planted feet.
+
+The MotionBricks overlay now applies the already-tested 0.35 arm / 0.10 wrist
+attenuation with a two-frame Gaussian before FK.  On the 10-clip canary, root,
+leg tracks, and reconstructed contacts are bit-identical to the unattenuated
+conversion.  Maximum arm excursion falls from 1.45 to 0.50 rad and wrist
+excursion from 0.77 to 0.075 rad, retaining modest counter-swing without making
+high-energy hand motion a learned requirement.  Default course selection is
+also explicitly symmetric: twelve evenly spaced native MotionBricks sources
+are paired with their twelve mirrors, while visually suspect `human_random`
+clips remain in the corpus but are excluded from the default matcher pool.
+
+The full overlay is now published and validated as 1,180 clips: 720 existing
+canonical clips plus 460 MotionBricks clips, split exactly into 230 native and
+230 mirrored motions.  All 460 clips retain observed travel/facing command
+tracks and reconstructed G1 contact.  A 24-source steering course did not
+select a MotionBricks row, however; its selected motion remained in Takara and
+registered GRAIL families.  The overlay is therefore validated as available
+coverage, but not yet as exercised coverage in this particular <=35-degree
+travel/facing-divergence route.  A more demanding two-stick selection test is
+still required before claiming that the online matcher uses the new lateral
+and backward motions.
+
+The remaining riser mismatch came from a compact-foot approximation in
+retrieval.  Canonical clips store sole, heel, and toe averages, but exact G1
+collision uses four sole-sphere corners.  A lateral corner could therefore hit
+a riser while all three averages looked clear.  Production matching now
+reconstructs the four model-exact corners from the named ankle poses and the
+MuJoCo collision geometry; the three-average representation remains only as a
+model-free compatibility fallback.  On the same 820-step ascent trace this
+reduced worst raw contact penetration from 99.76 to 36.12 mm, source
+transitions from 44 to 36, and mean search terrain RMS from 18.86 to 17.61 mm.
+Raw matching is still only a pose proposal and is not admitted without rigid
+contact reconstruction.
+
+Acceptance metrics now apply to the requested frames after hidden solve
+context is cropped.  The discarded context values remain in the report under
+explicit `solve_context_*` keys.  This fixes a bookkeeping error that rejected
+the delivered 560--650 ascent segment for a 55.23 mm target miss that existed
+only before frame 560.  The delivered source-anchored segment actually has
+2.71 mm maximum sole error, 3.09 mm exact foot penetration, zero body
+penetration, 2.37 mm stance drift, 0.195 rad maximum joint step, and 12.17
+m/s^2 maximum root acceleration.  Its partial edge plant retains three real
+support corners and passes the unchanged partial-rigid-support audit.  Dense
+review shows a coherent alternating climb without the earlier kick/shuffle.
+
+The first exact-corner reconstructed segment, frames 650--720, also passes all
+gates: 2.40 mm maximum sole error, 1.45 mm exact foot penetration, zero body
+penetration, 0.44 mm stance drift, 0.139 rad maximum joint step, and 11.93
+m/s^2 maximum root acceleration.  Dense 25-fps review shows no burial, stance
+slide, teleport, or one-frame source-transition snap.  The stride remains the
+authored terrain gait rather than a synthesized rough-ground shuffle.  This is
+one visually admitted ascent window; the extended ascent, crest, descent, and
+rough exit are being audited separately rather than inferred from it.
+
+The adjacent exact-corner windows also pass independently.  Frames 560--650
+required the full bounded yaw/planar lattice (675 exact candidate evaluations,
+481.8 seconds on one CPU) but finish with 0.73 mm sole error, 2.16 mm foot
+penetration, zero body penetration, 0.35 mm stance drift, 0.122 rad joint step,
+and 12.10 m/s^2 root acceleration.  Frames 720--820 finish with 3.92 mm sole
+error, 1.33 mm penetration, zero body penetration, 0.68 mm stance drift, 0.154
+rad joint step, and 10.19 m/s^2 root acceleration; dense review is also clean.
+They must not yet be presented as one continuous clip: independent pelvis
+plans create 51.6 and 47.9 mm root discontinuities at the two joins, with a
+0.218 rad joint discontinuity at the second.  A single sequence solve over the
+complete 560--820 ascent is running instead of concealing those joins with an
+un-audited blend.
+
+That unified solve now passes.  Before planning, the exact target mesh is
+cropped to a conservative 1.25 m corridor around the complete context path;
+this retained 9,680 of 43,200 faces (22.4 percent) while remaining far wider
+than the 12 cm foothold authority and the complete G1 body envelope.  Final
+collision is still independently cropped around and exactly audited on the
+result.  The geometry crop reduced the continuous 260-frame solve to 224.1
+seconds even though it evaluated 1,350 full-yaw candidates; the smaller
+uncropped lower window alone had taken 481.8 seconds.  The actual continuous
+560--820 ascent has 1.02 mm maximum sole error, 2.16 mm exact foot penetration,
+zero body penetration, 0.73 mm stance drift, 0.159 rad maximum joint step, and
+12.10 m/s^2 maximum root acceleration.  It contains no independent-window
+join or post-hoc blend.  A corrected 10-fps review over all 260 delivered
+frames (the earlier sheet command had duplicated two page pairs) shows a
+coherent alternating ascent and crest traversal with no buried foot, hover,
+pose teleport, or kick/shuffle recurrence.  Its maximum joint step occurs
+inside one continuous source passage rather than at a retrieval transition,
+and the measured planted-foot drift remains below 0.73 mm.  This admits the
+straight continuous ascent as a clean kinematic result; it does not admit the
+descent or procedural rough-terrain portions, which still require their own
+exact reconstruction and visual review.
+
+The first 230-frame procedural-rough reconstruction exposed two independent
+issues rather than one generic failure.  Sequence foothold planning already
+held planted feet well (0.92 mm sole error, 0.68 mm drift, and zero forbidden
+body penetration), but a free foot still cut 11.59 mm into a bump and one
+right-knee update jumped 0.403 rad.  Restoring the deliberately cleared swing
+target mask allowed the existing bounded repair to lift only the offending
+flight by 10.31 mm; exact penetration then fell to 3.14 mm with stance contact
+unchanged.  That intermediate result was rejected because its 0.367 rad knee
+step was visibly unsafe even though collision was solved.  Gaussian local
+time-density in-betweening now carries all trace/contact/command labels
+through the same monotonic source coordinate and re-audits every interpolated
+subframe without invoking nonlinear IK again.  The accepted in-betweened
+motion adds 33 frames, lowers the maximum joint step to 0.140 rad and root
+acceleration to 11.50 m/s^2, retains 3.15 mm maximum foot penetration, zero
+body penetration, and 0.40 mm stance drift.  Dense 25-fps review of the former
+knee jump shows a smooth speed ramp from roughly 0.12 to 0.64 m/s rather than
+a freeze or one-frame snap; review of the complete clip shows one coherent
+high-clearance rough step rather than the previous repeated kick/shuffle.
+The aggregate deviation from the raw source reaches 0.379 rad because it
+includes both the separately bounded foothold and swing repairs; the
+aggregate gate is therefore 0.40 rad, while each nonlinear solve retains its
+0.35-rad authority and the old 0.66-rad saturated branch remains rejected.

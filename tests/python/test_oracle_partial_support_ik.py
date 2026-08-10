@@ -21,6 +21,47 @@ _G1_MODEL = Path(
     "G1 model and MuJoCo are required",
 )
 class PartialSupportIKIntegrationTest(unittest.TestCase):
+    def test_unconstrained_foot_stays_on_authored_leg_pose(self) -> None:
+        adapter = _G1FootfallAdapter(
+            _G1_MODEL,
+            ISAACLAB_JOINT_NAMES,
+            maximum_joint_correction_rad=0.35,
+        )
+        root = np.asarray((0.0, 0.0, 0.8), dtype=np.float64)
+        quaternion = np.asarray((1.0, 0.0, 0.0, 0.0), dtype=np.float64)
+        joints = np.zeros(len(ISAACLAB_JOINT_NAMES), dtype=np.float64)
+        targets = [
+            value.copy()
+            for value in adapter.sole_positions_for_pose(
+                root_position=root,
+                root_quaternion_wxyz=quaternion,
+                joints=joints,
+            )
+        ]
+        targets[0][:, 2] += 0.01
+        initial = np.full_like(joints, 0.20)
+        active = np.ones(4, dtype=bool)
+        inactive = np.zeros(4, dtype=bool)
+
+        adapted, _correction, error = adapter.adapt_to_targets(
+            root_position=root,
+            root_quaternion_wxyz=quaternion,
+            authored_joints=joints,
+            sole_targets_world=targets,
+            sole_target_masks=(active, inactive),
+            initial_joints=initial,
+            allow_unconstrained_feet=True,
+        )
+
+        right_addresses = adapter._leg_qpos[1]
+        right_in_joint_order = np.isin(
+            adapter._joint_addresses, right_addresses
+        )
+        np.testing.assert_allclose(
+            adapted[right_in_joint_order], joints[right_in_joint_order], atol=1.0e-8
+        )
+        self.assertLess(error, 0.01)
+
     def test_mask_does_not_pull_unsupported_sole_corner(self) -> None:
         adapter = _G1FootfallAdapter(
             _G1_MODEL,

@@ -607,6 +607,26 @@ class TerrainFootholdPlannerTests(unittest.TestCase):
             0.5 + 1.0e-9,
         )
 
+    def test_rejects_a_support_plane_that_over_rotates_the_source_sole(self):
+        terrain = _heightfield_index(lambda x, y: 0.20 * x)
+        intent = FootholdIntent(
+            StanceSpan(0, 0, 8),
+            _flat_sole_pose((0.0, 0.0)),
+        )
+
+        result = plan_terrain_footholds(
+            terrain,
+            (intent,),
+            np.full(8, 0.78),
+            config=_fixed_config(
+                maximum_sole_tilt_adjustment_rad=math.radians(5.0)
+            ),
+        )
+
+        self.assertFalse(result.accepted)
+        counts = dict(result.diagnostics.foothold_searches[-1].rejection_counts)
+        self.assertEqual(counts.get("sole_tilt_adjustment_exceeds_bound"), 1)
+
     def test_rejects_supported_sole_when_the_full_foot_envelope_hits_a_riser(self):
         terrain = _quad_mesh(
             (
