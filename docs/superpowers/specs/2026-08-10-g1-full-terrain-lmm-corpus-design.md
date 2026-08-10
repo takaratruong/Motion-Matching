@@ -2,7 +2,8 @@
 
 Date: 2026-08-10
 
-Status: awaiting written-spec review
+Status: deep source-native verification reference; the accelerated full-model
+critical path is defined by `2026-08-10-g1-full-walking-terrain-lmm-design.md`
 
 ## Objective
 
