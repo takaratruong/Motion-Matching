@@ -600,6 +600,14 @@ def _verify_lane_contents(
         ):
             if values.shape != (stop - start, columns) or not np.isfinite(values).all():
                 raise ValueError(f"lane {label} is not finite and row aligned")
+        if not np.array_equal(
+            lane.artifacts.terrain_features[start:stop],
+            lane.terrain_grid[start:stop, (1, 3, 5, 7)],
+        ):
+            raise ValueError(
+                "lane terrain grid columns 1/3/5/7 must exactly equal the four "
+                "matching terrain features"
+            )
 
 
 def _global_kinematics(

@@ -156,6 +156,13 @@ def _clip(source_index: int, family_index: int, *, suffix: str = "") -> HoldenCl
     )
 
 
+def _terrain_grid(features: np.ndarray) -> np.ndarray:
+    grid = np.zeros((len(features), 36), dtype=np.float32)
+    for lane_offset in (0, 12, 24):
+        grid[:, np.asarray((1, 3, 5, 7)) + lane_offset] = features
+    return grid
+
+
 def _publish_lanes(
     root: Path, inventory: FullWalkingInventory, ledger
 ) -> tuple[Path, ...]:
@@ -212,7 +219,7 @@ def _publish_lanes(
             )
             clips.append(clip)
             range_source_ids.append(source_id)
-            grids.append(np.tile(clip.terrain_features, (1, 9)).astype(np.float32))
+            grids.append(_terrain_grid(clip.terrain_features))
             left.append(clip.source_left_indices)
             right.append(clip.source_right_indices)
             alpha.append(clip.source_alpha)
@@ -256,7 +263,7 @@ def _publish_lanes(
         )
         clips.append(quarantine)
         range_source_ids.append(quarantine_source.source_id)
-        grids.append(np.tile(quarantine.terrain_features, (1, 9)).astype(np.float32))
+        grids.append(_terrain_grid(quarantine.terrain_features))
         left.append(quarantine.source_left_indices)
         right.append(quarantine.source_right_indices)
         alpha.append(quarantine.source_alpha)
@@ -523,6 +530,35 @@ class FullWalkingTerrainLmmCorpusTests(unittest.TestCase):
             (lane / "manifest.json").write_bytes(canonical_json_bytes(manifest))
 
             with self.assertRaisesRegex(ValueError, "source frame count|source map"):
+                assemble_full_corpus(
+                    lanes,
+                    root / "corpus",
+                    inventory=inventory,
+                    split_ledger=ledger,
+                    scene_authority=scenes,
+                )
+
+    def test_assembly_rejects_inconsistent_four_and_thirty_six_dimensional_terrain(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory, ledger, lanes, scenes = self._fixture(root)
+            lane = lanes[0]
+            grid_path = lane / "terrain_grid.npy"
+            grid = np.load(grid_path, allow_pickle=False)
+            grid[0, 1] += np.float32(0.5)
+            with grid_path.open("wb") as stream:
+                np.save(stream, grid, allow_pickle=False)
+            manifest = json.loads((lane / "manifest.json").read_text())
+            manifest["members"][grid_path.name] = {
+                "path": grid_path.name,
+                "size_bytes": grid_path.stat().st_size,
+                "sha256": sha256_file(grid_path),
+            }
+            (lane / "manifest.json").write_bytes(canonical_json_bytes(manifest))
+
+            with self.assertRaisesRegex(ValueError, "terrain.*columns|terrain.*grid"):
                 assemble_full_corpus(
                     lanes,
                     root / "corpus",
