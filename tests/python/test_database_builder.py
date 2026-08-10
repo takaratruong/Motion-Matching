@@ -2,6 +2,7 @@ import os
 import struct
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -62,6 +63,33 @@ def _expected_database_bytes(artifacts: ArtifactSet) -> bytes:
 
 
 class DatabaseBuilderTests(unittest.TestCase):
+    def test_four_frame_lmm_contacts_initialize_both_velocity_endpoints(self):
+        frames = 4
+        positions = np.zeros((frames, 3, 3), np.float64)
+        positions[:, 1, 0] = np.arange(frames) * (0.08 / 60.0)
+        positions[:, 2, 0] = np.arange(frames) * (0.08 / 60.0)
+        rotations = np.zeros((frames, 3, 4), np.float64)
+        rotations[..., 0] = 1.0
+
+        def poisoned_empty_like(values):
+            result = np.empty(values.shape, dtype=values.dtype)
+            result.fill(1e6)
+            return result
+
+        with mock.patch.object(
+            database_module.np, "empty_like", side_effect=poisoned_empty_like
+        ):
+            contacts = database_module.derive_lmm_contacts(
+                positions,
+                rotations,
+                np.array([-1, 0, 0], np.int32),
+                1,
+                2,
+                60.0,
+            )
+
+        np.testing.assert_array_equal(contacts, 1)
+
     def test_lmm_terrain_partition_slices_and_derives_each_source_before_join(self):
         skeleton = SkeletonSpec(
             G1_SKELETON_NAMES,

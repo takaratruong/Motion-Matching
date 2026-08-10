@@ -557,9 +557,9 @@ def derive_lmm_contacts(
         0.5 * (positions[2:] - positions[1:-1]) * fps
         + 0.5 * (positions[1:-1] - positions[:-2]) * fps
     )
-    velocities[0] = velocities[1] - (velocities[3] - velocities[2])
     velocities[-1] = velocities[-2] + (
         velocities[-2] - velocities[-3])
+    velocities[0] = velocities[1] - (velocities[3] - velocities[2])
 
     angular_velocities = np.zeros_like(positions)
     with np.errstate(divide="ignore", invalid="ignore"):
