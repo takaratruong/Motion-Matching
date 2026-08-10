@@ -21,6 +21,7 @@ from .hybrid_terrain_lmm_runtime import CommandState, HybridMatcher
 from .hybrid_terrain_lmm_viewer import (
     DEFAULT_G1_XML,
     _g1_xml_asset_identity,
+    _generator_acceptance_status,
     _load_generator,
     build_viewer_model,
     load_scene_terrain,
@@ -47,10 +48,186 @@ _SAFETY_KEYS = (
     "nonfinite",
     "out_of_range_successor",
 )
+FULL_LABEL = (
+    "FULL WALKING TERRAIN LMM "
+    "(EXACT SEARCH + LEARNED GENERATOR; FULL WALKING CORPUS ONLY)"
+)
+FULL_DIAGNOSTIC_LABEL = (
+    "FULL WALKING TERRAIN LMM "
+    "(DIAGNOSTIC CAPPED SEARCH OR WRONG-RATE RUNTIME; NOT ACCEPTANCE EVIDENCE)"
+)
+FULL_DIAGNOSTIC_TERRAIN_LABEL = (
+    "FULL WALKING TERRAIN LMM "
+    "(DIAGNOSTIC UNAUTHENTICATED TERRAIN; NOT ACCEPTANCE EVIDENCE)"
+)
+FULL_DIAGNOSTIC_MODEL_LABEL = (
+    "FULL WALKING TERRAIN LMM "
+    "(DIAGNOSTIC UNVERIFIED FULL-CORPUS MODEL; NOT ACCEPTANCE EVIDENCE)"
+)
+_FULL_FORMAL_ARTIFACT_AUTHORITIES = {
+    "corpus_schema": "g1-full-walking-terrain-lmm-corpus/v1",
+    "model_schema": "g1-full-walking-terrain-lmm-model/v1",
+    "fps": 60.0,
+    "horizons": [20, 40, 60],
+    "source_identity_count": 15_918,
+    "inventory_terminal_count": 15_918,
+    "pfnn_bvh_count": 80,
+}
+_OVERNIGHT_BASELINE_AUTHORITIES = {
+    "corpus_path": "sonic/runs/g1-hybrid-terrain-lmm/corpus-primary-pfnn-v2-strict",
+    "corpus_manifest_sha256": (
+        "084c168b473e730ec24419a49f4be1526226e5f95a2dd81ae4d367c729889cdb"
+    ),
+    "model_path": (
+        "sonic/runs/g1-hybrid-terrain-lmm/"
+        "final-combined-v2-strict-latent32-visual-v1-allrows"
+    ),
+    "model_manifest_sha256": (
+        "f200db342dd514df6deb6203f3be014054efd4f9038dc0486cc3a4b274a6d826"
+    ),
+    "selection_model_manifest_sha256": (
+        "0f8d36395012d59deac2c54a88ba64252fc959fae00cd9255a4545479b49fa90"
+    ),
+    "selection_evaluation_sha256": (
+        "959f65141346a0dbd322472470414cb7f29fb1d070206cb16b0fc7ee8c08d494"
+    ),
+    "ramp_smoke_receipt_path": (
+        "sonic/runs/g1-hybrid-terrain-lmm/evidence/"
+        "final-combined-v2-strict-latent32-visual-v1-allrows-"
+        "ramp10-full-1000-formal-v2.json"
+    ),
+    "ramp_smoke_receipt_sha256": (
+        "0ad82ae339c6f55d7a4af52b18548a09d4b208624fa359832f99f0d88ab25f66"
+    ),
+    "stairs_smoke_receipt_path": (
+        "sonic/runs/g1-hybrid-terrain-lmm/evidence/"
+        "final-combined-v2-strict-latent32-visual-v1-allrows-"
+        "stairs-standard-full-1000-formal-v2.json"
+    ),
+    "stairs_smoke_receipt_sha256": (
+        "0c2f1de3e65af7fcec60cbb1cfbd001b605439a5d28aefe654698e00e8426a44"
+    ),
+}
 
 
 def _mapping(value: object) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
+
+
+def _full_formal_artifact_authorities(identity: object) -> bool:
+    getter = getattr(identity, "get", lambda *_args: None)
+    return all(
+        getter(name) == expected
+        for name, expected in _FULL_FORMAL_ARTIFACT_AUTHORITIES.items()
+    )
+
+
+def _baseline_authority_exact(identity: object) -> bool:
+    getter = getattr(identity, "get", lambda *_args: None)
+    return all(
+        getter(name) == expected
+        for name, expected in _OVERNIGHT_BASELINE_AUTHORITIES.items()
+    )
+
+
+def _path_identity(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    resolved = path.resolve()
+    try:
+        return str(resolved.relative_to(Path.cwd()))
+    except ValueError:
+        return str(resolved)
+
+
+def _corpus_manifest_sha256(corpus: object) -> str | None:
+    for name in ("cache_manifest_sha256", "manifest_sha256"):
+        value = getattr(corpus, name, None)
+        if isinstance(value, str) and len(value) == 64:
+            return value
+    receipt = getattr(corpus, "manifest_receipt", None)
+    if isinstance(receipt, Mapping):
+        digest = receipt.get("sha256")
+        if isinstance(digest, str) and len(digest) == 64:
+            return digest
+    return None
+
+
+def _baseline_authority_snapshot(evaluator: object) -> dict[str, object]:
+    corpus = getattr(evaluator, "corpus", None)
+    generator = getattr(evaluator, "generator", None)
+    generator_manifest = _mapping(getattr(generator, "manifest", {}))
+    corpus_root = Path(getattr(corpus, "source_root", "."))
+    model_root = getattr(generator, "root", None)
+    return {
+        "corpus_path": _path_identity(corpus_root),
+        "corpus_manifest_sha256": _corpus_manifest_sha256(corpus),
+        "model_path": _path_identity(Path(model_root))
+        if model_root is not None
+        else None,
+        "model_manifest_sha256": getattr(generator, "manifest_sha256", None),
+        "selection_model_manifest_sha256": generator_manifest.get(
+            "selection_model_manifest_sha256"
+        ),
+        "selection_evaluation_sha256": generator_manifest.get(
+            "selection_evaluation_sha256"
+        ),
+        "ramp_smoke_receipt_path": _OVERNIGHT_BASELINE_AUTHORITIES[
+            "ramp_smoke_receipt_path"
+        ],
+        "ramp_smoke_receipt_sha256": _OVERNIGHT_BASELINE_AUTHORITIES[
+            "ramp_smoke_receipt_sha256"
+        ],
+        "stairs_smoke_receipt_path": _OVERNIGHT_BASELINE_AUTHORITIES[
+            "stairs_smoke_receipt_path"
+        ],
+        "stairs_smoke_receipt_sha256": _OVERNIGHT_BASELINE_AUTHORITIES[
+            "stairs_smoke_receipt_sha256"
+        ],
+    }
+
+
+def _full_runtime_label(
+    matcher: HybridMatcher,
+    terrain: object | None = None,
+    *,
+    scene_authentication_current: bool | None = None,
+    search_acceptance_current: bool | None = None,
+    formal_authorities_current: bool | None = None,
+) -> str:
+    search_eligible = (
+        matcher.search_acceptance_eligible
+        if search_acceptance_current is None
+        else search_acceptance_current
+    )
+    if not search_eligible:
+        return FULL_DIAGNOSTIC_LABEL
+    if not _generator_acceptance_status(getattr(matcher, "generator", None))[
+        "accepted"
+    ]:
+        return FULL_DIAGNOSTIC_MODEL_LABEL
+    if formal_authorities_current is False:
+        return FULL_DIAGNOSTIC_MODEL_LABEL
+    if terrain is not None and (
+        not getattr(terrain, "scene_authenticated", False)
+        or scene_authentication_current is False
+    ):
+        return FULL_DIAGNOSTIC_TERRAIN_LABEL
+    return FULL_LABEL
+
+
+def _full_runtime_step_hz(matcher: object) -> float:
+    rate = getattr(matcher, "fps", None)
+    if rate is None:
+        raise ValueError(
+            "full walking interactive viewer requires authenticated 60 Hz runtime FPS"
+        )
+    value = float(rate)
+    if not math.isfinite(value) or value != 60.0:
+        raise ValueError(
+            "full walking interactive viewer requires authenticated 60 Hz runtime FPS"
+        )
+    return value
 
 
 def acceptance_failures(receipt: Mapping[str, object]) -> list[str]:
@@ -61,6 +238,8 @@ def acceptance_failures(receipt: Mapping[str, object]) -> list[str]:
     baseline = _mapping(root.get("baseline"))
     comparison = _mapping(root.get("comparison"))
     identity = _mapping(root.get("formal_identity"))
+    baseline_authority_pre = _mapping(identity.get("baseline_authority_pre"))
+    baseline_authority_post = _mapping(identity.get("baseline_authority_post"))
     failures: list[str] = []
 
     def gate(passed: bool, name: str) -> None:
@@ -75,10 +254,20 @@ def acceptance_failures(receipt: Mapping[str, object]) -> list[str]:
         identity.get("model_schema") == "g1-full-walking-terrain-lmm-model/v1",
         "full-all-row-model-required",
     )
+    gate(
+        _full_formal_artifact_authorities(identity),
+        "full-formal-artifact-authorities-required",
+    )
     gate(identity.get("fps") == 60.0, "60hz-candidate-required")
     gate(identity.get("horizons") == [20, 40, 60], "60hz-horizons-required")
-    gate(identity.get("source_identity_count") == 15_918, "full-source-inventory-required")
-    gate(identity.get("inventory_terminal_count") == 15_918, "terminal-source-receipts-required")
+    gate(
+        identity.get("source_identity_count") == 15_918,
+        "full-source-inventory-required",
+    )
+    gate(
+        identity.get("inventory_terminal_count") == 15_918,
+        "terminal-source-receipts-required",
+    )
     gate(identity.get("pfnn_bvh_count") == 80, "full-pfnn-required")
     for field, name in (
         ("split_receipt_current", "split-receipt-required"),
@@ -99,9 +288,22 @@ def acceptance_failures(receipt: Mapping[str, object]) -> list[str]:
     )
     authenticated = identity.get("authenticated_scene_ids")
     gate(
-        isinstance(authenticated, list)
-        and set(authenticated) == set(FORMAL_SCENE_IDS),
+        isinstance(authenticated, list) and set(authenticated) == set(FORMAL_SCENE_IDS),
         "four-authenticated-scenes-required",
+    )
+    gate(
+        _baseline_authority_exact(baseline_authority_pre)
+        and _baseline_authority_exact(baseline_authority_post),
+        "frozen-baseline-provenance-required",
+    )
+    gate(
+        identity.get("baseline_authority_current_pre") is True
+        and identity.get("baseline_authority_current_post") is True,
+        "baseline-authority-current-required",
+    )
+    gate(
+        baseline_authority_pre == baseline_authority_post,
+        "baseline-authority-unchanged-required",
     )
     gate(
         root.get("route_command_authority_sha256")
@@ -120,18 +322,26 @@ def acceptance_failures(receipt: Mapping[str, object]) -> list[str]:
         gate(safety.get(name) == 0, f"zero-{name.replace('_', '-')}-required")
     query_reduction = comparison.get("query_distance_p95_reduction_fraction")
     slip_reduction = comparison.get("slip_p95_reduction_fraction")
-    gate(isinstance(query_reduction, (int, float)) and query_reduction >= 0.30,
-         "query-distance-p95-improvement-30pct")
-    gate(isinstance(slip_reduction, (int, float)) and slip_reduction >= 0.50,
-         "slip-p95-improvement-50pct")
+    gate(
+        isinstance(query_reduction, (int, float)) and query_reduction >= 0.30,
+        "query-distance-p95-improvement-30pct",
+    )
+    gate(
+        isinstance(slip_reduction, (int, float)) and slip_reduction >= 0.50,
+        "slip-p95-improvement-50pct",
+    )
     slip = _mapping(candidate.get("slip"))
     median = slip.get("median_mps")
     p95 = slip.get("p95_mps")
     speed_mae = candidate.get("speed_mae_mps")
-    gate(isinstance(median, (int, float)) and math.isfinite(median) and median <= 0.02,
-         "slip-median-at-most-0.02mps")
-    gate(isinstance(p95, (int, float)) and math.isfinite(p95) and p95 <= 0.08,
-         "slip-p95-at-most-0.08mps")
+    gate(
+        isinstance(median, (int, float)) and math.isfinite(median) and median <= 0.02,
+        "slip-median-at-most-0.02mps",
+    )
+    gate(
+        isinstance(p95, (int, float)) and math.isfinite(p95) and p95 <= 0.08,
+        "slip-p95-at-most-0.08mps",
+    )
     gate(
         isinstance(speed_mae, (int, float))
         and math.isfinite(speed_mae)
@@ -190,7 +400,9 @@ def _canonical_source_identity(corpus: object, state: object) -> str:
         source_index = int(source_ids[row])
         if 0 <= source_index < len(source_names):
             return source_names[source_index]
-        raise ValueError("full corpus source ID is outside the authenticated source map")
+        raise ValueError(
+            "full corpus source ID is outside the authenticated source map"
+        )
     range_ids = np.asarray(getattr(corpus, "range_ids", ()))
     if range_ids.shape == (len(corpus.artifacts.positions),):
         return f"legacy-range-{int(range_ids[row])}"
@@ -266,7 +478,9 @@ class _MuJoCoRouteEvaluator:
         source_ids: list[str] = []
         initial = matcher.state
         prior_counters = {
-            "candidate_exhaustion": _counter(initial, "candidate_exhaustion_count", "exhaustion_count"),
+            "candidate_exhaustion": _counter(
+                initial, "candidate_exhaustion_count", "exhaustion_count"
+            ),
             "fallback": _counter(initial, "fallback_count"),
             "joint_clamp": _counter(initial, "joint_clamp_count"),
             "out_of_range_successor": _counter(initial, "out_of_range_successor_count"),
@@ -282,20 +496,25 @@ class _MuJoCoRouteEvaluator:
                     dt=1.0 / self.fps,
                 )
             qpos = np.asarray(state.qpos, dtype=np.float64)
-            nonfinite += int(qpos.shape != (int(model.nq),) or not np.isfinite(qpos).all())
+            nonfinite += int(
+                qpos.shape != (int(model.nq),) or not np.isfinite(qpos).all()
+            )
             if nonfinite:
                 raise ValueError("formal route produced nonfinite or wrong-sized qpos")
             for joint_id in range(1, int(model.njnt)):
                 address = int(model.jnt_qposadr[joint_id])
                 lower, upper = model.jnt_range[joint_id]
-                native_violations += int(qpos[address] < lower - 1e-5 or qpos[address] > upper + 1e-5)
+                native_violations += int(
+                    qpos[address] < lower - 1e-5 or qpos[address] > upper + 1e-5
+                )
             data.qpos[:] = qpos
             data.time = float(sample_times[frame])
             mujoco.mj_forward(model, data)
             for foot, body_id in enumerate(body_ids):
                 rotation = data.xmat[body_id].reshape(3, 3)
-                probes[frame, foot * 4:(foot + 1) * 4] = (
-                    geometry.corner_positions_body[foot] @ rotation.T + data.xpos[body_id]
+                probes[frame, foot * 4 : (foot + 1) * 4] = (
+                    geometry.corner_positions_body[foot] @ rotation.T
+                    + data.xpos[body_id]
                 )
             row_contacts = np.asarray(
                 getattr(state, "contacts", matcher.artifacts.contacts[int(state.row)]),
@@ -312,19 +531,26 @@ class _MuJoCoRouteEvaluator:
                 max_speed = abs(float(envelope))
             else:
                 max_speed = max(abs(float(value)) for value in envelope)
-            desired[frame] = abs(float(getattr(
-                state,
-                "desired_speed_mps",
-                float(command_speed[frame]) * max_speed,
-            )))
+            desired[frame] = abs(
+                float(
+                    getattr(
+                        state,
+                        "desired_speed_mps",
+                        float(command_speed[frame]) * max_speed,
+                    )
+                )
+            )
             distances[frame] = float(state.search_distance)
             source_ids.append(_canonical_source_identity(self.corpus, state))
         final = matcher.state
         safety = {
-            "candidate_exhaustion": _counter(final, "candidate_exhaustion_count", "exhaustion_count")
+            "candidate_exhaustion": _counter(
+                final, "candidate_exhaustion_count", "exhaustion_count"
+            )
             - prior_counters["candidate_exhaustion"],
             "fallback": _counter(final, "fallback_count") - prior_counters["fallback"],
-            "joint_clamp": _counter(final, "joint_clamp_count") - prior_counters["joint_clamp"],
+            "joint_clamp": _counter(final, "joint_clamp_count")
+            - prior_counters["joint_clamp"],
             "native_limit_violation": native_violations,
             "nonfinite": nonfinite,
             "out_of_range_successor": _counter(final, "out_of_range_successor_count")
@@ -379,10 +605,20 @@ def _formal_identity(
         "source_identity_count": len(source_names),
         "inventory_terminal_count": corpus_manifest.get("inventory_terminal_count"),
         "pfnn_bvh_count": corpus_manifest.get("pfnn_bvh_count", pfnn_count),
-        "split_receipt_current": getattr(corpus, "split_receipt_current", False) is True,
-        "test_receipt_current": getattr(evaluator.generator, "test_receipt_current", False) is True,
-        "refit_receipt_current": getattr(evaluator.generator, "refit_receipt_current", False) is True,
-        "determinism_receipt_current": getattr(corpus, "determinism_receipt_current", False) is True,
+        "split_receipt_current": getattr(corpus, "split_receipt_current", False)
+        is True,
+        "test_receipt_current": getattr(
+            evaluator.generator, "test_receipt_current", False
+        )
+        is True,
+        "refit_receipt_current": getattr(
+            evaluator.generator, "refit_receipt_current", False
+        )
+        is True,
+        "determinism_receipt_current": getattr(
+            corpus, "determinism_receipt_current", False
+        )
+        is True,
         "full_search": full_search,
         "motion_root_ownership": bool(matchers)
         and all(
@@ -397,20 +633,28 @@ def _formal_identity(
             for matcher in matchers
         ),
         "retry_budget": min(
-            (int(getattr(matcher, "candidate_retry_budget", 0)) for matcher in matchers),
+            (
+                int(getattr(matcher, "candidate_retry_budget", 0))
+                for matcher in matchers
+            ),
             default=0,
         ),
-        "g1_xml_sha256": __import__("hashlib").sha256(Path(g1_xml).read_bytes()).hexdigest(),
+        "g1_xml_sha256": __import__("hashlib")
+        .sha256(Path(g1_xml).read_bytes())
+        .hexdigest(),
         "g1_asset_inventory_sha256": asset_sha,
         "authenticated_scene_ids": sorted(
-            scene for scene in scenes
+            scene
+            for scene in scenes
             if getattr(evaluator.adapters.get(scene), "scene_evidence_status", None)
             == "authenticated-indexed"
         ),
     }
 
 
-def _default_routes(scenes: Sequence[str], frames_per_scene: int) -> tuple[FormalRoute, ...]:
+def _default_routes(
+    scenes: Sequence[str], frames_per_scene: int
+) -> tuple[FormalRoute, ...]:
     if type(frames_per_scene) is not int or frames_per_scene < 2:
         raise ValueError("formal frames per scene must be at least two")
     duration = (frames_per_scene - 1) / 60.0
@@ -434,15 +678,27 @@ def run_formal_smoke(
     routes: Sequence[FormalRoute],
     g1_xml: Path,
 ) -> dict[str, object]:
+    baseline_authority_pre = _baseline_authority_snapshot(baseline)
     receipt = dict(
         compare_baseline_candidate(
             baseline=baseline, candidate=candidate, routes=routes, g1_xml=g1_xml
         )
     )
+    baseline_authority_post = _baseline_authority_snapshot(baseline)
     receipt["schema"] = "g1-full-walking-terrain-lmm-formal-evidence/v1"
-    receipt["formal_identity"] = _formal_identity(
-        candidate, scenes=[route.scene_id for route in routes], g1_xml=g1_xml
-    )
+    receipt["formal_identity"] = {
+        **_formal_identity(
+            candidate, scenes=[route.scene_id for route in routes], g1_xml=g1_xml
+        ),
+        "baseline_authority_pre": baseline_authority_pre,
+        "baseline_authority_post": baseline_authority_post,
+        "baseline_authority_current_pre": _baseline_authority_exact(
+            baseline_authority_pre
+        ),
+        "baseline_authority_current_post": _baseline_authority_exact(
+            baseline_authority_post
+        ),
+    }
     failures = acceptance_failures(receipt)
     receipt["acceptance_failures"] = failures
     receipt["accepted"] = not failures
@@ -493,8 +749,14 @@ def main(argv: list[str] | None = None) -> int:
             g1_xml=arguments.g1_xml,
             gamepad=arguments.gamepad,
             max_render_frames=arguments.max_render_frames,
+            formal_authority_predicate=_full_formal_artifact_authorities,
+            runtime_label_resolver=_full_runtime_label,
+            runtime_step_hz_resolver=_full_runtime_step_hz,
         )
-    print(json.dumps(receipt, sort_keys=True, separators=(",", ":"), allow_nan=False), flush=True)
+    print(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":"), allow_nan=False),
+        flush=True,
+    )
     if arguments.receipt is not None:
         write_receipt_exclusive(arguments.receipt, receipt)
     return 0 if bool(receipt.get("accepted", True)) else 2
@@ -506,6 +768,9 @@ if __name__ == "__main__":
 
 __all__ = (
     "FORMAL_SCENE_IDS",
+    "FULL_LABEL",
+    "_full_formal_artifact_authorities",
+    "_full_runtime_step_hz",
     "acceptance_failures",
     "build_parser",
     "main",

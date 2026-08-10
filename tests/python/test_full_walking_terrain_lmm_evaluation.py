@@ -94,8 +94,7 @@ class _Evaluator:
             desired_speed_mps=np.full(count, 0.4),
             query_distances=np.full(count, self.scale),
             canonical_source_ids=tuple(
-                "source-a" if index % 2 == 0 else "source-b"
-                for index in range(count)
+                "source-a" if index % 2 == 0 else "source-b" for index in range(count)
             ),
             forward_count=count,
             safety_counts={},
@@ -122,20 +121,26 @@ def test_comparison_reuses_routes_and_reduces_coverage_slip_and_speed() -> None:
         baseline_expected = route.commands_at(baseline_call[1])
         candidate_expected = route.commands_at(candidate_call[1])
         for index in (2, 3):
-            np.testing.assert_array_equal(baseline_call[index], baseline_expected[index - 2])
-            np.testing.assert_array_equal(candidate_call[index], candidate_expected[index - 2])
+            np.testing.assert_array_equal(
+                baseline_call[index], baseline_expected[index - 2]
+            )
+            np.testing.assert_array_equal(
+                candidate_call[index], candidate_expected[index - 2]
+            )
     assert receipt["baseline"]["forward_count"] == 102
     assert receipt["candidate"]["forward_count"] == 242
     assert receipt["comparison"]["query_distance_p95_reduction_fraction"] == 0.6
     assert receipt["comparison"]["slip_p95_reduction_fraction"] == pytest.approx(0.6)
     assert receipt["candidate"]["speed_mae_mps"] < 1.0e-12
     assert receipt["candidate"]["by_terrain"]["stair"]["canonical_identity_count"] == 2
-    assert receipt["route_command_authority_sha256"] == receipt["baseline"][
-        "route_command_authority_sha256"
-    ]
-    assert receipt["route_command_authority_sha256"] == receipt["candidate"][
-        "route_command_authority_sha256"
-    ]
+    assert (
+        receipt["route_command_authority_sha256"]
+        == receipt["baseline"]["route_command_authority_sha256"]
+    )
+    assert (
+        receipt["route_command_authority_sha256"]
+        == receipt["candidate"]["route_command_authority_sha256"]
+    )
 
 
 def test_2500_candidate_frames_imply_exact_1042_baseline_frames() -> None:

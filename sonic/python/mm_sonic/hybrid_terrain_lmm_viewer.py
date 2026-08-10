@@ -28,8 +28,7 @@ from .hybrid_terrain_lmm_runtime import (
 )
 
 LABEL = (
-    "HYBRID TERRAIN LMM POC "
-    "(EXACT SEARCH + LEARNED GENERATOR; SUPPORTED TERRAIN ONLY)"
+    "HYBRID TERRAIN LMM POC (EXACT SEARCH + LEARNED GENERATOR; SUPPORTED TERRAIN ONLY)"
 )
 DIAGNOSTIC_LABEL = (
     "HYBRID TERRAIN LMM POC "
@@ -40,8 +39,7 @@ DIAGNOSTIC_TERRAIN_LABEL = (
     "(DIAGNOSTIC UNAUTHENTICATED TERRAIN; NOT ACCEPTANCE EVIDENCE)"
 )
 DIAGNOSTIC_MODEL_LABEL = (
-    "HYBRID TERRAIN LMM POC "
-    "(DIAGNOSTIC UNVERIFIED GENERATOR; NOT ACCEPTANCE EVIDENCE)"
+    "HYBRID TERRAIN LMM POC (DIAGNOSTIC UNVERIFIED GENERATOR; NOT ACCEPTANCE EVIDENCE)"
 )
 _FORMAL_ARTIFACT_AUTHORITIES = {
     "cache_manifest_sha256": (
@@ -183,8 +181,7 @@ def handle_key_press(
     keys.press(character, escape=escape)
     return (
         False
-        if escape
-        or (isinstance(character, str) and character.lower() in {"x", "q"})
+        if escape or (isinstance(character, str) and character.lower() in {"x", "q"})
         else None
     )
 
@@ -216,9 +213,7 @@ class EvdevCommandSource:
             speed = 0.0
         if abs(steering) < self.deadzone:
             steering = 0.0
-        return CommandState.from_gamepad(
-            speed_axis=speed, steering_axis=steering
-        )
+        return CommandState.from_gamepad(speed_axis=speed, steering_axis=steering)
 
 
 class _LinuxEvdevAxes:
@@ -351,7 +346,11 @@ class SceneTerrainAdapter:
         xs = self.origin_x + np.arange(columns, dtype=np.float64) * self.cell_size_m
         zs = self.origin_z + np.arange(rows, dtype=np.float64) * self.cell_size_m
         vertices = np.asarray(
-            [(x, -z, self.source_heights[j, i]) for j, z in enumerate(zs) for i, x in enumerate(xs)],
+            [
+                (x, -z, self.source_heights[j, i])
+                for j, z in enumerate(zs)
+                for i, x in enumerate(xs)
+            ],
             dtype=np.float64,
         )
         faces: list[tuple[int, int, int]] = []
@@ -465,7 +464,11 @@ def _scene_adapter_from_grid(
         scene_authenticated=bool(scene_authenticated),
         scene_evidence_status=str(
             scene_evidence_status
-            or ("diagnostic-generated" if source_path is None else "diagnostic-unindexed")
+            or (
+                "diagnostic-generated"
+                if source_path is None
+                else "diagnostic-unindexed"
+            )
         ),
         source_manifest_sha256=source_manifest_sha256,
         scene_index_sha256=scene_index_sha256,
@@ -509,10 +512,7 @@ def _primary_source_receipt(corpus: object) -> tuple[Path, dict[str, object]]:
         raise ValueError("corpus has no source-manifest receipt")
     if receipt.get("schema") == "g1-hybrid-terrain-lmm-source-receipt/v1":
         return Path(source_root).resolve(strict=True), receipt
-    if (
-        receipt.get("schema")
-        != "g1-hybrid-terrain-lmm-combined-receipt/v2-strict"
-    ):
+    if receipt.get("schema") != "g1-hybrid-terrain-lmm-combined-receipt/v2-strict":
         raise ValueError("corpus source-manifest receipt schema is unsupported")
     if set(receipt) != {
         "schema",
@@ -529,9 +529,7 @@ def _primary_source_receipt(corpus: object) -> tuple[Path, dict[str, object]]:
     ):
         raise ValueError("combined cache manifest path must be absolute")
     combined_path = Path(combined_path_value).resolve(strict=True)
-    expected_combined_path = (Path(source_root) / "manifest.json").resolve(
-        strict=True
-    )
+    expected_combined_path = (Path(source_root) / "manifest.json").resolve(strict=True)
     if combined_path != expected_combined_path:
         raise ValueError("combined receipt does not identify its cache manifest")
     combined_payload, _ = _authenticated_file(
@@ -541,11 +539,11 @@ def _primary_source_receipt(corpus: object) -> tuple[Path, dict[str, object]]:
         expected_size=receipt.get("size_bytes"),
     )
     combined_manifest = _json_object(combined_payload, "combined cache manifest")
-    if (
-        combined_manifest.get("schema")
-        != "g1-hybrid-terrain-lmm-combined-cache/v2-strict"
-        or combined_manifest.get("authorities") != receipt.get("authorities")
-    ):
+    if combined_manifest.get(
+        "schema"
+    ) != "g1-hybrid-terrain-lmm-combined-cache/v2-strict" or combined_manifest.get(
+        "authorities"
+    ) != receipt.get("authorities"):
         raise ValueError("combined cache receipt authority changed")
     authorities = combined_manifest.get("authorities")
     if type(authorities) is not dict or set(authorities) != {
@@ -579,10 +577,7 @@ def _primary_source_receipt(corpus: object) -> tuple[Path, dict[str, object]]:
         expected_size=primary.get("size_bytes"),
     )
     primary_manifest = _json_object(primary_payload, "primary cache manifest")
-    if (
-        primary_manifest.get("schema")
-        != "g1-hybrid-terrain-lmm-corpus/v2-strict"
-    ):
+    if primary_manifest.get("schema") != "g1-hybrid-terrain-lmm-corpus/v2-strict":
         raise ValueError("combined primary cache schema changed")
     pfnn = authorities["pfnn_supplement"]
     if type(pfnn) is not dict or set(pfnn) != {
@@ -595,10 +590,7 @@ def _primary_source_receipt(corpus: object) -> tuple[Path, dict[str, object]]:
     if pfnn.get("schema") != "pfnn-terrain-lmm-supplement/v1":
         raise ValueError("combined PFNN supplement schema changed")
     pfnn_path_value = pfnn.get("path")
-    if (
-        type(pfnn_path_value) is not str
-        or not Path(pfnn_path_value).is_absolute()
-    ):
+    if type(pfnn_path_value) is not str or not Path(pfnn_path_value).is_absolute():
         raise ValueError("combined PFNN supplement manifest path must be absolute")
     pfnn_path = Path(pfnn_path_value).resolve(strict=True)
     if pfnn_path.name != "manifest.json":
@@ -714,8 +706,13 @@ def load_scene_terrain(
         )
     if value == "flat":
         return _scene_adapter_from_grid(
-            np.zeros((2, 2), np.float32), origin_x=-10.0, origin_z=-10.0,
-            cell=20.0, exterior=0.0, name="flat", source_path=None,
+            np.zeros((2, 2), np.float32),
+            origin_x=-10.0,
+            origin_z=-10.0,
+            cell=20.0,
+            exterior=0.0,
+            name="flat",
+            source_path=None,
         )
     authority_identity: dict[str, str] | None = None
     path = Path(scene).expanduser()
@@ -749,8 +746,13 @@ def load_scene_terrain(
     )
     expected = 32 + int(nx) * int(nz) * 4
     if (
-        magic != b"G1HF" or version != 2 or nx < 2 or nz < 2
-        or expected != len(payload) or not math.isfinite(cell) or cell <= 0.0
+        magic != b"G1HF"
+        or version != 2
+        or nx < 2
+        or nz < 2
+        or expected != len(payload)
+        or not math.isfinite(cell)
+        or cell <= 0.0
     ):
         raise ValueError("scene terrain.bin is not a valid G1HF/v2 heightfield")
     heights = np.frombuffer(payload, dtype="<f4", offset=32).reshape((nz, nx))
@@ -775,8 +777,10 @@ def load_scene_terrain(
         ):
             raise ValueError("scene.json terrain contract is unsupported")
         heightfield = descriptor.get("heightfield")
-        if not isinstance(heightfield, dict) \
-                or heightfield.get("sha256") != terrain_sha256:
+        if (
+            not isinstance(heightfield, dict)
+            or heightfield.get("sha256") != terrain_sha256
+        ):
             raise ValueError("scene.json does not bind terrain.bin")
         spawn = descriptor.get("spawn")
         if not isinstance(spawn, dict):
@@ -810,15 +814,18 @@ def load_scene_terrain(
         ),
         source_manifest_sha256=(
             authority_identity.get("source_manifest_sha256")
-            if authority_identity is not None else None
+            if authority_identity is not None
+            else None
         ),
         scene_index_sha256=(
             authority_identity.get("scene_index_sha256")
-            if authority_identity is not None else None
+            if authority_identity is not None
+            else None
         ),
         scene_index_scene_sha256=(
             authority_identity.get("scene_index_scene_sha256")
-            if authority_identity is not None else None
+            if authority_identity is not None
+            else None
         ),
     )
 
@@ -837,8 +844,7 @@ def scene_authentication_is_current(
         return (
             source_path == expected_terrain
             and _sha256_file(source_path) == terrain.terrain_sha256
-            and identity.get("source_manifest_sha256")
-            == terrain.source_manifest_sha256
+            and identity.get("source_manifest_sha256") == terrain.source_manifest_sha256
             and identity.get("scene_index_sha256") == terrain.scene_index_sha256
             and identity.get("scene_index_scene_sha256")
             == terrain.scene_index_scene_sha256
@@ -863,12 +869,8 @@ def overlay_text(
     fallback_count = int(state.fallback_count)
     joint_clamp_count = int(getattr(state, "joint_clamp_count", 0))
     canonical_fallback_count = max(0, fallback_count - joint_clamp_count)
-    candidate_rejections = int(
-        getattr(state, "candidate_limit_rejection_count", 0)
-    )
-    first_rejected_row = getattr(
-        state, "first_candidate_limit_rejection_row", None
-    )
+    candidate_rejections = int(getattr(state, "candidate_limit_rejection_count", 0))
+    first_rejected_row = getattr(state, "first_candidate_limit_rejection_row", None)
     max_rejections_per_step = int(
         getattr(state, "max_candidate_limit_rejections_per_step", 0)
     )
@@ -879,7 +881,8 @@ def overlay_text(
     authenticated_scene = scene_evidence_status == "authenticated-indexed"
     search_text = (
         f"full exact rows {searched}/{total}"
-        if exact else f"diagnostic capped rows {searched}/{total}"
+        if exact
+        else f"diagnostic capped rows {searched}/{total}"
     )
     if exact and authenticated_scene and generator_accepted:
         title = LABEL
@@ -959,7 +962,9 @@ def _load_generator(path: Path, corpus: object) -> object:
             return loader(path)
 
 
-def _load_matcher(arguments: argparse.Namespace) -> tuple[HybridMatcher, SceneTerrainAdapter]:
+def _load_matcher(
+    arguments: argparse.Namespace,
+) -> tuple[HybridMatcher, SceneTerrainAdapter]:
     data_module = importlib.import_module("mm_sonic.hybrid_terrain_lmm_data")
     corpus = data_module.load_hybrid_cache(arguments.cache)
     generator = _load_generator(arguments.model, corpus)
@@ -1177,9 +1182,7 @@ def _model_manifest_identity(
         return str(path), mapping_digest, False
     digest = hashlib.sha256(payload).hexdigest()
     published_digest = getattr(generator, "manifest_sha256", None)
-    published_current = (
-        published_digest is None or published_digest == digest
-    )
+    published_current = published_digest is None or published_digest == digest
     corpus_current = dict(manifest).get("corpus_manifest_sha256") == cache_sha256
     return (
         str(resolved),
@@ -1216,9 +1219,7 @@ def _search_identity_is_current(matcher: HybridMatcher) -> bool:
     full = searched == expected_total
     if full:
         cursor = 0
-        for start, stop in zip(
-            matcher.range_starts, matcher.range_stops, strict=True
-        ):
+        for start, stop in zip(matcher.range_starts, matcher.range_stops, strict=True):
             count = int(stop - start - 1)
             if not np.array_equal(
                 rows[cursor : cursor + count],
@@ -1251,9 +1252,7 @@ def _search_identity_is_current(matcher: HybridMatcher) -> bool:
             for family in total_ids
         ]
     )
-    expected_scope = (
-        "full-range-safe-corpus" if full else "diagnostic-stratified-cap"
-    )
+    expected_scope = "full-range-safe-corpus" if full else "diagnostic-stratified-cap"
     return (
         digest == matcher.search_view_sha256
         and matcher.search_scope == expected_scope
@@ -1279,16 +1278,13 @@ def _all_row_canonical_evaluation_identity(
     receipt_get = getattr(receipt, "get", lambda *_args: None)
     return {
         "fit_all_rows": (
-            getattr(getattr(generator, "config", None), "fit_all_rows", None)
-            is True
+            getattr(getattr(generator, "config", None), "fit_all_rows", None) is True
         ),
         "evaluation_scope": receipt_get("evaluation_scope"),
         "evaluation_artifact_sha256": (
             evaluation.get("sha256") if isinstance(evaluation, dict) else None
         ),
-        "selection_evaluation_sha256": manifest_get(
-            "selection_evaluation_sha256"
-        ),
+        "selection_evaluation_sha256": manifest_get("selection_evaluation_sha256"),
         "selection_model_manifest_sha256": manifest_get(
             "selection_model_manifest_sha256"
         ),
@@ -1333,13 +1329,9 @@ def _runtime_identity(
     asset_inventory_sha, asset_inventory = _g1_xml_asset_identity(Path(g1_xml))
     corpus_artifacts = getattr(matcher.corpus, "artifacts", None)
     corpus_positions = np.asarray(getattr(corpus_artifacts, "positions", ()))
-    corpus_range_starts = np.asarray(
-        getattr(corpus_artifacts, "range_starts", ())
-    )
+    corpus_range_starts = np.asarray(getattr(corpus_artifacts, "range_starts", ()))
     corpus_train_mask = np.asarray(getattr(matcher.corpus, "train_mask", ()))
-    corpus_evaluation_mask = np.asarray(
-        getattr(matcher.corpus, "evaluation_mask", ())
-    )
+    corpus_evaluation_mask = np.asarray(getattr(matcher.corpus, "evaluation_mask", ()))
     generator_loader_authority = _generator_has_loader_authority(
         matcher.generator, model_sha
     )
@@ -1370,9 +1362,7 @@ def _runtime_identity(
         "corpus_row_count": len(corpus_positions),
         "corpus_range_count": len(corpus_range_starts),
         "corpus_train_row_count": int(np.count_nonzero(corpus_train_mask)),
-        "corpus_evaluation_row_count": int(
-            np.count_nonzero(corpus_evaluation_mask)
-        ),
+        "corpus_evaluation_row_count": int(np.count_nonzero(corpus_evaluation_mask)),
         "generator_loader_authority": generator_loader_authority,
         "search_view_sha256": matcher.search_view_sha256,
         "search_scope": matcher.search_scope,
@@ -1382,9 +1372,7 @@ def _runtime_identity(
         "total_safe_family_counts": dict(matcher.total_searchable_family_counts),
         "transition_penalty": matcher.transition_penalty,
         "search_identity_current": _search_identity_is_current(matcher),
-        "generator_acceptance_status": _generator_acceptance_status(
-            matcher.generator
-        ),
+        "generator_acceptance_status": _generator_acceptance_status(matcher.generator),
         "all_row_canonical_evaluation_identity": (
             _all_row_canonical_evaluation_identity(matcher.generator)
         ),
@@ -1423,9 +1411,9 @@ def _search_audit(matcher: HybridMatcher) -> dict[str, int]:
                 tree.distance, brute.distance, rel_tol=0.0, abs_tol=1.0e-12
             )
         )
-        exact_feature_matches += int(np.array_equal(
-            matcher.features[tree.row], matcher.features[row]
-        ))
+        exact_feature_matches += int(
+            np.array_equal(matcher.features[tree.row], matcher.features[row])
+        )
     return {
         "samples": samples,
         "failures": failures,
@@ -1526,9 +1514,7 @@ def run_mujoco_headless_smoke(
             selected_ranges.add(state.range_index)
             selected_families.add(state.family)
             terrain_classes.add(state.terrain_class)
-            terrain_rows.append(
-                np.asarray(state.terrain_features, dtype=np.float64)
-            )
+            terrain_rows.append(np.asarray(state.terrain_features, dtype=np.float64))
             if frame in parity_frames:
                 tree = matcher.match(state.query)
                 brute = matcher.brute_force_match(state.query)
@@ -1536,8 +1522,10 @@ def run_mujoco_headless_smoke(
                 parity_failures += int(
                     tree.row != brute.row
                     or not math.isclose(
-                        tree.distance, brute.distance,
-                        rel_tol=0.0, abs_tol=1.0e-12,
+                        tree.distance,
+                        brute.distance,
+                        rel_tol=0.0,
+                        abs_tol=1.0e-12,
                     )
                 )
             if not finite:
@@ -1554,8 +1542,7 @@ def run_mujoco_headless_smoke(
     canonical_fallback_count = max(0, fallback_count - joint_clamp_count)
     crash_count = int(failure_reason is not None)
     terrain_variance = (
-        float(np.var(np.stack(terrain_rows), axis=0).max())
-        if terrain_rows else 0.0
+        float(np.var(np.stack(terrain_rows), axis=0).max()) if terrain_rows else 0.0
     )
     authority_post = _capture_runtime_identity(matcher, terrain, Path(g1_xml))
     authority_current_fields = (
@@ -1593,10 +1580,9 @@ def run_mujoco_headless_smoke(
         authority_pre.get("transition_penalty") == 0.1
         and authority_post.get("transition_penalty") == 0.1
     )
-    formal_artifact_authorities = (
-        _formal_artifact_authorities(authority_pre)
-        and _formal_artifact_authorities(authority_post)
-    )
+    formal_artifact_authorities = _formal_artifact_authorities(
+        authority_pre
+    ) and _formal_artifact_authorities(authority_post)
     acceptance_failures: list[str] = []
     gates = (
         (frames >= 1_000, "minimum-1000-frames"),
@@ -1614,14 +1600,12 @@ def run_mujoco_headless_smoke(
             "tree-brute-parity",
         ),
         (
-            retrieval_audit["samples"] > 0
-            and retrieval_audit["failures"] == 0,
+            retrieval_audit["samples"] > 0 and retrieval_audit["failures"] == 0,
             "manifest-row-retrieval-audit",
         ),
         (
             retrieval_audit["samples"] > 0
-            and retrieval_audit["exact_feature_matches"]
-            == retrieval_audit["samples"],
+            and retrieval_audit["exact_feature_matches"] == retrieval_audit["samples"],
             "exact-feature-retrieval-required",
         ),
         (full_search, "full-search-required"),
@@ -1686,9 +1670,7 @@ def run_mujoco_headless_smoke(
         "tree_brute_parity_failures": parity_failures,
         "retrieval_audit_samples": retrieval_audit["samples"],
         "retrieval_audit_failures": retrieval_audit["failures"],
-        "retrieval_exact_feature_matches": retrieval_audit[
-            "exact_feature_matches"
-        ],
+        "retrieval_exact_feature_matches": retrieval_audit["exact_feature_matches"],
         "range_diversity_count": len(selected_ranges),
         "family_diversity_count": len(selected_families),
         "learned_decode_count": learned_count,
@@ -1733,9 +1715,7 @@ def run_mujoco_headless_smoke(
         "total_safe_row_count": authority_pre.get("total_safe_row_count"),
         "searched_row_count": authority_pre.get("searched_row_count"),
         "searched_family_counts": authority_pre.get("searched_family_counts"),
-        "total_safe_family_counts": authority_pre.get(
-            "total_safe_family_counts"
-        ),
+        "total_safe_family_counts": authority_pre.get("total_safe_family_counts"),
         "search_view_sha256": authority_pre.get("search_view_sha256"),
         "transition_penalty": authority_pre.get("transition_penalty"),
         "native_limit_audit_scope": "scripted-runtime-mujoco-forward-only",
@@ -1760,11 +1740,28 @@ def run_interactive(
     g1_xml: Path = DEFAULT_G1_XML,
     gamepad: str | None = None,
     max_render_frames: int = 0,
+    formal_authority_predicate: Callable[[object], bool] | None = None,
+    runtime_label_resolver: Callable[..., str] | None = None,
+    runtime_step_hz_resolver: Callable[[object], float] | None = None,
 ) -> dict[str, object]:
     if not os.environ.get("DISPLAY"):
         raise RuntimeError("interactive hybrid terrain viewer requires DISPLAY")
     import mujoco
     import mujoco.viewer
+
+    authority_predicate = (
+        _formal_artifact_authorities
+        if formal_authority_predicate is None
+        else formal_authority_predicate
+    )
+    label_resolver = (
+        _runtime_label if runtime_label_resolver is None else runtime_label_resolver
+    )
+    step_hz_resolver = (
+        _runtime_step_hz
+        if runtime_step_hz_resolver is None
+        else runtime_step_hz_resolver
+    )
 
     keyboard_module = _load_keyboard_module()
     keys = KeyboardCommandSource()
@@ -1785,16 +1782,14 @@ def run_interactive(
     interactive_scene_authentication_current = (
         identity.get("scene_authentication_current") is True
     )
-    interactive_formal_authorities_current = _formal_artifact_authorities(
-        identity
-    )
+    interactive_formal_authorities_current = authority_predicate(identity)
     interactive_generator_accepted = (
         identity.get("generator_acceptance_status", {}).get("accepted") is True
         and interactive_formal_authorities_current
     )
     overlay_scene_status = terrain.scene_evidence_status
     data = mujoco.MjData(model)
-    accumulator = FixedRateAccumulator(step_hz=_runtime_step_hz(matcher))
+    accumulator = FixedRateAccumulator(step_hz=step_hz_resolver(matcher))
     render_frames = 0
     reset_failures = 0
     started = time.monotonic()
@@ -1875,7 +1870,7 @@ def run_interactive(
         listener.join(timeout=1.0)
     return {
         "schema": "hybrid-terrain-lmm-viewer-runtime/v1",
-        "label": _runtime_label(
+        "label": label_resolver(
             matcher,
             terrain,
             scene_authentication_current=interactive_scene_authentication_current,
@@ -1913,9 +1908,7 @@ def write_receipt_exclusive(target: Path, receipt: dict[str, object]) -> Path:
     if type(receipt) is not dict:
         raise TypeError("runtime receipt must be a JSON object")
     payload = (
-        json.dumps(
-            receipt, sort_keys=True, separators=(",", ":"), allow_nan=False
-        )
+        json.dumps(receipt, sort_keys=True, separators=(",", ":"), allow_nan=False)
         + "\n"
     ).encode()
     destination = Path(target).expanduser()
