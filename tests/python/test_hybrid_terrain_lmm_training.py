@@ -16,6 +16,7 @@ import numpy as np
 import torch
 from mm_sonic.hybrid_terrain_lmm_training import (
     HybridModelConfig,
+    _MetricAccumulator,
     _physical_metrics_receipt_accepted,
     _read_bound_artifact,
     _rename_directory_noreplace,
@@ -237,6 +238,34 @@ class HybridTerrainLmmTrainingTests(unittest.TestCase):
         with self.assertRaisesRegex(FloatingPointError, "non-finite"):
             calculate_physical_metrics(corpus, rows, target)
 
+    def test_metric_accumulator_keeps_local_position_gate_diagnostic_only(self) -> None:
+        accumulator = _MetricAccumulator.empty()
+        accumulator.rows = 4
+        accumulator.joint_count = 4
+        accumulator.joint_sum = 0.04
+        accumulator.frame_joint_max = [np.full(4, 0.02, dtype=np.float32)]
+        accumulator.local_position_max = [np.full(4, 0.50, dtype=np.float32)]
+        accumulator.fk_position_max = [np.full(4, 0.02, dtype=np.float32)]
+        accumulator.support_position_max = [np.full(4, 0.01, dtype=np.float32)]
+        accumulator.true_positive = np.asarray([4, 4], dtype=np.int64)
+        accumulator.false_positive = np.zeros(2, dtype=np.int64)
+        accumulator.false_negative = np.zeros(2, dtype=np.int64)
+
+        metrics = accumulator.finish()
+
+        self.assertTrue(metrics["accepted"])
+        self.assertEqual(metrics["local_position_p95_m"], 0.50)
+        self.assertEqual(
+            metrics["gate_limits"],
+            {
+                "joint_geodesic_mae_rad": 0.03,
+                "joint_frame_max_p95_rad": 0.10,
+                "fk_body_position_p95_m": 0.08,
+                "support_foot_position_p95_m": 0.05,
+                "minimum_contact_f1": 0.85,
+            },
+        )
+
     def test_local_position_metric_is_diagnostic_only_not_an_acceptance_gate(
         self,
     ) -> None:
@@ -252,7 +281,6 @@ class HybridTerrainLmmTrainingTests(unittest.TestCase):
             "gate_limits": {
                 "joint_geodesic_mae_rad": 0.03,
                 "joint_frame_max_p95_rad": 0.10,
-                "local_position_p95_m": 0.03,
                 "fk_body_position_p95_m": 0.08,
                 "support_foot_position_p95_m": 0.05,
                 "minimum_contact_f1": 0.85,

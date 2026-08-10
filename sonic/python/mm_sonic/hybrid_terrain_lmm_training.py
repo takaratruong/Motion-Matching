@@ -64,6 +64,13 @@ _LOSS_PROFILE_WEIGHTS = {
         "latent_l2": 1.0e-4,
     },
 }
+_PHYSICAL_ACCEPTANCE_LIMITS = {
+    "joint_geodesic_mae_rad": 0.03,
+    "joint_frame_max_p95_rad": 0.10,
+    "fk_body_position_p95_m": 0.08,
+    "support_foot_position_p95_m": 0.05,
+}
+_MINIMUM_CONTACT_F1 = 0.85
 
 
 @dataclass(frozen=True)
@@ -887,21 +894,20 @@ class _MetricAccumulator:
             "support_foot_position_p95_m": float(np.percentile(support, 95.0)),
             "contact_f1": contact_f1,
             "gate_limits": {
-                "joint_geodesic_mae_rad": 0.03,
-                "joint_frame_max_p95_rad": 0.10,
-                "local_position_p95_m": 0.03,
-                "fk_body_position_p95_m": 0.08,
-                "support_foot_position_p95_m": 0.05,
-                "minimum_contact_f1": 0.85,
+                **_PHYSICAL_ACCEPTANCE_LIMITS,
+                "minimum_contact_f1": _MINIMUM_CONTACT_F1,
             },
         }
         metrics["accepted"] = bool(
-            metrics["joint_geodesic_mae_rad"] <= 0.03
-            and metrics["joint_frame_max_p95_rad"] <= 0.10
-            and metrics["local_position_p95_m"] <= 0.03
-            and metrics["fk_body_position_p95_m"] <= 0.08
-            and metrics["support_foot_position_p95_m"] <= 0.05
-            and min(contact_f1) >= 0.85
+            metrics["joint_geodesic_mae_rad"]
+            <= _PHYSICAL_ACCEPTANCE_LIMITS["joint_geodesic_mae_rad"]
+            and metrics["joint_frame_max_p95_rad"]
+            <= _PHYSICAL_ACCEPTANCE_LIMITS["joint_frame_max_p95_rad"]
+            and metrics["fk_body_position_p95_m"]
+            <= _PHYSICAL_ACCEPTANCE_LIMITS["fk_body_position_p95_m"]
+            and metrics["support_foot_position_p95_m"]
+            <= _PHYSICAL_ACCEPTANCE_LIMITS["support_foot_position_p95_m"]
+            and min(contact_f1) >= _MINIMUM_CONTACT_F1
         )
         return metrics
 
@@ -1218,17 +1224,20 @@ def _physical_metrics_receipt_accepted(metrics: object) -> bool:
     if type(metrics.get("rows")) is not int or metrics["rows"] <= 0:
         raise ValueError("selection model physical metrics row count is invalid")
     limits = {
-        "joint_geodesic_mae_rad": 0.03,
-        "joint_frame_max_p95_rad": 0.10,
-        "local_position_p95_m": 0.03,
-        "fk_body_position_p95_m": 0.08,
-        "support_foot_position_p95_m": 0.05,
-        "minimum_contact_f1": 0.85,
+        **_PHYSICAL_ACCEPTANCE_LIMITS,
+        "minimum_contact_f1": _MINIMUM_CONTACT_F1,
     }
     if metrics.get("gate_limits") != limits:
         raise ValueError("selection model physical gate limits changed")
     values: dict[str, float] = {}
-    for name in tuple(limits)[:-1]:
+    local_position = metrics.get("local_position_p95_m")
+    if (
+        type(local_position) not in (int, float)
+        or not math.isfinite(local_position)
+        or local_position < 0.0
+    ):
+        raise ValueError("selection model metric local_position_p95_m is invalid")
+    for name in _PHYSICAL_ACCEPTANCE_LIMITS:
         value = metrics.get(name)
         if type(value) not in (int, float) or not math.isfinite(value) or value < 0.0:
             raise ValueError(f"selection model metric {name} is invalid")
@@ -1244,12 +1253,15 @@ def _physical_metrics_receipt_accepted(metrics: object) -> bool:
     ):
         raise ValueError("selection model contact metrics are invalid")
     accepted = bool(
-        values["joint_geodesic_mae_rad"] <= limits["joint_geodesic_mae_rad"]
-        and values["joint_frame_max_p95_rad"] <= limits["joint_frame_max_p95_rad"]
-        and values["fk_body_position_p95_m"] <= limits["fk_body_position_p95_m"]
+        values["joint_geodesic_mae_rad"]
+        <= _PHYSICAL_ACCEPTANCE_LIMITS["joint_geodesic_mae_rad"]
+        and values["joint_frame_max_p95_rad"]
+        <= _PHYSICAL_ACCEPTANCE_LIMITS["joint_frame_max_p95_rad"]
+        and values["fk_body_position_p95_m"]
+        <= _PHYSICAL_ACCEPTANCE_LIMITS["fk_body_position_p95_m"]
         and values["support_foot_position_p95_m"]
-        <= limits["support_foot_position_p95_m"]
-        and min(float(value) for value in contact) >= limits["minimum_contact_f1"]
+        <= _PHYSICAL_ACCEPTANCE_LIMITS["support_foot_position_p95_m"]
+        and min(float(value) for value in contact) >= _MINIMUM_CONTACT_F1
     )
     if metrics.get("accepted") is not accepted:
         raise ValueError("selection model physical gate result is inconsistent")
@@ -1692,8 +1704,10 @@ def _full_test_receipt_authority(
     corpus_manifest_sha256: str,
     selection_model_manifest_sha256: str,
     selection_validation_receipt_sha256: str,
-) -> Path:
-    matches: list[Path] = []
+) -> tuple[Path, bytes]:
+    from .full_walking_terrain_lmm_training import _parse_test_receipt_payload
+
+    matches: list[tuple[Path, bytes]] = []
     seen: set[Path] = set()
     for pattern in ("*.json", "*/*.json"):
         for candidate in sorted(root.parent.glob(pattern)):
@@ -1705,15 +1719,19 @@ def _full_test_receipt_authority(
             except OSError:
                 continue
             if hashlib.sha256(payload).hexdigest() == expected_sha256:
-                matches.append(candidate)
+                matches.append((candidate, payload))
     if len(matches) != 1:
         raise ValueError(
             "full walking test receipt authority must resolve to exactly one "
             "immutable JSON file"
         )
-    from .full_walking_terrain_lmm_training import load_test_receipt
-
-    receipt = load_test_receipt(matches[0])
+    path, payload = matches[0]
+    current_payload = path.read_bytes()
+    if current_payload != payload:
+        raise ValueError(
+            "full walking test receipt authority changed during authentication"
+        )
+    receipt = _parse_test_receipt_payload(payload)
     if (
         receipt.get("accepted") is not True
         or receipt.get("corpus_manifest_sha256") != corpus_manifest_sha256
@@ -1723,7 +1741,7 @@ def _full_test_receipt_authority(
         != selection_validation_receipt_sha256
     ):
         raise ValueError("full walking test receipt authority is inconsistent")
-    return matches[0]
+    return path, payload
 
 
 def load_hybrid_generator(
@@ -1959,7 +1977,7 @@ def load_hybrid_generator(
             "selection_model_manifest_sha256"
         ) != artifact_identity.get("selection_model_manifest_sha256"):
             raise ValueError("full walking refit selection provenance is inconsistent")
-        _full_test_receipt_authority(
+        _test_receipt_path, _test_receipt_payload = _full_test_receipt_authority(
             root,
             expected_sha256=artifact_identity["test_receipt_sha256"],
             corpus_manifest_sha256=corpus_hash,

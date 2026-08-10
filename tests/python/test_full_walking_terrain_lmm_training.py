@@ -8,6 +8,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import torch
@@ -422,6 +423,8 @@ class FullWalkingTrainingContractTests(unittest.TestCase):
         corpus = _synthetic_full_corpus()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            corpus = SimpleNamespace(**{**vars(corpus), "root": root / "corpus"})
+            corpus.root.mkdir()
             selection = root / "red-selection"
             train_selection(corpus, selection, config=_config())
             with self.assertRaisesRegex(ValueError, "validation gates"):
@@ -437,6 +440,8 @@ class FullWalkingTrainingContractTests(unittest.TestCase):
         corpus = _easy_green_corpus()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            corpus = SimpleNamespace(**{**vars(corpus), "root": root / "corpus"})
+            corpus.root.mkdir()
             selection = root / "selection"
             selection_config = replace(_config(), post_coverage_steps=50)
             receipt = train_selection(corpus, selection, config=selection_config)
@@ -507,6 +512,31 @@ class FullWalkingTrainingContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "test receipt authority"):
                 load_hybrid_generator(refit, corpus=corpus, device="cpu")
             test_output.write_bytes(test_payload)
+            swapped_test = dict(test_receipt)
+            swapped_metrics = dict(test_receipt["metrics"])
+            swapped_metrics["local_position_p95_m"] = 0.02
+            swapped_test["metrics"] = swapped_metrics
+            swapped_payload = canonical_json_bytes(swapped_test)
+            original_read_bytes = Path.read_bytes
+            swapped_once = False
+
+            def swap_after_authority_scan(path: Path) -> bytes:
+                nonlocal swapped_once
+                resolved = path.expanduser().resolve()
+                if resolved == test_output.resolve() and not swapped_once:
+                    test_output.write_bytes(swapped_payload)
+                    swapped_once = True
+                    return test_payload
+                return original_read_bytes(path)
+
+            test_output.write_bytes(test_payload)
+            with mock.patch.object(Path, "read_bytes", autospec=True) as patched_read:
+                patched_read.side_effect = swap_after_authority_scan
+                with self.assertRaisesRegex(
+                    ValueError, "test receipt authority|changed during"
+                ):
+                    load_hybrid_generator(refit, corpus=corpus, device="cpu")
+            test_output.write_bytes(test_payload)
             changed_validation = dict(test_receipt)
             changed_validation["selection_validation_receipt_sha256"] = _sha("1")
             changed_validation_output = root / "changed-validation-test.json"
@@ -559,6 +589,8 @@ class FullWalkingTrainingContractTests(unittest.TestCase):
         corpus = _easy_green_corpus()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            corpus = SimpleNamespace(**{**vars(corpus), "root": root / "corpus"})
+            corpus.root.mkdir()
             selection = root / "selection"
             train_selection(corpus, selection, config=_config())
             first_receipt = root / "first-test.json"
@@ -569,6 +601,80 @@ class FullWalkingTrainingContractTests(unittest.TestCase):
             ):
                 evaluate_frozen_test(corpus, selection, second_receipt, device="cpu")
             self.assertFalse(second_receipt.exists())
+
+    def test_copied_selection_cannot_bypass_global_frozen_test_reservation(
+        self,
+    ) -> None:
+        corpus = _easy_green_corpus()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            corpus = SimpleNamespace(**{**vars(corpus), "root": root / "corpus"})
+            corpus.root.mkdir()
+            selection = root / "selection"
+            copied_parent = root / "copied-parent"
+            copied_selection = copied_parent / "selection-copy"
+            train_selection(corpus, selection, config=_config())
+            shutil.copytree(selection, copied_selection)
+
+            evaluate_frozen_test(
+                corpus, selection, root / "first-test.json", device="cpu"
+            )
+            with self.assertRaisesRegex(
+                (FileExistsError, ValueError), "frozen test|already"
+            ):
+                evaluate_frozen_test(
+                    corpus,
+                    copied_selection,
+                    root / "copied-test.json",
+                    device="cpu",
+                )
+
+    def test_frozen_test_loader_keeps_local_position_metric_diagnostic_only(
+        self,
+    ) -> None:
+        corpus = _easy_green_corpus()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            corpus = SimpleNamespace(**{**vars(corpus), "root": root / "corpus"})
+            corpus.root.mkdir()
+            selection = root / "selection"
+            train_selection(corpus, selection, config=_config())
+            patched_metrics = {
+                "finite": True,
+                "rows": int(np.count_nonzero(corpus.test_mask & corpus.eligible_mask)),
+                "joint_geodesic_mae_rad": 0.01,
+                "joint_frame_max_p95_rad": 0.02,
+                "local_position_p95_m": 0.50,
+                "fk_body_position_p95_m": 0.02,
+                "support_foot_position_p95_m": 0.01,
+                "contact_f1": [0.99, 0.99],
+                "gate_limits": {
+                    "joint_geodesic_mae_rad": 0.03,
+                    "joint_frame_max_p95_rad": 0.10,
+                    "fk_body_position_p95_m": 0.08,
+                    "support_foot_position_p95_m": 0.05,
+                    "minimum_contact_f1": 0.85,
+                },
+                "accepted": True,
+            }
+            with mock.patch(
+                "mm_sonic.full_walking_terrain_lmm_training.evaluate_hybrid_rows",
+                return_value=patched_metrics,
+            ):
+                receipt = evaluate_frozen_test(
+                    corpus,
+                    selection,
+                    root / "patched-test.json",
+                    device="cpu",
+                )
+            self.assertTrue(receipt["accepted"])
+            self.assertEqual(receipt["metrics"]["local_position_p95_m"], 0.50)
+            self.assertEqual(
+                load_test_receipt(root / "patched-test.json")["metrics"][
+                    "local_position_p95_m"
+                ],
+                0.50,
+            )
 
     def test_selection_authorization_is_validation_only_when_train_diagnostic_is_red(
         self,

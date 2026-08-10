@@ -70,6 +70,13 @@ _TEST_RECEIPT_KEYS = {
     "test_rows",
     "metrics",
 }
+_FULL_WALKING_ACCEPTANCE_LIMITS = {
+    "joint_geodesic_mae_rad": 0.03,
+    "joint_frame_max_p95_rad": 0.10,
+    "fk_body_position_p95_m": 0.08,
+    "support_foot_position_p95_m": 0.05,
+}
+_FULL_WALKING_MINIMUM_CONTACT_F1 = 0.85
 
 
 def _is_sha256(value: object) -> bool:
@@ -732,21 +739,21 @@ def _metric_receipt_valid(metrics: object) -> bool:
         raise ValueError("test physical metrics are invalid")
     if type(metrics.get("rows")) is not int or metrics["rows"] <= 0:
         raise ValueError("test physical metric row count is invalid")
-    numeric_limits = {
-        "joint_geodesic_mae_rad": 0.03,
-        "joint_frame_max_p95_rad": 0.10,
-        "local_position_p95_m": 0.03,
-        "fk_body_position_p95_m": 0.08,
-        "support_foot_position_p95_m": 0.05,
-    }
     expected_limits = {
-        **numeric_limits,
-        "minimum_contact_f1": 0.85,
+        **_FULL_WALKING_ACCEPTANCE_LIMITS,
+        "minimum_contact_f1": _FULL_WALKING_MINIMUM_CONTACT_F1,
     }
     if metrics.get("gate_limits") != expected_limits:
         raise ValueError("test physical gate limits changed")
+    local_position = metrics.get("local_position_p95_m")
+    if (
+        type(local_position) not in (int, float)
+        or not math.isfinite(local_position)
+        or local_position < 0
+    ):
+        raise ValueError("test metric local_position_p95_m is invalid")
     accepted = True
-    for name, limit in numeric_limits.items():
+    for name, limit in _FULL_WALKING_ACCEPTANCE_LIMITS.items():
         value = metrics.get(name)
         if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
             raise ValueError(f"test metric {name} is invalid")
@@ -764,7 +771,7 @@ def _metric_receipt_valid(metrics: object) -> bool:
         )
     ):
         raise ValueError("test contact F1 metrics are invalid")
-    accepted = accepted and min(contact) >= 0.85
+    accepted = accepted and min(contact) >= _FULL_WALKING_MINIMUM_CONTACT_F1
     if metrics.get("accepted") is not bool(accepted):
         raise ValueError("test physical gate result is inconsistent")
     return bool(accepted)
@@ -800,27 +807,42 @@ def _publish_file_exclusive(payload: bytes, output: Path) -> Path:
     return output
 
 
+def _corpus_authority_root(corpus: object) -> Path:
+    root = getattr(corpus, "root", None)
+    if not isinstance(root, Path):
+        raise TypeError("full walking corpus must expose a Path authority root")
+    resolved = root.expanduser().resolve()
+    if resolved.is_symlink() or (resolved.exists() and not resolved.is_dir()):
+        raise ValueError("full walking corpus authority root must be a directory")
+    if not resolved.is_dir():
+        raise ValueError("full walking corpus authority root does not exist")
+    return resolved
+
+
 def _reserve_frozen_test(
-    selection_root: Path,
+    corpus: object,
     *,
     corpus_manifest_sha256: str,
     selection_model_manifest_sha256: str,
     requested_output: Path,
 ) -> None:
-    reservation_root = selection_root.parent / (
-        ".full-walking-frozen-test-"
-        f"{corpus_manifest_sha256}-{selection_model_manifest_sha256}"
+    authority_root = _corpus_authority_root(corpus)
+    reservation_root = authority_root / ".full-walking-frozen-test-ledger"
+    if reservation_root.exists() and (
+        reservation_root.is_symlink() or not reservation_root.is_dir()
+    ):
+        raise ValueError("frozen test reservation ledger is not a directory")
+    reservation_root.mkdir(mode=0o755, exist_ok=True)
+    reservation_path = reservation_root / (
+        f"{corpus_manifest_sha256}-{selection_model_manifest_sha256}.json"
     )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     try:
-        reservation_root.mkdir(mode=0o755)
+        descriptor = os.open(reservation_path, flags, 0o644)
     except FileExistsError as error:
         raise FileExistsError(
             "frozen test is already reserved for this corpus and selection model"
         ) from error
-    descriptor, staging_name = tempfile.mkstemp(
-        prefix=".reservation-", dir=reservation_root
-    )
-    staging = Path(staging_name)
     reservation = {
         "schema": "g1-full-walking-terrain-lmm-frozen-test-reservation/v1",
         "status": "reserved-before-evaluation",
@@ -833,7 +855,6 @@ def _reserve_frozen_test(
             stream.write(canonical_json_bytes(reservation))
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(staging, reservation_root / "reservation.json")
         directory = os.open(
             reservation_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
         )
@@ -841,8 +862,9 @@ def _reserve_frozen_test(
             os.fsync(directory)
         finally:
             os.close(directory)
-    finally:
-        staging.unlink(missing_ok=True)
+    except Exception:
+        reservation_path.unlink(missing_ok=True)
+        raise
 
 
 def evaluate_frozen_test(
@@ -861,7 +883,7 @@ def evaluate_frozen_test(
         corpus, Path(model), device=device
     )
     _reserve_frozen_test(
-        Path(model).expanduser().resolve(),
+        corpus,
         corpus_manifest_sha256=corpus.manifest_sha256,
         selection_model_manifest_sha256=selection_sha256,
         requested_output=output,
@@ -898,13 +920,10 @@ def evaluate_frozen_test(
     return receipt
 
 
-def load_test_receipt(path: Path) -> dict[str, object]:
-    """Load and validate one canonical immutable frozen-test receipt."""
-
+def _parse_test_receipt_payload(payload: bytes) -> dict[str, object]:
     try:
-        payload = Path(path).expanduser().resolve().read_bytes()
         value = json.loads(payload)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("frozen test receipt cannot be decoded") from error
     if (
         not isinstance(value, dict)
@@ -936,6 +955,26 @@ def load_test_receipt(path: Path) -> dict[str, object]:
     return value
 
 
+def _load_test_receipt_authority(
+    path: Path,
+) -> tuple[dict[str, object], bytes, str]:
+    try:
+        payload = Path(path).expanduser().resolve().read_bytes()
+    except OSError as error:
+        raise ValueError("frozen test receipt cannot be decoded") from error
+    return (
+        _parse_test_receipt_payload(payload),
+        payload,
+        hashlib.sha256(payload).hexdigest(),
+    )
+
+
+def load_test_receipt(path: Path) -> dict[str, object]:
+    """Load and validate one canonical immutable frozen-test receipt."""
+
+    return _load_test_receipt_authority(path)[0]
+
+
 def train_all_rows(
     corpus: object,
     output: Path,
@@ -952,9 +991,7 @@ def train_all_rows(
         corpus, Path(selection_model), device="cpu"
     )
     receipt_path = Path(test_receipt).expanduser().resolve()
-    receipt = load_test_receipt(receipt_path)
-    receipt_payload = receipt_path.read_bytes()
-    test_sha256 = hashlib.sha256(receipt_payload).hexdigest()
+    receipt, _receipt_payload, test_sha256 = _load_test_receipt_authority(receipt_path)
     expected_bindings = {
         "corpus_manifest_sha256": corpus.manifest_sha256,
         "inventory_manifest_sha256": corpus.inventory_manifest_sha256,
