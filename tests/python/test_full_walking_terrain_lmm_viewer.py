@@ -1,12 +1,28 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+import numpy as np
 import pytest
+import mm_sonic.full_walking_terrain_lmm_viewer as viewer_module
 from mm_sonic.full_walking_terrain_lmm_viewer import (
     FORMAL_SCENE_IDS,
+    FULL_LABEL,
+    _baseline_authority_exact,
+    _baseline_authority_snapshot,
+    _formal_identity,
     _full_formal_artifact_authorities,
+    _full_runtime_identity,
     _full_runtime_step_hz,
+    _load_baseline_corpus,
     acceptance_failures,
     build_parser,
+    main,
 )
 from mm_sonic.hybrid_terrain_lmm_viewer import _runtime_step_hz
 
@@ -54,6 +70,12 @@ def _green_receipt() -> dict[str, object]:
             "source_identity_count": 15_918,
             "inventory_terminal_count": 15_918,
             "pfnn_bvh_count": 80,
+            "corpus_row_count": 9_758_524,
+            "corpus_range_count": 16_999,
+            "corpus_eligible_row_count": 9_758_524,
+            "corpus_manifest_authority_current": True,
+            "model_manifest_authority_current": True,
+            "model_corpus_binding_current": True,
             "split_receipt_current": True,
             "test_receipt_current": True,
             "refit_receipt_current": True,
@@ -80,8 +102,17 @@ def _green_receipt() -> dict[str, object]:
                 "selection_model_manifest_sha256": (
                     "0f8d36395012d59deac2c54a88ba64252fc959fae00cd9255a4545479b49fa90"
                 ),
+                "selection_model_path": (
+                    "sonic/runs/g1-hybrid-terrain-lmm/"
+                    "selection-combined-v2-strict-latent32-visual-v1"
+                ),
                 "selection_evaluation_sha256": (
                     "959f65141346a0dbd322472470414cb7f29fb1d070206cb16b0fc7ee8c08d494"
+                ),
+                "selection_evaluation_path": (
+                    "sonic/runs/g1-hybrid-terrain-lmm/"
+                    "selection-combined-v2-strict-latent32-visual-v1/"
+                    "evaluation.json"
                 ),
                 "ramp_smoke_receipt_path": (
                     "sonic/runs/g1-hybrid-terrain-lmm/evidence/"
@@ -115,8 +146,17 @@ def _green_receipt() -> dict[str, object]:
                 "selection_model_manifest_sha256": (
                     "0f8d36395012d59deac2c54a88ba64252fc959fae00cd9255a4545479b49fa90"
                 ),
+                "selection_model_path": (
+                    "sonic/runs/g1-hybrid-terrain-lmm/"
+                    "selection-combined-v2-strict-latent32-visual-v1"
+                ),
                 "selection_evaluation_sha256": (
                     "959f65141346a0dbd322472470414cb7f29fb1d070206cb16b0fc7ee8c08d494"
+                ),
+                "selection_evaluation_path": (
+                    "sonic/runs/g1-hybrid-terrain-lmm/"
+                    "selection-combined-v2-strict-latent32-visual-v1/"
+                    "evaluation.json"
                 ),
                 "ramp_smoke_receipt_path": (
                     "sonic/runs/g1-hybrid-terrain-lmm/evidence/"
@@ -212,6 +252,202 @@ def test_full_viewer_authority_gate_rejects_legacy_combined_counts() -> None:
     mutated = dict(identity)
     mutated["source_identity_count"] = 15_917
     assert not _full_formal_artifact_authorities(mutated)
+
+    for name, value in (
+        ("corpus_row_count", 9_758_523),
+        ("corpus_range_count", 16_998),
+        ("corpus_eligible_row_count", 9_758_523),
+        ("fps", 25.0),
+        ("horizons", [8, 16, 24]),
+    ):
+        wrong = dict(identity)
+        wrong[name] = value
+        assert not _full_formal_artifact_authorities(wrong), name
+
+
+def _write_authority(path: Path, payload: bytes) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+    return hashlib.sha256(payload).hexdigest()
+
+
+def test_baseline_snapshot_hashes_every_frozen_file_and_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    authorities = dict(viewer_module._OVERNIGHT_BASELINE_AUTHORITIES)
+    corpus_root = tmp_path / authorities["corpus_path"]
+    model_root = tmp_path / authorities["model_path"]
+    selection_root = tmp_path / authorities["selection_model_path"]
+    paths = {
+        "corpus_manifest_sha256": corpus_root / "manifest.json",
+        "model_manifest_sha256": model_root / "manifest.json",
+        "selection_model_manifest_sha256": selection_root / "manifest.json",
+        "selection_evaluation_sha256": selection_root / "evaluation.json",
+        "ramp_smoke_receipt_sha256": tmp_path / authorities["ramp_smoke_receipt_path"],
+        "stairs_smoke_receipt_sha256": tmp_path
+        / authorities["stairs_smoke_receipt_path"],
+    }
+    for index, (name, path) in enumerate(paths.items()):
+        authorities[name] = _write_authority(path, f"authority-{index}".encode())
+    monkeypatch.setattr(viewer_module, "_REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(viewer_module, "_OVERNIGHT_BASELINE_AUTHORITIES", authorities)
+    evaluator = SimpleNamespace(
+        corpus=SimpleNamespace(source_root=corpus_root),
+        generator=SimpleNamespace(root=model_root),
+    )
+
+    first = _baseline_authority_snapshot(evaluator)
+    assert _baseline_authority_exact(first)
+
+    paths["ramp_smoke_receipt_sha256"].unlink()
+    absent = _baseline_authority_snapshot(evaluator)
+    assert absent["ramp_smoke_receipt_sha256"] is None
+    assert not _baseline_authority_exact(absent)
+    absent_receipt = _green_receipt()
+    absent_receipt["formal_identity"]["baseline_authority_pre"] = absent
+    assert "frozen-baseline-provenance-required" in acceptance_failures(absent_receipt)
+
+    _write_authority(paths["ramp_smoke_receipt_sha256"], b"tampered-ramp-authority")
+    tampered = _baseline_authority_snapshot(evaluator)
+    assert (
+        tampered["ramp_smoke_receipt_sha256"]
+        != authorities["ramp_smoke_receipt_sha256"]
+    )
+    assert tampered != first
+    assert not _baseline_authority_exact(tampered)
+    changed_receipt = _green_receipt()
+    changed_receipt["formal_identity"]["baseline_authority_pre"] = first
+    changed_receipt["formal_identity"]["baseline_authority_post"] = tampered
+    assert "baseline-authority-unchanged-required" in acceptance_failures(
+        changed_receipt
+    )
+
+
+def test_frozen_combined_baseline_uses_the_combined_authority_loader() -> None:
+    loaded = object()
+    module = SimpleNamespace(load_combined_cache=mock.Mock(return_value=loaded))
+    with mock.patch.object(
+        viewer_module.importlib, "import_module", return_value=module
+    ) as imported:
+        assert _load_baseline_corpus(Path("baseline")) is loaded
+
+    imported.assert_called_once_with("mm_sonic.hybrid_terrain_lmm_combined")
+    module.load_combined_cache.assert_called_once_with(Path("baseline"))
+
+
+def test_formal_identity_reads_authenticated_task4_corpus_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "corpus"
+    root.mkdir()
+    manifest = {
+        "schema": "g1-full-walking-terrain-lmm-corpus/v1",
+        "fps": 60.0,
+        "horizons": [20, 40, 60],
+        "rows": 9_758_524,
+        "ranges": 16_999,
+        "sources": 15_918,
+        "eligible_rows": 9_758_524,
+    }
+    payload = (
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+    (root / "manifest.json").write_bytes(payload)
+    source_names = tuple(
+        [f"pfnn:{index}" for index in range(80)]
+        + [f"grail:{index}" for index in range(15_918 - 80)]
+    )
+    corpus = SimpleNamespace(
+        root=root,
+        manifest_sha256=hashlib.sha256(payload).hexdigest(),
+        fps=60.0,
+        horizons=(20, 40, 60),
+        source_names=source_names,
+    )
+    evaluator = SimpleNamespace(
+        corpus=corpus,
+        generator=SimpleNamespace(
+            manifest={
+                "schema": "g1-full-walking-terrain-lmm-model/v1",
+                "corpus_manifest_sha256": corpus.manifest_sha256,
+            }
+        ),
+        matchers={},
+        adapters={},
+    )
+    g1_xml = tmp_path / "g1.xml"
+    g1_xml.write_text("<mujoco/>")
+    monkeypatch.setattr(
+        viewer_module,
+        "_g1_xml_asset_identity",
+        lambda _path: ("a" * 64, {}),
+    )
+
+    identity = _formal_identity(evaluator, scenes=(), g1_xml=g1_xml)
+
+    assert identity["corpus_schema"] == manifest["schema"]
+    assert identity["inventory_terminal_count"] == 15_918
+    assert identity["pfnn_bvh_count"] == 80
+    assert identity["corpus_row_count"] == 9_758_524
+    assert identity["corpus_range_count"] == 16_999
+    assert identity["corpus_eligible_row_count"] == 9_758_524
+    assert identity["corpus_manifest_authority_current"] is True
+
+
+def test_full_view_passes_full_identity_and_visible_label_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    corpus = SimpleNamespace()
+    generator = SimpleNamespace(
+        manifest={"canonical_selection_accepted": True},
+        config=SimpleNamespace(fit_all_rows=True),
+        canonical_selection_verified=True,
+        selection_provenance_verified=True,
+    )
+    adapter = SimpleNamespace(
+        authority=object(),
+        spawn_native_xy=np.zeros(2),
+        spawn_heading=0.0,
+        scene_authenticated=True,
+    )
+    matcher = SimpleNamespace(
+        generator=generator,
+        search_acceptance_eligible=True,
+        fps=60.0,
+    )
+    call: dict[str, object] = {}
+
+    def fake_run_interactive(*args: object, **kwargs: object) -> dict[str, object]:
+        call.update(kwargs)
+        label = kwargs["runtime_label_resolver"](
+            matcher,
+            adapter,
+            scene_authentication_current=True,
+            formal_authorities_current=True,
+        )
+        return {"accepted": True, "label": label}
+
+    monkeypatch.setattr(viewer_module, "_load_full_corpus", lambda _path: corpus)
+    monkeypatch.setattr(viewer_module, "_load_generator", lambda *_args: generator)
+    monkeypatch.setattr(
+        viewer_module, "load_scene_terrain", lambda *_args, **_kwargs: adapter
+    )
+    monkeypatch.setattr(
+        viewer_module, "HybridMatcher", lambda *_args, **_kwargs: matcher
+    )
+    monkeypatch.setattr(viewer_module, "run_interactive", fake_run_interactive)
+    monkeypatch.setitem(
+        sys.modules,
+        "mujoco",
+        SimpleNamespace(MjModel=SimpleNamespace(from_xml_path=lambda _path: object())),
+    )
+
+    assert main(["view", "--corpus", "corpus", "--model", "model"]) == 0
+
+    assert call["runtime_identity_resolver"] is _full_runtime_identity
+    assert call["formal_authority_predicate"] is _full_formal_artifact_authorities
+    assert call["runtime_label_resolver"] is viewer_module._full_runtime_label
+    assert fake_run_interactive(matcher, adapter, **call)["label"] == FULL_LABEL
 
 
 def test_cli_matches_the_planned_smoke_and_view_commands() -> None:

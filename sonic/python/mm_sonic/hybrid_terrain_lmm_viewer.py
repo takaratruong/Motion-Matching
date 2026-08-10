@@ -1743,6 +1743,10 @@ def run_interactive(
     formal_authority_predicate: Callable[[object], bool] | None = None,
     runtime_label_resolver: Callable[..., str] | None = None,
     runtime_step_hz_resolver: Callable[[object], float] | None = None,
+    runtime_identity_resolver: Callable[
+        [HybridMatcher, SceneTerrainAdapter, Path], dict[str, object]
+    ]
+    | None = None,
 ) -> dict[str, object]:
     if not os.environ.get("DISPLAY"):
         raise RuntimeError("interactive hybrid terrain viewer requires DISPLAY")
@@ -1762,6 +1766,11 @@ def run_interactive(
         if runtime_step_hz_resolver is None
         else runtime_step_hz_resolver
     )
+    identity_resolver = (
+        _runtime_identity
+        if runtime_identity_resolver is None
+        else runtime_identity_resolver
+    )
 
     keyboard_module = _load_keyboard_module()
     keys = KeyboardCommandSource()
@@ -1778,7 +1787,7 @@ def run_interactive(
     listener = keyboard_module.Listener(on_press=on_press, on_release=on_release)
     listener.start()
     model = build_viewer_model(g1_xml, terrain)
-    identity = _runtime_identity(matcher, terrain, Path(g1_xml))
+    identity = identity_resolver(matcher, terrain, Path(g1_xml))
     interactive_scene_authentication_current = (
         identity.get("scene_authentication_current") is True
     )
@@ -1845,6 +1854,14 @@ def run_interactive(
                     paused=False,
                     scene_evidence_status=overlay_scene_status,
                     generator_accepted=interactive_generator_accepted,
+                )
+                title = label_resolver(
+                    matcher,
+                    terrain,
+                    scene_authentication_current=(
+                        interactive_scene_authentication_current
+                    ),
+                    formal_authorities_current=(interactive_formal_authorities_current),
                 )
                 with viewer.lock():
                     viewer.cam.lookat[:] = data.qpos[:3]

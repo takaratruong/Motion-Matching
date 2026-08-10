@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import json
 import math
@@ -26,6 +27,7 @@ from .hybrid_terrain_lmm_viewer import (
     build_viewer_model,
     load_scene_terrain,
     run_interactive,
+    scene_authentication_is_current,
     write_receipt_exclusive,
 )
 
@@ -72,7 +74,14 @@ _FULL_FORMAL_ARTIFACT_AUTHORITIES = {
     "source_identity_count": 15_918,
     "inventory_terminal_count": 15_918,
     "pfnn_bvh_count": 80,
+    "corpus_row_count": 9_758_524,
+    "corpus_range_count": 16_999,
+    "corpus_eligible_row_count": 9_758_524,
+    "corpus_manifest_authority_current": True,
+    "model_manifest_authority_current": True,
+    "model_corpus_binding_current": True,
 }
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 _OVERNIGHT_BASELINE_AUTHORITIES = {
     "corpus_path": "sonic/runs/g1-hybrid-terrain-lmm/corpus-primary-pfnn-v2-strict",
     "corpus_manifest_sha256": (
@@ -88,8 +97,16 @@ _OVERNIGHT_BASELINE_AUTHORITIES = {
     "selection_model_manifest_sha256": (
         "0f8d36395012d59deac2c54a88ba64252fc959fae00cd9255a4545479b49fa90"
     ),
+    "selection_model_path": (
+        "sonic/runs/g1-hybrid-terrain-lmm/"
+        "selection-combined-v2-strict-latent32-visual-v1"
+    ),
     "selection_evaluation_sha256": (
         "959f65141346a0dbd322472470414cb7f29fb1d070206cb16b0fc7ee8c08d494"
+    ),
+    "selection_evaluation_path": (
+        "sonic/runs/g1-hybrid-terrain-lmm/"
+        "selection-combined-v2-strict-latent32-visual-v1/evaluation.json"
     ),
     "ramp_smoke_receipt_path": (
         "sonic/runs/g1-hybrid-terrain-lmm/evidence/"
@@ -135,55 +152,135 @@ def _path_identity(path: Path | None) -> str | None:
         return None
     resolved = path.resolve()
     try:
-        return str(resolved.relative_to(Path.cwd()))
+        return str(resolved.relative_to(_REPOSITORY_ROOT))
     except ValueError:
         return str(resolved)
 
 
-def _corpus_manifest_sha256(corpus: object) -> str | None:
-    for name in ("cache_manifest_sha256", "manifest_sha256"):
-        value = getattr(corpus, name, None)
-        if isinstance(value, str) and len(value) == 64:
-            return value
-    receipt = getattr(corpus, "manifest_receipt", None)
-    if isinstance(receipt, Mapping):
-        digest = receipt.get("sha256")
-        if isinstance(digest, str) and len(digest) == 64:
-            return digest
-    return None
+def _observed_file_sha256(path: Path) -> str | None:
+    try:
+        resolved = path.resolve(strict=True)
+        if not resolved.is_file():
+            return None
+        return hashlib.sha256(resolved.read_bytes()).hexdigest()
+    except (OSError, RuntimeError, ValueError):
+        return None
 
 
 def _baseline_authority_snapshot(evaluator: object) -> dict[str, object]:
     corpus = getattr(evaluator, "corpus", None)
     generator = getattr(evaluator, "generator", None)
-    generator_manifest = _mapping(getattr(generator, "manifest", {}))
     corpus_root = Path(getattr(corpus, "source_root", "."))
     model_root = getattr(generator, "root", None)
+    selection_root = _REPOSITORY_ROOT / str(
+        _OVERNIGHT_BASELINE_AUTHORITIES["selection_model_path"]
+    )
+    selection_evaluation = _REPOSITORY_ROOT / str(
+        _OVERNIGHT_BASELINE_AUTHORITIES["selection_evaluation_path"]
+    )
+    ramp_receipt = _REPOSITORY_ROOT / str(
+        _OVERNIGHT_BASELINE_AUTHORITIES["ramp_smoke_receipt_path"]
+    )
+    stairs_receipt = _REPOSITORY_ROOT / str(
+        _OVERNIGHT_BASELINE_AUTHORITIES["stairs_smoke_receipt_path"]
+    )
     return {
         "corpus_path": _path_identity(corpus_root),
-        "corpus_manifest_sha256": _corpus_manifest_sha256(corpus),
+        "corpus_manifest_sha256": _observed_file_sha256(corpus_root / "manifest.json"),
         "model_path": _path_identity(Path(model_root))
         if model_root is not None
         else None,
-        "model_manifest_sha256": getattr(generator, "manifest_sha256", None),
-        "selection_model_manifest_sha256": generator_manifest.get(
-            "selection_model_manifest_sha256"
+        "model_manifest_sha256": (
+            _observed_file_sha256(Path(model_root) / "manifest.json")
+            if model_root is not None
+            else None
         ),
-        "selection_evaluation_sha256": generator_manifest.get(
-            "selection_evaluation_sha256"
+        "selection_model_path": _path_identity(selection_root),
+        "selection_model_manifest_sha256": _observed_file_sha256(
+            selection_root / "manifest.json"
         ),
-        "ramp_smoke_receipt_path": _OVERNIGHT_BASELINE_AUTHORITIES[
-            "ramp_smoke_receipt_path"
-        ],
-        "ramp_smoke_receipt_sha256": _OVERNIGHT_BASELINE_AUTHORITIES[
-            "ramp_smoke_receipt_sha256"
-        ],
-        "stairs_smoke_receipt_path": _OVERNIGHT_BASELINE_AUTHORITIES[
-            "stairs_smoke_receipt_path"
-        ],
-        "stairs_smoke_receipt_sha256": _OVERNIGHT_BASELINE_AUTHORITIES[
-            "stairs_smoke_receipt_sha256"
-        ],
+        "selection_evaluation_path": _path_identity(selection_evaluation),
+        "selection_evaluation_sha256": _observed_file_sha256(selection_evaluation),
+        "ramp_smoke_receipt_path": _path_identity(ramp_receipt),
+        "ramp_smoke_receipt_sha256": _observed_file_sha256(ramp_receipt),
+        "stairs_smoke_receipt_path": _path_identity(stairs_receipt),
+        "stairs_smoke_receipt_sha256": _observed_file_sha256(stairs_receipt),
+    }
+
+
+def _json_file_identity(path: Path) -> tuple[Mapping[str, Any], str | None]:
+    try:
+        resolved = path.resolve(strict=True)
+        if not resolved.is_file():
+            return {}, None
+        payload = resolved.read_bytes()
+        value = json.loads(payload)
+        if type(value) is not dict:
+            return {}, None
+        return value, hashlib.sha256(payload).hexdigest()
+    except (OSError, UnicodeError, json.JSONDecodeError, RuntimeError, ValueError):
+        return {}, None
+
+
+def _full_corpus_authority(corpus: object) -> dict[str, object]:
+    root_value = getattr(corpus, "root", getattr(corpus, "source_root", None))
+    if root_value is None:
+        return {"corpus_manifest_authority_current": False}
+    manifest, observed_sha = _json_file_identity(Path(root_value) / "manifest.json")
+    published_sha = getattr(corpus, "manifest_sha256", None)
+    source_names = tuple(str(value) for value in getattr(corpus, "source_names", ()))
+    current = (
+        isinstance(observed_sha, str)
+        and observed_sha == published_sha
+        and manifest.get("fps") == getattr(corpus, "fps", None)
+        and tuple(_mapping(manifest).get("horizons", ()))
+        == tuple(getattr(corpus, "horizons", ()))
+        and manifest.get("sources") == len(source_names)
+    )
+    return {
+        "corpus_schema": manifest.get("schema"),
+        "fps": manifest.get("fps"),
+        "horizons": manifest.get("horizons"),
+        "source_identity_count": manifest.get("sources"),
+        "inventory_terminal_count": manifest.get("sources"),
+        "pfnn_bvh_count": sum("pfnn" in name.lower() for name in source_names),
+        "corpus_row_count": manifest.get("rows"),
+        "corpus_range_count": manifest.get("ranges"),
+        "corpus_eligible_row_count": manifest.get("eligible_rows"),
+        "corpus_manifest_sha256": observed_sha,
+        "corpus_manifest_path": _path_identity(Path(root_value) / "manifest.json"),
+        "corpus_manifest_authority_current": current,
+    }
+
+
+def _full_model_authority(
+    generator: object, corpus_sha256: object
+) -> dict[str, object]:
+    root = getattr(generator, "root", None)
+    loaded_manifest = _mapping(getattr(generator, "manifest", {}))
+    if root is None:
+        manifest, observed_sha = loaded_manifest, None
+    else:
+        manifest, observed_sha = _json_file_identity(Path(root) / "manifest.json")
+    published_sha = getattr(generator, "manifest_sha256", None)
+    mapping_current = bool(manifest) and dict(manifest) == dict(loaded_manifest)
+    digest_current = isinstance(observed_sha, str) and (
+        published_sha is None or published_sha == observed_sha
+    )
+    artifact_identity = _mapping(manifest.get("artifact_identity"))
+    model_schema = artifact_identity.get("schema", manifest.get("schema"))
+    corpus_current = (
+        manifest.get("corpus_manifest_sha256") == corpus_sha256
+        and artifact_identity.get("corpus_manifest_sha256") == corpus_sha256
+    )
+    return {
+        "model_schema": model_schema,
+        "model_manifest_sha256": observed_sha,
+        "model_manifest_path": _path_identity(Path(root) / "manifest.json")
+        if root is not None
+        else None,
+        "model_manifest_authority_current": mapping_current and digest_current,
+        "model_corpus_binding_current": corpus_current,
     }
 
 
@@ -574,8 +671,8 @@ def _load_full_corpus(path: Path) -> object:
 
 
 def _load_baseline_corpus(path: Path) -> object:
-    module = importlib.import_module("mm_sonic.hybrid_terrain_lmm_data")
-    return module.load_hybrid_cache(path)
+    module = importlib.import_module("mm_sonic.hybrid_terrain_lmm_combined")
+    return module.load_combined_cache(path)
 
 
 def _manifest(generator: object) -> Mapping[str, Any]:
@@ -586,11 +683,11 @@ def _formal_identity(
     evaluator: _MuJoCoRouteEvaluator, *, scenes: Sequence[str], g1_xml: Path
 ) -> dict[str, object]:
     corpus = evaluator.corpus
-    generator_manifest = _manifest(evaluator.generator)
-    corpus_manifest = _mapping(getattr(corpus, "manifest", {}))
+    corpus_authority = _full_corpus_authority(corpus)
+    model_authority = _full_model_authority(
+        evaluator.generator, corpus_authority.get("corpus_manifest_sha256")
+    )
     asset_sha, _assets = _g1_xml_asset_identity(g1_xml)
-    source_names = tuple(str(value) for value in getattr(corpus, "source_names", ()))
-    pfnn_count = sum("pfnn" in name.lower() for name in source_names)
     matchers = tuple(evaluator.matchers.values())
     full_search = bool(matchers) and all(
         matcher.search_scope == "full-range-safe-corpus"
@@ -598,14 +695,11 @@ def _formal_identity(
         for matcher in matchers
     )
     return {
-        "corpus_schema": corpus_manifest.get("schema", getattr(corpus, "schema", None)),
-        "model_schema": generator_manifest.get("schema"),
-        "fps": float(getattr(corpus, "fps", math.nan)),
-        "horizons": list(getattr(corpus, "horizons", ())),
-        "source_identity_count": len(source_names),
-        "inventory_terminal_count": corpus_manifest.get("inventory_terminal_count"),
-        "pfnn_bvh_count": corpus_manifest.get("pfnn_bvh_count", pfnn_count),
-        "split_receipt_current": getattr(corpus, "split_receipt_current", False)
+        **corpus_authority,
+        **model_authority,
+        "split_receipt_current": corpus_authority.get(
+            "corpus_manifest_authority_current"
+        )
         is True,
         "test_receipt_current": getattr(
             evaluator.generator, "test_receipt_current", False
@@ -615,8 +709,8 @@ def _formal_identity(
             evaluator.generator, "refit_receipt_current", False
         )
         is True,
-        "determinism_receipt_current": getattr(
-            corpus, "determinism_receipt_current", False
+        "determinism_receipt_current": corpus_authority.get(
+            "corpus_manifest_authority_current"
         )
         is True,
         "full_search": full_search,
@@ -639,9 +733,7 @@ def _formal_identity(
             ),
             default=0,
         ),
-        "g1_xml_sha256": __import__("hashlib")
-        .sha256(Path(g1_xml).read_bytes())
-        .hexdigest(),
+        "g1_xml_sha256": hashlib.sha256(Path(g1_xml).read_bytes()).hexdigest(),
         "g1_asset_inventory_sha256": asset_sha,
         "authenticated_scene_ids": sorted(
             scene
@@ -650,6 +742,43 @@ def _formal_identity(
             == "authenticated-indexed"
         ),
     }
+
+
+def _full_runtime_identity(
+    matcher: HybridMatcher, terrain: object, g1_xml: Path
+) -> dict[str, object]:
+    evaluator = type(
+        "_InteractiveAuthority",
+        (),
+        {
+            "corpus": matcher.corpus,
+            "generator": matcher.generator,
+            "matchers": {str(getattr(terrain, "scene_id", "scene")): matcher},
+            "adapters": {str(getattr(terrain, "scene_id", "scene")): terrain},
+        },
+    )()
+    identity = _formal_identity(
+        evaluator,
+        scenes=(str(getattr(terrain, "scene_id", "scene")),),
+        g1_xml=Path(g1_xml),
+    )
+    identity.update(
+        {
+            "identity_capture_succeeded": True,
+            "scene_id": getattr(terrain, "scene_id", None),
+            "scene_evidence_status": getattr(terrain, "scene_evidence_status", None),
+            "scene_authentication_current": scene_authentication_is_current(
+                matcher.corpus, terrain
+            ),
+            "generator_acceptance_status": _generator_acceptance_status(
+                matcher.generator
+            ),
+            "search_scope": matcher.search_scope,
+            "searched_row_count": len(matcher.searchable_rows),
+            "total_safe_row_count": matcher.total_searchable_row_count,
+        }
+    )
+    return identity
 
 
 def _default_routes(
@@ -752,6 +881,7 @@ def main(argv: list[str] | None = None) -> int:
             formal_authority_predicate=_full_formal_artifact_authorities,
             runtime_label_resolver=_full_runtime_label,
             runtime_step_hz_resolver=_full_runtime_step_hz,
+            runtime_identity_resolver=_full_runtime_identity,
         )
     print(
         json.dumps(receipt, sort_keys=True, separators=(",", ":"), allow_nan=False),
@@ -770,6 +900,7 @@ __all__ = (
     "FORMAL_SCENE_IDS",
     "FULL_LABEL",
     "_full_formal_artifact_authorities",
+    "_full_runtime_identity",
     "_full_runtime_step_hz",
     "acceptance_failures",
     "build_parser",
