@@ -72,9 +72,7 @@ def _motion_corpus() -> SimpleNamespace:
     values[:, 21:27] = np.tile((0.0, 1.0), 3)
     return SimpleNamespace(
         artifacts=artifacts,
-        features=FeatureSet(
-            values, np.zeros(31, np.float32), np.ones(31, np.float32)
-        ),
+        features=FeatureSet(values, np.zeros(31, np.float32), np.ones(31, np.float32)),
         family_ids=np.asarray((0, 1), dtype=np.int32),
         family_names=("flat", "hill"),
         fps=10.0,
@@ -163,8 +161,11 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
             )
 
         matcher = HybridMatcher(
-            _motion_corpus(), _Generator(), TerrainAuthority.flat(),
-            pose_converter=converter, initial_root_xy=(2.0, -3.0),
+            _motion_corpus(),
+            _Generator(),
+            TerrainAuthority.flat(),
+            pose_converter=converter,
+            initial_root_xy=(2.0, -3.0),
             initial_heading=0.25,
         )
         matcher._elapsed_since_search = 0.0
@@ -184,7 +185,9 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
             np.asarray((0.0, -0.2)),
             np.pi / 2.0,
         )
-        np.testing.assert_allclose(second.root_position_world[:2], expected.xy, atol=1e-7)
+        np.testing.assert_allclose(
+            second.root_position_world[:2], expected.xy, atol=1e-7
+        )
         self.assertAlmostEqual(second.heading, expected.yaw, places=7)
         placed_yaw = 2.0 * np.arctan2(placements[-1][1][2], placements[-1][1][0])
         self.assertAlmostEqual(placed_yaw, second.heading, delta=1e-6)
@@ -193,8 +196,11 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         corpus = _motion_corpus()
         corpus.artifacts.contacts[4:] = (False, False)
         matcher = HybridMatcher(
-            corpus, _Generator(), TerrainAuthority.flat(),
-            pose_converter=_pose_converter, initial_root_xy=(1.0, 2.0),
+            corpus,
+            _Generator(),
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+            initial_root_xy=(1.0, 2.0),
             initial_heading=-0.3,
         )
         before = matcher.state
@@ -207,6 +213,63 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
             selected.root_position_world[:2], before.root_position_world[:2]
         )
         self.assertEqual(selected.heading, before.heading)
+
+    def test_successor_retry_reanchors_retried_row_once_for_pose_and_terrain(self):
+        placements: list[np.ndarray] = []
+
+        def converter(decoded, simulation_position, simulation_rotation, model):
+            placements.append(np.array(simulation_rotation, copy=True))
+            return _pose_converter(
+                decoded, simulation_position, simulation_rotation, model
+            )
+
+        class RetryGenerator(_Generator):
+            def decode(self, features: np.ndarray, latent: np.ndarray) -> np.ndarray:
+                row = int(np.asarray(latent).reshape(-1)[0])
+                output = np.zeros(458, dtype=np.float32)
+                output[0] = 0.75 if row == 1 else 0.25
+                return output
+
+        matcher = HybridMatcher(
+            _motion_corpus(),
+            RetryGenerator(),
+            TerrainAuthority(lambda xy: float(np.asarray(xy)[0]), name="x-ramp"),
+            pose_converter=converter,
+            native_model=_limited_native_model(),
+        )
+        matcher._elapsed_since_search = 0.0
+        matcher._last_command = CommandState()
+        matcher._last_terrain_class = "flat"
+
+        with mock.patch.object(
+            matcher,
+            "match",
+            return_value=SimpleNamespace(row=2, distance=1.25),
+        ) as patched_match:
+            state = matcher.step(CommandState(), dt=0.01)
+
+        expected = compose_root_delta(
+            SE2Transform(np.asarray((0.0, 0.0)), 0.0),
+            np.asarray((0.1, -0.2)),
+            np.pi / 2.0,
+        )
+        np.testing.assert_allclose(
+            state.root_position_world[:2], expected.xy, atol=1e-7
+        )
+        self.assertAlmostEqual(state.heading, expected.yaw, places=7)
+        placed_yaw = 2.0 * np.arctan2(placements[-1][2], placements[-1][0])
+        self.assertAlmostEqual(placed_yaw, state.heading, delta=1e-6)
+        np.testing.assert_allclose(
+            state.terrain_features,
+            np.asarray((0.25, 0.5, 0.75, 1.0)),
+            atol=1e-7,
+        )
+        self.assertEqual(state.row, 2)
+        self.assertEqual(state.pose_source, "learned")
+        self.assertEqual(state.candidate_limit_rejection_count, 1)
+        self.assertEqual(state.first_candidate_limit_rejection_row, 1)
+        self.assertEqual(state.max_candidate_limit_rejections_per_step, 1)
+        self.assertEqual(patched_match.call_count, 1)
 
     def test_yaw_alignment_is_shared_by_root_articulation_and_terrain_probes(self):
         queried: list[np.ndarray] = []
@@ -225,10 +288,16 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         corpus = _motion_corpus()
         corpus.artifacts.positions[1, 0] = corpus.artifacts.positions[0, 0]
         corpus.artifacts.rotations[1, 0] = (
-            np.cos(np.pi / 4.0), 0.0, np.sin(np.pi / 4.0), 0.0
+            np.cos(np.pi / 4.0),
+            0.0,
+            np.sin(np.pi / 4.0),
+            0.0,
         )
         matcher = HybridMatcher(
-            corpus, _Generator(), terrain, pose_converter=converter,
+            corpus,
+            _Generator(),
+            terrain,
+            pose_converter=converter,
             initial_heading=0.2,
         )
         matcher._elapsed_since_search = 0.0
@@ -254,7 +323,9 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         corpus = _motion_corpus()
         corpus.artifacts.positions[:, 0, (0, 2)] = 0.0
         matcher = HybridMatcher(
-            corpus, _Generator(), TerrainAuthority.flat(),
+            corpus,
+            _Generator(),
+            TerrainAuthority.flat(),
             pose_converter=_pose_converter,
         )
         matcher._elapsed_since_search = 0.0
@@ -267,7 +338,9 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
 
     def test_rate_horizons_and_command_speed_come_from_corpus(self):
         matcher = HybridMatcher(
-            _motion_corpus(), _Generator(), TerrainAuthority.flat(),
+            _motion_corpus(),
+            _Generator(),
+            TerrainAuthority.flat(),
             pose_converter=_pose_converter,
         )
 
@@ -278,11 +351,10 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         self.assertEqual(matcher.dt, 0.1)
         self.assertEqual(matcher.horizons, (2, 5, 10))
         self.assertAlmostEqual(matcher.walking_speed_p95_mps, expected_p95)
+        np.testing.assert_allclose(query[15:21:2], 0.0, atol=1e-7)
         np.testing.assert_allclose(
-            query[15:21:2], 0.0, atol=1e-7
-        )
-        np.testing.assert_allclose(
-            query[16:21:2], expected_p95 * np.asarray((0.2, 0.5, 1.0)),
+            query[16:21:2],
+            expected_p95 * np.asarray((0.2, 0.5, 1.0)),
             atol=1e-7,
         )
 
@@ -291,7 +363,9 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         corpus.features.values[1:4] = 0.1
         corpus.features.values[4] = 0.0
         matcher = HybridMatcher(
-            corpus, _Generator(), TerrainAuthority.flat(),
+            corpus,
+            _Generator(),
+            TerrainAuthority.flat(),
             pose_converter=_pose_converter,
         )
         query = np.zeros(31, dtype=np.float64)
@@ -311,7 +385,10 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
             name="finite-flat",
         )
         matcher = HybridMatcher(
-            _corpus(), generator, terrain, pose_converter=_pose_converter,
+            _corpus(),
+            generator,
+            terrain,
+            pose_converter=_pose_converter,
             initial_root_xy=(2.0, 0.0),
         )
 
@@ -333,7 +410,8 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
 
         generator = _Generator()
         matcher = HybridMatcher(
-            _corpus(), generator,
+            _corpus(),
+            generator,
             TerrainAuthority(
                 lambda _xy: 0.0,
                 domain_contains=domain_contains,
@@ -380,7 +458,8 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
             artifacts=artifacts,
             features=FeatureSet(
                 np.arange(rows * 31, dtype=np.float32).reshape(rows, 31),
-                np.zeros(31, np.float32), np.ones(31, np.float32),
+                np.zeros(31, np.float32),
+                np.ones(31, np.float32),
             ),
             range_family_ids=np.asarray((0, 1, 2), np.int16),
             family_ids=np.asarray((0,) * 10 + (1,) * 3 + (2,) * 3, np.int16),
@@ -388,15 +467,23 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         )
 
         first = HybridMatcher(
-            corpus, _Generator(rows), TerrainAuthority.flat(),
-            pose_converter=_pose_converter, max_search_rows=6,
+            corpus,
+            _Generator(rows),
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+            max_search_rows=6,
         )
         second = HybridMatcher(
-            corpus, _Generator(rows), TerrainAuthority.flat(),
-            pose_converter=_pose_converter, max_search_rows=6,
+            corpus,
+            _Generator(rows),
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+            max_search_rows=6,
         )
 
-        self.assertEqual(first.searchable_family_counts, (("flat", 2), ("curb", 2), ("slope", 2)))
+        self.assertEqual(
+            first.searchable_family_counts, (("flat", 2), ("curb", 2), ("slope", 2))
+        )
         np.testing.assert_array_equal(first.searchable_rows, second.searchable_rows)
         self.assertEqual(len(first.searchable_rows), 6)
         self.assertEqual(first.total_searchable_row_count, 13)
@@ -408,7 +495,9 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         self.assertFalse(first.search_acceptance_eligible)
 
         full = HybridMatcher(
-            corpus, _Generator(rows), TerrainAuthority.flat(),
+            corpus,
+            _Generator(rows),
+            TerrainAuthority.flat(),
             pose_converter=_pose_converter,
         )
         self.assertEqual(len(full.searchable_rows), 13)
@@ -424,12 +513,17 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         query = np.zeros(31, dtype=np.float64)
 
         regularized = HybridMatcher(
-            _corpus(values), _Generator(), TerrainAuthority.flat(),
+            _corpus(values),
+            _Generator(),
+            TerrainAuthority.flat(),
             pose_converter=_pose_converter,
         )
         unregularized = HybridMatcher(
-            _corpus(values), _Generator(), TerrainAuthority.flat(),
-            pose_converter=_pose_converter, transition_penalty=0.0,
+            _corpus(values),
+            _Generator(),
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+            transition_penalty=0.0,
         )
 
         self.assertAlmostEqual(regularized.transition_penalty, 0.1)
@@ -443,7 +537,9 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         values[4] = 0.0
         query = np.zeros(31, dtype=np.float64)
         matcher = HybridMatcher(
-            _corpus(values), _Generator(), TerrainAuthority.flat(),
+            _corpus(values),
+            _Generator(),
+            TerrainAuthority.flat(),
             pose_converter=_pose_converter,
         )
 
@@ -476,7 +572,9 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
             family_names=("flat", "slope"),
         )
         matcher = HybridMatcher(
-            corpus, _Generator(rows), TerrainAuthority.flat(),
+            corpus,
+            _Generator(rows),
+            TerrainAuthority.flat(),
             pose_converter=_pose_converter,
         )
 
@@ -506,7 +604,8 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
             artifacts=artifacts,
             features=FeatureSet(
                 np.zeros((rows, 31), np.float32),
-                np.zeros(31, np.float32), np.ones(31, np.float32),
+                np.zeros(31, np.float32),
+                np.ones(31, np.float32),
             ),
             range_family_ids=np.arange(4, dtype=np.int16),
             family_ids=family_ids,
@@ -514,8 +613,11 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         )
 
         matcher = HybridMatcher(
-            corpus, _Generator(rows), TerrainAuthority.flat(),
-            pose_converter=_pose_converter, max_search_rows=40,
+            corpus,
+            _Generator(rows),
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+            max_search_rows=40,
         )
 
         self.assertEqual(
@@ -528,7 +630,10 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
             lambda xy: -float(np.asarray(xy)[1]), name="native-negative-y-ramp"
         )
         matcher = HybridMatcher(
-            _corpus(), _Generator(), terrain, pose_converter=_pose_converter,
+            _corpus(),
+            _Generator(),
+            terrain,
+            pose_converter=_pose_converter,
         )
 
         state = matcher.step(CommandState(speed=1.0), dt=0.04, force_search=True)
@@ -536,7 +641,8 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(state.root_position_world[1], 0.0)
         self.assertAlmostEqual(state.qpos[1], state.root_position_world[1])
         np.testing.assert_allclose(
-            state.query[15:21], (0.0, 0.45 * 0.32, 0.0, 0.45 * 0.68, 0.0, 0.45),
+            state.query[15:21],
+            (0.0, 0.45 * 0.32, 0.0, 0.45 * 0.68, 0.0, 0.45),
             atol=1e-7,
         )
         np.testing.assert_allclose(
@@ -546,7 +652,10 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
     def test_steering_trajectory_and_terrain_follow_the_same_command_arc(self):
         terrain = TerrainAuthority(lambda xy: float(np.asarray(xy)[0]), name="x-ramp")
         matcher = HybridMatcher(
-            _corpus(), _Generator(), terrain, pose_converter=_pose_converter,
+            _corpus(),
+            _Generator(),
+            terrain,
+            pose_converter=_pose_converter,
         )
         command = CommandState(speed=1.0, steering=1.0)
 
@@ -576,7 +685,8 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         values[4:, 27:31] = 0.1
         generator = _Generator()
         matcher = HybridMatcher(
-            _corpus(values), generator,
+            _corpus(values),
+            generator,
             TerrainAuthority(lambda xy: -float(np.asarray(xy)[1]), name="steep"),
             pose_converter=_pose_converter,
         )
@@ -594,7 +704,9 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
     def test_real_generator_keyword_batch_decode_uses_learned_pose(self):
         generator = _KeywordGenerator()
         matcher = HybridMatcher(
-            _corpus(), generator, TerrainAuthority.flat(),
+            _corpus(),
+            generator,
+            TerrainAuthority.flat(),
             pose_converter=_pose_converter,
         )
 
@@ -607,7 +719,9 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
 
     def test_real_generator_floating_point_failure_uses_canonical_fallback(self):
         matcher = HybridMatcher(
-            _corpus(), _FloatingPointGenerator(), TerrainAuthority.flat(),
+            _corpus(),
+            _FloatingPointGenerator(),
+            TerrainAuthority.flat(),
             pose_converter=_pose_converter,
         )
 
@@ -623,15 +737,20 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         )
 
         np.testing.assert_allclose(
-            ramp.sample((0.3, 1.2), 0.0), raised.sample((0.3, 1.2), 0.0),
+            ramp.sample((0.3, 1.2), 0.0),
+            raised.sample((0.3, 1.2), 0.0),
             atol=1e-12,
         )
-        np.testing.assert_allclose(ramp.sample((0.3, 1.2), 0.0), (-0.05, -0.1, -0.15, -0.2))
+        np.testing.assert_allclose(
+            ramp.sample((0.3, 1.2), 0.0), (-0.05, -0.1, -0.15, -0.2)
+        )
         self.assertNotEqual(ramp.support((0.3, 1.2)), raised.support((0.3, 1.2)))
 
     def test_legacy_full_speed_query_retains_point_45_meter_per_second_scale(self):
         matcher = HybridMatcher(
-            _corpus(), _Generator(), TerrainAuthority.flat(),
+            _corpus(),
+            _Generator(),
+            TerrainAuthority.flat(),
             pose_converter=_pose_converter,
         )
 
@@ -639,7 +758,8 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
 
         self.assertAlmostEqual(state.root_position_world[1], 0.0)
         np.testing.assert_allclose(
-            state.query[15:21], (0.0, 0.45 * 0.32, 0.0, 0.45 * 0.68, 0.0, 0.45),
+            state.query[15:21],
+            (0.0, 0.45 * 0.32, 0.0, 0.45 * 0.68, 0.0, 0.45),
             atol=1e-7,
         )
 
@@ -648,7 +768,9 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         values = rng.normal(size=(8, 31)).astype(np.float32)
         values[1] = values[0]
         matcher = HybridMatcher(
-            _corpus(values), _Generator(), TerrainAuthority.flat(),
+            _corpus(values),
+            _Generator(),
+            TerrainAuthority.flat(),
             pose_converter=_pose_converter,
         )
 
@@ -663,7 +785,9 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
 
     def test_successors_never_cross_a_source_range(self):
         matcher = HybridMatcher(
-            _corpus(), _Generator(), TerrainAuthority.flat(),
+            _corpus(),
+            _Generator(),
+            TerrainAuthority.flat(),
             pose_converter=_pose_converter,
         )
         self.assertEqual(matcher.successor(2), 3)
@@ -673,14 +797,19 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(IndexError, "row"):
             matcher.successor(8)
 
-    def test_live_terrain_overwrites_generator_input_and_places_root_from_clearance(self):
+    def test_live_terrain_overwrites_generator_input_and_places_root_from_clearance(
+        self,
+    ):
         generator = _Generator()
         terrain = TerrainAuthority(
             lambda xy: 0.5 + 0.1 * float(np.asarray(xy)[0]),
             name="ramp",
         )
         matcher = HybridMatcher(
-            _corpus(), generator, terrain, pose_converter=_pose_converter,
+            _corpus(),
+            generator,
+            terrain,
+            pose_converter=_pose_converter,
         )
 
         state = matcher.step(CommandState(speed=0.5), dt=0.04, force_search=True)
@@ -697,7 +826,9 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
 
     def test_search_can_switch_ranges_nonmonotonically(self):
         matcher = HybridMatcher(
-            _corpus(), _Generator(), TerrainAuthority.flat(),
+            _corpus(),
+            _Generator(),
+            TerrainAuthority.flat(),
             pose_converter=_pose_converter,
         )
         high = np.array(matcher.corpus.features.values[5], dtype=np.float64)
@@ -709,7 +840,9 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
     def test_invalid_learned_decode_commits_visible_canonical_fallback_atomically(self):
         generator = _Generator()
         matcher = HybridMatcher(
-            _corpus(), generator, TerrainAuthority.flat(),
+            _corpus(),
+            generator,
+            TerrainAuthority.flat(),
             pose_converter=_pose_converter,
         )
         accepted = matcher.step(CommandState(), dt=0.04, force_search=True)
@@ -740,8 +873,11 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
                 return output
 
         matcher = HybridMatcher(
-            _corpus(values), SelectiveGenerator(), TerrainAuthority.flat(),
-            native_model=_limited_native_model(), pose_converter=_pose_converter,
+            _corpus(values),
+            SelectiveGenerator(),
+            TerrainAuthority.flat(),
+            native_model=_limited_native_model(),
+            pose_converter=_pose_converter,
         )
 
         state = matcher.select_query(np.zeros(31, dtype=np.float64))
@@ -769,8 +905,11 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
                 return output
 
         matcher = HybridMatcher(
-            _corpus(values), SuccessorGenerator(), TerrainAuthority.flat(),
-            native_model=_limited_native_model(), pose_converter=_pose_converter,
+            _corpus(values),
+            SuccessorGenerator(),
+            TerrainAuthority.flat(),
+            native_model=_limited_native_model(),
+            pose_converter=_pose_converter,
         )
         matcher._elapsed_since_search = 0.0
         matcher._last_command = CommandState()
@@ -815,8 +954,11 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
                 return output
 
         matcher = HybridMatcher(
-            corpus, AlwaysInvalidGenerator(rows), TerrainAuthority.flat(),
-            native_model=_limited_native_model(), pose_converter=_pose_converter,
+            corpus,
+            AlwaysInvalidGenerator(rows),
+            TerrainAuthority.flat(),
+            native_model=_limited_native_model(),
+            pose_converter=_pose_converter,
         )
         before = matcher.state
         before_root = matcher._root_xy.copy()
@@ -834,7 +976,9 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         self.assertEqual(state.row, before.row)
         np.testing.assert_array_equal(state.qpos, before.qpos)
         np.testing.assert_array_equal(state.query, before.query)
-        np.testing.assert_array_equal(state.root_position_world, before.root_position_world)
+        np.testing.assert_array_equal(
+            state.root_position_world, before.root_position_world
+        )
         np.testing.assert_array_equal(matcher._root_xy, before_root)
         self.assertEqual(matcher._heading, before_heading)
         self.assertEqual(matcher._elapsed_since_search, before_elapsed)
@@ -856,8 +1000,11 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         corpus.fps = 25.0
         corpus.horizons = (8, 17, 25)
         matcher = HybridMatcher(
-            corpus, _Generator(), TerrainAuthority.flat(),
-            native_model=_limited_native_model(), pose_converter=_pose_converter,
+            corpus,
+            _Generator(),
+            TerrainAuthority.flat(),
+            native_model=_limited_native_model(),
+            pose_converter=_pose_converter,
         )
 
         state = matcher.select_query(np.asarray(matcher.features[1], np.float64))
@@ -873,8 +1020,11 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         corpus.fps = 60.0
         corpus.horizons = (20, 40, 60)
         matcher = HybridMatcher(
-            corpus, _Generator(), TerrainAuthority.flat(),
-            native_model=_limited_native_model(), pose_converter=_pose_converter,
+            corpus,
+            _Generator(),
+            TerrainAuthority.flat(),
+            native_model=_limited_native_model(),
+            pose_converter=_pose_converter,
         )
 
         state = matcher.select_query(np.asarray(matcher.features[1], np.float64))
@@ -902,8 +1052,11 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
 
         generator = _Generator()
         matcher = HybridMatcher(
-            _corpus(), generator, TerrainAuthority.flat(),
-            native_model=_limited_native_model(), pose_converter=converter,
+            _corpus(),
+            generator,
+            TerrainAuthority.flat(),
+            native_model=_limited_native_model(),
+            pose_converter=converter,
         )
         before = matcher.state
         fail_root[0] = True
@@ -925,13 +1078,18 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
             return qpos
 
         matcher = HybridMatcher(
-            _corpus(), _Generator(), TerrainAuthority.flat(),
-            native_model=_limited_native_model(), pose_converter=converter,
+            _corpus(),
+            _Generator(),
+            TerrainAuthority.flat(),
+            native_model=_limited_native_model(),
+            pose_converter=converter,
         )
         before = matcher.state
         fail_root[0] = True
 
-        with self.assertRaisesRegex(ValueError, "canonical source conversion is invalid"):
+        with self.assertRaisesRegex(
+            ValueError, "canonical source conversion is invalid"
+        ):
             matcher.select_query(np.asarray(matcher.features[1], np.float64))
 
         self.assertIs(matcher.state, before)
@@ -1008,13 +1166,13 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
     def test_scripted_1000_frame_smoke_is_finite_and_exercises_hybrid_path(self):
         values = np.zeros((8, 31), dtype=np.float32)
         values[:, 21:27] = np.tile((0.0, 1.0), 3)
-        values[4:8, 15:21] = np.asarray(
-            (0.0, 0.45 * 0.32, 0.0, 0.45 * 0.68, 0.0, 0.45)
-        )
+        values[4:8, 15:21] = np.asarray((0.0, 0.45 * 0.32, 0.0, 0.45 * 0.68, 0.0, 0.45))
         values[[0, 4], 27:31] = -1.0
         values[[1, 5], 27:31] = 1.0
         matcher = HybridMatcher(
-            _corpus(values), _Generator(), TerrainAuthority.multi_hill(),
+            _corpus(values),
+            _Generator(),
+            TerrainAuthority.multi_hill(),
             pose_converter=_pose_converter,
         )
 
@@ -1051,18 +1209,21 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
     def test_headless_acceptance_rejects_short_or_capped_diagnostics(self):
         values = np.zeros((8, 31), dtype=np.float32)
         values[:, 21:27] = np.tile((0.0, 1.0), 3)
-        values[4:8, 15:21] = np.asarray(
-            (0.0, 0.45 * 0.32, 0.0, 0.45 * 0.68, 0.0, 0.45)
-        )
+        values[4:8, 15:21] = np.asarray((0.0, 0.45 * 0.32, 0.0, 0.45 * 0.68, 0.0, 0.45))
         values[[0, 4], 27:31] = -1.0
         values[[1, 5], 27:31] = 1.0
         short = HybridMatcher(
-            _corpus(values), _Generator(), TerrainAuthority.multi_hill(),
+            _corpus(values),
+            _Generator(),
+            TerrainAuthority.multi_hill(),
             pose_converter=_pose_converter,
         )
         capped = HybridMatcher(
-            _corpus(values), _Generator(), TerrainAuthority.multi_hill(),
-            pose_converter=_pose_converter, max_search_rows=4,
+            _corpus(values),
+            _Generator(),
+            TerrainAuthority.multi_hill(),
+            pose_converter=_pose_converter,
+            max_search_rows=4,
         )
 
         short_receipt = run_headless_smoke(short, frames=999)
