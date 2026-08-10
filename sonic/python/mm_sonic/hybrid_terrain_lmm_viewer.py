@@ -613,30 +613,73 @@ def _primary_source_receipt(corpus: object) -> tuple[Path, dict[str, object]]:
 def _indexed_scene_authority(
     corpus: object, scene_id: str
 ) -> tuple[Path, dict[str, str]]:
-    source_root, receipt = _primary_source_receipt(corpus)
-    manifest_path = (source_root / "manifest.json").resolve(strict=True)
-    receipt_path = Path(str(receipt.get("path"))).resolve(strict=True)
-    if receipt_path != manifest_path:
-        raise ValueError("source receipt does not identify source_root/manifest.json")
-    manifest_payload, source_sha = _authenticated_file(
-        manifest_path,
-        receipt.get("sha256"),
-        "source manifest",
-        expected_size=receipt.get("size_bytes"),
-    )
-    manifest = _json_object(manifest_payload, "source manifest")
-    if manifest.get("schema") != "g1-terrain-artifacts/v3":
-        raise ValueError("source manifest schema cannot authorize terrain scenes")
-    index_descriptor = manifest.get("scene_index")
-    if (
-        type(index_descriptor) is not dict
-        or index_descriptor.get("path") != "scenes/index.json"
-        or index_descriptor.get("schema") != "g1-terrain-scene-index/v1"
-    ):
-        raise ValueError("source scene-index descriptor changed")
+    full_walking = type(getattr(corpus, "manifest_receipt", None)) is not dict
+    members: dict[str, object] | None = None
+    if full_walking:
+        source_root_value = getattr(corpus, "root", None)
+        source_sha_value = getattr(corpus, "manifest_sha256", None)
+        if not isinstance(source_root_value, Path):
+            raise ValueError("full walking corpus has no scene authority root")
+        source_root = source_root_value.resolve(strict=True)
+        manifest_path = (source_root / "manifest.json").resolve(strict=True)
+        manifest_payload, source_sha = _authenticated_file(
+            manifest_path, source_sha_value, "full walking corpus manifest"
+        )
+        manifest = _json_object(manifest_payload, "full walking corpus manifest")
+        if manifest.get("schema") != "g1-full-walking-terrain-lmm-corpus/v1":
+            raise ValueError("full walking corpus schema cannot authorize scenes")
+        members_value = manifest.get("members")
+        if type(members_value) is not dict:
+            raise ValueError("full walking corpus member inventory changed")
+        members = members_value
+        index_descriptor = manifest.get("scene_index")
+        if (
+            type(index_descriptor) is not dict
+            or set(index_descriptor) != {"path", "scene_ids", "sha256"}
+            or index_descriptor.get("path") != "scenes/index.json"
+            or type(index_descriptor.get("scene_ids")) is not list
+            or scene_id not in index_descriptor.get("scene_ids", ())
+        ):
+            raise ValueError("full walking scene-index descriptor changed")
+        index_member = members.get("scenes/index.json")
+        if (
+            type(index_member) is not dict
+            or index_member.get("path") != "scenes/index.json"
+            or index_member.get("sha256") != index_descriptor.get("sha256")
+        ):
+            raise ValueError("full walking scene-index member changed")
+        index_size = index_member.get("size_bytes")
+    else:
+        source_root, receipt = _primary_source_receipt(corpus)
+        manifest_path = (source_root / "manifest.json").resolve(strict=True)
+        receipt_path = Path(str(receipt.get("path"))).resolve(strict=True)
+        if receipt_path != manifest_path:
+            raise ValueError(
+                "source receipt does not identify source_root/manifest.json"
+            )
+        manifest_payload, source_sha = _authenticated_file(
+            manifest_path,
+            receipt.get("sha256"),
+            "source manifest",
+            expected_size=receipt.get("size_bytes"),
+        )
+        manifest = _json_object(manifest_payload, "source manifest")
+        if manifest.get("schema") != "g1-terrain-artifacts/v3":
+            raise ValueError("source manifest schema cannot authorize terrain scenes")
+        index_descriptor = manifest.get("scene_index")
+        if (
+            type(index_descriptor) is not dict
+            or index_descriptor.get("path") != "scenes/index.json"
+            or index_descriptor.get("schema") != "g1-terrain-scene-index/v1"
+        ):
+            raise ValueError("source scene-index descriptor changed")
+        index_size = None
     index_path = (source_root / "scenes" / "index.json").resolve(strict=True)
     index_payload, index_sha = _authenticated_file(
-        index_path, index_descriptor.get("sha256"), "source scene index"
+        index_path,
+        index_descriptor.get("sha256"),
+        "source scene index",
+        expected_size=index_size,
     )
     index = _json_object(index_payload, "source scene index")
     ids = index.get("scene_ids")
@@ -663,8 +706,21 @@ def _indexed_scene_authority(
     ):
         raise ValueError("source scene descriptor changed")
     scene_path = (source_root / expected_path).resolve(strict=True)
+    scene_size = None
+    if members is not None:
+        scene_member = members.get(expected_path)
+        if (
+            type(scene_member) is not dict
+            or scene_member.get("path") != expected_path
+            or scene_member.get("sha256") != descriptor.get("sha256")
+        ):
+            raise ValueError("full walking scene member changed")
+        scene_size = scene_member.get("size_bytes")
     scene_payload, scene_sha = _authenticated_file(
-        scene_path, descriptor.get("sha256"), "source scene.json"
+        scene_path,
+        descriptor.get("sha256"),
+        "source scene.json",
+        expected_size=scene_size,
     )
     scene = _json_object(scene_payload, "source scene.json")
     if (

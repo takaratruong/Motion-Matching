@@ -143,6 +143,40 @@ def _write_authenticated_scene_pack(root: Path) -> SimpleNamespace:
     )
 
 
+def _write_full_walking_scene_pack(root: Path) -> SimpleNamespace:
+    _write_authenticated_scene_pack(root)
+    scene_id = "ramp-10-up-down"
+    member_names = (
+        "scenes/index.json",
+        f"scenes/{scene_id}/scene.json",
+        f"scenes/{scene_id}/terrain.bin",
+    )
+    members = {}
+    for name in member_names:
+        payload = (root / name).read_bytes()
+        members[name] = {
+            "path": name,
+            "size_bytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+    manifest_payload = _canonical_json(
+        {
+            "schema": "g1-full-walking-terrain-lmm-corpus/v1",
+            "scene_index": {
+                "path": "scenes/index.json",
+                "scene_ids": [scene_id],
+                "sha256": members["scenes/index.json"]["sha256"],
+            },
+            "members": members,
+        }
+    )
+    (root / "manifest.json").write_bytes(manifest_payload)
+    return SimpleNamespace(
+        root=root,
+        manifest_sha256=hashlib.sha256(manifest_payload).hexdigest(),
+    )
+
+
 def _bind_formal_model_and_cache_authorities(
     root: Path, corpus: object, generator: object
 ) -> Path:
@@ -347,6 +381,19 @@ class HybridTerrainViewerTests(unittest.TestCase):
             indexed_payload = indexed.source_path.read_bytes()
             indexed.source_path.write_bytes(indexed_payload[:-1] + b"\x01")
             self.assertFalse(
+                viewer_module.scene_authentication_is_current(corpus, indexed)
+            )
+
+    def test_full_walking_corpus_scene_pack_is_authenticated_directly(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            corpus = _write_full_walking_scene_pack(Path(temporary))
+
+            indexed = load_scene_terrain("ramp-10-up-down", corpus=corpus)
+
+            self.assertTrue(indexed.scene_authenticated)
+            self.assertEqual(indexed.scene_evidence_status, "authenticated-indexed")
+            self.assertEqual(indexed.source_manifest_sha256, corpus.manifest_sha256)
+            self.assertTrue(
                 viewer_module.scene_authentication_is_current(corpus, indexed)
             )
 
