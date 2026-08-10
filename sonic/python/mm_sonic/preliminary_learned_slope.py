@@ -8,6 +8,7 @@ path visible on the exact 595-row authored route.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import importlib
 import json
@@ -51,6 +52,10 @@ from resources.g1_terrain_builder.terrain import (
 PRELIMINARY_LABEL = (
     "PRELIMINARY LEARNED EXACT-ROUTE OVERFIT (NOT ACCEPTED/NO GENERALIZATION)"
 )
+PRELIMINARY_VISUAL_V2_LABEL = (
+    "PRELIMINARY V2 LEARNED EXACT-ROUTE OVERFIT "
+    "(POST-HOC VISUAL GATE; NOT ACCEPTED/NO GENERALIZATION)"
+)
 MODEL_ARTIFACT_NAMES = ("latent.bin", "decompressor.bin", "stepper.bin")
 CLIP_ID = "terrain_slopes__slope_000__000"
 FPS = 60.0
@@ -74,6 +79,14 @@ DEFAULT_MODEL_OUTPUT = (
 ).resolve()
 SOLE_FIT_CLAIM = (
     DEFAULT_MODEL_OUTPUT.parent / ".preliminary-learned-slope-sole-fit.claim"
+)
+DEFAULT_VISUAL_V2_MODEL_OUTPUT = (
+    REPOSITORY_ROOT
+    / "sonic/runs/g1-lmm-authored-slope-preliminary/model-v2-visual"
+).resolve()
+VISUAL_V2_SOLE_FIT_CLAIM = (
+    DEFAULT_VISUAL_V2_MODEL_OUTPUT.parent
+    / ".preliminary-learned-slope-visual-v2-sole-fit.claim"
 )
 
 
@@ -149,6 +162,7 @@ def build_preliminary_model_manifest(
     artifacts: Mapping[str, Mapping[str, object]],
     training_receipt: Mapping[str, object],
     numerical_gates_passed: bool,
+    visual_v2: bool = False,
 ) -> dict[str, object]:
     if (
         type(data_manifest_sha256) is not str
@@ -178,8 +192,12 @@ def build_preliminary_model_manifest(
         raise ValueError("preliminary manifest requires one bound training receipt")
     ordered = {name: dict(artifacts[name]) for name in MODEL_ARTIFACT_NAMES}
     return {
-        "schema": "g1-lmm-preliminary-slope-model/v1",
-        "label": PRELIMINARY_LABEL,
+        "schema": (
+            "g1-lmm-preliminary-slope-visual-model/v2"
+            if visual_v2
+            else "g1-lmm-preliminary-slope-model/v1"
+        ),
+        "label": PRELIMINARY_VISUAL_V2_LABEL if visual_v2 else PRELIMINARY_LABEL,
         "status": "preliminary-not-accepted",
         "accepted": False,
         "generalization_claim": "none",
@@ -193,6 +211,52 @@ def build_preliminary_model_manifest(
         "training_receipt": dict(training_receipt),
         "artifacts": ordered,
     }
+
+
+def visual_v2_decompressor_gate(gate: Mapping[str, object]) -> dict[str, object]:
+    """Copy the V1 decoder evidence under the isolated 2 mm visual policy."""
+
+    if type(gate) is not dict:
+        raise TypeError("visual V2 decompressor gate must be a dictionary")
+    result = copy.deepcopy(gate)
+    fitted = result.get("fitted")
+    withheld = result.get("withheld")
+    if type(fitted) is not dict or type(withheld) is not list:
+        raise ValueError("visual V2 decompressor gate structure changed")
+
+    def bounded(name: str, limit: float) -> bool:
+        value = fitted.get(name)
+        return (
+            type(value) in (int, float)
+            and np.isfinite(value)
+            and float(value) <= limit
+        )
+
+    contacts = fitted.get("contact_f1")
+    contacts_green = (
+        type(contacts) is list
+        and len(contacts) == 2
+        and all(
+            type(value) in (int, float)
+            and np.isfinite(value)
+            and float(value) >= 0.95
+            for value in contacts
+        )
+    )
+    fitted["accepted"] = bool(
+        fitted.get("finite") is True
+        and fitted.get("root_velocity_finite") is True
+        and bounded("joint_mae_rad", 0.010)
+        and bounded("joint_p95_frame_max_rad", 0.050)
+        and bounded("joint_max_rad", 0.100)
+        and bounded("fk_max_body_position_error_m", 0.010)
+        and bounded("sole_max_position_error_m", 0.010)
+        and bounded("local_translation_max_error_m", 0.002)
+        and contacts_green
+    )
+    result["local_translation_max_error_limit_m"] = 0.002
+    result["accepted"] = bool(fitted["accepted"] and not withheld)
+    return result
 
 
 @dataclass(frozen=True)
@@ -453,6 +517,8 @@ def _load_bound_training_receipt(
     root: Path,
     manifest: dict[str, object],
     bundle: PreliminarySlopeBundle,
+    *,
+    visual_v2: bool = False,
 ) -> dict[str, object]:
     descriptor = manifest.get("training_receipt")
     if (
@@ -480,8 +546,12 @@ def _load_bound_training_receipt(
         raise ValueError("preliminary training receipt is invalid JSON") from error
 
     required = {
-        "schema": "g1-lmm-preliminary-slope-training/v1",
-        "label": PRELIMINARY_LABEL,
+        "schema": (
+            "g1-lmm-preliminary-slope-visual-training/v2"
+            if visual_v2
+            else "g1-lmm-preliminary-slope-training/v1"
+        ),
+        "label": PRELIMINARY_VISUAL_V2_LABEL if visual_v2 else PRELIMINARY_LABEL,
         "status": "preliminary-not-accepted",
         "accepted": False,
         "generalization_claim": "none",
@@ -542,9 +612,10 @@ def _load_bound_training_receipt(
         raise ValueError("preliminary training receipt GPU3 identity changed")
 
     claim = receipt.get("sole_fit_claim")
+    expected_claim = VISUAL_V2_SOLE_FIT_CLAIM if visual_v2 else SOLE_FIT_CLAIM
     if (
         type(claim) is not dict
-        or claim.get("path") != str(SOLE_FIT_CLAIM)
+        or claim.get("path") != str(expected_claim)
         or type(claim.get("size_bytes")) is not int
         or claim["size_bytes"] <= 0
         or type(claim.get("sha256")) is not str
@@ -559,6 +630,10 @@ def _load_bound_training_receipt(
         gate = receipt.get(stage)
         if type(gate) is not dict or gate.get("accepted") is not True:
             raise ValueError(f"preliminary training receipt {stage} is not green")
+    if visual_v2 and receipt["decompressor_gate"].get(
+        "local_translation_max_error_limit_m"
+    ) != 0.002:
+        raise ValueError("preliminary training receipt visual V2 gate changed")
     rollout = receipt.get("full_route_rollout_gate")
     if type(rollout) is not dict or rollout.get("accepted") is not True:
         raise ValueError("preliminary training receipt full-route gate is not green")
@@ -590,6 +665,8 @@ def _load_bound_training_receipt(
 def load_preliminary_model(
     model_directory: str | Path,
     bundle: PreliminarySlopeBundle,
+    *,
+    visual_v2: bool = False,
 ) -> PreliminaryModel:
     """Authenticate the isolated three-artifact model; reject any projector."""
 
@@ -603,8 +680,12 @@ def load_preliminary_model(
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("invalid preliminary model manifest") from error
     required = {
-        "schema": "g1-lmm-preliminary-slope-model/v1",
-        "label": PRELIMINARY_LABEL,
+        "schema": (
+            "g1-lmm-preliminary-slope-visual-model/v2"
+            if visual_v2
+            else "g1-lmm-preliminary-slope-model/v1"
+        ),
+        "label": PRELIMINARY_VISUAL_V2_LABEL if visual_v2 else PRELIMINARY_LABEL,
         "status": "preliminary-not-accepted",
         "accepted": False,
         "generalization_claim": "none",
@@ -619,7 +700,9 @@ def load_preliminary_model(
         for name, expected in required.items()
     ):
         raise ValueError("preliminary model manifest scope or gate changed")
-    training_receipt = _load_bound_training_receipt(root, manifest, bundle)
+    training_receipt = _load_bound_training_receipt(
+        root, manifest, bundle, visual_v2=visual_v2
+    )
 
     paths = {
         name: _bound_artifact(root, manifest, name) for name in MODEL_ARTIFACT_NAMES
@@ -794,13 +877,21 @@ def build_viewer_model(bundle: PreliminarySlopeBundle):
     return model
 
 
-def overlay_text(*, row: int, frame_count: int, w_down: bool) -> tuple[str, str]:
+def overlay_text(
+    *,
+    row: int,
+    frame_count: int,
+    w_down: bool,
+    label: str = PRELIMINARY_LABEL,
+) -> tuple[str, str]:
     if type(row) is not int or type(frame_count) is not int:
         raise TypeError("overlay row and frame count must be integers")
     if frame_count < 1 or not 0 <= row < frame_count:
         raise ValueError("overlay row is outside the learned route")
     if type(w_down) is not bool:
         raise TypeError("overlay W state must be an exact boolean")
+    if label not in (PRELIMINARY_LABEL, PRELIMINARY_VISUAL_V2_LABEL):
+        raise ValueError("overlay label is outside the preliminary scope")
     mode = (
         "ROUTE COMPLETE"
         if row == frame_count - 1
@@ -809,7 +900,7 @@ def overlay_text(*, row: int, frame_count: int, w_down: bool) -> tuple[str, str]
         else "BITWISE PAUSED (W released)"
     )
     return (
-        PRELIMINARY_LABEL,
+        label,
         (
             f"row {row + 1}/{frame_count} @ 60 Hz | {mode}\n"
             "W: one LEARNED recurrent step/tick | release: exact pause | X: exit\n"
@@ -829,6 +920,18 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--model", type=Path, required=True)
     view = commands.add_parser("view", help="open the interactive MuJoCo viewer")
     view.add_argument("--model", type=Path, required=True)
+    train_v2 = commands.add_parser(
+        "train-v2", help="run the one frozen GPU3 post-hoc visual fit"
+    )
+    train_v2.add_argument("--output", type=Path, required=True)
+    smoke_v2 = commands.add_parser(
+        "smoke-v2", help="run the post-hoc learned route without a window"
+    )
+    smoke_v2.add_argument("--model", type=Path, required=True)
+    view_v2 = commands.add_parser(
+        "view-v2", help="open the post-hoc interactive MuJoCo viewer"
+    )
+    view_v2.add_argument("--model", type=Path, required=True)
     return parser
 
 
@@ -983,13 +1086,19 @@ def _json_safe_diagnostic(value: object) -> object:
     return str(value)
 
 
-def _acquire_atomic_fit_claim(claim: Path, output: Path) -> dict[str, object]:
+def _acquire_atomic_fit_claim(
+    claim: Path, output: Path, *, visual_v2: bool = False
+) -> dict[str, object]:
     claim_path = Path(claim).expanduser().resolve()
     target = Path(output).expanduser().resolve()
     payload = _json_bytes(
         {
-            "schema": "g1-lmm-preliminary-slope-sole-fit-claim/v1",
-            "label": PRELIMINARY_LABEL,
+            "schema": (
+                "g1-lmm-preliminary-slope-visual-sole-fit-claim/v2"
+                if visual_v2
+                else "g1-lmm-preliminary-slope-sole-fit-claim/v1"
+            ),
+            "label": PRELIMINARY_VISUAL_V2_LABEL if visual_v2 else PRELIMINARY_LABEL,
             "output": str(target),
         }
     )
@@ -1239,6 +1348,7 @@ def train_preliminary_model(
     *,
     bundle: PreliminarySlopeBundle | None = None,
     config: PreliminaryTrainingConfig | None = None,
+    visual_v2: bool = False,
 ) -> dict[str, object]:
     """Run the one immutable all-row slope-only fit; never train a projector."""
 
@@ -1246,9 +1356,14 @@ def train_preliminary_model(
     config = PreliminaryTrainingConfig() if config is None else config
     if not isinstance(config, PreliminaryTrainingConfig):
         raise TypeError("training requires the frozen preliminary config")
-    if output != DEFAULT_MODEL_OUTPUT:
+    expected_output = (
+        DEFAULT_VISUAL_V2_MODEL_OUTPUT if visual_v2 else DEFAULT_MODEL_OUTPUT
+    )
+    expected_claim = VISUAL_V2_SOLE_FIT_CLAIM if visual_v2 else SOLE_FIT_CLAIM
+    label = PRELIMINARY_VISUAL_V2_LABEL if visual_v2 else PRELIMINARY_LABEL
+    if output != expected_output:
         raise ValueError(
-            f"sole preliminary fit output is fixed at {DEFAULT_MODEL_OUTPUT}"
+            f"sole preliminary fit output is fixed at {expected_output}"
         )
     if output.exists():
         raise FileExistsError(f"refusing to replace immutable fit: {output}")
@@ -1270,13 +1385,19 @@ def train_preliminary_model(
     hardware = _gpu3_receipt(config)
     arrays = build_training_arrays(source.training)
     fit_config = orange_duck_training_config(config)
-    sole_fit_claim = _acquire_atomic_fit_claim(SOLE_FIT_CLAIM, output)
+    sole_fit_claim = _acquire_atomic_fit_claim(
+        expected_claim, output, visual_v2=visual_v2
+    )
     staging = Path(
         tempfile.mkdtemp(prefix=f".{output.name}.staging-", dir=output.parent)
     )
     receipt: dict[str, object] = {
-        "schema": "g1-lmm-preliminary-slope-training/v1",
-        "label": PRELIMINARY_LABEL,
+        "schema": (
+            "g1-lmm-preliminary-slope-visual-training/v2"
+            if visual_v2
+            else "g1-lmm-preliminary-slope-training/v1"
+        ),
+        "label": label,
         "status": "fitting",
         "accepted": False,
         "generalization_claim": "none",
@@ -1311,7 +1432,7 @@ def train_preliminary_model(
     }
     stopped_after = "preflight"
     try:
-        print(f"{PRELIMINARY_LABEL}: 64-row capacity preflight", flush=True)
+        print(f"{label}: 64-row capacity preflight", flush=True)
         overfit = _train_64_frame_overfit(source.training, arrays, fit_config)
         receipt["overfit_gate"] = overfit
         if not overfit["accepted"]:
@@ -1319,7 +1440,7 @@ def train_preliminary_model(
 
         stopped_after = "decompressor"
         print(
-            f"{PRELIMINARY_LABEL}: fitting compressor/latent + decompressor "
+            f"{label}: fitting compressor/latent + decompressor "
             f"for {config.decompressor_steps} steps",
             flush=True,
         )
@@ -1333,13 +1454,18 @@ def train_preliminary_model(
             empty,
         )
         receipt["decompressor_training"] = autoencoder.training_metrics
-        receipt["decompressor_gate"] = autoencoder.gate
-        if not autoencoder.gate["accepted"]:
+        decompressor_gate = (
+            visual_v2_decompressor_gate(autoencoder.gate)
+            if visual_v2
+            else autoencoder.gate
+        )
+        receipt["decompressor_gate"] = decompressor_gate
+        if not decompressor_gate["accepted"]:
             raise PreliminaryTrainingError("decompressor fit gate failed")
 
         stopped_after = "stepper"
         print(
-            f"{PRELIMINARY_LABEL}: fitting recurrent stepper for "
+            f"{label}: fitting recurrent stepper for "
             f"{config.stepper_steps} steps (NO PROJECTOR)",
             flush=True,
         )
@@ -1396,11 +1522,12 @@ def train_preliminary_model(
             artifacts=artifacts,
             training_receipt=_artifact_descriptor(staging / "training.json"),
             numerical_gates_passed=True,
+            visual_v2=visual_v2,
         )
         (staging / "manifest.json").write_bytes(_json_bytes(manifest))
         os.replace(staging, output)
         print(
-            f"{PRELIMINARY_LABEL}: numerical fit/rollout gates passed; "
+            f"{label}: numerical fit/rollout gates passed; "
             f"published {output}",
             flush=True,
         )
@@ -1419,14 +1546,33 @@ def train_preliminary_model(
         ) from error
 
 
+def train_preliminary_visual_v2_model(
+    output_directory: str | Path,
+    *,
+    bundle: PreliminarySlopeBundle | None = None,
+    config: PreliminaryTrainingConfig | None = None,
+) -> dict[str, object]:
+    """Run the one post-hoc visual-only V2 fit with the 2 mm decoder gate."""
+
+    return train_preliminary_model(
+        output_directory, bundle=bundle, config=config, visual_v2=True
+    )
+
+
 def smoke_preliminary_model(
     bundle: PreliminarySlopeBundle,
     model: PreliminaryModel,
+    *,
+    visual_v2: bool = False,
 ) -> dict[str, object]:
     receipt = _full_route_rollout(bundle, model)
     return {
-        "schema": "g1-lmm-preliminary-slope-smoke/v1",
-        "label": PRELIMINARY_LABEL,
+        "schema": (
+            "g1-lmm-preliminary-slope-visual-smoke/v2"
+            if visual_v2
+            else "g1-lmm-preliminary-slope-smoke/v1"
+        ),
+        "label": PRELIMINARY_VISUAL_V2_LABEL if visual_v2 else PRELIMINARY_LABEL,
         "status": "passed" if receipt["accepted"] else "rejected",
         "accepted": False,
         "generalization_claim": "none",
@@ -1470,6 +1616,8 @@ def _enforce_solid_rendering(flags: object) -> None:
 def run_interactive(
     bundle: PreliminarySlopeBundle,
     learned_model: PreliminaryModel,
+    *,
+    visual_v2: bool = False,
 ) -> int:
     rollout = _full_route_rollout(bundle, learned_model)
     if not rollout["accepted"]:
@@ -1492,7 +1640,8 @@ def run_interactive(
     )
     data.qpos[:] = state.qpos
     mujoco.mj_forward(model, data)
-    print(PRELIMINARY_LABEL, flush=True)
+    label = PRELIMINARY_VISUAL_V2_LABEL if visual_v2 else PRELIMINARY_LABEL
+    print(label, flush=True)
     print(
         "Hold W to advance the learned recurrent state and decoded G1 pose; "
         "release W for an exact pause; X exits. NO PROJECTOR.",
@@ -1535,6 +1684,7 @@ def run_interactive(
                     row=state.row,
                     frame_count=bundle.training.frames,
                     w_down=w_down,
+                    label=label,
                 )
                 with viewer.lock():
                     viewer.cam.lookat[:] = data.qpos[:3]
@@ -1563,14 +1713,19 @@ def main(argv: list[str] | None = None) -> int:
         receipt = train_preliminary_model(arguments.output)
         print(json.dumps(receipt, sort_keys=True, allow_nan=False), flush=True)
         return 0
+    if arguments.command == "train-v2":
+        receipt = train_preliminary_visual_v2_model(arguments.output)
+        print(json.dumps(receipt, sort_keys=True, allow_nan=False), flush=True)
+        return 0
+    visual_v2 = arguments.command.endswith("-v2")
     bundle = load_preliminary_slope_bundle()
-    model = load_preliminary_model(arguments.model, bundle)
-    if arguments.command == "smoke":
-        receipt = smoke_preliminary_model(bundle, model)
+    model = load_preliminary_model(arguments.model, bundle, visual_v2=visual_v2)
+    if arguments.command in ("smoke", "smoke-v2"):
+        receipt = smoke_preliminary_model(bundle, model, visual_v2=visual_v2)
         print(json.dumps(receipt, sort_keys=True, allow_nan=False), flush=True)
         return 0 if receipt["numerical_rollout_gate_passed"] else 2
-    if arguments.command == "view":
-        return run_interactive(bundle, model)
+    if arguments.command in ("view", "view-v2"):
+        return run_interactive(bundle, model, visual_v2=visual_v2)
     raise AssertionError(f"unreachable command: {arguments.command}")
 
 

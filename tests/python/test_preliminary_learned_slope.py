@@ -25,6 +25,7 @@ from mm_sonic.preliminary_learned_slope import (
     normalized_terrain_features,
     orange_duck_training_config,
     overlay_text,
+    visual_v2_decompressor_gate,
 )
 
 from resources.g1_lmm.dataset import build_training_arrays
@@ -42,6 +43,117 @@ class _ConstantNetwork:
 
 
 class PreliminaryLearnedSlopeContractTests(unittest.TestCase):
+    @staticmethod
+    def _v1_near_miss_gate() -> dict[str, object]:
+        return {
+            "accepted": False,
+            "evaluation_scope": "single-clip-all-row-overfit",
+            "fitted": {
+                "accepted": False,
+                "contact_f1": [1.0, 1.0],
+                "finite": True,
+                "fk_max_body_position_error_m": 0.005068,
+                "joint_mae_rad": 0.007690,
+                "joint_max_rad": 0.020,
+                "joint_p95_frame_max_rad": 0.030,
+                "local_translation_max_error_m": 0.001492458,
+                "root_velocity_finite": True,
+                "sole_max_position_error_m": 0.004948,
+            },
+            "withheld": [],
+        }
+
+    def test_visual_v2_only_relaxes_the_local_translation_gate(self):
+        v1_gate = self._v1_near_miss_gate()
+        self.assertFalse(v1_gate["accepted"])
+
+        visual_gate = visual_v2_decompressor_gate(v1_gate)
+
+        self.assertTrue(visual_gate["accepted"])
+        self.assertTrue(visual_gate["fitted"]["accepted"])
+        self.assertEqual(visual_gate["local_translation_max_error_limit_m"], 0.002)
+        self.assertEqual(
+            visual_gate["fitted"]["local_translation_max_error_m"], 0.001492458
+        )
+        self.assertFalse(v1_gate["accepted"])
+        self.assertFalse(v1_gate["fitted"]["accepted"])
+
+        exact_limit = self._v1_near_miss_gate()
+        exact_limit["fitted"]["local_translation_max_error_m"] = 0.002
+        self.assertTrue(visual_v2_decompressor_gate(exact_limit)["accepted"])
+
+        too_large = self._v1_near_miss_gate()
+        too_large["fitted"]["local_translation_max_error_m"] = 0.002000001
+        self.assertFalse(visual_v2_decompressor_gate(too_large)["accepted"])
+
+        failed_joint = self._v1_near_miss_gate()
+        failed_joint["fitted"]["joint_mae_rad"] = 0.010001
+        self.assertFalse(visual_v2_decompressor_gate(failed_joint)["accepted"])
+
+        withheld = self._v1_near_miss_gate()
+        withheld["withheld"] = [{"accepted": True}]
+        self.assertFalse(visual_v2_decompressor_gate(withheld)["accepted"])
+
+    def test_visual_v2_uses_distinct_receipt_output_claim_and_commands(self):
+        self.assertEqual(
+            preliminary.PRELIMINARY_VISUAL_V2_LABEL,
+            "PRELIMINARY V2 LEARNED EXACT-ROUTE OVERFIT "
+            "(POST-HOC VISUAL GATE; NOT ACCEPTED/NO GENERALIZATION)",
+        )
+        self.assertEqual(
+            preliminary.DEFAULT_VISUAL_V2_MODEL_OUTPUT.name, "model-v2-visual"
+        )
+        self.assertNotEqual(
+            preliminary.DEFAULT_VISUAL_V2_MODEL_OUTPUT,
+            preliminary.DEFAULT_MODEL_OUTPUT,
+        )
+        self.assertNotEqual(
+            preliminary.VISUAL_V2_SOLE_FIT_CLAIM,
+            preliminary.SOLE_FIT_CLAIM,
+        )
+        self.assertNotIn("projector", str(preliminary.DEFAULT_VISUAL_V2_MODEL_OUTPUT))
+        self.assertNotIn("projector", str(preliminary.VISUAL_V2_SOLE_FIT_CLAIM))
+
+        parser = build_parser()
+        train = parser.parse_args(("train-v2", "--output", "/tmp/model-v2-visual"))
+        smoke = parser.parse_args(("smoke-v2", "--model", "/tmp/model-v2-visual"))
+        view = parser.parse_args(("view-v2", "--model", "/tmp/model-v2-visual"))
+
+        self.assertEqual(train.command, "train-v2")
+        self.assertEqual(smoke.command, "smoke-v2")
+        self.assertEqual(view.command, "view-v2")
+
+    def test_visual_v2_loader_rejects_the_v1_receipt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = type(
+                "MinimalBundle",
+                (),
+                {
+                    "training": type("Training", (), {"manifest_sha256": "0" * 64})(),
+                    "hashes": {},
+                },
+            )()
+            with patch.object(preliminary, "PreliminarySlopeBundle", type(bundle)):
+                (root / "manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "schema": "g1-lmm-preliminary-slope-model/v1",
+                            "label": PRELIMINARY_LABEL,
+                            "status": "preliminary-not-accepted",
+                            "accepted": False,
+                            "generalization_claim": "none",
+                            "projector": "absent",
+                            "rows": 595,
+                            "output_fps": 60.0,
+                            "data_manifest_sha256": "0" * 64,
+                            "numerical_gates_passed": True,
+                        }
+                    )
+                )
+                with self.assertRaisesRegex(ValueError, "manifest scope or gate"):
+                    load_preliminary_model(root, bundle, visual_v2=True)
+
     def test_label_and_artifact_contract_cannot_be_mistaken_for_acceptance(self):
         self.assertEqual(
             PRELIMINARY_LABEL,
