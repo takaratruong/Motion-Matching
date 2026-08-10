@@ -129,20 +129,21 @@ def configure_single_gpu_visibility(spec: str) -> tuple[str, int]:
 
 Lazily import JAX only inside construction. Require exactly one visible GPU and use its single `Device` for every `device_put`. Store float64 searchable features, sorted global rows, range IDs, and contact codes on that device.
 
-The jitted kernel computes:
+The jitted kernel receives the resident feature, range, and contact arrays as explicit arguments so XLA does not capture a multi-gigabyte constant. It computes:
 
 ```python
-scores = jnp.sum(jnp.square(features - query[None, :]), axis=1)
-scores += transition_penalty * (range_ids != current_range)
-scores = jnp.where(contact_codes == active_contact_code, scores, jnp.inf)
-padded = jnp.concatenate((scores, jnp.asarray((jnp.inf,), dtype=jnp.float64)))
-safe_exclusions = jnp.where(excluded_positions >= 0, excluded_positions, len(scores))
-padded = padded.at[safe_exclusions].set(jnp.inf)
-scores = padded[:-1]
-values, positions = jax.lax.top_k(-scores, min(128, len(scores)))
-minimum = -values[0]
-tolerance = jnp.finfo(jnp.float64).eps * jnp.maximum(1.0, jnp.abs(minimum)) * 512
-close_count = jnp.count_nonzero(scores <= minimum + tolerance)
+def kernel(features, range_ids, contact_codes, query, current_range, active_contact_code, excluded_positions):
+    scores = jnp.sum(jnp.square(features - query[None, :]), axis=1)
+    scores += transition_penalty * (range_ids != current_range)
+    scores = jnp.where(contact_codes == active_contact_code, scores, jnp.inf)
+    padded = jnp.concatenate((scores, jnp.asarray((jnp.inf,), dtype=jnp.float64)))
+    safe_exclusions = jnp.where(excluded_positions >= 0, excluded_positions, len(scores))
+    padded = padded.at[safe_exclusions].set(jnp.inf)
+    scores = padded[:-1]
+    values, positions = jax.lax.top_k(-scores, min(128, len(scores)))
+    minimum = -values[0]
+    tolerance = jnp.finfo(jnp.float64).eps * jnp.maximum(1.0, jnp.abs(minimum)) * 512
+    close_count = jnp.count_nonzero(scores <= minimum + tolerance)
 ```
 
 Synchronize returned arrays before timing completes. Return the fixed top-candidate set; callers fail closed or use complete CPU brute force if `close_count` exceeds the returned set.

@@ -25,7 +25,7 @@ Each query exhaustively evaluates the same direct squared-difference score in fl
 
 It then adds the transition penalty outside the current range, sets incompatible-contact and explicitly excluded rows to infinity, and obtains the minimum in sorted searchable-row order. It returns every candidate within a conservative float64 roundoff window of the device minimum; the runtime uses the existing CPU `_candidate_score` and stable row tie-break over that bounded set before commitment. Randomized and adversarial parity tests compare the final result to the existing complete CPU brute-force result.
 
-JAX compilation and device transfer happen during matcher construction, before the MuJoCo window opens. Search calls synchronize before returning so measured latency reflects completed device work.
+JAX compilation and device transfer happen during matcher construction, before the MuJoCo window opens. The jitted kernel receives the resident feature/range/contact arrays as explicit arguments instead of capturing them as multi-gigabyte compiled constants. Search calls synchronize before returning so measured latency reflects completed device work.
 
 ## Integration boundaries
 
