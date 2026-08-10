@@ -41,6 +41,44 @@ def _frozen(values: object, dtype: np.dtype | str) -> np.ndarray:
 
 
 @dataclass(frozen=True)
+class SE2Transform:
+    """Immutable planar translation and yaw in the native world frame."""
+
+    xy: np.ndarray
+    yaw: float
+
+    def __post_init__(self) -> None:
+        xy = np.asarray(self.xy, dtype=np.float64)
+        if xy.shape != (2,) or not np.isfinite(xy).all():
+            raise ValueError("SE(2) translation must be one finite XY point")
+        yaw = _finite_scalar(self.yaw, "SE(2) yaw")
+        object.__setattr__(self, "xy", _frozen(xy, np.float64))
+        object.__setattr__(self, "yaw", math.remainder(yaw, 2.0 * math.pi))
+
+
+def compose_root_delta(
+    world: SE2Transform, local_delta_xy: np.ndarray, local_delta_yaw: float
+) -> SE2Transform:
+    """Compose one native-planar local motion delta into a world transform."""
+
+    if not isinstance(world, SE2Transform):
+        raise TypeError("root composition requires an SE2Transform")
+    delta = np.asarray(local_delta_xy, dtype=np.float64)
+    if delta.shape != (2,) or not np.isfinite(delta).all():
+        raise ValueError("local root delta must be one finite XY vector")
+    yaw_delta = _finite_scalar(local_delta_yaw, "local root yaw delta")
+    cosine, sine = math.cos(world.yaw), math.sin(world.yaw)
+    rotated = np.asarray(
+        (
+            cosine * delta[0] - sine * delta[1],
+            sine * delta[0] + cosine * delta[1],
+        ),
+        dtype=np.float64,
+    )
+    return SE2Transform(world.xy + rotated, world.yaw + yaw_delta)
+
+
+@dataclass(frozen=True)
 class CommandState:
     """Normalized forward-speed and steering request in ``[-1, 1]``."""
 
@@ -213,6 +251,9 @@ class HybridRuntimeState:
     candidate_limit_rejection_count: int
     first_candidate_limit_rejection_row: int | None
     max_candidate_limit_rejections_per_step: int
+    candidate_exhaustion_count: int
+    candidate_exhausted: bool
+    candidate_retry_budget: int
     pose_source: str
     support_height: float
     support_status: str
@@ -224,6 +265,11 @@ class HybridRuntimeState:
     search_scope: str
     search_acceptance_eligible: bool
     transition_penalty: float
+    fps: float
+    dt: float
+    horizons: tuple[int, int, int]
+    walking_speed_p95_mps: float
+    root_motion_source: str
 
 
 class HybridMatcher:
@@ -265,6 +311,29 @@ class HybridMatcher:
         self.max_root_step_m = _finite_scalar(max_root_step_m, "maximum root step")
         if self.max_root_step_m <= 0.0:
             raise ValueError("maximum root step must be positive")
+
+        corpus_has_rate = hasattr(corpus, "fps")
+        rate_value = getattr(corpus, "fps", FPS)
+        self.fps = _finite_scalar(rate_value, "corpus fps")
+        if self.fps <= 0.0:
+            raise ValueError("corpus fps must be positive")
+        self._legacy_runtime = self.fps == FPS
+        self.dt = 1.0 / self.fps
+        default_horizons = tuple(
+            int(round(seconds * self.fps)) for seconds in (0.32, 0.68, 1.0)
+        )
+        horizons = tuple(getattr(corpus, "horizons", default_horizons))
+        if len(horizons) != 3 or any(
+            type(value) is not int or value < 1 for value in horizons
+        ):
+            raise ValueError("corpus horizons must be three positive integers")
+        self.horizons = horizons
+        retry_budget = getattr(
+            corpus, "candidate_retry_budget", MAX_NATIVE_LIMIT_CANDIDATE_REJECTIONS
+        )
+        if type(retry_budget) is not int or retry_budget < 1:
+            raise ValueError("candidate retry budget must be a positive integer")
+        self.candidate_retry_budget = retry_budget
 
         self.artifacts = corpus.artifacts
         feature_set = corpus.features
@@ -336,6 +405,28 @@ class HybridMatcher:
         if not safe:
             raise ValueError("hybrid corpus has no range-safe searchable rows")
         searchable = np.concatenate(safe)
+        explicit_speed = getattr(corpus, "walking_speed_p95_mps", None)
+        if explicit_speed is not None:
+            walking_speed = _finite_scalar(
+                explicit_speed, "corpus walking speed p95"
+            )
+        elif corpus_has_rate:
+            planar_speeds: list[np.ndarray] = []
+            root_xz = np.asarray(self.artifacts.positions[:, 0], np.float64)[:, (0, 2)]
+            for start, stop in zip(starts, stops, strict=True):
+                if stop - start > 1:
+                    planar_speeds.append(
+                        np.linalg.norm(
+                            np.diff(root_xz[start:stop], axis=0), axis=1
+                        ) * self.fps
+                    )
+            walking_speed = float(np.percentile(np.concatenate(planar_speeds), 95.0))
+        else:
+            # Authenticated legacy wrappers predate corpus-owned rate metadata.
+            walking_speed = MAX_SPEED_MPS
+        if not math.isfinite(walking_speed) or walking_speed < 0.0:
+            raise ValueError("corpus walking speed p95 must be finite and nonnegative")
+        self.walking_speed_p95_mps = walking_speed
         row_families = self.family_ids[self.row_ranges]
         total_searchable = np.array(searchable, dtype=np.int64, copy=True)
 
@@ -425,6 +516,8 @@ class HybridMatcher:
         self._initial_heading = math.remainder(spawn_heading, 2.0 * math.pi)
         self._root_xy = np.array(self._initial_root_xy, copy=True)
         self._heading = self._initial_heading
+        self._world_transform = SE2Transform(self._root_xy, self._heading)
+        self._active_source_root = self._source_root_transform(0)
         initial_terrain = self._preview_terrain(CommandState())
         initial_domain_supported = self._preview_domain_supported(CommandState())
         initial_query = np.array(self.features[0], dtype=np.float64, copy=True)
@@ -446,6 +539,9 @@ class HybridMatcher:
             candidate_limit_rejection_count=0,
             first_candidate_limit_rejection_row=None,
             max_candidate_limit_rejections_per_step=0,
+            candidate_exhaustion_count=0,
+            candidate_exhausted=False,
+            candidate_retry_budget=self.candidate_retry_budget,
             pose_source="uninitialized",
             support_height=self.terrain.support(self._root_xy),
             support_status=self._terrain_support_status(
@@ -460,6 +556,11 @@ class HybridMatcher:
             search_scope=self.search_scope,
             search_acceptance_eligible=self.search_acceptance_eligible,
             transition_penalty=self.transition_penalty,
+            fps=self.fps,
+            dt=self.dt,
+            horizons=self.horizons,
+            walking_speed_p95_mps=self.walking_speed_p95_mps,
+            root_motion_source="canonical-simulation-se2",
         )
         self._commit_row(
             0,
@@ -476,6 +577,45 @@ class HybridMatcher:
             self.family_names[family_id]
             if 0 <= family_id < len(self.family_names)
             else str(family_id)
+        )
+
+    def _source_root_transform(self, row: int) -> SE2Transform:
+        position = np.asarray(self.artifacts.positions[row, 0], dtype=np.float64)
+        rotation = np.asarray(self.artifacts.rotations[row, 0], dtype=np.float64)
+        if position.shape != (3,) or rotation.shape != (4,) \
+                or not np.isfinite(position).all() or not np.isfinite(rotation).all():
+            raise ValueError("source root transform is invalid")
+        forward = quat.mul_vec(
+            rotation, np.asarray((0.0, 0.0, 1.0), dtype=np.float64)
+        )
+        horizontal_norm = float(np.linalg.norm(forward[[0, 2]]))
+        if not math.isfinite(horizontal_norm) or horizontal_norm <= 1.0e-8:
+            raise ValueError("source root heading is degenerate")
+        yaw = math.atan2(float(forward[0]), float(forward[2]))
+        return SE2Transform((position[0], -position[2]), yaw)
+
+    def _set_world_transform(self, transform: SE2Transform) -> None:
+        self._world_transform = transform
+        self._root_xy[:] = transform.xy
+        self._heading = transform.yaw
+
+    def _advance_world_to_source_row(self, row: int) -> None:
+        source = self._source_root_transform(row)
+        absolute_delta = source.xy - self._active_source_root.xy
+        cosine = math.cos(self._active_source_root.yaw)
+        sine = math.sin(self._active_source_root.yaw)
+        local_delta = np.asarray(
+            (
+                cosine * absolute_delta[0] + sine * absolute_delta[1],
+                -sine * absolute_delta[0] + cosine * absolute_delta[1],
+            ),
+            dtype=np.float64,
+        )
+        local_yaw = math.remainder(
+            source.yaw - self._active_source_root.yaw, 2.0 * math.pi
+        )
+        self._set_world_transform(
+            compose_root_delta(self._world_transform, local_delta, local_yaw)
         )
 
     def _normalize_terrain(self, raw: np.ndarray) -> np.ndarray:
@@ -541,6 +681,21 @@ class HybridMatcher:
         present[present] &= self.searchable_rows[indices[present]] == unique[present]
         return unique[present]
 
+    def _match_exclusions(self, excluded_rows: Iterable[int]) -> np.ndarray:
+        excluded = self._normalized_excluded_rows(excluded_rows)
+        if not hasattr(self, "state"):
+            return excluded
+        contacts = np.asarray(self.artifacts.contacts)
+        if contacts.shape != (len(self.features), 2):
+            raise ValueError("runtime contact table must have shape (rows, 2)")
+        active = np.asarray(contacts[self.state.row], dtype=np.bool_)
+        compatible = np.all(
+            np.asarray(contacts[self.searchable_rows], dtype=np.bool_) == active,
+            axis=1,
+        )
+        incompatible = self.searchable_rows[~compatible]
+        return np.union1d(excluded, incompatible).astype(np.int64, copy=False)
+
     @staticmethod
     def _exclude_rows(rows: np.ndarray, excluded: np.ndarray) -> np.ndarray:
         if not len(excluded):
@@ -553,7 +708,7 @@ class HybridMatcher:
         value = np.asarray(query, dtype=np.float64)
         if value.shape != (31,) or not np.isfinite(value).all():
             raise ValueError("search query must be one finite 31-D row")
-        excluded = self._normalized_excluded_rows(excluded_rows)
+        excluded = self._match_exclusions(excluded_rows)
         remaining = len(self.searchable_rows) - len(excluded)
         if remaining < 1:
             raise ValueError("candidate exclusions removed every searchable row")
@@ -582,7 +737,7 @@ class HybridMatcher:
         value = np.asarray(query, dtype=np.float64)
         if value.shape != (31,) or not np.isfinite(value).all():
             raise ValueError("search query must be one finite 31-D row")
-        excluded = self._normalized_excluded_rows(excluded_rows)
+        excluded = self._match_exclusions(excluded_rows)
         count = len(self.searchable_rows)
         if len(excluded) == count:
             raise ValueError("candidate exclusions removed every searchable row")
@@ -617,7 +772,7 @@ class HybridMatcher:
             scores = self._candidate_score(value, rows)
             row, best = self._best(rows, scores)
             if k == count:
-                return SearchResult(row, math.sqrt(max(best, 0.0)), len(rows))
+                return SearchResult(row, math.sqrt(max(best, 0.0)), count - len(excluded))
             # Every unseen feature distance is at least the kth distance. Strict
             # separation also proves that no omitted equal-distance row can win
             # the stable lowest-row tie break.
@@ -641,8 +796,8 @@ class HybridMatcher:
 
     def _command_query(self, command: CommandState, live_terrain: np.ndarray) -> np.ndarray:
         query = np.array(self.features[self.state.row], dtype=np.float64, copy=True)
-        horizons = np.asarray((8, 17, 25), dtype=np.float64) / FPS
-        speed = command.speed * MAX_SPEED_MPS
+        horizons = np.asarray(self.horizons, dtype=np.float64) / self.fps
+        speed = command.speed * self.walking_speed_p95_mps
         angular_speed = command.steering * 1.5
         future_yaw = angular_speed * horizons
         distance = speed * horizons
@@ -680,11 +835,16 @@ class HybridMatcher:
 
     def _preview_points(self, command: CommandState) -> np.ndarray:
         distances = np.asarray((0.25, 0.5, 0.75, 1.0), dtype=np.float64)
-        speed = command.speed * MAX_SPEED_MPS
+        speed = command.speed * self.walking_speed_p95_mps
         angular_speed = command.steering * 1.5
         if abs(speed) < 1.0e-8:
             signed_distance = distances
-            future_yaw = angular_speed * distances / MAX_SPEED_MPS
+            if self.walking_speed_p95_mps < 1.0e-8:
+                future_yaw = np.zeros_like(distances)
+            else:
+                future_yaw = (
+                    angular_speed * distances / self.walking_speed_p95_mps
+                )
         else:
             signed_distance = math.copysign(1.0, speed) * distances
             future_yaw = angular_speed * distances / abs(speed)
@@ -966,6 +1126,9 @@ class HybridMatcher:
             max_candidate_limit_rejections_per_step=(
                 self.state.max_candidate_limit_rejections_per_step
             ),
+            candidate_exhaustion_count=self.state.candidate_exhaustion_count,
+            candidate_exhausted=False,
+            candidate_retry_budget=self.candidate_retry_budget,
             pose_source=pose_source,
             support_height=float(support),
             support_status=support_status,
@@ -977,8 +1140,14 @@ class HybridMatcher:
             search_scope=self.search_scope,
             search_acceptance_eligible=self.search_acceptance_eligible,
             transition_penalty=self.transition_penalty,
+            fps=self.fps,
+            dt=self.dt,
+            horizons=self.horizons,
+            walking_speed_p95_mps=self.walking_speed_p95_mps,
+            root_motion_source="canonical-simulation-se2",
         )
         self.state = proposed
+        self._active_source_root = self._source_root_transform(int(row))
         return proposed
 
     def _commit_with_native_limit_retry(
@@ -989,11 +1158,22 @@ class HybridMatcher:
         search_distance: float,
         live_raw: np.ndarray,
         live_domain_supported: bool,
+        advance_source: bool = False,
+        command: CommandState | None = None,
     ) -> HybridRuntimeState:
         baseline = self.state
+        baseline_world = self._world_transform
+        baseline_source = self._active_source_root
         original_row = int(row)
         original_distance = float(search_distance)
         rejected: list[int] = []
+        if advance_source:
+            self._advance_world_to_source_row(int(row))
+            active_command = command or CommandState()
+            live_raw = self._preview_terrain(active_command)
+            live_domain_supported = self._preview_domain_supported(active_command)
+            query = np.array(query, dtype=np.float64, copy=True)
+            query[TERRAIN_INDICES] = self._normalize_terrain(live_raw)
         while True:
             try:
                 proposed = self._commit_row(
@@ -1007,24 +1187,48 @@ class HybridMatcher:
                 break
             except _NativeJointLimitError:
                 rejected.append(int(row))
-                searchable_rejections = self._normalized_excluded_rows(rejected)
+                self._set_world_transform(baseline_world)
+                self._active_source_root = baseline_source
+                searchable_rejections = self._match_exclusions(rejected)
                 exhausted = (
-                    len(rejected) >= MAX_NATIVE_LIMIT_CANDIDATE_REJECTIONS
+                    len(rejected) >= self.candidate_retry_budget
                     or len(searchable_rejections) == len(self.searchable_rows)
                 )
                 if exhausted:
-                    proposed = self._commit_row(
-                        original_row,
-                        query,
-                        search_distance=original_distance,
-                        live_raw=live_raw,
-                        live_domain_supported=live_domain_supported,
+                    if self._legacy_runtime:
+                        proposed = self._commit_row(
+                            original_row,
+                            query,
+                            search_distance=original_distance,
+                            live_raw=live_raw,
+                            live_domain_supported=live_domain_supported,
+                        )
+                        break
+                    proposed = replace(
+                        baseline,
+                        candidate_limit_rejection_count=(
+                            baseline.candidate_limit_rejection_count + len(rejected)
+                        ),
+                        first_candidate_limit_rejection_row=(
+                            baseline.first_candidate_limit_rejection_row
+                            if baseline.first_candidate_limit_rejection_row is not None
+                            else rejected[0]
+                        ),
+                        max_candidate_limit_rejections_per_step=max(
+                            baseline.max_candidate_limit_rejections_per_step,
+                            len(rejected),
+                        ),
+                        candidate_exhaustion_count=(
+                            baseline.candidate_exhaustion_count + 1
+                        ),
+                        candidate_exhausted=True,
                     )
+                    self.state = proposed
                     break
                 result = self.match(query, excluded_rows=searchable_rejections)
                 row = result.row
                 search_distance = result.distance
-        if rejected:
+        if rejected and not proposed.candidate_exhausted:
             proposed = replace(
                 proposed,
                 candidate_limit_rejection_count=(
@@ -1039,6 +1243,7 @@ class HybridMatcher:
                     baseline.max_candidate_limit_rejections_per_step,
                     len(rejected),
                 ),
+                candidate_exhausted=False,
             )
             self.state = proposed
         return proposed
@@ -1059,12 +1264,12 @@ class HybridMatcher:
         self,
         command: CommandState,
         *,
-        dt: float = DT,
+        dt: float | None = None,
         force_search: bool = False,
     ) -> HybridRuntimeState:
         if not isinstance(command, CommandState):
             raise TypeError("runtime command must be a CommandState")
-        elapsed = _finite_scalar(dt, "runtime dt")
+        elapsed = self.dt if dt is None else _finite_scalar(dt, "runtime dt")
         if elapsed <= 0.0:
             raise ValueError("runtime dt must be positive")
         snapshot = (
@@ -1074,22 +1279,10 @@ class HybridMatcher:
             self._elapsed_since_search,
             self._last_command,
             self._last_terrain_class,
+            self._world_transform,
+            self._active_source_root,
         )
         try:
-            yaw_delta = command.steering * 1.5 * elapsed
-            distance = command.speed * MAX_SPEED_MPS * elapsed
-            local_delta = self._arc_local(
-                np.asarray((distance,), np.float64),
-                np.asarray((yaw_delta,), np.float64),
-            )[0]
-            cosine, sine = math.cos(self._heading), math.sin(self._heading)
-            self._root_xy += (
-                cosine * local_delta[0] + sine * local_delta[1],
-                sine * local_delta[0] - cosine * local_delta[1],
-            )
-            self._heading = math.remainder(
-                self._heading + yaw_delta, 2.0 * math.pi
-            )
             live = self._preview_terrain(command)
             live_domain_supported = self._preview_domain_supported(command)
             terrain_class = self.terrain.terrain_class(live)
@@ -1120,7 +1313,22 @@ class HybridMatcher:
                 search_distance=distance,
                 live_raw=live,
                 live_domain_supported=live_domain_supported,
+                advance_source=not search,
+                command=command,
             )
+            if proposed.candidate_exhausted:
+                (
+                    _state,
+                    root_xy,
+                    self._heading,
+                    self._elapsed_since_search,
+                    self._last_command,
+                    self._last_terrain_class,
+                    self._world_transform,
+                    self._active_source_root,
+                ) = snapshot
+                self._root_xy[:] = root_xy
+                return proposed
             self._last_command = command
             self._last_terrain_class = terrain_class
             return proposed
@@ -1132,6 +1340,8 @@ class HybridMatcher:
                 self._elapsed_since_search,
                 self._last_command,
                 self._last_terrain_class,
+                self._world_transform,
+                self._active_source_root,
             ) = snapshot
             self._root_xy[:] = root_xy
             raise
@@ -1146,13 +1356,16 @@ class HybridMatcher:
             self._elapsed_since_search,
             self._last_command,
             self._last_terrain_class,
+            self._world_transform,
+            self._active_source_root,
         )
         try:
             self._elapsed_since_search = SEARCH_INTERVAL_S
             self._last_command = None
             self._last_terrain_class = None
-            self._root_xy[:] = self._initial_root_xy
-            self._heading = self._initial_heading
+            self._set_world_transform(
+                SE2Transform(self._initial_root_xy, self._initial_heading)
+            )
             live = self._preview_terrain(CommandState())
             live_domain_supported = self._preview_domain_supported(CommandState())
             query = np.array(self.features[0], dtype=np.float64, copy=True)
@@ -1185,6 +1398,8 @@ class HybridMatcher:
                 self._elapsed_since_search,
                 self._last_command,
                 self._last_terrain_class,
+                self._world_transform,
+                self._active_source_root,
             ) = snapshot
             self._root_xy[:] = root_xy
             raise
@@ -1210,7 +1425,7 @@ def _scripted_command(frame: int, frames: int) -> CommandState:
 def run_headless_smoke(
     matcher: HybridMatcher, *, frames: int = 1_000
 ) -> dict[str, object]:
-    """Exercise the 25 Hz matcher without importing MuJoCo or window packages."""
+    """Exercise the corpus-rate matcher without importing MuJoCo or windows."""
 
     if not isinstance(matcher, HybridMatcher):
         raise TypeError("headless smoke requires a HybridMatcher")
@@ -1229,6 +1444,7 @@ def run_headless_smoke(
     initial_decode_count = matcher.state.decode_count
     initial_fallback_count = matcher.state.fallback_count
     initial_joint_clamp_count = matcher.state.joint_clamp_count
+    initial_exhaustion_count = matcher.state.candidate_exhaustion_count
 
     row_families = matcher.family_ids[matcher.row_ranges[matcher.searchable_rows]]
     for family in np.unique(row_families):
@@ -1248,7 +1464,7 @@ def run_headless_smoke(
 
     parity_frames = {0, max(0, frames // 2)}
     for frame in range(frames):
-        state = matcher.step(_scripted_command(frame, frames), dt=DT)
+        state = matcher.step(_scripted_command(frame, frames), dt=matcher.dt)
         if not np.isfinite(state.qpos).all():
             raise RuntimeError(f"non-finite qpos at smoke frame {frame}")
         range_index = int(matcher.row_ranges[state.row])
@@ -1275,6 +1491,9 @@ def run_headless_smoke(
     joint_clamp_count = (
         matcher.state.joint_clamp_count - initial_joint_clamp_count
     )
+    candidate_exhaustion_count = (
+        matcher.state.candidate_exhaustion_count - initial_exhaustion_count
+    )
     canonical_fallback_count = max(
         0, fallback_count - joint_clamp_count
     )
@@ -1284,6 +1503,7 @@ def run_headless_smoke(
         (learned_decode_count > 0, "learned-decode-required"),
         (fallback_count == 0, "zero-fallback-required"),
         (joint_clamp_count == 0, "zero-native-limit-clamp-required"),
+        (candidate_exhaustion_count == 0, "zero-candidate-exhaustion-required"),
         (terrain_variance > 0.0, "nonflat-terrain-variance-required"),
         (parity_samples > 0 and parity_failures == 0, "tree-brute-parity"),
         (
@@ -1324,6 +1544,9 @@ def run_headless_smoke(
         "max_candidate_limit_rejections_per_step": (
             matcher.state.max_candidate_limit_rejections_per_step
         ),
+        "candidate_exhaustion_count": candidate_exhaustion_count,
+        "candidate_exhausted": matcher.state.candidate_exhausted,
+        "candidate_retry_budget": matcher.candidate_retry_budget,
         "terrain_variance": terrain_variance,
         "tree_brute_parity_samples": parity_samples,
         "tree_brute_parity_failures": parity_failures,
@@ -1343,6 +1566,11 @@ def run_headless_smoke(
         ),
         "search_view_sha256": matcher.search_view_sha256,
         "transition_penalty": matcher.transition_penalty,
+        "fps": matcher.fps,
+        "dt": matcher.dt,
+        "horizons": list(matcher.horizons),
+        "walking_speed_p95_mps": matcher.walking_speed_p95_mps,
+        "root_motion_source": "canonical-simulation-se2",
     }
 
 
@@ -1350,7 +1578,9 @@ __all__ = (
     "CommandState",
     "HybridMatcher",
     "HybridRuntimeState",
+    "SE2Transform",
     "SearchResult",
     "TerrainAuthority",
+    "compose_root_delta",
     "run_headless_smoke",
 )

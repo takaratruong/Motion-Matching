@@ -8,7 +8,9 @@ import numpy as np
 from mm_sonic.hybrid_terrain_lmm_runtime import (
     CommandState,
     HybridMatcher,
+    SE2Transform,
     TerrainAuthority,
+    compose_root_delta,
     run_headless_smoke,
 )
 
@@ -47,6 +49,36 @@ def _corpus(values: np.ndarray | None = None) -> SimpleNamespace:
         features=feature_set,
         family_ids=np.asarray((0, 1), dtype=np.int32),
         family_names=("flat", "hill"),
+    )
+
+
+def _motion_corpus() -> SimpleNamespace:
+    artifacts = ArtifactSet.empty(8, 31)
+    artifacts.range_starts = np.asarray((0, 4), dtype=np.int32)
+    artifacts.range_stops = np.asarray((4, 8), dtype=np.int32)
+    artifacts.rotations[..., 0] = 1.0
+    artifacts.positions[:, 0, 1] = 0.9
+    artifacts.positions[1, 0, 0] = 0.1
+    artifacts.positions[2, 0, 0] = 0.1
+    artifacts.positions[2, 0, 2] = 0.2
+    yaw = np.pi / 2.0
+    artifacts.rotations[2, 0] = (np.cos(yaw / 2.0), 0.0, np.sin(yaw / 2.0), 0.0)
+    artifacts.positions[3, 0, 2] = 0.3
+    artifacts.positions[4:, 0, 0] = 9.0
+    artifacts.contacts[:4] = (False, False)
+    artifacts.contacts[4:] = (True, False)
+    values = np.full((8, 31), 10.0, dtype=np.float32)
+    values[:4] = 0.0
+    values[:, 21:27] = np.tile((0.0, 1.0), 3)
+    return SimpleNamespace(
+        artifacts=artifacts,
+        features=FeatureSet(
+            values, np.zeros(31, np.float32), np.ones(31, np.float32)
+        ),
+        family_ids=np.asarray((0, 1), dtype=np.int32),
+        family_names=("flat", "hill"),
+        fps=10.0,
+        horizons=(2, 5, 10),
     )
 
 
@@ -105,6 +137,172 @@ def _limited_native_model() -> SimpleNamespace:
 
 
 class HybridTerrainRuntimeTests(unittest.TestCase):
+    def test_se2_composition_rotates_local_delta_and_wraps_yaw(self):
+        world = SE2Transform(np.asarray((2.0, -3.0)), np.pi / 2.0)
+
+        composed = compose_root_delta(
+            world, np.asarray((0.25, -0.5)), 3.0 * np.pi / 2.0
+        )
+
+        np.testing.assert_allclose(composed.xy, (2.5, -2.75), atol=1e-12)
+        self.assertAlmostEqual(composed.yaw, 0.0)
+        self.assertFalse(composed.xy.flags.writeable)
+
+    def test_successor_composes_canonical_root_and_yaw_exactly_once(self):
+        placements: list[tuple[np.ndarray, np.ndarray]] = []
+
+        def converter(decoded, simulation_position, simulation_rotation, model):
+            placements.append(
+                (
+                    np.array(simulation_position, copy=True),
+                    np.array(simulation_rotation, copy=True),
+                )
+            )
+            return _pose_converter(
+                decoded, simulation_position, simulation_rotation, model
+            )
+
+        matcher = HybridMatcher(
+            _motion_corpus(), _Generator(), TerrainAuthority.flat(),
+            pose_converter=converter, initial_root_xy=(2.0, -3.0),
+            initial_heading=0.25,
+        )
+        matcher._elapsed_since_search = 0.0
+        matcher._last_command = CommandState()
+        matcher._last_terrain_class = "flat"
+
+        first = matcher.step(CommandState(), dt=0.01)
+        second = matcher.step(CommandState(), dt=0.01)
+
+        np.testing.assert_allclose(
+            first.root_position_world[:2],
+            (2.0 + 0.1 * np.cos(0.25), -3.0 + 0.1 * np.sin(0.25)),
+            atol=1e-7,
+        )
+        expected = compose_root_delta(
+            SE2Transform(first.root_position_world[:2], first.heading),
+            np.asarray((0.0, -0.2)),
+            np.pi / 2.0,
+        )
+        np.testing.assert_allclose(second.root_position_world[:2], expected.xy, atol=1e-7)
+        self.assertAlmostEqual(second.heading, expected.yaw, places=7)
+        placed_yaw = 2.0 * np.arctan2(placements[-1][1][2], placements[-1][1][0])
+        self.assertAlmostEqual(placed_yaw, second.heading, delta=1e-6)
+
+    def test_search_jump_reanchors_source_without_root_teleport(self):
+        corpus = _motion_corpus()
+        corpus.artifacts.contacts[4:] = (False, False)
+        matcher = HybridMatcher(
+            corpus, _Generator(), TerrainAuthority.flat(),
+            pose_converter=_pose_converter, initial_root_xy=(1.0, 2.0),
+            initial_heading=-0.3,
+        )
+        before = matcher.state
+        query = np.asarray(matcher.features[6], dtype=np.float64)
+
+        selected = matcher.select_query(query)
+
+        self.assertEqual(selected.row, 4)
+        np.testing.assert_array_equal(
+            selected.root_position_world[:2], before.root_position_world[:2]
+        )
+        self.assertEqual(selected.heading, before.heading)
+
+    def test_yaw_alignment_is_shared_by_root_articulation_and_terrain_probes(self):
+        queried: list[np.ndarray] = []
+        placements: list[np.ndarray] = []
+        terrain = TerrainAuthority(
+            lambda xy: queried.append(np.array(xy, copy=True)) or float(xy[0]),
+            name="x-ramp",
+        )
+
+        def converter(decoded, simulation_position, simulation_rotation, model):
+            placements.append(np.array(simulation_rotation, copy=True))
+            return _pose_converter(
+                decoded, simulation_position, simulation_rotation, model
+            )
+
+        corpus = _motion_corpus()
+        corpus.artifacts.positions[1, 0] = corpus.artifacts.positions[0, 0]
+        corpus.artifacts.rotations[1, 0] = (
+            np.cos(np.pi / 4.0), 0.0, np.sin(np.pi / 4.0), 0.0
+        )
+        matcher = HybridMatcher(
+            corpus, _Generator(), terrain, pose_converter=converter,
+            initial_heading=0.2,
+        )
+        matcher._elapsed_since_search = 0.0
+        matcher._last_command = CommandState()
+        matcher._last_terrain_class = matcher.state.terrain_class
+        queried.clear()
+
+        state = matcher.step(CommandState(), dt=0.01)
+        points = matcher._preview_points(CommandState())
+
+        self.assertAlmostEqual(state.heading, 0.2 + np.pi / 2.0, places=7)
+        placed_yaw = 2.0 * np.arctan2(placements[-1][2], placements[-1][0])
+        self.assertAlmostEqual(placed_yaw, state.heading, places=7)
+        forward = points[0] - state.root_position_world[:2]
+        np.testing.assert_allclose(
+            forward / np.linalg.norm(forward),
+            (np.sin(state.heading), -np.cos(state.heading)),
+            atol=1e-7,
+        )
+        self.assertTrue(queried)
+
+    def test_stationary_corpus_does_not_move_for_nonzero_command(self):
+        corpus = _motion_corpus()
+        corpus.artifacts.positions[:, 0, (0, 2)] = 0.0
+        matcher = HybridMatcher(
+            corpus, _Generator(), TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+        )
+        matcher._elapsed_since_search = 0.0
+        matcher._last_command = CommandState(speed=1.0)
+        matcher._last_terrain_class = "flat"
+
+        state = matcher.step(CommandState(speed=1.0), dt=matcher.dt)
+
+        np.testing.assert_array_equal(state.root_position_world[:2], (0.0, 0.0))
+
+    def test_rate_horizons_and_command_speed_come_from_corpus(self):
+        matcher = HybridMatcher(
+            _motion_corpus(), _Generator(), TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+        )
+
+        query = matcher._command_query(CommandState(speed=1.0), np.zeros(4))
+
+        expected_p95 = np.percentile((1.0, 2.0, np.sqrt(2.0), 0.0, 0.0, 0.0), 95)
+        self.assertEqual(matcher.fps, 10.0)
+        self.assertEqual(matcher.dt, 0.1)
+        self.assertEqual(matcher.horizons, (2, 5, 10))
+        self.assertAlmostEqual(matcher.walking_speed_p95_mps, expected_p95)
+        np.testing.assert_allclose(
+            query[15:21:2], 0.0, atol=1e-7
+        )
+        np.testing.assert_allclose(
+            query[16:21:2], expected_p95 * np.asarray((0.2, 0.5, 1.0)),
+            atol=1e-7,
+        )
+
+    def test_contact_bits_are_a_hard_exact_match_filter(self):
+        corpus = _motion_corpus()
+        corpus.features.values[1:4] = 0.1
+        corpus.features.values[4] = 0.0
+        matcher = HybridMatcher(
+            corpus, _Generator(), TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+        )
+        query = np.zeros(31, dtype=np.float64)
+
+        tree = matcher.match(query, excluded_rows={0})
+        brute = matcher.brute_force_match(query, excluded_rows={0})
+
+        self.assertEqual(tree.row, 1)
+        self.assertEqual(brute.row, 1)
+        self.assertAlmostEqual(tree.distance, brute.distance, places=12)
+
     def test_finite_terrain_root_domain_miss_bypasses_learned_decode(self):
         generator = _Generator()
         terrain = TerrainAuthority(
@@ -325,7 +523,7 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
             (("flat", 1), ("curb", 13), ("slope", 13), ("stair", 13)),
         )
 
-    def test_holden_forward_basis_moves_and_samples_native_negative_y(self):
+    def test_command_shapes_query_without_dragging_stationary_source_root(self):
         terrain = TerrainAuthority(
             lambda xy: -float(np.asarray(xy)[1]), name="native-negative-y-ramp"
         )
@@ -335,7 +533,7 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
 
         state = matcher.step(CommandState(speed=1.0), dt=0.04, force_search=True)
 
-        self.assertAlmostEqual(state.root_position_world[1], -0.45 * 0.04)
+        self.assertAlmostEqual(state.root_position_world[1], 0.0)
         self.assertAlmostEqual(state.qpos[1], state.root_position_world[1])
         np.testing.assert_allclose(
             state.query[15:21], (0.0, 0.45 * 0.32, 0.0, 0.45 * 0.68, 0.0, 0.45),
@@ -431,7 +629,7 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         np.testing.assert_allclose(ramp.sample((0.3, 1.2), 0.0), (-0.05, -0.1, -0.15, -0.2))
         self.assertNotEqual(ramp.support((0.3, 1.2)), raised.support((0.3, 1.2)))
 
-    def test_normalized_full_speed_is_scaled_to_point_45_meters_per_second(self):
+    def test_legacy_full_speed_query_retains_point_45_meter_per_second_scale(self):
         matcher = HybridMatcher(
             _corpus(), _Generator(), TerrainAuthority.flat(),
             pose_converter=_pose_converter,
@@ -439,7 +637,7 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
 
         state = matcher.step(CommandState(speed=1.0), dt=0.04, force_search=True)
 
-        self.assertAlmostEqual(state.root_position_world[1], -0.45 * 0.04)
+        self.assertAlmostEqual(state.root_position_world[1], 0.0)
         np.testing.assert_allclose(
             state.query[15:21], (0.0, 0.45 * 0.32, 0.0, 0.45 * 0.68, 0.0, 0.45),
             atol=1e-7,
@@ -589,7 +787,7 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         self.assertEqual(state.first_candidate_limit_rejection_row, 1)
         self.assertEqual(state.max_candidate_limit_rejections_per_step, 1)
 
-    def test_native_limit_retry_budget_preserves_original_fail_safe(self):
+    def test_native_limit_retry_exhaustion_holds_complete_previous_state(self):
         rows = 40
         artifacts = ArtifactSet.empty(rows, 31)
         artifacts.range_starts = np.asarray((0,), dtype=np.int32)
@@ -605,6 +803,9 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
             ),
             family_ids=np.asarray((0,), dtype=np.int32),
             family_names=("flat",),
+            candidate_retry_budget=4,
+            fps=60.0,
+            horizons=(20, 40, 60),
         )
 
         class AlwaysInvalidGenerator(_Generator):
@@ -617,40 +818,77 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
             corpus, AlwaysInvalidGenerator(rows), TerrainAuthority.flat(),
             native_model=_limited_native_model(), pose_converter=_pose_converter,
         )
+        before = matcher.state
+        before_root = matcher._root_xy.copy()
+        before_heading = matcher._heading
+        before_elapsed = matcher._elapsed_since_search
+        before_command = matcher._last_command
+        before_terrain_class = matcher._last_terrain_class
 
-        state = matcher.select_query(np.zeros(31, dtype=np.float64))
+        state = matcher.step(
+            CommandState(speed=1.0, steering=0.5),
+            dt=matcher.dt,
+            force_search=True,
+        )
 
-        self.assertEqual(state.row, 0)
-        self.assertEqual(state.pose_source, "canonical-fallback")
-        self.assertEqual(state.decode_count, 0)
-        self.assertEqual(state.fallback_count, 1)
-        self.assertEqual(state.joint_clamp_count, 0)
-        self.assertEqual(state.candidate_limit_rejection_count, 32)
+        self.assertEqual(state.row, before.row)
+        np.testing.assert_array_equal(state.qpos, before.qpos)
+        np.testing.assert_array_equal(state.query, before.query)
+        np.testing.assert_array_equal(state.root_position_world, before.root_position_world)
+        np.testing.assert_array_equal(matcher._root_xy, before_root)
+        self.assertEqual(matcher._heading, before_heading)
+        self.assertEqual(matcher._elapsed_since_search, before_elapsed)
+        self.assertEqual(matcher._last_command, before_command)
+        self.assertEqual(matcher._last_terrain_class, before_terrain_class)
+        self.assertEqual(state.pose_source, before.pose_source)
+        self.assertEqual(state.decode_count, before.decode_count)
+        self.assertEqual(state.fallback_count, before.fallback_count)
+        self.assertEqual(state.joint_clamp_count, before.joint_clamp_count)
+        self.assertTrue(state.candidate_exhausted)
+        self.assertEqual(state.candidate_exhaustion_count, 1)
+        self.assertEqual(state.candidate_retry_budget, 4)
+        self.assertEqual(state.candidate_limit_rejection_count, 4)
         self.assertEqual(state.first_candidate_limit_rejection_row, 0)
-        self.assertEqual(state.max_candidate_limit_rejections_per_step, 32)
+        self.assertEqual(state.max_candidate_limit_rejections_per_step, 4)
 
-    def test_joint_invalid_learned_and_canonical_clamps_only_canonical_hinges(self):
+    def test_explicit_25hz_corpus_retains_legacy_retry_fallback(self):
+        corpus = _corpus()
+        corpus.fps = 25.0
+        corpus.horizons = (8, 17, 25)
         matcher = HybridMatcher(
-            _corpus(), _Generator(), TerrainAuthority.flat(),
+            corpus, _Generator(), TerrainAuthority.flat(),
             native_model=_limited_native_model(), pose_converter=_pose_converter,
         )
 
         state = matcher.select_query(np.asarray(matcher.features[1], np.float64))
 
-        self.assertEqual(state.row, 1)
+        self.assertFalse(state.candidate_exhausted)
+        self.assertEqual(state.candidate_exhaustion_count, 0)
         self.assertEqual(state.pose_source, "canonical-fallback-joint-clamped")
         self.assertEqual(state.fallback_count, 1)
         self.assertEqual(state.joint_clamp_count, 1)
-        self.assertAlmostEqual(state.max_joint_clamp_magnitude, 0.5)
+
+    def test_retry_exhaustion_never_uses_canonical_clamp(self):
+        corpus = _corpus()
+        corpus.fps = 60.0
+        corpus.horizons = (20, 40, 60)
+        matcher = HybridMatcher(
+            corpus, _Generator(), TerrainAuthority.flat(),
+            native_model=_limited_native_model(), pose_converter=_pose_converter,
+        )
+
+        state = matcher.select_query(np.asarray(matcher.features[1], np.float64))
+
+        self.assertEqual(state.row, 0)
+        self.assertTrue(state.candidate_exhausted)
+        self.assertEqual(state.candidate_exhaustion_count, 1)
+        self.assertEqual(state.fallback_count, 0)
+        self.assertEqual(state.joint_clamp_count, 0)
+        self.assertAlmostEqual(state.max_joint_clamp_magnitude, 0.0)
         self.assertEqual(state.candidate_limit_rejection_count, 6)
         self.assertEqual(state.first_candidate_limit_rejection_row, 1)
         self.assertEqual(state.max_candidate_limit_rejections_per_step, 6)
-        self.assertAlmostEqual(state.qpos[7], 0.5)
-        np.testing.assert_allclose(
-            state.qpos[:7],
-            state.root_position_world.tolist() + [1.0, 0.0, 0.0, 0.0],
-            atol=1e-7,
-        )
+        self.assertAlmostEqual(state.qpos[7], 0.0)
 
     def test_canonical_joint_clamp_does_not_hide_invalid_root_step(self):
         fail_root = [False]
@@ -662,12 +900,14 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
                 qpos[0] += 2.0
             return qpos
 
+        generator = _Generator()
         matcher = HybridMatcher(
-            _corpus(), _Generator(), TerrainAuthority.flat(),
+            _corpus(), generator, TerrainAuthority.flat(),
             native_model=_limited_native_model(), pose_converter=converter,
         )
         before = matcher.state
         fail_root[0] = True
+        generator.invalid = True
 
         with self.assertRaisesRegex(ValueError, "root exceeded"):
             matcher.select_query(np.asarray(matcher.features[1], np.float64))
@@ -800,6 +1040,10 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         self.assertEqual(receipt["searchable_row_count"], len(matcher.searchable_rows))
         self.assertEqual(len(receipt["search_view_sha256"]), 64)
         self.assertEqual(receipt["transition_penalty"], 0.1)
+        self.assertEqual(receipt["root_motion_source"], "canonical-simulation-se2")
+        self.assertEqual(receipt["fps"], matcher.fps)
+        self.assertEqual(receipt["dt"], matcher.dt)
+        self.assertEqual(receipt["candidate_exhaustion_count"], 0)
         self.assertEqual(receipt["candidate_limit_rejection_count"], 0)
         self.assertIsNone(receipt["first_candidate_limit_rejection_row"])
         self.assertEqual(receipt["max_candidate_limit_rejections_per_step"], 0)
