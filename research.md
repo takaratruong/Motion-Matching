@@ -2617,3 +2617,14 @@ the 14 visually admitted rough/curb/slope sources and their scene mirrors: 26
 of 28 pass unchanged mechanics/contact/arm gates.  The clip-13 source and its
 mirror remain excluded because the reversed source retains excessive arm
 excursion; no threshold was loosened to force them into the bank.
+
+The first generated `natural_terrain_gold_v1` manifest now contains 54 paired
+motion/terrain assets: 14 natural sources admitted by 5 fps dense review, 14
+independently audited exact scene mirrors, and 26 exact time reversals.  It
+contains about 8.98 minutes of command-labelled kinematics at median moving
+speeds from 0.424 to 0.931 m/s.  Every row points to its exact terrain and
+records contact, collision, smoothness, command, and construction provenance.
+This tranche supplies natural forward and exact backward/rear-diagonal rough,
+curb, and slope motion, but it does not pretend to solve genuine lateral or
+50-degree terrain gait; those spatial cases still require admitted natural
+stair phrases from the continuing source screen.
