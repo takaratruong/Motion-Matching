@@ -25,22 +25,12 @@ from resources.g1_terrain_builder.database import (
 )
 from resources.g1_terrain_builder.features import _NORMALIZATION_WEIGHTS
 from resources.g1_terrain_builder.resample import resample_map
-from resources.g1_terrain_builder.scenes import (
-    COORDINATE_SIGNATURE,
-    SceneDefinition,
-    SceneRoute,
-    build_scene,
-)
 from resources.g1_terrain_builder.schema import (
     G1_SKELETON_NAMES,
     G1_SKELETON_PARENTS,
     G1_SKELETON_SIGNATURE,
     ArtifactSet,
     FeatureSet,
-)
-from resources.g1_terrain_builder.terrain import (
-    FlatTerrain,
-    surface_semantics_signature,
 )
 
 from .full_walking_terrain_lmm_contracts import (
@@ -70,6 +60,10 @@ SCENE_IDS = (
     "grail-curb-default",
     "ramp-10-up-down",
     "stairs-standard",
+)
+COORDINATE_SIGNATURE = "holden-y-up-right-handed-forward-plus-z"
+SURFACE_SEMANTICS_SIGNATURE = (
+    "f151c2b1c7f0498880f76c37f48a47c46c48bcf58c1285863fabc9a09fd7993a"
 )
 DEFAULT_SCENE_AUTHORITY = Path(
     "/home/ubuntu/projects/motion-matching/resources/g1_terrain_banks_candidate"
@@ -954,7 +948,16 @@ def _root_deltas_for_range(
     return delta_xy, delta_yaw
 
 
-def _flat_scene_definition() -> SceneDefinition:
+def surface_semantics_signature() -> str:
+    """Return the frozen terrain ABI without importing build-only USD modules."""
+
+    return SURFACE_SEMANTICS_SIGNATURE
+
+
+def _flat_scene_definition() -> Any:
+    from resources.g1_terrain_builder.scenes import SceneDefinition, SceneRoute
+    from resources.g1_terrain_builder.terrain import FlatTerrain
+
     return SceneDefinition(
         scene_id="flat-standard",
         label="Flat Standard",
@@ -1085,6 +1088,8 @@ def _scene_pack_snapshot(
         descriptor = descriptor_by_id.get(scene_id)
         scene_root = scenes_root / scene_id
         if descriptor is None and scene_id == "flat-standard":
+            from resources.g1_terrain_builder.scenes import build_scene
+
             built = build_scene(_flat_scene_definition())
             payloads.append(
                 _ScenePayload(

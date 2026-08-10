@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
+import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -243,6 +247,39 @@ def _easy_green_corpus() -> SimpleNamespace:
 
 
 class FullWalkingTrainingContractTests(unittest.TestCase):
+    def test_cuda_training_import_does_not_require_build_only_usd(self) -> None:
+        script = textwrap.dedent(
+            """
+            import importlib.abc
+            import sys
+
+            class BlockPXR(importlib.abc.MetaPathFinder):
+                def find_spec(self, fullname, path=None, target=None):
+                    if fullname == "pxr" or fullname.startswith("pxr."):
+                        raise ModuleNotFoundError("blocked build-only pxr dependency")
+                    return None
+
+            sys.meta_path.insert(0, BlockPXR())
+            import mm_sonic.full_walking_terrain_lmm_corpus
+            """
+        )
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = os.pathsep.join(
+            (
+                str(Path.cwd()),
+                str(Path.cwd() / "resources"),
+                str(Path.cwd() / "sonic/python"),
+            )
+        )
+        subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=Path.cwd(),
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
     def test_exact_60_hz_abi_and_hash_authorities_are_required(self) -> None:
         corpus = _synthetic_full_corpus()
         validated = validate_full_walking_corpus(corpus)
