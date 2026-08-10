@@ -505,6 +505,32 @@ class FullWalkingTerrainLmmCorpusTests(unittest.TestCase):
                     scene_authority=scenes,
                 )
 
+    def test_assembly_requires_source_local_map_bounds_for_every_range(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory, ledger, lanes, scenes = self._fixture(root)
+            lane = lanes[0]
+            ranges_path = lane / "ranges.json"
+            ranges = json.loads(ranges_path.read_text())
+            ranges[0]["authority"].pop("source_frame_count")
+            ranges_path.write_bytes(canonical_json_bytes(ranges))
+            manifest = json.loads((lane / "manifest.json").read_text())
+            manifest["members"][ranges_path.name] = {
+                "path": ranges_path.name,
+                "size_bytes": ranges_path.stat().st_size,
+                "sha256": sha256_file(ranges_path),
+            }
+            (lane / "manifest.json").write_bytes(canonical_json_bytes(manifest))
+
+            with self.assertRaisesRegex(ValueError, "source frame count|source map"):
+                assemble_full_corpus(
+                    lanes,
+                    root / "corpus",
+                    inventory=inventory,
+                    split_ledger=ledger,
+                    scene_authority=scenes,
+                )
+
     def test_verify_recomputes_features_dynamics_contacts_and_split_metadata(self):
         mutations = (
             ("raw_features.npy", (0, 0), np.float32(5.0), "raw feature"),

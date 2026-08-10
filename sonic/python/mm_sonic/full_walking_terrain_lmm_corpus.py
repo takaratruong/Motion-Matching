@@ -529,15 +529,22 @@ def _verify_lane_contents(
         left = lane.source_left_indices[start:stop]
         right = lane.source_right_indices[start:stop]
         alpha = lane.source_alpha[start:stop]
+        source_frame_count = record.authority.get("source_frame_count")
         if (
-            np.any(left < 0)
+            type(source_frame_count) is not int
+            or source_frame_count < 1
+            or np.any(left < 0)
             or np.any(left > right)
+            or np.any(right >= source_frame_count)
             or np.any(np.diff(left.astype(np.int64)) < 0)
             or np.any(np.diff(right.astype(np.int64)) < 0)
             or np.any(alpha < 0.0)
             or np.any(alpha > 1.0)
         ):
-            raise ValueError("lane source map is not monotone range-local provenance")
+            raise ValueError(
+                "lane source map requires an exact source frame count and bounded, "
+                "monotone source-local provenance"
+            )
         source_map = record.authority.get("source_map")
         if isinstance(source_map, Mapping):
             expected_map = {
