@@ -65,7 +65,7 @@ git commit -m "feat: add preliminary slope visual v2"
 - [ ] **Step 2: Launch exactly once.**
 
 ```bash
-CUDA_VISIBLE_DEVICES=3 CUBLAS_WORKSPACE_CONFIG=:4096:8 PYTHONPATH=.:resources:sonic/python /home/ubuntu/miniconda3/envs/foundation_stereo/bin/python -m mm_sonic.preliminary_learned_slope train-v2 --output sonic/runs/g1-lmm-authored-slope-preliminary/model-v2-visual
+CUDA_VISIBLE_DEVICES=3 CUBLAS_WORKSPACE_CONFIG=:4096:8 PYTHONPATH=.:resources:sonic/python /home/ubuntu/miniconda3/envs/foundation_stereo/bin/python -c 'import numpy, torch, sys, runpy; sys.path.append("/home/ubuntu/miniconda3/envs/diffsim/lib/python3.11/site-packages"); sys.argv=["preliminary_learned_slope", "train-v2", "--output", "sonic/runs/g1-lmm-authored-slope-preliminary/model-v2-visual"]; runpy.run_module("mm_sonic.preliminary_learned_slope", run_name="__main__")'
 ```
 
 - [ ] **Step 3: Verify the terminal receipt.** Require exact bindings, no projector, V2 decompressor acceptance, stepper acceptance, full 595-row rollout acceptance, and exact artifact tree. Any rejection ends the visual experiment with no retry.
