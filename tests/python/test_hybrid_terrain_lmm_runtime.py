@@ -377,6 +377,19 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         self.assertEqual(brute.row, 1)
         self.assertAlmostEqual(tree.distance, brute.distance, places=12)
 
+    def test_contact_exclusions_do_not_resort_when_caller_exclusions_are_empty(
+        self,
+    ):
+        matcher = HybridMatcher(
+            _motion_corpus(),
+            _Generator(),
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+        )
+        with mock.patch("numpy.union1d", side_effect=AssertionError("redundant sort")):
+            result = matcher.match(np.zeros(31, np.float64))
+        self.assertEqual(result.row, matcher.brute_force_match(np.zeros(31)).row)
+
     def test_finite_terrain_root_domain_miss_bypasses_learned_decode(self):
         generator = _Generator()
         terrain = TerrainAuthority(

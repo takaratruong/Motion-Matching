@@ -701,6 +701,8 @@ class HybridMatcher:
             axis=1,
         )
         incompatible = self.searchable_rows[~compatible]
+        if not len(excluded):
+            return incompatible.astype(np.int64, copy=False)
         return np.union1d(excluded, incompatible).astype(np.int64, copy=False)
 
     @staticmethod
