@@ -17,14 +17,11 @@ from resources.g1_terrain_builder.artifacts import canonical_json_bytes
 
 ROOTS = {
     "bank": Path(
-        "/home/ubuntu/projects/motion-matching/resources/"
-        "g1_terrain_banks_candidate"
+        "/home/ubuntu/projects/motion-matching/resources/g1_terrain_banks_candidate"
     ),
     "pfnn_root": Path("/home/ubuntu/datasets/pfnn/pfnn"),
     "grail_root": Path("/home/ubuntu/datasets/GRAIL/data"),
-    "takara": Path(
-        "/home/ubuntu/Downloads/takara_walk_50hz.npz_v0/motion.npz"
-    ),
+    "takara": Path("/home/ubuntu/Downloads/takara_walk_50hz.npz_v0/motion.npz"),
 }
 
 
@@ -50,10 +47,14 @@ class FullWalkingTerrainLmmInventoryTests(unittest.TestCase):
         self.assertRegex(inventory.build_id, r"^[0-9a-f]{64}$")
         self.assertRegex(inventory.manifest_sha256, r"^[0-9a-f]{64}$")
 
-        pfnn = [record for record in inventory.sources if record.authority["kind"] == "pfnn"]
+        pfnn = [
+            record for record in inventory.sources if record.authority["kind"] == "pfnn"
+        ]
         self.assertEqual(sum(record.mirror_of is not None for record in pfnn), 40)
         source_ids = {record.source_id for record in inventory.sources}
-        self.assertTrue(all(record.mirror_of in source_ids for record in pfnn if record.mirror_of))
+        self.assertTrue(
+            all(record.mirror_of in source_ids for record in pfnn if record.mirror_of)
+        )
 
         grail_categories = {
             record.authority["category"]
@@ -66,7 +67,11 @@ class FullWalkingTerrainLmmInventoryTests(unittest.TestCase):
             re.IGNORECASE,
         )
         self.assertFalse(
-            [record.source_id for record in pfnn if excluded_pfnn_identity.search(record.source_id)]
+            [
+                record.source_id
+                for record in pfnn
+                if excluded_pfnn_identity.search(record.source_id)
+            ]
         )
 
         payload = inventory_manifest_bytes(inventory)

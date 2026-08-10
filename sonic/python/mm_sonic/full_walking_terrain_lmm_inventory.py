@@ -43,14 +43,27 @@ EXPECTED_GRAIL_COUNTS = {
 EXPECTED_PFNN_IDENTITIES = 80
 EXPECTED_IDENTITIES = 15_918
 _GRAIL_INPUTS = {
-    "curb": (("robot", ".pkl"), ("object_usd", ".usd"), ("objects", ".pkl"),
-             ("recon", ".pkl"), ("meta", ".pkl")),
-    "slope": (("robot", ".pkl"), ("object_usd", ".usd"), ("objects", ".pkl"),
-              ("recon", ".pkl"), ("meta", ".pkl")),
-    "stair_p1": (("robot", ".pkl"), ("object_usd", ".usd"),
-                 ("objects", ".pkl"), ("meta", ".pkl")),
-    "stair_p2": (("robot", ".pkl"), ("object_usd", ".usd"),
-                 ("objects", ".pkl")),
+    "curb": (
+        ("robot", ".pkl"),
+        ("object_usd", ".usd"),
+        ("objects", ".pkl"),
+        ("recon", ".pkl"),
+        ("meta", ".pkl"),
+    ),
+    "slope": (
+        ("robot", ".pkl"),
+        ("object_usd", ".usd"),
+        ("objects", ".pkl"),
+        ("recon", ".pkl"),
+        ("meta", ".pkl"),
+    ),
+    "stair_p1": (
+        ("robot", ".pkl"),
+        ("object_usd", ".usd"),
+        ("objects", ".pkl"),
+        ("meta", ".pkl"),
+    ),
+    "stair_p2": (("robot", ".pkl"), ("object_usd", ".usd"), ("objects", ".pkl")),
 }
 _TRIAL_SUFFIX = re.compile(r"__\d+$")
 
@@ -71,7 +84,9 @@ def _descriptor(path: Path, *, root: Path) -> dict[str, Any]:
     try:
         relative = path.relative_to(root)
     except ValueError as error:
-        raise ValueError(f"source descriptor escapes its authority root: {path}") from error
+        raise ValueError(
+            f"source descriptor escapes its authority root: {path}"
+        ) from error
     return {
         "path": relative.as_posix(),
         "size_bytes": path.stat().st_size,
@@ -99,11 +114,13 @@ def _strict_bank_descriptor(bank: Path) -> dict[str, Any]:
         decoded = json.loads(manifest_path.read_bytes())
     if digest != STRICT_BANK_MANIFEST_SHA256:
         raise ValueError("strict bank manifest SHA-256 mismatch")
-    if decoded.get("schema") != "g1-terrain-artifacts/v3" \
-            or decoded.get("database_frames") != 3_970_932 \
-            or decoded.get("total_clips") != 15_815 \
-            or decoded.get("grail_clips") != 15_814 \
-            or decoded.get("skipped_clips") != 23:
+    if (
+        decoded.get("schema") != "g1-terrain-artifacts/v3"
+        or decoded.get("database_frames") != 3_970_932
+        or decoded.get("total_clips") != 15_815
+        or decoded.get("grail_clips") != 15_814
+        or decoded.get("skipped_clips") != 23
+    ):
         raise ValueError("strict bank manifest cardinality contract changed")
     return {
         "path": "manifest.json",
@@ -127,8 +144,10 @@ def _pfnn_source_paths(source_table: Path) -> tuple[str, ...]:
     if type(values) is not list or not all(type(value) is str for value in values):
         raise ValueError("PFNN source table has no literal data_terrain list")
     normalized = tuple(Path(value).as_posix().removeprefix("./") for value in values)
-    if len(normalized) != EXPECTED_PFNN_IDENTITIES \
-            or len(set(normalized)) != EXPECTED_PFNN_IDENTITIES:
+    if (
+        len(normalized) != EXPECTED_PFNN_IDENTITIES
+        or len(set(normalized)) != EXPECTED_PFNN_IDENTITIES
+    ):
         raise ValueError("PFNN source table must name exactly 80 unique identities")
     return normalized
 
@@ -138,16 +157,26 @@ def _pfnn_semantics(stem: str) -> str:
         return "jumpy"
     if any(name in stem for name in ("NewCaptures01_000", "NewCaptures02_000")):
         return "flat"
-    if any(name in stem for name in (
-        "NewCaptures03_000", "NewCaptures03_001", "NewCaptures03_002",
-        "NewCaptures04_000",
-    )):
+    if any(
+        name in stem
+        for name in (
+            "NewCaptures03_000",
+            "NewCaptures03_001",
+            "NewCaptures03_002",
+            "NewCaptures04_000",
+        )
+    ):
         return "jumpy"
     if "WalkingUpSteps06_000" in stem:
         return "beam"
-    if any(name in stem for name in (
-        "WalkingUpSteps09_000", "WalkingUpSteps10_000", "WalkingUpSteps11_000",
-    )):
+    if any(
+        name in stem
+        for name in (
+            "WalkingUpSteps09_000",
+            "WalkingUpSteps10_000",
+            "WalkingUpSteps11_000",
+        )
+    ):
         return "flat"
     if "Flat" in stem:
         return "flat"
@@ -158,8 +187,10 @@ def _pfnn_records(pfnn_root: Path) -> list[SourceRecord]:
     root = Path(pfnn_root).resolve(strict=True)
     source_table = _regular_file(root / "generate_database.py", "PFNN source table")
     table_descriptor = _descriptor(source_table, root=root)
-    if table_descriptor["sha256"] != PFNN_SOURCE_TABLE_SHA256 \
-            or table_descriptor["size_bytes"] != 21_707:
+    if (
+        table_descriptor["sha256"] != PFNN_SOURCE_TABLE_SHA256
+        or table_descriptor["size_bytes"] != 21_707
+    ):
         raise ValueError("PFNN source table authority changed")
     records: list[SourceRecord] = []
     source_paths = _pfnn_source_paths(source_table)
@@ -262,17 +293,21 @@ def build_inventory(
     """Hash source descriptors and freeze the exact 15,918-identity ledger."""
 
     bank_descriptor = _strict_bank_descriptor(bank)
-    sources = tuple(sorted(
-        [
-            *_pfnn_records(pfnn_root),
-            *_grail_records(grail_root, bank_descriptor),
-            _takara_record(takara),
-        ],
-        key=lambda record: record.source_id,
-    ))
+    sources = tuple(
+        sorted(
+            [
+                *_pfnn_records(pfnn_root),
+                *_grail_records(grail_root, bank_descriptor),
+                _takara_record(takara),
+            ],
+            key=lambda record: record.source_id,
+        )
+    )
     kinds = Counter(record.authority["kind"] for record in sources)
-    if kinds != {"pfnn": 80, "grail": 15_837, "takara": 1} \
-            or len(sources) != EXPECTED_IDENTITIES:
+    if (
+        kinds != {"pfnn": 80, "grail": 15_837, "takara": 1}
+        or len(sources) != EXPECTED_IDENTITIES
+    ):
         raise ValueError("full walking inventory cardinality contract changed")
     identity_payload = _inventory_identity_bytes(sources)
     build_id = hashlib.sha256(identity_payload).hexdigest()
@@ -323,14 +358,21 @@ def load_inventory(
         raise ValueError("walking inventory is not UTF-8 JSON") from error
     if canonical_json_bytes(value) != payload:
         raise ValueError("walking inventory is not canonical JSON")
-    if type(value) is not dict or set(value) != {"schema", "build_id", "sources"} \
-            or value["schema"] != INVENTORY_SCHEMA \
-            or type(value["sources"]) is not list:
+    if (
+        type(value) is not dict
+        or set(value) != {"schema", "build_id", "sources"}
+        or value["schema"] != INVENTORY_SCHEMA
+        or type(value["sources"]) is not list
+    ):
         raise ValueError("walking inventory has invalid schema or keys")
     records = []
     expected_keys = {
-        "source_id", "canonical_source_id", "terrain_id", "mirror_of",
-        "family", "authority",
+        "source_id",
+        "canonical_source_id",
+        "terrain_id",
+        "mirror_of",
+        "family",
+        "authority",
     }
     for item in value["sources"]:
         if type(item) is not dict or set(item) != expected_keys:
@@ -340,11 +382,12 @@ def load_inventory(
     sources = tuple(records)
     kinds = Counter(record.authority.get("kind") for record in sources)
     families = Counter(record.family for record in sources)
-    if len(sources) != EXPECTED_IDENTITIES \
-            or kinds != {"pfnn": 80, "grail": 15_837, "takara": 1} \
-            or families != {"flat": 81, "curb": 1_769, "slope": 1_880,
-                            "stair": 12_188} \
-            or sum(record.mirror_of is not None for record in sources) != 40:
+    if (
+        len(sources) != EXPECTED_IDENTITIES
+        or kinds != {"pfnn": 80, "grail": 15_837, "takara": 1}
+        or families != {"flat": 81, "curb": 1_769, "slope": 1_880, "stair": 12_188}
+        or sum(record.mirror_of is not None for record in sources) != 40
+    ):
         raise ValueError("walking inventory exact cardinality/family contract changed")
     expected_build_id = hashlib.sha256(_inventory_identity_bytes(sources)).hexdigest()
     if value["build_id"] != expected_build_id:
@@ -374,9 +417,7 @@ def _publish_file_exclusive(payload: bytes, output: Path) -> Path:
             stream.flush()
             os.fsync(stream.fileno())
         os.link(staging, output)
-        directory = os.open(
-            output.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-        )
+        directory = os.open(output.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
             os.fsync(directory)
         finally:
@@ -436,11 +477,13 @@ def main(argv: list[str] | None = None) -> int:
             except BaseException:
                 arguments.output.unlink(missing_ok=True)
                 raise
-            result.update({
-                "split_path": str(arguments.split_output.resolve()),
-                "split_manifest_sha256": hashlib.sha256(split_payload).hexdigest(),
-                "assignments": len(ledger.assignments),
-            })
+            result.update(
+                {
+                    "split_path": str(arguments.split_output.resolve()),
+                    "split_manifest_sha256": hashlib.sha256(split_payload).hexdigest(),
+                    "assignments": len(ledger.assignments),
+                }
+            )
     else:
         inventory = load_inventory(arguments.inventory)
         ledger = build_split_ledger(

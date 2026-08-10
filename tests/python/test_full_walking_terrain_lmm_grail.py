@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-import unittest
 import tempfile
+import unittest
 from pathlib import Path
 
 import numpy as np
 from mm_sonic.full_walking_terrain_lmm_grail import (
-    _publish_directory_exclusive,
     _canonical_lane_artifacts,
+    _publish_directory_exclusive,
     _reconstruct_inherited_terrain_channels,
-    _terrain_grid_from_four_features,
     _resample_quaternions_vectorized,
+    _terrain_grid_from_four_features,
     authenticate_broad_bank,
     load_inherited_grail_work,
     missing_slope_source_ids,

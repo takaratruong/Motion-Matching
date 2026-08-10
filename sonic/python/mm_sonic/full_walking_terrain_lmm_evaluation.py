@@ -52,9 +52,13 @@ class FormalRoute:
         if not math.isfinite(duration) or duration < 0.0:
             raise ValueError("formal route duration must be finite and nonnegative")
         if len(times) == 0 or len(speed) != len(times) or len(steering) != len(times):
-            raise ValueError("formal route command vectors must be nonempty and aligned")
+            raise ValueError(
+                "formal route command vectors must be nonempty and aligned"
+            )
         if times[0] != 0.0 or np.any(np.diff(times) <= 0.0):
-            raise ValueError("formal route command times must start at zero and increase")
+            raise ValueError(
+                "formal route command times must start at zero and increase"
+            )
         if times[-1] > duration:
             raise ValueError("formal route command time exceeds its duration")
         if np.any(np.abs(speed) > 1.0) or np.any(np.abs(steering) > 1.0):
@@ -116,7 +120,9 @@ class SlipAccumulator:
             or prior_contact.dtype.kind != "b"
             or contact.dtype.kind != "b"
         ):
-            raise ValueError("probe/contact samples must align as [probe,xyz] and [probe]")
+            raise ValueError(
+                "probe/contact samples must align as [probe,xyz] and [probe]"
+            )
         if not np.isfinite(previous).all() or not np.isfinite(current).all():
             raise ValueError("support probes must be finite")
         if not math.isfinite(elapsed) or elapsed <= 0.0:
@@ -160,14 +166,24 @@ class EvaluationSeries:
             raise ValueError("evaluation probes must have shape [frame,probe,xyz]")
         if contacts.shape != probes.shape[:2] or contacts.dtype.kind != "b":
             raise ValueError("evaluation contacts must be boolean [frame,probe]")
-        if root.shape != (frames, 2) or desired.shape != (frames,) or distance.shape != (frames,):
+        if (
+            root.shape != (frames, 2)
+            or desired.shape != (frames,)
+            or distance.shape != (frames,)
+        ):
             raise ValueError("evaluation root/speed/distance timelines must align")
         if len(self.canonical_source_ids) != frames:
-            raise ValueError("canonical source timeline must align with evaluation frames")
-        if not all(np.isfinite(value).all() for value in (probes, root, desired, distance)):
+            raise ValueError(
+                "canonical source timeline must align with evaluation frames"
+            )
+        if not all(
+            np.isfinite(value).all() for value in (probes, root, desired, distance)
+        ):
             raise ValueError("evaluation observations must be finite")
         if type(self.forward_count) is not int or self.forward_count != frames:
-            raise ValueError("evaluation forward count must equal the observation count")
+            raise ValueError(
+                "evaluation forward count must equal the observation count"
+            )
         safety = {name: int(self.safety_counts.get(name, 0)) for name in _SAFETY_KEYS}
         if any(value < 0 for value in safety.values()):
             raise ValueError("evaluation safety counters must be nonnegative")
@@ -182,7 +198,9 @@ class EvaluationSeries:
             frozen.setflags(write=False)
             object.__setattr__(self, name, frozen)
         object.__setattr__(
-            self, "canonical_source_ids", tuple(str(value) for value in self.canonical_source_ids)
+            self,
+            "canonical_source_ids",
+            tuple(str(value) for value in self.canonical_source_ids),
         )
         object.__setattr__(self, "safety_counts", safety)
 
@@ -208,7 +226,9 @@ def _route_authority_sha256(routes: Sequence[FormalRoute]) -> str:
         }
         for route in routes
     ]
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -237,8 +257,11 @@ def _reduce_route(series: EvaluationSeries, *, fps: float) -> dict[str, object]:
     dt = 1.0 / fps
     for frame in range(1, series.forward_count):
         slip.update(
-            series.probes[frame - 1], series.probes[frame],
-            series.contacts[frame - 1], series.contacts[frame], dt=dt,
+            series.probes[frame - 1],
+            series.probes[frame],
+            series.contacts[frame - 1],
+            series.contacts[frame],
+            dt=dt,
         )
     realized = np.linalg.norm(np.diff(series.root_xy, axis=0), axis=1) / dt
     speed_error = np.abs(realized - np.abs(series.desired_speed_mps[1:]))
@@ -266,7 +289,9 @@ def _aggregate(
     forward_count = 0
     for route, result in route_results:
         forward_count += int(result["forward_count"])
-        speed_errors.extend(float(value) for value in result["speed_absolute_errors_mps"])
+        speed_errors.extend(
+            float(value) for value in result["speed_absolute_errors_mps"]
+        )
         distances.extend(float(value) for value in result["query_distances"])
         raw_slip = result.get("_slip_values", ())
         slip_values.extend(float(value) for value in raw_slip)
@@ -277,7 +302,9 @@ def _aggregate(
             terrain,
             {"forward_count": 0, "canonical_identities": set()},
         )
-        entry["forward_count"] = int(entry["forward_count"]) + int(result["forward_count"])
+        entry["forward_count"] = int(entry["forward_count"]) + int(
+            result["forward_count"]
+        )
         entry["canonical_identities"].update(result["canonical_identities"])
     by_terrain_json: dict[str, dict[str, object]] = {}
     for terrain, entry in sorted(by_terrain.items()):
@@ -293,12 +320,16 @@ def _aggregate(
         "slip": {
             "sample_count": len(slip_array),
             "median_mps": float(np.median(slip_array)) if len(slip_array) else None,
-            "p95_mps": float(np.percentile(slip_array, 95.0)) if len(slip_array) else None,
+            "p95_mps": float(np.percentile(slip_array, 95.0))
+            if len(slip_array)
+            else None,
         },
         "speed_sample_count": len(speed_errors),
         "speed_mae_mps": float(np.mean(speed_errors)) if speed_errors else None,
         "query_sample_count": len(distances),
-        "query_distance_p95": float(np.percentile(distances, 95.0)) if distances else None,
+        "query_distance_p95": float(np.percentile(distances, 95.0))
+        if distances
+        else None,
         "safety_counts": safety,
         "by_terrain": by_terrain_json,
         "route_command_authority_sha256": authority_sha,
@@ -322,7 +353,9 @@ def compare_baseline_candidate(
     """Evaluate identical continuous routes at frozen 25 Hz and candidate 60 Hz."""
 
     route_values = tuple(routes)
-    if not route_values or not all(isinstance(route, FormalRoute) for route in route_values):
+    if not route_values or not all(
+        isinstance(route, FormalRoute) for route in route_values
+    ):
         raise ValueError("formal comparison requires at least one FormalRoute")
     if float(getattr(baseline, "fps", math.nan)) != 25.0:
         raise ValueError("formal baseline evaluator must run at exactly 25 Hz")
@@ -330,11 +363,13 @@ def compare_baseline_candidate(
         raise ValueError("formal candidate evaluator must run at exactly 60 Hz")
     authority_sha = _route_authority_sha256(route_values)
     reduced: dict[str, list[tuple[FormalRoute, dict[str, object]]]] = {
-        "baseline": [], "candidate": []
+        "baseline": [],
+        "candidate": [],
     }
     for route in route_values:
         for name, evaluator, fps in (
-            ("baseline", baseline, 25.0), ("candidate", candidate, 60.0)
+            ("baseline", baseline, 25.0),
+            ("candidate", candidate, 60.0),
         ):
             times = route.sample_times(fps)
             speed, steering = route.commands_at(times)
@@ -345,7 +380,8 @@ def compare_baseline_candidate(
     candidate_result = _aggregate(reduced["candidate"], authority_sha)
     comparison = {
         "query_distance_p95_reduction_fraction": _reduction(
-            baseline_result["query_distance_p95"], candidate_result["query_distance_p95"]
+            baseline_result["query_distance_p95"],
+            candidate_result["query_distance_p95"],
         ),
         "slip_p95_reduction_fraction": _reduction(
             baseline_result["slip"]["p95_mps"], candidate_result["slip"]["p95_mps"]

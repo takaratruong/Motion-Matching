@@ -7,9 +7,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import mm_sonic.full_walking_terrain_lmm_viewer as viewer_module
 import numpy as np
 import pytest
-import mm_sonic.full_walking_terrain_lmm_viewer as viewer_module
 from mm_sonic.full_walking_terrain_lmm_viewer import (
     FORMAL_SCENE_IDS,
     FULL_LABEL,

@@ -9,9 +9,10 @@ import json
 import shutil
 import struct
 import tempfile
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import joblib
 import numpy as np
@@ -1250,10 +1251,10 @@ __all__ = [
     "main",
     "missing_slope_source_ids",
     "publish_inherited_grail_work",
-    "restore_inherited_work_terrain",
     "resample_holden_range",
     "resample_inherited_range",
     "resample_terrain_grid",
+    "restore_inherited_work_terrain",
 ]
 
 

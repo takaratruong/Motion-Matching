@@ -45,8 +45,7 @@ class _Axes:
 
 def _canonical_json(value: object) -> bytes:
     return (
-        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        + "\n"
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
     ).encode()
 
 
@@ -77,8 +76,14 @@ def _write_authenticated_scene_pack(root: Path) -> SimpleNamespace:
     terrain_payload = (
         struct.pack(
             "<4sIIIffff",
-            b"G1HF", 2, heights.shape[1], heights.shape[0],
-            float(xs[0]), float(-ys[-1]), float(xs[1] - xs[0]), 0.0,
+            b"G1HF",
+            2,
+            heights.shape[1],
+            heights.shape[0],
+            float(xs[0]),
+            float(-ys[-1]),
+            float(xs[1] - xs[0]),
+            0.0,
         )
         + heights.tobytes()
     )
@@ -223,9 +228,7 @@ class HybridTerrainViewerTests(unittest.TestCase):
             scene.mkdir()
             heights = np.zeros((2, 3), "<f4")
             (scene / "terrain.bin").write_bytes(
-                struct.pack(
-                    "<4sIIIffff", b"G1HF", 2, 3, 2, -1.0, 2.0, 0.5, -0.2
-                )
+                struct.pack("<4sIIIffff", b"G1HF", 2, 3, 2, -1.0, 2.0, 0.5, -0.2)
                 + heights.tobytes()
             )
 
@@ -273,15 +276,15 @@ class HybridTerrainViewerTests(unittest.TestCase):
             scene.mkdir()
             heights = np.zeros((2, 3), "<f4")
             (scene / "terrain.bin").write_bytes(
-                struct.pack(
-                    "<4sIIIffff", b"G1HF", 2, 3, 2, -1.0, 2.0, 0.5, 0.5
-                )
+                struct.pack("<4sIIIffff", b"G1HF", 2, 3, 2, -1.0, 2.0, 0.5, 0.5)
                 + heights.tobytes()
             )
             adapter = load_scene_terrain(scene)
             generator = _Generator()
             matcher = HybridMatcher(
-                _corpus(), generator, adapter.authority,
+                _corpus(),
+                generator,
+                adapter.authority,
                 pose_converter=_pose_converter,
                 initial_root_xy=(-0.5, -2.0),
             )
@@ -322,9 +325,7 @@ class HybridTerrainViewerTests(unittest.TestCase):
             arbitrary_root = root / "arbitrary"
             arbitrary_root.mkdir()
             (arbitrary_root / "terrain.bin").write_bytes(
-                struct.pack(
-                    "<4sIIIffff", b"G1HF", 2, 2, 2, 0.0, 0.0, 1.0, 0.0
-                )
+                struct.pack("<4sIIIffff", b"G1HF", 2, 2, 2, 0.0, 0.0, 1.0, 0.0)
                 + np.zeros((2, 2), "<f4").tobytes()
             )
             arbitrary = load_scene_terrain(arbitrary_root, corpus=corpus)
@@ -361,9 +362,7 @@ class HybridTerrainViewerTests(unittest.TestCase):
 
         values = np.zeros((8, 31), np.float32)
         values[:, 21:27] = np.tile((0.0, 1.0), 3)
-        values[4:, 15:21] = np.asarray(
-            (0.0, 0.45 * 0.32, 0.0, 0.45 * 0.68, 0.0, 0.45)
-        )
+        values[4:, 15:21] = np.asarray((0.0, 0.45 * 0.32, 0.0, 0.45 * 0.68, 0.0, 0.45))
         values[[0, 4], 27:31] = -1.0
         values[[1, 5], 27:31] = 1.0
         corpus = _corpus(values)
@@ -383,8 +382,11 @@ class HybridTerrainViewerTests(unittest.TestCase):
             return qpos
 
         matcher = HybridMatcher(
-            corpus, generator, terrain.authority,
-            native_model=native_model, pose_converter=valid_converter,
+            corpus,
+            generator,
+            terrain.authority,
+            native_model=native_model,
+            pose_converter=valid_converter,
             transition_penalty=0.100000001,
         )
 
@@ -402,10 +404,10 @@ class HybridTerrainViewerTests(unittest.TestCase):
 
         self.assertFalse(receipt["accepted"])
         self.assertIn("DIAGNOSTIC", receipt["label"])
-        self.assertIn("authenticated-indexed-scene-required", receipt["acceptance_failures"])
         self.assertIn(
-            "transition-penalty-exactly-0.1", receipt["acceptance_failures"]
+            "authenticated-indexed-scene-required", receipt["acceptance_failures"]
         )
+        self.assertIn("transition-penalty-exactly-0.1", receipt["acceptance_failures"])
         self.assertIn(
             "exact-feature-retrieval-required", receipt["acceptance_failures"]
         )
@@ -414,9 +416,7 @@ class HybridTerrainViewerTests(unittest.TestCase):
             "selection-provenance-verified-required",
             receipt["acceptance_failures"],
         )
-        self.assertIn(
-            "strict-combined-corpus-required", receipt["acceptance_failures"]
-        )
+        self.assertIn("strict-combined-corpus-required", receipt["acceptance_failures"])
         self.assertEqual(
             receipt["identity"]["scene_evidence_status"], "diagnostic-generated"
         )
@@ -500,8 +500,7 @@ class HybridTerrainViewerTests(unittest.TestCase):
 
             for authority_name in ("primary_cache", "pfnn_supplement"):
                 relative_authorities = {
-                    name: dict(descriptor)
-                    for name, descriptor in authorities.items()
+                    name: dict(descriptor) for name, descriptor in authorities.items()
                 }
                 relative_authorities[authority_name]["path"] = os.path.relpath(
                     relative_authorities[authority_name]["path"], Path.cwd()
@@ -519,21 +518,18 @@ class HybridTerrainViewerTests(unittest.TestCase):
                 relative_corpus = SimpleNamespace(
                     source_root=relative_root,
                     manifest_receipt={
-                        "schema": (
-                            "g1-hybrid-terrain-lmm-combined-receipt/v2-strict"
-                        ),
+                        "schema": ("g1-hybrid-terrain-lmm-combined-receipt/v2-strict"),
                         "path": str(relative_manifest.resolve()),
                         "size_bytes": len(relative_payload),
                         "sha256": hashlib.sha256(relative_payload).hexdigest(),
                         "authorities": relative_authorities,
                     },
                 )
-                with self.subTest(authority=authority_name), self.assertRaisesRegex(
-                    ValueError, "absolute"
+                with (
+                    self.subTest(authority=authority_name),
+                    self.assertRaisesRegex(ValueError, "absolute"),
                 ):
-                    load_scene_terrain(
-                        "ramp-10-up-down", corpus=relative_corpus
-                    )
+                    load_scene_terrain("ramp-10-up-down", corpus=relative_corpus)
 
             combined_manifest.write_bytes(combined_payload + b" ")
             self.assertFalse(
@@ -577,9 +573,7 @@ class HybridTerrainViewerTests(unittest.TestCase):
 
         values = np.zeros((8, 31), np.float32)
         values[:, 21:27] = np.tile((0.0, 1.0), 3)
-        values[4:, 15:21] = np.asarray(
-            (0.0, 0.45 * 0.32, 0.0, 0.45 * 0.68, 0.0, 0.45)
-        )
+        values[4:, 15:21] = np.asarray((0.0, 0.45 * 0.32, 0.0, 0.45 * 0.68, 0.0, 0.45))
         values[[0, 4], 27:31] = -1.0
         values[[1, 5], 27:31] = 1.0
         corpus = _corpus(values)
@@ -607,8 +601,11 @@ class HybridTerrainViewerTests(unittest.TestCase):
             return qpos
 
         matcher = HybridMatcher(
-            corpus, generator, terrain.authority,
-            native_model=native_model, pose_converter=valid_converter,
+            corpus,
+            generator,
+            terrain.authority,
+            native_model=native_model,
+            pose_converter=valid_converter,
             initial_root_xy=terrain.spawn_native_xy,
             initial_heading=terrain.spawn_heading,
             cache_manifest_path=cache_manifest,
@@ -669,9 +666,12 @@ class HybridTerrainViewerTests(unittest.TestCase):
             corpus.cache_manifest_sha256,
         )
         for name in (
-            "model_manifest_sha256", "scene_index_sha256",
-            "source_manifest_sha256", "g1_xml_sha256",
-            "g1_asset_inventory_sha256", "search_view_sha256",
+            "model_manifest_sha256",
+            "scene_index_sha256",
+            "source_manifest_sha256",
+            "g1_xml_sha256",
+            "g1_asset_inventory_sha256",
+            "search_view_sha256",
         ):
             self.assertEqual(len(identity[name]), 64, name)
         self.assertIsNone(identity["scene_generated_grid_sha256"])
@@ -732,9 +732,7 @@ class HybridTerrainViewerTests(unittest.TestCase):
             disappeared["acceptance_failures"],
         )
         self.assertFalse(
-            disappeared["evidence_authority_post"][
-                "identity_capture_succeeded"
-            ]
+            disappeared["evidence_authority_post"]["identity_capture_succeeded"]
         )
 
         rejected_status = dict(before["generator_acceptance_status"])
@@ -803,8 +801,11 @@ class HybridTerrainViewerTests(unittest.TestCase):
             return qpos
 
         matcher = HybridMatcher(
-            corpus, generator, terrain.authority,
-            native_model=native_model, pose_converter=joint_invalid_converter,
+            corpus,
+            generator,
+            terrain.authority,
+            native_model=native_model,
+            pose_converter=joint_invalid_converter,
             initial_root_xy=terrain.spawn_native_xy,
             initial_heading=terrain.spawn_heading,
         )
@@ -858,8 +859,11 @@ class HybridTerrainViewerTests(unittest.TestCase):
             return qpos
 
         matcher = HybridMatcher(
-            corpus, generator, terrain.authority,
-            native_model=native_model, pose_converter=canonical_valid_converter,
+            corpus,
+            generator,
+            terrain.authority,
+            native_model=native_model,
+            pose_converter=canonical_valid_converter,
         )
 
         receipt = run_mujoco_headless_smoke(
@@ -903,8 +907,11 @@ class HybridTerrainViewerTests(unittest.TestCase):
             return qpos
 
         matcher = HybridMatcher(
-            corpus, generator, terrain.authority,
-            native_model=native_model, pose_converter=converter,
+            corpus,
+            generator,
+            terrain.authority,
+            native_model=native_model,
+            pose_converter=converter,
         )
         fail[0] = True
 
@@ -963,20 +970,28 @@ class HybridTerrainViewerTests(unittest.TestCase):
 
             adapter = load_scene_terrain(scene)
             matcher = HybridMatcher(
-                _corpus(), _Generator(), adapter.authority,
+                _corpus(),
+                _Generator(),
+                adapter.authority,
                 pose_converter=_pose_converter,
                 initial_root_xy=adapter.spawn_native_xy,
                 initial_heading=adapter.spawn_heading,
             )
 
-            np.testing.assert_allclose(matcher.state.root_position_world[:2], (1.25, -3.5))
+            np.testing.assert_allclose(
+                matcher.state.root_position_world[:2], (1.25, -3.5)
+            )
             self.assertAlmostEqual(matcher.state.heading, 0.4)
             matcher.step(CommandState(1.0, 0.5), dt=0.04)
             reset = matcher.reset()
             np.testing.assert_allclose(reset.root_position_world[:2], (1.25, -3.5))
             self.assertAlmostEqual(reset.heading, 0.4)
-            self.assertEqual(adapter.scene_json_sha256, hashlib.sha256(scene_payload).hexdigest())
-            self.assertEqual(adapter.terrain_sha256, hashlib.sha256(terrain_payload).hexdigest())
+            self.assertEqual(
+                adapter.scene_json_sha256, hashlib.sha256(scene_payload).hexdigest()
+            )
+            self.assertEqual(
+                adapter.terrain_sha256, hashlib.sha256(terrain_payload).hexdigest()
+            )
 
     def test_xml_asset_identity_binds_nested_include_files_and_their_assets(self):
         import mujoco
@@ -1138,14 +1153,20 @@ class HybridTerrainViewerTests(unittest.TestCase):
 
     def test_overlay_exposes_required_runtime_fields(self):
         state = SimpleNamespace(
-            family="slope", range_index=12, row=345, search_distance=0.125,
-            terrain_features=(0.0, 0.1, 0.2, 0.3), decode_count=91,
-            fallback_count=2, joint_clamp_count=1,
+            family="slope",
+            range_index=12,
+            row=345,
+            search_distance=0.125,
+            terrain_features=(0.0, 0.1, 0.2, 0.3),
+            decode_count=91,
+            fallback_count=2,
+            joint_clamp_count=1,
             max_joint_clamp_magnitude=0.0375,
             candidate_limit_rejection_count=3,
             first_candidate_limit_rejection_row=168,
             max_candidate_limit_rejections_per_step=2,
-            support_height=0.18, support_status="SUPPORTED",
+            support_height=0.18,
+            support_status="SUPPORTED",
             pose_source="learned",
             searchable_row_count=500_000,
             searchable_family_counts=(("flat", 125_000), ("slope", 125_000)),
@@ -1159,12 +1180,24 @@ class HybridTerrainViewerTests(unittest.TestCase):
         self.assertIn("HYBRID TERRAIN LMM POC", title)
         self.assertNotIn("EXACT SEARCH", title)
         for value in (
-            "family slope", "range 12", "row 345", "distance 0.125000",
-            "terrain [0.000, 0.100, 0.200, 0.300]", "decode 91",
-            "fallback 2", "canonical 1", "clamped 1", "max 0.037500",
-            "native candidate rejects 3", "first 168", "max/step 2",
-            "support SUPPORTED", "height 0.180",
-            "diagnostic capped rows 500000/3955117", "flat=125000", "slope=125000",
+            "family slope",
+            "range 12",
+            "row 345",
+            "distance 0.125000",
+            "terrain [0.000, 0.100, 0.200, 0.300]",
+            "decode 91",
+            "fallback 2",
+            "canonical 1",
+            "clamped 1",
+            "max 0.037500",
+            "native candidate rejects 3",
+            "first 168",
+            "max/step 2",
+            "support SUPPORTED",
+            "height 0.180",
+            "diagnostic capped rows 500000/3955117",
+            "flat=125000",
+            "slope=125000",
             "transition penalty 0.100",
         ):
             self.assertIn(value, body)
@@ -1211,9 +1244,7 @@ class HybridTerrainViewerTests(unittest.TestCase):
         self.assertFalse(
             viewer_module._generator_acceptance_status(selection)["accepted"]
         )
-        self.assertTrue(
-            viewer_module._generator_acceptance_status(final)["accepted"]
-        )
+        self.assertTrue(viewer_module._generator_acceptance_status(final)["accepted"])
         matcher = SimpleNamespace(
             search_acceptance_eligible=True,
             generator=selection,
@@ -1253,9 +1284,7 @@ class HybridTerrainViewerTests(unittest.TestCase):
             with self.subTest(key=key):
                 changed = dict(identity)
                 changed[key] = "0" * 64
-                self.assertFalse(
-                    viewer_module._formal_artifact_authorities(changed)
-                )
+                self.assertFalse(viewer_module._formal_artifact_authorities(changed))
 
     def test_generator_loader_authority_requires_exact_loaded_class(self):
         from mm_sonic.hybrid_terrain_lmm_training import HybridGenerator
@@ -1293,13 +1322,23 @@ class HybridTerrainViewerTests(unittest.TestCase):
         import mujoco
 
         state = SimpleNamespace(
-            qpos=np.zeros(36, np.float64), family="slope", range_index=1, row=2,
-            search_distance=0.0, terrain_features=np.zeros(4), decode_count=3,
-            fallback_count=0, joint_clamp_count=0,
-            max_joint_clamp_magnitude=0.0, support_height=0.0,
-            support_status="SUPPORTED", pose_source="learned",
-            searchable_row_count=6, searchable_family_counts=(("slope", 6),),
-            total_searchable_row_count=6, search_scope="full-range-safe-corpus",
+            qpos=np.zeros(36, np.float64),
+            family="slope",
+            range_index=1,
+            row=2,
+            search_distance=0.0,
+            terrain_features=np.zeros(4),
+            decode_count=3,
+            fallback_count=0,
+            joint_clamp_count=0,
+            max_joint_clamp_magnitude=0.0,
+            support_height=0.0,
+            support_status="SUPPORTED",
+            pose_source="learned",
+            searchable_row_count=6,
+            searchable_family_counts=(("slope", 6),),
+            total_searchable_row_count=6,
+            search_scope="full-range-safe-corpus",
             transition_penalty=0.1,
         )
         matcher = SimpleNamespace(
@@ -1328,7 +1367,9 @@ class HybridTerrainViewerTests(unittest.TestCase):
         class FakeViewer:
             def __init__(self):
                 self.cam = SimpleNamespace(
-                    distance=0.0, azimuth=0.0, elevation=0.0,
+                    distance=0.0,
+                    azimuth=0.0,
+                    elevation=0.0,
                     lookat=np.zeros(3, np.float64),
                 )
                 self.user_scn = SimpleNamespace(flags=np.zeros(1_000, np.int32))
@@ -1415,8 +1456,15 @@ class HybridTerrainViewerTests(unittest.TestCase):
         parser = build_parser()
         smoke = parser.parse_args(
             [
-                "smoke", "--cache", "cache", "--model", "model", "--frames", "1000",
-                "--receipt", "smoke.json",
+                "smoke",
+                "--cache",
+                "cache",
+                "--model",
+                "model",
+                "--frames",
+                "1000",
+                "--receipt",
+                "smoke.json",
             ]
         )
         view = parser.parse_args(
@@ -1449,8 +1497,13 @@ class HybridTerrainViewerTests(unittest.TestCase):
             ):
                 main(
                     [
-                        "smoke", "--cache", "cache", "--model", "model",
-                        "--receipt", str(target),
+                        "smoke",
+                        "--cache",
+                        "cache",
+                        "--model",
+                        "model",
+                        "--receipt",
+                        str(target),
                     ]
                 )
             self.assertEqual(target.read_bytes(), b"immutable prior evidence\n")
@@ -1488,8 +1541,13 @@ class HybridTerrainViewerTests(unittest.TestCase):
                 self.assertEqual(
                     main(
                         [
-                            "smoke", "--cache", "cache", "--model", "model",
-                            "--receipt", str(target),
+                            "smoke",
+                            "--cache",
+                            "cache",
+                            "--model",
+                            "model",
+                            "--receipt",
+                            str(target),
                         ]
                     ),
                     0,
@@ -1500,7 +1558,9 @@ class HybridTerrainViewerTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(target.stat().st_mode) & 0o222, 0)
             self.assertGreaterEqual(fsync.call_count, 2)
             self.assertEqual(events[0][0], "fchmod")
-            self.assertEqual([path.name for path in target.parent.iterdir()], [target.name])
+            self.assertEqual(
+                [path.name for path in target.parent.iterdir()], [target.name]
+            )
             self.assertEqual(json.loads(stdout.getvalue()), receipt)
 
 

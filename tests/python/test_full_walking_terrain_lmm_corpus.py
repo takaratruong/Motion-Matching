@@ -765,12 +765,14 @@ class FullWalkingTerrainLmmCorpusTests(unittest.TestCase):
                 scene_authority=scenes,
             )
 
-            with mock.patch(
-                "mm_sonic.full_walking_terrain_lmm_corpus._ordered_ranges",
-                side_effect=ValueError("terminal range coverage changed"),
+            with (
+                mock.patch(
+                    "mm_sonic.full_walking_terrain_lmm_corpus._ordered_ranges",
+                    side_effect=ValueError("terminal range coverage changed"),
+                ),
+                self.assertRaisesRegex(ValueError, "terminal range coverage"),
             ):
-                with self.assertRaisesRegex(ValueError, "terminal range coverage"):
-                    verify_full_corpus(corpus, root / "rejected-coverage.json")
+                verify_full_corpus(corpus, root / "rejected-coverage.json")
 
     def test_publication_is_exclusive_and_reproduction_is_byte_exact(self):
         with tempfile.TemporaryDirectory() as directory:
