@@ -28,11 +28,11 @@ import numpy as np
 _CUBLAS_WORKSPACE_CONFIG = ":4096:8"
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", _CUBLAS_WORKSPACE_CONFIG)
 
-import torch
-from torch import nn
-from torch.nn import functional as F
+import torch  # noqa: E402
+from torch import nn  # noqa: E402
+from torch.nn import functional as F  # noqa: E402
 
-from resources import quat
+from resources import quat  # noqa: E402
 
 _CUDA_INITIALIZED_AT_MODULE_IMPORT = torch.cuda.is_initialized()
 
