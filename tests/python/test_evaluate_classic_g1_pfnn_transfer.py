@@ -76,8 +76,12 @@ def _write_evaluation_fixture(
     physical_x = np.full(
         (len(clips), CLASSIC_G1_INPUT_LAYOUT_V3.size), np.float32(0.75)
     )
-    physical_x[:, CLASSIC_G1_INPUT_LAYOUT_V3["joint_position"]] = np.float32(0.0)
-    physical_x[:, CLASSIC_G1_INPUT_LAYOUT_V3["joint_velocity"]] = np.float32(0.0)
+    physical_x[:, CLASSIC_G1_INPUT_LAYOUT_V3["joint_position"]] = np.float32(
+        0.125
+    )
+    physical_x[:, CLASSIC_G1_INPUT_LAYOUT_V3["joint_velocity"]] = np.float32(
+        -0.375
+    )
     values = VerticalSplitArrays(
         x=physical_x,
         y=target,
@@ -150,8 +154,8 @@ def _write_evaluation_fixture(
         validation_loss=0.1,
         seed=7,
         source_kind="mixed",
-        vertical_slice_receipt_sha256="f" * 64,
-        terrain_receipt_set_sha256="0" * 64,
+        vertical_slice_receipt_sha256=dataset.selection_sha256,
+        terrain_receipt_set_sha256=dataset.terrain_receipt_set_sha256,
     )
     return manifest, checkpoint, dataset
 
@@ -215,6 +219,18 @@ class ClassicG1PFNNTransferEvaluationTests(unittest.TestCase):
             )
             self.assertEqual(len(seen), 1)
             np.testing.assert_array_equal(seen[0][0].numpy(), expected_x)
+            np.testing.assert_array_equal(
+                seen[0][0].numpy()[
+                    :, CLASSIC_G1_INPUT_LAYOUT_V3["joint_position"]
+                ],
+                np.full((4, 29), np.float32(0.5)),
+            )
+            np.testing.assert_array_equal(
+                seen[0][0].numpy()[
+                    :, CLASSIC_G1_INPUT_LAYOUT_V3["joint_velocity"]
+                ],
+                np.full((4, 29), np.float32(-1.5)),
+            )
             self.assertEqual(seen[0][0].dtype, torch.float32)
             self.assertEqual(seen[0][1].dtype, torch.float32)
             np.testing.assert_array_equal(
@@ -237,6 +253,32 @@ class ClassicG1PFNNTransferEvaluationTests(unittest.TestCase):
             )
             self.assertEqual(report["checkpoint_sha256"], _sha256(checkpoint))
             self.assertEqual(report["dataset_manifest_sha256"], _sha256(manifest))
+            self.assertEqual(
+                report["schema"], "classic-g1-pfnn-transfer-evaluation/v2"
+            )
+
+    def test_evaluate_binds_checkpoint_dataset_receipts_before_inference(self) -> None:
+        for field in (
+            "vertical_slice_receipt_sha256",
+            "terrain_receipt_set_sha256",
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                manifest, checkpoint, _ = _write_evaluation_fixture(Path(directory))
+                payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+                payload[field] = "1" * 64
+                torch.save(payload, checkpoint)
+
+                with mock.patch.object(
+                    PhaseFunctionedNetwork,
+                    "forward",
+                    side_effect=AssertionError("inference ran"),
+                ):
+                    with self.assertRaisesRegex(ValueError, "receipt.*mismatch"):
+                        transfer.evaluate(
+                            checkpoint_path=checkpoint,
+                            dataset_path=manifest,
+                            device="cpu",
+                        )
 
     def test_evaluate_rejects_v2_dataset_and_checkpoint_before_inference(self) -> None:
         for artifact in ("dataset", "checkpoint"):

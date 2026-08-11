@@ -203,6 +203,13 @@ def evaluate(
         raise ValueError("classic PFNN checkpoint input contract is invalid")
     if checkpoint.dataset_digest != dataset.dataset_sha256:
         raise ValueError("classic PFNN checkpoint dataset digest mismatch")
+    if checkpoint.vertical_slice_receipt_sha256 != dataset.selection_sha256:
+        raise ValueError("classic PFNN checkpoint selection receipt mismatch")
+    if (
+        checkpoint.terrain_receipt_set_sha256
+        != dataset.terrain_receipt_set_sha256
+    ):
+        raise ValueError("classic PFNN checkpoint terrain receipt mismatch")
     normalization = _checkpoint_normalization(checkpoint, dataset)
     arrays = dataset.splits[split]
     x = normalize_pfnn_input(arrays.x, normalization["x_mean"], normalization["x_std"])
@@ -239,7 +246,7 @@ def evaluate(
     if _sha256(manifest_file) != dataset_manifest_sha256:
         raise ValueError("dataset manifest bytes changed during evaluation")
     return {
-        "schema": "classic-g1-pfnn-transfer-evaluation/v1",
+        "schema": "classic-g1-pfnn-transfer-evaluation/v2",
         "checkpoint_sha256": checkpoint_sha256,
         "dataset_manifest_sha256": dataset_manifest_sha256,
         "dataset_sha256": dataset.dataset_sha256,

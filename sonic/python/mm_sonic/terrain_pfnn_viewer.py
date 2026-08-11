@@ -753,8 +753,8 @@ def _load_runtime(
     loaded = load_classic_checkpoint(checkpoint)
     if loaded.dataset_digest != digest:
         raise ValueError("classic PFNN checkpoint dataset digest mismatch")
-    released = getattr(loaded, "source_kind", None) == "released_pfnn"
-    if released and (
+    vertical = getattr(loaded, "source_kind", None) in ("released_pfnn", "mixed")
+    if vertical and (
         manifest.get("selection_sha256") != loaded.vertical_slice_receipt_sha256
         or manifest.get("terrain_receipt_set_sha256")
         != loaded.terrain_receipt_set_sha256
@@ -769,7 +769,7 @@ def _load_runtime(
         enforce_motion_envelope=strict,
         command_driven_root=False,
         hold_idle_pose=False,
-        maximum_grade_degrees=89.0 if released else 20.0,
+        maximum_grade_degrees=89.0 if vertical else 20.0,
     )
 
 

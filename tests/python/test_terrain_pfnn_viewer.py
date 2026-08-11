@@ -308,6 +308,74 @@ class TerrainPFNNViewerTests(unittest.TestCase):
         self.assertIs(factory.call_args.kwargs["hold_idle_pose"], False)
         self.assertEqual(factory.call_args.kwargs["maximum_grade_degrees"], 89.0)
 
+    def test_mixed_runtime_uses_the_receipt_bound_vertical_contract(self) -> None:
+        import mm_sonic.terrain_pfnn_viewer as viewer_module
+        from mm_sonic.terrain_pfnn_viewer import _load_runtime, _parser
+
+        arguments = _parser().parse_args([])
+        checkpoint = SimpleNamespace(
+            dataset_digest="a" * 64,
+            kinematic_signature_sha256="b" * 64,
+            source_kind="mixed",
+            vertical_slice_receipt_sha256="c" * 64,
+            terrain_receipt_set_sha256="d" * 64,
+        )
+        kinematics = SimpleNamespace(kinematic_signature_sha256="b" * 64)
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "dataset_sha256": "a" * 64,
+                        "selection_sha256": "c" * 64,
+                        "terrain_receipt_set_sha256": "d" * 64,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(
+                    viewer_module, "load_classic_checkpoint", return_value=checkpoint
+                ),
+                mock.patch.object(
+                    viewer_module.TorchG1ForwardKinematics,
+                    "from_mjcf",
+                    return_value=kinematics,
+                ),
+                mock.patch.object(
+                    viewer_module, "TerrainPFNNRuntime", return_value=object()
+                ) as factory,
+            ):
+                _load_runtime(
+                    arguments,
+                    Path("checkpoint.pt"),
+                    manifest,
+                    Path("g1.xml"),
+                    object(),
+                )
+                self.assertEqual(
+                    factory.call_args.kwargs["maximum_grade_degrees"], 89.0
+                )
+
+                manifest.write_text(
+                    json.dumps(
+                        {
+                            "dataset_sha256": "a" * 64,
+                            "selection_sha256": "e" * 64,
+                            "terrain_receipt_set_sha256": "d" * 64,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(ValueError, "source or terrain receipt"):
+                    _load_runtime(
+                        arguments,
+                        Path("checkpoint.pt"),
+                        manifest,
+                        Path("g1.xml"),
+                        object(),
+                    )
+
     def test_defaults_select_the_classic_g1_artifacts(self) -> None:
         from mm_sonic.terrain_pfnn_viewer import _parser
 
