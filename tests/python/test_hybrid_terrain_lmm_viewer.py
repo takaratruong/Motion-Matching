@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import struct
+import sys
 import tempfile
 import unittest
 from dataclasses import replace
@@ -588,6 +589,11 @@ class HybridTerrainViewerTests(unittest.TestCase):
         receipt = {"accepted": True, "mujoco_forward_count": 1_000}
         stdout = io.StringIO()
         with (
+            mock.patch.object(
+                viewer_module,
+                "configure_single_gpu_visibility",
+                create=True,
+            ) as configure_visibility,
             mock.patch(
                 "mm_sonic.hybrid_terrain_lmm_viewer._load_matcher",
                 return_value=(matcher, terrain),
@@ -606,7 +612,160 @@ class HybridTerrainViewerTests(unittest.TestCase):
         smoke.assert_called_once_with(
             matcher, terrain, g1_xml=DEFAULT_G1_XML, frames=1_000
         )
+        configure_visibility.assert_not_called()
         self.assertEqual(json.loads(stdout.getvalue()), receipt)
+
+    def test_gpu_view_configures_visibility_before_loading(self):
+        events = []
+        matcher, terrain = object(), object()
+
+        def configure(device):
+            events.append(("configure", device))
+
+        def load(arguments):
+            events.append(("load", arguments.search_device))
+            return matcher, terrain
+
+        def run(*_arguments, **_keywords):
+            events.append("run")
+            return {"accepted": True}
+
+        with (
+            mock.patch.object(
+                viewer_module,
+                "configure_single_gpu_visibility",
+                side_effect=configure,
+                create=True,
+            ),
+            mock.patch.object(viewer_module, "_load_matcher", side_effect=load),
+            mock.patch.object(viewer_module, "run_interactive", side_effect=run),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            result = main(
+                [
+                    "view",
+                    "--cache",
+                    "cache",
+                    "--model",
+                    "model",
+                    "--search-device",
+                    "cuda:5",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(events, [("configure", "cuda:5"), ("load", "cuda:5"), "run"])
+
+    def test_cpu_view_does_not_configure_gpu_visibility(self):
+        matcher, terrain = object(), object()
+        with (
+            mock.patch.object(
+                viewer_module,
+                "configure_single_gpu_visibility",
+                create=True,
+            ) as configure_visibility,
+            mock.patch.object(
+                viewer_module,
+                "_load_matcher",
+                return_value=(matcher, terrain),
+            ) as load,
+            mock.patch.object(
+                viewer_module,
+                "run_interactive",
+                return_value={"accepted": True},
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            result = main(["view", "--cache", "cache", "--model", "model"])
+
+        self.assertEqual(result, 0)
+        configure_visibility.assert_not_called()
+        self.assertIsNone(load.call_args.args[0].search_device)
+
+    def test_gpu_view_rejects_conflicting_visibility_before_loading(self):
+        from mm_sonic.hybrid_terrain_lmm_gpu_search import (
+            configure_single_gpu_visibility,
+        )
+
+        with (
+            mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "4"}),
+            mock.patch.object(
+                viewer_module,
+                "configure_single_gpu_visibility",
+                configure_single_gpu_visibility,
+                create=True,
+            ),
+            mock.patch.object(
+                viewer_module,
+                "_load_matcher",
+                side_effect=AssertionError(
+                    "visibility conflict must fail before matcher loading"
+                ),
+            ),
+            self.assertRaisesRegex(RuntimeError, "visibility conflicts"),
+        ):
+            main(
+                [
+                    "view",
+                    "--cache",
+                    "cache",
+                    "--model",
+                    "model",
+                    "--search-device",
+                    "cuda:5",
+                ]
+            )
+
+    def test_load_matcher_passes_search_device_to_runtime(self):
+        corpus = SimpleNamespace()
+        generator = object()
+        adapter = SimpleNamespace(
+            authority=object(),
+            spawn_native_xy=np.zeros(2, np.float64),
+            spawn_heading=0.0,
+        )
+        data_module = SimpleNamespace(load_hybrid_cache=lambda _path: corpus)
+        training_module = SimpleNamespace(
+            load_hybrid_generator=lambda _path, *, corpus: generator
+        )
+
+        def import_module(name):
+            if name == "mm_sonic.hybrid_terrain_lmm_data":
+                return data_module
+            if name == "mm_sonic.hybrid_terrain_lmm_training":
+                return training_module
+            raise AssertionError(f"unexpected module import: {name}")
+
+        arguments = SimpleNamespace(
+            cache=Path("cache"),
+            model=Path("model"),
+            scene="ramp-10-up-down",
+            g1_xml=DEFAULT_G1_XML,
+            search_rows=None,
+            transition_penalty=0.1,
+            search_device="cuda:5",
+        )
+        built = object()
+        fake_mujoco = SimpleNamespace(
+            MjModel=SimpleNamespace(from_xml_path=lambda _path: object())
+        )
+        with (
+            mock.patch.object(
+                viewer_module.importlib, "import_module", side_effect=import_module
+            ),
+            mock.patch.object(
+                viewer_module, "load_scene_terrain", return_value=adapter
+            ),
+            mock.patch.object(
+                viewer_module, "HybridMatcher", return_value=built
+            ) as constructor,
+            mock.patch.dict(sys.modules, {"mujoco": fake_mujoco}),
+        ):
+            matcher, loaded_adapter = viewer_module._load_matcher(arguments)
+
+        self.assertIs(matcher, built)
+        self.assertIs(loaded_adapter, adapter)
+        self.assertEqual(constructor.call_args.kwargs["search_device"], "cuda:5")
 
     def test_real_mujoco_smoke_runs_1000_forwards_and_binds_every_identity(self):
         import mujoco
@@ -708,6 +867,9 @@ class HybridTerrainViewerTests(unittest.TestCase):
         self.assertEqual(receipt["search_scope"], "full-range-safe-corpus")
         self.assertEqual(receipt["transition_penalty"], 0.1)
         identity = receipt["identity"]
+        self.assertEqual(identity["search_backend_identity"], "cpu-ckdtree-exact")
+        self.assertIsNone(identity["last_search_elapsed_ms"])
+        self.assertIsNone(identity["first_runtime_search_elapsed_ms"])
         self.assertEqual(
             identity["cache_manifest_sha256"],
             corpus.cache_manifest_sha256,
@@ -1303,6 +1465,20 @@ class HybridTerrainViewerTests(unittest.TestCase):
         )
         self.assertIn("EXACT SEARCH", title)
         self.assertIn("full exact rows 3955117/3955117", body)
+        title, body = overlay_text(
+            state,
+            paused=False,
+            scene_evidence_status="authenticated-indexed",
+            generator_accepted=True,
+            search_backend_identity="single-gpu-full-row-fp32:cuda:5",
+            last_search_elapsed_ms=7.25,
+            first_runtime_search_elapsed_ms=11.5,
+        )
+        self.assertIn("DIAGNOSTIC", title)
+        self.assertNotIn("EXACT SEARCH", title)
+        self.assertIn("search backend single-gpu-full-row-fp32:cuda:5", body)
+        self.assertIn("last search 7.250 ms", body)
+        self.assertIn("first runtime search 11.500 ms", body)
         title, _ = overlay_text(
             state,
             paused=False,
@@ -1333,8 +1509,12 @@ class HybridTerrainViewerTests(unittest.TestCase):
         matcher = SimpleNamespace(
             search_acceptance_eligible=True,
             generator=selection,
+            search_backend_identity="cpu-ckdtree-exact",
         )
         terrain = SimpleNamespace(scene_authenticated=True)
+        self.assertIn("DIAGNOSTIC", viewer_module._runtime_label(matcher, terrain))
+        matcher.generator = final
+        matcher.search_backend_identity = "single-gpu-full-row-fp32:cuda:5"
         self.assertIn("DIAGNOSTIC", viewer_module._runtime_label(matcher, terrain))
 
     def test_formal_authority_gate_is_frozen_to_delivered_artifacts(self):
@@ -1433,6 +1613,9 @@ class HybridTerrainViewerTests(unittest.TestCase):
             reset=lambda: state,
             search_scope="full-range-safe-corpus",
             search_acceptance_eligible=True,
+            search_backend_identity="single-gpu-full-row-fp32:cuda:5",
+            last_search_elapsed_ms=7.25,
+            warm_search_elapsed_ms=11.5,
         )
         terrain = replace(
             load_scene_terrain("hills"),
@@ -1447,7 +1630,7 @@ class HybridTerrainViewerTests(unittest.TestCase):
             Listener=lambda **_kwargs: listener,
         )
 
-        overlay_titles = []
+        overlay_texts = []
 
         class FakeViewer:
             def __init__(self):
@@ -1472,7 +1655,7 @@ class HybridTerrainViewerTests(unittest.TestCase):
                 return contextlib.nullcontext()
 
             def set_texts(self, texts):
-                overlay_titles.append(texts[2])
+                overlay_texts.append((texts[2], texts[3]))
 
             def sync(self):
                 return None
@@ -1481,6 +1664,9 @@ class HybridTerrainViewerTests(unittest.TestCase):
         identity = {
             "cache_manifest_sha256": "c" * 64,
             "scene_authentication_current": True,
+            "search_backend_identity": "single-gpu-full-row-fp32:cuda:5",
+            "last_search_elapsed_ms": None,
+            "first_runtime_search_elapsed_ms": None,
         }
         with (
             mock.patch.dict(os.environ, {"DISPLAY": ":99"}),
@@ -1516,8 +1702,15 @@ class HybridTerrainViewerTests(unittest.TestCase):
 
         runtime_identity.assert_called_once_with(matcher, terrain, DEFAULT_G1_XML)
         scene_current.assert_called_once_with(matcher.corpus, terrain)
-        self.assertNotIn("EXACT SEARCH", overlay_titles[0])
+        self.assertNotIn("EXACT SEARCH", overlay_texts[0][0])
+        self.assertIn(
+            "search backend single-gpu-full-row-fp32:cuda:5", overlay_texts[0][1]
+        )
+        self.assertIn("last search 7.250 ms", overlay_texts[0][1])
+        self.assertIn("first runtime search 11.500 ms", overlay_texts[0][1])
         self.assertEqual(receipt["identity"], identity)
+        self.assertEqual(identity["last_search_elapsed_ms"], 7.25)
+        self.assertEqual(identity["first_runtime_search_elapsed_ms"], 11.5)
         self.assertEqual(
             receipt["overlay_scene_evidence_status"],
             "diagnostic-authentication-not-current",
@@ -1553,7 +1746,17 @@ class HybridTerrainViewerTests(unittest.TestCase):
             ]
         )
         view = parser.parse_args(
-            ["view", "--cache", "cache", "--model", "model", "--scene", "hills"]
+            [
+                "view",
+                "--cache",
+                "cache",
+                "--model",
+                "model",
+                "--scene",
+                "hills",
+                "--search-device",
+                "cuda:5",
+            ]
         )
         self.assertEqual(smoke.command, "smoke")
         self.assertEqual(smoke.frames, 1000)
@@ -1561,8 +1764,25 @@ class HybridTerrainViewerTests(unittest.TestCase):
         self.assertEqual(smoke.scene, "ramp-10-up-down")
         self.assertIsNone(smoke.search_rows)
         self.assertEqual(smoke.transition_penalty, 0.1)
+        self.assertFalse(hasattr(smoke, "search_device"))
         self.assertEqual(view.command, "view")
         self.assertEqual(view.scene, "hills")
+        self.assertEqual(view.search_device, "cuda:5")
+        with (
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            parser.parse_args(
+                [
+                    "smoke",
+                    "--cache",
+                    "cache",
+                    "--model",
+                    "model",
+                    "--search-device",
+                    "cuda:5",
+                ]
+            )
 
     def test_receipt_output_is_exclusive_and_never_overwrites_existing_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:

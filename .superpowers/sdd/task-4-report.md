@@ -304,3 +304,78 @@ The authenticated scope remains visible only on the LMM path. The focused
 controller-state test, controller syntax and full desktop link, and
 `git diff --check` passed. No viewer or GPU/model process was launched or
 modified.
+
+## Full-walking single-GPU viewer wiring (2026-08-10)
+
+This section covers only `full_walking_terrain_lmm_viewer.py`; the shared
+hybrid viewer and interactive overlay/receipt implementation are recorded by
+their owning lane. The full viewer now accepts `--search-device` on `view`
+only. Immediately after parsing a GPU view request, it calls
+`configure_single_gpu_visibility` before corpus, model, MuJoCo, matcher, or JAX
+work, then passes the unchanged physical device string to `HybridMatcher`.
+CPU views explicitly pass `None`. Formal smoke has no search-device namespace
+field, never configures GPU visibility, and retains its CPU matcher path.
+
+The full interactive identity exposes `search_backend_identity`,
+`last_search_elapsed_ms`, and `first_runtime_search_elapsed_ms`; the final key
+maps the runtime matcher's `warm_search_elapsed_ms` to the less ambiguous
+first-runtime-search name. Any backend other than `cpu-ckdtree-exact` forces
+the existing full diagnostic label even when all corpus, model, scene, and
+search-scope authorities are otherwise current. A diagnostic FP32 GPU search
+therefore cannot display the formal exact-search title.
+
+The focused RED run was:
+
+```text
+PYTHONPATH=.:resources:sonic/python \
+  /home/ubuntu/miniconda3/envs/diffsim/bin/python -m pytest -q \
+  tests/python/test_full_walking_terrain_lmm_viewer.py
+
+5 failed, 11 passed in 2.58s
+```
+
+The failures were the intended missing CPU `search_device=None` constructor
+wiring, missing view parser/device path, missing configure-before-load path,
+missing conflict rejection, and missing full identity metadata. The final
+focused GREEN run passed `17 passed in 2.35s`, including an explicit smoke
+dispatch regression that fails if visibility configuration is called.
+
+Scoped static verification passed:
+
+```text
+/home/ubuntu/miniconda3/envs/diffsim/bin/ruff check \
+  sonic/python/mm_sonic/full_walking_terrain_lmm_viewer.py \
+  tests/python/test_full_walking_terrain_lmm_viewer.py
+# All checks passed!
+
+/home/ubuntu/miniconda3/envs/diffsim/bin/ruff format --check \
+  sonic/python/mm_sonic/full_walking_terrain_lmm_viewer.py \
+  tests/python/test_full_walking_terrain_lmm_viewer.py
+# 2 files already formatted
+
+/home/ubuntu/miniconda3/envs/diffsim/bin/python -m py_compile \
+  sonic/python/mm_sonic/full_walking_terrain_lmm_viewer.py \
+  tests/python/test_full_walking_terrain_lmm_viewer.py
+
+git diff --check -- \
+  sonic/python/mm_sonic/full_walking_terrain_lmm_viewer.py \
+  tests/python/test_full_walking_terrain_lmm_viewer.py
+```
+
+Per orchestration, PID 1029253 was not signalled, no real corpus benchmark was
+run, and no viewer was launched. Those physical-GPU5 gates remain under the
+root lane after independent review.
+
+### Shared interactive overlay and receipt lane
+
+The shared hybrid viewer now exposes `--search-device` only for `view`,
+configures visibility before matcher loading, and leaves formal `smoke` on the
+unchanged CPU path. GPU searches remain visibly diagnostic. The live overlay
+shows backend identity, last search latency, and first runtime search latency;
+the same final values are written into the one already-authenticated identity
+object without invoking the authority resolver twice.
+
+This lane recorded 9 intended RED failures, then 37/37 hybrid-viewer tests
+green. Fresh combined verification across scorer, runtime, hybrid viewer, and
+full-walking viewer passed 119 tests in 20.64 seconds. Scoped Ruff check and
+format-check, `py_compile`, and `git diff --check` also passed.

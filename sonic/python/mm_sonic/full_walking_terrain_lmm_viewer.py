@@ -20,6 +20,7 @@ from .full_walking_terrain_lmm_evaluation import (
     compare_baseline_candidate,
 )
 from .hybrid_terrain_lmm_runtime import CommandState, HybridMatcher
+from .hybrid_terrain_lmm_gpu_search import configure_single_gpu_visibility
 from .hybrid_terrain_lmm_viewer import (
     DEFAULT_G1_XML,
     _g1_xml_asset_identity,
@@ -431,6 +432,11 @@ def _full_runtime_label(
     search_acceptance_current: bool | None = None,
     formal_authorities_current: bool | None = None,
 ) -> str:
+    if (
+        getattr(matcher, "search_backend_identity", "cpu-ckdtree-exact")
+        != "cpu-ckdtree-exact"
+    ):
+        return FULL_DIAGNOSTIC_LABEL
     search_eligible = (
         matcher.search_acceptance_eligible
         if search_acceptance_current is None
@@ -614,6 +620,7 @@ def build_parser() -> argparse.ArgumentParser:
     view.add_argument("--g1-xml", type=Path, default=DEFAULT_G1_XML)
     view.add_argument("--gamepad")
     view.add_argument("--max-render-frames", type=int, default=0)
+    view.add_argument("--search-device")
     view.add_argument("--receipt", type=Path)
     return parser
 
@@ -915,6 +922,13 @@ def _full_runtime_identity(
             "search_scope": matcher.search_scope,
             "searched_row_count": len(matcher.searchable_rows),
             "total_safe_row_count": matcher.total_searchable_row_count,
+            "search_backend_identity": getattr(
+                matcher, "search_backend_identity", "cpu-ckdtree-exact"
+            ),
+            "last_search_elapsed_ms": getattr(matcher, "last_search_elapsed_ms", None),
+            "first_runtime_search_elapsed_ms": getattr(
+                matcher, "warm_search_elapsed_ms", None
+            ),
         }
     )
     return identity
@@ -975,6 +989,8 @@ def run_formal_smoke(
 
 def main(argv: list[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
+    if arguments.command == "view" and arguments.search_device is not None:
+        configure_single_gpu_visibility(arguments.search_device)
     corpus = _load_full_corpus(arguments.corpus)
     generator = _load_generator(arguments.model, corpus)
     if arguments.command == "smoke":
@@ -1008,6 +1024,7 @@ def main(argv: list[str] | None = None) -> int:
             generator,
             adapter.authority,
             native_model=native_model,
+            search_device=arguments.search_device,
             initial_root_xy=adapter.spawn_native_xy,
             initial_heading=adapter.spawn_heading,
         )

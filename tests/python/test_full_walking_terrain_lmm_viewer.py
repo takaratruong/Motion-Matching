@@ -576,9 +576,11 @@ def test_full_view_passes_full_identity_and_visible_label_overrides(
     matcher = SimpleNamespace(
         generator=generator,
         search_acceptance_eligible=True,
+        search_backend_identity="cpu-ckdtree-exact",
         fps=60.0,
     )
     call: dict[str, object] = {}
+    matcher_call: dict[str, object] = {}
 
     def fake_run_interactive(*args: object, **kwargs: object) -> dict[str, object]:
         call.update(kwargs)
@@ -595,8 +597,17 @@ def test_full_view_passes_full_identity_and_visible_label_overrides(
     monkeypatch.setattr(
         viewer_module, "load_scene_terrain", lambda *_args, **_kwargs: adapter
     )
+
+    def fake_matcher(*_args: object, **kwargs: object) -> object:
+        matcher_call.update(kwargs)
+        return matcher
+
+    monkeypatch.setattr(viewer_module, "HybridMatcher", fake_matcher)
     monkeypatch.setattr(
-        viewer_module, "HybridMatcher", lambda *_args, **_kwargs: matcher
+        viewer_module,
+        "configure_single_gpu_visibility",
+        lambda _device: pytest.fail("CPU view must not configure GPU visibility"),
+        raising=False,
     )
     monkeypatch.setattr(viewer_module, "run_interactive", fake_run_interactive)
     monkeypatch.setitem(
@@ -610,7 +621,202 @@ def test_full_view_passes_full_identity_and_visible_label_overrides(
     assert call["runtime_identity_resolver"] is _full_runtime_identity
     assert call["formal_authority_predicate"] is _full_formal_artifact_authorities
     assert call["runtime_label_resolver"] is viewer_module._full_runtime_label
+    assert matcher_call["search_device"] is None
     assert fake_run_interactive(matcher, adapter, **call)["label"] == FULL_LABEL
+
+
+def test_full_gpu_view_configures_before_load_and_wires_search_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+    corpus = SimpleNamespace()
+    generator = SimpleNamespace()
+    adapter = SimpleNamespace(
+        authority=object(),
+        spawn_native_xy=np.zeros(2),
+        spawn_heading=0.0,
+    )
+    matcher = SimpleNamespace()
+
+    def configure(device: str) -> None:
+        events.append(("configure", device, "jax" in sys.modules))
+
+    def load_corpus(_path: Path) -> object:
+        events.append("corpus")
+        return corpus
+
+    def load_generator(*_args: object) -> object:
+        events.append("model")
+        return generator
+
+    def build_matcher(*_args: object, **kwargs: object) -> object:
+        events.append(("matcher", kwargs["search_device"]))
+        return matcher
+
+    monkeypatch.setattr(
+        viewer_module, "configure_single_gpu_visibility", configure, raising=False
+    )
+    monkeypatch.setattr(viewer_module, "_load_full_corpus", load_corpus)
+    monkeypatch.setattr(viewer_module, "_load_generator", load_generator)
+    monkeypatch.setattr(
+        viewer_module, "load_scene_terrain", lambda *_args, **_kwargs: adapter
+    )
+    monkeypatch.setattr(viewer_module, "HybridMatcher", build_matcher)
+    monkeypatch.setattr(
+        viewer_module, "run_interactive", lambda *_args, **_kwargs: {"accepted": True}
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "mujoco",
+        SimpleNamespace(MjModel=SimpleNamespace(from_xml_path=lambda _path: object())),
+    )
+
+    assert (
+        main(
+            [
+                "view",
+                "--corpus",
+                "corpus",
+                "--model",
+                "model",
+                "--search-device",
+                "cuda:5",
+            ]
+        )
+        == 0
+    )
+
+    assert events == [
+        ("configure", "cuda:5", False),
+        "corpus",
+        "model",
+        ("matcher", "cuda:5"),
+    ]
+
+
+def test_full_gpu_view_rejects_conflicting_visibility_before_loading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mm_sonic.hybrid_terrain_lmm_gpu_search import (
+        configure_single_gpu_visibility,
+    )
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4")
+    monkeypatch.setattr(
+        viewer_module,
+        "configure_single_gpu_visibility",
+        configure_single_gpu_visibility,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        viewer_module,
+        "_load_full_corpus",
+        lambda _path: pytest.fail("visibility conflict must fail before corpus load"),
+    )
+
+    with pytest.raises(RuntimeError, match="visibility conflicts"):
+        main(
+            [
+                "view",
+                "--corpus",
+                "corpus",
+                "--model",
+                "model",
+                "--search-device",
+                "cuda:5",
+            ]
+        )
+
+
+def test_full_formal_smoke_never_configures_gpu_visibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    corpus = object()
+    generator = object()
+    evaluators: list[object] = []
+
+    def build_evaluator(*_args: object, **_kwargs: object) -> object:
+        evaluator = object()
+        evaluators.append(evaluator)
+        return evaluator
+
+    monkeypatch.setattr(
+        viewer_module,
+        "configure_single_gpu_visibility",
+        lambda _device: pytest.fail("formal smoke must remain CPU-only"),
+    )
+    monkeypatch.setattr(viewer_module, "_load_full_corpus", lambda _path: corpus)
+    monkeypatch.setattr(viewer_module, "_load_baseline_corpus", lambda _path: corpus)
+    monkeypatch.setattr(viewer_module, "_load_generator", lambda *_args: generator)
+    monkeypatch.setattr(viewer_module, "_MuJoCoRouteEvaluator", build_evaluator)
+    monkeypatch.setattr(
+        viewer_module,
+        "run_formal_smoke",
+        lambda baseline, candidate, **_kwargs: {
+            "accepted": baseline is evaluators[0] and candidate is evaluators[1]
+        },
+    )
+
+    argv = [
+        "smoke",
+        "--corpus",
+        "corpus",
+        "--model",
+        "model",
+        "--baseline-corpus",
+        "baseline-corpus",
+        "--baseline-model",
+        "baseline-model",
+    ]
+    for scene in FORMAL_SCENE_IDS:
+        argv.extend(("--scene", scene))
+
+    assert main(argv) == 0
+    assert len(evaluators) == 2
+
+
+def test_full_gpu_identity_and_label_remain_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    matcher = SimpleNamespace(
+        corpus=object(),
+        generator=SimpleNamespace(
+            manifest={"canonical_selection_accepted": True},
+            config=SimpleNamespace(fit_all_rows=True),
+            canonical_selection_verified=True,
+            selection_provenance_verified=True,
+        ),
+        search_acceptance_eligible=True,
+        search_backend_identity="single-gpu-full-row-fp32:cuda:5",
+        last_search_elapsed_ms=7.25,
+        warm_search_elapsed_ms=11.5,
+        search_scope="full-range-safe-corpus",
+        searchable_rows=np.arange(3),
+        total_searchable_row_count=3,
+    )
+    terrain = SimpleNamespace(
+        scene_id="ramp-10-up-down",
+        scene_evidence_status="authenticated-indexed",
+        scene_authenticated=True,
+    )
+    monkeypatch.setattr(viewer_module, "_formal_identity", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        viewer_module, "scene_authentication_is_current", lambda *_args: True
+    )
+
+    identity = _full_runtime_identity(matcher, terrain, Path("g1.xml"))
+    label = viewer_module._full_runtime_label(
+        matcher,
+        terrain,
+        scene_authentication_current=True,
+        formal_authorities_current=True,
+    )
+
+    assert identity["search_backend_identity"] == ("single-gpu-full-row-fp32:cuda:5")
+    assert identity["last_search_elapsed_ms"] == 7.25
+    assert identity["first_runtime_search_elapsed_ms"] == 11.5
+    assert "DIAGNOSTIC" in label
+    assert "EXACT SEARCH" not in label
 
 
 def test_cli_matches_the_planned_smoke_and_view_commands() -> None:
@@ -635,12 +841,43 @@ def test_cli_matches_the_planned_smoke_and_view_commands() -> None:
         ]
     )
     view = parser.parse_args(
-        ["view", "--corpus", "corpus", "--model", "model", "--scene", "ramp-10-up-down"]
+        [
+            "view",
+            "--corpus",
+            "corpus",
+            "--model",
+            "model",
+            "--scene",
+            "ramp-10-up-down",
+            "--search-device",
+            "cuda:5",
+        ]
     )
 
     assert smoke.frames_per_scene == 2500
     assert smoke.scenes == ["flat-standard", "stairs-standard"]
+    assert not hasattr(smoke, "search_device")
     assert view.scene == "ramp-10-up-down"
+    assert view.search_device == "cuda:5"
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "smoke",
+                "--corpus",
+                "corpus",
+                "--model",
+                "model",
+                "--baseline-corpus",
+                "baseline-corpus",
+                "--baseline-model",
+                "baseline-model",
+                "--scene",
+                "flat-standard",
+                "--search-device",
+                "cuda:5",
+            ]
+        )
 
 
 def test_interactive_runtime_uses_authenticated_matcher_rate() -> None:

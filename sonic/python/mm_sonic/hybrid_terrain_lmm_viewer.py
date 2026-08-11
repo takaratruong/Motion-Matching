@@ -26,6 +26,7 @@ from .hybrid_terrain_lmm_runtime import (
     TerrainAuthority,
     _scripted_command,
 )
+from .hybrid_terrain_lmm_gpu_search import configure_single_gpu_visibility
 
 LABEL = (
     "HYBRID TERRAIN LMM POC (EXACT SEARCH + LEARNED GENERATOR; SUPPORTED TERRAIN ONLY)"
@@ -85,6 +86,11 @@ def _runtime_label(
     search_acceptance_current: bool | None = None,
     formal_authorities_current: bool | None = None,
 ) -> str:
+    if (
+        getattr(matcher, "search_backend_identity", "cpu-ckdtree-exact")
+        != "cpu-ckdtree-exact"
+    ):
+        return DIAGNOSTIC_LABEL
     search_eligible = (
         matcher.search_acceptance_eligible
         if search_acceptance_current is None
@@ -925,6 +931,9 @@ def overlay_text(
     paused: bool,
     scene_evidence_status: str = "diagnostic-unindexed",
     generator_accepted: bool = False,
+    search_backend_identity: str | None = None,
+    last_search_elapsed_ms: float | None = None,
+    first_runtime_search_elapsed_ms: float | None = None,
 ) -> tuple[str, str]:
     terrain = np.asarray(state.terrain_features, dtype=np.float64).reshape(4)
     mode = "PAUSED" if paused else str(state.pose_source).upper()
@@ -950,12 +959,28 @@ def overlay_text(
         if exact
         else f"diagnostic capped rows {searched}/{total}"
     )
-    if exact and authenticated_scene and generator_accepted:
+    diagnostic_backend = search_backend_identity not in (None, "cpu-ckdtree-exact")
+    if diagnostic_backend:
+        title = DIAGNOSTIC_LABEL
+    elif exact and authenticated_scene and generator_accepted:
         title = LABEL
     elif exact and authenticated_scene:
         title = DIAGNOSTIC_MODEL_LABEL
     else:
         title = DIAGNOSTIC_TERRAIN_LABEL if exact else DIAGNOSTIC_LABEL
+    backend_text = ""
+    if search_backend_identity is not None:
+        latency_fields = []
+        if last_search_elapsed_ms is not None:
+            latency_fields.append(f"last search {float(last_search_elapsed_ms):.3f} ms")
+        if first_runtime_search_elapsed_ms is not None:
+            latency_fields.append(
+                f"first runtime search {float(first_runtime_search_elapsed_ms):.3f} ms"
+            )
+        backend_text = f"search backend {search_backend_identity}"
+        if latency_fields:
+            backend_text += " | " + " | ".join(latency_fields)
+        backend_text += "\n"
     return title, (
         f"family {state.family} | range {int(state.range_index)} | row {int(state.row)} | "
         f"distance {float(state.search_distance):.6f}\n"
@@ -969,6 +994,7 @@ def overlay_text(
         f"support {state.support_status} | height {float(state.support_height):.3f} | {mode}\n"
         f"search {search_text} {family_counts} | transition penalty "
         f"{float(getattr(state, 'transition_penalty', 0.0)):.3f}\n"
+        f"{backend_text}"
         f"scene evidence {scene_evidence_status}\n"
         "Up/Down speed | Left/Right steer | WASD aliases | Space stop | R reset | X/Esc exit"
     )
@@ -1013,6 +1039,7 @@ def build_parser() -> argparse.ArgumentParser:
     view = commands.choices["view"]
     view.add_argument("--gamepad")
     view.add_argument("--max-render-frames", type=int, default=0)
+    view.add_argument("--search-device")
     return parser
 
 
@@ -1044,6 +1071,7 @@ def _load_matcher(
         adapter.authority,
         native_model=native_model,
         max_search_rows=arguments.search_rows,
+        search_device=getattr(arguments, "search_device", None),
         transition_penalty=arguments.transition_penalty,
         initial_root_xy=adapter.spawn_native_xy,
         initial_heading=adapter.spawn_heading,
@@ -1437,6 +1465,13 @@ def _runtime_identity(
         "searched_family_counts": dict(matcher.searchable_family_counts),
         "total_safe_family_counts": dict(matcher.total_searchable_family_counts),
         "transition_penalty": matcher.transition_penalty,
+        "search_backend_identity": getattr(
+            matcher, "search_backend_identity", "cpu-ckdtree-exact"
+        ),
+        "last_search_elapsed_ms": getattr(matcher, "last_search_elapsed_ms", None),
+        "first_runtime_search_elapsed_ms": getattr(
+            matcher, "warm_search_elapsed_ms", None
+        ),
         "search_identity_current": _search_identity_is_current(matcher),
         "generator_acceptance_status": _generator_acceptance_status(matcher.generator),
         "all_row_canonical_evaluation_identity": (
@@ -1921,6 +1956,15 @@ def run_interactive(
                     paused=False,
                     scene_evidence_status=overlay_scene_status,
                     generator_accepted=interactive_generator_accepted,
+                    search_backend_identity=getattr(
+                        matcher, "search_backend_identity", "cpu-ckdtree-exact"
+                    ),
+                    last_search_elapsed_ms=getattr(
+                        matcher, "last_search_elapsed_ms", None
+                    ),
+                    first_runtime_search_elapsed_ms=getattr(
+                        matcher, "warm_search_elapsed_ms", None
+                    ),
                 )
                 title = label_resolver(
                     matcher,
@@ -1952,6 +1996,17 @@ def run_interactive(
     finally:
         listener.stop()
         listener.join(timeout=1.0)
+    identity.update(
+        {
+            "search_backend_identity": getattr(
+                matcher, "search_backend_identity", "cpu-ckdtree-exact"
+            ),
+            "last_search_elapsed_ms": getattr(matcher, "last_search_elapsed_ms", None),
+            "first_runtime_search_elapsed_ms": getattr(
+                matcher, "warm_search_elapsed_ms", None
+            ),
+        }
+    )
     return {
         "schema": "hybrid-terrain-lmm-viewer-runtime/v1",
         "label": label_resolver(
@@ -2038,6 +2093,8 @@ def write_receipt_exclusive(target: Path, receipt: dict[str, object]) -> Path:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
+    if arguments.command == "view" and arguments.search_device is not None:
+        configure_single_gpu_visibility(arguments.search_device)
     matcher, terrain = _load_matcher(arguments)
     if arguments.command == "smoke":
         receipt = run_mujoco_headless_smoke(
