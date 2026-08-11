@@ -2235,41 +2235,75 @@ class HybridTerrainViewerTests(unittest.TestCase):
         )
         self.assertFalse(receipt["acceptance_eligible"])
 
-    def test_interactive_postprocessor_runs_on_fixed_ticks_and_resets_in_order(self):
+    def test_interactive_primes_postprocessor_on_startup_and_reset(self):
         import mujoco
 
         events: list[str] = []
-        state = SimpleNamespace(
-            qpos=np.arange(36, dtype=np.float64),
-            family="flat",
-            range_index=1,
-            row=2,
-            search_distance=0.0,
-            terrain_features=np.zeros(4),
-            decode_count=0,
-            fallback_count=0,
-            joint_clamp_count=0,
-            max_joint_clamp_magnitude=0.0,
-            support_height=0.0,
-            support_status="SUPPORTED",
-            pose_source="canonical",
-            searchable_row_count=3,
-            searchable_family_counts=(("flat", 3),),
-            total_searchable_row_count=3,
-            search_scope="diagnostic",
-            transition_penalty=0.1,
-        )
-        matcher = SimpleNamespace(
-            artifacts=SimpleNamespace(contacts=np.asarray([[False, False]] * 3)),
-            corpus=object(),
-            state=state,
-            step=lambda _command, *, dt, hard_stop=False: (
-                events.append("matcher.step") or state
-            ),
-            reset=lambda: events.append("matcher.reset") or state,
-            search_scope="diagnostic",
-            search_acceptance_eligible=False,
-        )
+
+        def runtime_state(row: int, value: float) -> SimpleNamespace:
+            return SimpleNamespace(
+                qpos=np.full(36, value, dtype=np.float64),
+                family="flat",
+                range_index=row,
+                row=row,
+                search_distance=0.0,
+                terrain_features=np.zeros(4),
+                decode_count=0,
+                fallback_count=0,
+                joint_clamp_count=0,
+                max_joint_clamp_magnitude=0.0,
+                support_height=0.0,
+                support_status="SUPPORTED",
+                pose_source="canonical",
+                searchable_row_count=4,
+                searchable_family_counts=(("flat", 4),),
+                total_searchable_row_count=4,
+                search_scope="diagnostic",
+                transition_penalty=0.1,
+            )
+
+        initial_state = runtime_state(0, 0.0)
+        first_tick_state = runtime_state(1, 10.0)
+        reset_state = runtime_state(2, 20.0)
+        post_reset_tick_state = runtime_state(3, 30.0)
+
+        class Matcher:
+            def __init__(self) -> None:
+                self.artifacts = SimpleNamespace(
+                    contacts=np.asarray(
+                        (
+                            (False, False),
+                            (True, False),
+                            (False, True),
+                            (True, True),
+                        ),
+                        dtype=bool,
+                    )
+                )
+                self.corpus = object()
+                self.state = initial_state
+                self.fps = 60.0
+                self.search_scope = "diagnostic"
+                self.search_acceptance_eligible = False
+                self._steps = iter((first_tick_state, post_reset_tick_state))
+
+            def step(self, _command, *, dt, hard_stop=False):
+                self.assert_fixed_tick(dt, hard_stop)
+                events.append("matcher.step")
+                self.state = next(self._steps)
+                return self.state
+
+            @staticmethod
+            def assert_fixed_tick(dt, hard_stop):
+                assert dt == 1.0 / 60.0
+                assert hard_stop is False
+
+            def reset(self):
+                events.append("matcher.reset")
+                self.state = reset_state
+                return self.state
+
+        matcher = Matcher()
         terrain = load_scene_terrain("hills")
         postprocessor_identity = {
             "diagnostic_display_postprocessor": (
@@ -2286,15 +2320,52 @@ class HybridTerrainViewerTests(unittest.TestCase):
             "pose_repair_rejection_count": 4,
             "last_reason": "lock rejected",
         }
-        postprocessor = SimpleNamespace(
-            reset=lambda: events.append("postprocessor.reset"),
-            step=lambda qpos, **_kwargs: (
-                events.append("postprocessor.step") or np.asarray(qpos) + 1.0
-            ),
-            identity=lambda: dict(postprocessor_identity),
+        postprocess_calls: list[tuple[int, tuple[bool, bool], float]] = []
+
+        class TransitionHoldingPostprocessor:
+            """Expose whether the viewer seeded the transition source pose."""
+
+            def __init__(self) -> None:
+                self.previous: np.ndarray | None = None
+
+            def reset(self) -> None:
+                events.append("postprocessor.reset")
+                self.previous = None
+
+            def step(
+                self,
+                qpos,
+                *,
+                row,
+                range_index,
+                source_contact,
+                dt_s,
+            ):
+                del range_index
+                events.append(f"postprocessor.step:{row}")
+                postprocess_calls.append(
+                    (int(row), tuple(bool(value) for value in source_contact), dt_s)
+                )
+                raw = np.asarray(qpos, dtype=np.float64)
+                displayed = (
+                    raw.copy() if self.previous is None else self.previous.copy()
+                )
+                self.previous = displayed
+                return displayed
+
+            @staticmethod
+            def identity():
+                return dict(postprocessor_identity)
+
+        postprocessor = TransitionHoldingPostprocessor()
+        snapshots = iter(
+            (
+                (CommandState(), False, False),
+                (CommandState(), True, False),
+            )
         )
         keys = SimpleNamespace(
-            snapshot=lambda: (CommandState(), True, False),
+            snapshot=lambda: next(snapshots),
             hard_stop_active=lambda: False,
             press=lambda _key: None,
             release=lambda _key: None,
@@ -2345,6 +2416,7 @@ class HybridTerrainViewerTests(unittest.TestCase):
                 return None
 
         data = SimpleNamespace(qpos=np.zeros(36, dtype=np.float64))
+        rendered_qposes: list[np.ndarray] = []
         model = object()
         identity = {
             "scene_authentication_current": False,
@@ -2375,7 +2447,10 @@ class HybridTerrainViewerTests(unittest.TestCase):
             mock.patch.object(
                 mujoco,
                 "mj_forward",
-                side_effect=lambda *_args: events.append("mj_forward"),
+                side_effect=lambda *_args: (
+                    events.append("mj_forward"),
+                    rendered_qposes.append(data.qpos.copy()),
+                ),
             ),
             mock.patch("mujoco.viewer.launch_passive", return_value=FakeViewer()),
             mock.patch.object(
@@ -2385,7 +2460,7 @@ class HybridTerrainViewerTests(unittest.TestCase):
             receipt = viewer_module.run_interactive(
                 matcher,
                 terrain,
-                max_render_frames=1,
+                max_render_frames=2,
                 display_postprocessor_factory=factory,
             )
 
@@ -2393,14 +2468,30 @@ class HybridTerrainViewerTests(unittest.TestCase):
         self.assertEqual(
             events,
             [
+                "postprocessor.step:0",
+                "matcher.step",
+                "postprocessor.step:1",
+                "mj_forward",
                 "matcher.reset",
                 "postprocessor.reset",
+                "postprocessor.step:2",
                 "matcher.step",
-                "postprocessor.step",
+                "postprocessor.step:3",
                 "mj_forward",
             ],
         )
-        np.testing.assert_array_equal(data.qpos, state.qpos + 1.0)
+        self.assertEqual(
+            postprocess_calls,
+            [
+                (0, (False, False), 1.0 / 60.0),
+                (1, (True, False), 1.0 / 60.0),
+                (2, (False, True), 1.0 / 60.0),
+                (3, (True, True), 1.0 / 60.0),
+            ],
+        )
+        np.testing.assert_array_equal(rendered_qposes[0], initial_state.qpos)
+        np.testing.assert_array_equal(rendered_qposes[1], reset_state.qpos)
+        np.testing.assert_array_equal(data.qpos, reset_state.qpos)
         self.assertEqual(receipt["identity"]["pose_repair_count"], 3)
         self.assertIn(
             "PoseInertializer + G1TerrainTransitionGuard",

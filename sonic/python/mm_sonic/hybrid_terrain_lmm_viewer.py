@@ -2092,22 +2092,22 @@ def run_interactive(
     )
     overlay_scene_status = terrain.scene_evidence_status
     data = mujoco.MjData(model)
-    accumulator = FixedRateAccumulator(step_hz=step_hz_resolver(matcher))
+    step_hz = step_hz_resolver(matcher)
+    accumulator = FixedRateAccumulator(step_hz=step_hz)
+    display_dt = 1.0 / step_hz
     render_frames = 0
     reset_failures = 0
     started = time.monotonic()
     last_clock = started
     next_scene_authentication_check = started
-    display_qpos = np.asarray(matcher.state.qpos)
 
-    def fixed_rate_step(dt: float, command: CommandState, hard_stop: bool) -> None:
-        nonlocal display_qpos
-        state = matcher.step(command, dt=dt, hard_stop=hard_stop)
-        display_qpos = (
-            state.qpos
-            if postprocessor is None
-            else postprocessor.step(
-                state.qpos,
+    def display_pose(state: object, dt: float) -> np.ndarray:
+        raw = np.asarray(state.qpos)
+        if postprocessor is None:
+            return raw
+        return np.asarray(
+            postprocessor.step(
+                raw,
                 row=state.row,
                 range_index=state.range_index,
                 source_contact=np.asarray(
@@ -2117,7 +2117,15 @@ def run_interactive(
             )
         )
 
+    display_qpos = np.asarray(matcher.state.qpos)
+
+    def fixed_rate_step(dt: float, command: CommandState, hard_stop: bool) -> None:
+        nonlocal display_qpos
+        state = matcher.step(command, dt=dt, hard_stop=hard_stop)
+        display_qpos = display_pose(state, dt)
+
     try:
+        display_qpos = display_pose(matcher.state, display_dt)
         with mujoco.viewer.launch_passive(
             model, data, show_left_ui=False, show_right_ui=False
         ) as viewer:
@@ -2141,12 +2149,13 @@ def run_interactive(
                 )
                 if reset:
                     previous = matcher.state
-                    _, error = reset_without_mutation_on_failure(
+                    reset_state, error = reset_without_mutation_on_failure(
                         previous, matcher.reset
                     )
                     reset_failures += int(error is not None)
                     if error is None and postprocessor is not None:
                         postprocessor.reset()
+                        display_qpos = display_pose(reset_state, display_dt)
                 accumulator.advance(
                     elapsed,
                     lambda dt, command=command, hard_stop=hard_stop: fixed_rate_step(
