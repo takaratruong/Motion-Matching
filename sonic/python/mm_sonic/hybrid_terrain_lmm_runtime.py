@@ -26,7 +26,6 @@ MAX_NATIVE_LIMIT_CANDIDATE_REJECTIONS = 32
 DIAGNOSTIC_MIN_PELVIS_SUPPORT_CLEARANCE_M = 0.4
 DIAGNOSTIC_MAX_PELVIS_SUPPORT_CLEARANCE_M = 1.2
 DIAGNOSTIC_MAX_SUCCESSOR_CLEARANCE_STEP_M = 0.1
-DIAGNOSTIC_MAX_SEARCH_JUMP_ARTICULATED_QPOS_DELTA_RAD = 0.5
 TERRAIN_INDICES = slice(27, 31)
 TRAJECTORY_INDICES = slice(15, 27)
 
@@ -1395,7 +1394,6 @@ class HybridMatcher:
         live_raw: np.ndarray | None = None,
         live_domain_supported: bool | None = None,
         reject_learned_native_limit: bool = False,
-        diagnostic_search_jump: bool = False,
     ) -> HybridRuntimeState:
         if (
             self.diagnostic_stability
@@ -1528,25 +1526,6 @@ class HybridMatcher:
             fallback_count += int(count_decode)
             if max_joint_clamp_magnitude == 0.0:
                 pose_source = "canonical-fallback"
-
-        if diagnostic_search_jump:
-            if not (
-                self.diagnostic_stability and self.diagnostic_canonical_source_pose
-            ):
-                raise AssertionError(
-                    "diagnostic search-jump validation requires canonical-source "
-                    "diagnostic stability"
-                )
-            articulated_delta = float(
-                np.max(np.abs(proposed_qpos[7:] - self.state.qpos[7:]))
-            )
-            if (
-                articulated_delta
-                > DIAGNOSTIC_MAX_SEARCH_JUMP_ARTICULATED_QPOS_DELTA_RAD
-            ):
-                raise _DiagnosticPoseError(
-                    "diagnostic search jump exceeded the articulated-qpos limit"
-                )
 
         proposed = HybridRuntimeState(
             row=int(row),
@@ -1687,10 +1666,6 @@ class HybridMatcher:
                     live_raw=prepared_live_raw,
                     live_domain_supported=prepared_live_domain_supported,
                     reject_learned_native_limit=True,
-                    diagnostic_search_jump=(
-                        self.diagnostic_canonical_source_pose
-                        and not candidate_advances_source
-                    ),
                 )
                 break
             except _OutsideSupportError:
