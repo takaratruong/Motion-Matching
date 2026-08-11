@@ -14,10 +14,17 @@ import numpy as np
 from mm_sonic.terrain_oracle.canonical import ISAACLAB_JOINT_NAMES
 
 from .layout import (
+    CLASSIC_G1_INPUT_LAYOUT_V3,
     CONTACT_ORDER,
     INPUT_LAYOUT,
     OUTPUT_LAYOUT,
     TRAJECTORY_TIMES_S,
+)
+from .features import (
+    PFNNTrainingWindow,
+    _JOINT_MIRROR,
+    _JOINT_MIRROR_SIGN,
+    mirror_window,
 )
 from .provenance import (
     DATASET_SCHEMA,
@@ -49,6 +56,85 @@ _SOURCE_RECORD_FIELDS = {
 }
 _TERRAIN_CLASSES = ("flat", "ascent", "descent", "transition")
 _SEQUENCE_LANES = ("motion", *(f"idle_phase_{index}" for index in range(8)))
+
+JOINT_MIRROR_PERMUTATION = np.asarray(_JOINT_MIRROR, dtype=np.int64).copy()
+JOINT_MIRROR_PERMUTATION.flags.writeable = False
+JOINT_MIRROR_SIGN = np.asarray(_JOINT_MIRROR_SIGN, dtype=np.float32).copy()
+JOINT_MIRROR_SIGN.flags.writeable = False
+
+
+def pack_classic_g1_input_v3(
+    base_input: object,
+    joint_position: object,
+    joint_velocity: object,
+) -> np.ndarray:
+    """Append exact physical G1 joint state to one legacy 288-value input."""
+
+    base = np.asarray(base_input, dtype=np.float32)
+    position = np.asarray(joint_position, dtype=np.float32)
+    velocity = np.asarray(joint_velocity, dtype=np.float32)
+    if base.shape != (INPUT_LAYOUT.size,):
+        raise ValueError("base_input must have shape (288,)")
+    if position.shape != (29,) or velocity.shape != (29,):
+        raise ValueError("joint position and velocity must have shape (29,)")
+    if not all(np.isfinite(value).all() for value in (base, position, velocity)):
+        raise ValueError("classic G1 v3 input values must be finite")
+    output = np.empty(CLASSIC_G1_INPUT_LAYOUT_V3.size, dtype=np.float32)
+    output[: INPUT_LAYOUT.size] = base
+    output[CLASSIC_G1_INPUT_LAYOUT_V3["joint_position"]] = position
+    output[CLASSIC_G1_INPUT_LAYOUT_V3["joint_velocity"]] = velocity
+    return output
+
+
+def mirror_classic_g1_joint_state(value: object) -> np.ndarray:
+    """Apply the committed 29-joint sagittal permutation/sign convention."""
+
+    array = np.asarray(value, dtype=np.float32)
+    if array.shape != (29,) or not np.isfinite(array).all():
+        raise ValueError("classic G1 joint state must contain 29 finite values")
+    return np.ascontiguousarray(
+        array[JOINT_MIRROR_PERMUTATION] * JOINT_MIRROR_SIGN,
+        dtype=np.float32,
+    )
+
+
+def mirror_classic_g1_physical_row_v3(
+    x: object, y: object, phase: object
+) -> tuple[np.ndarray, np.ndarray, np.float32]:
+    """Mirror one physical 346/268 row without normalizing or synthesizing state."""
+
+    input_value = np.asarray(x, dtype=np.float32)
+    target_value = np.asarray(y, dtype=np.float32)
+    if input_value.shape != (CLASSIC_G1_INPUT_LAYOUT_V3.size,):
+        raise ValueError("classic G1 v3 x must have shape (346,)")
+    if target_value.shape != (OUTPUT_LAYOUT.size,):
+        raise ValueError("classic G1 y must have shape (268,)")
+    if not np.isfinite(input_value).all() or not np.isfinite(target_value).all():
+        raise ValueError("classic G1 physical row must be finite")
+    window = PFNNTrainingWindow(
+        x=input_value[: INPUT_LAYOUT.size],
+        y=target_value,
+        phase=float(phase),
+        clip_id="terrain_slopes__slope_000__000",
+        split_identity="slope_000",
+        split="train",
+        sequence_lane="motion",
+        center_frame=0,
+        motion_sha256="a" * 64,
+        terrain_sha256="b" * 64,
+        terrain_class="flat",
+    )
+    mirrored = mirror_window(window)
+    mirrored_input = pack_classic_g1_input_v3(
+        mirrored.x,
+        mirror_classic_g1_joint_state(
+            input_value[CLASSIC_G1_INPUT_LAYOUT_V3["joint_position"]]
+        ),
+        mirror_classic_g1_joint_state(
+            input_value[CLASSIC_G1_INPUT_LAYOUT_V3["joint_velocity"]]
+        ),
+    )
+    return mirrored_input, mirrored.y.copy(), np.float32(mirrored.phase)
 
 
 def _sha256(path: Path) -> str:
@@ -167,10 +253,12 @@ def _validated_input_normalization_values(
     value = np.asarray(x, dtype=np.float32)
     mean = np.asarray(x_mean, dtype=np.float32)
     std = np.asarray(x_std, dtype=np.float32)
-    if value.shape[-1:] != (INPUT_LAYOUT.size,):
-        raise ValueError("x must end in 288 features")
-    if mean.shape != (INPUT_LAYOUT.size,) or std.shape != (INPUT_LAYOUT.size,):
-        raise ValueError("x normalization arrays must have shape (288,)")
+    supported_widths = (INPUT_LAYOUT.size, CLASSIC_G1_INPUT_LAYOUT_V3.size)
+    if value.shape[-1:] not in tuple((width,) for width in supported_widths):
+        raise ValueError("x must end in 288 or 346 features")
+    width = value.shape[-1]
+    if mean.shape != (width,) or std.shape != (width,):
+        raise ValueError("x and normalization arrays must have the same supported shape")
     if not np.isfinite(value).all() or not np.isfinite(mean).all() or not np.isfinite(std).all():
         raise ValueError("x and normalization arrays must be finite")
     if np.any(std <= 0.0):
@@ -218,20 +306,27 @@ def normalize_pfnn_output(
 
 
 def pfnn_input_sha256(value: object) -> str:
-    """Hash one canonical normalized 288-value PFNN input.
+    """Hash one canonical normalized 288- or 346-value PFNN input.
 
-    The receipt domain is fixed and values are contiguous little-endian
-    binary32, so the digest is independent of host array strides and byte order.
+    The v1 domain remains byte-compatible for 288-value artifacts. The v3
+    domain binds all 346 values, so neither layout can be mistaken for the
+    other even if a caller supplies the same binary prefix.
     """
 
     array = np.ascontiguousarray(np.asarray(value, dtype="<f4"))
-    if array.shape != (INPUT_LAYOUT.size,) or not np.isfinite(array).all():
-        raise ValueError("normalized PFNN input receipt requires 288 finite values")
+    domains = {
+        INPUT_LAYOUT.size: b"mm-sonic-normalized-pfnn-input/v1\0",
+        CLASSIC_G1_INPUT_LAYOUT_V3.size: b"mm-sonic-normalized-pfnn-input/v3\0",
+    }
+    if array.ndim != 1 or len(array) not in domains or not np.isfinite(array).all():
+        raise ValueError(
+            "normalized PFNN input receipt requires 288 or 346 finite values"
+        )
     # IEEE negative zero is numerically identical and may arise from an
     # otherwise exact frame rotation, so canonicalize both signs to +0.
     array = array.copy()
     array[array == 0.0] = np.float32(0.0)
-    digest = hashlib.sha256(b"mm-sonic-normalized-pfnn-input/v1\0")
+    digest = hashlib.sha256(domains[len(array)])
     digest.update(array.tobytes(order="C"))
     return digest.hexdigest()
 
@@ -462,9 +557,14 @@ class PFNNShardDataset:
 
 
 __all__ = [
+    "JOINT_MIRROR_PERMUTATION",
+    "JOINT_MIRROR_SIGN",
     "PFNNShardDataset",
     "denormalize_pfnn_input",
+    "mirror_classic_g1_joint_state",
+    "mirror_classic_g1_physical_row_v3",
     "normalize_pfnn_input",
     "normalize_pfnn_output",
+    "pack_classic_g1_input_v3",
     "pfnn_input_sha256",
 ]

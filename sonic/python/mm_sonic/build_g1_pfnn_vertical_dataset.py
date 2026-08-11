@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import argparse
+from collections import Counter, defaultdict
 import hashlib
 import json
 import os
@@ -15,24 +16,36 @@ from typing import Callable, Literal, Mapping
 
 import numpy as np
 
-from mm_sonic.grail_terrain_source import G1MujocoFK
+from mm_sonic.grail_terrain_source import G1MujocoFK, mujoco_to_isaaclab_joints
 from mm_sonic.pfnn_terrain_fit import (
     PFNNTerrainFit,
     fit_terrain_cycle,
     released_pfnn_contacts_for_interval,
     save_terrain_fit,
 )
+from mm_sonic.retarget_pfnn_bvh_g1 import G1_JOINT_NAMES
 from mm_sonic.terrain_oracle.canonical import ISAACLAB_JOINT_NAMES
+from mm_sonic.terrain_oracle.math3d import finite_difference
 from mm_sonic.terrain_pfnn.features import (
     PFNNTrainingWindow,
     build_clip_windows_with_audit,
     mirror_window,
 )
+from mm_sonic.terrain_pfnn.dataset import (
+    mirror_classic_g1_joint_state,
+    pack_classic_g1_input_v3,
+)
 from mm_sonic.terrain_pfnn.layout import (
+    CLASSIC_G1_INPUT_LAYOUT_V3,
     CONTACT_ORDER,
     INPUT_LAYOUT,
     OUTPUT_LAYOUT,
     TRAJECTORY_TIMES_S,
+)
+from mm_sonic.terrain_pfnn.provenance import (
+    MAXIMUM_JOINT_STEP_RAD,
+    canonical_joint_state_receipt,
+    validate_joint_state_receipt,
 )
 from mm_sonic.terrain_pfnn.pfnn_surface import (
     PFNN_G1_Z_OFFSET_M,
@@ -42,7 +55,7 @@ from mm_sonic.terrain_pfnn.phase import ContactPhaseTrack, released_pfnn_phase_t
 from mm_sonic.terrain_pfnn.sources import PFNNSourceClip, load_pfnn_retarget_source
 
 
-VERTICAL_DATASET_SCHEMA = "g1-pfnn-vertical-dataset/v2"
+VERTICAL_DATASET_SCHEMA = "g1-pfnn-vertical-dataset/v3"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SPLITS = ("train", "validation")
 _SPLIT_FIELDS = {
@@ -150,7 +163,7 @@ class VerticalSplitArrays:
     def __post_init__(self) -> None:
         count = len(np.asarray(self.phase))
         expected = {
-            "x": ((count, INPUT_LAYOUT.size), np.dtype(np.float32)),
+            "x": ((count, CLASSIC_G1_INPUT_LAYOUT_V3.size), np.dtype(np.float32)),
             "y": ((count, OUTPUT_LAYOUT.size), np.dtype(np.float32)),
             "phase": ((count,), np.dtype(np.float32)),
             "clip_id": ((count,), np.dtype("<U128")),
@@ -194,6 +207,7 @@ class VerticalDataset:
     retarget_manifest_sha256: str
     terrain_receipt_set_sha256: str
     source_roles: Mapping[str, str]
+    joint_state_receipt: Mapping[str, object]
     dataset_sha256: str
 
     def __post_init__(self) -> None:
@@ -208,8 +222,8 @@ class VerticalDataset:
             raise TypeError("vertical dataset split value is invalid")
         object.__setattr__(self, "splits", MappingProxyType(checked_splits))
         for name, width in (
-            ("x_mean", INPUT_LAYOUT.size),
-            ("x_std", INPUT_LAYOUT.size),
+            ("x_mean", CLASSIC_G1_INPUT_LAYOUT_V3.size),
+            ("x_std", CLASSIC_G1_INPUT_LAYOUT_V3.size),
             ("y_mean", OUTPUT_LAYOUT.size),
             ("y_std", OUTPUT_LAYOUT.size),
         ):
@@ -233,6 +247,8 @@ class VerticalDataset:
         ):
             raise ValueError("vertical source roles are invalid")
         object.__setattr__(self, "source_roles", MappingProxyType(dict(sorted(roles.items()))))
+        receipt = validate_joint_state_receipt(self.joint_state_receipt)
+        object.__setattr__(self, "joint_state_receipt", MappingProxyType(receipt))
 
 
 def _array_digest_update(digest: object, name: str, value: np.ndarray) -> None:
@@ -273,14 +289,16 @@ def _dataset_digest(
     retarget_manifest_sha256: str,
     terrain_receipt_set_sha256: str,
     source_roles: Mapping[str, str],
+    joint_state_receipt: Mapping[str, object],
 ) -> str:
-    digest = hashlib.sha256(b"g1-pfnn-vertical-dataset/v2\0")
+    digest = hashlib.sha256(b"g1-pfnn-vertical-dataset/v3\0")
     provenance = json.dumps(
         {
             "selection_sha256": selection_sha256,
             "retarget_manifest_sha256": retarget_manifest_sha256,
             "terrain_receipt_set_sha256": terrain_receipt_set_sha256,
             "source_roles": dict(sorted(source_roles.items())),
+            "joint_state_receipt": dict(joint_state_receipt),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -295,38 +313,45 @@ def _dataset_digest(
     return digest.hexdigest()
 
 
-def _split_arrays(
-    rows: list[tuple[PFNNTrainingWindow, int, str, bool, np.ndarray, float]]
-) -> VerticalSplitArrays:
+@dataclass(frozen=True)
+class _VerticalRow:
+    window: PFNNTrainingWindow
+    x: np.ndarray
+    center_frame_120hz: int
+    terrain_sha256: str
+    mirrored: bool
+    root_world_xy: np.ndarray
+    root_world_yaw: float
+
+
+def _split_arrays(rows: list[_VerticalRow]) -> VerticalSplitArrays:
     return VerticalSplitArrays(
-        x=np.stack([row.x for row, _, _, _, _, _ in rows]).astype(np.float32),
-        y=np.stack([row.y for row, _, _, _, _, _ in rows]).astype(np.float32),
+        x=np.stack([row.x for row in rows]).astype(np.float32),
+        y=np.stack([row.window.y for row in rows]).astype(np.float32),
         phase=np.asarray(
-            [row.phase for row, _, _, _, _, _ in rows], dtype=np.float32
+            [row.window.phase for row in rows], dtype=np.float32
         ),
         clip_id=np.asarray(
-            [row.clip_id for row, _, _, _, _, _ in rows], dtype="<U128"
+            [row.window.clip_id for row in rows], dtype="<U128"
         ),
         sequence_lane=np.asarray(
-            [row.sequence_lane for row, _, _, _, _, _ in rows], dtype="<U16"
+            [row.window.sequence_lane for row in rows], dtype="<U16"
         ),
         center_frame_120hz=np.asarray(
-            [center for _, center, _, _, _, _ in rows], dtype=np.int64
+            [row.center_frame_120hz for row in rows], dtype=np.int64
         ),
-        root_world_xy=np.stack([root for _, _, _, _, root, _ in rows]).astype(
-            np.float32
-        ),
+        root_world_xy=np.stack([row.root_world_xy for row in rows]).astype(np.float32),
         root_world_yaw=np.asarray(
-            [yaw for _, _, _, _, _, yaw in rows], dtype=np.float32
+            [row.root_world_yaw for row in rows], dtype=np.float32
         ),
         terrain_class=np.asarray(
-            [row.terrain_class for row, _, _, _, _, _ in rows], dtype="<U10"
+            [row.window.terrain_class for row in rows], dtype="<U10"
         ),
         terrain_sha256=np.asarray(
-            [terrain for _, _, terrain, _, _, _ in rows], dtype="<U64"
+            [row.terrain_sha256 for row in rows], dtype="<U64"
         ),
         mirrored=np.asarray(
-            [mirrored for _, _, _, mirrored, _, _ in rows], dtype=np.bool_
+            [row.mirrored for row in rows], dtype=np.bool_
         ),
     )
 
@@ -349,12 +374,14 @@ def build_vertical_dataset(sources: tuple[VerticalSliceSource, ...]) -> Vertical
     if len(selection) != 1 or len(retarget) != 1:
         raise ValueError("vertical source provenance mismatch")
 
-    rows: dict[
-        str, list[tuple[PFNNTrainingWindow, int, str, bool, np.ndarray, float]]
-    ] = {
-        name: [] for name in _SPLITS
-    }
+    rows: dict[str, list[_VerticalRow]] = {name: [] for name in _SPLITS}
     keys: set[tuple[str, str, int, str, bool]] = set()
+    accepted_rows: Counter[str] = Counter({source.stem: 0 for source in ordered})
+    rejected_rows: defaultdict[str, Counter[str]] = defaultdict(Counter)
+    rejected_joints: Counter[str] = Counter(
+        {name: 0 for name in ISAACLAB_JOINT_NAMES}
+    )
+    state_sources = {source.stem: "direct_source" for source in ordered}
     for source in ordered:
         for segment in source.segments:
             result = build_clip_windows_with_audit(
@@ -384,10 +411,40 @@ def build_vertical_dataset(sources: tuple[VerticalSliceSource, ...]) -> Vertical
                         1.0 - 2.0 * (y * y + z * z),
                     )
                 )
-                values = [(window, False)]
+                joint_position = source.clip.joint_position[window.center_frame]
+                joint_velocity = source.clip.joint_velocity[window.center_frame]
+                transition = np.abs(
+                    window.y[OUTPUT_LAYOUT["joint_position"]] - joint_position
+                )
+                unsafe = np.flatnonzero(transition > MAXIMUM_JOINT_STEP_RAD)
+                if len(unsafe):
+                    rejected_rows[source.stem]["joint_step_exceeds_limit"] += 1
+                    for joint_index in unsafe:
+                        rejected_joints[ISAACLAB_JOINT_NAMES[int(joint_index)]] += 1
+                    continue
+                values = [
+                    (
+                        window,
+                        pack_classic_g1_input_v3(
+                            window.x, joint_position, joint_velocity
+                        ),
+                        False,
+                    )
+                ]
                 if source.role == "train":
-                    values.append((mirror_window(window), True))
-                for value, mirrored in values:
+                    mirrored_window = mirror_window(window)
+                    values.append(
+                        (
+                            mirrored_window,
+                            pack_classic_g1_input_v3(
+                                mirrored_window.x,
+                                mirror_classic_g1_joint_state(joint_position),
+                                mirror_classic_g1_joint_state(joint_velocity),
+                            ),
+                            True,
+                        )
+                    )
+                for value, x_v3, mirrored in values:
                     key = (
                         source.role,
                         source.stem,
@@ -399,15 +456,17 @@ def build_vertical_dataset(sources: tuple[VerticalSliceSource, ...]) -> Vertical
                         raise ValueError("duplicate PFNN window")
                     keys.add(key)
                     rows[source.role].append(
-                        (
-                            value,
-                            center,
-                            segment.terrain_sha256,
-                            mirrored,
-                            root_xy,
-                            root_yaw,
+                        _VerticalRow(
+                            window=value,
+                            x=x_v3,
+                            center_frame_120hz=center,
+                            terrain_sha256=segment.terrain_sha256,
+                            mirrored=mirrored,
+                            root_world_xy=root_xy,
+                            root_world_yaw=root_yaw,
                         )
                     )
+                    accepted_rows[source.stem] += 1
     split_arrays = {name: _split_arrays(rows[name]) for name in _SPLITS}
     train = split_arrays["train"]
     x_mean = np.mean(train.x, axis=0, dtype=np.float64).astype(np.float32)
@@ -427,6 +486,14 @@ def build_vertical_dataset(sources: tuple[VerticalSliceSource, ...]) -> Vertical
     }
     terrain_receipt = _terrain_receipt_set_sha256(ordered)
     source_roles = dict(sorted(identities.items()))
+    joint_state_receipt = canonical_joint_state_receipt(
+        accepted_rows_by_source=dict(accepted_rows),
+        rejected_rows_by_source={
+            source: dict(counts) for source, counts in rejected_rows.items()
+        },
+        rejected_rows_by_joint=dict(rejected_joints),
+        state_source_by_clip=state_sources,
+    )
     dataset_sha256 = _dataset_digest(
         split_arrays,
         normalization,
@@ -434,6 +501,7 @@ def build_vertical_dataset(sources: tuple[VerticalSliceSource, ...]) -> Vertical
         retarget_manifest_sha256=next(iter(retarget)),
         terrain_receipt_set_sha256=terrain_receipt,
         source_roles=source_roles,
+        joint_state_receipt=joint_state_receipt,
     )
     return VerticalDataset(
         splits=split_arrays,
@@ -442,6 +510,7 @@ def build_vertical_dataset(sources: tuple[VerticalSliceSource, ...]) -> Vertical
         retarget_manifest_sha256=next(iter(retarget)),
         terrain_receipt_set_sha256=terrain_receipt,
         source_roles=source_roles,
+        joint_state_receipt=joint_state_receipt,
         dataset_sha256=dataset_sha256,
     )
 
@@ -513,7 +582,8 @@ def save_vertical_dataset(path: Path, dataset: VerticalDataset) -> Path:
         "schema": VERTICAL_DATASET_SCHEMA,
         "status": "accepted",
         "fps": 30.0,
-        "input_size": INPUT_LAYOUT.size,
+        "input_size": CLASSIC_G1_INPUT_LAYOUT_V3.size,
+        "input_layout": [list(field) for field in CLASSIC_G1_INPUT_LAYOUT_V3.fields],
         "output_size": OUTPUT_LAYOUT.size,
         "joint_order": list(ISAACLAB_JOINT_NAMES),
         "trajectory_times_s": TRAJECTORY_TIMES_S.tolist(),
@@ -522,6 +592,7 @@ def save_vertical_dataset(path: Path, dataset: VerticalDataset) -> Path:
         "retarget_manifest_sha256": dataset.retarget_manifest_sha256,
         "terrain_receipt_set_sha256": dataset.terrain_receipt_set_sha256,
         "source_roles": dict(dataset.source_roles),
+        "joint_state_receipt": dict(dataset.joint_state_receipt),
         "splits": records,
         "normalization": {
             "path": "normalization.npz",
@@ -556,6 +627,7 @@ def load_vertical_dataset(path: Path) -> VerticalDataset:
         "status",
         "fps",
         "input_size",
+        "input_layout",
         "output_size",
         "joint_order",
         "trajectory_times_s",
@@ -564,6 +636,7 @@ def load_vertical_dataset(path: Path) -> VerticalDataset:
         "retarget_manifest_sha256",
         "terrain_receipt_set_sha256",
         "source_roles",
+        "joint_state_receipt",
         "splits",
         "normalization",
         "dataset_sha256",
@@ -574,7 +647,9 @@ def load_vertical_dataset(path: Path) -> VerticalDataset:
         or manifest["schema"] != VERTICAL_DATASET_SCHEMA
         or manifest["status"] != "accepted"
         or manifest["fps"] != 30.0
-        or manifest["input_size"] != INPUT_LAYOUT.size
+        or manifest["input_size"] != CLASSIC_G1_INPUT_LAYOUT_V3.size
+        or manifest["input_layout"]
+        != [list(field) for field in CLASSIC_G1_INPUT_LAYOUT_V3.fields]
         or manifest["output_size"] != OUTPUT_LAYOUT.size
         or manifest["joint_order"] != list(ISAACLAB_JOINT_NAMES)
         or manifest["trajectory_times_s"] != TRAJECTORY_TIMES_S.tolist()
@@ -625,6 +700,7 @@ def load_vertical_dataset(path: Path) -> VerticalDataset:
         retarget_manifest_sha256=manifest["retarget_manifest_sha256"],
         terrain_receipt_set_sha256=manifest["terrain_receipt_set_sha256"],
         source_roles=manifest["source_roles"],
+        joint_state_receipt=manifest["joint_state_receipt"],
     )
     if rebuilt_digest != manifest["dataset_sha256"]:
         raise ValueError("vertical dataset digest mismatch")
@@ -635,8 +711,298 @@ def load_vertical_dataset(path: Path) -> VerticalDataset:
         retarget_manifest_sha256=manifest["retarget_manifest_sha256"],
         terrain_receipt_set_sha256=manifest["terrain_receipt_set_sha256"],
         source_roles=manifest["source_roles"],
+        joint_state_receipt=manifest["joint_state_receipt"],
         dataset_sha256=rebuilt_digest,
     )
+
+
+def _load_authenticated_vertical_v2(
+    path: Path,
+) -> tuple[dict[str, object], dict[str, dict[str, np.ndarray]], dict[str, np.ndarray]]:
+    """Read the sealed compact v2 corpus solely as a migration source."""
+
+    root = Path(path).expanduser().resolve(strict=True)
+    manifest = _read_json(root / "manifest.json", "vertical v2 manifest")
+    required = {
+        "schema", "status", "fps", "input_size", "output_size", "joint_order",
+        "trajectory_times_s", "contact_order", "selection_sha256",
+        "retarget_manifest_sha256", "terrain_receipt_set_sha256", "source_roles",
+        "splits", "normalization", "dataset_sha256",
+    }
+    if (
+        set(manifest) != required
+        or manifest.get("schema") != "g1-pfnn-vertical-dataset/v2"
+        or manifest.get("status") != "accepted"
+        or manifest.get("fps") != 30.0
+        or manifest.get("input_size") != INPUT_LAYOUT.size
+        or manifest.get("output_size") != OUTPUT_LAYOUT.size
+        or manifest.get("joint_order") != list(ISAACLAB_JOINT_NAMES)
+        or manifest.get("trajectory_times_s") != TRAJECTORY_TIMES_S.tolist()
+        or manifest.get("contact_order") != list(CONTACT_ORDER)
+        or not isinstance(manifest.get("splits"), dict)
+        or set(manifest["splits"]) != set(_SPLITS)
+    ):
+        raise ValueError("vertical v2 migration manifest contract is invalid")
+    split_arrays: dict[str, dict[str, np.ndarray]] = {}
+    for split in _SPLITS:
+        record = manifest["splits"][split]
+        if type(record) is not dict or set(record) != {"path", "sha256", "count"}:
+            raise ValueError("vertical v2 migration split record is invalid")
+        source = _artifact_path(root, record["path"])
+        if _sha256(source) != record["sha256"]:
+            raise ValueError("vertical v2 migration split digest mismatch")
+        try:
+            with np.load(source, allow_pickle=False) as archive:
+                if set(archive.files) != _SPLIT_FIELDS:
+                    raise ValueError("vertical v2 migration split fields are invalid")
+                arrays = {
+                    name: np.asarray(archive[name]).copy() for name in archive.files
+                }
+        except (OSError, ValueError, KeyError) as error:
+            raise ValueError("vertical v2 migration split is invalid") from error
+        count = record["count"]
+        expected = {
+            "x": ((count, INPUT_LAYOUT.size), np.dtype(np.float32)),
+            "y": ((count, OUTPUT_LAYOUT.size), np.dtype(np.float32)),
+            "phase": ((count,), np.dtype(np.float32)),
+            "clip_id": ((count,), np.dtype("<U128")),
+            "sequence_lane": ((count,), np.dtype("<U16")),
+            "center_frame_120hz": ((count,), np.dtype(np.int64)),
+            "root_world_xy": ((count, 2), np.dtype(np.float32)),
+            "root_world_yaw": ((count,), np.dtype(np.float32)),
+            "terrain_class": ((count,), np.dtype("<U10")),
+            "terrain_sha256": ((count,), np.dtype("<U64")),
+            "mirrored": ((count,), np.dtype(np.bool_)),
+        }
+        if type(count) is not int or count < 1 or any(
+            arrays[name].shape != shape or arrays[name].dtype != dtype
+            for name, (shape, dtype) in expected.items()
+        ):
+            raise ValueError("vertical v2 migration split shape is invalid")
+        if not all(
+            np.isfinite(arrays[name]).all()
+            for name in ("x", "y", "phase", "root_world_xy", "root_world_yaw")
+        ):
+            raise ValueError("vertical v2 migration split contains nonfinite values")
+        split_arrays[split] = arrays
+    normal = manifest["normalization"]
+    if type(normal) is not dict or set(normal) != {
+        "path", "sha256", "training_sample_count"
+    }:
+        raise ValueError("vertical v2 migration normalization record is invalid")
+    normal_path = _artifact_path(root, normal["path"])
+    if _sha256(normal_path) != normal["sha256"]:
+        raise ValueError("vertical v2 migration normalization digest mismatch")
+    try:
+        with np.load(normal_path, allow_pickle=False) as archive:
+            if set(archive.files) != {"x_mean", "x_std", "y_mean", "y_std"}:
+                raise ValueError("vertical v2 migration normalization fields are invalid")
+            normalization = {
+                name: np.asarray(archive[name]).copy() for name in archive.files
+            }
+    except (OSError, ValueError, KeyError) as error:
+        raise ValueError("vertical v2 migration normalization is invalid") from error
+    for name, width in (
+        ("x_mean", INPUT_LAYOUT.size), ("x_std", INPUT_LAYOUT.size),
+        ("y_mean", OUTPUT_LAYOUT.size), ("y_std", OUTPUT_LAYOUT.size),
+    ):
+        if normalization[name].shape != (width,) or normalization[name].dtype != np.float32:
+            raise ValueError("vertical v2 migration normalization shape is invalid")
+    digest = hashlib.sha256(b"g1-pfnn-vertical-dataset/v2\0")
+    digest.update(json.dumps(
+        {
+            "selection_sha256": manifest["selection_sha256"],
+            "retarget_manifest_sha256": manifest["retarget_manifest_sha256"],
+            "terrain_receipt_set_sha256": manifest["terrain_receipt_set_sha256"],
+            "source_roles": dict(sorted(manifest["source_roles"].items())),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8"))
+    for split in _SPLITS:
+        for name in sorted(_SPLIT_FIELDS):
+            _array_digest_update(digest, f"{split}/{name}", split_arrays[split][name])
+    for name in sorted(normalization):
+        _array_digest_update(digest, f"normalization/{name}", normalization[name])
+    if digest.hexdigest() != manifest["dataset_sha256"]:
+        raise ValueError("vertical v2 migration dataset digest mismatch")
+    return manifest, split_arrays, normalization
+
+
+def _authenticated_retarget_joint_state(
+    retarget_root: Path,
+    expected_manifest_sha256: str,
+) -> dict[str, tuple[int, np.ndarray, np.ndarray]]:
+    root = Path(retarget_root).expanduser().resolve(strict=True)
+    manifest_path = root / "retarget-manifest.json"
+    if _sha256(manifest_path) != expected_manifest_sha256:
+        raise ValueError("vertical migration retarget manifest digest mismatch")
+    manifest = _read_json(manifest_path, "vertical migration retarget manifest")
+    if (
+        set(manifest) != {"schema", "status", "selection_sha256", "items"}
+        or manifest.get("schema") != "g1-pfnn-vertical-slice-retarget/v1"
+        or manifest.get("status") != "accepted"
+        or not isinstance(manifest.get("items"), list)
+    ):
+        raise ValueError("vertical migration retarget manifest is invalid")
+    output: dict[str, tuple[int, np.ndarray, np.ndarray]] = {}
+    required = {
+        "stem", "role", "start_frame_120hz", "stop_frame_120hz", "coverage",
+        "output", "output_sha256", "receipt", "receipt_sha256",
+    }
+    for item in manifest["items"]:
+        if not isinstance(item, dict) or set(item) != required:
+            raise ValueError("vertical migration retarget item is invalid")
+        stem = item["stem"]
+        start = item["start_frame_120hz"]
+        stop = item["stop_frame_120hz"]
+        if (
+            type(stem) is not str or not stem or stem in output
+            or item["role"] not in _SPLITS
+            or type(start) is not int or type(stop) is not int or stop <= start
+        ):
+            raise ValueError("vertical migration retarget identity is invalid")
+        motion = _relative_artifact(root, item["output"])
+        receipt = _relative_artifact(root, item["receipt"])
+        if _sha256(motion) != item["output_sha256"] or _sha256(receipt) != item["receipt_sha256"]:
+            raise ValueError("vertical migration retarget artifact digest mismatch")
+        try:
+            with np.load(motion, allow_pickle=False) as archive:
+                if set(archive.files) != {
+                    "root_pos", "root_quat", "dof", "fps", "engine",
+                    "joint_names", "joint_limits",
+                }:
+                    raise ValueError("retarget fields are invalid")
+                dof = np.asarray(archive["dof"], dtype=np.float64)
+                fps = np.asarray(archive["fps"])
+                engine = np.asarray(archive["engine"])
+                joint_names = np.asarray(archive["joint_names"])
+        except (OSError, ValueError, KeyError) as error:
+            raise ValueError("vertical migration retarget archive is invalid") from error
+        if (
+            dof.shape != (stop - start, 29)
+            or not np.isfinite(dof).all()
+            or fps.shape != () or float(fps) != 120.0
+            or engine.shape != () or str(engine) != "gmr"
+            or joint_names.shape != (29,)
+            or tuple(joint_names.astype(str).tolist()) != G1_JOINT_NAMES
+        ):
+            raise ValueError("vertical migration retarget joint contract is invalid")
+        q = mujoco_to_isaaclab_joints(dof[::4])
+        qdot = finite_difference(q, 30.0)
+        output[stem] = (
+            start,
+            np.ascontiguousarray(q, dtype=np.float32),
+            np.ascontiguousarray(qdot, dtype=np.float32),
+        )
+    return output
+
+
+def migrate_vertical_dataset_v3(
+    *,
+    source_v2: Path,
+    retarget_root: Path,
+    output: Path | None = None,
+) -> VerticalDataset:
+    """Upgrade one authenticated compact v2 corpus using direct retarget q/qdot."""
+
+    manifest, v2_splits, _ = _load_authenticated_vertical_v2(source_v2)
+    retarget = _authenticated_retarget_joint_state(
+        retarget_root, str(manifest["retarget_manifest_sha256"])
+    )
+    if set(retarget) != set(manifest["source_roles"]):
+        raise ValueError("vertical migration retarget inventory mismatch")
+    accepted: Counter[str] = Counter({stem: 0 for stem in retarget})
+    rejected: defaultdict[str, Counter[str]] = defaultdict(Counter)
+    rejected_joints: Counter[str] = Counter(
+        {name: 0 for name in ISAACLAB_JOINT_NAMES}
+    )
+    migrated: dict[str, VerticalSplitArrays] = {}
+    joint_target = OUTPUT_LAYOUT["joint_position"]
+    for split in _SPLITS:
+        source = v2_splits[split]
+        keep: list[int] = []
+        x_v3: list[np.ndarray] = []
+        for index in range(len(source["phase"])):
+            clip_id = str(source["clip_id"][index])
+            mirrored = bool(source["mirrored"][index])
+            suffix = "__mirror"
+            stem = clip_id.removesuffix(suffix)
+            if mirrored != clip_id.endswith(suffix) or stem not in retarget:
+                raise ValueError("vertical migration row mirror/source identity is invalid")
+            start, q_trace, qdot_trace = retarget[stem]
+            offset = int(source["center_frame_120hz"][index]) - start
+            if offset < 0 or offset % 4 or offset // 4 >= len(q_trace):
+                raise ValueError("vertical migration row has no exact retarget frame")
+            frame = offset // 4
+            q = q_trace[frame]
+            qdot = qdot_trace[frame]
+            if mirrored:
+                q = mirror_classic_g1_joint_state(q)
+                qdot = mirror_classic_g1_joint_state(qdot)
+            delta = np.asarray(source["y"][index, joint_target], dtype=np.float32) - q
+            unsafe = np.flatnonzero(np.abs(delta) > MAXIMUM_JOINT_STEP_RAD)
+            if len(unsafe):
+                rejected[stem]["joint_step_exceeds_limit"] += 1
+                for joint_index in unsafe:
+                    rejected_joints[ISAACLAB_JOINT_NAMES[int(joint_index)]] += 1
+                continue
+            keep.append(index)
+            x_v3.append(pack_classic_g1_input_v3(source["x"][index], q, qdot))
+            accepted[stem] += 1
+        if not keep:
+            raise ValueError(f"vertical migration removed every {split} row")
+        indices = np.asarray(keep, dtype=np.int64)
+        migrated[split] = VerticalSplitArrays(
+            x=np.stack(x_v3).astype(np.float32),
+            **{
+                name: np.asarray(source[name])[indices]
+                for name in _SPLIT_FIELDS
+                if name != "x"
+            },
+        )
+    train = migrated["train"]
+    x_mean = np.mean(train.x, axis=0, dtype=np.float64).astype(np.float32)
+    x_std = np.std(train.x, axis=0, dtype=np.float64).astype(np.float32)
+    y_mean = np.mean(train.y, axis=0, dtype=np.float64).astype(np.float32)
+    y_std = np.std(train.y, axis=0, dtype=np.float64).astype(np.float32)
+    x_std[x_std < np.float32(1.0e-6)] = np.float32(1.0)
+    y_std[y_std < np.float32(1.0e-6)] = np.float32(1.0)
+    y_mean[OUTPUT_LAYOUT["contact_logit"]] = np.float32(0.0)
+    y_std[OUTPUT_LAYOUT["contact_logit"]] = np.float32(1.0)
+    normalization = {"x_mean": x_mean, "x_std": x_std, "y_mean": y_mean, "y_std": y_std}
+    receipt = canonical_joint_state_receipt(
+        accepted_rows_by_source=dict(accepted),
+        rejected_rows_by_source={source: dict(counts) for source, counts in rejected.items()},
+        rejected_rows_by_joint=dict(rejected_joints),
+        state_source_by_clip={stem: "direct_source" for stem in retarget},
+        migration_provenance={
+            "source_dataset_sha256": str(manifest["dataset_sha256"]),
+            "retarget_manifest_sha256": str(manifest["retarget_manifest_sha256"]),
+        },
+    )
+    dataset_sha = _dataset_digest(
+        migrated,
+        normalization,
+        selection_sha256=str(manifest["selection_sha256"]),
+        retarget_manifest_sha256=str(manifest["retarget_manifest_sha256"]),
+        terrain_receipt_set_sha256=str(manifest["terrain_receipt_set_sha256"]),
+        source_roles=manifest["source_roles"],
+        joint_state_receipt=receipt,
+    )
+    dataset = VerticalDataset(
+        splits=migrated,
+        **normalization,
+        selection_sha256=str(manifest["selection_sha256"]),
+        retarget_manifest_sha256=str(manifest["retarget_manifest_sha256"]),
+        terrain_receipt_set_sha256=str(manifest["terrain_receipt_set_sha256"]),
+        source_roles=manifest["source_roles"],
+        joint_state_receipt=receipt,
+        dataset_sha256=dataset_sha,
+    )
+    if output is not None:
+        save_vertical_dataset(Path(output), dataset)
+    return dataset
 
 
 def _canonical_selection_sha256(document: Mapping[str, object]) -> str:
@@ -931,22 +1297,52 @@ def build_vertical_dataset_from_retarget(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--retarget-root", type=Path, required=True)
-    parser.add_argument("--pfnn-root", type=Path, required=True)
-    parser.add_argument("--patches-path", type=Path, required=True)
-    parser.add_argument("--model-path", type=Path, required=True)
+    parser.add_argument("--source-v2", type=Path)
+    parser.add_argument("--pfnn-root", type=Path)
+    parser.add_argument("--patches-path", type=Path)
+    parser.add_argument("--model-path", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
-    dataset = build_vertical_dataset_from_retarget(
-        retarget_root=arguments.retarget_root,
-        pfnn_root=arguments.pfnn_root,
-        patches_path=arguments.patches_path,
-        model_path=arguments.model_path,
-        output=arguments.output,
-    )
+    if arguments.source_v2 is not None:
+        if any(
+            value is not None
+            for value in (
+                arguments.pfnn_root,
+                arguments.patches_path,
+                arguments.model_path,
+            )
+        ):
+            raise ValueError(
+                "--source-v2 cannot be combined with terrain rebuild inputs"
+            )
+        dataset = migrate_vertical_dataset_v3(
+            source_v2=arguments.source_v2,
+            retarget_root=arguments.retarget_root,
+            output=arguments.output,
+        )
+    else:
+        if any(
+            value is None
+            for value in (
+                arguments.pfnn_root,
+                arguments.patches_path,
+                arguments.model_path,
+            )
+        ):
+            raise ValueError(
+                "terrain rebuild requires --pfnn-root, --patches-path, and --model-path"
+            )
+        dataset = build_vertical_dataset_from_retarget(
+            retarget_root=arguments.retarget_root,
+            pfnn_root=arguments.pfnn_root,
+            patches_path=arguments.patches_path,
+            model_path=arguments.model_path,
+            output=arguments.output,
+        )
     print(
         json.dumps(
             {
@@ -970,6 +1366,7 @@ __all__ = [
     "build_vertical_dataset",
     "build_vertical_dataset_from_retarget",
     "load_vertical_dataset",
+    "migrate_vertical_dataset_v3",
     "save_vertical_dataset",
 ]
 

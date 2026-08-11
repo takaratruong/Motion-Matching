@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter, defaultdict
 import hashlib
 import json
 from pathlib import Path
@@ -18,11 +19,22 @@ from .build_g1_pfnn_vertical_dataset import (
     save_vertical_dataset,
 )
 from .terrain_pfnn.dataset import PFNNShardDataset
-from .terrain_pfnn.dataset import denormalize_pfnn_input
-from .terrain_pfnn.layout import INPUT_LAYOUT, OUTPUT_LAYOUT
+from .terrain_pfnn.dataset import (
+    denormalize_pfnn_input,
+    mirror_classic_g1_physical_row_v3,
+    pack_classic_g1_input_v3,
+)
+from .terrain_pfnn.layout import (
+    INPUT_LAYOUT,
+    OUTPUT_LAYOUT,
+)
+from .terrain_pfnn.provenance import (
+    MAXIMUM_JOINT_STEP_RAD,
+    canonical_joint_state_receipt,
+)
+from .terrain_oracle.canonical import ISAACLAB_JOINT_NAMES
 from .train_classic_g1_pfnn import (
     _grail_train_validation_masks,
-    _mirror_normalized_examples,
 )
 
 
@@ -87,17 +99,104 @@ def _grail_physical_rows(dataset: object) -> dict[str, np.ndarray]:
     }
 
 
+def _migrate_grail_predecessor_rows(
+    values: Mapping[str, np.ndarray],
+) -> tuple[dict[str, np.ndarray], dict[str, object]]:
+    """Append q/qdot only from two unique consecutive same-lane predecessors."""
+
+    count = len(values["phase"])
+    keys: dict[tuple[str, str, int], list[int]] = defaultdict(list)
+    clips = sorted(set(np.asarray(values["clip_id"]).astype(str).tolist()))
+    accepted: Counter[str] = Counter({clip: 0 for clip in clips})
+    rejected: defaultdict[str, Counter[str]] = defaultdict(Counter)
+    rejected_joints: Counter[str] = Counter(
+        {name: 0 for name in ISAACLAB_JOINT_NAMES}
+    )
+    for index in range(count):
+        keys[
+            (
+                str(values["clip_id"][index]),
+                str(values["sequence_lane"][index]),
+                int(values["center_frame"][index]),
+            )
+        ].append(index)
+    for (clip, _, _), indices in keys.items():
+        if len(indices) > 1:
+            rejected[clip]["duplicate_row_identity"] += len(indices)
+
+    keep: list[int] = []
+    migrated_x: list[np.ndarray] = []
+    joint = OUTPUT_LAYOUT["joint_position"]
+    for index in range(count):
+        clip = str(values["clip_id"][index])
+        lane = str(values["sequence_lane"][index])
+        center = int(values["center_frame"][index])
+        if len(keys[(clip, lane, center)]) != 1:
+            continue
+        predecessors = keys.get((clip, lane, center - 1), [])
+        previous_predecessors = keys.get((clip, lane, center - 2), [])
+        if len(predecessors) != 1 or len(previous_predecessors) != 1:
+            rejected[clip]["missing_unique_predecessor"] += 1
+            continue
+        predecessor = predecessors[0]
+        previous_predecessor = previous_predecessors[0]
+        q = np.asarray(values["y"][predecessor, joint], dtype=np.float32)
+        delta = np.asarray(values["y"][index, joint], dtype=np.float32) - q
+        qdot = (
+            q
+            - np.asarray(
+                values["y"][previous_predecessor, joint], dtype=np.float32
+            )
+        ) * np.float32(30.0)
+        unsafe = np.flatnonzero(np.abs(delta) > MAXIMUM_JOINT_STEP_RAD)
+        if len(unsafe):
+            rejected[clip]["joint_step_exceeds_limit"] += 1
+            for joint_index in unsafe:
+                rejected_joints[ISAACLAB_JOINT_NAMES[int(joint_index)]] += 1
+            continue
+        migrated_x.append(
+            pack_classic_g1_input_v3(
+                values["x"][index], q, qdot
+            )
+        )
+        keep.append(index)
+        accepted[clip] += 1
+    if not keep:
+        raise ValueError("GRAIL predecessor migration removed every row")
+    indices = np.asarray(keep, dtype=np.int64)
+    row_fields = (
+        "y",
+        "phase",
+        "clip_id",
+        "sequence_lane",
+        "terrain_class",
+        "center_frame",
+        "terrain_sha256",
+    )
+    migrated = {name: np.asarray(values[name])[indices] for name in row_fields}
+    migrated["x"] = np.stack(migrated_x).astype(np.float32)
+    receipt = canonical_joint_state_receipt(
+        accepted_rows_by_source=dict(accepted),
+        rejected_rows_by_source={
+            source: dict(counts) for source, counts in rejected.items()
+        },
+        rejected_rows_by_joint=dict(rejected_joints),
+        state_source_by_clip={clip: "unique_predecessor" for clip in clips},
+    )
+    return migrated, receipt
+
+
 def _grail_split(values: Mapping[str, np.ndarray], mask: np.ndarray) -> VerticalSplitArrays:
     indices = np.flatnonzero(mask)
-    normal = {name: values[name] for name in ("x_mean", "x_std", "y_mean", "y_std")}
-    mirror_x, mirror_y, mirror_phase = _mirror_normalized_examples(
-        values["x_normalized"][indices],
-        values["y_normalized"][indices],
-        values["phase"][indices],
-        normal,
-    )
-    physical_mirror_x = mirror_x * values["x_std"] + values["x_mean"]
-    physical_mirror_y = mirror_y * values["y_std"] + values["y_mean"]
+    mirrored = [
+        mirror_classic_g1_physical_row_v3(
+            values["x"][index], values["y"][index], values["phase"][index]
+        )
+        for index in indices
+    ]
+    physical_mirror_x = np.stack([row[0] for row in mirrored])
+    physical_mirror_y = np.stack([row[1] for row in mirrored])
+    mirror_phase = np.asarray([row[2] for row in mirrored], dtype=np.float32)
     count = len(indices)
     return VerticalSplitArrays(
         x=np.concatenate((values["x"][indices], physical_mirror_x), axis=0).astype(np.float32),
@@ -203,17 +302,17 @@ def combine_vertical_and_grail(
     if not isinstance(vertical, VerticalDataset):
         raise TypeError("vertical must be a VerticalDataset")
     grail_digest = _digest(grail_dataset_sha256, "grail_dataset_sha256")
-    values = _grail_physical_rows(grail_train)
+    values, grail_receipt = _migrate_grail_predecessor_rows(
+        _grail_physical_rows(grail_train)
+    )
     optimized, held_out = _grail_train_validation_masks(
         np.full(len(values["clip_id"]), "grail", dtype="<U6"),
         values["clip_id"],
     )
     splits = {
-        "train": _filter_infeasible_joint_transitions(
-            _concatenate(vertical.splits["train"], _grail_split(values, optimized))
-        ),
-        "validation": _filter_infeasible_joint_transitions(
-            _concatenate(vertical.splits["validation"], _grail_split(values, held_out))
+        "train": _concatenate(vertical.splits["train"], _grail_split(values, optimized)),
+        "validation": _concatenate(
+            vertical.splits["validation"], _grail_split(values, held_out)
         ),
     }
     train = splits["train"]
@@ -243,6 +342,32 @@ def combine_vertical_and_grail(
             name = str(clip).removesuffix("__mirror")
             if name.startswith("terrain_slopes__"):
                 roles[name] = split
+    accepted = Counter(vertical.joint_state_receipt["accepted_rows_by_source"])
+    accepted.update(grail_receipt["accepted_rows_by_source"])
+    rejected: defaultdict[str, Counter[str]] = defaultdict(Counter)
+    for receipt in (vertical.joint_state_receipt, grail_receipt):
+        for source, counts in receipt["rejected_rows_by_source"].items():
+            rejected[source].update(counts)
+    rejected_joints = Counter(
+        vertical.joint_state_receipt["rejected_rows_by_joint"]
+    )
+    rejected_joints.update(grail_receipt["rejected_rows_by_joint"])
+    state_sources = dict(vertical.joint_state_receipt["state_source_by_clip"])
+    for clip, mode in grail_receipt["state_source_by_clip"].items():
+        previous = state_sources.setdefault(clip, mode)
+        if previous != mode:
+            raise ValueError("mixed joint-state source mode conflicts")
+    joint_state_receipt = canonical_joint_state_receipt(
+        accepted_rows_by_source=dict(accepted),
+        rejected_rows_by_source={
+            source: dict(counts) for source, counts in rejected.items()
+        },
+        rejected_rows_by_joint=dict(rejected_joints),
+        state_source_by_clip=state_sources,
+        migration_provenance=vertical.joint_state_receipt[
+            "migration_provenance"
+        ],
+    )
     dataset_sha = _dataset_digest(
         splits,
         normalization,
@@ -250,6 +375,7 @@ def combine_vertical_and_grail(
         retarget_manifest_sha256=vertical.retarget_manifest_sha256,
         terrain_receipt_set_sha256=terrain_receipt,
         source_roles=roles,
+        joint_state_receipt=joint_state_receipt,
     )
     return VerticalDataset(
         splits=splits,
@@ -258,6 +384,7 @@ def combine_vertical_and_grail(
         retarget_manifest_sha256=vertical.retarget_manifest_sha256,
         terrain_receipt_set_sha256=terrain_receipt,
         source_roles=roles,
+        joint_state_receipt=joint_state_receipt,
         dataset_sha256=dataset_sha,
     )
 

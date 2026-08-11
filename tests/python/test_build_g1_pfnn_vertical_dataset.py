@@ -8,6 +8,7 @@ import unittest
 import numpy as np
 
 from mm_sonic.build_g1_pfnn_vertical_dataset import (
+    VERTICAL_DATASET_SCHEMA,
     VerticalSliceSource,
     VerticalSurfaceSegment,
     build_vertical_dataset,
@@ -16,12 +17,28 @@ from mm_sonic.build_g1_pfnn_vertical_dataset import (
     save_vertical_dataset,
 )
 from mm_sonic.pfnn_terrain_fit import PFNNTerrainFit
-from mm_sonic.terrain_pfnn.layout import OUTPUT_LAYOUT
+from mm_sonic.terrain_pfnn.dataset import (
+    JOINT_MIRROR_PERMUTATION,
+    JOINT_MIRROR_SIGN,
+    mirror_classic_g1_physical_row_v3,
+)
+from mm_sonic.terrain_pfnn.layout import (
+    CLASSIC_G1_INPUT_LAYOUT_V3,
+    INPUT_LAYOUT,
+    OUTPUT_LAYOUT,
+)
 from mm_sonic.terrain_pfnn.phase import ContactPhaseTrack
 from mm_sonic.terrain_pfnn.sources import PFNNSourceClip
+from mm_sonic.terrain_oracle.canonical import ISAACLAB_JOINT_NAMES
 
 
-def _clip(stem: str, *, joint_offset: float = 0.0) -> PFNNSourceClip:
+def _clip(
+    stem: str,
+    *,
+    joint_offset: float = 0.0,
+    stateful_joints: bool = False,
+    unsafe_frame: int | None = None,
+) -> PFNNSourceClip:
     frames = 100
     root = np.zeros((frames, 3), dtype=np.float32)
     root[:, 0] = np.linspace(0.0, 1.0, frames, dtype=np.float32)
@@ -29,6 +46,20 @@ def _clip(stem: str, *, joint_offset: float = 0.0) -> PFNNSourceClip:
     root_quaternion = np.zeros((frames, 4), dtype=np.float32)
     root_quaternion[:, 0] = 1.0
     joint = np.full((frames, 29), joint_offset, dtype=np.float32)
+    joint_velocity = np.zeros_like(joint)
+    if stateful_joints:
+        joint += (
+            np.arange(frames, dtype=np.float32)[:, None] * np.float32(0.001)
+            + np.arange(29, dtype=np.float32)[None, :] * np.float32(0.01)
+        )
+        # Deliberately not derived here: v3 must preserve authoritative source
+        # velocity instead of silently synthesizing it.
+        joint_velocity = (
+            np.arange(frames, dtype=np.float32)[:, None] * np.float32(0.25)
+            - np.arange(29, dtype=np.float32)[None, :] * np.float32(0.5)
+        )
+    if unsafe_frame is not None:
+        joint[unsafe_frame:, 7] += np.float32(0.225001)
     body = np.repeat(root[:, None, :], 30, axis=1)
     body[:, :, 2] += np.linspace(0.0, 0.4, 30, dtype=np.float32)
     body_quaternion = np.zeros((frames, 30, 4), dtype=np.float32)
@@ -50,7 +81,7 @@ def _clip(stem: str, *, joint_offset: float = 0.0) -> PFNNSourceClip:
         body_angular_velocity_world=np.zeros_like(body),
         root_linear_velocity_world=root_linear,
         root_angular_velocity_world=np.zeros_like(root),
-        joint_velocity=np.zeros_like(joint),
+        joint_velocity=joint_velocity,
         terrain_path=None,
         terrain_position_world=np.zeros(3),
         terrain_quaternion_world_from_usd_wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
@@ -80,12 +111,24 @@ def _surface(points: np.ndarray) -> np.ndarray:
     return np.zeros(np.asarray(points).shape[:-1], dtype=np.float64)
 
 
-def _source(role: str, stem: str, *, joint_offset: float = 0.0) -> VerticalSliceSource:
+def _source(
+    role: str,
+    stem: str,
+    *,
+    joint_offset: float = 0.0,
+    stateful_joints: bool = False,
+    unsafe_frame: int | None = None,
+) -> VerticalSliceSource:
     return VerticalSliceSource(
         role=role,
         stem=stem,
         source_start_frame_120hz=400,
-        clip=_clip(stem, joint_offset=joint_offset),
+        clip=_clip(
+            stem,
+            joint_offset=joint_offset,
+            stateful_joints=stateful_joints,
+            unsafe_frame=unsafe_frame,
+        ),
         phase_track=_phase(),
         segments=(
             VerticalSurfaceSegment(
@@ -101,6 +144,90 @@ def _source(role: str, stem: str, *, joint_offset: float = 0.0) -> VerticalSlice
 
 
 class BuildG1PFNNVerticalDatasetTest(unittest.TestCase):
+    def test_v3_rows_append_exact_source_q_and_qdot_in_isaaclab_order(self) -> None:
+        train_source = _source(
+            "train", "released_train", stateful_joints=True
+        )
+        dataset = build_vertical_dataset(
+            (train_source, _source("validation", "released_val"))
+        )
+        arrays = dataset.splits["train"]
+        index = int(np.flatnonzero(~arrays.mirrored)[0])
+        frame = (
+            int(arrays.center_frame_120hz[index])
+            - train_source.source_start_frame_120hz
+        ) // 4
+
+        self.assertEqual(arrays.x.shape[1:], (346,))
+        np.testing.assert_array_equal(
+            arrays.x[index, CLASSIC_G1_INPUT_LAYOUT_V3["joint_position"]],
+            train_source.clip.joint_position[frame],
+        )
+        np.testing.assert_array_equal(
+            arrays.x[index, CLASSIC_G1_INPUT_LAYOUT_V3["joint_velocity"]],
+            train_source.clip.joint_velocity[frame],
+        )
+        np.testing.assert_array_equal(
+            arrays.y[index, OUTPUT_LAYOUT["joint_position"]],
+            train_source.clip.joint_position[frame + 1],
+        )
+
+    def test_v3_mirror_uses_existing_joint_map_and_is_bitwise_involutive(self) -> None:
+        dataset = build_vertical_dataset((
+            _source("train", "released_train", stateful_joints=True),
+            _source("validation", "released_val"),
+        ))
+        arrays = dataset.splits["train"]
+        base_index = int(np.flatnonzero(~arrays.mirrored)[0])
+        paired = np.flatnonzero(
+            arrays.mirrored
+            & (arrays.center_frame_120hz == arrays.center_frame_120hz[base_index])
+            & (arrays.sequence_lane == arrays.sequence_lane[base_index])
+        )
+        self.assertEqual(len(paired), 1)
+        mirror_index = int(paired[0])
+        for field in ("joint_position", "joint_velocity"):
+            source = arrays.x[base_index, CLASSIC_G1_INPUT_LAYOUT_V3[field]]
+            expected = source[JOINT_MIRROR_PERMUTATION] * JOINT_MIRROR_SIGN
+            np.testing.assert_array_equal(
+                arrays.x[mirror_index, CLASSIC_G1_INPUT_LAYOUT_V3[field]],
+                expected,
+            )
+
+        mirrored_x, mirrored_y, mirrored_phase = mirror_classic_g1_physical_row_v3(
+            arrays.x[base_index], arrays.y[base_index], arrays.phase[base_index]
+        )
+        restored_x, restored_y, _ = mirror_classic_g1_physical_row_v3(
+            mirrored_x, mirrored_y, mirrored_phase
+        )
+        np.testing.assert_array_equal(restored_x, arrays.x[base_index])
+        np.testing.assert_array_equal(restored_y, arrays.y[base_index])
+
+    def test_rejects_joint_boundaries_and_receipts_source_and_joint_counts(self) -> None:
+        dataset = build_vertical_dataset((
+            _source(
+                "train",
+                "released_train",
+                stateful_joints=True,
+                unsafe_frame=40,
+            ),
+            _source("validation", "released_val"),
+        ))
+        train = dataset.splits["train"]
+        rejected_center = 400 + 4 * 39
+        self.assertFalse(np.any(train.center_frame_120hz == rejected_center))
+        receipt = dataset.joint_state_receipt
+        self.assertEqual(receipt["maximum_joint_step_rad"], 0.225)
+        self.assertEqual(
+            receipt["rejected_rows_by_source"]["released_train"][
+                "joint_step_exceeds_limit"
+            ],
+            1,
+        )
+        self.assertEqual(
+            receipt["rejected_rows_by_joint"][ISAACLAB_JOINT_NAMES[7]], 1
+        )
+
     def test_cycle_rows_stay_inside_surface_and_train_is_mirrored_once(self) -> None:
         dataset = build_vertical_dataset(
             (_source("train", "released_train"), _source("validation", "released_val"))
@@ -134,6 +261,12 @@ class BuildG1PFNNVerticalDatasetTest(unittest.TestCase):
         self.assertEqual(first.dataset_sha256, reversed_result.dataset_sha256)
         np.testing.assert_array_equal(first.x_mean, changed_validation.x_mean)
         np.testing.assert_array_equal(first.y_std, changed_validation.y_std)
+        self.assertEqual(first.x_mean.shape, (CLASSIC_G1_INPUT_LAYOUT_V3.size,))
+        self.assertEqual(first.x_std.shape, (CLASSIC_G1_INPUT_LAYOUT_V3.size,))
+        self.assertEqual(
+            CLASSIC_G1_INPUT_LAYOUT_V3["joint_position"],
+            slice(INPUT_LAYOUT.size, INPUT_LAYOUT.size + 29),
+        )
 
     def test_round_trips_safe_arrays_and_rejects_duplicate_or_split_overlap(self) -> None:
         sources = (_source("train", "released_train"), _source("validation", "released_val"))
@@ -144,6 +277,19 @@ class BuildG1PFNNVerticalDatasetTest(unittest.TestCase):
             loaded = load_vertical_dataset(root)
             self.assertEqual(loaded.dataset_sha256, dataset.dataset_sha256)
             np.testing.assert_array_equal(loaded.splits["train"].x, dataset.splits["train"].x)
+            manifest_path = root / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(VERTICAL_DATASET_SCHEMA, "g1-pfnn-vertical-dataset/v3")
+            self.assertEqual(manifest["schema"], VERTICAL_DATASET_SCHEMA)
+            self.assertEqual(manifest["input_size"], 346)
+            self.assertEqual(
+                manifest["input_layout"],
+                [list(field) for field in CLASSIC_G1_INPUT_LAYOUT_V3.fields],
+            )
+            manifest["input_layout"][-1][1] = 28
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "manifest contract"):
+                load_vertical_dataset(root)
         with self.assertRaisesRegex(ValueError, "duplicate PFNN source"):
             build_vertical_dataset((sources[0], sources[0]))
         with self.assertRaisesRegex(ValueError, "train/validation source overlap"):
@@ -165,6 +311,10 @@ class BuildG1PFNNVerticalDatasetTest(unittest.TestCase):
                 ("steps_val", "validation", ["ascent", "descent"]),
             )
             selection_items = []
+
+            def digest(path: Path) -> str:
+                return hashlib.sha256(path.read_bytes()).hexdigest()
+
             for index, (stem, role, coverage) in enumerate(definitions):
                 bvh = animations / f"{stem}.bvh"
                 bvh.write_text("fixture", encoding="utf-8")
@@ -192,7 +342,6 @@ class BuildG1PFNNVerticalDatasetTest(unittest.TestCase):
                         "receipt_sha256": hashlib.sha256(receipt.read_bytes()).hexdigest(),
                     }
                 )
-                digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
                 selection_items.append(
                     {
                         "stem": stem,

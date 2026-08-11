@@ -15,7 +15,109 @@ from .splits import split_identity as sealed_split, terrain_identity
 
 
 DATASET_SCHEMA = "mm-sonic-terrain-pfnn-dataset/v2"
+JOINT_STATE_RECEIPT_SCHEMA = "g1-pfnn-joint-state-receipt/v1"
+MAXIMUM_JOINT_STEP_RAD = 0.225
 SPLITS = ("train", "validation", "test")
+
+
+def canonical_joint_state_receipt(
+    *,
+    accepted_rows_by_source: Mapping[str, int],
+    rejected_rows_by_source: Mapping[str, Mapping[str, int]],
+    rejected_rows_by_joint: Mapping[str, int],
+    state_source_by_clip: Mapping[str, str],
+    migration_provenance: Mapping[str, str] | None = None,
+) -> dict[str, object]:
+    """Validate and canonicalize the exact q/qdot construction audit."""
+
+    accepted = dict(sorted(accepted_rows_by_source.items()))
+    modes = dict(sorted(state_source_by_clip.items()))
+    rejected = {
+        source: dict(sorted(counts.items()))
+        for source, counts in sorted(rejected_rows_by_source.items())
+    }
+    by_joint = dict(sorted(rejected_rows_by_joint.items()))
+    migration = dict(sorted((migration_provenance or {}).items()))
+    if (
+        not accepted
+        or set(modes) != set(accepted) | set(rejected)
+        or any(
+            type(source) is not str
+            or not source
+            or type(count) is not int
+            or count < 0
+            for source, count in accepted.items()
+        )
+        or any(mode not in ("direct_source", "unique_predecessor") for mode in modes.values())
+    ):
+        raise ValueError("joint-state source receipt is invalid")
+    for source, counts in rejected.items():
+        if (
+            type(source) is not str
+            or not source
+            or not counts
+            or any(
+                type(reason) is not str
+                or not reason
+                or type(count) is not int
+                or count < 1
+                for reason, count in counts.items()
+            )
+        ):
+            raise ValueError("joint-state rejection receipt is invalid")
+    if set(by_joint) != set(ISAACLAB_JOINT_NAMES) or any(
+        type(count) is not int or count < 0 for count in by_joint.values()
+    ):
+        raise ValueError("joint-state per-joint rejection receipt is invalid")
+    if migration and (
+        set(migration) != {"source_dataset_sha256", "retarget_manifest_sha256"}
+        or any(
+            type(value) is not str
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for value in migration.values()
+        )
+    ):
+        raise ValueError("joint-state migration provenance is invalid")
+    return {
+        "schema": JOINT_STATE_RECEIPT_SCHEMA,
+        "maximum_joint_step_rad": MAXIMUM_JOINT_STEP_RAD,
+        "accepted_rows_by_source": accepted,
+        "rejected_rows_by_source": rejected,
+        "rejected_rows_by_joint": by_joint,
+        "state_source_by_clip": modes,
+        "migration_provenance": migration,
+    }
+
+
+def validate_joint_state_receipt(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema",
+        "maximum_joint_step_rad",
+        "accepted_rows_by_source",
+        "rejected_rows_by_source",
+        "rejected_rows_by_joint",
+        "state_source_by_clip",
+        "migration_provenance",
+    }:
+        raise ValueError("joint-state receipt fields are invalid")
+    if (
+        value["schema"] != JOINT_STATE_RECEIPT_SCHEMA
+        or value["maximum_joint_step_rad"] != MAXIMUM_JOINT_STEP_RAD
+        or not isinstance(value["accepted_rows_by_source"], Mapping)
+        or not isinstance(value["rejected_rows_by_source"], Mapping)
+        or not isinstance(value["rejected_rows_by_joint"], Mapping)
+        or not isinstance(value["state_source_by_clip"], Mapping)
+        or not isinstance(value["migration_provenance"], Mapping)
+    ):
+        raise ValueError("joint-state receipt contract is invalid")
+    return canonical_joint_state_receipt(
+        accepted_rows_by_source=value["accepted_rows_by_source"],
+        rejected_rows_by_source=value["rejected_rows_by_source"],
+        rejected_rows_by_joint=value["rejected_rows_by_joint"],
+        state_source_by_clip=value["state_source_by_clip"],
+        migration_provenance=value["migration_provenance"],
+    )
 
 
 def canonical_json_sha256(payload: object) -> str:
@@ -138,11 +240,15 @@ def validate_normalization_metadata(
 
 __all__ = [
     "DATASET_SCHEMA",
+    "JOINT_STATE_RECEIPT_SCHEMA",
+    "MAXIMUM_JOINT_STEP_RAD",
     "SPLITS",
     "canonical_json_sha256",
+    "canonical_joint_state_receipt",
     "canonical_split_identities",
     "source_set_payload",
     "split_identity_digest",
     "validate_shard_row_provenance",
     "validate_normalization_metadata",
+    "validate_joint_state_receipt",
 ]

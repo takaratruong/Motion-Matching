@@ -29,9 +29,11 @@ from mm_sonic.terrain_pfnn.dataset import (
     PFNNShardDataset,
     denormalize_pfnn_input,
     normalize_pfnn_input,
+    pfnn_input_sha256,
 )
 from mm_sonic.terrain_pfnn.features import PFNNTrainingWindow
 from mm_sonic.terrain_pfnn.layout import (
+    CLASSIC_G1_INPUT_LAYOUT_V3,
     CONTACT_ORDER,
     INPUT_LAYOUT,
     OUTPUT_LAYOUT,
@@ -702,7 +704,7 @@ class TerrainPFNNDatasetTest(unittest.TestCase):
         np.testing.assert_allclose(restored, raw, rtol=2.0e-6, atol=2.0e-6)
 
         for invalid, expected in (
-            (np.zeros(INPUT_LAYOUT.size - 1), "288 features"),
+            (np.zeros(INPUT_LAYOUT.size - 1), "288 or 346 features"),
             (np.full(INPUT_LAYOUT.size, np.nan), "finite"),
         ):
             with self.subTest(invalid=expected):
@@ -716,6 +718,27 @@ class TerrainPFNNDatasetTest(unittest.TestCase):
             with self.subTest(invalid_std=invalid_std[0]):
                 with self.assertRaisesRegex(ValueError, "x_std|finite"):
                     denormalize_pfnn_input(raw, mean, invalid_std)
+
+    def test_v3_input_normalization_and_receipt_cover_all_346_values(self) -> None:
+        width = CLASSIC_G1_INPUT_LAYOUT_V3.size
+        raw = np.linspace(-2.0, 3.0, width, dtype=np.float32)
+        mean = np.linspace(-0.3, 0.4, width, dtype=np.float32)
+        std = np.linspace(0.2, 1.7, width, dtype=np.float32)
+        normalized = normalize_pfnn_input(raw, mean, std)
+        restored = denormalize_pfnn_input(normalized, mean, std)
+
+        self.assertEqual(normalized.shape, (346,))
+        np.testing.assert_allclose(restored, raw, rtol=2.0e-6, atol=2.0e-6)
+        digest = pfnn_input_sha256(normalized)
+        changed = normalized.copy()
+        changed[-1] = np.nextafter(changed[-1], np.float32(np.inf))
+        self.assertNotEqual(pfnn_input_sha256(changed), digest)
+        self.assertEqual(pfnn_input_sha256(normalized.copy()), digest)
+
+        with self.assertRaisesRegex(ValueError, "288 or 346"):
+            normalize_pfnn_input(raw[:-1], mean, std)
+        with self.assertRaisesRegex(ValueError, "same supported shape"):
+            normalize_pfnn_input(raw, mean[:-1], std[:-1])
 
     def test_refuses_nonempty_destination(self) -> None:
         output = self.root / "dataset"

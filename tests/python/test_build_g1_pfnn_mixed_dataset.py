@@ -7,7 +7,12 @@ import numpy as np
 from mm_sonic.build_g1_pfnn_mixed_dataset import combine_vertical_and_grail
 from mm_sonic.build_g1_pfnn_vertical_dataset import build_vertical_dataset
 from mm_sonic.terrain_pfnn.dataset import normalize_pfnn_input
-from mm_sonic.terrain_pfnn.layout import INPUT_LAYOUT, OUTPUT_LAYOUT
+from mm_sonic.terrain_pfnn.layout import (
+    CLASSIC_G1_INPUT_LAYOUT_V3,
+    INPUT_LAYOUT,
+    OUTPUT_LAYOUT,
+)
+from mm_sonic.terrain_oracle.canonical import ISAACLAB_JOINT_NAMES
 from tests.python.test_build_g1_pfnn_vertical_dataset import _source
 
 
@@ -25,7 +30,7 @@ class _GrailRows:
         for family in range(2):
             for variant in range(2):
                 clip = f"terrain_slopes__slope_{family:03d}__{variant:03d}"
-                for center in range(2):
+                for center in range(4):
                     x = np.linspace(
                         family + 0.1 * variant,
                         family + 1.0 + 0.1 * variant,
@@ -33,6 +38,12 @@ class _GrailRows:
                         dtype=np.float32,
                     )
                     y = np.full(OUTPUT_LAYOUT.size, 0.2 * center)
+                    y[OUTPUT_LAYOUT["joint_position"]] = (
+                        0.0,
+                        0.05,
+                        0.15,
+                        0.20,
+                    )[center]
                     y[OUTPUT_LAYOUT["contact_logit"]] = (1.0, 0.0, 0.0, 1.0)
                     key = (clip, "motion", center)
                     self.physical_x_by_key[key] = x.copy()
@@ -86,6 +97,80 @@ class BuildG1PFNNMixedDatasetTest(unittest.TestCase):
         self.assertFalse(train_clips & validation_clips)
         self.assertEqual(mixed.selection_sha256, vertical.selection_sha256)
         self.assertNotEqual(mixed.dataset_sha256, vertical.dataset_sha256)
+        self.assertEqual(mixed.splits["train"].x.shape[1:], (346,))
+        receipt = mixed.joint_state_receipt
+        self.assertEqual(
+            receipt["rejected_rows_by_source"][
+                "terrain_slopes__slope_000__000"
+            ]["missing_unique_predecessor"],
+            2,
+        )
+
+    def test_predecessor_migration_aligns_current_q_and_qdot_exactly(self) -> None:
+        grail = _GrailRows()
+        mixed = combine_vertical_and_grail(
+            build_vertical_dataset((
+                _source("train", "released_train"),
+                _source("validation", "released_val"),
+            )),
+            grail,
+            grail_dataset_sha256="9" * 64,
+        )
+        arrays = mixed.splits["train"]
+        clip = "terrain_slopes__slope_000__000"
+        indices = np.flatnonzero(
+            (arrays.clip_id == clip)
+            & ~arrays.mirrored
+            & (arrays.center_frame_120hz == 8)
+        )
+        self.assertEqual(len(indices), 1)
+        index = int(indices[0])
+        previous_previous = np.asarray(
+            grail.physical_y_by_key[(clip, "motion", 0)][
+                OUTPUT_LAYOUT["joint_position"]
+            ],
+            dtype=np.float32,
+        )
+        predecessor = np.asarray(
+            grail.physical_y_by_key[(clip, "motion", 1)][
+                OUTPUT_LAYOUT["joint_position"]
+            ],
+            dtype=np.float32,
+        )
+        np.testing.assert_array_equal(
+            arrays.x[index, CLASSIC_G1_INPUT_LAYOUT_V3["joint_position"]],
+            predecessor,
+        )
+        np.testing.assert_array_equal(
+            arrays.x[index, CLASSIC_G1_INPUT_LAYOUT_V3["joint_velocity"]],
+            (predecessor - previous_previous) * np.float32(30.0),
+        )
+
+    def test_predecessor_migration_rejects_nonunique_identity_and_dependents(self) -> None:
+        grail = _GrailRows()
+        duplicate = dict(grail.rows[0])
+        duplicate["x"] = np.asarray(duplicate["x"]).copy()
+        duplicate["y"] = np.asarray(duplicate["y"]).copy()
+        grail.rows.append(duplicate)
+        mixed = combine_vertical_and_grail(
+            build_vertical_dataset((
+                _source("train", "released_train"),
+                _source("validation", "released_val"),
+            )),
+            grail,
+            grail_dataset_sha256="9" * 64,
+        )
+        arrays = mixed.splits["train"]
+        clip = "terrain_slopes__slope_000__000"
+        self.assertFalse(
+            np.any(
+                (arrays.clip_id == clip)
+                & (arrays.center_frame_120hz == 8)
+            )
+        )
+        rejected = mixed.joint_state_receipt["rejected_rows_by_source"][clip]
+        self.assertEqual(rejected["duplicate_row_identity"], 2)
+        self.assertGreaterEqual(rejected["missing_unique_predecessor"], 1)
 
     def test_drops_infeasible_retarget_joint_transition_before_normalizing(self) -> None:
         vertical = build_vertical_dataset(
@@ -95,7 +180,7 @@ class BuildG1PFNNMixedDatasetTest(unittest.TestCase):
         for row in grail.rows:
             if (
                 row["clip_id"] == "terrain_slopes__slope_000__000"
-                and row["center_frame"] == 1
+                and row["center_frame"] == 3
             ):
                 row["y"][OUTPUT_LAYOUT["joint_position"].start] = 1.0
 
@@ -114,6 +199,12 @@ class BuildG1PFNNMixedDatasetTest(unittest.TestCase):
                     train_clips == "terrain_slopes__slope_000__000__mirror"
                 )
             ),
+            1,
+        )
+        self.assertEqual(
+            mixed.joint_state_receipt["rejected_rows_by_joint"][
+                ISAACLAB_JOINT_NAMES[0]
+            ],
             1,
         )
 
@@ -136,7 +227,12 @@ class BuildG1PFNNMixedDatasetTest(unittest.TestCase):
                     continue
                 key = (str(clip), str(arrays.sequence_lane[index]),
                        int(arrays.center_frame_120hz[index] // 4))
-                np.testing.assert_allclose(arrays.x[index], expected_x[key], rtol=2e-6, atol=2e-6)
+                np.testing.assert_allclose(
+                    arrays.x[index, : INPUT_LAYOUT.size],
+                    expected_x[key],
+                    rtol=2e-6,
+                    atol=2e-6,
+                )
                 np.testing.assert_allclose(arrays.y[index], expected_y[key], rtol=2e-6, atol=2e-6)
 
 
