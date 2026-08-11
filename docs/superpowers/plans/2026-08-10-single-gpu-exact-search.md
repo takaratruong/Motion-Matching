@@ -1,10 +1,10 @@
-# Single-GPU Exact Motion Search Implementation Plan
+# Single-GPU Full-Row FP32 Search Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Search all 9.74M range-safe full-walking rows on exactly physical GPU5 with p95 warm latency at most 100 ms, preserving the existing exact score and diagnostic evidence boundary.
+**Goal:** Score all 9.74M range-safe full-walking rows in FP32 on exactly physical GPU5 with p95 warm latency at most 100 ms, while preserving the diagnostic evidence boundary.
 
-**Architecture:** First remove a redundant CPU sort that currently costs 4.34 seconds per query. Then add a lazy JAX float64 exhaustive scorer isolated behind `HybridMatcher`; the full viewer pins JAX visibility to physical GPU5 before import, skips the CPU cKDTree, and records the backend identity. CPU search remains unchanged by default.
+**Architecture:** First remove a redundant CPU sort that currently costs 4.34 seconds per query. Then add a lazy JAX float32 exhaustive scorer isolated behind `HybridMatcher`; the full viewer pins JAX visibility to physical GPU5 before import, skips the CPU cKDTree, and records the diagnostic backend identity. Returned candidates are rescored in float64 on CPU. CPU search remains unchanged by default.
 
 **Tech Stack:** Python 3.11, NumPy, SciPy cKDTree, JAX CUDA, MuJoCo, pytest, Ruff.
 
@@ -13,7 +13,8 @@
 - Use exactly one GPU: physical CUDA index 5.
 - Do not use `pmap`, multi-device sharding, replication, or computation on GPUs 0–4 or 6–7.
 - Search every eligible range-safe row; do not cap, sample, or approximate the corpus.
-- Preserve float64 squared-L2 scoring, hard contact compatibility, transition penalty `0.1`, exclusions, and lowest-row stable tie-breaking.
+- Score all eligible rows in float32 while preserving hard contact compatibility, transition penalty `0.1`, exclusions, and stable lowest-row handling inside the device near-minimum set.
+- Rescore the bounded returned candidate set using the existing float64 CPU score before commitment.
 - CPU mode remains the default and must preserve existing behavior.
 - A requested unavailable GPU fails explicitly; there is no silent CPU or capped-search fallback.
 - The frozen model test remains diagnostic-red; acceleration must not change acceptance labels or thresholds.
@@ -74,7 +75,7 @@ git commit -m "perf: avoid redundant contact exclusion sorting"
 
 ---
 
-### Task 2: Add a one-device exhaustive JAX scorer
+### Task 2: Add a one-device exhaustive FP32 JAX scorer
 
 **Files:**
 - Create: `sonic/python/mm_sonic/hybrid_terrain_lmm_gpu_search.py`
@@ -82,7 +83,7 @@ git commit -m "perf: avoid redundant contact exclusion sorting"
 
 **Interfaces:**
 - Produces: `configure_single_gpu_visibility(spec: str) -> tuple[str, int]`.
-- Produces: `SingleGpuExactSearch(features, searchable_rows, row_ranges, contacts, *, physical_device_index, transition_penalty, exclusion_budget=32)`.
+- Produces: `SingleGpuExactSearch(features, searchable_rows, row_ranges, contacts, *, physical_device_index, transition_penalty, exclusion_budget=32)` and explicitly requires float32 features.
 - Produces: `match_candidates(query, *, current_range, active_contact_code, excluded_rows) -> GpuSearchCandidates`.
 - `GpuSearchCandidates` contains sorted global candidate rows, full compatible candidate count, device minimum score, close-candidate count, and elapsed milliseconds.
 
@@ -127,30 +128,31 @@ def configure_single_gpu_visibility(spec: str) -> tuple[str, int]:
 
 - [ ] **Step 4: Implement the exhaustive scorer**
 
-Lazily import JAX only inside construction. Require exactly one visible GPU and use its single `Device` for every `device_put`. Store float64 searchable features, sorted global rows, range IDs, and contact codes on that device.
+Lazily import JAX only inside construction. Require exactly one visible GPU and use its single `Device` for every `device_put`. Store native float32 searchable features, sorted global rows, range IDs, and contact codes on that device. Reject non-float32 feature tables rather than silently narrowing them.
 
 The jitted kernel receives the resident feature, range, and contact arrays as explicit arguments so XLA does not capture a multi-gigabyte constant. It computes:
 
 ```python
 def kernel(features, range_ids, contact_codes, query, current_range, active_contact_code, excluded_positions):
-    scores = jnp.sum(jnp.square(features - query[None, :]), axis=1)
+    scores = jnp.sum(jnp.square(features - query.astype(jnp.float32)[None, :]), axis=1)
     scores += transition_penalty * (range_ids != current_range)
     scores = jnp.where(contact_codes == active_contact_code, scores, jnp.inf)
-    padded = jnp.concatenate((scores, jnp.asarray((jnp.inf,), dtype=jnp.float64)))
+    padded = jnp.concatenate((scores, jnp.asarray((jnp.inf,), dtype=jnp.float32)))
     safe_exclusions = jnp.where(excluded_positions >= 0, excluded_positions, len(scores))
     padded = padded.at[safe_exclusions].set(jnp.inf)
     scores = padded[:-1]
     values, positions = jax.lax.top_k(-scores, min(128, len(scores)))
     minimum = -values[0]
-    tolerance = jnp.finfo(jnp.float64).eps * jnp.maximum(1.0, jnp.abs(minimum)) * 512
-    close_count = jnp.count_nonzero(scores <= minimum + tolerance)
+    tolerance = jnp.finfo(jnp.float32).eps * jnp.maximum(1.0, jnp.abs(minimum)) * 512
+    close = jnp.isfinite(scores) & ((scores - minimum) <= tolerance)
+    close_count = jnp.count_nonzero(close)
 ```
 
 Synchronize returned arrays before timing completes. Return the fixed top-candidate set; callers fail closed or use complete CPU brute force if `close_count` exceeds the returned set.
 
 - [ ] **Step 5: Prove parity on GPU5 in a subprocess**
 
-Use `CUDA_VISIBLE_DEVICES=5` and randomized synthetic corpora. Compare the CPU float64 brute-force winner to the GPU candidate set after CPU rescoring for every contact code, current-range penalty, explicit exclusion, exact duplicate tie, and seeded random query. Assert only one JAX GPU is visible.
+Use `CUDA_VISIBLE_DEVICES=5` and randomized synthetic float32 corpora. Prove the CPU float64 winner is recovered after rescoring the GPU candidate set for representative cases, and add constructed cases where the transition penalty and exclusion each change the winner. Add more than 128 exact device ties and verify the overflow signal plus stable lowest-row inclusion. Assert only one JAX GPU is visible.
 
 - [ ] **Step 6: Run static checks and commit**
 
@@ -159,12 +161,12 @@ Commit:
 ```bash
 git add sonic/python/mm_sonic/hybrid_terrain_lmm_gpu_search.py \
   tests/python/test_hybrid_terrain_lmm_gpu_search.py
-git commit -m "feat: add single-gpu exact motion scorer"
+git commit -m "feat: add single-gpu full-row motion scorer"
 ```
 
 ---
 
-### Task 3: Integrate exact GPU candidates into HybridMatcher
+### Task 3: Integrate GPU candidates into HybridMatcher
 
 **Files:**
 - Modify: `sonic/python/mm_sonic/hybrid_terrain_lmm_runtime.py`
@@ -172,7 +174,7 @@ git commit -m "feat: add single-gpu exact motion scorer"
 
 **Interfaces:**
 - Add keyword-only `search_device: str | None = None` to the existing `HybridMatcher.__init__` signature after `max_search_rows`.
-- Expose `search_backend_identity` as `cpu-ckdtree-exact` or `single-gpu-exact:cuda:5`.
+- Expose `search_backend_identity` as `cpu-ckdtree-exact` or `single-gpu-full-row-fp32:cuda:5`.
 - When GPU is selected, skip `_tree_values` and cKDTree construction.
 
 - [ ] **Step 1: Write RED integration tests**
@@ -198,7 +200,7 @@ if search_device is None:
     self._tree = cKDTree(self._tree_values, compact_nodes=True, balanced_tree=True)
 else:
     from .hybrid_terrain_lmm_gpu_search import SingleGpuExactSearch
-    self.search_backend_identity = f"single-gpu-exact:{search_device}"
+    self.search_backend_identity = f"single-gpu-full-row-fp32:{search_device}"
     self._gpu_search = SingleGpuExactSearch(
         self.features,
         self.searchable_rows,
@@ -219,7 +221,7 @@ Run the complete runtime test file plus GPU scorer tests, Ruff, format, compile,
 ```bash
 git add sonic/python/mm_sonic/hybrid_terrain_lmm_runtime.py \
   tests/python/test_hybrid_terrain_lmm_runtime.py
-git commit -m "feat: use exact single-gpu motion search"
+git commit -m "feat: use single-gpu full-row motion search"
 ```
 
 ---
@@ -241,7 +243,7 @@ git commit -m "feat: use exact single-gpu motion search"
 
 - [ ] **Step 1: Write RED parser/wiring/label tests**
 
-Assert `--search-device cuda:5` reaches matcher construction, conflicting visibility fails, CPU invocation remains unchanged, and the body displays `single-gpu-exact:cuda:5` without changing the diagnostic title.
+Assert `--search-device cuda:5` reaches matcher construction, conflicting visibility fails, CPU invocation remains unchanged, and the body displays `single-gpu-full-row-fp32:cuda:5` without changing the diagnostic title.
 
 - [ ] **Step 2: Run RED, implement minimal wiring, and run GREEN**
 
