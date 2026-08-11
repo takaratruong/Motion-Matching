@@ -26,6 +26,7 @@ MAX_NATIVE_LIMIT_CANDIDATE_REJECTIONS = 32
 DIAGNOSTIC_MIN_PELVIS_SUPPORT_CLEARANCE_M = 0.4
 DIAGNOSTIC_MAX_PELVIS_SUPPORT_CLEARANCE_M = 1.2
 DIAGNOSTIC_MAX_SUCCESSOR_CLEARANCE_STEP_M = 0.1
+DIAGNOSTIC_MAX_SEARCH_JUMP_ARTICULATED_QPOS_DELTA_RAD = 0.5
 TERRAIN_INDICES = slice(27, 31)
 TRAJECTORY_INDICES = slice(15, 27)
 
@@ -243,7 +244,7 @@ class _NativeJointLimitError(ValueError):
 
 
 class _DiagnosticPoseError(ValueError):
-    """A learned diagnostic pose failed before native-valid commit."""
+    """A diagnostic pose failed before native-valid commit."""
 
 
 class _OutsideSupportError(ValueError):
@@ -296,7 +297,7 @@ class HybridRuntimeState:
 
 
 class HybridMatcher:
-    """Range-safe exact NN matcher with a transactional learned display decode."""
+    """Range-safe exact NN matcher with a transactional display-pose decode."""
 
     def __init__(
         self,
@@ -317,10 +318,18 @@ class HybridMatcher:
         initial_heading: float = 0.0,
         cache_manifest_path: str | Path | None = None,
         diagnostic_stability: bool = False,
+        diagnostic_canonical_source_pose: bool = False,
     ) -> None:
         if type(diagnostic_stability) is not bool:
             raise TypeError("diagnostic stability must be a boolean")
+        if type(diagnostic_canonical_source_pose) is not bool:
+            raise TypeError("diagnostic canonical source pose must be a boolean")
+        if diagnostic_canonical_source_pose and not diagnostic_stability:
+            raise ValueError(
+                "diagnostic canonical source pose requires diagnostic stability"
+            )
         self.diagnostic_stability = diagnostic_stability
+        self.diagnostic_canonical_source_pose = diagnostic_canonical_source_pose
         physical_search_device: int | None = None
         if search_device is not None:
             if type(search_device) is not str or not search_device.startswith("cuda:"):
@@ -1386,6 +1395,7 @@ class HybridMatcher:
         live_raw: np.ndarray | None = None,
         live_domain_supported: bool | None = None,
         reject_learned_native_limit: bool = False,
+        diagnostic_search_jump: bool = False,
     ) -> HybridRuntimeState:
         if (
             self.diagnostic_stability
@@ -1420,7 +1430,11 @@ class HybridMatcher:
         diagnostic_pose_rejection_count = self.state.diagnostic_pose_rejection_count
         unsupported_hold_count = self.state.unsupported_hold_count
         max_joint_clamp_magnitude = 0.0
-        pose_source = "learned"
+        pose_source = (
+            "canonical-diagnostic"
+            if self.diagnostic_canonical_source_pose
+            else "learned"
+        )
         support_status = self._terrain_support_status(
             live_normalized, domain_supported=bool(live_domain_supported)
         )
@@ -1431,7 +1445,11 @@ class HybridMatcher:
         try:
             if support_status != "SUPPORTED":
                 raise ValueError("live terrain is outside the corpus envelope")
-            decoded = self._decode(row, seeded_features)
+            decoded = (
+                canonical
+                if self.diagnostic_canonical_source_pose
+                else self._decode(row, seeded_features)
+            )
             simulation_position, simulation_rotation = self._placed_transform(
                 decoded, target_root
             )
@@ -1442,7 +1460,7 @@ class HybridMatcher:
                 dtype=np.float64,
             )
             self._validate_qpos(proposed_qpos)
-            if count_decode:
+            if count_decode and not self.diagnostic_canonical_source_pose:
                 learned_count += 1
         except _NativeJointLimitError:
             if reject_learned_native_limit or self.diagnostic_stability:
@@ -1480,8 +1498,11 @@ class HybridMatcher:
             ValueError,
         ) as error:
             if self.diagnostic_stability:
+                source = (
+                    "canonical" if self.diagnostic_canonical_source_pose else "learned"
+                )
                 raise _DiagnosticPoseError(
-                    "diagnostic learned pose candidate failed validation"
+                    f"diagnostic {source} pose candidate failed validation"
                 ) from error
             simulation_position, simulation_rotation = self._placed_transform(
                 canonical, target_root
@@ -1507,6 +1528,25 @@ class HybridMatcher:
             fallback_count += int(count_decode)
             if max_joint_clamp_magnitude == 0.0:
                 pose_source = "canonical-fallback"
+
+        if diagnostic_search_jump:
+            if not (
+                self.diagnostic_stability and self.diagnostic_canonical_source_pose
+            ):
+                raise AssertionError(
+                    "diagnostic search-jump validation requires canonical-source "
+                    "diagnostic stability"
+                )
+            articulated_delta = float(
+                np.max(np.abs(proposed_qpos[7:] - self.state.qpos[7:]))
+            )
+            if (
+                articulated_delta
+                > DIAGNOSTIC_MAX_SEARCH_JUMP_ARTICULATED_QPOS_DELTA_RAD
+            ):
+                raise _DiagnosticPoseError(
+                    "diagnostic search jump exceeded the articulated-qpos limit"
+                )
 
         proposed = HybridRuntimeState(
             row=int(row),
@@ -1647,6 +1687,10 @@ class HybridMatcher:
                     live_raw=prepared_live_raw,
                     live_domain_supported=prepared_live_domain_supported,
                     reject_learned_native_limit=True,
+                    diagnostic_search_jump=(
+                        self.diagnostic_canonical_source_pose
+                        and not candidate_advances_source
+                    ),
                 )
                 break
             except _OutsideSupportError:

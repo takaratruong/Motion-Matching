@@ -669,6 +669,7 @@ def test_full_view_passes_full_identity_and_visible_label_overrides(
     assert call["runtime_label_resolver"] is viewer_module._full_runtime_label
     assert matcher_call["search_device"] is None
     assert matcher_call["diagnostic_stability"] is True
+    assert matcher_call["diagnostic_canonical_source_pose"] is True
     assert fake_run_interactive(matcher, adapter, **call)["label"] == FULL_LABEL
 
 
@@ -705,6 +706,7 @@ def test_full_formal_matcher_explicitly_keeps_diagnostic_stability_disabled(
 
     assert built is matcher
     assert matcher_call["diagnostic_stability"] is False
+    assert matcher_call["diagnostic_canonical_source_pose"] is False
 
 
 def test_full_gpu_view_configures_before_load_and_wires_search_device(
@@ -901,9 +903,37 @@ def test_full_gpu_identity_and_label_remain_diagnostic(
     assert "EXACT SEARCH" not in label
 
 
-def test_full_stability_label_reports_mechanical_filter_inventory() -> None:
+@pytest.mark.parametrize("canonical_source", (False, True))
+def test_full_stability_identity_reports_canonical_source_policy(
+    monkeypatch: pytest.MonkeyPatch, canonical_source: bool
+) -> None:
+    matcher = SimpleNamespace(
+        corpus=object(),
+        generator=object(),
+        diagnostic_stability=True,
+        diagnostic_canonical_source_pose=canonical_source,
+        search_scope="mechanically-filtered-range-safe-corpus",
+        searchable_rows=np.arange(5),
+        total_searchable_row_count=6,
+    )
+    terrain = SimpleNamespace(scene_id="flat-standard")
+    monkeypatch.setattr(viewer_module, "_formal_identity", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        viewer_module, "scene_authentication_is_current", lambda *_args: True
+    )
+
+    identity = _full_runtime_identity(matcher, terrain, Path("g1.xml"))
+
+    assert identity["diagnostic_canonical_source_pose"] is canonical_source
+
+
+@pytest.mark.parametrize("canonical_source", (False, True))
+def test_full_stability_label_reports_mechanical_filter_inventory(
+    canonical_source: bool,
+) -> None:
     matcher = SimpleNamespace(
         diagnostic_stability=True,
+        diagnostic_canonical_source_pose=canonical_source,
         diagnostic_mechanical_clearance_bounds_m=(0.4, 1.2),
         diagnostic_mechanical_retained_searchable_row_count=5,
         total_searchable_row_count=6,
@@ -917,6 +947,8 @@ def test_full_stability_label_reports_mechanical_filter_inventory() -> None:
     assert "0.400" in label
     assert "1.200" in label
     assert "5/6" in label
+    assert ("CANONICAL SOURCE POSES" in label) is canonical_source
+    assert "NOT ACCEPTANCE EVIDENCE" in label
 
 
 def test_cli_matches_the_planned_smoke_and_view_commands() -> None:

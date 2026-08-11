@@ -8,6 +8,7 @@ import numpy as np
 from mm_sonic.hybrid_terrain_lmm_gpu_search import GpuSearchCandidates
 from mm_sonic.hybrid_terrain_lmm_runtime import (
     CommandState,
+    DIAGNOSTIC_MAX_SEARCH_JUMP_ARTICULATED_QPOS_DELTA_RAD,
     HybridMatcher,
     SE2Transform,
     SearchResult,
@@ -203,6 +204,47 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         )
 
         self.assertFalse(matcher.diagnostic_stability)
+        self.assertFalse(matcher.diagnostic_canonical_source_pose)
+
+    def test_diagnostic_canonical_source_pose_requires_stability(self):
+        with self.assertRaisesRegex(ValueError, "requires diagnostic stability"):
+            HybridMatcher(
+                _corpus(),
+                _Generator(),
+                TerrainAuthority.flat(),
+                pose_converter=_pose_converter,
+                diagnostic_canonical_source_pose=True,
+            )
+
+    def test_diagnostic_canonical_source_pose_skips_learned_decode(self):
+        class DecodeForbiddenGenerator(_Generator):
+            def decode(self, features: np.ndarray, latent: np.ndarray) -> np.ndarray:
+                raise AssertionError("canonical diagnostic invoked learned decode")
+
+        generator = DecodeForbiddenGenerator()
+        matcher = HybridMatcher(
+            _mechanically_safe(_corpus()),
+            generator,
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+            diagnostic_stability=True,
+            diagnostic_canonical_source_pose=True,
+        )
+        command = CommandState(speed=1.0)
+        matcher._last_command = command
+        matcher._last_terrain_class = matcher.state.terrain_class
+
+        state = matcher.step(command, dt=matcher.dt)
+        reset = matcher.reset()
+
+        self.assertEqual(state.row, 1)
+        self.assertEqual(state.pose_source, "canonical-diagnostic")
+        self.assertEqual(reset.pose_source, "canonical-diagnostic")
+        self.assertEqual(state.decode_count, 0)
+        self.assertEqual(reset.decode_count, 0)
+        self.assertEqual(state.fallback_count, 0)
+        self.assertEqual(reset.fallback_count, 0)
+        self.assertEqual(generator.inputs, [])
 
     def test_se2_composition_rotates_local_delta_and_wraps_yaw(self):
         world = SE2Transform(np.asarray((2.0, -3.0)), np.pi / 2.0)
@@ -440,6 +482,61 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
             ),
             0.1,
         )
+
+    def test_diagnostic_search_jump_retries_articulated_qpos_discontinuity(self):
+        values = np.full((8, 31), 10.0, dtype=np.float32)
+        values[4] = 0.0
+        values[5] = 0.1
+        values[:, 27:31] = 0.0
+        corpus = _mechanically_safe(_corpus(values))
+        corpus.artifacts.positions[:, 1, 0] = 0.0
+        corpus.artifacts.positions[4, 1, 0] = 0.6
+        corpus.artifacts.positions[5, 1, 0] = 0.1
+        generator = _Generator()
+        matcher = HybridMatcher(
+            corpus,
+            generator,
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+            diagnostic_stability=True,
+            diagnostic_canonical_source_pose=True,
+        )
+
+        state = matcher.select_query(np.zeros(31, dtype=np.float64))
+
+        self.assertEqual(DIAGNOSTIC_MAX_SEARCH_JUMP_ARTICULATED_QPOS_DELTA_RAD, 0.5)
+        self.assertEqual(state.row, 5)
+        self.assertEqual(state.pose_source, "canonical-diagnostic")
+        self.assertEqual(state.diagnostic_pose_rejection_count, 1)
+        self.assertEqual(state.decode_count, 0)
+        self.assertEqual(state.fallback_count, 0)
+        self.assertAlmostEqual(state.qpos[7], 0.1)
+        self.assertEqual(generator.inputs, [])
+
+    def test_diagnostic_articulated_qpos_limit_does_not_reject_successor(self):
+        command = CommandState(speed=1.0)
+        corpus = _mechanically_safe(_corpus())
+        corpus.artifacts.positions[:, 1, 0] = 0.0
+        corpus.artifacts.positions[1, 1, 0] = 0.6
+        generator = _Generator()
+        matcher = HybridMatcher(
+            corpus,
+            generator,
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+            diagnostic_stability=True,
+            diagnostic_canonical_source_pose=True,
+        )
+        matcher._last_command = command
+        matcher._last_terrain_class = matcher.state.terrain_class
+
+        state = matcher.step(command, dt=matcher.dt)
+
+        self.assertEqual(state.row, 1)
+        self.assertEqual(state.pose_source, "canonical-diagnostic")
+        self.assertEqual(state.diagnostic_pose_rejection_count, 0)
+        self.assertAlmostEqual(state.qpos[7], 0.6)
+        self.assertEqual(generator.inputs, [])
 
     def test_diagnostic_stability_search_view_excludes_nonadvancing_boundary_seeds(
         self,

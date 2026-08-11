@@ -432,6 +432,11 @@ def _full_runtime_label(
     formal_authorities_current: bool | None = None,
 ) -> str:
     if getattr(matcher, "diagnostic_stability", False):
+        pose_policy = (
+            "CANONICAL SOURCE POSES; "
+            if getattr(matcher, "diagnostic_canonical_source_pose", False)
+            else ""
+        )
         bounds = tuple(getattr(matcher, "diagnostic_mechanical_clearance_bounds_m", ()))
         retained = getattr(
             matcher,
@@ -442,13 +447,15 @@ def _full_runtime_label(
         if len(bounds) == 2 and retained is not None and total is not None:
             return (
                 "FULL WALKING TERRAIN LMM "
-                f"(DIAGNOSTIC MECHANICALLY FILTERED {float(bounds[0]):.3f}.."
+                f"(DIAGNOSTIC {pose_policy}MECHANICALLY FILTERED "
+                f"{float(bounds[0]):.3f}.."
                 f"{float(bounds[1]):.3f} M; {int(retained)}/{int(total)} "
                 "RANGE-SAFE ROWS; NOT ACCEPTANCE EVIDENCE)"
             )
         return (
             "FULL WALKING TERRAIN LMM "
-            "(DIAGNOSTIC MECHANICALLY FILTERED SEARCH; NOT ACCEPTANCE EVIDENCE)"
+            f"(DIAGNOSTIC {pose_policy}MECHANICALLY FILTERED SEARCH; "
+            "NOT ACCEPTANCE EVIDENCE)"
         )
     if (
         getattr(matcher, "search_backend_identity", "cpu-ckdtree-exact")
@@ -713,6 +720,7 @@ class _MuJoCoRouteEvaluator:
             initial_root_xy=adapter.spawn_native_xy,
             initial_heading=adapter.spawn_heading,
             diagnostic_stability=False,
+            diagnostic_canonical_source_pose=False,
         )
         model = build_viewer_model(self.g1_xml, adapter)
         self.matchers[scene_id] = matcher
@@ -971,6 +979,9 @@ def _full_runtime_identity(
                 matcher, "warm_search_elapsed_ms", None
             ),
             "diagnostic_stability": getattr(matcher, "diagnostic_stability", False),
+            "diagnostic_canonical_source_pose": bool(
+                getattr(matcher, "diagnostic_canonical_source_pose", False)
+            ),
             "diagnostic_mechanical_clearance_bounds_m": list(
                 getattr(matcher, "diagnostic_mechanical_clearance_bounds_m", ())
             ),
@@ -1099,6 +1110,7 @@ def main(argv: list[str] | None = None) -> int:
             initial_root_xy=adapter.spawn_native_xy,
             initial_heading=adapter.spawn_heading,
             diagnostic_stability=True,
+            diagnostic_canonical_source_pose=True,
         )
         receipt = run_interactive(
             matcher,
