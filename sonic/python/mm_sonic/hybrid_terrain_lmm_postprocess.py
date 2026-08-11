@@ -17,8 +17,9 @@ from .terrain_pose_repair import G1TerrainPoseRepair
 
 _IDENTITY = (
     "existing-pose-inertializer-repair-"
-    "source-proximity-acquire-source-continue-foot-lock/v6"
+    "source-proximity-acquire-source-continue-strict-final-foot-lock/v7"
 )
+_DIAGNOSTIC_MAXIMUM_FOOT_TARGET_RESIDUAL_M = 0.0005
 
 
 class _ObservedPoseRepairer:
@@ -178,8 +179,21 @@ class ExistingUtilityPosePostprocessor:
             if pose_repairer is None
             else pose_repairer
         )
+        self._owns_foot_locker = foot_locker is None
         self.foot_locker = (
-            G1TerrainFootLock(model, scene) if foot_locker is None else foot_locker
+            G1TerrainFootLock(
+                model,
+                scene,
+                maximum_locked_foot_drift_m=(
+                    _DIAGNOSTIC_MAXIMUM_FOOT_TARGET_RESIDUAL_M
+                ),
+                maximum_releasing_foot_drift_m=(
+                    _DIAGNOSTIC_MAXIMUM_FOOT_TARGET_RESIDUAL_M
+                ),
+                defer_swing_clearance_until_release_complete=True,
+            )
+            if foot_locker is None
+            else foot_locker
         )
         self.transition_guard = G1TerrainTransitionGuard(
             _ObservedPoseRepairer(self.pose_repairer, self._record_pose_repair),
@@ -188,6 +202,7 @@ class ExistingUtilityPosePostprocessor:
             track_source_contacts=False,
             source_contact_delay_frames=4,
             dt_s=1.0 / rate,
+            trusted_source_lock_final_authority=self._owns_foot_locker,
         )
         self.reset()
 
@@ -228,6 +243,7 @@ class ExistingUtilityPosePostprocessor:
         self.last_ground_proximity_contact = (False, False)
         self.last_trusted_landing_contact = (False, False)
         self.last_published_locked_contact = (False, False)
+        self.last_published_releasing_contact = (False, False)
         self.last_pose_repair_rejection: dict[str, float] | None = None
         self.last_reason = "reset"
 
@@ -350,6 +366,7 @@ class ExistingUtilityPosePostprocessor:
         )
         published_filtered_pose = displayed_pose is not None
         self.last_published_locked_contact = (False, False)
+        self.last_published_releasing_contact = (False, False)
         if (
             published_filtered_pose
             and lock_result is not None
@@ -360,6 +377,14 @@ class ExistingUtilityPosePostprocessor:
                 self.last_published_locked_contact = (
                     bool(published_locked[0]),
                     bool(published_locked[1]),
+                )
+            published_releasing = tuple(
+                getattr(lock_result, "releasing", ())
+            )
+            if len(published_releasing) == 2:
+                self.last_published_releasing_contact = (
+                    bool(published_releasing[0]),
+                    bool(published_releasing[1]),
                 )
         if displayed_pose is None:
             self.continuous_lock_bypass_count += 1
@@ -459,6 +484,7 @@ class ExistingUtilityPosePostprocessor:
         failed_pre_repair_recovery = outcome in {
             "pre-repair-recovery-lock-rejected",
             "pre-repair-recovery-post-repair-rejected",
+            "pre-repair-recovery-post-repair-mutated",
         }
         if successful_pre_repair_recovery or failed_pre_repair_recovery:
             self.trusted_pre_repair_recovery_attempt_count += 1
@@ -468,7 +494,10 @@ class ExistingUtilityPosePostprocessor:
             self.trusted_pre_repair_recovery_failure_count += 1
         if outcome == "pre-repair-recovery-lock-rejected":
             self.trusted_pre_repair_recovery_lock_reject_count += 1
-        elif outcome == "pre-repair-recovery-post-repair-rejected":
+        elif outcome in {
+            "pre-repair-recovery-post-repair-rejected",
+            "pre-repair-recovery-post-repair-mutated",
+        }:
             self.trusted_pre_repair_recovery_post_reject_count += 1
 
         if outcome in {"active", "pre-repair-recovery-active"}:
@@ -485,6 +514,8 @@ class ExistingUtilityPosePostprocessor:
             self.continuous_lock_recovery_count += 1
             self.last_reason = outcome_reason
         elif failed_pre_repair_recovery:
+            self.last_reason = outcome_reason
+        elif outcome in {"post-repair-rejected", "post-repair-mutated"}:
             self.last_reason = outcome_reason
         elif outcome == "bypass-after-double-reject":
             # A returned pose needs the explicit outcome count.  A rejected
@@ -522,6 +553,34 @@ class ExistingUtilityPosePostprocessor:
             "measured_ground_proximity_required_for_acquisition": True,
             "measured_speed_used_for_acquisition": False,
             "source_contacts_used_for_trusted_continuation": True,
+            "diagnostic_owned_foot_locker": self._owns_foot_locker,
+            "foot_lock_maximum_locked_foot_drift_m": getattr(
+                self.foot_locker, "maximum_locked_foot_drift_m", None
+            ),
+            "foot_lock_maximum_releasing_foot_drift_m": getattr(
+                self.foot_locker, "maximum_releasing_foot_drift_m", None
+            ),
+            "foot_lock_maximum_joint_correction_rad": getattr(
+                self.foot_locker, "maximum_joint_correction_rad", None
+            ),
+            "foot_lock_maximum_joint_correction_step_rad": getattr(
+                self.foot_locker,
+                "maximum_joint_correction_step_rad",
+                None,
+            ),
+            "foot_lock_defer_swing_clearance_until_release_complete": bool(
+                getattr(
+                    self.foot_locker,
+                    "defer_swing_clearance_until_release_complete",
+                    False,
+                )
+            ),
+            "trusted_source_lock_final_authority": (
+                self.transition_guard.trusted_source_lock_final_authority
+            ),
+            "trusted_post_lock_safety_validator_requires_noop": (
+                self.transition_guard.trusted_source_lock_final_authority
+            ),
             "measured_stance_maximum_foot_speed_mps": (
                 self.transition_guard.landing_maximum_foot_speed_mps
             ),
@@ -594,6 +653,9 @@ class ExistingUtilityPosePostprocessor:
             "last_trusted_landing_contact": (self.last_trusted_landing_contact),
             "last_published_locked_contact": (
                 self.last_published_locked_contact
+            ),
+            "last_published_releasing_contact": (
+                self.last_published_releasing_contact
             ),
             "last_pose_repair_rejection": (
                 None

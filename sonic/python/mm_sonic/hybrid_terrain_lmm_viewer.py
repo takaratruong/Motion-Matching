@@ -45,11 +45,11 @@ DIAGNOSTIC_MODEL_LABEL = (
 )
 _DISPLAY_POSTPROCESSOR_IDENTITY = (
     "existing-pose-inertializer-repair-"
-    "source-proximity-acquire-source-continue-foot-lock/v6"
+    "source-proximity-acquire-source-continue-strict-final-foot-lock/v7"
 )
 _DISPLAY_POSTPROCESSOR_POLICY = (
     "PoseInertializer + source+proximity-acquire/source-continue "
-    "G1TerrainFootLock"
+    "strict-final G1TerrainFootLock"
 )
 _FORMAL_ARTIFACT_AUTHORITIES = {
     "cache_manifest_sha256": (
@@ -1101,6 +1101,19 @@ def _display_postprocessor_overlay(identity: object | None) -> tuple[str, str]:
     proximity = tuple(getter("last_ground_proximity_contact", (False, False)))
     trusted = tuple(getter("last_trusted_landing_contact", (False, False)))
     published = tuple(getter("last_published_locked_contact", (False, False)))
+    releasing = tuple(
+        getter("last_published_releasing_contact", (False, False))
+    )
+    locked_residual = float(getter("foot_lock_maximum_locked_foot_drift_m"))
+    releasing_residual = float(
+        getter("foot_lock_maximum_releasing_foot_drift_m")
+    )
+    correction_step = float(
+        getter("foot_lock_maximum_joint_correction_step_rad")
+    )
+    correction_maximum = float(
+        getter("foot_lock_maximum_joint_correction_rad")
+    )
     title = f"{_DISPLAY_POSTPROCESSOR_POLICY} | {half_life:.2f}s half-life"
     body = (
         f"display postprocess {_DISPLAY_POSTPROCESSOR_POLICY} | "
@@ -1112,6 +1125,13 @@ def _display_postprocessor_overlay(identity: object | None) -> tuple[str, str]:
         f"proximity L/R {int(bool(proximity[0]))}/{int(bool(proximity[1]))} | "
         f"trusted L/R {int(bool(trusted[0]))}/{int(bool(trusted[1]))} | "
         f"published lock L/R {int(bool(published[0]))}/{int(bool(published[1]))} | "
+        "published release L/R "
+        f"{int(bool(releasing[0]))}/{int(bool(releasing[1]))} | "
+        "lock/release target residual <= "
+        f"{1000.0 * locked_residual:.1f}/{1000.0 * releasing_residual:.1f} mm | "
+        f"joint correction step/max {correction_step:.2f}/{correction_maximum:.2f} rad | "
+        "release clearance deferred until target expiry | "
+        "post-lock safety validator must be no-op | "
         "acquire evidence/earned/source-only/proximity-only "
         f"{int(getter('source_proximity_candidate_frame_count', 0))}/"
         f"{int(getter('source_proximity_acquisition_frame_count', 0))}/"

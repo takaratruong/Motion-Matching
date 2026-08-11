@@ -189,6 +189,7 @@ class _MeasuredContinuousFootLocker(_RecordingFootLocker):
             tuple[KinematicPose, KinematicPose | None, float | None]
         ] = []
         self.swing_clearances: list[float] = []
+        self.releasing_queue: list[tuple[bool, bool]] = []
 
     def landing_stance_contact(
         self,
@@ -227,7 +228,11 @@ class _MeasuredContinuousFootLocker(_RecordingFootLocker):
             accepted=accepted,
             repaired=False,
             locked=(accepted and bool(contact[0]), accepted and bool(contact[1])),
-            releasing=(False, False),
+            releasing=(
+                self.releasing_queue.pop(0)
+                if self.releasing_queue
+                else (False, False)
+            ),
             reason="accepted" if accepted else "lock rejected",
         )
 
@@ -415,6 +420,124 @@ def test_existing_support_contact_rejects_136mm_airborne_feet(model) -> None:
     np.testing.assert_array_equal(locker.support_contact(pose), (False, False))
 
 
+def test_diagnostic_owned_locker_uses_strict_active_and_release_residuals(
+    model,
+) -> None:
+    scene = SimpleNamespace(height_at_world_xy=lambda _xy: 0.0)
+
+    processor = ExistingUtilityPosePostprocessor(model, scene)
+    diagnostic = processor.foot_locker
+    normal = G1TerrainFootLock(model, scene)
+
+    assert diagnostic.maximum_locked_foot_drift_m == pytest.approx(0.0005)
+    assert diagnostic.maximum_releasing_foot_drift_m == pytest.approx(0.0005)
+    assert diagnostic.defer_swing_clearance_until_release_complete is True
+    assert normal.maximum_locked_foot_drift_m == pytest.approx(0.010)
+    assert normal.maximum_releasing_foot_drift_m is None
+    assert normal.defer_swing_clearance_until_release_complete is False
+    identity = processor.identity()
+    assert identity["diagnostic_owned_foot_locker"] is True
+    assert identity["foot_lock_maximum_locked_foot_drift_m"] == pytest.approx(
+        0.0005
+    )
+    assert identity["foot_lock_maximum_releasing_foot_drift_m"] == pytest.approx(
+        0.0005
+    )
+    assert identity["foot_lock_maximum_joint_correction_rad"] == pytest.approx(0.25)
+    assert identity["foot_lock_maximum_joint_correction_step_rad"] == pytest.approx(
+        0.08
+    )
+    assert identity["trusted_source_lock_final_authority"] is True
+    assert identity["trusted_post_lock_safety_validator_requires_noop"] is True
+
+
+def test_release_retry_rejects_an_unsolved_existing_release_target(model) -> None:
+    scene = SimpleNamespace(height_at_world_xy=lambda _xy: 0.0)
+    locker = G1TerrainFootLock(
+        model,
+        scene,
+        maximum_locked_foot_drift_m=0.0005,
+    )
+    # Set the wished-for diagnostic policy explicitly so this test fails on
+    # behavior, rather than on the new constructor API being absent.
+    locker.maximum_releasing_foot_drift_m = 0.0005
+    locker.defer_swing_clearance_until_release_complete = True
+    adapter = NativeQposPoseAdapter(model)
+    initial_qpos = _qpos(model, x=0.0)
+    initial_qpos[2] += 0.024
+    shifted_qpos = initial_qpos.copy()
+    shifted_qpos[0] += 0.040
+    initial = adapter.to_pose(initial_qpos, dt_s=1.0 / 60.0)
+    shifted = adapter.to_pose(shifted_qpos, dt_s=1.0 / 60.0)
+
+    prime = locker.apply(
+        initial,
+        np.asarray((True, False), dtype=bool),
+        dt_s=1.0 / 60.0,
+        minimum_swing_clearance_m=0.0,
+    )
+    active = locker.apply(
+        shifted,
+        np.asarray((True, False), dtype=bool),
+        dt_s=1.0 / 60.0,
+        minimum_swing_clearance_m=0.012,
+    )
+    released = locker.apply(
+        shifted,
+        np.asarray((False, False), dtype=bool),
+        dt_s=1.0 / 60.0,
+        minimum_swing_clearance_m=0.012,
+    )
+
+    assert prime.accepted is True
+    assert active.accepted is False
+    assert active.maximum_locked_foot_drift_m > 0.0005
+    assert released.accepted is False
+    assert released.maximum_releasing_foot_drift_m > 0.0005
+    assert "releasing-foot drift exceeds 0.5 mm" in released.reason
+
+
+def test_swing_clearance_waits_until_existing_release_target_expires(model) -> None:
+    scene = SimpleNamespace(height_at_world_xy=lambda _xy: 0.0)
+    locker = G1TerrainFootLock(
+        model,
+        scene,
+        maximum_locked_foot_drift_m=0.0005,
+    )
+    locker.maximum_releasing_foot_drift_m = 0.0005
+    locker.defer_swing_clearance_until_release_complete = True
+    qpos = _qpos(model, x=0.0)
+    qpos[2] += 0.024
+    pose = NativeQposPoseAdapter(model).to_pose(qpos, dt_s=1.0 / 60.0)
+
+    prime = locker.apply(
+        pose,
+        np.asarray((True, True), dtype=bool),
+        dt_s=1.0 / 60.0,
+        minimum_swing_clearance_m=0.0,
+    )
+    released = locker.apply(
+        pose,
+        np.asarray((False, True), dtype=bool),
+        dt_s=1.0 / 60.0,
+        minimum_swing_clearance_m=0.012,
+    )
+    planar_step = float(
+        np.max(
+            np.linalg.norm(
+                released.sole_world_positions[0][:, :2]
+                - prime.sole_world_positions[0][:, :2],
+                axis=1,
+            )
+        )
+    )
+
+    assert prime.accepted is True
+    assert released.accepted is True
+    assert released.releasing == (True, False)
+    assert planar_step <= 0.001
+
+
 def test_guard_without_source_keeps_speed_qualified_acquisition_policy(model) -> None:
     repairer = _RecordingRepairer()
     locker = _MeasuredContinuousFootLocker()
@@ -439,6 +562,154 @@ def test_guard_without_source_keeps_speed_qualified_acquisition_policy(model) ->
         np.testing.assert_array_equal(contact, (False, False))
     # The speed-free support utility is diagnostic-source policy only.
     assert locker.support_calls == []
+
+
+def test_trusted_final_validator_mutation_bypasses_stale_lock_pose(model) -> None:
+    repairer = _KneeOffsetRepairer()
+    locker = _MeasuredContinuousFootLocker()
+    guard = G1TerrainTransitionGuard(
+        repairer,
+        locker,
+        contact_hold_frames=4,
+        source_contact_delay_frames=4,
+        dt_s=1.0 / 60.0,
+    )
+    guard.trusted_source_lock_final_authority = True
+    pose = NativeQposPoseAdapter(model).to_pose(
+        _qpos(model, x=0.0), dt_s=1.0 / 60.0
+    )
+    guard.begin_landing(pose)
+    repairer.knee_offsets[:] = [0.0, 0.10]
+
+    filtered = guard.filter_landing(
+        pose,
+        trusted_source_contact=np.asarray((True, False), dtype=bool),
+    )
+
+    assert filtered is None
+    assert guard.landing_filter_outcome == "post-repair-mutated"
+    assert "mutated accepted foot-lock pose" in guard.landing_filter_reason
+
+
+def test_no_source_path_still_publishes_existing_post_repair(model) -> None:
+    repairer = _KneeOffsetRepairer()
+    locker = _MeasuredContinuousFootLocker()
+    guard = G1TerrainTransitionGuard(
+        repairer,
+        locker,
+        contact_hold_frames=4,
+        source_contact_delay_frames=4,
+        dt_s=1.0 / 60.0,
+    )
+    guard.trusted_source_lock_final_authority = True
+    pose = NativeQposPoseAdapter(model).to_pose(
+        _qpos(model, x=0.0), dt_s=1.0 / 60.0
+    )
+    guard.begin_landing(pose)
+    repairer.knee_offsets[:] = [0.0, 0.10]
+
+    filtered = guard.filter_landing(pose)
+
+    assert isinstance(filtered, KinematicPose)
+    assert filtered.joint_position[9] - pose.joint_position[9] == pytest.approx(0.10)
+
+
+def test_published_release_mask_is_zeroed_on_following_bypass(model) -> None:
+    processor, repairer, locker = _continuous_processor(model)
+    locker.measured_support = np.asarray((True, False), dtype=bool)
+    source = np.asarray((True, False), dtype=bool)
+    dt = 1.0 / 60.0
+    for row in (1, 2):
+        processor.step(
+            _qpos(model, x=0.01 * (row - 1)),
+            row=row,
+            range_index=0,
+            source_contact=source,
+            dt_s=dt,
+        )
+    locker.releasing_queue[:] = [(True, False)]
+
+    processor.step(
+        _qpos(model, x=0.02),
+        row=3,
+        range_index=0,
+        source_contact=np.asarray((False, False), dtype=bool),
+        dt_s=dt,
+    )
+
+    identity = processor.identity()
+    assert identity["last_published_locked_contact"] == (False, False)
+    assert identity["last_published_releasing_contact"] == (True, False)
+
+    repairer.queue(False, reason="pre-repair rejected")
+    processor.step(
+        _qpos(model, x=0.03),
+        row=4,
+        range_index=0,
+        source_contact=np.asarray((False, False), dtype=bool),
+        dt_s=dt,
+    )
+
+    assert processor.identity()["last_published_releasing_contact"] == (
+        False,
+        False,
+    )
+
+
+def test_trusted_recovery_validator_mutation_restores_transaction(model) -> None:
+    repairer = _RecordingRepairer()
+    locker = _MeasuredContinuousFootLocker()
+    guard = G1TerrainTransitionGuard(
+        repairer,
+        locker,
+        contact_hold_frames=4,
+        source_contact_delay_frames=4,
+        dt_s=1.0 / 60.0,
+    )
+    guard.trusted_source_lock_final_authority = True
+    pose = NativeQposPoseAdapter(model).to_pose(
+        _qpos(model, x=0.0), dt_s=1.0 / 60.0
+    )
+    guard.begin_landing(pose)
+    repairer.queue(False, reason="pre-repair rejected")
+    repairer.queue(True, repaired=True)
+    restores_before = locker.restore_calls
+
+    filtered = guard.filter_landing(
+        pose,
+        trusted_source_contact=np.asarray((True, False), dtype=bool),
+    )
+
+    assert filtered is None
+    assert locker.restore_calls == restores_before + 1
+    assert guard.landing_filter_outcome == (
+        "pre-repair-recovery-post-repair-mutated"
+    )
+
+
+def test_double_reject_clears_deferred_neutral_prime_state(model) -> None:
+    repairer = _RecordingRepairer()
+    locker = _MeasuredContinuousFootLocker()
+    guard = G1TerrainTransitionGuard(
+        repairer,
+        locker,
+        contact_hold_frames=4,
+        source_contact_delay_frames=4,
+        dt_s=1.0 / 60.0,
+    )
+    pose = NativeQposPoseAdapter(model).to_pose(
+        _qpos(model, x=0.0), dt_s=1.0 / 60.0
+    )
+    guard.begin_landing(pose, defer_contact_acquisition=True)
+    locker.accepted[:] = [False, False]
+
+    filtered = guard.filter_landing(
+        pose,
+        trusted_source_contact=np.asarray((False, False), dtype=bool),
+    )
+
+    assert filtered is None
+    assert guard._landing_neutral_lock_primed is False
 
 
 def test_deferred_landing_primes_zero_correction_before_display_filter(model) -> None:
@@ -1146,9 +1417,10 @@ def test_reset_clears_temporal_state_and_diagnostics(model) -> None:
 
     identity = processor.identity()
     assert identity == {
-        "diagnostic_display_postprocessor": (
-            "existing-pose-inertializer-repair-"
-            "source-proximity-acquire-source-continue-foot-lock/v6"
+            "diagnostic_display_postprocessor": (
+                "existing-pose-inertializer-repair-"
+                "source-proximity-acquire-source-continue-"
+                "strict-final-foot-lock/v7"
         ),
         "inertialization_halflife_s": 0.10,
         "contact_policy": (
@@ -1158,7 +1430,15 @@ def test_reset_clears_temporal_state_and_diagnostics(model) -> None:
         "source_contacts_required_for_acquisition": True,
         "measured_ground_proximity_required_for_acquisition": True,
         "measured_speed_used_for_acquisition": False,
-        "source_contacts_used_for_trusted_continuation": True,
+            "source_contacts_used_for_trusted_continuation": True,
+            "diagnostic_owned_foot_locker": False,
+            "foot_lock_maximum_locked_foot_drift_m": None,
+            "foot_lock_maximum_releasing_foot_drift_m": None,
+            "foot_lock_maximum_joint_correction_rad": None,
+            "foot_lock_maximum_joint_correction_step_rad": None,
+            "foot_lock_defer_swing_clearance_until_release_complete": False,
+            "trusted_source_lock_final_authority": False,
+            "trusted_post_lock_safety_validator_requires_noop": False,
         "measured_stance_maximum_foot_speed_mps": 0.20,
         "ground_proximity_maximum_sole_clearance_m": 0.020,
         "source_proximity_acquire_frames": 2,
@@ -1189,7 +1469,8 @@ def test_reset_clears_temporal_state_and_diagnostics(model) -> None:
         "last_measured_stance_contact": (False, False),
         "last_ground_proximity_contact": (False, False),
         "last_trusted_landing_contact": (False, False),
-        "last_published_locked_contact": (False, False),
+            "last_published_locked_contact": (False, False),
+            "last_published_releasing_contact": (False, False),
         "last_pose_repair_rejection": None,
         "last_reason": "reset",
     }

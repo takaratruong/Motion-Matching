@@ -1703,7 +1703,8 @@ class HybridTerrainViewerTests(unittest.TestCase):
             display_postprocessor_identity={
                 "diagnostic_display_postprocessor": (
                     "existing-pose-inertializer-repair-"
-                    "source-proximity-acquire-source-continue-foot-lock/v6"
+                    "source-proximity-acquire-source-continue-"
+                    "strict-final-foot-lock/v7"
                 ),
                 "inertialization_halflife_s": 0.10,
                 "measured_stance_maximum_foot_speed_mps": 0.20,
@@ -1713,6 +1714,11 @@ class HybridTerrainViewerTests(unittest.TestCase):
                 "last_ground_proximity_contact": (True, False),
                 "last_trusted_landing_contact": (True, False),
                 "last_published_locked_contact": (True, False),
+                "last_published_releasing_contact": (False, True),
+                "foot_lock_maximum_locked_foot_drift_m": 0.0005,
+                "foot_lock_maximum_releasing_foot_drift_m": 0.0005,
+                "foot_lock_maximum_joint_correction_step_rad": 0.08,
+                "foot_lock_maximum_joint_correction_rad": 0.25,
                 "source_proximity_candidate_frame_count": 6,
                 "source_proximity_acquisition_frame_count": 4,
                 "source_without_proximity_frame_count": 2,
@@ -1740,7 +1746,7 @@ class HybridTerrainViewerTests(unittest.TestCase):
         self.assertNotIn("EXACT SEARCH", title)
         self.assertIn(
             "PoseInertializer + source+proximity-acquire/source-continue "
-            "G1TerrainFootLock",
+            "strict-final G1TerrainFootLock",
             title,
         )
         for value in (
@@ -1764,7 +1770,7 @@ class HybridTerrainViewerTests(unittest.TestCase):
             "slope=125000",
             "transition penalty 0.100",
             "PoseInertializer + source+proximity-acquire/source-continue "
-            "G1TerrainFootLock",
+            "strict-final G1TerrainFootLock",
             "0.10s half-life",
             "repair calls accepted 7",
             "acquire source + <= 20 mm proximity, 2f, speed ignored",
@@ -1773,6 +1779,11 @@ class HybridTerrainViewerTests(unittest.TestCase):
             "proximity L/R 1/0",
             "trusted L/R 1/0",
             "published lock L/R 1/0",
+            "published release L/R 0/1",
+            "lock/release target residual <= 0.5/0.5 mm",
+            "joint correction step/max 0.08/0.25 rad",
+            "release clearance deferred until target expiry",
+            "post-lock safety validator must be no-op",
             "acquire evidence/earned/source-only/proximity-only 6/4/2/1",
             "source continue/override/release 3/2/1",
             "pre-repair recover attempt/success/fail/post-reject 3/2/1/1",
@@ -2341,7 +2352,8 @@ class HybridTerrainViewerTests(unittest.TestCase):
         postprocessor_identity = {
             "diagnostic_display_postprocessor": (
                 "existing-pose-inertializer-repair-"
-                "source-proximity-acquire-source-continue-foot-lock/v6"
+                "source-proximity-acquire-source-continue-"
+                "strict-final-foot-lock/v7"
             ),
             "inertialization_halflife_s": 0.10,
             "measured_stance_maximum_foot_speed_mps": 0.20,
@@ -2351,6 +2363,11 @@ class HybridTerrainViewerTests(unittest.TestCase):
             "last_ground_proximity_contact": (False, True),
             "last_trusted_landing_contact": (False, True),
             "last_published_locked_contact": (False, True),
+            "last_published_releasing_contact": (True, False),
+            "foot_lock_maximum_locked_foot_drift_m": 0.0005,
+            "foot_lock_maximum_releasing_foot_drift_m": 0.0005,
+            "foot_lock_maximum_joint_correction_step_rad": 0.08,
+            "foot_lock_maximum_joint_correction_rad": 0.25,
             "source_proximity_candidate_frame_count": 2,
             "source_proximity_acquisition_frame_count": 1,
             "source_without_proximity_frame_count": 1,
@@ -2548,7 +2565,7 @@ class HybridTerrainViewerTests(unittest.TestCase):
         self.assertEqual(receipt["identity"]["pose_repair_count"], 3)
         self.assertIn(
             "PoseInertializer + source+proximity-acquire/source-continue "
-            "G1TerrainFootLock",
+            "strict-final G1TerrainFootLock",
             overlay_texts[0][0],
         )
         self.assertIn("0.10s half-life", overlay_texts[0][0])
@@ -2558,6 +2575,7 @@ class HybridTerrainViewerTests(unittest.TestCase):
         self.assertIn("repair rejected 4", overlay_texts[0][1])
         self.assertIn("speed ignored", overlay_texts[0][1])
         self.assertIn("published lock L/R 0/1", overlay_texts[0][1])
+        self.assertIn("published release L/R 1/0", overlay_texts[0][1])
         self.assertIn("last reason lock rejected", overlay_texts[0][1])
 
     def test_failed_reset_returns_original_runtime_unchanged(self):

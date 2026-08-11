@@ -796,7 +796,7 @@ def test_full_view_passes_full_identity_and_visible_label_overrides(
     label = fake_run_interactive(matcher, adapter, **call)["label"]
     assert (
         "PoseInertializer + source+proximity-acquire/source-continue "
-        "G1TerrainFootLock" in label
+        "strict-final G1TerrainFootLock" in label
     )
     assert "0.10s half-life" in label
 
@@ -1189,7 +1189,7 @@ def test_full_stability_label_reports_mechanical_filter_inventory(
     assert "ARM SLEW" not in label
     assert (
         "PoseInertializer + source+proximity-acquire/source-continue "
-        "G1TerrainFootLock" in label
+        "strict-final G1TerrainFootLock" in label
     )
     assert "0.10s half-life" in label
     assert "NOT ACCEPTANCE EVIDENCE" in label

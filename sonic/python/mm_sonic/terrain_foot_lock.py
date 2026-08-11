@@ -57,6 +57,7 @@ class TerrainFootLockResult:
     releasing: tuple[bool, bool]
     sole_world_positions: tuple[np.ndarray, np.ndarray]
     maximum_locked_foot_drift_m: float
+    maximum_releasing_foot_drift_m: float
     maximum_foot_penetration_m: float
     maximum_forbidden_penetration_m: float
     maximum_joint_delta_rad: float
@@ -119,6 +120,8 @@ class G1TerrainFootLock:
         *,
         maximum_foot_penetration_m: float = 0.005,
         maximum_locked_foot_drift_m: float = 0.010,
+        maximum_releasing_foot_drift_m: float | None = None,
+        defer_swing_clearance_until_release_complete: bool = False,
         maximum_joint_correction_rad: float = 0.25,
         maximum_joint_correction_step_rad: float = 0.08,
         maximum_support_snap_down_m: float = 0.020,
@@ -148,6 +151,14 @@ class G1TerrainFootLock:
             or int(maximum_iterations) <= 0
             or not math.isfinite(float(posture_weight))
             or float(posture_weight) < 0.0
+            or (
+                maximum_releasing_foot_drift_m is not None
+                and (
+                    not math.isfinite(float(maximum_releasing_foot_drift_m))
+                    or float(maximum_releasing_foot_drift_m) <= 0.0
+                )
+            )
+            or type(defer_swing_clearance_until_release_complete) is not bool
         ):
             raise ValueError("terrain foot-lock parameters are invalid")
 
@@ -158,6 +169,14 @@ class G1TerrainFootLock:
         )
         self.maximum_locked_foot_drift_m = float(
             maximum_locked_foot_drift_m
+        )
+        self.maximum_releasing_foot_drift_m = (
+            None
+            if maximum_releasing_foot_drift_m is None
+            else float(maximum_releasing_foot_drift_m)
+        )
+        self.defer_swing_clearance_until_release_complete = (
+            defer_swing_clearance_until_release_complete
         )
         self.maximum_joint_correction_rad = float(
             maximum_joint_correction_rad
@@ -1057,7 +1076,10 @@ class G1TerrainFootLock:
             mujoco.mj_forward(self.model, self._data)
             current_sole = self._sole_positions()
             for foot in range(2):
-                if contact[foot]:
+                if contact[foot] or (
+                    self.defer_swing_clearance_until_release_complete
+                    and proposed[foot] is not None
+                ):
                     continue
                 required_lift = 0.0
                 for geom_id, center in zip(
@@ -1122,12 +1144,25 @@ class G1TerrainFootLock:
         collision = self._collision_state()
         final_sole = self._sole_positions()
         locked_drift = 0.0
+        releasing_drift = 0.0
         for foot, active in enumerate(contact):
             if active and proposed[foot] is not None:
                 locked_drift = max(
                     locked_drift,
                     float(np.max(np.linalg.norm(
                         final_sole[foot] - proposed[foot].target,
+                        axis=1,
+                    ))),
+                )
+            if (
+                proposed[foot] is not None
+                and proposed[foot].release_weight is not None
+                and solve_targets[foot] is not None
+            ):
+                releasing_drift = max(
+                    releasing_drift,
+                    float(np.max(np.linalg.norm(
+                        final_sole[foot] - solve_targets[foot],
                         axis=1,
                     ))),
                 )
@@ -1156,6 +1191,15 @@ class G1TerrainFootLock:
             reasons.append(
                 "locked-foot drift exceeds "
                 f"{1000.0 * self.maximum_locked_foot_drift_m:.1f} mm"
+            )
+        if (
+            self.maximum_releasing_foot_drift_m is not None
+            and releasing_drift
+            > self.maximum_releasing_foot_drift_m + tolerance
+        ):
+            reasons.append(
+                "releasing-foot drift exceeds "
+                f"{1000.0 * self.maximum_releasing_foot_drift_m:.1f} mm"
             )
         if (
             joint_delta
@@ -1189,6 +1233,7 @@ class G1TerrainFootLock:
             ),
             sole_world_positions=final_sole,
             maximum_locked_foot_drift_m=locked_drift,
+            maximum_releasing_foot_drift_m=releasing_drift,
             maximum_foot_penetration_m=(
                 collision.maximum_foot_penetration_m
             ),
@@ -1226,6 +1271,7 @@ class G1TerrainTransitionGuard:
         landing_maximum_sole_clearance_m: float = 0.020,
         landing_contact_acquire_frames: int = 2,
         landing_minimum_swing_clearance_m: float = 0.012,
+        trusted_source_lock_final_authority: bool = False,
     ) -> None:
         landing_speed = float(landing_maximum_foot_speed_mps)
         landing_clearance = float(landing_maximum_sole_clearance_m)
@@ -1246,6 +1292,7 @@ class G1TerrainTransitionGuard:
             or landing_contact_acquire_frames <= 0
             or not math.isfinite(swing_clearance)
             or swing_clearance < 0.0
+            or type(trusted_source_lock_final_authority) is not bool
             or not callable(getattr(pose_repairer, "repair", None))
             or not callable(getattr(foot_locker, "apply", None))
             or not callable(getattr(foot_locker, "reset", None))
@@ -1267,6 +1314,9 @@ class G1TerrainTransitionGuard:
         self.landing_maximum_sole_clearance_m = landing_clearance
         self.landing_contact_acquire_frames = landing_contact_acquire_frames
         self.landing_minimum_swing_clearance_m = swing_clearance
+        self.trusted_source_lock_final_authority = (
+            trusted_source_lock_final_authority
+        )
         self.last_pose_repair_result: object | None = None
         self.last_foot_lock_result: object | None = None
         self.end_stair()
@@ -1574,6 +1624,20 @@ class G1TerrainTransitionGuard:
                 f"{getattr(post, 'reason', 'pose repair rejected')}"
             )
             return None
+        if (
+            self.trusted_source_lock_final_authority
+            and bool(getattr(post, "repaired", False))
+        ):
+            self.foot_locker.restore_state(snapshot)
+            self._landing_filter_outcome = (
+                "pre-repair-recovery-post-repair-mutated"
+            )
+            self._landing_filter_reason = (
+                "trusted recovery safety validator mutated accepted "
+                "foot-lock pose after pre-repair rejection: "
+                f"{rejected_reason}"
+            )
+            return None
         result = getattr(post, "pose", None)
         if not isinstance(result, KinematicPose):
             self.foot_locker.restore_state(snapshot)
@@ -1608,7 +1672,7 @@ class G1TerrainTransitionGuard:
             "recovered trusted contact after pre-repair rejection: "
             f"{rejected_reason}"
         )
-        return result
+        return filtered if self.trusted_source_lock_final_authority else result
 
     def filter_landing(
         self,
@@ -1753,6 +1817,14 @@ class G1TerrainTransitionGuard:
             contact_values[1],
         )
         contact = np.asarray(contact_values, dtype=bool)
+        lock_snapshot = (
+            self.foot_locker.snapshot_state()
+            if (
+                source_contact is not None
+                and self.trusted_source_lock_final_authority
+            )
+            else None
+        )
         locked = self.foot_locker.apply(
             candidate,
             contact,
@@ -1786,6 +1858,7 @@ class G1TerrainTransitionGuard:
                 # landing state, and publish its advancing inertialized source
                 # candidate rather than one side of an IK flip.
                 self.foot_locker.reset()
+                self._landing_neutral_lock_primed = False
                 self._landing_filter_outcome = (
                     "bypass-after-double-reject"
                 )
@@ -1822,15 +1895,36 @@ class G1TerrainTransitionGuard:
         post = self.pose_repairer.repair(filtered)
         self.last_pose_repair_result = post
         if not bool(getattr(post, "accepted", False)):
+            if lock_snapshot is not None:
+                self.foot_locker.restore_state(lock_snapshot)
             self._landing_filter_outcome = "post-repair-rejected"
             self._landing_filter_reason = str(
                 getattr(post, "reason", "post-lock pose repair rejected")
             )
             return None
+        if (
+            source_contact is not None
+            and self.trusted_source_lock_final_authority
+            and bool(getattr(post, "repaired", False))
+        ):
+            assert lock_snapshot is not None
+            self.foot_locker.restore_state(lock_snapshot)
+            self._landing_filter_outcome = "post-repair-mutated"
+            self._landing_filter_reason = (
+                "post-lock safety validator mutated accepted foot-lock pose"
+            )
+            return None
         result = getattr(post, "pose", None)
         if not isinstance(result, KinematicPose):
             raise ValueError("pose repairer returned an invalid pose")
-        return result
+        return (
+            filtered
+            if (
+                source_contact is not None
+                and self.trusted_source_lock_final_authority
+            )
+            else result
+        )
 
     reset = end_stair
 
