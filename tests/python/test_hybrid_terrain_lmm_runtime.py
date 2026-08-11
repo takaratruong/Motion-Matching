@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
 
@@ -349,6 +350,189 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
 
         self.assertEqual(rows, [0, 1, 2, 3, 0])
         self.assertEqual(searched.call_count, 4)
+
+    def test_gpu_diagnostic_periodic_searches_active_command_at_10_hz(self):
+        fake = _FakeSingleGpuSearch()
+        with mock.patch(
+            "mm_sonic.hybrid_terrain_lmm_gpu_search.SingleGpuExactSearch",
+            return_value=fake,
+        ):
+            matcher = HybridMatcher(
+                _mechanically_safe(_corpus()),
+                _Generator(),
+                TerrainAuthority.flat(),
+                pose_converter=_pose_converter,
+                search_device="cuda:5",
+                diagnostic_stability=True,
+            )
+        fake.responses.extend(
+            (
+                _gpu_candidates(
+                    matcher.searchable_rows,
+                    candidate_count=len(matcher.searchable_rows),
+                    close_candidate_count=len(matcher.searchable_rows),
+                ),
+                _gpu_candidates(
+                    matcher.searchable_rows,
+                    candidate_count=len(matcher.searchable_rows),
+                    close_candidate_count=len(matcher.searchable_rows),
+                ),
+            )
+        )
+
+        with mock.patch.object(matcher, "match", wraps=matcher.match) as searched:
+            for _ in range(3):
+                matcher.step(CommandState(1.0, 0.0), dt=0.04)
+
+        self.assertEqual(searched.call_count, 2)
+        self.assertEqual(len(fake.calls), 2)
+
+    def test_holden_velocity_release_is_bounded_and_snaps_neutral(self):
+        fake = _FakeSingleGpuSearch()
+        with mock.patch(
+            "mm_sonic.hybrid_terrain_lmm_gpu_search.SingleGpuExactSearch",
+            return_value=fake,
+        ):
+            matcher = HybridMatcher(
+                _mechanically_safe(_corpus()),
+                _Generator(),
+                TerrainAuthority.flat(),
+                pose_converter=_pose_converter,
+                search_device="cuda:5",
+                diagnostic_stability=True,
+            )
+        fake.responses.extend(
+            _gpu_candidates(
+                matcher.searchable_rows,
+                candidate_count=len(matcher.searchable_rows),
+                close_candidate_count=len(matcher.searchable_rows),
+            )
+            for _ in range(4)
+        )
+
+        for _ in range(3):
+            matcher.step(CommandState(1.0, 0.0), dt=0.04)
+        before_release = matcher._shaped_velocity_world_xy[1]
+        matcher.step(CommandState(), dt=0.04)
+        first_release = matcher._shaped_velocity_world_xy[1]
+
+        self.assertGreater(first_release, 0.0)
+        self.assertLessEqual(before_release - first_release, 2.0 * 0.04 + 1e-12)
+        matcher.step(CommandState(), dt=0.04)
+        self.assertEqual(matcher._shaped_velocity_world_xy[1], 0.0)
+
+    def test_holden_velocity_uses_one_shaped_command_for_preview_and_query(self):
+        fake = _FakeSingleGpuSearch()
+        with mock.patch(
+            "mm_sonic.hybrid_terrain_lmm_gpu_search.SingleGpuExactSearch",
+            return_value=fake,
+        ):
+            matcher = HybridMatcher(
+                _mechanically_safe(_corpus()),
+                _Generator(),
+                TerrainAuthority.flat(),
+                pose_converter=_pose_converter,
+                search_device="cuda:5",
+                diagnostic_stability=True,
+            )
+        fake.responses.append(
+            _gpu_candidates(
+                matcher.searchable_rows,
+                candidate_count=len(matcher.searchable_rows),
+                close_candidate_count=len(matcher.searchable_rows),
+            )
+        )
+        preview_speeds: list[float] = []
+        query_speeds: list[float] = []
+        preview = matcher._preview_points
+        query = matcher._command_query
+
+        def record_preview(command):
+            preview_speeds.append(command.speed)
+            return preview(command)
+
+        def record_query(command, live):
+            query_speeds.append(command.speed)
+            return query(command, live)
+
+        with (
+            mock.patch.object(matcher, "_preview_points", side_effect=record_preview),
+            mock.patch.object(matcher, "_command_query", side_effect=record_query),
+        ):
+            matcher.step(CommandState(1.0, 0.25), dt=0.04)
+
+        self.assertTrue(preview_speeds)
+        self.assertEqual(query_speeds, [preview_speeds[0]])
+        self.assertLess(query_speeds[0], 1.0)
+
+    def test_hard_stop_holds_gpu_diagnostic_and_zeros_holden_velocity(self):
+        fake = _FakeSingleGpuSearch()
+        with mock.patch(
+            "mm_sonic.hybrid_terrain_lmm_gpu_search.SingleGpuExactSearch",
+            return_value=fake,
+        ):
+            matcher = HybridMatcher(
+                _mechanically_safe(_corpus()),
+                _Generator(),
+                TerrainAuthority.flat(),
+                pose_converter=_pose_converter,
+                search_device="cuda:5",
+                diagnostic_stability=True,
+            )
+        fake.responses.append(
+            _gpu_candidates(
+                matcher.searchable_rows,
+                candidate_count=len(matcher.searchable_rows),
+                close_candidate_count=len(matcher.searchable_rows),
+            )
+        )
+        matcher.step(CommandState(1.0), dt=0.04)
+        before = matcher.state
+
+        with mock.patch.object(
+            matcher, "match", side_effect=AssertionError("hard stop searched")
+        ):
+            held = matcher.step(CommandState(1.0), dt=0.04, hard_stop=True)
+
+        self.assertIs(held, before)
+        np.testing.assert_array_equal(matcher._shaped_velocity_world_xy, (0.0, 0.0))
+
+    def test_holden_velocity_transaction_and_reset_restore_zero_state(self):
+        fake = _FakeSingleGpuSearch()
+        with mock.patch(
+            "mm_sonic.hybrid_terrain_lmm_gpu_search.SingleGpuExactSearch",
+            return_value=fake,
+        ):
+            matcher = HybridMatcher(
+                _mechanically_safe(_corpus()),
+                _Generator(),
+                TerrainAuthority.flat(),
+                pose_converter=_pose_converter,
+                search_device="cuda:5",
+                diagnostic_stability=True,
+            )
+        fake.responses.append(
+            _gpu_candidates(
+                matcher.searchable_rows,
+                candidate_count=len(matcher.searchable_rows),
+                close_candidate_count=len(matcher.searchable_rows),
+            )
+        )
+        matcher.step(CommandState(1.0), dt=0.04)
+        before = np.array(matcher._shaped_velocity_world_xy, copy=True)
+
+        exhausted = replace(matcher.state, candidate_exhausted=True)
+        with (
+            mock.patch.object(matcher, "match", return_value=SearchResult(0, 0.0, 1)),
+            mock.patch.object(
+                matcher, "_commit_with_native_limit_retry", return_value=exhausted
+            ),
+        ):
+            matcher.step(CommandState(1.0), dt=0.04, force_search=True)
+
+        np.testing.assert_array_equal(matcher._shaped_velocity_world_xy, before)
+        matcher.reset()
+        np.testing.assert_array_equal(matcher._shaped_velocity_world_xy, (0.0, 0.0))
 
     def test_diagnostic_stability_filters_mechanically_unsafe_exact_winner(self):
         corpus = _mechanically_safe(_corpus())
