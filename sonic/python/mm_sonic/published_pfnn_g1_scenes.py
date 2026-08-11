@@ -9,6 +9,14 @@ from pathlib import Path
 
 _MANIFEST = Path(__file__).with_suffix(".json")
 _FIELDS = {"scene", "world_id", "key", "heightmap", "display_stride"}
+_EXACT_MAPPING = {
+    1: (0, 1, "hmap_000_smooth.txt", 4),
+    2: (1, 2, "hmap_000_smooth.txt", 4),
+    3: (2, 3, "hmap_004_smooth.txt", 4),
+    4: (3, 4, "hmap_007_smooth.txt", 4),
+    5: (4, 5, "hmap_013_smooth.txt", 4),
+    6: (5, 6, "hmap_urban_001_smooth.txt", 4),
+}
 
 
 @dataclass(frozen=True)
@@ -48,4 +56,10 @@ def load_scenes(path: Path | None = None) -> dict[int, SceneSpec]:
         raise ValueError("PFNN scene manifest must contain scenes 1 through 6")
     if {spec.world_id for spec in scenes.values()} != set(range(6)):
         raise ValueError("PFNN scene manifest must contain worlds 0 through 5")
+    actual = {
+        scene: (spec.world_id, spec.key, spec.heightmap, spec.display_stride)
+        for scene, spec in scenes.items()
+    }
+    if actual != _EXACT_MAPPING:
+        raise ValueError("PFNN scene manifest does not match exact published mapping")
     return scenes

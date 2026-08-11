@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 
+import json
+from pathlib import Path
+import tempfile
 import unittest
 
 
@@ -26,6 +29,21 @@ class PublishedPFNNG1ScenesTests(unittest.TestCase):
             },
             expected,
         )
+
+    def test_rejects_semantically_changed_scene_mapping(self) -> None:
+        from mm_sonic.published_pfnn_g1_scenes import load_scenes
+
+        manifest = (
+            Path(__file__).parents[2]
+            / "sonic/python/mm_sonic/published_pfnn_g1_scenes.json"
+        )
+        entries = json.loads(manifest.read_text())
+        entries[0]["heightmap"] = "hmap_013_smooth.txt"
+        with tempfile.TemporaryDirectory() as directory:
+            changed = Path(directory) / "scenes.json"
+            changed.write_text(json.dumps(entries))
+            with self.assertRaisesRegex(ValueError, "exact published mapping"):
+                load_scenes(changed)
 
 
 if __name__ == "__main__":

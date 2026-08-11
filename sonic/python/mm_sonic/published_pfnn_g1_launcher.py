@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -247,6 +248,31 @@ def _spec_json(spec: LaunchSpec) -> dict[str, object]:
     }
 
 
+def _wait_for_expected_world(
+    log_path: Path,
+    expected_world: int,
+    processes: Sequence[subprocess.Popen[bytes]],
+    *,
+    timeout_seconds: float = 45.0,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    pattern = re.compile(r"\bworld=(\d+)\b")
+    while time.monotonic() < deadline:
+        failed = [process.pid for process in processes if process.poll() is not None]
+        if failed:
+            raise RuntimeError(f"launcher child exited before world confirmation: {failed}")
+        try:
+            worlds = {int(value) for value in pattern.findall(log_path.read_text())}
+        except OSError:
+            worlds = set()
+        if expected_world in worlds:
+            return
+        time.sleep(0.02)
+    raise RuntimeError(
+        f"viewer did not report world {expected_world} within {timeout_seconds:.1f}s"
+    )
+
+
 def _stop_receipt(receipt_path: Path) -> dict[str, object]:
     receipt = _read_receipt(receipt_path)
     if receipt is None:
@@ -340,6 +366,11 @@ def _start(arguments: argparse.Namespace) -> dict[str, object]:
         failed = [process.pid for process in started if process.poll() is not None]
         if failed:
             raise RuntimeError(f"launcher child exited during startup: {failed}")
+        _wait_for_expected_world(
+            run_dir / "viewer.log",
+            scene.world_id,
+            started,
+        )
         identities = {
             "bridge": process_identity(bridge.pid),
             "viewer": process_identity(viewer.pid),
@@ -439,6 +470,7 @@ if __name__ == "__main__":
 __all__ = [
     "LaunchSpec",
     "ProcessIdentity",
+    "_wait_for_expected_world",
     "build_launch_spec",
     "main",
     "process_identity",

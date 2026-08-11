@@ -12,6 +12,7 @@ import tempfile
 import unittest
 
 from mm_sonic.published_pfnn_g1_launcher import (
+    _wait_for_expected_world,
     build_launch_spec,
     main,
     process_identity,
@@ -101,6 +102,16 @@ class PublishedPFNNG1LauncherTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "exact process identities"):
                 main(["status", "--runtime-root", str(runtime)])
+
+    def test_startup_waits_for_matching_exported_world(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "viewer.log"
+            log.write_text(
+                "frame_count=1 root=(0,0,0) frame=9 world=5 phase=0.1\n"
+            )
+            _wait_for_expected_world(log, 5, (), timeout_seconds=0.1)
+            with self.assertRaisesRegex(RuntimeError, "did not report world 4"):
+                _wait_for_expected_world(log, 4, (), timeout_seconds=0.01)
 
 
 if __name__ == "__main__":
