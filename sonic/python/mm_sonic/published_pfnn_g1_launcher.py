@@ -14,7 +14,11 @@ import sys
 import time
 from typing import Mapping, Sequence
 
-from .published_pfnn_g1_prepare import prepare_exporter, prepare_terrain
+from .published_pfnn_g1_prepare import (
+    prepare_exporter,
+    prepare_terrain,
+    terrain_cache_path,
+)
 from .published_pfnn_g1_scenes import SceneSpec, load_scenes
 
 
@@ -172,9 +176,13 @@ def _read_receipt(path: Path) -> dict[str, object] | None:
 
 
 def _receipt_identities(receipt: Mapping[str, object]) -> dict[str, ProcessIdentity]:
+    if receipt.get("schema") != "published-pfnn-g1-live/v1":
+        raise ValueError("launcher receipt schema is invalid")
     raw = receipt.get("processes")
     if not isinstance(raw, dict):
         raise ValueError("launcher receipt has no process identities")
+    if set(raw) != {"exporter", "bridge", "viewer"}:
+        raise ValueError("launcher receipt must contain exact process identities")
     result: dict[str, ProcessIdentity] = {}
     for name, value in raw.items():
         if not isinstance(name, str) or not isinstance(value, dict):
@@ -206,6 +214,25 @@ def _environment(gmr_root: Path, display: str) -> dict[str, str]:
     environment["DISPLAY"] = display
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     return environment
+
+
+def _planned_spec(arguments: argparse.Namespace) -> LaunchSpec:
+    scene = load_scenes()[arguments.scene]
+    cache_root = arguments.cache_root.expanduser()
+    run_dir = (
+        arguments.runtime_root.expanduser()
+        / "runs"
+        / f"scene-{scene.scene}-dry-run"
+    )
+    return build_launch_spec(
+        scene=scene,
+        python=arguments.python,
+        exporter=cache_root / "export-demo" / "pfnn_export",
+        fifo=run_dir / "frames.fifo",
+        terrain=terrain_cache_path(scene, arguments.source_demo, cache_root),
+        scene_xml=arguments.scene_xml,
+        gmr_root=arguments.gmr_root,
+    )
 
 
 def _spec_json(spec: LaunchSpec) -> dict[str, object]:
@@ -249,6 +276,8 @@ def _stop_receipt(receipt_path: Path) -> dict[str, object]:
 
 
 def _start(arguments: argparse.Namespace) -> dict[str, object]:
+    if arguments.dry_run:
+        return {"dry_run": True, **_spec_json(_planned_spec(arguments))}
     runtime_root = arguments.runtime_root.expanduser()
     receipt_path = runtime_root / "active.json"
     existing = _read_receipt(receipt_path)
@@ -273,9 +302,6 @@ def _start(arguments: argparse.Namespace) -> dict[str, object]:
         scene_xml=arguments.scene_xml,
         gmr_root=arguments.gmr_root,
     )
-    if arguments.dry_run:
-        return {"dry_run": True, **_spec_json(spec)}
-
     environment = _environment(arguments.gmr_root, arguments.display)
     started: list[subprocess.Popen[bytes]] = []
     try:
@@ -376,14 +402,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     receipt_path = arguments.runtime_root.expanduser() / "active.json"
     if arguments.command == "prepare":
-        scene, exporter, terrain = _prepare(arguments)
-        result: dict[str, object] = {
-            "prepared": True,
-            "scene": scene.scene,
-            "world_id": scene.world_id,
-            "exporter": str(exporter),
-            "terrain": str(terrain),
-        }
+        if arguments.dry_run:
+            result: dict[str, object] = {
+                "dry_run": True,
+                **_spec_json(_planned_spec(arguments)),
+            }
+        else:
+            scene, exporter, terrain = _prepare(arguments)
+            result = {
+                "prepared": True,
+                "scene": scene.scene,
+                "world_id": scene.world_id,
+                "exporter": str(exporter),
+                "terrain": str(terrain),
+            }
     elif arguments.command == "start":
         result = _start(arguments)
     elif arguments.command == "switch":

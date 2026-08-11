@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
 from dataclasses import replace
+from dataclasses import asdict
+import io
+import json
+import os
 from pathlib import Path
 import subprocess
+import tempfile
 import unittest
 
 from mm_sonic.published_pfnn_g1_launcher import (
     build_launch_spec,
+    main,
     process_identity,
     stop_recorded_process,
 )
@@ -40,12 +47,60 @@ class PublishedPFNNG1LauncherTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "identity mismatch"):
                 stop_recorded_process(replace(identity, start_ticks=identity.start_ticks + 1))
             self.assertIsNone(process.poll())
+            with self.assertRaisesRegex(ValueError, "identity mismatch"):
+                stop_recorded_process(replace(identity, command_sha256="0" * 64))
+            self.assertIsNone(process.poll())
             self.assertTrue(stop_recorded_process(identity, timeout_seconds=2.0))
             process.wait(timeout=1.0)
         finally:
             if process.poll() is None:
                 process.terminate()
                 process.wait(timeout=1.0)
+
+    def test_switch_dry_run_does_not_touch_runtime_or_cache(self) -> None:
+        identity = process_identity(os.getpid())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            receipt = {
+                "schema": "published-pfnn-g1-live/v1",
+                "processes": {
+                    name: asdict(identity) for name in ("exporter", "bridge", "viewer")
+                },
+            }
+            active = runtime / "active.json"
+            active.write_text(json.dumps(receipt))
+            original = active.read_bytes()
+
+            with redirect_stdout(io.StringIO()):
+                main(
+                    [
+                        "switch",
+                        "--dry-run",
+                        "--scene",
+                        "6",
+                        "--runtime-root",
+                        str(runtime),
+                        "--cache-root",
+                        str(root / "cache"),
+                    ]
+                )
+
+            self.assertEqual(active.read_bytes(), original)
+            self.assertFalse((root / "cache").exists())
+            self.assertFalse((runtime / "runs").exists())
+
+    def test_status_rejects_receipt_without_exact_process_set(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory)
+            (runtime / "active.json").write_text(
+                json.dumps(
+                    {"schema": "published-pfnn-g1-live/v1", "processes": {}}
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "exact process identities"):
+                main(["status", "--runtime-root", str(runtime)])
 
 
 if __name__ == "__main__":

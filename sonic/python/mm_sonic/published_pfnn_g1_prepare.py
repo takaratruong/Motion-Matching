@@ -96,10 +96,10 @@ def prepare_exporter(
     return executable
 
 
-def prepare_terrain(
+def terrain_cache_path(
     scene: SceneSpec, source_demo: Path, cache_root: Path
 ) -> Path:
-    """Build or reuse the morphology-scaled display mesh for ``scene``."""
+    """Return the content-addressed terrain path without writing it."""
     source_heightmap = Path(source_demo) / "heightmaps" / scene.heightmap
     heightmap_digest = _sha256(source_heightmap)
     parameters = {
@@ -110,9 +110,17 @@ def prepare_terrain(
     cache_key = hashlib.sha256(
         json.dumps(parameters, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    terrain_root = Path(cache_root) / "terrain"
+    return Path(cache_root) / "terrain" / f"{Path(scene.heightmap).stem}-{cache_key}.npz"
+
+
+def prepare_terrain(
+    scene: SceneSpec, source_demo: Path, cache_root: Path
+) -> Path:
+    """Build or reuse the morphology-scaled display mesh for ``scene``."""
+    source_heightmap = Path(source_demo) / "heightmaps" / scene.heightmap
+    output = terrain_cache_path(scene, source_demo, cache_root)
+    terrain_root = output.parent
     terrain_root.mkdir(parents=True, exist_ok=True)
-    output = terrain_root / f"{Path(scene.heightmap).stem}-{cache_key}.npz"
     if output.is_file():
         return output
 
@@ -132,4 +140,5 @@ __all__ = [
     "RELEASED_PFNN_CPP_SHA256",
     "prepare_exporter",
     "prepare_terrain",
+    "terrain_cache_path",
 ]
