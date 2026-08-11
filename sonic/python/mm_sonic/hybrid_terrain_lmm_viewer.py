@@ -42,6 +42,10 @@ DIAGNOSTIC_TERRAIN_LABEL = (
 DIAGNOSTIC_MODEL_LABEL = (
     "HYBRID TERRAIN LMM POC (DIAGNOSTIC UNVERIFIED GENERATOR; NOT ACCEPTANCE EVIDENCE)"
 )
+_DISPLAY_POSTPROCESSOR_IDENTITY = "existing-pose-inertializer-repair-foot-lock/v1"
+_DISPLAY_POSTPROCESSOR_POLICY = (
+    "PoseInertializer + G1TerrainPoseRepair + G1TerrainFootLock"
+)
 _FORMAL_ARTIFACT_AUTHORITIES = {
     "cache_manifest_sha256": (
         "084c168b473e730ec24419a49f4be1526226e5f95a2dd81ae4d367c729889cdb"
@@ -958,6 +962,7 @@ def overlay_text(
     first_runtime_search_elapsed_ms: float | None = None,
     diagnostic_mechanical_retained_searchable_row_count: int | None = None,
     diagnostic_mechanical_clearance_bounds_m: tuple[float, float] | None = None,
+    display_postprocessor_identity: object | None = None,
 ) -> tuple[str, str]:
     terrain = np.asarray(state.terrain_features, dtype=np.float64).reshape(4)
     mode = "PAUSED" if paused else str(state.pose_source).upper()
@@ -1053,6 +1058,11 @@ def overlay_text(
         if latency_fields:
             backend_text += " | " + " | ".join(latency_fields)
         backend_text += "\n"
+    postprocessor_title, postprocessor_body = _display_postprocessor_overlay(
+        display_postprocessor_identity
+    )
+    if postprocessor_title:
+        title += f" | {postprocessor_title}"
     return title, (
         f"family {state.family} | range {int(state.range_index)} | row {int(state.row)} | "
         f"distance {float(state.search_distance):.6f}\n"
@@ -1069,8 +1079,28 @@ def overlay_text(
         f"{mechanical_text}"
         f"{backend_text}"
         f"scene evidence {scene_evidence_status}\n"
+        f"{postprocessor_body}"
         "Up/Down speed | Left/Right steer | WASD aliases | Space stop | R reset | X/Esc exit"
     )
+
+
+def _display_postprocessor_overlay(identity: object | None) -> tuple[str, str]:
+    getter = getattr(identity, "get", lambda *_args: None)
+    if getter("diagnostic_display_postprocessor") != _DISPLAY_POSTPROCESSOR_IDENTITY:
+        return "", ""
+    half_life = float(getter("inertialization_halflife_s"))
+    title = f"{_DISPLAY_POSTPROCESSOR_POLICY} | {half_life:.2f}s half-life"
+    body = (
+        f"display postprocess {_DISPLAY_POSTPROCESSOR_POLICY} | "
+        f"{half_life:.2f}s half-life | "
+        f"repair accepted {int(getter('pose_repair_count', 0))} | "
+        "lock accept/bypass "
+        f"{int(getter('foot_lock_accept_count', 0))}/"
+        f"{int(getter('foot_lock_bypass_count', 0))} | "
+        f"raw repair failures {int(getter('raw_repair_failure_count', 0))} | "
+        f"last reason {getter('last_reason', 'none')}\n"
+    )
+    return title, body
 
 
 def _generator_acceptance_status(generator: object) -> dict[str, bool]:
@@ -1199,21 +1229,37 @@ def build_diagnostic_collision_model(g1_xml: Path, terrain: SceneTerrainAdapter)
     import mujoco
 
     spec = mujoco.MjSpec.from_file(str(g1_xml))
-    vertices, faces = terrain.native_mesh()
-    spec.add_mesh(
-        name="terrain_hybrid_lmm_authoritative_mesh",
-        uservert=vertices.ravel(),
-        userface=faces.ravel(),
-        inertia=mujoco.mjtMeshInertia.mjMESH_INERTIA_SHELL,
-    )
-    spec.worldbody.add_geom(
-        name="terrain_hybrid_lmm_authoritative",
-        type=mujoco.mjtGeom.mjGEOM_MESH,
-        meshname="terrain_hybrid_lmm_authoritative_mesh",
-        contype=1,
-        conaffinity=1,
-    )
-    return spec.compile()
+    heights = np.asarray(terrain.source_heights, dtype=np.float64)
+    if np.all(heights == heights.flat[0]):
+        spec.worldbody.add_geom(
+            name="terrain_hybrid_lmm_authoritative",
+            type=mujoco.mjtGeom.mjGEOM_PLANE,
+            pos=(0.0, 0.0, float(heights.flat[0])),
+            size=(0.0, 0.0, 0.05),
+            contype=1,
+            conaffinity=1,
+        )
+    else:
+        vertices, faces = terrain.native_mesh()
+        spec.add_mesh(
+            name="terrain_hybrid_lmm_authoritative_mesh",
+            uservert=vertices.ravel(),
+            userface=faces.ravel(),
+            inertia=mujoco.mjtMeshInertia.mjMESH_INERTIA_SHELL,
+        )
+        spec.worldbody.add_geom(
+            name="terrain_hybrid_lmm_authoritative",
+            type=mujoco.mjtGeom.mjGEOM_MESH,
+            meshname="terrain_hybrid_lmm_authoritative_mesh",
+            contype=1,
+            conaffinity=1,
+        )
+    model = spec.compile()
+    floor = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+    if floor >= 0:
+        model.geom_contype[floor] = 0
+        model.geom_conaffinity[floor] = 0
+    return model
 
 
 def _sha256_file(path: Path) -> str:
@@ -2093,6 +2139,9 @@ def run_interactive(
                     if interactive_scene_authentication_current
                     else "diagnostic-authentication-not-current"
                 )
+                display_postprocessor_identity = (
+                    None if postprocessor is None else postprocessor.identity()
+                )
                 title, body = overlay_text(
                     matcher.state,
                     paused=False,
@@ -2115,6 +2164,7 @@ def run_interactive(
                     diagnostic_mechanical_clearance_bounds_m=getattr(
                         matcher, "diagnostic_mechanical_clearance_bounds_m", None
                     ),
+                    display_postprocessor_identity=display_postprocessor_identity,
                 )
                 title = label_resolver(
                     matcher,
@@ -2124,6 +2174,11 @@ def run_interactive(
                     ),
                     formal_authorities_current=(interactive_formal_authorities_current),
                 )
+                postprocessor_title, _postprocessor_body = (
+                    _display_postprocessor_overlay(display_postprocessor_identity)
+                )
+                if postprocessor_title and _DISPLAY_POSTPROCESSOR_POLICY not in title:
+                    title += f" | {postprocessor_title}"
                 with viewer.lock():
                     viewer.cam.lookat[:] = data.qpos[:3]
                     wireframe = int(mujoco.mjtRndFlag.mjRND_WIREFRAME)

@@ -256,12 +256,13 @@ class ExistingUtilityPosePostprocessor:
             self._previous_row = row_value
             self._previous_range_index = range_value
             if self._displayed_qpos is None:
-                raise RuntimeError("initial raw source pose repair rejected")
+                self._displayed_pose = raw_target
+                self._displayed_qpos = np.array(qpos, dtype=np.float64, copy=True)
+                return self._displayed_qpos.copy()
             return self._displayed_qpos.copy()
 
         repaired_pose = repaired.pose
-        if bool(getattr(repaired, "repaired", False)):
-            self.pose_repair_count += 1
+        self.pose_repair_count += 1
         snapshot = self.foot_locker.snapshot_state()
         locked = self.foot_locker.apply(repaired_pose, contacts, dt_s=step)
         if bool(locked.accepted):

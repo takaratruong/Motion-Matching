@@ -673,10 +673,9 @@ def test_full_view_passes_full_identity_and_visible_label_overrides(
     assert matcher_call["search_device"] is None
     assert matcher_call["diagnostic_stability"] is True
     assert matcher_call["diagnostic_canonical_source_pose"] is True
-    assert (
-        "EXISTING INERTIALIZER + TERRAIN FOOT LOCK"
-        in fake_run_interactive(matcher, adapter, **call)["label"]
-    )
+    label = fake_run_interactive(matcher, adapter, **call)["label"]
+    assert "PoseInertializer + G1TerrainPoseRepair + G1TerrainFootLock" in label
+    assert "0.10s half-life" in label
 
 
 def test_full_formal_matcher_explicitly_keeps_diagnostic_stability_disabled(
@@ -964,7 +963,8 @@ def test_full_stability_label_reports_mechanical_filter_inventory(
     assert ("CANONICAL SOURCE POSES" in label) is canonical_source
     assert "LEG SEARCH" not in label
     assert "ARM SLEW" not in label
-    assert "EXISTING INERTIALIZER + TERRAIN FOOT LOCK" in label
+    assert "PoseInertializer + G1TerrainPoseRepair + G1TerrainFootLock" in label
+    assert "0.10s half-life" in label
     assert "NOT ACCEPTANCE EVIDENCE" in label
 
 

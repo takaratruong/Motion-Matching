@@ -6,13 +6,19 @@ from types import SimpleNamespace
 import mujoco
 import numpy as np
 import pytest
+from resources.g1_terrain_builder.schema import ArtifactSet, FeatureSet
 
 from mm_sonic.hybrid_terrain_interactive import KinematicPose
 from mm_sonic.hybrid_terrain_lmm_postprocess import (
     ExistingUtilityPosePostprocessor,
     NativeQposPoseAdapter,
 )
+from mm_sonic.hybrid_terrain_lmm_runtime import HybridMatcher
 from mm_sonic.hybrid_terrain_lmm_viewer import DEFAULT_G1_XML
+from mm_sonic.hybrid_terrain_lmm_viewer import (
+    build_diagnostic_collision_model,
+    load_scene_terrain,
+)
 from mm_sonic.render_terrain_transition_mesh import build_qpos
 
 
@@ -221,7 +227,7 @@ def test_repair_fallback_holds_only_on_raw_failure_then_recovers(model) -> None:
         dt_s=dt,
     )
     np.testing.assert_allclose(fallback, target, atol=1.0e-6, rtol=0.0)
-    assert processor.pose_repair_count == 1
+    assert processor.pose_repair_count == 2
     assert processor.identity()["last_reason"] == "blend rejected"
 
     failed_target = _qpos(model, x=0.8, joint_offset=0.08)
@@ -271,6 +277,133 @@ def test_successor_raw_repair_failure_holds_without_duplicate_retry(model) -> No
     np.testing.assert_array_equal(held, displayed)
     assert len(repairer.calls) == 2
     assert processor.raw_repair_failure_count == 1
+
+
+def test_initial_raw_repair_failure_bypasses_without_stall_then_recovers(model) -> None:
+    processor, repairer, locker = _processor(model)
+    initial = _qpos(model, x=0.15, joint_offset=0.01)
+    repairer.queue(False, reason="initial raw rejected")
+
+    bypassed = processor.step(
+        initial,
+        row=7,
+        range_index=2,
+        source_contact=np.asarray((False, True)),
+        dt_s=1.0 / 60.0,
+    )
+
+    np.testing.assert_array_equal(bypassed, initial)
+    assert locker.calls == []
+    assert processor.raw_repair_failure_count == 1
+    assert processor.identity()["last_reason"] == "initial raw rejected"
+
+    recovered = processor.step(
+        _qpos(model, x=0.16, joint_offset=0.012),
+        row=8,
+        range_index=2,
+        source_contact=np.asarray((False, True)),
+        dt_s=1.0 / 60.0,
+    )
+
+    assert not np.array_equal(recovered, bypassed)
+    assert processor.pose_repair_count == 1
+    assert processor.foot_lock_accept_count == 1
+
+
+def test_pose_repair_count_counts_every_accepted_repair_call(model) -> None:
+    processor, repairer, _locker = _processor(model)
+
+    processor.step(
+        _qpos(model, x=0.0),
+        row=1,
+        range_index=0,
+        source_contact=np.asarray((False, False)),
+        dt_s=1.0 / 60.0,
+    )
+    repairer.queue(False, reason="blend rejected")
+    repairer.queue(True, repaired=False)
+    processor.step(
+        _qpos(model, x=0.2),
+        row=10,
+        range_index=1,
+        source_contact=np.asarray((False, False)),
+        dt_s=1.0 / 60.0,
+    )
+
+    assert processor.pose_repair_count == 2
+
+
+def test_real_existing_utilities_process_native_pose_on_nonflat_scene() -> None:
+    terrain = load_scene_terrain("hills")
+    collision_model = build_diagnostic_collision_model(DEFAULT_G1_XML, terrain)
+    artifacts = ArtifactSet.empty(3, 31)
+    artifacts.range_starts = np.asarray((0,), dtype=np.int32)
+    artifacts.range_stops = np.asarray((3,), dtype=np.int32)
+    artifacts.rotations[..., 0] = 1.0
+    artifacts.positions[:, 1, 1] = float(collision_model.qpos0[2])
+    feature_rows = np.zeros((3, 31), dtype=np.float32)
+    feature_rows[0, 27:31] = -10.0
+    feature_rows[1:, 27:31] = 10.0
+    corpus = SimpleNamespace(
+        artifacts=artifacts,
+        features=FeatureSet(
+            feature_rows,
+            np.zeros(31, dtype=np.float32),
+            np.ones(31, dtype=np.float32),
+        ),
+        family_ids=np.asarray((0,), dtype=np.int32),
+        family_names=("hill",),
+        fps=60.0,
+        horizons=(20, 40, 60),
+    )
+    generator = SimpleNamespace(latent=np.zeros((3, 1), dtype=np.float32))
+    native_source = np.array(collision_model.qpos0, dtype=np.float64, copy=True)
+    native_source[:2] = (-3.0, 2.0)
+
+    def place_native_source(
+        decoded: object,
+        simulation_position: object,
+        _simulation_rotation: object,
+        _native_model: object,
+    ) -> np.ndarray:
+        value = native_source.copy()
+        value[2] = float(np.asarray(simulation_position)[1]) + float(
+            np.asarray(decoded)[1]
+        )
+        return value
+
+    matcher = HybridMatcher(
+        corpus,
+        generator,
+        terrain.authority,
+        native_model=collision_model,
+        pose_converter=place_native_source,
+        diagnostic_stability=True,
+        diagnostic_canonical_source_pose=True,
+        initial_root_xy=(-3.0, 2.0),
+    )
+    processor = ExistingUtilityPosePostprocessor(
+        collision_model,
+        SimpleNamespace(height_at_world_xy=terrain.authority.height_at),
+    )
+
+    displayed = processor.step(
+        matcher.state.qpos,
+        row=matcher.state.row,
+        range_index=matcher.state.range_index,
+        source_contact=np.asarray(
+            matcher.artifacts.contacts[matcher.state.row], dtype=bool
+        ),
+        dt_s=matcher.dt,
+    )
+
+    assert matcher.state.pose_source == "canonical-diagnostic"
+    assert matcher.state.support_status == "SUPPORTED"
+    assert displayed.shape == (36,)
+    assert np.isfinite(displayed).all()
+    assert processor.pose_repair_count == 1
+    assert processor.foot_lock_accept_count == 1
+    assert processor.raw_repair_failure_count == 0
 
 
 def test_reset_clears_temporal_state_and_diagnostics(model) -> None:

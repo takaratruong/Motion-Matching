@@ -440,7 +440,10 @@ def _full_runtime_label(
             if getattr(matcher, "diagnostic_canonical_source_pose", False)
             else ""
         )
-        pose_policy += "EXISTING INERTIALIZER + TERRAIN FOOT LOCK; "
+        pose_policy += (
+            "PoseInertializer + G1TerrainPoseRepair + G1TerrainFootLock; "
+            "0.10s half-life; "
+        )
         bounds = tuple(getattr(matcher, "diagnostic_mechanical_clearance_bounds_m", ()))
         retained = getattr(
             matcher,

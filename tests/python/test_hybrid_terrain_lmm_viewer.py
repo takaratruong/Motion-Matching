@@ -260,26 +260,51 @@ class HybridTerrainViewerTests(unittest.TestCase):
     def test_diagnostic_collision_oracle_is_separate_from_render_model(self):
         import mujoco
 
-        terrain = load_scene_terrain("hills")
-        render_model = viewer_module.build_viewer_model(DEFAULT_G1_XML, terrain)
-        collision_model = viewer_module.build_diagnostic_collision_model(
-            DEFAULT_G1_XML, terrain
+        terrains = {
+            "flat": load_scene_terrain("flat"),
+            "hills": load_scene_terrain("hills"),
+            "ramp": load_scene_terrain(
+                viewer_module.DEFAULT_TERRAIN_ROOT / "ramp-10-up-down"
+            ),
+        }
+        render_model = viewer_module.build_viewer_model(
+            DEFAULT_G1_XML, terrains["hills"]
         )
 
         render_geom = mujoco.mj_name2id(
             render_model, mujoco.mjtObj.mjOBJ_GEOM, "hybrid_lmm_authoritative_terrain"
         )
-        collision_geom = mujoco.mj_name2id(
-            collision_model,
-            mujoco.mjtObj.mjOBJ_GEOM,
-            "terrain_hybrid_lmm_authoritative",
-        )
         self.assertGreaterEqual(render_geom, 0)
         self.assertEqual(int(render_model.geom_contype[render_geom]), 0)
         self.assertEqual(int(render_model.geom_conaffinity[render_geom]), 0)
-        self.assertGreaterEqual(collision_geom, 0)
-        self.assertNotEqual(int(collision_model.geom_contype[collision_geom]), 0)
-        self.assertNotEqual(int(collision_model.geom_conaffinity[collision_geom]), 0)
+        for name, terrain in terrains.items():
+            with self.subTest(scene=name):
+                collision_model = viewer_module.build_diagnostic_collision_model(
+                    DEFAULT_G1_XML, terrain
+                )
+                collision_geom = mujoco.mj_name2id(
+                    collision_model,
+                    mujoco.mjtObj.mjOBJ_GEOM,
+                    "terrain_hybrid_lmm_authoritative",
+                )
+                floor = mujoco.mj_name2id(
+                    collision_model, mujoco.mjtObj.mjOBJ_GEOM, "floor"
+                )
+                self.assertGreaterEqual(collision_geom, 0)
+                self.assertEqual(int(collision_model.geom_contype[collision_geom]), 1)
+                self.assertEqual(
+                    int(collision_model.geom_conaffinity[collision_geom]), 1
+                )
+                self.assertEqual(int(collision_model.geom_contype[floor]), 0)
+                self.assertEqual(int(collision_model.geom_conaffinity[floor]), 0)
+                expected_type = (
+                    mujoco.mjtGeom.mjGEOM_PLANE
+                    if name == "flat"
+                    else mujoco.mjtGeom.mjGEOM_MESH
+                )
+                self.assertEqual(
+                    int(collision_model.geom_type[collision_geom]), int(expected_type)
+                )
 
     def test_interactive_visuals_brighten_only_compiled_render_fields(self):
         import mujoco
@@ -1594,10 +1619,26 @@ class HybridTerrainViewerTests(unittest.TestCase):
             transition_penalty=0.1,
         )
         title, body = overlay_text(
-            state, paused=False, scene_evidence_status="diagnostic-generated"
+            state,
+            paused=False,
+            scene_evidence_status="diagnostic-generated",
+            display_postprocessor_identity={
+                "diagnostic_display_postprocessor": (
+                    "existing-pose-inertializer-repair-foot-lock/v1"
+                ),
+                "inertialization_halflife_s": 0.10,
+                "pose_repair_count": 7,
+                "foot_lock_accept_count": 5,
+                "foot_lock_bypass_count": 2,
+                "raw_repair_failure_count": 3,
+                "last_reason": "raw source pose repair rejected",
+            },
         )
         self.assertIn("HYBRID TERRAIN LMM POC", title)
         self.assertNotIn("EXACT SEARCH", title)
+        self.assertIn(
+            "PoseInertializer + G1TerrainPoseRepair + G1TerrainFootLock", title
+        )
         for value in (
             "family slope",
             "range 12",
@@ -1618,6 +1659,12 @@ class HybridTerrainViewerTests(unittest.TestCase):
             "flat=125000",
             "slope=125000",
             "transition penalty 0.100",
+            "PoseInertializer + G1TerrainPoseRepair + G1TerrainFootLock",
+            "0.10s half-life",
+            "repair accepted 7",
+            "lock accept/bypass 5/2",
+            "raw repair failures 3",
+            "last reason raw source pose repair rejected",
         ):
             self.assertIn(value, body)
 
@@ -2004,15 +2051,23 @@ class HybridTerrainViewerTests(unittest.TestCase):
             search_acceptance_eligible=False,
         )
         terrain = load_scene_terrain("hills")
+        postprocessor_identity = {
+            "diagnostic_display_postprocessor": (
+                "existing-pose-inertializer-repair-foot-lock/v1"
+            ),
+            "inertialization_halflife_s": 0.10,
+            "pose_repair_count": 3,
+            "foot_lock_accept_count": 2,
+            "foot_lock_bypass_count": 1,
+            "raw_repair_failure_count": 4,
+            "last_reason": "lock rejected",
+        }
         postprocessor = SimpleNamespace(
             reset=lambda: events.append("postprocessor.reset"),
             step=lambda qpos, **_kwargs: (
                 events.append("postprocessor.step") or np.asarray(qpos) + 1.0
             ),
-            identity=lambda: {
-                "diagnostic_display_postprocessor": "existing/v1",
-                "pose_repair_count": 3,
-            },
+            identity=lambda: dict(postprocessor_identity),
         )
         keys = SimpleNamespace(
             snapshot=lambda: (CommandState(), True, False),
@@ -2036,6 +2091,8 @@ class HybridTerrainViewerTests(unittest.TestCase):
                 callback(1.0 / self.step_hz)
                 return 1
 
+        overlay_texts: list[tuple[str, str]] = []
+
         class FakeViewer:
             cam = SimpleNamespace(
                 distance=0.0,
@@ -2057,8 +2114,8 @@ class HybridTerrainViewerTests(unittest.TestCase):
             def lock(self):
                 return contextlib.nullcontext()
 
-            def set_texts(self, _texts):
-                return None
+            def set_texts(self, texts):
+                overlay_texts.append((texts[2], texts[3]))
 
             def sync(self):
                 return None
@@ -2121,6 +2178,15 @@ class HybridTerrainViewerTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(data.qpos, state.qpos + 1.0)
         self.assertEqual(receipt["identity"]["pose_repair_count"], 3)
+        self.assertIn(
+            "PoseInertializer + G1TerrainPoseRepair + G1TerrainFootLock",
+            overlay_texts[0][0],
+        )
+        self.assertIn("0.10s half-life", overlay_texts[0][0])
+        self.assertIn("repair accepted 3", overlay_texts[0][1])
+        self.assertIn("lock accept/bypass 2/1", overlay_texts[0][1])
+        self.assertIn("raw repair failures 4", overlay_texts[0][1])
+        self.assertIn("last reason lock rejected", overlay_texts[0][1])
 
     def test_failed_reset_returns_original_runtime_unchanged(self):
         runtime = SimpleNamespace(marker=object())
