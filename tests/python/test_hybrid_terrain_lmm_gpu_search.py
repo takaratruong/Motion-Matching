@@ -52,10 +52,10 @@ class _FakeJax:
         self.jit_devices: list[_FakeDevice] = []
         self.compiled_calls: list[tuple[object, ...]] = []
         self.outputs = (
-            _FakeArray((9, 3, -1)),
+            _FakeArray((9, 7, 5, 3, 1)),
             _FakeArray(1.25),
             _FakeArray(2),
-            _FakeArray(7),
+            _FakeArray(5),
         )
 
     def devices(self, backend: str | None = None):
@@ -220,8 +220,8 @@ class SingleGpuExactSearchContractTests(unittest.TestCase):
         self.assertIs(fake.compiled_calls[-1][1], search._device_rows)
         self.assertIs(fake.compiled_calls[-1][2], search._device_range_ids)
         self.assertIs(fake.compiled_calls[-1][3], search._device_contact_codes)
-        np.testing.assert_array_equal(result.rows, (3, 9))
-        self.assertEqual(result.candidate_count, 7)
+        np.testing.assert_array_equal(result.rows, (1, 3, 5, 7, 9))
+        self.assertEqual(result.candidate_count, 5)
         self.assertEqual(result.close_candidate_count, 2)
         self.assertEqual(result.device_minimum_score, 1.25)
         self.assertGreaterEqual(result.elapsed_ms, 0.0)
@@ -415,7 +415,8 @@ class SingleGpuExactSearchGpuTests(unittest.TestCase):
                 active_contact_code=0,
                 excluded_rows=(),
             )
-            np.testing.assert_array_equal(penalty_result.rows, (0,))
+            np.testing.assert_array_equal(penalty_result.rows, (0, 1))
+            assert penalty_result.close_candidate_count == 1
             exclusion_result = search.match_candidates(
                 query,
                 current_range=0,
@@ -545,7 +546,7 @@ class SingleGpuExactSearchGpuTests(unittest.TestCase):
                     excluded_rows=exclusions,
                 )
                 assert result.candidate_count == len(rows)
-                assert result.close_candidate_count >= len(result.rows)
+                assert len(result.rows) == min(128, len(rows))
                 assert cpu_row in result.rows, (cpu_row, result)
 
                 candidate_delta = (

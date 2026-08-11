@@ -199,11 +199,8 @@ class SingleGpuExactSearch:
             tolerance = (
                 jnp.finfo(jnp.float32).eps * jnp.maximum(1.0, jnp.abs(minimum)) * 512
             )
-            close = jnp.isfinite(candidate_scores) & (
-                candidate_scores - minimum <= tolerance
-            )
             candidate_rows = jnp.where(
-                close,
+                jnp.isfinite(candidate_scores),
                 global_rows[positions],
                 jnp.asarray(-1, dtype=global_rows.dtype),
             )
