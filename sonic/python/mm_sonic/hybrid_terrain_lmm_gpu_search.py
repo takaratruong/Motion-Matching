@@ -18,7 +18,7 @@ _MAX_RETURNED_CANDIDATES = 128
 
 @dataclass(frozen=True)
 class GpuSearchCandidates:
-    """Bounded near-minimum rows returned by the diagnostic device scorer."""
+    """Complete finite stable device top-128 rows and independent metadata."""
 
     rows: np.ndarray
     candidate_count: int
@@ -291,7 +291,7 @@ class SingleGpuExactSearch:
         active_contact_code: int,
         excluded_rows: object,
     ) -> GpuSearchCandidates:
-        """Return all device candidates inside the conservative roundoff window."""
+        """Return finite top-128 rows and an independent near-minimum count."""
 
         with np.errstate(over="ignore", invalid="ignore"):
             value = np.asarray(query, dtype=np.float32)

@@ -417,6 +417,18 @@ class SingleGpuExactSearchGpuTests(unittest.TestCase):
             )
             np.testing.assert_array_equal(penalty_result.rows, (0, 1))
             assert penalty_result.close_candidate_count == 1
+            np.testing.assert_allclose(
+                penalty_result.device_minimum_score,
+                np.min(penalized),
+                rtol=1e-6,
+                atol=1e-7,
+            )
+            assert not np.isclose(
+                penalty_result.device_minimum_score,
+                np.min(raw_scores),
+                rtol=0.0,
+                atol=1e-6,
+            )
             exclusion_result = search.match_candidates(
                 query,
                 current_range=0,
