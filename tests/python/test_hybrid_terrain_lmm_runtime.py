@@ -417,6 +417,7 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         self.assertEqual(
             holden.controller_heading_policy, "persistent-command-yaw-rate"
         )
+        self.assertEqual(raw.controller_heading_policy, "authored-source-yaw")
         self.assertEqual(holden.controller_yaw_rate_rad_s, 1.5)
         self.assertEqual(holden.controller_acceleration_mps2, 1.5)
         self.assertEqual(holden.controller_deceleration_mps2, 2.0)

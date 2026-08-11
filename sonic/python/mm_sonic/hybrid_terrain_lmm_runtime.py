@@ -881,7 +881,9 @@ class HybridMatcher:
     def controller_heading_policy(self) -> str:
         """Return the desired-heading ownership policy."""
 
-        return "persistent-command-yaw-rate"
+        if self._holden_control_active:
+            return "persistent-command-yaw-rate"
+        return "authored-source-yaw"
 
     @property
     def controller_yaw_rate_rad_s(self) -> float:
