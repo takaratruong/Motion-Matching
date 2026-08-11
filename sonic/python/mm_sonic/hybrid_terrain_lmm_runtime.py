@@ -891,6 +891,12 @@ class HybridMatcher:
 
         return SEARCH_INTERVAL_S
 
+    @property
+    def controller_velocity_local_xz(self) -> np.ndarray:
+        """Return a defensive copy of the shaped local planar velocity."""
+
+        return np.array(self._shaped_velocity_local_xz, copy=True)
+
     def _family_name(self, range_index: int) -> str:
         family_id = int(self.family_ids[range_index])
         return (
@@ -1433,7 +1439,9 @@ class HybridMatcher:
         ).astype(np.float32)
         return simulation_position, simulation_rotation
 
-    def _validate_qpos(self, qpos: np.ndarray) -> None:
+    def _validate_qpos(
+        self, qpos: np.ndarray, *, enforce_root_step: bool = True
+    ) -> None:
         if qpos.shape != (36,) or not np.isfinite(qpos).all():
             raise ValueError("runtime qpos must be finite canonical G1 qpos")
         if self.native_model is not None:
@@ -1446,7 +1454,7 @@ class HybridMatcher:
                     raise _NativeJointLimitError(
                         "runtime decoded joint left its native limit"
                     )
-        if self.state.pose_source != "uninitialized":
+        if enforce_root_step and self.state.pose_source != "uninitialized":
             step = float(np.linalg.norm(qpos[:3] - self.state.qpos[:3]))
             if step > self.max_root_step_m:
                 raise ValueError("runtime decoded root exceeded the step bound")
@@ -1491,6 +1499,7 @@ class HybridMatcher:
         live_raw: np.ndarray | None = None,
         live_domain_supported: bool | None = None,
         reject_learned_native_limit: bool = False,
+        enforce_root_step: bool = True,
     ) -> HybridRuntimeState:
         if (
             self.diagnostic_stability
@@ -1554,7 +1563,7 @@ class HybridMatcher:
                 ),
                 dtype=np.float64,
             )
-            self._validate_qpos(proposed_qpos)
+            self._validate_qpos(proposed_qpos, enforce_root_step=enforce_root_step)
             if count_decode and not self.diagnostic_canonical_source_pose:
                 learned_count += 1
         except _NativeJointLimitError:
@@ -1573,12 +1582,12 @@ class HybridMatcher:
                 dtype=np.float64,
             )
             try:
-                self._validate_qpos(proposed_qpos)
+                self._validate_qpos(proposed_qpos, enforce_root_step=enforce_root_step)
             except _NativeJointLimitError:
                 proposed_qpos, max_joint_clamp_magnitude = self._clamp_canonical_hinges(
                     proposed_qpos
                 )
-                self._validate_qpos(proposed_qpos)
+                self._validate_qpos(proposed_qpos, enforce_root_step=enforce_root_step)
                 joint_clamp_count += int(count_decode)
                 pose_source = "canonical-fallback-joint-clamped"
             fallback_count += int(count_decode)
@@ -1612,12 +1621,12 @@ class HybridMatcher:
                 dtype=np.float64,
             )
             try:
-                self._validate_qpos(proposed_qpos)
+                self._validate_qpos(proposed_qpos, enforce_root_step=enforce_root_step)
             except _NativeJointLimitError:
                 proposed_qpos, max_joint_clamp_magnitude = self._clamp_canonical_hinges(
                     proposed_qpos
                 )
-                self._validate_qpos(proposed_qpos)
+                self._validate_qpos(proposed_qpos, enforce_root_step=enforce_root_step)
                 joint_clamp_count += int(count_decode)
                 pose_source = "canonical-fallback-joint-clamped"
             fallback_count += int(count_decode)
@@ -2139,6 +2148,7 @@ class HybridMatcher:
                 count_decode=False,
                 live_raw=live,
                 live_domain_supported=live_domain_supported,
+                enforce_root_step=False,
             )
             self.state = replace(
                 reset_state,
@@ -2161,6 +2171,28 @@ class HybridMatcher:
             ) = snapshot
             self._root_xy[:] = root_xy
             self._shaped_velocity_local_xz[:] = shaped_velocity_local_xz
+            raise
+
+    def reset_at(self, root_xy: object, heading: object) -> HybridRuntimeState:
+        """Reset at a new persistent planar placement without rebuilding assets."""
+
+        try:
+            placement = np.asarray(root_xy, dtype=np.float64)
+        except (TypeError, ValueError) as error:
+            raise ValueError("reset root XY must be one finite native point") from error
+        if placement.shape != (2,) or not np.isfinite(placement).all():
+            raise ValueError("reset root XY must be one finite native point")
+        reset_heading = _finite_scalar(heading, "reset heading")
+
+        initial_root_xy = self._initial_root_xy
+        initial_heading = self._initial_heading
+        self._initial_root_xy = np.array(placement, copy=True)
+        self._initial_heading = math.remainder(reset_heading, 2.0 * math.pi)
+        try:
+            return self.reset()
+        except BaseException:
+            self._initial_root_xy = initial_root_xy
+            self._initial_heading = initial_heading
             raise
 
 

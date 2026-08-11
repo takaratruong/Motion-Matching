@@ -425,6 +425,38 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(AttributeError):
                 setattr(holden, name, value)
 
+    def test_controller_velocity_property_is_a_read_only_defensive_copy(self):
+        fake = _FakeSingleGpuSearch()
+        with mock.patch(
+            "mm_sonic.hybrid_terrain_lmm_gpu_search.SingleGpuExactSearch",
+            return_value=fake,
+        ):
+            matcher = HybridMatcher(
+                _mechanically_safe(_corpus()),
+                _Generator(),
+                TerrainAuthority.flat(),
+                pose_converter=_pose_converter,
+                search_device="cuda:5",
+                diagnostic_stability=True,
+            )
+        fake.responses.append(
+            _gpu_candidates(
+                matcher.searchable_rows,
+                candidate_count=len(matcher.searchable_rows),
+                close_candidate_count=len(matcher.searchable_rows),
+            )
+        )
+        matcher.step(CommandState(1.0), dt=0.04)
+
+        exposed = matcher.controller_velocity_local_xz
+        expected = np.array(exposed, copy=True)
+        exposed[:] = (-100.0, 100.0)
+
+        np.testing.assert_array_equal(matcher.controller_velocity_local_xz, expected)
+        self.assertIsNot(exposed, matcher.controller_velocity_local_xz)
+        with self.assertRaises(AttributeError):
+            matcher.controller_velocity_local_xz = np.zeros(2)
+
     def test_gpu_diagnostic_periodic_searches_on_exact_sixth_60hz_tick(self):
         fake = _FakeSingleGpuSearch()
         values = np.zeros((16, 31), dtype=np.float32)
@@ -2794,6 +2826,138 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         self.assertEqual(matcher._heading, before_heading)
         self.assertEqual(matcher._last_command, before_command)
         self.assertEqual(matcher._elapsed_since_search, before_elapsed)
+        self.assertIs(matcher.generator, generator)
+
+    def test_reset_at_reanchors_and_becomes_the_new_reset_placement(self):
+        matcher = HybridMatcher(
+            _corpus(),
+            _Generator(),
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+            initial_root_xy=(0.25, -0.5),
+            initial_heading=0.25,
+        )
+        matcher.step(CommandState(1.0, 0.5), dt=0.04, force_search=True)
+        before_counters = (
+            matcher.state.decode_count,
+            matcher.state.fallback_count,
+            matcher.state.joint_clamp_count,
+        )
+        requested_xy = np.asarray((2.0, -3.0), dtype=np.float64)
+
+        reset = matcher.reset_at(requested_xy, 3.0 * np.pi)
+        requested_xy[:] = 99.0
+
+        self.assertIs(reset, matcher.state)
+        np.testing.assert_array_equal(matcher._initial_root_xy, (2.0, -3.0))
+        self.assertAlmostEqual(matcher._initial_heading, -np.pi)
+        np.testing.assert_array_equal(matcher._root_xy, (2.0, -3.0))
+        self.assertAlmostEqual(matcher._heading, -np.pi)
+        np.testing.assert_array_equal(matcher._world_transform.xy, (2.0, -3.0))
+        self.assertAlmostEqual(matcher._world_transform.yaw, -np.pi)
+        self.assertEqual(matcher._elapsed_since_search, SEARCH_INTERVAL_S)
+        self.assertIsNone(matcher._last_command)
+        self.assertIsNone(matcher._last_terrain_class)
+        np.testing.assert_array_equal(matcher.controller_velocity_local_xz, (0.0, 0.0))
+        self.assertEqual(
+            (
+                reset.decode_count,
+                reset.fallback_count,
+                reset.joint_clamp_count,
+            ),
+            before_counters,
+        )
+
+        matcher.step(CommandState(1.0), dt=0.04, force_search=True)
+        matcher.reset()
+
+        np.testing.assert_array_equal(matcher._root_xy, (2.0, -3.0))
+        self.assertAlmostEqual(matcher._heading, -np.pi)
+
+    def test_reset_at_rejects_invalid_placement_without_mutation(self):
+        matcher = HybridMatcher(
+            _corpus(),
+            _Generator(),
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+            initial_root_xy=(0.25, -0.5),
+            initial_heading=0.25,
+        )
+        before_state = matcher.state
+        before_initial_xy = matcher._initial_root_xy.copy()
+        before_initial_heading = matcher._initial_heading
+        before_root = matcher._root_xy.copy()
+        before_heading = matcher._heading
+
+        invalid_placements = (
+            (0.0, 0.0),
+            ((1.0,), 0.0),
+            (((1.0, 2.0),), 0.0),
+            (((1.0,), (2.0,)), 0.0),
+            ((1.0, np.nan), 0.0),
+            ((1.0, np.inf), 0.0),
+            ((1.0, 2.0), np.nan),
+            ((1.0, 2.0), np.inf),
+        )
+        for root_xy, heading in invalid_placements:
+            with self.subTest(root_xy=root_xy, heading=heading):
+                with self.assertRaises(ValueError):
+                    matcher.reset_at(root_xy, heading)
+                self.assertIs(matcher.state, before_state)
+                np.testing.assert_array_equal(
+                    matcher._initial_root_xy, before_initial_xy
+                )
+                self.assertEqual(matcher._initial_heading, before_initial_heading)
+                np.testing.assert_array_equal(matcher._root_xy, before_root)
+                self.assertEqual(matcher._heading, before_heading)
+
+    def test_failed_reset_at_rolls_back_runtime_and_initial_placement(self):
+        generator = _Generator()
+        fail = [False]
+
+        def converter(*arguments):
+            if fail[0]:
+                raise ValueError("conversion unavailable")
+            return _pose_converter(*arguments)
+
+        matcher = HybridMatcher(
+            _corpus(),
+            generator,
+            TerrainAuthority.flat(),
+            pose_converter=converter,
+            initial_root_xy=(0.25, -0.5),
+            initial_heading=0.25,
+        )
+        matcher.step(CommandState(1.0, 0.5), dt=0.04, force_search=True)
+        before_state = matcher.state
+        before_initial_xy = matcher._initial_root_xy
+        before_initial_heading = matcher._initial_heading
+        before_root = matcher._root_xy.copy()
+        before_heading = matcher._heading
+        before_command = matcher._last_command
+        before_terrain_class = matcher._last_terrain_class
+        before_elapsed = matcher._elapsed_since_search
+        before_world = matcher._world_transform
+        before_source = matcher._active_source_root
+        before_velocity = matcher.controller_velocity_local_xz
+        fail[0] = True
+
+        with self.assertRaisesRegex(ValueError, "conversion unavailable"):
+            matcher.reset_at((2.0, -3.0), -1.0)
+
+        self.assertIs(matcher.state, before_state)
+        self.assertIs(matcher._initial_root_xy, before_initial_xy)
+        self.assertEqual(matcher._initial_heading, before_initial_heading)
+        np.testing.assert_array_equal(matcher._root_xy, before_root)
+        self.assertEqual(matcher._heading, before_heading)
+        self.assertEqual(matcher._last_command, before_command)
+        self.assertEqual(matcher._last_terrain_class, before_terrain_class)
+        self.assertEqual(matcher._elapsed_since_search, before_elapsed)
+        self.assertIs(matcher._world_transform, before_world)
+        self.assertIs(matcher._active_source_root, before_source)
+        np.testing.assert_array_equal(
+            matcher.controller_velocity_local_xz, before_velocity
+        )
         self.assertIs(matcher.generator, generator)
 
     def test_failed_learned_and_canonical_transaction_holds_all_runtime_state(self):
