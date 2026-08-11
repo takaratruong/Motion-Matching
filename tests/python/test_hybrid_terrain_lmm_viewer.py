@@ -257,6 +257,69 @@ def _bind_formal_model_and_cache_authorities(
 
 
 class HybridTerrainViewerTests(unittest.TestCase):
+    def test_interactive_visuals_brighten_only_compiled_render_fields(self):
+        import mujoco
+
+        terrain = load_scene_terrain("hills")
+        canonical = viewer_module.build_viewer_model(DEFAULT_G1_XML, terrain)
+
+        def skybox_pixels(model):
+            texture_ids = np.flatnonzero(
+                model.tex_type == int(mujoco.mjtTexture.mjTEXTURE_SKYBOX)
+            )
+            self.assertEqual(len(texture_ids), 1)
+            texture_id = int(texture_ids[0])
+            start = int(model.tex_adr[texture_id])
+            channels = int(model.tex_nchannel[texture_id])
+            size = int(
+                model.tex_width[texture_id] * model.tex_height[texture_id] * channels
+            )
+            return np.asarray(model.tex_data[start : start + size]).reshape(
+                -1, channels
+            )
+
+        canonical_skybox = skybox_pixels(canonical)
+        self.assertEqual(int(canonical_skybox.min()), 0)
+        self.assertEqual(int(canonical_skybox.max()), 0)
+        np.testing.assert_allclose(
+            canonical.vis.headlight.ambient, (0.1, 0.1, 0.1), atol=1.0e-7
+        )
+
+        try:
+            interactive = viewer_module.build_viewer_model(
+                DEFAULT_G1_XML, terrain, interactive_visuals=True
+            )
+        except TypeError as error:
+            self.fail(f"interactive viewer visuals are unavailable: {error}")
+
+        interactive_skybox = skybox_pixels(interactive)
+        self.assertGreater(int(interactive_skybox.min()), 0)
+        self.assertGreater(
+            np.unique(interactive_skybox, axis=0).shape[0],
+            1,
+        )
+        self.assertTrue(np.all(np.diff(interactive_skybox.min(axis=0)) > 0))
+        self.assertTrue(np.all(np.diff(interactive_skybox.max(axis=0)) > 0))
+        np.testing.assert_allclose(
+            interactive.vis.headlight.ambient, (0.3, 0.3, 0.3), atol=1.0e-7
+        )
+        for field in (
+            "qpos0",
+            "jnt_type",
+            "jnt_range",
+            "geom_type",
+            "geom_pos",
+            "geom_quat",
+            "geom_size",
+            "geom_contype",
+            "geom_conaffinity",
+        ):
+            np.testing.assert_array_equal(
+                getattr(canonical, field),
+                getattr(interactive, field),
+                err_msg=field,
+            )
+
     def test_file_scene_domain_is_the_exact_inclusive_native_grid_rectangle(self):
         with tempfile.TemporaryDirectory() as temporary:
             scene = Path(temporary) / "finite"
@@ -1768,7 +1831,7 @@ class HybridTerrainViewerTests(unittest.TestCase):
             mock.patch(
                 "mm_sonic.hybrid_terrain_lmm_viewer.build_viewer_model",
                 return_value=object(),
-            ),
+            ) as build_model,
             mock.patch.object(mujoco, "MjData", return_value=data),
             mock.patch.object(mujoco, "mj_forward"),
             mock.patch("mujoco.viewer.launch_passive", return_value=FakeViewer()),
@@ -1786,6 +1849,9 @@ class HybridTerrainViewerTests(unittest.TestCase):
             )
 
         runtime_identity.assert_called_once_with(matcher, terrain, DEFAULT_G1_XML)
+        build_model.assert_called_once_with(
+            DEFAULT_G1_XML, terrain, interactive_visuals=True
+        )
         scene_current.assert_called_once_with(matcher.corpus, terrain)
         self.assertNotIn("EXACT SEARCH", overlay_texts[0][0])
         self.assertIn(

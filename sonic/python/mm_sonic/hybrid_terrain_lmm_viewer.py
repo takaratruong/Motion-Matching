@@ -1102,10 +1102,22 @@ def _load_matcher(
     return matcher, adapter
 
 
-def build_viewer_model(g1_xml: Path, terrain: SceneTerrainAdapter):
+def build_viewer_model(
+    g1_xml: Path,
+    terrain: SceneTerrainAdapter,
+    *,
+    interactive_visuals: bool = False,
+):
     import mujoco
 
     spec = mujoco.MjSpec.from_file(str(g1_xml))
+    if interactive_visuals:
+        for texture in spec.textures:
+            if texture.type == mujoco.mjtTexture.mjTEXTURE_SKYBOX:
+                texture.builtin = mujoco.mjtBuiltin.mjBUILTIN_GRADIENT
+                texture.rgb1[:] = (0.3, 0.5, 0.7)
+                texture.rgb2[:] = (0.05, 0.08, 0.12)
+        spec.visual.headlight.ambient[:] = (0.3, 0.3, 0.3)
     vertices, faces = terrain.native_mesh()
     spec.add_mesh(
         name="hybrid_lmm_authoritative_terrain",
@@ -1916,7 +1928,7 @@ def run_interactive(
 
     listener = keyboard_module.Listener(on_press=on_press, on_release=on_release)
     listener.start()
-    model = build_viewer_model(g1_xml, terrain)
+    model = build_viewer_model(g1_xml, terrain, interactive_visuals=True)
     identity = identity_resolver(matcher, terrain, Path(g1_xml))
     interactive_scene_authentication_current = (
         identity.get("scene_authentication_current") is True
