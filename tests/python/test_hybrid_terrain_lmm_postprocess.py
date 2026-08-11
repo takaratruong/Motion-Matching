@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -88,6 +89,26 @@ class _RecordingRepairer:
         )
         return SimpleNamespace(
             pose=pose, accepted=accepted, repaired=repaired, reason=reason
+        )
+
+
+class _KneeOffsetRepairer(_RecordingRepairer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.knee_offsets: list[float] = []
+
+    def repair(self, pose: KinematicPose) -> object:
+        self.calls.append(pose)
+        offset = self.knee_offsets.pop(0) if self.knee_offsets else 0.0
+        joints = pose.joint_position.copy()
+        # IsaacLab index 9 maps to MuJoCo qpos index 10 (left knee).
+        joints[9] += offset
+        repaired = replace(pose, joint_position=joints)
+        return SimpleNamespace(
+            pose=repaired,
+            accepted=True,
+            repaired=abs(offset) > 0.0,
+            reason="accepted",
         )
 
 
@@ -515,6 +536,69 @@ def test_double_lock_rejection_bypasses_advancing_candidate(model) -> None:
     assert identity["continuous_lock_bypass_count"] == 1
     assert identity["foot_lock_bypass_count"] == 1
     assert "release rejected" in identity["last_reason"]
+
+
+def test_double_lock_rejection_does_not_publish_one_side_of_knee_flip(model) -> None:
+    repairer = _KneeOffsetRepairer()
+    locker = _MeasuredContinuousFootLocker()
+    locker.measured_stance = np.asarray((False, False), dtype=bool)
+    processor = ExistingUtilityPosePostprocessor(
+        model,
+        SimpleNamespace(height_at_world_xy=lambda _xy: 0.0),
+        pose_repairer=repairer,
+        foot_locker=locker,
+    )
+    dt = 1.0 / 60.0
+    source_contact = np.asarray((True, False), dtype=bool)
+    processor.step(
+        _qpos(model, x=0.0),
+        row=1,
+        range_index=0,
+        source_contact=source_contact,
+        dt_s=dt,
+    )
+
+    # Reproduce the S2 seam: a once-repaired knee pose is followed by two
+    # rejected lock attempts, then the next advancing row accepts the
+    # opposite repair direction.  Publishing the rejected tick's inner
+    # repair creates a 0.50-rad display flip despite smooth source rows.
+    repairer.knee_offsets[:] = [-0.25]
+    locker.accepted[:] = [False, False]
+    resets_before_bypass = locker.reset_calls
+    bypass_source = _qpos(model, x=0.05)
+    bypassed = processor.step(
+        bypass_source,
+        row=2,
+        range_index=0,
+        source_contact=source_contact,
+        dt_s=dt,
+    )
+    bypass_identity = processor.identity()
+    resets_after_bypass = locker.reset_calls
+    calls_after_bypass = len(locker.calls)
+
+    repairer.knee_offsets[:] = [0.25, 0.0]
+    recovery_source = _qpos(model, x=0.10)
+    recovered = processor.step(
+        recovery_source,
+        row=3,
+        range_index=0,
+        source_contact=source_contact,
+        dt_s=dt,
+    )
+
+    np.testing.assert_allclose(bypassed, bypass_source, atol=1.0e-6, rtol=0.0)
+    assert bypassed[0] == pytest.approx(0.05)
+    assert recovered[0] == pytest.approx(0.10)
+    assert abs(float(recovered[10] - bypassed[10])) <= 0.25 + 1.0e-6
+    assert bypass_identity["continuous_lock_bypass_count"] == 1
+    assert bypass_identity["foot_lock_bypass_count"] == 1
+    assert bypass_identity["last_reason"] == (
+        "lock rejected; release rejected: lock rejected"
+    )
+    assert resets_after_bypass == resets_before_bypass + 2
+    assert locker.reset_calls == resets_after_bypass + 1
+    assert len(locker.calls) == calls_after_bypass + 2
 
 
 def test_post_lock_repair_rejection_resets_stale_lock_then_recovers(model) -> None:

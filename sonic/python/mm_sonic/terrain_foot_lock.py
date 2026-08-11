@@ -1599,9 +1599,10 @@ class G1TerrainTransitionGuard:
             )
             self.last_foot_lock_result = released
             if not bool(getattr(released, "accepted", False)):
-                # The contact layer is a bounded visual correction.  Keep the
-                # collision-safe source advancing if even release is
-                # infeasible rather than replaying one landing frame forever.
+                # Neither lock path can publish transactionally.  Signal the
+                # caller to discard this once-repaired inner pose, clear all
+                # landing state, and publish its advancing inertialized source
+                # candidate rather than one side of an IK flip.
                 self.foot_locker.reset()
                 self._landing_filter_outcome = (
                     "bypass-after-double-reject"
@@ -1610,7 +1611,7 @@ class G1TerrainTransitionGuard:
                     f"{rejected_reason}; release rejected: "
                     f"{getattr(released, 'reason', 'foot lock rejected')}"
                 )
-                return candidate
+                return None
             locked = released
             self._landing_filter_outcome = "release-after-reject"
             self._landing_filter_reason = rejected_reason

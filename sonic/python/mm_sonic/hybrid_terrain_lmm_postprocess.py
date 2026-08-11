@@ -326,6 +326,7 @@ class ExistingUtilityPosePostprocessor:
         )
         lock_result = self.transition_guard.last_foot_lock_result
         outcome = self.transition_guard.landing_filter_outcome
+        outcome_reason = self.transition_guard.landing_filter_reason
         self.last_measured_stance_contact = (
             self.transition_guard.measured_stance_contact
         )
@@ -395,10 +396,13 @@ class ExistingUtilityPosePostprocessor:
             self.continuous_lock_idle_frame_count += 1
         if outcome == "release-after-reject":
             self.continuous_lock_recovery_count += 1
-            self.last_reason = self.transition_guard.landing_filter_reason
+            self.last_reason = outcome_reason
         elif outcome == "bypass-after-double-reject":
-            self.continuous_lock_bypass_count += 1
-            self.last_reason = self.transition_guard.landing_filter_reason
+            # A returned pose needs the explicit outcome count.  A rejected
+            # transaction was already counted by the ``None`` bypass above.
+            if published_filtered_pose:
+                self.continuous_lock_bypass_count += 1
+            self.last_reason = outcome_reason
 
         if not isinstance(displayed_pose, KinematicPose):
             raise ValueError("terrain continuous foot lock returned an invalid pose")
