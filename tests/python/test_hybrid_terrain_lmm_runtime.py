@@ -387,6 +387,35 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         self.assertEqual(searched.call_count, 2)
         self.assertEqual(len(fake.calls), 2)
 
+    def test_cpu_diagnostic_remains_event_only_past_10hz(self):
+        matcher = HybridMatcher(
+            _mechanically_safe(_corpus()),
+            _Generator(),
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+            diagnostic_stability=True,
+        )
+
+        with mock.patch.object(matcher, "match", wraps=matcher.match) as searched:
+            for _ in range(3):
+                matcher.step(CommandState(1.0, 0.0), dt=0.04)
+
+        self.assertEqual(searched.call_count, 1)
+
+    def test_default_runtime_keeps_periodic_search_cadence(self):
+        matcher = HybridMatcher(
+            _corpus(),
+            _Generator(),
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+        )
+
+        with mock.patch.object(matcher, "match", wraps=matcher.match) as searched:
+            for _ in range(4):
+                matcher.step(CommandState(1.0, 0.0), dt=0.04)
+
+        self.assertEqual(searched.call_count, 2)
+
     def test_holden_velocity_release_is_bounded_and_snaps_neutral(self):
         fake = _FakeSingleGpuSearch()
         with mock.patch(

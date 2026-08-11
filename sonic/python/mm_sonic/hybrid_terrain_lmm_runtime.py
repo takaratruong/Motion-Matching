@@ -1905,7 +1905,9 @@ class HybridMatcher:
                 self._shaped_velocity_local_xz[:] = 0.0
                 self._last_command = CommandState()
                 return self.state
-            gpu_diagnostic = self.diagnostic_stability and self.search_device is not None
+            gpu_diagnostic = (
+                self.diagnostic_stability and self.search_device is not None
+            )
             effective_command = command
             if gpu_diagnostic:
                 config = MatcherConfig()
@@ -1922,7 +1924,10 @@ class HybridMatcher:
                     config=config,
                     dt=elapsed,
                 ).numpy()
-                if command.speed == 0.0 and np.linalg.norm(shaped) < config.stop_speed_mps:
+                if (
+                    command.speed == 0.0
+                    and np.linalg.norm(shaped) < config.stop_speed_mps
+                ):
                     shaped[:] = 0.0
                 self._shaped_velocity_local_xz[:] = shaped
                 effective_speed = (
@@ -1975,12 +1980,8 @@ class HybridMatcher:
                 and not self.diagnostic_row_mask[raw_successor]
             )
             periodic_search = (
-                (
-                    not self.diagnostic_stability
-                    or (gpu_diagnostic and effective_active)
-                )
-                and self._elapsed_since_search >= SEARCH_INTERVAL_S
-            )
+                not self.diagnostic_stability or (gpu_diagnostic and effective_active)
+            ) and self._elapsed_since_search >= SEARCH_INTERVAL_S
             event_search = bool(force_search) or command_event or terrain_event
             active_boundary_search = (
                 self.diagnostic_stability
@@ -1990,7 +1991,11 @@ class HybridMatcher:
             search = event_search or periodic_search or active_boundary_search
             if (
                 self.diagnostic_stability
-                and (not effective_active if gpu_diagnostic else command == CommandState())
+                and (
+                    not effective_active
+                    if gpu_diagnostic
+                    else command == CommandState()
+                )
                 and not search
             ):
                 self._last_command = command
