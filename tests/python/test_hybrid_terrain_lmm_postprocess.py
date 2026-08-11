@@ -232,6 +232,51 @@ class _MeasuredContinuousFootLocker(_RecordingFootLocker):
         )
 
 
+class _StepBoundedKneeFootLocker(_MeasuredContinuousFootLocker):
+    """Model the existing lock's unbounded first correction and step limit."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._correction = 0.0
+        self._correction_initialized = False
+
+    def reset(self) -> None:
+        super().reset()
+        self._correction = 0.0
+        self._correction_initialized = False
+
+    def apply(
+        self,
+        pose: KinematicPose,
+        source_contact: object,
+        *,
+        dt_s: float,
+        minimum_swing_clearance_m: float = 0.0,
+    ) -> object:
+        contact = np.array(source_contact, dtype=bool, copy=True)
+        self.calls.append((pose, contact, float(dt_s)))
+        clearance = float(minimum_swing_clearance_m)
+        self.swing_clearances.append(clearance)
+        desired = 0.25 if clearance > 0.0 else 0.0
+        if self._correction_initialized:
+            desired = self._correction + float(
+                np.clip(desired - self._correction, -0.08, 0.08)
+            )
+        self._correction = desired
+        self._correction_initialized = True
+        joints = pose.joint_position.copy()
+        joints[9] += self._correction
+        filtered = replace(pose, joint_position=joints)
+        return SimpleNamespace(
+            pose=filtered,
+            accepted=True,
+            repaired=abs(self._correction) > 0.0,
+            locked=(bool(contact[0]), bool(contact[1])),
+            releasing=(False, False),
+            reason="accepted",
+        )
+
+
 def _processor(model):
     repairer = _RecordingRepairer()
     locker = _RecordingFootLocker()
@@ -292,7 +337,7 @@ def test_source_false_scraping_proximity_resets_two_frame_acquisition(
     np.testing.assert_array_equal(locker.calls[-1][1], (True, False))
     assert locker.calls[-1][2] == pytest.approx(dt)
     assert locker.swing_clearances == pytest.approx(
-        [0.012] * (len(source_contacts) + 1)
+        [0.0] + [0.012] * len(source_contacts)
     )
     identity = processor.identity()
     assert identity["source_contacts_required_for_acquisition"] is True
@@ -394,6 +439,74 @@ def test_guard_without_source_keeps_speed_qualified_acquisition_policy(model) ->
         np.testing.assert_array_equal(contact, (False, False))
     # The speed-free support utility is diagnostic-source policy only.
     assert locker.support_calls == []
+
+
+def test_deferred_landing_primes_zero_correction_before_display_filter(model) -> None:
+    repairer = _KneeOffsetRepairer()
+    locker = _StepBoundedKneeFootLocker()
+    processor = ExistingUtilityPosePostprocessor(
+        model,
+        SimpleNamespace(height_at_world_xy=lambda _xy: 0.0),
+        pose_repairer=repairer,
+        foot_locker=locker,
+    )
+    repairer.knee_offsets[:] = [0.25, 0.0]
+    source = _qpos(model, x=0.0)
+
+    displayed = processor.step(
+        source,
+        row=1,
+        range_index=0,
+        source_contact=np.asarray((True, False), dtype=bool),
+        dt_s=1.0 / 60.0,
+    )
+
+    assert locker.swing_clearances == pytest.approx((0.0, 0.012))
+    assert displayed[10] - source[10] == pytest.approx(0.33, abs=1.0e-6)
+
+
+def test_deferred_landing_reprimes_after_raw_prime_rejection(model) -> None:
+    repairer = _RecordingRepairer()
+    locker = _MeasuredContinuousFootLocker()
+    locker.accepted[:] = [False, True, True]
+    guard = G1TerrainTransitionGuard(
+        repairer,
+        locker,
+        contact_hold_frames=4,
+        source_contact_delay_frames=4,
+        dt_s=1.0 / 60.0,
+    )
+    pose = NativeQposPoseAdapter(model).to_pose(
+        _qpos(model, x=0.0), dt_s=1.0 / 60.0
+    )
+
+    guard.begin_landing(pose, defer_contact_acquisition=True)
+    filtered = guard.filter_landing(
+        pose,
+        trusted_source_contact=np.asarray((False, False), dtype=bool),
+    )
+
+    assert isinstance(filtered, KinematicPose)
+    assert locker.swing_clearances == pytest.approx((0.0, 0.0, 0.012))
+
+
+def test_normal_landing_prime_keeps_existing_swing_clearance(model) -> None:
+    repairer = _RecordingRepairer()
+    locker = _MeasuredContinuousFootLocker()
+    guard = G1TerrainTransitionGuard(
+        repairer,
+        locker,
+        contact_hold_frames=4,
+        source_contact_delay_frames=4,
+        dt_s=1.0 / 60.0,
+    )
+    pose = NativeQposPoseAdapter(model).to_pose(
+        _qpos(model, x=0.0), dt_s=1.0 / 60.0
+    )
+
+    guard.begin_landing(pose)
+
+    assert locker.swing_clearances == pytest.approx((0.012,))
 
 
 def test_measured_acquired_contact_survives_search_transition_until_source_release(

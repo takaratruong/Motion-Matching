@@ -1402,6 +1402,8 @@ class G1TerrainTransitionGuard:
         self._landing_touchdown_frames = [0, 0]
         self._landing_supported_feet = [False, False]
         self._landing_side = "top"
+        self._landing_deferred_contact_acquisition = False
+        self._landing_neutral_lock_primed = False
         self._landing_filter_outcome = "reset"
         self._landing_filter_reason = "reset"
         self.last_pose_repair_result = None
@@ -1430,6 +1432,7 @@ class G1TerrainTransitionGuard:
             raise ValueError("defer_contact_acquisition must be bool")
         self.end_stair()
         self._landing_side = landing_side
+        self._landing_deferred_contact_acquisition = defer_contact_acquisition
         contact_method = getattr(
             self.foot_locker, "landing_stance_contact", None
         )
@@ -1476,7 +1479,9 @@ class G1TerrainTransitionGuard:
             seeded_contact,
             dt_s=self.dt_s,
             minimum_swing_clearance_m=(
-                self.landing_minimum_swing_clearance_m
+                0.0
+                if defer_contact_acquisition
+                else self.landing_minimum_swing_clearance_m
             ),
         )
         self.last_foot_lock_result = seeded
@@ -1487,6 +1492,7 @@ class G1TerrainTransitionGuard:
             )
             self.foot_locker.reset()
             return
+        self._landing_neutral_lock_primed = defer_contact_acquisition
         self._landing_filter_outcome = (
             "primed-active"
             if any(
@@ -1647,6 +1653,29 @@ class G1TerrainTransitionGuard:
         candidate = getattr(repair, "pose", None)
         if not isinstance(candidate, KinematicPose):
             raise ValueError("pose repairer returned an invalid pose")
+        if (
+            self._landing_deferred_contact_acquisition
+            and not self._landing_neutral_lock_primed
+        ):
+            # A raw pose can reject the unpublished deferred prime before
+            # repair makes it terrain-safe.  Re-prime the repaired pose with
+            # no contact or swing correction so the existing foot-lock
+            # correction-step bound governs its first displayed adjustment.
+            seeded = self.foot_locker.apply(
+                candidate,
+                np.zeros(2, dtype=bool),
+                dt_s=self.dt_s,
+                minimum_swing_clearance_m=0.0,
+            )
+            self.last_foot_lock_result = seeded
+            if not bool(getattr(seeded, "accepted", False)):
+                self._landing_filter_outcome = "deferred-prime-rejected"
+                self._landing_filter_reason = str(
+                    getattr(seeded, "reason", "deferred prime rejected")
+                )
+                self.foot_locker.reset()
+                return None
+            self._landing_neutral_lock_primed = True
         contact_method = getattr(
             self.foot_locker, "landing_stance_contact", None
         )
