@@ -1,4 +1,4 @@
-"""Lazy, exhaustive float64 motion search on one isolated GPU."""
+"""Lazy, exhaustive float32 diagnostic motion search on one isolated GPU."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ _MAX_RETURNED_CANDIDATES = 128
 
 @dataclass(frozen=True)
 class GpuSearchCandidates:
-    """Bounded near-minimum rows returned by the exhaustive device scorer."""
+    """Bounded near-minimum rows returned by the diagnostic device scorer."""
 
     rows: np.ndarray
     candidate_count: int
@@ -71,7 +71,7 @@ def _integer_vector(
 
 
 class SingleGpuExactSearch:
-    """Exhaustively score every searchable row on exactly one visible GPU."""
+    """Exhaustively score every searchable row with diagnostic float32 math."""
 
     def __init__(
         self,
@@ -105,10 +105,16 @@ class SingleGpuExactSearch:
             ) from error
         if not math.isfinite(penalty) or penalty < 0.0:
             raise ValueError("transition penalty must be finite and nonnegative")
+        with np.errstate(over="ignore", invalid="ignore"):
+            diagnostic_penalty = np.float32(penalty)
+        if not np.isfinite(diagnostic_penalty):
+            raise ValueError("transition penalty must be finite in float32")
 
         feature_values = np.asarray(features)
         if feature_values.ndim != 2 or feature_values.shape[1] != _FEATURE_COUNT:
             raise ValueError("features must have shape (rows, 31)")
+        if feature_values.dtype != np.dtype(np.float32):
+            raise ValueError("single-GPU diagnostic features must use native float32")
         corpus_rows = len(feature_values)
         rows = _integer_vector(searchable_rows, name="searchable rows").astype(
             np.int64, copy=False
@@ -147,8 +153,7 @@ class SingleGpuExactSearch:
         if len(devices) != 1 or getattr(devices[0], "platform", None) != "gpu":
             raise RuntimeError("single-GPU search requires exactly one visible GPU")
         if not bool(getattr(jax.config, "x64_enabled", False)):
-            raise RuntimeError("single-GPU exact search requires JAX float64 support")
-
+            raise RuntimeError("single-GPU search requires JAX 64-bit row indices")
         self.physical_device_index = physical_device_index
         self.transition_penalty = penalty
         self.exclusion_budget = exclusion_budget
@@ -158,9 +163,8 @@ class SingleGpuExactSearch:
         self._rows.setflags(write=False)
         self._corpus_row_count = corpus_rows
 
-        warm_query = np.asarray(searchable_features[0], dtype=np.float64)
-        device_features_float32 = jax.device_put(searchable_features, self._device)
-        self._device_features = device_features_float32.astype(jnp.float64)
+        warm_query = np.asarray(searchable_features[0], dtype=np.float32)
+        self._device_features = jax.device_put(searchable_features, self._device)
         self._device_rows = jax.device_put(self._rows, self._device)
         self._device_range_ids = jax.device_put(searchable_ranges, self._device)
         self._device_contact_codes = jax.device_put(contact_codes, self._device)
@@ -177,39 +181,40 @@ class SingleGpuExactSearch:
             active_contact_code,
             excluded_positions,
         ):
-            scores = jnp.sum(jnp.square(resident_features - query[None, :]), axis=1)
-            scores += penalty * (range_ids != current_range)
-            scores = jnp.where(
-                resident_contact_codes == active_contact_code, scores, jnp.inf
-            )
-            padded = jnp.concatenate(
-                (scores, jnp.asarray((jnp.inf,), dtype=jnp.float64))
+            eligible = resident_contact_codes == active_contact_code
+            padded_eligible = jnp.concatenate(
+                (eligible, jnp.asarray((False,), dtype=jnp.bool_))
             )
             safe_exclusions = jnp.where(
-                excluded_positions >= 0, excluded_positions, len(scores)
+                excluded_positions >= 0, excluded_positions, len(eligible)
             )
-            padded = padded.at[safe_exclusions].set(jnp.inf)
-            scores = padded[:-1]
+            padded_eligible = padded_eligible.at[safe_exclusions].set(False)
+            eligible = padded_eligible[:-1]
+            scores = jnp.sum(jnp.square(resident_features - query[None, :]), axis=1)
+            scores += diagnostic_penalty * (range_ids != current_range)
+            scores = jnp.where(eligible, scores, jnp.inf)
             values, positions = jax.lax.top_k(-scores, top_count)
             candidate_scores = -values
             minimum = candidate_scores[0]
             tolerance = (
-                jnp.finfo(jnp.float64).eps * jnp.maximum(1.0, jnp.abs(minimum)) * 512
+                jnp.finfo(jnp.float32).eps * jnp.maximum(1.0, jnp.abs(minimum)) * 512
             )
             close = jnp.isfinite(candidate_scores) & (
-                candidate_scores <= minimum + tolerance
+                candidate_scores - minimum <= tolerance
             )
             candidate_rows = jnp.where(
                 close,
                 global_rows[positions],
                 jnp.asarray(-1, dtype=global_rows.dtype),
             )
-            close_count = jnp.count_nonzero(scores <= minimum + tolerance)
-            candidate_count = jnp.count_nonzero(jnp.isfinite(scores))
+            close_count = jnp.count_nonzero(
+                jnp.isfinite(scores) & (scores - minimum <= tolerance)
+            )
+            candidate_count = jnp.count_nonzero(eligible)
             return candidate_rows, minimum, close_count, candidate_count
 
         self._kernel = jax.jit(kernel, device=self._device)
-        del device_features_float32, searchable_features
+        del searchable_features
         warm_exclusions = np.full(self.exclusion_budget, -1, dtype=np.int64)
         warm_outputs = self._execute(
             warm_query,
@@ -291,7 +296,8 @@ class SingleGpuExactSearch:
     ) -> GpuSearchCandidates:
         """Return all device candidates inside the conservative roundoff window."""
 
-        value = np.asarray(query, dtype=np.float64)
+        with np.errstate(over="ignore", invalid="ignore"):
+            value = np.asarray(query, dtype=np.float32)
         if value.shape != (_FEATURE_COUNT,) or not np.isfinite(value).all():
             raise ValueError("search query must be one finite 31-D row")
         if not isinstance(current_range, (int, np.integer)) or isinstance(
@@ -318,8 +324,12 @@ class SingleGpuExactSearch:
 
         candidate_count = int(np.asarray(outputs[3]))
         minimum = float(np.asarray(outputs[1]))
-        if candidate_count < 1 or not math.isfinite(minimum):
+        if candidate_count < 1:
             raise ValueError("single-GPU search found no compatible candidate")
+        if not math.isfinite(minimum):
+            raise FloatingPointError(
+                "single-GPU diagnostic scores overflowed for every compatible candidate"
+            )
         close_count = int(np.asarray(outputs[2]))
         rows = np.asarray(outputs[0], dtype=np.int64)
         rows = np.sort(rows[rows >= 0])

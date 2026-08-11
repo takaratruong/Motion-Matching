@@ -275,8 +275,180 @@ class SingleGpuExactSearchContractTests(unittest.TestCase):
 
 
 class SingleGpuExactSearchGpuTests(unittest.TestCase):
-    def test_gpu5_matches_randomized_and_adversarial_cpu_oracle(self):
+    def _assert_gpu5_script(self, script: str, marker: str) -> None:
         root = Path(__file__).resolve().parents[2]
+        environment = os.environ.copy()
+        environment["CUDA_VISIBLE_DEVICES"] = "5"
+        environment["PYTHONPATH"] = os.pathsep.join(
+            (str(root), str(root / "resources"), str(root / "sonic" / "python"))
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(script)],
+            cwd=root,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+        )
+        self.assertIn(marker, completed.stdout)
+
+    def test_rejects_float64_feature_tables_instead_of_silently_narrowing(self):
+        features, searchable_rows, row_ranges, contacts = _tables()
+        with (
+            mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "5"}, clear=True),
+            mock.patch(
+                "mm_sonic.hybrid_terrain_lmm_gpu_search._load_jax",
+                side_effect=AssertionError("dtype rejection must precede JAX import"),
+            ),
+            self.assertRaisesRegex(ValueError, "native float32"),
+        ):
+            SingleGpuExactSearch(
+                features.astype(np.float64),
+                searchable_rows,
+                row_ranges,
+                contacts,
+                physical_device_index=5,
+                transition_penalty=0.1,
+            )
+
+    def test_gpu5_handles_near_maximum_and_overflowed_scores(self):
+        self._assert_gpu5_script(
+            """
+            import numpy as np
+
+            from mm_sonic.hybrid_terrain_lmm_gpu_search import (
+                SingleGpuExactSearch,
+                configure_single_gpu_visibility,
+            )
+
+            _, physical_index = configure_single_gpu_visibility("cuda:5")
+            maximum = np.finfo(np.float32).max
+            near_maximum_delta = np.sqrt(
+                maximum * np.float32(1.0 - 1.0e-5)
+            )
+            features = np.zeros((4, 31), dtype=np.float32)
+            features[:, 0] = near_maximum_delta
+            contacts = np.zeros((4, 2), dtype=np.bool_)
+            contacts[2:, 0] = True
+            search = SingleGpuExactSearch(
+                features,
+                np.arange(4, dtype=np.int64),
+                np.zeros(4, dtype=np.int32),
+                contacts,
+                physical_device_index=physical_index,
+                transition_penalty=0.1,
+            )
+            result = search.match_candidates(
+                np.zeros(31, dtype=np.float64),
+                current_range=0,
+                active_contact_code=0,
+                excluded_rows=(),
+            )
+            assert np.isfinite(result.device_minimum_score)
+            assert result.candidate_count == 2
+            assert result.close_candidate_count == 2
+            np.testing.assert_array_equal(result.rows, (0, 1))
+
+            overflow_features = np.zeros((2, 31), dtype=np.float32)
+            overflow_features[:, 0] = maximum
+            overflow_search = SingleGpuExactSearch(
+                overflow_features,
+                np.arange(2, dtype=np.int64),
+                np.zeros(2, dtype=np.int32),
+                np.zeros((2, 2), dtype=np.bool_),
+                physical_device_index=physical_index,
+                transition_penalty=0.1,
+            )
+            try:
+                overflow_search.match_candidates(
+                    np.zeros(31, dtype=np.float64),
+                    current_range=0,
+                    active_contact_code=0,
+                    excluded_rows=(),
+                )
+            except FloatingPointError as error:
+                assert "scores overflowed" in str(error)
+            else:
+                raise AssertionError("all-score overflow was not reported")
+            print("GPU_SCORE_OVERFLOW_OK")
+            """,
+            "GPU_SCORE_OVERFLOW_OK",
+        )
+
+    def test_gpu5_constructed_controls_flip_winners_and_signal_tie_overflow(self):
+        self._assert_gpu5_script(
+            """
+            import numpy as np
+
+            from mm_sonic.hybrid_terrain_lmm_gpu_search import (
+                SingleGpuExactSearch,
+                configure_single_gpu_visibility,
+            )
+
+            _, physical_index = configure_single_gpu_visibility("cuda:5")
+            features = np.zeros((2, 31), dtype=np.float32)
+            features[0, 0] = np.sqrt(0.08)
+            row_ranges = np.asarray((0, 1), dtype=np.int32)
+            search = SingleGpuExactSearch(
+                features,
+                np.arange(2, dtype=np.int64),
+                row_ranges,
+                np.zeros((2, 2), dtype=np.bool_),
+                physical_device_index=physical_index,
+                transition_penalty=0.1,
+            )
+            query = np.zeros(31, dtype=np.float64)
+            raw_scores = np.sum(np.square(features - query), axis=1)
+            assert int(np.argmin(raw_scores)) == 1
+            penalized = raw_scores + 0.1 * (row_ranges != 0)
+            assert int(np.argmin(penalized)) == 0
+
+            penalty_result = search.match_candidates(
+                query,
+                current_range=0,
+                active_contact_code=0,
+                excluded_rows=(),
+            )
+            np.testing.assert_array_equal(penalty_result.rows, (0,))
+            exclusion_result = search.match_candidates(
+                query,
+                current_range=0,
+                active_contact_code=0,
+                excluded_rows=(0,),
+            )
+            np.testing.assert_array_equal(exclusion_result.rows, (1,))
+            assert exclusion_result.candidate_count == 1
+
+            tie_count = 140
+            tie_search = SingleGpuExactSearch(
+                np.zeros((tie_count, 31), dtype=np.float32),
+                np.arange(tie_count, dtype=np.int64),
+                np.zeros(tie_count, dtype=np.int32),
+                np.zeros((tie_count, 2), dtype=np.bool_),
+                physical_device_index=physical_index,
+                transition_penalty=0.1,
+            )
+            ties = tie_search.match_candidates(
+                query,
+                current_range=0,
+                active_contact_code=0,
+                excluded_rows=(),
+            )
+            assert ties.candidate_count == tie_count
+            assert ties.close_candidate_count == tie_count
+            np.testing.assert_array_equal(ties.rows, np.arange(128))
+            print("GPU_CONSTRUCTED_CONTROLS_OK")
+            """,
+            "GPU_CONSTRUCTED_CONTROLS_OK",
+        )
+
+    def test_gpu5_matches_randomized_and_adversarial_cpu_oracle(self):
         script = textwrap.dedent(
             """
             import numpy as np
@@ -398,28 +570,7 @@ class SingleGpuExactSearchGpuTests(unittest.TestCase):
             print(f"GPU_PARITY_OK cases={len(cases)} device={devices[0]}")
             """
         )
-        environment = os.environ.copy()
-        environment["CUDA_VISIBLE_DEVICES"] = "5"
-        environment["PYTHONPATH"] = os.pathsep.join(
-            (str(root), str(root / "resources"), str(root / "sonic" / "python"))
-        )
-
-        completed = subprocess.run(
-            [sys.executable, "-c", script],
-            cwd=root,
-            env=environment,
-            capture_output=True,
-            text=True,
-            timeout=120,
-            check=False,
-        )
-
-        self.assertEqual(
-            completed.returncode,
-            0,
-            msg=f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
-        )
-        self.assertIn("GPU_PARITY_OK cases=41", completed.stdout)
+        self._assert_gpu5_script(script, "GPU_PARITY_OK cases=41")
 
 
 if __name__ == "__main__":
