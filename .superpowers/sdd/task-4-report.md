@@ -379,3 +379,27 @@ This lane recorded 9 intended RED failures, then 37/37 hybrid-viewer tests
 green. Fresh combined verification across scorer, runtime, hybrid viewer, and
 full-walking viewer passed 119 tests in 20.64 seconds. Scoped Ruff check and
 format-check, `py_compile`, and `git diff --check` also passed.
+
+### Real physical-GPU5 benchmark and live viewer
+
+The exact 9,741,525-row corpus/model benchmark completed successfully in
+`/tmp/full-walking-gpu5-benchmark-20260810T184806.log`. Across 25 forced
+searches, device latency was 4.395 ms median, 4.868 ms p95, and 5.498 ms
+maximum. Complete viewer-step latency was 9.729 ms median, 13.556 ms p95, and
+29.510 ms maximum. Three representative GPU candidate searches exactly
+matched full CPU float64 brute-force row and distance results. Matcher transfer
+and JIT startup took 3.915 seconds; strict corpus/model authentication made
+total cold startup 318.782 seconds.
+
+The benchmark PID owned 2,488 MiB only on physical GPU5, UUID
+`GPU-6a819546-e32a-076b-a85e-0e539d6fd9df`; it opened no context on the other
+seven GPUs. The accepted latency target was p95 <=100 ms, so the measured
+4.868 ms passes with substantial margin.
+
+The prior CPU viewer PID 1029253 was terminated only after exact PID start
+ticks, cwd, and full command-line identity matched. The replacement runs in a
+persistent session as PID 1401033 with `--search-device cuda:5`. Its active
+MuJoCo window is maximized on DISPLAY `:1`; the live overlay visibly reports
+the diagnostic FP32 backend and approximately 4.8--4.9 ms last-search latency.
+The process owns a CUDA context only on physical GPU5. Interactive receipts
+remain explicitly diagnostic and acceptance-ineligible.
