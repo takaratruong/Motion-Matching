@@ -10,10 +10,12 @@ from pathlib import Path
 
 import numpy as np
 from scipy.spatial import cKDTree
+import torch
 
 from resources import quat
 
 from .preliminary_learned_slope import decoded_pose_to_native_qpos
+from .torch_motion_matcher import MatcherConfig, bounded_velocity_step
 
 FPS = 25.0
 DT = 1.0 / FPS
@@ -786,6 +788,7 @@ class HybridMatcher:
         self._elapsed_since_search = SEARCH_INTERVAL_S
         self._last_command: CommandState | None = None
         self._last_terrain_class: str | None = None
+        self._shaped_velocity_local_xz = np.zeros(2, dtype=np.float64)
         spawn_xy = np.asarray(initial_root_xy, dtype=np.float64)
         spawn_heading = _finite_scalar(initial_heading, "initial heading")
         if spawn_xy.shape != (2,) or not np.isfinite(spawn_xy).all():
@@ -1877,9 +1880,12 @@ class HybridMatcher:
         *,
         dt: float | None = None,
         force_search: bool = False,
+        hard_stop: bool = False,
     ) -> HybridRuntimeState:
         if not isinstance(command, CommandState):
             raise TypeError("runtime command must be a CommandState")
+        if type(hard_stop) is not bool:
+            raise TypeError("hard stop must be a boolean")
         elapsed = self.dt if dt is None else _finite_scalar(dt, "runtime dt")
         if elapsed <= 0.0:
             raise ValueError("runtime dt must be positive")
@@ -1892,10 +1898,42 @@ class HybridMatcher:
             self._last_terrain_class,
             self._world_transform,
             self._active_source_root,
+            self._shaped_velocity_local_xz.copy(),
         )
         try:
-            live = self._preview_terrain(command)
-            live_domain_supported = self._preview_domain_supported(command)
+            if hard_stop:
+                self._shaped_velocity_local_xz[:] = 0.0
+                self._last_command = CommandState()
+                return self.state
+            gpu_diagnostic = self.diagnostic_stability and self.search_device is not None
+            effective_command = command
+            if gpu_diagnostic:
+                config = MatcherConfig()
+                current = torch.as_tensor(
+                    self._shaped_velocity_local_xz, dtype=torch.float64
+                )
+                target = torch.tensor(
+                    (0.0, command.speed * self.walking_speed_p95_mps),
+                    dtype=torch.float64,
+                )
+                shaped = bounded_velocity_step(
+                    current,
+                    target,
+                    config=config,
+                    dt=elapsed,
+                ).numpy()
+                if command.speed == 0.0 and np.linalg.norm(shaped) < config.stop_speed_mps:
+                    shaped[:] = 0.0
+                self._shaped_velocity_local_xz[:] = shaped
+                effective_speed = (
+                    0.0
+                    if self.walking_speed_p95_mps == 0.0
+                    else float(shaped[1] / self.walking_speed_p95_mps)
+                )
+                effective_command = CommandState(effective_speed, command.steering)
+            effective_active = effective_command != CommandState()
+            live = self._preview_terrain(effective_command)
+            live_domain_supported = self._preview_domain_supported(effective_command)
             terrain_class = self.terrain.terrain_class(live)
             self._elapsed_since_search += elapsed
             if self.diagnostic_stability:
@@ -1937,21 +1975,28 @@ class HybridMatcher:
                 and not self.diagnostic_row_mask[raw_successor]
             )
             periodic_search = (
-                not self.diagnostic_stability
+                (
+                    not self.diagnostic_stability
+                    or (gpu_diagnostic and effective_active)
+                )
                 and self._elapsed_since_search >= SEARCH_INTERVAL_S
             )
             event_search = bool(force_search) or command_event or terrain_event
             active_boundary_search = (
                 self.diagnostic_stability
                 and range_terminal
-                and command != CommandState()
+                and (effective_active if gpu_diagnostic else command != CommandState())
             )
             search = event_search or periodic_search or active_boundary_search
-            if self.diagnostic_stability and command == CommandState() and not search:
+            if (
+                self.diagnostic_stability
+                and (not effective_active if gpu_diagnostic else command == CommandState())
+                and not search
+            ):
                 self._last_command = command
                 self._last_terrain_class = terrain_class
                 return self.state
-            query = self._command_query(command, live)
+            query = self._command_query(effective_command, live)
             if discontinuous_successor_boundary:
                 boundary_exclusions = (self.state.row, raw_successor)
             elif (
@@ -1976,7 +2021,7 @@ class HybridMatcher:
                 live_raw=live,
                 live_domain_supported=live_domain_supported,
                 advance_source=not search,
-                command=command,
+                command=effective_command,
                 base_excluded_rows=boundary_exclusions,
             )
             if proposed.candidate_exhausted:
@@ -1989,8 +2034,10 @@ class HybridMatcher:
                     self._last_terrain_class,
                     self._world_transform,
                     self._active_source_root,
+                    shaped_velocity_local_xz,
                 ) = snapshot
                 self._root_xy[:] = root_xy
+                self._shaped_velocity_local_xz[:] = shaped_velocity_local_xz
                 return proposed
             self._last_command = command
             self._last_terrain_class = terrain_class
@@ -2005,8 +2052,10 @@ class HybridMatcher:
                 self._last_terrain_class,
                 self._world_transform,
                 self._active_source_root,
+                shaped_velocity_local_xz,
             ) = snapshot
             self._root_xy[:] = root_xy
+            self._shaped_velocity_local_xz[:] = shaped_velocity_local_xz
             raise
 
     def reset(self) -> HybridRuntimeState:
@@ -2021,11 +2070,13 @@ class HybridMatcher:
             self._last_terrain_class,
             self._world_transform,
             self._active_source_root,
+            self._shaped_velocity_local_xz.copy(),
         )
         try:
             self._elapsed_since_search = SEARCH_INTERVAL_S
             self._last_command = None
             self._last_terrain_class = None
+            self._shaped_velocity_local_xz[:] = 0.0
             self._set_world_transform(
                 SE2Transform(self._initial_root_xy, self._initial_heading)
             )
@@ -2064,8 +2115,10 @@ class HybridMatcher:
                 self._last_terrain_class,
                 self._world_transform,
                 self._active_source_root,
+                shaped_velocity_local_xz,
             ) = snapshot
             self._root_xy[:] = root_xy
+            self._shaped_velocity_local_xz[:] = shaped_velocity_local_xz
             raise
 
 

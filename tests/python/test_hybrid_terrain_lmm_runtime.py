@@ -381,7 +381,7 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         )
 
         with mock.patch.object(matcher, "match", wraps=matcher.match) as searched:
-            for _ in range(3):
+            for _ in range(4):
                 matcher.step(CommandState(1.0, 0.0), dt=0.04)
 
         self.assertEqual(searched.call_count, 2)
@@ -412,14 +412,40 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
 
         for _ in range(3):
             matcher.step(CommandState(1.0, 0.0), dt=0.04)
-        before_release = matcher._shaped_velocity_world_xy[1]
+        before_release = matcher._shaped_velocity_local_xz[1]
         matcher.step(CommandState(), dt=0.04)
-        first_release = matcher._shaped_velocity_world_xy[1]
+        first_release = matcher._shaped_velocity_local_xz[1]
 
         self.assertGreater(first_release, 0.0)
         self.assertLessEqual(before_release - first_release, 2.0 * 0.04 + 1e-12)
         matcher.step(CommandState(), dt=0.04)
-        self.assertEqual(matcher._shaped_velocity_world_xy[1], 0.0)
+        self.assertEqual(matcher._shaped_velocity_local_xz[1], 0.0)
+
+    def test_holden_velocity_first_60hz_tick_remains_positive(self):
+        fake = _FakeSingleGpuSearch()
+        with mock.patch(
+            "mm_sonic.hybrid_terrain_lmm_gpu_search.SingleGpuExactSearch",
+            return_value=fake,
+        ):
+            matcher = HybridMatcher(
+                _mechanically_safe(_corpus()),
+                _Generator(),
+                TerrainAuthority.flat(),
+                pose_converter=_pose_converter,
+                search_device="cuda:5",
+                diagnostic_stability=True,
+            )
+        fake.responses.append(
+            _gpu_candidates(
+                matcher.searchable_rows,
+                candidate_count=len(matcher.searchable_rows),
+                close_candidate_count=len(matcher.searchable_rows),
+            )
+        )
+
+        matcher.step(CommandState(1.0), dt=1.0 / 60.0)
+
+        self.assertAlmostEqual(matcher._shaped_velocity_local_xz[1], 0.025)
 
     def test_holden_velocity_uses_one_shaped_command_for_preview_and_query(self):
         fake = _FakeSingleGpuSearch()
@@ -493,9 +519,11 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
             matcher, "match", side_effect=AssertionError("hard stop searched")
         ):
             held = matcher.step(CommandState(1.0), dt=0.04, hard_stop=True)
+            released = matcher.step(CommandState(), dt=0.04)
 
         self.assertIs(held, before)
-        np.testing.assert_array_equal(matcher._shaped_velocity_world_xy, (0.0, 0.0))
+        self.assertIs(released, before)
+        np.testing.assert_array_equal(matcher._shaped_velocity_local_xz, (0.0, 0.0))
 
     def test_holden_velocity_transaction_and_reset_restore_zero_state(self):
         fake = _FakeSingleGpuSearch()
@@ -519,7 +547,7 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
             )
         )
         matcher.step(CommandState(1.0), dt=0.04)
-        before = np.array(matcher._shaped_velocity_world_xy, copy=True)
+        before = np.array(matcher._shaped_velocity_local_xz, copy=True)
 
         exhausted = replace(matcher.state, candidate_exhausted=True)
         with (
@@ -530,9 +558,9 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         ):
             matcher.step(CommandState(1.0), dt=0.04, force_search=True)
 
-        np.testing.assert_array_equal(matcher._shaped_velocity_world_xy, before)
+        np.testing.assert_array_equal(matcher._shaped_velocity_local_xz, before)
         matcher.reset()
-        np.testing.assert_array_equal(matcher._shaped_velocity_world_xy, (0.0, 0.0))
+        np.testing.assert_array_equal(matcher._shaped_velocity_local_xz, (0.0, 0.0))
 
     def test_diagnostic_stability_filters_mechanically_unsafe_exact_winner(self):
         corpus = _mechanically_safe(_corpus())
