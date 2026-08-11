@@ -482,7 +482,7 @@ def _full_runtime_label(
             else ""
         )
         pose_policy += (
-            "PoseInertializer + measured-acquire/source-continue "
+            "PoseInertializer + source+proximity-acquire/source-continue "
             "G1TerrainFootLock; "
             "0.10s half-life; "
         )

@@ -44,10 +44,12 @@ DIAGNOSTIC_MODEL_LABEL = (
     "HYBRID TERRAIN LMM POC (DIAGNOSTIC UNVERIFIED GENERATOR; NOT ACCEPTANCE EVIDENCE)"
 )
 _DISPLAY_POSTPROCESSOR_IDENTITY = (
-    "existing-pose-inertializer-repair-measured-acquire-source-continue-foot-lock/v5"
+    "existing-pose-inertializer-repair-"
+    "source-proximity-acquire-source-continue-foot-lock/v6"
 )
 _DISPLAY_POSTPROCESSOR_POLICY = (
-    "PoseInertializer + measured-acquire/source-continue G1TerrainFootLock"
+    "PoseInertializer + source+proximity-acquire/source-continue "
+    "G1TerrainFootLock"
 )
 _FORMAL_ARTIFACT_AUTHORITIES = {
     "cache_manifest_sha256": (
@@ -1093,24 +1095,37 @@ def _display_postprocessor_overlay(identity: object | None) -> tuple[str, str]:
         return "", ""
     half_life = float(getter("inertialization_halflife_s"))
     speed = float(getter("measured_stance_maximum_foot_speed_mps", 0.20))
-    clearance = float(getter("measured_stance_maximum_sole_clearance_m", 0.020))
-    acquire = int(getter("measured_stance_acquire_frames", 2))
+    clearance = float(getter("ground_proximity_maximum_sole_clearance_m", 0.020))
+    acquire = int(getter("source_proximity_acquire_frames", 2))
     measured = tuple(getter("last_measured_stance_contact", (False, False)))
+    proximity = tuple(getter("last_ground_proximity_contact", (False, False)))
     trusted = tuple(getter("last_trusted_landing_contact", (False, False)))
+    published = tuple(getter("last_published_locked_contact", (False, False)))
     title = f"{_DISPLAY_POSTPROCESSOR_POLICY} | {half_life:.2f}s half-life"
     body = (
         f"display postprocess {_DISPLAY_POSTPROCESSOR_POLICY} | "
         f"{half_life:.2f}s half-life | "
-        f"measured stance <= {speed:.2f} m/s, "
-        f"{1000.0 * clearance:.0f} mm, {acquire}f | "
-        "source labels continue/release trusted contacts only | "
+        f"acquire source + <= {1000.0 * clearance:.0f} mm proximity, "
+        f"{acquire}f, speed ignored | "
+        f"speed-qualified stance <= {speed:.2f} m/s | "
         f"measured L/R {int(bool(measured[0]))}/{int(bool(measured[1]))} | "
+        f"proximity L/R {int(bool(proximity[0]))}/{int(bool(proximity[1]))} | "
         f"trusted L/R {int(bool(trusted[0]))}/{int(bool(trusted[1]))} | "
-        "measured acquire/source continue/override/release "
-        f"{int(getter('measured_stance_acquisition_frame_count', 0))}/"
+        f"published lock L/R {int(bool(published[0]))}/{int(bool(published[1]))} | "
+        "acquire evidence/earned/source-only/proximity-only "
+        f"{int(getter('source_proximity_candidate_frame_count', 0))}/"
+        f"{int(getter('source_proximity_acquisition_frame_count', 0))}/"
+        f"{int(getter('source_without_proximity_frame_count', 0))}/"
+        f"{int(getter('proximity_without_source_frame_count', 0))} | "
+        "source continue/override/release "
         f"{int(getter('trusted_source_continuation_frame_count', 0))}/"
         f"{int(getter('trusted_source_override_frame_count', 0))}/"
         f"{int(getter('trusted_source_release_frame_count', 0))} | "
+        "pre-repair recover attempt/success/fail/post-reject "
+        f"{int(getter('trusted_pre_repair_recovery_attempt_count', 0))}/"
+        f"{int(getter('trusted_pre_repair_recovery_success_count', 0))}/"
+        f"{int(getter('trusted_pre_repair_recovery_failure_count', 0))}/"
+        f"{int(getter('trusted_pre_repair_recovery_post_reject_count', 0))} | "
         f"repair calls accepted {int(getter('pose_repair_count', 0))} | "
         "continuous active/releasing/idle "
         f"{int(getter('continuous_lock_active_frame_count', 0))}/"

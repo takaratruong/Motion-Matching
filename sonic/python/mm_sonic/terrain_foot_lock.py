@@ -1286,6 +1286,12 @@ class G1TerrainTransitionGuard:
         return self._landing_measured_contact
 
     @property
+    def ground_proximity_contact(self) -> tuple[bool, bool]:
+        """Return the last speed-independent measured support proximity."""
+
+        return self._landing_ground_proximity_contact
+
+    @property
     def trusted_landing_contact(self) -> tuple[bool, bool]:
         """Return the contact state currently authorized for locking."""
 
@@ -1303,7 +1309,12 @@ class G1TerrainTransitionGuard:
 
         return self._landing_filter_reason
 
-    def support_contact(self, pose: KinematicPose) -> np.ndarray:
+    def support_contact(
+        self,
+        pose: KinematicPose,
+        *,
+        maximum_sole_clearance_m: float | None = None,
+    ) -> np.ndarray:
         """Expose the measured support phase for entry matching."""
 
         method = getattr(self.foot_locker, "support_contact", None)
@@ -1311,7 +1322,14 @@ class G1TerrainTransitionGuard:
             raise ValueError(
                 "terrain transition foot locker cannot measure support"
             )
-        contact = np.asarray(method(pose))
+        contact = np.asarray(
+            method(pose)
+            if maximum_sole_clearance_m is None
+            else method(
+                pose,
+                maximum_sole_clearance_m=maximum_sole_clearance_m,
+            )
+        )
         if contact.shape != (2,) or contact.dtype.kind != "b":
             raise ValueError(
                 "foot locker support_contact must return two booleans"
@@ -1379,6 +1397,7 @@ class G1TerrainTransitionGuard:
         self._entry_contact = None
         self._landing_previous_pose: KinematicPose | None = None
         self._landing_measured_contact = (False, False)
+        self._landing_ground_proximity_contact = (False, False)
         self._landing_contact = (False, False)
         self._landing_touchdown_frames = [0, 0]
         self._landing_supported_feet = [False, False]
@@ -1435,6 +1454,10 @@ class G1TerrainTransitionGuard:
             bool(contact[0]),
             bool(contact[1]),
         )
+        self._landing_ground_proximity_contact = (
+            bool(contact[0]),
+            bool(contact[1]),
+        )
         seeded_contact = (
             np.zeros(2, dtype=bool)
             if defer_contact_acquisition
@@ -1476,18 +1499,124 @@ class G1TerrainTransitionGuard:
             getattr(seeded, "reason", "accepted")
         )
 
+    def _recover_trusted_pre_repair_contact(
+        self,
+        pose: KinematicPose,
+        source_contact: np.ndarray,
+        rejected_repair: object,
+    ) -> KinematicPose | None:
+        """Retry a rejected repair through an existing trusted foot target."""
+
+        continued = np.asarray(
+            [
+                self._landing_contact[foot] and bool(source_contact[foot])
+                for foot in range(2)
+            ],
+            dtype=bool,
+        )
+        rejected_reason = str(
+            getattr(rejected_repair, "reason", "pose repair rejected")
+        )
+        if not bool(np.any(continued)):
+            self._landing_filter_outcome = "repair-rejected"
+            self._landing_filter_reason = rejected_reason
+            return None
+
+        snapshot = self.foot_locker.snapshot_state()
+        locked = self.foot_locker.apply(
+            pose,
+            continued,
+            dt_s=self.dt_s,
+            minimum_swing_clearance_m=(
+                self.landing_minimum_swing_clearance_m
+            ),
+        )
+        self.last_foot_lock_result = locked
+        if not bool(getattr(locked, "accepted", False)):
+            self.foot_locker.restore_state(snapshot)
+            self._landing_filter_outcome = (
+                "pre-repair-recovery-lock-rejected"
+            )
+            self._landing_filter_reason = (
+                "trusted recovery lock rejected after pre-repair rejection: "
+                f"{rejected_reason}; "
+                f"{getattr(locked, 'reason', 'foot lock rejected')}"
+            )
+            return None
+        filtered = getattr(locked, "pose", None)
+        if not isinstance(filtered, KinematicPose):
+            self.foot_locker.restore_state(snapshot)
+            self._landing_filter_outcome = (
+                "pre-repair-recovery-lock-rejected"
+            )
+            self._landing_filter_reason = (
+                "trusted recovery foot locker returned an invalid pose"
+            )
+            return None
+
+        post = self.pose_repairer.repair(filtered)
+        self.last_pose_repair_result = post
+        if not bool(getattr(post, "accepted", False)):
+            self.foot_locker.restore_state(snapshot)
+            self._landing_filter_outcome = (
+                "pre-repair-recovery-post-repair-rejected"
+            )
+            self._landing_filter_reason = (
+                "trusted recovery post-lock repair rejected after "
+                "pre-repair rejection: "
+                f"{rejected_reason}; "
+                f"{getattr(post, 'reason', 'pose repair rejected')}"
+            )
+            return None
+        result = getattr(post, "pose", None)
+        if not isinstance(result, KinematicPose):
+            self.foot_locker.restore_state(snapshot)
+            self._landing_filter_outcome = (
+                "pre-repair-recovery-post-repair-rejected"
+            )
+            self._landing_filter_reason = (
+                "trusted recovery post-lock repair returned an invalid pose"
+            )
+            return None
+
+        # Commit guard state only after both existing utilities accept.  No
+        # measurement or source label can acquire a new foot in this path.
+        self._landing_previous_pose = pose
+        self._landing_contact = (
+            bool(continued[0]),
+            bool(continued[1]),
+        )
+        self._landing_touchdown_frames = [
+            self.landing_contact_acquire_frames if bool(value) else 0
+            for value in continued
+        ]
+        if any(bool(value) for value in getattr(locked, "locked", ())):
+            self._landing_filter_outcome = "pre-repair-recovery-active"
+        elif any(
+            bool(value) for value in getattr(locked, "releasing", ())
+        ):
+            self._landing_filter_outcome = "pre-repair-recovery-releasing"
+        else:
+            self._landing_filter_outcome = "pre-repair-recovery-idle"
+        self._landing_filter_reason = (
+            "recovered trusted contact after pre-repair rejection: "
+            f"{rejected_reason}"
+        )
+        return result
+
     def filter_landing(
         self,
         pose: KinematicPose,
         *,
         trusted_source_contact: object | None = None,
     ) -> KinematicPose | None:
-        """Apply measured-acquire stance lock during a flat landing bridge.
+        """Apply bounded stance locking during a flat landing bridge.
 
-        An optional trusted source label can continue or release a contact
-        that measured evidence already acquired.  It can never acquire an
-        untrusted foot.  Omitting it preserves the measured-only policy used
-        by the normal terrain-transition path.
+        With a trusted source label, an untrusted foot requires both source
+        contact and measured ground proximity for acquisition.  Existing
+        trusted contacts use source continuation/release.  Omitting the label
+        preserves the measured speed-and-support policy used by the normal
+        terrain-transition path.
         """
 
         if not isinstance(pose, KinematicPose):
@@ -1504,11 +1633,17 @@ class G1TerrainTransitionGuard:
         self.last_pose_repair_result = repair
         self.last_foot_lock_result = None
         if not bool(getattr(repair, "accepted", False)):
-            self._landing_filter_outcome = "repair-rejected"
-            self._landing_filter_reason = str(
-                getattr(repair, "reason", "pose repair rejected")
+            if source_contact is None:
+                self._landing_filter_outcome = "repair-rejected"
+                self._landing_filter_reason = str(
+                    getattr(repair, "reason", "pose repair rejected")
+                )
+                return None
+            return self._recover_trusted_pre_repair_contact(
+                pose,
+                source_contact,
+                repair,
             )
-            return None
         candidate = getattr(repair, "pose", None)
         if not isinstance(candidate, KinematicPose):
             raise ValueError("pose repairer returned an invalid pose")
@@ -1545,6 +1680,20 @@ class G1TerrainTransitionGuard:
             bool(raw_contact[0]),
             bool(raw_contact[1]),
         )
+        proximity_contact = (
+            raw_contact
+            if source_contact is None
+            else self.support_contact(
+                candidate,
+                maximum_sole_clearance_m=(
+                    self.landing_maximum_sole_clearance_m
+                ),
+            )
+        )
+        self._landing_ground_proximity_contact = (
+            bool(proximity_contact[0]),
+            bool(proximity_contact[1]),
+        )
         contact_values: list[bool] = [False, False]
         for foot in range(2):
             if self._landing_contact[foot]:
@@ -1558,7 +1707,11 @@ class G1TerrainTransitionGuard:
                     if contact_values[foot]
                     else 0
                 )
-            elif bool(raw_contact[foot]):
+            elif bool(
+                raw_contact[foot]
+                if source_contact is None
+                else source_contact[foot] and proximity_contact[foot]
+            ):
                 self._landing_touchdown_frames[foot] += 1
                 contact_values[foot] = (
                     self._landing_touchdown_frames[foot]

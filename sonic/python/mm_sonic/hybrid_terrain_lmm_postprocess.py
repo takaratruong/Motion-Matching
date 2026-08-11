@@ -16,7 +16,8 @@ from .terrain_pose_repair import G1TerrainPoseRepair
 
 
 _IDENTITY = (
-    "existing-pose-inertializer-repair-measured-acquire-source-continue-foot-lock/v5"
+    "existing-pose-inertializer-repair-"
+    "source-proximity-acquire-source-continue-foot-lock/v6"
 )
 
 
@@ -211,12 +212,22 @@ class ExistingUtilityPosePostprocessor:
         self.continuous_lock_idle_frame_count = 0
         self.continuous_lock_recovery_count = 0
         self.continuous_lock_bypass_count = 0
-        self.measured_stance_acquisition_frame_count = 0
+        self.source_proximity_candidate_frame_count = 0
+        self.source_proximity_acquisition_frame_count = 0
+        self.source_without_proximity_frame_count = 0
+        self.proximity_without_source_frame_count = 0
         self.trusted_source_continuation_frame_count = 0
         self.trusted_source_override_frame_count = 0
         self.trusted_source_release_frame_count = 0
+        self.trusted_pre_repair_recovery_attempt_count = 0
+        self.trusted_pre_repair_recovery_success_count = 0
+        self.trusted_pre_repair_recovery_failure_count = 0
+        self.trusted_pre_repair_recovery_lock_reject_count = 0
+        self.trusted_pre_repair_recovery_post_reject_count = 0
         self.last_measured_stance_contact = (False, False)
+        self.last_ground_proximity_contact = (False, False)
         self.last_trusted_landing_contact = (False, False)
+        self.last_published_locked_contact = (False, False)
         self.last_pose_repair_rejection: dict[str, float] | None = None
         self.last_reason = "reset"
 
@@ -309,10 +320,11 @@ class ExistingUtilityPosePostprocessor:
                 raw_target, elapsed_s=self._inertializer_elapsed_s
             )
         )
-        # Only measured evidence can acquire a display lock.  Once acquired,
-        # the authenticated corpus contact may continue or release that same
-        # foot across a motion-match transition, preserving its world-space
-        # stance target when the transition itself inflates measured speed.
+        # An untrusted foot needs both authenticated corpus contact and
+        # measured ground proximity for two displayed frames.  Speed is not
+        # an acquisition authority because a search splice can itself inflate
+        # finite-difference speed.  Once trusted, source continuation/release
+        # preserves the existing world-space stance target.
         if not self._continuous_lock_started:
             self.transition_guard.begin_landing(
                 candidate,
@@ -330,10 +342,25 @@ class ExistingUtilityPosePostprocessor:
         self.last_measured_stance_contact = (
             self.transition_guard.measured_stance_contact
         )
+        self.last_ground_proximity_contact = (
+            self.transition_guard.ground_proximity_contact
+        )
         self.last_trusted_landing_contact = (
             self.transition_guard.trusted_landing_contact
         )
         published_filtered_pose = displayed_pose is not None
+        self.last_published_locked_contact = (False, False)
+        if (
+            published_filtered_pose
+            and lock_result is not None
+            and bool(getattr(lock_result, "accepted", False))
+        ):
+            published_locked = tuple(getattr(lock_result, "locked", ()))
+            if len(published_locked) == 2:
+                self.last_published_locked_contact = (
+                    bool(published_locked[0]),
+                    bool(published_locked[1]),
+                )
         if displayed_pose is None:
             self.continuous_lock_bypass_count += 1
             if lock_result is not None:
@@ -344,6 +371,15 @@ class ExistingUtilityPosePostprocessor:
             # field and re-prime from a later advancing candidate.
             self.transition_guard.reset()
             self._continuous_lock_started = False
+            self.last_measured_stance_contact = (
+                self.transition_guard.measured_stance_contact
+            )
+            self.last_ground_proximity_contact = (
+                self.transition_guard.ground_proximity_contact
+            )
+            self.last_trusted_landing_contact = (
+                self.transition_guard.trusted_landing_contact
+            )
             displayed_pose = candidate
         elif lock_result is not None:
             if bool(getattr(lock_result, "accepted", False)):
@@ -362,9 +398,27 @@ class ExistingUtilityPosePostprocessor:
             }
         )
         if policy_applied:
+            candidate_evidence = tuple(
+                not prior_trusted_contact[foot]
+                and bool(contacts[foot])
+                and self.last_ground_proximity_contact[foot]
+                for foot in range(2)
+            )
             acquired = tuple(
                 not prior_trusted_contact[foot]
                 and self.last_trusted_landing_contact[foot]
+                for foot in range(2)
+            )
+            source_without_proximity = tuple(
+                not prior_trusted_contact[foot]
+                and bool(contacts[foot])
+                and not self.last_ground_proximity_contact[foot]
+                for foot in range(2)
+            )
+            proximity_without_source = tuple(
+                not prior_trusted_contact[foot]
+                and not bool(contacts[foot])
+                and self.last_ground_proximity_contact[foot]
                 for foot in range(2)
             )
             continued = tuple(
@@ -383,19 +437,54 @@ class ExistingUtilityPosePostprocessor:
                 and not self.last_trusted_landing_contact[foot]
                 for foot in range(2)
             )
-            self.measured_stance_acquisition_frame_count += int(any(acquired))
+            self.source_proximity_candidate_frame_count += int(
+                any(candidate_evidence)
+            )
+            self.source_proximity_acquisition_frame_count += int(any(acquired))
+            self.source_without_proximity_frame_count += int(
+                any(source_without_proximity)
+            )
+            self.proximity_without_source_frame_count += int(
+                any(proximity_without_source)
+            )
             self.trusted_source_continuation_frame_count += int(any(continued))
             self.trusted_source_override_frame_count += int(any(overridden))
             self.trusted_source_release_frame_count += int(any(released))
 
-        if outcome == "active":
+        successful_pre_repair_recovery = outcome in {
+            "pre-repair-recovery-active",
+            "pre-repair-recovery-releasing",
+            "pre-repair-recovery-idle",
+        }
+        failed_pre_repair_recovery = outcome in {
+            "pre-repair-recovery-lock-rejected",
+            "pre-repair-recovery-post-repair-rejected",
+        }
+        if successful_pre_repair_recovery or failed_pre_repair_recovery:
+            self.trusted_pre_repair_recovery_attempt_count += 1
+        if successful_pre_repair_recovery:
+            self.trusted_pre_repair_recovery_success_count += 1
+        elif failed_pre_repair_recovery:
+            self.trusted_pre_repair_recovery_failure_count += 1
+        if outcome == "pre-repair-recovery-lock-rejected":
+            self.trusted_pre_repair_recovery_lock_reject_count += 1
+        elif outcome == "pre-repair-recovery-post-repair-rejected":
+            self.trusted_pre_repair_recovery_post_reject_count += 1
+
+        if outcome in {"active", "pre-repair-recovery-active"}:
             self.continuous_lock_active_frame_count += 1
-        elif outcome in {"releasing", "release-after-reject"}:
+        elif outcome in {
+            "releasing",
+            "release-after-reject",
+            "pre-repair-recovery-releasing",
+        }:
             self.continuous_lock_releasing_frame_count += 1
-        elif outcome == "idle":
+        elif outcome in {"idle", "pre-repair-recovery-idle"}:
             self.continuous_lock_idle_frame_count += 1
-        if outcome == "release-after-reject":
+        if outcome == "release-after-reject" or successful_pre_repair_recovery:
             self.continuous_lock_recovery_count += 1
+            self.last_reason = outcome_reason
+        elif failed_pre_repair_recovery:
             self.last_reason = outcome_reason
         elif outcome == "bypass-after-double-reject":
             # A returned pose needs the explicit outcome count.  A rejected
@@ -426,17 +515,20 @@ class ExistingUtilityPosePostprocessor:
             "diagnostic_display_postprocessor": _IDENTITY,
             "inertialization_halflife_s": self.inertialization_halflife_s,
             "contact_policy": (
-                "measured-two-frame-acquire-authenticated-source-continue-release"
+                "authenticated-source-and-measured-ground-proximity-two-frame-"
+                "acquire-source-continue-release"
             ),
-            "source_contacts_used_for_acquisition": False,
+            "source_contacts_required_for_acquisition": True,
+            "measured_ground_proximity_required_for_acquisition": True,
+            "measured_speed_used_for_acquisition": False,
             "source_contacts_used_for_trusted_continuation": True,
             "measured_stance_maximum_foot_speed_mps": (
                 self.transition_guard.landing_maximum_foot_speed_mps
             ),
-            "measured_stance_maximum_sole_clearance_m": (
+            "ground_proximity_maximum_sole_clearance_m": (
                 self.transition_guard.landing_maximum_sole_clearance_m
             ),
-            "measured_stance_acquire_frames": (
+            "source_proximity_acquire_frames": (
                 self.transition_guard.landing_contact_acquire_frames
             ),
             "minimum_swing_clearance_m": (
@@ -459,8 +551,17 @@ class ExistingUtilityPosePostprocessor:
             "continuous_lock_idle_frame_count": (self.continuous_lock_idle_frame_count),
             "continuous_lock_recovery_count": (self.continuous_lock_recovery_count),
             "continuous_lock_bypass_count": (self.continuous_lock_bypass_count),
-            "measured_stance_acquisition_frame_count": (
-                self.measured_stance_acquisition_frame_count
+            "source_proximity_candidate_frame_count": (
+                self.source_proximity_candidate_frame_count
+            ),
+            "source_proximity_acquisition_frame_count": (
+                self.source_proximity_acquisition_frame_count
+            ),
+            "source_without_proximity_frame_count": (
+                self.source_without_proximity_frame_count
+            ),
+            "proximity_without_source_frame_count": (
+                self.proximity_without_source_frame_count
             ),
             "trusted_source_continuation_frame_count": (
                 self.trusted_source_continuation_frame_count
@@ -471,8 +572,29 @@ class ExistingUtilityPosePostprocessor:
             "trusted_source_release_frame_count": (
                 self.trusted_source_release_frame_count
             ),
+            "trusted_pre_repair_recovery_attempt_count": (
+                self.trusted_pre_repair_recovery_attempt_count
+            ),
+            "trusted_pre_repair_recovery_success_count": (
+                self.trusted_pre_repair_recovery_success_count
+            ),
+            "trusted_pre_repair_recovery_failure_count": (
+                self.trusted_pre_repair_recovery_failure_count
+            ),
+            "trusted_pre_repair_recovery_lock_reject_count": (
+                self.trusted_pre_repair_recovery_lock_reject_count
+            ),
+            "trusted_pre_repair_recovery_post_reject_count": (
+                self.trusted_pre_repair_recovery_post_reject_count
+            ),
             "last_measured_stance_contact": (self.last_measured_stance_contact),
+            "last_ground_proximity_contact": (
+                self.last_ground_proximity_contact
+            ),
             "last_trusted_landing_contact": (self.last_trusted_landing_contact),
+            "last_published_locked_contact": (
+                self.last_published_locked_contact
+            ),
             "last_pose_repair_rejection": (
                 None
                 if self.last_pose_repair_rejection is None
