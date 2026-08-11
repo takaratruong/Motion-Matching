@@ -956,6 +956,8 @@ def overlay_text(
     search_backend_identity: str | None = None,
     last_search_elapsed_ms: float | None = None,
     first_runtime_search_elapsed_ms: float | None = None,
+    diagnostic_mechanical_retained_searchable_row_count: int | None = None,
+    diagnostic_mechanical_clearance_bounds_m: tuple[float, float] | None = None,
 ) -> tuple[str, str]:
     terrain = np.asarray(state.terrain_features, dtype=np.float64).reshape(4)
     mode = "PAUSED" if paused else str(state.pose_source).upper()
@@ -975,12 +977,60 @@ def overlay_text(
     searched = int(getattr(state, "searchable_row_count", 0))
     total = int(getattr(state, "total_searchable_row_count", searched))
     exact = search_scope == "full-range-safe-corpus" and searched == total
-    authenticated_scene = scene_evidence_status == "authenticated-indexed"
-    search_text = (
-        f"full exact rows {searched}/{total}"
-        if exact
-        else f"diagnostic capped rows {searched}/{total}"
+    mechanical_scope = search_scope in (
+        "diagnostic-mechanically-filtered-corpus",
+        "diagnostic-mechanically-filtered-cap",
     )
+    mechanical_cap = search_scope == "diagnostic-mechanically-filtered-cap"
+    mechanical_retained_value = getattr(
+        state,
+        "diagnostic_mechanical_retained_searchable_row_count",
+        diagnostic_mechanical_retained_searchable_row_count,
+    )
+    mechanical_retained = (
+        int(mechanical_retained_value)
+        if mechanical_retained_value is not None
+        else (searched if mechanical_scope and not mechanical_cap else None)
+    )
+    authenticated_scene = scene_evidence_status == "authenticated-indexed"
+    if exact:
+        search_text = f"full exact rows {searched}/{total}"
+    elif mechanical_cap:
+        retained_label = (
+            "unknown" if mechanical_retained is None else mechanical_retained
+        )
+        search_text = f"diagnostic capped rows {searched}/{retained_label}"
+    elif mechanical_scope:
+        search_text = f"mechanically filtered rows {mechanical_retained}/{total}"
+    else:
+        search_text = f"diagnostic capped rows {searched}/{total}"
+    mechanical_fields = []
+    if mechanical_scope:
+        if mechanical_cap and mechanical_retained is not None:
+            mechanical_fields.append(
+                f"mechanically filtered rows {mechanical_retained}/{total}"
+            )
+        clearance_bounds = getattr(
+            state,
+            "diagnostic_mechanical_clearance_bounds_m",
+            diagnostic_mechanical_clearance_bounds_m,
+        )
+        if clearance_bounds is not None:
+            lower, upper = (float(value) for value in clearance_bounds)
+            mechanical_fields.append(f"clearance {lower:.3f}..{upper:.3f} m")
+        diagnostic_pose_rejections = getattr(
+            state, "diagnostic_pose_rejection_count", None
+        )
+        if diagnostic_pose_rejections is not None:
+            mechanical_fields.append(
+                f"diagnostic pose rejects {int(diagnostic_pose_rejections)}"
+            )
+        unsupported_holds = getattr(state, "unsupported_hold_count", None)
+        if unsupported_holds is not None:
+            mechanical_fields.append(f"unsupported holds {int(unsupported_holds)}")
+    mechanical_text = ""
+    if mechanical_fields:
+        mechanical_text = " | ".join(mechanical_fields) + "\n"
     diagnostic_backend = search_backend_identity not in (None, "cpu-ckdtree-exact")
     if diagnostic_backend:
         title = DIAGNOSTIC_LABEL
@@ -1016,6 +1066,7 @@ def overlay_text(
         f"support {state.support_status} | height {float(state.support_height):.3f} | {mode}\n"
         f"search {search_text} {family_counts} | transition penalty "
         f"{float(getattr(state, 'transition_penalty', 0.0)):.3f}\n"
+        f"{mechanical_text}"
         f"{backend_text}"
         f"scene evidence {scene_evidence_status}\n"
         "Up/Down speed | Left/Right steer | WASD aliases | Space stop | R reset | X/Esc exit"
@@ -2004,6 +2055,14 @@ def run_interactive(
                     ),
                     first_runtime_search_elapsed_ms=getattr(
                         matcher, "warm_search_elapsed_ms", None
+                    ),
+                    diagnostic_mechanical_retained_searchable_row_count=getattr(
+                        matcher,
+                        "diagnostic_mechanical_retained_searchable_row_count",
+                        None,
+                    ),
+                    diagnostic_mechanical_clearance_bounds_m=getattr(
+                        matcher, "diagnostic_mechanical_clearance_bounds_m", None
                     ),
                 )
                 title = label_resolver(

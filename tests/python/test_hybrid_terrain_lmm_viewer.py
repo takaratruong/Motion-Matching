@@ -1636,6 +1636,63 @@ class HybridTerrainViewerTests(unittest.TestCase):
         self.assertIn("DIAGNOSTIC", title)
         self.assertNotIn("EXACT SEARCH", title)
 
+    def test_overlay_distinguishes_complete_mechanical_view_from_cap(self):
+        state = SimpleNamespace(
+            family="slope",
+            range_index=12,
+            row=345,
+            search_distance=0.125,
+            terrain_features=(0.0, 0.1, 0.2, 0.3),
+            decode_count=91,
+            fallback_count=0,
+            joint_clamp_count=0,
+            diagnostic_pose_rejection_count=3,
+            unsupported_hold_count=4,
+            max_joint_clamp_magnitude=0.0,
+            candidate_limit_rejection_count=0,
+            first_candidate_limit_rejection_row=None,
+            max_candidate_limit_rejections_per_step=0,
+            support_height=0.18,
+            support_status="SUPPORTED",
+            pose_source="learned",
+            searchable_row_count=90,
+            searchable_family_counts=(("slope", 90),),
+            total_searchable_row_count=100,
+            search_scope="diagnostic-mechanically-filtered-corpus",
+            transition_penalty=0.1,
+        )
+        overlay_arguments = {
+            "paused": False,
+            "scene_evidence_status": "authenticated-indexed",
+            "generator_accepted": True,
+            "search_backend_identity": "cpu-ckdtree-mechanically-filtered-exact",
+            "diagnostic_mechanical_retained_searchable_row_count": 90,
+            "diagnostic_mechanical_clearance_bounds_m": (0.4, 1.2),
+        }
+
+        def render_overlay():
+            try:
+                return overlay_text(state, **overlay_arguments)
+            except TypeError as error:
+                self.fail(f"mechanical overlay metadata is unavailable: {error}")
+
+        title, body = render_overlay()
+
+        self.assertIn("DIAGNOSTIC", title)
+        self.assertNotIn("diagnostic capped rows", body)
+        self.assertIn("mechanically filtered rows 90/100", body)
+        self.assertIn("clearance 0.400..1.200 m", body)
+        self.assertIn("diagnostic pose rejects 3", body)
+        self.assertIn("unsupported holds 4", body)
+
+        state.search_scope = "diagnostic-mechanically-filtered-cap"
+        state.searchable_row_count = 25
+        title, body = render_overlay()
+
+        self.assertIn("DIAGNOSTIC", title)
+        self.assertIn("diagnostic capped rows 25/90", body)
+        self.assertIn("mechanically filtered rows 90/100", body)
+
     def test_generator_acceptance_requires_verified_all_row_refit(self):
         selection = SimpleNamespace(
             config=SimpleNamespace(fit_all_rows=False),
@@ -1764,6 +1821,8 @@ class HybridTerrainViewerTests(unittest.TestCase):
             search_backend_identity="single-gpu-full-row-fp32:cuda:5",
             last_search_elapsed_ms=7.25,
             warm_search_elapsed_ms=11.5,
+            diagnostic_mechanical_retained_searchable_row_count=5,
+            diagnostic_mechanical_clearance_bounds_m=(0.4, 1.2),
         )
         terrain = replace(
             load_scene_terrain("hills"),
@@ -1836,6 +1895,10 @@ class HybridTerrainViewerTests(unittest.TestCase):
             mock.patch.object(mujoco, "mj_forward"),
             mock.patch("mujoco.viewer.launch_passive", return_value=FakeViewer()),
             mock.patch(
+                "mm_sonic.hybrid_terrain_lmm_viewer.overlay_text",
+                wraps=viewer_module.overlay_text,
+            ) as rendered_overlay,
+            mock.patch(
                 "mm_sonic.hybrid_terrain_lmm_viewer._runtime_identity",
                 return_value=identity,
             ) as runtime_identity,
@@ -1851,6 +1914,18 @@ class HybridTerrainViewerTests(unittest.TestCase):
         runtime_identity.assert_called_once_with(matcher, terrain, DEFAULT_G1_XML)
         build_model.assert_called_once_with(
             DEFAULT_G1_XML, terrain, interactive_visuals=True
+        )
+        self.assertEqual(
+            rendered_overlay.call_args.kwargs.get(
+                "diagnostic_mechanical_retained_searchable_row_count"
+            ),
+            5,
+        )
+        self.assertEqual(
+            rendered_overlay.call_args.kwargs.get(
+                "diagnostic_mechanical_clearance_bounds_m"
+            ),
+            (0.4, 1.2),
         )
         scene_current.assert_called_once_with(matcher.corpus, terrain)
         self.assertNotIn("EXACT SEARCH", overlay_texts[0][0])
