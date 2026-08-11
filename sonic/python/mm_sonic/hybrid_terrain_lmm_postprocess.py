@@ -32,19 +32,11 @@ class NativeQposPoseAdapter:
             raise ValueError("model must have the native 36-qpos G1 layout")
         self._root_qpos_address = int(model.jnt_qposadr[int(free[0])])
         self._joint_ids = tuple(
-            int(
-                mujoco.mj_name2id(
-                    model, mujoco.mjtObj.mjOBJ_JOINT, joint_name
-                )
-            )
+            int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name))
             for joint_name in MUJOCO_JOINT_NAMES
         )
         self._body_ids = tuple(
-            int(
-                mujoco.mj_name2id(
-                    model, mujoco.mjtObj.mjOBJ_BODY, body_name
-                )
-            )
+            int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name))
             for body_name in BODY_NAMES
         )
         if any(index < 0 for index in (*self._joint_ids, *self._body_ids)):
@@ -107,14 +99,10 @@ class NativeQposPoseAdapter:
             )
             assert self._previous_body_position is not None
             assert self._previous_body_quaternion_wxyz is not None
-            body_linear_velocity = (
-                body_position - self._previous_body_position
-            ) / step
+            body_linear_velocity = (body_position - self._previous_body_position) / step
             body_angular_velocity = np.asarray(
                 angular_velocity_world_wxyz(
-                    np.stack(
-                        (self._previous_body_quaternion_wxyz, body_wxyz), axis=0
-                    ),
+                    np.stack((self._previous_body_quaternion_wxyz, body_wxyz), axis=0),
                     1.0 / step,
                 )[-1],
                 dtype=np.float64,
@@ -159,9 +147,7 @@ class ExistingUtilityPosePostprocessor:
         if not math.isfinite(rate) or rate <= 0.0:
             raise ValueError("fps must be finite and positive")
         if not math.isfinite(half) or half <= 0.0:
-            raise ValueError(
-                "inertialization_halflife_s must be finite and positive"
-            )
+            raise ValueError("inertialization_halflife_s must be finite and positive")
         if not callable(getattr(scene, "height_at_world_xy", None)):
             raise ValueError("scene must provide height_at_world_xy")
         self.model = model
@@ -277,9 +263,7 @@ class ExistingUtilityPosePostprocessor:
         if bool(getattr(repaired, "repaired", False)):
             self.pose_repair_count += 1
         snapshot = self.foot_locker.snapshot_state()
-        locked = self.foot_locker.apply(
-            repaired_pose, contacts, dt_s=step
-        )
+        locked = self.foot_locker.apply(repaired_pose, contacts, dt_s=step)
         if bool(locked.accepted):
             displayed_pose = locked.pose
             self.foot_lock_accept_count += 1

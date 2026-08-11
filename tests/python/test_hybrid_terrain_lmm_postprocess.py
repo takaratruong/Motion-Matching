@@ -54,9 +54,7 @@ def test_native_qpos_adapter_round_trips_native_g1_order_and_quaternion(model) -
 def test_native_qpos_adapter_derives_finite_velocities(model) -> None:
     adapter = NativeQposPoseAdapter(model)
     adapter.to_pose(_qpos(model, x=0.0), dt_s=1.0 / 60.0)
-    pose = adapter.to_pose(
-        _qpos(model, x=0.01, joint_offset=0.005), dt_s=1.0 / 60.0
-    )
+    pose = adapter.to_pose(_qpos(model, x=0.01, joint_offset=0.005), dt_s=1.0 / 60.0)
 
     assert pose.joint_velocity.shape == (29,)
     assert pose.body_linear_velocity_world.shape == (30, 3)
@@ -170,12 +168,8 @@ def test_switch_is_continuous_and_successor_and_neutral_ticks_decay(model) -> No
     )
 
     np.testing.assert_allclose(switched, displayed_a, atol=1.0e-6, rtol=0.0)
-    assert np.linalg.norm(neutral - target_c) < np.linalg.norm(
-        switched - target_b
-    )
-    assert np.linalg.norm(neutral - target_c) < np.linalg.norm(
-        successor - target_c
-    )
+    assert np.linalg.norm(neutral - target_c) < np.linalg.norm(switched - target_b)
+    assert np.linalg.norm(neutral - target_c) < np.linalg.norm(successor - target_c)
     np.testing.assert_array_equal(locker.calls[0][1], (False, True))
     np.testing.assert_array_equal(locker.calls[1][1], (True, False))
 
