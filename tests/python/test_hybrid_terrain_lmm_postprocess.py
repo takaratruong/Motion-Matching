@@ -220,45 +220,62 @@ def test_repair_fallback_bypasses_raw_failure_resets_lock_then_recovers(
     )
     target = _qpos(model, x=0.6, joint_offset=0.05)
     repairer.queue(False, reason="blend rejected")
-    repairer.queue(True, repaired=True)
-    fallback = processor.step(
+    bypassed = processor.step(
         target,
         row=20,
         range_index=3,
         source_contact=np.asarray((False, True)),
         dt_s=dt,
     )
-    np.testing.assert_allclose(fallback, target, atol=1.0e-6, rtol=0.0)
-    assert processor.pose_repair_count == 2
+    assert len(repairer.calls) == 2
+    rejected_candidate = repairer.calls[-1]
+    np.testing.assert_allclose(
+        bypassed,
+        build_qpos(
+            rejected_candidate.root_position_world,
+            rejected_candidate.root_orientation_world_xyzw,
+            rejected_candidate.joint_position,
+            model,
+        ),
+        atol=1.0e-7,
+        rtol=0.0,
+    )
+    assert processor.pose_repair_count == 1
+    assert processor.pose_repair_rejection_count == 1
+    assert processor.foot_lock_bypass_count == 1
+    assert len(locker.calls) == 1
+    assert locker.reset_calls == 2
     assert processor.identity()["last_reason"] == "blend rejected"
 
-    failed_target = _qpos(model, x=0.8, joint_offset=0.08)
-    repairer.queue(False, reason="blend bad")
-    repairer.queue(False, reason="raw bad")
-    bypassed = processor.step(
-        failed_target,
-        row=40,
-        range_index=4,
+    successor_target = _qpos(model, x=0.61, joint_offset=0.051)
+    repairer.queue(False, reason="successor rejected")
+    advanced = processor.step(
+        successor_target,
+        row=21,
+        range_index=3,
         source_contact=np.asarray((True, False)),
         dt_s=dt,
     )
-    assert np.all(np.isfinite(bypassed))
-    assert processor.raw_repair_failure_count == 1
-    assert processor.foot_lock_bypass_count == 1
-    assert processor.identity()["last_reason"] == "raw bad"
-    assert len(locker.calls) == 2
-    assert locker.reset_calls == 2
+    assert not np.array_equal(advanced, bypassed)
+    assert len(repairer.calls) == 3
+    assert processor.pose_repair_rejection_count == 2
+    assert processor.foot_lock_bypass_count == 2
+    assert len(locker.calls) == 1
+    assert locker.reset_calls == 3
+    assert processor.identity()["last_reason"] == "successor rejected"
 
     recovered_target = _qpos(model, x=0.85, joint_offset=0.09)
     recovered = processor.step(
         recovered_target,
-        row=41,
-        range_index=4,
+        row=22,
+        range_index=3,
         source_contact=np.asarray((True, False)),
         dt_s=dt,
     )
-    assert not np.array_equal(recovered, bypassed)
+    assert not np.array_equal(recovered, advanced)
     assert locker.calls[-1][1].tolist() == [True, False]
+    assert processor.pose_repair_count + processor.pose_repair_rejection_count == 4
+    assert processor.foot_lock_accept_count + processor.foot_lock_bypass_count == 4
 
 
 def test_successor_raw_repair_failure_publishes_source_without_duplicate_retry(
@@ -285,7 +302,7 @@ def test_successor_raw_repair_failure_publishes_source_without_duplicate_retry(
     assert not np.array_equal(bypassed, displayed)
     np.testing.assert_allclose(bypassed, source, atol=1.0e-6, rtol=0.0)
     assert len(repairer.calls) == 2
-    assert processor.raw_repair_failure_count == 1
+    assert processor.pose_repair_rejection_count == 1
 
 
 def test_initial_raw_repair_failure_bypasses_without_stall_then_recovers(model) -> None:
@@ -303,7 +320,8 @@ def test_initial_raw_repair_failure_bypasses_without_stall_then_recovers(model) 
 
     np.testing.assert_allclose(bypassed, initial, atol=1.0e-7, rtol=0.0)
     assert locker.calls == []
-    assert processor.raw_repair_failure_count == 1
+    assert processor.pose_repair_rejection_count == 1
+    assert processor.foot_lock_bypass_count == 1
     assert processor.identity()["last_reason"] == "initial raw rejected"
 
     recovered = processor.step(
@@ -338,8 +356,19 @@ def test_pose_repair_count_counts_every_accepted_repair_call(model) -> None:
         source_contact=np.asarray((False, False)),
         dt_s=1.0 / 60.0,
     )
+    assert processor.pose_repair_count == 1
+    assert processor.pose_repair_rejection_count == 1
+
+    processor.step(
+        _qpos(model, x=0.21),
+        row=11,
+        range_index=1,
+        source_contact=np.asarray((False, False)),
+        dt_s=1.0 / 60.0,
+    )
 
     assert processor.pose_repair_count == 2
+    assert processor.pose_repair_rejection_count == 1
 
 
 def test_real_existing_utilities_process_native_pose_on_nonflat_scene() -> None:
@@ -412,7 +441,7 @@ def test_real_existing_utilities_process_native_pose_on_nonflat_scene() -> None:
     assert np.isfinite(displayed).all()
     assert processor.pose_repair_count == 1
     assert processor.foot_lock_accept_count == 1
-    assert processor.raw_repair_failure_count == 0
+    assert processor.pose_repair_rejection_count == 0
 
 
 def test_reset_clears_temporal_state_and_diagnostics(model) -> None:
@@ -429,13 +458,13 @@ def test_reset_clears_temporal_state_and_diagnostics(model) -> None:
     identity = processor.identity()
     assert identity == {
         "diagnostic_display_postprocessor": (
-            "existing-pose-inertializer-repair-foot-lock/v1"
+            "existing-pose-inertializer-repair-foot-lock/v2"
         ),
         "inertialization_halflife_s": 0.10,
         "pose_repair_count": 0,
         "foot_lock_accept_count": 0,
         "foot_lock_bypass_count": 0,
-        "raw_repair_failure_count": 0,
+        "pose_repair_rejection_count": 0,
         "last_reason": "reset",
     }
     assert locker.reset_calls == 2

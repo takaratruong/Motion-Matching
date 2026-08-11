@@ -1624,13 +1624,13 @@ class HybridTerrainViewerTests(unittest.TestCase):
             scene_evidence_status="diagnostic-generated",
             display_postprocessor_identity={
                 "diagnostic_display_postprocessor": (
-                    "existing-pose-inertializer-repair-foot-lock/v1"
+                    "existing-pose-inertializer-repair-foot-lock/v2"
                 ),
                 "inertialization_halflife_s": 0.10,
                 "pose_repair_count": 7,
                 "foot_lock_accept_count": 5,
                 "foot_lock_bypass_count": 2,
-                "raw_repair_failure_count": 3,
+                "pose_repair_rejection_count": 3,
                 "last_reason": "raw source pose repair rejected",
             },
         )
@@ -1663,7 +1663,7 @@ class HybridTerrainViewerTests(unittest.TestCase):
             "0.10s half-life",
             "repair accepted 7",
             "lock accept/bypass 5/2",
-            "raw repair failures 3",
+            "repair rejected 3",
             "last reason raw source pose repair rejected",
         ):
             self.assertIn(value, body)
@@ -2053,13 +2053,13 @@ class HybridTerrainViewerTests(unittest.TestCase):
         terrain = load_scene_terrain("hills")
         postprocessor_identity = {
             "diagnostic_display_postprocessor": (
-                "existing-pose-inertializer-repair-foot-lock/v1"
+                "existing-pose-inertializer-repair-foot-lock/v2"
             ),
             "inertialization_halflife_s": 0.10,
             "pose_repair_count": 3,
             "foot_lock_accept_count": 2,
             "foot_lock_bypass_count": 1,
-            "raw_repair_failure_count": 4,
+            "pose_repair_rejection_count": 4,
             "last_reason": "lock rejected",
         }
         postprocessor = SimpleNamespace(
@@ -2185,7 +2185,7 @@ class HybridTerrainViewerTests(unittest.TestCase):
         self.assertIn("0.10s half-life", overlay_texts[0][0])
         self.assertIn("repair accepted 3", overlay_texts[0][1])
         self.assertIn("lock accept/bypass 2/1", overlay_texts[0][1])
-        self.assertIn("raw repair failures 4", overlay_texts[0][1])
+        self.assertIn("repair rejected 4", overlay_texts[0][1])
         self.assertIn("last reason lock rejected", overlay_texts[0][1])
 
     def test_failed_reset_returns_original_runtime_unchanged(self):

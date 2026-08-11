@@ -42,7 +42,7 @@ DIAGNOSTIC_TERRAIN_LABEL = (
 DIAGNOSTIC_MODEL_LABEL = (
     "HYBRID TERRAIN LMM POC (DIAGNOSTIC UNVERIFIED GENERATOR; NOT ACCEPTANCE EVIDENCE)"
 )
-_DISPLAY_POSTPROCESSOR_IDENTITY = "existing-pose-inertializer-repair-foot-lock/v1"
+_DISPLAY_POSTPROCESSOR_IDENTITY = "existing-pose-inertializer-repair-foot-lock/v2"
 _DISPLAY_POSTPROCESSOR_POLICY = (
     "PoseInertializer + G1TerrainPoseRepair + G1TerrainFootLock"
 )
@@ -1097,7 +1097,7 @@ def _display_postprocessor_overlay(identity: object | None) -> tuple[str, str]:
         "lock accept/bypass "
         f"{int(getter('foot_lock_accept_count', 0))}/"
         f"{int(getter('foot_lock_bypass_count', 0))} | "
-        f"raw repair failures {int(getter('raw_repair_failure_count', 0))} | "
+        f"repair rejected {int(getter('pose_repair_rejection_count', 0))} | "
         f"last reason {getter('last_reason', 'none')}\n"
     )
     return title, body

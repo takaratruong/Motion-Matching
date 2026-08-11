@@ -15,7 +15,7 @@ from .terrain_oracle.math3d import angular_velocity_world_wxyz
 from .terrain_pose_repair import G1TerrainPoseRepair
 
 
-_IDENTITY = "existing-pose-inertializer-repair-foot-lock/v1"
+_IDENTITY = "existing-pose-inertializer-repair-foot-lock/v2"
 
 
 class NativeQposPoseAdapter:
@@ -181,7 +181,7 @@ class ExistingUtilityPosePostprocessor:
         self.pose_repair_count = 0
         self.foot_lock_accept_count = 0
         self.foot_lock_bypass_count = 0
-        self.raw_repair_failure_count = 0
+        self.pose_repair_rejection_count = 0
         self.last_reason = "reset"
 
     @staticmethod
@@ -241,15 +241,8 @@ class ExistingUtilityPosePostprocessor:
             )
         )
         repaired = self.pose_repairer.repair(candidate)
-        if not bool(repaired.accepted) and used_inertializer:
-            self.last_reason = str(
-                getattr(repaired, "reason", "inertialized pose repair rejected")
-            )
-            self._inertializer = None
-            self._inertializer_elapsed_s = 0.0
-            repaired = self.pose_repairer.repair(raw_target)
         if not bool(repaired.accepted):
-            self.raw_repair_failure_count += 1
+            self.pose_repair_rejection_count += 1
             self.last_reason = str(
                 getattr(repaired, "reason", "raw source pose repair rejected")
             )
@@ -304,7 +297,7 @@ class ExistingUtilityPosePostprocessor:
             "pose_repair_count": self.pose_repair_count,
             "foot_lock_accept_count": self.foot_lock_accept_count,
             "foot_lock_bypass_count": self.foot_lock_bypass_count,
-            "raw_repair_failure_count": self.raw_repair_failure_count,
+            "pose_repair_rejection_count": self.pose_repair_rejection_count,
             "last_reason": self.last_reason,
         }
 
