@@ -15,12 +15,17 @@ import torch
 from resources import quat
 
 from .preliminary_learned_slope import decoded_pose_to_native_qpos
-from .torch_motion_matcher import MatcherConfig, bounded_velocity_step
+from .torch_motion_matcher import (
+    MatcherConfig,
+    bounded_velocity_step,
+    bounded_yaw_step,
+)
 
 FPS = 25.0
 DT = 1.0 / FPS
 SEARCH_INTERVAL_S = 0.1
 MAX_SPEED_MPS = 0.45
+STEERING_YAW_RATE_RAD_S = 1.5
 MAX_NATIVE_LIMIT_CANDIDATE_REJECTIONS = 32
 # Broad native-walking mechanical plausibility guards for the interactive
 # diagnostic.  They are not learned-pose quality scores or formal acceptance
@@ -796,6 +801,7 @@ class HybridMatcher:
             raise ValueError("initial root XY must be one finite native point")
         self._initial_root_xy = np.array(spawn_xy, copy=True)
         self._initial_heading = math.remainder(spawn_heading, 2.0 * math.pi)
+        self._desired_heading = self._initial_heading
         self._root_xy = np.array(self._initial_root_xy, copy=True)
         self._heading = self._initial_heading
         self._world_transform = SE2Transform(self._root_xy, self._heading)
@@ -863,9 +869,13 @@ class HybridMatcher:
     def controller_identity(self) -> str:
         """Return the command controller active for this matcher configuration."""
 
-        if self.diagnostic_stability and self.search_device is not None:
+        if self._holden_control_active:
             return "holden-bounded-velocity-v1"
         return "raw-command-v1"
+
+    @property
+    def _holden_control_active(self) -> bool:
+        return self.diagnostic_stability and self.search_device is not None
 
     @property
     def controller_acceleration_mps2(self) -> float:
@@ -939,12 +949,14 @@ class HybridMatcher:
             ),
             dtype=np.float64,
         )
+        world = self._world_transform
         local_yaw = math.remainder(
             source.yaw - self._active_source_root.yaw, 2.0 * math.pi
         )
-        self._set_world_transform(
-            compose_root_delta(self._world_transform, local_delta, local_yaw)
-        )
+        if self._holden_control_active:
+            world = SE2Transform(world.xy, self._desired_heading)
+            local_yaw = 0.0
+        self._set_world_transform(compose_root_delta(world, local_delta, local_yaw))
 
     def _normalize_terrain(self, raw: np.ndarray) -> np.ndarray:
         with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
@@ -1286,7 +1298,7 @@ class HybridMatcher:
         query = np.array(self.features[self.state.row], dtype=np.float64, copy=True)
         horizons = np.asarray(self.horizons, dtype=np.float64) / self.fps
         speed = command.speed * self.walking_speed_p95_mps
-        angular_speed = command.steering * 1.5
+        angular_speed = command.steering * STEERING_YAW_RATE_RAD_S
         future_yaw = angular_speed * horizons
         distance = speed * horizons
         trajectory = self._arc_local(distance, future_yaw).reshape(-1)
@@ -1325,7 +1337,7 @@ class HybridMatcher:
     def _preview_points(self, command: CommandState) -> np.ndarray:
         distances = np.asarray((0.25, 0.5, 0.75, 1.0), dtype=np.float64)
         speed = command.speed * self.walking_speed_p95_mps
-        angular_speed = command.steering * 1.5
+        angular_speed = command.steering * STEERING_YAW_RATE_RAD_S
         if abs(speed) < 1.0e-8:
             signed_distance = distances
             if self.walking_speed_p95_mps < 1.0e-8:
@@ -1336,7 +1348,10 @@ class HybridMatcher:
             signed_distance = math.copysign(1.0, speed) * distances
             future_yaw = angular_speed * distances / abs(speed)
         local = self._arc_local(signed_distance, future_yaw)
-        cosine, sine = math.cos(self._heading), math.sin(self._heading)
+        heading = (
+            self._desired_heading if self._holden_control_active else self._heading
+        )
+        cosine, sine = math.cos(heading), math.sin(heading)
         world = np.empty_like(local)
         world[:, 0] = self._root_xy[0] + cosine * local[:, 0] + sine * local[:, 1]
         world[:, 1] = self._root_xy[1] + sine * local[:, 0] - cosine * local[:, 1]
@@ -1736,6 +1751,10 @@ class HybridMatcher:
                 candidate_query[TERRAIN_INDICES] = self._normalize_terrain(
                     candidate_live_raw
                 )
+            elif self._holden_control_active:
+                self._set_world_transform(
+                    SE2Transform(baseline_world.xy, self._desired_heading)
+                )
             return (
                 candidate_query,
                 np.asarray(candidate_live_raw, dtype=np.float64),
@@ -1935,6 +1954,7 @@ class HybridMatcher:
             self.state,
             self._root_xy.copy(),
             self._heading,
+            self._desired_heading,
             self._elapsed_since_search,
             self._last_command,
             self._last_terrain_class,
@@ -1947,9 +1967,7 @@ class HybridMatcher:
                 self._shaped_velocity_local_xz[:] = 0.0
                 self._last_command = CommandState()
                 return self.state
-            gpu_diagnostic = (
-                self.diagnostic_stability and self.search_device is not None
-            )
+            gpu_diagnostic = self._holden_control_active
             effective_command = command
             if gpu_diagnostic:
                 config = self._controller_config
@@ -1978,6 +1996,20 @@ class HybridMatcher:
                     else float(shaped[1] / self.walking_speed_p95_mps)
                 )
                 effective_command = CommandState(effective_speed, command.steering)
+                current_heading = torch.tensor(
+                    self._desired_heading, dtype=torch.float64
+                )
+                target_heading = current_heading + (
+                    command.steering * STEERING_YAW_RATE_RAD_S * elapsed
+                )
+                self._desired_heading = float(
+                    bounded_yaw_step(
+                        current_heading,
+                        target_heading,
+                        config=config,
+                        dt=elapsed,
+                    ).item()
+                )
             effective_active = effective_command != CommandState()
             live = self._preview_terrain(effective_command)
             live_domain_supported = self._preview_domain_supported(effective_command)
@@ -2080,6 +2112,7 @@ class HybridMatcher:
                     _state,
                     root_xy,
                     self._heading,
+                    self._desired_heading,
                     self._elapsed_since_search,
                     self._last_command,
                     self._last_terrain_class,
@@ -2098,6 +2131,7 @@ class HybridMatcher:
                 self.state,
                 root_xy,
                 self._heading,
+                self._desired_heading,
                 self._elapsed_since_search,
                 self._last_command,
                 self._last_terrain_class,
@@ -2116,6 +2150,7 @@ class HybridMatcher:
             self.state,
             self._root_xy.copy(),
             self._heading,
+            self._desired_heading,
             self._elapsed_since_search,
             self._last_command,
             self._last_terrain_class,
@@ -2128,6 +2163,7 @@ class HybridMatcher:
             self._last_command = None
             self._last_terrain_class = None
             self._shaped_velocity_local_xz[:] = 0.0
+            self._desired_heading = self._initial_heading
             self._set_world_transform(
                 SE2Transform(self._initial_root_xy, self._initial_heading)
             )
@@ -2162,6 +2198,7 @@ class HybridMatcher:
                 self.state,
                 root_xy,
                 self._heading,
+                self._desired_heading,
                 self._elapsed_since_search,
                 self._last_command,
                 self._last_terrain_class,

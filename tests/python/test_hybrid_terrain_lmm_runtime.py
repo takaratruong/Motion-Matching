@@ -697,6 +697,159 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         matcher.reset()
         np.testing.assert_array_equal(matcher._shaped_velocity_local_xz, (0.0, 0.0))
 
+    def test_gpu_diagnostic_zero_steering_owns_heading_across_authored_yaw(self):
+        fake = _FakeSingleGpuSearch()
+        with mock.patch(
+            "mm_sonic.hybrid_terrain_lmm_gpu_search.SingleGpuExactSearch",
+            return_value=fake,
+        ):
+            matcher = HybridMatcher(
+                _mechanically_safe(_motion_corpus()),
+                _Generator(),
+                TerrainAuthority.flat(),
+                pose_converter=_pose_converter,
+                search_device="cuda:5",
+                diagnostic_stability=True,
+                initial_root_xy=(2.0, -3.0),
+                initial_heading=0.25,
+            )
+        compatible_rows = matcher.searchable_rows[matcher.searchable_rows < 4]
+        fake.responses.append(
+            _gpu_candidates(
+                compatible_rows,
+                candidate_count=len(compatible_rows),
+                close_candidate_count=len(compatible_rows),
+            )
+        )
+        command = CommandState(speed=1.0, steering=0.0)
+
+        searched = matcher.step(command, dt=0.01)
+        first = matcher.step(command, dt=0.01)
+        second = matcher.step(command, dt=0.01)
+
+        self.assertEqual((searched.row, first.row, second.row), (0, 1, 2))
+        self.assertAlmostEqual(searched.heading, 0.25)
+        self.assertAlmostEqual(first.heading, 0.25)
+        self.assertAlmostEqual(second.heading, 0.25)
+        expected_first = compose_root_delta(
+            SE2Transform(searched.root_position_world[:2], 0.25),
+            np.asarray((0.1, 0.0)),
+            0.0,
+        )
+        expected_second = compose_root_delta(
+            expected_first,
+            np.asarray((0.0, -0.2)),
+            0.0,
+        )
+        np.testing.assert_allclose(
+            first.root_position_world[:2], expected_first.xy, atol=1e-7
+        )
+        np.testing.assert_allclose(
+            second.root_position_world[:2], expected_second.xy, atol=1e-7
+        )
+
+    def test_gpu_diagnostic_steering_integrates_owned_heading_with_correct_sign(self):
+        for steering in (-0.5, 0.5):
+            with self.subTest(steering=steering):
+                fake = _FakeSingleGpuSearch()
+                with mock.patch(
+                    "mm_sonic.hybrid_terrain_lmm_gpu_search.SingleGpuExactSearch",
+                    return_value=fake,
+                ):
+                    matcher = HybridMatcher(
+                        _mechanically_safe(_corpus()),
+                        _Generator(),
+                        TerrainAuthority.flat(),
+                        pose_converter=_pose_converter,
+                        search_device="cuda:5",
+                        diagnostic_stability=True,
+                        initial_heading=0.25,
+                    )
+                fake.responses.append(
+                    _gpu_candidates(
+                        matcher.searchable_rows,
+                        candidate_count=len(matcher.searchable_rows),
+                        close_candidate_count=len(matcher.searchable_rows),
+                    )
+                )
+
+                state = matcher.step(
+                    CommandState(speed=1.0, steering=steering), dt=0.04
+                )
+
+                self.assertAlmostEqual(
+                    state.heading,
+                    0.25 + steering * 1.5 * 0.04,
+                    places=12,
+                )
+
+    def test_gpu_diagnostic_reset_and_reset_at_restore_owned_heading(self):
+        fake = _FakeSingleGpuSearch()
+        with mock.patch(
+            "mm_sonic.hybrid_terrain_lmm_gpu_search.SingleGpuExactSearch",
+            return_value=fake,
+        ):
+            matcher = HybridMatcher(
+                _mechanically_safe(_corpus()),
+                _Generator(),
+                TerrainAuthority.flat(),
+                pose_converter=_pose_converter,
+                search_device="cuda:5",
+                diagnostic_stability=True,
+                initial_heading=0.25,
+            )
+        fake.responses.extend(
+            _gpu_candidates(
+                matcher.searchable_rows,
+                candidate_count=len(matcher.searchable_rows),
+                close_candidate_count=len(matcher.searchable_rows),
+            )
+            for _ in range(2)
+        )
+        matcher.step(CommandState(1.0, 0.5), dt=0.04)
+
+        reset = matcher.reset()
+
+        self.assertAlmostEqual(matcher._desired_heading, 0.25)
+        self.assertAlmostEqual(reset.heading, 0.25)
+        matcher.step(CommandState(1.0, -0.5), dt=0.04)
+
+        reset_at = matcher.reset_at((2.0, -3.0), -1.25)
+
+        self.assertAlmostEqual(matcher._desired_heading, -1.25)
+        self.assertAlmostEqual(reset_at.heading, -1.25)
+
+    def test_gpu_diagnostic_exception_rolls_back_owned_heading(self):
+        fake = _FakeSingleGpuSearch()
+        with mock.patch(
+            "mm_sonic.hybrid_terrain_lmm_gpu_search.SingleGpuExactSearch",
+            return_value=fake,
+        ):
+            matcher = HybridMatcher(
+                _mechanically_safe(_corpus()),
+                _Generator(),
+                TerrainAuthority.flat(),
+                pose_converter=_pose_converter,
+                search_device="cuda:5",
+                diagnostic_stability=True,
+                initial_heading=0.25,
+            )
+        before_state = matcher.state
+        before_world = matcher._world_transform
+        before_heading = matcher._desired_heading
+
+        with (
+            mock.patch.object(
+                matcher, "_command_query", side_effect=RuntimeError("injected failure")
+            ),
+            self.assertRaisesRegex(RuntimeError, "injected failure"),
+        ):
+            matcher.step(CommandState(1.0, 0.5), dt=0.04)
+
+        self.assertIs(matcher.state, before_state)
+        self.assertIs(matcher._world_transform, before_world)
+        self.assertEqual(matcher._desired_heading, before_heading)
+
     def test_diagnostic_stability_filters_mechanically_unsafe_exact_winner(self):
         corpus = _mechanically_safe(_corpus())
         corpus.artifacts.positions[0, 1, 1] = 0.2
