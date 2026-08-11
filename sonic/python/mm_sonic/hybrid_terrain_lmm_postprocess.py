@@ -10,12 +10,25 @@ from .gear_action import mujoco_to_isaaclab_joint_vector
 from .hybrid_terrain_interactive import KinematicPose, PoseInertializer
 from .offline_corpus import BODY_NAMES
 from .render_terrain_transition_mesh import MUJOCO_JOINT_NAMES, build_qpos
-from .terrain_foot_lock import G1TerrainFootLock
+from .terrain_foot_lock import G1TerrainFootLock, G1TerrainTransitionGuard
 from .terrain_oracle.math3d import angular_velocity_world_wxyz
 from .terrain_pose_repair import G1TerrainPoseRepair
 
 
-_IDENTITY = "existing-pose-inertializer-repair-foot-lock/v2"
+_IDENTITY = "existing-pose-inertializer-repair-transition-guard/v3"
+
+
+class _ObservedPoseRepairer:
+    """Count every repair call made internally by the transition guard."""
+
+    def __init__(self, delegate: object, observer: object) -> None:
+        self.delegate = delegate
+        self.observer = observer
+
+    def repair(self, pose: KinematicPose) -> object:
+        result = self.delegate.repair(pose)
+        self.observer(result)
+        return result
 
 
 class NativeQposPoseAdapter:
@@ -165,13 +178,21 @@ class ExistingUtilityPosePostprocessor:
         self.foot_locker = (
             G1TerrainFootLock(model, scene) if foot_locker is None else foot_locker
         )
+        self.transition_guard = G1TerrainTransitionGuard(
+            _ObservedPoseRepairer(self.pose_repairer, self._record_pose_repair),
+            self.foot_locker,
+            contact_hold_frames=4,
+            track_source_contacts=False,
+            source_contact_delay_frames=4,
+            dt_s=1.0 / rate,
+        )
         self.reset()
 
     def reset(self) -> None:
         """Clear adapter, inertializer, displayed pose, and foot-lock state."""
 
         self.pose_adapter.reset()
-        self.foot_locker.reset()
+        self.transition_guard.reset()
         self._inertializer: PoseInertializer | None = None
         self._inertializer_elapsed_s = 0.0
         self._displayed_pose: KinematicPose | None = None
@@ -183,6 +204,13 @@ class ExistingUtilityPosePostprocessor:
         self.foot_lock_bypass_count = 0
         self.pose_repair_rejection_count = 0
         self.last_reason = "reset"
+
+    def _record_pose_repair(self, result: object) -> None:
+        if bool(getattr(result, "accepted", False)):
+            self.pose_repair_count += 1
+            return
+        self.pose_repair_rejection_count += 1
+        self.last_reason = str(getattr(result, "reason", "pose repair rejected"))
 
     @staticmethod
     def _index(value: object, name: str) -> int:
@@ -229,6 +257,7 @@ class ExistingUtilityPosePostprocessor:
                 halflife_s=self.inertialization_halflife_s,
             )
             self._inertializer_elapsed_s = 0.0
+            self.transition_guard.begin_entry()
         elif self._inertializer is not None:
             self._inertializer_elapsed_s += step
 
@@ -240,41 +269,37 @@ class ExistingUtilityPosePostprocessor:
                 raw_target, elapsed_s=self._inertializer_elapsed_s
             )
         )
-        repaired = self.pose_repairer.repair(candidate)
-        if not bool(repaired.accepted):
-            self.pose_repair_rejection_count += 1
-            self.last_reason = str(
-                getattr(repaired, "reason", "raw source pose repair rejected")
-            )
-            # Repair is an optional display correction.  A rejected correction
-            # must not freeze corpus playback: publish the inertialized source
-            # pose for this tick and reset any stale planted-foot anchors.
-            self.foot_locker.reset()
-            self.foot_lock_bypass_count += 1
-            displayed_qpos = build_qpos(
-                candidate.root_position_world,
-                candidate.root_orientation_world_xyzw,
-                candidate.joint_position,
-                self.model,
-            )
-            self._displayed_pose = candidate
-            self._displayed_qpos = displayed_qpos.copy()
-            self._previous_row = row_value
-            self._previous_range_index = range_value
-            return self._displayed_qpos.copy()
+        snapshot = self.transition_guard.snapshot_state()
+        displayed_pose = self.transition_guard(candidate, contacts)
+        repair_result = self.transition_guard.last_pose_repair_result
+        lock_result = self.transition_guard.last_foot_lock_result
+        if displayed_pose is None:
+            if lock_result is not None:
+                self.foot_lock_bypass_count += 1
+            if not bool(getattr(repair_result, "accepted", False)):
+                # Repair is an optional display correction. A rejected initial
+                # or post-lock repair must never freeze corpus playback.
+                self.transition_guard.reset()
+                displayed_pose = candidate
+            else:
+                # A first-frame entry lock rejection is transactional: retain
+                # the armed measured-support entry and publish the safe repair.
+                self.transition_guard.restore_state(snapshot)
+                displayed_pose = getattr(repair_result, "pose", None)
+                self.last_reason = str(
+                    getattr(lock_result, "reason", "foot lock rejected")
+                )
+        elif lock_result is not None:
+            if bool(getattr(lock_result, "accepted", False)):
+                self.foot_lock_accept_count += 1
+            else:
+                self.foot_lock_bypass_count += 1
+                self.last_reason = str(
+                    getattr(lock_result, "reason", "foot lock rejected")
+                )
 
-        repaired_pose = repaired.pose
-        self.pose_repair_count += 1
-        snapshot = self.foot_locker.snapshot_state()
-        locked = self.foot_locker.apply(repaired_pose, contacts, dt_s=step)
-        if bool(locked.accepted):
-            displayed_pose = locked.pose
-            self.foot_lock_accept_count += 1
-        else:
-            self.foot_locker.restore_state(snapshot)
-            displayed_pose = repaired_pose
-            self.foot_lock_bypass_count += 1
-            self.last_reason = str(getattr(locked, "reason", "foot lock rejected"))
+        if not isinstance(displayed_pose, KinematicPose):
+            raise ValueError("terrain transition guard returned an invalid pose")
 
         displayed_qpos = build_qpos(
             displayed_pose.root_position_world,
@@ -294,6 +319,12 @@ class ExistingUtilityPosePostprocessor:
         return {
             "diagnostic_display_postprocessor": _IDENTITY,
             "inertialization_halflife_s": self.inertialization_halflife_s,
+            "entry_contact_hold_frames": self.transition_guard.contact_hold_frames,
+            "track_source_contacts": self.transition_guard.track_source_contacts,
+            "source_contact_delay_frames": (
+                self.transition_guard.source_contact_delay_frames
+            ),
+            "transition_guard_dt_s": self.transition_guard.dt_s,
             "pose_repair_count": self.pose_repair_count,
             "foot_lock_accept_count": self.foot_lock_accept_count,
             "foot_lock_bypass_count": self.foot_lock_bypass_count,

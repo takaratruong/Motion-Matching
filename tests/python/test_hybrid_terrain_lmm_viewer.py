@@ -300,11 +300,89 @@ class HybridTerrainViewerTests(unittest.TestCase):
                 expected_type = (
                     mujoco.mjtGeom.mjGEOM_PLANE
                     if name == "flat"
-                    else mujoco.mjtGeom.mjGEOM_MESH
+                    else mujoco.mjtGeom.mjGEOM_HFIELD
                 )
                 self.assertEqual(
                     int(collision_model.geom_type[collision_geom]), int(expected_type)
                 )
+
+    def test_ramp_collision_contacts_match_authoritative_surface(self):
+        import mujoco
+
+        terrain = load_scene_terrain(
+            viewer_module.DEFAULT_TERRAIN_ROOT / "ramp-10-up-down"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            probe_xml = Path(temporary) / "sphere_probe.xml"
+            probe_xml.write_text(
+                """
+<mujoco model="terrain-sphere-probe">
+  <worldbody>
+    <geom name="floor" type="plane" size="0 0 0.05"/>
+    <body name="probe">
+      <freejoint/>
+      <geom name="probe" type="sphere" size="0.01" mass="0.001"
+            contype="1" conaffinity="1"/>
+    </body>
+  </worldbody>
+</mujoco>
+""".strip(),
+                encoding="utf-8",
+            )
+            model = viewer_module.build_diagnostic_collision_model(probe_xml, terrain)
+
+        terrain_geom = mujoco.mj_name2id(
+            model,
+            mujoco.mjtObj.mjOBJ_GEOM,
+            "terrain_hybrid_lmm_authoritative",
+        )
+        probe_geom = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "probe")
+        data = mujoco.MjData(model)
+
+        def probe_touches_terrain(x: float, y: float, center_z: float) -> bool:
+            data.qpos[:] = (x, y, center_z, 1.0, 0.0, 0.0, 0.0)
+            mujoco.mj_forward(model, data)
+            mujoco.mj_collision(model, data)
+            return any(
+                {int(data.contact[index].geom1), int(data.contact[index].geom2)}
+                == {terrain_geom, probe_geom}
+                for index in range(int(data.ncon))
+            )
+
+        def highest_contact_surface(x: float, y: float) -> float:
+            above = 0.7
+            self.assertFalse(probe_touches_terrain(x, y, above))
+            hit = None
+            for center_z in np.linspace(0.695, -0.2, 180):
+                if probe_touches_terrain(x, y, float(center_z)):
+                    hit = float(center_z)
+                    break
+                above = float(center_z)
+            self.assertIsNotNone(hit)
+            assert hit is not None
+            touching, clear = hit, above
+            for _ in range(45):
+                midpoint = 0.5 * (touching + clear)
+                if probe_touches_terrain(x, y, midpoint):
+                    touching = midpoint
+                else:
+                    clear = midpoint
+            return touching - 0.01
+
+        points = {
+            "flat": (0.0, 0.0),
+            "up-ramp": (0.0, -3.0),
+            "landing": (0.0, -5.0),
+            "down-ramp": (0.0, -7.0),
+            "off-strip": (0.7, -5.0),
+        }
+        for label, (x, y) in points.items():
+            with self.subTest(surface=label):
+                expected = terrain.authority.height_at(
+                    np.asarray((x, y), dtype=np.float64)
+                )
+                observed = highest_contact_surface(x, y)
+                self.assertAlmostEqual(observed, expected, delta=2.0e-4)
 
     def test_interactive_visuals_brighten_only_compiled_render_fields(self):
         import mujoco
@@ -1624,9 +1702,13 @@ class HybridTerrainViewerTests(unittest.TestCase):
             scene_evidence_status="diagnostic-generated",
             display_postprocessor_identity={
                 "diagnostic_display_postprocessor": (
-                    "existing-pose-inertializer-repair-foot-lock/v2"
+                    "existing-pose-inertializer-repair-transition-guard/v3"
                 ),
                 "inertialization_halflife_s": 0.10,
+                "entry_contact_hold_frames": 4,
+                "track_source_contacts": False,
+                "source_contact_delay_frames": 4,
+                "transition_guard_dt_s": 1.0 / 60.0,
                 "pose_repair_count": 7,
                 "foot_lock_accept_count": 5,
                 "foot_lock_bypass_count": 2,
@@ -1636,9 +1718,7 @@ class HybridTerrainViewerTests(unittest.TestCase):
         )
         self.assertIn("HYBRID TERRAIN LMM POC", title)
         self.assertNotIn("EXACT SEARCH", title)
-        self.assertIn(
-            "PoseInertializer + G1TerrainPoseRepair + G1TerrainFootLock", title
-        )
+        self.assertIn("PoseInertializer + G1TerrainTransitionGuard", title)
         for value in (
             "family slope",
             "range 12",
@@ -1659,11 +1739,13 @@ class HybridTerrainViewerTests(unittest.TestCase):
             "flat=125000",
             "slope=125000",
             "transition penalty 0.100",
-            "PoseInertializer + G1TerrainPoseRepair + G1TerrainFootLock",
+            "PoseInertializer + G1TerrainTransitionGuard",
             "0.10s half-life",
-            "repair accepted 7",
-            "lock accept/bypass 5/2",
+            "repair calls accepted 7",
+            "entry lock published/bypassed 5/2",
             "repair rejected 3",
+            "measured support hold 4f",
+            "source tracking off",
             "last reason raw source pose repair rejected",
         ):
             self.assertIn(value, body)
@@ -2053,9 +2135,13 @@ class HybridTerrainViewerTests(unittest.TestCase):
         terrain = load_scene_terrain("hills")
         postprocessor_identity = {
             "diagnostic_display_postprocessor": (
-                "existing-pose-inertializer-repair-foot-lock/v2"
+                "existing-pose-inertializer-repair-transition-guard/v3"
             ),
             "inertialization_halflife_s": 0.10,
+            "entry_contact_hold_frames": 4,
+            "track_source_contacts": False,
+            "source_contact_delay_frames": 4,
+            "transition_guard_dt_s": 1.0 / 60.0,
             "pose_repair_count": 3,
             "foot_lock_accept_count": 2,
             "foot_lock_bypass_count": 1,
@@ -2179,13 +2265,15 @@ class HybridTerrainViewerTests(unittest.TestCase):
         np.testing.assert_array_equal(data.qpos, state.qpos + 1.0)
         self.assertEqual(receipt["identity"]["pose_repair_count"], 3)
         self.assertIn(
-            "PoseInertializer + G1TerrainPoseRepair + G1TerrainFootLock",
+            "PoseInertializer + G1TerrainTransitionGuard",
             overlay_texts[0][0],
         )
         self.assertIn("0.10s half-life", overlay_texts[0][0])
-        self.assertIn("repair accepted 3", overlay_texts[0][1])
-        self.assertIn("lock accept/bypass 2/1", overlay_texts[0][1])
+        self.assertIn("repair calls accepted 3", overlay_texts[0][1])
+        self.assertIn("entry lock published/bypassed 2/1", overlay_texts[0][1])
         self.assertIn("repair rejected 4", overlay_texts[0][1])
+        self.assertIn("measured support hold 4f", overlay_texts[0][1])
+        self.assertIn("source tracking off", overlay_texts[0][1])
         self.assertIn("last reason lock rejected", overlay_texts[0][1])
 
     def test_failed_reset_returns_original_runtime_unchanged(self):

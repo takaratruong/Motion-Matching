@@ -318,6 +318,7 @@ class HybridMatcher:
         cache_manifest_path: str | Path | None = None,
         diagnostic_stability: bool = False,
         diagnostic_canonical_source_pose: bool = False,
+        diagnostic_row_mask: object | None = None,
     ) -> None:
         if type(diagnostic_stability) is not bool:
             raise TypeError("diagnostic stability must be a boolean")
@@ -327,6 +328,8 @@ class HybridMatcher:
             raise ValueError(
                 "diagnostic canonical source pose requires diagnostic stability"
             )
+        if diagnostic_row_mask is not None and not diagnostic_stability:
+            raise ValueError("diagnostic row mask requires diagnostic stability")
         self.diagnostic_stability = diagnostic_stability
         self.diagnostic_canonical_source_pose = diagnostic_canonical_source_pose
         physical_search_device: int | None = None
@@ -415,6 +418,26 @@ class HybridMatcher:
             or np.any(self.feature_scale <= 0.0)
         ):
             raise ValueError("hybrid feature normalization is invalid")
+        if diagnostic_row_mask is None:
+            self.diagnostic_row_mask: np.ndarray | None = None
+        else:
+            row_mask = np.asarray(diagnostic_row_mask)
+            if row_mask.shape != (len(self.features),):
+                raise ValueError(
+                    "diagnostic row mask must have one boolean value per corpus row"
+                )
+            if row_mask.dtype != np.dtype(bool):
+                raise ValueError("diagnostic row mask must be boolean")
+            self.diagnostic_row_mask = np.array(row_mask, dtype=bool, copy=True)
+            self.diagnostic_row_mask.setflags(write=False)
+        self.diagnostic_authorized_row_count: int | None = (
+            None
+            if self.diagnostic_row_mask is None
+            else int(np.count_nonzero(self.diagnostic_row_mask))
+        )
+        self.diagnostic_authorized_searchable_row_count: int | None = None
+        self.diagnostic_retained_row_count: int | None = None
+        self.diagnostic_retained_searchable_row_count: int | None = None
         if not self.diagnostic_stability:
             terrain_columns = self.features[:, TERRAIN_INDICES]
             self.terrain_feature_min = np.min(terrain_columns, axis=0).astype(
@@ -462,6 +485,13 @@ class HybridMatcher:
         if not safe:
             raise ValueError("hybrid corpus has no range-safe searchable rows")
         searchable = np.concatenate(safe)
+        if self.diagnostic_row_mask is not None:
+            self.diagnostic_authorized_searchable_row_count = int(
+                np.count_nonzero(self.diagnostic_row_mask[searchable])
+            )
+            searchable = searchable[self.diagnostic_row_mask[searchable]]
+            if not len(searchable):
+                raise ValueError("diagnostic row mask removed every searchable row")
         explicit_speed = getattr(corpus, "walking_speed_p95_mps", None)
         if explicit_speed is not None:
             walking_speed = _finite_scalar(explicit_speed, "corpus walking speed p95")
@@ -579,6 +609,15 @@ class HybridMatcher:
             self.diagnostic_mechanical_retained_searchable_row_count = int(
                 len(mechanically_searchable)
             )
+            if self.diagnostic_row_mask is not None:
+                self.diagnostic_retained_row_count = int(
+                    np.count_nonzero(
+                        self.diagnostic_row_mask & self._diagnostic_mechanical_safe_rows
+                    )
+                )
+                self.diagnostic_retained_searchable_row_count = int(
+                    len(mechanically_searchable)
+                )
             retained_terrain = self.features[mechanically_searchable, TERRAIN_INDICES]
             self.terrain_feature_min = np.min(retained_terrain, axis=0).astype(
                 np.float64
@@ -654,11 +693,18 @@ class HybridMatcher:
             self.searchable_rows, mechanically_searchable
         )
         if self.diagnostic_stability:
-            self.search_scope = (
-                "diagnostic-mechanically-filtered-corpus"
-                if retained_view_complete
-                else "diagnostic-mechanically-filtered-cap"
-            )
+            if self.diagnostic_row_mask is not None:
+                self.search_scope = (
+                    "diagnostic-authenticated-scene-filtered-corpus"
+                    if retained_view_complete
+                    else "diagnostic-authenticated-scene-filtered-cap"
+                )
+            else:
+                self.search_scope = (
+                    "diagnostic-mechanically-filtered-corpus"
+                    if retained_view_complete
+                    else "diagnostic-mechanically-filtered-cap"
+                )
         else:
             self.search_scope = (
                 "full-range-safe-corpus"
@@ -681,11 +727,14 @@ class HybridMatcher:
         self.last_search_elapsed_ms: float | None = None
         self.warm_search_elapsed_ms: float | None = None
         if physical_search_device is None:
-            self.search_backend_identity = (
-                "cpu-ckdtree-mechanically-filtered-exact"
-                if self.diagnostic_stability
-                else "cpu-ckdtree-exact"
-            )
+            if self.diagnostic_row_mask is not None:
+                self.search_backend_identity = (
+                    "cpu-ckdtree-authenticated-scene-filtered-exact"
+                )
+            elif self.diagnostic_stability:
+                self.search_backend_identity = "cpu-ckdtree-mechanically-filtered-exact"
+            else:
+                self.search_backend_identity = "cpu-ckdtree-exact"
             self._tree_values = np.asarray(self.features[searchable], dtype=np.float64)
             self._tree = cKDTree(
                 self._tree_values, compact_nodes=True, balanced_tree=True
@@ -708,11 +757,18 @@ class HybridMatcher:
             self._searchable_contact_counts = tuple(
                 int(value) for value in np.bincount(contact_codes, minlength=4)
             )
-            self.search_backend_identity = (
-                f"single-gpu-mechanically-filtered-fp32:{search_device}"
-                if self.diagnostic_stability
-                else f"single-gpu-full-row-fp32:{search_device}"
-            )
+            if self.diagnostic_row_mask is not None:
+                self.search_backend_identity = (
+                    f"single-gpu-authenticated-scene-filtered-fp32:{search_device}"
+                )
+            elif self.diagnostic_stability:
+                self.search_backend_identity = (
+                    f"single-gpu-mechanically-filtered-fp32:{search_device}"
+                )
+            else:
+                self.search_backend_identity = (
+                    f"single-gpu-full-row-fp32:{search_device}"
+                )
             self._gpu_search = SingleGpuExactSearch(
                 self.features,
                 self.searchable_rows,
@@ -1169,6 +1225,11 @@ class HybridMatcher:
         range_index = int(self.row_ranges[row])
         candidate = min(row + 1, int(self.range_stops[range_index]) - 1)
         if self.diagnostic_stability:
+            if (
+                self.diagnostic_row_mask is not None
+                and not self.diagnostic_row_mask[candidate]
+            ):
+                return row
             safe_rows = self._diagnostic_mechanical_safe_rows
             discontinuous = self._diagnostic_mechanical_discontinuous_successors
             if safe_rows is None or discontinuous is None:
@@ -1869,6 +1930,12 @@ class HybridMatcher:
                 and self._diagnostic_mechanical_discontinuous_successors is not None
                 and self._diagnostic_mechanical_discontinuous_successors[self.state.row]
             )
+            unauthorized_successor_boundary = (
+                self.diagnostic_stability
+                and self.diagnostic_row_mask is not None
+                and raw_successor != self.state.row
+                and not self.diagnostic_row_mask[raw_successor]
+            )
             periodic_search = (
                 not self.diagnostic_stability
                 and self._elapsed_since_search >= SEARCH_INTERVAL_S
@@ -1887,7 +1954,10 @@ class HybridMatcher:
             query = self._command_query(command, live)
             if discontinuous_successor_boundary:
                 boundary_exclusions = (self.state.row, raw_successor)
-            elif mechanically_unsafe_successor_boundary:
+            elif (
+                mechanically_unsafe_successor_boundary
+                or unauthorized_successor_boundary
+            ):
                 boundary_exclusions = (self.state.row,)
             else:
                 boundary_exclusions = ()
@@ -2150,6 +2220,14 @@ def run_headless_smoke(
         "total_safe_row_count": matcher.total_searchable_row_count,
         "searched_row_count": len(matcher.searchable_rows),
         "searchable_row_count": len(matcher.searchable_rows),
+        "diagnostic_authorized_row_count": matcher.diagnostic_authorized_row_count,
+        "diagnostic_authorized_searchable_row_count": (
+            matcher.diagnostic_authorized_searchable_row_count
+        ),
+        "diagnostic_retained_row_count": matcher.diagnostic_retained_row_count,
+        "diagnostic_retained_searchable_row_count": (
+            matcher.diagnostic_retained_searchable_row_count
+        ),
         "searchable_family_counts": dict(matcher.searchable_family_counts),
         "total_searchable_family_counts": dict(matcher.total_searchable_family_counts),
         "search_view_sha256": matcher.search_view_sha256,

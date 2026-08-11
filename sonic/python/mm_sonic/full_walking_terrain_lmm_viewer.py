@@ -23,6 +23,7 @@ from .full_walking_terrain_lmm_evaluation import (
 from .hybrid_terrain_lmm_runtime import CommandState, HybridMatcher
 from .hybrid_terrain_lmm_postprocess import ExistingUtilityPosePostprocessor
 from .hybrid_terrain_lmm_gpu_search import configure_single_gpu_visibility
+from .full_walking_terrain_lmm_inventory import load_inventory
 from .hybrid_terrain_lmm_viewer import (
     DEFAULT_G1_XML,
     _g1_xml_asset_identity,
@@ -440,10 +441,7 @@ def _full_runtime_label(
             if getattr(matcher, "diagnostic_canonical_source_pose", False)
             else ""
         )
-        pose_policy += (
-            "PoseInertializer + G1TerrainPoseRepair + G1TerrainFootLock; "
-            "0.10s half-life; "
-        )
+        pose_policy += "PoseInertializer + G1TerrainTransitionGuard; 0.10s half-life; "
         bounds = tuple(getattr(matcher, "diagnostic_mechanical_clearance_bounds_m", ()))
         retained = getattr(
             matcher,
@@ -692,6 +690,92 @@ def _canonical_source_identity(corpus: object, state: object) -> str:
     if range_ids.shape == (len(corpus.artifacts.positions),):
         return f"legacy-range-{int(range_ids[row])}"
     return f"legacy-row-{row}"
+
+
+_DIAGNOSTIC_SCENE_FAMILIES = {
+    "ramp-10-up-down": "slope",
+    "grail-curb-default": "curb",
+    "stairs-standard": "stair",
+    "flat-standard": "flat",
+}
+_PFNN_TERRAIN_SEMANTICS = frozenset(("flat", "rocky", "jumpy", "beam"))
+
+
+def _diagnostic_scene_row_mask(corpus: object, adapter: object) -> np.ndarray | None:
+    """Return the authenticated scene's diagnostic-only source eligibility mask."""
+
+    if (
+        not bool(getattr(adapter, "scene_authenticated", False))
+        or getattr(adapter, "scene_evidence_status", None) != "authenticated-indexed"
+    ):
+        return None
+    scene_id = getattr(adapter, "scene_id", None)
+    family_name = _DIAGNOSTIC_SCENE_FAMILIES.get(scene_id)
+    if family_name is None:
+        raise ValueError(f"scene family mapping is missing for {scene_id!r}")
+    corpus_family_names = getattr(corpus, "family_names", None)
+    if corpus_family_names is not None and tuple(corpus_family_names) != _TERRAINS:
+        raise ValueError("scene family mapping does not match corpus families")
+    family_ids = np.asarray(getattr(corpus, "family_ids", ()))
+    source_ids = np.asarray(getattr(corpus, "source_ids", ()))
+    source_names = tuple(str(value) for value in getattr(corpus, "source_names", ()))
+    if (
+        family_ids.shape != (len(source_ids),)
+        or source_ids.ndim != 1
+        or not len(source_ids)
+        or not np.issubdtype(family_ids.dtype, np.integer)
+        or not np.issubdtype(source_ids.dtype, np.integer)
+        or np.any(family_ids < 0)
+        or np.any(family_ids >= len(_TERRAINS))
+        or source_ids.min(initial=0) < 0
+        or source_ids.max(initial=-1) >= len(source_names)
+    ):
+        raise ValueError("scene family mapping corpus row metadata is invalid")
+    family_index = _TERRAINS.index(family_name)
+    if family_name != "flat":
+        mask = family_ids == family_index
+    else:
+        root = getattr(corpus, "root", None)
+        inventory_sha = getattr(corpus, "inventory_manifest_sha256", None)
+        if not isinstance(root, Path) or not isinstance(inventory_sha, str):
+            raise ValueError("flat scene inventory authority is unavailable")
+        inventory = load_inventory(
+            root / "inventory.json", expected_manifest_sha256=inventory_sha
+        )
+        records = tuple(inventory.sources)
+        inventory_names = tuple(sorted(str(record.source_id) for record in records))
+        if inventory_names != tuple(sorted(source_names)):
+            raise ValueError("flat scene inventory source mapping changed")
+        allowed_source_ids: set[str] = set()
+        for record in records:
+            authority = record.authority
+            kind = authority.get("kind") if isinstance(authority, Mapping) else None
+            if kind == "takara":
+                if record.family != "flat":
+                    raise ValueError("flat scene Takara family mapping changed")
+                allowed_source_ids.add(record.source_id)
+            elif kind == "pfnn":
+                semantics = (
+                    authority.get("terrain_semantics")
+                    if isinstance(authority, Mapping)
+                    else None
+                )
+                if semantics not in _PFNN_TERRAIN_SEMANTICS:
+                    raise ValueError("flat scene PFNN terrain semantics changed")
+                if semantics == "flat":
+                    if record.family != "flat":
+                        raise ValueError("flat scene PFNN family mapping changed")
+                    allowed_source_ids.add(record.source_id)
+        if not allowed_source_ids:
+            raise ValueError("flat scene inventory has no eligible sources")
+        mask = np.isin(
+            np.asarray(source_names, dtype=object)[source_ids],
+            tuple(sorted(allowed_source_ids)),
+        )
+    mask = np.asarray(mask, dtype=bool)
+    if mask.shape != family_ids.shape or not np.any(mask):
+        raise ValueError("scene family mapping authorized no corpus rows")
+    return mask
 
 
 class _MuJoCoRouteEvaluator:
@@ -989,6 +1073,18 @@ def _full_runtime_identity(
             "diagnostic_canonical_source_pose": bool(
                 getattr(matcher, "diagnostic_canonical_source_pose", False)
             ),
+            "diagnostic_authorized_row_count": getattr(
+                matcher, "diagnostic_authorized_row_count", None
+            ),
+            "diagnostic_authorized_searchable_row_count": getattr(
+                matcher, "diagnostic_authorized_searchable_row_count", None
+            ),
+            "diagnostic_retained_row_count": getattr(
+                matcher, "diagnostic_retained_row_count", None
+            ),
+            "diagnostic_retained_searchable_row_count": getattr(
+                matcher, "diagnostic_retained_searchable_row_count", None
+            ),
             "diagnostic_mechanical_clearance_bounds_m": list(
                 getattr(matcher, "diagnostic_mechanical_clearance_bounds_m", ())
             ),
@@ -1108,6 +1204,7 @@ def main(argv: list[str] | None = None) -> int:
 
         adapter = load_scene_terrain(arguments.scene, corpus=corpus)
         native_model = mujoco.MjModel.from_xml_path(str(arguments.g1_xml))
+        diagnostic_row_mask = _diagnostic_scene_row_mask(corpus, adapter)
         matcher = HybridMatcher(
             corpus,
             generator,
@@ -1118,6 +1215,7 @@ def main(argv: list[str] | None = None) -> int:
             initial_heading=adapter.spawn_heading,
             diagnostic_stability=True,
             diagnostic_canonical_source_pose=True,
+            diagnostic_row_mask=diagnostic_row_mask,
         )
 
         def display_postprocessor_factory(

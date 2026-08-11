@@ -385,6 +385,98 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         np.testing.assert_array_equal(matcher.terrain_feature_min, 0.0)
         np.testing.assert_array_equal(matcher.terrain_feature_max, 0.0)
 
+    def test_diagnostic_row_mask_excludes_wrong_family_before_search(self):
+        values = np.full((8, 31), 10.0, dtype=np.float32)
+        values[4] = 0.0
+        values[:, 27:31] = 0.0
+        corpus = _mechanically_safe(_corpus(values))
+        matcher = HybridMatcher(
+            corpus,
+            _Generator(),
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+            diagnostic_stability=True,
+            diagnostic_canonical_source_pose=True,
+            diagnostic_row_mask=np.asarray(
+                (True, True, True, True, False, False, False, False), dtype=bool
+            ),
+        )
+
+        state = matcher.select_query(values[4].astype(np.float64))
+
+        self.assertNotEqual(state.row, 4)
+        self.assertTrue(np.all(matcher.searchable_rows < 4))
+        self.assertEqual(matcher.diagnostic_authorized_row_count, 4)
+        self.assertEqual(matcher.diagnostic_retained_row_count, 4)
+        self.assertEqual(matcher.diagnostic_authorized_searchable_row_count, 3)
+        self.assertEqual(matcher.diagnostic_retained_searchable_row_count, 3)
+
+    def test_diagnostic_row_mask_requires_exact_boolean_corpus_mask(self):
+        corpus = _mechanically_safe(_corpus())
+
+        with self.assertRaisesRegex(ValueError, "diagnostic row mask requires"):
+            HybridMatcher(
+                corpus,
+                _Generator(),
+                TerrainAuthority.flat(),
+                pose_converter=_pose_converter,
+                diagnostic_row_mask=np.ones(8, dtype=bool),
+            )
+
+        with self.assertRaisesRegex(ValueError, "diagnostic row mask must have"):
+            HybridMatcher(
+                corpus,
+                _Generator(),
+                TerrainAuthority.flat(),
+                pose_converter=_pose_converter,
+                diagnostic_stability=True,
+                diagnostic_row_mask=np.ones(7, dtype=bool),
+            )
+
+    def test_diagnostic_row_mask_stops_successor_and_excludes_boundary_current_row(
+        self,
+    ):
+        corpus = _mechanically_safe(_corpus())
+        matcher = HybridMatcher(
+            corpus,
+            _Generator(),
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+            diagnostic_stability=True,
+            diagnostic_canonical_source_pose=True,
+            diagnostic_row_mask=np.asarray(
+                (True, False, True, False, False, False, False, False),
+                dtype=bool,
+            ),
+        )
+        self.assertEqual(matcher.state.row, 0)
+        self.assertEqual(matcher.successor(0), 0)
+
+        with mock.patch.object(matcher, "match", wraps=matcher.match) as searched:
+            state = matcher.step(CommandState(speed=1.0), dt=matcher.dt)
+
+        self.assertNotEqual(state.row, 0)
+        self.assertTrue(matcher.diagnostic_row_mask[state.row])
+        self.assertEqual(tuple(searched.call_args.kwargs["excluded_rows"]), (0,))
+
+    def test_diagnostic_row_mask_uses_authenticated_cpu_backend_identity(self):
+        matcher = HybridMatcher(
+            _mechanically_safe(_corpus()),
+            _Generator(),
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+            diagnostic_stability=True,
+            diagnostic_row_mask=np.asarray(
+                (True, False, True, False, True, False, True, False),
+                dtype=bool,
+            ),
+        )
+
+        self.assertEqual(
+            matcher.search_backend_identity,
+            "cpu-ckdtree-authenticated-scene-filtered-exact",
+        )
+
     def test_diagnostic_stability_requires_simulation_root_height_invariant(self):
         corpus = _corpus()
         corpus.artifacts.positions[:, 1, 1] = (
@@ -944,6 +1036,32 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         self.assertEqual(
             factory.call_args.kwargs["exclusion_budget"],
             matcher.candidate_retry_budget + 2,
+        )
+
+    def test_single_gpu_authenticated_scene_mask_backend_identity(self):
+        corpus = _mechanically_safe(_corpus())
+        fake = _FakeSingleGpuSearch()
+
+        with mock.patch(
+            "mm_sonic.hybrid_terrain_lmm_gpu_search.SingleGpuExactSearch",
+            return_value=fake,
+        ):
+            matcher = HybridMatcher(
+                corpus,
+                _Generator(),
+                TerrainAuthority.flat(),
+                pose_converter=_pose_converter,
+                search_device="cuda:5",
+                diagnostic_stability=True,
+                diagnostic_row_mask=np.asarray(
+                    (True, False, True, False, True, False, True, False),
+                    dtype=bool,
+                ),
+            )
+
+        self.assertEqual(
+            matcher.search_backend_identity,
+            "single-gpu-authenticated-scene-filtered-fp32:cuda:5",
         )
 
     def test_single_gpu_passes_current_contact_range_and_explicit_exclusions(self):

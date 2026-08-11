@@ -27,6 +27,113 @@ from mm_sonic.full_walking_terrain_lmm_viewer import (
 from mm_sonic.hybrid_terrain_lmm_viewer import _runtime_step_hz
 
 
+def _scene_inventory_records() -> tuple[SimpleNamespace, ...]:
+    return (
+        SimpleNamespace(
+            source_id="takara-source",
+            family="flat",
+            authority={"kind": "takara"},
+        ),
+        SimpleNamespace(
+            source_id="pfnn-flat",
+            family="flat",
+            authority={"kind": "pfnn", "terrain_semantics": "flat"},
+        ),
+        SimpleNamespace(
+            source_id="pfnn-rocky",
+            family="flat",
+            authority={"kind": "pfnn", "terrain_semantics": "rocky"},
+        ),
+        SimpleNamespace(
+            source_id="pfnn-jumpy",
+            family="flat",
+            authority={"kind": "pfnn", "terrain_semantics": "jumpy"},
+        ),
+        SimpleNamespace(
+            source_id="pfnn-beam",
+            family="flat",
+            authority={"kind": "pfnn", "terrain_semantics": "beam"},
+        ),
+        SimpleNamespace(
+            source_id="slope-source",
+            family="slope",
+            authority={"kind": "grail"},
+        ),
+        SimpleNamespace(
+            source_id="stair-source",
+            family="stair",
+            authority={"kind": "grail"},
+        ),
+    )
+
+
+def _scene_mask_corpus() -> SimpleNamespace:
+    return SimpleNamespace(
+        source_names=(
+            "takara-source",
+            "pfnn-flat",
+            "pfnn-rocky",
+            "pfnn-jumpy",
+            "pfnn-beam",
+            "slope-source",
+            "stair-source",
+        ),
+        source_ids=np.asarray((0, 1, 2, 3, 4, 5, 6), dtype=np.int32),
+        family_names=("flat", "curb", "slope", "stair"),
+        family_ids=np.asarray((0, 0, 0, 0, 0, 2, 3), dtype=np.uint8),
+    )
+
+
+def test_authenticated_scene_row_mask_maps_ramp_to_slope_family() -> None:
+    corpus = _scene_mask_corpus()
+    adapter = SimpleNamespace(
+        scene_id="ramp-10-up-down",
+        scene_authenticated=True,
+        scene_evidence_status="authenticated-indexed",
+    )
+
+    mask = viewer_module._diagnostic_scene_row_mask(corpus, adapter)
+
+    np.testing.assert_array_equal(
+        mask, [False, False, False, False, False, True, False]
+    )
+
+
+def test_authenticated_flat_scene_row_mask_keeps_takara_and_flat_pfnn_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    corpus = _scene_mask_corpus()
+    corpus.root = Path("corpus")
+    corpus.inventory_manifest_sha256 = "inventory-sha"
+    adapter = SimpleNamespace(
+        scene_id="flat-standard",
+        scene_authenticated=True,
+        scene_evidence_status="authenticated-indexed",
+    )
+    monkeypatch.setattr(
+        viewer_module,
+        "load_inventory",
+        lambda *_args, **_kwargs: SimpleNamespace(sources=_scene_inventory_records()),
+    )
+
+    mask = viewer_module._diagnostic_scene_row_mask(corpus, adapter)
+
+    np.testing.assert_array_equal(mask, [True, True, False, False, False, False, False])
+
+
+def test_authenticated_canonical_scene_mask_fails_closed_on_family_mismatch() -> None:
+    corpus = _scene_mask_corpus()
+    corpus.family_names = ("flat", "curb", "stairs")
+    adapter = SimpleNamespace(
+        scene_id="stairs-standard",
+        scene_authenticated=True,
+        scene_evidence_status="authenticated-indexed",
+    )
+
+    with pytest.raises(ValueError, match="scene family mapping"):
+        viewer_module._diagnostic_scene_row_mask(corpus, adapter)
+
+
 def _green_receipt() -> dict[str, object]:
     return {
         "route_command_authority_sha256": "a" * 64,
@@ -605,7 +712,9 @@ def test_formal_identity_requires_separate_exact_deterministic_rebuild_receipt(
 def test_full_view_passes_full_identity_and_visible_label_overrides(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    corpus = SimpleNamespace()
+    corpus = _scene_mask_corpus()
+    corpus.root = Path("corpus")
+    corpus.inventory_manifest_sha256 = "inventory-sha"
     generator = SimpleNamespace(
         manifest={"canonical_selection_accepted": True},
         config=SimpleNamespace(fit_all_rows=True),
@@ -617,6 +726,8 @@ def test_full_view_passes_full_identity_and_visible_label_overrides(
         spawn_native_xy=np.zeros(2),
         spawn_heading=0.0,
         scene_authenticated=True,
+        scene_id="ramp-10-up-down",
+        scene_evidence_status="authenticated-indexed",
     )
     matcher = SimpleNamespace(
         generator=generator,
@@ -642,6 +753,11 @@ def test_full_view_passes_full_identity_and_visible_label_overrides(
 
     monkeypatch.setattr(viewer_module, "_load_full_corpus", lambda _path: corpus)
     monkeypatch.setattr(viewer_module, "_load_generator", lambda *_args: generator)
+    monkeypatch.setattr(
+        viewer_module,
+        "load_inventory",
+        lambda *_args, **_kwargs: SimpleNamespace(sources=()),
+    )
     monkeypatch.setattr(
         viewer_module, "load_scene_terrain", lambda *_args, **_kwargs: adapter
     )
@@ -673,8 +789,12 @@ def test_full_view_passes_full_identity_and_visible_label_overrides(
     assert matcher_call["search_device"] is None
     assert matcher_call["diagnostic_stability"] is True
     assert matcher_call["diagnostic_canonical_source_pose"] is True
+    np.testing.assert_array_equal(
+        matcher_call["diagnostic_row_mask"],
+        [False, False, False, False, False, True, False],
+    )
     label = fake_run_interactive(matcher, adapter, **call)["label"]
-    assert "PoseInertializer + G1TerrainPoseRepair + G1TerrainFootLock" in label
+    assert "PoseInertializer + G1TerrainTransitionGuard" in label
     assert "0.10s half-life" in label
 
 
@@ -887,6 +1007,10 @@ def test_full_gpu_identity_and_label_remain_diagnostic(
         search_scope="full-range-safe-corpus",
         searchable_rows=np.arange(3),
         total_searchable_row_count=3,
+        diagnostic_authorized_row_count=7,
+        diagnostic_authorized_searchable_row_count=5,
+        diagnostic_retained_row_count=6,
+        diagnostic_retained_searchable_row_count=4,
     )
     terrain = SimpleNamespace(
         scene_id="ramp-10-up-down",
@@ -909,6 +1033,10 @@ def test_full_gpu_identity_and_label_remain_diagnostic(
     assert identity["search_backend_identity"] == ("single-gpu-full-row-fp32:cuda:5")
     assert identity["last_search_elapsed_ms"] == 7.25
     assert identity["first_runtime_search_elapsed_ms"] == 11.5
+    assert identity["diagnostic_authorized_row_count"] == 7
+    assert identity["diagnostic_authorized_searchable_row_count"] == 5
+    assert identity["diagnostic_retained_row_count"] == 6
+    assert identity["diagnostic_retained_searchable_row_count"] == 4
     assert "DIAGNOSTIC" in label
     assert "EXACT SEARCH" not in label
 
@@ -963,7 +1091,7 @@ def test_full_stability_label_reports_mechanical_filter_inventory(
     assert ("CANONICAL SOURCE POSES" in label) is canonical_source
     assert "LEG SEARCH" not in label
     assert "ARM SLEW" not in label
-    assert "PoseInertializer + G1TerrainPoseRepair + G1TerrainFootLock" in label
+    assert "PoseInertializer + G1TerrainTransitionGuard" in label
     assert "0.10s half-life" in label
     assert "NOT ACCEPTANCE EVIDENCE" in label
 

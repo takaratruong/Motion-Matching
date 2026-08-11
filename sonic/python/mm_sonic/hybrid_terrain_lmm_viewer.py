@@ -19,6 +19,7 @@ from pathlib import Path
 
 import numpy as np
 
+from . import scene as scene_module
 from .hybrid_terrain_lmm_runtime import (
     CommandState,
     HybridMatcher,
@@ -42,10 +43,10 @@ DIAGNOSTIC_TERRAIN_LABEL = (
 DIAGNOSTIC_MODEL_LABEL = (
     "HYBRID TERRAIN LMM POC (DIAGNOSTIC UNVERIFIED GENERATOR; NOT ACCEPTANCE EVIDENCE)"
 )
-_DISPLAY_POSTPROCESSOR_IDENTITY = "existing-pose-inertializer-repair-foot-lock/v2"
-_DISPLAY_POSTPROCESSOR_POLICY = (
-    "PoseInertializer + G1TerrainPoseRepair + G1TerrainFootLock"
+_DISPLAY_POSTPROCESSOR_IDENTITY = (
+    "existing-pose-inertializer-repair-transition-guard/v3"
 )
+_DISPLAY_POSTPROCESSOR_POLICY = "PoseInertializer + G1TerrainTransitionGuard"
 _FORMAL_ARTIFACT_AUTHORITIES = {
     "cache_manifest_sha256": (
         "084c168b473e730ec24419a49f4be1526226e5f95a2dd81ae4d367c729889cdb"
@@ -1089,12 +1090,16 @@ def _display_postprocessor_overlay(identity: object | None) -> tuple[str, str]:
     if getter("diagnostic_display_postprocessor") != _DISPLAY_POSTPROCESSOR_IDENTITY:
         return "", ""
     half_life = float(getter("inertialization_halflife_s"))
+    hold_frames = int(getter("entry_contact_hold_frames", 0))
+    source_tracking = "on" if bool(getter("track_source_contacts", False)) else "off"
     title = f"{_DISPLAY_POSTPROCESSOR_POLICY} | {half_life:.2f}s half-life"
     body = (
         f"display postprocess {_DISPLAY_POSTPROCESSOR_POLICY} | "
         f"{half_life:.2f}s half-life | "
-        f"repair accepted {int(getter('pose_repair_count', 0))} | "
-        "lock accept/bypass "
+        f"measured support hold {hold_frames}f | "
+        f"source tracking {source_tracking} | "
+        f"repair calls accepted {int(getter('pose_repair_count', 0))} | "
+        "entry lock published/bypassed "
         f"{int(getter('foot_lock_accept_count', 0))}/"
         f"{int(getter('foot_lock_bypass_count', 0))} | "
         f"repair rejected {int(getter('pose_repair_rejection_count', 0))} | "
@@ -1228,9 +1233,9 @@ def build_diagnostic_collision_model(g1_xml: Path, terrain: SceneTerrainAdapter)
 
     import mujoco
 
-    spec = mujoco.MjSpec.from_file(str(g1_xml))
     heights = np.asarray(terrain.source_heights, dtype=np.float64)
     if np.all(heights == heights.flat[0]):
+        spec = mujoco.MjSpec.from_file(str(g1_xml))
         spec.worldbody.add_geom(
             name="terrain_hybrid_lmm_authoritative",
             type=mujoco.mjtGeom.mjGEOM_PLANE,
@@ -1240,17 +1245,37 @@ def build_diagnostic_collision_model(g1_xml: Path, terrain: SceneTerrainAdapter)
             conaffinity=1,
         )
     else:
-        vertices, faces = terrain.native_mesh()
-        spec.add_mesh(
-            name="terrain_hybrid_lmm_authoritative_mesh",
-            uservert=vertices.ravel(),
-            userface=faces.ravel(),
-            inertia=mujoco.mjtMeshInertia.mjMESH_INERTIA_SHELL,
+        rows, columns = terrain.source_heights.shape
+        g1hf_contents = (
+            struct.pack(
+                "<4sIIIffff",
+                b"G1HF",
+                2,
+                columns,
+                rows,
+                terrain.origin_x,
+                terrain.origin_z,
+                terrain.cell_size_m,
+                terrain.exterior_height_m,
+            )
+            + np.ascontiguousarray(terrain.source_heights, dtype="<f4").tobytes()
+        )
+        hfield = scene_module._mujoco_heightfield(g1hf_contents)
+        asset_name = "terrain_hybrid_lmm_authoritative.hfield"
+        spec = mujoco.MjSpec.from_file(
+            str(g1_xml), assets={asset_name: hfield.file_bytes}
+        )
+        spec.add_hfield(
+            name="terrain_hybrid_lmm_authoritative_hfield",
+            file=asset_name,
+            size=hfield.size,
         )
         spec.worldbody.add_geom(
             name="terrain_hybrid_lmm_authoritative",
-            type=mujoco.mjtGeom.mjGEOM_MESH,
-            meshname="terrain_hybrid_lmm_authoritative_mesh",
+            type=mujoco.mjtGeom.mjGEOM_HFIELD,
+            hfieldname="terrain_hybrid_lmm_authoritative_hfield",
+            pos=hfield.position_mujoco,
+            quat=hfield.quaternion_mujoco_wxyz,
             contype=1,
             conaffinity=1,
         )

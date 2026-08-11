@@ -94,6 +94,8 @@ class _RecordingRepairer:
 class _RecordingFootLocker:
     def __init__(self) -> None:
         self.calls: list[tuple[KinematicPose, np.ndarray, float]] = []
+        self.support_calls: list[KinematicPose] = []
+        self.measured_support = np.asarray((False, True), dtype=bool)
         self.accepted: list[bool] = []
         self.reset_calls = 0
         self.restore_calls = 0
@@ -110,6 +112,10 @@ class _RecordingFootLocker:
         assert snapshot == ("snapshot", self._serial)
         self.restore_calls += 1
 
+    def support_contact(self, pose: KinematicPose) -> np.ndarray:
+        self.support_calls.append(pose)
+        return self.measured_support.copy()
+
     def apply(
         self, pose: KinematicPose, source_contact: object, *, dt_s: float
     ) -> object:
@@ -121,6 +127,8 @@ class _RecordingFootLocker:
             pose=pose,
             accepted=accepted,
             repaired=False,
+            locked=(bool(source_contact[0]), bool(source_contact[1])),
+            releasing=(False, False),
             reason="accepted" if accepted else "lock rejected",
         )
 
@@ -176,34 +184,120 @@ def test_switch_is_continuous_and_successor_and_neutral_ticks_decay(model) -> No
     np.testing.assert_allclose(switched, displayed_a, atol=1.0e-6, rtol=0.0)
     assert np.linalg.norm(neutral - target_c) < np.linalg.norm(switched - target_b)
     assert np.linalg.norm(neutral - target_c) < np.linalg.norm(successor - target_c)
-    np.testing.assert_array_equal(locker.calls[0][1], (False, True))
-    np.testing.assert_array_equal(locker.calls[1][1], (True, False))
+    assert len(locker.support_calls) == 1
+    assert len(locker.calls) == 3
+    for _pose, contact, _dt_s in locker.calls:
+        np.testing.assert_array_equal(contact, (False, True))
+
+
+def test_transition_guard_measures_support_then_releases_after_four_frames(
+    model,
+) -> None:
+    processor, _repairer, locker = _processor(model)
+    locker.measured_support = np.asarray((True, False), dtype=bool)
+    dt = 1.0 / 60.0
+
+    processor.step(
+        _qpos(model, x=0.0),
+        row=10,
+        range_index=1,
+        source_contact=np.asarray((False, True)),
+        dt_s=dt,
+    )
+    processor.step(
+        _qpos(model, x=0.01),
+        row=11,
+        range_index=1,
+        source_contact=np.asarray((False, True)),
+        dt_s=dt,
+    )
+    assert locker.calls == []
+
+    for row in range(20, 26):
+        processor.step(
+            _qpos(model, x=0.02 + 0.01 * (row - 20)),
+            row=row,
+            range_index=1,
+            source_contact=np.asarray((False, True)),
+            dt_s=dt,
+        )
+
+    assert len(locker.support_calls) == 1
+    assert len(locker.calls) == 5
+    for _pose, contact, _dt_s in locker.calls[:4]:
+        np.testing.assert_array_equal(contact, (True, False))
+    np.testing.assert_array_equal(locker.calls[4][1], (False, False))
+    assert processor.transition_guard.contact_hold_frames == 4
+    assert processor.transition_guard.source_contact_delay_frames == 4
+    assert processor.transition_guard.track_source_contacts is False
+    assert processor.transition_guard.dt_s == pytest.approx(dt)
+    assert processor.transition_guard.entry_lock_active is False
 
 
 def test_lock_rejection_restores_snapshot_and_publishes_repaired_source(model) -> None:
-    processor, _repairer, locker = _processor(model)
-    locker.accepted[:] = [True, False]
-    previous = processor.step(
+    processor, repairer, locker = _processor(model)
+    processor.step(
         _qpos(model, x=0.0),
         row=1,
         range_index=0,
         source_contact=np.asarray((True, False)),
         dt_s=1.0 / 60.0,
     )
+    locker.accepted[:] = [False]
     source = _qpos(model, x=0.05, joint_offset=0.01)
     rejected = processor.step(
         source,
-        row=2,
-        range_index=0,
+        row=20,
+        range_index=1,
         source_contact=np.asarray((False, True)),
         dt_s=1.0 / 60.0,
     )
 
     assert locker.restore_calls == 1
-    assert not np.array_equal(rejected, previous)
-    np.testing.assert_allclose(rejected, source, atol=1.0e-6, rtol=0.0)
+    repaired_candidate = repairer.calls[-1]
+    np.testing.assert_allclose(
+        rejected,
+        build_qpos(
+            repaired_candidate.root_position_world,
+            repaired_candidate.root_orientation_world_xyzw,
+            repaired_candidate.joint_position,
+            model,
+        ),
+        atol=1.0e-6,
+        rtol=0.0,
+    )
+    assert len(locker.calls) == 1
     assert processor.foot_lock_bypass_count == 1
     assert processor.identity()["last_reason"] == "lock rejected"
+
+
+def test_post_lock_repair_rejection_counts_one_real_lock_bypass(model) -> None:
+    processor, repairer, locker = _processor(model)
+    processor.step(
+        _qpos(model, x=0.0),
+        row=1,
+        range_index=0,
+        source_contact=np.asarray((True, False)),
+        dt_s=1.0 / 60.0,
+    )
+    repairer.queue(True)
+    repairer.queue(False, reason="post-lock repair rejected")
+
+    processor.step(
+        _qpos(model, x=0.5, joint_offset=0.05),
+        row=20,
+        range_index=1,
+        source_contact=np.asarray((False, True)),
+        dt_s=1.0 / 60.0,
+    )
+
+    assert len(locker.calls) == 1
+    assert processor.pose_repair_count == 2
+    assert processor.pose_repair_rejection_count == 1
+    assert processor.foot_lock_accept_count == 0
+    assert processor.foot_lock_bypass_count == 1
+    assert processor.transition_guard.entry_lock_active is False
+    assert processor.identity()["last_reason"] == "post-lock repair rejected"
 
 
 def test_repair_fallback_bypasses_raw_failure_resets_lock_then_recovers(
@@ -242,9 +336,9 @@ def test_repair_fallback_bypasses_raw_failure_resets_lock_then_recovers(
     )
     assert processor.pose_repair_count == 1
     assert processor.pose_repair_rejection_count == 1
-    assert processor.foot_lock_bypass_count == 1
-    assert len(locker.calls) == 1
-    assert locker.reset_calls == 2
+    assert processor.foot_lock_bypass_count == 0
+    assert len(locker.calls) == 0
+    assert processor.transition_guard.entry_lock_active is False
     assert processor.identity()["last_reason"] == "blend rejected"
 
     successor_target = _qpos(model, x=0.61, joint_offset=0.051)
@@ -259,9 +353,9 @@ def test_repair_fallback_bypasses_raw_failure_resets_lock_then_recovers(
     assert not np.array_equal(advanced, bypassed)
     assert len(repairer.calls) == 3
     assert processor.pose_repair_rejection_count == 2
-    assert processor.foot_lock_bypass_count == 2
-    assert len(locker.calls) == 1
-    assert locker.reset_calls == 3
+    assert processor.foot_lock_bypass_count == 0
+    assert len(locker.calls) == 0
+    assert processor.transition_guard.entry_lock_active is False
     assert processor.identity()["last_reason"] == "successor rejected"
 
     recovered_target = _qpos(model, x=0.85, joint_offset=0.09)
@@ -273,9 +367,11 @@ def test_repair_fallback_bypasses_raw_failure_resets_lock_then_recovers(
         dt_s=dt,
     )
     assert not np.array_equal(recovered, advanced)
-    assert locker.calls[-1][1].tolist() == [True, False]
-    assert processor.pose_repair_count + processor.pose_repair_rejection_count == 4
-    assert processor.foot_lock_accept_count + processor.foot_lock_bypass_count == 4
+    assert locker.calls == []
+    assert processor.pose_repair_count == 2
+    assert processor.pose_repair_rejection_count == 2
+    assert processor.foot_lock_accept_count == 0
+    assert processor.foot_lock_bypass_count == 0
 
 
 def test_successor_raw_repair_failure_publishes_source_without_duplicate_retry(
@@ -303,6 +399,7 @@ def test_successor_raw_repair_failure_publishes_source_without_duplicate_retry(
     np.testing.assert_allclose(bypassed, source, atol=1.0e-6, rtol=0.0)
     assert len(repairer.calls) == 2
     assert processor.pose_repair_rejection_count == 1
+    assert processor.foot_lock_bypass_count == 0
 
 
 def test_initial_raw_repair_failure_bypasses_without_stall_then_recovers(model) -> None:
@@ -321,7 +418,7 @@ def test_initial_raw_repair_failure_bypasses_without_stall_then_recovers(model) 
     np.testing.assert_allclose(bypassed, initial, atol=1.0e-7, rtol=0.0)
     assert locker.calls == []
     assert processor.pose_repair_rejection_count == 1
-    assert processor.foot_lock_bypass_count == 1
+    assert processor.foot_lock_bypass_count == 0
     assert processor.identity()["last_reason"] == "initial raw rejected"
 
     recovered = processor.step(
@@ -334,7 +431,8 @@ def test_initial_raw_repair_failure_bypasses_without_stall_then_recovers(model) 
 
     assert not np.array_equal(recovered, bypassed)
     assert processor.pose_repair_count == 1
-    assert processor.foot_lock_accept_count == 1
+    assert processor.foot_lock_accept_count == 0
+    assert locker.calls == []
 
 
 def test_pose_repair_count_counts_every_accepted_repair_call(model) -> None:
@@ -440,7 +538,7 @@ def test_real_existing_utilities_process_native_pose_on_nonflat_scene() -> None:
     assert displayed.shape == (36,)
     assert np.isfinite(displayed).all()
     assert processor.pose_repair_count == 1
-    assert processor.foot_lock_accept_count == 1
+    assert processor.foot_lock_accept_count == 0
     assert processor.pose_repair_rejection_count == 0
 
 
@@ -458,13 +556,17 @@ def test_reset_clears_temporal_state_and_diagnostics(model) -> None:
     identity = processor.identity()
     assert identity == {
         "diagnostic_display_postprocessor": (
-            "existing-pose-inertializer-repair-foot-lock/v2"
+            "existing-pose-inertializer-repair-transition-guard/v3"
         ),
         "inertialization_halflife_s": 0.10,
+        "entry_contact_hold_frames": 4,
+        "track_source_contacts": False,
+        "source_contact_delay_frames": 4,
+        "transition_guard_dt_s": 1.0 / 60.0,
         "pose_repair_count": 0,
         "foot_lock_accept_count": 0,
         "foot_lock_bypass_count": 0,
         "pose_repair_rejection_count": 0,
         "last_reason": "reset",
     }
-    assert locker.reset_calls == 2
+    assert locker.reset_calls == 3
