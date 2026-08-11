@@ -514,6 +514,24 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         self.assertEqual(call["active_contact_code"], 1)
         np.testing.assert_array_equal(call["excluded_rows"], (4,))
 
+    def test_single_gpu_rejects_capped_search_before_backend_construction(self):
+        with (
+            mock.patch(
+                "mm_sonic.hybrid_terrain_lmm_gpu_search.SingleGpuExactSearch"
+            ) as factory,
+            self.assertRaisesRegex(ValueError, "full-range-safe"),
+        ):
+            HybridMatcher(
+                _corpus(),
+                _Generator(),
+                TerrainAuthority.flat(),
+                pose_converter=_pose_converter,
+                max_search_rows=2,
+                search_device="cuda:5",
+            )
+
+        factory.assert_not_called()
+
     def test_single_gpu_rescores_complete_top128_and_preserves_stable_ties(self):
         values = np.ones((130, 31), dtype=np.float32)
         values[2] = np.float32(0.25)

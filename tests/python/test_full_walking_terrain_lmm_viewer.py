@@ -89,6 +89,10 @@ def _green_receipt() -> dict[str, object]:
             "refit_receipt_current": True,
             "determinism_receipt_current": True,
             "full_search": True,
+            "search_backend_identities": {
+                scene: "cpu-ckdtree-exact" for scene in FORMAL_SCENE_IDS
+            },
+            "cpu_search_backend_only": True,
             "motion_root_ownership": True,
             "supported_speed_envelope_current": True,
             "retry_budget": 32,
@@ -231,6 +235,28 @@ def _green_receipt() -> dict[str, object]:
 
 def test_formal_acceptance_is_green_only_for_full_safe_evidence() -> None:
     assert acceptance_failures(_green_receipt()) == []
+
+
+def test_formal_acceptance_rejects_programmatic_gpu_candidate() -> None:
+    mutations = (
+        (
+            {scene: "single-gpu-full-row-fp32:cuda:5" for scene in FORMAL_SCENE_IDS},
+            True,
+        ),
+        (
+            {scene: "cpu-ckdtree-exact" for scene in FORMAL_SCENE_IDS},
+            False,
+        ),
+        ({"flat-standard": "cpu-ckdtree-exact"}, True),
+    )
+    for backend_identities, cpu_only in mutations:
+        receipt = _green_receipt()
+        receipt["formal_identity"]["search_backend_identities"] = (  # type: ignore[index]
+            backend_identities
+        )
+        receipt["formal_identity"]["cpu_search_backend_only"] = cpu_only  # type: ignore[index]
+
+        assert "cpu-exact-search-backend-required" in acceptance_failures(receipt)
 
 
 def test_formal_acceptance_rejects_every_provenance_and_runtime_shortcut() -> None:
@@ -463,6 +489,15 @@ def test_formal_identity_reads_authenticated_task4_corpus_manifest(
         horizons=(20, 40, 60),
         source_names=source_names,
     )
+    matcher = SimpleNamespace(
+        search_scope="full-range-safe-corpus",
+        searchable_rows=np.arange(3),
+        total_searchable_row_count=3,
+        search_backend_identity="cpu-ckdtree-exact",
+        state=SimpleNamespace(root_motion_source="canonical-simulation-se2"),
+        walking_speed_p95_mps=1.0,
+        candidate_retry_budget=32,
+    )
     evaluator = SimpleNamespace(
         corpus=corpus,
         generator=SimpleNamespace(
@@ -471,7 +506,7 @@ def test_formal_identity_reads_authenticated_task4_corpus_manifest(
                 "corpus_manifest_sha256": corpus.manifest_sha256,
             }
         ),
-        matchers={},
+        matchers={"flat-standard": matcher},
         adapters={},
     )
     g1_xml = tmp_path / "g1.xml"
@@ -492,6 +527,17 @@ def test_formal_identity_reads_authenticated_task4_corpus_manifest(
     assert identity["corpus_eligible_row_count"] == 9_758_524
     assert identity["corpus_manifest_authority_current"] is True
     assert identity["determinism_receipt_current"] is False
+    assert identity["search_backend_identities"] == {
+        "flat-standard": "cpu-ckdtree-exact"
+    }
+    assert identity["cpu_search_backend_only"] is True
+
+    matcher.search_backend_identity = "single-gpu-full-row-fp32:cuda:5"
+    gpu_identity = _formal_identity(evaluator, scenes=(), g1_xml=g1_xml)
+    assert gpu_identity["search_backend_identities"] == {
+        "flat-standard": "single-gpu-full-row-fp32:cuda:5"
+    }
+    assert gpu_identity["cpu_search_backend_only"] is False
 
 
 def test_formal_identity_requires_separate_exact_deterministic_rebuild_receipt(

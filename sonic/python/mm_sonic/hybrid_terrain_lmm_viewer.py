@@ -122,6 +122,18 @@ DEFAULT_G1_XML = Path(
 class KeyboardCommandSource:
     """Thread-safe keyboard levels with edge-triggered reset."""
 
+    _LOGICAL_KEYS = {
+        "w": "w",
+        "a": "a",
+        "s": "s",
+        "d": "d",
+        " ": " ",
+        "arrow-up": "w",
+        "arrow-down": "s",
+        "arrow-left": "a",
+        "arrow-right": "d",
+    }
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._pressed: set[str] = set()
@@ -136,9 +148,10 @@ class KeyboardCommandSource:
     def press(self, character: str | None = None, *, escape: bool = False) -> None:
         value = self._key(character)
         with self._lock:
-            if value in {"w", "a", "s", "d", " "}:
+            newly_pressed = value not in self._pressed
+            if value in self._LOGICAL_KEYS or value == "r":
                 self._pressed.add(value)
-            if value == "r":
+            if value == "r" and newly_pressed:
                 self._reset = True
             if value in {"x", "q"} or escape:
                 self._stopped = True
@@ -150,7 +163,12 @@ class KeyboardCommandSource:
 
     def snapshot(self) -> tuple[CommandState, bool, bool]:
         with self._lock:
-            command = CommandState.from_keyboard(self._pressed)
+            logical_pressed = {
+                self._LOGICAL_KEYS[value]
+                for value in self._pressed
+                if value in self._LOGICAL_KEYS
+            }
+            command = CommandState.from_keyboard(logical_pressed)
             reset = self._reset
             self._reset = False
             return command, reset, self._stopped
@@ -177,13 +195,17 @@ def _select_control_command(
 
 
 def _keyboard_command_token(key: object, keyboard_module: object) -> str | None:
-    arrows = {
-        keyboard_module.Key.up: "w",
-        keyboard_module.Key.down: "s",
-        keyboard_module.Key.left: "a",
-        keyboard_module.Key.right: "d",
-    }
-    return arrows.get(key, getattr(key, "char", None))
+    specials = (
+        (getattr(keyboard_module.Key, "up", None), "arrow-up"),
+        (getattr(keyboard_module.Key, "down", None), "arrow-down"),
+        (getattr(keyboard_module.Key, "left", None), "arrow-left"),
+        (getattr(keyboard_module.Key, "right", None), "arrow-right"),
+        (getattr(keyboard_module.Key, "space", None), " "),
+    )
+    for special, token in specials:
+        if special is not None and key == special:
+            return token
+    return getattr(key, "char", None)
 
 
 def handle_key_press(
@@ -1677,6 +1699,10 @@ def run_mujoco_headless_smoke(
         and authority_pre.get("searched_row_count")
         == authority_pre.get("total_safe_row_count")
     )
+    cpu_search_backend_only = (
+        authority_pre.get("search_backend_identity") == "cpu-ckdtree-exact"
+        and authority_post.get("search_backend_identity") == "cpu-ckdtree-exact"
+    )
     transition_penalty_exact = (
         authority_pre.get("transition_penalty") == 0.1
         and authority_post.get("transition_penalty") == 0.1
@@ -1710,6 +1736,7 @@ def run_mujoco_headless_smoke(
             "exact-feature-retrieval-required",
         ),
         (full_search, "full-search-required"),
+        (cpu_search_backend_only, "cpu-exact-search-backend-required"),
         (strict_combined_corpus, "strict-combined-corpus-required"),
         (
             formal_artifact_authorities,
@@ -1813,6 +1840,7 @@ def run_mujoco_headless_smoke(
         ),
         "search_scope": authority_pre.get("search_scope"),
         "search_acceptance_eligible": full_search,
+        "cpu_search_backend_only": cpu_search_backend_only,
         "total_safe_row_count": authority_pre.get("total_safe_row_count"),
         "searched_row_count": authority_pre.get("searched_row_count"),
         "searched_family_counts": authority_pre.get("searched_family_counts"),
@@ -2093,6 +2121,12 @@ def write_receipt_exclusive(target: Path, receipt: dict[str, object]) -> Path:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
+    if (
+        arguments.command == "view"
+        and arguments.search_device is not None
+        and arguments.search_rows is not None
+    ):
+        raise ValueError("--search-device cannot be combined with --search-rows")
     if arguments.command == "view" and arguments.search_device is not None:
         configure_single_gpu_visibility(arguments.search_device)
     matcher, terrain = _load_matcher(arguments)

@@ -656,6 +656,31 @@ class HybridTerrainViewerTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(events, [("configure", "cuda:5"), ("load", "cuda:5"), "run"])
 
+    def test_gpu_view_rejects_capped_search_before_visibility_or_loading(self):
+        with (
+            mock.patch.object(
+                viewer_module, "configure_single_gpu_visibility"
+            ) as configure_visibility,
+            mock.patch.object(viewer_module, "_load_matcher") as load,
+            self.assertRaisesRegex(ValueError, "search-device.*search-rows"),
+        ):
+            main(
+                [
+                    "view",
+                    "--cache",
+                    "cache",
+                    "--model",
+                    "model",
+                    "--search-device",
+                    "cuda:5",
+                    "--search-rows",
+                    "2",
+                ]
+            )
+
+        configure_visibility.assert_not_called()
+        load.assert_not_called()
+
     def test_cpu_view_does_not_configure_gpu_visibility(self):
         matcher, terrain = object(), object()
         with (
@@ -866,6 +891,9 @@ class HybridTerrainViewerTests(unittest.TestCase):
         self.assertGreaterEqual(receipt["range_diversity_count"], 2)
         self.assertEqual(receipt["search_scope"], "full-range-safe-corpus")
         self.assertEqual(receipt["transition_penalty"], 0.1)
+        self.assertNotIn(
+            "cpu-exact-search-backend-required", receipt["acceptance_failures"]
+        )
         identity = receipt["identity"]
         self.assertEqual(identity["search_backend_identity"], "cpu-ckdtree-exact")
         self.assertIsNone(identity["last_search_elapsed_ms"])
@@ -909,6 +937,22 @@ class HybridTerrainViewerTests(unittest.TestCase):
             self.assertGreater(descriptor["size_bytes"], 0)
 
         before = viewer_module._runtime_identity(matcher, terrain, DEFAULT_G1_XML)
+        gpu_identity = dict(before)
+        gpu_identity["search_backend_identity"] = "single-gpu-full-row-fp32:cuda:5"
+        with mock.patch(
+            "mm_sonic.hybrid_terrain_lmm_viewer._runtime_identity",
+            side_effect=(gpu_identity, gpu_identity),
+        ) as identity_check:
+            gpu_snapshot = run_mujoco_headless_smoke(
+                matcher, terrain, g1_xml=DEFAULT_G1_XML, frames=1
+            )
+        self.assertEqual(identity_check.call_count, 2)
+        self.assertFalse(gpu_snapshot["accepted"])
+        self.assertIn(
+            "cpu-exact-search-backend-required",
+            gpu_snapshot["acceptance_failures"],
+        )
+
         after = dict(before)
         after["model_manifest_sha256"] = "0" * 64
         with mock.patch(
@@ -1321,11 +1365,21 @@ class HybridTerrainViewerTests(unittest.TestCase):
         self.assertTrue(reset)
         self.assertFalse(stopped)
         self.assertFalse(keys.snapshot()[1], "reset must be edge-triggered")
+        keys.press("r")
+        self.assertFalse(keys.snapshot()[1], "key repeat must not retrigger reset")
+        keys.release("r")
+        keys.press("r")
+        self.assertTrue(keys.snapshot()[1], "a new physical press must reset")
 
     def test_arrow_keys_map_to_level_safe_drive_commands(self):
         keyboard = SimpleNamespace(
             Key=SimpleNamespace(
-                up=object(), down=object(), left=object(), right=object(), esc=object()
+                up=object(),
+                down=object(),
+                left=object(),
+                right=object(),
+                space=object(),
+                esc=object(),
             )
         )
         keys = KeyboardCommandSource()
@@ -1344,6 +1398,8 @@ class HybridTerrainViewerTests(unittest.TestCase):
 
         up_token = viewer_module._keyboard_command_token(keyboard.Key.up, keyboard)
         down_token = viewer_module._keyboard_command_token(keyboard.Key.down, keyboard)
+        self.assertNotEqual(up_token, "w")
+        self.assertNotEqual(down_token, "s")
         keys.press(up_token)
         keys.press(down_token)
         self.assertEqual(keys.snapshot()[0], CommandState())
@@ -1360,9 +1416,38 @@ class HybridTerrainViewerTests(unittest.TestCase):
         keys.release(left_token)
         keys.release(right_token)
 
+        keys.press(up_token)
+        keys.press("w")
+        self.assertEqual(keys.snapshot()[0], CommandState(speed=1.0))
+        keys.release(up_token)
+        self.assertEqual(keys.snapshot()[0], CommandState(speed=1.0))
+        keys.press(up_token)
+        keys.release("w")
+        self.assertEqual(keys.snapshot()[0], CommandState(speed=1.0))
+        keys.release(up_token)
+        self.assertEqual(keys.snapshot()[0], CommandState())
+
+        keys.press(up_token)
+        keys.press(up_token)
+        keys.release(up_token)
+        self.assertEqual(keys.snapshot()[0], CommandState())
+
     def test_space_hard_stop_overrides_an_active_gamepad(self):
+        keyboard = SimpleNamespace(
+            Key=SimpleNamespace(
+                up=object(),
+                down=object(),
+                left=object(),
+                right=object(),
+                space=object(),
+            )
+        )
         keys = KeyboardCommandSource()
-        keys.press("space")
+        space_token = viewer_module._keyboard_command_token(
+            keyboard.Key.space, keyboard
+        )
+        self.assertEqual(space_token, " ")
+        keys.press(space_token)
 
         command = viewer_module._select_control_command(
             keyboard_command=keys.snapshot()[0],

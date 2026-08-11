@@ -521,6 +521,16 @@ def acceptance_failures(receipt: Mapping[str, object]) -> list[str]:
         ("supported_speed_envelope_current", "supported-speed-envelope-required"),
     ):
         gate(identity.get(field) is True, name)
+    search_backend_identities = _mapping(identity.get("search_backend_identities"))
+    gate(
+        identity.get("cpu_search_backend_only") is True
+        and set(search_backend_identities) == set(FORMAL_SCENE_IDS)
+        and all(
+            type(backend) is str and backend == "cpu-ckdtree-exact"
+            for backend in search_backend_identities.values()
+        ),
+        "cpu-exact-search-backend-required",
+    )
     retry_budget = identity.get("retry_budget")
     gate(type(retry_budget) is int and retry_budget > 0, "finite-retry-budget-required")
     gate(identity.get("g1_xml_sha256") == _G1_XML_SHA256, "canonical-g1-xml-required")
@@ -840,6 +850,16 @@ def _formal_identity(
         and len(matcher.searchable_rows) == matcher.total_searchable_row_count
         for matcher in matchers
     )
+    search_backend_identities = {
+        str(scene_id): getattr(matcher, "search_backend_identity", None)
+        for scene_id, matcher in sorted(
+            evaluator.matchers.items(), key=lambda item: str(item[0])
+        )
+    }
+    cpu_search_backend_only = bool(search_backend_identities) and all(
+        type(backend) is str and backend == "cpu-ckdtree-exact"
+        for backend in search_backend_identities.values()
+    )
     return {
         **corpus_authority,
         **model_authority,
@@ -860,6 +880,8 @@ def _formal_identity(
         )
         is True,
         "full_search": full_search,
+        "search_backend_identities": search_backend_identities,
+        "cpu_search_backend_only": cpu_search_backend_only,
         "motion_root_ownership": bool(matchers)
         and all(
             getattr(matcher.state, "root_motion_source", None)

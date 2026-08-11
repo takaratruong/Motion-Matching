@@ -515,6 +515,10 @@ class HybridMatcher:
             if self.search_acceptance_eligible
             else "diagnostic-stratified-cap"
         )
+        if physical_search_device is not None and not self.search_acceptance_eligible:
+            raise ValueError(
+                "single-GPU search requires the full-range-safe searchable corpus"
+            )
         self.search_view_sha256 = hashlib.sha256(
             np.ascontiguousarray(self.searchable_rows, dtype="<i8").tobytes()
         ).hexdigest()
