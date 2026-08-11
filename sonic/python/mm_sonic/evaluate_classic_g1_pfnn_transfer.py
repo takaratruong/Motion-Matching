@@ -18,7 +18,7 @@ from mm_sonic.terrain_pfnn.dataset import (
     normalize_pfnn_input,
     normalize_pfnn_output,
 )
-from mm_sonic.terrain_pfnn.layout import INPUT_LAYOUT, OUTPUT_LAYOUT
+from mm_sonic.terrain_pfnn.layout import CLASSIC_G1_INPUT_LAYOUT_V3, OUTPUT_LAYOUT
 from mm_sonic.train_classic_g1_pfnn import load_classic_checkpoint
 
 
@@ -167,8 +167,12 @@ def _checkpoint_normalization(checkpoint: object, dataset: object) -> dict[str, 
     }
     if any(
         value.shape != (width,)
-        for name, width in (("x_mean", INPUT_LAYOUT.size), ("x_std", INPUT_LAYOUT.size),
-                            ("y_mean", OUTPUT_LAYOUT.size), ("y_std", OUTPUT_LAYOUT.size))
+        for name, width in (
+            ("x_mean", CLASSIC_G1_INPUT_LAYOUT_V3.size),
+            ("x_std", CLASSIC_G1_INPUT_LAYOUT_V3.size),
+            ("y_mean", OUTPUT_LAYOUT.size),
+            ("y_std", OUTPUT_LAYOUT.size),
+        )
         for value in (values[name],)
     ) or any(not np.isfinite(value).all() for value in values.values()):
         raise ValueError("classic PFNN checkpoint normalization is invalid")
@@ -195,6 +199,8 @@ def evaluate(
     dataset_manifest_sha256 = _sha256(manifest_file)
     checkpoint = load_classic_checkpoint(checkpoint_file)
     dataset = load_vertical_dataset(root)
+    if checkpoint.input_size != CLASSIC_G1_INPUT_LAYOUT_V3.size:
+        raise ValueError("classic PFNN checkpoint input contract is invalid")
     if checkpoint.dataset_digest != dataset.dataset_sha256:
         raise ValueError("classic PFNN checkpoint dataset digest mismatch")
     normalization = _checkpoint_normalization(checkpoint, dataset)

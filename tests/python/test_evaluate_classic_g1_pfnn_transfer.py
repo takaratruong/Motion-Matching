@@ -23,9 +23,11 @@ from mm_sonic.evaluate_classic_g1_pfnn_transfer import (
     released_pfnn_gate_failures,
     source_joint_reconstruction_metrics,
 )
+from mm_sonic.terrain_oracle.canonical import ISAACLAB_JOINT_NAMES
 from mm_sonic.terrain_pfnn.dataset import normalize_pfnn_input
-from mm_sonic.terrain_pfnn.layout import INPUT_LAYOUT, OUTPUT_LAYOUT
+from mm_sonic.terrain_pfnn.layout import CLASSIC_G1_INPUT_LAYOUT_V3, OUTPUT_LAYOUT
 from mm_sonic.terrain_pfnn.model import PhaseFunctionedNetwork
+from mm_sonic.terrain_pfnn.provenance import canonical_joint_state_receipt
 from mm_sonic.terrain_pfnn.training import finite_runtime_seed
 from mm_sonic.train_classic_g1_pfnn import save_classic_checkpoint
 
@@ -38,8 +40,10 @@ def _write_evaluation_fixture(
     root: Path, *, checkpoint_dataset_digest: str | None = None,
     source: str = "mixed",
 ) -> tuple[Path, Path, VerticalDataset]:
-    x_mean = np.full(INPUT_LAYOUT.size, np.float32(0.5))
-    x_std = np.full(INPUT_LAYOUT.size, np.float32(0.25))
+    x_mean = np.full(CLASSIC_G1_INPUT_LAYOUT_V3.size, np.float32(0.5))
+    x_std = np.full(CLASSIC_G1_INPUT_LAYOUT_V3.size, np.float32(0.25))
+    x_mean[CLASSIC_G1_INPUT_LAYOUT_V3["joint_position"]] = np.float32(0.0)
+    x_mean[CLASSIC_G1_INPUT_LAYOUT_V3["joint_velocity"]] = np.float32(0.0)
     y_mean = np.full(OUTPUT_LAYOUT.size, np.float32(1.5))
     y_std = np.full(OUTPUT_LAYOUT.size, np.float32(2.0))
     joint = OUTPUT_LAYOUT["joint_position"]
@@ -69,8 +73,13 @@ def _write_evaluation_fixture(
     )
     all_centers = np.asarray((100, 200, 300, 400), dtype=np.int64)
     all_phase = np.asarray((0.1, 0.2, 0.3, 0.4), dtype=np.float32)
+    physical_x = np.full(
+        (len(clips), CLASSIC_G1_INPUT_LAYOUT_V3.size), np.float32(0.75)
+    )
+    physical_x[:, CLASSIC_G1_INPUT_LAYOUT_V3["joint_position"]] = np.float32(0.0)
+    physical_x[:, CLASSIC_G1_INPUT_LAYOUT_V3["joint_velocity"]] = np.float32(0.0)
     values = VerticalSplitArrays(
-        x=np.full((len(clips), INPUT_LAYOUT.size), np.float32(0.75)),
+        x=physical_x,
         y=target,
         phase=all_phase[selected],
         clip_id=clips,
@@ -89,6 +98,12 @@ def _write_evaluation_fixture(
         "y_std": y_std,
     }
     source_roles = {str(clip): "validation" for clip in clips}
+    joint_state_receipt = canonical_joint_state_receipt(
+        accepted_rows_by_source={"fixture": len(clips)},
+        rejected_rows_by_source={},
+        rejected_rows_by_joint={name: 0 for name in ISAACLAB_JOINT_NAMES},
+        state_source_by_clip={"fixture": "direct_source"},
+    )
     dataset = VerticalDataset(
         splits={"train": values, "validation": values},
         **normalization,
@@ -96,6 +111,7 @@ def _write_evaluation_fixture(
         retarget_manifest_sha256="c" * 64,
         terrain_receipt_set_sha256="d" * 64,
         source_roles=source_roles,
+        joint_state_receipt=joint_state_receipt,
         dataset_sha256=_dataset_digest(
             {"train": values, "validation": values},
             normalization,
@@ -103,10 +119,15 @@ def _write_evaluation_fixture(
             retarget_manifest_sha256="c" * 64,
             terrain_receipt_set_sha256="d" * 64,
             source_roles=source_roles,
+            joint_state_receipt=joint_state_receipt,
         ),
     )
     manifest = save_vertical_dataset(root / "dataset", dataset)
-    model = PhaseFunctionedNetwork(hidden_size=4, dropout_probability=0.0)
+    model = PhaseFunctionedNetwork(
+        hidden_size=4,
+        dropout_probability=0.0,
+        input_size=CLASSIC_G1_INPUT_LAYOUT_V3.size,
+    )
     with torch.no_grad():
         for parameter in model.parameters():
             parameter.zero_()
@@ -116,7 +137,7 @@ def _write_evaluation_fixture(
         checkpoint,
         model=model,
         normalization=normalization,
-        runtime_seed=finite_runtime_seed(),
+        runtime_seed=finite_runtime_seed(CLASSIC_G1_INPUT_LAYOUT_V3),
         dataset_digest=(
             dataset.dataset_sha256
             if checkpoint_dataset_digest is None
@@ -216,6 +237,33 @@ class ClassicG1PFNNTransferEvaluationTests(unittest.TestCase):
             )
             self.assertEqual(report["checkpoint_sha256"], _sha256(checkpoint))
             self.assertEqual(report["dataset_manifest_sha256"], _sha256(manifest))
+
+    def test_evaluate_rejects_v2_dataset_and_checkpoint_before_inference(self) -> None:
+        for artifact in ("dataset", "checkpoint"):
+            with self.subTest(artifact=artifact), tempfile.TemporaryDirectory() as directory:
+                manifest, checkpoint, _ = _write_evaluation_fixture(Path(directory))
+                if artifact == "dataset":
+                    payload = json.loads(manifest.read_text(encoding="utf-8"))
+                    payload["schema"] = "g1-pfnn-vertical-dataset/v2"
+                    manifest.write_text(
+                        json.dumps(payload, sort_keys=True), encoding="utf-8"
+                    )
+                else:
+                    payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+                    payload["schema"] = "classic-g1-pfnn/v2"
+                    torch.save(payload, checkpoint)
+
+                with mock.patch.object(
+                    PhaseFunctionedNetwork,
+                    "forward",
+                    side_effect=AssertionError("inference ran"),
+                ):
+                    with self.assertRaisesRegex(ValueError, "schema|contract"):
+                        transfer.evaluate(
+                            checkpoint_path=checkpoint,
+                            dataset_path=manifest,
+                            device="cpu",
+                        )
 
     def test_digest_mismatch_rejects_before_model_inference(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
