@@ -257,6 +257,30 @@ def _bind_formal_model_and_cache_authorities(
 
 
 class HybridTerrainViewerTests(unittest.TestCase):
+    def test_diagnostic_collision_oracle_is_separate_from_render_model(self):
+        import mujoco
+
+        terrain = load_scene_terrain("hills")
+        render_model = viewer_module.build_viewer_model(DEFAULT_G1_XML, terrain)
+        collision_model = viewer_module.build_diagnostic_collision_model(
+            DEFAULT_G1_XML, terrain
+        )
+
+        render_geom = mujoco.mj_name2id(
+            render_model, mujoco.mjtObj.mjOBJ_GEOM, "hybrid_lmm_authoritative_terrain"
+        )
+        collision_geom = mujoco.mj_name2id(
+            collision_model,
+            mujoco.mjtObj.mjOBJ_GEOM,
+            "terrain_hybrid_lmm_authoritative",
+        )
+        self.assertGreaterEqual(render_geom, 0)
+        self.assertEqual(int(render_model.geom_contype[render_geom]), 0)
+        self.assertEqual(int(render_model.geom_conaffinity[render_geom]), 0)
+        self.assertGreaterEqual(collision_geom, 0)
+        self.assertNotEqual(int(collision_model.geom_contype[collision_geom]), 0)
+        self.assertNotEqual(int(collision_model.geom_conaffinity[collision_geom]), 0)
+
     def test_interactive_visuals_brighten_only_compiled_render_fields(self):
         import mujoco
 
@@ -1945,6 +1969,158 @@ class HybridTerrainViewerTests(unittest.TestCase):
             receipt["evidence_status"], "interactive-diagnostic-not-acceptance"
         )
         self.assertFalse(receipt["acceptance_eligible"])
+
+    def test_interactive_postprocessor_runs_on_fixed_ticks_and_resets_in_order(self):
+        import mujoco
+
+        events: list[str] = []
+        state = SimpleNamespace(
+            qpos=np.arange(36, dtype=np.float64),
+            family="flat",
+            range_index=1,
+            row=2,
+            search_distance=0.0,
+            terrain_features=np.zeros(4),
+            decode_count=0,
+            fallback_count=0,
+            joint_clamp_count=0,
+            max_joint_clamp_magnitude=0.0,
+            support_height=0.0,
+            support_status="SUPPORTED",
+            pose_source="canonical",
+            searchable_row_count=3,
+            searchable_family_counts=(("flat", 3),),
+            total_searchable_row_count=3,
+            search_scope="diagnostic",
+            transition_penalty=0.1,
+        )
+        matcher = SimpleNamespace(
+            artifacts=SimpleNamespace(contacts=np.asarray([[False, False]] * 3)),
+            corpus=object(),
+            state=state,
+            step=lambda _command, dt: events.append("matcher.step") or state,
+            reset=lambda: events.append("matcher.reset") or state,
+            search_scope="diagnostic",
+            search_acceptance_eligible=False,
+        )
+        terrain = load_scene_terrain("hills")
+        postprocessor = SimpleNamespace(
+            reset=lambda: events.append("postprocessor.reset"),
+            step=lambda qpos, **_kwargs: (
+                events.append("postprocessor.step") or np.asarray(qpos) + 1.0
+            ),
+            identity=lambda: {
+                "diagnostic_display_postprocessor": "existing/v1",
+                "pose_repair_count": 3,
+            },
+        )
+        keys = SimpleNamespace(
+            snapshot=lambda: (CommandState(), True, False),
+            hard_stop_active=lambda: False,
+            press=lambda _key: None,
+            release=lambda _key: None,
+        )
+        listener = SimpleNamespace(
+            start=lambda: None, stop=lambda: None, join=lambda timeout: None
+        )
+        keyboard = SimpleNamespace(
+            Key=SimpleNamespace(esc=object()),
+            Listener=lambda **_kwargs: listener,
+        )
+
+        class FakeAccumulator:
+            def __init__(self, *, step_hz):
+                self.step_hz = step_hz
+
+            def advance(self, _elapsed, callback):
+                callback(1.0 / self.step_hz)
+                return 1
+
+        class FakeViewer:
+            cam = SimpleNamespace(
+                distance=0.0,
+                azimuth=0.0,
+                elevation=0.0,
+                lookat=np.zeros(3),
+            )
+            user_scn = SimpleNamespace(flags=np.zeros(1_000, np.int32))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def is_running(self):
+                return True
+
+            def lock(self):
+                return contextlib.nullcontext()
+
+            def set_texts(self, _texts):
+                return None
+
+            def sync(self):
+                return None
+
+        data = SimpleNamespace(qpos=np.zeros(36, dtype=np.float64))
+        model = object()
+        identity = {
+            "scene_authentication_current": False,
+            "generator_acceptance_status": {"accepted": False},
+        }
+        factory_calls: list[tuple[object, object, object]] = []
+
+        def factory(*args):
+            factory_calls.append(args)
+            return postprocessor
+
+        with (
+            mock.patch.dict(os.environ, {"DISPLAY": ":99"}),
+            mock.patch.object(
+                viewer_module, "KeyboardCommandSource", return_value=keys
+            ),
+            mock.patch.object(viewer_module, "FixedRateAccumulator", FakeAccumulator),
+            mock.patch.object(
+                viewer_module, "_load_keyboard_module", return_value=keyboard
+            ),
+            mock.patch.object(
+                viewer_module,
+                "optional_evdev_source",
+                return_value=SimpleNamespace(connected=False, snapshot=CommandState),
+            ),
+            mock.patch.object(viewer_module, "build_viewer_model", return_value=model),
+            mock.patch.object(mujoco, "MjData", return_value=data),
+            mock.patch.object(
+                mujoco,
+                "mj_forward",
+                side_effect=lambda *_args: events.append("mj_forward"),
+            ),
+            mock.patch("mujoco.viewer.launch_passive", return_value=FakeViewer()),
+            mock.patch.object(
+                viewer_module, "_runtime_identity", return_value=identity
+            ),
+        ):
+            receipt = viewer_module.run_interactive(
+                matcher,
+                terrain,
+                max_render_frames=1,
+                display_postprocessor_factory=factory,
+            )
+
+        self.assertEqual(factory_calls, [(model, matcher, terrain)])
+        self.assertEqual(
+            events,
+            [
+                "matcher.reset",
+                "postprocessor.reset",
+                "matcher.step",
+                "postprocessor.step",
+                "mj_forward",
+            ],
+        )
+        np.testing.assert_array_equal(data.qpos, state.qpos + 1.0)
+        self.assertEqual(receipt["identity"]["pose_repair_count"], 3)
 
     def test_failed_reset_returns_original_runtime_unchanged(self):
         runtime = SimpleNamespace(marker=object())

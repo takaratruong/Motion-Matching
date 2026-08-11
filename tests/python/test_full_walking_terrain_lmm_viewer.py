@@ -13,7 +13,6 @@ import pytest
 from resources.g1_terrain_builder.artifacts import canonical_json_bytes
 from mm_sonic.full_walking_terrain_lmm_viewer import (
     FORMAL_SCENE_IDS,
-    FULL_LABEL,
     _baseline_authority_exact,
     _baseline_authority_snapshot,
     _formal_identity,
@@ -621,6 +620,9 @@ def test_full_view_passes_full_identity_and_visible_label_overrides(
     )
     matcher = SimpleNamespace(
         generator=generator,
+        diagnostic_stability=True,
+        diagnostic_canonical_source_pose=True,
+        diagnostic_mechanical_clearance_bounds_m=(),
         search_acceptance_eligible=True,
         search_backend_identity="cpu-ckdtree-exact",
         fps=60.0,
@@ -667,10 +669,14 @@ def test_full_view_passes_full_identity_and_visible_label_overrides(
     assert call["runtime_identity_resolver"] is _full_runtime_identity
     assert call["formal_authority_predicate"] is _full_formal_artifact_authorities
     assert call["runtime_label_resolver"] is viewer_module._full_runtime_label
+    assert call["display_postprocessor_factory"] is not None
     assert matcher_call["search_device"] is None
     assert matcher_call["diagnostic_stability"] is True
     assert matcher_call["diagnostic_canonical_source_pose"] is True
-    assert fake_run_interactive(matcher, adapter, **call)["label"] == FULL_LABEL
+    assert (
+        "EXISTING INERTIALIZER + TERRAIN FOOT LOCK"
+        in fake_run_interactive(matcher, adapter, **call)["label"]
+    )
 
 
 def test_full_formal_matcher_explicitly_keeps_diagnostic_stability_disabled(
@@ -829,6 +835,11 @@ def test_full_formal_smoke_never_configures_gpu_visibility(
         "configure_single_gpu_visibility",
         lambda _device: pytest.fail("formal smoke must remain CPU-only"),
     )
+    monkeypatch.setattr(
+        viewer_module,
+        "build_diagnostic_collision_model",
+        lambda *_args: pytest.fail("formal smoke must not build a collision oracle"),
+    )
     monkeypatch.setattr(viewer_module, "_load_full_corpus", lambda _path: corpus)
     monkeypatch.setattr(viewer_module, "_load_baseline_corpus", lambda _path: corpus)
     monkeypatch.setattr(viewer_module, "_load_generator", lambda *_args: generator)
@@ -925,6 +936,9 @@ def test_full_stability_identity_reports_canonical_source_policy(
     identity = _full_runtime_identity(matcher, terrain, Path("g1.xml"))
 
     assert identity["diagnostic_canonical_source_pose"] is canonical_source
+    assert "diagnostic_pose_source" not in identity
+    assert "diagnostic_leg_search_limit_rad" not in identity
+    assert "diagnostic_arm_slew_limit_rad_per_frame" not in identity
 
 
 @pytest.mark.parametrize("canonical_source", (False, True))
@@ -948,6 +962,9 @@ def test_full_stability_label_reports_mechanical_filter_inventory(
     assert "1.200" in label
     assert "5/6" in label
     assert ("CANONICAL SOURCE POSES" in label) is canonical_source
+    assert "LEG SEARCH" not in label
+    assert "ARM SLEW" not in label
+    assert "EXISTING INERTIALIZER + TERRAIN FOOT LOCK" in label
     assert "NOT ACCEPTANCE EVIDENCE" in label
 
 

@@ -1193,6 +1193,29 @@ def build_viewer_model(
     return model
 
 
+def build_diagnostic_collision_model(g1_xml: Path, terrain: SceneTerrainAdapter):
+    """Build a separate collidable terrain oracle for display pose utilities."""
+
+    import mujoco
+
+    spec = mujoco.MjSpec.from_file(str(g1_xml))
+    vertices, faces = terrain.native_mesh()
+    spec.add_mesh(
+        name="terrain_hybrid_lmm_authoritative_mesh",
+        uservert=vertices.ravel(),
+        userface=faces.ravel(),
+        inertia=mujoco.mjtMeshInertia.mjMESH_INERTIA_SHELL,
+    )
+    spec.worldbody.add_geom(
+        name="terrain_hybrid_lmm_authoritative",
+        type=mujoco.mjtGeom.mjGEOM_MESH,
+        meshname="terrain_hybrid_lmm_authoritative_mesh",
+        contype=1,
+        conaffinity=1,
+    )
+    return spec.compile()
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as source:
@@ -1939,6 +1962,8 @@ def run_interactive(
         [HybridMatcher, SceneTerrainAdapter, Path], dict[str, object]
     ]
     | None = None,
+    display_postprocessor_factory: Callable[[object, object, object], object]
+    | None = None,
 ) -> dict[str, object]:
     if not os.environ.get("DISPLAY"):
         raise RuntimeError("interactive hybrid terrain viewer requires DISPLAY")
@@ -1980,6 +2005,11 @@ def run_interactive(
     listener = keyboard_module.Listener(on_press=on_press, on_release=on_release)
     listener.start()
     model = build_viewer_model(g1_xml, terrain, interactive_visuals=True)
+    postprocessor = (
+        None
+        if display_postprocessor_factory is None
+        else display_postprocessor_factory(model, matcher, terrain)
+    )
     identity = identity_resolver(matcher, terrain, Path(g1_xml))
     interactive_scene_authentication_current = (
         identity.get("scene_authentication_current") is True
@@ -1997,6 +2027,25 @@ def run_interactive(
     started = time.monotonic()
     last_clock = started
     next_scene_authentication_check = started
+    display_qpos = np.asarray(matcher.state.qpos)
+
+    def fixed_rate_step(dt: float, command: CommandState) -> None:
+        nonlocal display_qpos
+        state = matcher.step(command, dt=dt)
+        display_qpos = (
+            state.qpos
+            if postprocessor is None
+            else postprocessor.step(
+                state.qpos,
+                row=state.row,
+                range_index=state.range_index,
+                source_contact=np.asarray(
+                    matcher.artifacts.contacts[state.row], dtype=bool
+                ),
+                dt_s=dt,
+            )
+        )
+
     try:
         with mujoco.viewer.launch_passive(
             model, data, show_left_ui=False, show_right_ui=False
@@ -2024,10 +2073,12 @@ def run_interactive(
                         previous, matcher.reset
                     )
                     reset_failures += int(error is not None)
+                    if error is None and postprocessor is not None:
+                        postprocessor.reset()
                 accumulator.advance(
-                    elapsed, lambda dt, command=command: matcher.step(command, dt=dt)
+                    elapsed, lambda dt, command=command: fixed_rate_step(dt, command)
                 )
-                data.qpos[:] = matcher.state.qpos
+                data.qpos[:] = display_qpos
                 mujoco.mj_forward(model, data)
                 if (
                     interactive_scene_authentication_current
@@ -2106,6 +2157,8 @@ def run_interactive(
             ),
         }
     )
+    if postprocessor is not None:
+        identity.update(postprocessor.identity())
     return {
         "schema": "hybrid-terrain-lmm-viewer-runtime/v1",
         "label": label_resolver(
@@ -2237,6 +2290,7 @@ __all__ = (
     "SceneTerrainAdapter",
     "build_parser",
     "build_viewer_model",
+    "build_diagnostic_collision_model",
     "handle_key_press",
     "load_scene_terrain",
     "main",

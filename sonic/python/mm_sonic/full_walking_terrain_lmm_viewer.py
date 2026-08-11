@@ -9,6 +9,7 @@ import json
 import math
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -20,12 +21,14 @@ from .full_walking_terrain_lmm_evaluation import (
     compare_baseline_candidate,
 )
 from .hybrid_terrain_lmm_runtime import CommandState, HybridMatcher
+from .hybrid_terrain_lmm_postprocess import ExistingUtilityPosePostprocessor
 from .hybrid_terrain_lmm_gpu_search import configure_single_gpu_visibility
 from .hybrid_terrain_lmm_viewer import (
     DEFAULT_G1_XML,
     _g1_xml_asset_identity,
     _generator_acceptance_status,
     _load_generator,
+    build_diagnostic_collision_model,
     build_viewer_model,
     load_scene_terrain,
     run_interactive,
@@ -437,6 +440,7 @@ def _full_runtime_label(
             if getattr(matcher, "diagnostic_canonical_source_pose", False)
             else ""
         )
+        pose_policy += "EXISTING INERTIALIZER + TERRAIN FOOT LOCK; "
         bounds = tuple(getattr(matcher, "diagnostic_mechanical_clearance_bounds_m", ()))
         retained = getattr(
             matcher,
@@ -1112,6 +1116,21 @@ def main(argv: list[str] | None = None) -> int:
             diagnostic_stability=True,
             diagnostic_canonical_source_pose=True,
         )
+
+        def display_postprocessor_factory(
+            _render_model: object, matcher: object, terrain: object
+        ) -> ExistingUtilityPosePostprocessor:
+            collision_model = build_diagnostic_collision_model(
+                arguments.g1_xml, terrain
+            )
+            scene = SimpleNamespace(height_at_world_xy=terrain.authority.height_at)
+            return ExistingUtilityPosePostprocessor(
+                collision_model,
+                scene,
+                fps=_full_runtime_step_hz(matcher),
+                inertialization_halflife_s=0.10,
+            )
+
         receipt = run_interactive(
             matcher,
             adapter,
@@ -1122,6 +1141,7 @@ def main(argv: list[str] | None = None) -> int:
             runtime_label_resolver=_full_runtime_label,
             runtime_step_hz_resolver=_full_runtime_step_hz,
             runtime_identity_resolver=_full_runtime_identity,
+            display_postprocessor_factory=display_postprocessor_factory,
         )
     print(
         json.dumps(receipt, sort_keys=True, separators=(",", ":"), allow_nan=False),
