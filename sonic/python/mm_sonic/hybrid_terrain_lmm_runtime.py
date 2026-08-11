@@ -292,12 +292,31 @@ class HybridMatcher:
         transition_penalty: float = 0.1,
         max_root_step_m: float = 1.0,
         max_search_rows: int | None = None,
+        search_device: str | None = None,
         initial_root_xy: object = (0.0, 0.0),
         initial_heading: float = 0.0,
         cache_manifest_path: str | Path | None = None,
     ) -> None:
+        physical_search_device: int | None = None
+        if search_device is not None:
+            if type(search_device) is not str or not search_device.startswith("cuda:"):
+                raise ValueError(
+                    "search device must be canonical cuda:<nonnegative integer>"
+                )
+            index_text = search_device.removeprefix("cuda:")
+            if (
+                not index_text
+                or not index_text.isascii()
+                or not index_text.isdigit()
+                or (len(index_text) > 1 and index_text.startswith("0"))
+            ):
+                raise ValueError(
+                    "search device must be canonical cuda:<nonnegative integer>"
+                )
+            physical_search_device = int(index_text)
         self.corpus = corpus
         self.generator = generator
+        self.search_device = search_device
         self.cache_manifest_path = (
             None
             if cache_manifest_path is None
@@ -500,8 +519,27 @@ class HybridMatcher:
             np.ascontiguousarray(self.searchable_rows, dtype="<i8").tobytes()
         ).hexdigest()
         self.searchable_family_counts = family_counts(self.searchable_rows)
-        self._tree_values = np.asarray(self.features[searchable], dtype=np.float64)
-        self._tree = cKDTree(self._tree_values, compact_nodes=True, balanced_tree=True)
+        self.last_search_elapsed_ms: float | None = None
+        self.warm_search_elapsed_ms: float | None = None
+        if physical_search_device is None:
+            self.search_backend_identity = "cpu-ckdtree-exact"
+            self._tree_values = np.asarray(self.features[searchable], dtype=np.float64)
+            self._tree = cKDTree(
+                self._tree_values, compact_nodes=True, balanced_tree=True
+            )
+        else:
+            from .hybrid_terrain_lmm_gpu_search import SingleGpuExactSearch
+
+            self.search_backend_identity = f"single-gpu-full-row-fp32:{search_device}"
+            self._gpu_search = SingleGpuExactSearch(
+                self.features,
+                self.searchable_rows,
+                self.row_ranges,
+                self.artifacts.contacts,
+                physical_device_index=physical_search_device,
+                transition_penalty=self.transition_penalty,
+                exclusion_budget=self.candidate_retry_budget,
+            )
 
         self._elapsed_since_search = SEARCH_INTERVAL_S
         self._last_command: CommandState | None = None
@@ -738,12 +776,50 @@ class HybridMatcher:
             raise AssertionError("range-safe search view became empty")
         return SearchResult(best_row, math.sqrt(max(best, 0.0)), remaining)
 
+    def _single_gpu_match(
+        self, query: np.ndarray, *, excluded_rows: Iterable[int]
+    ) -> SearchResult:
+        excluded = self._normalized_excluded_rows(excluded_rows)
+        current_row = int(self.state.row)
+        current_range = int(self.row_ranges[current_row])
+        contacts = np.asarray(self.artifacts.contacts)
+        if contacts.shape != (len(self.features), 2):
+            raise ValueError("runtime contact table must have shape (rows, 2)")
+        current_contact = np.asarray(contacts[current_row], dtype=np.uint8)
+        active_contact_code = int(current_contact[0]) | (int(current_contact[1]) << 1)
+        candidates = self._gpu_search.match_candidates(
+            query,
+            current_range=current_range,
+            active_contact_code=active_contact_code,
+            excluded_rows=excluded,
+        )
+        elapsed_ms = float(candidates.elapsed_ms)
+        if not math.isfinite(elapsed_ms) or elapsed_ms < 0.0:
+            raise ValueError(
+                "single-GPU search elapsed time must be finite and nonnegative"
+            )
+        self.last_search_elapsed_ms = elapsed_ms
+        if self.warm_search_elapsed_ms is None:
+            self.warm_search_elapsed_ms = elapsed_ms
+        rows = np.asarray(candidates.rows, dtype=np.int64)
+        if candidates.close_candidate_count > len(rows):
+            return self.brute_force_match(query, excluded_rows=excluded)
+        scores = self._candidate_score(query, rows)
+        row, best = self._best(rows, scores)
+        return SearchResult(
+            row,
+            math.sqrt(max(best, 0.0)),
+            int(candidates.candidate_count),
+        )
+
     def match(
         self, query: object, *, excluded_rows: Iterable[int] = ()
     ) -> SearchResult:
         value = np.asarray(query, dtype=np.float64)
         if value.shape != (31,) or not np.isfinite(value).all():
             raise ValueError("search query must be one finite 31-D row")
+        if self.search_device is not None:
+            return self._single_gpu_match(value, excluded_rows=excluded_rows)
         excluded = self._match_exclusions(excluded_rows)
         count = len(self.searchable_rows)
         if len(excluded) == count:

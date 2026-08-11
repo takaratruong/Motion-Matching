@@ -5,10 +5,12 @@ from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
+from mm_sonic.hybrid_terrain_lmm_gpu_search import GpuSearchCandidates
 from mm_sonic.hybrid_terrain_lmm_runtime import (
     CommandState,
     HybridMatcher,
     SE2Transform,
+    SearchResult,
     TerrainAuthority,
     compose_root_delta,
     run_headless_smoke,
@@ -31,7 +33,6 @@ def _artifacts(rows: int = 8) -> ArtifactSet:
 
 
 def _corpus(values: np.ndarray | None = None) -> SimpleNamespace:
-    artifacts = _artifacts()
     if values is None:
         values = np.zeros((8, 31), dtype=np.float32)
         values[:, 0] = np.asarray((0, 1, 2, 3, 10, 11, 12, 13), np.float32)
@@ -39,6 +40,7 @@ def _corpus(values: np.ndarray | None = None) -> SimpleNamespace:
         values[4:, 15:21] = 1.0
         values[:4, 27:31] = 0.0
         values[4:, 27:31] = 1.0
+    artifacts = _artifacts(len(values))
     feature_set = FeatureSet(
         np.asarray(values, dtype=np.float32),
         np.zeros(31, dtype=np.float32),
@@ -106,6 +108,39 @@ class _KeywordGenerator(_Generator):
 class _FloatingPointGenerator(_Generator):
     def decode_rows(self, features: np.ndarray, rows: np.ndarray) -> np.ndarray:
         raise FloatingPointError("non-finite model output")
+
+
+class _FakeSingleGpuSearch:
+    def __init__(self) -> None:
+        self.responses: list[GpuSearchCandidates] = []
+        self.calls: list[dict[str, object]] = []
+
+    def match_candidates(self, query: object, **arguments) -> GpuSearchCandidates:
+        self.calls.append(
+            {
+                "query": np.array(query, dtype=np.float64, copy=True),
+                **arguments,
+            }
+        )
+        if not self.responses:
+            raise AssertionError("fake GPU search has no queued response")
+        return self.responses.pop(0)
+
+
+def _gpu_candidates(
+    rows: object,
+    *,
+    candidate_count: int,
+    close_candidate_count: int,
+    elapsed_ms: float = 2.5,
+) -> GpuSearchCandidates:
+    return GpuSearchCandidates(
+        rows=np.asarray(rows, dtype=np.int64),
+        candidate_count=candidate_count,
+        device_minimum_score=0.0,
+        close_candidate_count=close_candidate_count,
+        elapsed_ms=elapsed_ms,
+    )
 
 
 def _pose_converter(decoded, simulation_position, simulation_rotation, _model):
@@ -389,6 +424,196 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         with mock.patch("numpy.union1d", side_effect=AssertionError("redundant sort")):
             result = matcher.match(np.zeros(31, np.float64))
         self.assertEqual(result.row, matcher.brute_force_match(np.zeros(31)).row)
+
+    def test_single_gpu_construction_skips_ckdtree_and_requires_canonical_device(
+        self,
+    ):
+        fake = _FakeSingleGpuSearch()
+        with (
+            mock.patch(
+                "mm_sonic.hybrid_terrain_lmm_runtime.cKDTree",
+                side_effect=AssertionError("GPU mode must not construct cKDTree"),
+            ),
+            mock.patch(
+                "mm_sonic.hybrid_terrain_lmm_gpu_search.SingleGpuExactSearch",
+                return_value=fake,
+            ) as factory,
+        ):
+            matcher = HybridMatcher(
+                _corpus(),
+                _Generator(),
+                TerrainAuthority.flat(),
+                pose_converter=_pose_converter,
+                search_device="cuda:5",
+            )
+
+        self.assertEqual(
+            matcher.search_backend_identity,
+            "single-gpu-full-row-fp32:cuda:5",
+        )
+        self.assertFalse(hasattr(matcher, "_tree"))
+        self.assertFalse(hasattr(matcher, "_tree_values"))
+        self.assertIsNone(matcher.last_search_elapsed_ms)
+        self.assertIsNone(matcher.warm_search_elapsed_ms)
+        factory.assert_called_once()
+        positional = factory.call_args.args
+        np.testing.assert_array_equal(positional[0], matcher.features)
+        np.testing.assert_array_equal(positional[1], matcher.searchable_rows)
+        np.testing.assert_array_equal(positional[2], matcher.row_ranges)
+        np.testing.assert_array_equal(positional[3], matcher.artifacts.contacts)
+        self.assertEqual(
+            factory.call_args.kwargs,
+            {
+                "physical_device_index": 5,
+                "transition_penalty": 0.1,
+                "exclusion_budget": matcher.candidate_retry_budget,
+            },
+        )
+
+        for invalid in ("5", "cuda:+5", "cuda:05", "cuda:-1", "cpu:5", 5):
+            with (
+                self.subTest(search_device=invalid),
+                self.assertRaisesRegex(ValueError, "canonical cuda"),
+            ):
+                HybridMatcher(
+                    _corpus(),
+                    _Generator(),
+                    TerrainAuthority.flat(),
+                    pose_converter=_pose_converter,
+                    search_device=invalid,
+                )
+
+    def test_single_gpu_passes_current_contact_range_and_explicit_exclusions(self):
+        fake = _FakeSingleGpuSearch()
+        fake.responses.append(
+            _gpu_candidates((5,), candidate_count=2, close_candidate_count=1)
+        )
+        with mock.patch(
+            "mm_sonic.hybrid_terrain_lmm_gpu_search.SingleGpuExactSearch",
+            return_value=fake,
+        ):
+            matcher = HybridMatcher(
+                _motion_corpus(),
+                _Generator(),
+                TerrainAuthority.flat(),
+                pose_converter=_pose_converter,
+                search_device="cuda:5",
+            )
+        matcher.state = SimpleNamespace(row=4, range_index=1)
+        query = np.zeros(31, dtype=np.float64)
+
+        result = matcher.match(query, excluded_rows=(4, 4, 3))
+
+        self.assertEqual(result.row, 5)
+        self.assertEqual(result.candidate_count, 2)
+        self.assertEqual(len(fake.calls), 1)
+        call = fake.calls[0]
+        np.testing.assert_array_equal(call["query"], query)
+        self.assertEqual(call["current_range"], 1)
+        self.assertEqual(call["active_contact_code"], 1)
+        np.testing.assert_array_equal(call["excluded_rows"], (4,))
+
+    def test_single_gpu_rescores_complete_top128_and_preserves_stable_ties(self):
+        values = np.ones((130, 31), dtype=np.float32)
+        values[2] = np.float32(0.25)
+        values[6] = np.float32(0.25)
+        values[128] = np.float32(0.0)
+        fake = _FakeSingleGpuSearch()
+        with mock.patch(
+            "mm_sonic.hybrid_terrain_lmm_gpu_search.SingleGpuExactSearch",
+            return_value=fake,
+        ):
+            matcher = HybridMatcher(
+                _corpus(values),
+                _Generator(),
+                TerrainAuthority.flat(),
+                pose_converter=_pose_converter,
+                search_device="cuda:5",
+            )
+        self.assertEqual(len(matcher.searchable_rows), 128)
+        fake.responses.extend(
+            (
+                _gpu_candidates(
+                    matcher.searchable_rows,
+                    candidate_count=128,
+                    close_candidate_count=1,
+                    elapsed_ms=3.25,
+                ),
+                _gpu_candidates(
+                    (6, 2),
+                    candidate_count=128,
+                    close_candidate_count=2,
+                    elapsed_ms=7.0,
+                ),
+            )
+        )
+
+        complete = matcher.match(np.zeros(31, dtype=np.float64))
+        tied = matcher.match(np.full(31, 0.25, dtype=np.float64))
+
+        self.assertEqual(complete.row, 128)
+        self.assertEqual(complete.candidate_count, 128)
+        self.assertEqual(tied.row, 2)
+        self.assertEqual(matcher.last_search_elapsed_ms, 7.0)
+        self.assertEqual(matcher.warm_search_elapsed_ms, 3.25)
+
+    def test_single_gpu_close_set_overflow_invokes_complete_brute_force(self):
+        fake = _FakeSingleGpuSearch()
+        fake.responses.append(
+            _gpu_candidates((0, 2), candidate_count=5, close_candidate_count=3)
+        )
+        with mock.patch(
+            "mm_sonic.hybrid_terrain_lmm_gpu_search.SingleGpuExactSearch",
+            return_value=fake,
+        ):
+            matcher = HybridMatcher(
+                _corpus(),
+                _Generator(),
+                TerrainAuthority.flat(),
+                pose_converter=_pose_converter,
+                search_device="cuda:5",
+            )
+        expected = SearchResult(row=2, distance=0.75, candidate_count=5)
+        query = np.zeros(31, dtype=np.float64)
+        with mock.patch.object(
+            matcher, "brute_force_match", return_value=expected
+        ) as brute:
+            result = matcher.match(query, excluded_rows=(1, 1, 3))
+
+        self.assertEqual(result, expected)
+        brute.assert_called_once()
+        np.testing.assert_array_equal(brute.call_args.args[0], query)
+        np.testing.assert_array_equal(
+            brute.call_args.kwargs["excluded_rows"], np.asarray((1,), dtype=np.int64)
+        )
+
+    def test_single_gpu_default_keeps_cpu_ckdtree_mode_unchanged(self):
+        values = np.zeros((8, 31), dtype=np.float32)
+        values[:, 0] = np.arange(8, dtype=np.float32)
+        with mock.patch(
+            "mm_sonic.hybrid_terrain_lmm_gpu_search.SingleGpuExactSearch"
+        ) as factory:
+            matcher = HybridMatcher(
+                _corpus(values),
+                _Generator(),
+                TerrainAuthority.flat(),
+                pose_converter=_pose_converter,
+            )
+
+        factory.assert_not_called()
+        self.assertEqual(matcher.search_backend_identity, "cpu-ckdtree-exact")
+        self.assertTrue(hasattr(matcher, "_tree"))
+        self.assertTrue(hasattr(matcher, "_tree_values"))
+        self.assertIsNone(matcher.last_search_elapsed_ms)
+        self.assertIsNone(matcher.warm_search_elapsed_ms)
+        for query in (
+            np.zeros(31, dtype=np.float64),
+            np.full(31, 2.5, dtype=np.float64),
+        ):
+            tree = matcher.match(query)
+            brute = matcher.brute_force_match(query)
+            self.assertEqual(tree.row, brute.row)
+            self.assertAlmostEqual(tree.distance, brute.distance, places=12)
 
     def test_finite_terrain_root_domain_miss_bypasses_learned_decode(self):
         generator = _Generator()
