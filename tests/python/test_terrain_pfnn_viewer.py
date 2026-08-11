@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stdout
+import inspect
 from io import StringIO
 import math
 from pathlib import Path
@@ -12,10 +13,51 @@ from unittest import mock
 import numpy as np
 
 from mm_sonic.pfnn_terrain_fit import PFNNTerrainFit
+from mm_sonic.hybrid_terrain_lmm_viewer import _scene_adapter_from_grid
 from mm_sonic.terrain_pfnn.pfnn_surface import PlacedPFNNSurface
+from mm_sonic.terrain_pfnn.runtime import PFNNRuntimeFrame, PFNNTrajectoryState
 
 
 class TerrainPFNNViewerTests(unittest.TestCase):
+    def _sloped_scene_adapter(self, heading: float = math.pi / 2.0) -> object:
+        # Native coordinates cover X=[2, 4], Y=[3, 5], with h=2X+3Y.
+        return _scene_adapter_from_grid(
+            np.asarray(((19.0, 23.0), (13.0, 17.0)), dtype=np.float32),
+            origin_x=2.0,
+            origin_z=-5.0,
+            cell=2.0,
+            exterior=-1.0,
+            name="two-by-two-slope",
+            source_path=None,
+            spawn_native_xy=(3.0, 4.0),
+            spawn_heading=heading,
+        )
+
+    def test_scene_terrain_callback_uses_one_rigid_course_frame_and_native_mesh(
+        self,
+    ) -> None:
+        from mm_sonic.terrain_pfnn_viewer import _ScenePFNNTerrainCallback
+
+        adapter = self._sloped_scene_adapter()
+        callback = _ScenePFNNTerrainCallback(adapter)
+
+        origin = callback(np.zeros(2, dtype=np.float64))
+        forward = callback(np.asarray((0.25, 0.0), dtype=np.float64))
+        self.assertIsNotNone(origin)
+        self.assertIsNotNone(forward)
+        assert origin is not None and forward is not None
+        self.assertEqual(origin.height_m, adapter.authority.height_at((3.0, 4.0)))
+        self.assertEqual(forward.height_m, adapter.authority.height_at((3.25, 4.0)))
+        np.testing.assert_allclose(origin.gradient_xy, (2.0, 3.0), atol=1.0e-12)
+        np.testing.assert_allclose(
+            callback.collision_heights_at(np.asarray(((0.0, 0.0), (0.25, 0.0)))),
+            (18.0, 18.5),
+            atol=1.0e-12,
+        )
+        vertices, faces = adapter.native_mesh()
+        np.testing.assert_array_equal(callback.vertices, vertices)
+        np.testing.assert_array_equal(callback.faces, faces)
+
     def test_exact_pfnn_surface_drives_runtime_collision_and_render_mesh(self) -> None:
         from mm_sonic.terrain_pfnn_viewer import _PFNNTerrainCallback
 
@@ -60,7 +102,9 @@ class TerrainPFNNViewerTests(unittest.TestCase):
             rtol=0.0,
         )
 
-    def test_pfnn_course_has_flat_bootstrap_and_then_the_exact_transferred_surface(self) -> None:
+    def test_pfnn_course_has_flat_bootstrap_and_then_the_exact_transferred_surface(
+        self,
+    ) -> None:
         from mm_sonic.terrain_pfnn_viewer import _PFNNCourseCallback
 
         fit = PFNNTerrainFit(
@@ -96,7 +140,9 @@ class TerrainPFNNViewerTests(unittest.TestCase):
         np.testing.assert_array_equal(bootstrap.gradient_xy, np.zeros(2))
         world = np.array((2.0, 0.2))
         source = callback.source_anchor_xy + np.array((1.25, 0.2))
-        expected_height = float(surface.height_at(source[None, :])[0]) - callback.source_height_m
+        expected_height = (
+            float(surface.height_at(source[None, :])[0]) - callback.source_height_m
+        )
         sample = callback(world)
         self.assertIsNotNone(sample)
         assert sample is not None
@@ -128,15 +174,19 @@ class TerrainPFNNViewerTests(unittest.TestCase):
                 '{"dataset_digest_sha256":"' + ("a" * 64) + '"}',
                 encoding="utf-8",
             )
-            with mock.patch.object(
-                viewer_module, "load_classic_checkpoint", return_value=checkpoint
-            ) as loader, mock.patch.object(
-                viewer_module.TorchG1ForwardKinematics,
-                "from_mjcf",
-                return_value=kinematics,
-            ) as load_kinematics, mock.patch.object(
-                viewer_module, "TerrainPFNNRuntime", return_value=object()
-            ) as factory:
+            with (
+                mock.patch.object(
+                    viewer_module, "load_classic_checkpoint", return_value=checkpoint
+                ) as loader,
+                mock.patch.object(
+                    viewer_module.TorchG1ForwardKinematics,
+                    "from_mjcf",
+                    return_value=kinematics,
+                ) as load_kinematics,
+                mock.patch.object(
+                    viewer_module, "TerrainPFNNRuntime", return_value=object()
+                ) as factory,
+            ):
                 loaded = _load_runtime(
                     arguments,
                     Path("checkpoint.pt"),
@@ -154,7 +204,7 @@ class TerrainPFNNViewerTests(unittest.TestCase):
         self.assertEqual(factory.call_args.kwargs["device"], "cuda")
         self.assertIs(factory.call_args.kwargs["enforce_motion_envelope"], False)
         self.assertIs(factory.call_args.kwargs["command_driven_root"], False)
-        self.assertIs(factory.call_args.kwargs["hold_idle_pose"], True)
+        self.assertIs(factory.call_args.kwargs["hold_idle_pose"], False)
 
     def test_vertical_runtime_requires_exact_source_and_terrain_receipts(self) -> None:
         import json
@@ -182,15 +232,19 @@ class TerrainPFNNViewerTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            with mock.patch.object(
-                viewer_module, "load_classic_checkpoint", return_value=checkpoint
-            ), mock.patch.object(
-                viewer_module.TorchG1ForwardKinematics,
-                "from_mjcf",
-                return_value=kinematics,
-            ), mock.patch.object(
-                viewer_module, "TerrainPFNNRuntime", return_value=object()
-            ) as factory:
+            with (
+                mock.patch.object(
+                    viewer_module, "load_classic_checkpoint", return_value=checkpoint
+                ),
+                mock.patch.object(
+                    viewer_module.TorchG1ForwardKinematics,
+                    "from_mjcf",
+                    return_value=kinematics,
+                ),
+                mock.patch.object(
+                    viewer_module, "TerrainPFNNRuntime", return_value=object()
+                ) as factory,
+            ):
                 _load_runtime(
                     arguments,
                     Path("checkpoint.pt"),
@@ -198,7 +252,7 @@ class TerrainPFNNViewerTests(unittest.TestCase):
                     Path("g1.xml"),
                     object(),
                 )
-        self.assertIs(factory.call_args.kwargs["hold_idle_pose"], True)
+        self.assertIs(factory.call_args.kwargs["hold_idle_pose"], False)
         self.assertEqual(factory.call_args.kwargs["maximum_grade_degrees"], 89.0)
 
     def test_defaults_select_the_classic_g1_artifacts(self) -> None:
@@ -208,8 +262,7 @@ class TerrainPFNNViewerTests(unittest.TestCase):
         self.assertEqual(
             arguments.dataset,
             Path(
-                "sonic/runs/native-g1-pfnn/expanded/"
-                "mixed-corpus-filtered/manifest.json"
+                "sonic/runs/native-g1-pfnn/expanded/mixed-corpus-filtered/manifest.json"
             ),
         )
         self.assertEqual(
@@ -233,6 +286,27 @@ class TerrainPFNNViewerTests(unittest.TestCase):
                 "motionbricks/out/G1-clip.ckpt"
             ),
         )
+
+    def test_scene_options_select_authenticated_terrain_and_reject_explicit_fit(
+        self,
+    ) -> None:
+        from mm_sonic.terrain_pfnn_viewer import _parser, _validate
+
+        arguments = _parser().parse_args(
+            [
+                "--scene",
+                "ramp-10-up-down",
+                "--terrain-root",
+                "/tmp/terrain",
+                "--terrain-fit",
+                "/tmp/fit.npz",
+            ]
+        )
+        self.assertEqual(arguments.scene, "ramp-10-up-down")
+        self.assertEqual(arguments.terrain_root, Path("/tmp/terrain"))
+        with mock.patch.object(Path, "is_file", return_value=True):
+            with self.assertRaisesRegex(ValueError, "--scene.*--terrain-fit"):
+                _validate(arguments)
 
     def test_motionbricks_native_g1_idle_pose_is_loaded_safely(self) -> None:
         import torch
@@ -317,54 +391,69 @@ class TerrainPFNNViewerTests(unittest.TestCase):
         self.assertEqual(viewer.cam.elevation, -18.0)
         self.assertEqual(viewer.cam.distance, 4.0)
 
-    def test_preview_root_quaternion_keeps_yaw_and_removes_tilt(self) -> None:
-        from mm_sonic.terrain_pfnn_viewer import _upright_yaw_quaternion
-
-        rolled = np.asarray((math.cos(0.2), math.sin(0.2), 0.0, 0.0))
-        np.testing.assert_allclose(
-            _upright_yaw_quaternion(rolled), (1.0, 0.0, 0.0, 0.0), atol=1.0e-12
-        )
-        yaw = 0.75
-        yawed = np.asarray((math.cos(yaw / 2.0), 0.0, 0.0, math.sin(yaw / 2.0)))
-        np.testing.assert_allclose(
-            _upright_yaw_quaternion(yawed), yawed, atol=1.0e-12
-        )
-
-    def test_idle_uses_native_g1_rest_pose_without_replacing_moving_prediction(self) -> None:
+    def test_exact_frame_preserves_full_quaternion_and_all_pfnn_joints(self) -> None:
         from mm_sonic.gear_action import mujoco_to_isaaclab_joint_vector
         from mm_sonic.terrain_pfnn_viewer import _apply_frame
 
         model = SimpleNamespace(qpos0=np.arange(36, dtype=np.float64))
         data = SimpleNamespace(qpos=np.zeros(36, dtype=np.float64))
-        frame = SimpleNamespace(
-            root_position_world=np.asarray((1.0, 2.0, 0.8)),
-            root_quaternion_world_wxyz=np.asarray((1.0, 0.0, 0.0, 0.0)),
-            joint_position_isaaclab=np.full(29, 0.25),
-            diagnostics={"idle_pose_held": True, "initial_idle_pose_held": True},
+        roll, pitch, yaw = 0.3, -0.2, 0.4
+        cr, sr = math.cos(roll / 2.0), math.sin(roll / 2.0)
+        cp, sp = math.cos(pitch / 2.0), math.sin(pitch / 2.0)
+        cy, sy = math.cos(yaw / 2.0), math.sin(yaw / 2.0)
+        frame_quaternion = np.asarray(
+            (
+                cr * cp * cy + sr * sp * sy,
+                sr * cp * cy - cr * sp * sy,
+                cr * sp * cy + sr * cp * sy,
+                cr * cp * sy - sr * sp * cy,
+            )
         )
+        frame = PFNNRuntimeFrame(
+            root_position_world=np.asarray((1.0, 2.0, 0.8)),
+            root_quaternion_world_wxyz=frame_quaternion,
+            joint_position_isaaclab=np.arange(29, dtype=np.float64) / 10.0,
+            phase=0.0,
+            contact_probability=np.zeros(4),
+            trajectory=PFNNTrajectoryState(
+                position_world_xy=np.zeros((12, 2)),
+                direction_world_xy=np.tile((1.0, 0.0), (12, 1)),
+                semantic_intent=np.tile((1.0, 0.0), (12, 1)),
+            ),
+            supported=True,
+            diagnostics={},
+        )
+        adapter = self._sloped_scene_adapter(math.pi)
 
-        _apply_frame(model, data, frame)
-        np.testing.assert_array_equal(data.qpos[7:36], model.qpos0[7:36])
-
-        frame.diagnostics["initial_idle_pose_held"] = False
-        _apply_frame(model, data, frame)
+        _apply_frame(model, data, frame, scene_terrain=adapter)
+        np.testing.assert_allclose(data.qpos[:3], (1.0, 5.0, 0.8), atol=1.0e-12)
+        scene_yaw = np.asarray(
+            (math.cos(math.pi / 4.0), 0.0, 0.0, math.sin(math.pi / 4.0))
+        )
+        expected_quaternion = np.asarray(
+            (
+                scene_yaw[0] * frame_quaternion[0] - scene_yaw[3] * frame_quaternion[3],
+                scene_yaw[0] * frame_quaternion[1] - scene_yaw[3] * frame_quaternion[2],
+                scene_yaw[0] * frame_quaternion[2] + scene_yaw[3] * frame_quaternion[1],
+                scene_yaw[0] * frame_quaternion[3] + scene_yaw[3] * frame_quaternion[0],
+            )
+        )
+        expected_quaternion /= np.linalg.norm(expected_quaternion)
+        np.testing.assert_allclose(
+            data.qpos[3:7], expected_quaternion, atol=1.0e-12, rtol=0.0
+        )
         np.testing.assert_array_equal(
             mujoco_to_isaaclab_joint_vector(data.qpos[7:36]),
             frame.joint_position_isaaclab,
         )
 
-    def test_display_pose_blends_quickly_into_motion_and_smoothly_back_to_idle(self) -> None:
-        from mm_sonic.terrain_pfnn_viewer import _blend_display_joints
+    def test_advance_has_no_display_joint_override_or_blend(self) -> None:
+        import mm_sonic.terrain_pfnn_viewer as viewer_module
 
-        previous = np.zeros(29, dtype=np.float64)
-        target = np.ones(29, dtype=np.float64)
-        moving = _blend_display_joints(previous, target, idle=False)
-        settling = _blend_display_joints(target, previous, idle=True)
-
-        np.testing.assert_allclose(moving, np.full(29, 0.45), atol=0.0, rtol=0.0)
-        np.testing.assert_allclose(
-            settling, np.full(29, 0.82), atol=2.0e-16, rtol=0.0
-        )
+        source = inspect.getsource(viewer_module._run)
+        self.assertNotIn("_upright_yaw_quaternion(", source)
+        self.assertNotIn("_blend_display_joints(", source)
+        self.assertNotIn("display_joints_mujoco=", source)
 
 
 if __name__ == "__main__":

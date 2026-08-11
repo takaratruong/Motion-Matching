@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 from pathlib import Path
 import time
 from typing import Iterable
@@ -14,6 +13,11 @@ import numpy as np
 import torch
 
 from .gear_action import isaaclab_to_mujoco_joint_vector
+from .hybrid_terrain_lmm_viewer import (
+    DEFAULT_TERRAIN_ROOT,
+    SceneTerrainAdapter,
+    load_scene_terrain,
+)
 from .train_classic_g1_pfnn import load_classic_checkpoint
 from .terrain_pfnn.hill_map import TerrainPFNNHillMap
 from .terrain_pfnn.kinematics import TorchG1ForwardKinematics
@@ -36,17 +40,29 @@ DEFAULT_DATASET = Path(
     "sonic/runs/native-g1-pfnn/expanded/mixed-corpus-filtered/manifest.json"
 )
 DEFAULT_CHECKPOINT = Path(
-    "sonic/runs/native-g1-pfnn/expanded/"
-    "model-mixed-filtered-rollout16-final-v2/best.pt"
+    "sonic/runs/native-g1-pfnn/expanded/model-mixed-filtered-rollout16-final-v2/best.pt"
 )
 DEFAULT_TERRAIN_FIT = Path(
     "sonic/runs/native-g1-pfnn/expanded/vertical-corpus/terrain/"
     "WalkingUpSteps08_000__01550_01675.npz"
 )
 DEFAULT_IDLE_CLIPS = Path(
-    "/home/ubuntu/projects/gear-sonic-pinned-60de0df/"
-    "motionbricks/out/G1-clip.ckpt"
+    "/home/ubuntu/projects/gear-sonic-pinned-60de0df/motionbricks/out/G1-clip.ckpt"
 )
+
+
+class _TerrainFitAction(argparse.Action):
+    """Remember whether the default PFNN fit was explicitly overridden."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: object,
+        option_string: str | None = None,
+    ) -> None:
+        setattr(namespace, self.dest, values)
+        setattr(namespace, "terrain_fit_explicit", True)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -56,7 +72,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--scene-xml", type=Path, default=DEFAULT_SCENE)
     parser.add_argument("--idle-clips", type=Path, default=DEFAULT_IDLE_CLIPS)
-    parser.add_argument("--terrain-fit", type=Path, default=DEFAULT_TERRAIN_FIT)
+    parser.set_defaults(terrain_fit_explicit=False)
+    parser.add_argument(
+        "--terrain-fit",
+        type=Path,
+        default=DEFAULT_TERRAIN_FIT,
+        action=_TerrainFitAction,
+    )
+    parser.add_argument("--scene")
+    parser.add_argument("--terrain-root", type=Path, default=DEFAULT_TERRAIN_ROOT)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--speed", type=float, default=0.8)
     parser.add_argument("--max-steps", type=int, default=1_000_000)
@@ -183,6 +207,68 @@ class _PFNNTerrainCallback:
         return self.surface.height_at(points)
 
 
+def _course_to_native_rotation(spawn_heading: float) -> np.ndarray:
+    """Map PFNN +X to the scene's native forward convention."""
+
+    heading = spawn_heading - 0.5 * math.pi
+    cosine, sine = math.cos(heading), math.sin(heading)
+    return np.asarray(((cosine, -sine), (sine, cosine)), dtype=np.float64)
+
+
+class _ScenePFNNTerrainCallback:
+    """One authenticated native scene expressed in the PFNN course frame."""
+
+    def __init__(self, adapter: SceneTerrainAdapter) -> None:
+        if not isinstance(adapter, SceneTerrainAdapter):
+            raise TypeError("scene terrain must be a SceneTerrainAdapter")
+        self.adapter = adapter
+        self._course_to_native = _course_to_native_rotation(adapter.spawn_heading)
+        self._gradient_step_m = 0.25 * adapter.cell_size_m
+        self.vertices, self.faces = adapter.native_mesh()
+
+    def _native_xy(self, local_xy: object) -> np.ndarray:
+        local = np.asarray(local_xy, dtype=np.float64)
+        if local.shape != (2,) or not np.isfinite(local).all():
+            raise ValueError("PFNN course XY must be one finite point")
+        return self.adapter.spawn_native_xy + self._course_to_native @ local
+
+    def __call__(self, xy: object) -> TerrainSample | None:
+        local = np.asarray(xy, dtype=np.float64)
+        if local.shape != (2,) or not np.isfinite(local).all():
+            return None
+        native = self._native_xy(local)
+        if not self.adapter.authority.contains(native):
+            return None
+        gradient = np.empty(2, dtype=np.float64)
+        for axis in range(2):
+            offset = np.zeros(2, dtype=np.float64)
+            offset[axis] = self._gradient_step_m
+            lower = self._native_xy(local - offset)
+            upper = self._native_xy(local + offset)
+            if not (
+                self.adapter.authority.contains(lower)
+                and self.adapter.authority.contains(upper)
+            ):
+                return None
+            gradient[axis] = (
+                self.adapter.authority.height_at(upper)
+                - self.adapter.authority.height_at(lower)
+            ) / (2.0 * self._gradient_step_m)
+        return TerrainSample(self.adapter.authority.height_at(native), gradient)
+
+    def collision_heights_at(self, xy: object) -> np.ndarray:
+        local = np.asarray(xy, dtype=np.float64)
+        if local.ndim != 2 or local.shape[1] != 2 or not np.isfinite(local).all():
+            raise ValueError("collision XY must have finite shape [N,2]")
+        native = self.adapter.spawn_native_xy + local @ self._course_to_native.T
+        if not all(self.adapter.authority.contains(point) for point in native):
+            raise ValueError("collision query left the authenticated scene terrain")
+        return np.asarray(
+            [self.adapter.authority.height_at(point) for point in native],
+            dtype=np.float64,
+        )
+
+
 class _PFNNCourseCallback:
     """Flat run-up followed by the unchanged scaled released-PFNN surface."""
 
@@ -265,11 +351,7 @@ class _PFNNCourseCallback:
     ) -> tuple[np.ndarray, np.ndarray]:
         query = np.asarray(points, dtype=np.float64)
         source = np.empty_like(query)
-        source[:, 0] = (
-            self.source_anchor_xy[0]
-            + query[:, 0]
-            - self._BLEND_START_X_M
-        )
+        source[:, 0] = self.source_anchor_xy[0] + query[:, 0] - self._BLEND_START_X_M
         source[:, 1] = self.source_anchor_xy[1] + query[:, 1]
         raw_height = self.surface.height_at(source) - self.source_height_m
         raw_gradient = self.surface.gradient_at(source)
@@ -281,8 +363,7 @@ class _PFNNCourseCallback:
         )
         weight = u * u * (3.0 - 2.0 * u)
         weight_derivative = (
-            6.0 * u * (1.0 - u)
-            / (self._BLEND_STOP_X_M - self._BLEND_START_X_M)
+            6.0 * u * (1.0 - u) / (self._BLEND_STOP_X_M - self._BLEND_START_X_M)
         )
         height = weight * raw_height
         gradient = weight[:, None] * raw_gradient
@@ -291,7 +372,11 @@ class _PFNNCourseCallback:
 
     def __call__(self, xy: object) -> TerrainSample | None:
         point = np.asarray(xy, dtype=np.float64)
-        if point.shape != (2,) or not np.isfinite(point).all() or not self._supported(point):
+        if (
+            point.shape != (2,)
+            or not np.isfinite(point).all()
+            or not self._supported(point)
+        ):
             return None
         height, gradient = self._heights_and_gradients(point[None, :])
         return TerrainSample(float(height[0]), gradient[0])
@@ -322,21 +407,51 @@ def _configure_camera(viewer: object) -> None:
     viewer.cam.distance = 4.0
 
 
-def _upright_yaw_quaternion(quaternion_wxyz: object) -> np.ndarray:
-    """Remove roll/pitch while preserving the predicted world yaw."""
+def _scene_root_position(
+    root_position_world: object, scene_terrain: SceneTerrainAdapter | None
+) -> np.ndarray:
+    position = np.asarray(root_position_world, dtype=np.float64)
+    if position.shape != (3,) or not np.isfinite(position).all():
+        raise ValueError("root position must be finite XYZ")
+    if scene_terrain is None:
+        return position
+    native = np.array(position, copy=True)
+    native[:2] = (
+        scene_terrain.spawn_native_xy
+        + _course_to_native_rotation(scene_terrain.spawn_heading) @ position[:2]
+    )
+    return native
 
+
+def _scene_root_quaternion(
+    quaternion_wxyz: object, scene_terrain: SceneTerrainAdapter | None
+) -> np.ndarray:
     quaternion = np.asarray(quaternion_wxyz, dtype=np.float64)
     if quaternion.shape != (4,) or not np.isfinite(quaternion).all():
         raise ValueError("root quaternion must be finite wxyz")
-    w, x, y, z = quaternion
-    yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
-    return np.asarray(
-        (math.cos(0.5 * yaw), 0.0, 0.0, math.sin(0.5 * yaw)),
+    if scene_terrain is None:
+        return quaternion
+    yaw = scene_terrain.spawn_heading - 0.5 * math.pi
+    aw, ax, ay, az = math.cos(0.5 * yaw), 0.0, 0.0, math.sin(0.5 * yaw)
+    bw, bx, by, bz = quaternion
+    result = np.asarray(
+        (
+            aw * bw - ax * bx - ay * by - az * bz,
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+        ),
         dtype=np.float64,
     )
+    norm = float(np.linalg.norm(result))
+    if not math.isfinite(norm) or norm < 1.0e-12:
+        raise ValueError("root quaternion must have nonzero norm")
+    return result / norm
 
 
 def _validate(arguments: argparse.Namespace) -> tuple[Path, Path, Path, Path, Path]:
+    if arguments.scene is not None and arguments.terrain_fit_explicit:
+        raise ValueError("--scene cannot be combined with explicit --terrain-fit")
     paths = tuple(
         Path(value).expanduser().resolve()
         for value in (
@@ -353,7 +468,9 @@ def _validate(arguments: argparse.Namespace) -> tuple[Path, Path, Path, Path, Pa
         if not terrain_fit.is_file():
             missing = (*missing, terrain_fit)
     if missing:
-        raise FileNotFoundError("missing PFNN viewer input: " + ", ".join(map(str, missing)))
+        raise FileNotFoundError(
+            "missing PFNN viewer input: " + ", ".join(map(str, missing))
+        )
     if not math.isfinite(arguments.speed) or arguments.speed <= 0.0:
         raise ValueError("--speed must be finite and positive")
     if arguments.max_steps < 1 or arguments.trace_every < 1:
@@ -369,7 +486,9 @@ def _motionbricks_idle_mujoco_qpos(path: Path) -> np.ndarray:
     try:
         payload = torch.load(path, map_location="cpu", weights_only=True)
     except (OSError, RuntimeError, TypeError, ValueError) as error:
-        raise ValueError("MotionBricks G1 idle clips cannot be loaded safely") from error
+        raise ValueError(
+            "MotionBricks G1 idle clips cannot be loaded safely"
+        ) from error
     if type(payload) is not dict:
         raise ValueError("MotionBricks G1 idle clips are invalid")
     qpos = payload.get("mujoco_qpos")
@@ -387,7 +506,9 @@ def _motionbricks_idle_mujoco_qpos(path: Path) -> np.ndarray:
     ):
         raise ValueError("MotionBricks G1 idle clips are invalid")
     result = np.asarray(qpos[0, 0].to(dtype=torch.float64), dtype=np.float64).copy()
-    if result[2] <= 0.0 or not np.isclose(np.linalg.norm(result[3:7]), 1.0, atol=1.0e-4):
+    if result[2] <= 0.0 or not np.isclose(
+        np.linalg.norm(result[3:7]), 1.0, atol=1.0e-4
+    ):
         raise ValueError("MotionBricks G1 idle keyframe is invalid")
     return result
 
@@ -421,46 +542,19 @@ def _build_scene(
     return model, mujoco.MjData(model)
 
 
-def _blend_display_joints(
-    previous: object, target: object, *, idle: bool
-) -> np.ndarray:
-    """Render-only damping for clean key-down and key-release transitions."""
-
-    before = np.asarray(previous, dtype=np.float64)
-    after = np.asarray(target, dtype=np.float64)
-    if (
-        before.shape != (29,)
-        or after.shape != (29,)
-        or not np.isfinite(before).all()
-        or not np.isfinite(after).all()
-        or type(idle) is not bool
-    ):
-        raise ValueError("display joints must be finite native-G1 vectors")
-    alpha = 0.18 if idle else 0.45
-    return before + alpha * (after - before)
-
-
 def _apply_frame(
     model: object,
     data: object,
     frame: object,
     *,
-    display_joints_mujoco: np.ndarray | None = None,
+    scene_terrain: SceneTerrainAdapter | None = None,
 ) -> None:
     data.qpos[:] = model.qpos0
-    data.qpos[:3] = frame.root_position_world
-    data.qpos[3:7] = _upright_yaw_quaternion(
-        frame.root_quaternion_world_wxyz
+    data.qpos[:3] = _scene_root_position(frame.root_position_world, scene_terrain)
+    data.qpos[3:7] = _scene_root_quaternion(
+        frame.root_quaternion_world_wxyz, scene_terrain
     )
-    if display_joints_mujoco is not None:
-        displayed = np.asarray(display_joints_mujoco, dtype=np.float64)
-        if displayed.shape != (29,) or not np.isfinite(displayed).all():
-            raise ValueError("display joint override must be a finite G1 vector")
-        data.qpos[7:36] = displayed
-    elif not bool(frame.diagnostics.get("initial_idle_pose_held", False)):
-        data.qpos[7:36] = isaaclab_to_mujoco_joint_vector(
-            frame.joint_position_isaaclab
-        )
+    data.qpos[7:36] = isaaclab_to_mujoco_joint_vector(frame.joint_position_isaaclab)
 
 
 def _trace(step: int, frame: object, terrain: object) -> str:
@@ -499,8 +593,7 @@ def _load_runtime(
         raise ValueError("classic PFNN checkpoint dataset digest mismatch")
     released = getattr(loaded, "source_kind", None) == "released_pfnn"
     if released and (
-        manifest.get("selection_sha256")
-        != loaded.vertical_slice_receipt_sha256
+        manifest.get("selection_sha256") != loaded.vertical_slice_receipt_sha256
         or manifest.get("terrain_receipt_set_sha256")
         != loaded.terrain_receipt_set_sha256
     ):
@@ -513,14 +606,21 @@ def _load_runtime(
         device=arguments.device,
         enforce_motion_envelope=strict,
         command_driven_root=False,
-        hold_idle_pose=True,
+        hold_idle_pose=False,
         maximum_grade_degrees=89.0 if released else 20.0,
     )
 
 
 def _run(arguments: argparse.Namespace) -> int:
     checkpoint, dataset, model_path, scene_xml, idle_clips = _validate(arguments)
-    if arguments.terrain_fit is None:
+    scene_terrain: SceneTerrainAdapter | None = None
+    if arguments.scene is not None:
+        scene_terrain = load_scene_terrain(
+            arguments.scene, terrain_root=arguments.terrain_root
+        )
+        terrain = _ScenePFNNTerrainCallback(scene_terrain)
+        rendered_terrain = terrain
+    elif arguments.terrain_fit is None:
         terrain_map = _viewer_terrain_map()
         terrain = _HillTerrainCallback(terrain_map)
         rendered_terrain = terrain_map
@@ -532,30 +632,13 @@ def _run(arguments: argparse.Namespace) -> int:
             y_samples=np.linspace(-4.0, 4.0, 161),
         )
         rendered_terrain = terrain
-    runtime = _load_runtime(
-        arguments, checkpoint, dataset, model_path, terrain
-    )
+    runtime = _load_runtime(arguments, checkpoint, dataset, model_path, terrain)
     model, data = _build_scene(scene_xml, rendered_terrain, idle_clips)
     import mujoco
-    display_joints = np.asarray(model.qpos0[7:36], dtype=np.float64).copy()
 
     def advance(step: int, command: np.ndarray) -> object:
         frame = runtime.step(command, camera_yaw=0.0)
-        idle = bool(frame.diagnostics.get("idle_pose_held", False))
-        target_joints = (
-            np.asarray(model.qpos0[7:36], dtype=np.float64)
-            if idle
-            else isaaclab_to_mujoco_joint_vector(frame.joint_position_isaaclab)
-        )
-        display_joints[:] = _blend_display_joints(
-            display_joints, target_joints, idle=idle
-        )
-        _apply_frame(
-            model,
-            data,
-            frame,
-            display_joints_mujoco=display_joints,
-        )
+        _apply_frame(model, data, frame, scene_terrain=scene_terrain)
         mujoco.mj_forward(model, data)
         if step % arguments.trace_every == 0 or "hold_reason" in frame.diagnostics:
             print(_trace(step, frame, terrain), flush=True)
@@ -569,9 +652,17 @@ def _run(arguments: argparse.Namespace) -> int:
                 first_hold = dict(frame.diagnostics)
                 break
         if first_hold is not None:
-            print(json.dumps({"accepted": False, "first_hold": first_hold}, sort_keys=True))
+            print(
+                json.dumps(
+                    {"accepted": False, "first_hold": first_hold}, sort_keys=True
+                )
+            )
             return 2
-        print(json.dumps({"accepted": True, "steps": arguments.smoke_steps}, sort_keys=True))
+        print(
+            json.dumps(
+                {"accepted": True, "steps": arguments.smoke_steps}, sort_keys=True
+            )
+        )
         return 0
 
     import mujoco.viewer
@@ -602,9 +693,7 @@ def _run(arguments: argparse.Namespace) -> int:
             step = 0
             while viewer.is_running() and not stopped[0] and step < arguments.max_steps:
                 started = time.monotonic()
-                frame = advance(
-                    step, _command_from_pressed(pressed, arguments.speed)
-                )
+                frame = advance(step, _command_from_pressed(pressed, arguments.speed))
                 viewer.cam.lookat[:] = frame.root_position_world
                 viewer.sync()
                 step += 1
