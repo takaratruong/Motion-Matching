@@ -98,3 +98,40 @@ git diff --check: exit 0
 
 None for Task 3. Task 4 still owns real full-corpus latency measurement, viewer
 wiring, overlay display, and the physical-GPU isolation evidence.
+
+## Review-fix follow-up
+
+Review base: `d2deaa24bb6e76cb1e29dc28b9dde6576f00c04e`.
+
+The first review RED covered malformed GPU responses, a real 129-row response
+from a 130-searchable-row corpus, and retry with 77 contact-incompatible rows.
+The focused command selected those three tests and observed `3 failed, 46
+deselected in 2.73s`: malformed rows reached CPU scoring, 129 rows were
+accepted, and retry forwarded 78 exclusions. A later metadata RED added an
+in-range but incorrect candidate count plus a negative finite device minimum;
+it observed `1 failed, 48 deselected in 2.70s` because both reached scoring.
+
+The review fix now:
+
+- caches exact searchable counts for all four contact codes once during GPU
+  construction;
+- sends only sorted, unique, explicitly rejected searchable rows during GPU
+  native-limit retry and determines contact exhaustion from the cached count;
+- never calls `_match_exclusions` or `np.union1d` on that retry path (the
+  regression test makes either call fail);
+- validates the complete device response before CPU scoring or timing mutation:
+  1-D exact integer rows, nonempty top-128 bound, strict sort/uniqueness,
+  searchable/nonexcluded/contact-compatible membership, exact nonboolean
+  counts, exact contact-filtered candidate count after exclusions, finite
+  nonnegative minimum, and finite nonnegative elapsed time; and
+- preserves close-set overflow fallback, stable float64 CPU rescoring, warm
+  timing semantics, and the unchanged CPU path. Negative zero remains a valid
+  device minimum.
+
+Final focused GREEN: `8 passed, 41 deselected in 2.39s`.
+
+Final complete runtime plus GPU scorer GREEN: `64 passed in 10.48s`.
+
+Static verification after formatting: Ruff check passed, Ruff format check
+reported both files formatted, `py_compile` exited zero, and `git diff --check`
+exited zero.

@@ -112,10 +112,10 @@ class _FloatingPointGenerator(_Generator):
 
 class _FakeSingleGpuSearch:
     def __init__(self) -> None:
-        self.responses: list[GpuSearchCandidates] = []
+        self.responses: list[object] = []
         self.calls: list[dict[str, object]] = []
 
-    def match_candidates(self, query: object, **arguments) -> GpuSearchCandidates:
+    def match_candidates(self, query: object, **arguments) -> object:
         self.calls.append(
             {
                 "query": np.array(query, dtype=np.float64, copy=True),
@@ -132,12 +132,13 @@ def _gpu_candidates(
     *,
     candidate_count: int,
     close_candidate_count: int,
+    device_minimum_score: float = 0.0,
     elapsed_ms: float = 2.5,
 ) -> GpuSearchCandidates:
     return GpuSearchCandidates(
         rows=np.asarray(rows, dtype=np.int64),
         candidate_count=candidate_count,
-        device_minimum_score=0.0,
+        device_minimum_score=device_minimum_score,
         close_candidate_count=close_candidate_count,
         elapsed_ms=elapsed_ms,
     )
@@ -540,7 +541,7 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
                     elapsed_ms=3.25,
                 ),
                 _gpu_candidates(
-                    (6, 2),
+                    (2, 6),
                     candidate_count=128,
                     close_candidate_count=2,
                     elapsed_ms=7.0,
@@ -557,10 +558,114 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         self.assertEqual(matcher.last_search_elapsed_ms, 7.0)
         self.assertEqual(matcher.warm_search_elapsed_ms, 3.25)
 
+    def test_single_gpu_rejects_malformed_candidates_before_timing_or_scoring(self):
+        fake = _FakeSingleGpuSearch()
+        with mock.patch(
+            "mm_sonic.hybrid_terrain_lmm_gpu_search.SingleGpuExactSearch",
+            return_value=fake,
+        ):
+            matcher = HybridMatcher(
+                _motion_corpus(),
+                _Generator(),
+                TerrainAuthority.flat(),
+                pose_converter=_pose_converter,
+                search_device="cuda:5",
+            )
+        base = {
+            "rows": np.asarray((0,), dtype=np.int64),
+            "candidate_count": 3,
+            "device_minimum_score": 0.0,
+            "close_candidate_count": 1,
+            "elapsed_ms": 2.5,
+        }
+        cases = (
+            ("negative row", {"rows": np.asarray((-1,), dtype=np.int64)}, ()),
+            ("excluded row", {"rows": np.asarray((1,), dtype=np.int64)}, (1,)),
+            ("terminal row", {"rows": np.asarray((3,), dtype=np.int64)}, ()),
+            ("incompatible row", {"rows": np.asarray((4,), dtype=np.int64)}, ()),
+            ("duplicate rows", {"rows": np.asarray((0, 0), dtype=np.int64)}, ()),
+            ("unsorted rows", {"rows": np.asarray((1, 0), dtype=np.int64)}, ()),
+            ("empty rows", {"rows": np.empty(0, dtype=np.int64)}, ()),
+            ("rank-two rows", {"rows": np.asarray(((0,),), dtype=np.int64)}, ()),
+            ("float rows", {"rows": np.asarray((0.5,), dtype=np.float64)}, ()),
+            ("too many rows", {"rows": np.arange(129, dtype=np.int64)}, ()),
+            ("boolean candidate count", {"candidate_count": True}, ()),
+            ("fractional candidate count", {"candidate_count": 1.0}, ()),
+            ("short candidate count", {"candidate_count": 0}, ()),
+            ("inexact candidate count", {"candidate_count": 2}, ()),
+            ("large candidate count", {"candidate_count": 7}, ()),
+            ("boolean close count", {"close_candidate_count": True}, ()),
+            ("fractional close count", {"close_candidate_count": 1.0}, ()),
+            ("zero close count", {"close_candidate_count": 0}, ()),
+            ("large close count", {"close_candidate_count": 4}, ()),
+            ("negative minimum", {"device_minimum_score": -0.1}, ()),
+            ("nonfinite minimum", {"device_minimum_score": np.inf}, ()),
+            ("negative timing", {"elapsed_ms": -1.0}, ()),
+            ("nonfinite timing", {"elapsed_ms": np.nan}, ()),
+            ("nonnumeric timing", {"elapsed_ms": "2.5"}, ()),
+        )
+        query = np.zeros(31, dtype=np.float64)
+        for label, changed, exclusions in cases:
+            with self.subTest(case=label):
+                fake.responses.append(SimpleNamespace(**{**base, **changed}))
+                matcher.last_search_elapsed_ms = 19.0
+                matcher.warm_search_elapsed_ms = 17.0
+                with (
+                    mock.patch.object(
+                        matcher,
+                        "_candidate_score",
+                        side_effect=AssertionError(
+                            "invalid candidates must not be scored"
+                        ),
+                    ),
+                    self.assertRaisesRegex(ValueError, "single-GPU"),
+                ):
+                    matcher.match(query, excluded_rows=exclusions)
+                self.assertEqual(matcher.last_search_elapsed_ms, 19.0)
+                self.assertEqual(matcher.warm_search_elapsed_ms, 17.0)
+
+    def test_single_gpu_rejects_more_than_top128_on_a_large_compatible_view(self):
+        values = np.zeros((132, 31), dtype=np.float32)
+        fake = _FakeSingleGpuSearch()
+        with mock.patch(
+            "mm_sonic.hybrid_terrain_lmm_gpu_search.SingleGpuExactSearch",
+            return_value=fake,
+        ):
+            matcher = HybridMatcher(
+                _corpus(values),
+                _Generator(),
+                TerrainAuthority.flat(),
+                pose_converter=_pose_converter,
+                search_device="cuda:5",
+            )
+        self.assertGreater(len(matcher.searchable_rows), 128)
+        fake.responses.append(
+            SimpleNamespace(
+                rows=np.array(matcher.searchable_rows[:129], copy=True),
+                candidate_count=len(matcher.searchable_rows),
+                device_minimum_score=0.0,
+                close_candidate_count=1,
+                elapsed_ms=2.5,
+            )
+        )
+        matcher.last_search_elapsed_ms = 19.0
+        matcher.warm_search_elapsed_ms = 17.0
+
+        with self.assertRaisesRegex(ValueError, "single-GPU"):
+            matcher.match(np.zeros(31, dtype=np.float64))
+
+        self.assertEqual(matcher.last_search_elapsed_ms, 19.0)
+        self.assertEqual(matcher.warm_search_elapsed_ms, 17.0)
+
     def test_single_gpu_close_set_overflow_invokes_complete_brute_force(self):
         fake = _FakeSingleGpuSearch()
         fake.responses.append(
-            _gpu_candidates((0, 2), candidate_count=5, close_candidate_count=3)
+            _gpu_candidates(
+                (0, 2),
+                candidate_count=5,
+                close_candidate_count=3,
+                device_minimum_score=-0.0,
+            )
         )
         with mock.patch(
             "mm_sonic.hybrid_terrain_lmm_gpu_search.SingleGpuExactSearch",
@@ -1129,6 +1234,88 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         self.assertEqual(state.first_candidate_limit_rejection_row, 0)
         self.assertEqual(state.max_candidate_limit_rejections_per_step, 1)
         self.assertAlmostEqual(state.qpos[7], 0.25)
+
+    def test_single_gpu_retry_forwards_only_explicit_compatible_rejections(self):
+        rows = 80
+        artifacts = ArtifactSet.empty(rows, 31)
+        artifacts.range_starts = np.asarray((0,), dtype=np.int32)
+        artifacts.range_stops = np.asarray((rows,), dtype=np.int32)
+        artifacts.positions[:, 0, 1] = 0.9
+        artifacts.rotations[..., 0] = 1.0
+        artifacts.contacts[2:] = (True, False)
+        values = np.full((rows, 31), 10.0, dtype=np.float32)
+        values[0] = 0.0
+        values[1] = 0.0
+        values[1, 0] = 0.1
+        corpus = SimpleNamespace(
+            artifacts=artifacts,
+            features=FeatureSet(
+                values, np.zeros(31, np.float32), np.ones(31, np.float32)
+            ),
+            family_ids=np.asarray((0,), dtype=np.int32),
+            family_names=("flat",),
+            candidate_retry_budget=32,
+            fps=60.0,
+            horizons=(20, 40, 60),
+        )
+
+        class SelectiveGenerator(_Generator):
+            def decode(self, features: np.ndarray, latent: np.ndarray) -> np.ndarray:
+                row = int(np.asarray(latent).reshape(-1)[0])
+                output = np.zeros(458, dtype=np.float32)
+                output[0] = 0.75 if row == 0 else 0.25
+                return output
+
+        fake = _FakeSingleGpuSearch()
+        fake.responses.extend(
+            (
+                _gpu_candidates((0, 1), candidate_count=2, close_candidate_count=1),
+                _gpu_candidates((1,), candidate_count=1, close_candidate_count=1),
+            )
+        )
+        with mock.patch(
+            "mm_sonic.hybrid_terrain_lmm_gpu_search.SingleGpuExactSearch",
+            return_value=fake,
+        ):
+            matcher = HybridMatcher(
+                corpus,
+                SelectiveGenerator(rows),
+                TerrainAuthority.flat(),
+                native_model=_limited_native_model(),
+                pose_converter=_pose_converter,
+                search_device="cuda:5",
+            )
+
+        with (
+            mock.patch.object(
+                matcher,
+                "_match_exclusions",
+                side_effect=AssertionError(
+                    "GPU retry must not expand contact incompatibilities"
+                ),
+            ),
+            mock.patch(
+                "numpy.union1d",
+                side_effect=AssertionError("GPU retry must not sort exclusions"),
+            ),
+        ):
+            state = matcher.select_query(np.zeros(31, dtype=np.float64))
+
+        self.assertEqual(state.row, 1)
+        self.assertEqual(state.candidate_limit_rejection_count, 1)
+        self.assertGreater(
+            np.count_nonzero(
+                np.any(
+                    artifacts.contacts[matcher.searchable_rows]
+                    != artifacts.contacts[0],
+                    axis=1,
+                )
+            ),
+            matcher.candidate_retry_budget,
+        )
+        self.assertEqual(len(fake.calls), 2)
+        np.testing.assert_array_equal(fake.calls[0]["excluded_rows"], ())
+        np.testing.assert_array_equal(fake.calls[1]["excluded_rows"], (0,))
 
     def test_native_invalid_successor_retries_the_same_query_exactly(self):
         values = np.full((8, 31), 10.0, dtype=np.float32)

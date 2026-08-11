@@ -530,6 +530,21 @@ class HybridMatcher:
         else:
             from .hybrid_terrain_lmm_gpu_search import SingleGpuExactSearch
 
+            contact_values = np.asarray(self.artifacts.contacts)
+            if contact_values.shape != (len(self.features), 2) or not np.all(
+                (contact_values == 0) | (contact_values == 1)
+            ):
+                raise ValueError(
+                    "single-GPU runtime contacts must have shape (rows, 2) "
+                    "and contain only booleans"
+                )
+            searchable_contacts = np.asarray(
+                contact_values[self.searchable_rows], dtype=np.uint8
+            )
+            contact_codes = searchable_contacts[:, 0] | (searchable_contacts[:, 1] << 1)
+            self._searchable_contact_counts = tuple(
+                int(value) for value in np.bincount(contact_codes, minlength=4)
+            )
             self.search_backend_identity = f"single-gpu-full-row-fp32:{search_device}"
             self._gpu_search = SingleGpuExactSearch(
                 self.features,
@@ -793,23 +808,125 @@ class HybridMatcher:
             active_contact_code=active_contact_code,
             excluded_rows=excluded,
         )
-        elapsed_ms = float(candidates.elapsed_ms)
-        if not math.isfinite(elapsed_ms) or elapsed_ms < 0.0:
+
+        try:
+            raw_rows = np.asarray(candidates.rows)
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ValueError(
+                "single-GPU candidate rows must be a one-dimensional integer array"
+            ) from error
+        if raw_rows.ndim != 1 or raw_rows.dtype.kind not in "iu":
+            raise ValueError(
+                "single-GPU candidate rows must be a one-dimensional integer array"
+            )
+        if not 1 <= len(raw_rows) <= 128:
+            raise ValueError(
+                "single-GPU candidate rows must contain between 1 and 128 rows"
+            )
+        if raw_rows.dtype.kind == "u" and np.any(raw_rows > np.iinfo(np.int64).max):
+            raise ValueError("single-GPU candidate row cannot be represented exactly")
+        rows = raw_rows.astype(np.int64, copy=False)
+        if np.any(rows[1:] <= rows[:-1]):
+            raise ValueError(
+                "single-GPU candidate rows must be strictly sorted and unique"
+            )
+        searchable_positions = np.searchsorted(self.searchable_rows, rows)
+        searchable = searchable_positions < len(self.searchable_rows)
+        searchable[searchable] &= (
+            self.searchable_rows[searchable_positions[searchable]] == rows[searchable]
+        )
+        if not np.all(searchable):
+            raise ValueError("single-GPU candidate row is not searchable")
+        if len(excluded) and np.any(np.isin(rows, excluded, assume_unique=True)):
+            raise ValueError("single-GPU candidate row was explicitly excluded")
+        candidate_contacts = np.asarray(contacts[rows])
+        if (
+            current_contact.shape != (2,)
+            or candidate_contacts.shape != (len(rows), 2)
+            or not np.all((current_contact == 0) | (current_contact == 1))
+            or not np.all((candidate_contacts == 0) | (candidate_contacts == 1))
+            or not np.all(candidate_contacts == current_contact)
+        ):
+            raise ValueError("single-GPU candidate row violates current hard contacts")
+
+        def exact_integer_metadata(name: str) -> int:
+            try:
+                value = getattr(candidates, name)
+            except AttributeError as error:
+                raise ValueError(
+                    f"single-GPU {name} must be an exact integer"
+                ) from error
+            if not isinstance(value, (int, np.integer)) or isinstance(
+                value, (bool, np.bool_)
+            ):
+                raise ValueError(f"single-GPU {name} must be an exact integer")
+            return int(value)
+
+        candidate_count = exact_integer_metadata("candidate_count")
+        close_candidate_count = exact_integer_metadata("close_candidate_count")
+        if not len(rows) <= candidate_count <= len(self.searchable_rows):
+            raise ValueError(
+                "single-GPU candidate_count is inconsistent with returned "
+                "and searchable rows"
+            )
+        excluded_contacts = np.asarray(contacts[excluded])
+        if excluded_contacts.shape != (len(excluded), 2) or not np.all(
+            (excluded_contacts == 0) | (excluded_contacts == 1)
+        ):
+            raise ValueError("single-GPU explicit exclusion contacts are invalid")
+        compatible_exclusion_count = int(
+            np.count_nonzero(np.all(excluded_contacts == current_contact, axis=1))
+        )
+        expected_candidate_count = (
+            self._searchable_contact_counts[active_contact_code]
+            - compatible_exclusion_count
+        )
+        if candidate_count != expected_candidate_count:
+            raise ValueError(
+                "single-GPU candidate_count is inconsistent with hard contacts "
+                "and explicit exclusions"
+            )
+        if not 1 <= close_candidate_count <= candidate_count:
+            raise ValueError(
+                "single-GPU close_candidate_count is inconsistent with candidates"
+            )
+
+        def finite_metadata(name: str) -> float:
+            try:
+                value = getattr(candidates, name)
+            except AttributeError as error:
+                raise ValueError(f"single-GPU {name} must be finite") from error
+            if not isinstance(
+                value, (int, float, np.integer, np.floating)
+            ) or isinstance(value, (bool, np.bool_)):
+                raise ValueError(f"single-GPU {name} must be finite")
+            try:
+                result = float(value)
+            except (OverflowError, TypeError, ValueError) as error:
+                raise ValueError(f"single-GPU {name} must be finite") from error
+            if not math.isfinite(result):
+                raise ValueError(f"single-GPU {name} must be finite")
+            return result
+
+        device_minimum_score = finite_metadata("device_minimum_score")
+        if device_minimum_score < 0.0:
+            raise ValueError("single-GPU device_minimum_score must be nonnegative")
+        elapsed_ms = finite_metadata("elapsed_ms")
+        if elapsed_ms < 0.0:
             raise ValueError(
                 "single-GPU search elapsed time must be finite and nonnegative"
             )
         self.last_search_elapsed_ms = elapsed_ms
         if self.warm_search_elapsed_ms is None:
             self.warm_search_elapsed_ms = elapsed_ms
-        rows = np.asarray(candidates.rows, dtype=np.int64)
-        if candidates.close_candidate_count > len(rows):
+        if close_candidate_count > len(rows):
             return self.brute_force_match(query, excluded_rows=excluded)
         scores = self._candidate_score(query, rows)
         row, best = self._best(rows, scores)
         return SearchResult(
             row,
             math.sqrt(max(best, 0.0)),
-            int(candidates.candidate_count),
+            candidate_count,
         )
 
     def match(
@@ -1311,10 +1428,38 @@ class HybridMatcher:
                 rejected.append(int(row))
                 self._set_world_transform(baseline_world)
                 self._active_source_root = baseline_source
-                searchable_rejections = self._match_exclusions(rejected)
-                exhausted = len(rejected) >= self.candidate_retry_budget or len(
-                    searchable_rejections
-                ) == len(self.searchable_rows)
+                if self.search_device is None:
+                    retry_exclusions = self._match_exclusions(rejected)
+                    contact_exhausted = len(retry_exclusions) == len(
+                        self.searchable_rows
+                    )
+                else:
+                    retry_exclusions = self._normalized_excluded_rows(rejected)
+                    contacts = np.asarray(self.artifacts.contacts)
+                    active_contact = np.asarray(contacts[self.state.row])
+                    rejected_contacts = np.asarray(contacts[np.asarray(rejected)])
+                    if (
+                        active_contact.shape != (2,)
+                        or rejected_contacts.shape != (len(rejected), 2)
+                        or not np.all((active_contact == 0) | (active_contact == 1))
+                        or not np.all(
+                            (rejected_contacts == 0) | (rejected_contacts == 1)
+                        )
+                        or not np.all(rejected_contacts == active_contact)
+                    ):
+                        raise ValueError(
+                            "single-GPU rejected candidate violates current hard contacts"
+                        )
+                    active_contact_code = int(active_contact[0]) | (
+                        int(active_contact[1]) << 1
+                    )
+                    contact_exhausted = (
+                        len(retry_exclusions)
+                        >= (self._searchable_contact_counts[active_contact_code])
+                    )
+                exhausted = (
+                    len(rejected) >= self.candidate_retry_budget or contact_exhausted
+                )
                 if exhausted:
                     if self._legacy_runtime:
                         proposed = self._commit_row(
@@ -1346,7 +1491,7 @@ class HybridMatcher:
                     )
                     self.state = proposed
                     break
-                result = self.match(prepared_query, excluded_rows=searchable_rejections)
+                result = self.match(prepared_query, excluded_rows=retry_exclusions)
                 row = result.row
                 search_distance = result.distance
                 (
