@@ -273,3 +273,122 @@ Nothing recorded for PID `1401033` satisfies these post-fix placeholders.
   values, sizes, and hashes, but does not embed their bytes.
 - The live listener exercise is pre-final-fix only. Fresh replacement
   PID/window/input evidence remains required after the pending fix lands.
+
+## Post-final-fix operational closure
+
+This section supersedes the earlier pending status and the placeholders in the
+reserved section above; it does not erase or reinterpret the preserved
+pre-final-fix evidence.
+The closure remains **diagnostic operational evidence only**. It is not formal
+acceptance evidence and makes no multi-GPU claim.
+
+### Corrected code, review, and committed-tree verification
+
+The exact corrected code baseline reviewed and exercised here is
+`35767f203b89ee8dfe60338d078c73b2e7dc3e6f` (`fix runtime input and formal CPU
+gates`). The evidence-report commit is documentation-only and follows that code
+commit.
+
+Two independent terminal reviews of that exact code HEAD returned **PASS with
+no findings**. The owning lane's committed-tree verification recorded:
+
+```text
+122 passed in 20.50s
+Ruff check: passed
+Ruff format check: passed
+py_compile: exit 0
+git diff --check: exit 0
+```
+
+The corrected installed-`pynput` Space normalization, mixed physical
+`Up`+`W` level-safe release behavior, and edge-triggered `R` behavior were
+independently exercised by the reviews/tests. The same review confirmed that
+GPU search remains diagnostic-only and that the generic and full formal-smoke
+paths require the CPU exact-search backend.
+
+### Identity-checked process replacement and window
+
+The old, pre-fix PID `1401033` was identity-checked and stopped cleanly before
+replacement. A direct post-replacement process scan found it absent and found
+exactly one full-walking viewer: PID `1449809`.
+
+The corrected viewer identity is:
+
+| Field | Exact value |
+| --- | --- |
+| PID | `1449809` |
+| Start time | `Mon Aug 10 19:42:42 2026 PDT` |
+| Start ticks | `53563209` |
+| Cwd | `/home/ubuntu/worktrees/motion-matching-full-walking-integration` |
+| X11 window | `65011730` |
+| `_NET_WM_PID` | `1449809` |
+| `WM_CLASS` | `"MuJoCo", "MuJoCo"` |
+| `WM_NAME` | `MuJoCo : g1_29dof_simplified` |
+| Window state | maximized horizontally/vertically and focused |
+
+The exact command line is:
+
+```text
+/home/ubuntu/miniconda3/envs/diffsim/bin/python -u -m mm_sonic.full_walking_terrain_lmm_viewer view --corpus /home/ubuntu/worktrees/motion-matching-hill-conditioning/sonic/runs/g1-full-walking-terrain-lmm/corpus-v1 --model /home/ubuntu/worktrees/motion-matching-hill-conditioning/sonic/runs/g1-full-walking-terrain-lmm/selection-full60-latent32-locomotion-v1 --scene ramp-10-up-down --g1-xml /home/ubuntu/projects/mjx-diffphysics/env/g1/assets/g1_29dof.xml --search-device cuda:5
+```
+
+Report preparation did not signal, replace, or otherwise disturb PID
+`1449809`; it remained the single live full-walking viewer.
+
+### Post-fix physical-GPU5 ownership
+
+The live compute-process inventory contains PID `1449809` only on physical
+index 5, UUID `GPU-6a819546-e32a-076b-a85e-0e539d6fd9df`, with `2488` MiB
+process memory. It contains no viewer context for PID `1449809` on GPUs 0--4
+or 6--7. Other unrelated compute processes on the host are not attributed to
+the viewer.
+
+This proves the replacement viewer's single-GPU5 ownership for this run only.
+No multi-GPU execution or support is claimed.
+
+### Live real X11/`pynput` arrow-listener validation
+
+With window `65011730` focused, the real X11/`pynput` listener received a held
+`Up` arrow for `1.0 s`, followed by release and a `0.75 s` wait. The before and
+after screenshots show a responsive family/range transition while retaining
+the diagnostic backend and full searchable-row count.
+
+Before input:
+
+- screenshot: `/tmp/full-walking-gpu5-postfix-before.png`;
+- size/type: `51545` bytes, PNG `1432x851`;
+- SHA-256:
+  `7b78b87ace439433980f12213d8be358a191d9e495c42fe9d530c5b1f817f5c2`;
+- family `0`, range `112`, row `72076`, distance `0.249249`;
+- `SUPPORTED`, height `0.000`, `LEARNED`; and
+- last search `4.841 ms`.
+
+After the held-and-released `Up` input:
+
+- screenshot: `/tmp/full-walking-gpu5-postfix-after-up.png`;
+- size/type: `67756` bytes, PNG `1432x851`;
+- SHA-256:
+  `ae2f0e48afbdf13cb5b1b88f481bcf148099d32f9905a963ad53e6175c66f6cc`;
+- family `1`, range `2569`, row `1129981`, distance `0.223741`;
+- `SUPPORTED`, height `0.000`, `LEARNED`; and
+- last search `4.815 ms`.
+
+Both screenshots visibly report full search rows `9741525/9741525`, backend
+`single-gpu-full-row-fp32:cuda:5`, and the diagnostic acceptance-ineligible
+title. The end-to-end listener input changed family `0`/range `112` to family
+`1`/range `2569` without a multi-second search stall.
+
+### Remaining post-fix input limits
+
+The installed-`pynput` Space path, mixed `Up`+`W` release bookkeeping, and
+`R` repeat behavior were independently checked in review/tests as stated
+above. No gamepad was attached during the live operational exercise, so this
+report does **not** claim a live physical-gamepad test of Space overriding an
+active gamepad command. The end-to-end X11/window exercise above covers the
+physical `Up` arrow sequence only; other fixed input paths retain their
+automated/review evidence boundary.
+
+This closes the requested post-fix replacement PID/window/arrow-input gate for
+diagnostic operation. It does not change the red frozen test receipt, establish
+formal motion acceptance, validate multi-GPU behavior, or provide sim-to-real
+evidence.
