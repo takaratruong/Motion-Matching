@@ -76,19 +76,32 @@ FULL_DIAGNOSTIC_MODEL_LABEL = (
 def _controller_diagnostic_label(matcher: object) -> str:
     try:
         identity = getattr(matcher, "controller_identity")
+        heading_policy = getattr(matcher, "controller_heading_policy")
+        yaw_rate = float(getattr(matcher, "controller_yaw_rate_rad_s"))
         acceleration = float(getattr(matcher, "controller_acceleration_mps2"))
         deceleration = float(getattr(matcher, "controller_deceleration_mps2"))
         stop_speed = float(getattr(matcher, "controller_stop_speed_mps"))
         search_interval = float(getattr(matcher, "controller_search_interval_s"))
     except (AttributeError, TypeError, ValueError):
         return ""
-    if type(identity) is not str or not all(
-        math.isfinite(value)
-        for value in (acceleration, deceleration, stop_speed, search_interval)
+    if (
+        type(identity) is not str
+        or type(heading_policy) is not str
+        or not all(
+            math.isfinite(value)
+            for value in (
+                yaw_rate,
+                acceleration,
+                deceleration,
+                stop_speed,
+                search_interval,
+            )
+        )
     ):
         return ""
     return (
-        f"CONTROL {identity}; accel {acceleration:.3f} m/s^2; "
+        f"CONTROL {identity}; heading {heading_policy}; "
+        f"yaw-rate {yaw_rate:.3f} rad/s; accel {acceleration:.3f} m/s^2; "
         f"decel {deceleration:.3f} m/s^2; stop {stop_speed:.3f} m/s; "
         f"search {search_interval:.3f} s"
     )
@@ -1099,6 +1112,12 @@ def _full_runtime_identity(
                 matcher, "warm_search_elapsed_ms", None
             ),
             "controller_identity": getattr(matcher, "controller_identity", None),
+            "controller_heading_policy": getattr(
+                matcher, "controller_heading_policy", None
+            ),
+            "controller_yaw_rate_rad_s": getattr(
+                matcher, "controller_yaw_rate_rad_s", None
+            ),
             "controller_acceleration_mps2": getattr(
                 matcher, "controller_acceleration_mps2", None
             ),

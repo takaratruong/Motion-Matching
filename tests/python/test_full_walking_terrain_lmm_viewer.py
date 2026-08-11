@@ -1051,7 +1051,9 @@ def test_holden_control_identity_is_runtime_diagnostic_only(
         search_scope="full-range-safe-corpus",
         searchable_rows=np.arange(3),
         total_searchable_row_count=3,
-        controller_identity="holden-bounded-velocity-v1",
+        controller_identity="holden-bounded-velocity-command-heading-v2",
+        controller_heading_policy="persistent-command-yaw-rate",
+        controller_yaw_rate_rad_s=1.5,
         controller_acceleration_mps2=1.5,
         controller_deceleration_mps2=2.0,
         controller_stop_speed_mps=0.05,
@@ -1072,12 +1074,18 @@ def test_holden_control_identity_is_runtime_diagnostic_only(
     label = viewer_module._full_runtime_label(matcher)
 
     assert formal_identity == {"formal-provenance": "unchanged"}
-    assert identity["controller_identity"] == "holden-bounded-velocity-v1"
+    assert identity["controller_identity"] == (
+        "holden-bounded-velocity-command-heading-v2"
+    )
+    assert identity["controller_heading_policy"] == "persistent-command-yaw-rate"
+    assert identity["controller_yaw_rate_rad_s"] == 1.5
     assert identity["controller_acceleration_mps2"] == 1.5
     assert identity["controller_deceleration_mps2"] == 2.0
     assert identity["controller_stop_speed_mps"] == 0.05
     assert identity["controller_search_interval_s"] == 0.10
-    assert "holden-bounded-velocity-v1" in label
+    assert "holden-bounded-velocity-command-heading-v2" in label
+    assert "persistent-command-yaw-rate" in label
+    assert "yaw-rate 1.500 rad/s" in label
     assert "1.500 m/s^2" in label
     assert "2.000 m/s^2" in label
     assert "0.050 m/s" in label

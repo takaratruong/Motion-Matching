@@ -409,14 +409,23 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
             pose_converter=_pose_converter,
         )
 
-        self.assertEqual(holden.controller_identity, "holden-bounded-velocity-v1")
+        self.assertEqual(
+            holden.controller_identity,
+            "holden-bounded-velocity-command-heading-v2",
+        )
         self.assertEqual(raw.controller_identity, "raw-command-v1")
+        self.assertEqual(
+            holden.controller_heading_policy, "persistent-command-yaw-rate"
+        )
+        self.assertEqual(holden.controller_yaw_rate_rad_s, 1.5)
         self.assertEqual(holden.controller_acceleration_mps2, 1.5)
         self.assertEqual(holden.controller_deceleration_mps2, 2.0)
         self.assertEqual(holden.controller_stop_speed_mps, 0.05)
         self.assertEqual(holden.controller_search_interval_s, SEARCH_INTERVAL_S)
         for name, value in (
             ("controller_identity", "changed"),
+            ("controller_heading_policy", "changed"),
+            ("controller_yaw_rate_rad_s", 0.0),
             ("controller_acceleration_mps2", 0.0),
             ("controller_deceleration_mps2", 0.0),
             ("controller_stop_speed_mps", 0.0),
@@ -683,6 +692,7 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         )
         matcher.step(CommandState(1.0), dt=0.04)
         before = np.array(matcher._shaped_velocity_local_xz, copy=True)
+        before_heading = matcher._desired_heading
 
         exhausted = replace(matcher.state, candidate_exhausted=True)
         with (
@@ -691,9 +701,10 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
                 matcher, "_commit_with_native_limit_retry", return_value=exhausted
             ),
         ):
-            matcher.step(CommandState(1.0), dt=0.04, force_search=True)
+            matcher.step(CommandState(1.0, 0.5), dt=0.04, force_search=True)
 
         np.testing.assert_array_equal(matcher._shaped_velocity_local_xz, before)
+        self.assertEqual(matcher._desired_heading, before_heading)
         matcher.reset()
         np.testing.assert_array_equal(matcher._shaped_velocity_local_xz, (0.0, 0.0))
 
@@ -849,6 +860,50 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         self.assertIs(matcher.state, before_state)
         self.assertIs(matcher._world_transform, before_world)
         self.assertEqual(matcher._desired_heading, before_heading)
+
+    def test_gpu_diagnostic_unsupported_hold_retains_heading_for_recovery(self):
+        supported = [True]
+        fake = _FakeSingleGpuSearch()
+        with mock.patch(
+            "mm_sonic.hybrid_terrain_lmm_gpu_search.SingleGpuExactSearch",
+            return_value=fake,
+        ):
+            matcher = HybridMatcher(
+                _mechanically_safe(_corpus()),
+                _Generator(),
+                TerrainAuthority(
+                    lambda _xy: 0.0,
+                    domain_contains=lambda _xy: supported[0],
+                    name="switchable-flat",
+                ),
+                pose_converter=_pose_converter,
+                search_device="cuda:5",
+                diagnostic_stability=True,
+                initial_heading=0.25,
+            )
+        before = matcher.state
+        before_world = matcher._world_transform
+        supported[0] = False
+
+        held = matcher.step(CommandState(1.0, 0.5), dt=0.04)
+
+        self.assertEqual(held.pose_source, "held-outside-support")
+        np.testing.assert_array_equal(held.qpos, before.qpos)
+        self.assertIs(matcher._world_transform, before_world)
+        self.assertAlmostEqual(matcher._desired_heading, 0.28)
+
+        supported[0] = True
+        fake.responses.append(
+            _gpu_candidates(
+                matcher.searchable_rows,
+                candidate_count=len(matcher.searchable_rows),
+                close_candidate_count=len(matcher.searchable_rows),
+            )
+        )
+        recovered = matcher.step(CommandState(1.0, 0.0), dt=0.04, force_search=True)
+
+        self.assertAlmostEqual(recovered.heading, 0.28)
+        self.assertAlmostEqual(matcher._world_transform.yaw, 0.28)
 
     def test_diagnostic_stability_filters_mechanically_unsafe_exact_winner(self):
         corpus = _mechanically_safe(_corpus())

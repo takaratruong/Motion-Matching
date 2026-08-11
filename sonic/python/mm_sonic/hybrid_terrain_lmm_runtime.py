@@ -870,12 +870,24 @@ class HybridMatcher:
         """Return the command controller active for this matcher configuration."""
 
         if self._holden_control_active:
-            return "holden-bounded-velocity-v1"
+            return "holden-bounded-velocity-command-heading-v2"
         return "raw-command-v1"
 
     @property
     def _holden_control_active(self) -> bool:
         return self.diagnostic_stability and self.search_device is not None
+
+    @property
+    def controller_heading_policy(self) -> str:
+        """Return the desired-heading ownership policy."""
+
+        return "persistent-command-yaw-rate"
+
+    @property
+    def controller_yaw_rate_rad_s(self) -> float:
+        """Return the full-scale steering yaw rate."""
+
+        return STEERING_YAW_RATE_RAD_S
 
     @property
     def controller_acceleration_mps2(self) -> float:
