@@ -12,6 +12,7 @@
 
 - Do not modify `sonic/python/mm_sonic/terrain_pfnn/runtime.py` or any checkpoint/dataset artifact.
 - Do not instantiate or call `HybridMatcher`, `ExistingUtilityPosePostprocessor`, pose repair, or foot locking in the PFNN viewer path.
+- Do not import `hybrid_terrain_lmm_viewer`; reuse `scene_runtime`'s G1HF parser/sampler so the PFNN environment requires no USD/PXR dependency.
 - Keep `command_driven_root=False`; PFNN owns planar root motion and learned support-relative root height.
 - Keep `hold_idle_pose=False`; neutral input must pass through PFNN rather than a viewer hold branch.
 - Preserve the complete PFNN root quaternion and all 29 emitted joints exactly after the existing IsaacLab-to-MuJoCo permutation.
@@ -28,7 +29,9 @@
 - Modify: `tests/python/test_terrain_pfnn_viewer.py`
 
 **Interfaces:**
-- Consumes: `load_scene_terrain(scene, terrain_root=...) -> SceneTerrainAdapter`, `TerrainSample`, and `PFNNRuntimeFrame`.
+- Consumes: `scene_runtime._parse_heightfield`,
+  `scene_runtime._sample_terrain_height`, `TerrainSample`, and
+  `PFNNRuntimeFrame`.
 - Produces: `_ScenePFNNTerrainCallback`, exact `_apply_frame`, and CLI options `--scene` / `--terrain-root`.
 
 - [ ] **Step 1: Write failing tests for the rigid scene callback**

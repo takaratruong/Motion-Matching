@@ -35,13 +35,17 @@ outputs of `TerrainPFNNRuntime`.  MuJoCo is only a renderer.
   `model-mixed-filtered-rollout16-final-v2/best.pt`.
 - Dataset: `mixed-corpus-filtered/manifest.json`, which contains flat,
   `WalkingUpSteps*`, and `terrain_slopes__*` training sources.
-- Scene loading: existing `load_scene_terrain` and `SceneTerrainAdapter`.
+- Scene loading: reuse the lightweight existing G1HF/v2 parser and exact
+  fixed-diagonal sampler from `mm_sonic.scene_runtime`.  The PFNN viewer must
+  not import `hybrid_terrain_lmm_viewer` merely to load a scene, because that
+  pulls the retired hybrid runtime and its USD/PXR dependencies into inference.
 - Skeleton conversion: existing `isaaclab_to_mujoco_joint_vector`.
 
 ## Viewer adapter
 
 Extend `terrain_pfnn_viewer.py` with an optional `--scene` and
-`--terrain-root`.  When `--scene` is present, load the existing G1HF scene and
+`--terrain-root`.  When `--scene` is present, load the existing G1HF scene via
+the shared parser/sampler and
 construct a callback that:
 
 1. maps PFNN course XY into scene-native XY using the scene spawn and the
