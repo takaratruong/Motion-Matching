@@ -90,8 +90,9 @@ class TerrainPFNNSourcesTest(unittest.TestCase):
         pfnn_root[:, 0] = np.arange(pfnn_frames, dtype=np.float64)
         pfnn_quaternion = np.zeros((pfnn_frames, 4), dtype=np.float64)
         pfnn_quaternion[:, 3] = 1.0
-        pfnn_dof = np.arange(pfnn_frames * 29, dtype=np.float64).reshape(
-            pfnn_frames, 29
+        pfnn_dof = (
+            np.square(np.arange(pfnn_frames, dtype=np.float64))[:, None]
+            + np.arange(29, dtype=np.float64)[None, :]
         ) / 1000.0
         with self.pfnn_motion.open("wb") as stream:
             np.savez_compressed(
@@ -177,6 +178,15 @@ class TerrainPFNNSourcesTest(unittest.TestCase):
         np.testing.assert_array_equal(source.root_position_world[:, 0], [0.0, 4.0, 8.0])
         self.assertEqual(source.joint_position.shape, (3, 29))
         self.assertEqual(source.body_position_world.shape, (3, 30, 3))
+        self.assertEqual(source.joint_velocity_source, "unique_predecessor")
+        backward = (
+            source.joint_position[1] - source.joint_position[0]
+        ) * np.float32(30.0)
+        central = (
+            source.joint_position[2] - source.joint_position[0]
+        ) * np.float32(15.0)
+        np.testing.assert_array_equal(source.joint_velocity[1], backward)
+        self.assertFalse(np.array_equal(source.joint_velocity[1], central))
 
     def test_pfnn_retarget_rejects_receipt_or_artifact_tampering(self) -> None:
         receipt_path = self.pfnn_motion.with_suffix(".receipt.json")

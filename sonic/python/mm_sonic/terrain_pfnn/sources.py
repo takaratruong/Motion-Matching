@@ -23,10 +23,7 @@ from mm_sonic.retarget_pfnn_bvh_g1 import (
     PFNN_POSITION_SCALE,
     RETARGET_PROJECT_COMMIT,
 )
-from mm_sonic.terrain_oracle.canonical import (
-    ISAACLAB_BODY_NAMES,
-    ISAACLAB_JOINT_NAMES,
-)
+from mm_sonic.terrain_oracle.canonical import ISAACLAB_BODY_NAMES
 from mm_sonic.terrain_oracle.math3d import (
     finite_difference,
     quaternion_inverse_wxyz,
@@ -71,6 +68,20 @@ _PFNN_RETARGET_ARRAY_FIELDS = {
     "joint_names",
     "joint_limits",
 }
+
+
+def _backward_finite_difference(value: object, fps: float) -> np.ndarray:
+    """Differentiate using only the current and unique predecessor samples."""
+
+    samples = _readonly_float32(value, "backward-difference values")
+    if samples.ndim < 1 or len(samples) < 2:
+        raise ValueError("backward-difference values need at least two frames")
+    if type(fps) not in (int, float) or not np.isfinite(fps) or fps <= 0.0:
+        raise ValueError("backward-difference fps must be positive and finite")
+    result = np.zeros_like(samples)
+    result[1:] = (samples[1:] - samples[:-1]) * np.float32(fps)
+    result.flags.writeable = False
+    return result
 _TERRAIN_QUATERNION_WORLD_FROM_USD_WXYZ = np.array(
     (np.sqrt(0.5), 0.0, 0.0, -np.sqrt(0.5)), dtype=np.float32
 )
@@ -184,6 +195,7 @@ class PFNNSourceClip:
     motion_sha256: str
     terrain_sha256: str | None
     source_license_id: str
+    joint_velocity_source: str = "direct_source"
 
     def __post_init__(self) -> None:
         if type(self.clip_id) is not str or not self.clip_id:
@@ -194,6 +206,8 @@ class PFNNSourceClip:
             raise ValueError("PFNN source clips must be exactly 30 Hz")
         if type(self.source_license_id) is not str or not self.source_license_id:
             raise ValueError("source_license_id must be a nonempty string")
+        if self.joint_velocity_source not in ("direct_source", "unique_predecessor"):
+            raise ValueError("joint_velocity_source is invalid")
         if _SHA256_RE.fullmatch(self.motion_sha256) is None:
             raise ValueError("motion_sha256 must be a lowercase SHA-256 digest")
         if self.terrain_sha256 is not None and _SHA256_RE.fullmatch(self.terrain_sha256) is None:
@@ -328,13 +342,14 @@ def _make_clip(
         body_angular_velocity_world=_angular_velocity_world_wxyz(body_wxyz, _FPS),
         root_linear_velocity_world=finite_difference(root_position, _FPS),
         root_angular_velocity_world=_angular_velocity_world_wxyz(root_wxyz, _FPS),
-        joint_velocity=finite_difference(joint_position, _FPS),
+        joint_velocity=_backward_finite_difference(joint_position, _FPS),
         terrain_path=terrain_path,
         terrain_position_world=terrain_position,
         terrain_quaternion_world_from_usd_wxyz=terrain_quaternion,
         motion_sha256=motion_sha256,
         terrain_sha256=terrain_sha256,
         source_license_id=source_license_id,
+        joint_velocity_source="unique_predecessor",
     )
 
 

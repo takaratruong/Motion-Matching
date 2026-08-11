@@ -25,7 +25,6 @@ from mm_sonic.pfnn_terrain_fit import (
 )
 from mm_sonic.retarget_pfnn_bvh_g1 import G1_JOINT_NAMES
 from mm_sonic.terrain_oracle.canonical import ISAACLAB_JOINT_NAMES
-from mm_sonic.terrain_oracle.math3d import finite_difference
 from mm_sonic.terrain_pfnn.features import (
     PFNNTrainingWindow,
     build_clip_windows_with_audit,
@@ -52,7 +51,11 @@ from mm_sonic.terrain_pfnn.pfnn_surface import (
     PlacedPFNNSurface,
 )
 from mm_sonic.terrain_pfnn.phase import ContactPhaseTrack, released_pfnn_phase_track
-from mm_sonic.terrain_pfnn.sources import PFNNSourceClip, load_pfnn_retarget_source
+from mm_sonic.terrain_pfnn.sources import (
+    PFNNSourceClip,
+    _backward_finite_difference,
+    load_pfnn_retarget_source,
+)
 
 
 VERTICAL_DATASET_SCHEMA = "g1-pfnn-vertical-dataset/v3"
@@ -381,8 +384,18 @@ def build_vertical_dataset(sources: tuple[VerticalSliceSource, ...]) -> Vertical
     rejected_joints: Counter[str] = Counter(
         {name: 0 for name in ISAACLAB_JOINT_NAMES}
     )
-    state_sources = {source.stem: "direct_source" for source in ordered}
+    state_sources = {
+        source.stem: source.clip.joint_velocity_source for source in ordered
+    }
     for source in ordered:
+        if source.clip.joint_velocity_source == "unique_predecessor":
+            expected_velocity = _backward_finite_difference(
+                source.clip.joint_position, source.clip.fps
+            )
+            if not np.array_equal(
+                source.clip.joint_velocity[1:], expected_velocity[1:]
+            ):
+                raise ValueError("predecessor-derived joint velocity is invalid")
         for segment in source.segments:
             result = build_clip_windows_with_audit(
                 source.clip,
@@ -396,6 +409,12 @@ def build_vertical_dataset(sources: tuple[VerticalSliceSource, ...]) -> Vertical
                     <= center
                     < segment.cycle_stop_frame_120hz
                 ):
+                    continue
+                if (
+                    source.clip.joint_velocity_source == "unique_predecessor"
+                    and window.center_frame < 1
+                ):
+                    rejected_rows[source.stem]["missing_unique_predecessor"] += 1
                     continue
                 root_xy = np.asarray(
                     source.clip.root_position_world[window.center_frame, :2],
@@ -889,7 +908,7 @@ def _authenticated_retarget_joint_state(
         ):
             raise ValueError("vertical migration retarget joint contract is invalid")
         q = mujoco_to_isaaclab_joints(dof[::4])
-        qdot = finite_difference(q, 30.0)
+        qdot = _backward_finite_difference(q, 30.0)
         output[stem] = (
             start,
             np.ascontiguousarray(q, dtype=np.float32),
@@ -935,6 +954,9 @@ def migrate_vertical_dataset_v3(
             if offset < 0 or offset % 4 or offset // 4 >= len(q_trace):
                 raise ValueError("vertical migration row has no exact retarget frame")
             frame = offset // 4
+            if frame < 1:
+                rejected[stem]["missing_unique_predecessor"] += 1
+                continue
             q = q_trace[frame]
             qdot = qdot_trace[frame]
             if mirrored:
@@ -975,7 +997,7 @@ def migrate_vertical_dataset_v3(
         accepted_rows_by_source=dict(accepted),
         rejected_rows_by_source={source: dict(counts) for source, counts in rejected.items()},
         rejected_rows_by_joint=dict(rejected_joints),
-        state_source_by_clip={stem: "direct_source" for stem in retarget},
+        state_source_by_clip={stem: "unique_predecessor" for stem in retarget},
         migration_provenance={
             "source_dataset_sha256": str(manifest["dataset_sha256"]),
             "retarget_manifest_sha256": str(manifest["retarget_manifest_sha256"]),

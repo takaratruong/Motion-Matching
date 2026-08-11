@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -14,6 +15,7 @@ from mm_sonic.build_g1_pfnn_vertical_dataset import (
     build_vertical_dataset,
     build_vertical_dataset_from_retarget,
     load_vertical_dataset,
+    migrate_vertical_dataset_v3,
     save_vertical_dataset,
 )
 from mm_sonic.pfnn_terrain_fit import PFNNTerrainFit
@@ -171,6 +173,96 @@ class BuildG1PFNNVerticalDatasetTest(unittest.TestCase):
             arrays.y[index, OUTPUT_LAYOUT["joint_position"]],
             train_source.clip.joint_position[frame + 1],
         )
+
+    def test_position_only_migration_uses_backward_qdot_and_receipts_boundary(self) -> None:
+        def split(clip: str) -> dict[str, np.ndarray]:
+            q = np.zeros((2, 29), dtype=np.float32)
+            q[1] = np.float32(0.01)
+            y = np.zeros((2, OUTPUT_LAYOUT.size), dtype=np.float32)
+            y[:, OUTPUT_LAYOUT["joint_position"]] = q
+            return {
+                "x": np.zeros((2, INPUT_LAYOUT.size), dtype=np.float32),
+                "y": y,
+                "phase": np.asarray((0.0, 0.1), dtype=np.float32),
+                "clip_id": np.asarray((clip, clip), dtype="<U128"),
+                "sequence_lane": np.asarray(("motion", "motion"), dtype="<U16"),
+                "center_frame_120hz": np.asarray((400, 404), dtype=np.int64),
+                "root_world_xy": np.zeros((2, 2), dtype=np.float32),
+                "root_world_yaw": np.zeros(2, dtype=np.float32),
+                "terrain_class": np.asarray(("flat", "flat"), dtype="<U10"),
+                "terrain_sha256": np.asarray(("a" * 64, "a" * 64), dtype="<U64"),
+                "mirrored": np.zeros(2, dtype=np.bool_),
+            }
+
+        traces: dict[str, tuple[int, np.ndarray, np.ndarray]] = {}
+        for clip in ("released_train", "released_val"):
+            q = np.zeros((3, 29), dtype=np.float32)
+            q[1] = np.float32(0.01)
+            q[2] = np.float32(0.04)
+            qdot = np.zeros_like(q)
+            qdot[1:] = (q[1:] - q[:-1]) * np.float32(30.0)
+            traces[clip] = (400, q, qdot)
+        manifest = {
+            "dataset_sha256": "1" * 64,
+            "selection_sha256": "2" * 64,
+            "retarget_manifest_sha256": "3" * 64,
+            "terrain_receipt_set_sha256": "4" * 64,
+            "source_roles": {
+                "released_train": "train",
+                "released_val": "validation",
+            },
+        }
+        normalization = {
+            "x_mean": np.zeros(INPUT_LAYOUT.size, dtype=np.float32),
+            "x_std": np.ones(INPUT_LAYOUT.size, dtype=np.float32),
+            "y_mean": np.zeros(OUTPUT_LAYOUT.size, dtype=np.float32),
+            "y_std": np.ones(OUTPUT_LAYOUT.size, dtype=np.float32),
+        }
+        with (
+            mock.patch(
+                "mm_sonic.build_g1_pfnn_vertical_dataset._load_authenticated_vertical_v2",
+                return_value=(
+                    manifest,
+                    {
+                        "train": split("released_train"),
+                        "validation": split("released_val"),
+                    },
+                    normalization,
+                ),
+            ),
+            mock.patch(
+                "mm_sonic.build_g1_pfnn_vertical_dataset._authenticated_retarget_joint_state",
+                return_value=traces,
+            ),
+        ):
+            dataset = migrate_vertical_dataset_v3(
+                source_v2=Path("unused-v2"), retarget_root=Path("unused-retarget")
+            )
+
+        for split_name, clip in (
+            ("train", "released_train"),
+            ("validation", "released_val"),
+        ):
+            arrays = dataset.splits[split_name]
+            self.assertEqual(arrays.center_frame_120hz.tolist(), [404])
+            np.testing.assert_array_equal(
+                arrays.x[0, CLASSIC_G1_INPUT_LAYOUT_V3["joint_position"]],
+                traces[clip][1][1],
+            )
+            np.testing.assert_array_equal(
+                arrays.x[0, CLASSIC_G1_INPUT_LAYOUT_V3["joint_velocity"]],
+                (traces[clip][1][1] - traces[clip][1][0]) * np.float32(30.0),
+            )
+            self.assertEqual(
+                dataset.joint_state_receipt["rejected_rows_by_source"][clip][
+                    "missing_unique_predecessor"
+                ],
+                1,
+            )
+            self.assertEqual(
+                dataset.joint_state_receipt["state_source_by_clip"][clip],
+                "unique_predecessor",
+            )
 
     def test_v3_mirror_uses_existing_joint_map_and_is_bitwise_involutive(self) -> None:
         dataset = build_vertical_dataset((
