@@ -34,7 +34,8 @@
 - [ ] **Step 1: Write failing tests for the rigid scene callback**
 
   Add a two-by-two sloped `SceneTerrainAdapter` fixture. Assert local PFNN
-  `(0, 0)` maps to its scene spawn, local +X maps along the scene heading,
+  `(0, 0)` maps to its scene spawn, local +X maps to native
+  `(sin(heading), -cos(heading))`,
   returned height equals `authority.height`, returned gradient is expressed in
   local axes, and the callback's vertices/faces are exactly `native_mesh()`.
 

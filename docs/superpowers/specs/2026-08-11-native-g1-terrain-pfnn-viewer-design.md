@@ -44,7 +44,9 @@ Extend `terrain_pfnn_viewer.py` with an optional `--scene` and
 `--terrain-root`.  When `--scene` is present, load the existing G1HF scene and
 construct a callback that:
 
-1. maps PFNN course XY into scene-native XY using the scene spawn and heading;
+1. maps PFNN course XY into scene-native XY using the scene spawn and the
+   established native forward vector `(sin(heading), -cos(heading))`, so PFNN
+   local +X is character-forward;
 2. samples height and finite, piecewise height gradient from that exact scene;
 3. maps the gradient back into PFNN course axes; and
 4. exposes the unchanged scene mesh for rendering.
