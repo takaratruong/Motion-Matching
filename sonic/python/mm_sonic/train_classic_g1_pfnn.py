@@ -657,6 +657,11 @@ def _evaluate(
 
 
 def train(arguments: argparse.Namespace) -> Path:
+    if arguments.train_source == "grail":
+        raise ValueError(
+            "legacy 288-value GRAIL shards are incompatible with classic PFNN v3; "
+            "choose --train-source released-pfnn or mixed"
+        )
     torch.manual_seed(arguments.seed)
     np.random.seed(arguments.seed)
     device = torch.device(arguments.device)
@@ -839,7 +844,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--train-source",
         choices=("grail", "mixed", "released-pfnn"),
-        default="grail",
+        default="released-pfnn",
     )
     parser.add_argument(
         "--runtime-seed", choices=("flat", "terrain"), default="flat"

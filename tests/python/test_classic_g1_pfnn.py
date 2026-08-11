@@ -105,7 +105,32 @@ class ClassicG1PFNNTests(unittest.TestCase):
         used = np.concatenate(batches)
         self.assertTrue(np.all(source_kind[used] == "grail"))
         self.assertTrue(set(range(5)).issubset(set(used.tolist())))
-        self.assertEqual(_parser().parse_args(["--dataset", "d", "--model-path", "m", "--output", "o"]).train_source, "grail")
+
+    def test_cli_defaults_to_the_v3_compact_released_source(self) -> None:
+        arguments = _parser().parse_args(
+            ["--dataset", "d", "--model-path", "m", "--output", "o"]
+        )
+
+        self.assertEqual(arguments.train_source, "released-pfnn")
+
+    def test_explicit_legacy_grail_source_fails_before_dataset_loading(self) -> None:
+        arguments = _parser().parse_args(
+            [
+                "--dataset",
+                "/definitely/missing/legacy-grail",
+                "--model-path",
+                "/definitely/missing/g1.xml",
+                "--output",
+                "/definitely/missing/output",
+                "--train-source",
+                "grail",
+            ]
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "legacy 288.*released-pfnn.*mixed"
+        ):
+            train(arguments)
 
     def test_released_pfnn_batches_are_deterministic_and_cover_each_row_once(self) -> None:
         first = vertical_epoch_batches(11, batch_size=4, seed=23, epoch=2)
