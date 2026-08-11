@@ -1941,6 +1941,142 @@ class HybridTerrainViewerTests(unittest.TestCase):
         self.assertEqual(accumulator.advance(1.0 / 60.0, ticks.append), 1)
         self.assertEqual(ticks, [0.04])
 
+    def test_interactive_space_hard_stop_level_reaches_every_fixed_tick(self):
+        import mujoco
+
+        state = SimpleNamespace(
+            qpos=np.zeros(36, np.float64),
+            family="slope",
+            range_index=1,
+            row=2,
+            search_distance=0.0,
+            terrain_features=np.zeros(4),
+            decode_count=0,
+            fallback_count=0,
+            joint_clamp_count=0,
+            max_joint_clamp_magnitude=0.0,
+            support_height=0.0,
+            support_status="SUPPORTED",
+            pose_source="learned",
+            searchable_row_count=6,
+            searchable_family_counts=(("slope", 6),),
+            total_searchable_row_count=6,
+            search_scope="full-range-safe-corpus",
+            transition_penalty=0.1,
+        )
+        calls: list[tuple[CommandState, bool]] = []
+
+        def step(command: CommandState, *, dt: float, hard_stop: bool = False):
+            self.assertEqual(dt, 1.0 / 25.0)
+            calls.append((command, hard_stop))
+            return state
+
+        matcher = SimpleNamespace(
+            corpus=object(),
+            state=state,
+            step=step,
+            reset=lambda: state,
+            search_scope="full-range-safe-corpus",
+            search_acceptance_eligible=False,
+        )
+        terrain = replace(
+            load_scene_terrain("hills"),
+            scene_authenticated=False,
+            scene_evidence_status="diagnostic",
+        )
+        keys = KeyboardCommandSource()
+        listener = SimpleNamespace(
+            start=lambda: None, stop=lambda: None, join=lambda timeout: None
+        )
+        keyboard = SimpleNamespace(
+            Key=SimpleNamespace(esc=object()),
+            Listener=lambda **_kwargs: listener,
+        )
+
+        class FakeAccumulator:
+            def __init__(self, *, step_hz: float):
+                self.step_hz = step_hz
+
+            def advance(self, _elapsed: float, callback):
+                callback(1.0 / self.step_hz)
+                callback(1.0 / self.step_hz)
+                return 2
+
+        class FakeViewer:
+            cam = SimpleNamespace(
+                distance=0.0,
+                azimuth=0.0,
+                elevation=0.0,
+                lookat=np.zeros(3, np.float64),
+            )
+            user_scn = SimpleNamespace(flags=np.zeros(1_000, np.int32))
+
+            def __init__(self):
+                self.frame = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def is_running(self):
+                if self.frame == 0:
+                    keys.press("arrow-up")
+                elif self.frame == 1:
+                    keys.release("arrow-up")
+                elif self.frame == 2:
+                    keys.press("space")
+                self.frame += 1
+                return self.frame <= 3
+
+            def lock(self):
+                return contextlib.nullcontext()
+
+            def set_texts(self, _texts):
+                return None
+
+            def sync(self):
+                return None
+
+        identity = {
+            "scene_authentication_current": False,
+            "generator_acceptance_status": {"accepted": False},
+        }
+        with (
+            mock.patch.dict(os.environ, {"DISPLAY": ":99"}),
+            mock.patch.object(
+                viewer_module, "KeyboardCommandSource", return_value=keys
+            ),
+            mock.patch.object(viewer_module, "FixedRateAccumulator", FakeAccumulator),
+            mock.patch.object(
+                viewer_module, "_load_keyboard_module", return_value=keyboard
+            ),
+            mock.patch.object(
+                viewer_module,
+                "optional_evdev_source",
+                return_value=SimpleNamespace(
+                    connected=False, snapshot=lambda: CommandState()
+                ),
+            ),
+            mock.patch.object(
+                viewer_module, "build_viewer_model", return_value=object()
+            ),
+            mock.patch.object(
+                mujoco, "MjData", return_value=SimpleNamespace(qpos=np.zeros(36))
+            ),
+            mock.patch.object(mujoco, "mj_forward"),
+            mock.patch("mujoco.viewer.launch_passive", return_value=FakeViewer()),
+            mock.patch.object(
+                viewer_module, "_runtime_identity", return_value=identity
+            ),
+        ):
+            viewer_module.run_interactive(matcher, terrain, max_render_frames=3)
+
+        self.assertEqual(calls[:2], [(CommandState(speed=1.0), False)] * 2)
+        self.assertEqual(calls[2:4], [(CommandState(), False)] * 2)
+        self.assertEqual(calls[4:], [(CommandState(), True)] * 2)
+
     def test_interactive_receipt_binds_identity_and_is_not_acceptance_evidence(self):
         import mujoco
 
@@ -2127,7 +2263,9 @@ class HybridTerrainViewerTests(unittest.TestCase):
             artifacts=SimpleNamespace(contacts=np.asarray([[False, False]] * 3)),
             corpus=object(),
             state=state,
-            step=lambda _command, dt: events.append("matcher.step") or state,
+            step=lambda _command, *, dt, hard_stop=False: (
+                events.append("matcher.step") or state
+            ),
             reset=lambda: events.append("matcher.reset") or state,
             search_scope="diagnostic",
             search_acceptance_eligible=False,

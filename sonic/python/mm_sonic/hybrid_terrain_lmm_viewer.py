@@ -2100,9 +2100,9 @@ def run_interactive(
     next_scene_authentication_check = started
     display_qpos = np.asarray(matcher.state.qpos)
 
-    def fixed_rate_step(dt: float, command: CommandState) -> None:
+    def fixed_rate_step(dt: float, command: CommandState, hard_stop: bool) -> None:
         nonlocal display_qpos
-        state = matcher.step(command, dt=dt)
+        state = matcher.step(command, dt=dt, hard_stop=hard_stop)
         display_qpos = (
             state.qpos
             if postprocessor is None
@@ -2132,11 +2132,12 @@ def run_interactive(
                 if stopped:
                     break
                 gamepad_command = joystick.snapshot()
+                hard_stop = keys.hard_stop_active()
                 command = _select_control_command(
                     keyboard_command=keyboard_command,
                     gamepad_command=gamepad_command,
                     gamepad_connected=joystick.connected,
-                    hard_stop=keys.hard_stop_active(),
+                    hard_stop=hard_stop,
                 )
                 if reset:
                     previous = matcher.state
@@ -2147,7 +2148,10 @@ def run_interactive(
                     if error is None and postprocessor is not None:
                         postprocessor.reset()
                 accumulator.advance(
-                    elapsed, lambda dt, command=command: fixed_rate_step(dt, command)
+                    elapsed,
+                    lambda dt, command=command, hard_stop=hard_stop: fixed_rate_step(
+                        dt, command, hard_stop
+                    ),
                 )
                 data.qpos[:] = display_qpos
                 mujoco.mj_forward(model, data)

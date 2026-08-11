@@ -1041,6 +1041,91 @@ def test_full_gpu_identity_and_label_remain_diagnostic(
     assert "EXACT SEARCH" not in label
 
 
+def test_holden_control_identity_is_runtime_diagnostic_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    formal_identity = {"formal-provenance": "unchanged"}
+    matcher = SimpleNamespace(
+        corpus=object(),
+        generator=object(),
+        search_scope="full-range-safe-corpus",
+        searchable_rows=np.arange(3),
+        total_searchable_row_count=3,
+        controller_identity="holden-bounded-velocity-v1",
+        controller_acceleration_mps2=1.5,
+        controller_deceleration_mps2=2.0,
+        controller_stop_speed_mps=0.05,
+        controller_search_interval_s=0.10,
+        diagnostic_stability=True,
+        search_backend_identity="single-gpu-full-row-fp32:cuda:5",
+        search_acceptance_eligible=False,
+    )
+    terrain = SimpleNamespace(scene_id="ramp-10-up-down")
+    monkeypatch.setattr(
+        viewer_module, "_formal_identity", lambda *_args, **_kwargs: formal_identity
+    )
+    monkeypatch.setattr(
+        viewer_module, "scene_authentication_is_current", lambda *_args: True
+    )
+
+    identity = _full_runtime_identity(matcher, terrain, Path("g1.xml"))
+    label = viewer_module._full_runtime_label(matcher)
+
+    assert formal_identity == {"formal-provenance": "unchanged"}
+    assert identity["controller_identity"] == "holden-bounded-velocity-v1"
+    assert identity["controller_acceleration_mps2"] == 1.5
+    assert identity["controller_deceleration_mps2"] == 2.0
+    assert identity["controller_stop_speed_mps"] == 0.05
+    assert identity["controller_search_interval_s"] == 0.10
+    assert "holden-bounded-velocity-v1" in label
+    assert "1.500 m/s^2" in label
+    assert "2.000 m/s^2" in label
+    assert "0.050 m/s" in label
+    assert "0.100 s" in label
+
+
+def test_holden_control_identity_leaves_accepted_full_label_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    matcher = SimpleNamespace(
+        diagnostic_stability=False,
+        search_backend_identity="cpu-ckdtree-exact",
+        search_acceptance_eligible=True,
+        generator=object(),
+        controller_identity="holden-bounded-velocity-v1",
+        controller_acceleration_mps2=1.5,
+        controller_deceleration_mps2=2.0,
+        controller_stop_speed_mps=0.05,
+        controller_search_interval_s=0.10,
+    )
+    monkeypatch.setattr(
+        viewer_module,
+        "_generator_acceptance_status",
+        lambda _generator: {"accepted": True},
+    )
+
+    assert viewer_module._full_runtime_label(matcher) == viewer_module.FULL_LABEL
+
+
+def test_holden_control_identity_does_not_change_general_diagnostic_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    matcher = SimpleNamespace(
+        diagnostic_stability=False,
+        search_backend_identity="single-gpu-full-row-fp32:cuda:5",
+        controller_identity="holden-bounded-velocity-v1",
+        controller_acceleration_mps2=1.5,
+        controller_deceleration_mps2=2.0,
+        controller_stop_speed_mps=0.05,
+        controller_search_interval_s=0.10,
+    )
+
+    assert (
+        viewer_module._full_runtime_label(matcher)
+        == viewer_module.FULL_DIAGNOSTIC_LABEL
+    )
+
+
 @pytest.mark.parametrize("canonical_source", (False, True))
 def test_full_stability_identity_reports_canonical_source_policy(
     monkeypatch: pytest.MonkeyPatch, canonical_source: bool

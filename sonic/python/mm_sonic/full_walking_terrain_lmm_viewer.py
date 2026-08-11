@@ -71,6 +71,29 @@ FULL_DIAGNOSTIC_MODEL_LABEL = (
     "FULL WALKING TERRAIN LMM "
     "(DIAGNOSTIC UNVERIFIED FULL-CORPUS MODEL; NOT ACCEPTANCE EVIDENCE)"
 )
+
+
+def _controller_diagnostic_label(matcher: object) -> str:
+    try:
+        identity = getattr(matcher, "controller_identity")
+        acceleration = float(getattr(matcher, "controller_acceleration_mps2"))
+        deceleration = float(getattr(matcher, "controller_deceleration_mps2"))
+        stop_speed = float(getattr(matcher, "controller_stop_speed_mps"))
+        search_interval = float(getattr(matcher, "controller_search_interval_s"))
+    except (AttributeError, TypeError, ValueError):
+        return ""
+    if type(identity) is not str or not all(
+        math.isfinite(value)
+        for value in (acceleration, deceleration, stop_speed, search_interval)
+    ):
+        return ""
+    return (
+        f"CONTROL {identity}; accel {acceleration:.3f} m/s^2; "
+        f"decel {deceleration:.3f} m/s^2; stop {stop_speed:.3f} m/s; "
+        f"search {search_interval:.3f} s"
+    )
+
+
 _FULL_FORMAL_ARTIFACT_AUTHORITIES = {
     "corpus_schema": "g1-full-walking-terrain-lmm-corpus/v1",
     "model_schema": "g1-full-walking-terrain-lmm-model/v1",
@@ -435,6 +458,10 @@ def _full_runtime_label(
     search_acceptance_current: bool | None = None,
     formal_authorities_current: bool | None = None,
 ) -> str:
+    def with_controller_label(label: str) -> str:
+        controller_label = _controller_diagnostic_label(matcher)
+        return f"{label} | {controller_label}" if controller_label else label
+
     if getattr(matcher, "diagnostic_stability", False):
         pose_policy = (
             "CANONICAL SOURCE POSES; "
@@ -450,14 +477,14 @@ def _full_runtime_label(
         )
         total = getattr(matcher, "total_searchable_row_count", None)
         if len(bounds) == 2 and retained is not None and total is not None:
-            return (
+            return with_controller_label(
                 "FULL WALKING TERRAIN LMM "
                 f"(DIAGNOSTIC {pose_policy}MECHANICALLY FILTERED "
                 f"{float(bounds[0]):.3f}.."
                 f"{float(bounds[1]):.3f} M; {int(retained)}/{int(total)} "
                 "RANGE-SAFE ROWS; NOT ACCEPTANCE EVIDENCE)"
             )
-        return (
+        return with_controller_label(
             "FULL WALKING TERRAIN LMM "
             f"(DIAGNOSTIC {pose_policy}MECHANICALLY FILTERED SEARCH; "
             "NOT ACCEPTANCE EVIDENCE)"
@@ -1043,10 +1070,12 @@ def _full_runtime_identity(
             "adapters": {str(getattr(terrain, "scene_id", "scene")): terrain},
         },
     )()
-    identity = _formal_identity(
-        evaluator,
-        scenes=(str(getattr(terrain, "scene_id", "scene")),),
-        g1_xml=Path(g1_xml),
+    identity = dict(
+        _formal_identity(
+            evaluator,
+            scenes=(str(getattr(terrain, "scene_id", "scene")),),
+            g1_xml=Path(g1_xml),
+        )
     )
     identity.update(
         {
@@ -1068,6 +1097,19 @@ def _full_runtime_identity(
             "last_search_elapsed_ms": getattr(matcher, "last_search_elapsed_ms", None),
             "first_runtime_search_elapsed_ms": getattr(
                 matcher, "warm_search_elapsed_ms", None
+            ),
+            "controller_identity": getattr(matcher, "controller_identity", None),
+            "controller_acceleration_mps2": getattr(
+                matcher, "controller_acceleration_mps2", None
+            ),
+            "controller_deceleration_mps2": getattr(
+                matcher, "controller_deceleration_mps2", None
+            ),
+            "controller_stop_speed_mps": getattr(
+                matcher, "controller_stop_speed_mps", None
+            ),
+            "controller_search_interval_s": getattr(
+                matcher, "controller_search_interval_s", None
             ),
             "diagnostic_stability": getattr(matcher, "diagnostic_stability", False),
             "diagnostic_canonical_source_pose": bool(
