@@ -135,3 +135,25 @@ Final complete runtime plus GPU scorer GREEN: `64 passed in 10.48s`.
 Static verification after formatting: Ruff check passed, Ruff format check
 reported both files formatted, `py_compile` exited zero, and `git diff --check`
 exited zero.
+
+## Invalid-successor review fix
+
+A final review found that a sequential successor can legitimately cross from
+the current contact code to another contact code before its learned decode is
+mechanically rejected. The previous GPU retry treated that rejected successor
+as a malformed GPU candidate even though it had never come from GPU search.
+
+The new regression starts at contact 00, advances sequentially to contact 01,
+forces that successor outside a native joint limit, and requires recovery from
+the GPU search with an empty explicit-exclusion vector. Both
+`_match_exclusions` and `np.union1d` are patched to fail. Its RED was `1 failed,
+49 deselected in 2.59s`, at the obsolete all-rejections-compatible assertion.
+
+GPU retry now normalizes mechanical rejections to searchable rows and then
+keeps only current-contact-compatible rows for both the device exclusion vector
+and cached-count exhaustion. The unfiltered mechanical rejection list still
+owns retry-budget and rejection evidence.
+
+Focused GREEN: `9 passed, 41 deselected in 2.40s`.
+
+Complete runtime plus GPU scorer GREEN: `65 passed in 10.38s`.

@@ -1437,19 +1437,17 @@ class HybridMatcher:
                     retry_exclusions = self._normalized_excluded_rows(rejected)
                     contacts = np.asarray(self.artifacts.contacts)
                     active_contact = np.asarray(contacts[self.state.row])
-                    rejected_contacts = np.asarray(contacts[np.asarray(rejected)])
+                    retry_contacts = np.asarray(contacts[retry_exclusions])
                     if (
                         active_contact.shape != (2,)
-                        or rejected_contacts.shape != (len(rejected), 2)
+                        or retry_contacts.shape != (len(retry_exclusions), 2)
                         or not np.all((active_contact == 0) | (active_contact == 1))
-                        or not np.all(
-                            (rejected_contacts == 0) | (rejected_contacts == 1)
-                        )
-                        or not np.all(rejected_contacts == active_contact)
+                        or not np.all((retry_contacts == 0) | (retry_contacts == 1))
                     ):
-                        raise ValueError(
-                            "single-GPU rejected candidate violates current hard contacts"
-                        )
+                        raise ValueError("single-GPU retry contacts are invalid")
+                    retry_exclusions = retry_exclusions[
+                        np.all(retry_contacts == active_contact, axis=1)
+                    ]
                     active_contact_code = int(active_contact[0]) | (
                         int(active_contact[1]) << 1
                     )

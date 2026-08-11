@@ -1317,6 +1317,69 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         np.testing.assert_array_equal(fake.calls[0]["excluded_rows"], ())
         np.testing.assert_array_equal(fake.calls[1]["excluded_rows"], (0,))
 
+    def test_single_gpu_invalid_contact_transition_successor_retries_without_exclusion(
+        self,
+    ):
+        values = np.full((8, 31), 10.0, dtype=np.float32)
+        values[0:2] = 0.0
+        values[0:2, 21:27] = np.tile((0.0, 1.0), 3)
+        corpus = _corpus(values)
+        corpus.artifacts.contacts[1] = (True, False)
+        corpus.fps = 60.0
+        corpus.horizons = (20, 40, 60)
+
+        class SuccessorGenerator(_Generator):
+            def decode(self, features: np.ndarray, latent: np.ndarray) -> np.ndarray:
+                row = int(np.asarray(latent).reshape(-1)[0])
+                output = np.zeros(458, dtype=np.float32)
+                output[0] = 0.75 if row == 1 else 0.25
+                return output
+
+        fake = _FakeSingleGpuSearch()
+        fake.responses.append(
+            _gpu_candidates((0,), candidate_count=5, close_candidate_count=1)
+        )
+        with mock.patch(
+            "mm_sonic.hybrid_terrain_lmm_gpu_search.SingleGpuExactSearch",
+            return_value=fake,
+        ):
+            matcher = HybridMatcher(
+                corpus,
+                SuccessorGenerator(),
+                TerrainAuthority.flat(),
+                native_model=_limited_native_model(),
+                pose_converter=_pose_converter,
+                search_device="cuda:5",
+            )
+        matcher._elapsed_since_search = 0.0
+        matcher._last_command = CommandState()
+        matcher._last_terrain_class = "flat"
+        np.testing.assert_array_equal(corpus.artifacts.contacts[0], (False, False))
+        np.testing.assert_array_equal(corpus.artifacts.contacts[1], (True, False))
+
+        with (
+            mock.patch.object(
+                matcher,
+                "_match_exclusions",
+                side_effect=AssertionError(
+                    "GPU retry must not expand contact incompatibilities"
+                ),
+            ),
+            mock.patch(
+                "numpy.union1d",
+                side_effect=AssertionError("GPU retry must not sort exclusions"),
+            ),
+        ):
+            state = matcher.step(CommandState(), dt=0.04)
+
+        self.assertEqual(state.row, 0)
+        self.assertEqual(state.pose_source, "learned")
+        self.assertEqual(state.candidate_limit_rejection_count, 1)
+        self.assertEqual(state.first_candidate_limit_rejection_row, 1)
+        self.assertEqual(state.max_candidate_limit_rejections_per_step, 1)
+        self.assertEqual(len(fake.calls), 1)
+        np.testing.assert_array_equal(fake.calls[0]["excluded_rows"], ())
+
     def test_native_invalid_successor_retries_the_same_query_exactly(self):
         values = np.full((8, 31), 10.0, dtype=np.float32)
         values[0:2] = 0.0
