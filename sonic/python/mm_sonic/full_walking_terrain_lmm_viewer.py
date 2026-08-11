@@ -482,7 +482,8 @@ def _full_runtime_label(
             else ""
         )
         pose_policy += (
-            "PoseInertializer + measured continuous G1TerrainFootLock; "
+            "PoseInertializer + measured-acquire/source-continue "
+            "G1TerrainFootLock; "
             "0.10s half-life; "
         )
         bounds = tuple(getattr(matcher, "diagnostic_mechanical_clearance_bounds_m", ()))

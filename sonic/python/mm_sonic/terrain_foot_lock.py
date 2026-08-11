@@ -1281,7 +1281,13 @@ class G1TerrainTransitionGuard:
 
     @property
     def measured_stance_contact(self) -> tuple[bool, bool]:
-        """Return the last debounced measured landing-stance decision."""
+        """Return the last raw measured landing-stance decision."""
+
+        return self._landing_measured_contact
+
+    @property
+    def trusted_landing_contact(self) -> tuple[bool, bool]:
+        """Return the contact state currently authorized for locking."""
 
         return self._landing_contact
 
@@ -1372,6 +1378,7 @@ class G1TerrainTransitionGuard:
         self._entry_lock_active = False
         self._entry_contact = None
         self._landing_previous_pose: KinematicPose | None = None
+        self._landing_measured_contact = (False, False)
         self._landing_contact = (False, False)
         self._landing_touchdown_frames = [0, 0]
         self._landing_supported_feet = [False, False]
@@ -1386,14 +1393,22 @@ class G1TerrainTransitionGuard:
         pose: KinematicPose,
         *,
         side: str = "top",
+        defer_contact_acquisition: bool = False,
     ) -> None:
-        """Prime landing stance targets at the final authored stair pose."""
+        """Prime landing stance targets at the final authored stair pose.
+
+        ``defer_contact_acquisition`` is reserved for diagnostic playback that
+        must observe the configured number of displayed frames before earning
+        a lock.  The normal transition path retains immediate landing prime.
+        """
 
         if not isinstance(pose, KinematicPose):
             raise ValueError("pose must be a KinematicPose")
         landing_side = str(side)
         if landing_side not in {"top", "ground"}:
             raise ValueError("landing side must be 'top' or 'ground'")
+        if type(defer_contact_acquisition) is not bool:
+            raise ValueError("defer_contact_acquisition must be bool")
         self.end_stair()
         self._landing_side = landing_side
         contact_method = getattr(
@@ -1416,21 +1431,26 @@ class G1TerrainTransitionGuard:
             dtype=bool,
         )
         self._landing_previous_pose = pose
-        self._landing_contact = (
+        self._landing_measured_contact = (
             bool(contact[0]),
             bool(contact[1]),
         )
+        seeded_contact = (
+            np.zeros(2, dtype=bool)
+            if defer_contact_acquisition
+            else contact
+        )
+        self._landing_contact = (
+            bool(seeded_contact[0]),
+            bool(seeded_contact[1]),
+        )
         self._landing_touchdown_frames = [
-            (
-                self.landing_contact_acquire_frames
-                if bool(value)
-                else 0
-            )
-            for value in contact
+            self.landing_contact_acquire_frames if bool(value) else 0
+            for value in seeded_contact
         ]
         seeded = self.foot_locker.apply(
             pose,
-            contact,
+            seeded_contact,
             dt_s=self.dt_s,
             minimum_swing_clearance_m=(
                 self.landing_minimum_swing_clearance_m
@@ -1457,12 +1477,29 @@ class G1TerrainTransitionGuard:
         )
 
     def filter_landing(
-        self, pose: KinematicPose
+        self,
+        pose: KinematicPose,
+        *,
+        trusted_source_contact: object | None = None,
     ) -> KinematicPose | None:
-        """Apply stance lock and swing clearance during flat landing bridge."""
+        """Apply measured-acquire stance lock during a flat landing bridge.
+
+        An optional trusted source label can continue or release a contact
+        that measured evidence already acquired.  It can never acquire an
+        untrusted foot.  Omitting it preserves the measured-only policy used
+        by the normal terrain-transition path.
+        """
 
         if not isinstance(pose, KinematicPose):
             raise ValueError("pose must be a KinematicPose")
+        source_contact: np.ndarray | None = None
+        if trusted_source_contact is not None:
+            source_value = np.asarray(trusted_source_contact)
+            if source_value.shape != (2,) or source_value.dtype.kind != "b":
+                raise ValueError(
+                    "trusted_source_contact must contain two booleans"
+                )
+            source_contact = np.ascontiguousarray(source_value, dtype=bool)
         repair = self.pose_repairer.repair(pose)
         self.last_pose_repair_result = repair
         self.last_foot_lock_result = None
@@ -1504,10 +1541,18 @@ class G1TerrainTransitionGuard:
             dtype=bool,
         )
         self._landing_previous_pose = candidate
+        self._landing_measured_contact = (
+            bool(raw_contact[0]),
+            bool(raw_contact[1]),
+        )
         contact_values: list[bool] = [False, False]
         for foot in range(2):
             if self._landing_contact[foot]:
-                contact_values[foot] = bool(raw_contact[foot])
+                contact_values[foot] = bool(
+                    raw_contact[foot]
+                    if source_contact is None
+                    else source_contact[foot]
+                )
                 self._landing_touchdown_frames[foot] = (
                     self.landing_contact_acquire_frames
                     if contact_values[foot]

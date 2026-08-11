@@ -228,42 +228,67 @@ def _continuous_processor(model):
     return processor, repairer, locker
 
 
-def test_continuous_lock_uses_measured_stance_on_every_tick_and_ignores_source(
+def test_source_contact_cannot_acquire_before_two_measured_stance_frames(
     model,
 ) -> None:
     processor, _repairer, locker = _continuous_processor(model)
+    locker.measured_stance_queue[:] = [
+        np.asarray(contact, dtype=bool)
+        for contact in (
+            (False, False),
+            (False, False),
+            (False, False),
+            (True, False),
+            (False, False),
+            (True, False),
+            (True, False),
+        )
+    ]
     dt = 1.0 / 60.0
-    rows = (10, 11, 12, 13, 14, 15, 30, 31)
+    source_contacts = (
+        (True, False),
+        (False, False),
+        (True, False),
+        (True, False),
+        (False, False),
+        (True, False),
+    )
 
-    for index, row in enumerate(rows):
+    for index, source_contact in enumerate(source_contacts):
         processor.step(
             _qpos(model, x=0.01 * index),
-            row=row,
-            range_index=0 if row < 30 else 1,
-            source_contact=np.asarray((False, bool(index % 2)), dtype=bool),
+            row=10 + index,
+            range_index=0,
+            source_contact=np.asarray(source_contact, dtype=bool),
             dt_s=dt,
         )
 
-    # One priming classification/apply plus one continuous filtered update
-    # per displayed tick.  The discontinuous row switch must not reset the
-    # planted world-space target.
-    assert len(locker.landing_stance_calls) == len(rows) + 1
-    assert len(locker.calls) == len(rows) + 1
+    # Alternating and stale source labels cannot advance the measured
+    # acquisition debounce.  Only the final two consecutive measured stance
+    # observations earn the left-foot lock.
+    assert len(locker.landing_stance_calls) == len(source_contacts) + 1
+    assert len(locker.calls) == len(source_contacts) + 1
     assert locker.reset_calls == 3
-    for _pose, contact, call_dt in locker.calls:
-        np.testing.assert_array_equal(contact, (True, False))
+    for _pose, contact, call_dt in locker.calls[:-1]:
+        np.testing.assert_array_equal(contact, (False, False))
         assert call_dt == pytest.approx(dt)
-    assert locker.swing_clearances == pytest.approx([0.012] * (len(rows) + 1))
+    np.testing.assert_array_equal(locker.calls[-1][1], (True, False))
+    assert locker.calls[-1][2] == pytest.approx(dt)
+    assert locker.swing_clearances == pytest.approx(
+        [0.012] * (len(source_contacts) + 1)
+    )
     identity = processor.identity()
-    assert identity["source_contacts_used_for_locking"] is False
+    assert identity["source_contacts_used_for_acquisition"] is False
+    assert identity["source_contacts_used_for_trusted_continuation"] is True
     assert identity["last_measured_stance_contact"] == (True, False)
-    assert identity["continuous_lock_active_frame_count"] == len(rows)
+    assert identity["last_trusted_landing_contact"] == (True, False)
+    assert identity["measured_stance_acquisition_frame_count"] == 1
 
 
-def test_continuous_measured_stance_requires_two_frames_to_acquire(model) -> None:
+def test_initial_measured_stance_also_requires_two_displayed_frames(model) -> None:
     processor, _repairer, locker = _continuous_processor(model)
     locker.measured_stance_queue[:] = [
-        np.asarray((False, False), dtype=bool),
+        np.asarray((True, False), dtype=bool),
         np.asarray((True, False), dtype=bool),
         np.asarray((True, False), dtype=bool),
     ]
@@ -271,23 +296,71 @@ def test_continuous_measured_stance_requires_two_frames_to_acquire(model) -> Non
 
     processor.step(
         _qpos(model, x=0.0),
-        row=1,
+        row=10,
         range_index=0,
-        source_contact=np.asarray((False, True), dtype=bool),
+        source_contact=np.asarray((True, False), dtype=bool),
         dt_s=dt,
     )
     processor.step(
         _qpos(model, x=0.01),
-        row=2,
+        row=11,
         range_index=0,
-        source_contact=np.asarray((False, True), dtype=bool),
+        source_contact=np.asarray((True, False), dtype=bool),
         dt_s=dt,
     )
 
     np.testing.assert_array_equal(locker.calls[0][1], (False, False))
     np.testing.assert_array_equal(locker.calls[1][1], (False, False))
     np.testing.assert_array_equal(locker.calls[2][1], (True, False))
-    assert processor.identity()["last_measured_stance_contact"] == (True, False)
+
+
+def test_measured_acquired_contact_survives_search_transition_until_source_release(
+    model,
+) -> None:
+    processor, _repairer, locker = _continuous_processor(model)
+    locker.measured_stance_queue[:] = [
+        np.asarray((False, False), dtype=bool),
+        np.asarray((True, False), dtype=bool),
+        np.asarray((True, False), dtype=bool),
+        np.asarray((False, False), dtype=bool),
+        np.asarray((False, False), dtype=bool),
+        np.asarray((False, False), dtype=bool),
+    ]
+    dt = 1.0 / 60.0
+
+    for index, (row, range_index, source_contact) in enumerate(
+        (
+            (10, 0, (True, False)),
+            (11, 0, (True, False)),
+            (30, 1, (True, False)),
+            (31, 1, (False, False)),
+            (32, 1, (True, False)),
+        )
+    ):
+        processor.step(
+            _qpos(model, x=0.01 * index),
+            row=row,
+            range_index=range_index,
+            source_contact=np.asarray(source_contact, dtype=bool),
+            dt_s=dt,
+        )
+
+    np.testing.assert_array_equal(locker.calls[0][1], (False, False))
+    np.testing.assert_array_equal(locker.calls[1][1], (False, False))
+    np.testing.assert_array_equal(locker.calls[2][1], (True, False))
+    # The discontinuous row/range jump creates a measured speed rejection,
+    # but the authenticated source label may continue the already-trusted
+    # left foot.  Source false then releases it, and stale source true cannot
+    # reacquire while measured stance remains false.
+    np.testing.assert_array_equal(locker.calls[3][1], (True, False))
+    np.testing.assert_array_equal(locker.calls[4][1], (False, False))
+    np.testing.assert_array_equal(locker.calls[5][1], (False, False))
+    identity = processor.identity()
+    assert identity["last_measured_stance_contact"] == (False, False)
+    assert identity["last_trusted_landing_contact"] == (False, False)
+    assert identity["trusted_source_continuation_frame_count"] == 1
+    assert identity["trusted_source_override_frame_count"] == 1
+    assert identity["trusted_source_release_frame_count"] == 1
 
 
 def test_pose_repair_rejection_identity_reports_actionable_mechanical_values(
@@ -373,8 +446,17 @@ def test_switch_is_continuous_and_successor_and_neutral_ticks_decay(model) -> No
     assert np.linalg.norm(neutral - target_c) < np.linalg.norm(successor - target_c)
     assert len(locker.support_calls) == 5
     assert len(locker.calls) == 5
-    for _pose, contact, _dt_s in locker.calls:
-        np.testing.assert_array_equal(contact, (False, True))
+    expected_contacts = (
+        (False, False),
+        (False, False),
+        (False, True),
+        (False, False),
+        (False, False),
+    )
+    for (_pose, contact, _dt_s), expected in zip(
+        locker.calls, expected_contacts, strict=True
+    ):
+        np.testing.assert_array_equal(contact, expected)
     assert locker.reset_calls == 3
 
 
@@ -385,7 +467,7 @@ def test_active_lock_rejection_uses_existing_release_without_freezing(model) -> 
         _qpos(model, x=0.0),
         row=1,
         range_index=0,
-        source_contact=np.asarray((False, True)),
+        source_contact=np.asarray((True, False)),
         dt_s=dt,
     )
     locker.accepted[:] = [False, True]
@@ -394,7 +476,7 @@ def test_active_lock_rejection_uses_existing_release_without_freezing(model) -> 
         _qpos(model, x=0.05),
         row=2,
         range_index=0,
-        source_contact=np.asarray((False, True)),
+        source_contact=np.asarray((True, False)),
         dt_s=dt,
     )
 
@@ -590,11 +672,15 @@ def test_reset_clears_temporal_state_and_diagnostics(model) -> None:
     identity = processor.identity()
     assert identity == {
         "diagnostic_display_postprocessor": (
-            "existing-pose-inertializer-repair-measured-continuous-foot-lock/v4"
+            "existing-pose-inertializer-repair-"
+            "measured-acquire-source-continue-foot-lock/v5"
         ),
         "inertialization_halflife_s": 0.10,
-        "contact_policy": "measured-support-speed-hysteresis",
-        "source_contacts_used_for_locking": False,
+        "contact_policy": (
+            "measured-two-frame-acquire-authenticated-source-continue-release"
+        ),
+        "source_contacts_used_for_acquisition": False,
+        "source_contacts_used_for_trusted_continuation": True,
         "measured_stance_maximum_foot_speed_mps": 0.20,
         "measured_stance_maximum_sole_clearance_m": 0.020,
         "measured_stance_acquire_frames": 2,
@@ -610,7 +696,12 @@ def test_reset_clears_temporal_state_and_diagnostics(model) -> None:
         "continuous_lock_idle_frame_count": 0,
         "continuous_lock_recovery_count": 0,
         "continuous_lock_bypass_count": 0,
+        "measured_stance_acquisition_frame_count": 0,
+        "trusted_source_continuation_frame_count": 0,
+        "trusted_source_override_frame_count": 0,
+        "trusted_source_release_frame_count": 0,
         "last_measured_stance_contact": (False, False),
+        "last_trusted_landing_contact": (False, False),
         "last_pose_repair_rejection": None,
         "last_reason": "reset",
     }

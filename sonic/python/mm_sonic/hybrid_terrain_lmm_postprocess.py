@@ -15,7 +15,9 @@ from .terrain_oracle.math3d import angular_velocity_world_wxyz
 from .terrain_pose_repair import G1TerrainPoseRepair
 
 
-_IDENTITY = "existing-pose-inertializer-repair-measured-continuous-foot-lock/v4"
+_IDENTITY = (
+    "existing-pose-inertializer-repair-measured-acquire-source-continue-foot-lock/v5"
+)
 
 
 class _ObservedPoseRepairer:
@@ -209,7 +211,12 @@ class ExistingUtilityPosePostprocessor:
         self.continuous_lock_idle_frame_count = 0
         self.continuous_lock_recovery_count = 0
         self.continuous_lock_bypass_count = 0
+        self.measured_stance_acquisition_frame_count = 0
+        self.trusted_source_continuation_frame_count = 0
+        self.trusted_source_override_frame_count = 0
+        self.trusted_source_release_frame_count = 0
         self.last_measured_stance_contact = (False, False)
+        self.last_trusted_landing_contact = (False, False)
         self.last_pose_repair_rejection: dict[str, float] | None = None
         self.last_reason = "reset"
 
@@ -302,19 +309,30 @@ class ExistingUtilityPosePostprocessor:
                 raw_target, elapsed_s=self._inertializer_elapsed_s
             )
         )
-        # Corpus contacts remain part of the caller ABI and are validated
-        # above, but they never authorize a display lock.  Prime the existing
-        # measured landing classifier once after reset, then preserve its
-        # world-space stance targets across motion-match transitions.
+        # Only measured evidence can acquire a display lock.  Once acquired,
+        # the authenticated corpus contact may continue or release that same
+        # foot across a motion-match transition, preserving its world-space
+        # stance target when the transition itself inflates measured speed.
         if not self._continuous_lock_started:
-            self.transition_guard.begin_landing(candidate)
+            self.transition_guard.begin_landing(
+                candidate,
+                defer_contact_acquisition=True,
+            )
             self._continuous_lock_started = True
-        displayed_pose = self.transition_guard.filter_landing(candidate)
+        prior_trusted_contact = self.transition_guard.trusted_landing_contact
+        displayed_pose = self.transition_guard.filter_landing(
+            candidate,
+            trusted_source_contact=contacts,
+        )
         lock_result = self.transition_guard.last_foot_lock_result
         outcome = self.transition_guard.landing_filter_outcome
         self.last_measured_stance_contact = (
             self.transition_guard.measured_stance_contact
         )
+        self.last_trusted_landing_contact = (
+            self.transition_guard.trusted_landing_contact
+        )
+        published_filtered_pose = displayed_pose is not None
         if displayed_pose is None:
             self.continuous_lock_bypass_count += 1
             if lock_result is not None:
@@ -331,6 +349,43 @@ class ExistingUtilityPosePostprocessor:
                 self.foot_lock_accept_count += 1
             else:
                 self.foot_lock_bypass_count += 1
+
+        policy_applied = bool(
+            published_filtered_pose
+            and lock_result is not None
+            and getattr(lock_result, "accepted", False)
+            and outcome
+            not in {
+                "release-after-reject",
+                "bypass-after-double-reject",
+            }
+        )
+        if policy_applied:
+            acquired = tuple(
+                not prior_trusted_contact[foot]
+                and self.last_trusted_landing_contact[foot]
+                for foot in range(2)
+            )
+            continued = tuple(
+                prior_trusted_contact[foot]
+                and bool(contacts[foot])
+                and self.last_trusted_landing_contact[foot]
+                for foot in range(2)
+            )
+            overridden = tuple(
+                continued[foot] and not self.last_measured_stance_contact[foot]
+                for foot in range(2)
+            )
+            released = tuple(
+                prior_trusted_contact[foot]
+                and not bool(contacts[foot])
+                and not self.last_trusted_landing_contact[foot]
+                for foot in range(2)
+            )
+            self.measured_stance_acquisition_frame_count += int(any(acquired))
+            self.trusted_source_continuation_frame_count += int(any(continued))
+            self.trusted_source_override_frame_count += int(any(overridden))
+            self.trusted_source_release_frame_count += int(any(released))
 
         if outcome == "active":
             self.continuous_lock_active_frame_count += 1
@@ -366,8 +421,11 @@ class ExistingUtilityPosePostprocessor:
         return {
             "diagnostic_display_postprocessor": _IDENTITY,
             "inertialization_halflife_s": self.inertialization_halflife_s,
-            "contact_policy": "measured-support-speed-hysteresis",
-            "source_contacts_used_for_locking": False,
+            "contact_policy": (
+                "measured-two-frame-acquire-authenticated-source-continue-release"
+            ),
+            "source_contacts_used_for_acquisition": False,
+            "source_contacts_used_for_trusted_continuation": True,
             "measured_stance_maximum_foot_speed_mps": (
                 self.transition_guard.landing_maximum_foot_speed_mps
             ),
@@ -397,7 +455,20 @@ class ExistingUtilityPosePostprocessor:
             "continuous_lock_idle_frame_count": (self.continuous_lock_idle_frame_count),
             "continuous_lock_recovery_count": (self.continuous_lock_recovery_count),
             "continuous_lock_bypass_count": (self.continuous_lock_bypass_count),
+            "measured_stance_acquisition_frame_count": (
+                self.measured_stance_acquisition_frame_count
+            ),
+            "trusted_source_continuation_frame_count": (
+                self.trusted_source_continuation_frame_count
+            ),
+            "trusted_source_override_frame_count": (
+                self.trusted_source_override_frame_count
+            ),
+            "trusted_source_release_frame_count": (
+                self.trusted_source_release_frame_count
+            ),
             "last_measured_stance_contact": (self.last_measured_stance_contact),
+            "last_trusted_landing_contact": (self.last_trusted_landing_contact),
             "last_pose_repair_rejection": (
                 None
                 if self.last_pose_repair_rejection is None

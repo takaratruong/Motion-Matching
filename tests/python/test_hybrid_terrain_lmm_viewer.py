@@ -1702,13 +1702,19 @@ class HybridTerrainViewerTests(unittest.TestCase):
             scene_evidence_status="diagnostic-generated",
             display_postprocessor_identity={
                 "diagnostic_display_postprocessor": (
-                    "existing-pose-inertializer-repair-measured-continuous-foot-lock/v4"
+                    "existing-pose-inertializer-repair-"
+                    "measured-acquire-source-continue-foot-lock/v5"
                 ),
                 "inertialization_halflife_s": 0.10,
                 "measured_stance_maximum_foot_speed_mps": 0.20,
                 "measured_stance_maximum_sole_clearance_m": 0.020,
                 "measured_stance_acquire_frames": 2,
                 "last_measured_stance_contact": (True, False),
+                "last_trusted_landing_contact": (True, False),
+                "measured_stance_acquisition_frame_count": 4,
+                "trusted_source_continuation_frame_count": 3,
+                "trusted_source_override_frame_count": 2,
+                "trusted_source_release_frame_count": 1,
                 "continuous_lock_active_frame_count": 5,
                 "continuous_lock_releasing_frame_count": 2,
                 "continuous_lock_idle_frame_count": 1,
@@ -1723,7 +1729,10 @@ class HybridTerrainViewerTests(unittest.TestCase):
         )
         self.assertIn("HYBRID TERRAIN LMM POC", title)
         self.assertNotIn("EXACT SEARCH", title)
-        self.assertIn("PoseInertializer + measured continuous G1TerrainFootLock", title)
+        self.assertIn(
+            "PoseInertializer + measured-acquire/source-continue G1TerrainFootLock",
+            title,
+        )
         for value in (
             "family slope",
             "range 12",
@@ -1744,12 +1753,14 @@ class HybridTerrainViewerTests(unittest.TestCase):
             "flat=125000",
             "slope=125000",
             "transition penalty 0.100",
-            "PoseInertializer + measured continuous G1TerrainFootLock",
+            "PoseInertializer + measured-acquire/source-continue G1TerrainFootLock",
             "0.10s half-life",
             "repair calls accepted 7",
             "measured stance <= 0.20 m/s, 20 mm, 2f",
-            "source labels ignored for locking",
-            "stance L/R 1/0",
+            "source labels continue/release trusted contacts only",
+            "measured L/R 1/0",
+            "trusted L/R 1/0",
+            "measured acquire/source continue/override/release 4/3/2/1",
             "continuous active/releasing/idle 5/2/1",
             "recovery/bypass 1/2",
             "repair rejected 3",
@@ -2314,13 +2325,19 @@ class HybridTerrainViewerTests(unittest.TestCase):
         terrain = load_scene_terrain("hills")
         postprocessor_identity = {
             "diagnostic_display_postprocessor": (
-                "existing-pose-inertializer-repair-measured-continuous-foot-lock/v4"
+                "existing-pose-inertializer-repair-"
+                "measured-acquire-source-continue-foot-lock/v5"
             ),
             "inertialization_halflife_s": 0.10,
             "measured_stance_maximum_foot_speed_mps": 0.20,
             "measured_stance_maximum_sole_clearance_m": 0.020,
             "measured_stance_acquire_frames": 2,
             "last_measured_stance_contact": (False, True),
+            "last_trusted_landing_contact": (False, True),
+            "measured_stance_acquisition_frame_count": 1,
+            "trusted_source_continuation_frame_count": 2,
+            "trusted_source_override_frame_count": 1,
+            "trusted_source_release_frame_count": 1,
             "continuous_lock_active_frame_count": 2,
             "continuous_lock_releasing_frame_count": 1,
             "continuous_lock_idle_frame_count": 0,
@@ -2506,7 +2523,7 @@ class HybridTerrainViewerTests(unittest.TestCase):
         np.testing.assert_array_equal(data.qpos, reset_state.qpos)
         self.assertEqual(receipt["identity"]["pose_repair_count"], 3)
         self.assertIn(
-            "PoseInertializer + measured continuous G1TerrainFootLock",
+            "PoseInertializer + measured-acquire/source-continue G1TerrainFootLock",
             overlay_texts[0][0],
         )
         self.assertIn("0.10s half-life", overlay_texts[0][0])
@@ -2514,7 +2531,10 @@ class HybridTerrainViewerTests(unittest.TestCase):
         self.assertIn("continuous active/releasing/idle 2/1/0", overlay_texts[0][1])
         self.assertIn("recovery/bypass 1/1", overlay_texts[0][1])
         self.assertIn("repair rejected 4", overlay_texts[0][1])
-        self.assertIn("source labels ignored for locking", overlay_texts[0][1])
+        self.assertIn(
+            "source labels continue/release trusted contacts only",
+            overlay_texts[0][1],
+        )
         self.assertIn("last reason lock rejected", overlay_texts[0][1])
 
     def test_failed_reset_returns_original_runtime_unchanged(self):
