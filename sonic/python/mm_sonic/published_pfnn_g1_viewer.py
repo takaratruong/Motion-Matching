@@ -64,6 +64,16 @@ class Frame:
     input_space: str = "source"
 
 
+def require_expected_world(frame: Frame, expected_world: int | None) -> None:
+    if expected_world is None:
+        return
+    actual = frame.metadata.get("world")
+    if actual is None or int(actual) != expected_world:
+        raise ValueError(
+            f"PFNN world mismatch: expected {expected_world}, received {actual}"
+        )
+
+
 def _exact_read(stream: BinaryIO, size: int, *, allow_eof: bool = False) -> bytes | None:
     chunks: list[bytes] = []
     remaining = size
@@ -438,7 +448,7 @@ def _producer(iterator: Iterator[Frame], output: queue.Queue[object]) -> None:
         output.put(None)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", default="-", help="input path, or - for stdin")
     parser.add_argument("--format", choices=("auto", "pfnnxfm", "jsonl", "npz", "f32"),
@@ -457,8 +467,10 @@ def main() -> None:
     parser.add_argument("--max-frames", type=int, default=0,
                         help="0 means consume through EOF")
     parser.add_argument("--trace-every", type=int, default=60)
+    parser.add_argument("--expected-world", type=int, choices=range(6),
+                        help="require each exported frame to use this PFNN world")
     parser.add_argument("--no-viewer", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if (not np.isfinite(args.fps) or args.fps <= 0 or args.max_frames < 0
             or args.trace_every < 1 or not np.isfinite(args.source_position_scale_m)
             or args.source_position_scale_m <= 0):
@@ -497,6 +509,7 @@ def main() -> None:
                 raise item
             assert isinstance(item, Frame)
             frame = item
+            require_expected_world(frame, args.expected_world)
             if frame.qpos_wxyz is not None:
                 qpos = frame.qpos_wxyz.copy()
                 source_root = frame.source_root_pos_zup_m.copy()

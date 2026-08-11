@@ -84,5 +84,15 @@ class ProducerQueuePolicyTest(unittest.TestCase):
             self._finish(thread, output)
 
 
+class ExpectedWorldTests(unittest.TestCase):
+    def test_rejects_frame_from_a_different_pfnn_world(self) -> None:
+        frame = viewer.Frame(metadata={"world": 4})
+
+        with self.assertRaisesRegex(
+            ValueError, "PFNN world mismatch: expected 5, received 4"
+        ):
+            viewer.require_expected_world(frame, 5)
+
+
 if __name__ == "__main__":
     unittest.main()

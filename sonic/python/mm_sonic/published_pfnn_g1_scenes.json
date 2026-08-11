@@ -1,0 +1,8 @@
+[
+  {"scene": 1, "world_id": 0, "key": 1, "heightmap": "hmap_000_smooth.txt", "display_stride": 4},
+  {"scene": 2, "world_id": 1, "key": 2, "heightmap": "hmap_000_smooth.txt", "display_stride": 4},
+  {"scene": 3, "world_id": 2, "key": 3, "heightmap": "hmap_004_smooth.txt", "display_stride": 4},
+  {"scene": 4, "world_id": 3, "key": 4, "heightmap": "hmap_007_smooth.txt", "display_stride": 4},
+  {"scene": 5, "world_id": 4, "key": 5, "heightmap": "hmap_013_smooth.txt", "display_stride": 4},
+  {"scene": 6, "world_id": 5, "key": 6, "heightmap": "hmap_urban_001_smooth.txt", "display_stride": 4}
+]
