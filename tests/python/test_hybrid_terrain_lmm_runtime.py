@@ -393,8 +393,6 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         support = np.asarray(corpus.artifacts.terrain_support[:, 0], dtype=np.float32)
         corpus.artifacts.positions[0, 1, 1] = support[0] + 0.6
         corpus.artifacts.positions[1, 1, 1] = support[1] + 0.75
-        corpus.artifacts.positions[2, 1, 1] = support[2] + 0.69
-        corpus.artifacts.positions[3, 1, 1] = support[3] + 0.69
         matcher = HybridMatcher(
             corpus,
             _Generator(),
@@ -402,18 +400,9 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
             pose_converter=_pose_converter,
             diagnostic_stability=True,
         )
-        command = CommandState(speed=1.0)
-        matcher._last_command = command
-        matcher._last_terrain_class = matcher.state.terrain_class
-
-        with mock.patch.object(matcher, "match", wraps=matcher.match) as searched:
-            state = matcher.step(command, dt=matcher.dt)
-
-        self.assertIn(0, matcher.searchable_rows)
+        self.assertNotIn(0, matcher.searchable_rows)
         self.assertIn(1, matcher.searchable_rows)
         self.assertEqual(matcher.successor(0), 0)
-        self.assertEqual(state.row, 2)
-        self.assertEqual(set(searched.call_args.kwargs["excluded_rows"]), {0, 1})
         self.assertEqual(matcher.diagnostic_mechanical_successor_clearance_limit_m, 0.1)
         self.assertEqual(
             matcher.diagnostic_mechanical_discontinuous_successor_edge_count, 1
@@ -422,12 +411,14 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
     def test_diagnostic_stability_search_jump_retries_clearance_discontinuity(self):
         values = np.full((8, 31), 10.0, dtype=np.float32)
         values[4] = 0.0
-        values[5] = 0.1
+        values[6] = 0.1
+        values[:, 27:31] = 0.0
         corpus = _mechanically_safe(_corpus(values))
         support = np.asarray(corpus.artifacts.terrain_support[:, 0], dtype=np.float32)
         corpus.artifacts.positions[0, 1, 1] = support[0] + 0.8
         corpus.artifacts.positions[4, 1, 1] = support[4] + 1.19
-        corpus.artifacts.positions[5, 1, 1] = support[5] + 0.85
+        corpus.artifacts.positions[5, 1, 1] = support[5] + 1.19
+        corpus.artifacts.positions[6, 1, 1] = support[6] + 0.85
         matcher = HybridMatcher(
             corpus,
             _Generator(),
@@ -438,7 +429,7 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
 
         state = matcher.select_query(np.zeros(31, dtype=np.float64))
 
-        self.assertEqual(state.row, 5)
+        self.assertEqual(state.row, 6)
         self.assertEqual(state.pose_source, "learned")
         self.assertEqual(state.diagnostic_pose_rejection_count, 1)
         self.assertAlmostEqual(state.root_position_world[2], 0.85, places=6)
@@ -450,6 +441,37 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
             0.1,
         )
 
+    def test_diagnostic_stability_search_view_excludes_nonadvancing_boundary_seeds(
+        self,
+    ):
+        corpus = _mechanically_safe(_corpus())
+        corpus.artifacts.positions[1, 1, 1] = 0.2
+        corpus.artifacts.positions[5, 1, 1] = 0.2
+
+        matcher = HybridMatcher(
+            corpus,
+            _Generator(),
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+            diagnostic_stability=True,
+        )
+
+        self.assertEqual(matcher.successor(0), 0)
+        self.assertEqual(matcher.successor(4), 4)
+        self.assertNotIn(0, matcher.searchable_rows)
+        self.assertNotIn(4, matcher.searchable_rows)
+        self.assertIn(2, matcher.searchable_rows)
+        self.assertIn(6, matcher.searchable_rows)
+
+        command = CommandState(speed=1.0)
+        matcher._last_command = command
+        matcher._last_terrain_class = matcher.state.terrain_class
+        with mock.patch.object(matcher, "match", wraps=matcher.match) as searched:
+            rows = [matcher.step(command, dt=matcher.dt).row for _ in range(8)]
+
+        self.assertFalse(any(row in (0, 4) for row in rows))
+        self.assertLess(searched.call_count, len(rows))
+
     def test_diagnostic_stability_neutral_holds_at_unsafe_successor_boundary(self):
         corpus = _mechanically_safe(_corpus())
         corpus.artifacts.positions[1, 1, 1] = 0.2
@@ -459,6 +481,12 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
             TerrainAuthority.flat(),
             pose_converter=_pose_converter,
             diagnostic_stability=True,
+        )
+        matcher._commit_row(
+            0,
+            np.asarray(matcher.features[0], dtype=np.float64),
+            search_distance=0.0,
+            count_decode=False,
         )
         matcher._last_command = CommandState()
         matcher._last_terrain_class = matcher.state.terrain_class
@@ -493,6 +521,12 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
             pose_converter=_pose_converter,
             diagnostic_stability=True,
         )
+        matcher._commit_row(
+            0,
+            np.asarray(matcher.features[0], dtype=np.float64),
+            search_distance=0.0,
+            count_decode=False,
+        )
         command = CommandState(speed=1.0)
         matcher._last_command = command
         matcher._last_terrain_class = matcher.state.terrain_class
@@ -507,9 +541,7 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         self.assertEqual(
             tuple(searched.call_args_list[0].kwargs["excluded_rows"]), (0,)
         )
-        self.assertEqual(
-            set(searched.call_args_list[1].kwargs["excluded_rows"]), {0, 2}
-        )
+        self.assertEqual(set(searched.call_args_list[1].kwargs["excluded_rows"]), {2})
 
     def test_diagnostic_stability_retains_observed_takara_clearance_band(self):
         corpus = _corpus()

@@ -537,9 +537,29 @@ class HybridMatcher:
             self.diagnostic_mechanical_retained_row_count = int(
                 np.count_nonzero(self._diagnostic_mechanical_safe_rows)
             )
-            mechanically_searchable = total_searchable[
+            discontinuous_successors = np.zeros(len(self.features), dtype=np.bool_)
+            discontinuous_successors[:-1] = (
+                self._diagnostic_mechanical_safe_rows[:-1]
+                & self._diagnostic_mechanical_safe_rows[1:]
+                & (self.row_ranges[:-1] == self.row_ranges[1:])
+                & (
+                    np.abs(clearance[1:] - clearance[:-1])
+                    > DIAGNOSTIC_MAX_SUCCESSOR_CLEARANCE_STEP_M
+                )
+            )
+            self._diagnostic_mechanical_discontinuous_successors = (
+                discontinuous_successors
+            )
+            self.diagnostic_mechanical_discontinuous_successor_edge_count = int(
+                np.count_nonzero(discontinuous_successors)
+            )
+            next_rows = total_searchable + 1
+            continuation_safe = (
                 self._diagnostic_mechanical_safe_rows[total_searchable]
-            ]
+                & self._diagnostic_mechanical_safe_rows[next_rows]
+                & ~discontinuous_successors[total_searchable]
+            )
+            mechanically_searchable = total_searchable[continuation_safe]
             if not len(mechanically_searchable):
                 raise ValueError(
                     "diagnostic mechanical filter removed every searchable row"
@@ -557,22 +577,6 @@ class HybridMatcher:
             )
             self.terrain_feature_max = np.max(retained_terrain, axis=0).astype(
                 np.float64
-            )
-            discontinuous_successors = np.zeros(len(self.features), dtype=np.bool_)
-            discontinuous_successors[:-1] = (
-                self._diagnostic_mechanical_safe_rows[:-1]
-                & self._diagnostic_mechanical_safe_rows[1:]
-                & (self.row_ranges[:-1] == self.row_ranges[1:])
-                & (
-                    np.abs(clearance[1:] - clearance[:-1])
-                    > DIAGNOSTIC_MAX_SUCCESSOR_CLEARANCE_STEP_M
-                )
-            )
-            self._diagnostic_mechanical_discontinuous_successors = (
-                discontinuous_successors
-            )
-            self.diagnostic_mechanical_discontinuous_successor_edge_count = int(
-                np.count_nonzero(discontinuous_successors)
             )
 
         def family_counts(rows: np.ndarray) -> tuple[tuple[str, int], ...]:
