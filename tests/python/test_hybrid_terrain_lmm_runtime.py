@@ -393,6 +393,8 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         support = np.asarray(corpus.artifacts.terrain_support[:, 0], dtype=np.float32)
         corpus.artifacts.positions[0, 1, 1] = support[0] + 0.6
         corpus.artifacts.positions[1, 1, 1] = support[1] + 0.75
+        corpus.artifacts.positions[2, 1, 1] = support[2] + 0.69
+        corpus.artifacts.positions[3, 1, 1] = support[3] + 0.69
         matcher = HybridMatcher(
             corpus,
             _Generator(),
@@ -415,6 +417,37 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         self.assertEqual(matcher.diagnostic_mechanical_successor_clearance_limit_m, 0.1)
         self.assertEqual(
             matcher.diagnostic_mechanical_discontinuous_successor_edge_count, 1
+        )
+
+    def test_diagnostic_stability_search_jump_retries_clearance_discontinuity(self):
+        values = np.full((8, 31), 10.0, dtype=np.float32)
+        values[4] = 0.0
+        values[5] = 0.1
+        corpus = _mechanically_safe(_corpus(values))
+        support = np.asarray(corpus.artifacts.terrain_support[:, 0], dtype=np.float32)
+        corpus.artifacts.positions[0, 1, 1] = support[0] + 0.8
+        corpus.artifacts.positions[4, 1, 1] = support[4] + 1.19
+        corpus.artifacts.positions[5, 1, 1] = support[5] + 0.85
+        matcher = HybridMatcher(
+            corpus,
+            _Generator(),
+            TerrainAuthority.flat(),
+            pose_converter=_pose_converter,
+            diagnostic_stability=True,
+        )
+
+        state = matcher.select_query(np.zeros(31, dtype=np.float64))
+
+        self.assertEqual(state.row, 5)
+        self.assertEqual(state.pose_source, "learned")
+        self.assertEqual(state.diagnostic_pose_rejection_count, 1)
+        self.assertAlmostEqual(state.root_position_world[2], 0.85, places=6)
+        self.assertLessEqual(
+            abs(
+                matcher._diagnostic_mechanical_clearance[state.row]
+                - matcher._diagnostic_mechanical_clearance[0]
+            ),
+            0.1,
         )
 
     def test_diagnostic_stability_neutral_holds_at_unsafe_successor_boundary(self):

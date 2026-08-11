@@ -1623,6 +1623,19 @@ class HybridMatcher:
         original_live_domain_supported = bool(prepared_live_domain_supported)
         while True:
             try:
+                if self.diagnostic_stability and not candidate_advances_source:
+                    clearance = self._diagnostic_mechanical_clearance
+                    if clearance is None:
+                        raise AssertionError(
+                            "diagnostic mechanical clearance is unavailable"
+                        )
+                    if (
+                        abs(float(clearance[row]) - float(clearance[baseline.row]))
+                        > DIAGNOSTIC_MAX_SUCCESSOR_CLEARANCE_STEP_M
+                    ):
+                        raise _DiagnosticMechanicalRowError(
+                            "diagnostic search jump exceeded the clearance-step limit"
+                        )
                 proposed = self._commit_row(
                     row,
                     prepared_query,
@@ -1645,7 +1658,9 @@ class HybridMatcher:
                 rejected.append(int(row))
                 if isinstance(error, _NativeJointLimitError):
                     native_rejected.append(int(row))
-                elif isinstance(error, _DiagnosticPoseError):
+                elif isinstance(
+                    error, (_DiagnosticMechanicalRowError, _DiagnosticPoseError)
+                ):
                     diagnostic_pose_rejected.append(int(row))
                 self._set_world_transform(baseline_world)
                 self._active_source_root = baseline_source
