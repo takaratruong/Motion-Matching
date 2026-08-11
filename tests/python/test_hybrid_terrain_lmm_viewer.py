@@ -44,6 +44,24 @@ class _Axes:
         return self.values
 
 
+def test_injected_foot_locker_identity_does_not_render_strict_overlay() -> None:
+    title, body = viewer_module._display_postprocessor_overlay(
+        {
+            "diagnostic_display_postprocessor": (
+                "existing-pose-inertializer-repair-injected-foot-lock/unverified"
+            ),
+            "diagnostic_owned_foot_locker": False,
+            "foot_lock_maximum_locked_foot_drift_m": None,
+            "foot_lock_maximum_releasing_foot_drift_m": None,
+            "foot_lock_maximum_joint_correction_step_rad": None,
+            "foot_lock_maximum_joint_correction_rad": None,
+        }
+    )
+
+    assert title == ""
+    assert body == ""
+
+
 def _canonical_json(value: object) -> bytes:
     return (
         json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"

@@ -19,6 +19,9 @@ _IDENTITY = (
     "existing-pose-inertializer-repair-"
     "source-proximity-acquire-source-continue-strict-final-foot-lock/v7"
 )
+_INJECTED_FOOT_LOCK_IDENTITY = (
+    "existing-pose-inertializer-repair-injected-foot-lock/unverified"
+)
 _DIAGNOSTIC_MAXIMUM_FOOT_TARGET_RESIDUAL_M = 0.0005
 
 
@@ -543,7 +546,11 @@ class ExistingUtilityPosePostprocessor:
         """Return immutable policy values and current diagnostic counters."""
 
         return {
-            "diagnostic_display_postprocessor": _IDENTITY,
+            "diagnostic_display_postprocessor": (
+                _IDENTITY
+                if self._owns_foot_locker
+                else _INJECTED_FOOT_LOCK_IDENTITY
+            ),
             "inertialization_halflife_s": self.inertialization_halflife_s,
             "contact_policy": (
                 "authenticated-source-and-measured-ground-proximity-two-frame-"

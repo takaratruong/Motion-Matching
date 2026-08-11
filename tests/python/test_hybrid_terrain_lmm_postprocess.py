@@ -436,6 +436,10 @@ def test_diagnostic_owned_locker_uses_strict_active_and_release_residuals(
     assert normal.maximum_releasing_foot_drift_m is None
     assert normal.defer_swing_clearance_until_release_complete is False
     identity = processor.identity()
+    assert identity["diagnostic_display_postprocessor"] == (
+        "existing-pose-inertializer-repair-source-proximity-acquire-"
+        "source-continue-strict-final-foot-lock/v7"
+    )
     assert identity["diagnostic_owned_foot_locker"] is True
     assert identity["foot_lock_maximum_locked_foot_drift_m"] == pytest.approx(
         0.0005
@@ -1417,10 +1421,8 @@ def test_reset_clears_temporal_state_and_diagnostics(model) -> None:
 
     identity = processor.identity()
     assert identity == {
-            "diagnostic_display_postprocessor": (
-                "existing-pose-inertializer-repair-"
-                "source-proximity-acquire-source-continue-"
-                "strict-final-foot-lock/v7"
+        "diagnostic_display_postprocessor": (
+            "existing-pose-inertializer-repair-injected-foot-lock/unverified"
         ),
         "inertialization_halflife_s": 0.10,
         "contact_policy": (
