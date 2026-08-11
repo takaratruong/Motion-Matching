@@ -463,7 +463,7 @@ def _validate(arguments: argparse.Namespace) -> tuple[Path, Path, Path, Path, Pa
         )
     )
     missing = tuple(path for path in paths if not path.is_file())
-    if arguments.terrain_fit is not None:
+    if arguments.scene is None and arguments.terrain_fit is not None:
         terrain_fit = Path(arguments.terrain_fit).expanduser().resolve()
         if not terrain_fit.is_file():
             missing = (*missing, terrain_fit)
@@ -694,7 +694,9 @@ def _run(arguments: argparse.Namespace) -> int:
             while viewer.is_running() and not stopped[0] and step < arguments.max_steps:
                 started = time.monotonic()
                 frame = advance(step, _command_from_pressed(pressed, arguments.speed))
-                viewer.cam.lookat[:] = frame.root_position_world
+                viewer.cam.lookat[:] = _scene_root_position(
+                    frame.root_position_world, scene_terrain
+                )
                 viewer.sync()
                 step += 1
                 remaining = 1.0 / FPS - (time.monotonic() - started)

@@ -38,7 +38,8 @@ class TerrainPFNNViewerTests(unittest.TestCase):
     ) -> None:
         from mm_sonic.terrain_pfnn_viewer import _ScenePFNNTerrainCallback
 
-        adapter = self._sloped_scene_adapter()
+        heading = 0.3
+        adapter = self._sloped_scene_adapter(heading)
         callback = _ScenePFNNTerrainCallback(adapter)
 
         origin = callback(np.zeros(2, dtype=np.float64))
@@ -46,12 +47,22 @@ class TerrainPFNNViewerTests(unittest.TestCase):
         self.assertIsNotNone(origin)
         self.assertIsNotNone(forward)
         assert origin is not None and forward is not None
+        forward_native = np.asarray(
+            (3.0 + 0.25 * math.sin(heading), 4.0 - 0.25 * math.cos(heading))
+        )
         self.assertEqual(origin.height_m, adapter.authority.height_at((3.0, 4.0)))
-        self.assertEqual(forward.height_m, adapter.authority.height_at((3.25, 4.0)))
-        np.testing.assert_allclose(origin.gradient_xy, (2.0, 3.0), atol=1.0e-12)
+        self.assertEqual(forward.height_m, adapter.authority.height_at(forward_native))
+        np.testing.assert_allclose(
+            origin.gradient_xy,
+            (
+                2.0 * math.sin(heading) - 3.0 * math.cos(heading),
+                2.0 * math.cos(heading) + 3.0 * math.sin(heading),
+            ),
+            atol=1.0e-12,
+        )
         np.testing.assert_allclose(
             callback.collision_heights_at(np.asarray(((0.0, 0.0), (0.25, 0.0)))),
-            (18.0, 18.5),
+            (18.0, adapter.authority.height_at(forward_native)),
             atol=1.0e-12,
         )
         vertices, faces = adapter.native_mesh()
@@ -308,6 +319,38 @@ class TerrainPFNNViewerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "--scene.*--terrain-fit"):
                 _validate(arguments)
 
+    def test_scene_validation_ignores_the_absent_default_terrain_fit(self) -> None:
+        import mm_sonic.terrain_pfnn_viewer as viewer_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            default_fit = root / "absent-default-fit.npz"
+            inputs = tuple(
+                root / name
+                for name in ("checkpoint", "dataset", "model", "scene", "idle")
+            )
+            for path in inputs:
+                path.touch()
+            with mock.patch.object(viewer_module, "DEFAULT_TERRAIN_FIT", default_fit):
+                arguments = viewer_module._parser().parse_args(
+                    [
+                        "--scene",
+                        "ramp-10-up-down",
+                        "--checkpoint",
+                        str(inputs[0]),
+                        "--dataset",
+                        str(inputs[1]),
+                        "--model-path",
+                        str(inputs[2]),
+                        "--scene-xml",
+                        str(inputs[3]),
+                        "--idle-clips",
+                        str(inputs[4]),
+                    ]
+                )
+                self.assertFalse(arguments.terrain_fit.is_file())
+                self.assertEqual(viewer_module._validate(arguments), inputs)
+
     def test_motionbricks_native_g1_idle_pose_is_loaded_safely(self) -> None:
         import torch
         from mm_sonic.terrain_pfnn_viewer import _motionbricks_idle_mujoco_qpos
@@ -454,6 +497,17 @@ class TerrainPFNNViewerTests(unittest.TestCase):
         self.assertNotIn("_upright_yaw_quaternion(", source)
         self.assertNotIn("_blend_display_joints(", source)
         self.assertNotIn("display_joints_mujoco=", source)
+
+    def test_interactive_camera_tracks_the_scene_placed_root(self) -> None:
+        import mm_sonic.terrain_pfnn_viewer as viewer_module
+
+        source = inspect.getsource(viewer_module._run)
+        self.assertIn(
+            "viewer.cam.lookat[:] = _scene_root_position(\n"
+            "                    frame.root_position_world, scene_terrain\n"
+            "                )",
+            source,
+        )
 
 
 if __name__ == "__main__":
