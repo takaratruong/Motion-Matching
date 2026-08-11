@@ -28,7 +28,12 @@ from mm_sonic.evaluate_terrain_pfnn import (
 )
 from mm_sonic.train_terrain_pfnn import fitted_subset_metadata, validated_normal_selection
 from mm_sonic.terrain_pfnn.dataset import pfnn_input_sha256
-from mm_sonic.terrain_pfnn.layout import INPUT_LAYOUT, OUTPUT_LAYOUT, TRAJECTORY_TIMES_S
+from mm_sonic.terrain_pfnn.layout import (
+    CLASSIC_G1_INPUT_LAYOUT_V3,
+    INPUT_LAYOUT,
+    OUTPUT_LAYOUT,
+    TRAJECTORY_TIMES_S,
+)
 from mm_sonic.terrain_pfnn.recurrence import (
     PlannedTrajectory,
     advance_recurrent_state,
@@ -78,6 +83,19 @@ class FakeCheckpoint:
             "y_std": torch.ones(OUTPUT_LAYOUT.size, dtype=torch.float32),
         }
         self.dataset_digest = "dataset"
+
+
+class FakeV3Checkpoint(FakeCheckpoint):
+    def __init__(self) -> None:
+        super().__init__()
+        self.input_size = CLASSIC_G1_INPUT_LAYOUT_V3.size
+        self.normalization["x_mean"] = torch.zeros(
+            CLASSIC_G1_INPUT_LAYOUT_V3.size, dtype=torch.float32
+        )
+        self.normalization["x_std"] = torch.ones(
+            CLASSIC_G1_INPUT_LAYOUT_V3.size, dtype=torch.float32
+        )
+        self.runtime_seed["joint_velocity"] = torch.zeros(29, dtype=torch.float32)
 
 
 def physical_output(
@@ -136,28 +154,40 @@ class TerrainPFNNRuntimeTests(unittest.TestCase):
     @staticmethod
     def bind_identity_bootstrap(checkpoint: FakeCheckpoint) -> np.ndarray:
         seed = checkpoint.runtime_seed
-        raw = np.zeros(INPUT_LAYOUT.size, dtype=np.float32)
-        raw[INPUT_LAYOUT["trajectory_position"]] = np.asarray(
+        input_size = len(checkpoint.normalization["x_mean"])
+        layout = (
+            CLASSIC_G1_INPUT_LAYOUT_V3
+            if input_size == CLASSIC_G1_INPUT_LAYOUT_V3.size
+            else INPUT_LAYOUT
+        )
+        raw = np.zeros(layout.size, dtype=np.float32)
+        raw[layout["trajectory_position"]] = np.asarray(
             seed["trajectory_position"]
         ).reshape(-1)
-        raw[INPUT_LAYOUT["trajectory_direction"]] = np.asarray(
+        raw[layout["trajectory_direction"]] = np.asarray(
             seed["trajectory_direction"]
         ).reshape(-1)
-        raw[INPUT_LAYOUT["terrain_height"]] = np.asarray(
+        raw[layout["terrain_height"]] = np.asarray(
             seed["terrain_height"]
         ).reshape(-1)
-        raw[INPUT_LAYOUT["semantic_intent"]] = np.asarray(
+        raw[layout["semantic_intent"]] = np.asarray(
             seed["semantic_intent"]
         ).reshape(-1)
-        raw[INPUT_LAYOUT["previous_body_position"]] = np.asarray(
+        raw[layout["previous_body_position"]] = np.asarray(
             seed["body_position"]
         ).reshape(-1)
-        raw[INPUT_LAYOUT["previous_body_velocity"]] = np.asarray(
+        raw[layout["previous_body_velocity"]] = np.asarray(
             seed["body_velocity"]
         ).reshape(-1)
-        normalized = raw.copy()
+        if layout == CLASSIC_G1_INPUT_LAYOUT_V3:
+            raw[layout["joint_position"]] = np.asarray(seed["joint_position"])
+            raw[layout["joint_velocity"]] = np.asarray(seed["joint_velocity"])
+        normalized = (
+            raw - np.asarray(checkpoint.normalization["x_mean"])
+        ) / np.asarray(checkpoint.normalization["x_std"])
         for field in ("previous_body_position", "previous_body_velocity"):
-            normalized[INPUT_LAYOUT[field]] *= 0.1
+            normalized[layout[field]] *= 0.1
+        normalized = np.ascontiguousarray(normalized, dtype=np.float32)
         seed["normalized_input"] = torch.as_tensor(normalized.copy())
         seed["normalized_input_sha256"] = pfnn_input_sha256(normalized)
         return normalized
@@ -229,6 +259,27 @@ class TerrainPFNNRuntimeTests(unittest.TestCase):
         np.testing.assert_array_equal(
             model.inputs[0][0, INPUT_LAYOUT["semantic_intent"]].reshape(12, 2),
             np.tile((0.0, 1.0), (12, 1)),
+        )
+
+    def test_v3_bootstrap_appends_receipt_bound_joint_position_and_velocity(self) -> None:
+        checkpoint = FakeV3Checkpoint()
+        checkpoint.runtime_seed["joint_position"] = torch.linspace(-0.05, 0.05, 29)
+        checkpoint.runtime_seed["joint_velocity"] = torch.linspace(-1.0, 1.0, 29)
+        expected = self.bind_identity_bootstrap(checkpoint)
+        model = FakeModel([physical_output()])
+        runtime = self.make_runtime(model, checkpoint=checkpoint)
+
+        frame = runtime.step(np.zeros(2), camera_yaw=0.0)
+
+        self.assertNotIn("hold_reason", frame.diagnostics)
+        np.testing.assert_array_equal(model.inputs[0][0].numpy(), expected)
+        np.testing.assert_array_equal(
+            model.inputs[0][0, CLASSIC_G1_INPUT_LAYOUT_V3["joint_position"]],
+            checkpoint.runtime_seed["joint_position"],
+        )
+        np.testing.assert_array_equal(
+            model.inputs[0][0, CLASSIC_G1_INPUT_LAYOUT_V3["joint_velocity"]],
+            checkpoint.runtime_seed["joint_velocity"],
         )
 
     def test_second_input_contains_first_prediction_not_teacher_state(self) -> None:
@@ -389,6 +440,45 @@ class TerrainPFNNRuntimeTests(unittest.TestCase):
         third = runtime.step(np.zeros(2), camera_yaw=0.0)
         np.testing.assert_array_equal(model.inputs[1], model.inputs[2])
         self.assertEqual(third.diagnostics["hold_count"], 1)
+
+    def test_v3_commit_and_hold_advance_q_qdot_transactionally(self) -> None:
+        checkpoint = FakeV3Checkpoint()
+        self.bind_identity_bootstrap(checkpoint)
+        model = FakeModel(
+            [
+                physical_output(joints=0.1),
+                physical_output(joints=1.0),
+                physical_output(joints=0.2),
+            ]
+        )
+        runtime = self.make_runtime(model, checkpoint=checkpoint)
+
+        first = runtime.step(np.zeros(2), camera_yaw=0.0)
+        committed = runtime._recurrent_state
+        torch.testing.assert_close(
+            committed.joint_position, torch.full((1, 29), 0.1)
+        )
+        torch.testing.assert_close(
+            committed.joint_velocity, torch.full((1, 29), 3.0)
+        )
+        held = runtime.step(np.zeros(2), camera_yaw=0.0)
+
+        self.assertEqual(held.diagnostics["hold_reason"], "joint_step")
+        self.assertIs(runtime._recurrent_state, committed)
+        torch.testing.assert_close(runtime._recurrent_state.joint_position, committed.joint_position)
+        torch.testing.assert_close(runtime._recurrent_state.joint_velocity, committed.joint_velocity)
+        third = runtime.step(np.zeros(2), camera_yaw=0.0)
+        np.testing.assert_array_equal(model.inputs[1], model.inputs[2])
+        self.assertNotIn("hold_reason", third.diagnostics)
+        torch.testing.assert_close(
+            runtime._recurrent_state.joint_position, torch.full((1, 29), 0.2)
+        )
+        torch.testing.assert_close(
+            runtime._recurrent_state.joint_velocity, torch.full((1, 29), 3.0)
+        )
+        np.testing.assert_allclose(
+            first.joint_position_isaaclab, np.full(29, 0.1), atol=2.0e-9, rtol=0.0
+        )
 
     def test_preview_mode_commits_finite_pose_and_reports_envelope_violation(self) -> None:
         model = FakeModel(

@@ -25,10 +25,12 @@ from mm_sonic.terrain_oracle.canonical import (
 
 from .dataset import normalize_pfnn_input, pfnn_input_sha256
 from .layout import (
+    CLASSIC_G1_INPUT_LAYOUT_V3,
     CONTACT_ORDER,
     INPUT_LAYOUT,
     OUTPUT_LAYOUT,
     TRAJECTORY_TIMES_S,
+    VectorLayout,
 )
 from .model import PhaseFunctionedNetwork
 from .recurrence import (
@@ -1830,8 +1832,14 @@ def training_phase_advance_q99(dataset: object) -> float:
     return float(np.quantile(values, 0.99, method="linear"))
 
 
-def fitted_row_sha256(sample: Mapping[str, object]) -> str:
+def fitted_row_sha256(
+    sample: Mapping[str, object],
+    input_layout: VectorLayout = INPUT_LAYOUT,
+) -> str:
     """Hash one normalized fitted row and its sealed training provenance."""
+
+    if input_layout not in (INPUT_LAYOUT, CLASSIC_G1_INPUT_LAYOUT_V3):
+        raise ValueError("fitted row input layout is unsupported")
 
     try:
         x = np.ascontiguousarray(np.asarray(sample["x"], dtype="<f4"))
@@ -1848,7 +1856,7 @@ def fitted_row_sha256(sample: Mapping[str, object]) -> str:
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("fitted row receipt source is invalid") from error
     if (
-        x.shape != (INPUT_LAYOUT.size,)
+        x.shape != (input_layout.size,)
         or y.shape != (OUTPUT_LAYOUT.size,)
         or not np.isfinite(x).all()
         or not np.isfinite(y).all()
@@ -1865,7 +1873,12 @@ def fitted_row_sha256(sample: Mapping[str, object]) -> str:
         not in ("flat", "ascent", "descent", "transition")
     ):
         raise ValueError("fitted row receipt source is invalid")
-    digest = hashlib.sha256(b"mm-sonic-fitted-pfnn-row/v2\0")
+    domain = (
+        b"mm-sonic-fitted-pfnn-row/v3\0"
+        if input_layout == CLASSIC_G1_INPUT_LAYOUT_V3
+        else b"mm-sonic-fitted-pfnn-row/v2\0"
+    )
+    digest = hashlib.sha256(domain)
     digest.update(
         json.dumps(
             provenance, sort_keys=True, separators=(",", ":"), allow_nan=False
@@ -2468,6 +2481,7 @@ def choose_runtime_seed(
     *,
     fitted_subset: Mapping[str, object] | None = None,
     require_terrain: bool = False,
+    input_layout: VectorLayout = INPUT_LAYOUT,
 ) -> dict[str, object]:
     """Choose a fitted recurrent state whose first inference is also fitted.
 
@@ -2480,6 +2494,8 @@ def choose_runtime_seed(
 
     if type(require_terrain) is not bool:
         raise TypeError("require_terrain must be bool")
+    if input_layout not in (INPUT_LAYOUT, CLASSIC_G1_INPUT_LAYOUT_V3):
+        raise ValueError("runtime seed input layout is unsupported")
     if getattr(dataset, "split", None) != "train":
         raise ValueError("runtime seed may only be selected from training data")
     limits = torch.as_tensor(joint_limits, dtype=torch.float64, device="cpu")
@@ -2488,8 +2504,8 @@ def choose_runtime_seed(
     x_mean = np.asarray(dataset.x_mean, dtype=np.float64)
     x_std = np.asarray(dataset.x_std, dtype=np.float64)
     if (
-        x_mean.shape != (INPUT_LAYOUT.size,)
-        or x_std.shape != (INPUT_LAYOUT.size,)
+        x_mean.shape != (input_layout.size,)
+        or x_std.shape != (input_layout.size,)
         or not np.isfinite(x_mean).all()
         or not np.isfinite(x_std).all()
         or np.any(x_std <= 0.0)
@@ -2554,7 +2570,13 @@ def choose_runtime_seed(
         )
         candidates.append(
             (
-                (speed, clip, lane, center, fitted_row_sha256(sample)),
+                (
+                    speed,
+                    clip,
+                    lane,
+                    center,
+                    fitted_row_sha256(sample, input_layout),
+                ),
                 predecessor,
                 sample,
             )
@@ -2576,10 +2598,10 @@ def choose_runtime_seed(
 
     first_normalized = np.asarray(first_fitted["x"], dtype=np.float32)
     first_input = np.asarray(first_normalized, dtype=np.float64).copy()
-    if first_input.shape != (INPUT_LAYOUT.size,) or not np.isfinite(first_input).all():
+    if first_input.shape != (input_layout.size,) or not np.isfinite(first_input).all():
         raise ValueError("first fitted recurrent input is invalid")
     for field in ("previous_body_position", "previous_body_velocity"):
-        first_input[INPUT_LAYOUT[field]] /= 0.1
+        first_input[input_layout[field]] /= 0.1
     first_input = first_input * x_std + x_mean
     recurrent_pairs = (
         ("trajectory_position", "trajectory_position"),
@@ -2589,7 +2611,7 @@ def choose_runtime_seed(
     )
     for output_name, input_name in recurrent_pairs:
         left = predecessor_physical[OUTPUT_LAYOUT[output_name]]
-        right = first_input[INPUT_LAYOUT[input_name]]
+        right = first_input[input_layout[input_name]]
         if not np.allclose(left, right, rtol=3.0e-5, atol=3.0e-5):
             raise ValueError(
                 f"fitted recurrent {output_name} does not reconstruct first input"
@@ -2603,7 +2625,7 @@ def choose_runtime_seed(
     if phase_error > 3.0e-5:
         raise ValueError("fitted recurrent phase does not reconstruct first input")
     reconstructed_semantic = first_input[
-        INPUT_LAYOUT["semantic_intent"]
+        input_layout["semantic_intent"]
     ].reshape(12, 2)
     semantic = np.zeros((12, 2), dtype=np.float64)
     semantic[np.arange(12), np.argmax(reconstructed_semantic, axis=1)] = 1.0
@@ -2611,22 +2633,31 @@ def choose_runtime_seed(
         reconstructed_semantic, semantic, rtol=0.0, atol=3.0e-5
     ):
         raise ValueError("first fitted semantic intent is not one-hot")
-    expected_terrain = first_input[INPUT_LAYOUT["terrain_height"]].reshape(12, 3).copy()
-    reconstructed = np.empty(INPUT_LAYOUT.size, dtype=np.float32)
-    reconstructed[INPUT_LAYOUT["trajectory_position"]] = predecessor_physical[
+    expected_terrain = first_input[input_layout["terrain_height"]].reshape(12, 3).copy()
+    reconstructed = np.empty(input_layout.size, dtype=np.float32)
+    reconstructed[input_layout["trajectory_position"]] = predecessor_physical[
         OUTPUT_LAYOUT["trajectory_position"]
     ]
-    reconstructed[INPUT_LAYOUT["trajectory_direction"]] = predecessor_physical[
+    reconstructed[input_layout["trajectory_direction"]] = predecessor_physical[
         OUTPUT_LAYOUT["trajectory_direction"]
     ]
-    reconstructed[INPUT_LAYOUT["terrain_height"]] = expected_terrain.reshape(-1)
-    reconstructed[INPUT_LAYOUT["semantic_intent"]] = semantic.reshape(-1)
-    reconstructed[INPUT_LAYOUT["previous_body_position"]] = predecessor_physical[
+    reconstructed[input_layout["terrain_height"]] = expected_terrain.reshape(-1)
+    reconstructed[input_layout["semantic_intent"]] = semantic.reshape(-1)
+    reconstructed[input_layout["previous_body_position"]] = predecessor_physical[
         OUTPUT_LAYOUT["body_position"]
     ]
-    reconstructed[INPUT_LAYOUT["previous_body_velocity"]] = predecessor_physical[
+    reconstructed[input_layout["previous_body_velocity"]] = predecessor_physical[
         OUTPUT_LAYOUT["body_velocity"]
     ]
+    joint_velocity: np.ndarray | None = None
+    if input_layout == CLASSIC_G1_INPUT_LAYOUT_V3:
+        input_joints = first_input[input_layout["joint_position"]].copy()
+        joint_velocity = first_input[input_layout["joint_velocity"]].copy()
+        if not np.allclose(input_joints, joints, rtol=0.0, atol=3.0e-5):
+            raise ValueError("fitted recurrent joint position does not reconstruct first input")
+        joints = input_joints
+        reconstructed[input_layout["joint_position"]] = joints
+        reconstructed[input_layout["joint_velocity"]] = joint_velocity
     reconstructed_normalized = normalize_pfnn_input(
         reconstructed, dataset.x_mean, dataset.x_std
     )
@@ -2692,8 +2723,12 @@ def choose_runtime_seed(
                 "first_fitted_center_frame": center,
                 "first_fitted_sequence_lane": str(first_fitted["sequence_lane"]),
                 "speed": speed,
-                "predecessor_row_sha256": fitted_row_sha256(predecessor),
-                "first_fitted_row_sha256": fitted_row_sha256(first_fitted),
+                "predecessor_row_sha256": fitted_row_sha256(
+                    predecessor, input_layout
+                ),
+                "first_fitted_row_sha256": fitted_row_sha256(
+                    first_fitted, input_layout
+                ),
                 "fitted_subset_rows_sha256": (
                     "0" * 64
                     if fitted_subset is None
@@ -2701,7 +2736,11 @@ def choose_runtime_seed(
                 ),
             },
         }
-    checked = _validate_runtime_seed(best, limits)
+    if joint_velocity is not None:
+        best["joint_velocity"] = torch.as_tensor(
+            joint_velocity.copy(), dtype=torch.float32
+        )
+    checked = _validate_runtime_seed(best, limits, input_layout=input_layout)
     if fitted_subset is not None:
         validate_runtime_seed_fitted_subset(checked, fitted_subset)
     return checked
@@ -2794,15 +2833,19 @@ def one_step_metrics(
     return {**means, "one_step_score": score, "samples": count}
 
 
-def finite_runtime_seed() -> dict[str, object]:
+def finite_runtime_seed(
+    input_layout: VectorLayout = INPUT_LAYOUT,
+) -> dict[str, object]:
+    if input_layout not in (INPUT_LAYOUT, CLASSIC_G1_INPUT_LAYOUT_V3):
+        raise ValueError("runtime seed input layout is unsupported")
     direction = torch.zeros(12, 2, dtype=torch.float32)
     direction[:, 0] = 1.0
     semantic = torch.zeros(12, 2, dtype=torch.float32)
     semantic[:, 0] = 1.0
-    normalized = np.zeros(INPUT_LAYOUT.size, dtype=np.float32)
-    normalized[INPUT_LAYOUT["trajectory_direction"]] = direction.numpy().reshape(-1)
-    normalized[INPUT_LAYOUT["semantic_intent"]] = semantic.numpy().reshape(-1)
-    return {
+    normalized = np.zeros(input_layout.size, dtype=np.float32)
+    normalized[input_layout["trajectory_direction"]] = direction.numpy().reshape(-1)
+    normalized[input_layout["semantic_intent"]] = semantic.numpy().reshape(-1)
+    seed = {
         "phase": torch.tensor(0.0, dtype=torch.float32),
         "world_xy": torch.zeros(2, dtype=torch.float32),
         "world_yaw": torch.tensor(0.0, dtype=torch.float32),
@@ -2831,12 +2874,19 @@ def finite_runtime_seed() -> dict[str, object]:
             "fitted_subset_rows_sha256": "0" * 64,
         },
     }
+    if input_layout == CLASSIC_G1_INPUT_LAYOUT_V3:
+        seed["joint_velocity"] = torch.zeros(29, dtype=torch.float32)
+    return seed
 
 
 def _validate_runtime_seed(
-    seed: object, joint_limits: torch.Tensor, *, exact_tensors: bool = False
+    seed: object,
+    joint_limits: torch.Tensor,
+    *,
+    exact_tensors: bool = False,
+    input_layout: VectorLayout = INPUT_LAYOUT,
 ) -> dict[str, object]:
-    template = finite_runtime_seed()
+    template = finite_runtime_seed(input_layout)
     if type(seed) is not dict or set(seed) != set(template):
         raise ValueError("runtime seed fields are invalid")
     output: dict[str, object] = {}

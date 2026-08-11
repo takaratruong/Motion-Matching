@@ -9,7 +9,13 @@ from numbers import Real
 import torch
 from torch import Tensor
 
-from .layout import INPUT_LAYOUT, OUTPUT_LAYOUT, TRAJECTORY_TIMES_S
+from .layout import (
+    CLASSIC_G1_INPUT_LAYOUT_V3,
+    INPUT_LAYOUT,
+    OUTPUT_LAYOUT,
+    TRAJECTORY_TIMES_S,
+    VectorLayout,
+)
 
 
 _DT = 1.0 / 30.0
@@ -99,6 +105,8 @@ class RecurrentTrajectoryState:
     predicted_direction_world_xy: Tensor
     previous_body_position_local: Tensor
     previous_body_velocity_local: Tensor
+    joint_position: Tensor
+    joint_velocity: Tensor
     phase: Tensor
 
     def __post_init__(self) -> None:
@@ -146,6 +154,8 @@ class RecurrentTrajectoryState:
                 self.previous_body_velocity_local,
                 (batch_size, 30, 3),
             ),
+            ("joint_position", self.joint_position, (batch_size, 29)),
+            ("joint_velocity", self.joint_velocity, (batch_size, 29)),
             ("phase", self.phase, (batch_size,)),
         )
         for name, value, shape in fields:
@@ -202,6 +212,8 @@ def initialize_recurrent_state(
     phase: Tensor,
     root_world_xy: Tensor,
     root_yaw_world: Tensor,
+    joint_position: Tensor | None = None,
+    joint_velocity: Tensor | None = None,
 ) -> RecurrentTrajectoryState:
     if not isinstance(trajectory_position_local, Tensor) or trajectory_position_local.ndim != 3:
         raise ValueError("trajectory_position_local must have shape (B, 12, 2)")
@@ -237,6 +249,26 @@ def initialize_recurrent_state(
         _validate_tensor(name, value, shape, reference=reference)
     _validate_directions("trajectory_direction_local", trajectory_direction_local)
     _validate_semantics("semantic_intent", semantic_intent)
+    if joint_position is None:
+        joint_position = torch.zeros(
+            (batch_size, 29), dtype=reference.dtype, device=reference.device
+        )
+    if joint_velocity is None:
+        joint_velocity = torch.zeros(
+            (batch_size, 29), dtype=reference.dtype, device=reference.device
+        )
+    _validate_tensor(
+        "joint_position",
+        joint_position,
+        (batch_size, 29),
+        reference=reference,
+    )
+    _validate_tensor(
+        "joint_velocity",
+        joint_velocity,
+        (batch_size, 29),
+        reference=reference,
+    )
 
     rotation = _rotation_2d(root_yaw_world)
     predicted_position_world_xy = root_world_xy[:, None] + torch.matmul(
@@ -285,6 +317,8 @@ def initialize_recurrent_state(
         predicted_direction_world_xy=predicted_direction_world_xy,
         previous_body_position_local=previous_body_position_local,
         previous_body_velocity_local=previous_body_velocity_local,
+        joint_position=joint_position,
+        joint_velocity=joint_velocity,
         phase=phase,
     )
 
@@ -418,11 +452,14 @@ def pack_recurrent_input(
     x_mean: Tensor,
     x_std: Tensor,
     body_scale: float = 0.1,
+    input_layout: VectorLayout = INPUT_LAYOUT,
 ) -> Tensor:
     if not isinstance(state, RecurrentTrajectoryState):
         raise TypeError("state must be RecurrentTrajectoryState")
     if not isinstance(planned, PlannedTrajectory):
         raise TypeError("planned must be PlannedTrajectory")
+    if input_layout not in (INPUT_LAYOUT, CLASSIC_G1_INPUT_LAYOUT_V3):
+        raise ValueError("recurrent input layout is unsupported")
     batch_size = int(state.root_world_xy.shape[0])
     reference = state.root_world_xy
     fields = (
@@ -434,8 +471,8 @@ def pack_recurrent_input(
         ),
         ("planned semantic_intent", planned.semantic_intent, (batch_size, 12, 2)),
         ("terrain_height", terrain_height, (batch_size, 12, 3)),
-        ("x_mean", x_mean, (INPUT_LAYOUT.size,)),
-        ("x_std", x_std, (INPUT_LAYOUT.size,)),
+        ("x_mean", x_mean, (input_layout.size,)),
+        ("x_std", x_std, (input_layout.size,)),
     )
     for name, value, shape in fields:
         _validate_tensor(name, value, shape, reference=reference)
@@ -455,26 +492,21 @@ def pack_recurrent_input(
     local_direction = _local_from_world(
         planned.direction_world_xy, state.root_yaw_world
     )
-    raw = torch.cat(
-        (
-            local_position.reshape(batch_size, -1),
-            local_direction.reshape(batch_size, -1),
-            terrain_height.reshape(batch_size, -1),
-            planned.semantic_intent.reshape(batch_size, -1),
-            state.previous_body_position_local.reshape(batch_size, -1),
-            state.previous_body_velocity_local.reshape(batch_size, -1),
-        ),
-        dim=-1,
-    )
+    fields = [
+        local_position.reshape(batch_size, -1),
+        local_direction.reshape(batch_size, -1),
+        terrain_height.reshape(batch_size, -1),
+        planned.semantic_intent.reshape(batch_size, -1),
+        state.previous_body_position_local.reshape(batch_size, -1),
+        state.previous_body_velocity_local.reshape(batch_size, -1),
+    ]
+    if input_layout == CLASSIC_G1_INPUT_LAYOUT_V3:
+        fields.extend((state.joint_position, state.joint_velocity))
+    raw = torch.cat(fields, dim=-1)
     normalized = (raw - x_mean) / x_std
-    body_start = INPUT_LAYOUT["previous_body_position"].start
-    packed = torch.cat(
-        (
-            normalized[:, :body_start],
-            normalized[:, body_start:] * float(body_scale),
-        ),
-        dim=-1,
-    )
+    packed = normalized.clone()
+    for field in ("previous_body_position", "previous_body_velocity"):
+        packed[:, input_layout[field]] *= float(body_scale)
     if not bool(torch.isfinite(packed).all()):
         raise ValueError("packed recurrent input must be finite")
     return packed
@@ -562,5 +594,11 @@ def advance_recurrent_state(
         previous_body_velocity_local=physical_output[
             :, OUTPUT_LAYOUT["body_velocity"]
         ].reshape(batch_size, 30, 3),
+        joint_position=physical_output[:, OUTPUT_LAYOUT["joint_position"]],
+        joint_velocity=(
+            physical_output[:, OUTPUT_LAYOUT["joint_position"]]
+            - state.joint_position
+        )
+        / _DT,
         phase=phase,
     )

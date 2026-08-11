@@ -27,12 +27,21 @@ from .build_g1_pfnn_vertical_dataset import (
 )
 from .terrain_pfnn.features import PFNNTrainingWindow, mirror_window
 from .terrain_pfnn.kinematics import TorchG1ForwardKinematics
-from .terrain_pfnn.layout import INPUT_LAYOUT, OUTPUT_LAYOUT
+from .terrain_pfnn.layout import (
+    CLASSIC_G1_INPUT_LAYOUT_V3,
+    INPUT_LAYOUT,
+    OUTPUT_LAYOUT,
+)
 from .terrain_pfnn.model import PhaseFunctionedNetwork
-from .terrain_pfnn.training import choose_runtime_seed, training_phase_advance_q99
+from .terrain_pfnn.training import (
+    _validate_runtime_seed,
+    choose_runtime_seed,
+    training_phase_advance_q99,
+)
+from .terrain_oracle.canonical import ISAACLAB_JOINT_NAMES
 
 
-CLASSIC_CHECKPOINT_SCHEMA = "classic-g1-pfnn/v2"
+CLASSIC_CHECKPOINT_SCHEMA = "classic-g1-pfnn/v3"
 _SHA256_CHARS = frozenset("0123456789abcdef")
 
 
@@ -160,9 +169,31 @@ def _finite_tree(value: object) -> bool:
     return value is None or type(value) in (str, int, bool)
 
 
+def _validate_classic_runtime_seed_binding(
+    seed: Mapping[str, object], normalization: Mapping[str, torch.Tensor]
+) -> None:
+    normalized = torch.as_tensor(seed["normalized_input"], dtype=torch.float32)
+    for field, seed_name in (
+        ("joint_position", "joint_position"),
+        ("joint_velocity", "joint_velocity"),
+    ):
+        section = CLASSIC_G1_INPUT_LAYOUT_V3[field]
+        expected = (
+            torch.as_tensor(seed[seed_name], dtype=torch.float32)
+            - normalization["x_mean"][section]
+        ) / normalization["x_std"][section]
+        if not torch.allclose(
+            normalized[section], expected, rtol=0.0, atol=3.0e-5
+        ):
+            raise ValueError(
+                f"classic PFNN runtime seed {field} binding is invalid"
+            )
+
+
 @dataclass(frozen=True)
 class ClassicG1PFNNCheckpoint:
     model_state: dict[str, torch.Tensor]
+    input_size: int
     hidden_size: int
     dropout_probability: float
     normalization: dict[str, torch.Tensor]
@@ -182,6 +213,7 @@ class ClassicG1PFNNCheckpoint:
         model = PhaseFunctionedNetwork(
             hidden_size=self.hidden_size,
             dropout_probability=self.dropout_probability,
+            input_size=self.input_size,
         )
         model.load_state_dict(self.model_state, strict=True)
         return model
@@ -207,6 +239,11 @@ def save_classic_checkpoint(
     if not isinstance(model, PhaseFunctionedNetwork):
         raise TypeError("classic PFNN checkpoint model is invalid")
     if (
+        model.input_size != CLASSIC_G1_INPUT_LAYOUT_V3.size
+        or model.W0.shape[2] != CLASSIC_G1_INPUT_LAYOUT_V3.size
+    ):
+        raise ValueError("classic PFNN checkpoint input contract is invalid")
+    if (
         type(dataset_digest) is not str
         or len(dataset_digest) != 64
         or not set(dataset_digest) <= _SHA256_CHARS
@@ -230,8 +267,8 @@ def save_classic_checkpoint(
     if not math.isfinite(score) or score < 0.0 or not math.isfinite(q99) or q99 <= 0.0:
         raise ValueError("classic PFNN checkpoint metrics are invalid")
     expected_normal = {
-        "x_mean": INPUT_LAYOUT.size,
-        "x_std": INPUT_LAYOUT.size,
+        "x_mean": CLASSIC_G1_INPUT_LAYOUT_V3.size,
+        "x_std": CLASSIC_G1_INPUT_LAYOUT_V3.size,
         "y_mean": OUTPUT_LAYOUT.size,
         "y_std": OUTPUT_LAYOUT.size,
     }
@@ -252,15 +289,26 @@ def save_classic_checkpoint(
     limits = torch.as_tensor(joint_limits, dtype=torch.float64, device="cpu").contiguous().clone()
     if limits.shape != (29, 2) or not bool(torch.all(limits[:, 0] < limits[:, 1])):
         raise ValueError("classic PFNN joint limits are invalid")
+    checked_runtime_seed = _validate_runtime_seed(
+        dict(runtime_seed),
+        limits,
+        input_layout=CLASSIC_G1_INPUT_LAYOUT_V3,
+    )
+    _validate_classic_runtime_seed_binding(checked_runtime_seed, normal)
     payload = {
         "schema": CLASSIC_CHECKPOINT_SCHEMA,
+        "input_size": CLASSIC_G1_INPUT_LAYOUT_V3.size,
+        "output_size": OUTPUT_LAYOUT.size,
+        "input_layout": [list(field) for field in CLASSIC_G1_INPUT_LAYOUT_V3.fields],
+        "output_layout": [list(field) for field in OUTPUT_LAYOUT.fields],
+        "canonical_joint_order": list(ISAACLAB_JOINT_NAMES),
         "model_config": {
             "hidden_size": int(model.W0.shape[1]),
             "dropout_probability": float(model.dropout.p),
         },
         "model_state": dict(model.state_dict()),
         "normalization": normal,
-        "runtime_seed": dict(runtime_seed),
+        "runtime_seed": checked_runtime_seed,
         "dataset_digest": dataset_digest,
         "kinematic_signature_sha256": kinematic_signature_sha256,
         "joint_limits": limits,
@@ -295,7 +343,8 @@ def load_classic_checkpoint(path: str | Path) -> ClassicG1PFNNCheckpoint:
     except (OSError, RuntimeError, TypeError, ValueError) as error:
         raise ValueError("classic PFNN checkpoint cannot be loaded safely") from error
     required = {
-        "schema", "model_config", "model_state", "normalization", "runtime_seed",
+        "schema", "input_size", "output_size", "input_layout", "output_layout",
+        "canonical_joint_order", "model_config", "model_state", "normalization", "runtime_seed",
         "dataset_digest", "kinematic_signature_sha256", "joint_limits",
         "phase_advance_q99", "epoch", "validation_loss", "seed",
         "source_kind", "vertical_slice_receipt_sha256",
@@ -303,6 +352,15 @@ def load_classic_checkpoint(path: str | Path) -> ClassicG1PFNNCheckpoint:
     }
     if type(payload) is not dict or set(payload) != required or payload["schema"] != CLASSIC_CHECKPOINT_SCHEMA:
         raise ValueError("classic PFNN checkpoint schema is invalid")
+    expected_contract = {
+        "input_size": CLASSIC_G1_INPUT_LAYOUT_V3.size,
+        "output_size": OUTPUT_LAYOUT.size,
+        "input_layout": [list(field) for field in CLASSIC_G1_INPUT_LAYOUT_V3.fields],
+        "output_layout": [list(field) for field in OUTPUT_LAYOUT.fields],
+        "canonical_joint_order": list(ISAACLAB_JOINT_NAMES),
+    }
+    if any(payload[name] != value for name, value in expected_contract.items()):
+        raise ValueError("classic PFNN checkpoint immutable contract mismatch")
     config = payload["model_config"]
     if (
         type(config) is not dict
@@ -313,6 +371,40 @@ def load_classic_checkpoint(path: str | Path) -> ClassicG1PFNNCheckpoint:
         or not 0.0 <= config["dropout_probability"] < 1.0
     ):
         raise ValueError("classic PFNN model config is invalid")
+    normalization = payload["normalization"]
+    expected_normal = {
+        "x_mean": CLASSIC_G1_INPUT_LAYOUT_V3.size,
+        "x_std": CLASSIC_G1_INPUT_LAYOUT_V3.size,
+        "y_mean": OUTPUT_LAYOUT.size,
+        "y_std": OUTPUT_LAYOUT.size,
+    }
+    if type(normalization) is not dict or set(normalization) != set(expected_normal):
+        raise ValueError("classic PFNN normalization is invalid")
+    if any(
+        not isinstance(normalization[name], torch.Tensor)
+        or normalization[name].shape != (width,)
+        or not bool(torch.isfinite(normalization[name]).all())
+        for name, width in expected_normal.items()
+    ) or any(
+        not bool(torch.all(normalization[name] > 0.0))
+        for name in ("x_std", "y_std")
+    ):
+        raise ValueError("classic PFNN normalization is invalid")
+    limits = payload["joint_limits"]
+    if (
+        not isinstance(limits, torch.Tensor)
+        or limits.shape != (29, 2)
+        or not bool(torch.isfinite(limits).all())
+        or not bool(torch.all(limits[:, 0] < limits[:, 1]))
+    ):
+        raise ValueError("classic PFNN joint limits are invalid")
+    runtime_seed = _validate_runtime_seed(
+        payload["runtime_seed"],
+        limits.to(dtype=torch.float64),
+        exact_tensors=True,
+        input_layout=CLASSIC_G1_INPUT_LAYOUT_V3,
+    )
+    _validate_classic_runtime_seed_binding(runtime_seed, normalization)
     if (
         payload["source_kind"] not in ("grail", "mixed", "released_pfnn")
         or type(payload["vertical_slice_receipt_sha256"]) is not str
@@ -325,10 +417,11 @@ def load_classic_checkpoint(path: str | Path) -> ClassicG1PFNNCheckpoint:
         raise ValueError("classic PFNN source provenance is invalid")
     checkpoint = ClassicG1PFNNCheckpoint(
         model_state=payload["model_state"],
+        input_size=payload["input_size"],
         hidden_size=config["hidden_size"],
         dropout_probability=config["dropout_probability"],
         normalization=payload["normalization"],
-        runtime_seed=payload["runtime_seed"],
+        runtime_seed=runtime_seed,
         dataset_digest=payload["dataset_digest"],
         kinematic_signature_sha256=payload["kinematic_signature_sha256"],
         joint_limits=payload["joint_limits"],
@@ -447,7 +540,9 @@ def _released_runtime_seed_view(dataset: VerticalDataset) -> _IndexedTrainDatase
 def _materialize_vertical(
     view: _VerticalTrainingView,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    x = np.empty((len(view), INPUT_LAYOUT.size), dtype=np.float32)
+    x = np.empty(
+        (len(view), CLASSIC_G1_INPUT_LAYOUT_V3.size), dtype=np.float32
+    )
     y = np.empty((len(view), OUTPUT_LAYOUT.size), dtype=np.float32)
     phase = np.empty(len(view), dtype=np.float32)
     for index in range(len(view)):
@@ -568,15 +663,23 @@ def train(arguments: argparse.Namespace) -> Path:
     dataset_path = Path(arguments.dataset).expanduser().resolve()
     root = dataset_path if dataset_path.is_dir() else dataset_path.parent
     vertical_dataset: VerticalDataset | None = None
-    if arguments.train_source == "released-pfnn":
+    if arguments.train_source in ("released-pfnn", "mixed"):
         vertical_dataset = load_vertical_dataset(root)
         train_dataset = _VerticalTrainingView(vertical_dataset, "train")
         validation_dataset = _VerticalTrainingView(vertical_dataset, "validation")
         train_x, train_y, train_phase = _materialize_vertical(train_dataset)
         val_x, val_y, val_phase = _materialize_vertical(validation_dataset)
-        train_source = np.full(len(train_x), "released_pfnn", dtype="<U13")
         train_clip = np.asarray(
             vertical_dataset.splits["train"].clip_id, dtype="<U128"
+        )
+        train_source = (
+            np.where(
+                np.char.startswith(train_clip, "terrain_slopes__"),
+                "grail",
+                "lafan",
+            ).astype("<U6")
+            if arguments.train_source == "mixed"
+            else np.full(len(train_x), "released_pfnn", dtype="<U13")
         )
         manifest = {"dataset_digest_sha256": vertical_dataset.dataset_sha256}
         seed_dataset = _released_runtime_seed_view(vertical_dataset)
@@ -601,10 +704,6 @@ def train(arguments: argparse.Namespace) -> Path:
         train_y = train_y[optimized]
         train_phase = train_phase[optimized]
         train_source = train_source[optimized]
-    elif arguments.train_source == "mixed":
-        validation_dataset = PFNNShardDataset(root, "validation")
-        val_x, val_y, val_phase, _, _ = _materialize(validation_dataset)
-        seed_dataset = train_dataset
     kinematics = TorchG1ForwardKinematics.from_mjcf(arguments.model_path)
     runtime_seed = choose_runtime_seed(
         seed_dataset,
@@ -613,6 +712,7 @@ def train(arguments: argparse.Namespace) -> Path:
             arguments.train_source == "released-pfnn"
             and arguments.runtime_seed == "terrain"
         ),
+        input_layout=CLASSIC_G1_INPUT_LAYOUT_V3,
     )
     phase_q99 = training_phase_advance_q99(seed_dataset)
     normalization = {
@@ -638,7 +738,9 @@ def train(arguments: argparse.Namespace) -> Path:
         val_y = np.concatenate((val_y, val_mirror_y), axis=0)
         val_phase = np.concatenate((val_phase, val_mirror_phase), axis=0)
     model = PhaseFunctionedNetwork(
-        hidden_size=arguments.hidden_size, dropout_probability=0.30
+        hidden_size=arguments.hidden_size,
+        dropout_probability=0.30,
+        input_size=CLASSIC_G1_INPUT_LAYOUT_V3.size,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=arguments.learning_rate)
     output = Path(arguments.output).expanduser().resolve()

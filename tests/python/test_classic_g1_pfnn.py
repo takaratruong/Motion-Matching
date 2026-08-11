@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import replace
 from pathlib import Path
 import tempfile
@@ -11,6 +12,7 @@ import torch
 from torch.nn import functional as F
 
 from mm_sonic.train_classic_g1_pfnn import (
+    CLASSIC_CHECKPOINT_SCHEMA,
     _released_runtime_seed_view,
     _grail_train_validation_masks,
     _mirror_normalized_examples,
@@ -27,12 +29,27 @@ from mm_sonic.build_g1_pfnn_vertical_dataset import (
     save_vertical_dataset,
 )
 from tests.python.test_build_g1_pfnn_vertical_dataset import _source
-from mm_sonic.terrain_pfnn.layout import INPUT_LAYOUT, OUTPUT_LAYOUT
+from mm_sonic.terrain_pfnn.dataset import pfnn_input_sha256
+from mm_sonic.terrain_pfnn.layout import (
+    CLASSIC_G1_INPUT_LAYOUT_V3,
+    INPUT_LAYOUT,
+    OUTPUT_LAYOUT,
+)
 from mm_sonic.terrain_pfnn.model import PhaseFunctionedNetwork
 from mm_sonic.terrain_pfnn.training import finite_runtime_seed
 
 
 class ClassicG1PFNNTests(unittest.TestCase):
+    @staticmethod
+    def _v3_runtime_seed() -> dict[str, object]:
+        seed = finite_runtime_seed()
+        normalized = np.zeros(CLASSIC_G1_INPUT_LAYOUT_V3.size, dtype=np.float32)
+        normalized[: INPUT_LAYOUT.size] = np.asarray(seed["normalized_input"])
+        seed["joint_velocity"] = torch.zeros(29, dtype=torch.float32)
+        seed["normalized_input"] = torch.as_tensor(normalized)
+        seed["normalized_input_sha256"] = pfnn_input_sha256(normalized)
+        return seed
+
     def test_loss_is_only_one_step_supervision(self) -> None:
         generator = torch.Generator().manual_seed(11)
         prediction = torch.randn(
@@ -179,18 +196,24 @@ class ClassicG1PFNNTests(unittest.TestCase):
 
     def test_safe_checkpoint_round_trip_preserves_exact_model_output(self) -> None:
         torch.manual_seed(7)
-        model = PhaseFunctionedNetwork(hidden_size=32, dropout_probability=0.30)
+        model = PhaseFunctionedNetwork(
+            hidden_size=32,
+            dropout_probability=0.30,
+            input_size=CLASSIC_G1_INPUT_LAYOUT_V3.size,
+        )
         model.eval()
-        x = torch.randn((4, INPUT_LAYOUT.size), dtype=torch.float32)
+        x = torch.randn(
+            (4, CLASSIC_G1_INPUT_LAYOUT_V3.size), dtype=torch.float32
+        )
         phase = torch.tensor((0.0, 0.5, 2.0, 6.0), dtype=torch.float32)
         expected = model(x, phase).detach()
         normal = {
-            "x_mean": torch.zeros(INPUT_LAYOUT.size),
-            "x_std": torch.ones(INPUT_LAYOUT.size),
+            "x_mean": torch.zeros(CLASSIC_G1_INPUT_LAYOUT_V3.size),
+            "x_std": torch.ones(CLASSIC_G1_INPUT_LAYOUT_V3.size),
             "y_mean": torch.zeros(OUTPUT_LAYOUT.size),
             "y_std": torch.ones(OUTPUT_LAYOUT.size),
         }
-        seed = finite_runtime_seed()
+        seed = self._v3_runtime_seed()
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "best.pt"
@@ -210,6 +233,7 @@ class ClassicG1PFNNTests(unittest.TestCase):
                 vertical_slice_receipt_sha256="c" * 64,
                 terrain_receipt_set_sha256="d" * 64,
             )
+            payload = torch.load(path, map_location="cpu", weights_only=True)
             loaded = load_classic_checkpoint(path)
 
         actual = loaded.build_model().eval()(x, phase).detach()
@@ -217,9 +241,87 @@ class ClassicG1PFNNTests(unittest.TestCase):
         self.assertEqual(loaded.epoch, 3)
         self.assertEqual(loaded.dataset_digest, "a" * 64)
         self.assertEqual(loaded.validation_loss, 0.125)
+        self.assertEqual(loaded.input_size, CLASSIC_G1_INPUT_LAYOUT_V3.size)
+        self.assertEqual(payload["schema"], CLASSIC_CHECKPOINT_SCHEMA)
+        self.assertEqual(payload["input_size"], CLASSIC_G1_INPUT_LAYOUT_V3.size)
+        self.assertEqual(
+            payload["input_layout"],
+            [list(field) for field in CLASSIC_G1_INPUT_LAYOUT_V3.fields],
+        )
         self.assertEqual(loaded.source_kind, "released_pfnn")
         self.assertEqual(loaded.vertical_slice_receipt_sha256, "c" * 64)
         self.assertEqual(loaded.terrain_receipt_set_sha256, "d" * 64)
+
+    def test_checkpoint_rejects_v2_model_and_tampered_v3_contract(self) -> None:
+        normal = {
+            "x_mean": torch.zeros(CLASSIC_G1_INPUT_LAYOUT_V3.size),
+            "x_std": torch.ones(CLASSIC_G1_INPUT_LAYOUT_V3.size),
+            "y_mean": torch.zeros(OUTPUT_LAYOUT.size),
+            "y_std": torch.ones(OUTPUT_LAYOUT.size),
+        }
+        common = {
+            "normalization": normal,
+            "runtime_seed": self._v3_runtime_seed(),
+            "dataset_digest": "a" * 64,
+            "kinematic_signature_sha256": "b" * 64,
+            "joint_limits": torch.tensor([[-2.0, 2.0]] * 29),
+            "phase_advance_q99": 0.2,
+            "epoch": 3,
+            "validation_loss": 0.125,
+            "seed": 7,
+            "source_kind": "released_pfnn",
+            "vertical_slice_receipt_sha256": "c" * 64,
+            "terrain_receipt_set_sha256": "d" * 64,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(ValueError, "input"):
+                save_classic_checkpoint(
+                    root / "legacy.pt",
+                    model=PhaseFunctionedNetwork(hidden_size=8),
+                    **common,
+                )
+
+            path = root / "valid.pt"
+            save_classic_checkpoint(
+                path,
+                model=PhaseFunctionedNetwork(
+                    hidden_size=8,
+                    input_size=CLASSIC_G1_INPUT_LAYOUT_V3.size,
+                ),
+                **common,
+            )
+            valid = torch.load(path, map_location="cpu", weights_only=True)
+            tampered = (
+                ("input size", lambda value: value.__setitem__("input_size", 288)),
+                (
+                    "input layout",
+                    lambda value: value.__setitem__(
+                        "input_layout", [list(field) for field in INPUT_LAYOUT.fields]
+                    ),
+                ),
+                ("schema", lambda value: value.__setitem__("schema", "classic-g1-pfnn/v2")),
+            )
+            for label, mutate in tampered:
+                with self.subTest(label=label):
+                    payload = copy.deepcopy(valid)
+                    mutate(payload)
+                    candidate = root / f"tampered-{label.replace(' ', '-')}.pt"
+                    torch.save(payload, candidate)
+                    with self.assertRaisesRegex(ValueError, "schema|contract"):
+                        load_classic_checkpoint(candidate)
+
+            relabeled_v2 = copy.deepcopy(valid)
+            relabeled_v2["schema"] = CLASSIC_CHECKPOINT_SCHEMA
+            relabeled_v2["input_size"] = INPUT_LAYOUT.size
+            relabeled_v2["input_layout"] = [list(field) for field in INPUT_LAYOUT.fields]
+            relabeled_v2["model_state"]["W0"] = relabeled_v2["model_state"]["W0"][
+                :, :, : INPUT_LAYOUT.size
+            ]
+            candidate = root / "relabeled-v2.pt"
+            torch.save(relabeled_v2, candidate)
+            with self.assertRaisesRegex(ValueError, "contract"):
+                load_classic_checkpoint(candidate)
 
     def test_trains_one_vertical_epoch_and_binds_dataset_receipts(self) -> None:
         dataset = build_vertical_dataset(
@@ -264,6 +366,60 @@ class ClassicG1PFNNTests(unittest.TestCase):
         self.assertEqual(checkpoint.dataset_digest, dataset.dataset_sha256)
         self.assertEqual(checkpoint.vertical_slice_receipt_sha256, dataset.selection_sha256)
         self.assertEqual(checkpoint.terrain_receipt_set_sha256, dataset.terrain_receipt_set_sha256)
+
+    def test_trains_one_compact_mixed_epoch_with_explicit_v3_width(self) -> None:
+        from mm_sonic.build_g1_pfnn_mixed_dataset import combine_vertical_and_grail
+        from tests.python.test_build_g1_pfnn_mixed_dataset import _GrailRows
+
+        dataset = combine_vertical_and_grail(
+            build_vertical_dataset(
+                (
+                    _source("train", "released_train"),
+                    _source("validation", "released_val"),
+                )
+            ),
+            _GrailRows(),
+            grail_dataset_sha256="8" * 64,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = save_vertical_dataset(root / "dataset", dataset)
+            arguments = _parser().parse_args(
+                [
+                    "--dataset",
+                    str(manifest),
+                    "--model-path",
+                    str(root / "unused.xml"),
+                    "--output",
+                    str(root / "run"),
+                    "--device",
+                    "cpu",
+                    "--epochs",
+                    "1",
+                    "--batch-size",
+                    "8",
+                    "--evaluation-batch-size",
+                    "16",
+                    "--hidden-size",
+                    "16",
+                    "--train-source",
+                    "mixed",
+                ]
+            )
+            fake_kinematics = mock.Mock(
+                joint_limits=torch.tensor([[-2.0, 2.0]] * 29, dtype=torch.float64),
+                kinematic_signature_sha256="9" * 64,
+            )
+            with mock.patch(
+                "mm_sonic.train_classic_g1_pfnn.TorchG1ForwardKinematics.from_mjcf",
+                return_value=fake_kinematics,
+            ):
+                checkpoint_path = train(arguments)
+            checkpoint = load_classic_checkpoint(checkpoint_path)
+
+        self.assertEqual(checkpoint.source_kind, "mixed")
+        self.assertEqual(checkpoint.input_size, CLASSIC_G1_INPUT_LAYOUT_V3.size)
+        self.assertEqual(checkpoint.dataset_digest, dataset.dataset_sha256)
 
     def test_small_fixed_set_overfits_with_classic_objective(self) -> None:
         torch.manual_seed(19)

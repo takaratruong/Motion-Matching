@@ -31,6 +31,12 @@ INPUT_LAYOUT = VectorLayout((
     ("previous_body_velocity", 90),
 ))
 
+CLASSIC_G1_INPUT_LAYOUT_V3 = VectorLayout((
+    *INPUT_LAYOUT.fields,
+    ("joint_position", 29),
+    ("joint_velocity", 29),
+))
+
 OUTPUT_LAYOUT = VectorLayout((
     ("trajectory_position", 24),
     ("trajectory_direction", 24),
@@ -46,6 +52,7 @@ OUTPUT_LAYOUT = VectorLayout((
 ))
 
 assert INPUT_LAYOUT.size == 288
+assert CLASSIC_G1_INPUT_LAYOUT_V3.size == 346
 assert OUTPUT_LAYOUT.size == 268
 
 TRAJECTORY_TIMES_S = np.array(

@@ -7,7 +7,12 @@ import unittest
 import torch
 import mm_sonic.terrain_pfnn as terrain_pfnn
 
-from mm_sonic.terrain_pfnn.layout import INPUT_LAYOUT, OUTPUT_LAYOUT, TRAJECTORY_TIMES_S
+from mm_sonic.terrain_pfnn.layout import (
+    CLASSIC_G1_INPUT_LAYOUT_V3,
+    INPUT_LAYOUT,
+    OUTPUT_LAYOUT,
+    TRAJECTORY_TIMES_S,
+)
 from mm_sonic.terrain_pfnn.recurrence import (
     PlannedTrajectory,
     RecurrentTrajectoryState,
@@ -194,6 +199,45 @@ class TerrainPFNNRecurrenceTests(unittest.TestCase):
             (terrain.reshape(2, -1) - 1.0) / 2.0,
         )
 
+    def test_v3_packer_appends_unscaled_committed_joint_state(self) -> None:
+        self.assertIn("joint_position", RecurrentTrajectoryState.__dataclass_fields__)
+        self.assertIn("joint_velocity", RecurrentTrajectoryState.__dataclass_fields__)
+        state = self.make_state()
+        joint_position = torch.linspace(-0.4, 0.4, 29, dtype=self.dtype).repeat(2, 1)
+        joint_velocity = torch.linspace(-1.4, 1.4, 29, dtype=self.dtype).repeat(2, 1)
+        state = replace(
+            state,
+            joint_position=joint_position,
+            joint_velocity=joint_velocity,
+            previous_body_position_local=torch.full(
+                (2, 30, 3), 2.0, dtype=self.dtype
+            ),
+        )
+        planned = plan_recurrent_trajectory(
+            state, torch.zeros((2, 2), dtype=self.dtype)
+        )
+
+        packed = pack_recurrent_input(
+            state=state,
+            planned=planned,
+            terrain_height=torch.zeros((2, 12, 3), dtype=self.dtype),
+            x_mean=torch.zeros(CLASSIC_G1_INPUT_LAYOUT_V3.size, dtype=self.dtype),
+            x_std=torch.ones(CLASSIC_G1_INPUT_LAYOUT_V3.size, dtype=self.dtype),
+            input_layout=CLASSIC_G1_INPUT_LAYOUT_V3,
+        )
+
+        self.assertEqual(packed.shape, (2, CLASSIC_G1_INPUT_LAYOUT_V3.size))
+        torch.testing.assert_close(
+            packed[:, CLASSIC_G1_INPUT_LAYOUT_V3["joint_position"]], joint_position
+        )
+        torch.testing.assert_close(
+            packed[:, CLASSIC_G1_INPUT_LAYOUT_V3["joint_velocity"]], joint_velocity
+        )
+        torch.testing.assert_close(
+            packed[:, CLASSIC_G1_INPUT_LAYOUT_V3["previous_body_position"]],
+            torch.full((2, 90), 0.2, dtype=self.dtype),
+        )
+
     def test_state_advance_integrates_thirty_hz_and_transforms_prediction(self) -> None:
         state = self.make_state()
         planned = plan_recurrent_trajectory(
@@ -237,6 +281,34 @@ class TerrainPFNNRecurrenceTests(unittest.TestCase):
         torch.testing.assert_close(advanced.predicted_position_world_xy, expected_world)
         self.assertEqual(advanced.history_semantic_intent[0, -1].tolist(), [1.0, 0.0])
         self.assertEqual(advanced.history_semantic_intent[1, -1].tolist(), [0.0, 1.0])
+
+    def test_state_advance_commits_raw_q_and_thirty_hz_qdot(self) -> None:
+        self.assertIn("joint_position", RecurrentTrajectoryState.__dataclass_fields__)
+        state = self.make_state()
+        current = torch.linspace(-0.3, 0.3, 29, dtype=self.dtype).repeat(2, 1)
+        state = replace(
+            state,
+            joint_position=current,
+            joint_velocity=torch.full_like(current, -9.0),
+        )
+        planned = plan_recurrent_trajectory(
+            state, torch.zeros((2, 2), dtype=self.dtype)
+        )
+        physical = self.make_physical_output()
+        predicted = current + torch.tensor((0.01, -0.02), dtype=self.dtype)[:, None]
+        physical[:, OUTPUT_LAYOUT["joint_position"]] = predicted
+
+        advanced = advance_recurrent_state(
+            state,
+            planned,
+            physical,
+            phase_advance_cap=torch.full((2,), 0.3, dtype=self.dtype),
+        )
+
+        torch.testing.assert_close(advanced.joint_position, predicted)
+        torch.testing.assert_close(
+            advanced.joint_velocity, (predicted - current) * 30.0
+        )
 
     def test_planning_packing_and_advancement_remain_differentiable(self) -> None:
         state = self.make_state()

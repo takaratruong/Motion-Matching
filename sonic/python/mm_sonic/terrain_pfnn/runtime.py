@@ -25,7 +25,7 @@ from mm_sonic.terrain_oracle.canonical import (
 
 from .dataset import pfnn_input_sha256
 from .kinematics import TorchG1ForwardKinematics, root_tilt_quaternion_wxyz
-from .layout import INPUT_LAYOUT, OUTPUT_LAYOUT
+from .layout import CLASSIC_G1_INPUT_LAYOUT_V3, INPUT_LAYOUT, OUTPUT_LAYOUT
 from .recurrence import (
     PlannedTrajectory,
     _integrate_root_motion,
@@ -317,6 +317,25 @@ class TerrainPFNNRuntime:
             ).copy()
             for name in ("x_mean", "x_std", "y_mean", "y_std")
         }
+        input_size = int(self._normalization["x_mean"].size)
+        declared_input_size = getattr(checkpoint, "input_size", input_size)
+        if (
+            type(declared_input_size) is not int
+            or declared_input_size != input_size
+            or self._normalization["x_mean"].shape != (input_size,)
+            or self._normalization["x_std"].shape != (input_size,)
+            or self._normalization["y_mean"].shape != (OUTPUT_LAYOUT.size,)
+            or self._normalization["y_std"].shape != (OUTPUT_LAYOUT.size,)
+            or np.any(self._normalization["x_std"] <= 0.0)
+            or np.any(self._normalization["y_std"] <= 0.0)
+        ):
+            raise ValueError("checkpoint normalization/input contract mismatch")
+        if input_size == INPUT_LAYOUT.size:
+            self._input_layout = INPUT_LAYOUT
+        elif input_size == CLASSIC_G1_INPUT_LAYOUT_V3.size:
+            self._input_layout = CLASSIC_G1_INPUT_LAYOUT_V3
+        else:
+            raise ValueError("checkpoint PFNN input width is unsupported")
         self._x_mean = torch.as_tensor(
             self._normalization["x_mean"], dtype=torch.float32, device=self._device
         )
@@ -338,6 +357,8 @@ class TerrainPFNNRuntime:
             raise ValueError("checkpoint runtime seed is invalid")
 
         def seed_array(name: str, shape: tuple[int, ...]) -> np.ndarray:
+            if name not in seed:
+                raise ValueError(f"runtime seed {name} is missing")
             value = getattr(seed[name], "detach", lambda: seed[name])()
             if isinstance(value, torch.Tensor):
                 value = value.cpu().numpy()
@@ -347,6 +368,11 @@ class TerrainPFNNRuntime:
         root_height = float(seed_array("root_height", (),).item())
         tilt = seed_array("root_tilt", (2,))
         joints = seed_array("joint_position", (29,))
+        joint_velocity = (
+            seed_array("joint_velocity", (29,))
+            if self._input_layout == CLASSIC_G1_INPUT_LAYOUT_V3
+            else np.zeros(29, dtype=np.float64)
+        )
         if (
             not 0.0 <= phase < TWO_PI
             or root_height <= 0.0
@@ -369,7 +395,7 @@ class TerrainPFNNRuntime:
             "terrain_height", (12, 3)
         ).copy()
         self._bootstrap_expected_input = seed_array(
-            "normalized_input", (INPUT_LAYOUT.size,)
+            "normalized_input", (self._input_layout.size,)
         ).astype(np.float32)
         self._bootstrap_input_sha256 = seed.get("normalized_input_sha256")
         if (
@@ -412,6 +438,12 @@ class TerrainPFNNRuntime:
             root_yaw_world=torch.tensor(
                 (yaw,), dtype=torch.float32, device=self._device
             ),
+            joint_position=torch.tensor(
+                joints, dtype=torch.float32, device=self._device
+            ).reshape(1, 29),
+            joint_velocity=torch.tensor(
+                joint_velocity, dtype=torch.float32, device=self._device
+            ).reshape(1, 29),
         )
         self._bootstrap_pending = True
         self._wall_tick = 0
@@ -706,6 +738,7 @@ class TerrainPFNNRuntime:
                 ).reshape(1, 12, 3),
                 x_mean=self._x_mean,
                 x_std=self._x_std,
+                input_layout=self._input_layout,
             )
             if bootstrap_tick and not np.allclose(
                 np.asarray(normalized[0].to(device="cpu"), dtype=np.float32),
@@ -719,7 +752,10 @@ class TerrainPFNNRuntime:
                     normalized,
                     self._recurrent_state.phase,
                 )
-            if not isinstance(prediction, torch.Tensor) or prediction.shape != (1, 268):
+            if (
+                not isinstance(prediction, torch.Tensor)
+                or prediction.shape != (1, OUTPUT_LAYOUT.size)
+            ):
                 return self._hold("model_output_shape")
             raw_output = prediction.to(device=self._device, dtype=torch.float64)[0]
         except Exception as error:  # model failures are a rejected transaction

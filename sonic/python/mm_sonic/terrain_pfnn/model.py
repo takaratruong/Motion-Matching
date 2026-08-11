@@ -33,9 +33,17 @@ def _batched_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -
 
 
 class PhaseFunctionedNetwork(nn.Module):
-    def __init__(self, hidden_size: int = 512, dropout_probability: float = 0.30) -> None:
+    def __init__(
+        self,
+        hidden_size: int = 512,
+        dropout_probability: float = 0.30,
+        input_size: int = INPUT_LAYOUT.size,
+    ) -> None:
         super().__init__()
-        self.W0 = nn.Parameter(torch.empty(4, hidden_size, INPUT_LAYOUT.size))
+        if type(input_size) is not int or input_size < 1:
+            raise ValueError("PFNN input_size must be a positive integer")
+        self.input_size = input_size
+        self.W0 = nn.Parameter(torch.empty(4, hidden_size, input_size))
         self.b0 = nn.Parameter(torch.zeros(4, hidden_size))
         self.W1 = nn.Parameter(torch.empty(4, hidden_size, hidden_size))
         self.b1 = nn.Parameter(torch.zeros(4, hidden_size))
@@ -48,8 +56,10 @@ class PhaseFunctionedNetwork(nn.Module):
                 nn.init.xavier_uniform_(bank)
 
     def forward(self, x: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
-        if x.ndim != 2 or x.shape[1] != INPUT_LAYOUT.size or phase.shape != (len(x),):
-            raise ValueError("PFNN expects x[B,288] and phase[B]")
+        if x.ndim != 2 or x.shape[1] != self.input_size or phase.shape != (len(x),):
+            raise ValueError(
+                f"PFNN expects x[B,{self.input_size}] and phase[B]"
+            )
         h0 = self.activation(_batched_linear(x, catmull_rom_phase_banks(self.W0, phase), catmull_rom_phase_banks(self.b0, phase)))
         h1 = self.activation(_batched_linear(self.dropout(h0), catmull_rom_phase_banks(self.W1, phase), catmull_rom_phase_banks(self.b1, phase)))
         return _batched_linear(self.dropout(h1), catmull_rom_phase_banks(self.W2, phase), catmull_rom_phase_banks(self.b2, phase))

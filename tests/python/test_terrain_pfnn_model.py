@@ -2,8 +2,12 @@ import math
 import unittest
 
 import torch
+import mm_sonic.terrain_pfnn.layout as layout_module
 
-from mm_sonic.terrain_pfnn.layout import INPUT_LAYOUT, OUTPUT_LAYOUT
+from mm_sonic.terrain_pfnn.layout import (
+    INPUT_LAYOUT,
+    OUTPUT_LAYOUT,
+)
 from mm_sonic.terrain_pfnn.model import (
     PhaseFunctionedNetwork,
     catmull_rom_phase_banks,
@@ -12,7 +16,14 @@ from mm_sonic.terrain_pfnn.model import (
 
 class TerrainPFNNModelTest(unittest.TestCase):
     def test_layout_sizes_are_frozen(self) -> None:
+        joint_state_layout = getattr(
+            layout_module, "CLASSIC_G1_INPUT_LAYOUT_V3", None
+        )
+        self.assertIsNotNone(joint_state_layout)
         self.assertEqual(INPUT_LAYOUT.size, 288)
+        self.assertEqual(joint_state_layout.size, 346)
+        self.assertEqual(joint_state_layout["joint_position"], slice(288, 317))
+        self.assertEqual(joint_state_layout["joint_velocity"], slice(317, 346))
         self.assertEqual(OUTPUT_LAYOUT.size, 268)
         self.assertEqual(INPUT_LAYOUT["terrain_height"].stop - INPUT_LAYOUT["terrain_height"].start, 36)
         self.assertEqual(OUTPUT_LAYOUT["contact_logit"].stop - OUTPUT_LAYOUT["contact_logit"].start, 4)
@@ -64,6 +75,29 @@ class TerrainPFNNModelTest(unittest.TestCase):
         output.square().mean().backward()
         self.assertIsNotNone(model.W1.grad)
         self.assertTrue(torch.isfinite(model.W1.grad).all())
+
+    def test_network_defaults_to_v2_and_accepts_explicit_v3_input_width(self) -> None:
+        legacy = PhaseFunctionedNetwork(hidden_size=16, dropout_probability=0.0)
+        try:
+            joint_state = PhaseFunctionedNetwork(
+                hidden_size=16,
+                dropout_probability=0.0,
+                input_size=346,
+            )
+        except TypeError as error:
+            self.fail(f"explicit input width is unsupported: {error}")
+
+        self.assertEqual(legacy.input_size, INPUT_LAYOUT.size)
+        self.assertEqual(tuple(legacy.W0.shape), (4, 16, 288))
+        self.assertEqual(joint_state.input_size, 346)
+        self.assertEqual(tuple(joint_state.W0.shape), (4, 16, 346))
+        output = joint_state(
+            torch.randn(3, 346),
+            torch.tensor((0.0, 1.0, 2.0)),
+        )
+        self.assertEqual(tuple(output.shape), (3, OUTPUT_LAYOUT.size))
+        with self.assertRaisesRegex(ValueError, "x\\[B,346\\]"):
+            joint_state(torch.randn(3, INPUT_LAYOUT.size), torch.zeros(3))
 
 
 if __name__ == "__main__":
