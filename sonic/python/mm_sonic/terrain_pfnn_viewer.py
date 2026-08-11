@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -13,11 +15,7 @@ import numpy as np
 import torch
 
 from .gear_action import isaaclab_to_mujoco_joint_vector
-from .hybrid_terrain_lmm_viewer import (
-    DEFAULT_TERRAIN_ROOT,
-    SceneTerrainAdapter,
-    load_scene_terrain,
-)
+from .scene_runtime import _Heightfield, _parse_heightfield, _sample_terrain_height
 from .train_classic_g1_pfnn import load_classic_checkpoint
 from .terrain_pfnn.hill_map import TerrainPFNNHillMap
 from .terrain_pfnn.kinematics import TorchG1ForwardKinematics
@@ -48,6 +46,9 @@ DEFAULT_TERRAIN_FIT = Path(
 )
 DEFAULT_IDLE_CLIPS = Path(
     "/home/ubuntu/projects/gear-sonic-pinned-60de0df/motionbricks/out/G1-clip.ckpt"
+)
+DEFAULT_TERRAIN_ROOT = Path(
+    "/home/ubuntu/projects/motion-matching/resources/g1_terrain/scenes"
 )
 
 
@@ -215,12 +216,177 @@ def _course_to_native_rotation(spawn_heading: float) -> np.ndarray:
     return np.asarray(((cosine, -sine), (sine, cosine)), dtype=np.float64)
 
 
+@dataclass(frozen=True)
+class _SceneTerrain:
+    """Lightweight G1HF scene used only as PFNN input and render geometry."""
+
+    field: _Heightfield
+    spawn_native_xy: object
+    spawn_heading: float
+    scene_id: str
+    terrain_sha256: str
+    scene_json_sha256: str | None
+    source_path: Path | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.field, _Heightfield):
+            raise TypeError("scene field must be a parsed G1HF heightfield")
+        if (
+            not math.isfinite(self.field.cell_size)
+            or self.field.cell_size <= 0.0
+            or not math.isfinite(self.field.exterior_height)
+            or self.field.heights.shape != (self.field.nx * self.field.nz,)
+        ):
+            raise ValueError("scene G1HF dimensions are invalid")
+        spawn = np.asarray(self.spawn_native_xy, dtype=np.float64)
+        if spawn.shape != (2,) or not np.isfinite(spawn).all():
+            raise ValueError("scene spawn must be finite native XY")
+        spawn = np.array(spawn, copy=True)
+        spawn.setflags(write=False)
+        heading = float(self.spawn_heading)
+        if not math.isfinite(heading):
+            raise ValueError("scene spawn heading must be finite")
+        if type(self.scene_id) is not str or not self.scene_id:
+            raise ValueError("scene ID must be nonempty")
+        if type(self.terrain_sha256) is not str or len(self.terrain_sha256) != 64:
+            raise ValueError("scene terrain SHA-256 is invalid")
+        if self.scene_json_sha256 is not None and (
+            type(self.scene_json_sha256) is not str or len(self.scene_json_sha256) != 64
+        ):
+            raise ValueError("scene JSON SHA-256 is invalid")
+        object.__setattr__(self, "spawn_native_xy", spawn)
+        object.__setattr__(
+            self, "spawn_heading", math.remainder(heading, 2.0 * math.pi)
+        )
+
+    @property
+    def cell_size_m(self) -> float:
+        return float(self.field.cell_size)
+
+    def contains(self, native_xy: object) -> bool:
+        point = np.asarray(native_xy, dtype=np.float64)
+        if point.shape != (2,) or not np.isfinite(point).all():
+            return False
+        x, z = float(point[0]), -float(point[1])
+        maximum_x = self.field.origin_x + (self.field.nx - 1) * self.field.cell_size
+        maximum_z = self.field.origin_z + (self.field.nz - 1) * self.field.cell_size
+        return bool(
+            self.field.origin_x <= x <= maximum_x
+            and self.field.origin_z <= z <= maximum_z
+        )
+
+    def height_at(self, native_xy: object) -> float:
+        point = np.asarray(native_xy, dtype=np.float64)
+        if point.shape != (2,) or not np.isfinite(point).all():
+            raise ValueError("scene height query must be finite native XY")
+        return _sample_terrain_height(self.field, float(point[0]), -float(point[1]))
+
+    def native_mesh(self) -> tuple[np.ndarray, np.ndarray]:
+        xs = self.field.origin_x + np.arange(self.field.nx) * self.field.cell_size
+        zs = self.field.origin_z + np.arange(self.field.nz) * self.field.cell_size
+        heights = self.field.heights.reshape((self.field.nz, self.field.nx))
+        vertices = np.asarray(
+            [
+                (float(x), -float(z), float(heights[row, column]))
+                for row, z in enumerate(zs)
+                for column, x in enumerate(xs)
+            ],
+            dtype=np.float64,
+        )
+        faces = np.asarray(
+            [
+                triangle
+                for row in range(self.field.nz - 1)
+                for column in range(self.field.nx - 1)
+                for triangle in (
+                    (
+                        row * self.field.nx + column,
+                        (row + 1) * self.field.nx + column + 1,
+                        row * self.field.nx + column + 1,
+                    ),
+                    (
+                        row * self.field.nx + column,
+                        (row + 1) * self.field.nx + column,
+                        (row + 1) * self.field.nx + column + 1,
+                    ),
+                )
+            ],
+            dtype=np.int32,
+        )
+        return vertices, faces
+
+
+def _load_scene_terrain(
+    scene: str | Path, *, terrain_root: Path = DEFAULT_TERRAIN_ROOT
+) -> _SceneTerrain:
+    """Load one scene.json-bound G1HF without importing the hybrid runtime."""
+
+    requested = Path(scene).expanduser()
+    path = (
+        requested if requested.exists() else Path(terrain_root).expanduser() / requested
+    )
+    terrain_path = path / "terrain.bin" if path.is_dir() else path
+    payload = terrain_path.read_bytes()
+    terrain_sha256 = hashlib.sha256(payload).hexdigest()
+    field = _parse_heightfield(payload)
+    spawn_native_xy = np.zeros(2, dtype=np.float64)
+    spawn_heading = 0.0
+    scene_id = path.name
+    scene_json_sha256: str | None = None
+    scene_json_path = path / "scene.json" if path.is_dir() else None
+    if scene_json_path is not None and scene_json_path.is_file():
+        scene_payload = scene_json_path.read_bytes()
+        scene_json_sha256 = hashlib.sha256(scene_payload).hexdigest()
+        try:
+            descriptor = json.loads(scene_payload)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("scene.json is invalid JSON") from error
+        heightfield = (
+            descriptor.get("heightfield") if isinstance(descriptor, dict) else None
+        )
+        if (
+            not isinstance(descriptor, dict)
+            or descriptor.get("schema") != "g1-terrain-scene/v1"
+            or descriptor.get("coordinate_signature")
+            != "holden-y-up-right-handed-forward-plus-z"
+            or not isinstance(heightfield, dict)
+            or heightfield.get("sha256") != terrain_sha256
+        ):
+            raise ValueError("scene.json terrain contract is invalid")
+        spawn = descriptor.get("spawn")
+        if not isinstance(spawn, dict):
+            raise ValueError("scene.json has no spawn")
+        position = np.asarray(spawn.get("position"), dtype=np.float64)
+        heading = float(spawn.get("yaw_radians", float("nan")))
+        identifier = descriptor.get("id")
+        if (
+            position.shape != (3,)
+            or not np.isfinite(position).all()
+            or not math.isfinite(heading)
+            or type(identifier) is not str
+            or not identifier
+        ):
+            raise ValueError("scene.json spawn identity is invalid")
+        spawn_native_xy = np.asarray((position[0], -position[2]), dtype=np.float64)
+        spawn_heading = heading
+        scene_id = identifier
+    return _SceneTerrain(
+        field=field,
+        spawn_native_xy=spawn_native_xy,
+        spawn_heading=spawn_heading,
+        scene_id=scene_id,
+        terrain_sha256=terrain_sha256,
+        scene_json_sha256=scene_json_sha256,
+        source_path=terrain_path.resolve(strict=True),
+    )
+
+
 class _ScenePFNNTerrainCallback:
     """One authenticated native scene expressed in the PFNN course frame."""
 
-    def __init__(self, adapter: SceneTerrainAdapter) -> None:
-        if not isinstance(adapter, SceneTerrainAdapter):
-            raise TypeError("scene terrain must be a SceneTerrainAdapter")
+    def __init__(self, adapter: _SceneTerrain) -> None:
+        if not isinstance(adapter, _SceneTerrain):
+            raise TypeError("scene terrain must be a parsed G1HF scene")
         self.adapter = adapter
         self._course_to_native = _course_to_native_rotation(adapter.spawn_heading)
         self._gradient_step_m = 0.25 * adapter.cell_size_m
@@ -237,7 +403,7 @@ class _ScenePFNNTerrainCallback:
         if local.shape != (2,) or not np.isfinite(local).all():
             return None
         native = self._native_xy(local)
-        if not self.adapter.authority.contains(native):
+        if not self.adapter.contains(native):
             return None
         gradient = np.empty(2, dtype=np.float64)
         for axis in range(2):
@@ -245,26 +411,22 @@ class _ScenePFNNTerrainCallback:
             offset[axis] = self._gradient_step_m
             lower = self._native_xy(local - offset)
             upper = self._native_xy(local + offset)
-            if not (
-                self.adapter.authority.contains(lower)
-                and self.adapter.authority.contains(upper)
-            ):
+            if not (self.adapter.contains(lower) and self.adapter.contains(upper)):
                 return None
             gradient[axis] = (
-                self.adapter.authority.height_at(upper)
-                - self.adapter.authority.height_at(lower)
+                self.adapter.height_at(upper) - self.adapter.height_at(lower)
             ) / (2.0 * self._gradient_step_m)
-        return TerrainSample(self.adapter.authority.height_at(native), gradient)
+        return TerrainSample(self.adapter.height_at(native), gradient)
 
     def collision_heights_at(self, xy: object) -> np.ndarray:
         local = np.asarray(xy, dtype=np.float64)
         if local.ndim != 2 or local.shape[1] != 2 or not np.isfinite(local).all():
             raise ValueError("collision XY must have finite shape [N,2]")
         native = self.adapter.spawn_native_xy + local @ self._course_to_native.T
-        if not all(self.adapter.authority.contains(point) for point in native):
+        if not all(self.adapter.contains(point) for point in native):
             raise ValueError("collision query left the authenticated scene terrain")
         return np.asarray(
-            [self.adapter.authority.height_at(point) for point in native],
+            [self.adapter.height_at(point) for point in native],
             dtype=np.float64,
         )
 
@@ -408,7 +570,7 @@ def _configure_camera(viewer: object) -> None:
 
 
 def _scene_root_position(
-    root_position_world: object, scene_terrain: SceneTerrainAdapter | None
+    root_position_world: object, scene_terrain: _SceneTerrain | None
 ) -> np.ndarray:
     position = np.asarray(root_position_world, dtype=np.float64)
     if position.shape != (3,) or not np.isfinite(position).all():
@@ -424,7 +586,7 @@ def _scene_root_position(
 
 
 def _scene_root_quaternion(
-    quaternion_wxyz: object, scene_terrain: SceneTerrainAdapter | None
+    quaternion_wxyz: object, scene_terrain: _SceneTerrain | None
 ) -> np.ndarray:
     quaternion = np.asarray(quaternion_wxyz, dtype=np.float64)
     if quaternion.shape != (4,) or not np.isfinite(quaternion).all():
@@ -547,7 +709,7 @@ def _apply_frame(
     data: object,
     frame: object,
     *,
-    scene_terrain: SceneTerrainAdapter | None = None,
+    scene_terrain: _SceneTerrain | None = None,
 ) -> None:
     data.qpos[:] = model.qpos0
     data.qpos[:3] = _scene_root_position(frame.root_position_world, scene_terrain)
@@ -613,9 +775,9 @@ def _load_runtime(
 
 def _run(arguments: argparse.Namespace) -> int:
     checkpoint, dataset, model_path, scene_xml, idle_clips = _validate(arguments)
-    scene_terrain: SceneTerrainAdapter | None = None
+    scene_terrain: _SceneTerrain | None = None
     if arguments.scene is not None:
-        scene_terrain = load_scene_terrain(
+        scene_terrain = _load_scene_terrain(
             arguments.scene, terrain_root=arguments.terrain_root
         )
         terrain = _ScenePFNNTerrainCallback(scene_terrain)

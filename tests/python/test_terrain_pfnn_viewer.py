@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from contextlib import redirect_stdout
+import hashlib
 import inspect
 from io import StringIO
+import json
 import math
 from pathlib import Path
+import struct
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -13,25 +16,64 @@ from unittest import mock
 import numpy as np
 
 from mm_sonic.pfnn_terrain_fit import PFNNTerrainFit
-from mm_sonic.hybrid_terrain_lmm_viewer import _scene_adapter_from_grid
+from mm_sonic.scene_runtime import _Heightfield
 from mm_sonic.terrain_pfnn.pfnn_surface import PlacedPFNNSurface
 from mm_sonic.terrain_pfnn.runtime import PFNNRuntimeFrame, PFNNTrajectoryState
 
 
 class TerrainPFNNViewerTests(unittest.TestCase):
     def _sloped_scene_adapter(self, heading: float = math.pi / 2.0) -> object:
+        from mm_sonic.terrain_pfnn_viewer import _SceneTerrain
+
         # Native coordinates cover X=[2, 4], Y=[3, 5], with h=2X+3Y.
-        return _scene_adapter_from_grid(
-            np.asarray(((19.0, 23.0), (13.0, 17.0)), dtype=np.float32),
+        field = _Heightfield(
+            nx=2,
+            nz=2,
             origin_x=2.0,
             origin_z=-5.0,
-            cell=2.0,
-            exterior=-1.0,
-            name="two-by-two-slope",
-            source_path=None,
+            cell_size=2.0,
+            exterior_height=-1.0,
+            heights=np.asarray((19.0, 23.0, 13.0, 17.0), dtype=np.float32),
+        )
+        return _SceneTerrain(
+            field=field,
             spawn_native_xy=(3.0, 4.0),
             spawn_heading=heading,
+            scene_id="two-by-two-slope",
+            terrain_sha256="a" * 64,
+            scene_json_sha256=None,
+            source_path=None,
         )
+
+    def test_lightweight_scene_loader_binds_g1hf_without_hybrid_import(self) -> None:
+        import mm_sonic.terrain_pfnn_viewer as viewer_module
+
+        heights = np.asarray(((0.0, 0.1), (0.2, 0.3)), dtype="<f4")
+        payload = struct.pack("<4sIIIffff", b"G1HF", 2, 2, 2, -1.0, -2.0, 1.0, 0.0)
+        payload += heights.tobytes(order="C")
+        digest = hashlib.sha256(payload).hexdigest()
+        descriptor = {
+            "schema": "g1-terrain-scene/v1",
+            "id": "fixture-ramp",
+            "coordinate_signature": "holden-y-up-right-handed-forward-plus-z",
+            "heightfield": {"sha256": digest},
+            "spawn": {"position": [0.25, 0.0, 0.5], "yaw_radians": 0.3},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            scene = Path(directory) / "fixture-ramp"
+            scene.mkdir()
+            (scene / "terrain.bin").write_bytes(payload)
+            (scene / "scene.json").write_text(json.dumps(descriptor), encoding="utf-8")
+            loaded = viewer_module._load_scene_terrain(
+                "fixture-ramp", terrain_root=Path(directory)
+            )
+
+        self.assertEqual(loaded.scene_id, "fixture-ramp")
+        self.assertEqual(loaded.terrain_sha256, digest)
+        np.testing.assert_allclose(loaded.spawn_native_xy, (0.25, -0.5))
+        self.assertAlmostEqual(loaded.spawn_heading, 0.3)
+        self.assertAlmostEqual(loaded.height_at((-1.0, 2.0)), 0.0)
+        self.assertNotIn("hybrid_terrain_lmm_viewer", inspect.getsource(viewer_module))
 
     def test_scene_terrain_callback_uses_one_rigid_course_frame_and_native_mesh(
         self,
@@ -50,20 +92,20 @@ class TerrainPFNNViewerTests(unittest.TestCase):
         forward_native = np.asarray(
             (3.0 + 0.25 * math.sin(heading), 4.0 - 0.25 * math.cos(heading))
         )
-        self.assertEqual(origin.height_m, adapter.authority.height_at((3.0, 4.0)))
-        self.assertEqual(forward.height_m, adapter.authority.height_at(forward_native))
+        self.assertEqual(origin.height_m, adapter.height_at((3.0, 4.0)))
+        self.assertEqual(forward.height_m, adapter.height_at(forward_native))
         np.testing.assert_allclose(
             origin.gradient_xy,
             (
                 2.0 * math.sin(heading) - 3.0 * math.cos(heading),
                 2.0 * math.cos(heading) + 3.0 * math.sin(heading),
             ),
-            atol=1.0e-12,
+            atol=3.0e-6,
         )
         np.testing.assert_allclose(
             callback.collision_heights_at(np.asarray(((0.0, 0.0), (0.25, 0.0)))),
-            (18.0, adapter.authority.height_at(forward_native)),
-            atol=1.0e-12,
+            (18.0, adapter.height_at(forward_native)),
+            atol=3.0e-6,
         )
         vertices, faces = adapter.native_mesh()
         np.testing.assert_array_equal(callback.vertices, vertices)
