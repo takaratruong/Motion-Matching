@@ -1979,9 +1979,13 @@ class HybridMatcher:
                 and raw_successor != self.state.row
                 and not self.diagnostic_row_mask[raw_successor]
             )
+            elapsed_reaches_search_interval = (
+                self._elapsed_since_search + math.ulp(SEARCH_INTERVAL_S)
+                >= SEARCH_INTERVAL_S
+            )
             periodic_search = (
                 not self.diagnostic_stability or (gpu_diagnostic and effective_active)
-            ) and self._elapsed_since_search >= SEARCH_INTERVAL_S
+            ) and elapsed_reaches_search_interval
             event_search = bool(force_search) or command_event or terrain_event
             active_boundary_search = (
                 self.diagnostic_stability

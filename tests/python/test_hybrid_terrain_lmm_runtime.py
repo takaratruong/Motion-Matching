@@ -387,6 +387,42 @@ class HybridTerrainRuntimeTests(unittest.TestCase):
         self.assertEqual(searched.call_count, 2)
         self.assertEqual(len(fake.calls), 2)
 
+    def test_gpu_diagnostic_periodic_searches_on_exact_sixth_60hz_tick(self):
+        fake = _FakeSingleGpuSearch()
+        values = np.zeros((16, 31), dtype=np.float32)
+        with mock.patch(
+            "mm_sonic.hybrid_terrain_lmm_gpu_search.SingleGpuExactSearch",
+            return_value=fake,
+        ):
+            matcher = HybridMatcher(
+                _mechanically_safe(_corpus(values)),
+                _Generator(rows=16),
+                TerrainAuthority.flat(),
+                pose_converter=_pose_converter,
+                search_device="cuda:5",
+                diagnostic_stability=True,
+            )
+        fake.responses.extend(
+            _gpu_candidates(
+                matcher.searchable_rows,
+                candidate_count=len(matcher.searchable_rows),
+                close_candidate_count=len(matcher.searchable_rows),
+            )
+            for _ in range(2)
+        )
+        command = CommandState(1.0, 0.0)
+        tick = 1.0 / 60.0
+
+        with mock.patch.object(matcher, "match", wraps=matcher.match) as searched:
+            matcher.step(command, dt=tick)
+            for _ in range(5):
+                matcher.step(command, dt=tick)
+            self.assertEqual(searched.call_count, 1)
+
+            matcher.step(command, dt=tick)
+
+        self.assertEqual(searched.call_count, 2)
+
     def test_cpu_diagnostic_remains_event_only_past_10hz(self):
         matcher = HybridMatcher(
             _mechanically_safe(_corpus()),
